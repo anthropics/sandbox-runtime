@@ -984,6 +984,42 @@ describe.if(isMacOS)('macOS Seatbelt Process Enumeration', () => {
   })
 })
 
+describe.if(isMacOS)(
+  'macOS Seatbelt built-in security mach-lookup rules',
+  () => {
+    it('should include com.apple.SecurityServer for Keychain IPC on all macOS versions', () => {
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: true,
+        readConfig: undefined,
+        writeConfig: undefined,
+      })
+
+      expect(wrappedCommand).toContain(
+        '(allow mach-lookup (global-name \\"com.apple.SecurityServer\\"))',
+      )
+    })
+
+    it('should include com.apple.secd for Keychain IPC on macOS 13+ (Ventura and later)', () => {
+      // com.apple.secd is the Security Entry Daemon that became the primary handler
+      // for Keychain credential operations (read/write/delete) on macOS 13 (Ventura)
+      // and later. Without it, token refresh flows that rely on the apple-tool: partition
+      // fail silently even though com.apple.SecurityServer is allowed - secd is the
+      // actual endpoint for those Mach IPC calls on modern macOS.
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: true,
+        readConfig: undefined,
+        writeConfig: undefined,
+      })
+
+      expect(wrappedCommand).toContain(
+        '(allow mach-lookup (global-name \\"com.apple.secd\\"))',
+      )
+    })
+  },
+)
+
 describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
   it('should emit global-name and global-name-prefix rules for configured services', () => {
     const wrappedCommand = wrapCommandWithSandboxMacOS({
