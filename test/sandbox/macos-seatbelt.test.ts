@@ -996,7 +996,7 @@ describe.if(isMacOS)(
       })
 
       expect(wrappedCommand).toContain(
-        '(allow mach-lookup (global-name \\"com.apple.SecurityServer\\"))',
+        '(allow mach-lookup (global-name "com.apple.SecurityServer"))',
       )
     })
 
@@ -1014,7 +1014,30 @@ describe.if(isMacOS)(
       })
 
       expect(wrappedCommand).toContain(
-        '(allow mach-lookup (global-name \\"com.apple.secd\\"))',
+        '(allow mach-lookup (global-name "com.apple.secd"))',
+      )
+    })
+
+    it('should allow security.mac.sandbox.sentinel sysctl read so Keychain CLI tools proceed', () => {
+      // The `security` CLI (and similar tools) read security.mac.sandbox.sentinel
+      // as a pre-flight sandbox check. When that read fails with EPERM they abort
+      // before attempting any Keychain operation. The sentinel is enforced by
+      // seatbelt (not a deeper kernel check), so an explicit allow unblocks those
+      // tools while srt's other rules remain the enforcement boundary.
+      //
+      // Diagnosed via: log stream --predicate 'eventMessage CONTAINS "Sandbox:"'
+      // Only violation during a failed security add-generic-password:
+      //   deny(1) sysctl-read security.mac.sandbox.sentinel
+      // No secd or file-write denials - the sentinel check was the sole blocker.
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: true,
+        readConfig: undefined,
+        writeConfig: undefined,
+      })
+
+      expect(wrappedCommand).toContain(
+        '(sysctl-name "security.mac.sandbox.sentinel")',
       )
     })
   },
