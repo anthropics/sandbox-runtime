@@ -77,7 +77,13 @@ async function main(): Promise<void> {
     .description(
       'Run commands in a sandbox with network and filesystem restrictions',
     )
-    .version(process.env.npm_package_version || '1.0.0')
+    .version(
+      (
+        JSON.parse(
+          fs.readFileSync(new URL('../package.json', import.meta.url), 'utf-8'),
+        ) as { version: string }
+      ).version,
+    )
 
   // ── Windows install/uninstall ─────────────────────────────────
   // Self-elevating one-shot install (one UAC prompt). Also
