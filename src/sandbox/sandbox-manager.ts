@@ -1673,16 +1673,21 @@ async function wrapWithSandbox(
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
         setEnvVars: credentialRestrictions.setEnvVars,
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
-        allowUnixSockets: getAllowUnixSockets(),
+        allowUnixSockets:
+          customConfig?.network?.allowUnixSockets ?? getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
+        allowLocalBinding:
+          customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding(),
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
         gitSafeDirectories,
-        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
-        allowAppleEvents: getAllowAppleEvents(),
+        enableWeakerNetworkIsolation:
+          customConfig?.enableWeakerNetworkIsolation ??
+          getEnableWeakerNetworkIsolation(),
+        allowAppleEvents:
+          customConfig?.allowAppleEvents ?? getAllowAppleEvents(),
         binShell,
       })
 
