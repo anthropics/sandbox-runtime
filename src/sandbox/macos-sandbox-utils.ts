@@ -6,6 +6,7 @@ import { whichSync } from '../utils/which.js'
 import {
   normalizePathForSandbox,
   generateProxyEnvVars,
+  buildPosixGitSafeDirEnv,
   encodeSandboxedCommand,
   decodeSandboxedCommand,
   containsGlobChars,
@@ -13,6 +14,7 @@ import {
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
+import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 import type {
   FsReadRestrictionConfig,
@@ -22,6 +24,15 @@ import type { IgnoreViolationsConfig } from './sandbox-config.js'
 
 export interface MacOSSandboxParams {
   command: string
+  /**
+   * Attribution key for this invocation: the string encoded into the
+   * seatbelt log tag and the proxy username, and reported as the
+   * violation's `command`. Defaults to `command`. Set it when the string
+   * you execute differs from the one you will later look violations up by
+   * (e.g. you wrap an assembled `source snapshot && eval '<cmd>'` but query
+   * `getViolationsForCommand('<cmd>')`).
+   */
+  commandLabel?: string
   needsNetworkRestriction: boolean
   httpProxyPort?: number
   socksProxyPort?: number
@@ -48,6 +59,11 @@ export interface MacOSSandboxParams {
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
+  /**
+   * Directories to emit as `safe.directory` via `GIT_CONFIG_*` env
+   * vars — see {@link buildPosixGitSafeDirEnv}.
+   */
+  gitSafeDirectories?: readonly string[]
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   binShell?: string
@@ -283,6 +299,9 @@ function generateReadRules(
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
   const allowedSubpaths: string[] = []
   for (const pathPattern of config.allowWithinDeny || []) {
+    // Non-glob spellings arrive slash-free from normalizePathForSandbox —
+    // the nested-deny re-emit below matches by `subpath + '/'` prefix,
+    // which a preserved trailing slash would defeat ('<dir>//').
     const normalizedPath = normalizePathForSandbox(pathPattern)
 
     if (containsGlobChars(normalizedPath)) {
@@ -785,6 +804,7 @@ export function wrapCommandWithSandboxMacOS(
 ): string {
   const {
     command,
+    commandLabel,
     needsNetworkRestriction,
     httpProxyPort,
     socksProxyPort,
@@ -801,6 +821,7 @@ export function wrapCommandWithSandboxMacOS(
     maskedFileBinds,
     allowPty,
     allowGitConfig = false,
+    gitSafeDirectories,
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
@@ -834,18 +855,24 @@ export function wrapCommandWithSandboxMacOS(
   const hasEnvRestrictions =
     (unsetEnvVars !== undefined && unsetEnvVars.length > 0) ||
     (setEnvVars !== undefined && Object.keys(setEnvVars).length > 0)
+  const hasGitConfig = (gitSafeDirectories?.length ?? 0) > 0
 
   // No sandboxing needed
   if (
     !needsNetworkRestriction &&
     !hasReadRestrictions &&
     !hasWriteRestrictions &&
-    !hasEnvRestrictions
+    !hasEnvRestrictions &&
+    !hasGitConfig
   ) {
     return command
   }
 
-  const logTag = generateLogTag(command)
+  // Both correlation carriers (seatbelt log tag, proxy username) encode
+  // the attribution key, which is the caller's commandLabel when the
+  // executed string differs from the one violations are looked up by.
+  const attributionCommand = commandLabel ?? command
+  const logTag = generateLogTag(attributionCommand)
 
   const profile = generateSandboxProfile({
     readConfig,
@@ -871,6 +898,7 @@ export function wrapCommandWithSandboxMacOS(
     caCertPath,
     proxyAuthToken,
     writeConfig === undefined,
+    encodeSandboxedCommand(attributionCommand),
   )
 
   // Seatbelt's (remote ip "localhost:*") filter — used for the
@@ -890,6 +918,22 @@ export function wrapCommandWithSandboxMacOS(
       ? inherited
       : [inherited, flag].filter(Boolean).join(' ')
     proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${value}`)
+  }
+
+  // safe.directory (dubious-ownership) — `buildPosixGitSafeDirEnv`
+  // composes against the child's actual starting env (process.env
+  // inherited under sandbox-exec, unsetEnvVars dropped, setEnvVars
+  // overlaid) so an ambient GIT_CONFIG_COUNT is continued, not
+  // clobbered.
+  if (gitSafeDirectories && gitSafeDirectories.length > 0) {
+    const gitCfg = buildPosixGitSafeDirEnv({
+      safeDirs: gitSafeDirectories,
+      unsetEnvVars,
+      setEnvVars,
+    })
+    for (const [name, value] of Object.entries(gitCfg)) {
+      proxyEnvArgs.push(`${name}=${value}`)
+    }
   }
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
@@ -957,12 +1001,6 @@ export function startMacOSSandboxLogMonitor(
   const cmdExtractRegex = /CMD64_(.+?)_END/
   const sandboxExtractRegex = /Sandbox:\s+(.+)$/
 
-  // Pre-process ignore patterns for faster lookup
-  const wildcardPaths = ignoreViolations?.['*'] || []
-  const commandPatterns = ignoreViolations
-    ? Object.entries(ignoreViolations).filter(([pattern]) => pattern !== '*')
-    : []
-
   // Stream and filter kernel logs for all sandbox violations
   // We can't filter by specific logTag since it's dynamic per command
   const logProcess = spawn('log', [
@@ -1015,24 +1053,8 @@ export function startMacOSSandboxLogMonitor(
     }
 
     // Check if we should ignore this violation
-    if (ignoreViolations && command) {
-      // Check wildcard patterns first
-      if (wildcardPaths.length > 0) {
-        const shouldIgnore = wildcardPaths.some(path =>
-          violationDetails.includes(path),
-        )
-        if (shouldIgnore) return
-      }
-
-      // Check command-specific patterns
-      for (const [pattern, paths] of commandPatterns) {
-        if (command.includes(pattern)) {
-          const shouldIgnore = paths.some(path =>
-            violationDetails.includes(path),
-          )
-          if (shouldIgnore) return
-        }
-      }
+    if (shouldIgnoreViolation(violationDetails, command, ignoreViolations)) {
+      return
     }
 
     // Not ignored - report the violation

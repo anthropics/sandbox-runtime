@@ -362,6 +362,89 @@ try {
   }
   Write-Host ('A30 ok: hardlink guard — per-exec AND session ' +
               'acl stamp refuse multi-link Deny targets')
+
+  # ── A31: non-existent deny target → placeholder-create + stamp ──
+  # `acl stamp` mkdirs each missing intermediate + creates an empty
+  # leaf; leaf gets the full Deny mask, intermediates get an
+  # object-only deny-DELETE (so rename/rmdir of an intermediate is
+  # blocked too). Placeholders are PERMANENT (leave-in-place):
+  # `acl restore` strips the ACEs but never deletes the file/dir.
+  $leaf31 = Join-Path $Root 'a31\secrets\token'
+  if (Test-Path (Join-Path $Root 'a31')) {
+    throw 'A31 pre: a31 subtree already exists'
+  }
+  Stamp @{ denyRead = @($leaf31) }
+  # (a) placeholder chain exists; leaf is an empty file with a
+  #     sb-user Deny ACE; child `type` denied.
+  if (-not (Test-Path $leaf31 -PathType Leaf)) {
+    throw 'A31(a): placeholder leaf not created'
+  }
+  if (-not (Has-SbAce $leaf31)) {
+    throw 'A31(a): placeholder leaf has no sb-user Deny ACE'
+  }
+  $r = RExec @('--', $cmd, '/c', "type `"$leaf31`"")
+  if ($r.exit -eq 0) {
+    throw "A31(a): child read placeholder leaf. raw: $($r.raw)"
+  }
+  # (b) child cannot delete/rename the placeholder chain (full
+  #     Deny on leaf, deny-DELETE on intermediates, DenyFdc on
+  #     parents).
+  $r = RExec @('--', $cmd, '/c', "del /f `"$leaf31`"")
+  if (-not (Test-Path $leaf31)) {
+    throw "A31(b): child deleted placeholder leaf. raw: $($r.raw)"
+  }
+  $mid31 = Join-Path $Root 'a31\secrets'
+  $r = RExec @('--', $cmd, '/c',
+               "ren `"$mid31`" secrets2 && mkdir `"$mid31`"")
+  if (Test-Path (Join-Path $Root 'a31\secrets2')) {
+    throw ("A31(b): child renamed placeholder intermediate. " +
+           "raw: $($r.raw)")
+  }
+  # (c) restore strips the ACEs; placeholder chain LEFT IN PLACE
+  #     (leave-in-place — never delete what the user may have
+  #     written into).
+  Restore $PID
+  if ((Has-SbAce $leaf31) -or (Has-SbAce $mid31)) {
+    throw 'A31(c): placeholder chain still has sb-user ACE after restore'
+  }
+  if (-not (Test-Path $leaf31 -PathType Leaf)) {
+    throw ('A31(c): placeholder leaf gone after restore ' +
+           '(should be left in place)')
+  }
+  Write-Host ('A31 ok: non-existent deny target → placeholder ' +
+              'chain created+stamped, delete/rename blocked, ' +
+              'ACEs stripped and chain left in place on restore')
+
+  # (d) trailing `\` ⇒ leaf materialized as a DIRECTORY.
+  $dir31 = Join-Path $Root 'a31d\hooks'
+  Stamp @{ denyRead = @($dir31 + '\') }
+  if (-not (Test-Path $dir31 -PathType Container)) {
+    throw 'A31(d): trailing-\ deny target not created as directory'
+  }
+  if (-not (Has-SbAce $dir31)) {
+    throw 'A31(d): dir placeholder leaf has no sb-user Deny ACE'
+  }
+  Restore $PID
+  Write-Host 'A31(d) ok: trailing-\ ⇒ directory placeholder'
+
+  # (e) broker-unwritable deny target soft-drops (exit 0) — the
+  #     sandbox cannot create there either. Constructed: deny the
+  #     REAL user create under $Root\a31e so `create_placeholder_
+  #     chain` hits PermissionDenied even on the elevated CI
+  #     runner. `Stamp` throws on nonzero exit, so reaching the
+  #     next line is the assertion.
+  $unw = Join-Path $Root 'a31e'
+  New-Item -ItemType Directory $unw | Out-Null
+  $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+  $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $me, 'CreateFiles,CreateDirectories', 'Deny')
+  $a = Get-Acl $unw; $a.AddAccessRule($rule); Set-Acl $unw $a
+  Stamp @{ denyRead = @((Join-Path $unw 'sub\token')) }
+  if (Test-Path (Join-Path $unw 'sub')) {
+    throw 'A31(e): placeholder created under broker-unwritable dir'
+  }
+  $a.RemoveAccessRule($rule) | Out-Null; Set-Acl $unw $a
+  Write-Host 'A31(e) ok: broker-unwritable deny target soft-drops'
 }
 finally {
   & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
@@ -371,4 +454,4 @@ finally {
   & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-Null
 }
 
-Write-Host 'smoke-aces: PASS (A2/A2(reg)/A4/A5/A13/A28/A29/A30)'
+Write-Host 'smoke-aces: PASS (A2/A2(reg)/A4/A5/A13/A28/A29/A30/A31)'

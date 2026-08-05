@@ -714,6 +714,23 @@ int main(int argc, char *argv[]) {
         uid_t uid = geteuid();
         gid_t gid = getegid();
 
+        /* If this binary was exec'd without read permission (e.g. installed
+         * mode 0111), the kernel marked the process non-dumpable, which
+         * makes /proc/self/{setgroups,uid_map,gid_map} root-owned, so the
+         * writes below would fail with EACCES. Temporarily flip dumpable
+         * on for the uid/gid mapping and restore it right after. While
+         * dumpable is 1, a same-uid process can ptrace us (under yama
+         * ptrace_scope=0) and dump the mapped pages that mode 0111 is
+         * meant to hide; the save/restore keeps that exposure to a
+         * few-syscall race window — the same unavoidable window runc and
+         * systemd accept for this pattern.
+         *
+         * prctl failures here are ignored: they are next to impossible for
+         * these calls, and if raising dumpable did fail the map writes
+         * below fail with their own clearer errors. */
+        int dumpable = prctl(PR_GET_DUMPABLE);
+        (void)prctl(PR_SET_DUMPABLE, 1);
+
         if (unshare(CLONE_NEWUSER) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWUSER)");
         }
@@ -728,6 +745,10 @@ int main(int argc, char *argv[]) {
         if (write_file("/proc/self/gid_map", "%u %u 1\n", gid, gid) < 0) {
             die("apply-seccomp: write /proc/self/gid_map");
         }
+        /* PR_SET_DUMPABLE only accepts 0 or 1; if the saved value was
+         * SUID_DUMP_ROOT (2) — or the read above failed — restore the more
+         * restrictive 0. */
+        (void)prctl(PR_SET_DUMPABLE, dumpable == 1 ? 1 : 0);
         if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS) after userns");
         }

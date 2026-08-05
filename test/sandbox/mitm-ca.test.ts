@@ -11,9 +11,12 @@ import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import forge from 'node-forge'
 import {
+  certThumbprint,
   createMitmCA,
   disposeMitmCA,
+  generateCa,
   signCertificateNative,
+  validateCaPair,
 } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 import { whichSync } from '../../src/utils/which.js'
@@ -192,6 +195,75 @@ describe('mitm-ca: ephemeral generation', () => {
     expect(() => createMitmCA({ caKeyPath: keyPath })).toThrow(
       /must be provided together/,
     )
+  })
+})
+
+describe('mitm-ca: generateCa + validateCaPair', () => {
+  // One shared pair — RSA-2048 keygen dominates the cost.
+  const g = generateCa({ cn: 'srt-test-generateCa', validityDays: 7 })
+
+  test('generateCa: cn + validityDays are honoured; pair validates', () => {
+    const cert = forge.pki.certificateFromPem(g.certPem)
+    expect(cert.subject.getField('CN').value).toBe('srt-test-generateCa')
+    // notAfter within [6, 8] days from now (allow for slow CI + DST).
+    const days =
+      (cert.validity.notAfter.getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+    expect(days).toBeGreaterThan(5)
+    expect(days).toBeLessThan(9)
+    const v = validateCaPair(g.certPem, g.keyPem)
+    expect(v.ok).toBe(true)
+    if (v.ok) {
+      expect(v.notAfter.getTime()).toBe(cert.validity.notAfter.getTime())
+      // 40 uppercase-hex chars, no separators — matches srt-win's
+      // `CertDer::thumb()` and PowerShell's `Cert:\…\Thumbprint`.
+      expect(v.thumbprint).toMatch(/^[0-9A-F]{40}$/)
+      expect(v.thumbprint).toBe(certThumbprint(g.certPem))
+    }
+  })
+
+  test('generateCa: defaults match the ephemeral CA (cn + 825d)', () => {
+    // The defaults are also what the ephemeral in-process CA uses, so
+    // this row pins that generateEphemeralCA's refactor to call
+    // generateCa() didn't change its output shape.
+    const d = generateCa()
+    const cert = forge.pki.certificateFromPem(d.certPem)
+    expect(cert.subject.getField('CN').value).toBe(
+      'sandbox-runtime ephemeral CA',
+    )
+    const days =
+      (cert.validity.notAfter.getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+    expect(Math.round(days)).toBe(825)
+  })
+
+  test('validateCaPair: mismatched key → ok:false', () => {
+    // Fixture cert with the freshly-generated key: moduli differ.
+    const v = validateCaPair(certPem, g.keyPem)
+    expect(v.ok).toBe(false)
+    if (!v.ok) expect(v.reason).toMatch(/does not match/)
+  })
+
+  test('validateCaPair: unparseable input → ok:false, not throw', () => {
+    expect(validateCaPair('not pem', g.keyPem).ok).toBe(false)
+    expect(validateCaPair(g.certPem, 'not pem').ok).toBe(false)
+  })
+
+  test('validateCaPair: fixture cert+key → ok:true', () => {
+    // The committed fixture is a real matching pair.
+    const v = validateCaPair(certPem, keyPem)
+    expect(v.ok).toBe(true)
+  })
+
+  test('validateCaPair: notBefore in the future → ok:false (clock-skew guard)', () => {
+    // Re-sign the generated CA with notBefore pushed into the future,
+    // as a system-clock-ahead-then-NTP-corrected machine would
+    // produce. Without this check the persistent-CA layer would keep
+    // reusing a cert schannel/OpenSSL both reject as not-yet-valid.
+    const c = forge.pki.certificateFromPem(g.certPem)
+    c.validity.notBefore = new Date(Date.now() + 24 * 60 * 60 * 1000)
+    signCertificateNative(c, g.keyPem)
+    const v = validateCaPair(forge.pki.certificateToPem(c), g.keyPem)
+    expect(v.ok).toBe(false)
+    if (!v.ok) expect(v.reason).toMatch(/notBefore .* is in the future/)
   })
 })
 

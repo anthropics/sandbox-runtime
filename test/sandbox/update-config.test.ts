@@ -3,7 +3,7 @@ import { SandboxManager } from '../../src/index.js'
 import { connect } from 'net'
 import { getPlatform } from '../../src/utils/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
-import { isLinux } from '../helpers/platform.js'
+import { isLinux, isMacOS } from '../helpers/platform.js'
 
 /**
  * Helper to make a CONNECT request through the proxy using raw TCP
@@ -79,6 +79,194 @@ describe('proxy auth + network deny semantics', () => {
     const port = SandboxManager.getProxyPort()!
     expect((await proxyRequest(port, 'example.com')).statusCode).toBe(403)
     expect((await proxyRequest(port, 'other.net')).statusCode).toBe(403)
+  })
+
+  it("reports a deniedDomains entry's deniedDomainReasons text in the violation line", async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: ['github.com', 'evil.net'],
+        deniedDomainReasons: {
+          'github.com':
+            'SSH pushes to GitHub are blocked; use an https:// remote',
+        },
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    expect((await proxyRequest(port, 'github.com')).statusCode).toBe(403)
+    // No reason for this entry → the generic one.
+    expect((await proxyRequest(port, 'evil.net')).statusCode).toBe(403)
+
+    const lines = store.getViolations().map(v => v.line)
+    expect(lines).toContain(
+      'deny network-outbound github.com:443 (SSH pushes to GitHub are blocked; use an https:// remote)',
+    )
+    expect(lines).toContain(
+      'deny network-outbound evil.net:443 (host is on the deny list)',
+    )
+  })
+
+  it('honors ignoreViolations for proxy-recorded network denials', async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: ['ignored.test', 'kept.test'],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      ignoreViolations: { '*': ['ignored.test'] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    expect((await proxyRequest(port, 'ignored.test')).statusCode).toBe(403)
+    expect((await proxyRequest(port, 'kept.test')).statusCode).toBe(403)
+
+    // The deny still happens (403), only the recorded violation is dropped.
+    const lines = store.getViolations().map(v => v.line)
+    expect(lines.some(l => l.includes('ignored.test'))).toBe(false)
+    expect(lines).toContain(
+      'deny network-outbound kept.test:443 (host is on the deny list)',
+    )
+  })
+
+  it('redacts the query string from filterRequest deny lines', async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: ['blocked.test'],
+        deniedDomains: [],
+        filterRequest: async () => ({
+          action: 'deny',
+          reason: 'policy says no',
+        }),
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    // Plain-HTTP GET through the proxy so filterRequest sees (and denies) it
+    // without any upstream connection.
+    await new Promise<void>(resolve => {
+      const token = SandboxManager.getProxyAuthToken()
+      const auth = Buffer.from(`srt:${token}`).toString('base64')
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(
+          `GET http://alice:PASSW0RD@blocked.test/x?access_token=SECRET123 HTTP/1.1\r\n` +
+            `Host: blocked.test\r\n` +
+            `Proxy-Authorization: Basic ${auth}\r\n` +
+            `Connection: close\r\n\r\n`,
+        )
+      })
+      socket.on('data', () => socket.destroy())
+      socket.on('close', () => resolve())
+      socket.on('error', () => resolve())
+      socket.setTimeout(2000, () => {
+        socket.destroy()
+        resolve()
+      })
+    })
+
+    const lines = store.getViolations().map(v => v.line)
+    expect(lines).toContain(
+      'deny http-request GET http://blocked.test/x?… (policy says no)',
+    )
+    const joined = lines.join('\n')
+    expect(joined).not.toContain('SECRET123')
+    // userinfo (name:pass@) is dropped along with the query.
+    expect(joined).not.toContain('PASSW0RD')
+    expect(joined).not.toContain('alice')
+  })
+
+  // The embedder bug this option exists for: Claude Code wraps an assembled
+  // `source <snapshot> ... && eval '<cmd>'` string but looks violations up by
+  // the raw `<cmd>`, so the stored key (first 100 chars of boilerplate) never
+  // equalled the lookup key and no <sandbox_violations> block was produced.
+  it.if(isMacOS || isLinux)(
+    'commandLabel: violations are attributed to the label, not the wrapped string',
+    async () => {
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: ['blocked.test'] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      const store = SandboxManager.getSandboxViolationStore()
+      const raw = 'curl -s -o /dev/null http://blocked.test/'
+      // >100 chars of invocation-independent prefix, like a snapshot source line.
+      const assembled =
+        `: ${'boilerplate-'.repeat(10)} 2>/dev/null || true && ` +
+        `eval '${raw}'`
+
+      // Without a label the key is the assembled prefix: lookup by raw misses.
+      store.clear()
+      const unlabelled = await SandboxManager.wrapWithSandbox(assembled)
+      await spawnAsync('bash', ['-c', unlabelled])
+      expect(store.getViolationsForCommand(raw)).toHaveLength(0)
+      expect(store.getCount()).toBeGreaterThan(0)
+
+      // With the label, the same run is found by the raw command.
+      store.clear()
+      const labelled = await SandboxManager.wrapWithSandbox(
+        assembled,
+        undefined,
+        undefined,
+        undefined,
+        { commandLabel: raw },
+      )
+      await spawnAsync('bash', ['-c', labelled])
+      const found = store.getViolationsForCommand(raw)
+      expect(found.length).toBeGreaterThan(0)
+      expect(found[0]!.line).toContain('blocked.test')
+      expect(found[0]!.command).toBe(raw)
+      expect(
+        SandboxManager.annotateStderrWithSandboxFailures(raw, ''),
+      ).toContain('<sandbox_violations>')
+    },
+    30000,
+  )
+
+  it('strips control characters from a client-supplied (forged) proxy username command', async () => {
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: ['blocked.test'] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    // A sandboxed process holds the proxy token (it's in HTTP_PROXY) and can
+    // put arbitrary bytes in the username suffix.
+    const forged = Buffer.from('legit\n\x1b[31mSPOOFED ROW\x1b[0m').toString(
+      'base64',
+    )
+    const token = SandboxManager.getProxyAuthToken()
+    const auth = Buffer.from(`srt.${forged}:${token}`).toString('base64')
+    await new Promise<void>(resolve => {
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(
+          `CONNECT blocked.test:443 HTTP/1.1\r\nHost: blocked.test:443\r\n` +
+            `Proxy-Authorization: Basic ${auth}\r\n\r\n`,
+        )
+      })
+      socket.on('data', () => socket.destroy())
+      socket.on('close', () => resolve())
+      socket.on('error', () => resolve())
+      socket.setTimeout(2000, () => {
+        socket.destroy()
+        resolve()
+      })
+    })
+
+    const [v] = store.getViolations()
+    expect(v).toBeDefined()
+    expect(v!.command!.includes('\n')).toBe(false)
+    expect(v!.command!.includes('\x1b')).toBe(false)
+    expect(v!.command).toContain('legit')
+    expect(v!.command).toContain('SPOOFED ROW')
   })
 
   it('strictAllowlist denies off-allowlist hosts without consulting the callback', async () => {

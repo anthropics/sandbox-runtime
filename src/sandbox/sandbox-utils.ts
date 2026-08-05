@@ -98,6 +98,39 @@ export function stripExtendedPathPrefix(p: string): string {
 }
 
 /**
+ * True for a Windows UNC path in any spelling — `\\server\share\…`,
+ * extended-length `\\?\UNC\server\share\…`, device-namespace
+ * `\\.\UNC\server\share\…` (all any casing, either separator).
+ * Delegates path-form normalization to
+ * `path.win32.toNamespacedPath` — every UNC spelling canonicalizes
+ * to `\\?\UNC\…` — so the check is "namespaced form starts with
+ * `\\?\UNC\` (or `\\.\UNC\`)". Drive-local forms (`C:\…`,
+ * `\\?\C:\…`), other device paths (`\\.\pipe\…`), relative paths
+ * (resolved against a local cwd), and server-only `\\srv` (no
+ * share) are all false.
+ *
+ * The broker uses this to skip `stat`/`realpath` on UNC **literals**
+ * (see {@link normalizePathForSandbox}): any such call is an SMB
+ * request carrying the **real user's** NTLM credentials to whatever
+ * host the path names — a forced-auth / path-encoded-exfil channel
+ * if the path is model-influenced. Literals pass through raw
+ * (resolution failures surface at `srt-win` stamp/grant time); a
+ * UNC **glob** still walks the share with real-user credentials —
+ * the user consented by naming their own share in the config.
+ * Defense-in-depth: the primary embedder already gates
+ * model-provided cwd/paths upstream.
+ */
+export function isUncPath(p: string): boolean {
+  const ns = path.win32.toNamespacedPath(p)
+  // Already-namespaced input passes through `toNamespacedPath`
+  // verbatim (casing and separators preserved), so match the UNC
+  // marker case-insensitively with either separator. `[?.]` also
+  // catches the device-namespace `\\.\UNC\…` form — that is a real
+  // network access, not a local device.
+  return /^[\\/]{2}[?.][\\/]unc[\\/]/i.test(ns)
+}
+
+/**
  * Remove trailing /** glob suffix from a path pattern
  * Used to normalize path patterns since /** just means "directory and everything under it"
  */
@@ -289,6 +322,30 @@ export function normalizePathForSandbox(pathPattern: string): string {
     if (/^[a-z]:/.test(pathPattern)) {
       pathPattern = pathPattern[0].toUpperCase() + pathPattern.slice(1)
     }
+    // UNC literal: return as-is (separators normalised only) — no
+    // stat/realpath. A UNC *glob* falls through to the glob walk
+    // below (user-trusted share). See {@link isUncPath}.
+    if (isUncPath(pathPattern) && !containsGlobCharsWin(pathPattern)) {
+      return path.win32.normalize(pathPattern)
+    }
+  }
+  // POSIX: strip trailing slashes from non-glob spellings before any
+  // resolution. Consumers on the Linux and macOS paths compare spellings by
+  // exact match and `path + '/'` prefixes — which a preserved slash silently
+  // defeats ('<dir>//') — and the realpath-acceptance checks below treat a
+  // slash-only difference as a mismatch. bwrap binds and sbpl subpath
+  // filters treat 'dir' and 'dir/' identically, so only the comparisons
+  // change. Glob spellings are left untouched: a slash after a glob segment
+  // is semantic ('/x/*/' compiles to a different regex than '/x/*'). On
+  // Windows a trailing separator is the directory marker for absent deny
+  // targets (srt#404) and must survive.
+  if (
+    getPlatform() !== 'windows' &&
+    pathPattern.endsWith('/') &&
+    pathPattern !== '/' &&
+    !containsGlobCharsForPlatform(pathPattern)
+  ) {
+    pathPattern = pathPattern.replace(/\/+$/, '') || '/'
   }
   let normalizedPath = expandTilde(pathPattern)
 
@@ -407,11 +464,21 @@ export function generateProxyEnvVars(
   caCertPath?: string,
   proxyAuthToken?: string,
   skipTmpdir?: boolean,
+  encodedCommand?: string,
 ): string[] {
   // When the proxy requires auth, embed the credential in the URL so clients
   // send Proxy-Authorization automatically. Only the sandbox child sees this
   // env, so the token never reaches host processes.
-  const auth = proxyAuthToken ? `srt:${proxyAuthToken}@` : ''
+  //
+  // The username carries the per-command encodedCommand so the proxy can
+  // attribute denials to a specific invocation (see
+  // SandboxViolationStore). Standard base64 is percent-encoded in the URL so
+  // `+/=` survive userinfo parsing; clients URL-decode before building the
+  // Basic header / RFC 1929 frame, so the proxy receives the raw base64.
+  const userRaw = proxyUsernameFor(encodedCommand)
+  const userPct =
+    userRaw === PROXY_AUTH_USER ? userRaw : encodeURIComponent(userRaw)
+  const auth = proxyAuthToken ? `${userPct}:${proxyAuthToken}@` : ''
   const envVars: string[] = [`SANDBOX_RUNTIME=1`]
   // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
   // allows (getDefaultWritePaths). When filesystem policy is disabled
@@ -525,7 +592,9 @@ export function generateProxyEnvVars(
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
       // socat is already a required Linux sandbox dependency, and PROXY: is
       // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
-      const socatAuth = proxyAuthToken ? `,proxyauth=srt:${proxyAuthToken}` : ''
+      const socatAuth = proxyAuthToken
+        ? `,proxyauth=${userRaw}:${proxyAuthToken}`
+        : ''
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
       )
@@ -573,7 +642,7 @@ export function generateProxyEnvVars(
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
       if (proxyAuthToken) {
-        envVars.push(`CLOUDSDK_PROXY_USERNAME=srt`)
+        envVars.push(`CLOUDSDK_PROXY_USERNAME=${userRaw}`)
         envVars.push(`CLOUDSDK_PROXY_PASSWORD=${proxyAuthToken}`)
       }
     }
@@ -595,6 +664,124 @@ export function generateProxyEnvVars(
 }
 
 /**
+ * `safe.directory` entries above this count collapse to a single
+ * `safe.directory=*`. Keeps `GIT_CONFIG_COUNT` (and the argv it rides
+ * on) bounded when the safe-dir set is wide.
+ */
+const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
+
+/**
+ * Build the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` /
+ * `GIT_CONFIG_VALUE_<n>` env-var set for the sandboxed child.
+ *
+ * Emits:
+ *   - `safe.directory=<dir>` for each entry in `safeDirs` (or one
+ *     `safe.directory=*` when the list is long) — inside the sandbox
+ *     the working tree is owned by a different user (Windows: the
+ *     real user vs `srt-sandbox`; Linux: unmapped uid under
+ *     `bwrap --unshare-user`), so git refuses with "detected dubious
+ *     ownership" without it.
+ *   - `http.schannelUseSSLCAInfo=true` and
+ *     `http.schannelCheckRevoke=false` when `schannelCa` (Windows
+ *     only) — makes git's schannel backend honor `GIT_SSL_CAINFO`
+ *     without `-c http.sslBackend=openssl`. Revocation is disabled
+ *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
+ *     be WFP-fenced.
+ *
+ * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
+ * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the
+ * new total. `baseEnv` should reflect what the child will actually
+ * see: on Windows the two-hop launch means the broker's own
+ * `process.env` never reaches the child, so `baseEnv` is the caller
+ * overlay (`WindowsSandboxParams.setEnvVars`); on Linux/macOS the
+ * child inherits `process.env`, so callers use
+ * {@link buildPosixGitSafeDirEnv} (which folds in `process.env`,
+ * `unsetEnvVars`, and `setEnvVars`).
+ *
+ * Paths are emitted with forward slashes so the value survives
+ * msys2's env conversion untouched and native git accepts it (a
+ * no-op on POSIX paths).
+ */
+export function buildGitConfigEnv(opts: {
+  safeDirs: readonly string[]
+  /** Windows-only schannel knobs; default false. */
+  schannelCa?: boolean
+  baseEnv?: Readonly<Record<string, string | undefined>>
+}): Record<string, string> {
+  // An explicit `GIT_CONFIG_COUNT=0` in baseEnv is an opt-out ("no
+  // env-level git config") — respect it rather than overwriting.
+  if (opts.baseEnv?.GIT_CONFIG_COUNT === '0') return {}
+  const parsed = Number.parseInt(opts.baseEnv?.GIT_CONFIG_COUNT ?? '', 10)
+  const start = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+  let n = start
+  const out: Record<string, string> = {}
+  const emit = (key: string, value: string) => {
+    out[`GIT_CONFIG_KEY_${n}`] = key
+    out[`GIT_CONFIG_VALUE_${n}`] = value
+    n++
+  }
+  const dirs = [
+    ...new Set(
+      opts.safeDirs
+        .filter((d): d is string => !!d)
+        .map(d => {
+          const fwd = d.replace(/\\/g, '/')
+          const stripped = fwd.replace(/\/+$/, '')
+          // Don't strip the trailing slash off a bare root: `C:`
+          // is drive-relative-cwd (git wants `C:/`), and `` is
+          // git's list-reset sentinel for safe.directory (would
+          // wipe preceding entries) — POSIX `/` must stay `/`.
+          if (stripped === '' || /^[A-Za-z]:$/.test(stripped)) {
+            return `${stripped}/`
+          }
+          return stripped
+        }),
+    ),
+  ]
+  if (dirs.length > SAFE_DIRECTORY_WILDCARD_THRESHOLD) {
+    emit('safe.directory', '*')
+  } else {
+    // git matches safe.directory against the REPO TOP-LEVEL exactly,
+    // so a workspace root doesn't cover a nested repo. Emit both the
+    // exact path and the `<dir>/*` glob (git ≥2.46) so any repo
+    // at-or-under a granted dir is trusted. Roots keep their trailing
+    // `/`; don't double it in the glob (`//*` never wildmatches).
+    for (const d of dirs) {
+      emit('safe.directory', d)
+      emit('safe.directory', d.endsWith('/') ? `${d}*` : `${d}/*`)
+    }
+  }
+  if (opts.schannelCa) {
+    emit('http.schannelUseSSLCAInfo', 'true')
+    emit('http.schannelCheckRevoke', 'false')
+  }
+  if (n === start) return {}
+  out.GIT_CONFIG_COUNT = String(n)
+  return out
+}
+
+/**
+ * POSIX-side wrapper over {@link buildGitConfigEnv} that constructs
+ * the correct `baseEnv` for a Linux/macOS sandbox: the child inherits
+ * `process.env` under bwrap/sandbox-exec, then `unsetEnvVars` are
+ * dropped and `setEnvVars` overlaid — so numbering must continue from
+ * whatever `GIT_CONFIG_COUNT` survives that. Shared by
+ * `wrapCommandWithSandbox{Linux,MacOS}`.
+ */
+export function buildPosixGitSafeDirEnv(opts: {
+  safeDirs: readonly string[]
+  unsetEnvVars?: readonly string[]
+  setEnvVars?: Readonly<Record<string, string>>
+}): Record<string, string> {
+  const baseEnv: Record<string, string | undefined> = {
+    GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+  }
+  for (const k of opts.unsetEnvVars ?? []) delete baseEnv[k]
+  Object.assign(baseEnv, opts.setEnvVars ?? {})
+  return buildGitConfigEnv({ safeDirs: opts.safeDirs, baseEnv })
+}
+
+/**
  * Encode a command for sandbox monitoring
  * Truncates to 100 chars and base64 encodes to avoid parsing issues
  */
@@ -608,6 +795,38 @@ export function encodeSandboxedCommand(command: string): string {
  */
 export function decodeSandboxedCommand(encodedCommand: string): string {
   return Buffer.from(encodedCommand, 'base64').toString('utf8')
+}
+
+/** Base proxy username; the auth token is the credential, this is a label. */
+export const PROXY_AUTH_USER = 'srt'
+
+/**
+ * Build the proxy username for a sandboxed command: `srt.<encodedCommand>`
+ * so the proxy can attribute a denial to the invocation that triggered it,
+ * or bare `srt` when there is nothing to attribute. RFC 1929 caps the
+ * SOCKS5 username at 255 bytes; a multibyte command whose 100-code-unit
+ * truncation still base64s past that would fail the SOCKS handshake, so
+ * fall back to bare `srt` (attribution is lost, connectivity is not).
+ */
+export function proxyUsernameFor(encodedCommand: string | undefined): string {
+  if (!encodedCommand) return PROXY_AUTH_USER
+  const user = `${PROXY_AUTH_USER}.${encodedCommand}`
+  return Buffer.byteLength(user) <= 255 ? user : PROXY_AUTH_USER
+}
+
+/**
+ * Inverse of {@link proxyUsernameFor}: extract the encodedCommand suffix
+ * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
+ * The username is client-controlled inside the sandbox, so a forged suffix
+ * can only misattribute a denial in the violation report — it cannot
+ * authenticate (the token does that) or reach another command's data.
+ */
+export function encodedCommandFromProxyUser(
+  username: string | undefined,
+): string | undefined {
+  if (!username || !username.startsWith(`${PROXY_AUTH_USER}.`)) return undefined
+  const suffix = username.slice(PROXY_AUTH_USER.length + 1)
+  return suffix || undefined
 }
 
 /**

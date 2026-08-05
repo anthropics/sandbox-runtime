@@ -7,50 +7,91 @@ import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
-import { isInjectHostCoveredByAllowedDomains } from './domain-pattern.js'
+import {
+  isInjectHostCoveredByAllowedDomains,
+  splitDomainPatternPort,
+  stripDomainPatternPort,
+} from './domain-pattern.js'
+
+/**
+ * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
+ * protocols, paths, ports, and overly broad wildcards.
+ */
+function isValidDomainPattern(val: string): boolean {
+  // Reject protocols, paths, ports, etc.
+  if (val.includes('://') || val.includes('/') || val.includes(':')) {
+    return false
+  }
+
+  // Allow localhost
+  if (val === 'localhost') return true
+
+  // Allow wildcard domains like *.example.com
+  if (val.startsWith('*.')) {
+    const domain = val.slice(2)
+    // After the *. there must be a valid domain with at least one more dot
+    // e.g., *.example.com is valid, *.com is not (too broad)
+    if (
+      !domain.includes('.') ||
+      domain.startsWith('.') ||
+      domain.endsWith('.')
+    ) {
+      return false
+    }
+    // Count dots - must have at least 2 parts after the wildcard (e.g., example.com)
+    const parts = domain.split('.')
+    return parts.length >= 2 && parts.every(p => p.length > 0)
+  }
+
+  // Reject any other use of wildcards (e.g., *, *., etc.)
+  if (val.includes('*')) {
+    return false
+  }
+
+  // Regular domains must have at least one dot and only valid characters
+  return val.includes('.') && !val.startsWith('.') && !val.endsWith('.')
+}
+
+const DOMAIN_PATTERN_MESSAGE =
+  'Invalid domain pattern. Must be a valid domain (e.g., "example.com") or wildcard (e.g., "*.example.com"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
  * Validates that domain patterns are safe and don't include overly broad wildcards
  */
-const domainPatternSchema = z.string().refine(
+const domainPatternSchema = z
+  .string()
+  .refine(isValidDomainPattern, { message: DOMAIN_PATTERN_MESSAGE })
+
+/**
+ * Domain pattern with an optional `:port` suffix (e.g., "example.com:443",
+ * "*.npmjs.org:8443"). Used for allowedDomains / deniedDomains, where the
+ * proxy knows the destination port; an entry without a port matches any port.
+ */
+const domainPortPatternSchema = z
+  .string()
+  .refine(
+    val => isValidDomainPattern(splitDomainPatternPort(val).hostPattern),
+    {
+      message:
+        DOMAIN_PATTERN_MESSAGE +
+        ' An optional ":port" suffix (1-65535) restricts the entry to that port.',
+    },
+  )
+
+/**
+ * deniedDomains entry: a domainPortPattern, or a bare "*" / "*:port"
+ * (deny-all, optionally per-port).
+ */
+const deniedDomainPatternSchema = z.string().refine(
   val => {
-    // Reject protocols, paths, ports, etc.
-    if (val.includes('://') || val.includes('/') || val.includes(':')) {
-      return false
-    }
-
-    // Allow localhost
-    if (val === 'localhost') return true
-
-    // Allow wildcard domains like *.example.com
-    if (val.startsWith('*.')) {
-      const domain = val.slice(2)
-      // After the *. there must be a valid domain with at least one more dot
-      // e.g., *.example.com is valid, *.com is not (too broad)
-      if (
-        !domain.includes('.') ||
-        domain.startsWith('.') ||
-        domain.endsWith('.')
-      ) {
-        return false
-      }
-      // Count dots - must have at least 2 parts after the wildcard (e.g., example.com)
-      const parts = domain.split('.')
-      return parts.length >= 2 && parts.every(p => p.length > 0)
-    }
-
-    // Reject any other use of wildcards (e.g., *, *., etc.)
-    if (val.includes('*')) {
-      return false
-    }
-
-    // Regular domains must have at least one dot and only valid characters
-    return val.includes('.') && !val.startsWith('.') && !val.endsWith('.')
+    const { hostPattern } = splitDomainPatternPort(val)
+    return hostPattern === '*' || isValidDomainPattern(hostPattern)
   },
   {
     message:
-      'Invalid domain pattern. Must be a valid domain (e.g., "example.com") or wildcard (e.g., "*.example.com"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.',
+      DOMAIN_PATTERN_MESSAGE +
+      ' In deniedDomains a bare "*" (deny-all) is also accepted, and an optional ":port" suffix (1-65535) restricts the entry to that port.',
   },
 )
 
@@ -497,6 +538,98 @@ export const CredentialEnvVarConfigSchema = z.object({
 })
 
 /**
+ * Explicit grouping of masked env vars into an AWS credential pair for
+ * SigV4 re-signing.
+ *
+ * A SigV4 signature is an HMAC derived from the secret access key, so a
+ * client signing with a masked (fake) secret produces a signature no
+ * substitution can repair — the proxy must re-sign with the real secret.
+ * Re-signing needs the access key id, secret, and optional session token
+ * *linked* as one credential: this entry names the `credentials.envVars`
+ * entries (all `mode: "mask"`, whole-value — no `extract`/`decode`) that
+ * hold each part.
+ *
+ * The conventional trio AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+ * AWS_SESSION_TOKEN is paired automatically when those vars are masked
+ * whole-value and no explicit awsPairs entry references them — this
+ * config exists for non-standard variable names.
+ *
+ * Re-signing triggers only on requests whose signature scope references
+ * the pair's fake access key id (exact match); everything else — including
+ * requests signed with real, unmasked AWS credentials — is untouched. The
+ * substitution gate is the access-key-id entry's `injectHosts` (defaulting
+ * to network.allowedDomains); the secret/session-token entries' own
+ * injectHosts are not consulted for re-signing.
+ */
+export const AwsPairConfigSchema = z
+  .object({
+    accessKeyIdVar: envVarNameSchema.describe(
+      'Name of the masked env var holding the AWS access key id.',
+    ),
+    secretAccessKeyVar: envVarNameSchema.describe(
+      'Name of the masked env var holding the AWS secret access key.',
+    ),
+    sessionTokenVar: envVarNameSchema
+      .optional()
+      .describe(
+        'Optional name of the masked env var holding the AWS session ' +
+          'token (temporary credentials). When set, the proxy sends the ' +
+          'real token as x-amz-security-token on re-signed requests and ' +
+          'adds it to the signed header set if the client did not.',
+      ),
+  })
+  .strict()
+
+const sigv4PolicySchema = z.enum(['deny', 'passthrough'])
+
+/**
+ * Per-shape policy for AWS SigV4 request forms the proxy cannot re-sign.
+ * Applies only to requests whose signature references a masked pair's
+ * fake access key id; requests signed with unmasked credentials are never
+ * affected.
+ *
+ * - `"deny"` (default): fail closed with a 403 naming the case, so the
+ *   sandboxed client sees a policy block instead of a confusing upstream
+ *   signature error.
+ * - `"passthrough"`: forward the request without re-signing. Ordinary
+ *   header substitution still applies, but the signature was computed
+ *   from the masked placeholder secret, so the upstream will reject it —
+ *   set this only when that failure mode is preferable to a proxy denial.
+ *
+ * Re-signable header-SigV4 requests that sign a literal body hash are
+ * buffered (up to 64 MiB — MAX_SIGV4_RESIGN_BODY_BYTES in
+ * tls-terminate-proxy.ts) so the hash can be recomputed over the bytes
+ * actually forwarded; larger bodies are denied with a 403. Payloads
+ * signed as UNSIGNED-PAYLOAD stream through without buffering.
+ */
+export const Sigv4ConfigSchema = z
+  .object({
+    streaming: sigv4PolicySchema
+      .optional()
+      .describe(
+        'Policy for aws-chunked streaming uploads (x-amz-content-sha256: ' +
+          'STREAMING-*): per-chunk signatures chain off the seed ' +
+          'signature, so re-signing would require rewriting the body. ' +
+          'Default "deny".',
+      ),
+    presigned: sigv4PolicySchema
+      .optional()
+      .describe(
+        'Policy for presigned URLs (X-Amz-Algorithm/X-Amz-Signature in ' +
+          'the query, no Authorization header): the signature lives in ' +
+          'the URL itself. Default "deny".',
+      ),
+    sigv4a: sigv4PolicySchema
+      .optional()
+      .describe(
+        'Policy for SigV4A (AWS4-ECDSA-P256-SHA256) asymmetric ' +
+          'signatures: there is no shared-key HMAC to recompute. ' +
+          'Default "deny".',
+      ),
+  })
+  .strict()
+
+/**
  * Credentials configuration schema for validation.
  *
  * Declares credential sources (files and environment variables) with a
@@ -528,6 +661,20 @@ export const CredentialsConfigSchema = z
           'is unverified and the credential travels in cleartext. Set only ' +
           'for trusted-network test fixtures.',
       ),
+    awsPairs: z
+      .array(AwsPairConfigSchema)
+      .optional()
+      .describe(
+        'Explicit groupings of masked env vars into AWS credential pairs ' +
+          'for SigV4 re-signing, for non-standard variable names. The ' +
+          'conventional AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / ' +
+          'AWS_SESSION_TOKEN trio is paired automatically when masked.',
+      ),
+    sigv4: Sigv4ConfigSchema.optional().describe(
+      'Policies for AWS SigV4 request shapes the proxy cannot re-sign ' +
+        '(streaming, presigned, sigv4a) when they reference a masked ' +
+        'credential pair: "deny" (default) or "passthrough".',
+    ),
   })
   // Reject unknown keys so a stale `credentials.injectHosts` (the removed
   // block-level default) fails loudly instead of being silently stripped.
@@ -538,12 +685,24 @@ export const CredentialsConfigSchema = z
  */
 export const NetworkConfigSchema = z.object({
   allowedDomains: z
-    .array(domainPatternSchema)
-    .describe('List of allowed domains (e.g., ["github.com", "*.npmjs.org"])'),
-  deniedDomains: z
-    .array(z.union([z.literal('*'), domainPatternSchema]))
+    .array(domainPortPatternSchema)
     .describe(
-      'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all).',
+      'List of allowed domains (e.g., ["github.com", "*.npmjs.org", "api.example.com:443"]). ' +
+        'An optional ":port" suffix restricts the entry to that destination port.',
+    ),
+  deniedDomains: z
+    .array(deniedDomainPatternSchema)
+    .describe(
+      'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all). ' +
+        'An optional ":port" suffix (e.g., "*:22") restricts the entry to that destination port.',
+    ),
+  deniedDomainReasons: z
+    .record(z.string(), z.string().min(1))
+    .optional()
+    .describe(
+      'Optional model-facing reason keyed by the exact deniedDomains entry it explains (e.g., {"github.com:22": "SSH pushes to GitHub are blocked; use an https remote"}). ' +
+        'Reported in the <sandbox_violations> line when that entry denies a connection; entries without one use a generic reason. ' +
+        'Keys are matched by exact entry string, so a key with no matching deniedDomains entry never fires.',
     ),
   strictAllowlist: z
     .boolean()
@@ -637,8 +796,11 @@ export const NetworkConfigSchema = z.object({
         .describe(
           'Path to a PEM-encoded CA certificate. The sandboxed child is ' +
             'configured to trust this CA, and the TLS-terminating proxy uses ' +
-            'it to sign per-host certificates. If omitted, SRT generates an ' +
-            'ephemeral CA into a temp directory for the lifetime of the ' +
+            'it to sign per-host certificates. If omitted, on Windows SRT ' +
+            'generates-if-absent a persistent CA under ' +
+            '%LOCALAPPDATA%\\sandbox-runtime\\ca\\ and trusts it in the ' +
+            "sandbox user's Root store; on other platforms SRT generates " +
+            'an ephemeral CA into a temp directory for the lifetime of the ' +
             'session.',
         ),
       caKeyPath: z
@@ -759,6 +921,23 @@ export const RipgrepConfigSchema = z.object({
 })
 
 /**
+ * Git configuration schema (cross-platform). Injected via
+ * `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`
+ * env vars — see `buildGitConfigEnv` in `sandbox-utils.ts`.
+ */
+export const GitConfigSchema = z.object({
+  safeDirectories: z
+    .array(z.string())
+    .default([])
+    .describe(
+      'Directories git should treat as safe (`safe.directory`) even though ' +
+        "they're owned by a different user inside the sandbox. Use for the " +
+        'repo top-level when launching from a subdirectory. Does NOT grant ' +
+        'write.',
+    ),
+})
+
+/**
  * Configuration for locating/invoking the `srt-win` helper (Windows
  * only). An embedder that links `srt-win`'s CLI into its own
  * multicall binary points `path` at that binary; spawns then pass
@@ -774,12 +953,13 @@ export const SrtWinConfigSchema = z.object({
   path: z
     .string()
     .min(1)
-    .optional()
     .describe(
-      'Path to the srt-win binary. When unset, getSrtWinPath() resolves ' +
-        'the packaged vendor/srt-win/<arch>/srt-win.exe. When set, the ' +
-        'binary is spawned with the `--srt-win` argv[1] sentinel so a ' +
-        "multicall dispatcher can route to srt-win's CLI.",
+      'Path to the srt-win binary. Pass the exported ' +
+        'VENDORED_SRT_WIN_EXE constant to use the packaged ' +
+        'vendor/srt-win/<arch>/srt-win.exe (see its WARNING: in a dev ' +
+        'checkout that file may sit inside your sandbox write grant). ' +
+        'The binary is spawned with the `--srt-win` argv[1] sentinel so ' +
+        "a multicall dispatcher can route to srt-win's CLI.",
     ),
 })
 
@@ -834,9 +1014,9 @@ export const WindowsConfigSchema = z.object({
         'permit only covers ports in that range.',
     ),
   srtWin: SrtWinConfigSchema.optional().describe(
-    'How to locate/invoke the srt-win helper binary. Omit to resolve the ' +
-      'packaged vendor binary; set when embedding srt-win into a multicall ' +
-      'binary.',
+    'How to locate/invoke the srt-win helper binary. `srtWin.path` is ' +
+      'required to use the Windows sandbox — your own (multicall) binary, ' +
+      'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
   ),
 })
 
@@ -933,6 +1113,11 @@ export const SandboxRuntimeConfigSchema = z
     windows: WindowsConfigSchema.optional().describe(
       'Windows-specific settings (WFP sublayer, proxy port range).',
     ),
+    git: GitConfigSchema.optional().describe(
+      'Git configuration to inject via GIT_CONFIG_* env vars ' +
+        '(cross-platform). `safeDirectories` marks paths as ' +
+        '`safe.directory` without adding them to `filesystem.allowWrite`.',
+    ),
   })
   .superRefine((cfg, ctx) => {
     const creds = cfg.credentials
@@ -942,13 +1127,15 @@ export const SandboxRuntimeConfigSchema = z
     // allowedDomains — semantic (wildcard-aware) coverage, not literal
     // string membership, so `injectHosts: ['api.github.com']` is accepted
     // when `allowedDomains: ['*.github.com']`.
-    const allowed = cfg.network.allowedDomains
+    // Host-scoped view of the allowlist (":port" suffixes dropped) —
+    // injection is per-host, not per-port.
+    const allowedHosts = cfg.network.allowedDomains.map(stripDomainPatternPort)
     const checkSubset = (
       hosts: readonly string[],
       path: (string | number)[],
     ) => {
       for (const [i, host] of hosts.entries()) {
-        if (!isInjectHostCoveredByAllowedDomains(host, allowed)) {
+        if (!isInjectHostCoveredByAllowedDomains(host, allowedHosts)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: [...path, i],
@@ -1006,8 +1193,10 @@ export const SandboxRuntimeConfigSchema = z
             }
           }
         } else if (
-          allowed.length > 0 &&
-          allowed.every(p => isInjectHostCoveredByAllowedDomains(p, exclude))
+          allowedHosts.length > 0 &&
+          allowedHosts.every(p =>
+            isInjectHostCoveredByAllowedDomains(p, exclude),
+          )
         ) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
@@ -1103,6 +1292,57 @@ export const SandboxRuntimeConfigSchema = z
       }
     }
 
+    // awsPairs entries must reference whole-value masked env vars: the
+    // re-signer needs the fake value to BE the sentinel (exact-match
+    // trigger on the access key id in the credential scope) and the real
+    // value to be the entire secret. extract/decode entries violate both.
+    const seenPairVars = new Set<string>()
+    for (const [idx, pair] of (creds.awsPairs ?? []).entries()) {
+      const vars: Array<[string, string]> = [
+        ['accessKeyIdVar', pair.accessKeyIdVar],
+        ['secretAccessKeyVar', pair.secretAccessKeyVar],
+      ]
+      if (pair.sessionTokenVar !== undefined) {
+        vars.push(['sessionTokenVar', pair.sessionTokenVar])
+      }
+      for (const [field, name] of vars) {
+        const path = ['credentials', 'awsPairs', idx, field]
+        if (seenPairVars.has(name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path,
+            message:
+              `"${name}" appears in more than one awsPairs slot (within ` +
+              `or across pairs) — each variable can fill exactly one slot.`,
+          })
+          continue
+        }
+        seenPairVars.add(name)
+        const entry = (creds.envVars ?? []).find(v => v.name === name)
+        if (entry === undefined || entry.mode !== 'mask') {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path,
+            message:
+              `"${name}" does not reference a credentials.envVars entry ` +
+              `with mode "mask" — an AWS pair links already-masked ` +
+              `variables; add the entry (masking is the opt-in for ` +
+              `SigV4 re-signing).`,
+          })
+        } else if (entry.extract !== undefined || entry.decode !== undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path,
+            message:
+              `"${name}" uses extract/decode, but an AWS pair member ` +
+              `must be masked whole-value: the SigV4 trigger is an ` +
+              `exact match of the fake access key id, and the signer ` +
+              `needs the entire real value.`,
+          })
+        }
+      }
+    }
+
     // Masked credentials require the TLS-terminated proxy path so the real
     // value is only sent to a cert-verified upstream. allowPlaintextInject
     // is the explicit escape hatch.
@@ -1133,10 +1373,13 @@ export type CredentialEnvVarConfig = z.infer<
   typeof CredentialEnvVarConfigSchema
 >
 export type CredentialsConfig = z.infer<typeof CredentialsConfigSchema>
+export type AwsPairConfig = z.infer<typeof AwsPairConfigSchema>
+export type Sigv4Config = z.infer<typeof Sigv4ConfigSchema>
 export type IgnoreViolationsConfig = z.infer<
   typeof IgnoreViolationsConfigSchema
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
+export type GitConfig = z.infer<typeof GitConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
 export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>

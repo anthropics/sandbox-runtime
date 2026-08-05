@@ -173,6 +173,47 @@ describe('Config Validation', () => {
     }
   })
 
+  test('should accept ":port" suffixes on allowed/denied domains', () => {
+    const valid = [
+      'example.com:443',
+      '*.example.com:8080',
+      'localhost:3000',
+      'example.com:65535',
+      'example.com:1',
+    ]
+    for (const domain of valid) {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [domain], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      expect(result.success).toBe(true)
+    }
+
+    // deniedDomains additionally accepts a bare "*" with a port.
+    const denyOnly = SandboxRuntimeConfigSchema.safeParse({
+      network: { allowedDomains: [], deniedDomains: ['*:22'] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    expect(denyOnly.success).toBe(true)
+
+    const invalid = [
+      'example.com:0', // port out of range → suffix not a port → ":" in host
+      'example.com:65536',
+      'example.com:0443', // leading zero
+      'example.com:abc',
+      'example.com:80:443',
+      'example.com:', // empty suffix
+      '*:22', // "*" is deny-only, still rejected in allowedDomains
+    ]
+    for (const domain of invalid) {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [domain], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      expect(result.success).toBe(false)
+    }
+  })
+
   test('should validate config with enableWeakerNetworkIsolation', () => {
     const config = {
       network: {
@@ -444,6 +485,49 @@ describe('Config Validation', () => {
         const messages = result.error.issues.map(i => i.message).join('\n')
         expect(messages).toContain('tlsTerminate')
       }
+    })
+
+    test('injectHosts covered by a port-scoped allowedDomains entry', () => {
+      // ":port" narrows the allow to one port but the host is still
+      // reachable, so it counts as coverage; injectHosts itself stays
+      // host-only.
+      const ok = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com:443'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/gh/token',
+              mode: 'mask',
+              injectHosts: ['api.github.com'],
+            },
+          ],
+        },
+      })
+      expect(ok.success).toBe(true)
+
+      const bad = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          allowedDomains: ['api.github.com:443'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+        credentials: {
+          files: [
+            {
+              path: '~/.config/gh/token',
+              mode: 'mask',
+              injectHosts: ['api.github.com:443'],
+            },
+          ],
+        },
+      })
+      expect(bad.success).toBe(false)
     })
 
     test('accepts a masked file with per-entry injectHosts', () => {

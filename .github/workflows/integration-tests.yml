@@ -100,6 +100,11 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-aces.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      - name: Smoke-test srt-win kill-chain invariant (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-kill.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh

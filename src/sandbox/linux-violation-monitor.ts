@@ -12,6 +12,7 @@ import type {
 } from './macos-sandbox-utils.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
 import { decodeSandboxedCommand } from './sandbox-utils.js'
+import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 export interface LinuxViolationMonitorOptions {
   /**
@@ -78,11 +79,6 @@ export function startLinuxSandboxViolationMonitor(
   const sockDir = mkdtempSync(join(tmpdir(), 'srt-obs-'))
   const sockPath = join(sockDir, `s${randomBytes(4).toString('hex')}.sock`)
 
-  const wildcardPaths = ignoreViolations?.['*'] ?? []
-  const commandPatterns = ignoreViolations
-    ? Object.entries(ignoreViolations).filter(([k]) => k !== '*')
-    : []
-
   const underPrefix = (p: string, prefix: string): boolean =>
     p === prefix || p.startsWith(prefix.endsWith('/') ? prefix : prefix + '/')
 
@@ -95,18 +91,6 @@ export function startLinuxSandboxViolationMonitor(
     const norm = posix.normalize(p)
     if (denyWritePaths.some(d => underPrefix(norm, d))) return true
     return !allowWritePaths.some(a => underPrefix(norm, a))
-  }
-
-  const shouldIgnore = (path: string, command: string | undefined): boolean => {
-    if (wildcardPaths.some(w => path.includes(w))) return true
-    if (command) {
-      for (const [pattern, paths] of commandPatterns) {
-        if (command.includes(pattern) && paths.some(w => path.includes(w))) {
-          return true
-        }
-      }
-    }
-    return false
   }
 
   const handleEvent = (
@@ -134,7 +118,7 @@ export function startLinuxSandboxViolationMonitor(
         /* ignore */
       }
     }
-    if (shouldIgnore(ev.path, command)) return
+    if (shouldIgnoreViolation(ev.path, command, ignoreViolations)) return
 
     const violation: SandboxViolationEvent = {
       line: `deny ${ev.syscall ?? 'syscall'} ${ev.path}`,

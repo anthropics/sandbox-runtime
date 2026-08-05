@@ -40,6 +40,17 @@ pub fn wstr(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Overwrite `buf` with zeros using volatile writes so LLVM
+/// dead-store elimination can't remove the scrub in release. For
+/// clearing UTF-16 password buffers after `LogonUserW` /
+/// `CreateProcessWithLogonW` has consumed them.
+pub fn scrub_wstr(buf: &mut [u16]) {
+    for c in buf.iter_mut() {
+        // SAFETY: `c` is a valid, aligned, exclusive `&mut u16`.
+        unsafe { core::ptr::write_volatile(c, 0) };
+    }
+}
+
 /// Borrow a `Vec<u16>` from `wstr` as a `PCWSTR`.
 pub fn pcwstr(buf: &[u16]) -> PCWSTR {
     PCWSTR(buf.as_ptr())

@@ -18,6 +18,8 @@ param(
   [string]$ExecSublayer = '5b0e64f4-09f1-4c2e-8c97-4d2c0f4e9b7d',
   # Must match smoke-aces.ps1's default.
   [string]$AcesSublayer = 'd3a85b1c-7e92-4f6a-b1d4-8e0c5f2a9b3e',
+  # Must match smoke-kill.ps1's default.
+  [string]$KillSublayer = '4c1f7a2e-8b9d-4e3a-9f6c-1d7e5a0b8c4f',
   # Must match test/sandbox/winsrt.test.ts.
   [string]$TsSublayer = '7c1f0e90-3a2b-4f5d-9e8c-1d2e3f4a5b6c'
 )
@@ -32,6 +34,7 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $InstallSublayer
 & $Exe wfp uninstall --sublayer-guid $ExecSublayer
 & $Exe wfp uninstall --sublayer-guid $AcesSublayer
+& $Exe wfp uninstall --sublayer-guid $KillSublayer
 & $Exe wfp uninstall --sublayer-guid $TsSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
 # sublayers; the test tears down via uninstallWindowsSandbox(). This

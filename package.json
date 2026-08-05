@@ -1,6 +1,6 @@
 {
   "name": "@anthropic-ai/sandbox-runtime",
-  "version": "0.0.66",
+  "version": "0.0.70",
   "description": "Anthropic Sandbox Runtime (ASRT) - A general-purpose tool for wrapping security boundaries around arbitrary processes",
   "type": "module",
   "main": "./dist/index.js",

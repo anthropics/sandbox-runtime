@@ -79,6 +79,12 @@ export interface CredentialRestrictionConfig {
  * registered SandboxAskCallback when one exists, and is denied only when
  * no callback is registered. Hosts needing a hard block-all regardless of
  * callback behavior should use a `deniedHosts` wildcard.
+ *
+ * Entries are the raw config patterns and may carry an optional `:port`
+ * suffix (`api.example.com:443`, `*:22`) meaning "this rule applies only
+ * to that destination port". Consumers matching hosts themselves should
+ * parse the suffix (see `splitDomainPatternPort`) rather than compare the
+ * whole string; a deny-all check must accept `*:<port>` as well as `*`.
  */
 export interface NetworkRestrictionConfig {
   allowedHosts?: string[]

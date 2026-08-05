@@ -1,0 +1,5 @@
+# Vendored AWS SigV4 official test-suite vectors — collapse in diff view,
+# but keep provenance/licensing files visible.
+test/fixtures/aws-sigv4-suite/** linguist-generated=true
+test/fixtures/aws-sigv4-suite/NOTICE linguist-generated=false
+test/fixtures/aws-sigv4-suite/README.md linguist-generated=false

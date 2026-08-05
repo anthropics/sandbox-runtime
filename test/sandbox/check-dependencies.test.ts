@@ -54,3 +54,29 @@ describe('SandboxManager.checkDependencies: ripgrep', () => {
     expect(result.errors).toContain('ripgrep (custom-rg) not found')
   })
 })
+
+describe('SandboxManager.checkDependenciesAsync', () => {
+  test('returns a Promise and matches the sync result (POSIX)', async () => {
+    platformSpy.mockReturnValue('linux')
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'rg' ? null : `/usr/bin/${bin}`,
+    )
+
+    const p = SandboxManager.checkDependenciesAsync()
+    expect(p).toBeInstanceOf(Promise)
+    expect(await p).toEqual(SandboxManager.checkDependencies())
+  })
+
+  test('honours explicit ripgrepConfig.command', async () => {
+    platformSpy.mockReturnValue('linux')
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'custom-rg' ? null : `/usr/bin/${bin}`,
+    )
+
+    const result = await SandboxManager.checkDependenciesAsync({
+      command: 'custom-rg',
+    })
+
+    expect(result.errors).toContain('ripgrep (custom-rg) not found')
+  })
+})

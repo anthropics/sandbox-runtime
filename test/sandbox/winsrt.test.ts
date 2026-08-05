@@ -1,5 +1,15 @@
-import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  spyOn,
+} from 'bun:test'
+import * as child_process from 'node:child_process'
 import { spawn, spawnSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import {
   existsSync,
   mkdtempSync,
@@ -8,29 +18,43 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
-import { isWindows } from '../helpers/platform.js'
+import { isMacOS, isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
-import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import type {
+  SandboxRuntimeConfig,
+  SrtWinConfig,
+} from '../../src/sandbox/sandbox-config.js'
 import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
 import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
+  getWindowsWfpStatusAsync,
   getWindowsSandboxUserStatus,
+  getWindowsSandboxUserStatusAsync,
+  checkWindowsSandboxStatus,
+  checkWindowsSandboxStatusAsync,
+  checkWindowsDependencies,
+  checkWindowsDependenciesAsync,
   installWindowsSandbox,
+  installWindowsSandboxAsync,
   uninstallWindowsSandbox,
+  WindowsSandboxError,
   verifyWindowsWfpEgress,
   windowsTrustCa,
+  ensurePersistentWindowsCa,
+  windowsStateDir,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   resolveSrtWin,
   buildGitConfigEnv,
   SRT_WIN_DISPATCH_ARG1,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  VENDORED_SRT_WIN_EXE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
 /**
@@ -77,6 +101,14 @@ function hasTool(name: string): boolean {
   return whereAll(name).length > 0
 }
 
+// Direct helper calls (and SandboxManager configs) must thread an
+// explicit srt-win path — there is no ambient vendor fallback.
+// getSrtWinPath() picks the built exe (vendored or cargo
+// target/release) on the CI runner.
+const TEST_SRT_WIN = isWindows
+  ? resolveSrtWin({ path: getSrtWinPath() })
+  : undefined
+
 function createTestConfig(
   allowedDomains: string[] = ['example.com'],
 ): SandboxRuntimeConfig {
@@ -94,6 +126,7 @@ function createTestConfig(
     windows: {
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: [PORT_RANGE[0], PORT_RANGE[1]],
+      srtWin: isWindows ? { path: getSrtWinPath() } : undefined,
     },
   }
 }
@@ -298,7 +331,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(off.argv).not.toContain('--quiet')
   })
 
-  it('resolveSrtWin: explicit path → sentinel prepend; unset → packaged binary, no sentinel', () => {
+  it('resolveSrtWin: explicit path → used verbatim, sentinel prepend', () => {
     const set = resolveSrtWin({ path: process.execPath })
     expect(set.exe).toBe(process.execPath)
     expect(set.prependArgs).toEqual([SRT_WIN_DISPATCH_ARG1])
@@ -310,6 +343,29 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(() => resolveSrtWin({ path: '/nonexistent/srt-win.exe' })).toThrow(
       /windows\.srtWin\.path is set to '.+' but the file does not exist/,
     )
+  })
+
+  it('resolveSrtWin: no path → throws naming VENDORED_SRT_WIN_EXE', () => {
+    // No implicit vendor fallback — the message tells the embedder
+    // how to opt in explicitly.
+    expect(() => resolveSrtWin()).toThrow(
+      /set windows\.srtWin\.path[\s\S]*VENDORED_SRT_WIN_EXE/,
+    )
+    // {} (path absent at runtime despite the type) hits the same
+    // no-path branch; cast keeps tsc-test clean.
+    expect(() => resolveSrtWin({} as SrtWinConfig)).toThrow(
+      /VENDORED_SRT_WIN_EXE/,
+    )
+  })
+
+  it('VENDORED_SRT_WIN_EXE: absolute path to the arch-specific vendored exe', () => {
+    expect(isAbsolute(VENDORED_SRT_WIN_EXE)).toBe(true)
+    expect(VENDORED_SRT_WIN_EXE.split(/[\\/]/).slice(-4)).toEqual([
+      'vendor',
+      'srt-win',
+      process.arch,
+      'srt-win.exe',
+    ])
   })
 
   it('drops NO_PROXY/no_proxy from the --env overlay (WFP fences direct loopback)', () => {
@@ -382,6 +438,33 @@ describe('parseWindowsBinShell (pure, all platforms)', () => {
     expect(() =>
       parseWindowsBinShell('C:\\Program Files\\Git\\git-bash.exe'),
     ).toThrow(/unrecognised binShell/)
+  })
+})
+
+describe('WindowsSandboxError (pure, all platforms)', () => {
+  it('carries a stable .code and is instanceof Error', () => {
+    const e = new WindowsSandboxError('install_config_conflict', 'x')
+    expect(e).toBeInstanceOf(Error)
+    expect(e).toBeInstanceOf(WindowsSandboxError)
+    expect(e.code).toBe('install_config_conflict')
+    expect(e.name).toBe('WindowsSandboxError')
+    expect(e.message).toBe('x')
+    expect(e.subcommand).toBeUndefined()
+    // Spawn-helper throws set .subcommand to args[0].
+    const s = new WindowsSandboxError('srt_win_timeout', 'y', 'install')
+    expect(s.subcommand).toBe('install')
+  })
+
+  it('parseWindowsBinShell throws with .code = bin_shell_invalid', () => {
+    // Consumers branch on `.code` instead of prose-matching `.message`.
+    let err: unknown
+    try {
+      parseWindowsBinShell('zsh')
+    } catch (e) {
+      err = e
+    }
+    expect(err).toBeInstanceOf(WindowsSandboxError)
+    expect((err as WindowsSandboxError).code).toBe('bin_shell_invalid')
   })
 })
 
@@ -471,11 +554,41 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
     expect(argv.lastIndexOf('--env')).toBeLessThan(argv.indexOf('--'))
   })
 
-  it('drive-root safeDir keeps its trailing slash; explicit COUNT=0 is an opt-out', () => {
+  it('wrapCommandWithSandboxWindows: gitSafeDirectories flows to safe.directory without allowWrite', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'git status',
+      cwd: 'C:\\repo\\sub\\dir',
+      gitSafeDirectories: ['C:\\repo'],
+      srtWin,
+    })
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    // cwd (dir + dir/*) + gitSafeDirectories (dir + dir/*), no schannel
+    // knobs (no caCertPath). The repo top-level reaches safe.directory
+    // without appearing in allowWrite.
+    expect(envArgs).toContain('GIT_CONFIG_COUNT=4')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_0=safe.directory')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_0=C:/repo/sub/dir')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_1=C:/repo/sub/dir/*')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_2=safe.directory')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_2=C:/repo')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_3=C:/repo/*')
+    // No --allow-write flag exists on `srt-win exec`; the write grant
+    // is session-level. Assert gitSafeDirectories didn't leak into a
+    // per-exec deny/allow flag either.
+    expect(argv.join(' ')).not.toMatch(/--(allow|deny)-\w+ C:[/\\]repo\b/)
+  })
+
+  it('root safeDir keeps its trailing slash; explicit COUNT=0 is an opt-out', () => {
     const env = buildGitConfigEnv({ safeDirs: ['C:\\'], schannelCa: false })
     // `C:` alone is drive-relative-cwd, not the root — git wants `C:/`.
+    // Glob is `C:/*` (single slash — `//*` never wildmatches).
     expect(env.GIT_CONFIG_VALUE_0).toBe('C:/')
-    expect(env.GIT_CONFIG_VALUE_1).toBe('C://*')
+    expect(env.GIT_CONFIG_VALUE_1).toBe('C:/*')
+    // POSIX root: `/` must not strip to `` (git's list-reset sentinel).
+    const posix = buildGitConfigEnv({ safeDirs: ['/'], schannelCa: false })
+    expect(posix.GIT_CONFIG_VALUE_0).toBe('/')
+    expect(posix.GIT_CONFIG_VALUE_1).toBe('/*')
     // Explicit GIT_CONFIG_COUNT=0 in baseEnv → respect the opt-out.
     expect(
       buildGitConfigEnv({
@@ -484,6 +597,421 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
         baseEnv: { GIT_CONFIG_COUNT: '0' },
       }),
     ).toEqual({})
+  })
+
+  it.if(isMacOS)(
+    'wrapCommandWithSandboxMacOS: gitSafeDirectories alone still emits GIT_CONFIG_*',
+    async () => {
+      // Repo owned by another unix user + filesystem.disabled: no
+      // net/fs/env restriction, only safe.directory. The early-return
+      // gate must NOT swallow the emit.
+      const { wrapCommandWithSandboxMacOS } = await import(
+        '../../src/sandbox/macos-sandbox-utils.js'
+      )
+      const wrapped = wrapCommandWithSandboxMacOS({
+        command: 'git status',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: undefined,
+        gitSafeDirectories: ['/repo'],
+      })
+      expect(wrapped).toContain('GIT_CONFIG_KEY_0=safe.directory')
+      expect(wrapped).toContain('GIT_CONFIG_VALUE_0=/repo')
+      expect(wrapped).not.toBe('git status')
+    },
+  )
+})
+
+// ════════════════════════════════════════════════════════════════════
+// Async variants — sync/async parity (pure, all platforms)
+// ════════════════════════════════════════════════════════════════════
+// These pin the *Async twins to the same argv shape and result mapping
+// as the sync originals by spying on child_process.spawn/spawnSync.
+// The srtWin handle points at the test runner's own executable so
+// resolveSrtWin's existence check passes on non-Windows hosts; the
+// spies intercept before any real process is spawned.
+
+describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
+  const RAW_USER = JSON.stringify({
+    user: {
+      exists: true,
+      sid: 'S-1-5-21-1',
+      group_exists: true,
+      group_sid: 'S-1-5-21-2',
+      in_builtin_users: true,
+      in_sandbox_group: true,
+      hidden_from_logon: true,
+    },
+    cred_present: true,
+    marker_version: 1,
+    real_user_sid: 'S-1-5-21-3',
+    ca_cert_thumb: null,
+    ca_cert_pem: null,
+  })
+  const RAW_WFP = JSON.stringify({
+    state: 'installed',
+    filters: 4,
+    port_range: [60080, 60089],
+    user_sid: 'S-1-5-21-1',
+  })
+  // `srt-win status` (combined readback after install).
+  const RAW_STATUS = JSON.stringify({
+    user: JSON.parse(RAW_USER),
+    wfp: JSON.parse(RAW_WFP),
+  })
+  const stdoutFor = (argv: readonly string[]): string =>
+    argv.includes('user')
+      ? RAW_USER
+      : argv.includes('wfp')
+        ? RAW_WFP
+        : argv.includes('status')
+          ? RAW_STATUS
+          : ''
+
+  let spawnSpy: ReturnType<typeof spyOn>
+  let spawnSyncSpy: ReturnType<typeof spyOn>
+
+  // Minimal ChildProcess stand-in for runSrtWinAsync's surface:
+  // stdout/stderr readable-like, stdin writable-like, once/on,
+  // close, kill. `delayMs: Infinity` = never closes on its own
+  // (only via kill(), which closes with (null, 'SIGTERM') the way
+  // a real killed child does).
+  function mkFakeChild(
+    stdout: string,
+    status: number,
+    delayMs = 0,
+    onClose?: () => void,
+  ) {
+    const mkStream = () => {
+      const s = new EventEmitter() as EventEmitter & {
+        setEncoding(e: string): typeof s
+        end(d?: string): void
+      }
+      s.setEncoding = () => s
+      s.end = () => {}
+      return s
+    }
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: ReturnType<typeof mkStream>
+      stderr: ReturnType<typeof mkStream>
+      stdin: ReturnType<typeof mkStream>
+      kill(): boolean
+    }
+    child.stdout = mkStream()
+    child.stderr = mkStream()
+    child.stdin = mkStream()
+    child.kill = () => {
+      setImmediate(() => child.emit('close', null, 'SIGTERM'))
+      return true
+    }
+    const fire = () => {
+      onClose?.()
+      child.stdout.emit('data', stdout)
+      child.emit('close', status, null)
+    }
+    if (delayMs === Infinity) {
+      // wait for kill()
+    } else if (delayMs > 0) setTimeout(fire, delayMs)
+    else setImmediate(fire)
+    return child
+  }
+
+  const stubSpawn = (
+    behaviour: (argv: readonly string[]) => { status: number; stdout: string },
+    delayMs = 0,
+    onClose?: () => void,
+  ) => {
+    spawnSyncSpy = spyOn(child_process, 'spawnSync').mockImplementation(((
+      _exe: string,
+      argv: readonly string[],
+    ) => {
+      const b = behaviour(argv)
+      return { status: b.status, stdout: b.stdout, stderr: '', error: null }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any)
+    spawnSpy = spyOn(child_process, 'spawn').mockImplementation(((
+      _exe: string,
+      argv: readonly string[],
+    ) => {
+      const b = behaviour(argv)
+      return mkFakeChild(b.stdout, b.status, delayMs, onClose)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any)
+  }
+
+  afterEach(() => {
+    spawnSpy?.mockRestore()
+    spawnSyncSpy?.mockRestore()
+  })
+
+  it('getWindowsSandboxUserStatus{,Async}: identical argv + identical result', async () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sync = getWindowsSandboxUserStatus({ srtWin })
+    const asyn = await getWindowsSandboxUserStatusAsync({ srtWin })
+    expect(asyn).toEqual(sync)
+    expect(spawnSyncSpy.mock.calls[0].slice(0, 2)).toEqual(
+      spawnSpy.mock.calls[0].slice(0, 2),
+    )
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'user',
+      'status',
+    ])
+    expect(spawnSpy.mock.calls[0][2]).toMatchObject({ windowsHide: true })
+  })
+
+  it('getWindowsWfpStatus{,Async}: identical argv + identical result', async () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sl = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const sync = getWindowsWfpStatus({ sublayerGuid: sl, srtWin })
+    const asyn = await getWindowsWfpStatusAsync({ sublayerGuid: sl, srtWin })
+    expect(asyn).toEqual(sync)
+    expect(spawnSpy.mock.calls[0][1]).toEqual(spawnSyncSpy.mock.calls[0][1])
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'wfp',
+      'status',
+      '--sublayer-guid',
+      sl,
+    ])
+  })
+
+  it('checkWindowsSandboxStatus{,Async}: identical argv + identical result', async () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sl = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const sync = checkWindowsSandboxStatus({ sublayerGuid: sl, srtWin })
+    const asyn = await checkWindowsSandboxStatusAsync({
+      sublayerGuid: sl,
+      srtWin,
+    })
+    expect(asyn).toEqual(sync)
+    expect(spawnSpy.mock.calls[0][1]).toEqual(spawnSyncSpy.mock.calls[0][1])
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'status',
+      '--sublayer-guid',
+      sl,
+    ])
+  })
+
+  it('installWindowsSandbox{,Async}: identical install argv (all opts)', async () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const opts = {
+      sublayerGuid: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      proxyPortRange: [60080, 60089] as const,
+      sandboxUser: 'srt-sb-test',
+      force: true,
+      srtWin,
+    }
+    const sync = installWindowsSandbox(opts)
+    const asyn = await installWindowsSandboxAsync(opts)
+    expect(asyn).toEqual(sync)
+    // First call to each spy is the `install` invocation.
+    const syncArgv = spawnSyncSpy.mock.calls[0][1]
+    const asynArgv = spawnSpy.mock.calls[0][1]
+    expect(asynArgv).toEqual(syncArgv)
+    expect(asynArgv).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'install',
+      '--sublayer-guid',
+      opts.sublayerGuid,
+      '--proxy-port-range',
+      '60080-60089',
+      '--sandbox-user',
+      'srt-sb-test',
+      '--force',
+    ])
+  })
+
+  it('installWindowsSandbox: default timeout ≥ UAC TTL; opts.timeoutMs overrides', () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    // Default: 120 s (matches UAC consent auto-dismiss). The async
+    // variant computes its budget through the same installTimeoutMs
+    // helper (it arms its own timer instead of a spawn option, so
+    // there is no opts.timeout to observe there).
+    installWindowsSandbox({ srtWin })
+    expect(spawnSyncSpy.mock.calls[0][2].timeout).toBe(120_000)
+    // Explicit override.
+    installWindowsSandbox({ srtWin, timeoutMs: 300_000 })
+    expect(spawnSyncSpy.mock.calls.at(-2)?.[2].timeout).toBe(300_000)
+  })
+
+  it('installWindowsSandbox{,Async}: timeout → identical install_timeout error', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    // Sync: spawnSync kills at `timeout` and reports ETIMEDOUT.
+    spawnSyncSpy = spyOn(child_process, 'spawnSync').mockImplementation(
+      (() => ({
+        status: null,
+        signal: 'SIGTERM',
+        stdout: '',
+        stderr: '',
+        error: Object.assign(new Error('spawnSync ETIMEDOUT'), {
+          code: 'ETIMEDOUT',
+        }),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      })) as any,
+    )
+    // Async: child never closes on its own; runSrtWinAsync's own
+    // timer kills it (close(null, 'SIGTERM')).
+    spawnSpy = spyOn(child_process, 'spawn').mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (() => mkFakeChild('', 0, Infinity)) as any,
+    )
+    const grab = async (fn: () => unknown): Promise<WindowsSandboxError> => {
+      try {
+        await fn()
+      } catch (e) {
+        return e as WindowsSandboxError
+      }
+      throw new Error('expected a timeout throw')
+    }
+    const syncErr = await grab(() =>
+      installWindowsSandbox({ srtWin, timeoutMs: 30 }),
+    )
+    const asynErr = await grab(() =>
+      installWindowsSandboxAsync({ srtWin, timeoutMs: 30 }),
+    )
+    for (const e of [syncErr, asynErr]) {
+      expect(e).toBeInstanceOf(WindowsSandboxError)
+      expect(e.code).toBe('install_timeout')
+      expect(e.message).toMatch(/UAC prompt may still be open/)
+      expect(e.message).toMatch(/timed out after 30ms \(killed by SIGTERM\)/)
+    }
+    expect(asynErr.message).toBe(syncErr.message)
+  })
+
+  it('getWindowsSandboxUserStatus{,Async}: non-zero exit → identical typed error', async () => {
+    stubSpawn(() => ({ status: 1, stdout: '' }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const errs: WindowsSandboxError[] = []
+    try {
+      getWindowsSandboxUserStatus({ srtWin })
+    } catch (e) {
+      errs.push(e as WindowsSandboxError)
+    }
+    try {
+      await getWindowsSandboxUserStatusAsync({ srtWin })
+    } catch (e) {
+      errs.push(e as WindowsSandboxError)
+    }
+    expect(errs).toHaveLength(2)
+    for (const e of errs) {
+      expect(e).toBeInstanceOf(WindowsSandboxError)
+      expect(e.code).toBe('srt_win_nonzero')
+      expect(e.subcommand).toBe('user')
+    }
+    expect(errs[1].message).toBe(errs[0].message)
+  })
+
+  it('installWindowsSandbox{,Async}: exit 10 → both return {cancelled:true}', async () => {
+    stubSpawn(argv => ({
+      status: argv[1] === 'install' ? 10 : 0,
+      stdout: stdoutFor(argv),
+    }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sync = installWindowsSandbox({ srtWin })
+    const asyn = await installWindowsSandboxAsync({ srtWin })
+    expect(sync.cancelled).toBe(true)
+    expect(asyn).toEqual(sync)
+  })
+
+  it('installWindowsSandbox{,Async}: exit 13 → both throw the same message', async () => {
+    stubSpawn(() => ({ status: 13, stdout: '' }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    let syncMsg = ''
+    let asynMsg = ''
+    try {
+      installWindowsSandbox({ srtWin })
+    } catch (e) {
+      syncMsg = (e as Error).message
+    }
+    try {
+      await installWindowsSandboxAsync({ srtWin })
+    } catch (e) {
+      asynMsg = (e as Error).message
+    }
+    expect(syncMsg).toMatch(/already exist.*different/i)
+    expect(asynMsg).toBe(syncMsg)
+  })
+
+  it('installWindowsSandbox{,Async}: exit 13 → both throw install_config_conflict', async () => {
+    stubSpawn(() => ({ status: 13, stdout: '' }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const codes: string[] = []
+    try {
+      installWindowsSandbox({ srtWin })
+    } catch (e) {
+      codes.push((e as WindowsSandboxError).code)
+    }
+    try {
+      await installWindowsSandboxAsync({ srtWin })
+    } catch (e) {
+      codes.push((e as WindowsSandboxError).code)
+    }
+    expect(codes).toEqual([
+      'install_config_conflict',
+      'install_config_conflict',
+    ])
+  })
+
+  it('checkWindowsDependencies{,Async}: identical result (ok, unprovisioned, spawn-fail)', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    // ok
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    expect(await checkWindowsDependenciesAsync({ srtWin })).toEqual(
+      checkWindowsDependencies({ srtWin }),
+    )
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    // user not provisioned → same errors[]
+    const unprov = JSON.stringify({
+      ...JSON.parse(RAW_USER),
+      user: { ...JSON.parse(RAW_USER).user, exists: false },
+      cred_present: false,
+    })
+    stubSpawn(argv => ({
+      status: 0,
+      stdout: argv.includes('user') ? unprov : RAW_WFP,
+    }))
+    const sync = checkWindowsDependencies({ srtWin })
+    const asyn = await checkWindowsDependenciesAsync({ srtWin })
+    expect(sync.errors.length).toBe(1)
+    expect(asyn).toEqual(sync)
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    // user-status probe non-zero → same short-circuit; sync variant
+    // must NOT spawn wfp-status (pins the pre-existing behaviour).
+    stubSpawn(argv => ({
+      status: argv.includes('user') ? 1 : 0,
+      stdout: argv.includes('user') ? '' : RAW_WFP,
+    }))
+    const syncFail = checkWindowsDependencies({ srtWin })
+    expect(spawnSyncSpy.mock.calls.length).toBe(1)
+    const asynFail = await checkWindowsDependenciesAsync({ srtWin })
+    expect(syncFail.errors[0]).toMatch(/user status failed/)
+    expect(asynFail).toEqual(syncFail)
+  })
+
+  it('checkWindowsDependenciesAsync: probes run concurrently', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    let inFlight = 0
+    let maxInFlight = 0
+    stubSpawn(
+      argv => {
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        return { status: 0, stdout: stdoutFor(argv) }
+      },
+      20,
+      () => inFlight--,
+    )
+    await checkWindowsDependenciesAsync({ srtWin })
+    expect(maxInFlight).toBe(2)
   })
 })
 
@@ -500,6 +1028,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     const { argv } = wrapCommandWithSandboxWindows({
       command: cmd,
       binShell: parseWindowsBinShell(bashPath),
+      srtWin: TEST_SRT_WIN,
     })
     expect(argv.slice(-3)).toEqual([bashPath, '-c', cmd])
     expect(argv).not.toContain('/c')
@@ -509,10 +1038,34 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('getWindowsWfpStatus reports absent for a never-installed sublayer', () => {
     const ws = getWindowsWfpStatus({
       sublayerGuid: '11111111-2222-3333-4444-555555555555',
+      srtWin: TEST_SRT_WIN,
     })
     expect(ws.state).toBe('absent')
     expect(ws.filters).toBe(0)
   })
+
+  it('async twins: real-spawn parity with sync (status + dependency check)', async () => {
+    // No spies — this drives the real srt-win.exe via spawn() and
+    // spawnSync() and asserts the async result equals the sync one.
+    const sl = '11111111-2222-3333-4444-555555555555'
+    expect(
+      await getWindowsWfpStatusAsync({
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      }),
+    ).toEqual(getWindowsWfpStatus({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }))
+    expect(
+      await getWindowsSandboxUserStatusAsync({ srtWin: TEST_SRT_WIN }),
+    ).toEqual(getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN }))
+    expect(
+      await checkWindowsDependenciesAsync({
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      }),
+    ).toEqual(
+      checkWindowsDependencies({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }),
+    )
+  }, 30_000)
 
   // The non-elevated readiness check that initialize() runs.
   // Hermetic sublayer + full-uninstall in finally so the
@@ -522,13 +1075,17 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     installWindowsSandbox({
       sublayerGuid: sl,
       proxyPortRange: PORT_RANGE,
+      srtWin: TEST_SRT_WIN,
     })
     try {
       // Fence active: WFP block-user filter fires at
       // ALE_AUTH_CONNECT before any packet leaves → WSAEACCES. The
       // probe binds a local out-of-range loopback listener; no
       // external host involved.
-      const v = await verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE })
+      const v = await verifyWindowsWfpEgress({
+        proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
+      })
       expect(v.target).toMatch(/^127\.0\.0\.1:\d+$/)
       // Filters removed, sandbox user kept → fence inactive →
       // throws. This is the throw initialize() relays when a stale
@@ -537,13 +1094,20 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       // matches both the exit-3 (`is not active`) and exit-2
       // (`could not be verified`) messages — either is correct
       // fail-closed behaviour.
-      uninstallWindowsSandbox({ sublayerGuid: sl, keepUser: true })
+      uninstallWindowsSandbox({
+        sublayerGuid: sl,
+        keepUser: true,
+        srtWin: TEST_SRT_WIN,
+      })
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
       await expect(
-        verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE }),
+        verifyWindowsWfpEgress({
+          proxyPortRange: PORT_RANGE,
+          srtWin: TEST_SRT_WIN,
+        }),
       ).rejects.toThrow(/WFP egress fence/i)
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl })
+      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
     }
   }, 60_000)
 
@@ -556,6 +1120,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       const r = installWindowsSandbox({
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
       })
       expect(r.cancelled).toBeUndefined()
       expect(r.wfp.state).toBe('installed')
@@ -570,18 +1135,33 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.user.credPresent).toBe(true)
       expect(r.user.markerVersion).toBe(1)
       expect(r.wfp.userSid).toBe(r.user.sid)
+      // Combined `srt-win status` returns the same objects the two
+      // per-noun calls do (one spawn instead of two).
+      const c = checkWindowsSandboxStatus({
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      })
+      expect(c.wfp).toEqual(
+        getWindowsWfpStatus({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }),
+      )
+      expect(c.user).toEqual(
+        getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN }),
+      )
       // Idempotent re-run with the SAME config also succeeds.
       const r2 = installWindowsSandbox({
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
       })
       expect(r2.cancelled).toBeUndefined()
       expect(r2.wfp.state).toBe('installed')
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl })
+      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
     }
-    expect(getWindowsWfpStatus({ sublayerGuid: sl }).state).toBe('absent')
-    const u = getWindowsSandboxUserStatus()
+    expect(
+      getWindowsWfpStatus({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }).state,
+    ).toBe('absent')
+    const u = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
     expect(u.provisioned).toBe(false)
     expect(u.credPresent).toBe(false)
     expect(u.markerVersion).toBeUndefined()
@@ -590,24 +1170,36 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('installWindowsSandbox refuses different-config without force (exit 13)', () => {
     const sl = '9e3a2fa2-5c4d-6b7f-ba0e-3f4a5b6c7d8e'
     try {
-      installWindowsSandbox({ sublayerGuid: sl, proxyPortRange: PORT_RANGE })
+      installWindowsSandbox({
+        sublayerGuid: sl,
+        proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
+      })
       // Re-install with a DIFFERENT port range under the same
-      // sublayer without force → exit 13 → throw.
-      expect(() =>
+      // sublayer without force → exit 13 → throw with a stable
+      // .code (message text is diagnostic and may change).
+      let err: unknown
+      try {
         installWindowsSandbox({
           sublayerGuid: sl,
           proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
-        }),
-      ).toThrow(/already exist.*different/i)
+          srtWin: TEST_SRT_WIN,
+        })
+      } catch (e) {
+        err = e
+      }
+      expect(err).toBeInstanceOf(WindowsSandboxError)
+      expect((err as WindowsSandboxError).code).toBe('install_config_conflict')
       // With force → succeeds and replaces.
       const r = installWindowsSandbox({
         sublayerGuid: sl,
         proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
         force: true,
+        srtWin: TEST_SRT_WIN,
       })
       expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[0] + 1])
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl })
+      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
     }
   })
 
@@ -625,6 +1217,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     installWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
+      srtWin: TEST_SRT_WIN,
     })
     const scratch = mkdtempSync(join(tmpdir(), 'srt-fsdeny-'))
     const f = join(scratch, 'secret.txt')
@@ -662,6 +1255,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     const r = installWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
+      srtWin: TEST_SRT_WIN,
     })
     if (!r.user.provisioned || !r.user.sid || !r.user.credPresent) {
       throw new Error(
@@ -680,7 +1274,10 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
   afterAll(async () => {
     await SandboxManager.reset()
-    uninstallWindowsSandbox({ sublayerGuid: TEST_SUBLAYER })
+    uninstallWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
   })
 
   it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
@@ -1076,7 +1673,7 @@ describe.if(isWindows)(
       if (inst.status !== 0) {
         throw new Error(`srt-win install failed: ${inst.stderr || inst.stdout}`)
       }
-      const us = getWindowsSandboxUserStatus()
+      const us = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
       if (!us.provisioned || !us.sid || !us.credPresent) {
         throw new Error(
           `srt-sandbox not provisioned after install: ${JSON.stringify(us)}`,
@@ -1098,6 +1695,7 @@ describe.if(isWindows)(
     async function rexec(tail: string) {
       const { argv, env } = wrapCommandWithSandboxWindows({
         command: tail,
+        srtWin: TEST_SRT_WIN,
       })
       return spawnAsync(argv[0], argv.slice(1), {
         env,
@@ -1145,6 +1743,7 @@ describe.if(isWindows)(
       const { argv, env } = wrapCommandWithSandboxWindows({
         command: `waitfor /t 30 ${nonce}`,
         quiet: false,
+        srtWin: TEST_SRT_WIN,
       })
       const broker = spawn(argv[0], argv.slice(1), { env })
       let stderr = ''
@@ -1585,18 +2184,22 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     // Reuse the network/file describes' WFP install (already
     // present in CI from the earlier suites; install when running
     // this describe in isolation).
-    const wfp = getWindowsWfpStatus({ sublayerGuid: TEST_SUBLAYER })
+    const wfp = getWindowsWfpStatus({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
     if (wfp.state !== 'installed') {
       installWindowsSandbox({
         sublayerGuid: TEST_SUBLAYER,
         proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
       })
     }
     // tlsTerminate on Windows requires the fixture CA to be
     // installed in the sandbox user's CurrentUser\Root
     // (initialize() gates on the thumbprint match). Idempotent —
     // replaces any prior install.
-    windowsTrustCa(CA_CERT)
+    windowsTrustCa(CA_CERT, { srtWin: TEST_SRT_WIN })
     await SandboxManager.initialize(createTlsTestConfig(TLS_ALLOWED))
     // Sanity: tlsTerminate config produced a CA + trust bundle.
     const ca = SandboxManager.getMitmCA()
@@ -1611,10 +2214,13 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
   afterAll(async () => {
     await SandboxManager.reset()
     // Mirror the network + H-rows describes: leave no WFP filters,
-    // sandbox user, or fixture CA behind for a subsequent local
-    // run. In CI `cleanup.ps1` sweeps regardless, but this is the
-    // last describe in the file so it owns final teardown.
-    uninstallWindowsSandbox({ sublayerGuid: TEST_SUBLAYER })
+    // sandbox user, or fixture CA behind. The P-group below
+    // re-provisions if it needs to; in CI `cleanup.ps1` sweeps
+    // regardless.
+    uninstallWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
   }, 60_000)
 
   it('G2: child sees SSL_CERT_FILE and can read the trust bundle', async () => {
@@ -1832,4 +2438,153 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     },
     120_000,
   )
+})
+
+// ────────────────────────────────────────────────────────────────────
+// Group P — persistent CA (`ensurePersistentWindowsCa` +
+// `initialize()` auto-load with `tlsTerminate: {}`).
+//
+// Separate describe from G: G's beforeAll pins the fixture CA
+// (explicit caCertPath); this group exercises the no-explicit-path
+// branch that generates-if-absent under
+// `%LOCALAPPDATA%\sandbox-runtime\ca\`.
+// ────────────────────────────────────────────────────────────────────
+
+describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
+  // bun evaluates describe bodies even under `.if(false)` — guard the
+  // top-level const so `windowsStateDir()` (throws without
+  // LOCALAPPDATA) doesn't run on macOS/Linux.
+  const caDir = isWindows ? join(windowsStateDir(), 'ca') : ''
+
+  beforeAll(async () => {
+    console.error('[winsrt P beforeAll] start')
+    // G's afterAll uninstalled — re-provision (own sublayer).
+    const wfp = getWindowsWfpStatus({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
+    if (wfp.state !== 'installed') {
+      installWindowsSandbox({
+        sublayerGuid: TEST_SUBLAYER,
+        proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
+      })
+    }
+    // Start from a clean slate so P1's `generated: true` is
+    // deterministic across repeated local runs.
+    rmSync(caDir, { recursive: true, force: true })
+    console.error('[winsrt P beforeAll] done')
+  }, 120_000)
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(caDir, { recursive: true, force: true })
+    // Last describe in the file → owns final teardown.
+    uninstallWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
+  }, 60_000)
+
+  it('P1: idempotent — first call generates, second reuses (temp dir)', async () => {
+    // Scoped to a scratch dir so this row is hermetic irrespective
+    // of what P2/P3 write to the default location.
+    const dir = mkdtempSync(join(tmpdir(), 'srt-persist-ca-'))
+    const srtWin = TEST_SRT_WIN
+    try {
+      const status = getWindowsSandboxUserStatus({ srtWin })
+      const a = await ensurePersistentWindowsCa({ dir, status, srtWin })
+      expect(a.generated).toBe(true)
+      expect(a.trusted).toBe(true)
+      expect(a.thumbprint).toMatch(/^[0-9A-F]{40}$/)
+      expect(a.certPem).toContain('BEGIN CERTIFICATE')
+      expect(a.keyPem).toContain('PRIVATE KEY')
+      // ca.json is the atomic source of truth; cert.pem/key.pem are
+      // derived siblings.
+      expect(existsSync(join(dir, 'ca.json'))).toBe(true)
+      expect(existsSync(a.certPath)).toBe(true)
+      expect(existsSync(a.keyPath)).toBe(true)
+      // Second call: same PEMs, same thumb, no regenerate. `trusted`
+      // is false — the first call's trust step recorded this thumb
+      // in state.db, so the reconcile finds it already installed.
+      const b = await ensurePersistentWindowsCa({
+        dir,
+        status: getWindowsSandboxUserStatus({ srtWin }),
+        srtWin,
+      })
+      expect(b.generated).toBe(false)
+      expect(b.trusted).toBe(false)
+      expect(b.thumbprint).toBe(a.thumbprint)
+      expect(b.certPem).toBe(a.certPem)
+      // Corrupt ca.json → regenerates (no throw).
+      writeFileSync(join(dir, 'ca.json'), 'not json')
+      const c = await ensurePersistentWindowsCa({ dir, status, srtWin })
+      expect(c.generated).toBe(true)
+      expect(c.thumbprint).not.toBe(a.thumbprint)
+      // `force` regenerates even with a valid pair on disk (via
+      // tmp+rename, so ca.json is always a matched pair).
+      const d = await ensurePersistentWindowsCa({
+        dir,
+        status,
+        srtWin,
+        force: true,
+      })
+      expect(d.generated).toBe(true)
+      expect(d.thumbprint).not.toBe(c.thumbprint)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 120_000)
+
+  it('P2: initialize() with tlsTerminate:{} auto-loads the persistent CA', async () => {
+    // No caCertPath/caKeyPath → the Windows branch of initialize()
+    // calls ensurePersistentWindowsCa(), then createMitmCA on its
+    // paths. First run generates; the returned MitmCA's certPath
+    // must be under the state-dir `ca/` (not a mkdtemp `srt-ca-`).
+    const cfg = createTestConfig(['example.com'])
+    await SandboxManager.initialize({
+      ...cfg,
+      network: { ...cfg.network, tlsTerminate: {} },
+    })
+    const ca = SandboxManager.getMitmCA()
+    expect(ca).toBeTruthy()
+    expect(ca!.ephemeral).toBe(false)
+    // Case-insensitive prefix match — Windows path casing varies.
+    expect(ca!.certPath.toLowerCase()).toBe(
+      join(caDir, 'cert.pem').toLowerCase(),
+    )
+    // `srt-win user status` now reports the same thumb the session
+    // CA carries — proves ensurePersistentWindowsCa's trust step
+    // landed and the initialize() gate would have passed the
+    // explicit-path check too.
+    const u = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
+    expect(u.caCertThumb).toBeTruthy()
+  }, 60_000)
+
+  it('P3: schannel trusts the persistent CA end-to-end (System32 curl)', async () => {
+    // Mirrors G8 but with the persistent (not fixture) CA — the
+    // load-bearing proof that an embedder passing `tlsTerminate:{}`
+    // gets working schannel-level trust with zero orchestration.
+    const sysCurl = `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\curl.exe`
+    const r = await runSandboxedUntil(
+      `"${sysCurl}" -sS -o NUL -w "%{http_code}" https://example.com/`,
+      x => x.status === 0,
+    )
+    expectStatus('P3', r, [0])
+    expect(r.stdout).toContain('200')
+  }, 60_000)
+
+  it('P4: ca.json (key custody) is unreadable from inside the sandbox', async () => {
+    // The `ca/` dir inherits the state-dir's `(OI)(CI)` real-user
+    // -only DACL + `sandbox-runtime-users` DENY. `type` from inside
+    // the sandbox must fail. Gate on stdout NOT containing the PEM
+    // header (cmd `type` exit codes are unreliable on access-denied).
+    const jsonPath = join(caDir, 'ca.json')
+    // Broker (real user) CAN read it.
+    expect(readFileSync(jsonPath, 'utf8')).toContain('PRIVATE KEY')
+    const r = await runSandboxed(`type "${jsonPath}"`)
+    expect(r.stdout).not.toContain('PRIVATE KEY')
+    // stderr should carry the access-denied — tolerant match.
+    expect(`${r.stdout} ${r.stderr}`).toMatch(/denied|Access is denied/i)
+  }, 30_000)
 })

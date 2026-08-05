@@ -70,7 +70,7 @@ impl std::str::FromStr for HolderPid {
 /// The cross-session same-user case is rare enough that we accept
 /// the limitation for v1; revisit if a real use case appears.
 const MUTEX_NAME: &str = r"Local\sandbox-runtime-acl-init";
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS brokers (
@@ -106,6 +106,19 @@ CREATE TABLE IF NOT EXISTS ace_holders (
   PRIMARY KEY (canonical_path, kind, pid)
 );
 CREATE INDEX IF NOT EXISTS ace_holders_by_pid ON ace_holders (pid);
+-- Filesystem objects `acl stamp` created (empty file at a
+-- non-existent deny target + any missing intermediate dirs) so a
+-- Deny ACE could be stamped on the exact path. Placeholders are
+-- PERMANENT once created (leave-in-place — never deleted by
+-- restore/recover, so a user who wrote into one cannot lose data).
+-- The record exists so a LATER holder denying the same or a
+-- descendant path can discover and hold the full ancestor chain
+-- (`Locked::placeholder_ancestors_of`) — otherwise releasing the
+-- creating holder would strip intermediates the later holder
+-- depends on.
+CREATE TABLE IF NOT EXISTS placeholders (
+  canonical_path TEXT PRIMARY KEY
+);
 -- Install-time setup record: the sandbox user's DPAPI-encrypted
 -- credential plus the setup marker. One row per provisioned
 -- sandbox user (currently exactly one). Additive table — no
@@ -267,7 +280,7 @@ pub fn open_db() -> Result<Connection> {
 }
 
 /// Filter on `release_aces` for the deny-ACE lifecycle.
-pub const KIND_DENY: &[&str] = &["deny", "deny_fdc"];
+pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete"];
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
 
@@ -743,7 +756,7 @@ impl Locked {
                 // it in the same pass wastes a SetSecurityInfo
                 // round-trip and clutters the failure output.
                 if one(canon, *ace)
-                    && matches!(ace, SbAce::Deny(_))
+                    && matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete)
                     && let Some(p) = path_id::canonical_parent_of(canon)
                 {
                     one(&p, SbAce::DenyFdc);
@@ -990,10 +1003,9 @@ impl Locked {
     }
 
     /// Release every ACE hold of `self.holder_pid` for the given
-    /// `kinds` (`["grant"]` for `acl revoke`;
-    /// `["deny","deny_fdc"]` for `acl restore --sandbox-user-sid`)
-    /// and unregister if no holds of any kind remain. Per-path
-    /// catch-and-continue.
+    /// `kinds` ([`KIND_GRANT`] for `acl revoke`; [`KIND_DENY`] for
+    /// `acl restore --sandbox-user-sid`) and unregister if no holds
+    /// of any kind remain. Per-path catch-and-continue.
     pub fn release_aces(
         &self,
         sandbox_sid: &str,
@@ -1023,6 +1035,43 @@ impl Locked {
         }
         Ok((out, failed))
     }
+
+    /// Record a placeholder component `acl stamp` is about to
+    /// create (see the `placeholders` table comment). Idempotent
+    /// (`INSERT OR IGNORE`); called intent-first — before the
+    /// on-disk create — so a crash between record and create leaves
+    /// a harmless orphan row rather than an unrecorded on-disk
+    /// component a later holder cannot discover.
+    pub fn record_placeholder(&self, canon: &str) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO placeholders (canonical_path) \
+                 VALUES (?1)",
+            )?
+            .execute(params![canon])
+            .with_context(|| format!("INSERT placeholders '{canon}'"))?;
+        Ok(())
+    }
+
+    /// Every recorded placeholder that is a STRICT ancestor of
+    /// `canon` (i.e. `canon` starts with `placeholder || '\'`) —
+    /// the discovery half of the full-chain hold (see the
+    /// `placeholders` table comment). The table is tiny, so filter
+    /// in Rust rather than a `LIKE` pattern that would have to
+    /// escape `?`/`_` in canonical paths.
+    pub fn placeholder_ancestors_of(&self, canon: &str) -> Result<Vec<String>> {
+        let all: Vec<String> = query_vec(
+            &self.conn,
+            "SELECT canonical_path FROM placeholders",
+            [],
+            |r| r.get(0),
+        )?;
+        let cb = canon.as_bytes();
+        Ok(all
+            .into_iter()
+            .filter(|p| cb.get(p.len()) == Some(&b'\\') && canon.starts_with(p.as_str()))
+            .collect())
+    }
 }
 
 /// Read all `working_aces` rows for `canon` and converge the on-disk
@@ -1044,6 +1093,7 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::Grant(g) => set.grant = Some(g),
             SbAce::Deny(d) => set.deny = Some(d),
             SbAce::DenyFdc => set.deny_fdc = true,
+            SbAce::DenyDelete => set.deny_delete = true,
         }
     }
     acl::apply_sandbox_aces(canon, sandbox_sid, set)
@@ -1202,18 +1252,11 @@ enum IdGate {
 /// any other open error → `Unreadable` (retryable, not a
 /// mismatch).
 fn identity_gate(path: &str, expect: FileId) -> IdGate {
-    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
     match path_id::capture_file_id(path) {
         Ok(cur) if cur == expect => IdGate::Match,
         Ok(_) => IdGate::Mismatch,
         Err(e) => {
-            let code = e.downcast_ref::<windows::core::Error>().map(|we| we.code());
-            let gone = matches!(
-                code,
-                Some(c) if c == ERROR_FILE_NOT_FOUND.into()
-                        || c == ERROR_PATH_NOT_FOUND.into()
-            );
-            if gone {
+            if path_id::is_not_found(&e) {
                 IdGate::Mismatch
             } else {
                 eprintln!(
@@ -1388,12 +1431,12 @@ mod tests {
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type='table' \
                      AND name IN ('brokers','working_aces','ace_holders', \
-                                  'sandbox_user')",
+                                  'sandbox_user','placeholders')",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(n, 4);
+            assert_eq!(n, 5);
         });
     }
 

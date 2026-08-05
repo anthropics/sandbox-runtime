@@ -10,6 +10,13 @@ import {
 } from './credential-mask-files.js'
 import { buildMaskedEnvVars } from './credential-mask-env.js'
 import {
+  AwsPairRegistry,
+  createSigv4Planner,
+  registerAwsPairs,
+  type PlanSigv4,
+} from './credential-aws-pairs.js'
+import {
+  certThumbprint,
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
@@ -19,7 +26,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import { randomBytes, X509Certificate } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import type {
   CredentialsConfig,
   SandboxRuntimeConfig,
@@ -50,6 +57,7 @@ import {
 } from './linux-violation-monitor.js'
 import {
   checkWindowsDependencies,
+  checkWindowsDependenciesAsync,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   expandWindowsFsPaths,
@@ -57,10 +65,12 @@ import {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
-  getWindowsSandboxUserStatus,
+  getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
+  ensurePersistentWindowsCa,
   verifyWindowsWfpEgress,
   resolveSrtWin,
+  WindowsSandboxError,
   type SrtWinSpawn,
   type WindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
@@ -70,8 +80,12 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  decodeSandboxedCommand,
 } from './sandbox-utils.js'
-import { SandboxViolationStore } from './sandbox-violation-store.js'
+import {
+  SandboxViolationStore,
+  shouldIgnoreViolation,
+} from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
 import type { GetBodySubstitutions } from './body-substitution.js'
 import {
@@ -80,7 +94,11 @@ import {
   redactUrl,
   resolveParentProxy,
 } from './parent-proxy.js'
-import { matchesDomainPattern } from './domain-pattern.js'
+import {
+  matchesDomainPattern,
+  matchesDomainPatternWithPort,
+  stripDomainPatternPort,
+} from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
@@ -140,6 +158,10 @@ const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
 const sentinelRegistry = new SentinelRegistry()
+// Per-session linked AWS credential pairs for SigV4 re-signing, keyed by
+// the fake access key id. Same lifecycle and secrecy posture as the
+// sentinel registry.
+const awsPairRegistry = new AwsPairRegistry()
 // Temp dir holding the sentinel-content fake files for masked credential
 // files. Created lazily on first masked file; removed on reset().
 const maskedFileStore = new MaskedFileStore()
@@ -164,14 +186,84 @@ function registerCleanup(): void {
   cleanupRegistered = true
 }
 
+/**
+ * Record a proxy-side denial in the violation store so the model sees a
+ * structured <sandbox_violations> block alongside the raw 403 / SOCKS
+ * failure in stderr — parity with the macOS seatbelt log monitor and the
+ * Linux seccomp observer. The proxy is the only component that knows the
+ * destination host of a network deny, so neither of those can produce
+ * this line. `encodedCommand` (from the proxy username) attributes it to
+ * the invocation; without one the event is stored unattributed.
+ */
+function recordProxyViolation(
+  line: string,
+  encodedCommand: string | undefined,
+): void {
+  // The proxy username is client-supplied inside the sandbox (only the
+  // password is authenticated), so the decoded command is untrusted bytes:
+  // strip control characters so a forged suffix can't inject newlines or
+  // escape sequences into whatever renders `command`.
+  const command = encodedCommand
+    ? // eslint-disable-next-line no-control-regex -- stripping control chars is the point
+      decodeSandboxedCommand(encodedCommand).replace(/[\x00-\x1f\x7f]+/g, ' ')
+    : undefined
+  // Same suppression the seatbelt / seccomp monitors apply, so a
+  // configured ignoreViolations pattern silences the event no matter
+  // which producer saw it.
+  if (shouldIgnoreViolation(line, command, config?.ignoreViolations)) {
+    return
+  }
+  sandboxViolationStore.addViolation({
+    // One physical line inside the <sandbox_violations> block: an embedder-
+    // supplied reason (deniedDomainReasons / filterRequest) must not be able
+    // to break the framing with a newline or a stray closing tag.
+    // eslint-disable-next-line no-control-regex -- stripping control chars is the point
+    line: line.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/[<>]/g, ''),
+    encodedCommand,
+    command,
+    timestamp: new Date(),
+  })
+}
+
+/**
+ * The request URL as it should appear in a model-visible violation line:
+ * origin + path, with any query string reduced to a `?…` marker (origin
+ * carries no userinfo, so an embedded `name:pass@` is dropped too). Query
+ * strings routinely carry credentials (api_key=, access_token=, signed
+ * URLs) that the sandboxed client interpolated at runtime and that were
+ * never in the model's context, so they must not enter the transcript via
+ * the <sandbox_violations> block. The full URL still reaches the embedder's
+ * filterRequest callback and its own debug logging.
+ */
+function redactUrlForViolation(url: string): string {
+  try {
+    const u = new URL(url)
+    return `${u.origin}${u.pathname}${u.search ? '?…' : ''}`
+  } catch {
+    // Not an absolute URL (shouldn't happen for proxy requests) — drop
+    // anything after '?' rather than risk leaking it.
+    const q = url.indexOf('?')
+    return q === -1 ? url : `${url.slice(0, q)}?…`
+  }
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
-  sandboxAskCallback?: SandboxAskCallback,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  encodedCommand?: string,
 ): Promise<boolean> {
+  const denied = (reason: string): false => {
+    recordProxyViolation(
+      `deny network-outbound ${host}:${port} (${reason})`,
+      encodedCommand,
+    )
+    return false
+  }
+
   if (!config) {
     logForDebugging('No config available, denying network request')
-    return false
+    return denied('sandbox policy unavailable')
   }
 
   // Reject hosts containing control characters before pattern matching.
@@ -184,7 +276,7 @@ async function filterNetworkRequest(
     logForDebugging(`Denying malformed host: ${JSON.stringify(host)}:${port}`, {
       level: 'error',
     })
-    return false
+    return denied('malformed host')
   }
 
   // Canonicalize so string comparisons match what getaddrinfo() will dial.
@@ -194,9 +286,15 @@ async function filterNetworkRequest(
 
   // Check denied domains first
   for (const deniedDomain of config.network.deniedDomains) {
-    if (matchesDomainPattern(canonicalHost, deniedDomain)) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
-      return false
+      // The matched entry's own reason when the caller supplied one, so the
+      // model reads why this destination is off-limits (and the sanctioned
+      // alternative) instead of a generic deny; keyed by the exact entry.
+      return denied(
+        config.network.deniedDomainReasons?.[deniedDomain] ??
+          'host is on the deny list',
+      )
     }
   }
 
@@ -209,7 +307,7 @@ async function filterNetworkRequest(
 
   // Check allowed domains
   for (const allowedDomain of config.network.allowedDomains) {
-    if (matchesDomainPattern(canonicalHost, allowedDomain)) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {
       logForDebugging(`Allowed by config rule: ${host}:${port}`)
       return true
     }
@@ -219,7 +317,7 @@ async function filterNetworkRequest(
   // allowlist deterministic enforcement: never fall through to the callback.
   if (!sandboxAskCallback || config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
-    return false
+    return denied('host is not on the allow list')
   }
 
   logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
@@ -228,15 +326,14 @@ async function filterNetworkRequest(
     if (userAllowed) {
       logForDebugging(`User allowed: ${host}:${port}`)
       return true
-    } else {
-      logForDebugging(`User denied: ${host}:${port}`)
-      return false
     }
+    logForDebugging(`User denied: ${host}:${port}`)
+    return denied('user denied')
   } catch (error) {
     logForDebugging(`Error in permission callback: ${error}`, {
       level: 'error',
     })
-    return false
+    return denied('permission prompt failed')
   }
 }
 
@@ -276,6 +373,25 @@ function buildBodyCredentialInjector(): GetBodySubstitutions | undefined {
   if (!config?.credentials) return undefined
   return destHost =>
     sentinelRegistry.sentinelsForHost(destHost, matchesDomainPattern)
+}
+
+/**
+ * Build the per-request SigV4 hook for the TLS-terminating proxy.
+ * Returns undefined when no `credentials` block is configured. The hook
+ * consults {@link awsPairRegistry} at request time, so pairs registered
+ * later (wrapWithSandbox runs after the proxy starts) are picked up.
+ */
+function buildSigv4Planner(): PlanSigv4 | undefined {
+  if (!config?.credentials) return undefined
+  // Re-read the policies per request (not captured at proxy start) so an
+  // updateConfig() that changes credentials.sigv4 takes effect without a
+  // proxy restart, matching how the injector sees live registry state.
+  return (method, requestTarget, headers, destHost) =>
+    createSigv4Planner(
+      awsPairRegistry,
+      config?.credentials?.sigv4,
+      matchesDomainPattern,
+    )(method, requestTarget, headers, destHost)
 }
 
 function getMitmSocketPath(host: string): string | undefined {
@@ -345,12 +461,18 @@ async function startMuxProxyServer(
   const injectCredentials = buildCredentialInjector()
   const injectBodyCredentials = buildBodyCredentialInjector()
   httpProxyServer = createHttpProxyServer({
-    filter: (port: number, host: string) =>
-      filterNetworkRequest(port, host, sandboxAskCallback),
+    filter: (port, host, _socket, encodedCommand) =>
+      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     getMitmSocketPath,
     mitmCA,
     shouldTerminateTLS: shouldTerminateTLSForHost,
     filterRequest: config?.network.filterRequest,
+    onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
+      recordProxyViolation(
+        `deny http-request ${method} ${redactUrlForViolation(url)} (${reason})`,
+        encodedCommand,
+      )
+    },
     // TLS-terminated path always gets the injector; the plain-HTTP path
     // only when explicitly opted in. Without the opt-in, a sentinel sent
     // over plain HTTP reaches the upstream unchanged (fails closed).
@@ -362,13 +484,16 @@ async function startMuxProxyServer(
     getBodySubstitutionsPlaintext: config?.credentials?.allowPlaintextInject
       ? injectBodyCredentials
       : undefined,
+    // SigV4 re-signing is TLS-terminated-path only, like credential
+    // injection: the real signature must not travel over plaintext.
+    planSigv4: buildSigv4Planner(),
     parentProxy,
     proxyAuthToken,
   })
 
   socksProxyServer = createSocksProxyServer({
-    filter: (port: number, host: string) =>
-      filterNetworkRequest(port, host, sandboxAskCallback),
+    filter: (port, host, encodedCommand) =>
+      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     parentProxy,
     proxyAuthToken,
   })
@@ -434,12 +559,25 @@ async function initialize(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
-  mitmCA = runtimeConfig.network.tlsTerminate
-    ? createMitmCA(runtimeConfig.network.tlsTerminate)
-    : undefined
+  // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
+  // defer CA creation until the Windows block below has resolved
+  // srt-win and fetched user status — the persistent CA is
+  // generated-if-absent under %LOCALAPPDATA%\sandbox-runtime\ca\ and
+  // trusted in the sandbox user's Root store, then loaded here.
+  // Explicit paths (or non-Windows) go straight to createMitmCA.
+  const tlsTerminate = runtimeConfig.network.tlsTerminate
+  const useWindowsPersistentCa =
+    getPlatform() === 'windows' &&
+    tlsTerminate !== undefined &&
+    !tlsTerminate.caCertPath &&
+    !tlsTerminate.caKeyPath
+  mitmCA =
+    tlsTerminate && !useWindowsPersistentCa
+      ? createMitmCA(tlsTerminate)
+      : undefined
 
   // Check dependencies
-  const deps = checkDependencies()
+  const deps = await checkDependenciesAsync()
   if (deps.errors.length > 0) {
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
@@ -486,10 +624,11 @@ async function initialize(
     // Resolve once (stats disk); captured module-level for wrap/reset.
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
-    const u = getWindowsSandboxUserStatus({ srtWin })
+    const u = await getWindowsSandboxUserStatusAsync({ srtWin })
     if (!u.provisioned || !u.credPresent) {
       config = undefined
-      throw new Error(
+      throw new WindowsSandboxError(
+        'not_provisioned',
         `Windows sandbox user is not provisioned (user=` +
           `${u.provisioned}, cred=${u.credPresent}). Run \`npx ` +
           `sandbox-runtime windows-install\` (one UAC prompt) to ` +
@@ -516,21 +655,39 @@ async function initialize(
       }
       windowsWfpVerified = true
     }
-    // schannel-level trust under the sandbox user is install-time
-    // (cert lifecycle = sandbox-user lifecycle), not per-session.
-    // System32 curl / IWR / .NET / default-backend git only trust
-    // what's in the sandbox user's `CurrentUser\Root` — which
-    // `srt-win exec` does not (and must not) write. Compare
-    // thumbprints so a stale install-time CA doesn't pass the gate
-    // while schannel rejects the session's proxy-minted leaves.
-    if (runtimeConfig.network.tlsTerminate && mitmCA) {
+    // Persistent-CA branch (see the deferral comment above).
+    // `ensurePersistentWindowsCa` reconciles the registry thumb
+    // itself (so initialize() after uninstall→reinstall repairs
+    // trust) and may make `u.caCertThumb` stale — hence the
+    // explicit-path thumb check below skips this branch.
+    if (useWindowsPersistentCa && tlsTerminate) {
+      try {
+        const p = await ensurePersistentWindowsCa({ status: u, srtWin })
+        mitmCA = createMitmCA({
+          caCertPem: p.certPem,
+          caKeyPem: p.keyPem,
+          caCertPath: p.certPath,
+          caKeyPath: p.keyPath,
+          extraCaCertPaths: tlsTerminate.extraCaCertPaths,
+        })
+      } catch (e) {
+        config = undefined
+        throw e
+      }
+    }
+    // Explicit-path branch: schannel clients (System32 curl, IWR,
+    // .NET, default-backend git) only trust what's in the sandbox
+    // user's `CurrentUser\Root` — which `srt-win exec` does not (and
+    // must not) write. Compare thumbprints so a stale install-time
+    // CA doesn't pass the gate while schannel rejects the session's
+    // proxy-minted leaves.
+    if (tlsTerminate && mitmCA && !useWindowsPersistentCa) {
       const installed = getWindowsSandboxCaCert(u)
-      const sessionThumb = new X509Certificate(mitmCA.certPem).fingerprint
-        .replace(/:/g, '')
-        .toUpperCase()
+      const sessionThumb = certThumbprint(mitmCA.certPem)
       if (!installed) {
         config = undefined
-        throw new Error(
+        throw new WindowsSandboxError(
+          'trust_ca_not_installed',
           `tlsTerminate on Windows requires the sandbox to be ` +
             `installed with this CA (thumb=${sessionThumb}): run ` +
             `\`srt-win user trust-ca ${mitmCA.certPath}\`. Per-exec ` +
@@ -540,7 +697,8 @@ async function initialize(
       }
       if (installed.thumb !== sessionThumb) {
         config = undefined
-        throw new Error(
+        throw new WindowsSandboxError(
+          'trust_ca_thumbprint_mismatch',
           `tlsTerminate on Windows: the sandbox's installed CA ` +
             `(thumb=${installed.thumb}) doesn't match this ` +
             `session's CA (thumb=${sessionThumb}). Run \`srt-win ` +
@@ -732,16 +890,19 @@ function isSandboxingEnabled(): boolean {
 }
 
 /**
- * Check sandbox dependencies for the current platform
- * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
- * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
+ * Platform-independent part of the dependency check. Returns either
+ * a finished result (POSIX, unsupported platform, or a Windows
+ * srt-win resolution failure) or the inputs for the Windows probe —
+ * the only platform where the sync and async variants differ.
  */
-function checkDependencies(ripgrepConfig?: {
+function checkDependenciesCommon(ripgrepConfig?: {
   command: string
   args?: string[]
-}): SandboxDependencyCheck {
+}):
+  | { done: SandboxDependencyCheck }
+  | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
   if (!isSupportedPlatform()) {
-    return { errors: ['Unsupported platform'], warnings: [] }
+    return { done: { errors: ['Unsupported platform'], warnings: [] } }
   }
 
   const errors: string[] = []
@@ -765,23 +926,53 @@ function checkDependencies(ripgrepConfig?: {
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   } else if (platform === 'windows') {
-    let srtWin: SrtWinSpawn | undefined
+    let srtWin: SrtWinSpawn
     try {
       srtWin = resolveSrtWin(config?.windows?.srtWin)
     } catch (e) {
       errors.push((e as Error).message)
-      return { errors, warnings }
+      return { done: { errors, warnings } }
     }
-    const winDeps = checkWindowsDependencies({
-      sublayerGuid:
-        config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
-      srtWin,
-    })
-    errors.push(...winDeps.errors)
-    warnings.push(...winDeps.warnings)
+    return {
+      windows: {
+        sublayerGuid:
+          config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
+        srtWin,
+      },
+    }
   }
 
-  return { errors, warnings }
+  return { done: { errors, warnings } }
+}
+
+/**
+ * Check sandbox dependencies for the current platform
+ * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
+ * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
+ */
+function checkDependencies(ripgrepConfig?: {
+  command: string
+  args?: string[]
+}): SandboxDependencyCheck {
+  const common = checkDependenciesCommon(ripgrepConfig)
+  if ('done' in common) return common.done
+  return checkWindowsDependencies(common.windows)
+}
+
+/**
+ * Async variant of {@link checkDependencies} — same result for the
+ * same underlying state. On Windows the srt-win probes run via
+ * `spawn` (never blocking the event loop) and concurrently; on other
+ * platforms the checks are native and this simply wraps the sync
+ * result. Windows callers should prefer this variant.
+ */
+async function checkDependenciesAsync(ripgrepConfig?: {
+  command: string
+  args?: string[]
+}): Promise<SandboxDependencyCheck> {
+  const common = checkDependenciesCommon(ripgrepConfig)
+  if ('done' in common) return common.done
+  return checkWindowsDependenciesAsync(common.windows)
 }
 
 /**
@@ -811,6 +1002,13 @@ function getCredentialRestrictions(
 
   const denyReadPaths = getCredentialDenyReadPaths(credentials)
 
+  // Default injectHosts (= allowedDomains) is host-scoped: drop any
+  // `:port` suffixes, otherwise the sentinel would carry an entry no bare
+  // destination host can ever match and the credential would never inject.
+  const defaultInjectHosts = [
+    ...new Set((allowedDomains ?? []).map(stripDomainPatternPort)),
+  ]
+
   const unsetEnvVars: string[] = []
   for (const v of credentials.envVars ?? []) {
     if (v.mode === 'deny') unsetEnvVars.push(v.name)
@@ -823,10 +1021,21 @@ function getCredentialRestrictions(
   // unsetEnvVars below so the value is withheld rather than exposed.
   const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
     credentials.envVars ?? [],
-    allowedDomains ?? [],
+    defaultInjectHosts,
     sentinelRegistry,
   )
   unsetEnvVars.push(...degradeToUnsetNames)
+
+  // Link masked AWS credentials into pairs so the proxy can re-sign
+  // SigV4 requests (the signature is derived from the secret; header
+  // substitution alone cannot fix it).
+  registerAwsPairs(
+    credentials.envVars ?? [],
+    credentials.awsPairs,
+    defaultInjectHosts,
+    setEnvVars,
+    awsPairRegistry,
+  )
 
   // Masked files: read the real bytes on the host, register a sentinel,
   // write it to a fake file in the manager-owned temp dir. Missing/unreadable
@@ -837,7 +1046,7 @@ function getCredentialRestrictions(
   const files = credentials.files ?? []
   const { binds: maskedFileBinds, degradeToDenyPaths } = buildMaskedFileBinds(
     files,
-    allowedDomains ?? [],
+    defaultInjectHosts,
     sentinelRegistry,
     maskedFileStore,
   )
@@ -1002,20 +1211,27 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
     return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
   }
   const expand = expandWindowsFsPaths
-  const denyRead = expand([
-    ...new Set([
-      ...(fs?.denyRead ?? []),
-      ...getCredentialDenyReadPaths(c.credentials),
-    ]),
-  ])
-  const denyWrite = expand(fs?.denyWrite ?? [])
+  // `mode: 'deny'` — non-existent literals reach srt-win, which
+  // creates a placeholder chain and stamps it (deny lands on the
+  // exact target path). `mode: 'grant'` drops them (a grant on
+  // nothing is meaningless).
+  const denyRead = expand(
+    [
+      ...new Set([
+        ...(fs?.denyRead ?? []),
+        ...getCredentialDenyReadPaths(c.credentials),
+      ]),
+    ],
+    { mode: 'deny' },
+  )
+  const denyWrite = expand(fs?.denyWrite ?? [], { mode: 'deny' })
   return {
     // `allowRead` also serves as `allowWithinDeny`: a file under a
     // denied dir gets an explicit ALLOW ACE for the sandbox user,
     // and explicit DENY on the parent doesn't override it because
     // the recompose chokepoint orders deny-before-allow per-path.
-    grantRead: expand(fs?.allowRead ?? []),
-    grantWrite: expand(fs?.allowWrite ?? []),
+    grantRead: expand(fs?.allowRead ?? [], { mode: 'grant' }),
+    grantWrite: expand(fs?.allowWrite ?? [], { mode: 'grant' }),
     denyRead,
     denyWrite,
   }
@@ -1138,6 +1354,21 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
+/**
+ * Union of session-level and per-call `git.safeDirectories`. Marks
+ * paths as `safe.directory` (dubious-ownership bypass) WITHOUT
+ * touching the write grant — the repo top-level for a subdirectory
+ * launch must NOT go in `filesystem.allowWrite`.
+ */
+function getGitSafeDirectories(
+  customConfig?: Partial<SandboxRuntimeConfig>,
+): string[] {
+  return [
+    ...(config?.git?.safeDirectories ?? []),
+    ...(customConfig?.git?.safeDirectories ?? []),
+  ]
+}
+
 function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
@@ -1181,13 +1412,35 @@ async function waitForNetworkInitialization(): Promise<boolean> {
   return managerContext !== undefined
 }
 
+/**
+ * Per-invocation options for {@link wrapWithSandbox} /
+ * {@link wrapWithSandboxArgv} that aren't sandbox *policy* (that's
+ * `customConfig`).
+ */
+export type WrapWithSandboxOptions = {
+  /**
+   * Attribution key for this invocation. Violations observed while it runs
+   * (seatbelt log lines, seccomp events, proxy denies) are stored under this
+   * string, so it must equal what you later pass to
+   * `annotateStderrWithSandboxFailures` / `getViolationsForCommand`. Defaults
+   * to `command`. Set it when the string you execute is not the string you
+   * look up by — e.g. an embedder that wraps an assembled
+   * `source <snapshot> && eval '<cmd>'` but queries by the raw `<cmd>`;
+   * otherwise the lookup key never matches the stored one and no
+   * <sandbox_violations> block is ever produced.
+   */
+  commandLabel?: string
+}
+
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
 ): Promise<string> {
   const platform = getPlatform()
+  const commandLabel = options?.commandLabel
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -1312,11 +1565,14 @@ async function wrapWithSandbox(
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
+  const gitSafeDirectories = getGitSafeDirectories(customConfig)
+
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
       return wrapCommandWithSandboxMacOS({
         command,
+        commandLabel,
         needsNetworkRestriction,
         // Only pass proxy ports if proxy is running (when there are domains to filter)
         httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
@@ -1335,6 +1591,7 @@ async function wrapWithSandbox(
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
+        gitSafeDirectories,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         allowAppleEvents: getAllowAppleEvents(),
         binShell,
@@ -1343,6 +1600,7 @@ async function wrapWithSandbox(
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
+        commandLabel,
         needsNetworkRestriction,
         // Only pass socket paths if proxy is running (when there are domains to filter)
         httpSocketPath: needsNetworkProxy
@@ -1371,6 +1629,7 @@ async function wrapWithSandbox(
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
         allowGitConfig: getAllowGitConfig(),
+        gitSafeDirectories,
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
@@ -1424,6 +1683,7 @@ async function wrapWithSandboxArgv(
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
   cwd?: string,
+  options?: WrapWithSandboxOptions,
 ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
   const platform = getPlatform()
 
@@ -1482,8 +1742,10 @@ async function wrapWithSandboxArgv(
         const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
         const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
         const expand = expandWindowsFsPaths
-        perExecDenyRead = expand(rawRead).filter(p => !sessRead.has(p))
-        perExecDenyWrite = expand(rawWrite).filter(
+        perExecDenyRead = expand(rawRead, { mode: 'deny' }).filter(
+          p => !sessRead.has(p),
+        )
+        perExecDenyWrite = expand(rawWrite, { mode: 'deny' }).filter(
           p => !sessRead.has(p) && !sessWrite.has(p),
         )
       }
@@ -1498,6 +1760,7 @@ async function wrapWithSandboxArgv(
     // via `computeWindowsFsAccessSet`.
     return wrapCommandWithSandboxWindows({
       command,
+      commandLabel: options?.commandLabel,
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
@@ -1509,10 +1772,12 @@ async function wrapWithSandboxArgv(
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
-      // grants — exactly the working-tree roots the sandbox user
-      // has MODIFY on and where git will see real-user-owned files.
+      // grants + explicit git.safeDirectories — the working-tree
+      // roots the sandbox user has MODIFY on plus any repo top-level
+      // the caller marks as safe without granting write.
       cwd,
       allowWrite: windowsFsStampedSet?.grantWrite,
+      gitSafeDirectories: getGitSafeDirectories(customConfig),
       caCertPath: mitmCA?.trustBundlePath,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
@@ -1534,6 +1799,7 @@ async function wrapWithSandboxArgv(
     binShell,
     customConfig,
     abortSignal,
+    options,
   )
   const shell = binShell ?? '/bin/bash'
   return { argv: [shell, '-c', wrapped], env: process.env }
@@ -1852,6 +2118,7 @@ async function reset(): Promise<void> {
   parentProxy = undefined
   mitmCA = undefined
   sentinelRegistry.clear()
+  awsPairRegistry.clear()
   maskedFileStore.dispose()
 }
 
@@ -1937,6 +2204,10 @@ export interface ISandboxManager {
     command: string
     args?: string[]
   }): SandboxDependencyCheck
+  checkDependenciesAsync(ripgrepConfig?: {
+    command: string
+    args?: string[]
+  }): Promise<SandboxDependencyCheck>
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
@@ -1956,6 +2227,7 @@ export interface ISandboxManager {
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
+    options?: WrapWithSandboxOptions,
   ): Promise<string>
   wrapWithSandboxArgv(
     command: string,
@@ -1963,6 +2235,7 @@ export interface ISandboxManager {
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
     cwd?: string,
+    options?: WrapWithSandboxOptions,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
@@ -1970,6 +2243,7 @@ export interface ISandboxManager {
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
   getSentinelRegistry(): SentinelRegistry
+  getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
   updateConfig(newConfig: SandboxRuntimeConfig): void
   cleanupAfterCommand(): void
@@ -1989,6 +2263,7 @@ export const SandboxManager: ISandboxManager = {
   isSupportedPlatform,
   isSandboxingEnabled,
   checkDependencies,
+  checkDependenciesAsync,
   getFsReadConfig,
   getFsWriteConfig,
   getNetworkRestrictionConfig,
@@ -2009,6 +2284,7 @@ export const SandboxManager: ISandboxManager = {
   reset,
   getMitmCA: () => mitmCA,
   getSentinelRegistry: () => sentinelRegistry,
+  getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,

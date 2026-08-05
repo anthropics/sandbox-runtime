@@ -9,9 +9,22 @@ import {
   selectParentProxyUrl,
   shouldBypassParentProxy,
 } from './parent-proxy.js'
+import {
+  encodedCommandFromProxyUser,
+  PROXY_AUTH_USER,
+} from './sandbox-utils.js'
 
 export interface SocksProxyServerOptions {
-  filter(port: number, host: string): Promise<boolean> | boolean
+  /**
+   * Host-allowlist decision. `encodedCommand` is the per-command suffix
+   * parsed from the SOCKS5 username (`srt.<encodedCommand>`), so the
+   * manager can attribute a denial to the invocation that made it.
+   */
+  filter(
+    port: number,
+    host: string,
+    encodedCommand?: string,
+  ): Promise<boolean> | boolean
 
   /**
    * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests are
@@ -23,7 +36,9 @@ export interface SocksProxyServerOptions {
   /**
    * Per-session token (same value as the HTTP proxy's). When set, the
    * server requires SOCKS5 username/password auth and only accepts
-   * user "srt" with this token as the password.
+   * usernames of the form `srt` or `srt.<encodedCommand>` with this token
+   * as the password. The `<encodedCommand>` suffix is passed to `filter()`
+   * so denials can be attributed to a specific command.
    */
   proxyAuthToken?: string
 }
@@ -49,7 +64,11 @@ export function createSocksProxyServer(
 
   if (options.proxyAuthToken) {
     socksServer.setAuthHandler((conn, accept, deny) => {
-      if (conn.username === 'srt' && conn.password === options.proxyAuthToken) {
+      if (
+        (conn.username === PROXY_AUTH_USER ||
+          conn.username.startsWith(`${PROXY_AUTH_USER}.`)) &&
+        conn.password === options.proxyAuthToken
+      ) {
         accept()
       } else {
         logForDebugging('SOCKS auth rejected', { level: 'error' })
@@ -77,7 +96,11 @@ export function createSocksProxyServer(
 
       logForDebugging(`Connection request to ${hostname}:${port}`)
 
-      const allowed = await options.filter(port, hostname)
+      const allowed = await options.filter(
+        port,
+        hostname,
+        encodedCommandFromProxyUser(conn.username),
+      )
 
       if (!allowed) {
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {

@@ -199,7 +199,7 @@ describe('network.filterRequest', () => {
         async port => {
           const r = await curl(port, `https://127.0.0.1:${upstreamPort}/`)
           expect(r.status).toBe(403)
-          expect(r.body).toContain('filterRequest threw: boom')
+          expect(r.body).toContain('sandbox policy check failed: boom')
         },
       )
     },

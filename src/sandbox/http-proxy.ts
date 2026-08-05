@@ -7,6 +7,7 @@ import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
+import { encodedCommandFromProxyUser } from './sandbox-utils.js'
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
@@ -21,6 +22,7 @@ import {
   prepareBodySubstitution,
   type GetBodySubstitutions,
 } from './body-substitution.js'
+import type { PlanSigv4 } from './credential-aws-pairs.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
@@ -34,10 +36,16 @@ import {
 } from './parent-proxy.js'
 
 export interface HttpProxyServerOptions {
+  /**
+   * Host-allowlist decision. `encodedCommand` is the per-command suffix
+   * parsed from the Proxy-Authorization username (`srt.<encodedCommand>`),
+   * so the manager can attribute a denial to the invocation that made it.
+   */
   filter(
     port: number,
     host: string,
     socket: Socket | Duplex,
+    encodedCommand?: string,
   ): Promise<boolean> | boolean
 
   /**
@@ -80,6 +88,19 @@ export interface HttpProxyServerOptions {
   filterRequest?: FilterRequestCallback
 
   /**
+   * Called when `filterRequest` denies a request, with the verified
+   * method/URL, the decision reason, and the encodedCommand parsed from
+   * the Proxy-Authorization username. Lets the manager record the deny in
+   * the SandboxViolationStore alongside the host-allowlist denials.
+   */
+  onFilterRequestDenied?: (info: {
+    method: string
+    url: string
+    reason: string
+    encodedCommand?: string
+  }) => void
+
+  /**
    * Mutate forwarded headers on the TLS-terminated path, after the allow
    * decision and before the upstream request is built. The upstream leg is
    * always cert-verified (rejectUnauthorized defaults to true), so the TLS
@@ -112,6 +133,23 @@ export interface HttpProxyServerOptions {
   getBodySubstitutionsPlaintext?: GetBodySubstitutions
 
   /**
+   * Per-request AWS SigV4 hook on the TLS-terminated path. Runs in
+   * forwardUpstream around `mutateHeaders`: requests whose signature
+   * references a masked credential pair are re-signed with the real
+   * credentials (or denied per policy for shapes that cannot be
+   * re-signed); everything else is untouched. See credential-aws-pairs.ts.
+   */
+  planSigv4?: PlanSigv4
+
+  /**
+   * Override for the SigV4 literal-hash body buffering cap
+   * (MAX_SIGV4_RESIGN_BODY_BYTES). Primarily a test seam — exercising the
+   * over-cap denial with the production 64 MiB value would need a 64 MiB
+   * fixture upload per test.
+   */
+  maxSigv4ResignBodyBytes?: number
+
+  /**
    * Additional trusted CA(s) for the terminating proxy's outbound TLS leg.
    * Unset → system roots + NODE_EXTRA_CA_CERTS. Primarily a test seam.
    */
@@ -126,9 +164,12 @@ export interface HttpProxyServerOptions {
 
   /**
    * Per-session bearer token. When set, every CONNECT and absolute-URI
-   * request must carry `Proxy-Authorization: Basic base64("srt:<token>")`
-   * or it gets a 407. Without this, any host process can dial 127.0.0.1
-   * and reach the filter callback.
+   * request must carry `Proxy-Authorization: Basic
+   * base64("srt[.<encodedCommand>]:<token>")` or it gets a 407. Without
+   * this, any host process can dial 127.0.0.1 and reach the filter
+   * callback. The optional `<encodedCommand>` suffix is parsed and passed to
+   * `filter()` / `onFilterRequestDenied` so denials can be attributed to a
+   * specific command.
    */
   proxyAuthToken?: string
 }
@@ -136,13 +177,55 @@ export interface HttpProxyServerOptions {
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
 
-  const checkAuth = (got: string | undefined): boolean => {
-    if (!options.proxyAuthToken) return true
+  // A client that is killed mid-exchange (sandboxed process tree teardown)
+  // resets its connection; without a listener that surfaces as an
+  // ECONNRESET uncaughtException from node:_http_server and can take down
+  // the host process. Parse errors get the RFC-required 400; resets and
+  // already-unwritable sockets are just dropped.
+  server.on('clientError', (err, socket) => {
+    logForDebugging(`Client connection error: ${err.message}`, {
+      level: 'error',
+    })
+    // The peer may reset while the 400 flushes; without a listener that
+    // write failure is itself an uncaughtException.
+    socket.on('error', () => {})
+    if (
+      (err as NodeJS.ErrnoException).code !== 'ECONNRESET' &&
+      socket.writable
+    ) {
+      // Destroy only after the flush: destroying immediately races the
+      // write and can reset the connection before the 400 reaches the
+      // client, while end() alone can leave a half-open socket from a
+      // client that never closes its side. Under Bun the flush callback
+      // may never fire on a parse-errored socket (the 400 is dropped;
+      // verified empirically), so back-stop with a timer or the socket
+      // leaks.
+      const status =
+        (err as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW'
+          ? '431 Request Header Fields Too Large'
+          : '400 Bad Request'
+      socket.end(`HTTP/1.1 ${status}\r\n\r\n`, () => socket.destroy())
+      const backstop = setTimeout(() => socket.destroy(), 1000)
+      backstop.unref?.()
+      return
+    }
+    socket.destroy()
+  })
+
+  type AuthResult = { ok: true; encodedCommand?: string } | { ok: false }
+  const checkAuth = (got: string | undefined): AuthResult => {
+    if (!options.proxyAuthToken) return { ok: true }
     const m = /^basic\s+([a-z0-9+/=]+)\s*$/i.exec(got ?? '')
-    if (!m) return false
+    if (!m) return { ok: false }
     const decoded = Buffer.from(m[1]!, 'base64').toString('utf8')
     const sep = decoded.indexOf(':')
-    return sep > 0 && decoded.slice(sep + 1) === options.proxyAuthToken
+    if (sep <= 0 || decoded.slice(sep + 1) !== options.proxyAuthToken) {
+      return { ok: false }
+    }
+    return {
+      ok: true,
+      encodedCommand: encodedCommandFromProxyUser(decoded.slice(0, sep)),
+    }
   }
 
   // Handle CONNECT requests for HTTPS traffic
@@ -159,7 +242,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     })
 
     try {
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      const auth = checkAuth(req.headers['proxy-authorization'])
+      if (!auth.ok) {
         socket.end(
           'HTTP/1.1 407 Proxy Authentication Required\r\n' +
             'Proxy-Authenticate: Basic realm="srt"\r\n\r\n',
@@ -176,7 +260,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
       const { hostname, port } = target
 
-      const allowed = await options.filter(port, hostname, socket)
+      const allowed = await options.filter(
+        port,
+        hostname,
+        socket,
+        auth.encodedCommand,
+      )
       if (!allowed) {
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
@@ -223,7 +312,22 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             options.getBodySubstitutions,
             socket,
             peeked.head,
-            { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
+            {
+              hostname,
+              port,
+              upstreamCA: options.tlsTerminateUpstreamCA,
+              onFilterRequestDeny: options.onFilterRequestDenied
+                ? (method, url, reason) =>
+                    options.onFilterRequestDenied!({
+                      method,
+                      url,
+                      reason,
+                      encodedCommand: auth.encodedCommand,
+                    })
+                : undefined,
+            },
+            options.planSigv4,
+            options.maxSigv4ResignBodyBytes,
           )
           return
         }
@@ -308,6 +412,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
   // Handle regular HTTP requests
   server.on('request', async (req, res) => {
+    // A client abort mid-request destroys req/res with an error; with no
+    // listener it escapes as an uncaughtException (the runtime emits it
+    // from node:_http_server). `pipe()` does not forward error events, so
+    // the body pipelines below never see it either.
+    req.on('error', err => {
+      logForDebugging(`Client request error: ${err.message}`, {
+        level: 'error',
+      })
+    })
+    res.on('error', err => {
+      logForDebugging(`Client response error: ${err.message}`, {
+        level: 'error',
+      })
+    })
     try {
       // Serve the empty CRL for Schannel's revocation check on MITM-minted
       // leaves (see MitmCA.crlDer). CryptoAPI fetches the leaf's
@@ -330,7 +448,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         res.end(options.mitmCA.crlDer)
         return
       }
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      const auth = checkAuth(req.headers['proxy-authorization'])
+      if (!auth.ok) {
         res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
         res.end()
         return
@@ -343,7 +462,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           ? 443
           : 80
 
-      const allowed = await options.filter(port, hostname, req.socket)
+      const allowed = await options.filter(
+        port,
+        hostname,
+        req.socket,
+        auth.encodedCommand,
+      )
       if (!allowed) {
         logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
           level: 'error',
@@ -400,9 +524,50 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           res,
           absUrl,
           ac.signal,
+          options.onFilterRequestDenied
+            ? (method, url, reason) =>
+                options.onFilterRequestDenied!({
+                  method,
+                  url,
+                  reason,
+                  encodedCommand: auth.encodedCommand,
+                })
+            : undefined,
         )
         if (out === null) return
         body = out
+        // The client may have aborted during the filterRequest await —
+        // the tee branch is already destroyed and res 'close' has already
+        // fired, so the teardown listeners attached below would never
+        // run. Don't dial an upstream for a dead client. A COMPLETED
+        // request is also destroyed=true (normal stream lifecycle after
+        // 'end'); only a destroy without a clean end is an abort.
+        if (
+          (req.destroyed && !req.readableEnded) ||
+          res.destroyed ||
+          req.socket.destroyed ||
+          body.destroyed
+        ) {
+          body.destroy()
+          return
+        }
+      }
+
+      // When the client declared a body but the forwarded headers carry no
+      // framing (chunked TE stripped as hop-by-hop, or a body transform
+      // deleted content-length), the upstream leg must re-frame
+      // explicitly: for bodyless-method requests the runtime would
+      // otherwise write the piped body bytes raw after complete-framed
+      // headers — a request-smuggling primitive.
+      const clientDeclaredBody = Boolean(
+        req.headers['content-length'] || req.headers['transfer-encoding'],
+      )
+      if (
+        clientDeclaredBody &&
+        fwdHeaders['content-length'] === undefined &&
+        fwdHeaders['transfer-encoding'] === undefined
+      ) {
+        fwdHeaders['transfer-encoding'] = 'chunked'
       }
 
       let proxyReq
@@ -422,6 +587,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             headers: fwdHeaders,
           },
           proxyRes => {
+            // The response stream errors independently of proxyReq (e.g.
+            // upstream reset mid-body after headers); pipe() does not
+            // handle source errors.
+            proxyRes.on('error', err => {
+              logForDebugging(`Upstream response error: ${err.message}`, {
+                level: 'error',
+              })
+              res.destroy()
+            })
             res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
@@ -444,6 +618,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               : fwdHeaders,
           },
           proxyRes => {
+            // The response stream errors independently of proxyReq (e.g.
+            // upstream reset mid-body after headers); pipe() does not
+            // handle source errors.
+            proxyRes.on('error', err => {
+              logForDebugging(`Upstream response error: ${err.message}`, {
+                level: 'error',
+              })
+              res.destroy()
+            })
             res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
@@ -459,6 +642,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             headers: fwdHeaders,
           },
           proxyRes => {
+            // The response stream errors independently of proxyReq (e.g.
+            // upstream reset mid-body after headers); pipe() does not
+            // handle source errors.
+            proxyRes.on('error', err => {
+              logForDebugging(`Upstream response error: ${err.message}`, {
+                level: 'error',
+              })
+              res.destroy()
+            })
             res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
@@ -489,6 +681,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         res.on('close', () => bodyTransform.destroy())
         body.pipe(bodyTransform).pipe(proxyReq)
       } else {
+        // pipe() does not handle source errors. `body` may be a tee branch
+        // from decideAndRespond (not `req` itself), so a client abort
+        // surfaces here as an 'error' that would otherwise escape as an
+        // uncaughtException.
+        body.on('error', err => proxyReq.destroy(err))
         body.pipe(proxyReq)
       }
     } catch (err) {

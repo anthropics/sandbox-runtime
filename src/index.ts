@@ -1,5 +1,6 @@
 // Library exports
 export { SandboxManager } from './sandbox/sandbox-manager.js'
+export type { WrapWithSandboxOptions } from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 
 // Configuration types and schemas
@@ -46,14 +47,25 @@ export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
 
 // Windows install/status API
 export {
+  WindowsSandboxError,
   getSrtWinPath,
   resolveSrtWin,
+  VENDORED_SRT_WIN_EXE,
+  checkWindowsSandboxStatus,
+  checkWindowsSandboxStatusAsync,
   getWindowsWfpStatus,
+  getWindowsWfpStatusAsync,
   verifyWindowsWfpEgress,
   getWindowsSandboxUserStatus,
+  getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   windowsTrustCa,
+  windowsTrustCaAsync,
+  ensurePersistentWindowsCa,
+  windowsStateDir,
   installWindowsSandbox,
+  installWindowsSandboxAsync,
+  checkWindowsDependenciesAsync,
   uninstallWindowsSandbox,
   windowsInstallInstructions,
   stampWindowsAcl,
@@ -63,11 +75,16 @@ export {
   expandWindowsFsPaths,
   buildGitConfigEnv,
   parseWindowsBinShell,
+  parseWindowsSandboxError,
+  isUncPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
+  WindowsSandboxErrorCode,
+  WindowsSandboxStatus,
   WindowsBinShell,
+  MappedDriveCwdError,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,
@@ -77,12 +94,28 @@ export type {
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
+  WindowsPersistentCa,
   SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
-export type { WindowsConfig, SrtWinConfig } from './sandbox/sandbox-config.js'
+
+// TLS-termination CA generation/validation (mitm-ca.ts). Embedders that
+// manage CA persistence themselves (rather than relying on the Windows
+// persistent-CA default) use these to generate and validate a pair.
+export {
+  generateCa,
+  validateCaPair,
+  certThumbprint,
+} from './sandbox/mitm-ca.js'
+export type { GeneratedCa, CaPairValidation } from './sandbox/mitm-ca.js'
+export type {
+  WindowsConfig,
+  SrtWinConfig,
+  GitConfig,
+} from './sandbox/sandbox-config.js'
 export {
   WindowsConfigSchema,
   SrtWinConfigSchema,
+  GitConfigSchema,
 } from './sandbox/sandbox-config.js'
 
 // Utility functions

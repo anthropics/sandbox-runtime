@@ -32,9 +32,14 @@ pub enum CanonError {
     /// Input contains `*` or `?` (outside the `\\?\` prefix).
     /// Always a config bug — never transient.
     Glob,
-    /// Open / final-path / attribute read failed (covers
-    /// `ERROR_FILE_NOT_FOUND`, unpaired-surrogate canonical paths,
-    /// and any other Win32 error).
+    /// `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND` from
+    /// `CreateFileW`. Distinguished so a deny target that does not
+    /// exist yet can be materialized as a placeholder chain
+    /// ([`create_placeholder_chain`]) instead of soft-skipped.
+    NotFound(anyhow::Error),
+    /// Open / final-path / attribute read failed for any other
+    /// reason (unpaired-surrogate canonical paths, permission
+    /// denied, transient IO error).
     Other(anyhow::Error),
 }
 
@@ -46,11 +51,53 @@ impl std::fmt::Display for CanonError {
                 "Windows fs deny requires explicit file or directory \
                  paths; got glob"
             ),
-            Self::Other(e) => write!(f, "{e:#}"),
+            Self::NotFound(e) | Self::Other(e) => write!(f, "{e:#}"),
         }
     }
 }
 impl std::error::Error for CanonError {}
+
+/// True iff the [`windows::core::Error`] at `e`'s root is
+/// `ERROR_FILE_NOT_FOUND` (2) or `ERROR_PATH_NOT_FOUND` (3).
+pub fn is_not_found(e: &anyhow::Error) -> bool {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    e.root_cause()
+        .downcast_ref::<windows::core::Error>()
+        .map(|we| we.code())
+        .is_some_and(|c| c == ERROR_FILE_NOT_FOUND.into() || c == ERROR_PATH_NOT_FOUND.into())
+}
+
+/// True iff `p` names a UNC network path (`\\server\share\…`,
+/// `//server/share/…`, `\\?\UNC\server\…`) — NOT a local extended
+/// path (`\\?\C:\…`) or device namespace (`\\.\…`). Checked before
+/// materializing a placeholder chain: never `mkdir` on the user's
+/// SMB share; the local ACL model does not apply there.
+pub fn is_unc_path(p: &str) -> bool {
+    // Normalize `/` → `\` so Git-Bash-style `//server/…` and
+    // mixed-separator inputs are recognized.
+    let n = p.replace('/', "\\");
+    if n.get(..8)
+        .is_some_and(|s| s.eq_ignore_ascii_case(r"\\?\UNC\"))
+    {
+        return true;
+    }
+    n.starts_with(r"\\") && !n.starts_with(r"\\?\") && !n.starts_with(r"\\.\")
+}
+
+/// Strip a `\\?\` or `\\?\UNC\` extended-path prefix from a
+/// pre-canonicalized input (either separator style). Used for
+/// comparable component-count sort keys so `\\?\C:\y` and `C:\y`
+/// depth-compare correctly.
+pub fn strip_extended_prefix(p: &str) -> &str {
+    for pfx in [r"\\?\UNC\", "//?/UNC/", r"\\?\", "//?/"] {
+        if p.get(..pfx.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(pfx))
+        {
+            return &p[pfx.len()..];
+        }
+    }
+    p
+}
 
 /// Resolve `path` to its kernel-canonical form via
 /// `GetFinalPathNameByHandleW` (handles symlinks, junctions, 8.3
@@ -111,7 +158,179 @@ pub fn canonicalize_path(path: &str) -> Result<(String, bool), CanonError> {
         let is_dir = info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
         Ok((canonical, is_dir))
     })()
-    .map_err(CanonError::Other)
+    .map_err(|e| {
+        if is_not_found(&e) {
+            CanonError::NotFound(e)
+        } else {
+            CanonError::Other(e)
+        }
+    })
+}
+
+/// A filesystem object created by [`create_placeholder_chain`].
+/// `canon` is the CANONICAL path so it keys the same as
+/// `working_aces` rows.
+#[derive(Debug, Clone)]
+pub struct Placeholder {
+    pub canon: String,
+    pub is_dir: bool,
+}
+
+/// Materialize `path` (a deny target that does not exist yet):
+/// `mkdir` each missing intermediate directory then create an
+/// empty leaf. Returns `(leaf_canonical, components_we_created)`.
+/// The caller stamps the leaf with the full [`SbAce::Deny`] mask —
+/// the deny lands on the exact path, not an over-broad ancestor —
+/// and the intermediates with object-only `DenyDelete`.
+///
+/// **Leaf is a FILE** unless `leaf_is_dir` (target ended with a
+/// path separator) or a deeper deny target already created it as a
+/// directory (overlapping denies are processed deepest-first). If
+/// the user later needs a directory where a placeholder file
+/// landed, they (non-sandboxed) delete + `mkdir`; the sandbox
+/// cannot.
+///
+/// Placeholders are PERMANENT (leave-in-place): `acl restore`
+/// strips the ACEs but never deletes the file/dir — a user who
+/// wrote into a placeholder cannot lose data.
+///
+/// `record_intent` is called with each component's canonical path
+/// BEFORE the on-disk create — intent-first, so a crash between
+/// record and create leaves a harmless orphan row rather than an
+/// unrecorded on-disk component a later holder cannot discover.
+///
+/// Idempotent: an `AlreadyExists` on any component is accepted and
+/// not added to the return list (we didn't create it); the
+/// caller's ancestor-discovery picks it up if it's a recorded
+/// placeholder. An intermediate that already exists as a FILE is a
+/// hard error (cannot mkdir through it); a leaf that already
+/// exists as either kind is accepted.
+///
+/// [`SbAce::Deny`]: crate::acl::SbAce::Deny
+pub fn create_placeholder_chain(
+    path: &str,
+    leaf_is_dir: bool,
+    mut record_intent: impl FnMut(&str) -> Result<()>,
+) -> Result<(String, Vec<Placeholder>)> {
+    use std::io::ErrorKind::AlreadyExists;
+    use std::path::Path;
+    // Strip a trailing separator so `Path::components` doesn't
+    // yield an empty leaf.
+    let target = Path::new(path.trim_end_matches(['\\', '/']));
+    // 1. Walk parents to the first that exists — capture its
+    //    CANONICAL path. A component we CREATE takes exactly the
+    //    case we give it, so `<base-canon>\<component>…` is
+    //    canonical without a post-create re-resolve — which lets
+    //    intent be recorded BEFORE the create.
+    let mut base: Option<(&Path, String)> = None;
+    for anc in target.ancestors().skip(1) {
+        if anc.as_os_str().is_empty() {
+            break;
+        }
+        match canonicalize_path(&anc.display().to_string()) {
+            Ok((c, true)) => {
+                base = Some((anc, c));
+                break;
+            }
+            Ok((_, false)) => bail!(
+                "deny target '{path}': ancestor '{}' exists as a \
+                 FILE — cannot create placeholder chain through it",
+                anc.display()
+            ),
+            Err(CanonError::NotFound(_)) => {}
+            Err(e) => bail!(
+                "deny target '{path}': canonicalize ancestor '{}': {e}",
+                anc.display()
+            ),
+        }
+    }
+    let (base_raw, mut cur_canon) = base.ok_or_else(|| {
+        anyhow::anyhow!(
+            "deny target '{path}' has no existing ancestor \
+             directory"
+        )
+    })?;
+    let tail: Vec<_> = target
+        .strip_prefix(base_raw)
+        .expect("ancestors() yields prefixes of self")
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    // 2. Per component: record intent, then create. On hard
+    //    failure, best-effort unwind (with leave-in-place a leaked
+    //    empty component is only cosmetic, but a half-built chain
+    //    from a hard error is still worth cleaning up).
+    let mut created: Vec<Placeholder> = Vec::new();
+    let unwind = |created: &[Placeholder]| {
+        for p in created.iter().rev() {
+            let _ = if p.is_dir {
+                std::fs::remove_dir(&p.canon)
+            } else {
+                std::fs::remove_file(&p.canon)
+            };
+        }
+    };
+    let mut cur_raw = base_raw.to_path_buf();
+    for (i, comp) in tail.iter().enumerate() {
+        let is_leaf = i + 1 == tail.len();
+        let is_dir = !is_leaf || leaf_is_dir;
+        // `\\?\C:\` already has a trailing `\` — don't double it.
+        if !cur_canon.ends_with('\\') {
+            cur_canon.push('\\');
+        }
+        cur_canon.push_str(comp);
+        cur_raw.push(comp);
+        if let Err(e) = record_intent(&cur_canon) {
+            unwind(&created);
+            return Err(e);
+        }
+        let r = if is_dir {
+            std::fs::create_dir(&cur_raw)
+        } else {
+            // `create_new` so a raced-in leaf is never truncated.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&cur_raw)
+                .map(drop)
+        };
+        match r {
+            Ok(()) => created.push(Placeholder {
+                canon: cur_canon.clone(),
+                is_dir,
+            }),
+            Err(e) if e.kind() == AlreadyExists => {
+                if !is_leaf && !cur_raw.is_dir() {
+                    unwind(&created);
+                    bail!(
+                        "deny target '{path}': intermediate '{}' \
+                         exists as a FILE — cannot create placeholder \
+                         chain through it",
+                        cur_raw.display()
+                    );
+                }
+                // Not ours to record; a Deny'd dir/file at this
+                // name is at least as strong. `cur_canon` may
+                // differ from the on-disk canonical (case) if we
+                // didn't create it — re-canonicalize so the caller
+                // and ancestor-discovery key correctly.
+                cur_canon = canonicalize_path(&cur_raw.display().to_string())
+                    .map(|(c, _)| c)
+                    .unwrap_or(cur_canon);
+            }
+            Err(e) => {
+                unwind(&created);
+                return Err(e).with_context(|| {
+                    format!(
+                        "create placeholder {} '{}'",
+                        if is_dir { "dir" } else { "leaf" },
+                        cur_raw.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok((cur_canon, created))
 }
 
 /// Open `path` with no data access (`dwDesiredAccess = 0`), full
@@ -340,8 +559,47 @@ mod tests {
         }
         assert!(matches!(
             canonicalize_path(r"C:\srt-win-no-such-path"),
-            Err(CanonError::Other(_))
+            Err(CanonError::NotFound(_))
         ));
+    }
+
+    /// `create_placeholder_chain` records intent before creating,
+    /// builds the missing dirs + leaf, and returns exactly what it
+    /// created; a second call is idempotent (`AlreadyExists`
+    /// accepted, nothing new returned).
+    #[test]
+    fn placeholder_chain_round_trip() {
+        let base = std::env::temp_dir().join(format!("srt-ph-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let leaf = base.join("a").join("b").join("secret.txt");
+        let mut recorded = Vec::new();
+        let mut rec = |c: &str| {
+            // Intent-first: not on disk yet when recorded.
+            assert!(!std::path::Path::new(c).exists(), "{c}");
+            recorded.push(c.to_owned());
+            Ok(())
+        };
+        let (leaf_canon, chain) =
+            create_placeholder_chain(&leaf.display().to_string(), false, &mut rec).unwrap();
+        // Two dirs + one leaf file, root-first; leaf canonical.
+        assert_eq!(chain.len(), 3);
+        assert!(chain[0].is_dir && chain[1].is_dir && !chain[2].is_dir);
+        assert!(leaf_canon.starts_with(r"\\?\"), "{leaf_canon}");
+        assert_eq!(leaf_canon, chain[2].canon);
+        assert_eq!(recorded.len(), 3);
+        assert!(leaf.is_file());
+        // Idempotent: second call finds everything already present
+        // → returns nothing new; leaf canon unchanged.
+        let (again_canon, again) =
+            create_placeholder_chain(&leaf.display().to_string(), false, |_| Ok(())).unwrap();
+        assert!(again.is_empty(), "got {again:?}");
+        assert_eq!(again_canon, leaf_canon);
+        // Trailing separator ⇒ directory leaf.
+        let dir_leaf = format!("{}\\", base.join("d").display());
+        let (dc, _) = create_placeholder_chain(&dir_leaf, true, |_| Ok(())).unwrap();
+        assert!(base.join("d").is_dir());
+        assert!(dc.starts_with(r"\\?\"), "{dc}");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -397,5 +655,25 @@ mod tests {
         assert!(utf16_roundtrips(&pair, &String::from_utf16_lossy(&pair)));
         let ok = [0x0041, 0x0042];
         assert!(utf16_roundtrips(&ok, &String::from_utf16_lossy(&ok)));
+    }
+
+    #[test]
+    fn unc_and_extended_prefix() {
+        for p in [
+            r"\\server\share\x",
+            "//server/share/x",
+            r"\\?\UNC\server\share",
+            r"\\?\unc\server\share",
+            "//?/UNC/server/share",
+        ] {
+            assert!(is_unc_path(p), "should be UNC: {p}");
+        }
+        for p in [r"\\?\C:\x", "//?/C:/x", r"\\.\PIPE\x", r"C:\x", "/tmp/x"] {
+            assert!(!is_unc_path(p), "should NOT be UNC: {p}");
+        }
+        assert_eq!(strip_extended_prefix(r"\\?\C:\y"), r"C:\y");
+        assert_eq!(strip_extended_prefix("//?/C:/y"), "C:/y");
+        assert_eq!(strip_extended_prefix(r"\\?\UNC\srv\s"), r"srv\s");
+        assert_eq!(strip_extended_prefix(r"C:\y"), r"C:\y");
     }
 }

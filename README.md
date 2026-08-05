@@ -215,6 +215,20 @@ child.on('exit', async code => {
 })
 ```
 
+**Violation attribution (`commandLabel`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key derived from the command string, and `annotateStderrWithSandboxFailures(cmd, stderr)` / `getViolationsForCommand(cmd)` look them up by that same key. If the string you *execute* is not the string you *look up by* — e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'` but query by the raw `<cmd>` — pass the lookup string as `commandLabel` so the two keys match; otherwise no `<sandbox_violations>` block is ever produced:
+
+```typescript
+const wrapped = await SandboxManager.wrapWithSandbox(
+  assembledCommand, // what actually runs
+  undefined,
+  undefined,
+  undefined,
+  { commandLabel: rawCommand }, // what you'll look violations up by
+)
+// ... run it ...
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(rawCommand, stderr)
+```
+
 #### Available exports
 
 ```typescript
@@ -287,8 +301,9 @@ srt --settings /path/to/srt-settings.json <command>
 
 Uses an **allow-only pattern** - all network access is denied by default.
 
-- `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access.
-- `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
+- `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access. An optional `:port` suffix (`api.example.com:443`, `*.example.com:8443`) restricts an entry to that destination port; entries without a port match any port.
+- `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains). Same `:port` suffix, and a bare `*` (or `*:22`) is accepted for deny-all.
+- `network.deniedDomainReasons` - Optional map from a `deniedDomains` entry (matched by exact string) to a model-facing reason that appears in the `<sandbox_violations>` line when that entry denies a connection — say what is blocked and the sanctioned alternative (e.g. `{"github.com:22": "SSH pushes to GitHub are blocked; use an https:// remote"}`). Entries without a reason report a generic one.
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
 
 **TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.

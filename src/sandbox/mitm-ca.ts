@@ -9,7 +9,7 @@
  */
 
 import forge from 'node-forge'
-import { sign as cryptoSign } from 'node:crypto'
+import { sign as cryptoSign, X509Certificate } from 'node:crypto'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -163,9 +163,26 @@ export function rsaSha256SignNative(der: string, keyPem: string): string {
 export function createMitmCA(opts: {
   caCertPath?: string
   caKeyPath?: string
+  /**
+   * PEM strings for the CA — used when the caller has already read /
+   * generated them (e.g. the Windows persistent-CA path). When set,
+   * `caCertPath`/`caKeyPath` are recorded on the returned {@link MitmCA}
+   * but NOT read from disk.
+   */
+  caCertPem?: string
+  caKeyPem?: string
   /** PEM CA files appended to the trust bundle; unreadable paths skipped. */
   extraCaCertPaths?: string[]
 }): MitmCA {
+  if (opts.caCertPem && opts.caKeyPem) {
+    const v = validateCaPair(opts.caCertPem, opts.caKeyPem)
+    if (!v.ok) throw new Error(`tlsTerminate: CA PEM pair: ${v.reason}`)
+    return buildMitmCA(opts.caCertPem, opts.caKeyPem, v.cert, v.key, {
+      certPath: opts.caCertPath ?? '',
+      keyPath: opts.caKeyPath ?? '',
+      extraCaCertPaths: opts.extraCaCertPaths,
+    })
+  }
   if (opts.caCertPath && opts.caKeyPath) {
     return loadCA(opts.caCertPath, opts.caKeyPath, opts.extraCaCertPaths)
   }
@@ -370,53 +387,91 @@ function loadCA(
 ): MitmCA {
   const certPem = readPem(certPath, 'CERTIFICATE', 'tlsTerminate.caCertPath')
   const keyPem = readPem(keyPath, 'PRIVATE KEY', 'tlsTerminate.caKeyPath')
-
-  let cert: forge.pki.Certificate
-  let key: forge.pki.PrivateKey
-  try {
-    cert = pki.certificateFromPem(certPem)
-    key = pki.privateKeyFromPem(keyPem)
-  } catch (err) {
-    throw new Error(
-      `tlsTerminate: failed to parse CA from ${certPath}: ` +
-        (err as Error).message,
-    )
+  const v = validateCaPair(certPem, keyPem)
+  if (!v.ok) {
+    throw new Error(`tlsTerminate: CA at ${certPath}: ${v.reason}`)
   }
-  if (!('n' in key) || !('d' in key)) {
-    // node-forge can only sign with RSA private keys.
-    throw new Error(`tlsTerminate.caKeyPath: CA key at ${keyPath} must be RSA`)
-  }
-
-  // The CA files are the user's; the trust bundle still needs an SRT-owned
-  // directory of its own.
-  const bundleDir = mkdtempSync(join(tmpdir(), 'srt-ca-'))
-  const trustBundlePath = writeTrustBundle(bundleDir, certPem, extraCaCertPaths)
-
   logForDebugging(`[mitm-ca] loaded CA from ${certPath}`)
-  return {
+  return buildMitmCA(certPem, keyPem, v.cert, v.key, {
     certPath,
     keyPath,
-    trustBundlePath,
+    extraCaCertPaths,
+  })
+}
+
+/**
+ * Assemble a {@link MitmCA} from an already-parsed cert+key. Shared by
+ * `loadCA` (explicit paths), `generateEphemeralCA`, and the Windows
+ * persistent-CA path so trust-bundle/CRL/cache setup lives in one place.
+ * `certPath`/`keyPath` are recorded verbatim; the trust bundle goes to a
+ * fresh mkdtemp so it's always disposable.
+ */
+function buildMitmCA(
+  certPem: string,
+  keyPem: string,
+  cert: forge.pki.Certificate,
+  key: forge.pki.rsa.PrivateKey,
+  opts: {
+    certPath: string
+    keyPath: string
+    extraCaCertPaths?: string[]
+    ephemeral?: boolean
+  },
+): MitmCA {
+  const bundleDir = mkdtempSync(join(tmpdir(), 'srt-ca-'))
+  return {
+    certPath: opts.certPath,
+    keyPath: opts.keyPath,
+    trustBundlePath: writeTrustBundle(
+      bundleDir,
+      certPem,
+      opts.extraCaCertPaths,
+    ),
     certPem,
     keyPem,
     cert,
-    key: key as forge.pki.rsa.PrivateKey,
+    key,
     leafCerts: new Map(),
     secureContexts: new Map(),
     crlDer: generateEmptyCrl(cert, keyPem),
-    ephemeral: false,
+    ephemeral: opts.ephemeral ?? false,
   }
 }
 
-function generateEphemeralCA(extraCaCertPaths?: string[]): MitmCA {
+/** Result of {@link generateCa}. PEMs plus the parsed forge objects. */
+export type GeneratedCa = {
+  certPem: string
+  keyPem: string
+  /** Parsed certificate — same object the PEM encodes. */
+  cert: forge.pki.Certificate
+  /** Parsed RSA private key — same object the PEM encodes. */
+  key: forge.pki.rsa.PrivateKey
+}
+
+/**
+ * Generate a self-signed RSA-2048 CA certificate + private key as PEM
+ * strings. Pure — no filesystem side effects; the caller decides where (and
+ * whether) to persist. This is the primitive under both the ephemeral
+ * per-process CA and the Windows persistent CA
+ * (`ensurePersistentWindowsCa`).
+ *
+ * @param opts.cn subject/issuer commonName. Default
+ *   `'sandbox-runtime ephemeral CA'`.
+ * @param opts.validityDays certificate `notAfter` in days from now.
+ *   Default 825 (the CA/B Forum limit for publicly-trusted leaves; not
+ *   binding on a private CA, but a reasonable rotation horizon).
+ */
+export function generateCa(
+  opts: { cn?: string; validityDays?: number } = {},
+): GeneratedCa {
   const keys = pki.rsa.generateKeyPair(2048)
   const cert = pki.createCertificate()
   cert.publicKey = keys.publicKey
   cert.serialNumber = randomSerial()
   cert.validity.notBefore = daysFromNow(-1)
-  cert.validity.notAfter = daysFromNow(825)
+  cert.validity.notAfter = daysFromNow(opts.validityDays ?? 825)
   const subject = [
-    { name: 'commonName', value: 'sandbox-runtime ephemeral CA' },
+    { name: 'commonName', value: opts.cn ?? 'sandbox-runtime ephemeral CA' },
     { name: 'organizationName', value: 'sandbox-runtime' },
   ]
   cert.setSubject(subject)
@@ -434,9 +489,94 @@ function generateEphemeralCA(extraCaCertPaths?: string[]): MitmCA {
   ])
   const keyPem = pki.privateKeyToPem(keys.privateKey)
   signCertificateNative(cert, keyPem)
+  return {
+    certPem: pki.certificateToPem(cert),
+    keyPem,
+    cert,
+    key: keys.privateKey,
+  }
+}
 
-  const certPem = pki.certificateToPem(cert)
+/**
+ * SHA-1 thumbprint of `certPem` as uppercase hex with no separators —
+ * the format `srt-win user status` reports (`ca_cert_thumb`) and
+ * PowerShell's `Cert:\…\Thumbprint` uses. Throws if `certPem` is not a
+ * parseable X.509 certificate.
+ */
+export function certThumbprint(certPem: string): string {
+  return new X509Certificate(certPem).fingerprint
+    .replace(/:/g, '')
+    .toUpperCase()
+}
 
+/** Result of {@link validateCaPair}. */
+export type CaPairValidation =
+  | {
+      ok: true
+      thumbprint: string
+      notAfter: Date
+      /** Parsed certificate — reuse instead of re-parsing `certPem`. */
+      cert: forge.pki.Certificate
+      /** Parsed RSA private key — reuse instead of re-parsing `keyPem`. */
+      key: forge.pki.rsa.PrivateKey
+    }
+  | { ok: false; reason: string }
+
+/**
+ * Check that `certPem` + `keyPem` are a usable RSA CA pair: both parse, the
+ * key is RSA (node-forge signs with nothing else), the private key's
+ * modulus matches the certificate's public key (i.e. this key actually
+ * signs for this cert), and `notBefore` is not in the future — a CA
+ * minted while the system clock was ahead and later NTP-corrected would
+ * otherwise be permanently not-yet-valid with nothing to trigger a
+ * regenerate. Returns the cert's thumbprint and `notAfter` on success so
+ * a caller can decide expiry policy without a second parse.
+ *
+ * Does not throw — a persistence layer that finds an unreadable/mismatched
+ * pair on disk treats `{ok: false}` as "regenerate", not a hard error.
+ */
+export function validateCaPair(
+  certPem: string,
+  keyPem: string,
+): CaPairValidation {
+  let cert: forge.pki.Certificate
+  let key: forge.pki.PrivateKey
+  try {
+    cert = pki.certificateFromPem(certPem)
+    key = pki.privateKeyFromPem(keyPem)
+  } catch (err) {
+    return { ok: false, reason: `parse: ${(err as Error).message}` }
+  }
+  if (!('n' in key) || !('d' in key)) {
+    return { ok: false, reason: 'key is not RSA' }
+  }
+  if (cert.validity.notBefore.getTime() > Date.now()) {
+    return {
+      ok: false,
+      reason: `notBefore ${cert.validity.notBefore.toISOString()} is in the future (clock skew?)`,
+    }
+  }
+  const pub = cert.publicKey as forge.pki.rsa.PublicKey
+  if (!('n' in pub) || pub.n.compareTo((key as forge.pki.rsa.PrivateKey).n)) {
+    return { ok: false, reason: 'key does not match certificate public key' }
+  }
+  let thumbprint: string
+  try {
+    thumbprint = certThumbprint(certPem)
+  } catch (err) {
+    return { ok: false, reason: `thumbprint: ${(err as Error).message}` }
+  }
+  return {
+    ok: true,
+    thumbprint,
+    notAfter: cert.validity.notAfter,
+    cert,
+    key: key as forge.pki.rsa.PrivateKey,
+  }
+}
+
+function generateEphemeralCA(extraCaCertPaths?: string[]): MitmCA {
+  const { certPem, keyPem, cert, key } = generateCa()
   // Write to disk so trust env vars (NODE_EXTRA_CA_CERTS etc.) can point at
   // a real path. mkdtemp gives us an unguessable per-process directory.
   const dir = mkdtempSync(join(tmpdir(), 'srt-ca-'))
@@ -444,22 +584,13 @@ function generateEphemeralCA(extraCaCertPaths?: string[]): MitmCA {
   const keyPath = join(dir, 'ca.key')
   writeFileSync(certPath, certPem, { mode: 0o644 })
   writeFileSync(keyPath, keyPem, { mode: 0o600 })
-  const trustBundlePath = writeTrustBundle(dir, certPem, extraCaCertPaths)
-
   logForDebugging(`[mitm-ca] generated ephemeral CA at ${certPath}`)
-  return {
+  return buildMitmCA(certPem, keyPem, cert, key, {
     certPath,
     keyPath,
-    trustBundlePath,
-    certPem,
-    keyPem,
-    cert,
-    key: keys.privateKey,
-    leafCerts: new Map(),
-    secureContexts: new Map(),
-    crlDer: generateEmptyCrl(cert, keyPem),
+    extraCaCertPaths,
     ephemeral: true,
-  }
+  })
 }
 
 function readPem(path: string, label: string, field: string): string {

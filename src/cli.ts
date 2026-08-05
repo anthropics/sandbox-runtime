@@ -66,9 +66,8 @@ async function main(): Promise<void> {
     )
     .option('--force', 'replace an existing install with different config')
     .action(async (o: Record<string, string | boolean | undefined>) => {
-      const { installWindowsSandbox } = await import(
-        './sandbox/windows-sandbox-utils.js'
-      )
+      const { installWindowsSandbox, resolveSrtWin, VENDORED_SRT_WIN_EXE } =
+        await import('./sandbox/windows-sandbox-utils.js')
       const range =
         typeof o.proxyPortRange === 'string'
           ? (o.proxyPortRange.split('-').map(Number) as [number, number])
@@ -79,6 +78,9 @@ async function main(): Promise<void> {
           proxyPortRange: range,
           sandboxUser: o.sandboxUser as string | undefined,
           force: Boolean(o.force),
+          // Our own CLI opts into the packaged exe explicitly —
+          // there is no ambient vendor fallback.
+          srtWin: resolveSrtWin({ path: VENDORED_SRT_WIN_EXE }),
         })
         if (r.cancelled) {
           console.error('Install cancelled at the UAC prompt. Nothing changed.')
@@ -110,11 +112,13 @@ async function main(): Promise<void> {
     )
     .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
     .action(async (o: Record<string, string | undefined>) => {
-      const { uninstallWindowsSandbox } = await import(
-        './sandbox/windows-sandbox-utils.js'
-      )
+      const { uninstallWindowsSandbox, resolveSrtWin, VENDORED_SRT_WIN_EXE } =
+        await import('./sandbox/windows-sandbox-utils.js')
       try {
-        const r = uninstallWindowsSandbox({ sublayerGuid: o.sublayerGuid })
+        const r = uninstallWindowsSandbox({
+          sublayerGuid: o.sublayerGuid,
+          srtWin: resolveSrtWin({ path: VENDORED_SRT_WIN_EXE }),
+        })
         if (r.cancelled) {
           console.error('Uninstall cancelled at the UAC prompt.')
           process.exit(2)
@@ -181,6 +185,26 @@ async function main(): Promise<void> {
               `No config found at ${configPath}, using default config`,
             )
             runtimeConfig = getDefaultConfig()
+          }
+
+          // Windows: srtWin.path is required (no ambient vendor
+          // fallback). When the user's config doesn't set it, this
+          // CLI opts into the packaged exe explicitly — that's our
+          // code making the choice, not a library default.
+          if (
+            process.platform === 'win32' &&
+            runtimeConfig.windows?.srtWin?.path === undefined
+          ) {
+            const { VENDORED_SRT_WIN_EXE } = await import(
+              './sandbox/windows-sandbox-utils.js'
+            )
+            runtimeConfig = {
+              ...runtimeConfig,
+              windows: {
+                ...runtimeConfig.windows,
+                srtWin: { path: VENDORED_SRT_WIN_EXE },
+              },
+            }
           }
 
           // Initialize sandbox with config
