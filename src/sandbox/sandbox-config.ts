@@ -1130,10 +1130,16 @@ export const SandboxRuntimeConfigSchema = z
     // Host-scoped view of the allowlist (":port" suffixes dropped) —
     // injection is per-host, not per-port.
     const allowedHosts = cfg.network.allowedDomains.map(stripDomainPatternPort)
+    // allowAllDomains makes every host reachable regardless of the
+    // allowlist, so the reachability requirement on injectHosts is
+    // vacuous — without this, the masking recipe would demand allowlist
+    // entries that the flag makes meaningless.
+    const allowAll = cfg.network.allowAllDomains === true
     const checkSubset = (
       hosts: readonly string[],
       path: (string | number)[],
     ) => {
+      if (allowAll) return
       for (const [i, host] of hosts.entries()) {
         if (!isInjectHostCoveredByAllowedDomains(host, allowedHosts)) {
           ctx.addIssue({
@@ -1163,6 +1169,28 @@ export const SandboxRuntimeConfigSchema = z
       }
       if (entry.mode !== 'mask') return
       hasMasked = true
+      // Runtime default injectHosts is network.allowedDomains. Under
+      // allowAllDomains the allowlist no longer gates reachability and is
+      // typically empty — the default then resolves to no hosts at all
+      // and the credential would be masked but never injected (silent
+      // auth failure inside the sandbox). Require explicit injectHosts.
+      if (
+        allowAll &&
+        entry.injectHosts === undefined &&
+        allowedHosts.length === 0
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path,
+          message:
+            `This masked credential has no injectHosts, so it defaults to ` +
+            `network.allowedDomains — which is empty. With ` +
+            `network.allowAllDomains the allowlist does not gate ` +
+            `reachability, so the default would inject the credential ` +
+            `nowhere. List the hosts that should receive the real value ` +
+            `in injectHosts.`,
+        })
+      }
       // Credential substitution only runs on the TLS-terminated path, so a
       // host covered by tlsTerminate.excludeDomains can never receive the
       // real value — the upstream sees the placeholder. Reject the
