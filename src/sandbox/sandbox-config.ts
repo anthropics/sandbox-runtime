@@ -766,6 +766,12 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'macOS only: Additional XPC/Mach service names to allow looking up. Supports trailing-wildcard prefix matching (e.g., "2BUA8C4S2C.com.1password.*"). Needed for tools like 1Password CLI, Playwright, or the iOS Simulator that communicate via XPC.',
     ),
+  httpProxyDualStack: z
+    .boolean()
+    .optional()
+    .describe(
+      'macOS only: Also listen on IPv6 loopback when the runtime owns the HTTP proxy. The proxy URL remains on localhost.',
+    ),
   httpProxyPort: z
     .number()
     .int()
