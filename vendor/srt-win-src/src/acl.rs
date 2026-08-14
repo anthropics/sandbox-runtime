@@ -262,6 +262,7 @@ const fn dword_align(n: usize) -> usize {
 /// One ACE to add at the head/tail of a [`rebuild_acl`] output.
 /// `PSID` borrows the caller's SID buffer; keep it alive across the
 /// call.
+#[derive(Debug)]
 pub(crate) enum NewAce {
     Allow(PSID, u32, ACE_FLAGS),
     Deny(PSID, u32, ACE_FLAGS),
@@ -394,6 +395,55 @@ pub(crate) fn write_file_dacl(path: &str, acl: *const ACL, p: Protection) -> Res
     win32_ok(r, &format!("SetNamedSecurityInfoW('{path}')"))
 }
 
+/// Handle-based mirror of [`read_file_dacl`]: `GetSecurityInfo` on
+/// an open handle, so the caller controls follow semantics (a
+/// NO-FOLLOW handle reads the reparse OBJECT's DACL, which the
+/// named API cannot guarantee).
+pub(crate) fn read_handle_dacl(h: &crate::util::OwnedHandle) -> Result<(OwnedSd, *mut ACL)> {
+    use windows::Win32::Security::Authorization::GetSecurityInfo;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let r = unsafe {
+        GetSecurityInfo(
+            h.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut psd),
+        )
+    };
+    win32_ok(r, "GetSecurityInfo(handle DACL)")?;
+    Ok((OwnedSd::from_raw(psd), dacl))
+}
+
+/// Handle-based mirror of [`write_file_dacl`].
+pub(crate) fn write_handle_dacl(
+    h: &crate::util::OwnedHandle,
+    acl: *const ACL,
+    p: Protection,
+) -> Result<()> {
+    use windows::Win32::Security::Authorization::SetSecurityInfo;
+    let prot = match p {
+        Protection::Protected => PROTECTED_DACL_SECURITY_INFORMATION,
+        Protection::Unprotected => UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let r = unsafe {
+        SetSecurityInfo(
+            h.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | prot,
+            None,
+            None,
+            Some(acl),
+            None,
+        )
+    };
+    win32_ok(r, "SetSecurityInfo(handle DACL)")
+}
+
 /// `(kept ACE ptrs+sizes, Σ kept sizes, source AclRevision)`.
 pub(crate) type KeptAces = (Vec<(*const c_void, u16)>, usize, ACE_REVISION);
 
@@ -510,6 +560,49 @@ pub fn set_path_dacl_from_sddl(path: &str, sddl: &str, label: &str) -> Result<()
         bail!("{label}: SDDL '{sddl}' yielded no DACL");
     }
     write_file_dacl(path, dacl, Protection::Protected).context(label.to_owned())
+}
+
+/// Open `path`'s REPARSE OBJECT for security writes: no-follow, and
+/// REQUIRE the object to be a reparse point. The reparse-lock stamp
+/// targets junction/symlink objects specifically — if the path no
+/// longer denotes a reparse point (a racing replace swapped in a
+/// real directory), the stamp must fail loudly rather than silently
+/// re-ACL whatever took its place.
+pub fn open_reparse_for_security(path: &str) -> Result<crate::util::OwnedHandle> {
+    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, OPEN_EXISTING,
+    };
+    let w = wstr(path);
+    let h = unsafe {
+        CreateFileW(
+            pcwstr(&w),
+            Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits(),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .with_context(|| format!("CreateFileW('{path}', reparse no-follow)"))?;
+    if h == INVALID_HANDLE_VALUE {
+        bail!("CreateFileW('{path}'): INVALID_HANDLE_VALUE");
+    }
+    let owned = crate::util::OwnedHandle(h);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(owned.0, &mut info) }
+        .with_context(|| format!("GetFileInformationByHandle('{path}')"))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
+        bail!(
+            "'{path}' is no longer a reparse point — the link this \
+             deny spelling traversed was replaced; re-run the stamp"
+        );
+    }
+    Ok(owned)
 }
 
 /// Open `path` for security-descriptor writes with NO-FOLLOW
@@ -789,7 +882,7 @@ impl SbAceSet {
     /// deny → deny-fdc → allow order. `Deny`/`DenyFdc`/`Grant` carry
     /// [`OICI`]; `DenyDelete` is object-only ([`NO_INHERIT`]) — see
     /// [`SbAce::DenyDelete`].
-    fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
+    pub(crate) fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
         let mut v = Vec::with_capacity(4);
         if let Some(m) = self.deny {
             v.push(NewAce::Deny(sid, m.bits(), OICI));
@@ -848,11 +941,28 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
     let sid_bytes = sid.as_bytes();
+    // Reparse-lock sets target the LINK OBJECT itself: hold a
+    // NO-FOLLOW handle for the whole read-modify-write so the DACL
+    // provably lands on the reparse point, never its target (the
+    // named security APIs' follow behavior is not part of their
+    // contract), and so a concurrent re-point cannot redirect the
+    // write.
+    let lock_handle = if set.deny_reparse_lock {
+        Some(
+            open_reparse_for_security(canonical_path)
+                .with_context(|| format!("no-follow open '{canonical_path}'"))?,
+        )
+    } else {
+        None
+    };
     // 1. Read the current DACL and its protection state. `sd` owns
     //    the buffer `old`/`keep` point into; it's freed after step
     //    4's write.
-    let (sd, old) =
-        read_file_dacl(canonical_path).with_context(|| format!("recompose '{canonical_path}'"))?;
+    let (sd, old) = match &lock_handle {
+        Some(h) => read_handle_dacl(h).with_context(|| format!("recompose '{canonical_path}'"))?,
+        None => read_file_dacl(canonical_path)
+            .with_context(|| format!("recompose '{canonical_path}'"))?,
+    };
     let protected =
         sd_dacl_protected(&sd).with_context(|| format!("recompose '{canonical_path}'"))?;
     // 2. Collect surviving explicit ACEs (drop inherited and any
@@ -872,8 +982,12 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     } else {
         Protection::Unprotected
     };
-    write_file_dacl(canonical_path, new.as_ptr(), prot)
-        .with_context(|| format!("recompose '{canonical_path}'"))
+    match &lock_handle {
+        Some(h) => write_handle_dacl(h, new.as_ptr(), prot)
+            .with_context(|| format!("recompose '{canonical_path}'")),
+        None => write_file_dacl(canonical_path, new.as_ptr(), prot)
+            .with_context(|| format!("recompose '{canonical_path}'")),
+    }
 }
 
 /// Whether `canonical_path` carries an EXPLICIT `(OI)(CI)` deny ACE
@@ -1033,13 +1147,24 @@ mod tests {
     fn sb_ace_deny_reparse_round_trips() {
         let a = SbAce::DenyReparseLock;
         assert_eq!(SbAce::parse(a.kind(), a.as_str()).unwrap(), a);
-        // Object-only: the emitted ACE must not inherit.
+        // The emitted ACE must be OBJECT-ONLY (no inheritance): an
+        // (OI)(CI) lock here would deny writes across the junction's
+        // entire subtree.
+        let sid = LocalPsid::from_string("S-1-5-21-1-2-3-1000").unwrap();
         let set = SbAceSet {
             deny_reparse_lock: true,
             ..Default::default()
         };
-        // head_aces is private; the compose path is exercised by the
-        // recompose tests — here we only pin serialization.
-        let _ = set;
+        let aces = set.head_aces(sid.as_psid());
+        assert_eq!(aces.len(), 1);
+        match &aces[0] {
+            NewAce::Deny(_, mask, flags) => {
+                assert_eq!(*flags, NO_INHERIT, "lock must not inherit");
+                assert_ne!(mask & Mask::DELETE.bits(), 0);
+                assert_ne!(mask & Mask::WRITE_DAC.bits(), 0);
+                assert_ne!(mask & Mask::FILE_WRITE_DATA.bits(), 0);
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
     }
 }

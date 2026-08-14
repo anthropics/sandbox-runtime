@@ -243,4 +243,5 @@ try {
 }
 
 Write-Host "probe-deny-alias: done ($($script:FailCount) FAIL)"
-exit 0
+# Wired into CI: a FAIL must fail the workflow step.
+exit $script:FailCount

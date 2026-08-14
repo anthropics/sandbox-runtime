@@ -10,4 +10,4 @@ variant); and whether the junction object itself is protected from deletion (DA4
 Run as admin in the guest (PowerShell 5.1):
 `powershell -ExecutionPolicy Bypass -File probe-deny-alias.ps1 C:\path\to\srt-win.exe`
 Installs under a test-only sublayer GUID, uninstalls and cleans up everything at the
-end. Grep output for `DA[n] PASS|FAIL|INFO`. Diagnostic probe only; not wired into CI.
+end. Grep output for `DA[n] PASS|FAIL|INFO`. Runs in the Windows CI legs; non-zero exit = FAIL count.
