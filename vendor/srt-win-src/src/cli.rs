@@ -18,6 +18,8 @@
 //!   wfp    status | verify | uninstall — inspect/probe/remove WFP filters
 //!   acl    stamp | grant | restore | revoke | recover
 //!                                       — additive sandbox-user ACEs
+//!   audit-ww                           — bounded world-writable-dir
+//!                                         audit + session deny stamps
 //!   exec   -- <target> [args...]       — spawn under the two-hop
 //!                                         sandbox-user lockdown
 //!
@@ -178,6 +180,37 @@ enum Cmd {
     Acl {
         #[command(subcommand)]
         sub: AclCmd,
+    },
+    /// Bounded, unelevated world-writable-directory audit — the
+    /// dynamic complement to the install-time ambient deny list.
+    ///
+    /// Scans a fixed root set (top-level dirs of `%SystemDrive%`,
+    /// `%TEMP%`, `%PUBLIC%`, the broker's `PATH` entries, the cwd's
+    /// immediate children; local fixed drives only, reparse points
+    /// never followed) for directories whose DACL carries an
+    /// EXPLICIT ALLOW granting write to Everyone / BUILTIN\Users /
+    /// Authenticated Users (or a NULL DACL), and stamps
+    /// each hit with the same additive `(D;OICI;WriteDeny;;;<sb>)`
+    /// ACE as `acl stamp`'s denyWrite, recorded as a session hold
+    /// under `--holder-pid` (released by `acl restore`, reaped by
+    /// crash recovery). Best-effort: per-path stamp failures (the
+    /// broker lacks WRITE_DAC on a dir it does not own) are
+    /// reported, never fatal. Hard budgets — 2s wall, 50k DACL
+    /// reads, 1000 entries per listed dir — bound the scan; hitting
+    /// one is reported on stderr, never silent. Exit 0 unless the
+    /// state DB / init lock itself fails.
+    AuditWw {
+        /// Holder PID the audit denies are held under (see `acl
+        /// stamp` — normally the long-lived Node host).
+        #[arg(long)]
+        holder_pid: u32,
+        /// SID to deny — the dedicated sandbox user
+        /// (`srt-win user status` → `marker_user_sid`).
+        #[arg(long)]
+        sandbox_user_sid: String,
+        /// Emit a one-line JSON result object on stdout.
+        #[arg(long)]
+        json: bool,
     },
     /// Spawn a process inside the sandbox.
     ///
@@ -1362,6 +1395,87 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
         }
 
+        // ─── audit-ww ──────────────────────────────────────────────
+        Cmd::AuditWw {
+            holder_pid,
+            sandbox_user_sid,
+            json,
+        } => {
+            use srt_win::{state_db, ww_audit};
+            let (out, report) =
+                ww_audit::audit_and_stamp(state_db::HolderPid(holder_pid), &sandbox_user_sid)?;
+            eprintln!(
+                "srt-win: audit-ww — {} candidate(s), {} probed, {} \
+                 flagged, {} stamped{}; recovery pruned {} dead \
+                 broker(s), revoked {} orphan ACE(s)",
+                out.candidates,
+                out.probed,
+                out.flagged.len(),
+                out.stamped.len(),
+                if out.failed.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} FAILED (left unstamped)", out.failed.len())
+                },
+                report.dead_brokers,
+                report.aces_revoked,
+            );
+            // No silent caps: every bounded/skipped class is
+            // spelled out when it fired.
+            if out.wall_expired
+                || out.dacl_exhausted
+                || out.skipped_budget > 0
+                || out.dirs_truncated > 0
+                || out.unreadable > 0
+                || out.reparse_skipped > 0
+                || out.remote_skipped > 0
+            {
+                eprintln!(
+                    "srt-win: audit-ww: partial coverage — \
+                     wall_expired={}, dacl_reads={} (exhausted={}), \
+                     {} candidate(s) skipped on budget, {} dir \
+                     listing(s) truncated at {} entries, {} \
+                     unreadable, {} reparse-point(s) skipped, {} \
+                     non-local path(s) skipped",
+                    out.wall_expired,
+                    out.dacl_reads,
+                    out.dacl_exhausted,
+                    out.skipped_budget,
+                    out.dirs_truncated,
+                    srt_win::ww_audit::MAX_DIR_ENTRIES,
+                    out.unreadable,
+                    out.reparse_skipped,
+                    out.remote_skipped,
+                );
+            }
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "candidates": out.candidates,
+                        "scanned": out.probed,
+                        "flagged": out.flagged,
+                        "stamped": out.stamped,
+                        "failed": out
+                            .failed
+                            .iter()
+                            .map(|(p, e)| json!({ "path": p, "error": e }))
+                            .collect::<Vec<_>>(),
+                        "budget": {
+                            "wallExpired": out.wall_expired,
+                            "daclReads": out.dacl_reads,
+                            "daclExhausted": out.dacl_exhausted,
+                            "skipped": out.skipped_budget,
+                            "dirsTruncated": out.dirs_truncated,
+                            "unreadable": out.unreadable,
+                            "reparseSkipped": out.reparse_skipped,
+                            "remoteSkipped": out.remote_skipped,
+                        },
+                    })
+                );
+            }
+        }
+
         // ─── runner ────────────────────────────────────────────────
         Cmd::Runner => {
             let code = srt_win::runner::run()?;
@@ -1794,6 +1908,42 @@ mod tests {
                 sublayer_guid: Some(_)
             }
         ));
+    }
+
+    /// `audit-ww` parses with its required args and the `--json`
+    /// flag defaulting off.
+    #[test]
+    fn audit_ww_parses() {
+        let c = Cli::try_parse_from([
+            "srt-win",
+            "audit-ww",
+            "--holder-pid",
+            "1234",
+            "--sandbox-user-sid",
+            "S-1-5-21-1-2-3-1000",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            c.cmd,
+            Cmd::AuditWw {
+                holder_pid: 1234,
+                json: false,
+                ..
+            }
+        ));
+        let j = Cli::try_parse_from([
+            "srt-win",
+            "audit-ww",
+            "--holder-pid",
+            "1",
+            "--sandbox-user-sid",
+            "S-1-1-0",
+            "--json",
+        ])
+        .expect("parse");
+        assert!(matches!(j.cmd, Cmd::AuditWw { json: true, .. }));
+        // Both args are required.
+        assert!(Cli::try_parse_from(["srt-win", "audit-ww"]).is_err());
     }
 
     /// `--quiet` on `exec` parses and defaults false. Placement

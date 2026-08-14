@@ -72,6 +72,7 @@ import {
   getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
   verifyWindowsWfpEgress,
+  auditWindowsWorldWritable,
   resolveSrtWin,
   WindowsSandboxError,
   type SrtWinSpawn,
@@ -166,6 +167,12 @@ let windowsFsSbUserSid: string | undefined
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
 let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
+// Whether the initialize()-time world-writable audit stamped any
+// deny. The audit denies are ordinary session holds under this
+// process's PID, so reset()'s `acl restore` releases them — this
+// flag makes reset() run the release even when the session had no
+// filesystem config of its own (windowsFsStampedSet undefined).
+let windowsWwAuditApplied = false
 // `verifyWindowsWfpEgress()` is once per PROCESS (it spawns a
 // CreateProcessWithLogonW runner; first call may create the sandbox
 // user's profile). The WFP fence is install-scoped, not config- or
@@ -917,6 +924,34 @@ async function initialize(
       windowsFsSbUserSid = undefined
       config = undefined
       throw e
+    }
+    // World-writable-directory audit — bounded (2s / 50k DACL reads),
+    // best-effort, and NEVER blocks initialization: it flags
+    // third-party Everyone/Users-writable dirs (on PATH, under the
+    // drive root, in the cwd) that the static install-time ambient
+    // list cannot know about, and write-deny-stamps them for the
+    // sandbox SID as ordinary session deny holds under this
+    // process's PID — released at reset(), reaped by crash recovery.
+    // Runs AFTER the grants above so the session's allowWrite set is
+    // recorded in the state DB and excluded from stamping. The
+    // helper catches everything and returns undefined on failure.
+    if (windowsFsSbUserSid) {
+      const audit = await auditWindowsWorldWritable({
+        sandboxUserSid: windowsFsSbUserSid,
+        srtWin,
+      })
+      if (audit) {
+        windowsWwAuditApplied = audit.stamped.length > 0
+        logForDebugging(
+          `[Sandbox Windows] ww audit: ${audit.scanned} scanned, ` +
+            `${audit.flagged.length} flagged, ` +
+            `${audit.stamped.length} stamped, ` +
+            `${audit.failed.length} failed` +
+            (audit.budget.wallExpired || audit.budget.daclExhausted
+              ? ` (budget hit — partial coverage)`
+              : ''),
+        )
+      }
     }
   }
 
@@ -2194,7 +2229,10 @@ async function reset(): Promise<void> {
   // — log anomalies rather than throw, so teardown always
   // completes. Leftover ACEs are recoverable later via
   // `srt-win acl recover` (which sweeps by trustee SID).
-  if (windowsFsStampedSet && windowsFsSbUserSid) {
+  // `windowsWwAuditApplied` counts too: the world-writable audit's
+  // deny stamps are session holds under this PID even when the
+  // session had no filesystem config of its own.
+  if ((windowsFsStampedSet || windowsWwAuditApplied) && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
@@ -2223,6 +2261,7 @@ async function reset(): Promise<void> {
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  windowsWwAuditApplied = false
   srtWinSpawn = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 

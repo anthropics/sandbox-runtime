@@ -341,6 +341,33 @@ pub(crate) fn read_file_dacl(canonical_path: &str) -> Result<(OwnedSd, *mut ACL)
     Ok((OwnedSd::from_raw(psd), dacl))
 }
 
+/// Read a DACL from an OPEN handle via `GetSecurityInfo` — the
+/// by-handle mirror of [`read_file_dacl`], for callers that must
+/// not re-resolve the path by name after a no-follow open
+/// (`ww_audit`'s reparse-hardened probe: a name re-resolve could be
+/// redirected through a raced-in junction, including onto a UNC
+/// target). Same ownership contract: the `*mut ACL` points into the
+/// returned [`OwnedSd`]'s buffer.
+pub(crate) fn read_handle_dacl(h: &crate::util::OwnedHandle) -> Result<(OwnedSd, *mut ACL)> {
+    use windows::Win32::Security::Authorization::GetSecurityInfo;
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let r = unsafe {
+        GetSecurityInfo(
+            h.raw(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut dacl),
+            None,
+            Some(&mut psd),
+        )
+    };
+    win32_ok(r, "GetSecurityInfo(dacl, by-handle)")?;
+    Ok((OwnedSd::from_raw(psd), dacl))
+}
+
 /// Whether `sd`'s DACL carries `SE_DACL_PROTECTED` — inheritance from
 /// the parent was deliberately severed (`icacls /inheritance:d`,
 /// hardened trees). [`apply_sandbox_aces`] preserves this bit on

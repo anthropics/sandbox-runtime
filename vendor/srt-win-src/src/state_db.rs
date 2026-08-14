@@ -975,6 +975,21 @@ impl Locked {
         Ok((out, failed))
     }
 
+    /// Canonical paths of live session write grants —
+    /// `working_aces` rows with `kind='grant'` at the effective
+    /// `'modify'` mask. The world-writable audit's allow-list: a
+    /// path a session deliberately opened for sandbox writes (the
+    /// working tree) must not be write-deny-stamped by the audit.
+    pub fn granted_write_paths(&self) -> Result<Vec<String>> {
+        query_vec(
+            &self.conn,
+            "SELECT canonical_path FROM working_aces \
+             WHERE kind = 'grant' AND mask = 'modify'",
+            [],
+            |r| r.get(0),
+        )
+    }
+
     /// Record a placeholder component `acl stamp` is about to
     /// create (see the `placeholders` table comment). Idempotent
     /// (`INSERT OR IGNORE`); called intent-first — before the

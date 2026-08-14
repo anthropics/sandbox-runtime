@@ -128,15 +128,7 @@ pub fn canonicalize_path(path: &str) -> Result<(String, bool), CanonError> {
         let h = open_for_metadata(path)
             .with_context(|| format!("open '{path}' for canonicalization"))?;
 
-        let buf = final_path_from_handle(h.raw())
-            .with_context(|| format!("GetFinalPathNameByHandleW('{path}')"))?;
-        let canonical = String::from_utf16_lossy(&buf);
-        if !utf16_roundtrips(&buf, &canonical) {
-            bail!(
-                "canonical path for '{path}' is not representable as \
-                 UTF-8 (contains unpaired surrogates); not supported"
-            );
-        }
+        let canonical = canonical_path_from_handle(h.raw(), path)?;
 
         // Directory check on the OPEN HANDLE (not a path
         // re-resolve): the handle was opened without
@@ -331,6 +323,25 @@ pub fn create_placeholder_chain(
         }
     }
     Ok((cur_canon, created))
+}
+
+/// Kernel-canonical `\\?\…` path of an OPEN handle — the by-handle
+/// half of [`canonicalize_path`], shared with `ww_audit`'s
+/// no-follow probe (which must derive the canonical path from the
+/// handle it validated, never a name re-resolve). `label` is the
+/// caller's input path, for error context only. Fails closed on a
+/// canonical path that is not UTF-8-representable.
+pub(crate) fn canonical_path_from_handle(h: HANDLE, label: &str) -> Result<String> {
+    let buf = final_path_from_handle(h)
+        .with_context(|| format!("GetFinalPathNameByHandleW('{label}')"))?;
+    let canonical = String::from_utf16_lossy(&buf);
+    if !utf16_roundtrips(&buf, &canonical) {
+        bail!(
+            "canonical path for '{label}' is not representable as \
+             UTF-8 (contains unpaired surrogates); not supported"
+        );
+    }
+    Ok(canonical)
 }
 
 /// Open `path` with no data access (`dwDesiredAccess = 0`), full

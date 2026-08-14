@@ -1995,6 +1995,106 @@ export function revokeWindowsAcl(opts: {
   }
 }
 
+/** Budget/coverage counters from `srt-win audit-ww` — every bounded
+ *  or skipped class is reported so partial coverage is visible. */
+export interface WindowsWwAuditBudget {
+  /** The 2s wall-clock budget expired mid-scan. */
+  wallExpired: boolean
+  /** DACL probes performed (cap 50 000). */
+  daclReads: number
+  /** The DACL-probe cap was hit. */
+  daclExhausted: boolean
+  /** Candidates never probed because a budget ran out first. */
+  skipped: number
+  /** Root listings truncated at the 1000-entries-per-dir cap. */
+  dirsTruncated: number
+  /** Candidates whose probe failed (not simple not-found). */
+  unreadable: number
+  /** Candidates skipped as reparse points (junctions/symlinks). */
+  reparseSkipped: number
+  /** Candidates that resolved outside plain local-drive space. */
+  remoteSkipped: number
+}
+
+/** Result of `srt-win audit-ww --json` — see
+ *  {@link auditWindowsWorldWritable}. */
+export interface WindowsWwAuditResult {
+  /** Candidate directories collected from the fixed root set. */
+  candidates: number
+  /** Candidates actually probed (open + DACL read). */
+  scanned: number
+  /** Canonical paths whose DACL carries an explicit ALLOW granting
+   *  write to Everyone / BUILTIN\Users / Authenticated Users. */
+  flagged: string[]
+  /** Flagged paths whose write-deny stamp landed. */
+  stamped: string[]
+  /** Flagged paths whose stamp failed (broker lacks WRITE_DAC
+   *  there) — recorded and warned, never fatal. */
+  failed: { path: string; error: string }[]
+  budget: WindowsWwAuditBudget
+}
+
+/**
+ * Bounded world-writable-directory audit — the per-session dynamic
+ * complement to the install-time static ambient deny list. Thin
+ * wrapper around `srt-win audit-ww`: scans a fixed root set
+ * (top-level dirs of `%SystemDrive%`, `%TEMP%`, `%PUBLIC%`, the
+ * broker's `PATH` entries, the cwd's immediate children — local
+ * fixed drives only, reparse points never followed) for
+ * directories whose DACL carries an EXPLICIT ALLOW granting write
+ * to Everyone / BUILTIN\Users / Authenticated Users (inherited
+ * world-write — the stock volume-root class — is out of scope; see
+ * `ww_audit.rs`), and write-deny-stamps each hit for the
+ * sandbox SID as an ordinary session deny hold under `holderPid` —
+ * released by {@link restoreWindowsAcl} at `reset()`, reaped by
+ * crash recovery if the holder dies. Paths already covered by the
+ * ambient list, a session write grant, or the machine state dir are
+ * excluded.
+ *
+ * BEST-EFFORT BY CONTRACT: any failure — spawn, timeout, non-zero
+ * exit, unparseable output — degrades to a debug log and an
+ * `undefined` return. It must never block `initialize()`; the
+ * audit is defense-in-depth on top of the WFP fence and the
+ * separate-user FS model, not a load-bearing gate.
+ */
+export async function auditWindowsWorldWritable(opts: {
+  /** SID of the dedicated sandbox user — {@link WindowsSandboxUserStatus.sid}. */
+  sandboxUserSid: string
+  /** Long-lived host PID the holds are tied to. Default: this process. */
+  holderPid?: number
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
+}): Promise<WindowsWwAuditResult | undefined> {
+  const holder = opts.holderPid ?? process.pid
+  try {
+    // 30s: the scan itself is capped at 2s, but the init lock can
+    // wait up to 60s behind a wedged holder and Defender may
+    // cold-scan the exe — do not let a slow environment turn the
+    // best-effort audit into a spurious timeout throw upstream.
+    const r = await runSrtWinAsync(
+      [
+        'audit-ww',
+        '--holder-pid',
+        `${holder}`,
+        '--sandbox-user-sid',
+        opts.sandboxUserSid,
+        '--json',
+      ],
+      { timeoutMs: 30_000, srtWin: opts.srtWin },
+    )
+    logForDebugging(
+      `[Sandbox Windows] audit-ww exit=${r.status}: ${r.stderr || r.stdout}`,
+    )
+    if (r.status !== 0) return undefined
+    return JSON.parse(r.stdout) as WindowsWwAuditResult
+  } catch (e) {
+    logForDebugging(`[Sandbox Windows] audit-ww: ${(e as Error).message}`, {
+      level: 'warn',
+    })
+    return undefined
+  }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Wrap
 // ────────────────────────────────────────────────────────────────────

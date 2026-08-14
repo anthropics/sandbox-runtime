@@ -6,7 +6,10 @@
   for a sandboxed child (write denied, read allowed), that a session
   deny stamp + restore on the same path preserves the ambient floor
   (the `ambient_denies` fold-in at the recompose chokepoint), and
-  that uninstall removes it all.
+  that uninstall removes it all. Also covers the broker-time
+  `audit-ww` sweep (WW1): a third-party Everyone-writable dir under
+  the system drive is flagged and session-deny-stamped, a junction
+  sibling is skipped, and `acl restore` releases the stamp.
 
   Self-contained: installs under a fixed test-only sublayer GUID
   (distinct from the other smoke scripts). NOTE the ambient stamps
@@ -96,6 +99,47 @@ try {
   Assert-WriteDenied 'AM3: ambient deny lost after session stamp+restore round-trip'
   Write-Host 'AM3 ok: ambient floor survives session stamp+restore'
 
+  # -- WW1: audit-ww flags + stamps a third-party world-writable dir --
+  # Create an Everyone-writable dir directly under the system drive
+  # (a scanned root), a junction sibling pointing at it (must be
+  # skipped, never followed), run the audit, and assert: the dir is
+  # stamped, a sandboxed write into it is denied, the junction is
+  # not flagged, and `acl restore` releases the deny (the dir is
+  # Everyone-writable again for the sandbox account).
+  $wwDir  = Join-Path $env:SystemDrive "srt-ww-smoke-$([guid]::NewGuid().ToString('N'))"
+  $wwJunc = "$wwDir-junc"
+  New-Item -ItemType Directory -Path $wwDir | Out-Null
+  # Everyone: generic write, inheritable - the shape a sloppy
+  # third-party installer leaves behind.
+  icacls $wwDir /grant '*S-1-1-0:(OI)(CI)(GW)' | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "WW1: icacls grant on $wwDir failed" }
+  New-Item -ItemType Junction -Path $wwJunc -Value $wwDir | Out-Null
+  $auditRaw = & $Exe audit-ww --holder-pid $PID --sandbox-user-sid $sbSid --json 2>&1
+  if ($LASTEXITCODE -ne 0) { throw "WW1: audit-ww exited ${LASTEXITCODE}: $auditRaw" }
+  Write-Host ($auditRaw | Out-String)
+  $audit = ($auditRaw | Where-Object { "$_".StartsWith('{') } | Select-Object -First 1) | ConvertFrom-Json
+  $wwLeaf = Split-Path $wwDir -Leaf
+  if (-not ($audit.stamped | Where-Object { $_ -like "*$wwLeaf" })) {
+    throw "WW1: audit-ww did not stamp ${wwDir}: stamped=$($audit.stamped -join ', ')"
+  }
+  if ($audit.flagged | Where-Object { $_ -like "*$wwLeaf-junc" }) {
+    throw 'WW1: audit-ww flagged the junction (reparse points must be skipped)'
+  }
+  $probe = Join-Path $wwDir 'ww-probe.txt'
+  Assert-WriteDenied 'WW1: sandboxed write into audited world-writable dir succeeded (must be denied)'
+  # Release: the audit denies are ordinary session holds under this
+  # holder PID, so `acl restore` removes them; the dir then accepts
+  # sandbox writes again via its own Everyone grant.
+  Run @('acl','restore','--holder-pid',$PID,'--sandbox-user-sid',$sbSid,'--json')
+  & $Exe exec --quiet -- $cmd /c "echo p > `"$probe`"" 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $probe)) {
+    throw 'WW1: sandboxed write still denied after acl restore (audit deny not released)'
+  }
+  Remove-Item $probe -Force -ea SilentlyContinue
+  # Reset $probe for the later ambient sections that reuse it.
+  $probe = Join-Path $env:ProgramData "srt-ambient-smoke-$([guid]::NewGuid().ToString('N')).txt"
+  Write-Host 'WW1 ok: audit-ww stamped the world-writable dir, skipped the junction, restore released it'
+
   # ── AM4: --keep-user uninstall keeps the floor ───────────────────
   # Ambient stamps key on the ACCOUNT, not the sublayer: tearing down
   # one sublayer with --keep-user (what test suites do around a
@@ -133,6 +177,14 @@ try {
 }
 finally {
   & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-Null
+  # WW1 leftovers: remove the junction FIRST (rmdir on a junction
+  # deletes the link, not the target), then the dir.
+  if ($wwJunc -and (Test-Path $wwJunc)) {
+    (Get-Item $wwJunc).Delete()
+  }
+  if ($wwDir -and (Test-Path $wwDir)) {
+    Remove-Item $wwDir -Recurse -Force -ea SilentlyContinue
+  }
 }
 
-Write-Host 'smoke-ambient: PASS (AM1/AM2/AM3/AM4/AM5)'
+Write-Host 'smoke-ambient: PASS (AM1/AM2/AM3/WW1/AM4/AM5)'
