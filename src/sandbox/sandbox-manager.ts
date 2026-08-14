@@ -89,6 +89,7 @@ import {
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
+import { collectSshKeyDenyPaths } from './ssh-config-deny.js'
 import {
   SandboxViolationStore,
   sanitizeUnregisteredCommandKey,
@@ -177,6 +178,14 @@ let windowsWfpVerified = false
 // and so reset()'s revoke/restore addresses the SAME binary the
 // grants/stamps were applied with even if `config` mutated between.
 let srtWinSpawn: SrtWinSpawn | undefined
+/**
+ * SSH key material referenced by the user's ssh config (or ssh's default key
+ * filenames) that is not already covered by the configured denyRead entries.
+ * Computed once per initialize()/updateConfig() and appended to every
+ * effective denyRead set — appended only, so it can widen protection but
+ * never narrow what the caller configured.
+ */
+let sshKeyDenyPaths: string[] = []
 const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
@@ -643,6 +652,11 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+
+  // Widen read protection to SSH key material referenced by the user's ssh
+  // config (keys often live outside ~/.ssh). Never fails initialization —
+  // a malformed config yields fewer additions, not an error.
+  sshKeyDenyPaths = collectSshKeyDenyPaths()
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
@@ -1213,7 +1227,18 @@ function getCredentialDenyReadPaths(
   credentials: CredentialsConfig | undefined,
 ): string[] {
   const files = credentials?.files ?? []
-  return [...new Set(files.filter(f => f.mode === 'deny').map(f => f.path))]
+  // sshKeyDenyPaths rides the credential deny-read channel: this is
+  // the file's documented choke point for "paths this config wants
+  // read-denied", so the SSH key protection reaches every backend —
+  // including the Windows ACL stamp set and the per-exec path,
+  // which never consult getFsReadConfig()/wrapWithSandbox's POSIX
+  // assembly.
+  return [
+    ...new Set([
+      ...files.filter(f => f.mode === 'deny').map(f => f.path),
+      ...sshKeyDenyPaths,
+    ]),
+  ]
 }
 
 /**
@@ -1337,6 +1362,8 @@ function getFsReadConfig(): FsReadRestrictionConfig {
       expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
     credentialRestrictions.degradeToDenyPaths,
   )
+
+  // Mandatory SSH key protection (concrete absolute paths, no globs).
 
   return {
     denyOnly: denyPaths,
@@ -2055,6 +2082,8 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
   resolvedAddressGuard = nextGuard
+  // Recompute SSH key denies against the new denyRead set (see initialize()).
+  sshKeyDenyPaths = collectSshKeyDenyPaths()
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
   // effect only on re-initialize. This keeps the state consistent for the
