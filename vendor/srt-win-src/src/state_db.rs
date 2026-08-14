@@ -981,11 +981,15 @@ impl Locked {
     /// path a session deliberately opened for sandbox writes (the
     /// working tree) must not be write-deny-stamped by the audit.
     pub fn granted_write_paths(&self) -> Result<Vec<String>> {
+        // Bound to the enum's own serialization so a mask-token
+        // rename cannot silently desynchronize this filter from
+        // what apply_aces writes.
+        let write_mask = acl::SbAce::Grant(acl::GrantMask::Modify).as_str();
         query_vec(
             &self.conn,
             "SELECT canonical_path FROM working_aces \
-             WHERE kind = 'grant' AND mask = 'modify'",
-            [],
+             WHERE kind = 'grant' AND mask = ?1",
+            params![write_mask],
             |r| r.get(0),
         )
     }

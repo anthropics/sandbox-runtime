@@ -20,9 +20,11 @@
 //!
 //! ## Scope and budgets
 //!
-//! Roots: the top-level directories of `%SystemDrive%`, `%TEMP%`,
-//! `%PUBLIC%`, every `PATH` entry of the broker's environment, and
-//! the immediate children of the broker's cwd. Depth 1 — this is a
+//! Roots: the top-level directories of `%SystemDrive%`; `%TEMP%`
+//! and `%PUBLIC%` themselves (single candidates — enumerating
+//! TEMP's thousands of entries would eat the budget); every `PATH`
+//! entry of the broker's environment; and the immediate children
+//! of the broker's cwd. Depth 1 — this is a
 //! cheap sweep of the highest-value surfaces, not a filesystem walk.
 //! Hard budgets bound the worst case: [`WALL_BUDGET`] wall-clock,
 //! [`MAX_DACL_READS`] DACL probes, [`MAX_DIR_ENTRIES`] entries per
@@ -83,9 +85,15 @@
 //! refcounting across concurrent brokers, release at `acl restore`
 //! (the host's `reset()`), and crash-recovery reaping when the
 //! holder dies. `apply_aces` also stamps the flagged dir's parent
-//! with the standard `deny_fdc` ACE (never a volume root —
-//! `canonical_parent_of` refuses those), which protects the deny
-//! from a sandbox-side rename/delete of the flagged dir itself.
+//! with the standard `deny_fdc` ACE — EXCEPT when the parent is a
+//! volume root (`canonical_parent_of` returns `None` there, and the
+//! audit's primary candidate class is exactly top-level
+//! `%SystemDrive%` dirs): for those, a parent that itself grants
+//! FILE_DELETE_CHILD to the sandbox (an admin loosening `C:\`)
+//! would let the sandbox delete-and-recreate the flagged dir
+//! deny-free. Accepted: the stock root grants no such right, and
+//! stamping a volume root is exactly what this module must never
+//! do.
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -454,7 +462,14 @@ fn push_children(
         // extra open, and it reports reparse points as symlinks
         // WITHOUT following them.
         let Ok(ft) = ent.file_type() else { continue };
-        if !ft.is_dir() || ft.is_symlink() {
+        if ft.is_symlink() {
+            // Counted so the CI junction regression check has a
+            // signal: a healthy run skips planted reparse points
+            // HERE, before probe_dir ever sees them.
+            out.reparse_skipped += 1;
+            continue;
+        }
+        if !ft.is_dir() {
             continue;
         }
         push_candidate(candidates, seen, ent.path().display().to_string());
@@ -466,7 +481,16 @@ fn push_candidate(candidates: &mut Vec<String>, seen: &mut HashSet<String>, p: S
     if !lexically_local_drive_path(&p) {
         return;
     }
-    if seen.insert(norm_key(&p)) {
+    // NEVER a bare drive root (norm_key("C:\") == "c:"): a root can
+    // reach here via a PATH entry of `C:\` (a common installer
+    // artifact) or TEMP/PUBLIC set to a root, the stock root's
+    // explicit `AU:(AD)` ACE always flags, and stamping it would
+    // propagate an (OI)(CI) WriteDeny across the entire volume.
+    let key = norm_key(&p);
+    if key.len() <= 2 {
+        return;
+    }
+    if seen.insert(key) {
         candidates.push(p);
     }
 }

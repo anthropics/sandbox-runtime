@@ -125,6 +125,14 @@ try {
   if ($audit.flagged | Where-Object { $_ -like "*$wwLeaf-junc" }) {
     throw 'WW1: audit-ww flagged the junction (reparse points must be skipped)'
   }
+  # Non-vacuous half: a regression that FOLLOWS reparse points would
+  # surface the junction under its target's canonical name and dedup
+  # away - the flagged-list check above cannot see that. The
+  # collection-time skip is counted, so require the counter to have
+  # registered our planted junction.
+  if (-not $audit.budget.reparseSkipped -or $audit.budget.reparseSkipped -lt 1) {
+    throw "WW1: reparseSkipped=$($audit.budget.reparseSkipped) - the planted junction was not skip-counted (reparse handling regressed?)"
+  }
   $probe = Join-Path $wwDir 'ww-probe.txt'
   Assert-WriteDenied 'WW1: sandboxed write into audited world-writable dir succeeded (must be denied)'
   # Release: the audit denies are ordinary session holds under this
@@ -180,7 +188,9 @@ finally {
   # WW1 leftovers: remove the junction FIRST (rmdir on a junction
   # deletes the link, not the target), then the dir.
   if ($wwJunc -and (Test-Path $wwJunc)) {
-    (Get-Item $wwJunc).Delete()
+    # Guarded: a transient AV/indexer handle here must not mask the
+    # real test error or skip the wwDir removal below.
+    try { (Get-Item $wwJunc).Delete() } catch { }
   }
   if ($wwDir -and (Test-Path $wwDir)) {
     Remove-Item $wwDir -Recurse -Force -ea SilentlyContinue

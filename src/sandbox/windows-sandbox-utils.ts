@@ -2038,7 +2038,7 @@ export interface WindowsWwAuditResult {
  * Bounded world-writable-directory audit — the per-session dynamic
  * complement to the install-time static ambient deny list. Thin
  * wrapper around `srt-win audit-ww`: scans a fixed root set
- * (top-level dirs of `%SystemDrive%`, `%TEMP%`, `%PUBLIC%`, the
+ * (top-level dirs of `%SystemDrive%`; `%TEMP%` and `%PUBLIC%` themselves; the
  * broker's `PATH` entries, the cwd's immediate children — local
  * fixed drives only, reparse points never followed) for
  * directories whose DACL carries an EXPLICIT ALLOW granting write
@@ -2071,7 +2071,7 @@ export async function auditWindowsWorldWritable(opts: {
     // wait up to 60s behind a wedged holder and Defender may
     // cold-scan the exe — do not let a slow environment turn the
     // best-effort audit into a spurious timeout throw upstream.
-    const r = await runSrtWinAsync(
+    const result = await runSrtWinJsonAsync<WindowsWwAuditResult>(
       [
         'audit-ww',
         '--holder-pid',
@@ -2082,11 +2082,8 @@ export async function auditWindowsWorldWritable(opts: {
       ],
       { timeoutMs: 30_000, srtWin: opts.srtWin },
     )
-    logForDebugging(
-      `[Sandbox Windows] audit-ww exit=${r.status}: ${r.stderr || r.stdout}`,
-    )
-    if (r.status !== 0) return undefined
-    return JSON.parse(r.stdout) as WindowsWwAuditResult
+    logForDebugging(`[Sandbox Windows] audit-ww ok`)
+    return result
   } catch (e) {
     logForDebugging(`[Sandbox Windows] audit-ww: ${(e as Error).message}`, {
       level: 'warn',

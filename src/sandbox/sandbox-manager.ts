@@ -168,11 +168,6 @@ let windowsFsSbUserSid: string | undefined
 // re-expands globs — see `sameWindowsStampSet`.
 let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // Whether the initialize()-time world-writable audit stamped any
-// deny. The audit denies are ordinary session holds under this
-// process's PID, so reset()'s `acl restore` releases them — this
-// flag makes reset() run the release even when the session had no
-// filesystem config of its own (windowsFsStampedSet undefined).
-let windowsWwAuditApplied = false
 // `verifyWindowsWfpEgress()` is once per PROCESS (it spawns a
 // CreateProcessWithLogonW runner; first call may create the sandbox
 // user's profile). The WFP fence is install-scoped, not config- or
@@ -941,7 +936,6 @@ async function initialize(
         srtWin,
       })
       if (audit) {
-        windowsWwAuditApplied = audit.stamped.length > 0
         logForDebugging(
           `[Sandbox Windows] ww audit: ${audit.scanned} scanned, ` +
             `${audit.flagged.length} flagged, ` +
@@ -2229,10 +2223,14 @@ async function reset(): Promise<void> {
   // — log anomalies rather than throw, so teardown always
   // completes. Leftover ACEs are recoverable later via
   // `srt-win acl recover` (which sweeps by trustee SID).
-  // `windowsWwAuditApplied` counts too: the world-writable audit's
-  // deny stamps are session holds under this PID even when the
-  // session had no filesystem config of its own.
-  if ((windowsFsStampedSet || windowsWwAuditApplied) && windowsFsSbUserSid) {
+  // Gated on the SID alone, not windowsFsStampedSet: the
+  // world-writable audit's deny stamps are session holds under this
+  // PID even when the session had no filesystem config of its own —
+  // and audit stamps can land on disk while the TS wrapper observed
+  // a failure (timeout mid-stamping, garbled stdout), so no flag on
+  // this side can be trusted to know. restore/revoke are cheap
+  // no-op sweeps by SID+PID when nothing is held.
+  if (windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
@@ -2261,7 +2259,6 @@ async function reset(): Promise<void> {
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
-  windowsWwAuditApplied = false
   srtWinSpawn = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
