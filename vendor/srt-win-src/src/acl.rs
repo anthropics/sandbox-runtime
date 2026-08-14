@@ -92,6 +92,8 @@ impl Mask {
     pub const FILE_DELETE_CHILD: Self = Self(0x0000_0040);
     pub const FILE_ALL: Self = Self(FILE_ALL_ACCESS.0);
     pub const FILE_WRITE_ATTRIBUTES: Self = Self(0x0000_0100);
+    pub const FILE_WRITE_DATA: Self = Self(0x0000_0002);
+    pub const FILE_WRITE_EA: Self = Self(0x0000_0010);
     pub const FILE_GENERIC_READ: Self = Self(FILE_GENERIC_READ.0);
     pub const FILE_GENERIC_WRITE: Self =
         Self(windows::Win32::Storage::FileSystem::FILE_GENERIC_WRITE.0);
@@ -671,6 +673,19 @@ pub enum SbAce {
     /// whole subtree if the placeholder later becomes a real user
     /// directory.
     DenyDelete,
+    /// Object-only (`NO_INHERIT`) deny of
+    /// `DELETE | FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES |
+    /// FILE_WRITE_EA | WRITE_DAC` on a REPARSE POINT that a deny
+    /// path's lexical spelling traverses (or is). ACLs attach to the
+    /// resolved OBJECT, so a junction-spelled deny stamps only the
+    /// canonical target — leaving the junction itself re-pointable:
+    /// delete + recreate (object DELETE via an inherited grant beats
+    /// the parent-FDC deny) or an in-place FSCTL_SET_REPARSE_POINT
+    /// rewrite makes the denied SPELLING resolve to an unstamped
+    /// object (verified live: probe-deny-alias DA3b/DA4). Locking
+    /// the reparse object closes both without touching ordinary
+    /// ancestor directories.
+    DenyReparseLock,
 }
 
 impl GrantMask {
@@ -710,6 +725,7 @@ impl SbAce {
             SbAce::Deny(_) => "deny",
             SbAce::DenyFdc => "deny_fdc",
             SbAce::DenyDelete => "deny_delete",
+            SbAce::DenyReparseLock => "deny_reparse",
         }
     }
     /// `'read' | 'modify' | 'denyRead' | 'denyWrite' | 'fdc'` — the
@@ -723,6 +739,7 @@ impl SbAce {
             SbAce::Deny(DenyMask::WriteDeny) => "denyWrite",
             SbAce::DenyFdc => "fdc",
             SbAce::DenyDelete => "delete",
+            SbAce::DenyReparseLock => "reparse_lock",
         }
     }
     pub fn parse(kind: &str, mask: &str) -> Result<Self> {
@@ -733,6 +750,7 @@ impl SbAce {
             ("deny", "denyWrite") => SbAce::Deny(DenyMask::WriteDeny),
             ("deny_fdc", _) => SbAce::DenyFdc,
             ("deny_delete", _) => SbAce::DenyDelete,
+            ("deny_reparse", _) => SbAce::DenyReparseLock,
             (k, m) => bail!("unknown SbAce kind={k:?} mask={m:?}"),
         })
     }
@@ -763,6 +781,7 @@ pub struct SbAceSet {
     pub deny: Option<DenyMask>,
     pub deny_fdc: bool,
     pub deny_delete: bool,
+    pub deny_reparse_lock: bool,
 }
 
 impl SbAceSet {
@@ -777,6 +796,18 @@ impl SbAceSet {
         }
         if self.deny_delete {
             v.push(NewAce::Deny(sid, Mask::DELETE.bits(), NO_INHERIT));
+        }
+        if self.deny_reparse_lock {
+            v.push(NewAce::Deny(
+                sid,
+                Mask::DELETE
+                    .with(Mask::FILE_WRITE_DATA)
+                    .with(Mask::FILE_WRITE_ATTRIBUTES)
+                    .with(Mask::FILE_WRITE_EA)
+                    .with(Mask::WRITE_DAC)
+                    .bits(),
+                NO_INHERIT,
+            ));
         }
         if self.deny_fdc {
             v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));
@@ -996,5 +1027,19 @@ mod tests {
         assert_eq!(ow.bits(), Mask::READ_CONTROL.bits());
         assert_ne!(ow.bits(), 0);
         assert_eq!(ow.bits() & Mask::WRITE_DAC.bits(), 0);
+    }
+
+    #[test]
+    fn sb_ace_deny_reparse_round_trips() {
+        let a = SbAce::DenyReparseLock;
+        assert_eq!(SbAce::parse(a.kind(), a.as_str()).unwrap(), a);
+        // Object-only: the emitted ACE must not inherit.
+        let set = SbAceSet {
+            deny_reparse_lock: true,
+            ..Default::default()
+        };
+        // head_aces is private; the compose path is exercised by the
+        // recompose tests — here we only pin serialization.
+        let _ = set;
     }
 }

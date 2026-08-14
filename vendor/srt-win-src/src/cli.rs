@@ -523,6 +523,17 @@ fn canonicalize_ace_targets(
             for anc in db.placeholder_ancestors_of(&canon)? {
                 targets.push((anc, SbAce::DenyDelete));
             }
+            // A deny whose SPELLING rides through reparse points
+            // stamps only the resolved object; lock each traversed
+            // link so the child cannot re-point or delete+recreate
+            // it to make the denied spelling resolve elsewhere
+            // (probe-deny-alias DA3b/DA4).
+            for link in srt_win::path_id::reparse_components(p) {
+                eprintln!(
+                    "srt-win: deny target '{p}' traverses reparse                      point '{link}'; locking the link object"
+                );
+                targets.push((link, SbAce::DenyReparseLock));
+            }
         }
     }
     Ok(AceTargets {
