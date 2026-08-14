@@ -8,9 +8,10 @@ use anyhow::{Context, Result, bail};
 use std::mem::size_of;
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS,
-    GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS, GetFinalPathNameByHandleW, OPEN_EXISTING,
+    VOLUME_NAME_DOS,
 };
 
 use crate::util::{OwnedHandle, pcwstr, wstr};
@@ -84,6 +85,18 @@ pub fn is_unc_path(p: &str) -> bool {
     n.starts_with(r"\\") && !n.starts_with(r"\\?\") && !n.starts_with(r"\\.\")
 }
 
+/// Whether `path` equals `prefix` or sits strictly under it on a
+/// whole path-component boundary (`C:\Program` does NOT cover
+/// `C:\ProgramData`). Purely bytewise: callers must pass both sides
+/// in one consistent normalization (case, separators, no trailing
+/// separator).
+pub(crate) fn is_path_prefix(prefix: &str, path: &str) -> bool {
+    path == prefix
+        || (path.len() > prefix.len()
+            && path.starts_with(prefix)
+            && path.as_bytes()[prefix.len()] == b'\\')
+}
+
 /// Strip a `\\?\` or `\\?\UNC\` extended-path prefix from a
 /// pre-canonicalized input (either separator style). Used for
 /// comparable component-count sort keys so `\\?\C:\y` and `C:\y`
@@ -125,7 +138,7 @@ pub fn canonicalize_path(path: &str) -> Result<(String, bool), CanonError> {
         // Open without requesting any data access so we don't
         // need read permission on the target.
         // `BACKUP_SEMANTICS` lets directories open too.
-        let h = open_for_metadata(path)
+        let h = open_for_metadata(path, 0, false)
             .with_context(|| format!("open '{path}' for canonicalization"))?;
 
         let canonical = canonical_path_from_handle(h.raw(), path)?;
@@ -344,20 +357,28 @@ pub(crate) fn canonical_path_from_handle(h: HANDLE, label: &str) -> Result<Strin
     Ok(canonical)
 }
 
-/// Open `path` with no data access (`dwDesiredAccess = 0`), full
-/// sharing, `BACKUP_SEMANTICS` (so directories open), `OPEN_EXISTING`.
-/// Shared by every metadata-query helper so a future change to the
-/// open flags (e.g. `FILE_FLAG_OPEN_REPARSE_POINT`) lands once.
-fn open_for_metadata(path: &str) -> Result<OwnedHandle> {
+/// Open `path` for metadata queries: `access` (usually 0 — attribute
+/// and final-path reads need no data access; `READ_CONTROL` for a
+/// DACL read), full sharing, `BACKUP_SEMANTICS` (so directories
+/// open), `OPEN_EXISTING`, and — when `no_follow` —
+/// `FILE_FLAG_OPEN_REPARSE_POINT` so the object itself opens with no
+/// reparse traversal. The single chokepoint for metadata opens, so a
+/// change to the open flags lands once.
+pub(crate) fn open_for_metadata(path: &str, access: u32, no_follow: bool) -> Result<OwnedHandle> {
     let w = wstr(path);
+    let flags = if no_follow {
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    } else {
+        FILE_FLAG_BACKUP_SEMANTICS
+    };
     let h = unsafe {
         CreateFileW(
             pcwstr(&w),
-            0,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
+            flags,
             None,
         )
     }?;
@@ -461,7 +482,7 @@ fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
 /// (identity query only), so a DENY-ACE on the file does not
 /// interfere — the broker is the real user, not the deny trustee.
 pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
-    let h = open_for_metadata(canonical_path)
+    let h = open_for_metadata(canonical_path, 0, false)
         .with_context(|| format!("open '{canonical_path}' for file_id"))?;
     file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))
 }
@@ -477,7 +498,7 @@ pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)>
     use windows::Win32::Storage::FileSystem::{
         FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
     };
-    let h = open_for_metadata(canonical_path)
+    let h = open_for_metadata(canonical_path, 0, false)
         .with_context(|| format!("open '{canonical_path}' for file_id+links"))?;
     let id = file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))?;
     let mut std_info = FILE_STANDARD_INFO::default();
@@ -518,7 +539,7 @@ pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
     // its canonical_path was recorded under).
     for drive in b'A'..=b'Z' {
         let root = format!(r"\\?\{}:\", drive as char);
-        let vh = match open_for_metadata(&root) {
+        let vh = match open_for_metadata(&root, 0, false) {
             Ok(h) => h,
             Err(_) => continue,
         };

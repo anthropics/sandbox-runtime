@@ -189,16 +189,22 @@ enum Cmd {
     /// immediate children; local fixed drives only, reparse points
     /// never followed) for directories whose DACL carries an
     /// EXPLICIT ALLOW granting write to Everyone / BUILTIN\Users /
-    /// Authenticated Users (or a NULL DACL), and stamps
-    /// each hit with the same additive `(D;OICI;WriteDeny;;;<sb>)`
-    /// ACE as `acl stamp`'s denyWrite, recorded as a session hold
-    /// under `--holder-pid` (released by `acl restore`, reaped by
-    /// crash recovery). Best-effort: per-path stamp failures (the
+    /// Authenticated Users (or a NULL DACL), and stamps each hit
+    /// with an additive `(OI)(CI)` deny for the sandbox SID — the
+    /// denyWrite mask plus WRITE_DAC/WRITE_OWNER, so the world
+    /// grant that flagged the dir cannot be used to strip the deny
+    /// (`ww_audit.rs` module doc). Recorded as a session hold under
+    /// `--holder-pid` (released by `acl restore`, reaped by crash
+    /// recovery). NULL-DACL dirs are reported but never stamped
+    /// (stamping would materialize a DACL that restore cannot
+    /// return to NULL). Best-effort: per-path stamp failures (the
     /// broker lacks WRITE_DAC on a dir it does not own) are
     /// reported, never fatal. Hard budgets — 2s wall, 50k DACL
     /// reads, 1000 entries per listed dir — bound the scan; hitting
     /// one is reported on stderr, never silent. Exit 0 unless the
-    /// state DB / init lock itself fails.
+    /// state DB / init lock itself fails (the scan's only fallible
+    /// step of its own is converting the three constant well-known
+    /// SIDs, which is practically unreachable).
     AuditWw {
         /// Holder PID the audit denies are held under (see `acl
         /// stamp` — normally the long-lived Node host).
@@ -1406,7 +1412,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 ww_audit::audit_and_stamp(state_db::HolderPid(holder_pid), &sandbox_user_sid)?;
             eprintln!(
                 "srt-win: audit-ww — {} candidate(s), {} probed, {} \
-                 flagged, {} stamped{}; recovery pruned {} dead \
+                 flagged, {} stamped{}{}; recovery pruned {} dead \
                  broker(s), revoked {} orphan ACE(s)",
                 out.candidates,
                 out.probed,
@@ -1417,18 +1423,28 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 } else {
                     format!(", {} FAILED (left unstamped)", out.failed.len())
                 },
+                if out.null_dacl_refused == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " (of which {} NULL-DACL, stamp refused by policy)",
+                        out.null_dacl_refused
+                    )
+                },
                 report.dead_brokers,
                 report.aces_revoked,
             );
             // No silent caps: every bounded/skipped class is
             // spelled out when it fired.
-            if out.wall_expired
-                || out.dacl_exhausted
-                || out.skipped_budget > 0
-                || out.dirs_truncated > 0
-                || out.unreadable > 0
-                || out.reparse_skipped > 0
-                || out.remote_skipped > 0
+            let b = &out.budget;
+            if b.wall_expired
+                || b.dacl_exhausted
+                || b.skipped_budget > 0
+                || b.dirs_truncated > 0
+                || b.unreadable > 0
+                || b.reparse_skipped > 0
+                || b.remote_skipped > 0
+                || b.roots_skipped_non_local > 0
             {
                 eprintln!(
                     "srt-win: audit-ww: partial coverage — \
@@ -1436,43 +1452,25 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                      {} candidate(s) skipped on budget, {} dir \
                      listing(s) truncated at {} entries, {} \
                      unreadable, {} reparse-point(s) skipped, {} \
-                     non-local path(s) skipped",
-                    out.wall_expired,
-                    out.dacl_reads,
-                    out.dacl_exhausted,
-                    out.skipped_budget,
-                    out.dirs_truncated,
+                     non-local path(s) skipped, {} scan root(s) \
+                     skipped as non-local",
+                    b.wall_expired,
+                    b.dacl_reads,
+                    b.dacl_exhausted,
+                    b.skipped_budget,
+                    b.dirs_truncated,
                     srt_win::ww_audit::MAX_DIR_ENTRIES,
-                    out.unreadable,
-                    out.reparse_skipped,
-                    out.remote_skipped,
+                    b.unreadable,
+                    b.reparse_skipped,
+                    b.remote_skipped,
+                    b.roots_skipped_non_local,
                 );
             }
             if json {
-                println!(
-                    "{}",
-                    json!({
-                        "candidates": out.candidates,
-                        "scanned": out.probed,
-                        "flagged": out.flagged,
-                        "stamped": out.stamped,
-                        "failed": out
-                            .failed
-                            .iter()
-                            .map(|(p, e)| json!({ "path": p, "error": e }))
-                            .collect::<Vec<_>>(),
-                        "budget": {
-                            "wallExpired": out.wall_expired,
-                            "daclReads": out.dacl_reads,
-                            "daclExhausted": out.dacl_exhausted,
-                            "skipped": out.skipped_budget,
-                            "dirsTruncated": out.dirs_truncated,
-                            "unreadable": out.unreadable,
-                            "reparseSkipped": out.reparse_skipped,
-                            "remoteSkipped": out.remote_skipped,
-                        },
-                    })
-                );
+                // `AuditOutcome` derives `Serialize` (camelCase,
+                // `probed` → `scanned`) — the JSON contract lives on
+                // the struct, mirrored by TS `WindowsWwAuditResult`.
+                println!("{}", serde_json::to_string(&out)?);
             }
         }
 

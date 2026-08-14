@@ -1996,7 +1996,8 @@ export function revokeWindowsAcl(opts: {
 }
 
 /** Budget/coverage counters from `srt-win audit-ww` — every bounded
- *  or skipped class is reported so partial coverage is visible. */
+ *  or skipped class is reported so partial coverage is visible.
+ *  Mirrors the Rust `ww_audit::Budget` serialization. */
 export interface WindowsWwAuditBudget {
   /** The 2s wall-clock budget expired mid-scan. */
   wallExpired: boolean
@@ -2012,26 +2013,70 @@ export interface WindowsWwAuditBudget {
   unreadable: number
   /** Candidates skipped as reparse points (junctions/symlinks). */
   reparseSkipped: number
-  /** Candidates that resolved outside plain local-drive space. */
+  /** Candidates on a non-fixed drive, or whose canonical path
+   *  resolved outside plain local-drive space (or onto a bare
+   *  volume root). */
   remoteSkipped: number
+  /** Whole scan roots skipped as non-local (e.g. a cwd on a mapped
+   *  drive) — nonzero means the sweep did not cover that root. */
+  rootsSkippedNonLocal: number
 }
 
 /** Result of `srt-win audit-ww --json` — see
- *  {@link auditWindowsWorldWritable}. */
+ *  {@link auditWindowsWorldWritable}. Mirrors the Rust
+ *  `ww_audit::AuditOutcome` serialization. */
 export interface WindowsWwAuditResult {
   /** Candidate directories collected from the fixed root set. */
   candidates: number
   /** Candidates actually probed (open + DACL read). */
   scanned: number
   /** Canonical paths whose DACL carries an explicit ALLOW granting
-   *  write to Everyone / BUILTIN\Users / Authenticated Users. */
+   *  write to Everyone / BUILTIN\Users / Authenticated Users —
+   *  NULL-DACL hits included (those are detected, never stamped). */
   flagged: string[]
   /** Flagged paths whose write-deny stamp landed. */
   stamped: string[]
-  /** Flagged paths whose stamp failed (broker lacks WRITE_DAC
-   *  there) — recorded and warned, never fatal. */
+  /** Flagged paths left unstamped: stamp failed (broker lacks
+   *  WRITE_DAC there) or refused (NULL DACL) — recorded and
+   *  warned, never fatal. */
   failed: { path: string; error: string }[]
+  /** How many of `failed` are NULL-DACL stamp refusals. */
+  nullDaclRefused: number
   budget: WindowsWwAuditBudget
+}
+
+/** Runtime shape check for {@link WindowsWwAuditResult}. The result
+ *  is consumed OUTSIDE the helper's try/catch (`initialize()` reads
+ *  `audit.flagged.length`, `audit.budget.wallExpired`), so a
+ *  Rust-side field rename must degrade to the helper's `undefined`
+ *  return — never surface as a TypeError that breaks the
+ *  "never blocks init" contract. */
+function isWindowsWwAuditResult(v: unknown): v is WindowsWwAuditResult {
+  if (typeof v !== 'object' || v === null) return false
+  const r = v as Record<string, unknown>
+  const b = r['budget']
+  return (
+    typeof r['candidates'] === 'number' &&
+    typeof r['scanned'] === 'number' &&
+    typeof r['nullDaclRefused'] === 'number' &&
+    Array.isArray(r['flagged']) &&
+    r['flagged'].every(p => typeof p === 'string') &&
+    Array.isArray(r['stamped']) &&
+    r['stamped'].every(p => typeof p === 'string') &&
+    Array.isArray(r['failed']) &&
+    r['failed'].every(
+      f =>
+        typeof f === 'object' &&
+        f !== null &&
+        typeof (f as Record<string, unknown>)['path'] === 'string' &&
+        typeof (f as Record<string, unknown>)['error'] === 'string',
+    ) &&
+    typeof b === 'object' &&
+    b !== null &&
+    typeof (b as Record<string, unknown>)['wallExpired'] === 'boolean' &&
+    typeof (b as Record<string, unknown>)['daclExhausted'] === 'boolean' &&
+    typeof (b as Record<string, unknown>)['daclReads'] === 'number'
+  )
 }
 
 /**
@@ -2044,12 +2089,15 @@ export interface WindowsWwAuditResult {
  * directories whose DACL carries an EXPLICIT ALLOW granting write
  * to Everyone / BUILTIN\Users / Authenticated Users (inherited
  * world-write — the stock volume-root class — is out of scope; see
- * `ww_audit.rs`), and write-deny-stamps each hit for the
- * sandbox SID as an ordinary session deny hold under `holderPid` —
- * released by {@link restoreWindowsAcl} at `reset()`, reaped by
- * crash recovery if the holder dies. Paths already covered by the
- * ambient list, a session write grant, or the machine state dir are
- * excluded.
+ * `ww_audit.rs`), and stamps each hit for the sandbox SID with an
+ * audit-specific deny (the denyWrite mask plus WRITE_DAC and
+ * WRITE_OWNER, so the world grant that flagged the dir cannot be
+ * used to strip the deny; no parent-FDC stamp) as an ordinary
+ * session deny hold under `holderPid` — released by
+ * {@link restoreWindowsAcl} at `reset()`, reaped by crash recovery
+ * if the holder dies. NULL-DACL dirs are reported in `failed` but
+ * never stamped. Paths already covered by the ambient list, a
+ * session write grant, or the machine state dir are excluded.
  *
  * BEST-EFFORT BY CONTRACT: any failure — spawn, timeout, non-zero
  * exit, unparseable output — degrades to a debug log and an
@@ -2067,11 +2115,13 @@ export async function auditWindowsWorldWritable(opts: {
 }): Promise<WindowsWwAuditResult | undefined> {
   const holder = opts.holderPid ?? process.pid
   try {
-    // 30s: the scan itself is capped at 2s, but the init lock can
-    // wait up to 60s behind a wedged holder and Defender may
-    // cold-scan the exe — do not let a slow environment turn the
-    // best-effort audit into a spurious timeout throw upstream.
-    const result = await runSrtWinJsonAsync<WindowsWwAuditResult>(
+    // 90s = the init-lock acquire's own 60s cap (it can wait that
+    // long behind a wedged holder, and audit-ww acquires it twice)
+    // + the 2s scan cap + headroom for stamping and a Defender
+    // cold-scan of the exe — do not let a slow environment turn
+    // the best-effort audit into a spurious timeout throw
+    // upstream.
+    const result = await runSrtWinJsonAsync<unknown>(
       [
         'audit-ww',
         '--holder-pid',
@@ -2080,8 +2130,18 @@ export async function auditWindowsWorldWritable(opts: {
         opts.sandboxUserSid,
         '--json',
       ],
-      { timeoutMs: 30_000, srtWin: opts.srtWin },
+      { timeoutMs: 90_000, srtWin: opts.srtWin },
     )
+    // Callers dereference the result outside this try/catch, so an
+    // out-of-contract shape (Rust-side rename) degrades to
+    // undefined here rather than TypeError-ing initialize().
+    if (!isWindowsWwAuditResult(result)) {
+      logForDebugging(
+        `[Sandbox Windows] audit-ww: result shape out of contract; ignoring`,
+        { level: 'warn' },
+      )
+      return undefined
+    }
     logForDebugging(`[Sandbox Windows] audit-ww ok`)
     return result
   } catch (e) {

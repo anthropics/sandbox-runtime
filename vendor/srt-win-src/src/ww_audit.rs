@@ -11,12 +11,23 @@
 //! every session initialize: scan a small fixed root set, flag
 //! directories whose DACL carries an EXPLICIT ALLOW granting write
 //! to Everyone / BUILTIN\Users / Authenticated Users (or a NULL
-//! DACL), and stamp each hit with the same additive
-//! `(D;OICI;WriteDeny;;;<sb-SID>)` shape as `acl stamp --deny-write`.
+//! DACL), and stamp each hit with an additive `(OI)(CI)` deny for
+//! the sandbox SID — [`crate::acl::SbAce::DenyWwAudit`]: the `acl
+//! stamp --deny-write` mask PLUS `WRITE_DAC`/`WRITE_OWNER`, because
+//! the flagged grants (`Everyone:(F)`, `GENERIC_ALL`) hand the
+//! sandbox user `WRITE_DAC` through the very ACE that got the dir
+//! flagged, so a plain write-deny would be self-strippable.
 //! INHERITED world-write is deliberately out of scope — see
 //! [`dacl_grants_world_write`]'s doc for why (the stock volume-root
 //! `Authenticated Users:(OI)(CI)(IO)(M)` would otherwise flag every
 //! plain `C:\<dir>` and materialize denies over huge trees).
+//!
+//! NULL-DACL directories are DETECTED (they appear in
+//! [`AuditOutcome::flagged`]) but never stamped: a NULL DACL means
+//! "everyone: full control", and recomposing it would materialize a
+//! real DACL that `acl restore` can never return to NULL — a
+//! durable permission change on a directory we don't own. They are
+//! reported in [`AuditOutcome::failed`] with a distinct reason.
 //!
 //! ## Scope and budgets
 //!
@@ -29,8 +40,13 @@
 //! Hard budgets bound the worst case: [`WALL_BUDGET`] wall-clock,
 //! [`MAX_DACL_READS`] DACL probes, [`MAX_DIR_ENTRIES`] entries per
 //! enumerated root. Budget exhaustion is never silent: every skip
-//! class is counted in [`AuditOutcome`] and summarized on stderr by
-//! the `audit-ww` CLI arm.
+//! class is counted in [`AuditOutcome::budget`] and summarized on
+//! stderr by the `audit-ww` CLI arm.
+//!
+//! Nothing is cached across sessions, deliberately: the flagged set
+//! is environment-dependent (`PATH`, cwd, third-party installs
+//! between sessions), so each session re-scans and the budgets
+//! above bound what the re-scan can cost.
 //!
 //! The budgets bound the SCAN. The stamping step is bounded by the
 //! flagged count instead, and each stamp's cost is proportional to
@@ -52,14 +68,16 @@
 //! candidate is opened with `FILE_FLAG_OPEN_REPARSE_POINT` (the
 //! object itself, no traversal), rejected if it carries
 //! `FILE_ATTRIBUTE_REPARSE_POINT`, re-checked lexically on its
-//! handle-derived canonical path, and has its DACL read BY HANDLE —
-//! never by a name re-resolve after the check. Child enumeration
-//! (`read_dir`) does not dereference child reparse points either;
-//! reparse children are skipped outright. The final deny stamp goes
-//! through the name-based [`crate::acl::apply_sandbox_aces`]
-//! chokepoint on the handle-derived canonical path — the same
-//! residual name-vs-handle window every other stamp site in this
-//! crate accepts.
+//! handle-derived canonical path (which is also where the
+//! never-a-drive-root guard lands, so a `C:\.`-style spelling
+//! cannot dodge it), and has its DACL read BY HANDLE — never by a
+//! name re-resolve after the check. Child enumeration (`read_dir`)
+//! does not dereference child reparse points either; reparse
+//! children are skipped outright. The final deny stamp goes through
+//! the name-based [`crate::acl::apply_sandbox_aces`] chokepoint on
+//! the handle-derived canonical path — the same residual
+//! name-vs-handle window every other stamp site in this crate
+//! accepts.
 //!
 //! ## Exclusions
 //!
@@ -68,11 +86,15 @@
 //! a recorded ambient path, a live session write GRANT (the session
 //! deliberately opened it for sandbox writes), or the machine state
 //! dir. Matching is case-insensitive, extended-prefix-agnostic
-//! prefix matching on whole path components.
+//! prefix matching on whole path components. Session READ grants
+//! are deliberately NOT excluded — currently safe because the audit
+//! deny leaves read+execute open (its mask carries no read bits),
+//! but note the ordering-dependent edge: a read-granted dir that is
+//! also world-writable WILL be write-deny-stamped.
 //!
 //! ## Session-tracking decision
 //!
-//! Audit denies are recorded as ORDINARY session `deny` rows
+//! Audit denies are recorded as ORDINARY session `deny_ww` rows
 //! (`working_aces`/`ace_holders`) under the broker's holder PID via
 //! [`crate::state_db::Locked::apply_aces`] — deliberately NOT as
 //! persistent ambient entries. Rationale: (a) the flagged set is
@@ -84,30 +106,36 @@
 //! (c) the session rows get the full existing lifecycle for free:
 //! refcounting across concurrent brokers, release at `acl restore`
 //! (the host's `reset()`), and crash-recovery reaping when the
-//! holder dies. `apply_aces` also stamps the flagged dir's parent
-//! with the standard `deny_fdc` ACE — EXCEPT when the parent is a
-//! volume root (`canonical_parent_of` returns `None` there, and the
-//! audit's primary candidate class is exactly top-level
-//! `%SystemDrive%` dirs): for those, a parent that itself grants
-//! FILE_DELETE_CHILD to the sandbox (an admin loosening `C:\`)
-//! would let the sandbox delete-and-recreate the flagged dir
-//! deny-free. Accepted: the stock root grants no such right, and
-//! stamping a volume root is exactly what this module must never
-//! do.
+//! holder dies. Two deliberate deviations from ordinary denies:
+//! `apply_aces` stamps NO parent `deny_fdc` ACE for the audit kind
+//! (audit parents — the drive root's dirs, `%TEMP%`'s parent, deep
+//! `PATH` ancestors — can be huge trees, and materializing an
+//! inheritable ACE across them at every session start is unbounded
+//! cost the scan budgets don't cover; the flagged dir's own
+//! `(OI)(CI)` deny covers the planting threat and its DELETE bit
+//! covers rename-away — see the rationale comment in
+//! `state_db::apply_aces`); and an audit deny YIELDS to a live
+//! session write grant on the same path at the recompose chokepoint
+//! (`SbAceSet::head_aces`) — foreground grant intent beats the
+//! background floor, so one session's audit hold cannot break
+//! another session's workspace.
 
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::acl::{self, DenyMask, SbAce};
-use crate::path_id::{is_unc_path, strip_extended_prefix};
+use crate::acl::{self, SbAce};
+use crate::path_id::{is_path_prefix, is_unc_path, strip_extended_prefix};
 use crate::state_db::{self, HolderPid, RecoveryReport};
 
 /// Wall-clock budget for the whole scan.
-pub const WALL_BUDGET: Duration = Duration::from_secs(2);
+const WALL_BUDGET: Duration = Duration::from_secs(2);
 /// Maximum candidate DACL probes (open + read) per audit.
-pub const MAX_DACL_READS: u32 = 50_000;
-/// Maximum entries consumed per enumerated root directory.
+const MAX_DACL_READS: u32 = 50_000;
+/// Maximum entries consumed per enumerated root directory. `pub`
+/// (unlike the other limits) because the CLI's partial-coverage
+/// summary names it.
 pub const MAX_DIR_ENTRIES: usize = 1_000;
 
 /// The trustees whose ALLOW ACEs make a directory "world-writable":
@@ -115,34 +143,30 @@ pub const MAX_DIR_ENTRIES: usize = 1_000;
 /// account — the sandbox user included — is a member of all three
 /// (Everyone/Authenticated Users by definition; BUILTIN\Users
 /// because provisioning adds the account to it for profile loads).
-pub const FLAGGED_SIDS: [&str; 3] = ["S-1-1-0", "S-1-5-32-545", "S-1-5-11"];
-
-/// `ACE_HEADER.AceFlags` bit: the ACE exists only to be inherited
-/// by children and grants nothing on the container itself (e.g. the
-/// stock `CREATOR OWNER` rows). Same raw-u8 convention as
-/// `acl.rs`'s `INHERITED_ACE`.
-const INHERIT_ONLY_ACE: u8 = 0x08;
-/// `ACE_HEADER.AceFlags` bit: the ACE was derived from the parent's
-/// inheritable set, not set explicitly on this object.
-const INHERITED_ACE: u8 = 0x10;
+const FLAGGED_SIDS: [&str; 3] = ["S-1-1-0", "S-1-5-32-545", "S-1-5-11"];
 
 /// Whether an ACE with `flags` applies to the directory itself (an
 /// `INHERIT_ONLY` ACE does not — it grants nothing on the
 /// container, only on future children).
-pub fn ace_applies_to_container(flags: u8) -> bool {
-    flags & INHERIT_ONLY_ACE == 0
+fn ace_applies_to_container(flags: u8) -> bool {
+    flags & acl::INHERIT_ONLY_ACE == 0
 }
 
-/// Whether `mask` lets its trustee create content in a directory:
-/// the specific `FILE_ADD_FILE`/`FILE_ADD_SUBDIRECTORY` bits, or a
-/// generic bit the object's mapping resolves to include them
-/// (`GENERIC_WRITE`/`GENERIC_ALL`).
-pub fn mask_grants_dir_write(mask: u32) -> bool {
-    const FILE_ADD_FILE: u32 = 0x0002;
-    const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
-    const GENERIC_WRITE: u32 = 0x4000_0000;
-    const GENERIC_ALL: u32 = 0x1000_0000;
-    mask & (FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY) != 0 || mask & (GENERIC_WRITE | GENERIC_ALL) != 0
+/// Whether `mask` makes a directory writable for its trustee: the
+/// specific `FILE_ADD_FILE`/`FILE_ADD_SUBDIRECTORY` bits, a generic
+/// bit the object's mapping resolves to include them
+/// (`GENERIC_WRITE`/`GENERIC_ALL`) — or `WRITE_DAC`/`WRITE_OWNER`,
+/// which are write-equivalent: an `Everyone:(WDAC)` dir lets any
+/// member rewrite the DACL and grant itself write.
+fn mask_grants_dir_write(mask: u32) -> bool {
+    const DIR_WRITE: u32 = acl::Mask::FILE_ADD_FILE
+        .with(acl::Mask::FILE_ADD_SUBDIRECTORY)
+        .with(acl::Mask::GENERIC_WRITE)
+        .with(acl::Mask::GENERIC_ALL)
+        .with(acl::Mask::WRITE_DAC)
+        .with(acl::Mask::WRITE_OWNER)
+        .bits();
+    mask & DIR_WRITE != 0
 }
 
 /// True iff `p` is lexically a plain local drive path (`X:\…`,
@@ -150,49 +174,83 @@ pub fn mask_grants_dir_write(mask: u32) -> bool {
 /// device path, NOT relative. This runs BEFORE any filesystem
 /// syscall on the path: merely `stat`ing a UNC path sends the
 /// broker's credentials to the named host.
-pub fn lexically_local_drive_path(p: &str) -> bool {
+fn lexically_local_drive_path(p: &str) -> bool {
     if is_unc_path(p) {
         return false;
     }
-    let s = strip_extended_prefix(p);
-    let b = s.as_bytes();
     // `\\.\PIPE\x` and friends survive is_unc_path; the drive-letter
     // shape check rejects them (first byte is `\`).
-    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    crate::util::drive_letter_root(strip_extended_prefix(p)).is_some()
 }
 
 // ─── Budget ─────────────────────────────────────────────────────────
 
-/// Scan budget accounting: a wall-clock deadline plus a DACL-probe
-/// counter. Pure bookkeeping (no Win32) so the arithmetic is
-/// unit-testable; the limits are injected for tests via
-/// [`Budget::with_limits`].
+/// Scan budget + coverage accounting: a wall-clock deadline, a
+/// DACL-probe cap, and every per-class skip counter — one struct so
+/// there is a single source of truth: [`scan`] owns it while
+/// running and moves it into [`AuditOutcome::budget`] when done
+/// (serialized as the JSON `budget` object). The arithmetic is pure
+/// bookkeeping (no Win32) so it is unit-testable; the limits are
+/// injected for tests via [`Budget::with_limits`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Budget {
+    #[serde(skip)]
     deadline: Instant,
+    #[serde(skip)]
     max_dacl_reads: u32,
-    dacl_reads: u32,
-    wall_expired: bool,
-    dacl_exhausted: bool,
+    /// The wall-clock budget expired mid-scan.
+    pub(crate) wall_expired: bool,
+    /// Candidate DACL probes performed.
+    pub(crate) dacl_reads: u32,
+    /// The DACL-probe cap was hit.
+    pub(crate) dacl_exhausted: bool,
+    /// Candidates never probed because a budget ran out first.
+    #[serde(rename = "skipped")]
+    pub(crate) skipped_budget: u32,
+    /// Enumerated roots whose listing hit [`MAX_DIR_ENTRIES`].
+    pub(crate) dirs_truncated: u32,
+    /// Candidates whose probe failed for a reason other than
+    /// not-found (access denied on the open, unreadable SD, …), plus
+    /// enumeration roots whose listing failed to open.
+    pub(crate) unreadable: u32,
+    /// Candidates skipped as reparse points (junction/symlink).
+    pub(crate) reparse_skipped: u32,
+    /// Candidates skipped as non-local: on a non-fixed drive, or
+    /// whose handle-derived canonical path was not a plain local
+    /// drive path (resolved onto a UNC target or a bare volume
+    /// root).
+    pub(crate) remote_skipped: u32,
+    /// Enumeration ROOTS skipped whole because they are not local
+    /// fixed-drive paths (e.g. a cwd on a mapped drive) — without
+    /// this counter such a run would read as full coverage.
+    pub(crate) roots_skipped_non_local: u32,
 }
 
 impl Budget {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::with_limits(WALL_BUDGET, MAX_DACL_READS)
     }
 
-    pub fn with_limits(wall: Duration, max_dacl_reads: u32) -> Self {
+    fn with_limits(wall: Duration, max_dacl_reads: u32) -> Self {
         Self {
             deadline: Instant::now() + wall,
             max_dacl_reads,
-            dacl_reads: 0,
             wall_expired: false,
+            dacl_reads: 0,
             dacl_exhausted: false,
+            skipped_budget: 0,
+            dirs_truncated: 0,
+            unreadable: 0,
+            reparse_skipped: 0,
+            remote_skipped: 0,
+            roots_skipped_non_local: 0,
         }
     }
 
     /// Charge one DACL probe. `false` = out of budget (wall or
     /// count; the corresponding flag latches).
-    pub fn try_charge_dacl_read(&mut self) -> bool {
+    fn try_charge_dacl_read(&mut self) -> bool {
         if self.wall_expired_now() {
             return false;
         }
@@ -206,21 +264,11 @@ impl Budget {
 
     /// Check (and latch) wall-clock expiry without charging a probe
     /// — used inside enumeration loops.
-    pub fn wall_expired_now(&mut self) -> bool {
+    fn wall_expired_now(&mut self) -> bool {
         if !self.wall_expired && Instant::now() >= self.deadline {
             self.wall_expired = true;
         }
         self.wall_expired
-    }
-
-    pub fn dacl_reads(&self) -> u32 {
-        self.dacl_reads
-    }
-    pub fn wall_expired(&self) -> bool {
-        self.wall_expired
-    }
-    pub fn dacl_exhausted(&self) -> bool {
-        self.dacl_exhausted
     }
 }
 
@@ -243,15 +291,23 @@ fn norm_key(p: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// A [`norm_key`] naming a bare drive root (`norm_key("C:\\") ==
+/// "c:"`) — NEVER a candidate: the stock root's explicit `AU:(AD)`
+/// ACE always flags, and stamping it would propagate an `(OI)(CI)`
+/// deny across the entire volume.
+fn is_drive_root_key(key: &str) -> bool {
+    key.len() <= 2
+}
+
 /// Prefix set for "already covered" checks: a candidate equal to, or
 /// strictly under, any entry is excluded from the audit. Pure (no
 /// Win32) so the component-boundary matching is unit-testable.
-pub struct Exclusions {
+struct Exclusions {
     prefixes: Vec<String>,
 }
 
 impl Exclusions {
-    pub fn new(paths: impl IntoIterator<Item = String>) -> Self {
+    fn new(paths: impl IntoIterator<Item = String>) -> Self {
         let mut prefixes: Vec<String> = paths
             .into_iter()
             .map(|p| norm_key(&p))
@@ -265,11 +321,15 @@ impl Exclusions {
     /// Whether `path` is one of the excluded prefixes or a
     /// descendant of one (component-boundary match — `C:\Program`
     /// does not cover `C:\ProgramData`).
-    pub fn covers(&self, path: &str) -> bool {
-        let k = norm_key(path);
-        self.prefixes.iter().any(|p| {
-            k == *p || (k.len() > p.len() && k.starts_with(p) && k.as_bytes()[p.len()] == b'\\')
-        })
+    fn covers(&self, path: &str) -> bool {
+        self.covers_key(&norm_key(path))
+    }
+
+    /// As [`Self::covers`] for a caller that already normalized the
+    /// candidate — [`norm_key`] runs once per candidate, not once
+    /// per check.
+    fn covers_key(&self, key: &str) -> bool {
+        self.prefixes.iter().any(|p| is_path_prefix(p, key))
     }
 }
 
@@ -277,65 +337,82 @@ impl Exclusions {
 
 /// What one audit did — every bounded/skipped class is counted so
 /// the CLI summary can report exactly what was NOT covered (no
-/// silent caps).
-#[derive(Debug, Default)]
+/// silent caps). Serialized as-is (camelCase) for `audit-ww --json`;
+/// the TS `WindowsWwAuditResult` interface mirrors this shape.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AuditOutcome {
     /// Candidate directories collected from the root set (post
     /// lexical filter + dedup + pre-probe exclusion check).
-    pub candidates: u32,
+    pub(crate) candidates: u32,
     /// Candidates actually probed (open + DACL read).
-    pub probed: u32,
-    /// Canonical paths whose DACL grants write to a flagged SID.
-    pub flagged: Vec<String>,
+    #[serde(rename = "scanned")]
+    pub(crate) probed: u32,
+    /// Canonical paths whose DACL grants write to a flagged SID
+    /// (NULL-DACL hits included — those are detected, not stamped).
+    pub(crate) flagged: Vec<String>,
     /// Flagged paths whose deny stamp landed (recorded + on disk).
-    pub stamped: Vec<String>,
-    /// Flagged paths whose deny stamp failed `(path, error)` — the
-    /// broker lacks `WRITE_DAC` there, or the recompose failed.
-    pub failed: Vec<(String, String)>,
-    /// Candidates never probed because a budget ran out first.
-    pub skipped_budget: u32,
-    /// Enumerated roots whose listing hit [`MAX_DIR_ENTRIES`].
-    pub dirs_truncated: u32,
-    /// Candidates whose probe failed for a reason other than
-    /// not-found (access denied on the open, unreadable SD, …).
-    pub unreadable: u32,
-    /// Candidates skipped as reparse points (junction/symlink).
-    pub reparse_skipped: u32,
-    /// Candidates whose handle-derived canonical path was not a
-    /// plain local drive path (e.g. resolved onto a UNC target).
-    pub remote_skipped: u32,
-    pub wall_expired: bool,
-    pub dacl_exhausted: bool,
-    pub dacl_reads: u32,
+    pub(crate) stamped: Vec<String>,
+    /// Flagged paths left unstamped: the stamp failed (the broker
+    /// lacks `WRITE_DAC` there, or the recompose failed) or was
+    /// refused (NULL DACL).
+    pub(crate) failed: Vec<FailedStamp>,
+    /// How many of `failed` are NULL-DACL refusals (see module doc)
+    /// — split out so the stderr summary can name the reason.
+    pub(crate) null_dacl_refused: u32,
+    /// Budget + coverage counters (the scan's [`Budget`], moved in
+    /// whole at end of scan).
+    pub(crate) budget: Budget,
+}
+
+/// One flagged path the audit did not stamp, with why.
+#[derive(Debug, Serialize)]
+pub struct FailedStamp {
+    pub(crate) path: String,
+    pub(crate) error: String,
 }
 
 // ─── Scan (Win32) ───────────────────────────────────────────────────
 
-/// `GetDriveTypeW(X:\) == DRIVE_FIXED`. Reads the local mount
-/// table only — no network contact for remote/mapped letters.
-fn drive_is_fixed(path: &str) -> bool {
-    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
-    const DRIVE_FIXED: u32 = 3;
-    let s = strip_extended_prefix(path);
-    let Some(letter) = s.as_bytes().first().copied() else {
-        return false;
-    };
-    let root = format!("{}:\\", letter as char);
-    let w = crate::util::wstr(&root);
-    unsafe { GetDriveTypeW(crate::util::pcwstr(&w)) == DRIVE_FIXED }
+/// `GetDriveTypeW(X:\) == DRIVE_FIXED`, memoized per drive letter —
+/// the scan asks once per candidate and most candidates share a
+/// handful of drives, so children of a root validated in
+/// [`push_children`] cost a map hit, not a syscall. Reads the local
+/// mount table only — no network contact for remote/mapped letters.
+#[derive(Default)]
+struct FixedDriveCache(HashMap<u8, bool>);
+
+impl FixedDriveCache {
+    fn is_fixed(&mut self, path: &str) -> bool {
+        use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+        let Some(root) = crate::util::drive_letter_root(strip_extended_prefix(path)) else {
+            return false;
+        };
+        *self.0.entry(root.as_bytes()[0]).or_insert_with(|| {
+            let w = crate::util::wstr(&root);
+            unsafe { GetDriveTypeW(crate::util::pcwstr(&w)) == crate::util::DRIVE_FIXED }
+        })
+    }
 }
 
 /// Outcome of probing one candidate directory.
 enum Probe {
-    /// World-writable; carries the handle-derived canonical path.
-    Flagged(String),
+    /// World-writable; carries the handle-derived canonical path
+    /// and whether it flagged as a NULL DACL (detected, never
+    /// stamped — see module doc).
+    Flagged {
+        canon: String,
+        null_dacl: bool,
+    },
     Clean,
     /// The object itself is a reparse point — never dereferenced.
     Reparse,
     /// Exists but is not a directory (stale `PATH` entry naming a
     /// file). Not an audit concern.
     NotDir,
-    /// Canonical path resolved outside plain local-drive space.
+    /// Canonical path resolved outside plain local-drive space — or
+    /// onto a bare drive root (a `C:\.`-style spelling), which this
+    /// module must never stamp.
     RemoteCanon,
 }
 
@@ -344,30 +421,16 @@ enum Probe {
 /// open requests `READ_CONTROL` only, so it works on directories
 /// the broker cannot write.
 fn probe_dir(path: &str, flagged_sids: &[Vec<u8>]) -> Result<Probe> {
-    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-        OPEN_EXISTING,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
     };
-    let w = crate::util::wstr(path);
-    let h = unsafe {
-        CreateFileW(
-            crate::util::pcwstr(&w),
-            acl::Mask::READ_CONTROL.bits(),
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-    }
-    .with_context(|| format!("CreateFileW('{path}', no-follow)"))?;
-    if h == INVALID_HANDLE_VALUE {
-        anyhow::bail!("CreateFileW('{path}'): INVALID_HANDLE_VALUE");
-    }
-    let h = crate::util::OwnedHandle(h);
+    let h = crate::path_id::open_for_metadata(
+        path,
+        acl::Mask::READ_CONTROL.bits(),
+        /* no_follow */ true,
+    )
+    .with_context(|| format!("open '{path}' (no-follow)"))?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(h.raw(), &mut info) }
         .with_context(|| format!("GetFileInformationByHandle('{path}')"))?;
@@ -378,7 +441,12 @@ fn probe_dir(path: &str, flagged_sids: &[Vec<u8>]) -> Result<Probe> {
         return Ok(Probe::NotDir);
     }
     let canon = crate::path_id::canonical_path_from_handle(h.raw(), path)?;
-    if !lexically_local_drive_path(&canon) {
+    // Re-apply BOTH lexical guards to the HANDLE-DERIVED canonical
+    // path. The pre-probe checks are lexical-only, so a `C:\.` or
+    // `C:\foo\..` spelling (a real PATH-entry artifact) passes them
+    // and resolves to the volume root HERE — every spelling funnels
+    // through this one guard before the DACL is even read.
+    if !lexically_local_drive_path(&canon) || is_drive_root_key(&norm_key(&canon)) {
         return Ok(Probe::RemoteCanon);
     }
     let (sd, dacl) =
@@ -386,10 +454,11 @@ fn probe_dir(path: &str, flagged_sids: &[Vec<u8>]) -> Result<Probe> {
     // A NULL DACL is "everyone: full control" — the most
     // world-writable a directory can be. `filter_aces` treats null
     // as an empty ACE list, so special-case it here.
-    let flagged = dacl.is_null() || dacl_grants_world_write(dacl, flagged_sids)?;
+    let null_dacl = dacl.is_null();
+    let flagged = null_dacl || dacl_grants_world_write(dacl, flagged_sids)?;
     drop(sd);
     Ok(if flagged {
-        Probe::Flagged(canon)
+        Probe::Flagged { canon, null_dacl }
     } else {
         Probe::Clean
     })
@@ -414,7 +483,7 @@ fn dacl_grants_world_write(
     let hits = acl::filter_aces(dacl, |hdr, body| {
         if u32::from(hdr.AceType) != ACCESS_ALLOWED_ACE_TYPE
             || !ace_applies_to_container(hdr.AceFlags)
-            || hdr.AceFlags & INHERITED_ACE != 0
+            || hdr.AceFlags & acl::INHERITED_ACE != 0
             || body.len() < 8
         {
             return false;
@@ -429,21 +498,22 @@ fn dacl_grants_world_write(
 /// Collect a root's immediate directory children as candidates.
 /// Reparse-point children are skipped (never dereferenced);
 /// listing stops at [`MAX_DIR_ENTRIES`] or wall expiry, counted in
-/// `out`.
+/// `budget`.
 fn push_children(
     root: &str,
     candidates: &mut Vec<String>,
     seen: &mut HashSet<String>,
     budget: &mut Budget,
-    out: &mut AuditOutcome,
+    drives: &mut FixedDriveCache,
 ) {
-    if !lexically_local_drive_path(root) || !drive_is_fixed(root) {
+    if !lexically_local_drive_path(root) || !drives.is_fixed(root) {
+        budget.roots_skipped_non_local += 1;
         return;
     }
     let rd = match std::fs::read_dir(root) {
         Ok(r) => r,
         Err(_) => {
-            out.unreadable += 1;
+            budget.unreadable += 1;
             return;
         }
     };
@@ -455,7 +525,7 @@ fn push_children(
         let Ok(ent) = ent else { continue };
         n += 1;
         if n > MAX_DIR_ENTRIES {
-            out.dirs_truncated += 1;
+            budget.dirs_truncated += 1;
             return;
         }
         // `file_type()` comes from the enumeration record — no
@@ -466,7 +536,7 @@ fn push_children(
             // Counted so the CI junction regression check has a
             // signal: a healthy run skips planted reparse points
             // HERE, before probe_dir ever sees them.
-            out.reparse_skipped += 1;
+            budget.reparse_skipped += 1;
             continue;
         }
         if !ft.is_dir() {
@@ -476,18 +546,17 @@ fn push_children(
     }
 }
 
-/// Dedup + lexical-filter one candidate path.
+/// Dedup + lexical-filter one candidate path. NEVER a bare drive
+/// root (see [`is_drive_root_key`]): a root can reach here via a
+/// PATH entry of `C:\` (a common installer artifact) or
+/// TEMP/PUBLIC set to a root. Lexical only — [`probe_dir`] re-runs
+/// both guards on the handle-derived canonical path.
 fn push_candidate(candidates: &mut Vec<String>, seen: &mut HashSet<String>, p: String) {
     if !lexically_local_drive_path(&p) {
         return;
     }
-    // NEVER a bare drive root (norm_key("C:\") == "c:"): a root can
-    // reach here via a PATH entry of `C:\` (a common installer
-    // artifact) or TEMP/PUBLIC set to a root, the stock root's
-    // explicit `AU:(AD)` ACE always flags, and stamping it would
-    // propagate an (OI)(CI) WriteDeny across the entire volume.
     let key = norm_key(&p);
-    if key.len() <= 2 {
+    if is_drive_root_key(&key) {
         return;
     }
     if seen.insert(key) {
@@ -497,20 +566,23 @@ fn push_candidate(candidates: &mut Vec<String>, seen: &mut HashSet<String>, p: S
 
 /// Run the scan: collect candidates from the fixed root set, probe
 /// each within `budget`, and return the outcome with `flagged`
-/// filled (stamping is the caller's step).
-fn scan(exclusions: &Exclusions, budget: &mut Budget) -> Result<AuditOutcome> {
+/// filled, plus the subset to stamp (flagged minus NULL-DACL
+/// refusals — stamping is the caller's step).
+fn scan(exclusions: &Exclusions, mut budget: Budget) -> Result<(AuditOutcome, Vec<String>)> {
     let mut out = AuditOutcome::default();
+    let mut to_stamp: Vec<String> = Vec::new();
     let flagged_sids: Vec<Vec<u8>> = FLAGGED_SIDS
         .iter()
         .map(|s| crate::sid::sid_bytes(s))
         .collect::<Result<_>>()?;
+    let mut drives = FixedDriveCache::default();
 
     // ── Candidate collection ────────────────────────────────────
     let mut seen: HashSet<String> = HashSet::new();
     let mut candidates: Vec<String> = Vec::new();
     if let Some(sd) = std::env::var_os("SystemDrive") {
         let root = format!("{}\\", sd.to_string_lossy());
-        push_children(&root, &mut candidates, &mut seen, budget, &mut out);
+        push_children(&root, &mut candidates, &mut seen, &mut budget, &mut drives);
     }
     for var in ["TEMP", "PUBLIC"] {
         if let Some(v) = std::env::var_os(var) {
@@ -527,8 +599,8 @@ fn scan(exclusions: &Exclusions, budget: &mut Budget) -> Result<AuditOutcome> {
             &cwd.display().to_string(),
             &mut candidates,
             &mut seen,
-            budget,
-            &mut out,
+            &mut budget,
+            &mut drives,
         );
     }
 
@@ -539,83 +611,116 @@ fn scan(exclusions: &Exclusions, budget: &mut Budget) -> Result<AuditOutcome> {
             continue;
         }
         out.candidates += 1;
-        if !drive_is_fixed(&cand) {
-            out.remote_skipped += 1;
+        // Memoized: a map hit for children whose root was already
+        // validated in push_children; one real GetDriveTypeW per
+        // first-seen letter (TEMP/PUBLIC/PATH entries).
+        if !drives.is_fixed(&cand) {
+            budget.remote_skipped += 1;
             continue;
         }
         if !budget.try_charge_dacl_read() {
-            out.skipped_budget += 1;
+            budget.skipped_budget += 1;
             continue;
         }
         out.probed += 1;
         match probe_dir(&cand, &flagged_sids) {
-            Ok(Probe::Flagged(canon)) => {
+            Ok(Probe::Flagged { canon, null_dacl }) => {
                 // Re-check exclusions on the CANONICAL path — 8.3
                 // short names or case differences in the raw
-                // candidate must not dodge the prefix match.
-                if !exclusions.covers(&canon) && flagged_seen.insert(norm_key(&canon)) {
-                    out.flagged.push(canon);
+                // candidate must not dodge the prefix match. One
+                // norm_key per canonical path; the key doubles as
+                // the dedup entry.
+                let key = norm_key(&canon);
+                if !exclusions.covers_key(&key) && flagged_seen.insert(key) {
+                    if null_dacl {
+                        // Detected, never stamped — see module doc.
+                        out.null_dacl_refused += 1;
+                        out.failed.push(FailedStamp {
+                            path: canon.clone(),
+                            error: "NULL DACL (everyone: full control); stamp refused — \
+                                    recomposing would materialize a DACL that `acl \
+                                    restore` cannot return to NULL"
+                                .to_string(),
+                        });
+                        out.flagged.push(canon);
+                    } else {
+                        out.flagged.push(canon.clone());
+                        to_stamp.push(canon);
+                    }
                 }
             }
             Ok(Probe::Clean) => {}
-            Ok(Probe::Reparse) => out.reparse_skipped += 1,
+            Ok(Probe::Reparse) => budget.reparse_skipped += 1,
             Ok(Probe::NotDir) => {}
-            Ok(Probe::RemoteCanon) => out.remote_skipped += 1,
+            Ok(Probe::RemoteCanon) => budget.remote_skipped += 1,
             Err(e) => {
                 // Nonexistent candidates (stale PATH entries) are
                 // normal; anything else is counted for the summary.
                 if !crate::path_id::is_not_found(&e) {
-                    out.unreadable += 1;
+                    budget.unreadable += 1;
                 }
             }
         }
     }
-    out.wall_expired = budget.wall_expired();
-    out.dacl_exhausted = budget.dacl_exhausted();
-    out.dacl_reads = budget.dacl_reads();
-    Ok(out)
+    out.budget = budget;
+    Ok((out, to_stamp))
 }
 
-/// Full audit under the session init lock: build the exclusion set
-/// (static ambient targets + recorded ambient paths + live session
-/// write grants + machine state dir), scan, then stamp each flagged
-/// dir as a session write-deny hold for `holder` — one
-/// [`crate::state_db::Locked::apply_aces`] call per path so a
-/// failure (the broker lacks `WRITE_DAC` on a dir it does not own)
-/// rolls back only that path and the rest still land. Best-effort
-/// by design: per-path failures are collected in
+/// Full audit. The session init lock is held only for the DB
+/// touches, never across the scan: a first brief acquire runs crash
+/// recovery (as every acquire does) and snapshots the DB-derived
+/// exclusions; the scan itself — up to [`WALL_BUDGET`] of DACL
+/// probes — runs UNLOCKED so concurrent brokers' `acl` ops are not
+/// stalled behind it; a second brief acquire applies the stamps
+/// (skipped entirely when nothing needs stamping). A concurrent
+/// session's write grant landing between snapshot and stamp is
+/// benign: the audit deny yields to a live write grant at the
+/// recompose chokepoint (see `SbAceSet::head_aces`).
+///
+/// Stamping is one [`crate::state_db::Locked::apply_aces`] call per
+/// path so a failure (the broker lacks `WRITE_DAC` on a dir it does
+/// not own) rolls back only that path and the rest still land.
+/// Best-effort by design: per-path failures are collected in
 /// [`AuditOutcome::failed`], never fatal.
 pub fn audit_and_stamp(
     holder: HolderPid,
     sandbox_sid: &str,
 ) -> Result<(AuditOutcome, RecoveryReport)> {
-    state_db::with_init_lock(holder, false, |db| {
-        let mut excluded: Vec<String> = crate::ambient::ambient_deny_targets();
-        excluded.extend(crate::install::ambient_recorded_paths().unwrap_or_default());
-        excluded.extend(db.granted_write_paths()?);
-        if let Ok(d) = state_db::machine_store_dir() {
-            excluded.push(d.display().to_string());
-        }
-        let exclusions = Exclusions::new(excluded);
-        let mut budget = Budget::new();
-        let mut out = scan(&exclusions, &mut budget)?;
-        for canon in out.flagged.clone() {
-            match db.apply_aces(
-                sandbox_sid,
-                &[(canon.clone(), SbAce::Deny(DenyMask::WriteDeny))],
-            ) {
-                Ok((_, 0)) => out.stamped.push(canon),
-                // apply_aces already printed the per-path warning
-                // and rolled this path's fresh rows back.
-                Ok((_, _failed)) => out.failed.push((
-                    canon,
-                    "stamp failed (see warning above); left unstamped".to_string(),
-                )),
-                Err(e) => out.failed.push((canon, format!("{e:#}"))),
+    let (granted_writes, mut report) =
+        state_db::with_init_lock(holder, false, |db| db.granted_write_paths())?;
+    let mut excluded: Vec<String> = crate::ambient::ambient_deny_targets();
+    excluded.extend(crate::install::ambient_recorded_paths().unwrap_or_default());
+    excluded.extend(granted_writes);
+    if let Ok(d) = state_db::machine_store_dir() {
+        excluded.push(d.display().to_string());
+    }
+    let exclusions = Exclusions::new(excluded);
+    let (mut out, to_stamp) = scan(&exclusions, Budget::new())?;
+    if !to_stamp.is_empty() {
+        let ((), stamp_report) = state_db::with_init_lock(holder, false, |db| {
+            for canon in to_stamp {
+                match db.apply_aces(sandbox_sid, &[(canon.clone(), SbAce::DenyWwAudit)]) {
+                    Ok((_, 0)) => out.stamped.push(canon),
+                    // apply_aces already printed the per-path warning
+                    // and rolled this path's fresh rows back.
+                    Ok((_, _failed)) => out.failed.push(FailedStamp {
+                        path: canon,
+                        error: "stamp failed (see warning above); left unstamped".to_string(),
+                    }),
+                    Err(e) => out.failed.push(FailedStamp {
+                        path: canon,
+                        error: format!("{e:#}"),
+                    }),
+                }
             }
-        }
-        Ok(out)
-    })
+            Ok(())
+        })?;
+        // The second acquire runs crash recovery again (normally a
+        // no-op right after the first); report the total.
+        report.dead_brokers += stamp_report.dead_brokers;
+        report.aces_revoked += stamp_report.aces_revoked;
+    }
+    Ok((out, report))
 }
 
 #[cfg(test)]
@@ -631,6 +736,10 @@ mod tests {
         assert!(mask_grants_dir_write(0x4000_0000)); // GENERIC_WRITE
         assert!(mask_grants_dir_write(0x1000_0000)); // GENERIC_ALL
         assert!(mask_grants_dir_write(0x001f_01ff)); // FILE_ALL_ACCESS
+        // Write-equivalent security rights flag too: WRITE_DAC /
+        // WRITE_OWNER let the trustee grant itself write.
+        assert!(mask_grants_dir_write(0x0004_0000)); // WRITE_DAC
+        assert!(mask_grants_dir_write(0x0008_0000)); // WRITE_OWNER
         // Read/execute/list-only masks must NOT flag.
         assert!(!mask_grants_dir_write(0x0012_00a9)); // FILE_GENERIC_READ|EXECUTE
         assert!(!mask_grants_dir_write(0x8000_0000)); // GENERIC_READ
@@ -672,15 +781,15 @@ mod tests {
         assert!(b.try_charge_dacl_read());
         assert!(b.try_charge_dacl_read());
         assert!(!b.try_charge_dacl_read());
-        assert!(b.dacl_exhausted());
-        assert!(!b.wall_expired());
-        assert_eq!(b.dacl_reads(), 2);
+        assert!(b.dacl_exhausted);
+        assert!(!b.wall_expired);
+        assert_eq!(b.dacl_reads, 2);
         // Wall expiry latches without charging.
         let mut b = Budget::with_limits(Duration::ZERO, 100);
         assert!(b.wall_expired_now());
         assert!(!b.try_charge_dacl_read());
-        assert!(b.wall_expired());
-        assert_eq!(b.dacl_reads(), 0);
+        assert!(b.wall_expired);
+        assert_eq!(b.dacl_reads, 0);
     }
 
     #[test]
@@ -731,6 +840,10 @@ mod tests {
         assert!(check("D:(A;OICI;GW;;;WD)"));
         assert!(check("D:(A;OICI;0x100002;;;BU)")); // FILE_ADD_FILE
         assert!(check("D:(A;OICI;FA;;;AU)"));
+        // WRITE_DAC- / WRITE_OWNER-only world grants are
+        // write-equivalent (the trustee can grant itself write).
+        assert!(check("D:(A;OICI;0x40000;;;WD)")); // WRITE_DAC
+        assert!(check("D:(A;OICI;0x80000;;;WD)")); // WRITE_OWNER
         // Read-only world access is fine.
         assert!(!check("D:(A;OICI;FR;;;WD)"));
         // Write for a non-flagged trustee (Administrators) is fine.

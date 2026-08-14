@@ -154,8 +154,11 @@ let javaAgentJarPath: string | undefined
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
 let proxyAuthToken: string | undefined
 // Windows: the resolved access set that was actually applied at
-// initialize(). `undefined` means no stamp/grant was applied
-// (gates running `acl restore`/`acl revoke` at reset()).
+// initialize(). Feeds wrap-time reuse only: the per-exec deny
+// dedup and the resolved allowWrite list (git safe.directory) in
+// wrapCommandWithSandbox. It does NOT gate reset() — reset()
+// sweeps by `windowsFsSbUserSid` alone, because audit deny stamps
+// can exist even when the session applied no fs config of its own.
 let windowsFsStampedSet:
   | ReturnType<typeof computeWindowsFsAccessSet>
   | undefined
@@ -167,7 +170,6 @@ let windowsFsSbUserSid: string | undefined
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
 let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
-// Whether the initialize()-time world-writable audit stamped any
 // `verifyWindowsWfpEgress()` is once per PROCESS (it spawns a
 // CreateProcessWithLogonW runner; first call may create the sandbox
 // user's profile). The WFP fence is install-scoped, not config- or
@@ -748,6 +750,12 @@ async function initialize(
   // Register cleanup handlers first time
   registerCleanup()
 
+  // Windows world-writable audit, started inside the Windows block
+  // below and collected after the network init so the two overlap.
+  // The helper never rejects (it catches everything and resolves
+  // undefined), so holding the promise across the overlap is safe.
+  let wwAuditPromise: ReturnType<typeof auditWindowsWorldWritable> | undefined
+
   // Windows: validate provisioning + filesystem config BEFORE any
   // sandboxed child can be spawned. Doing this at initialize() (not
   // wrap-time) means the host gets a single actionable error before
@@ -887,11 +895,12 @@ async function initialize(
           srtWin,
         })
       }
-      // Only record when something was actually applied — gates
-      // running revoke/restore at reset(). Recorded AFTER success —
-      // the catch below clears `config`, and a non-undefined
-      // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed.
+      // Only record when something was actually applied, and AFTER
+      // success — the catch below clears `config`, and a
+      // non-undefined stampedSet would leave the wrap-time
+      // consumers (per-exec deny dedup, allowWrite) seeing state
+      // that never landed. reset() does not key on this — it
+      // sweeps by `windowsFsSbUserSid` alone.
       const anyApplied =
         acc.grantRead.length > 0 ||
         acc.grantWrite.length > 0 ||
@@ -930,22 +939,15 @@ async function initialize(
     // Runs AFTER the grants above so the session's allowWrite set is
     // recorded in the state DB and excluded from stamping. The
     // helper catches everything and returns undefined on failure.
+    // Started here but awaited only after the network init below —
+    // the audit is an independent srt-win subprocess touching only
+    // the ACL state DB, so it overlaps proxy startup instead of
+    // serializing in front of it.
     if (windowsFsSbUserSid) {
-      const audit = await auditWindowsWorldWritable({
+      wwAuditPromise = auditWindowsWorldWritable({
         sandboxUserSid: windowsFsSbUserSid,
         srtWin,
       })
-      if (audit) {
-        logForDebugging(
-          `[Sandbox Windows] ww audit: ${audit.scanned} scanned, ` +
-            `${audit.flagged.length} flagged, ` +
-            `${audit.stamped.length} stamped, ` +
-            `${audit.failed.length} failed` +
-            (audit.budget.wallExpired || audit.budget.daclExhausted
-              ? ` (budget hit — partial coverage)`
-              : ''),
-        )
-      }
     }
   }
 
@@ -1028,6 +1030,13 @@ async function initialize(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
+      // Let the concurrent world-writable audit settle before the
+      // reset() sweep — otherwise its stamps could land AFTER
+      // restore ran and be stranded until this process exits.
+      // Never rejects (the helper catches everything).
+      if (wwAuditPromise) {
+        await wwAuditPromise
+      }
       reset().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
@@ -1038,6 +1047,25 @@ async function initialize(
   })()
 
   await initializationPromise
+
+  // Collect the Windows world-writable audit started before the
+  // network init. Preserves the pre-overlap contract: initialize()
+  // does not resolve until the audit's stamps are on disk (or it
+  // failed — undefined, already logged by the helper).
+  if (wwAuditPromise) {
+    const audit = await wwAuditPromise
+    if (audit) {
+      logForDebugging(
+        `[Sandbox Windows] ww audit: ${audit.scanned} scanned, ` +
+          `${audit.flagged.length} flagged, ` +
+          `${audit.stamped.length} stamped, ` +
+          `${audit.failed.length} failed` +
+          (audit.budget.wallExpired || audit.budget.daclExhausted
+            ? ` (budget hit — partial coverage)`
+            : ''),
+      )
+    }
+  }
 }
 
 function isSupportedPlatform(): boolean {

@@ -296,8 +296,10 @@ pub fn open_db() -> Result<Connection> {
     )
 }
 
-/// Filter on `release_aces` for the deny-ACE lifecycle.
-pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete"];
+/// Filter on `release_aces` for the deny-ACE lifecycle. Includes
+/// the world-writable audit's `deny_ww` holds — `acl restore`
+/// releases them like any other session deny.
+pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", "deny_ww"];
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
 
@@ -694,6 +696,20 @@ impl Locked {
                 // and stamping the parent first just to release
                 // it in the same pass wastes a SetSecurityInfo
                 // round-trip and clutters the failure output.
+                //
+                // `DenyWwAudit` deliberately takes NO parent-FDC
+                // stamp: the FDC parent-stamp protects deny
+                // TARGETS from being renamed/deleted away, but
+                // the audit's parents (the drive root's dirs,
+                // %TEMP%'s parent, deep PATH ancestors) can be
+                // huge trees, and `SetNamedSecurityInfoW` would
+                // materialize the inheritable ACE across every
+                // unprotected descendant at every session start
+                // (and strip it at reset) — unbounded cost the
+                // scan budgets don't cover. The `(OI)(CI)` deny
+                // on the flagged dir itself covers the planting
+                // threat, and rename-away by the sandbox is
+                // already denied by the deny mask's DELETE bit.
                 if one(canon, *ace)
                     && matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete)
                     && let Some(p) = path_id::canonical_parent_of(canon)
@@ -721,7 +737,7 @@ impl Locked {
         // Refuse Deny on multi-link files; Grant is fail-open so
         // an early release is safe, and `DenyFdc` only targets
         // directories.
-        if matches!(want, SbAce::Deny(_)) && !is_dir && links > 1 {
+        if matches!(want, SbAce::Deny(_) | SbAce::DenyWwAudit) && !is_dir && links > 1 {
             bail!(
                 "deny refused: '{canon}' has {links} hardlink(s); \
                  ace_holders rows are path-keyed, so releasing an \
@@ -1052,6 +1068,7 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::Deny(d) => set.deny = Some(d),
             SbAce::DenyFdc => set.deny_fdc = true,
             SbAce::DenyDelete => set.deny_delete = true,
+            SbAce::DenyWwAudit => set.deny_ww = true,
         }
     }
     // Install-time ambient write-deny (HKLM AmbientDenies) folds

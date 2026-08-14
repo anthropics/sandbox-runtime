@@ -114,10 +114,11 @@ try {
   icacls $wwDir /grant '*S-1-1-0:(OI)(CI)(GW)' | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "WW1: icacls grant on $wwDir failed" }
   New-Item -ItemType Junction -Path $wwJunc -Value $wwDir | Out-Null
-  $auditRaw = & $Exe audit-ww --holder-pid $PID --sandbox-user-sid $sbSid --json 2>&1
-  if ($LASTEXITCODE -ne 0) { throw "WW1: audit-ww exited ${LASTEXITCODE}: $auditRaw" }
-  Write-Host ($auditRaw | Out-String)
-  $audit = ($auditRaw | Where-Object { "$_".StartsWith('{') } | Select-Object -First 1) | ConvertFrom-Json
+  # Parse stdout alone as the JSON document (the J helper captures
+  # stdout and lets stderr flow to the console) - no fishing the
+  # first '{'-line out of a merged stream, which broke whenever a
+  # stderr line contained '{'. J/Run throw on a non-zero exit.
+  $audit = J @('audit-ww','--holder-pid',"$PID",'--sandbox-user-sid',$sbSid,'--json')
   $wwLeaf = Split-Path $wwDir -Leaf
   if (-not ($audit.stamped | Where-Object { $_ -like "*$wwLeaf" })) {
     throw "WW1: audit-ww did not stamp ${wwDir}: stamped=$($audit.stamped -join ', ')"

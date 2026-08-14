@@ -83,12 +83,16 @@ impl Mask {
     pub const DELETE: Self = Self(0x0001_0000);
     pub const READ_CONTROL: Self = Self(0x0002_0000);
     pub const WRITE_DAC: Self = Self(0x0004_0000);
+    pub const WRITE_OWNER: Self = Self(0x0008_0000);
     pub const SYNCHRONIZE: Self = Self(0x0010_0000);
 
     // Generic — resolved via the object's GENERIC_MAPPING.
     pub const GENERIC_ALL: Self = Self(0x1000_0000);
+    pub const GENERIC_WRITE: Self = Self(0x4000_0000);
 
     // File/dir-specific.
+    pub const FILE_ADD_FILE: Self = Self(0x0000_0002);
+    pub const FILE_ADD_SUBDIRECTORY: Self = Self(0x0000_0004);
     pub const FILE_DELETE_CHILD: Self = Self(0x0000_0040);
     pub const FILE_ALL: Self = Self(FILE_ALL_ACCESS.0);
     pub const FILE_WRITE_ATTRIBUTES: Self = Self(0x0000_0100);
@@ -559,7 +563,7 @@ pub fn open_for_security_no_follow(path: &str) -> Result<crate::util::OwnedHandl
     let h = unsafe {
         CreateFileW(
             pcwstr(&w),
-            Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits() | 0x0008_0000, // + WRITE_OWNER
+            Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits() | Mask::WRITE_OWNER.bits(),
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
@@ -698,6 +702,18 @@ pub enum SbAce {
     /// whole subtree if the placeholder later becomes a real user
     /// directory.
     DenyDelete,
+    /// `(OI)(CI)` write-deny stamped by the world-writable audit
+    /// (`ww_audit.rs`) on a directory whose DACL explicitly grants
+    /// write to Everyone / BUILTIN\Users / Authenticated Users.
+    /// The mask is [`DenyMask::WriteDeny`] PLUS `WRITE_DAC` and
+    /// `WRITE_OWNER`: the flagged class typically grants the world
+    /// (sandbox user included) `GENERIC_ALL`/`(F)` — which carries
+    /// `WRITE_DAC` — so a plain write-deny would be self-strippable
+    /// (the sandboxed child could `SetSecurityInfo` the deny ACE
+    /// away and write). A distinct kind, not a widened
+    /// [`DenyMask::WriteDeny`], so user-configured `denyWrite`
+    /// semantics are unchanged.
+    DenyWwAudit,
 }
 
 impl GrantMask {
@@ -729,19 +745,28 @@ impl DenyMask {
     }
 }
 
+/// [`SbAce::DenyWwAudit`]'s deny mask: [`DenyMask::WriteDeny`] plus
+/// `WRITE_DAC` and `WRITE_OWNER` — see the variant doc for why the
+/// audit's stamps must also deny DACL/owner rewrites.
+fn ww_audit_deny_bits() -> u32 {
+    DenyMask::WriteDeny.bits() | Mask::WRITE_DAC.with(Mask::WRITE_OWNER).bits()
+}
+
 impl SbAce {
-    /// `'grant' | 'deny' | 'deny_fdc'` — the row's `kind` column.
+    /// `'grant' | 'deny' | 'deny_fdc' | 'deny_delete' | 'deny_ww'`
+    /// — the row's `kind` column.
     pub fn kind(self) -> &'static str {
         match self {
             SbAce::Grant(_) => "grant",
             SbAce::Deny(_) => "deny",
             SbAce::DenyFdc => "deny_fdc",
             SbAce::DenyDelete => "deny_delete",
+            SbAce::DenyWwAudit => "deny_ww",
         }
     }
-    /// `'read' | 'modify' | 'denyRead' | 'denyWrite' | 'fdc'` — the
-    /// row's `mask` / holder's `want_mask` column. Round-trips via
-    /// [`SbAce::parse`].
+    /// `'read' | 'modify' | 'denyRead' | 'denyWrite' | 'fdc' |
+    /// 'delete' | 'wwAudit'` — the row's `mask` / holder's
+    /// `want_mask` column. Round-trips via [`SbAce::parse`].
     pub fn as_str(self) -> &'static str {
         match self {
             SbAce::Grant(GrantMask::ReadOnly) => "read",
@@ -750,6 +775,7 @@ impl SbAce {
             SbAce::Deny(DenyMask::WriteDeny) => "denyWrite",
             SbAce::DenyFdc => "fdc",
             SbAce::DenyDelete => "delete",
+            SbAce::DenyWwAudit => "wwAudit",
         }
     }
     pub fn parse(kind: &str, mask: &str) -> Result<Self> {
@@ -760,11 +786,13 @@ impl SbAce {
             ("deny", "denyWrite") => SbAce::Deny(DenyMask::WriteDeny),
             ("deny_fdc", _) => SbAce::DenyFdc,
             ("deny_delete", _) => SbAce::DenyDelete,
+            ("deny_ww", _) => SbAce::DenyWwAudit,
             (k, m) => bail!("unknown SbAce kind={k:?} mask={m:?}"),
         })
     }
     /// Widening within one kind: `Modify ⊃ ReadOnly`, `ReadDeny ⊃
-    /// WriteDeny`, `DenyFdc` is unit. Cross-kind is meaningless (a
+    /// WriteDeny`; the maskless kinds (`DenyFdc`/`DenyDelete`/
+    /// `DenyWwAudit`) are unit. Cross-kind is meaningless (a
     /// path can hold one `Grant` row AND one `Deny` row; never
     /// merged).
     pub fn max(self, other: Self) -> Self {
@@ -790,17 +818,32 @@ pub struct SbAceSet {
     pub deny: Option<DenyMask>,
     pub deny_fdc: bool,
     pub deny_delete: bool,
+    pub deny_ww: bool,
 }
 
 impl SbAceSet {
     /// The set's entries as [`NewAce`]s for `sid`, in canonical
-    /// deny → deny-fdc → allow order. `Deny`/`DenyFdc`/`Grant` carry
-    /// [`OICI`]; `DenyDelete` is object-only ([`NO_INHERIT`]) — see
-    /// [`SbAce::DenyDelete`].
+    /// deny → deny-fdc → allow order. `Deny`/`DenyWwAudit`/`DenyFdc`/
+    /// `Grant` carry [`OICI`]; `DenyDelete` is object-only
+    /// ([`NO_INHERIT`]) — see [`SbAce::DenyDelete`].
+    ///
+    /// The audit deny YIELDS to a live write grant: deny ACEs order
+    /// before allows, so an audit stamp left by one session would
+    /// otherwise break another session's later explicit write grant
+    /// on the same path (workspace writes failing with nothing
+    /// pointing at the other session's audit hold). An explicit
+    /// grant is foreground user intent; the audit is a best-effort
+    /// background floor — so while a `Modify` grant row exists the
+    /// `deny_ww` ACE is excluded from the composed set, and it
+    /// returns automatically on the next recompose after the grant
+    /// is released (the `deny_ww` row itself stays held).
     fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
         let mut v = Vec::with_capacity(4);
         if let Some(m) = self.deny {
             v.push(NewAce::Deny(sid, m.bits(), OICI));
+        }
+        if self.deny_ww && !matches!(self.grant, Some(GrantMask::Modify)) {
+            v.push(NewAce::Deny(sid, ww_audit_deny_bits(), OICI));
         }
         if self.deny_delete {
             v.push(NewAce::Deny(sid, Mask::DELETE.bits(), NO_INHERIT));
@@ -899,7 +942,13 @@ pub fn sandbox_deny_present(canonical_path: &str, sandbox_sid: &str) -> Result<b
     Ok(!denies.0.is_empty())
 }
 
-const INHERITED_ACE: u8 = 0x10;
+/// `ACE_HEADER.AceFlags` bit: the ACE was derived from the parent's
+/// inheritable set, not set explicitly on this object.
+pub(crate) const INHERITED_ACE: u8 = 0x10;
+/// `ACE_HEADER.AceFlags` bit: the ACE exists only to be inherited by
+/// children and grants nothing on the container itself (e.g. the
+/// stock `CREATOR OWNER` rows).
+pub(crate) const INHERIT_ONLY_ACE: u8 = 0x08;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,6 +1058,50 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Composition rule: the world-writable-audit deny yields to a
+    /// live `Modify` write grant and returns once the grant is gone
+    /// (see [`SbAceSet::head_aces`]); and its mask really denies the
+    /// DACL/owner rewrites that make a plain write-deny
+    /// self-strippable on Everyone-`(F)` directories.
+    #[test]
+    fn ww_audit_deny_yields_to_write_grant() {
+        let sid = LocalPsid::from_string("S-1-5-32-546").unwrap();
+        let ww_bits = ww_audit_deny_bits();
+        let count_ww = |set: SbAceSet| {
+            set.head_aces(sid.as_psid())
+                .iter()
+                .filter(|a| matches!(a, NewAce::Deny(_, m, f) if *m == ww_bits && *f == OICI))
+                .count()
+        };
+        let ww_only = SbAceSet {
+            deny_ww: true,
+            ..Default::default()
+        };
+        assert_eq!(count_ww(ww_only), 1);
+        // A ReadOnly grant is not a write grant — the deny stays.
+        assert_eq!(
+            count_ww(SbAceSet {
+                grant: Some(GrantMask::ReadOnly),
+                ..ww_only
+            }),
+            1
+        );
+        // A Modify (write) grant wins while it exists.
+        assert_eq!(
+            count_ww(SbAceSet {
+                grant: Some(GrantMask::Modify),
+                ..ww_only
+            }),
+            0
+        );
+        // Self-strip guard: DACL/owner rewrites are denied; read
+        // stays open (no SYNCHRONIZE/READ_CONTROL in the deny).
+        assert_ne!(ww_bits & Mask::WRITE_DAC.bits(), 0);
+        assert_ne!(ww_bits & Mask::WRITE_OWNER.bits(), 0);
+        assert_eq!(ww_bits & Mask::SYNCHRONIZE.bits(), 0);
+        assert_eq!(ww_bits & Mask::READ_CONTROL.bits(), 0);
     }
 
     #[test]
