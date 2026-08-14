@@ -2,9 +2,11 @@ import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
 import { logForDebugging } from '../utils/debug.js'
+import { getPlatform } from '../utils/platform.js'
 import {
-  containsGlobChars,
+  containsGlobCharsForPlatform,
   expandGlobPattern,
+  expandTilde,
   normalizePathForSandbox,
 } from './sandbox-utils.js'
 
@@ -29,6 +31,7 @@ const DEFAULT_IDENTITY_FILES = [
   'id_ed25519',
   'id_ed25519_sk',
   'id_dsa',
+  'id_xmss',
 ] as const
 
 /**
@@ -49,7 +52,6 @@ const PATH_DIRECTIVES = new Set([
 ])
 
 interface SshConfigScanState {
-  filesParsed: number
   visitedFiles: Set<string>
   collected: Set<string>
 }
@@ -106,12 +108,9 @@ export function expandSshPathTokens(
   value: string,
   homeDir: string,
 ): string | undefined {
-  let expanded = value
-  if (expanded === '~') {
-    expanded = homeDir
-  } else if (expanded.startsWith('~/')) {
-    expanded = homeDir + expanded.slice(1)
-  } else if (expanded.startsWith('~')) {
+  // Shared tilde handling (covers `~`, `~/`, and Windows `~\`).
+  const expanded = expandTilde(value, homeDir)
+  if (expanded.startsWith('~')) {
     // ~otheruser expansion requires user database lookups; skip.
     return undefined
   }
@@ -166,7 +165,7 @@ function expandIncludeArgument(pattern: string, homeDir: string): string[] {
     ? expanded
     : path.join(homeDir, '.ssh', expanded)
 
-  if (!containsGlobChars(absolute)) {
+  if (!containsGlobCharsForPlatform(absolute)) {
     return [absolute]
   }
   try {
@@ -187,7 +186,10 @@ function parseSshConfigFile(
   depth: number,
   state: SshConfigScanState,
 ): void {
-  if (depth > MAX_INCLUDE_DEPTH || state.filesParsed >= MAX_CONFIG_FILES) {
+  if (
+    depth > MAX_INCLUDE_DEPTH ||
+    state.visitedFiles.size >= MAX_CONFIG_FILES
+  ) {
     return
   }
   // Track by resolved path so include cycles (a includes b includes a)
@@ -202,7 +204,6 @@ function parseSshConfigFile(
     return
   }
   state.visitedFiles.add(resolved)
-  state.filesParsed++
 
   let content: string
   try {
@@ -259,20 +260,23 @@ function parseSshConfigFile(
  * ssh configs routinely point IdentityFile/CertificateFile/ControlPath at
  * files OUTSIDE ~/.ssh, so a denyRead entry for ~/.ssh alone does not protect
  * them. This walks the config (including Include chains) and returns every
- * referenced path that exists and is not already under an existing denyRead
- * entry, plus the default key filenames ssh tries when no IdentityFile is
- * set. Purely additive: callers append the result to their effective denyRead
- * set, and any failure yields fewer additions, never removed protection.
+ * referenced path — existing or not on POSIX (denies must predate the
+ * secret; on Windows absent targets are skipped, see the inline comment) —
+ * plus ssh's default key filenames when a ~/.ssh directory exists. No
+ * dedup against configured denyRead entries happens here (duplicates are
+ * harmless — every consumer Set-unions). Purely additive: callers append
+ * the result to their effective denyRead set, and any failure yields fewer
+ * additions, never removed protection.
  *
- * @param homeDirOverride - Test seam; defaults to os.homedir().
+ * Test seam: suites point `_test.homedirOverride` at a temp home
+ * (bun's os.homedir() reads passwd, not $HOME).
  */
-export function collectSshKeyDenyPaths(homeDirOverride?: string): string[] {
+export function collectSshKeyDenyPaths(): string[] {
   try {
-    const homeDir = homeDirOverride ?? _test.homedirOverride ?? homedir()
+    const homeDir = _test.homedirOverride ?? homedir()
     const sshDir = path.join(homeDir, '.ssh')
 
     const state: SshConfigScanState = {
-      filesParsed: 0,
       visitedFiles: new Set(),
       collected: new Set(),
     }
@@ -303,7 +307,7 @@ export function collectSshKeyDenyPaths(homeDirOverride?: string): string[] {
       // profile generator would compile such a path as a GLOB and
       // deny the wrong object — a silent loss of protection. Skip
       // loudly instead (the shape is vanishingly rare).
-      if (containsGlobChars(normalized)) {
+      if (containsGlobCharsForPlatform(normalized)) {
         logForDebugging(
           `[Sandbox] SSH key path contains glob metacharacters, ` +
             `skipping deny: ${normalized}`,
@@ -311,13 +315,20 @@ export function collectSshKeyDenyPaths(homeDirOverride?: string): string[] {
         )
         continue
       }
-      // Deliberately NOT filtered on existence: a ControlPath mux
-      // socket typically appears only when the first master
-      // connection opens, and keys can be generated mid-session.
-      // Every backend tolerates absent deny entries (seatbelt
-      // subpath denies are valid for absent paths; Linux
-      // logs-and-skips; Windows materializes a placeholder), so the
-      // deny must be in place BEFORE the secret exists.
+      // POSIX: deliberately NOT filtered on existence — a ControlPath
+      // mux socket appears only when the first master connection
+      // opens, keys can be generated mid-session, and absent deny
+      // entries are inert (seatbelt subpath denies are valid for
+      // absent paths; Linux logs-and-skips). Windows is the
+      // exception: srt-win placeholder-MATERIALIZES absent deny
+      // targets, and planting zero-byte files at default key names
+      // inside a real ~/.ssh makes OpenSSH try to load them and
+      // fail — so absent targets are skipped there (an existing
+      // .ssh gets its existing material denied; a key generated
+      // mid-session is covered from the next initialize()).
+      if (getPlatform() === 'windows' && !fs.existsSync(normalized)) {
+        continue
+      }
       denyPaths.push(normalized)
     }
     denyPaths.sort()

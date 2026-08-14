@@ -1,8 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+  realpathSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  _test as sshDenyTest,
   collectSshKeyDenyPaths,
   expandSshPathTokens,
   splitSshConfigLine,
@@ -26,16 +33,15 @@ describe('collectSshKeyDenyPaths', () => {
   let sshDir: string
 
   beforeEach(() => {
-    rawHome = join(
-      tmpdir(),
-      `ssh-deny-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    )
+    rawHome = mkdtempSync(join(tmpdir(), 'ssh-deny-test-'))
     sshDir = join(rawHome, '.ssh')
     mkdirSync(sshDir, { recursive: true })
     home = realPath(rawHome)
+    sshDenyTest.homedirOverride = rawHome
   })
 
   afterEach(() => {
+    sshDenyTest.homedirOverride = undefined
     rmSync(rawHome, { recursive: true, force: true })
   })
 
@@ -48,7 +54,7 @@ describe('collectSshKeyDenyPaths', () => {
       `Host work\n  IdentityFile ${join(rawHome, 'keys', 'work_ed25519')}\n`,
     )
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, 'keys', 'work_ed25519'))
   })
 
@@ -60,7 +66,7 @@ describe('collectSshKeyDenyPaths', () => {
       'IdentityFile ~/tilde_key\nIdentityFile %d/percent_key\n',
     )
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, 'tilde_key'))
     expect(result).toContain(join(home, 'percent_key'))
   })
@@ -73,7 +79,7 @@ describe('collectSshKeyDenyPaths', () => {
       `CertificateFile ${join(rawHome, 'cert.pub')}\nControlPath ${join(rawHome, 'mux')}\n`,
     )
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, 'cert.pub'))
     expect(result).toContain(join(home, 'mux'))
   })
@@ -87,7 +93,7 @@ describe('collectSshKeyDenyPaths', () => {
       `IdentityFile ${join(rawHome, 'nested_key')}\n`,
     )
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, 'nested_key'))
   })
 
@@ -105,7 +111,7 @@ describe('collectSshKeyDenyPaths', () => {
     )
     writeFileSync(join(sshDir, 'config'), 'Include config.d/*\n')
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, 'glob_key_a'))
     expect(result).toContain(join(home, 'glob_key_b'))
   })
@@ -119,7 +125,7 @@ describe('collectSshKeyDenyPaths', () => {
       `IdentityFile ${join(rawHome, '%h_key')}\nIdentityFile ${join(rawHome, 'real_key')}\n`,
     )
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, 'real_key'))
     expect(result.some(p => p.includes('%'))).toBe(false)
   })
@@ -131,7 +137,7 @@ describe('collectSshKeyDenyPaths', () => {
     // spelling — both are denied.
     writeFileSync(join(sshDir, 'id_ed25519'), 'k')
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, '.ssh', 'id_ed25519'))
     expect(result).toContain(join(rawHome, '.ssh', 'id_rsa'))
   })
@@ -141,7 +147,7 @@ describe('collectSshKeyDenyPaths', () => {
     // placeholder-materialized on Windows, and planting a .ssh
     // skeleton into profiles that never used ssh is out of scope.
     rmSync(sshDir, { recursive: true, force: true })
-    expect(collectSshKeyDenyPaths(rawHome)).toEqual([])
+    expect(collectSshKeyDenyPaths()).toEqual([])
   })
 
   it('denies referenced paths that do not exist yet', () => {
@@ -149,9 +155,7 @@ describe('collectSshKeyDenyPaths', () => {
       join(sshDir, 'config'),
       `IdentityFile ${join(rawHome, 'no_such_key')}\n`,
     )
-    expect(collectSshKeyDenyPaths(rawHome)).toContain(
-      join(rawHome, 'no_such_key'),
-    )
+    expect(collectSshKeyDenyPaths()).toContain(join(rawHome, 'no_such_key'))
   })
 
   it('tolerates malformed lines without dropping valid ones', () => {
@@ -169,7 +173,7 @@ describe('collectSshKeyDenyPaths', () => {
       ].join('\n'),
     )
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, 'good_key'))
   })
 
@@ -181,7 +185,7 @@ describe('collectSshKeyDenyPaths', () => {
     )
     writeFileSync(join(sshDir, 'loop'), 'Include config\n')
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).toContain(join(home, 'cycle_key'))
   })
 
@@ -198,7 +202,7 @@ describe('collectSshKeyDenyPaths', () => {
       `IdentityFile ${join(rawHome, 'deep_key')}\n`,
     )
 
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result).not.toContain(join(home, 'deep_key'))
   })
 
@@ -206,19 +210,19 @@ describe('collectSshKeyDenyPaths', () => {
     const agentSock = join(rawHome, 'agent.sock')
     writeFileSync(agentSock, '')
     writeFileSync(join(sshDir, 'config'), `IdentityAgent ${agentSock}\n`)
-    expect(collectSshKeyDenyPaths(rawHome)).toContain(join(home, 'agent.sock'))
+    expect(collectSshKeyDenyPaths()).toContain(join(home, 'agent.sock'))
   })
 
   it('skips candidates containing glob metacharacters (would mis-deny)', () => {
     const weird = join(rawHome, 'keys[1]')
     writeFileSync(join(sshDir, 'config'), `IdentityFile ${weird}\n`)
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result.some(p => p.includes('keys[1]'))).toBe(false)
   })
 
   it('skips IdentityFile none', () => {
     writeFileSync(join(sshDir, 'config'), 'IdentityFile none\n')
-    const result = collectSshKeyDenyPaths(rawHome)
+    const result = collectSshKeyDenyPaths()
     expect(result.some(p => p.endsWith('none'))).toBe(false)
   })
 })
