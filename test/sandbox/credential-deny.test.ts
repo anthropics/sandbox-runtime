@@ -10,6 +10,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import { _test as sshConfigDenyTest } from '../../src/sandbox/ssh-config-deny.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { normalizePathForSandbox } from '../../src/sandbox/sandbox-utils.js'
@@ -22,7 +23,24 @@ import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
  * File entries with mode: deny are unioned into the read-deny set; env var
  * entries with mode: deny are unset inside the sandbox. Only explicitly
  * declared sources are restricted — the block applies no implicit defaults.
+ *
+ * HOME is pointed at an empty temp dir for the whole file: the exact-set
+ * assertions below would otherwise pick up the runner's real ~/.ssh via the
+ * ssh-config key protection (which is additive by design and covered by its
+ * own suite).
  */
+const hermeticHome = join(
+  tmpdir(),
+  `cred-deny-home-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+)
+beforeAll(() => {
+  mkdirSync(hermeticHome, { recursive: true })
+  sshConfigDenyTest.homedirOverride = hermeticHome
+})
+afterAll(() => {
+  sshConfigDenyTest.homedirOverride = undefined
+  rmSync(hermeticHome, { recursive: true, force: true })
+})
 
 function baseConfig(
   overrides: Partial<SandboxRuntimeConfig> = {},

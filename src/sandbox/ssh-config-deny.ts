@@ -268,7 +268,7 @@ function parseSshConfigFile(
  */
 export function collectSshKeyDenyPaths(homeDirOverride?: string): string[] {
   try {
-    const homeDir = homeDirOverride ?? homedir()
+    const homeDir = homeDirOverride ?? _test.homedirOverride ?? homedir()
     const sshDir = path.join(homeDir, '.ssh')
 
     const state: SshConfigScanState = {
@@ -285,8 +285,15 @@ export function collectSshKeyDenyPaths(homeDirOverride?: string): string[] {
     // Default identity filenames are tried by ssh even with no config file,
     // and this library has no mandatory read denies covering them (its
     // mandatory protections — DANGEROUS_FILES et al. — are write-side only).
-    for (const name of DEFAULT_IDENTITY_FILES) {
-      state.collected.add(path.join(sshDir, name))
+    // Gated on the .ssh DIRECTORY existing: within it, names are denied
+    // before the keys exist (mid-session keygen stays covered), but a
+    // machine with no .ssh at all gets no denies — on Windows, absent deny
+    // targets are placeholder-materialized, and planting a .ssh skeleton
+    // into every profile that never used ssh is not this feature's call.
+    if (fs.existsSync(sshDir)) {
+      for (const name of DEFAULT_IDENTITY_FILES) {
+        state.collected.add(path.join(sshDir, name))
+      }
     }
 
     const denyPaths: string[] = []
@@ -328,4 +335,14 @@ export function collectSshKeyDenyPaths(homeDirOverride?: string): string[] {
     })
     return []
   }
+}
+
+/**
+ * Test seam (house convention): suites asserting EXACT deny sets
+ * point this at an empty temp home — bun's os.homedir() reads
+ * passwd, not $HOME, so an env-var swap cannot make the scan
+ * hermetic.
+ */
+export const _test: { homedirOverride: string | undefined } = {
+  homedirOverride: undefined,
 }

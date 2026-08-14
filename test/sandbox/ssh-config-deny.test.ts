@@ -136,10 +136,12 @@ describe('collectSshKeyDenyPaths', () => {
     expect(result).toContain(join(rawHome, '.ssh', 'id_rsa'))
   })
 
-  it('still returns default key names when no .ssh material exists at all', () => {
+  it('returns nothing when no .ssh directory exists at all', () => {
+    // No .ssh -> no defaults: absent deny targets are
+    // placeholder-materialized on Windows, and planting a .ssh
+    // skeleton into profiles that never used ssh is out of scope.
     rmSync(sshDir, { recursive: true, force: true })
-    const result = collectSshKeyDenyPaths(rawHome)
-    expect(result).toContain(join(rawHome, '.ssh', 'id_ed25519'))
+    expect(collectSshKeyDenyPaths(rawHome)).toEqual([])
   })
 
   it('denies referenced paths that do not exist yet', () => {
