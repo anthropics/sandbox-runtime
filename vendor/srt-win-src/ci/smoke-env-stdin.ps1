@@ -47,12 +47,17 @@ function Run {
   }
 }
 
-# Quote one argument for a Win32 command line (MSVCRT rules; our
-# arguments contain no embedded quotes, so wrapping and doubling
-# backslashes before a closing quote is enough).
+# Quote one argument for a Win32 command line (MSVCRT rules). This
+# hand-rolled quoter cannot represent EMBEDDED quotes - rather than
+# emit a silently-mangled Arguments string (which can swallow later
+# flags into a quoted value), refuse loudly.
 function Quote-Arg {
   param([string] $a)
-  if ($a -notmatch '[ \t"]') { return $a }
+  if ($a.Contains('"')) {
+    throw ("Quote-Arg: argument contains an embedded quote and would " +
+           "mangle the command line: " + $a)
+  }
+  if ($a -notmatch '[ \t]') { return $a }
   $escaped = $a -replace '(\\+)$', '$1$1'
   return '"' + $escaped + '"'
 }
@@ -75,6 +80,11 @@ function Find-CmdlinesContaining {
 # cmd/powershell quoting.
 $ProbeDir   = Join-Path $env:ProgramData 'srt-env-stdin-probe'
 $InnerProbe = Join-Path $ProbeDir 'inner.ps1'
+# Primary S4/S5 oracle: the child WRITES its dump here (host reads it
+# after the chain exits). Cycle-4 showed the child's bulk stdout can
+# go missing in the VM while single trailing lines (CHILD-DONE)
+# arrive, so stdout parsing is only the fallback oracle.
+$CenvFile   = Join-Path $ProbeDir 'cenv.txt'
 
 $decoy = $null
 try {
@@ -85,20 +95,24 @@ try {
   Run @('install',
         '--sublayer-guid', $Sublayer,
         '--proxy-port-range', $PortRange)
-  Write-Host 'S0 ok: installed under test sublayer'
+  $us = (& $Exe user status) | ConvertFrom-Json
+  if ($LASTEXITCODE -ne 0) { throw 'S0: srt-win user status failed' }
+  $sbSid = $us.marker_user_sid
+  if (-not $sbSid) { throw 'S0: setup marker missing user_sid' }
+  Write-Host "S0 ok: installed under test sublayer (sb sid=$sbSid)"
 
   # -- S1: detection method works: a token planted on a decoy argv IS found --
   # ping -n 30 keeps the decoy alive ~29s; no -WindowStyle (it can
   # fail from a session-0 / service context). Fall back to
   # Diagnostics.Process if Start-Process itself refuses.
-  $decoyArgs = '/c', ('rem {0} & ping -n 30 127.0.0.1 >nul' -f $Token)
+  $decoyArgs = '/c', ('ping -n 30 127.0.0.1 >nul & rem {0}' -f $Token)
   try {
     $decoy = Start-Process -FilePath $cmd -ArgumentList $decoyArgs -PassThru
   } catch {
     Write-Host "S1: Start-Process failed ($_); falling back to Diagnostics.Process"
     $dpsi = New-Object System.Diagnostics.ProcessStartInfo
     $dpsi.FileName        = $cmd
-    $dpsi.Arguments       = '/c "rem {0} & ping -n 30 127.0.0.1 >nul"' -f $Token
+    $dpsi.Arguments       = '/c "ping -n 30 127.0.0.1 >nul & rem {0}"' -f $Token
     $dpsi.UseShellExecute = $false
     $dpsi.CreateNoWindow  = $true
     $decoy = [System.Diagnostics.Process]::Start($dpsi)
@@ -141,6 +155,20 @@ try {
 
   # -- S2: run exec with the token ONLY in the --env-stdin frame ----------
   New-Item -ItemType Directory -Force -Path $ProbeDir | Out-Null
+  # Explicit modify grants (locale-proof SID form) so the srt-sandbox
+  # child can create cenv.txt here regardless of what ProgramData's
+  # inherited ACL says on this VM: BUILTIN\Users, plus the sandbox
+  # user's own SID in case srt-sandbox is not a Users member.
+  & icacls $ProbeDir /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "S2: icacls Users grant on $ProbeDir failed ($LASTEXITCODE)"
+  }
+  & icacls $ProbeDir /grant ('*{0}:(OI)(CI)M' -f $sbSid) | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "S2: icacls sandbox-sid grant on $ProbeDir failed ($LASTEXITCODE)"
+  }
+  # The child writes its dump to $CenvFile (primary oracle) AND to
+  # stdout (fallback). FILEOK/FILEERR on stdout says which happened.
   $inner = @(
     "`$ErrorActionPreference = 'Continue'"
     '$lines = @()'
@@ -156,7 +184,31 @@ try {
     '} catch {'
     '  $lines += "WMIERR=$_"'
     '}'
-    'foreach ($e in Get-ChildItem env:) { $lines += "CENV=$($e.Name)=$($e.Value)" }'
+    # Env enumeration, DOUBLE-sourced with distinct prefixes and a
+    # per-source try/catch that leaves a CENV*ERR trace in the dump
+    # (cycle 5: Get-ChildItem env: produced zero entries under real
+    # 5.1 in-sandbox with no trace - the loop sat outside any
+    # catch, so a statement-terminating provider error vanished).
+    # [Environment]::GetEnvironmentVariables() is pure .NET, no PS
+    # provider involved.
+    'try {'
+    '  foreach ($de in [Environment]::GetEnvironmentVariables().GetEnumerator()) {'
+    '    $lines += "CENVD=$($de.Key)=$($de.Value)"'
+    '  }'
+    '} catch {'
+    '  $lines += "CENVDERR=$_"'
+    '}'
+    'try {'
+    '  foreach ($e in Get-ChildItem env:) { $lines += "CENV=$($e.Name)=$($e.Value)" }'
+    '} catch {'
+    '  $lines += "CENVERR=$_"'
+    '}'
+    'try {'
+    ('  Set-Content -Path ''{0}'' -Value ($lines -join "`r`n") -Encoding Ascii' -f $CenvFile)
+    '  Write-Output "FILEOK=1"'
+    '} catch {'
+    '  Write-Output "FILEERR=$_"'
+    '}'
     '$lines | Write-Output'
     'Start-Sleep -Seconds 6'
     "Write-Output 'CHILD-DONE'"
@@ -176,9 +228,17 @@ try {
   $frameBody = [Text.Encoding]::UTF8.GetBytes($frameJson)
   $frameLen  = [BitConverter]::GetBytes([UInt32]$frameBody.Length)
 
+  # MINIMAL literal PATH/PATHEXT, not the host's ($env:PATH can
+  # contain embedded quotes from third-party installers, which the
+  # hand-rolled Quote-Arg cannot represent - a mangled Arguments
+  # string can silently swallow later tokens like --env-stdin into a
+  # quoted value, and exec would then run happily WITHOUT ever
+  # reading the frame). The child only runs cmd + powershell by
+  # absolute path, so this minimal set is sufficient.
+  $probePath = ('{0}\System32;{0};{0}\System32\WindowsPowerShell\v1.0' -f $env:SystemRoot)
   $argv = @('exec',
-            '--env', "PATH=$($env:PATH)",
-            '--env', "PATHEXT=$($env:PATHEXT)",
+            '--env', "PATH=$probePath",
+            '--env', 'PATHEXT=.COM;.EXE;.BAT;.CMD;.PS1',
             '--env-stdin',
             '--', $cmd, '/c',
             "$ps -NoProfile -ExecutionPolicy Bypass -File $InnerProbe")
@@ -192,6 +252,11 @@ try {
   $psi.RedirectStandardInput  = $true
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError  = $true
+  # Broker-side debug breadcrumbs (spawn_runner checkpoints, DACL
+  # dump). Note this does NOT reach the runner - seclogon rebuilds
+  # its env from the sandbox user's profile - so the runner's own
+  # 'spec read' line is best-effort only (see S2c).
+  $psi.Environment['SANDBOX_RUNTIME_WIN_DEBUG'] = '1'
   $p = [System.Diagnostics.Process]::Start($psi)
   # Drain output pipes concurrently so a full buffer cannot wedge
   # WaitForExit.
@@ -232,6 +297,35 @@ try {
   }
   Write-Host 'S2 ok: exec chain ran the probe to completion'
 
+  # -- S2b/S2c: frame-delivery breadcrumbs, localizing any S4 fail --
+  # exec (non-quiet) prints 'launching runner as ... (overlay=N
+  # var(s))': N must be 4 (PATH + PATHEXT + the 2 frame vars). N=2
+  # with exit 0 means clap never saw --env-stdin (exec cannot exit 0
+  # with the flag parsed but the frame unread - the read errors or
+  # times out), i.e. the Arguments string was mangled.
+  if ($raw -notmatch 'overlay=4 var\(s\)') {
+    $srtLines = ($raw -split "`r?`n") | Where-Object { $_ -match 'srt-win:' }
+    throw ("S2b FAIL: exec did not report overlay=4 - the stdin frame " +
+           "vars never joined the overlay (flag lost or frame unread). " +
+           "srt-win lines:`n" + ($srtLines -join "`n"))
+  }
+  Write-Host 'S2b ok: exec merged the frame (overlay=4)'
+  # Runner debug line ('spec read (argv=N env_overlay=M)'): only
+  # printed when the RUNNER's env has SANDBOX_RUNTIME_WIN_DEBUG,
+  # which the broker-side setting above does NOT provide (the runner
+  # starts from the sandbox user's profile env - lpEnvironment=NULL
+  # across seclogon). Assert when present, note when absent.
+  if ($raw -match 'env_overlay=(\d+)') {
+    if ($Matches[1] -ne '4') {
+      throw ("S2c FAIL: runner reported env_overlay=$($Matches[1]), " +
+             "expected 4 - the spec pipe dropped entries")
+    }
+    Write-Host 'S2c ok: runner received all 4 overlay entries'
+  } else {
+    Write-Host ('S2c skipped: no runner spec-read line (debug env does ' +
+                'not cross the seclogon boundary)')
+  }
+
   # -- S3: host-side sweep assertions -----------------------------------
   if ($hostHits.Count -ne 0) {
     throw ("S3 FAIL: token visible on a command line (host sweep):`n" +
@@ -244,22 +338,55 @@ try {
   }
   Write-Host 'S3 ok: host-side sweep - token on no command line; exec chain was live'
 
-  # -- S4: child got the token in its ENVIRONMENT (mechanism works) -----
-  if ($raw -notmatch "CENV=HTTPS_PROXY=http://sb:$Token@") {
-    throw "S4 FAIL: token missing from child env - delivery broken. raw: $raw"
+  # -- Child-dump oracle: prefer the FILE the child wrote; fall back
+  # to stdout parsing. (Cycle 4: the child's bulk stdout dump went
+  # missing while CHILD-DONE arrived, so stdout alone is not a
+  # trustworthy negative.)
+  $rawLines = $raw -split "`r?`n"
+  if (Test-Path $CenvFile) {
+    $oracleSrc = 'file'
+    $dump = @(Get-Content -Path $CenvFile)
+  } else {
+    $oracleSrc = 'stdout'
+    $dump = @($rawLines | Where-Object {
+      $_ -match '^(SELFCMD|PARENTCMD|ANYCMD|CENV|CENVD|CENVERR|CENVDERR|WMIOK|WMIERR)='
+    })
+    $fileNote = @($rawLines | Where-Object { $_ -match '^FILE(OK|ERR)=' })
+    Write-Host ("oracle: cenv.txt missing - child file-write said: " +
+                ($fileNote -join '; '))
   }
-  Write-Host 'S4 ok: token present in the sandboxed child environment'
+  Write-Host ("oracle: source=$oracleSrc dump lines=$($dump.Count)")
+
+  # -- S4: child got the token in its ENVIRONMENT (mechanism works) -----
+  # Either enumeration source counts: CENVD= ([Environment]::
+  # GetEnvironmentVariables()) or CENV= (Get-ChildItem env:).
+  $tokenEnv = @($dump | Where-Object {
+    $_ -match "^CENVD?=HTTPS_PROXY=http://sb:$Token@"
+  })
+  if ($tokenEnv.Count -lt 1) {
+    # With S2b green the drop is in build_env_block / CreateProcess /
+    # the cmd->powershell hop OR in the child-side enumeration. The
+    # dump is small on failure - print it VERBATIM so the next cycle
+    # needs no guessing about what the child recorded.
+    $srtLines = @($rawLines | Where-Object { $_ -match 'srt-win:' })
+    throw ("S4 FAIL: token missing from child env - delivery broken " +
+           "past the runner (see S2b/S2c). oracle=$oracleSrc; " +
+           "dump ($($dump.Count) line(s)) verbatim:`n" +
+           ($dump -join "`n") +
+           "`nsrt-win lines:`n" + ($srtLines -join "`n"))
+  }
+  Write-Host "S4 ok: token present in the sandboxed child environment ($oracleSrc)"
 
   # -- S5: child-side view - own + parent + visible cmdlines token-free -
-  $selfLine = ($raw -split "`r?`n") | Where-Object { $_ -match '^SELFCMD=' }
-  $parentLine = ($raw -split "`r?`n") | Where-Object { $_ -match '^PARENTCMD=' }
+  $selfLine = $dump | Where-Object { $_ -match '^SELFCMD=' }
+  $parentLine = $dump | Where-Object { $_ -match '^PARENTCMD=' }
   if (-not $selfLine -or -not $parentLine) {
     Write-Host ("S5 WARNING: child could not read its own/parent command " +
                 "line via WMI (restricted token); host sweep in S3 already " +
                 "covers those processes")
   }
   $badChild = @()
-  foreach ($line in ($raw -split "`r?`n")) {
+  foreach ($line in $dump) {
     if (($line -match '^(SELFCMD|PARENTCMD|ANYCMD)=') -and $line.Contains($Token)) {
       $badChild += $line
     }

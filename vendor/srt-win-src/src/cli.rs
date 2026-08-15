@@ -1901,6 +1901,68 @@ mod tests {
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
     }
 
+    /// Full exec-side delivery path, no VM needed: a hand-rolled
+    /// frame exactly as ci/smoke-env-stdin.ps1 writes it (u32 LE
+    /// byte length + compact JSON `[[K,V],…]`, NOT built with
+    /// `encode_env_frame` — independence from the canonical encoder
+    /// is the point) goes through `decode_env_frame` →
+    /// `merge_env_overlay` → `RunnerSpec` → `encode_cmd`, and the
+    /// token-bearing var must be present in the spec JSON the
+    /// runner would receive over the spec pipe.
+    #[test]
+    fn exec_env_stdin_frame_reaches_runner_spec() {
+        use srt_win::runner::{
+            RunnerCmd, RunnerSpec, decode_env_frame, encode_cmd, merge_env_overlay,
+        };
+        let token = "tokprobe0123456789abcdef0123456789abcdef";
+        let url = format!("http://sb:{token}@localhost:60080");
+        let json = format!(r#"[["HTTP_PROXY","{url}"],["HTTPS_PROXY","{url}"]]"#);
+        let mut frame = (json.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(json.as_bytes());
+
+        // `--env` args as the probe passes them, through the same
+        // split_once('=') parse the exec handler uses.
+        let env_args = [
+            "PATH=C:\\Windows\\System32".to_string(),
+            "PATHEXT=.COM;.EXE;.BAT;.CMD".to_string(),
+        ];
+        let base: Vec<(String, String)> = env_args
+            .iter()
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').expect("KEY=VALUE");
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+
+        let extra = decode_env_frame(&mut &frame[..]).expect("decode probe frame");
+        let overlay = merge_env_overlay(base, extra).expect("disjoint merge");
+        assert_eq!(overlay.len(), 4, "PATH + PATHEXT + 2 frame vars");
+
+        let spec_bytes = encode_cmd(&RunnerCmd::Exec(RunnerSpec {
+            argv: vec!["cmd.exe".into(), "/c".into(), "set".into()],
+            env_overlay: overlay,
+        }))
+        .expect("encode spec");
+        let spec_json = std::str::from_utf8(&spec_bytes[4..]).expect("utf8");
+        assert!(
+            spec_json.contains(&format!(r#"["HTTPS_PROXY","{url}"]"#)),
+            "token var missing from runner spec JSON: {spec_json}"
+        );
+        // And a decode round-trip of what the runner would parse.
+        let back: RunnerCmd = serde_json::from_slice(spec_bytes[4..].as_ref()).unwrap();
+        match back {
+            RunnerCmd::Exec(s) => {
+                assert!(
+                    s.env_overlay
+                        .iter()
+                        .any(|(k, v)| k == "HTTPS_PROXY" && v == &url),
+                    "HTTPS_PROXY lost across the spec pipe"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
     /// `--env-stdin` on `exec` parses, defaults false, and composes
     /// with `--env` (the TS wrapper emits both: plain entries via
     /// `--env`, secret-bearing entries via the stdin frame).
