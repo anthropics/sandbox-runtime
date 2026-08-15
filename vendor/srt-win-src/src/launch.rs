@@ -354,7 +354,7 @@ pub fn run_lockdown(
 /// `srt-win exec` is a dumb passthrough for proxy configuration: it
 /// does NOT synthesize `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` and has
 /// no `--http-proxy` / `--socks-proxy` flags. The single source of
-/// proxy env is the TS `generateProxyEnvVars`, which the caller passes
+/// proxy env is the TS `generateProxyEnvEntries`, which the caller passes
 /// via `--env`; this function just forwards the runner's environment
 /// (= the sandbox user's `LOGON_WITH_PROFILE` defaults) with the
 /// overlay applied on top to the child. No proxy value is invented,

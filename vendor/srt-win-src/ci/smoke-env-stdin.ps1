@@ -88,15 +88,54 @@ try {
   Write-Host 'S0 ok: installed under test sublayer'
 
   # -- S1: detection method works: a token planted on a decoy argv IS found --
-  $decoy = Start-Process -FilePath $cmd `
-    -ArgumentList '/c', "rem $Token & timeout /t 30 /nobreak >nul" `
-    -WindowStyle Hidden -PassThru
+  # ping -n 30 keeps the decoy alive ~29s; no -WindowStyle (it can
+  # fail from a session-0 / service context). Fall back to
+  # Diagnostics.Process if Start-Process itself refuses.
+  $decoyArgs = '/c', ('rem {0} & ping -n 30 127.0.0.1 >nul' -f $Token)
+  try {
+    $decoy = Start-Process -FilePath $cmd -ArgumentList $decoyArgs -PassThru
+  } catch {
+    Write-Host "S1: Start-Process failed ($_); falling back to Diagnostics.Process"
+    $dpsi = New-Object System.Diagnostics.ProcessStartInfo
+    $dpsi.FileName        = $cmd
+    $dpsi.Arguments       = '/c "rem {0} & ping -n 30 127.0.0.1 >nul"' -f $Token
+    $dpsi.UseShellExecute = $false
+    $dpsi.CreateNoWindow  = $true
+    $decoy = [System.Diagnostics.Process]::Start($dpsi)
+  }
   Start-Sleep -Seconds 1
+  # Self-diagnosing control: before trusting the generic sweep,
+  # interrogate the decoy DIRECTLY by PID so a failure names its own
+  # cause instead of 'sweep method is broken'.
+  if ($decoy.HasExited) {
+    throw (('S1: decoy exited early with code {0} - the planted-token ' +
+            'process did not stay alive for the sweep') -f $decoy.ExitCode)
+  }
+  $row = Get-CimInstance Win32_Process -Filter ('ProcessId={0}' -f $decoy.Id)
+  if ($null -eq $row) {
+    throw (('S1: decoy pid {0} is alive but has no Win32_Process row - ' +
+            'CIM/WMI is not returning processes in this context') -f $decoy.Id)
+  }
+  if ([string]::IsNullOrEmpty($row.CommandLine)) {
+    $who = & whoami
+    throw (('S1: decoy pid {0} row exists but CommandLine is empty - this ' +
+            'context ({1}) lacks command-line read rights via WMI') -f $decoy.Id, $who)
+  }
+  if (-not $row.CommandLine.Contains($Token)) {
+    throw (('S1: decoy CommandLine lacks the token (quoting bug). ' +
+            'Actual: {0}') -f $row.CommandLine)
+  }
   $hits = Find-CmdlinesContaining $Token
   if ($hits.Count -lt 1) {
-    throw 'S1: decoy token not found on any command line - sweep method is broken'
+    throw ('S1: direct PID query sees the token but the generic sweep ' +
+           'does not - Find-CmdlinesContaining is broken')
   }
+  # Kill the decoy and WAIT for it to be gone - Stop-Process is
+  # async, and a lingering decoy would false-fail S3's clean sweep.
   Stop-Process -Id $decoy.Id -Force -ea SilentlyContinue
+  if (-not $decoy.WaitForExit(5000)) {
+    throw 'S1: decoy did not exit within 5s of Stop-Process'
+  }
   $decoy = $null
   Write-Host "S1 ok: cmdline sweep detects a planted token ($($hits.Count) hit(s))"
 
@@ -124,9 +163,14 @@ try {
   )
   Set-Content -Path $InnerProbe -Value ($inner -join "`r`n") -Encoding Ascii
 
-  # Same shapes the TS wrapper (wrapCommandWithSandboxWindows) now
+  # Same shapes the TS wrapper (wrapCommandWithSandboxWindows)
   # emits: tokenless entries on --env, token-bearing proxy entries in
-  # the length-prefixed JSON stdin frame gated by --env-stdin.
+  # the length-prefixed JSON stdin frame gated by --env-stdin. The
+  # frame bytes here are a third, hand-rolled copy of the wire
+  # format - the canonical definitions are encodeEnvStdinFrame
+  # (src/sandbox/windows-sandbox-utils.ts, writer) and
+  # runner::decode_env_frame (vendor/srt-win-src/src/runner.rs,
+  # reader); keep all three in sync.
   $proxyUrl = "http://sb:$Token@localhost:$PortLo"
   $frameJson = '[["HTTP_PROXY","' + $proxyUrl + '"],["HTTPS_PROXY","' + $proxyUrl + '"]]'
   $frameBody = [Text.Encoding]::UTF8.GetBytes($frameJson)
@@ -161,10 +205,14 @@ try {
   $stdin.Flush()
   $p.StandardInput.Close()
 
-  # -- S3: HOST-side sweep while the two-hop chain is alive -------------
+  # -- S3 data collection: HOST-side sweep while the chain is alive -----
   # The child sleeps 6s after printing; broker + runner + child are
   # all up during this window. The host is the broker's owner, so
   # every process that used to carry the token on argv is visible.
+  # COLLECT only here - assertions run after the exec's own exit
+  # state is known, so a fast exec failure (install race, seclogon
+  # down) surfaces as the exec error it is, not as a sweep
+  # misdiagnosis.
   Start-Sleep -Seconds 3
   $hostHits = Find-CmdlinesContaining $Token
   $brokerRows = Find-CmdlinesContaining '--env-stdin'
@@ -175,24 +223,28 @@ try {
   }
   $raw = $so.Result + "`n" + $se.Result
 
-  if ($hostHits.Count -ne 0) {
-    throw ("S3 FAIL: token visible on a command line (host sweep):`n" +
-           ($hostHits -join "`n"))
-  }
-  if ($brokerRows.Count -lt 1) {
-    throw ("S3 FAIL: no live process carried --env-stdin during the " +
-           "sweep window - the sweep may have missed the exec chain. " +
-           "stderr: $($se.Result)")
-  }
-  Write-Host 'S3 ok: host-side sweep - token on no command line; exec chain was live'
-
-  # -- S4: child got the token in its ENVIRONMENT (mechanism works) -----
+  # -- S2 verdict FIRST: did exec itself succeed? -----------------------
   if ($p.ExitCode -ne 0) {
     throw "S2: exec exited $($p.ExitCode). raw: $raw"
   }
   if ($raw -notmatch 'CHILD-DONE') {
     throw "S2: child probe did not complete. raw: $raw"
   }
+  Write-Host 'S2 ok: exec chain ran the probe to completion'
+
+  # -- S3: host-side sweep assertions -----------------------------------
+  if ($hostHits.Count -ne 0) {
+    throw ("S3 FAIL: token visible on a command line (host sweep):`n" +
+           ($hostHits -join "`n"))
+  }
+  if ($brokerRows.Count -lt 1) {
+    throw ("S3 FAIL: exec succeeded but no live process carried " +
+           "--env-stdin during the sweep window - the sweep timing " +
+           "missed the chain; consider a longer child sleep")
+  }
+  Write-Host 'S3 ok: host-side sweep - token on no command line; exec chain was live'
+
+  # -- S4: child got the token in its ENVIRONMENT (mechanism works) -----
   if ($raw -notmatch "CENV=HTTPS_PROXY=http://sb:$Token@") {
     throw "S4 FAIL: token missing from child env - delivery broken. raw: $raw"
   }

@@ -49,6 +49,7 @@ import {
   ensurePersistentWindowsCa,
   windowsStateDir,
   wrapCommandWithSandboxWindows,
+  encodeEnvStdinFrame,
   parseWindowsBinShell,
   resolveSrtWin,
   buildGitConfigEnv,
@@ -435,6 +436,57 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     for (const k of keys) {
       expect(envArgs.some(e => e.startsWith(`${k}=`))).toBe(false)
     }
+  })
+
+  it('broker env: ambient secret-NAMED vars are deleted, any case, any value', () => {
+    // Nested-session / stale-export case: an OUTER session's
+    // token-bearing HTTPS_PROXY (a different token than ours) sits
+    // in process.env. Scrubbing must go by KEY name, not by
+    // this-session-token value matching, or the foreign secret
+    // rides the broker's spawn env.
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const saved = { ...process.env }
+    process.env.HTTPS_PROXY = 'http://u:outer-session-token@localhost:59999'
+    process.env['HtTp_PrOxY'] = 'http://u:outer-session-token@localhost:59999'
+    try {
+      const { env } = wrapCommandWithSandboxWindows({
+        command: 'exit 0',
+        httpProxyPort: 60080,
+        proxyAuthToken: 'tok-this-session',
+        srtWin,
+      })
+      expect(env.HTTPS_PROXY).toBeUndefined()
+      expect(env['HtTp_PrOxY']).toBeUndefined()
+      for (const v of Object.values(env)) {
+        expect(v ?? '').not.toContain('outer-session-token')
+        expect(v ?? '').not.toContain('tok-this-session')
+      }
+    } finally {
+      delete process.env.HTTPS_PROXY
+      delete process.env['HtTp_PrOxY']
+      if (saved.HTTPS_PROXY !== undefined) {
+        process.env.HTTPS_PROXY = saved.HTTPS_PROXY
+      }
+    }
+  })
+
+  it('encodeEnvStdinFrame: <u32 LE byte length><JSON>; rejects frames over the 4 MiB cap', () => {
+    const frame = encodeEnvStdinFrame([['K', 'V']])
+    expect(frame.readUInt32LE(0)).toBe(frame.length - 4)
+    expect(JSON.parse(frame.subarray(4).toString('utf8'))).toEqual([['K', 'V']])
+    // Byte length, not char length: multi-byte values still frame
+    // correctly for Rust's read_exact.
+    const multi = encodeEnvStdinFrame([['K', 'ünïcode']])
+    expect(multi.readUInt32LE(0)).toBe(multi.length - 4)
+
+    let thrown: unknown
+    try {
+      encodeEnvStdinFrame([['BIG', 'x'.repeat(4 * 1024 * 1024)]])
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeInstanceOf(WindowsSandboxError)
+    expect((thrown as WindowsSandboxError).code).toBe('env_frame_too_large')
   })
 
   it('no proxyAuthToken → no --env-stdin, no stdinPayload; proxy URLs stay on --env', () => {

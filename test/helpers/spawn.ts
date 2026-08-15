@@ -48,10 +48,16 @@ export async function spawnAsync(
 
   // Match spawnSync: write `input` (if any), then EOF. Without the
   // end(), things like `su` wait for a password on the open pipe.
-  // The error no-op absorbs EPIPE when the child exits before
-  // reading (e.g. a spawn-time failure) — spawnSync ignores that
-  // too, and an unhandled 'error' would crash the test run.
-  child.stdin?.on('error', () => {})
+  // EPIPE (child exited before reading the payload — its exit
+  // code/stderr is the real diagnostic) is absorbed ONLY when an
+  // `input` was actually written, mirroring
+  // src/sandbox/windows-sandbox-utils.ts `writeStdinPayload` (the
+  // production writer; local copy so this generic helper stays free
+  // of prod imports). Anything else re-emits on the child →
+  // unhandled 'error' → the test fails loudly.
+  child.stdin?.on('error', (e: NodeJS.ErrnoException) => {
+    if (opts.input === undefined || e.code !== 'EPIPE') child.emit('error', e)
+  })
   if (opts.input !== undefined) child.stdin?.write(opts.input)
   child.stdin?.end()
 

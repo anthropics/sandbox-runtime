@@ -118,41 +118,55 @@ pub fn decode_env_frame(r: &mut impl Read) -> Result<Vec<(String, String)>> {
     serde_json::from_slice(&buf).context("exec: parse --env-stdin overlay JSON")
 }
 
-/// Merge a decoded `--env-stdin` frame into the `--env` overlay:
-/// frame entries replace same-key argv entries (case-insensitive,
-/// matching `build_env_block`'s key semantics) and append after the
-/// rest, so the secret channel wins deterministically on conflict.
+/// Append a decoded `--env-stdin` frame to the `--env` overlay. The
+/// writer-side invariant is that each key rides EXACTLY ONE channel
+/// (the TS wrapper partitions by key), so a case-insensitive overlap
+/// means the two sides disagree about the contract — fail loudly
+/// instead of silently picking a winner.
 pub fn merge_env_overlay(
     mut base: Vec<(String, String)>,
     extra: Vec<(String, String)>,
-) -> Vec<(String, String)> {
-    let keys: std::collections::HashSet<String> =
-        extra.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
-    base.retain(|(k, _)| !keys.contains(&k.to_ascii_uppercase()));
+) -> Result<Vec<(String, String)>> {
+    let base_keys: std::collections::HashSet<String> =
+        base.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
+    if let Some((k, _)) = extra
+        .iter()
+        .find(|(k, _)| base_keys.contains(&k.to_ascii_uppercase()))
+    {
+        return Err(anyhow!(
+            "exec: --env-stdin frame key '{k}' duplicates an --env \
+             argument (case-insensitive) — the caller must put each \
+             key on exactly one channel"
+        ));
+    }
     base.extend(extra);
-    base
+    Ok(base)
+}
+
+/// Frame `json` as `<u32 LE length><payload>` — the single writer-side
+/// definition of the wire format [`read_frame`] consumes.
+fn encode_frame(json: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + json.len());
+    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    out.extend(json);
+    out
 }
 
 /// Serialize env-overlay entries as `<u32 LE length><JSON>` — the
-/// inverse of [`decode_env_frame`]. Test helper; kept next to the
-/// decoder so the wire format has one definition on the Rust side
-/// (the production writer is the TS host).
-pub fn encode_env_frame(entries: &[(String, String)]) -> Result<Vec<u8>> {
+/// inverse of [`decode_env_frame`]. Test-only: the production writer
+/// is the TS host (`encodeEnvStdinFrame`); this exists so the Rust
+/// tests exercise the same wire shape.
+#[cfg(test)]
+fn encode_env_frame(entries: &[(String, String)]) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(entries).context("encode env frame")?;
-    let mut out = Vec::with_capacity(4 + json.len());
-    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    out.extend_from_slice(&json);
-    Ok(out)
+    Ok(encode_frame(json))
 }
 
 /// Serialize `cmd` as `<u32 LE length><JSON>`. Broker-side helper —
 /// lives here so the wire format has one definition.
 pub fn encode_cmd(cmd: &RunnerCmd) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(cmd).context("runner: encode cmd")?;
-    let mut out = Vec::with_capacity(4 + json.len());
-    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    out.extend_from_slice(&json);
-    Ok(out)
+    Ok(encode_frame(json))
 }
 
 /// Entry point for `srt-win runner`. Reads the command from stdin,
@@ -304,19 +318,13 @@ mod tests {
     }
 
     #[test]
-    fn merge_env_overlay_secret_channel_wins_case_insensitively() {
-        let base = vec![
-            ("PATH".to_string(), "C:\\bin".to_string()),
-            (
-                "https_proxy".to_string(),
-                "http://localhost:60080".to_string(),
-            ),
-        ];
+    fn merge_env_overlay_appends_disjoint_and_rejects_overlap() {
+        let base = vec![("PATH".to_string(), "C:\\bin".to_string())];
         let extra = vec![(
             "HTTPS_PROXY".to_string(),
             "http://u:tok@localhost:60080".to_string(),
         )];
-        let merged = merge_env_overlay(base, extra);
+        let merged = merge_env_overlay(base.clone(), extra.clone()).unwrap();
         assert_eq!(
             merged,
             vec![
@@ -327,6 +335,17 @@ mod tests {
                 ),
             ]
         );
+
+        // Case-insensitive overlap = writer-side contract violation.
+        let overlapping_base = vec![
+            ("PATH".to_string(), "C:\\bin".to_string()),
+            (
+                "https_proxy".to_string(),
+                "http://localhost:60080".to_string(),
+            ),
+        ];
+        let e = merge_env_overlay(overlapping_base, extra).unwrap_err();
+        assert!(format!("{e:#}").contains("exactly one channel"), "{e:#}");
     }
 
     #[test]

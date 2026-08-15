@@ -1958,10 +1958,12 @@ async function wrapWithSandboxArgv(
         )
       }
     }
-    // Per-exec deny rides on argv (`acl stamp` reads stdin, but
-    // exec's stdin belongs to the child). The CreateProcessW
-    // length check lives in `wrapCommandWithSandboxWindows`
-    // where the full argv (incl. shell + user command) is known.
+    // Per-exec deny rides on argv (`acl stamp` reads stdin;
+    // exec's own stdin is reserved for the `--env-stdin` secret
+    // frame and is never forwarded to the sandboxed child). The
+    // CreateProcessW length check lives in
+    // `wrapCommandWithSandboxWindows` where the full argv (incl.
+    // shell + user command) is known.
     //
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
