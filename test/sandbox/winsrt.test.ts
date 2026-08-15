@@ -29,7 +29,10 @@ import type {
   SrtWinConfig,
 } from '../../src/sandbox/sandbox-config.js'
 import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
-import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
+import {
+  CA_TRUST_VARS,
+  windowsEnvNameKey,
+} from '../../src/sandbox/sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
@@ -401,10 +404,12 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
   // case-sensitive lookups by POSIX-ported tools.
   const overlayEnvArgs = (argv: string[]): string[] =>
     argv.filter((_, i) => argv[i - 1] === '--env')
+  // Compare with the PRODUCTION fold so these tests pin the exact
+  // semantics the overlay uses.
   const entriesNamed = (envArgs: string[], name: string): string[] =>
     envArgs.filter(e => {
       const k = e.slice(0, e.indexOf('='))
-      return k.toUpperCase() === name.toUpperCase()
+      return windowsEnvNameKey(k) === windowsEnvNameKey(name)
     })
 
   it('case-variant duplicates in setEnvVars collapse to the later writer', () => {

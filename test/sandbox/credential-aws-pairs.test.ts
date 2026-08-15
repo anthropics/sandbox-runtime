@@ -248,6 +248,32 @@ describe('registerAwsPairs', () => {
     }
   })
 
+  test('win32: the sentinel comes only from the MATCHED entry, never a fold-twin', () => {
+    // Fold-duplicate entry names are rejected by config validation;
+    // constructed directly here to pin the runtime side of the same
+    // invariant: matching stops at the FIRST fold-equal entry, and the
+    // sentinel is read under THAT entry's own spelling. The first match
+    // is an extract entry (not whole-value), so no pair may register —
+    // in particular the second entry's whole-value sentinel must not be
+    // picked up via a spec-spelling lookup.
+    const spy = spyOn(platform, 'getPlatform').mockReturnValue('windows')
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { pairs } = buildPairs(
+        [
+          { name: 'AWS_ACCESS_KEY_ID', mode: 'mask', extract: '(AKIA\\w+)' },
+          { name: 'aws_access_key_id', mode: 'mask' },
+          { name: 'AWS_SECRET_ACCESS_KEY', mode: 'mask' },
+        ],
+        { AWS_ACCESS_KEY_ID: REAL_AKID, AWS_SECRET_ACCESS_KEY: REAL_SECRET },
+      )
+      expect(pairs.size).toBe(0)
+    } finally {
+      warnSpy.mockRestore()
+      spy.mockRestore()
+    }
+  })
+
   test('POSIX: case-variant names do NOT link (case-sensitive)', () => {
     const spy = spyOn(platform, 'getPlatform').mockReturnValue('linux')
     try {
@@ -652,6 +678,55 @@ describe('config validation for awsPairs and sigv4', () => {
     } finally {
       linuxSpy.mockRestore()
     }
+  })
+
+  test('win32: fold-duplicate envVars entry names are rejected; POSIX keeps them distinct', () => {
+    // On Windows the two entries name the SAME variable: each would
+    // mint its own sentinel, only one spelling survives into the child
+    // env, and SigV4 re-signing silently breaks when the registry binds
+    // a sentinel the child never holds. On POSIX they are genuinely
+    // distinct variables and both entries are legitimate.
+    const config = {
+      ...base,
+      credentials: {
+        envVars: [
+          { name: 'MY_AKID', mode: 'mask' },
+          { name: 'my_akid', mode: 'mask' },
+        ],
+      },
+    }
+    const winSpy = spyOn(platform, 'getPlatform').mockReturnValue('windows')
+    try {
+      const result = SandboxRuntimeConfigSchema.safeParse(config)
+      expect(result.success).toBe(false)
+      expect(JSON.stringify(result.error?.issues)).toContain(
+        'duplicates another credentials.envVars entry',
+      )
+    } finally {
+      winSpy.mockRestore()
+    }
+    const linuxSpy = spyOn(platform, 'getPlatform').mockReturnValue('linux')
+    try {
+      expect(SandboxRuntimeConfigSchema.safeParse(config).success).toBe(true)
+    } finally {
+      linuxSpy.mockRestore()
+    }
+  })
+
+  test('exact-duplicate envVars entry names are rejected on every platform', () => {
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      ...base,
+      credentials: {
+        envVars: [
+          { name: 'MY_AKID', mode: 'mask' },
+          { name: 'MY_AKID', mode: 'deny' },
+        ],
+      },
+    })
+    expect(result.success).toBe(false)
+    expect(JSON.stringify(result.error?.issues)).toContain(
+      'duplicates another credentials.envVars entry',
+    )
   })
 
   test('win32: case-variant spellings cannot fill two awsPairs slots', () => {

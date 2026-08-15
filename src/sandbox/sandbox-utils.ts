@@ -873,18 +873,15 @@ export function generateProxyEnvVars(
  * `GiThUb_ToKeN` name the SAME variable — so any name-vs-name or
  * name-vs-key comparison that targets a Windows environment must fold
  * case or a mixed-case spelling slips past a deny/mask entry. The fold
- * is ASCII-ordinal (a–z → A–Z only), matching srt-win's
- * `to_ascii_uppercase` overlay matching in `build_env_block`; full
- * Unicode uppercasing can change string length (`ß` → `SS`) and would
- * collide names Windows itself keeps distinct.
+ * is ASCII-only (a–z → A–Z; non-ASCII passes through untouched), so it
+ * is ordinal and deterministic — matching srt-win's
+ * `to_ascii_uppercase` overlay matching in `build_env_block`.
  *
  * POSIX env names are case-sensitive — do NOT use this for
  * Linux/macOS comparisons; see {@link envNameComparisonKey}.
  */
 export function windowsEnvNameKey(name: string): string {
-  return name.replace(/[a-z]/g, c =>
-    String.fromCharCode(c.charCodeAt(0) - 0x20),
-  )
+  return name.replace(/[a-z]/g, c => c.toUpperCase())
 }
 
 /**
@@ -894,6 +891,24 @@ export function windowsEnvNameKey(name: string): string {
  */
 export function envNameComparisonKey(name: string): string {
   return getPlatform() === 'windows' ? windowsEnvNameKey(name) : name
+}
+
+/**
+ * Find the entry whose `name` names the same env variable as `name`
+ * under the current platform's env semantics (Windows folds case,
+ * POSIX is exact — see {@link envNameComparisonKey}). First match in
+ * entry order wins; config validation rejects fold-duplicate entry
+ * names, so validated configs have at most one match. The single
+ * matching rule shared by config validation and the runtime
+ * credential layers — keep both on this helper so they cannot
+ * diverge.
+ */
+export function findByEnvName<T extends { name: string }>(
+  entries: readonly T[],
+  name: string,
+): T | undefined {
+  const key = envNameComparisonKey(name)
+  return entries.find(e => envNameComparisonKey(e.name) === key)
 }
 
 /**
