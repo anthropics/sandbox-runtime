@@ -194,7 +194,9 @@ enum Cmd {
     /// The child inherits the runner's environment (= the sandbox
     /// user's `LOGON_WITH_PROFILE` defaults) with the `--env` overlay
     /// applied — proxy configuration is single-sourced by the caller
-    /// (TS `generateProxyEnvVars`) and passed here via `--env`.
+    /// (TS `generateProxyEnvVars`) and passed here via `--env`, except
+    /// secret-bearing entries, which ride the `--env-stdin` frame so
+    /// they never appear on a command line.
     ///
     /// Requires `srt-win install` to have provisioned the user;
     /// otherwise exits **15**.
@@ -220,6 +222,19 @@ enum Cmd {
         /// source) passes them here explicitly.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Read one additional overlay frame from THIS process's
+        /// stdin before spawning the runner: `<u32 LE length><JSON
+        /// [[KEY,VALUE],…]>` (see `runner::decode_env_frame`).
+        /// Secret-bearing entries — the per-session proxy auth
+        /// token embedded in the proxy URLs — ride here instead of
+        /// `--env`: command lines are freely readable by same-user
+        /// sibling processes, so argv must stay token-free. Frame
+        /// entries replace same-key `--env` duplicates
+        /// (case-insensitive). With this flag set, exec blocks on
+        /// stdin until the frame arrives — the caller must write it
+        /// immediately after spawning.
+        #[arg(long = "env-stdin")]
+        env_stdin: bool,
         /// Suppress informational stderr (progress lines,
         /// per-exec-deny summary, seclogon-job note). Actual
         /// errors still print. The host sets this by default so
@@ -1373,6 +1388,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             deny_read,
             deny_write,
             env,
+            env_stdin,
             quiet,
             target,
         } => {
@@ -1496,7 +1512,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // environment; the caller (whose proxy/CA-var builder
             // is the single source) supplies the full overlay
             // explicitly.
-            let env_overlay: Vec<(String, String)> = env
+            let mut env_overlay: Vec<(String, String)> = env
                 .iter()
                 .map(|kv| {
                     kv.split_once('=')
@@ -1509,6 +1525,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         })
                 })
                 .collect::<anyhow::Result<_>>()?;
+            // `--env-stdin`: secret-bearing overlay entries (the
+            // per-session proxy auth token embedded in the proxy
+            // URLs) arrive as a length-prefixed JSON frame on THIS
+            // process's stdin, never on argv — command lines are
+            // freely readable by same-user sibling processes.
+            // Nothing else reads exec's stdin today; if that ever
+            // changes, note that `Stdin`'s buffered reader may pull
+            // post-frame bytes into this process's buffer.
+            if env_stdin {
+                let extra = srt_win::runner::decode_env_frame(&mut std::io::stdin().lock())
+                    .context("exec: read --env-stdin overlay frame")?;
+                env_overlay = srt_win::runner::merge_env_overlay(env_overlay, extra);
+            }
             if !quiet {
                 eprintln!(
                     "srt-win: launching runner as '{}' (overlay={} var(s))",
@@ -1805,5 +1834,38 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    /// `--env-stdin` on `exec` parses, defaults false, and composes
+    /// with `--env` (the TS wrapper emits both: plain entries via
+    /// `--env`, secret-bearing entries via the stdin frame).
+    #[test]
+    fn exec_env_stdin_flag_parses() {
+        let with = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--quiet",
+            "--env",
+            "PATH=C:\\bin",
+            "--env-stdin",
+            "--",
+            "cmd.exe",
+        ])
+        .expect("parse");
+        match with.cmd {
+            Cmd::Exec { env, env_stdin, .. } => {
+                assert!(env_stdin);
+                assert_eq!(env, ["PATH=C:\\bin"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(
+            without.cmd,
+            Cmd::Exec {
+                env_stdin: false,
+                ..
+            }
+        ));
     }
 }

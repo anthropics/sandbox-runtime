@@ -508,8 +508,13 @@ async function main(): Promise<void> {
           // command bytes off the host shell. On other platforms
           // we keep the existing shell-string path.
           if (process.platform === 'win32') {
-            // env carries the proxy vars the sandboxed child must inherit.
-            const { argv, env } =
+            // env is the broker (srt-win exec) process's spawn env;
+            // the sandboxed child sees the --env overlay baked into
+            // argv plus, when stdinPayload is set, the secret env
+            // frame written to the broker's stdin (--env-stdin) —
+            // that frame carries the proxy auth token, which must
+            // never ride a command line.
+            const { argv, env, stdinPayload } =
               await SandboxManager.wrapWithSandboxArgv(command)
             // No slot to displace: libuv passes only the stdio array's
             // entries to the child as CRT descriptors, so the control fd
@@ -517,9 +522,18 @@ async function main(): Promise<void> {
             // child, but unnamed — nothing there can find it).
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
-              stdio: 'inherit',
+              stdio: [stdinPayload ? 'pipe' : 'inherit', 'inherit', 'inherit'],
               env,
             })
+            if (stdinPayload) {
+              // EPIPE no-op: if srt-win exits before reading (spawn
+              // failure, unknown-flag error from an older binary),
+              // an unhandled stream 'error' would crash the CLI and
+              // mask the child's real diagnostic.
+              child.stdin?.on('error', () => {})
+              child.stdin?.write(stdinPayload)
+              child.stdin?.end()
+            }
           } else {
             const sandboxedCommand =
               await SandboxManager.wrapWithSandbox(command)

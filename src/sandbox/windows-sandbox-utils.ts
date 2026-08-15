@@ -370,7 +370,13 @@ export interface WindowsSandboxParams {
    * port (same as `httpProxyPort`).
    */
   socksProxyPort?: number
-  /** Per-session proxy auth token; embedded in proxy env URLs. */
+  /**
+   * Per-session proxy auth token; embedded in proxy env URLs.
+   * Entries carrying it are delivered via the `--env-stdin` frame
+   * (returned as `stdinPayload`), never on `srt-win exec`'s argv or
+   * spawn env — command lines are freely readable by same-user
+   * sibling processes.
+   */
   proxyAuthToken?: string
   /**
    * `mode: 'mask'` credential env vars — sentinel values the
@@ -2001,25 +2007,36 @@ export function revokeWindowsAcl(opts: {
 
 /**
  * Build the spawn descriptor for running `command` inside the Windows
- * sandbox: an `argv` array plus the `env` to spawn it with.
+ * sandbox: an `argv` array, the `env` to spawn it with, and — when a
+ * proxy auth token is in play — a `stdinPayload` the caller must
+ * write to the spawned process's stdin.
  *
  * Caller MUST spawn the result with `{shell: false}` — that is the
  * security boundary that keeps untrusted bytes off the host's shell
  * (the inner `cmd.exe /c` runs INSIDE the sandbox; see
  * `vendor/srt-win-src/src/launch.rs` `build_cmdline` for the passthrough
- * rationale) — AND with the returned `env`.
+ * rationale) — AND with the returned `env`. When `stdinPayload` is
+ * set, the caller MUST additionally spawn with stdin piped and write
+ * the payload immediately (`srt-win exec` blocks reading it before
+ * spawning the runner): it carries the overlay entries whose values
+ * embed the per-session proxy auth token, framed as
+ * `<u32 LE length><JSON [[KEY,VALUE],…]>` for `--env-stdin`. Those
+ * entries are excluded from both the `--env` argv overlay and the
+ * returned spawn `env` — a process's command line is freely readable
+ * by same-user sibling processes, so the token must never ride argv.
  *
  * Proxy configuration is single-sourced by {@link generateProxyEnvVars}
  * (the same canonical builder used on macOS/Linux). `srt-win exec`
  * takes no `--http-proxy` / `--socks-proxy` flags and synthesizes no
  * proxy env. The two-hop runner starts with the SANDBOX user's
  * profile env (`USERPROFILE`/`TEMP` isolated) and overlays exactly
- * what we pass as `--env` — built here from the broker's `PATH` plus
- * the generated proxy set.
+ * what we pass as `--env` plus the `--env-stdin` frame — built here
+ * from the broker's `PATH` plus the generated proxy set.
  */
 export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   argv: string[]
   env: NodeJS.ProcessEnv
+  stdinPayload?: Buffer
 } {
   const { exe, prependArgs } = p.srtWin ?? resolveSrtWin()
   // Generated proxy + CA-trust env. Single-sourced here so the
@@ -2094,8 +2111,29 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     ...generated,
     ...gitCfg,
   }
+  // Secret split: entries whose value embeds the per-session proxy
+  // auth token must NOT ride argv — command lines are freely
+  // readable by same-user sibling processes. They go over `srt-win
+  // exec`'s own stdin instead (`--env-stdin`, length-prefixed JSON;
+  // see `runner::decode_env_frame`). Everything else stays on
+  // `--env` for debuggability.
+  // `|| undefined`: generateProxyEnvVars treats an empty token as
+  // no-token (nothing embedded), and `''.includes` matches every
+  // value — normalize so the partition agrees.
+  const token = p.proxyAuthToken || undefined
+  const secretEntries: [string, string][] = []
   for (const [k, v] of Object.entries(overlay)) {
-    if (v !== undefined) argv.push('--env', `${k}=${v}`)
+    if (v === undefined) continue
+    if (token !== undefined && v.includes(token)) secretEntries.push([k, v])
+    else argv.push('--env', `${k}=${v}`)
+  }
+  let stdinPayload: Buffer | undefined
+  if (secretEntries.length > 0) {
+    argv.push('--env-stdin')
+    const json = Buffer.from(JSON.stringify(secretEntries), 'utf8')
+    stdinPayload = Buffer.alloc(4 + json.length)
+    stdinPayload.writeUInt32LE(json.length, 0)
+    json.copy(stdinPayload, 4)
   }
   argv.push('--')
 
@@ -2124,9 +2162,16 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // broker process's environment never reaches the child. The
   // returned `env` is the spawn env for the broker (srt-win)
   // process only; the child sees the `--env` overlay built into
-  // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy).
-  const env: NodeJS.ProcessEnv = { ...process.env, ...generated }
-  return { argv, env }
+  // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy)
+  // plus the `--env-stdin` frame. Token-bearing entries are kept
+  // out of the broker's spawn env too — the broker never needs
+  // them, and its env is one more same-user-readable surface.
+  const env: NodeJS.ProcessEnv = { ...process.env }
+  for (const [k, v] of Object.entries(generated)) {
+    if (v !== undefined && token !== undefined && v.includes(token)) continue
+    env[k] = v
+  }
+  return { argv, env, stdinPayload }
 }
 
 /**

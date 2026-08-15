@@ -141,13 +141,15 @@ async function runSandboxed(
   stderr: string
   status: number | null
 }> {
-  const { argv, env } = await SandboxManager.wrapWithSandboxArgv(command)
-  // The child reaches the proxy via the runner's --env overlay; the
-  // returned `env` is the BROKER's spawn env (proxy vars also there
-  // for diagnostics, but the runner's overlay is what the child sees).
+  const { argv, env, stdinPayload } =
+    await SandboxManager.wrapWithSandboxArgv(command)
+  // The child reaches the proxy via the runner's --env overlay plus
+  // the --env-stdin frame (`stdinPayload` carries the token-bearing
+  // proxy vars; they never ride argv or the broker's spawn env).
   return spawnAsync(argv[0], argv.slice(1), {
     timeout: timeoutMs,
     env: extraEnv ? { ...env, ...extraEnv } : env,
+    input: stdinPayload,
   })
 }
 
@@ -388,6 +390,64 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(envArgs.some(e => e.startsWith('no_proxy='))).toBe(false)
     // The proxy vars themselves survive — only the bypass list is dropped.
     expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
+  })
+
+  it('proxyAuthToken: token absent from argv and spawn env; rides the --env-stdin frame', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const TOKEN = 'tok-secret-not-for-argv'
+    const { argv, env, stdinPayload } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      httpProxyPort: 60080,
+      socksProxyPort: 60081,
+      proxyAuthToken: TOKEN,
+      srtWin,
+    })
+    // The whole point: no argv element may carry the token — a
+    // process's command line is freely readable by same-user
+    // sibling processes.
+    for (const a of argv) {
+      expect(a).not.toContain(TOKEN)
+    }
+    expect(argv).toContain('--env-stdin')
+    expect(argv.indexOf('--env-stdin')).toBeLessThan(argv.indexOf('--'))
+    // Tokenless entries still ride --env for debuggability.
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
+    // The broker spawn env carries no token either.
+    for (const v of Object.values(env)) {
+      expect(v ?? '').not.toContain(TOKEN)
+    }
+    // The stdin frame is `<u32 LE length><JSON [[KEY,VALUE],…]>` and
+    // holds exactly the token-bearing entries (matched by srt-win's
+    // `runner::decode_env_frame`).
+    expect(stdinPayload).toBeDefined()
+    expect(stdinPayload!.readUInt32LE(0)).toBe(stdinPayload!.length - 4)
+    const entries: [string, string][] = JSON.parse(
+      stdinPayload!.subarray(4).toString('utf8'),
+    )
+    const keys = entries.map(([k]) => k)
+    expect(keys).toContain('HTTPS_PROXY')
+    expect(keys).toContain('ALL_PROXY')
+    for (const [, v] of entries) {
+      expect(v).toContain(TOKEN)
+    }
+    // No key rides both channels.
+    for (const k of keys) {
+      expect(envArgs.some(e => e.startsWith(`${k}=`))).toBe(false)
+    }
+  })
+
+  it('no proxyAuthToken → no --env-stdin, no stdinPayload; proxy URLs stay on --env', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv, stdinPayload } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      httpProxyPort: 60080,
+      srtWin,
+    })
+    expect(argv).not.toContain('--env-stdin')
+    expect(stdinPayload).toBeUndefined()
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
   })
 })
 
@@ -1572,14 +1632,13 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     async () => {
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const cmd = `curl --noproxy '*' -sS -m 5 https://example.com`
-      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-        cmd,
-        GIT_BASH,
-      )
+      const { argv, env, stdinPayload } =
+        await SandboxManager.wrapWithSandboxArgv(cmd, GIT_BASH)
       expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
       const r = await spawnAsync(argv[0], argv.slice(1), {
         timeout: 60_000,
         env,
+        input: stdinPayload,
       })
       expectEgressBlocked('E4', r)
     },
@@ -1590,14 +1649,13 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     'E5: binShell=bash.exe — &&, single-quote, pipe survive argv round-trip',
     async () => {
       const cmd = `printf '%s ' one && printf '%s' two | tr a-z A-Z`
-      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-        cmd,
-        GIT_BASH,
-      )
+      const { argv, env, stdinPayload } =
+        await SandboxManager.wrapWithSandboxArgv(cmd, GIT_BASH)
       expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
       const r = await spawnAsync(argv[0], argv.slice(1), {
         timeout: 60_000,
         env,
+        input: stdinPayload,
       })
       expectStatus('E5', r, [0])
       expect(r.stdout.trim()).toBe('one TWO')
@@ -1721,13 +1779,16 @@ describe.if(isWindows)(
     }, 60_000)
 
     async function rexec(tail: string) {
-      const { argv, env } = wrapCommandWithSandboxWindows({
+      // No proxyAuthToken here → no --env-stdin frame; `input` is
+      // threaded anyway so a future token-carrying row can't hang.
+      const { argv, env, stdinPayload } = wrapCommandWithSandboxWindows({
         command: tail,
         srtWin: TEST_SRT_WIN,
       })
       return spawnAsync(argv[0], argv.slice(1), {
         env,
         timeout: 60_000,
+        input: stdinPayload,
       })
     }
 
@@ -1953,17 +2014,18 @@ describe.if(isWindows)(
       writeFileSync(b, 'GLOB-B')
       await SandboxManager.initialize(createFsTestConfig({ allowWrite: [dir] }))
       try {
-        const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-          `type "${a}" & echo --SEP-- & type "${b}"`,
-          undefined,
-          {
-            filesystem: {
-              denyRead: [join(dir, 'glob-*.secret')],
-              allowWrite: [],
-              denyWrite: [],
+        const { argv, env, stdinPayload } =
+          await SandboxManager.wrapWithSandboxArgv(
+            `type "${a}" & echo --SEP-- & type "${b}"`,
+            undefined,
+            {
+              filesystem: {
+                denyRead: [join(dir, 'glob-*.secret')],
+                allowWrite: [],
+                denyWrite: [],
+              },
             },
-          },
-        )
+          )
         // Glob expanded TS-side: exactly two --deny-read flags;
         // no glob char survives onto the argv (Rust would
         // hard-fail otherwise).
@@ -1985,6 +2047,7 @@ describe.if(isWindows)(
         const r = await spawnAsync(argv[0], argv.slice(1), {
           env,
           timeout: 60_000,
+          input: stdinPayload,
         })
         if (r.stdout.includes('GLOB-A') || r.stdout.includes('GLOB-B')) {
           throw new Error(
