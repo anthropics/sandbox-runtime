@@ -867,6 +867,64 @@ export function generateProxyEnvVars(
 }
 
 /**
+ * Fold an environment-variable NAME for a Windows comparison.
+ *
+ * Windows env names are case-insensitive — `GITHUB_TOKEN` and
+ * `GiThUb_ToKeN` name the SAME variable — so any name-vs-name or
+ * name-vs-key comparison that targets a Windows environment must fold
+ * case or a mixed-case spelling slips past a deny/mask entry. The fold
+ * is ASCII-ordinal (a–z → A–Z only), matching srt-win's
+ * `to_ascii_uppercase` overlay matching in `build_env_block`; full
+ * Unicode uppercasing can change string length (`ß` → `SS`) and would
+ * collide names Windows itself keeps distinct.
+ *
+ * POSIX env names are case-sensitive — do NOT use this for
+ * Linux/macOS comparisons; see {@link envNameComparisonKey}.
+ */
+export function windowsEnvNameKey(name: string): string {
+  return name.replace(/[a-z]/g, c =>
+    String.fromCharCode(c.charCodeAt(0) - 0x20),
+  )
+}
+
+/**
+ * Fold an env-var name for comparison under the CURRENT platform's
+ * env semantics: Windows folds case ({@link windowsEnvNameKey});
+ * POSIX names are case-sensitive and pass through verbatim.
+ */
+export function envNameComparisonKey(name: string): string {
+  return getPlatform() === 'windows' ? windowsEnvNameKey(name) : name
+}
+
+/**
+ * Read `name` from an env record under the current platform's
+ * env-name semantics. An exact-key match always wins; on Windows a
+ * miss falls back to the first ordinal case-insensitive key match in
+ * the record's own key order (deterministic — mirrors Win32
+ * `GetEnvironmentVariableW`, which matches names case-insensitively).
+ * POSIX lookups stay exact.
+ *
+ * Needed because a plain-object env snapshot (a spread of
+ * `process.env`, or an explicitly passed record) does not carry
+ * Node's case-insensitive `process.env` magic on Windows.
+ */
+export function readEnvCaseAware(
+  env: Readonly<Record<string, string | undefined>>,
+  name: string,
+): string | undefined {
+  const exact = env[name]
+  if (exact !== undefined || getPlatform() !== 'windows') return exact
+  const key = windowsEnvNameKey(name)
+  for (const k of Object.keys(env)) {
+    if (windowsEnvNameKey(k) === key) {
+      const v = env[k]
+      if (v !== undefined) return v
+    }
+  }
+  return undefined
+}
+
+/**
  * `safe.directory` entries above this count collapse to a single
  * `safe.directory=*`. Keeps `GIT_CONFIG_COUNT` (and the argv it rides
  * on) bounded when the safe-dir set is wide.

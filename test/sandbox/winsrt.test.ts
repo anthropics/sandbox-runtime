@@ -389,6 +389,81 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     // The proxy vars themselves survive — only the bypass list is dropped.
     expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
   })
+
+  // Windows env-var names are case-insensitive: the child's env block
+  // must never carry two case-variant spellings of one name with
+  // different values (srt-win preserves duplicates verbatim; which one
+  // the child's getenv resolves would depend on env-block sort order),
+  // and a `mode: 'deny'` name must not ride the overlay under ANY
+  // spelling. The overlay therefore dedupes on an ordinal (ASCII) case
+  // fold with later-writer-wins precedence, while same-value case
+  // twins (HTTP_PROXY/http_proxy) are deliberately kept for
+  // case-sensitive lookups by POSIX-ported tools.
+  const overlayEnvArgs = (argv: string[]): string[] =>
+    argv.filter((_, i) => argv[i - 1] === '--env')
+  const entriesNamed = (envArgs: string[], name: string): string[] =>
+    envArgs.filter(e => {
+      const k = e.slice(0, e.indexOf('='))
+      return k.toUpperCase() === name.toUpperCase()
+    })
+
+  it('case-variant duplicates in setEnvVars collapse to the later writer', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      setEnvVars: { GITHUB_TOKEN: 'sentinel-1', GiThUb_ToKeN: 'sentinel-2' },
+      srtWin,
+    })
+    const hits = entriesNamed(overlayEnvArgs(argv), 'GITHUB_TOKEN')
+    expect(hits).toEqual(['GiThUb_ToKeN=sentinel-2'])
+  })
+
+  it('a case-variant mask of a proxy var loses to the generated proxy set', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      httpProxyPort: 60080,
+      setEnvVars: { Https_Proxy: 'sentinel-masked' },
+      srtWin,
+    })
+    const hits = entriesNamed(overlayEnvArgs(argv), 'HTTPS_PROXY')
+    // The sentinel spelling is gone; the sandbox's own plumbing —
+    // including the deliberate same-value lowercase twin — survives.
+    expect(hits.sort()).toEqual([
+      'HTTPS_PROXY=http://localhost:60080',
+      'https_proxy=http://localhost:60080',
+    ])
+  })
+
+  it('unsetEnvVars filters ambient forwards case-insensitively; masks still win', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      unsetEnvVars: ['pAtH', 'GITHUB_TOKEN'],
+      setEnvVars: { GiThUb_ToKeN: 'sentinel-masked' },
+      srtWin,
+    })
+    const envArgs = overlayEnvArgs(argv)
+    // A deny of `pAtH` covers the forwarded PATH under any spelling.
+    expect(entriesNamed(envArgs, 'PATH')).toEqual([])
+    // A masked sentinel overrides a deny of the same (case-variant)
+    // name — the POSIX `env -u X X=sentinel` precedence.
+    expect(entriesNamed(envArgs, 'GITHUB_TOKEN')).toEqual([
+      'GiThUb_ToKeN=sentinel-masked',
+    ])
+  })
+
+  it('unsetEnvVars of an unrelated name leaves the ambient forwards alone', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      unsetEnvVars: ['SOME_OTHER_TOKEN'],
+      srtWin,
+    })
+    expect(
+      entriesNamed(overlayEnvArgs(argv), 'PATH').length,
+    ).toBeGreaterThanOrEqual(1)
+  })
 })
 
 describe('parseWindowsBinShell (pure, all platforms)', () => {

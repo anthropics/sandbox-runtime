@@ -38,6 +38,7 @@ import type {
   CredentialEnvVarConfig,
   Sigv4Config,
 } from './sandbox-config.js'
+import { envNameComparisonKey, readEnvCaseAware } from './sandbox-utils.js'
 
 /** Conventional env var names the AWS SDKs and CLI read credentials from. */
 export const AWS_ACCESS_KEY_ID_VAR = 'AWS_ACCESS_KEY_ID'
@@ -113,19 +114,25 @@ export function registerAwsPairs(
   env: Record<string, string | undefined> = process.env,
 ): void {
   const specs: AwsPairConfig[] = [...(awsPairs ?? [])]
+  // All name comparisons below go through envNameComparisonKey: on
+  // Windows env-var names are case-insensitive, so a spec/entry/host
+  // spelling that differs only in case still names the same variable;
+  // POSIX comparisons stay exact.
   const explicitNames = new Set(
-    specs.flatMap(p => [
-      p.accessKeyIdVar,
-      p.secretAccessKeyVar,
-      ...(p.sessionTokenVar ? [p.sessionTokenVar] : []),
-    ]),
+    specs
+      .flatMap(p => [
+        p.accessKeyIdVar,
+        p.secretAccessKeyVar,
+        ...(p.sessionTokenVar ? [p.sessionTokenVar] : []),
+      ])
+      .map(envNameComparisonKey),
   )
   const conventional = [
     AWS_ACCESS_KEY_ID_VAR,
     AWS_SECRET_ACCESS_KEY_VAR,
     AWS_SESSION_TOKEN_VAR,
   ]
-  if (!conventional.some(n => explicitNames.has(n))) {
+  if (!conventional.some(n => explicitNames.has(envNameComparisonKey(n)))) {
     specs.push({
       accessKeyIdVar: AWS_ACCESS_KEY_ID_VAR,
       secretAccessKeyVar: AWS_SECRET_ACCESS_KEY_VAR,
@@ -138,19 +145,23 @@ export function registerAwsPairs(
   const wholeValueEntry = (name: string) =>
     envVars.find(
       v =>
-        v.name === name &&
+        envNameComparisonKey(v.name) === envNameComparisonKey(name) &&
         v.mode === 'mask' &&
         v.extract === undefined &&
         v.decode === undefined,
     )
+  // setEnvVars is keyed by the ENTRY's spelling, which on Windows may
+  // differ in case from the spec's — read it case-aware too.
   const maskedSentinel = (name: string): string | undefined =>
-    wholeValueEntry(name) !== undefined ? setEnvVars[name] : undefined
+    wholeValueEntry(name) !== undefined
+      ? readEnvCaseAware(setEnvVars, name)
+      : undefined
 
   for (const spec of specs) {
     const akidSentinel = maskedSentinel(spec.accessKeyIdVar)
     const secretMasked = maskedSentinel(spec.secretAccessKeyVar) !== undefined
-    const realAkid = env[spec.accessKeyIdVar]
-    const realSecret = env[spec.secretAccessKeyVar]
+    const realAkid = readEnvCaseAware(env, spec.accessKeyIdVar)
+    const realSecret = readEnvCaseAware(env, spec.secretAccessKeyVar)
     if (
       akidSentinel === undefined ||
       !secretMasked ||
@@ -178,7 +189,7 @@ export function registerAwsPairs(
         : undefined
     const realSessionToken =
       sessionSentinel !== undefined && spec.sessionTokenVar !== undefined
-        ? env[spec.sessionTokenVar]
+        ? readEnvCaseAware(env, spec.sessionTokenVar)
         : undefined
 
     registry.register({

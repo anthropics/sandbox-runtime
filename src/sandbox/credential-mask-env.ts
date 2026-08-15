@@ -19,6 +19,7 @@ import { randomUUID } from 'node:crypto'
 import { logForDebugging } from '../utils/debug.js'
 import { maskJwtClaims, mintFakeJwt, verifyJwt } from './credential-decode.js'
 import { extractAndSubstitute } from './credential-extract.js'
+import { readEnvCaseAware } from './sandbox-utils.js'
 import type { CredentialEnvVarConfig } from './sandbox-config.js'
 import type { SentinelRegistry } from './credential-sentinel.js'
 
@@ -78,6 +79,11 @@ export interface MaskedEnvBuildResult {
  * to protect, and emitting an unset (or set) var would change tool
  * behaviour (presence checks would flip).
  *
+ * On Windows the host lookup is ordinal case-insensitive (env names
+ * are case-insensitive there — a `GiThUb_ToKeN` in the host env IS
+ * the `GITHUB_TOKEN` the entry names); POSIX lookups stay exact. See
+ * {@link readEnvCaseAware}.
+ *
  * `mode: "deny"` entries are ignored here; the caller handles them
  * directly (they need no registry or host environment access).
  */
@@ -91,7 +97,7 @@ export function buildMaskedEnvVars(
   const degradeToUnsetNames: string[] = []
   for (const v of envVars) {
     if (v.mode !== 'mask') continue
-    const real = env[v.name]
+    const real = readEnvCaseAware(env, v.name)
     if (real === undefined) continue
 
     // Effective injectHosts: per-entry narrows; if unset, default to
