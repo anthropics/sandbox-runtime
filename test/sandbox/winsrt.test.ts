@@ -1427,21 +1427,36 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     )
   })
 
-  it('wrapWithSandboxArgv returns argv carrying the --env overlay', async () => {
-    const { argv } = await SandboxManager.wrapWithSandboxArgv('echo hi')
+  it('wrapWithSandboxArgv splits the overlay: tokenless on --env, token-bearing in stdinPayload', async () => {
+    const { argv, stdinPayload } =
+      await SandboxManager.wrapWithSandboxArgv('echo hi')
     expect(argv[0]).toMatch(/srt-win\.exe$/i)
     expect(argv).toContain('exec')
-    // Proxy ports ride as --env KEY=VALUE pairs to the runner.
     const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
-    const httpProxy = envArgs.find(e => e.startsWith('HTTP_PROXY='))
-    const allProxy = envArgs.find(e => e.startsWith('ALL_PROXY='))
-    expect(httpProxy).toMatch(/^HTTP_PROXY=http:\/\/.+:\d+$/)
-    expect(allProxy).toMatch(/^ALL_PROXY=http:\/\/.+:\d+$/)
-    const httpPort = Number(httpProxy!.split(':').pop())
+    // The session proxy has an auth token, so the token-bearing proxy
+    // URLs must NOT ride argv — they travel in the --env-stdin frame.
+    expect(argv).toContain('--env-stdin')
+    for (const key of ['HTTP_PROXY=', 'ALL_PROXY=', 'DOCKER_HTTP_PROXY=']) {
+      expect(envArgs.some(e => e.startsWith(key))).toBe(false)
+    }
+    // Tokenless entries still ride --env: RSYNC_PROXY is host:port
+    // only (no userinfo), so it carries the port-range proof.
+    const rsync = envArgs.find(e => e.startsWith('RSYNC_PROXY='))
+    expect(rsync).toMatch(/^RSYNC_PROXY=localhost:\d+$/)
+    // The frame carries the full token-bearing set, ports in range.
+    expect(stdinPayload).toBeDefined()
+    const frame: [string, string][] = JSON.parse(
+      stdinPayload!.subarray(4).toString('utf8'),
+    )
+    const frameKeys = frame.map(([k]) => k)
+    expect(frameKeys).toContain('HTTP_PROXY')
+    expect(frameKeys).toContain('ALL_PROXY')
+    expect(frameKeys).toContain('DOCKER_HTTP_PROXY')
+    const httpProxy = frame.find(([k]) => k === 'HTTP_PROXY')![1]
+    expect(httpProxy).toMatch(/^http:\/\/.+:.+@localhost:\d+$/)
+    const httpPort = Number(httpProxy.split(':').pop())
     expect(httpPort).toBeGreaterThanOrEqual(PORT_RANGE[0])
     expect(httpPort).toBeLessThanOrEqual(PORT_RANGE[1])
-    // The FULL set rides along, not just the standard trio.
-    expect(envArgs.some(e => e.startsWith('DOCKER_HTTP_PROXY='))).toBe(true)
     // Last element is the user's command, passed verbatim to cmd /c.
     expect(argv.slice(-4)).toEqual(['/d', '/s', '/c', 'echo hi'])
   })
@@ -1982,6 +1997,9 @@ describe.if(isWindows)(
         return await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
           env: wrapped.env,
           timeout: 60_000,
+          // The secret --env-stdin frame; without it exec fails fast
+          // ("read length prefix: failed to fill whole buffer").
+          input: wrapped.stdinPayload,
         })
       } finally {
         await SandboxManager.reset()
@@ -2116,6 +2134,7 @@ describe.if(isWindows)(
         const rR = await spawnAsync(wf.argv[0], wf.argv.slice(1), {
           env: wf.env,
           timeout: 60_000,
+          input: wf.stdinPayload,
         })
         if (!rR.stdout.includes('GLOB-A') || !rR.stdout.includes('GLOB-B')) {
           throw new Error(
