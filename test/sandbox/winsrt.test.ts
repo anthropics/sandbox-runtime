@@ -440,32 +440,42 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
 
   it('broker env: ambient secret-NAMED vars are deleted, any case, any value', () => {
     // Nested-session / stale-export case: an OUTER session's
-    // token-bearing HTTPS_PROXY (a different token than ours) sits
-    // in process.env. Scrubbing must go by KEY name, not by
-    // this-session-token value matching, or the foreign secret
-    // rides the broker's spawn env.
+    // token-bearing var (a different token than ours) sits in
+    // process.env under a secret-tagged NAME. Scrubbing must go by
+    // KEY name, not by this-session-token value matching, or the
+    // foreign secret rides the broker's spawn env.
+    //
+    // HAZARD — do NOT plant HTTP(S)_PROXY/http(s)_proxy here: Bun
+    // LATCHES those env vars into its HTTP client the moment they
+    // are set, even if deleted before any request, and every later
+    // in-process request (including other test files' TLS-terminate
+    // upstream legs) then dials the dead proxy and 502s. Use
+    // CLOUDSDK_PROXY_PASSWORD — secret-tagged by
+    // generateProxyEnvEntries but meaningless to Bun's networking —
+    // to exercise the same delete-by-key scrub path.
     const srtWin = resolveSrtWin({ path: process.execPath })
-    const saved = { ...process.env }
-    process.env.HTTPS_PROXY = 'http://u:outer-session-token@localhost:59999'
-    process.env['HtTp_PrOxY'] = 'http://u:outer-session-token@localhost:59999'
+    const saved = process.env.CLOUDSDK_PROXY_PASSWORD
+    process.env.CLOUDSDK_PROXY_PASSWORD = 'outer-session-token'
+    process.env['ClOuDsDk_PrOxY_pAsSwOrD'] = 'outer-session-token'
     try {
       const { env } = wrapCommandWithSandboxWindows({
         command: 'exit 0',
         httpProxyPort: 60080,
+        socksProxyPort: 60081,
         proxyAuthToken: 'tok-this-session',
         srtWin,
       })
-      expect(env.HTTPS_PROXY).toBeUndefined()
-      expect(env['HtTp_PrOxY']).toBeUndefined()
+      expect(env.CLOUDSDK_PROXY_PASSWORD).toBeUndefined()
+      expect(env['ClOuDsDk_PrOxY_pAsSwOrD']).toBeUndefined()
       for (const v of Object.values(env)) {
         expect(v ?? '').not.toContain('outer-session-token')
         expect(v ?? '').not.toContain('tok-this-session')
       }
     } finally {
-      delete process.env.HTTPS_PROXY
-      delete process.env['HtTp_PrOxY']
-      if (saved.HTTPS_PROXY !== undefined) {
-        process.env.HTTPS_PROXY = saved.HTTPS_PROXY
+      delete process.env.CLOUDSDK_PROXY_PASSWORD
+      delete process.env['ClOuDsDk_PrOxY_pAsSwOrD']
+      if (saved !== undefined) {
+        process.env.CLOUDSDK_PROXY_PASSWORD = saved
       }
     }
   })
