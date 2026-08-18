@@ -12,7 +12,7 @@
 //! directories whose DACL carries an EXPLICIT ALLOW granting write
 //! to Everyone / BUILTIN\Users / Authenticated Users (or a NULL
 //! DACL), and stamp each hit with an additive `(OI)(CI)` deny for
-//! the sandbox SID — [`crate::acl::SbAce::DenyWwAudit`]: the `acl
+//! the sandbox SID — [`crate::acl::SbAce::DenyAudit`]: the `acl
 //! stamp --deny-write` mask PLUS `WRITE_DAC`/`WRITE_OWNER`, because
 //! the flagged grants (`Everyone:(F)`, `GENERIC_ALL`) hand the
 //! sandbox user `WRITE_DAC` through the very ACE that got the dir
@@ -94,7 +94,7 @@
 //!
 //! ## Session-tracking decision
 //!
-//! Audit denies are recorded as ORDINARY session `deny_ww` rows
+//! Audit denies are recorded as ORDINARY session `deny_audit` rows
 //! (`working_aces`/`ace_holders`) under the broker's holder PID via
 //! [`crate::state_db::Locked::apply_aces`] — deliberately NOT as
 //! persistent ambient entries. Rationale: (a) the flagged set is
@@ -703,7 +703,7 @@ pub fn audit_and_stamp(
     if !to_stamp.is_empty() {
         let ((), stamp_report) = state_db::with_init_lock(holder, false, |db| {
             for canon in to_stamp {
-                match db.apply_aces(sandbox_sid, &[(canon.clone(), SbAce::DenyWwAudit)]) {
+                match db.apply_aces(sandbox_sid, &[(canon.clone(), SbAce::DenyAudit)]) {
                     Ok((_, 0)) => out.stamped.push(canon),
                     // apply_aces already printed the per-path warning
                     // and rolled this path's fresh rows back.

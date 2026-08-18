@@ -173,7 +173,7 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // In-flight world-writable audit (`srt-win acl audit` subprocess),
 // started by initialize()'s Windows block. MODULE-level, not
 // initialize()-local, so an external reset() racing initialize()
-// can settle it before sweeping: the subprocess stamps deny_ww
+// can settle it before sweeping: the subprocess stamps deny_audit
 // rows under this process's PID, and a sweep that runs before a
 // late stamp lands would strand that stamp until process exit
 // (crash recovery only reaps rows whose holder died — this process
@@ -1049,14 +1049,14 @@ async function initialize(
       // concurrent callers onto initializationPromise (`await
       // initializationPromise; return`), so settling the audit
       // after it resolved would hand a deduped caller an exec
-      // window before the deny_ww stamps land. (A concurrent
+      // window before the deny_audit stamps land. (A concurrent
       // reset() may have captured the promise for its own
       // settlement — then the teardown owns it and this session is
       // going away anyway.)
-      const wwAudit = windowsAclAuditInFlight
-      if (wwAudit) {
-        const audit = await wwAudit // never rejects
-        if (windowsAclAuditInFlight === wwAudit) {
+      const aclAudit = windowsAclAuditInFlight
+      if (aclAudit) {
+        const audit = await aclAudit // never rejects
+        if (windowsAclAuditInFlight === aclAudit) {
           windowsAclAuditInFlight = undefined
         }
         if (audit) {
@@ -2277,7 +2277,7 @@ function forceCloseHttpServer(
 async function reset(): Promise<void> {
   // Windows ACL teardown as ONE tracked promise: settle any
   // in-flight world-writable audit, THEN sweep, THEN clear the
-  // module state. Audit-first so a late `deny_ww` stamp cannot land
+  // module state. Audit-first so a late `deny_audit` stamp cannot land
   // after the sweep and stay stranded until process exit (crash
   // recovery only reaps rows whose holder died; this process is the
   // holder and alive). Tracked in `windowsAclTeardownPromise` so a
@@ -2288,10 +2288,10 @@ async function reset(): Promise<void> {
   // (async fns run sync until their first await), preserving the
   // old sweep-before-anything-interleaves behavior.
   const teardown = (async () => {
-    const wwAudit = windowsAclAuditInFlight
+    const aclAudit = windowsAclAuditInFlight
     windowsAclAuditInFlight = undefined
-    if (wwAudit) {
-      await wwAudit // never rejects (the helper catches everything)
+    if (aclAudit) {
+      await aclAudit // never rejects (the helper catches everything)
     }
     // Windows: release this session's sandbox-user ACEs. Best-effort
     // — log anomalies rather than throw, so teardown always

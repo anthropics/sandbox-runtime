@@ -297,9 +297,9 @@ pub fn open_db() -> Result<Connection> {
 }
 
 /// Filter on `release_aces` for the deny-ACE lifecycle. Includes
-/// the world-writable audit's `deny_ww` holds — `acl restore`
+/// the world-writable audit's `deny_audit` holds — `acl restore`
 /// releases them like any other session deny.
-pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", "deny_ww"];
+pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", "deny_audit"];
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
 
@@ -697,7 +697,7 @@ impl Locked {
                 // it in the same pass wastes a SetSecurityInfo
                 // round-trip and clutters the failure output.
                 //
-                // `DenyWwAudit` deliberately takes NO parent-FDC
+                // `DenyAudit` deliberately takes NO parent-FDC
                 // stamp: the FDC parent-stamp protects deny
                 // TARGETS from being renamed/deleted away, but
                 // the audit's parents (the drive root's dirs,
@@ -737,7 +737,7 @@ impl Locked {
         // Refuse Deny on multi-link files; Grant is fail-open so
         // an early release is safe, and `DenyFdc` only targets
         // directories.
-        if matches!(want, SbAce::Deny(_) | SbAce::DenyWwAudit) && !is_dir && links > 1 {
+        if matches!(want, SbAce::Deny(_) | SbAce::DenyAudit) && !is_dir && links > 1 {
             bail!(
                 "deny refused: '{canon}' has {links} hardlink(s); \
                  ace_holders rows are path-keyed, so releasing an \
@@ -1068,7 +1068,7 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::Deny(d) => set.deny = Some(d),
             SbAce::DenyFdc => set.deny_fdc = true,
             SbAce::DenyDelete => set.deny_delete = true,
-            SbAce::DenyWwAudit => set.deny_ww = true,
+            SbAce::DenyAudit => set.deny_audit = true,
         }
     }
     // Install-time ambient write-deny (HKLM AmbientDenies) folds

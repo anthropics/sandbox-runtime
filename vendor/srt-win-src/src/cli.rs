@@ -369,7 +369,7 @@ enum AclCmd {
     /// with an additive `(OI)(CI)` deny for the sandbox SID — the
     /// denyWrite mask plus WRITE_DAC/WRITE_OWNER, so the world
     /// grant that flagged the dir cannot be used to strip the deny
-    /// (`ww_audit.rs` module doc). Recorded as a session hold under
+    /// (`audit.rs` module doc). Recorded as a session hold under
     /// `--holder-pid` (released by `acl restore`, reaped by crash
     /// recovery). NULL-DACL dirs are reported but never stamped
     /// (stamping would materialize a DACL that restore cannot
@@ -1410,9 +1410,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     json,
                 },
         } => {
-            use srt_win::{state_db, ww_audit};
+            use srt_win::{audit, state_db};
             let (out, report) =
-                ww_audit::audit_and_stamp(state_db::HolderPid(holder_pid), &sandbox_user_sid)?;
+                audit::audit_and_stamp(state_db::HolderPid(holder_pid), &sandbox_user_sid)?;
             eprintln!(
                 "srt-win: acl audit — {} candidate(s), {} probed, {} \
                  flagged, {} stamped{}{}; recovery pruned {} dead \
@@ -1462,7 +1462,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     b.dacl_exhausted,
                     b.skipped_budget,
                     b.dirs_truncated,
-                    srt_win::ww_audit::MAX_DIR_ENTRIES,
+                    srt_win::audit::MAX_DIR_ENTRIES,
                     b.unreadable,
                     b.reparse_skipped,
                     b.remote_skipped,

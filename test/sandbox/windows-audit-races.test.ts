@@ -9,7 +9,7 @@ import type { WindowsAclAuditResult } from '../../src/sandbox/windows-sandbox-ut
 
 /**
  * Lifecycle races between the Windows world-writable audit (an
- * `srt-win acl audit` subprocess that stamps deny_ww session holds
+ * `srt-win acl audit` subprocess that stamps deny_audit session holds
  * under this process's PID) and initialize()/reset(). Platform and
  * every srt-win touchpoint are stubbed, so these run on any OS —
  * they exercise the ORDERING contracts in sandbox-manager.ts:
@@ -180,7 +180,7 @@ describe('windows world-writable audit lifecycle races (stubbed srt-win)', () =>
     const s2 = track(p2)
 
     // Neither caller may resolve while the audit subprocess is still
-    // running: its deny_ww stamps are part of what initialize()
+    // running: its deny_audit stamps are part of what initialize()
     // promises. (Everything else — network phase included — is done;
     // the audit is the only pending work.)
     await new Promise(r => setTimeout(r, 50))

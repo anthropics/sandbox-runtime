@@ -354,7 +354,7 @@ pub(crate) fn read_file_dacl(canonical_path: &str) -> Result<(OwnedSd, *mut ACL)
 /// Read a DACL from an OPEN handle via `GetSecurityInfo` — the
 /// by-handle mirror of [`read_file_dacl`], for callers that must
 /// not re-resolve the path by name after a no-follow open
-/// (`ww_audit`'s reparse-hardened probe: a name re-resolve could be
+/// (`audit`'s reparse-hardened probe: a name re-resolve could be
 /// redirected through a raced-in junction, including onto a UNC
 /// target). Same ownership contract: the `*mut ACL` points into the
 /// returned [`OwnedSd`]'s buffer.
@@ -695,7 +695,7 @@ pub enum SbAce {
     /// directory.
     DenyDelete,
     /// `(OI)(CI)` write-deny stamped by the world-writable audit
-    /// (`ww_audit.rs`) on a directory whose DACL explicitly grants
+    /// (`audit.rs`) on a directory whose DACL explicitly grants
     /// write to Everyone / BUILTIN\Users / Authenticated Users.
     /// The mask is [`DenyMask::WriteDeny`] PLUS `WRITE_DAC` and
     /// `WRITE_OWNER`: the flagged class typically grants the world
@@ -705,7 +705,7 @@ pub enum SbAce {
     /// away and write). A distinct kind, not a widened
     /// [`DenyMask::WriteDeny`], so user-configured `denyWrite`
     /// semantics are unchanged.
-    DenyWwAudit,
+    DenyAudit,
 }
 
 impl GrantMask {
@@ -737,15 +737,15 @@ impl DenyMask {
     }
 }
 
-/// [`SbAce::DenyWwAudit`]'s deny mask: [`DenyMask::WriteDeny`] plus
+/// [`SbAce::DenyAudit`]'s deny mask: [`DenyMask::WriteDeny`] plus
 /// `WRITE_DAC` and `WRITE_OWNER` — see the variant doc for why the
 /// audit's stamps must also deny DACL/owner rewrites.
-fn ww_audit_deny_bits() -> u32 {
+fn audit_deny_bits() -> u32 {
     DenyMask::WriteDeny.bits() | Mask::WRITE_DAC.with(Mask::WRITE_OWNER).bits()
 }
 
 impl SbAce {
-    /// `'grant' | 'deny' | 'deny_fdc' | 'deny_delete' | 'deny_ww'`
+    /// `'grant' | 'deny' | 'deny_fdc' | 'deny_delete' | 'deny_audit'`
     /// — the row's `kind` column.
     pub fn kind(self) -> &'static str {
         match self {
@@ -753,11 +753,11 @@ impl SbAce {
             SbAce::Deny(_) => "deny",
             SbAce::DenyFdc => "deny_fdc",
             SbAce::DenyDelete => "deny_delete",
-            SbAce::DenyWwAudit => "deny_ww",
+            SbAce::DenyAudit => "deny_audit",
         }
     }
     /// `'read' | 'modify' | 'denyRead' | 'denyWrite' | 'fdc' |
-    /// 'delete' | 'wwAudit'` — the row's `mask` / holder's
+    /// 'delete' | 'auditWriteDeny'` — the row's `mask` / holder's
     /// `want_mask` column. Round-trips via [`SbAce::parse`].
     pub fn as_str(self) -> &'static str {
         match self {
@@ -767,7 +767,7 @@ impl SbAce {
             SbAce::Deny(DenyMask::WriteDeny) => "denyWrite",
             SbAce::DenyFdc => "fdc",
             SbAce::DenyDelete => "delete",
-            SbAce::DenyWwAudit => "wwAudit",
+            SbAce::DenyAudit => "audit_write_deny",
         }
     }
     pub fn parse(kind: &str, mask: &str) -> Result<Self> {
@@ -778,13 +778,13 @@ impl SbAce {
             ("deny", "denyWrite") => SbAce::Deny(DenyMask::WriteDeny),
             ("deny_fdc", _) => SbAce::DenyFdc,
             ("deny_delete", _) => SbAce::DenyDelete,
-            ("deny_ww", _) => SbAce::DenyWwAudit,
+            ("deny_audit", _) => SbAce::DenyAudit,
             (k, m) => bail!("unknown SbAce kind={k:?} mask={m:?}"),
         })
     }
     /// Widening within one kind: `Modify ⊃ ReadOnly`, `ReadDeny ⊃
     /// WriteDeny`; the maskless kinds (`DenyFdc`/`DenyDelete`/
-    /// `DenyWwAudit`) are unit. Cross-kind is meaningless (a
+    /// `DenyAudit`) are unit. Cross-kind is meaningless (a
     /// path can hold one `Grant` row AND one `Deny` row; never
     /// merged).
     pub fn max(self, other: Self) -> Self {
@@ -810,12 +810,12 @@ pub struct SbAceSet {
     pub deny: Option<DenyMask>,
     pub deny_fdc: bool,
     pub deny_delete: bool,
-    pub deny_ww: bool,
+    pub deny_audit: bool,
 }
 
 impl SbAceSet {
     /// The set's entries as [`NewAce`]s for `sid`, in canonical
-    /// deny → deny-fdc → allow order. `Deny`/`DenyWwAudit`/`DenyFdc`/
+    /// deny → deny-fdc → allow order. `Deny`/`DenyAudit`/`DenyFdc`/
     /// `Grant` carry [`OICI`]; `DenyDelete` is object-only
     /// ([`NO_INHERIT`]) — see [`SbAce::DenyDelete`].
     ///
@@ -826,16 +826,16 @@ impl SbAceSet {
     /// pointing at the other session's audit hold). An explicit
     /// grant is foreground user intent; the audit is a best-effort
     /// background floor — so while a `Modify` grant row exists the
-    /// `deny_ww` ACE is excluded from the composed set, and it
+    /// `deny_audit` ACE is excluded from the composed set, and it
     /// returns automatically on the next recompose after the grant
-    /// is released (the `deny_ww` row itself stays held).
+    /// is released (the `deny_audit` row itself stays held).
     fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
         let mut v = Vec::with_capacity(4);
         if let Some(m) = self.deny {
             v.push(NewAce::Deny(sid, m.bits(), OICI));
         }
-        if self.deny_ww && !matches!(self.grant, Some(GrantMask::Modify)) {
-            v.push(NewAce::Deny(sid, ww_audit_deny_bits(), OICI));
+        if self.deny_audit && !matches!(self.grant, Some(GrantMask::Modify)) {
+            v.push(NewAce::Deny(sid, audit_deny_bits(), OICI));
         }
         if self.deny_delete {
             v.push(NewAce::Deny(sid, Mask::DELETE.bits(), NO_INHERIT));
@@ -1058,9 +1058,9 @@ mod tests {
     /// DACL/owner rewrites that make a plain write-deny
     /// self-strippable on Everyone-`(F)` directories.
     #[test]
-    fn ww_audit_deny_yields_to_write_grant() {
+    fn audit_deny_yields_to_write_grant() {
         let sid = LocalPsid::from_string("S-1-5-32-546").unwrap();
-        let ww_bits = ww_audit_deny_bits();
+        let ww_bits = audit_deny_bits();
         let count_ww = |set: SbAceSet| {
             set.head_aces(sid.as_psid())
                 .iter()
@@ -1068,7 +1068,7 @@ mod tests {
                 .count()
         };
         let ww_only = SbAceSet {
-            deny_ww: true,
+            deny_audit: true,
             ..Default::default()
         };
         assert_eq!(count_ww(ww_only), 1);

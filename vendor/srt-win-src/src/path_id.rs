@@ -339,7 +339,7 @@ pub fn create_placeholder_chain(
 }
 
 /// Kernel-canonical `\\?\…` path of an OPEN handle — the by-handle
-/// half of [`canonicalize_path`], shared with `ww_audit`'s
+/// half of [`canonicalize_path`], shared with `audit`'s
 /// no-follow probe (which must derive the canonical path from the
 /// handle it validated, never a name re-resolve). `label` is the
 /// caller's input path, for error context only. Fails closed on a

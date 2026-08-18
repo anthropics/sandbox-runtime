@@ -1997,7 +1997,7 @@ export function revokeWindowsAcl(opts: {
 
 /** Budget/coverage counters from `srt-win acl audit` — every bounded
  *  or skipped class is reported so partial coverage is visible.
- *  Mirrors the Rust `ww_audit::Budget` serialization. */
+ *  Mirrors the Rust `audit::Budget` serialization. */
 export interface WindowsAclAuditBudget {
   /** The 2s wall-clock budget expired mid-scan. */
   wallExpired: boolean
@@ -2024,7 +2024,7 @@ export interface WindowsAclAuditBudget {
 
 /** Result of `srt-win acl audit --json` — see
  *  {@link auditWindowsWorldWritable}. Mirrors the Rust
- *  `ww_audit::AuditOutcome` serialization. */
+ *  `audit::AuditOutcome` serialization. */
 export interface WindowsAclAuditResult {
   /** Candidate directories collected from the fixed root set. */
   candidates: number
@@ -2109,7 +2109,7 @@ function isWindowsAclAuditBudget(v: unknown): v is WindowsAclAuditBudget {
  * directories whose DACL carries an EXPLICIT ALLOW granting write
  * to Everyone / BUILTIN\Users / Authenticated Users (inherited
  * world-write — the stock volume-root class — is out of scope; see
- * `ww_audit.rs`), and stamps each hit for the sandbox SID with an
+ * `audit.rs`), and stamps each hit for the sandbox SID with an
  * audit-specific deny (the denyWrite mask plus WRITE_DAC and
  * WRITE_OWNER, so the world grant that flagged the dir cannot be
  * used to strip the deny; no parent-FDC stamp) as an ordinary
