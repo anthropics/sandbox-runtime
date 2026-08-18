@@ -7,7 +7,7 @@
   deny stamp + restore on the same path preserves the ambient floor
   (the `ambient_denies` fold-in at the recompose chokepoint), and
   that uninstall removes it all. Also covers the broker-time
-  `audit-ww` sweep (WW1): a third-party Everyone-writable dir under
+  `acl audit` sweep (WW1): a third-party Everyone-writable dir under
   the system drive is flagged and session-deny-stamped, a junction
   sibling is skipped, and `acl restore` releases the stamp.
 
@@ -99,7 +99,7 @@ try {
   Assert-WriteDenied 'AM3: ambient deny lost after session stamp+restore round-trip'
   Write-Host 'AM3 ok: ambient floor survives session stamp+restore'
 
-  # -- WW1: audit-ww flags + stamps a third-party world-writable dir --
+  # -- WW1: acl audit flags + stamps a third-party world-writable dir --
   # Create an Everyone-writable dir directly under the system drive
   # (a scanned root), a junction sibling pointing at it (must be
   # skipped, never followed), run the audit, and assert: the dir is
@@ -118,13 +118,13 @@ try {
   # stdout and lets stderr flow to the console) - no fishing the
   # first '{'-line out of a merged stream, which broke whenever a
   # stderr line contained '{'. J/Run throw on a non-zero exit.
-  $audit = J @('audit-ww','--holder-pid',"$PID",'--sandbox-user-sid',$sbSid,'--json')
+  $audit = J @('acl','audit','--holder-pid',"$PID",'--sandbox-user-sid',$sbSid,'--json')
   $wwLeaf = Split-Path $wwDir -Leaf
   if (-not ($audit.stamped | Where-Object { $_ -like "*$wwLeaf" })) {
-    throw "WW1: audit-ww did not stamp ${wwDir}: stamped=$($audit.stamped -join ', ')"
+    throw "WW1: acl audit did not stamp ${wwDir}: stamped=$($audit.stamped -join ', ')"
   }
   if ($audit.flagged | Where-Object { $_ -like "*$wwLeaf-junc" }) {
-    throw 'WW1: audit-ww flagged the junction (reparse points must be skipped)'
+    throw 'WW1: acl audit flagged the junction (reparse points must be skipped)'
   }
   # Non-vacuous half: a regression that FOLLOWS reparse points would
   # surface the junction under its target's canonical name and dedup
@@ -147,7 +147,7 @@ try {
   Remove-Item $probe -Force -ea SilentlyContinue
   # Reset $probe for the later ambient sections that reuse it.
   $probe = Join-Path $env:ProgramData "srt-ambient-smoke-$([guid]::NewGuid().ToString('N')).txt"
-  Write-Host 'WW1 ok: audit-ww stamped the world-writable dir, skipped the junction, restore released it'
+  Write-Host 'WW1 ok: acl audit stamped the world-writable dir, skipped the junction, restore released it'
 
   # ── AM4: --keep-user uninstall keeps the floor ───────────────────
   # Ambient stamps key on the ACCOUNT, not the sublayer: tearing down

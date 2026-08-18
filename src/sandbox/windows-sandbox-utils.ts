@@ -1995,7 +1995,7 @@ export function revokeWindowsAcl(opts: {
   }
 }
 
-/** Budget/coverage counters from `srt-win audit-ww` — every bounded
+/** Budget/coverage counters from `srt-win acl audit` — every bounded
  *  or skipped class is reported so partial coverage is visible.
  *  Mirrors the Rust `ww_audit::Budget` serialization. */
 export interface WindowsWwAuditBudget {
@@ -2022,7 +2022,7 @@ export interface WindowsWwAuditBudget {
   rootsSkippedNonLocal: number
 }
 
-/** Result of `srt-win audit-ww --json` — see
+/** Result of `srt-win acl audit --json` — see
  *  {@link auditWindowsWorldWritable}. Mirrors the Rust
  *  `ww_audit::AuditOutcome` serialization. */
 export interface WindowsWwAuditResult {
@@ -2082,7 +2082,7 @@ function isWindowsWwAuditResult(v: unknown): v is WindowsWwAuditResult {
 /**
  * Bounded world-writable-directory audit — the per-session dynamic
  * complement to the install-time static ambient deny list. Thin
- * wrapper around `srt-win audit-ww`: scans a fixed root set
+ * wrapper around `srt-win acl audit`: scans a fixed root set
  * (top-level dirs of `%SystemDrive%`; `%TEMP%` and `%PUBLIC%` themselves; the
  * broker's `PATH` entries, the cwd's immediate children — local
  * fixed drives only, reparse points never followed) for
@@ -2116,14 +2116,15 @@ export async function auditWindowsWorldWritable(opts: {
   const holder = opts.holderPid ?? process.pid
   try {
     // 90s = the init-lock acquire's own 60s cap (it can wait that
-    // long behind a wedged holder, and audit-ww acquires it twice)
+    // long behind a wedged holder, and acl audit acquires it twice)
     // + the 2s scan cap + headroom for stamping and a Defender
     // cold-scan of the exe — do not let a slow environment turn
     // the best-effort audit into a spurious timeout throw
     // upstream.
     const result = await runSrtWinJsonAsync<unknown>(
       [
-        'audit-ww',
+        'acl',
+        'audit',
         '--holder-pid',
         `${holder}`,
         '--sandbox-user-sid',
@@ -2137,15 +2138,15 @@ export async function auditWindowsWorldWritable(opts: {
     // undefined here rather than TypeError-ing initialize().
     if (!isWindowsWwAuditResult(result)) {
       logForDebugging(
-        `[Sandbox Windows] audit-ww: result shape out of contract; ignoring`,
+        `[Sandbox Windows] acl audit: result shape out of contract; ignoring`,
         { level: 'warn' },
       )
       return undefined
     }
-    logForDebugging(`[Sandbox Windows] audit-ww ok`)
+    logForDebugging(`[Sandbox Windows] acl audit ok`)
     return result
   } catch (e) {
-    logForDebugging(`[Sandbox Windows] audit-ww: ${(e as Error).message}`, {
+    logForDebugging(`[Sandbox Windows] acl audit: ${(e as Error).message}`, {
       level: 'warn',
     })
     return undefined

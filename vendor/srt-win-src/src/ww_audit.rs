@@ -41,7 +41,7 @@
 //! [`MAX_DACL_READS`] DACL probes, [`MAX_DIR_ENTRIES`] entries per
 //! enumerated root. Budget exhaustion is never silent: every skip
 //! class is counted in [`AuditOutcome::budget`] and summarized on
-//! stderr by the `audit-ww` CLI arm.
+//! stderr by the `acl audit` CLI arm.
 //!
 //! Nothing is cached across sessions, deliberately: the flagged set
 //! is environment-dependent (`PATH`, cwd, third-party installs
@@ -337,7 +337,7 @@ impl Exclusions {
 
 /// What one audit did — every bounded/skipped class is counted so
 /// the CLI summary can report exactly what was NOT covered (no
-/// silent caps). Serialized as-is (camelCase) for `audit-ww --json`;
+/// silent caps). Serialized as-is (camelCase) for `acl audit --json`;
 /// the TS `WindowsWwAuditResult` interface mirrors this shape.
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
