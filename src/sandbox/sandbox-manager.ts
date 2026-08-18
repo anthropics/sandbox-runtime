@@ -179,7 +179,7 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // (crash recovery only reaps rows whose holder died — this process
 // is the holder and alive). The promise never rejects (the helper
 // catches everything). Cleared by whichever side settles it.
-let windowsWwAuditInFlight:
+let windowsAclAuditInFlight:
   | ReturnType<typeof auditWindowsWorldWritable>
   | undefined
 // reset()'s Windows ACL teardown — audit settlement, then the SID
@@ -965,7 +965,7 @@ async function initialize(
     // the ACL state DB, so it overlaps proxy startup instead of
     // serializing in front of it.
     if (windowsFsSbUserSid) {
-      windowsWwAuditInFlight = auditWindowsWorldWritable({
+      windowsAclAuditInFlight = auditWindowsWorldWritable({
         sandboxUserSid: windowsFsSbUserSid,
         srtWin,
       })
@@ -1053,11 +1053,11 @@ async function initialize(
       // reset() may have captured the promise for its own
       // settlement — then the teardown owns it and this session is
       // going away anyway.)
-      const wwAudit = windowsWwAuditInFlight
+      const wwAudit = windowsAclAuditInFlight
       if (wwAudit) {
         const audit = await wwAudit // never rejects
-        if (windowsWwAuditInFlight === wwAudit) {
-          windowsWwAuditInFlight = undefined
+        if (windowsAclAuditInFlight === wwAudit) {
+          windowsAclAuditInFlight = undefined
         }
         if (audit) {
           logForDebugging(
@@ -2288,8 +2288,8 @@ async function reset(): Promise<void> {
   // (async fns run sync until their first await), preserving the
   // old sweep-before-anything-interleaves behavior.
   const teardown = (async () => {
-    const wwAudit = windowsWwAuditInFlight
-    windowsWwAuditInFlight = undefined
+    const wwAudit = windowsAclAuditInFlight
+    windowsAclAuditInFlight = undefined
     if (wwAudit) {
       await wwAudit // never rejects (the helper catches everything)
     }

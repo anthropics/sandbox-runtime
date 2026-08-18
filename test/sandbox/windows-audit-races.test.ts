@@ -5,7 +5,7 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import * as platform from '../../src/utils/platform.js'
 import * as wutils from '../../src/sandbox/windows-sandbox-utils.js'
 import * as httpProxy from '../../src/sandbox/http-proxy.js'
-import type { WindowsWwAuditResult } from '../../src/sandbox/windows-sandbox-utils.js'
+import type { WindowsAclAuditResult } from '../../src/sandbox/windows-sandbox-utils.js'
 
 /**
  * Lifecycle races between the Windows world-writable audit (an
@@ -61,7 +61,7 @@ function track(p: Promise<unknown>): { settled: boolean; rejected: boolean } {
   return s
 }
 
-function auditResult(): WindowsWwAuditResult {
+function auditResult(): WindowsAclAuditResult {
   return {
     candidates: 3,
     scanned: 3,
@@ -167,7 +167,7 @@ describe('windows world-writable audit lifecycle races (stubbed srt-win)', () =>
   })
 
   it('a deduped initialize() caller waits for the audit to settle', async () => {
-    const d = deferred<WindowsWwAuditResult | undefined>()
+    const d = deferred<WindowsAclAuditResult | undefined>()
     auditSpy.mockImplementation(() => d.promise)
 
     const p1 = SandboxManager.initialize(externalPortsConfig())
@@ -195,7 +195,7 @@ describe('windows world-writable audit lifecycle races (stubbed srt-win)', () =>
   })
 
   it('reset() during initialize() defers the sweep until the audit settles (zero stranded rows)', async () => {
-    const d = deferred<WindowsWwAuditResult | undefined>()
+    const d = deferred<WindowsAclAuditResult | undefined>()
     auditSpy.mockImplementation(() => d.promise)
 
     const p1 = SandboxManager.initialize(externalPortsConfig())
@@ -231,8 +231,8 @@ describe('windows world-writable audit lifecycle races (stubbed srt-win)', () =>
   })
 
   it('failed network init rethrows promptly; a retry waits out the teardown before re-stamping', async () => {
-    const d1 = deferred<WindowsWwAuditResult | undefined>()
-    const d2 = deferred<WindowsWwAuditResult | undefined>()
+    const d1 = deferred<WindowsAclAuditResult | undefined>()
+    const d2 = deferred<WindowsAclAuditResult | undefined>()
     auditSpy
       .mockImplementationOnce(() => d1.promise)
       .mockImplementationOnce(() => d2.promise)

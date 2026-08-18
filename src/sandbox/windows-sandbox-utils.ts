@@ -1998,7 +1998,7 @@ export function revokeWindowsAcl(opts: {
 /** Budget/coverage counters from `srt-win acl audit` — every bounded
  *  or skipped class is reported so partial coverage is visible.
  *  Mirrors the Rust `ww_audit::Budget` serialization. */
-export interface WindowsWwAuditBudget {
+export interface WindowsAclAuditBudget {
   /** The 2s wall-clock budget expired mid-scan. */
   wallExpired: boolean
   /** DACL probes performed (cap 50 000). */
@@ -2025,7 +2025,7 @@ export interface WindowsWwAuditBudget {
 /** Result of `srt-win acl audit --json` — see
  *  {@link auditWindowsWorldWritable}. Mirrors the Rust
  *  `ww_audit::AuditOutcome` serialization. */
-export interface WindowsWwAuditResult {
+export interface WindowsAclAuditResult {
   /** Candidate directories collected from the fixed root set. */
   candidates: number
   /** Candidates actually probed (open + DACL read). */
@@ -2042,16 +2042,16 @@ export interface WindowsWwAuditResult {
   failed: { path: string; error: string }[]
   /** How many of `failed` are NULL-DACL stamp refusals. */
   nullDaclRefused: number
-  budget: WindowsWwAuditBudget
+  budget: WindowsAclAuditBudget
 }
 
-/** Runtime shape check for {@link WindowsWwAuditResult}. The result
+/** Runtime shape check for {@link WindowsAclAuditResult}. The result
  *  is consumed OUTSIDE the helper's try/catch (`initialize()` reads
  *  `audit.flagged.length`, `audit.budget.wallExpired`), so a
  *  Rust-side field rename must degrade to the helper's `undefined`
  *  return — never surface as a TypeError that breaks the
  *  "never blocks init" contract. */
-function isWindowsWwAuditResult(v: unknown): v is WindowsWwAuditResult {
+function isWindowsAclAuditResult(v: unknown): v is WindowsAclAuditResult {
   if (typeof v !== 'object' || v === null) return false
   const r = v as Record<string, unknown>
   const b = r['budget']
@@ -2071,20 +2071,20 @@ function isWindowsWwAuditResult(v: unknown): v is WindowsWwAuditResult {
         typeof (f as Record<string, unknown>)['path'] === 'string' &&
         typeof (f as Record<string, unknown>)['error'] === 'string',
     ) &&
-    isWindowsWwAuditBudget(b)
+    isWindowsAclAuditBudget(b)
   )
 }
 
-/** Runtime shape check for {@link WindowsWwAuditBudget} — all nine
+/** Runtime shape check for {@link WindowsAclAuditBudget} — all nine
  *  fields, since the guard asserts the full exported type. */
-function isWindowsWwAuditBudget(v: unknown): v is WindowsWwAuditBudget {
+function isWindowsAclAuditBudget(v: unknown): v is WindowsAclAuditBudget {
   if (typeof v !== 'object' || v === null) return false
   const b = v as Record<string, unknown>
-  const booleans: (keyof WindowsWwAuditBudget)[] = [
+  const booleans: (keyof WindowsAclAuditBudget)[] = [
     'wallExpired',
     'daclExhausted',
   ]
-  const numbers: (keyof WindowsWwAuditBudget)[] = [
+  const numbers: (keyof WindowsAclAuditBudget)[] = [
     'daclReads',
     'skipped',
     'dirsTruncated',
@@ -2132,7 +2132,7 @@ export async function auditWindowsWorldWritable(opts: {
   holderPid?: number
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
   srtWin?: SrtWinSpawn
-}): Promise<WindowsWwAuditResult | undefined> {
+}): Promise<WindowsAclAuditResult | undefined> {
   const holder = opts.holderPid ?? process.pid
   try {
     // 150s: `acl audit` acquires the init lock TWICE (exclusion
@@ -2161,7 +2161,7 @@ export async function auditWindowsWorldWritable(opts: {
     // Callers dereference the result outside this try/catch, so an
     // out-of-contract shape (Rust-side rename) degrades to
     // undefined here rather than TypeError-ing initialize().
-    if (!isWindowsWwAuditResult(result)) {
+    if (!isWindowsAclAuditResult(result)) {
       logForDebugging(
         `[Sandbox Windows] acl audit: result shape out of contract; ignoring`,
         { level: 'warn' },
