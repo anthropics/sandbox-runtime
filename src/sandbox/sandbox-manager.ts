@@ -170,6 +170,24 @@ let windowsFsSbUserSid: string | undefined
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
 let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
+// In-flight world-writable audit (`srt-win acl audit` subprocess),
+// started by initialize()'s Windows block. MODULE-level, not
+// initialize()-local, so an external reset() racing initialize()
+// can settle it before sweeping: the subprocess stamps deny_ww
+// rows under this process's PID, and a sweep that runs before a
+// late stamp lands would strand that stamp until process exit
+// (crash recovery only reaps rows whose holder died — this process
+// is the holder and alive). The promise never rejects (the helper
+// catches everything). Cleared by whichever side settles it.
+let windowsWwAuditInFlight:
+  | ReturnType<typeof auditWindowsWorldWritable>
+  | undefined
+// reset()'s Windows ACL teardown — audit settlement, then the SID
+// sweep, then the module-state clears — as ONE tracked promise. A
+// retry/concurrent initialize() awaits it before stamping anew:
+// the sweep releases by SID + holder PID (this process), so
+// interleaving would strip the NEW session's fresh holds.
+let windowsAclTeardownPromise: Promise<void> | undefined
 // `verifyWindowsWfpEgress()` is once per PROCESS (it spawns a
 // CreateProcessWithLogonW runner; first call may create the sandbox
 // user's profile). The WFP fence is install-scoped, not config- or
@@ -750,17 +768,20 @@ async function initialize(
   // Register cleanup handlers first time
   registerCleanup()
 
-  // Windows world-writable audit, started inside the Windows block
-  // below and collected after the network init so the two overlap.
-  // The helper never rejects (it catches everything and resolves
-  // undefined), so holding the promise across the overlap is safe.
-  let wwAuditPromise: ReturnType<typeof auditWindowsWorldWritable> | undefined
-
   // Windows: validate provisioning + filesystem config BEFORE any
   // sandboxed child can be spawned. Doing this at initialize() (not
   // wrap-time) means the host gets a single actionable error before
   // any per-exec work happens, instead of exit-15 on every command.
   if (getPlatform() === 'windows') {
+    // A previous session's ACL teardown may still be draining
+    // (reset() settles an in-flight audit before its sweep — see
+    // windowsAclTeardownPromise). Wait it out so this session's
+    // fresh grants/stamps can't be released by that sweep, and so
+    // the teardown's state clears can't clobber the assignments
+    // below.
+    if (windowsAclTeardownPromise) {
+      await windowsAclTeardownPromise
+    }
     // Resolve once (stats disk); captured module-level for wrap/reset.
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
@@ -939,12 +960,12 @@ async function initialize(
     // Runs AFTER the grants above so the session's allowWrite set is
     // recorded in the state DB and excluded from stamping. The
     // helper catches everything and returns undefined on failure.
-    // Started here but awaited only after the network init below —
+    // Started here but settled inside initializationPromise below —
     // the audit is an independent srt-win subprocess touching only
     // the ACL state DB, so it overlaps proxy startup instead of
     // serializing in front of it.
     if (windowsFsSbUserSid) {
-      wwAuditPromise = auditWindowsWorldWritable({
+      windowsWwAuditInFlight = auditWindowsWorldWritable({
         sandboxUserSid: windowsFsSbUserSid,
         srtWin,
       })
@@ -1023,6 +1044,33 @@ async function initialize(
         socksProxyPort,
         linuxBridge,
       }
+      // Windows: settle the world-writable audit HERE, inside the
+      // promise EVERY caller awaits — initialize() dedups
+      // concurrent callers onto initializationPromise (`await
+      // initializationPromise; return`), so settling the audit
+      // after it resolved would hand a deduped caller an exec
+      // window before the deny_ww stamps land. (A concurrent
+      // reset() may have captured the promise for its own
+      // settlement — then the teardown owns it and this session is
+      // going away anyway.)
+      const wwAudit = windowsWwAuditInFlight
+      if (wwAudit) {
+        const audit = await wwAudit // never rejects
+        if (windowsWwAuditInFlight === wwAudit) {
+          windowsWwAuditInFlight = undefined
+        }
+        if (audit) {
+          logForDebugging(
+            `[Sandbox Windows] ww audit: ${audit.scanned} scanned, ` +
+              `${audit.flagged.length} flagged, ` +
+              `${audit.stamped.length} stamped, ` +
+              `${audit.failed.length} failed` +
+              (audit.budget.wallExpired || audit.budget.daclExhausted
+                ? ` (budget hit — partial coverage)`
+                : ''),
+          )
+        }
+      }
       managerContext = context
       logForDebugging('Network infrastructure initialized')
       return context
@@ -1030,13 +1078,12 @@ async function initialize(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
-      // Let the concurrent world-writable audit settle before the
-      // reset() sweep — otherwise its stamps could land AFTER
-      // restore ran and be stranded until this process exits.
-      // Never rejects (the helper catches everything).
-      if (wwAuditPromise) {
-        await wwAuditPromise
-      }
+      // Rethrow promptly — a fast failure (port-bind conflict) must
+      // not wait out the in-flight audit's settlement (up to its
+      // subprocess timeout) here. The audit-vs-sweep ordering holds:
+      // reset() itself settles the in-flight audit before its ACL
+      // sweep, and a retry initialize() awaits that teardown before
+      // stamping anew (windowsAclTeardownPromise).
       reset().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
@@ -1047,25 +1094,6 @@ async function initialize(
   })()
 
   await initializationPromise
-
-  // Collect the Windows world-writable audit started before the
-  // network init. Preserves the pre-overlap contract: initialize()
-  // does not resolve until the audit's stamps are on disk (or it
-  // failed — undefined, already logged by the helper).
-  if (wwAuditPromise) {
-    const audit = await wwAuditPromise
-    if (audit) {
-      logForDebugging(
-        `[Sandbox Windows] ww audit: ${audit.scanned} scanned, ` +
-          `${audit.flagged.length} flagged, ` +
-          `${audit.stamped.length} stamped, ` +
-          `${audit.failed.length} failed` +
-          (audit.budget.wallExpired || audit.budget.daclExhausted
-            ? ` (budget hit — partial coverage)`
-            : ''),
-      )
-    }
-  }
 }
 
 function isSupportedPlatform(): boolean {
@@ -2247,48 +2275,82 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
-  // Windows: release this session's sandbox-user ACEs. Best-effort
-  // — log anomalies rather than throw, so teardown always
-  // completes. Leftover ACEs are recoverable later via
-  // `srt-win acl recover` (which sweeps by trustee SID).
-  // Gated on the SID alone, not windowsFsStampedSet: the
-  // world-writable audit's deny stamps are session holds under this
-  // PID even when the session had no filesystem config of its own —
-  // and audit stamps can land on disk while the TS wrapper observed
-  // a failure (timeout mid-stamping, garbled stdout), so no flag on
-  // this side can be trusted to know. restore/revoke are cheap
-  // no-op sweeps by SID+PID when nothing is held.
-  if (windowsFsSbUserSid) {
-    const sb = windowsFsSbUserSid
-    // Captured at initialize() — the SAME binary the grants/stamps
-    // were applied with, immune to `config` mutation between.
-    const srtWin = srtWinSpawn
-    // 'restored'/'alreadyOriginal' are the pre- same-user-removal
-    // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
-    // post-. Either is non-anomalous.
-    const ok = new Set(['revoked', 'stillHeld', 'restored', 'alreadyOriginal'])
-    const log = (kind: string, e: { path: string; status: string }) => {
-      if (!ok.has(e.status)) {
-        logForDebugging(
-          `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
-            `ACE may be left in place; resolve and run ` +
-            `\`srt-win acl recover\` to clear`,
-          { level: 'warn' },
-        )
+  // Windows ACL teardown as ONE tracked promise: settle any
+  // in-flight world-writable audit, THEN sweep, THEN clear the
+  // module state. Audit-first so a late `deny_ww` stamp cannot land
+  // after the sweep and stay stranded until process exit (crash
+  // recovery only reaps rows whose holder died; this process is the
+  // holder and alive). Tracked in `windowsAclTeardownPromise` so a
+  // retry/concurrent initialize() waits it out before stamping anew
+  // — the sweep releases by SID + holder PID, which would strip the
+  // new session's fresh holds if the two interleaved. With no audit
+  // in flight the body runs synchronously to completion at the call
+  // (async fns run sync until their first await), preserving the
+  // old sweep-before-anything-interleaves behavior.
+  const teardown = (async () => {
+    const wwAudit = windowsWwAuditInFlight
+    windowsWwAuditInFlight = undefined
+    if (wwAudit) {
+      await wwAudit // never rejects (the helper catches everything)
+    }
+    // Windows: release this session's sandbox-user ACEs. Best-effort
+    // — log anomalies rather than throw, so teardown always
+    // completes. Leftover ACEs are recoverable later via
+    // `srt-win acl recover` (which sweeps by trustee SID).
+    // Gated on the SID alone, not windowsFsStampedSet: the
+    // world-writable audit's deny stamps are session holds under this
+    // PID even when the session had no filesystem config of its own —
+    // and audit stamps can land on disk while the TS wrapper observed
+    // a failure (timeout mid-stamping, garbled stdout), so no flag on
+    // this side can be trusted to know. restore/revoke are cheap
+    // no-op sweeps by SID+PID when nothing is held.
+    if (windowsFsSbUserSid) {
+      const sb = windowsFsSbUserSid
+      // Captured at initialize() — the SAME binary the grants/stamps
+      // were applied with, immune to `config` mutation between.
+      const srtWin = srtWinSpawn
+      // 'restored'/'alreadyOriginal' are the pre- same-user-removal
+      // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
+      // post-. Either is non-anomalous.
+      const ok = new Set([
+        'revoked',
+        'stillHeld',
+        'restored',
+        'alreadyOriginal',
+      ])
+      const log = (kind: string, e: { path: string; status: string }) => {
+        if (!ok.has(e.status)) {
+          logForDebugging(
+            `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
+              `ACE may be left in place; resolve and run ` +
+              `\`srt-win acl recover\` to clear`,
+            { level: 'warn' },
+          )
+        }
+      }
+      for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
+        log('grant revoke', e)
+      }
+      for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
+        log('deny restore', e)
       }
     }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('grant revoke', e)
-    }
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('deny restore', e)
+    windowsFsStampedSet = undefined
+    windowsFsSbUserSid = undefined
+    windowsFsRawInputs = undefined
+    srtWinSpawn = undefined
+    // windowsWfpVerified is NOT cleared — per-process, not per-session.
+  })()
+  windowsAclTeardownPromise = teardown
+  try {
+    await teardown
+  } finally {
+    // A newer reset() may have installed its own teardown — only
+    // clear the tracker if it is still ours.
+    if (windowsAclTeardownPromise === teardown) {
+      windowsAclTeardownPromise = undefined
     }
   }
-  windowsFsStampedSet = undefined
-  windowsFsSbUserSid = undefined
-  windowsFsRawInputs = undefined
-  srtWinSpawn = undefined
-  // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
   // active-sandbox counter — reset() means the session is over.

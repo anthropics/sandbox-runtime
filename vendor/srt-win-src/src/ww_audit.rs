@@ -143,7 +143,11 @@ pub const MAX_DIR_ENTRIES: usize = 1_000;
 /// account — the sandbox user included — is a member of all three
 /// (Everyone/Authenticated Users by definition; BUILTIN\Users
 /// because provisioning adds the account to it for profile loads).
-const FLAGGED_SIDS: [&str; 3] = ["S-1-1-0", "S-1-5-32-545", "S-1-5-11"];
+const FLAGGED_SIDS: [&str; 3] = [
+    acl::SID_EVERYONE,
+    acl::SID_BUILTIN_USERS,
+    acl::SID_AUTHENTICATED_USERS,
+];
 
 /// Whether an ACE with `flags` applies to the directory itself (an
 /// `INHERIT_ONLY` ACE does not — it grants nothing on the

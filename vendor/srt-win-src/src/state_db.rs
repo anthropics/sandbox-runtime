@@ -263,7 +263,7 @@ pub fn open_db() -> Result<Connection> {
     let deny_sid = match crate::sid::lookup_account_sid(crate::user::SANDBOX_GROUP) {
         Ok(s) => Some(s),
         Err(e) => {
-            match crate::sid::sid_account_exists("S-1-5-32-545") {
+            match crate::sid::sid_account_exists(crate::acl::SID_BUILTIN_USERS) {
                 // BUILTIN\Users always maps; if it does, SAM is up
                 // and the sandbox group is genuinely absent.
                 Ok(crate::sid::SidExistence::Mapped) => None,

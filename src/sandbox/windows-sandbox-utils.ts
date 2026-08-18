@@ -2071,11 +2071,31 @@ function isWindowsWwAuditResult(v: unknown): v is WindowsWwAuditResult {
         typeof (f as Record<string, unknown>)['path'] === 'string' &&
         typeof (f as Record<string, unknown>)['error'] === 'string',
     ) &&
-    typeof b === 'object' &&
-    b !== null &&
-    typeof (b as Record<string, unknown>)['wallExpired'] === 'boolean' &&
-    typeof (b as Record<string, unknown>)['daclExhausted'] === 'boolean' &&
-    typeof (b as Record<string, unknown>)['daclReads'] === 'number'
+    isWindowsWwAuditBudget(b)
+  )
+}
+
+/** Runtime shape check for {@link WindowsWwAuditBudget} — all nine
+ *  fields, since the guard asserts the full exported type. */
+function isWindowsWwAuditBudget(v: unknown): v is WindowsWwAuditBudget {
+  if (typeof v !== 'object' || v === null) return false
+  const b = v as Record<string, unknown>
+  const booleans: (keyof WindowsWwAuditBudget)[] = [
+    'wallExpired',
+    'daclExhausted',
+  ]
+  const numbers: (keyof WindowsWwAuditBudget)[] = [
+    'daclReads',
+    'skipped',
+    'dirsTruncated',
+    'unreadable',
+    'reparseSkipped',
+    'remoteSkipped',
+    'rootsSkippedNonLocal',
+  ]
+  return (
+    booleans.every(k => typeof b[k] === 'boolean') &&
+    numbers.every(k => typeof b[k] === 'number')
   )
 }
 
@@ -2115,12 +2135,17 @@ export async function auditWindowsWorldWritable(opts: {
 }): Promise<WindowsWwAuditResult | undefined> {
   const holder = opts.holderPid ?? process.pid
   try {
-    // 90s = the init-lock acquire's own 60s cap (it can wait that
-    // long behind a wedged holder, and acl audit acquires it twice)
-    // + the 2s scan cap + headroom for stamping and a Defender
-    // cold-scan of the exe — do not let a slow environment turn
-    // the best-effort audit into a spurious timeout throw
-    // upstream.
+    // 150s: `acl audit` acquires the init lock TWICE (exclusion
+    // snapshot, then stamping), and each acquire can wait up to its
+    // own 60s cap behind a wedged holder before erroring — so the
+    // true worst case is 60s + 60s + the 2s scan cap + stamping +
+    // a Defender cold-scan of the exe. The timeout must sit ABOVE
+    // that: killing the child mid-stamp-loop would leave partial,
+    // unreported coverage (stamps applied but not surfaced). A
+    // generous TS-side timeout is the right lever — shortening the
+    // second acquire in Rust would add a special-cased lock path
+    // just to drop legitimate stamps behind a slow-but-alive
+    // holder, and this path is best-effort by contract either way.
     const result = await runSrtWinJsonAsync<unknown>(
       [
         'acl',
@@ -2131,7 +2156,7 @@ export async function auditWindowsWorldWritable(opts: {
         opts.sandboxUserSid,
         '--json',
       ],
-      { timeoutMs: 90_000, srtWin: opts.srtWin },
+      { timeoutMs: 150_000, srtWin: opts.srtWin },
     )
     // Callers dereference the result outside this try/catch, so an
     // out-of-contract shape (Rust-side rename) degrades to

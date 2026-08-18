@@ -62,7 +62,13 @@ use crate::util::{OwnedSd, pcwstr, win32_ok, wstr};
 pub const SID_OWNER_RIGHTS: &str = "S-1-3-4";
 pub const SID_SYSTEM: &str = "S-1-5-18";
 pub const SID_BUILTIN_ADMINS: &str = "S-1-5-32-544";
+/// `BUILTIN\Users` — well-known SID, stable across locales (unlike
+/// the *name* "Users" / "Benutzer" / "Utilisateurs").
 pub const SID_BUILTIN_USERS: &str = "S-1-5-32-545";
+/// `Everyone` (World).
+pub const SID_EVERYONE: &str = "S-1-1-0";
+/// `Authenticated Users`.
+pub const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
 
 // ─── DACL builder primitives ────────────────────────────────────────
 // The policy functions below declare ACE lists as `&[Allow]`; this
@@ -546,36 +552,22 @@ pub fn set_path_dacl_from_sddl(path: &str, sddl: &str, label: &str) -> Result<()
 /// DACL lets standard users pre-create directories — including as
 /// NTFS mount points / junctions targeting an arbitrary directory —
 /// so an elevated install that take-owns and re-ACLs by NAME can be
-/// redirected into re-ACLing a victim tree. Opening with
-/// `FILE_FLAG_OPEN_REPARSE_POINT` pins the object itself (no
-/// traversal), the attribute check rejects a planted reparse point,
-/// and the returned HANDLE is what the security writes below
-/// operate on — validate-then-use on the same object, not a name.
+/// redirected into re-ACLing a victim tree. The no-follow open
+/// (via the [`crate::path_id::open_for_metadata`] chokepoint) pins
+/// the object itself (no traversal), the attribute check rejects a
+/// planted reparse point, and the returned HANDLE is what the
+/// security writes below operate on — validate-then-use on the
+/// same object, not a name.
 pub fn open_for_security_no_follow(path: &str) -> Result<crate::util::OwnedHandle> {
-    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GetFileInformationByHandle, OPEN_EXISTING,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
     };
-    let w = wstr(path);
-    let h = unsafe {
-        CreateFileW(
-            pcwstr(&w),
-            Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits() | Mask::WRITE_OWNER.bits(),
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-    }
+    let owned = crate::path_id::open_for_metadata(
+        path,
+        Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits() | Mask::WRITE_OWNER.bits(),
+        /* no_follow */ true,
+    )
     .with_context(|| format!("CreateFileW('{path}', no-follow)"))?;
-    if h == INVALID_HANDLE_VALUE {
-        bail!("CreateFileW('{path}'): INVALID_HANDLE_VALUE");
-    }
-    let owned = crate::util::OwnedHandle(h);
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(owned.0, &mut info) }
         .with_context(|| format!("GetFileInformationByHandle('{path}')"))?;
