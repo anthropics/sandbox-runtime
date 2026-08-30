@@ -44,6 +44,8 @@ import {
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
+  initializeLinuxPortForwardBridges,
+  type LinuxPortForwardBridge,
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
@@ -123,6 +125,7 @@ interface HostNetworkManagerContext {
   httpProxyPort: number
   socksProxyPort: number
   linuxBridge: LinuxNetworkBridgeContext | undefined
+  portForwardBridges: LinuxPortForwardBridge[] | undefined
 }
 
 // ============================================================================
@@ -979,18 +982,28 @@ async function initialize(
 
       // Initialize platform-specific infrastructure
       let linuxBridge: LinuxNetworkBridgeContext | undefined
+      let portForwardBridges: LinuxPortForwardBridge[] | undefined
       if (getPlatform() === 'linux') {
         linuxBridge = await initializeLinuxNetworkBridge(
           httpProxyPort,
           socksProxyPort,
           config.socatPath,
         )
+
+        const exposeLoopbackPorts = getExposeLoopbackPorts()
+        if (exposeLoopbackPorts && exposeLoopbackPorts.length > 0) {
+          portForwardBridges = await initializeLinuxPortForwardBridges(
+            exposeLoopbackPorts,
+            config.socatPath,
+          )
+        }
       }
 
       const context: HostNetworkManagerContext = {
         httpProxyPort,
         socksProxyPort,
         linuxBridge,
+        portForwardBridges,
       }
       managerContext = context
       logForDebugging('Network infrastructure initialized')
@@ -1515,6 +1528,10 @@ function getAllowLocalBinding(): boolean | undefined {
   return config?.network?.allowLocalBinding
 }
 
+function getExposeLoopbackPorts(): number[] | undefined {
+  return config?.network?.exposeLoopbackPorts
+}
+
 function getAllowMachLookup(): string[] | undefined {
   return config?.network?.allowMachLookup
 }
@@ -1584,6 +1601,10 @@ function getLinuxHttpSocketPath(): string | undefined {
 
 function getLinuxSocksSocketPath(): string | undefined {
   return managerContext?.linuxBridge?.socksSocketPath
+}
+
+function getLinuxPortForwardBridges(): LinuxPortForwardBridge[] | undefined {
+  return managerContext?.portForwardBridges
 }
 
 /**
@@ -1833,6 +1854,16 @@ async function wrapWithSandbox(
         socatPath: config?.socatPath,
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
+        // Bind-mounting these sockets is only meaningful inside a
+        // network-namespaced sandbox; without needsNetworkRestriction
+        // there is no --unshare-net and the sockets would just be
+        // superfluous host-path binds.
+        exposeLoopbackPorts: needsNetworkRestriction
+          ? getLinuxPortForwardBridges()?.map(b => ({
+              port: b.port,
+              socketPath: b.socketPath,
+            }))
+          : undefined,
       })
 
     case 'windows':
@@ -2278,6 +2309,31 @@ async function reset(): Promise<void> {
     }
   }
 
+  if (managerContext?.portForwardBridges) {
+    const portForwardBridges = managerContext.portForwardBridges
+
+    // Kill all port-forward bridges and wait for them to exit
+    await Promise.all(
+      portForwardBridges.map(bridge =>
+        killBridgeProcess(bridge.bridgeProcess, `port-forward:${bridge.port}`),
+      ),
+    )
+
+    // Clean up sockets
+    for (const bridge of portForwardBridges) {
+      try {
+        fs.rmSync(bridge.socketPath, { force: true })
+        logForDebugging(
+          `Cleaned up port-forward socket for port ${bridge.port}`,
+        )
+      } catch (err) {
+        logForDebugging(`Port-forward socket cleanup error: ${err}`, {
+          level: 'error',
+        })
+      }
+    }
+  }
+
   // Close servers in parallel (only if they exist, i.e., were started by us)
   const closePromises: Promise<void>[] = []
 
@@ -2444,6 +2500,7 @@ export interface ISandboxManager {
   getSocksProxyPort(): number | undefined
   getLinuxHttpSocketPath(): string | undefined
   getLinuxSocksSocketPath(): string | undefined
+  getLinuxPortForwardBridges(): LinuxPortForwardBridge[] | undefined
   waitForNetworkInitialization(): Promise<boolean>
   wrapWithSandbox(
     command: string,
@@ -2500,6 +2557,7 @@ export const SandboxManager: ISandboxManager = {
   getSocksProxyPort,
   getLinuxHttpSocketPath,
   getLinuxSocksSocketPath,
+  getLinuxPortForwardBridges,
   waitForNetworkInitialization,
   wrapWithSandbox,
   wrapWithSandboxArgv,
