@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import * as net from 'node:net'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, type RipgrepConfig } from '../utils/ripgrep.js'
@@ -1352,6 +1353,30 @@ export interface LinuxPortForwardBridge {
 }
 
 /**
+ * Probe whether something is actively listening on 127.0.0.1:<port> by
+ * attempting a real TCP connect. A successful 'connect' event proves a
+ * listener has bound and is accepting connections on that port; a
+ * connection-refused error or timeout means nothing is listening yet (the
+ * caller should retry). This is used to verify the host-side socat bridge
+ * actually bound the requested TCP port, rather than merely existing as a
+ * process.
+ */
+function probeTcpListening(port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = net.connect({ host: '127.0.0.1', port })
+    const done = (result: boolean): void => {
+      socket.removeAllListeners()
+      socket.destroy()
+      resolve(result)
+    }
+    socket.setTimeout(timeoutMs)
+    socket.once('connect', () => done(true))
+    socket.once('timeout', () => done(false))
+    socket.once('error', () => done(false))
+  })
+}
+
+/**
  * Initialize host-side reverse port-forward bridges for Linux sandbox networking.
  *
  * ARCHITECTURE NOTE:
@@ -1438,6 +1463,16 @@ export async function initializeLinuxPortForwardBridges(
       stdio: 'ignore',
     })
 
+    // Tracks real process exit (as opposed to ChildProcess#killed, which is
+    // only true when *we* called process.kill() on it — it stays false when
+    // socat exits on its own, e.g. because the requested TCP port is already
+    // in use and it gets EADDRINUSE). The readiness loop below reads this
+    // flag instead of `.killed` so a dead-on-arrival bridge is detected.
+    let bridgeExited = false
+    let bridgeExitInfo:
+      | { code: number | null; signal: NodeJS.Signals | null }
+      | undefined
+
     // Add error and exit handlers to monitor bridge health. These must be
     // registered before the !pid check: when spawn fails (e.g. socat is
     // missing or not executable), the ChildProcess emits an asynchronous
@@ -1451,6 +1486,8 @@ export async function initializeLinuxPortForwardBridges(
       )
     })
     bridgeProcess.on('exit', (code, signal) => {
+      bridgeExited = true
+      bridgeExitInfo = { code, signal }
       logForDebugging(
         `Port-forward bridge process exited (port ${port}) with code ${code}, signal ${signal}`,
         { level: code === 0 ? 'info' : 'error' },
@@ -1471,30 +1508,59 @@ export async function initializeLinuxPortForwardBridges(
 
     bridges.push({ port, socketPath, bridgeProcess })
 
-    // Wait for the socket to be ready
+    // Wait for the bridge to actually be listening on the host TCP port.
+    //
+    // Unlike initializeLinuxNetworkBridge above (where the host side is the
+    // UNIX-LISTEN/socket-creating side, so fs.existsSync genuinely proves
+    // that socat has bound its socket), this bridge's socketPath is an
+    // empty placeholder file created unconditionally *before* socat even
+    // starts (see the PRE-EXISTING BUG FIX comment above), purely so bwrap's
+    // --bind precondition can pass later. Its existence says nothing about
+    // whether socat has bound 127.0.0.1:<port>. Instead, probe the actual
+    // TCP port: a successful connect proves socat is listening and
+    // accepting, regardless of what happens to the UNIX-CONNECT side after.
     const maxAttempts = 5
     let ready = false
     for (let i = 0; i < maxAttempts; i++) {
-      if (!bridgeProcess.pid || bridgeProcess.killed) {
+      if (!bridgeProcess.pid || bridgeExited) {
         cleanupAll()
         throw new Error(
-          `Port-forward bridge process died unexpectedly (port ${port})`,
+          `Port-forward bridge process for port ${port} exited unexpectedly ` +
+            `(code=${bridgeExitInfo?.code}, signal=${bridgeExitInfo?.signal}) before becoming ready`,
         )
       }
 
+      let probedListening = false
       try {
-        if (fs.existsSync(socketPath)) {
-          logForDebugging(
-            `Port-forward bridge for port ${port} ready after ${i + 1} attempts`,
-          )
-          ready = true
-          break
-        }
+        probedListening = await probeTcpListening(port, 250)
       } catch (err) {
         logForDebugging(
-          `Error checking port-forward socket for port ${port} (attempt ${i + 1}): ${err}`,
+          `Error probing port-forward bridge for port ${port} (attempt ${i + 1}): ${err}`,
           { level: 'error' },
         )
+      }
+
+      if (probedListening) {
+        // A successful connect proves *some* process is listening on the
+        // port, but socat's own bind failure (e.g. EADDRINUSE because
+        // another process already held the port) can race with this
+        // check: the connect may succeed against that other process before
+        // socat's near-instant exit event has fired. Give the exit event a
+        // brief grace period and re-check bridgeExited before trusting the
+        // probe.
+        await new Promise(resolve => setTimeout(resolve, 50))
+        if (bridgeExited) {
+          cleanupAll()
+          throw new Error(
+            `Port-forward bridge process for port ${port} exited unexpectedly ` +
+              `(code=${bridgeExitInfo?.code}, signal=${bridgeExitInfo?.signal}) before becoming ready`,
+          )
+        }
+        logForDebugging(
+          `Port-forward bridge for port ${port} ready after ${i + 1} attempts`,
+        )
+        ready = true
+        break
       }
 
       if (i === maxAttempts - 1) {
@@ -1507,7 +1573,10 @@ export async function initializeLinuxPortForwardBridges(
     if (!ready) {
       cleanupAll()
       throw new Error(
-        `Failed to create port-forward bridge socket for port ${port} after ${maxAttempts} attempts`,
+        `Failed to create port-forward bridge socket for port ${port} after ${maxAttempts} attempts` +
+          (bridgeExited
+            ? ` (bridge process exited: code=${bridgeExitInfo?.code}, signal=${bridgeExitInfo?.signal})`
+            : ''),
       )
     }
   }
