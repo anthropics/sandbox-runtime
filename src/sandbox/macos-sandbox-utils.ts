@@ -1,6 +1,7 @@
 import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
 import * as path from 'path'
+import * as fs from 'fs'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
@@ -95,37 +96,68 @@ export interface MacOSSandboxParams {
  */
 export function macGetMandatoryDenyEntries(
   allowGitConfig = false,
+  scanRoots: string[] = [process.cwd()],
 ): PathEntry[] {
-  const cwd = normalizePathForSandbox(process.cwd(), { literal: true })
+  const deduplicatedRoots = [
+    ...new Set(
+      scanRoots.map(r => normalizePathForSandbox(r, { literal: true })),
+    ),
+  ].filter(r => {
+    try {
+      return fs.existsSync(r) && fs.statSync(r).isDirectory()
+    } catch {
+      return false
+    }
+  })
+  if (deduplicatedRoots.length === 0) {
+    deduplicatedRoots.push(
+      normalizePathForSandbox(process.cwd(), { literal: true }),
+    )
+  }
+
   const entries: PathEntry[] = []
-  const literal = (relativePath: string): PathEntry =>
-    toLiteralPathEntry(path.resolve(cwd, relativePath))
-  const beneathCwd = (pattern: string): PathEntry =>
-    anchoredGlobEntry(cwd, pattern)
 
-  // Dangerous files - static paths in CWD + glob patterns for subtree
-  for (const fileName of DANGEROUS_FILES) {
-    entries.push(literal(fileName))
-    entries.push(beneathCwd(`**/${fileName}`))
-  }
+  for (const root of deduplicatedRoots) {
+    const literal = (relativePath: string): PathEntry =>
+      toLiteralPathEntry(path.resolve(root, relativePath))
+    const beneathRoot = (pattern: string): PathEntry =>
+      anchoredGlobEntry(root, pattern)
 
-  // Dangerous directories
-  for (const dirName of getDangerousDirectories()) {
-    entries.push(literal(dirName))
-    entries.push(beneathCwd(`**/${dirName}/**`))
-  }
+    // Dangerous files - static paths in root + glob patterns for subtree
+    for (const fileName of DANGEROUS_FILES) {
+      entries.push(literal(fileName))
+      entries.push(beneathRoot(`**/${fileName}`))
+    }
 
-  // Git hooks are always blocked for security
-  entries.push(literal('.git/hooks'))
-  entries.push(beneathCwd('**/.git/hooks/**'))
+    // Dangerous directories
+    for (const dirName of getDangerousDirectories()) {
+      entries.push(literal(dirName))
+      entries.push(beneathRoot(`**/${dirName}/**`))
+    }
 
-  // Git config - conditionally blocked based on allowGitConfig setting
-  if (!allowGitConfig) {
-    entries.push(literal('.git/config'))
-    entries.push(beneathCwd('**/.git/config'))
+    // Git hooks are always blocked for security
+    entries.push(literal('.git/hooks'))
+    entries.push(beneathRoot('**/.git/hooks'))
+    entries.push(beneathRoot('**/.git/hooks/**'))
+
+    // Git config - conditionally blocked based on allowGitConfig setting
+    if (!allowGitConfig) {
+      entries.push(literal('.git/config'))
+      entries.push(beneathRoot('**/.git/config'))
+    }
   }
 
   return entries
+}
+
+/**
+ * Backward-compatible helper returning string patterns for mandatory denies.
+ */
+export function macGetMandatoryDenyPatterns(
+  allowGitConfig = false,
+  scanRoots: string[] = [process.cwd()],
+): string[] {
+  return macGetMandatoryDenyEntries(allowGitConfig, scanRoots).map(e => e.path)
 }
 
 export interface SandboxViolationEvent {
@@ -884,12 +916,23 @@ function generateWriteRules(
   }
   rules.push(...renderRule('allow', ['file-write*'], allowFilters, logTag))
 
-  // Combine user-specified and mandatory deny patterns (no ripgrep needed on
-  // macOS). The caller's spellings are patterns when they read as patterns;
-  // the mandatory entries carry their own literal/glob split.
+  // Combine user-specified and mandatory deny patterns across all allowed write roots
+  const normalizedAllowRoots = (config.allowOnly || []).map(p =>
+    normalizePathForSandbox(p, { literal: true }),
+  )
+  const scanRoots = [
+    normalizePathForSandbox(process.cwd(), { literal: true }),
+    ...normalizedAllowRoots.filter(p => {
+      try {
+        return fs.existsSync(p) && fs.statSync(p).isDirectory()
+      } catch {
+        return false
+      }
+    }),
+  ]
   const denyEntries = [
     ...(config.denyWithinAllow || []).map(toPathEntry),
-    ...macGetMandatoryDenyEntries(allowGitConfig),
+    ...macGetMandatoryDenyEntries(allowGitConfig, scanRoots),
   ]
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)
