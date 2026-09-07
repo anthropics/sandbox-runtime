@@ -306,6 +306,21 @@ describe('detectSigv4 classification', () => {
     })
   })
 
+  test('presigned: a SigV4A signature in the query is still presigned', () => {
+    // A presigned SigV4A URL spells X-Amz-Algorithm AWS4-ECDSA-P256-SHA256
+    // and adds X-Amz-Region-Set. Its signature is in the URL, so it is the
+    // presigned shape — the same one the header-SigV4A case is not.
+    const target =
+      '/key?X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256' +
+      `&X-Amz-Credential=${encodeURIComponent(`${AKID}/20150830/s3/aws4_request`)}` +
+      '&X-Amz-Date=20150830T123600Z&X-Amz-Expires=3600' +
+      '&X-Amz-Region-Set=%2A&X-Amz-SignedHeaders=host&X-Amz-Signature=ff00'
+    expect(detectSigv4({}, target)).toEqual({
+      kind: 'presigned',
+      accessKeyId: AKID,
+    })
+  })
+
   test('sigv4a: AWS4-ECDSA-P256-SHA256 Authorization', () => {
     const auth =
       `AWS4-ECDSA-P256-SHA256 Credential=${AKID}/20150830/s3/aws4_request, ` +
@@ -321,6 +336,14 @@ describe('detectSigv4 classification', () => {
     expect(detectSigv4({}, '/')).toBeNull()
     // Query mentions X-Amz-Signature but not the SigV4 algorithm.
     expect(detectSigv4({}, '/?X-Amz-Signature=ff00')).toBeNull()
+    // An X-Amz-Algorithm the proxy does not know is not a SigV4 signature.
+    expect(
+      detectSigv4(
+        {},
+        '/key?X-Amz-Algorithm=AWS1-HMAC-SHA1&X-Amz-Signature=ff00' +
+          `&X-Amz-Credential=${encodeURIComponent(`${AKID}/20150830/us-east-1/s3/aws4_request`)}`,
+      ),
+    ).toBeNull()
   })
 
   test('a non-AWS Authorization header does not hide a presigned query', () => {
