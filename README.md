@@ -666,7 +666,8 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 **Always-blocked files:**
 
-- Shell config files: `.bashrc`, `.bash_profile`, `.zshrc`, `.zprofile`, `.profile`
+- Shell config files: `.bashrc`, `.bash_profile`, `.bash_login`, `.bash_logout`,
+  `.zshrc`, `.zprofile`, `.profile`
 - Git config files: `.gitconfig`, `.gitmodules`
 - Other sensitive files: `.ripgreprc`, `.mcp.json`
 
