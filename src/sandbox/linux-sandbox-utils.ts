@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
-import { ripGrep } from '../utils/ripgrep.js'
+import { ripGrep, RipgrepError } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   generateProxyEnvVars,
@@ -20,9 +20,12 @@ import {
   isAtOrUnder,
   isStrictlyUnder,
   getDangerousDirectories,
+} from './sandbox-utils.js'
+import {
   gitDirDenyPaths,
   gitFileDenyPaths,
-} from './sandbox-utils.js'
+  submoduleGitDirs,
+} from './mandatory-deny-paths.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
@@ -272,42 +275,6 @@ function findFirstNonExistentComponent(targetPath: string): string {
 }
 
 /**
- * Git directories of the submodules kept under `modulesDir` (a repository's
- * `.git/modules`), nested submodules included: a directory there holding a
- * HEAD file is one, and its own `modules/` may hold more. A submodule's
- * name is its path, so a git directory can sit several levels down
- * (`modules/vendor/lib/HEAD`); the walk stops `maxDepth` levels in.
- */
-function submoduleGitDirs(modulesDir: string, maxDepth: number): string[] {
-  const found: string[] = []
-  const pending: Array<{ dir: string; depth: number }> = [
-    { dir: modulesDir, depth: 0 },
-  ]
-  while (pending.length > 0) {
-    const { dir, depth } = pending.pop()!
-    let entries: fs.Dirent[]
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true })
-    } catch {
-      continue
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue
-      const child = path.join(dir, entry.name)
-      if (fs.existsSync(path.join(child, 'HEAD'))) {
-        found.push(child)
-        if (depth + 1 < maxDepth) {
-          pending.push({ dir: path.join(child, 'modules'), depth: depth + 1 })
-        }
-      } else if (depth + 1 < maxDepth) {
-        pending.push({ dir: child, depth: depth + 1 })
-      }
-    }
-  }
-  return found
-}
-
-/**
  * Get mandatory deny paths using ripgrep (Linux only).
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
  * With --max-depth limiting, this is fast enough to run on each command without memoization.
@@ -332,30 +299,34 @@ async function linuxGetMandatoryDenyPaths(
     ...dangerousDirectories.map(d => path.resolve(cwd, d)),
   ]
 
-  // cwd's own repository. A .git DIRECTORY gets its hooks/ and config
-  // denied, plus those of every submodule git directory it keeps under
-  // .git/modules (the hooks a `git commit` inside the submodule runs). A .git
-  // FILE (linked worktree, submodule checkout) is denied itself along with
-  // the hooks/config git consults through it (gitFileDenyPaths); .git/hooks
-  // beneath a file can never exist and denying it would make bwrap fail. When .git
-  // doesn't exist at all nothing is denied: a mount at .git would block its
-  // creation and break git init.
+  // A repository's hooks/ and config, and those of the submodule git
+  // directories under its .git/modules (what a commit inside the submodule
+  // runs). Called for cwd's .git and for each nested one the scan finds.
+  const seenGitDirs = new Set<string>()
+  const denyGitDir = (gitDir: string): void => {
+    if (seenGitDirs.has(gitDir)) return
+    seenGitDirs.add(gitDir)
+    const moduleGitDirs = submoduleGitDirs(
+      path.join(gitDir, 'modules'),
+      maxDepth,
+    )
+    for (const dir of [gitDir, ...moduleGitDirs]) {
+      denyPaths.push(...gitDirDenyPaths(dir, allowGitConfig))
+    }
+  }
+
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
   try {
     dotGitStat = fs.statSync(dotGitPath)
   } catch {
-    // .git doesn't exist
+    // No .git: nothing is denied, since a mount at .git would block `git init`.
   }
   if (dotGitStat?.isDirectory()) {
-    denyPaths.push(...gitDirDenyPaths(dotGitPath, allowGitConfig))
-    for (const moduleGitDir of submoduleGitDirs(
-      path.join(dotGitPath, 'modules'),
-      maxDepth,
-    )) {
-      denyPaths.push(...gitDirDenyPaths(moduleGitDir, allowGitConfig))
-    }
+    denyGitDir(dotGitPath)
   } else if (dotGitStat?.isFile()) {
+    // A pointer file (linked worktree, submodule checkout) has no hooks/
+    // beneath it, and binding a path under a file makes bwrap fail.
     denyPaths.push(...gitFileDenyPaths(dotGitPath, allowGitConfig))
   }
 
@@ -368,7 +339,7 @@ async function linuxGetMandatoryDenyPaths(
     iglobArgs.push('--iglob', `**/${dirName}/**`)
   }
   // A nested repository is recognised by any file directly inside its .git
-  // directory — HEAD is always there — so its hooks/ and config are denied
+  // directory (HEAD is always there), so its hooks/ and config are denied
   // at the depth the repository itself is found, not one level further down
   // where the hook files sit (with the default depth, a repository directly
   // under cwd has .git/config within reach but .git/hooks/* beyond it).
@@ -387,16 +358,16 @@ async function linuxGetMandatoryDenyPaths(
 
   // Single ripgrep call to find all dangerous paths in subdirectories
   // Limit depth for performance - deeply nested dangerous files are rare
-  // and the security benefit doesn't justify the traversal cost.
-  // --no-ignore: .gitignore, .ignore and .rgignore are writable inside the
-  // sandbox, so honouring them would let one command hide a nested
-  // repository from the next command's scan.
+  // and the security benefit doesn't justify the traversal cost
   let matches: string[] = []
   try {
     matches = await ripGrep(
       [
         '--files',
         '--hidden',
+        // .gitignore, .ignore and .rgignore are writable inside the sandbox:
+        // honouring them would let one command hide a nested repository
+        // from the next command's scan.
         '--no-ignore',
         '--max-depth',
         String(maxDepth),
@@ -409,46 +380,53 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
-    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
+    // An unreadable directory makes rg exit non-zero after listing the rest
+    // of the tree; those matches still count.
+    if (error instanceof RipgrepError) {
+      matches = error.partialMatches
+    }
+    logForDebugging(
+      `[Sandbox] ripgrep scan failed, kept ${matches.length} partial matches; mandatory denies below cwd may be incomplete: ${error}`,
+      { level: 'warn' },
+    )
   }
 
-  // Each match is cwd-relative. One inside a dangerous directory (whose name
-  // may span segments: .claude/commands) denies the directory, so files
-  // created in it later are covered too. One inside a nested .git directory
-  // marks a repository: deny that directory's hooks/ and config. One that IS
-  // a file named .git is a worktree/submodule pointer. Anything else is a
-  // dangerous file denied by itself. Segments are compared on the relative
-  // path, so a dangerous name in cwd's own location never counts.
   const dirPatterns = dangerousDirectories.map(d =>
     normalizeCaseForComparison(d).split('/'),
   )
-  const runAt = (segments: string[], parts: string[]): number =>
-    segments.findIndex((_, i) =>
-      parts.every((part, j) => segments[i + j] === part),
-    )
   for (const match of matches) {
-    const relative = match.split('/')
+    // rg prefixes each match with its target, cwd. Segments are compared
+    // relative to it, so a dangerous name in cwd's own location never counts.
+    const absolute = path.resolve(cwd, match)
+    const relative = path.relative(cwd, absolute).split(path.sep)
+    if (relative[0] === '..') {
+      denyPaths.push(absolute)
+      continue
+    }
     const lowered = relative.map(normalizeCaseForComparison)
     const absoluteOf = (n: number): string =>
-      path.resolve(cwd, relative.slice(0, n).join('/'))
+      path.join(cwd, ...relative.slice(0, n))
+    // Where `parts` first occurs as consecutive segments: a dangerous
+    // directory's name can span two (.claude/commands).
+    const runAt = (parts: string[]): number =>
+      lowered.findIndex((_, i) =>
+        parts.every((part, j) => lowered[i + j] === part),
+      )
 
-    const dirParts = dirPatterns.find(parts => runAt(lowered, parts) !== -1)
+    const dirParts = dirPatterns.find(parts => runAt(parts) !== -1)
     if (dirParts) {
-      denyPaths.push(absoluteOf(runAt(lowered, dirParts) + dirParts.length))
+      // The directory, not the file, so files created in it later are covered.
+      denyPaths.push(absoluteOf(runAt(dirParts) + dirParts.length))
       continue
     }
     const gitAt = lowered.indexOf('.git')
-    if (gitAt !== -1 && gitAt < relative.length - 1) {
-      denyPaths.push(...gitDirDenyPaths(absoluteOf(gitAt + 1), allowGitConfig))
-      continue
+    if (gitAt === -1) {
+      denyPaths.push(absolute)
+    } else if (gitAt < relative.length - 1) {
+      denyGitDir(absoluteOf(gitAt + 1))
+    } else {
+      denyPaths.push(...gitFileDenyPaths(absolute, allowGitConfig))
     }
-    if (gitAt === relative.length - 1) {
-      denyPaths.push(
-        ...gitFileDenyPaths(absoluteOf(relative.length), allowGitConfig),
-      )
-      continue
-    }
-    denyPaths.push(absoluteOf(relative.length))
   }
 
   return [...new Set(denyPaths)]

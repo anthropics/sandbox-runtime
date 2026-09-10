@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'bun:test'
-import { writeFileSync, mkdtempSync, rmSync } from 'fs'
+import { chmodSync, mkdirSync, writeFileSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { ripGrep } from '../../src/utils/ripgrep.js'
+import { ripGrep, RipgrepError } from '../../src/utils/ripgrep.js'
 
 describe('ripGrep', () => {
   it('finds matches with default config', async () => {
@@ -79,4 +79,29 @@ describe('ripGrep', () => {
       ripGrep(['--invalid-flag-xyz'], '.', new AbortController().signal),
     ).rejects.toThrow(/ripgrep failed/)
   })
+
+  it.if(process.getuid?.() !== 0)(
+    'hands back what rg listed before an unreadable directory failed the run',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'rg-test-'))
+      mkdirSync(join(dir, 'locked'))
+      writeFileSync(join(dir, 'a.txt'), 'hello')
+      chmodSync(join(dir, 'locked'), 0o000)
+      try {
+        const error = await ripGrep(
+          ['--files'],
+          dir,
+          new AbortController().signal,
+        ).catch((e: unknown) => e)
+
+        expect(error).toBeInstanceOf(RipgrepError)
+        expect((error as RipgrepError).partialMatches).toEqual([
+          join(dir, 'a.txt'),
+        ])
+      } finally {
+        chmodSync(join(dir, 'locked'), 0o755)
+        rmSync(dir, { recursive: true })
+      }
+    },
+  )
 })

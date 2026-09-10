@@ -14,9 +14,9 @@ import {
   containsGlobChars,
   globToRegex,
   DANGEROUS_FILES,
-  gitFileDenyPaths,
   getDangerousDirectories,
 } from './sandbox-utils.js'
+import { gitFileDenyPaths } from './mandatory-deny-paths.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 import type {
@@ -94,11 +94,11 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
     denyPaths.push(`**/${dirName}/**`)
   }
 
-  // Git hooks are always blocked for security — in cwd's repository, in
-  // nested repositories, and in the submodule git directories a repository
-  // keeps under .git/modules (the hooks a commit inside the submodule runs)
+  // Git hooks are always blocked for security
   denyPaths.push(path.resolve(cwd, '.git/hooks'))
   denyPaths.push('**/.git/hooks/**')
+  // A submodule's git directory (.git/modules/<name>/) is not matched by the
+  // pattern above; its hooks are what a commit inside the submodule runs.
   denyPaths.push('**/.git/modules/**/hooks/**')
 
   // Git config - conditionally blocked based on allowGitConfig setting
@@ -108,10 +108,9 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
     denyPaths.push('**/.git/modules/**/config')
   }
 
-  // cwd checked out as a linked worktree or submodule: .git is a file
-  // pointing at the real git directory. The file is denied, and so are the
-  // hooks/config git consults through it (nested .git files are covered by
-  // gitPointerFileDenyFilter, by vnode type).
+  // cwd checked out as a linked worktree or submodule: .git is a pointer
+  // file. Nested pointer files are matched by vnode type instead
+  // (gitPointerFileFilters), which cannot follow them.
   const dotGit = path.resolve(cwd, '.git')
   try {
     if (fs.statSync(dotGit).isFile()) {
@@ -125,16 +124,12 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
 }
 
 /**
- * SBPL filter for a regular file named `.git` anywhere under `cwd`: a linked
- * worktree's or submodule checkout's `gitdir:` pointer, which repointed at a
- * directory the command prepared is as good as writing that directory's
- * config. Matched by vnode type so an ordinary repository's .git DIRECTORY
- * stays writable. The write rules re-allow file-write-create for it: only
- * an existing pointer is protected, and `git worktree add` / `git submodule
- * update --init` can still lay down new ones.
+ * SBPL filters that together match a regular file named `.git` anywhere
+ * under `cwd`, a `gitdir:` pointer. Matched by vnode type so a repository's
+ * .git DIRECTORY stays writable.
  */
-export function gitPointerFileDenyFilter(cwd: string): string {
-  return `(require-all (vnode-type REGULAR-FILE) (regex ${escapePath(globToRegex(path.join(cwd, '**', '.git')))}))`
+function gitPointerFileFilters(cwd: string): string {
+  return `(vnode-type REGULAR-FILE) (regex ${escapePath(globToRegex(path.join(cwd, '**', '.git')))})`
 }
 
 export interface SandboxViolationEvent {
@@ -826,21 +821,24 @@ function generateWriteRules(
   for (const normalizedPath of ungrouped) {
     denyFilters.add(denyPathFilter(normalizedPath))
   }
-  const gitPointerFilter = gitPointerFileDenyFilter(
-    normalizePathForSandbox('.'),
-  )
-  denyFilters.add(gitPointerFilter)
+  const gitPointer = gitPointerFileFilters(normalizePathForSandbox('.'))
+  denyFilters.add(`(require-all ${gitPointer})`)
   rules.push(...renderRule('deny', ['file-write*'], denyFilters, logTag))
-  // An existing .git pointer file cannot be rewritten, replaced or removed;
-  // creating one where none exists stays possible.
-  rules.push(
-    ...renderRule(
-      'allow',
-      ['file-write-create'],
-      new Set([gitPointerFilter]),
-      logTag,
-    ),
-  )
+  // An existing pointer cannot be rewritten, replaced or removed; `git
+  // worktree add` and `git submodule update --init` still create new ones,
+  // but only inside the write roots, since this allow follows the denies.
+  // User and mandatory denies are re-applied to creation by the rule below.
+  if (allowFilters.size > 0) {
+    const createPointer = `(require-all ${gitPointer} (require-any ${[...allowFilters].join(' ')}))`
+    rules.push(
+      ...renderRule(
+        'allow',
+        ['file-write-create'],
+        new Set([createPointer]),
+        logTag,
+      ),
+    )
+  }
 
   // Block file movement to prevent bypass via mv/rename. A grouped path
   // contributes its regex, the pin for its parent directory, and the

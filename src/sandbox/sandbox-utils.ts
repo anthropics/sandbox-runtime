@@ -40,60 +40,6 @@ export function getDangerousDirectories(): string[] {
 }
 
 /**
- * The paths inside a git directory through which a write becomes code the
- * host's git runs later: hooks/ always, config (core.fsmonitor, core.editor,
- * core.hooksPath, …) unless the caller allows it.
- */
-export function gitDirDenyPaths(
-  gitDir: string,
-  allowGitConfig: boolean,
-): string[] {
-  return allowGitConfig
-    ? [path.join(gitDir, 'hooks')]
-    : [path.join(gitDir, 'hooks'), path.join(gitDir, 'config')]
-}
-
-/**
- * Deny paths for a `.git` FILE — a linked worktree's or submodule checkout's
- * `gitdir:` pointer. The file itself is denied (repointing it at a directory
- * the command prepared is as good as writing that directory's config), and
- * so are the hooks/config git actually consults for it: those of the git
- * directory it names (a submodule's, under the superproject's .git/modules),
- * or, when that directory has a `commondir` (a linked worktree's), those of
- * the common directory — the main repository's .git — plus the worktree's
- * own config.worktree when one exists.
- */
-export function gitFileDenyPaths(
-  gitFile: string,
-  allowGitConfig: boolean,
-): string[] {
-  const denyPaths = [gitFile]
-  try {
-    const pointer = fs
-      .readFileSync(gitFile, 'utf8')
-      .match(/^gitdir:\s*(.+?)\s*$/m)
-    if (!pointer) return denyPaths
-    const gitDir = path.resolve(path.dirname(gitFile), pointer[1]!)
-    if (!fs.statSync(gitDir).isDirectory()) return denyPaths
-    let hooksAndConfigDir = gitDir
-    try {
-      const common = fs.readFileSync(path.join(gitDir, 'commondir'), 'utf8')
-      hooksAndConfigDir = path.resolve(gitDir, common.trim())
-      const worktreeConfig = path.join(gitDir, 'config.worktree')
-      if (!allowGitConfig && fs.existsSync(worktreeConfig)) {
-        denyPaths.push(worktreeConfig)
-      }
-    } catch {
-      // no commondir: a submodule (or standalone) git directory
-    }
-    denyPaths.push(...gitDirDenyPaths(hooksAndConfigDir, allowGitConfig))
-  } catch {
-    // Unreadable, or the pointer dangles: the file itself stays denied.
-  }
-  return denyPaths
-}
-
-/**
  * Normalizes a path for case-insensitive comparison.
  * This prevents bypassing security checks using mixed-case paths on case-insensitive
  * filesystems (macOS/Windows) like `.cLauDe/Settings.locaL.json`.

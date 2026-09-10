@@ -666,7 +666,7 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 - IDE directories: `.vscode/`, `.idea/`
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
-- Git hooks and config: `.git/hooks/`, `.git/config` — in the working directory's repository, in nested repositories, and in the submodule git directories a repository keeps under `.git/modules/`. A `.git` _file_ (a linked worktree's or submodule checkout's `gitdir:` pointer) is read-only itself, and the hooks and config it leads to (the main repository's, for a worktree) are blocked as well; creating a new one is still allowed.
+- Git hooks and config: `.git/hooks/`, `.git/config`, in the working directory's repository, in nested repositories, and in the submodule git directories they keep under `.git/modules/`. An existing `.git` _file_ (a linked worktree's or submodule checkout's `gitdir:` pointer) is read-only; creating a new one inside an allowed write path is still possible. The hooks and config a pointer leads to (the main repository's, for a worktree) are blocked as well; on macOS that holds for the working directory's own `.git` file only, since nested pointers are matched by pattern and not followed.
 
 These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 
@@ -680,7 +680,7 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 
 **Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach (a blocked _directory_, such as a repository's `.git/hooks/`, does cover files created in it later). macOS uses glob patterns which block both existing and new files. The Linux scan ignores `.gitignore` and similar ignore files, since the sandboxed command can write those.
 
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance (a path of at most three segments below the working directory, so a nested repository directly beneath it — `pkg/.git/HEAD` — is found and its hooks and config blocked). You can configure this with `mandatoryDenySearchDepth`:
+**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance, which reaches a nested repository directly beneath the working directory. You can configure this with `mandatoryDenySearchDepth`:
 
 ```json
 {

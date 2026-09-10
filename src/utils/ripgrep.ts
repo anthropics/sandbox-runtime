@@ -18,13 +18,27 @@ export function hasRipgrepSync(): boolean {
 }
 
 /**
+ * ripgrep exited with an error status. `partialMatches` is what it listed
+ * before that: rg reports an unreadable directory with exit code 2 after
+ * printing every match it could reach.
+ */
+export class RipgrepError extends Error {
+  readonly partialMatches: string[]
+
+  constructor(message: string, partialMatches: string[]) {
+    super(message)
+    this.partialMatches = partialMatches
+  }
+}
+
+/**
  * Execute ripgrep with the given arguments
  * @param args Command-line arguments to pass to rg
  * @param target Target directory or file to search
  * @param abortSignal AbortSignal to cancel the operation
  * @param config Ripgrep configuration (command and optional args)
  * @returns Array of matching lines (one per line of output)
- * @throws Error if ripgrep exits with non-zero status (except exit code 1 which means no matches)
+ * @throws RipgrepError if ripgrep exits with non-zero status (except exit code 1 which means no matches)
  */
 export async function ripGrep(
   args: string[],
@@ -50,12 +64,16 @@ export async function ripGrep(
     }),
   ])
 
+  const matches = stdout.trim().split('\n').filter(Boolean)
   if (code === 0) {
-    return stdout.trim().split('\n').filter(Boolean)
+    return matches
   }
   if (code === 1) {
     // Exit code 1 means "no matches found" - this is normal
     return []
   }
-  throw new Error(`ripgrep failed with exit code ${code}: ${stderr}`)
+  throw new RipgrepError(
+    `ripgrep failed with exit code ${code}: ${stderr}`,
+    matches,
+  )
 }

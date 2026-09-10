@@ -9,6 +9,7 @@ import {
 } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   mkdirSync,
   rmSync,
   writeFileSync,
@@ -131,6 +132,14 @@ describe.if(isSupportedPlatform)(
       )
       writeFileSync(join(TEST_DIR, 'nested', 'src', 'ok.txt'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.gitignore'), 'nested/\nlib/\n')
+      // The nested repository has a submodule of its own.
+      mkdirSync(join(TEST_DIR, 'nested', '.git', 'modules', 'dep', 'hooks'), {
+        recursive: true,
+      })
+      writeFileSync(
+        join(TEST_DIR, 'nested', '.git', 'modules', 'dep', 'HEAD'),
+        'ref: x',
+      )
       // A submodule: its git directory lives under cwd's .git/modules and its
       // checkout has a .git FILE pointing there.
       mkdirSync(join(TEST_DIR, '.git', 'modules', 'lib', 'hooks'), {
@@ -152,7 +161,7 @@ describe.if(isSupportedPlatform)(
       )
       // A linked worktree of this repository checked out inside it: its
       // .git file points at .git/worktrees/wt, whose commondir is the main
-      // .git — the hooks a commit in the worktree runs are the main ones.
+      // .git, so the hooks a commit in the worktree runs are the main ones.
       mkdirSync(join(TEST_DIR, '.git', 'worktrees', 'wt'), { recursive: true })
       writeFileSync(join(TEST_DIR, '.git', 'worktrees', 'wt', 'HEAD'), 'ref: x')
       writeFileSync(
@@ -171,6 +180,14 @@ describe.if(isSupportedPlatform)(
       })
       writeFileSync(
         join(TEST_DIR, 'pkg', '.claude', 'commands', 'x.md'),
+        ORIGINAL_CONTENT,
+      )
+      // A working directory whose own location has a dangerous name in it.
+      mkdirSync(join(TEST_DIR, '.vscode', 'ext', 'foo', 'sub'), {
+        recursive: true,
+      })
+      writeFileSync(
+        join(TEST_DIR, '.vscode', 'ext', 'foo', 'sub', '.gitconfig'),
         ORIGINAL_CONTENT,
       )
 
@@ -201,14 +218,18 @@ describe.if(isSupportedPlatform)(
     async function runSandboxedWrite(
       filePath: string,
       content: string,
-      opts: { mandatoryDenySearchDepth?: number; append?: boolean } = {},
+      opts: {
+        mandatoryDenySearchDepth?: number
+        allowGitConfig?: boolean
+        allowOnly?: string[]
+      } = {},
     ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
-      const command = `echo '${content}' ${opts.append ? '>>' : '>'} '${filePath}'`
+      const command = `echo '${content}' > '${filePath}'`
 
       // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
-        allowOnly: ['.'],
+        allowOnly: opts.allowOnly ?? ['.'],
         denyWithinAllow: [], // Empty - relying on mandatory denies
       }
 
@@ -219,6 +240,7 @@ describe.if(isSupportedPlatform)(
           needsNetworkRestriction: false,
           readConfig: undefined,
           writeConfig,
+          allowGitConfig: opts.allowGitConfig,
         })
       } else {
         wrappedCommand = await wrapCommandWithSandboxLinux({
@@ -227,6 +249,7 @@ describe.if(isSupportedPlatform)(
           readConfig: undefined,
           writeConfig,
           mandatoryDenySearchDepth: opts.mandatoryDenySearchDepth,
+          allowGitConfig: opts.allowGitConfig,
         })
       }
 
@@ -332,7 +355,7 @@ describe.if(isSupportedPlatform)(
     })
 
     describe('Nested repositories, submodules and worktree pointers', () => {
-      it("blocks writes to a nested repository's .git/config (gitignored or not)", async () => {
+      it("blocks writes to a nested repository's .git/config even when gitignored", async () => {
         const result = await runSandboxedWrite(
           'nested/.git/config',
           MODIFIED_CONTENT,
@@ -345,11 +368,24 @@ describe.if(isSupportedPlatform)(
       })
 
       it("blocks writes to a nested repository's existing hook at the default depth", async () => {
-        // The hook file itself lies one level past the default scan depth;
-        // the repository is recognised by nested/.git/HEAD.
         const result = await runSandboxedWrite(
           'nested/.git/hooks/pre-commit',
           MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('nested/.git/hooks/pre-commit', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+      })
+
+      it("blocks a nested repository's hooks when only its HEAD is within the scan depth", async () => {
+        // With allowGitConfig the scan does not look for .git/config, and the
+        // hook files lie one level past the default depth.
+        const result = await runSandboxedWrite(
+          'nested/.git/hooks/pre-commit',
+          MODIFIED_CONTENT,
+          { allowGitConfig: true },
         )
 
         expect(result.success).toBe(false)
@@ -380,22 +416,59 @@ describe.if(isSupportedPlatform)(
         )
       })
 
-      it("blocks writes to a submodule's config and hooks under .git/modules", async () => {
-        const config = await runSandboxedWrite(
+      it.if(isLinux && process.getuid?.() !== 0)(
+        'keeps what the scan found when a directory under cwd is unreadable',
+        async () => {
+          mkdirSync('unreadable', { mode: 0o000 })
+          try {
+            const result = await runSandboxedWrite(
+              'nested/.git/config',
+              MODIFIED_CONTENT,
+            )
+
+            expect(result.success).toBe(false)
+            expect(readFileSync('nested/.git/config', 'utf8')).toBe(
+              ORIGINAL_CONTENT,
+            )
+          } finally {
+            chmodSync('unreadable', 0o755)
+            rmSync('unreadable', { recursive: true, force: true })
+          }
+        },
+      )
+
+      it("blocks writes to a submodule's config under .git/modules", async () => {
+        const result = await runSandboxedWrite(
           '.git/modules/lib/config',
           MODIFIED_CONTENT,
         )
-        expect(config.success).toBe(false)
+
+        expect(result.success).toBe(false)
         expect(readFileSync('.git/modules/lib/config', 'utf8')).toBe(
           ORIGINAL_CONTENT,
         )
+      })
 
-        const hook = await runSandboxedWrite(
+      it("blocks creating a hook in a submodule's git directory", async () => {
+        const result = await runSandboxedWrite(
           '.git/modules/lib/hooks/post-checkout',
           MODIFIED_CONTENT,
         )
-        expect(hook.success).toBe(false)
+
+        expect(result.success).toBe(false)
         expect(existsSync('.git/modules/lib/hooks/post-checkout')).toBe(false)
+      })
+
+      it("blocks creating a hook in a nested repository's submodule", async () => {
+        const result = await runSandboxedWrite(
+          'nested/.git/modules/dep/hooks/post-checkout',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(existsSync('nested/.git/modules/dep/hooks/post-checkout')).toBe(
+          false,
+        )
       })
 
       it("blocks repointing a submodule checkout's .git file", async () => {
@@ -427,36 +500,77 @@ describe.if(isSupportedPlatform)(
         }
       })
 
-      it("from a linked worktree, blocks the main repository's hooks its commits would run", async () => {
-        // cwd is the worktree checkout; the main repository (TEST_DIR) is
-        // writable, so without following .git -> gitdir -> commondir its
-        // hooks/ would be too.
-        process.chdir(join(TEST_DIR, 'wt-checkout'))
-        const hook = join(TEST_DIR, '.git', 'hooks', 'pre-commit')
-        const command = `echo '${MODIFIED_CONTENT}' > '${hook}'`
-        const writeConfig = { allowOnly: [TEST_DIR], denyWithinAllow: [] }
-        const wrappedCommand =
-          getPlatform() === 'macos'
-            ? wrapCommandWithSandboxMacOS({
-                command,
-                needsNetworkRestriction: false,
-                readConfig: undefined,
-                writeConfig,
-              })
-            : await wrapCommandWithSandboxLinux({
-                command,
-                needsNetworkRestriction: false,
-                readConfig: undefined,
-                writeConfig,
-              })
-        const result = spawnSync(wrappedCommand, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 10000,
+      it('does not let a .git file be created outside the allowed write paths', async () => {
+        const opts = { allowOnly: [join(TEST_DIR, 'nested', 'src')] }
+        mkdirSync('unlisted', { recursive: true })
+        try {
+          const pointer = await runSandboxedWrite(
+            'unlisted/.git',
+            'gitdir: /tmp/elsewhere',
+            opts,
+          )
+          expect(pointer.success).toBe(false)
+          expect(existsSync('unlisted/.git')).toBe(false)
+
+          const control = await runSandboxedWrite(
+            'nested/src/ok.txt',
+            MODIFIED_CONTENT,
+            opts,
+          )
+          expect(control.success).toBe(true)
+        } finally {
+          rmSync('unlisted', { recursive: true, force: true })
+        }
+      })
+
+      describe('from a linked worktree checkout', () => {
+        const opts = { allowOnly: [TEST_DIR] }
+        beforeEach(() => {
+          process.chdir(join(TEST_DIR, 'wt-checkout'))
+        })
+        afterEach(() => {
+          rmSync(join(TEST_DIR, 'wt-checkout', 'notes.txt'), { force: true })
         })
 
-        expect(result.status).not.toBe(0)
-        expect(readFileSync(hook, 'utf8')).toBe(ORIGINAL_CONTENT)
+        it("blocks the main repository's hooks, which the worktree's commits run", async () => {
+          const hook = join(TEST_DIR, '.git', 'hooks', 'pre-commit')
+          const denied = await runSandboxedWrite(hook, MODIFIED_CONTENT, opts)
+          expect(denied.success).toBe(false)
+          expect(readFileSync(hook, 'utf8')).toBe(ORIGINAL_CONTENT)
+
+          const control = await runSandboxedWrite(
+            'notes.txt',
+            MODIFIED_CONTENT,
+            opts,
+          )
+          expect(control.success).toBe(true)
+        })
+
+        it("blocks repointing the checkout's own .git file", async () => {
+          const original = readFileSync('.git', 'utf8')
+          const result = await runSandboxedWrite(
+            '.git',
+            'gitdir: /tmp/elsewhere',
+            opts,
+          )
+
+          expect(result.success).toBe(false)
+          expect(readFileSync('.git', 'utf8')).toBe(original)
+        })
+      })
+
+      it("matches dangerous names below cwd only, not in cwd's own location", async () => {
+        process.chdir(join(TEST_DIR, '.vscode', 'ext', 'foo'))
+
+        const denied = await runSandboxedWrite(
+          'sub/.gitconfig',
+          MODIFIED_CONTENT,
+        )
+        expect(denied.success).toBe(false)
+        expect(readFileSync('sub/.gitconfig', 'utf8')).toBe(ORIGINAL_CONTENT)
+
+        const control = await runSandboxedWrite('sub/ok.txt', MODIFIED_CONTENT)
+        expect(control.success).toBe(true)
       })
 
       it('denies a nested .claude/commands as a directory once the scan reaches it', async () => {
@@ -1165,24 +1279,6 @@ describe.if(isSupportedPlatform)(
             expect(result.status).toBe(0)
             expect(result.stdout.trim()).toBe('hello')
             cleanupBwrapMountPoints()
-
-            // …and the pointer file itself is read-only: repointing it at a
-            // directory the command prepared would hand the host's git that
-            // directory's config and hooks.
-            const repoint = spawnSync(
-              await wrapCommandWithSandboxLinux({
-                command: 'echo "gitdir: /tmp/evil" > .git',
-                needsNetworkRestriction: false,
-                readConfig: undefined,
-                writeConfig,
-                enableWeakerNestedSandbox: true,
-              }),
-              { shell: true, encoding: 'utf8', timeout: 10000 },
-            )
-            expect(repoint.status).not.toBe(0)
-            expect(readFileSync(join(worktreeDir, '.git'), 'utf8')).toBe(
-              'gitdir: /tmp/fake-main-repo/.git/worktrees/my-branch',
-            )
 
             cleanupBwrapMountPoints()
           } finally {
