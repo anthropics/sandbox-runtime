@@ -51,6 +51,7 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <poll.h>
+#include <time.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -714,6 +715,33 @@ int main(int argc, char *argv[]) {
         uid_t uid = geteuid();
         gid_t gid = getegid();
 
+        /* unshare(CLONE_NEWUSER) implies CLONE_THREAD, and check_unshare_flags()
+         * rejects that with EINVAL while thread_group_empty() is false. A thread
+         * that has already exited stays in the thread group until release_task()
+         * runs, but its joiner is woken earlier, in mm_release() — so code that
+         * reaches this point right after joining a thread can land inside that
+         * window. The standalone apply-seccomp binary cannot: it spawns no
+         * threads, and execve() reaps the caller's threads before main() runs.
+         * The exposed configuration is seccomp.argv0 — a multicall runtime
+         * binary that runs this sequence in-process moments after its runtime
+         * parked a helper thread (an allocator scavenger, a GC worker).
+         *
+         * The retry must sleep, not sched_yield(): a freshly futex-woken
+         * joiner sits several milliseconds behind the exiting thread in
+         * vruntime, and on a single-CPU host CFS ignores yields until that
+         * lead is burned (measured: ~6500 yields before the first success,
+         * versus one attempt after a 1us sleep). Bounded so a permanent
+         * EINVAL (a kernel built without CONFIG_USER_NS) still dies, at
+         * worst 5ms later. This runs before the dumpable flip below so the
+         * sleeps never extend the window in which we are ptrace-able. */
+        for (int attempt = 0; unshare(CLONE_NEWUSER) < 0; attempt++) {
+            if (errno != EINVAL || attempt >= 50) {
+                die("apply-seccomp: unshare(CLONE_NEWUSER)");
+            }
+            struct timespec backoff = { .tv_nsec = 100000 };  /* 100us */
+            nanosleep(&backoff, NULL);
+        }
+
         /* If this binary was exec'd without read permission (e.g. installed
          * mode 0111), the kernel marked the process non-dumpable, which
          * makes /proc/self/{setgroups,uid_map,gid_map} root-owned, so the
@@ -731,9 +759,6 @@ int main(int argc, char *argv[]) {
         int dumpable = prctl(PR_GET_DUMPABLE);
         (void)prctl(PR_SET_DUMPABLE, 1);
 
-        if (unshare(CLONE_NEWUSER) < 0) {
-            die("apply-seccomp: unshare(CLONE_NEWUSER)");
-        }
         if (write_file("/proc/self/setgroups", "deny") < 0) {
             die("apply-seccomp: write /proc/self/setgroups "
                 "(nested userns is capability-restricted; "
