@@ -12,6 +12,7 @@ import {
   decodeSandboxedCommand,
   containsGlobChars,
   globToRegex,
+  denyGlobRegex,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -135,20 +136,6 @@ function pathFilter(normalizedPath: string): string {
   return containsGlobChars(normalizedPath)
     ? `(regex ${escapePath(globToRegex(normalizedPath))})`
     : `(subpath ${escapePath(normalizedPath)})`
-}
-
-/**
- * Regex for a glob used in a DENY rule: {@link globToRegex} plus an optional
- * `/…` tail, so the deny covers everything beneath each match the way
- * `subpath` does for literals. Callers strip a trailing `/**` before the
- * pattern gets here (removeTrailingGlobSuffix), so `**\/secrets/**` arrives
- * as `**\/secrets` and, matched exactly, would deny only the directory
- * vnode while `secrets/key` stayed readable. This is what the Linux backend
- * already does (a deny masks the whole subtree). Only ever widens a deny.
- */
-function denyGlobRegex(normalizedGlob: string): string {
-  // globToRegex() always returns '^…$'.
-  return globToRegex(normalizedGlob).slice(0, -1) + '(/.*)?$'
 }
 
 /** {@link pathFilter} for deny rules: globs get {@link denyGlobRegex}. */

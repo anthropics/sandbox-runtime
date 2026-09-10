@@ -914,6 +914,20 @@ export function globToRegex(globPattern: string): string {
   )
 }
 
+/**
+ * Regex for a glob used in a DENY rule: {@link globToRegex} plus an optional
+ * `/…` tail, so the deny covers everything beneath each match the way
+ * `subpath` does for literals. Callers strip a trailing `/**` before the
+ * pattern gets here (removeTrailingGlobSuffix), so `**\/secrets/**` arrives
+ * as `**\/secrets` and, matched exactly, would deny only the directory
+ * vnode while `secrets/key` stayed readable. This is what the Linux backend
+ * already does (a deny masks the whole subtree). Only ever widens a deny.
+ */
+export function denyGlobRegex(normalizedGlob: string): string {
+  // globToRegex() always returns '^…$'.
+  return globToRegex(normalizedGlob).slice(0, -1) + '(/.*)?$'
+}
+
 export interface ExpandGlobOptions {
   /**
    * Match case-insensitively. Set this on Windows where the
