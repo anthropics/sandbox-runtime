@@ -288,10 +288,12 @@ async function linuxGetMandatoryDenyPaths(
 
   // Note: Settings files are added at the callsite in sandbox-manager.ts
   const denyPaths = [
-    // Dangerous files in CWD
-    ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
-    // Dangerous directories in CWD
-    ...dangerousDirectories.map(d => path.resolve(cwd, d)),
+    // Dangerous files in CWD - only protect if they actually exist on disk.
+    // Non-existent dangerous files should NOT have host mount points created for them,
+    // which would pollute the working directory with 0-byte ghost dotfiles.
+    ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)).filter(p => fs.existsSync(p)),
+    // Dangerous directories in CWD - only protect if they exist
+    ...dangerousDirectories.map(d => path.resolve(cwd, d)).filter(p => fs.existsSync(p)),
   ]
 
   // Git hooks and config are only denied when .git exists as a directory.
@@ -1469,12 +1471,11 @@ async function generateFilesystemArgs(
               `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
           } else {
-            denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
-            denyWriteRawDests.set(firstNonExistent, rawPath)
-            bwrapMountPoints.add(firstNonExistent)
-            registerExitCleanupHandler()
+            // Do not create empty files on the host for non-existent leaf deny paths.
+            // Creating host stub files for missing paths pollutes the repository with ghost
+            // dotfiles and causes race conditions with concurrent bwrap instances.
             logForDebugging(
-              `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
+              `[Sandbox Linux] Skipping non-existent leaf deny path to avoid creating host ghost files: ${normalizedPath}`,
             )
           }
         } else if (ancestorIsWithinReadOnlyDeny) {
