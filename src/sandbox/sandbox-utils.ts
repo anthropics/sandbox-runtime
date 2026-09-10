@@ -1,6 +1,7 @@
 import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
+import { fileURLToPath } from 'node:url'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
 
@@ -93,6 +94,10 @@ function containsGlobCharsForPlatform(p: string): boolean {
   return getPlatform() === 'windows'
     ? containsGlobCharsWin(p)
     : containsGlobChars(p)
+}
+
+function shellDoubleQuote(value: string): string {
+  return `"${value.replace(/[\\"$`]/g, character => `\\${character}`)}"`
 }
 
 /**
@@ -595,11 +600,23 @@ export function generateProxyEnvVars(
     const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
     if (platform === 'macos') {
-      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
-      // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
-      // handshake — use git-over-https (HTTP_PROXY carries the credential).
+      // macOS BSD nc supports SOCKS5 but not username/password auth. Use the
+      // bundled client when the proxy requires auth; retain nc for the legacy
+      // unauthenticated case.
+      const proxyCommand = proxyAuthToken
+        ? `${shellDoubleQuote(process.execPath)} ${shellDoubleQuote(
+            path.join(
+              path.dirname(fileURLToPath(import.meta.url)),
+              fileURLToPath(import.meta.url).endsWith('.ts')
+                ? 'socks5-proxy-command.ts'
+                : 'socks5-proxy-command.js',
+            ),
+          )} ${socksProxyPort} ${shellDoubleQuote(userRaw)} ${shellDoubleQuote(
+            proxyAuthToken,
+          )} "%h" "%p"`
+        : `nc -X 5 -x localhost:${socksProxyPort} %h %p`
       envVars.push(
-        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='${proxyCommand}'`,
       )
     } else if (platform === 'linux' && httpProxyPort) {
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
