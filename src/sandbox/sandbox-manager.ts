@@ -1778,17 +1778,23 @@ async function wrapWithSandbox(
 
 /**
  * Wrap `command` for the sandbox and return a spawn descriptor:
- * `{ argv, env }`, suitable for
+ * `{ argv, env, stdinPayload? }`, suitable for
  * `spawn(argv[0], argv.slice(1), {shell: false, env})`.
  *
  * On Windows this is the ONLY supported wrap method (see
  * {@link wrapWithSandbox}); `env` is the broker process's spawn env
  * — the sandboxed child gets a fresh `srt-sandbox` profile env with
  * only the `--env` overlay baked into `argv` (see
- * {@link wrapCommandWithSandboxWindows}). On
+ * {@link wrapCommandWithSandboxWindows}). When `stdinPayload` is set
+ * (network config with proxy auth), the caller MUST spawn with
+ * stdin piped and write the payload immediately — it carries the
+ * proxy env entries embedding the per-session auth token, which
+ * must never appear on a command line (same-user siblings can
+ * enumerate those freely). On
  * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
- * (proxy env is baked into that command) and `env` is the unchanged
- * `process.env`, so callers can spawn uniformly across platforms.
+ * (proxy env is baked into that command), `env` is the unchanged
+ * `process.env`, and `stdinPayload` is never set, so callers can
+ * spawn uniformly across platforms.
  *
  * @param cwd the working directory the caller will spawn the result
  *   with. On Windows the child's cwd is whatever the caller passes
@@ -1804,7 +1810,11 @@ async function wrapWithSandboxArgv(
   abortSignal?: AbortSignal,
   cwd?: string,
   options?: WrapWithSandboxOptions,
-): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
+): Promise<{
+  argv: string[]
+  env: NodeJS.ProcessEnv
+  stdinPayload?: Buffer
+}> {
   const platform = getPlatform()
 
   if (platform === 'windows') {
@@ -1870,10 +1880,12 @@ async function wrapWithSandboxArgv(
         )
       }
     }
-    // Per-exec deny rides on argv (`acl stamp` reads stdin, but
-    // exec's stdin belongs to the child). The CreateProcessW
-    // length check lives in `wrapCommandWithSandboxWindows`
-    // where the full argv (incl. shell + user command) is known.
+    // Per-exec deny rides on argv (`acl stamp` reads stdin;
+    // exec's own stdin is reserved for the `--env-stdin` secret
+    // frame and is never forwarded to the sandboxed child). The
+    // CreateProcessW length check lives in
+    // `wrapCommandWithSandboxWindows` where the full argv (incl.
+    // shell + user command) is known.
     //
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
@@ -2363,7 +2375,11 @@ export interface ISandboxManager {
     abortSignal?: AbortSignal,
     cwd?: string,
     options?: WrapWithSandboxOptions,
-  ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
+  ): Promise<{
+    argv: string[]
+    env: NodeJS.ProcessEnv
+    stdinPayload?: Buffer
+  }>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]

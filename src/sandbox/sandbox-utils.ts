@@ -471,14 +471,29 @@ export const CA_TRUST_VARS = [
   'NIX_SSL_CERT_FILE',
 ] as const
 
-export function generateProxyEnvVars(
+/**
+ * Proxy/CA env list plus secret tags: `env` is the `KEY=VALUE` list
+ * (same content {@link generateProxyEnvVars} returns), `secretKeys`
+ * names the entries whose VALUE embeds `proxyAuthToken`. This is the
+ * single source of "which entries are secret" — spawn layers use the
+ * tags to keep those entries off command lines and to scrub
+ * same-named vars from ambient process envs (e.g. Windows routes
+ * them over `srt-win exec --env-stdin` instead of argv). Empty when
+ * no token is configured.
+ */
+export interface ProxyEnvEntries {
+  env: string[]
+  secretKeys: string[]
+}
+
+export function generateProxyEnvEntries(
   httpProxyPort?: number,
   socksProxyPort?: number,
   caCertPath?: string,
   proxyAuthToken?: string,
   skipTmpdir?: boolean,
   encodedCommand?: string,
-): string[] {
+): ProxyEnvEntries {
   // When the proxy requires auth, embed the credential in the URL so clients
   // send Proxy-Authorization automatically. Only the sandbox child sees this
   // env, so the token never reaches host processes.
@@ -493,6 +508,17 @@ export function generateProxyEnvVars(
     userRaw === PROXY_AUTH_USER ? userRaw : encodeURIComponent(userRaw)
   const auth = proxyAuthToken ? `${userPct}:${proxyAuthToken}@` : ''
   const envVars: string[] = [`SANDBOX_RUNTIME=1`]
+  const secretKeys: string[] = []
+  // Push an entry whose value interpolates `auth` / the raw token.
+  // Every site that embeds the credential MUST go through this
+  // helper — the tag recorded here is what downstream spawn layers
+  // trust to keep the token off command lines. When no token is
+  // configured the value carries no credential and nothing is
+  // tagged.
+  const pushTokenBearing = (key: string, value: string): void => {
+    envVars.push(`${key}=${value}`)
+    if (proxyAuthToken) secretKeys.push(key)
+  }
   // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
   // allows (getDefaultWritePaths). When filesystem policy is disabled
   // (writeConfig === undefined → skipTmpdir), the host TMPDIR is already
@@ -518,7 +544,7 @@ export function generateProxyEnvVars(
 
   // If no proxy ports provided, return minimal env vars
   if (!httpProxyPort && !socksProxyPort) {
-    return envVars
+    return { env: envVars, secretKeys }
   }
 
   // Always set NO_PROXY to exclude localhost and private networks from
@@ -540,11 +566,11 @@ export function generateProxyEnvVars(
   envVars.push(`no_proxy=${noProxyAddresses}`)
 
   if (httpProxyPort) {
-    envVars.push(`HTTP_PROXY=http://${auth}localhost:${httpProxyPort}`)
-    envVars.push(`HTTPS_PROXY=http://${auth}localhost:${httpProxyPort}`)
+    pushTokenBearing('HTTP_PROXY', `http://${auth}localhost:${httpProxyPort}`)
+    pushTokenBearing('HTTPS_PROXY', `http://${auth}localhost:${httpProxyPort}`)
     // Lowercase versions for compatibility with some tools
-    envVars.push(`http_proxy=http://${auth}localhost:${httpProxyPort}`)
-    envVars.push(`https_proxy=http://${auth}localhost:${httpProxyPort}`)
+    pushTokenBearing('http_proxy', `http://${auth}localhost:${httpProxyPort}`)
+    pushTokenBearing('https_proxy', `http://${auth}localhost:${httpProxyPort}`)
     if (proxyAuthToken) {
       // Pre-send Basic so git never gets a 407 and never invokes a
       // credential helper for the proxy URL (Windows GCM intercepts the
@@ -568,8 +594,8 @@ export function generateProxyEnvVars(
   // ALL_PROXY is a socks5h:// URL and crash with ImportError in envs that
   // lack the package — before any bytes hit the wire, so the mux's
   // protocol sniffing can't help.
-  envVars.push(`ALL_PROXY=${connectProxyUrl}`)
-  envVars.push(`all_proxy=${connectProxyUrl}`)
+  pushTokenBearing('ALL_PROXY', connectProxyUrl)
+  pushTokenBearing('all_proxy', connectProxyUrl)
 
   // gRPC-based tools. gRPC C-core (every google-cloud-* Python client, and
   // grpc-js) only understands HTTP CONNECT proxies. Given a socks5h:// URL it
@@ -579,8 +605,8 @@ export function generateProxyEnvVars(
   // servers" instead of falling back to https_proxy. Not gated on
   // socksProxyPort: the value no longer depends on it, and a gRPC client in
   // an HTTP-only sandbox needs this var just as much.
-  envVars.push(`GRPC_PROXY=${connectProxyUrl}`)
-  envVars.push(`grpc_proxy=${connectProxyUrl}`)
+  pushTokenBearing('GRPC_PROXY', connectProxyUrl)
+  pushTokenBearing('grpc_proxy', connectProxyUrl)
 
   if (socksProxyPort) {
     // Configure Git to use SSH through the proxy so DNS resolution happens outside the sandbox.
@@ -608,8 +634,9 @@ export function generateProxyEnvVars(
       const socatAuth = proxyAuthToken
         ? `,proxyauth=${userRaw}:${proxyAuthToken}`
         : ''
-      envVars.push(
-        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
+      pushTokenBearing(
+        'GIT_SSH_COMMAND',
+        `ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
       )
     }
 
@@ -619,8 +646,14 @@ export function generateProxyEnvVars(
     // `GET ftp://host/path HTTP/1.1` to the proxy — which the mux does not
     // implement, and an env var can't ask curl for --proxytunnel. socks5h is
     // transparent at the TCP layer, so it is the value that works here.
-    envVars.push(`FTP_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
-    envVars.push(`ftp_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
+    pushTokenBearing(
+      'FTP_PROXY',
+      `socks5h://${auth}localhost:${socksProxyPort}`,
+    )
+    pushTokenBearing(
+      'ftp_proxy',
+      `socks5h://${auth}localhost:${socksProxyPort}`,
+    )
 
     // rsync proxy support — RSYNC_PROXY is host:port only, no userinfo. With
     // proxy auth on, rsync via this var fails at the CONNECT (407); use SSH
@@ -632,11 +665,13 @@ export function generateProxyEnvVars(
 
     // Docker CLI uses HTTP for the API
     // This makes Docker use the HTTP proxy for registry operations
-    envVars.push(
-      `DOCKER_HTTP_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
+    pushTokenBearing(
+      'DOCKER_HTTP_PROXY',
+      `http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
     )
-    envVars.push(
-      `DOCKER_HTTPS_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
+    pushTokenBearing(
+      'DOCKER_HTTPS_PROXY',
+      `http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
     )
 
     // Kubernetes kubectl - uses standard HTTPS_PROXY
@@ -656,7 +691,8 @@ export function generateProxyEnvVars(
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
       if (proxyAuthToken) {
         envVars.push(`CLOUDSDK_PROXY_USERNAME=${userRaw}`)
-        envVars.push(`CLOUDSDK_PROXY_PASSWORD=${proxyAuthToken}`)
+        // The bare token, not a URL — still a token-bearing value.
+        pushTokenBearing('CLOUDSDK_PROXY_PASSWORD', proxyAuthToken)
       }
     }
 
@@ -673,7 +709,30 @@ export function generateProxyEnvVars(
   // most HTTP clients reject socks*:// in those vars. ALL_PROXY (above)
   // already carries the route for clients that read it.
 
-  return envVars
+  return { env: envVars, secretKeys }
+}
+
+/**
+ * Flat `KEY=VALUE` view of {@link generateProxyEnvEntries} for
+ * callers that don't need the secret tags (macOS/Linux wrap the
+ * whole set into the sandboxed child's spawn surface either way).
+ */
+export function generateProxyEnvVars(
+  httpProxyPort?: number,
+  socksProxyPort?: number,
+  caCertPath?: string,
+  proxyAuthToken?: string,
+  skipTmpdir?: boolean,
+  encodedCommand?: string,
+): string[] {
+  return generateProxyEnvEntries(
+    httpProxyPort,
+    socksProxyPort,
+    caCertPath,
+    proxyAuthToken,
+    skipTmpdir,
+    encodedCommand,
+  ).env
 }
 
 /**

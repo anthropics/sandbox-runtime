@@ -79,6 +79,10 @@ export {
   isUncPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   SRT_WIN_DISPATCH_ARG1,
+  spawnWrappedCommandWindows,
+  writeStdinPayload,
+  encodeEnvStdinFrame,
+  ENV_STDIN_FRAME_CAP,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
   WindowsSandboxErrorCode,
