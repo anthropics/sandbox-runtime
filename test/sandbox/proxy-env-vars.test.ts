@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test'
-import { createServer } from 'node:http'
+import { createServer, request } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import {
@@ -9,7 +9,7 @@ import {
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
-import { isLinux } from '../helpers/platform.js'
+import { isLinux, isMacOS } from '../helpers/platform.js'
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
@@ -29,6 +29,42 @@ describe('generateProxyEnvVars', () => {
 
     expect(env.some(v => v.startsWith('CLOUDSDK_PROXY_'))).toBe(false)
   })
+
+  it.if(isMacOS)(
+    'can add an IPv6 listener without changing the proxy URL',
+    async () => {
+      try {
+        await SandboxManager.initialize({
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+            httpProxyDualStack: true,
+          },
+          filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        })
+        const port = SandboxManager.getProxyPort()
+        const wrapped = await SandboxManager.wrapWithSandbox('true')
+        expect(wrapped).toContain('@localhost:')
+
+        const status = await new Promise<number | undefined>(
+          (resolve, reject) => {
+            const req = request(
+              { host: '::1', port, path: 'http://example.invalid/' },
+              response => {
+                response.resume()
+                resolve(response.statusCode)
+              },
+            )
+            req.once('error', reject)
+            req.end()
+          },
+        )
+        expect(status).toBe(407)
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+  )
 
   describe('GRPC_PROXY', () => {
     const grpcNames = ['GRPC_PROXY', 'grpc_proxy']

@@ -45,8 +45,10 @@ export interface MuxProxyOptions {
 }
 
 export interface MuxProxyServer {
-  /** The front-end TCP listener. Call `.listen()` on this. */
+  /** The IPv4 front-end TCP listener. Call `.listen()` on this. */
   server: Server
+  /** Optional IPv6 HTTP front end. */
+  ipv6Server: Server
   /** Bound front-end port, once listening. */
   getPort(): number | undefined
   /**
@@ -60,7 +62,7 @@ export interface MuxProxyServer {
   listenHttpBackend(): Promise<number | undefined>
   /** Tear down front-end, backend, and all open client sockets. */
   close(): Promise<void>
-  /** unref() both listeners so they don't keep the event loop alive. */
+  /** Prevent listeners from keeping the event loop alive. */
   unref(): void
 }
 
@@ -137,12 +139,16 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     upstream.pipe(client)
   }
 
-  const server = createServer(client => {
+  function trackClient(client: Socket): void {
     openSockets.add(client)
     client.once('close', () => openSockets.delete(client))
     client.on('error', err =>
       logForDebugging(`mux: client socket error: ${err.message}`),
     )
+  }
+
+  const server = createServer(client => {
+    trackClient(client)
 
     const timer = setTimeout(() => {
       logForDebugging('mux: first-byte timeout; destroying connection')
@@ -168,8 +174,14 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     })
   })
 
+  const ipv6Server = createServer(client => {
+    trackClient(client)
+    dispatchHttp(client)
+  })
+
   return {
     server,
+    ipv6Server,
     getPort(): number | undefined {
       const addr = server.address()
       return addr && typeof addr === 'object' ? addr.port : undefined
@@ -212,7 +224,14 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     async close(): Promise<void> {
       for (const s of openSockets) s.destroy()
       openSockets.clear()
-      await new Promise<void>(resolve => server.close(() => resolve()))
+      await Promise.all(
+        [server, ipv6Server]
+          .filter(listener => listener.listening)
+          .map(
+            listener =>
+              new Promise<void>(resolve => listener.close(() => resolve())),
+          ),
+      )
       // The mux owns httpServer's listen lifecycle, so it owns close too.
       // sandbox-manager.reset() additionally calls forceCloseHttpServer()
       // for closeAllConnections() semantics; double-close is a no-op.
@@ -225,6 +244,7 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     },
     unref(): void {
       server.unref()
+      if (ipv6Server.listening) ipv6Server.unref()
       opts.httpServer.unref()
     },
   }
