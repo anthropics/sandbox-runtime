@@ -1301,10 +1301,8 @@ async function generateFilesystemArgs(
     // a directory or for the ancestor standing in for an entry that cannot
     // be inspected) — as named and as resolved, which is where the tmpfs
     // goes. The named form over-predicts, which only keeps a stub. A
-    // read-denied tmpfs at or under a covering deny dir is the TRIGGER for the
-    // post-denyWrite writable re-application, and a deny bind whose dest sits
-    // under one can be dropped by the emission filter — both facts feed the
-    // guard.
+    // read-denied tmpfs containing a covering deny dir drops that dir's own
+    // bind at emission, which is what the guard needs it for.
     let stubSkipVetoInputs:
       | {
           allowedWritePathsBothForms: string[]
@@ -1411,8 +1409,8 @@ async function generateFilesystemArgs(
     // gate as the --ro-bind emission, and it records every raw spelling each
     // directory is reached through. A recorded directory is EVIDENCE for
     // skipping a stub only if it also passes the guard's vetoes below (no
-    // allowed write path strictly beneath it; incomparable with every
-    // read-deny tmpfs in any spelling), which exclude every way its subtree
+    // allowed write path strictly beneath it; contained by no read-deny
+    // tmpfs in any spelling), which exclude every way its subtree
     // could be writable in the sandbox. Keep the two passes in lockstep: a
     // directory recorded here but never re-bound read-only AND not vetoed
     // would suppress stubs unsafely, while an emitted one missing from the
@@ -1460,26 +1458,33 @@ async function generateFilesystemArgs(
     // deny entry.
     // INVARIANT: a stub, or an existing deny path's own bind, is skipped
     // only under a recorded covering deny directory that has no allowed
-    // write path strictly beneath it and is INCOMPARABLE with every
-    // read-deny tmpfs directory (neither at-or-beneath it nor containing it
-    // or any spelling it was reached through). Containment is root-aware
-    // (isAtOrUnder): '/' is a recordable covering directory when allowOnly
-    // and denyWithinAllow both name it, and '/' + '/' is a prefix of
-    // nothing, so a string-prefix test would judge it safe for every path
+    // write path strictly beneath it and that no read-deny tmpfs directory
+    // contains (it, or any spelling it was reached through). Containment is
+    // root-aware (isAtOrUnder): '/' is a recordable covering directory when
+    // allowOnly and denyWithinAllow both name it, and '/' + '/' is a prefix
+    // of nothing, so a string-prefix test would judge it safe for every path
     // and drop the binds the re-application passes below key off.
     // Rationale: the only writable emissions that land after the
     // buffered read-only binds are the denyRead re-applications
     // (pushReadDenyDirMounts), which mount a tmpfs and re-bind allowed write
-    // paths beneath it WITHOUT re-emitting the binds it buries — so a
-    // comparable tmpfs is both the re-opening vector (beneath or around the
-    // dir) and the only way the dir's own --ro-bind gets dropped at emission
-    // as hidden-by-a-tmpfs. (The emission filter's other drop condition,
+    // paths beneath it WITHOUT re-emitting the binds it buries. A tmpfs
+    // beneath the dir is re-applied after the dir's bind, and what that makes
+    // writable again is exactly the allowed write paths beneath the tmpfs,
+    // hence beneath the dir: veto (i). The tmpfs itself needs no veto of its
+    // own: a path created inside it never reaches the host, so a deny path
+    // beneath it needs no stub, and one elsewhere under the dir is not
+    // affected by it. (Vetoing on it would abort every command of a
+    // write-denied checkout as soon as a denyRead pattern such as
+    // `**/build/**` matched a directory inside it.) A tmpfs containing the
+    // dir is the only way the dir's own --ro-bind gets dropped at emission as
+    // hidden-by-a-tmpfs, and can re-bind an allowed path around it: veto
+    // (ii). (The emission filter's other drop condition,
     // maskedFiles, holds file dests only — /dev/null read-deny masks and
     // credential-mask fakes — while the pre-pass stat-verifies every
     // recorded dir as a directory, so it cannot drop a recorded dir short of
     // a dir→file race, which ends in bwrap refusing to start, not a silent
     // gap.) Only existing read-deny directories become a tmpfs: absent and
-    // file-level read-denies count for nothing. If any condition could
+    // file-level read-denies count for nothing. If either condition could
     // apply, keep the stub — the pre-existing abort is preferable to a
     // silently creatable deny path. (An allow path bound before the
     // denyWrite binds is not a vector by itself: the later read-only re-bind
@@ -1496,16 +1501,12 @@ async function generateFilesystemArgs(
       } = getStubSkipVetoInputs()
       const unsafe =
         // (i) an allowed write path strictly beneath the dir: the
-        //     re-application's effect would re-bind it writable.
+        //     re-application of a read-deny tmpfs above it would re-bind it
+        //     writable.
         allowedWritePathsBothForms.some(writePath =>
           isStrictlyUnder(writePath, denyDir),
         ) ||
-        // (ii) a read-deny tmpfs at or beneath the dir: the re-application's
-        //     trigger.
-        prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
-          isAtOrUnder(tmpfsDir, denyDir),
-        ) ||
-        // (iii) a read-deny tmpfs CONTAINING the dir or any raw spelling it
+        // (ii) a read-deny tmpfs CONTAINING the dir or any raw spelling it
         //     was reached through: the dir's own --ro-bind can be dropped as
         //     hidden-by-the-tmpfs at emission, and a tmpfs above it can
         //     re-bind an allowed path around it — either way the directory
@@ -1713,7 +1714,7 @@ async function generateFilesystemArgs(
 
       if (isWithinAllowedPath) {
         // Already unwritable under a read-only denied directory (the
-        // existing-path twin of the stub skip above). Veto (iii) keeps the
+        // existing-path twin of the stub skip above). Veto (ii) keeps the
         // covering bind through the emission filter; a symlinked spelling
         // keeps its own bind because the re-application passes below key
         // off emitted raw spellings.

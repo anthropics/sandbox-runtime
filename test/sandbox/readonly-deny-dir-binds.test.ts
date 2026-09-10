@@ -156,14 +156,37 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind ${FILE} ${FILE}`)
   })
 
-  it('keeps the descendant bind when a denyRead tmpfs sits under the covering dir (veto)', async () => {
+  it('skips the descendant bind when only a denyRead tmpfs sits under the covering dir', async () => {
+    // The tmpfs is re-applied after PROJ's bind, and re-binds writable only
+    // the allowed write paths beneath it (the veto above): with none, all it
+    // adds under PROJ is a tmpfs whose contents never reach the host, and
+    // FILE stays under the read-only bind.
     const readDenied = join(PROJ, 'secrets')
     mkdirSync(readDenied)
 
-    const command = await wrap([PROJ, FILE], [readDenied])
+    const command = await wrap(
+      [PROJ, FILE],
+      [readDenied],
+      [AREA],
+      `sh -c 'echo x >> ${FILE}'`,
+    )
 
-    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
-    expect(command).toContain(`--ro-bind ${FILE} ${FILE}`)
+    const projBind = command.lastIndexOf(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(projBind).toBeGreaterThan(-1)
+    expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
+    expect(command.lastIndexOf(`--tmpfs ${readDenied}`)).toBeGreaterThan(
+      projBind,
+    )
+    if (BWRAP_CAN_NAMESPACE) {
+      const write = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: BASE,
+      })
+      expect(write.status).not.toBe(0)
+      expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
+    }
   })
 
   it('does not trust a recorded "/" as a covering directory', async () => {
@@ -230,7 +253,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
   it('vetoes "/" for an allowed write path beneath it even with no read policy', async () => {
     // Veto (i) alone must be root-aware: with readConfig undefined there is
-    // no read-deny tmpfs for veto (ii) to catch '/' with.
+    // no read-deny tmpfs for the other veto to fire on.
     const command = await wrapCommandWithSandboxLinux({
       command: 'echo hello',
       needsNetworkRestriction: false,

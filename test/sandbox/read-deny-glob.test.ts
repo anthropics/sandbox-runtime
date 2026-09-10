@@ -1070,6 +1070,58 @@ describe.if(isLinux)(
       }
     })
 
+    it('starts in a write-denied checkout with a denyRead pattern matching a directory inside it', async () => {
+      // denyWrite [proj, proj/.claude/settings.json (absent)] + denyRead
+      // proj/**/build/**: collapsed, the pattern is a tmpfs beneath the
+      // write-denied directory. The absent deny path is uncreatable under
+      // proj's read-only bind either way, and a stub for it would have bwrap
+      // create a mount point inside that bind and abort.
+      const work = join(ROOT, 's14', 'work')
+      const proj = join(work, 'proj')
+      mkdirSync(join(proj, 'pkg', 'build'), { recursive: true })
+      writeFileSync(join(proj, 'pkg', 'build', '1.out'), 'OUT')
+      const cwd = process.cwd()
+      process.chdir(proj)
+      try {
+        const wrapped = await wrapCommandWithSandboxLinux({
+          command: `mkdir ${join(proj, '.claude')} || echo UNCREATABLE; cat ${join(proj, 'pkg', 'build', '1.out')} || echo HIDDEN`,
+          needsNetworkRestriction: false,
+          readConfig: {
+            denyOnly: expandReadDenyGlobLinux(join(proj, '**/build/**'), [
+              work,
+            ]),
+          },
+          writeConfig: {
+            allowOnly: [work],
+            denyWithinAllow: [proj, join(proj, '.claude', 'settings.json')],
+          },
+          mandatoryDenySearchDepth: 1,
+        })
+        const projBind = wrapped.lastIndexOf(`--ro-bind ${proj} ${proj}`)
+        expect(projBind).toBeGreaterThan(-1)
+        // No stub: nothing is mounted at or beneath proj/.claude.
+        expect(
+          wrapped
+            .slice(0, wrapped.indexOf(' --dev '))
+            .split(' --')
+            .filter(op => op.includes(` ${join(proj, '.claude')}`)),
+        ).toEqual([])
+        expect(
+          wrapped.lastIndexOf(`--tmpfs ${join(proj, 'pkg', 'build')}`),
+        ).toBeGreaterThan(projBind)
+        if (hasBwrap) {
+          const run = spawnSync(wrapped, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 15000,
+          })
+          expect(run.stdout).toBe('UNCREATABLE\nHIDDEN\n')
+        }
+      } finally {
+        process.chdir(cwd)
+      }
+    })
+
     it('still masks the target of a file symlink listed beneath a denied directory', async () => {
       // denyRead [cfg, cfg/token], cfg/token -> ../secrets/token: the link
       // vanishes with cfg's tmpfs, but the file it named is the target,
