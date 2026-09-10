@@ -1159,6 +1159,9 @@ export const SandboxRuntimeConfigSchema = z
         '`safe.directory` without adding them to `filesystem.allowWrite`.',
     ),
   })
+  // Reject unknown top-level keys so misspelled policy settings fail closed
+  // instead of being silently stripped by Zod.
+  .strict()
   .superRefine((cfg, ctx) => {
     const creds = cfg.credentials
     if (!creds) return

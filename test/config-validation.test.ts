@@ -19,6 +19,33 @@ describe('Config Validation', () => {
     expect(result.success).toBe(true)
   })
 
+  test('should reject unknown top-level config keys', () => {
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+      denyWriteTypo: ['/Users/me'],
+    })
+
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      expect(
+        result.error.issues.some(
+          issue =>
+            issue.code === 'unrecognized_keys' &&
+            issue.path.length === 0 &&
+            issue.keys.includes('denyWriteTypo'),
+        ),
+      ).toBe(true)
+    }
+  })
+
   test('should validate a config with valid domains', () => {
     const config = {
       network: {
