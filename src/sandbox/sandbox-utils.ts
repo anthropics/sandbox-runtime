@@ -931,9 +931,13 @@ export interface GlobWalk {
    *  absence). Whatever the pattern matches beneath them is missing from
    *  `matches`; a deny expansion must cover them whole. */
   unlisted: string[]
+  /** Where an entry of `matches`, `directoryMatches` or `unlisted` really
+   *  lives, for each one whose path passes through a symlink (above the walk,
+   *  on the way down, or the entry itself). A symlink that does not resolve
+   *  has no entry. */
+  realOf: Map<string, string>
   /** The directory listed (the pattern's static prefix) and its resolved
-   *  form, which differ when a symlink sits above the walk: every match then
-   *  has a second, resolved spelling. Unset when nothing was listed. */
+   *  form. Unset when nothing was listed. */
   base?: { dir: string; real: string }
 }
 
@@ -956,6 +960,37 @@ export function expandGlobPattern(
 }
 
 /**
+ * A test for whether `normalizedPattern` can match anything strictly beneath
+ * a directory, so the walk lists only directories that can hold a match
+ * (`proj/*.pem` lists `proj` alone). Segment by segment up to the first one
+ * that can span directories (`**`); from there on every directory qualifies.
+ * A pattern with no such segment matches at exactly its own depth. Errs
+ * towards descending: a bracket expression holding a `/` cannot be split
+ * into segments, so nothing is pruned for it.
+ */
+function globDescentFilter(
+  normalizedPattern: string,
+  flags: string,
+): (dir: string) => boolean {
+  if (/\[[^\]]*\/[^\]]*\]/.test(normalizedPattern)) return () => true
+  const segments = normalizedPattern.split('/')
+  const spanning = segments.findIndex(segment => segment.includes('**'))
+  const fixedDepth = spanning === -1 ? segments.length : spanning
+  const segmentRegexes = segments
+    .slice(0, fixedDepth)
+    .map(segment => new RegExp(globToRegex(segment), flags))
+  return dir => {
+    const dirSegments = dir.split('/')
+    if (spanning === -1 && dirSegments.length >= segments.length) return false
+    const compared = Math.min(dirSegments.length, fixedDepth)
+    for (let i = 0; i < compared; i++) {
+      if (!segmentRegexes[i]!.test(dirSegments[i]!)) return false
+    }
+    return true
+  }
+}
+
+/**
  * The walk behind {@link expandGlobPattern}: one listing of the pattern's
  * static prefix, filtered by `globPath` and, with `withDirectoryForm`, by
  * `globPath` without its trailing `/**`, with the symlinks seen recorded.
@@ -969,6 +1004,7 @@ export function walkGlobPattern(
     directoryMatches: [],
     symlinks: new Set(),
     unlisted: [],
+    realOf: new Map(),
   }
 
   // Normalize to `/` separators throughout so {@link globToRegex}
@@ -980,17 +1016,19 @@ export function walkGlobPattern(
     process.platform === 'win32' ? s.replace(/\\/g, '/') : s
   const normalizedPattern = toFwd(normalizePathForSandbox(globPath))
 
-  // Extract the static directory prefix before any glob characters
+  // Extract the static directory prefix before any glob characters, and the
+  // base directory from it. A wildcard in the first path component leaves
+  // the root as the only directory to start from.
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
-  if (!staticPrefix || staticPrefix === '/') {
+  const baseDir = !staticPrefix
+    ? ''
+    : staticPrefix.endsWith('/')
+      ? staticPrefix.slice(0, -1)
+      : path.dirname(staticPrefix)
+  if (baseDir === '' || baseDir === '/') {
     logForDebugging(`[Sandbox] Glob pattern too broad, skipping: ${globPath}`)
     return walk
   }
-
-  // Get the base directory from the static prefix
-  const baseDir = staticPrefix.endsWith('/')
-    ? staticPrefix.slice(0, -1)
-    : path.dirname(staticPrefix)
 
   if (!fs.existsSync(baseDir)) {
     logForDebugging(
@@ -999,21 +1037,25 @@ export function walkGlobPattern(
     return walk
   }
 
-  const flags = opts.caseInsensitive ? 'i' : ''
+  // `s`: a name may hold a line terminator, which `.` alone does not match.
+  const flags = opts.caseInsensitive ? 'is' : 's'
   const regex = new RegExp(globToRegex(normalizedPattern), flags)
   const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
   const directoryRegex =
     opts.withDirectoryForm && directoryForm !== normalizedPattern
       ? new RegExp(globToRegex(directoryForm), flags)
       : undefined
+  const canHoldMatch = globDescentFilter(normalizedPattern, flags)
 
   // One readdir per directory rather than readdirSync's `recursive` option,
   // so an unreadable subtree or a symlink cycle costs only itself, not the
   // whole pattern. Symlinked directories are descended: every spelling the
   // sandboxed command could read through is listed, so a target reached
-  // twice is listed twice. The one exception is a link whose target is at or
-  // above a directory on the current descent (the real directory each earlier
-  // link was taken from, and this one), which would never terminate.
+  // twice is listed twice (its listing and its links' targets are read
+  // once, keyed on where they really are). The one exception is a link
+  // whose target is at or above a directory on the current descent (the real
+  // directory each earlier link was taken from, and this one), which would
+  // never terminate.
   type Frame = {
     dir: string
     /** `dir` with every symlink resolved. */
@@ -1021,6 +1063,46 @@ export function walkGlobPattern(
     /** The real directory each symlink on the way here was taken from. */
     linkedFrom: readonly string[]
   }
+  type Listing = { entries: fs.Dirent[] } | { errorCode: string | undefined }
+  const listings = new Map<string, Listing>()
+  const listingOf = (frame: Frame): Listing => {
+    let listing = listings.get(frame.real)
+    if (listing === undefined) {
+      try {
+        listing = {
+          entries: fs.readdirSync(frame.dir, { withFileTypes: true }),
+        }
+      } catch (err) {
+        const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+        listing = { errorCode }
+        logForDebugging(
+          `[Sandbox] Error listing ${frame.dir} for glob pattern ${globPath}: ${err}`,
+          { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
+        )
+      }
+      listings.set(frame.real, listing)
+    }
+    return listing
+  }
+  /** Where a symlink leads and whether that is a directory; undefined for
+   *  one that dangles, vanished or cannot be traversed. */
+  type LinkTarget = { real: string; isDirectory: boolean } | undefined
+  const linkTargets = new Map<string, LinkTarget>()
+  const linkTargetOf = (linkPath: string, realLinkPath: string): LinkTarget => {
+    if (linkTargets.has(realLinkPath)) return linkTargets.get(realLinkPath)
+    let target: LinkTarget
+    try {
+      target = {
+        isDirectory: fs.statSync(linkPath).isDirectory(),
+        real: fs.realpathSync(linkPath),
+      }
+    } catch {
+      // Dangling, vanished or not traversable: nothing to descend into.
+    }
+    linkTargets.set(realLinkPath, target)
+    return target
+  }
+
   let baseReal = baseDir
   try {
     baseReal = fs.realpathSync(baseDir)
@@ -1031,36 +1113,37 @@ export function walkGlobPattern(
   const pending: Frame[] = [{ dir: baseDir, real: baseReal, linkedFrom: [] }]
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real, linkedFrom } = frame
-    let entries: fs.Dirent[]
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true })
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException | undefined)?.code
-      if (code !== 'ENOENT') walk.unlisted.push(dir)
-      logForDebugging(
-        `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
-        { level: code === 'ENOENT' ? 'info' : 'warn' },
-      )
+    const listing = listingOf(frame)
+    if (!('entries' in listing)) {
+      if (listing.errorCode !== 'ENOENT') {
+        walk.unlisted.push(dir)
+        if (real !== dir) walk.realOf.set(dir, real)
+      }
       continue
     }
-    for (const entry of entries) {
+    for (const entry of listing.entries) {
       const fullPath = path.join(dir, entry.name)
+      const realPath = path.join(real, entry.name)
       const candidate = toFwd(fullPath)
-      if (regex.test(candidate)) {
-        walk.matches.push(fullPath)
-      }
+      const isMatch = regex.test(candidate)
+      if (isMatch) walk.matches.push(fullPath)
       if (entry.isDirectory()) {
-        if (directoryRegex?.test(candidate)) {
-          walk.directoryMatches.push(fullPath)
+        const isDirectoryMatch = directoryRegex?.test(candidate) === true
+        if (isDirectoryMatch) walk.directoryMatches.push(fullPath)
+        if ((isMatch || isDirectoryMatch) && realPath !== fullPath) {
+          walk.realOf.set(fullPath, realPath)
         }
-        pending.push({
-          dir: fullPath,
-          real: path.join(real, entry.name),
-          linkedFrom,
-        })
+        if (canHoldMatch(candidate)) {
+          pending.push({ dir: fullPath, real: realPath, linkedFrom })
+        }
         continue
       }
-      if (!entry.isSymbolicLink()) continue
+      if (!entry.isSymbolicLink()) {
+        if (isMatch && realPath !== fullPath) {
+          walk.realOf.set(fullPath, realPath)
+        }
+        continue
+      }
       walk.symlinks.add(fullPath)
       if (process.platform === 'win32') {
         // The Windows ACL expansion does not follow reparse points
@@ -1068,30 +1151,30 @@ export function walkGlobPattern(
         // POSIX-separated paths.
         continue
       }
-      let target: string | undefined
-      try {
-        if (fs.statSync(fullPath).isDirectory()) {
-          target = fs.realpathSync(fullPath)
-        }
-      } catch {
-        // Dangling, vanished or not traversable: nothing to descend into.
-      }
+      const isDirectoryFormCandidate = directoryRegex?.test(candidate) === true
+      const descends = canHoldMatch(candidate)
+      if (!isMatch && !isDirectoryFormCandidate && !descends) continue
+      const target = linkTargetOf(fullPath, realPath)
       if (target === undefined) continue
-      if (directoryRegex?.test(candidate)) {
+      if (isMatch) walk.realOf.set(fullPath, target.real)
+      if (!target.isDirectory) continue
+      if (isDirectoryFormCandidate) {
         walk.directoryMatches.push(fullPath)
+        walk.realOf.set(fullPath, target.real)
       }
+      if (!descends) continue
       const cycle = [...linkedFrom, real].some(from =>
-        isAtOrUnder(from, target),
+        isAtOrUnder(from, target.real),
       )
       if (cycle) {
         logForDebugging(
-          `[Sandbox] Not following symlink ${fullPath} -> ${target} for glob pattern ${globPath}: it leads back into its own ancestry`,
+          `[Sandbox] Not following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}: it leads back into its own ancestry`,
         )
         continue
       }
       pending.push({
         dir: fullPath,
-        real: target,
+        real: target.real,
         linkedFrom: [...linkedFrom, real],
       })
     }
