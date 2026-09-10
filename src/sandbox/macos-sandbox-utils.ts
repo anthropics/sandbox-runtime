@@ -1,6 +1,7 @@
 import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
 import * as path from 'path'
+import { createInterface } from 'node:readline'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
@@ -1405,11 +1406,32 @@ export function startMacOSSandboxLogMonitor(
     '--predicate',
     `(eventMessage ENDSWITH "${sessionSuffix}")`,
     '--style',
-    'compact',
+    'ndjson',
   ])
 
-  logProcess.stdout?.on('data', (data: Buffer) => {
-    const lines = data.toString().split('\n')
+  let stopped = false
+  const lineReader = logProcess.stdout
+    ? createInterface({ input: logProcess.stdout, crlfDelay: Infinity })
+    : undefined
+
+  lineReader?.on('line', line => {
+    if (stopped || !line.trim()) return
+
+    let record: unknown
+    try {
+      record = JSON.parse(line)
+    } catch {
+      return
+    }
+    if (
+      typeof record !== 'object' ||
+      record === null ||
+      !('eventMessage' in record) ||
+      typeof record.eventMessage !== 'string'
+    ) {
+      return
+    }
+    const lines = record.eventMessage.split('\n')
 
     // Get violation and command lines
     const violationLine = lines.find(
@@ -1478,6 +1500,9 @@ export function startMacOSSandboxLogMonitor(
   })
 
   return () => {
+    if (stopped) return
+    stopped = true
+    lineReader?.close()
     logForDebugging('[Sandbox Monitor] Stopping log monitor')
     logProcess.kill('SIGTERM')
   }
