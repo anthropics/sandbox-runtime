@@ -431,6 +431,162 @@ function getAncestorDirectories(pathStr: string): string[] {
 }
 
 /**
+ * sandbox-exec rejects a string literal longer than 1025 bytes ("Error
+ * reading string"); the regexes built below stay well under that, since
+ * one oversized string invalidates the whole profile.
+ */
+const SBPL_STRING_MAX_BYTES = 900
+
+/**
+ * Below this many names, one regex is not shorter than the literal filters
+ * it would replace.
+ */
+const MIN_DENY_GROUP_SIZE = 4
+
+/** Escape a literal path component for use inside a regex. */
+function escapeRegexLiteral(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Literal deny paths of the shape `<dir>/<name>/<leaf>` that share `dir` and
+ * the same set of leaves, e.g. git's per-worktree registry
+ * `<gitdir>/worktrees/<name>/{commondir,config.worktree}` for every
+ * registered worktree.
+ */
+interface LiteralDenyGroup {
+  dir: string
+  names: string[]
+  leaves: string[]
+}
+
+/**
+ * Fold literal deny paths into {@link LiteralDenyGroup}s. Each group renders
+ * as one anchored regex per chunk of names instead of one `subpath` filter
+ * per path, so a directory with many same-shaped children costs bytes and
+ * profile compile time proportional to the names, not to the repeated
+ * absolute prefix (sandbox-exec compiles a few thousand path filters in
+ * seconds; a few dozen regexes in milliseconds). Globs, paths that do not
+ * fit a group of at least {@link MIN_DENY_GROUP_SIZE} names, and names too
+ * long for one regex are returned in `rest` unchanged.
+ */
+function groupLiteralDenyPaths(normalizedPaths: readonly string[]): {
+  groups: LiteralDenyGroup[]
+  rest: string[]
+} {
+  const byDir = new Map<string, Map<string, Set<string>>>()
+  for (const p of normalizedPaths) {
+    if (containsGlobChars(p)) continue
+    const parent = path.dirname(p)
+    const dir = path.dirname(parent)
+    if (dir === parent || parent === p || dir === '/') continue
+    let names = byDir.get(dir)
+    if (!names) {
+      names = new Map()
+      byDir.set(dir, names)
+    }
+    const name = path.basename(parent)
+    let leaves = names.get(name)
+    if (!leaves) {
+      leaves = new Set()
+      names.set(name, leaves)
+    }
+    leaves.add(path.basename(p))
+  }
+  const grouped = new Set<string>()
+  const groups: LiteralDenyGroup[] = []
+  for (const [dir, names] of byDir) {
+    const bySignature = new Map<string, LiteralDenyGroup>()
+    for (const [name, leafSet] of names) {
+      const leaves = [...leafSet].sort()
+      const signature = leaves.join('\0')
+      let group = bySignature.get(signature)
+      if (!group) {
+        group = { dir, names: [], leaves }
+        bySignature.set(signature, group)
+      }
+      group.names.push(name)
+    }
+    for (const group of bySignature.values()) {
+      const fixedLength =
+        regexLength(groupRegexPrefix(group)) + regexLength(groupDenyTail(group))
+      group.names = group.names.filter(
+        name =>
+          fixedLength + regexLength(escapeRegexLiteral(name)) <=
+          SBPL_STRING_MAX_BYTES,
+      )
+      if (group.names.length < MIN_DENY_GROUP_SIZE) continue
+      groups.push(group)
+      for (const name of group.names) {
+        for (const leaf of group.leaves) {
+          grouped.add(path.join(dir, name, leaf))
+        }
+      }
+    }
+  }
+  return {
+    groups,
+    rest: normalizedPaths.filter(p => !grouped.has(p)),
+  }
+}
+
+/** Bytes a regex fragment occupies inside an SBPL string literal. */
+function regexLength(fragment: string): number {
+  return Buffer.byteLength(escapePath(fragment)) - 2
+}
+
+function groupRegexPrefix(group: LiteralDenyGroup): string {
+  return `^${escapeRegexLiteral(group.dir)}/(`
+}
+
+function groupDenyTail(group: LiteralDenyGroup): string {
+  return `)/(${group.leaves.map(escapeRegexLiteral).join('|')})(/.*)?$`
+}
+
+/**
+ * Regex filters for a {@link LiteralDenyGroup}, chunked so no regex exceeds
+ * {@link SBPL_STRING_MAX_BYTES}. `deny` matches each `<dir>/<name>/<leaf>`
+ * and everything beneath it (the `subpath` semantics of a literal deny);
+ * `pins` match each `<dir>/<name>` directory itself, the move-blocking
+ * literal a per-path deny would have added for its parent.
+ */
+function literalDenyGroupFilters(group: LiteralDenyGroup): {
+  deny: string[]
+  pins: string[]
+} {
+  const prefix = groupRegexPrefix(group)
+  const denyTail = groupDenyTail(group)
+  const pinTail = ')$'
+  const fixedLength = regexLength(prefix) + regexLength(denyTail)
+  const chunks: string[][] = []
+  let chunk: string[] = []
+  let chunkLength = 0
+  for (const name of group.names.map(escapeRegexLiteral)) {
+    const nameLength = regexLength(name) + (chunk.length === 0 ? 0 : 1)
+    if (
+      chunk.length > 0 &&
+      fixedLength + chunkLength + nameLength > SBPL_STRING_MAX_BYTES
+    ) {
+      chunks.push(chunk)
+      chunk = []
+      chunkLength = 0
+    }
+    chunk.push(name)
+    chunkLength += chunk.length === 1 ? regexLength(name) : nameLength
+  }
+  chunks.push(chunk)
+  const alternations = chunks.map(names => names.join('|'))
+  return {
+    deny: alternations.map(
+      names => `(regex ${escapePath(prefix + names + denyTail)})`,
+    ),
+    pins: alternations.map(
+      names => `(regex ${escapePath(prefix + names + pinTail)})`,
+    ),
+  }
+}
+
+/**
  * Generate deny rules for file movement (file-write-unlink) and creation
  * (file-write-create) to protect paths. This prevents bypassing read or write
  * restrictions by moving files/directories, and prevents replacing a
@@ -449,11 +605,19 @@ function generateMoveBlockingRules(
   pathPatterns: string[],
   logTag: string,
 ): string[] {
+  return renderRule(
+    'deny',
+    ['file-write-unlink', 'file-write-create'],
+    moveBlockingFilters(pathPatterns.map(normalizePathForSandbox)),
+    logTag,
+  )
+}
+
+/** The filters {@link generateMoveBlockingRules} emits, for normalized paths. */
+function moveBlockingFilters(normalizedPaths: readonly string[]): Set<string> {
   const filters = new Set<string>()
 
-  for (const pathPattern of pathPatterns) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
-
+  for (const normalizedPath of normalizedPaths) {
     // Block moving/renaming the denied path itself (or files matching the
     // pattern, and anything beneath them)
     filters.add(denyPathFilter(normalizedPath))
@@ -475,12 +639,7 @@ function generateMoveBlockingRules(
     }
   }
 
-  return renderRule(
-    'deny',
-    ['file-write-unlink', 'file-write-create'],
-    filters,
-    logTag,
-  )
+  return filters
 }
 
 /**
@@ -623,14 +782,40 @@ function generateWriteRules(
     ...macGetMandatoryDenyPatterns(allowGitConfig),
   ]
 
+  const { groups, rest: ungrouped } = groupLiteralDenyPaths(
+    denyPaths.map(normalizePathForSandbox),
+  )
+  const groupFilters = groups.map(literalDenyGroupFilters)
+
   const denyFilters = new Set<string>()
-  for (const pathPattern of denyPaths) {
-    denyFilters.add(denyPathFilter(normalizePathForSandbox(pathPattern)))
+  for (const { deny } of groupFilters) {
+    for (const filter of deny) denyFilters.add(filter)
+  }
+  for (const normalizedPath of ungrouped) {
+    denyFilters.add(denyPathFilter(normalizedPath))
   }
   rules.push(...renderRule('deny', ['file-write*'], denyFilters, logTag))
 
-  // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(denyPaths, logTag))
+  // Block file movement to prevent bypass via mv/rename. A grouped path
+  // contributes its regex, the pin for its parent directory, and the
+  // literals for the group directory and its ancestors — the same set a
+  // per-path filter would add.
+  const moveFilters = moveBlockingFilters(ungrouped)
+  for (const [index, { deny, pins }] of groupFilters.entries()) {
+    for (const filter of [...deny, ...pins]) moveFilters.add(filter)
+    const { dir } = groups[index]
+    for (const ancestorDir of [dir, ...getAncestorDirectories(dir)]) {
+      moveFilters.add(`(literal ${escapePath(ancestorDir)})`)
+    }
+  }
+  rules.push(
+    ...renderRule(
+      'deny',
+      ['file-write-unlink', 'file-write-create'],
+      moveFilters,
+      logTag,
+    ),
+  )
 
   return rules
 }

@@ -1237,7 +1237,7 @@ describe.if(isLinux)(
 
 // ============================================================================
 // Git over SSH through proxy (GIT_SSH_COMMAND)
-// Regression test for https://github.com/anthropic-experimental/sandbox-runtime/issues/161
+// Regression test for https://github.com/anthropics/sandbox-runtime/issues/161
 // ============================================================================
 
 describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
@@ -1300,7 +1300,7 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     // GIT_SSH_COMMAND is already set by the sandbox; these options stack on top.
     const command = await SandboxManager.wrapWithSandbox(
       'GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i /dev/null" ' +
-        'git ls-remote ssh://git@github.com/anthropic-experimental/sandbox-runtime.git HEAD 2>&1',
+        'git ls-remote ssh://git@github.com/anthropics/sandbox-runtime.git HEAD 2>&1',
     )
 
     const result = await spawnAsync(command, {
@@ -1337,7 +1337,7 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
 
     const command = await SandboxManager.wrapWithSandbox(
       `GIT_SSH_COMMAND="$GIT_SSH_COMMAND -F ${sshConfigPath} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i /dev/null" ` +
-        'git ls-remote ssh://git@github.com/anthropic-experimental/sandbox-runtime.git HEAD 2>&1',
+        'git ls-remote ssh://git@github.com/anthropics/sandbox-runtime.git HEAD 2>&1',
     )
 
     const result = await spawnAsync(command, {

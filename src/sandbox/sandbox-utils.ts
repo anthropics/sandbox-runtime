@@ -60,6 +60,11 @@ export function isAtOrUnder(p: string, dir: string): boolean {
   return p === dir || p.startsWith(dir === '/' ? '/' : dir + '/')
 }
 
+/** `p` lies strictly beneath `dir` (isAtOrUnder, excluding `dir` itself). */
+export function isStrictlyUnder(p: string, dir: string): boolean {
+  return p !== dir && isAtOrUnder(p, dir)
+}
+
 /**
  * Check if a path pattern contains glob characters
  */
