@@ -16,11 +16,12 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 
-// A pin is left out, without aborting the wrap, when a component of its path
-// is missing or cannot be lstat'ed. EACCES is injected through an fs spy (a
-// root container sees no real one). Nothing here executes bwrap.
+// What is emitted for paths that are missing or cannot be inspected: a missing
+// directory gets no pin, and one that exists but cannot be stat'ed is
+// protected anyway. EACCES is injected through an fs spy (a root container
+// sees no real one). Nothing here executes bwrap.
 describe.if(isLinux)(
-  'Linux sandbox — ancestor pins that cannot be made',
+  'Linux sandbox — pins and read denies on paths that cannot be inspected',
   () => {
     const created: string[] = []
     const spies: Array<{ mockRestore: () => void }> = []
@@ -57,43 +58,66 @@ describe.if(isLinux)(
       })
     }
 
-    /** Make lstatSync(target) throw EACCES; returns how often it was hit. */
-    function failLstatOn(target: string): () => number {
-      const realLstat = fs.lstatSync
+    /** Make statSync(p) throw EACCES where matches(p); returns the hit count. */
+    function failStatWhere(matches: (p: string) => boolean): () => number {
+      const realStat = fs.statSync
       let hits = 0
       spies.push(
-        spyOn(fs, 'lstatSync').mockImplementation(((
+        spyOn(fs, 'statSync').mockImplementation(((
           p: fs.PathLike,
           ...rest: unknown[]
         ) => {
-          if (String(p) === target) {
+          if (matches(String(p))) {
             hits++
             throw Object.assign(new Error('EACCES: permission denied'), {
               code: 'EACCES',
             })
           }
-          return (realLstat as (...a: unknown[]) => unknown)(p, ...rest)
-        }) as typeof fs.lstatSync),
+          return (realStat as (...a: unknown[]) => unknown)(p, ...rest)
+        }) as typeof fs.statSync),
       )
       return () => hits
     }
 
-    it('leaves out every pin through a component that cannot be inspected, and still builds the wrap', async () => {
+    it('still pins a directory that exists but cannot be inspected', async () => {
       const proj = makeTree()
-      const component = join(proj, 'a')
-      const lstatHits = failLstatOn(component)
+      const uninspectable = join(proj, 'a', 'b')
+      const statHits = failStatWhere(p => p === uninspectable)
 
       const wrapped = await wrap(proj)
 
-      expect(lstatHits()).toBeGreaterThan(0)
+      expect(statHits()).toBeGreaterThan(0)
       for (const dir of [
-        component,
-        join(proj, 'a', 'b'),
+        join(proj, 'a'),
+        uninspectable,
         join(proj, 'a', 'b', '.git'),
       ]) {
-        expect(wrapped).not.toContain(`--ro-bind ${dir} ${dir}`)
+        expect(wrapped).toContain(`--ro-bind ${dir} ${dir}`)
       }
-      const cfg = join(proj, 'a', 'b', '.git', 'config')
+    })
+
+    it('hides the deepest inspectable directory above a denyRead path that cannot be inspected', async () => {
+      // chmod 000 on cfg/secrets by an earlier command: the key cannot be
+      // stat'ed, but the next command can chmod it back and read it.
+      const proj = makeTree()
+      const secrets = join(proj, 'cfg', 'secrets')
+      mkdirSync(join(secrets, 'pub'), { recursive: true })
+      writeFileSync(join(secrets, 'key'), 'K')
+      const statHits = failStatWhere(p => p.startsWith(secrets + '/'))
+
+      const wrapped = await wrap(proj, {
+        readConfig: {
+          denyOnly: [join(secrets, 'key')],
+          allowWithinDeny: [join(secrets, 'pub')],
+        },
+      })
+
+      expect(statHits()).toBeGreaterThan(0)
+      expect(wrapped).toContain(`--tmpfs ${secrets} `)
+      // Nothing beneath the stand-in can be vouched for, so nothing returns.
+      expect(wrapped).not.toContain(join(secrets, 'pub'))
+      expect(wrapped).not.toContain(join(secrets, 'key'))
+      const cfg = join(proj, 'cfg')
       expect(wrapped).toContain(`--ro-bind ${cfg} ${cfg}`)
     })
 
@@ -114,23 +138,23 @@ describe.if(isLinux)(
       expect(wrapped).toContain(`--ro-bind ${above} ${above}`)
     })
 
-    it('pins the ancestors of a FIFO denyRead entry (every non-directory is masked)', async () => {
-      const proj = makeTree()
-      mkdirSync(join(proj, 'secrets'))
-      const fifoPath = join(proj, 'secrets', 'pipe.fifo')
-      const mk = spawnSync('mkfifo', [fifoPath])
-      if (mk.status !== 0) {
-        throw new Error('mkfifo unavailable')
-      }
+    it.if(Bun.which('mkfifo') !== null)(
+      'pins the ancestors of a FIFO denyRead entry (every non-directory is masked)',
+      async () => {
+        const proj = makeTree()
+        mkdirSync(join(proj, 'secrets'))
+        const fifoPath = join(proj, 'secrets', 'pipe.fifo')
+        expect(spawnSync('mkfifo', [fifoPath]).status).toBe(0)
 
-      const wrapped = await wrap(proj, {
-        readConfig: { denyOnly: [fifoPath], allowWithinDeny: [] },
-      })
+        const wrapped = await wrap(proj, {
+          readConfig: { denyOnly: [fifoPath], allowWithinDeny: [] },
+        })
 
-      const maskedDir = join(proj, 'secrets')
-      expect(wrapped).toContain(`--ro-bind ${maskedDir} ${maskedDir}`)
-      expect(wrapped).toContain(`--ro-bind /dev/null ${fifoPath}`)
-    })
+        const maskedDir = join(proj, 'secrets')
+        expect(wrapped).toContain(`--ro-bind ${maskedDir} ${maskedDir}`)
+        expect(wrapped).toContain(`--ro-bind /dev/null ${fifoPath}`)
+      },
+    )
 
     it('pins nothing for a denyRead file that does not exist', async () => {
       // secrets exists, so only the missing file decides: an unmasked entry
