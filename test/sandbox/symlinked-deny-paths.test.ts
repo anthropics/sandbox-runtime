@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -168,6 +169,41 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     expect(result).not.toContain(`--tmpfs ${claudeLink}`)
     expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
   })
+
+  // /bin -> usr/bin and friends on a usr-merged system.
+  const rootLinks = readdirSync('/', { withFileTypes: true })
+    .filter(entry => entry.isSymbolicLink())
+    .map(entry => realpathSync('/' + entry.name))
+    .filter(target => target.startsWith('/usr/'))
+
+  it.if(rootLinks.length > 0)(
+    "does not deny the root's symlinks in their own right under a denyRead of /",
+    async () => {
+      // A '/' deny stands for the root's children. /bin, /lib and /sbin are
+      // links into /usr: denied as entries of their own they are mounted
+      // where they lead, after /usr's tmpfs and the allowRead of /usr bound
+      // back over it, and empty the very directories that allowRead names.
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: 'echo STARTED',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['/'], allowWithinDeny: ['/usr', '/etc'] },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+      })
+
+      expect(wrapped).toContain('--tmpfs /usr --ro-bind /usr /usr')
+      for (const target of rootLinks) {
+        expect(wrapped).not.toContain(`--tmpfs ${target} `)
+      }
+      if (hasBwrap) {
+        const run = spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 10000,
+        })
+        expect(run.stdout).toBe('STARTED\n')
+      }
+    },
+  )
 
   it('resolves the mandatory .claude deny paths when cwd/.claude is a symlink', async () => {
     const claudeLink = join(PROJ, '.claude')

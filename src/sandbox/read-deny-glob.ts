@@ -14,41 +14,42 @@ import {
 const READ_DENY_GLOB_MOUNT_WARN_THRESHOLD = 256
 
 /**
- * Reduce a read-deny glob's matches to the mounts that change what the
- * sandbox can read; ancestors precede descendants in the result. A match is
- * dropped only when a kept proper ancestor's tmpfs already hides it and no
- * re-exposer sits at the ancestor or between the two.
+ * Reduce the places a read-deny glob's matches really live to the ones whose
+ * mount changes what the sandbox can read. A location is dropped only when a
+ * kept proper ancestor's tmpfs already hides it and no re-exposer sits at the
+ * ancestor or between the two. The denyRead loop mounts each entry where it
+ * really lives, so this is decided there too: the spelled parent of a match
+ * reached through a symlink need not contain it.
  */
-function collapseReadDenyMounts({
-  matches,
+function collapseReadDenyLocations({
+  locations,
   reExposedPaths,
 }: {
-  /** Absolute, normalized, trailing-slash-free paths; a match reached
-   *  through a symlink appears in both its spellings. */
-  matches: Iterable<string>
-  /** allowRead/allowWrite paths the denyRead loop re-binds over a tmpfs, in
-   *  every spelling that can name them. */
+  /** Absolute, symlink-free, trailing-slash-free paths. */
+  locations: Iterable<string>
+  /** allowRead/allowWrite paths the denyRead loop binds back over a tmpfs, as
+   *  spelled and as resolved. */
   reExposedPaths: ReadonlySet<string>
-}): string[] {
+}): Set<string> {
   // A proper ancestor is a proper string prefix, so lexicographic order
   // visits every ancestor before its descendants.
-  const sorted = [...new Set(matches)].sort()
+  const sorted = [...new Set(locations)].sort()
   const kept = new Set<string>()
-  for (const candidate of sorted) {
+  for (const location of sorted) {
     // A re-exposer at the kept ancestor counts: the deny loop binds it back
     // over the tmpfs, so everything beneath needs its own mount.
-    let reExposedBetween = reExposedPaths.has(candidate)
+    let reExposedBetween = reExposedPaths.has(location)
     let hidden = false
-    for (const ancestor of properAncestors(candidate)) {
+    for (const ancestor of properAncestors(location)) {
       if (reExposedPaths.has(ancestor)) reExposedBetween = true
       if (kept.has(ancestor)) {
         hidden = true
         break
       }
     }
-    if (!hidden || reExposedBetween) kept.add(candidate)
+    if (!hidden || reExposedBetween) kept.add(location)
   }
-  return [...kept]
+  return kept
 }
 
 /**
@@ -56,8 +57,9 @@ function collapseReadDenyMounts({
  * against `reExposedPaths` (the caller's allowRead and allowWrite entries).
  * A pattern ending in `/**` also takes its directory form, so
  * `**\/build/**` yields one mount per `build/` directory. A match reached
- * through a symlink is listed in its resolved spelling as well, and a
- * directory the walk could not list is denied whole.
+ * through a symlink is listed where it really lives, and a directory the walk
+ * could not list is denied whole. Sorted, so an ancestor precedes its
+ * descendants.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
@@ -82,56 +84,50 @@ export function expandReadDenyGlobLinux(
     }
   }
 
+  // Where each candidate really lives: the denyRead loop mounts an entry
+  // there, whatever spelling named it.
+  const locations = new Set<string>()
+  for (const candidate of candidates) {
+    const location = walk.realOf.get(candidate) ?? candidate
+    if (walk.symlinks.has(candidate) && !walk.realOf.has(candidate)) {
+      // A link that resolves to nothing denies nothing, and bwrap cannot
+      // mount on the link itself.
+      logForDebugging(
+        `[Sandbox Linux] denyRead glob "${globPattern}": ${candidate} does not resolve, skipping`,
+      )
+      continue
+    }
+    if (location === '/') {
+      // A tmpfs over the root would hide everything, and one on the link is
+      // refused by bwrap: every later command would fail to start for as
+      // long as the link exists.
+      logForDebugging(
+        `[Sandbox Linux] denyRead glob "${globPattern}": ${candidate} resolves to /, skipping`,
+        { level: 'warn' },
+      )
+      continue
+    }
+    locations.add(location)
+  }
+
   const reExposed = new Set(
     reExposedPaths.flatMap(p => pathSpellings(normalizePathForSandbox(p))),
   )
-  // Resolved spellings: a realpath for a match under a link the walk
-  // descended, a string swap for one under a symlinked base.
-  const throughWalkLink = (p: string): boolean => {
-    if (walk.symlinks.has(p)) return true
-    for (const ancestor of properAncestors(p)) {
-      if (walk.symlinks.has(ancestor)) return true
-    }
-    return false
-  }
-  const base = walk.base
-  const swappedBase =
-    base !== undefined && base.real !== base.dir ? base : undefined
-  for (const match of [...candidates]) {
-    if (throughWalkLink(match)) {
-      const spellings = pathSpellings(match)
-      if (spellings.length === 2) {
-        candidates.add(spellings[1])
-      } else if (walk.symlinks.has(match)) {
-        // The spelling stays, and bwrap refuses to mount on the link.
-        logForDebugging(
-          `[Sandbox Linux] denyRead glob "${globPattern}": ${match} is dangling or resolves to /, not denied at its target`,
-          { level: 'warn' },
-        )
-      }
-    } else if (swappedBase !== undefined) {
-      const beneathBase = match.slice(swappedBase.dir.length)
-      candidates.add(
-        swappedBase.real === '/' ? beneathBase : swappedBase.real + beneathBase,
-      )
-    }
-  }
-
-  const mounts = collapseReadDenyMounts({
-    matches: candidates,
+  const mounts = collapseReadDenyLocations({
+    locations,
     reExposedPaths: reExposed,
   })
 
   logForDebugging(
-    `[Sandbox Linux] Expanded denyRead glob "${globPattern}": ${walk.matches.length} matches -> ${mounts.length} mounts`,
+    `[Sandbox Linux] Expanded denyRead glob "${globPattern}": ${walk.matches.length} matches -> ${mounts.size} mounts`,
   )
-  if (mounts.length > READ_DENY_GLOB_MOUNT_WARN_THRESHOLD) {
+  if (mounts.size > READ_DENY_GLOB_MOUNT_WARN_THRESHOLD) {
     logForDebugging(
-      `[Sandbox Linux] denyRead glob "${globPattern}" still needs ${mounts.length} mounts after collapsing ` +
+      `[Sandbox Linux] denyRead glob "${globPattern}" still needs ${mounts.size} mounts after collapsing ` +
         `(threshold ${READ_DENY_GLOB_MOUNT_WARN_THRESHOLD}); each is a separate bwrap mount at sandbox start. ` +
         `Prefer denying the enclosing directories.`,
       { level: 'warn' },
     )
   }
-  return mounts
+  return [...mounts].sort()
 }

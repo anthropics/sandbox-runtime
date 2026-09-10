@@ -936,9 +936,6 @@ export interface GlobWalk {
    *  on the way down, or the entry itself). A symlink that does not resolve
    *  has no entry. */
   realOf: Map<string, string>
-  /** The directory listed (the pattern's static prefix) and its resolved
-   *  form. Unset when nothing was listed. */
-  base?: { dir: string; real: string }
 }
 
 /**
@@ -1109,7 +1106,6 @@ export function walkGlobPattern(
   } catch {
     // Vanished between the existence check and here: list what remains.
   }
-  walk.base = { dir: baseDir, real: baseReal }
   const pending: Frame[] = [{ dir: baseDir, real: baseReal, linkedFrom: [] }]
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real, linkedFrom } = frame
