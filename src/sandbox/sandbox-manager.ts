@@ -670,8 +670,11 @@ async function initialize(
         // apply-seccomp's observer reports every write-intent syscall
         // (allowed or not). Only paths bwrap would actually refuse — outside
         // allowWrite or inside a denyWrite carve-out — go to the store.
+        // The defaults are listed in full: a home directory a wrap leaves
+        // out because it is read-denied sits under that deny's writable
+        // tmpfs, so a write there succeeds and is not a violation.
         allowWritePaths: [
-          ...getDefaultWritePaths(getFsReadConfig().denyOnly),
+          ...getDefaultWritePaths(),
           ...config.filesystem.allowWrite,
         ],
         denyWritePaths: config.filesystem.denyWrite,
@@ -1151,6 +1154,30 @@ function getCredentialDenyReadPaths(
 }
 
 /**
+ * The default write paths under a filesystem policy's read rules, for
+ * getFsWriteConfig() and wrapWithSandbox() alike. Fed the entries as
+ * configured, through the pure {@link getCredentialDenyReadPaths}: no glob
+ * expansion and no credential masking, because getFsWriteConfig() is a
+ * getter callers reach from permission checks and render paths. A mask entry
+ * that degrades to a deny is a file and cannot cover a directory, so
+ * leaving those out changes nothing.
+ */
+function defaultWritePathsUnder({
+  denyRead,
+  allowRead,
+  credentials,
+}: {
+  denyRead: readonly string[]
+  allowRead: readonly string[] | undefined
+  credentials: CredentialsConfig | undefined
+}): string[] {
+  return getDefaultWritePaths({
+    denyRead: [...denyRead, ...getCredentialDenyReadPaths(credentials)],
+    allowRead,
+  })
+}
+
+/**
  * Union the explicit `filesystem.denyRead` with credential-derived
  * deny paths. The single source of "what files does this config
  * want read-denied" — all platforms route through here so a new
@@ -1247,7 +1274,11 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     })
 
   const allowOnly = [
-    ...getDefaultWritePaths(getFsReadConfig().denyOnly),
+    ...defaultWritePathsUnder({
+      denyRead: config.filesystem.denyRead,
+      allowRead: config.filesystem.allowRead,
+      credentials: config.credentials,
+    }),
     ...allowPaths,
   ]
 
@@ -1577,6 +1608,26 @@ async function wrapWithSandbox(
         config?.filesystem.allowWrite ??
         [],
     )
+    writeConfig = {
+      allowOnly: [
+        ...defaultWritePathsUnder({
+          denyRead:
+            customConfig?.filesystem?.denyRead ??
+            config?.filesystem.denyRead ??
+            [],
+          allowRead:
+            customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+          credentials: customConfig?.credentials ?? config?.credentials,
+        }),
+        ...userAllowWrite,
+      ],
+      denyWithinAllow: stripWriteGlobs(
+        customConfig?.filesystem?.denyWrite ??
+          config?.filesystem.denyWrite ??
+          [],
+      ),
+    }
+
     // Credential deny paths are unioned with the caller's denyRead — never
     // replacing it — so explicit filesystem restrictions always survive.
     const rawDenyRead = unionDenyReadPaths(
@@ -1591,14 +1642,6 @@ async function wrapWithSandbox(
       } else {
         expandedDenyRead.push(stripped)
       }
-    }
-    writeConfig = {
-      allowOnly: [...getDefaultWritePaths(expandedDenyRead), ...userAllowWrite],
-      denyWithinAllow: stripWriteGlobs(
-        customConfig?.filesystem?.denyWrite ??
-          config?.filesystem.denyWrite ??
-          [],
-      ),
     }
     const rawAllowRead =
       customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []

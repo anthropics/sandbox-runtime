@@ -325,7 +325,6 @@ export function expandWindowsEnvRefs(p: string): string {
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
  */
 export function normalizePathForSandbox(pathPattern: string): string {
-  const cwd = process.cwd()
   // Windows pre-processing: expand `%USERPROFILE%` / `%HOMEDRIVE%` /
   // `%HOMEPATH%`, strip the `\\?\` / `\\?\UNC\` extended prefix (its
   // `?` is a literal, not a glob char), and uppercase the drive
@@ -366,10 +365,10 @@ export function normalizePathForSandbox(pathPattern: string): string {
     // tilde was expanded above
   } else if (pathPattern.startsWith('./') || pathPattern.startsWith('../')) {
     // Convert relative to absolute based on current working directory
-    normalizedPath = path.resolve(cwd, pathPattern)
+    normalizedPath = path.resolve(process.cwd(), pathPattern)
   } else if (!path.isAbsolute(pathPattern)) {
     // Handle other relative paths (e.g., ".", "..", "foo/bar")
-    normalizedPath = path.resolve(cwd, pathPattern)
+    normalizedPath = path.resolve(process.cwd(), pathPattern)
   }
 
   // For glob patterns, resolve symlinks for the directory portion only
@@ -421,66 +420,121 @@ export function normalizePathForSandbox(pathPattern: string): string {
 }
 
 /**
+ * What the sandbox itself needs writable: the child's stdio and the TMPDIR it
+ * is handed (generateProxyEnvVars). Kept whatever is read-denied.
+ */
+const SANDBOX_OWN_WRITE_PATHS: readonly string[] = [
+  '/dev/stdout',
+  '/dev/stderr',
+  '/dev/null',
+  '/dev/tty',
+  '/dev/dtracehelper',
+  '/dev/autofs_nowait',
+  '/tmp/claude',
+  '/private/tmp/claude',
+]
+
+/**
+ * Directories under the home directory made writable as a convenience the
+ * caller never asked for. Every entry is subject to the read-rule check in
+ * {@link getDefaultWritePaths}.
+ */
+const HOME_CONVENIENCE_WRITE_DIRS: readonly string[] = [
+  '.npm/_logs',
+  '.claude/debug',
+]
+
+/**
  * Get recommended system paths that should be writable for commands to work properly
  *
  * WARNING: These default paths are intentionally broad for compatibility but may
  * allow access to files from other processes. In highly security-sensitive
  * environments, you should configure more restrictive write paths.
  *
- * @param denyRead - The read-deny list in force (credential denies included)
+ * With no argument this is the whole list. Given the read rules of a
+ * filesystem policy, a home convenience directory (~/.npm/_logs,
+ * ~/.claude/debug) is left out when a `denyRead` entry names it or a
+ * directory above it: kept, it would be bound back over that deny on Linux
+ * (readable and writable again) and stay writable on macOS, so the explicit
+ * denyRead wins over the implicit write allow. It is kept when an `allowRead`
+ * entry beneath that deny re-opens it, because the caller has already made it
+ * readable. A caller who wants it writable regardless lists it in
+ * `allowWrite`. What the sandbox itself needs (stdio, /tmp/claude) is never
+ * left out.
+ *
+ * Pass the entries as configured, not expanded. `dir/**` counts as `dir`,
+ * and a glob covers a directory when it matches that directory or one above
+ * it; nothing is listed from disk. On Linux, where the backend expands globs
+ * against the disk, two things follow: a glob that matches nothing there
+ * still counts (which only ever drops a convenience path), and a glob whose
+ * match is a symlink to one of these directories is not seen. A glob
+ * `allowRead` entry is not counted as re-opening anything.
  */
-export function getDefaultWritePaths(
-  denyRead: readonly string[] = [],
-): string[] {
-  const homeDir = homedir()
+export function getDefaultWritePaths(readRules?: {
+  denyRead: readonly string[]
+  allowRead?: readonly string[]
+}): string[] {
+  const home = homedir()
+  const keptDirs =
+    !readRules || readRules.denyRead.length === 0
+      ? HOME_CONVENIENCE_WRITE_DIRS
+      : homeDirsNotReadDenied(home, readRules.denyRead, readRules.allowRead)
   return [
-    '/dev/stdout',
-    '/dev/stderr',
-    '/dev/null',
-    '/dev/tty',
-    '/dev/dtracehelper',
-    '/dev/autofs_nowait',
-    '/tmp/claude',
-    '/private/tmp/claude',
-    // The two home directories are conveniences the caller never asked for.
-    // One that a read-deny covers would be bound back over that deny on Linux
-    // (readable and writable again) and stay writable on macOS, so the
-    // explicit denyRead wins; a caller who wants the path writable lists it
-    // in allowWrite. The entries above are what the sandbox itself needs
-    // (stdio, TMPDIR) and stay whatever is read-denied.
-    ...[
-      path.join(homeDir, '.npm/_logs'),
-      path.join(homeDir, '.claude/debug'),
-    ].filter(dir => !isCoveredByReadDeny(dir, denyRead)),
+    ...SANDBOX_OWN_WRITE_PATHS,
+    ...keptDirs.map(rel => path.join(home, rel)),
   ]
 }
 
-/** A read-deny entry names `dir` or a directory above it. */
-function isCoveredByReadDeny(
-  dir: string,
+/**
+ * The {@link HOME_CONVENIENCE_WRITE_DIRS} no `denyRead` entry covers, or
+ * that an `allowRead` entry beneath the covering deny re-opens.
+ */
+function homeDirsNotReadDenied(
+  home: string,
   denyRead: readonly string[],
-): boolean {
-  // Deny entries are compared normalized (symlinks resolved where that stays
-  // within bounds), so `dir` is tested both as listed and normalized:
-  // whichever spelling an entry kept, one of the two lines up with it.
-  const forms = [dir, normalizePathForSandbox(dir)]
-  return denyRead.some(entry => {
-    // 'x/**' denies x and everything beneath it, exactly like 'x'.
-    const stripped = removeTrailingGlobSuffix(entry)
-    const denied = normalizePathForSandbox(stripped)
-    if (!containsGlobChars(stripped)) {
-      return forms.some(form => isAtOrUnder(form, denied))
-    }
-    // A glob still here (Linux callers expand theirs to concrete paths
-    // first) covers `dir` when it matches `dir` or a directory above it.
-    const matcher = new RegExp(globToRegex(denied))
-    return forms.some(form => {
-      for (let p = form; p !== path.dirname(p); p = path.dirname(p)) {
-        if (matcher.test(p)) return true
-      }
-      return false
-    })
+  allowRead: readonly string[] = [],
+): readonly string[] {
+  // Rules are compared as normalizePathForSandbox spells them, and on macOS
+  // that resolves /tmp and /var to /private/... for a path that exists. A
+  // convenience directory may not exist yet, so its second spelling is built
+  // from the home directory, which does.
+  const homes = [...new Set([home, normalizePathForSandbox(home)])]
+  const denies = denyRead.map(entry => readRuleCovers(entry))
+  const reopened = allowRead
+    .map(entry => removeTrailingGlobSuffix(entry))
+    .filter(entry => !containsGlobCharsForPlatform(entry))
+    .map(entry => normalizePathForSandbox(entry))
+  return HOME_CONVENIENCE_WRITE_DIRS.filter(rel => {
+    const spellings = homes.map(h => path.join(h, rel))
+    return !denies.some(
+      denyCovers =>
+        spellings.some(denyCovers) &&
+        !reopened.some(
+          allow =>
+            denyCovers(allow) && spellings.some(s => isAtOrUnder(s, allow)),
+        ),
+    )
   })
+}
+
+/**
+ * Whether a read rule covers a path: the path is the rule's own or lies
+ * beneath it. `dir/**` is `dir`, and a glob covers whatever
+ * {@link denyGlobRegex} matches.
+ */
+function readRuleCovers(entry: string): (p: string) => boolean {
+  const stripped = removeTrailingGlobSuffix(entry)
+  const rule = normalizePathForSandbox(stripped)
+  if (containsGlobCharsForPlatform(stripped)) {
+    try {
+      const regex = new RegExp(denyGlobRegex(rule))
+      return p => regex.test(p)
+    } catch {
+      // Brackets that do not form a valid class. The entry may be a literal
+      // file name, so it is compared as one.
+    }
+  }
+  return p => isAtOrUnder(p, rule)
 }
 
 /**

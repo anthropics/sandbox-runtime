@@ -215,7 +215,7 @@ child.on('exit', async code => {
 })
 ```
 
-**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you *execute* is not the command the invocation *represents* (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
+**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you _execute_ is not the command the invocation _represents_ (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
 
 ```typescript
 const wrapped = await SandboxManager.wrapWithSandbox(
@@ -226,7 +226,10 @@ const wrapped = await SandboxManager.wrapWithSandbox(
   { commandId: invocationId, commandText: rawCommand },
 )
 // ... run it ...
-const annotated = SandboxManager.annotateStderrWithSandboxFailures(invocationId, stderr)
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(
+  invocationId,
+  stderr,
+)
 ```
 
 #### Available exports
@@ -352,6 +355,8 @@ Uses two different patterns:
 
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
+
+A few paths are writable without being listed: the child's stdio and `/tmp/claude`, and as a convenience `~/.npm/_logs` and `~/.claude/debug`. Those two home directories are dropped when a `denyRead` entry covers them (and kept when an `allowRead` entry beneath that deny re-opens them), so list them in `allowWrite` if you want them writable under a home read-deny.
 
 **Path Syntax (macOS):**
 
