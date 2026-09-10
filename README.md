@@ -361,6 +361,10 @@ Uses two different patterns:
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
 
+**Automatic SSH key protection:**
+
+On initialization the runtime parses `~/.ssh/config` (including `Include` chains) and appends read denies for `IdentityFile`, `CertificateFile`, `ControlPath`, and `IdentityAgent` targets — keys often live outside `~/.ssh`, where a `denyRead` on the directory would not cover them — plus ssh's default key filenames (`~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc.). Targets are denied whether or not they exist yet (a `ControlPath` socket appears only when the first master connection opens). This is additive only: it never removes configured protection, and a malformed ssh config never fails initialization. To make a specific key readable inside the sandbox, add an `allowRead` entry with the key's EXACT path — an `allowRead` on a parent directory does not override a file-specific deny (most-specific-wins).
+
 **Path Syntax (macOS):**
 
 Paths support git-style glob patterns on macOS, similar to `.gitignore` syntax:

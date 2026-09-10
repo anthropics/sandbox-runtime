@@ -83,6 +83,7 @@ import {
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
+import { collectSshKeyDenyPaths } from './ssh-config-deny.js'
 import {
   SandboxViolationStore,
   sanitizeViolationText,
@@ -170,6 +171,16 @@ let windowsWfpVerified = false
 // and so reset()'s revoke/restore addresses the SAME binary the
 // grants/stamps were applied with even if `config` mutated between.
 let srtWinSpawn: SrtWinSpawn | undefined
+/**
+ * SSH key material referenced by the user's ssh config, plus ssh's default
+ * key filenames — see collectSshKeyDenyPaths for the exact contract.
+ * Computed at initialize()/updateConfig() (a re-scan: the ssh config may
+ * have changed on disk), appended to every effective denyRead set as its
+ * own named source (unionDenyReadPaths third arm + the Windows stamp
+ * set), and cleared at reset(). Append-only: widens protection, never
+ * narrows what the caller configured.
+ */
+let sshKeyDenyPaths: string[] = []
 const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
@@ -640,6 +651,11 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+
+  // Widen read protection to SSH key material referenced by the user's ssh
+  // config (keys often live outside ~/.ssh). Never fails initialization —
+  // a malformed config yields fewer additions, not an error.
+  sshKeyDenyPaths = collectSshKeyDenyPaths()
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
@@ -1191,7 +1207,19 @@ function unionDenyReadPaths(
   denyRead: readonly string[],
   credentialRestrictions: CredentialRestrictionConfig,
 ): string[] {
-  return [...new Set([...denyRead, ...credentialRestrictions.denyReadPaths])]
+  // Three named sources: caller config, credential file denies, and the
+  // ssh-config key protection. The ssh arm is separate (NOT smuggled
+  // through the credential channel) because getCredentialRestrictions
+  // early-returns for configs with no credentials block — riding that
+  // channel would silently drop the ssh denies for the common
+  // credentials-less config.
+  return [
+    ...new Set([
+      ...denyRead,
+      ...credentialRestrictions.denyReadPaths,
+      ...sshKeyDenyPaths,
+    ]),
+  ]
 }
 
 function getFsReadConfig(): FsReadRestrictionConfig {
@@ -1326,6 +1354,9 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
       ...new Set([
         ...(fs?.denyRead ?? []),
         ...getCredentialDenyReadPaths(c.credentials),
+        // SSH key protection: session-wide stamp only (the per-exec
+        // path deliberately excludes it — already stamped here).
+        ...sshKeyDenyPaths,
       ]),
     ],
     { mode: 'deny' },
@@ -1360,6 +1391,7 @@ function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
     allowRead: [...(c.filesystem.allowRead ?? [])],
     allowWrite: [...c.filesystem.allowWrite],
     credFiles: getCredentialDenyReadPaths(c.credentials),
+    sshFiles: [...sshKeyDenyPaths],
   }
 }
 
@@ -1379,7 +1411,8 @@ function sameRawWindowsFsInputs(
     setEq(a.denyWrite, b.denyWrite) &&
     setEq(a.allowRead, b.allowRead) &&
     setEq(a.allowWrite, b.allowWrite) &&
-    setEq(a.credFiles, b.credFiles)
+    setEq(a.credFiles, b.credFiles) &&
+    setEq(a.sshFiles, b.sshFiles)
   )
 }
 
@@ -1954,6 +1987,11 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * @param newConfig - The new configuration to use
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
+  // Re-scan the ssh config FIRST (it may have changed on disk since
+  // initialize()) so the staleness compare below sees the fresh set —
+  // recomputing after the compare would make ssh-derived drift
+  // invisible to the warning and then desynchronize silently.
+  sshKeyDenyPaths = collectSshKeyDenyPaths()
   if (
     getPlatform() === 'windows' &&
     config &&
@@ -1961,9 +1999,10 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   ) {
     logForDebugging(
       `[Sandbox Windows] updateConfig: the resolved file-access set ` +
-        `(filesystem.* ∪ credentials.files) changed but the ACL ` +
-        `stamp/grant is session-wide — call reset() then initialize() ` +
-        `to apply. The previously-applied set stays in effect.`,
+        `(filesystem.* ∪ credentials.files ∪ ssh-config keys) changed ` +
+        `but the ACL stamp/grant is session-wide — call reset() then ` +
+        `initialize() to apply. The previously-applied set stays in ` +
+        `effect.`,
       { level: 'warn' },
     )
   }
@@ -2145,6 +2184,7 @@ async function reset(): Promise<void> {
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  sshKeyDenyPaths = []
   srtWinSpawn = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
