@@ -860,47 +860,77 @@ function buildSandboxCommand(
   }
 }
 
-/** True when an fs error means the path is absent, as opposed to
- * unreadable (EACCES), looping (ELOOP) or otherwise unverifiable. */
-function isAbsenceError(err: unknown): boolean {
-  const code = (err as NodeJS.ErrnoException | undefined)?.code
-  return code === 'ENOENT' || code === 'ENOTDIR'
-}
+/** What lstat says about one component of a pin path. */
+type PinPathComponent = 'plain' | 'symlink' | 'uninspectable'
 
 /**
- * Directories to pin: every ancestor of a deny dest or mask seed up to (and
- * excluding) the outermost covering allowed write root, shallow-first. A pin
- * is a read-only self-bind emitted straight after the read-only root, before
- * every other mount, so its only effect is to make the directory a mountpoint
- * (rename/rmdir on it fail EBUSY however many later mounts cover it); it
- * changes no permission and creates no mount boundary on the lookup path.
- * Allowed write roots are skipped (their own bind is a mountpoint already)
- * and so are absent directories (bwrap cannot bind a missing source). The
- * probes are injected so the walk is testable without bwrap.
+ * `--ro-bind <dir> <dir>` for every directory strictly between a seed (the
+ * canonical location of a deny bind or file mask) and its outermost covering
+ * allowed write root, shallow-first. Write roots are skipped: their own bind
+ * makes them mountpoints already. A directory whose path has a component
+ * that is missing, cannot be inspected or is now a symlink gets no pin:
+ * bwrap could not bind it where the seed was resolved, and no deny bind
+ * depends on the pin.
  */
-export function computeAncestorPins(
+function ancestorPinArgs(
   seeds: Iterable<string>,
-  probes: {
+  writeRoots: {
     isWithinAllowedWrite: (dir: string) => boolean
     isAllowedWriteRoot: (dir: string) => boolean
-    isAbsent: (dir: string) => boolean
   },
 ): string[] {
-  const pins = new Set<string>()
+  const pinDirs = new Set<string>()
   // Verdicts are seed-independent: a visited ancestor's chain is done.
   const visited = new Set<string>()
   for (const seed of seeds) {
-    let dir = path.dirname(seed)
-    while (dir !== '/' && dir !== '.' && probes.isWithinAllowedWrite(dir)) {
-      if (visited.has(dir)) break
-      visited.add(dir)
-      if (!probes.isAllowedWriteRoot(dir) && !probes.isAbsent(dir)) {
-        pins.add(dir)
-      }
+    for (
+      let dir = path.dirname(seed);
+      dir !== '/' && !visited.has(dir) && writeRoots.isWithinAllowedWrite(dir);
       dir = path.dirname(dir)
+    ) {
+      visited.add(dir)
+      if (!writeRoots.isAllowedWriteRoot(dir)) pinDirs.add(dir)
     }
   }
-  return [...pins].sort((a, b) => a.split('/').length - b.split('/').length)
+  const inspected = new Map<string, PinPathComponent>()
+  const inspect = (prefix: string): PinPathComponent => {
+    let component = inspected.get(prefix)
+    if (component === undefined) {
+      try {
+        component = fs.lstatSync(prefix).isSymbolicLink() ? 'symlink' : 'plain'
+      } catch (err) {
+        component = 'uninspectable'
+        logForDebugging(
+          `[Sandbox Linux] No ancestor pin at or beneath ${prefix}: lstat failed (${(err as NodeJS.ErrnoException | undefined)?.code ?? 'unknown'})`,
+        )
+      }
+      if (component === 'symlink') {
+        logForDebugging(
+          `[Sandbox Linux] No ancestor pin at or beneath ${prefix}: it is a symlink (changed since resolution)`,
+        )
+      }
+      inspected.set(prefix, component)
+    }
+    return component
+  }
+  const everyComponentIsPlain = (pinDir: string): boolean => {
+    let prefix = ''
+    for (const name of pinDir.split('/').filter(Boolean)) {
+      prefix += '/' + name
+      switch (inspect(prefix)) {
+        case 'plain':
+          break
+        case 'symlink':
+        case 'uninspectable':
+          return false
+      }
+    }
+    return true
+  }
+  return [...pinDirs]
+    .filter(everyComponentIsPlain)
+    .sort((a, b) => a.split('/').length - b.split('/').length)
+    .flatMap(dir => ['--ro-bind', dir, dir])
 }
 
 /**
@@ -931,19 +961,31 @@ function resolveSymlinkDenyDest(normalizedPath: string): string {
  * Mount a tmpfs over a read-denied directory, then restore the allowed write
  * paths and allowRead paths the tmpfs just wiped. Used by the denyRead loop
  * in generateFilesystemArgs and again when a late denyWrite ro-bind re-exposes
- * a read-denied directory and the tmpfs must be re-applied on top.
+ * a read-denied directory and the tmpfs must be re-applied on top. Returns
+ * the write paths it re-bound.
  */
 function pushReadDenyDirMounts(
   args: string[],
-  normalizedPath: string,
-  allowedWritePaths: string[],
-  readAllowPaths: string[],
-  pathForms: (p: string) => string[],
-  readDenyLocations: string[],
+  unit: {
+    dir: string
+    allowedWritePaths: readonly string[]
+    readAllowPaths: readonly string[]
+    /** Canonical locations of the read-deny mounts a restore must not bury. */
+    readDenyLocations: readonly string[]
+    /** A path's recorded spelling plus where a mount given it lands. */
+    pathForms: (p: string) => string[]
+  },
 ): string[] {
+  const {
+    dir,
+    allowedWritePaths,
+    readAllowPaths,
+    readDenyLocations,
+    pathForms,
+  } = unit
   // Mounts land at canonical locations while recorded spellings may be
   // symlinked, so containment tests expand both sides to both forms.
-  const denyForms = pathForms(normalizedPath)
+  const denyForms = pathForms(dir)
   const underDeniedDir = (p: string): boolean =>
     pathForms(p).some(pForm => denyForms.some(form => isAtOrUnder(pForm, form)))
   // A restore at-or-above an already-emitted read-deny mount would bind host
@@ -956,11 +998,9 @@ function pushReadDenyDirMounts(
           isAtOrUnder(location, restoreForm),
         ),
     )
-  args.push('--tmpfs', normalizedPath)
+  args.push('--tmpfs', dir)
 
   // tmpfs wiped any earlier write binds under this path — restore them.
-  // What was actually re-bound is recorded and returned; consumers read the
-  // record rather than re-deriving the predicate.
   const restoredWrites: string[] = []
   for (const writePath of allowedWritePaths) {
     if (underDeniedDir(writePath)) {
@@ -1002,9 +1042,9 @@ function pushReadDenyDirMounts(
           )
           continue
         }
-      } catch {
+      } catch (err) {
         logForDebugging(
-          `[Sandbox Linux] Skipping allowRead restore that could not be resolved: ${allowPath}`,
+          `[Sandbox Linux] Skipping allowRead restore that could not be resolved (${(err as NodeJS.ErrnoException | undefined)?.code ?? 'unknown'}): ${allowPath}`,
         )
         continue
       }
@@ -1068,9 +1108,10 @@ async function generateFilesystemArgs(
   // create file at <path>: Read-only file system"). An EXISTING deny path
   // strictly beneath one is likewise already unwritable and its own
   // --ro-bind <p> <p> is skipped as redundant. The spellings matter
-  // because the emission filter and the denyRead re-application compare raw
-  // spellings as well as the resolved dest, so the stub-skip guard tests a
-  // covering directory in its canonical form AND every recorded spelling.
+  // because the file-mask filter and the re-application passes compare a
+  // deny bind's raw spelling as well as its resolved dest, so the stub-skip
+  // guard tests a covering directory in its canonical form AND every
+  // recorded spelling.
   const readOnlyDenyDirSpellings = new Map<string, Set<string>>()
   // dest → the pre-resolution deny path it came from. denyWrite dests are
   // canonicalized through symlinks but the denyRead tmpfs dirs and the write
@@ -1078,44 +1119,53 @@ async function generateFilesystemArgs(
   // symlink no longer matches them by string prefix. Both spellings name the
   // same inode once bwrap resolves them, so the comparisons below test both.
   const denyWriteRawDests = new Map<string, string>()
-  // A mount given a symlink-spelled path lands at its canonical target while
-  // recorded lists keep their spelling; containment tests expand to both
-  // forms through this memoized helper.
-  const mountFormsCache = new Map<string, string[]>()
-  const mountForms = (p: string): string[] => {
-    let forms = mountFormsCache.get(p)
-    if (forms === undefined) {
-      forms = [p]
-      try {
-        const canonical = fs.realpathSync(p)
-        if (canonical !== p) forms.push(canonical)
-      } catch {
-        // vanished or unresolvable: the recorded form suffices
-      }
-      mountFormsCache.set(p, forms)
-    }
-    return forms
-  }
+  // Where a mount given `p` lands. One resolution per path per wrap, so every
+  // predicate below sees the same answer, and none before the mandatory-deny
+  // scan's await: that scan can run arbitrarily long, and a realpath taken
+  // ahead of it would miss a symlink retargeted meanwhile.
+  const canonicalFormCache = new Map<string, string>()
   const canonicalForm = (p: string): string => {
-    const forms = mountForms(p)
-    return forms[forms.length - 1]!
+    let canonical = canonicalFormCache.get(p)
+    if (canonical === undefined) {
+      try {
+        canonical = fs.realpathSync(p)
+      } catch {
+        canonical = p // vanished or unresolvable: the recorded form stands
+      }
+      canonicalFormCache.set(p, canonical)
+    }
+    return canonical
   }
-  // Canonical locations of every read-deny mount (tmpfs, file masks,
-  // credential fakes); a write-path restore must never bury one.
-  const readDenyCanonicalLocations: string[] = [
-    ...(readConfig?.denyOnly ?? []).map(p =>
-      canonicalForm(normalizePathForSandbox(p)),
-    ),
-    ...(maskedFileBinds ?? []).map(bind => canonicalForm(bind.realPath)),
-  ]
+  /** `p` as recorded, plus its canonical location when that differs. */
+  const mountForms = (p: string): string[] => {
+    const canonical = canonicalForm(p)
+    return canonical === p ? [p] : [p, canonical]
+  }
+  // Whether a canonical path lies inside the write allowlist. The deny
+  // pre-pass, the deny loop's --ro-bind gate and the ancestor-pin walk MUST
+  // share it: the pre-pass is only sound if it records exactly the
+  // directories the loop re-binds read-only (a recorded directory that is
+  // never re-bound read-only would suppress stubs unsafely; a re-bound
+  // directory missing from the record only costs an abort). allowedWritePaths
+  // entries are recorded with trailing slashes stripped; a symlink-spelled
+  // entry's bind lands at its canonical target, so candidates are tested
+  // against both forms of each entry.
+  const isWithinAnyAllowedWritePath = (candidatePath: string): boolean =>
+    allowedWritePaths.some(allowedPath =>
+      mountForms(allowedPath).some(form => isAtOrUnder(candidatePath, form)),
+    )
+  const isAllowedWriteRoot = (candidatePath: string): boolean =>
+    allowedWritePaths.some(allowedPath =>
+      mountForms(allowedPath).includes(candidatePath),
+    )
+  // Where the ancestor pins are spliced in once every mount is known.
+  let ancestorPinInsertAt: number | undefined
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
     // Write restrictions: Start with read-only root, then allow writes to specific paths
     args.push('--ro-bind', '/', '/')
-    // Ancestor pins are spliced in here, beneath every later mount (see the
-    // pin walk after the deny loop).
-    const ancestorPinInsertAt = args.length
+    ancestorPinInsertAt = args.length
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
@@ -1188,10 +1238,10 @@ async function generateFilesystemArgs(
     // the real filesystem.
     //
     // allowedWritePathsBothForms: allowWrite paths in their recorded and
-    // realpath-canonical spellings. The canonical form is re-resolved HERE,
-    // not reused from the allow loop's earlier resolution, deliberately: the
-    // getter runs after the (unbounded) mandatory-deny scan, and a fresh
-    // realpath sees an allow path whose symlink target changed during that
+    // realpath-canonical spellings (mountForms). The canonical form is not
+    // reused from the allow loop's earlier resolution, deliberately:
+    // canonicalForm resolves after the (unbounded) mandatory-deny scan, so
+    // it sees an allow path whose symlink target changed during that
     // window — the fail-closed direction, since a link now pointing into a
     // covering deny dir must veto the skip. The guard's veto compares deny
     // dests (always canonical) against allow paths, so it keeps both
@@ -1203,7 +1253,9 @@ async function generateFilesystemArgs(
     // /etc/ssh/ssh_config.d when present, and keep only entries that exist as
     // directories (the loop skips absent entries and gives file entries a
     // read-only /dev/null mask instead of a tmpfs) — in raw and canonical
-    // spellings. A read-denied tmpfs at or under a covering deny dir is the
+    // spellings. It is a superset: the loop also skips a root child an
+    // allowRead covers, and predicting a tmpfs that is never mounted only
+    // keeps a stub. A read-denied tmpfs at or under a covering deny dir is the
     // TRIGGER for the post-denyWrite writable re-application, and a deny bind
     // whose dest sits under one can be dropped by the emission filter — both
     // facts feed the guard.
@@ -1219,18 +1271,7 @@ async function generateFilesystemArgs(
       if (stubSkipVetoInputs !== undefined) {
         return stubSkipVetoInputs
       }
-      const allowedWritePathsBothForms: string[] = []
-      for (const writePath of allowedWritePaths) {
-        allowedWritePathsBothForms.push(writePath)
-        try {
-          const canonical = fs.realpathSync(writePath)
-          if (canonical !== writePath) {
-            allowedWritePathsBothForms.push(canonical)
-          }
-        } catch {
-          // vanished since the allow loop: the recorded form suffices
-        }
-      }
+      const allowedWritePathsBothForms = allowedWritePaths.flatMap(mountForms)
       const prospectiveReadDenyTmpfsDirsBothForms: string[] = []
       if (readConfig) {
         const effectiveReadDenyPaths: string[] = []
@@ -1266,15 +1307,9 @@ async function generateFilesystemArgs(
           if (!isDirectory) {
             continue // a file gets a read-only /dev/null mask, never a tmpfs
           }
-          prospectiveReadDenyTmpfsDirsBothForms.push(denyReadPath)
-          try {
-            const canonical = fs.realpathSync(denyReadPath)
-            if (canonical !== denyReadPath) {
-              prospectiveReadDenyTmpfsDirsBothForms.push(canonical)
-            }
-          } catch {
-            // vanished between the stat and here: the raw form suffices
-          }
+          prospectiveReadDenyTmpfsDirsBothForms.push(
+            ...mountForms(denyReadPath),
+          )
         }
       }
       stubSkipVetoInputs = {
@@ -1283,24 +1318,6 @@ async function generateFilesystemArgs(
       }
       return stubSkipVetoInputs
     }
-    // The ONE predicate deciding whether a deny dest lies inside the write
-    // allowlist. The read-only pre-pass below and the loop's --ro-bind gate
-    // MUST share it: the pre-pass is only sound if it records exactly the
-    // directories the loop re-binds read-only (a recorded directory that is
-    // never re-bound read-only would suppress stubs unsafely; a re-bound
-    // directory missing from the record only costs an abort). allowedWritePaths
-    // entries are recorded with trailing slashes stripped; a symlink-spelled
-    // entry's bind lands at its canonical target, so candidates (canonical)
-    // are tested against both forms of each entry.
-    const isWithinAnyAllowedWritePath = (candidatePath: string): boolean =>
-      allowedWritePaths.some(allowedPath =>
-        mountForms(allowedPath).some(form => isAtOrUnder(candidatePath, form)),
-      )
-    const isAllowedWriteRoot = (candidatePath: string): boolean =>
-      allowedWritePaths.some(allowedPath =>
-        mountForms(allowedPath).some(form => candidatePath === form),
-      )
-
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
@@ -1355,11 +1372,10 @@ async function generateFilesystemArgs(
         continue
       }
       if (isWithinAnyAllowedWritePath(resolvedPath)) {
-        // Keep every spelling this dest is reached through (the emission
-        // filter tests the first-seen raw spelling, which this pass cannot
-        // assume, and the re-application matches raw tmpfs spellings): the
-        // guard below treats the directory as unsafe if a read-deny tmpfs
-        // contains ANY of them.
+        // Keep every spelling this dest is reached through (the
+        // re-application passes record the first-seen raw spelling beside
+        // the dest, which this pass cannot assume): the guard below treats
+        // the directory as unsafe if a read-deny tmpfs contains ANY of them.
         let spellings = readOnlyDenyDirSpellings.get(resolvedPath)
         if (spellings === undefined) {
           spellings = new Set()
@@ -1383,8 +1399,8 @@ async function generateFilesystemArgs(
     // Rationale: the only writable emissions that land after the
     // buffered read-only binds are the denyRead re-application's write
     // restores, and those fire only for a tmpfs whose canonical location
-    // sits inside an emitted dest — a tmpfs comparable with the covering
-    // directory — with a restore list filtered to exclude any write path
+    // sits inside an emitted dest (a tmpfs comparable with the covering
+    // directory), with a restore list filtered to exclude any write path
     // that has an emitted deny bind at-or-under it. (Ancestor pins are
     // read-only self-binds spliced in beneath every other mount, so they
     // are neither writable emissions nor part of denyWriteArgs.) A comparable
@@ -1651,106 +1667,6 @@ async function generateFilesystemArgs(
         )
       }
     }
-
-    // Ancestor pinning: the directories strictly between a deny dest and its
-    // covering allowed write root carry no mount, so rename(2) on one moves
-    // the deny bind along with it and the path can be recreated unprotected
-    // (mv .git aside; mkdir .git; write .git/hooks/x). Each gets a read-only
-    // self-bind spliced in straight after the read-only root: buried under
-    // every later mount it still makes the directory a mountpoint, which is
-    // all rename/rmdir/RENAME_EXCHANGE check (EBUSY), while permissions,
-    // deny binds, tmpfs units and masks are decided entirely by the mounts
-    // above it and no vfsmount boundary appears on the lookup path (no EXDEV
-    // for renames across a pinned directory). Being read-only and beneath the
-    // allow roots, a pin that bwrap resolves somewhere unexpected (a component
-    // swapped for a symlink after the walk) widens nothing.
-    // Every deny dest the loop above produced is a key of denyWriteRawDests.
-    // File masks (non-directory denyRead entries, credential fakes) are the
-    // second protection channel and seed the walk too.
-    const maskPinSeeds: string[] = []
-    for (const denyReadPath of readConfig?.denyOnly ?? []) {
-      const resolvedDenyRead = normalizePathForSandbox(denyReadPath)
-      let seedIt: boolean
-      try {
-        // Every non-directory (sockets and FIFOs included) gets a mask.
-        seedIt = !fs.statSync(resolvedDenyRead).isDirectory()
-      } catch (err) {
-        // Absent paths get no mask; any other errno seeds conservatively
-        // (over-seeding only adds pins, which restrict nothing).
-        seedIt = !isAbsenceError(err)
-      }
-      if (seedIt) {
-        // Seed the canonical mount location, not the raw spelling.
-        maskPinSeeds.push(
-          canonicalForm(resolveSymlinkDenyDest(resolvedDenyRead)),
-        )
-      }
-    }
-    for (const maskedFileBind of maskedFileBinds ?? []) {
-      maskPinSeeds.push(canonicalForm(maskedFileBind.realPath))
-    }
-    const ancestorIsAbsent = (dir: string): boolean => {
-      try {
-        fs.statSync(dir)
-        return false
-      } catch (err) {
-        return isAbsenceError(err)
-      }
-    }
-    const ancestorPinDirs = computeAncestorPins(
-      [...denyWriteRawDests.keys(), ...maskPinSeeds],
-      {
-        isWithinAllowedWrite: isWithinAnyAllowedWritePath,
-        isAllowedWriteRoot,
-        isAbsent: ancestorIsAbsent,
-      },
-    )
-    // Seeds are canonical, so a pin path with a symlink component means the
-    // tree changed since the walk; bwrap would bind the target instead, which
-    // is harmless (read-only, beneath the allow roots) but pins the wrong
-    // directory, so such a pin is dropped, as is one whose component can no
-    // longer be inspected.
-    const componentLstatMemo = new Map<string, boolean | null>()
-    const componentIsSymlink = (prefix: string): boolean | null => {
-      let verdict = componentLstatMemo.get(prefix)
-      if (verdict === undefined) {
-        try {
-          verdict = fs.lstatSync(prefix).isSymbolicLink()
-        } catch {
-          verdict = null
-        }
-        componentLstatMemo.set(prefix, verdict)
-      }
-      return verdict
-    }
-    const pinComponentsAreSymlinkFree = (pinDir: string): boolean => {
-      let prefix = ''
-      for (const component of pinDir.split('/')) {
-        if (component === '') continue
-        prefix += '/' + component
-        const verdict = componentIsSymlink(prefix)
-        if (verdict === null) {
-          logForDebugging(
-            `[Sandbox Linux] Dropping ancestor pin with an unverifiable component: ${pinDir}`,
-          )
-          return false
-        }
-        if (verdict) {
-          logForDebugging(
-            `[Sandbox Linux] Dropping ancestor pin with symlink component (changed since resolution): ${pinDir}`,
-          )
-          return false
-        }
-      }
-      return true
-    }
-    const ancestorPinArgs: string[] = []
-    for (const pinDir of ancestorPinDirs) {
-      if (pinComponentsAreSymlinkFree(pinDir)) {
-        ancestorPinArgs.push('--ro-bind', pinDir, pinDir)
-      }
-    }
-    args.splice(ancestorPinInsertAt, 0, ...ancestorPinArgs)
   } else {
     // No write restrictions: Allow all writes
     args.push('--bind', '/', '/')
@@ -1774,13 +1690,16 @@ async function generateFilesystemArgs(
   // Canonical locations of read-deny mounts emitted so far: only an
   // already-emitted mount can be buried by a later unit's restore.
   const emittedReadDenyLocations: string[] = []
-  // Per tmpfs unit, in emission order: its mount forms and the write paths
-  // its restore loop actually re-bound. Replayed by the emission filter.
-  const readSectionPlan: Array<{ forms: string[]; restores: string[] }> = []
-  // Directories masked by --tmpfs below, in emission (shallow-first) order.
-  // Used to filter denyWriteArgs the same way: a dir in both deny lists must
-  // not get its host contents re-bound on top of its own tmpfs.
-  const tmpfsDirs: string[] = []
+  // Directories masked by --tmpfs below, in emission (shallow-first) order,
+  // each with where it mounted and the write paths its restore loop actually
+  // re-bound. Replayed by the emission filter (a dir in both deny lists must
+  // not get its host contents re-bound on top of its own tmpfs) and by the
+  // re-application pass.
+  const readDenyTmpfsUnits: Array<{
+    dir: string
+    canonical: string
+    restores: string[]
+  }> = []
 
   // --tmpfs / would wipe all prior mounts (ro-bind /, write binds, deny binds).
   // Expand a root deny into its direct children so the existing per-dir tmpfs
@@ -1843,19 +1762,17 @@ async function generateFilesystemArgs(
 
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
-      tmpfsDirs.push(normalizedPath)
+      const canonical = canonicalForm(normalizedPath)
       // Joins the emitted set before its own call (exempt from its own veto).
-      const unitForms = mountForms(normalizedPath)
-      emittedReadDenyLocations.push(unitForms[unitForms.length - 1]!)
-      const restores = pushReadDenyDirMounts(
-        args,
-        normalizedPath,
+      emittedReadDenyLocations.push(canonical)
+      const restores = pushReadDenyDirMounts(args, {
+        dir: normalizedPath,
         allowedWritePaths,
         readAllowPaths,
-        mountForms,
-        emittedReadDenyLocations,
-      )
-      readSectionPlan.push({ forms: unitForms, restores })
+        readDenyLocations: emittedReadDenyLocations,
+        pathForms: mountForms,
+      })
+      readDenyTmpfsUnits.push({ dir: normalizedPath, canonical, restores })
     } else {
       // For files, only an exact allowRead match overrides the deny. A
       // directory allowRead does not un-deny a file specifically listed in
@@ -1891,6 +1808,36 @@ async function generateFilesystemArgs(
     args.push('--ro-bind', fakePath, dest)
     maskedFiles.set(dest, fakePath)
     maskedFiles.set(realPath, fakePath)
+    emittedReadDenyLocations.push(canonicalForm(realPath))
+  }
+
+  // Ancestor pinning: the directories strictly between a deny bind or file
+  // mask and its covering allowed write root carry no mount, so rename(2) on
+  // one moves the mount along with it and the path can be recreated
+  // unprotected (mv .git aside; mkdir .git; write .git/hooks/x). Each gets a
+  // read-only self-bind spliced in straight after the read-only root: buried
+  // under every later mount it still makes the directory a mountpoint, which
+  // is all rename/rmdir/RENAME_EXCHANGE check (EBUSY), while permissions,
+  // deny binds, tmpfs units and masks are decided entirely by the mounts
+  // above it and no vfsmount boundary appears on the lookup path (no EXDEV
+  // for renames across a pinned directory). Seeds are canonical because the
+  // walk takes dirname() of each: a symlink spelling would pin the chain of
+  // the link, not of where the mount landed.
+  if (ancestorPinInsertAt !== undefined) {
+    args.splice(
+      ancestorPinInsertAt,
+      0,
+      ...ancestorPinArgs(
+        [
+          ...denyWriteRawDests.keys(),
+          ...[...maskedFiles.keys()].map(canonicalForm),
+        ],
+        {
+          isWithinAllowedWrite: isWithinAnyAllowedWritePath,
+          isAllowedWriteRoot,
+        },
+      ),
+    )
   }
 
   // Emitting denyWrite last means these ro-binds layer on top of any write
@@ -1907,19 +1854,19 @@ async function generateFilesystemArgs(
   //   if an allowed write path at-or-under that tmpfs covers the dest, the
   //   denyRead loop re-bound it (the .git/hooks case) and the write-deny bind
   //   is still required on top.
-  // Replay the read section's plan in order — bwrap is last-mount-wins, so a
-  // dest hidden by one unit's tmpfs is re-exposed by a later unit's restore.
+  // Replay the tmpfs units in order: bwrap is last-mount-wins, so a dest
+  // hidden by one unit's tmpfs is re-exposed by a later unit's restore.
   // Only the canonical dest is tested: a raw route can read as covered while
   // the canonical mount location is exposed.
-  const writeRebindCovers = (writePath: string, dest: string): boolean =>
-    mountForms(writePath).some(writeForm => isAtOrUnder(dest, writeForm))
+  const isAtOrUnderMountOf = (dest: string, recorded: string): boolean =>
+    mountForms(recorded).some(form => isAtOrUnder(dest, form))
   const isHiddenByTmpfs = (dest: string): boolean => {
     let hidden = false
-    for (const unit of readSectionPlan) {
-      if (unit.forms.some(form => isAtOrUnder(dest, form))) {
+    for (const unit of readDenyTmpfsUnits) {
+      if (isAtOrUnderMountOf(dest, unit.dir)) {
         hidden = true
       }
-      if (unit.restores.some(writePath => writeRebindCovers(writePath, dest))) {
+      if (unit.restores.some(w => isAtOrUnderMountOf(dest, w))) {
         hidden = false
       }
     }
@@ -1958,15 +1905,12 @@ async function generateFilesystemArgs(
   // them, so containment is root-aware.
   // Containment is tested at the tmpfs's canonical location (where it
   // actually mounted); a raw-spelling match means the mount was never buried.
-  for (const tmpfsDir of tmpfsDirs) {
-    const canonicalLocation = canonicalForm(tmpfsDir)
+  for (const unit of readDenyTmpfsUnits) {
     if (
-      emittedDenyWriteDests.some(dest =>
-        isStrictlyUnder(canonicalLocation, dest),
-      )
+      emittedDenyWriteDests.some(dest => isStrictlyUnder(unit.canonical, dest))
     ) {
       logForDebugging(
-        `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${tmpfsDir}`,
+        `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${unit.dir}`,
       )
       // Restoring a write path with an emitted deny bind at-or-under it, or
       // one at-or-inside an emitted deny dest, would bury that bind.
@@ -1978,14 +1922,13 @@ async function generateFilesystemArgs(
             ),
           ),
       )
-      pushReadDenyDirMounts(
-        args,
-        tmpfsDir,
-        restorableWritePaths,
+      pushReadDenyDirMounts(args, {
+        dir: unit.dir,
+        allowedWritePaths: restorableWritePaths,
         readAllowPaths,
-        mountForms,
-        readDenyCanonicalLocations,
-      )
+        readDenyLocations: emittedReadDenyLocations,
+        pathForms: mountForms,
+      })
     }
   }
   // Same problem for masked files: the mask landed before the denyWrite

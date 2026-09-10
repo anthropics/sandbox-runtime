@@ -12,11 +12,7 @@ import { dirname, join } from 'node:path'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 
-// Arg-level checks of the read-section record the emission filter replays:
-// the restore veto counts only mounts already emitted, the filter reads the
-// record of restores actually made, and symlink-spelled file masks seed pins
-// at their canonical location. Pins are read-only self-binds emitted straight
-// after the read-only root, beneath every tmpfs, restore and mask.
+// Argument-level checks; nothing here executes bwrap.
 describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
   const baseParams = {
     command: 'true',
@@ -55,7 +51,8 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     // outer tmpfs; the deeper tmpfs mounts after the restore and on top.
     const bind = `--bind ${build} ${build}`
     const restoreIdx = wrapped.lastIndexOf(bind)
-    expect(restoreIdx).toBeGreaterThan(wrapped.indexOf(`--tmpfs ${data}`))
+    // Space-terminated: data is a string prefix of logs.
+    expect(restoreIdx).toBeGreaterThan(wrapped.indexOf(`--tmpfs ${data} `))
     expect(wrapped.indexOf(`--tmpfs ${logs}`)).toBeGreaterThan(restoreIdx)
   })
 
@@ -113,6 +110,33 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(wrapped.indexOf(gitPin)).toBeLessThan(wrapped.indexOf(wBind))
     expect(wrapped.indexOf(gitPin)).toBeLessThan(
       wrapped.indexOf(`--tmpfs ${join(proj, 's')}`),
+    )
+  })
+
+  it('resolves a symlink-spelled denyRead directory after the mandatory-deny scan, not before it', async () => {
+    // link points at old/ when the wrap starts and at now/ once the scan (a
+    // stand-in for ripgrep that retargets it) has run. bwrap mounts the tmpfs
+    // where the link points at spawn time, so the write path beneath that
+    // target is the one the tmpfs wipes and the one to restore.
+    const proj = tempTree({ 'old/w/f': 'x', 'now/w/f': 'x' })
+    const link = join(proj, 'link')
+    symlinkSync(join(proj, 'old'), link)
+    const retarget = join(proj, 'retarget.sh')
+    writeFileSync(
+      retarget,
+      `#!/bin/sh\nln -sfn ${join(proj, 'now')} ${link}\nexit 1\n`,
+      { mode: 0o755 },
+    )
+    const nowW = join(proj, 'now/w')
+    const wrapped = await wrapCommandWithSandboxLinux({
+      ...baseParams,
+      ripgrepConfig: { command: retarget },
+      readConfig: { denyOnly: [link], allowWithinDeny: [] },
+      writeConfig: { allowOnly: [nowW], denyWithinAllow: [] },
+    })
+    const bind = `--bind ${nowW} ${nowW}`
+    expect(wrapped.lastIndexOf(bind)).toBeGreaterThan(
+      wrapped.indexOf(`--tmpfs ${link}`),
     )
   })
 
