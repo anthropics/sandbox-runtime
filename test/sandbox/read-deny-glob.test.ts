@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import {
+  chmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -64,6 +65,27 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
     ])
     expect(mounts).toEqual([join(ROOT, 'build'), join(ROOT, 'build-cache')])
   })
+
+  it.if(process.getuid?.() !== 0)(
+    'denies a directory it cannot list as a whole',
+    () => {
+      // Searchable but not listable (what a sandboxed command with write
+      // access to the tree can leave for the next wrap): the matches beneath
+      // it cannot be found, so the directory itself is the mount.
+      const locked = join(ROOT, 'locked')
+      mkdirSync(join(locked, 'build'), { recursive: true })
+      writeFileSync(join(locked, 'build', 'secret.out'), '')
+      chmodSync(locked, 0o311)
+      try {
+        const mounts = expandReadDenyGlobLinux(join(ROOT, '**/build/**'), [])
+        expect(mounts).toContain(locked)
+        expect(mounts).toContain(join(ROOT, 'build'))
+      } finally {
+        chmodSync(locked, 0o755)
+        rmSync(locked, { recursive: true, force: true })
+      }
+    },
+  )
 })
 
 describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
@@ -562,6 +584,42 @@ describe.if(isLinux)(
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
       expect(wrapped).toContain(`--tmpfs ${join(D, 'lnk', 'sub')}`)
+      if (hasBwrap) {
+        const run = spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 15000,
+        })
+        expect(run.stdout).not.toContain('secret')
+        expect(run.stdout).toContain('HIDDEN')
+      }
+    })
+
+    it('mounts a deny spelled beneath a denied directory after it, however shallow its target', async () => {
+      // denyRead [a/b/D/lnk/sub, a/b/D] + allowRead [a/b/D/lnk], lnk -> x:
+      // the deny beneath the carve-out resolves shallower than D. Mounted
+      // before D, it would go to x/sub alone, and D's tmpfs plus the
+      // carve-out bound back over it would show x/sub/secret at D/lnk/sub.
+      const D = join(ROOT, 's2', 'a', 'b', 'D')
+      const target = join(ROOT, 's2', 'x')
+      mkdirSync(D, { recursive: true })
+      mkdirSync(join(target, 'sub'), { recursive: true })
+      writeFileSync(join(target, 'sub', 'secret'), 'secret')
+      symlinkSync(target, join(D, 'lnk'))
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: `cat ${join(D, 'lnk', 'sub', 'secret')} || echo HIDDEN`,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [join(D, 'lnk', 'sub'), D],
+          allowWithinDeny: [join(D, 'lnk')],
+        },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+      })
+      expect(
+        wrapped.indexOf(`--tmpfs ${join(D, 'lnk', 'sub')}`),
+      ).toBeGreaterThan(
+        wrapped.indexOf(`--ro-bind ${join(D, 'lnk')} ${join(D, 'lnk')}`),
+      )
       if (hasBwrap) {
         const run = spawnSync(wrapped, {
           shell: true,

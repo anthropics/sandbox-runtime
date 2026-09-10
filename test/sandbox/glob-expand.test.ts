@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   writeFileSync,
@@ -253,9 +254,37 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
+  it.if(process.getuid?.() !== 0)(
+    'records a directory it cannot list and still lists its siblings',
+    () => {
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unlisted-')))
+      const locked = join(root, 'pkg', 'locked')
+      try {
+        mkdirSync(join(locked, 'build'), { recursive: true })
+        writeFileSync(join(locked, 'build', 'secret.out'), '')
+        mkdirSync(join(root, 'pkg', 'open', 'build'), { recursive: true })
+        writeFileSync(join(root, 'pkg', 'open', 'build', '1.out'), '')
+        // Searchable but not listable: what a sandboxed command with write
+        // access to the tree can leave behind for the next wrap.
+        chmodSync(locked, 0o311)
+
+        const walk = walkGlobPattern(join(root, '**/build/**'))
+
+        expect(walk.unlisted).toEqual([locked])
+        expect(walk.matches).toEqual([
+          join(root, 'pkg', 'open', 'build', '1.out'),
+        ])
+      } finally {
+        chmodSync(locked, 0o755)
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
   it('leaves the base unset when nothing was listed', () => {
     const walk = walkGlobPattern(join(RAW_BASE, 'nope', '*.env'))
     expect(walk.base).toBeUndefined()
+    expect(walk.unlisted).toEqual([])
   })
 })
 

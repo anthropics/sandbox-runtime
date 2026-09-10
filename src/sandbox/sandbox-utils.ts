@@ -927,6 +927,10 @@ export interface GlobWalk {
    *  descends into symlinked directories, so a match beneath one really
    *  lives outside the tree it was found in. */
   symlinks: Set<string>
+  /** Directories the walk reached but could not list (any error but
+   *  absence). Whatever the pattern matches beneath them is missing from
+   *  `matches`; a deny expansion must cover them whole. */
+  unlisted: string[]
   /** The directory listed (the pattern's static prefix) and its resolved
    *  form, which differ when a symlink sits above the walk: every match then
    *  has a second, resolved spelling. Unset when nothing was listed. */
@@ -964,6 +968,7 @@ export function walkGlobPattern(
     matches: [],
     directoryMatches: [],
     symlinks: new Set(),
+    unlisted: [],
   }
 
   // Normalize to `/` separators throughout so {@link globToRegex}
@@ -1030,8 +1035,11 @@ export function walkGlobPattern(
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true })
     } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code
+      if (code !== 'ENOENT') walk.unlisted.push(dir)
       logForDebugging(
         `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
+        { level: code === 'ENOENT' ? 'info' : 'warn' },
       )
       continue
     }

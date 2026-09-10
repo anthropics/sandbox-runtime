@@ -56,14 +56,16 @@ function collapseReadDenyMounts({
  * against `reExposedPaths` (the caller's allowRead and allowWrite entries).
  * A pattern ending in `/**` also takes its directory form, so
  * `**\/build/**` yields one mount per `build/` directory. A match reached
- * through a symlink is listed in its resolved spelling as well.
+ * through a symlink is listed in its resolved spelling as well, and a
+ * directory the walk could not list is denied whole.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
 ): string[] {
   const walk = walkGlobPattern(globPattern, { withDirectoryForm: true })
-  const candidates = new Set(walk.matches)
+  // An unlisted directory hides whatever the pattern matches beneath it.
+  const candidates = new Set([...walk.matches, ...walk.unlisted])
   if (walk.directoryMatches.length > 0) {
     // Everything beneath a directory-form match is itself a match (the
     // pattern ends in /**), so a directory with something to deny is some

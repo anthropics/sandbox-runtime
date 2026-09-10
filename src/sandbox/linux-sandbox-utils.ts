@@ -998,8 +998,12 @@ class SandboxMountView {
 }
 
 /**
- * Read-deny paths shallow-first by resolved path, so a tmpfs over an ancestor
- * directory lands before a mask on a file beneath it.
+ * Read-deny paths ordered so that each follows every other one that contains
+ * it in either spelling. A directory's tmpfs and the carve-outs bound back
+ * over it must be in place before anything beneath is mounted: emitted
+ * later, the tmpfs would wipe that mount and a carve-out re-expose what it
+ * hid. Shallow resolved paths first otherwise, so a file mask follows the
+ * tmpfs of a directory above it.
  */
 function orderReadDenyPaths(
   paths: readonly string[],
@@ -1007,7 +1011,32 @@ function orderReadDenyPaths(
 ): string[] {
   const resolvedDepth = (p: string): number =>
     view.resolved(p).split('/').length
-  return [...new Set(paths)].sort((a, b) => resolvedDepth(a) - resolvedDepth(b))
+  const shallowFirst = [...new Set(paths)].sort(
+    (a, b) => resolvedDepth(a) - resolvedDepth(b),
+  )
+  const bySpelling = new Map<string, string[]>()
+  for (const p of shallowFirst) {
+    for (const spelling of view.spellings(p)) {
+      const named = bySpelling.get(spelling)
+      if (named === undefined) bySpelling.set(spelling, [p])
+      else named.push(p)
+    }
+  }
+  const ordered: string[] = []
+  const visited = new Set<string>()
+  const visit = (p: string): void => {
+    // Already placed, or an ancestry cycle through symlinks: stop here.
+    if (visited.has(p)) return
+    visited.add(p)
+    for (const spelling of view.spellings(p)) {
+      for (const ancestor of properAncestors(spelling)) {
+        for (const container of bySpelling.get(ancestor) ?? []) visit(container)
+      }
+    }
+    ordered.push(p)
+  }
+  for (const p of shallowFirst) visit(p)
+  return ordered
 }
 
 /**
