@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import {
   mkdirSync,
+  mkdtempSync,
   writeFileSync,
   rmSync,
   existsSync,
@@ -192,18 +193,21 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     rmSync(RAW_BASE, { recursive: true, force: true })
   })
 
-  it('evaluates the directory pattern over the same listing and records symlinks', () => {
+  it('evaluates the directory form over the same listing and records symlinks', () => {
     const BASE = realPath(RAW_BASE)
-    const pattern = join(RAW_BASE, '**/build/**')
-    const walk = walkGlobPattern(pattern, {
-      directoryPattern: join(RAW_BASE, '**/build'),
+    const walk = walkGlobPattern(join(RAW_BASE, 'a', '**/build/**'), {
+      withDirectoryForm: true,
     })
 
     expect(walk.matches).toContain(join(BASE, 'a', 'build', '1.out'))
     expect(walk.directoryMatches).toEqual([join(BASE, 'a', 'build')])
     expect([...walk.symlinks]).toEqual([join(BASE, 'a', 'build', 'link')])
-    expect(walk.baseDir).toBe(BASE)
-    expect(walk.baseReal).toBe(BASE)
+    expect(walk.base).toEqual({ dir: join(BASE, 'a'), real: join(BASE, 'a') })
+  })
+
+  it('lists no directory matches without the directory form', () => {
+    const walk = walkGlobPattern(join(RAW_BASE, 'a', '**/build/**'))
+    expect(walk.directoryMatches).toEqual([])
   })
 
   it('reports a symlinked base in both spellings', () => {
@@ -219,8 +223,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     symlinkSync(BASE, alias)
     try {
       const walk = walkGlobPattern(join(alias, '**/build/**'))
-      expect(walk.baseDir).toBe(alias)
-      expect(walk.baseReal).toBe(BASE)
+      expect(walk.base).toEqual({ dir: alias, real: BASE })
       expect(walk.matches).toContain(join(alias, 'a', 'build', '1.out'))
     } finally {
       rmSync(alias)
@@ -228,37 +231,31 @@ describe.if(!isWindows)('walkGlobPattern', () => {
   })
 
   it('terminates on a symlink cycle and still lists the tree', () => {
-    // build/up -> .. : a recursive readdir throws ELOOP (Bun) or follows
-    // the link to the kernel's limit and lists ~40 phantom copies (Node
-    // 22.13+); the walk must survive it, or a denyRead glob over this tree
-    // would silently deny nothing.
-    const BASE = realPath(RAW_BASE)
-    mkdirSync(join(RAW_BASE, 'cyc', 'build'), { recursive: true })
-    writeFileSync(join(RAW_BASE, 'cyc', 'build', '1.out'), '')
-    symlinkSync('..', join(RAW_BASE, 'cyc', 'build', 'up'))
+    // build/up -> ..: the link leads back into its own ancestry, so a walk
+    // that followed it would never end.
+    const cyc = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-cycle-')))
+    try {
+      mkdirSync(join(cyc, 'build'))
+      writeFileSync(join(cyc, 'build', '1.out'), '')
+      symlinkSync('..', join(cyc, 'build', 'up'))
 
-    const walk = walkGlobPattern(join(RAW_BASE, 'cyc', '**/build/**'), {
-      directoryPattern: join(RAW_BASE, 'cyc', '**/build'),
-    })
+      const walk = walkGlobPattern(join(cyc, '**/build/**'), {
+        withDirectoryForm: true,
+      })
 
-    expect(walk.matches).toContain(join(BASE, 'cyc', 'build', '1.out'))
-    expect(walk.directoryMatches).toEqual([join(BASE, 'cyc', 'build')])
-    expect(walk.symlinks.has(join(BASE, 'cyc', 'build', 'up'))).toBe(true)
-    // The cycle is not re-entered: nothing appears twice.
-    expect(new Set(walk.matches).size).toBe(walk.matches.length)
+      expect(walk.matches).toContain(join(cyc, 'build', '1.out'))
+      expect(walk.directoryMatches).toEqual([join(cyc, 'build')])
+      expect(walk.symlinks.has(join(cyc, 'build', 'up'))).toBe(true)
+      // The cycle is not re-entered: nothing appears twice.
+      expect(new Set(walk.matches).size).toBe(walk.matches.length)
+    } finally {
+      rmSync(cyc, { recursive: true, force: true })
+    }
   })
 
-  it('returns empty results for a missing base', () => {
-    const walk = walkGlobPattern(join(RAW_BASE, 'nope', '*.env'), {
-      directoryPattern: join(RAW_BASE, 'nope', '*'),
-    })
-    expect(walk).toEqual({
-      matches: [],
-      directoryMatches: [],
-      symlinks: new Set(),
-      baseDir: '',
-      baseReal: '',
-    })
+  it('leaves the base unset when nothing was listed', () => {
+    const walk = walkGlobPattern(join(RAW_BASE, 'nope', '*.env'))
+    expect(walk.base).toBeUndefined()
   })
 })
 

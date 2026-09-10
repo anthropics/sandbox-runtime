@@ -65,6 +65,36 @@ export function isStrictlyUnder(p: string, dir: string): boolean {
   return p !== dir && isAtOrUnder(p, dir)
 }
 
+/** The proper ancestors of an absolute POSIX path, nearest first, ending at '/'. */
+export function* properAncestors(p: string): Generator<string> {
+  for (
+    let slash = p.lastIndexOf('/');
+    slash > 0;
+    slash = p.lastIndexOf('/', slash - 1)
+  ) {
+    yield p.slice(0, slash)
+  }
+  if (p !== '/') yield '/'
+}
+
+/** A path as spelled and, when that differs, with every symlink resolved. */
+export type PathSpellings = readonly [string] | readonly [string, string]
+
+/**
+ * The spellings that name `p` for a mount comparison. The spelling alone when
+ * `p` cannot be resolved (dangling, vanished) or resolves to '/': a mount
+ * over the root would hide everything.
+ */
+export function pathSpellings(p: string): PathSpellings {
+  try {
+    const resolved = fs.realpathSync(p)
+    if (resolved !== p && resolved !== '/') return [p, resolved]
+  } catch {
+    // Dangling or vanished: only the spelling names it.
+  }
+  return [p]
+}
+
 /**
  * Check if a path pattern contains glob characters
  */
@@ -890,19 +920,17 @@ export interface ExpandGlobOptions {
 export interface GlobWalk {
   /** Absolute paths matching the pattern. */
   matches: string[]
-  /** Directories (a symlink to one included) matching `directoryPattern`
-   *  over the same listing; empty without one. */
+  /** With `withDirectoryForm`: directories (a symlink to one included)
+   *  matching the pattern without its trailing `/**`. */
   directoryMatches: string[]
   /** Every visited entry that is a symbolic link, by full path. The walk
    *  descends into symlinked directories, so a match beneath one really
    *  lives outside the tree it was found in. */
   symlinks: Set<string>
   /** The directory listed (the pattern's static prefix) and its resolved
-   *  form; they differ when a symlink sits above the walk, in which case
-   *  every match has a second, resolved spelling. Empty when nothing was
-   *  listed. */
-  baseDir: string
-  baseReal: string
+   *  form, which differ when a symlink sits above the walk: every match then
+   *  has a second, resolved spelling. Unset when nothing was listed. */
+  base?: { dir: string; real: string }
 }
 
 /**
@@ -924,20 +952,18 @@ export function expandGlobPattern(
 }
 
 /**
- * The walk behind {@link expandGlobPattern}: one recursive listing of the
- * static prefix, filtered by `globPath` and, when given, `directoryPattern`
- * (which must share that prefix), with the symlinks seen recorded.
+ * The walk behind {@link expandGlobPattern}: one listing of the pattern's
+ * static prefix, filtered by `globPath` and, with `withDirectoryForm`, by
+ * `globPath` without its trailing `/**`, with the symlinks seen recorded.
  */
 export function walkGlobPattern(
   globPath: string,
-  opts: ExpandGlobOptions & { directoryPattern?: string } = {},
+  opts: ExpandGlobOptions & { withDirectoryForm?: boolean } = {},
 ): GlobWalk {
   const walk: GlobWalk = {
     matches: [],
     directoryMatches: [],
     symlinks: new Set(),
-    baseDir: '',
-    baseReal: '',
   }
 
   // Normalize to `/` separators throughout so {@link globToRegex}
@@ -967,33 +993,22 @@ export function walkGlobPattern(
     )
     return walk
   }
-  walk.baseDir = baseDir
 
   const flags = opts.caseInsensitive ? 'i' : ''
   const regex = new RegExp(globToRegex(normalizedPattern), flags)
+  const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
   const directoryRegex =
-    opts.directoryPattern === undefined
-      ? undefined
-      : new RegExp(
-          globToRegex(toFwd(normalizePathForSandbox(opts.directoryPattern))),
-          flags,
-        )
+    opts.withDirectoryForm && directoryForm !== normalizedPattern
+      ? new RegExp(globToRegex(directoryForm), flags)
+      : undefined
 
-  // Walk explicitly, one readdir per directory, rather than through
-  // readdirSync's `recursive` option: that listing is all-or-nothing, so
-  // one unreadable subtree — or a symlink cycle, which Bun's throws ELOOP
-  // on and Node's (22.13 and later) follows to the kernel's link limit,
-  // listing some forty phantom copies — would void or bloat the whole
-  // pattern, and a read-deny glob would silently deny nothing. Symlinked
-  // directories are descended like any other on every runtime (Node before
-  // 22.13 never descended one; a match beneath one names an inode outside
-  // the tree; see GlobWalk.symlinks) — every spelling the sandboxed command
-  // could read through must be listed, so a target reached twice is listed
-  // twice, never skipped — except a link back into its own ancestry, which
-  // is the one shape that never terminates: a symlink is not followed when
-  // its target is at or above any directory on the current descent (the
-  // real directory each earlier link was taken from, and this one).
-  // Depth-first, so a directory's entries stay together.
+  // One readdir per directory rather than readdirSync's `recursive` option,
+  // so an unreadable subtree or a symlink cycle costs only itself, not the
+  // whole pattern. Symlinked directories are descended: every spelling the
+  // sandboxed command could read through is listed, so a target reached
+  // twice is listed twice. The one exception is a link whose target is at or
+  // above a directory on the current descent (the real directory each earlier
+  // link was taken from, and this one), which would never terminate.
   type Frame = {
     dir: string
     /** `dir` with every symlink resolved. */
@@ -1007,10 +1022,10 @@ export function walkGlobPattern(
   } catch {
     // Vanished between the existence check and here: list what remains.
   }
-  walk.baseReal = baseReal
+  walk.base = { dir: baseDir, real: baseReal }
   const pending: Frame[] = [{ dir: baseDir, real: baseReal, linkedFrom: [] }]
-  while (pending.length > 0) {
-    const { dir, real, linkedFrom } = pending.pop()!
+  for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
+    const { dir, real, linkedFrom } = frame
     let entries: fs.Dirent[]
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true })
@@ -1040,19 +1055,18 @@ export function walkGlobPattern(
       if (!entry.isSymbolicLink()) continue
       walk.symlinks.add(fullPath)
       if (process.platform === 'win32') {
-        // A reparse point (junction, directory symlink) is listed but not
-        // descended, as readdirSync's recursive listing never did on
-        // Windows; the cycle check below also speaks POSIX separators.
+        // The Windows ACL expansion does not follow reparse points
+        // (junctions, directory symlinks), and the `cycle` check compares
+        // POSIX-separated paths.
         continue
       }
-      // A link pays a stat and, when it leads to a directory, a realpath.
       let target: string | undefined
       try {
         if (fs.statSync(fullPath).isDirectory()) {
           target = fs.realpathSync(fullPath)
         }
       } catch {
-        // Dangling, or vanished: nothing to descend into.
+        // Dangling, vanished or not traversable: nothing to descend into.
       }
       if (target === undefined) continue
       if (directoryRegex?.test(candidate)) {
