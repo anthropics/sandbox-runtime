@@ -18,14 +18,8 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 
-// Every directory strictly between a deny bind's dest and its outermost
-// covering allowWrite root is pinned with a read-only self-bind emitted
-// straight after `--ro-bind / /`, beneath every allow bind, deny bind, tmpfs
-// and mask. Buried like that it still makes the directory a mountpoint, so
-// rename/rmdir of the directory itself fail EBUSY and the deny cannot be
-// moved aside and the path recreated unprotected, while permissions are
-// decided entirely by the later mounts and renames into, out of or across a
-// pinned directory see no mount boundary.
+// The blocks that execute bwrap need unprivileged user namespaces; the
+// argument-level assertions run everywhere on Linux.
 describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   let BASE: string
   let PROJECT: string
@@ -49,14 +43,16 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       { timeout: 5000 },
     ).status === 0
 
-  function mkTree(root: string, tree: Record<string, unknown>): void {
+  type Tree = { [name: string]: string | Tree }
+
+  function mkTree(root: string, tree: Tree): void {
     for (const [name, value] of Object.entries(tree)) {
       const p = join(root, name)
       if (typeof value === 'string') {
         writeFileSync(p, value)
       } else {
         mkdirSync(p, { recursive: true })
-        mkTree(p, value as Record<string, unknown>)
+        mkTree(p, value)
       }
     }
   }
@@ -103,6 +99,8 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       encoding: 'utf8',
       timeout: 15000,
       cwd: PROJECT,
+      // The EBUSY assertions match strerror text.
+      env: { ...process.env, LC_ALL: 'C' },
     })
   }
 
@@ -118,12 +116,9 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     // .git sits strictly between the leaf denies and the allowWrite root.
     const gitPin = `--ro-bind ${gitDir} ${gitDir}`
     expect(command).toContain(gitPin)
-    // The pin lands straight after the read-only root: before the allow
-    // root's writable bind and before the leaf deny.
     const rootBind = `--bind ${PROJECT} ${PROJECT}`
     expect(command.indexOf(gitPin)).toBeLessThan(command.indexOf(rootBind))
     expect(command.indexOf(gitPin)).toBeLessThan(command.indexOf(configBind))
-    // Nothing outside the writable set is pinned.
     const outside = dirname(PROJECT)
     expect(command).not.toContain(`--ro-bind ${outside} ${outside}`)
     // The allowWrite root is bound exactly once (its allow bind); a pin there
@@ -238,13 +233,12 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     )
 
     const dataTmpfs = `--tmpfs ${dataDir}`
-    const yTmpfs = `--tmpfs ${yDir}`
+    // Space-terminated: yDir is a string prefix of dataDir.
+    const yTmpfs = `--tmpfs ${yDir} `
     const appPin = `--ro-bind ${appDir} ${appDir}`
     const xPin = `--ro-bind ${join(PROJECT, 'x')} ${join(PROJECT, 'x')}`
     expect(command).toContain(dataTmpfs)
     expect(command).toContain(yTmpfs)
-    // app contains the data tmpfs and x contains the y tmpfs; both are
-    // pinned regardless, and each tmpfs is emitted after (on top of) its pin.
     expect(command).toContain(appPin)
     expect(command).toContain(xPin)
     expect(command.indexOf(appPin)).toBeLessThan(command.indexOf(dataTmpfs))
@@ -255,7 +249,8 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     if (BWRAP_CAN_NAMESPACE) {
       const result = run(command)
-      expect(result.stdout ?? '').not.toContain('TOPSECRET')
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).not.toContain('TOPSECRET')
       expect(readFileSync(secretPath, 'utf8')).toBe('TOPSECRET\n')
       expect(readFileSync(configPath, 'utf8')).toBe('[core]\n')
     }
@@ -372,7 +367,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     )
 
     if (BWRAP_CAN_NAMESPACE) {
-      run(command)
+      expect(run(command).stdout).toContain('DONE')
       expect(existsSync(join(repoDir, '.git', 'planted'))).toBe(false)
       expect(readFileSync(join(appDir, 'owned.txt'), 'utf8')).toBe('KEEP\n')
     }
@@ -411,7 +406,8 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   })
 
   it('keeps a deny leaf protected when its carve-out sits inside a denyRead inside a denied directory', async () => {
-    // denyWrite dir ⊃ denyRead ⊃ allowWrite carve-out ⊃ denyWrite leaf: the
+    // denyWrite dir > denyRead > allowWrite carve-out > denyWrite leaf, each
+    // containing the next: the
     // tmpfs re-application must not restore a write path with an emitted
     // deny bind under it.
     mkTree(PROJECT, { d: { t: { w: { secret: 'PROTECT\n' } }, 'o.txt': 'X' } })
@@ -433,7 +429,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     )
 
     if (BWRAP_CAN_NAMESPACE) {
-      run(command)
+      expect(run(command).stdout).toContain('DONE')
       expect(readFileSync(secretPath, 'utf8')).toBe('PROTECT\n')
     }
   })
@@ -454,6 +450,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     if (BWRAP_CAN_NAMESPACE) {
       const result = run(command)
       expect(result.status).not.toBe(0)
+      expect(result.stderr).toMatch(/busy/i)
       expect(existsSync(join(PROJECT, 'config-moved'))).toBe(false)
       expect(readFileSync(secretPath, 'utf8')).toBe('{"k":"REAL"}\n')
     }
@@ -479,8 +476,6 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     const credsPin = `--ro-bind ${credsDir} ${credsDir}`
     expect(command).toContain(credsPin)
-    // The pin lands before the mask, so nothing buries the fake and it is
-    // emitted exactly once.
     const maskBind = `--ro-bind ${fakePath} ${realPath}`
     expect(command.indexOf(maskBind)).toBeGreaterThan(command.indexOf(credsPin))
     expect(command.lastIndexOf(maskBind)).toBe(command.indexOf(maskBind))
@@ -509,7 +504,8 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     if (BWRAP_CAN_NAMESPACE) {
       const result = run(command)
-      expect(result.stdout ?? '').not.toContain('MASKME')
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).not.toContain('MASKME')
       expect(readFileSync(secretCanonical, 'utf8')).toBe('MASKME\n')
     }
   })
@@ -531,7 +527,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command.lastIndexOf(wBind)).toBeLessThan(command.lastIndexOf(DRo))
 
     if (BWRAP_CAN_NAMESPACE) {
-      run(command)
+      expect(run(command).stdout).toContain('DONE')
       expect(existsSync(join(wDir, 'planted.txt'))).toBe(false)
     }
   })
@@ -558,7 +554,8 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     if (BWRAP_CAN_NAMESPACE) {
       const result = run(command)
-      expect(result.stdout ?? '').not.toContain('MASKME')
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).not.toContain('MASKME')
       expect(readFileSync(secretCanonical, 'utf8')).toBe('MASKME\n')
     }
   })
@@ -584,25 +581,32 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   )
 
   it.if(BWRAP_CAN_NAMESPACE)(
-    'blocks rmdir and exchange-rename of the pinned directory',
+    'blocks rmdir of the pinned directory',
     async () => {
       mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
 
-      // renameat2(RENAME_EXCHANGE) must fail EBUSY (errno 16): the python
-      // probe exits 0 only in that case.
-      const exchangeProbe =
-        Bun.which('python3') === null
-          ? 'true'
-          : `mkdir exch && python3 -c "import ctypes, os, sys; libc = ctypes.CDLL('libc.so.6', use_errno=True); r = libc.renameat2(-100, b'.git', -100, b'exch', 2); sys.exit(0 if r != 0 and ctypes.get_errno() == 16 else 1)"`
+      const result = run(await wrap({}, `cd ${PROJECT} && rmdir .git`))
+
+      expect(result.status).not.toBe(0)
+      expect(result.stderr).toMatch(/busy/i)
+      expect(existsSync(join(PROJECT, '.git'))).toBe(true)
+    },
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE && Bun.which('python3') !== null)(
+    'blocks an exchange-rename of the pinned directory',
+    async () => {
+      mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' }, exch: {} })
+
+      // renameat2(RENAME_EXCHANGE) must fail EBUSY (errno 16): the probe
+      // exits 0 only in that case.
       const command = await wrap(
         {},
-        `cd ${PROJECT} && rmdir .git 2>&1; ${exchangeProbe}`,
+        `cd ${PROJECT} && python3 -c "import ctypes, os, sys; libc = ctypes.CDLL('libc.so.6', use_errno=True); r = libc.renameat2(-100, b'.git', -100, b'exch', 2); sys.exit(0 if r != 0 and ctypes.get_errno() == 16 else 1)"`,
       )
-      const result = run(command)
 
-      expect(result.status).toBe(0)
-      expect(result.stdout + (result.stderr ?? '')).toMatch(/busy/i)
-      expect(existsSync(join(PROJECT, '.git'))).toBe(true)
+      expect(run(command).status).toBe(0)
+      expect(existsSync(join(PROJECT, '.git', 'config'))).toBe(true)
     },
   )
 
@@ -625,8 +629,6 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       expect(existsSync(join(PROJECT, '.git', 'index'))).toBe(true)
       expect(existsSync(join(PROJECT, 'sub-renamed'))).toBe(true)
 
-      // A plain rename(2) straddling the pinned directory sees no mount
-      // boundary and succeeds without a copy fallback.
       const straddle = await wrap(
         {},
         `cd ${PROJECT} && ${process.execPath} -e "require('fs').renameSync('README.md', '.git/README.md')" && echo STRADDLE_OK`,
@@ -701,8 +703,8 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
         `--ro-bind ${join(appDir, '.git')} ${join(appDir, '.git')}`,
       )
 
-      // The npm-style staging rename (node_modules/.staging/x -> node_modules/
-      // x) inside the pinned directory works as before.
+      // The npm-style staging rename (node_modules/.staging/x to
+      // node_modules/x) inside the pinned directory works.
       const staged = join(appDir, 'node_modules', '.staging', 'left-pad-abc')
       const final = join(appDir, 'node_modules', 'left-pad')
       const npmLike = await wrap(
@@ -713,7 +715,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       expect(npmResult.stdout).toContain('RENAME_OK')
       expect(existsSync(join(final, 'index.js'))).toBe(true)
 
-      // A plain rename(2) that straddles the pinned directory (app ->
+      // A plain rename(2) that straddles the pinned directory (app to
       // PROJECT and back) sees no mount boundary: it succeeds without a
       // copy fallback in either direction.
       const straddle = await wrap(
@@ -728,10 +730,10 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       expect(existsSync(join(appDir, 'notes.txt'))).toBe(false)
 
       // git's ordinary object/index/ref writes, including its atomic
-      // rename-into-place of lockfiles within .git, work as before.
+      // rename-into-place of lockfiles within .git, work.
       const gitWork = await wrap(
         {},
-        `cd ${appDir} && git add index.js && git -c user.name=t -c user.email=t@t commit -q -m init && git log --oneline | wc -l && echo GIT_OK`,
+        `cd ${appDir} && git add index.js && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false commit -q -m init && git log --oneline | wc -l && echo GIT_OK`,
       )
       const gitResult = run(gitWork)
       expect(gitResult.status).toBe(0)
@@ -739,55 +741,6 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       expect(existsSync(join(appDir, '.git', 'refs', 'heads', 'main'))).toBe(
         true,
       )
-    },
-  )
-
-  it.if(BWRAP_CAN_NAMESPACE)(
-    'a pinned directory under a writable allow root cannot itself be renamed or removed, but work inside it and renames out of it succeed',
-    async () => {
-      // nested/.git/config is a mandatory deny found by the depth scan, so
-      // nested (an intermediate directory directly under the writable
-      // project root) is pinned.
-      mkTree(PROJECT, {
-        nested: { '.git': { hooks: {}, config: '[core]\n' } },
-        sibling: {},
-      })
-      const nestedDir = join(PROJECT, 'nested')
-      const siblingDir = join(PROJECT, 'sibling')
-
-      const plan = await wrap()
-      expect(plan).toContain(`--ro-bind ${nestedDir} ${nestedDir}`)
-
-      const mvSelf = run(await wrap({}, `cd ${PROJECT} && mv nested nested2`))
-      expect(mvSelf.status).not.toBe(0)
-      expect(mvSelf.stderr ?? '').toContain('Device or resource busy')
-      expect(existsSync(join(PROJECT, 'nested2'))).toBe(false)
-
-      const rmdirSelf = run(await wrap({}, `cd ${PROJECT} && rmdir nested`))
-      expect(rmdirSelf.status).not.toBe(0)
-      expect(rmdirSelf.stderr ?? '').toContain('Device or resource busy')
-      expect(existsSync(nestedDir)).toBe(true)
-
-      const inside = run(
-        await wrap(
-          {},
-          `cd ${nestedDir} && echo a > new.txt && mv new.txt renamed.txt && echo INSIDE_OK`,
-        ),
-      )
-      expect(inside.stdout).toContain('INSIDE_OK')
-      expect(existsSync(join(nestedDir, 'renamed.txt'))).toBe(true)
-
-      // rename(2) from inside the pinned directory to a sibling outside it:
-      // no mount boundary on the lookup path, so no EXDEV.
-      const out = run(
-        await wrap(
-          {},
-          `cd ${PROJECT} && ${process.execPath} -e "try { require('fs').renameSync('nested/renamed.txt', 'sibling/renamed.txt'); console.log('NO_ERROR') } catch (e) { console.log('CODE=' + e.code) }"`,
-        ),
-      )
-      expect(out.stdout).toContain('NO_ERROR')
-      expect(existsSync(join(siblingDir, 'renamed.txt'))).toBe(true)
-      expect(existsSync(join(nestedDir, 'renamed.txt'))).toBe(false)
     },
   )
 
