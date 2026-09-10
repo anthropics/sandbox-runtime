@@ -441,40 +441,31 @@ function capabilityArgs(usesSeccompHelper: boolean): string[] {
   return args
 }
 
-/** Linux's per-argument cap (MAX_ARG_STRLEN, 32 pages) on 4 KiB-page kernels. */
+/**
+ * Size at which the profile moves to a `--args` file: Linux's per-argument
+ * cap (MAX_ARG_STRLEN, 32 pages) on a 4 KiB-page kernel, the smallest there is.
+ */
 const LINUX_MAX_ARG_STRLEN = 128 * 1024
 
 /**
- * The fd an over-long profile's `--args` file is opened on. A single digit,
- * since dash (Debian/Ubuntu's /bin/sh) rejects multi-digit redirections, and
- * high, since embedders hand the command low fds of their own (an extra
- * stdio pipe, or a helper binary passed as `/proc/self/fd/3`). When the
- * caller's seccompConfig.applyPath names this very fd, the next one down is
- * used instead.
+ * The fd the `--args` file is opened on: a single digit, since dash rejects
+ * multi-digit redirections, and high, since embedders hand the command low
+ * fds of their own (an extra stdio pipe, a helper as `/proc/self/fd/3`).
  */
 const BWRAP_ARGS_FD = 9
 
-function bwrapArgsFdFor(seccompApplyPath: string | undefined): number {
-  const taken = seccompApplyPath?.match(/^\/(?:proc\/self|dev)\/fd\/(\d+)$/)
-  return Number(taken?.[1]) === BWRAP_ARGS_FD
-    ? BWRAP_ARGS_FD - 1
-    : BWRAP_ARGS_FD
-}
-
 /**
- * Per-process directory for the `bwrap --args` files of profiles too large
- * for one shell argument, created on the first sandboxed wrap and ro-bound
- * over itself in EVERY profile this process generates (the INVARIANT at the
- * end of generateFilesystemArgs). bwrap reads a file only when the embedder
- * spawns the string; until then no sandbox this process launched may be
- * able to write there, or a sandboxed command could rewrite the next
- * command's profile. The rendered string unlinks its file as soon as the
- * shell has opened it, so a file lives from the wrap to the spawn; one never
- * spawned goes with the mount points. The directory lives for the whole
- * process — never removed at reset(), since a sandbox launched before a
- * reset may still be running with it bound — and goes at exit.
+ * Per-process directory for `--args` files. INVARIANT: every profile this
+ * process generates ro-binds it (generateFilesystemArgs), so no sandbox it
+ * launched can rewrite a profile bwrap has yet to read. Removed at exit, not
+ * at reset(): a sandbox launched before a reset may still have it bound.
  */
 let bwrapArgsDir: string | undefined
+/**
+ * The directory was re-created while an earlier sandbox, which never bound
+ * the new one, may still be running. Cleared once no sandbox is active.
+ */
+let bwrapArgsDirUnboundInLiveSandbox = false
 const bwrapArgsFiles: Set<string> = new Set()
 let bwrapArgsFileCount = 0
 
@@ -482,19 +473,73 @@ function ensureBwrapArgsDir(): string {
   if (bwrapArgsDir !== undefined && fs.existsSync(bwrapArgsDir)) {
     return bwrapArgsDir
   }
-  if (bwrapArgsDir !== undefined) {
-    // Removed under us (an age-based clean of os.tmpdir()): a profile
-    // binding a gone path would never start, so a fresh one is made — but
-    // a sandbox launched earlier that is still running never bound it, and
-    // could write there. Say so.
-    logForDebugging(
-      `[Sandbox Linux] --args directory ${bwrapArgsDir} was removed; re-creating it. Sandboxes started before this point do not have the new directory read-only.`,
-      { level: 'warn' },
-    )
+  // Removed under us (an age-based clean of os.tmpdir()). Profiles that fit
+  // the command line only bind the directory, so a fresh one keeps them
+  // starting; writing a file into it is what renderBwrapInvocation refuses
+  // while the flag is set. The count includes the wrap in progress.
+  if (bwrapArgsDir !== undefined && activeSandboxCount > 1) {
+    bwrapArgsDirUnboundInLiveSandbox = true
   }
   bwrapArgsDir = fs.mkdtempSync(path.join(tmpdir(), 'srt-bwrap-args-'))
   registerExitCleanupHandler()
   return bwrapArgsDir
+}
+
+/**
+ * The shell string that runs bwrap with `bwrapArgs`; the words from
+ * `trailerStart` on are the `-- <shell> -c <command>` trailer. The caller
+ * runs it as the one argument of `sh -c`, so past the per-argument cap the
+ * options go through `--args` from a file under `argsDir` and only the
+ * trailer stays on the line (a command that alone exceeds the kernel's cap
+ * still fails at spawn). Throws when the file cannot be written safely.
+ */
+function renderBwrapInvocation(
+  bwrapBinary: string,
+  bwrapArgs: string[],
+  trailerStart: number,
+  argsDir: string,
+): string {
+  const inline = quote([bwrapBinary, ...bwrapArgs])
+  const inlineBytes = Buffer.byteLength(inline, 'utf8')
+  if (inlineBytes + 1 <= LINUX_MAX_ARG_STRLEN) {
+    return inline
+  }
+  if (bwrapArgsDirUnboundInLiveSandbox) {
+    throw new Error(
+      `Sandbox profile is too long for one shell argument (${inlineBytes} bytes) and cannot be passed through a file yet: ${argsDir} replaced a directory that was removed while an earlier sandboxed command, which does not have the new one read-only, may still be running. Retry once earlier sandboxed commands have finished.`,
+    )
+  }
+  const argsFile = path.join(
+    argsDir,
+    `args-${process.pid}-${++bwrapArgsFileCount}`,
+  )
+  // Tracked before the write, so a failed write is cleaned up as well.
+  bwrapArgsFiles.add(argsFile)
+  fs.writeFileSync(
+    argsFile,
+    bwrapArgs
+      .slice(0, trailerStart)
+      .map(arg => arg + '\0')
+      .join(''),
+    { mode: 0o600, flag: 'wx' },
+  )
+  logForDebugging(
+    `[Sandbox Linux] bwrap options moved to ${argsFile} (fd ${BWRAP_ARGS_FD}): the command line would be ${inlineBytes} bytes as one argument`,
+  )
+  // The redirect opens the file before the group runs and rm unlinks it at
+  // once (bwrap reads the open fd), so a file lives only from the wrap to
+  // the spawn. `command` bypasses an rm alias or function of the embedder's
+  // shell (zsh reads .zshenv for -c).
+  return (
+    `{ command rm -f -- ${quote([argsFile])}; exec ` +
+    quote([
+      bwrapBinary,
+      '--args',
+      String(BWRAP_ARGS_FD),
+      ...bwrapArgs.slice(trailerStart),
+    ]) +
+    `; } ${BWRAP_ARGS_FD}<${quote([argsFile])}`
+  )
 }
 
 function removeBwrapArgsDir(): void {
@@ -552,6 +597,8 @@ function registerExitCleanupHandler(): void {
  *
  * Pass `{ force: true }` to delete unconditionally — used by the process-exit
  * handler and reset() where deferral is not meaningful.
+ *
+ * Also removes the `--args` files of wraps that were never spawned.
  */
 export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
   if (!opts?.force) {
@@ -600,10 +647,11 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
       fs.rmSync(argsFile, { force: true })
     } catch {
       // Unremovable (a permission change under the directory): cleanup
-      // must not throw at the caller, as for the mount points above.
+      // must not throw at the caller.
     }
   }
   bwrapArgsFiles.clear()
+  bwrapArgsDirUnboundInLiveSandbox = false
 }
 
 /**
@@ -1027,6 +1075,7 @@ async function generateFilesystemArgs(
   writeConfig: FsWriteRestrictionConfig | undefined,
   maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
   maskedFileStoreDir: string | undefined,
+  argsDir: string,
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
@@ -1795,16 +1844,9 @@ async function generateFilesystemArgs(
   if (maskedFileStoreDir !== undefined) {
     args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
   }
-  // The same invariant for the --args directory (bwrapArgsDir): a profile
-  // bwrap has yet to read sits there, and an earlier sandbox of this
-  // process may still be running with the directory's parent writable.
-  // Like the store's bind, this one lands even beneath a denyRead tmpfs
-  // over tmpdir, so the pending profiles (deny paths, --setenv values) are
-  // readable there — the same bytes a sandbox already sees in its own
-  // /proc/1/cmdline and environment.
-  if (bwrapArgsDir !== undefined) {
-    args.push('--ro-bind', bwrapArgsDir, bwrapArgsDir)
-  }
+  // Lands even beneath a denyRead tmpfs over tmpdir, so another command's
+  // profile is readable there between its wrap and its spawn.
+  args.push('--ro-bind', argsDir, argsDir)
 
   return args
 }
@@ -1926,8 +1968,7 @@ export async function wrapCommandWithSandboxLinux(
   let applySeccompPrefix: string | undefined
 
   try {
-    // Before the profile is generated, so this one ro-binds it too; inside
-    // the try, so a failure gives the count back.
+    // Inside the try, so a failure gives the count back.
     const argsDir = ensureBwrapArgsDir()
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
@@ -2102,6 +2143,7 @@ export async function wrapCommandWithSandboxLinux(
       writeConfig,
       maskedFileBinds,
       maskedFileStoreDir,
+      argsDir,
       ripgrepConfig,
       mandatoryDenySearchDepth,
       allowGitConfig,
@@ -2181,60 +2223,12 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    let wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
-    const oneArgumentBytes = Buffer.byteLength(wrappedCommand, 'utf8')
-    if (oneArgumentBytes + 1 > LINUX_MAX_ARG_STRLEN) {
-      // The caller runs this string as the one argument of `sh -c`, and
-      // Linux caps a single argv element at MAX_ARG_STRLEN (the byte count
-      // plus its NUL), so a profile this large would fail every spawn with
-      // E2BIG. Hand the options to bwrap through `--args`, which reads them
-      // NUL-separated from an fd (and closes it before the command starts);
-      // only the trailer stays on the line. bwrap still caps the number of
-      // parsed arguments (MAX_ARGS, 9000: about 3000 mounts), so a profile
-      // should still be kept small at the source.
-      const argsFd = bwrapArgsFdFor(seccompConfig?.applyPath)
-      // The directory this profile ro-binds (created above, before the
-      // filesystem arguments were generated).
-      const argsFile = path.join(
-        argsDir,
-        `args-${process.pid}-${++bwrapArgsFileCount}`,
-      )
-      // The redirect opens the file before the group runs, and rm unlinks
-      // it at once (the open fd keeps it readable for bwrap), so the file
-      // lives only until the spawn — the window the ro-bind covers — and
-      // never accumulates while a sandbox stays active. `command` keeps an
-      // rm alias of the embedder's shell (zsh reads .zshenv for -c) out of
-      // the way.
-      const viaArgsFile =
-        `{ command rm -f -- ${quote([argsFile])}; exec ` +
-        quote([
-          bwrapPath ?? 'bwrap',
-          '--args',
-          String(argsFd),
-          ...bwrapArgs.slice(trailerStart),
-        ]) +
-        `; } ${argsFd}<${quote([argsFile])}`
-      if (Buffer.byteLength(viaArgsFile, 'utf8') + 1 > LINUX_MAX_ARG_STRLEN) {
-        // The command itself does not fit one argument; nothing here can
-        // help, and the caller's spawn would fail with an opaque E2BIG.
-        throw new Error(
-          `Sandboxed command is too long for one shell argument (${Buffer.byteLength(viaArgsFile, 'utf8')} bytes with the bwrap options already moved to a file; the limit is ${LINUX_MAX_ARG_STRLEN - 1})`,
-        )
-      }
-      fs.writeFileSync(
-        argsFile,
-        bwrapArgs
-          .slice(0, trailerStart)
-          .map(arg => arg + '\0')
-          .join(''),
-        { mode: 0o600, flag: 'wx' },
-      )
-      bwrapArgsFiles.add(argsFile)
-      wrappedCommand = viaArgsFile
-      logForDebugging(
-        `[Sandbox Linux] bwrap options moved to ${argsFile} (fd ${argsFd}): the command line would be ${oneArgumentBytes} bytes as one argument`,
-      )
-    }
+    const wrappedCommand = renderBwrapInvocation(
+      bwrapPath ?? 'bwrap',
+      bwrapArgs,
+      trailerStart,
+      argsDir,
+    )
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')

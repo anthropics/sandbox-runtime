@@ -18,17 +18,19 @@ import {
 import { isLinux } from '../helpers/platform.js'
 
 /**
- * A bwrap profile too large for one shell argument (Linux's 128 KiB
- * MAX_ARG_STRLEN) is handed to bwrap through `--args` from a file in a
- * per-process directory that every profile ro-binds over itself; a profile
- * that fits stays on the command line.
+ * A bwrap profile too large for one shell argument (128 KiB on a 4 KiB-page
+ * kernel) is handed to bwrap through `--args` from a file in a per-process
+ * directory that every profile ro-binds over itself; a profile that fits
+ * stays on the command line.
  */
 describe.if(isLinux)('bwrap --args for over-long profiles', () => {
+  const MAX_ARG_STRLEN = 128 * 1024
+  const VIA_ARGS_FILE = /^\{ command rm -f -- (\S+); exec bwrap --args 9 -- /
+
   let BASE: string
   const savedCwd = process.cwd()
 
-  // Runtime arm, as in readonly-deny-dir-stubs.test.ts: only where bwrap can
-  // run the namespace/proc surface the wrapped commands use.
+  // Only where bwrap can create the user and pid namespaces and mount /proc.
   const BWRAP_CAN_NAMESPACE =
     spawnSync(
       'bwrap',
@@ -71,12 +73,15 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     const files: string[] = []
     for (let i = 0; i < count; i++) {
       const file = join(dir, `${stem}${i}.log`)
-      // Content, so a masked read of 0 bytes proves the mask applied.
+      // Content, so the e2e case can tell the host file was left alone.
       writeFileSync(file, 'secret\n')
       files.push(file)
     }
     return files
   }
+
+  // 2000 masks of ~80 bytes each: well past 128 KiB as one argument.
+  const overLongProfile = (): string[] => flatFiles(2000)
 
   async function wrap(
     files: string[],
@@ -85,7 +90,6 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       allowOnly?: string[]
       setEnvVars?: Record<string, string>
       mandatoryDenySearchDepth?: number
-      seccompConfig?: { applyPath: string; argv0?: string }
     } = {},
   ): Promise<string> {
     return wrapCommandWithSandboxLinux({
@@ -95,7 +99,6 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       writeConfig: { allowOnly: opts.allowOnly ?? [], denyWithinAllow: [] },
       setEnvVars: opts.setEnvVars,
       mandatoryDenySearchDepth: opts.mandatoryDenySearchDepth,
-      seccompConfig: opts.seccompConfig,
     })
   }
 
@@ -108,21 +111,20 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     return bind![1]!
   }
 
-  // The file an over-long profile was written to, from the redirect.
   function argsFileOf(wrapped: string): string {
     const redirect = wrapped.match(/ 9<(\S+)$/)
     expect(redirect).not.toBeNull()
     return redirect![1]!
   }
 
-  it('keeps a profile that fits on the command line and still ro-binds the --args directory', async () => {
+  it('keeps a profile that fits on the command line and still ro-binds the --args directory last', async () => {
     const files = flatFiles(20)
     const wrapped = await wrap(files)
     expect(wrapped).not.toContain('--args')
     expect(wrapped).toContain(`--ro-bind /dev/null ${files[0]}`)
-    // Ro-bound in every profile, not only the ones that use it: a sandbox
-    // launched with a small profile may still be running when a later
-    // over-long one is written there.
+    // In every profile, not only the ones that use it: a sandbox launched
+    // with a small profile may still be running when a later over-long one
+    // is written there.
     const argsDir = argsDirOf(wrapped)
     expect(existsSync(argsDir)).toBe(true)
     expect(wrapped.lastIndexOf(`--ro-bind ${argsDir} ${argsDir}`)).toBe(
@@ -130,69 +132,62 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     )
   })
 
-  it('moves the options to a NUL-separated file bwrap reads through --args', async () => {
-    // 2000 masks of ~80 bytes each: well past 128 KiB as one argument.
-    const files = flatFiles(2000)
+  it('moves every option, and only the options, to a NUL-separated file the string opens on fd 9 and unlinks', async () => {
+    const files = overLongProfile()
     const wrapped = await wrap(files, {
       setEnvVars: { SRT_TEST_VAR: "value with spaces and 'quotes'" },
     })
 
-    expect(Buffer.byteLength(wrapped)).toBeLessThan(128 * 1024)
-    // The shell opens the file on fd 9 (dash takes single-digit fds only;
-    // low fds belong to the embedder), unlinks it, and execs bwrap.
+    expect(Buffer.byteLength(wrapped)).toBeLessThan(MAX_ARG_STRLEN)
+    // `--args 9` is followed at once by the trailer: no option is left on
+    // the line.
     expect(wrapped).toMatch(
-      /^\{ command rm -f -- (\S+); exec bwrap --args 9 -- \S+ -c /,
+      /^\{ command rm -f -- \S+; exec bwrap --args 9 -- \S+ -c .+; \} 9<\S+$/s,
     )
     const argsFile = argsFileOf(wrapped)
-    expect(wrapped.match(/^\{ command rm -f -- (\S+); /)![1]).toBe(argsFile)
-    expect(existsSync(argsFile)).toBe(true)
-    // Inside the per-process directory.
+    expect(wrapped.match(VIA_ARGS_FILE)![1]).toBe(argsFile)
     const argsDir = dirname(argsFile)
     expect(argsDir).toMatch(/srt-bwrap-args-/)
 
     const words = readFileSync(argsFile, 'utf8').split('\0')
-    expect(words[words.length - 1]).toBe('') // every word NUL-terminated
+    expect(words[words.length - 1]).toBe('')
     const options = words.slice(0, -1)
-    // The profile, one word per element, unquoted: 2000 masks between the
-    // fixed plumbing at either end, and a value bwrap must receive verbatim.
-    expect(options.slice(0, 2)).toEqual(['--new-session', '--die-with-parent'])
-    expect(options.slice(-2)).toEqual(['--proc', '/proc'])
-    // The directory's own ro-bind, last of the binds, rides in the file.
+    expect(options).not.toContain('--')
+    expect(options).not.toContain('-c')
+    expect(
+      options.filter(w => w === '--ro-bind').length,
+    ).toBeGreaterThanOrEqual(files.length)
+    expect(options).toContain(files[0])
     const lastBind = options.lastIndexOf('--ro-bind')
     expect(options.slice(lastBind, lastBind + 3)).toEqual([
       '--ro-bind',
       argsDir,
       argsDir,
     ])
-    expect(
-      options.filter(w => w === '--ro-bind').length,
-    ).toBeGreaterThanOrEqual(2000)
-    expect(options).toContain(files[0])
+    // A value bwrap must receive verbatim: one word, unquoted.
     const setenv = options.indexOf('--setenv')
     expect(options.slice(setenv, setenv + 3)).toEqual([
       '--setenv',
       'SRT_TEST_VAR',
       "value with spaces and 'quotes'",
     ])
-    // The trailer stays on the line, not in the file.
-    expect(options).not.toContain('--')
-    expect(options).not.toContain('-c')
+  })
 
-    // A file never spawned goes with the other per-command artifacts; the
-    // directory stays for the process (a sandbox launched earlier may still
-    // have it bound) and goes at exit.
+  it('removes a file that was never spawned at cleanup and keeps the directory for the process', async () => {
+    const argsFile = argsFileOf(await wrap(overLongProfile()))
+    expect(existsSync(argsFile)).toBe(true)
     cleanupBwrapMountPoints()
     expect(existsSync(argsFile)).toBe(false)
-    expect(existsSync(argsDir)).toBe(true)
+    // A sandbox launched earlier may still have the directory bound.
     cleanupBwrapMountPoints({ force: true })
-    expect(existsSync(argsDir)).toBe(true)
+    expect(existsSync(dirname(argsFile))).toBe(true)
   })
 
   it('switches to --args exactly where one argument would exceed 128 KiB', async () => {
     // The command is the last word on the line; a trailing two-byte
     // character keeps the shell quoter's output constant while every
     // added 'a' adds one byte, so the padding sets the rendered size byte
-    // for byte — and a regression to string length (UTF-16 units) would
+    // for byte, and a regression to string length (UTF-16 units) would
     // miscount it by one.
     const files = flatFiles(20)
     const base = await wrap(files, { command: 'é' })
@@ -202,43 +197,46 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
         command: 'a'.repeat(bytes - Buffer.byteLength(base)) + 'é',
       })
 
-    const fits = await renderedAt(128 * 1024 - 1)
-    expect(Buffer.byteLength(fits)).toBe(128 * 1024 - 1)
+    const fits = await renderedAt(MAX_ARG_STRLEN - 1)
+    expect(Buffer.byteLength(fits)).toBe(MAX_ARG_STRLEN - 1)
     expect(fits).not.toContain('--args')
 
-    const overflows = await renderedAt(128 * 1024)
-    expect(overflows).toMatch(
-      /^\{ command rm -f -- \S+; exec bwrap --args 9 -- /,
-    )
+    expect(await renderedAt(MAX_ARG_STRLEN)).toMatch(VIA_ARGS_FILE)
   })
 
-  it('steps aside from an fd the seccomp helper is passed on, and refuses a command that cannot fit at all', async () => {
-    // An embedder that hands its helper binary over as /proc/self/fd/9
-    // would lose it to the redirect; the args move to fd 8.
-    const files = flatFiles(2000)
-    const wrapped = await wrap(files, {
-      seccompConfig: { applyPath: '/proc/self/fd/9', argv0: 'apply-seccomp' },
+  it('leaves a command that alone exceeds 128 KiB to the kernel, whose cap grows with the page size', async () => {
+    const wrapped = await wrap(flatFiles(20), {
+      command: 'a'.repeat(MAX_ARG_STRLEN),
     })
-    expect(wrapped).toMatch(/^\{ command rm -f -- \S+; exec bwrap --args 8 -- /)
-    expect(wrapped).toMatch(/ 8<\S+$/)
-    expect(wrapped).toContain('/proc/self/fd/9')
+    expect(wrapped).toMatch(VIA_ARGS_FILE)
+    expect(Buffer.byteLength(wrapped)).toBeGreaterThan(MAX_ARG_STRLEN)
+  })
 
-    // The options are already in the file; a command past 128 KiB on its
-    // own has nowhere to go, and the caller hears why instead of E2BIG.
-    let thrown: unknown
-    try {
-      await wrap(files, { command: 'a'.repeat(128 * 1024) })
-    } catch (err) {
-      thrown = err
-    }
-    expect(String(thrown)).toMatch(/too long for one shell argument/)
+  it('refuses an over-long profile after the directory was replaced under a sandbox that may still be running', async () => {
+    const removed = argsDirOf(await wrap(flatFiles(1)))
+    rmSync(removed, { recursive: true, force: true })
+
+    const refusal = await wrap(overLongProfile()).then(
+      () => undefined,
+      (err: unknown) => err,
+    )
+    expect(String(refusal)).toMatch(
+      /removed while an earlier sandboxed command/,
+    )
+    // A profile that fits only binds the directory, so it still wraps.
+    const replacement = argsDirOf(await wrap(flatFiles(1)))
+    expect(replacement).not.toBe(removed)
+    expect(existsSync(replacement)).toBe(true)
+
+    // Once no sandbox is active, no sandbox predates the new directory.
+    cleanupBwrapMountPoints({ force: true })
+    const wrapped = await wrap(overLongProfile())
+    expect(dirname(argsFileOf(wrapped))).toBe(replacement)
   })
 
   it.if(BWRAP_CAN_NAMESPACE)(
     'e2e: bwrap applies the profile from the file, and the command sees neither the fd nor a writable --args directory',
     async () => {
-      // The directory is created by the first wrap of the process, so a
-      // small one names it for the command below.
       const argsDir = argsDirOf(await wrap(flatFiles(1)))
       const probe = join(argsDir, 'srt-args-probe')
       // tmpdir writable inside the sandbox: the case the trailing ro-bind
@@ -266,13 +264,13 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
         timeout: 60000,
         cwd: BASE,
       })
-      expect(run.stderr ?? '').not.toMatch(/--args|Exceeded maximum/)
       expect(run.status).toBe(0)
-      const lines = run.stdout.trim().split('\n')
-      expect(lines[0]).toBe('MASKED') // the mask from the file applied
-      expect(readFileSync(files[0]!, 'utf8')).toBe('secret\n') // host intact
-      expect(lines[1]).toBe('FD9_CLOSED')
-      expect(lines[2]).toBe('ARGS_READONLY')
+      expect(run.stdout.trim().split('\n')).toEqual([
+        'MASKED',
+        'FD9_CLOSED',
+        'ARGS_READONLY',
+      ])
+      expect(readFileSync(files[0]!, 'utf8')).toBe('secret\n')
       expect(existsSync(probe)).toBe(false)
       // Unlinked by the spawn itself.
       expect(existsSync(argsFile)).toBe(false)

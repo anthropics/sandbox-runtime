@@ -652,6 +652,8 @@ Filesystem restrictions are enforced at the OS level:
 
 **Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas.
 
+**Note (Linux, large profiles):** The wrapped string runs as the one argument of `sh -c`, which Linux caps at 32 pages (128 KiB with 4 KiB pages). A profile past 128 KiB reaches bubblewrap through `--args` instead: the string opens a file on fd 9, unlinks it and runs bubblewrap, so it must run unmodified as the whole `sh -c` script under a POSIX `sh`, with fd 9 free. The file sits in a per-process directory under `os.tmpdir()` that every profile of the process binds read-only, so a command it sandboxed cannot rewrite a pending profile; a sandbox started by another `srt` process with tmpdir writable is not covered. If that directory is removed while a sandboxed command is running, an over-long profile is refused until the earlier commands have finished. The command itself must still fit one argument, and bubblewrap parses at most 9000 arguments (about 3000 mounts).
+
 ### Mandatory Deny Paths (Auto-Protected Files)
 
 Certain sensitive files and directories are **always blocked from writes**, even if they fall within an allowed write path. This provides defense-in-depth against sandbox escapes and configuration tampering.
@@ -679,8 +681,6 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 ```
 
 **Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
-
-**Note (Linux):** The wrapped string becomes the one argument of `sh -c`, and Linux caps a single argument at 128 KiB (`MAX_ARG_STRLEN` on 4 KiB-page kernels). A profile past that is handed to bubblewrap through `--args` from a file in a per-process temporary directory (created under `os.tmpdir()` on the process's first sandboxed wrap) that every profile of that process ro-binds over itself, so a sandboxed command it launched cannot rewrite a profile bubblewrap has yet to read; a sandbox launched by another `srt` process with tmpdir writable is not covered. The string then opens the file on fd 9, unlinks it, and runs bubblewrap, so it must be run unmodified as the whole `sh -c` script under a POSIX `sh`, and fd 9 is consumed there (fd 8 instead when `seccompConfig.applyPath` is `/proc/self/fd/9`); a file never spawned is removed with the other per-command artifacts (`cleanupAfterCommand()`, process exit). The command itself must still fit one argument, and bubblewrap caps a profile at 9000 parsed arguments (about 3000 mounts).
 
 **Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
 
