@@ -290,6 +290,88 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(wrapped).not.toContain(`--ro-bind ${link} ${link}`)
   })
 
+  it('does not restore an allowRead entry that is a symlink into a read-denied directory', async () => {
+    // A command run earlier (or the repository) plants docs -> home/.ssh at
+    // an allowed path: the entry names the link, not what it points at.
+    const proj = tempTree({ 'home/.ssh/id_rsa': 'KEY', 'proj/src.ts': 'x' })
+    const ssh = join(proj, 'home/.ssh')
+    const docs = join(proj, 'proj/docs')
+    symlinkSync(ssh, docs)
+    const wrapped = await wrapCommandWithSandboxLinux({
+      ...baseParams,
+      readConfig: { denyOnly: [ssh], allowWithinDeny: [docs] },
+      writeConfig: { allowOnly: [join(proj, 'proj')], denyWithinAllow: [] },
+    })
+    expect(wrapped).toContain(`--tmpfs ${ssh} `)
+    expect(wrapped).not.toContain(`--ro-bind ${ssh} ${ssh}`)
+    expect(wrapped).not.toContain(`--ro-bind ${docs} `)
+  })
+
+  it('does not restore a file inside a read-denied directory through a symlink planted outside it', async () => {
+    const proj = tempTree({ 'home/.aws/credentials': 'SECRET', 'proj/a': 'x' })
+    const aws = join(proj, 'home/.aws')
+    const credentials = join(aws, 'credentials')
+    const cfg = join(proj, 'proj/cfg.json')
+    symlinkSync(credentials, cfg)
+    const wrapped = await wrapCommandWithSandboxLinux({
+      ...baseParams,
+      readConfig: { denyOnly: [aws], allowWithinDeny: [cfg] },
+      writeConfig: { allowOnly: [join(proj, 'proj')], denyWithinAllow: [] },
+    })
+    expect(wrapped).toContain(`--tmpfs ${aws} `)
+    expect(wrapped).not.toContain(`--ro-bind ${credentials} ${credentials}`)
+  })
+
+  it('keeps a file mask when the allowRead entry is a symlink to the file, even one the deny list names too', async () => {
+    // sub/.env.example -> ../.env, matched by an allowRead glob and by a
+    // denyRead glob: the deny lands on .env (bwrap cannot bind onto a link),
+    // and the allow names the link, so nothing lifts it.
+    const proj = tempTree({ '.env': 'SECRET', 'sub/keep': 'x' })
+    const env = join(proj, '.env')
+    const planted = join(proj, 'sub/.env.example')
+    symlinkSync('../.env', planted)
+    const viaLink = await wrapCommandWithSandboxLinux({
+      ...baseParams,
+      readConfig: { denyOnly: [planted], allowWithinDeny: [planted] },
+      writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
+    })
+    expect(viaLink).toContain(`--ro-bind /dev/null ${env}`)
+    const direct = await wrapCommandWithSandboxLinux({
+      ...baseParams,
+      readConfig: { denyOnly: [env], allowWithinDeny: [planted] },
+      writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
+    })
+    expect(direct).toContain(`--ro-bind /dev/null ${env}`)
+  })
+
+  it('still lifts a file mask for an allowRead entry naming that file through a symlinked directory', async () => {
+    const proj = tempTree({ 'real/.env.example': 'ok' })
+    symlinkSync(join(proj, 'real'), join(proj, 'link'))
+    const file = join(proj, 'real/.env.example')
+    const wrapped = await wrapCommandWithSandboxLinux({
+      ...baseParams,
+      readConfig: {
+        denyOnly: [file],
+        allowWithinDeny: [join(proj, 'link/.env.example')],
+      },
+      writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
+    })
+    expect(wrapped).not.toContain(`--ro-bind /dev/null ${file}`)
+  })
+
+  it('still hides a root child under a root deny when an allowRead entry is a symlink to it', async () => {
+    const proj = tempTree({ 'proj/a': 'x' })
+    const docs = join(proj, 'proj/docs')
+    symlinkSync('/etc', docs)
+    const wrapped = await wrapCommandWithSandboxLinux({
+      ...baseParams,
+      readConfig: { denyOnly: ['/'], allowWithinDeny: [docs] },
+      writeConfig: { allowOnly: [join(proj, 'proj')], denyWithinAllow: [] },
+    })
+    expect(wrapped).toContain('--tmpfs /etc ')
+    expect(wrapped).not.toContain('--ro-bind /etc /etc')
+  })
+
   it('keeps a deny bind under the target of a denyRead symlink that an earlier tmpfs already hid', async () => {
     // home/u/sec -> work/proj/secrets, but home/u is hidden first, so the
     // second tmpfs is created on the first and never reaches work/proj.

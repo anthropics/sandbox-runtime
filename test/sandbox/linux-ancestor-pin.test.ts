@@ -495,11 +495,12 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   it.if(BWRAP_CAN_NAMESPACE)(
     'starts, and honours the carve-out, when a symlink and the directory holding its target are both read-denied',
     async () => {
-      // The merged-/usr shape under a root deny: bin -> usr/bin, lib -> usr/lib.
+      // The merged-/usr shape under a root deny: bin -> usr/bin, lib -> usr/lib,
+      // with the loader directory carved out through the lib link.
       mkTree(PROJECT, {
         usr: {
           bin: { tool: 'TOOL\n' },
-          lib: { so: 'LIB\n' },
+          lib: { x86: { so: 'LIB\n' }, other: 'OTHER\n' },
           share: { doc: 'DOC\n' },
         },
       })
@@ -512,15 +513,43 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
             join(PROJECT, 'bin'),
             join(PROJECT, 'lib'),
           ],
-          allowRead: [join(PROJECT, 'lib')],
+          allowRead: [join(PROJECT, 'lib', 'x86')],
         },
-        `cat ${PROJECT}/lib/so; cat ${PROJECT}/bin/tool 2>&1; cat ${PROJECT}/usr/share/doc 2>&1; echo DONE`,
+        `cat ${PROJECT}/lib/x86/so; cat ${PROJECT}/lib/other 2>&1; cat ${PROJECT}/bin/tool 2>&1; cat ${PROJECT}/usr/share/doc 2>&1; echo DONE`,
       )
       const result = run(command)
       expect(result.stdout).toContain('DONE')
       expect(result.stdout).toContain('LIB')
+      expect(result.stdout).not.toContain('OTHER')
       expect(result.stdout).not.toContain('TOOL')
       expect(result.stdout).not.toContain('DOC')
+    },
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'does not let a symlink planted at an allowRead path re-open a read-denied directory',
+    async () => {
+      const sshDir = join(BASE, 'home', '.ssh')
+      mkTree(BASE, { home: { '.ssh': { id_rsa: 'PRIVATEKEY\n' } } })
+      const docs = join(PROJECT, 'docs')
+      const filesystem = { denyRead: [sshDir], allowRead: [docs] }
+
+      // The first command plants the link where a docs directory is allowed.
+      mkdirSync(docs)
+      const plant = await wrap(
+        filesystem,
+        `rm -rf ${docs} && ln -s ${sshDir} ${docs} && echo PLANTED`,
+      )
+      expect(run(plant).stdout).toContain('PLANTED')
+
+      const next = await wrap(
+        filesystem,
+        `cat ${docs}/id_rsa 2>&1; cat ${sshDir}/id_rsa 2>&1; echo DONE`,
+      )
+      expect(next).not.toContain(`--ro-bind ${sshDir} ${sshDir}`)
+      const result = run(next)
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).not.toContain('PRIVATEKEY')
     },
   )
 

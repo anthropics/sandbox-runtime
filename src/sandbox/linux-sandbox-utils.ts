@@ -953,28 +953,47 @@ function pushReadDenyDirMounts(
     landing: string
     allowedWritePaths: readonly string[]
     readAllowPaths: readonly string[]
-    /** A path's recorded spelling plus its canonical location. */
-    pathForms: (p: string) => string[]
+    /** Where a path resolves to (canonicalForm in the caller). */
+    resolved: (p: string) => string
+    /** Where a path's name lives (nameLocationOf in the caller). */
+    nameLocation: (p: string) => string
   },
 ): { restoredWrites: string[]; restoredReads: string[] } {
-  const { dir, landing, allowedWritePaths, readAllowPaths, pathForms } = unit
-  // The tmpfs wiped what lies beneath its landing; paths are recorded in
-  // either spelling, so both of theirs are tested against both of its.
-  const denyForms = dir === landing ? [dir] : [dir, landing]
-  const underDeniedDir = (p: string): boolean =>
-    pathForms(p).some(pForm => denyForms.some(form => isAtOrUnder(pForm, form)))
+  const { dir, landing, allowedWritePaths, readAllowPaths } = unit
   args.push('--tmpfs', dir)
+
+  // Where to bind allowed path `p` back, if it is a carve-out of this unit:
+  // its name must live inside the denied directory, and so must what it
+  // resolves to, which is where the bind goes. Parent directories may be
+  // symlinks (/lib/x is a carve-out of a tmpfs on /usr, where /lib is a link
+  // to /usr/lib). A path that is itself a symlink INTO the directory is not:
+  // it names the link, which this tmpfs did not hide, and re-allows nothing
+  // the link points at, or a link planted at an allowed path (docs ->
+  // ~/.ssh) would cancel the deny of its target. The bind goes to the
+  // resolved location because bwrap cannot mount onto a symlink whose target
+  // the tmpfs just hid, and can always create a plain path on the tmpfs.
+  const restoreLocationOf = (p: string): string | undefined => {
+    if (!isAtOrUnder(unit.nameLocation(p), landing)) return undefined
+    const resolved = unit.resolved(p)
+    if (!isAtOrUnder(resolved, landing)) {
+      logForDebugging(
+        `[Sandbox Linux] Not restoring ${p} over denyRead tmpfs ${dir}: it resolves outside it, to ${resolved}`,
+      )
+      return undefined
+    }
+    return resolved
+  }
 
   // tmpfs wiped any earlier write binds under this path — restore them.
   const restoredWrites: string[] = []
   for (const writePath of allowedWritePaths) {
-    if (underDeniedDir(writePath)) {
-      args.push('--bind', writePath, writePath)
-      restoredWrites.push(writePath)
-      logForDebugging(
-        `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
-      )
-    }
+    const restoreAt = restoreLocationOf(writePath)
+    if (restoreAt === undefined) continue
+    args.push('--bind', writePath, restoreAt)
+    restoredWrites.push(restoreAt)
+    logForDebugging(
+      `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
+    )
   }
 
   // Re-allow specific paths within the denied directory (allowRead overrides denyRead).
@@ -982,56 +1001,25 @@ function pushReadDenyDirMounts(
   // so they are readable again.
   const restoredReads: string[] = []
   for (const allowPath of readAllowPaths) {
-    if (underDeniedDir(allowPath)) {
-      if (!fs.existsSync(allowPath)) {
-        logForDebugging(
-          `[Sandbox Linux] Skipping non-existent read allow path: ${allowPath}`,
-        )
-        continue
-      }
-      // A symlink-spelled entry is a carve-out of this unit only when its
-      // target lies inside it (/lib/x under a tmpfs on /usr, where /lib is a
-      // link to /usr/lib). One pointing elsewhere was not hidden by this
-      // tmpfs, and binding it here would show that other tree under this
-      // name whatever read-denies cover it there. The bind goes where the
-      // target is: bwrap cannot mount onto a symlink whose target the tmpfs
-      // just hid (/lib after a tmpfs on /usr), and can always create a plain
-      // path on the tmpfs.
-      let resolvedAllow: string
-      try {
-        resolvedAllow = fs.realpathSync(allowPath)
-        if (!denyForms.some(form => isAtOrUnder(resolvedAllow, form))) {
-          logForDebugging(
-            `[Sandbox Linux] Skipping allowRead restore whose target lies outside the denied directory: ${allowPath} -> ${resolvedAllow}`,
-          )
-          continue
-        }
-      } catch (err) {
-        logForDebugging(
-          `[Sandbox Linux] Skipping allowRead restore that could not be resolved (${(err as NodeJS.ErrnoException | undefined)?.code ?? 'unknown'}): ${allowPath}`,
-        )
-        continue
-      }
-      // Skip only if a write path was re-bound just above AND covers
-      // allowPath. A write path that's an ancestor of the deny dir isn't
-      // re-bound (it wasn't wiped), so allowPath under it still needs
-      // its own ro-bind here.
-      if (
-        restoredWrites.some(w =>
-          pathForms(w).some(wForm =>
-            pathForms(allowPath).some(aForm => isAtOrUnder(aForm, wForm)),
-          ),
-        )
-      ) {
-        continue
-      }
-      // Bind the allowed path back over the tmpfs so it's readable
-      args.push('--ro-bind', resolvedAllow, resolvedAllow)
-      restoredReads.push(resolvedAllow)
+    const restoreAt = restoreLocationOf(allowPath)
+    if (restoreAt === undefined) continue
+    if (!fs.existsSync(allowPath)) {
       logForDebugging(
-        `[Sandbox Linux] Re-allowed read access within denied region: ${allowPath}`,
+        `[Sandbox Linux] Skipping non-existent read allow path: ${allowPath}`,
       )
+      continue
     }
+    // Skip only if a write path was re-bound just above AND covers
+    // allowPath. A write path that's an ancestor of the deny dir isn't
+    // re-bound (it wasn't wiped), so allowPath under it still needs
+    // its own ro-bind here.
+    if (restoredWrites.some(w => isAtOrUnder(restoreAt, w))) continue
+    // Bind the allowed path back over the tmpfs so it's readable
+    args.push('--ro-bind', restoreAt, restoreAt)
+    restoredReads.push(restoreAt)
+    logForDebugging(
+      `[Sandbox Linux] Re-allowed read access within denied region: ${allowPath}`,
+    )
   }
   return { restoredWrites, restoredReads }
 }
@@ -1099,6 +1087,15 @@ async function generateFilesystemArgs(
     const canonical = canonicalForm(p)
     return canonical === p ? [p] : [p, canonical]
   }
+  // Where the name `p` lives: its parent directories resolved, its last
+  // component as written. This, not what `p` resolves to, decides which read
+  // deny an allowRead entry is an exception to: an entry that is a symlink
+  // names the link, and re-allows nothing the link points at.
+  const nameLocationOf = (p: string): string => {
+    if (p === '/') return p
+    const parent = canonicalForm(path.dirname(p))
+    return `${parent === '/' ? '' : parent}/${path.basename(p)}`
+  }
   // Whether a canonical path lies inside the write allowlist. The deny
   // pre-pass, the deny loop's --ro-bind gate and the ancestor-pin walk MUST
   // share it: the pre-pass is only sound if it records exactly the
@@ -1149,10 +1146,11 @@ async function generateFilesystemArgs(
   // every prior mount (ro-bind /, write binds, deny binds). /proc and /dev are
   // skipped (the caller remounts them after this function returns) and so is
   // /sys (kernel interface; the host's is already read-only via ro-bind). A
-  // child an allowRead entry covers (equal to it, or an ancestor of where it
-  // lands) is skipped too: the deny is synthetic and the allow is the
-  // caller's, and a tmpfs at the child's canonical location (/bin lands at
-  // /usr/bin) would only be restored over again. /etc/ssh/ssh_config.d is
+  // child an allowRead entry covers (its name is the child, or an ancestor
+  // of where the child lands) is skipped too: the deny is synthetic and the
+  // allow is the caller's, and a tmpfs at the child's canonical location
+  // (/bin lands at /usr/bin) would only be restored over again. An entry
+  // that is a symlink to the child covers nothing: its name lives elsewhere. /etc/ssh/ssh_config.d is
   // always hidden when there is a read policy: ssh is strict about config
   // file ownership and permissions, which can look wrong inside the sandbox
   // ("Bad owner or permissions" under OrbStack). Throws if '/' cannot be
@@ -1171,7 +1169,7 @@ async function generateFilesystemArgs(
         if (['proc', 'dev', 'sys'].includes(child)) continue
         const childLocation = canonicalForm('/' + child)
         const covered = readAllowPaths().some(allowPath =>
-          mountForms(allowPath).some(form => isAtOrUnder(childLocation, form)),
+          isAtOrUnder(childLocation, nameLocationOf(allowPath)),
         )
         if (covered) {
           logForDebugging(
@@ -1774,15 +1772,24 @@ async function generateFilesystemArgs(
         landing,
         allowedWritePaths: isStandIn ? [] : allowedWritePaths,
         readAllowPaths: isStandIn ? [] : readAllowPaths(),
-        pathForms: mountForms,
+        resolved: canonicalForm,
+        nameLocation: nameLocationOf,
       })
       readDenyTmpfsUnits.push({ dir, landing, ...restored })
     } else {
-      // For files, only an exact allowRead match overrides the deny. A
-      // directory allowRead does not un-deny a file specifically listed in
-      // denyRead — otherwise denyRead: ['.env'] + allowRead: ['.'] silently
-      // drops the .env deny.
-      if (readAllowPaths().includes(normalizedPath)) {
+      // For files, only an exact allowRead match overrides the deny: an
+      // entry that names this very file, through whatever symlinked
+      // directories. One that is a symlink to it names the link and lifts
+      // nothing, or a link planted at an allowRead path would cancel the deny
+      // of the file it points at. A directory allowRead does not un-deny a
+      // file specifically listed in denyRead — otherwise denyRead: ['.env']
+      // + allowRead: ['.'] silently drops the .env deny.
+      const deniedFile = canonicalForm(normalizedPath)
+      if (
+        readAllowPaths().some(
+          allowPath => nameLocationOf(allowPath) === deniedFile,
+        )
+      ) {
         logForDebugging(
           `[Sandbox Linux] Skipping read deny for re-allowed path: ${normalizedPath}`,
         )
@@ -1903,7 +1910,8 @@ async function generateFilesystemArgs(
         landing: unit.landing,
         allowedWritePaths: [],
         readAllowPaths: [...unit.restoredWrites, ...unit.restoredReads],
-        pathForms: mountForms,
+        resolved: canonicalForm,
+        nameLocation: nameLocationOf,
       })
     }
   }
