@@ -40,7 +40,7 @@ use windows::core::{PCWSTR, PWSTR};
 
 use crate::job::Job;
 use crate::launch::{SpawnedChild, quote_arg};
-use crate::util::{OwnedHandle, scrub_wstr, wstr};
+use crate::util::{DRIVE_REMOTE, OwnedHandle, scrub_wstr, wstr};
 use crate::winsta::{IsolatedDesk, grant_sandbox_on_session_bno, grant_sandbox_on_winsta};
 
 /// Typed error for [`spawn_runner`] with a mapped/network-drive
@@ -74,23 +74,16 @@ impl std::fmt::Display for MappedDriveCwd {
 
 impl std::error::Error for MappedDriveCwd {}
 
-/// `GetDriveTypeW` return value for a network drive. The `windows`
-/// crate parks this constant under `Win32_System_WindowsProgramming`
-/// (a grab-bag feature we don't otherwise need); the value is a
-/// stable Win32 ABI constant.
-const DRIVE_REMOTE: u32 = 4;
-
 /// Extract the drive root of `cwd` in the form `GetDriveTypeW`
-/// wants: `X:\` for a drive-letter path, `\\server\share\` for a
+/// wants: `X:\` for a drive-letter path (via
+/// [`crate::util::drive_letter_root`]), `\\server\share\` for a
 /// UNC path. `None` for anything else (relative, device path
 /// `\\.\…` / `\\?\…`, or malformed) — the caller falls through to
 /// the `CreateProcessWithLogonW` attempt and the post-check catches
 /// the `ERROR_DIRECTORY` case.
 fn cwd_drive_root(cwd: &str) -> Option<String> {
-    let b = cwd.as_bytes();
-    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
-    {
-        return Some(format!("{}:\\", (b[0] as char).to_ascii_uppercase()));
+    if let Some(root) = crate::util::drive_letter_root(cwd) {
+        return Some(root);
     }
     if let Some(rest) = cwd.strip_prefix(r"\\") {
         // `\\?\…` / `\\.\…` are extended/device prefixes, not a

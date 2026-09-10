@@ -67,6 +67,29 @@ pub fn pcwstr(buf: &[u16]) -> PCWSTR {
     PCWSTR(buf.as_ptr())
 }
 
+/// `GetDriveTypeW` return value for a local fixed disk. The `windows`
+/// crate parks the `DRIVE_*` constants under
+/// `Win32_System_WindowsProgramming` (a grab-bag feature we don't
+/// otherwise need); the values are stable Win32 ABI constants.
+pub(crate) const DRIVE_FIXED: u32 = 3;
+/// `GetDriveTypeW` return value for a network drive (see
+/// [`DRIVE_FIXED`] for why the constant is spelled locally).
+pub(crate) const DRIVE_REMOTE: u32 = 4;
+
+/// `X:\` (letter uppercased) for a lexical drive-letter path
+/// (`X:\…` or `X:/…`) — the root spelling `GetDriveTypeW` wants.
+/// `None` for anything else (relative, UNC, extended/device
+/// `\\?\…`/`\\.\…` prefixes, malformed). Purely lexical: no
+/// filesystem or network contact.
+pub(crate) fn drive_letter_root(p: &str) -> Option<String> {
+    let b = p.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    {
+        return Some(format!("{}:\\", (b[0] as char).to_ascii_uppercase()));
+    }
+    None
+}
+
 /// Read a NUL-terminated `PWSTR` (typically returned by a Win32 API
 /// that allocates) into an owned `String`. Caller still owns the
 /// underlying allocation.

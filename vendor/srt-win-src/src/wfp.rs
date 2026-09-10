@@ -782,7 +782,8 @@ mod tests {
     /// live WFP engine.
     #[test]
     fn sddl_template_parses() {
-        let sd = OwnedSd::from_sddl(&sddl_sandbox_user("S-1-5-32-545")).expect("sddl");
+        let sd =
+            OwnedSd::from_sddl(&sddl_sandbox_user(crate::acl::SID_BUILTIN_USERS)).expect("sddl");
         assert!(!sd.ptr.0.is_null());
         assert!(sd.len > 0);
     }

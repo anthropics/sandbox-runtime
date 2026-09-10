@@ -1995,6 +1995,189 @@ export function revokeWindowsAcl(opts: {
   }
 }
 
+/** Budget/coverage counters from `srt-win acl audit` — every bounded
+ *  or skipped class is reported so partial coverage is visible.
+ *  Mirrors the Rust `audit::Budget` serialization. */
+export interface WindowsAclAuditBudget {
+  /** The 2s wall-clock budget expired mid-scan. */
+  wallExpired: boolean
+  /** DACL probes performed (cap 50 000). */
+  daclReads: number
+  /** The DACL-probe cap was hit. */
+  daclExhausted: boolean
+  /** Candidates never probed because a budget ran out first. */
+  skipped: number
+  /** Root listings truncated at the 1000-entries-per-dir cap. */
+  dirsTruncated: number
+  /** Candidates whose probe failed (not simple not-found). */
+  unreadable: number
+  /** Candidates skipped as reparse points (junctions/symlinks). */
+  reparseSkipped: number
+  /** Candidates on a non-fixed drive, or whose canonical path
+   *  resolved outside plain local-drive space (or onto a bare
+   *  volume root). */
+  remoteSkipped: number
+  /** Whole scan roots skipped as non-local (e.g. a cwd on a mapped
+   *  drive) — nonzero means the sweep did not cover that root. */
+  rootsSkippedNonLocal: number
+}
+
+/** Result of `srt-win acl audit --json` — see
+ *  {@link auditWindowsWorldWritable}. Mirrors the Rust
+ *  `audit::AuditOutcome` serialization. */
+export interface WindowsAclAuditResult {
+  /** Candidate directories collected from the fixed root set. */
+  candidates: number
+  /** Candidates actually probed (open + DACL read). */
+  scanned: number
+  /** Canonical paths whose DACL carries an explicit ALLOW granting
+   *  write to Everyone / BUILTIN\Users / Authenticated Users —
+   *  NULL-DACL hits included (those are detected, never stamped). */
+  flagged: string[]
+  /** Flagged paths whose write-deny stamp landed. */
+  stamped: string[]
+  /** Flagged paths left unstamped: stamp failed (broker lacks
+   *  WRITE_DAC there) or refused (NULL DACL) — recorded and
+   *  warned, never fatal. */
+  failed: { path: string; error: string }[]
+  /** How many of `failed` are NULL-DACL stamp refusals. */
+  nullDaclRefused: number
+  budget: WindowsAclAuditBudget
+}
+
+/** Runtime shape check for {@link WindowsAclAuditResult}. The result
+ *  is consumed OUTSIDE the helper's try/catch (`initialize()` reads
+ *  `audit.flagged.length`, `audit.budget.wallExpired`), so a
+ *  Rust-side field rename must degrade to the helper's `undefined`
+ *  return — never surface as a TypeError that breaks the
+ *  "never blocks init" contract. */
+function isWindowsAclAuditResult(v: unknown): v is WindowsAclAuditResult {
+  if (typeof v !== 'object' || v === null) return false
+  const r = v as Record<string, unknown>
+  const b = r['budget']
+  return (
+    typeof r['candidates'] === 'number' &&
+    typeof r['scanned'] === 'number' &&
+    typeof r['nullDaclRefused'] === 'number' &&
+    Array.isArray(r['flagged']) &&
+    r['flagged'].every(p => typeof p === 'string') &&
+    Array.isArray(r['stamped']) &&
+    r['stamped'].every(p => typeof p === 'string') &&
+    Array.isArray(r['failed']) &&
+    r['failed'].every(
+      f =>
+        typeof f === 'object' &&
+        f !== null &&
+        typeof (f as Record<string, unknown>)['path'] === 'string' &&
+        typeof (f as Record<string, unknown>)['error'] === 'string',
+    ) &&
+    isWindowsAclAuditBudget(b)
+  )
+}
+
+/** Runtime shape check for {@link WindowsAclAuditBudget} — all nine
+ *  fields, since the guard asserts the full exported type. */
+function isWindowsAclAuditBudget(v: unknown): v is WindowsAclAuditBudget {
+  if (typeof v !== 'object' || v === null) return false
+  const b = v as Record<string, unknown>
+  const booleans: (keyof WindowsAclAuditBudget)[] = [
+    'wallExpired',
+    'daclExhausted',
+  ]
+  const numbers: (keyof WindowsAclAuditBudget)[] = [
+    'daclReads',
+    'skipped',
+    'dirsTruncated',
+    'unreadable',
+    'reparseSkipped',
+    'remoteSkipped',
+    'rootsSkippedNonLocal',
+  ]
+  return (
+    booleans.every(k => typeof b[k] === 'boolean') &&
+    numbers.every(k => typeof b[k] === 'number')
+  )
+}
+
+/**
+ * Bounded world-writable-directory audit — the per-session dynamic
+ * complement to the install-time static ambient deny list. Thin
+ * wrapper around `srt-win acl audit`: scans a fixed root set
+ * (top-level dirs of `%SystemDrive%`; `%TEMP%` and `%PUBLIC%` themselves; the
+ * broker's `PATH` entries, the cwd's immediate children — local
+ * fixed drives only, reparse points never followed) for
+ * directories whose DACL carries an EXPLICIT ALLOW granting write
+ * to Everyone / BUILTIN\Users / Authenticated Users (inherited
+ * world-write — the stock volume-root class — is out of scope; see
+ * `audit.rs`), and stamps each hit for the sandbox SID with an
+ * audit-specific deny (the denyWrite mask plus WRITE_DAC and
+ * WRITE_OWNER, so the world grant that flagged the dir cannot be
+ * used to strip the deny; no parent-FDC stamp) as an ordinary
+ * session deny hold under `holderPid` — released by
+ * {@link restoreWindowsAcl} at `reset()`, reaped by crash recovery
+ * if the holder dies. NULL-DACL dirs are reported in `failed` but
+ * never stamped. Paths already covered by the ambient list, a
+ * session write grant, or the machine state dir are excluded.
+ *
+ * BEST-EFFORT BY CONTRACT: any failure — spawn, timeout, non-zero
+ * exit, unparseable output — degrades to a debug log and an
+ * `undefined` return. It must never block `initialize()`; the
+ * audit is defense-in-depth on top of the WFP fence and the
+ * separate-user FS model, not a load-bearing gate.
+ */
+export async function auditWindowsWorldWritable(opts: {
+  /** SID of the dedicated sandbox user — {@link WindowsSandboxUserStatus.sid}. */
+  sandboxUserSid: string
+  /** Long-lived host PID the holds are tied to. Default: this process. */
+  holderPid?: number
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
+}): Promise<WindowsAclAuditResult | undefined> {
+  const holder = opts.holderPid ?? process.pid
+  try {
+    // 150s: `acl audit` acquires the init lock TWICE (exclusion
+    // snapshot, then stamping), and each acquire can wait up to its
+    // own 60s cap behind a wedged holder before erroring — so the
+    // true worst case is 60s + 60s + the 2s scan cap + stamping +
+    // a Defender cold-scan of the exe. The timeout must sit ABOVE
+    // that: killing the child mid-stamp-loop would leave partial,
+    // unreported coverage (stamps applied but not surfaced). A
+    // generous TS-side timeout is the right lever — shortening the
+    // second acquire in Rust would add a special-cased lock path
+    // just to drop legitimate stamps behind a slow-but-alive
+    // holder, and this path is best-effort by contract either way.
+    const result = await runSrtWinJsonAsync<unknown>(
+      [
+        'acl',
+        'audit',
+        '--holder-pid',
+        `${holder}`,
+        '--sandbox-user-sid',
+        opts.sandboxUserSid,
+        '--json',
+      ],
+      { timeoutMs: 150_000, srtWin: opts.srtWin },
+    )
+    // Callers dereference the result outside this try/catch, so an
+    // out-of-contract shape (Rust-side rename) degrades to
+    // undefined here rather than TypeError-ing initialize().
+    if (!isWindowsAclAuditResult(result)) {
+      logForDebugging(
+        `[Sandbox Windows] acl audit: result shape out of contract; ignoring`,
+        { level: 'warn' },
+      )
+      return undefined
+    }
+    logForDebugging(`[Sandbox Windows] acl audit ok`)
+    return result
+  } catch (e) {
+    logForDebugging(`[Sandbox Windows] acl audit: ${(e as Error).message}`, {
+      level: 'warn',
+    })
+    return undefined
+  }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Wrap
 // ────────────────────────────────────────────────────────────────────
