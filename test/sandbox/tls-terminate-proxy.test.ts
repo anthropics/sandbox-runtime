@@ -40,6 +40,17 @@ describe('tls-terminate-proxy: end-to-end through createHttpProxyServer', () => 
     upstream = createHttpsServer(
       { cert: upLeafOnly, key: upCert.keyPem },
       (req, res) => {
+        if (req.url === '/non-latin1-header') {
+          req.socket.write(
+            'HTTP/1.1 200 OK\r\n' +
+              'Content-Type: application/octet-stream\r\n' +
+              'Content-Disposition: attachment; filename="\u4e2d\u6587\u540d.pdf"\r\n' +
+              'Content-Length: 6\r\n' +
+              'Connection: close\r\n\r\n' +
+              'binary',
+          )
+          return
+        }
         let body = ''
         req.on('data', c => (body += c))
         req.on('end', () => {
@@ -105,6 +116,17 @@ describe('tls-terminate-proxy: end-to-end through createHttpProxyServer', () => 
     expect(r.exit).toBe(0)
     expect(r.status).toBe(200)
     expect(JSON.parse(r.body).path).toBe('/ping')
+  })
+
+  test('survives and sanitizes non-Latin1 response headers (#490)', async () => {
+    const r = await curlViaProxy(
+      proxyPort,
+      `https://127.0.0.1:${upstreamPort}/non-latin1-header`,
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    expect(r.body).toBe('binary')
+    expect(r.headers['content-disposition']).toBeDefined()
   })
 
   test('serves the empty CRL at GET /srt.crl (Schannel revocation)', async () => {
