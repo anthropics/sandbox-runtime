@@ -110,7 +110,7 @@ export function shouldIgnoreViolation(
 
 /**
  * Collapse control characters (C0, DEL, C1) to spaces. Shared by the store
- * (for `line`) and the proxy path (for a client-supplied decoded id).
+ * (for `line`) and resolveCommandText (for an unregistered attribution key).
  */
 export function sanitizeViolationText(text: string): string {
   // eslint-disable-next-line no-control-regex -- stripping control chars is the point

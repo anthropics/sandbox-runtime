@@ -30,6 +30,7 @@ describe.if(inDocker)('srt end-to-end in unprivileged container', () => {
   const WORK = join(tmpdir(), `srt-e2e-${Date.now()}`)
   const ALLOWED = join(WORK, 'allowed')
   const DENIED = join(WORK, 'denied')
+  const SECRET = join(WORK, 'secret')
   const CONFIG = join(WORK, 'srt.json')
 
   const srt = (cmd: string) =>
@@ -41,12 +42,14 @@ describe.if(inDocker)('srt end-to-end in unprivileged container', () => {
   beforeAll(() => {
     mkdirSync(ALLOWED, { recursive: true })
     mkdirSync(DENIED, { recursive: true })
+    mkdirSync(SECRET, { recursive: true })
+    writeFileSync(join(SECRET, 'key'), 'TOPSECRET')
     writeFileSync(
       CONFIG,
       JSON.stringify({
         network: { allowedDomains: [], deniedDomains: [] },
         filesystem: {
-          denyRead: [],
+          denyRead: [SECRET],
           allowWrite: [ALLOWED],
           denyWrite: [],
         },
@@ -84,5 +87,22 @@ describe.if(inDocker)('srt end-to-end in unprivileged container', () => {
   it('seccomp allows AF_INET socket creation', () => {
     const r = srt('python3 -c "import socket; socket.socket(socket.AF_INET)"')
     expect(r.status).toBe(0)
+  })
+
+  // A root caller (this container's uid 0) hands bwrap every capability it
+  // holds; the sandbox must drop them, or CAP_SYS_ADMIN unmounts the policy.
+  // With Docker's default capability set the unmounts below fail either
+  // way; run the container with --cap-add SYS_ADMIN (or --privileged) to
+  // see them succeed on a runtime that keeps the caller's capabilities.
+  it('leaves the command no capability to unmount a deny', () => {
+    const read = srt(`umount ${SECRET} 2>&1; cat ${join(SECRET, 'key')}`)
+    expect(read.stdout).not.toContain('TOPSECRET')
+
+    const out = join(DENIED, 'escaped')
+    const write = srt(
+      `mount -o remount,bind,rw / 2>&1; umount ${WORK} 2>&1; echo bad > ${out}`,
+    )
+    expect(write.status).not.toBe(0)
+    expect(existsSync(out)).toBe(false)
   })
 })
