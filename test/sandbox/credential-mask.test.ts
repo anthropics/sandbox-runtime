@@ -646,11 +646,12 @@ describe.if(isLinux)('per-credential injectHosts via SandboxManager', () => {
   const GH_REAL = 'gh-real-secret'
   const NPM_REAL = 'npm-real-secret'
 
-  // Two upstreams, two hostnames that both resolve to 127.0.0.1: the
-  // proxy distinguishes them by the absolute-URI host on the plain-HTTP
-  // path, which is what destHost gating sees.
+  // Two upstreams behind two loopback names (a `.localhost` name resolves
+  // to loopback locally, and the resolved-address guard lets it): the proxy
+  // distinguishes them by the absolute-URI host on the plain-HTTP path,
+  // which is what destHost gating sees.
   const GH_HOST = 'localhost'
-  const NPM_HOST = 'localtest.me'
+  const NPM_HOST = 'npm.localhost'
 
   let ghUp: Server, ghPort: number, ghHeaders: IncomingHttpHeaders | undefined
   let npmUp: Server,
@@ -726,7 +727,6 @@ describe.if(isLinux)('per-credential injectHosts via SandboxManager', () => {
     const r = await curlViaProxy(proxyPort, `http://${NPM_HOST}:${npmPort}/`, {
       headers: ['Authorization: Bearer ' + npmSentinel],
       proxyAuth: `srt:${authToken}`,
-      resolve: `${NPM_HOST}:${npmPort}:127.0.0.1`,
     })
     expect(r.exit).toBe(0)
     expect(npmHeaders?.authorization).toBe(`Bearer ${NPM_REAL}`)
@@ -748,7 +748,6 @@ describe.if(isLinux)('per-credential injectHosts via SandboxManager', () => {
     const r = await curlViaProxy(proxyPort, `http://${NPM_HOST}:${npmPort}/`, {
       headers: ['Authorization: Bearer ' + ghSentinel],
       proxyAuth: `srt:${authToken}`,
-      resolve: `${NPM_HOST}:${npmPort}:127.0.0.1`,
     })
     expect(r.exit).toBe(0)
     expect(npmHeaders?.authorization).toBe(`Bearer ${ghSentinel}`)
@@ -768,7 +767,7 @@ describe.if(isLinux)(
     const VAR = 'SRT_TEST_DEFAULT_TOKEN'
     const REAL = 'default-real-secret'
     const HOST_A = 'localhost'
-    const HOST_B = 'localtest.me'
+    const HOST_B = 'host-b.localhost'
 
     let upA: Server, portA: number, hdrA: IncomingHttpHeaders | undefined
     let upB: Server, portB: number, hdrB: IncomingHttpHeaders | undefined
@@ -858,7 +857,6 @@ describe.if(isLinux)(
       const rb = await curlViaProxy(proxyPort, `http://${HOST_B}:${portB}/`, {
         headers: ['Authorization: Bearer ' + sentinel],
         proxyAuth: `srt:${authToken}`,
-        resolve: `${HOST_B}:${portB}:127.0.0.1`,
       })
       expect(rb.exit).toBe(0)
       expect(hdrB?.authorization).toBe(`Bearer ${REAL}`)
@@ -1011,7 +1009,7 @@ describe.if(isLinux)('env decode: "jwt" masking on Linux (bwrap)', () => {
 describe.if(isLinux)('end-to-end env decode masking via SandboxManager', () => {
   const JWT_VAR = 'SRT_TEST_E2E_JWT_TOKEN'
   const HOST_A = 'localhost'
-  const HOST_B = 'localtest.me'
+  const HOST_B = 'host-b.localhost'
 
   const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
   const REAL_JWT =
@@ -1100,7 +1098,6 @@ describe.if(isLinux)('end-to-end env decode masking via SandboxManager', () => {
       {
         headers: ['Authorization: Bearer ' + fakeJwt],
         proxyAuth: `srt:${authToken}`,
-        resolve: `${HOST_B}:${upstreamPort}:127.0.0.1`,
       },
     )
     expect(r.exit).toBe(0)
@@ -1254,7 +1251,7 @@ describe.if(isLinux)('env maskClaims masking on Linux (bwrap)', () => {
 describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
   const JWT_VAR = 'SRT_TEST_E2E_JWT_CLAIMS'
   const HOST_A = 'localhost'
-  const HOST_B = 'localtest.me'
+  const HOST_B = 'host-b.localhost'
 
   const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
   const REAL_CLAIM = 'e2e-env-claim-secret-0123456789'
@@ -1382,7 +1379,6 @@ describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
     let r = await curlViaProxy(proxyPort, `http://${HOST_B}:${upstreamPort}/`, {
       headers: ['Authorization: Bearer ' + fakeJwt],
       proxyAuth: `srt:${authToken}`,
-      resolve: `${HOST_B}:${upstreamPort}:127.0.0.1`,
     })
     expect(r.exit).toBe(0)
     expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
@@ -1392,7 +1388,6 @@ describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
     r = await curlViaProxy(proxyPort, `http://${HOST_B}:${upstreamPort}/`, {
       headers: ['Authorization: Bearer ' + claimOf(fakeJwt)],
       proxyAuth: `srt:${authToken}`,
-      resolve: `${HOST_B}:${upstreamPort}:127.0.0.1`,
     })
     expect(r.exit).toBe(0)
     expect(lastHeaders?.authorization).toBe(`Bearer ${claimOf(fakeJwt)}`)

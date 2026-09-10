@@ -13,6 +13,7 @@ import {
   splitDomainPatternPort,
   stripDomainPatternPort,
 } from './domain-pattern.js'
+import { parseAddressRange } from './address.js'
 
 /**
  * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
@@ -117,6 +118,14 @@ const deniedDomainPatternSchema = z.string().refine(
       ' In deniedDomains a bare "*" (deny-all) is also accepted, and an optional ":port" suffix (1-65535) restricts the entry to that port.',
   },
 )
+
+/** IP literal or CIDR range (`10.0.0.0/8`, `fc00::/7`, `169.254.169.254`). */
+const addressRangeSchema = z
+  .string()
+  .refine(v => parseAddressRange(v) !== undefined, {
+    message:
+      'Invalid IP address or CIDR range. Use an IPv4/IPv6 literal or CIDR, e.g. "10.0.0.0/8", "192.168.1.10", "fc00::/7" (IPv6 unbracketed).',
+  })
 
 /**
  * Schema for filesystem paths
@@ -732,6 +741,16 @@ export const NetworkConfigSchema = z.object({
     .optional()
     .describe(
       'If true, hosts not in allowedDomains are denied without consulting the ask callback. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
+    ),
+  deniedResolvedAddresses: z
+    .array(addressRangeSchema)
+    .optional()
+    .describe(
+      'IP addresses / CIDR ranges (IPv4 or IPv6, unbracketed) that an allowed HOSTNAME must not resolve to, ' +
+        'in addition to the built-in set (see README "Resolved-address check") and any IP literal listed in ' +
+        'deniedDomains. A permitted name that resolves only into these is refused instead of dialed. A name may ' +
+        'resolve to a denied address only if that IP literal (and port) is itself in allowedDomains. Not evaluated ' +
+        'for connections routed through parentProxy (including one taken from HTTP_PROXY/HTTPS_PROXY) or mitmProxy (that hop resolves the name).',
     ),
   allowUnixSockets: z
     .array(z.string())

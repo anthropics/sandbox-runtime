@@ -219,9 +219,8 @@ export interface Sigv4SignInput {
    */
   requestTarget: string
   /**
-   * Headers as they will be sent upstream. `host` is not looked up here
-   * (the proxy deletes it and lets the runtime re-derive it) — its value
-   * comes from `hostHeader`.
+   * Headers as they will be sent upstream. `host` is not looked up here —
+   * its value comes from `hostHeader`.
    */
   headers: IncomingHttpHeaders
   /** Host header value the upstream connection will carry. */

@@ -1478,7 +1478,7 @@ describe.if(isLinux)('end-to-end file masking via SandboxManager', () => {
   const SECRET_FILE = join(TEST_DIR, 'token')
   const SECRET_CONTENT = 'ghp_e2e_real_secret_0123456789'
   const HOST_A = 'localhost'
-  const HOST_B = 'localtest.me'
+  const HOST_B = 'host-b.localhost'
 
   let upstream: Server
   let upstreamPort: number
@@ -1518,7 +1518,6 @@ describe.if(isLinux)('end-to-end file masking via SandboxManager', () => {
   async function curlViaManagerProxy(
     url: string,
     bearer: string,
-    resolve?: string,
   ): Promise<number> {
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
@@ -1531,7 +1530,6 @@ describe.if(isLinux)('end-to-end file masking via SandboxManager', () => {
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]
-    if (resolve) args.push('--resolve', resolve)
     args.push(url)
     const child = spawn('curl', args)
     child.stdout.on('data', () => {})
@@ -1573,13 +1571,12 @@ describe.if(isLinux)('end-to-end file masking via SandboxManager', () => {
     }).stdout
 
     // HOST_B is allowlisted but NOT in this file's injectHosts. The
-    // proxy dials localtest.me (publicly resolves to 127.0.0.1) and
-    // forwards the sentinel as-is — fails closed.
+    // proxy resolves it to loopback (a `.localhost` name) and forwards
+    // the sentinel as-is — fails closed.
     lastHeaders = undefined
     const exit = await curlViaManagerProxy(
       `http://${HOST_B}:${upstreamPort}/`,
       sentinel,
-      `${HOST_B}:${upstreamPort}:127.0.0.1`,
     )
     expect(exit).toBe(0)
     expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
@@ -1598,7 +1595,7 @@ describe.if(isLinux)(
   () => {
     const TEST_DIR = join(tmpdir(), 'srt-credmask-extract-e2e-' + Date.now())
     const HOST_A = 'localhost'
-    const HOST_B = 'localtest.me'
+    const HOST_B = 'host-b.localhost'
 
     // hosts.yml-style: one credential, structure must survive.
     const YML_FILE = join(TEST_DIR, 'hosts.yml')
@@ -1676,7 +1673,6 @@ describe.if(isLinux)(
     async function curlViaManagerProxy(
       url: string,
       bearer: string,
-      resolve?: string,
     ): Promise<number> {
       const proxyPort = SandboxManager.getProxyPort()!
       const authToken = SandboxManager.getProxyAuthToken()!
@@ -1689,7 +1685,6 @@ describe.if(isLinux)(
         '-H',
         `Authorization: Bearer ${bearer}`,
       ]
-      if (resolve) args.push('--resolve', resolve)
       args.push(url)
       const child = spawn('curl', args)
       child.stdout.on('data', () => {})
@@ -1760,7 +1755,6 @@ describe.if(isLinux)(
       const exit = await curlViaManagerProxy(
         `http://${HOST_B}:${upstreamPort}/`,
         sentinel,
-        `${HOST_B}:${upstreamPort}:127.0.0.1`,
       )
       expect(exit).toBe(0)
       expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
@@ -1779,7 +1773,7 @@ describe.if(isLinux)('end-to-end JWT decode masking via SandboxManager', () => {
   const TEST_DIR = join(tmpdir(), 'srt-credmask-jwt-e2e-' + Date.now())
   const JWT_FILE = join(TEST_DIR, 'id-token')
   const HOST_A = 'localhost'
-  const HOST_B = 'localtest.me'
+  const HOST_B = 'host-b.localhost'
 
   const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
   const REAL_JWT =
@@ -1830,7 +1824,6 @@ describe.if(isLinux)('end-to-end JWT decode masking via SandboxManager', () => {
   async function curlViaManagerProxy(
     url: string,
     bearer: string,
-    resolve?: string,
   ): Promise<number> {
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
@@ -1843,7 +1836,6 @@ describe.if(isLinux)('end-to-end JWT decode masking via SandboxManager', () => {
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]
-    if (resolve) args.push('--resolve', resolve)
     args.push(url)
     const child = spawn('curl', args)
     child.stdout.on('data', () => {})
@@ -1888,7 +1880,6 @@ describe.if(isLinux)('end-to-end JWT decode masking via SandboxManager', () => {
     const exit = await curlViaManagerProxy(
       `http://${HOST_B}:${upstreamPort}/`,
       fakeJwt,
-      `${HOST_B}:${upstreamPort}:127.0.0.1`,
     )
     expect(exit).toBe(0)
     expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
@@ -1907,7 +1898,7 @@ describe.if(isLinux)('end-to-end maskClaims via SandboxManager', () => {
   const TEST_DIR = join(tmpdir(), 'srt-credmask-claims-e2e-' + Date.now())
   const JWT_FILE = join(TEST_DIR, 'id-token')
   const HOST_A = 'localhost'
-  const HOST_B = 'localtest.me'
+  const HOST_B = 'host-b.localhost'
 
   const b64u = (s: string) => Buffer.from(s, 'utf8').toString('base64url')
   const REAL_CLAIM = 'e2e-real-claim-secret-0123456789'
@@ -1960,7 +1951,6 @@ describe.if(isLinux)('end-to-end maskClaims via SandboxManager', () => {
   async function curlViaManagerProxy(
     url: string,
     bearer: string,
-    resolve?: string,
   ): Promise<number> {
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
@@ -1973,7 +1963,6 @@ describe.if(isLinux)('end-to-end maskClaims via SandboxManager', () => {
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]
-    if (resolve) args.push('--resolve', resolve)
     args.push(url)
     const child = spawn('curl', args)
     child.stdout.on('data', () => {})
@@ -2045,7 +2034,6 @@ describe.if(isLinux)('end-to-end maskClaims via SandboxManager', () => {
     let exit = await curlViaManagerProxy(
       `http://${HOST_B}:${upstreamPort}/`,
       fakeJwt,
-      `${HOST_B}:${upstreamPort}:127.0.0.1`,
     )
     expect(exit).toBe(0)
     expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
@@ -2055,7 +2043,6 @@ describe.if(isLinux)('end-to-end maskClaims via SandboxManager', () => {
     exit = await curlViaManagerProxy(
       `http://${HOST_B}:${upstreamPort}/`,
       claimOf(fakeJwt),
-      `${HOST_B}:${upstreamPort}:127.0.0.1`,
     )
     expect(exit).toBe(0)
     expect(lastHeaders?.authorization).toBe(`Bearer ${claimOf(fakeJwt)}`)

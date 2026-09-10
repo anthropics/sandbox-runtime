@@ -681,6 +681,23 @@ describe.if(!isWindows)(
       expect(mitm.connects).toEqual([])
     })
 
+    it('an IPv4-mapped spelling of a deny-listed address is refused even when that spelling is allow-listed', async () => {
+      const { port, token } = await start({
+        allowedDomains: ['[::ffff:127.0.0.1]'],
+        deniedDomains: ['127.0.0.1'],
+        mitmDomains: [],
+      })
+      for (const target of [
+        `[::ffff:127.0.0.1]:${originPort}`,
+        `[::FFFF:7F00:1]:${originPort}`,
+        `[0:0:0:0:0:ffff:7f00:1]:${originPort}`,
+      ]) {
+        expect(await rawConnect(port, target, token)).toMatch(
+          /^HTTP\/1\.1 403 /,
+        )
+      }
+    })
+
     it('deniedDomains wins over every spelling of the denied host', async () => {
       const { port, token } = await start({
         allowedDomains: ['*.mitm.invalid', '127.0.0.1'],

@@ -4,16 +4,24 @@ import type { Server } from 'node:http'
 import { Agent, createServer } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { connect, isIP } from 'node:net'
+import { connect } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import { encodedCommandFromProxyUser } from './sandbox-utils.js'
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
+  rawDenied,
+  respondDenied,
+  respondUpstreamError,
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
+
+const ALLOWLIST_DENY = [
+  'Connection blocked by network allowlist',
+  'blocked-by-allowlist',
+] as const
 import {
   peekForClientHello,
   terminateAndForward,
@@ -24,10 +32,15 @@ import {
 } from './body-substitution.js'
 import type { PlanSigv4 } from './credential-aws-pairs.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
+import { isResolvedAddressDenied } from './resolved-address-guard.js'
 import {
   canonicalizeHost,
   connectViaParentProxy,
+  directRequestOptions,
+  type DirectRequestOptions,
   dialDirect,
+  formatAuthority,
+  type DirectLookup,
   openConnectTunnel,
   proxyAuthHeader,
   selectParentProxyUrl,
@@ -172,6 +185,17 @@ export interface HttpProxyServerOptions {
    * connecting directly. NO_PROXY-matched hosts still connect directly.
    */
   parentProxy?: ResolvedParentProxy
+
+  /**
+   * Name resolution for DIRECT dials (opaque CONNECT tunnel, plain-HTTP
+   * forward, TLS-terminated upstream leg), bound per destination port and
+   * requesting command. The manager returns the resolved-address guard's
+   * lookup, which refuses (and records) an allow-listed hostname that
+   * resolves into denied address space; the proxy answers that with a 403.
+   * Not consulted for the mitmProxy or parentProxy routes — that hop
+   * resolves the name.
+   */
+  lookupFor?: DirectLookup
 
   /**
    * Per-session bearer token. When set, every CONNECT and absolute-URI
@@ -427,13 +451,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         logForDebugging(`Connection blocked to ${requestedHost}:${port}`, {
           level: 'error',
         })
-        endWithStatus(
-          'HTTP/1.1 403 Forbidden\r\n' +
-            'Content-Type: text/plain\r\n' +
-            'X-Proxy-Error: blocked-by-allowlist\r\n' +
-            '\r\n' +
-            'Connection blocked by network allowlist',
-        )
+        endWithStatus(rawDenied(...ALLOWLIST_DENY))
         return
       }
       // The client may have died during the filter await (EOF destroy
@@ -455,6 +473,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // the (already-validated, so practically unreachable) case where
       // canonicalization fails, so the two layers can never disagree.
       const hostname = canonicalizeHost(requestedHost) ?? requestedHost
+      const lookup = options.lookupFor?.(port, auth.encodedCommand)
 
       // Decide upstream route:
       //   in-process TLS termination
@@ -494,6 +513,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               hostname,
               port,
               upstreamCA: options.tlsTerminateUpstreamCA,
+              lookup,
               onFilterRequestDeny: options.onFilterRequestDenied
                 ? (method, url, reason) =>
                     options.onFilterRequestDenied!({
@@ -545,7 +565,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         } else if (parentUrl) {
           upstream = await connectViaParentProxy(parentUrl, hostname, port)
         } else {
-          upstream = await dialDirect(hostname, port)
+          upstream = await dialDirect(hostname, port, lookup)
         }
       } catch (err) {
         logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
@@ -554,7 +574,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // If we already sent 200 (mitmCA sniff path), an HTTP status line now
         // would land inside the tunnel as payload. Just close.
         if (wrote200) socket.destroy()
-        else endWithStatus('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+        else if (isResolvedAddressDenied(err)) {
+          endWithStatus(rawDenied(err.message))
+        } else endWithStatus('HTTP/1.1 502 Bad Gateway\r\n\r\n')
         return
       }
 
@@ -649,12 +671,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
       const url = new URL(req.url!)
+      const isHttps = url.protocol === 'https:'
+      const defaultPort = isHttps ? 443 : 80
       const requestedHost = stripBrackets(url.hostname)
-      const port = url.port
-        ? parseInt(url.port, 10)
-        : url.protocol === 'https:'
-          ? 443
-          : 80
+      const port = url.port ? parseInt(url.port, 10) : defaultPort
 
       const allowed = await options.filter(
         port,
@@ -675,11 +695,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           res.destroy()
           return
         }
-        res.writeHead(403, {
-          'Content-Type': 'text/plain',
-          'X-Proxy-Error': 'blocked-by-allowlist',
-        })
-        res.end('Connection blocked by network allowlist')
+        respondDenied(res, ...ALLOWLIST_DENY)
         return
       }
 
@@ -693,14 +709,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // leaves behind is the trailing dot, which is exactly the spelling
       // that used to reach getMitmSocketPath / the upstream unchanged.
       const hostname = canonicalizeHost(requestedHost) ?? requestedHost
-      // The authority we forward (request-target and Host header) is
-      // rebuilt from the canonical host so the MITM / parent proxy sees the
-      // host we allowlist-checked, not the client's spelling of it. `url.port`
-      // is '' when the scheme default was given or implied, matching the
-      // `url.host` form this replaces.
-      const authority =
-        (isIP(hostname) === 6 ? `[${hostname}]` : hostname) +
-        (url.port ? `:${url.port}` : '')
+      // The authority we forward (request-target and Host header) is rebuilt
+      // from the canonical host so the MITM / parent proxy sees the host we
+      // allowlist-checked, not the client's spelling of it.
+      const authority = formatAuthority(hostname, port, defaultPort)
 
       const fwdHeaders = { ...stripHopByHop(req.headers), host: authority }
       options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
@@ -720,7 +732,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         options.parentProxy &&
         !shouldBypassParentProxy(options.parentProxy, hostname)
           ? selectParentProxyUrl(options.parentProxy, {
-              isHttps: url.protocol === 'https:',
+              isHttps,
             })
           : undefined
 
@@ -788,6 +800,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         fwdHeaders['transfer-encoding'] = 'chunked'
       }
 
+      const failUpstream = (err: Error) => {
+        logForDebugging(`Proxy request failed: ${err.message}`, {
+          level: 'error',
+        })
+        respondUpstreamError(res, err)
+      }
       let proxyReq
       if (mitmSocketPath) {
         logForDebugging(
@@ -850,11 +868,28 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           },
         )
       } else {
-        const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest
-        proxyReq = requestFn(
-          {
+        // Vet and pick the upstream address before any request object exists
+        // (see directRequestOptions); the name stays in Host and, for TLS, SNI.
+        let direct: DirectRequestOptions
+        try {
+          direct = await directRequestOptions(
             hostname,
             port,
+            options.lookupFor?.(port, auth.encodedCommand),
+            isHttps,
+          )
+        } catch (err) {
+          failUpstream(err as Error)
+          return
+        }
+        if (res.destroyed || req.socket.destroyed) {
+          // Client went away during the dial.
+          body.destroy()
+          return
+        }
+        proxyReq = (isHttps ? httpsRequest : httpRequest)(
+          {
+            ...direct,
             path: url.pathname + url.search,
             method: req.method,
             headers: fwdHeaders,
@@ -875,17 +910,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         )
       }
 
-      proxyReq.on('error', err => {
-        logForDebugging(`Proxy request failed: ${err.message}`, {
-          level: 'error',
-        })
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'text/plain' })
-          res.end('Bad Gateway')
-        } else {
-          res.destroy()
-        }
-      })
+      proxyReq.on('error', failUpstream)
 
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())
