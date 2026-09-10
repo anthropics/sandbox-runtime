@@ -13,6 +13,9 @@ import {
   containsGlobCharsWin,
   expandGlobPattern,
   isUncPath,
+  DANGEROUS_FILES,
+  getDangerousDirectories,
+  normalizeCaseForComparison,
 } from './sandbox-utils.js'
 // Re-export so existing tests (glob-expand.test.ts) and any
 // out-of-tree caller keep their import path. `buildGitConfigEnv` is
@@ -1721,6 +1724,64 @@ export function expandWindowsFsPaths(
     }
   }
   return [...out]
+}
+
+/**
+ * Mandatory write-deny paths under `cwd` (dangerous files/dirs,
+ * `.git\\hooks`, `.git\\config` unless `allowGitConfig`). Existing
+ * paths only; `maxDepth` counts a path's components below `cwd`,
+ * like `rg --max-depth`. Cheap enough to rerun per exec.
+ */
+export function windowsGetMandatoryDenyPaths(
+  cwd: string,
+  opts: { maxDepth?: number; allowGitConfig?: boolean } = {},
+): string[] {
+  const maxDepth = opts.maxDepth ?? 3
+  const files = new Set(DANGEROUS_FILES.map(normalizeCaseForComparison))
+  const dirs = getDangerousDirectories().map(d =>
+    normalizeCaseForComparison(d.split('/').join(path.sep)),
+  )
+  const out: string[] = []
+  const gitDir = (dir: string) => {
+    for (const leaf of opts.allowGitConfig ? ['hooks'] : ['hooks', 'config']) {
+      const p = path.join(dir, leaf)
+      if (fs.statSync(p, { throwIfNoEntry: false })) out.push(p)
+    }
+  }
+  const depthOk = (p: string) =>
+    path.relative(cwd, p).split(path.sep).length <= maxDepth
+  const walk = (dir: string, depth: number) => {
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const e of entries) {
+      const name = normalizeCaseForComparison(e.name)
+      const full = path.join(dir, e.name)
+      if (!e.isDirectory()) {
+        if (files.has(name)) out.push(full)
+        continue
+      }
+      if (name === 'node_modules') continue
+      if (name === '.git') {
+        if (depth < maxDepth) gitDir(full)
+        continue
+      }
+      const rel = normalizeCaseForComparison(path.relative(cwd, full))
+      if (dirs.some(d => rel === d || rel.endsWith(path.sep + d))) {
+        // rg only sees a dir through a file inside it (one level
+        // deeper); cwd-level dirs are added unconditionally on Linux.
+        if (depth === 1 || depth < maxDepth) out.push(full)
+        continue
+      }
+      if (depth < maxDepth) walk(full, depth + 1)
+    }
+  }
+  cwd = path.resolve(cwd)
+  walk(cwd, 1)
+  return [...new Set(out)].filter(depthOk)
 }
 
 /**

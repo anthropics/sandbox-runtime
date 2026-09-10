@@ -297,7 +297,7 @@ pub fn open_db() -> Result<Connection> {
 }
 
 /// Filter on `release_aces` for the deny-ACE lifecycle.
-pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete"];
+pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", "deny_pin"];
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
 
@@ -1011,6 +1011,23 @@ impl Locked {
             .filter(|p| cb.get(p.len()) == Some(&b'\\') && canon.starts_with(p.as_str()))
             .collect())
     }
+    /// Deepest held modify-grant that is a STRICT ancestor of `canon`
+    /// — the upper bound of the pin chain. Read-only grants carry no
+    /// DELETE, so they are not roots.
+    pub fn grant_root_of(&self, canon: &str) -> Result<Option<String>> {
+        let all: Vec<String> = query_vec(
+            &self.conn,
+            "SELECT canonical_path FROM working_aces \
+             WHERE kind = 'grant' AND mask = 'modify'",
+            [],
+            |r| r.get(0),
+        )?;
+        let cb = canon.as_bytes();
+        Ok(all
+            .into_iter()
+            .filter(|p| cb.get(p.len()) == Some(&b'\\') && canon.starts_with(p.as_str()))
+            .max_by_key(|p| p.len()))
+    }
 }
 
 /// Read all `working_aces` rows for `canon` and converge the on-disk
@@ -1032,7 +1049,7 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::Grant(g) => set.grant = Some(g),
             SbAce::Deny(d) => set.deny = Some(d),
             SbAce::DenyFdc => set.deny_fdc = true,
-            SbAce::DenyDelete => set.deny_delete = true,
+            SbAce::DenyDelete | SbAce::DenyPin => set.deny_delete = true,
         }
     }
     // Install-time ambient write-deny (HKLM AmbientDenies) folds
@@ -1419,5 +1436,34 @@ mod tests {
     fn aliveness_bogus_pid_is_dead() {
         // PID 0x7FFF_FFFE is well above any plausible live PID.
         assert!(!is_process_alive(0x7FFF_FFFE, 0));
+    }
+
+    #[test]
+    fn grant_root_of_picks_deepest_modify_grant() {
+        with_mem_db(|db| {
+            for (p, m) in [
+                (r"\\?\C:\proj", "modify"),
+                (r"\\?\C:\proj\pkg", "modify"),
+                (r"\\?\C:\proj\pkg\app\ro", "read"),
+            ] {
+                db.conn
+                    .execute(
+                        "INSERT INTO working_aces \
+                         (canonical_path, kind, file_id, mask) \
+                         VALUES (?1, 'grant', x'00', ?2)",
+                        params![p, m],
+                    )
+                    .unwrap();
+            }
+            let root = db
+                .grant_root_of(r"\\?\C:\proj\pkg\app\ro\.git\config")
+                .unwrap();
+            assert_eq!(root.as_deref(), Some(r"\\?\C:\proj\pkg"));
+            assert_eq!(
+                db.grant_root_of(r"\\?\C:\proj\pkg").unwrap().as_deref(),
+                Some(r"\\?\C:\proj")
+            );
+            assert!(db.grant_root_of(r"\\?\C:\project\x").unwrap().is_none());
+        });
     }
 }

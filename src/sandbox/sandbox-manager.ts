@@ -61,7 +61,7 @@ import {
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   expandWindowsFsPaths,
-  stampWindowsAcl,
+  windowsGetMandatoryDenyPaths,
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
@@ -838,9 +838,6 @@ async function initialize(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
-      // Grant FIRST so the sandbox user has working-tree access by
-      // the time the deny stamp runs. The two are independent
-      // refcounted state-DB sets keyed on the same holder PID.
       if (acc.grantRead.length > 0 || acc.grantWrite.length > 0) {
         grantWindowsAcl({
           sandboxUserSid: sb,
@@ -848,33 +845,12 @@ async function initialize(
           write: acc.grantWrite,
           srtWin,
         })
-      }
-      if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
-        stampWindowsAcl({
-          sandboxUserSid: sb,
-          denyRead: acc.denyRead,
-          denyWrite: acc.denyWrite,
-          srtWin,
-        })
-      }
-      // Only record when something was actually applied — gates
-      // running revoke/restore at reset(). Recorded AFTER success —
-      // the catch below clears `config`, and a non-undefined
-      // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed.
-      const anyApplied =
-        acc.grantRead.length > 0 ||
-        acc.grantWrite.length > 0 ||
-        acc.denyRead.length > 0 ||
-        acc.denyWrite.length > 0
-      if (anyApplied) {
+        // Recorded after success: the catch below clears `config`.
         windowsFsStampedSet = acc
         logForDebugging(
-          `[Sandbox Windows] fs applied: ` +
+          `[Sandbox Windows] fs granted: ` +
             `${acc.grantWrite.length} grantWrite, ` +
-            `${acc.grantRead.length} grantRead, ` +
-            `${acc.denyRead.length} denyRead, ` +
-            `${acc.denyWrite.length} denyWrite`,
+            `${acc.grantRead.length} grantRead`,
         )
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
@@ -1286,51 +1262,21 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
 }
 
 /**
- * Build the Windows file-access set (deny stamps + sandbox-user
- * grants) from `runtimeConfig`. Globs are expanded to concrete
- * paths (point-in-time — a path appearing after this returns is NOT
- * covered). Directory targets are accepted (the `(OI)(CI)` ACEs
- * cover the subtree).
- *
- * The sandbox user has no inherent rights on real-user-owned files,
- * so `allowWrite` (the working-tree roots) becomes a per-session
- * `MODIFY_NO_FDC` ALLOW ACE for `<sb-SID>`, `allowRead` a
- * `READ|EXECUTE` ALLOW ACE, and `denyRead`/`denyWrite` become an
- * explicit DENY ACE for `<sb-SID>` on the target plus a
- * `(OI)(CI) FILE_DELETE_CHILD` DENY on its parent.
+ * Session-level grant set: `allowWrite` → `MODIFY_NO_FDC`, `allowRead`
+ * → `READ|EXECUTE` ALLOW ACEs for `<sb-SID>`, globs expanded at
+ * initialize(). Denies are per exec — {@link computeWindowsPerExecDenySet}.
  */
 function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   grantRead: string[]
   grantWrite: string[]
-  denyRead: string[]
-  denyWrite: string[]
 } {
   const fs = c.filesystem
   // filesystem.disabled bypasses ALL filesystem rule generation —
-  // same as the macOS/Linux wrapWithSandbox path (readConfig /
-  // writeConfig left undefined). On Windows this means no ACL
-  // stamp/grant; credential FILE denies are dropped along with the
-  // rest (credential ENV: mode:'deny' is structural under the
-  // fresh srt-sandbox env; mode:'mask' sentinels are passed via
-  // the --env overlay).
+  // same as the macOS/Linux wrapWithSandbox path.
   if (fs?.disabled) {
-    return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
+    return { grantRead: [], grantWrite: [] }
   }
   const expand = expandWindowsFsPaths
-  // `mode: 'deny'` — non-existent literals reach srt-win, which
-  // creates a placeholder chain and stamps it (deny lands on the
-  // exact target path). `mode: 'grant'` drops them (a grant on
-  // nothing is meaningless).
-  const denyRead = expand(
-    [
-      ...new Set([
-        ...(fs?.denyRead ?? []),
-        ...getCredentialDenyReadPaths(c.credentials),
-      ]),
-    ],
-    { mode: 'deny' },
-  )
-  const denyWrite = expand(fs?.denyWrite ?? [], { mode: 'deny' })
   return {
     // `allowRead` also serves as `allowWithinDeny`: a file under a
     // denied dir gets an explicit ALLOW ACE for the sandbox user,
@@ -1338,9 +1284,51 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
     // the recompose chokepoint orders deny-before-allow per-path.
     grantRead: expand(fs?.allowRead ?? [], { mode: 'grant' }),
     grantWrite: expand(fs?.allowWrite ?? [], { mode: 'grant' }),
-    denyRead,
-    denyWrite,
   }
+}
+
+/**
+ * Deny set for one exec: session + per-exec `denyRead`/`denyWrite`,
+ * credential files, and the mandatory set under `cwd`. Applied via
+ * `srt-win exec --deny-*` under the exec's PID, so a `.git` the host
+ * creates or rewrites between commands is covered by the next one.
+ */
+export function computeWindowsPerExecDenySet(
+  c: SandboxRuntimeConfig | undefined,
+  custom: Partial<SandboxRuntimeConfig> | undefined,
+  cwd: string,
+): { denyRead: string[]; denyWrite: string[] } {
+  const sessFs = c?.filesystem
+  const fsCfg = custom?.filesystem
+  if (sessFs?.disabled || fsCfg?.disabled) {
+    return { denyRead: [], denyWrite: [] }
+  }
+  const expand = expandWindowsFsPaths
+  const denyRead = expand(
+    [
+      ...new Set([
+        ...(sessFs?.denyRead ?? []),
+        ...(fsCfg?.denyRead ?? []),
+        ...getCredentialDenyReadPaths(c?.credentials),
+        ...getCredentialDenyReadPaths(custom?.credentials),
+      ]),
+    ],
+    { mode: 'deny' },
+  )
+  const mandatory = windowsGetMandatoryDenyPaths(cwd, {
+    maxDepth: c?.mandatoryDenySearchDepth ?? 3,
+    allowGitConfig: c?.filesystem?.allowGitConfig ?? false,
+  })
+  const read = new Set(denyRead)
+  const denyWrite = [
+    ...new Set([
+      ...expand([...(sessFs?.denyWrite ?? []), ...(fsCfg?.denyWrite ?? [])], {
+        mode: 'deny',
+      }),
+      ...mandatory,
+    ]),
+  ].filter(p => !read.has(p))
+  return { denyRead, denyWrite }
 }
 
 /**
@@ -1351,15 +1339,10 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
  */
 function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   // Keyed exactly on what {@link computeWindowsFsAccessSet} reads.
-  // `network.allowedDomains` does NOT feed file-deny (only mask
-  // injectHosts), so a network-only updateConfig hits the cache.
   return {
     disabled: c.filesystem.disabled ?? false,
-    denyRead: [...c.filesystem.denyRead],
-    denyWrite: [...c.filesystem.denyWrite],
     allowRead: [...(c.filesystem.allowRead ?? [])],
     allowWrite: [...c.filesystem.allowWrite],
-    credFiles: getCredentialDenyReadPaths(c.credentials),
   }
 }
 
@@ -1375,17 +1358,14 @@ function sameRawWindowsFsInputs(
 ): boolean {
   return (
     a.disabled === b.disabled &&
-    setEq(a.denyRead, b.denyRead) &&
-    setEq(a.denyWrite, b.denyWrite) &&
     setEq(a.allowRead, b.allowRead) &&
-    setEq(a.allowWrite, b.allowWrite) &&
-    setEq(a.credFiles, b.credFiles)
+    setEq(a.allowWrite, b.allowWrite)
   )
 }
 
 /**
- * True when `newConfig`'s file-deny inputs match what was
- * stamped at initialize(). Compares raw inputs only (cheap,
+ * True when `newConfig`'s grant inputs match what was applied at
+ * initialize(). Compares raw inputs only (cheap,
  * order-insensitive); never re-expands globs — updateConfig is
  * warn-only on Windows and the resolved set wouldn't be used.
  */
@@ -1818,66 +1798,28 @@ async function wrapWithSandboxArgv(
       customConfig?.credentials ?? config?.credentials,
       customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
     )
-    // Per-exec FILE denies (customConfig only — the session-level
-    // config's denies were already stamped at initialize()).
-    // Paths go through `expandWindowsFsPaths` — the SAME
-    // chokepoint the session-level set uses (point-in-time glob
-    // expand, normalize, missing→drop) — so a per-exec entry
-    // resolves identically to its session-level equivalent.
-    // macOS/Linux per-exec already reuses session-level expansion;
-    // Windows now matches.
-    //
-    // The dedup against `windowsFsStampedSet` is an OPTIMIZATION,
-    // not a correctness gate: re-stamping a session-held path
-    // under the exec's distinct holder is refcount-safe but wastes
-    // a SetSecurityInfo round-trip.
-    //
-    // filesystem.disabled bypasses ALL filesystem rule generation
-    // — including credential-derived file denies — same ordering
-    // as session-level `computeWindowsFsAccessSet` (credential
-    // ENV: mode:'deny' is structural under the fresh srt-sandbox
-    // env; mode:'mask' sentinels are passed via the --env
-    // overlay).
     // Per-exec allowRead/allowWrite throw — `srt-win exec` only
     // exposes `--deny-*`; per-exec grants are not implemented.
     const fsCfg = customConfig?.filesystem
-    let perExecDenyRead: string[] = []
-    let perExecDenyWrite: string[] = []
-    if (!fsCfg?.disabled) {
-      if (fsCfg?.allowRead?.length || fsCfg?.allowWrite?.length) {
-        throw new Error(
-          `Per-exec filesystem.allowRead/allowWrite is not supported ` +
-            `on Windows — \`srt-win exec\` only exposes per-exec ` +
-            `denies. Set them at the session level (initialize()).`,
-        )
-      }
-      const rawRead = [
-        ...(fsCfg?.denyRead ?? []),
-        ...getCredentialDenyReadPaths(customConfig?.credentials),
-      ]
-      const rawWrite = fsCfg?.denyWrite ?? []
-      // Skip on the dominant path (no per-exec fs or
-      // credential-file deny).
-      if (rawRead.length > 0 || rawWrite.length > 0) {
-        const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
-        const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
-        const expand = expandWindowsFsPaths
-        perExecDenyRead = expand(rawRead, { mode: 'deny' }).filter(
-          p => !sessRead.has(p),
-        )
-        perExecDenyWrite = expand(rawWrite, { mode: 'deny' }).filter(
-          p => !sessRead.has(p) && !sessWrite.has(p),
-        )
-      }
+    if (
+      !fsCfg?.disabled &&
+      (fsCfg?.allowRead?.length || fsCfg?.allowWrite?.length)
+    ) {
+      throw new Error(
+        `Per-exec filesystem.allowRead/allowWrite is not supported ` +
+          `on Windows — \`srt-win exec\` only exposes per-exec ` +
+          `denies. Set them at the session level (initialize()).`,
+      )
     }
+    const perExec = computeWindowsPerExecDenySet(
+      config,
+      customConfig,
+      cwd ?? process.cwd(),
+    )
     // Per-exec deny rides on argv (`acl stamp` reads stdin, but
     // exec's stdin belongs to the child). The CreateProcessW
     // length check lives in `wrapCommandWithSandboxWindows`
     // where the full argv (incl. shell + user command) is known.
-    //
-    // The `denyReadPaths` half of the SESSION-level credentials
-    // is already unioned into the stamp set at initialize() time
-    // via `computeWindowsFsAccessSet`.
     registerCommandText(command, options)
     return wrapCommandWithSandboxWindows({
       command,
@@ -1890,8 +1832,8 @@ async function wrapWithSandboxArgv(
       // passed via the --env overlay so the sandboxed child sees
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
-      denyRead: perExecDenyRead,
-      denyWrite: perExecDenyWrite,
+      denyRead: perExec.denyRead,
+      denyWrite: perExec.denyWrite,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
       // roots the sandbox user has MODIFY on plus any repo top-level
@@ -1960,10 +1902,10 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
     !sameWindowsStampSet(newConfig)
   ) {
     logForDebugging(
-      `[Sandbox Windows] updateConfig: the resolved file-access set ` +
-        `(filesystem.* ∪ credentials.files) changed but the ACL ` +
-        `stamp/grant is session-wide — call reset() then initialize() ` +
-        `to apply. The previously-applied set stays in effect.`,
+      `[Sandbox Windows] updateConfig: filesystem.allowRead/allowWrite ` +
+        `changed but the ACL grant is session-wide — call reset() then ` +
+        `initialize() to apply. The previously-applied grants stay in ` +
+        `effect; denies are recomputed per command.`,
       { level: 'warn' },
     )
   }

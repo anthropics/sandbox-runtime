@@ -663,14 +663,19 @@ pub enum SbAce {
     /// `BUILTIN\Users:(F)` (which the sandbox user, a Users member,
     /// would otherwise pick up).
     DenyFdc,
-    /// `(D;;DELETE;;;<sb>)` — object-only (`NO_INHERIT`) DELETE deny
-    /// on a placeholder INTERMEDIATE directory. Blocks the sandbox
-    /// from renaming/rmdir'ing the intermediate (which would bypass
-    /// the leaf's stamp) without leaking any semantics onto children:
-    /// a full-mask `(OI)(CI)` deny here would deny reads over the
-    /// whole subtree if the placeholder later becomes a real user
-    /// directory.
+    /// `(D;;DELETE|WRITE_DAC;;;<sb>)` — object-only (`NO_INHERIT`)
+    /// deny on a placeholder INTERMEDIATE directory. Blocks the
+    /// sandbox from renaming/rmdir'ing the intermediate (which would
+    /// bypass the leaf's stamp) without leaking any semantics onto
+    /// children: a full-mask `(OI)(CI)` deny here would deny reads
+    /// over the whole subtree if the placeholder later becomes a
+    /// real user directory.
     DenyDelete,
+    /// Same ACE on a REAL directory between a `Deny` target and its
+    /// modify-grant root, so the ancestor chain cannot be renamed
+    /// aside. No parent-FDC side ACE: that would re-propagate an
+    /// inheritable ACE over the tree on every exec.
+    DenyPin,
 }
 
 impl GrantMask {
@@ -710,6 +715,7 @@ impl SbAce {
             SbAce::Deny(_) => "deny",
             SbAce::DenyFdc => "deny_fdc",
             SbAce::DenyDelete => "deny_delete",
+            SbAce::DenyPin => "deny_pin",
         }
     }
     /// `'read' | 'modify' | 'denyRead' | 'denyWrite' | 'fdc'` — the
@@ -723,6 +729,7 @@ impl SbAce {
             SbAce::Deny(DenyMask::WriteDeny) => "denyWrite",
             SbAce::DenyFdc => "fdc",
             SbAce::DenyDelete => "delete",
+            SbAce::DenyPin => "pin",
         }
     }
     pub fn parse(kind: &str, mask: &str) -> Result<Self> {
@@ -733,6 +740,7 @@ impl SbAce {
             ("deny", "denyWrite") => SbAce::Deny(DenyMask::WriteDeny),
             ("deny_fdc", _) => SbAce::DenyFdc,
             ("deny_delete", _) => SbAce::DenyDelete,
+            ("deny_pin", _) => SbAce::DenyPin,
             (k, m) => bail!("unknown SbAce kind={k:?} mask={m:?}"),
         })
     }
@@ -768,15 +776,19 @@ pub struct SbAceSet {
 impl SbAceSet {
     /// The set's entries as [`NewAce`]s for `sid`, in canonical
     /// deny → deny-fdc → allow order. `Deny`/`DenyFdc`/`Grant` carry
-    /// [`OICI`]; `DenyDelete` is object-only ([`NO_INHERIT`]) — see
-    /// [`SbAce::DenyDelete`].
+    /// [`OICI`]; `DenyDelete`/`DenyPin` is object-only
+    /// ([`NO_INHERIT`]) — see [`SbAce::DenyDelete`].
     fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
         let mut v = Vec::with_capacity(4);
         if let Some(m) = self.deny {
             v.push(NewAce::Deny(sid, m.bits(), OICI));
         }
         if self.deny_delete {
-            v.push(NewAce::Deny(sid, Mask::DELETE.bits(), NO_INHERIT));
+            v.push(NewAce::Deny(
+                sid,
+                Mask::DELETE.with(Mask::WRITE_DAC).bits(),
+                NO_INHERIT,
+            ));
         }
         if self.deny_fdc {
             v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));

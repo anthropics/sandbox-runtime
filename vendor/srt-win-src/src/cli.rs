@@ -404,7 +404,9 @@ struct AceTargets {
 /// [`placeholder_ancestors_of`], any earlier holder's — get
 /// [`SbAce::DenyDelete`], so every holder holds the FULL chain and
 /// releasing any one holder cannot strip an intermediate another
-/// holder still depends on.
+/// holder still depends on. Real ancestors strictly between the
+/// target and its enclosing modify-grant root get
+/// [`SbAce::DenyPin`].
 ///
 /// A `Deny` target the broker cannot create (`PermissionDenied` —
 /// e.g. under `Program Files` non-elevated) or that names a UNC
@@ -429,7 +431,8 @@ fn canonicalize_ace_targets(
     use anyhow::anyhow;
     use srt_win::acl::SbAce;
     use srt_win::path_id::{
-        CanonError, canonicalize_path, create_placeholder_chain, is_unc_path, strip_extended_prefix,
+        CanonError, canonical_parent_of, canonicalize_path, create_placeholder_chain, is_unc_path,
+        strip_extended_prefix,
     };
     use std::io::ErrorKind;
     let mut targets = Vec::new();
@@ -520,8 +523,19 @@ fn canonicalize_ace_targets(
         // harmless — `apply_aces` is idempotent per
         // `(path, kind, holder)`.
         if matches!(ace, SbAce::Deny(_)) {
-            for anc in db.placeholder_ancestors_of(&canon)? {
-                targets.push((anc, SbAce::DenyDelete));
+            let placeholders = db.placeholder_ancestors_of(&canon)?;
+            for anc in &placeholders {
+                targets.push((anc.clone(), SbAce::DenyDelete));
+            }
+            // Pin real ancestors below the grant root; never above it.
+            if let Some(root) = db.grant_root_of(&canon)? {
+                let mut cur = canonical_parent_of(&canon);
+                while let Some(anc) = cur.filter(|a| *a != root && a.len() > root.len()) {
+                    if !placeholders.contains(&anc) {
+                        targets.push((anc.clone(), SbAce::DenyPin));
+                    }
+                    cur = canonical_parent_of(&anc);
+                }
             }
         }
     }

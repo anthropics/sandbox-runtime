@@ -686,6 +686,8 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
+**Note (Windows):** On Windows, mandatory deny paths cover existing files only and are rescanned per command (paths up to `mandatoryDenySearchDepth` components below the working directory, default 3, same counting as Linux, skipping `node_modules`), with the deny ACEs applied for the command's lifetime. A repo's `.git` directory and its ancestors up to the write-granted root are also pinned against rename/delete for the command's duration.
+
 **Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
 
 **Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
