@@ -52,6 +52,7 @@
   },
   "files": [
     "dist",
+    "examples",
     "vendor/seccomp",
     "vendor/srt-win",
     "vendor/java-proxy-agent",

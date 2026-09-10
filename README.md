@@ -174,6 +174,59 @@ srt --debug curl https://example.com
 srt --settings /path/to/srt-settings.json npm install
 ```
 
+### The Sandbox-Agent channel
+
+A sandbox policy is written before the wrapped program runs, so it cannot
+bend to what the program turns out to need. When the wrapped program is an
+agent, it can be asked. `--agent-channel` opens a bidirectional channel to
+the wrapped command:
+
+- the sandbox **asks the agent** to decide requests the policy does not
+  cover (e.g. a network host on neither the allow nor the deny list), and
+- the sandbox **tells the agent** what actions were blocked, so the agent
+  can react to a denial rather than assume the hard drive is failing or a
+  remote service is down.
+
+The channel is one end of a Unix socketpair, inherited by the wrapped
+command as the file descriptor named by the `SANDBOX_AGENT_CHANNEL_FD`
+environment variable. Messages are newline-delimited JSON:
+
+```
+sandbox → agent  {"type":"hello","protocol_version":1}
+agent → sandbox  {"type":"hello","protocol_version":1}
+sandbox → agent  {"type":"permission_request","id":"pr_1",
+                  "resource":{"type":"network","host":"api.github.com","port":443},
+                  "operation":"connect",
+                  "description":"Connecting to api.github.com:443"}
+agent → sandbox  {"type":"permission_response","id":"pr_1","behavior":"allow"}
+sandbox → agent  {"type":"blocked",
+                  "resource":{"type":"file","path":"/etc/hosts"},
+                  "operation":"write",
+                  "description":"Writing to /etc/hosts, which the sandbox policy does not allow"}
+```
+
+Until the agent's `hello` arrives, the sandbox asks nothing and denies what
+its policy does not cover. Neither resource `type` nor `operation` is a
+fixed list — an agent must gracefully handle types it does not know about;
+`description` is what lets it prompt about them anyway. When the agent
+itself denies a `permission_request`, the sandbox does not send a `blocked`
+message for that request.
+
+The trust boundary: the agent is trusted because the user pilots it — an
+allow from it is worth the same as a human saying yes. The programs the
+agent runs are not trusted, but note that the agent and its tools live in
+the same jail under the same policy: the channel gives the agent back the
+decision, it does not isolate the agent from the programs it runs.
+
+You can run the whole loop with the reference agent that ships in
+`examples/`:
+
+```bash
+# Prompts on the terminal for uncovered hosts; SRT_AGENT_DEMO_BEHAVIOR=allow|deny
+# answers automatically.
+srt --agent-channel -- ./examples/agent-demo.sh curl https://api.github.com
+```
+
 ### As a library
 
 ```typescript
@@ -237,6 +290,14 @@ export { SandboxManager } from '@anthropic-ai/sandbox-runtime'
 
 // Violation tracking
 export { SandboxViolationStore } from '@anthropic-ai/sandbox-runtime'
+
+// Sandbox-Agent channel (sandbox side)
+export {
+  SandboxAgentChannel,
+  blockedMessageFromViolation,
+  AGENT_CHANNEL_PROTOCOL_VERSION,
+  SANDBOX_AGENT_CHANNEL_FD_ENV_VAR,
+} from '@anthropic-ai/sandbox-runtime'
 
 // TypeScript types
 export type {
