@@ -5,6 +5,7 @@ import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import * as net from 'node:net'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
@@ -97,6 +98,14 @@ export interface LinuxSandboxParams {
   observeSocketPath?: string
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
+  /**
+   * Linux-only: reverse loopback port-forward bridges to bind-mount into
+   * the sandbox and wire up so the host can reach a TCP server the
+   * sandboxed process binds on 127.0.0.1:<port>. Each entry's socketPath
+   * must already exist (spawned by initializeLinuxPortForwardBridges on
+   * the host side) before this is used.
+   */
+  exposeLoopbackPorts?: Array<{ port: number; socketPath: string }>
 }
 
 /** Default max depth for searching dangerous files */
@@ -799,6 +808,249 @@ export async function initializeLinuxNetworkBridge(
 }
 
 /**
+ * A single host-side reverse port-forward bridge, forwarding
+ * 127.0.0.1:<port> on the host into a Unix socket that the sandbox side
+ * (set up in a later step) will listen on.
+ */
+export interface LinuxPortForwardBridge {
+  port: number
+  socketPath: string
+  bridgeProcess: ChildProcess
+}
+
+/**
+ * Probe whether something is actively listening on 127.0.0.1:<port> by
+ * attempting a real TCP connect. A successful 'connect' event proves a
+ * listener has bound and is accepting connections on that port; a
+ * connection-refused error or timeout means nothing is listening yet (the
+ * caller should retry). This is used to verify the host-side socat bridge
+ * actually bound the requested TCP port, rather than merely existing as a
+ * process.
+ */
+function probeTcpListening(port: number, timeoutMs: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = net.connect({ host: '127.0.0.1', port })
+    const done = (result: boolean): void => {
+      socket.removeAllListeners()
+      socket.destroy()
+      resolve(result)
+    }
+    socket.setTimeout(timeoutMs)
+    socket.once('connect', () => done(true))
+    socket.once('timeout', () => done(false))
+    socket.once('error', () => done(false))
+  })
+}
+
+/**
+ * Initialize host-side reverse port-forward bridges for Linux sandbox networking.
+ *
+ * ARCHITECTURE NOTE:
+ * This is the REVERSE direction of initializeLinuxNetworkBridge above. That
+ * function lets processes INSIDE the sandbox's isolated network namespace
+ * reach OUT to host proxy servers. This function does the opposite: it lets
+ * the HOST reach a TCP server that a SANDBOXED process binds on
+ * 127.0.0.1:<port> inside its own isolated network namespace.
+ *
+ * Since bwrap --unshare-net gives the sandbox a fully isolated network
+ * namespace, the host cannot directly connect to a port the sandboxed
+ * process listens on. To bridge this without opening up the network
+ * namespace generally, we:
+ *
+ * 1. Host side (this function): For each configured port, spawn a socat
+ *    process that listens on 127.0.0.1:<port> on the HOST and forwards each
+ *    connection to a unique Unix socket in tmpdir.
+ * 2. Sandbox side (a later step): Bind that Unix socket into the isolated
+ *    namespace and run a socat listener there that connects the Unix socket
+ *    to the sandboxed process's own TCP server on 127.0.0.1:<port>.
+ *
+ * Only the ports explicitly listed in `ports` are bridged — no other network
+ * access is granted by this mechanism.
+ *
+ * DEPENDENCIES: Requires socat.
+ */
+export async function initializeLinuxPortForwardBridges(
+  ports: number[],
+  socatPath?: string,
+): Promise<LinuxPortForwardBridge[]> {
+  if (ports.length === 0) {
+    return []
+  }
+
+  const socat = socatPath ?? 'socat'
+  const bridges: LinuxPortForwardBridge[] = []
+
+  const cleanupAll = () => {
+    for (const bridge of bridges) {
+      if (bridge.bridgeProcess.pid) {
+        try {
+          process.kill(bridge.bridgeProcess.pid, 'SIGTERM')
+        } catch {
+          // Ignore errors
+        }
+      }
+      try {
+        fs.unlinkSync(bridge.socketPath)
+      } catch {
+        // Ignore errors (placeholder file may not have been created, or
+        // already replaced/removed)
+      }
+    }
+  }
+
+  for (const port of ports) {
+    const socketPath = join(
+      tmpdir(),
+      `claude-portfwd-${port}-${randomBytes(8).toString('hex')}.sock`,
+    )
+
+    // PRE-EXISTING BUG FIX (minimal, flagged): wrapCommandWithSandboxLinux
+    // requires exposeLoopbackPorts[].socketPath to already exist on the host
+    // before bwrap can --bind it into the sandbox. The host-side bridge
+    // spawned below is a UNIX-CONNECT *client* (it connects to socketPath,
+    // it does not create it), so nothing ever created this placeholder file
+    // — bwrap's precheck would always throw. Create an empty regular file
+    // now as a bind-mount target; the in-sandbox UNIX-LISTEN socat (see
+    // buildSandboxCommand's exposeLoopbackPorts branch, which passes
+    // `unlink-early`) replaces it with the real socket once the sandbox
+    // starts.
+    fs.closeSync(fs.openSync(socketPath, 'w'))
+
+    const socatArgs = [
+      `TCP-LISTEN:${port},fork,reuseaddr,bind=127.0.0.1`,
+      `UNIX-CONNECT:${socketPath}`,
+    ]
+
+    logForDebugging(
+      `Starting port-forward bridge for port ${port}: ${socat} ${socatArgs.join(' ')}`,
+    )
+
+    const bridgeProcess = spawn(socat, socatArgs, {
+      stdio: 'ignore',
+    })
+
+    // Tracks real process exit (as opposed to ChildProcess#killed, which is
+    // only true when *we* called process.kill() on it — it stays false when
+    // socat exits on its own, e.g. because the requested TCP port is already
+    // in use and it gets EADDRINUSE). The readiness loop below reads this
+    // flag instead of `.killed` so a dead-on-arrival bridge is detected.
+    let bridgeExited = false
+    let bridgeExitInfo:
+      | { code: number | null; signal: NodeJS.Signals | null }
+      | undefined
+
+    // Add error and exit handlers to monitor bridge health. These must be
+    // registered before the !pid check: when spawn fails (e.g. socat is
+    // missing or not executable), the ChildProcess emits an asynchronous
+    // 'error' event, and throwing first would leave that event without a
+    // listener — surfacing as an uncaughtException instead of the rejection
+    // below.
+    bridgeProcess.on('error', err => {
+      logForDebugging(
+        `Port-forward bridge process error (port ${port}): ${err}`,
+        { level: 'error' },
+      )
+    })
+    bridgeProcess.on('exit', (code, signal) => {
+      bridgeExited = true
+      bridgeExitInfo = { code, signal }
+      logForDebugging(
+        `Port-forward bridge process exited (port ${port}) with code ${code}, signal ${signal}`,
+        { level: code === 0 ? 'info' : 'error' },
+      )
+    })
+
+    if (!bridgeProcess.pid) {
+      cleanupAll()
+      try {
+        fs.unlinkSync(socketPath)
+      } catch {
+        // Ignore errors
+      }
+      throw new Error(
+        `Failed to start port-forward bridge process for port ${port}`,
+      )
+    }
+
+    bridges.push({ port, socketPath, bridgeProcess })
+
+    // Wait for the bridge to actually be listening on the host TCP port.
+    //
+    // Unlike initializeLinuxNetworkBridge above (where the host side is the
+    // UNIX-LISTEN/socket-creating side, so fs.existsSync genuinely proves
+    // that socat has bound its socket), this bridge's socketPath is an
+    // empty placeholder file created unconditionally *before* socat even
+    // starts (see the PRE-EXISTING BUG FIX comment above), purely so bwrap's
+    // --bind precondition can pass later. Its existence says nothing about
+    // whether socat has bound 127.0.0.1:<port>. Instead, probe the actual
+    // TCP port: a successful connect proves socat is listening and
+    // accepting, regardless of what happens to the UNIX-CONNECT side after.
+    const maxAttempts = 5
+    let ready = false
+    for (let i = 0; i < maxAttempts; i++) {
+      if (!bridgeProcess.pid || bridgeExited) {
+        cleanupAll()
+        throw new Error(
+          `Port-forward bridge process for port ${port} exited unexpectedly ` +
+            `(code=${bridgeExitInfo?.code}, signal=${bridgeExitInfo?.signal}) before becoming ready`,
+        )
+      }
+
+      let probedListening = false
+      try {
+        probedListening = await probeTcpListening(port, 250)
+      } catch (err) {
+        logForDebugging(
+          `Error probing port-forward bridge for port ${port} (attempt ${i + 1}): ${err}`,
+          { level: 'error' },
+        )
+      }
+
+      if (probedListening) {
+        // A successful connect proves *some* process is listening on the
+        // port, but socat's own bind failure (e.g. EADDRINUSE because
+        // another process already held the port) can race with this
+        // check: the connect may succeed against that other process before
+        // socat's near-instant exit event has fired. Give the exit event a
+        // brief grace period and re-check bridgeExited before trusting the
+        // probe.
+        await new Promise(resolve => setTimeout(resolve, 50))
+        if (bridgeExited) {
+          cleanupAll()
+          throw new Error(
+            `Port-forward bridge process for port ${port} exited unexpectedly ` +
+              `(code=${bridgeExitInfo?.code}, signal=${bridgeExitInfo?.signal}) before becoming ready`,
+          )
+        }
+        logForDebugging(
+          `Port-forward bridge for port ${port} ready after ${i + 1} attempts`,
+        )
+        ready = true
+        break
+      }
+
+      if (i === maxAttempts - 1) {
+        break
+      }
+
+      await new Promise(resolve => setTimeout(resolve, i * 100))
+    }
+
+    if (!ready) {
+      cleanupAll()
+      throw new Error(
+        `Failed to create port-forward bridge socket for port ${port} after ${maxAttempts} attempts` +
+          (bridgeExited
+            ? ` (bridge process exited: code=${bridgeExitInfo?.code}, signal=${bridgeExitInfo?.signal})`
+            : ''),
+      )
+    }
+  }
+
+  return bridges
+}
+
+/**
  * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
  * multicall-binary prefix that dispatches on the ARGV0 env var.
  *
@@ -828,12 +1080,13 @@ function resolveApplySeccompPrefix(
  * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
  */
 function buildSandboxCommand(
-  httpSocketPath: string,
-  socksSocketPath: string,
+  httpSocketPath: string | undefined,
+  socksSocketPath: string | undefined,
   userCommand: string,
   applySeccompPrefix: string | undefined,
   shell?: string,
   socatPath?: string,
+  exposeLoopbackPorts?: Array<{ port: number; socketPath: string }>,
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
@@ -841,9 +1094,34 @@ function buildSandboxCommand(
   // socatPath resolves to the same binary inside bwrap.
   const socat = quote([socatPath ?? 'socat'])
   const socatCommands = [
-    `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
-    `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    'trap "kill %1 %2 2>/dev/null; exit" EXIT',
+    // Proxy listeners only start when proxy sockets are actually provided —
+    // a fully network-blocked sandbox (empty allowedDomains, no proxy) can
+    // still request exposeLoopbackPorts on their own (see call site).
+    ...(httpSocketPath
+      ? [
+          `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+        ]
+      : []),
+    ...(socksSocketPath
+      ? [
+          `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+        ]
+      : []),
+    ...(exposeLoopbackPorts ?? []).map(
+      // PRE-EXISTING BUG FIX (minimal, flagged): the bind-mounted socketPath
+      // already exists on the host as an empty placeholder regular file (see
+      // initializeLinuxPortForwardBridges), needed so bwrap's --bind precheck
+      // passes. socat's UNIX-LISTEN refuses to bind when the target path
+      // already exists ("File exists"), even with `reuseaddr` — only
+      // `unlink-early` makes it remove the placeholder and create the real
+      // socket in its place.
+      ({ port, socketPath }) =>
+        `${socat} UNIX-LISTEN:${socketPath},fork,reuseaddr,unlink-early TCP:127.0.0.1:${port} >/dev/null 2>&1 &`,
+    ),
+    // Single-quoted so `$(jobs -p)` is deferred to trap-fire time (after
+    // all background socat commands above have started), not expanded
+    // immediately when this string is constructed/registered.
+    "trap 'kill $(jobs -p) 2>/dev/null; exit' EXIT",
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
@@ -1802,6 +2080,7 @@ export async function wrapCommandWithSandboxLinux(
     socatPath,
     observeSocketPath,
     abortSignal,
+    exposeLoopbackPorts,
   } = params
 
   // Determine if we have restrictions to apply
@@ -1925,6 +2204,22 @@ export async function wrapCommandWithSandboxLinux(
       // Always unshare network namespace to isolate network access
       // This removes all network interfaces, effectively blocking all network
       bwrapArgs.push('--unshare-net')
+
+      // Bind-mount each reverse loopback port-forward socket so the
+      // sandboxed process's own socat listener (started in
+      // buildSandboxCommand) can bind that path inside the namespace. This
+      // is independent of whether a proxy is configured: a fully
+      // network-blocked sandbox (empty allowedDomains, no proxy sockets)
+      // can still expose specific loopback ports.
+      for (const { port, socketPath } of exposeLoopbackPorts ?? []) {
+        if (!fs.existsSync(socketPath)) {
+          throw new Error(
+            `Linux loopback port-forward bridge socket for port ${port} does not exist: ${socketPath}. ` +
+              'The bridge process may have died. Try reinitializing the sandbox.',
+          )
+        }
+        bwrapArgs.push('--bind', socketPath, socketPath)
+      }
 
       // If proxy sockets are provided, bind them into the sandbox to allow
       // filtered network access through the proxy. If not provided, network
@@ -2072,8 +2367,14 @@ export async function wrapCommandWithSandboxLinux(
 
     // With network restrictions, route the command through buildSandboxCommand
     // so socat starts before seccomp is applied. Otherwise invoke apply-seccomp
-    // directly if we have a binary.
-    if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
+    // directly if we have a binary. Triggers whenever there's a proxy bridge
+    // OR loopback ports to expose — a fully network-blocked sandbox can still
+    // request exposeLoopbackPorts on its own.
+    const hasExposeLoopbackPorts = (exposeLoopbackPorts?.length ?? 0) > 0
+    if (
+      needsNetworkRestriction &&
+      ((httpSocketPath && socksSocketPath) || hasExposeLoopbackPorts)
+    ) {
       const sandboxCommand = buildSandboxCommand(
         httpSocketPath,
         socksSocketPath,
@@ -2081,6 +2382,7 @@ export async function wrapCommandWithSandboxLinux(
         applySeccompPrefix,
         shell,
         socatPath,
+        exposeLoopbackPorts,
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
