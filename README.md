@@ -374,12 +374,13 @@ Examples:
 
 bubblewrap binds concrete paths, so glob support is narrower than on macOS:
 
-- `allowWrite` / `denyWrite` take literal paths only; a glob pattern there is skipped.
-- `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the matching entries when the command is wrapped, so a file that appears later is not covered — with one exception:
-  - A directory matched by a `denyRead` pattern ending in `/**` becomes one tmpfs mount rather than one mount per file beneath it, and behaves exactly like a directory listed in `denyRead` literally: inside the sandbox it is empty and writable, writes into it stay in the tmpfs and never reach the host, and a file added to it later on the host is hidden too. An `allowRead` beneath it is bound back over the tmpfs, and matched entries beneath that carve-out keep their own masks.
-  - Symlinked directories are descended. An entry reached through a symlink is denied at the link's target as well; a link back up the tree denies everything it reaches, as a literal deny of the link would; a link to `/` is left alone.
-  - A carve-out beneath a link applies in whichever spelling it is written; an `allowRead` that is itself a symlink is bound at its target.
-- A directory `denyRead` whose path is a symlink — literal, or matched by a pattern — is mounted at the link's target, since bubblewrap refuses to mount on a symlink.
+- `allowWrite` / `denyWrite` take literal paths. A trailing `/**` is dropped (`src/**` means `src`); any other glob pattern there is skipped.
+- `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the entries that exist when the command is wrapped, so a file that appears later is not covered. The pattern needs a literal directory to start from (a relative pattern starts at the current directory): one whose first wildcard comes straight after `/`, such as `/**/*.pem`, is skipped on Linux.
+- A directory matched by a `denyRead` pattern ending in `/**` that holds at least one entry when the command is wrapped becomes one tmpfs mount, like a directory listed in `denyRead` literally: inside the sandbox it is empty and writable, writes into it never reach the host, and a file added to it later on the host is hidden too. A matched directory that is empty at that point gets no mount. An `allowRead` beneath a mounted directory is bound back over the tmpfs, and matched entries beneath that carve-out keep their own masks.
+- A directory the expansion cannot list is denied as a whole.
+- Symlinked directories are descended. An entry reached through a symlink is denied at the link's target as well, and a link back up the tree denies everything it reaches, as a literal deny of the link would. Nothing is denied at `/` through a link that resolves to it.
+- A carve-out beneath a link applies in whichever spelling it is written; an `allowRead` that is itself a symlink is bound at its target.
+- A directory `denyRead` whose path is a symlink (listed literally, or matched by a pattern) is mounted at the link's target: bubblewrap 0.12 and later refuse to mount on a symlink.
 
 Examples:
 
