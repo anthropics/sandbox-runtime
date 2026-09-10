@@ -215,7 +215,7 @@ child.on('exit', async code => {
 })
 ```
 
-**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you *execute* is not the command the invocation *represents* (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
+**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you _execute_ is not the command the invocation _represents_ (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
 
 ```typescript
 const wrapped = await SandboxManager.wrapWithSandbox(
@@ -226,7 +226,10 @@ const wrapped = await SandboxManager.wrapWithSandbox(
   { commandId: invocationId, commandText: rawCommand },
 )
 // ... run it ...
-const annotated = SandboxManager.annotateStderrWithSandboxFailures(invocationId, stderr)
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(
+  invocationId,
+  stderr,
+)
 ```
 
 #### Available exports
@@ -339,13 +342,16 @@ What the check leaves alone: allowlist entries that **are** IP literals (allow-l
 
 | Setting                        | macOS                     | Linux                                    |
 | ------------------------------ | ------------------------- | ---------------------------------------- |
-| `allowUnixSockets: string[]`   | Allowlist of socket paths | _Ignored_ (seccomp can't filter by path) |
+| `allowUnixSockets: string[]`   | Allowlist of socket paths | Allowlist of socket paths (connect only) |
 | `allowAllUnixSockets: boolean` | Allow all sockets         | Disable seccomp blocking                 |
 
 Unix sockets are **blocked by default** on both platforms.
 
 - **macOS**: Use `allowUnixSockets` to allow specific paths (e.g., `["/var/run/docker.sock"]`), or `allowAllUnixSockets: true` to allow all.
-- **Linux**: Blocking uses seccomp filters (x64/arm64 only). If seccomp isn't available, sockets are unrestricted and a warning is shown. Use `allowAllUnixSockets: true` to explicitly disable blocking.
+- **Linux**: Blocking uses seccomp filters (x64/arm64 only). `allowUnixSockets` allows `connect()` to the listed paths (see [Allowing specific sockets on Linux](#allowing-specific-sockets-on-linux)); `allowAllUnixSockets: true` disables blocking entirely. If seccomp isn't available, sockets are unrestricted and a warning is shown.
+
+An entry is a socket path or a directory whose sockets are all allowed — the
+same subpath semantics on both platforms.
 
 #### Filesystem Configuration
 
@@ -728,6 +734,68 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 **Security limitations**: The filter blocks `socket(AF_UNIX, ...)` and the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls (the latter three because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rule). It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
 
+#### Allowing specific sockets on Linux
+
+`network.allowUnixSockets` names paths the sandboxed command may `connect()`
+to — a daemon's socket, or a directory whose sockets are all allowed:
+
+```json
+{
+  "network": {
+    "allowUnixSockets": ["~/.cache/mytool/daemon/"]
+  }
+}
+```
+
+seccomp-bpf cannot read a socket path out of user memory, so the allowlist is
+enforced one level up. With any entry configured, `apply-seccomp` installs a
+user-notification filter instead of the blocking one, and its supervisor
+process performs each `connect()`/`bind()`/`listen()` itself on the caller's
+socket, allowing a connect only when the canonical target is inside the
+allowlist. It never answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE` for those
+syscalls: continuing would re-execute the syscall from the caller's own
+memory and file descriptor table, which a sibling thread can rewrite between
+the check and the call. The connect goes through a pinned `O_PATH` handle of
+the target inode rather than a second path walk, so no symlink or rename
+swap after the check can redirect it.
+
+What stays blocked with an allowlist configured:
+
+- `bind()` and `listen()` on Unix sockets — a sandboxed command connects to
+  services, it does not publish them
+- the abstract namespace, which has no path to match against
+- datagram Unix sockets (`SOCK_DGRAM`, and the `SOCK_RAW` spelling the kernel
+  maps onto it), whose `sendto()` carries a destination path of its own
+- `seccomp(..., SECCOMP_FILTER_FLAG_NEW_LISTENER)` and the seccomp
+  notification ioctls, so nothing inside the sandbox can install a listener
+  of its own and answer its own traps
+
+TCP is unaffected: those calls are performed by the supervisor unchanged,
+including non-blocking connects.
+
+Requirements and caveats:
+
+- **Linux 5.6 or newer** (`pidfd_getfd`). On older kernels `apply-seccomp`
+  prints a warning and blocks Unix sockets outright — degraded, never
+  permissive.
+- Entries that **do not exist** are dropped, and so are entries the sandbox
+  can also **write**: `link(2)` works on socket inodes, so a writable
+  allow-listed directory is one hard link away from every other socket the
+  user owns. Give the socket's directory a `denyWrite` carve-out, or keep it
+  outside `allowWrite`.
+- The allowed server sees the supervisor's pid in `SO_PEERCRED`; the uid and
+  gid are the workload's. Servers that authorize by peer pid will not
+  recognize the caller.
+- Each brokered `connect()`/`bind()`/`listen()` costs tens of microseconds
+  (measured: ~8 µs → ~57 µs per TCP connect on arm64). The data path is
+  untouched.
+- If the supervisor dies, its listener closes and every trapped syscall
+  returns `ENOSYS` — TCP included, not just Unix sockets. Fail-closed, but it
+  couples the workload's networking to the supervisor's liveness. The
+  workload cannot cause this itself: the supervisor runs outside the
+  sandbox's PID namespace, so it is neither addressable nor signallable from
+  inside.
+
 **Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
 
 **Architecture support**: x64 and arm64 are fully supported with pre-built binaries. Other architectures are not currently supported. To use sandboxing without Unix socket blocking on unsupported architectures, set `allowAllUnixSockets: true` in your configuration.
@@ -787,7 +855,7 @@ Note: Custom proxy configuration is not yet supported in the new configuration f
 Users should be aware of potential risks that come from allowing broad domains like `github.com` that may allow for data exfiltration. Also, in some cases it may be possible to bypass the network filtering through [domain fronting](https://en.wikipedia.org/wiki/Domain_fronting).
 </Warning>
 
-- Privilege Escalation via Unix Sockets: The `allowUnixSockets` configuration can inadvertently grant access to powerful system services that could lead to sandbox bypasses. For example, if it is used to allow access to `/var/run/docker.sock` this would effectively grant access to the host system through exploiting the docker socket. Users are encouraged to carefully consider any unix sockets that they allow through the sandbox.
+- Privilege Escalation via Unix Sockets: The `allowUnixSockets` configuration can inadvertently grant access to powerful system services that could lead to sandbox bypasses. For example, if it is used to allow access to `/var/run/docker.sock` this would effectively grant access to the host system through exploiting the docker socket. Users are encouraged to carefully consider any unix sockets that they allow through the sandbox. Allowing a _directory_ grants every socket in it, now and later, so an allow-listed directory the sandbox can write to (or hard-link into) is equivalent to allowing whatever it can put there — on Linux such entries are dropped for that reason.
 - Filesystem Permission Escalation: Overly broad filesystem write permissions can enable privilege escalation attacks. Allowing writes to directories containing executables in `$PATH`, system configuration directories, or user shell configuration files (`.bashrc`, `.zshrc`) can lead to code execution in different security contexts when other users or system processes access these files.
 - Linux Sandbox Strength: The Linux implementation provides strong filesystem and network isolation but includes an `enableWeakerNestedSandbox` mode that enables it to work inside of Docker environments without privileged namespaces. This option considerably weakens security and should only be used in cases where additional isolation is otherwise enforced.
 - Weaker Network Isolation (macOS): The `enableWeakerNetworkIsolation` option re-enables access to `com.apple.trustd.agent`, which is needed for Go programs to verify TLS certificates via the macOS Security framework. This opens a potential data exfiltration vector through the trustd service and should only be enabled when Go TLS verification is required (e.g., when using `httpProxyPort` with a MITM proxy and custom CA).

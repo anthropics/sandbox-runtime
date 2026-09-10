@@ -16,6 +16,8 @@ import {
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
   encodeSandboxedCommand,
+  expandTilde,
+  containsGlobChars,
   DANGEROUS_FILES,
   isAtOrUnder,
   isStrictlyUnder,
@@ -70,6 +72,14 @@ export interface LinuxSandboxParams {
    */
   maskedFileStoreDir?: string
   enableWeakerNestedSandbox?: boolean
+  /**
+   * Unix socket paths the sandboxed command may connect to. Each entry is a
+   * socket path or a directory whose sockets are all allowed (the same
+   * subpath semantics as macOS). Ignored when {@link allowAllUnixSockets}
+   * is set. Requires Linux 5.6+; on older kernels apply-seccomp warns and
+   * blocks unix sockets outright.
+   */
+  allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: { command: string; args?: string[] }
@@ -812,15 +822,151 @@ export async function initializeLinuxNetworkBridge(
 function resolveApplySeccompPrefix(
   applyPath: string | undefined,
   argv0: string | undefined,
+  unixConnectArgs: string[] = [],
 ): string | undefined {
+  // `--` terminates apply-seccomp's own options so a command that starts
+  // with a dash is never mistaken for one.
+  const opts = unixConnectArgs.length > 0 ? `${quote(unixConnectArgs)} -- ` : ''
   if (argv0) {
     if (!applyPath) {
       throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
     }
-    return `ARGV0=${quote([argv0])} ${quote([applyPath])} `
+    return `ARGV0=${quote([argv0])} ${quote([applyPath])} ${opts}`
   }
   const binary = getApplySeccompBinaryPath(applyPath)
-  return binary ? `${quote([binary])} ` : undefined
+  return binary ? `${quote([binary])} ${opts}` : undefined
+}
+
+/**
+ * Turn `network.allowUnixSockets` into apply-seccomp `--allow-unix-connect`
+ * arguments: tilde-expanded, absolute, and canonicalized the same way the
+ * supervisor canonicalizes a connect target, so the two agree on what an
+ * entry names.
+ *
+ * Two classes of entry are dropped rather than passed through, because
+ * neither is a boundary the supervisor can hold:
+ *
+ * - Paths that do not exist. A path the sandbox can still create is a way
+ *   in: the socket that eventually appears there may be one the sandboxed
+ *   command put there. Allow-list the directory a socket appears in —
+ *   sockets created inside it later match by prefix — rather than a socket
+ *   path that is not there yet.
+ * - Paths the sandbox can also write. `link(2)` works on socket inodes and
+ *   `fs.protected_hardlinks` only stops linking sockets owned by another
+ *   user, so a writable allow-listed directory is one hard link away from
+ *   every other socket this user owns, an ssh-agent or docker socket among
+ *   them. Give the socket's directory a `denyWrite` carve-out, or move the
+ *   socket somewhere the sandbox cannot write, to allow it.
+ *
+ * When the sandbox restricts writes nowhere at all — no `writeConfig`, or
+ * `filesystem.disabled` (which is `allowOnly: ['/']`) — that second rule has
+ * nothing to hold onto: every path is writable, so an allow-listed directory
+ * is worth exactly as much as the sockets the command can link into it. Every
+ * entry is dropped in that case rather than passed through, which is the same
+ * direction the rest of this feature fails in.
+ */
+/** The deepest directory a glob pattern can write into: everything before
+ *  its first glob character. `~/code/**\/build` -> `~/code`. */
+function globRoot(pattern: string): string {
+  const firstGlob = pattern.search(/[*?[\]{}]/)
+  const head = firstGlob === -1 ? pattern : pattern.slice(0, firstGlob)
+  const lastSlash = head.lastIndexOf('/')
+  return lastSlash <= 0 ? '/' : head.slice(0, lastSlash)
+}
+
+function buildUnixConnectArgs(
+  allowUnixSockets: string[] | undefined,
+  writeConfig: FsWriteRestrictionConfig | undefined,
+): string[] {
+  if (!allowUnixSockets || allowUnixSockets.length === 0) return []
+
+  if (!writeConfig) {
+    logForDebugging(
+      `[Sandbox Linux] Ignoring allowUnixSockets: this sandbox restricts ` +
+        `writes nowhere, so the command could hard-link any socket it can ` +
+        `reach into an allowed directory. Configure filesystem write ` +
+        `restrictions to use a unix socket allowlist.`,
+      { level: 'warn' },
+    )
+    return []
+  }
+
+  const canonicalize = (
+    p: string,
+    { mustExist = false }: { mustExist?: boolean } = {},
+  ): string | undefined => {
+    // Trailing slashes are stripped so a spelling difference is not a
+    // mismatch — but "/" is all slash, and must survive as the root it is:
+    // it is how `filesystem.disabled` spells "everything is writable".
+    const trimmed = expandTilde(p).replace(/\/+$/, '')
+    const expanded = trimmed === '' && p.startsWith('/') ? '/' : trimmed
+    if (!expanded.startsWith('/')) {
+      logForDebugging(
+        `[Sandbox Linux] Ignoring non-absolute allowUnixSockets entry: ${p}`,
+        { level: 'warn' },
+      )
+      return undefined
+    }
+    try {
+      return fs.realpathSync(expanded)
+    } catch {
+      if (mustExist) {
+        logForDebugging(
+          `[Sandbox Linux] Ignoring allowUnixSockets entry that does not ` +
+            `exist: ${expanded}. Allow the directory the socket appears in ` +
+            `instead of a socket path that is not there yet.`,
+          { level: 'warn' },
+        )
+        return undefined
+      }
+      // A write root that does not exist yet still bounds where the sandbox
+      // may write, so keep its literal spelling for the comparison below.
+      return expanded
+    }
+  }
+
+  const underPrefix = (child: string, parent: string): boolean =>
+    child === parent ||
+    child.startsWith(parent.endsWith('/') ? parent : parent + '/')
+
+  // A writable root given as a glob is reduced to the directory the glob
+  // starts from: broader than the pattern, which errs toward dropping an
+  // entry rather than trusting one. A glob in denyWrite is skipped for the
+  // mirror-image reason — an approximate carve-out must not be what keeps a
+  // writable entry alive.
+  const writableRoots = (writeConfig?.allowOnly ?? [])
+    .map(p => (containsGlobChars(p) ? globRoot(p) : p))
+    .map(p => canonicalize(p))
+    .filter((p): p is string => p !== undefined)
+  const writeDenied = (writeConfig?.denyWithinAllow ?? [])
+    .filter(p => !containsGlobChars(p))
+    .map(p => canonicalize(p))
+    .filter((p): p is string => p !== undefined)
+
+  const args: string[] = []
+  const seen = new Set<string>()
+  for (const entry of allowUnixSockets) {
+    const canonical = canonicalize(entry, { mustExist: true })
+    if (!canonical || seen.has(canonical)) continue
+
+    const writable =
+      writableRoots.some(root => underPrefix(canonical, root)) &&
+      !writeDenied.some(deny => underPrefix(canonical, deny))
+    if (writable) {
+      logForDebugging(
+        `[Sandbox Linux] Ignoring allowUnixSockets entry the sandbox can ` +
+          `also write, since the command could hard-link another socket ` +
+          `into it: ${canonical}. Add it to denyWrite, or move the socket ` +
+          `to a directory the sandbox cannot write.`,
+        { level: 'warn' },
+      )
+      continue
+    }
+
+    seen.add(canonical)
+    args.push('--allow-unix-connect', canonical)
+  }
+  return args
 }
 
 /**
@@ -1759,8 +1905,13 @@ async function generateFilesystemArgs(
  * - All other syscalls
  *
  * PLATFORM NOTE:
- * The allowUnixSockets configuration is not path-based on Linux (unlike macOS)
- * because seccomp-bpf cannot inspect user-space memory to read socket paths.
+ * seccomp-bpf cannot read a socket path out of user memory, so allowUnixSockets
+ * is enforced one level up: with any entry configured, apply-seccomp installs a
+ * user-notification filter instead of the blocking one and its supervisor
+ * performs each connect()/bind()/listen() itself, permitting a unix connect
+ * only when the canonical target is inside the allowlist. Unix bind/listen,
+ * the abstract namespace and datagram unix sockets stay blocked. See
+ * buildUnixConnectArgs() and vendor/seccomp-src/apply-seccomp.c.
  *
  * Requirements for seccomp filtering:
  * - Pre-built apply-seccomp binaries are included for x64 and ARM64
@@ -1791,6 +1942,7 @@ export async function wrapCommandWithSandboxLinux(
     maskedFileBinds,
     maskedFileStoreDir,
     enableWeakerNestedSandbox,
+    allowUnixSockets,
     allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
@@ -1837,15 +1989,18 @@ export async function wrapCommandWithSandboxLinux(
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let applySeccompPrefix: string | undefined
+  let unixConnectArgs: string[] = []
 
   try {
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
     if (!allowAllUnixSockets) {
+      unixConnectArgs = buildUnixConnectArgs(allowUnixSockets, writeConfig)
       applySeccompPrefix = resolveApplySeccompPrefix(
         seccompConfig?.applyPath,
         seccompConfig?.argv0,
+        unixConnectArgs,
       )
 
       if (!applySeccompPrefix) {
@@ -2097,7 +2252,13 @@ export async function wrapCommandWithSandboxLinux(
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
     if (hasEnvRestrictions) restrictions.push('env')
-    if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
+    if (applySeccompPrefix) {
+      restrictions.push(
+        unixConnectArgs.length > 0
+          ? `seccomp(unix-allowlist:${unixConnectArgs.length / 2})`
+          : 'seccomp(unix-block)',
+      )
+    }
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,

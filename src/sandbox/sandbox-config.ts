@@ -756,7 +756,10 @@ export const NetworkConfigSchema = z.object({
     .array(z.string())
     .optional()
     .describe(
-      'macOS only: Unix socket paths to allow. Ignored on Linux (seccomp cannot filter by path).',
+      'Unix socket paths to allow: a socket path, or a directory whose sockets are all allowed. ' +
+        'macOS: a seatbelt subpath rule. Linux: connect() is brokered by the seccomp supervisor, ' +
+        'which requires Linux 5.6+ — on older kernels unix sockets stay blocked entirely. ' +
+        'Unix bind(), abstract sockets and datagram sockets are never allowed on Linux.',
     ),
   allowAllUnixSockets: z
     .boolean()
