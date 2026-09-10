@@ -1,6 +1,7 @@
 import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
 import * as path from 'path'
+import * as fs from 'fs'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
@@ -76,29 +77,60 @@ export interface MacOSSandboxParams {
  * Get mandatory deny patterns as glob patterns (no filesystem scanning).
  * macOS sandbox profile supports regex/glob matching directly via globToRegex().
  */
-export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
-  const cwd = process.cwd()
+export function macGetMandatoryDenyPatterns(
+  allowGitConfig = false,
+  scanRoots: string[] = [process.cwd()],
+): string[] {
+  const deduplicatedRoots = [
+    ...new Set(scanRoots.map(r => path.resolve(r))),
+  ].filter(r => {
+    try {
+      return fs.existsSync(r) && fs.statSync(r).isDirectory()
+    } catch {
+      return false
+    }
+  })
+  if (deduplicatedRoots.length === 0) {
+    deduplicatedRoots.push(process.cwd())
+  }
+
   const denyPaths: string[] = []
 
-  // Dangerous files - static paths in CWD + glob patterns for subtree
+  for (const root of deduplicatedRoots) {
+    // Dangerous files - static paths in root + glob patterns for subtree
+    for (const fileName of DANGEROUS_FILES) {
+      denyPaths.push(path.resolve(root, fileName))
+      denyPaths.push(`${root}/**/${fileName}`)
+    }
+
+    // Dangerous directories
+    for (const dirName of getDangerousDirectories()) {
+      denyPaths.push(path.resolve(root, dirName))
+      denyPaths.push(`${root}/**/${dirName}/**`)
+    }
+
+    // Git hooks are always blocked for security
+    denyPaths.push(path.resolve(root, '.git/hooks'))
+    denyPaths.push(`${root}/**/.git/hooks`)
+    denyPaths.push(`${root}/**/.git/hooks/**`)
+
+    // Git config - conditionally blocked based on allowGitConfig setting
+    if (!allowGitConfig) {
+      denyPaths.push(path.resolve(root, '.git/config'))
+      denyPaths.push(`${root}/**/.git/config`)
+    }
+  }
+
+  // Also include generic unrooted globs for backward compatibility
   for (const fileName of DANGEROUS_FILES) {
-    denyPaths.push(path.resolve(cwd, fileName))
     denyPaths.push(`**/${fileName}`)
   }
-
-  // Dangerous directories
   for (const dirName of getDangerousDirectories()) {
-    denyPaths.push(path.resolve(cwd, dirName))
     denyPaths.push(`**/${dirName}/**`)
   }
-
-  // Git hooks are always blocked for security
-  denyPaths.push(path.resolve(cwd, '.git/hooks'))
+  denyPaths.push('**/.git/hooks')
   denyPaths.push('**/.git/hooks/**')
-
-  // Git config - conditionally blocked based on allowGitConfig setting
   if (!allowGitConfig) {
-    denyPaths.push(path.resolve(cwd, '.git/config'))
     denyPaths.push('**/.git/config')
   }
 
@@ -776,10 +808,23 @@ function generateWriteRules(
   }
   rules.push(...renderRule('allow', ['file-write*'], allowFilters, logTag))
 
-  // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
+  // Combine user-specified and mandatory deny patterns across all allowed write roots
+  const normalizedAllowRoots = (config.allowOnly || []).map(
+    normalizePathForSandbox,
+  )
+  const scanRoots = [
+    process.cwd(),
+    ...normalizedAllowRoots.filter(p => {
+      try {
+        return fs.existsSync(p) && fs.statSync(p).isDirectory()
+      } catch {
+        return false
+      }
+    }),
+  ]
   const denyPaths = [
     ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(allowGitConfig),
+    ...macGetMandatoryDenyPatterns(allowGitConfig, scanRoots),
   ]
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(

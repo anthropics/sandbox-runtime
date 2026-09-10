@@ -124,9 +124,8 @@ function findSymlinkInPath(
       const stats = fs.lstatSync(nextPath)
       if (stats.isSymbolicLink()) {
         // Check if this symlink is within an allowed write path
-        const isWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            nextPath.startsWith(allowedPath + '/') || nextPath === allowedPath,
+        const isWithinAllowedPath = allowedWritePaths.some(allowedPath =>
+          isAtOrUnder(nextPath, allowedPath),
         )
         if (isWithinAllowedPath) {
           return nextPath
@@ -279,115 +278,133 @@ async function linuxGetMandatoryDenyPaths(
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  scanRoots: string[] = [process.cwd()],
 ): Promise<string[]> {
-  const cwd = process.cwd()
   // Use provided signal or create a fallback controller
   const fallbackController = new AbortController()
   const signal = abortSignal ?? fallbackController.signal
   const dangerousDirectories = getDangerousDirectories()
 
-  // Note: Settings files are added at the callsite in sandbox-manager.ts
-  const denyPaths = [
-    // Dangerous files in CWD
-    ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
-    // Dangerous directories in CWD
-    ...dangerousDirectories.map(d => path.resolve(cwd, d)),
-  ]
-
-  // Git hooks and config are only denied when .git exists as a directory.
-  // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
-  // .git/hooks can never exist — denying it would cause bwrap to fail.
-  // When .git doesn't exist at all, mounting at .git would block its
-  // creation and break git init.
-  const dotGitPath = path.resolve(cwd, '.git')
-  let dotGitIsDirectory = false
-  try {
-    dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
-  } catch {
-    // .git doesn't exist
-  }
-
-  if (dotGitIsDirectory) {
-    // Git hooks always blocked for security
-    denyPaths.push(path.resolve(cwd, '.git/hooks'))
-
-    // Git config conditionally blocked based on allowGitConfig setting
-    if (!allowGitConfig) {
-      denyPaths.push(path.resolve(cwd, '.git/config'))
+  const deduplicatedRoots = [
+    ...new Set(scanRoots.map(r => path.resolve(r))),
+  ].filter(r => {
+    try {
+      return fs.existsSync(r) && fs.statSync(r).isDirectory()
+    } catch {
+      return false
     }
+  })
+  if (deduplicatedRoots.length === 0) {
+    deduplicatedRoots.push(process.cwd())
   }
 
-  // Build iglob args for all patterns in one ripgrep call
-  const iglobArgs: string[] = []
-  for (const fileName of DANGEROUS_FILES) {
-    iglobArgs.push('--iglob', fileName)
-  }
-  for (const dirName of dangerousDirectories) {
-    iglobArgs.push('--iglob', `**/${dirName}/**`)
-  }
-  // Git hooks always blocked in nested repos
-  iglobArgs.push('--iglob', '**/.git/hooks/**')
+  const denyPaths: string[] = []
 
-  // Git config conditionally blocked in nested repos
-  if (!allowGitConfig) {
-    iglobArgs.push('--iglob', '**/.git/config')
-  }
+  for (const root of deduplicatedRoots) {
+    // Dangerous files in root
+    for (const f of DANGEROUS_FILES) {
+      denyPaths.push(path.resolve(root, f))
+    }
+    // Dangerous directories in root
+    for (const d of dangerousDirectories) {
+      denyPaths.push(path.resolve(root, d))
+    }
 
-  // Single ripgrep call to find all dangerous paths in subdirectories
-  // Limit depth for performance - deeply nested dangerous files are rare
-  // and the security benefit doesn't justify the traversal cost
-  let matches: string[] = []
-  try {
-    matches = await ripGrep(
-      [
-        '--files',
-        '--hidden',
-        '--max-depth',
-        String(maxDepth),
-        ...iglobArgs,
-        '-g',
-        '!**/node_modules/**',
-      ],
-      cwd,
-      signal,
-      ripgrepConfig,
-    )
-  } catch (error) {
-    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
-  }
+    // Git hooks and config are only denied when .git exists as a directory.
+    // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
+    // .git/hooks can never exist — denying it would cause bwrap to fail.
+    // When .git doesn't exist at all, mounting at .git would block its
+    // creation and break git init.
+    const dotGitPath = path.resolve(root, '.git')
+    let dotGitIsDirectory = false
+    try {
+      dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
+    } catch {
+      // .git doesn't exist
+    }
 
-  // Process matches
-  for (const match of matches) {
-    const absolutePath = path.resolve(cwd, match)
+    if (dotGitIsDirectory) {
+      // Git hooks always blocked for security
+      denyPaths.push(path.resolve(root, '.git/hooks'))
 
-    // File inside a dangerous directory -> add the directory path
-    let foundDir = false
-    for (const dirName of [...dangerousDirectories, '.git']) {
-      const normalizedDirName = normalizeCaseForComparison(dirName)
-      const segments = absolutePath.split(path.sep)
-      const dirIndex = segments.findIndex(
-        s => normalizeCaseForComparison(s) === normalizedDirName,
-      )
-      if (dirIndex !== -1) {
-        // For .git, we want hooks/ or config, not the whole .git dir
-        if (dirName === '.git') {
-          const gitDir = segments.slice(0, dirIndex + 1).join(path.sep)
-          if (match.includes('.git/hooks')) {
-            denyPaths.push(path.join(gitDir, 'hooks'))
-          } else if (match.includes('.git/config')) {
-            denyPaths.push(path.join(gitDir, 'config'))
-          }
-        } else {
-          denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
-        }
-        foundDir = true
-        break
+      // Git config conditionally blocked based on allowGitConfig setting
+      if (!allowGitConfig) {
+        denyPaths.push(path.resolve(root, '.git/config'))
       }
     }
 
-    // Dangerous file match
-    if (!foundDir) {
-      denyPaths.push(absolutePath)
+    // Build iglob args for all patterns in one ripgrep call
+    const iglobArgs: string[] = []
+    for (const fileName of DANGEROUS_FILES) {
+      iglobArgs.push('--iglob', fileName)
+    }
+    for (const dirName of dangerousDirectories) {
+      iglobArgs.push('--iglob', `**/${dirName}/**`)
+    }
+    // Git hooks always blocked in nested repos
+    iglobArgs.push('--iglob', '**/.git/hooks/**')
+
+    // Git config conditionally blocked in nested repos
+    if (!allowGitConfig) {
+      iglobArgs.push('--iglob', '**/.git/config')
+    }
+
+    // Single ripgrep call to find all dangerous paths in subdirectories
+    // Limit depth for performance - deeply nested dangerous files are rare
+    // and the security benefit doesn't justify the traversal cost
+    let matches: string[] = []
+    try {
+      matches = await ripGrep(
+        [
+          '--files',
+          '--hidden',
+          '--max-depth',
+          String(maxDepth),
+          ...iglobArgs,
+          '-g',
+          '!**/node_modules/**',
+        ],
+        root,
+        signal,
+        ripgrepConfig,
+      )
+    } catch (error) {
+      logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
+    }
+
+    // Process matches
+    for (const match of matches) {
+      const absolutePath = path.resolve(root, match)
+
+      // File inside a dangerous directory -> add the directory path
+      let foundDir = false
+      for (const dirName of [...dangerousDirectories, '.git']) {
+        const normalizedDirName = normalizeCaseForComparison(dirName)
+        const segments = absolutePath.split(path.sep)
+        const dirIndex = segments.findIndex(
+          s => normalizeCaseForComparison(s) === normalizedDirName,
+        )
+        if (dirIndex !== -1) {
+          // For .git, we want hooks/ or config, not the whole .git dir
+          if (dirName === '.git') {
+            const gitDir = segments.slice(0, dirIndex + 1).join(path.sep)
+            if (match.includes('.git/hooks')) {
+              denyPaths.push(path.join(gitDir, 'hooks'))
+            } else if (match.includes('.git/config')) {
+              denyPaths.push(path.join(gitDir, 'config'))
+            }
+          } else {
+            denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
+          }
+          foundDir = true
+          break
+        }
+      }
+
+      // Dangerous file match
+      if (!foundDir) {
+        denyPaths.push(absolutePath)
+      }
     }
   }
 
@@ -1164,11 +1181,21 @@ async function generateFilesystemArgs(
     // handling is needed here: allowedWritePaths entries are recorded with
     // trailing slashes stripped, and candidates are resolved deny dests.
     const isWithinAnyAllowedWritePath = (candidatePath: string): boolean =>
-      allowedWritePaths.some(
-        allowedPath =>
-          candidatePath.startsWith(allowedPath + '/') ||
-          candidatePath === allowedPath,
+      allowedWritePaths.some(allowedPath =>
+        isAtOrUnder(candidatePath, allowedPath),
       )
+
+    // Collect all roots to scan for mandatory deny paths (CWD + all allowedWrite paths)
+    const scanRoots = [
+      process.cwd(),
+      ...allowedWritePaths.filter(p => {
+        try {
+          return fs.statSync(p).isDirectory()
+        } catch {
+          return false
+        }
+      }),
+    ]
 
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
@@ -1178,6 +1205,7 @@ async function generateFilesystemArgs(
         mandatoryDenySearchDepth,
         allowGitConfig,
         abortSignal,
+        scanRoots,
       )),
     ]
 
