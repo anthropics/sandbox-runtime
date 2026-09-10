@@ -440,10 +440,10 @@ describe.if(isMacOS)('macOS write enforcement for glob denies', () => {
     expect(readFileSync(join(PROJECT, 'plain.txt'), 'utf8')).toBe('X\n')
   })
 
-  it("mandatory **/.git/hooks/** still blocks a nested repo's hooks (regression guard)", () => {
-    // The mandatory patterns are anchored at process.cwd(); this pattern
-    // already carried its own /** tail before the subtree change, so this
-    // guards that the change keeps it working rather than fixing it.
+  it("mandatory **/.git/hooks still blocks a nested repo's hooks (regression guard)", () => {
+    // The mandatory patterns are anchored at process.cwd(). The pattern
+    // names the hooks directory itself, and the deny covers everything
+    // beneath it the way a literal subpath deny does.
     process.chdir(PROJECT)
     const hook = join(PROJECT, 'vendor', 'dep', '.git', 'hooks', 'pre-commit')
     const newHook = join(
