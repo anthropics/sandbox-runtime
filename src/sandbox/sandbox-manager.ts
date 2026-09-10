@@ -1266,8 +1266,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
  * so `allowWrite` (the working-tree roots) becomes a per-session
  * `MODIFY_NO_FDC` ALLOW ACE for `<sb-SID>`, `allowRead` a
  * `READ|EXECUTE` ALLOW ACE, and `denyRead`/`denyWrite` become an
- * explicit DENY ACE for `<sb-SID>` on the target plus a
- * `(OI)(CI) FILE_DELETE_CHILD` DENY on its parent.
+ * explicit DENY ACE for `<sb-SID>` on the target plus an
+ * object-only `FILE_DELETE_CHILD` DENY on its parent.
  */
 function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   grantRead: string[]

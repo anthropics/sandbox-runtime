@@ -575,7 +575,7 @@ try {
   Write-Host 'G2 ok: DENY ACE + working-tree grant compose — sibling readable, stamped file denied'
 
   # ── G3: parent-FDC DENY — child cannot del/ren the stamped file ──
-  # The stamp adds (D;OICI;FILE_DELETE_CHILD;;;<sb-SID>) on the
+  # The stamp adds (D;;FILE_DELETE_CHILD;;;<sb-SID>) on the
   # parent; explicit DENY is evaluated first, so even where the
   # parent inherits an allow-FDC the child has no path through it.
   $r = RExec @('--', $cmd, '/c', "del `"$secret`"")
