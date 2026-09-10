@@ -228,9 +228,15 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
+      # The suite runs twice in one container: first as uid 0 holding
+      # CAP_SYS_ADMIN (a root parent on a VM; the sandbox must drop it, or a
+      # sandboxed umount lifts any deny), then with it dropped (Docker's
+      # default set: the unprivileged container enableWeakerNestedSandbox
+      # exists for).
       - name: Run srt end-to-end in unprivileged container
         run: |
           docker run --rm \
+            --cap-add SYS_ADMIN \
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
             -v "${{ github.workspace }}:/work" \
@@ -239,7 +245,7 @@ jobs:
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev
+              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin
               curl -fsSL https://bun.sh/install | bash
               export PATH="$HOME/.bun/bin:$PATH"
               curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
@@ -247,5 +253,8 @@ jobs:
               npm ci
               npm run build:seccomp
               npm run build
+              echo "== as uid 0 with CAP_SYS_ADMIN"
               bun test test/docker-weak-sandbox.test.ts
+              echo "== as uid 0 without CAP_SYS_ADMIN"
+              capsh --drop=cap_sys_admin -- -c "bun test test/docker-weak-sandbox.test.ts"
             '

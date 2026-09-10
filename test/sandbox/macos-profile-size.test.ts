@@ -68,6 +68,10 @@ describe.if(isMacOS)('macOS Seatbelt profile size', () => {
     })
 
     expect(Buffer.byteLength(wrappedCommand)).toBeLessThan(MACOS_ARG_MAX / 2)
+
+    // Same-shaped groups fold into regexes: far below one filter per path.
+
+    expect(Buffer.byteLength(wrappedCommand)).toBeLessThan(64 * 1024)
   })
 
   it('spawns and enforces subpath, literal-ancestor and regex filters', () => {
