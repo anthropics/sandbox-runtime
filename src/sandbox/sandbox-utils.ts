@@ -53,6 +53,19 @@ export function normalizeCaseForComparison(pathStr: string): string {
 }
 
 /**
+ * `p` is `dir` itself or lies beneath it, by path segment ('/x' is not under
+ * '/xy'); root-aware, since '/' + '/' is a prefix of nothing.
+ */
+export function isAtOrUnder(p: string, dir: string): boolean {
+  return p === dir || p.startsWith(dir === '/' ? '/' : dir + '/')
+}
+
+/** `p` lies strictly beneath `dir` (isAtOrUnder, excluding `dir` itself). */
+export function isStrictlyUnder(p: string, dir: string): boolean {
+  return p !== dir && isAtOrUnder(p, dir)
+}
+
+/**
  * Check if a path pattern contains glob characters
  */
 export function containsGlobChars(pathPattern: string): boolean {
