@@ -666,7 +666,7 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 - IDE directories: `.vscode/`, `.idea/`
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
-- Git hooks and config: `.git/hooks/`, `.git/config`, in the working directory's repository, in nested repositories, and in the submodule git directories they keep under `.git/modules/`. An existing `.git` _file_ (a linked worktree's or submodule checkout's `gitdir:` pointer) is read-only; creating a new one inside an allowed write path is still possible. The hooks and config a pointer leads to (the main repository's, for a worktree) are blocked as well; on macOS that holds for the working directory's own `.git` file only, since nested pointers are matched by pattern and not followed.
+- Git hooks and config: `hooks/`, `config`, `config.worktree` and `commondir` of a git directory — the working directory's repository, nested repositories, the submodule git directories they keep under `.git/modules/`, and a linked worktree's git directory. `commondir` and `config.worktree` are denied because git reads the hooks and config through them: `commondir` moves them to another directory entirely, and `config.worktree` is read instead of `config` wherever `extensions.worktreeConfig` is on (`git sparse-checkout init` turns it on). An existing `.git` _file_ (a linked worktree's or submodule checkout's `gitdir:` pointer) is read-only and cannot be removed or renamed over; creating a new one inside an allowed write path is still possible. The hooks and config a pointer leads to (the main repository's, for a worktree) are blocked as well, and so is filling in a git directory a pointer names but that does not exist yet; a pointer naming a directory that is not a git directory is not followed. On macOS only the working directory's own `.git` file is followed, since nested pointers are matched by pattern; the working directory's own submodule git directories are enumerated exactly, while a nested repository's are matched as `.git/modules/<name>/`, which covers a single-segment submodule name.
 
 These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 
@@ -678,7 +678,17 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
-**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach (a blocked _directory_, such as a repository's `.git/hooks/`, does cover files created in it later). macOS uses glob patterns which block both existing and new files. The Linux scan ignores `.gitignore` and similar ignore files, since the sandboxed command can write those.
+**Git operations these denies break.** A git directory's `hooks/` and `config` are what a hook or a `core.fsmonitor` would be written to, so anything that writes or removes them fails inside the sandbox:
+
+- removing a tree that holds a submodule checkout or a linked worktree (`rm -rf lib`, `git clean -ffdx`), because its `.git` pointer file cannot be removed;
+- `git worktree remove`, `git worktree move`, `git worktree repair`, `git submodule deinit`, for the same reason;
+- `git submodule update --init` for a submodule that has not been cloned yet, which copies template hooks into `.git/modules/<name>/hooks/` and writes its config;
+- from a linked worktree, anything writing the main repository's config: `git push -u`, `git checkout -b x origin/y`;
+- `git init` and `git clone` into a subdirectory, which create `.git/hooks/`.
+
+**Known limit (both platforms).** A pointer file or a pattern-matched path is protected where it is: a command may still rename the directory _holding_ it aside and create a fresh one in its place (`mv lib lib.old && mkdir lib && echo 'gitdir: …' > lib/.git`). On Linux a path found by the scan has its ancestor directories pinned within the scan depth, so this is blocked there for what the scan reached; on macOS it is blocked for the literal denies (the working directory's own repository and its submodule git directories) and not for the pattern ones.
+
+**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach (a blocked _directory_, such as a repository's `.git/hooks/`, does cover files created in it later). macOS uses glob patterns which block both existing and new files. The Linux scan ignores `.gitignore` and similar ignore files, since the sandboxed command can write those. It fails closed: a directory it cannot read is denied whole, and a scan that does not finish in time aborts the command rather than sandboxing it with a partial deny list (a scan that cannot run at all — no `ripgrep` — is still logged and not fatal).
 
 **Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance, which reaches a nested repository directly beneath the working directory. You can configure this with `mandatoryDenySearchDepth`:
 
