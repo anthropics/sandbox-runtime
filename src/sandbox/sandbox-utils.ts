@@ -426,12 +426,14 @@ export function normalizePathForSandbox(pathPattern: string): string {
  * WARNING: These default paths are intentionally broad for compatibility but may
  * allow access to files from other processes. In highly security-sensitive
  * environments, you should configure more restrictive write paths.
+ *
+ * @param denyRead - The read-deny list in force (credential denies included)
  */
 export function getDefaultWritePaths(
   denyRead: readonly string[] = [],
 ): string[] {
   const homeDir = homedir()
-  const recommendedPaths = [
+  return [
     '/dev/stdout',
     '/dev/stderr',
     '/dev/null',
@@ -440,28 +442,45 @@ export function getDefaultWritePaths(
     '/dev/autofs_nowait',
     '/tmp/claude',
     '/private/tmp/claude',
-    path.join(homeDir, '.npm/_logs'),
-    path.join(homeDir, '.claude/debug'),
+    // The two home directories are conveniences the caller never asked for.
+    // One that a read-deny covers would be bound back over that deny on Linux
+    // (readable and writable again) and stay writable on macOS, so the
+    // explicit denyRead wins; a caller who wants the path writable lists it
+    // in allowWrite. The entries above are what the sandbox itself needs
+    // (stdio, TMPDIR) and stay whatever is read-denied.
+    ...[
+      path.join(homeDir, '.npm/_logs'),
+      path.join(homeDir, '.claude/debug'),
+    ].filter(dir => !isCoveredByReadDeny(dir, denyRead)),
   ]
-  if (denyRead.length === 0) return recommendedPaths
+}
 
-  // These are conveniences the caller never asked for. One that lies at or
-  // under a directory the caller read-denies would be bound back over that
-  // deny on Linux (readable and writable again) and writable on macOS, so
-  // an explicit denyRead wins over an implicit allowWrite. A caller who
-  // wants the path writable lists it in allowWrite.
-  const denied = denyRead
-    .filter(p => !containsGlobChars(removeTrailingGlobSuffix(p)))
-    .map(p => normalizePathForSandbox(p))
-  const atOrUnder = (p: string, dir: string): boolean =>
-    p === dir || p.startsWith(dir === '/' ? '/' : dir + '/')
-  // Both spellings of the recommended path: as listed, and as the sandbox
-  // normalizes it (symlinks such as /tmp -> /private/tmp resolved).
-  return recommendedPaths.filter(recommended =>
-    [recommended, normalizePathForSandbox(recommended)].every(
-      form => !denied.some(d => atOrUnder(form, d)),
-    ),
-  )
+/** A read-deny entry names `dir` or a directory above it. */
+function isCoveredByReadDeny(
+  dir: string,
+  denyRead: readonly string[],
+): boolean {
+  // Deny entries are compared normalized (symlinks resolved where that stays
+  // within bounds), so `dir` is tested both as listed and normalized:
+  // whichever spelling an entry kept, one of the two lines up with it.
+  const forms = [dir, normalizePathForSandbox(dir)]
+  return denyRead.some(entry => {
+    // 'x/**' denies x and everything beneath it, exactly like 'x'.
+    const stripped = removeTrailingGlobSuffix(entry)
+    const denied = normalizePathForSandbox(stripped)
+    if (!containsGlobChars(stripped)) {
+      return forms.some(form => isAtOrUnder(form, denied))
+    }
+    // A glob still here (Linux callers expand theirs to concrete paths
+    // first) covers `dir` when it matches `dir` or a directory above it.
+    const matcher = new RegExp(globToRegex(denied))
+    return forms.some(form => {
+      for (let p = form; p !== path.dirname(p); p = path.dirname(p)) {
+        if (matcher.test(p)) return true
+      }
+      return false
+    })
+  })
 }
 
 /**

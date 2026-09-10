@@ -671,7 +671,7 @@ async function initialize(
         // (allowed or not). Only paths bwrap would actually refuse — outside
         // allowWrite or inside a denyWrite carve-out — go to the store.
         allowWritePaths: [
-          ...getDefaultWritePaths(config.filesystem.denyRead),
+          ...getDefaultWritePaths(getFsReadConfig().denyOnly),
           ...config.filesystem.allowWrite,
         ],
         denyWritePaths: config.filesystem.denyWrite,
@@ -1246,10 +1246,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
       return true
     })
 
-  // Build allowOnly list: default paths (less any the config read-denies)
-  // + configured allow paths
   const allowOnly = [
-    ...getDefaultWritePaths(config.filesystem.denyRead),
+    ...getDefaultWritePaths(getFsReadConfig().denyOnly),
     ...allowPaths,
   ]
 
@@ -1581,21 +1579,10 @@ async function wrapWithSandbox(
     )
     // Credential deny paths are unioned with the caller's denyRead — never
     // replacing it — so explicit filesystem restrictions always survive.
-    // Computed ahead of the write config: a default write path under a
-    // read-denied directory is dropped from it.
     const rawDenyRead = unionDenyReadPaths(
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
       credentialRestrictions,
     )
-    writeConfig = {
-      allowOnly: [...getDefaultWritePaths(rawDenyRead), ...userAllowWrite],
-      denyWithinAllow: stripWriteGlobs(
-        customConfig?.filesystem?.denyWrite ??
-          config?.filesystem.denyWrite ??
-          [],
-      ),
-    }
-
     const expandedDenyRead: string[] = []
     for (const p of rawDenyRead) {
       const stripped = removeTrailingGlobSuffix(p)
@@ -1604,6 +1591,14 @@ async function wrapWithSandbox(
       } else {
         expandedDenyRead.push(stripped)
       }
+    }
+    writeConfig = {
+      allowOnly: [...getDefaultWritePaths(expandedDenyRead), ...userAllowWrite],
+      denyWithinAllow: stripWriteGlobs(
+        customConfig?.filesystem?.denyWrite ??
+          config?.filesystem.denyWrite ??
+          [],
+      ),
     }
     const rawAllowRead =
       customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
