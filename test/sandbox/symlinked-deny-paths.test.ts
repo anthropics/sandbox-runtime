@@ -170,40 +170,56 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
   })
 
-  // /bin -> usr/bin and friends on a usr-merged system.
-  const rootLinks = readdirSync('/', { withFileTypes: true })
-    .filter(entry => entry.isSymbolicLink())
-    .map(entry => realpathSync('/' + entry.name))
-    .filter(target => target.startsWith('/usr/'))
-
-  it.if(rootLinks.length > 0)(
-    "does not deny the root's symlinks in their own right under a denyRead of /",
-    async () => {
-      // A '/' deny stands for the root's children. /bin, /lib and /sbin are
-      // links into /usr: denied as entries of their own they are mounted
-      // where they lead, after /usr's tmpfs and the allowRead of /usr bound
-      // back over it, and empty the very directories that allowRead names.
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: 'echo STARTED',
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/'], allowWithinDeny: ['/usr', '/etc'] },
-        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+  it("does not deny the root's symlinks in their own right under a denyRead of /", async () => {
+    // /bin -> usr/bin and friends on a usr-merged system. Listed here, not
+    // while the suite is collected: that happens on every platform, and a
+    // root symlink may dangle (macOS runners have one).
+    const rootLinks = readdirSync('/', { withFileTypes: true })
+      .filter(entry => entry.isSymbolicLink())
+      .flatMap(entry => {
+        try {
+          return [realpathSync('/' + entry.name)]
+        } catch {
+          return []
+        }
       })
+      .filter(target => target.startsWith('/usr/'))
+    if (rootLinks.length === 0) return // not usr-merged: nothing to tell apart
 
-      expect(wrapped).toContain('--tmpfs /usr --ro-bind /usr /usr')
-      for (const target of rootLinks) {
-        expect(wrapped).not.toContain(`--tmpfs ${target} `)
-      }
-      if (hasBwrap) {
-        const run = spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 10000,
-        })
-        expect(run.stdout).toBe('STARTED\n')
-      }
-    },
-  )
+    // A '/' deny stands for the root's children. /bin, /lib and /sbin are
+    // links into /usr: denied as entries of their own they are mounted
+    // where they lead, after /usr's tmpfs and the allowRead of /usr bound
+    // back over it, and empty the very directories that allowRead names.
+    // allowAllUnixSockets keeps the apply-seccomp helper out of the command:
+    // where it has been built it lives in the checkout, which the '/' deny
+    // hides, and the shell would fail to exec it (allow-read.test.ts does the
+    // same for its '/' denies).
+    const wrapped = await wrapCommandWithSandboxLinux({
+      command: 'echo STARTED',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: ['/'], allowWithinDeny: ['/usr', '/etc'] },
+      writeConfig: { allowOnly: [], denyWithinAllow: [] },
+      allowAllUnixSockets: true,
+    })
+
+    expect(wrapped).toContain('--tmpfs /usr --ro-bind /usr /usr')
+    for (const target of rootLinks) {
+      expect(wrapped).not.toContain(`--tmpfs ${target} `)
+    }
+    if (hasBwrap) {
+      const run = spawnSync(wrapped, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+      // The whole outcome, so a failure says why the sandbox did not start.
+      expect({
+        status: run.status,
+        stdout: run.stdout,
+        stderr: run.stderr,
+      }).toEqual({ status: 0, stdout: 'STARTED\n', stderr: '' })
+    }
+  })
 
   it('resolves the mandatory .claude deny paths when cwd/.claude is a symlink', async () => {
     const claudeLink = join(PROJ, '.claude')
