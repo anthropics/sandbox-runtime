@@ -63,6 +63,7 @@ describe.if(isSupportedPlatform)(
       writeFileSync(join(TEST_DIR, '.profile'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.ripgreprc'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.mcp.json'), ORIGINAL_CONTENT)
+      writeFileSync(join(TEST_DIR, '.srt-settings.json'), ORIGINAL_CONTENT)
 
       // Create .git with hooks and config
       mkdirSync(join(TEST_DIR, '.git', 'hooks'), { recursive: true })
@@ -243,6 +244,18 @@ describe.if(isSupportedPlatform)(
 
         expect(result.success).toBe(false)
         expect(readFileSync('.ripgreprc', 'utf8')).toBe(ORIGINAL_CONTENT)
+      })
+
+      it('blocks writes to .srt-settings.json', async () => {
+        const result = await runSandboxedWrite(
+          '.srt-settings.json',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('.srt-settings.json', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
       })
     })
 
