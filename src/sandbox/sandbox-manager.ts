@@ -2,7 +2,7 @@ import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { createMuxProxyServer, type MuxProxyServer } from './mux-proxy.js'
-import { listenInRange } from './listen-in-range.js'
+import { listenInRange, loopbackListenOptions } from './listen-in-range.js'
 import { SentinelRegistry } from './credential-sentinel.js'
 import {
   MaskedFileStore,
@@ -608,9 +608,16 @@ async function startMuxProxyServer(
   // dispatch to an unbound backend. On Windows the backend's port is
   // excluded when binding the front-end in the same WFP range.
   const backendPort = await mux.listenHttpBackend()
+  // `exclusive: true` keeps this listener out of Node's cluster handle
+  // sharing. srt is a one-process-one-proxy design — the backend socket is
+  // pid scoped and each process mints its own proxyAuthToken — but a plain
+  // listen() under `cluster` is intercepted by the primary, which shares one
+  // handle and round robins connections across workers. A sandboxed child of
+  // worker A then reaches worker B's proxy carrying A's token and is answered
+  // with 407.
   await listenInRange(
     mux.server,
-    p => mux.server.listen(p, '127.0.0.1'),
+    p => mux.server.listen(loopbackListenOptions(p)),
     portRange,
     backendPort !== undefined ? new Set([backendPort]) : new Set(),
   )
