@@ -73,12 +73,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anthropic-experimental/sandbox-runtime.git"
+    "url": "git+https://github.com/anthropics/sandbox-runtime.git"
   },
   "bugs": {
-    "url": "https://github.com/anthropic-experimental/sandbox-runtime/issues"
+    "url": "https://github.com/anthropics/sandbox-runtime/issues"
   },
-  "homepage": "https://github.com/anthropic-experimental/sandbox-runtime#readme",
+  "homepage": "https://github.com/anthropics/sandbox-runtime#readme",
   "lint-staged": {
     "*.ts": [
       "eslint --fix --cache --cache-location=node_modules/.cache/.eslintcache",

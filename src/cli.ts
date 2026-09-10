@@ -8,6 +8,7 @@ import { logForDebugging } from './utils/debug.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
 import * as readline from 'readline'
 import * as fs from 'fs'
+import * as net from 'net'
 import * as path from 'path'
 import * as os from 'os'
 
@@ -34,6 +35,38 @@ function getDefaultConfig(): SandboxRuntimeConfig {
       denyWrite: [],
     },
   }
+}
+
+/**
+ * A readable stream over the control fd. A pipe or socket is read through a
+ * libuv stream handle, driven by the event loop: fs.createReadStream would
+ * park a threadpool thread in a blocking read(2) that process.exit() then
+ * waits for, so srt would outlive the wrapped command until the parent
+ * closed the fd. Anything else keeps the fs stream, which is right for a
+ * regular file (its reads never block) and leaves a tty with the old wait.
+ * Under Bun, net.Socket({ fd }) reads nothing, and Bun's fs stream does not
+ * hold exit, so the fs stream serves every fd kind there.
+ *
+ * A libuv handle switches the fd's open file description to non-blocking
+ * mode, from the moment srt opens it and for good (Node restores only fds
+ * 0-2 at exit). A parent that shares that description (a shell
+ * `exec 3<fifo`, a Python pass_fds of an fd it keeps using) then sees
+ * EAGAIN on its own blocking reads, so hand srt a dedicated pipe end.
+ */
+function openControlFd(fd: number): NodeJS.ReadableStream {
+  const stat = fs.fstatSync(fd)
+  if (!process.versions.bun && (stat.isFIFO() || stat.isSocket())) {
+    try {
+      return new net.Socket({ fd, readable: true, writable: false }).unref()
+    } catch (err) {
+      // A socket libuv cannot adopt as a stream (datagram, seqpacket):
+      // read it through fs as before, one read(2) per datagram.
+      logForDebugging(
+        `Control fd ${fd} is not a stream socket (${err instanceof Error ? err.message : String(err)}); reading it through fs`,
+      )
+    }
+  }
+  return fs.createReadStream('', { fd })
 }
 
 async function main(): Promise<void> {
@@ -215,11 +248,8 @@ async function main(): Promise<void> {
           let controlReader: readline.Interface | null = null
           if (options.controlFd !== undefined) {
             try {
-              const controlStream = fs.createReadStream('', {
-                fd: options.controlFd,
-              })
               controlReader = readline.createInterface({
-                input: controlStream,
+                input: openControlFd(options.controlFd),
                 crlfDelay: Infinity,
               })
 
