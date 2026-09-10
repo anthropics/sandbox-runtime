@@ -686,9 +686,16 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
-**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
+On macOS the directories that hold these paths (`.git`, `.vscode`, `.idea`, `.claude`) are also pinned at any depth, so a sandboxed command cannot create, rename, or delete them — for example `mv decoy packages/app/.git` or `git init` in a subdirectory fails, while writes inside an existing nested `.git` still work.
 
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
+| Platform | Covers | Paths created after the scan |
+| --- | --- | --- |
+| macOS | Pattern rules, any depth | Blocked |
+| Linux | Direct writes to existing paths, up to `mandatoryDenySearchDepth` | Not blocked |
+
+A nested repository whose `.git` sits `L` directories below the project is within the scan when `mandatoryDenySearchDepth >= L + 2`. `node_modules` is never scanned.
+
+**Search depth (Linux):** the project directory is scanned for these paths with `ripgrep`, 3 levels deep by default. Configure with `mandatoryDenySearchDepth`:
 
 ```json
 {

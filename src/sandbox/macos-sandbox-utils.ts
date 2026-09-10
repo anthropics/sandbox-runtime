@@ -412,6 +412,28 @@ function renderRule(
  * Get all ancestor directories for a path, up to (but not including) root
  * Example: /private/tmp/test/file.txt -> ["/private/tmp/test", "/private/tmp", "/private"]
  */
+/**
+ * Glob-containing ancestors of a glob, nearest first, stopping before a
+ * bare `**`: `**\/.git/hooks` → [`**\/.git`]; `**\/.env` → [].
+ */
+function getGlobAncestorPatterns(normalizedGlob: string): string[] {
+  const ancestors: string[] = []
+  let current = path.posix.dirname(normalizedGlob)
+  while (
+    current !== '/' &&
+    current !== '.' &&
+    current !== '**' &&
+    !current.endsWith('/**') &&
+    containsGlobChars(current)
+  ) {
+    ancestors.push(current)
+    const parent = path.posix.dirname(current)
+    if (parent === current) break
+    current = parent
+  }
+  return ancestors
+}
+
 function getAncestorDirectories(pathStr: string): string[] {
   const ancestors: string[] = []
   let currentPath = path.dirname(pathStr)
@@ -626,6 +648,12 @@ function moveBlockingFilters(normalizedPaths: readonly string[]): Set<string> {
     if (containsGlobChars(normalizedPath)) {
       // For glob patterns, block moves of the directory containing the
       // pattern's static prefix, then of its ancestors
+      // Pin the glob's ancestor directories too (exact match, no subtree):
+      // a rename of a prepared directory onto `<subdir>/.git` is checked
+      // against the target only, not the children it carries.
+      for (const ancestor of getGlobAncestorPatterns(normalizedPath)) {
+        filters.add(`(regex ${escapePath(globToRegex(ancestor))})`)
+      }
       baseDir = globBaseDir(normalizedPath)
       if (baseDir === '/') continue
       filters.add(`(literal ${escapePath(baseDir)})`)

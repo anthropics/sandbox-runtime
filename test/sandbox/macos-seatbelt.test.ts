@@ -1023,3 +1023,95 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     expect(result.status).toBe(0)
   })
 })
+
+/**
+ * Nested `.git` directory swap: the mandatory deny globs have no static
+ * prefix, so only the literal `<cwd>/.git` was move-protected and a prepared
+ * directory could be renamed onto `<subdir>/.git`. The fix pins every
+ * glob-shaped ancestor (`**\/.git`) against create/unlink at any depth.
+ */
+describe.if(isMacOS)('macOS Seatbelt Nested .git Swap Prevention', () => {
+  const TEST_BASE_DIR = join(
+    realpathSync(tmpdir()),
+    'seatbelt-git-swap-test-' + Date.now(),
+  )
+  const TEST_ALLOWED_DIR = join(TEST_BASE_DIR, 'allowed')
+  const NESTED_DIR = join(TEST_ALLOWED_DIR, 'packages', 'app')
+  const DECOY_DIR = join(NESTED_DIR, '_gd')
+  const NESTED_GIT = join(NESTED_DIR, '.git')
+  const EXISTING_DIR = join(TEST_ALLOWED_DIR, 'packages', 'lib')
+  const EXISTING_GIT = join(EXISTING_DIR, '.git')
+
+  // The mandatory `.git` globs are anchored to process.cwd(); mirror them here.
+  const writeConfig: FsWriteRestrictionConfig = {
+    allowOnly: [TEST_ALLOWED_DIR],
+    denyWithinAllow: [
+      join(TEST_ALLOWED_DIR, '**/.git/config'),
+      join(TEST_ALLOWED_DIR, '**/.git/hooks/**'),
+    ],
+  }
+
+  function run(command: string) {
+    const wrapped = wrapCommandWithSandboxMacOS({
+      command,
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig,
+    })
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+    // A nested Seatbelt fails with "sandbox_apply: Operation not permitted",
+    // which would satisfy the deny assertions without running the command.
+    expect(result.stderr || '').not.toContain('sandbox_apply')
+    return result
+  }
+
+  beforeAll(() => {
+    mkdirSync(DECOY_DIR, { recursive: true })
+    writeFileSync(
+      join(DECOY_DIR, 'config'),
+      '[core]\n\tfsmonitor = /tmp/payload\n',
+    )
+    mkdirSync(EXISTING_GIT, { recursive: true })
+    writeFileSync(join(EXISTING_GIT, 'index'), 'old')
+  })
+
+  afterAll(() => {
+    if (existsSync(TEST_BASE_DIR)) {
+      rmSync(TEST_BASE_DIR, { recursive: true, force: true })
+    }
+  })
+
+  it('blocks renaming a decoy directory onto a nested .git', () => {
+    const result = run(`mv ${DECOY_DIR} ${NESTED_GIT}`)
+    expect(result.status).not.toBe(0)
+    expect((result.stderr || '').toLowerCase()).toContain(
+      'operation not permitted',
+    )
+    expect(existsSync(NESTED_GIT)).toBe(false)
+    expect(existsSync(DECOY_DIR)).toBe(true)
+  })
+
+  it('blocks creating a nested .git directory or symlink directly', () => {
+    expect(run(`mkdir ${NESTED_GIT}`).status).not.toBe(0)
+    expect(run(`ln -s ${DECOY_DIR} ${NESTED_GIT}`).status).not.toBe(0)
+    expect(existsSync(NESTED_GIT)).toBe(false)
+  })
+
+  it('blocks renaming an existing nested .git away', () => {
+    const result = run(`mv ${EXISTING_GIT} ${EXISTING_DIR}/gone`)
+    expect(result.status).not.toBe(0)
+    expect(existsSync(EXISTING_GIT)).toBe(true)
+  })
+
+  it('still allows ordinary writes inside a nested .git', () => {
+    const result = run(
+      `echo new > ${EXISTING_GIT}/index.lock && mv ${EXISTING_GIT}/index.lock ${EXISTING_GIT}/index && mkdir -p ${EXISTING_GIT}/refs/heads`,
+    )
+    expect(result.status).toBe(0)
+    expect(readFileSync(join(EXISTING_GIT, 'index'), 'utf8').trim()).toBe('new')
+  })
+})
