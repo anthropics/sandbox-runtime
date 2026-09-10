@@ -860,11 +860,6 @@ function buildSandboxCommand(
   }
 }
 
-/** Prefix that a strict descendant of `dir` starts with ('/' for the root). */
-function pathSep(dir: string): string {
-  return dir === '/' ? '/' : dir + '/'
-}
-
 /** True when an fs error means the path is absent, as opposed to
  * unreadable (EACCES), looping (ELOOP) or otherwise unverifiable. */
 function isAbsenceError(err: unknown): boolean {
@@ -950,19 +945,15 @@ function pushReadDenyDirMounts(
   // symlinked, so containment tests expand both sides to both forms.
   const denyForms = pathForms(normalizedPath)
   const underDeniedDir = (p: string): boolean =>
-    pathForms(p).some(pForm =>
-      denyForms.some(form => pForm === form || pForm.startsWith(pathSep(form))),
-    )
+    pathForms(p).some(pForm => denyForms.some(form => isAtOrUnder(pForm, form)))
   // A restore at-or-above an already-emitted read-deny mount would bind host
   // content over it; skip it (the unit's own location is exempt).
   const wouldBuryReadDeny = (restorePath: string): boolean =>
     readDenyLocations.some(
       location =>
         !denyForms.includes(location) &&
-        pathForms(restorePath).some(
-          restoreForm =>
-            location === restoreForm ||
-            location.startsWith(pathSep(restoreForm)),
+        pathForms(restorePath).some(restoreForm =>
+          isAtOrUnder(location, restoreForm),
         ),
     )
   args.push('--tmpfs', normalizedPath)
@@ -1024,9 +1015,7 @@ function pushReadDenyDirMounts(
       if (
         restoredWrites.some(w =>
           pathForms(w).some(wForm =>
-            pathForms(allowPath).some(
-              aForm => aForm === wForm || aForm.startsWith(wForm + '/'),
-            ),
+            pathForms(allowPath).some(aForm => isAtOrUnder(aForm, wForm)),
           ),
         )
       ) {
@@ -1305,10 +1294,7 @@ async function generateFilesystemArgs(
     // are tested against both forms of each entry.
     const isWithinAnyAllowedWritePath = (candidatePath: string): boolean =>
       allowedWritePaths.some(allowedPath =>
-        mountForms(allowedPath).some(
-          form =>
-            candidatePath.startsWith(pathSep(form)) || candidatePath === form,
-        ),
+        mountForms(allowedPath).some(form => isAtOrUnder(candidatePath, form)),
       )
     const isAllowedWriteRoot = (candidatePath: string): boolean =>
       allowedWritePaths.some(allowedPath =>
@@ -1810,10 +1796,7 @@ async function generateFilesystemArgs(
   const coveredByAllowRead = (child: string): boolean => {
     const childLocation = canonicalForm(child)
     return readAllowPaths.some(allowPath =>
-      mountForms(allowPath).some(
-        form =>
-          form === childLocation || childLocation.startsWith(pathSep(form)),
-      ),
+      mountForms(allowPath).some(form => isAtOrUnder(childLocation, form)),
     )
   }
   for (const p of readConfig?.denyOnly || []) {
@@ -1929,15 +1912,11 @@ async function generateFilesystemArgs(
   // Only the canonical dest is tested: a raw route can read as covered while
   // the canonical mount location is exposed.
   const writeRebindCovers = (writePath: string, dest: string): boolean =>
-    mountForms(writePath).some(
-      writeForm => dest === writeForm || dest.startsWith(pathSep(writeForm)),
-    )
+    mountForms(writePath).some(writeForm => isAtOrUnder(dest, writeForm))
   const isHiddenByTmpfs = (dest: string): boolean => {
     let hidden = false
     for (const unit of readSectionPlan) {
-      if (
-        unit.forms.some(form => dest === form || dest.startsWith(pathSep(form)))
-      ) {
+      if (unit.forms.some(form => isAtOrUnder(dest, form))) {
         hidden = true
       }
       if (unit.restores.some(writePath => writeRebindCovers(writePath, dest))) {
@@ -1995,10 +1974,7 @@ async function generateFilesystemArgs(
         writePath =>
           !mountForms(writePath).some(wForm =>
             emittedDenyWriteDests.some(
-              dest =>
-                dest === wForm ||
-                dest.startsWith(wForm + '/') ||
-                wForm.startsWith(pathSep(dest)),
+              dest => isAtOrUnder(dest, wForm) || isStrictlyUnder(wForm, dest),
             ),
           ),
       )
