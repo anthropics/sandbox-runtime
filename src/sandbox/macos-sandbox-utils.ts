@@ -992,6 +992,7 @@ function generateSandboxProfile({
     '  (sysctl-name-prefix "hw.optional.arm")',
     '  (sysctl-name-prefix "hw.optional.arm.")',
     '  (sysctl-name-prefix "hw.optional.armv8_")',
+    '  (sysctl-name-prefix "hw.optional.neon")',
     '  (sysctl-name-prefix "hw.perflevel")',
     '  (sysctl-name-prefix "kern.proc.all")',
     '  (sysctl-name-prefix "kern.proc.pgrp.")',
