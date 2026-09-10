@@ -400,6 +400,31 @@ async function linuxGetMandatoryDenyPaths(
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
+/**
+ * Is `p` a mount point an earlier sandbox left behind? bwrap makes the mount
+ * point for `--ro-bind /dev/null <absent path>` with ensure_file(dest, 0444):
+ * an empty regular file with no write bits. The set above lives in memory, so
+ * a process that dies without an 'exit' event (SIGKILL, OOM) leaves the file
+ * on the host with nothing left that knows what it is. Files that only look
+ * similar are written by their creators with write bits (a lockfile, an empty
+ * file materialised on purpose: 0666 & ~umask) or have content or a second
+ * link. An empty read-only DIRECTORY left the same way is not recognisable:
+ * it looks like anyone's empty directory.
+ */
+function isStaleBwrapMountPoint(p: string): boolean {
+  try {
+    const stat = fs.lstatSync(p)
+    return (
+      stat.isFile() &&
+      stat.size === 0 &&
+      (stat.mode & 0o222) === 0 &&
+      stat.nlink === 1
+    )
+  } catch {
+    return false
+  }
+}
+
 const CAP_SETFCAP = 31
 
 /** Whether this process holds `cap` in its effective set (Linux). */
@@ -1396,6 +1421,32 @@ async function generateFilesystemArgs(
         }
         logForDebugging(
           `[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`,
+        )
+        continue
+      }
+
+      // A mount point an earlier sandbox left on the host (see
+      // isStaleBwrapMountPoint) is an absent deny path in all but name. Bound
+      // onto itself as an existing file it would never be tracked, so never
+      // removed, and on the host its existence can be the whole meaning (a
+      // lockfile's). Cover it with /dev/null like the absent leaf below and
+      // track it, so cleanupBwrapMountPoints() takes it away. Same gate as
+      // that branch. Under a read-only denied directory nothing needs
+      // covering (the file is already unwritable there), but it is still
+      // tracked: it is no more the caller's file for being there.
+      if (
+        (isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
+          isWithinAnyAllowedWritePath(normalizedPath)) &&
+        isStaleBwrapMountPoint(normalizedPath)
+      ) {
+        if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
+          denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
+          denyWriteRawDests.set(normalizedPath, rawPath)
+        }
+        bwrapMountPoints.add(normalizedPath)
+        registerExitCleanupHandler()
+        logForDebugging(
+          `[Sandbox Linux] Re-covering a mount point an earlier sandbox left behind: ${normalizedPath}`,
         )
         continue
       }
