@@ -3,16 +3,15 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
-  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { join } from 'node:path'
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
@@ -22,8 +21,8 @@ import { bwrapCanNamespace } from '../helpers/bwrap.js'
 
 /**
  * A bwrap profile too large for one shell argument (32 pages) has its mounts
- * handed to bwrap through `--args` from a file in a per-process directory
- * that every profile ro-binds over itself; a profile that fits stays on the
+ * handed to bwrap through `--args`, from an unnamed file this process holds
+ * open and the string reopens through /proc; a profile that fits stays on the
  * command line.
  */
 describe.if(isLinux)('bwrap --args for over-long profiles', () => {
@@ -32,10 +31,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   // The largest rendering kept on the command line: the kernel's limit less
   // the NUL, less the 4 KiB left for a prefix of the caller's own.
   const INLINE_MAX = MAX_ARG_STRLEN - 1 - 4096
-  // The one rendered shape: file, then the options left before and the words
-  // left after `--args 9`.
+  // The one rendered shape: the profile's path, then the options left before
+  // and the words left after `--args 9`.
   const VIA_ARGS_FILE =
-    /^\/bin\/sh -c 'exec 9<"\$1" && (?:\/\S+ -f -- "\$1" && )?shift && exec "\$@"' srt-args (\S+) bwrap (.*?) ?--args 9 (.*)$/s
+    /^\/bin\/sh -c 'exec 9<"\$1" && shift && exec "\$@"' srt-args (\S+) bwrap (.*?) ?--args 9 (.*)$/s
   const MODULE = join(
     import.meta.dir,
     '../../src/sandbox/linux-sandbox-utils.ts',
@@ -112,39 +111,36 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     )
   }
 
-  // The per-process --args directory, from the trailing ro-bind every
-  // profile that fits the command line carries (an over-long profile
-  // carries it inside the file).
-  function argsDirOf(wrapped: string): string {
-    const bind = wrapped.match(/--ro-bind (\S*\.srt-bwrap-args-\S+) \1(?: |$)/)
-    expect(bind).not.toBeNull()
-    return bind![1]!
-  }
-
-  function argsFileOf(wrapped: string): string {
+  function argsPathOf(wrapped: string): string {
     const rendered = wrapped.match(VIA_ARGS_FILE)
     expect(rendered).not.toBeNull()
     return rendered![1]!
   }
 
   // A fresh process for what depends on the module's per-process state (the
-  // directory is created once and never again) or on TMPDIR at first use.
-  // `body` runs after the prelude and prints one JSON value.
-  function isolated(body: string, env: Record<string, string> = {}): unknown {
+  // open profiles, the fd baseline) or on TMPDIR at first use. `body` runs
+  // after the prelude and prints one JSON value; `launcher` runs the runtime
+  // itself under something (bwrap, to take away the directories an unnamed
+  // file can go in).
+  function isolated(
+    body: string,
+    env: Record<string, string> = {},
+    launcher: string[] = [],
+  ): unknown {
     const files = overLongProfile()
     const script = `
       import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints } from ${JSON.stringify(MODULE)}
       import * as fs from 'node:fs'
       const overLong = ${JSON.stringify(files)}
       const small = overLong.slice(0, 1)
-      const wrap = denyOnly => wrapCommandWithSandboxLinux({
-        command: 'echo hello',
+      const wrap = (denyOnly, command = 'echo hello') => wrapCommandWithSandboxLinux({
+        command,
         needsNetworkRestriction: false,
         readConfig: { denyOnly },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
       const outcome = wrapping => wrapping.then(() => 'resolved', error => String(error))
-      const argsDirOf = wrapped => wrapped.match(/--ro-bind (\\S*\\.srt-bwrap-args-\\S+) \\1(?: |$)/)?.[1]
+      const argsPathOf = wrapped => wrapped.match(/' srt-args (\\S+) /)?.[1]
       ${body}
     `
     // A file, not `-e`: the script names every fixture path, and would not
@@ -153,7 +149,8 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     writeFileSync(scriptFile, script)
     // A tmpdir of its own, so what a scenario leaves there goes with BASE.
     mkdirSync(join(BASE, 'tmp'), { recursive: true })
-    const run = spawnSync(process.execPath, ['run', scriptFile], {
+    const argv = [...launcher, process.execPath, 'run', scriptFile]
+    const run = spawnSync(argv[0]!, argv.slice(1), {
       cwd: BASE,
       encoding: 'utf8',
       env: { ...process.env, TMPDIR: join(BASE, 'tmp'), ...env },
@@ -163,43 +160,34 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     return JSON.parse(run.stdout)
   }
 
-  it('keeps a profile that fits on the command line and still ro-binds the --args directory last', async () => {
+  it('keeps a profile that fits on the command line, and names no file for it', async () => {
     const files = maskedFiles(20)
     const wrapped = await wrap(files)
     expect(wrapped).not.toContain('--args')
+    expect(wrapped).not.toContain('srt-args')
     expect(wrapped).toContain(`--ro-bind /dev/null ${files[0]}`)
-    // In every profile, not only the ones that use it: a sandbox launched
-    // with a small profile may still be running when a later over-long one
-    // is written there.
-    const argsDir = argsDirOf(wrapped)
-    expect(existsSync(argsDir)).toBe(true)
-    expect(wrapped.lastIndexOf(`--ro-bind ${argsDir} ${argsDir}`)).toBe(
-      wrapped.lastIndexOf('--ro-bind'),
-    )
-    // Dot-prefixed, so a sandboxed `rm -rf "$TMPDIR"/*` does not trip on the
-    // mount point.
-    expect(basename(argsDir).startsWith('.')).toBe(true)
   })
 
-  it('moves the mounts, and only the mounts, to a NUL-separated file and stays a simple command', async () => {
+  it('moves the mounts, and only the mounts, to an unnamed file the string reopens through /proc', async () => {
     const files = overLongProfile()
     const wrapped = await wrap(files, {
       setEnvVars: { SRT_TEST_VAR: "value with spaces and 'quotes'" },
     })
 
     expect(Buffer.byteLength(wrapped)).toBeLessThan(MAX_ARG_STRLEN)
-    const [, argsFile, before, after] = wrapped.match(VIA_ARGS_FILE)!
-    const argsDir = dirname(argsFile!)
-    expect(basename(argsDir)).toMatch(/^\.srt-bwrap-args-/)
+    const [, argsPath, before, after] = wrapped.match(VIA_ARGS_FILE)!
+    // This process's own fd: the profile has no name anywhere, so nothing
+    // can be put in its place between here and the execution.
+    expect(argsPath).toMatch(new RegExp(`^/proc/${process.pid}/fd/\\d+$`))
+    expect(readlinkSync(argsPath!)).toMatch(/\(deleted\)$/)
 
-    const words = readFileSync(argsFile!, 'utf8').split('\0')
+    const words = readFileSync(argsPath!, 'utf8').split('\0')
     expect(words[words.length - 1]).toBe('')
     const mounts = words.slice(0, -1)
     expect(mounts.filter(w => w === '/dev/null').length).toBe(files.length)
     expect(mounts).toContain(files[0])
-    expect(mounts.slice(-3)).toEqual(['--ro-bind', argsDir, argsDir])
-    // The file is readable in every sandbox of the process: nothing about
-    // the command or its environment goes there.
+    // Only mounts go to the file: nothing about the command or its
+    // environment is in it.
     expect(
       mounts.filter(
         w => w.startsWith('--') && !/^--(ro-bind|bind|tmpfs)$/.test(w),
@@ -212,16 +200,6 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     expect(before).not.toContain('--ro-bind /dev/null')
     // What followed the mounts still follows them.
     expect(after).toMatch(/--unshare-pid .* -- \S+ -c /s)
-  })
-
-  it('removes a file that was never spawned at cleanup and keeps the directory for the process', async () => {
-    const argsFile = argsFileOf(await wrap(overLongProfile()))
-    expect(existsSync(argsFile)).toBe(true)
-    cleanupBwrapMountPoints()
-    expect(existsSync(argsFile)).toBe(false)
-    // A sandbox launched earlier may still have the directory bound.
-    cleanupBwrapMountPoints({ force: true })
-    expect(existsSync(dirname(argsFile))).toBe(true)
   })
 
   it('switches to the file exactly where one argument would come within 4 KiB of the cap', async () => {
@@ -245,14 +223,12 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     expect(await renderedAt(INLINE_MAX + 1)).toMatch(VIA_ARGS_FILE)
   })
 
-  it('refuses a command that is too long for one argument by itself, and writes no file for it', async () => {
-    const argsDir = argsDirOf(await wrap(maskedFiles(1)))
+  it('refuses a command that is too long for one argument by itself', async () => {
     expect(
       await rejection(
         wrap(maskedFiles(20), { command: 'a'.repeat(MAX_ARG_STRLEN) }),
       ),
     ).toMatch(/too long for one shell argument even with the mounts/)
-    expect(readdirSync(argsDir)).toEqual([])
   })
 
   it('refuses a profile past the 9000 arguments bwrap accepts', async () => {
@@ -273,92 +249,139 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     ).toMatch(/NUL byte/)
   })
 
-  it('refuses over-long profiles for the rest of the process once the directory has been replaced', () => {
+  it('holds one fd per pending profile and gives them all back at cleanup, a refused wrap included', () => {
     const seen = isolated(`
-      const made = argsDirOf(await wrap(small))
-      // Same path, another inode: what a sandbox with the parent writable,
-      // or a tmp cleaner followed by anyone, can arrange.
-      fs.renameSync(made, made + '.aside')
-      fs.mkdirSync(made, { mode: 0o700 })
-      const refused = await outcome(wrap(overLong))
-      const afterRefusal = await wrap(small)
-      cleanupBwrapMountPoints()
+      const openFds = () => fs.readdirSync('/proc/self/fd').length
+      // The runtime opens event-loop fds of its own on the first wrap.
+      await wrap(small)
+      const baseline = openFds()
+      await wrap(overLong)
+      await wrap(overLong)
+      const held = openFds() - baseline
+      // A rendering that cannot be run releases its profile too.
+      const refused = await outcome(wrap(overLong, 'a'.repeat(${MAX_ARG_STRLEN})))
+      const afterRefusal = openFds() - baseline
       cleanupBwrapMountPoints({ force: true })
-      console.log(JSON.stringify({
-        refused,
-        planted: fs.readdirSync(made),
-        stillBinds: argsDirOf(afterRefusal) !== undefined,
-        refusedAfterReset: await outcome(wrap(overLong)),
-      }))
+      console.log(JSON.stringify({ held, refused, afterRefusal, afterCleanup: openFds() - baseline }))
     `)
     expect(seen).toEqual({
-      refused: expect.stringMatching(
-        /cannot be passed through a file until this process restarts: \S+ was removed or replaced/,
-      ),
-      planted: [],
-      stillBinds: false,
-      refusedAfterReset: expect.stringMatching(/was removed or replaced/),
+      held: 2,
+      refused: expect.stringMatching(/too long for one shell argument/),
+      afterRefusal: 2,
+      afterCleanup: 0,
     })
   })
 
-  it('says so, rather than ENOENT, when the directory vanishes while a profile is being generated', () => {
-    const seen = isolated(`
-      const made = argsDirOf(await wrap(small))
-      const wrapping = outcome(wrap(overLong))
-      fs.rmSync(made, { recursive: true })
-      console.log(JSON.stringify(await wrapping))
-    `)
-    expect(seen).toMatch(/until this process restarts: \S+ was removed/)
-  })
-
-  it('wraps a profile that fits when tmpdir is unusable, and refuses only the over-long one', () => {
-    // A file where the directory should be: not creatable by root either.
-    writeFileSync(join(BASE, 'not-a-directory'), '')
+  it('refuses at wrap time, with the reason, when no directory takes an unnamed file', () => {
+    // Both candidates read-only: tmpdir and /dev/shm. A profile that fits
+    // needs neither and is unaffected.
+    const roTmp = join(BASE, 'ro-tmp')
+    mkdirSync(roTmp)
     const seen = isolated(
       `
       const fits = await wrap(small)
       console.log(JSON.stringify({
-        fits: fits.includes('--ro-bind /dev/null') && !fits.includes('srt-bwrap-args'),
+        fits: fits.includes('--ro-bind /dev/null') && !fits.includes('srt-args'),
         refused: await outcome(wrap(overLong)),
       }))
     `,
-      { TMPDIR: join(BASE, 'not-a-directory') },
+      { TMPDIR: roTmp },
+      [
+        'bwrap',
+        '--dev-bind',
+        '/',
+        '/',
+        '--ro-bind',
+        '/etc',
+        '/dev/shm',
+        '--ro-bind',
+        '/etc',
+        roTmp,
+      ],
     )
     expect(seen).toEqual({
       fits: true,
-      refused: expect.stringMatching(/it could not be created under \S+/),
+      refused: expect.stringMatching(
+        /cannot be passed through a file: no unnamed file could be opened for it \(.*read-only/s,
+      ),
     })
   })
 
+  it('fails in the redirection, and does not run the command, when the string is run after its cleanup', async () => {
+    const marker = join(BASE, 'ran')
+    const wrapped = await wrap(overLongProfile(), {
+      command: `touch ${marker}`,
+    })
+    cleanupBwrapMountPoints({ force: true })
+    // No pipes for the run: a parent-side fd would take the number the
+    // profile just gave up.
+    const run = spawnSync(wrapped, {
+      shell: true,
+      stdio: 'ignore',
+      timeout: 60000,
+    })
+    expect(run.status).not.toBe(0)
+    expect(existsSync(marker)).toBe(false)
+  })
+
   it.if(BWRAP_CAN_NAMESPACE)(
-    'e2e: binds the directory by its resolved path, which bwrap before 0.12 needs when tmpdir is behind an absolute symlink',
+    'e2e: a pending profile survives a tmpdir whose parent is replaced, because no path leads to it',
     () => {
-      mkdirSync(join(BASE, 'real-tmp'))
-      symlinkSync(join(BASE, 'real-tmp'), join(BASE, 'link-tmp'))
+      const parent = join(BASE, 'scratch')
+      mkdirSync(join(parent, 'tmp'), { recursive: true })
+      const marker = join(BASE, 'written-by-the-sandbox')
       const seen = isolated(
         `
         const { spawnSync } = await import('node:child_process')
-        const wrapped = await wrap(small)
-        const run = spawnSync(wrapped, { shell: true, encoding: 'utf8' })
-        console.log(JSON.stringify({ argsDir: argsDirOf(wrapped), status: run.status, stdout: run.stdout }))
+        const wrapped = await wrap(overLong, 'touch ${marker} 2>/dev/null && echo WROTE || echo DENIED')
+        const argsPath = argsPathOf(wrapped)
+        // The runtime leaves a cache of its own there; nothing of ours.
+        const namedUnderTmpdir = fs.readdirSync(process.env.TMPDIR, { recursive: true })
+          .filter(entry => /srt|args|bwrap/.test(entry))
+        // What a sandbox with the parent writable, or another process of
+        // this user sandboxing with tmpdir writable, can arrange: the
+        // directory goes aside, and a profile that binds / read-write takes
+        // the place of every path the string could still open.
+        fs.renameSync(${JSON.stringify(parent)}, ${JSON.stringify(parent + '.aside')})
+        let planted = null
+        if (!argsPath.startsWith('/proc/')) {
+          fs.mkdirSync(argsPath.slice(0, argsPath.lastIndexOf('/')), { recursive: true })
+          fs.writeFileSync(argsPath, '--bind\\0/\\0/\\0')
+          planted = argsPath
+        }
+        const run = spawnSync(wrapped, { shell: true, encoding: 'utf8', timeout: 60000 })
+        console.log(JSON.stringify({
+          argsPath,
+          namedUnderTmpdir,
+          planted,
+          status: run.status,
+          stdout: run.stdout.trim(),
+          marker: fs.existsSync(${JSON.stringify(marker)}),
+        }))
       `,
-        { TMPDIR: join(BASE, 'link-tmp') },
-      ) as { argsDir: string; status: number; stdout: string }
-      expect(dirname(seen.argsDir)).toBe(join(BASE, 'real-tmp'))
-      expect(seen).toMatchObject({ status: 0, stdout: 'hello\n' })
+        { TMPDIR: join(parent, 'tmp') },
+      )
+      expect(seen).toEqual({
+        argsPath: expect.stringMatching(/^\/proc\/\d+\/fd\/\d+$/),
+        namedUnderTmpdir: [],
+        planted: null,
+        status: 0,
+        // The command ran under the profile that was wrapped, not one
+        // planted after it.
+        stdout: 'DENIED',
+        marker: false,
+      })
     },
     60_000,
   )
 
   it.if(BWRAP_CAN_NAMESPACE)(
-    'e2e: bwrap applies the mounts from the file, the string composes with a prefix and a suffix, and the command sees neither the fd nor a writable --args directory',
+    'e2e: bwrap applies the mounts from the file, the string composes with a prefix and a suffix, and the command reaches neither fd 9 nor the profile',
     async () => {
-      const argsDir = argsDirOf(await wrap(maskedFiles(1)))
-      const probe = join(argsDir, 'srt-args-probe')
       const files = overLongProfile()
-      // tmpdir writable inside the sandbox: the case the trailing ro-bind
-      // exists for. The runner's tmpdir is scanned shallowly, since every
-      // mount costs bwrap time.
+      // tmpdir writable inside the sandbox: with nothing named there, that
+      // is no longer a way to the pending profile. The runner's tmpdir is
+      // scanned shallowly, since every mount costs bwrap time.
       const wrapped = await wrap(files, {
         allowOnly: [tmpdir()],
         mandatoryDenySearchDepth: 1,
@@ -368,11 +391,14 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
           // is not portable across hosts, so its type is the oracle).
           `[ -c ${files[0]} ] && echo MASKED || echo UNMASKED`,
           '[ -e /proc/self/fd/9 ] && echo FD9_OPEN || echo FD9_CLOSED',
-          `touch ${probe} 2>/dev/null && echo ARGS_WRITABLE || echo ARGS_READONLY`,
+          // A fresh /proc in its own PID namespace: the wrapping process,
+          // and so the fd its profiles are on, is not there at all.
+          `[ -e /proc/${process.pid} ] && echo RUNTIME_PROC_VISIBLE || echo RUNTIME_PROC_HIDDEN`,
         ].join('; '),
       })
-      const argsFile = argsFileOf(wrapped)
-      expect(dirname(argsFile)).toBe(argsDir)
+      expect(argsPathOf(wrapped)).toMatch(
+        new RegExp(`^/proc/${process.pid}/fd/\\d+$`),
+      )
       const run = spawnSync(`timeout 60 ${wrapped} && echo AFTER`, {
         shell: true,
         encoding: 'utf8',
@@ -383,13 +409,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       expect(run.stdout.trim().split('\n')).toEqual([
         'MASKED',
         'FD9_CLOSED',
-        'ARGS_READONLY',
+        'RUNTIME_PROC_HIDDEN',
         'AFTER',
       ])
       expect(readFileSync(files[0]!, 'utf8')).toBe('secret\n')
-      expect(existsSync(probe)).toBe(false)
-      // Unlinked by the spawn itself.
-      expect(existsSync(argsFile)).toBe(false)
     },
     60_000,
   )
