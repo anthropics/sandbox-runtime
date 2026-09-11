@@ -9,11 +9,21 @@ function isAbsenceError(err: unknown): boolean {
 }
 
 /**
- * How much of a `.git` pointer or a `commondir` is read. Both hold a single
- * path, and git refuses a gitfile larger than 1 MiB, so a file this size is
- * not one git would follow either.
+ * The path is longer than the filesystem allows, so no file can occupy it:
+ * git's own stat of it fails, and a sandboxed command cannot create a git
+ * directory there either.
  */
-const MAX_GIT_METADATA_BYTES = 8192
+function isUnusablePathError(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === 'ENAMETOOLONG'
+}
+
+/**
+ * How much of a `.git` pointer or a `commondir` is read: what git's
+ * `read_gitfile_gently` accepts for a pointer file, so one larger than this
+ * is not a pointer git follows either. `commondir` has no bound in git, so
+ * one this large is read by git and not by this, and fails closed.
+ */
+const MAX_GIT_METADATA_BYTES = 1024 * 1024
 
 /**
  * Depth bound for the `.git/modules` walk. A submodule's name is its path
@@ -31,7 +41,25 @@ const MAX_SUBMODULE_WALK_DEPTH = 10
 const GIT_DIR_MARKERS = new Set(['HEAD', 'config', 'hooks', 'objects'])
 
 /** What {@link gitDirKind} concluded about a `gitdir:`/`commondir` target. */
-type GitDirKind = 'git-dir' | 'absent' | 'other' | 'unreadable'
+type GitDirKind = 'git-dir' | 'absent' | 'other' | 'unreadable' | 'unusable'
+
+/** What {@link readGitMetadataFile} found at a `.git` file or a `commondir`. */
+type GitMetadata =
+  /** The whole file, within the size git accepts. */
+  | { kind: 'contents'; bytes: Buffer }
+  /** Absent, or not the regular file git requires: nothing git reads here. */
+  | { kind: 'none' }
+  /** Longer than {@link MAX_GIT_METADATA_BYTES}. */
+  | { kind: 'too-large' }
+
+/**
+ * A git metadata file whose target cannot be worked out the way git works it
+ * out. Thrown rather than logged, and not swallowed by
+ * {@link gitFileDenyPaths}: sandboxing with a deny list that misses the hooks
+ * and config git reads is worse than not sandboxing, which is the same call
+ * the Linux backend makes for a scan that does not finish in time.
+ */
+export class GitMetadataError extends Error {}
 
 /** Directories found under a `.git/modules`, and what could not be read. */
 export interface SubmoduleScan {
@@ -72,6 +100,11 @@ export function gitDirDenyPaths(
  * submodule checkout: the file itself plus the hooks/ and config git reads
  * through it (the named git directory's, and for a linked worktree its
  * commondir's as well).
+ *
+ * Throws {@link GitMetadataError} when the pointer or the `commondir` names
+ * something this cannot resolve the way git does; the wrap is then refused
+ * rather than applied with a deny list that may not cover the directory git
+ * uses.
  */
 export function gitFileDenyPaths(
   gitFile: string,
@@ -80,8 +113,18 @@ export function gitFileDenyPaths(
   const denyPaths = [gitFile]
   try {
     const pointer = readGitMetadataFile(gitFile)
+    if (pointer.kind === 'too-large') {
+      // git refuses a .git file this large outright, so it leads nowhere.
+      logForDebugging(
+        `[Sandbox] ${gitFile} is larger than the ${MAX_GIT_METADATA_BYTES} bytes git accepts for a .git file, so git does not follow it either; denying only the file itself`,
+        { level: 'warn' },
+      )
+      return denyPaths
+    }
     const target =
-      pointer === undefined ? undefined : parseGitdirPointer(pointer)
+      pointer.kind === 'contents'
+        ? parseGitdirPointer(pointer.bytes, gitFile)
+        : undefined
     if (target === undefined) return denyPaths
     const gitDir = path.resolve(path.dirname(gitFile), target)
     denyPaths.push(...gitDirTargetDenyPaths(gitDir, allowGitConfig, gitFile))
@@ -90,16 +133,28 @@ export function gitFileDenyPaths(
     // hooks and config its commits run.
     const commonFile = path.join(gitDir, 'commondir')
     const common = readGitMetadataFile(commonFile)
+    if (common.kind === 'too-large') {
+      // git reads commondir whole, with no size limit of its own, so a file
+      // past this bound still names the directory whose hooks git runs.
+      throw new GitMetadataError(
+        `[Sandbox] ${commonFile} is larger than ${MAX_GIT_METADATA_BYTES} bytes; refusing to sandbox without the git directory it names`,
+      )
+    }
+    const commonTarget =
+      common.kind === 'contents'
+        ? gitMetadataPath(common.bytes, commonFile)
+        : undefined
     const commonDir =
-      common === undefined
+      commonTarget === undefined
         ? undefined
-        : path.resolve(gitDir, firstLine(common).trim())
+        : path.resolve(gitDir, commonTarget)
     if (commonDir !== undefined && commonDir !== gitDir) {
       denyPaths.push(
         ...gitDirTargetDenyPaths(commonDir, allowGitConfig, commonFile),
       )
     }
   } catch (err) {
+    if (err instanceof GitMetadataError) throw err
     // A dangling pointer names nothing git would read. A pointer this process
     // cannot read is one the host's git cannot read either, so the file
     // itself is the whole deny; an unreadable TARGET is denied whole by
@@ -228,6 +283,12 @@ function gitDirTargetDenyPaths(
       )
       return [denied]
     }
+    case 'unusable':
+      logForDebugging(
+        `[Sandbox] ${source} names ${target}, which is longer than the filesystem allows: no file can be there for git to read or for a command to create; denying only ${source}`,
+        { level: 'warn' },
+      )
+      return []
     case 'other':
       logForDebugging(
         `[Sandbox] ${source} names ${target}, which is not a git directory; denying only ${source}`,
@@ -237,11 +298,18 @@ function gitDirTargetDenyPaths(
   }
 }
 
+/**
+ * Whether `dir` is a git directory. Deliberately looser than git's
+ * `is_git_directory` (a valid HEAD plus objects/ and refs/): every directory
+ * git accepts has a HEAD entry, so this accepts those and some besides,
+ * which only ever denies more.
+ */
 function gitDirKind(dir: string): GitDirKind {
   let entries: fs.Dirent[]
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true })
   } catch (err) {
+    if (isUnusablePathError(err)) return 'unusable'
     return isAbsenceError(err) ? 'absent' : 'unreadable'
   }
   return entries.some(e => e.name === 'HEAD' || e.name === 'objects')
@@ -250,13 +318,11 @@ function gitDirKind(dir: string): GitDirKind {
 }
 
 /**
- * At most {@link MAX_GIT_METADATA_BYTES} of `file`, or undefined when it is
- * absent, is not a regular file, or is longer than that. The path is one a
- * sandboxed command may create: a FIFO there would block the host on every
- * later wrap (hence O_NONBLOCK and the type check), and an arbitrarily large
- * file would be buffered whole on every command.
+ * The contents of `file`, or what stopped this from reading it the way git
+ * does. The path is one a sandboxed command may create: a FIFO there would
+ * block the host on every later wrap (hence O_NONBLOCK and the type check).
  */
-function readGitMetadataFile(file: string): string | undefined {
+function readGitMetadataFile(file: string): GitMetadata {
   // O_NONBLOCK is POSIX-only; this file's callers are the Linux and macOS
   // backends, and 0 leaves the flags as they were.
   const nonBlocking = fs.constants.O_NONBLOCK ?? 0
@@ -264,44 +330,88 @@ function readGitMetadataFile(file: string): string | undefined {
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | nonBlocking)
   } catch (err) {
-    if (isAbsenceError(err)) return undefined
+    if (isAbsenceError(err) || isUnusablePathError(err)) return { kind: 'none' }
     throw err
   }
   try {
     // From the open file description, so it describes what was actually
     // opened rather than what the path named a moment ago.
-    if (!fs.fstatSync(fd).isFile()) return undefined
-    const buffer = Buffer.alloc(MAX_GIT_METADATA_BYTES)
-    const read = fs.readSync(fd, buffer, 0, buffer.length, 0)
-    if (read === buffer.length) {
-      logForDebugging(
-        `[Sandbox] ${file} is larger than ${MAX_GIT_METADATA_BYTES} bytes, which is not a path git would follow; ignoring it`,
-        { level: 'warn' },
-      )
-      return undefined
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile()) return { kind: 'none' }
+    if (stat.size > MAX_GIT_METADATA_BYTES) return { kind: 'too-large' }
+    // Sized from that stat rather than from the bound, and one byte past it
+    // so a file that grew since is read on rather than taken for whole;
+    // readSync can also stop short of the length it was given.
+    let buffer = Buffer.alloc(stat.size + 1)
+    let read = 0
+    for (;;) {
+      if (read === buffer.length) {
+        if (buffer.length > MAX_GIT_METADATA_BYTES) return { kind: 'too-large' }
+        const grown = Buffer.alloc(MAX_GIT_METADATA_BYTES + 1)
+        buffer.copy(grown)
+        buffer = grown
+      }
+      const chunk = fs.readSync(fd, buffer, read, buffer.length - read, read)
+      if (chunk === 0) break
+      read += chunk
     }
-    return buffer.toString('utf8', 0, read)
+    return { kind: 'contents', bytes: buffer.subarray(0, read) }
   } finally {
     fs.closeSync(fd)
   }
 }
 
 /**
- * The `gitdir:` target of a pointer file. git requires the prefix at byte 0
- * and trims only newline bytes from the end, and a path never spans lines.
+ * The `gitdir:` target of a pointer file, or undefined when git would not
+ * follow the file at all. git requires the 8-byte prefix at offset 0 — no
+ * leading whitespace, no other spelling — and everything after it is path.
  */
-function parseGitdirPointer(contents: string): string | undefined {
-  const prefix = 'gitdir: '
-  const line = firstLine(contents)
-  if (!line.startsWith(prefix)) return undefined
-  const target = line.slice(prefix.length)
-  return target.length > 0 ? target : undefined
+function parseGitdirPointer(
+  contents: Buffer,
+  file: string,
+): string | undefined {
+  const prefix = Buffer.from('gitdir: ')
+  if (!contents.subarray(0, prefix.length).equals(prefix)) return undefined
+  return gitMetadataPath(contents.subarray(prefix.length), file)
 }
 
-/** The first line, without the newline bytes git strips (`\n`, `\r`). */
-function firstLine(contents: string): string {
-  const end = contents.indexOf('\n')
-  return (end === -1 ? contents : contents.slice(0, end)).replace(/\r+$/, '')
+/**
+ * The path a git metadata file names, by git's rules rather than a line
+ * reader's: `\n` and `\r` are stripped from the END OF THE FILE (so a newline
+ * inside the path is part of it), nothing is trimmed, and what is left is a C
+ * string and ends at the first NUL. `read_gitfile_gently` and
+ * `get_common_dir_noenv` in git's setup.c both read this way.
+ *
+ * This re-implements that parsing instead of asking git, because the library
+ * has to work where git is not installed, a wrap would otherwise spawn a
+ * process per pointer per command, and running git inside a checkout the
+ * sandboxed command can write is the hazard these denies exist to contain;
+ * test/sandbox/git-pointer-parity.test.ts is what keeps the two in step,
+ * resolving a corpus of pointer shapes both ways and comparing.
+ *
+ * Throws {@link GitMetadataError} for a path whose bytes are not valid UTF-8:
+ * a JavaScript string of them names a different file than git opens, so
+ * there is no path here to deny.
+ */
+function gitMetadataPath(contents: Buffer, file: string): string | undefined {
+  let end = contents.length
+  while (
+    end > 0 &&
+    (contents[end - 1] === 0x0a || contents[end - 1] === 0x0d)
+  ) {
+    end--
+  }
+  const nul = contents.subarray(0, end).indexOf(0)
+  const pathBytes = contents.subarray(0, nul === -1 ? end : nul)
+  if (pathBytes.length === 0) return undefined
+
+  const decoded = pathBytes.toString('utf8')
+  if (!Buffer.from(decoded, 'utf8').equals(pathBytes)) {
+    throw new GitMetadataError(
+      `[Sandbox] ${file} names a path that is not valid UTF-8; refusing to sandbox with a deny list that would name a different directory than git opens`,
+    )
+  }
+  return decoded
 }
 
 /**
