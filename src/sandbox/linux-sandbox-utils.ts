@@ -493,104 +493,109 @@ const BWRAP_MAX_ARGS = 9000
 const BWRAP_ARGS_FD = 9
 
 /**
- * The directory `--args` files are written to, or why there is none.
- *
- * INVARIANT: the directory is created before this process wraps its first
- * sandbox and every profile ro-binds it, so no sandbox the process launched
- * can rewrite a profile bwrap has yet to read. It is never created a second
- * time: a sandbox wrapped earlier would lack the new one's bind, and the
- * library cannot tell whether that sandbox is still running (reset() does
- * not end sandboxes, and cleanupBwrapMountPoints() is only as exact as its
- * caller). So once the directory cannot be created, or is found removed or
- * replaced, profiles stop binding it and an over-long one is refused until
- * the process restarts. Removed at exit, not at reset().
+ * Linux's O_TMPFILE, which neither Node nor Bun exposes in `fs.constants`:
+ * the asm-generic __O_TMPFILE, the value on every architecture they build
+ * for Linux, together with the O_DIRECTORY the flag is defined to carry — a
+ * kernel or filesystem that does not know it therefore fails the open on the
+ * directory rather than creating a named file.
  */
-type BwrapArgsDir =
-  | { kind: 'dir'; path: string; identity: string }
-  | { kind: 'unavailable'; why: string }
-let bwrapArgsDir: BwrapArgsDir | undefined
-const bwrapArgsFiles: Set<string> = new Set()
-let bwrapArgsFileCount = 0
+const O_TMPFILE = 0o20000000 | fs.constants.O_DIRECTORY
 
-function directoryIdentity(dir: string): string {
-  const { dev, ino, uid, mode } = fs.statSync(dir)
-  return `${dev}:${ino}:${uid}:${mode}`
+/**
+ * The `--args` profiles this process holds open.
+ *
+ * A profile is an unnamed file (O_TMPFILE): written at wrap time, kept open
+ * here, and opened again by the string bwrap runs through
+ * `/proc/<pid>/fd/<n>`, which is a fresh read-only description of the same
+ * inode at offset 0. Nothing is named at any point, so there is nothing for
+ * anyone to substitute between the wrap and the execution — not a sandbox
+ * that renames an ancestor of tmpdir, not a sandbox another process of the
+ * same user launched with tmpdir writable. Every sandbox this library starts
+ * has its own PID namespace and a fresh /proc, so none of them can reach
+ * /proc/<this pid> either.
+ *
+ * Fds close when the sandboxes of a batch are cleaned up, and fd numbers are
+ * reused: a string kept past its cleanup and run later opens whatever the
+ * number means by then — nothing (the redirection fails and the command does
+ * not run), something bwrap refuses, or another profile of this process,
+ * never one from outside it.
+ */
+const bwrapArgsFds: Set<number> = new Set()
+
+/** Where the string bwrap runs opens the profile held on `fd`. */
+function bwrapArgsProfilePath(fd: number): string {
+  return `/proc/${process.pid}/fd/${fd}`
 }
 
-/** bwrapArgsDir, created on the first call and checked on every later one. */
-function checkedBwrapArgsDir(): BwrapArgsDir {
-  if (bwrapArgsDir === undefined) {
+/**
+ * Writes `mountWords` NUL-separated to an unnamed file and returns the fd it
+ * stays open on. Throws when no directory takes an O_TMPFILE file, or when
+ * the profile cannot be opened again through /proc: there is no named-file
+ * fallback, and before any of this an over-long profile failed with E2BIG
+ * anyway. The check is this process's own open; a child's can still be
+ * refused (a process made non-dumpable owns its /proc entries as root), and
+ * the string then fails in the redirection and runs no command.
+ */
+function openBwrapArgsProfile(mountWords: string[]): number {
+  const contents = mountWords.map(word => word + '\0').join('')
+  const failures: string[] = []
+  for (const dir of new Set([tmpdir(), '/dev/shm'])) {
+    let fd: number
     try {
-      // Dot-prefixed: the bind is a mount point the sandbox cannot delete,
-      // and `rm -rf "$TMPDIR"/*` in a sandboxed build step should not trip
-      // on it. Resolved: bwrap before 0.12 cannot follow an absolute
-      // symlink (/tmp -> /scratch/tmp) in a bind destination.
-      const dir = fs.realpathSync(
-        fs.mkdtempSync(path.join(tmpdir(), '.srt-bwrap-args-')),
-      )
-      bwrapArgsDir = {
-        kind: 'dir',
-        path: dir,
-        identity: directoryIdentity(dir),
-      }
-      registerExitCleanupHandler()
+      fd = fs.openSync(dir, O_TMPFILE | fs.constants.O_RDWR, 0o600)
     } catch (error) {
-      bwrapArgsDir = {
-        kind: 'unavailable',
-        why: `it could not be created under ${tmpdir()} (${error instanceof Error ? error.message : String(error)})`,
-      }
+      failures.push(`${dir}: ${errorText(error)}`)
+      continue
     }
-  } else if (bwrapArgsDir.kind === 'dir') {
-    let found: string | undefined
     try {
-      found = directoryIdentity(bwrapArgsDir.path)
-    } catch {
-      // Gone, or no longer reachable: the same as replaced.
+      fs.writeFileSync(fd, contents)
+      // Read-only from here: this process is done writing it.
+      fs.fchmodSync(fd, 0o400)
+      // The string opens this path. Fail now, where the caller is told why,
+      // rather than when the command runs.
+      fs.closeSync(fs.openSync(bwrapArgsProfilePath(fd), fs.constants.O_RDONLY))
+    } catch (error) {
+      failures.push(`${dir}: ${errorText(error)}`)
+      fs.closeSync(fd)
+      continue
     }
-    if (found !== bwrapArgsDir.identity) {
-      bwrapArgsDir = {
-        kind: 'unavailable',
-        why: `${bwrapArgsDir.path} was removed or replaced after this process created it`,
-      }
-    }
+    bwrapArgsFds.add(fd)
+    return fd
   }
-  return bwrapArgsDir
+  throw new Error(
+    `no unnamed file could be opened for it (${failures.join('; ')})`,
+  )
 }
 
-/** `rm` at a fixed system location, never from PATH; undefined if absent. */
-let systemRm: string | null | undefined
-function systemRmPath(): string | undefined {
-  if (systemRm === undefined) {
-    systemRm =
-      ['/usr/bin/rm', '/bin/rm'].find(candidate => {
-        try {
-          fs.accessSync(candidate, fs.constants.X_OK)
-          return true
-        } catch {
-          return false
-        }
-      }) ?? null
+function closeBwrapArgsProfile(fd: number): void {
+  bwrapArgsFds.delete(fd)
+  try {
+    fs.closeSync(fd)
+  } catch {
+    // Already closed: nothing left to release.
   }
-  return systemRm ?? undefined
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 /**
  * The shell string that runs bwrap with `bwrapArgs`, which the caller runs
  * as one argument of `sh -c`. When that would not fit the kernel's
- * per-argument cap, the words in `mounts` (a slice of `bwrapArgs`) are
- * written NUL-separated to a file and bwrap reads them through `--args` at
- * the same position. Every other word, the per-command environment and the
- * command among them, stays on the line, because the file is readable in
- * every sandbox of this process. The result stays a simple command, so a
- * prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
- * Throws when the profile cannot run: too many words for bwrap, no usable
- * directory for the file, or a line too long even without the mounts.
+ * per-argument cap, the words in `mounts` (a slice of `bwrapArgs`) go to an
+ * unnamed file this process holds open (see `bwrapArgsFds`) and bwrap reads
+ * them through `--args` at the same position; the string opens that file
+ * again through /proc. Every other word, the per-command environment and the
+ * command among them, stays on the line. The result stays a simple command,
+ * so a prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
+ * Throws when the profile cannot run: too many words for bwrap, no unnamed
+ * file to put the mounts in, or a line too long even without them.
  */
 function renderBwrapInvocation(
   bwrapBinary: string,
   bwrapArgs: string[],
   mounts: { start: number; end: number },
-  argsDir: BwrapArgsDir,
 ): string {
   if (bwrapArgs.length > BWRAP_MAX_ARGS) {
     throw new Error(
@@ -611,11 +616,6 @@ function renderBwrapInvocation(
       `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts`,
     )
   }
-  if (argsDir.kind === 'unavailable') {
-    throw new Error(
-      `${tooLong} and cannot be passed through a file until this process restarts: ${argsDir.why}`,
-    )
-  }
   const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
   if (mountWords.some(word => word.includes('\0'))) {
     // bwrap splits the file on NUL: the word would become several options.
@@ -623,20 +623,22 @@ function renderBwrapInvocation(
       `${tooLong} and contains a path with a NUL byte, which a file of bwrap arguments cannot carry`,
     )
   }
-  const argsFile = path.join(
-    argsDir.path,
-    `args-${process.pid}-${++bwrapArgsFileCount}`,
-  )
-  // /bin/sh opens the file on the fd, unlinks it at once (bwrap reads the
-  // open fd) and execs bwrap, so a file lives only from the wrap to the
-  // spawn; one never spawned goes at cleanup.
-  const rm = systemRmPath()
+  let argsFd: number
+  try {
+    argsFd = openBwrapArgsProfile(mountWords)
+  } catch (error) {
+    throw new Error(
+      `${tooLong} and cannot be passed through a file: ${errorText(error)}`,
+    )
+  }
+  // /bin/sh opens the profile on the fd and execs bwrap, which reads it to
+  // EOF and closes it before running the command.
   const viaArgsFile = quote([
     '/bin/sh',
     '-c',
-    `exec ${BWRAP_ARGS_FD}<"$1" && ${rm === undefined ? '' : `${rm} -f -- "$1" && `}shift && exec "$@"`,
+    `exec ${BWRAP_ARGS_FD}<"$1" && shift && exec "$@"`,
     'srt-args',
-    argsFile,
+    bwrapArgsProfilePath(argsFd),
     bwrapBinary,
     ...bwrapArgs.slice(0, mounts.start),
     '--args',
@@ -645,40 +647,15 @@ function renderBwrapInvocation(
   ])
   const viaArgsFileBytes = Buffer.byteLength(viaArgsFile, 'utf8')
   if (viaArgsFileBytes > limit) {
+    closeBwrapArgsProfile(argsFd)
     throw new Error(
       `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})`,
     )
   }
-  // Tracked before the write, so a failed write is cleaned up as well.
-  bwrapArgsFiles.add(argsFile)
-  try {
-    fs.writeFileSync(argsFile, mountWords.map(word => word + '\0').join(''), {
-      mode: 0o600,
-      flag: 'wx',
-    })
-  } catch (error) {
-    bwrapArgsDir = {
-      kind: 'unavailable',
-      why: `writing ${argsFile} failed (${error instanceof Error ? error.message : String(error)})`,
-    }
-    throw new Error(
-      `${tooLong} and cannot be passed through a file until this process restarts: ${bwrapArgsDir.why}`,
-    )
-  }
   logForDebugging(
-    `[Sandbox Linux] bwrap mounts moved to ${argsFile} (fd ${BWRAP_ARGS_FD}): the command line would be ${inlineBytes} bytes as one argument`,
+    `[Sandbox Linux] bwrap mounts moved to an unnamed file, read through ${bwrapArgsProfilePath(argsFd)} on bwrap's fd ${BWRAP_ARGS_FD}: the command line would be ${inlineBytes} bytes as one argument`,
   )
   return viaArgsFile
-}
-
-function removeBwrapArgsDir(): void {
-  if (bwrapArgsDir?.kind !== 'dir') return
-  try {
-    fs.rmSync(bwrapArgsDir.path, { recursive: true, force: true })
-  } catch {
-    // Unremovable: nothing left to do at exit.
-  }
-  bwrapArgsDir = undefined
 }
 
 // Number of wrapped commands that have been generated but whose cleanup has
@@ -700,7 +677,6 @@ function registerExitCleanupHandler(): void {
 
   process.on('exit', () => {
     cleanupBwrapMountPoints({ force: true })
-    removeBwrapArgsDir()
   })
 
   exitHandlerRegistered = true
@@ -727,7 +703,7 @@ function registerExitCleanupHandler(): void {
  * Pass `{ force: true }` to delete unconditionally — used by the process-exit
  * handler and reset() where deferral is not meaningful.
  *
- * Also removes the `--args` files of wraps that were never spawned.
+ * Also closes the `--args` profiles the wraps of this batch opened.
  */
 export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
   if (!opts?.force) {
@@ -771,15 +747,9 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
   }
   bwrapMountPoints.clear()
 
-  for (const argsFile of bwrapArgsFiles) {
-    try {
-      fs.rmSync(argsFile, { force: true })
-    } catch {
-      // Unremovable (a permission change under the directory): cleanup
-      // must not throw at the caller.
-    }
+  for (const argsFd of [...bwrapArgsFds]) {
+    closeBwrapArgsProfile(argsFd)
   }
-  bwrapArgsFiles.clear()
 }
 
 /**
@@ -2272,12 +2242,6 @@ export async function wrapCommandWithSandboxLinux(
     )
     const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)
-    const argsDir = checkedBwrapArgsDir()
-    if (argsDir.kind === 'dir') {
-      // Last of the binds, so it lands over an allowWrite of tmpdir (and
-      // beneath a denyRead tmpfs over it: a pending file is readable).
-      bwrapArgs.push('--ro-bind', argsDir.path, argsDir.path)
-    }
     const mounts = { start: mountsStart, end: bwrapArgs.length }
 
     // Always bind /dev
@@ -2355,7 +2319,6 @@ export async function wrapCommandWithSandboxLinux(
       bwrapPath ?? 'bwrap',
       bwrapArgs,
       mounts,
-      argsDir,
     )
 
     const restrictions = []
