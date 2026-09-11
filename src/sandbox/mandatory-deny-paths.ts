@@ -26,6 +26,12 @@ function isUnusablePathError(err: unknown): boolean {
 const MAX_GIT_METADATA_BYTES = 1024 * 1024
 
 /**
+ * Symlink hops allowed while resolving one path, the limit Linux itself
+ * applies before it gives up with ELOOP.
+ */
+const MAX_SYMLINK_HOPS = 40
+
+/**
  * Depth bound for the `.git/modules` walk. A submodule's name is its path
  * (`vendor/lib`) and submodules nest, so the walk descends both name segments
  * and nested `modules` directories; this bounds a hostile or looping tree, not
@@ -101,6 +107,10 @@ export function gitDirDenyPaths(
  * through it (the named git directory's, and for a linked worktree its
  * commondir's as well).
  *
+ * A `..` in either path can land the kernel somewhere other than where the
+ * path folds to on paper, so both directories are denied — see
+ * {@link gitMetadataTargets}.
+ *
  * Throws {@link GitMetadataError} when the pointer or the `commondir` names
  * something this cannot resolve the way git does; the wrap is then refused
  * rather than applied with a deny list that may not cover the directory git
@@ -126,32 +136,36 @@ export function gitFileDenyPaths(
         ? parseGitdirPointer(pointer.bytes, gitFile)
         : undefined
     if (target === undefined) return denyPaths
-    const gitDir = path.resolve(path.dirname(gitFile), target)
-    denyPaths.push(...gitDirTargetDenyPaths(gitDir, allowGitConfig, gitFile))
+    const gitDirs = gitMetadataTargets(path.dirname(gitFile), target)
+    for (const gitDir of gitDirs) {
+      denyPaths.push(...gitDirTargetDenyPaths(gitDir, allowGitConfig, gitFile))
+    }
 
     // A linked worktree's git directory holds the path of the main one, whose
-    // hooks and config its commits run.
-    const commonFile = path.join(gitDir, 'commondir')
-    const common = readGitMetadataFile(commonFile)
-    if (common.kind === 'too-large') {
-      // git reads commondir whole, with no size limit of its own, so a file
-      // past this bound still names the directory whose hooks git runs.
-      throw new GitMetadataError(
-        `[Sandbox] ${commonFile} is larger than ${MAX_GIT_METADATA_BYTES} bytes; refusing to sandbox without the git directory it names`,
-      )
-    }
-    const commonTarget =
-      common.kind === 'contents'
-        ? gitMetadataPath(common.bytes, commonFile)
-        : undefined
-    const commonDir =
-      commonTarget === undefined
-        ? undefined
-        : path.resolve(gitDir, commonTarget)
-    if (commonDir !== undefined && commonDir !== gitDir) {
-      denyPaths.push(
-        ...gitDirTargetDenyPaths(commonDir, allowGitConfig, commonFile),
-      )
+    // hooks and config its commits run. git reads it out of the directory it
+    // opened, so each candidate above has its own.
+    for (const gitDir of gitDirs) {
+      const commonFile = path.join(gitDir, 'commondir')
+      const common = readGitMetadataFile(commonFile)
+      if (common.kind === 'too-large') {
+        // git reads commondir whole, with no size limit of its own, so a
+        // file past this bound still names the directory whose hooks git
+        // runs.
+        throw new GitMetadataError(
+          `[Sandbox] ${commonFile} is larger than ${MAX_GIT_METADATA_BYTES} bytes; refusing to sandbox without the git directory it names`,
+        )
+      }
+      const commonTarget =
+        common.kind === 'contents'
+          ? gitMetadataPath(common.bytes, commonFile)
+          : undefined
+      if (commonTarget === undefined) continue
+      for (const commonDir of gitMetadataTargets(gitDir, commonTarget)) {
+        if (commonDir === gitDir) continue
+        denyPaths.push(
+          ...gitDirTargetDenyPaths(commonDir, allowGitConfig, commonFile),
+        )
+      }
     }
   } catch (err) {
     if (err instanceof GitMetadataError) throw err
@@ -412,6 +426,72 @@ function gitMetadataPath(contents: Buffer, file: string): string | undefined {
     )
   }
   return decoded
+}
+
+/**
+ * The git directories a `gitdir:` or `commondir` value read in `base` leads
+ * to: the path as it folds on paper, which is the spelling these denies have
+ * always used, and — when a `..` in it could send the kernel elsewhere — the
+ * directory the kernel actually reaches. git hands the two strings to stat
+ * joined and unnormalised, so a symlink is followed before a later `..`
+ * applies and `a/link/../b` need not be `a/b`. Both are denied when they
+ * differ: git opens one of them, and denying the other costs one bind.
+ */
+function gitMetadataTargets(base: string, target: string): string[] {
+  const lexical = path.resolve(base, target)
+  if (!target.split('/').includes('..')) return [lexical]
+  const root = path.parse(lexical).root
+  const physical = physicalPath(physicalPath(root, base), target)
+  // Both sides resolved the same way, so a base that merely spells itself
+  // differently (a /var that is a symlink to /private/var) is no difference.
+  return physical === physicalPath(root, lexical)
+    ? [lexical]
+    : [lexical, physical]
+}
+
+/**
+ * Where the kernel lands walking `target` from `base`, symlinks followed as
+ * it meets them. `path.resolve` folds `..` lexically, and `fs.realpathSync`
+ * folds its argument the same way before resolving it, so neither answers
+ * this; a walk also reaches a tail that does not exist yet, which realpath
+ * cannot. A component that cannot be walked — missing, unreadable, or a loop
+ * past the hop limit — ends it, since the kernel cannot traverse one either
+ * and nothing beyond it can redirect the path; the rest is taken as written
+ * and classified by {@link gitDirTargetDenyPaths} like any other target.
+ */
+function physicalPath(base: string, target: string): string {
+  let current = path.isAbsolute(target) ? path.parse(target).root : base
+  let pending = target.split('/')
+  let hops = 0
+  while (pending.length > 0) {
+    const name = pending.shift()
+    if (name === undefined || name === '' || name === '.') continue
+    if (name === '..') {
+      current = path.dirname(current)
+      continue
+    }
+    const next = path.join(current, name)
+    let link: string | undefined
+    try {
+      if (fs.lstatSync(next).isSymbolicLink()) link = fs.readlinkSync(next)
+    } catch {
+      return path.join(next, ...pending)
+    }
+    if (link === undefined) {
+      current = next
+      continue
+    }
+    // A loop is where the walk stops, and what it hands back: the rest of
+    // the path folded past it would name a directory this cannot vouch for,
+    // while the link itself reads as unreadable and is denied whole.
+    hops += 1
+    if (hops > MAX_SYMLINK_HOPS) return next
+    // A link's own target is walked in its place, from the directory holding
+    // it unless it is absolute.
+    if (path.isAbsolute(link)) current = path.parse(link).root
+    pending = [...link.split('/'), ...pending]
+  }
+  return current
 }
 
 /**

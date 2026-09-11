@@ -99,6 +99,22 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
       `${relative(checkout, target)}/`,
     backThroughDotDot: (checkout: string, target: string): string =>
       join('..', basename(checkout), '..', relative(dirname(checkout), target)),
+    // These two build the symlink they then walk through, and return a
+    // string rather than a join(), since a `..` after a symlink is exactly
+    // what a lexical fold would take out.
+    viaSymlinkThenDotDot: (checkout: string, target: string): string => {
+      const side = join(dirname(target), 'side')
+      mkdirSync(side, { recursive: true })
+      symlinkSync(side, join(checkout, 'hop'))
+      return `hop/../${basename(target)}`
+    },
+    viaSymlinkThenTwoDotDots: (checkout: string, target: string): string => {
+      const deeper = join(dirname(target), 'side', 'deeper')
+      mkdirSync(deeper, { recursive: true })
+      mkdirSync(join(checkout, 'sub'), { recursive: true })
+      symlinkSync(deeper, join(checkout, 'sub', 'hop'))
+      return `sub/hop/../../${basename(target)}`
+    },
   }
 
   /**
@@ -519,6 +535,62 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
       target: 'gitDir',
       pointerIsASymlink: true,
     },
+    // A `..` after a symlink: the kernel follows the link first, so these
+    // land somewhere a lexical fold of the path never visits.
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenDotDot',
+      trailer: 'newline',
+      target: 'gitDir',
+    },
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenDotDot',
+      trailer: 'nineThousandNewlines',
+      target: 'gitDir',
+    },
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenDotDot',
+      trailer: 'newline',
+      target: 'realGitInit',
+    },
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenDotDot',
+      trailer: 'newline',
+      target: 'symlinkToAGitDir',
+    },
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenDotDot',
+      trailer: 'newline',
+      target: 'worktreeGitDir',
+    },
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenDotDot',
+      trailer: 'newline',
+      target: 'absent',
+    },
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenTwoDotDots',
+      trailer: 'newline',
+      target: 'gitDir',
+    },
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenTwoDotDots',
+      trailer: 'newline',
+      target: 'worktreeGitDir',
+    },
+    {
+      prefix: 'plain',
+      spelling: 'viaSymlinkThenTwoDotDots',
+      trailer: 'embeddedNul',
+      target: 'gitDir',
+    },
   ]
 
   it('resolves a corpus of pointer shapes the way git does', () => {
@@ -554,6 +626,23 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     )
     expect(verdicts.filter(v => v === 'checked').length).toBeGreaterThan(20)
   }, 300_000)
+
+  it('resolves a .. against the directory the pointer file is really in', () => {
+    // The base counts as much as the target: with the checkout reached
+    // through a symlink, `..` pops the directory the kernel is in, not the
+    // one the path was spelled from, and git follows it there.
+    const caseDir = join(root, `pointer-${caseCount++}`)
+    mkdirSync(join(caseDir, 'nested', 'checkout'), { recursive: true })
+    const checkout = join(caseDir, 'checkout-link')
+    symlinkSync(join(caseDir, 'nested', 'checkout'), checkout)
+    makeGitDir(join(caseDir, 'nested', 'target'))
+    const pointer = join(checkout, '.git')
+    writeFileSync(pointer, 'gitdir: ../target\n')
+
+    expect(assertParity('symlinked pointer directory', pointer, checkout)).toBe(
+      'checked',
+    )
+  })
 
   // Linux only: the target has to exist for git to follow it, and macOS
   // filesystems refuse a name that is not valid UTF-8 (EILSEQ on mkdir). The

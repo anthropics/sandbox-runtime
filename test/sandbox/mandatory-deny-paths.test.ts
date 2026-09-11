@@ -19,6 +19,7 @@ import {
   symlinkSync,
   existsSync,
   statSync,
+  realpathSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -1864,7 +1865,9 @@ describe('Git metadata deny paths - Unit Tests', () => {
   let dir: string
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'git-deny-paths-'))
+    // Real, so a temporary directory that is itself reached through a
+    // symlink (macOS /var) does not make every path here two paths.
+    dir = realpathSync(mkdtempSync(join(tmpdir(), 'git-deny-paths-')))
   })
 
   afterEach(() => {
@@ -2095,6 +2098,124 @@ describe('Git metadata deny paths - Unit Tests', () => {
     ])
     expect(denyPaths).not.toContain(join(main, 'hooks'))
   })
+
+  it.if(!isWindows)(
+    'denies where a .. after a symlink lands, and the lexical path too',
+    () => {
+      // checkout/hop is real/side, so the kernel reads hop/../evil as
+      // real/evil while folding it on paper gives checkout/evil. git opens
+      // the first; denying only the second leaves its hooks writable.
+      const physical = makeGitDir(join(dir, 'real', 'evil'))
+      mkdirSync(join(dir, 'real', 'side'), { recursive: true })
+      const pointer = writePointer('checkout', 'gitdir: hop/../evil\n')
+      symlinkSync(join(dir, 'real', 'side'), join(dir, 'checkout', 'hop'))
+
+      expect(gitFileDenyPaths(pointer, false)).toEqual([
+        pointer,
+        ...gitDirDenyPaths(join(dir, 'checkout', 'evil'), false),
+        ...gitDirDenyPaths(physical, false),
+      ])
+    },
+  )
+
+  it.if(!isWindows)('denies both when both are git directories', () => {
+    const lexical = makeGitDir(join(dir, 'checkout', 'evil'))
+    const physical = makeGitDir(join(dir, 'real', 'evil'))
+    mkdirSync(join(dir, 'real', 'side'), { recursive: true })
+    const pointer = writePointer('checkout', 'gitdir: hop/../evil\n')
+    symlinkSync(join(dir, 'real', 'side'), join(dir, 'checkout', 'hop'))
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(lexical, false),
+      ...gitDirDenyPaths(physical, false),
+    ])
+  })
+
+  it.if(!isWindows)('walks a chain of symlinks as the kernel does', () => {
+    // first is second, second is an absolute path to real/side/deeper.
+    const physical = makeGitDir(join(dir, 'real', 'evil'))
+    mkdirSync(join(dir, 'real', 'side', 'deeper'), { recursive: true })
+    const pointer = writePointer('checkout', 'gitdir: first/../../evil\n')
+    symlinkSync('second', join(dir, 'checkout', 'first'))
+    symlinkSync(
+      join(dir, 'real', 'side', 'deeper'),
+      join(dir, 'checkout', 'second'),
+    )
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(join(dir, 'evil'), false),
+      ...gitDirDenyPaths(physical, false),
+    ])
+  })
+
+  it.if(!isWindows)(
+    'takes the rest of a path as written past what is not there',
+    () => {
+      // The kernel cannot traverse a missing directory, so nothing after it
+      // redirects the path: gone/x is denied against being created, and so
+      // is the lexical checkout/x.
+      const pointer = writePointer('checkout', 'gitdir: hop/../x\n')
+      symlinkSync('gone/deeper', join(dir, 'checkout', 'hop'))
+
+      expect(gitFileDenyPaths(pointer, false)).toEqual([
+        pointer,
+        ...gitDirDenyPaths(join(dir, 'checkout', 'x'), false),
+        ...gitDirDenyPaths(join(dir, 'checkout', 'gone', 'x'), false),
+      ])
+    },
+  )
+
+  it.if(!isWindows)('denies what it can reach when symlinks loop', () => {
+    const pointer = writePointer('checkout', 'gitdir: loopA/../evil\n')
+    symlinkSync(join(dir, 'checkout', 'loopB'), join(dir, 'checkout', 'loopA'))
+    symlinkSync(join(dir, 'checkout', 'loopA'), join(dir, 'checkout', 'loopB'))
+
+    // Past the hop limit the walk stops on the loop itself, which is where
+    // the deny goes: the whole directory that still reads.
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(join(dir, 'checkout', 'evil'), false),
+      join(dir, 'checkout'),
+    ])
+  })
+
+  it.if(!isWindows)('resolves a commondir the same way', () => {
+    const worktreeGitDir = makeGitDir(join(dir, 'wt.git'))
+    const physical = makeGitDir(join(dir, 'real', 'common'))
+    mkdirSync(join(dir, 'real', 'side'), { recursive: true })
+    symlinkSync(join(dir, 'real', 'side'), join(worktreeGitDir, 'hop'))
+    writeFileSync(join(worktreeGitDir, 'commondir'), 'hop/../common\n')
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(worktreeGitDir, false),
+      ...gitDirDenyPaths(join(worktreeGitDir, 'common'), false),
+      ...gitDirDenyPaths(physical, false),
+    ])
+  })
+
+  it.if(!isWindows)(
+    'resolves a .. against the directory the pointer file is really in',
+    () => {
+      // The checkout is reached through a symlink, so `..` pops the
+      // directory the kernel is in and not the one the path was spelled
+      // from — nested/target, not dir/target.
+      const physical = makeGitDir(join(dir, 'nested', 'target'))
+      mkdirSync(join(dir, 'nested', 'checkout'), { recursive: true })
+      symlinkSync(join(dir, 'nested', 'checkout'), join(dir, 'link'))
+      const pointer = join(dir, 'link', '.git')
+      writeFileSync(pointer, 'gitdir: ../target\n')
+
+      expect(gitFileDenyPaths(pointer, false)).toEqual([
+        pointer,
+        ...gitDirDenyPaths(join(dir, 'target'), false),
+        ...gitDirDenyPaths(physical, false),
+      ])
+    },
+  )
 
   it('refuses to sandbox at all on a commondir past the size it reads', () => {
     // git reads commondir whole and with no bound of its own, so one this
