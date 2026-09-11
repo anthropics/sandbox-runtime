@@ -92,6 +92,11 @@ function getVendorArchitecture(): string | null {
     case 'arm64':
     case 'aarch64':
       return 'arm64'
+    case 'ppc64':
+      // Node.js reports 'ppc64' on ppc64le Linux; the BPF filter and
+      // apply-seccomp build target the ELFv2 little-endian ABI only, so the
+      // vendor directory is named explicitly.
+      return 'ppc64le'
     case 'ia32':
     case 'x86':
       // TODO: Add support for 32-bit x86 (ia32)

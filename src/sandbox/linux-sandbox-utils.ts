@@ -1765,6 +1765,8 @@ async function generateFilesystemArgs(
  * Requirements for seccomp filtering:
  * - Pre-built apply-seccomp binaries are included for x64 and ARM64
  * - Pre-generated BPF filters are included for x64 and ARM64
+ * - ppc64le (POWER, ELFv2 little-endian) is supported when apply-seccomp is
+ *   built locally via `npm run build:seccomp`
  * - Other architectures are not currently supported (no apply-seccomp binary available)
  * - To use sandboxing without Unix socket blocking on unsupported architectures,
  *   set allowAllUnixSockets: true in your configuration
