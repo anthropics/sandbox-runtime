@@ -987,6 +987,7 @@ function generateSandboxProfile({
     '  (sysctl-name "machdep.cpu.brand_string")',
     '  (sysctl-name "machdep.ptrauth_enabled")',
     '  (sysctl-name "security.mac.lockdown_mode_state")',
+    '  (sysctl-name "security.mac.sandbox.sentinel")',
     '  (sysctl-name "sysctl.proc_cputype")',
     '  (sysctl-name "vm.loadavg")',
     '  (sysctl-name-prefix "hw.optional.arm")',
