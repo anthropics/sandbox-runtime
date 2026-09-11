@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { tmpdir } from 'node:os'
+import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
@@ -441,6 +441,223 @@ function capabilityArgs(usesSeccompHelper: boolean): string[] {
   return args
 }
 
+/**
+ * Linux's per-argument cap, MAX_ARG_STRLEN: 32 pages, so 128 KiB on most
+ * kernels and up to 2 MiB with 64 KiB pages. The page size is AT_PAGESZ in
+ * /proc/self/auxv (pairs of native words); 4 KiB, the smallest, if unreadable.
+ */
+let linuxMaxArgStrlen: number | undefined
+function maxArgStrlen(): number {
+  if (linuxMaxArgStrlen === undefined) {
+    const AT_PAGESZ = 6
+    let pageSize = 4096
+    try {
+      const auxv = fs.readFileSync('/proc/self/auxv')
+      const wordBytes = /64|s390x/.test(process.arch) ? 8 : 4
+      // Buffer reads at most 6 bytes as a number; no value needed here is wider.
+      const low = Math.min(wordBytes, 6)
+      const word = (at: number): number =>
+        endianness() === 'BE'
+          ? auxv.readUIntBE(at + wordBytes - low, low)
+          : auxv.readUIntLE(at, low)
+      for (let at = 0; at + 2 * wordBytes <= auxv.length; at += 2 * wordBytes) {
+        if (word(at) === AT_PAGESZ) {
+          pageSize = word(at + wordBytes)
+          break
+        }
+      }
+    } catch {
+      // No /proc: the smallest page size only moves a profile to the file
+      // sooner than it had to.
+    }
+    linuxMaxArgStrlen = 32 * pageSize
+  }
+  return linuxMaxArgStrlen
+}
+
+/**
+ * Room left below the cap when deciding whether the profile stays on the
+ * command line: the embedder may put a prefix of its own (`exec`, `cd x &&`,
+ * an assignment) in the same argument.
+ */
+const ARG_HEADROOM_BYTES = 4096
+
+/** bwrap's cap on parsed words, the command line and `--args` file together. */
+const BWRAP_MAX_ARGS = 9000
+
+/**
+ * The fd the `--args` file is opened on: a single digit, since dash rejects
+ * multi-digit redirections, and high, since embedders hand the command low
+ * fds of their own (an extra stdio pipe, a helper as `/proc/self/fd/3`).
+ */
+const BWRAP_ARGS_FD = 9
+
+/**
+ * Linux's O_TMPFILE, which neither Node nor Bun exposes in `fs.constants`:
+ * the asm-generic __O_TMPFILE, the value on every architecture they build
+ * for Linux, together with the O_DIRECTORY the flag is defined to carry — a
+ * kernel or filesystem that does not know it therefore fails the open on the
+ * directory rather than creating a named file.
+ */
+const O_TMPFILE = 0o20000000 | fs.constants.O_DIRECTORY
+
+/**
+ * The `--args` profiles this process holds open.
+ *
+ * A profile is an unnamed file (O_TMPFILE): written at wrap time, kept open
+ * here, and opened again by the string bwrap runs through
+ * `/proc/<pid>/fd/<n>`, which is a fresh read-only description of the same
+ * inode at offset 0. Nothing is named at any point, so there is nothing for
+ * anyone to substitute between the wrap and the execution — not a sandbox
+ * that renames an ancestor of tmpdir, not a sandbox another process of the
+ * same user launched with tmpdir writable. Every sandbox this library starts
+ * has its own PID namespace and a fresh /proc, so none of them can reach
+ * /proc/<this pid> either.
+ *
+ * Fds close when the sandboxes of a batch are cleaned up, and fd numbers are
+ * reused: a string kept past its cleanup and run later opens whatever the
+ * number means by then — nothing (the redirection fails and the command does
+ * not run), something bwrap refuses, or another profile of this process,
+ * never one from outside it.
+ */
+const bwrapArgsFds: Set<number> = new Set()
+
+/** Where the string bwrap runs opens the profile held on `fd`. */
+function bwrapArgsProfilePath(fd: number): string {
+  return `/proc/${process.pid}/fd/${fd}`
+}
+
+/**
+ * Writes `mountWords` NUL-separated to an unnamed file and returns the fd it
+ * stays open on. Throws when no directory takes an O_TMPFILE file, or when
+ * the profile cannot be opened again through /proc: there is no named-file
+ * fallback, and before any of this an over-long profile failed with E2BIG
+ * anyway. The check is this process's own open; a child's can still be
+ * refused (a process made non-dumpable owns its /proc entries as root), and
+ * the string then fails in the redirection and runs no command.
+ */
+function openBwrapArgsProfile(mountWords: string[]): number {
+  const contents = mountWords.map(word => word + '\0').join('')
+  const failures: string[] = []
+  for (const dir of new Set([tmpdir(), '/dev/shm'])) {
+    let fd: number
+    try {
+      fd = fs.openSync(dir, O_TMPFILE | fs.constants.O_RDWR, 0o600)
+    } catch (error) {
+      failures.push(`${dir}: ${errorText(error)}`)
+      continue
+    }
+    try {
+      fs.writeFileSync(fd, contents)
+      // Read-only from here: this process is done writing it.
+      fs.fchmodSync(fd, 0o400)
+      // The string opens this path. Fail now, where the caller is told why,
+      // rather than when the command runs.
+      fs.closeSync(fs.openSync(bwrapArgsProfilePath(fd), fs.constants.O_RDONLY))
+    } catch (error) {
+      failures.push(`${dir}: ${errorText(error)}`)
+      fs.closeSync(fd)
+      continue
+    }
+    bwrapArgsFds.add(fd)
+    return fd
+  }
+  throw new Error(
+    `no unnamed file could be opened for it (${failures.join('; ')})`,
+  )
+}
+
+function closeBwrapArgsProfile(fd: number): void {
+  bwrapArgsFds.delete(fd)
+  try {
+    fs.closeSync(fd)
+  } catch {
+    // Already closed: nothing left to release.
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * The shell string that runs bwrap with `bwrapArgs`, which the caller runs
+ * as one argument of `sh -c`. When that would not fit the kernel's
+ * per-argument cap, the words in `mounts` (a slice of `bwrapArgs`) go to an
+ * unnamed file this process holds open (see `bwrapArgsFds`) and bwrap reads
+ * them through `--args` at the same position; the string opens that file
+ * again through /proc. Every other word, the per-command environment and the
+ * command among them, stays on the line. The result stays a simple command,
+ * so a prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
+ * Throws when the profile cannot run: too many words for bwrap, no unnamed
+ * file to put the mounts in, or a line too long even without them.
+ */
+function renderBwrapInvocation(
+  bwrapBinary: string,
+  bwrapArgs: string[],
+  mounts: { start: number; end: number },
+): string {
+  if (bwrapArgs.length > BWRAP_MAX_ARGS) {
+    throw new Error(
+      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts); reduce the number of paths the configuration expands to`,
+    )
+  }
+  const inline = quote([bwrapBinary, ...bwrapArgs])
+  const inlineBytes = Buffer.byteLength(inline, 'utf8')
+  const limit = maxArgStrlen() - 1
+  if (inlineBytes <= limit - ARG_HEADROOM_BYTES) {
+    return inline
+  }
+
+  const tooLong = `Sandbox profile is too long for the command line (${inlineBytes} bytes; past ${limit - ARG_HEADROOM_BYTES} it goes through a file)`
+  // `--args <fd>` are two more words.
+  if (bwrapArgs.length + 2 > BWRAP_MAX_ARGS) {
+    throw new Error(
+      `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts`,
+    )
+  }
+  const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
+  if (mountWords.some(word => word.includes('\0'))) {
+    // bwrap splits the file on NUL: the word would become several options.
+    throw new Error(
+      `${tooLong} and contains a path with a NUL byte, which a file of bwrap arguments cannot carry`,
+    )
+  }
+  let argsFd: number
+  try {
+    argsFd = openBwrapArgsProfile(mountWords)
+  } catch (error) {
+    throw new Error(
+      `${tooLong} and cannot be passed through a file: ${errorText(error)}`,
+    )
+  }
+  // /bin/sh opens the profile on the fd and execs bwrap, which reads it to
+  // EOF and closes it before running the command.
+  const viaArgsFile = quote([
+    '/bin/sh',
+    '-c',
+    `exec ${BWRAP_ARGS_FD}<"$1" && shift && exec "$@"`,
+    'srt-args',
+    bwrapArgsProfilePath(argsFd),
+    bwrapBinary,
+    ...bwrapArgs.slice(0, mounts.start),
+    '--args',
+    String(BWRAP_ARGS_FD),
+    ...bwrapArgs.slice(mounts.end),
+  ])
+  const viaArgsFileBytes = Buffer.byteLength(viaArgsFile, 'utf8')
+  if (viaArgsFileBytes > limit) {
+    closeBwrapArgsProfile(argsFd)
+    throw new Error(
+      `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})`,
+    )
+  }
+  logForDebugging(
+    `[Sandbox Linux] bwrap mounts moved to an unnamed file, read through ${bwrapArgsProfilePath(argsFd)} on bwrap's fd ${BWRAP_ARGS_FD}: the command line would be ${inlineBytes} bytes as one argument`,
+  )
+  return viaArgsFile
+}
+
 // Number of wrapped commands that have been generated but whose cleanup has
 // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
 // positive, because deleting a mount point file on the host while another
@@ -485,6 +702,8 @@ function registerExitCleanupHandler(): void {
  *
  * Pass `{ force: true }` to delete unconditionally — used by the process-exit
  * handler and reset() where deferral is not meaningful.
+ *
+ * Also closes the `--args` profiles the wraps of this batch opened.
  */
 export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
   if (!opts?.force) {
@@ -527,6 +746,10 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     }
   }
   bwrapMountPoints.clear()
+
+  for (const argsFd of [...bwrapArgsFds]) {
+    closeBwrapArgsProfile(argsFd)
+  }
 }
 
 /**
@@ -2017,7 +2240,9 @@ export async function wrapCommandWithSandboxLinux(
       allowGitConfig,
       abortSignal,
     )
+    const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)
+    const mounts = { start: mountsStart, end: bwrapArgs.length }
 
     // Always bind /dev
     bwrapArgs.push('--dev', '/dev')
@@ -2090,7 +2315,11 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
+    const wrappedCommand = renderBwrapInvocation(
+      bwrapPath ?? 'bwrap',
+      bwrapArgs,
+      mounts,
+    )
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
