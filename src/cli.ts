@@ -11,6 +11,10 @@ import * as fs from 'fs'
 import * as net from 'net'
 import * as path from 'path'
 import * as os from 'os'
+import { createRequire } from 'module'
+
+const require = createRequire(import.meta.url)
+const { version } = require('../package.json')
 
 /**
  * Get default config path
@@ -77,7 +81,7 @@ async function main(): Promise<void> {
     .description(
       'Run commands in a sandbox with network and filesystem restrictions',
     )
-    .version(process.env.npm_package_version || '1.0.0')
+    .version(version)
 
   // ── Windows install/uninstall ─────────────────────────────────
   // Self-elevating one-shot install (one UAC prompt). Also
