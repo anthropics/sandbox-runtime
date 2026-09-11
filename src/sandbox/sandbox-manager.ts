@@ -76,6 +76,16 @@ import {
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './windows-sandbox-utils.js'
 import {
+  resolveMxc,
+  selectWindowsBackend,
+  mxcUnavailableReason,
+  buildMxcContainerConfig,
+  encodeMxcConfig,
+  wrapCommandWithSandboxMxc,
+  type WindowsBackendSelection,
+  type MxcSpawn,
+} from './mxc-sandbox-utils.js'
+import {
   getDefaultWritePaths,
   containsGlobChars,
   removeTrailingGlobSuffix,
@@ -170,6 +180,24 @@ let windowsWfpVerified = false
 // and so reset()'s revoke/restore addresses the SAME binary the
 // grants/stamps were applied with even if `config` mutated between.
 let srtWinSpawn: SrtWinSpawn | undefined
+// Windows backend selection, decided ONCE at initialize() by running
+// `wxc-exec --probe` against the session policy (see
+// `selectWindowsBackend`): BaseContainer-capable hosts get MXC, every
+// other host gets srt-win. Not user-configurable. undefined until
+// initialize(); wrap treats undefined as srt-win.
+let windowsSelection: WindowsBackendSelection | undefined
+// Set iff selection landed on mxc: the resolved runner, the probe's
+// deny-capability bit, and the session fs sets — the SAME expansion
+// (`computeWindowsFsAccessSet`) the probe validated, applied per-exec
+// inside the MXC config instead of via session ACLs. Its presence IS
+// the "mxc selected" signal wrap dispatches on.
+let windowsMxcState:
+  | Readonly<{
+      mxc: MxcSpawn
+      denyPathsSupported: boolean
+      fsSet: ReturnType<typeof computeWindowsFsAccessSet>
+    }>
+  | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
@@ -723,6 +751,103 @@ async function initialize(
   // wrap-time) means the host gets a single actionable error before
   // any per-exec work happens, instead of exit-15 on every command.
   if (getPlatform() === 'windows') {
+    // Pick the enforcement backend for this session: MXC iff
+    // `wxc-exec --probe` — MXC's own fallback detector, run against
+    // OUR compiled policy — answers 'base-container'. Any other
+    // answer (SDK absent, runner missing, probe failure, an
+    // AppContainer tier) selects srt-win; MXC's AppContainer tiers
+    // are never used (see the mxc-sandbox-utils.ts header for why).
+    const mxcCfg = runtimeConfig.windows?.mxc
+    const mxcSpawn = resolveMxc(mxcCfg)
+    if (!mxcSpawn) {
+      windowsSelection = {
+        backend: 'srt-win',
+        reason: mxcUnavailableReason(mxcCfg),
+      }
+    } else {
+      // Compile the session policy ONCE: the probe validates the
+      // same expanded fs sets (tier selection keys on denies +
+      // SANDBOX_CAP_FS_DENY) and the same policy SHAPE — including
+      // the proxy stanza and the trust-bundle read grant — that
+      // every wrap-time config will carry, and the mxc branch below
+      // reuses the expansion for wrap-time. A probe fed a slimmer
+      // policy could answer 'base-container' for a policy the exec
+      // then widens, letting wxc-exec silently fall through to an
+      // AppContainer tier.
+      const acc = computeWindowsFsAccessSet(runtimeConfig)
+      if (mitmCA) {
+        // Trust bundle read grant — same dirname-level grant as the
+        // srt-win path pushes below.
+        //
+        // tlsTerminate caveat (manual test #4): only the env-var CA
+        // layer (OpenSSL-backed clients) is known to work under mxc.
+        // Whether schannel clients inside a BaseContainer see the
+        // invoking user's Root store is unverified — srt-win's
+        // install-time sandbox-user store write has no MXC analogue.
+        acc.grantRead.push(dirname(mitmCA.trustBundlePath))
+      }
+      try {
+        const probeCfg = await buildMxcContainerConfig({
+          command: 'exit 0',
+          // Representative proxy port: the real mux port is bound
+          // later in initialize (inside this same range on Windows),
+          // and the probe only needs the policy shape, not a live
+          // listener.
+          httpProxyPort:
+            runtimeConfig.network.allowedDomains !== undefined
+              ? DEFAULT_WINDOWS_PROXY_PORT_RANGE[0]
+              : undefined,
+          denyRead: acc.denyRead,
+          denyWrite: acc.denyWrite,
+          allowRead: acc.grantRead,
+          allowWrite: acc.grantWrite,
+          mxc: mxcSpawn,
+        })
+        windowsSelection = selectWindowsBackend(
+          mxcSpawn,
+          encodeMxcConfig(probeCfg),
+        )
+      } catch (e) {
+        // Runner exists but the SDK import/compile failed.
+        windowsSelection = {
+          backend: 'srt-win',
+          reason: `mxc sdk error: ${(e as Error).message}`,
+        }
+      }
+      if (windowsSelection.backend === 'mxc') {
+        // MXC BaseContainer: the OS applies filesystem + network
+        // policy per exec, in its own elevated context — no sandbox
+        // user, no WFP install, no session ACL stamping, nothing to
+        // verify or restore.
+        //
+        // tlsTerminate with default (unset) CA paths: the Windows
+        // persistent-CA flow is srt-win machinery — it persists into
+        // the SANDBOX USER's CurrentUser\Root via srt-win, and mxc
+        // has no sandbox user. Mint a session CA the same way
+        // macOS/Linux do; the env-var CA layer covers OpenSSL-backed
+        // clients, and schannel trust under BaseContainer is manual
+        // test #4. Created here (after selection, before capturing
+        // the fs sets) so the trust bundle's read grant lands in
+        // every wrap-time config; the probe config predates it by
+        // one readonly path, which cannot flip the tier answer
+        // (tier selection keys on denies).
+        if (useWindowsPersistentCa && tlsTerminate) {
+          mitmCA = createMitmCA(tlsTerminate)
+          acc.grantRead.push(dirname(mitmCA.trustBundlePath))
+        }
+        windowsMxcState = {
+          mxc: windowsSelection.mxc,
+          denyPathsSupported: windowsSelection.denyPathsSupported,
+          fsSet: acc,
+        }
+      }
+    }
+    logForDebugging(
+      `[Sandbox Windows] using ${windowsSelection.backend} ` +
+        `(${windowsSelection.reason})`,
+    )
+  }
+  if (getPlatform() === 'windows' && !windowsMxcState) {
     // Resolve once (stats disk); captured module-level for wrap/reset.
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
@@ -1037,7 +1162,9 @@ function checkDependenciesCommon(ripgrepConfig?: {
       srtWin = resolveSrtWin(config?.windows?.srtWin)
     } catch (e) {
       errors.push((e as Error).message)
-      return { done: { errors, warnings } }
+      return {
+        done: downgradeSrtWinProblemsIfMxcPresent({ errors, warnings }),
+      }
     }
     return {
       windows: {
@@ -1052,6 +1179,34 @@ function checkDependenciesCommon(ripgrepConfig?: {
 }
 
 /**
+ * Backend selection is decided at initialize() (async probe). When an
+ * MXC runner is present it may take over entirely — a BaseContainer
+ * host needs neither srt-win.exe nor the WFP/user install — so
+ * srt-win problems downgrade to warnings, labelled so the report is
+ * honest about the remaining risk: runner PRESENCE is not selection
+ * (a 24H2 host with the SDK installed still probes to srt-win), and
+ * on such a host initialize() hard-fails with these same messages.
+ * Hosts that need a true preflight for the mxc path can run
+ * `selectWindowsBackend` themselves.
+ */
+function downgradeSrtWinProblemsIfMxcPresent(
+  deps: SandboxDependencyCheck,
+): SandboxDependencyCheck {
+  if (resolveMxc(config?.windows?.mxc) === undefined) return deps
+  return {
+    errors: [],
+    warnings: [
+      ...deps.errors.map(
+        m =>
+          `srt-win (required unless initialize() selects the MXC ` +
+          `BaseContainer backend): ${m}`,
+      ),
+      ...deps.warnings,
+    ],
+  }
+}
+
+/**
  * Check sandbox dependencies for the current platform
  * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
  * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
@@ -1062,7 +1217,9 @@ function checkDependencies(ripgrepConfig?: {
 }): SandboxDependencyCheck {
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
-  return checkWindowsDependencies(common.windows)
+  return downgradeSrtWinProblemsIfMxcPresent(
+    checkWindowsDependencies(common.windows),
+  )
 }
 
 /**
@@ -1078,7 +1235,9 @@ async function checkDependenciesAsync(ripgrepConfig?: {
 }): Promise<SandboxDependencyCheck> {
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
-  return checkWindowsDependenciesAsync(common.windows)
+  return downgradeSrtWinProblemsIfMxcPresent(
+    await checkWindowsDependenciesAsync(common.windows),
+  )
 }
 
 /**
@@ -1818,6 +1977,61 @@ async function wrapWithSandboxArgv(
       customConfig?.credentials ?? config?.credentials,
       customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
     )
+    // MXC BaseContainer (selected at initialize() — see
+    // `windowsSelection`): the one-shot model carries the FULL policy
+    // in every exec's config, so per-exec allowRead/allowWrite are
+    // natively expressible here (srt-win throws on them — its grants
+    // are session-ACL state). Per-exec paths go through the same
+    // `expandWindowsFsPaths` chokepoint as everywhere else.
+    if (windowsMxcState) {
+      const st = windowsMxcState
+      const fsCfg = customConfig?.filesystem
+      let perExecDenyRead: string[] = []
+      let perExecDenyWrite: string[] = []
+      let perExecAllowRead: string[] = []
+      let perExecAllowWrite: string[] = []
+      if (!fsCfg?.disabled) {
+        perExecAllowRead = expandWindowsFsPaths(fsCfg?.allowRead ?? [])
+        perExecAllowWrite = expandWindowsFsPaths(fsCfg?.allowWrite ?? [])
+        perExecDenyRead = expandWindowsFsPaths([
+          ...(fsCfg?.denyRead ?? []),
+          ...getCredentialDenyReadPaths(customConfig?.credentials),
+        ])
+        perExecDenyWrite = expandWindowsFsPaths(fsCfg?.denyWrite ?? [])
+        // Session-level denies were validated by the selection probe
+        // (the tier answer accounts for SANDBOX_CAP_FS_DENY — a host
+        // without it never selects mxc when the session has denies).
+        // Per-exec denies arrive AFTER selection, so gate them here:
+        // fail closed rather than let wxc-exec silently fall through
+        // to an AppContainer tier.
+        if (
+          (perExecDenyRead.length > 0 || perExecDenyWrite.length > 0) &&
+          !st.denyPathsSupported
+        ) {
+          throw new Error(
+            `Per-exec filesystem denies are not enforceable on this ` +
+              `host: MXC BaseContainer lacks the deniedPaths ` +
+              `capability (SANDBOX_CAP_FS_DENY).`,
+          )
+        }
+      }
+      return wrapCommandWithSandboxMxc({
+        command,
+        httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
+        socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
+        proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+        setEnvVars: credentialRestrictions.setEnvVars,
+        denyRead: [...st.fsSet.denyRead, ...perExecDenyRead],
+        denyWrite: [...st.fsSet.denyWrite, ...perExecDenyWrite],
+        allowRead: [...st.fsSet.grantRead, ...perExecAllowRead],
+        allowWrite: [...st.fsSet.grantWrite, ...perExecAllowWrite],
+        cwd,
+        gitSafeDirectories: getGitSafeDirectories(customConfig),
+        caCertPath: mitmCA?.trustBundlePath,
+        binShell: parseWindowsBinShell(binShell),
+        mxc: st.mxc,
+      })
+    }
     // Per-exec FILE denies (customConfig only — the session-level
     // config's denies were already stamped at initialize()).
     // Paths go through `expandWindowsFsPaths` — the SAME
@@ -1961,9 +2175,11 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   ) {
     logForDebugging(
       `[Sandbox Windows] updateConfig: the resolved file-access set ` +
-        `(filesystem.* ∪ credentials.files) changed but the ACL ` +
-        `stamp/grant is session-wide — call reset() then initialize() ` +
-        `to apply. The previously-applied set stays in effect.`,
+        `(filesystem.* ∪ credentials.files) changed but the session ` +
+        `state is fixed at initialize() — srt-win's ACL stamp/grant ` +
+        `is session-wide, and the mxc backend's probed selection + ` +
+        `fs sets are cached — call reset() then initialize() to ` +
+        `apply. The previously-applied set stays in effect.`,
       { level: 'warn' },
     )
   }
@@ -2146,6 +2362,11 @@ async function reset(): Promise<void> {
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
+  // MXC's one-shot model applies policy per exec inside wxc-exec and
+  // leaves nothing behind, so there is no ACL/user state to unwind —
+  // only the session's selection and cached fs sets.
+  windowsSelection = undefined
+  windowsMxcState = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
@@ -2247,6 +2468,16 @@ async function reset(): Promise<void> {
   sentinelRegistry.clear()
   awsPairRegistry.clear()
   maskedFileStore.dispose()
+}
+
+/**
+ * Which Windows enforcement backend initialize() selected (and why).
+ * undefined before initialize() or on non-Windows platforms. Hosts
+ * and the Windows test suite log this so a run's enforcement path is
+ * visible at a glance.
+ */
+function getWindowsBackend(): WindowsBackendSelection | undefined {
+  return windowsSelection
 }
 
 function getSandboxViolationStore() {
@@ -2364,6 +2595,9 @@ export interface ISandboxManager {
     cwd?: string,
     options?: WrapWithSandboxOptions,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
+  // Optional so downstream ISandboxManager implementers/mocks written
+  // against older versions keep typechecking.
+  getWindowsBackend?(): WindowsBackendSelection | undefined
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
@@ -2407,6 +2641,7 @@ export const SandboxManager: ISandboxManager = {
   waitForNetworkInitialization,
   wrapWithSandbox,
   wrapWithSandboxArgv,
+  getWindowsBackend,
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,

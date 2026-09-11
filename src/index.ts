@@ -98,6 +98,24 @@ export type {
   SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
 
+// Windows MXC BaseContainer backend — selected automatically at
+// initialize() on hosts whose Windows build supports it; srt-win
+// everywhere else. Only the diagnostic/preflight surface is public
+// (parallel to the srt-win status APIs above); the policy compiler
+// and wire-format helpers are internal. See mxc-sandbox-utils.ts for
+// the selection and policy-mapping design.
+export {
+  getWxcExecPath,
+  resolveMxc,
+  probeMxc,
+  selectWindowsBackend,
+} from './sandbox/mxc-sandbox-utils.js'
+export type {
+  MxcSpawn,
+  MxcProbeResult,
+  WindowsBackendSelection,
+} from './sandbox/mxc-sandbox-utils.js'
+
 // TLS-termination CA generation/validation (mitm-ca.ts). Embedders that
 // manage CA persistence themselves (rather than relying on the Windows
 // persistent-CA default) use these to generate and validate a pair.
@@ -110,11 +128,13 @@ export type { GeneratedCa, CaPairValidation } from './sandbox/mitm-ca.js'
 export type {
   WindowsConfig,
   SrtWinConfig,
+  MxcConfig,
   GitConfig,
 } from './sandbox/sandbox-config.js'
 export {
   WindowsConfigSchema,
   SrtWinConfigSchema,
+  MxcConfigSchema,
   GitConfigSchema,
 } from './sandbox/sandbox-config.js'
 

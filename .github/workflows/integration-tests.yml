@@ -136,6 +136,17 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
+          # mxc.test.ts (the backend-agnostic boundary suite) runs in
+          # its OWN bun process, before the srt-win suites: it
+          # self-provisions srt-win and uninstalls what it installed,
+          # and the separate process keeps sandbox-manager's
+          # process-lifetime state (e.g. the once-per-process WFP
+          # verification) from leaking into winsrt's fail-closed
+          # guards. On these runners it exercises the srt-win path
+          # (the selection probe answers an AppContainer tier); on a
+          # BaseContainer-capable machine the same file verifies the
+          # mxc backend.
+          bun test test/sandbox/mxc.test.ts
           bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts
 
       - name: Cleanup srt-win state (Windows)
