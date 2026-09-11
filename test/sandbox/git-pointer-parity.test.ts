@@ -22,7 +22,7 @@ import {
   GitMetadataError,
   gitFileDenyPaths,
 } from '../../src/sandbox/mandatory-deny-paths.js'
-import { isWindows } from '../helpers/platform.js'
+import { isLinux, isWindows } from '../helpers/platform.js'
 
 /**
  * Differential tests for the `.git` pointer and `commondir` parsing in
@@ -555,40 +555,47 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     expect(verdicts.filter(v => v === 'checked').length).toBeGreaterThan(20)
   }, 300_000)
 
-  it('refuses to sandbox on a pointer whose path is not valid UTF-8', () => {
-    // The one shape with no honest answer: the bytes name a directory git
-    // opens and a JavaScript string of them names a different one, so there
-    // is nothing to put in the deny list.
-    const caseDir = join(root, `pointer-${caseCount++}`)
-    const checkout = join(caseDir, 'checkout')
-    mkdirSync(checkout, { recursive: true })
-    const target = Buffer.concat([
-      Buffer.from(join(caseDir, 'target-')),
-      Buffer.from([0xff]),
-    ])
-    mkdirSync(Buffer.concat([target, Buffer.from('/objects')]), {
-      recursive: true,
-    })
-    mkdirSync(Buffer.concat([target, Buffer.from('/refs')]), {
-      recursive: true,
-    })
-    writeFileSync(
-      Buffer.concat([target, Buffer.from('/HEAD')]),
-      'ref: refs/heads/main\n',
-    )
-    const pointer = join(checkout, '.git')
-    writeFileSync(
-      pointer,
-      Buffer.concat([Buffer.from('gitdir: '), target, Buffer.from('\n')]),
-    )
+  // Linux only: the target has to exist for git to follow it, and macOS
+  // filesystems refuse a name that is not valid UTF-8 (EILSEQ on mkdir). The
+  // refusal itself is platform-independent and covered everywhere by the
+  // unit case in mandatory-deny-paths.test.ts, which needs no such target.
+  it.if(isLinux)(
+    'refuses to sandbox on a pointer whose path is not valid UTF-8',
+    () => {
+      // The one shape with no honest answer: the bytes name a directory git
+      // opens and a JavaScript string of them names a different one, so there
+      // is nothing to put in the deny list.
+      const caseDir = join(root, `pointer-${caseCount++}`)
+      const checkout = join(caseDir, 'checkout')
+      mkdirSync(checkout, { recursive: true })
+      const target = Buffer.concat([
+        Buffer.from(join(caseDir, 'target-')),
+        Buffer.from([0xff]),
+      ])
+      mkdirSync(Buffer.concat([target, Buffer.from('/objects')]), {
+        recursive: true,
+      })
+      mkdirSync(Buffer.concat([target, Buffer.from('/refs')]), {
+        recursive: true,
+      })
+      writeFileSync(
+        Buffer.concat([target, Buffer.from('/HEAD')]),
+        'ref: refs/heads/main\n',
+      )
+      const pointer = join(checkout, '.git')
+      writeFileSync(
+        pointer,
+        Buffer.concat([Buffer.from('gitdir: '), target, Buffer.from('\n')]),
+      )
 
-    // git follows it, so anything short of refusing would be a deny list
-    // for a directory other than the one whose hooks run.
-    expect(
-      runGit(checkout, ['rev-parse', '--absolute-git-dir']),
-    ).not.toBeUndefined()
-    expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
-  })
+      // git follows it, so anything short of refusing would be a deny list
+      // for a directory other than the one whose hooks run.
+      expect(
+        runGit(checkout, ['rev-parse', '--absolute-git-dir']),
+      ).not.toBeUndefined()
+      expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+    },
+  )
 
   /** The same shapes in a linked worktree's `commondir`, which has no prefix. */
   interface CommonDirCase {
