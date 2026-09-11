@@ -32,6 +32,7 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
+  GitMetadataError,
   gitDirDenyPaths,
   gitFileDenyPaths,
   submoduleGitDirs,
@@ -187,6 +188,20 @@ describe.if(isSupportedPlatform)(
       writeFileSync(
         join(TEST_DIR, 'wt-checkout', '.git'),
         `gitdir: ${join(TEST_DIR, '.git', 'worktrees', 'wt')}`,
+      )
+      // A checkout whose .git pointer carries 9,000 newline bytes after the
+      // path. git strips them and follows the pointer, so its target needs
+      // the same denies an unpadded pointer's does.
+      mkdirSync(join(TEST_DIR, 'padded-target', 'hooks'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'padded-target', 'HEAD'),
+        'ref: refs/heads/main',
+      )
+      writeFileSync(join(TEST_DIR, 'padded-target', 'config'), ORIGINAL_CONTENT)
+      mkdirSync(join(TEST_DIR, 'padded-checkout'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'padded-checkout', '.git'),
+        `gitdir: ${join(TEST_DIR, 'padded-target')}${'\n'.repeat(9000)}`,
       )
       // A nested .claude/commands one level down (a name spanning two
       // segments), within reach only of a deeper scan.
@@ -853,6 +868,44 @@ describe.if(isSupportedPlatform)(
 
           expect(result.success).toBe(false)
           expect(readFileSync('.git', 'utf8')).toBe(original)
+        })
+      })
+
+      describe('from a checkout whose pointer is padded with newlines', () => {
+        // git strips them from the end of the file and follows the pointer,
+        // so reading less of the file than git does would leave the target's
+        // hooks and config writable.
+        const opts = { allowOnly: [TEST_DIR] }
+        beforeEach(() => {
+          process.chdir(join(TEST_DIR, 'padded-checkout'))
+        })
+        afterEach(() => {
+          rmSync(join(TEST_DIR, 'padded-checkout', 'notes.txt'), {
+            force: true,
+          })
+        })
+
+        it("blocks the padded pointer's target, as an unpadded one's", async () => {
+          const config = join(TEST_DIR, 'padded-target', 'config')
+          const denied = await runSandboxedWrite(config, MODIFIED_CONTENT, opts)
+          expect(denied.success).toBe(false)
+          expect(readFileSync(config, 'utf8')).toBe(ORIGINAL_CONTENT)
+
+          const hook = join(TEST_DIR, 'padded-target', 'hooks', 'pre-commit')
+          const hookWrite = await runSandboxedWrite(
+            hook,
+            MODIFIED_CONTENT,
+            opts,
+          )
+          expect(hookWrite.success).toBe(false)
+          expectNotWritten(hook)
+
+          const control = await runSandboxedWrite(
+            'notes.txt',
+            MODIFIED_CONTENT,
+            opts,
+          )
+          expect(control.success).toBe(true)
         })
       })
 
@@ -1825,11 +1878,16 @@ describe('Git metadata deny paths - Unit Tests', () => {
     return gitDir
   }
 
-  function makePointer(checkout: string, target: string): string {
+  /** A checkout whose `.git` file holds exactly `contents`. */
+  function writePointer(checkout: string, contents: string | Buffer): string {
     mkdirSync(join(dir, checkout), { recursive: true })
     const pointer = join(dir, checkout, '.git')
-    writeFileSync(pointer, `gitdir: ${target}\n`)
+    writeFileSync(pointer, contents)
     return pointer
+  }
+
+  function makePointer(checkout: string, target: string): string {
+    return writePointer(checkout, `gitdir: ${target}\n`)
   }
 
   it('denies commondir in every git directory, and config.worktree with config', () => {
@@ -1886,15 +1944,169 @@ describe('Git metadata deny paths - Unit Tests', () => {
     ])
   })
 
-  it('ignores a .git file longer than a path git would follow', () => {
+  it('follows a pointer padded with the newline bytes git strips', () => {
     const gitDir = makeGitDir(join(dir, 'gitdir'))
-    mkdirSync(join(dir, 'checkout'), { recursive: true })
-    const pointer = join(dir, 'checkout', '.git')
-    writeFileSync(pointer, `gitdir: ${gitDir}${' '.repeat(9000)}\n`)
+    const pointer = writePointer(
+      'checkout',
+      `gitdir: ${gitDir}${'\n'.repeat(9000)}`,
+    )
 
-    // git trims only newline bytes, so the padded path is not one it follows
-    // either — and the file is never read whole on the way to finding out.
+    // git strips them from the end of the whole file, so this is a pointer
+    // it follows; reading less of the file than git does would leave the
+    // target's hooks and config out of the deny list.
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it('counts trailing spaces as part of the path, as git does', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const padded = `${gitDir}${' '.repeat(200)}`
+    const pointer = writePointer('checkout', `gitdir: ${padded}\n`)
+
+    // Nothing is trimmed but the newline, so the pointer names a directory
+    // that does not exist — denied against being created, not confused for
+    // the real git directory next to it.
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(padded, false),
+    ])
+  })
+
+  it('follows a pointer to a path no file can occupy nowhere', () => {
+    // Past the filesystem's name limit: git's own stat of it fails, and a
+    // sandboxed command cannot create a git directory there either, so
+    // there is nothing below the pointer to deny.
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer(
+      'checkout',
+      `gitdir: ${gitDir}${' '.repeat(9000)}\n`,
+    )
+
     expect(gitFileDenyPaths(pointer, false)).toEqual([pointer])
+  })
+
+  it('follows a pointer of the largest size git accepts, and no larger', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const maxSize = 1024 * 1024
+    const head = `gitdir: ${gitDir}`
+
+    const atBound = writePointer(
+      'checkout',
+      head + '\n'.repeat(maxSize - head.length),
+    )
+    expect(statSync(atBound).size).toBe(maxSize)
+    expect(gitFileDenyPaths(atBound, false)).toEqual([
+      atBound,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+
+    // One byte more is a .git file git refuses outright, so it leads nowhere.
+    const pastBound = writePointer(
+      'past-bound',
+      head + '\n'.repeat(maxSize + 1 - head.length),
+    )
+    expect(statSync(pastBound).size).toBe(maxSize + 1)
+    expect(gitFileDenyPaths(pastBound, false)).toEqual([pastBound])
+  })
+
+  it.if(!isWindows)('takes a path that spans lines whole, as git does', () => {
+    // Only the newline bytes at the END of the file are stripped, so one in
+    // the middle is part of the directory name.
+    const gitDir = makeGitDir(join(dir, 'two\nlines'))
+    const pointer = writePointer('checkout', `gitdir: ${gitDir}\n`)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it('stops the path at the first NUL byte, as a C string does', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer(
+      'checkout',
+      `gitdir: ${gitDir}\0/../elsewhere\n`,
+    )
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it('strips a CRLF line ending', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer('checkout', `gitdir: ${gitDir}\r\n`)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it('refuses to sandbox at all on a path that is not valid UTF-8', () => {
+    // Decoded, those bytes name a different directory than git opens, so
+    // there is no deny list to be had — and sandboxing without one would
+    // leave the hooks git runs writable.
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer(
+      'checkout',
+      Buffer.concat([
+        Buffer.from(`gitdir: ${gitDir}`),
+        Buffer.from([0xff]),
+        Buffer.from('\n'),
+      ]),
+    )
+
+    expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+  })
+
+  it("follows a commondir padded past the pointer's own bound", () => {
+    const main = makeGitDir(join(dir, 'main.git'))
+    const worktreeGitDir = makeGitDir(join(dir, 'main.git', 'worktrees', 'wt'))
+    writeFileSync(
+      join(worktreeGitDir, 'commondir'),
+      `../..${'\n'.repeat(9000)}`,
+    )
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(worktreeGitDir, false),
+      ...gitDirDenyPaths(main, false),
+    ])
+  })
+
+  it('does not trim a commondir, which git reads byte for byte', () => {
+    const main = makeGitDir(join(dir, 'main.git'))
+    const worktreeGitDir = makeGitDir(join(dir, 'main.git', 'worktrees', 'wt'))
+    // A leading space makes this a relative path beginning with a space,
+    // which is where git looks too — not the main git directory.
+    writeFileSync(join(worktreeGitDir, 'commondir'), ` ${main}\n`)
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    const denyPaths = gitFileDenyPaths(pointer, false)
+    expect(denyPaths).toEqual([
+      pointer,
+      ...gitDirDenyPaths(worktreeGitDir, false),
+      ...gitDirDenyPaths(join(worktreeGitDir, ` ${main}`), false),
+    ])
+    expect(denyPaths).not.toContain(join(main, 'hooks'))
+  })
+
+  it('refuses to sandbox at all on a commondir past the size it reads', () => {
+    // git reads commondir whole and with no bound of its own, so one this
+    // large still names the git directory whose hooks a commit here runs.
+    const worktreeGitDir = makeGitDir(join(dir, 'wt.git'))
+    writeFileSync(
+      join(worktreeGitDir, 'commondir'),
+      '../main.git'.padEnd(1024 * 1024 + 1, '\n'),
+    )
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
   })
 
   it.if(!isWindows)(
