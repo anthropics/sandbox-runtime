@@ -215,7 +215,7 @@ child.on('exit', async code => {
 })
 ```
 
-**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you *execute* is not the command the invocation *represents* (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
+**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you _execute_ is not the command the invocation _represents_ (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
 
 ```typescript
 const wrapped = await SandboxManager.wrapWithSandbox(
@@ -226,7 +226,10 @@ const wrapped = await SandboxManager.wrapWithSandbox(
   { commandId: invocationId, commandText: rawCommand },
 )
 // ... run it ...
-const annotated = SandboxManager.annotateStderrWithSandboxFailures(invocationId, stderr)
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(
+  invocationId,
+  stderr,
+)
 ```
 
 #### Available exports
@@ -652,12 +655,12 @@ Filesystem restrictions are enforced at the OS level:
 
 **Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas.
 
-**Note (Linux, large profiles):** The wrapped string runs as one argument of `sh -c`, which Linux caps at 32 pages (128 KiB with 4 KiB pages). A profile that would not fit, with 4 KiB to spare for a prefix of the caller's own, has its mounts written to a file that bubblewrap reads through `--args`. The string then reads `/bin/sh -c '…' srt-args <file> bwrap … --args 9 …`: still a simple command, which opens the file on fd 9, unlinks it and runs bubblewrap, so it can be run once. The environment and the command stay on the command line; the file holds mount paths only.
+**Note (Linux, large profiles):** The wrapped string runs as one argument of `sh -c`, which Linux caps at 32 pages (128 KiB with 4 KiB pages). A profile that would not fit, with 4 KiB to spare for a prefix of the caller's own, has its mounts written to an unnamed file (`O_TMPFILE`) that the wrapping process holds open and bubblewrap reads through `--args`. The string then reads `/bin/sh -c '…' srt-args /proc/<wrapping pid>/fd/<n> bwrap … --args 9 …`: still a simple command, which opens the profile on fd 9 and runs bubblewrap. The environment and the command stay on the command line; the file holds mount paths only.
 
-- The file sits in a per-process directory, `<os.tmpdir()>/.srt-bwrap-args-*`, that every profile of the process binds read-only over itself, so a command the process sandboxed cannot rewrite a pending profile. It can read one: the mount paths of a command that is wrapped but not yet started are visible to the process's other sandboxes.
-- A sandbox with tmpdir writable sees that directory as an entry it cannot delete. `rm -rf "$TMPDIR"/*` skips it (the name starts with a dot); `find "$TMPDIR" -mindepth 1 -delete` does not.
-- The directory is created once. If it cannot be created, or is later removed or replaced (an age-based tmp cleaner), profiles that fit are unaffected and an over-long one is refused with an error until the process restarts: a sandbox started earlier would not have a new directory read-only, and the library cannot tell whether it is still running.
-- Not covered: a sandbox started by another process of the same user with tmpdir writable never bound this directory, and can swap a pending file so that the command runs with bubblewrap options of its choosing. The same holds when `os.tmpdir()` lies below a directory a sandbox may write (`TMPDIR=/tmp/work` with `/tmp` writable): a sandboxed command can rename that parent and put its own directory at the path. Where profiles can be over-long, keep tmpdir out of `allowWrite`, which closes both, or at least point `TMPDIR` at a directory that is itself an `allowWrite` entry, which closes the second.
+- The profile is never given a name, so nothing can be put in its place between the wrap and the execution — not a command the process sandboxed, not a sandbox another process of the same user started with tmpdir writable, not a rename of a directory above `TMPDIR`. Every sandbox this library starts has its own PID namespace and a fresh `/proc`, so none of them can reach `/proc/<wrapping pid>` either.
+- Not covered: another process of the same user running outside a sandbox can read a pending profile through `/proc`. It can already read the wrapping process's memory, so this gives it nothing new.
+- The string must be run while the process that produced it is alive, and before the runtime cleans up after that command (`cleanupAfterCommand()`), which is when the profile is released.
+- The profile needs a directory that takes an `O_TMPFILE` file — `os.tmpdir()`, else `/dev/shm` — and a readable `/proc/self/fd`. Without them an over-long profile is refused at wrap time with the reason; there is no fallback to a named file. Profiles that fit the command line do not use any of this.
 - bubblewrap parses at most 9000 arguments (about 3000 mounts). A profile past that, or a command too long for one argument by itself, fails at wrap time with an error.
 
 ### Mandatory Deny Paths (Auto-Protected Files)
