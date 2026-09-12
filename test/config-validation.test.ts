@@ -350,6 +350,74 @@ describe('Config Validation', () => {
     }
   })
 
+  describe('deny globs with a trailing slash', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    // A slashed deny glob compiles to a pattern only a path ending in '/'
+    // could satisfy, so it denies nothing on either backend — fail-open,
+    // and with no diagnostic beyond a debug line about zero expansions.
+    test.each([['/data/*/'], ['/data/**/'], ['/data/[ab]/'], ['/data/?/']])(
+      'rejects denyRead %s',
+      spelling => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          filesystem: { ...base.filesystem, denyRead: [spelling] },
+        })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.message).toContain(spelling)
+          expect(result.error.issues[0]?.message).toContain('denies nothing')
+          expect(result.error.issues[0]?.path).toEqual([
+            'filesystem',
+            'denyRead',
+            0,
+          ])
+        }
+      },
+    )
+
+    test('rejects denyWrite with a trailing slash on a glob', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: { ...base.filesystem, denyWrite: ['/data/*/'] },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toContain('/data/*')
+      }
+    })
+
+    test('accepts the slash-free glob spellings it points at', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: {
+          ...base.filesystem,
+          denyRead: ['/data/*', '/data/**'],
+          denyWrite: ['/data/*'],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    // Non-glob spellings are canonicalised at the sandbox chokepoint, and an
+    // allow that matches nothing fails closed — neither is rejected here.
+    test('leaves trailing-slash literals and allow globs alone', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: {
+          denyRead: ['/data/secrets/'],
+          allowRead: ['/data/*/'],
+          allowWrite: ['/work/*/'],
+          denyWrite: ['/data/secrets/'],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+  })
+
   describe('bwrapPath / socatPath', () => {
     const base = {
       network: { allowedDomains: [], deniedDomains: [] },

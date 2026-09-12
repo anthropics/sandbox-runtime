@@ -370,6 +370,8 @@ Paths support git-style glob patterns on macOS, similar to `.gitignore` syntax:
 - `?` - Matches any single character except `/` (e.g., `file?.txt` matches `file1.txt`)
 - `[abc]` - Matches any character in the set (e.g., `file[0-9].txt` matches `file3.txt`)
 
+A glob must not end in `/`: the trailing slash is compiled into the pattern, and no path the pattern is matched against ends in one, so the rule matches nothing. `denyRead`/`denyWrite` reject such an entry at config validation rather than emit a deny that denies nothing — write `/data/*` (the matching entries and everything inside them) or `/data/**`.
+
 Examples:
 
 - `"allowWrite": ["src/"]` - Allow write to entire `src/` directory

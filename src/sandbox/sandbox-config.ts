@@ -14,6 +14,7 @@ import {
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import { parseAddressRange } from './address.js'
+import { containsGlobChars } from './sandbox-utils.js'
 
 /**
  * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
@@ -889,6 +890,29 @@ export const NetworkConfigSchema = z.object({
 })
 
 /**
+ * A deny entry spelled as a glob must not end in `/`. The trailing slash is
+ * compiled into the pattern — the macOS regex then requires a match ending
+ * in a slash, and Linux tests the same shape against the paths it walks
+ * while expanding the glob — and no path either backend matches against ends
+ * in one, so the rule matches nothing and the deny is silently inert. An
+ * inert deny is fail-open, so it is rejected here instead of emitted. A
+ * slashed *allow* glob is inert in exactly the same way, but an allow that
+ * matches nothing fails closed, so `allowRead`/`allowWrite` keep taking it.
+ */
+const denyPathSchema = filesystemPathSchema.superRefine((val, ctx) => {
+  if (!val.endsWith('/') || !containsGlobChars(val)) return
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    message:
+      `Deny glob "${val}" ends in "/", so it denies nothing: the trailing ` +
+      `slash becomes part of the compiled pattern and no path it is tested ` +
+      `against ends in one. Write "${val.replace(/\/+$/, '')}" — a deny ` +
+      `covers every match and everything inside it — or add a "**" segment ` +
+      `to match at any depth.`,
+  })
+})
+
+/**
  * Filesystem configuration schema for validation
  */
 export const FilesystemConfigSchema = z.object({
@@ -903,7 +927,7 @@ export const FilesystemConfigSchema = z.object({
         'is trusted with full host filesystem access. Network and credential-env restrictions ' +
         'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',
     ),
-  denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
+  denyRead: z.array(denyPathSchema).describe('Paths denied for reading'),
   allowRead: z
     .array(filesystemPathSchema)
     .optional()
@@ -915,7 +939,7 @@ export const FilesystemConfigSchema = z.object({
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),
   denyWrite: z
-    .array(filesystemPathSchema)
+    .array(denyPathSchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
   allowGitConfig: z
     .boolean()
