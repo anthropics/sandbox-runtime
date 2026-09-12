@@ -255,11 +255,12 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     expect(command.indexOf(`--bind ${X} ${X}`, lastRoBind)).toBe(-1)
   })
 
-  // A deny bind kept BECAUSE an allowed write path restored it under a
-  // read-deny tmpfs is buried again when that tmpfs is re-applied over a
-  // write-deny bind of an ancestor, and the write path is re-bound writable
-  // underneath it. The re-application has to emit those deny binds again.
-  describe('write-deny binds survive a re-applied read-deny tmpfs', () => {
+  // A write-deny bind under a read-deny tmpfs is kept at emission BECAUSE an
+  // allowed write path restored it. Re-applying that tmpfs over a write-deny
+  // bind of an ancestor buries the deny bind again, so the re-application
+  // must restore what it covers read-only: everything under it is inside
+  // that write deny.
+  describe('a re-applied read-deny tmpfs restores read-only', () => {
     let RO: string // read-denied dir inside PROJ
     let W: string // allowed write path inside RO
     let SECRET: string // write-denied file inside W
@@ -272,20 +273,32 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       writeFileSync(SECRET, 'HOST\n')
     })
 
-    it('emits the deny bind after the last writable re-bind of its allow path', async () => {
+    it('restores the allow path read-only after the re-applied tmpfs', async () => {
       const command = await wrap([PROJ, SECRET], [RO], [AREA, W])
 
-      const lastWriteReBind = command.lastIndexOf(`--bind ${W} ${W}`)
-      expect(lastWriteReBind).toBeGreaterThan(-1)
-      expect(
-        command.lastIndexOf(`--ro-bind ${SECRET} ${SECRET}`),
-      ).toBeGreaterThan(lastWriteReBind)
+      const lastTmpfs = command.lastIndexOf(`--tmpfs ${RO} `)
+      expect(lastTmpfs).toBeGreaterThan(-1)
+      expect(command.lastIndexOf(`--ro-bind ${W} ${W}`)).toBeGreaterThan(
+        lastTmpfs,
+      )
+      expect(command.indexOf(`--bind ${W} ${W}`, lastTmpfs)).toBe(-1)
+    })
+
+    it('leaves the allow path writable when no write deny re-exposes the tmpfs', async () => {
+      // Control: without a deny on PROJ nothing re-applies the tmpfs, so the
+      // first pass's writable re-bind of W is the last word and only SECRET
+      // keeps its own deny bind.
+      const command = await wrap([SECRET], [RO], [AREA, W])
+
+      const lastTmpfs = command.lastIndexOf(`--tmpfs ${RO} `)
+      expect(command.indexOf(`--bind ${W} ${W}`, lastTmpfs)).toBeGreaterThan(-1)
+      expect(command).toContain(`--ro-bind ${SECRET} ${SECRET}`)
     })
 
     // `echo BOOTED` guards every runtime case below: a bwrap start-up abort
     // would otherwise read as "the write was blocked".
     it.skipIf(!BWRAP_CAN_NAMESPACE)(
-      'blocks the write-denied file and nothing else under the allow path',
+      'blocks writes under the allow path while its contents stay readable',
       async () => {
         const sibling = join(W, 'notes.txt')
         writeFileSync(sibling, 'notes\n')
@@ -293,6 +306,29 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
         const result = spawnSync(
           await wrap(
             [PROJ, SECRET],
+            [RO],
+            [AREA, W],
+            `sh -c 'echo BOOTED; echo x >> ${SECRET}; echo y >> ${sibling}; cat ${sibling}'`,
+          ),
+          { shell: true, encoding: 'utf8', timeout: 15000, cwd: BASE },
+        )
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(result.stdout).toContain('notes')
+        expect(readFileSync(SECRET, 'utf8')).toBe('HOST\n')
+        expect(readFileSync(sibling, 'utf8')).toBe('notes\n')
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'still writes under the allow path when no write deny re-exposes the tmpfs',
+      async () => {
+        const sibling = join(W, 'notes.txt')
+        writeFileSync(sibling, 'notes\n')
+
+        const result = spawnSync(
+          await wrap(
+            [SECRET],
             [RO],
             [AREA, W],
             `sh -c 'echo BOOTED; echo x >> ${SECRET}; echo y >> ${sibling}'`,
@@ -335,15 +371,14 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
     // Absent deny paths are listed FIRST in the two cases below, so their
     // placeholder mount points are created while the allow path is still
-    // writable and bwrap starts instead of aborting. Re-emitting a
-    // placeholder over the host file or directory bwrap left behind must not
-    // hit the creat() trap either.
+    // writable and bwrap starts instead of aborting. A placeholder the
+    // re-application buries is covered by the read-only restore above it.
     it.skipIf(!BWRAP_CAN_NAMESPACE)(
-      'keeps the /dev/null stub of an absent deny path in force',
+      'keeps an absent deny path uncreatable through its /dev/null stub',
       async () => {
         // bwrap leaves the mount point behind as a mode-444 file on the host,
-        // so the write has to be preceded by a chmod: without the stub back
-        // on top, its owner may widen the mode and write through it.
+        // so the write has to be preceded by a chmod: on a writable restore
+        // its owner may widen the mode and write through it.
         const absent = join(W, '.secret')
 
         const result = spawnSync(
@@ -362,7 +397,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     )
 
     it.skipIf(!BWRAP_CAN_NAMESPACE)(
-      'keeps the empty-dir placeholder of an absent deny path in force',
+      'keeps an absent deny path uncreatable through its empty-dir placeholder',
       async () => {
         const placeholder = join(W, '.cfg')
         const absent = join(placeholder, 'deep', 'x')
