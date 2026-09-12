@@ -220,12 +220,14 @@ describe.if(isSupportedPlatform)(
       platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
       Object.defineProperty(process, 'platform', { value: 'darwin' })
 
-      const config = loadConfig(SETTINGS_FILE)
-      if (!config) {
-        throw new Error(`Settings file failed to load: ${SETTINGS_FILE}`)
+      const loaded = loadConfig(SETTINGS_FILE)
+      if (loaded.kind !== 'ok') {
+        throw new Error(
+          `Settings file failed to load (${loaded.kind}): ${SETTINGS_FILE}`,
+        )
       }
       await SandboxManager.reset()
-      await SandboxManager.initialize(config)
+      await SandboxManager.initialize(loaded.config)
     })
 
     afterAll(async () => {
@@ -319,12 +321,14 @@ describe.if(isMacOS)('credential deny on macOS (sandbox-exec)', () => {
       }),
     )
 
-    const config = loadConfig(SETTINGS_FILE)
-    if (!config) {
-      throw new Error(`Settings file failed to load: ${SETTINGS_FILE}`)
+    const loaded = loadConfig(SETTINGS_FILE)
+    if (loaded.kind !== 'ok') {
+      throw new Error(
+        `Settings file failed to load (${loaded.kind}): ${SETTINGS_FILE}`,
+      )
     }
     await SandboxManager.reset()
-    await SandboxManager.initialize(config)
+    await SandboxManager.initialize(loaded.config)
   })
 
   afterAll(async () => {

@@ -174,12 +174,15 @@ srt --debug curl https://example.com
 srt --settings /path/to/srt-settings.json npm install
 ```
 
-The settings file is optional — with none at `~/.srt-settings.json`, `srt`
-runs with built-in defaults that restrict nothing. A settings file that _is_
-there but cannot be read or does not validate is an error: `srt` says so and
-exits rather than falling back to those defaults, so one bad entry cannot
-quietly discard every other rule in the file. The same goes for a file named
-with `--settings`.
+The settings file is optional — with no file at `~/.srt-settings.json`, `srt`
+runs with built-in defaults: no network access, no writes outside the default
+write paths, and unrestricted reads. A settings file that _is_ there but is
+empty, cannot be read, or does not validate is an error: `srt` says so and
+exits rather than falling back to those defaults, which are a different
+config rather than a weaker one — falling back would drop the file's
+`denyRead`, `allowRead` and credential rules along with everything else it
+said. The same goes for a file named with `--settings`, which must also
+exist.
 
 #### Updating the config while the command runs: `--control-fd`
 

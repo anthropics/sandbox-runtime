@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -14,14 +14,18 @@ function getCliPath(): string {
 /**
  * Run the CLI with given arguments and return the result
  */
-function runCli(args: string[], options?: { input?: string; debug?: boolean }) {
+function runCli(
+  args: string[],
+  options?: { input?: string; debug?: boolean; home?: string },
+) {
   const result = spawnSync('bun', ['run', getCliPath(), ...args], {
     encoding: 'utf-8',
     input: options?.input,
     env: {
       ...process.env,
-      // Use a non-existent config to get default behavior
-      HOME: '/tmp/cli-test-nonexistent',
+      // Default to a non-existent config to get default behavior; `home`
+      // points the default settings path at a directory the test set up.
+      HOME: options?.home ?? '/tmp/cli-test-nonexistent',
       // Enable SRT_DEBUG if debug option is set
       ...(options?.debug ? { SRT_DEBUG: 'true' } : {}),
     },
@@ -147,7 +151,8 @@ describe('CLI', () => {
         'should-not-run',
       ])
       expect(result.status).toBe(1)
-      expect(result.stderr).toContain('Could not load settings')
+      expect(result.stderr).toContain('does not exist')
+      expect(result.stderr).toContain('--settings asked for')
       expect(result.stdout).not.toContain('should-not-run')
     })
 
@@ -164,7 +169,7 @@ describe('CLI', () => {
           'should-not-run',
         ])
         expect(result.status).toBe(1)
-        expect(result.stderr).toContain('Could not load settings')
+        expect(result.stderr).toContain('does not hold a valid config')
         expect(result.stdout).not.toContain('should-not-run')
       } finally {
         rmSync(dir, { recursive: true, force: true })
@@ -175,42 +180,76 @@ describe('CLI', () => {
   describe('default settings file error handling', () => {
     // Same rule for the default ~/.srt-settings.json: it is optional, but
     // one that is there and does not load must not fall through to the
-    // built-in default config, which restricts nothing — a single bad entry
-    // would otherwise discard every rule in the file.
-    test('refuses to run when the default settings file fails validation', () => {
+    // built-in defaults, which are a different config rather than a weaker
+    // one — falling back would drop every rule the file did hold.
+    function withHome(run: (home: string) => void): void {
       const home = mkdtempSync(join(tmpdir(), 'srt-cli-home-'))
-      // Valid JSON, but missing required network/filesystem fields
-      writeFileSync(
-        join(home, '.srt-settings.json'),
-        JSON.stringify({ network: {} }),
-      )
       try {
-        const result = spawnSync(
-          'bun',
-          ['run', getCliPath(), 'echo', 'should-not-run'],
-          { encoding: 'utf-8', env: { ...process.env, HOME: home } },
-        )
-        expect(result.status).toBe(1)
-        expect(result.stderr).toContain('does not hold a valid config')
-        expect(result.stdout).not.toContain('should-not-run')
+        run(home)
       } finally {
         rmSync(home, { recursive: true, force: true })
       }
+    }
+
+    test('refuses to run when the default settings file fails validation', () => {
+      withHome(home => {
+        // Valid JSON, but missing required network/filesystem fields
+        writeFileSync(
+          join(home, '.srt-settings.json'),
+          JSON.stringify({ network: {} }),
+        )
+        const result = runCli(['echo', 'should-not-run'], { home })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('does not hold a valid config')
+        // Names the key that failed, so the file can be fixed from the
+        // message alone.
+        expect(result.stderr).toContain('filesystem')
+        expect(result.stdout).not.toContain('should-not-run')
+      })
+    })
+
+    test('refuses to run when the default settings file is empty', () => {
+      withHome(home => {
+        // A file truncated to nothing: falling back to the defaults here
+        // would drop rules that were in force before the truncation.
+        writeFileSync(join(home, '.srt-settings.json'), '')
+        const result = runCli(['echo', 'should-not-run'], { home })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('is empty')
+        expect(result.stdout).not.toContain('should-not-run')
+      })
+    })
+
+    test('refuses to run when the default settings file is whitespace only', () => {
+      withHome(home => {
+        writeFileSync(join(home, '.srt-settings.json'), '   \n\t  ')
+        const result = runCli(['echo', 'should-not-run'], { home })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('is empty')
+        expect(result.stdout).not.toContain('should-not-run')
+      })
+    })
+
+    test('refuses to run when the default settings path cannot be read', () => {
+      withHome(home => {
+        // A directory where the file should be: readFileSync fails with
+        // EISDIR, which is not "no settings file" and must not be treated
+        // as one.
+        mkdirSync(join(home, '.srt-settings.json'))
+        const result = runCli(['echo', 'should-not-run'], { home })
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('could not be read')
+        expect(result.stderr).toContain('EISDIR')
+        expect(result.stdout).not.toContain('should-not-run')
+      })
     })
 
     test('runs with the built-in defaults when there is no settings file', () => {
-      const home = mkdtempSync(join(tmpdir(), 'srt-cli-home-'))
-      try {
-        const result = spawnSync(
-          'bun',
-          ['run', getCliPath(), 'echo', 'no-settings-file'],
-          { encoding: 'utf-8', env: { ...process.env, HOME: home } },
-        )
+      withHome(home => {
+        const result = runCli(['echo', 'no-settings-file'], { home })
         expect(result.status).toBe(0)
         expect(result.stdout).toContain('no-settings-file')
-      } finally {
-        rmSync(home, { recursive: true, force: true })
-      }
+      })
     })
   })
 

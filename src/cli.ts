@@ -20,19 +20,24 @@ function getDefaultConfigPath(): string {
 }
 
 /**
- * Whether there is a settings file at this path at all. loadConfig() returns
- * null both for a file that is not there and for one that is there but does
- * not load, and only the first of those is a reason to fall back to the
- * built-in defaults.
+ * Exit rather than run under the built-in defaults, naming what that would
+ * cost. The defaults are not a weaker version of any settings file - they
+ * are a different config, so falling back to them drops rules rather than
+ * relaxing them.
  */
-function settingsFilePresent(filePath: string): boolean {
-  try {
-    fs.readFileSync(filePath)
-    return true
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== 'ENOENT'
-  }
+function refuseSettings(reason: string, lost: string): never {
+  console.error(`Error: ${reason}`)
+  console.error(
+    `Refusing to run with the built-in defaults, which would drop ${lost}.`,
+  )
+  process.exit(1)
 }
+
+/**
+ * What a fall-back to the built-in defaults costs when the file is there.
+ */
+const FILE_RULES =
+  "this file's rules (its denyRead, allowRead and credential entries included)"
 
 /**
  * Create a minimal default config if no config file exists
@@ -277,35 +282,39 @@ async function main(): Promise<void> {
 
           // Load config from file
           const configPath = options.settings || getDefaultConfigPath()
-          let runtimeConfig = loadConfig(configPath)
-
-          if (!runtimeConfig) {
-            // An explicitly requested settings file must load successfully —
-            // silently falling back to the default config would run the
-            // command without the restrictions the caller asked for.
-            if (options.settings) {
-              console.error(
-                `Error: Could not load settings from ${configPath} (missing, unreadable, or invalid). ` +
-                  'Refusing to run with the default config.',
+          const loaded = loadConfig(configPath)
+          let runtimeConfig: SandboxRuntimeConfig
+          switch (loaded.kind) {
+            case 'ok':
+              runtimeConfig = loaded.config
+              break
+            case 'missing':
+              // A settings file that is not there is the documented way to
+              // ask for the built-in defaults. One the caller named with
+              // --settings is not: those are rules it asked to have applied.
+              if (options.settings) {
+                refuseSettings(
+                  `${configPath} does not exist.`,
+                  'the rules --settings asked for',
+                )
+              }
+              logForDebugging(
+                `No config found at ${configPath}, using default config`,
               )
-              process.exit(1)
-            }
-            // The default settings file is optional, but one that is there
-            // and does not load is not the same as not having one: the
-            // default config denies nothing, so falling back to it would
-            // let a single bad entry discard every rule in the file.
-            // loadConfig has already said what is wrong with it.
-            if (settingsFilePresent(configPath)) {
-              console.error(
-                `Error: ${configPath} exists but does not hold a valid config. ` +
-                  'Refusing to run with the default config, which restricts nothing.',
+              runtimeConfig = getDefaultConfig()
+              break
+            case 'empty':
+              // A file truncated to nothing is exactly the case where
+              // falling back would drop rules that were in force yesterday.
+              refuseSettings(
+                `${configPath} is empty. Delete it, or put a config in it.`,
+                FILE_RULES,
               )
-              process.exit(1)
-            }
-            logForDebugging(
-              `No config found at ${configPath}, using default config`,
-            )
-            runtimeConfig = getDefaultConfig()
+              break
+            case 'unreadable':
+            case 'invalid':
+              refuseSettings(loaded.reason, FILE_RULES)
+              break
           }
 
           // Windows: srtWin.path is required (no ambient vendor
