@@ -72,10 +72,18 @@ export interface SubmoduleScan {
   /** The submodule git directories. */
   gitDirs: string[]
   /**
-   * Directories the walk could not see through: one it could not list, and
-   * the one it stops at on reaching {@link MAX_SUBMODULE_WALK_DEPTH}. What
-   * lies under them is unknown, so they are denied whole rather than left
-   * writable with a git directory possibly inside them.
+   * Directories the walk could not see through: what lies under them is
+   * unknown, so they are denied whole rather than left writable with a git
+   * directory possibly inside. Three things produce one — a directory the walk
+   * could not list, an entry it could not stat, and, once per branch that
+   * reaches {@link MAX_SUBMODULE_WALK_DEPTH}, the `modules` beneath the
+   * directory it stopped at (or that directory itself, when it is not a git
+   * directory). For the first two the recorded path is the deepest ancestor
+   * this process can reach, which can be the `.git/modules` root itself.
+   *
+   * A whole-directory deny is read-only for everything beneath it, a
+   * submodule's `objects`, `refs` and `index` included, so git writes inside a
+   * tree that trips one stop working.
    */
   unreadableDirs: string[]
 }
@@ -330,7 +338,10 @@ function gitDirTargetDenyPaths(
  *
  * Narrower than {@link GIT_DIR_MARKERS}, which the `.git/modules` walk uses:
  * a directory here is named by file content a sandboxed command can write, so
- * accepting `config` or `hooks` would let that content aim a deny anywhere.
+ * accepting `config` or `hooks` would let that content aim a deny at any
+ * directory at all. The walk reaches only what lies under `.git/modules` —
+ * except through a symlinked entry there, which a command able to write under
+ * it can aim at one directory of its choosing.
  */
 function gitDirKind(dir: string): GitDirKind {
   let entries: fs.Dirent[]
