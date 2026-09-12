@@ -470,26 +470,29 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(secIdx).toBeGreaterThan(pubIdx)
   })
 
-  it('denies beneath a writable root, and pins nothing under it', async () => {
+  it('denies beneath a writable root, and pins writably above its bind', async () => {
     // '/' is a legal allowOnly entry, and the allow loop binds it writable,
     // so the denies inside it apply: a `root + '/'` prefix test spells '//'
     // and matches nothing, which silently dropped every deny and every
     // mandatory deny over a root already bound read-write.
     //
-    // The pins are the one consumer that cannot follow. They are spliced in
-    // beneath every other mount, and this root's own recursive --bind / / is
-    // one of them, landing on top: a directory pinned under it is not a
-    // mountpoint and renames as if unpinned. They are skipped instead of
-    // emitted as arguments that promise an EBUSY that does not happen.
+    // The pins cannot sit beneath that root's own recursive --bind / /,
+    // which would bury them, nor be read-only on top of it, which would make
+    // the tree read-only. They are writable self-binds after the allow binds.
     const wrapped = await wrapCommandWithSandboxLinux({
       ...baseParams,
       writeConfig: { allowOnly: ['/'], denyWithinAllow: [] },
     })
     const cwd = process.cwd()
-    expect(wrapped).toContain('--bind / /')
+    const rootBind = wrapped.indexOf('--bind / /')
+    const parentPin = wrapped.indexOf(`--bind ${dirname(cwd)} ${dirname(cwd)}`)
+    const cwdPin = wrapped.indexOf(`--bind ${cwd} ${cwd}`)
+    expect(rootBind).toBeGreaterThan(-1)
     expect(wrapped).toContain(` ${join(cwd, '.bashrc')}`)
     expect(wrapped).not.toContain(`--ro-bind ${dirname(cwd)} ${dirname(cwd)}`)
     expect(wrapped).not.toContain(`--ro-bind ${cwd} ${cwd}`)
+    expect(parentPin).toBeGreaterThan(rootBind)
+    expect(cwdPin).toBeGreaterThan(parentPin)
   })
 
   it('stubs no absent path after a read-only root when the root is both allowed and denied', async () => {

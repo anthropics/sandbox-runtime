@@ -703,6 +703,55 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     },
   )
 
+  it('pins writably above the allow binds under a "/" write root', async () => {
+    mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
+
+    const command = await wrap({ allowWrite: ['/'] })
+
+    // Read-only pins would make the tree read-only, and pins beneath the
+    // root's own recursive bind would be buried by it.
+    const gitPin = `--bind ${join(PROJECT, '.git')} ${join(PROJECT, '.git')}`
+    expect(command).not.toContain(
+      `--ro-bind ${join(PROJECT, '.git')} ${join(PROJECT, '.git')}`,
+    )
+    expect(command.indexOf(gitPin)).toBeGreaterThan(
+      command.indexOf('--bind / /'),
+    )
+    // Other write roots are pinned too there: their own allow bind is buried
+    // by the root's, so it no longer makes them mountpoints.
+    expect(command.lastIndexOf(`--bind ${PROJECT} ${PROJECT}`)).toBeGreaterThan(
+      command.indexOf('--bind / /'),
+    )
+    // The deny bind still lands on top of the pins.
+    expect(
+      command.indexOf(
+        `--ro-bind ${join(PROJECT, '.git', 'hooks')} ${join(PROJECT, '.git', 'hooks')}`,
+      ),
+    ).toBeGreaterThan(command.indexOf(gitPin))
+  })
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'blocks renaming .git aside under a "/" write root too',
+    async () => {
+      mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
+
+      const command = await wrap(
+        { allowWrite: ['/'] },
+        `cd ${PROJECT} && echo work > newfile.txt && (mv .git .git-moved && mkdir .git && echo planted > .git/config) 2>&1; echo DONE`,
+      )
+      const result = run(command)
+
+      expect(result.stdout).toContain('DONE')
+      expect(result.stderr ?? '').not.toContain('bwrap:')
+      expect(result.stdout).toMatch(/busy/i)
+      expect(existsSync(join(PROJECT, 'newfile.txt'))).toBe(true)
+      expect(existsSync(join(PROJECT, '.git-moved'))).toBe(false)
+      expect(readFileSync(join(PROJECT, '.git', 'config'), 'utf8')).toBe(
+        '[core]\n',
+      )
+    },
+  )
+
   it.if(BWRAP_CAN_NAMESPACE)(
     'blocks rmdir of the pinned directory',
     async () => {
