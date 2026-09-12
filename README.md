@@ -498,7 +498,9 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
 or add an AppArmor profile that grants `userns` to the relevant binaries.
 
-**Running as root:** a caller with euid 0 needs `CAP_SETFCAP`. Bubblewrap's user namespace maps the caller's uid, and Linux 5.12+ lets a namespace map uid 0 only when its creator held that capability; the seccomp isolation layer's nested namespace has the same requirement. Without it every sandboxed command fails with `Operation not permitted` while writing a uid map. Grant the capability to the calling process — it is in Docker's default set, but `capsh --drop=cap_setfcap` and a tightened `CapabilityBoundingSet=` remove it — or run as a non-root user, for which none of this applies.
+**Running as root:** a caller with euid 0 needs `CAP_SETFCAP` in its capability bounding set. Bubblewrap's user namespace maps the caller's uid, and Linux 5.12 — and the older distribution kernels that backported the change — lets a namespace map uid 0 only when its creator held that capability; the seccomp isolation layer's nested namespace has the same requirement. Without it every sandboxed command fails with `Operation not permitted` while writing a uid map, and `initialize()` refuses to start once bubblewrap has confirmed it. Grant the capability to the calling process — it is in Docker's default set, but `capsh --drop=cap_setfcap` and a tightened `CapabilityBoundingSet=` remove it — or run as a non-root user, for which none of this applies. The bounding set is what counts, because bubblewrap is reached by `execve` and the kernel recomputes a root caller's permitted set from it.
+
+Prefer a non-root caller where there is the choice. Under the seccomp isolation layer a root caller's command still holds a full capability set inside the helper's nested user namespace, which is identity-mapped to the caller's uid 0; what holds the filesystem policy there is that the nested namespace's copies of the mounts are locked, not the command's capabilities. A non-root caller's command holds no capabilities at all.
 
 **Optional Linux dependencies (for seccomp fallback):**
 

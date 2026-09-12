@@ -842,13 +842,17 @@ int main(int argc, char *argv[]) {
      * and there are no file capabilities to raise. For a uid-0 caller the
      * kernel's root rule recomputes the permitted set from the bounding
      * set, which unshare(CLONE_NEWUSER) above reset to full, so the worker
-     * holds a full set in the nested namespace — the ambient clear and
-     * PR_SET_NO_NEW_PRIVS do not change that. Emptying the sets with capset
-     * before exec would not either, for the same reason: exec recomputes
-     * them. Only dropping the bounding set, or the no-root securebits,
-     * would. What keeps the deny mounts in place for that worker is not its
-     * capabilities but that the nested mount namespace's copies of them are
-     * locked, having been created across a user-namespace boundary. */
+     * holds a full set in the nested namespace — the ambient clear and the
+     * PR_SET_NO_NEW_PRIVS the worker sets below do not change that, because
+     * the worker already holds those capabilities and so gains nothing at
+     * exec. Measured (Linux 6.12): capset()ing the three sets empty before
+     * that exec does leave the worker with none, because it turns the root
+     * rule's recompute into a gain and NO_NEW_PRIVS clamps a gain back to
+     * what was held; dropping the bounding set has the same effect. Neither
+     * is done here. What keeps the deny mounts in place for that worker is
+     * not its capabilities but that the nested mount namespace's copies of
+     * them are locked, having been created across a user-namespace
+     * boundary. */
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
     }
