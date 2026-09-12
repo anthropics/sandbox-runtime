@@ -12,6 +12,7 @@ import {
   decodeSandboxedCommand,
   containsGlobChars,
   globToRegex,
+  isStrictlyUnder as isPathStrictlyUnder,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -201,8 +202,10 @@ function denyGlobCovers(denyRegex: RegExp, entry: PathEntry): boolean {
 
 /** Is `entry`'s region strictly inside the literal directory `dir`? */
 function isStrictlyUnder(entry: PathEntry, dir: string): boolean {
-  const probe = entry.glob ? globSamplePath(entry.path) : entry.path
-  return probe.startsWith(dir === '/' ? '/' : dir + '/') && probe !== dir
+  return isPathStrictlyUnder(
+    entry.glob ? globSamplePath(entry.path) : entry.path,
+    dir,
+  )
 }
 
 /**
@@ -270,7 +273,7 @@ function lateReadDenyFilters(resolved: ResolvedReadConfig): {
   const literalAllowDirs = resolved.allows.filter(a => !a.glob).map(a => a.path)
   for (const deny of resolved.denies) {
     if (!deny.glob) {
-      if (literalAllowDirs.some(a => deny.path.startsWith(a + '/'))) {
+      if (literalAllowDirs.some(a => isStrictlyUnder(deny, a))) {
         filters.push(denyPathFilter(deny.path))
       }
       continue
