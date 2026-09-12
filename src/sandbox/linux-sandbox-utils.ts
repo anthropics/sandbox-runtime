@@ -3,7 +3,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
@@ -400,62 +400,86 @@ async function linuxGetMandatoryDenyPaths(
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
-const CAP_SETFCAP = 31
+export const CAP_SETFCAP = 31
 
-// This process's permitted capability set, read once. Nothing in the process
-// changes it, and without this the read is a synchronous open of
-// /proc/self/status on the path of every wrapped command. `null` records a
-// read or parse failure, which counts as holding nothing.
-let permittedCapabilities: bigint | null | undefined
+// This process's bounding set unioned with its inheritable set, read once —
+// see processHasBoundingCapability for why those two. Only prctl(CAPBSET_DROP)
+// and capset move them and this library calls neither, and without the memo
+// the read is a synchronous open of /proc/self/status on the path of every
+// wrapped command. Only a successful read is stored, so a transient failure
+// does not latch "no capabilities" for the life of the process.
+let boundingCapabilities: bigint | undefined
+let capabilityReadFailureLogged = false
 
 /**
- * Whether this process holds `cap` in its permitted set (Linux).
+ * Whether this process holds `cap` in its bounding or inheritable set (Linux).
  *
- * The permitted set, not the effective one: a process may hold a capability
- * permitted and leave it lowered, and bwrap raises what it is given back
- * into its effective set before it unshares, so reading CapEff would refuse
- * a caller that can in fact supply the capability.
+ * bwrap is reached by execve, and for a euid-0 caller the kernel recomputes
+ * the new permitted set from the bounding and inheritable sets, discarding
+ * what the caller itself had permitted. Those two sets are therefore what
+ * decides which capabilities bwrap holds when it writes its uid map; CapPrm
+ * and CapEff do not, and for any process itself reached by exec as root they
+ * merely repeat the union.
  */
-function processHasPermittedCapability(cap: number): boolean {
-  if (permittedCapabilities === undefined) {
-    permittedCapabilities = null
+export function processHasBoundingCapability(cap: number): boolean {
+  let bits = boundingCapabilities
+  if (bits === undefined) {
+    let failure = 'has no CapBnd or CapInh line'
     try {
-      const status = fs.readFileSync('/proc/self/status', 'utf8')
-      const capPrm = status.match(/^CapPrm:\s*([0-9a-fA-F]+)\s*$/m)
-      if (capPrm) {
-        permittedCapabilities = BigInt('0x' + capPrm[1])
-      } else {
+      bits = boundingCapabilitiesFromStatus(
+        fs.readFileSync('/proc/self/status', 'utf8'),
+      )
+      boundingCapabilities = bits
+    } catch (e) {
+      failure = `could not be read (${String(e)})`
+    }
+    if (bits === undefined) {
+      if (!capabilityReadFailureLogged) {
+        capabilityReadFailureLogged = true
         logForDebugging(
-          '[Sandbox Linux] /proc/self/status has no CapPrm line - assuming no capabilities',
+          `[Sandbox Linux] /proc/self/status ${failure} - assuming this process holds no capabilities`,
           { level: 'warn' },
         )
       }
-    } catch (e) {
-      logForDebugging(
-        `[Sandbox Linux] Cannot read /proc/self/status (${String(e)}) - assuming no capabilities`,
-        { level: 'warn' },
-      )
+      return false
     }
   }
-  return (
-    permittedCapabilities !== null &&
-    ((permittedCapabilities >> BigInt(cap)) & 1n) === 1n
-  )
+  return ((bits >> BigInt(cap)) & 1n) === 1n
+}
+
+/**
+ * The capability set an execve gives a euid-0 caller's child, parsed out of a
+ * `/proc/<pid>/status`: CapBnd unioned with CapInh. `undefined` when either
+ * line is absent. CapPrm and CapEff are deliberately not consulted — see
+ * processHasBoundingCapability.
+ */
+export function boundingCapabilitiesFromStatus(
+  status: string,
+): bigint | undefined {
+  const bounding = status.match(/^CapBnd:\s*([0-9a-fA-F]+)\s*$/m)
+  const inheritable = status.match(/^CapInh:\s*([0-9a-fA-F]+)\s*$/m)
+  return bounding && inheritable
+    ? BigInt('0x' + bounding[1]) | BigInt('0x' + inheritable[1])
+    : undefined
 }
 
 /**
  * The bwrap capability list. Always `--cap-drop ALL`, which for a non-root
  * caller is bwrap's default anyway. `--cap-add CAP_SETFCAP` for the whole
  * bwrap invocation — the outer shell and the two socat relays hold it too —
- * when the caller is uid 0, the seccomp helper is in use and the caller
- * holds the capability: the helper's nested user namespace maps uid 0, which
- * kernels 5.12+ allow only from a creator holding CAP_SETFCAP. Under the
- * helper a uid-0 caller's command therefore has a full set inside that
- * nested namespace, which is identity-mapped to the caller's uid 0, and the
- * filesystem policy there rests on the nested namespace's mount copies being
- * locked. Without the helper (`allowAllUnixSockets`, or no usable helper
- * binary) the command runs in bwrap's own namespaces and `--cap-drop ALL` is
- * what stops it unmounting a deny.
+ * when the caller is uid 0, the seccomp helper is in use and the capability
+ * survives into bwrap: the helper's nested user namespace maps uid 0, which
+ * Linux 5.12 and the distribution kernels that backported it allow only from
+ * a creator holding CAP_SETFCAP. Under the helper a uid-0 caller's command
+ * therefore has a full set inside that nested namespace, which is
+ * identity-mapped to the caller's uid 0, and the filesystem policy there
+ * rests on the nested namespace's mount copies being locked. Without the
+ * helper (`allowAllUnixSockets`, or no usable helper binary) the command runs
+ * in bwrap's own namespaces and `--cap-drop ALL` is what stops it unmounting
+ * a deny.
+ *
+ * Pure: `hasSetfcap` is decided by the caller, which is also where the
+ * missing-capability case is reported once per process.
  */
 export function capabilityArgs({
   euid,
@@ -468,23 +492,27 @@ export function capabilityArgs({
 }): string[] {
   const args = ['--cap-drop', 'ALL']
   if (euid !== 0) return args
-  if (!hasSetfcap) {
-    logForDebugging(CAP_SETFCAP_MISSING_WARNING, { level: 'warn' })
-    return args
-  }
+  if (!hasSetfcap) return args
   if (usesSeccompHelper) args.push('--cap-add', 'CAP_SETFCAP')
   return args
 }
 
-// A uid-0 caller without CAP_SETFCAP cannot sandbox anything: bwrap's own
-// --unshare-user writes a uid map containing uid 0, and so does the seccomp
-// helper's nested namespace, and kernels 5.12+ refuse both unless the
-// namespace's creator held CAP_SETFCAP. allowAllUnixSockets does not avoid
-// it — it only drops the helper, not bwrap's own user namespace.
-const CAP_SETFCAP_MISSING_WARNING =
-  '[Sandbox Linux] Running as uid 0 without CAP_SETFCAP - bubblewrap cannot map uid 0 ' +
-  'into a user namespace on Linux 5.12+, so every sandboxed command fails writing a uid ' +
-  'map ("Operation not permitted"). Grant CAP_SETFCAP to this process, or run as a non-root user.'
+// Latch for the predicted case: once per process, not once per command.
+let setfcapMissingLogged = false
+
+// A uid-0 caller whose bounding set lacks CAP_SETFCAP cannot sandbox
+// anything: bwrap's own --unshare-user writes a uid map containing uid 0, and
+// so does the seccomp helper's nested namespace, and a kernel that enforces
+// the requirement refuses both unless the namespace's creator held the
+// capability. allowAllUnixSockets does not avoid it — it only drops the
+// helper, not bwrap's own user namespace. Worded for both the predicted case
+// (the debug warning on the path of a wrapped command) and the confirmed one
+// (checkLinuxDependencies, after bubblewrap has actually refused).
+export const CAP_SETFCAP_MISSING_MESSAGE =
+  "running as uid 0 without CAP_SETFCAP in this process's capability bounding set - on " +
+  'kernels that enforce the CAP_SETFCAP requirement for mapping uid 0 into a user namespace ' +
+  '(Linux 5.12 and distribution backports) every sandboxed command fails while writing a uid ' +
+  'map ("Operation not permitted"). Grant CAP_SETFCAP to this process, or run as a non-root user'
 
 // Number of wrapped commands that have been generated but whose cleanup has
 // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
@@ -640,11 +668,13 @@ export function checkLinuxDependencies(
 
   // An explicit override is a directive, not a hint — if it doesn't exist,
   // surface that rather than silently falling back to PATH.
+  let usableBwrap: string | null = null
   if (bwrapPath) {
-    if (!isExecutable(bwrapPath))
-      errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
-  } else if (whichSync('bwrap') === null) {
-    errors.push('bubblewrap (bwrap) not installed')
+    if (isExecutable(bwrapPath)) usableBwrap = bwrapPath
+    else errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
+  } else {
+    usableBwrap = whichSync('bwrap')
+    if (usableBwrap === null) errors.push('bubblewrap (bwrap) not installed')
   }
 
   if (socatPath) {
@@ -661,17 +691,78 @@ export function checkLinuxDependencies(
     warnings.push('seccomp not available - unix socket access not restricted')
   }
 
-  if (
-    process.geteuid?.() === 0 &&
-    !processHasPermittedCapability(CAP_SETFCAP)
-  ) {
-    warnings.push(
-      'running as uid 0 without CAP_SETFCAP - bubblewrap cannot map uid 0 into a user ' +
-        'namespace, so sandboxed commands will fail (grant CAP_SETFCAP, or run as a non-root user)',
-    )
-  }
+  const uid0Error = uid0SandboxError({
+    euid: process.geteuid?.(),
+    hasSetfcap: processHasBoundingCapability(CAP_SETFCAP),
+    bwrap: usableBwrap,
+  })
+  if (uid0Error !== null) errors.push(uid0Error)
 
   return { warnings, errors }
+}
+
+/**
+ * Predict, then confirm. The prediction — uid 0 with no CAP_SETFCAP to hand
+ * to bwrap — is exact about the capability but not about the kernel, so ask
+ * bubblewrap itself before failing the caller's initialize(). An error, not a
+ * warning: if it holds, every sandboxed command fails.
+ *
+ * `bwrap === null` skips the probe: a missing or unusable bubblewrap is
+ * already its own dependency error, and a second one about capabilities would
+ * only misdirect.
+ */
+export function uid0SandboxError({
+  euid,
+  hasSetfcap,
+  bwrap,
+}: {
+  euid: number | undefined
+  hasSetfcap: boolean
+  bwrap: string | null
+}): string | null {
+  if (euid !== 0 || hasSetfcap || bwrap === null) return null
+  const refusal = probeUid0UserNamespace(bwrap)
+  if (refusal === null) return null
+  return refusal === ''
+    ? CAP_SETFCAP_MISSING_MESSAGE
+    : `${CAP_SETFCAP_MISSING_MESSAGE} (bubblewrap: ${refusal})`
+}
+
+// One probe result per bwrap binary: whether a uid-0 map is refused is a
+// property of the kernel and the binary, not of the moment. Keyed by path so
+// a caller that passes an explicit bwrapPath is not answered for another one.
+const uid0UserNamespaceProbes = new Map<string, string | null>()
+
+/**
+ * Run `bwrap --unshare-user --dev-bind / / true` once and report whether this
+ * kernel actually refuses to map uid 0. `null` means it does not, so there is
+ * nothing to report; otherwise bubblewrap's own first stderr line, or the
+ * empty string when the probe could not be run at all and the prediction
+ * stands unaided.
+ */
+function probeUid0UserNamespace(bwrap: string): string | null {
+  const cached = uid0UserNamespaceProbes.get(bwrap)
+  if (cached !== undefined) return cached
+
+  const probe = spawnSync(
+    bwrap,
+    ['--unshare-user', '--dev-bind', '/', '/', 'true'],
+    {
+      timeout: 5000,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      encoding: 'utf8',
+    },
+  )
+  const refusal =
+    probe.error === undefined && probe.status === 0
+      ? null
+      : ((probe.stderr ?? '')
+          .split('\n')
+          .map(line => line.trim())
+          .find(line => line.length > 0)
+          ?.slice(0, 200) ?? '')
+  uid0UserNamespaceProbes.set(bwrap, refusal)
+  return refusal
 }
 
 /**
@@ -1827,7 +1918,8 @@ async function generateFilesystemArgs(
  *
  * CALLER OBLIGATION: the euid and capability decisions behind the returned
  * string are made here, in the process that builds it, so the string must be
- * run by a process with the same euid and capabilities.
+ * run by a process with the same euid and the same capability bounding and
+ * inheritable sets.
  */
 export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
@@ -2093,11 +2185,19 @@ export async function wrapCommandWithSandboxLinux(
     // EUID != 0. A root parent in an unprivileged container (Docker's
     // default: EUID=0 without CAP_SYS_ADMIN) would otherwise try a direct
     // clone and EPERM.
+    const euid = process.geteuid?.()
+    const hasSetfcap = processHasBoundingCapability(CAP_SETFCAP)
+    if (euid === 0 && !hasSetfcap && !setfcapMissingLogged) {
+      setfcapMissingLogged = true
+      logForDebugging(`[Sandbox Linux] ${CAP_SETFCAP_MISSING_MESSAGE}`, {
+        level: 'warn',
+      })
+    }
     bwrapArgs.push(
       '--unshare-user',
       ...capabilityArgs({
-        euid: process.geteuid?.(),
-        hasSetfcap: processHasPermittedCapability(CAP_SETFCAP),
+        euid,
+        hasSetfcap,
         usesSeccompHelper: applySeccompPrefix !== undefined,
       }),
     )
