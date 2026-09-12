@@ -418,7 +418,7 @@ function ensureEmptyMountSourceDir(): string {
       if (
         stat.isDirectory() &&
         stat.uid === process.getuid?.() &&
-        (stat.mode & 0o777) === 0o700 &&
+        (stat.mode & 0o077) === 0 &&
         fs.readdirSync(emptyMountSourceDir).length === 0
       ) {
         return emptyMountSourceDir
@@ -426,8 +426,15 @@ function ensureEmptyMountSourceDir(): string {
     } catch {
       // Gone, or no longer inspectable: make a new one below.
     }
+    logForDebugging(
+      `[Sandbox Linux] Not reusing the empty-directory mount source, it is gone or no longer our own empty directory: ${emptyMountSourceDir}`,
+    )
   }
   emptyMountSourceDir = fs.mkdtempSync(path.join(tmpdir(), 'claude-empty-'))
+  // mkdtemp asks for 0700 but the umask applies, so under `umask 0200` the
+  // directory lands on 0500. Set the mode here rather than let the check
+  // above reject the directory this call has just made.
+  fs.chmodSync(emptyMountSourceDir, 0o700)
   return emptyMountSourceDir
 }
 
@@ -592,10 +599,22 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
       logForDebugging(
         `[Sandbox Linux] Cleaned up the empty-directory mount source: ${emptyMountSourceDir}`,
       )
-    } catch {
-      // Already gone, not empty, or not ours any more: leave it alone.
+      emptyMountSourceDir = undefined
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOTEMPTY') {
+        logForDebugging(
+          `[Sandbox Linux] Left the empty-directory mount source behind, something has written into it: ${emptyMountSourceDir}`,
+        )
+      }
+      // Forget the path only when there is nothing left to remove. ENOTEMPTY,
+      // EACCES and EBUSY (a forced cleanup while a live sandbox still pins the
+      // source) leave it ours to try again; the revalidation on next use
+      // decides whether it can be reused.
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        emptyMountSourceDir = undefined
+      }
     }
-    emptyMountSourceDir = undefined
   }
 }
 
