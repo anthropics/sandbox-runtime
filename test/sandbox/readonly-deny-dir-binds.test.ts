@@ -348,6 +348,58 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       expect(countBinds(command, '--ro-bind', '/dev/null', mcp)).toBe(1)
     })
 
+    it('skips every per-path deny when "/" is denied whole, and brings them back on the first veto', async () => {
+      // allowOnly ['/'] and denyWithinAllow ['/'] and nothing else: '/' is
+      // recorded as a covering deny directory, and nothing vetoes it — no
+      // allowed write path lies strictly beneath it, and there is no
+      // read-deny tmpfs at all. Every other deny, bind and stub alike, is
+      // then skipped as already covered, and the deny-side --ro-bind / /
+      // after the allow's writable --bind / / is the whole protection.
+      // readConfig is undefined rather than { denyOnly: [] } so the implicit
+      // /etc/ssh/ssh_config.d deny cannot make the verdict host-dependent.
+      const bashrc = join(BASE, '.bashrc')
+      const hooks = join(BASE, '.git', 'hooks')
+      const mcp = join(BASE, '.mcp.json')
+      writeFileSync(bashrc, '')
+      mkdirSync(hooks, { recursive: true })
+      const wrapRoot = (
+        allowOnly: string[],
+        readConfig: { denyOnly: string[] } | undefined,
+      ) =>
+        wrapCommandWithSandboxLinux({
+          command: 'echo hello',
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig: { allowOnly, denyWithinAllow: ['/'] },
+        })
+
+      const rootDeniedWhole = await wrapRoot(['/'], undefined)
+
+      expect(countBinds(rootDeniedWhole, '--bind', '/', '/')).toBe(1)
+      // Two: the base root mount, then the deny bind of '/'.
+      expect(countBinds(rootDeniedWhole, '--ro-bind', '/', '/')).toBe(2)
+      expect(rootDeniedWhole.lastIndexOf('--ro-bind / /')).toBeGreaterThan(
+        rootDeniedWhole.indexOf('--bind / /'),
+      )
+      expect(countBinds(rootDeniedWhole, '--ro-bind', bashrc, bashrc)).toBe(0)
+      expect(countBinds(rootDeniedWhole, '--ro-bind', hooks, hooks)).toBe(0)
+      expect(countBinds(rootDeniedWhole, '--ro-bind', '/dev/null', mcp)).toBe(0)
+      expect(rootDeniedWhole).not.toContain('claude-empty-')
+
+      // A second allow entry vetoes '/' — it lies strictly beneath it — and
+      // so does a single read-deny directory, the re-application's trigger.
+      // Either way every per-path deny comes back.
+      const secondAllow = await wrapRoot(['/', AREA], undefined)
+      expect(countBinds(secondAllow, '--ro-bind', bashrc, bashrc)).toBe(1)
+      expect(countBinds(secondAllow, '--ro-bind', '/dev/null', mcp)).toBe(1)
+
+      const readDenied = join(BASE, 'ro')
+      mkdirSync(readDenied)
+      const oneReadDeny = await wrapRoot(['/'], { denyOnly: [readDenied] })
+      expect(countBinds(oneReadDeny, '--ro-bind', bashrc, bashrc)).toBe(1)
+      expect(countBinds(oneReadDeny, '--ro-bind', '/dev/null', mcp)).toBe(1)
+    })
+
     it('masks a symlinked ancestor of a deny path', async () => {
       // A self-referential link: resolveSymlinkedDenyPath gives up and the
       // fail-closed branch masks the symlink component, so it cannot be
