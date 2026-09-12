@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -88,6 +89,29 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
   const countOccurrences = (haystack: string, needle: string): number =>
     haystack.split(needle).length - 1
 
+  const RUN_TIMEOUT_MS = 15000
+
+  // Runs `payload` in the wrapped sandbox behind an `echo BOOTED`, so a bwrap
+  // start-up abort cannot read as "the payload was blocked".
+  async function runSandboxed(
+    denyPaths: string[],
+    readDenyPaths: string[],
+    allowPaths: string[],
+    payload: string,
+  ) {
+    const result = spawnSync(
+      await wrap(
+        denyPaths,
+        readDenyPaths,
+        allowPaths,
+        `sh -c 'echo BOOTED; ${payload}'`,
+      ),
+      { shell: true, encoding: 'utf8', timeout: RUN_TIMEOUT_MS, cwd: BASE },
+    )
+    expect(result.stdout).toContain('BOOTED')
+    return result
+  }
+
   it('binds the denied allow-root once and skips the existing file beneath it', async () => {
     // allowOnly=[proj], denyWithinAllow=[proj, proj/sub/file]: the directory
     // deny equals the allow root and must still be emitted; the file is a
@@ -101,19 +125,15 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     // holds: the file reads, and a write through it fails and changes
     // nothing on the host.
     if (BWRAP_CAN_NAMESPACE) {
-      const run = (wrapped: string) =>
-        spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-          cwd: BASE,
-        })
-      const read = run(await wrap([PROJ, FILE], [], [PROJ], `cat ${FILE}`))
+      const read = await runSandboxed([PROJ, FILE], [], [PROJ], `cat ${FILE}`)
       expect(read.status).toBe(0)
       expect(read.stdout).toContain('{}')
 
-      const write = run(
-        await wrap([PROJ, FILE], [], [PROJ], `sh -c 'echo x >> ${FILE}'`),
+      const write = await runSandboxed(
+        [PROJ, FILE],
+        [],
+        [PROJ],
+        `echo x >> ${FILE}`,
       )
       expect(write.status).not.toBe(0)
       expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
@@ -144,9 +164,9 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
   })
 
   it('keeps the descendant bind when an allowed write path sits strictly beneath the covering dir (veto)', async () => {
-    // Same veto as the stub skip: with an allowWrite under PROJ the denyRead
-    // re-application machinery could re-open part of the subtree, so the
-    // covering bind is not trusted and the explicit deny keeps its own.
+    // Same veto as the stub skip: an allowWrite under PROJ is bound writable
+    // before the covering bind, so that bind is not the only mount claiming
+    // the subtree and the explicit deny keeps its own.
     const nestedAllow = join(PROJ, 'w')
     mkdirSync(nestedAllow)
 
@@ -252,6 +272,277 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     const lastRoBind = command.lastIndexOf(`--ro-bind ${X} ${X}`)
     expect(lastRoBind).toBeGreaterThan(-1)
     expect(command.indexOf(`--bind ${X} ${X}`, lastRoBind)).toBe(-1)
+  })
+
+  // A write-deny bind under a read-deny tmpfs is kept at emission BECAUSE an
+  // allowed write path restored it. Re-applying that tmpfs over a write-deny
+  // bind of an ancestor buries the deny bind again, so the re-application
+  // must restore what it covers read-only: everything under it is inside
+  // that write deny.
+  describe('a re-applied read-deny tmpfs restores read-only', () => {
+    let RO: string // read-denied dir inside PROJ
+    let nestedAllow: string // allowed write path inside RO
+    let SECRET: string // write-denied file inside nestedAllow
+    let UNREADABLE: string // read-denied file inside RO, outside nestedAllow
+
+    beforeEach(() => {
+      RO = join(PROJ, 'ro')
+      nestedAllow = join(RO, 'w')
+      mkdirSync(nestedAllow, { recursive: true })
+      SECRET = join(nestedAllow, 'secret.txt')
+      writeFileSync(SECRET, 'HOST\n')
+      UNREADABLE = join(RO, 'other.txt')
+      writeFileSync(UNREADABLE, 'HIDDEN\n')
+    })
+
+    it('restores the allow path read-only after the re-applied tmpfs', async () => {
+      const command = await wrap([PROJ, SECRET], [RO], [AREA, nestedAllow])
+
+      const lastTmpfs = command.lastIndexOf(`--tmpfs ${RO} `)
+      expect(lastTmpfs).toBeGreaterThan(-1)
+      expect(
+        command.lastIndexOf(`--ro-bind ${nestedAllow} ${nestedAllow}`),
+      ).toBeGreaterThan(lastTmpfs)
+      expect(
+        command.indexOf(`--bind ${nestedAllow} ${nestedAllow}`, lastTmpfs),
+      ).toBe(-1)
+    })
+
+    it('leaves the allow path writable when no write deny re-exposes the tmpfs', async () => {
+      // Control: without a deny on PROJ nothing re-applies the tmpfs, so the
+      // first pass's writable re-bind of nestedAllow is the last word and
+      // only SECRET keeps its own deny bind.
+      const command = await wrap([SECRET], [RO], [AREA, nestedAllow])
+
+      const lastTmpfs = command.lastIndexOf(`--tmpfs ${RO} `)
+      expect(lastTmpfs).toBeGreaterThan(-1)
+      expect(
+        command.indexOf(`--bind ${nestedAllow} ${nestedAllow}`, lastTmpfs),
+      ).toBeGreaterThan(-1)
+      expect(command).toContain(`--ro-bind ${SECRET} ${SECRET}`)
+    })
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'blocks writes under the allow path while its contents stay readable',
+      async () => {
+        const sibling = join(nestedAllow, 'notes.txt')
+        writeFileSync(sibling, 'notes\n')
+
+        const result = await runSandboxed(
+          [PROJ, SECRET],
+          [RO],
+          [AREA, nestedAllow],
+          `echo x >> ${SECRET}; echo y >> ${sibling}; cat ${sibling}; cat ${UNREADABLE}`,
+        )
+
+        expect(result.stdout).toContain('notes')
+        // The re-applied tmpfs still hides the read-denied directory around
+        // the restored allow path.
+        expect(result.stdout).not.toContain('HIDDEN')
+        expect(readFileSync(SECRET, 'utf8')).toBe('HOST\n')
+        expect(readFileSync(sibling, 'utf8')).toBe('notes\n')
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps an allowRead carve-out readable and unwritable across the re-application',
+      async () => {
+        const carveOut = join(RO, 'pub')
+        const carveOutFile = join(carveOut, 'note.txt')
+        mkdirSync(carveOut)
+        writeFileSync(carveOutFile, 'PUBLIC\n')
+
+        const command = await wrapCommandWithSandboxLinux({
+          command: `sh -c 'echo BOOTED; cat ${carveOutFile}; echo x >> ${carveOutFile}'`,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [RO], allowWithinDeny: [carveOut] },
+          writeConfig: {
+            allowOnly: [AREA, nestedAllow],
+            denyWithinAllow: [PROJ],
+          },
+        })
+
+        // The carve-out is restored by the re-application, not just by the
+        // first pass the deny bind of PROJ buries.
+        const lastTmpfs = command.lastIndexOf(`--tmpfs ${RO} `)
+        expect(lastTmpfs).toBeGreaterThan(-1)
+        expect(
+          command.lastIndexOf(`--ro-bind ${carveOut} ${carveOut}`),
+        ).toBeGreaterThan(lastTmpfs)
+
+        const result = spawnSync(command, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: RUN_TIMEOUT_MS,
+          cwd: BASE,
+        })
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(result.stdout).toContain('PUBLIC')
+        expect(readFileSync(carveOutFile, 'utf8')).toBe('PUBLIC\n')
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'still writes under the allow path when no write deny re-exposes the tmpfs',
+      async () => {
+        const sibling = join(nestedAllow, 'notes.txt')
+        writeFileSync(sibling, 'notes\n')
+
+        await runSandboxed(
+          [SECRET],
+          [RO],
+          [AREA, nestedAllow],
+          `echo x >> ${SECRET}; echo y >> ${sibling}`,
+        )
+
+        expect(readFileSync(SECRET, 'utf8')).toBe('HOST\n')
+        expect(readFileSync(sibling, 'utf8')).toBe('notes\ny\n')
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps the git hooks and config denies of a repo under the read-denied dir',
+      async () => {
+        // The shape the emission filter's own .git/hooks exception describes:
+        // a repo under a read-denied directory, writable, inside a
+        // write-denied project.
+        const hooks = join(nestedAllow, '.git', 'hooks')
+        const config = join(nestedAllow, '.git', 'config')
+        mkdirSync(hooks, { recursive: true })
+        writeFileSync(config, '[core]\n')
+
+        await runSandboxed(
+          [PROJ, hooks, config],
+          [RO],
+          [AREA, nestedAllow],
+          `echo hook > ${join(hooks, 'pre-commit')}; echo x >> ${config}`,
+        )
+
+        expect(existsSync(join(hooks, 'pre-commit'))).toBe(false)
+        expect(readFileSync(config, 'utf8')).toBe('[core]\n')
+      },
+    )
+
+    // Absent deny paths are listed FIRST in the two cases below, so their
+    // placeholder mount points are created while the allow path is still
+    // writable and bwrap starts instead of aborting. A placeholder the
+    // re-application buries is covered by the read-only restore above it.
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps an absent deny path uncreatable through its /dev/null stub',
+      async () => {
+        // bwrap leaves the mount point behind as a mode-444 file on the host,
+        // so the write has to be preceded by a chmod: on a writable restore
+        // its owner may widen the mode and write through it.
+        const absent = join(nestedAllow, '.secret')
+
+        await runSandboxed(
+          [absent, PROJ],
+          [RO],
+          [AREA, nestedAllow],
+          `chmod u+w ${absent}; echo pwned > ${absent}`,
+        )
+
+        expect(readFileSync(absent, 'utf8')).toBe('')
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps an absent deny path uncreatable through its empty-dir placeholder',
+      async () => {
+        const placeholder = join(nestedAllow, '.cfg')
+        const absent = join(placeholder, 'deep', 'x')
+
+        await runSandboxed(
+          [absent, PROJ],
+          [RO],
+          [AREA, nestedAllow],
+          `mkdir -p ${join(placeholder, 'deep')} && echo pwned > ${absent}`,
+        )
+
+        expect(existsSync(absent)).toBe(false)
+      },
+    )
+  })
+
+  // A write-deny bind whose dest is hidden by a read-deny tmpfs is dropped:
+  // binding it would expose the read-denied contents. The allowed write paths
+  // beneath the dest are a different matter — the read-deny loop re-bound
+  // them writable and they are inside that write deny, so they come back
+  // read-only.
+  describe('a write deny dropped as hidden by a read-deny tmpfs', () => {
+    let RO: string // read-denied dir inside PROJ
+    let DENIED: string // write-denied dir inside RO
+    let INNER: string // allowed write path inside DENIED
+    let INNER_FILE: string
+    let UNREADABLE: string // read-denied file inside DENIED, outside INNER
+
+    beforeEach(() => {
+      RO = join(PROJ, 'ro')
+      DENIED = join(RO, 'x')
+      INNER = join(DENIED, 'inner')
+      mkdirSync(INNER, { recursive: true })
+      INNER_FILE = join(INNER, 'f')
+      writeFileSync(INNER_FILE, 'HOST\n')
+      UNREADABLE = join(DENIED, 'other.txt')
+      writeFileSync(UNREADABLE, 'SECRET\n')
+    })
+
+    it('restores the allow path beneath the dropped dest read-only', async () => {
+      const command = await wrap([DENIED], [RO], [AREA, INNER])
+
+      expect(command).not.toContain(`--ro-bind ${DENIED} ${DENIED}`)
+      const lastTmpfs = command.lastIndexOf(`--tmpfs ${RO} `)
+      expect(lastTmpfs).toBeGreaterThan(-1)
+      expect(
+        command.lastIndexOf(`--ro-bind ${INNER} ${INNER}`),
+      ).toBeGreaterThan(command.lastIndexOf(`--bind ${INNER} ${INNER}`))
+    })
+
+    it('binds the dest itself when no read deny hides it', async () => {
+      const command = await wrap([DENIED], [], [AREA, INNER])
+
+      expect(
+        command.lastIndexOf(`--ro-bind ${DENIED} ${DENIED}`),
+      ).toBeGreaterThan(command.lastIndexOf(`--bind ${INNER} ${INNER}`))
+      expect(command).not.toContain(`--ro-bind ${INNER} ${INNER}`)
+    })
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'blocks the write beneath the dropped dest without lifting the read deny',
+      async () => {
+        const result = await runSandboxed(
+          [DENIED],
+          [RO],
+          [AREA, INNER],
+          `cat ${INNER_FILE}; echo pwned >> ${INNER_FILE}; cat ${UNREADABLE}`,
+        )
+
+        expect(result.stdout).toContain('HOST')
+        expect(result.stdout).not.toContain('SECRET')
+        expect(readFileSync(INNER_FILE, 'utf8')).toBe('HOST\n')
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps a read deny mounted inside the restored allow path',
+      async () => {
+        // The read-only restore lands above the mounts the denyRead loop made
+        // under the allow path, so those are re-applied on top of it.
+        const nestedReadDeny = join(INNER, 'sub')
+        mkdirSync(nestedReadDeny)
+        writeFileSync(join(nestedReadDeny, 'token.txt'), 'NESTED\n')
+
+        const result = await runSandboxed(
+          [DENIED],
+          [RO, nestedReadDeny],
+          [AREA, INNER],
+          `cat ${join(nestedReadDeny, 'token.txt')}`,
+        )
+
+        expect(result.stdout).not.toContain('NESTED')
+      },
+    )
   })
 
   it('keeps the bind for a deny reached through a symlinked spelling', async () => {

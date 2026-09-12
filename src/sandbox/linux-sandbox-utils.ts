@@ -1076,7 +1076,7 @@ async function generateFilesystemArgs(
     // directories (the loop skips absent entries and gives file entries a
     // read-only /dev/null mask instead of a tmpfs) — in raw and canonical
     // spellings. A read-denied tmpfs at or under a covering deny dir is the
-    // TRIGGER for the post-denyWrite writable re-application, and a deny bind
+    // TRIGGER for the post-denyWrite re-application, and a deny bind
     // whose dest sits under one can be dropped by the emission filter — both
     // facts feed the guard.
     let stubSkipVetoInputs:
@@ -1249,18 +1249,14 @@ async function generateFilesystemArgs(
     // and denyWithinAllow both name it, and '/' + '/' is a prefix of
     // nothing, so a string-prefix test would judge it safe for every path
     // and drop the binds the re-application passes below key off.
-    // Rationale: the only writable emissions that land after the
-    // buffered read-only binds are the denyRead re-applications
-    // (pushReadDenyDirMounts), which mount a tmpfs and re-bind allowed write
-    // paths beneath it WITHOUT re-emitting the binds it buries — so a
-    // comparable tmpfs is both the re-opening vector (beneath or around the
-    // dir) and the only way the dir's own --ro-bind gets dropped at emission
-    // as hidden-by-a-tmpfs. (The emission filter's other drop condition,
-    // maskedFiles, holds file dests only — /dev/null read-deny masks and
-    // credential-mask fakes — while the pre-pass stat-verifies every
-    // recorded dir as a directory, so it cannot drop a recorded dir short of
-    // a dir→file race, which ends in bwrap refusing to start, not a silent
-    // gap.) Only existing read-deny directories become a tmpfs: absent and
+    // Rationale: nothing writable lands after the buffered read-only binds,
+    // so no later mount re-opens what a covering bind closed. The vetoes
+    // stay all the same, for the reasons given at each of them below. (The
+    // emission filter's other drop condition, maskedFiles, holds file dests
+    // only — /dev/null read-deny masks and credential-mask fakes — while the
+    // pre-pass stat-verifies every recorded dir as a directory, so it cannot
+    // drop a recorded dir short of a dir→file race, which ends in bwrap
+    // refusing to start, not a silent gap.) Only existing read-deny directories become a tmpfs: absent and
     // file-level read-denies count for nothing. If any condition could
     // apply, keep the stub — the pre-existing abort is preferable to a
     // silently creatable deny path. (An allow path bound before the
@@ -1277,21 +1273,26 @@ async function generateFilesystemArgs(
         prospectiveReadDenyTmpfsDirsBothForms,
       } = getStubSkipVetoInputs()
       const unsafe =
-        // (i) an allowed write path strictly beneath the dir: the
-        //     re-application's effect would re-bind it writable.
+        // (i) an allowed write path strictly beneath the dir: the covering
+        //     bind is not the only mount claiming that subtree, since the
+        //     allow loop binds that path writable before it. It is also the
+        //     only veto that fires for a recorded '/' when there is no read
+        //     policy, which is what keeps coveredBySafeReadOnlyDenyDir
+        //     walking past the root.
         allowedWritePathsBothForms.some(writePath =>
           isStrictlyUnder(writePath, denyDir),
         ) ||
-        // (ii) a read-deny tmpfs at or beneath the dir: the re-application's
-        //     trigger.
+        // (ii) a read-deny tmpfs at or beneath the dir: the tmpfs, not the
+        //     covering bind, decides that subtree. Kept conservatively; the
+        //     re-application's own trigger is strict containment.
         prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
           isAtOrUnder(tmpfsDir, denyDir),
         ) ||
         // (iii) a read-deny tmpfs CONTAINING the dir or any raw spelling it
         //     was reached through: the dir's own --ro-bind can be dropped as
-        //     hidden-by-the-tmpfs at emission, and a tmpfs above it can
-        //     re-bind an allowed path around it — either way the directory
-        //     is not reliably read-only in the sandbox.
+        //     hidden-by-the-tmpfs at emission, and a tmpfs above it restores
+        //     allowed paths around it — either way the dir's own bind is not
+        //     the last word on that subtree.
         prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
           [denyDir, ...(readOnlyDenyDirSpellings.get(denyDir) ?? [])].some(
             spelling => isAtOrUnder(spelling, tmpfsDir),
@@ -1658,6 +1659,9 @@ async function generateFilesystemArgs(
     })
 
   const emittedDenyWriteDests: string[] = []
+  // Write paths already restored read-only by a dropped deny bind, so two
+  // denies covering the same path emit one --ro-bind.
+  const restoredReadOnlyWritePaths = new Set<string>()
   for (let i = 0; i < denyWriteArgs.length; i += 3) {
     const dest = denyWriteArgs[i + 2]!
     const rawDest = denyWriteRawDests.get(dest) ?? dest
@@ -1666,6 +1670,25 @@ async function generateFilesystemArgs(
       logForDebugging(
         `[Sandbox Linux] Skipping denyWrite bind already hidden by denyRead tmpfs: ${dest}`,
       )
+      // The tmpfs hides this dest but not an allowed write path the denyRead
+      // loop re-bound writable beneath it: that path is inside this write
+      // deny, so restore it read-only. Emitting the dest's own bind instead
+      // would expose the read-denied directory around it.
+      for (const writePath of allowedWritePaths) {
+        if (!isAtOrUnder(writePath, dest) && !isAtOrUnder(writePath, rawDest)) {
+          continue
+        }
+        if (restoredReadOnlyWritePaths.has(writePath)) continue
+        restoredReadOnlyWritePaths.add(writePath)
+        args.push('--ro-bind', writePath, writePath)
+        // Like a deny bind, this one lands above whatever the denyRead loop
+        // mounted inside the write path, so the re-application passes below
+        // have to see it and put those mounts back.
+        emittedDenyWriteDests.push(writePath)
+        logForDebugging(
+          `[Sandbox Linux] Restoring write path read-only inside dropped denyWrite bind ${dest}: ${writePath}`,
+        )
+      }
       continue
     }
     args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
@@ -1678,16 +1701,40 @@ async function generateFilesystemArgs(
 
   // The inverse stacking problem: a denyWrite ro-bind whose dest strictly
   // contains a read-denied dir re-exposes that dir's real contents (the bind
-  // landed after the tmpfs). Re-apply the tmpfs on top, with the same write
-  // and allowRead re-binds the denyRead loop emitted. A bind of '/' itself
-  // (allowOnly and denyWithinAllow both naming it) contains every one of
-  // them, so containment is root-aware.
+  // landed after the tmpfs). Re-apply the tmpfs on top, restoring the paths
+  // the denyRead loop restored beneath it. A bind of '/' itself (allowOnly
+  // and denyWithinAllow both naming it) contains every one of them, so
+  // containment is root-aware.
+  //
+  // An allowed write path beneath such a tmpfs lies inside the emitted deny
+  // dest too, so the deny wins: the write paths go in as allowRead entries
+  // and come back read-only, visible as the first pass left them but not
+  // writable. Re-binding them writable would undo, for the whole subtree,
+  // the write denies the pass above just emitted.
   for (const tmpfsDir of tmpfsDirs) {
-    if (emittedDenyWriteDests.some(dest => isStrictlyUnder(tmpfsDir, dest))) {
+    const reExposingDest = emittedDenyWriteDests.find(dest =>
+      isStrictlyUnder(tmpfsDir, dest),
+    )
+    if (reExposingDest !== undefined) {
       logForDebugging(
         `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${tmpfsDir}`,
       )
-      pushReadDenyDirMounts(args, tmpfsDir, allowedWritePaths, readAllowPaths)
+      // The helper logs each restore as a read allow; say which of them are
+      // write paths losing their write access, and to which deny.
+      const restoredReadOnly = allowedWritePaths.filter(writePath =>
+        isAtOrUnder(writePath, tmpfsDir),
+      )
+      if (restoredReadOnly.length > 0) {
+        logForDebugging(
+          `[Sandbox Linux] Restoring write paths read-only inside denyWrite bind ${reExposingDest}: ${restoredReadOnly.join(', ')}`,
+        )
+      }
+      pushReadDenyDirMounts(
+        args,
+        tmpfsDir,
+        [],
+        [...allowedWritePaths, ...readAllowPaths],
+      )
     }
   }
   // Same problem for masked files: the mask landed before the denyWrite
