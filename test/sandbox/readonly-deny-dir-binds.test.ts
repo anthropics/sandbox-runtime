@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import {
   existsSync,
   mkdirSync,
@@ -211,6 +211,31 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       expect(result.stdout).toContain('read:[]')
       expect(existsSync(newFile)).toBe(false)
     }
+  })
+
+  it('warns that a write deny covers an allowed write path beneath it', async () => {
+    // The deny's read-only bind is emitted after every allow bind, so this
+    // shape starts with AREA read-only instead of aborting. Name both paths.
+    const warnings: string[] = []
+    const savedDebug = process.env.SRT_DEBUG
+    process.env.SRT_DEBUG = '1'
+    const spies = [
+      spyOn(console, 'warn').mockImplementation((...parts: unknown[]) => {
+        warnings.push(parts.map(String).join(' '))
+      }),
+      spyOn(console, 'error').mockImplementation(() => {}),
+    ]
+    try {
+      await wrap(['/'], [], ['/', AREA])
+    } finally {
+      for (const spy of spies) spy.mockRestore()
+      if (savedDebug === undefined) delete process.env.SRT_DEBUG
+      else process.env.SRT_DEBUG = savedDebug
+    }
+
+    expect(warnings.join('\n')).toContain(
+      `Write deny / covers allowed write path ${AREA}`,
+    )
   })
 
   it('skips the stubs under a write-denied cwd when a recorded "/" is vetoed', async () => {

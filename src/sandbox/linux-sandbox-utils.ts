@@ -1794,6 +1794,21 @@ async function generateFilesystemArgs(
           )
           continue
         }
+        // A deny's read-only bind is emitted after every allow bind, so an
+        // allowed write path beneath it comes back read-only instead of
+        // stopping the sandbox from starting. Say so: the config asked for
+        // both and only the deny takes effect.
+        for (const buried of allowedWritePaths) {
+          if (
+            buried !== normalizedPath &&
+            isAtOrUnder(buried, normalizedPath)
+          ) {
+            logForDebugging(
+              `[Sandbox Linux] Write deny ${normalizedPath} covers allowed write path ${buried}; ${buried} will be read-only`,
+              { level: 'warn' },
+            )
+          }
+        }
         denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
         denyWriteRawDests.set(normalizedPath, rawPath)
       } else {

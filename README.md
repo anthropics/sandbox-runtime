@@ -684,6 +684,8 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 
 With `allowWrite: ["/"]` the pins reach every ancestor, including any other allowed write root that is one (`mv /work /work.bak` fails with `EBUSY` given `allowWrite: ["/", "/work"]` and a protected path inside `/work`). They stop below the top-level directory, which is bound writable over them, and that directory is the one new filesystem boundary: `mv` or `ln` between two top-level directories — say `/tmp` and `/home` — fails with `EXDEV` ("Invalid cross-device link"), as it does on any host where they are separate filesystems. `mv` falls back to a copy; `ln` and a raw `rename(2)` do not.
 
+**Write denies win over allowed paths beneath them (Linux):** a `denyWrite` entry at or above an `allowWrite` entry makes that path read-only rather than writable — `allowWrite: ["/", "/work"]` with `denyWrite: ["/"]` leaves `/work` read-only. The wrap logs a warning naming both paths.
+
 **Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
 
 ```json
