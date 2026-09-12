@@ -6,7 +6,7 @@
 import { isIP } from 'node:net'
 import type { FilterRequestCallback } from './request-filter.js'
 
-import { isAbsolute } from 'node:path'
+import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
 import { z } from 'zod'
 import {
   isInjectHostCoveredByAllowedDomains,
@@ -14,6 +14,8 @@ import {
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import { parseAddressRange } from './address.js'
+import { containsGlobCharsForPlatform } from './sandbox-utils.js'
+import { getPlatform } from '../utils/platform.js'
 
 /**
  * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
@@ -1071,6 +1073,37 @@ export const SeccompConfigSchema = z.object({
 })
 
 /**
+ * An inert deny is fail-open, so a deny glob whose trailing separator leaves
+ * it matching nothing is rejected; the same glob as an allow fails closed,
+ * so the allow lists keep the plain path schema.
+ */
+function addInertSlashedDenyGlobIssue(
+  value: string,
+  path: (string | number)[],
+  ctx: z.RefinementCtx,
+): void {
+  const onWindows = getPlatform() === 'windows'
+  const trailingSeparator = onWindows ? /[\\/]+$/ : /\/+$/
+  if (!trailingSeparator.test(value)) return
+  if (!containsGlobCharsForPlatform(value)) return
+  // Only absolute and `~`-rooted spellings reach a backend with the
+  // separator still attached: normalizePathForSandbox resolves a relative
+  // spelling through path.resolve, which drops it, so `build/*/` is live.
+  const rooted = onWindows
+    ? win32Path.isAbsolute(value)
+    : posixPath.isAbsolute(value)
+  if (!rooted && !value.startsWith('~')) return
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path,
+    message:
+      `Deny glob "${value}" ends in a separator, so the pattern can match ` +
+      `no path. Write "${value.replace(trailingSeparator, '')}", or add a ` +
+      `"**" segment to match at any depth.`,
+  })
+}
+
+/**
  * Main configuration schema for Sandbox Runtime validation
  */
 export const SandboxRuntimeConfigSchema = z
@@ -1160,6 +1193,20 @@ export const SandboxRuntimeConfigSchema = z
     ),
   })
   .superRefine((cfg, ctx) => {
+    // filesystem.disabled drops every filesystem rule, the credential file
+    // denies included (getFsReadConfig, getFsWriteConfig and
+    // computeWindowsFsAccessSet all short-circuit on it), so an inert deny
+    // under it is not a hole.
+    const fsEnforced = !cfg.filesystem.disabled
+    if (fsEnforced) {
+      for (const [idx, p] of cfg.filesystem.denyRead.entries()) {
+        addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyRead', idx], ctx)
+      }
+      for (const [idx, p] of cfg.filesystem.denyWrite.entries()) {
+        addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyWrite', idx], ctx)
+      }
+    }
+
     const creds = cfg.credentials
     if (!creds) return
 
@@ -1329,6 +1376,15 @@ export const SandboxRuntimeConfigSchema = z
             `directory. Use mode "deny" for "${f.path}", or point at the ` +
             `credential file inside it.`,
         })
+      }
+      // A `mode: 'deny'` path is unioned into the read-deny set and takes
+      // the same glob branches as filesystem.denyRead.
+      if (fsEnforced && f.mode === 'deny') {
+        addInertSlashedDenyGlobIssue(
+          f.path,
+          ['credentials', 'files', idx, 'path'],
+          ctx,
+        )
       }
     }
 
