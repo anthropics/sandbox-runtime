@@ -83,6 +83,7 @@ import {
   attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
+  normalizePathForSandbox,
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
@@ -691,17 +692,29 @@ async function initialize(
     logForDebugging('Started macOS sandbox log monitor')
   }
   if (enableLogMonitor && getPlatform() === 'linux') {
+    // The write configuration the wrapper itself is built from, spelled the
+    // way the backend spells it: getFsWriteConfig() folds in the default
+    // write paths and drops the glob entries bwrap cannot take, and
+    // normalizePathForSandbox expands `~` and relative spellings and
+    // resolves symlinks, exactly as wrapCommandWithSandboxLinux does before
+    // it binds. The monitor compares these against paths the kernel
+    // reported, so an unexpanded entry matches none of them: handed
+    // `allowWrite: ['~/proj']` raw, every write beneath it was recorded as a
+    // violation although bwrap allowed it, and a `denyWrite: ['~/.ssh']`
+    // inside an allowed tree was not recorded although bwrap refused it.
+    const monitoredWrites = getFsWriteConfig()
     linuxMonitor = startLinuxSandboxViolationMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       {
         // apply-seccomp's observer reports every write-intent syscall
         // (allowed or not). Only paths bwrap would actually refuse — outside
         // allowWrite or inside a denyWrite carve-out — go to the store.
-        allowWritePaths: [
-          ...getDefaultWritePaths(),
-          ...config.filesystem.allowWrite,
-        ],
-        denyWritePaths: config.filesystem.denyWrite,
+        allowWritePaths: monitoredWrites.allowOnly.map(p =>
+          normalizePathForSandbox(p),
+        ),
+        denyWritePaths: monitoredWrites.denyWithinAllow.map(p =>
+          normalizePathForSandbox(p),
+        ),
         ignoreViolations: config.ignoreViolations,
         resolveCommandText,
       },

@@ -1,16 +1,27 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  afterEach,
+  spyOn,
+} from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { connect } from 'node:net'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { isLinux } from '../helpers/platform.js'
+import * as linuxViolationMonitorModule from '../../src/sandbox/linux-violation-monitor.js'
 import {
   startLinuxSandboxViolationMonitor,
   type LinuxViolationMonitor,
+  type LinuxViolationMonitorOptions,
 } from '../../src/sandbox/linux-violation-monitor.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
+import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { encodeSandboxedCommand } from '../../src/sandbox/sandbox-utils.js'
 
 const d = isLinux ? describe : describe.skip
@@ -263,4 +274,82 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
     const r = spawnSync(applyPath!, ['/bin/sh', '-c', 'kill -TERM $$'])
     expect(r.status).toBe(128 + 15)
   })
+})
+
+d('the write configuration the manager hands the monitor', () => {
+  // ~-spelled, relative and glob entries reach the monitor as configured,
+  // while the paths it classifies come from the kernel. bwrap is built from
+  // the expanded, glob-free spellings, so an unexpanded entry matches
+  // nothing: everything under an allow is reported as a violation bwrap
+  // permitted, and a deny inside an allowed tree is not reported although
+  // bwrap refused it. Enforcement is unaffected either way; this is the
+  // accuracy of the violation records.
+  const ALLOW = join(homedir(), 'srt-monitor-allow')
+  const DENY = join(ALLOW, 'secrets')
+
+  afterEach(async () => {
+    await SandboxManager.reset()
+  })
+
+  it('classifies a ~ allow and a ~ deny the way bwrap does', async () => {
+    let handedOver: LinuxViolationMonitorOptions | undefined
+    const spy = spyOn(
+      linuxViolationMonitorModule,
+      'startLinuxSandboxViolationMonitor',
+    ).mockImplementation((_callback, opts) => {
+      handedOver = opts
+      return {
+        observeSocketPath: undefined,
+        ready: Promise.resolve(),
+        stop: () => {},
+      }
+    })
+    try {
+      await SandboxManager.initialize(
+        {
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            denyRead: [],
+            allowWrite: ['~/srt-monitor-allow', '~/srt-monitor-allow/g/*'],
+            denyWrite: ['~/srt-monitor-allow/secrets'],
+          },
+        },
+        undefined,
+        true,
+      )
+    } finally {
+      spy.mockRestore()
+    }
+    expect(handedOver).toBeDefined()
+    // A glob is dropped, not kept as a prefix: bwrap never binds one, so
+    // treating it as an allow would excuse writes bwrap refuses.
+    expect(handedOver!.allowWritePaths.some(p => p.includes('*'))).toBe(false)
+
+    // Drive the real listener with exactly what the manager handed over.
+    const lines: string[] = []
+    const monitor = startLinuxSandboxViolationMonitor(
+      v => lines.push(v.line),
+      handedOver!,
+    )
+    await monitor.ready
+    try {
+      await new Promise<void>((res, rej) => {
+        const c = connect(monitor.observeSocketPath!, () => {
+          c.write(
+            [
+              JSON.stringify({ syscall: 'openat', path: `${ALLOW}/file` }),
+              JSON.stringify({ syscall: 'openat', path: `${DENY}/token` }),
+            ].join('\n') + '\n',
+          )
+          c.end()
+        })
+        c.on('close', () => res())
+        c.on('error', rej)
+      })
+      await new Promise(r => setTimeout(r, 50))
+      expect(lines).toEqual([`deny openat ${DENY}/token`])
+    } finally {
+      monitor.stop()
+    }
+  }, 30_000)
 })
