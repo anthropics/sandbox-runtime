@@ -46,6 +46,7 @@ export interface MacOSSandboxParams {
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowLocalPorts?: number[]
   allowMachLookup?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
@@ -832,6 +833,7 @@ function generateSandboxProfile({
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
+  allowLocalPorts,
   allowMachLookup,
   allowPty,
   allowGitConfig = false,
@@ -847,6 +849,7 @@ function generateSandboxProfile({
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowLocalPorts?: number[]
   allowMachLookup?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
@@ -1117,6 +1120,22 @@ function generateSandboxProfile({
         `(allow network-outbound (remote ip "localhost:${socksProxyPort}"))`,
       )
     }
+
+    // Allow localhost TCP operations on each declared port (a host launching
+    // a headless browser on a devtools port, a dev server), without opening
+    // every port the way allowLocalBinding does. These use "localhost:N" on
+    // purpose, not "*:N": the wildcard would also admit a LAN-facing bind on
+    // that port. The trade-off is the one the outbound rule above already
+    // carries: "localhost" does not match the IPv4-mapped form
+    // ::ffff:127.0.0.1, so a dual-stack runtime (Java etc.) must bind
+    // AF_INET for the per-port rule to match (see JAVA_TOOL_OPTIONS below).
+    if (allowLocalPorts) {
+      for (const port of allowLocalPorts) {
+        profile.push(`(allow network-bind (local ip "localhost:${port}"))`)
+        profile.push(`(allow network-inbound (local ip "localhost:${port}"))`)
+        profile.push(`(allow network-outbound (remote ip "localhost:${port}"))`)
+      }
+    }
   }
   profile.push('')
 
@@ -1192,6 +1211,7 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowLocalPorts,
     allowMachLookup,
     readConfig: readConfigIn,
     writeConfig,
@@ -1262,6 +1282,7 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowLocalPorts,
     allowMachLookup,
     allowPty,
     allowGitConfig,
@@ -1286,8 +1307,9 @@ export function wrapCommandWithSandboxMacOS(
   //   env vars above, so the agent translates them into system properties
   //   plus an Authenticator for the proxy credential at JVM start.
   // - -Djava.net.preferIPv4Stack=true whenever the profile lets the child
-  //   reach loopback at all (the proxy ports, or allowLocalBinding's
-  //   localhost:*): Seatbelt's (remote ip "localhost:N") filter matches
+  //   reach loopback at all (the proxy ports, allowLocalPorts, or
+  //   allowLocalBinding's localhost:*): Seatbelt's (remote ip "localhost:N")
+  //   filter matches
   //   127.0.0.1 and ::1 but not the IPv4-mapped IPv6 form ::ffff:127.0.0.1.
   //   Modern Java defaults to AF_INET6 dual-stack sockets, so a Java client
   //   connecting to 127.0.0.1 reaches the kernel as ::ffff:127.0.0.1 and is
@@ -1301,6 +1323,7 @@ export function wrapCommandWithSandboxMacOS(
   const loopbackReachable =
     needsNetworkRestriction &&
     (allowLocalBinding ||
+      (allowLocalPorts?.length ?? 0) > 0 ||
       httpProxyPort !== undefined ||
       socksProxyPort !== undefined)
   const javaToolOptions = buildJavaToolOptions({
