@@ -95,6 +95,7 @@ describe('Config Validation', () => {
         allowUnixSockets: ['/var/run/docker.sock'],
         allowAllUnixSockets: false,
         allowLocalBinding: true,
+        allowLocalPorts: [9222],
       },
       filesystem: {
         denyRead: ['/etc/shadow'],
@@ -321,6 +322,40 @@ describe('Config Validation', () => {
           allowedDomains: [],
           deniedDomains: [],
           allowMachLookup: [entry],
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      }
+
+      const result = SandboxRuntimeConfigSchema.safeParse(config)
+      expect(result.success).toBe(false)
+    },
+  )
+
+  test('should dedupe allowLocalPorts', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowLocalPorts: [9222, 3000, 9222],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.network.allowLocalPorts).toEqual([9222, 3000])
+    }
+  })
+
+  test.each([0, 70000, 1.5, '9222'])(
+    'should reject allowLocalPorts entry: %p',
+    entry => {
+      const config = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          allowLocalPorts: [entry],
         },
         filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
       }

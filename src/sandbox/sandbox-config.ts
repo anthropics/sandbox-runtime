@@ -768,6 +768,13 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe('Whether to allow binding to local ports (default: false)'),
+  allowLocalPorts: z
+    .array(z.number().int().min(1).max(65535))
+    .transform(ports => [...new Set(ports)])
+    .optional()
+    .describe(
+      'macOS only: loopback TCP ports the sandboxed process may bind, accept on and connect to, without opening every port the way allowLocalBinding does. A dual-stack runtime (Java etc.) must bind AF_INET for the per-port rule to match. No-op on Linux (loopback inside the network namespace is already private) and on Windows.',
+    ),
   allowMachLookup: z
     .array(
       z.string().refine(
