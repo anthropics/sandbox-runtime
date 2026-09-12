@@ -520,11 +520,104 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       expect(command).toContain(
         `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
       )
+      // The throw is the reason, not some unresolvable child of '/' this
+      // host happens to have: that would pass the test for free.
       expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
+      expect(warnings.join('\n')).toContain('deriving it threw')
     } finally {
       for (const spy of spies) spy.mockRestore()
       if (savedDebug === undefined) delete process.env.SRT_DEBUG
       else process.env.SRT_DEBUG = savedDebug
     }
+  })
+
+  /**
+   * Run a `denyOnly: ['/']` wrap with one extra, non-existent child listed
+   * under the root whose canonical location cannot be resolved for `code`.
+   * The shape of a dangling symlink under '/' (Ubuntu ships
+   * /initrd.img.old), without needing to create one.
+   */
+  async function wrapWithUnresolvableRootChild(
+    code: string,
+  ): Promise<{ command: string; warnings: string[]; probeLookups: number }> {
+    process.chdir(PROJ)
+    const probe = '/srt-unresolvable-probe'
+    const tmpRoot = `/${BASE.split('/')[1]}`
+    const realReaddirSync = fs.readdirSync
+    const realRealpathSync = fs.realpathSync
+    let probeLookups = 0
+    const warnings: string[] = []
+    const savedDebug = process.env.SRT_DEBUG
+    process.env.SRT_DEBUG = '1'
+    const spies = [
+      spyOn(fs, 'readdirSync').mockImplementation(((
+        p: fs.PathLike,
+        ...rest: unknown[]
+      ) => {
+        const real = (realReaddirSync as (...a: unknown[]) => unknown)(
+          p,
+          ...rest,
+        )
+        return String(p) === '/' && Array.isArray(real)
+          ? [...real, probe.slice(1)]
+          : real
+      }) as typeof fs.readdirSync),
+      spyOn(fs, 'realpathSync').mockImplementation(((
+        p: fs.PathLike,
+        ...rest: unknown[]
+      ) => {
+        if (String(p) === probe) {
+          probeLookups++
+          throw Object.assign(new Error(`${code}: cannot resolve`), { code })
+        }
+        return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
+      }) as typeof fs.realpathSync),
+      spyOn(console, 'warn').mockImplementation((...parts: unknown[]) => {
+        warnings.push(parts.map(String).join(' '))
+      }),
+      spyOn(console, 'error').mockImplementation(() => {}),
+    ]
+    try {
+      const command = await wrapCommandWithSandboxLinux({
+        command: 'echo hello',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
+        writeConfig: { allowOnly: [AREA], denyWithinAllow: [PROJ] },
+      })
+      return { command, warnings, probeLookups }
+    } finally {
+      for (const spy of spies) spy.mockRestore()
+      if (savedDebug === undefined) delete process.env.SRT_DEBUG
+      else process.env.SRT_DEBUG = savedDebug
+    }
+  }
+
+  it('skips the stubs when a root child is merely absent', async () => {
+    // A dangling symlink under '/' is ordinary. Counting its unresolvable
+    // canonical location as a guess made the prediction unusable, which
+    // vetoes every covering directory and stubs the absent cwd dotfiles on
+    // the read-only cwd — every command on such a host aborts at startup.
+    const { command, warnings, probeLookups } =
+      await wrapWithUnresolvableRootChild('ENOENT')
+
+    expect(probeLookups).toBeGreaterThan(0)
+    expect(warnings.join('\n')).not.toContain('Read-deny prediction unusable')
+    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+  })
+
+  it('keeps the stubs when a root child cannot be looked at', async () => {
+    // The other direction: a location that exists but cannot be resolved is
+    // a guess about the prediction's own inputs, so the prediction is
+    // unusable and every stub is kept.
+    const { command, warnings, probeLookups } =
+      await wrapWithUnresolvableRootChild('EACCES')
+
+    expect(probeLookups).toBeGreaterThan(0)
+    expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
+    expect(warnings.join('\n')).toContain('/srt-unresolvable-probe')
+    expect(command).toContain(`--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`)
   })
 })

@@ -1080,21 +1080,30 @@ async function generateFilesystemArgs(
   // scan's await: that scan can run arbitrarily long, and a realpath taken
   // ahead of it would miss a symlink retargeted meanwhile.
   const canonicalFormCache = new Map<string, string>()
-  // Paths whose canonical location could not be resolved, so the recorded
-  // spelling stands in for it. That is a guess, and the stub-skip prediction
-  // below refuses to conclude anything from a guess made about its own inputs.
+  // Paths whose canonical location could not be LOOKED AT (EACCES, EIO,
+  // anything unrecognised), so the recorded spelling stands in for it. That
+  // is a guess, and the stub-skip prediction below refuses to conclude
+  // anything from a guess made about its own inputs. Plain absence is not a
+  // guess: nothing is there to resolve, and every consumer already treats
+  // such a path as absent (a dangling symlink under '/' is ordinary, and
+  // counting it would keep every deny placeholder on the whole host).
   const canonicalFormGuesses = new Set<string>()
+  // Set while the stub-skip prediction is derived: canonicalForm reports
+  // every guess it hands that derivation, memoised answers included, which a
+  // set-size delta over the cache would miss.
+  let canonicalFormGuessesSeen: Set<string> | undefined
   const canonicalForm = (p: string): string => {
     let canonical = canonicalFormCache.get(p)
     if (canonical === undefined) {
       try {
         canonical = fs.realpathSync(p)
-      } catch {
+      } catch (err) {
         canonical = p // vanished or unresolvable: the recorded form stands
-        canonicalFormGuesses.add(p)
+        if (!isAbsenceErrno(err)) canonicalFormGuesses.add(p)
       }
       canonicalFormCache.set(p, canonical)
     }
+    if (canonicalFormGuesses.has(p)) canonicalFormGuessesSeen?.add(p)
     return canonical
   }
   /** `p` as recorded, plus its canonical location when that differs. */
@@ -1323,12 +1332,13 @@ async function generateFilesystemArgs(
       if (stubSkipVetoInputs !== undefined) {
         return stubSkipVetoInputs
       }
-      // Every canonicalForm() the derivation needs is first reached from
-      // here, so a location it had to guess shows up as a new entry.
-      const guessesBefore = canonicalFormGuesses.size
+      // canonicalForm reports into this set every guess it hands back below,
+      // so the prediction never concludes anything from one.
+      const guessed = new Set<string>()
       let allowedWritePathsBothForms: string[] = []
       let prospectiveReadDenyTmpfsDirsBothForms: string[] = []
       let unreliableCause: string | undefined
+      canonicalFormGuessesSeen = guessed
       try {
         allowedWritePathsBothForms = allowedWritePaths.flatMap(mountForms)
         prospectiveReadDenyTmpfsDirsBothForms = readDenyEntries().flatMap(
@@ -1339,12 +1349,11 @@ async function generateFilesystemArgs(
         )
       } catch (err) {
         unreliableCause = `deriving it threw: ${err}`
+      } finally {
+        canonicalFormGuessesSeen = undefined
       }
-      if (
-        unreliableCause === undefined &&
-        canonicalFormGuesses.size > guessesBefore
-      ) {
-        unreliableCause = 'a path has no resolvable canonical location'
+      if (unreliableCause === undefined && guessed.size > 0) {
+        unreliableCause = `no canonical location for ${[...guessed].join(', ')}`
       }
       if (unreliableCause !== undefined) {
         logForDebugging(
