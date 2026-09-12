@@ -16,6 +16,7 @@ import {
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
   encodeSandboxedCommand,
+  attributionKeyFor,
   DANGEROUS_FILES,
   isAtOrUnder,
   isStrictlyUnder,
@@ -1877,7 +1878,7 @@ export async function wrapCommandWithSandboxLinux(
         bwrapArgs.push(
           '--setenv',
           'SRT_ENCODED_CMD',
-          encodeSandboxedCommand(commandId ?? command),
+          encodeSandboxedCommand(attributionKeyFor(command, commandId)),
         )
       } else {
         logForDebugging(
@@ -1962,7 +1963,7 @@ export async function wrapCommandWithSandboxLinux(
           caCertPath,
           proxyAuthToken,
           writeConfig === undefined,
-          encodeSandboxedCommand(commandId ?? command),
+          encodeSandboxedCommand(attributionKeyFor(command, commandId)),
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {

@@ -1,6 +1,9 @@
 import { type SandboxViolationEvent } from './macos-sandbox-utils.js'
 import { type IgnoreViolationsConfig } from './sandbox-config.js'
-import { encodeSandboxedCommand } from './sandbox-utils.js'
+import {
+  encodeSandboxedCommand,
+  SANDBOXED_COMMAND_KEY_LENGTH,
+} from './sandbox-utils.js'
 
 /**
  * In-memory tail for sandbox violations
@@ -109,10 +112,34 @@ export function shouldIgnoreViolation(
 }
 
 /**
- * Collapse control characters (C0, DEL, C1) to spaces. Shared by the store
- * (for `line`) and resolveCommandText (for an unregistered attribution key).
+ * Everything that would make stored text render as something other than
+ * what it says: the control characters (C0, DEL, C1 — the latter covers the
+ * 8-bit CSI/OSC introducers), the U+2028/U+2029 line terminators, the bidi
+ * embedding/override/isolate controls and the zero-width invisibles.
+ */
+/* eslint-disable no-control-regex -- stripping control chars is the point */
+const DISPLAY_UNSAFE_CHARACTERS =
+  /[\x00-\x1f\x7f-\x9f\u00ad\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]+/g
+/* eslint-enable no-control-regex */
+
+/**
+ * Collapse those to spaces, so that what is stored is what is displayed.
+ * Shared by the store (for `line`) and by the unregistered-key fallback.
  */
 export function sanitizeViolationText(text: string): string {
-  // eslint-disable-next-line no-control-regex -- stripping control chars is the point
-  return text.replace(/[\x00-\x1f\x7f-\x9f]+/g, ' ').trim()
+  return text.replace(DISPLAY_UNSAFE_CHARACTERS, ' ').trim()
+}
+
+/**
+ * What a violation reports for an attribution key no invocation registered.
+ * Such a key arrived over a carrier the sandboxed process can write, so it
+ * is bytes rather than text: collapse it, drop the angle brackets that would
+ * close an embedder's <sandbox_violations> envelope early, and cut it to the
+ * length a key this process minted can have — the carriers are bounded far
+ * more loosely than that (an HTTP proxy header budget is kilobytes).
+ */
+export function sanitizeUnregisteredCommandKey(decodedKey: string): string {
+  return sanitizeViolationText(decodedKey)
+    .replace(/[<>]/g, '')
+    .slice(0, SANDBOXED_COMMAND_KEY_LENGTH)
 }

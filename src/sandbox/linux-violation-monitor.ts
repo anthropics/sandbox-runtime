@@ -12,7 +12,10 @@ import type {
 } from './macos-sandbox-utils.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
 import { decodeSandboxedCommand } from './sandbox-utils.js'
-import { shouldIgnoreViolation } from './sandbox-violation-store.js'
+import {
+  sanitizeUnregisteredCommandKey,
+  shouldIgnoreViolation,
+} from './sandbox-violation-store.js'
 
 export interface LinuxViolationMonitorOptions {
   /**
@@ -26,10 +29,11 @@ export interface LinuxViolationMonitorOptions {
   /** Paths bwrap re-mounts read-only inside an allowWrite region. */
   denyWritePaths: string[]
   ignoreViolations?: IgnoreViolationsConfig
-  /** Map a decoded attribution key (commandId) to the command text it
-   *  represents; identity when omitted. Applied before ignoreViolations
-   *  matching and before the event's `command` is set. */
-  resolveCommandText?: (decodedId: string) => string
+  /** Map a decoded attribution key to the command text it represents,
+   *  before ignoreViolations matching and before the event's `command` is
+   *  set. Only the manager holds the registry that can do that; omitted,
+   *  the key is treated as the untrusted bytes it arrived as. */
+  resolveCommandText?: (decodedKey: string) => string
 }
 
 export interface LinuxViolationMonitor {
@@ -81,7 +85,7 @@ export function startLinuxSandboxViolationMonitor(
     allowWritePaths,
     denyWritePaths,
     ignoreViolations,
-    resolveCommandText = (id: string) => id,
+    resolveCommandText = sanitizeUnregisteredCommandKey,
   } = opts
 
   // sun_path is 108 bytes; mkdtemp under tmpdir() keeps us well under.

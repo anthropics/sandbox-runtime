@@ -80,12 +80,13 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
-  sanitizeViolationText,
+  sanitizeUnregisteredCommandKey,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -203,16 +204,14 @@ function registerCleanup(): void {
 }
 
 /**
- * Attribution key → command text for every wrapped invocation, so each
- * producer can report (and ignoreViolations can match) the command an
- * event belongs to rather than the opaque key. The key is the commandId
- * when the embedder passes one, else the command itself; either way it is
- * stored as decodeSandboxedCommand yields it (its first 100 characters).
- * Bounded FIFO: the violation store itself only retains the last 100
- * events, so long-gone invocations don't need resolving.
+ * Attribution key to command text for every wrapped invocation, so each
+ * producer can report (and ignoreViolations can match) the command an event
+ * belongs to rather than the opaque key. Keys are held decoded because that
+ * is the form the carriers deliver. Bounded FIFO: the violation store itself
+ * only retains the last 100 events, so long-gone invocations need no entry.
  */
 const MAX_COMMAND_TEXTS = 1024
-const commandTextsById = new Map<string, string>()
+const commandTextsByKey = new Map<string, string>()
 
 /** Exported for testing. */
 export function registerCommandText(
@@ -220,29 +219,30 @@ export function registerCommandText(
   options: WrapWithSandboxOptions | undefined,
 ): void {
   const key = decodeSandboxedCommand(
-    encodeSandboxedCommand(options?.commandId ?? command),
+    encodeSandboxedCommand(attributionKeyFor(command, options?.commandId)),
   )
   const text = options?.commandText ?? command
-  commandTextsById.delete(key)
-  commandTextsById.set(key, text)
-  while (commandTextsById.size > MAX_COMMAND_TEXTS) {
-    const oldest = commandTextsById.keys().next().value
+  commandTextsByKey.delete(key)
+  commandTextsByKey.set(key, text)
+  while (commandTextsByKey.size > MAX_COMMAND_TEXTS) {
+    const oldest = commandTextsByKey.keys().next().value
     if (oldest === undefined) break
-    commandTextsById.delete(oldest)
+    commandTextsByKey.delete(oldest)
   }
 }
 
 /**
- * The command text for a decoded attribution key: the registered text when
- * the key belongs to an invocation this process wrapped (the embedder's
- * own, trusted text), else the key with control characters collapsed. The
- * decoded bytes arrive over carriers the sandboxed process can write to
- * (the observe socket's event field, the macOS log tag, the proxy
- * username), so a key that was never wrapped here is untrusted and every
- * producer's fallback sanitizes it alike. Exported for testing.
+ * The command text for a decoded attribution key. Keys arrive over carriers
+ * the sandboxed process can write (the observe socket's event field, the
+ * macOS log tag, the proxy username), so only a key this process registered
+ * carries the embedder's own text; anything else is untrusted bytes.
+ * Exported for testing.
  */
-export function resolveCommandText(decodedId: string): string {
-  return commandTextsById.get(decodedId) ?? sanitizeViolationText(decodedId)
+export function resolveCommandText(decodedKey: string): string {
+  return (
+    commandTextsByKey.get(decodedKey) ??
+    sanitizeUnregisteredCommandKey(decodedKey)
+  )
 }
 
 /**
@@ -258,9 +258,6 @@ function recordProxyViolation(
   line: string,
   encodedCommand: string | undefined,
 ): void {
-  // The proxy username is client-supplied inside the sandbox (only the
-  // password is authenticated), so the decoded key is untrusted bytes and
-  // resolves through the same registry-or-sanitize path as every producer.
   const command = encodedCommand
     ? resolveCommandText(decodeSandboxedCommand(encodedCommand))
     : undefined
@@ -2246,6 +2243,7 @@ async function reset(): Promise<void> {
   javaAgentJarPath = undefined
   sentinelRegistry.clear()
   awsPairRegistry.clear()
+  commandTextsByKey.clear()
   maskedFileStore.dispose()
 }
 

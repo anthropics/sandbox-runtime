@@ -795,11 +795,35 @@ export function buildPosixGitSafeDirEnv(opts: {
 }
 
 /**
+ * How much of an attribution key rides the carriers. A key is cut to this
+ * many characters before encoding, so two commands that share this much of
+ * a prefix share a key.
+ */
+export const SANDBOXED_COMMAND_KEY_LENGTH = 100
+
+/**
+ * The attribution key for an invocation: the caller's `commandId` when it
+ * passed a non-empty one, else the command itself. An empty id counts as
+ * absent, because every carrier drops an empty attribution (a bare `srt`
+ * proxy username, a log tag the extraction regex will not match, a falsy
+ * SRT_ENCODED_CMD), so keying on it would silently cost the invocation its
+ * attribution. Both the wrappers and the manager's registry derive the key
+ * here, so the two sides of the carrier agree on it.
+ */
+export function attributionKeyFor(
+  command: string,
+  commandId: string | undefined,
+): string {
+  return commandId === undefined || commandId === '' ? command : commandId
+}
+
+/**
  * Encode a command for sandbox monitoring
- * Truncates to 100 chars and base64 encodes to avoid parsing issues
+ * Truncates to SANDBOXED_COMMAND_KEY_LENGTH chars and base64 encodes to
+ * avoid parsing issues
  */
 export function encodeSandboxedCommand(command: string): string {
-  const truncatedCommand = command.slice(0, 100)
+  const truncatedCommand = command.slice(0, SANDBOXED_COMMAND_KEY_LENGTH)
   return Buffer.from(truncatedCommand).toString('base64')
 }
 
