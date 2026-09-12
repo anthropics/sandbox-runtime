@@ -115,6 +115,22 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     })
   }
 
+  // A command that reports one errno per labelled raw syscall and ends with
+  // PROBE_DONE, so a sandbox that never starts cannot pass as "no failures".
+  const PROBE_DONE = 'PROBE_DONE'
+  const q = (s: string): string => JSON.stringify(s)
+  function nodeProbe(ops: Array<[string, string]>): string {
+    const script = [
+      "const fs = require('fs')",
+      "const op = (n, f) => { try { f(); console.log(n + '=OK') } catch (e) { console.log(n + '=' + e.code) } }",
+      ...ops.map(([label, body]) => `op(${q(label)}, () => { ${body} })`),
+      `console.log(${q(PROBE_DONE)})`,
+    ].join('; ')
+    const probeFile = join(BASE, 'probe.cjs')
+    writeFileSync(probeFile, script)
+    return `${process.execPath} ${probeFile}`
+  }
+
   it('pins the directories between a mandatory deny leaf and the allowWrite root', async () => {
     mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
     const gitDir = join(PROJECT, '.git')
@@ -703,32 +719,207 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     },
   )
 
-  it('pins writably above the allow binds under a "/" write root', async () => {
+  it('pins above the allow binds under one writable cover with a "/" write root', async () => {
     mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
+    const gitDir = join(PROJECT, '.git')
+    const top = `/${BASE.split('/')[1]}`
 
     const command = await wrap({ allowWrite: ['/'] })
 
-    // Read-only pins would make the tree read-only, and pins beneath the
-    // root's own recursive bind would be buried by it.
-    const gitPin = `--bind ${join(PROJECT, '.git')} ${join(PROJECT, '.git')}`
-    expect(command).not.toContain(
-      `--ro-bind ${join(PROJECT, '.git')} ${join(PROJECT, '.git')}`,
-    )
-    expect(command.indexOf(gitPin)).toBeGreaterThan(
-      command.indexOf('--bind / /'),
-    )
-    // Other write roots are pinned too there: their own allow bind is buried
-    // by the root's, so it no longer makes them mountpoints.
-    expect(command.lastIndexOf(`--bind ${PROJECT} ${PROJECT}`)).toBeGreaterThan(
-      command.indexOf('--bind / /'),
-    )
-    // The deny bind still lands on top of the pins.
+    // Pins beneath the root's own recursive bind would be buried by it, so
+    // they go after the allow binds; the cover over them is what keeps them
+    // off the lookup path, which lets the pins themselves stay read-only.
+    const rootBind = command.indexOf('--bind / /')
+    const gitPin = command.indexOf(`--ro-bind ${gitDir} ${gitDir}`)
+    // Another write root is an ancestor like any other here: its own allow
+    // bind is buried by the root's and no longer makes it a mountpoint.
+    const projectPin = command.indexOf(`--ro-bind ${PROJECT} ${PROJECT}`)
+    const cover = command.indexOf(`--bind ${top} ${top}`)
+    for (const idx of [rootBind, gitPin, projectPin, cover]) {
+      expect(idx).toBeGreaterThan(-1)
+    }
+    expect(projectPin).toBeGreaterThan(rootBind)
+    expect(gitPin).toBeGreaterThan(projectPin)
+    expect(cover).toBeGreaterThan(gitPin)
+    // A read-only cover would make the whole top-level directory read-only.
+    expect(command).not.toContain(`--ro-bind ${top} ${top}`)
+    // The deny bind still lands on top of both.
     expect(
       command.indexOf(
-        `--ro-bind ${join(PROJECT, '.git', 'hooks')} ${join(PROJECT, '.git', 'hooks')}`,
+        `--ro-bind ${join(gitDir, 'hooks')} ${join(gitDir, 'hooks')}`,
       ),
-    ).toBeGreaterThan(command.indexOf(gitPin))
+    ).toBeGreaterThan(cover)
   })
+
+  it('covers the top-level directory of a protected path sitting directly in it', async () => {
+    // The WORKDIR /app shape: a protected path one level below '/' has no
+    // ancestor to pin, and the cover is the only thing that keeps its
+    // top-level directory a mountpoint. /usr holds no other protected path,
+    // so the cover can only come from this deny.
+    const absent = '/usr/srt-ancestor-pin-probe'
+    const command = await wrap({ allowWrite: ['/'], denyWrite: [absent] })
+
+    expect(command).toContain(`--ro-bind /dev/null ${absent}`)
+    expect(command).toContain('--bind /usr /usr')
+    expect(command).not.toContain('--ro-bind /usr /usr')
+  })
+
+  it('covers no top-level directory without a "/" write root', async () => {
+    mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
+    const top = `/${BASE.split('/')[1]}`
+
+    const command = await wrap()
+
+    expect(command).not.toContain(`--bind ${top} ${top}`)
+  })
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'renames and hard-links across every pinned ancestor under a "/" write root',
+    async () => {
+      // mv copies when rename(2) fails with EXDEV, so only raw syscalls say
+      // whether the pins put a filesystem boundary on the lookup path.
+      mkTree(PROJECT, {
+        '.git': { hooks: {}, config: '[core]\n', 'b.txt': 'b\n' },
+        sub: { 'c.txt': 'c\n' },
+        'a.txt': 'a\n',
+      })
+      const gitDir = join(PROJECT, '.git')
+      writeFileSync(join(BASE, 'outside.txt'), 'o\n')
+
+      const result = run(
+        await wrap(
+          { allowWrite: ['/'] },
+          nodeProbe([
+            [
+              'within',
+              `fs.renameSync(${q(join(PROJECT, 'a.txt'))}, ${q(join(PROJECT, 'sub', 'a2.txt'))})`,
+            ],
+            [
+              'intoGit',
+              `fs.renameSync(${q(join(PROJECT, 'sub', 'c.txt'))}, ${q(join(gitDir, 'c2.txt'))})`,
+            ],
+            [
+              'outOfGit',
+              `fs.renameSync(${q(join(gitDir, 'b.txt'))}, ${q(join(PROJECT, 'b2.txt'))})`,
+            ],
+            [
+              'intoProject',
+              `fs.renameSync(${q(join(BASE, 'outside.txt'))}, ${q(join(PROJECT, 'o2.txt'))})`,
+            ],
+            [
+              'linkIntoGit',
+              `fs.linkSync(${q(join(PROJECT, 'sub', 'a2.txt'))}, ${q(join(gitDir, 'hard.txt'))})`,
+            ],
+            [
+              'writeInGit',
+              `fs.writeFileSync(${q(join(gitDir, 'new.txt'))}, 'x')`,
+            ],
+          ]),
+        ),
+      )
+
+      expect(result.stdout).toContain(PROBE_DONE)
+      for (const label of [
+        'within',
+        'intoGit',
+        'outOfGit',
+        'intoProject',
+        'linkIntoGit',
+        'writeInGit',
+      ]) {
+        expect(result.stdout).toContain(`${label}=OK`)
+      }
+      expect(existsSync(join(gitDir, 'hard.txt'))).toBe(true)
+      expect(existsSync(join(PROJECT, 'o2.txt'))).toBe(true)
+    },
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'refuses to move, exchange or remove any pinned ancestor under a "/" write root',
+    async () => {
+      mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' }, exch: {} })
+      const gitDir = join(PROJECT, '.git')
+
+      const result = run(
+        await wrap(
+          { allowWrite: ['/'] },
+          nodeProbe([
+            [
+              'moveGit',
+              `fs.renameSync(${q(gitDir)}, ${q(join(PROJECT, '.git-aside'))})`,
+            ],
+            [
+              'moveProject',
+              `fs.renameSync(${q(PROJECT)}, ${q(join(BASE, 'project2'))})`,
+            ],
+            ['moveBase', `fs.renameSync(${q(BASE)}, ${q(`${BASE}2`)})`],
+            ['rmdirGit', `fs.rmdirSync(${q(gitDir)})`],
+            ['rmdirHooks', `fs.rmdirSync(${q(join(gitDir, 'hooks'))})`],
+          ]),
+        ),
+      )
+
+      expect(result.stdout).toContain(PROBE_DONE)
+      for (const label of [
+        'moveGit',
+        'moveProject',
+        'moveBase',
+        'rmdirGit',
+        'rmdirHooks',
+      ]) {
+        expect(result.stdout).toContain(`${label}=EBUSY`)
+      }
+      expect(readFileSync(join(gitDir, 'config'), 'utf8')).toBe('[core]\n')
+      expect(existsSync(`${BASE}2`)).toBe(false)
+    },
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE && CAN_CALL_RENAMEAT2)(
+    'blocks an exchange-rename of a pinned directory under a "/" write root',
+    async () => {
+      mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' }, exch: {} })
+
+      const result = run(
+        await wrap(
+          { allowWrite: ['/'] },
+          `cd ${PROJECT} && python3 -c "import ctypes, sys; libc = ctypes.CDLL(None, use_errno=True); r = libc.renameat2(-100, b'.git', -100, b'exch', 2); print('exchange=' + ('OK' if r == 0 else str(ctypes.get_errno())))"; echo ${PROBE_DONE}`,
+        ),
+      )
+
+      expect(result.stdout).toContain(PROBE_DONE)
+      // 16 is EBUSY.
+      expect(result.stdout).toContain('exchange=16')
+      expect(existsSync(join(PROJECT, '.git', 'config'))).toBe(true)
+    },
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE && Bun.which('git') !== null)(
+    'lets git commit in a pinned repository under a "/" write root',
+    async () => {
+      mkTree(PROJECT, { 'index.js': 'console.log(1)\n' })
+      expect(
+        spawnSync('git', [
+          '-c',
+          'init.defaultBranch=main',
+          'init',
+          '-q',
+          PROJECT,
+        ]).status,
+      ).toBe(0)
+
+      const result = run(
+        await wrap(
+          { allowWrite: ['/'] },
+          `cd ${PROJECT} && git add index.js && git -c user.name=t -c user.email=t@t -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m init && echo ${PROBE_DONE}`,
+        ),
+      )
+
+      expect(result.stdout).toContain(PROBE_DONE)
+      expect(existsSync(join(PROJECT, '.git', 'refs', 'heads', 'main'))).toBe(
+        true,
+      )
+    },
+  )
 
   it.if(BWRAP_CAN_NAMESPACE)(
     'blocks renaming .git aside under a "/" write root too',

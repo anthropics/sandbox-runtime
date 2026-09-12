@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -176,11 +177,40 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     // nothing, dropped the root's own deny, and left the file readable.
     const command = await wrap(['/', PROJ], [FILE], ['/', AREA])
 
-    expect(command).not.toContain(`--ro-bind ${PROJ} ${PROJ}`)
-    const rootBind = command.lastIndexOf('--ro-bind / /')
-    const mask = command.lastIndexOf(`--ro-bind /dev/null ${FILE}`)
-    expect(rootBind).toBeGreaterThan(-1)
-    expect(mask).toBeGreaterThan(rootBind)
+    // Two whole triples: the base root mount, then the deny's own bind. Both
+    // the dropped bind and the mask are measured against the SECOND —
+    // against the base mount alone the assertions hold even when the deny
+    // bind is missing, and that bind is what re-exposes the file.
+    const roots = [...command.matchAll(/--ro-bind \/ \/(?= )/g)]
+    expect(roots).toHaveLength(2)
+    // PROJ's own deny bind is dropped; its ancestor pin, emitted before the
+    // root's bind, is a different mount with the same spelling.
+    expect(command.indexOf(`--ro-bind ${PROJ} ${PROJ}`, roots[1]!.index)).toBe(
+      -1,
+    )
+    expect(command.lastIndexOf(`--ro-bind /dev/null ${FILE}`)).toBeGreaterThan(
+      roots[1]!.index,
+    )
+
+    if (BWRAP_CAN_NAMESPACE) {
+      const newFile = join(PROJ, 'new.txt')
+      const probe = await wrap(
+        ['/', PROJ],
+        [FILE],
+        ['/', AREA],
+        `(echo x > ${newFile}) 2>/dev/null && echo WROTE || echo REFUSED; echo "read:[$(cat ${FILE})]"`,
+      )
+      const result = spawnSync(probe, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: BASE,
+      })
+      expect(result.stderr ?? '').not.toContain('bwrap:')
+      expect(result.stdout).toContain('REFUSED')
+      expect(result.stdout).toContain('read:[]')
+      expect(existsSync(newFile)).toBe(false)
+    }
   })
 
   it('skips the stubs under a write-denied cwd when a recorded "/" is vetoed', async () => {

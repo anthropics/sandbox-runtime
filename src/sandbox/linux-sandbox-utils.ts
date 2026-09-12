@@ -872,45 +872,69 @@ function isAbsenceErrno(err: unknown): boolean {
   )
 }
 
+/** Top-level directories a cover must never take: --proc and --dev replace
+ * two of them after the pins are spliced in, and /sys is kernel state. */
+const TOP_LEVEL_DIRS_NEVER_COVERED = ['/proc', '/dev', '/sys']
+
 /**
- * A self-bind for every directory strictly between a seed (where a deny
- * bind, file mask or read-deny tmpfs lands) and its outermost covering
- * allowed write root, shallow-first. A directory that is not there is
- * skipped: bwrap cannot bind a missing source and there is nothing to
- * rename. One that exists but cannot be inspected is still pinned, and if
- * bwrap cannot bind it either the sandbox does not start, which is where the
- * deny loop lands too.
+ * A self-bind ("pin") for every directory between a seed (where a deny bind,
+ * file mask or read-deny tmpfs lands) and the allowed write root covering it,
+ * shallow-first, which makes each one a mountpoint the kernel refuses to
+ * rename or remove. A directory that is not there is skipped: bwrap cannot
+ * bind a missing source and there is nothing to rename. One that exists but
+ * cannot be inspected is still pinned, and if bwrap cannot bind it either the
+ * sandbox does not start, which is where the deny loop lands too.
  *
  * Pins are read-only and spliced in beneath every other mount, so that one
  * landing on top of an allowed write root cannot make it read-only; a write
  * root needs no pin of its own there, its allow bind already being a live
- * mountpoint. A '/' write root defeats both: its own recursive `--bind / /`
- * is one of the mounts above the pins and buries them — and any other allow
- * bind emitted before it — leaving those directories renamable. So under one
- * the pins are WRITABLE, cover the other write roots too, and are spliced in
- * after the allow binds: a mountpoint without a permission change, which is
- * all rename/rmdir/RENAME_EXCHANGE check. Deny binds, tmpfs units and masks
- * are emitted later still and land on top either way.
+ * mountpoint.
+ *
+ * A '/' write root defeats that: its own recursive `--bind / /` is one of the
+ * mounts above the pins and buries them, leaving those directories renamable.
+ * Under one the pins therefore go AFTER the allow binds and take every
+ * ancestor, the other allowed write roots included, stopping below the
+ * top-level directory D on the chain; a writable `--bind D D` — the cover —
+ * takes D itself and buries them again. Lookups enter the cover and never meet
+ * a pin, so no filesystem boundary lands inside D, while the kernel's rename
+ * and rmdir checks scan mounts by dentry and still find one. The only new
+ * boundary is at D. /proc, /dev and /sys are never covered, and a seed under
+ * one of them gets no pins.
  */
 function ancestorPinArgs(
   seeds: Iterable<string>,
   writeRoots: {
+    rootIsWriteRoot: boolean
     isWithinAllowedWrite: (dir: string) => boolean
     isAllowedWriteRoot: (dir: string) => boolean
   },
-): string[] {
-  const rootIsWriteRoot = writeRoots.isAllowedWriteRoot('/')
+): { args: string[]; covers: string[] } {
+  const { rootIsWriteRoot } = writeRoots
   const pinDirs = new Set<string>()
+  const coverDirs = new Set<string>()
   // Verdicts are seed-independent: a visited ancestor's chain is done.
   const visited = new Set<string>()
   for (const seed of seeds) {
+    if (
+      rootIsWriteRoot &&
+      TOP_LEVEL_DIRS_NEVER_COVERED.includes(`/${seed.split('/')[1] ?? ''}`)
+    ) {
+      continue
+    }
     for (
       let dir = path.dirname(seed);
       dir !== '/' && !visited.has(dir) && writeRoots.isWithinAllowedWrite(dir);
       dir = path.dirname(dir)
     ) {
       visited.add(dir)
-      if (!rootIsWriteRoot && writeRoots.isAllowedWriteRoot(dir)) continue
+      if (rootIsWriteRoot) {
+        if (path.dirname(dir) === '/') {
+          coverDirs.add(dir)
+          continue
+        }
+      } else if (writeRoots.isAllowedWriteRoot(dir)) {
+        continue
+      }
       try {
         fs.statSync(dir)
       } catch (err) {
@@ -919,9 +943,16 @@ function ancestorPinArgs(
       pinDirs.add(dir)
     }
   }
-  return [...pinDirs]
-    .sort((a, b) => a.split('/').length - b.split('/').length)
-    .flatMap(dir => [rootIsWriteRoot ? '--bind' : '--ro-bind', dir, dir])
+  const covers = [...coverDirs]
+  return {
+    args: [
+      ...[...pinDirs]
+        .sort((a, b) => a.split('/').length - b.split('/').length)
+        .flatMap(dir => ['--ro-bind', dir, dir]),
+      ...covers.flatMap(dir => ['--bind', dir, dir]),
+    ],
+    covers,
+  }
 }
 
 /**
@@ -1216,17 +1247,18 @@ async function generateFilesystemArgs(
     readDenyEntriesMemo = entries
     return entries
   }
-  // Where the ancestor pins are spliced in once every mount is known:
-  // beneath the allow binds, or above them under a '/' write root that would
-  // otherwise bury them (ancestorPinArgs picks the flavour to match).
-  let ancestorPinInsertAt: number | undefined
-  let writableAncestorPinInsertAt: number | undefined
+  // Where the ancestor pins are spliced in once every mount is known, and in
+  // which flavour: beneath the allow binds, or after them under a '/' write
+  // root that would otherwise bury them (see ancestorPinArgs).
+  let ancestorPinPlan:
+    | { insertAt: number; rootIsWriteRoot: boolean }
+    | undefined
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
     // Write restrictions: Start with read-only root, then allow writes to specific paths
     args.push('--ro-bind', '/', '/')
-    ancestorPinInsertAt = args.length
+    const beneathAllowBinds = args.length
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
@@ -1288,7 +1320,11 @@ async function generateFilesystemArgs(
       args.push('--bind', normalizedPath, normalizedPath)
       allowedWritePaths.push(normalizedPath)
     }
-    writableAncestorPinInsertAt = args.length
+    const rootIsWriteRoot = isAllowedWriteRoot('/')
+    ancestorPinPlan = {
+      insertAt: rootIsWriteRoot ? args.length : beneathAllowBinds,
+      rootIsWriteRoot,
+    }
 
     // Inputs for the covering-directory vetoes, computed at most once and
     // only when a deny path (absent or existing) lies strictly beneath a
@@ -1459,11 +1495,15 @@ async function generateFilesystemArgs(
     // read-only binds is the tmpfs the denyRead re-application mounts (what
     // it restores comes back read-only), and it fires only for a tmpfs that
     // landed inside an emitted dest (a tmpfs comparable with the covering
-    // directory). (Ancestor pins are read-only self-binds spliced in beneath
-    // every other mount, so they are neither writable emissions nor part of
-    // denyWriteArgs.) A comparable tmpfs is thus both the re-opening vector
-    // (beneath or around the dir) and the only way the dir's own --ro-bind
-    // gets dropped at emission as hidden-by-a-tmpfs. (The emission filter's
+    // directory). (The ancestor pins and their covers are spliced in before
+    // the buffered deny binds, so neither is ever a writable emission on top
+    // of one; under a '/' write root a cover adds no access that root's own
+    // --bind / / had not already given. A buried pin survives a later mount
+    // that shadows it, but not one AT '/': that one the pivot promotes, and
+    // protection there is the deny's own EROFS.) A comparable tmpfs is thus
+    // both the re-opening vector (beneath or around the dir) and the only way
+    // the dir's own --ro-bind gets dropped at emission as
+    // hidden-by-a-tmpfs. (The emission filter's
     // other drop condition, fileMasks, holds file dests only — /dev/null
     // read-deny masks and credential-mask fakes — while the pre-pass stat-verifies every
     // recorded dir as a directory, so it cannot drop a recorded dir short of
@@ -1914,42 +1954,35 @@ async function generateFilesystemArgs(
     fileMasks.push({ dest, source: fakePath, landing })
   }
 
-  // Ancestor pinning: the directories strictly between a deny bind, file
-  // mask or read-deny tmpfs and its covering allowed write root carry no
-  // mount, so rename(2) on one moves the mount along with it and the path
-  // can be recreated unprotected (mv .git aside; mkdir .git; write
-  // .git/hooks/x), or, for a read-denied path, is simply not found by the
-  // next command's wrap and left readable under its new name. Each gets a
-  // self-bind spliced in straight after the read-only root — or, under a '/'
-  // write root, after the allow binds that would otherwise bury it (see
-  // ancestorPinArgs): buried under every later mount it still makes the
-  // directory a mountpoint, which is all rename/rmdir/RENAME_EXCHANGE check
-  // (EBUSY), while permissions, deny binds, tmpfs units and masks are decided
-  // entirely by the mounts above it and no vfsmount boundary appears on the
-  // lookup path (no EXDEV for renames across a pinned directory). Seeds are
-  // landings because the walk takes dirname() of each: a symlink spelling
-  // would pin the chain of the link, not of where the mount sits.
-  if (
-    ancestorPinInsertAt !== undefined &&
-    writableAncestorPinInsertAt !== undefined
-  ) {
-    args.splice(
-      isAllowedWriteRoot('/')
-        ? writableAncestorPinInsertAt
-        : ancestorPinInsertAt,
-      0,
-      ...ancestorPinArgs(
-        [
-          ...denyWriteRawDests.keys(),
-          ...fileMasks.map(mask => mask.landing),
-          ...readDenyTmpfsUnits.map(unit => unit.landing),
-        ],
-        {
-          isWithinAllowedWrite: isWithinAnyAllowedWritePath,
-          isAllowedWriteRoot,
-        },
-      ),
+  // Ancestor pinning: the directories between a deny bind, file mask or
+  // read-deny tmpfs and its covering allowed write root carry no mount, so
+  // rename(2) on one moves the mount along with it and the path can be
+  // recreated unprotected (mv .git aside; mkdir .git; write .git/hooks/x),
+  // or, for a read-denied path, is simply not found by the next command's
+  // wrap and left readable under its new name. ancestorPinArgs says what is
+  // pinned and where. Seeds are landings because the walk takes dirname() of
+  // each: a symlink spelling would pin the chain of the link, not of where
+  // the mount sits. Deny binds, tmpfs units and masks are emitted later and
+  // land on top of both pins and covers.
+  if (ancestorPinPlan !== undefined) {
+    const { args: pinArgs, covers } = ancestorPinArgs(
+      [
+        ...denyWriteRawDests.keys(),
+        ...fileMasks.map(mask => mask.landing),
+        ...readDenyTmpfsUnits.map(unit => unit.landing),
+      ],
+      {
+        rootIsWriteRoot: ancestorPinPlan.rootIsWriteRoot,
+        isWithinAllowedWrite: isWithinAnyAllowedWritePath,
+        isAllowedWriteRoot,
+      },
     )
+    if (covers.length > 0) {
+      logForDebugging(
+        `[Sandbox Linux] Covering the pinned ancestors under: ${covers.join(', ')}`,
+      )
+    }
+    args.splice(ancestorPinPlan.insertAt, 0, ...pinArgs)
   }
 
   // Emitting denyWrite last means these ro-binds layer on top of any write

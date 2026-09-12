@@ -470,29 +470,50 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(secIdx).toBeGreaterThan(pubIdx)
   })
 
-  it('denies beneath a writable root, and pins writably above its bind', async () => {
+  it('denies beneath a writable root, and pins above its bind under one writable cover', async () => {
     // '/' is a legal allowOnly entry, and the allow loop binds it writable,
     // so the denies inside it apply: a `root + '/'` prefix test spells '//'
     // and matches nothing, which silently dropped every deny and every
     // mandatory deny over a root already bound read-write.
     //
     // The pins cannot sit beneath that root's own recursive --bind / /,
-    // which would bury them, nor be read-only on top of it, which would make
-    // the tree read-only. They are writable self-binds after the allow binds.
-    const wrapped = await wrapCommandWithSandboxLinux({
-      ...baseParams,
-      writeConfig: { allowOnly: ['/'], denyWithinAllow: [] },
-    })
-    const cwd = process.cwd()
-    const rootBind = wrapped.indexOf('--bind / /')
-    const parentPin = wrapped.indexOf(`--bind ${dirname(cwd)} ${dirname(cwd)}`)
-    const cwdPin = wrapped.indexOf(`--bind ${cwd} ${cwd}`)
-    expect(rootBind).toBeGreaterThan(-1)
-    expect(wrapped).toContain(` ${join(cwd, '.bashrc')}`)
-    expect(wrapped).not.toContain(`--ro-bind ${dirname(cwd)} ${dirname(cwd)}`)
-    expect(wrapped).not.toContain(`--ro-bind ${cwd} ${cwd}`)
-    expect(parentPin).toBeGreaterThan(rootBind)
-    expect(cwdPin).toBeGreaterThan(parentPin)
+    // which would bury them. They go after the allow binds, stopping below
+    // the top-level directory, which a writable --bind takes over them.
+    const savedCwd = process.cwd()
+    // An explicit two-deep tree: with the ambient cwd a direct child of '/'
+    // (a checkout at /src, WORKDIR /app) the parent pin IS the cover.
+    const proj = tempTree({ 'work/proj/keep.txt': 'x' })
+    const cwd = join(proj, 'work', 'proj')
+    const top = `/${proj.split('/')[1]}`
+    process.chdir(cwd)
+    try {
+      const wrapped = await wrapCommandWithSandboxLinux({
+        ...baseParams,
+        writeConfig: { allowOnly: ['/'], denyWithinAllow: [] },
+      })
+      const rootBind = wrapped.indexOf('--bind / /')
+      const parentPin = wrapped.indexOf(
+        `--ro-bind ${dirname(cwd)} ${dirname(cwd)}`,
+      )
+      const cwdPin = wrapped.indexOf(`--ro-bind ${cwd} ${cwd}`)
+      const cover = wrapped.indexOf(`--bind ${top} ${top}`)
+      for (const idx of [rootBind, parentPin, cwdPin, cover]) {
+        expect(idx).toBeGreaterThan(-1)
+      }
+      expect(wrapped).toContain(` ${join(cwd, '.bashrc')}`)
+      // Read-only pins under one writable cover: a read-only cover would
+      // make the whole top-level directory read-only.
+      expect(wrapped).not.toContain(`--ro-bind ${top} ${top}`)
+      expect(parentPin).toBeGreaterThan(rootBind)
+      expect(cwdPin).toBeGreaterThan(parentPin)
+      expect(cover).toBeGreaterThan(cwdPin)
+      // The deny binds still land on top of the cover.
+      expect(
+        wrapped.indexOf(`--ro-bind /dev/null ${join(cwd, '.bashrc')}`),
+      ).toBeGreaterThan(cover)
+    } finally {
+      process.chdir(savedCwd)
+    }
   })
 
   it('stubs no absent path after a read-only root when the root is both allowed and denied', async () => {
