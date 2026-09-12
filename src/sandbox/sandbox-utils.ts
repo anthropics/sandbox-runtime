@@ -323,9 +323,23 @@ export function expandWindowsEnvRefs(p: string): string {
  * - Glob patterns preserve wildcards after path normalization
  *
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
+ *
+ * `opts.literal` marks a path that names one file or directory rather
+ * than matching several: one the library computed itself, or a caller
+ * spelling that carried no glob character — resolving such a spelling can
+ * splice in a cwd or home directory whose own name does. The glob
+ * branches are skipped for it, so a component like `a[b` is resolved and
+ * later compiled as the name it is. A spelling the caller wrote with `*`,
+ * `?` or `[…]` in it keeps the character sniffing: there the brackets are
+ * the glob syntax it asked for.
  */
-export function normalizePathForSandbox(pathPattern: string): string {
+export function normalizePathForSandbox(
+  pathPattern: string,
+  opts?: { literal?: boolean },
+): string {
   const cwd = process.cwd()
+  const isGlobSpelling = (p: string): boolean =>
+    !opts?.literal && containsGlobCharsForPlatform(p)
   // Windows pre-processing: expand `%USERPROFILE%` / `%HOMEDRIVE%` /
   // `%HOMEPATH%`, strip the `\\?\` / `\\?\UNC\` extended prefix (its
   // `?` is a literal, not a glob char), and uppercase the drive
@@ -338,7 +352,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
     // UNC literal: return as-is (separators normalised only) — no
     // stat/realpath. A UNC *glob* falls through to the glob walk
     // below (user-trusted share). See {@link isUncPath}.
-    if (isUncPath(pathPattern) && !containsGlobCharsWin(pathPattern)) {
+    if (isUncPath(pathPattern) && !isGlobSpelling(pathPattern)) {
       return path.win32.normalize(pathPattern)
     }
   }
@@ -356,7 +370,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
     getPlatform() !== 'windows' &&
     pathPattern.endsWith('/') &&
     pathPattern !== '/' &&
-    !containsGlobCharsForPlatform(pathPattern)
+    !isGlobSpelling(pathPattern)
   ) {
     pathPattern = pathPattern.replace(/\/+$/, '') || '/'
   }
@@ -373,7 +387,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
   }
 
   // For glob patterns, resolve symlinks for the directory portion only
-  if (containsGlobCharsForPlatform(normalizedPath)) {
+  if (isGlobSpelling(normalizedPath)) {
     // Extract the static directory prefix before glob characters
     // (on Windows, `[`/`]` are literal so only split on `*`/`?`).
     const splitRe = getPlatform() === 'windows' ? /[*?]/ : /[*?[\]]/

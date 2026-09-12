@@ -22,7 +22,7 @@ import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import {
   wrapCommandWithSandboxMacOS,
-  macGetMandatoryDenyPatterns,
+  macGetMandatoryDenyEntries,
 } from '../../src/sandbox/macos-sandbox-utils.js'
 import {
   wrapCommandWithSandboxLinux,
@@ -1135,9 +1135,9 @@ describe.if(isSupportedPlatform)(
   },
 )
 
-describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
+describe('macGetMandatoryDenyEntries - Unit Tests', () => {
   it('includes .git/config in deny patterns when allowGitConfig is false', () => {
-    const patterns = macGetMandatoryDenyPatterns(false)
+    const patterns = macGetMandatoryDenyEntries(false).map(e => e.path)
 
     // Should include .git/config pattern
     const hasGitConfigPattern = patterns.some(
@@ -1147,7 +1147,7 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
   })
 
   it('excludes .git/config from deny patterns when allowGitConfig is true', () => {
-    const patterns = macGetMandatoryDenyPatterns(true)
+    const patterns = macGetMandatoryDenyEntries(true).map(e => e.path)
 
     // Should NOT include .git/config pattern
     const hasGitConfigPattern = patterns.some(
@@ -1157,8 +1157,12 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
   })
 
   it('always includes .git/hooks in deny patterns regardless of allowGitConfig', () => {
-    const patternsWithoutGitConfig = macGetMandatoryDenyPatterns(false)
-    const patternsWithGitConfig = macGetMandatoryDenyPatterns(true)
+    const patternsWithoutGitConfig = macGetMandatoryDenyEntries(false).map(
+      e => e.path,
+    )
+    const patternsWithGitConfig = macGetMandatoryDenyEntries(true).map(
+      e => e.path,
+    )
 
     // Both should include .git/hooks pattern
     const hasHooksPatternFalse = patternsWithoutGitConfig.some(p =>
@@ -1173,7 +1177,7 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
   })
 
   it('defaults to blocking .git/config when no argument provided', () => {
-    const patterns = macGetMandatoryDenyPatterns()
+    const patterns = macGetMandatoryDenyEntries().map(e => e.path)
 
     const hasGitConfigPattern = patterns.some(
       p => p.includes('.git/config') || p.endsWith('.git/config'),
