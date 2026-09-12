@@ -453,8 +453,11 @@ export function normalizePathForSandbox(pathPattern: string): string {
     return warnIfParentRefUnfolded(normalizedPath)
   }
 
-  // A trailing '/' or '/.' is not semantic outside a glob.
-  if (getPlatform() !== 'windows') {
+  // A trailing '/' or '/.' is not semantic outside a glob, and the empty
+  // string is not the filesystem root: an empty HOME makes expandTilde('~')
+  // empty, and '' || '/' would turn `allowWrite: ['~']` into a whole-
+  // filesystem grant.
+  if (getPlatform() !== 'windows' && normalizedPath !== '') {
     normalizedPath =
       normalizedPath.replace(/\/\.$/, '').replace(/\/+$/, '') || '/'
   }
