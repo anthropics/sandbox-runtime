@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { quote } from './utils/shell-quote.js'
-import { Command } from 'commander'
+import { Command, InvalidArgumentError } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
 import { spawn } from 'child_process'
@@ -17,6 +17,21 @@ import * as os from 'os'
  */
 function getDefaultConfigPath(): string {
   return path.join(os.homedir(), '.srt-settings.json')
+}
+
+/**
+ * Whether there is a settings file at this path at all. loadConfig() returns
+ * null both for a file that is not there and for one that is there but does
+ * not load, and only the first of those is a reason to fall back to the
+ * built-in defaults.
+ */
+function settingsFilePresent(filePath: string): boolean {
+  try {
+    fs.readFileSync(filePath)
+    return true
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ENOENT'
+  }
 }
 
 /**
@@ -59,14 +74,40 @@ function openControlFd(fd: number): NodeJS.ReadableStream {
     try {
       return new net.Socket({ fd, readable: true, writable: false }).unref()
     } catch (err) {
-      // A socket libuv cannot adopt as a stream (datagram, seqpacket):
-      // read it through fs as before, one read(2) per datagram.
+      const code = (err as NodeJS.ErrnoException).code
+      if (code !== 'ERR_INVALID_FD_TYPE') {
+        // ERR_INVALID_FD_TYPE is the only refusal that leaves the fd
+        // untouched (a datagram or seqpacket socket, which the fs stream
+        // still reads, one read(2) per datagram). Every other failure comes
+        // out of uv_pipe_open, which has already switched the fd to
+        // non-blocking mode: an fs stream over it would read EAGAIN
+        // forever, so no fallback is left to take.
+        throw new Error(
+          `could not be adopted as a stream (${code ?? String(err)})`,
+        )
+      }
       logForDebugging(
         `Control fd ${fd} is not a stream socket (${err instanceof Error ? err.message : String(err)}); reading it through fs`,
       )
     }
   }
   return fs.createReadStream('', { fd })
+}
+
+/**
+ * Parse --control-fd. Anything but an integer >= 3 is refused here, before
+ * the sandbox is built: 0-2 are the standard streams, and a number that is
+ * not a descriptor the caller passed in either cannot be read at all or
+ * names one this process opened for itself (fstat succeeds on those).
+ */
+function parseControlFd(value: string): number {
+  const fd = Number(value)
+  if (!Number.isInteger(fd) || fd < 3) {
+    throw new InvalidArgumentError(
+      'must be an integer file descriptor >= 3 (0-2 are stdin, stdout and stderr).',
+    )
+  }
+  return fd
 }
 
 async function main(): Promise<void> {
@@ -177,8 +218,9 @@ async function main(): Promise<void> {
     )
     .option(
       '--control-fd <fd>',
-      'read config updates from file descriptor (JSON lines protocol)',
-      parseInt,
+      'read config updates from an inherited file descriptor >= 3 (JSON lines ' +
+        'protocol; give srt a dedicated read-only end — see the README)',
+      parseControlFd,
     )
     .allowUnknownOption()
     .action(
@@ -214,6 +256,18 @@ async function main(): Promise<void> {
               )
               process.exit(1)
             }
+            // The default settings file is optional, but one that is there
+            // and does not load is not the same as not having one: the
+            // default config denies nothing, so falling back to it would
+            // let a single bad entry discard every rule in the file.
+            // loadConfig has already said what is wrong with it.
+            if (settingsFilePresent(configPath)) {
+              console.error(
+                `Error: ${configPath} exists but does not hold a valid config. ` +
+                  'Refusing to run with the default config, which restricts nothing.',
+              )
+              process.exit(1)
+            }
             logForDebugging(
               `No config found at ${configPath}, using default config`,
             )
@@ -246,10 +300,11 @@ async function main(): Promise<void> {
 
           // Set up control fd for dynamic config updates if specified
           let controlReader: readline.Interface | null = null
-          if (options.controlFd !== undefined) {
+          const controlFd = options.controlFd
+          if (controlFd !== undefined) {
             try {
               controlReader = readline.createInterface({
-                input: openControlFd(options.controlFd),
+                input: openControlFd(controlFd),
                 crlfDelay: Infinity,
               })
 
@@ -261,7 +316,12 @@ async function main(): Promise<void> {
                   )
                   SandboxManager.updateConfig(newConfig)
                 } else if (line.trim()) {
-                  // Only log non-empty lines that failed to parse
+                  // The caller has to learn its update was dropped whether
+                  // or not it runs srt with --debug; the line itself stays
+                  // in the debug log rather than on the terminal.
+                  console.error(
+                    `Invalid config on control fd ${controlFd}: ignored, previous config still in force`,
+                  )
                   logForDebugging(
                     `Invalid config on control fd (ignored): ${line}`,
                   )
@@ -269,16 +329,25 @@ async function main(): Promise<void> {
               })
 
               controlReader.on('error', err => {
-                logForDebugging(`Control fd error: ${err.message}`)
+                console.error(
+                  `Error reading control fd ${controlFd}: ${err.message}`,
+                )
               })
 
-              logForDebugging(
-                `Listening for config updates on fd ${options.controlFd}`,
-              )
+              // End of input just means the writer closed its end. The
+              // command keeps running under the config last applied.
+              logForDebugging(`Listening for config updates on fd ${controlFd}`)
             } catch (err) {
-              logForDebugging(
-                `Failed to open control fd ${options.controlFd}: ${err instanceof Error ? err.message : String(err)}`,
+              // Same rule as an explicit --settings that will not load: a
+              // caller that asked for a control channel gets an error, not
+              // a run whose updates — including the ones that tighten the
+              // sandbox — quietly go nowhere.
+              console.error(
+                `Error: --control-fd ${controlFd} is not usable: ` +
+                  `${err instanceof Error ? err.message : String(err)}. ` +
+                  'Refusing to run the command without the control channel it asks for.',
               )
+              process.exit(1)
             }
           }
 
