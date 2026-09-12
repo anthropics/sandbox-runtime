@@ -889,20 +889,26 @@ function resolveSymlinkDenyDest(normalizedPath: string): string {
  * paths and allowRead paths the tmpfs just wiped. Used by the denyRead loop
  * in generateFilesystemArgs and again when a late denyWrite ro-bind re-exposes
  * a read-denied directory and the tmpfs must be re-applied on top.
+ *
+ * Returns the allowed write paths it re-bound writable. On the re-application
+ * those binds also bury every write-deny bind already emitted beneath them, so
+ * the caller has to emit those again.
  */
 function pushReadDenyDirMounts(
   args: string[],
   normalizedPath: string,
   allowedWritePaths: string[],
   readAllowPaths: string[],
-): void {
+): string[] {
   const denySep = normalizedPath === '/' ? '/' : normalizedPath + '/'
+  const reBoundWritePaths: string[] = []
   args.push('--tmpfs', normalizedPath)
 
   // tmpfs wiped any earlier write binds under this path — restore them.
   for (const writePath of allowedWritePaths) {
     if (writePath.startsWith(denySep) || writePath === normalizedPath) {
       args.push('--bind', writePath, writePath)
+      reBoundWritePaths.push(writePath)
       logForDebugging(
         `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
       )
@@ -940,6 +946,8 @@ function pushReadDenyDirMounts(
       )
     }
   }
+
+  return reBoundWritePaths
 }
 
 /**
@@ -1252,15 +1260,16 @@ async function generateFilesystemArgs(
     // Rationale: the only writable emissions that land after the
     // buffered read-only binds are the denyRead re-applications
     // (pushReadDenyDirMounts), which mount a tmpfs and re-bind allowed write
-    // paths beneath it WITHOUT re-emitting the binds it buries — so a
-    // comparable tmpfs is both the re-opening vector (beneath or around the
-    // dir) and the only way the dir's own --ro-bind gets dropped at emission
-    // as hidden-by-a-tmpfs. (The emission filter's other drop condition,
-    // maskedFiles, holds file dests only — /dev/null read-deny masks and
-    // credential-mask fakes — while the pre-pass stat-verifies every
-    // recorded dir as a directory, so it cannot drop a recorded dir short of
-    // a dir→file race, which ends in bwrap refusing to start, not a silent
-    // gap.) Only existing read-deny directories become a tmpfs: absent and
+    // paths beneath it. The re-application re-emits the deny binds it buries,
+    // but a bind skipped here was never emitted and so has nothing to
+    // re-emit — so a comparable tmpfs is both the re-opening vector (beneath
+    // or around the dir) and the only way the dir's own --ro-bind gets
+    // dropped at emission as hidden-by-a-tmpfs. (The emission filter's other
+    // drop condition, maskedFiles, holds file dests only — /dev/null
+    // read-deny masks and credential-mask fakes — while the pre-pass
+    // stat-verifies every recorded dir as a directory, so it cannot drop a
+    // recorded dir short of a dir→file race, which ends in bwrap refusing to
+    // start, not a silent gap.) Only existing read-deny directories become a tmpfs: absent and
     // file-level read-denies count for nothing. If any condition could
     // apply, keep the stub — the pre-existing abort is preferable to a
     // silently creatable deny path. (An allow path bound before the
@@ -1640,7 +1649,9 @@ async function generateFilesystemArgs(
   //   the host, so the write-deny stays enforced without the bind. Exception:
   //   if an allowed write path at-or-under that tmpfs covers the dest, the
   //   denyRead loop re-bound it (the .git/hooks case) and the write-deny bind
-  //   is still required on top.
+  //   is still required on top. Such a bind is buried again every time that
+  //   tmpfs is re-applied below, which is why the re-application emits it a
+  //   second time.
   // tmpfsDirs and allowedWritePaths hold unresolved paths while dest has been
   // canonicalized, so each dest is tested under both spellings: they name the
   // same inode after bwrap resolves the mount destinations, and a hit on
@@ -1658,6 +1669,15 @@ async function generateFilesystemArgs(
     })
 
   const emittedDenyWriteDests: string[] = []
+  // The emitted triples themselves, in emission order, for the tmpfs
+  // re-application below: only a bind's own (flag, source, dest) can put it
+  // back once a re-applied tmpfs has buried it.
+  const emittedDenyWriteBinds: Array<{
+    flag: string
+    source: string
+    dest: string
+    rawDest: string
+  }> = []
   for (let i = 0; i < denyWriteArgs.length; i += 3) {
     const dest = denyWriteArgs[i + 2]!
     const rawDest = denyWriteRawDests.get(dest) ?? dest
@@ -1669,6 +1689,12 @@ async function generateFilesystemArgs(
       continue
     }
     args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
+    emittedDenyWriteBinds.push({
+      flag: denyWriteArgs[i]!,
+      source: denyWriteArgs[i + 1]!,
+      dest,
+      rawDest,
+    })
     emittedDenyWriteDests.push(dest)
     // The tmpfs / mask re-application passes below ask "does this bind sit
     // above a read-denied path?". A bind at the resolved dest also re-exposes
@@ -1687,7 +1713,36 @@ async function generateFilesystemArgs(
       logForDebugging(
         `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${tmpfsDir}`,
       )
-      pushReadDenyDirMounts(args, tmpfsDir, allowedWritePaths, readAllowPaths)
+      const reBoundWritePaths = pushReadDenyDirMounts(
+        args,
+        tmpfsDir,
+        allowedWritePaths,
+        readAllowPaths,
+      )
+      // The re-applied tmpfs buried every denyWrite bind under it and the
+      // writable re-binds just put the host contents back underneath them, so
+      // each such bind has to be emitted again — the same reason the masked
+      // files below are. Without this the write-deny the emission filter
+      // deliberately kept (the .git/hooks case) ends up writable, with no
+      // abort and nothing in the log. Only binds at or under a re-bound write
+      // path need it: anything else the tmpfs covers stays covered, and
+      // writes there never reach the host. Dests are canonical while the
+      // re-bound write paths are spelled as configured, so both spellings are
+      // tested, as in the emission filter above.
+      for (const bind of emittedDenyWriteBinds) {
+        if (
+          reBoundWritePaths.some(
+            writePath =>
+              isAtOrUnder(bind.dest, writePath) ||
+              isAtOrUnder(bind.rawDest, writePath),
+          )
+        ) {
+          logForDebugging(
+            `[Sandbox Linux] Re-applying denyWrite bind buried by the re-applied tmpfs: ${bind.dest}`,
+          )
+          args.push(bind.flag, bind.source, bind.dest)
+        }
+      }
     }
   }
   // Same problem for masked files: the mask landed before the denyWrite
