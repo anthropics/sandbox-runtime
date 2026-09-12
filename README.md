@@ -215,7 +215,7 @@ child.on('exit', async code => {
 })
 ```
 
-**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you *execute* is not the command the invocation *represents* (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
+**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you _execute_ is not the command the invocation _represents_ (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
 
 ```typescript
 const wrapped = await SandboxManager.wrapWithSandbox(
@@ -226,7 +226,10 @@ const wrapped = await SandboxManager.wrapWithSandbox(
   { commandId: invocationId, commandText: rawCommand },
 )
 // ... run it ...
-const annotated = SandboxManager.annotateStderrWithSandboxFailures(invocationId, stderr)
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(
+  invocationId,
+  stderr,
+)
 ```
 
 #### Available exports
@@ -674,7 +677,7 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 - IDE directories: `.vscode/`, `.idea/`
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
-- Git hooks and config: `.git/hooks/`, `.git/config`
+- Git hooks and config: `hooks/`, `config`, `config.worktree` and `commondir` of a git directory — the working directory's repository, nested repositories, the submodule git directories they keep under `.git/modules/`, and a linked worktree's git directory. A directory under `.git/modules` the walk cannot see through is denied whole instead, which leaves it and everything beneath it read-only inside the sandbox — a submodule's `objects`, `refs` and `index` included, so git writes inside such a tree stop working. Three things produce one: a directory the walk cannot list, an entry it cannot stat — for both of which what is denied is the deepest ancestor it can reach, which may be `.git/modules` itself — and, once per branch that reaches the walk's depth bound (`MAX_SUBMODULE_WALK_DEPTH`), the `modules` directory beneath the git directory it stopped at, or that directory itself when it is not a git directory. `commondir` and `config.worktree` are denied because git reads the hooks and config through them: `commondir` moves them to another directory entirely, and `config.worktree` is read instead of `config` wherever `extensions.worktreeConfig` is on (`git sparse-checkout init` turns it on). An existing `.git` _file_ (a linked worktree's or submodule checkout's `gitdir:` pointer) is read-only and cannot be removed or renamed over; creating a new one inside an allowed write path is still possible. The hooks and config a pointer leads to (the main repository's, for a worktree) are blocked as well, and so is filling in a git directory a pointer names but that does not exist yet; a pointer naming a directory that is not a git directory is not followed. A pointer is read the way git reads one — the whole file, `\n` and `\r` stripped from its end, the path ending at the first NUL — and one larger than the 1 MiB git accepts for a `.git` file is not followed, because git refuses it too. A pointer and a `commondir` are both denied under the path as written and, where a `..` in one follows a symlink, under the directory the kernel actually opens as well, since `link/../x` does not land where folding the path on paper says it does. Where the directory a pointer or a `commondir` names cannot be worked out that way at all — a `commondir` past that size, which git reads with no limit of its own, or a path whose bytes are not valid UTF-8 — the command is refused rather than sandboxed with a deny list that may cover the wrong directory. On macOS only the working directory's own `.git` file is followed, since nested pointers are matched by pattern; the working directory's own submodule git directories are enumerated exactly, while a nested repository's are matched as `.git/modules/<name>/`, which covers a single-segment submodule name.
 
 These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 
@@ -686,9 +689,19 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
-**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
+**Git operations these denies break.** A git directory's `hooks/` and `config` are what a hook or a `core.fsmonitor` would be written to, so anything that writes or removes them fails inside the sandbox:
 
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
+- removing a tree that holds a submodule checkout or a linked worktree (`rm -rf lib`, `git clean -ffdx`), because its `.git` pointer file cannot be removed;
+- `git worktree remove`, `git worktree move`, `git worktree repair`, `git submodule deinit`, for the same reason;
+- `git submodule update --init` for a submodule that has not been cloned yet, which copies template hooks into `.git/modules/<name>/hooks/` and writes its config;
+- from a linked worktree, anything writing the main repository's config: `git push -u`, `git checkout -b x origin/y`;
+- `git init` and `git clone` into a subdirectory, which create `.git/hooks/`.
+
+**Known limit (both platforms).** A pointer file or a pattern-matched path is protected where it is: a command may still rename the directory _holding_ it aside and create a fresh one in its place (`mv lib lib.old && mkdir lib && echo 'gitdir: …' > lib/.git`). On Linux a path found by the scan has its ancestor directories pinned within the scan depth, so this is blocked there for what the scan reached; on macOS it is blocked for the literal denies (the working directory's own repository and its submodule git directories) and not for the pattern ones.
+
+**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach (a blocked _directory_, such as a repository's `.git/hooks/`, does cover files created in it later). macOS uses glob patterns which block both existing and new files. The Linux scan ignores `.gitignore` and similar ignore files, since the sandboxed command can write those. It fails closed: a directory it cannot read is denied whole, and a scan that does not finish in time aborts the command rather than sandboxing it with a partial deny list (a scan that cannot run at all — no `ripgrep` — is still logged and not fatal).
+
+**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance, which reaches a nested repository directly beneath the working directory. You can configure this with `mandatoryDenySearchDepth`:
 
 ```json
 {

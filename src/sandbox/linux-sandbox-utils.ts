@@ -7,7 +7,8 @@ import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
-import { ripGrep } from '../utils/ripgrep.js'
+import { ripGrep, RipgrepError } from '../utils/ripgrep.js'
+import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   generateProxyEnvVars,
@@ -21,6 +22,11 @@ import {
   isStrictlyUnder,
   getDangerousDirectories,
 } from './sandbox-utils.js'
+import {
+  gitDirDenyPaths,
+  gitFileDenyPaths,
+  submoduleGitDirs,
+} from './mandatory-deny-paths.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
@@ -72,7 +78,7 @@ export interface LinuxSandboxParams {
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
-  ripgrepConfig?: { command: string; args?: string[] }
+  ripgrepConfig?: RipgrepConfig
   /** Maximum directory depth to search for dangerous files (default: 3) */
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
@@ -269,13 +275,50 @@ function findFirstNonExistentComponent(targetPath: string): string {
   return targetPath // Shouldn't reach here if called correctly
 }
 
+/** Where `parts` first occurs as consecutive segments of `segments`, or -1. */
+function indexOfSegmentRun(segments: string[], parts: string[]): number {
+  return segments.findIndex((_, i) =>
+    parts.every((part, j) => segments[i + j] === part),
+  )
+}
+
+/**
+ * The paths under `cwd` a failed ripgrep run named in its diagnostics — the
+ * directories it could not read. Denying them is how the scan fails closed:
+ * their contents are unknown, so a nested repository inside one must not stay
+ * writable. rg reports `<path>: <message>`; a path holding `: ` is cut short
+ * at it, which denies an ancestor and so only ever denies more.
+ */
+function unreadablePathsFromRipgrepStderr(
+  stderr: string,
+  cwd: string,
+): string[] {
+  const prefix = cwd + path.sep
+  const paths = new Set<string>()
+  for (const line of stderr.split('\n')) {
+    const start = line.indexOf(prefix)
+    if (start === -1) continue
+    const rest = line.slice(start)
+    const end = rest.indexOf(': ')
+    const candidate = (end === -1 ? rest : rest.slice(0, end)).trimEnd()
+    if (candidate.length > prefix.length) paths.add(candidate)
+  }
+  return [...paths]
+}
+
 /**
  * Get mandatory deny paths using ripgrep (Linux only).
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
- * With --max-depth limiting, this is fast enough to run on each command without memoization.
+ *
+ * Runs on each command without memoization. `--max-depth` keeps that to
+ * milliseconds on ordinary trees, but `--no-ignore` means gitignored data
+ * within the depth is walked too: measured at about +100 ms per command on a
+ * tree with 150k ignored files three levels down. A scan that cannot finish
+ * inside {@link ripGrep}'s timeout aborts the wrap rather than sandboxing
+ * with a deny list of unknown completeness.
  */
 async function linuxGetMandatoryDenyPaths(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  ripgrepConfig: RipgrepConfig = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
@@ -294,27 +337,33 @@ async function linuxGetMandatoryDenyPaths(
     ...dangerousDirectories.map(d => path.resolve(cwd, d)),
   ]
 
-  // Git hooks and config are only denied when .git exists as a directory.
-  // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
-  // .git/hooks can never exist — denying it would cause bwrap to fail.
-  // When .git doesn't exist at all, mounting at .git would block its
-  // creation and break git init.
-  const dotGitPath = path.resolve(cwd, '.git')
-  let dotGitIsDirectory = false
-  try {
-    dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
-  } catch {
-    // .git doesn't exist
+  // A repository's hooks/ and config, and those of the submodule git
+  // directories under its .git/modules (what a commit inside the submodule
+  // runs). Called for cwd's .git and for each nested one the scan finds.
+  const seenGitDirs = new Set<string>()
+  const denyGitDir = (gitDir: string): void => {
+    if (seenGitDirs.has(gitDir)) return
+    seenGitDirs.add(gitDir)
+    const modules = submoduleGitDirs(path.join(gitDir, 'modules'))
+    denyPaths.push(...modules.unreadableDirs)
+    for (const dir of [gitDir, ...modules.gitDirs]) {
+      denyPaths.push(...gitDirDenyPaths(dir, allowGitConfig))
+    }
   }
 
-  if (dotGitIsDirectory) {
-    // Git hooks always blocked for security
-    denyPaths.push(path.resolve(cwd, '.git/hooks'))
-
-    // Git config conditionally blocked based on allowGitConfig setting
-    if (!allowGitConfig) {
-      denyPaths.push(path.resolve(cwd, '.git/config'))
-    }
+  const dotGitPath = path.resolve(cwd, '.git')
+  let dotGitStat: fs.Stats | undefined
+  try {
+    dotGitStat = fs.statSync(dotGitPath)
+  } catch {
+    // No .git: nothing is denied, since a mount at .git would block `git init`.
+  }
+  if (dotGitStat?.isDirectory()) {
+    denyGitDir(dotGitPath)
+  } else if (dotGitStat?.isFile()) {
+    // A pointer file (linked worktree, submodule checkout) has no hooks/
+    // beneath it, and binding a path under a file makes bwrap fail.
+    denyPaths.push(...gitFileDenyPaths(dotGitPath, allowGitConfig))
   }
 
   // Build iglob args for all patterns in one ripgrep call
@@ -325,13 +374,15 @@ async function linuxGetMandatoryDenyPaths(
   for (const dirName of dangerousDirectories) {
     iglobArgs.push('--iglob', `**/${dirName}/**`)
   }
-  // Git hooks always blocked in nested repos
-  iglobArgs.push('--iglob', '**/.git/hooks/**')
-
-  // Git config conditionally blocked in nested repos
-  if (!allowGitConfig) {
-    iglobArgs.push('--iglob', '**/.git/config')
-  }
+  // A nested repository is recognised by ANY regular file directly inside its
+  // .git directory, so its hooks/ and config are denied at the depth the
+  // repository itself is found, not one level further down where the hook
+  // files sit (with the default depth, a repository directly under cwd has
+  // .git/config within reach but .git/hooks/* beyond it). Detection must not
+  // depend on any one file the sandboxed command could move aside, nor on
+  // allowGitConfig, which governs what is denied and not what is found.
+  // A FILE named .git is a worktree/submodule pointer (gitFileDenyPaths).
+  iglobArgs.push('--iglob', '**/.git/*', '--iglob', '**/.git')
 
   // Single ripgrep call to find all dangerous paths in subdirectories
   // Limit depth for performance - deeply nested dangerous files are rare
@@ -342,6 +393,10 @@ async function linuxGetMandatoryDenyPaths(
       [
         '--files',
         '--hidden',
+        // .gitignore, .ignore and .rgignore are writable inside the sandbox:
+        // honouring them would let one command hide a nested repository
+        // from the next command's scan.
+        '--no-ignore',
         '--max-depth',
         String(maxDepth),
         ...iglobArgs,
@@ -353,41 +408,54 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
-    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
+    if (error instanceof RipgrepError && error.timedOut) {
+      // The command that runs next is the one that could have made the tree
+      // slow to walk, so a truncated listing is not something to sandbox on:
+      // an unreached nested repository would be one with writable hooks.
+      throw new Error(
+        `[Sandbox] ripgrep scan of ${cwd} did not finish; refusing to sandbox with mandatory denies of unknown completeness: ${error.message}`,
+      )
+    }
+    if (error instanceof RipgrepError) {
+      // An unreadable directory makes rg exit non-zero after listing the rest
+      // of the tree; those matches still count, and each directory it could
+      // not read is denied whole, since what it holds is unknown.
+      matches = error.partialMatches
+      denyPaths.push(...unreadablePathsFromRipgrepStderr(error.stderr, cwd))
+    }
+    logForDebugging(
+      `[Sandbox] ripgrep scan failed, kept ${matches.length} partial matches; mandatory denies below cwd may be incomplete: ${error}`,
+      { level: 'warn' },
+    )
   }
 
-  // Process matches
+  const dirPatterns = dangerousDirectories.map(d =>
+    normalizeCaseForComparison(d).split('/'),
+  )
   for (const match of matches) {
-    const absolutePath = path.resolve(cwd, match)
+    // rg prefixes each match with its target, cwd, and does not follow
+    // symlinks, so every line is under it. Segments are compared relative to
+    // cwd, so a dangerous name in cwd's own location never counts.
+    const relative = path.relative(cwd, match).split(path.sep)
+    const lowered = relative.map(normalizeCaseForComparison)
 
-    // File inside a dangerous directory -> add the directory path
-    let foundDir = false
-    for (const dirName of [...dangerousDirectories, '.git']) {
-      const normalizedDirName = normalizeCaseForComparison(dirName)
-      const segments = absolutePath.split(path.sep)
-      const dirIndex = segments.findIndex(
-        s => normalizeCaseForComparison(s) === normalizedDirName,
-      )
-      if (dirIndex !== -1) {
-        // For .git, we want hooks/ or config, not the whole .git dir
-        if (dirName === '.git') {
-          const gitDir = segments.slice(0, dirIndex + 1).join(path.sep)
-          if (match.includes('.git/hooks')) {
-            denyPaths.push(path.join(gitDir, 'hooks'))
-          } else if (match.includes('.git/config')) {
-            denyPaths.push(path.join(gitDir, 'config'))
-          }
-        } else {
-          denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
-        }
-        foundDir = true
-        break
-      }
+    const dirRun = dirPatterns
+      .map(parts => ({ parts, at: indexOfSegmentRun(lowered, parts) }))
+      .find(({ at }) => at !== -1)
+    if (dirRun) {
+      // The directory, not the file, so files created in it later are covered.
+      const end = dirRun.at + dirRun.parts.length
+      denyPaths.push(path.join(cwd, ...relative.slice(0, end)))
+      continue
     }
-
-    // Dangerous file match
-    if (!foundDir) {
-      denyPaths.push(absolutePath)
+    const gitAt = lowered.indexOf('.git')
+    if (gitAt === -1) {
+      denyPaths.push(match)
+    } else if (gitAt < relative.length - 1) {
+      denyGitDir(path.join(cwd, ...relative.slice(0, gitAt + 1)))
+    } else if (relative.length > 1) {
+      // cwd's own pointer file is handled above, before the scan.
+      denyPaths.push(...gitFileDenyPaths(match, allowGitConfig))
     }
   }
 
@@ -950,7 +1018,7 @@ async function generateFilesystemArgs(
   writeConfig: FsWriteRestrictionConfig | undefined,
   maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
   maskedFileStoreDir: string | undefined,
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  ripgrepConfig: RipgrepConfig = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
@@ -1458,6 +1526,13 @@ async function generateFilesystemArgs(
           // of /dev/null. This prevents the component from appearing as a file
           // which breaks tools that expect to traverse it as a directory.
           if (firstNonExistent !== normalizedPath) {
+            // Absent deny paths under one absent directory share this
+            // destination (a git directory's hooks/ and config, say). A
+            // second bind would hit the first's mount point and bwrap
+            // aborts, taking every command in this cwd with it. The leaf
+            // case needs no check: normalizedPath is deduped above.
+            if (seenDenyWrite.has(firstNonExistent)) continue
+            seenDenyWrite.add(firstNonExistent)
             const emptyDir = fs.mkdtempSync(
               path.join(tmpdir(), 'claude-empty-'),
             )
