@@ -314,6 +314,14 @@ export function expandWindowsEnvRefs(p: string): string {
 }
 
 /**
+ * Runs of `/` collapsed to one and `/./` components dropped, leaving the rest
+ * of the spelling (a trailing `/` or `/.`, a `..`) to the caller. POSIX only.
+ */
+function collapseInteriorSpellings(pathPattern: string): string {
+  return pathPattern.replace(/\/{2,}/g, '/').replace(/\/\.(?=\/)/g, '')
+}
+
+/**
  * Normalize a path for use in sandbox configurations
  * Handles:
  * - Tilde (~) expansion for home directory
@@ -374,6 +382,14 @@ export function normalizePathForSandbox(pathPattern: string): string {
 
   // For glob patterns, resolve symlinks for the directory portion only
   if (containsGlobCharsForPlatform(normalizedPath)) {
+    // The interior collapse below is needed here too, and for the same
+    // reason: '~/.aws//*.pem' compiles to a regex holding '//', which the
+    // kernel's canonical path never matches, so the deny covers nothing. The
+    // interior only — a trailing slash after a glob segment is semantic, and
+    // a '**' segment holds no run of its own to collapse.
+    if (getPlatform() !== 'windows') {
+      normalizedPath = collapseInteriorSpellings(normalizedPath)
+    }
     // Extract the static directory prefix before glob characters
     // (on Windows, `[`/`]` are literal so only split on `*`/`?`).
     const splitRe = getPlatform() === 'windows' ? /[*?]/ : /[*?[\]]/
@@ -412,16 +428,15 @@ export function normalizePathForSandbox(pathPattern: string): string {
   // whenever realpath cannot rescue it — i.e. whenever its target does not
   // exist, which for a deny is exactly the credential-file-not-created-yet
   // case. A leading '//' is collapsed too: POSIX permits an implementation to
-  // treat it specially, but neither backend does.
+  // treat it specially, but neither backend does. Only the trailing run is
+  // non-glob-only; the interior collapse runs for a glob as well, above.
   //
   // Lexical only, and deliberately not path.normalize/path.resolve: those
   // fold '..' on paper, which through a symlinked component aims the rule at
   // a different file than the kernel would resolve. '..' is left to realpath.
   if (getPlatform() !== 'windows') {
     normalizedPath =
-      normalizedPath
-        .replace(/\/{2,}/g, '/')
-        .replace(/\/\.(?=\/)/g, '')
+      collapseInteriorSpellings(normalizedPath)
         .replace(/\/\.$/, '')
         .replace(/\/+$/, '') || '/'
   }

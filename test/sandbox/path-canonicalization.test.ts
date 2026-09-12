@@ -16,10 +16,11 @@ import { isWindows } from '../helpers/platform.js'
  * Seatbelt compares the kernel's canonical path, so a rule spelled that way
  * matches nothing and denies nothing, silently: with sandbox-exec, `(deny
  * file-read* (subpath "<T>/x//dir"))` and `(literal "<T>/x//dir/f.txt")` both
- * allow the read. The chokepoint therefore collapses '//' runs, '/.'
- * components and the trailing run after expansion, for non-glob POSIX
- * spellings. '..' is left to realpath: folding it lexically can aim the rule
- * at a different file than the kernel would reach through a symlink.
+ * allow the read. The chokepoint therefore collapses '//' runs and '/.'
+ * components after expansion, on POSIX, plus the trailing run for the
+ * spellings where it is not semantic. '..' is left to realpath: folding it
+ * lexically can aim the rule at a different file than the kernel would reach
+ * through a symlink.
  *
  * The Linux backend rebuilds its destinations with path.dirname/join, so it
  * canonicalises these spellings on its own; the argv was already right.
@@ -49,9 +50,22 @@ describe.if(!isWindows)('normalizePathForSandbox interior spellings', () => {
     )
   })
 
-  it('leaves glob spellings untouched', () => {
-    expect(normalizePathForSandbox(`${ABSENT}//x/*`)).toBe(`${ABSENT}//x/*`)
-    expect(normalizePathForSandbox(`${ABSENT}/./x/*`)).toBe(`${ABSENT}/./x/*`)
+  it('collapses the interior of a glob spelling too', () => {
+    expect(normalizePathForSandbox(`${ABSENT}//x/*`)).toBe(`${ABSENT}/x/*`)
+    expect(normalizePathForSandbox(`${ABSENT}/./x/*.pem`)).toBe(
+      `${ABSENT}/x/*.pem`,
+    )
+    expect(normalizePathForSandbox(`${ABSENT}//**/x`)).toBe(`${ABSENT}/**/x`)
+    expect(normalizePathForSandbox('//**/x')).toBe('/**/x')
+  })
+
+  it('keeps what is semantic in a glob spelling', () => {
+    // A slash after a glob segment compiles to a different regex, and a '**'
+    // segment is left as it is.
+    expect(normalizePathForSandbox(`${ABSENT}/x/*/`)).toBe(`${ABSENT}/x/*/`)
+    expect(normalizePathForSandbox(`${ABSENT}/**/*.pem`)).toBe(
+      `${ABSENT}/**/*.pem`,
+    )
   })
 
   it('canonicalises a home directory spelled with a trailing slash', () => {
@@ -70,7 +84,7 @@ describe.if(!isWindows)('normalizePathForSandbox interior spellings', () => {
         [
           '-e',
           `const m = await import(${JSON.stringify(module)})\n` +
-            `console.log(JSON.stringify([m.normalizePathForSandbox('~'), m.normalizePathForSandbox('~/x')]))`,
+            `console.log(JSON.stringify([m.normalizePathForSandbox('~'), m.normalizePathForSandbox('~/x'), m.normalizePathForSandbox('~/x/*.key')]))`,
         ],
         {
           encoding: 'utf8',
@@ -80,7 +94,11 @@ describe.if(!isWindows)('normalizePathForSandbox interior spellings', () => {
       )
       expect(child.stderr ?? '').toBe('')
       expect(child.status).toBe(0)
-      expect(JSON.parse(child.stdout)).toEqual([home, `${home}/x`])
+      expect(JSON.parse(child.stdout)).toEqual([
+        home,
+        `${home}/x`,
+        `${home}/x/*.key`,
+      ])
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
@@ -97,5 +115,19 @@ describe.if(!isWindows)('macOS profile: interior spellings', () => {
     })
     expect(profile).toContain('(subpath "/srt-no-such-root/a/b")')
     expect(profile).not.toContain('/srt-no-such-root/a//b')
+  })
+
+  it('compiles a deny glob spelled with a slash run like the clean one', () => {
+    const profileFor = (deny: string): string =>
+      wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [deny], allowWithinDeny: [] },
+        writeConfig: undefined,
+      })
+
+    const spelled = profileFor('/srt-no-such-root/a//*.pem')
+    expect(spelled).toBe(profileFor('/srt-no-such-root/a/*.pem'))
+    expect(spelled).not.toContain('/srt-no-such-root/a//')
   })
 })
