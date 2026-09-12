@@ -1438,8 +1438,8 @@ export function wrapCommandWithSandboxMacOS(
 
   logForDebugging(
     `[Sandbox macOS] Applied restrictions - network: ${!!(httpProxyPort || socksProxyPort)}, read: ${
-      readConfig
-        ? 'allowAllExcept' in readConfig
+      hasReadRestrictions
+        ? readConfig && 'allowAllExcept' in readConfig
           ? 'allowAllExcept'
           : 'denyAllExcept'
         : 'none'
