@@ -2307,4 +2307,15 @@ describe('Git metadata deny paths - Unit Tests', () => {
 
     expect(submoduleGitDirs(join(dir, 'modules')).gitDirs).toEqual([])
   })
+
+  it('denies the directory the modules walk stopped at', () => {
+    // A git directory one level past the bound: the walk never sees it, so
+    // the directory it stopped at is denied whole instead.
+    const bound = join(dir, 'modules', ...Array.from({ length: 10 }, () => 'x'))
+    makeGitDir(join(bound, 'deep'))
+
+    const scan = submoduleGitDirs(join(dir, 'modules'))
+    expect(scan.gitDirs).toEqual([])
+    expect(scan.unreadableDirs).toEqual([bound])
+  })
 })

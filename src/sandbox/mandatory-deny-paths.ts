@@ -72,9 +72,10 @@ export interface SubmoduleScan {
   /** The submodule git directories. */
   gitDirs: string[]
   /**
-   * Directories the walk could not list. Their contents are unknown, so they
-   * are denied whole rather than left writable with a git directory possibly
-   * inside them.
+   * Directories the walk could not see through: one it could not list, and
+   * the one it stops at on reaching {@link MAX_SUBMODULE_WALK_DEPTH}. What
+   * lies under them is unknown, so they are denied whole rather than left
+   * writable with a git directory possibly inside them.
    */
   unreadableDirs: string[]
 }
@@ -218,8 +219,12 @@ function collectSubmoduleGitDirs(
     if (isGitDir) scan.gitDirs.push(child)
 
     if (depth + 1 >= MAX_SUBMODULE_WALK_DEPTH) {
+      // Nothing below here is inspected, so the directory is denied whole,
+      // like one the walk could not list: a submodule git directory nested
+      // deeper would otherwise keep its hooks and config writable.
+      scan.unreadableDirs.push(child)
       logForDebugging(
-        `[Sandbox] Stopped the .git/modules walk below ${child} at depth ${MAX_SUBMODULE_WALK_DEPTH}; submodule git directories beneath it are not denied`,
+        `[Sandbox] Stopped the .git/modules walk below ${child} at depth ${MAX_SUBMODULE_WALK_DEPTH}, denying ${child} whole`,
         { level: 'warn' },
       )
       continue
@@ -317,6 +322,10 @@ function gitDirTargetDenyPaths(
  * `is_git_directory` (a valid HEAD plus objects/ and refs/): every directory
  * git accepts has a HEAD entry, so this accepts those and some besides,
  * which only ever denies more.
+ *
+ * Narrower than {@link GIT_DIR_MARKERS}, which the `.git/modules` walk uses:
+ * a directory here is named by file content a sandboxed command can write, so
+ * accepting `config` or `hooks` would let that content aim a deny anywhere.
  */
 function gitDirKind(dir: string): GitDirKind {
   let entries: fs.Dirent[]
