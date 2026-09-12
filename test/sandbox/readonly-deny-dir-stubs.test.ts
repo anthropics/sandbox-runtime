@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import * as fs from 'fs'
 import {
   existsSync,
   mkdirSync,
@@ -411,5 +412,61 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).toContain(`--tmpfs ${PROJ}`)
     expect(command).toContain(`--bind ${nestedAllow} ${nestedAllow}`)
     expect(command).toContain(`--ro-bind ${secret} ${secret}`)
+  })
+
+  it('keeps every stub when the read-deny prediction cannot be derived', async () => {
+    // The tmpfs dirs the vetoes are judged against are predicted from the
+    // same readDenyEntries() the denyRead loop uses, and listing the root
+    // can fail transiently (EMFILE/ENFILE). Reading that failure as "no
+    // read-deny tmpfs" skips stubs on evidence that never existed: the loop
+    // derives the set again moments later, succeeds, and the wrap reaches
+    // bwrap. Here the first derivation throws and the second succeeds, so
+    // every covering directory must be vetoed and the stubs kept.
+    process.chdir(PROJ)
+    // The root child the temp tree lives under. allowRead keeps it out of
+    // the '/' deny expansion, so with a derivable prediction no tmpfs lands
+    // anywhere near PROJ, nothing vetoes it and the stubs would be skipped.
+    const tmpRoot = `/${BASE.split('/')[1]}`
+    const realReaddirSync = fs.readdirSync
+    let rootListingsFailed = 0
+    const warnings: string[] = []
+    const savedDebug = process.env.SRT_DEBUG
+    process.env.SRT_DEBUG = '1'
+    const spies = [
+      spyOn(fs, 'readdirSync').mockImplementation(((
+        p: fs.PathLike,
+        ...rest: unknown[]
+      ) => {
+        if (String(p) === '/' && rootListingsFailed === 0) {
+          rootListingsFailed++
+          throw Object.assign(new Error('EMFILE: too many open files'), {
+            code: 'EMFILE',
+          })
+        }
+        return (realReaddirSync as (...a: unknown[]) => unknown)(p, ...rest)
+      }) as typeof fs.readdirSync),
+      spyOn(console, 'warn').mockImplementation((...parts: unknown[]) => {
+        warnings.push(parts.map(String).join(' '))
+      }),
+      spyOn(console, 'error').mockImplementation(() => {}),
+    ]
+    try {
+      const command = await wrapCommandWithSandboxLinux({
+        command: 'echo hello',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
+        writeConfig: { allowOnly: [AREA], denyWithinAllow: [PROJ] },
+      })
+      expect(rootListingsFailed).toBe(1)
+      expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+      expect(command).toContain(
+        `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+      )
+      expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
+    } finally {
+      for (const spy of spies) spy.mockRestore()
+      if (savedDebug === undefined) delete process.env.SRT_DEBUG
+      else process.env.SRT_DEBUG = savedDebug
+    }
   })
 })

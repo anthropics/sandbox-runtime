@@ -1070,6 +1070,10 @@ async function generateFilesystemArgs(
   // scan's await: that scan can run arbitrarily long, and a realpath taken
   // ahead of it would miss a symlink retargeted meanwhile.
   const canonicalFormCache = new Map<string, string>()
+  // Paths whose canonical location could not be resolved, so the recorded
+  // spelling stands in for it. That is a guess, and the stub-skip prediction
+  // below refuses to conclude anything from a guess made about its own inputs.
+  const canonicalFormGuesses = new Set<string>()
   const canonicalForm = (p: string): string => {
     let canonical = canonicalFormCache.get(p)
     if (canonical === undefined) {
@@ -1077,6 +1081,7 @@ async function generateFilesystemArgs(
         canonical = fs.realpathSync(p)
       } catch {
         canonical = p // vanished or unresolvable: the recorded form stands
+        canonicalFormGuesses.add(p)
       }
       canonicalFormCache.set(p, canonical)
     }
@@ -1287,6 +1292,14 @@ async function generateFilesystemArgs(
       | {
           allowedWritePathsBothForms: string[]
           prospectiveReadDenyTmpfsDirsBothForms: string[]
+          // The derivation below failed, so the prediction describes nothing
+          // and every covering directory is vetoed. A failure must not read
+          // as "no read-deny tmpfs": the denyRead loop derives the same set
+          // again moments later with no catch of its own, and the reason it
+          // failed here can be transient (EMFILE/ENFILE on the root listing)
+          // — that wrap reaches bwrap, with its placeholders skipped on a
+          // prediction that never held.
+          unreliable: boolean
         }
       | undefined
     const getStubSkipVetoInputs = (): NonNullable<
@@ -1295,23 +1308,39 @@ async function generateFilesystemArgs(
       if (stubSkipVetoInputs !== undefined) {
         return stubSkipVetoInputs
       }
-      const allowedWritePathsBothForms = allowedWritePaths.flatMap(mountForms)
-      let effectiveReadDenyPaths: string[] = []
+      // Every canonicalForm() the derivation needs is first reached from
+      // here, so a location it had to guess shows up as a new entry.
+      const guessesBefore = canonicalFormGuesses.size
+      let allowedWritePathsBothForms: string[] = []
+      let prospectiveReadDenyTmpfsDirsBothForms: string[] = []
+      let unreliableCause: string | undefined
       try {
-        effectiveReadDenyPaths = readDenyEntries()
-      } catch {
-        // Unreadable root: contribute nothing. (The denyRead loop has no
-        // catch and would abort the whole wrap, so an under-predicted tmpfs
-        // set here can never reach a running sandbox.)
+        allowedWritePathsBothForms = allowedWritePaths.flatMap(mountForms)
+        prospectiveReadDenyTmpfsDirsBothForms = readDenyEntries().flatMap(
+          entry => {
+            const target = readDenyTargetOf(normalizePathForSandbox(entry))
+            return target?.isDirectory ? mountForms(target.path) : []
+          },
+        )
+      } catch (err) {
+        unreliableCause = `deriving it threw: ${err}`
       }
-      const prospectiveReadDenyTmpfsDirsBothForms =
-        effectiveReadDenyPaths.flatMap(entry => {
-          const target = readDenyTargetOf(normalizePathForSandbox(entry))
-          return target?.isDirectory ? mountForms(target.path) : []
-        })
+      if (
+        unreliableCause === undefined &&
+        canonicalFormGuesses.size > guessesBefore
+      ) {
+        unreliableCause = 'a path has no resolvable canonical location'
+      }
+      if (unreliableCause !== undefined) {
+        logForDebugging(
+          `[Sandbox Linux] Read-deny prediction unusable (${unreliableCause}); keeping every deny placeholder`,
+          { level: 'warn' },
+        )
+      }
       stubSkipVetoInputs = {
         allowedWritePathsBothForms,
         prospectiveReadDenyTmpfsDirsBothForms,
+        unreliable: unreliableCause !== undefined,
       }
       return stubSkipVetoInputs
     }
@@ -1385,10 +1414,11 @@ async function generateFilesystemArgs(
     // (the inputs never change during the deny loop) instead of per absent
     // deny entry.
     // INVARIANT: a stub, or an existing deny path's own bind, is skipped
-    // only under a recorded covering deny directory that has no allowed
-    // write path strictly beneath it and is INCOMPARABLE with every
-    // read-deny tmpfs directory (neither at-or-beneath it nor containing it
-    // or any spelling it was reached through). Containment is root-aware
+    // only under a recorded covering deny directory that was judged against
+    // a prediction that could be derived, has no allowed write path strictly
+    // beneath it and is INCOMPARABLE with every read-deny tmpfs directory
+    // (neither at-or-beneath it nor containing it or any spelling it was
+    // reached through). Containment is root-aware
     // (isAtOrUnder): '/' is a recordable covering directory when allowOnly
     // and denyWithinAllow both name it, and '/' + '/' is a prefix of
     // nothing, so a string-prefix test would judge it safe for every path
@@ -1421,8 +1451,14 @@ async function generateFilesystemArgs(
       const {
         allowedWritePathsBothForms,
         prospectiveReadDenyTmpfsDirsBothForms,
+        unreliable,
       } = getStubSkipVetoInputs()
       const unsafe =
+        // (0) the prediction of what the denyRead loop will mount could not
+        //     be derived, so vetoes (ii) and (iii) have nothing to fire on.
+        //     Veto everything rather than nothing: a prediction that failed
+        //     is no evidence that this directory is reliably read-only.
+        unreliable ||
         // (i) an allowed write path strictly beneath the dir: the skip is
         //     kept to directories with nothing writable configured inside
         //     them, whatever the mount order makes of it.
