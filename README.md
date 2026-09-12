@@ -174,6 +174,43 @@ srt --debug curl https://example.com
 srt --settings /path/to/srt-settings.json npm install
 ```
 
+The settings file is optional — with none at `~/.srt-settings.json`, `srt`
+runs with built-in defaults that restrict nothing. A settings file that _is_
+there but cannot be read or does not validate is an error: `srt` says so and
+exits rather than falling back to those defaults, so one bad entry cannot
+quietly discard every other rule in the file. The same goes for a file named
+with `--settings`.
+
+#### Updating the config while the command runs: `--control-fd`
+
+`--control-fd <fd>` reads config updates from a descriptor the caller has
+already opened, one JSON object per line in the same shape as the settings
+file. Each line replaces the whole config for everything still running
+under the sandbox:
+
+```bash
+# fd 3 is the read end of a pipe the caller writes lines to
+srt --control-fd 3 -- npm test
+```
+
+- The descriptor must be an integer **3 or above** and open — `0`-`2` are
+  the standard streams. srt exits with an error instead of running the
+  command when it cannot read the descriptor it was given, so a dead
+  channel never passes for a live one.
+- A line that is not a valid config is reported on stderr and dropped; the
+  previous config stays in force.
+- srt **exits with the wrapped command** and does not wait for the writer
+  to close the descriptor. End of input is not an error either: the
+  command keeps running under the config last applied.
+- Give srt a **dedicated, read-only end**. srt puts a pipe or socket into
+  non-blocking mode, and that flag lives on the open file description, so
+  anything else holding the same description — a shell's `exec 3<fifo`, a
+  `pass_fds` of a descriptor the parent goes on using — gets `EAGAIN` from
+  its own blocking reads from then on.
+- The sandboxed command does not get the descriptor: srt points that slot
+  at `/dev/null` for the command, so nothing inside the sandbox can read
+  the updates or write a config of its own.
+
 ### As a library
 
 ```typescript
