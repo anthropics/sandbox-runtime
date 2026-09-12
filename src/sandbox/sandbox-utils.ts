@@ -802,19 +802,16 @@ export function buildPosixGitSafeDirEnv(opts: {
 export const SANDBOXED_COMMAND_KEY_LENGTH = 100
 
 /**
- * The attribution key for an invocation: the caller's `commandId` when it
- * passed a non-empty one, else the command itself. An empty id counts as
- * absent, because every carrier drops an empty attribution (a bare `srt`
- * proxy username, a log tag the extraction regex will not match, a falsy
- * SRT_ENCODED_CMD), so keying on it would silently cost the invocation its
- * attribution. Both the wrappers and the manager's registry derive the key
- * here, so the two sides of the carrier agree on it.
+ * The attribution key for an invocation: the caller's `commandId`, or the
+ * command itself when there is no usable id.
  */
 export function attributionKeyFor(
   command: string,
   commandId: string | undefined,
 ): string {
-  return commandId === undefined || commandId === '' ? command : commandId
+  // Falsy, not `=== undefined`: every carrier drops an empty attribution, and
+  // a JavaScript caller's `null` would throw in encodeSandboxedCommand.
+  return !commandId ? command : commandId
 }
 
 /**
@@ -837,18 +834,32 @@ export function decodeSandboxedCommand(encodedCommand: string): string {
 /** Base proxy username; the auth token is the credential, this is a label. */
 export const PROXY_AUTH_USER = 'srt'
 
+/** RFC 1929 caps a SOCKS5 username at 255 bytes. */
+const MAX_PROXY_USERNAME_BYTES = 255
+
+/**
+ * The longest encodedCommand a carrier this process mints can hold: what is
+ * left of the username budget after `srt.`. Every carrier is bounded far more
+ * loosely than that (an HTTP proxy header budget is kilobytes), so a longer
+ * attribution field was not minted here and is stored by nobody.
+ */
+export const MAX_ENCODED_COMMAND_BYTES =
+  MAX_PROXY_USERNAME_BYTES - Buffer.byteLength(`${PROXY_AUTH_USER}.`)
+
 /**
  * Build the proxy username for a sandboxed command: `srt.<encodedCommand>`
  * so the proxy can attribute a denial to the invocation that triggered it,
- * or bare `srt` when there is nothing to attribute. RFC 1929 caps the
- * SOCKS5 username at 255 bytes; a multibyte command whose 100-code-unit
- * truncation still base64s past that would fail the SOCKS handshake, so
- * fall back to bare `srt` (attribution is lost, connectivity is not).
+ * or bare `srt` when there is nothing to attribute. A multibyte command whose
+ * 100-code-unit truncation still base64s past the username budget would fail
+ * the SOCKS handshake, so fall back to bare `srt` (attribution is lost,
+ * connectivity is not).
  */
 export function proxyUsernameFor(encodedCommand: string | undefined): string {
   if (!encodedCommand) return PROXY_AUTH_USER
   const user = `${PROXY_AUTH_USER}.${encodedCommand}`
-  return Buffer.byteLength(user) <= 255 ? user : PROXY_AUTH_USER
+  return Buffer.byteLength(user) <= MAX_PROXY_USERNAME_BYTES
+    ? user
+    : PROXY_AUTH_USER
 }
 
 /**
@@ -856,14 +867,20 @@ export function proxyUsernameFor(encodedCommand: string | undefined): string {
  * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
  * The username is client-controlled inside the sandbox, so a forged suffix
  * can only misattribute a denial in the violation report — it cannot
- * authenticate (the token does that) or reach another command's data.
+ * authenticate (the token does that) or reach another command's data. A
+ * suffix past {@link MAX_ENCODED_COMMAND_BYTES} is longer than this process
+ * can mint, so it is dropped rather than stored: the denial is still
+ * recorded, unattributed.
  */
 export function encodedCommandFromProxyUser(
   username: string | undefined,
 ): string | undefined {
   if (!username || !username.startsWith(`${PROXY_AUTH_USER}.`)) return undefined
   const suffix = username.slice(PROXY_AUTH_USER.length + 1)
-  return suffix || undefined
+  if (!suffix || Buffer.byteLength(suffix) > MAX_ENCODED_COMMAND_BYTES) {
+    return undefined
+  }
+  return suffix
 }
 
 /**
