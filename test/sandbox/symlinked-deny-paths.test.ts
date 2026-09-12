@@ -188,6 +188,42 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     }
   })
 
+  it('resolves the mandatory .git/hooks deny path when hooks is a symlink to a directory', async () => {
+    // A repo that shares its hooks: .git/hooks -> ../hooks (#221). The
+    // mandatory deny is cwd-relative, so cwd has to be the repo.
+    mkdirSync(join(PROJ, '.git'))
+    mkdirSync(join(PROJ, 'hooks'))
+    const hooksLink = join(PROJ, '.git', 'hooks')
+    symlinkSync(join('..', 'hooks'), hooksLink)
+
+    const originalCwd = process.cwd()
+    process.chdir(PROJ)
+    try {
+      const result = await wrap([])
+
+      expect(result).not.toContain(`--ro-bind /dev/null ${hooksLink}`)
+      const resolved = join(PROJ, 'hooks')
+      expect(result).toContain(`--ro-bind ${resolved} ${resolved}`)
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+
+  it('denies the resolved target for a denyWrite entry that is a symlink to a directory', async () => {
+    // .claude/skills -> ../../dotfiles/skills (#314): the entry itself is
+    // the symlink, not an ancestor of the deny path.
+    mkdirSync(join(DOTFILES, 'skills'))
+    mkdirSync(join(PROJ, '.claude'))
+    const skillsLink = join(PROJ, '.claude', 'skills')
+    symlinkSync(join('..', '..', 'dotfiles', 'skills'), skillsLink)
+
+    const result = await wrap([skillsLink])
+    const resolved = join(DOTFILES, 'skills')
+
+    expect(result).not.toContain(`--ro-bind /dev/null ${skillsLink}`)
+    expect(result).toContain(`--ro-bind ${resolved} ${resolved}`)
+  })
+
   it.if(hasBwrap)(
     'e2e: sandbox starts with a symlinked .claude and still denies writes through it',
     async () => {
