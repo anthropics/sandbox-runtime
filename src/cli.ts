@@ -3,7 +3,7 @@ import { quote } from './utils/shell-quote.js'
 import { Command, InvalidArgumentError } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
-import { spawn } from 'child_process'
+import { spawn, type ChildProcess } from 'child_process'
 import { logForDebugging } from './utils/debug.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
 import * as readline from 'readline'
@@ -20,8 +20,13 @@ function getDefaultConfigPath(): string {
 }
 
 /**
+ * How long a command that ignores SIGTERM gets before SIGKILL.
+ */
+const KILL_GRACE_MS = 2000
+
+/**
  * Exit rather than run under the built-in defaults, naming what that would
- * cost. The defaults are not a weaker version of any settings file - they
+ * cost. The defaults are not a weaker version of any settings file — they
  * are a different config, so falling back to them drops rules rather than
  * relaxing them.
  */
@@ -74,6 +79,13 @@ function getDefaultConfig(): SandboxRuntimeConfig {
  * EAGAIN on its own blocking reads, so hand srt a dedicated pipe end.
  */
 function openControlFd(fd: number): NodeJS.ReadableStream {
+  // fstat succeeds on descriptors srt can never read a byte from — one
+  // opened write-only, the write end of a pipe — and a reader over those
+  // fails only once the command is already running. A zero-length readv(2)
+  // asks the kernel whether a read is permitted at all without performing
+  // one: EBADF for those, 0 for every readable kind, on both node and bun,
+  // without blocking on an empty pipe or consuming a byte of a full one.
+  fs.readvSync(fd, [Buffer.alloc(0)])
   const stat = fs.fstatSync(fd)
   if (!process.versions.bun && (stat.isFIFO() || stat.isSocket())) {
     try {
@@ -100,36 +112,26 @@ function openControlFd(fd: number): NodeJS.ReadableStream {
 }
 
 /**
- * Parse --control-fd. Anything but an integer >= 3 is refused here, before
- * the sandbox is built: 0-2 are the standard streams, and a number that is
- * not a descriptor the caller passed in either cannot be read at all or
- * names one this process opened for itself (fstat succeeds on those).
+ * Parse --control-fd: an integer descriptor number >= 3.
  */
 function parseControlFd(value: string): number {
-  const fd = Number(value)
-  if (!Number.isInteger(fd) || fd < 3) {
+  // Number() alone would also take '0x10', '3e0' and ' 5 '.
+  if (!/^\d+$/.test(value) || Number(value) < 3) {
     throw new InvalidArgumentError(
       'must be an integer file descriptor >= 3 (0-2 are stdin, stdout and stderr).',
     )
   }
-  return fd
+  return Number(value)
 }
 
 /**
  * stdio for the sandboxed command: the three standard streams, plus
- * /dev/null over the control fd's slot.
+ * /dev/null over the control fd's slot, so nothing inside the sandbox can
+ * read the channel that carries the policy confining it.
  *
- * Nothing but the close-on-exec flag keeps an inherited descriptor out of
- * an exec'd command, and Node sets that flag at startup for descriptors
- * 0-15 unconditionally but then stops at the first closed number
- * (uv_disable_stdio_inheritance), so `--control-fd 20` with 16-19 closed
- * leaves the control channel live inside the sandbox: the command can read
- * updates before srt does and, when the caller's end is a socket or an
- * O_RDWR fifo, write a config of its own for srt to apply. Displacing the
- * slot covers every kind of descriptor, which re-opening the fd privately
- * and closing srt's own copy does not — a socket cannot be re-opened that
- * way (ENXIO). 'ignore' past fd 2 leaves a slot as it is rather than
- * closing it, so the slot needs a descriptor to displace the fd with.
+ * The displacement is what matters on Linux. On macOS libuv spawns through
+ * posix_spawn with POSIX_SPAWN_CLOEXEC_DEFAULT, which already keeps every
+ * descriptor the caller did not list out of the child.
  */
 function sandboxedStdio(
   controlFd: number | undefined,
@@ -142,9 +144,17 @@ function sandboxedStdio(
   if (controlFd === undefined) {
     return stdio
   }
+  // 'ignore' past fd 2 leaves a slot as it is rather than closing it, so the
+  // control fd's slot needs a descriptor of its own to displace it with.
   while (stdio.length < controlFd) {
     stdio.push('ignore')
   }
+  // Only close-on-exec keeps an inherited descriptor out of an exec'd
+  // command, and uv_disable_stdio_inheritance() stops at the first closed
+  // number above 15, so `--control-fd 20` with 16-19 closed leaves the
+  // channel live in the sandbox. Displacing the slot covers every kind of
+  // descriptor, which re-opening the fd privately does not: a unix socket
+  // cannot be re-opened through /proc/self/fd at all (ENXIO).
   stdio.push(fs.openSync('/dev/null', 'r'))
   return stdio
 }
@@ -337,49 +347,55 @@ async function main(): Promise<void> {
             }
           }
 
-          // Initialize sandbox with config
-          logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
-
-          // Set up control fd for dynamic config updates if specified
-          let controlReader: readline.Interface | null = null
+          // The wrapped command, once it exists: a control channel that
+          // dies before it delivers anything takes it down with it.
+          let child: ChildProcess | undefined
+          let controlChannelFailed = false
+          let receivedAnyLine = false
+          let controlErrorReported = false
           const controlFd = options.controlFd
+
+          function onControlError(err: Error): void {
+            // Attached both to the stream and to the reader: the stream is
+            // live from the moment the fd is opened, which is before the
+            // reader exists, and readline re-emits an input error on the
+            // reader as well. The channel is gone after the first error
+            // either way, so it is reported once.
+            if (controlErrorReported) {
+              return
+            }
+            controlErrorReported = true
+            if (receivedAnyLine) {
+              // The channel did deliver. The config last applied stays in
+              // force, so the command keeps running under it.
+              console.error(
+                `Error reading control fd ${controlFd}: ${err.message}. The control channel is closed; no further updates will be applied.`,
+              )
+              return
+            }
+            // Nothing ever came through: this is the descriptor that would
+            // not open, found one step later. The caller is sending updates
+            // into a channel srt cannot read.
+            console.error(
+              `Error: control fd ${controlFd} failed before delivering an update: ${err.message}. Refusing to run the command without the control channel it asks for.`,
+            )
+            controlChannelFailed = true
+            if (child === undefined) {
+              process.exit(1)
+            }
+            child.kill('SIGTERM')
+            // The child's own exit is what exits srt; this covers a command
+            // that ignores SIGTERM.
+            setTimeout(() => child?.kill('SIGKILL'), KILL_GRACE_MS).unref()
+          }
+
+          // Open and check the control fd before anything is built: a
+          // refusal here has no proxy or Linux bridge to unwind, and
+          // process.exit() cannot wait for the async reset() that would.
+          let controlStream: NodeJS.ReadableStream | undefined
           if (controlFd !== undefined) {
             try {
-              controlReader = readline.createInterface({
-                input: openControlFd(controlFd),
-                crlfDelay: Infinity,
-              })
-
-              controlReader.on('line', line => {
-                const newConfig = loadConfigFromString(line)
-                if (newConfig) {
-                  logForDebugging(
-                    `Config updated from control fd: ${JSON.stringify(newConfig)}`,
-                  )
-                  SandboxManager.updateConfig(newConfig)
-                } else if (line.trim()) {
-                  // The caller has to learn its update was dropped whether
-                  // or not it runs srt with --debug; the line itself stays
-                  // in the debug log rather than on the terminal.
-                  console.error(
-                    `Invalid config on control fd ${controlFd}: ignored, previous config still in force`,
-                  )
-                  logForDebugging(
-                    `Invalid config on control fd (ignored): ${line}`,
-                  )
-                }
-              })
-
-              controlReader.on('error', err => {
-                console.error(
-                  `Error reading control fd ${controlFd}: ${err.message}`,
-                )
-              })
-
-              // End of input just means the writer closed its end. The
-              // command keeps running under the config last applied.
-              logForDebugging(`Listening for config updates on fd ${controlFd}`)
+              controlStream = openControlFd(controlFd)
             } catch (err) {
               // Same rule as an explicit --settings that will not load: a
               // caller that asked for a control channel gets an error, not
@@ -392,6 +408,50 @@ async function main(): Promise<void> {
               )
               process.exit(1)
             }
+            controlStream.on('error', onControlError)
+          }
+
+          // Initialize sandbox with config
+          logForDebugging('Initializing sandbox...')
+          await SandboxManager.initialize(runtimeConfig)
+
+          // Read config updates only now. The stream has been waiting
+          // unread, so nothing the caller wrote meanwhile is lost, and an
+          // update applied before initialize() would have been overwritten
+          // by it.
+          let controlReader: readline.Interface | null = null
+          if (controlStream !== undefined) {
+            controlReader = readline.createInterface({
+              input: controlStream,
+              crlfDelay: Infinity,
+            })
+
+            controlReader.on('line', line => {
+              receivedAnyLine = true
+              const newConfig = loadConfigFromString(line)
+              if (newConfig) {
+                logForDebugging(
+                  `Config updated from control fd: ${JSON.stringify(newConfig)}`,
+                )
+                SandboxManager.updateConfig(newConfig)
+              } else if (line.trim()) {
+                // The caller has to learn its update was dropped whether
+                // or not it runs srt with --debug; the line itself stays
+                // in the debug log rather than on the terminal.
+                console.error(
+                  `Invalid config on control fd ${controlFd}: ignored, previous config still in force`,
+                )
+                logForDebugging(
+                  `Invalid config on control fd (ignored): ${line}`,
+                )
+              }
+            })
+
+            controlReader.on('error', onControlError)
+
+            // End of input just means the writer closed its end. The
+            // command keeps running under the config last applied.
+            logForDebugging(`Listening for config updates on fd ${controlFd}`)
           }
 
           // Cleanup control reader on exit
@@ -432,11 +492,14 @@ async function main(): Promise<void> {
           // with {shell:false} — that's the boundary keeping the
           // command bytes off the host shell. On other platforms
           // we keep the existing shell-string path.
-          let child
           if (process.platform === 'win32') {
             // env carries the proxy vars the sandboxed child must inherit.
             const { argv, env } =
               await SandboxManager.wrapWithSandboxArgv(command)
+            // No slot to displace: libuv passes only the stdio array's
+            // entries to the child as CRT descriptors, so the control fd
+            // is not among them (an inheritable HANDLE still reaches the
+            // child, but unnamed — nothing there can find it).
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
               stdio: 'inherit',
@@ -458,6 +521,12 @@ async function main(): Promise<void> {
             // non-existent deny paths. This removes them.
             SandboxManager.cleanupAfterCommand()
 
+            if (controlChannelFailed) {
+              // srt killed the command over a dead control channel, so the
+              // status it died with is not the run's result.
+              process.exit(1)
+            }
+
             if (signal) {
               if (signal === 'SIGINT' || signal === 'SIGTERM') {
                 process.exit(0)
@@ -476,11 +545,11 @@ async function main(): Promise<void> {
 
           // Handle cleanup on interrupt
           process.on('SIGINT', () => {
-            child.kill('SIGINT')
+            child?.kill('SIGINT')
           })
 
           process.on('SIGTERM', () => {
-            child.kill('SIGTERM')
+            child?.kill('SIGTERM')
           })
         } catch (error) {
           console.error(

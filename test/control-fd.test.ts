@@ -373,12 +373,10 @@ d('--control-fd', () => {
     })
   }
 
-  it('should refuse to run when the control fd cannot be opened', () => {
-    // 200 is well past anything node opens for itself, so it is closed in
-    // srt and fstat fails on it. Running the command anyway would give the
-    // caller a sandbox whose updates — including the ones that tighten it —
-    // go nowhere.
-    const marker = path.join(tmpDir, 'ran')
+  // A settings file that lets the wrapped command write to tmpDir, so a
+  // marker it fails to leave is evidence that it never ran rather than
+  // evidence that the sandbox denied the write.
+  function writeWritableSettings(): string {
     const settings = path.join(tmpDir, 'settings.json')
     fs.writeFileSync(
       settings,
@@ -392,6 +390,16 @@ d('--control-fd', () => {
         },
       }),
     )
+    return settings
+  }
+
+  it('should refuse to run when the control fd cannot be opened', () => {
+    // 200 is well past anything node opens for itself, so it is closed in
+    // srt and fstat fails on it. Running the command anyway would give the
+    // caller a sandbox whose updates — including the ones that tighten it —
+    // go nowhere.
+    const marker = path.join(tmpDir, 'ran')
+    const settings = writeWritableSettings()
     const testScript = writeScript(`touch ${marker}\necho "SHOULD_NOT_RUN"`)
 
     const { status, stdout, stderr } = runSrt(
@@ -401,6 +409,28 @@ d('--control-fd', () => {
 
     expect(status).not.toBe(0)
     expect(stderr).toContain('--control-fd 200 is not usable')
+    expect(stdout).not.toContain('SHOULD_NOT_RUN')
+    expect(fs.existsSync(marker)).toBe(false)
+  })
+
+  it('should refuse a control fd it cannot read from', () => {
+    // A descriptor open for writing only: fstat succeeds on it, so nothing
+    // short of asking the kernel whether a read is permitted tells it from
+    // a live channel. Running the command would give the caller a sandbox
+    // whose updates — including the ones that tighten it — go nowhere.
+    const marker = path.join(tmpDir, 'ran')
+    const settings = writeWritableSettings()
+    const sink = fs.openSync(path.join(tmpDir, 'sink'), 'w')
+    heldFds.push(sink)
+    const testScript = writeScript(`touch ${marker}\necho "SHOULD_NOT_RUN"`)
+
+    const { status, stdout, stderr } = runSrt(
+      ['--settings', settings, '--control-fd', '3', '--', testScript],
+      ['inherit', 'pipe', 'pipe', sink],
+    )
+
+    expect(status).not.toBe(0)
+    expect(stderr).toContain('--control-fd 3 is not usable')
     expect(stdout).not.toContain('SHOULD_NOT_RUN')
     expect(fs.existsSync(marker)).toBe(false)
   })
