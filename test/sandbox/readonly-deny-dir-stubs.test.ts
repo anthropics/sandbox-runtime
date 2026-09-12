@@ -483,11 +483,6 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
         readConfig: { denyOnly: [readDenied] },
         writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
       })
-      expect(withRead).not.toContain(`--ro-bind /dev/null ${dotfile}`)
-      // Two whole triples: the base root mount, then the deny's read-only
-      // bind that covers the dotfile.
-      expect(withRead.match(/--ro-bind \/ \/(?= )/g)).toHaveLength(2)
-      expect(withRead).toContain(`--tmpfs ${readDenied} `)
       const ranWithRead = spawnSync(withRead, {
         shell: true,
         encoding: 'utf8',
@@ -500,6 +495,32 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       expect(existsSync(dotfile)).toBe(false)
     },
   )
+
+  it('stubs nothing under a "/" write root denied whole with a read policy', async () => {
+    // The argv half of the bubblewrap case above: any read-deny tmpfs lies
+    // under '/' and vetoes it, so the root's covering bind is judged against
+    // the candidate instead. The dotfile is outside that tmpfs, so it is
+    // still covered and still needs no stub.
+    process.chdir(PROJ)
+    const readDenied = join(BASE, 'ro')
+    mkdirSync(readDenied)
+    writeFileSync(join(readDenied, 'token.txt'), 'x\n')
+
+    const command = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: [readDenied] },
+      writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
+    })
+
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+    // Two whole triples: the base root mount, then the deny's read-only bind
+    // that covers the dotfile.
+    expect(command.match(/--ro-bind \/ \/(?= )/g)).toHaveLength(2)
+    expect(command).toContain(`--tmpfs ${readDenied} `)
+  })
 
   it('skips stubs under a "/" write root denied whole beside a second allow entry', async () => {
     // The deny of '/' is emitted as a read-only bind after BOTH allow binds,
