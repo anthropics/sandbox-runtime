@@ -322,6 +322,28 @@ function collapseInteriorSpellings(pathPattern: string): string {
 }
 
 /**
+ * Says so when a `..` reaches a backend unfolded — realpath could not resolve
+ * the path (absent, or unreadable), and folding `..` lexically here could aim
+ * the rule past a symlink at a file the kernel would never reach. Debug-only
+ * (`SRT_DEBUG`), so a rule that matches nothing is silent by default. Called
+ * at every return of {@link normalizePathForSandbox} that can carry one, glob
+ * spellings included.
+ */
+function warnIfParentRefUnfolded(normalizedPath: string): string {
+  if (
+    getPlatform() !== 'windows' &&
+    /(?:^|\/)\.\.(?:\/|$)/.test(normalizedPath)
+  ) {
+    logForDebugging(
+      `[Sandbox] "${normalizedPath}" could not be resolved and still contains ` +
+        `a ".." component, so a rule spelled this way may not match.`,
+      { level: 'warn' },
+    )
+  }
+  return normalizedPath
+}
+
+/**
  * Normalize a path for use in sandbox configurations
  * Handles:
  * - Tilde (~) expansion for home directory
@@ -421,14 +443,14 @@ export function normalizePathForSandbox(pathPattern: string): string {
         if (!isSymlinkOutsideBoundary(baseDir, resolvedBaseDir)) {
           // Reconstruct the pattern with the resolved directory
           const patternSuffix = normalizedPath.slice(baseDir.length)
-          return resolvedBaseDir + patternSuffix
+          return warnIfParentRefUnfolded(resolvedBaseDir + patternSuffix)
         }
         // If resolution would broaden scope, keep original pattern
       } catch {
         // If directory doesn't exist or can't be resolved, keep the original pattern
       }
     }
-    return normalizedPath
+    return warnIfParentRefUnfolded(normalizedPath)
   }
 
   // A trailing '/' or '/.' is not semantic outside a glob.
@@ -449,24 +471,10 @@ export function normalizePathForSandbox(pathPattern: string): string {
       normalizedPath = resolvedPath
     }
   } catch {
-    // If path doesn't exist or can't be resolved, keep the normalized path.
-    // A '..' component that survived to here is one realpath would have
-    // folded; folding it lexically could aim the rule past a symlink, so the
-    // spelling is kept and the caller is told it may not match.
-    if (
-      getPlatform() !== 'windows' &&
-      /(?:^|\/)\.\.(?:\/|$)/.test(normalizedPath)
-    ) {
-      logForDebugging(
-        `[Sandbox] "${pathPattern}" does not exist and still contains a ".." ` +
-          `component, so it could not be canonicalised; a rule spelled this ` +
-          `way may not match.`,
-        { level: 'warn' },
-      )
-    }
+    // Absent, or unreadable: keep the normalized spelling.
   }
 
-  return normalizedPath
+  return warnIfParentRefUnfolded(normalizedPath)
 }
 
 /**
