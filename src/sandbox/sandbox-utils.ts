@@ -326,7 +326,7 @@ function collapseInteriorSpellings(pathPattern: string): string {
  * Handles:
  * - Tilde (~) expansion for home directory
  * - Relative paths (./foo, ../foo, etc.) converted to absolute
- * - Absolute paths remain unchanged
+ * - POSIX: '//' runs, '/./' components and a trailing '/' or '/.' collapsed
  * - Symlinks are resolved to their real paths for non-glob patterns
  * - Glob patterns preserve wildcards after path normalization
  *
@@ -380,16 +380,29 @@ export function normalizePathForSandbox(pathPattern: string): string {
     normalizedPath = path.resolve(process.cwd(), pathPattern)
   }
 
+  // POSIX: collapse the interior spellings realpath would have removed, on the
+  // EXPANDED path — the trailing strip above runs before expansion and only
+  // ever touches a trailing run, and tilde expansion can put a run back
+  // (HOME='/home/u/' turns '~/x' into '/home/u//x'). Glob spellings need it
+  // for the same reason: '~/.aws//*.pem' compiles to a regex holding '//'.
+  //
+  // It matters on macOS: Seatbelt compares the kernel's canonical path, so a
+  // filter spelled with '//' or '/./' matches nothing, silently — which for a
+  // deny is exactly the absent-target case the deny exists for. bwrap
+  // tolerates the spelling, and the Linux backend rebuilds its destinations
+  // with path.dirname/join, so that argv was already right.
+  //
+  // Lexical only, and deliberately not path.normalize/path.resolve: those
+  // also fold '..', which through a symlinked component aims the rule at a
+  // different file than the kernel would reach. An absolute spelling's '..' is
+  // left to realpath below; a relative one was already folded lexically by the
+  // path.resolve above (pre-existing).
+  if (getPlatform() !== 'windows') {
+    normalizedPath = collapseInteriorSpellings(normalizedPath)
+  }
+
   // For glob patterns, resolve symlinks for the directory portion only
   if (containsGlobCharsForPlatform(normalizedPath)) {
-    // The interior collapse below is needed here too, and for the same
-    // reason: '~/.aws//*.pem' compiles to a regex holding '//', which the
-    // kernel's canonical path never matches, so the deny covers nothing. The
-    // interior only — a trailing slash after a glob segment is semantic, and
-    // a '**' segment holds no run of its own to collapse.
-    if (getPlatform() !== 'windows') {
-      normalizedPath = collapseInteriorSpellings(normalizedPath)
-    }
     // Extract the static directory prefix before glob characters
     // (on Windows, `[`/`]` are literal so only split on `*`/`?`).
     const splitRe = getPlatform() === 'windows' ? /[*?]/ : /[*?[\]]/
@@ -418,27 +431,10 @@ export function normalizePathForSandbox(pathPattern: string): string {
     return normalizedPath
   }
 
-  // POSIX: collapse the interior spellings realpath below would have removed,
-  // on the EXPANDED path. The strip above runs before expansion and only ever
-  // touches a trailing run, so neither covers '/a//b' or '/a/./b' — and tilde
-  // expansion can put a slash run back (HOME='/home/u/' turns '~/x' into
-  // '/home/u//x'). Interior non-canonical spellings are tolerated by neither
-  // backend: bwrap binds the literal string and Seatbelt compares the
-  // kernel's canonical path, so a rule spelled that way matches nothing
-  // whenever realpath cannot rescue it — i.e. whenever its target does not
-  // exist, which for a deny is exactly the credential-file-not-created-yet
-  // case. A leading '//' is collapsed too: POSIX permits an implementation to
-  // treat it specially, but neither backend does. Only the trailing run is
-  // non-glob-only; the interior collapse runs for a glob as well, above.
-  //
-  // Lexical only, and deliberately not path.normalize/path.resolve: those
-  // fold '..' on paper, which through a symlinked component aims the rule at
-  // a different file than the kernel would resolve. '..' is left to realpath.
+  // A trailing '/' or '/.' is not semantic outside a glob.
   if (getPlatform() !== 'windows') {
     normalizedPath =
-      collapseInteriorSpellings(normalizedPath)
-        .replace(/\/\.$/, '')
-        .replace(/\/+$/, '') || '/'
+      normalizedPath.replace(/\/\.$/, '').replace(/\/+$/, '') || '/'
   }
 
   // Resolve symlinks to real paths to avoid bwrap issues
