@@ -29,11 +29,6 @@ import { isLinux, isWindows } from '../helpers/platform.js'
  * - Linux denyRead '<dir>/': records a tmpfs the hidden-by-tmpfs emission
  *   filter can never match, so a denyWrite bind beneath it is emitted AFTER
  *   the tmpfs and re-mounts the read-denied host contents readable.
- * - Linux allowOnly '<dir>/': every within-allowlist comparison misses, so
- *   denyWithinAllow (and mandatory) deny binds are silently dropped while
- *   the tree is bind-mounted writable. Pinned in
- *   readonly-deny-dir-stubs.test.ts, where the allow-record site it turns on
- *   lives.
  * - Linux allowWithinDeny + allowOnly sharing a slashed spelling: the
  *   re-allow skip in the tmpfs re-bind pass depends on both sides using the
  *   same spelling, or an extra ro-bind stacks over the writable re-bind and
@@ -43,12 +38,14 @@ import { isLinux, isWindows } from '../helpers/platform.js'
  *
  * Glob spellings are deliberately untouched (a slash after a glob segment
  * is semantic), as is Windows (a trailing separator there is the directory
- * marker for absent deny targets).
+ * marker for absent deny targets). The glob a trailing slash compiles to
+ * matches nothing: harmless as an allow, which is why an allow still takes
+ * it, and rejected at config validation as a deny.
  */
 describe('normalizePathForSandbox trailing slashes', () => {
   // Pure string work on the POSIX spellings below, so it runs on Linux and
   // macOS alike. Gated off Windows only because the strip is deliberately
-  // skipped there (the trailing separator is the directory marker).
+  // skipped there (see the header).
   it.if(!isWindows)('strips non-glob spellings, keeps globs and root', () => {
     expect(normalizePathForSandbox('/data/secrets/')).toBe('/data/secrets')
     expect(normalizePathForSandbox('/data/secrets//')).toBe('/data/secrets')
@@ -57,10 +54,15 @@ describe('normalizePathForSandbox trailing slashes', () => {
     expect(normalizePathForSandbox('/data/*/')).toBe('/data/*/')
     expect(normalizePathForSandbox('/data/**/')).toBe('/data/**/')
     // Empty input means the cwd, like any other relative spelling — it is
-    // not rewritten into the filesystem root.
+    // not rewritten into the filesystem root. The equivalence alone would
+    // also hold for a normaliser that answered '/' to everything, so anchor
+    // it — unless the cwd really is the root.
     expect(normalizePathForSandbox('')).toBe(
       normalizePathForSandbox(process.cwd()),
     )
+    if (process.cwd() !== '/') {
+      expect(normalizePathForSandbox('')).not.toBe('/')
+    }
   })
 })
 
@@ -132,18 +134,17 @@ describe.if(isLinux)('Linux: trailing-slash spellings', () => {
     const writableRebind = command.lastIndexOf(`--bind ${data} ${data}`)
     expect(writableRebind).toBeGreaterThanOrEqual(0)
     // The ro-bind must be absent, or land before the writable re-bind — last
-    // mount wins. (`lastIndexOf` returns -1 when absent, which is why the
-    // two cases are spelled out rather than compared numerically.)
+    // mount wins. `lastIndexOf` returns -1 when absent, which reads as
+    // "before" given the precondition above.
     const roStack = command.lastIndexOf(`--ro-bind ${data} ${data}`)
-    expect(roStack === -1 || roStack < writableRebind).toBe(true)
+    expect(roStack).toBeLessThan(writableRebind)
   })
 })
 
 // Profile GENERATION is pure string building, so these assertions run under
 // Linux too even though the profile only executes under macOS sandbox-exec.
-// Windows is excluded: the chokepoint keeps the trailing separator there (it
-// is the directory marker for absent deny targets), so the carve-out would
-// not reach the profile in its slash-free spelling.
+// Windows is excluded: the chokepoint keeps the trailing separator there, so
+// the carve-out would not reach the profile in its slash-free spelling.
 describe.if(!isWindows)(
   'macOS profile: trailing-slash allowWithinDeny spelling',
   () => {
