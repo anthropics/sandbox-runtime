@@ -167,13 +167,6 @@ d('--control-fd', () => {
       if (child.exitCode === null && child.signalCode === null) {
         child.kill('SIGKILL')
       }
-      // Release the runner's own wrappers around this child's pipes.
-      // Left to the garbage collector they pile up across the file's
-      // spawns, and bun's node:child_process shim then starts losing a
-      // later child's output and its 'close' altogether.
-      for (const stream of child.stdio) {
-        stream?.destroy()
-      }
     }
     spawned = []
     for (const fd of heldFds) {
