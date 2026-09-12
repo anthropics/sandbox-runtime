@@ -36,8 +36,11 @@ import { isLinux } from '../helpers/platform.js'
  * already uncreatable there — and keeps the stub (fail closed, preferring
  * the pre-existing abort to a silently creatable deny path) whenever the
  * denyRead re-application machinery could make that subtree writable
- * again: an allowed write path strictly beneath the covering directory, or
- * a read-deny tmpfs containing it or any spelling it was reached through.
+ * again: an allowed write path that is both strictly beneath the covering
+ * directory and at or under a read-deny tmpfs (the tmpfs re-application
+ * binds exactly those back, writable, after the covering bind), or a
+ * read-deny tmpfs containing the covering directory or any spelling it was
+ * reached through.
  */
 describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   // realpathSync so exact-string assertions hold even when tmpdir itself
@@ -188,6 +191,67 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       expect(run.stderr ?? '').not.toMatch(/Can't create file/i)
       expect(run.status).toBe(0)
       expect(run.stdout).toContain('hello')
+    },
+  )
+
+  it('skips stubs when a nested allow under the write-denied checkout is buried, not re-opened', async () => {
+    // The "write-protect the checkout, let the build write to <checkout>/out"
+    // profile, with nothing read-denied. The nested allow's --bind is emitted
+    // BEFORE the covering read-only bind, and with no read-deny tmpfs over it
+    // there is no re-application to bind it back on top — so the whole
+    // checkout is read-only in the sandbox and the absent dotfile denies need
+    // no stub. Vetoing on the nested allow alone kept them and aborted every
+    // command at startup inside the read-only bind.
+    process.chdir(PROJ)
+    const out = join(PROJ, 'out')
+    mkdirSync(out)
+
+    const command = await wrap([PROJ], [], [AREA, out])
+
+    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+    // The nested allow is bound before the covering bind buries it, and
+    // nothing re-binds it afterwards.
+    const projBind = command.lastIndexOf(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command.indexOf(`--bind ${out} ${out}`)).toBeLessThan(projBind)
+    expect(command.indexOf(`--bind ${out} ${out}`, projBind)).toBe(-1)
+  })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'boots with a buried nested allow, and both the dotfile and the nested allow stay unwritable',
+    async () => {
+      // The runtime half of the test above: bwrap starts (no startup abort),
+      // the absent dotfile is uncreatable, the nested allow is unwritable too
+      // — the covering bind buries it, which is what makes skipping the stub
+      // sound — and the rest of the allowed area is still writable.
+      process.chdir(PROJ)
+      const out = join(PROJ, 'out')
+      mkdirSync(out)
+      const control = join(AREA, 'control.txt')
+
+      const command = await wrap(
+        [PROJ],
+        [],
+        [AREA, out],
+        `touch ${join(PROJ, '.gitconfig')} 2>/dev/null || echo NO-DOTFILE; ` +
+          `touch ${join(out, 'x')} 2>/dev/null || echo NO-NESTED-ALLOW; ` +
+          `touch ${control} 2>/dev/null && echo AREA-WRITABLE`,
+      )
+      const run = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: PROJ,
+      })
+
+      // A kept stub aborts bwrap here, before the command runs at all.
+      expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
+      expect(run.stdout).toBe('NO-DOTFILE\nNO-NESTED-ALLOW\nAREA-WRITABLE\n')
+      expect(existsSync(join(PROJ, '.gitconfig'))).toBe(false)
+      expect(existsSync(join(out, 'x'))).toBe(false)
+      expect(existsSync(control)).toBe(true)
     },
   )
 

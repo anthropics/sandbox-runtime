@@ -1409,9 +1409,10 @@ async function generateFilesystemArgs(
     // gate as the --ro-bind emission, and it records every raw spelling each
     // directory is reached through. A recorded directory is EVIDENCE for
     // skipping a stub only if it also passes the guard's vetoes below (no
-    // allowed write path strictly beneath it; contained by no read-deny
-    // tmpfs in any spelling), which exclude every way its subtree
-    // could be writable in the sandbox. Keep the two passes in lockstep: a
+    // allowed write path both strictly beneath it and under a read-deny
+    // tmpfs; contained by no read-deny tmpfs in any spelling), which exclude
+    // every way its subtree could be writable in the sandbox. Keep the two
+    // passes in lockstep: a
     // directory recorded here but never re-bound read-only AND not vetoed
     // would suppress stubs unsafely, while an emitted one missing from the
     // record only costs a spurious abort.
@@ -1458,27 +1459,35 @@ async function generateFilesystemArgs(
     // deny entry.
     // INVARIANT: a stub, or an existing deny path's own bind, is skipped
     // only under a recorded covering deny directory that has no allowed
-    // write path strictly beneath it and that no read-deny tmpfs directory
+    // write path both strictly beneath it and at or under a prospective
+    // read-deny tmpfs directory, and that no read-deny tmpfs directory
     // contains (it, or any spelling it was reached through). Containment is
     // root-aware (isAtOrUnder): '/' is a recordable covering directory when
     // allowOnly and denyWithinAllow both name it, and '/' + '/' is a prefix
     // of nothing, so a string-prefix test would judge it safe for every path
     // and drop the binds the re-application passes below key off.
-    // Rationale: the only writable emissions that land after the
-    // buffered read-only binds are the denyRead re-applications
-    // (pushReadDenyDirMounts), which mount a tmpfs and re-bind allowed write
-    // paths beneath it WITHOUT re-emitting the binds it buries. A tmpfs
-    // beneath the dir is re-applied after the dir's bind, and what that makes
-    // writable again is exactly the allowed write paths beneath the tmpfs,
-    // hence beneath the dir: veto (i). The tmpfs itself needs no veto of its
-    // own: a path created inside it never reaches the host, so a deny path
-    // beneath it needs no stub, and one elsewhere under the dir is not
-    // affected by it. (Vetoing on it would abort every command of a
-    // write-denied checkout as soon as a denyRead pattern such as
-    // `**/build/**` matched a directory inside it.) A tmpfs containing the
-    // dir is the only way the dir's own --ro-bind gets dropped at emission as
-    // hidden-by-a-tmpfs, and can re-bind an allowed path around it: veto
-    // (ii). (The emission filter's other drop condition,
+    // Rationale: the only emission that lands after the buffered read-only
+    // binds and is both host-backed and writable is the denyRead
+    // re-application's `--bind <allow> <allow>` (pushReadDenyDirMounts):
+    // everything else that follows is a tmpfs (its contents never reach the
+    // host), a --ro-bind file mask, or the read-only fake-file store bind.
+    // That re-application mounts a tmpfs and re-binds allowed write paths
+    // beneath it WITHOUT re-emitting the binds it buries, and it re-binds an
+    // allowed write path only when that path is AT OR UNDER the tmpfs. So the
+    // dir's subtree can be re-opened only by an allowed write path that is
+    // both strictly beneath the dir and at or under a prospective read-deny
+    // tmpfs: veto (i). An allowed write path beneath the dir with no such
+    // tmpfs over it is bound BEFORE the dir's read-only bind and stays buried
+    // by it — vetoing on it alone aborted every command of the common
+    // "write-protect the checkout, let the build write to <checkout>/out"
+    // profile. The tmpfs itself needs no veto of its own: a path created
+    // inside it never reaches the host, so a deny path beneath it needs no
+    // stub, and one elsewhere under the dir is not affected by it. (Vetoing
+    // on it would abort every command of a write-denied checkout as soon as a
+    // denyRead pattern such as `**/build/**` matched a directory inside it.) A
+    // tmpfs containing the dir is the only way the dir's own --ro-bind gets
+    // dropped at emission as hidden-by-a-tmpfs, and can re-bind an allowed
+    // path around it: veto (ii). (The emission filter's other drop condition,
     // maskedFiles, holds file dests only — /dev/null read-deny masks and
     // credential-mask fakes — while the pre-pass stat-verifies every
     // recorded dir as a directory, so it cannot drop a recorded dir short of
@@ -1500,11 +1509,17 @@ async function generateFilesystemArgs(
         prospectiveReadDenyTmpfsDirsBothForms,
       } = getStubSkipVetoInputs()
       const unsafe =
-        // (i) an allowed write path strictly beneath the dir: the
-        //     re-application of a read-deny tmpfs above it would re-bind it
-        //     writable.
-        allowedWritePathsBothForms.some(writePath =>
-          isStrictlyUnder(writePath, denyDir),
+        // (i) an allowed write path strictly beneath the dir AND at or under
+        //     a prospective read-deny tmpfs: re-applying that tmpfs after the
+        //     dir's read-only bind re-binds exactly such a path, writable.
+        //     Without a tmpfs over it the path's own --bind was emitted
+        //     before the dir's bind and stays buried by it.
+        allowedWritePathsBothForms.some(
+          writePath =>
+            isStrictlyUnder(writePath, denyDir) &&
+            prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
+              isAtOrUnder(writePath, tmpfsDir),
+            ),
         ) ||
         // (ii) a read-deny tmpfs CONTAINING the dir or any raw spelling it
         //     was reached through: the dir's own --ro-bind can be dropped as
