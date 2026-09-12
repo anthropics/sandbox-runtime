@@ -685,13 +685,15 @@ int main(int argc, char *argv[]) {
     /* ---- New PID + mount namespaces. Children (not us) enter the PID ns. ----
      *
      * Two paths to get CAP_SYS_ADMIN for the unshare:
-     *   (a) The caller (bwrap) kept CAP_SYS_ADMIN in this user namespace via
-     *       --cap-add. Just unshare directly.
+     *   (a) We already hold CAP_SYS_ADMIN in this user namespace. Just
+     *       unshare directly. Under the sandbox we never do — bwrap is
+     *       given --cap-drop ALL and at most --cap-add CAP_SETFCAP — so
+     *       this path is for a standalone run by a privileged caller.
      *   (b) We don't have the cap. Create a nested user namespace to get it,
      *       map uid/gid, then unshare. This also works when apply-seccomp is
      *       run standalone outside bwrap.
      *
-     * Path (a) is tried first. If the caller didn't give us the cap, the
+     * Path (a) is tried first. If we don't have the cap, the
      * kernel returns EPERM and we fall through to (b). Path (b) can itself
      * fail on hosts where unprivileged user namespaces are gated by an LSM
      * (Ubuntu 24.04's AppArmor restriction, for example) — the unshare
@@ -831,9 +833,26 @@ int main(int argc, char *argv[]) {
         die("apply-seccomp: mount(/proc)");
     }
 
-    /* bwrap --cap-add places CAP_SYS_ADMIN in the ambient set so it survives
-     * exec. Clear it now that the mount is done; combined with
-     * PR_SET_NO_NEW_PRIVS, the worker's execve drops to zero capabilities. */
+    /* Drop whatever bwrap's --cap-add left in the ambient set (today at most
+     * CAP_SETFCAP, which path (b) above has already spent) so it cannot
+     * survive the worker's exec.
+     *
+     * What the worker ends up with depends on its euid. For a non-root
+     * caller it execs with no capability at all: the ambient set is empty
+     * and there are no file capabilities to raise. For a uid-0 caller the
+     * kernel's root rule recomputes the permitted set from the bounding
+     * set, which unshare(CLONE_NEWUSER) above reset to full, so the worker
+     * holds a full set in the nested namespace — the ambient clear and the
+     * PR_SET_NO_NEW_PRIVS the worker sets below do not change that, because
+     * the worker already holds those capabilities and so gains nothing at
+     * exec. Measured (Linux 6.12): capset()ing the three sets empty before
+     * that exec does leave the worker with none, because it turns the root
+     * rule's recompute into a gain and NO_NEW_PRIVS clamps a gain back to
+     * what was held; dropping the bounding set has the same effect. Neither
+     * is done here. What keeps the deny mounts in place for that worker is
+     * not its capabilities but that the nested mount namespace's copies of
+     * them are locked, having been created across a user-namespace
+     * boundary. */
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
     }
