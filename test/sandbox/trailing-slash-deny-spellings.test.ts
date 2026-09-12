@@ -14,7 +14,7 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { normalizePathForSandbox } from '../../src/sandbox/sandbox-utils.js'
-import { isLinux } from '../helpers/platform.js'
+import { isLinux, isWindows } from '../helpers/platform.js'
 
 /**
  * Trailing-slash spellings.
@@ -31,7 +31,9 @@ import { isLinux } from '../helpers/platform.js'
  *   the tmpfs and re-mounts the read-denied host contents readable.
  * - Linux allowOnly '<dir>/': every within-allowlist comparison misses, so
  *   denyWithinAllow (and mandatory) deny binds are silently dropped while
- *   the tree is bind-mounted writable.
+ *   the tree is bind-mounted writable. Pinned in
+ *   readonly-deny-dir-stubs.test.ts, where the allow-record site it turns on
+ *   lives.
  * - Linux allowWithinDeny + allowOnly sharing a slashed spelling: the
  *   re-allow skip in the tmpfs re-bind pass depends on both sides using the
  *   same spelling, or an extra ro-bind stacks over the writable re-bind and
@@ -44,15 +46,21 @@ import { isLinux } from '../helpers/platform.js'
  * marker for absent deny targets).
  */
 describe('normalizePathForSandbox trailing slashes', () => {
-  it.if(isLinux)('strips non-glob spellings, keeps globs and root', () => {
+  // Pure string work on the POSIX spellings below, so it runs on Linux and
+  // macOS alike. Gated off Windows only because the strip is deliberately
+  // skipped there (the trailing separator is the directory marker).
+  it.if(!isWindows)('strips non-glob spellings, keeps globs and root', () => {
     expect(normalizePathForSandbox('/data/secrets/')).toBe('/data/secrets')
     expect(normalizePathForSandbox('/data/secrets//')).toBe('/data/secrets')
     expect(normalizePathForSandbox('/')).toBe('/')
     // Glob spellings keep their trailing slash — it changes glob semantics.
     expect(normalizePathForSandbox('/data/*/')).toBe('/data/*/')
     expect(normalizePathForSandbox('/data/**/')).toBe('/data/**/')
-    // Empty input is not rewritten into the filesystem root.
-    expect(normalizePathForSandbox('')).not.toBe('/')
+    // Empty input means the cwd, like any other relative spelling — it is
+    // not rewritten into the filesystem root.
+    expect(normalizePathForSandbox('')).toBe(
+      normalizePathForSandbox(process.cwd()),
+    )
   })
 })
 
@@ -78,10 +86,13 @@ describe.if(isLinux)('Linux: trailing-slash spellings', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  it.each([['plain'], ['trailing-slash']])(
+  it.each([
+    ['plain', ''],
+    ['trailing-slash', '/'],
+  ])(
     'drops a denyWrite bind hidden by a read-deny tmpfs (%s spelling)',
-    async spelling => {
-      const denyRead = spelling === 'trailing-slash' ? `${SECRETS}/` : SECRETS
+    async (_label, suffix) => {
+      const denyRead = `${SECRETS}${suffix}`
 
       const command = await wrapCommandWithSandboxLinux({
         command: 'true',
@@ -100,24 +111,6 @@ describe.if(isLinux)('Linux: trailing-slash spellings', () => {
       expect(command).not.toContain(`--ro-bind ${SUB} ${SUB}`)
     },
   )
-
-  it('enforces denyWithinAllow under a trailing-slash allowOnly spelling', async () => {
-    // A slashed allowOnly used to make every within-allowlist comparison
-    // miss, silently dropping the deny re-binds while the tree stayed
-    // bind-mounted writable.
-    const secret = join(AREA, 'secret.txt')
-    writeFileSync(secret, 'x\n')
-
-    const command = await wrapCommandWithSandboxLinux({
-      command: 'true',
-      needsNetworkRestriction: false,
-      readConfig: { denyOnly: [] },
-      writeConfig: { allowOnly: [`${AREA}/`], denyWithinAllow: [secret] },
-    })
-
-    expect(command).toContain(`--bind ${AREA} ${AREA}`)
-    expect(command).toContain(`--ro-bind ${secret} ${secret}`)
-  })
 
   it('does not stack a ro-bind over an allowed write dir named by a slashed carve-out (EROFS shape)', async () => {
     // The same directory appears (naturally, by copy-paste) as a
@@ -138,54 +131,64 @@ describe.if(isLinux)('Linux: trailing-slash spellings', () => {
 
     const writableRebind = command.lastIndexOf(`--bind ${data} ${data}`)
     expect(writableRebind).toBeGreaterThanOrEqual(0)
+    // The ro-bind must be absent, or land before the writable re-bind — last
+    // mount wins. (`lastIndexOf` returns -1 when absent, which is why the
+    // two cases are spelled out rather than compared numerically.)
     const roStack = command.lastIndexOf(`--ro-bind ${data} ${data}`)
-    expect(roStack).toBeLessThan(writableRebind)
+    expect(roStack === -1 || roStack < writableRebind).toBe(true)
   })
 })
 
-// Profile GENERATION is pure string building, so these assertions run on
-// every platform even though the profile only executes under macOS
-// sandbox-exec.
-describe('macOS profile: trailing-slash allowWithinDeny spelling', () => {
-  it.each([['plain'], ['trailing-slash']])(
-    're-emits a nested literal deny after the carve-out allow (%s spelling)',
-    spelling => {
-      const carveOut =
-        spelling === 'trailing-slash' ? '/work/priv/pub/' : '/work/priv/pub'
+// Profile GENERATION is pure string building, so these assertions run under
+// Linux too even though the profile only executes under macOS sandbox-exec.
+// Windows is excluded: the chokepoint keeps the trailing separator there (it
+// is the directory marker for absent deny targets), so the carve-out would
+// not reach the profile in its slash-free spelling.
+describe.if(!isWindows)(
+  'macOS profile: trailing-slash allowWithinDeny spelling',
+  () => {
+    it.each([
+      ['plain', ''],
+      ['trailing-slash', '/'],
+    ])(
+      're-emits a nested literal deny after the carve-out allow (%s spelling)',
+      (_label, suffix) => {
+        const profile = wrapCommandWithSandboxMacOS({
+          command: 'true',
+          needsNetworkRestriction: false,
+          readConfig: {
+            denyOnly: ['/work/priv', '/work/priv/pub/secret'],
+            allowWithinDeny: [`/work/priv/pub${suffix}`],
+          },
+          writeConfig: undefined,
+        })
 
+        // The carve-out allow rule uses the slash-free subpath spelling.
+        const allowRule = `(allow file-read*\n  (subpath "/work/priv/pub")`
+        const allowIdx = profile.indexOf(allowRule)
+        expect(allowIdx).toBeGreaterThanOrEqual(0)
+        // Last-match-wins: the more-specific nested deny must land AFTER the
+        // allow rule, or the carve-out silently re-allows it.
+        const lastDenyIdx = profile.lastIndexOf(
+          `(deny file-read*\n  (subpath "/work/priv/pub/secret")`,
+        )
+        expect(lastDenyIdx).toBeGreaterThan(allowIdx)
+      },
+    )
+
+    it('keeps glob carve-out spellings untouched (no dead-to-live regex flip)', () => {
+      // A glob carve-out ending in '/' compiles to whatever regex its author
+      // wrote; the chokepoint must not rewrite it into a broader one.
       const profile = wrapCommandWithSandboxMacOS({
         command: 'true',
         needsNetworkRestriction: false,
         readConfig: {
-          denyOnly: ['/work/priv', '/work/priv/pub/secret'],
-          allowWithinDeny: [carveOut],
+          denyOnly: ['/work/priv'],
+          allowWithinDeny: ['/work/priv/pub/*/'],
         },
+        writeConfig: undefined,
       })
-
-      // The carve-out allow rule uses the slash-free subpath spelling.
-      const allowRule = `(allow file-read*\n  (subpath "/work/priv/pub")`
-      const allowIdx = profile.indexOf(allowRule)
-      expect(allowIdx).toBeGreaterThanOrEqual(0)
-      // Last-match-wins: the more-specific nested deny must land AFTER the
-      // allow rule, or the carve-out silently re-allows it.
-      const lastDenyIdx = profile.lastIndexOf(
-        `(deny file-read*\n  (subpath "/work/priv/pub/secret")`,
-      )
-      expect(lastDenyIdx).toBeGreaterThan(allowIdx)
-    },
-  )
-
-  it('keeps glob carve-out spellings untouched (no dead-to-live regex flip)', () => {
-    // A glob carve-out ending in '/' compiles to whatever regex its author
-    // wrote; the chokepoint must not rewrite it into a broader one.
-    const profile = wrapCommandWithSandboxMacOS({
-      command: 'true',
-      needsNetworkRestriction: false,
-      readConfig: {
-        denyOnly: ['/work/priv'],
-        allowWithinDeny: ['/work/priv/pub/*/'],
-      },
+      expect(profile).toContain('/work/priv/pub/[^/]*/$')
     })
-    expect(profile).toContain('/work/priv/pub/[^/]*/$')
-  })
-})
+  },
+)
