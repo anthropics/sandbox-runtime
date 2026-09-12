@@ -1222,6 +1222,60 @@ describe.if(isLinux)('extract no-match onExtractNoMatch on Linux', () => {
 })
 
 /**
+ * A degraded entry names a file the library opened, so the deny must
+ * survive on a path whose own name holds glob characters. Expanded as a
+ * pattern instead, `a[b/c]d` matches nothing and the deny is dropped.
+ */
+describe.if(isLinux)('a degraded credential path holding brackets', () => {
+  const TEST_DIR = join(
+    realpathSync(tmpdir()),
+    'srt-credmask-brackets-' + Date.now(),
+    'a[b',
+    'c]d',
+  )
+  const SECRET_FILE = join(TEST_DIR, 'hosts.yml')
+  const SECRET = 'gho_brackets_real_0123456789'
+
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        files: [
+          {
+            path: SECRET_FILE,
+            mode: 'mask',
+            extract: 'will_not_match_(\\S+)',
+            onExtractNoMatch: 'deny',
+          },
+        ],
+        allowPlaintextInject: true,
+      },
+    })
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
+
+  test('stays unreadable inside the sandbox', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    expect(wrapped).not.toContain(SECRET)
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    expect(result.status).not.toBe(0)
+    expect(result.stdout).not.toContain(SECRET)
+  })
+})
+
+/**
  * macOS: SBPL cannot redirect a read, so a masked file degrades to a
  * (deny file-read* …) rule — same profile output as mode: "deny". The
  * fakePath is unused. Pure string assertion; runs on any platform.
