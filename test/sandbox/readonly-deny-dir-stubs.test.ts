@@ -36,9 +36,11 @@ import { isLinux } from '../helpers/platform.js'
  * already uncreatable there — and keeps the stub (fail closed, preferring
  * the pre-existing abort to a silently creatable deny path) whenever the
  * denyRead re-application machinery could make that subtree writable
- * again: an allowed write path strictly beneath the covering directory, or
- * a read-deny tmpfs comparable with it (at/beneath it, or containing it or
- * any spelling it was reached through).
+ * again: an allowed write path that is both strictly beneath the covering
+ * directory and at or under a read-deny tmpfs (the tmpfs re-application
+ * binds exactly those back, writable, after the covering bind), or a
+ * read-deny tmpfs containing the covering directory or any spelling it was
+ * reached through.
  */
 describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   // realpathSync so exact-string assertions hold even when tmpdir itself
@@ -105,7 +107,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     })
   }
 
-  it('skips stubs for absent mandatory-deny dotfiles inside a write-denied cwd, and bwrap still boots', async () => {
+  it('skips stubs for absent mandatory-deny dotfiles inside a write-denied cwd', async () => {
     // The real-world shape: cwd is write-denied, so the mandatory dotfile
     // denies at cwd (.gitconfig, .bashrc, …) are all absent stub candidates.
     process.chdir(PROJ)
@@ -131,12 +133,17 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(afterReadOnlyRebind).not.toMatch(
       /--ro-bind \S*claude-empty-\S+ \S*\/proj\//,
     )
+  })
 
-    // Where the host can run bwrap, prove the sandbox actually boots — the
-    // pre-fix symptom was a startup abort with no command executed — and
-    // that the deny still holds (the absent dotfile stays uncreatable).
-    if (BWRAP_CAN_NAMESPACE) {
-      const run = spawnSync(command, {
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'boots under a write-denied cwd and still blocks the absent dotfile',
+    async () => {
+      // The runtime half: the pre-fix symptom was a startup abort with no
+      // command executed, and the deny must still hold (the absent dotfile
+      // stays uncreatable).
+      process.chdir(PROJ)
+
+      const run = spawnSync(await wrap([PROJ]), {
         shell: true,
         encoding: 'utf8',
         timeout: 15000,
@@ -152,8 +159,8 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       )
       expect(denied.status).not.toBe(0)
       expect(existsSync(join(PROJ, '.gitconfig'))).toBe(false)
-    }
-  })
+    },
+  )
 
   it('still stubs an absent mandatory-deny dotfile when the cwd remains writable (no over-broad skip)', async () => {
     // Control: without the covering denyWrite, cwd stays writable, so the
@@ -165,6 +172,88 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).toContain(`--bind ${AREA} ${AREA}`)
     expect(command).toContain(`--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`)
   })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'boots with the stub kept over a writable cwd',
+    async () => {
+      // A KEPT stub bwrap can still mount: nothing re-binds cwd read-only, so
+      // the /dev/null mount point is created in a writable tree and the
+      // sandbox starts. Where a kept stub lands inside a read-only bind it
+      // aborts instead — the fail-closed case pinned further down.
+      process.chdir(PROJ)
+
+      const run = spawnSync(await wrap([]), {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: PROJ,
+      })
+      expect(run.stderr ?? '').not.toMatch(/Can't create file/i)
+      expect(run.status).toBe(0)
+      expect(run.stdout).toContain('hello')
+    },
+  )
+
+  it('skips stubs when a nested allow under the write-denied checkout is buried, not re-opened', async () => {
+    // The "write-protect the checkout, let the build write to <checkout>/out"
+    // profile, with nothing read-denied. The nested allow's --bind is emitted
+    // BEFORE the covering read-only bind, and with no read-deny tmpfs over it
+    // there is no re-application to bind it back on top — so the whole
+    // checkout is read-only in the sandbox and the absent dotfile denies need
+    // no stub. Vetoing on the nested allow alone kept them and aborted every
+    // command at startup inside the read-only bind.
+    process.chdir(PROJ)
+    const out = join(PROJ, 'out')
+    mkdirSync(out)
+
+    const command = await wrap([PROJ], [], [AREA, out])
+
+    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+    // The nested allow is bound before the covering bind buries it, and
+    // nothing re-binds it afterwards.
+    const projBind = command.lastIndexOf(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command.indexOf(`--bind ${out} ${out}`)).toBeLessThan(projBind)
+    expect(command.indexOf(`--bind ${out} ${out}`, projBind)).toBe(-1)
+  })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'boots with a buried nested allow, and both the dotfile and the nested allow stay unwritable',
+    async () => {
+      // The runtime half of the test above: bwrap starts (no startup abort),
+      // the absent dotfile is uncreatable, the nested allow is unwritable too
+      // — the covering bind buries it, which is what makes skipping the stub
+      // sound — and the rest of the allowed area is still writable.
+      process.chdir(PROJ)
+      const out = join(PROJ, 'out')
+      mkdirSync(out)
+      const control = join(AREA, 'control.txt')
+
+      const command = await wrap(
+        [PROJ],
+        [],
+        [AREA, out],
+        `touch ${join(PROJ, '.gitconfig')} 2>/dev/null || echo NO-DOTFILE; ` +
+          `touch ${join(out, 'x')} 2>/dev/null || echo NO-NESTED-ALLOW; ` +
+          `touch ${control} 2>/dev/null && echo AREA-WRITABLE`,
+      )
+      const run = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: PROJ,
+      })
+
+      // A kept stub aborts bwrap here, before the command runs at all.
+      expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
+      expect(run.stdout).toBe('NO-DOTFILE\nNO-NESTED-ALLOW\nAREA-WRITABLE\n')
+      expect(existsSync(join(PROJ, '.gitconfig'))).toBe(false)
+      expect(existsSync(join(out, 'x'))).toBe(false)
+      expect(existsSync(control)).toBe(true)
+    },
+  )
 
   it('keeps the stub (fails closed) when an allowed write path beneath the denied dir is re-opened by denyRead', async () => {
     // The one shape where "the ancestor is under a read-only deny" is not
@@ -189,16 +278,48 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind /dev/null ${absentDeny}`)
   })
 
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'aborts at startup rather than leaving the kept stub creatable (fail closed)',
+    async () => {
+      // The runtime half of the case above, and the tradeoff the guard is
+      // written around: the kept stub is emitted after the covering read-only
+      // bind, so bwrap has to creat() its mount point inside that bind and
+      // refuses to start. That is the pre-existing abort, deliberately
+      // preferred to a silently creatable deny path — and a regression that
+      // kept the stub AND ran would show up here as a created file.
+      const readDenied = join(PROJ, 'ro')
+      const nestedAllow = join(readDenied, 'w')
+      mkdirSync(nestedAllow, { recursive: true })
+      const absentDeny = join(nestedAllow, '.secret')
+
+      const run = spawnSync(
+        await wrap(
+          [PROJ, absentDeny],
+          [readDenied],
+          [AREA, nestedAllow],
+          `touch ${absentDeny}`,
+        ),
+        { shell: true, encoding: 'utf8', timeout: 15000, cwd: PROJ },
+      )
+
+      expect(run.status).not.toBe(0)
+      expect(run.stderr ?? '').toMatch(/Read-only file system/i)
+      expect(existsSync(absentDeny)).toBe(false)
+    },
+  )
+
   it('keeps the stub when ANY covering deny dir has an allowed write path re-opened beneath it', async () => {
     // The read-only conclusion must hold across EVERY deny dir covering the
-    // ancestor, not just one. Here the absent deny's ancestor d is covered
-    // by both PROJ (which has the allowWrite t/w strictly beneath it,
-    // re-opened by the denyRead re-application of t) and d itself (with no
-    // re-opener beneath it). A per-dir check would skip on d and leave the
-    // path creatable through the t/w re-bind.
+    // ancestor, not just one. Here the absent deny's ancestor d is covered by
+    // both PROJ — vetoed, because the allowWrite t/w beneath it sits under
+    // the read-deny tmpfs t and is bound back writable when that tmpfs is
+    // re-applied — and d itself, which nothing vetoes: no allowWrite lies
+    // beneath d and no read-deny tmpfs contains it. A per-dir check would
+    // skip on d and leave the path creatable through the t/w re-bind.
     const readDenied = join(PROJ, 't')
     const nestedAllow = join(readDenied, 'w')
-    const innerDenied = join(nestedAllow, 'd')
+    mkdirSync(nestedAllow, { recursive: true })
+    const innerDenied = join(PROJ, 'other', 'd')
     mkdirSync(innerDenied, { recursive: true })
     writeFileSync(join(innerDenied, 'keep.txt'), 'x\n')
     const absentDeny = join(innerDenied, '.secret')
@@ -215,12 +336,14 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
   it('keeps the stub regardless of where the vetoed covering dir appears in the deny ordering', async () => {
     // Same shape, but the vetoed covering dir PROJ is listed AFTER the
-    // absent entry. A decision that only consults deny dirs seen so far
-    // would miss PROJ's re-opener and skip unsafely; the pre-pass collects
-    // deny dirs order-independently, so the stub is kept.
+    // absent entry, and the unvetoed d before it. A decision that only
+    // consults deny dirs seen so far would find d alone, conclude read-only
+    // and skip unsafely; the pre-pass collects deny dirs order-independently,
+    // so PROJ's veto is visible here too and the stub is kept.
     const readDenied = join(PROJ, 't')
     const nestedAllow = join(readDenied, 'w')
-    const innerDenied = join(nestedAllow, 'd')
+    mkdirSync(nestedAllow, { recursive: true })
+    const innerDenied = join(PROJ, 'other', 'd')
     mkdirSync(innerDenied, { recursive: true })
     writeFileSync(join(innerDenied, 'keep.txt'), 'x\n')
     const absentDeny = join(innerDenied, '.secret')
@@ -245,12 +368,15 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).not.toContain(`--ro-bind /dev/null ${absentDeny}`)
   })
 
-  it('keeps the stub when a denyRead directory sits under the covering deny dir (trigger without nested allow)', async () => {
-    // A read-denied directory strictly inside the write-denied dir is the
-    // TRIGGER for the post-deny writable re-application, so the subtree is
-    // treated as re-openable and the stub is kept even with no nested
-    // allowWrite — a config a later allowWrite addition would otherwise
-    // silently weaken.
+  it('skips the stub when a denyRead directory sits under the covering deny dir with no allowed write path beneath it', async () => {
+    // A read-denied directory strictly inside the write-denied dir is
+    // re-applied as a tmpfs after that dir's read-only bind. What the
+    // re-application makes writable again is the allowed write paths beneath
+    // the tmpfs (vetoed separately) and the tmpfs itself, whose contents
+    // never reach the host: the absent dotfile stays uncreatable, and a stub
+    // for it would abort bwrap inside the read-only bind — for every command
+    // of a write-denied checkout, as soon as a denyRead pattern such as
+    // **/build/** matches a directory in it.
     process.chdir(PROJ)
     const readDenied = join(PROJ, 'secrets')
     mkdirSync(readDenied)
@@ -258,9 +384,38 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
     const command = await wrap([PROJ], [readDenied])
 
-    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
-    expect(command).toContain(`--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`)
+    const projBind = command.lastIndexOf(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(projBind).toBeGreaterThan(-1)
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+    expect(command.lastIndexOf(`--tmpfs ${readDenied}`)).toBeGreaterThan(
+      projBind,
+    )
   })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'leaves the dotfile uncreatable with a denyRead tmpfs under the covering deny dir',
+    async () => {
+      process.chdir(PROJ)
+      const readDenied = join(PROJ, 'secrets')
+      mkdirSync(readDenied)
+      writeFileSync(join(readDenied, 'token.txt'), 'x\n')
+
+      const run = spawnSync(
+        await wrap(
+          [PROJ],
+          [readDenied],
+          [AREA],
+          `touch ${join(PROJ, '.gitconfig')} || echo UNCREATABLE`,
+        ),
+        { shell: true, encoding: 'utf8', timeout: 15000, cwd: PROJ },
+      )
+
+      expect(run.stdout).toBe('UNCREATABLE\n')
+      expect(existsSync(join(PROJ, '.gitconfig'))).toBe(false)
+    },
+  )
 
   it('skips the stub when only a file-level denyRead sits under the covering dir (no tmpfs, no re-open)', async () => {
     // Only an existing DIRECTORY in denyRead becomes a tmpfs and can
@@ -334,18 +489,27 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).not.toContain(
       `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const run = spawnSync(command, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 15000,
-        cwd: PROJ,
-      })
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'boots with the read-denied dirs as unrelated siblings of the write-denied dir',
+    async () => {
+      const homeDir = join(BASE, 'home')
+      mkdirSync(join(homeDir, '.ssh'), { recursive: true })
+      writeFileSync(join(homeDir, '.ssh', 'id_test.pub'), 'ssh-test AAAA\n')
+      const runDir = join(BASE, 'run')
+      mkdirSync(runDir)
+      process.chdir(PROJ)
+
+      const run = spawnSync(
+        await wrap([PROJ], [join(homeDir, '.ssh')], [AREA, runDir]),
+        { shell: true, encoding: 'utf8', timeout: 15000, cwd: PROJ },
+      )
+
       expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
       expect(run.status).toBe(0)
-    }
-  })
+    },
+  )
 
   it('enforces denyWithinAllow under a trailing-slash allowOnly spelling', async () => {
     // A trailing-slash allowOnly entry survives normalizePathForSandbox and
@@ -380,17 +544,58 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).not.toContain(
       `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const run = spawnSync(command, {
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'boots under a trailing-slash allow spelled at the denied dir',
+    async () => {
+      process.chdir(PROJ)
+
+      const run = spawnSync(await wrap([PROJ], [], [`${PROJ}/`]), {
         shell: true,
         encoding: 'utf8',
         timeout: 15000,
         cwd: PROJ,
       })
+
       expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
       expect(run.status).toBe(0)
-    }
+    },
+  )
+
+  it('enforces denyWithinAllow under a glob-character trailing-slash allowOnly spelling', async () => {
+    // normalizePathForSandbox leaves the trailing slash on any spelling it
+    // takes for a glob, so a literal directory named with glob characters is
+    // the one shape the allow loop's own strip still has to handle: recorded
+    // as '<dir>/', it defeats every `allowedPath + '/'` comparison — starting
+    // with the gate that decides whether a deny is inside the allowlist at
+    // all, which would drop the deny and leave the tree writable.
+    const area = join(BASE, '[id]')
+    const secrets = join(area, 'secrets')
+    mkdirSync(secrets, { recursive: true })
+    writeFileSync(join(secrets, 'token.txt'), 'x\n')
+
+    const command = await wrap([secrets], [], [`${area}/`])
+
+    expect(command).toContain(`--bind '${area}' '${area}'`)
+    expect(command).toContain(`--ro-bind '${secrets}' '${secrets}'`)
+  })
+
+  it('denies a glob-character read-deny spelled with a trailing slash', async () => {
+    // Same exemption on the read side. stat() of '<file>/' is ENOTDIR, which
+    // read as "the entry is not there" and dropped the deny outright —
+    // silently, and only for this spelling; the directory form entered the
+    // tmpfs prediction as '<dir>/', which no '<dir>/' prefix test can match.
+    const secretFile = join(PROJ, '[id].env')
+    writeFileSync(secretFile, 'SECRET=1\n')
+    const secretDir = join(PROJ, '[id]')
+    mkdirSync(secretDir)
+    writeFileSync(join(secretDir, 'token.txt'), 'x\n')
+
+    const command = await wrap([], [`${secretFile}/`, `${secretDir}/`])
+
+    expect(command).toContain(`--ro-bind /dev/null '${secretFile}'`)
+    expect(command).toContain(`--tmpfs '${secretDir}'`)
   })
 
   it('re-applies a denyWithinAllow bind under a trailing-slash allow re-bound over a denyRead tmpfs', async () => {
