@@ -1442,7 +1442,10 @@ async function generateFilesystemArgs(
     // a prediction that could be derived, has no allowed write path strictly
     // beneath it and is INCOMPARABLE with every read-deny tmpfs directory
     // (neither at-or-beneath it nor containing it or any spelling it was
-    // reached through). Containment is root-aware
+    // reached through). '/' is the exception: it contains every tmpfs and
+    // every allowed write path, so coveredBySafeReadOnlyDenyDir judges a
+    // vetoed '/' against the candidate instead — see the branch there.
+    // Containment is root-aware
     // (isAtOrUnder): '/' is a recordable covering directory when allowOnly
     // and denyWithinAllow both name it, and '/' + '/' is a prefix of
     // nothing, so a string-prefix test would judge it safe for every path
@@ -1478,10 +1481,10 @@ async function generateFilesystemArgs(
         unreliable,
       } = getStubSkipVetoInputs()
       const unsafe =
-        // (0) the prediction of what the denyRead loop will mount could not
-        //     be derived, so vetoes (ii) and (iii) have nothing to fire on.
-        //     Veto everything rather than nothing: a prediction that failed
-        //     is no evidence that this directory is reliably read-only.
+        // (0) the prediction of what the denyRead loop will mount is
+        //     unusable, so no veto below can be trusted to fire. Veto
+        //     everything rather than nothing: a prediction that failed is no
+        //     evidence that this directory is reliably read-only.
         unreliable ||
         // (i) an allowed write path strictly beneath the dir: the skip is
         //     kept to directories with nothing writable configured inside
