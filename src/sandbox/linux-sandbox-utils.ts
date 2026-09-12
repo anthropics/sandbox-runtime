@@ -1665,6 +1665,9 @@ async function generateFilesystemArgs(
     })
 
   const emittedDenyWriteDests: string[] = []
+  // Write paths already restored read-only by a dropped deny bind, so two
+  // denies covering the same path emit one --ro-bind.
+  const restoredReadOnlyWritePaths = new Set<string>()
   for (let i = 0; i < denyWriteArgs.length; i += 3) {
     const dest = denyWriteArgs[i + 2]!
     const rawDest = denyWriteRawDests.get(dest) ?? dest
@@ -1673,6 +1676,25 @@ async function generateFilesystemArgs(
       logForDebugging(
         `[Sandbox Linux] Skipping denyWrite bind already hidden by denyRead tmpfs: ${dest}`,
       )
+      // The tmpfs hides this dest but not an allowed write path the denyRead
+      // loop re-bound writable beneath it: that path is inside this write
+      // deny, so restore it read-only. Emitting the dest's own bind instead
+      // would expose the read-denied directory around it.
+      for (const writePath of allowedWritePaths) {
+        if (!isAtOrUnder(writePath, dest) && !isAtOrUnder(writePath, rawDest)) {
+          continue
+        }
+        if (restoredReadOnlyWritePaths.has(writePath)) continue
+        restoredReadOnlyWritePaths.add(writePath)
+        args.push('--ro-bind', writePath, writePath)
+        // Like a deny bind, this one lands above whatever the denyRead loop
+        // mounted inside the write path, so the re-application passes below
+        // have to see it and put those mounts back.
+        emittedDenyWriteDests.push(writePath)
+        logForDebugging(
+          `[Sandbox Linux] Restoring write path read-only inside dropped denyWrite bind ${dest}: ${writePath}`,
+        )
+      }
       continue
     }
     args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
