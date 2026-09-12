@@ -124,9 +124,8 @@ function findSymlinkInPath(
       const stats = fs.lstatSync(nextPath)
       if (stats.isSymbolicLink()) {
         // Check if this symlink is within an allowed write path
-        const isWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            nextPath.startsWith(allowedPath + '/') || nextPath === allowedPath,
+        const isWithinAllowedPath = allowedWritePaths.some(allowedPath =>
+          isAtOrUnder(nextPath, allowedPath),
         )
         if (isWithinAllowedPath) {
           return nextPath
@@ -1156,18 +1155,22 @@ async function generateFilesystemArgs(
       return stubSkipVetoInputs
     }
     // The ONE predicate deciding whether a deny dest lies inside the write
-    // allowlist. The read-only pre-pass below and the loop's --ro-bind gate
-    // MUST share it: the pre-pass is only sound if it records exactly the
-    // directories the loop re-binds read-only (a recorded directory that is
-    // never re-bound read-only would suppress stubs unsafely; a re-bound
-    // directory missing from the record only costs an abort). No spelling
-    // handling is needed here: allowedWritePaths entries are recorded with
-    // trailing slashes stripped, and candidates are resolved deny dests.
+    // allowlist, and so whether the deny is applied at all: a dest outside it
+    // is left read-only by the initial --ro-bind / /. The read-only pre-pass
+    // below and the loop's --ro-bind gate MUST share it, so that the pre-pass
+    // records the directories the loop re-binds read-only.
+    //
+    // Containment is root-aware (isAtOrUnder) because '/' is a legal
+    // allowOnly entry: an `allowedPath + '/'` prefix test spells it '//' and
+    // matches nothing, so under a '/' write root every deny that no other
+    // allow entry covers would be judged outside the allowlist and silently
+    // lose its bind — over a root the allow loop has already bound writable.
+    // Spelling needs no further handling here: allowedWritePaths entries are
+    // recorded with trailing slashes stripped, and candidates are resolved
+    // deny dests.
     const isWithinAnyAllowedWritePath = (candidatePath: string): boolean =>
-      allowedWritePaths.some(
-        allowedPath =>
-          candidatePath.startsWith(allowedPath + '/') ||
-          candidatePath === allowedPath,
+      allowedWritePaths.some(allowedPath =>
+        isAtOrUnder(candidatePath, allowedPath),
       )
 
     // Deny writes within allowed paths (user-specified + mandatory denies)
@@ -1196,9 +1199,11 @@ async function generateFilesystemArgs(
     // allowed write path strictly beneath it; incomparable with every
     // read-deny tmpfs in any spelling), which exclude every way its subtree
     // could be writable in the sandbox. Keep the two passes in lockstep: a
-    // directory recorded here but never re-bound read-only AND not vetoed
-    // would suppress stubs unsafely, while an emitted one missing from the
-    // record only costs a spurious abort.
+    // directory recorded here is either re-bound read-only by the loop or
+    // skipped because a recorded directory above it survived the vetoes and
+    // is bound in its place, so every record still stands for a bind that
+    // lands; an emitted one missing from the record only costs a spurious
+    // abort.
     for (const pathPattern of denyPaths) {
       const rawPath = normalizePathForSandbox(pathPattern)
       if (rawPath.startsWith('/dev/')) {
@@ -1317,9 +1322,7 @@ async function generateFilesystemArgs(
           // recorded directory: everything lies beneath it, so it would
           // veto every skip and stub each absent mandatory-deny path of a
           // write-denied cwd after that cwd's own bind — the startup abort.
-          // Its descendants are decided by their own recorded directories,
-          // as before, when the string-prefix filter matched '/' only for a
-          // path directly beneath it and the vetoes never fired for it.
+          // Its descendants are decided by their own recorded directories.
           if (denyDir === '/') continue
           return false
         }
