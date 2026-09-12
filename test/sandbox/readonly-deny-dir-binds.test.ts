@@ -85,6 +85,14 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     })
   }
 
+  const run = (wrapped: string) =>
+    spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 15000,
+      cwd: BASE,
+    })
+
   const countOccurrences = (haystack: string, needle: string): number =>
     haystack.split(needle).length - 1
 
@@ -118,9 +126,11 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
    */
   const expectDeniedByReadOnlyMount = (result: {
     error?: Error
+    status: number | null
     stderr: string
   }): void => {
     expect(result.error).toBeUndefined()
+    expect(result.status).not.toBe(0)
     expect(result.stderr).not.toContain('bwrap:')
     expect(result.stderr).toMatch(/Read-only file system|Permission denied/)
   }
@@ -138,13 +148,6 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     // holds: the file reads, and a write through it fails and changes
     // nothing on the host.
     if (BWRAP_CAN_NAMESPACE) {
-      const run = (wrapped: string) =>
-        spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-          cwd: BASE,
-        })
       const read = run(await wrap([PROJ, FILE], [], [PROJ], `cat ${FILE}`))
       expect(read.status).toBe(0)
       expect(read.stdout).toContain('{}')
@@ -400,6 +403,38 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       expect(countBinds(oneReadDeny, '--ro-bind', '/dev/null', mcp)).toBe(1)
     })
 
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'boots with "/" denied whole, and the lone deny bind holds the write off',
+      async () => {
+        // The argv arm above pins a single `--ro-bind / /` after the allow's
+        // `--bind / /` as the entire protection. Prove bubblewrap agrees:
+        // it starts (nothing beneath the read-only root needs creating,
+        // because every per-path deny was skipped), the tree it re-binds is
+        // readable, and a write through it fails and changes nothing.
+        const wrapRootDeniedWhole = (command: string) =>
+          wrapCommandWithSandboxLinux({
+            command,
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
+          })
+
+        const write = run(
+          await wrapRootDeniedWhole(`echo BOOTED; sh -c 'echo x >> ${FILE}'`),
+        )
+        expect(write.stdout).toContain('BOOTED')
+        expectDeniedByReadOnlyMount(write)
+        expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
+
+        const read = run(await wrapRootDeniedWhole(`echo BOOTED; cat ${FILE}`))
+        expect(read.error).toBeUndefined()
+        expect(read.stderr).not.toContain('bwrap:')
+        expect(read.status).toBe(0)
+        expect(read.stdout).toContain('BOOTED')
+        expect(read.stdout).toContain('{}')
+      },
+    )
+
     it('masks a symlinked ancestor of a deny path', async () => {
       // A self-referential link: resolveSymlinkedDenyPath gives up and the
       // fail-closed branch masks the symlink component, so it cannot be
@@ -412,31 +447,26 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       expect(countBinds(command, '--ro-bind', '/dev/null', loop)).toBe(1)
     })
 
-    it('denies the write at runtime and leaves the rest of the tree writable', async () => {
-      if (!BWRAP_CAN_NAMESPACE) return
-      const control = join(AREA, 'control.txt')
-      writeFileSync(control, '')
-      const run = (wrapped: string) =>
-        spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-          cwd: BASE,
-        })
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'denies the write at runtime and leaves the rest of the tree writable',
+      async () => {
+        const control = join(AREA, 'control.txt')
+        writeFileSync(control, '')
 
-      const denied = run(
-        await wrap([FILE], [], ['/'], `sh -c 'echo x >> ${FILE}'`),
-      )
-      expectDeniedByReadOnlyMount(denied)
-      expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
+        const denied = run(
+          await wrap([FILE], [], ['/'], `sh -c 'echo x >> ${FILE}'`),
+        )
+        expectDeniedByReadOnlyMount(denied)
+        expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
 
-      const allowed = run(
-        await wrap([FILE], [], ['/'], `sh -c 'echo ok >> ${control}'`),
-      )
-      expect(allowed.error).toBeUndefined()
-      expect(allowed.stderr).not.toContain('bwrap:')
-      expect(allowed.status).toBe(0)
-      expect(readFileSync(control, 'utf8')).toBe('ok\n')
-    })
+        const allowed = run(
+          await wrap([FILE], [], ['/'], `sh -c 'echo ok >> ${control}'`),
+        )
+        expect(allowed.error).toBeUndefined()
+        expect(allowed.stderr).not.toContain('bwrap:')
+        expect(allowed.status).toBe(0)
+        expect(readFileSync(control, 'utf8')).toBe('ok\n')
+      },
+    )
   })
 })

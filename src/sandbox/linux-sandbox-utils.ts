@@ -1202,8 +1202,10 @@ async function generateFilesystemArgs(
     // directory recorded here is either re-bound read-only by the loop or
     // skipped because a recorded directory above it survived the vetoes and
     // is bound in its place, so every record still stands for a bind that
-    // lands; an emitted one missing from the record only costs a spurious
-    // abort.
+    // lands — unless a symlink appears in its path between the two passes,
+    // where the loop masks that component and emits no bind for the
+    // directory (the re-check below); an emitted one missing from the record
+    // only costs a spurious abort.
     for (const pathPattern of denyPaths) {
       const rawPath = normalizePathForSandbox(pathPattern)
       if (rawPath.startsWith('/dev/')) {
