@@ -51,8 +51,9 @@ describe('normalizePathForSandbox trailing slashes', () => {
     // Glob spellings keep their trailing slash — it changes glob semantics.
     expect(normalizePathForSandbox('/data/*/')).toBe('/data/*/')
     expect(normalizePathForSandbox('/data/**/')).toBe('/data/**/')
-    // Empty input is not rewritten into the filesystem root.
-    expect(normalizePathForSandbox('')).not.toBe('/')
+    // Empty input resolves like any other relative spelling, and is not
+    // rewritten into the filesystem root.
+    expect(normalizePathForSandbox('')).toBe(process.cwd())
   })
 })
 
