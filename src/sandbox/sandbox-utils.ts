@@ -345,16 +345,17 @@ export function normalizePathForSandbox(pathPattern: string): string {
   // resolution. Consumers on the Linux and macOS paths compare spellings by
   // exact match and `path + '/'` prefixes — which a preserved slash silently
   // defeats ('<dir>//') — and the realpath-acceptance checks below treat a
-  // slash-only difference as a mismatch. bwrap binds and sbpl subpath
-  // filters treat 'dir' and 'dir/' identically, so only the comparisons
-  // change. Glob spellings are left untouched: a slash after a glob segment
-  // is semantic ('/x/*/' compiles to a different regex than '/x/*'). On
-  // Windows a trailing separator is the directory marker for absent deny
-  // targets (srt#404) and must survive.
+  // slash-only difference as a mismatch. A Seatbelt `subpath` filter is the
+  // one place the two spellings really are interchangeable: a `literal`
+  // filter and a glob regex ending '/$' match nothing when the slash is
+  // there, and a bwrap bind tolerates it only for a directory (a slashed
+  // file path fails ENOTDIR at mount). Glob spellings are left untouched: a
+  // slash after a glob segment is semantic ('/x/*/' compiles to a different
+  // regex than '/x/*'). On Windows a trailing separator is the directory
+  // marker for absent deny targets (srt#404) and must survive.
   if (
     getPlatform() !== 'windows' &&
     pathPattern.endsWith('/') &&
-    pathPattern !== '/' &&
     !containsGlobCharsForPlatform(pathPattern)
   ) {
     pathPattern = pathPattern.replace(/\/+$/, '') || '/'
@@ -401,6 +402,30 @@ export function normalizePathForSandbox(pathPattern: string): string {
     return normalizedPath
   }
 
+  // POSIX: collapse the interior spellings realpath below would have removed,
+  // on the EXPANDED path. The strip above runs before expansion and only ever
+  // touches a trailing run, so neither covers '/a//b' or '/a/./b' — and tilde
+  // expansion can put a slash run back (HOME='/home/u/' turns '~/x' into
+  // '/home/u//x'). Interior non-canonical spellings are tolerated by neither
+  // backend: bwrap binds the literal string and Seatbelt compares the
+  // kernel's canonical path, so a rule spelled that way matches nothing
+  // whenever realpath cannot rescue it — i.e. whenever its target does not
+  // exist, which for a deny is exactly the credential-file-not-created-yet
+  // case. A leading '//' is collapsed too: POSIX permits an implementation to
+  // treat it specially, but neither backend does.
+  //
+  // Lexical only, and deliberately not path.normalize/path.resolve: those
+  // fold '..' on paper, which through a symlinked component aims the rule at
+  // a different file than the kernel would resolve. '..' is left to realpath.
+  if (getPlatform() !== 'windows') {
+    normalizedPath =
+      normalizedPath
+        .replace(/\/{2,}/g, '/')
+        .replace(/\/\.(?=\/)/g, '')
+        .replace(/\/\.$/, '')
+        .replace(/\/+$/, '') || '/'
+  }
+
   // Resolve symlinks to real paths to avoid bwrap issues
   // Validate that the resolution stays within expected boundaries
   try {
@@ -413,7 +438,21 @@ export function normalizePathForSandbox(pathPattern: string): string {
       normalizedPath = resolvedPath
     }
   } catch {
-    // If path doesn't exist or can't be resolved, keep the normalized path
+    // If path doesn't exist or can't be resolved, keep the normalized path.
+    // A '..' component that survived to here is one realpath would have
+    // folded; folding it lexically could aim the rule past a symlink, so the
+    // spelling is kept and the caller is told it may not match.
+    if (
+      getPlatform() !== 'windows' &&
+      /(?:^|\/)\.\.(?:\/|$)/.test(normalizedPath)
+    ) {
+      logForDebugging(
+        `[Sandbox] "${pathPattern}" does not exist and still contains a ".." ` +
+          `component, so it could not be canonicalised; a rule spelled this ` +
+          `way may not match.`,
+        { level: 'warn' },
+      )
+    }
   }
 
   return normalizedPath
