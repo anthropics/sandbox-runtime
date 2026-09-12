@@ -400,25 +400,19 @@ async function linuxGetMandatoryDenyPaths(
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
-// The source of the empty-directory mount points: one per process, made on
-// first use and reused, because every such bind is read-only and the source's
-// only job is to be an empty directory. A fresh mkdtemp per bind left two
-// directories under the temp dir on every sandboxed command in a project with
-// no `.claude/` — only the destination is tracked, so nothing removed them.
-// Removed with the mount points, and never while a sandbox is still running:
-// a live bind's source must stay.
+// The source of the empty-directory mount points: at most one at a time, made
+// on first use, reused while a sandbox is running, and removed with the mount
+// points — never before, because a live bind's source must stay.
+// generateFilesystemArgs pins it read-only inside every sandbox that uses it.
 let emptyMountSourceDir: string | undefined
 
-/**
- * The shared empty directory, revalidated rather than trusted. It lives under
- * the system temp dir, which sandboxed commands commonly can write, and bwrap
- * resolves a bind source on the HOST — so a directory swapped for a symlink
- * between two wraps would publish whatever it points at (a read-denied
- * directory, say) at the mount point. Anything but our own private empty
- * directory is abandoned here, never deleted: it is not ours any more.
- */
-function getEmptyMountSourceDir(): string {
+function ensureEmptyMountSourceDir(): string {
   if (emptyMountSourceDir !== undefined) {
+    // Revalidated, not trusted: the path is under the system temp dir, which
+    // sandboxed commands commonly can write, and bwrap resolves a bind source
+    // on the HOST, so a directory swapped for a symlink between two wraps
+    // would publish whatever it points at. Anything that is not our own
+    // private empty directory is left where it is: it is not ours to delete.
     try {
       const stat = fs.lstatSync(emptyMountSourceDir)
       if (
@@ -1059,6 +1053,11 @@ async function generateFilesystemArgs(
   // symlink no longer matches them by string prefix. Both spellings name the
   // same inode once bwrap resolves them, so the comparisons below test both.
   const denyWriteRawDests = new Map<string, string>()
+  // The shared empty directory this call's placeholders bind from, resolved at
+  // most once per wrap: resolving again mid-wrap (the cached path having been
+  // tampered with in between) would leave the binds already emitted pointing
+  // at a directory this same call has just judged not ours.
+  let emptySource: string | undefined
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
@@ -1564,7 +1563,9 @@ async function generateFilesystemArgs(
           // of /dev/null. This prevents the component from appearing as a file
           // which breaks tools that expect to traverse it as a directory.
           const isIntermediate = firstNonExistent !== normalizedPath
-          const source = isIntermediate ? getEmptyMountSourceDir() : '/dev/null'
+          const source = isIntermediate
+            ? (emptySource ??= ensureEmptyMountSourceDir())
+            : '/dev/null'
 
           // One mount point per destination. Deny paths are deduplicated on
           // the deny path, but a placeholder lands on the first MISSING
@@ -1573,19 +1574,13 @@ async function generateFilesystemArgs(
           // mandatory '<cwd>/.claude/commands', in a project with no
           // `.claude/`. Two binds there make bwrap refuse to start when they
           // disagree about the destination's kind ("Can't mkdir <dest>: Not a
-          // directory"), so every sandboxed command in such a project failed.
-          // The directory form wins the disagreement: an empty read-only
-          // directory blocks creating the destination and everything below it
-          // exactly as /dev/null does, and stays traversable for the deeper
-          // deny that asked for a directory.
+          // directory"). The directory form wins the disagreement: an empty
+          // read-only directory blocks creating the destination and everything
+          // below it exactly as /dev/null does, and stays traversable for the
+          // deeper deny that asked for a directory.
           const placeholderAt = placeholderSourceArgIndex.get(firstNonExistent)
           if (placeholderAt !== undefined) {
-            if (
-              isIntermediate &&
-              denyWriteArgs[placeholderAt] === '/dev/null'
-            ) {
-              denyWriteArgs[placeholderAt] = source
-            }
+            if (isIntermediate) denyWriteArgs[placeholderAt] = source
             logForDebugging(
               `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
@@ -1596,6 +1591,11 @@ async function generateFilesystemArgs(
             firstNonExistent,
             denyWriteArgs.length - 2,
           )
+          // First writer wins for a destination several denies share (the
+          // reuse branch above returns before reaching this), and the record
+          // is purely additive: it only gives the tmpfs and mask comparisons
+          // below a second spelling to test, and `dest` itself is always
+          // tested.
           denyWriteRawDests.set(firstNonExistent, rawPath)
           bwrapMountPoints.add(firstNonExistent)
           registerExitCleanupHandler()
@@ -1844,6 +1844,18 @@ async function generateFilesystemArgs(
   // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()).
   if (maskedFileStoreDir !== undefined) {
     args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
+  }
+
+  // INVARIANT, for the same reason: the empty directory the placeholders above
+  // bind from must never be writable from inside the sandbox. It lives under
+  // the system temp dir, so a caller's allowWrite or a host $TMPDIR under a
+  // default write path makes it writable — and a placeholder binds it onto a
+  // DENIED destination, so a write to the source lands at the deny. Emit last,
+  // like the store, to overlay any earlier --bind that covers it. A same-uid
+  // process on the host can still swap the source between wrap and run, which
+  // is outside what this library defends against.
+  if (emptySource !== undefined) {
+    args.push('--ro-bind', emptySource, emptySource)
   }
 
   return args
