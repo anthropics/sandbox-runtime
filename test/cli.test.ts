@@ -172,6 +172,48 @@ describe('CLI', () => {
     })
   })
 
+  describe('default settings file error handling', () => {
+    // Same rule for the default ~/.srt-settings.json: it is optional, but
+    // one that is there and does not load must not fall through to the
+    // built-in default config, which restricts nothing — a single bad entry
+    // would otherwise discard every rule in the file.
+    test('refuses to run when the default settings file fails validation', () => {
+      const home = mkdtempSync(join(tmpdir(), 'srt-cli-home-'))
+      // Valid JSON, but missing required network/filesystem fields
+      writeFileSync(
+        join(home, '.srt-settings.json'),
+        JSON.stringify({ network: {} }),
+      )
+      try {
+        const result = spawnSync(
+          'bun',
+          ['run', getCliPath(), 'echo', 'should-not-run'],
+          { encoding: 'utf-8', env: { ...process.env, HOME: home } },
+        )
+        expect(result.status).toBe(1)
+        expect(result.stderr).toContain('does not hold a valid config')
+        expect(result.stdout).not.toContain('should-not-run')
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    })
+
+    test('runs with the built-in defaults when there is no settings file', () => {
+      const home = mkdtempSync(join(tmpdir(), 'srt-cli-home-'))
+      try {
+        const result = spawnSync(
+          'bun',
+          ['run', getCliPath(), 'echo', 'no-settings-file'],
+          { encoding: 'utf-8', env: { ...process.env, HOME: home } },
+        )
+        expect(result.status).toBe(0)
+        expect(result.stdout).toContain('no-settings-file')
+      } finally {
+        rmSync(home, { recursive: true, force: true })
+      }
+    })
+  })
+
   describe('debug output', () => {
     test('SRT_DEBUG enables debug output for positional args', () => {
       const result = runCli(['echo', 'test'], { debug: true })
