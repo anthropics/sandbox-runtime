@@ -169,5 +169,24 @@ describe.if(isLinux)(
 
       expect(wrapped).not.toContain(`--ro-bind ${parent} ${parent}`)
     })
+
+    it('mounts nothing for a denyRead path uninspectable all the way up to "/"', async () => {
+      // A dead network mount answers every ancestor with ENOTCONN/ESTALE/EIO,
+      // so the stand-in walk reaches '/', where stat succeeds. '/' as the
+      // stand-in means --tmpfs /, which wipes every mount before it and the
+      // second pivot promotes: the command boots on an empty tree.
+      const proj = makeTree()
+      const statHits = failStatWhere(p => p === '/mnt' || p.startsWith('/mnt/'))
+
+      const wrapped = await wrap(proj, {
+        readConfig: { denyOnly: ['/mnt/share/secrets'], allowWithinDeny: [] },
+      })
+
+      expect(statHits()).toBeGreaterThan(0)
+      const argv = wrapped.split(/\s+/)
+      expect(
+        argv.some((token, i) => token === '--tmpfs' && argv[i + 1] === '/'),
+      ).toBe(false)
+    })
   },
 )

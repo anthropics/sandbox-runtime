@@ -859,9 +859,10 @@ function buildSandboxCommand(
   }
 }
 
-/** An fs error that means nothing is there to protect (missing, or a name
- * that can resolve to nothing), as opposed to one that means it could not be
- * looked at (EACCES, EPERM, EIO, anything unrecognised). */
+/** An fs error that means the name resolves to no file — it is missing, or
+ * the path cannot name one at all — as opposed to one that means a file is
+ * there but could not be looked at (EACCES, EPERM, EIO, anything
+ * unrecognised). */
 function isAbsenceErrno(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code
   return (
@@ -1188,10 +1189,13 @@ async function generateFilesystemArgs(
   // directory above it that can. That hides more than was asked, never less:
   // a same-uid command can make a parent unsearchable (chmod 000) and undo it
   // again from inside the next sandbox, so "unreadable now" is not "absent".
+  // '/' is never the stand-in: a --tmpfs / would wipe every mount before it
+  // and the pivot would promote it, booting the command on an empty tree.
   const readDenyTargetOf = (
     entry: string,
   ): { path: string; isDirectory: boolean } | undefined => {
     for (let candidate = entry; ; candidate = path.dirname(candidate)) {
+      if (candidate === '/' && candidate !== entry) return undefined
       try {
         return {
           path: candidate,
@@ -1884,7 +1888,7 @@ async function generateFilesystemArgs(
     const target = readDenyTargetOf(normalizedPath)
     if (target === undefined) {
       logForDebugging(
-        `[Sandbox Linux] Skipping non-existent read deny path: ${normalizedPath}`,
+        `[Sandbox Linux] Read deny path resolves to nothing this wrap can mount (absent, or uninspectable all the way up to '/'): ${normalizedPath}`,
       )
       continue
     }
