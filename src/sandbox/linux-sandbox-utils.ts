@@ -400,6 +400,69 @@ async function linuxGetMandatoryDenyPaths(
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
+// The source of the empty-directory mount points: at most one at a time, made
+// on first use, reused while a sandbox is running, and removed with the mount
+// points — never before, because a live bind's source must stay.
+// generateFilesystemArgs pins it read-only inside every sandbox that uses it.
+let emptyMountSourceDir: string | undefined
+
+function ensureEmptyMountSourceDir(): string {
+  if (emptyMountSourceDir !== undefined) {
+    // Revalidated, not trusted: the path is under the system temp dir, which
+    // sandboxed commands commonly can write, and bwrap resolves a bind source
+    // on the HOST, so a directory swapped for a symlink between two wraps
+    // would publish whatever it points at. Anything that is not our own
+    // private empty directory is left where it is: it is not ours to delete.
+    try {
+      const stat = fs.lstatSync(emptyMountSourceDir)
+      if (
+        stat.isDirectory() &&
+        stat.uid === process.getuid?.() &&
+        (stat.mode & 0o077) === 0 &&
+        fs.readdirSync(emptyMountSourceDir).length === 0
+      ) {
+        return emptyMountSourceDir
+      }
+    } catch {
+      // Gone, or no longer inspectable: make a new one below.
+    }
+    logForDebugging(
+      `[Sandbox Linux] Not reusing the empty-directory mount source, it is gone or no longer our own empty directory: ${emptyMountSourceDir}`,
+    )
+  }
+  emptyMountSourceDir = fs.mkdtempSync(path.join(tmpdir(), 'claude-empty-'))
+  // mkdtemp asks for 0700 but the umask applies, so under `umask 0200` the
+  // directory lands on 0500. Set the mode here rather than let the check
+  // above reject the directory this call has just made.
+  fs.chmodSync(emptyMountSourceDir, 0o700)
+  return emptyMountSourceDir
+}
+
+/**
+ * Is `p` a mount point an earlier sandbox left behind? bwrap makes the mount
+ * point for `--ro-bind /dev/null <absent path>` with ensure_file(dest, 0444):
+ * an empty regular file with no write bits. The set above lives in memory, so
+ * a process that dies without an 'exit' event (SIGKILL, OOM) leaves the file
+ * on the host with nothing left that knows what it is. Files that only look
+ * similar are written by their creators with write bits (a lockfile, an empty
+ * file materialised on purpose: 0666 & ~umask) or have content or a second
+ * link. An empty read-only DIRECTORY left the same way is not recognisable:
+ * it looks like anyone's empty directory.
+ */
+function isStaleBwrapMountPoint(p: string): boolean {
+  try {
+    const stat = fs.lstatSync(p)
+    return (
+      stat.isFile() &&
+      stat.size === 0 &&
+      (stat.mode & 0o222) === 0 &&
+      stat.nlink === 1
+    )
+  } catch {
+    return false
+  }
+}
+
 const CAP_SETFCAP = 31
 
 /** Whether this process holds `cap` in its effective set (Linux). */
@@ -527,6 +590,32 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     }
   }
   bwrapMountPoints.clear()
+  if (emptyMountSourceDir !== undefined) {
+    try {
+      // rmdirSync, not a recursive remove: it neither follows a symlink nor
+      // descends, so a path that is no longer our empty directory is left
+      // exactly as found.
+      fs.rmdirSync(emptyMountSourceDir)
+      logForDebugging(
+        `[Sandbox Linux] Cleaned up the empty-directory mount source: ${emptyMountSourceDir}`,
+      )
+      emptyMountSourceDir = undefined
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOTEMPTY') {
+        logForDebugging(
+          `[Sandbox Linux] Left the empty-directory mount source behind, something has written into it: ${emptyMountSourceDir}`,
+        )
+      }
+      // Forget the path only when there is nothing left to remove. ENOTEMPTY,
+      // EACCES and EBUSY (a forced cleanup while a live sandbox still pins the
+      // source) leave it ours to try again; the revalidation on next use
+      // decides whether it can be reused.
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        emptyMountSourceDir = undefined
+      }
+    }
+  }
 }
 
 /**
@@ -983,6 +1072,11 @@ async function generateFilesystemArgs(
   // symlink no longer matches them by string prefix. Both spellings name the
   // same inode once bwrap resolves them, so the comparisons below test both.
   const denyWriteRawDests = new Map<string, string>()
+  // The shared empty directory this call's placeholders bind from, resolved at
+  // most once per wrap: resolving again mid-wrap (the cached path having been
+  // tampered with in between) would leave the binds already emitted pointing
+  // at a directory this same call has just judged not ours.
+  let emptySource: string | undefined
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
@@ -1185,6 +1279,10 @@ async function generateFilesystemArgs(
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
     // bwrap's ensure_file() falls through to creat() on a read-only mount.
     const seenDenyWrite = new Set<string>()
+    // Placeholder destination -> the index of its source in denyWriteArgs, so
+    // a later deny reaching the same destination can upgrade a /dev/null
+    // placeholder to the directory form in place (see the emission below).
+    const placeholderSourceArgIndex = new Map<string, number>()
     // PRE-PASS (order-independent): record the directories the loop below
     // re-binds read-only, BEFORE any stub decision, so the read-only
     // conclusion does not depend on where an enclosing directory appears in
@@ -1400,6 +1498,32 @@ async function generateFilesystemArgs(
         continue
       }
 
+      // A mount point an earlier sandbox left on the host (see
+      // isStaleBwrapMountPoint) is an absent deny path in all but name. Bound
+      // onto itself as an existing file it would never be tracked, so never
+      // removed, and on the host its existence can be the whole meaning (a
+      // lockfile's). Cover it with /dev/null like the absent leaf below and
+      // track it, so cleanupBwrapMountPoints() takes it away. Same gate as
+      // that branch. Under a read-only denied directory nothing needs
+      // covering (the file is already unwritable there), but it is still
+      // tracked: it is no more the caller's file for being there.
+      if (
+        (isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
+          isWithinAnyAllowedWritePath(normalizedPath)) &&
+        isStaleBwrapMountPoint(normalizedPath)
+      ) {
+        if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
+          denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
+          denyWriteRawDests.set(normalizedPath, rawPath)
+        }
+        bwrapMountPoints.add(normalizedPath)
+        registerExitCleanupHandler()
+        logForDebugging(
+          `[Sandbox Linux] Re-covering a mount point an earlier sandbox left behind: ${normalizedPath}`,
+        )
+        continue
+      }
+
       // Handle non-existent paths by mounting /dev/null to block creation.
       // Without this, a sandboxed process could mkdir+write a denied path that
       // doesn't exist yet, bypassing the deny rule entirely.
@@ -1457,26 +1581,48 @@ async function generateFilesystemArgs(
           // leaf deny path itself), mount a read-only empty directory instead
           // of /dev/null. This prevents the component from appearing as a file
           // which breaks tools that expect to traverse it as a directory.
-          if (firstNonExistent !== normalizedPath) {
-            const emptyDir = fs.mkdtempSync(
-              path.join(tmpdir(), 'claude-empty-'),
-            )
-            denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent)
-            denyWriteRawDests.set(firstNonExistent, rawPath)
-            bwrapMountPoints.add(firstNonExistent)
-            registerExitCleanupHandler()
+          const isIntermediate = firstNonExistent !== normalizedPath
+          const source = isIntermediate
+            ? (emptySource ??= ensureEmptyMountSourceDir())
+            : '/dev/null'
+
+          // One mount point per destination. Deny paths are deduplicated on
+          // the deny path, but a placeholder lands on the first MISSING
+          // component, so two denies sharing one arrive here with a single
+          // destination — denyWrite '<cwd>/.claude' together with the
+          // mandatory '<cwd>/.claude/commands', in a project with no
+          // `.claude/`. Two binds there make bwrap refuse to start when they
+          // disagree about the destination's kind ("Can't mkdir <dest>: Not a
+          // directory"). The directory form wins the disagreement: an empty
+          // read-only directory blocks creating the destination and everything
+          // below it exactly as /dev/null does, and stays traversable for the
+          // deeper deny that asked for a directory.
+          const placeholderAt = placeholderSourceArgIndex.get(firstNonExistent)
+          if (placeholderAt !== undefined) {
+            if (isIntermediate) denyWriteArgs[placeholderAt] = source
             logForDebugging(
-              `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
+              `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
-          } else {
-            denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
-            denyWriteRawDests.set(firstNonExistent, rawPath)
-            bwrapMountPoints.add(firstNonExistent)
-            registerExitCleanupHandler()
-            logForDebugging(
-              `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
-            )
+            continue
           }
+          denyWriteArgs.push('--ro-bind', source, firstNonExistent)
+          placeholderSourceArgIndex.set(
+            firstNonExistent,
+            denyWriteArgs.length - 2,
+          )
+          // First writer wins for a destination several denies share (the
+          // reuse branch above returns before reaching this), and the record
+          // is purely additive: it only gives the tmpfs and mask comparisons
+          // below a second spelling to test, and `dest` itself is always
+          // tested.
+          denyWriteRawDests.set(firstNonExistent, rawPath)
+          bwrapMountPoints.add(firstNonExistent)
+          registerExitCleanupHandler()
+          logForDebugging(
+            `[Sandbox Linux] Mounted ${
+              isIntermediate ? 'empty dir' : '/dev/null'
+            } at ${firstNonExistent} to block creation of ${normalizedPath}`,
+          )
         } else if (ancestorIsWithinReadOnlyDeny) {
           logForDebugging(
             `[Sandbox Linux] Skipping non-existent deny path inside a read-only denied directory (already uncreatable): ${normalizedPath}`,
@@ -1717,6 +1863,18 @@ async function generateFilesystemArgs(
   // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()).
   if (maskedFileStoreDir !== undefined) {
     args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
+  }
+
+  // INVARIANT, for the same reason: the empty directory the placeholders above
+  // bind from must never be writable from inside the sandbox. It lives under
+  // the system temp dir, so a caller's allowWrite or a host $TMPDIR under a
+  // default write path makes it writable — and a placeholder binds it onto a
+  // DENIED destination, so a write to the source lands at the deny. Emit last,
+  // like the store, to overlay any earlier --bind that covers it. A same-uid
+  // process on the host can still swap the source between wrap and run, which
+  // is outside what this library defends against.
+  if (emptySource !== undefined) {
+    args.push('--ro-bind', emptySource, emptySource)
   }
 
   return args
