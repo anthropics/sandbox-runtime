@@ -432,4 +432,43 @@ d('the write configuration the manager hands the monitor', () => {
       monitor.stop()
     }
   }, 30_000)
+
+  it('hands over no built-in denies when the filesystem policy is off', async () => {
+    // filesystem.disabled reaches the wrapper as `writeConfig === undefined`,
+    // which skips every bind and the built-in denies with them. A monitor
+    // holding them would report writes bubblewrap was never asked to refuse.
+    let handedOver: LinuxViolationMonitorOptions | undefined
+    const spy = spyOn(
+      linuxViolationMonitorModule,
+      'startLinuxSandboxViolationMonitor',
+    ).mockImplementation((_callback, opts) => {
+      handedOver = opts
+      return {
+        observeSocketPath: undefined,
+        ready: Promise.resolve(),
+        stop: () => {},
+      }
+    })
+    try {
+      process.chdir(ALLOW)
+      await SandboxManager.initialize(
+        {
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            disabled: true,
+            denyRead: [],
+            allowWrite: [],
+            denyWrite: [],
+          },
+        },
+        undefined,
+        true,
+      )
+    } finally {
+      process.chdir(originalCwd)
+      spy.mockRestore()
+    }
+    expect(handedOver!.allowWritePaths).toEqual(['/'])
+    expect(handedOver!.denyWritePaths).toEqual([])
+  }, 30_000)
 })

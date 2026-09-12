@@ -717,7 +717,12 @@ async function initialize(
           ...monitoredWrites.denyWithinAllow.map(p =>
             normalizePathForSandbox(p),
           ),
-          ...linuxGetCwdMandatoryDenyPaths(getAllowGitConfig()),
+          // filesystem.disabled reaches the wrapper as `writeConfig ===
+          // undefined`, which skips every bind and the built-in denies with
+          // them, so the monitor must not judge by them either.
+          ...(config.filesystem.disabled
+            ? []
+            : linuxGetCwdMandatoryDenyPaths(getAllowGitConfig())),
         ],
         ignoreViolations: config.ignoreViolations,
         resolveCommandText,
