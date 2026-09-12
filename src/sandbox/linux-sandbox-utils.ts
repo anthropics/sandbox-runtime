@@ -400,6 +400,43 @@ async function linuxGetMandatoryDenyPaths(
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
+// The source of the empty-directory mount points: one per process, made on
+// first use and reused, because every such bind is read-only and the source's
+// only job is to be an empty directory. A fresh mkdtemp per bind left two
+// directories under the temp dir on every sandboxed command in a project with
+// no `.claude/` — only the destination is tracked, so nothing removed them.
+// Removed with the mount points, and never while a sandbox is still running:
+// a live bind's source must stay.
+let emptyMountSourceDir: string | undefined
+
+/**
+ * The shared empty directory, revalidated rather than trusted. It lives under
+ * the system temp dir, which sandboxed commands commonly can write, and bwrap
+ * resolves a bind source on the HOST — so a directory swapped for a symlink
+ * between two wraps would publish whatever it points at (a read-denied
+ * directory, say) at the mount point. Anything but our own private empty
+ * directory is abandoned here, never deleted: it is not ours any more.
+ */
+function getEmptyMountSourceDir(): string {
+  if (emptyMountSourceDir !== undefined) {
+    try {
+      const stat = fs.lstatSync(emptyMountSourceDir)
+      if (
+        stat.isDirectory() &&
+        stat.uid === process.getuid?.() &&
+        (stat.mode & 0o777) === 0o700 &&
+        fs.readdirSync(emptyMountSourceDir).length === 0
+      ) {
+        return emptyMountSourceDir
+      }
+    } catch {
+      // Gone, or no longer inspectable: make a new one below.
+    }
+  }
+  emptyMountSourceDir = fs.mkdtempSync(path.join(tmpdir(), 'claude-empty-'))
+  return emptyMountSourceDir
+}
+
 /**
  * Is `p` a mount point an earlier sandbox left behind? bwrap makes the mount
  * point for `--ro-bind /dev/null <absent path>` with ensure_file(dest, 0444):
@@ -552,6 +589,20 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     }
   }
   bwrapMountPoints.clear()
+  if (emptyMountSourceDir !== undefined) {
+    try {
+      // rmdirSync, not a recursive remove: it neither follows a symlink nor
+      // descends, so a path that is no longer our empty directory is left
+      // exactly as found.
+      fs.rmdirSync(emptyMountSourceDir)
+      logForDebugging(
+        `[Sandbox Linux] Cleaned up the empty-directory mount source: ${emptyMountSourceDir}`,
+      )
+    } catch {
+      // Already gone, not empty, or not ours any more: leave it alone.
+    }
+    emptyMountSourceDir = undefined
+  }
 }
 
 /**
@@ -1210,6 +1261,10 @@ async function generateFilesystemArgs(
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
     // bwrap's ensure_file() falls through to creat() on a read-only mount.
     const seenDenyWrite = new Set<string>()
+    // Placeholder destination -> the index of its source in denyWriteArgs, so
+    // a later deny reaching the same destination can upgrade a /dev/null
+    // placeholder to the directory form in place (see the emission below).
+    const placeholderSourceArgIndex = new Map<string, number>()
     // PRE-PASS (order-independent): record the directories the loop below
     // re-binds read-only, BEFORE any stub decision, so the read-only
     // conclusion does not depend on where an enclosing directory appears in
@@ -1508,26 +1563,47 @@ async function generateFilesystemArgs(
           // leaf deny path itself), mount a read-only empty directory instead
           // of /dev/null. This prevents the component from appearing as a file
           // which breaks tools that expect to traverse it as a directory.
-          if (firstNonExistent !== normalizedPath) {
-            const emptyDir = fs.mkdtempSync(
-              path.join(tmpdir(), 'claude-empty-'),
-            )
-            denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent)
-            denyWriteRawDests.set(firstNonExistent, rawPath)
-            bwrapMountPoints.add(firstNonExistent)
-            registerExitCleanupHandler()
+          const isIntermediate = firstNonExistent !== normalizedPath
+          const source = isIntermediate ? getEmptyMountSourceDir() : '/dev/null'
+
+          // One mount point per destination. Deny paths are deduplicated on
+          // the deny path, but a placeholder lands on the first MISSING
+          // component, so two denies sharing one arrive here with a single
+          // destination — denyWrite '<cwd>/.claude' together with the
+          // mandatory '<cwd>/.claude/commands', in a project with no
+          // `.claude/`. Two binds there make bwrap refuse to start when they
+          // disagree about the destination's kind ("Can't mkdir <dest>: Not a
+          // directory"), so every sandboxed command in such a project failed.
+          // The directory form wins the disagreement: an empty read-only
+          // directory blocks creating the destination and everything below it
+          // exactly as /dev/null does, and stays traversable for the deeper
+          // deny that asked for a directory.
+          const placeholderAt = placeholderSourceArgIndex.get(firstNonExistent)
+          if (placeholderAt !== undefined) {
+            if (
+              isIntermediate &&
+              denyWriteArgs[placeholderAt] === '/dev/null'
+            ) {
+              denyWriteArgs[placeholderAt] = source
+            }
             logForDebugging(
-              `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
+              `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
-          } else {
-            denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
-            denyWriteRawDests.set(firstNonExistent, rawPath)
-            bwrapMountPoints.add(firstNonExistent)
-            registerExitCleanupHandler()
-            logForDebugging(
-              `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
-            )
+            continue
           }
+          denyWriteArgs.push('--ro-bind', source, firstNonExistent)
+          placeholderSourceArgIndex.set(
+            firstNonExistent,
+            denyWriteArgs.length - 2,
+          )
+          denyWriteRawDests.set(firstNonExistent, rawPath)
+          bwrapMountPoints.add(firstNonExistent)
+          registerExitCleanupHandler()
+          logForDebugging(
+            `[Sandbox Linux] Mounted ${
+              isIntermediate ? 'empty dir' : '/dev/null'
+            } at ${firstNonExistent} to block creation of ${normalizedPath}`,
+          )
         } else if (ancestorIsWithinReadOnlyDeny) {
           logForDebugging(
             `[Sandbox Linux] Skipping non-existent deny path inside a read-only denied directory (already uncreatable): ${normalizedPath}`,
