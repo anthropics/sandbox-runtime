@@ -21,6 +21,11 @@ const CLI_PATH = path.join(process.cwd(), 'dist', 'cli.js')
 // per-test timeout so the failure names the hang rather than the runner.
 const EXIT_TIMEOUT_MS = 4500
 
+// Extra time for the stdio pipes to close after srt's own exit. It starts
+// only once 'exit' has fired, and EXIT_TIMEOUT_MS + this stays under bun's
+// 5 s per-test default so a stalled drain still names itself.
+const DRAIN_TIMEOUT_MS = 400
+
 type Spawned = {
   child: ChildProcess
   exited: Promise<number | null>
@@ -35,7 +40,8 @@ type Spawned = {
 function waitForExit(child: ChildProcess): Promise<number | null> {
   return new Promise((resolve, reject) => {
     let code: number | null = null
-    const timer = setTimeout(
+    let drainTimer: ReturnType<typeof setTimeout> | undefined
+    const exitTimer = setTimeout(
       () =>
         reject(
           new Error(
@@ -46,13 +52,27 @@ function waitForExit(child: ChildProcess): Promise<number | null> {
     )
     child.on('exit', c => {
       code = c
+      // srt is gone; only the pipes are still open, which is a different
+      // failure (something else holding them) and gets its own deadline.
+      clearTimeout(exitTimer)
+      drainTimer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `srt exited but its stdio did not close within ${DRAIN_TIMEOUT_MS}ms`,
+            ),
+          ),
+        DRAIN_TIMEOUT_MS,
+      )
     })
     child.on('close', () => {
-      clearTimeout(timer)
+      clearTimeout(exitTimer)
+      clearTimeout(drainTimer)
       resolve(code)
     })
     child.on('error', err => {
-      clearTimeout(timer)
+      clearTimeout(exitTimer)
+      clearTimeout(drainTimer)
       reject(err)
     })
   })
@@ -84,9 +104,7 @@ const INJECTED_UPDATE = JSON.stringify({
 
 // mkfifo and /bin/bash; the Windows CI legs run neither this suite nor
 // anything it shells out to.
-const d = isWindows ? describe.skip : describe
-
-d('--control-fd', () => {
+describe.skipIf(isWindows)('--control-fd', () => {
   let tmpDir: string
   // Every process this file starts, so a test that fails with one still
   // running does not leave it behind.
@@ -119,12 +137,36 @@ d('--control-fd', () => {
     return { child, exited, stdout, stderr }
   }
 
+  // Resolves once srt has printed `needle` on stderr, so a test can act on
+  // srt's own progress instead of waiting a guessed interval.
+  function waitForStderr(spawnedSrt: Spawned, needle: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `srt did not print ${JSON.stringify(needle)} within ${EXIT_TIMEOUT_MS}ms`,
+            ),
+          ),
+        EXIT_TIMEOUT_MS,
+      )
+      // spawnSrt's own collector is attached first, so the buffer this
+      // reads is already up to date when this runs.
+      const check = (): void => {
+        if (spawnedSrt.stderr.join('').includes(needle)) {
+          clearTimeout(timer)
+          resolve()
+        }
+      }
+      spawnedSrt.child.stderr?.on('data', check)
+      check()
+    })
+  }
+
   // For a run that needs nothing written to the control fd while it is in
   // progress: spawnSync keeps the runner's asynchronous child bookkeeping
   // out of it, which matters because this file spawns srt a dozen times
-  // over, and it makes a hang a bounded failure rather than a wait. It
-  // closes the descriptors it is handed in `stdio`, so a caller that needs
-  // one afterwards uses spawnSrt instead.
+  // over, and it makes a hang a bounded failure rather than a wait.
   function runSrt(
     args: string[],
     stdio: Array<'inherit' | 'pipe' | 'ignore' | number>,
@@ -135,6 +177,9 @@ d('--control-fd', () => {
       env,
       encoding: 'utf8',
       timeout: EXIT_TIMEOUT_MS,
+      // srt traps SIGTERM and only forwards it, so the default timeout
+      // signal would leave a hung srt alive and spawnSync waiting forever.
+      killSignal: 'SIGKILL',
     })
     if (result.error) {
       throw new Error(
@@ -143,8 +188,8 @@ d('--control-fd', () => {
     }
     return {
       status: result.status,
-      stdout: result.stdout ?? '',
-      stderr: result.stderr ?? '',
+      stdout: result.stdout,
+      stderr: result.stderr,
     }
   }
 
@@ -216,6 +261,30 @@ d('--control-fd', () => {
       expect(allStderr).not.toContain('Invalid config on control fd')
     })
   }
+
+  it('should apply an update written after the reader is listening', async () => {
+    // Every other case here writes before srt starts, so the line is
+    // waiting in the descriptor's buffer when the reader attaches. This one
+    // writes once srt has said it is listening, which is the live-update
+    // path the flag exists for.
+    const testScript = writeScript('sleep 0.3\necho "LIVE_DONE"')
+
+    const spawnedSrt = spawnSrt(
+      ['--debug', '--control-fd', '3', '--', testScript],
+      ['inherit', 'pipe', 'pipe', 'pipe'],
+      { ...process.env, SRT_DEBUG: 'true' },
+    )
+
+    await waitForStderr(spawnedSrt, 'Listening for config updates on fd 3')
+    const controlFd = spawnedSrt.child.stdio[3] as Writable
+    controlFd.write(CONFIG_UPDATE + '\n')
+
+    expect(await spawnedSrt.exited).toBe(0)
+    expect(spawnedSrt.stdout.join('')).toContain('LIVE_DONE')
+    const allStderr = spawnedSrt.stderr.join('')
+    expect(allStderr).toContain('Config updated from control fd')
+    expect(allStderr).toContain('updated-domain.com')
+  })
 
   it('should ignore invalid JSON on control fd and continue running', async () => {
     const testScript = writeScript('sleep 0.3\necho "COMPLETED"')
@@ -289,6 +358,7 @@ d('--control-fd', () => {
     const writer = fs.openSync(fifo, fs.constants.O_RDWR)
     heldFds.push(writer)
     const readEnd = fs.openSync(fifo, fs.constants.O_RDONLY)
+    heldFds.push(readEnd)
 
     fs.writeSync(writer, CONFIG_UPDATE + '\n')
 
@@ -312,6 +382,7 @@ d('--control-fd', () => {
     const configFile = path.join(tmpDir, 'control.json')
     fs.writeFileSync(configFile, CONFIG_UPDATE + '\n')
     const fileFd = fs.openSync(configFile, fs.constants.O_RDONLY)
+    heldFds.push(fileFd)
 
     const testScript = writeScript('sleep 0.3\necho "FILE_DONE"')
     const { status, stdout, stderr } = runSrt(
@@ -367,9 +438,11 @@ d('--control-fd', () => {
         ['inherit', 'pipe', 'pipe'],
       )
 
-      expect(status).not.toBe(0)
+      expect(status).toBe(1)
       expect(stdout).not.toContain('SHOULD_NOT_RUN')
-      expect(stderr).toContain('--control-fd')
+      // The flag name alone is in commander's own usage banner; this is the
+      // text the parser rejects the value with.
+      expect(stderr).toContain('must be an integer file descriptor >= 3')
     })
   }
 
@@ -393,26 +466,6 @@ d('--control-fd', () => {
     return settings
   }
 
-  it('should refuse to run when the control fd cannot be opened', () => {
-    // 200 is well past anything node opens for itself, so it is closed in
-    // srt and fstat fails on it. Running the command anyway would give the
-    // caller a sandbox whose updates — including the ones that tighten it —
-    // go nowhere.
-    const marker = path.join(tmpDir, 'ran')
-    const settings = writeWritableSettings()
-    const testScript = writeScript(`touch ${marker}\necho "SHOULD_NOT_RUN"`)
-
-    const { status, stdout, stderr } = runSrt(
-      ['--settings', settings, '--control-fd', '200', '--', testScript],
-      ['inherit', 'pipe', 'pipe'],
-    )
-
-    expect(status).not.toBe(0)
-    expect(stderr).toContain('--control-fd 200 is not usable')
-    expect(stdout).not.toContain('SHOULD_NOT_RUN')
-    expect(fs.existsSync(marker)).toBe(false)
-  })
-
   it('should refuse a control fd it cannot read from', () => {
     // A descriptor open for writing only: fstat succeeds on it, so nothing
     // short of asking the kernel whether a read is permitted tells it from
@@ -429,8 +482,28 @@ d('--control-fd', () => {
       ['inherit', 'pipe', 'pipe', sink],
     )
 
-    expect(status).not.toBe(0)
+    expect(status).toBe(1)
     expect(stderr).toContain('--control-fd 3 is not usable')
+    expect(stdout).not.toContain('SHOULD_NOT_RUN')
+    expect(fs.existsSync(marker)).toBe(false)
+  })
+
+  it('should refuse to run when the control fd cannot be opened', () => {
+    // 200 is well past anything node opens for itself, so it is closed in
+    // srt and fstat fails on it. Running the command anyway would give the
+    // caller a sandbox whose updates — including the ones that tighten it —
+    // go nowhere.
+    const marker = path.join(tmpDir, 'ran')
+    const settings = writeWritableSettings()
+    const testScript = writeScript(`touch ${marker}\necho "SHOULD_NOT_RUN"`)
+
+    const { status, stdout, stderr } = runSrt(
+      ['--settings', settings, '--control-fd', '200', '--', testScript],
+      ['inherit', 'pipe', 'pipe'],
+    )
+
+    expect(status).toBe(1)
+    expect(stderr).toContain('--control-fd 200 is not usable')
     expect(stdout).not.toContain('SHOULD_NOT_RUN')
     expect(fs.existsSync(marker)).toBe(false)
   })
@@ -449,9 +522,12 @@ d('--control-fd', () => {
       heldFds.push(caller)
       fs.writeSync(caller, CONFIG_UPDATE + '\n')
 
+      // `>&20` writes through the descriptor the command inherited.
+      // `>/dev/fd/20` would not: that re-opens the symlink's target, which
+      // succeeds whether the slot holds the fifo or /dev/null.
       const testScript = writeScript(
         'ls -l /proc/self/fd\n' +
-          `printf '%s\\n' '${INJECTED_UPDATE}' >/dev/fd/20 || echo "WRITE_REFUSED"\n` +
+          `printf '%s\\n' '${INJECTED_UPDATE}' >&20 || echo "WRITE_REFUSED"\n` +
           'sleep 0.3\necho "SANDBOX_DONE"',
       )
 
@@ -472,17 +548,21 @@ d('--control-fd', () => {
           env: { ...process.env, SRT_DEBUG: 'true' },
           encoding: 'utf8',
           timeout: EXIT_TIMEOUT_MS,
+          // As in runSrt: srt forwards SIGTERM rather than dying of it.
+          killSignal: 'SIGKILL',
         },
       )
-      const status = result.status
-      const stdout = result.stdout ?? ''
-      const stderr = result.stderr ?? ''
+      const { status, stdout, stderr } = result
 
       expect(status).toBe(0)
       expect(stdout).toContain('SANDBOX_DONE')
-      // The channel itself is not reachable from inside the sandbox...
-      expect(stdout).not.toContain(fifo)
-      // ...so nothing written there is ever applied...
+      // The slot holds srt's read-only /dev/null, so the write fails...
+      expect(stdout).toContain('WRITE_REFUSED')
+      // ...and that is what is in the slot, not merely something that is
+      // not the fifo: an assertion on the fifo's absence alone would also
+      // pass on an `ls` that printed nothing at all.
+      expect(stdout).toMatch(/\b20 -> \/dev\/null/)
+      // Nothing written there is ever applied...
       expect(stderr).not.toContain('injected-by-the-sandbox.com')
       // ...while the caller's line still is.
       expect(stderr).toContain('updated-domain.com')
