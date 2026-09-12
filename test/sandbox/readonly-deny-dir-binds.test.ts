@@ -166,34 +166,34 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind ${FILE} ${FILE}`)
   })
 
-  it('does not trust a recorded "/" as a covering directory', async () => {
+  it("covers a descendant deny with the root's own bind, and still re-applies the mask", async () => {
     // allowOnly and denyWithinAllow both naming '/' records it as a
-    // read-only deny directory that every path lies beneath. A string-prefix
-    // veto ('/' + '/') could never fire, so PROJ's own bind would be dropped
-    // as covered; the recursive --ro-bind / / emitted later then shadows the
-    // FILE mask with no bind left to key its re-application off, and the
-    // read-denied file is readable. Root-aware containment vetoes '/' (AREA
-    // is an allowed write path beneath it), keeps PROJ's bind, and re-applies
-    // the mask after the root bind.
+    // read-only deny directory that every path lies beneath. Its own
+    // --ro-bind / / lands after both allow binds and holds PROJ read-only,
+    // so PROJ's bind is dropped as covered — and that root bind is what the
+    // FILE mask's re-application keys off, so the read-denied file is masked
+    // again on top of it. A string-prefix comparison ('/' + '/') matched
+    // nothing, dropped the root's own deny, and left the file readable.
     const command = await wrap(['/', PROJ], [FILE], ['/', AREA])
 
-    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command).not.toContain(`--ro-bind ${PROJ} ${PROJ}`)
     const rootBind = command.lastIndexOf('--ro-bind / /')
     const mask = command.lastIndexOf(`--ro-bind /dev/null ${FILE}`)
     expect(rootBind).toBeGreaterThan(-1)
     expect(mask).toBeGreaterThan(rootBind)
   })
 
-  it('skips the stubs under a write-denied cwd even when a recorded "/" is vetoed', async () => {
+  it('skips the stubs under a write-denied cwd when a recorded "/" is vetoed', async () => {
     // '/' recorded and vetoed (AREA is writable beneath it). A veto that
     // disqualified every skip would stub each absent mandatory-deny dotfile
     // of the write-denied cwd after the cwd's own bind — the startup abort
-    // readonly-deny-dir-stubs.test.ts documents. The cwd's recorded bind
-    // decides instead, as on main.
+    // readonly-deny-dir-stubs.test.ts documents.
     process.chdir(PROJ)
     const command = await wrap(['/', PROJ], [], ['/', AREA])
 
-    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    // Two whole triples: the base root mount, then the deny's read-only bind
+    // that holds PROJ and everything else uncreatable.
+    expect(command.match(/--ro-bind \/ \/(?= )/g)).toHaveLength(2)
     expect(command).not.toContain(`/dev/null ${PROJ}/`)
     expect(command).not.toMatch(/--ro-bind \S*claude-empty-\S+ \S*\/proj\//)
   })
@@ -228,9 +228,11 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind ${sibling} ${sibling}`)
   })
 
-  it('vetoes "/" for an allowed write path beneath it even with no read policy', async () => {
-    // Veto (i) alone must be root-aware: with readConfig undefined there is
-    // no read-deny tmpfs for veto (ii) to catch '/' with.
+  it('emits the root deny that covers a descendant, with no read policy', async () => {
+    // Containment must be root-aware even with readConfig undefined: a
+    // string-prefix test ('/' + '/') judges '/' outside its own allowlist
+    // and drops the bind that makes the whole tree read-only, leaving PROJ
+    // writable with its own bind dropped as covered by it.
     const command = await wrapCommandWithSandboxLinux({
       command: 'echo hello',
       needsNetworkRestriction: false,
@@ -238,7 +240,8 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       writeConfig: { allowOnly: ['/', AREA], denyWithinAllow: ['/', PROJ] },
     })
 
-    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command.match(/--ro-bind \/ \/(?= )/g)).toHaveLength(2)
+    expect(command).not.toContain(`--ro-bind ${PROJ} ${PROJ}`)
   })
 
   it('does not re-apply a tmpfs over the bind that denies the same directory', async () => {

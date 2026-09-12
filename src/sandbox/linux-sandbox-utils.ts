@@ -1528,33 +1528,25 @@ async function generateFilesystemArgs(
             // after that cwd's own bind — the startup abort. Its descendants
             // are decided by their own recorded directories.
             //
-            // It does still COVER a candidate that nothing beneath it can
-            // re-open, and only then: with the write allowlist exactly '/'
-            // (veto (i) silent) and the candidate outside every predicted
-            // read-deny tmpfs. Its own --ro-bind / / then holds the whole
-            // tree read-only from where it is emitted, and the one
-            // host-backed writable emission after it is what a re-applied
-            // tmpfs restores — a write path lying inside that tmpfs. Without
-            // this the shape `allowOnly: ['/']` with `denyWithinAllow: ['/']`
-            // stubs each absent cwd dotfile on the read-only root it just
-            // mounted, which is the startup abort, and it reaches that shape
-            // as soon as any read policy is configured at all (the library's
-            // own /etc/ssh/ssh_config.d entry is a tmpfs under '/'). An
-            // allowed write path strictly beneath '/' is left to veto the
-            // skip as before; it cannot make the candidate creatable here,
-            // but narrowing this to the one shape that needs it keeps every
-            // other verdict as it was. An underivable prediction proves
-            // nothing and keeps the stub.
-            const {
-              allowedWritePathsBothForms,
-              prospectiveReadDenyTmpfsDirsBothForms,
-              unreliable,
-            } = getStubSkipVetoInputs()
+            // It does still COVER a candidate outside every predicted
+            // read-deny tmpfs. Its own --ro-bind / / holds the whole tree
+            // read-only from where it is emitted, burying the allow loop's
+            // binds, and the only writable surface after it is a re-applied
+            // tmpfs itself: the re-application passes no allowed write
+            // paths, so everything it restores comes back read-only. An
+            // allowed write path beneath the root is therefore not a vector
+            // here, and vetoing on one only brings the abort back for
+            // `allowOnly: ['/', <dir>]`. An underivable prediction proves
+            // nothing and keeps the stub. Without this branch, `allowOnly:
+            // ['/']` with `denyWithinAllow: ['/']` stubs each absent cwd
+            // dotfile on the read-only root it just mounted — the startup
+            // abort — whenever anything vetoes '/': a read-deny tmpfs
+            // beneath it (the library's own /etc/ssh/ssh_config.d entry,
+            // added when that directory exists) or a second allow entry.
+            const { prospectiveReadDenyTmpfsDirsBothForms, unreliable } =
+              getStubSkipVetoInputs()
             if (
               !unreliable &&
-              !allowedWritePathsBothForms.some(writePath =>
-                isStrictlyUnder(writePath, '/'),
-              ) &&
               !prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
                 isAtOrUnder(candidate, tmpfsDir),
               )

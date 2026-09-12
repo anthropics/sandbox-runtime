@@ -469,6 +469,86 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       expect(ranDenied.stdout).toContain('hello')
       expect(ranDenied.stdout).toContain('REFUSED')
       expect(existsSync(dotfile)).toBe(false)
+
+      // Allowed and denied WITH a read policy: any read-deny tmpfs lies
+      // under '/' and vetoes it, so the root's covering bind is judged
+      // against the candidate instead. The dotfile is outside that tmpfs,
+      // so it is still covered and still needs no stub.
+      const readDenied = join(BASE, 'ro')
+      mkdirSync(readDenied)
+      writeFileSync(join(readDenied, 'token.txt'), 'x\n')
+      const withRead = await wrapCommandWithSandboxLinux({
+        command: probe,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [readDenied] },
+        writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
+      })
+      expect(withRead).not.toContain(`--ro-bind /dev/null ${dotfile}`)
+      // Two whole triples: the base root mount, then the deny's read-only
+      // bind that covers the dotfile.
+      expect(withRead.match(/--ro-bind \/ \/(?= )/g)).toHaveLength(2)
+      expect(withRead).toContain(`--tmpfs ${readDenied} `)
+      const ranWithRead = spawnSync(withRead, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: PROJ,
+      })
+      expect(ranWithRead.stderr ?? '').not.toContain('bwrap:')
+      expect(ranWithRead.stdout).toContain('hello')
+      expect(ranWithRead.stdout).toContain('REFUSED')
+      expect(existsSync(dotfile)).toBe(false)
+    },
+  )
+
+  it('skips stubs under a "/" write root denied whole beside a second allow entry', async () => {
+    // The deny of '/' is emitted as a read-only bind after BOTH allow binds,
+    // burying them, so a second allowOnly entry cannot make the candidate
+    // creatable and must not veto the skip: doing so stubs the absent cwd
+    // dotfile on the read-only root and the sandbox never starts.
+    process.chdir(PROJ)
+
+    const command = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      writeConfig: { allowOnly: ['/', AREA], denyWithinAllow: ['/'] },
+    })
+
+    expect(command).toContain(`--bind ${AREA} ${AREA}`)
+    expect(command.match(/--ro-bind \/ \/(?= )/g)).toHaveLength(2)
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+  })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'starts under a "/" write root denied whole beside a second allow entry, and denies both',
+    async () => {
+      // The root deny buries the allow binds, so nothing under it is
+      // writable — not the absent cwd dotfile, and not the second allow
+      // entry either.
+      process.chdir(PROJ)
+      const dotfile = join(PROJ, '.gitconfig')
+      const inArea = join(AREA, 'probe.txt')
+
+      const command = await wrapCommandWithSandboxLinux({
+        command: `echo BOOTED; (echo x > ${dotfile}) 2>/dev/null && echo WROTE || echo REFUSED; (echo x > ${inArea}) 2>/dev/null && echo WROTE-AREA || echo REFUSED-AREA`,
+        needsNetworkRestriction: false,
+        writeConfig: { allowOnly: ['/', AREA], denyWithinAllow: ['/'] },
+      })
+      const run = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: PROJ,
+      })
+
+      expect(run.stderr ?? '').not.toContain('bwrap:')
+      expect(run.stdout).toContain('BOOTED')
+      expect(run.stdout).toContain('REFUSED')
+      expect(run.stdout).toContain('REFUSED-AREA')
+      expect(existsSync(dotfile)).toBe(false)
+      expect(existsSync(inArea)).toBe(false)
     },
   )
 
