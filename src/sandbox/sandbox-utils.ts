@@ -795,11 +795,32 @@ export function buildPosixGitSafeDirEnv(opts: {
 }
 
 /**
+ * How much of an attribution key rides the carriers. A key is cut to this
+ * many characters before encoding, so two commands that share this much of
+ * a prefix share a key.
+ */
+export const SANDBOXED_COMMAND_KEY_LENGTH = 100
+
+/**
+ * The attribution key for an invocation: the caller's `commandId`, or the
+ * command itself when there is no usable id.
+ */
+export function attributionKeyFor(
+  command: string,
+  commandId: string | undefined,
+): string {
+  // Falsy, not `=== undefined`: every carrier drops an empty attribution, and
+  // a JavaScript caller's `null` would throw in encodeSandboxedCommand.
+  return !commandId ? command : commandId
+}
+
+/**
  * Encode a command for sandbox monitoring
- * Truncates to 100 chars and base64 encodes to avoid parsing issues
+ * Truncates to SANDBOXED_COMMAND_KEY_LENGTH chars and base64 encodes to
+ * avoid parsing issues
  */
 export function encodeSandboxedCommand(command: string): string {
-  const truncatedCommand = command.slice(0, 100)
+  const truncatedCommand = command.slice(0, SANDBOXED_COMMAND_KEY_LENGTH)
   return Buffer.from(truncatedCommand).toString('base64')
 }
 
@@ -813,18 +834,32 @@ export function decodeSandboxedCommand(encodedCommand: string): string {
 /** Base proxy username; the auth token is the credential, this is a label. */
 export const PROXY_AUTH_USER = 'srt'
 
+/** RFC 1929 caps a SOCKS5 username at 255 bytes. */
+const MAX_PROXY_USERNAME_BYTES = 255
+
+/**
+ * The longest encodedCommand a carrier this process mints can hold: what is
+ * left of the username budget after `srt.`. Every carrier is bounded far more
+ * loosely than that (an HTTP proxy header budget is kilobytes), so a longer
+ * attribution field was not minted here and is stored by nobody.
+ */
+export const MAX_ENCODED_COMMAND_BYTES =
+  MAX_PROXY_USERNAME_BYTES - Buffer.byteLength(`${PROXY_AUTH_USER}.`)
+
 /**
  * Build the proxy username for a sandboxed command: `srt.<encodedCommand>`
  * so the proxy can attribute a denial to the invocation that triggered it,
- * or bare `srt` when there is nothing to attribute. RFC 1929 caps the
- * SOCKS5 username at 255 bytes; a multibyte command whose 100-code-unit
- * truncation still base64s past that would fail the SOCKS handshake, so
- * fall back to bare `srt` (attribution is lost, connectivity is not).
+ * or bare `srt` when there is nothing to attribute. A multibyte command whose
+ * 100-code-unit truncation still base64s past the username budget would fail
+ * the SOCKS handshake, so fall back to bare `srt` (attribution is lost,
+ * connectivity is not).
  */
 export function proxyUsernameFor(encodedCommand: string | undefined): string {
   if (!encodedCommand) return PROXY_AUTH_USER
   const user = `${PROXY_AUTH_USER}.${encodedCommand}`
-  return Buffer.byteLength(user) <= 255 ? user : PROXY_AUTH_USER
+  return Buffer.byteLength(user) <= MAX_PROXY_USERNAME_BYTES
+    ? user
+    : PROXY_AUTH_USER
 }
 
 /**
@@ -832,14 +867,20 @@ export function proxyUsernameFor(encodedCommand: string | undefined): string {
  * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
  * The username is client-controlled inside the sandbox, so a forged suffix
  * can only misattribute a denial in the violation report — it cannot
- * authenticate (the token does that) or reach another command's data.
+ * authenticate (the token does that) or reach another command's data. A
+ * suffix past {@link MAX_ENCODED_COMMAND_BYTES} is longer than this process
+ * can mint, so it is dropped rather than stored: the denial is still
+ * recorded, unattributed.
  */
 export function encodedCommandFromProxyUser(
   username: string | undefined,
 ): string | undefined {
   if (!username || !username.startsWith(`${PROXY_AUTH_USER}.`)) return undefined
   const suffix = username.slice(PROXY_AUTH_USER.length + 1)
-  return suffix || undefined
+  if (!suffix || Buffer.byteLength(suffix) > MAX_ENCODED_COMMAND_BYTES) {
+    return undefined
+  }
+  return suffix
 }
 
 /**

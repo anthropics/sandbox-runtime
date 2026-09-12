@@ -8,6 +8,7 @@ import {
   normalizePathForSandbox,
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
+  attributionKeyFor,
   encodeSandboxedCommand,
   decodeSandboxedCommand,
   containsGlobChars,
@@ -1250,7 +1251,7 @@ export function wrapCommandWithSandboxMacOS(
   // Both correlation carriers (seatbelt log tag, proxy username) encode
   // the attribution key, which is the caller's commandId when the
   // executed string differs from the one violations are looked up by.
-  const attributionCommand = commandId ?? command
+  const attributionCommand = attributionKeyFor(command, commandId)
   const logTag = generateLogTag(attributionCommand)
 
   const profile = generateSandboxProfile({
@@ -1388,11 +1389,14 @@ export function wrapCommandWithSandboxMacOS(
  */
 export function startMacOSSandboxLogMonitor(
   callback: SandboxViolationCallback,
-  ignoreViolations?: IgnoreViolationsConfig,
-  /** Map a decoded attribution key (commandId) to the command text it
-   *  represents; identity when omitted. Applied before ignoreViolations
-   *  matching and before the event's `command` is set. */
-  resolveCommandText: (decodedId: string) => string = id => id,
+  ignoreViolations: IgnoreViolationsConfig | undefined,
+  /** Map a decoded attribution key to the command text it represents, before
+   *  ignoreViolations matching and before the event's `command` is set. Only
+   *  the manager holds the registry that can do that, so it is required
+   *  rather than defaulted: a caller with no registry passes
+   *  `sanitizeUnregisteredCommandKey`, which treats the key as the untrusted
+   *  bytes it arrived as. */
+  resolveCommandText: (decodedKey: string) => string,
 ): () => void {
   // Pre-compile regex patterns for better performance
   const cmdExtractRegex = /CMD64_(.+?)_END/

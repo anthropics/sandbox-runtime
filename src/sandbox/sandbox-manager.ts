@@ -46,6 +46,7 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
+  linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
 import {
   wrapCommandWithSandboxMacOS,
@@ -80,12 +81,14 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
+  normalizePathForSandbox,
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
-  sanitizeViolationText,
+  sanitizeUnregisteredCommandKey,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -203,16 +206,14 @@ function registerCleanup(): void {
 }
 
 /**
- * Attribution key → command text for every wrapped invocation, so each
- * producer can report (and ignoreViolations can match) the command an
- * event belongs to rather than the opaque key. The key is the commandId
- * when the embedder passes one, else the command itself; either way it is
- * stored as decodeSandboxedCommand yields it (its first 100 characters).
- * Bounded FIFO: the violation store itself only retains the last 100
- * events, so long-gone invocations don't need resolving.
+ * Attribution key to command text for every wrapped invocation, so each
+ * producer can report (and ignoreViolations can match) the command an event
+ * belongs to rather than the opaque key. Keys are held decoded because that
+ * is the form the carriers deliver. Bounded FIFO: the violation store itself
+ * only retains the last 100 events, so long-gone invocations need no entry.
  */
 const MAX_COMMAND_TEXTS = 1024
-const commandTextsById = new Map<string, string>()
+const commandTextsByKey = new Map<string, string>()
 
 /** Exported for testing. */
 export function registerCommandText(
@@ -220,29 +221,30 @@ export function registerCommandText(
   options: WrapWithSandboxOptions | undefined,
 ): void {
   const key = decodeSandboxedCommand(
-    encodeSandboxedCommand(options?.commandId ?? command),
+    encodeSandboxedCommand(attributionKeyFor(command, options?.commandId)),
   )
   const text = options?.commandText ?? command
-  commandTextsById.delete(key)
-  commandTextsById.set(key, text)
-  while (commandTextsById.size > MAX_COMMAND_TEXTS) {
-    const oldest = commandTextsById.keys().next().value
+  commandTextsByKey.delete(key)
+  commandTextsByKey.set(key, text)
+  while (commandTextsByKey.size > MAX_COMMAND_TEXTS) {
+    const oldest = commandTextsByKey.keys().next().value
     if (oldest === undefined) break
-    commandTextsById.delete(oldest)
+    commandTextsByKey.delete(oldest)
   }
 }
 
 /**
- * The command text for a decoded attribution key: the registered text when
- * the key belongs to an invocation this process wrapped (the embedder's
- * own, trusted text), else the key with control characters collapsed. The
- * decoded bytes arrive over carriers the sandboxed process can write to
- * (the observe socket's event field, the macOS log tag, the proxy
- * username), so a key that was never wrapped here is untrusted and every
- * producer's fallback sanitizes it alike. Exported for testing.
+ * The command text for a decoded attribution key. Keys arrive over carriers
+ * the sandboxed process can write (the observe socket's event field, the
+ * macOS log tag, the proxy username), so only a key this process registered
+ * carries the embedder's own text; anything else is untrusted bytes.
+ * Exported for testing.
  */
-export function resolveCommandText(decodedId: string): string {
-  return commandTextsById.get(decodedId) ?? sanitizeViolationText(decodedId)
+export function resolveCommandText(decodedKey: string): string {
+  return (
+    commandTextsByKey.get(decodedKey) ??
+    sanitizeUnregisteredCommandKey(decodedKey)
+  )
 }
 
 /**
@@ -258,9 +260,6 @@ function recordProxyViolation(
   line: string,
   encodedCommand: string | undefined,
 ): void {
-  // The proxy username is client-supplied inside the sandbox (only the
-  // password is authenticated), so the decoded key is untrusted bytes and
-  // resolves through the same registry-or-sanitize path as every producer.
   const command = encodedCommand
     ? resolveCommandText(decodeSandboxedCommand(encodedCommand))
     : undefined
@@ -694,17 +693,37 @@ async function initialize(
     logForDebugging('Started macOS sandbox log monitor')
   }
   if (enableLogMonitor && getPlatform() === 'linux') {
+    // The monitor compares paths the kernel reported, so its lists are
+    // expanded the way the wrapper expands them (getFsWriteConfig folds in
+    // the default write paths and drops the globs bwrap cannot take;
+    // normalizePathForSandbox resolves `~`, relative spellings and symlinks),
+    // plus the built-in write denies the wrapper always applies.
+    // It does not reproduce the wrapper's existence and boundary-symlink
+    // filters, nor the ripgrep scan for nested dangerous paths; and it still
+    // reports writes bwrap permits through `--dev`, `--proc` and the tmpfs
+    // over each read-denied directory. Started once, so both lists are fixed
+    // at the cwd and configuration of this call.
+    const monitoredWrites = getFsWriteConfig()
     linuxMonitor = startLinuxSandboxViolationMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       {
         // apply-seccomp's observer reports every write-intent syscall
         // (allowed or not). Only paths bwrap would actually refuse — outside
         // allowWrite or inside a denyWrite carve-out — go to the store.
-        allowWritePaths: [
-          ...getDefaultWritePaths(),
-          ...config.filesystem.allowWrite,
+        allowWritePaths: monitoredWrites.allowOnly.map(p =>
+          normalizePathForSandbox(p),
+        ),
+        denyWritePaths: [
+          ...monitoredWrites.denyWithinAllow.map(p =>
+            normalizePathForSandbox(p),
+          ),
+          // filesystem.disabled reaches the wrapper as `writeConfig ===
+          // undefined`, which skips every bind and the built-in denies with
+          // them, so the monitor must not judge by them either.
+          ...(config.filesystem.disabled
+            ? []
+            : linuxGetCwdMandatoryDenyPaths(getAllowGitConfig())),
         ],
-        denyWritePaths: config.filesystem.denyWrite,
         ignoreViolations: config.ignoreViolations,
         resolveCommandText,
       },
@@ -2246,6 +2265,7 @@ async function reset(): Promise<void> {
   javaAgentJarPath = undefined
   sentinelRegistry.clear()
   awsPairRegistry.clear()
+  commandTextsByKey.clear()
   maskedFileStore.dispose()
 }
 

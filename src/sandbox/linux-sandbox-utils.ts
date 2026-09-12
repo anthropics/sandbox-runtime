@@ -16,6 +16,7 @@ import {
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
   encodeSandboxedCommand,
+  attributionKeyFor,
   DANGEROUS_FILES,
   isAtOrUnder,
   isStrictlyUnder,
@@ -270,28 +271,24 @@ function findFirstNonExistentComponent(targetPath: string): string {
 }
 
 /**
- * Get mandatory deny paths using ripgrep (Linux only).
- * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
- * With --max-depth limiting, this is fast enough to run on each command without memoization.
+ * The part of the mandatory deny set that follows from the cwd alone: the
+ * dangerous files and directories resolved against it, plus `.git/hooks` and
+ * (unless the caller allows git config) `.git/config`.
+ * {@link linuxGetMandatoryDenyPaths} adds the nested matches its ripgrep scan
+ * finds on top of these. Split out so a consumer that must not scan — the
+ * violation monitor, which needs the same denies to judge a write bwrap
+ * refuses — reads the same definition rather than a copy of it.
  */
-async function linuxGetMandatoryDenyPaths(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
-  maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
+export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
-  abortSignal?: AbortSignal,
-): Promise<string[]> {
+): string[] {
   const cwd = process.cwd()
-  // Use provided signal or create a fallback controller
-  const fallbackController = new AbortController()
-  const signal = abortSignal ?? fallbackController.signal
-  const dangerousDirectories = getDangerousDirectories()
-
   // Note: Settings files are added at the callsite in sandbox-manager.ts
   const denyPaths = [
     // Dangerous files in CWD
     ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
     // Dangerous directories in CWD
-    ...dangerousDirectories.map(d => path.resolve(cwd, d)),
+    ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
   ]
 
   // Git hooks and config are only denied when .git exists as a directory.
@@ -316,6 +313,28 @@ async function linuxGetMandatoryDenyPaths(
       denyPaths.push(path.resolve(cwd, '.git/config'))
     }
   }
+
+  return denyPaths
+}
+
+/**
+ * Get mandatory deny paths using ripgrep (Linux only).
+ * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
+ * With --max-depth limiting, this is fast enough to run on each command without memoization.
+ */
+async function linuxGetMandatoryDenyPaths(
+  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
+  allowGitConfig = false,
+  abortSignal?: AbortSignal,
+): Promise<string[]> {
+  const cwd = process.cwd()
+  // Use provided signal or create a fallback controller
+  const fallbackController = new AbortController()
+  const signal = abortSignal ?? fallbackController.signal
+  const dangerousDirectories = getDangerousDirectories()
+
+  const denyPaths = linuxGetCwdMandatoryDenyPaths(allowGitConfig)
 
   // Build iglob args for all patterns in one ripgrep call
   const iglobArgs: string[] = []
@@ -1835,6 +1854,14 @@ export async function wrapCommandWithSandboxLinux(
   // decrements so the count does not leak.
   activeSandboxCount++
 
+  // One encoded key for both carriers below (SRT_ENCODED_CMD for the seccomp
+  // observer, the proxy username for network denies), so a violation seen
+  // through either resolves to the same registry entry. macOS derives its log
+  // tag from a single key the same way.
+  const attributionKey = encodeSandboxedCommand(
+    attributionKeyFor(command, commandId),
+  )
+
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let applySeccompPrefix: string | undefined
 
@@ -1874,11 +1901,7 @@ export async function wrapCommandWithSandboxLinux(
         bwrapArgs.push('--setenv', 'SRT_OBSERVE_SOCK', observeSocketPath)
         // Tag events with the encoded command so the violation store can
         // associate them with this invocation (parity with macOS log tag).
-        bwrapArgs.push(
-          '--setenv',
-          'SRT_ENCODED_CMD',
-          encodeSandboxedCommand(commandId ?? command),
-        )
+        bwrapArgs.push('--setenv', 'SRT_ENCODED_CMD', attributionKey)
       } else {
         logForDebugging(
           '[Sandbox Linux] observe socket missing — supervisor not running; ' +
@@ -1962,7 +1985,7 @@ export async function wrapCommandWithSandboxLinux(
           caCertPath,
           proxyAuthToken,
           writeConfig === undefined,
-          encodeSandboxedCommand(commandId ?? command),
+          attributionKey,
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {
