@@ -50,11 +50,21 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     })
 
   // Marker first, so a run in which srt never launched cannot pass on the
-  // negative assertions alone.
+  // negative assertions alone. Each step then labels its own exit status, so
+  // one step succeeding cannot hide behind another's failure, and the script
+  // exits with the write's status so `r.status` still reports the escape.
   const escapeAttempt = (out: string) =>
     `echo SANDBOX-RAN; python3 ${UMOUNT_PROBE} / ${SECRET}; ` +
-    `mount -o remount,bind,rw / 2>&1; cat ${join(SECRET, 'key')} 2>&1; ` +
-    `echo bad > ${out} 2>&1`
+    `mount -o remount,bind,rw / 2>&1; echo "remount-rc=$?"; ` +
+    `cat ${join(SECRET, 'key')} 2>&1; echo "read-secret-rc=$?"; ` +
+    `echo bad > ${out} 2>&1; w=$?; echo "write-denied-rc=$w"; exit $w`
+
+  // Each labelled step must have failed: present in the output, non-zero.
+  const refusedEveryStep = (stdout: string) => {
+    expect(stdout).toMatch(/^remount-rc=[1-9][0-9]*$/m)
+    expect(stdout).toMatch(/^read-secret-rc=[1-9][0-9]*$/m)
+    expect(stdout).toMatch(/^write-denied-rc=[1-9][0-9]*$/m)
+  }
 
   beforeAll(() => {
     mkdirSync(ALLOWED, { recursive: true })
@@ -71,7 +81,7 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
         '    rc = libc.umount2(target.encode(), 0)',
         '    e = ctypes.get_errno()',
         "    print('umount2 %s rc=%d errno=%s (%s)' % (",
-        "        target, rc, errno.errorcode.get(e, '0'), os.strerror(e)))",
+        '        target, rc, errno.errorcode.get(e, str(e)), os.strerror(e)))',
         '',
       ].join('\n'),
     )
@@ -144,7 +154,8 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(r.stdout).toContain('SANDBOX-RAN')
     expect(r.stdout).toContain('umount2 / rc=-1 errno=EINVAL')
     expect(r.stdout).toContain(`umount2 ${SECRET} rc=-1 errno=EINVAL`)
-    expect(r.stdout + r.stderr).toMatch(/permission denied|not permitted/i)
+    refusedEveryStep(r.stdout)
+    expect(r.status).not.toBe(0)
     expect(r.stdout).not.toContain('TOPSECRET')
     expect(existsSync(out)).toBe(false)
   })
@@ -159,7 +170,8 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(r.stdout).toContain('SANDBOX-RAN')
     expect(r.stdout).toContain('umount2 / rc=-1 errno=EPERM')
     expect(r.stdout).toContain(`umount2 ${SECRET} rc=-1 errno=EPERM`)
-    expect(r.stdout + r.stderr).toMatch(/permission denied|not permitted/i)
+    refusedEveryStep(r.stdout)
+    expect(r.status).not.toBe(0)
     expect(r.stdout).not.toContain('TOPSECRET')
     expect(existsSync(out)).toBe(false)
   })
