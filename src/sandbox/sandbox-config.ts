@@ -6,7 +6,7 @@
 import { isIP } from 'node:net'
 import type { FilterRequestCallback } from './request-filter.js'
 
-import { isAbsolute } from 'node:path'
+import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
 import { z } from 'zod'
 import {
   isInjectHostCoveredByAllowedDomains,
@@ -14,7 +14,8 @@ import {
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import { parseAddressRange } from './address.js'
-import { containsGlobChars } from './sandbox-utils.js'
+import { containsGlobCharsForPlatform } from './sandbox-utils.js'
+import { getPlatform } from '../utils/platform.js'
 
 /**
  * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
@@ -890,29 +891,6 @@ export const NetworkConfigSchema = z.object({
 })
 
 /**
- * A deny entry spelled as a glob must not end in `/`. The trailing slash is
- * compiled into the pattern — the macOS regex then requires a match ending
- * in a slash, and Linux tests the same shape against the paths it walks
- * while expanding the glob — and no path either backend matches against ends
- * in one, so the rule matches nothing and the deny is silently inert. An
- * inert deny is fail-open, so it is rejected here instead of emitted. A
- * slashed *allow* glob is inert in exactly the same way, but an allow that
- * matches nothing fails closed, so `allowRead`/`allowWrite` keep taking it.
- */
-const denyPathSchema = filesystemPathSchema.superRefine((val, ctx) => {
-  if (!val.endsWith('/') || !containsGlobChars(val)) return
-  ctx.addIssue({
-    code: z.ZodIssueCode.custom,
-    message:
-      `Deny glob "${val}" ends in "/", so it denies nothing: the trailing ` +
-      `slash becomes part of the compiled pattern and no path it is tested ` +
-      `against ends in one. Write "${val.replace(/\/+$/, '')}" — a deny ` +
-      `covers every match and everything inside it — or add a "**" segment ` +
-      `to match at any depth.`,
-  })
-})
-
-/**
  * Filesystem configuration schema for validation
  */
 export const FilesystemConfigSchema = z.object({
@@ -927,7 +905,7 @@ export const FilesystemConfigSchema = z.object({
         'is trusted with full host filesystem access. Network and credential-env restrictions ' +
         'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',
     ),
-  denyRead: z.array(denyPathSchema).describe('Paths denied for reading'),
+  denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
   allowRead: z
     .array(filesystemPathSchema)
     .optional()
@@ -939,7 +917,7 @@ export const FilesystemConfigSchema = z.object({
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),
   denyWrite: z
-    .array(denyPathSchema)
+    .array(filesystemPathSchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
   allowGitConfig: z
     .boolean()
@@ -1095,6 +1073,37 @@ export const SeccompConfigSchema = z.object({
 })
 
 /**
+ * An inert deny is fail-open, so a deny glob whose trailing separator leaves
+ * it matching nothing is rejected; the same glob as an allow fails closed,
+ * so the allow lists keep the plain path schema.
+ */
+function addInertSlashedDenyGlobIssue(
+  value: string,
+  path: (string | number)[],
+  ctx: z.RefinementCtx,
+): void {
+  const onWindows = getPlatform() === 'windows'
+  const trailingSeparator = onWindows ? /[\\/]+$/ : /\/+$/
+  if (!trailingSeparator.test(value)) return
+  if (!containsGlobCharsForPlatform(value)) return
+  // Only absolute and `~`-rooted spellings reach a backend with the
+  // separator still attached: normalizePathForSandbox resolves a relative
+  // spelling through path.resolve, which drops it, so `build/*/` is live.
+  const rooted = onWindows
+    ? win32Path.isAbsolute(value)
+    : posixPath.isAbsolute(value)
+  if (!rooted && !value.startsWith('~')) return
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path,
+    message:
+      `Deny glob "${value}" ends in a separator, so the pattern can match ` +
+      `no path. Write "${value.replace(trailingSeparator, '')}", or add a ` +
+      `"**" segment to match at any depth.`,
+  })
+}
+
+/**
  * Main configuration schema for Sandbox Runtime validation
  */
 export const SandboxRuntimeConfigSchema = z
@@ -1184,6 +1193,20 @@ export const SandboxRuntimeConfigSchema = z
     ),
   })
   .superRefine((cfg, ctx) => {
+    // filesystem.disabled drops every filesystem rule, the credential file
+    // denies included (getFsReadConfig, getFsWriteConfig and
+    // computeWindowsFsAccessSet all short-circuit on it), so an inert deny
+    // under it is not a hole.
+    const fsEnforced = !cfg.filesystem.disabled
+    if (fsEnforced) {
+      for (const [idx, p] of cfg.filesystem.denyRead.entries()) {
+        addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyRead', idx], ctx)
+      }
+      for (const [idx, p] of cfg.filesystem.denyWrite.entries()) {
+        addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyWrite', idx], ctx)
+      }
+    }
+
     const creds = cfg.credentials
     if (!creds) return
 
@@ -1353,6 +1376,15 @@ export const SandboxRuntimeConfigSchema = z
             `directory. Use mode "deny" for "${f.path}", or point at the ` +
             `credential file inside it.`,
         })
+      }
+      // A `mode: 'deny'` path is unioned into the read-deny set and takes
+      // the same glob branches as filesystem.denyRead.
+      if (fsEnforced && f.mode === 'deny') {
+        addInertSlashedDenyGlobIssue(
+          f.path,
+          ['credentials', 'files', idx, 'path'],
+          ctx,
+        )
       }
     }
 

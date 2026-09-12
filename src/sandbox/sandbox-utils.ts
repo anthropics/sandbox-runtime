@@ -89,7 +89,7 @@ export function containsGlobCharsWin(p: string): boolean {
 }
 
 /** Platform-appropriate glob-char check. */
-function containsGlobCharsForPlatform(p: string): boolean {
+export function containsGlobCharsForPlatform(p: string): boolean {
   return getPlatform() === 'windows'
     ? containsGlobCharsWin(p)
     : containsGlobChars(p)
@@ -349,9 +349,12 @@ export function normalizePathForSandbox(pathPattern: string): string {
   // slash-only difference as a mismatch. bwrap binds and sbpl subpath
   // filters treat 'dir' and 'dir/' identically, so only the comparisons
   // change. Glob spellings are left untouched: a slash after a glob segment
-  // is semantic ('/x/*/' compiles to a different regex than '/x/*'). On
-  // Windows a trailing separator is the directory marker for absent deny
-  // targets (srt#404) and must survive.
+  // is semantic ('/x/*/' compiles to a different regex than '/x/*'). That
+  // regex matches nothing, which an allow may harmlessly be — so an allow
+  // keeps the spelling, while the same spelling as a deny is rejected at
+  // config validation (see sandbox-config.ts). On Windows a trailing
+  // separator is the directory marker for absent deny targets (srt#404) and
+  // must survive.
   if (
     getPlatform() !== 'windows' &&
     pathPattern.endsWith('/') &&
