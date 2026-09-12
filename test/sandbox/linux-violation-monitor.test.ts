@@ -11,18 +11,28 @@ import {
   type LinuxViolationMonitor,
 } from '../../src/sandbox/linux-violation-monitor.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
+import { encodeSandboxedCommand } from '../../src/sandbox/sandbox-utils.js'
 
 const d = isLinux ? describe : describe.skip
 
 d('linux-violation-monitor (listener)', () => {
   let mon: LinuxViolationMonitor
-  const violations: { line: string; encodedCommand?: string }[] = []
+  const violations: {
+    line: string
+    encodedCommand?: string
+    command?: string
+  }[] = []
   const allow = '/tmp/srt-test-allow'
   const deny = '/tmp/srt-test-allow/deny'
 
   beforeAll(async () => {
     mon = startLinuxSandboxViolationMonitor(
-      v => violations.push({ line: v.line, encodedCommand: v.encodedCommand }),
+      v =>
+        violations.push({
+          line: v.line,
+          encodedCommand: v.encodedCommand,
+          command: v.command,
+        }),
       { allowWritePaths: [allow, '/dev'], denyWritePaths: [deny] },
     )
     await mon.ready
@@ -102,6 +112,21 @@ d('linux-violation-monitor (listener)', () => {
       'deny openat /b',
       'deny openat /c',
     ])
+  })
+
+  it('reports an unregistered attribution key as untrusted bytes', async () => {
+    // No resolveCommandText was passed, so the monitor falls back to its
+    // own sanitizing default rather than storing the key as the sandboxed
+    // process spelled it.
+    violations.length = 0
+    await send([
+      JSON.stringify({
+        encodedCommand: encodeSandboxedCommand('x<a>\u202eb\ncdef'),
+      }),
+      JSON.stringify({ syscall: 'openat', path: '/etc/passwd' }),
+    ])
+    await new Promise(r => setTimeout(r, 50))
+    expect(violations.map(v => v.command)).toEqual(['xa b cdef'])
   })
 
   it('ignores malformed lines and observe_init_error', async () => {
