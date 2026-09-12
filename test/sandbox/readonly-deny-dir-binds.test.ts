@@ -96,11 +96,13 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
     expect(countOccurrences(command, `--ro-bind ${PROJ} ${PROJ}`)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
+  })
 
-    // Where the host can run bwrap, prove the covering bind alone still
-    // holds: the file reads, and a write through it fails and changes
-    // nothing on the host.
-    if (BWRAP_CAN_NAMESPACE) {
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'holds the skipped file under the covering bind alone at runtime',
+    async () => {
+      // The covering bind is all that protects FILE: it must still read, and
+      // a write through it must fail and change nothing on the host.
       const run = (wrapped: string) =>
         spawnSync(wrapped, {
           shell: true,
@@ -117,8 +119,8 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       )
       expect(write.status).not.toBe(0)
       expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
-    }
-  })
+    },
+  )
 
   it('is independent of the order the denies are listed in', async () => {
     const command = await wrap([FILE, PROJ], [], [PROJ])
@@ -164,12 +166,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     const readDenied = join(PROJ, 'secrets')
     mkdirSync(readDenied)
 
-    const command = await wrap(
-      [PROJ, FILE],
-      [readDenied],
-      [AREA],
-      `sh -c 'echo x >> ${FILE}'`,
-    )
+    const command = await wrap([PROJ, FILE], [readDenied])
 
     const projBind = command.lastIndexOf(`--ro-bind ${PROJ} ${PROJ}`)
     expect(projBind).toBeGreaterThan(-1)
@@ -177,17 +174,28 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     expect(command.lastIndexOf(`--tmpfs ${readDenied}`)).toBeGreaterThan(
       projBind,
     )
-    if (BWRAP_CAN_NAMESPACE) {
-      const write = spawnSync(command, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 15000,
-        cwd: BASE,
-      })
+  })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'keeps the file unwritable when only a denyRead tmpfs sits under the covering dir',
+    async () => {
+      const readDenied = join(PROJ, 'secrets')
+      mkdirSync(readDenied)
+
+      const write = spawnSync(
+        await wrap(
+          [PROJ, FILE],
+          [readDenied],
+          [AREA],
+          `sh -c 'echo x >> ${FILE}'`,
+        ),
+        { shell: true, encoding: 'utf8', timeout: 15000, cwd: BASE },
+      )
+
       expect(write.status).not.toBe(0)
       expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
-    }
-  })
+    },
+  )
 
   it('does not trust a recorded "/" as a covering directory', async () => {
     // allowOnly and denyWithinAllow both naming '/' records it as a
