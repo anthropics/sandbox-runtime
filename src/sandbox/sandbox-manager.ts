@@ -50,6 +50,7 @@ import {
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
+  resolveInheritedStdioTtys,
 } from './macos-sandbox-utils.js'
 import {
   startLinuxSandboxViolationMonitor,
@@ -1543,6 +1544,22 @@ export type WrapWithSandboxOptions = {
    * reported as the violation's `command`. Defaults to `command`.
    */
   commandText?: string
+  /**
+   * Declares that the wrapped command will be spawned with this process's
+   * stdio inherited, so the terminals on our fds are the terminals the child
+   * gets. On macOS this is what lets the profile grant `file-ioctl` on each
+   * of those devices, which an interactive TUI needs to enter raw mode.
+   *
+   * Off by default, and deliberately a caller's assertion rather than
+   * something detected here: wrapping returns a command string and the
+   * caller picks stdio afterwards, so detection at wrap time would guess at
+   * a decision not yet made — wrap under pipes then launch into a fresh
+   * pty, or wrap under terminal A then launch under terminal B, and the
+   * guess is wrong. Pass it only when you spawn with `stdio: 'inherit'`.
+   * Ignored when `allowPty` is `true` (that mode already grants every pty);
+   * honored for both unset and `false`, which share the inherited-only grant.
+   */
+  inheritsStdio?: boolean
 }
 
 async function wrapWithSandbox(
@@ -1709,6 +1726,16 @@ async function wrapWithSandbox(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
+        // Only when the caller asserts the child inherits our stdio, and only
+        // in the default mode. `allowPty: true` already covers every pty, so
+        // resolving the inherited set adds nothing; every other value (unset
+        // or an explicit `false`) takes the inherited-only default, which is
+        // why the guard is `!== true` rather than `=== undefined` — `false`
+        // must behave identically to unset, not suppress the grant.
+        inheritedTtys:
+          allowPty !== true && options?.inheritsStdio
+            ? resolveInheritedStdioTtys()
+            : undefined,
         allowGitConfig: getAllowGitConfig(),
         gitSafeDirectories,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),

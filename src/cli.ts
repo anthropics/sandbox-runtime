@@ -323,6 +323,8 @@ async function main(): Promise<void> {
           let child
           if (process.platform === 'win32') {
             // env carries the proxy vars the sandboxed child must inherit.
+            // No inheritsStdio here: it only drives the macOS terminal grant,
+            // and this branch is Windows-only.
             const { argv, env } =
               await SandboxManager.wrapWithSandboxArgv(command)
             child = spawn(argv[0], argv.slice(1), {
@@ -331,8 +333,13 @@ async function main(): Promise<void> {
               env,
             })
           } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
+            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+              command,
+              undefined,
+              undefined,
+              undefined,
+              { inheritsStdio: true },
+            )
             child = spawn(sandboxedCommand, {
               shell: true,
               stdio: 'inherit',

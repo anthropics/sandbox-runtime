@@ -398,6 +398,10 @@ Examples:
 - `javaAgentJarPath` - macOS/Linux: absolute path to `srt-proxy-agent.jar`, the JVM agent injected via `JAVA_TOOL_OPTIONS` (see "JVM tools" under Network Isolation). Only needed by consumers that bundle sandbox-runtime and ship the jar separately; a normal npm install finds it under `vendor/java-proxy-agent/`.
 - `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service.
 - `allowAppleEvents` - Allow sending Apple Events and Launch Services open requests from the macOS sandbox (boolean, default: false). Without this, commands like `open`, `osascript`, and anything that opens URLs or scripts other apps via AppleScript fail with AppleScript error `-600` ("Application isn't running") or LaunchServices errors (`-10822`, `-54`). **Security warning:** enabling this means the sandbox no longer provides code-execution isolation. A sandboxed command can launch other applications via `open` with no user prompt, and anything it launches runs outside the sandbox's filesystem and network restrictions; scripting already-running apps via Apple Events is additionally gated by the user's per-app TCC automation consent. Embedders should only source this option from trusted user-level configuration — never from project-local files in a checked-out repository, which would let an attacker-authored project elevate its own sandbox permissions.
+- `allowPty` - Pseudo-terminal access in the macOS sandbox (boolean, macOS only). **Leave it unset** for the default: the sandboxed process is granted `file-ioctl` — and only `file-ioctl` — on the terminals it inherited on stdin/stdout/stderr, which is what an interactive TUI needs to enter raw mode (`tcsetattr` / `process.stdin.setRawMode()`). Without it the terminal never leaves canonical mode and capability replies and mouse events echo as literal text. Each inherited terminal gets its own rule.
+  - `true` widens the grant to `(allow pseudo-tty)` plus read/write/ioctl on **every** pty. Programs that allocate their own pty need this: `tmux`, `script`, `expect`, anything built on `node-pty`.
+  - `false` behaves the same as unset — inherited-terminal `file-ioctl` only. To give the process no terminal at all, spawn it with piped stdio; the default then emits nothing.
+  - **Library callers must opt in.** The `srt` CLI gets this automatically (it spawns with `stdio: 'inherit'`). `wrapWithSandbox()` and `wrapWithSandboxArgv()` return a command you spawn yourself, so they emit no terminal rule unless you pass `{ inheritsStdio: true }`.
 
 ### Common Configuration Recipes
 
@@ -744,8 +748,10 @@ When a sandboxed process attempts to access a restricted resource:
 
 ```bash
 # View sandbox violations in real-time
-log stream --predicate 'process == "sandbox-exec"' --style syslog
+log stream --predicate 'eventMessage CONTAINS "deny("' --style syslog
 ```
+
+Match on the message, not on `process == "sandbox-exec"`: `sandbox-exec` execs into the target, so the kernel attributes each violation to the child that hit it (`node`, `bash`, the sandboxed binary), and a predicate on the `sandbox-exec` process name returns nothing.
 
 **Linux**: Bubblewrap doesn't provide built-in violation reporting. Use `strace` to trace system calls and identify blocked operations:
 
