@@ -498,6 +498,8 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
 or add an AppArmor profile that grants `userns` to the relevant binaries.
 
+**Running as root:** a caller with euid 0 needs `CAP_SETFCAP`. Bubblewrap's user namespace maps the caller's uid, and Linux 5.12+ lets a namespace map uid 0 only when its creator held that capability; the seccomp isolation layer's nested namespace has the same requirement. Without it every sandboxed command fails with `Operation not permitted` while writing a uid map. Grant the capability to the calling process — it is in Docker's default set, but `capsh --drop=cap_setfcap` and a tightened `CapabilityBoundingSet=` remove it — or run as a non-root user, for which none of this applies.
+
 **Optional Linux dependencies (for seccomp fallback):**
 
 The package includes pre-generated seccomp BPF filters for x86-64 and arm architectures. These dependencies are only needed if you are on a different architecture where pre-generated filters are not available:

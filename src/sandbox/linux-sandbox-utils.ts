@@ -402,44 +402,89 @@ const bwrapMountPoints: Set<string> = new Set()
 
 const CAP_SETFCAP = 31
 
-/** Whether this process holds `cap` in its effective set (Linux). */
-function processHasEffectiveCapability(cap: number): boolean {
-  try {
-    const status = fs.readFileSync('/proc/self/status', 'utf8')
-    const capEff = status.match(/^CapEff:\s*([0-9a-fA-F]+)\s*$/m)
-    if (!capEff) return false
-    return ((BigInt('0x' + capEff[1]) >> BigInt(cap)) & 1n) === 1n
-  } catch {
-    return false
+// This process's permitted capability set, read once. Nothing in the process
+// changes it, and without this the read is a synchronous open of
+// /proc/self/status on the path of every wrapped command. `null` records a
+// read or parse failure, which counts as holding nothing.
+let permittedCapabilities: bigint | null | undefined
+
+/**
+ * Whether this process holds `cap` in its permitted set (Linux).
+ *
+ * The permitted set, not the effective one: a process may hold a capability
+ * permitted and leave it lowered, and bwrap raises what it is given back
+ * into its effective set before it unshares, so reading CapEff would refuse
+ * a caller that can in fact supply the capability.
+ */
+function processHasPermittedCapability(cap: number): boolean {
+  if (permittedCapabilities === undefined) {
+    permittedCapabilities = null
+    try {
+      const status = fs.readFileSync('/proc/self/status', 'utf8')
+      const capPrm = status.match(/^CapPrm:\s*([0-9a-fA-F]+)\s*$/m)
+      if (capPrm) {
+        permittedCapabilities = BigInt('0x' + capPrm[1])
+      } else {
+        logForDebugging(
+          '[Sandbox Linux] /proc/self/status has no CapPrm line - assuming no capabilities',
+          { level: 'warn' },
+        )
+      }
+    } catch (e) {
+      logForDebugging(
+        `[Sandbox Linux] Cannot read /proc/self/status (${String(e)}) - assuming no capabilities`,
+        { level: 'warn' },
+      )
+    }
   }
+  return (
+    permittedCapabilities !== null &&
+    ((permittedCapabilities >> BigInt(cap)) & 1n) === 1n
+  )
 }
 
 /**
- * Capability arguments: the command holds no capability in bwrap's user
- * namespace. For a non-root caller that is bwrap's default and the drop is a
- * no-op; bwrap run by uid 0 hands the command every capability the caller
- * holds unless told otherwise, and inside bwrap's user namespace
- * CAP_SYS_ADMIN is enough to unmount a read-deny tmpfs or a write-deny bind,
- * or remount / read-write: the whole filesystem policy. The one exception,
- * for a root caller while the seccomp helper is in use and the caller has
- * it, is CAP_SETFCAP: the helper's nested user namespace must map uid 0,
- * which the kernel (5.12+) permits only when the namespace's creator held
- * CAP_SETFCAP. The helper loses it on entering that namespace, so the
- * command itself runs with no capability in bwrap's namespace and full ones
- * only in a nested namespace whose copies of these mounts are locked. A
- * non-root caller may not add a capability.
+ * The bwrap capability list. Always `--cap-drop ALL`, which for a non-root
+ * caller is bwrap's default anyway. `--cap-add CAP_SETFCAP` for the whole
+ * bwrap invocation — the outer shell and the two socat relays hold it too —
+ * when the caller is uid 0, the seccomp helper is in use and the caller
+ * holds the capability: the helper's nested user namespace maps uid 0, which
+ * kernels 5.12+ allow only from a creator holding CAP_SETFCAP. Under the
+ * helper a uid-0 caller's command therefore has a full set inside that
+ * nested namespace, which is identity-mapped to the caller's uid 0, and the
+ * filesystem policy there rests on the nested namespace's mount copies being
+ * locked. Without the helper (`allowAllUnixSockets`, or no usable helper
+ * binary) the command runs in bwrap's own namespaces and `--cap-drop ALL` is
+ * what stops it unmounting a deny.
  */
-function capabilityArgs(usesSeccompHelper: boolean): string[] {
+export function capabilityArgs({
+  euid,
+  hasSetfcap,
+  usesSeccompHelper,
+}: {
+  euid: number | undefined
+  hasSetfcap: boolean
+  usesSeccompHelper: boolean
+}): string[] {
   const args = ['--cap-drop', 'ALL']
-  if (
-    usesSeccompHelper &&
-    process.geteuid?.() === 0 &&
-    processHasEffectiveCapability(CAP_SETFCAP)
-  ) {
-    args.push('--cap-add', 'CAP_SETFCAP')
+  if (euid !== 0) return args
+  if (!hasSetfcap) {
+    logForDebugging(CAP_SETFCAP_MISSING_WARNING, { level: 'warn' })
+    return args
   }
+  if (usesSeccompHelper) args.push('--cap-add', 'CAP_SETFCAP')
   return args
 }
+
+// A uid-0 caller without CAP_SETFCAP cannot sandbox anything: bwrap's own
+// --unshare-user writes a uid map containing uid 0, and so does the seccomp
+// helper's nested namespace, and kernels 5.12+ refuse both unless the
+// namespace's creator held CAP_SETFCAP. allowAllUnixSockets does not avoid
+// it — it only drops the helper, not bwrap's own user namespace.
+const CAP_SETFCAP_MISSING_WARNING =
+  '[Sandbox Linux] Running as uid 0 without CAP_SETFCAP - bubblewrap cannot map uid 0 ' +
+  'into a user namespace on Linux 5.12+, so every sandboxed command fails writing a uid ' +
+  'map ("Operation not permitted"). Grant CAP_SETFCAP to this process, or run as a non-root user.'
 
 // Number of wrapped commands that have been generated but whose cleanup has
 // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
@@ -614,6 +659,16 @@ export function checkLinuxDependencies(
     getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
   ) {
     warnings.push('seccomp not available - unix socket access not restricted')
+  }
+
+  if (
+    process.geteuid?.() === 0 &&
+    !processHasPermittedCapability(CAP_SETFCAP)
+  ) {
+    warnings.push(
+      'running as uid 0 without CAP_SETFCAP - bubblewrap cannot map uid 0 into a user ' +
+        'namespace, so sandboxed commands will fail (grant CAP_SETFCAP, or run as a non-root user)',
+    )
   }
 
   return { warnings, errors }
@@ -1769,6 +1824,10 @@ async function generateFilesystemArgs(
  * - To use sandboxing without Unix socket blocking on unsupported architectures,
  *   set allowAllUnixSockets: true in your configuration
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
+ *
+ * CALLER OBLIGATION: the euid and capability decisions behind the returned
+ * string are made here, in the process that builds it, so the string must be
+ * run by a process with the same euid and capabilities.
  */
 export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
@@ -2033,15 +2092,14 @@ export async function wrapCommandWithSandboxLinux(
     // --unshare-user in both modes: bwrap only auto-creates a userns when
     // EUID != 0. A root parent in an unprivileged container (Docker's
     // default: EUID=0 without CAP_SYS_ADMIN) would otherwise try a direct
-    // clone and EPERM; a root parent WITH capabilities would leave the
-    // command holding them, CAP_SYS_ADMIN included, which unmounts any deny
-    // in this namespace — hence capabilityArgs in both modes as well.
-    // apply-seccomp creates its own nested userns to obtain CAP_SYS_ADMIN
-    // for its PID+mount unshare (see below); for a root caller that needs
-    // the one capability capabilityArgs keeps.
+    // clone and EPERM.
     bwrapArgs.push(
       '--unshare-user',
-      ...capabilityArgs(applySeccompPrefix !== undefined),
+      ...capabilityArgs({
+        euid: process.geteuid?.(),
+        hasSetfcap: processHasPermittedCapability(CAP_SETFCAP),
+        usesSeccompHelper: applySeccompPrefix !== undefined,
+      }),
     )
     if (!enableWeakerNestedSandbox) {
       // Mount fresh /proc if PID namespace is isolated (secure mode).
