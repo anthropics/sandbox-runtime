@@ -756,6 +756,44 @@ function generateReadRules(
 }
 
 /**
+ * Re-allow writes under a `node_modules/**` subtree for the same names
+ * {@link macGetMandatoryDenyPatterns}'s depth-agnostic globs (`**\/<name>`,
+ * `**\/<name>/**`) deny everywhere. Those globs have no `node_modules`
+ * carve-out, unlike the Linux backend (which excludes `node_modules` from
+ * its ripgrep scan), so a dependency shipping its own e.g.
+ * `.vscode/settings.json` gets that write denied on macOS even though
+ * nothing reads it as configuration.
+ *
+ * Emitted at both the `file-write*` wildcard level and the
+ * `file-write-unlink`/`file-write-create` levels: Seatbelt resolves
+ * conflicting rules by operation specificity rather than declaration order,
+ * so a wildcard-only allow here would still lose to the
+ * file-write-unlink/file-write-create denies the move-blocking rules below
+ * emit for the same mandatory-deny patterns.
+ */
+function generateNodeModulesDenyExemptionRules(logTag: string): string[] {
+  const globs = [
+    ...DANGEROUS_FILES.map(fileName => `**/node_modules/**/${fileName}`),
+    ...getDangerousDirectories().map(
+      dirName => `**/node_modules/**/${dirName}/**`,
+    ),
+  ]
+  const filters = new Set(
+    globs.map(glob => pathFilter(normalizePathForSandbox(glob))),
+  )
+
+  return [
+    ...renderRule('allow', ['file-write*'], filters, logTag),
+    ...renderRule(
+      'allow',
+      ['file-write-unlink', 'file-write-create'],
+      filters,
+      logTag,
+    ),
+  ]
+}
+
+/**
  * Generate filesystem write rules for sandbox profile
  */
 function generateWriteRules(
@@ -816,6 +854,11 @@ function generateWriteRules(
       logTag,
     ),
   )
+
+  // Undo the node_modules-oblivious part of the mandatory denies above: a
+  // dependency's own dotfiles/dot-directories are not attacker-controlled
+  // configuration the way the same names at the project root are.
+  rules.push(...generateNodeModulesDenyExemptionRules(logTag))
 
   return rules
 }
