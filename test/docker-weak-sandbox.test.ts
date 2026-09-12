@@ -1,15 +1,17 @@
 /**
- * End-to-end: run srt in an unprivileged container with
+ * End-to-end: run srt as uid 0 inside a container with
  * enableWeakerNestedSandbox and verify the sandbox enforces.
  *
- * Gated on SRT_E2E_DOCKER so `npm test` on the host jobs skips it —
- * it's designed for a container that lacks CAP_SYS_ADMIN.
+ * Gated on SRT_E2E_DOCKER so `npm test` on the host jobs skips it. CI runs it
+ * twice in one container — once holding CAP_SYS_ADMIN, once under
+ * `capsh --drop=cap_sys_admin` — because a uid-0 caller is what the
+ * capability drop exists for.
  *
  * Invoked by CI via:
  *   docker run --rm \
  *     --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
  *     -v "$PWD:/work" -w /work -e SRT_E2E_DOCKER=1 \
- *     ubuntu:24.04 bash -c '<setup> && bun test test/e2e/docker.test.ts'
+ *     ubuntu:24.04 bash -c '<setup> && bun test test/docker-weak-sandbox.test.ts'
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
@@ -26,18 +28,33 @@ import { join } from 'node:path'
 
 const inDocker = process.env.SRT_E2E_DOCKER === '1'
 
-describe.if(inDocker)('srt end-to-end in unprivileged container', () => {
+describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   const WORK = join(tmpdir(), `srt-e2e-${Date.now()}`)
   const ALLOWED = join(WORK, 'allowed')
   const DENIED = join(WORK, 'denied')
   const SECRET = join(WORK, 'secret')
   const CONFIG = join(WORK, 'srt.json')
+  // Same policy without the seccomp helper: the command then runs in bwrap's
+  // own namespaces, where --cap-drop ALL is the only thing between it and the
+  // deny mounts.
+  const CONFIG_NO_SECCOMP = join(WORK, 'srt-no-seccomp.json')
+  // umount(8) reports through /proc/self/mountinfo, which under the helper
+  // belongs to another pid namespace; call the syscall so the kernel's own
+  // errno is what the test reads.
+  const UMOUNT_PROBE = join(WORK, 'umount-probe.py')
 
-  const srt = (cmd: string) =>
-    spawnSync('node', ['dist/cli.js', '-s', CONFIG, '-c', cmd], {
+  const srt = (cmd: string, config: string = CONFIG) =>
+    spawnSync('node', ['dist/cli.js', '-s', config, '-c', cmd], {
       encoding: 'utf8',
       timeout: 15000,
     })
+
+  // Marker first, so a run in which srt never launched cannot pass on the
+  // negative assertions alone.
+  const escapeAttempt = (out: string) =>
+    `echo SANDBOX-RAN; python3 ${UMOUNT_PROBE} / ${SECRET}; ` +
+    `mount -o remount,bind,rw / 2>&1; cat ${join(SECRET, 'key')} 2>&1; ` +
+    `echo bad > ${out} 2>&1`
 
   beforeAll(() => {
     mkdirSync(ALLOWED, { recursive: true })
@@ -45,15 +62,43 @@ describe.if(inDocker)('srt end-to-end in unprivileged container', () => {
     mkdirSync(SECRET, { recursive: true })
     writeFileSync(join(SECRET, 'key'), 'TOPSECRET')
     writeFileSync(
+      UMOUNT_PROBE,
+      [
+        'import ctypes, errno, os, sys',
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)",
+        'for target in sys.argv[1:]:',
+        '    ctypes.set_errno(0)',
+        '    rc = libc.umount2(target.encode(), 0)',
+        '    e = ctypes.get_errno()',
+        "    print('umount2 %s rc=%d errno=%s (%s)' % (",
+        "        target, rc, errno.errorcode.get(e, '0'), os.strerror(e)))",
+        '',
+      ].join('\n'),
+    )
+    const policy = {
+      filesystem: {
+        denyRead: [SECRET],
+        allowWrite: [ALLOWED],
+        denyWrite: [],
+      },
+      enableWeakerNestedSandbox: true,
+    }
+    writeFileSync(
       CONFIG,
       JSON.stringify({
+        ...policy,
         network: { allowedDomains: [], deniedDomains: [] },
-        filesystem: {
-          denyRead: [SECRET],
-          allowWrite: [ALLOWED],
-          denyWrite: [],
+      }),
+    )
+    writeFileSync(
+      CONFIG_NO_SECCOMP,
+      JSON.stringify({
+        ...policy,
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          allowAllUnixSockets: true,
         },
-        enableWeakerNestedSandbox: true,
       }),
     )
   })
@@ -89,20 +134,33 @@ describe.if(inDocker)('srt end-to-end in unprivileged container', () => {
     expect(r.status).toBe(0)
   })
 
-  // A root caller (this container's uid 0) hands bwrap every capability it
-  // holds; the sandbox must drop them, or CAP_SYS_ADMIN unmounts the policy.
-  // With Docker's default capability set the unmounts below fail either
-  // way; run the container with --cap-add SYS_ADMIN (or --privileged) to
-  // see them succeed on a runtime that keeps the caller's capabilities.
-  it('leaves the command no capability to unmount a deny', () => {
-    const read = srt(`umount ${SECRET} 2>&1; cat ${join(SECRET, 'key')}`)
-    expect(read.stdout).not.toContain('TOPSECRET')
-
+  // Under the helper the command holds a full capability set in the helper's
+  // nested user namespace, so what refuses the unmount is EINVAL: the mounts
+  // it inherited were copied across a user-namespace boundary and are locked.
+  it('leaves the command no way to unmount a deny (seccomp helper)', () => {
     const out = join(DENIED, 'escaped')
-    const write = srt(
-      `mount -o remount,bind,rw / 2>&1; umount ${WORK} 2>&1; echo bad > ${out}`,
-    )
-    expect(write.status).not.toBe(0)
+    const r = srt(escapeAttempt(out))
+
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    expect(r.stdout).toContain('umount2 / rc=-1 errno=EINVAL')
+    expect(r.stdout).toContain(`umount2 ${SECRET} rc=-1 errno=EINVAL`)
+    expect(r.stdout + r.stderr).toMatch(/permission denied|not permitted/i)
+    expect(r.stdout).not.toContain('TOPSECRET')
+    expect(existsSync(out)).toBe(false)
+  })
+
+  // Without the helper there is no nested namespace and no locked copies:
+  // --cap-drop ALL is the whole barrier, and the kernel refuses with EPERM
+  // because the command holds no CAP_SYS_ADMIN in bwrap's user namespace.
+  it('leaves the command no way to unmount a deny (no seccomp helper)', () => {
+    const out = join(DENIED, 'escaped-no-seccomp')
+    const r = srt(escapeAttempt(out), CONFIG_NO_SECCOMP)
+
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    expect(r.stdout).toContain('umount2 / rc=-1 errno=EPERM')
+    expect(r.stdout).toContain(`umount2 ${SECRET} rc=-1 errno=EPERM`)
+    expect(r.stdout + r.stderr).toMatch(/permission denied|not permitted/i)
+    expect(r.stdout).not.toContain('TOPSECRET')
     expect(existsSync(out)).toBe(false)
   })
 })

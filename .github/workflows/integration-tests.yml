@@ -233,7 +233,7 @@ jobs:
       # sandboxed umount lifts any deny), then with it dropped (Docker's
       # default set: the unprivileged container enableWeakerNestedSandbox
       # exists for).
-      - name: Run srt end-to-end in unprivileged container
+      - name: Run srt end-to-end as uid 0 in a container
         run: |
           docker run --rm \
             --cap-add SYS_ADMIN \

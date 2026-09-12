@@ -1,10 +1,26 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import * as which from '../../src/utils/which.js'
 import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
 import {
+  capabilityArgs,
   checkLinuxDependencies,
   getLinuxDependencyStatus,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+
+// checkLinuxDependencies reads the real process's permitted set, so gate the
+// uid-0 warning test on this process not already holding CAP_SETFCAP (bit
+// 31). True for a non-root CI user, and on platforms without /proc.
+const lacksSetfcap = (() => {
+  try {
+    const capPrm = readFileSync('/proc/self/status', 'utf8').match(
+      /^CapPrm:\s*([0-9a-fA-F]+)/m,
+    )
+    return capPrm ? ((BigInt('0x' + capPrm[1]) >> 31n) & 1n) === 0n : true
+  } catch {
+    return true
+  }
+})()
 
 // Spies set up in beforeEach, torn down in afterEach. Each test overrides
 // just the piece it's exercising. spyOn patches the export binding, so
@@ -76,6 +92,21 @@ describe('checkLinuxDependencies', () => {
     )
   })
 
+  test.if(typeof process.geteuid === 'function' && lacksSetfcap)(
+    'warns when a uid-0 caller has no CAP_SETFCAP',
+    () => {
+      using euidSpy = spyOn(process, 'geteuid').mockReturnValue(0)
+
+      const result = checkLinuxDependencies()
+
+      expect(euidSpy).toHaveBeenCalled()
+      expect(result.errors).toEqual([])
+      expect(result.warnings.find(w => w.includes('CAP_SETFCAP'))).toMatch(
+        /uid 0.*non-root user/s,
+      )
+    },
+  )
+
   test('passes custom applyPath through to the resolver', () => {
     checkLinuxDependencies({ seccompConfig: { applyPath: '/custom/apply' } })
 
@@ -120,6 +151,49 @@ describe('checkLinuxDependencies', () => {
 
     expect(result.errors).toEqual([])
     expect(whichSpy).not.toHaveBeenCalledWith('bwrap')
+  })
+})
+
+describe('capabilityArgs', () => {
+  test('non-root caller: drops everything, never adds', () => {
+    for (const usesSeccompHelper of [true, false]) {
+      expect(
+        capabilityArgs({ euid: 1000, hasSetfcap: true, usesSeccompHelper }),
+      ).toEqual(['--cap-drop', 'ALL'])
+    }
+  })
+
+  test('uid 0 under the helper, holding CAP_SETFCAP: keeps it', () => {
+    expect(
+      capabilityArgs({ euid: 0, hasSetfcap: true, usesSeccompHelper: true }),
+    ).toEqual(['--cap-drop', 'ALL', '--cap-add', 'CAP_SETFCAP'])
+  })
+
+  test('uid 0 without the helper: nothing to keep it for', () => {
+    expect(
+      capabilityArgs({ euid: 0, hasSetfcap: true, usesSeccompHelper: false }),
+    ).toEqual(['--cap-drop', 'ALL'])
+  })
+
+  test('uid 0 missing CAP_SETFCAP: adds nothing and warns', () => {
+    using warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    const debug = process.env.SRT_DEBUG
+    process.env.SRT_DEBUG = '1'
+    try {
+      for (const usesSeccompHelper of [true, false]) {
+        expect(
+          capabilityArgs({ euid: 0, hasSetfcap: false, usesSeccompHelper }),
+        ).toEqual(['--cap-drop', 'ALL'])
+      }
+    } finally {
+      if (debug === undefined) delete process.env.SRT_DEBUG
+      else process.env.SRT_DEBUG = debug
+    }
+
+    expect(warnSpy).toHaveBeenCalledTimes(2)
+    expect(warnSpy.mock.calls[0]?.[0]).toMatch(
+      /uid 0 without CAP_SETFCAP.*non-root user/s,
+    )
   })
 })
 
