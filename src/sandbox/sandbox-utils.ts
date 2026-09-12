@@ -324,12 +324,14 @@ export function expandWindowsEnvRefs(p: string): string {
  *
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
  *
- * `opts.literal` marks a path the library computed itself (a cwd-joined
- * mandatory deny, a scan result). Such a path is a name on disk, never a
- * pattern, so the glob branches are skipped for it and a component like
- * `a[b` is resolved and later compiled as the name it is. Spellings that
- * came from the caller's config keep the character sniffing: there, `[…]`
- * is glob syntax the caller asked for.
+ * `opts.literal` marks a path that names one file or directory rather
+ * than matching several: one the library computed itself, or a caller
+ * spelling that carried no glob character — resolving such a spelling can
+ * splice in a cwd or home directory whose own name does. The glob
+ * branches are skipped for it, so a component like `a[b` is resolved and
+ * later compiled as the name it is. A spelling the caller wrote with `*`,
+ * `?` or `[…]` in it keeps the character sniffing: there the brackets are
+ * the glob syntax it asked for.
  */
 export function normalizePathForSandbox(
   pathPattern: string,
