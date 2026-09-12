@@ -8,7 +8,14 @@ import {
   spyOn,
 } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs'
 import { connect } from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -22,9 +29,24 @@ import {
 } from '../../src/sandbox/linux-violation-monitor.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
-import { encodeSandboxedCommand } from '../../src/sandbox/sandbox-utils.js'
+import {
+  encodeSandboxedCommand,
+  MAX_ENCODED_COMMAND_BYTES,
+} from '../../src/sandbox/sandbox-utils.js'
+import { sanitizeUnregisteredCommandKey } from '../../src/sandbox/sandbox-violation-store.js'
 
 const d = isLinux ? describe : describe.skip
+
+/** Simulate apply-seccomp's outer stub: connect and write JSON lines. */
+const send = (socketPath: string, lines: string[]): Promise<void> =>
+  new Promise((res, rej) => {
+    const c = connect(socketPath, () => {
+      c.write(lines.join('\n') + '\n')
+      c.end()
+    })
+    c.on('close', () => res())
+    c.on('error', rej)
+  })
 
 d('linux-violation-monitor (listener)', () => {
   let mon: LinuxViolationMonitor
@@ -44,22 +66,15 @@ d('linux-violation-monitor (listener)', () => {
           encodedCommand: v.encodedCommand,
           command: v.command,
         }),
-      { allowWritePaths: [allow, '/dev'], denyWritePaths: [deny] },
+      {
+        allowWritePaths: [allow, '/dev'],
+        denyWritePaths: [deny],
+        resolveCommandText: sanitizeUnregisteredCommandKey,
+      },
     )
     await mon.ready
   })
   afterAll(() => mon.stop())
-
-  /** Simulate apply-seccomp's outer stub: connect and write JSON lines. */
-  const send = (lines: string[]): Promise<void> =>
-    new Promise((res, rej) => {
-      const c = connect(mon.observeSocketPath!, () => {
-        c.write(lines.join('\n') + '\n')
-        c.end()
-      })
-      c.on('close', () => res())
-      c.on('error', rej)
-    })
 
   it('binds a filesystem unix socket', () => {
     expect(mon.observeSocketPath).toBeDefined()
@@ -68,7 +83,7 @@ d('linux-violation-monitor (listener)', () => {
 
   it('filters allowed writes, surfaces denied writes', async () => {
     violations.length = 0
-    await send([
+    await send(mon.observeSocketPath!, [
       JSON.stringify({ encodedCommand: 'dGVzdA==' }), // base64("test")
       JSON.stringify({ nr: 257, syscall: 'openat', path: `${allow}/ok` }),
       JSON.stringify({ nr: 257, syscall: 'openat', path: '/dev/null' }),
@@ -88,7 +103,7 @@ d('linux-violation-monitor (listener)', () => {
     // path here means resolution failed. Best-effort telemetry: never
     // classify what could not be evaluated against policy.
     violations.length = 0
-    await send([
+    await send(mon.observeSocketPath!, [
       JSON.stringify({ nr: 83, syscall: 'mkdir', path: 'rel/dir' }),
       JSON.stringify({ nr: 257, syscall: 'openat', path: '/etc/passwd' }),
     ])
@@ -96,26 +111,56 @@ d('linux-violation-monitor (listener)', () => {
     expect(violations.map(v => v.line)).toEqual(['deny openat /etc/passwd'])
   })
 
-  it('normalizes ./ and ../ segments before the policy check', async () => {
+  it('reports the normalized path it classified, not the spelling', async () => {
     violations.length = 0
-    await send([
+    await send(mon.observeSocketPath!, [
       // inside allow once collapsed → not a violation
       JSON.stringify({ syscall: 'openat', path: `${allow}/sub/../ok` }),
-      // escapes allow once collapsed → violation, reported as spelled
+      // escapes allow once collapsed → violation, under the collapsed path
       JSON.stringify({ syscall: 'openat', path: `${allow}/../escape` }),
     ])
     await new Promise(r => setTimeout(r, 50))
-    expect(violations.map(v => v.line)).toEqual([
-      `deny openat ${allow}/../escape`,
-    ])
+    expect(violations.map(v => v.line)).toEqual(['deny openat /tmp/escape'])
+  })
+
+  it('suppresses by the normalized path, so a detour cannot evade it', async () => {
+    // `ignoreViolations` is matched against the same collapsed path the
+    // policy check used: a `node_modules/..` detour neither smuggles a
+    // suppression nor hides which file was written.
+    const lines: string[] = []
+    const mon2 = startLinuxSandboxViolationMonitor(v => lines.push(v.line), {
+      allowWritePaths: ['/tmp/srt-ignore-allow'],
+      denyWritePaths: [],
+      ignoreViolations: { '*': ['node_modules'] },
+      resolveCommandText: sanitizeUnregisteredCommandKey,
+    })
+    await mon2.ready
+    try {
+      await send(mon2.observeSocketPath!, [
+        JSON.stringify({
+          syscall: 'openat',
+          path: '/home/u/.ssh/node_modules/../authorized_keys',
+        }),
+      ])
+      await new Promise(r => setTimeout(r, 50))
+      expect(lines).toEqual(['deny openat /home/u/.ssh/authorized_keys'])
+    } finally {
+      mon2.stop()
+    }
   })
 
   it('handles concurrent connections (one per command)', async () => {
     violations.length = 0
     await Promise.all([
-      send([JSON.stringify({ syscall: 'openat', path: '/a' })]),
-      send([JSON.stringify({ syscall: 'openat', path: '/b' })]),
-      send([JSON.stringify({ syscall: 'openat', path: '/c' })]),
+      send(mon.observeSocketPath!, [
+        JSON.stringify({ syscall: 'openat', path: '/a' }),
+      ]),
+      send(mon.observeSocketPath!, [
+        JSON.stringify({ syscall: 'openat', path: '/b' }),
+      ]),
+      send(mon.observeSocketPath!, [
+        JSON.stringify({ syscall: 'openat', path: '/c' }),
+      ]),
     ])
     await new Promise(r => setTimeout(r, 50))
     expect(violations.map(v => v.line).sort()).toEqual([
@@ -126,11 +171,8 @@ d('linux-violation-monitor (listener)', () => {
   })
 
   it('reports an unregistered attribution key as untrusted bytes', async () => {
-    // No resolveCommandText was passed, so the monitor falls back to its
-    // own sanitizing default rather than storing the key as the sandboxed
-    // process spelled it.
     violations.length = 0
-    await send([
+    await send(mon.observeSocketPath!, [
       JSON.stringify({
         encodedCommand: encodeSandboxedCommand('x<a>\u202eb\ncdef'),
       }),
@@ -140,9 +182,34 @@ d('linux-violation-monitor (listener)', () => {
     expect(violations.map(v => v.command)).toEqual(['xa b cdef'])
   })
 
+  it('drops an attribution longer than a minted key, keeping the violation', async () => {
+    violations.length = 0
+    await send(mon.observeSocketPath!, [
+      JSON.stringify({ encodedCommand: 'A'.repeat(MAX_ENCODED_COMMAND_BYTES) }),
+      JSON.stringify({ syscall: 'openat', path: '/etc/one' }),
+    ])
+    await send(mon.observeSocketPath!, [
+      JSON.stringify({
+        encodedCommand: 'A'.repeat(MAX_ENCODED_COMMAND_BYTES + 1),
+      }),
+      JSON.stringify({ syscall: 'openat', path: '/etc/two' }),
+    ])
+    await new Promise(r => setTimeout(r, 50))
+    expect(violations.map(v => v.line).sort()).toEqual([
+      'deny openat /etc/one',
+      'deny openat /etc/two',
+    ])
+    const oversized = violations.find(v => v.line.endsWith('/etc/two'))!
+    expect(oversized.encodedCommand).toBeUndefined()
+    expect(oversized.command).toBeUndefined()
+    expect(
+      violations.find(v => v.line.endsWith('/etc/one'))!.encodedCommand,
+    ).toBeDefined()
+  })
+
   it('ignores malformed lines and observe_init_error', async () => {
     violations.length = 0
-    await send([
+    await send(mon.observeSocketPath!, [
       'not json',
       JSON.stringify({ observe_init_error: 'seccomp: EINVAL' }),
       JSON.stringify({ nr: 257 }), // no path
@@ -170,6 +237,7 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
     mon = startLinuxSandboxViolationMonitor(v => violations.push(v.line), {
       allowWritePaths: [allow, '/dev'],
       denyWritePaths: [deny],
+      resolveCommandText: sanitizeUnregisteredCommandKey,
     })
     await mon.ready
   })
@@ -212,11 +280,9 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
     await new Promise(r => setTimeout(r, 100))
     // The allowed relative write resolved inside allow → no violation.
     expect(violations.some(v => v.includes('rel-ok.txt'))).toBe(false)
-    // The escaping relative write resolved into deny → violation, with
-    // an absolute (cwd-joined) path.
-    const bad = violations.find(v => v.includes('rel-bad.txt'))
-    expect(bad).toBeDefined()
-    expect(bad).toContain(`deny openat ${allow}/../ro/rel-bad.txt`)
+    // The escaping relative write resolved into deny → violation, reported
+    // under the collapsed path.
+    expect(violations).toContain(`deny openat ${deny}/rel-bad.txt`)
   })
 
   it('does not hang when the listener stops reading (full pipe drops)', () => {
@@ -226,6 +292,7 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
     const stall = startLinuxSandboxViolationMonitor(() => {}, {
       allowWritePaths: ['/'],
       denyWritePaths: [],
+      resolveCommandText: sanitizeUnregisteredCommandKey,
     })
     return stall.ready.then(() => {
       const dir = mkdtempSync(join(tmpdir(), 'srt-vmon-stall-'))
@@ -277,21 +344,32 @@ de('linux-violation-monitor + apply-seccomp (e2e)', () => {
 })
 
 d('the write configuration the manager hands the monitor', () => {
-  // ~-spelled, relative and glob entries reach the monitor as configured,
-  // while the paths it classifies come from the kernel. bwrap is built from
-  // the expanded, glob-free spellings, so an unexpanded entry matches
-  // nothing: everything under an allow is reported as a violation bwrap
-  // permitted, and a deny inside an allowed tree is not reported although
-  // bwrap refused it. Enforcement is unaffected either way; this is the
-  // accuracy of the violation records.
-  const ALLOW = join(homedir(), 'srt-monitor-allow')
-  const DENY = join(ALLOW, 'secrets')
+  // `~`-spelled, relative and glob entries reach the monitor as configured,
+  // while the paths it classifies come from the kernel; and bwrap refuses
+  // more than the configuration names, because it adds the built-in write
+  // denies on top. The fixture is a real tree: bwrap skips a write allow
+  // path that does not exist, so a non-existent one would prove nothing.
+  const NAME = `srt-monitor-allow-${randomBytes(4).toString('hex')}`
+  const HOME_SPELLING = join(homedir(), NAME)
+  let ALLOW: string
+  let DENY: string
+  let originalCwd: string
+
+  beforeAll(() => {
+    originalCwd = process.cwd()
+    mkdirSync(join(HOME_SPELLING, 'secrets'), { recursive: true })
+    mkdirSync(join(HOME_SPELLING, '.git', 'hooks'), { recursive: true })
+    ALLOW = realpathSync(HOME_SPELLING)
+    DENY = join(ALLOW, 'secrets')
+  })
+  afterAll(() => rmSync(HOME_SPELLING, { recursive: true, force: true }))
 
   afterEach(async () => {
+    process.chdir(originalCwd)
     await SandboxManager.reset()
   })
 
-  it('classifies a ~ allow and a ~ deny the way bwrap does', async () => {
+  it('classifies a ~ allow, a ~ deny and a built-in deny the way bwrap does', async () => {
     let handedOver: LinuxViolationMonitorOptions | undefined
     const spy = spyOn(
       linuxViolationMonitorModule,
@@ -305,19 +383,23 @@ d('the write configuration the manager hands the monitor', () => {
       }
     })
     try {
+      // The built-in denies are resolved against the cwd of the initialize()
+      // call, so make that the tree the allow rule covers.
+      process.chdir(ALLOW)
       await SandboxManager.initialize(
         {
           network: { allowedDomains: [], deniedDomains: [] },
           filesystem: {
             denyRead: [],
-            allowWrite: ['~/srt-monitor-allow', '~/srt-monitor-allow/g/*'],
-            denyWrite: ['~/srt-monitor-allow/secrets'],
+            allowWrite: [`~/${NAME}`, `~/${NAME}/g/*`],
+            denyWrite: [`~/${NAME}/secrets`],
           },
         },
         undefined,
         true,
       )
     } finally {
+      process.chdir(originalCwd)
       spy.mockRestore()
     }
     expect(handedOver).toBeDefined()
@@ -333,21 +415,19 @@ d('the write configuration the manager hands the monitor', () => {
     )
     await monitor.ready
     try {
-      await new Promise<void>((res, rej) => {
-        const c = connect(monitor.observeSocketPath!, () => {
-          c.write(
-            [
-              JSON.stringify({ syscall: 'openat', path: `${ALLOW}/file` }),
-              JSON.stringify({ syscall: 'openat', path: `${DENY}/token` }),
-            ].join('\n') + '\n',
-          )
-          c.end()
-        })
-        c.on('close', () => res())
-        c.on('error', rej)
-      })
+      await send(monitor.observeSocketPath!, [
+        JSON.stringify({ syscall: 'openat', path: `${ALLOW}/file` }),
+        JSON.stringify({ syscall: 'openat', path: `${DENY}/token` }),
+        JSON.stringify({
+          syscall: 'openat',
+          path: `${ALLOW}/.git/hooks/pre-commit`,
+        }),
+      ])
       await new Promise(r => setTimeout(r, 50))
-      expect(lines).toEqual([`deny openat ${DENY}/token`])
+      expect(lines).toEqual([
+        `deny openat ${DENY}/token`,
+        `deny openat ${ALLOW}/.git/hooks/pre-commit`,
+      ])
     } finally {
       monitor.stop()
     }
