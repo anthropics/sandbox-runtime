@@ -37,7 +37,7 @@ const MAX_SYMLINK_HOPS = 40
  * and nested `modules` directories; this bounds a hostile or looping tree, not
  * a real one, and is deliberately unrelated to the ripgrep scan's depth.
  */
-const MAX_SUBMODULE_WALK_DEPTH = 10
+export const MAX_SUBMODULE_WALK_DEPTH = 10
 
 /**
  * Entries whose presence makes a directory a git directory. git needs HEAD
@@ -219,12 +219,17 @@ function collectSubmoduleGitDirs(
     if (isGitDir) scan.gitDirs.push(child)
 
     if (depth + 1 >= MAX_SUBMODULE_WALK_DEPTH) {
-      // Nothing below here is inspected, so the directory is denied whole,
-      // like one the walk could not list: a submodule git directory nested
-      // deeper would otherwise keep its hooks and config writable.
-      scan.unreadableDirs.push(child)
+      // Nothing below here is inspected, so what the walk would have descended
+      // into is denied whole, like a directory it could not list: a submodule
+      // git directory nested deeper would otherwise keep its hooks and config
+      // writable. For a git directory that is the `modules` beneath it (absent
+      // or not — a sandboxed command must not be able to create one and hide a
+      // git directory inside), NOT the directory itself, whose objects, refs
+      // and index stay writable so git still works in that submodule.
+      const denied = isGitDir ? path.join(child, 'modules') : child
+      scan.unreadableDirs.push(denied)
       logForDebugging(
-        `[Sandbox] Stopped the .git/modules walk below ${child} at depth ${MAX_SUBMODULE_WALK_DEPTH}, denying ${child} whole`,
+        `[Sandbox] Stopped the .git/modules walk below ${child} at depth ${MAX_SUBMODULE_WALK_DEPTH}, denying ${denied} whole`,
         { level: 'warn' },
       )
       continue

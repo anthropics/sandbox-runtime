@@ -34,6 +34,7 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   GitMetadataError,
+  MAX_SUBMODULE_WALK_DEPTH,
   gitDirDenyPaths,
   gitFileDenyPaths,
   submoduleGitDirs,
@@ -1874,6 +1875,29 @@ describe('Git metadata deny paths - Unit Tests', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
+  /** Whether bwrap can build the namespaces a wrapped command runs in here. */
+  let canNamespace: boolean | undefined
+  function bwrapCanNamespace(): boolean {
+    canNamespace ??=
+      spawnSync(
+        'bwrap',
+        [
+          '--unshare-pid',
+          '--unshare-user',
+          '--cap-drop',
+          'ALL',
+          '--ro-bind',
+          '/',
+          '/',
+          '--proc',
+          '/proc',
+          'true',
+        ],
+        { timeout: 5000 },
+      ).status === 0
+    return canNamespace
+  }
+
   /** A directory git would accept as a git directory. */
   function makeGitDir(gitDir: string): string {
     mkdirSync(join(gitDir, 'hooks'), { recursive: true })
@@ -2299,23 +2323,119 @@ describe('Git metadata deny paths - Unit Tests', () => {
     },
   )
 
-  it('stops walking modules at its own depth bound', () => {
-    // Deeper than the bound: a name of 12 segments, which no real submodule
-    // has, and which a symlink loop could otherwise spin on.
-    const deep = join(dir, 'modules', ...Array.from({ length: 12 }, () => 'x'))
-    makeGitDir(deep)
+  /** The directory the walk stops at: MAX_SUBMODULE_WALK_DEPTH levels down. */
+  function boundDir(): string {
+    return join(
+      dir,
+      'modules',
+      ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
+    )
+  }
 
-    expect(submoduleGitDirs(join(dir, 'modules')).gitDirs).toEqual([])
-  })
+  it.each([
+    // A git directory below the bound is never seen, so what the walk would
+    // have descended into is denied whole in its place.
+    ['a plain directory', false, (bound: string) => bound],
+    // When the bound directory is a git directory itself it is BOTH: its own
+    // hooks and config are denied by path, and only the `modules` beneath it
+    // is denied whole — denying the git directory would take its objects,
+    // refs and index with it and stop git working in that submodule.
+    ['a git directory', true, (bound: string) => join(bound, 'modules')],
+  ])(
+    'stops the modules walk at its depth bound, with %s there',
+    (_label, boundIsGitDir, denied) => {
+      const bound = boundDir()
+      if (boundIsGitDir) makeGitDir(bound)
+      makeGitDir(join(bound, 'deep'))
 
-  it('denies the directory the modules walk stopped at', () => {
-    // A git directory one level past the bound: the walk never sees it, so
-    // the directory it stopped at is denied whole instead.
-    const bound = join(dir, 'modules', ...Array.from({ length: 10 }, () => 'x'))
-    makeGitDir(join(bound, 'deep'))
+      expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
+        gitDirs: boundIsGitDir ? [bound] : [],
+        unreadableDirs: [denied(bound)],
+      })
+    },
+  )
 
-    const scan = submoduleGitDirs(join(dir, 'modules'))
-    expect(scan.gitDirs).toEqual([])
-    expect(scan.unreadableDirs).toEqual([bound])
+  it.if(isLinux)(
+    'keeps a bound git directory writable except for its hooks, config and modules',
+    async () => {
+      const checkout = join(dir, 'repo')
+      const gitDir = makeGitDir(join(checkout, '.git'))
+      const bound = join(
+        gitDir,
+        'modules',
+        ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
+      )
+      makeGitDir(bound)
+      mkdirSync(join(bound, 'objects'), { recursive: true })
+
+      const originalCwd = process.cwd()
+      process.chdir(checkout)
+      try {
+        const wrap = (command: string): Promise<string> =>
+          wrapCommandWithSandboxLinux({
+            command,
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+
+        // The covering deny is the `modules` beneath it, not the git directory
+        // itself: denying that whole would take its objects, refs and index.
+        const command = await wrap('true')
+        expect(command).not.toContain(`--ro-bind ${bound} ${bound} `)
+        expect(command).toContain(join(bound, 'modules'))
+        expect(command).toContain(`--ro-bind ${join(bound, 'hooks')} `)
+
+        // Where bwrap can run, prove it: what git needs writable in that
+        // submodule still is, and what makes a write into code is not.
+        if (bwrapCanNamespace()) {
+          const result = spawnSync(
+            await wrap(
+              `sh -c 'echo o > ${join(bound, 'objects', 'x')} && ` +
+                `! echo h > ${join(bound, 'hooks', 'x')} && ` +
+                `! echo c > ${join(bound, 'config')} && ` +
+                `! mkdir -p ${join(bound, 'modules', 'sub')} && ` +
+                `echo SRT_BOUND_OK'`,
+            ),
+            { shell: true, encoding: 'utf8', timeout: 30000, cwd: checkout },
+          )
+          expect(result.stdout).toContain('SRT_BOUND_OK')
+        }
+      } finally {
+        cleanupBwrapMountPoints({ force: true })
+        process.chdir(originalCwd)
+      }
+    },
+    60000,
+  )
+
+  it('denies the bound git directory by pattern on macOS, without contradiction', () => {
+    const checkout = join(dir, 'repo')
+    const gitDir = makeGitDir(join(checkout, '.git'))
+    const bound = join(
+      gitDir,
+      'modules',
+      ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
+    )
+    makeGitDir(bound)
+
+    const originalCwd = process.cwd()
+    process.chdir(checkout)
+    try {
+      // Profile generation is pure string building, so this runs anywhere.
+      const profile = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+      })
+      expect(profile).toContain(`(subpath "${join(bound, 'modules')}")`)
+      expect(profile).toContain(`(subpath "${join(bound, 'hooks')}")`)
+      // No deny covering the git directory whole, which would take its
+      // objects, refs and index with it.
+      expect(profile).not.toContain(`(subpath "${bound}")`)
+    } finally {
+      process.chdir(originalCwd)
+    }
   })
 })
