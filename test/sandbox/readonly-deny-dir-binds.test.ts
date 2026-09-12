@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -252,6 +253,134 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     const lastRoBind = command.lastIndexOf(`--ro-bind ${X} ${X}`)
     expect(lastRoBind).toBeGreaterThan(-1)
     expect(command.indexOf(`--bind ${X} ${X}`, lastRoBind)).toBe(-1)
+  })
+
+  // A deny bind kept BECAUSE an allowed write path restored it under a
+  // read-deny tmpfs is buried again when that tmpfs is re-applied over a
+  // write-deny bind of an ancestor, and the write path is re-bound writable
+  // underneath it. The re-application has to emit those deny binds again.
+  describe('write-deny binds survive a re-applied read-deny tmpfs', () => {
+    let RO: string // read-denied dir inside PROJ
+    let W: string // allowed write path inside RO
+    let SECRET: string // write-denied file inside W
+
+    beforeEach(() => {
+      RO = join(PROJ, 'ro')
+      W = join(RO, 'w')
+      mkdirSync(W, { recursive: true })
+      SECRET = join(W, 'secret.txt')
+      writeFileSync(SECRET, 'HOST\n')
+    })
+
+    it('emits the deny bind after the last writable re-bind of its allow path', async () => {
+      const command = await wrap([PROJ, SECRET], [RO], [AREA, W])
+
+      const lastWriteReBind = command.lastIndexOf(`--bind ${W} ${W}`)
+      expect(lastWriteReBind).toBeGreaterThan(-1)
+      expect(
+        command.lastIndexOf(`--ro-bind ${SECRET} ${SECRET}`),
+      ).toBeGreaterThan(lastWriteReBind)
+    })
+
+    // `echo BOOTED` guards every runtime case below: a bwrap start-up abort
+    // would otherwise read as "the write was blocked".
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'blocks the write-denied file and nothing else under the allow path',
+      async () => {
+        const sibling = join(W, 'notes.txt')
+        writeFileSync(sibling, 'notes\n')
+
+        const result = spawnSync(
+          await wrap(
+            [PROJ, SECRET],
+            [RO],
+            [AREA, W],
+            `sh -c 'echo BOOTED; echo x >> ${SECRET}; echo y >> ${sibling}'`,
+          ),
+          { shell: true, encoding: 'utf8', timeout: 15000, cwd: BASE },
+        )
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(readFileSync(SECRET, 'utf8')).toBe('HOST\n')
+        expect(readFileSync(sibling, 'utf8')).toBe('notes\ny\n')
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps the git hooks and config denies of a repo under the read-denied dir',
+      async () => {
+        // The shape the emission filter's own .git/hooks exception describes:
+        // a repo under a read-denied directory, writable, inside a
+        // write-denied project.
+        const hooks = join(W, '.git', 'hooks')
+        const config = join(W, '.git', 'config')
+        mkdirSync(hooks, { recursive: true })
+        writeFileSync(config, '[core]\n')
+
+        const result = spawnSync(
+          await wrap(
+            [PROJ, hooks, config],
+            [RO],
+            [AREA, W],
+            `sh -c 'echo BOOTED; echo hook > ${join(hooks, 'pre-commit')}; echo x >> ${config}'`,
+          ),
+          { shell: true, encoding: 'utf8', timeout: 15000, cwd: BASE },
+        )
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(existsSync(join(hooks, 'pre-commit'))).toBe(false)
+        expect(readFileSync(config, 'utf8')).toBe('[core]\n')
+      },
+    )
+
+    // Absent deny paths are listed FIRST in the two cases below, so their
+    // placeholder mount points are created while the allow path is still
+    // writable and bwrap starts instead of aborting. Re-emitting a
+    // placeholder over the host file or directory bwrap left behind must not
+    // hit the creat() trap either.
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps the /dev/null stub of an absent deny path in force',
+      async () => {
+        // bwrap leaves the mount point behind as a mode-444 file on the host,
+        // so the write has to be preceded by a chmod: without the stub back
+        // on top, its owner may widen the mode and write through it.
+        const absent = join(W, '.secret')
+
+        const result = spawnSync(
+          await wrap(
+            [absent, PROJ],
+            [RO],
+            [AREA, W],
+            `sh -c 'echo BOOTED; chmod u+w ${absent}; echo pwned > ${absent}'`,
+          ),
+          { shell: true, encoding: 'utf8', timeout: 15000, cwd: BASE },
+        )
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(readFileSync(absent, 'utf8')).toBe('')
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps the empty-dir placeholder of an absent deny path in force',
+      async () => {
+        const placeholder = join(W, '.cfg')
+        const absent = join(placeholder, 'deep', 'x')
+
+        const result = spawnSync(
+          await wrap(
+            [absent, PROJ],
+            [RO],
+            [AREA, W],
+            `sh -c 'echo BOOTED; mkdir -p ${join(placeholder, 'deep')} && echo pwned > ${absent}'`,
+          ),
+          { shell: true, encoding: 'utf8', timeout: 15000, cwd: BASE },
+        )
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(existsSync(absent)).toBe(false)
+      },
+    )
   })
 
   it('keeps the bind for a deny reached through a symlinked spelling', async () => {
