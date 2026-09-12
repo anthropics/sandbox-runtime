@@ -124,9 +124,8 @@ function findSymlinkInPath(
       const stats = fs.lstatSync(nextPath)
       if (stats.isSymbolicLink()) {
         // Check if this symlink is within an allowed write path
-        const isWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            nextPath.startsWith(allowedPath + '/') || nextPath === allowedPath,
+        const isWithinAllowedPath = allowedWritePaths.some(allowedPath =>
+          isAtOrUnder(nextPath, allowedPath),
         )
         if (isWithinAllowedPath) {
           return nextPath
@@ -881,6 +880,16 @@ function isAbsenceErrno(err: unknown): boolean {
  * cannot bind a missing source and there is nothing to rename. One that
  * exists but cannot be inspected is still pinned, and if bwrap cannot bind it
  * either the sandbox does not start, which is where the deny loop lands too.
+ *
+ * Nothing is pinned when '/' is itself an allowed write root. Pins are
+ * spliced in beneath every other mount, and that root's own recursive
+ * `--bind / /` is one of them: it lands on top of every pin, so a directory
+ * "pinned" under it is not a mountpoint in the sandbox and renames as if it
+ * had no pin (measured: `mv` of one succeeds, and the swap-and-recreate the
+ * pin exists to stop goes through). Emitting them there would cost arguments
+ * and promise an EBUSY that does not happen. Splicing them above the allow
+ * binds instead is not an option: a pin on top of a write root makes the
+ * directory read-only, which is what putting them underneath avoids.
  */
 function ancestorPinArgs(
   seeds: Iterable<string>,
@@ -889,6 +898,7 @@ function ancestorPinArgs(
     isAllowedWriteRoot: (dir: string) => boolean
   },
 ): string[] {
+  if (writeRoots.isAllowedWriteRoot('/')) return []
   const pinDirs = new Set<string>()
   // Verdicts are seed-independent: a visited ancestor's chain is done.
   const visited = new Set<string>()
@@ -1101,21 +1111,26 @@ async function generateFilesystemArgs(
     const parent = canonicalForm(path.dirname(p))
     return `${parent === '/' ? '' : parent}/${path.basename(p)}`
   }
-  // Whether a canonical path lies inside the write allowlist. The deny
-  // pre-pass, the deny loop's --ro-bind gate and the ancestor-pin walk MUST
-  // share it: the pre-pass is only sound if it records exactly the
-  // directories the loop re-binds read-only (a recorded directory that is
-  // never re-bound read-only would suppress stubs unsafely; a re-bound
-  // directory missing from the record only costs an abort). allowedWritePaths
-  // entries are canonical (the allow loop drops a symlink-spelled one) and
-  // recorded with trailing slashes stripped. Deliberately not root-aware: an
-  // allowOnly of '/' contains only itself, so nothing is denied, stubbed or
-  // pinned beneath a writable root, as before.
+  // Whether a canonical path lies inside the write allowlist, and so
+  // whether it is denied, stubbed and pinned at all: a path outside it is
+  // left read-only by the initial --ro-bind / /. The deny pre-pass, the deny
+  // loop's --ro-bind gate and the ancestor-pin walk MUST share it: the
+  // pre-pass is only sound if it records exactly the directories the loop
+  // re-binds read-only (a recorded directory that is never re-bound read-only
+  // would suppress stubs unsafely; a re-bound directory missing from the
+  // record only costs an abort). allowedWritePaths entries are canonical (the
+  // allow loop drops a symlink-spelled one) and recorded with trailing
+  // slashes stripped.
+  //
+  // Containment is root-aware (isAtOrUnder) because '/' is a legal allowOnly
+  // entry that the allow loop binds writable: an `allowedPath + '/'` prefix
+  // test spells it '//' and matches nothing, so every deny no other allow
+  // entry covers would be judged outside the allowlist and silently lose its
+  // bind over a writable root. The ancestor pins are the one consumer that
+  // draws no conclusion from a '/' write root: see ancestorPinArgs.
   const isWithinAnyAllowedWritePath = (candidatePath: string): boolean =>
-    allowedWritePaths.some(
-      allowedPath =>
-        candidatePath === allowedPath ||
-        candidatePath.startsWith(allowedPath + '/'),
+    allowedWritePaths.some(allowedPath =>
+      isAtOrUnder(candidatePath, allowedPath),
     )
   const isAllowedWriteRoot = (candidatePath: string): boolean =>
     allowedWritePaths.includes(candidatePath)
@@ -1497,14 +1512,48 @@ async function generateFilesystemArgs(
       for (const denyDir of readOnlyDenyDirs) {
         if (!isStrictlyUnder(candidate, denyDir)) continue
         if (coveringDirIsUnsafe(denyDir)) {
-          // A vetoed '/' neither covers a path nor disqualifies an inner
-          // recorded directory: everything lies beneath it, so it would
-          // veto every skip and stub each absent mandatory-deny path of a
-          // write-denied cwd after that cwd's own bind — the startup abort.
-          // Its descendants are decided by their own recorded directories,
-          // as before, when the string-prefix filter matched '/' only for a
-          // path directly beneath it and the vetoes never fired for it.
-          if (denyDir === '/') continue
+          if (denyDir === '/') {
+            // A vetoed '/' does not disqualify an inner recorded directory:
+            // everything lies beneath it, so it would veto every skip and
+            // stub each absent mandatory-deny path of a write-denied cwd
+            // after that cwd's own bind — the startup abort. Its descendants
+            // are decided by their own recorded directories.
+            //
+            // It does still COVER a candidate that nothing beneath it can
+            // re-open, and only then: with the write allowlist exactly '/'
+            // (veto (i) silent) and the candidate outside every predicted
+            // read-deny tmpfs. Its own --ro-bind / / then holds the whole
+            // tree read-only from where it is emitted, and the one
+            // host-backed writable emission after it is what a re-applied
+            // tmpfs restores — a write path lying inside that tmpfs. Without
+            // this the shape `allowOnly: ['/']` with `denyWithinAllow: ['/']`
+            // stubs each absent cwd dotfile on the read-only root it just
+            // mounted, which is the startup abort, and it reaches that shape
+            // as soon as any read policy is configured at all (the library's
+            // own /etc/ssh/ssh_config.d entry is a tmpfs under '/'). An
+            // allowed write path strictly beneath '/' is left to veto the
+            // skip as before; it cannot make the candidate creatable here,
+            // but narrowing this to the one shape that needs it keeps every
+            // other verdict as it was. An underivable prediction proves
+            // nothing and keeps the stub.
+            const {
+              allowedWritePathsBothForms,
+              prospectiveReadDenyTmpfsDirsBothForms,
+              unreliable,
+            } = getStubSkipVetoInputs()
+            if (
+              !unreliable &&
+              !allowedWritePathsBothForms.some(writePath =>
+                isStrictlyUnder(writePath, '/'),
+              ) &&
+              !prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
+                isAtOrUnder(candidate, tmpfsDir),
+              )
+            ) {
+              covered = true
+            }
+            continue
+          }
           return false
         }
         covered = true

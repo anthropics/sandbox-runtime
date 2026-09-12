@@ -27,6 +27,23 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     }
   })
 
+  /** Occurrences of one whole `<flag> <source> <dest>` argv triple. */
+  function countBinds(
+    command: string,
+    flag: string,
+    source: string,
+    dest: string,
+  ): number {
+    const argv = command.split(/\s+/)
+    let found = 0
+    for (let i = 0; i + 2 < argv.length; i++) {
+      if (argv[i] === flag && argv[i + 1] === source && argv[i + 2] === dest) {
+        found++
+      }
+    }
+    return found
+  }
+
   function tempTree(files: Record<string, string>): string {
     const proj = realpathSync(mkdtempSync(join(tmpdir(), 'mount-plan-')))
     created.push(proj)
@@ -453,28 +470,46 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(secIdx).toBeGreaterThan(pubIdx)
   })
 
-  it('denies, stubs and pins nothing beneath a writable root', async () => {
+  it('denies beneath a writable root, and pins nothing under it', async () => {
+    // '/' is a legal allowOnly entry, and the allow loop binds it writable,
+    // so the denies inside it apply: a `root + '/'` prefix test spells '//'
+    // and matches nothing, which silently dropped every deny and every
+    // mandatory deny over a root already bound read-write.
+    //
+    // The pins are the one consumer that cannot follow. They are spliced in
+    // beneath every other mount, and this root's own recursive --bind / / is
+    // one of them, landing on top: a directory pinned under it is not a
+    // mountpoint and renames as if unpinned. They are skipped instead of
+    // emitted as arguments that promise an EBUSY that does not happen.
     const wrapped = await wrapCommandWithSandboxLinux({
       ...baseParams,
       writeConfig: { allowOnly: ['/'], denyWithinAllow: [] },
     })
     const cwd = process.cwd()
     expect(wrapped).toContain('--bind / /')
+    expect(wrapped).toContain(` ${join(cwd, '.bashrc')}`)
     expect(wrapped).not.toContain(`--ro-bind ${dirname(cwd)} ${dirname(cwd)}`)
     expect(wrapped).not.toContain(`--ro-bind ${cwd} ${cwd}`)
-    expect(wrapped).not.toContain(` ${join(cwd, '.bashrc')}`)
   })
 
   it('stubs no absent path after a read-only root when the root is both allowed and denied', async () => {
     // bwrap cannot create a stub's mount point on a read-only '/', so one
-    // emitted here stops the sandbox from starting.
+    // emitted here stops the sandbox from starting. Now that a '/' write
+    // root contains the paths beneath it, the deny of '/' is emitted as a
+    // second, read-only bind after the allow's writable one, and that is
+    // what makes the whole tree uncreatable: the absent cwd dotfiles are
+    // covered by it and need no stub of their own. The read-denied directory
+    // is the exception the guard keeps — its tmpfs is writable inside.
     const proj = tempTree({ 'hidden/x': 'x' })
     const wrapped = await wrapCommandWithSandboxLinux({
       ...baseParams,
       readConfig: { denyOnly: [join(proj, 'hidden')], allowWithinDeny: [] },
       writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
     })
+    // Two: the base root mount, then the deny bind that holds it read-only.
+    expect(countBinds(wrapped, '--ro-bind', '/', '/')).toBe(2)
     expect(wrapped).toContain(`--tmpfs ${join(proj, 'hidden')} `)
     expect(wrapped).not.toContain(`/dev/null ${join(process.cwd(), '.bashrc')}`)
+    expect(wrapped).not.toContain(`--ro-bind ${process.cwd()} ${process.cwd()}`)
   })
 })

@@ -414,6 +414,64 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind ${secret} ${secret}`)
   })
 
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'starts, and still denies, under a write root of "/"',
+    async () => {
+      // A '/' write root contains everything, so the denies inside it apply
+      // where a `root + '/'` prefix test matched nothing and dropped them
+      // all. Both shapes have to start: with the root allowed only, the
+      // absent cwd dotfiles are stubbed on a writable tree; with the root
+      // denied as well, its second read-only bind covers them and they are
+      // not stubbed, because a stub's mount point cannot be created there.
+      process.chdir(PROJ)
+      const dotfile = join(PROJ, '.gitconfig')
+
+      const probe = `echo hello; (echo x > ${dotfile}) 2>/dev/null && echo WROTE || echo REFUSED`
+
+      // Allowed only: the tree is writable, so the absent dotfile needs its
+      // own stub. bwrap makes that stub's mount point on the host, so the
+      // path existing afterwards says nothing; the refused write does.
+      const writable = await wrapCommandWithSandboxLinux({
+        command: probe,
+        needsNetworkRestriction: false,
+        writeConfig: { allowOnly: ['/'], denyWithinAllow: [] },
+      })
+      expect(writable).toContain(`--ro-bind /dev/null ${dotfile}`)
+      const ran = spawnSync(writable, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: PROJ,
+      })
+      expect(ran.stderr ?? '').not.toContain('bwrap:')
+      expect(ran.stdout).toContain('hello')
+      expect(ran.stdout).toContain('REFUSED')
+      cleanupBwrapMountPoints({ force: true })
+      expect(existsSync(dotfile)).toBe(false)
+
+      // Allowed and denied: the deny's second, read-only bind of '/' covers
+      // the dotfile, so no stub is emitted — one there would be a mount
+      // point bwrap has to create on that read-only root, and the sandbox
+      // would not start.
+      const denied = await wrapCommandWithSandboxLinux({
+        command: probe,
+        needsNetworkRestriction: false,
+        writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
+      })
+      expect(denied).not.toContain(`--ro-bind /dev/null ${dotfile}`)
+      const ranDenied = spawnSync(denied, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: PROJ,
+      })
+      expect(ranDenied.stderr ?? '').not.toContain('bwrap:')
+      expect(ranDenied.stdout).toContain('hello')
+      expect(ranDenied.stdout).toContain('REFUSED')
+      expect(existsSync(dotfile)).toBe(false)
+    },
+  )
+
   it('keeps every stub when the read-deny prediction cannot be derived', async () => {
     // The tmpfs dirs the vetoes are judged against are predicted from the
     // same readDenyEntries() the denyRead loop uses, and listing the root
