@@ -110,6 +110,40 @@ function parseControlFd(value: string): number {
   return fd
 }
 
+/**
+ * stdio for the sandboxed command: the three standard streams, plus
+ * /dev/null over the control fd's slot.
+ *
+ * Nothing but the close-on-exec flag keeps an inherited descriptor out of
+ * an exec'd command, and Node sets that flag at startup for descriptors
+ * 0-15 unconditionally but then stops at the first closed number
+ * (uv_disable_stdio_inheritance), so `--control-fd 20` with 16-19 closed
+ * leaves the control channel live inside the sandbox: the command can read
+ * updates before srt does and, when the caller's end is a socket or an
+ * O_RDWR fifo, write a config of its own for srt to apply. Displacing the
+ * slot covers every kind of descriptor, which re-opening the fd privately
+ * and closing srt's own copy does not — a socket cannot be re-opened that
+ * way (ENXIO). 'ignore' past fd 2 leaves a slot as it is rather than
+ * closing it, so the slot needs a descriptor to displace the fd with.
+ */
+function sandboxedStdio(
+  controlFd: number | undefined,
+): Array<'inherit' | 'ignore' | number> {
+  const stdio: Array<'inherit' | 'ignore' | number> = [
+    'inherit',
+    'inherit',
+    'inherit',
+  ]
+  if (controlFd === undefined) {
+    return stdio
+  }
+  while (stdio.length < controlFd) {
+    stdio.push('ignore')
+  }
+  stdio.push(fs.openSync('/dev/null', 'r'))
+  return stdio
+}
+
 async function main(): Promise<void> {
   const program = new Command()
 
@@ -404,7 +438,7 @@ async function main(): Promise<void> {
               await SandboxManager.wrapWithSandbox(command)
             child = spawn(sandboxedCommand, {
               shell: true,
-              stdio: 'inherit',
+              stdio: sandboxedStdio(controlFd),
             })
           }
 
