@@ -563,6 +563,41 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     },
   )
 
+  it('enforces denyWithinAllow under a glob-character trailing-slash allowOnly spelling', async () => {
+    // normalizePathForSandbox leaves the trailing slash on any spelling it
+    // takes for a glob, so a literal directory named with glob characters is
+    // the one shape the allow loop's own strip still has to handle: recorded
+    // as '<dir>/', it defeats every `allowedPath + '/'` comparison — starting
+    // with the gate that decides whether a deny is inside the allowlist at
+    // all, which would drop the deny and leave the tree writable.
+    const area = join(BASE, '[id]')
+    const secrets = join(area, 'secrets')
+    mkdirSync(secrets, { recursive: true })
+    writeFileSync(join(secrets, 'token.txt'), 'x\n')
+
+    const command = await wrap([secrets], [], [`${area}/`])
+
+    expect(command).toContain(`--bind '${area}' '${area}'`)
+    expect(command).toContain(`--ro-bind '${secrets}' '${secrets}'`)
+  })
+
+  it('denies a glob-character read-deny spelled with a trailing slash', async () => {
+    // Same exemption on the read side. stat() of '<file>/' is ENOTDIR, which
+    // read as "the entry is not there" and dropped the deny outright —
+    // silently, and only for this spelling; the directory form entered the
+    // tmpfs prediction as '<dir>/', which no '<dir>/' prefix test can match.
+    const secretFile = join(PROJ, '[id].env')
+    writeFileSync(secretFile, 'SECRET=1\n')
+    const secretDir = join(PROJ, '[id]')
+    mkdirSync(secretDir)
+    writeFileSync(join(secretDir, 'token.txt'), 'x\n')
+
+    const command = await wrap([], [`${secretFile}/`, `${secretDir}/`])
+
+    expect(command).toContain(`--ro-bind /dev/null '${secretFile}'`)
+    expect(command).toContain(`--tmpfs '${secretDir}'`)
+  })
+
   it('re-applies a denyWithinAllow bind under a trailing-slash allow re-bound over a denyRead tmpfs', async () => {
     // The emission filter drops deny binds hidden by a denyRead tmpfs
     // UNLESS a write re-bind re-exposes them (reExposedByWriteBind). That

@@ -996,16 +996,24 @@ class SandboxMountView {
  * What the read section mounts for one denyRead entry: the entry itself, or,
  * when it cannot be inspected (a parent that is readable but not searchable
  * hides whether it exists), the nearest ancestor that can, standing in for
- * it. Undefined when the entry is not there.
+ * it (`isStandIn`). Undefined when the entry is not there.
+ *
+ * The trailing slash is dropped first. normalizePathForSandbox keeps one on
+ * any spelling it takes for a glob, so a literal path named with glob
+ * characters arrives with it — and stat() of '<file>/' is ENOTDIR, which
+ * reads as "not there" and silently drops the deny, while '<dir>/' would
+ * enter the prediction in a spelling no `<dir>/` prefix test can match.
  */
 function readDenyTargetOf(
   entry: string,
-): { path: string; isDirectory: boolean } | undefined {
-  for (let candidate = entry; ; candidate = path.dirname(candidate)) {
+): { path: string; isDirectory: boolean; isStandIn: boolean } | undefined {
+  const named = entry.replace(/\/+$/, '') || '/'
+  for (let candidate = named; ; candidate = path.dirname(candidate)) {
     try {
       return {
         path: candidate,
         isDirectory: fs.statSync(candidate).isDirectory(),
+        isStandIn: candidate !== named,
       }
     } catch (err) {
       if (isAbsenceErrno(err) || candidate === '/') return undefined
@@ -1033,7 +1041,7 @@ function readDenyUnitsOf(
       )
       continue
     }
-    const isStandIn = target.path !== entry
+    const isStandIn = target.isStandIn
     if (isStandIn) {
       logForDebugging(
         `[Sandbox Linux] Read deny path ${entry} cannot be inspected; hiding ${target.path} instead`,
@@ -1215,15 +1223,17 @@ async function generateFilesystemArgs(
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
-      // Trailing slashes are stripped HERE, at the single point where allow
-      // paths are bound and recorded, because every downstream comparison —
-      // the deny loop's within-allowlist gate, findSymlinkInPath's mask
-      // scoping, the emission filter's re-expose check, the denyRead
-      // re-bind and its allowRead skip, and the stub-skip vetoes — matches
-      // by `allowedPath + '/'` prefix, which a preserved trailing slash
-      // ('<dir>//') silently defeats. bwrap binds 'dir' and 'dir/'
-      // identically, so normalizing the recorded spelling fixes every
-      // consumer at once instead of per-predicate. ('/' itself is kept.)
+      // normalizePathForSandbox already strips a trailing slash from every
+      // spelling it does not take for a glob; this strip covers the ones it
+      // exempts — a literal directory named with glob characters, spelled
+      // '<dir>/[id]/'. Allow paths are recorded slash-free because every
+      // downstream comparison — the deny loop's within-allowlist gate,
+      // findSymlinkInPath's mask scoping, the emission filter's re-expose
+      // check, the denyRead re-bind and its allowRead skip, and the stub-skip
+      // vetoes — matches by `allowedPath + '/'` prefix, which '<dir>//'
+      // silently defeats. bwrap binds 'dir' and 'dir/' identically, so
+      // normalizing the recorded spelling fixes every consumer at once
+      // instead of per-predicate. ('/' itself is kept.)
       const normalizedPath =
         normalizePathForSandbox(pathPattern).replace(/\/+$/, '') || '/'
 
@@ -1249,12 +1259,8 @@ async function generateFilesystemArgs(
       // This could unexpectedly expose paths the user didn't intend to allow
       try {
         const resolvedPath = fs.realpathSync(normalizedPath)
-        // Trim trailing slashes before comparing: realpathSync never returns
-        // a trailing slash, but normalizedPath may have one, which would cause
-        // a false mismatch and incorrectly treat the path as a symlink.
-        const normalizedForComparison = normalizedPath.replace(/\/+$/, '')
         if (
-          resolvedPath !== normalizedForComparison &&
+          resolvedPath !== normalizedPath &&
           isSymlinkOutsideBoundary(normalizedPath, resolvedPath)
         ) {
           logForDebugging(
