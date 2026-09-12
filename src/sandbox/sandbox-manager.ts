@@ -46,6 +46,7 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
+  linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
 import {
   wrapCommandWithSandboxMacOS,
@@ -692,16 +693,16 @@ async function initialize(
     logForDebugging('Started macOS sandbox log monitor')
   }
   if (enableLogMonitor && getPlatform() === 'linux') {
-    // The write configuration the wrapper itself is built from, spelled the
-    // way the backend spells it: getFsWriteConfig() folds in the default
-    // write paths and drops the glob entries bwrap cannot take, and
-    // normalizePathForSandbox expands `~` and relative spellings and
-    // resolves symlinks, exactly as wrapCommandWithSandboxLinux does before
-    // it binds. The monitor compares these against paths the kernel
-    // reported, so an unexpanded entry matches none of them: handed
-    // `allowWrite: ['~/proj']` raw, every write beneath it was recorded as a
-    // violation although bwrap allowed it, and a `denyWrite: ['~/.ssh']`
-    // inside an allowed tree was not recorded although bwrap refused it.
+    // The monitor compares paths the kernel reported, so its lists are
+    // expanded the way the wrapper expands them (getFsWriteConfig folds in
+    // the default write paths and drops the globs bwrap cannot take;
+    // normalizePathForSandbox resolves `~`, relative spellings and symlinks),
+    // plus the built-in write denies the wrapper always applies.
+    // It does not reproduce the wrapper's existence and boundary-symlink
+    // filters, nor the ripgrep scan for nested dangerous paths; and it still
+    // reports writes bwrap permits through `--dev`, `--proc` and the tmpfs
+    // over each read-denied directory. Started once, so both lists are fixed
+    // at the cwd and configuration of this call.
     const monitoredWrites = getFsWriteConfig()
     linuxMonitor = startLinuxSandboxViolationMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
@@ -712,9 +713,12 @@ async function initialize(
         allowWritePaths: monitoredWrites.allowOnly.map(p =>
           normalizePathForSandbox(p),
         ),
-        denyWritePaths: monitoredWrites.denyWithinAllow.map(p =>
-          normalizePathForSandbox(p),
-        ),
+        denyWritePaths: [
+          ...monitoredWrites.denyWithinAllow.map(p =>
+            normalizePathForSandbox(p),
+          ),
+          ...linuxGetCwdMandatoryDenyPaths(getAllowGitConfig()),
+        ],
         ignoreViolations: config.ignoreViolations,
         resolveCommandText,
       },

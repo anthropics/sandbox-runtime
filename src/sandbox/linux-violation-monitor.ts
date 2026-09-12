@@ -11,11 +11,11 @@ import type {
   SandboxViolationEvent,
 } from './macos-sandbox-utils.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
-import { decodeSandboxedCommand } from './sandbox-utils.js'
 import {
-  sanitizeUnregisteredCommandKey,
-  shouldIgnoreViolation,
-} from './sandbox-violation-store.js'
+  decodeSandboxedCommand,
+  MAX_ENCODED_COMMAND_BYTES,
+} from './sandbox-utils.js'
+import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 export interface LinuxViolationMonitorOptions {
   /**
@@ -29,11 +29,13 @@ export interface LinuxViolationMonitorOptions {
   /** Paths bwrap re-mounts read-only inside an allowWrite region. */
   denyWritePaths: string[]
   ignoreViolations?: IgnoreViolationsConfig
-  /** Map a decoded attribution key to the command text it represents,
-   *  before ignoreViolations matching and before the event's `command` is
-   *  set. Only the manager holds the registry that can do that; omitted,
-   *  the key is treated as the untrusted bytes it arrived as. */
-  resolveCommandText?: (decodedKey: string) => string
+  /** Map a decoded attribution key to the command text it represents, before
+   *  ignoreViolations matching and before the event's `command` is set. Only
+   *  the manager holds the registry that can do that, so it is required
+   *  rather than defaulted: a caller with no registry passes
+   *  `sanitizeUnregisteredCommandKey`, which treats the key as the untrusted
+   *  bytes it arrived as. */
+  resolveCommandText: (decodedKey: string) => string
 }
 
 export interface LinuxViolationMonitor {
@@ -85,7 +87,7 @@ export function startLinuxSandboxViolationMonitor(
     allowWritePaths,
     denyWritePaths,
     ignoreViolations,
-    resolveCommandText = sanitizeUnregisteredCommandKey,
+    resolveCommandText,
   } = opts
 
   // sun_path is 108 bytes; mkdtemp under tmpdir() keeps us well under.
@@ -96,14 +98,10 @@ export function startLinuxSandboxViolationMonitor(
     p === prefix || p.startsWith(prefix.endsWith('/') ? prefix : prefix + '/')
 
   /** A write attempt is a violation iff bwrap would refuse it: outside every
-   *  allowWrite prefix, or back inside a denyWrite carve-out. apply-seccomp
-   *  resolves relative paths against the tracee's cwd/dirfd before emitting,
-   *  so events arrive absolute; the joined form may still contain ./ and
-   *  ../ segments, which must be collapsed before prefix comparison. */
+   *  allowWrite prefix, or back inside a denyWrite carve-out. */
   const isDenied = (p: string): boolean => {
-    const norm = posix.normalize(p)
-    if (denyWritePaths.some(d => underPrefix(norm, d))) return true
-    return !allowWritePaths.some(a => underPrefix(norm, a))
+    if (denyWritePaths.some(d => underPrefix(p, d))) return true
+    return !allowWritePaths.some(a => underPrefix(p, a))
   }
 
   const handleEvent = (
@@ -121,7 +119,14 @@ export function startLinuxSandboxViolationMonitor(
     // resolution failed upstream (or an old producer): this channel is
     // best-effort telemetry, so drop rather than guess.
     if (!ev.path.startsWith('/')) return
-    if (!isDenied(ev.path)) return
+    // apply-seccomp resolves relative paths against the tracee's cwd/dirfd
+    // before emitting, so events arrive absolute; the joined form may still
+    // contain ./ and ../ segments. Collapse them ONCE, here: the policy
+    // check, the ignoreViolations match and the recorded line must all speak
+    // of the same path, or a `..` detour suppresses a record it did not
+    // match, or hides which file was written.
+    const observedPath = posix.normalize(ev.path)
+    if (!isDenied(observedPath)) return
 
     let command: string | undefined
     if (encodedCommand) {
@@ -131,10 +136,10 @@ export function startLinuxSandboxViolationMonitor(
         /* ignore */
       }
     }
-    if (shouldIgnoreViolation(ev.path, command, ignoreViolations)) return
+    if (shouldIgnoreViolation(observedPath, command, ignoreViolations)) return
 
     const violation: SandboxViolationEvent = {
-      line: `deny ${ev.syscall ?? 'syscall'} ${ev.path}`,
+      line: `deny ${ev.syscall ?? 'syscall'} ${observedPath}`,
       command,
       encodedCommand,
       timestamp: new Date(),
@@ -160,13 +165,22 @@ export function startLinuxSandboxViolationMonitor(
       } catch {
         return
       }
+      // The socket is writable from inside the sandbox, so the attribution
+      // field is attacker-chosen bytes of attacker-chosen length. One longer
+      // than a carrier this process mints can hold attributes nothing: drop
+      // it and keep the violation itself, unattributed.
+      const attribution =
+        ev.encodedCommand !== undefined &&
+        Buffer.byteLength(ev.encodedCommand) <= MAX_ENCODED_COMMAND_BYTES
+          ? ev.encodedCommand
+          : undefined
       // First line from each apply-seccomp instance is the encodedCommand
       // header; subsequent lines may also carry it but the header is
       // authoritative for this connection.
-      if (ev.encodedCommand && encodedCommand === undefined) {
-        encodedCommand = ev.encodedCommand
+      if (attribution && encodedCommand === undefined) {
+        encodedCommand = attribution
       }
-      handleEvent(ev, encodedCommand ?? ev.encodedCommand)
+      handleEvent(ev, encodedCommand ?? attribution)
     })
     conn.on('error', () => rl.close())
     conn.on('close', () => rl.close())

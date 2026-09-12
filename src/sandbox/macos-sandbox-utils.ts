@@ -16,10 +16,7 @@ import {
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
-import {
-  sanitizeUnregisteredCommandKey,
-  shouldIgnoreViolation,
-} from './sandbox-violation-store.js'
+import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 import type {
   FsReadRestrictionConfig,
@@ -1392,14 +1389,14 @@ export function wrapCommandWithSandboxMacOS(
  */
 export function startMacOSSandboxLogMonitor(
   callback: SandboxViolationCallback,
-  ignoreViolations?: IgnoreViolationsConfig,
-  /** Map a decoded attribution key to the command text it represents,
-   *  before ignoreViolations matching and before the event's `command` is
-   *  set. Only the manager holds the registry that can do that; omitted,
-   *  the key is treated as the untrusted bytes it arrived as. */
-  resolveCommandText: (
-    decodedKey: string,
-  ) => string = sanitizeUnregisteredCommandKey,
+  ignoreViolations: IgnoreViolationsConfig | undefined,
+  /** Map a decoded attribution key to the command text it represents, before
+   *  ignoreViolations matching and before the event's `command` is set. Only
+   *  the manager holds the registry that can do that, so it is required
+   *  rather than defaulted: a caller with no registry passes
+   *  `sanitizeUnregisteredCommandKey`, which treats the key as the untrusted
+   *  bytes it arrived as. */
+  resolveCommandText: (decodedKey: string) => string,
 ): () => void {
   // Pre-compile regex patterns for better performance
   const cmdExtractRegex = /CMD64_(.+?)_END/
