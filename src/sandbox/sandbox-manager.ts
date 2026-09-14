@@ -18,6 +18,7 @@ import {
 import {
   certThumbprint,
   createMitmCA,
+  createMitmCAAsync,
   CRL_PATH,
   disposeMitmCA,
   type MitmCA,
@@ -664,7 +665,8 @@ async function initialize(
   // srt-win and fetched user status — the persistent CA is
   // generated-if-absent under windowsStateDir()/ca and
   // trusted in the sandbox user's Root store, then loaded here.
-  // Explicit paths (or non-Windows) go straight to createMitmCA.
+  // Explicit paths (or non-Windows) go straight to createMitmCAAsync, which
+  // generates an ephemeral CA's RSA key off the event loop.
   const tlsTerminate = runtimeConfig.network.tlsTerminate
   const useWindowsPersistentCa =
     getPlatform() === 'windows' &&
@@ -673,7 +675,7 @@ async function initialize(
     !tlsTerminate.caKeyPath
   mitmCA =
     tlsTerminate && !useWindowsPersistentCa
-      ? createMitmCA(tlsTerminate)
+      ? await createMitmCAAsync(tlsTerminate)
       : undefined
 
   // Check dependencies

@@ -13,8 +13,10 @@ import forge from 'node-forge'
 import {
   certThumbprint,
   createMitmCA,
+  createMitmCAAsync,
   disposeMitmCA,
   generateCa,
+  generateCaAsync,
   signCertificateNative,
   validateCaPair,
 } from '../../src/sandbox/mitm-ca.js'
@@ -155,7 +157,7 @@ describe('mitm-ca: ephemeral generation', () => {
     // RSASSA-PKCS1-v1_5 is deterministic, so signing the same TBSCertificate
     // with the same key via native crypto and via node-forge's pure-JS RSA
     // must produce the same signature bytes — and therefore the same PEM.
-    // This is the equivalence guarantee that lets generateEphemeralCA(),
+    // This is the equivalence guarantee that lets ephemeral-CA generation,
     // generateEmptyCrl(), and mintLeafCert() use native crypto for the RSA
     // private-key operation without changing what ends up on the wire.
     const ca = createMitmCA({})
@@ -223,7 +225,7 @@ describe('mitm-ca: generateCa + validateCaPair', () => {
 
   test('generateCa: defaults match the ephemeral CA (cn + 825d)', () => {
     // The defaults are also what the ephemeral in-process CA uses, so
-    // this row pins that generateEphemeralCA's refactor to call
+    // this row pins that the ephemeral path's refactor to call
     // generateCa() didn't change its output shape.
     const d = generateCa()
     const cert = forge.pki.certificateFromPem(d.certPem)
@@ -264,6 +266,140 @@ describe('mitm-ca: generateCa + validateCaPair', () => {
     const v = validateCaPair(forge.pki.certificateToPem(c), g.keyPem)
     expect(v.ok).toBe(false)
     if (!v.ok) expect(v.reason).toMatch(/notBefore .* is in the future/)
+  })
+})
+
+describe('mitm-ca: generateCaAsync', () => {
+  const opts = { cn: 'srt-test-generateCaAsync', validityDays: 7 }
+
+  // Everything but the key-dependent bits (modulus, SKI, signature, serial).
+  function fields(c: forge.pki.Certificate) {
+    const pub = c.publicKey as forge.pki.rsa.PublicKey
+    type Ext = { name: string; critical?: boolean; value: string }
+    return {
+      version: c.version,
+      sigAlg: c.siginfo.algorithmOid,
+      subject: c.subject.attributes.map(a => [a.name, a.value]),
+      issuer: c.issuer.attributes.map(a => [a.name, a.value]),
+      extensions: (c.extensions as Ext[]).map(e => ({
+        name: e.name,
+        critical: e.critical ?? false,
+        value: e.name === 'subjectKeyIdentifier' ? e.value.length : e.value,
+      })),
+      modulusBits: pub.n.bitLength(),
+      exponent: pub.e.intValue(),
+      serialShape: /^[0-7][0-9a-f]{31}$/.test(c.serialNumber),
+    }
+  }
+
+  test('pair validates and matches generateCa field-for-field', async () => {
+    const a = await generateCaAsync(opts)
+    const s = generateCa(opts)
+    const v = validateCaPair(a.certPem, a.keyPem)
+    expect(v.ok).toBe(true)
+
+    const ac = forge.pki.certificateFromPem(a.certPem)
+    const sc = forge.pki.certificateFromPem(s.certPem)
+    expect(fields(ac)).toEqual(fields(sc))
+    expect(fields(ac).modulusBits).toBe(2048)
+    expect(fields(ac).exponent).toBe(0x10001)
+    // Validity is computed at call time; the two calls are ms apart.
+    for (const k of ['notBefore', 'notAfter'] as const) {
+      expect(
+        Math.abs(ac.validity[k].getTime() - sc.validity[k].getTime()),
+      ).toBeLessThan(60_000)
+    }
+    // Same key PEM encoding (PKCS#1) as the sync variant.
+    expect(a.keyPem.split('\n')[0]).toBe(s.keyPem.split('\n')[0])
+    // The returned forge objects are the ones the PEMs encode.
+    expect(forge.pki.certificateToPem(a.cert)).toBe(a.certPem)
+    expect(a.key.n.equals((ac.publicKey as forge.pki.rsa.PublicKey).n)).toBe(
+      true,
+    )
+    // Self-signed: forge's verifier accepts the cert against itself.
+    expect(ac.verify(ac)).toBe(true)
+  })
+
+  test('defaults match generateCa (cn + 825d)', async () => {
+    const cert = forge.pki.certificateFromPem((await generateCaAsync()).certPem)
+    expect(cert.subject.getField('CN').value).toBe(
+      'sandbox-runtime ephemeral CA',
+    )
+    const days =
+      (cert.validity.notAfter.getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+    expect(Math.round(days)).toBe(825)
+  })
+
+  test('keeps the event loop running while the key is generated', async () => {
+    // generateKeyPairSync would hold the loop for the whole keygen, so a
+    // 1 ms interval could not fire until it returned. The async variant
+    // generates on the thread pool; the interval keeps ticking.
+    let ticks = 0
+    const timer = setInterval(() => ticks++, 1)
+    try {
+      await generateCaAsync()
+    } finally {
+      clearInterval(timer)
+    }
+    expect(ticks).toBeGreaterThan(0)
+  })
+})
+
+describe('mitm-ca: createMitmCAAsync', () => {
+  test('ephemeral: same shape as createMitmCA({})', async () => {
+    const ca = await createMitmCAAsync({})
+    try {
+      expect(ca.ephemeral).toBe(true)
+      expect(ca.certPath).toContain('srt-ca-')
+      expect(readFileSync(ca.certPath, 'utf8')).toBe(ca.certPem)
+      expect(readFileSync(ca.keyPath, 'utf8')).toBe(ca.keyPem)
+      expect(validateCaPair(ca.certPem, ca.keyPem).ok).toBe(true)
+      expect(ca.cert.subject.getField('CN').value).toBe(
+        'sandbox-runtime ephemeral CA',
+      )
+      expect(
+        readFileSync(ca.trustBundlePath, 'utf8').startsWith(ca.certPem.trim()),
+      ).toBe(true)
+      expect(ca.crlDer.length).toBeGreaterThan(0)
+      const leaf = mintLeafCert(ca, 'example.com')
+      expect(leaf.certPem).toContain('-----BEGIN CERTIFICATE-----')
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('supplied CA: loads the same pair as createMitmCA', async () => {
+    const ca = await createMitmCAAsync({
+      caCertPath: certPath,
+      caKeyPath: keyPath,
+    })
+    try {
+      expect(ca.ephemeral).toBe(false)
+      expect(ca.certPem).toBe(certPem)
+      expect(ca.keyPem).toBe(keyPem)
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('rejects with the same errors createMitmCA throws', async () => {
+    // Message of the rejection, or undefined if the promise resolved.
+    const rejection = (p: Promise<unknown>) =>
+      p.then(
+        () => undefined,
+        (e: unknown) => (e as Error).message,
+      )
+    expect(
+      await rejection(createMitmCAAsync({ caCertPath: certPath })),
+    ).toMatch(/must be provided together/)
+    expect(
+      await rejection(
+        createMitmCAAsync({
+          caCertPath: join(tmpdir(), 'srt-nope.crt'),
+          caKeyPath: keyPath,
+        }),
+      ),
+    ).toMatch(/tlsTerminate\.caCertPath: cannot read .* \(ENOENT\)/)
   })
 })
 
