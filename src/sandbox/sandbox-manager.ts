@@ -88,7 +88,12 @@ import {
   sanitizeViolationText,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
-import { createSystemLogViolationSink } from './system-log-violation-sink.js'
+import {
+  createSystemLogViolationSink,
+  tagSystemLogMessage,
+  writeSystemLogLine,
+} from './system-log-violation-sink.js'
+import { getPackageVersion } from '../utils/package-version.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
 import type { GetBodySubstitutions } from './body-substitution.js'
 import {
@@ -701,6 +706,24 @@ async function initialize(
         }
       })
     }
+  }
+  // One line per session so a reader of the log stream can tell which srt
+  // build produced the denials that follow. Same opt-in as the sink: it is
+  // the "I am watching the system log" switch.
+  if (config.logViolationsToSystemLog) {
+    writeSystemLogLine(
+      tagSystemLogMessage(
+        `srt startup version=${getPackageVersion()} pid=${process.pid}`,
+        process.platform,
+      ),
+      {
+        onError: err =>
+          logForDebugging(
+            `[Sandbox System Log] startup line not written: ${err.message}`,
+            { level: 'warn' },
+          ),
+      },
+    )
   }
 
   // Register cleanup handlers first time

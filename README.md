@@ -772,6 +772,12 @@ srt proxy deny network-outbound api.example.com:443 (host is not on the allow li
 
 Seatbelt denials are not forwarded (the kernel already logs them), nothing is written to stderr, and events are dropped rather than queued if `logger` processes pile up.
 
+With the option enabled srt also writes one line per session at initialization, so the stream shows which build produced the denials that follow:
+
+```
+srt startup version=0.0.75 pid=48213 _SBX
+```
+
 ### Advanced: Bring Your Own Proxy
 
 For more sophisticated network filtering, you can configure the sandbox to use your own proxy instead of the built-in ones. This enables:
