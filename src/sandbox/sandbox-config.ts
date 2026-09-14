@@ -1091,6 +1091,15 @@ export const SandboxRuntimeConfigSchema = z
           'network restrictions), and can script running apps subject to TCC automation consent. ' +
           'Default: false.',
       ),
+    logViolationsToSystemLog: z
+      .boolean()
+      .optional()
+      .describe(
+        'Forward sandbox violations that have no native log line - proxy denials on macOS and Linux, ' +
+          'seccomp denials on Linux - to the system log via logger(1) (macOS unified log, Linux syslog/journald). ' +
+          'Seatbelt denials are skipped because the kernel already logs them. Nothing is written to stderr. ' +
+          'Default: false.',
+      ),
     ripgrep: RipgrepConfigSchema.optional().describe(
       'Custom ripgrep configuration (default: { command: "rg" })',
     ),

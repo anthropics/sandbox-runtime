@@ -105,11 +105,19 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
   return [...new Set(denyPaths)]
 }
 
+/**
+ * Which enforcement layer produced a violation. `seatbelt` denials are also
+ * written to the macOS unified log by the kernel; `seccomp` and `proxy`
+ * denials are decided inside srt and have no native log line.
+ */
+export type SandboxViolationSource = 'seatbelt' | 'seccomp' | 'proxy'
+
 export interface SandboxViolationEvent {
   line: string
   command?: string
   encodedCommand?: string
   timestamp: Date
+  source?: SandboxViolationSource
 }
 
 export type SandboxViolationCallback = (
@@ -1460,6 +1468,7 @@ export function startMacOSSandboxLogMonitor(
       command,
       encodedCommand,
       timestamp: new Date(), // We could parse the timestamp from the log but this feels more reliable
+      source: 'seatbelt',
     })
   })
 
