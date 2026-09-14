@@ -445,7 +445,8 @@ srt --settings /path/to/srt-settings.json <command>
   "enableWeakerNestedSandbox": false,
   "allowNestedUserNamespaces": false,
   "enableWeakerNetworkIsolation": false,
-  "allowAppleEvents": false
+  "allowAppleEvents": false,
+  "logViolationsToSystemLog": false
 }
 ```
 
@@ -594,6 +595,7 @@ Examples:
 - `git.safeDirectories` - Directories git should treat as `safe.directory` inside the sandbox, where the working tree is owned by another user — the repository top level when the command runs from a subdirectory, say. Injected through `GIT_CONFIG_*` environment variables, and it grants no write access of its own.
 - `credentials` - Environment variables (`credentials.envVars`) and files (`credentials.files`) the sandboxed command must not read the real values of. `mode: "deny"` withholds the value; `mode: "mask"` puts a sentinel in its place inside the sandbox and has the proxy substitute the real value back on egress to the hosts that entry's `injectHosts` lists (default: `network.allowedDomains`). Masking requires `network.tlsTerminate`, so the real value only leaves over a verified TLS connection, unless `credentials.allowPlaintextInject` opts out. Files are masked on Linux only; macOS denies a masked file instead.
 - `allowAppleEvents` - Allow sending Apple Events and Launch Services open requests from the macOS sandbox (boolean, default: false). Without this, commands like `open`, `osascript`, and anything that opens URLs or scripts other apps via AppleScript fail with AppleScript error `-600` ("Application isn't running") or LaunchServices errors (`-10822`, `-54`). **Security warning:** enabling this means the sandbox no longer provides code-execution isolation. A sandboxed command can launch other applications via `open` with no user prompt, and anything it launches runs outside the sandbox's filesystem and network restrictions; scripting already-running apps via Apple Events is additionally gated by the user's per-app TCC automation consent. Embedders should only source this option from trusted user-level configuration — never from project-local files in a checked-out repository, which would let an attacker-authored project elevate its own sandbox permissions.
+- `logViolationsToSystemLog` - Forward sandbox violations that have no native log line to the system log via `logger(1)` (boolean, default: false). Proxy denials on macOS and Linux and seccomp denials on Linux are decided inside the srt process, so nothing else records them; with this enabled they appear in the macOS unified log or Linux syslog/journald. Seatbelt denials are skipped because the kernel already logs them. Nothing is written to stderr, so TUI applications running in the sandbox are unaffected. See "Violation Detection and Monitoring" for how to watch the stream.
 
 ### Common Configuration Recipes
 
@@ -1032,6 +1034,24 @@ strace -f -e trace=open,openat,stat,access srt <your-command> 2>&1 | grep EPERM
 # Trace network operations
 strace -f -e trace=network srt <your-command> 2>&1 | grep EPERM
 ```
+
+**Proxy and seccomp denials in the system log**: network requests refused by the srt proxy (a host outside `allowedDomains`, a `deniedDomains` match, a `filterRequest` deny) and, on Linux, seccomp-observed writes are decided inside the srt process. Neither the seatbelt log nor `strace` shows them. Set `logViolationsToSystemLog: true` to have srt forward these to the system log via `logger(1)`, tagged `srt`. On macOS each line ends with `_SBX`, so one predicate covers both kernel seatbelt denials and srt's own:
+
+```bash
+# macOS: seatbelt denials and srt proxy/seccomp denials in one stream
+log stream --predicate 'eventMessage ENDSWITH "_SBX"' --style compact
+
+# Linux: systemd-journald
+journalctl -f -t srt
+```
+
+Example line:
+
+```
+srt proxy deny network-outbound api.example.com:443 (host is not on the allow list) cmd="curl https://api.example.com/v1" _SBX
+```
+
+Seatbelt denials are not forwarded (the kernel already logs them), nothing is written to stderr, and events are dropped rather than queued if `logger` processes pile up.
 
 ### Advanced: Bring Your Own Proxy
 
