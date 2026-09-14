@@ -41,11 +41,14 @@ export interface SpawnedLogger {
 
 export type LoggerSpawner = (command: string, args: string[]) => SpawnedLogger
 
-export interface SystemLogViolationSinkOptions {
+export interface SystemLogOptions {
   /** `process.platform` unless overridden by tests. */
   platform?: NodeJS.Platform
   /** Spawner for the `logger` binary; injected by tests. */
   spawn?: LoggerSpawner
+}
+
+export interface SystemLogViolationSinkOptions extends SystemLogOptions {
   /**
    * Upper bound on concurrently running `logger` processes. A burst of
    * denials (a tool retrying a blocked host in a tight loop) must not fork a
@@ -82,6 +85,29 @@ const NATIVELY_LOGGED_SOURCES = new Set<SandboxViolationEvent['source']>([
   'seatbelt',
 ])
 
+/** Platforms with a `logger(1)` this module knows how to drive. */
+export function systemLogSupported(platform: NodeJS.Platform): boolean {
+  return platform === 'darwin' || platform === 'linux'
+}
+
+/**
+ * Append the macOS `_SBX` tag (space-separated, see the module comment) and
+ * bound the line so it survives traditional syslog limits. Exported for
+ * tests.
+ */
+export function tagSystemLogMessage(
+  message: string,
+  platform: NodeJS.Platform,
+): string {
+  const suffix = platform === 'darwin' ? ` ${MACOS_TAG}` : ''
+  const budget = MAX_MESSAGE_CHARS - suffix.length
+  let body = sanitizeViolationText(message)
+  if (body.length > budget) {
+    body = `${body.slice(0, budget - 3)}...`
+  }
+  return body + suffix
+}
+
 /**
  * Format one violation as a single bounded line for `logger`.
  * Exported for tests; `line` is expected to be store-sanitized already, the
@@ -100,12 +126,33 @@ export function formatSystemLogMessage(
     }
     message += ` cmd="${cmd}"`
   }
-  const suffix = platform === 'darwin' ? ` ${MACOS_TAG}` : ''
-  const budget = MAX_MESSAGE_CHARS - suffix.length
-  if (message.length > budget) {
-    message = `${message.slice(0, budget - 3)}...`
+  return tagSystemLogMessage(message, platform)
+}
+
+/**
+ * Hand one already-tagged line to `logger -t srt`, detached, with stdio
+ * ignored. Returns the child so callers can track its lifetime, or
+ * `undefined` when the platform has no `logger(1)`. A synchronous spawn
+ * failure is reported via `onError` rather than thrown; asynchronous child
+ * errors (typically ENOENT) reach the same callback.
+ */
+export function writeSystemLogLine(
+  message: string,
+  options: SystemLogOptions & { onError?: (err: Error) => void } = {},
+): SpawnedLogger | undefined {
+  const platform = options.platform ?? process.platform
+  if (!systemLogSupported(platform)) return undefined
+  const spawn = options.spawn ?? defaultSpawn
+  let child: SpawnedLogger
+  try {
+    child = spawn('logger', ['-t', 'srt', message])
+  } catch (err) {
+    options.onError?.(err instanceof Error ? err : new Error(String(err)))
+    return undefined
   }
-  return message + suffix
+  child.on('error', (err: Error) => options.onError?.(err))
+  child.unref()
+  return child
 }
 
 /**
@@ -116,7 +163,7 @@ export function createSystemLogViolationSink(
   options: SystemLogViolationSinkOptions = {},
 ): SystemLogViolationSink | undefined {
   const platform = options.platform ?? process.platform
-  if (platform !== 'darwin' && platform !== 'linux') {
+  if (!systemLogSupported(platform)) {
     logForDebugging(
       `[Sandbox System Log] not supported on ${platform}; violations will not be forwarded`,
       { level: 'warn' },
@@ -145,36 +192,28 @@ export function createSystemLogViolationSink(
       )
       return
     }
-    const message = formatSystemLogMessage(event, platform)
-    let child: SpawnedLogger
-    try {
-      child = spawn('logger', ['-t', 'srt', message])
-    } catch (err) {
-      disabled = true
-      logForDebugging(
-        `[Sandbox System Log] spawn logger failed, disabling: ${String(err)}`,
-        { level: 'error' },
-      )
-      return
-    }
-    inFlight++
-    written++
     let settled = false
     const settle = (): void => {
       if (settled) return
       settled = true
       inFlight--
     }
-    child.on('error', (err: Error) => {
-      settle()
-      disabled = true
-      logForDebugging(
-        `[Sandbox System Log] logger failed, disabling: ${err.message}`,
-        { level: 'error' },
-      )
+    const child = writeSystemLogLine(formatSystemLogMessage(event, platform), {
+      platform,
+      spawn,
+      onError: err => {
+        settle()
+        disabled = true
+        logForDebugging(
+          `[Sandbox System Log] logger failed, disabling: ${err.message}`,
+          { level: 'error' },
+        )
+      },
     })
+    if (!child) return
+    inFlight++
+    written++
     child.on('exit', settle)
-    child.unref()
   }
 
   return {

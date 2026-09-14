@@ -4,6 +4,8 @@ import { SandboxViolationStore } from '../../src/sandbox/sandbox-violation-store
 import {
   createSystemLogViolationSink,
   formatSystemLogMessage,
+  tagSystemLogMessage,
+  writeSystemLogLine,
   type LoggerSpawner,
   type SpawnedLogger,
 } from '../../src/sandbox/system-log-violation-sink.js'
@@ -307,5 +309,70 @@ describe('SandboxViolationStore.onViolation', () => {
     store.addViolation(proxyEvent({ source: 'proxy' }))
     expect(calls).toHaveLength(1)
     expect(calls[0]!.args[2]).toStartWith('srt proxy deny network-outbound')
+  })
+})
+
+describe('tagSystemLogMessage / writeSystemLogLine', () => {
+  test('tags with a space-separated _SBX on macOS only', () => {
+    expect(tagSystemLogMessage('srt startup version=1.2.3', 'darwin')).toBe(
+      'srt startup version=1.2.3 _SBX',
+    )
+    expect(tagSystemLogMessage('srt startup version=1.2.3', 'linux')).toBe(
+      'srt startup version=1.2.3',
+    )
+  })
+
+  test('collapses control characters and bounds the line', () => {
+    const tagged = tagSystemLogMessage(`a\nb${'x'.repeat(2000)}`, 'darwin')
+    expect(tagged).not.toContain('\n')
+    expect(tagged.length).toBeLessThanOrEqual(1000)
+    expect(tagged.endsWith(' _SBX')).toBe(true)
+  })
+
+  test('writes one line via logger -t srt and returns the child', () => {
+    const { spawn, calls } = fakeSpawner()
+    const child = writeSystemLogLine('srt startup version=1.2.3 _SBX', {
+      platform: 'darwin',
+      spawn,
+    })
+    expect(child).toBeDefined()
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.args).toEqual([
+      '-t',
+      'srt',
+      'srt startup version=1.2.3 _SBX',
+    ])
+    expect(calls[0]!.child.unrefCalled).toBe(true)
+  })
+
+  test('is a no-op on platforms without logger(1)', () => {
+    const { spawn, calls } = fakeSpawner()
+    expect(
+      writeSystemLogLine('x', { platform: 'win32', spawn }),
+    ).toBeUndefined()
+    expect(calls).toHaveLength(0)
+  })
+
+  test('routes synchronous and asynchronous spawn failures to onError', () => {
+    const errors: string[] = []
+    const throwing: LoggerSpawner = () => {
+      throw new Error('EAGAIN')
+    }
+    expect(
+      writeSystemLogLine('x', {
+        platform: 'linux',
+        spawn: throwing,
+        onError: e => errors.push(e.message),
+      }),
+    ).toBeUndefined()
+
+    const { spawn, calls } = fakeSpawner()
+    writeSystemLogLine('x', {
+      platform: 'linux',
+      spawn,
+      onError: e => errors.push(e.message),
+    })
+    calls[0]!.child.fail(new Error('spawn logger ENOENT'))
+    expect(errors).toEqual(['EAGAIN', 'spawn logger ENOENT'])
   })
 })
