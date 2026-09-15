@@ -132,6 +132,16 @@ describe('splitDomainPatternPort — IPv6 literals', () => {
       hostPattern: 'fd00:ec2::254',
       port: undefined,
     })
+    // A zone id is meaningless for matching (a request can never carry one)
+    // and is dropped, so the entry matches the address on any interface.
+    expect(splitDomainPatternPort('[fe80::1%en0]:22')).toEqual({
+      hostPattern: 'fe80::1',
+      port: 22,
+    })
+    expect(splitDomainPatternPort('fe80::1%en0')).toEqual({
+      hostPattern: 'fe80::1',
+      port: undefined,
+    })
   })
 
   test('unbracketed multi-colon is never split (no hextet mistaken for a port)', () => {

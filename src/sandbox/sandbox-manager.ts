@@ -102,10 +102,16 @@ import {
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
-import type { ResolvedParentProxy } from './parent-proxy.js'
+import type { DirectLookup, ResolvedParentProxy } from './parent-proxy.js'
+import {
+  createResolvedAddressGuard,
+  isResolvedAddressDenied,
+  type ResolvedAddressGuard,
+} from './resolved-address-guard.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
-import { getJavaProxyAgentJarPath } from './java-proxy-agent.js'
+import { getJavaProxyAgentJarPathAsync } from './java-proxy-agent.js'
+import { getApplySeccompBinaryPathAsync } from './generate-seccomp-filter.js'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -127,6 +133,8 @@ let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
+/** Read live through {@link directLookup}, so a config update applies to the next dial. */
+let resolvedAddressGuard: ResolvedAddressGuard = createResolvedAddressGuard()
 let mitmCA: MitmCA | undefined
 /**
  * Resolved path of the JVM proxy agent jar (see java-proxy-agent.ts); set
@@ -271,6 +279,32 @@ function recordProxyViolation(
   })
 }
 
+function recordOutboundDeny(
+  host: string,
+  port: number,
+  reason: string,
+  encodedCommand?: string,
+): void {
+  recordProxyViolation(
+    `deny network-outbound ${host}:${port} (${reason})`,
+    encodedCommand,
+  )
+}
+
+/** Direct-dial `lookup` for the proxies: the current guard's, with a refusal recorded as a violation. */
+const directLookup: DirectLookup =
+  (port, encodedCommand) => (hostname, options, callback) =>
+    resolvedAddressGuard.lookupFor(port)(
+      hostname,
+      options,
+      (err, address, family) => {
+        if (isResolvedAddressDenied(err)) {
+          recordOutboundDeny(hostname, port, err.reason, encodedCommand)
+        }
+        callback(err, address, family)
+      },
+    )
+
 /**
  * The request URL as it should appear in a model-visible violation line:
  * origin + path, with any query string reduced to a `?…` marker (origin
@@ -300,10 +334,7 @@ async function filterNetworkRequest(
   encodedCommand?: string,
 ): Promise<boolean> {
   const denied = (reason: string): false => {
-    recordProxyViolation(
-      `deny network-outbound ${host}:${port} (${reason})`,
-      encodedCommand,
-    )
+    recordOutboundDeny(host, port, reason, encodedCommand)
     return false
   }
 
@@ -538,6 +569,7 @@ async function startMuxProxyServer(
     // injection: the real signature must not travel over plaintext.
     planSigv4: buildSigv4Planner(),
     parentProxy,
+    lookupFor: directLookup,
     proxyAuthToken,
   })
 
@@ -545,6 +577,7 @@ async function startMuxProxyServer(
     filter: (port, host, encodedCommand) =>
       filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     parentProxy,
+    lookupFor: directLookup,
     proxyAuthToken,
     probeUnauthenticated: async (port, host) => {
       // Explicit deny rules only: an unauthenticated peer must never reach
@@ -557,10 +590,7 @@ async function startMuxProxyServer(
           const reason =
             config.network.deniedDomainReasons?.[entry] ??
             'host is on the deny list'
-          recordProxyViolation(
-            `deny network-outbound ${host}:${port} (${reason})`,
-            undefined,
-          )
+          recordOutboundDeny(host, port, reason)
           return { deniedReason: reason }
         }
       }
@@ -621,6 +651,7 @@ async function initialize(
         `https=${redactUrl(parentProxy.httpsUrl)}`,
     )
   }
+  resolvedAddressGuard = createResolvedAddressGuard(runtimeConfig.network)
 
   // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
   // tlsTerminate is explicit opt-in, so a bad config is a hard error.
@@ -896,8 +927,10 @@ async function initialize(
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
       // JVMs read neither HTTPS_PROXY nor its credential; the agent bridges
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
+      // Async: the global-npm fallback spawns `npm root -g`.
       javaAgentJarPath =
-        getJavaProxyAgentJarPath(config.javaAgentJarPath) ?? undefined
+        (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
+        undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1046,6 +1079,12 @@ async function checkDependenciesAsync(ripgrepConfig?: {
   command: string
   args?: string[]
 }): Promise<SandboxDependencyCheck> {
+  // Linux: resolve apply-seccomp first so its global-npm fallback
+  // (`npm root -g`) runs off the event loop; the sync check below then
+  // hits the shared path cache.
+  if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
+    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+  }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
@@ -1937,12 +1976,16 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
       { level: 'warn' },
     )
   }
+  // Built before anything is swapped, so a malformed range leaves the
+  // previous config fully in effect.
+  const nextGuard = createResolvedAddressGuard(newConfig.network)
   // Deep clone the config to avoid mutations. structuredClone cannot clone
   // functions, so pull filterRequest out, clone the rest, and put it back —
   // a function reference is immutable in the sense that matters here.
   const { filterRequest, ...rest } = newConfig.network
   config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
+  resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
   // effect only on re-initialize. This keeps the state consistent for the
@@ -2207,6 +2250,7 @@ async function reset(): Promise<void> {
   managerContext = undefined
   initializationPromise = undefined
   parentProxy = undefined
+  resolvedAddressGuard = createResolvedAddressGuard()
   mitmCA = undefined
   javaAgentJarPath = undefined
   sentinelRegistry.clear()

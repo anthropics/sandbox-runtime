@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { tmpdir } from 'node:os'
+import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
@@ -124,9 +124,8 @@ function findSymlinkInPath(
       const stats = fs.lstatSync(nextPath)
       if (stats.isSymbolicLink()) {
         // Check if this symlink is within an allowed write path
-        const isWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            nextPath.startsWith(allowedPath + '/') || nextPath === allowedPath,
+        const isWithinAllowedPath = allowedWritePaths.some(allowedPath =>
+          isAtOrUnder(nextPath, allowedPath),
         )
         if (isWithinAllowedPath) {
           return nextPath
@@ -504,6 +503,223 @@ function capabilityArgs(usesSeccompHelper: boolean): string[] {
   return args
 }
 
+/**
+ * Linux's per-argument cap, MAX_ARG_STRLEN: 32 pages, so 128 KiB on most
+ * kernels and up to 2 MiB with 64 KiB pages. The page size is AT_PAGESZ in
+ * /proc/self/auxv (pairs of native words); 4 KiB, the smallest, if unreadable.
+ */
+let linuxMaxArgStrlen: number | undefined
+function maxArgStrlen(): number {
+  if (linuxMaxArgStrlen === undefined) {
+    const AT_PAGESZ = 6
+    let pageSize = 4096
+    try {
+      const auxv = fs.readFileSync('/proc/self/auxv')
+      const wordBytes = /64|s390x/.test(process.arch) ? 8 : 4
+      // Buffer reads at most 6 bytes as a number; no value needed here is wider.
+      const low = Math.min(wordBytes, 6)
+      const word = (at: number): number =>
+        endianness() === 'BE'
+          ? auxv.readUIntBE(at + wordBytes - low, low)
+          : auxv.readUIntLE(at, low)
+      for (let at = 0; at + 2 * wordBytes <= auxv.length; at += 2 * wordBytes) {
+        if (word(at) === AT_PAGESZ) {
+          pageSize = word(at + wordBytes)
+          break
+        }
+      }
+    } catch {
+      // No /proc: the smallest page size only moves a profile to the file
+      // sooner than it had to.
+    }
+    linuxMaxArgStrlen = 32 * pageSize
+  }
+  return linuxMaxArgStrlen
+}
+
+/**
+ * Room left below the cap when deciding whether the profile stays on the
+ * command line: the embedder may put a prefix of its own (`exec`, `cd x &&`,
+ * an assignment) in the same argument.
+ */
+const ARG_HEADROOM_BYTES = 4096
+
+/** bwrap's cap on parsed words, the command line and `--args` file together. */
+const BWRAP_MAX_ARGS = 9000
+
+/**
+ * The fd the `--args` file is opened on: a single digit, since dash rejects
+ * multi-digit redirections, and high, since embedders hand the command low
+ * fds of their own (an extra stdio pipe, a helper as `/proc/self/fd/3`).
+ */
+const BWRAP_ARGS_FD = 9
+
+/**
+ * Linux's O_TMPFILE, which neither Node nor Bun exposes in `fs.constants`:
+ * the asm-generic __O_TMPFILE, the value on every architecture they build
+ * for Linux, together with the O_DIRECTORY the flag is defined to carry — a
+ * kernel or filesystem that does not know it therefore fails the open on the
+ * directory rather than creating a named file.
+ */
+const O_TMPFILE = 0o20000000 | fs.constants.O_DIRECTORY
+
+/**
+ * The `--args` profiles this process holds open.
+ *
+ * A profile is an unnamed file (O_TMPFILE): written at wrap time, kept open
+ * here, and opened again by the string bwrap runs through
+ * `/proc/<pid>/fd/<n>`, which is a fresh read-only description of the same
+ * inode at offset 0. Nothing is named at any point, so there is nothing for
+ * anyone to substitute between the wrap and the execution — not a sandbox
+ * that renames an ancestor of tmpdir, not a sandbox another process of the
+ * same user launched with tmpdir writable. Every sandbox this library starts
+ * has its own PID namespace and a fresh /proc, so none of them can reach
+ * /proc/<this pid> either.
+ *
+ * Fds close when the sandboxes of a batch are cleaned up, and fd numbers are
+ * reused: a string kept past its cleanup and run later opens whatever the
+ * number means by then — nothing (the redirection fails and the command does
+ * not run), something bwrap refuses, or another profile of this process,
+ * never one from outside it.
+ */
+const bwrapArgsFds: Set<number> = new Set()
+
+/** Where the string bwrap runs opens the profile held on `fd`. */
+function bwrapArgsProfilePath(fd: number): string {
+  return `/proc/${process.pid}/fd/${fd}`
+}
+
+/**
+ * Writes `mountWords` NUL-separated to an unnamed file and returns the fd it
+ * stays open on. Throws when no directory takes an O_TMPFILE file, or when
+ * the profile cannot be opened again through /proc: there is no named-file
+ * fallback, and before any of this an over-long profile failed with E2BIG
+ * anyway. The check is this process's own open; a child's can still be
+ * refused (a process made non-dumpable owns its /proc entries as root), and
+ * the string then fails in the redirection and runs no command.
+ */
+function openBwrapArgsProfile(mountWords: string[]): number {
+  const contents = mountWords.map(word => word + '\0').join('')
+  const failures: string[] = []
+  for (const dir of new Set([tmpdir(), '/dev/shm'])) {
+    let fd: number
+    try {
+      fd = fs.openSync(dir, O_TMPFILE | fs.constants.O_RDWR, 0o600)
+    } catch (error) {
+      failures.push(`${dir}: ${errorText(error)}`)
+      continue
+    }
+    try {
+      fs.writeFileSync(fd, contents)
+      // Read-only from here: this process is done writing it.
+      fs.fchmodSync(fd, 0o400)
+      // The string opens this path. Fail now, where the caller is told why,
+      // rather than when the command runs.
+      fs.closeSync(fs.openSync(bwrapArgsProfilePath(fd), fs.constants.O_RDONLY))
+    } catch (error) {
+      failures.push(`${dir}: ${errorText(error)}`)
+      fs.closeSync(fd)
+      continue
+    }
+    bwrapArgsFds.add(fd)
+    return fd
+  }
+  throw new Error(
+    `no unnamed file could be opened for it (${failures.join('; ')})`,
+  )
+}
+
+function closeBwrapArgsProfile(fd: number): void {
+  bwrapArgsFds.delete(fd)
+  try {
+    fs.closeSync(fd)
+  } catch {
+    // Already closed: nothing left to release.
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * The shell string that runs bwrap with `bwrapArgs`, which the caller runs
+ * as one argument of `sh -c`. When that would not fit the kernel's
+ * per-argument cap, the words in `mounts` (a slice of `bwrapArgs`) go to an
+ * unnamed file this process holds open (see `bwrapArgsFds`) and bwrap reads
+ * them through `--args` at the same position; the string opens that file
+ * again through /proc. Every other word, the per-command environment and the
+ * command among them, stays on the line. The result stays a simple command,
+ * so a prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
+ * Throws when the profile cannot run: too many words for bwrap, no unnamed
+ * file to put the mounts in, or a line too long even without them.
+ */
+function renderBwrapInvocation(
+  bwrapBinary: string,
+  bwrapArgs: string[],
+  mounts: { start: number; end: number },
+): string {
+  if (bwrapArgs.length > BWRAP_MAX_ARGS) {
+    throw new Error(
+      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts); reduce the number of paths the configuration expands to`,
+    )
+  }
+  const inline = quote([bwrapBinary, ...bwrapArgs])
+  const inlineBytes = Buffer.byteLength(inline, 'utf8')
+  const limit = maxArgStrlen() - 1
+  if (inlineBytes <= limit - ARG_HEADROOM_BYTES) {
+    return inline
+  }
+
+  const tooLong = `Sandbox profile is too long for the command line (${inlineBytes} bytes; past ${limit - ARG_HEADROOM_BYTES} it goes through a file)`
+  // `--args <fd>` are two more words.
+  if (bwrapArgs.length + 2 > BWRAP_MAX_ARGS) {
+    throw new Error(
+      `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts`,
+    )
+  }
+  const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
+  if (mountWords.some(word => word.includes('\0'))) {
+    // bwrap splits the file on NUL: the word would become several options.
+    throw new Error(
+      `${tooLong} and contains a path with a NUL byte, which a file of bwrap arguments cannot carry`,
+    )
+  }
+  let argsFd: number
+  try {
+    argsFd = openBwrapArgsProfile(mountWords)
+  } catch (error) {
+    throw new Error(
+      `${tooLong} and cannot be passed through a file: ${errorText(error)}`,
+    )
+  }
+  // /bin/sh opens the profile on the fd and execs bwrap, which reads it to
+  // EOF and closes it before running the command.
+  const viaArgsFile = quote([
+    '/bin/sh',
+    '-c',
+    `exec ${BWRAP_ARGS_FD}<"$1" && shift && exec "$@"`,
+    'srt-args',
+    bwrapArgsProfilePath(argsFd),
+    bwrapBinary,
+    ...bwrapArgs.slice(0, mounts.start),
+    '--args',
+    String(BWRAP_ARGS_FD),
+    ...bwrapArgs.slice(mounts.end),
+  ])
+  const viaArgsFileBytes = Buffer.byteLength(viaArgsFile, 'utf8')
+  if (viaArgsFileBytes > limit) {
+    closeBwrapArgsProfile(argsFd)
+    throw new Error(
+      `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})`,
+    )
+  }
+  logForDebugging(
+    `[Sandbox Linux] bwrap mounts moved to an unnamed file, read through ${bwrapArgsProfilePath(argsFd)} on bwrap's fd ${BWRAP_ARGS_FD}: the command line would be ${inlineBytes} bytes as one argument`,
+  )
+  return viaArgsFile
+}
+
 // Number of wrapped commands that have been generated but whose cleanup has
 // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
 // positive, because deleting a mount point file on the host while another
@@ -548,6 +764,8 @@ function registerExitCleanupHandler(): void {
  *
  * Pass `{ force: true }` to delete unconditionally — used by the process-exit
  * handler and reset() where deferral is not meaningful.
+ *
+ * Also closes the `--args` profiles the wraps of this batch opened.
  */
 export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
   if (!opts?.force) {
@@ -615,6 +833,10 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
         emptyMountSourceDir = undefined
       }
     }
+  }
+
+  for (const argsFd of [...bwrapArgsFds]) {
+    closeBwrapArgsProfile(argsFd)
   }
 }
 
@@ -1170,7 +1392,7 @@ async function generateFilesystemArgs(
     // directories (the loop skips absent entries and gives file entries a
     // read-only /dev/null mask instead of a tmpfs) — in raw and canonical
     // spellings. A read-denied tmpfs at or under a covering deny dir is the
-    // TRIGGER for the post-denyWrite writable re-application, and a deny bind
+    // TRIGGER for the post-denyWrite re-application, and a deny bind
     // whose dest sits under one can be dropped by the emission filter — both
     // facts feed the guard.
     let stubSkipVetoInputs:
@@ -1250,18 +1472,22 @@ async function generateFilesystemArgs(
       return stubSkipVetoInputs
     }
     // The ONE predicate deciding whether a deny dest lies inside the write
-    // allowlist. The read-only pre-pass below and the loop's --ro-bind gate
-    // MUST share it: the pre-pass is only sound if it records exactly the
-    // directories the loop re-binds read-only (a recorded directory that is
-    // never re-bound read-only would suppress stubs unsafely; a re-bound
-    // directory missing from the record only costs an abort). No spelling
-    // handling is needed here: allowedWritePaths entries are recorded with
-    // trailing slashes stripped, and candidates are resolved deny dests.
+    // allowlist, and so whether the deny is applied at all: a dest outside it
+    // is left read-only by the initial --ro-bind / /. The read-only pre-pass
+    // below and the loop's --ro-bind gate MUST share it, so that the pre-pass
+    // records the directories the loop re-binds read-only.
+    //
+    // Containment is root-aware (isAtOrUnder) because '/' is a legal
+    // allowOnly entry: an `allowedPath + '/'` prefix test spells it '//' and
+    // matches nothing, so under a '/' write root every deny that no other
+    // allow entry covers would be judged outside the allowlist and silently
+    // lose its bind — over a root the allow loop has already bound writable.
+    // Spelling needs no further handling here: allowedWritePaths entries are
+    // recorded with trailing slashes stripped, and candidates are resolved
+    // deny dests.
     const isWithinAnyAllowedWritePath = (candidatePath: string): boolean =>
-      allowedWritePaths.some(
-        allowedPath =>
-          candidatePath.startsWith(allowedPath + '/') ||
-          candidatePath === allowedPath,
+      allowedWritePaths.some(allowedPath =>
+        isAtOrUnder(candidatePath, allowedPath),
       )
 
     // Deny writes within allowed paths (user-specified + mandatory denies)
@@ -1294,9 +1520,13 @@ async function generateFilesystemArgs(
     // allowed write path strictly beneath it; incomparable with every
     // read-deny tmpfs in any spelling), which exclude every way its subtree
     // could be writable in the sandbox. Keep the two passes in lockstep: a
-    // directory recorded here but never re-bound read-only AND not vetoed
-    // would suppress stubs unsafely, while an emitted one missing from the
-    // record only costs a spurious abort.
+    // directory recorded here is either re-bound read-only by the loop or
+    // skipped because a recorded directory above it survived the vetoes and
+    // is bound in its place, so every record still stands for a bind that
+    // lands — unless a symlink appears in its path between the two passes,
+    // where the loop masks that component and emits no bind for the
+    // directory (the re-check below); an emitted one missing from the record
+    // only costs a spurious abort.
     for (const pathPattern of denyPaths) {
       const rawPath = normalizePathForSandbox(pathPattern)
       if (rawPath.startsWith('/dev/')) {
@@ -1347,18 +1577,14 @@ async function generateFilesystemArgs(
     // and denyWithinAllow both name it, and '/' + '/' is a prefix of
     // nothing, so a string-prefix test would judge it safe for every path
     // and drop the binds the re-application passes below key off.
-    // Rationale: the only writable emissions that land after the
-    // buffered read-only binds are the denyRead re-applications
-    // (pushReadDenyDirMounts), which mount a tmpfs and re-bind allowed write
-    // paths beneath it WITHOUT re-emitting the binds it buries — so a
-    // comparable tmpfs is both the re-opening vector (beneath or around the
-    // dir) and the only way the dir's own --ro-bind gets dropped at emission
-    // as hidden-by-a-tmpfs. (The emission filter's other drop condition,
-    // maskedFiles, holds file dests only — /dev/null read-deny masks and
-    // credential-mask fakes — while the pre-pass stat-verifies every
-    // recorded dir as a directory, so it cannot drop a recorded dir short of
-    // a dir→file race, which ends in bwrap refusing to start, not a silent
-    // gap.) Only existing read-deny directories become a tmpfs: absent and
+    // Rationale: nothing writable lands after the buffered read-only binds,
+    // so no later mount re-opens what a covering bind closed. The vetoes
+    // stay all the same, for the reasons given at each of them below. (The
+    // emission filter's other drop condition, maskedFiles, holds file dests
+    // only — /dev/null read-deny masks and credential-mask fakes — while the
+    // pre-pass stat-verifies every recorded dir as a directory, so it cannot
+    // drop a recorded dir short of a dir→file race, which ends in bwrap
+    // refusing to start, not a silent gap.) Only existing read-deny directories become a tmpfs: absent and
     // file-level read-denies count for nothing. If any condition could
     // apply, keep the stub — the pre-existing abort is preferable to a
     // silently creatable deny path. (An allow path bound before the
@@ -1375,21 +1601,26 @@ async function generateFilesystemArgs(
         prospectiveReadDenyTmpfsDirsBothForms,
       } = getStubSkipVetoInputs()
       const unsafe =
-        // (i) an allowed write path strictly beneath the dir: the
-        //     re-application's effect would re-bind it writable.
+        // (i) an allowed write path strictly beneath the dir: the covering
+        //     bind is not the only mount claiming that subtree, since the
+        //     allow loop binds that path writable before it. It is also the
+        //     only veto that fires for a recorded '/' when there is no read
+        //     policy, which is what keeps coveredBySafeReadOnlyDenyDir
+        //     walking past the root.
         allowedWritePathsBothForms.some(writePath =>
           isStrictlyUnder(writePath, denyDir),
         ) ||
-        // (ii) a read-deny tmpfs at or beneath the dir: the re-application's
-        //     trigger.
+        // (ii) a read-deny tmpfs at or beneath the dir: the tmpfs, not the
+        //     covering bind, decides that subtree. Kept conservatively; the
+        //     re-application's own trigger is strict containment.
         prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
           isAtOrUnder(tmpfsDir, denyDir),
         ) ||
         // (iii) a read-deny tmpfs CONTAINING the dir or any raw spelling it
         //     was reached through: the dir's own --ro-bind can be dropped as
-        //     hidden-by-the-tmpfs at emission, and a tmpfs above it can
-        //     re-bind an allowed path around it — either way the directory
-        //     is not reliably read-only in the sandbox.
+        //     hidden-by-the-tmpfs at emission, and a tmpfs above it restores
+        //     allowed paths around it — either way the dir's own bind is not
+        //     the last word on that subtree.
         prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
           [denyDir, ...(readOnlyDenyDirSpellings.get(denyDir) ?? [])].some(
             spelling => isAtOrUnder(spelling, tmpfsDir),
@@ -1415,9 +1646,7 @@ async function generateFilesystemArgs(
           // recorded directory: everything lies beneath it, so it would
           // veto every skip and stub each absent mandatory-deny path of a
           // write-denied cwd after that cwd's own bind — the startup abort.
-          // Its descendants are decided by their own recorded directories,
-          // as before, when the string-prefix filter matched '/' only for a
-          // path directly beneath it and the vetoes never fired for it.
+          // Its descendants are decided by their own recorded directories.
           if (denyDir === '/') continue
           return false
         }
@@ -1804,6 +2033,9 @@ async function generateFilesystemArgs(
     })
 
   const emittedDenyWriteDests: string[] = []
+  // Write paths already restored read-only by a dropped deny bind, so two
+  // denies covering the same path emit one --ro-bind.
+  const restoredReadOnlyWritePaths = new Set<string>()
   for (let i = 0; i < denyWriteArgs.length; i += 3) {
     const dest = denyWriteArgs[i + 2]!
     const rawDest = denyWriteRawDests.get(dest) ?? dest
@@ -1812,6 +2044,25 @@ async function generateFilesystemArgs(
       logForDebugging(
         `[Sandbox Linux] Skipping denyWrite bind already hidden by denyRead tmpfs: ${dest}`,
       )
+      // The tmpfs hides this dest but not an allowed write path the denyRead
+      // loop re-bound writable beneath it: that path is inside this write
+      // deny, so restore it read-only. Emitting the dest's own bind instead
+      // would expose the read-denied directory around it.
+      for (const writePath of allowedWritePaths) {
+        if (!isAtOrUnder(writePath, dest) && !isAtOrUnder(writePath, rawDest)) {
+          continue
+        }
+        if (restoredReadOnlyWritePaths.has(writePath)) continue
+        restoredReadOnlyWritePaths.add(writePath)
+        args.push('--ro-bind', writePath, writePath)
+        // Like a deny bind, this one lands above whatever the denyRead loop
+        // mounted inside the write path, so the re-application passes below
+        // have to see it and put those mounts back.
+        emittedDenyWriteDests.push(writePath)
+        logForDebugging(
+          `[Sandbox Linux] Restoring write path read-only inside dropped denyWrite bind ${dest}: ${writePath}`,
+        )
+      }
       continue
     }
     args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
@@ -1824,16 +2075,40 @@ async function generateFilesystemArgs(
 
   // The inverse stacking problem: a denyWrite ro-bind whose dest strictly
   // contains a read-denied dir re-exposes that dir's real contents (the bind
-  // landed after the tmpfs). Re-apply the tmpfs on top, with the same write
-  // and allowRead re-binds the denyRead loop emitted. A bind of '/' itself
-  // (allowOnly and denyWithinAllow both naming it) contains every one of
-  // them, so containment is root-aware.
+  // landed after the tmpfs). Re-apply the tmpfs on top, restoring the paths
+  // the denyRead loop restored beneath it. A bind of '/' itself (allowOnly
+  // and denyWithinAllow both naming it) contains every one of them, so
+  // containment is root-aware.
+  //
+  // An allowed write path beneath such a tmpfs lies inside the emitted deny
+  // dest too, so the deny wins: the write paths go in as allowRead entries
+  // and come back read-only, visible as the first pass left them but not
+  // writable. Re-binding them writable would undo, for the whole subtree,
+  // the write denies the pass above just emitted.
   for (const tmpfsDir of tmpfsDirs) {
-    if (emittedDenyWriteDests.some(dest => isStrictlyUnder(tmpfsDir, dest))) {
+    const reExposingDest = emittedDenyWriteDests.find(dest =>
+      isStrictlyUnder(tmpfsDir, dest),
+    )
+    if (reExposingDest !== undefined) {
       logForDebugging(
         `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${tmpfsDir}`,
       )
-      pushReadDenyDirMounts(args, tmpfsDir, allowedWritePaths, readAllowPaths)
+      // The helper logs each restore as a read allow; say which of them are
+      // write paths losing their write access, and to which deny.
+      const restoredReadOnly = allowedWritePaths.filter(writePath =>
+        isAtOrUnder(writePath, tmpfsDir),
+      )
+      if (restoredReadOnly.length > 0) {
+        logForDebugging(
+          `[Sandbox Linux] Restoring write paths read-only inside denyWrite bind ${reExposingDest}: ${restoredReadOnly.join(', ')}`,
+        )
+      }
+      pushReadDenyDirMounts(
+        args,
+        tmpfsDir,
+        [],
+        [...allowedWritePaths, ...readAllowPaths],
+      )
     }
   }
   // Same problem for masked files: the mask landed before the denyWrite
@@ -2175,7 +2450,9 @@ export async function wrapCommandWithSandboxLinux(
       allowGitConfig,
       abortSignal,
     )
+    const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)
+    const mounts = { start: mountsStart, end: bwrapArgs.length }
 
     // Always bind /dev
     bwrapArgs.push('--dev', '/dev')
@@ -2248,7 +2525,11 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
+    const wrappedCommand = renderBwrapInvocation(
+      bwrapPath ?? 'bwrap',
+      bwrapArgs,
+      mounts,
+    )
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
