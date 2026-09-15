@@ -2093,6 +2093,25 @@ async function generateFilesystemArgs(
           ) {
             continue
           }
+          // A masked file needs no restore: its mask already holds it
+          // unreadable and unwritable. Binding the real file read-only here
+          // would land ABOVE that mask and leave the protection to the mask
+          // re-application below, which is one comparison away from not
+          // covering an equal path at all. Skipping keeps it local. A masked
+          // file strictly BENEATH a restored directory is the other case and
+          // stays: recording that directory is what puts its mask back on
+          // top. Both spellings the record holds are checked, since the
+          // restore is keyed by where the path lands.
+          if (
+            fileMasks.some(
+              mask => mask.dest === writePath || mask.landing === writePath,
+            )
+          ) {
+            logForDebugging(
+              `[Sandbox Linux] Leaving a masked file to its mask inside dropped denyWrite bind ${dest}: ${writePath}`,
+            )
+            continue
+          }
           if (restoredReadOnlyWritePaths.has(writePath)) continue
           restoredReadOnlyWritePaths.add(writePath)
           args.push('--ro-bind', writeMount.source, writePath)

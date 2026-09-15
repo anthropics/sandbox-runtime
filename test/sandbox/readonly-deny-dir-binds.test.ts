@@ -589,6 +589,93 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
         expect(result.stdout).not.toContain('NESTED')
       },
     )
+
+    // An allowed write path that IS a masked file is the one restore to skip:
+    // its mask already holds it unreadable and unwritable, and a read-only
+    // bind of the real file would land above that mask. Whether anything puts
+    // the mask back then rests on one comparison in the re-application pass,
+    // so the mask stays the last mount on the file by not being covered at
+    // all. A masked file BENEATH a restored directory is the opposite case
+    // and is re-applied; the third test here pins that.
+    describe('a masked file that is itself the allowed write path', () => {
+      let MASKED: string
+      let FAKE: string
+
+      beforeEach(() => {
+        MASKED = join(DENIED, 'token.txt')
+        writeFileSync(MASKED, 'REALTOKEN\n')
+        FAKE = join(BASE, 'fake-token.txt')
+        writeFileSync(FAKE, 'FAKE\n')
+      })
+
+      it('leaves a read-deny mask as the last mount on it', async () => {
+        const command = await wrap([DENIED], [RO, MASKED], [AREA, MASKED])
+
+        expect(countBinds(command, '--ro-bind', MASKED, MASKED)).toBe(0)
+        expect(countBinds(command, '--ro-bind', '/dev/null', MASKED)).toBe(1)
+      })
+
+      it('leaves a credential mask as the last mount on it', async () => {
+        const command = await wrapCommandWithSandboxLinux({
+          command: 'echo hello',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [RO] },
+          writeConfig: {
+            allowOnly: [AREA, MASKED],
+            denyWithinAllow: [DENIED],
+          },
+          maskedFileBinds: [{ realPath: MASKED, fakePath: FAKE }],
+        })
+
+        expect(countBinds(command, '--ro-bind', MASKED, MASKED)).toBe(0)
+        expect(countBinds(command, '--ro-bind', FAKE, MASKED)).toBe(1)
+      })
+
+      it('still re-applies a mask on a file beneath the restored directory', async () => {
+        const nested = join(INNER, 'token.txt')
+        writeFileSync(nested, 'NESTEDTOKEN\n')
+
+        const command = await wrap([DENIED], [RO, nested], [AREA, INNER])
+
+        const restored = command.lastIndexOf(`--ro-bind ${INNER} ${INNER}`)
+        expect(restored).toBeGreaterThan(-1)
+        expect(
+          command.lastIndexOf(`--ro-bind /dev/null ${nested}`),
+        ).toBeGreaterThan(restored)
+      })
+
+      it.skipIf(!BWRAP_CAN_NAMESPACE)(
+        'keeps the real bytes unreadable and the file unwritable',
+        async () => {
+          const readDeny = await runSandboxed(
+            [DENIED],
+            [RO, MASKED],
+            [AREA, MASKED],
+            `cat ${MASKED} 2>&1; echo pwned >> ${MASKED} 2>&1`,
+          )
+          expect(readDeny.stdout).not.toContain('REALTOKEN')
+          expect(readFileSync(MASKED, 'utf8')).toBe('REALTOKEN\n')
+
+          const credential = run(
+            await wrapCommandWithSandboxLinux({
+              command: `sh -c 'echo BOOTED; cat ${MASKED} 2>&1; echo pwned >> ${MASKED} 2>&1'`,
+              needsNetworkRestriction: false,
+              readConfig: { denyOnly: [RO] },
+              writeConfig: {
+                allowOnly: [AREA, MASKED],
+                denyWithinAllow: [DENIED],
+              },
+              maskedFileBinds: [{ realPath: MASKED, fakePath: FAKE }],
+            }),
+          )
+          expect(credential.stderr ?? '').not.toContain('bwrap:')
+          expect(credential.stdout).toContain('BOOTED')
+          expect(credential.stdout).toContain('FAKE')
+          expect(credential.stdout).not.toContain('REALTOKEN')
+          expect(readFileSync(MASKED, 'utf8')).toBe('REALTOKEN\n')
+        },
+      )
+    })
   })
 
   it('keeps the bind for a deny reached through a symlinked spelling', async () => {
