@@ -7,8 +7,13 @@ import { join } from 'node:path'
 import {
   buildJavaToolOptions,
   getJavaProxyAgentJarPath,
+  getJavaProxyAgentJarPathAsync,
   JAVA_PROXY_AGENT_JAR_NAME,
 } from '../../src/sandbox/java-proxy-agent.js'
+import {
+  getGlobalNpmPaths,
+  getGlobalNpmPathsAsync,
+} from '../../src/sandbox/generate-seccomp-filter.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
@@ -82,6 +87,30 @@ describe('getJavaProxyAgentJarPath', () => {
     // Either the vendor jar (when built) or null — never the bogus path.
     const r = getJavaProxyAgentJarPath('/nonexistent/srt-proxy-agent.jar')
     expect(r).toBe(jarPath)
+  })
+
+  it('async variant resolves the same paths as the sync one', async () => {
+    const explicit = join(
+      import.meta.dir,
+      '..',
+      'fixtures',
+      'java-proxy-agent',
+      'ProxyProbe.java',
+    )
+    expect(await getJavaProxyAgentJarPathAsync(explicit)).toBe(explicit)
+    // A distinct missing path is its own cache key, so this runs the full
+    // lookup (including the async global-npm fallback) rather than a hit.
+    expect(
+      await getJavaProxyAgentJarPathAsync('/nonexistent/async-agent.jar'),
+    ).toBe(jarPath)
+  })
+
+  it('getGlobalNpmPathsAsync shares the sync cache and fallbacks', async () => {
+    const asyncPaths = await getGlobalNpmPathsAsync()
+    expect(getGlobalNpmPaths()).toBe(asyncPaths)
+    expect(asyncPaths).toContain(
+      join('/usr', 'lib', 'node_modules', '@anthropic-ai', 'sandbox-runtime'),
+    )
   })
 
   it.if(jarPath !== null)('finds the built jar under vendor/', () => {
