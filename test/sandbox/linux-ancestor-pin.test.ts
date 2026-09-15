@@ -346,6 +346,47 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     }
   })
 
+  it('restores an allowRead carve-out that is a symlink at the name it is, from its vetted target', async () => {
+    // The dotfile-manager shape: .netrc and docs inside a read-denied home
+    // are links into a sibling directory inside it. Restoring them only
+    // where they resolve leaves the names themselves missing in the sandbox;
+    // naming the link as the bind SOURCE would hand bwrap the link to
+    // re-resolve at mount time, after the containment check ran.
+    mkTree(BASE, {
+      home: {
+        store: { netrc: 'SECRETTOKEN\n', pages: { 'readme.md': 'PAGETEXT\n' } },
+        'other.txt': 'HIDDEN\n',
+      },
+    })
+    const homeDir = join(BASE, 'home')
+    const netrcName = join(homeDir, '.netrc')
+    const netrcTarget = join(homeDir, 'store', 'netrc')
+    const docsName = join(homeDir, 'docs')
+    const docsTarget = join(homeDir, 'store', 'pages')
+    symlinkSync(join('store', 'netrc'), netrcName)
+    symlinkSync(join('store', 'pages'), docsName)
+
+    const command = await wrap(
+      { denyRead: [homeDir], allowRead: [netrcName, docsName] },
+      `cat ${netrcName} 2>&1; cat ${join(docsName, 'readme.md')} 2>&1; cat ${join(homeDir, 'other.txt')} 2>&1; echo DONE`,
+    )
+
+    expect(command).toContain(`--tmpfs ${homeDir} `)
+    // The name is the destination; the vetted target is the source.
+    expect(command).toContain(`--ro-bind ${netrcTarget} ${netrcName}`)
+    expect(command).toContain(`--ro-bind ${docsTarget} ${docsName}`)
+    expect(command).not.toContain(`--ro-bind ${netrcName} `)
+    expect(command).not.toContain(`--ro-bind ${docsName} `)
+
+    if (BWRAP_CAN_NAMESPACE) {
+      const result = run(command)
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).toContain('SECRETTOKEN')
+      expect(result.stdout).toContain('PAGETEXT')
+      expect(result.stdout).not.toContain('HIDDEN')
+    }
+  })
+
   it('pins inside a write-denied directory; the directory deny bind still lands on top', async () => {
     mkTree(PROJECT, {
       x: {
@@ -599,6 +640,55 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command.lastIndexOf(maskBind)).toBe(command.indexOf(maskBind))
   })
 
+  it('pins and covers a credential mask when there are no write restrictions', async () => {
+    // A mask-only config passes no write config at all, so the root is bound
+    // writable — the same shape as a '/' write root, and the pins go after
+    // that bind under one writable cover. Without them the directory above
+    // the mask is renamed aside and the real file read under its new name.
+    mkTree(PROJECT, {
+      creds: { 'token.txt': 'REALTOKEN\n' },
+      fakes: { 'token.txt': 'FAKE\n' },
+    })
+    const credsDir = join(PROJECT, 'creds')
+    const realPath = join(credsDir, 'token.txt')
+    const fakePath = join(PROJECT, 'fakes', 'token.txt')
+    const top = `/${BASE.split('/')[1]}`
+    process.chdir(PROJECT)
+
+    const command = await wrapCommandWithSandboxLinux({
+      command: `cd ${PROJECT} && mv creds creds-moved 2>&1; cat ${realPath} 2>&1; echo DONE`,
+      needsNetworkRestriction: false,
+      allowAllUnixSockets: true,
+      maskedFileBinds: [{ realPath, fakePath }],
+    })
+
+    expect(command).toContain('--bind / /')
+    const credsPin = `--ro-bind ${credsDir} ${credsDir}`
+    const cover = `--bind ${top} ${top}`
+    const mask = `--ro-bind ${fakePath} ${realPath}`
+    for (const fragment of [
+      credsPin,
+      `--ro-bind ${PROJECT} ${PROJECT}`,
+      cover,
+      mask,
+    ]) {
+      expect(command).toContain(fragment)
+    }
+    // A read-only cover would make the whole top-level directory read-only.
+    expect(command).not.toContain(`--ro-bind ${top} ${top}`)
+    expect(command.indexOf(credsPin)).toBeLessThan(command.indexOf(cover))
+    expect(command.indexOf(cover)).toBeLessThan(command.indexOf(mask))
+
+    if (BWRAP_CAN_NAMESPACE) {
+      const result = run(command)
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).toMatch(/busy/i)
+      expect(result.stdout).not.toContain('REALTOKEN')
+      expect(existsSync(join(PROJECT, 'creds-moved'))).toBe(false)
+      expect(readFileSync(realPath, 'utf8')).toBe('REALTOKEN\n')
+    }
+  })
+
   it('restores a write path around a symlink-spelled mask inside it; the mask lands on top', async () => {
     mkTree(PROJECT, { d: { w: { secret: 'MASKME\n', 'other.txt': 'ok\n' } } })
     const wDir = join(PROJECT, 'd', 'w')
@@ -767,6 +857,25 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command).toContain(`--ro-bind /dev/null ${absent}`)
     expect(command).toContain('--bind /usr /usr')
     expect(command).not.toContain('--ro-bind /usr /usr')
+  })
+
+  it('covers and pins nothing under /proc or /sys with a "/" write root', async () => {
+    // --proc and --dev replace two of those trees after the pins are spliced
+    // in, and /sys is kernel state the root bind already holds read-only, so
+    // a cover or a pin there would only fight the mount that follows it. A
+    // sibling top-level directory still gets its cover from its own deny.
+    const probe = 'srt-ancestor-pin-probe'
+    const command = await wrap({
+      allowWrite: ['/'],
+      denyWrite: [`/proc/${probe}`, `/sys/${probe}`, `/usr/${probe}`],
+    })
+
+    expect(command).toContain(`--ro-bind /dev/null /proc/${probe}`)
+    expect(command).toContain(`--ro-bind /dev/null /sys/${probe}`)
+    expect(command).toContain('--bind /usr /usr')
+    expect(command).not.toContain('--bind /proc /proc')
+    expect(command).not.toContain('--bind /sys /sys')
+    expect(command).not.toContain('--ro-bind /sys /sys')
   })
 
   it('covers no top-level directory without a "/" write root', async () => {

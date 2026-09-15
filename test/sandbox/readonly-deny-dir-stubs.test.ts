@@ -573,21 +573,24 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     },
   )
 
-  it('keeps every stub when the read-deny prediction cannot be derived', async () => {
-    // The tmpfs dirs the vetoes are judged against are predicted from the
-    // same readDenyEntries() the denyRead loop uses, and listing the root
-    // can fail transiently (EMFILE/ENFILE). Reading that failure as "no
-    // read-deny tmpfs" skips stubs on evidence that never existed: the loop
-    // derives the set again moments later, succeeds, and the wrap reaches
-    // bwrap. Here the first derivation throws and the second succeeds, so
-    // every covering directory must be vetoed and the stubs kept.
+  /**
+   * Run a `denyOnly: ['/']` wrap in which the first `failures` listings of
+   * '/' throw EMFILE, and report how many of them actually fired.
+   */
+  async function wrapWithFailingRootListings(
+    failures: number,
+    writeConfig: { allowOnly: string[]; denyWithinAllow: string[] } = {
+      allowOnly: [AREA],
+      denyWithinAllow: [PROJ],
+    },
+  ): Promise<{ command: string; warnings: string[]; failed: number }> {
     process.chdir(PROJ)
     // The root child the temp tree lives under. allowRead keeps it out of
-    // the '/' deny expansion, so with a derivable prediction no tmpfs lands
-    // anywhere near PROJ, nothing vetoes it and the stubs would be skipped.
+    // the '/' deny expansion, so with a usable prediction no tmpfs lands
+    // anywhere near PROJ, nothing vetoes it and the stubs are skipped.
     const tmpRoot = `/${BASE.split('/')[1]}`
     const realReaddirSync = fs.readdirSync
-    let rootListingsFailed = 0
+    let failed = 0
     const warnings: string[] = []
     const savedDebug = process.env.SRT_DEBUG
     process.env.SRT_DEBUG = '1'
@@ -596,8 +599,8 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
         p: fs.PathLike,
         ...rest: unknown[]
       ) => {
-        if (String(p) === '/' && rootListingsFailed === 0) {
-          rootListingsFailed++
+        if (String(p) === '/' && failed < failures) {
+          failed++
           throw Object.assign(new Error('EMFILE: too many open files'), {
             code: 'EMFILE',
           })
@@ -614,22 +617,97 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
         command: 'echo hello',
         needsNetworkRestriction: false,
         readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
-        writeConfig: { allowOnly: [AREA], denyWithinAllow: [PROJ] },
+        writeConfig,
       })
-      expect(rootListingsFailed).toBe(1)
-      expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
-      expect(command).toContain(
-        `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
-      )
-      // The throw is the reason, not some unresolvable child of '/' this
-      // host happens to have: that would pass the test for free.
-      expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
-      expect(warnings.join('\n')).toContain('deriving it threw')
+      return { command, warnings, failed }
     } finally {
       for (const spy of spies) spy.mockRestore()
       if (savedDebug === undefined) delete process.env.SRT_DEBUG
       else process.env.SRT_DEBUG = savedDebug
     }
+  }
+
+  it('keeps every stub only when the root listing fails twice', async () => {
+    // The tmpfs dirs the vetoes are judged against are predicted from the
+    // same readDenyEntries() the denyRead loop uses, and listing the root can
+    // fail transiently (EMFILE/ENFILE). Reading that failure as "no read-deny
+    // tmpfs" would skip stubs on evidence that never existed; treating one
+    // failure as final keeps every placeholder, which is itself a start-up
+    // refusal under a read-only covering deny. So it is derived twice.
+    const stub = `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`
+
+    const transient = await wrapWithFailingRootListings(1)
+    expect(transient.failed).toBe(1)
+    expect(transient.command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(transient.command).not.toContain(stub)
+    expect(transient.warnings.join('\n')).not.toContain(
+      'Read-deny prediction unusable',
+    )
+
+    const persistent = await wrapWithFailingRootListings(2)
+    expect(persistent.failed).toBe(2)
+    expect(persistent.command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(persistent.command).toContain(stub)
+    // The throw is the reason, not some unresolvable child of '/' this
+    // host happens to have: that would pass the test for free.
+    expect(persistent.warnings.join('\n')).toContain(
+      'Read-deny prediction unusable',
+    )
+    expect(persistent.warnings.join('\n')).toContain('deriving it threw')
+  })
+
+  it('keeps a per-path deny inside a read-deny tmpfs under a "/" write root denied whole', async () => {
+    // The root's own read-only bind covers every candidate OUTSIDE the
+    // predicted read-deny tmpfs set. One inside it is not covered by that
+    // bind — the tmpfs lands on top of it, and an allowed write path
+    // restored through the tmpfs is writable again — so such a deny keeps
+    // its own bind and its own placeholder. This is the branch the
+    // "keeps skipping them when '/' is vetoed" assertions in
+    // readonly-deny-dir-binds.test.ts point at.
+    const readDenied = join(BASE, 'ro')
+    const writable = join(readDenied, 'w')
+    mkdirSync(writable, { recursive: true })
+    const existing = join(writable, 'settings.json')
+    writeFileSync(existing, '{}\n')
+    const absent = join(writable, '.mcp.json')
+    process.chdir(PROJ)
+
+    const command = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: [readDenied] },
+      writeConfig: {
+        allowOnly: ['/', writable],
+        denyWithinAllow: ['/', existing, absent],
+      },
+    })
+
+    expect(command).toContain(`--tmpfs ${readDenied} `)
+    expect(command).toContain(`--ro-bind ${existing} ${existing}`)
+    expect(command).toContain(`--ro-bind /dev/null ${absent}`)
+    // The control: a candidate outside that tmpfs is covered by the root's
+    // own bind and needs neither.
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+  })
+
+  it('keeps every placeholder under a "/" write root denied whole when the prediction is unusable', async () => {
+    // The other half of that branch: with no usable prediction the root's
+    // covering bind proves nothing, so even a candidate outside every
+    // read-deny tmpfs keeps its placeholder — fail closed, at the cost the
+    // unusable-prediction warning names.
+    const rootDeniedWhole = { allowOnly: ['/'], denyWithinAllow: ['/'] }
+    const stub = `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`
+
+    const usable = await wrapWithFailingRootListings(0, rootDeniedWhole)
+    expect(usable.command).not.toContain(stub)
+
+    const unusable = await wrapWithFailingRootListings(2, rootDeniedWhole)
+    expect(unusable.warnings.join('\n')).toContain(
+      'Read-deny prediction unusable',
+    )
+    expect(unusable.command).toContain(stub)
   })
 
   /**
