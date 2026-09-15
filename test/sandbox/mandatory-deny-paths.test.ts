@@ -1130,6 +1130,55 @@ describe.if(isSupportedPlatform)(
             rmSync(targetDir, { recursive: true, force: true })
           }
         })
+        it('blocks writes to .git/hooks in allowedWrite paths outside process.cwd()', async () => {
+          const externalRepoDir = join(
+            tmpdir(),
+            `external-repo-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          )
+          const hooksDir = join(externalRepoDir, '.git', 'hooks')
+          mkdirSync(hooksDir, { recursive: true })
+          const hookFile = join(hooksDir, 'pre-commit')
+          writeFileSync(hookFile, 'ORIGINAL')
+
+          try {
+            const platform = getPlatform()
+            const command = `echo 'EXPLOIT' > '${hookFile}'`
+            const writeConfig = {
+              allowOnly: [externalRepoDir],
+              denyWithinAllow: [] as string[],
+            }
+
+            let wrappedCommand: string
+            if (platform === 'macos') {
+              wrappedCommand = wrapCommandWithSandboxMacOS({
+                command,
+                needsNetworkRestriction: false,
+                readConfig: undefined,
+                writeConfig,
+              })
+            } else {
+              wrappedCommand = await wrapCommandWithSandboxLinux({
+                command,
+                needsNetworkRestriction: false,
+                readConfig: undefined,
+                writeConfig,
+              })
+            }
+
+            const result = spawnSync(wrappedCommand, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 10000,
+            })
+
+            // Write should be denied
+            expect(result.status).not.toBe(0)
+            expect(readFileSync(hookFile, 'utf8')).toBe('ORIGINAL')
+          } finally {
+            cleanupBwrapMountPoints({ force: true })
+            rmSync(externalRepoDir, { recursive: true, force: true })
+          }
+        })
       },
     )
   },
@@ -1179,5 +1228,15 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
       p => p.includes('.git/config') || p.endsWith('.git/config'),
     )
     expect(hasGitConfigPattern).toBe(true)
+  })
+
+  it('includes static and glob deny patterns for multiple scanRoots', () => {
+    const extraRoot = tmpdir()
+    const patterns = macGetMandatoryDenyPatterns(false, [
+      process.cwd(),
+      extraRoot,
+    ])
+
+    expect(patterns.some(p => p.includes(extraRoot))).toBe(true)
   })
 })
