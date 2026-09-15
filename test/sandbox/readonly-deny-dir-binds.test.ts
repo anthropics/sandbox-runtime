@@ -117,9 +117,6 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     return result
   }
 
-  const countOccurrences = (haystack: string, needle: string): number =>
-    haystack.split(needle).length - 1
-
   /**
    * The write really hit a read-only mount, rather than the command failing
    * for some other reason that also exits non-zero: bwrap refusing to start,
@@ -142,7 +139,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     // strict descendant of that read-only bind and needs nothing.
     const command = await wrap([PROJ, FILE], [], [PROJ])
 
-    expect(countOccurrences(command, `--ro-bind ${PROJ} ${PROJ}`)).toBe(1)
+    expect(countBinds(command, '--ro-bind', PROJ, PROJ)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
 
     // Where the host can run bwrap, prove the covering bind alone still
@@ -169,7 +166,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
   it('is independent of the order the denies are listed in', async () => {
     const command = await wrap([FILE, PROJ], [], [PROJ])
 
-    expect(countOccurrences(command, `--ro-bind ${PROJ} ${PROJ}`)).toBe(1)
+    expect(countBinds(command, '--ro-bind', PROJ, PROJ)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
   })
 
@@ -184,7 +181,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     const sub = join(PROJ, 'sub')
     const command = await wrap([PROJ, sub, FILE])
 
-    expect(countOccurrences(command, `--ro-bind ${PROJ} ${PROJ}`)).toBe(1)
+    expect(countBinds(command, '--ro-bind', PROJ, PROJ)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${sub} ${sub}`)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
   })
