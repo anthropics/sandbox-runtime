@@ -1886,14 +1886,34 @@ async function generateFilesystemArgs(
       return !reExposedByWriteBind
     })
 
+  // Every spelling a masked file can be named by: the maskedFiles keys (the
+  // spelling denyRead or the credential list used, and resolveSymlinkDenyDest
+  // of it, which resolves the LAST component only) plus their full realpaths.
+  // Deny-write dests and allowWrite entries are canonicalized, so a symlink in
+  // an ANCESTOR component records the mask under one string and has every
+  // consumer below ask under another. Held apart from maskedFiles because the
+  // re-application pass iterates that map and must emit one mask per resolved
+  // destination.
+  const maskedFileSpellings = new Set<string>()
+  for (const maskedFile of maskedFiles.keys()) {
+    maskedFileSpellings.add(maskedFile)
+    maskedFileSpellings.add(resolveSymlinkedDenyPath(maskedFile) ?? maskedFile)
+  }
+  const isMaskedFile = (candidate: string): boolean =>
+    maskedFileSpellings.has(candidate) ||
+    maskedFileSpellings.has(resolveSymlinkedDenyPath(candidate) ?? candidate)
+
   const emittedDenyWriteDests: string[] = []
   // Write paths already restored read-only by a dropped deny bind, so two
   // denies covering the same path emit one --ro-bind.
   const restoredReadOnlyWritePaths = new Set<string>()
+  // Write paths whose mask a dropped deny bind already left in place, so two
+  // denies covering the same path log once.
+  const maskedWritePathsKept = new Set<string>()
   for (let i = 0; i < denyWriteArgs.length; i += 3) {
     const dest = denyWriteArgs[i + 2]!
     const rawDest = denyWriteRawDests.get(dest) ?? dest
-    if (maskedFiles.has(dest)) continue
+    if (isMaskedFile(dest) || isMaskedFile(rawDest)) continue
     if (isHiddenByTmpfs(dest) || isHiddenByTmpfs(rawDest)) {
       logForDebugging(
         `[Sandbox Linux] Skipping denyWrite bind already hidden by denyRead tmpfs: ${dest}`,
@@ -1909,16 +1929,13 @@ async function generateFilesystemArgs(
         // A write path that is itself a masked file keeps its mask, which
         // already leaves it unreadable and unwritable. --ro-bind <f> <f> on
         // top would hand the sandbox the real file, and the mask
-        // re-application below covers only a masked file STRICTLY under an
-        // emitted dest, so nothing puts the mask back. maskedFiles records
-        // the listed spelling and the resolved dest; allowedWritePaths holds
-        // listed spellings, so test both. A masked file strictly beneath a
-        // restored DIRECTORY is unaffected: that directory goes on
+        // re-application below keys off masked files STRICTLY under an
+        // emitted dest, so nothing puts the mask back. A masked file strictly
+        // beneath a restored DIRECTORY is unaffected: that directory goes on
         // emittedDenyWriteDests and the re-application re-masks the file.
-        if (
-          maskedFiles.has(writePath) ||
-          maskedFiles.has(resolveSymlinkDenyDest(writePath))
-        ) {
+        if (isMaskedFile(writePath)) {
+          if (maskedWritePathsKept.has(writePath)) continue
+          maskedWritePathsKept.add(writePath)
           logForDebugging(
             `[Sandbox Linux] Keeping the mask on a write path inside dropped denyWrite bind ${dest}: ${writePath}`,
           )
@@ -1986,8 +2003,20 @@ async function generateFilesystemArgs(
   // Same problem for masked files: the mask landed before the denyWrite
   // ancestor bind, so the real file is back. Re-apply the mask with its
   // original source (/dev/null for read-deny, the fake for credential mask).
+  // An emitted dest is canonical (or a raw alias of one) while the key may be
+  // spelled through a symlinked ancestor, so containment is tested under both
+  // spellings of the key and the mask goes back once per resolved destination.
+  const reAppliedMaskDests = new Set<string>()
   for (const [maskedFile, source] of maskedFiles) {
-    if (emittedDenyWriteDests.some(dest => isStrictlyUnder(maskedFile, dest))) {
+    const canonicalMaskedFile =
+      resolveSymlinkedDenyPath(maskedFile) ?? maskedFile
+    if (
+      emittedDenyWriteDests.some(
+        dest =>
+          isStrictlyUnder(maskedFile, dest) ||
+          isStrictlyUnder(canonicalMaskedFile, dest),
+      )
+    ) {
       // maskedFiles holds both the symlink path and its resolved target so
       // the denyWrite skip-check above matches either. Re-emission must go
       // to the target only — bwrap rejects a symlink bind dest (see
@@ -1995,6 +2024,8 @@ async function generateFilesystemArgs(
       // either its original mask survived (target outside this denyWrite
       // ancestor) or its own iteration re-emits it here.
       if (resolveSymlinkDenyDest(maskedFile) !== maskedFile) continue
+      if (reAppliedMaskDests.has(canonicalMaskedFile)) continue
+      reAppliedMaskDests.add(canonicalMaskedFile)
       logForDebugging(
         `[Sandbox Linux] Re-applying file mask re-exposed by denyWrite bind: ${maskedFile}`,
       )
