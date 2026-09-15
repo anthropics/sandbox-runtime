@@ -670,7 +670,7 @@ Filesystem restrictions are enforced at the OS level:
 - The string must be run while the process that produced it is alive, and before the runtime cleans up after that command (`cleanupAfterCommand()`), which is when the profile is released.
 - The profile needs a directory that takes an `O_TMPFILE` file — `os.tmpdir()`, else `/dev/shm` — and a readable `/proc/self/fd`. Without them an over-long profile is refused at wrap time with the reason; there is no fallback to a named file. Profiles that fit the command line do not use any of this.
 - bubblewrap parses at most 9000 arguments (about 3000 mounts). A profile past that, or a command too long for one argument by itself, fails at wrap time with an error.
-- Every one of these wrap-time refusals is a `LinuxSandboxProfileError`, exported from the package root, and `.code` tells the cases apart: `too_many_arguments`, `too_many_arguments_via_file`, `nul_in_path`, `args_file_unavailable`, `command_too_long`. They say the configuration expands to a profile this host cannot run, not that the embedding program did anything wrong, so branch on `.code` rather than on the message.
+- Every one of these wrap-time refusals is a `LinuxSandboxProfileError`, exported from the package root, with a `LinuxSandboxProfileErrorCode` on `.code` to tell the cases apart; branch on `.code` rather than on the message. They say the configuration expands to a profile this host cannot run, except `command_too_long` and `nul_in_path`, which also fire on what the embedding program passed in. A wrap that threw has already released what it held: do not call `cleanupAfterCommand()` for it, or a sandbox still running loses its mount points.
 
 ### Mandatory Deny Paths (Auto-Protected Files)
 
