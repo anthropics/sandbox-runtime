@@ -1906,6 +1906,24 @@ async function generateFilesystemArgs(
         if (!isAtOrUnder(writePath, dest) && !isAtOrUnder(writePath, rawDest)) {
           continue
         }
+        // A write path that is itself a masked file keeps its mask, which
+        // already leaves it unreadable and unwritable. --ro-bind <f> <f> on
+        // top would hand the sandbox the real file, and the mask
+        // re-application below covers only a masked file STRICTLY under an
+        // emitted dest, so nothing puts the mask back. maskedFiles records
+        // the listed spelling and the resolved dest; allowedWritePaths holds
+        // listed spellings, so test both. A masked file strictly beneath a
+        // restored DIRECTORY is unaffected: that directory goes on
+        // emittedDenyWriteDests and the re-application re-masks the file.
+        if (
+          maskedFiles.has(writePath) ||
+          maskedFiles.has(resolveSymlinkDenyDest(writePath))
+        ) {
+          logForDebugging(
+            `[Sandbox Linux] Keeping the mask on a write path inside dropped denyWrite bind ${dest}: ${writePath}`,
+          )
+          continue
+        }
         if (restoredReadOnlyWritePaths.has(writePath)) continue
         restoredReadOnlyWritePaths.add(writePath)
         args.push('--ro-bind', writePath, writePath)
