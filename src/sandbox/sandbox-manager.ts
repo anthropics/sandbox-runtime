@@ -110,7 +110,8 @@ import {
 } from './resolved-address-guard.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
-import { getJavaProxyAgentJarPath } from './java-proxy-agent.js'
+import { getJavaProxyAgentJarPathAsync } from './java-proxy-agent.js'
+import { getApplySeccompBinaryPathAsync } from './generate-seccomp-filter.js'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -926,8 +927,10 @@ async function initialize(
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
       // JVMs read neither HTTPS_PROXY nor its credential; the agent bridges
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
+      // Async: the global-npm fallback spawns `npm root -g`.
       javaAgentJarPath =
-        getJavaProxyAgentJarPath(config.javaAgentJarPath) ?? undefined
+        (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
+        undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1076,6 +1079,12 @@ async function checkDependenciesAsync(ripgrepConfig?: {
   command: string
   args?: string[]
 }): Promise<SandboxDependencyCheck> {
+  // Linux: resolve apply-seccomp first so its global-npm fallback
+  // (`npm root -g`) runs off the event loop; the sync check below then
+  // hits the shared path cache.
+  if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
+    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+  }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
