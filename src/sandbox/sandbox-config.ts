@@ -768,6 +768,12 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe('Whether to allow binding to local ports (default: false)'),
+  exposeLoopbackPorts: z
+    .array(z.number().int().min(1).max(65535))
+    .optional()
+    .describe(
+      'Linux only: specific 127.0.0.1 ports the sandboxed process binds that the host should be able to reach through the bwrap network-namespace boundary. Each listed port gets its own scoped Unix-socket bridge; no general network access is granted, and ports not listed remain unreachable from outside the sandbox. Has no effect on macOS (no network namespace is created there).',
+    ),
   allowMachLookup: z
     .array(
       z.string().refine(
