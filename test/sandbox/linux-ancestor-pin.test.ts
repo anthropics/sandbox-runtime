@@ -396,10 +396,15 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     }
   })
 
-  it('pins the corridor below an allowWrite carve-out nested inside a denied directory', async () => {
-    // repo is denyRead-hidden (its own read-only bind is dropped as
-    // tmpfs-hidden) and the carve-out sub inside it is restored writable;
-    // x, between sub and the deeper leaf, is pinned and cannot be moved.
+  it('pins the corridor below an allowWrite carve-out nested inside a read-denied directory', async () => {
+    // repo is denyRead-hidden and the carve-out sub inside it is restored
+    // writable; x, between sub and the deeper leaf, is pinned. That restore
+    // buries the pin, and a buried mount still answers the kernel's rename
+    // check, so x cannot be moved aside.
+    //
+    // A denyWrite on repo itself would make this a different shape: its own
+    // bind is dropped as tmpfs-hidden and sub, inside that write deny, comes
+    // back read-only instead of writable (readonly-deny-dir-binds.test.ts).
     mkTree(PROJECT, {
       repo: { sub: { x: { secret: 'DENYTEST\n' } }, 'hidden.txt': 'X\n' },
     })
@@ -412,7 +417,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       {
         allowWrite: [subDir],
         denyRead: [repoDir],
-        denyWrite: [repoDir, secretPath],
+        denyWrite: [secretPath],
       },
       `cd ${subDir} && mv x x2 && mkdir -p x && echo evil > ${secretPath}`,
     )
