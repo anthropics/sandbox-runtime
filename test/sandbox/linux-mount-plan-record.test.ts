@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
+import { countBinds } from '../helpers/bwrap-argv.js'
 
 // Argument-level checks; nothing here executes bwrap.
 describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
@@ -26,23 +27,6 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
-
-  /** Occurrences of one whole `<flag> <source> <dest>` argv triple. */
-  function countBinds(
-    command: string,
-    flag: string,
-    source: string,
-    dest: string,
-  ): number {
-    const argv = command.split(/\s+/)
-    let found = 0
-    for (let i = 0; i + 2 < argv.length; i++) {
-      if (argv[i] === flag && argv[i + 1] === source && argv[i + 2] === dest) {
-        found++
-      }
-    }
-    return found
-  }
 
   function tempTree(files: Record<string, string>): string {
     const proj = realpathSync(mkdtempSync(join(tmpdir(), 'mount-plan-')))

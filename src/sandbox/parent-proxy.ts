@@ -15,13 +15,19 @@
  *   - a generic CONNECT-tunnel helper that works over Unix socket, TCP, or TLS
  */
 
-import type { Socket } from 'node:net'
+import type { LookupFunction, Socket } from 'node:net'
 import type { IncomingHttpHeaders } from 'node:http'
 import { BlockList, connect as netConnect, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import type { ParentProxyConfig } from './sandbox-config.js'
+import {
+  addRange,
+  addressInSet,
+  isLoopbackAddress,
+  mappedIPv4,
+} from './address.js'
 
 export interface ResolvedParentProxy {
   httpUrl?: URL
@@ -127,26 +133,10 @@ function parseNoProxy(raw: string): NoProxyRules {
       continue
     }
 
-    // CIDR?
-    const slash = entry.indexOf('/')
-    if (slash !== -1) {
-      const ip = entry.slice(0, slash)
-      const prefixStr = entry.slice(slash + 1)
-      const fam = isIP(ip)
-      if (fam && prefixStr !== '' && /^\d+$/.test(prefixStr)) {
-        const prefix = Number(prefixStr)
-        const max = fam === 6 ? 128 : 32
-        if (prefix >= 0 && prefix <= max) {
-          try {
-            rules.cidr.addSubnet(ip, prefix, fam === 6 ? 'ipv6' : 'ipv4')
-          } catch {
-            // BlockList rejected it — ignore this entry.
-          }
-          continue
-        }
-      }
-      // malformed CIDR → ignore (do NOT treat as suffix; `/` isn't a valid
-      // hostname char)
+    // CIDR? A malformed one is ignored (do NOT treat as suffix; `/` isn't
+    // a valid hostname char).
+    if (entry.includes('/')) {
+      addRange(rules.cidr, entry)
       continue
     }
 
@@ -157,21 +147,15 @@ function parseNoProxy(raw: string): NoProxyRules {
     const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(v)
     if (bracketed) v = bracketed[1]!
     if (v.startsWith('*.')) v = v.slice(1)
-    const bareFam = isIP(v)
-    if (!bareFam) {
+    if (!isIP(v)) {
       const colon = v.lastIndexOf(':')
       if (colon !== -1 && /^\d+$/.test(v.slice(colon + 1))) {
         v = v.slice(0, colon)
       }
-    } else {
-      // Bare IP literal — store as an exact-match /32 or /128 CIDR so that
-      // lookups go through BlockList rather than string suffix matching.
-      try {
-        rules.cidr.addAddress(v, bareFam === 6 ? 'ipv6' : 'ipv4')
-        continue
-      } catch {
-        // fall through to suffix push
-      }
+    } else if (addRange(rules.cidr, v)) {
+      // Bare IP literal — an exact-match /32 or /128 rule, so lookups go
+      // through BlockList rather than string suffix matching.
+      continue
     }
     rules.suffixes.push(v)
   }
@@ -194,17 +178,10 @@ export function shouldBypassParentProxy(
 
   // Always bypass loopback — chaining localhost through an upstream proxy is
   // never what you want. Covers the whole 127/8 block and IPv4-mapped forms.
-  if (h === 'localhost') return true
-  const fam = isIP(h)
-  if (fam) {
-    if (LOOPBACK.check(h, fam === 6 ? 'ipv6' : 'ipv4')) return true
-  }
+  if (h === 'localhost' || isLoopbackAddress(h)) return true
 
   if (resolved.noProxy.all) return true
-
-  if (fam) {
-    if (resolved.noProxy.cidr.check(h, fam === 6 ? 'ipv6' : 'ipv4')) return true
-  }
+  if (addressInSet(resolved.noProxy.cidr, h)) return true
 
   for (const v of resolved.noProxy.suffixes) {
     if (v.startsWith('.')) {
@@ -217,14 +194,6 @@ export function shouldBypassParentProxy(
   }
   return false
 }
-
-const LOOPBACK = (() => {
-  const bl = new BlockList()
-  bl.addSubnet('127.0.0.0', 8, 'ipv4')
-  bl.addAddress('::1', 'ipv6')
-  bl.addSubnet('::ffff:127.0.0.0', 104, 'ipv6') // v4-mapped loopback
-  return bl
-})()
 
 /**
  * Pick which parent proxy URL to use for a given destination.
@@ -475,25 +444,93 @@ export function canonicalizeHost(h: string): string | undefined {
     // forms and IPv6 compression. It does NOT strip trailing dots or IPv6
     // brackets from the output, so we do that ourselves.
     const bracketed = isIP(bare) === 6 ? `[${bare}]` : bare
-    const out = new URL(`http://${bracketed}/`).hostname
-    return stripBrackets(out).replace(/\.$/, '')
+    const out = stripBrackets(new URL(`http://${bracketed}/`).hostname)
+    // An IPv4-mapped literal connects to that IPv4 address, so it is spelled
+    // as one: allow/deny entries and requests then compare equal.
+    return isIP(out) === 6 ? (mappedIPv4(out) ?? out) : out.replace(/\.$/, '')
   } catch {
     return undefined
+  }
+}
+
+/** Per-dial name resolution the proxies are handed: the guard's `lookup` for `port`, refusals recorded. */
+export type DirectLookup = (
+  port: number,
+  encodedCommand?: string,
+) => LookupFunction
+
+/** `host[:port]` as it belongs in a Host header / URL authority: IPv6 bracketed, the default port elided. */
+export function formatAuthority(
+  host: string,
+  port: number,
+  defaultPort: number,
+): string {
+  const bracketed = isIP(host) === 6 ? `[${host}]` : host
+  return port === defaultPort ? bracketed : `${bracketed}:${port}`
+}
+
+export interface DirectRequestOptions {
+  host: string
+  port: number
+  servername?: string
+  agent: false
+}
+
+/**
+ * Connection options for an `http(s).request` to `host:port` over the direct
+ * route. The name is dialed exactly as a tunnel would be ({@link dialDirect}:
+ * the guard's `lookup`, the connect timeout, the runtime's address-family
+ * fallback), the address that answered is kept and that connection released;
+ * the request then goes to the literal, with the name in SNI (callers keep it
+ * in Host). So the vetted address is the one requested and `lookup` never
+ * reaches the HTTP client: Bun's node:http client up to 1.3.x resolves through
+ * a custom `lookup` but then drops or repeats a streamed request body, and
+ * ignores `createConnection` (oven-sh/bun#7471), so the vetted socket cannot
+ * simply be adopted. Bun 1.4 rewrote that client (oven-sh/bun#31587); once it
+ * is the floor, hand the request the dialed socket and drop the second connect.
+ * No agent: the global pool is shared with the embedding process (and Bun
+ * caches the first request's `ca` on it), and the vetting dial runs per request
+ * anyway. Without a `lookup`, or for an IP literal, the host is used as given.
+ */
+export async function directRequestOptions(
+  host: string,
+  port: number,
+  lookup: LookupFunction | undefined,
+  tls: boolean,
+): Promise<DirectRequestOptions> {
+  let address = host
+  if (lookup && !isIP(host)) {
+    const probe = await dialDirect(host, port, lookup)
+    address = probe.remoteAddress ?? ''
+    probe.destroy()
+    if (!address) throw new Error(`connect ${host}:${port}: no peer address`)
+  }
+  // SNI cannot carry an IP literal, and Bun treats `servername: undefined`
+  // differently from an absent key.
+  return {
+    host: address,
+    port,
+    ...(tls && !isIP(host) ? { servername: host } : {}),
+    agent: false,
   }
 }
 
 /**
  * Dial `host:port` directly with a bounded timeout. Shared by the HTTP and
  * SOCKS direct-connect paths so they get the same timeout behaviour as the
- * CONNECT-tunnelled paths.
+ * CONNECT-tunnelled paths. `lookup` is the resolved-address guard's (see
+ * resolved-address-guard.ts); the runtime dials what it returns. It is a
+ * required argument so no direct dial omits it by accident — pass
+ * `undefined` explicitly to use the runtime's resolver unguarded.
  */
 export function dialDirect(
   host: string,
   port: number,
+  lookup: LookupFunction | undefined,
   timeoutMs = CONNECT_TIMEOUT_MS,
 ): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const s = netConnect(port, host)
+    const s = netConnect({ port, host, lookup })
     let settled = false
     const done = (err?: Error) => {
       if (settled) return
