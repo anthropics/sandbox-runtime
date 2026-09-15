@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import {
   existsSync,
   mkdirSync,
@@ -18,6 +18,8 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 import { countBinds } from '../helpers/bwrap-argv.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 /**
  * A deny path strictly beneath a directory that denyWithinAllow re-binds
@@ -33,25 +35,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
   const savedCwd = process.cwd()
 
-  // Runtime arm, as in readonly-deny-dir-stubs.test.ts: only where bwrap can
-  // run the namespace/proc surface the wrapped commands use.
-  const BWRAP_CAN_NAMESPACE =
-    spawnSync(
-      'bwrap',
-      [
-        '--unshare-pid',
-        '--unshare-user',
-        '--cap-drop',
-        'ALL',
-        '--ro-bind',
-        '/',
-        '/',
-        '--proc',
-        '/proc',
-        'true',
-      ],
-      { timeout: 5000 },
-    ).status === 0
+  const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
 
   beforeEach(() => {
     BASE = realpathSync(mkdtempSync(join(tmpdir(), 'ro-deny-bind-')))
@@ -215,8 +199,9 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     // --ro-bind / / lands after both allow binds and holds PROJ read-only,
     // so PROJ's bind is dropped as covered — and that root bind is what the
     // FILE mask's re-application keys off, so the read-denied file is masked
-    // again on top of it. A string-prefix comparison ('/' + '/') matched
-    // nothing, dropped the root's own deny, and left the file readable.
+    // again on top of it. Containment has to be root-aware for any of that:
+    // a string-prefix comparison ('/' + '/') matched nothing, dropped the
+    // root's own deny, and left the file readable.
     const command = await wrap(['/', PROJ], [FILE], ['/', AREA])
 
     // Two whole triples: the base root mount, then the deny's own bind. Both
@@ -256,22 +241,9 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
   it('warns that a write deny covers an allowed write path beneath it', async () => {
     // The deny's read-only bind is emitted after every allow bind, so this
     // shape starts with AREA read-only instead of aborting. Name both paths.
-    const warnings: string[] = []
-    const savedDebug = process.env.SRT_DEBUG
-    process.env.SRT_DEBUG = '1'
-    const spies = [
-      spyOn(console, 'warn').mockImplementation((...parts: unknown[]) => {
-        warnings.push(parts.map(String).join(' '))
-      }),
-      spyOn(console, 'error').mockImplementation(() => {}),
-    ]
-    try {
-      await wrap(['/'], [], ['/', AREA])
-    } finally {
-      for (const spy of spies) spy.mockRestore()
-      if (savedDebug === undefined) delete process.env.SRT_DEBUG
-      else process.env.SRT_DEBUG = savedDebug
-    }
+    const { warnings } = await withCapturedWarnings(() =>
+      wrap(['/'], [], ['/', AREA]),
+    )
 
     expect(warnings.join('\n')).toContain(
       `Write deny / covers allowed write path ${AREA}`,

@@ -17,6 +17,8 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 /**
  * Regression tests for creation-blocking stubs under a read-only denied
@@ -51,30 +53,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
   const savedCwd = process.cwd()
 
-  // Runtime arm: only where bwrap can actually run the same namespace/proc
-  // surface the wrapped commands use (--unshare-pid/--unshare-user/--proc —
-  // a bare --ro-bind probe passes on hosts where mounting a fresh /proc in
-  // the new PID namespace still EPERMs, turning the arm into a false red).
-  // No --unshare-net: wrap() passes needsNetworkRestriction: false, so the
-  // commands under test never create a netns and the probe must not require
-  // one (a netns-restricted host would otherwise silently skip the arm).
-  const BWRAP_CAN_NAMESPACE =
-    spawnSync(
-      'bwrap',
-      [
-        '--unshare-pid',
-        '--unshare-user',
-        '--cap-drop',
-        'ALL',
-        '--ro-bind',
-        '/',
-        '/',
-        '--proc',
-        '/proc',
-        'true',
-      ],
-      { timeout: 5000 },
-    ).status === 0
+  const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
 
   beforeEach(() => {
     BASE = realpathSync(mkdtempSync(join(tmpdir(), 'ro-deny-stub-')))
@@ -396,12 +375,11 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
   it('re-applies a denyWithinAllow bind under a trailing-slash allow re-bound over a denyRead tmpfs', async () => {
     // The emission filter drops deny binds hidden by a denyRead tmpfs
-    // UNLESS a write re-bind re-exposes them (reExposedByWriteBind). That
-    // exception also compares `writePath + '/'` prefixes, so a
-    // trailing-slash allow spelling used to defeat it: the writable
-    // re-bind was emitted but the deny bind beneath it was dropped —
-    // leaving the explicitly denied file writable. With the recorded
-    // spelling stripped, the deny bind survives the filter.
+    // UNLESS an allowed write path the tmpfs restored covers them. That
+    // exception tests containment root-aware, which a trailing-slash allow
+    // spelling used to defeat: the writable re-bind was emitted but the
+    // deny bind beneath it was dropped — leaving the explicitly denied file
+    // writable. With the recorded spelling stripped, the bind survives.
     const nestedAllow = join(PROJ, 'w')
     mkdirSync(nestedAllow, { recursive: true })
     const secret = join(nestedAllow, 'secret.txt')
@@ -591,39 +569,30 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const tmpRoot = `/${BASE.split('/')[1]}`
     const realReaddirSync = fs.readdirSync
     let failed = 0
-    const warnings: string[] = []
-    const savedDebug = process.env.SRT_DEBUG
-    process.env.SRT_DEBUG = '1'
-    const spies = [
-      spyOn(fs, 'readdirSync').mockImplementation(((
-        p: fs.PathLike,
-        ...rest: unknown[]
-      ) => {
-        if (String(p) === '/' && failed < failures) {
-          failed++
-          throw Object.assign(new Error('EMFILE: too many open files'), {
-            code: 'EMFILE',
-          })
-        }
-        return (realReaddirSync as (...a: unknown[]) => unknown)(p, ...rest)
-      }) as typeof fs.readdirSync),
-      spyOn(console, 'warn').mockImplementation((...parts: unknown[]) => {
-        warnings.push(parts.map(String).join(' '))
-      }),
-      spyOn(console, 'error').mockImplementation(() => {}),
-    ]
+    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      p: fs.PathLike,
+      ...rest: unknown[]
+    ) => {
+      if (String(p) === '/' && failed < failures) {
+        failed++
+        throw Object.assign(new Error('EMFILE: too many open files'), {
+          code: 'EMFILE',
+        })
+      }
+      return (realReaddirSync as (...a: unknown[]) => unknown)(p, ...rest)
+    }) as typeof fs.readdirSync)
     try {
-      const command = await wrapCommandWithSandboxLinux({
-        command: 'echo hello',
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
-        writeConfig,
-      })
+      const { result: command, warnings } = await withCapturedWarnings(() =>
+        wrapCommandWithSandboxLinux({
+          command: 'echo hello',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
+          writeConfig,
+        }),
+      )
       return { command, warnings, failed }
     } finally {
-      for (const spy of spies) spy.mockRestore()
-      if (savedDebug === undefined) delete process.env.SRT_DEBUG
-      else process.env.SRT_DEBUG = savedDebug
+      spy.mockRestore()
     }
   }
 
@@ -725,9 +694,6 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const realReaddirSync = fs.readdirSync
     const realRealpathSync = fs.realpathSync
     let probeLookups = 0
-    const warnings: string[] = []
-    const savedDebug = process.env.SRT_DEBUG
-    process.env.SRT_DEBUG = '1'
     const spies = [
       spyOn(fs, 'readdirSync').mockImplementation(((
         p: fs.PathLike,
@@ -751,23 +717,19 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
         }
         return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
       }) as typeof fs.realpathSync),
-      spyOn(console, 'warn').mockImplementation((...parts: unknown[]) => {
-        warnings.push(parts.map(String).join(' '))
-      }),
-      spyOn(console, 'error').mockImplementation(() => {}),
     ]
     try {
-      const command = await wrapCommandWithSandboxLinux({
-        command: 'echo hello',
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
-        writeConfig: { allowOnly: [AREA], denyWithinAllow: [PROJ] },
-      })
+      const { result: command, warnings } = await withCapturedWarnings(() =>
+        wrapCommandWithSandboxLinux({
+          command: 'echo hello',
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
+          writeConfig: { allowOnly: [AREA], denyWithinAllow: [PROJ] },
+        }),
+      )
       return { command, warnings, probeLookups }
     } finally {
       for (const spy of spies) spy.mockRestore()
-      if (savedDebug === undefined) delete process.env.SRT_DEBUG
-      else process.env.SRT_DEBUG = savedDebug
     }
   }
 

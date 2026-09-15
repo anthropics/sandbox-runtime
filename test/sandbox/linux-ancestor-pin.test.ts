@@ -16,32 +16,29 @@ import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
 import { isLinux } from '../helpers/platform.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import {
+  countBinds,
+  indexOfTriple,
+  lastIndexOfTriple,
+} from '../helpers/bwrap-argv.js'
 
-// The blocks that execute bwrap need unprivileged user namespaces; the
-// argument-level assertions run everywhere on Linux.
+// Every scenario has an argument-level arm that runs everywhere on Linux and,
+// where one is useful, a "(live bwrap)" companion that executes the wrapped
+// command. The companions are skipped, visibly, where unprivileged user
+// namespaces are unavailable.
 describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   let BASE: string
   let PROJECT: string
   const savedCwd = process.cwd()
 
-  const BWRAP_CAN_NAMESPACE =
-    spawnSync(
-      'bwrap',
-      [
-        '--unshare-pid',
-        '--unshare-user',
-        '--cap-drop',
-        'ALL',
-        '--ro-bind',
-        '/',
-        '/',
-        '--proc',
-        '/proc',
-        'true',
-      ],
-      { timeout: 5000 },
-    ).status === 0
+  const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
+
+  // Built in CI; absent elsewhere, where the arm that needs it must skip
+  // visibly rather than quietly run without the seccomp stage.
+  const APPLY_SECCOMP = getApplySeccompBinaryPath()
 
   // glibc before 2.28 and some other libcs have no renameat2 wrapper.
   const CAN_CALL_RENAMEAT2 =
@@ -54,12 +51,12 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
   function mkTree(root: string, tree: Tree): void {
     for (const [name, value] of Object.entries(tree)) {
-      const p = join(root, name)
+      const entryPath = join(root, name)
       if (typeof value === 'string') {
-        writeFileSync(p, value)
+        writeFileSync(entryPath, value)
       } else {
-        mkdirSync(p, { recursive: true })
-        mkTree(p, value)
+        mkdirSync(entryPath, { recursive: true })
+        mkTree(entryPath, value)
       }
     }
   }
@@ -118,13 +115,15 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   // A command that reports one errno per labelled raw syscall and ends with
   // PROBE_DONE, so a sandbox that never starts cannot pass as "no failures".
   const PROBE_DONE = 'PROBE_DONE'
-  const q = (s: string): string => JSON.stringify(s)
+  const asJsString = (s: string): string => JSON.stringify(s)
   function nodeProbe(ops: Array<[string, string]>): string {
     const script = [
       "const fs = require('fs')",
       "const op = (n, f) => { try { f(); console.log(n + '=OK') } catch (e) { console.log(n + '=' + e.code) } }",
-      ...ops.map(([label, body]) => `op(${q(label)}, () => { ${body} })`),
-      `console.log(${q(PROBE_DONE)})`,
+      ...ops.map(
+        ([label, body]) => `op(${asJsString(label)}, () => { ${body} })`,
+      ),
+      `console.log(${asJsString(PROBE_DONE)})`,
     ].join('; ')
     const probeFile = join(BASE, 'probe.cjs')
     writeFileSync(probeFile, script)
@@ -138,20 +137,23 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     const command = await wrap()
 
     expect(command).toContain('--ro-bind / /')
-    const configBind = `--ro-bind ${gitDir}/config ${gitDir}/config`
-    expect(command).toContain(configBind)
+    const configDeny = `${gitDir}/config`
+    expect(countBinds(command, '--ro-bind', configDeny, configDeny)).toBe(1)
     // .git sits strictly between the leaf denies and the allowWrite root.
-    const gitPin = `--ro-bind ${gitDir} ${gitDir}`
-    expect(command).toContain(gitPin)
-    const rootBind = `--bind ${PROJECT} ${PROJECT}`
-    expect(command.indexOf(gitPin)).toBeLessThan(command.indexOf(rootBind))
-    expect(command.indexOf(gitPin)).toBeLessThan(command.indexOf(configBind))
+    const gitPin = indexOfTriple(command, '--ro-bind', gitDir, gitDir)
+    expect(gitPin).toBeGreaterThan(-1)
+    expect(gitPin).toBeLessThan(
+      indexOfTriple(command, '--bind', PROJECT, PROJECT),
+    )
+    expect(gitPin).toBeLessThan(
+      indexOfTriple(command, '--ro-bind', configDeny, configDeny),
+    )
     const outside = dirname(PROJECT)
     expect(command).not.toContain(`--ro-bind ${outside} ${outside}`)
     // The allowWrite root is bound exactly once (its allow bind); a pin there
     // would add nothing.
-    expect(command.split(rootBind).length - 1).toBe(1)
-    expect(command).not.toContain(`--ro-bind ${PROJECT} ${PROJECT}`)
+    expect(countBinds(command, '--bind', PROJECT, PROJECT)).toBe(1)
+    expect(countBinds(command, '--ro-bind', PROJECT, PROJECT)).toBe(0)
   })
 
   it('pins ancestors of absent-path stub dests', async () => {
@@ -181,42 +183,53 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command).toContain(`--ro-bind ${nestedDir} ${nestedDir}`)
   })
 
-  it('keeps leaf denies enforced when a denyRead tmpfs sits between nested allowWrite roots', async () => {
-    // x and y are pinned beneath everything; the tmpfs on y lands on top of
-    // both, the denyRead section's restore of the nested allowWrite z runs
-    // before the buffered deny binds, and the config deny lands on top of it.
+  // x and y are pinned beneath everything; the tmpfs on y lands on top of
+  // both, the denyRead section's restore of the nested allowWrite z runs
+  // before the buffered deny binds, and the config deny lands on top of it.
+  function nestedWriteRootsUnderTmpfs() {
     mkTree(PROJECT, {
       x: { y: { z: { '.git': { hooks: {}, config: '[core]\n' } } } },
     })
     const yDir = join(PROJECT, 'x', 'y')
     const zDir = join(yDir, 'z')
-    const configPath = join(zDir, '.git', 'config')
-    const filesystem = {
-      allowWrite: [zDir],
-      denyRead: [yDir],
-      denyWrite: [configPath],
+    return {
+      xDir: join(PROJECT, 'x'),
+      yDir,
+      zDir,
+      configPath: join(zDir, '.git', 'config'),
+      filesystem: {
+        allowWrite: [zDir],
+        denyRead: [yDir],
+        denyWrite: [join(zDir, '.git', 'config')],
+      },
     }
+  }
 
-    const command = await wrap(
-      filesystem,
-      `echo evil >> ${configPath} && echo PLANTED`,
-    )
+  it('keeps leaf denies enforced when a denyRead tmpfs sits between nested allowWrite roots', async () => {
+    const { xDir, yDir, zDir, configPath, filesystem } =
+      nestedWriteRootsUnderTmpfs()
 
-    const configBind = `--ro-bind ${configPath} ${configPath}`
-    const zBind = `--bind ${zDir} ${zDir}`
-    const xPin = `--ro-bind ${join(PROJECT, 'x')} ${join(PROJECT, 'x')}`
-    expect(command).toContain(configBind)
-    expect(command).toContain(zBind)
-    expect(command.lastIndexOf(configBind)).toBeGreaterThan(
-      command.lastIndexOf(zBind),
-    )
+    const command = await wrap(filesystem)
+
+    expect(
+      lastIndexOfTriple(command, '--ro-bind', configPath, configPath),
+    ).toBeGreaterThan(lastIndexOfTriple(command, '--bind', zDir, zDir))
+    expect(countBinds(command, '--bind', zDir, zDir)).toBeGreaterThan(0)
+    const xPin = `--ro-bind ${xDir} ${xDir}`
     expect(command).toContain(xPin)
     expect(command.indexOf(xPin)).toBeLessThan(
       command.indexOf(`--tmpfs ${yDir}`),
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'keeps leaf denies enforced when a denyRead tmpfs sits between nested allowWrite roots (live bwrap)',
+    async () => {
+      const { zDir, configPath, filesystem } = nestedWriteRootsUnderTmpfs()
+
+      const result = run(
+        await wrap(filesystem, `echo evil >> ${configPath} && echo PLANTED`),
+      )
       expect(result.stdout ?? '').not.toContain('PLANTED')
       expect(result.status).not.toBe(0)
       expect(readFileSync(configPath, 'utf8')).toBe('[core]\n')
@@ -227,10 +240,10 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       )
       expect(run(writable).stdout).toContain('Z_WRITE_OK')
       expect(existsSync(join(zDir, 'newfile.txt'))).toBe(true)
-    }
-  })
+    },
+  )
 
-  it('pins an ancestor that contains a read-deny tmpfs; the tmpfs still lands on top', async () => {
+  function tmpfsInsidePinnedAncestor() {
     mkTree(PROJECT, {
       x: {
         y: {
@@ -247,23 +260,33 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     const zDir = join(yDir, 'z')
     const appDir = join(zDir, 'app')
     const dataDir = join(appDir, 'data')
-    const secretPath = join(dataDir, 'secret.txt')
     const configPath = join(appDir, 'repo', '.git', 'config')
-
-    const command = await wrap(
-      {
+    return {
+      xDir: join(PROJECT, 'x'),
+      yDir,
+      appDir,
+      dataDir,
+      secretPath: join(dataDir, 'secret.txt'),
+      configPath,
+      filesystem: {
         allowWrite: [zDir],
         denyRead: [yDir, dataDir],
         denyWrite: [configPath],
       },
-      `cat ${secretPath} 2>&1; echo evil >> ${secretPath} 2>&1; echo evil >> ${configPath} 2>&1; echo DONE`,
-    )
+    }
+  }
+
+  it('pins an ancestor that contains a read-deny tmpfs; the tmpfs still lands on top', async () => {
+    const { xDir, yDir, appDir, dataDir, filesystem } =
+      tmpfsInsidePinnedAncestor()
+
+    const command = await wrap(filesystem)
 
     const dataTmpfs = `--tmpfs ${dataDir}`
     // Space-terminated: yDir is a string prefix of dataDir.
     const yTmpfs = `--tmpfs ${yDir} `
     const appPin = `--ro-bind ${appDir} ${appDir}`
-    const xPin = `--ro-bind ${join(PROJECT, 'x')} ${join(PROJECT, 'x')}`
+    const xPin = `--ro-bind ${xDir} ${xDir}`
     expect(command).toContain(dataTmpfs)
     expect(command).toContain(yTmpfs)
     expect(command).toContain(appPin)
@@ -273,47 +296,78 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command).toContain(
       `--ro-bind ${join(appDir, 'repo')} ${join(appDir, 'repo')}`,
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'pins an ancestor that contains a read-deny tmpfs; the tmpfs still lands on top (live bwrap)',
+    async () => {
+      const { secretPath, configPath, filesystem } = tmpfsInsidePinnedAncestor()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `cat ${secretPath} 2>&1; echo evil >> ${secretPath} 2>&1; echo evil >> ${configPath} 2>&1; echo DONE`,
+        ),
+      )
+
       expect(result.stdout).toContain('DONE')
       expect(result.stdout).not.toContain('TOPSECRET')
       expect(readFileSync(secretPath, 'utf8')).toBe('TOPSECRET\n')
       expect(readFileSync(configPath, 'utf8')).toBe('[core]\n')
-    }
-  })
+    },
+  )
 
-  it('pins an ancestor that contains a symlink-spelled read-deny tmpfs location; the tmpfs still lands on top', async () => {
-    // The tmpfs mounts at data/secrets via the symlink spelling; data is
-    // pinned beneath it, so data cannot be renamed aside and the secret
-    // stays hidden.
+  // The tmpfs mounts at data/secrets via the symlink spelling; data is
+  // pinned beneath it, so data cannot be renamed aside and the secret
+  // stays hidden.
+  function symlinkSpelledTmpfs() {
     mkTree(PROJECT, { data: { secrets: { 'secret.txt': 'TOPSECRET\n' } } })
     const dataDir = join(PROJECT, 'data')
     const secretsLink = join(PROJECT, 'secrets')
     symlinkSync(join('data', 'secrets'), secretsLink)
-    const secretCanonical = join(dataDir, 'secrets', 'secret.txt')
+    return {
+      dataDir,
+      secretsLink,
+      secretCanonical: join(dataDir, 'secrets', 'secret.txt'),
+      filesystem: { denyRead: [secretsLink] },
+    }
+  }
 
-    const command = await wrap(
-      { denyRead: [secretsLink] },
-      `cat ${secretCanonical} 2>&1; cat ${secretsLink}/secret.txt 2>&1; echo evil >> ${secretCanonical} 2>&1; mv ${dataDir} ${dataDir}-moved 2>&1; echo DONE`,
-    )
+  it('pins an ancestor that contains a symlink-spelled read-deny tmpfs location; the tmpfs still lands on top', async () => {
+    const { dataDir, secretsLink, filesystem } = symlinkSpelledTmpfs()
+
+    const command = await wrap(filesystem)
 
     const tmpfsOp = `--tmpfs ${secretsLink}`
     const dataPin = `--ro-bind ${dataDir} ${dataDir}`
     expect(command).toContain(tmpfsOp)
     expect(command).toContain(dataPin)
     expect(command.indexOf(dataPin)).toBeLessThan(command.indexOf(tmpfsOp))
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'pins an ancestor that contains a symlink-spelled read-deny tmpfs location; the tmpfs still lands on top (live bwrap)',
+    async () => {
+      const { dataDir, secretsLink, secretCanonical, filesystem } =
+        symlinkSpelledTmpfs()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `cat ${secretCanonical} 2>&1; cat ${secretsLink}/secret.txt 2>&1; echo evil >> ${secretCanonical} 2>&1; mv ${dataDir} ${dataDir}-moved 2>&1; echo DONE`,
+        ),
+      )
+
+      expect(result.stdout ?? '').toContain('DONE')
+      expect(result.stderr ?? '').not.toContain('bwrap:')
       expect(result.stdout ?? '').not.toContain('TOPSECRET')
       expect(result.stdout ?? '').toMatch(/busy/i)
       expect(existsSync(`${dataDir}-moved`)).toBe(false)
       expect(readFileSync(secretCanonical, 'utf8')).toBe('TOPSECRET\n')
-    }
-  })
+    },
+  )
 
-  it('restores a canonical allowWrite carve-out inside a symlink-spelled denyRead', async () => {
+  function carveOutInsideSymlinkSpelledDenyRead() {
     mkTree(PROJECT, {
       data: {
         d: { w: { secret: 'DENYTEST\n' }, 'elsewhere.txt': 'ALSOSECRET\n' },
@@ -324,11 +378,23 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     const secretPath = join(wDir, 'secret')
     const linkD = join(PROJECT, 'link-d')
     symlinkSync(join('data', 'd'), linkD)
+    return {
+      dDir,
+      wDir,
+      secretPath,
+      linkD,
+      filesystem: {
+        allowWrite: [wDir],
+        denyRead: [linkD],
+        denyWrite: [secretPath],
+      },
+    }
+  }
 
-    const command = await wrap(
-      { allowWrite: [wDir], denyRead: [linkD], denyWrite: [secretPath] },
-      `echo n > ${wDir}/newfile.txt 2>&1; echo evil >> ${secretPath} 2>&1; cat ${dDir}/elsewhere.txt 2>&1; echo DONE`,
-    )
+  it('restores a canonical allowWrite carve-out inside a symlink-spelled denyRead', async () => {
+    const { wDir, linkD, filesystem } = carveOutInsideSymlinkSpelledDenyRead()
+
+    const command = await wrap(filesystem)
 
     // The carve-out's writable re-bind must follow the tmpfs.
     const tmpfsOp = `--tmpfs ${linkD}`
@@ -337,21 +403,34 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command.lastIndexOf(wBind)).toBeGreaterThan(
       command.lastIndexOf(tmpfsOp),
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'restores a canonical allowWrite carve-out inside a symlink-spelled denyRead (live bwrap)',
+    async () => {
+      const { dDir, wDir, secretPath, filesystem } =
+        carveOutInsideSymlinkSpelledDenyRead()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `echo n > ${wDir}/newfile.txt 2>&1; echo evil >> ${secretPath} 2>&1; cat ${dDir}/elsewhere.txt 2>&1; echo DONE`,
+        ),
+      )
+
+      expect(result.stdout ?? '').toContain('DONE')
       expect(existsSync(join(wDir, 'newfile.txt'))).toBe(true)
       expect(readFileSync(secretPath, 'utf8')).toBe('DENYTEST\n')
       expect(result.stdout ?? '').not.toContain('ALSOSECRET')
-    }
-  })
+    },
+  )
 
-  it('restores an allowRead carve-out that is a symlink at the name it is, from its vetted target', async () => {
-    // The dotfile-manager shape: .netrc and docs inside a read-denied home
-    // are links into a sibling directory inside it. Restoring them only
-    // where they resolve leaves the names themselves missing in the sandbox;
-    // naming the link as the bind SOURCE would hand bwrap the link to
-    // re-resolve at mount time, after the containment check ran.
+  // The dotfile-manager shape: .netrc and docs inside a read-denied home are
+  // links into a sibling directory inside it. Restoring them only where they
+  // resolve leaves the names themselves missing in the sandbox; naming the
+  // link as the bind SOURCE would hand bwrap the link to re-resolve at mount
+  // time, after the containment check ran.
+  function symlinkedAllowReadCarveOuts() {
     mkTree(BASE, {
       home: {
         store: { netrc: 'SECRETTOKEN\n', pages: { 'readme.md': 'PAGETEXT\n' } },
@@ -360,34 +439,63 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     })
     const homeDir = join(BASE, 'home')
     const netrcName = join(homeDir, '.netrc')
-    const netrcTarget = join(homeDir, 'store', 'netrc')
     const docsName = join(homeDir, 'docs')
-    const docsTarget = join(homeDir, 'store', 'pages')
     symlinkSync(join('store', 'netrc'), netrcName)
     symlinkSync(join('store', 'pages'), docsName)
+    return {
+      homeDir,
+      netrcName,
+      netrcTarget: join(homeDir, 'store', 'netrc'),
+      docsName,
+      docsTarget: join(homeDir, 'store', 'pages'),
+      filesystem: {
+        denyRead: [homeDir],
+        allowRead: [netrcName, docsName],
+      },
+    }
+  }
 
-    const command = await wrap(
-      { denyRead: [homeDir], allowRead: [netrcName, docsName] },
-      `cat ${netrcName} 2>&1; cat ${join(docsName, 'readme.md')} 2>&1; cat ${join(homeDir, 'other.txt')} 2>&1; echo DONE`,
-    )
+  it('restores an allowRead carve-out that is a symlink at the name it is, from its vetted target', async () => {
+    const {
+      homeDir,
+      netrcName,
+      netrcTarget,
+      docsName,
+      docsTarget,
+      filesystem,
+    } = symlinkedAllowReadCarveOuts()
+
+    const command = await wrap(filesystem)
 
     expect(command).toContain(`--tmpfs ${homeDir} `)
     // The name is the destination; the vetted target is the source.
-    expect(command).toContain(`--ro-bind ${netrcTarget} ${netrcName}`)
-    expect(command).toContain(`--ro-bind ${docsTarget} ${docsName}`)
+    expect(countBinds(command, '--ro-bind', netrcTarget, netrcName)).toBe(1)
+    expect(countBinds(command, '--ro-bind', docsTarget, docsName)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${netrcName} `)
     expect(command).not.toContain(`--ro-bind ${docsName} `)
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'restores an allowRead carve-out that is a symlink at the name it is, from its vetted target (live bwrap)',
+    async () => {
+      const { homeDir, netrcName, docsName, filesystem } =
+        symlinkedAllowReadCarveOuts()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `cat ${netrcName} 2>&1; cat ${join(docsName, 'readme.md')} 2>&1; cat ${join(homeDir, 'other.txt')} 2>&1; echo DONE`,
+        ),
+      )
+
       expect(result.stdout).toContain('DONE')
       expect(result.stdout).toContain('SECRETTOKEN')
       expect(result.stdout).toContain('PAGETEXT')
       expect(result.stdout).not.toContain('HIDDEN')
-    }
-  })
+    },
+  )
 
-  it('pins inside a write-denied directory; the directory deny bind still lands on top', async () => {
+  function pinsInsideWriteDeniedDirectory() {
     mkTree(PROJECT, {
       x: {
         y: {
@@ -404,48 +512,70 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     const zDir = join(yDir, 'z')
     const appDir = join(zDir, 'app')
     const repoDir = join(appDir, 'repo')
-    const configPath = join(repoDir, '.git', 'config')
+    return {
+      zDir,
+      appDir,
+      repoDir,
+      filesystem: {
+        allowWrite: [zDir],
+        denyRead: [yDir],
+        denyWrite: [appDir, join(repoDir, '.git', 'config')],
+      },
+    }
+  }
 
-    const command = await wrap(
-      { allowWrite: [zDir], denyRead: [yDir], denyWrite: [appDir, configPath] },
-      `echo evil > ${repoDir}/.git/planted 2>&1; echo evil >> ${appDir}/owned.txt 2>&1; echo DONE`,
-    )
+  it('pins inside a write-denied directory; the directory deny bind still lands on top', async () => {
+    const { zDir, appDir, repoDir, filesystem } =
+      pinsInsideWriteDeniedDirectory()
 
-    const repoPin = `--ro-bind ${repoDir} ${repoDir}`
-    const gitPin = `--ro-bind ${repoDir}/.git ${repoDir}/.git`
-    const appRo = `--ro-bind ${appDir} ${appDir}`
-    expect(command).toContain(repoPin)
-    expect(command).toContain(gitPin)
+    const command = await wrap(filesystem)
+
+    const gitDir = join(repoDir, '.git')
+    const repoPin = indexOfTriple(command, '--ro-bind', repoDir, repoDir)
+    const gitPin = indexOfTriple(command, '--ro-bind', gitDir, gitDir)
+    const projectBind = indexOfTriple(command, '--bind', PROJECT, PROJECT)
+    expect(repoPin).toBeGreaterThan(-1)
+    expect(gitPin).toBeGreaterThan(-1)
     // app is both pinned (first occurrence) and denied (last occurrence);
     // the deny bind lands after z's writable restore and after every pin.
-    expect(command.split(appRo).length - 1).toBe(2)
-    expect(command.indexOf(appRo)).toBeLessThan(
-      command.indexOf(`--bind ${PROJECT} ${PROJECT}`),
+    expect(countBinds(command, '--ro-bind', appDir, appDir)).toBe(2)
+    const firstAppRo = indexOfTriple(command, '--ro-bind', appDir, appDir)
+    const lastAppRo = lastIndexOfTriple(command, '--ro-bind', appDir, appDir)
+    expect(firstAppRo).toBeLessThan(projectBind)
+    expect(lastAppRo).toBeGreaterThan(
+      lastIndexOfTriple(command, '--bind', zDir, zDir),
     )
-    expect(command.lastIndexOf(appRo)).toBeGreaterThan(
-      command.lastIndexOf(`--bind ${zDir} ${zDir}`),
-    )
-    expect(command.lastIndexOf(appRo)).toBeGreaterThan(command.indexOf(gitPin))
-    expect(command.indexOf(repoPin)).toBeLessThan(
-      command.indexOf(`--bind ${PROJECT} ${PROJECT}`),
-    )
-
-    if (BWRAP_CAN_NAMESPACE) {
-      expect(run(command).stdout).toContain('DONE')
-      expect(existsSync(join(repoDir, '.git', 'planted'))).toBe(false)
-      expect(readFileSync(join(appDir, 'owned.txt'), 'utf8')).toBe('KEEP\n')
-    }
+    expect(lastAppRo).toBeGreaterThan(gitPin)
+    expect(repoPin).toBeLessThan(projectBind)
   })
 
-  it('pins the corridor below an allowWrite carve-out nested inside a read-denied directory', async () => {
-    // repo is denyRead-hidden and the carve-out sub inside it is restored
-    // writable; x, between sub and the deeper leaf, is pinned. That restore
-    // buries the pin, and a buried mount still answers the kernel's rename
-    // check, so x cannot be moved aside.
-    //
-    // A denyWrite on repo itself would make this a different shape: its own
-    // bind is dropped as tmpfs-hidden and sub, inside that write deny, comes
-    // back read-only instead of writable (readonly-deny-dir-binds.test.ts).
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'pins inside a write-denied directory; the directory deny bind still lands on top (live bwrap)',
+    async () => {
+      const { appDir, repoDir, filesystem } = pinsInsideWriteDeniedDirectory()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `echo evil > ${repoDir}/.git/planted 2>&1; echo evil >> ${appDir}/owned.txt 2>&1; echo DONE`,
+        ),
+      )
+
+      expect(result.stdout).toContain('DONE')
+      expect(existsSync(join(repoDir, '.git', 'planted'))).toBe(false)
+      expect(readFileSync(join(appDir, 'owned.txt'), 'utf8')).toBe('KEEP\n')
+    },
+  )
+
+  // repo is denyRead-hidden and the carve-out sub inside it is restored
+  // writable; x, between sub and the deeper leaf, is pinned. That restore
+  // buries the pin, and a buried mount still answers the kernel's rename
+  // check, so x cannot be moved aside.
+  //
+  // A denyWrite on repo itself would make this a different shape: its own
+  // bind is dropped as tmpfs-hidden and sub, inside that write deny, comes
+  // back read-only instead of writable (readonly-deny-dir-binds.test.ts).
+  function pinnedCorridorBelowCarveOut() {
     mkTree(PROJECT, {
       repo: { sub: { x: { secret: 'DENYTEST\n' } }, 'hidden.txt': 'X\n' },
     })
@@ -453,94 +583,163 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     const subDir = join(repoDir, 'sub')
     const xDir = join(subDir, 'x')
     const secretPath = join(xDir, 'secret')
-
-    const command = await wrap(
-      {
+    return {
+      subDir,
+      xDir,
+      secretPath,
+      filesystem: {
         allowWrite: [subDir],
         denyRead: [repoDir],
         denyWrite: [secretPath],
       },
-      `cd ${subDir} && mv x x2 && mkdir -p x && echo evil > ${secretPath}`,
-    )
+    }
+  }
 
-    expect(command).toContain(`--ro-bind ${xDir} ${xDir}`)
+  it('pins the corridor below an allowWrite carve-out nested inside a read-denied directory', async () => {
+    const { xDir, filesystem } = pinnedCorridorBelowCarveOut()
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
-      expect(result.status).not.toBe(0)
+    const command = await wrap(filesystem)
+
+    expect(countBinds(command, '--ro-bind', xDir, xDir)).toBe(1)
+  })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'pins the corridor below an allowWrite carve-out nested inside a read-denied directory (live bwrap)',
+    async () => {
+      const { subDir, secretPath, filesystem } = pinnedCorridorBelowCarveOut()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `cd ${subDir} && mv x x2 && mkdir -p x && echo evil > ${secretPath}; echo ${PROBE_DONE}`,
+        ),
+      )
+
+      // The sentinel and a clean stderr first: a bwrap that never started
+      // also exits non-zero and says nothing about the payload.
+      expect(result.stdout ?? '').toContain(PROBE_DONE)
+      expect(result.stderr ?? '').not.toContain('bwrap:')
       expect(result.stderr ?? '').toMatch(/busy/i)
       expect(existsSync(join(subDir, 'x2'))).toBe(false)
       expect(readFileSync(secretPath, 'utf8')).toBe('DENYTEST\n')
-    }
-  })
+    },
+  )
 
-  it('keeps a deny leaf protected when its carve-out sits inside a denyRead inside a denied directory', async () => {
-    // denyWrite dir > denyRead > allowWrite carve-out > denyWrite leaf, each
-    // containing the next: the
-    // tmpfs re-application must not restore a write path with an emitted
-    // deny bind under it.
+  // denyWrite dir > denyRead > allowWrite carve-out > denyWrite leaf, each
+  // containing the next: the tmpfs re-application must not restore a write
+  // path with an emitted deny bind under it.
+  function denyLeafUnderNestedCarveOut() {
     mkTree(PROJECT, { d: { t: { w: { secret: 'PROTECT\n' } }, 'o.txt': 'X' } })
     const dDir = join(PROJECT, 'd')
     const tDir = join(dDir, 't')
     const wDir = join(tDir, 'w')
     const secretPath = join(wDir, 'secret')
-
-    const command = await wrap(
-      { allowWrite: [wDir], denyRead: [tDir], denyWrite: [dDir, secretPath] },
-      `echo evil >> ${secretPath} 2>&1; echo DONE`,
-    )
-
-    const secretRo = `--ro-bind ${secretPath} ${secretPath}`
-    const wBind = `--bind ${wDir} ${wDir}`
-    expect(command).toContain(secretRo)
-    expect(command.lastIndexOf(wBind)).toBeLessThan(
-      command.lastIndexOf(secretRo),
-    )
-
-    if (BWRAP_CAN_NAMESPACE) {
-      expect(run(command).stdout).toContain('DONE')
-      expect(readFileSync(secretPath, 'utf8')).toBe('PROTECT\n')
+    return {
+      wDir,
+      secretPath,
+      filesystem: {
+        allowWrite: [wDir],
+        denyRead: [tDir],
+        denyWrite: [dDir, secretPath],
+      },
     }
+  }
+
+  it('keeps a deny leaf protected when its carve-out sits inside a denyRead inside a denied directory', async () => {
+    const { wDir, secretPath, filesystem } = denyLeafUnderNestedCarveOut()
+
+    const command = await wrap(filesystem)
+
+    const secretRo = lastIndexOfTriple(
+      command,
+      '--ro-bind',
+      secretPath,
+      secretPath,
+    )
+    expect(secretRo).toBeGreaterThan(-1)
+    expect(lastIndexOfTriple(command, '--bind', wDir, wDir)).toBeLessThan(
+      secretRo,
+    )
   })
 
-  it('pins ancestors of denyRead file masks', async () => {
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'keeps a deny leaf protected when its carve-out sits inside a denyRead inside a denied directory (live bwrap)',
+    async () => {
+      const { secretPath, filesystem } = denyLeafUnderNestedCarveOut()
+
+      const result = run(
+        await wrap(filesystem, `echo evil >> ${secretPath} 2>&1; echo DONE`),
+      )
+
+      expect(result.stdout).toContain('DONE')
+      expect(readFileSync(secretPath, 'utf8')).toBe('PROTECT\n')
+    },
+  )
+
+  function denyReadFileMask() {
     mkTree(PROJECT, { config: { 'secrets.json': '{"k":"REAL"}\n' } })
     const configDir = join(PROJECT, 'config')
     const secretPath = join(configDir, 'secrets.json')
+    return { configDir, secretPath, filesystem: { denyRead: [secretPath] } }
+  }
 
-    const command = await wrap(
-      { denyRead: [secretPath] },
-      `cd ${PROJECT} && mv config config-moved && mkdir config && echo attacker > ${secretPath}`,
-    )
+  it('pins ancestors of denyRead file masks', async () => {
+    const { configDir, secretPath, filesystem } = denyReadFileMask()
 
-    expect(command).toContain(`--ro-bind /dev/null ${secretPath}`)
-    expect(command).toContain(`--ro-bind ${configDir} ${configDir}`)
+    const command = await wrap(filesystem)
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
-      expect(result.status).not.toBe(0)
+    expect(countBinds(command, '--ro-bind', '/dev/null', secretPath)).toBe(1)
+    expect(countBinds(command, '--ro-bind', configDir, configDir)).toBe(1)
+  })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'pins ancestors of denyRead file masks (live bwrap)',
+    async () => {
+      const { secretPath, filesystem } = denyReadFileMask()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `cd ${PROJECT} && mv config config-moved && mkdir config && echo attacker > ${secretPath}; echo ${PROBE_DONE}`,
+        ),
+      )
+
+      expect(result.stdout ?? '').toContain(PROBE_DONE)
+      expect(result.stderr ?? '').not.toContain('bwrap:')
       expect(result.stderr).toMatch(/busy/i)
       expect(existsSync(join(PROJECT, 'config-moved'))).toBe(false)
       expect(readFileSync(secretPath, 'utf8')).toBe('{"k":"REAL"}\n')
-    }
-  })
+    },
+  )
 
-  it('pins ancestors of a read-denied directory, so it cannot be renamed out from under its tmpfs', async () => {
+  function readDeniedDirectory() {
     mkTree(PROJECT, { other: { secrets: { 'key.pem': 'REALKEY\n' } } })
     const otherDir = join(PROJECT, 'other')
     const secretsDir = join(otherDir, 'secrets')
-    const filesystem = { denyRead: [secretsDir] }
+    return { otherDir, secretsDir, filesystem: { denyRead: [secretsDir] } }
+  }
 
-    const command = await wrap(
-      filesystem,
-      `cd ${PROJECT} && mv other o2; cat o2/secrets/key.pem 2>&1; echo DONE`,
-    )
+  it('pins ancestors of a read-denied directory, so it cannot be renamed out from under its tmpfs', async () => {
+    const { otherDir, secretsDir, filesystem } = readDeniedDirectory()
+
+    const command = await wrap(filesystem)
 
     expect(command).toContain(`--tmpfs ${secretsDir} `)
-    expect(command).toContain(`--ro-bind ${otherDir} ${otherDir}`)
+    expect(countBinds(command, '--ro-bind', otherDir, otherDir)).toBe(1)
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'pins ancestors of a read-denied directory, so it cannot be renamed out from under its tmpfs (live bwrap)',
+    async () => {
+      const { secretsDir, filesystem } = readDeniedDirectory()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `cd ${PROJECT} && mv other o2; cat o2/secrets/key.pem 2>&1; echo DONE`,
+        ),
+      )
+
       expect(result.stdout).toContain('DONE')
       expect(result.stderr).toMatch(/busy/i)
       expect(result.stdout).not.toContain('REALKEY')
@@ -551,8 +750,8 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
         `cat ${secretsDir}/key.pem 2>&1; echo DONE`,
       )
       expect(run(next).stdout).not.toContain('REALKEY')
-    }
-  })
+    },
+  )
 
   it.if(BWRAP_CAN_NAMESPACE)(
     'starts, and honours the carve-out, when a symlink and the directory holding its target are both read-denied',
@@ -640,11 +839,25 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command.lastIndexOf(maskBind)).toBe(command.indexOf(maskBind))
   })
 
+  // A mask-only config passes no write config at all, so the root is bound
+  // writable — the same shape as a '/' write root, and the pins go after that
+  // bind under one writable cover. Without them the directory above the mask
+  // is renamed aside and the real file read under its new name.
+  function maskOnlyWrap(command: string): Promise<string> {
+    return wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      allowAllUnixSockets: true,
+      maskedFileBinds: [
+        {
+          realPath: join(PROJECT, 'creds', 'token.txt'),
+          fakePath: join(PROJECT, 'fakes', 'token.txt'),
+        },
+      ],
+    })
+  }
+
   it('pins and covers a credential mask when there are no write restrictions', async () => {
-    // A mask-only config passes no write config at all, so the root is bound
-    // writable — the same shape as a '/' write root, and the pins go after
-    // that bind under one writable cover. Without them the directory above
-    // the mask is renamed aside and the real file read under its new name.
     mkTree(PROJECT, {
       creds: { 'token.txt': 'REALTOKEN\n' },
       fakes: { 'token.txt': 'FAKE\n' },
@@ -655,53 +868,71 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     const top = `/${BASE.split('/')[1]}`
     process.chdir(PROJECT)
 
-    const command = await wrapCommandWithSandboxLinux({
-      command: `cd ${PROJECT} && mv creds creds-moved 2>&1; cat ${realPath} 2>&1; echo DONE`,
-      needsNetworkRestriction: false,
-      allowAllUnixSockets: true,
-      maskedFileBinds: [{ realPath, fakePath }],
-    })
+    const command = await maskOnlyWrap('echo ok')
 
     expect(command).toContain('--bind / /')
-    const credsPin = `--ro-bind ${credsDir} ${credsDir}`
-    const cover = `--bind ${top} ${top}`
-    const mask = `--ro-bind ${fakePath} ${realPath}`
-    for (const fragment of [
+    const credsPin = indexOfTriple(command, '--ro-bind', credsDir, credsDir)
+    const cover = indexOfTriple(command, '--bind', top, top)
+    const mask = indexOfTriple(command, '--ro-bind', fakePath, realPath)
+    for (const index of [
       credsPin,
-      `--ro-bind ${PROJECT} ${PROJECT}`,
+      indexOfTriple(command, '--ro-bind', PROJECT, PROJECT),
       cover,
       mask,
     ]) {
-      expect(command).toContain(fragment)
+      expect(index).toBeGreaterThan(-1)
     }
     // A read-only cover would make the whole top-level directory read-only.
-    expect(command).not.toContain(`--ro-bind ${top} ${top}`)
-    expect(command.indexOf(credsPin)).toBeLessThan(command.indexOf(cover))
-    expect(command.indexOf(cover)).toBeLessThan(command.indexOf(mask))
+    expect(countBinds(command, '--ro-bind', top, top)).toBe(0)
+    expect(credsPin).toBeLessThan(cover)
+    expect(cover).toBeLessThan(mask)
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'pins and covers a credential mask when there are no write restrictions (live bwrap)',
+    async () => {
+      mkTree(PROJECT, {
+        creds: { 'token.txt': 'REALTOKEN\n' },
+        fakes: { 'token.txt': 'FAKE\n' },
+      })
+      const realPath = join(PROJECT, 'creds', 'token.txt')
+      process.chdir(PROJECT)
+
+      const result = run(
+        await maskOnlyWrap(
+          `cd ${PROJECT} && mv creds creds-moved 2>&1; cat ${realPath} 2>&1; echo DONE`,
+        ),
+      )
+
       expect(result.stdout).toContain('DONE')
+      expect(result.stderr ?? '').not.toContain('bwrap:')
       expect(result.stdout).toMatch(/busy/i)
       expect(result.stdout).not.toContain('REALTOKEN')
       expect(existsSync(join(PROJECT, 'creds-moved'))).toBe(false)
       expect(readFileSync(realPath, 'utf8')).toBe('REALTOKEN\n')
-    }
-  })
+    },
+  )
 
-  it('restores a write path around a symlink-spelled mask inside it; the mask lands on top', async () => {
+  function maskInsideRestoredWritePath() {
     mkTree(PROJECT, { d: { w: { secret: 'MASKME\n', 'other.txt': 'ok\n' } } })
     const wDir = join(PROJECT, 'd', 'w')
-    const secretCanonical = join(wDir, 'secret')
     const sLink = join(PROJECT, 's-link')
     const dLink = join(PROJECT, 'link')
     symlinkSync(join('d', 'w', 'secret'), sLink)
     symlinkSync('d', dLink)
+    return {
+      wDir,
+      dLink,
+      secretCanonical: join(wDir, 'secret'),
+      filesystem: { denyRead: [sLink, dLink], allowWrite: [wDir] },
+    }
+  }
 
-    const command = await wrap(
-      { denyRead: [sLink, dLink], allowWrite: [wDir] },
-      `cat ${secretCanonical} 2>&1; echo evil >> ${secretCanonical} 2>&1; cat ${wDir}/other.txt; echo DONE`,
-    )
+  it('restores a write path around a symlink-spelled mask inside it; the mask lands on top', async () => {
+    const { wDir, dLink, secretCanonical, filesystem } =
+      maskInsideRestoredWritePath()
+
+    const command = await wrap(filesystem)
 
     // s-link is spelled shallower than link but lands deeper, so it mounts
     // after link's tmpfs and after w's restore.
@@ -715,28 +946,51 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command.lastIndexOf(mask)).toBeGreaterThan(
       command.lastIndexOf(wBind),
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'restores a write path around a symlink-spelled mask inside it; the mask lands on top (live bwrap)',
+    async () => {
+      const { wDir, secretCanonical, filesystem } =
+        maskInsideRestoredWritePath()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `cat ${secretCanonical} 2>&1; echo evil >> ${secretCanonical} 2>&1; cat ${wDir}/other.txt; echo DONE`,
+        ),
+      )
+
       expect(result.stdout).toContain('DONE')
       expect(result.stdout).toContain('ok')
       expect(result.stdout).not.toContain('MASKME')
       expect(readFileSync(secretCanonical, 'utf8')).toBe('MASKME\n')
-    }
-  })
+    },
+  )
 
-  it('brings a carve-out inside an emitted denied directory back read-only across re-application', async () => {
+  function carveOutInsideEmittedDenyDir() {
     mkTree(PROJECT, {
       D: { t: { w: { 'file.txt': 'KEEP\n' }, 'hidden.txt': 'HIDDEN\n' } },
     })
     const DDir = join(PROJECT, 'D')
     const tDir = join(DDir, 't')
     const wDir = join(tDir, 'w')
+    return {
+      DDir,
+      tDir,
+      wDir,
+      filesystem: {
+        allowWrite: [wDir],
+        denyWrite: [DDir],
+        denyRead: [tDir],
+      },
+    }
+  }
 
-    const command = await wrap(
-      { allowWrite: [wDir], denyWrite: [DDir], denyRead: [tDir] },
-      `echo evil > ${wDir}/planted.txt 2>&1; cat ${wDir}/file.txt; cat ${tDir}/hidden.txt 2>&1; echo DONE`,
-    )
+  it('brings a carve-out inside an emitted denied directory back read-only across re-application', async () => {
+    const { DDir, tDir, wDir, filesystem } = carveOutInsideEmittedDenyDir()
+
+    const command = await wrap(filesystem)
 
     // D's bind re-exposes t, so t's tmpfs is re-applied on top of it. The
     // write path inside is under the deny too: visible again, not writable.
@@ -752,28 +1006,49 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command.lastIndexOf(wRo)).toBeGreaterThan(
       command.lastIndexOf(tTmpfs),
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'brings a carve-out inside an emitted denied directory back read-only across re-application (live bwrap)',
+    async () => {
+      const { tDir, wDir, filesystem } = carveOutInsideEmittedDenyDir()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `echo evil > ${wDir}/planted.txt 2>&1; cat ${wDir}/file.txt; cat ${tDir}/hidden.txt 2>&1; echo DONE`,
+        ),
+      )
+
       expect(result.stdout).toContain('DONE')
       expect(result.stdout).toContain('KEEP')
       expect(result.stdout).not.toContain('HIDDEN')
       expect(existsSync(join(wDir, 'planted.txt'))).toBe(false)
-    }
-  })
+    },
+  )
 
-  it('masks a read-denied file on top of an allowWrite entry naming the same file', async () => {
+  function maskOverAllowWriteOfTheSameFile() {
     mkTree(PROJECT, { d: { w: { secret: 'MASKME\n' } } })
     const secretCanonical = join(PROJECT, 'd', 'w', 'secret')
     const sLink = join(PROJECT, 's-link')
     const dLink = join(PROJECT, 'link')
     symlinkSync(join('d', 'w', 'secret'), sLink)
     symlinkSync('d', dLink)
+    return {
+      secretCanonical,
+      dLink,
+      filesystem: {
+        denyRead: [sLink, dLink],
+        allowWrite: [secretCanonical],
+      },
+    }
+  }
 
-    const command = await wrap(
-      { denyRead: [sLink, dLink], allowWrite: [secretCanonical] },
-      `cat ${secretCanonical} 2>&1; echo evil >> ${secretCanonical} 2>&1; echo DONE`,
-    )
+  it('masks a read-denied file on top of an allowWrite entry naming the same file', async () => {
+    const { secretCanonical, dLink, filesystem } =
+      maskOverAllowWriteOfTheSameFile()
+
+    const command = await wrap(filesystem)
 
     const tmpfsOp = `--tmpfs ${dLink} `
     const fileBind = `--bind ${secretCanonical} ${secretCanonical}`
@@ -785,14 +1060,25 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command.lastIndexOf(mask)).toBeGreaterThan(
       command.lastIndexOf(tmpfsOp),
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'masks a read-denied file on top of an allowWrite entry naming the same file (live bwrap)',
+    async () => {
+      const { secretCanonical, filesystem } = maskOverAllowWriteOfTheSameFile()
+
+      const result = run(
+        await wrap(
+          filesystem,
+          `cat ${secretCanonical} 2>&1; echo evil >> ${secretCanonical} 2>&1; echo DONE`,
+        ),
+      )
+
       expect(result.stdout).toContain('DONE')
       expect(result.stdout).not.toContain('MASKME')
       expect(readFileSync(secretCanonical, 'utf8')).toBe('MASKME\n')
-    }
-  })
+    },
+  )
 
   it.if(BWRAP_CAN_NAMESPACE)(
     'blocks renaming .git aside inside the sandbox, and the host tree is untouched',
@@ -878,13 +1164,20 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command).not.toContain('--ro-bind /sys /sys')
   })
 
-  it('covers no top-level directory without a "/" write root', async () => {
+  it('adds no cover for a top-level directory that is an ordinary write root', async () => {
+    // The chain has to reach a top-level directory for the assertion to mean
+    // anything, so the write root IS one: the walk visits it, finds it is an
+    // allowed write root and stops. Without a '/' write root it keeps only
+    // its own allow bind — never a second, writable cover over the pins.
     mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
     const top = `/${BASE.split('/')[1]}`
 
-    const command = await wrap()
+    const command = await wrap({ allowWrite: [top] })
 
-    expect(command).not.toContain(`--bind ${top} ${top}`)
+    const gitDir = join(PROJECT, '.git')
+    expect(countBinds(command, '--ro-bind', gitDir, gitDir)).toBe(1)
+    expect(countBinds(command, '--ro-bind', BASE, BASE)).toBe(1)
+    expect(countBinds(command, '--bind', top, top)).toBe(1)
   })
 
   it.if(BWRAP_CAN_NAMESPACE)(
@@ -906,27 +1199,27 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
           nodeProbe([
             [
               'within',
-              `fs.renameSync(${q(join(PROJECT, 'a.txt'))}, ${q(join(PROJECT, 'sub', 'a2.txt'))})`,
+              `fs.renameSync(${asJsString(join(PROJECT, 'a.txt'))}, ${asJsString(join(PROJECT, 'sub', 'a2.txt'))})`,
             ],
             [
               'intoGit',
-              `fs.renameSync(${q(join(PROJECT, 'sub', 'c.txt'))}, ${q(join(gitDir, 'c2.txt'))})`,
+              `fs.renameSync(${asJsString(join(PROJECT, 'sub', 'c.txt'))}, ${asJsString(join(gitDir, 'c2.txt'))})`,
             ],
             [
               'outOfGit',
-              `fs.renameSync(${q(join(gitDir, 'b.txt'))}, ${q(join(PROJECT, 'b2.txt'))})`,
+              `fs.renameSync(${asJsString(join(gitDir, 'b.txt'))}, ${asJsString(join(PROJECT, 'b2.txt'))})`,
             ],
             [
               'intoProject',
-              `fs.renameSync(${q(join(BASE, 'outside.txt'))}, ${q(join(PROJECT, 'o2.txt'))})`,
+              `fs.renameSync(${asJsString(join(BASE, 'outside.txt'))}, ${asJsString(join(PROJECT, 'o2.txt'))})`,
             ],
             [
               'linkIntoGit',
-              `fs.linkSync(${q(join(PROJECT, 'sub', 'a2.txt'))}, ${q(join(gitDir, 'hard.txt'))})`,
+              `fs.linkSync(${asJsString(join(PROJECT, 'sub', 'a2.txt'))}, ${asJsString(join(gitDir, 'hard.txt'))})`,
             ],
             [
               'writeInGit',
-              `fs.writeFileSync(${q(join(gitDir, 'new.txt'))}, 'x')`,
+              `fs.writeFileSync(${asJsString(join(gitDir, 'new.txt'))}, 'x')`,
             ],
           ]),
         ),
@@ -960,15 +1253,21 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
           nodeProbe([
             [
               'moveGit',
-              `fs.renameSync(${q(gitDir)}, ${q(join(PROJECT, '.git-aside'))})`,
+              `fs.renameSync(${asJsString(gitDir)}, ${asJsString(join(PROJECT, '.git-aside'))})`,
             ],
             [
               'moveProject',
-              `fs.renameSync(${q(PROJECT)}, ${q(join(BASE, 'project2'))})`,
+              `fs.renameSync(${asJsString(PROJECT)}, ${asJsString(join(BASE, 'project2'))})`,
             ],
-            ['moveBase', `fs.renameSync(${q(BASE)}, ${q(`${BASE}2`)})`],
-            ['rmdirGit', `fs.rmdirSync(${q(gitDir)})`],
-            ['rmdirHooks', `fs.rmdirSync(${q(join(gitDir, 'hooks'))})`],
+            [
+              'moveBase',
+              `fs.renameSync(${asJsString(BASE)}, ${asJsString(`${BASE}2`)})`,
+            ],
+            ['rmdirGit', `fs.rmdirSync(${asJsString(gitDir)})`],
+            [
+              'rmdirHooks',
+              `fs.rmdirSync(${asJsString(join(gitDir, 'hooks'))})`,
+            ],
           ]),
         ),
       )
@@ -1062,11 +1361,43 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     async () => {
       mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
 
-      const result = run(await wrap({}, `cd ${PROJECT} && rmdir .git`))
+      const result = run(
+        await wrap({}, `cd ${PROJECT} && rmdir .git; echo ${PROBE_DONE}`),
+      )
 
-      expect(result.status).not.toBe(0)
+      expect(result.stdout ?? '').toContain(PROBE_DONE)
+      expect(result.stderr ?? '').not.toContain('bwrap:')
       expect(result.stderr).toMatch(/busy/i)
       expect(existsSync(join(PROJECT, '.git'))).toBe(true)
+    },
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE && APPLY_SECCOMP !== null)(
+    'blocks renaming the pinned directory with the seccomp helper in the stack',
+    async () => {
+      // Every other live arm here sets allowAllUnixSockets, which drops the
+      // apply-seccomp stage. That stage makes its own user, PID and mount
+      // namespaces and remounts /proc inside them, so the pins have to
+      // survive it — otherwise they protect nothing in the configuration
+      // the library actually ships.
+      mkTree(PROJECT, { '.git': { hooks: {}, config: '[core]\n' } })
+      process.chdir(PROJECT)
+
+      const result = run(
+        await wrapCommandWithSandboxLinux({
+          command: `cd ${PROJECT} && mv .git .git-moved 2>&1; echo ${PROBE_DONE}`,
+          needsNetworkRestriction: false,
+          writeConfig: { allowOnly: [PROJECT], denyWithinAllow: [] },
+        }),
+      )
+
+      expect(result.stdout ?? '').toContain(PROBE_DONE)
+      expect(result.stderr ?? '').not.toContain('bwrap:')
+      expect(result.stdout ?? '').toMatch(/busy/i)
+      expect(existsSync(join(PROJECT, '.git-moved'))).toBe(false)
+      expect(readFileSync(join(PROJECT, '.git', 'config'), 'utf8')).toBe(
+        '[core]\n',
+      )
     },
   )
 
@@ -1221,18 +1552,23 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     },
   )
 
-  it('pins the ancestor between a read-denied directory and a nested repo deny below it; the tmpfs lands after the pin', async () => {
-    // top is read-denied and contains the nested repo's .git/config deny;
-    // top/.git sits between them and is pinned, top itself is pinned too,
-    // and the tmpfs on top is emitted after both so it still hides them.
+  // top is read-denied and contains the nested repo's .git/config deny;
+  // top/.git sits between them and is pinned, top itself is pinned too, and
+  // the tmpfs on top is emitted after both so it still hides them.
+  function readDeniedDirAboveNestedRepo() {
     mkTree(PROJECT, { top: { '.git': { hooks: {}, config: '[core]\n' } } })
     const topDir = join(PROJECT, 'top')
-    const gitDir = join(topDir, '.git')
+    return {
+      topDir,
+      gitDir: join(topDir, '.git'),
+      filesystem: { denyRead: [topDir] },
+    }
+  }
 
-    const command = await wrap(
-      { denyRead: [topDir] },
-      `cat ${gitDir}/config 2>&1; echo DONE`,
-    )
+  it('pins the ancestor between a read-denied directory and a nested repo deny below it; the tmpfs lands after the pin', async () => {
+    const { topDir, gitDir, filesystem } = readDeniedDirAboveNestedRepo()
+
+    const command = await wrap(filesystem)
 
     const topPin = `--ro-bind ${topDir} ${topDir}`
     const gitPin = `--ro-bind ${gitDir} ${gitDir}`
@@ -1245,11 +1581,19 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command.indexOf(gitPin)).toBeLessThan(
       command.indexOf(`--bind ${PROJECT} ${PROJECT}`),
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
-      const result = run(command)
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'pins the ancestor between a read-denied directory and a nested repo deny below it; the tmpfs lands after the pin (live bwrap)',
+    async () => {
+      const { gitDir, filesystem } = readDeniedDirAboveNestedRepo()
+
+      const result = run(
+        await wrap(filesystem, `cat ${gitDir}/config 2>&1; echo DONE`),
+      )
+
       expect(result.stdout ?? '').not.toContain('[core]')
       expect(result.stdout ?? '').toContain('DONE')
-    }
-  })
+    },
+  )
 })

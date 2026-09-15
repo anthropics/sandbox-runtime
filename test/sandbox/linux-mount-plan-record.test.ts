@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import {
   mkdirSync,
   mkdtempSync,
@@ -12,8 +13,11 @@ import { dirname, join } from 'node:path'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 import { countBinds } from '../helpers/bwrap-argv.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
-// Argument-level checks; nothing here executes bwrap.
+// Argument-level checks, plus one "(live bwrap)" arm per symlink shape: this
+// suite has the densest symlink inputs, and where the emitted mounts land is
+// only really settled by bubblewrap.
 describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
   const baseParams = {
     command: 'true',
@@ -21,12 +25,31 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     allowAllUnixSockets: true,
   }
 
+  const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
+  const BOOTED = 'BOOTED'
+
   const created: string[] = []
   afterEach(() => {
     for (const dir of created.splice(0)) {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  /**
+   * Run a wrapped command and return its stdout, having first established
+   * that bubblewrap started at all: an abort would leave every "the secret
+   * is not in the output" assertion true for the wrong reason.
+   */
+  function runBooted(wrapped: string): string {
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 15000,
+    })
+    expect(result.stderr ?? '').not.toContain('bwrap:')
+    expect(result.stdout ?? '').toContain(BOOTED)
+    return result.stdout ?? ''
+  }
 
   function tempTree(files: Record<string, string>): string {
     const proj = realpathSync(mkdtempSync(join(tmpdir(), 'mount-plan-')))
@@ -62,58 +85,62 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       'a/t/w/secret-dir/s.txt': 'x',
       'a/t/w/deep/file.txt': 'x',
     })
-    // s is spelled shallow but lands deep inside the write root w.
-    const s = join(proj, 's')
-    symlinkSync(join(proj, 'a/t/w/secret-dir'), s)
-    const t = join(proj, 'a/t')
-    const w = join(proj, 'a/t/w')
+    // secretLink is spelled shallow but lands deep inside the write root.
+    const secretLink = join(proj, 's')
+    symlinkSync(join(proj, 'a/t/w/secret-dir'), secretLink)
+    const deniedDir = join(proj, 'a/t')
+    const writeRoot = join(proj, 'a/t/w')
     const file = join(proj, 'a/t/w/deep/file.txt')
     const plan = (denyOnly: string[]) =>
       wrapCommandWithSandboxLinux({
         ...baseParams,
         readConfig: { denyOnly, allowWithinDeny: [] },
-        writeConfig: { allowOnly: [w], denyWithinAllow: [file] },
+        writeConfig: { allowOnly: [writeRoot], denyWithinAllow: [file] },
       })
-    const wrapped = await plan([s, t])
-    expect(await plan([t, s])).toBe(wrapped)
+    const wrapped = await plan([secretLink, deniedDir])
+    expect(await plan([deniedDir, secretLink])).toBe(wrapped)
 
-    // t is hidden, w comes back writable on top of it, and the tmpfs on the
-    // secret directory and the deny bind land on top of w.
-    const wBind = `--bind ${w} ${w}`
-    const tTmpfs = wrapped.indexOf(`--tmpfs ${t} `)
-    expect(tTmpfs).toBeGreaterThan(-1)
-    expect(wrapped.lastIndexOf(wBind)).toBeGreaterThan(tTmpfs)
-    expect(wrapped.indexOf(`--tmpfs ${s} `)).toBeGreaterThan(
-      wrapped.lastIndexOf(wBind),
+    // The denied directory is hidden, the write root comes back writable on
+    // top of it, and the tmpfs on the secret directory and the deny bind
+    // land on top of the write root.
+    const writeRootBind = `--bind ${writeRoot} ${writeRoot}`
+    const deniedTmpfs = wrapped.indexOf(`--tmpfs ${deniedDir} `)
+    expect(deniedTmpfs).toBeGreaterThan(-1)
+    expect(wrapped.lastIndexOf(writeRootBind)).toBeGreaterThan(deniedTmpfs)
+    expect(wrapped.indexOf(`--tmpfs ${secretLink} `)).toBeGreaterThan(
+      wrapped.lastIndexOf(writeRootBind),
     )
     expect(wrapped.indexOf(`--ro-bind ${file} ${file}`)).toBeGreaterThan(
-      wrapped.lastIndexOf(wBind),
+      wrapped.lastIndexOf(writeRootBind),
     )
-    // The deny bind's parent is pinned beneath w's first bind.
-    const deepPin = `--ro-bind ${join(w, 'deep')} ${join(w, 'deep')}`
+    // The deny bind's parent is pinned beneath the write root's first bind.
+    const deepDir = join(writeRoot, 'deep')
+    const deepPin = `--ro-bind ${deepDir} ${deepDir}`
     expect(wrapped.indexOf(deepPin)).toBeGreaterThan(-1)
-    expect(wrapped.indexOf(deepPin)).toBeLessThan(wrapped.indexOf(wBind))
+    expect(wrapped.indexOf(deepPin)).toBeLessThan(
+      wrapped.indexOf(writeRootBind),
+    )
   })
 
   it('emits a deny bind whose region a later unit re-exposed', async () => {
     const proj = tempTree({ 'p/q/w/.git/config': 'x' })
-    const W = join(proj, 'p/q/w')
+    const writeRoot = join(proj, 'p/q/w')
     const cfg = join(proj, 'p/q/w/.git/config')
-    // p/q hides W and restores it; s and W each mount a tmpfs at W and
-    // restore it again, so W's host content is on top and the deny bind is
-    // still needed.
-    symlinkSync(W, join(proj, 's'))
+    // p/q hides the write root and restores it; the link and the write root
+    // itself each mount a tmpfs there and restore it again, so the host
+    // content is on top and the deny bind is still needed.
+    symlinkSync(writeRoot, join(proj, 's'))
     const wrapped = await wrapCommandWithSandboxLinux({
       ...baseParams,
       readConfig: {
-        denyOnly: [join(proj, 's'), join(proj, 'p/q'), W],
+        denyOnly: [join(proj, 's'), join(proj, 'p/q'), writeRoot],
         allowWithinDeny: [],
       },
-      writeConfig: { allowOnly: [W], denyWithinAllow: [cfg] },
+      writeConfig: { allowOnly: [writeRoot], denyWithinAllow: [cfg] },
     })
-    const wBind = `--bind ${W} ${W}`
+    const wBind = `--bind ${writeRoot} ${writeRoot}`
     expect(wrapped.lastIndexOf(wBind)).toBeGreaterThan(
-      wrapped.indexOf(`--tmpfs ${W}`),
+      wrapped.indexOf(`--tmpfs ${writeRoot}`),
     )
     expect(wrapped).toContain(`--ro-bind ${cfg} ${cfg}`)
     const gitPin = `--ro-bind ${join(proj, 'p/q/w/.git')} ${join(proj, 'p/q/w/.git')}`
@@ -219,17 +246,34 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     )
   })
 
-  it('restores an allowRead carve-out spelled through a symlink whose target lies inside the denied directory', async () => {
-    // The merged-/usr shape: lib -> usr/lib, denyRead lib, allowRead lib/x.
-    const proj = tempTree({ 'usr/lib/x/lib.so': 'so', 'usr/lib/y/other': 'o' })
-    const lib = join(proj, 'lib')
-    symlinkSync(join(proj, 'usr/lib'), lib)
-    const carveOut = join(lib, 'x')
-    const wrapped = await wrapCommandWithSandboxLinux({
-      ...baseParams,
-      readConfig: { denyOnly: [lib], allowWithinDeny: [carveOut] },
-      writeConfig: { allowOnly: [], denyWithinAllow: [] },
+  // The merged-/usr shape: lib -> usr/lib, denyRead lib, allowRead lib/x.
+  function mergedUsrCarveOut() {
+    const proj = tempTree({
+      'usr/lib/x/lib.so': 'LIBSOBYTES\n',
+      'usr/lib/y/other': 'OTHERBYTES\n',
     })
+    const lib = join(proj, 'lib')
+    symlinkSync('usr/lib', lib)
+    const carveOut = join(lib, 'x')
+    return {
+      proj,
+      lib,
+      carveOut,
+      wrap: (command: string) =>
+        wrapCommandWithSandboxLinux({
+          ...baseParams,
+          command,
+          readConfig: { denyOnly: [lib], allowWithinDeny: [carveOut] },
+          writeConfig: { allowOnly: [], denyWithinAllow: [] },
+        }),
+    }
+  }
+
+  it('restores an allowRead carve-out spelled through a symlink whose target lies inside the denied directory', async () => {
+    const { proj, lib, wrap } = mergedUsrCarveOut()
+
+    const wrapped = await wrap('true')
+
     // Bound where it resolves: after the tmpfs, lib/x is a plain path on it.
     const resolved = join(proj, 'usr/lib/x')
     const restore = `--ro-bind ${resolved} ${resolved}`
@@ -238,18 +282,50 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     )
   })
 
-  it('spells a read-deny mount by where it lands once an earlier tmpfs has hidden its symlink target', async () => {
-    // The merged-/usr root expansion: bin -> usr/bin, both denied. After the
-    // tmpfs on usr, bin dangles in the new root and bwrap cannot mount on it.
-    const proj = tempTree({ 'usr/bin/tool': 't', 'usr/share/doc': 'd' })
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'restores an allowRead carve-out spelled through a symlink whose target lies inside the denied directory (live bwrap)',
+    async () => {
+      const { lib, wrap } = mergedUsrCarveOut()
+
+      const stdout = runBooted(
+        await wrap(
+          `sh -c 'echo ${BOOTED}; cat ${join(lib, 'x/lib.so')} 2>&1; cat ${join(lib, 'y/other')} 2>&1'`,
+        ),
+      )
+
+      expect(stdout).toContain('LIBSOBYTES')
+      expect(stdout).not.toContain('OTHERBYTES')
+    },
+  )
+
+  // The merged-/usr root expansion: bin -> usr/bin, both denied. After the
+  // tmpfs on usr, bin dangles in the new root and bwrap cannot mount on it.
+  function mergedUsrBothDenied() {
+    const proj = tempTree({
+      'usr/bin/tool': 'TOOLBYTES\n',
+      'usr/share/doc': 'DOCBYTES\n',
+    })
     const bin = join(proj, 'bin')
     symlinkSync('usr/bin', bin)
     const usr = join(proj, 'usr')
-    const wrapped = await wrapCommandWithSandboxLinux({
-      ...baseParams,
-      readConfig: { denyOnly: [bin, usr], allowWithinDeny: [] },
-      writeConfig: { allowOnly: [], denyWithinAllow: [] },
-    })
+    return {
+      bin,
+      usr,
+      wrap: (command: string) =>
+        wrapCommandWithSandboxLinux({
+          ...baseParams,
+          command,
+          readConfig: { denyOnly: [bin, usr], allowWithinDeny: [] },
+          writeConfig: { allowOnly: [], denyWithinAllow: [] },
+        }),
+    }
+  }
+
+  it('spells a read-deny mount by where it lands once an earlier tmpfs has hidden its symlink target', async () => {
+    const { bin, usr, wrap } = mergedUsrBothDenied()
+
+    const wrapped = await wrap('true')
+
     const usrTmpfs = wrapped.indexOf(`--tmpfs ${usr} `)
     expect(usrTmpfs).toBeGreaterThan(-1)
     expect(wrapped.indexOf(`--tmpfs ${join(usr, 'bin')} `)).toBeGreaterThan(
@@ -258,25 +334,69 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(wrapped).not.toContain(`--tmpfs ${bin} `)
   })
 
-  it('restores an allowRead carve-out under a denied directory reached through a symlinked parent', async () => {
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'spells a read-deny mount by where it lands once an earlier tmpfs has hidden its symlink target (live bwrap)',
+    async () => {
+      const { bin, usr, wrap } = mergedUsrBothDenied()
+
+      const stdout = runBooted(
+        await wrap(
+          `sh -c 'echo ${BOOTED}; cat ${join(bin, 'tool')} 2>&1; cat ${join(usr, 'share/doc')} 2>&1'`,
+        ),
+      )
+
+      expect(stdout).not.toContain('TOOLBYTES')
+      expect(stdout).not.toContain('DOCBYTES')
+    },
+  )
+
+  function carveOutUnderSymlinkedParent() {
     const proj = tempTree({
-      'var/home/u/work/f': 'x',
-      'var/home/u/secret': 's',
+      'var/home/u/work/f': 'WORKBYTES\n',
+      'var/home/u/secret': 'SECRETBYTES\n',
     })
-    symlinkSync(join(proj, 'var/home'), join(proj, 'home'))
+    symlinkSync('var/home', join(proj, 'home'))
     const denied = join(proj, 'home/u')
-    const carveOut = join(proj, 'home/u/work')
-    const wrapped = await wrapCommandWithSandboxLinux({
-      ...baseParams,
-      readConfig: { denyOnly: [denied], allowWithinDeny: [carveOut] },
-      writeConfig: { allowOnly: [], denyWithinAllow: [] },
-    })
+    return {
+      denied,
+      wrap: (command: string) =>
+        wrapCommandWithSandboxLinux({
+          ...baseParams,
+          command,
+          readConfig: {
+            denyOnly: [denied],
+            allowWithinDeny: [join(denied, 'work')],
+          },
+          writeConfig: { allowOnly: [], denyWithinAllow: [] },
+        }),
+    }
+  }
+
+  it('restores an allowRead carve-out under a denied directory reached through a symlinked parent', async () => {
+    const wrapped = await carveOutUnderSymlinkedParent().wrap('true')
+
     const restore = wrapped.match(/--ro-bind (\S+\/u\/work) \1/)
     expect(restore).not.toBeNull()
     expect(wrapped.indexOf(restore![0])).toBeGreaterThan(
       wrapped.indexOf('--tmpfs '),
     )
   })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'restores an allowRead carve-out under a denied directory reached through a symlinked parent (live bwrap)',
+    async () => {
+      const { denied, wrap } = carveOutUnderSymlinkedParent()
+
+      const stdout = runBooted(
+        await wrap(
+          `sh -c 'echo ${BOOTED}; cat ${join(denied, 'work/f')} 2>&1; cat ${join(denied, 'secret')} 2>&1'`,
+        ),
+      )
+
+      expect(stdout).toContain('WORKBYTES')
+      expect(stdout).not.toContain('SECRETBYTES')
+    },
+  )
 
   it('does not bind an allowRead symlink whose target lies outside the denied directory', async () => {
     const proj = tempTree({ 'd/keep': 'x', 'elsewhere/secret': 's' })
@@ -291,22 +411,53 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(wrapped).not.toContain(`--ro-bind ${link} ${link}`)
   })
 
-  it('does not restore an allowRead entry that is a symlink into a read-denied directory', async () => {
-    // A command run earlier (or the repository) plants docs -> home/.ssh at
-    // an allowed path: the entry names the link, not what it points at.
-    const proj = tempTree({ 'home/.ssh/id_rsa': 'KEY', 'proj/src.ts': 'x' })
+  // A command run earlier (or the repository) plants docs -> home/.ssh at an
+  // allowed path: the entry names the link, not what it points at.
+  function plantedAllowReadLink() {
+    const proj = tempTree({
+      'home/.ssh/id_rsa': 'PRIVATEKEYBYTES\n',
+      'proj/src.ts': 'x',
+    })
     const ssh = join(proj, 'home/.ssh')
     const docs = join(proj, 'proj/docs')
     symlinkSync(ssh, docs)
-    const wrapped = await wrapCommandWithSandboxLinux({
-      ...baseParams,
-      readConfig: { denyOnly: [ssh], allowWithinDeny: [docs] },
-      writeConfig: { allowOnly: [join(proj, 'proj')], denyWithinAllow: [] },
-    })
+    return {
+      ssh,
+      docs,
+      wrap: (command: string) =>
+        wrapCommandWithSandboxLinux({
+          ...baseParams,
+          command,
+          readConfig: { denyOnly: [ssh], allowWithinDeny: [docs] },
+          writeConfig: { allowOnly: [join(proj, 'proj')], denyWithinAllow: [] },
+        }),
+    }
+  }
+
+  it('does not restore an allowRead entry that is a symlink into a read-denied directory', async () => {
+    const { ssh, docs, wrap } = plantedAllowReadLink()
+
+    const wrapped = await wrap('true')
+
     expect(wrapped).toContain(`--tmpfs ${ssh} `)
     expect(wrapped).not.toContain(`--ro-bind ${ssh} ${ssh}`)
     expect(wrapped).not.toContain(`--ro-bind ${docs} `)
   })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'does not restore an allowRead entry that is a symlink into a read-denied directory (live bwrap)',
+    async () => {
+      const { ssh, docs, wrap } = plantedAllowReadLink()
+
+      const stdout = runBooted(
+        await wrap(
+          `sh -c 'echo ${BOOTED}; cat ${join(docs, 'id_rsa')} 2>&1; cat ${join(ssh, 'id_rsa')} 2>&1'`,
+        ),
+      )
+
+      expect(stdout).not.toContain('PRIVATEKEYBYTES')
+    },
+  )
 
   it('does not restore a file inside a read-denied directory through a symlink planted outside it', async () => {
     const proj = tempTree({ 'home/.aws/credentials': 'SECRET', 'proj/a': 'x' })
@@ -456,9 +607,9 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
 
   it('denies beneath a writable root, and pins above its bind under one writable cover', async () => {
     // '/' is a legal allowOnly entry, and the allow loop binds it writable,
-    // so the denies inside it apply: a `root + '/'` prefix test spells '//'
-    // and matches nothing, which silently dropped every deny and every
-    // mandatory deny over a root already bound read-write.
+    // so the denies inside it apply — which needs the containment test to be
+    // root-aware, a plain string prefix having matched nothing there and
+    // silently dropped every deny over a root already bound read-write.
     //
     // The pins cannot sit beneath that root's own recursive --bind / /,
     // which would bury them. They go after the allow binds, stopping below
