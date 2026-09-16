@@ -101,6 +101,30 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     return result
   }
 
+  /** The mount flags this generator emits with a source and a destination. */
+  const MOUNT_FLAGS = ['--bind', '--ro-bind']
+
+  /**
+   * The last mount whose destination is exactly `dest`. That is what the
+   * sandbox sees there only if nothing later mounts over an ANCESTOR of it,
+   * which this does not look for. Scanning flag/source/dest triples rather
+   * than lastIndexOf keeps a path that appears as a mount SOURCE from passing
+   * for a mount at that destination; `--tmpfs` takes a destination alone and
+   * needs its own arm.
+   */
+  const lastMountAt = (command: string, dest: string): string | undefined => {
+    const argv = command.split(/\s+/)
+    let last: string | undefined
+    for (let i = 0; i + 1 < argv.length; i++) {
+      if (argv[i] === '--tmpfs' && argv[i + 1] === dest) {
+        last = `--tmpfs ${dest}`
+      } else if (MOUNT_FLAGS.includes(argv[i]) && argv[i + 2] === dest) {
+        last = `${argv[i]} ${argv[i + 1]} ${argv[i + 2]}`
+      }
+    }
+    return last
+  }
+
   /**
    * The write really hit a read-only mount, rather than the command failing
    * for some other reason that also exits non-zero: bwrap refusing to start,
@@ -676,6 +700,305 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
         },
       )
     })
+  })
+
+  describe('a write path that is itself a masked file', () => {
+    const SECRET = 'REAL-PRIVATE-KEY'
+    const SENTINEL = 'SENTINEL-NOT-A-KEY'
+
+    let SECRETS: string // read-denied and write-denied dir inside PROJ
+    let PEM: string // masked file inside SECRETS, and an allowed write path
+    let SUB: string // allowed write DIRECTORY inside SECRETS
+    let NESTED: string // masked file strictly beneath SUB
+    let PLAIN: string // unmasked file beside NESTED
+    let STORE: string // fake-file store for the credential mask
+    let FAKE: string
+
+    beforeEach(() => {
+      SECRETS = join(PROJ, 'secrets')
+      mkdirSync(SECRETS, { recursive: true })
+      PEM = join(SECRETS, 'dev.pem')
+      writeFileSync(PEM, SECRET + '\n')
+      SUB = join(SECRETS, 'sub')
+      mkdirSync(SUB)
+      NESTED = join(SUB, 'nested.pem')
+      writeFileSync(NESTED, SECRET + '\n')
+      PLAIN = join(SUB, 'plain.txt')
+      writeFileSync(PLAIN, 'PLAIN\n')
+      STORE = join(BASE, 'store')
+      mkdirSync(STORE, { recursive: true })
+      FAKE = join(STORE, 'dev.pem.fake')
+      writeFileSync(FAKE, SENTINEL + '\n')
+    })
+
+    // The write deny on SECRETS has to stay hidden by its own tmpfs, with PEM
+    // an allowed write path at-or-under it.
+    const readDenyMask = () => wrap([SECRETS], [SECRETS, PEM], [AREA, PEM])
+
+    // Same shape with a credential mask in place of the /dev/null read deny.
+    const credentialMask = (command = 'echo hello') =>
+      wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [SECRETS] },
+        writeConfig: { allowOnly: [AREA, PEM], denyWithinAllow: [SECRETS] },
+        maskedFileBinds: [{ realPath: PEM, fakePath: FAKE }],
+        maskedFileStoreDir: STORE,
+      })
+
+    it('leaves the /dev/null mask as the last mount on the write path', async () => {
+      const command = await readDenyMask()
+
+      expect(countBinds(command, '--ro-bind', PEM, PEM)).toBe(0)
+      expect(lastMountAt(command, PEM)).toBe(`--ro-bind /dev/null ${PEM}`)
+    })
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps the read-denied write path unreadable and unwritable',
+      async () => {
+        const read = await runSandboxed(
+          [SECRETS],
+          [SECRETS, PEM],
+          [AREA, PEM],
+          `cat ${PEM}`,
+        )
+        // The whole of stdout, not merely "no secret in it": a read that fails
+        // for any other reason satisfies that just as well. No exit-code
+        // assertion — binds are mounted nodev, so opening the /dev/null mask
+        // may be refused outright.
+        expect(read.stdout.trim()).toBe('BOOTED')
+
+        const write = await runSandboxed(
+          [SECRETS],
+          [SECRETS, PEM],
+          [AREA, PEM],
+          `echo pwned >> ${PEM}`,
+        )
+        expectDeniedByReadOnlyMount(write)
+        expect(readFileSync(PEM, 'utf8')).toBe(SECRET + '\n')
+      },
+    )
+
+    it('leaves the credential mask as the last mount on the write path', async () => {
+      const command = await credentialMask()
+
+      expect(countBinds(command, '--ro-bind', PEM, PEM)).toBe(0)
+      expect(lastMountAt(command, PEM)).toBe(`--ro-bind ${FAKE} ${PEM}`)
+    })
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'serves the fake for a masked credential write path and refuses the write',
+      async () => {
+        const read = run(
+          await credentialMask(`sh -c 'echo BOOTED; cat ${PEM}'`),
+        )
+        expect(read.stdout).toContain('BOOTED')
+        expect(read.stdout).toContain(SENTINEL)
+        expect(read.stdout).not.toContain(SECRET)
+
+        const write = run(
+          await credentialMask(`sh -c 'echo BOOTED; echo pwned >> ${PEM}'`),
+        )
+        expect(write.stdout).toContain('BOOTED')
+        expectDeniedByReadOnlyMount(write)
+        expect(readFileSync(PEM, 'utf8')).toBe(SECRET + '\n')
+      },
+    )
+
+    it('re-masks a file strictly beneath a restored write directory', async () => {
+      const command = await wrap([SECRETS], [SECRETS, NESTED], [AREA, SUB])
+
+      expect(countBinds(command, '--ro-bind', SUB, SUB)).toBe(1)
+      // Twice: the denyRead loop's mask, then the re-application on top of the
+      // directory's restore. Position, not lastMountAt: both masks are the
+      // same triple at the same destination, so only order distinguishes a
+      // re-applied mask from one the restore buried.
+      expect(countBinds(command, '--ro-bind', '/dev/null', NESTED)).toBe(2)
+      expect(
+        command.lastIndexOf(`--ro-bind /dev/null ${NESTED}`),
+      ).toBeGreaterThan(command.lastIndexOf(`--ro-bind ${SUB} ${SUB}`))
+    })
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'keeps the rest of the restored directory readable',
+      async () => {
+        const result = await runSandboxed(
+          [SECRETS],
+          [SECRETS, NESTED],
+          [AREA, SUB],
+          `cat ${PLAIN}; cat ${NESTED}`,
+        )
+
+        expect(result.stdout.trim()).toBe('BOOTED\nPLAIN')
+      },
+    )
+  })
+
+  // A symlinked ANCESTOR component makes the spelling a mask is listed under
+  // differ from the canonical spelling deny-write dests and allowWrite entries
+  // carry. Each case below hands the decision to a different consumer.
+  describe('a mask listed through a symlinked ancestor', () => {
+    const SECRET = 'REAL-PRIVATE-KEY'
+    const SENTINEL = 'SENTINEL-NOT-A-KEY'
+
+    let DOT: string // the real directory PROJ/.claude points into
+    let REAL: string // the masked file, canonically
+    let VIA_LINK: string // the same file, spelled through PROJ/.claude
+    let STORE: string
+    let FAKE: string
+
+    beforeEach(() => {
+      DOT = join(AREA, 'dotfiles', 'claude')
+      mkdirSync(DOT, { recursive: true })
+      REAL = join(DOT, 'secrets.json')
+      writeFileSync(REAL, SECRET + '\n')
+      // Relative target: an absolute one resolves outside the not-yet-pivoted
+      // root and bwrap aborts on the mask's own bind, before any of this.
+      symlinkSync(join('..', 'dotfiles', 'claude'), join(PROJ, '.claude'))
+      VIA_LINK = join(PROJ, '.claude', 'secrets.json')
+      STORE = join(BASE, 'store')
+      mkdirSync(STORE)
+      FAKE = join(STORE, 'secrets.json.fake')
+      writeFileSync(FAKE, SENTINEL + '\n')
+    })
+
+    /**
+     * The policy that hands the decision to each consumer the cases above
+     * cover, for the live arms to walk: the restore inside a deny bind
+     * dropped as hidden by its own tmpfs, the flush's own skip where the deny
+     * dest IS the masked file, and the mask re-application where a bind of
+     * the canonical ancestor directory lands after the mask. The read-deny
+     * arm adds VIA_LINK to readDenied; the credential arm masks that spelling
+     * with the fake instead.
+     */
+    const POLICIES = () => [
+      { denyWrite: [DOT], readDenied: [DOT], allow: [AREA, REAL] },
+      { denyWrite: [REAL], readDenied: [], allow: [AREA] },
+      { denyWrite: [DOT], readDenied: [], allow: [AREA] },
+    ]
+
+    const credentialWrap = (
+      denyWrite: string[],
+      readDenied: string[],
+      allow: string[],
+      command = 'echo hello',
+    ) =>
+      wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: readDenied },
+        writeConfig: { allowOnly: allow, denyWithinAllow: denyWrite },
+        maskedFileBinds: [{ realPath: VIA_LINK, fakePath: FAKE }],
+        maskedFileStoreDir: STORE,
+      })
+
+    it('keeps the mask when a dropped deny bind restores the file canonically', async () => {
+      const command = await wrap([DOT], [DOT, VIA_LINK], [AREA, REAL])
+
+      expect(countBinds(command, '--ro-bind', REAL, REAL)).toBe(0)
+      expect(lastMountAt(command, VIA_LINK)).toBe(
+        `--ro-bind /dev/null ${VIA_LINK}`,
+      )
+    })
+
+    it('keeps the mask when the deny dest resolves to the masked file', async () => {
+      const command = await wrap([REAL], [VIA_LINK], [AREA])
+
+      expect(countBinds(command, '--ro-bind', REAL, REAL)).toBe(0)
+      expect(lastMountAt(command, VIA_LINK)).toBe(
+        `--ro-bind /dev/null ${VIA_LINK}`,
+      )
+    })
+
+    it('re-applies the mask a bind of the canonical ancestor directory buried', async () => {
+      const command = await wrap([DOT], [VIA_LINK], [AREA])
+
+      // Twice: the ancestor pin spliced in beneath the allow binds, then the
+      // write deny's own bind. Both are self-binds of the same directory and
+      // spell the same triple.
+      expect(countBinds(command, '--ro-bind', DOT, DOT)).toBe(2)
+      // Twice: the denyRead loop's mask, then the re-application above the
+      // directory bind. Only order tells the two apart.
+      expect(countBinds(command, '--ro-bind', '/dev/null', VIA_LINK)).toBe(2)
+      expect(
+        command.lastIndexOf(`--ro-bind /dev/null ${VIA_LINK}`),
+      ).toBeGreaterThan(command.lastIndexOf(`--ro-bind ${DOT} ${DOT}`))
+    })
+
+    it('reconciles the same three spellings for a credential mask', async () => {
+      const restored = await credentialWrap([DOT], [DOT], [AREA, REAL])
+      expect(countBinds(restored, '--ro-bind', REAL, REAL)).toBe(0)
+      expect(lastMountAt(restored, VIA_LINK)).toBe(
+        `--ro-bind ${FAKE} ${VIA_LINK}`,
+      )
+
+      const skipped = await credentialWrap([REAL], [], [AREA])
+      expect(countBinds(skipped, '--ro-bind', REAL, REAL)).toBe(0)
+      expect(lastMountAt(skipped, VIA_LINK)).toBe(
+        `--ro-bind ${FAKE} ${VIA_LINK}`,
+      )
+
+      const buried = await credentialWrap([DOT], [], [AREA])
+      expect(countBinds(buried, '--ro-bind', FAKE, VIA_LINK)).toBe(2)
+      expect(
+        buried.lastIndexOf(`--ro-bind ${FAKE} ${VIA_LINK}`),
+      ).toBeGreaterThan(buried.lastIndexOf(`--ro-bind ${DOT} ${DOT}`))
+    })
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'serves the read-denied file through neither spelling and refuses the write',
+      async () => {
+        for (const { denyWrite, readDenied, allow } of POLICIES()) {
+          const read = await runSandboxed(
+            denyWrite,
+            [...readDenied, VIA_LINK],
+            allow,
+            `cat ${REAL}; cat ${VIA_LINK}`,
+          )
+          expect(read.stdout.trim()).toBe('BOOTED')
+
+          const write = await runSandboxed(
+            denyWrite,
+            [...readDenied, VIA_LINK],
+            allow,
+            `echo pwned >> ${REAL}`,
+          )
+          expectDeniedByReadOnlyMount(write)
+          expect(readFileSync(REAL, 'utf8')).toBe(SECRET + '\n')
+        }
+      },
+    )
+
+    it.skipIf(!BWRAP_CAN_NAMESPACE)(
+      'serves the fake through both spellings and refuses the write',
+      async () => {
+        for (const { denyWrite, readDenied, allow } of POLICIES()) {
+          const read = run(
+            await credentialWrap(
+              denyWrite,
+              readDenied,
+              allow,
+              `sh -c 'echo BOOTED; cat ${REAL}; cat ${VIA_LINK}'`,
+            ),
+          )
+          expect(read.stdout.trim()).toBe(
+            ['BOOTED', SENTINEL, SENTINEL].join('\n'),
+          )
+
+          const write = run(
+            await credentialWrap(
+              denyWrite,
+              readDenied,
+              allow,
+              `sh -c 'echo BOOTED; echo pwned >> ${REAL}'`,
+            ),
+          )
+          expect(write.stdout).toContain('BOOTED')
+          expectDeniedByReadOnlyMount(write)
+          expect(readFileSync(REAL, 'utf8')).toBe(SECRET + '\n')
+        }
+      },
+    )
   })
 
   it('keeps the bind for a deny reached through a symlinked spelling', async () => {
