@@ -79,6 +79,8 @@ import {
 import {
   getDefaultWritePaths,
   containsGlobChars,
+  globPatternBaseDir,
+  normalizePathForSandbox,
   removeTrailingGlobSuffix,
   expandGlobPattern,
   decodeSandboxedCommand,
@@ -1265,19 +1267,19 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     config.filesystem.allowRead ?? [],
     expandAllowReadGlob,
   )
+  const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
+  const unlistableDenyDirs = new Set<string>()
   const denyPaths = resolveReadPathEntries(
     unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
     pattern =>
-      expandReadDenyGlobLinux(pattern, [
-        ...allowPaths,
-        ...getFsWriteConfig().allowOnly,
-      ]),
+      expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
     credentialRestrictions.degradeToDenyPaths,
   )
 
   return {
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
+    unlistableDenyDirs: [...unlistableDenyDirs],
   }
 }
 
@@ -1670,17 +1672,20 @@ async function wrapWithSandbox(
       expandedAllowRead.push(javaAgentJarPath)
     }
     const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
+    const unlistableDenyDirs = new Set<string>()
     const expandedDenyRead = resolveReadPathEntries(
       unionDenyReadPaths(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
         credentialRestrictions,
       ),
-      pattern => expandReadDenyGlobLinux(pattern, reExposedPaths),
+      pattern =>
+        expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
       credentialRestrictions.degradeToDenyPaths,
     )
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
+      unlistableDenyDirs: [...unlistableDenyDirs],
     }
   }
 
@@ -2321,8 +2326,8 @@ function getLinuxGlobPatternWarnings(): string[] {
 
   const globPatterns: string[] = []
 
-  // Check filesystem paths for glob patterns
-  // Note: denyRead is excluded because globs are now expanded to concrete paths on Linux
+  // Write paths take no globs at all on Linux: bubblewrap binds concrete
+  // paths, and nothing expands them.
   const allPaths = [
     ...config.filesystem.allowWrite,
     ...config.filesystem.denyWrite,
@@ -2334,6 +2339,23 @@ function getLinuxGlobPatternWarnings(): string[] {
 
     // Only warn if there are still glob characters after removing trailing /**
     if (containsGlobChars(pathWithoutTrailingStar)) {
+      globPatterns.push(path)
+    }
+  }
+
+  // Read paths are expanded, so a glob there is supported — unless the
+  // pattern has no literal directory for the walk to start from (a wildcard
+  // in its first path component, `/**/*.pem`), which expands to nothing and
+  // leaves the entry unenforced.
+  for (const path of [
+    ...config.filesystem.denyRead,
+    ...(config.filesystem.allowRead ?? []),
+  ]) {
+    const baseDir = globPatternBaseDir(normalizePathForSandbox(path))
+    if (
+      containsGlobChars(removeTrailingGlobSuffix(path)) &&
+      (baseDir === '' || baseDir === '/')
+    ) {
       globPatterns.push(path)
     }
   }
