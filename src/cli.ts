@@ -69,6 +69,21 @@ function openControlFd(fd: number): NodeJS.ReadableStream {
   return fs.createReadStream('', { fd })
 }
 
+/**
+ * Build a `stdio` array for `spawn` that passes the caller's file
+ * descriptors (3-8) to the sandboxed command at the same fd numbers.
+ * Positions 3-8 not listed in `passFds` are set to 'ignore' so the
+ * child does not inherit fds this process holds for its own use
+ * (the control fd, proxy sockets, …). Fds 0-2 are always inherited.
+ */
+function buildChildStdio(passFds: number[]): ('inherit' | 'ignore' | number)[] {
+  const stdio: ('inherit' | 'ignore' | number)[] = [0, 1, 2]
+  for (let i = 3; i <= 8; i++) {
+    stdio.push(passFds.includes(i) ? i : 'ignore')
+  }
+  return stdio
+}
+
 async function main(): Promise<void> {
   const program = new Command()
 
@@ -180,6 +195,12 @@ async function main(): Promise<void> {
       'read config updates from file descriptor (JSON lines protocol)',
       parseInt,
     )
+    .option(
+      '--pass-fd <fd>',
+      'pass a file descriptor (3-8) to the sandboxed command at the same number (repeatable)',
+      (val: string, prev: number[]) => [...prev, parseInt(val, 10)],
+      [] as number[],
+    )
     .allowUnknownOption()
     .action(
       async (
@@ -189,6 +210,7 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          passFd?: number[]
         },
       ) => {
         try {
@@ -197,6 +219,19 @@ async function main(): Promise<void> {
           // package and other tools) — keep this in sync with utils/debug.ts.
           if (options.debug) {
             process.env.SRT_DEBUG = 'true'
+          }
+
+          // Validate --pass-fd values: the caller already has the fd open
+          // and it must be in the range 3-8 (0-2 are stdin/stdout/stderr,
+          // 9+ are reserved for srt's own use).
+          const passFds = options.passFd ?? []
+          for (const fd of passFds) {
+            if (isNaN(fd) || fd <= 2 || fd > 8) {
+              console.error(
+                `Error: --pass-fd must be a file descriptor between 3 and 8 (got ${fd})`,
+              )
+              process.exit(1)
+            }
           }
 
           // Load config from file
@@ -327,7 +362,7 @@ async function main(): Promise<void> {
               await SandboxManager.wrapWithSandboxArgv(command)
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
-              stdio: 'inherit',
+              stdio: passFds.length > 0 ? buildChildStdio(passFds) : 'inherit',
               env,
             })
           } else {
@@ -335,7 +370,7 @@ async function main(): Promise<void> {
               await SandboxManager.wrapWithSandbox(command)
             child = spawn(sandboxedCommand, {
               shell: true,
-              stdio: 'inherit',
+              stdio: passFds.length > 0 ? buildChildStdio(passFds) : 'inherit',
             })
           }
 
