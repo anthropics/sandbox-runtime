@@ -23,7 +23,10 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
-import { getGlobalNpmPaths } from './generate-seccomp-filter.js'
+import {
+  getGlobalNpmPaths,
+  getGlobalNpmPathsAsync,
+} from './generate-seccomp-filter.js'
 
 export const JAVA_PROXY_AGENT_JAR_NAME = 'srt-proxy-agent.jar'
 
@@ -43,12 +46,36 @@ export function getJavaProxyAgentJarPath(explicitPath?: string): string | null {
   const key = explicitPath ?? ''
   const cached = jarPathCache.get(key)
   if (cached !== undefined) return cached
-  const found = findJar(explicitPath)
+  const found = findLocalJar(explicitPath) ?? findGlobalJar(getGlobalNpmPaths())
   jarPathCache.set(key, found)
   return found
 }
 
-function findJar(explicitPath?: string): string | null {
+/**
+ * Async variant of {@link getJavaProxyAgentJarPath}, used by initialize():
+ * same lookup order and cache, but the global-npm fallback resolves
+ * `npm root -g` without blocking the event loop.
+ */
+export async function getJavaProxyAgentJarPathAsync(
+  explicitPath?: string,
+): Promise<string | null> {
+  const key = explicitPath ?? ''
+  const cached = jarPathCache.get(key)
+  if (cached !== undefined) return cached
+  const found =
+    findLocalJar(explicitPath) ?? findGlobalJar(await getGlobalNpmPathsAsync())
+  jarPathCache.set(key, found)
+  return found
+}
+
+const JAR_REL_PATH = join(
+  'vendor',
+  'java-proxy-agent',
+  JAVA_PROXY_AGENT_JAR_NAME,
+)
+
+/** Steps 0–3 of the lookup; undefined means try the global npm install. */
+function findLocalJar(explicitPath?: string): string | undefined {
   if (explicitPath) {
     if (existsSync(explicitPath)) return explicitPath
     logForDebugging(
@@ -57,14 +84,18 @@ function findJar(explicitPath?: string): string | null {
     )
   }
   const baseDir = dirname(fileURLToPath(import.meta.url))
-  const rel = join('vendor', 'java-proxy-agent', JAVA_PROXY_AGENT_JAR_NAME)
   const candidates = [
-    join(baseDir, rel),
-    join(baseDir, '..', '..', rel),
-    join(baseDir, '..', rel),
-    ...getGlobalNpmPaths().map(base => join(base, rel)),
+    join(baseDir, JAR_REL_PATH),
+    join(baseDir, '..', '..', JAR_REL_PATH),
+    join(baseDir, '..', JAR_REL_PATH),
   ]
-  for (const p of candidates) {
+  return candidates.find(p => existsSync(p))
+}
+
+/** Step 4 of the lookup: a global npm install of the package. */
+function findGlobalJar(globalBases: string[]): string | null {
+  for (const base of globalBases) {
+    const p = join(base, JAR_REL_PATH)
     if (existsSync(p)) return p
   }
   logForDebugging(

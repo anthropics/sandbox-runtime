@@ -8,6 +8,12 @@
 import { isIP } from 'node:net'
 import { canonicalizeHost, stripBrackets } from './parent-proxy.js'
 
+/** Drop an IPv6 zone id from an IP-literal entry; matching ignores zones. */
+function dropZone(host: string): string {
+  const pct = host.indexOf('%')
+  return pct === -1 ? host : host.slice(0, pct)
+}
+
 /**
  * Split an optional `:port` suffix off a domain pattern.
  *
@@ -36,7 +42,7 @@ export function splitDomainPatternPort(pattern: string): {
   if (pattern.startsWith('[')) {
     const close = pattern.indexOf(']')
     if (close === -1) return { hostPattern: pattern, port: undefined }
-    const inner = pattern.slice(1, close)
+    const inner = dropZone(pattern.slice(1, close))
     const host = canonicalizeHost(inner) ?? inner
     const rest = pattern.slice(close + 1)
     if (rest === '') return { hostPattern: host, port: undefined }
@@ -50,8 +56,9 @@ export function splitDomainPatternPort(pattern: string): {
   if (idx === -1) return { hostPattern: pattern, port: undefined }
   if (pattern.indexOf(':') !== idx) {
     // ≥2 colons, no brackets: an IPv6 literal (or garbage). Never split.
+    const host = dropZone(pattern)
     return {
-      hostPattern: canonicalizeHost(pattern) ?? pattern,
+      hostPattern: canonicalizeHost(host) ?? host,
       port: undefined,
     }
   }
@@ -64,6 +71,20 @@ function parsePortSuffix(suffix: string): number | undefined {
   if (!/^[1-9][0-9]{0,4}$/.test(suffix)) return undefined
   const port = Number(suffix)
   return port > 65535 ? undefined : port
+}
+
+/**
+ * The IP-literal entries of an allow/deny list as `{ range, port? }` rules
+ * for the resolved-address check: an address the list names explicitly is
+ * judged the same way when a hostname resolves to it.
+ */
+export function ipLiteralRules(
+  entries: readonly string[],
+): Array<{ range: string; port?: number }> {
+  return entries.flatMap(entry => {
+    const { hostPattern, port } = splitDomainPatternPort(entry)
+    return isIP(hostPattern) ? [{ range: hostPattern, port }] : []
+  })
 }
 
 /** Drop a `:port` suffix, if any (see {@link splitDomainPatternPort}). */

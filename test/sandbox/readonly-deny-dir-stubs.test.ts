@@ -35,10 +35,11 @@ import { isLinux } from '../helpers/platform.js'
  * sits inside a directory the deny loop re-binds read-only — the path is
  * already uncreatable there — and keeps the stub (fail closed, preferring
  * the pre-existing abort to a silently creatable deny path) whenever the
- * denyRead re-application machinery could make that subtree writable
- * again: an allowed write path strictly beneath the covering directory, or
- * a read-deny tmpfs comparable with it (at/beneath it, or containing it or
- * any spelling it was reached through).
+ * covering bind is not the last word on that subtree: an allowed write
+ * path strictly beneath the covering directory, or a read-deny tmpfs
+ * comparable with it (at/beneath it, or containing it or any spelling it
+ * was reached through). Those vetoes are kept conservatively: the denyRead
+ * re-applications restore what they cover read-only.
  */
 describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   // realpathSync so exact-string assertions hold even when tmpdir itself
@@ -166,13 +167,12 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`)
   })
 
-  it('keeps the stub (fails closed) when an allowed write path beneath the denied dir is re-opened by denyRead', async () => {
+  it('keeps the stub (fails closed) when an allowed write path beneath the denied dir is restored by denyRead', async () => {
     // The one shape where "the ancestor is under a read-only deny" is not
-    // reliable: a denyRead directory inside the write-denied dir plus an
-    // allowWrite path beneath it. The denyRead re-application emits
-    // "--tmpfs <dir>" and a WRITABLE "--bind <allow> <allow>" after the
-    // read-only re-bind, without re-emitting the deny binds it buries, so
-    // the absent deny path below would otherwise become creatable.
+    // the last word on its own: a denyRead directory inside the
+    // write-denied dir plus an allowWrite path beneath it. The re-applied
+    // "--tmpfs <dir>" lands after the deny binds it buries and restores the
+    // allow path read-only; the stub is kept conservatively all the same.
     const readDenied = join(PROJ, 'ro')
     const nestedAllow = join(readDenied, 'w')
     mkdirSync(nestedAllow, { recursive: true })
@@ -189,13 +189,13 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind /dev/null ${absentDeny}`)
   })
 
-  it('keeps the stub when ANY covering deny dir has an allowed write path re-opened beneath it', async () => {
+  it('keeps the stub when ANY covering deny dir has an allowed write path restored beneath it', async () => {
     // The read-only conclusion must hold across EVERY deny dir covering the
     // ancestor, not just one. Here the absent deny's ancestor d is covered
     // by both PROJ (which has the allowWrite t/w strictly beneath it,
-    // re-opened by the denyRead re-application of t) and d itself (with no
-    // re-opener beneath it). A per-dir check would skip on d and leave the
-    // path creatable through the t/w re-bind.
+    // restored by the denyRead re-application of t) and d itself (with
+    // nothing beneath it). A per-dir check would skip on d, resting the
+    // decision on a covering bind the t/w re-bind sits beneath.
     const readDenied = join(PROJ, 't')
     const nestedAllow = join(readDenied, 'w')
     const innerDenied = join(nestedAllow, 'd')
@@ -216,7 +216,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   it('keeps the stub regardless of where the vetoed covering dir appears in the deny ordering', async () => {
     // Same shape, but the vetoed covering dir PROJ is listed AFTER the
     // absent entry. A decision that only consults deny dirs seen so far
-    // would miss PROJ's re-opener and skip unsafely; the pre-pass collects
+    // would miss PROJ's veto and skip unsafely; the pre-pass collects
     // deny dirs order-independently, so the stub is kept.
     const readDenied = join(PROJ, 't')
     const nestedAllow = join(readDenied, 'w')
@@ -247,8 +247,8 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
   it('keeps the stub when a denyRead directory sits under the covering deny dir (trigger without nested allow)', async () => {
     // A read-denied directory strictly inside the write-denied dir is the
-    // TRIGGER for the post-deny writable re-application, so the subtree is
-    // treated as re-openable and the stub is kept even with no nested
+    // TRIGGER for the post-deny re-application, so the covering bind is not
+    // taken as the last word and the stub is kept even with no nested
     // allowWrite — a config a later allowWrite addition would otherwise
     // silently weaken.
     process.chdir(PROJ)
