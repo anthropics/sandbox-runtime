@@ -704,12 +704,13 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
   /**
    * The same wrap with one extra, non-existent child listed under the root
-   * whose canonical location cannot be resolved for `code`. The shape of a
-   * dangling symlink under '/' (Ubuntu ships /initrd.img.old), without
-   * needing to create one.
+   * whose canonical location fails to resolve for `code` on its first
+   * `failures` lookups. The shape of a dangling symlink under '/' (Ubuntu
+   * ships /initrd.img.old), without needing to create one.
    */
   async function wrapWithUnresolvableRootChild(
     code: string,
+    failures = Number.POSITIVE_INFINITY,
   ): Promise<{ command: string; warnings: string[]; probeLookups: number }> {
     const probe = '/srt-unresolvable-probe'
     const realReaddirSync = fs.readdirSync
@@ -734,7 +735,10 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       ) => {
         if (String(p) === probe) {
           probeLookups++
-          throw Object.assign(new Error(`${code}: cannot resolve`), { code })
+          if (probeLookups <= failures) {
+            throw Object.assign(new Error(`${code}: cannot resolve`), { code })
+          }
+          return probe
         }
         return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
       }) as typeof fs.realpathSync),
@@ -757,6 +761,21 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(probeLookups).toBeGreaterThan(0)
     expect(warnings.join('\n')).not.toContain('Read-deny prediction unusable')
     expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+  })
+
+  it('resolves a root child again when the first failure is transient', async () => {
+    // EIO is about the host, not the path: settling on the fallback after
+    // one such failure would record a guess, make the prediction unusable
+    // and stub the absent cwd dotfiles on a read-only cwd. EACCES, below,
+    // is the settled case that must not be retried into a pass.
+    const { command, warnings, probeLookups } =
+      await wrapWithUnresolvableRootChild('EIO', 1)
+
+    expect(probeLookups).toBeGreaterThan(0)
+    expect(warnings.join('\n')).not.toContain('Read-deny prediction unusable')
     expect(command).not.toContain(
       `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
     )
