@@ -1270,6 +1270,13 @@ function pushReadDenyDirMounts(
     readAllowPaths: readonly string[]
     /** Where a path resolves to (canonicalForm in the caller). */
     resolved: (p: string) => string
+    /** Whether that answer is the spelling itself because nothing could be
+     * resolved (canonicalFormUnresolved in the caller). */
+    resolutionFailed: (p: string) => boolean
+    /** What the read section hides at or around a resolved target, other
+     * than this tmpfs and the denies above it (readDenialAround in the
+     * caller). */
+    readDenialAround: (target: string, landing: string) => string | undefined
     /** Where a path's name lives (nameLocationOf in the caller). */
     nameLocation: (p: string) => string
   },
@@ -1290,18 +1297,37 @@ function pushReadDenyDirMounts(
   // an entry whose last component is a symlink is ENOENT inside the sandbox
   // if restored only at its target), from the RESOLVED source: that is the
   // path both containment checks were made against, and naming it leaves
-  // bwrap nothing to re-resolve at mount time. The destination is always a
-  // plain path bwrap can create on the tmpfs, never a symlink whose target
-  // the tmpfs just hid.
+  // bwrap nothing to re-resolve at mount time.
+  //
+  // Restoring at the name from a DIFFERENT path is a second mount of the
+  // target's inode, which nothing landing on the target's own path covers,
+  // so such a restore is dropped whenever the read section hides anything
+  // at, inside or around that target: the deny wins, and the follow-up that
+  // gives the carve-out back has to bind the target at the target.
   const restorePlacementOf = (p: string): RestoredMount | undefined => {
     const dest = unit.nameLocation(p)
     if (!isAtOrUnder(dest, landing)) return undefined
     const source = unit.resolved(p)
+    if (unit.resolutionFailed(p)) {
+      logForDebugging(
+        `[Sandbox Linux] Not restoring ${p} over denyRead tmpfs ${dir}: nothing there resolves (absent, dangling or unreadable), so the only source available is the name itself`,
+      )
+      return undefined
+    }
     if (!isAtOrUnder(source, landing)) {
       logForDebugging(
         `[Sandbox Linux] Not restoring ${p} over denyRead tmpfs ${dir}: it resolves outside it, to ${source}`,
       )
       return undefined
+    }
+    if (source !== dest) {
+      const denied = unit.readDenialAround(source, landing)
+      if (denied !== undefined) {
+        logForDebugging(
+          `[Sandbox Linux] Not restoring ${p} over denyRead tmpfs ${dir}: it resolves to ${source}, and the read section denies or masks ${denied}`,
+        )
+        return undefined
+      }
     }
     return { source, dest }
   }
@@ -1325,12 +1351,6 @@ function pushReadDenyDirMounts(
   for (const allowPath of readAllowPaths) {
     const placement = restorePlacementOf(allowPath)
     if (placement === undefined) continue
-    if (!fs.existsSync(allowPath)) {
-      logForDebugging(
-        `[Sandbox Linux] Skipping non-existent read allow path: ${allowPath}`,
-      )
-      continue
-    }
     // Skip only if a write path was re-bound just above AND covers
     // allowPath. A write path that's an ancestor of the deny dir isn't
     // re-bound (it wasn't wiped), so allowPath under it still needs
@@ -1401,6 +1421,11 @@ async function generateFilesystemArgs(
   // dangling symlink under '/' is ordinary, and counting it would keep every
   // deny placeholder on the whole host).
   const canonicalFormGuesses = new Set<string>()
+  // Paths canonicalForm answered with the spelling it was given because
+  // nothing could be resolved. A mount SOURCE must never be one of them:
+  // bwrap would resolve whatever sits at that name at mount time, after the
+  // containment checks ran against the name itself.
+  const canonicalFormUnresolved = new Set<string>()
   const canonicalForm = (p: string): string => {
     let canonical = canonicalFormCache.get(p)
     if (canonical === undefined) {
@@ -1409,6 +1434,7 @@ async function generateFilesystemArgs(
         canonical = resolved.canonical
       } else {
         canonical = p // vanished or unresolvable: the recorded form stands
+        canonicalFormUnresolved.add(p)
         if (!isAbsenceErrno(resolved.error)) canonicalFormGuesses.add(p)
       }
       canonicalFormCache.set(p, canonical)
@@ -1538,6 +1564,33 @@ async function generateFilesystemArgs(
     readDenyEntriesMemo = entries
     return entries
   }
+  // Every location the read section hides, at the canonical location its
+  // mount lands on: one per denyRead entry and one per masked credential
+  // file. Derived from the same readDenyEntries() the loop below walks.
+  let readDeniedLocationsMemo: string[] | undefined
+  const readDeniedLocations = (): string[] =>
+    (readDeniedLocationsMemo ??= [
+      ...readDenyEntries().map(entry =>
+        canonicalForm(normalizePathForSandbox(entry)),
+      ),
+      ...(maskedFileBinds ?? []).map(mask => canonicalForm(mask.realPath)),
+    ])
+  // What the read section hides at, inside, or around `target`, ignoring the
+  // tmpfs landing at `landing` and every deny above it — those are what a
+  // carve-out restored into that tmpfs is the exception to. Everything else
+  // that overlaps the target wins over the carve-out: an allowRead entry
+  // reached through a symlink is restored as a SECOND mount of the target's
+  // inode, at the name, which a deny or mask landing on the target's own
+  // path never covers. Returns the offending location, for the debug line.
+  const readDenialAround = (
+    target: string,
+    landing: string,
+  ): string | undefined =>
+    readDeniedLocations().find(
+      denied =>
+        !isAtOrUnder(landing, denied) &&
+        (isAtOrUnder(denied, target) || isAtOrUnder(target, denied)),
+    )
   // Where the ancestor pins are spliced in once every mount is known:
   // beneath the allow binds, or after them under a '/' write root that would
   // otherwise bury them (see ancestorPinArgs).
@@ -2139,26 +2192,25 @@ async function generateFilesystemArgs(
   const fileMasks: Array<{ dest: string; source: string; landing: string }> = []
 
   // Replay the tmpfs units in order (bwrap is last-mount-wins): is `location`
-  // beneath a unit's tmpfs and not brought back by a restore since? A
-  // restore counts wherever it lands and wherever it was spelled: a
-  // symlinked spelling brings back the same inode.
+  // beneath a unit's tmpfs and not brought back by a restore since? A restore
+  // counts only where it lands. One reached through a symlink puts the
+  // target's inode at the NAME; the target's own path is still under the
+  // tmpfs, and asking there must not answer "brought back".
   const isHiddenByTmpfs = (
     location: string,
     broughtBackBy: 'writes' | 'writes and reads',
   ): boolean => {
+    const broughtBack = (restored: readonly RestoredMount[]): boolean =>
+      restored.some(r => isAtOrUnder(location, r.dest))
     let hidden = false
     for (const unit of readDenyTmpfsUnits) {
       if (isAtOrUnder(location, unit.landing)) {
         hidden = true
       }
-      const restored =
-        broughtBackBy === 'writes'
-          ? unit.restoredWrites
-          : [...unit.restoredWrites, ...unit.restoredReads]
       if (
-        restored.some(r =>
-          mountForms(r.dest).some(form => isAtOrUnder(location, form)),
-        )
+        broughtBack(unit.restoredWrites) ||
+        (broughtBackBy === 'writes and reads' &&
+          broughtBack(unit.restoredReads))
       ) {
         hidden = false
       }
@@ -2231,6 +2283,8 @@ async function generateFilesystemArgs(
         allowedWritePaths: isStandIn ? [] : allowedWritePaths,
         readAllowPaths: isStandIn ? [] : readAllowPaths(),
         resolved: canonicalForm,
+        resolutionFailed: p => canonicalFormUnresolved.has(p),
+        readDenialAround,
         nameLocation: nameLocationOf,
       })
       readDenyTmpfsUnits.push({ dir, landing, ...restored })

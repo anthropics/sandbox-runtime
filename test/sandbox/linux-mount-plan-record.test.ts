@@ -582,6 +582,55 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(wrapped).toContain(`--tmpfs ${secrets} `)
   })
 
+  it('drops an allowRead carve-out spelled through a symlink when a deeper deny lies at its target', async () => {
+    // The same shape as the case below, with the carve-out a symlink: the
+    // restore would bind the target's inode at the name, where the deeper
+    // deny's own mount never reaches it, so no restore is emitted at all.
+    const proj = tempTree({
+      'cfg/private/pub/readme': 'r',
+      'cfg/private/pub/sec/k': 'k',
+    })
+    const priv = join(proj, 'cfg/private')
+    const pub = join(priv, 'pub')
+    const sec = join(pub, 'sec')
+    const pubLink = join(priv, 'docs')
+    symlinkSync('pub', pubLink)
+    const wrapped = await wrapCommandWithSandboxLinux({
+      ...baseParams,
+      readConfig: { denyOnly: [priv, sec], allowWithinDeny: [pubLink] },
+      writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
+    })
+
+    expect(countMounts(wrapped, '--ro-bind', pub, pubLink)).toBe(0)
+    expect(countMounts(wrapped, '--tmpfs', priv)).toBeGreaterThan(0)
+  })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'drops an allowRead carve-out spelled through a symlink when a deeper deny lies at its target (live bwrap)',
+    async () => {
+      const proj = tempTree({
+        'cfg/private/pub/readme': 'PUBTEXT\n',
+        'cfg/private/pub/sec/k': 'SECRETKEY\n',
+      })
+      const priv = join(proj, 'cfg/private')
+      const sec = join(priv, 'pub/sec')
+      const pubLink = join(priv, 'docs')
+      symlinkSync('pub', pubLink)
+
+      const stdout = runBooted(
+        await wrapCommandWithSandboxLinux({
+          ...baseParams,
+          command: `sh -c 'echo ${BOOTED}; cat ${join(pubLink, 'sec/k')} 2>&1; cat ${join(pubLink, 'readme')} 2>&1'`,
+          readConfig: { denyOnly: [priv, sec], allowWithinDeny: [pubLink] },
+          writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
+        }),
+      )
+
+      expect(stdout).not.toContain('SECRETKEY')
+      expect(stdout).not.toContain('PUBTEXT')
+    },
+  )
+
   it('re-applies an allowRead carve-out that contains a deeper read-deny, then the deeper deny', async () => {
     const proj = tempTree({
       'cfg/private/pub/readme': 'r',

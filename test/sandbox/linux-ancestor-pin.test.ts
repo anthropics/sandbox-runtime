@@ -490,6 +490,231 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     },
   )
 
+  // Restoring such a carve-out puts the TARGET's inode at the NAME: a second
+  // mount of it, which a deny or a credential mask landing on the target's
+  // own path does not cover. So the read section wins over the carve-out
+  // whenever it hides anything at, inside or around the target, and the
+  // carve-out is not restored at all. Each flavour below has a control whose
+  // carve-out is an ordinary directory, where the deeper deny lands inside
+  // the restore and the rest of the carve-out stays readable.
+  function carveOutsOverDeniedTargets() {
+    mkTree(BASE, {
+      home: {
+        store: {
+          netrc: 'SECRETTOKEN\n',
+          pages: { 'readme.md': 'PAGETEXT\n', sec: { x: 'SECRETPAGE\n' } },
+        },
+        plain: { 'readme.md': 'PAGETEXT\n', sec: { x: 'SECRETPAGE\n' } },
+      },
+    })
+    const homeDir = join(BASE, 'home')
+    const storeDir = join(homeDir, 'store')
+    const netrcName = join(homeDir, '.netrc')
+    const docsName = join(homeDir, 'docs')
+    const hopName = join(homeDir, '.hop')
+    const danglingName = join(homeDir, '.gone')
+    symlinkSync(join('store', 'netrc'), netrcName)
+    symlinkSync(join('store', 'pages'), docsName)
+    // Two hops, through a directory link: the source has to be the full
+    // realpath, not one hop of it.
+    symlinkSync('store', join(homeDir, 'alias'))
+    symlinkSync(join('alias', 'netrc'), hopName)
+    symlinkSync(join('store', 'gone'), danglingName)
+    return {
+      homeDir,
+      netrcName,
+      netrcTarget: join(storeDir, 'netrc'),
+      docsName,
+      docsTarget: join(storeDir, 'pages'),
+      deniedPage: join(storeDir, 'pages', 'sec'),
+      storeDir,
+      hopName,
+      danglingName,
+      plainDir: join(homeDir, 'plain'),
+      plainDenied: join(homeDir, 'plain', 'sec'),
+    }
+  }
+
+  it('drops a symlinked allowRead carve-out whose target is read-denied', async () => {
+    const { homeDir, netrcName, netrcTarget, plainDir, plainDenied } =
+      carveOutsOverDeniedTargets()
+
+    const command = await wrap({
+      denyRead: [homeDir, netrcTarget],
+      allowRead: [netrcName],
+    })
+
+    expect(countMounts(command, '--ro-bind', netrcTarget, netrcName)).toBe(0)
+    expect(
+      indexOfMount(command, '--ro-bind', '/dev/null', netrcTarget),
+    ).toBeGreaterThan(-1)
+
+    // The control: an ordinary directory carve-out keeps its restore, and
+    // the deeper deny lands inside it.
+    const control = await wrap({
+      denyRead: [homeDir, plainDenied],
+      allowRead: [plainDir],
+    })
+    const restore = indexOfMount(control, '--ro-bind', plainDir, plainDir)
+    expect(restore).toBeGreaterThan(-1)
+    expect(indexOfMount(control, '--tmpfs', plainDenied)).toBeGreaterThan(
+      restore,
+    )
+  })
+
+  it('drops a symlinked directory carve-out whose target holds a read deny', async () => {
+    const { homeDir, docsName, docsTarget, deniedPage } =
+      carveOutsOverDeniedTargets()
+
+    const command = await wrap({
+      denyRead: [homeDir, deniedPage],
+      allowRead: [docsName],
+    })
+
+    expect(countMounts(command, '--ro-bind', docsTarget, docsName)).toBe(0)
+  })
+
+  it('drops a symlinked carve-out whose target a deeper tmpfs hides', async () => {
+    const { homeDir, netrcName, netrcTarget, storeDir } =
+      carveOutsOverDeniedTargets()
+
+    // The deny is neither at nor under the target: it is around it, and the
+    // name would sit outside it serving what it hides.
+    const command = await wrap({
+      denyRead: [homeDir, storeDir],
+      allowRead: [netrcName],
+    })
+
+    expect(countMounts(command, '--ro-bind', netrcTarget, netrcName)).toBe(0)
+    expect(indexOfMount(command, '--tmpfs', storeDir)).toBeGreaterThan(-1)
+  })
+
+  it('drops a symlinked carve-out reached through more than one link', async () => {
+    const { homeDir, hopName, netrcTarget } = carveOutsOverDeniedTargets()
+
+    const command = await wrap({
+      denyRead: [homeDir, netrcTarget],
+      allowRead: [hopName],
+    })
+
+    expect(countMounts(command, '--ro-bind', netrcTarget, hopName)).toBe(0)
+  })
+
+  it('restores nothing for a carve-out whose link dangles', async () => {
+    const { homeDir, danglingName } = carveOutsOverDeniedTargets()
+
+    const command = await wrap({
+      denyRead: [homeDir],
+      allowRead: [danglingName],
+    })
+
+    expect(countMounts(command, '--ro-bind', danglingName, danglingName)).toBe(
+      0,
+    )
+    expect(command).not.toContain(`${danglingName} `)
+  })
+
+  it('drops a symlinked carve-out whose target is a masked credential', async () => {
+    const { homeDir, netrcName, netrcTarget } = carveOutsOverDeniedTargets()
+    const storeDir = join(BASE, 'fakes')
+    mkdirSync(storeDir)
+    const fakePath = join(storeDir, 'netrc')
+    writeFileSync(fakePath, 'SENTINEL\n')
+
+    const command = await wrapCommandWithSandboxLinux({
+      command: 'echo ok',
+      needsNetworkRestriction: false,
+      allowAllUnixSockets: true,
+      readConfig: { denyOnly: [homeDir], allowWithinDeny: [netrcName] },
+      maskedFileBinds: [{ realPath: netrcTarget, fakePath }],
+      maskedFileStoreDir: storeDir,
+    })
+
+    expect(countMounts(command, '--ro-bind', netrcTarget, netrcName)).toBe(0)
+    expect(
+      indexOfMount(command, '--ro-bind', fakePath, netrcTarget),
+    ).toBeGreaterThan(-1)
+  })
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'serves none of the denied bytes through a symlinked carve-out (live bwrap)',
+    async () => {
+      const {
+        homeDir,
+        netrcName,
+        netrcTarget,
+        docsName,
+        deniedPage,
+        storeDir,
+        plainDir,
+        plainDenied,
+      } = carveOutsOverDeniedTargets()
+
+      const denied = run(
+        await wrap(
+          { denyRead: [homeDir, netrcTarget], allowRead: [netrcName] },
+          `cat ${netrcName} 2>&1; echo DONE`,
+        ),
+      )
+      expect(denied.stdout).toContain('DONE')
+      expect(denied.stdout).not.toContain('SECRETTOKEN')
+
+      const directory = run(
+        await wrap(
+          { denyRead: [homeDir, deniedPage], allowRead: [docsName] },
+          `cat ${join(docsName, 'sec', 'x')} 2>&1; echo DONE`,
+        ),
+      )
+      expect(directory.stdout).toContain('DONE')
+      expect(directory.stdout).not.toContain('SECRETPAGE')
+
+      const around = run(
+        await wrap(
+          { denyRead: [homeDir, storeDir], allowRead: [netrcName] },
+          `cat ${netrcName} 2>&1; echo DONE`,
+        ),
+      )
+      expect(around.stdout).toContain('DONE')
+      expect(around.stdout).not.toContain('SECRETTOKEN')
+
+      // The control still reads everything the deeper deny does not cover.
+      const control = run(
+        await wrap(
+          { denyRead: [homeDir, plainDenied], allowRead: [plainDir] },
+          `cat ${join(plainDir, 'sec', 'x')} 2>&1; cat ${join(plainDir, 'readme.md')} 2>&1; echo DONE`,
+        ),
+      )
+      expect(control.stdout).toContain('DONE')
+      expect(control.stdout).not.toContain('SECRETPAGE')
+      expect(control.stdout).toContain('PAGETEXT')
+    },
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'never serves the real credential through a symlinked carve-out (live bwrap)',
+    async () => {
+      const { homeDir, netrcName, netrcTarget } = carveOutsOverDeniedTargets()
+      const storeDir = join(BASE, 'fakes')
+      mkdirSync(storeDir)
+      const fakePath = join(storeDir, 'netrc')
+      writeFileSync(fakePath, 'SENTINEL\n')
+
+      const result = run(
+        await wrapCommandWithSandboxLinux({
+          command: `sh -c 'cat ${netrcName} 2>&1; echo DONE'`,
+          needsNetworkRestriction: false,
+          allowAllUnixSockets: true,
+          readConfig: { denyOnly: [homeDir], allowWithinDeny: [netrcName] },
+          maskedFileBinds: [{ realPath: netrcTarget, fakePath }],
+          maskedFileStoreDir: storeDir,
+        }),
+      )
+
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).not.toContain('SECRETTOKEN')
+    },
+  )
+
   function pinsInsideWriteDeniedDirectory() {
     mkTree(PROJECT, {
       x: {
