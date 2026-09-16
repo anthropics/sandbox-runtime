@@ -76,12 +76,17 @@ describe.if(!isWindows)('getDefaultWritePaths', () => {
     ])
   })
 
-  it('drops a convenience under a directory a glob matches', () => {
-    expect(getDefaultWritePaths({ denyRead: [join(home, '.n*')] })).toEqual([
-      ...SANDBOX_OWN,
-      claudeDebug,
-    ])
-  })
+  it.each([join(home, '.n*'), join(home, '.np?'), '~/.n*', '~/**/_logs'])(
+    'drops a convenience a glob deny reaches: %s',
+    deny => {
+      // These go through the string-level denyGlobRegex, the one a caller's
+      // configured spelling belongs in: every character in it is pattern.
+      expect(getDefaultWritePaths({ denyRead: [deny] })).toEqual([
+        ...SANDBOX_OWN,
+        claudeDebug,
+      ])
+    },
+  )
 
   it('keeps a convenience beside, not beneath, what is read-denied', () => {
     expect(
