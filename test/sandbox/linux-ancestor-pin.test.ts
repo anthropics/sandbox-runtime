@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { spawnSync } from 'node:child_process'
+import * as fs from 'fs'
 import {
   existsSync,
   mkdirSync,
@@ -23,6 +24,7 @@ import {
   countMounts,
   indexOfMount,
   lastIndexOfMount,
+  lastMountAt,
 } from '../helpers/bwrap-argv.js'
 
 // Every scenario has an argument-level arm that runs everywhere on Linux and,
@@ -712,6 +714,142 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
       expect(result.stdout).toContain('DONE')
       expect(result.stdout).not.toContain('SECRETTOKEN')
+    },
+  )
+
+  // The other side of that rule: only a deny that MOUNTS something overlaps
+  // the target. An entry naming a path that is not there mounts nothing (the
+  // manager hands every configured credential file to the read denies,
+  // present or not), and neither does a file deny an allowRead entry lifts —
+  // so neither may cost the carve-out its restore.
+  it('restores a symlinked carve-out around a read deny that is not there', async () => {
+    const { homeDir, docsName, docsTarget } = symlinkedAllowReadCarveOuts()
+
+    const command = await wrap({
+      denyRead: [homeDir, join(docsTarget, 'secret.txt')],
+      allowRead: [docsName],
+    })
+
+    expect(countMounts(command, '--ro-bind', docsTarget, docsName)).toBe(1)
+  })
+
+  it('restores a symlinked carve-out around a file deny an allowRead entry lifts', async () => {
+    const { homeDir, docsName, docsTarget } = symlinkedAllowReadCarveOuts()
+    const readme = join(docsTarget, 'readme.md')
+
+    const command = await wrap({
+      denyRead: [homeDir, readme],
+      allowRead: [docsName, readme],
+    })
+
+    expect(countMounts(command, '--ro-bind', '/dev/null', readme)).toBe(0)
+    expect(countMounts(command, '--ro-bind', readme, readme)).toBe(1)
+    expect(countMounts(command, '--ro-bind', docsTarget, docsName)).toBe(1)
+  })
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'serves a symlinked carve-out no read deny lands inside (live bwrap)',
+    async () => {
+      const { homeDir, docsName, docsTarget } = symlinkedAllowReadCarveOuts()
+      const readme = join(docsTarget, 'readme.md')
+      const read = `cat ${join(docsName, 'readme.md')} 2>&1; cat ${join(homeDir, 'other.txt')} 2>&1; echo DONE`
+
+      const absent = run(
+        await wrap(
+          {
+            denyRead: [homeDir, join(docsTarget, 'secret.txt')],
+            allowRead: [docsName],
+          },
+          read,
+        ),
+      )
+      expect(absent.stdout).toContain('DONE')
+      expect(absent.stdout).toContain('PAGETEXT')
+      expect(absent.stdout).not.toContain('HIDDEN')
+
+      const lifted = run(
+        await wrap(
+          { denyRead: [homeDir, readme], allowRead: [docsName, readme] },
+          read,
+        ),
+      )
+      expect(lifted.stdout).toContain('DONE')
+      expect(lifted.stdout).toContain('PAGETEXT')
+      expect(lifted.stdout).not.toContain('HIDDEN')
+    },
+  )
+
+  // An entry that cannot be inspected is not mounted where it was written:
+  // the tmpfs lands on the deepest directory above it that can be. That
+  // stand-in is what hides the target here, and the carve-out's name sits
+  // outside it, where the stand-in never reaches.
+  function carveOutUnderStandIn() {
+    mkTree(BASE, {
+      home: {
+        u: { app: { data: { 'readme.md': 'PAGETEXT\n' }, cfg: 'CFGTEXT\n' } },
+      },
+    })
+    const homeDir = join(BASE, 'home')
+    const appDir = join(homeDir, 'u', 'app')
+    const docsName = join(homeDir, 'docs')
+    symlinkSync(join('u', 'app', 'data'), docsName)
+    return { homeDir, appDir, docsName, uninspectable: join(appDir, 'cfg') }
+  }
+
+  /** The wrap `uninspectable` answers EACCES throughout, as a parent made
+   * unsearchable would. The spy is gone before the command runs, so a live
+   * arm executes the plan against the real tree. */
+  async function wrapWithUninspectable(
+    uninspectable: string,
+    filesystem: Parameters<typeof wrap>[0],
+    command?: string,
+  ): Promise<string> {
+    const realStat = fs.statSync
+    const spy = spyOn(fs, 'statSync').mockImplementation(((
+      p: fs.PathLike,
+      ...rest: unknown[]
+    ) => {
+      if (String(p) === uninspectable) {
+        throw Object.assign(new Error('EACCES: permission denied'), {
+          code: 'EACCES',
+        })
+      }
+      return (realStat as (...a: unknown[]) => unknown)(p, ...rest)
+    }) as typeof fs.statSync)
+    try {
+      return await wrap(filesystem, command)
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
+  it('drops a symlinked carve-out whose target a stand-in tmpfs hides', async () => {
+    const { homeDir, appDir, docsName, uninspectable } = carveOutUnderStandIn()
+
+    const command = await wrapWithUninspectable(uninspectable, {
+      denyRead: [homeDir, uninspectable],
+      allowRead: [docsName],
+    })
+
+    expect(indexOfMount(command, '--tmpfs', appDir)).toBeGreaterThan(-1)
+    expect(lastMountAt(command, docsName)).toBeUndefined()
+  })
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'serves nothing through a symlinked carve-out a stand-in hides (live bwrap)',
+    async () => {
+      const { homeDir, docsName, uninspectable } = carveOutUnderStandIn()
+
+      const result = run(
+        await wrapWithUninspectable(
+          uninspectable,
+          { denyRead: [homeDir, uninspectable], allowRead: [docsName] },
+          `cat ${join(docsName, 'readme.md')} 2>&1; echo DONE`,
+        ),
+      )
+
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).not.toContain('PAGETEXT')
     },
   )
 

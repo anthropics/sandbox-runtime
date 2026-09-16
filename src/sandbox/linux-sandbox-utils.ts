@@ -1564,33 +1564,6 @@ async function generateFilesystemArgs(
     readDenyEntriesMemo = entries
     return entries
   }
-  // Every location the read section hides, at the canonical location its
-  // mount lands on: one per denyRead entry and one per masked credential
-  // file. Derived from the same readDenyEntries() the loop below walks.
-  let readDeniedLocationsMemo: string[] | undefined
-  const readDeniedLocations = (): string[] =>
-    (readDeniedLocationsMemo ??= [
-      ...readDenyEntries().map(entry =>
-        canonicalForm(normalizePathForSandbox(entry)),
-      ),
-      ...(maskedFileBinds ?? []).map(mask => canonicalForm(mask.realPath)),
-    ])
-  // What the read section hides at, inside, or around `target`, ignoring the
-  // tmpfs landing at `landing` and every deny above it — those are what a
-  // carve-out restored into that tmpfs is the exception to. Everything else
-  // that overlaps the target wins over the carve-out: an allowRead entry
-  // reached through a symlink is restored as a SECOND mount of the target's
-  // inode, at the name, which a deny or mask landing on the target's own
-  // path never covers. Returns the offending location, for the debug line.
-  const readDenialAround = (
-    target: string,
-    landing: string,
-  ): string | undefined =>
-    readDeniedLocations().find(
-      denied =>
-        !isAtOrUnder(landing, denied) &&
-        (isAtOrUnder(denied, target) || isAtOrUnder(target, denied)),
-    )
   // Where the ancestor pins are spliced in once every mount is known:
   // beneath the allow binds, or after them under a '/' write root that would
   // otherwise bury them (see ancestorPinArgs).
@@ -2257,8 +2230,55 @@ async function generateFilesystemArgs(
     .map(p => normalizePathForSandbox(p))
     .sort((a, b) => canonicalDepth(a) - canonicalDepth(b))
 
-  for (const normalizedPath of normalizedDenyPaths) {
+  // What each entry mounts, walked once here so that the loop below and the
+  // list of denied locations beside it cannot disagree about where a deny
+  // lands. `target` is undefined where nothing is mounted at all;
+  // `liftedFile` marks a file deny an allowRead entry naming that very file
+  // cancels — the entry mounts nothing in that case either.
+  const readDenyPlan = normalizedDenyPaths.map(normalizedPath => {
     const target = readDenyTargetOf(normalizedPath)
+    return {
+      normalizedPath,
+      target,
+      liftedFile:
+        target !== undefined &&
+        !target.isDirectory &&
+        readAllowPaths().some(
+          allowPath => nameLocationOf(allowPath) === canonicalForm(target.path),
+        ),
+    }
+  })
+  // Every location the read section hides, at the canonical location its
+  // mount lands on: one per entry that mounts something — a directory's
+  // tmpfs, the stand-in tmpfs of an entry that could not be inspected, a
+  // file's /dev/null mask — and one per masked credential file. An entry
+  // that mounts nothing hides nothing, and must not cost a carve-out; a
+  // stand-in hides where it lands, which is above the entry that asked for
+  // it.
+  const readDeniedLocations = [
+    ...readDenyPlan.flatMap(({ target, liftedFile }) =>
+      target === undefined || liftedFile ? [] : [canonicalForm(target.path)],
+    ),
+    ...(maskedFileBinds ?? []).map(mask => canonicalForm(mask.realPath)),
+  ]
+  // What the read section hides at, inside, or around `target`, ignoring the
+  // tmpfs landing at `landing` and every deny above it — those are what a
+  // carve-out restored into that tmpfs is the exception to. Everything else
+  // that overlaps the target wins over the carve-out: an allowRead entry
+  // reached through a symlink is restored as a SECOND mount of the target's
+  // inode, at the name, which a deny or mask landing on the target's own
+  // path never covers. Returns the offending location, for the debug line.
+  const readDenialAround = (
+    target: string,
+    landing: string,
+  ): string | undefined =>
+    readDeniedLocations.find(
+      denied =>
+        !isAtOrUnder(landing, denied) &&
+        (isAtOrUnder(denied, target) || isAtOrUnder(target, denied)),
+    )
+
+  for (const { normalizedPath, target, liftedFile } of readDenyPlan) {
     if (target === undefined) {
       logForDebugging(
         `[Sandbox Linux] Read deny path resolves to nothing this wrap can mount (absent, or uninspectable all the way up to '/'): ${normalizedPath}`,
@@ -2296,12 +2316,7 @@ async function generateFilesystemArgs(
       // of the file it points at. A directory allowRead does not un-deny a
       // file specifically listed in denyRead — otherwise denyRead: ['.env']
       // + allowRead: ['.'] silently drops the .env deny.
-      const deniedFile = canonicalForm(normalizedPath)
-      if (
-        readAllowPaths().some(
-          allowPath => nameLocationOf(allowPath) === deniedFile,
-        )
-      ) {
+      if (liftedFile) {
         logForDebugging(
           `[Sandbox Linux] Skipping read deny for re-allowed path: ${normalizedPath}`,
         )
