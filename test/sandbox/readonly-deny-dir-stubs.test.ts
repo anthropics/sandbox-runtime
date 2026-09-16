@@ -95,7 +95,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     })
   }
 
-  it('skips stubs for absent mandatory-deny dotfiles inside a write-denied cwd, and bwrap still boots', async () => {
+  it('skips stubs for absent mandatory-deny dotfiles inside a write-denied cwd', async () => {
     // The real-world shape: cwd is write-denied, so the mandatory dotfile
     // denies at cwd (.gitconfig, .bashrc, …) are all absent stub candidates.
     process.chdir(PROJ)
@@ -625,7 +625,8 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     // fail transiently (EMFILE/ENFILE). Reading that failure as "no read-deny
     // tmpfs" would skip stubs on evidence that never existed; treating one
     // failure as final keeps every placeholder, which is itself a start-up
-    // refusal under a read-only covering deny. So it is derived twice.
+    // refusal under a read-only covering deny. So the listing itself asks
+    // once more, and only a second failure is taken for an answer.
     const stub = `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`
 
     const transient = await wrapWithFailingRootListings(1)
@@ -702,6 +703,13 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(unusable.command).toContain(stub)
   })
 
+  /** What one wrap costs a root child whose location will not resolve:
+   * twice normalizing the entry (the deny loop's list and the stub
+   * prediction's, neither of which caches) and once for its canonical
+   * location, which does cache. A retried failure adds exactly one, which is
+   * what the counts below are asserted against. */
+  const SETTLED_PROBE_LOOKUPS = 3
+
   /**
    * The same wrap with one extra, non-existent child listed under the root
    * whose canonical location fails to resolve for `code` on its first
@@ -758,7 +766,9 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const { command, warnings, probeLookups } =
       await wrapWithUnresolvableRootChild('ENOENT')
 
-    expect(probeLookups).toBeGreaterThan(0)
+    // No retry: absence is settled, and asking again would only cost a
+    // syscall on a host whose root holds a dangling link.
+    expect(probeLookups).toBe(SETTLED_PROBE_LOOKUPS)
     expect(warnings.join('\n')).not.toContain('Read-deny prediction unusable')
     expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
     expect(command).not.toContain(
@@ -774,7 +784,9 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const { command, warnings, probeLookups } =
       await wrapWithUnresolvableRootChild('EIO', 1)
 
-    expect(probeLookups).toBeGreaterThan(0)
+    // Exactly one more lookup than a settled failure costs: the retry fired
+    // once, and its answer was cached rather than asked for again.
+    expect(probeLookups).toBe(SETTLED_PROBE_LOOKUPS + 1)
     expect(warnings.join('\n')).not.toContain('Read-deny prediction unusable')
     expect(command).not.toContain(
       `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
@@ -788,7 +800,9 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const { command, warnings, probeLookups } =
       await wrapWithUnresolvableRootChild('EACCES')
 
-    expect(probeLookups).toBeGreaterThan(0)
+    // No retry here either: EACCES is settled, and retrying it would turn
+    // the same wrap into two lookups of a path that cannot be looked at.
+    expect(probeLookups).toBe(SETTLED_PROBE_LOOKUPS)
     expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
     expect(warnings.join('\n')).toContain('/srt-unresolvable-probe')
     expect(command).toContain(`--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`)

@@ -546,7 +546,10 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       allowRead: [netrcName],
     })
 
-    expect(countMounts(command, '--ro-bind', netrcTarget, netrcName)).toBe(0)
+    // Nothing lands at the name, whatever it would have been bound from:
+    // asserting the absence of one spelling would pass for a restore spelled
+    // `--ro-bind <name> <name>`, which bwrap resolves to the same inode.
+    expect(lastMountAt(command, netrcName)).toBeUndefined()
     expect(
       indexOfMount(command, '--ro-bind', '/dev/null', netrcTarget),
     ).toBeGreaterThan(-1)
@@ -565,20 +568,18 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   })
 
   it('drops a symlinked directory carve-out whose target holds a read deny', async () => {
-    const { homeDir, docsName, docsTarget, deniedPage } =
-      carveOutsOverDeniedTargets()
+    const { homeDir, docsName, deniedPage } = carveOutsOverDeniedTargets()
 
     const command = await wrap({
       denyRead: [homeDir, deniedPage],
       allowRead: [docsName],
     })
 
-    expect(countMounts(command, '--ro-bind', docsTarget, docsName)).toBe(0)
+    expect(lastMountAt(command, docsName)).toBeUndefined()
   })
 
   it('drops a symlinked carve-out whose target a deeper tmpfs hides', async () => {
-    const { homeDir, netrcName, netrcTarget, storeDir } =
-      carveOutsOverDeniedTargets()
+    const { homeDir, netrcName, storeDir } = carveOutsOverDeniedTargets()
 
     // The deny is neither at nor under the target: it is around it, and the
     // name would sit outside it serving what it hides.
@@ -587,7 +588,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       allowRead: [netrcName],
     })
 
-    expect(countMounts(command, '--ro-bind', netrcTarget, netrcName)).toBe(0)
+    expect(lastMountAt(command, netrcName)).toBeUndefined()
     expect(indexOfMount(command, '--tmpfs', storeDir)).toBeGreaterThan(-1)
   })
 
@@ -599,7 +600,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       allowRead: [hopName],
     })
 
-    expect(countMounts(command, '--ro-bind', netrcTarget, hopName)).toBe(0)
+    expect(lastMountAt(command, hopName)).toBeUndefined()
   })
 
   it('restores nothing for a carve-out whose link dangles', async () => {
@@ -632,7 +633,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       maskedFileStoreDir: storeDir,
     })
 
-    expect(countMounts(command, '--ro-bind', netrcTarget, netrcName)).toBe(0)
+    expect(lastMountAt(command, netrcName)).toBeUndefined()
     expect(
       indexOfMount(command, '--ro-bind', fakePath, netrcTarget),
     ).toBeGreaterThan(-1)

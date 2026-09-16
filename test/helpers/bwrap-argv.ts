@@ -9,6 +9,15 @@ const ARGS_FILE_ARGV0 = 'srt-args'
 const MOUNT_FLAGS = ['--bind', '--ro-bind']
 
 /**
+ * A whole mount, in the two shapes bwrap is given here: a destination-only
+ * `--tmpfs`, or a flag with a source and a destination. Spelling them out is
+ * what keeps an absence assertion honest — a run of any length would let a
+ * typo'd flag, or a transposed source and destination, match nothing and
+ * report 0 for free.
+ */
+type MountWords = ['--tmpfs', string] | ['--bind' | '--ro-bind', string, string]
+
+/**
  * The wrapped command as argv words. Refused when the mounts went to the
  * argument file, where nothing below can see them: every absence assertion
  * would otherwise pass for free.
@@ -44,7 +53,7 @@ function assertLiteralToken(token: string): void {
  * `lastIndexOf('--ro-bind / /')` finds the root mount and passes even when
  * the deny-side bind was never emitted.
  */
-function runIndices(command: string, words: string[]): number[] {
+function runIndices(command: string, words: readonly string[]): number[] {
   for (const token of words) assertLiteralToken(token)
   const argv = argvOf(command)
   const found: number[] = []
@@ -54,9 +63,8 @@ function runIndices(command: string, words: string[]): number[] {
   return found
 }
 
-/** How many times that whole mount appears: a `<flag> <source> <dest>`
- * triple, a two-word `--tmpfs <dest>`, or any other run of argv words. */
-export function countMounts(command: string, ...words: string[]): number {
+/** How many times that whole mount appears. */
+export function countMounts(command: string, ...words: MountWords): number {
   return runIndices(command, words).length
 }
 
@@ -65,12 +73,15 @@ export function countMounts(command: string, ...words: string[]): number {
  * with another mount's index to assert mount order — but never with a
  * character offset from `String.indexOf`.
  */
-export function indexOfMount(command: string, ...words: string[]): number {
+export function indexOfMount(command: string, ...words: MountWords): number {
   return runIndices(command, words)[0] ?? -1
 }
 
 /** Argv index of the last occurrence of that whole mount, or -1. */
-export function lastIndexOfMount(command: string, ...words: string[]): number {
+export function lastIndexOfMount(
+  command: string,
+  ...words: MountWords
+): number {
   return runIndices(command, words).at(-1) ?? -1
 }
 
@@ -89,7 +100,7 @@ export function lastMountAt(command: string, dest: string): string | undefined {
   for (let i = 0; i + 1 < argv.length; i++) {
     if (argv[i] === '--tmpfs' && argv[i + 1] === dest) {
       last = `--tmpfs ${dest}`
-    } else if (MOUNT_FLAGS.includes(argv[i]!) && argv[i + 2] === dest) {
+    } else if (MOUNT_FLAGS.includes(argv[i]) && argv[i + 2] === dest) {
       last = `${argv[i]} ${argv[i + 1]} ${argv[i + 2]}`
     }
   }
