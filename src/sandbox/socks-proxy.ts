@@ -1,7 +1,8 @@
 import type { Socket } from 'net'
 import { createServer } from '@pondwader/socks5-server'
 import { logForDebugging } from '../utils/debug.js'
-import type { ResolvedParentProxy } from './parent-proxy.js'
+import type { DirectLookup, ResolvedParentProxy } from './parent-proxy.js'
+import { isResolvedAddressDenied } from './resolved-address-guard.js'
 import {
   canonicalizeHost,
   connectViaParentProxy,
@@ -33,6 +34,9 @@ export interface SocksProxyServerOptions {
    * NO_PROXY-matched hosts still connect directly.
    */
   parentProxy?: ResolvedParentProxy
+
+  /** Direct-dial name resolution (see HttpProxyServerOptions.lookupFor); a refusal is answered "not allowed by ruleset". */
+  lookupFor?: DirectLookup
 
   /**
    * Per-session token (same value as the HTTP proxy's). When set, the
@@ -166,7 +170,11 @@ export function createSocksProxyServer(
 
     const open = parentUrl
       ? connectViaParentProxy(parentUrl, host, port)
-      : dialDirect(host, port)
+      : dialDirect(
+          host,
+          port,
+          options.lookupFor?.(port, encodedCommandFromProxyUser(conn.username)),
+        )
 
     open
       .then(upstream => {
@@ -188,7 +196,11 @@ export function createSocksProxyServer(
         )
         if (!clientGone) {
           try {
-            sendStatus('HOST_UNREACHABLE')
+            sendStatus(
+              isResolvedAddressDenied(err)
+                ? 'CONNECTION_NOT_ALLOWED'
+                : 'HOST_UNREACHABLE',
+            )
           } catch {
             // socket may have closed between the check and the write
           }

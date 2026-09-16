@@ -186,10 +186,11 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       .filter(target => target.startsWith('/usr/'))
     if (rootLinks.length === 0) return // not usr-merged: nothing to tell apart
 
-    // A '/' deny stands for the root's children. /bin, /lib and /sbin are
-    // links into /usr: denied as entries of their own they are mounted
-    // where they lead, after /usr's tmpfs and the allowRead of /usr bound
-    // back over it, and empty the very directories that allowRead names.
+    // A '/' deny stands for the root's children, minus the ones an allowRead
+    // entry covers: /usr and /etc are named, and /bin, /lib and /sbin are
+    // links into /usr, so all five are skipped. Denied as entries of their
+    // own the links would be mounted where they lead and empty the very
+    // directories that allowRead names.
     // allowAllUnixSockets keeps the apply-seccomp helper out of the command:
     // where it has been built it lives in the checkout, which the '/' deny
     // hides, and the shell would fail to exec it (allow-read.test.ts does the
@@ -202,7 +203,8 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       allowAllUnixSockets: true,
     })
 
-    expect(wrapped).toContain('--tmpfs /usr --ro-bind /usr /usr')
+    expect(wrapped).not.toContain('--tmpfs /usr ')
+    expect(wrapped).not.toContain('--tmpfs /etc ')
     for (const target of rootLinks) {
       expect(wrapped).not.toContain(`--tmpfs ${target} `)
     }

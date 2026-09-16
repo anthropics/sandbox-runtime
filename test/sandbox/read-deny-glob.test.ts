@@ -458,8 +458,10 @@ describe.if(isLinux)(
         const lastTmpfs = Math.max(
           ...ops.flatMap((op, i) => (op.startsWith('tmpfs ') ? [i] : [])),
         )
+        // The carve-out goes back at the name it is, read from where that
+        // name resolves: both are inside the package's real location.
         const reBind = ops.lastIndexOf(
-          `ro-bind ${carveOut} ${join(real, 'public')}`,
+          `ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
         )
         expect(reBind).toBeGreaterThan(lastTmpfs)
 
@@ -509,7 +511,7 @@ describe.if(isLinux)(
       })
 
       expect(wrapped).toContain(
-        `--ro-bind ${carveOut} ${join(real, 'index.js')}`,
+        `--ro-bind ${join(real, 'index.js')} ${join(real, 'index.js')}`,
       )
       expect(wrapped).not.toContain(`/dev/null ${join(real, 'index.js')}`)
       expect(wrapped).not.toContain(`/dev/null ${carveOut}`)
@@ -603,7 +605,7 @@ describe.if(isLinux)(
       })
       expect(viaLink).toContain(`--tmpfs ${real}`)
       expect(viaLink).toContain(
-        `--ro-bind ${join(link, 'public')} ${join(real, 'public')}`,
+        `--ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
       )
     })
 
@@ -623,7 +625,7 @@ describe.if(isLinux)(
       })
       expect(wrapped).toContain(`--tmpfs ${real}`)
       expect(wrapped).toContain(
-        `--ro-bind ${join(link, 'public')} ${join(real, 'public')}`,
+        `--ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
       )
       if (hasBwrap) {
         const run = spawnSync(wrapped, {

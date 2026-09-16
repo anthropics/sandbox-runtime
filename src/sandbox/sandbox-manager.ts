@@ -103,10 +103,16 @@ import {
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
-import type { ResolvedParentProxy } from './parent-proxy.js'
+import type { DirectLookup, ResolvedParentProxy } from './parent-proxy.js'
+import {
+  createResolvedAddressGuard,
+  isResolvedAddressDenied,
+  type ResolvedAddressGuard,
+} from './resolved-address-guard.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
-import { getJavaProxyAgentJarPath } from './java-proxy-agent.js'
+import { getJavaProxyAgentJarPathAsync } from './java-proxy-agent.js'
+import { getApplySeccompBinaryPathAsync } from './generate-seccomp-filter.js'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -128,6 +134,8 @@ let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
+/** Read live through {@link directLookup}, so a config update applies to the next dial. */
+let resolvedAddressGuard: ResolvedAddressGuard = createResolvedAddressGuard()
 let mitmCA: MitmCA | undefined
 /**
  * Resolved path of the JVM proxy agent jar (see java-proxy-agent.ts); set
@@ -272,6 +280,32 @@ function recordProxyViolation(
   })
 }
 
+function recordOutboundDeny(
+  host: string,
+  port: number,
+  reason: string,
+  encodedCommand?: string,
+): void {
+  recordProxyViolation(
+    `deny network-outbound ${host}:${port} (${reason})`,
+    encodedCommand,
+  )
+}
+
+/** Direct-dial `lookup` for the proxies: the current guard's, with a refusal recorded as a violation. */
+const directLookup: DirectLookup =
+  (port, encodedCommand) => (hostname, options, callback) =>
+    resolvedAddressGuard.lookupFor(port)(
+      hostname,
+      options,
+      (err, address, family) => {
+        if (isResolvedAddressDenied(err)) {
+          recordOutboundDeny(hostname, port, err.reason, encodedCommand)
+        }
+        callback(err, address, family)
+      },
+    )
+
 /**
  * The request URL as it should appear in a model-visible violation line:
  * origin + path, with any query string reduced to a `?…` marker (origin
@@ -301,10 +335,7 @@ async function filterNetworkRequest(
   encodedCommand?: string,
 ): Promise<boolean> {
   const denied = (reason: string): false => {
-    recordProxyViolation(
-      `deny network-outbound ${host}:${port} (${reason})`,
-      encodedCommand,
-    )
+    recordOutboundDeny(host, port, reason, encodedCommand)
     return false
   }
 
@@ -539,6 +570,7 @@ async function startMuxProxyServer(
     // injection: the real signature must not travel over plaintext.
     planSigv4: buildSigv4Planner(),
     parentProxy,
+    lookupFor: directLookup,
     proxyAuthToken,
   })
 
@@ -546,6 +578,7 @@ async function startMuxProxyServer(
     filter: (port, host, encodedCommand) =>
       filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     parentProxy,
+    lookupFor: directLookup,
     proxyAuthToken,
     probeUnauthenticated: async (port, host) => {
       // Explicit deny rules only: an unauthenticated peer must never reach
@@ -558,10 +591,7 @@ async function startMuxProxyServer(
           const reason =
             config.network.deniedDomainReasons?.[entry] ??
             'host is on the deny list'
-          recordProxyViolation(
-            `deny network-outbound ${host}:${port} (${reason})`,
-            undefined,
-          )
+          recordOutboundDeny(host, port, reason)
           return { deniedReason: reason }
         }
       }
@@ -622,6 +652,7 @@ async function initialize(
         `https=${redactUrl(parentProxy.httpsUrl)}`,
     )
   }
+  resolvedAddressGuard = createResolvedAddressGuard(runtimeConfig.network)
 
   // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
   // tlsTerminate is explicit opt-in, so a bad config is a hard error.
@@ -897,8 +928,10 @@ async function initialize(
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
       // JVMs read neither HTTPS_PROXY nor its credential; the agent bridges
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
+      // Async: the global-npm fallback spawns `npm root -g`.
       javaAgentJarPath =
-        getJavaProxyAgentJarPath(config.javaAgentJarPath) ?? undefined
+        (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
+        undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1047,6 +1080,12 @@ async function checkDependenciesAsync(ripgrepConfig?: {
   command: string
   args?: string[]
 }): Promise<SandboxDependencyCheck> {
+  // Linux: resolve apply-seccomp first so its global-npm fallback
+  // (`npm root -g`) runs off the event loop; the sync check below then
+  // hits the shared path cache.
+  if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
+    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+  }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
@@ -1074,6 +1113,7 @@ function getCredentialRestrictions(
       setEnvVars: {},
       maskedFileBinds: [],
       maskedFileStoreDir: undefined,
+      degradeToDenyPaths: [],
     }
   }
 
@@ -1119,7 +1159,8 @@ function getCredentialRestrictions(
   // entries are skipped (same posture as an unset masked env var).
   // degradeToDenyPaths carries paths whose extract pattern matched
   // nothing with onExtractNoMatch: "deny" — merged into denyReadPaths
-  // below so both the read-deny config and the platform builders see them.
+  // below so both the read-deny config and the platform builders see
+  // them, and carried separately so they stay literal on the way there.
   const files = credentials.files ?? []
   const { binds: maskedFileBinds, degradeToDenyPaths } = buildMaskedFileBinds(
     files,
@@ -1134,6 +1175,7 @@ function getCredentialRestrictions(
     setEnvVars,
     maskedFileBinds,
     maskedFileStoreDir: maskedFileStore.dirPath,
+    degradeToDenyPaths,
   }
 }
 
@@ -1169,14 +1211,23 @@ function unionDenyReadPaths(
  * Strip a trailing `/**` from each read-path entry and, on Linux, replace
  * any remaining glob with what `expandGlob` returns for it (bubblewrap takes
  * concrete paths only). Other platforms match globs natively.
+ *
+ * `literalPaths` are the ones the library resolved itself (a masked
+ * credential file that degraded to deny) — each names one file on disk, so
+ * it is passed through whatever characters it contains. Expanded as a
+ * pattern, a name holding `[` matches nothing and the deny is lost.
  */
 function resolveReadPathEntries(
   paths: readonly string[],
   expandGlob: (pattern: string) => string[],
+  literalPaths: readonly string[] = [],
 ): string[] {
+  const literal = new Set(literalPaths)
   return paths.flatMap(p => {
     const stripped = removeTrailingGlobSuffix(p)
-    return getPlatform() === 'linux' && containsGlobChars(stripped)
+    return getPlatform() === 'linux' &&
+      !literal.has(p) &&
+      containsGlobChars(stripped)
       ? expandGlob(p)
       : [stripped]
   })
@@ -1204,25 +1255,24 @@ function getFsReadConfig(): FsReadRestrictionConfig {
 
   // Credential deny paths are unioned with the caller's denyRead — never
   // replacing it — so explicit filesystem restrictions always survive.
-  const rawDenyRead = unionDenyReadPaths(
-    config.filesystem.denyRead,
-    getCredentialRestrictions(
-      config.credentials,
-      config.network.allowedDomains,
-    ),
+  const credentialRestrictions = getCredentialRestrictions(
+    config.credentials,
+    config.network.allowedDomains,
   )
-
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.
   const allowPaths = resolveReadPathEntries(
     config.filesystem.allowRead ?? [],
     expandAllowReadGlob,
   )
-  const denyPaths = resolveReadPathEntries(rawDenyRead, pattern =>
-    expandReadDenyGlobLinux(pattern, [
-      ...allowPaths,
-      ...getFsWriteConfig().allowOnly,
-    ]),
+  const denyPaths = resolveReadPathEntries(
+    unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
+    pattern =>
+      expandReadDenyGlobLinux(pattern, [
+        ...allowPaths,
+        ...getFsWriteConfig().allowOnly,
+      ]),
+    credentialRestrictions.degradeToDenyPaths,
   )
 
   return {
@@ -1602,10 +1652,6 @@ async function wrapWithSandbox(
 
     // Credential deny paths are unioned with the caller's denyRead — never
     // replacing it — so explicit filesystem restrictions always survive.
-    const rawDenyRead = unionDenyReadPaths(
-      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-      credentialRestrictions,
-    )
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
@@ -1624,8 +1670,13 @@ async function wrapWithSandbox(
       expandedAllowRead.push(javaAgentJarPath)
     }
     const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
-    const expandedDenyRead = resolveReadPathEntries(rawDenyRead, pattern =>
-      expandReadDenyGlobLinux(pattern, reExposedPaths),
+    const expandedDenyRead = resolveReadPathEntries(
+      unionDenyReadPaths(
+        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+        credentialRestrictions,
+      ),
+      pattern => expandReadDenyGlobLinux(pattern, reExposedPaths),
+      credentialRestrictions.degradeToDenyPaths,
     )
     readConfig = {
       denyOnly: expandedDenyRead,
@@ -1680,6 +1731,7 @@ async function wrapWithSandbox(
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
         setEnvVars: credentialRestrictions.setEnvVars,
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
+        degradeToDenyPaths: credentialRestrictions.degradeToDenyPaths,
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
@@ -1944,12 +1996,16 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
       { level: 'warn' },
     )
   }
+  // Built before anything is swapped, so a malformed range leaves the
+  // previous config fully in effect.
+  const nextGuard = createResolvedAddressGuard(newConfig.network)
   // Deep clone the config to avoid mutations. structuredClone cannot clone
   // functions, so pull filterRequest out, clone the rest, and put it back —
   // a function reference is immutable in the sense that matters here.
   const { filterRequest, ...rest } = newConfig.network
   config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
+  resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
   // effect only on re-initialize. This keeps the state consistent for the
@@ -2214,6 +2270,7 @@ async function reset(): Promise<void> {
   managerContext = undefined
   initializationPromise = undefined
   parentProxy = undefined
+  resolvedAddressGuard = createResolvedAddressGuard()
   mitmCA = undefined
   javaAgentJarPath = undefined
   sentinelRegistry.clear()
