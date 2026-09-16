@@ -1,4 +1,7 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+// The namespace the library binds, so a spy on it is seen by the code under
+// test (see linux-ancestor-pin-errno.test.ts).
+import * as fs from 'fs'
 import {
   chmodSync,
   existsSync,
@@ -22,6 +25,7 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
   let ROOT: string
@@ -109,6 +113,63 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
       }
     },
   )
+
+  it('warns once per mount that lands outside the pattern it came from', async () => {
+    // A matched link decides what is hidden for the whole sandbox: the
+    // pattern names config/, the mount goes on a database directory nothing
+    // in the configuration mentions.
+    const outside = join(ROOT, 'pgdata')
+    const config = join(ROOT, 'config')
+    mkdirSync(join(outside, 'base'), { recursive: true })
+    mkdirSync(config, { recursive: true })
+    writeFileSync(join(config, 'app.conf'), '')
+    symlinkSync(outside, join(config, 'data'))
+    try {
+      const { result, warnings } = await withCapturedWarnings(async () =>
+        expandReadDenyGlobLinux(join(config, '*'), []),
+      )
+
+      expect(result).toContain(outside)
+      const escaped = warnings.filter(line => line.includes(outside))
+      expect(escaped).toHaveLength(1)
+      expect(escaped[0]).toContain(join(config, '*'))
+      expect(escaped[0]).toContain(join(config, 'data'))
+      // What stays inside the pattern's own base is not worth a warning.
+      expect(
+        warnings.filter(line => line.includes(join(config, 'app.conf'))),
+      ).toEqual([])
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+      rmSync(config, { recursive: true, force: true })
+    }
+  })
+
+  it('warns when a pattern still needs more mounts than the threshold after collapsing', async () => {
+    // The expansion is never truncated — that would silently un-deny paths —
+    // so a broad pattern is reported rather than cut short.
+    const many = join(ROOT, 'many')
+    mkdirSync(many, { recursive: true })
+    for (let i = 0; i <= 256; i++) writeFileSync(join(many, `${i}.key`), '')
+    try {
+      const { result, warnings } = await withCapturedWarnings(async () =>
+        expandReadDenyGlobLinux(join(many, '*.key'), []),
+      )
+
+      expect(result).toHaveLength(257)
+      expect(
+        warnings.filter(line => line.includes('after collapsing')),
+      ).toHaveLength(1)
+
+      const { warnings: quiet } = await withCapturedWarnings(async () =>
+        expandReadDenyGlobLinux(join(many, '1?.key'), []),
+      )
+      expect(quiet.filter(line => line.includes('after collapsing'))).toEqual(
+        [],
+      )
+    } finally {
+      rmSync(many, { recursive: true, force: true })
+    }
+  })
 })
 
 describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
@@ -140,8 +201,22 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     )
   })
 
+  /**
+   * A fixture directory of its own for a case that plants a tree: four of
+   * the tests here glob the whole of ROOT, and would otherwise see whatever
+   * another case left in it.
+   */
+  const caseRoots: string[] = []
+  function caseRoot(name: string): string {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), `deny-glob-${name}-`)))
+    caseRoots.push(dir)
+    return dir
+  }
+
   afterAll(() => {
-    rmSync(ROOT, { recursive: true, force: true })
+    for (const dir of [ROOT, ...caseRoots]) {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('mounts a symlink beneath a collapsed directory at its target', () => {
@@ -204,11 +279,10 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
 
   it('lists a link named like the pattern segment with its target', () => {
     // proj/config/secrets -> ../vault: the target is a real directory the
-    // walk reaches first by its own name, which matches nothing; the link
-    // is the only spelling the pattern matches, so the walk must list
-    // through it (a global visited set would not). The target is where the
-    // mount lands.
-    const shal = join(ROOT, 'shal')
+    // walk also reaches by its own name, which matches nothing; the link is
+    // the only spelling the pattern matches, so both names have to be
+    // listed. The target is where the mount lands.
+    const shal = caseRoot('shallow')
     mkdirSync(join(shal, 'proj', 'vault'), { recursive: true })
     writeFileSync(join(shal, 'proj', 'vault', 'secret.out'), '')
     mkdirSync(join(shal, 'proj', 'config'))
@@ -256,11 +330,13 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     }
   })
 
-  it('never denies the root through a link to it', () => {
+  it('denies what holds a link to the root, never the root', () => {
     // build/root -> /: denied where it resolves, that would be a tmpfs over
     // every top-level directory; denied at the link, a mount bwrap refuses,
-    // so that no later command starts while the link exists. It is dropped.
-    const rooted = join(ROOT, 'rooted')
+    // so that no later command starts while the link exists. The directory
+    // holding it is denied instead, as for an entry that cannot be
+    // inspected — here build, which the pattern denies anyway.
+    const rooted = caseRoot('rooted')
     mkdirSync(join(rooted, 'build'), { recursive: true })
     writeFileSync(join(rooted, 'build', '1.out'), '')
     symlinkSync('/', join(rooted, 'build', 'root'))
@@ -269,33 +345,34 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
 
     expect(mounts).toEqual([join(rooted, 'build')])
 
-    // The same when the link is itself the matched directory.
+    // The same when the link is itself the matched directory: the mount goes
+    // on the directory holding it.
     mkdirSync(join(rooted, 'img'))
     symlinkSync('/', join(rooted, 'img', 'build'))
     expect(
       expandReadDenyGlobLinux(join(rooted, 'img', '**/build/**'), []),
-    ).toEqual([])
+    ).toEqual([join(rooted, 'img')])
   })
 
   it('denies the target of a directory-form link the walk did not descend', () => {
-    // u/x/y/build -> u/x names a directory on its own descent chain, so the
-    // walk lists nothing beneath it; it is still a match, and its target is
-    // what a literal deny of the link would deny.
-    const u = join(ROOT, 'u')
-    mkdirSync(join(u, 'x', 'y'), { recursive: true })
-    writeFileSync(join(u, 'x', 'src.ts'), '')
-    symlinkSync(join('..'), join(u, 'x', 'y', 'build'))
+    // pkg/x/y/build -> pkg/x names a directory on its own descent chain, so
+    // the walk lists nothing beneath it; it is still a match, and its target
+    // is what a literal deny of the link would deny.
+    const ancestry = caseRoot('ancestry')
+    mkdirSync(join(ancestry, 'x', 'y'), { recursive: true })
+    writeFileSync(join(ancestry, 'x', 'src.ts'), '')
+    symlinkSync(join('..'), join(ancestry, 'x', 'y', 'build'))
 
-    const mounts = expandReadDenyGlobLinux(join(u, '**/build/**'), [])
+    const mounts = expandReadDenyGlobLinux(join(ancestry, '**/build/**'), [])
 
-    expect(mounts).toContain(join(u, 'x'))
+    expect(mounts).toContain(join(ancestry, 'x'))
   })
 
   it('denies through a link back to the tree', () => {
     // build/up -> ..: the target is the whole tree the link reaches, as a
     // literal deny of the link would have it; the walk itself stops at the
     // link.
-    const esc = join(ROOT, 'esc')
+    const esc = caseRoot('escape')
     mkdirSync(join(esc, 'build'), { recursive: true })
     writeFileSync(join(esc, 'build', '1.out'), '')
     symlinkSync('..', join(esc, 'build', 'up'))
@@ -312,7 +389,7 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     let real: string
     let link: string
     beforeAll(() => {
-      pnpmRoot = join(ROOT, 'pnpm')
+      pnpmRoot = caseRoot('pnpm')
       real = join(pnpmRoot, '.pnpm', 'foo@1', 'node_modules', 'foo')
       link = join(pnpmRoot, 'node_modules', 'foo')
       mkdirSync(join(real, 'public'), { recursive: true })
@@ -358,7 +435,7 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     // no spelled ancestor of the match contains. Collapsing along the
     // spelling would drop it under proj/build and lose the mask beneath the
     // carve-out.
-    const chain = join(ROOT, 'chain')
+    const chain = caseRoot('chain')
     const proj = join(chain, 'proj')
     const store = join(chain, 'store')
     mkdirSync(proj, { recursive: true })
@@ -382,7 +459,7 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
   })
 
   it('drops a matched link that does not resolve', () => {
-    const dangling = join(ROOT, 'dangling')
+    const dangling = caseRoot('dangling')
     mkdirSync(join(dangling, 'build'), { recursive: true })
     writeFileSync(join(dangling, 'build', '1.out'), '')
     symlinkSync(join(dangling, 'gone'), join(dangling, 'build', 'lost'))
@@ -405,6 +482,32 @@ describe.if(isLinux)(
     let link: string
     const savedCwd = process.cwd()
     const hasBwrap = bwrapCanNamespace()
+
+    /**
+     * Run a wrapped command and hold it to having started. A sandbox that
+     * refuses to start prints nothing, which every assertion about what it
+     * hides would otherwise read as a pass, so each command under test says
+     * BOOTED first.
+     */
+    function runBooted(wrapped: string): string {
+      const result = spawnSync(wrapped, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+      })
+      expect(result.stderr ?? '').not.toContain('bwrap:')
+      expect(result.stdout).toContain('BOOTED')
+      return result.stdout
+    }
+
+    /** `ln -s` a case's second test can call again over its own fixture. */
+    function ensureLink(target: string, linkPath: string): void {
+      try {
+        symlinkSync(target, linkPath)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
+      }
+    }
 
     beforeAll(() => {
       ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'deny-glob-bwrap-')))
@@ -441,8 +544,9 @@ describe.if(isLinux)(
     }
 
     for (const spelling of ['link', 'target'] as const) {
+      const carveOutOf = () => join(spelling === 'link' ? link : real, 'public')
       it(`mounts no tmpfs on a symlink and re-binds the carve-out last (allowRead in ${spelling} spelling)`, async () => {
-        const carveOut = join(spelling === 'link' ? link : real, 'public')
+        const carveOut = carveOutOf()
         const wrapped = await wrap('echo hello', carveOut)
         const ops = wrapped.split(' --').map(op => op.trim())
 
@@ -466,32 +570,32 @@ describe.if(isLinux)(
           `ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
         )
         expect(reBind).toBeGreaterThan(lastTmpfs)
+      })
 
-        if (hasBwrap) {
-          // Inside: the package is empty but for the carve-out, in both
-          // spellings; the entries beneath the carve-out keep their masks.
-          const run = spawnSync(
+      it.skipIf(!hasBwrap)(
+        `serves the package empty but for the carve-out, in both spellings (allowRead in ${spelling} spelling)`,
+        async () => {
+          const stdout = runBooted(
             await wrap(
               [
+                'echo BOOTED',
                 `ls ${link}`,
                 `ls ${real}`,
                 `cat ${join(link, 'public', 'ok.txt')} | wc -c`,
                 `[ -e ${join(link, 'index.js')} ] && echo INDEX_VISIBLE || echo INDEX_HIDDEN`,
               ].join('; '),
-              carveOut,
+              carveOutOf(),
             ),
-            { shell: true, encoding: 'utf8', timeout: 15000, cwd: ROOT },
           )
-          expect(run.stderr ?? '').not.toContain('symlink destination')
-          expect(run.status).toBe(0)
-          expect(run.stdout.trim().split('\n')).toEqual([
+          expect(stdout.trim().split('\n')).toEqual([
+            'BOOTED',
             'public',
             'public',
             '0',
             'INDEX_HIDDEN',
           ])
-        }
-      })
+        },
+      )
     }
 
     it('honours a file carve-out written in the link spelling', async () => {
@@ -538,7 +642,7 @@ describe.if(isLinux)(
 
       const storeBind = wrapped.lastIndexOf(`--ro-bind ${store} ${store}`)
       expect(storeBind).toBeGreaterThan(-1)
-      expect(wrapped.lastIndexOf(`--tmpfs ${real}`)).toBeGreaterThan(storeBind)
+      expect(wrapped.lastIndexOf(`--tmpfs ${real} `)).toBeGreaterThan(storeBind)
     })
 
     it('does not re-apply a tmpfs over its carve-out when a denyWrite bind covers only the link spelling', async () => {
@@ -547,23 +651,26 @@ describe.if(isLinux)(
       // (realdir), so the bind re-exposes nothing; re-applying the tmpfs
       // there anyway would re-bind realdir/pub over the mask on
       // realdir/pub/secret.txt and leave the file readable.
-      const R = join(ROOT, 'f4')
-      const realdir = join(R, 'realdir')
-      const W = join(R, 'w')
-      const S = join(W, 'd', 'link')
+      const caseRoot = join(ROOT, 'f4')
+      const realdir = join(caseRoot, 'realdir')
+      const writeRoot = join(caseRoot, 'w')
+      const linkInWriteRoot = join(writeRoot, 'd', 'link')
       mkdirSync(join(realdir, 'pub'), { recursive: true })
       writeFileSync(join(realdir, 'pub', 'secret.txt'), 'secret')
-      mkdirSync(join(W, 'd'), { recursive: true })
-      symlinkSync(realdir, S)
+      mkdirSync(join(writeRoot, 'd'), { recursive: true })
+      symlinkSync(realdir, linkInWriteRoot)
 
       const wrapped = await wrapCommandWithSandboxLinux({
         command: 'true',
         needsNetworkRestriction: false,
         readConfig: {
-          denyOnly: [S, join(realdir, 'pub', 'secret.txt')],
+          denyOnly: [linkInWriteRoot, join(realdir, 'pub', 'secret.txt')],
           allowWithinDeny: [join(realdir, 'pub')],
         },
-        writeConfig: { allowOnly: [W], denyWithinAllow: [join(W, 'd')] },
+        writeConfig: {
+          allowOnly: [writeRoot],
+          denyWithinAllow: [join(writeRoot, 'd')],
+        },
         mandatoryDenySearchDepth: 1,
       })
 
@@ -589,7 +696,7 @@ describe.if(isLinux)(
         },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
-      expect(viaLink).toContain(`--tmpfs ${real}`)
+      expect(viaLink).toContain(`--tmpfs ${real} `)
       expect(viaLink).toContain(
         `--ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
       )
@@ -605,19 +712,19 @@ describe.if(isLinux)(
         },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
-      expect(viaLink).toContain(`--tmpfs ${real}`)
+      expect(viaLink).toContain(`--tmpfs ${real} `)
       expect(viaLink).toContain(
         `--ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
       )
     })
 
-    it('re-binds a carve-out written through a symlinked directory outside the denied one, at its target', async () => {
-      // denyRead [real] + allowRead [link/public]: the name `public` lives in
-      // the denied directory whichever way it is reached, and the bind goes
-      // where it is (bwrap refuses a symlink as a destination and, before
-      // 0.12, an absolute one anywhere in it).
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: `cat ${join(link, 'public', 'ok.txt')}; cat ${join(real, 'index.js')} || echo HIDDEN`,
+    // denyRead [real] + allowRead [link/public]: the name `public` lives in
+    // the denied directory whichever way it is reached, and the bind goes
+    // where it is (bwrap refuses a symlink as a destination and, before 0.12,
+    // an absolute one anywhere in it).
+    function wrapCarveOutThroughOutsideLink(command: string): Promise<string> {
+      return wrapCommandWithSandboxLinux({
+        command,
         needsNetworkRestriction: false,
         readConfig: {
           denyOnly: [real],
@@ -625,42 +732,42 @@ describe.if(isLinux)(
         },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
-      expect(wrapped).toContain(`--tmpfs ${real}`)
+    }
+
+    it('re-binds a carve-out written through a symlinked directory outside the denied one, at its target', async () => {
+      const wrapped = await wrapCarveOutThroughOutsideLink('true')
+      expect(wrapped).toContain(`--tmpfs ${real} `)
       expect(wrapped).toContain(
         `--ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
       )
-      if (hasBwrap) {
-        const run = spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-        })
-        expect(run.stdout).toBe('publicHIDDEN\n')
-      }
     })
+
+    it.skipIf(!hasBwrap)(
+      'serves that carve-out and nothing else of the denied directory',
+      async () => {
+        const stdout = runBooted(
+          await wrapCarveOutThroughOutsideLink(
+            `echo BOOTED; cat ${join(link, 'public', 'ok.txt')}; cat ${join(real, 'index.js')} || echo HIDDEN`,
+          ),
+        )
+        expect(stdout).toBe('BOOTED\npublicHIDDEN\n')
+      },
+    )
 
     describe('an allowRead that only leads into a denied directory', () => {
       // What an allowRead entry resolves to never decides which deny it
       // carves out of: a sandboxed command with write access to where the
       // entry lives can point it anywhere.
-      function run(wrapped: string): string {
-        return spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-        }).stdout
-      }
 
-      it('does not bind a denied directory back through an allowRead symlink to it', async () => {
+      function wrapAllowReadLinkToDeniedDir(command: string): Promise<string> {
         const home = join(ROOT, 'g1', 'home')
         const proj = join(ROOT, 'g1', 'proj')
         mkdirSync(join(home, '.ssh'), { recursive: true })
         writeFileSync(join(home, '.ssh', 'id_rsa'), 'KEY')
         mkdirSync(proj, { recursive: true })
-        symlinkSync(join(home, '.ssh'), join(proj, 'docs'))
-
-        const wrapped = await wrapCommandWithSandboxLinux({
-          command: `cat ${join(home, '.ssh', 'id_rsa')} ${join(proj, 'docs', 'id_rsa')} || echo HIDDEN`,
+        ensureLink(join(home, '.ssh'), join(proj, 'docs'))
+        return wrapCommandWithSandboxLinux({
+          command,
           needsNetworkRestriction: false,
           readConfig: {
             denyOnly: [join(home, '.ssh')],
@@ -669,26 +776,43 @@ describe.if(isLinux)(
           writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
           mandatoryDenySearchDepth: 1,
         })
+      }
 
-        expect(wrapped).toContain(`--tmpfs ${join(home, '.ssh')}`)
-        expect(wrapped).not.toContain(`--ro-bind ${join(proj, 'docs')}`)
-        if (hasBwrap) {
-          const stdout = run(wrapped)
-          expect(stdout).not.toContain('KEY')
-          expect(stdout).toContain('HIDDEN')
-        }
+      it('does not bind a denied directory back through an allowRead symlink to it', async () => {
+        const wrapped = await wrapAllowReadLinkToDeniedDir('true')
+
+        expect(wrapped).toContain(
+          `--tmpfs ${join(ROOT, 'g1', 'home', '.ssh')} `,
+        )
+        expect(wrapped).not.toContain(
+          `--ro-bind ${join(ROOT, 'g1', 'proj', 'docs')}`,
+        )
       })
 
-      it('keeps the mask on a denied file an allowRead symlink points at', async () => {
+      it.skipIf(!hasBwrap)(
+        'serves nothing of that denied directory under either name',
+        async () => {
+          const home = join(ROOT, 'g1', 'home')
+          const proj = join(ROOT, 'g1', 'proj')
+          const stdout = runBooted(
+            await wrapAllowReadLinkToDeniedDir(
+              `echo BOOTED; cat ${join(home, '.ssh', 'id_rsa')} ${join(proj, 'docs', 'id_rsa')} || echo HIDDEN`,
+            ),
+          )
+          expect(stdout).not.toContain('KEY')
+          expect(stdout).toContain('HIDDEN')
+        },
+      )
+
+      function wrapAllowReadLinkToDeniedFile(command: string): Promise<string> {
         const aws = join(ROOT, 'g2', 'aws')
         const proj = join(ROOT, 'g2', 'proj')
         mkdirSync(aws, { recursive: true })
         writeFileSync(join(aws, 'credentials'), 'CREDS')
         mkdirSync(proj, { recursive: true })
-        symlinkSync(join(aws, 'credentials'), join(proj, 'cfg.json'))
-
-        const wrapped = await wrapCommandWithSandboxLinux({
-          command: `cat ${join(aws, 'credentials')} ${join(proj, 'cfg.json')}; echo END`,
+        ensureLink(join(aws, 'credentials'), join(proj, 'cfg.json'))
+        return wrapCommandWithSandboxLinux({
+          command,
           needsNetworkRestriction: false,
           readConfig: {
             denyOnly: [join(aws, 'credentials')],
@@ -697,27 +821,44 @@ describe.if(isLinux)(
           writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
           mandatoryDenySearchDepth: 1,
         })
+      }
+
+      it('keeps the mask on a denied file an allowRead symlink points at', async () => {
+        const wrapped = await wrapAllowReadLinkToDeniedFile('true')
 
         expect(wrapped).toContain(
-          `--ro-bind /dev/null ${join(aws, 'credentials')}`,
+          `--ro-bind /dev/null ${join(ROOT, 'g2', 'aws', 'credentials')}`,
         )
-        if (hasBwrap) expect(run(wrapped)).not.toContain('CREDS')
       })
 
-      it('does not lift a file mask for an allowRead symlink that a pattern also matches', async () => {
-        // denyRead **/.env* with allowRead **/.env.example, and
-        // sub/.env.example -> ../.env planted: both patterns match the link,
-        // which names the link, not .env.
+      it.skipIf(!hasBwrap)(
+        'serves that file through neither name',
+        async () => {
+          const aws = join(ROOT, 'g2', 'aws')
+          const proj = join(ROOT, 'g2', 'proj')
+          const stdout = runBooted(
+            await wrapAllowReadLinkToDeniedFile(
+              `echo BOOTED; cat ${join(aws, 'credentials')} ${join(proj, 'cfg.json')}; echo END`,
+            ),
+          )
+          expect(stdout).not.toContain('CREDS')
+          expect(stdout).toContain('END')
+        },
+      )
+
+      // denyRead **/.env* with allowRead **/.env.example, and
+      // sub/.env.example -> ../.env planted: both patterns match the link,
+      // which names the link, not .env.
+      function wrapPlantedExampleLink(command: string): Promise<string> {
         const proj = join(ROOT, 'g3', 'proj')
         mkdirSync(join(proj, 'sub'), { recursive: true })
         writeFileSync(join(proj, '.env'), 'ENVSECRET')
         writeFileSync(join(proj, '.env.example'), 'EXAMPLE')
-        symlinkSync(join('..', '.env'), join(proj, 'sub', '.env.example'))
+        ensureLink(join('..', '.env'), join(proj, 'sub', '.env.example'))
         const allowWithinDeny = expandGlobPattern(join(proj, '**/.env.example'))
         expect(allowWithinDeny).toContain(join(proj, 'sub', '.env.example'))
-
-        const wrapped = await wrapCommandWithSandboxLinux({
-          command: `cat ${join(proj, '.env.example')}; cat ${join(proj, 'sub', '.env.example')} ${join(proj, '.env')}; echo END`,
+        return wrapCommandWithSandboxLinux({
+          command,
           needsNetworkRestriction: false,
           readConfig: {
             denyOnly: expandReadDenyGlobLinux(
@@ -729,357 +870,708 @@ describe.if(isLinux)(
           writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
           mandatoryDenySearchDepth: 1,
         })
+      }
+
+      it('does not lift a file mask for an allowRead symlink that a pattern also matches', async () => {
+        const proj = join(ROOT, 'g3', 'proj')
+        const wrapped = await wrapPlantedExampleLink('true')
 
         expect(wrapped).toContain(`--ro-bind /dev/null ${join(proj, '.env')}`)
         expect(wrapped).not.toContain(`/dev/null ${join(proj, '.env.example')}`)
-        if (hasBwrap) {
-          const stdout = run(wrapped)
+      })
+
+      it.skipIf(!hasBwrap)(
+        'serves the example file and not what the planted link points at',
+        async () => {
+          const proj = join(ROOT, 'g3', 'proj')
+          const stdout = runBooted(
+            await wrapPlantedExampleLink(
+              `echo BOOTED; cat ${join(proj, '.env.example')}; cat ${join(proj, 'sub', '.env.example')} ${join(proj, '.env')}; echo END`,
+            ),
+          )
           expect(stdout).toContain('EXAMPLE')
           expect(stdout).not.toContain('ENVSECRET')
-        }
-      })
+        },
+      )
 
-      it('does not show a tree outside the denied directory under a name inside it', async () => {
-        // denyRead [D, e/sub] + allowRead [D/lnk], D/lnk -> ../e: bound back
-        // at D/lnk, e would be readable there whatever is denied inside it.
-        // e was never hidden by D's tmpfs, so there is nothing to restore.
-        const D = join(ROOT, 's1', 'D')
-        const e = join(ROOT, 's1', 'e')
-        mkdirSync(D, { recursive: true })
-        mkdirSync(join(e, 'sub'), { recursive: true })
-        writeFileSync(join(e, 'sub', 'secret'), 'secret')
-        symlinkSync(join('..', 'e'), join(D, 'lnk'))
-        for (const denyOnly of [
-          [D, join(e, 'sub')],
-          [join(D, 'lnk', 'sub'), D],
-        ]) {
-          const wrapped = await wrapCommandWithSandboxLinux({
-            command: `cat ${join(D, 'lnk', 'sub', 'secret')} ${join(e, 'sub', 'secret')} || echo HIDDEN`,
-            needsNetworkRestriction: false,
-            readConfig: { denyOnly, allowWithinDeny: [join(D, 'lnk')] },
-            writeConfig: { allowOnly: [], denyWithinAllow: [] },
-          })
-          expect(wrapped).toContain(`--tmpfs ${D}`)
-          expect(wrapped).toContain(`--tmpfs ${join(e, 'sub')}`)
-          expect(wrapped).not.toContain(`--ro-bind ${join(D, 'lnk')}`)
-          if (hasBwrap) {
-            const stdout = run(wrapped)
-            expect(stdout).not.toContain('secret')
-            expect(stdout).toContain('HIDDEN')
-          }
-        }
-      })
-
-      it('leaves a link inside a carve-out to lead where it leads, without a mount of its own', async () => {
-        // denyRead [t/private, D] + allowRead [D/x, D/x/lnk], D/x/lnk -> t:
-        // D/x is bound back from the host, live link included, so t is
-        // reached through it as on the host and t/private stays denied. A
-        // bind of D/x/lnk would land on t and bury that deny.
-        const D = join(ROOT, 's3', 'D')
-        const t = join(ROOT, 's3', 't')
-        mkdirSync(join(D, 'x'), { recursive: true })
-        mkdirSync(join(t, 'private'), { recursive: true })
-        writeFileSync(join(t, 'f'), 'T')
-        writeFileSync(join(t, 'private', 'key'), 'KEY')
-        symlinkSync(join('..', '..', 't'), join(D, 'x', 'lnk'))
-        const wrapped = await wrapCommandWithSandboxLinux({
-          command: `cat ${join(D, 'x', 'lnk', 'f')}; cat ${join(t, 'private', 'key')} ${join(D, 'x', 'lnk', 'private', 'key')} || echo HIDDEN`,
+      // denyRead [denied, outside/sub] + allowRead [denied/lnk], denied/lnk ->
+      // ../outside: bound back at denied/lnk, `outside` would be readable
+      // there whatever is denied inside it. It was never hidden by the
+      // tmpfs on `denied`, so there is nothing to restore.
+      const outsideTreeOrders = [
+        ['the denied directory first', 0],
+        ['the link spelling first', 1],
+      ] as const
+      function outsideTreeDenyOnly(order: number): string[] {
+        const denied = join(ROOT, 's1', 'D')
+        const outside = join(ROOT, 's1', 'e')
+        mkdirSync(denied, { recursive: true })
+        mkdirSync(join(outside, 'sub'), { recursive: true })
+        writeFileSync(join(outside, 'sub', 'secret'), 'secret')
+        ensureLink(join('..', 'e'), join(denied, 'lnk'))
+        return order === 0
+          ? [denied, join(outside, 'sub')]
+          : [join(denied, 'lnk', 'sub'), denied]
+      }
+      function wrapOutsideTree(
+        command: string,
+        order: number,
+      ): Promise<string> {
+        const denied = join(ROOT, 's1', 'D')
+        return wrapCommandWithSandboxLinux({
+          command,
           needsNetworkRestriction: false,
           readConfig: {
-            denyOnly: [join(t, 'private'), D],
-            allowWithinDeny: [join(D, 'x'), join(D, 'x', 'lnk')],
+            denyOnly: outsideTreeDenyOnly(order),
+            allowWithinDeny: [join(denied, 'lnk')],
           },
           writeConfig: { allowOnly: [], denyWithinAllow: [] },
         })
-        expect(wrapped).not.toContain(`--ro-bind ${join(D, 'x', 'lnk')}`)
-        if (hasBwrap) {
-          const run = spawnSync(wrapped, {
-            shell: true,
-            encoding: 'utf8',
-            timeout: 15000,
-          })
-          expect(run.stderr ?? '').not.toContain('symlink destination')
-          expect(run.stdout).toBe('THIDDEN\n')
-        }
-      })
-    })
+      }
 
-    it('denies a path the same way whatever order and spelling name it', async () => {
-      // l1 -> a/b, a/b/l2 -> t: l1/l2/f is t/f. Mounted where it really is,
-      // it is denied under every name, in either order of the two entries.
-      const R = join(ROOT, 's7')
-      mkdirSync(join(R, 'a', 'b'), { recursive: true })
-      mkdirSync(join(R, 't'))
-      writeFileSync(join(R, 't', 'f'), 'FCONTENT')
-      symlinkSync(join('a', 'b'), join(R, 'l1'))
-      symlinkSync(join('..', '..', 't'), join(R, 'a', 'b', 'l2'))
-      const denied = [join(R, 'l1', 'l2', 'f'), join(R, 'a', 'b')]
-      for (const denyOnly of [denied, [...denied].reverse()]) {
-        const wrapped = await wrapCommandWithSandboxLinux({
-          command: `cat ${join(R, 'l1', 'l2', 'f')} ${join(R, 't', 'f')}; echo END`,
+      for (const [orderName, index] of outsideTreeOrders) {
+        it(`does not show a tree outside the denied directory under a name inside it, with ${orderName}`, async () => {
+          const denied = join(ROOT, 's1', 'D')
+          const outside = join(ROOT, 's1', 'e')
+          const wrapped = await wrapOutsideTree('true', index)
+
+          expect(wrapped).toContain(`--tmpfs ${denied} `)
+          expect(wrapped).toContain(`--tmpfs ${join(outside, 'sub')} `)
+          expect(wrapped).not.toContain(`--ro-bind ${join(denied, 'lnk')}`)
+        })
+
+        it.skipIf(!hasBwrap)(
+          `serves nothing of that tree under either name, with ${orderName}`,
+          async () => {
+            const denied = join(ROOT, 's1', 'D')
+            const outside = join(ROOT, 's1', 'e')
+            const stdout = runBooted(
+              await wrapOutsideTree(
+                `echo BOOTED; cat ${join(denied, 'lnk', 'sub', 'secret')} ${join(outside, 'sub', 'secret')} || echo HIDDEN`,
+                index,
+              ),
+            )
+            expect(stdout).not.toContain('secret')
+            expect(stdout).toContain('HIDDEN')
+          },
+        )
+      }
+
+      // denyRead [target/private, denied] + allowRead [denied/x,
+      // denied/x/lnk], denied/x/lnk -> target: denied/x is bound back from
+      // the host, live link included, so `target` is reached through it as on
+      // the host and target/private stays denied. A bind of denied/x/lnk
+      // would land on `target` and bury that deny.
+      function wrapLinkInsideCarveOut(command: string): Promise<string> {
+        const denied = join(ROOT, 's3', 'D')
+        const target = join(ROOT, 's3', 't')
+        mkdirSync(join(denied, 'x'), { recursive: true })
+        mkdirSync(join(target, 'private'), { recursive: true })
+        writeFileSync(join(target, 'f'), 'T')
+        writeFileSync(join(target, 'private', 'key'), 'KEY')
+        ensureLink(join('..', '..', 't'), join(denied, 'x', 'lnk'))
+        return wrapCommandWithSandboxLinux({
+          command,
           needsNetworkRestriction: false,
-          readConfig: { denyOnly, allowWithinDeny: [join(R, 'a', 'b', 'l2')] },
+          readConfig: {
+            denyOnly: [join(target, 'private'), denied],
+            allowWithinDeny: [join(denied, 'x'), join(denied, 'x', 'lnk')],
+          },
           writeConfig: { allowOnly: [], denyWithinAllow: [] },
         })
-        expect(wrapped).toContain(`--ro-bind /dev/null ${join(R, 't', 'f')}`)
-        expect(wrapped).toContain(`--tmpfs ${join(R, 'a', 'b')}`)
-        if (hasBwrap) {
-          const run = spawnSync(wrapped, {
-            shell: true,
-            encoding: 'utf8',
-            timeout: 15000,
-          })
-          expect(run.stdout).toBe('END\n')
-        }
       }
+
+      it('leaves a link inside a carve-out to lead where it leads, without a mount of its own', async () => {
+        const wrapped = await wrapLinkInsideCarveOut('true')
+
+        expect(wrapped).not.toContain(
+          `--ro-bind ${join(ROOT, 's3', 'D', 'x', 'lnk')}`,
+        )
+      })
+
+      it.skipIf(!hasBwrap)(
+        'reads through that link as on the host, and still denies what it leads into',
+        async () => {
+          const denied = join(ROOT, 's3', 'D')
+          const target = join(ROOT, 's3', 't')
+          const stdout = runBooted(
+            await wrapLinkInsideCarveOut(
+              `echo BOOTED; cat ${join(denied, 'x', 'lnk', 'f')}; cat ${join(target, 'private', 'key')} ${join(denied, 'x', 'lnk', 'private', 'key')} || echo HIDDEN`,
+            ),
+          )
+          expect(stdout).toBe('BOOTED\nTHIDDEN\n')
+        },
+      )
     })
 
-    it('mounts a directory that a link inside a denied directory leads back up to before that directory', async () => {
-      // x/secrets/latest -> .. (x, an allowed write root): the deny of the
-      // link is a deny of x, which the write bind cancels; mounted after
-      // x/secrets it would wipe that tmpfs and bind the secrets back.
-      const x = join(ROOT, 's5', 'x')
-      mkdirSync(join(x, 'secrets'), { recursive: true })
-      writeFileSync(join(x, 'secrets', 'key'), 'KEY')
-      symlinkSync('..', join(x, 'secrets', 'latest'))
-      const denied = [join(x, 'secrets'), join(x, 'secrets', 'latest')]
-      for (const denyOnly of [denied, [...denied].reverse()]) {
-        const wrapped = await wrapCommandWithSandboxLinux({
-          command: `cat ${join(x, 'secrets', 'key')} || echo HIDDEN`,
-          needsNetworkRestriction: false,
-          readConfig: { denyOnly },
-          writeConfig: { allowOnly: [x], denyWithinAllow: [] },
-          mandatoryDenySearchDepth: 1,
-        })
-        expect(
-          wrapped.lastIndexOf(`--tmpfs ${join(x, 'secrets')} `),
-        ).toBeGreaterThan(wrapped.lastIndexOf(`--bind ${x} ${x} `))
-        if (hasBwrap) {
-          const run = spawnSync(wrapped, {
-            shell: true,
-            encoding: 'utf8',
-            timeout: 15000,
-          })
-          expect(run.stdout).toBe('HIDDEN\n')
-        }
-      }
-    })
-
-    it('binds an allowed write path back only where it really is', async () => {
-      // D/L -> ../T with denyRead [D, D/L/sub] and allowWrite [T/sub/w]:
-      // T/sub/w is bound back once, at T/sub/w, under the deny binds and
-      // masks that protect it. Bound a second time beneath D/L it would be
-      // writable there with none of them on top.
-      const D = join(ROOT, 's6', 'D')
-      const T = join(ROOT, 's6', 'T')
-      const w = join(T, 'sub', 'w')
-      mkdirSync(D, { recursive: true })
-      mkdirSync(join(w, '.git', 'hooks'), { recursive: true })
-      writeFileSync(join(w, '.env'), 'ENV')
-      symlinkSync(join('..', 'T'), join(D, 'L'))
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: `touch ${join(D, 'L', 'sub', 'w', '.git', 'hooks', 'pre-commit')} ${join(w, '.git', 'hooks', 'pre-commit')} && echo WRITTEN; cat ${join(D, 'L', 'sub', 'w', '.env')} ${join(w, '.env')} || echo HIDDEN`,
+    // l1 -> a/b, a/b/l2 -> t: l1/l2/f is t/f. Mounted where it really is, it
+    // is denied under every name, in either order of the two entries.
+    function wrapTwoLinkSpellings(
+      command: string,
+      reversed: boolean,
+    ): Promise<string> {
+      const caseRoot = join(ROOT, 's7')
+      mkdirSync(join(caseRoot, 'a', 'b'), { recursive: true })
+      mkdirSync(join(caseRoot, 't'), { recursive: true })
+      writeFileSync(join(caseRoot, 't', 'f'), 'FCONTENT')
+      ensureLink(join('a', 'b'), join(caseRoot, 'l1'))
+      ensureLink(join('..', '..', 't'), join(caseRoot, 'a', 'b', 'l2'))
+      const denied = [join(caseRoot, 'l1', 'l2', 'f'), join(caseRoot, 'a', 'b')]
+      return wrapCommandWithSandboxLinux({
+        command,
         needsNetworkRestriction: false,
         readConfig: {
-          denyOnly: [D, join(D, 'L', 'sub'), join(w, '.env')],
-          allowWithinDeny: [join(D, 'L')],
+          denyOnly: reversed ? [...denied].reverse() : denied,
+          allowWithinDeny: [join(caseRoot, 'a', 'b', 'l2')],
+        },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+      })
+    }
+
+    for (const reversed of [false, true]) {
+      const order = reversed ? 'the directory first' : 'the file first'
+
+      it(`denies a path the same way whatever spelling names it, with ${order}`, async () => {
+        const caseRoot = join(ROOT, 's7')
+        const wrapped = await wrapTwoLinkSpellings('true', reversed)
+
+        expect(wrapped).toContain(
+          `--ro-bind /dev/null ${join(caseRoot, 't', 'f')}`,
+        )
+        expect(wrapped).toContain(`--tmpfs ${join(caseRoot, 'a', 'b')} `)
+      })
+
+      it.skipIf(!hasBwrap)(
+        `serves that path through neither spelling, with ${order}`,
+        async () => {
+          const caseRoot = join(ROOT, 's7')
+          const stdout = runBooted(
+            await wrapTwoLinkSpellings(
+              `echo BOOTED; cat ${join(caseRoot, 'l1', 'l2', 'f')} ${join(caseRoot, 't', 'f')}; echo END`,
+              reversed,
+            ),
+          )
+          expect(stdout).toBe('BOOTED\nEND\n')
+        },
+      )
+    }
+
+    // x/secrets/latest -> .. (x, an allowed write root): the deny of the link
+    // is a deny of x, which the write bind cancels; mounted after x/secrets
+    // it would wipe that tmpfs and bind the secrets back.
+    function wrapLinkBackUpToWriteRoot(
+      command: string,
+      reversed: boolean,
+    ): Promise<string> {
+      const writeRoot = join(ROOT, 's5', 'x')
+      mkdirSync(join(writeRoot, 'secrets'), { recursive: true })
+      writeFileSync(join(writeRoot, 'secrets', 'key'), 'KEY')
+      ensureLink('..', join(writeRoot, 'secrets', 'latest'))
+      const denied = [
+        join(writeRoot, 'secrets'),
+        join(writeRoot, 'secrets', 'latest'),
+      ]
+      return wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: reversed ? [...denied].reverse() : denied },
+        writeConfig: { allowOnly: [writeRoot], denyWithinAllow: [] },
+        mandatoryDenySearchDepth: 1,
+      })
+    }
+
+    for (const reversed of [false, true]) {
+      const order = reversed ? 'the link first' : 'the directory first'
+
+      it(`mounts a directory that a link inside a denied directory leads back up to before that directory, with ${order}`, async () => {
+        const writeRoot = join(ROOT, 's5', 'x')
+        const wrapped = await wrapLinkBackUpToWriteRoot('true', reversed)
+
+        expect(
+          wrapped.lastIndexOf(`--tmpfs ${join(writeRoot, 'secrets')} `),
+        ).toBeGreaterThan(
+          wrapped.lastIndexOf(`--bind ${writeRoot} ${writeRoot} `),
+        )
+      })
+
+      it.skipIf(!hasBwrap)(
+        `hides those secrets from the write root, with ${order}`,
+        async () => {
+          const writeRoot = join(ROOT, 's5', 'x')
+          const stdout = runBooted(
+            await wrapLinkBackUpToWriteRoot(
+              `echo BOOTED; cat ${join(writeRoot, 'secrets', 'key')} || echo HIDDEN`,
+              reversed,
+            ),
+          )
+          expect(stdout).toBe('BOOTED\nHIDDEN\n')
+        },
+      )
+    }
+
+    // denied/L -> ../T with denyRead [denied, denied/L/sub] and allowWrite
+    // [T/sub/writable]: T/sub/writable is bound back once, where it is, under
+    // the deny binds and masks that protect it. Bound a second time beneath
+    // denied/L it would be writable there with none of them on top.
+    function wrapWritePathUnderLink(command: string): Promise<string> {
+      const denied = join(ROOT, 's6', 'D')
+      const target = join(ROOT, 's6', 'T')
+      const writable = join(target, 'sub', 'w')
+      mkdirSync(denied, { recursive: true })
+      mkdirSync(join(writable, '.git', 'hooks'), { recursive: true })
+      writeFileSync(join(writable, '.env'), 'ENV')
+      ensureLink(join('..', 'T'), join(denied, 'L'))
+      return wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [denied, join(denied, 'L', 'sub'), join(writable, '.env')],
+          allowWithinDeny: [join(denied, 'L')],
         },
         writeConfig: {
-          allowOnly: [w],
-          denyWithinAllow: [join(w, '.git', 'hooks')],
+          allowOnly: [writable],
+          denyWithinAllow: [join(writable, '.git', 'hooks')],
         },
         mandatoryDenySearchDepth: 1,
       })
+    }
+
+    it('binds an allowed write path back only where it really is', async () => {
+      const writable = join(ROOT, 's6', 'T', 'sub', 'w')
+      const wrapped = await wrapWritePathUnderLink('true')
+
       const binds = wrapped
         .split(' --')
-        .filter(op => op.startsWith(`bind ${w} `))
-      expect(binds.every(op => op.trim() === `bind ${w} ${w}`)).toBe(true)
-      if (hasBwrap) {
-        const run = spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-        })
-        expect(run.stdout).not.toContain('WRITTEN')
-        expect(run.stdout).not.toContain('ENV')
-        expect(run.stdout).toContain('HIDDEN')
-      }
+        .filter(op => op.startsWith(`bind ${writable} `))
+        .map(op => op.trim())
+      expect(binds.length).toBeGreaterThan(0)
+      expect([...new Set(binds)]).toEqual([`bind ${writable} ${writable}`])
     })
 
-    it('keeps a denyWrite bind whose path only passes through a read-denied directory', async () => {
-      // ln -> real/secretdir and real/secretdir/out -> elsewhere/hooks:
-      // denyWrite [real/secretdir/out] protects elsewhere/hooks, which the
-      // tmpfs on real/secretdir does not hide.
-      const root = join(ROOT, 's8', 'root')
-      const hooks = join(root, 'elsewhere', 'hooks')
-      mkdirSync(join(root, 'real', 'secretdir'), { recursive: true })
+    it.skipIf(!hasBwrap)(
+      'writes to that path through neither name, and reads its denied file through neither',
+      async () => {
+        const denied = join(ROOT, 's6', 'D')
+        const writable = join(ROOT, 's6', 'T', 'sub', 'w')
+        const stdout = runBooted(
+          await wrapWritePathUnderLink(
+            `echo BOOTED; touch ${join(denied, 'L', 'sub', 'w', '.git', 'hooks', 'pre-commit')} ${join(writable, '.git', 'hooks', 'pre-commit')} && echo WRITTEN; cat ${join(denied, 'L', 'sub', 'w', '.env')} ${join(writable, '.env')} || echo HIDDEN`,
+          ),
+        )
+        expect(stdout).not.toContain('WRITTEN')
+        expect(stdout).not.toContain('ENV')
+        expect(stdout).toContain('HIDDEN')
+      },
+    )
+
+    // ln -> real/secretdir and real/secretdir/out -> elsewhere/hooks:
+    // denyWrite [real/secretdir/out] protects elsewhere/hooks, which the
+    // tmpfs on real/secretdir does not hide.
+    function wrapDenyWriteThroughDeniedDir(command: string): Promise<string> {
+      const caseRoot = join(ROOT, 's8', 'root')
+      const hooks = join(caseRoot, 'elsewhere', 'hooks')
+      mkdirSync(join(caseRoot, 'real', 'secretdir'), { recursive: true })
       mkdirSync(hooks, { recursive: true })
-      symlinkSync(join(root, 'real', 'secretdir'), join(root, 'ln'))
-      symlinkSync(hooks, join(root, 'real', 'secretdir', 'out'))
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: `touch ${join(hooks, 'x')} && echo WRITTEN || echo DENIED`,
+      ensureLink(join(caseRoot, 'real', 'secretdir'), join(caseRoot, 'ln'))
+      ensureLink(hooks, join(caseRoot, 'real', 'secretdir', 'out'))
+      return wrapCommandWithSandboxLinux({
+        command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: [join(root, 'ln')] },
+        readConfig: { denyOnly: [join(caseRoot, 'ln')] },
         writeConfig: {
-          allowOnly: [root],
-          denyWithinAllow: [join(root, 'real', 'secretdir', 'out')],
+          allowOnly: [caseRoot],
+          denyWithinAllow: [join(caseRoot, 'real', 'secretdir', 'out')],
         },
         mandatoryDenySearchDepth: 1,
       })
-      expect(wrapped).toContain(`--tmpfs ${join(root, 'real', 'secretdir')}`)
+    }
+
+    it('keeps a denyWrite bind whose path only passes through a read-denied directory', async () => {
+      const caseRoot = join(ROOT, 's8', 'root')
+      const hooks = join(caseRoot, 'elsewhere', 'hooks')
+      const wrapped = await wrapDenyWriteThroughDeniedDir('true')
+
+      expect(wrapped).toContain(
+        `--tmpfs ${join(caseRoot, 'real', 'secretdir')} `,
+      )
       expect(wrapped).toContain(`--ro-bind ${hooks} ${hooks}`)
-      if (hasBwrap) {
-        const run = spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-        })
-        expect(run.stdout).toBe('DENIED\n')
-      }
+    })
+
+    it.skipIf(!hasBwrap)('refuses the write that bind protects', async () => {
+      const hooks = join(ROOT, 's8', 'root', 'elsewhere', 'hooks')
+      const stdout = runBooted(
+        await wrapDenyWriteThroughDeniedDir(
+          `echo BOOTED; touch ${join(hooks, 'x')} && echo WRITTEN || echo DENIED`,
+        ),
+      )
+      expect(stdout).toBe('BOOTED\nDENIED\n')
     })
 
     it('re-applies one mask for a file denied through a symlinked directory', async () => {
-      // W/lnk -> real, denyRead [W/lnk/secret], denyWrite [W]: the mask sits
-      // on W/real/secret alone, so the bind of W re-exposes one file and one
-      // mask goes back (a second on the same inode aborts bwrap before 0.5).
-      const W = join(ROOT, 's10', 'W')
-      mkdirSync(join(W, 'real'), { recursive: true })
-      writeFileSync(join(W, 'real', 'secret'), 'S')
-      symlinkSync('real', join(W, 'lnk'))
+      // writeRoot/lnk -> real, denyRead [writeRoot/lnk/secret], denyWrite
+      // [writeRoot]: the mask sits on writeRoot/real/secret alone, so the
+      // bind of writeRoot re-exposes one file and one mask goes back (a
+      // second on the same inode aborts bwrap before 0.5).
+      const writeRoot = join(ROOT, 's10', 'W')
+      mkdirSync(join(writeRoot, 'real'), { recursive: true })
+      writeFileSync(join(writeRoot, 'real', 'secret'), 'S')
+      symlinkSync('real', join(writeRoot, 'lnk'))
       const wrapped = await wrapCommandWithSandboxLinux({
         command: 'true',
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: [join(W, 'lnk', 'secret')] },
-        writeConfig: { allowOnly: [W], denyWithinAllow: [W] },
+        readConfig: { denyOnly: [join(writeRoot, 'lnk', 'secret')] },
+        writeConfig: { allowOnly: [writeRoot], denyWithinAllow: [writeRoot] },
         mandatoryDenySearchDepth: 1,
       })
-      const mask = `--ro-bind /dev/null ${join(W, 'real', 'secret')}`
+      const mask = `--ro-bind /dev/null ${join(writeRoot, 'real', 'secret')}`
       const afterDenyBind = wrapped.slice(
-        wrapped.lastIndexOf(`--ro-bind ${W} ${W}`),
+        wrapped.lastIndexOf(`--ro-bind ${writeRoot} ${writeRoot}`),
       )
       expect(afterDenyBind.split(mask)).toHaveLength(2)
-      expect(wrapped).not.toContain(`/dev/null ${join(W, 'lnk', 'secret')}`)
+      expect(wrapped).not.toContain(
+        `/dev/null ${join(writeRoot, 'lnk', 'secret')}`,
+      )
     })
 
+    // denyRead **/.env with the working directory an allowed write root and
+    // mode 0311 (what a sandboxed command can leave behind): the .env files
+    // beneath it cannot be enumerated, so the directory is denied whole, and
+    // binding the write root back over that tmpfs would show every one of
+    // them unmasked.
+    function unlistableCwd(): string {
+      const cwd = join(ROOT, 's11', 'cwd')
+      mkdirSync(join(cwd, 'svc'), { recursive: true })
+      writeFileSync(join(cwd, '.env'), 'ENV1')
+      writeFileSync(join(cwd, 'svc', '.env'), 'ENV2')
+      chmodSync(cwd, 0o311)
+      return cwd
+    }
+    async function wrapUnlistableCwd(command: string): Promise<string> {
+      const cwd = unlistableCwd()
+      const unlistableDenyDirs = new Set<string>()
+      const denyOnly = expandReadDenyGlobLinux(
+        join(cwd, '**/.env'),
+        [cwd],
+        unlistableDenyDirs,
+      )
+      expect(denyOnly).toEqual([cwd])
+      expect([...unlistableDenyDirs]).toEqual([cwd])
+      return wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly,
+          unlistableDenyDirs: [...unlistableDenyDirs],
+        },
+        writeConfig: { allowOnly: [cwd], denyWithinAllow: [] },
+        mandatoryDenySearchDepth: 1,
+      })
+    }
+
     it.if(process.getuid?.() !== 0)(
-      'restores nothing beneath a read-denied directory it cannot list',
+      'restores nothing beneath a directory the glob expansion could not list',
       async () => {
-        // denyRead **/.env with the working directory an allowed write root
-        // and mode 0311 (what a sandboxed command can leave behind): the
-        // .env files beneath it cannot be enumerated, so the directory is
-        // denied whole, and binding the write root back over that tmpfs
-        // would show every one of them unmasked.
-        const cwd = join(ROOT, 's11', 'cwd')
-        mkdirSync(join(cwd, 'svc'), { recursive: true })
-        writeFileSync(join(cwd, '.env'), 'ENV1')
-        writeFileSync(join(cwd, 'svc', '.env'), 'ENV2')
+        try {
+          const cwd = join(ROOT, 's11', 'cwd')
+          const wrapped = await wrapUnlistableCwd('true')
+
+          expect(
+            wrapped.slice(wrapped.indexOf(`--tmpfs ${cwd} `)),
+          ).not.toContain(`--bind ${cwd} ${cwd}`)
+        } finally {
+          chmodSync(join(ROOT, 's11', 'cwd'), 0o755)
+        }
+      },
+    )
+
+    it.if(process.getuid?.() !== 0 && hasBwrap)(
+      'serves none of the files beneath it',
+      async () => {
+        try {
+          const cwd = join(ROOT, 's11', 'cwd')
+          const stdout = runBooted(
+            await wrapUnlistableCwd(
+              `echo BOOTED; cat ${join(cwd, '.env')} ${join(cwd, 'svc', '.env')} || echo HIDDEN`,
+            ),
+          )
+          expect(stdout).not.toContain('ENV1')
+          expect(stdout).not.toContain('ENV2')
+          expect(stdout).toContain('HIDDEN')
+        } finally {
+          chmodSync(join(ROOT, 's11', 'cwd'), 0o755)
+        }
+      },
+    )
+
+    it.if(process.getuid?.() !== 0)(
+      'keeps the carve-outs of a literal deny of a directory it cannot list',
+      async () => {
+        // The same directory, denied literally: nothing was enumerated under
+        // it, so nothing is missing from the deny either, and the allowed
+        // write path inside it is bound back as on any other denied
+        // directory. Without that bind the build writes into the tmpfs and
+        // loses its output when the command exits.
+        const cwd = join(ROOT, 's15', 'cwd')
+        const out = join(cwd, 'out')
+        mkdirSync(out, { recursive: true })
+        writeFileSync(join(cwd, '.env'), 'ENV')
         chmodSync(cwd, 0o311)
         try {
-          const denyOnly = expandReadDenyGlobLinux(join(cwd, '**/.env'), [cwd])
-          expect(denyOnly).toEqual([cwd])
           const wrapped = await wrapCommandWithSandboxLinux({
-            command: `cat ${join(cwd, '.env')} ${join(cwd, 'svc', '.env')} || echo HIDDEN`,
+            command: 'true',
             needsNetworkRestriction: false,
-            readConfig: { denyOnly },
-            writeConfig: { allowOnly: [cwd], denyWithinAllow: [] },
+            readConfig: { denyOnly: [cwd] },
+            writeConfig: { allowOnly: [out], denyWithinAllow: [] },
             mandatoryDenySearchDepth: 1,
           })
+
+          const tmpfs = wrapped.lastIndexOf(`--tmpfs ${cwd} `)
+          expect(tmpfs).toBeGreaterThan(-1)
           expect(
-            wrapped.slice(wrapped.indexOf(`--tmpfs ${cwd}`)),
-          ).not.toContain(`--bind ${cwd} ${cwd}`)
-          if (hasBwrap) {
-            const run = spawnSync(wrapped, {
-              shell: true,
-              encoding: 'utf8',
-              timeout: 15000,
-            })
-            expect(run.stdout).not.toContain('ENV')
-            expect(run.stdout).toContain('HIDDEN')
-          }
+            wrapped.indexOf(`--bind ${out} ${out} `, tmpfs),
+          ).toBeGreaterThan(tmpfs)
         } finally {
           chmodSync(cwd, 0o755)
         }
       },
     )
 
+    // proj/pkg is readable but not searchable (0600): its entries can be
+    // listed, so the pattern matches pkg/.env and finds pkg/build, but
+    // neither can be stat'ed. Skipped as absent, both would be readable once
+    // the mode is put back.
+    async function wrapUninspectableEntries(command: string): Promise<string> {
+      const proj = join(ROOT, 's12', 'proj')
+      const pkg = join(proj, 'pkg')
+      mkdirSync(join(pkg, 'build'), { recursive: true })
+      writeFileSync(join(pkg, '.env'), 'ENV')
+      writeFileSync(join(pkg, 'build', 'o'), 'OUT')
+      chmodSync(pkg, 0o600)
+      const denyOnly = [
+        ...expandReadDenyGlobLinux(join(proj, '**/build/**'), [proj]),
+        ...expandReadDenyGlobLinux(join(proj, '**/.env'), [proj]),
+      ]
+      expect(denyOnly).toContain(join(pkg, '.env'))
+      return wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly },
+        writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
+        mandatoryDenySearchDepth: 1,
+      })
+    }
+
     it.if(process.getuid?.() !== 0)(
       'hides the nearest directory it can inspect when an entry cannot be looked at',
       async () => {
-        // proj/pkg is readable but not searchable (0600): its entries can be
-        // listed, so the pattern matches pkg/.env and finds pkg/build, but
-        // neither can be stat'ed. Skipped as absent, both would be readable
-        // once the mode is put back.
-        const proj = join(ROOT, 's12', 'proj')
-        const pkg = join(proj, 'pkg')
-        mkdirSync(join(pkg, 'build'), { recursive: true })
-        writeFileSync(join(pkg, '.env'), 'ENV')
-        writeFileSync(join(pkg, 'build', 'o'), 'OUT')
-        chmodSync(pkg, 0o600)
+        const pkg = join(ROOT, 's12', 'proj', 'pkg')
         try {
-          const denyOnly = [
-            ...expandReadDenyGlobLinux(join(proj, '**/build/**'), [proj]),
-            ...expandReadDenyGlobLinux(join(proj, '**/.env'), [proj]),
-          ]
-          expect(denyOnly).toContain(join(pkg, '.env'))
-          const wrapped = await wrapCommandWithSandboxLinux({
-            command: `chmod 755 ${pkg}; cat ${join(pkg, '.env')} ${join(pkg, 'build', 'o')} || echo HIDDEN`,
-            needsNetworkRestriction: false,
-            readConfig: { denyOnly },
-            writeConfig: { allowOnly: [proj], denyWithinAllow: [] },
-            mandatoryDenySearchDepth: 1,
-          })
-          expect(wrapped).toContain(`--tmpfs ${pkg}`)
-          if (hasBwrap) {
-            const run = spawnSync(wrapped, {
-              shell: true,
-              encoding: 'utf8',
-              timeout: 15000,
-            })
-            expect(run.stdout).not.toContain('ENV')
-            expect(run.stdout).not.toContain('OUT')
-            expect(run.stdout).toContain('HIDDEN')
-          }
+          expect(await wrapUninspectableEntries('true')).toContain(
+            `--tmpfs ${pkg} `,
+          )
         } finally {
           chmodSync(pkg, 0o755)
         }
       },
     )
 
-    it('starts with a matched link to / in the tree', async () => {
-      // A sandboxed command with write access under the pattern's base can
-      // plant such a link; a mount on it would stop every later command.
+    it.if(process.getuid?.() !== 0 && hasBwrap)(
+      'serves neither entry once the command puts the mode back',
+      async () => {
+        const pkg = join(ROOT, 's12', 'proj', 'pkg')
+        try {
+          const stdout = runBooted(
+            await wrapUninspectableEntries(
+              `echo BOOTED; chmod 755 ${pkg}; cat ${join(pkg, '.env')} ${join(pkg, 'build', 'o')} || echo HIDDEN`,
+            ),
+          )
+          expect(stdout).not.toContain('ENV')
+          expect(stdout).not.toContain('OUT')
+          expect(stdout).toContain('HIDDEN')
+        } finally {
+          chmodSync(pkg, 0o755)
+        }
+      },
+    )
+
+    /**
+     * A matched link whose target is there but cannot be looked at: the
+     * shape a sandboxed command leaves behind by making the target's
+     * directory unsearchable, which it can undo from inside the next
+     * sandbox. Dropped as "does not resolve", the deny would vanish for
+     * exactly that command. EACCES is injected through fs spies, since a
+     * root container sees no real one; the sandboxed command itself then
+     * runs against the real filesystem.
+     */
+    async function wrapUninspectableLinkTarget(
+      command: string,
+    ): Promise<{ wrapped: string; certs: string; link: string }> {
+      const caseRootDir = join(ROOT, 's16')
+      const certs = join(caseRootDir, 'certs')
+      const secret = join(caseRootDir, 'secret')
+      const link = join(certs, 'k')
+      mkdirSync(certs, { recursive: true })
+      mkdirSync(secret, { recursive: true })
+      writeFileSync(join(secret, 'k'), 'KEYBYTES')
+      ensureLink(join('..', 'secret', 'k'), link)
+
+      const unreachable = (p: string): boolean =>
+        p === link || p.startsWith(secret + '/') || p === secret
+      const eacces = (p: fs.PathLike): never => {
+        throw Object.assign(new Error(`EACCES: permission denied, '${p}'`), {
+          code: 'EACCES',
+        })
+      }
+      const realStat = fs.statSync
+      const realRealpath = fs.realpathSync
+      const spies = [
+        spyOn(fs, 'statSync').mockImplementation(((
+          p: fs.PathLike,
+          ...rest: unknown[]
+        ) =>
+          unreachable(String(p))
+            ? eacces(p)
+            : (realStat as (...a: unknown[]) => unknown)(
+                p,
+                ...rest,
+              )) as typeof fs.statSync),
+        spyOn(fs, 'realpathSync').mockImplementation(((
+          p: fs.PathLike,
+          ...rest: unknown[]
+        ) =>
+          unreachable(String(p))
+            ? eacces(p)
+            : (realRealpath as (...a: unknown[]) => unknown)(
+                p,
+                ...rest,
+              )) as typeof fs.realpathSync),
+      ]
+      try {
+        const wrapped = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: {
+            denyOnly: expandReadDenyGlobLinux(join(certs, '*'), []),
+          },
+          writeConfig: { allowOnly: [caseRootDir], denyWithinAllow: [] },
+          mandatoryDenySearchDepth: 1,
+        })
+        return { wrapped, certs, link }
+      } finally {
+        for (const spy of spies) spy.mockRestore()
+      }
+    }
+
+    it('hides what holds a matched link whose target cannot be looked at', async () => {
+      const { wrapped, certs, link } = await wrapUninspectableLinkTarget('true')
+
+      // The deny reaches the mount loop under the link's own spelling, where
+      // the stand-in rule hides the nearest directory that can be inspected.
+      expect(wrapped).toContain(`--tmpfs ${certs} `)
+      expect(wrapped).not.toContain(`--tmpfs ${link} `)
+    })
+
+    it.skipIf(!hasBwrap)(
+      'serves that link nothing, even once the command can look at the target again',
+      async () => {
+        const { wrapped, link } = await wrapUninspectableLinkTarget(
+          `echo BOOTED; cat ${join(ROOT, 's16', 'certs', 'k')} || echo HIDDEN; ls ${join(ROOT, 's16', 'certs')}`,
+        )
+        const stdout = runBooted(wrapped)
+
+        expect(stdout).not.toContain('KEYBYTES')
+        expect(stdout).toContain('HIDDEN')
+        expect(link).toBe(join(ROOT, 's16', 'certs', 'k'))
+      },
+    )
+
+    // A sandboxed command with write access under the pattern's base can
+    // plant a link to the root; a mount on it, or on what it resolves to,
+    // would stop every later command. The directory holding it is hidden
+    // instead, by the same rule as an entry that cannot be inspected.
+    function wrapLinkToRoot(command: string): Promise<string> {
       const proj = join(ROOT, 's13', 'proj')
       mkdirSync(join(proj, 'img'), { recursive: true })
-      symlinkSync('/', join(proj, 'img', 'build'))
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: 'echo STARTED',
+      writeFileSync(join(proj, 'img', 'note.txt'), 'NOTE')
+      ensureLink('/', join(proj, 'img', 'build'))
+      return wrapCommandWithSandboxLinux({
+        command,
         needsNetworkRestriction: false,
         readConfig: {
           denyOnly: [
             ...expandReadDenyGlobLinux(join(proj, '**/build/**'), []),
-            // Named literally, the link is skipped by the loop as well.
+            // Named literally, the loop applies the same rule.
             join(proj, 'img', 'build'),
           ],
         },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
+        allowAllUnixSockets: true,
       })
-      expect(wrapped).not.toContain(`--tmpfs ${join(proj, 'img', 'build')}`)
-      if (hasBwrap) {
-        const run = spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-        })
-        expect(run.stdout).toBe('STARTED\n')
-      }
+    }
+
+    it('hides the directory holding a matched link to / instead of the root', async () => {
+      const img = join(ROOT, 's13', 'proj', 'img')
+      const wrapped = await wrapLinkToRoot('true')
+
+      expect(wrapped).toContain(`--tmpfs ${img} `)
+      expect(wrapped).not.toContain(`--tmpfs ${join(img, 'build')} `)
+      // A --tmpfs / would wipe every mount before it and boot the command on
+      // an empty tree, so it is never emitted, whatever a link resolves to.
+      expect(wrapped).not.toContain('--tmpfs / ')
     })
 
-    it('starts in a write-denied checkout with a denyRead pattern matching a directory inside it', async () => {
-      // denyWrite [proj, proj/.claude/settings.json (absent)] + denyRead
-      // proj/**/build/**: collapsed, the pattern is a tmpfs beneath the
-      // write-denied directory. The absent deny path is uncreatable under
-      // proj's read-only bind either way, and a stub for it would have bwrap
-      // create a mount point inside that bind and abort.
+    it('keeps a link to / out of the read-deny prediction', async () => {
+      // The prediction says where the loop will mount a tmpfs, and every
+      // covering deny directory lies under '/'. Predicted there, no deny
+      // stub could be skipped anywhere on the host, and a write-denied
+      // checkout would refuse to start: bubblewrap cannot create a stub's
+      // mount point inside a read-only bind. A link to the root is predicted
+      // at the directory holding it, where the loop mounts it.
+      const work = join(ROOT, 's17', 'work')
+      const proj = join(work, 'proj')
+      mkdirSync(join(proj, 'img'), { recursive: true })
+      ensureLink('/', join(proj, 'img', 'build'))
+
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [join(proj, 'img', 'build')] },
+        writeConfig: {
+          allowOnly: [work],
+          denyWithinAllow: [proj, join(proj, '.claude', 'settings.json')],
+        },
+        mandatoryDenySearchDepth: 1,
+      })
+
+      expect(wrapped).toContain(`--tmpfs ${join(proj, 'img')} `)
+      expect(wrapped).not.toContain('--tmpfs / ')
+      // The absent deny path under the read-only bind of proj keeps no stub.
+      expect(
+        wrapped
+          .split(' --')
+          .filter(op => op.includes(` ${join(proj, '.claude')}`)),
+      ).toEqual([])
+    })
+
+    it.skipIf(!hasBwrap)('starts, with that directory hidden', async () => {
+      const img = join(ROOT, 's13', 'proj', 'img')
+      const stdout = runBooted(
+        await wrapLinkToRoot(
+          `echo BOOTED; cat ${join(img, 'note.txt')} || echo HIDDEN; ls /`,
+        ),
+      )
+      expect(stdout).not.toContain('NOTE')
+      expect(stdout).toContain('HIDDEN')
+      // The root itself is untouched: the command can still list it.
+      expect(stdout).toContain('usr')
+    })
+
+    // denyWrite [proj, proj/.claude/settings.json (absent)] + denyRead
+    // proj/**/build/**: collapsed, the pattern is a tmpfs beneath the
+    // write-denied directory. The absent deny path is uncreatable under
+    // proj's read-only bind either way, and a stub for it would have bwrap
+    // create a mount point inside that bind and abort.
+    async function wrapWriteDeniedCheckout(command: string): Promise<string> {
       const work = join(ROOT, 's14', 'work')
       const proj = join(work, 'proj')
       mkdirSync(join(proj, 'pkg', 'build'), { recursive: true })
@@ -1087,8 +1579,8 @@ describe.if(isLinux)(
       const cwd = process.cwd()
       process.chdir(proj)
       try {
-        const wrapped = await wrapCommandWithSandboxLinux({
-          command: `mkdir ${join(proj, '.claude')} || echo UNCREATABLE; cat ${join(proj, 'pkg', 'build', '1.out')} || echo HIDDEN`,
+        return await wrapCommandWithSandboxLinux({
+          command,
           needsNetworkRestriction: false,
           readConfig: {
             denyOnly: expandReadDenyGlobLinux(join(proj, '**/build/**'), [
@@ -1101,58 +1593,80 @@ describe.if(isLinux)(
           },
           mandatoryDenySearchDepth: 1,
         })
-        const projBind = wrapped.lastIndexOf(`--ro-bind ${proj} ${proj}`)
-        expect(projBind).toBeGreaterThan(-1)
-        // No stub: nothing is mounted at or beneath proj/.claude.
-        expect(
-          wrapped
-            .slice(0, wrapped.indexOf(' --dev '))
-            .split(' --')
-            .filter(op => op.includes(` ${join(proj, '.claude')}`)),
-        ).toEqual([])
-        expect(
-          wrapped.lastIndexOf(`--tmpfs ${join(proj, 'pkg', 'build')}`),
-        ).toBeGreaterThan(projBind)
-        if (hasBwrap) {
-          const run = spawnSync(wrapped, {
-            shell: true,
-            encoding: 'utf8',
-            timeout: 15000,
-          })
-          expect(run.stdout).toBe('UNCREATABLE\nHIDDEN\n')
-        }
       } finally {
         process.chdir(cwd)
       }
+    }
+
+    it('keeps no deny stub in a write-denied checkout with a denyRead pattern matching a directory inside it', async () => {
+      const proj = join(ROOT, 's14', 'work', 'proj')
+      const wrapped = await wrapWriteDeniedCheckout('true')
+
+      const projBind = wrapped.lastIndexOf(`--ro-bind ${proj} ${proj}`)
+      expect(projBind).toBeGreaterThan(-1)
+      // No stub: nothing is mounted at or beneath proj/.claude.
+      expect(
+        wrapped
+          .slice(0, wrapped.indexOf(' --dev '))
+          .split(' --')
+          .filter(op => op.includes(` ${join(proj, '.claude')}`)),
+      ).toEqual([])
+      expect(
+        wrapped.lastIndexOf(`--tmpfs ${join(proj, 'pkg', 'build')} `),
+      ).toBeGreaterThan(projBind)
     })
 
-    it('still masks the target of a file symlink listed beneath a denied directory', async () => {
-      // denyRead [cfg, cfg/token], cfg/token -> ../secrets/token: the link
-      // vanishes with cfg's tmpfs, but the file it named is the target,
-      // which stays reachable by its own name and must be masked there.
+    it.skipIf(!hasBwrap)(
+      'starts such a checkout, with the directory hidden and the absent deny path uncreatable',
+      async () => {
+        const proj = join(ROOT, 's14', 'work', 'proj')
+        const stdout = runBooted(
+          await wrapWriteDeniedCheckout(
+            `echo BOOTED; mkdir ${join(proj, '.claude')} || echo UNCREATABLE; cat ${join(proj, 'pkg', 'build', '1.out')} || echo HIDDEN`,
+          ),
+        )
+        expect(stdout).toBe('BOOTED\nUNCREATABLE\nHIDDEN\n')
+      },
+    )
+
+    // denyRead [cfg, cfg/token], cfg/token -> ../secrets/token: the link
+    // vanishes with cfg's tmpfs, but the file it named is the target, which
+    // stays reachable by its own name and must be masked there.
+    function wrapFileLinkBeneathDeniedDir(command: string): Promise<string> {
       const cfg = join(ROOT, 's9', 'cfg')
       const secrets = join(ROOT, 's9', 'secrets')
       mkdirSync(cfg, { recursive: true })
       mkdirSync(secrets, { recursive: true })
       writeFileSync(join(secrets, 'token'), 'TOKEN')
-      symlinkSync(join('..', 'secrets', 'token'), join(cfg, 'token'))
-      const wrapped = await wrapCommandWithSandboxLinux({
-        command: `cat ${join(secrets, 'token')}; echo`,
+      ensureLink(join('..', 'secrets', 'token'), join(cfg, 'token'))
+      return wrapCommandWithSandboxLinux({
+        command,
         needsNetworkRestriction: false,
         readConfig: { denyOnly: [cfg, join(cfg, 'token')] },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
+    }
+
+    it('still masks the target of a file symlink listed beneath a denied directory', async () => {
+      const secrets = join(ROOT, 's9', 'secrets')
+      const wrapped = await wrapFileLinkBeneathDeniedDir('true')
+
       expect(wrapped).toContain(`--ro-bind /dev/null ${join(secrets, 'token')}`)
-      if (hasBwrap) {
-        const run = spawnSync(wrapped, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 15000,
-        })
-        expect(run.status).toBe(0)
-        expect(run.stdout).not.toContain('TOKEN')
-      }
     })
+
+    it.skipIf(!hasBwrap)(
+      'serves that target masked under its own name',
+      async () => {
+        const secrets = join(ROOT, 's9', 'secrets')
+        const stdout = runBooted(
+          await wrapFileLinkBeneathDeniedDir(
+            `echo BOOTED; cat ${join(secrets, 'token')}; echo END`,
+          ),
+        )
+        expect(stdout).not.toContain('TOKEN')
+        expect(stdout).toContain('END')
+      },
+    )
 
     describe('a directory deny plus per-file entries beneath it', () => {
       let big: string
@@ -1171,7 +1685,7 @@ describe.if(isLinux)(
           readConfig: { denyOnly: [big, ...keys] },
           writeConfig: { allowOnly: [], denyWithinAllow: [] },
         })
-        expect(collapsed.split(`--tmpfs ${big}`)).toHaveLength(2)
+        expect(collapsed.split(`--tmpfs ${big} `)).toHaveLength(2)
         expect(collapsed).not.toContain(`/dev/null ${big}/`)
       })
 
@@ -1262,7 +1776,7 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
         },
       )
 
-      expect(wrapped).toContain(`--tmpfs ${join(ROOT, 'pkg', 'a', 'build')}`)
+      expect(wrapped).toContain(`--tmpfs ${join(ROOT, 'pkg', 'a', 'build')} `)
       expect(wrapped).toContain(
         `--ro-bind /dev/null ${join(carveOut, 'ok.txt')}`,
       )
@@ -1274,7 +1788,7 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
     }
   })
 
-  it('seeds the ancestor pins from a collapsed directory, and pins hold at runtime', async () => {
+  it('seeds the ancestor pins from a collapsed directory', async () => {
     // Every tmpfs the collapse adds is an ordinary read-deny unit, so the
     // directories between it and the allowed write root are pinned: the
     // package directory above a collapsed build/ cannot be renamed aside to
@@ -1297,7 +1811,7 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
     expect(wrapped.indexOf(pin)).toBeLessThan(
       wrapped.indexOf(`--bind ${ROOT} ${ROOT}`),
     )
-    expect(wrapped).toContain(`--tmpfs ${build}`)
+    expect(wrapped).toContain(`--tmpfs ${build} `)
   })
 
   it.skipIf(!bwrapCanNamespace())(
@@ -1349,7 +1863,7 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
       },
     })
 
-    const tmpfs = wrapped.lastIndexOf(`--tmpfs ${build}`)
+    const tmpfs = wrapped.lastIndexOf(`--tmpfs ${build} `)
     expect(tmpfs).toBeGreaterThan(-1)
     // The deny's own bind is dropped (its ancestor pin, spelled the same,
     // sits beneath the write root's bind, so only what follows the tmpfs
@@ -1427,7 +1941,7 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
       )
 
       for (const pkg of PKGS) {
-        expect(wrapped).toContain(`--tmpfs ${join(ROOT, 'pkg', pkg, 'build')}`)
+        expect(wrapped).toContain(`--tmpfs ${join(ROOT, 'pkg', pkg, 'build')} `)
       }
       for (const pkg of PKGS) {
         expect(wrapped).not.toContain(
@@ -1522,7 +2036,7 @@ describe.if(isLinux)(
       rmSync(ROOT, { recursive: true, force: true })
     })
 
-    it.each([
+    const LINK_PATTERNS = [
       ['the wildcard segment names the link', 'l*/key.txt'],
       ['a bare star names the link', '*/key.txt'],
       ['a globstar reaches the link by name', '**/lnk/key.txt'],
@@ -1530,9 +2044,14 @@ describe.if(isLinux)(
       ['the tail names the target directory', '**/cfg/key.txt'],
       ['the pattern spans depths through the link', 'l*/**/key.txt'],
       ['the link has an absolute target inside the base', 'a*/key.txt'],
-    ])('covers the file behind a directory link when %s', (_why, tail) => {
-      expect(expandReadDenyGlobLinux(join(BASE, tail), [])).toEqual([REALKEY])
-    })
+    ] as const
+
+    it.each(LINK_PATTERNS)(
+      'covers the file behind a directory link when %s',
+      (_why, tail) => {
+        expect(expandReadDenyGlobLinux(join(BASE, tail), [])).toEqual([REALKEY])
+      },
+    )
 
     it('mounts a match behind a link whose target is outside the pattern base, at its target', () => {
       const mounts = expandReadDenyGlobLinux(
@@ -1592,10 +2111,10 @@ describe.if(isLinux)(
       ])
     })
 
-    it.skipIf(!CAN_RUN)(
-      'serves the file through neither spelling for a pattern that names the link',
-      async () => {
-        for (const tail of ['l*/key.txt', '*/key.txt', '**/lnk/key.txt']) {
+    for (const [why, tail] of LINK_PATTERNS) {
+      it.skipIf(!CAN_RUN)(
+        `serves the file through neither spelling when ${why}`,
+        async () => {
           const wrapped = await wrapCommandWithSandboxLinux({
             command: `sh -c 'echo BOOTED; cat ${join(LNK, 'key.txt')} 2>&1; cat ${REALKEY} 2>&1; cat ${join(ABS, 'key.txt')} 2>&1'`,
             needsNetworkRestriction: false,
@@ -1615,8 +2134,8 @@ describe.if(isLinux)(
           expect(result.stderr ?? '').not.toContain('bwrap:')
           expect(result.stdout).toContain('BOOTED')
           expect(result.stdout).not.toContain('KEYBYTES')
-        }
-      },
-    )
+        },
+      )
+    }
   },
 )

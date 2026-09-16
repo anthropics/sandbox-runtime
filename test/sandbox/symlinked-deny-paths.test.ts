@@ -16,6 +16,25 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+
+/**
+ * The root's symlinks into /usr (/bin, /lib, /sbin on a usr-merged system),
+ * listed here rather than inside a test: a `describe.if` body runs on every
+ * platform, and a root symlink may dangle (macOS runners have one). An empty
+ * list means the host is not usr-merged, and the case below has nothing to
+ * tell apart.
+ */
+const USR_MERGED_ROOT_LINKS = readdirSync('/', { withFileTypes: true })
+  .filter(entry => entry.isSymbolicLink())
+  .flatMap(entry => {
+    try {
+      return [realpathSync('/' + entry.name)]
+    } catch {
+      return []
+    }
+  })
+  .filter(target => target.startsWith('/usr/'))
 
 /**
  * Regression tests for symlinked deny paths (resolve-before-mask).
@@ -36,7 +55,7 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
   let PROJ: string // project dir containing the symlinks
   let DOTFILES: string // real directory the symlinks point into
 
-  const hasBwrap = spawnSync('bwrap', ['--version']).status === 0
+  const hasBwrap = bwrapCanNamespace()
 
   beforeEach(() => {
     BASE = realpathSync(mkdtempSync(join(tmpdir(), 'symlinked-deny-')))
@@ -170,58 +189,46 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
   })
 
-  it("does not deny the root's symlinks in their own right under a denyRead of /", async () => {
-    // /bin -> usr/bin and friends on a usr-merged system. Listed here, not
-    // while the suite is collected: that happens on every platform, and a
-    // root symlink may dangle (macOS runners have one).
-    const rootLinks = readdirSync('/', { withFileTypes: true })
-      .filter(entry => entry.isSymbolicLink())
-      .flatMap(entry => {
-        try {
-          return [realpathSync('/' + entry.name)]
-        } catch {
-          return []
-        }
+  it.skipIf(USR_MERGED_ROOT_LINKS.length === 0)(
+    "does not deny the root's symlinks in their own right under a denyRead of /",
+    async () => {
+      // A '/' deny stands for the root's children, minus the ones an allowRead
+      // entry covers: /usr and /etc are named, and /bin, /lib and /sbin are
+      // links into /usr, so all five are skipped. Denied as entries of their
+      // own the links would be mounted where they lead and empty the very
+      // directories that allowRead names.
+      // allowAllUnixSockets keeps the apply-seccomp helper out of the command:
+      // where it has been built it lives in the checkout, which the '/' deny
+      // hides, and the shell would fail to exec it (allow-read.test.ts does the
+      // same for its '/' denies).
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: 'echo STARTED',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['/'], allowWithinDeny: ['/usr', '/etc'] },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+        allowAllUnixSockets: true,
       })
-      .filter(target => target.startsWith('/usr/'))
-    if (rootLinks.length === 0) return // not usr-merged: nothing to tell apart
 
-    // A '/' deny stands for the root's children, minus the ones an allowRead
-    // entry covers: /usr and /etc are named, and /bin, /lib and /sbin are
-    // links into /usr, so all five are skipped. Denied as entries of their
-    // own the links would be mounted where they lead and empty the very
-    // directories that allowRead names.
-    // allowAllUnixSockets keeps the apply-seccomp helper out of the command:
-    // where it has been built it lives in the checkout, which the '/' deny
-    // hides, and the shell would fail to exec it (allow-read.test.ts does the
-    // same for its '/' denies).
-    const wrapped = await wrapCommandWithSandboxLinux({
-      command: 'echo STARTED',
-      needsNetworkRestriction: false,
-      readConfig: { denyOnly: ['/'], allowWithinDeny: ['/usr', '/etc'] },
-      writeConfig: { allowOnly: [], denyWithinAllow: [] },
-      allowAllUnixSockets: true,
-    })
-
-    expect(wrapped).not.toContain('--tmpfs /usr ')
-    expect(wrapped).not.toContain('--tmpfs /etc ')
-    for (const target of rootLinks) {
-      expect(wrapped).not.toContain(`--tmpfs ${target} `)
-    }
-    if (hasBwrap) {
-      const run = spawnSync(wrapped, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 10000,
-      })
-      // The whole outcome, so a failure says why the sandbox did not start.
-      expect({
-        status: run.status,
-        stdout: run.stdout,
-        stderr: run.stderr,
-      }).toEqual({ status: 0, stdout: 'STARTED\n', stderr: '' })
-    }
-  })
+      expect(wrapped).not.toContain('--tmpfs /usr ')
+      expect(wrapped).not.toContain('--tmpfs /etc ')
+      for (const target of USR_MERGED_ROOT_LINKS) {
+        expect(wrapped).not.toContain(`--tmpfs ${target} `)
+      }
+      if (hasBwrap) {
+        const run = spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 10000,
+        })
+        // The whole outcome, so a failure says why the sandbox did not start.
+        expect({
+          status: run.status,
+          stdout: run.stdout,
+          stderr: run.stderr,
+        }).toEqual({ status: 0, stdout: 'STARTED\n', stderr: '' })
+      }
+    },
+  )
 
   it('resolves the mandatory .claude deny paths when cwd/.claude is a symlink', async () => {
     const claudeLink = join(PROJ, '.claude')

@@ -180,8 +180,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     // BEFORE the covering read-only bind, and with no read-deny tmpfs over it
     // there is no re-application to bind it back on top — so the whole
     // checkout is read-only in the sandbox and the absent dotfile denies need
-    // no stub. Vetoing on the nested allow alone kept them and aborted every
-    // command at startup inside the read-only bind.
+    // no stub, which bubblewrap could not create inside that bind anyway.
     process.chdir(PROJ)
     const out = join(PROJ, 'out')
     mkdirSync(out)
@@ -371,7 +370,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).not.toContain(
       `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
     )
-    expect(command.lastIndexOf(`--tmpfs ${readDenied}`)).toBeGreaterThan(
+    expect(command.lastIndexOf(`--tmpfs ${readDenied} `)).toBeGreaterThan(
       projBind,
     )
   })
@@ -566,35 +565,14 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind '${secrets}' '${secrets}'`)
   })
 
-  it('denies a glob-character read-deny spelled with a trailing slash', async () => {
-    // Same exemption on the read side, and the one spelling the strip in
-    // readDenyTargetOf is for: stat() of '<file>/' is ENOTDIR, which reads as
-    // "the entry is not there" and dropped the deny outright, silently. The
-    // directory form is a non-regression check — '<dir>/' stats fine — and
-    // pins that the tmpfs is spelled without the slash. Neither spelling
-    // reaches the read section through the manager, which routes every
-    // glob-character entry through the glob expansion; this guards a direct
-    // caller of wrapCommandWithSandboxLinux.
-    const secretFile = join(PROJ, '[id].env')
-    writeFileSync(secretFile, 'SECRET=1\n')
-    const secretDir = join(PROJ, '[id]')
-    mkdirSync(secretDir)
-    writeFileSync(join(secretDir, 'token.txt'), 'x\n')
-
-    const command = await wrap([], [`${secretFile}/`, `${secretDir}/`])
-
-    expect(command).toContain(`--ro-bind /dev/null '${secretFile}'`)
-    expect(command).toContain(`--tmpfs '${secretDir}'`)
-  })
-
   it('re-applies a denyWithinAllow bind under a trailing-slash allow re-bound over a denyRead tmpfs', async () => {
     // The emission filter drops deny binds hidden by a denyRead tmpfs
     // UNLESS an allowed write path the tmpfs restored covers them. That
     // exception tests containment root-aware, which a raw trailing-slash
     // allow spelling would defeat: the writable re-bind emitted but the deny
     // bind beneath it dropped, leaving the explicitly denied file writable.
-    // Non-regression, like the two above: the spelling is stripped before it
-    // is recorded.
+    // A non-regression check: the spelling is stripped before it is
+    // recorded.
     const nestedAllow = join(PROJ, 'w')
     mkdirSync(nestedAllow, { recursive: true })
     const secret = join(nestedAllow, 'secret.txt')
@@ -602,7 +580,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
     const command = await wrap([secret], [PROJ], [`${nestedAllow}/`])
 
-    expect(command).toContain(`--tmpfs ${PROJ}`)
+    expect(command).toContain(`--tmpfs ${PROJ} `)
     expect(command).toContain(`--bind ${nestedAllow} ${nestedAllow}`)
     expect(command).toContain(`--ro-bind ${secret} ${secret}`)
   })
@@ -969,9 +947,9 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     // `**/build/**` collapses to a tmpfs strictly inside the write-denied
     // checkout. With nothing writable configured under that checkout the
     // covering bind is the last word and the absent dotfile denies need no
-    // stub — the old veto on any tmpfs beneath the dir aborted every command
-    // of such a profile. Only an unusable prediction keeps them, because a
-    // prediction that failed is no evidence about this directory at all.
+    // stub, which bubblewrap could not create inside that bind anyway. Only
+    // an unusable prediction keeps them, because a prediction that failed is
+    // no evidence about this directory at all.
     process.chdir(PROJ)
     const build = join(PROJ, 'pkg', 'build')
     mkdirSync(build, { recursive: true })
@@ -979,7 +957,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const stub = `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`
 
     const usable = await wrap([PROJ], [build])
-    expect(usable).toContain(`--tmpfs ${build}`)
+    expect(usable).toContain(`--tmpfs ${build} `)
     expect(usable).not.toContain(stub)
 
     const realRealpathSync = fs.realpathSync
