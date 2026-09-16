@@ -1,6 +1,12 @@
 import { describe, it, expect, afterAll, beforeAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
@@ -390,6 +396,252 @@ describe.if(isMacOS)(
       // can refuse this write.
       const key = join(tree.work, 'secrets', 'key')
       expect(run(`echo x > ${JSON.stringify(key)}`, [tree.root])).not.toBe(0)
+    })
+  },
+)
+
+/**
+ * `<work>/.git` as a directory, with a submodule git directory and a
+ * directory the `.git/modules` walk stops at, each named across a bracket
+ * pair the way a submodule name can be: a submodule's name is its path, so
+ * `a[b/c]d` is an ordinary one, and it is the sandboxed command that chooses
+ * it.
+ */
+interface ModulesTree {
+  /** Bracket-free write root, so only the denies are under test. */
+  root: string
+  /** The bracketed working directory. */
+  work: string
+  /** `<work>/.git/modules/s[m/o]d`, a submodule git directory. */
+  submodule: string
+  /** `<work>/.git/modules/u[n/r]d`, where the walk stops. */
+  unreadable: string
+}
+
+function modulesTree(prefix: string): ModulesTree {
+  const root = join(realpathSync(tmpdir()), `${prefix}-${Date.now()}`)
+  const work = join(root, ...BRACKET_SEGMENTS)
+  const modules = join(work, '.git', 'modules')
+  const submodule = join(modules, 's[m', 'o]d')
+  const unreadable = join(modules, 'u[n', 'r]d')
+  mkdirSync(join(submodule, 'hooks'), { recursive: true })
+  mkdirSync(join(submodule, 'objects'), { recursive: true })
+  writeFileSync(join(submodule, 'HEAD'), 'ref: refs/heads/main\n')
+  writeFileSync(join(work, '.git', 'HEAD'), 'ref: refs/heads/main\n')
+  mkdirSync(unreadable, { recursive: true })
+  // A loop the walk cannot stat, so it stops and denies the directory
+  // holding it whole — the same record an unlistable directory produces.
+  symlinkSync('loop', join(unreadable, 'loop'))
+  return { root, work, submodule, unreadable }
+}
+
+/**
+ * `<work>/.git` as a pointer file, naming a git directory whose `commondir`
+ * names another. Every directory here is one the file's own contents chose.
+ */
+interface PointerTree {
+  root: string
+  work: string
+  /** The `.git` pointer file in the cwd. */
+  pointer: string
+  /** `<root>/g[h/i]j`, the git directory the pointer names. */
+  gitDir: string
+  /** `<root>/c[o/m]n`, the git directory its `commondir` names. */
+  commonDir: string
+}
+
+function pointerTree(prefix: string): PointerTree {
+  const root = join(realpathSync(tmpdir()), `${prefix}-${Date.now()}`)
+  const work = join(root, ...BRACKET_SEGMENTS)
+  const gitDir = join(root, 'g[h', 'i]j')
+  const commonDir = join(root, 'c[o', 'm]n')
+  mkdirSync(work, { recursive: true })
+  mkdirSync(gitDir, { recursive: true })
+  mkdirSync(commonDir, { recursive: true })
+  writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main\n')
+  writeFileSync(join(commonDir, 'HEAD'), 'ref: refs/heads/main\n')
+  writeFileSync(join(gitDir, 'commondir'), `${commonDir}\n`)
+  const pointer = join(work, '.git')
+  writeFileSync(pointer, `gitdir: ${gitDir}\n`)
+  return { root, work, pointer, gitDir, commonDir }
+}
+
+/** The four paths inside a git directory the mandatory denies name. */
+const GIT_DIR_LEAVES = ['hooks', 'commondir', 'config', 'config.worktree']
+
+/**
+ * The git directories the macOS denies cover are read off the filesystem,
+ * and what they are called is up to the sandboxed command. Compiled as a
+ * glob, `[m/o]` is a one-character class, so a deny built from
+ * `.git/modules/s[m/o]d` matches neither that directory nor anything else —
+ * and a `.gitmodules` naming that submodule makes the host's next
+ * `git submodule update --init` run whatever hook was planted in it.
+ */
+describe.if(!isWindows)(
+  'macOS profile: git directories read off disk under a bracketed cwd',
+  () => {
+    let tree: ModulesTree
+    let originalCwd: string
+
+    beforeAll(() => {
+      originalCwd = process.cwd()
+      tree = modulesTree('bracket-modules-profile')
+      process.chdir(tree.work)
+    })
+
+    afterAll(() => {
+      process.chdir(originalCwd)
+      rmSync(tree.root, { recursive: true, force: true })
+    })
+
+    function profile(): string {
+      return wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: { allowOnly: [tree.root], denyWithinAllow: [] },
+      })
+    }
+
+    it('denies a submodule git directory by subpath', () => {
+      const text = profile()
+      for (const leaf of GIT_DIR_LEAVES) {
+        const denied = join(tree.submodule, leaf)
+        expect(text).toContain(`(subpath ${JSON.stringify(denied)})`)
+        expect(text).not.toContain(sniffedFilter(denied, '(/.*)?$'))
+      }
+    })
+
+    it('denies the directory the walk stopped at by subpath', () => {
+      const text = profile()
+      expect(text).toContain(`(subpath ${JSON.stringify(tree.unreadable)})`)
+      expect(text).not.toContain(sniffedFilter(tree.unreadable, '(/.*)?$'))
+    })
+
+    it('leaves no regex carrying a bracket read off the filesystem', () => {
+      // A spelling sniffed as a pattern keeps its brackets verbatim, since
+      // they are the glob syntax it is taken to be asking for. An anchored
+      // pattern escapes the part of it the library built.
+      for (const regex of emittedRegexes(profile())) {
+        for (const opening of ['s[m/', 'u[n/', 'a[b/']) {
+          expect(regex).not.toContain(opening)
+        }
+      }
+    })
+
+    it('anchors the nested-repository patterns at the escaped cwd', () => {
+      const anchor = tree.work.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const text = profile()
+      // A nested repository, and a nested repository's submodule, have no
+      // path on disk to enumerate: they are matched by pattern, hung off the
+      // cwd, which is escaped into the regex like any other literal.
+      expect(text).toContain(
+        `(regex ${JSON.stringify(`^${anchor}/(.*/)?\\.git/modules/[^/]*/hooks(/.*)?$`)})`,
+      )
+      // Same for the `.git` pointer filter, matched by vnode type.
+      expect(text).toContain(
+        `(regex ${JSON.stringify(`^${anchor}/(.*/)?\\.git$`)})`,
+      )
+    })
+  },
+)
+
+/**
+ * A pointer file's target, and the target its `commondir` names, are paths
+ * the sandboxed command wrote into a file. Both are followed the way git
+ * follows them, and both are names on disk once followed.
+ */
+describe.if(!isWindows)(
+  'macOS profile: a bracketed git directory named by a pointer file',
+  () => {
+    let tree: PointerTree
+    let originalCwd: string
+
+    beforeAll(() => {
+      originalCwd = process.cwd()
+      tree = pointerTree('bracket-pointer-profile')
+      process.chdir(tree.work)
+    })
+
+    afterAll(() => {
+      process.chdir(originalCwd)
+      rmSync(tree.root, { recursive: true, force: true })
+    })
+
+    it('denies the pointer and both git directories by subpath', () => {
+      const text = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: { allowOnly: [tree.root], denyWithinAllow: [] },
+      })
+      const denied = [
+        tree.pointer,
+        ...GIT_DIR_LEAVES.map(leaf => join(tree.gitDir, leaf)),
+        ...GIT_DIR_LEAVES.map(leaf => join(tree.commonDir, leaf)),
+      ]
+      for (const path of denied) {
+        expect(text).toContain(`(subpath ${JSON.stringify(path)})`)
+        expect(text).not.toContain(sniffedFilter(path, '(/.*)?$'))
+      }
+    })
+  },
+)
+
+describe.if(isMacOS)(
+  'macOS sandbox: a bracketed submodule git directory keeps its hooks',
+  () => {
+    let tree: ModulesTree
+    let originalCwd: string
+
+    beforeAll(() => {
+      originalCwd = process.cwd()
+      tree = modulesTree('bracket-modules-exec')
+      process.chdir(tree.work)
+    })
+
+    afterAll(() => {
+      process.chdir(originalCwd)
+      rmSync(tree.root, { recursive: true, force: true })
+    })
+
+    function run(command: string): { status: number | null; stderr: string } {
+      const result = spawnSync(
+        wrapCommandWithSandboxMacOS({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: undefined,
+          writeConfig: { allowOnly: [tree.root], denyWithinAllow: [] },
+        }),
+        {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 10000,
+          // Assert on the message, so pin the language it is written in.
+          env: { ...process.env, LC_ALL: 'C' },
+        },
+      )
+      return { status: result.status, stderr: result.stderr || '' }
+    }
+
+    it('writes elsewhere in that git directory (sanity check)', () => {
+      const target = join(tree.submodule, 'objects', 'written')
+      const result = run(`echo ok > ${JSON.stringify(target)}`)
+      expect(result.status).toBe(0)
+    })
+
+    it('refuses a hook planted in that git directory', () => {
+      const target = join(tree.submodule, 'hooks', 'pre-commit')
+      const result = run(`echo planted > ${JSON.stringify(target)}`)
+      expect(result.status).not.toBe(0)
+      expect(result.stderr.toLowerCase()).toContain('operation not permitted')
+    })
+
+    it('refuses a write in the directory the walk stopped at', () => {
+      const target = join(tree.unreadable, 'planted')
+      const result = run(`echo planted > ${JSON.stringify(target)}`)
+      expect(result.status).not.toBe(0)
+      expect(result.stderr.toLowerCase()).toContain('operation not permitted')
     })
   },
 )
