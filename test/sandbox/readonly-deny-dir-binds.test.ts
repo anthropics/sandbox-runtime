@@ -17,7 +17,7 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
-import { countBinds } from '../helpers/bwrap-argv.js'
+import { countMounts, lastMountAt } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
@@ -101,30 +101,6 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     return result
   }
 
-  /** The mount flags this generator emits with a source and a destination. */
-  const MOUNT_FLAGS = ['--bind', '--ro-bind']
-
-  /**
-   * The last mount whose destination is exactly `dest`. That is what the
-   * sandbox sees there only if nothing later mounts over an ANCESTOR of it,
-   * which this does not look for. Scanning flag/source/dest triples rather
-   * than lastIndexOf keeps a path that appears as a mount SOURCE from passing
-   * for a mount at that destination; `--tmpfs` takes a destination alone and
-   * needs its own arm.
-   */
-  const lastMountAt = (command: string, dest: string): string | undefined => {
-    const argv = command.split(/\s+/)
-    let last: string | undefined
-    for (let i = 0; i + 1 < argv.length; i++) {
-      if (argv[i] === '--tmpfs' && argv[i + 1] === dest) {
-        last = `--tmpfs ${dest}`
-      } else if (MOUNT_FLAGS.includes(argv[i]) && argv[i + 2] === dest) {
-        last = `${argv[i]} ${argv[i + 1]} ${argv[i + 2]}`
-      }
-    }
-    return last
-  }
-
   /**
    * The write really hit a read-only mount, rather than the command failing
    * for some other reason that also exits non-zero: bwrap refusing to start,
@@ -147,13 +123,13 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     // strict descendant of that read-only bind and needs nothing.
     const command = await wrap([PROJ, FILE], [], [PROJ])
 
-    expect(countBinds(command, '--ro-bind', PROJ, PROJ)).toBe(1)
+    expect(countMounts(command, '--ro-bind', PROJ, PROJ)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
+  })
 
-    // Where the host can run bwrap, prove the covering bind alone still
-    // holds: the file reads, and a write through it fails and changes
-    // nothing on the host.
-    if (BWRAP_CAN_NAMESPACE) {
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'holds the file beneath the covering bind readable and unwritable',
+    async () => {
       const read = await runSandboxed([PROJ, FILE], [], [PROJ], `cat ${FILE}`)
       expect(read.status).toBe(0)
       expect(read.stdout).toContain('{}')
@@ -168,13 +144,13 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       // abort or a spawn timeout would satisfy that just as well.
       expectDeniedByReadOnlyMount(write)
       expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
-    }
-  })
+    },
+  )
 
   it('is independent of the order the denies are listed in', async () => {
     const command = await wrap([FILE, PROJ], [], [PROJ])
 
-    expect(countBinds(command, '--ro-bind', PROJ, PROJ)).toBe(1)
+    expect(countMounts(command, '--ro-bind', PROJ, PROJ)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
   })
 
@@ -189,7 +165,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     const sub = join(PROJ, 'sub')
     const command = await wrap([PROJ, sub, FILE])
 
-    expect(countBinds(command, '--ro-bind', PROJ, PROJ)).toBe(1)
+    expect(countMounts(command, '--ro-bind', PROJ, PROJ)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${sub} ${sub}`)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
   })
@@ -232,7 +208,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     // the dropped bind and the mask are measured against the SECOND —
     // against the base mount alone the assertions hold even when the deny
     // bind is missing, and that bind is what re-exposes the file.
-    expect(countBinds(command, '--ro-bind', '/', '/')).toBe(2)
+    expect(countMounts(command, '--ro-bind', '/', '/')).toBe(2)
     const rootBind = command.lastIndexOf('--ro-bind / /')
     // PROJ's own deny bind is dropped; its ancestor pin, emitted before the
     // root's bind, is a different mount with the same spelling.
@@ -240,27 +216,26 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     expect(command.lastIndexOf(`--ro-bind /dev/null ${FILE}`)).toBeGreaterThan(
       rootBind,
     )
+  })
 
-    if (BWRAP_CAN_NAMESPACE) {
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    "keeps the file masked and the directory unwritable under the root's own bind",
+    async () => {
       const newFile = join(PROJ, 'new.txt')
-      const probe = await wrap(
-        ['/', PROJ],
-        [FILE],
-        ['/', AREA],
-        `(echo x > ${newFile}) 2>/dev/null && echo WROTE || echo REFUSED; echo "read:[$(cat ${FILE})]"`,
+      const result = run(
+        await wrap(
+          ['/', PROJ],
+          [FILE],
+          ['/', AREA],
+          `(echo x > ${newFile}) 2>/dev/null && echo WROTE || echo REFUSED; echo "read:[$(cat ${FILE})]"`,
+        ),
       )
-      const result = spawnSync(probe, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 15000,
-        cwd: BASE,
-      })
       expect(result.stderr ?? '').not.toContain('bwrap:')
       expect(result.stdout).toContain('REFUSED')
       expect(result.stdout).toContain('read:[]')
       expect(existsSync(newFile)).toBe(false)
-    }
-  })
+    },
+  )
 
   it('warns that a write deny covers an allowed write path beneath it', async () => {
     // The deny's read-only bind is emitted after every allow bind, so this
@@ -284,7 +259,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
     // Two whole triples: the base root mount, then the deny's read-only bind
     // that holds PROJ and everything else uncreatable.
-    expect(countBinds(command, '--ro-bind', '/', '/')).toBe(2)
+    expect(countMounts(command, '--ro-bind', '/', '/')).toBe(2)
     expect(command).not.toContain(`/dev/null ${PROJ}/`)
     expect(command).not.toMatch(/--ro-bind \S*claude-empty-\S+ \S*\/proj\//)
   })
@@ -298,7 +273,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     const command = await wrap(['/'], [FILE, secrets], ['/'])
 
     // Two: the base root mount, then the deny bind under test.
-    expect(countBinds(command, '--ro-bind', '/', '/')).toBe(2)
+    expect(countMounts(command, '--ro-bind', '/', '/')).toBe(2)
     const rootBind = command.lastIndexOf('--ro-bind / /')
     expect(command.lastIndexOf(`--ro-bind /dev/null ${FILE}`)).toBeGreaterThan(
       rootBind,
@@ -332,7 +307,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       writeConfig: { allowOnly: ['/', AREA], denyWithinAllow: ['/', PROJ] },
     })
 
-    expect(countBinds(command, '--ro-bind', '/', '/')).toBe(2)
+    expect(countMounts(command, '--ro-bind', '/', '/')).toBe(2)
     expect(command).not.toContain(`--ro-bind ${PROJ} ${PROJ}`)
   })
 
@@ -613,95 +588,14 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
         expect(result.stdout).not.toContain('NESTED')
       },
     )
-
-    // An allowed write path that IS a masked file is the one restore to skip:
-    // its mask already holds it unreadable and unwritable, and a read-only
-    // bind of the real file would land above that mask. Whether anything puts
-    // the mask back then rests on one comparison in the re-application pass,
-    // so the mask stays the last mount on the file by not being covered at
-    // all. A masked file BENEATH a restored directory is the opposite case
-    // and is re-applied; the third test here pins that.
-    describe('a masked file that is itself the allowed write path', () => {
-      let MASKED: string
-      let FAKE: string
-
-      beforeEach(() => {
-        MASKED = join(DENIED, 'token.txt')
-        writeFileSync(MASKED, 'REALTOKEN\n')
-        FAKE = join(BASE, 'fake-token.txt')
-        writeFileSync(FAKE, 'FAKE\n')
-      })
-
-      it('leaves a read-deny mask as the last mount on it', async () => {
-        const command = await wrap([DENIED], [RO, MASKED], [AREA, MASKED])
-
-        expect(countBinds(command, '--ro-bind', MASKED, MASKED)).toBe(0)
-        expect(countBinds(command, '--ro-bind', '/dev/null', MASKED)).toBe(1)
-      })
-
-      it('leaves a credential mask as the last mount on it', async () => {
-        const command = await wrapCommandWithSandboxLinux({
-          command: 'echo hello',
-          needsNetworkRestriction: false,
-          readConfig: { denyOnly: [RO] },
-          writeConfig: {
-            allowOnly: [AREA, MASKED],
-            denyWithinAllow: [DENIED],
-          },
-          maskedFileBinds: [{ realPath: MASKED, fakePath: FAKE }],
-        })
-
-        expect(countBinds(command, '--ro-bind', MASKED, MASKED)).toBe(0)
-        expect(countBinds(command, '--ro-bind', FAKE, MASKED)).toBe(1)
-      })
-
-      it('still re-applies a mask on a file beneath the restored directory', async () => {
-        const nested = join(INNER, 'token.txt')
-        writeFileSync(nested, 'NESTEDTOKEN\n')
-
-        const command = await wrap([DENIED], [RO, nested], [AREA, INNER])
-
-        const restored = command.lastIndexOf(`--ro-bind ${INNER} ${INNER}`)
-        expect(restored).toBeGreaterThan(-1)
-        expect(
-          command.lastIndexOf(`--ro-bind /dev/null ${nested}`),
-        ).toBeGreaterThan(restored)
-      })
-
-      it.skipIf(!BWRAP_CAN_NAMESPACE)(
-        'keeps the real bytes unreadable and the file unwritable',
-        async () => {
-          const readDeny = await runSandboxed(
-            [DENIED],
-            [RO, MASKED],
-            [AREA, MASKED],
-            `cat ${MASKED} 2>&1; echo pwned >> ${MASKED} 2>&1`,
-          )
-          expect(readDeny.stdout).not.toContain('REALTOKEN')
-          expect(readFileSync(MASKED, 'utf8')).toBe('REALTOKEN\n')
-
-          const credential = run(
-            await wrapCommandWithSandboxLinux({
-              command: `sh -c 'echo BOOTED; cat ${MASKED} 2>&1; echo pwned >> ${MASKED} 2>&1'`,
-              needsNetworkRestriction: false,
-              readConfig: { denyOnly: [RO] },
-              writeConfig: {
-                allowOnly: [AREA, MASKED],
-                denyWithinAllow: [DENIED],
-              },
-              maskedFileBinds: [{ realPath: MASKED, fakePath: FAKE }],
-            }),
-          )
-          expect(credential.stderr ?? '').not.toContain('bwrap:')
-          expect(credential.stdout).toContain('BOOTED')
-          expect(credential.stdout).toContain('FAKE')
-          expect(credential.stdout).not.toContain('REALTOKEN')
-          expect(readFileSync(MASKED, 'utf8')).toBe('REALTOKEN\n')
-        },
-      )
-    })
   })
 
+  // An allowed write path that IS a masked file is the one restore to skip:
+  // its mask already holds it unreadable and unwritable, and a read-only bind
+  // of the real file would land above that mask; skipping keeps the mask the
+  // last mount on the file instead of relying on the re-application pass. A
+  // masked file BENEATH a restored directory is the opposite case and is
+  // re-applied.
   describe('a write path that is itself a masked file', () => {
     const SECRET = 'REAL-PRIVATE-KEY'
     const SENTINEL = 'SENTINEL-NOT-A-KEY'
@@ -749,7 +643,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     it('leaves the /dev/null mask as the last mount on the write path', async () => {
       const command = await readDenyMask()
 
-      expect(countBinds(command, '--ro-bind', PEM, PEM)).toBe(0)
+      expect(countMounts(command, '--ro-bind', PEM, PEM)).toBe(0)
       expect(lastMountAt(command, PEM)).toBe(`--ro-bind /dev/null ${PEM}`)
     })
 
@@ -782,7 +676,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     it('leaves the credential mask as the last mount on the write path', async () => {
       const command = await credentialMask()
 
-      expect(countBinds(command, '--ro-bind', PEM, PEM)).toBe(0)
+      expect(countMounts(command, '--ro-bind', PEM, PEM)).toBe(0)
       expect(lastMountAt(command, PEM)).toBe(`--ro-bind ${FAKE} ${PEM}`)
     })
 
@@ -808,12 +702,12 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     it('re-masks a file strictly beneath a restored write directory', async () => {
       const command = await wrap([SECRETS], [SECRETS, NESTED], [AREA, SUB])
 
-      expect(countBinds(command, '--ro-bind', SUB, SUB)).toBe(1)
+      expect(countMounts(command, '--ro-bind', SUB, SUB)).toBe(1)
       // Twice: the denyRead loop's mask, then the re-application on top of the
       // directory's restore. Position, not lastMountAt: both masks are the
       // same triple at the same destination, so only order distinguishes a
       // re-applied mask from one the restore buried.
-      expect(countBinds(command, '--ro-bind', '/dev/null', NESTED)).toBe(2)
+      expect(countMounts(command, '--ro-bind', '/dev/null', NESTED)).toBe(2)
       expect(
         command.lastIndexOf(`--ro-bind /dev/null ${NESTED}`),
       ).toBeGreaterThan(command.lastIndexOf(`--ro-bind ${SUB} ${SUB}`))
@@ -895,7 +789,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     it('keeps the mask when a dropped deny bind restores the file canonically', async () => {
       const command = await wrap([DOT], [DOT, VIA_LINK], [AREA, REAL])
 
-      expect(countBinds(command, '--ro-bind', REAL, REAL)).toBe(0)
+      expect(countMounts(command, '--ro-bind', REAL, REAL)).toBe(0)
       expect(lastMountAt(command, VIA_LINK)).toBe(
         `--ro-bind /dev/null ${VIA_LINK}`,
       )
@@ -904,7 +798,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     it('keeps the mask when the deny dest resolves to the masked file', async () => {
       const command = await wrap([REAL], [VIA_LINK], [AREA])
 
-      expect(countBinds(command, '--ro-bind', REAL, REAL)).toBe(0)
+      expect(countMounts(command, '--ro-bind', REAL, REAL)).toBe(0)
       expect(lastMountAt(command, VIA_LINK)).toBe(
         `--ro-bind /dev/null ${VIA_LINK}`,
       )
@@ -916,10 +810,10 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       // Twice: the ancestor pin spliced in beneath the allow binds, then the
       // write deny's own bind. Both are self-binds of the same directory and
       // spell the same triple.
-      expect(countBinds(command, '--ro-bind', DOT, DOT)).toBe(2)
+      expect(countMounts(command, '--ro-bind', DOT, DOT)).toBe(2)
       // Twice: the denyRead loop's mask, then the re-application above the
       // directory bind. Only order tells the two apart.
-      expect(countBinds(command, '--ro-bind', '/dev/null', VIA_LINK)).toBe(2)
+      expect(countMounts(command, '--ro-bind', '/dev/null', VIA_LINK)).toBe(2)
       expect(
         command.lastIndexOf(`--ro-bind /dev/null ${VIA_LINK}`),
       ).toBeGreaterThan(command.lastIndexOf(`--ro-bind ${DOT} ${DOT}`))
@@ -927,19 +821,19 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
     it('reconciles the same three spellings for a credential mask', async () => {
       const restored = await credentialWrap([DOT], [DOT], [AREA, REAL])
-      expect(countBinds(restored, '--ro-bind', REAL, REAL)).toBe(0)
+      expect(countMounts(restored, '--ro-bind', REAL, REAL)).toBe(0)
       expect(lastMountAt(restored, VIA_LINK)).toBe(
         `--ro-bind ${FAKE} ${VIA_LINK}`,
       )
 
       const skipped = await credentialWrap([REAL], [], [AREA])
-      expect(countBinds(skipped, '--ro-bind', REAL, REAL)).toBe(0)
+      expect(countMounts(skipped, '--ro-bind', REAL, REAL)).toBe(0)
       expect(lastMountAt(skipped, VIA_LINK)).toBe(
         `--ro-bind ${FAKE} ${VIA_LINK}`,
       )
 
       const buried = await credentialWrap([DOT], [], [AREA])
-      expect(countBinds(buried, '--ro-bind', FAKE, VIA_LINK)).toBe(2)
+      expect(countMounts(buried, '--ro-bind', FAKE, VIA_LINK)).toBe(2)
       expect(
         buried.lastIndexOf(`--ro-bind ${FAKE} ${VIA_LINK}`),
       ).toBeGreaterThan(buried.lastIndexOf(`--ro-bind ${DOT} ${DOT}`))
@@ -1033,9 +927,9 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
       const command = await wrap([FILE, denied], [], ['/'])
 
-      expect(countBinds(command, '--bind', '/', '/')).toBe(1)
-      expect(countBinds(command, '--ro-bind', FILE, FILE)).toBe(1)
-      expect(countBinds(command, '--ro-bind', denied, denied)).toBe(1)
+      expect(countMounts(command, '--bind', '/', '/')).toBe(1)
+      expect(countMounts(command, '--ro-bind', FILE, FILE)).toBe(1)
+      expect(countMounts(command, '--ro-bind', denied, denied)).toBe(1)
     })
 
     it('binds the mandatory denies that exist and stubs the ones that do not', async () => {
@@ -1047,10 +941,10 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
       const command = await wrap([], [], ['/'])
 
-      expect(countBinds(command, '--ro-bind', bashrc, bashrc)).toBe(1)
-      expect(countBinds(command, '--ro-bind', hooks, hooks)).toBe(1)
+      expect(countMounts(command, '--ro-bind', bashrc, bashrc)).toBe(1)
+      expect(countMounts(command, '--ro-bind', hooks, hooks)).toBe(1)
       // Absent: blocked from being created rather than bound read-only.
-      expect(countBinds(command, '--ro-bind', '/dev/null', mcp)).toBe(1)
+      expect(countMounts(command, '--ro-bind', '/dev/null', mcp)).toBe(1)
     })
 
     it('skips every per-path deny when "/" is denied whole, and keeps skipping them when "/" is vetoed', async () => {
@@ -1080,15 +974,17 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
       const rootDeniedWhole = await wrapRoot(['/'], undefined)
 
-      expect(countBinds(rootDeniedWhole, '--bind', '/', '/')).toBe(1)
+      expect(countMounts(rootDeniedWhole, '--bind', '/', '/')).toBe(1)
       // Two: the base root mount, then the deny bind of '/'.
-      expect(countBinds(rootDeniedWhole, '--ro-bind', '/', '/')).toBe(2)
+      expect(countMounts(rootDeniedWhole, '--ro-bind', '/', '/')).toBe(2)
       expect(rootDeniedWhole.lastIndexOf('--ro-bind / /')).toBeGreaterThan(
         rootDeniedWhole.indexOf('--bind / /'),
       )
-      expect(countBinds(rootDeniedWhole, '--ro-bind', bashrc, bashrc)).toBe(0)
-      expect(countBinds(rootDeniedWhole, '--ro-bind', hooks, hooks)).toBe(0)
-      expect(countBinds(rootDeniedWhole, '--ro-bind', '/dev/null', mcp)).toBe(0)
+      expect(countMounts(rootDeniedWhole, '--ro-bind', bashrc, bashrc)).toBe(0)
+      expect(countMounts(rootDeniedWhole, '--ro-bind', hooks, hooks)).toBe(0)
+      expect(countMounts(rootDeniedWhole, '--ro-bind', '/dev/null', mcp)).toBe(
+        0,
+      )
       expect(rootDeniedWhole).not.toContain('claude-empty-')
 
       // A second allow entry vetoes '/' — it lies strictly beneath it — and
@@ -1099,14 +995,14 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       // cannot reach — one inside a predicted tmpfs, or a prediction that
       // could not be derived — which readonly-deny-dir-stubs.test.ts covers.
       const secondAllow = await wrapRoot(['/', AREA], undefined)
-      expect(countBinds(secondAllow, '--ro-bind', bashrc, bashrc)).toBe(0)
-      expect(countBinds(secondAllow, '--ro-bind', '/dev/null', mcp)).toBe(0)
+      expect(countMounts(secondAllow, '--ro-bind', bashrc, bashrc)).toBe(0)
+      expect(countMounts(secondAllow, '--ro-bind', '/dev/null', mcp)).toBe(0)
 
       const readDenied = join(BASE, 'ro')
       mkdirSync(readDenied)
       const oneReadDeny = await wrapRoot(['/'], { denyOnly: [readDenied] })
-      expect(countBinds(oneReadDeny, '--ro-bind', bashrc, bashrc)).toBe(0)
-      expect(countBinds(oneReadDeny, '--ro-bind', '/dev/null', mcp)).toBe(0)
+      expect(countMounts(oneReadDeny, '--ro-bind', bashrc, bashrc)).toBe(0)
+      expect(countMounts(oneReadDeny, '--ro-bind', '/dev/null', mcp)).toBe(0)
     })
 
     it.skipIf(!BWRAP_CAN_NAMESPACE)(
@@ -1150,7 +1046,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
       const command = await wrap([join(loop, 'settings.json')], [], ['/'])
 
-      expect(countBinds(command, '--ro-bind', '/dev/null', loop)).toBe(1)
+      expect(countMounts(command, '--ro-bind', '/dev/null', loop)).toBe(1)
     })
 
     it.skipIf(!BWRAP_CAN_NAMESPACE)(

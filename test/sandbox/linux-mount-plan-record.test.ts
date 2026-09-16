@@ -10,9 +10,12 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  wrapCommandWithSandboxLinux,
+  cleanupBwrapMountPoints,
+} from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
-import { countBinds } from '../helpers/bwrap-argv.js'
+import { countMounts } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
 // Argument-level checks, plus one "(live bwrap)" arm per symlink shape: this
@@ -30,6 +33,7 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
 
   const created: string[] = []
   afterEach(() => {
+    cleanupBwrapMountPoints({ force: true })
     for (const dir of created.splice(0)) {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -258,7 +262,6 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     return {
       proj,
       lib,
-      carveOut,
       wrap: (command: string) =>
         wrapCommandWithSandboxLinux({
           ...baseParams,
@@ -666,7 +669,7 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
     })
     // Two: the base root mount, then the deny bind that holds it read-only.
-    expect(countBinds(wrapped, '--ro-bind', '/', '/')).toBe(2)
+    expect(countMounts(wrapped, '--ro-bind', '/', '/')).toBe(2)
     expect(wrapped).toContain(`--tmpfs ${join(proj, 'hidden')} `)
     expect(wrapped).not.toContain(`/dev/null ${join(process.cwd(), '.bashrc')}`)
     expect(wrapped).not.toContain(`--ro-bind ${process.cwd()} ${process.cwd()}`)
