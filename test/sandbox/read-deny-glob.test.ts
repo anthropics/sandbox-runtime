@@ -20,6 +20,7 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
 describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
   let ROOT: string
@@ -402,7 +403,7 @@ describe.if(isLinux)(
     let real: string
     let link: string
     const savedCwd = process.cwd()
-    const hasBwrap = spawnSync('bwrap', ['--version']).status === 0
+    const hasBwrap = bwrapCanNamespace()
 
     beforeAll(() => {
       ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'deny-glob-bwrap-')))
@@ -1309,3 +1310,183 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
     }
   })
 })
+
+describe.if(isLinux)(
+  'expandReadDenyGlobLinux (coverage behind a directory link)',
+  () => {
+    // The walk descends symlinked directories and reports each match where it
+    // really lives, so a deny glob covers what it matches whichever spelling
+    // found it, and one mount stands for every spelling. These cases are the
+    // ones a walk that does not follow links loses outright.
+    let ROOT: string
+    let BASE: string
+    let LNK: string
+    let ABS: string
+    let REALKEY: string
+    const CAN_RUN = bwrapCanNamespace()
+
+    beforeAll(() => {
+      ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'deny-glob-links-')))
+      // A link named by the pattern's own wildcard segment.
+      BASE = join(ROOT, 'base')
+      mkdirSync(join(BASE, 'real', 'cfg'), { recursive: true })
+      REALKEY = join(BASE, 'real', 'cfg', 'key.txt')
+      writeFileSync(REALKEY, 'KEYBYTES\n')
+      LNK = join(BASE, 'lnk')
+      symlinkSync(join('real', 'cfg'), LNK)
+      ABS = join(BASE, 'abs')
+      symlinkSync(join(BASE, 'real', 'cfg'), ABS)
+      // A link whose target is outside the pattern's base directory.
+      mkdirSync(join(ROOT, 'out', 'config', 'dev'), { recursive: true })
+      mkdirSync(join(ROOT, 'out', 'shared', 'prod'), { recursive: true })
+      writeFileSync(join(ROOT, 'out', 'config', 'dev', 'key'), 'DEVKEY\n')
+      writeFileSync(join(ROOT, 'out', 'shared', 'prod', 'key'), 'PRODKEY\n')
+      symlinkSync(
+        join('..', 'shared', 'prod'),
+        join(ROOT, 'out', 'config', 'prod'),
+      )
+      // The same, with an absolute target.
+      mkdirSync(join(ROOT, 'absout', 'config'), { recursive: true })
+      mkdirSync(join(ROOT, 'absout', 'elsewhere', 'prod'), { recursive: true })
+      writeFileSync(join(ROOT, 'absout', 'elsewhere', 'prod', 'key'), 'ABS\n')
+      symlinkSync(
+        join(ROOT, 'absout', 'elsewhere', 'prod'),
+        join(ROOT, 'absout', 'config', 'prod'),
+      )
+      // A package linked out of node_modules, as a workspace install leaves it.
+      mkdirSync(join(ROOT, 'store', 'node_modules', 'other'), {
+        recursive: true,
+      })
+      mkdirSync(join(ROOT, 'store', 'packages', 'pkg'), { recursive: true })
+      writeFileSync(
+        join(ROOT, 'store', 'node_modules', 'other', 'index.js'),
+        'OTHER\n',
+      )
+      writeFileSync(join(ROOT, 'store', 'packages', 'pkg', 'index.js'), 'PKG\n')
+      symlinkSync(
+        join('..', 'packages', 'pkg'),
+        join(ROOT, 'store', 'node_modules', 'pkg'),
+      )
+      // A link to its own directory, and two links into each other.
+      mkdirSync(join(ROOT, 'cycles', 'a'), { recursive: true })
+      mkdirSync(join(ROOT, 'cycles', 'b'), { recursive: true })
+      writeFileSync(join(ROOT, 'cycles', 'a', 'key.txt'), 'AKEY\n')
+      writeFileSync(join(ROOT, 'cycles', 'b', 'key.txt'), 'BKEY\n')
+      symlinkSync('.', join(ROOT, 'cycles', 'self'))
+      symlinkSync(join('..', 'b'), join(ROOT, 'cycles', 'a', 'l1'))
+      symlinkSync(join('..', 'a'), join(ROOT, 'cycles', 'b', 'l2'))
+      // build/ as a link, and a build/ directory behind a link.
+      mkdirSync(join(ROOT, 'builds', 'pkg1', 'build'), { recursive: true })
+      mkdirSync(join(ROOT, 'builds', 'linked'), { recursive: true })
+      mkdirSync(join(ROOT, 'builds', 'pkg2'), { recursive: true })
+      mkdirSync(join(ROOT, 'builds', 'pkg3'), { recursive: true })
+      mkdirSync(join(ROOT, 'builds', 'realpkg', 'build'), { recursive: true })
+      writeFileSync(join(ROOT, 'builds', 'pkg1', 'build', 'f'), 'ONE\n')
+      writeFileSync(join(ROOT, 'builds', 'linked', 'f'), 'LINKED\n')
+      writeFileSync(join(ROOT, 'builds', 'realpkg', 'build', 'f'), 'BEHIND\n')
+      symlinkSync(join('..', 'linked'), join(ROOT, 'builds', 'pkg2', 'build'))
+      symlinkSync(join('..', 'realpkg'), join(ROOT, 'builds', 'pkg3', 'lnk'))
+    })
+
+    afterAll(() => {
+      rmSync(ROOT, { recursive: true, force: true })
+    })
+
+    it.each([
+      ['the wildcard segment names the link', 'l*/key.txt'],
+      ['a bare star names the link', '*/key.txt'],
+      ['a globstar reaches the link by name', '**/lnk/key.txt'],
+      ['a globstar tail matches below the link', '**/key.txt'],
+      ['the tail names the target directory', '**/cfg/key.txt'],
+      ['the pattern spans depths through the link', 'l*/**/key.txt'],
+      ['the link has an absolute target inside the base', 'a*/key.txt'],
+    ])('covers the file behind a directory link when %s', (_why, tail) => {
+      expect(expandReadDenyGlobLinux(join(BASE, tail), [])).toEqual([REALKEY])
+    })
+
+    it('mounts a match behind a link whose target is outside the pattern base, at its target', () => {
+      const mounts = expandReadDenyGlobLinux(
+        join(ROOT, 'out', 'config', '*', 'key'),
+        [],
+      )
+
+      expect(mounts).toEqual([
+        join(ROOT, 'out', 'config', 'dev', 'key'),
+        join(ROOT, 'out', 'shared', 'prod', 'key'),
+      ])
+    })
+
+    it('mounts a match behind an absolute-target link outside the base, at its target', () => {
+      const mounts = expandReadDenyGlobLinux(
+        join(ROOT, 'absout', 'config', '*', 'key'),
+        [],
+      )
+
+      expect(mounts).toEqual([join(ROOT, 'absout', 'elsewhere', 'prod', 'key')])
+    })
+
+    it('mounts a package linked out of node_modules where the package really is', () => {
+      const mounts = expandReadDenyGlobLinux(
+        join(ROOT, 'store', 'node_modules', '**', 'index.js'),
+        [],
+      )
+
+      expect(mounts).toEqual([
+        join(ROOT, 'store', 'node_modules', 'other', 'index.js'),
+        join(ROOT, 'store', 'packages', 'pkg', 'index.js'),
+      ])
+    })
+
+    it('terminates on a link to its own directory and on two links into each other', () => {
+      const mounts = expandReadDenyGlobLinux(
+        join(ROOT, 'cycles', '**', 'key.txt'),
+        [],
+      )
+
+      expect(mounts).toEqual([
+        join(ROOT, 'cycles', 'a', 'key.txt'),
+        join(ROOT, 'cycles', 'b', 'key.txt'),
+      ])
+    })
+
+    it('collapses a linked build directory, and one behind a link, onto their targets', () => {
+      const mounts = expandReadDenyGlobLinux(
+        join(ROOT, 'builds', '**', 'build', '**'),
+        [],
+      )
+
+      expect(mounts).toEqual([
+        join(ROOT, 'builds', 'linked'),
+        join(ROOT, 'builds', 'pkg1', 'build'),
+        join(ROOT, 'builds', 'realpkg', 'build'),
+      ])
+    })
+
+    it.skipIf(!CAN_RUN)(
+      'serves the file through neither spelling for a pattern that names the link',
+      async () => {
+        for (const tail of ['l*/key.txt', '*/key.txt', '**/lnk/key.txt']) {
+          const wrapped = await wrapCommandWithSandboxLinux({
+            command: `sh -c 'echo BOOTED; cat ${join(LNK, 'key.txt')} 2>&1; cat ${REALKEY} 2>&1; cat ${join(ABS, 'key.txt')} 2>&1'`,
+            needsNetworkRestriction: false,
+            readConfig: {
+              denyOnly: expandReadDenyGlobLinux(join(BASE, tail), []),
+              allowWithinDeny: [],
+            },
+            writeConfig: { allowOnly: [], denyWithinAllow: [] },
+            allowAllUnixSockets: true,
+          })
+          const result = spawnSync(wrapped, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 15000,
+          })
+
+          expect(result.stderr ?? '').not.toContain('bwrap:')
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).not.toContain('KEYBYTES')
+        }
+      },
+    )
+  },
+)
