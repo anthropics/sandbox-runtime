@@ -1498,15 +1498,17 @@ async function generateFilesystemArgs(
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
-      // Trailing slashes are stripped HERE, at the single point where allow
-      // paths are bound and recorded, because every downstream comparison —
-      // the deny loop's within-allowlist gate, findSymlinkInPath's mask
-      // scoping, the emission filter's re-expose check, the denyRead
-      // re-bind and its allowRead skip, and the stub-skip vetoes — matches
-      // by `allowedPath + '/'` prefix, which a preserved trailing slash
-      // ('<dir>//') silently defeats. bwrap binds 'dir' and 'dir/'
-      // identically, so normalizing the recorded spelling fixes every
-      // consumer at once instead of per-predicate. ('/' itself is kept.)
+      // normalizePathForSandbox already strips a trailing slash from every
+      // spelling it does not take for a glob; this strip covers the ones it
+      // exempts — a literal directory named with glob characters, spelled
+      // '<dir>/[id]/'. Allow paths are recorded slash-free because every
+      // downstream comparison — the deny loop's within-allowlist gate,
+      // findSymlinkInPath's mask scoping, the emission filter's re-expose
+      // check, the denyRead re-bind and its allowRead skip, and the stub-skip
+      // vetoes — matches by `allowedPath + '/'` prefix, which '<dir>//'
+      // silently defeats. bwrap binds 'dir' and 'dir/' identically, so
+      // normalizing the recorded spelling fixes every consumer at once
+      // instead of per-predicate. ('/' itself is kept.)
       const normalizedPath =
         normalizePathForSandbox(pathPattern).replace(/\/+$/, '') || '/'
 

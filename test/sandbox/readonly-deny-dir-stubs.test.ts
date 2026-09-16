@@ -276,12 +276,15 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
           [PROJ, absentDeny],
           [readDenied],
           [AREA, nestedAllow],
-          `touch ${absentDeny}`,
+          `sh -c 'echo RAN; touch ${absentDeny}'`,
         ),
         { shell: true, encoding: 'utf8', timeout: 15000, cwd: PROJ },
       )
 
       expect(run.status).not.toBe(0)
+      // bwrap refused to start, so the payload never ran: the same message
+      // from touch itself would leave RAN on stdout.
+      expect(run.stdout).toBe('')
       expect(run.stderr ?? '').toMatch(/Read-only file system/i)
       expect(existsSync(absentDeny)).toBe(false)
     },
@@ -959,6 +962,45 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).not.toContain(
       `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
     )
+  })
+
+  it('skips the stubs for a collapsed read-deny glob inside the write-denied cwd, and keeps them when the prediction is unusable', async () => {
+    // The shape the narrowed veto exists for: a denyRead pattern such as
+    // `**/build/**` collapses to a tmpfs strictly inside the write-denied
+    // checkout. With nothing writable configured under that checkout the
+    // covering bind is the last word and the absent dotfile denies need no
+    // stub — the old veto on any tmpfs beneath the dir aborted every command
+    // of such a profile. Only an unusable prediction keeps them, because a
+    // prediction that failed is no evidence about this directory at all.
+    process.chdir(PROJ)
+    const build = join(PROJ, 'pkg', 'build')
+    mkdirSync(build, { recursive: true })
+    writeFileSync(join(build, 'out.o'), '')
+    const stub = `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`
+
+    const usable = await wrap([PROJ], [build])
+    expect(usable).toContain(`--tmpfs ${build}`)
+    expect(usable).not.toContain(stub)
+
+    const realRealpathSync = fs.realpathSync
+    using spy = spyOn(fs, 'realpathSync').mockImplementation(((
+      p: fs.PathLike,
+      ...rest: unknown[]
+    ) => {
+      if (String(p) === build) {
+        throw Object.assign(new Error('EACCES: cannot resolve'), {
+          code: 'EACCES',
+        })
+      }
+      return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
+    }) as typeof fs.realpathSync)
+    const { result: unusable, warnings } = await withCapturedWarnings(() =>
+      wrap([PROJ], [build]),
+    )
+    expect(spy).toHaveBeenCalled()
+
+    expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
+    expect(unusable).toContain(stub)
   })
 
   it('keeps the stubs when a root child cannot be looked at', async () => {

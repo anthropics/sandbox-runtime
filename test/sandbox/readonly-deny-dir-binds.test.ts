@@ -394,6 +394,33 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     )
   })
 
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'holds the whole tree read-only when the per-path denies under "/" are dropped',
+    async () => {
+      // The runtime half of the drop above, which was argv-only: with PROJ's
+      // own bind gone, the root deny's read-only bind is all that stands
+      // between the command and the allowed write area, and the denied file
+      // must still read (it is read-only, not masked).
+      const result = run(
+        await wrapCommandWithSandboxLinux({
+          command: `sh -c 'echo BOOTED; touch ${join(AREA, 'x')} 2>/dev/null || echo AREA-READONLY; cat ${FILE}'`,
+          needsNetworkRestriction: false,
+          readConfig: undefined,
+          writeConfig: {
+            allowOnly: ['/', AREA],
+            denyWithinAllow: ['/', PROJ],
+          },
+        }),
+      )
+
+      expect(result.stderr ?? '').not.toContain('bwrap:')
+      expect(result.stdout).toContain('BOOTED')
+      expect(result.stdout).toContain('AREA-READONLY')
+      expect(result.stdout).toContain('{}')
+      expect(existsSync(join(AREA, 'x'))).toBe(false)
+    },
+  )
+
   it('does not re-apply a tmpfs over the bind that denies the same directory', async () => {
     // X in allowOnly, denyWithinAllow and denyRead: the read-only bind of X
     // is not "an ancestor that re-exposes X", so no --tmpfs X --bind X X may

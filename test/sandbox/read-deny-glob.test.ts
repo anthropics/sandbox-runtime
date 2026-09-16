@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -1270,6 +1271,135 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
       )
     } finally {
       await SandboxManager.reset()
+    }
+  })
+
+  it('seeds the ancestor pins from a collapsed directory, and pins hold at runtime', async () => {
+    // Every tmpfs the collapse adds is an ordinary read-deny unit, so the
+    // directories between it and the allowed write root are pinned: the
+    // package directory above a collapsed build/ cannot be renamed aside to
+    // strip the deny off it.
+    const pkgDir = join(ROOT, 'pkg', 'a')
+    const build = join(pkgDir, 'build')
+    const wrapped = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: {
+        denyOnly: expandReadDenyGlobLinux(join(ROOT, '**/build/**'), []),
+        allowWithinDeny: [],
+      },
+      writeConfig: { allowOnly: [ROOT], denyWithinAllow: [] },
+    })
+
+    const pin = `--ro-bind ${pkgDir} ${pkgDir}`
+    expect(wrapped).toContain(pin)
+    // Beneath the write root's own bind, and so beneath the tmpfs too.
+    expect(wrapped.indexOf(pin)).toBeLessThan(
+      wrapped.indexOf(`--bind ${ROOT} ${ROOT}`),
+    )
+    expect(wrapped).toContain(`--tmpfs ${build}`)
+  })
+
+  it.skipIf(!bwrapCanNamespace())(
+    'refuses to rename the package directory above a collapsed build directory',
+    async () => {
+      const pkgDir = join(ROOT, 'pkg', 'b')
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: `sh -c 'echo BOOTED; mv ${pkgDir} ${pkgDir}-moved 2>&1; echo DONE'`,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: expandReadDenyGlobLinux(join(ROOT, '**/build/**'), []),
+          allowWithinDeny: [],
+        },
+        writeConfig: { allowOnly: [ROOT], denyWithinAllow: [] },
+      })
+      const result = spawnSync(wrapped, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+      })
+
+      expect(result.stderr ?? '').not.toContain('bwrap:')
+      expect(result.stdout).toContain('BOOTED')
+      expect(result.stdout).toContain('DONE')
+      expect(result.stdout).toMatch(/busy/i)
+      expect(existsSync(`${pkgDir}-moved`)).toBe(false)
+    },
+  )
+
+  it('restores a write path read-only when a write deny inside a collapsed directory is dropped', async () => {
+    // The collapsed tmpfs hides the write deny's own destination, so that
+    // bind is dropped rather than re-exposing the read-denied directory
+    // around it — and the allowed write path the tmpfs restored beneath that
+    // destination comes back read-only, where the deny leaves it.
+    const build = join(ROOT, 'pkg', 'c', 'build')
+    const denied = join(build, 'nested')
+    const writable = join(denied, 'out')
+    mkdirSync(writable, { recursive: true })
+    const wrapped = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: {
+        denyOnly: expandReadDenyGlobLinux(join(ROOT, '**/build/**'), []),
+        allowWithinDeny: [],
+      },
+      writeConfig: {
+        allowOnly: [ROOT, writable],
+        denyWithinAllow: [denied],
+      },
+    })
+
+    const tmpfs = wrapped.lastIndexOf(`--tmpfs ${build}`)
+    expect(tmpfs).toBeGreaterThan(-1)
+    // The deny's own bind is dropped (its ancestor pin, spelled the same,
+    // sits beneath the write root's bind, so only what follows the tmpfs
+    // counts).
+    expect(wrapped.indexOf(`--ro-bind ${denied} ${denied}`, tmpfs)).toBe(-1)
+    // The tmpfs put the write path back writable; the dropped bind puts it
+    // back read-only on top, which is where the deny leaves it.
+    const writableBind = wrapped.indexOf(
+      `--bind ${writable} ${writable}`,
+      tmpfs,
+    )
+    const readOnlyRestore = wrapped.lastIndexOf(
+      `--ro-bind ${writable} ${writable}`,
+    )
+    expect(writableBind).toBeGreaterThan(tmpfs)
+    expect(readOnlyRestore).toBeGreaterThan(writableBind)
+  })
+
+  it('leaves a masked file inside a collapsed directory to its mask', async () => {
+    // The dropped write-deny bind restores what the tmpfs put back beneath
+    // it, but never a masked file: binding the real file read-only there
+    // would land above its mask and serve the real bytes.
+    const build = join(ROOT, 'pkg', 'a', 'build')
+    const secret = join(build, 'cred.json')
+    writeFileSync(secret, 'REAL-CREDENTIAL\n')
+    const store = mkdtempSync(join(tmpdir(), 'deny-glob-store-'))
+    const fake = join(store, 'cred.json.fake')
+    writeFileSync(fake, 'SENTINEL\n')
+    try {
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: 'echo hello',
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: expandReadDenyGlobLinux(join(ROOT, '**/build/**'), [
+            secret,
+          ]),
+          allowWithinDeny: [],
+        },
+        writeConfig: { allowOnly: [ROOT, secret], denyWithinAllow: [build] },
+        maskedFileBinds: [{ realPath: secret, fakePath: fake }],
+        maskedFileStoreDir: store,
+      })
+
+      expect(wrapped).toContain(`--ro-bind ${fake} ${secret}`)
+      expect(wrapped).not.toContain(`--ro-bind ${secret} ${secret}`)
+      const mask = wrapped.lastIndexOf(`--ro-bind ${fake} ${secret}`)
+      expect(wrapped.indexOf(`--bind ${secret} ${secret}`, mask)).toBe(-1)
+    } finally {
+      rmSync(store, { recursive: true, force: true })
+      rmSync(secret, { force: true })
     }
   })
 
