@@ -55,6 +55,10 @@ export interface FsWriteRestrictionConfig {
  * - `maskedFileStoreDir`: host directory holding the fake files. The
  *   Linux layer ro-binds it over itself so the sandbox cannot tamper
  *   with the bind sources regardless of allowWrite.
+ * - `degradeToDenyPaths`: the subset of `denyReadPaths` that the library
+ *   resolved itself — a masked file whose extract pattern matched nothing
+ *   under `onExtractNoMatch: "deny"`. Each names one file that was opened,
+ *   so backends must apply it literally rather than as a pattern.
  */
 export interface CredentialRestrictionConfig {
   denyReadPaths: string[]
@@ -62,6 +66,7 @@ export interface CredentialRestrictionConfig {
   setEnvVars: Record<string, string>
   maskedFileBinds: Array<{ realPath: string; fakePath: string }>
   maskedFileStoreDir: string | undefined
+  degradeToDenyPaths: string[]
 }
 
 /**

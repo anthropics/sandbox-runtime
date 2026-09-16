@@ -15,6 +15,7 @@ import type {
 } from 'node:http'
 import { PassThrough, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
+import { isResolvedAddressDenied } from './resolved-address-guard.js'
 
 export type RequestDecision = {
   action: 'allow' | 'deny'
@@ -207,23 +208,60 @@ function deny(res: ServerResponse, decision: RequestDecision): void {
   respondDenied(res, decision.reason ?? DEFAULT_DENY_REASON)
 }
 
+const DEFAULT_DENY_TAG = 'blocked-by-sandbox-runtime'
+
+/**
+ * The proxy's standard policy-denial response as raw bytes, for paths that
+ * answer on a bare socket (CONNECT): 403 with an `X-Proxy-Error` tag and
+ * the reason as the body.
+ */
+export function rawDenied(reason: string, tag = DEFAULT_DENY_TAG): string {
+  return (
+    'HTTP/1.1 403 Forbidden\r\n' +
+    'Content-Type: text/plain\r\n' +
+    `X-Proxy-Error: ${tag}\r\n` +
+    '\r\n' +
+    reason
+  )
+}
+
 /**
  * Write the proxy's standard policy-denial response: 403 with the reason
  * in the body, so the sandboxed client can tell a policy block from a
  * network failure. Shared by filterRequest denials and other in-proxy
  * policy decisions (e.g. SigV4 shapes that cannot be re-signed).
  */
-export function respondDenied(res: ServerResponse, reason: string): void {
-  logForDebugging(`[request-filter] deny: ${reason}`)
-  if (res.headersSent) {
+export function respondDenied(
+  res: ServerResponse,
+  reason: string,
+  tag = DEFAULT_DENY_TAG,
+): void {
+  logForDebugging(`[proxy] deny: ${reason}`)
+  if (res.headersSent || res.destroyed) {
     res.destroy()
     return
   }
   res.writeHead(403, {
     'Content-Type': 'text/plain',
-    'X-Proxy-Error': 'blocked-by-sandbox-runtime',
+    'X-Proxy-Error': tag,
   })
   res.end(reason + '\n')
+}
+
+/**
+ * Answer a failed upstream leg: a resolved-address refusal is a policy
+ * denial (403 with the reason); anything else is a 502, or a bare destroy
+ * once headers are out.
+ */
+export function respondUpstreamError(res: ServerResponse, err: Error): void {
+  if (isResolvedAddressDenied(err)) {
+    respondDenied(res, err.message)
+  } else if (!res.headersSent) {
+    res.writeHead(502, { 'Content-Type': 'text/plain' })
+    res.end('Bad Gateway')
+  } else {
+    res.destroy()
+  }
 }
 
 function incomingHeaders(req: IncomingMessage): Headers {

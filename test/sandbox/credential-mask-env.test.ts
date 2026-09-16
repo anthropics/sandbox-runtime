@@ -457,7 +457,7 @@ describe.if(isLinux)(
   () => {
     const VAR = 'SRT_TEST_E2E_DB_URL'
     const HOST_A = 'localhost'
-    const HOST_B = 'localtest.me'
+    const HOST_B = 'host-b.localhost'
 
     let upstream: Server
     let upstreamPort: number
@@ -517,7 +517,6 @@ describe.if(isLinux)(
     async function curlViaManagerProxy(
       url: string,
       bearer: string,
-      resolve?: string,
       body?: string,
     ): Promise<number> {
       const proxyPort = SandboxManager.getProxyPort()!
@@ -531,7 +530,6 @@ describe.if(isLinux)(
         '-H',
         `Authorization: Bearer ${bearer}`,
       ]
-      if (resolve) args.push('--resolve', resolve)
       if (body !== undefined) args.push('--data-binary', body)
       args.push(url)
       const child = spawn('curl', args)
@@ -578,7 +576,6 @@ describe.if(isLinux)(
       const exit = await curlViaManagerProxy(
         `http://${HOST_A}:${upstreamPort}/`,
         sentinel,
-        undefined,
         `{"password":"${sentinel}"}`,
       )
       expect(exit).toBe(0)
@@ -593,13 +590,12 @@ describe.if(isLinux)(
       const sentinel = runInSandbox(wrapped).stdout.trim()
 
       // HOST_B is allowlisted but NOT in this entry's injectHosts. The
-      // proxy dials localtest.me (publicly resolves to 127.0.0.1) and
-      // forwards the sentinel as-is — fails closed.
+      // proxy resolves it to loopback (a `.localhost` name) and forwards
+      // the sentinel as-is — fails closed.
       lastHeaders = undefined
       const exit = await curlViaManagerProxy(
         `http://${HOST_B}:${upstreamPort}/`,
         sentinel,
-        `${HOST_B}:${upstreamPort}:127.0.0.1`,
       )
       expect(exit).toBe(0)
       expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)

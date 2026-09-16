@@ -53,8 +53,8 @@ export function normalizeCaseForComparison(pathStr: string): string {
 }
 
 /**
- * `p` is `dir` itself or lies beneath it, by path segment ('/x' is not under
- * '/xy'); root-aware, since '/' + '/' is a prefix of nothing.
+ * `p` is `dir` itself or lies beneath it, by path segment ('/xy' is not under
+ * '/x'); root-aware, since '/' + '/' is a prefix of nothing.
  */
 export function isAtOrUnder(p: string, dir: string): boolean {
   return p === dir || p.startsWith(dir === '/' ? '/' : dir + '/')
@@ -353,8 +353,23 @@ function warnIfParentRefUnfolded(normalizedPath: string): string {
  * - Glob patterns preserve wildcards after path normalization
  *
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
+ *
+ * `opts.literal` marks a path that names one file or directory rather
+ * than matching several: one the library computed itself, or a caller
+ * spelling that carried no glob character — resolving such a spelling can
+ * splice in a cwd or home directory whose own name does. The glob
+ * branches are skipped for it, so a component like `a[b` is resolved and
+ * later compiled as the name it is. A spelling the caller wrote with `*`,
+ * `?` or `[…]` in it keeps the character sniffing: there the brackets are
+ * the glob syntax it asked for. The interior collapse below is not one of
+ * the glob branches: `//` and `/./` are dead spellings either way.
  */
-export function normalizePathForSandbox(pathPattern: string): string {
+export function normalizePathForSandbox(
+  pathPattern: string,
+  opts?: { literal?: boolean },
+): string {
+  const isGlobSpelling = (p: string): boolean =>
+    !opts?.literal && containsGlobCharsForPlatform(p)
   // Windows pre-processing: expand `%USERPROFILE%` / `%HOMEDRIVE%` /
   // `%HOMEPATH%`, strip the `\\?\` / `\\?\UNC\` extended prefix (its
   // `?` is a literal, not a glob char), and uppercase the drive
@@ -367,7 +382,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
     // UNC literal: return as-is (separators normalised only) — no
     // stat/realpath. A UNC *glob* falls through to the glob walk
     // below (user-trusted share). See {@link isUncPath}.
-    if (isUncPath(pathPattern) && !containsGlobCharsWin(pathPattern)) {
+    if (isUncPath(pathPattern) && !isGlobSpelling(pathPattern)) {
       return path.win32.normalize(pathPattern)
     }
   }
@@ -386,7 +401,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
   if (
     getPlatform() !== 'windows' &&
     pathPattern.endsWith('/') &&
-    !containsGlobCharsForPlatform(pathPattern)
+    !isGlobSpelling(pathPattern)
   ) {
     pathPattern = pathPattern.replace(/\/+$/, '') || '/'
   }
@@ -424,7 +439,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
   }
 
   // For glob patterns, resolve symlinks for the directory portion only
-  if (containsGlobCharsForPlatform(normalizedPath)) {
+  if (isGlobSpelling(normalizedPath)) {
     // Extract the static directory prefix before glob characters
     // (on Windows, `[`/`]` are literal so only split on `*`/`?`).
     const splitRe = getPlatform() === 'windows' ? /[*?]/ : /[*?[\]]/
@@ -559,12 +574,14 @@ function homeDirsNotReadDenied(
   // that resolves /tmp and /var to /private/... for a path that exists. A
   // convenience directory may not exist yet, so its second spelling is built
   // from the home directory, which does.
-  const homes = [...new Set([home, normalizePathForSandbox(home)])]
+  const homes = [
+    ...new Set([home, normalizePathForSandbox(home, { literal: true })]),
+  ]
   const denies = denyRead.map(entry => readRuleCovers(entry))
   const reopened = allowRead
     .map(entry => removeTrailingGlobSuffix(entry))
     .filter(entry => !containsGlobCharsForPlatform(entry))
-    .map(entry => normalizePathForSandbox(entry))
+    .map(entry => normalizePathForSandbox(entry, { literal: true }))
   return HOME_CONVENIENCE_WRITE_DIRS.filter(rel => {
     const spellings = homes.map(h => path.join(h, rel))
     return !denies.some(
@@ -582,19 +599,25 @@ function homeDirsNotReadDenied(
  * Whether a read rule covers a path: the path is the rule's own or lies
  * beneath it. `dir/**` is `dir`, and a glob covers whatever
  * {@link denyGlobRegex} matches.
+ *
+ * Pattern or name is decided on what the caller wrote, before the spelling
+ * is resolved: `*`, `?` and `[…]` there are the syntax it asked for, while
+ * resolving splices in a cwd or home directory that may carry those
+ * characters in its own name. A spelling without them is normalized as the
+ * name it is.
  */
 function readRuleCovers(entry: string): (p: string) => boolean {
   const stripped = removeTrailingGlobSuffix(entry)
-  const rule = normalizePathForSandbox(stripped)
   if (containsGlobCharsForPlatform(stripped)) {
     try {
-      const regex = new RegExp(denyGlobRegex(rule))
+      const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
       return p => regex.test(p)
     } catch {
       // Brackets that do not form a valid class. The entry may be a literal
       // file name, so it is compared as one.
     }
   }
+  const rule = normalizePathForSandbox(stripped, { literal: true })
   return p => isAtOrUnder(p, rule)
 }
 
@@ -1037,6 +1060,12 @@ export function globToRegex(globPattern: string): string {
  * as `**\/secrets` and, matched exactly, would deny only the directory
  * vnode while `secrets/key` stayed readable. This is what the Linux backend
  * already does (a deny masks the whole subtree). Only ever widens a deny.
+ *
+ * Takes a whole pattern, so every character in it is glob syntax: right for
+ * a spelling the caller wrote, which is what {@link readRuleCovers} passes.
+ * A pattern the library anchored at a directory of its own goes through the
+ * macOS `denyGlobEntryRegex`, which splices that directory back in escaped
+ * and calls this for the tail.
  */
 export function denyGlobRegex(normalizedGlob: string): string {
   // globToRegex() always returns '^…$'.
