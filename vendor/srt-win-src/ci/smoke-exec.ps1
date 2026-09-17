@@ -222,10 +222,14 @@ Write-Host "R5 ok: outbound blocked for srt-sandbox (curl exit=$($r.exit))"
 $inRangeR = Bind-Listener ($PortHi..($PortLo+5))
 $portInR  = $inRangeR.LocalEndpoint.Port
 try {
+  # TcpClient, as in R5d/R5e, not Test-NetConnection: the cmdlet loads the
+  # NetTCPIP module and falls back to a ping, and this is the first pwsh
+  # started under the new sandbox profile, so the pair can outlast RExec's
+  # 30s limit on a slow runner.
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
-    "(Test-NetConnection 127.0.0.1 -Port $portInR " +
-    "-WarningAction SilentlyContinue).TcpTestSucceeded")
-  if ($r.out -notmatch '(?i)\bTrue\b') {
+    "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portInR); Write-Output CONNECTED } " +
+    "catch { Write-Output blocked }")
+  if ($r.out -notmatch 'CONNECTED') {
     throw "R5b: loopback to in-range port $portInR did not succeed. raw: $($r.raw)"
   }
   Write-Host "R5b ok: in-range loopback permitted for srt-sandbox (port=$portInR)"
@@ -238,9 +242,9 @@ $outRange = Bind-Listener (50000, 50001, 50002, 49999)
 $portOut  = $outRange.LocalEndpoint.Port
 try {
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
-    "(Test-NetConnection 127.0.0.1 -Port $portOut " +
-    "-WarningAction SilentlyContinue).TcpTestSucceeded")
-  if ($r.out -match '(?i)\bTrue\b') {
+    "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portOut); Write-Output CONNECTED } " +
+    "catch { Write-Output blocked }")
+  if ($r.out -match 'CONNECTED') {
     throw "R5c: loopback to out-of-range port $portOut succeeded. raw: $($r.raw)"
   }
   # Sanity: prove the listener was actually live (reachable from
@@ -261,14 +265,22 @@ try {
 # would leave [::1] as a silent hole to every local service. Real
 # listener on [::1], child connect must be denied (an
 # AccessDenied/timeout, never a successful connect).
-$v6l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Loopback, 49998)
-$v6l.Start()
+# Ephemeral, not a fixed port: a bind inside one of Windows' per-machine
+# excluded port ranges fails with WSAEACCES. Re-draw if the OS hands out a
+# port inside the permit range.
+do {
+  $v6l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Loopback, 0)
+  $v6l.Start()
+  $portV6 = $v6l.LocalEndpoint.Port
+  $inPermit = $portV6 -ge $PortLo -and $portV6 -le $PortHi
+  if ($inPermit) { $v6l.Stop() }
+} while ($inPermit)
 try {
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
     "try { `$c = New-Object Net.Sockets.TcpClient([Net.Sockets.AddressFamily]::InterNetworkV6); " +
-    "`$c.Connect('::1', 49998); Write-Output CONNECTED } catch { Write-Output blocked }")
+    "`$c.Connect('::1', $portV6); Write-Output CONNECTED } catch { Write-Output blocked }")
   if ($r.out -match 'CONNECTED') {
-    throw "R5d: sandboxed connect to [::1]:49998 succeeded — v6 fence hole. raw: $($r.raw)"
+    throw "R5d: sandboxed connect to [::1]:$portV6 succeeded — v6 fence hole. raw: $($r.raw)"
   }
   Write-Host 'R5d ok: IPv6 loopback out-of-range blocked'
 } finally {
