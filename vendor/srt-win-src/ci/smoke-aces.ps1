@@ -445,6 +445,22 @@ try {
   }
   $a.RemoveAccessRule($rule) | Out-Null; Set-Acl $unw $a
   Write-Host 'A31(e) ok: broker-unwritable deny target soft-drops'
+
+  # (f) dir-marked deny whose target exists as a FILE → tolerated:
+  #     the marker is a creation hint, so the deny binds to the
+  #     file (config snapshot can race the filesystem).
+  $f31f = Join-Path $Root 'a31f-existing.txt'
+  Set-Content $f31f 'A31F-DATA'
+  Stamp @{ denyRead = @($f31f + '\') }
+  if (-not (Has-SbAce $f31f)) {
+    throw 'A31(f): dir-marked existing file has no sb-user Deny ACE'
+  }
+  $r = RExec @('--', $cmd, '/c', "type `"$f31f`"")
+  if ($r.exit -eq 0) {
+    throw "A31(f): child read dir-marked denied file. raw: $($r.raw)"
+  }
+  Restore $PID
+  Write-Host 'A31(f) ok: dir-marked existing FILE → deny bound to the file'
 }
 finally {
   & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
