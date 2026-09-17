@@ -1063,6 +1063,7 @@ function generateSandboxProfile({
     '  (sysctl-name "kern.argmax")',
     '  (sysctl-name "kern.bootargs")',
     '  (sysctl-name "kern.hostname")',
+    '  (sysctl-name "kern.hv_vmm_present")',
     '  (sysctl-name "kern.maxfiles")',
     '  (sysctl-name "kern.maxfilesperproc")',
     '  (sysctl-name "kern.maxproc")',
