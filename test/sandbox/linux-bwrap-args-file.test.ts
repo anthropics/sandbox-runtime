@@ -16,8 +16,33 @@ import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import { LinuxSandboxProfileError } from '../../src/index.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+
+describe('the bwrap profile error at the package root', () => {
+  it('carries a name, a code, and a cause only when one is given', () => {
+    const plain = new LinuxSandboxProfileError('command_too_long', 'refused')
+    expect(plain.name).toBe('LinuxSandboxProfileError')
+    expect(plain.code).toBe('command_too_long')
+    expect('cause' in plain).toBe(false)
+    expect(Object.keys(plain)).not.toContain('cause')
+
+    const open = new Error('no directory took an unnamed file')
+    const withCause = new LinuxSandboxProfileError(
+      'args_file_unavailable',
+      'refused',
+      open,
+    )
+    expect(withCause.cause).toBe(open)
+    // Non-enumerable, as a native `cause` is, so it stays out of the keys and
+    // out of anything that walks them.
+    expect(
+      Object.getOwnPropertyDescriptor(withCause, 'cause')?.enumerable,
+    ).toBe(false)
+  })
+})
 
 /**
  * A bwrap profile too large for one shell argument (32 pages) has its mounts
@@ -79,6 +104,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   const overLongProfile = (): string[] =>
     maskedFiles(Math.ceil(MAX_ARG_STRLEN / 300) + 50)
 
+  // `count` variables to unset, two bwrap words each.
+  const envVarNames = (count: number): string[] =>
+    Array.from({ length: count }, (_, i) => `V${i}`)
+
   async function wrap(
     files: string[],
     opts: {
@@ -104,11 +133,22 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     })
   }
 
-  function rejection(wrapping: Promise<string>): Promise<string> {
-    return wrapping.then(
-      () => 'resolved',
-      (error: unknown) => String(error),
+  async function refused(
+    wrapping: Promise<string>,
+  ): Promise<LinuxSandboxProfileError> {
+    const thrown: unknown = await wrapping.then(
+      // A rendering is up to the kernel's per-argument cap: its size, not the
+      // string, is what a failure here needs to report.
+      wrapped => `the wrap resolved, in ${wrapped.length} characters`,
+      (error: unknown) => error,
     )
+    expect(thrown).toBeInstanceOf(LinuxSandboxProfileError)
+    if (!(thrown instanceof LinuxSandboxProfileError)) {
+      // Narrowing only.
+      throw new Error(String(thrown))
+    }
+    expect(thrown.name).toBe('LinuxSandboxProfileError')
+    return thrown
   }
 
   function argsPathOf(wrapped: string): string {
@@ -129,7 +169,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   ): unknown {
     const files = overLongProfile()
     const script = `
-      import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints } from ${JSON.stringify(MODULE)}
+      import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints, LinuxSandboxProfileError } from ${JSON.stringify(MODULE)}
       import * as fs from 'node:fs'
       const overLong = ${JSON.stringify(files)}
       const small = overLong.slice(0, 1)
@@ -140,6 +180,14 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
       const outcome = wrapping => wrapping.then(() => 'resolved', error => String(error))
+      // What a refusal carries, read in the process that threw it.
+      const refusal = wrapping => wrapping.then(() => 'resolved', error => ({
+        profileError: error instanceof LinuxSandboxProfileError,
+        name: error.name,
+        code: error.code,
+        cause: error.cause instanceof Error ? error.cause.message : String(error.cause),
+        message: error.message,
+      }))
       const argsPathOf = wrapped => wrapped.match(/' srt-args (\\S+) /)?.[1]
       ${body}
     `
@@ -224,29 +272,86 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   })
 
   it('refuses a command that is too long for one argument by itself', async () => {
-    expect(
-      await rejection(
-        wrap(maskedFiles(20), { command: 'a'.repeat(MAX_ARG_STRLEN) }),
-      ),
-    ).toMatch(/too long for one shell argument even with the mounts/)
+    const error = await refused(
+      wrap(maskedFiles(20), { command: 'a'.repeat(MAX_ARG_STRLEN) }),
+    )
+    expect(error.code).toBe('command_too_long')
+    expect(error.message).toMatch(
+      /too long for one shell argument even with the mounts passed through a file \(\d+ bytes; the limit here is \d+\)/,
+    )
+  })
+
+  it('reaches the same refusal through SandboxManager, the way an embedder wraps', async () => {
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: maskedFiles(20), allowWrite: [], denyWrite: [] },
+    })
+    try {
+      const error = await refused(
+        SandboxManager.wrapWithSandbox('a'.repeat(MAX_ARG_STRLEN)),
+      )
+      expect(error.code).toBe('command_too_long')
+    } finally {
+      await SandboxManager.reset()
+    }
   })
 
   it('refuses a profile past the 9000 arguments bwrap accepts', async () => {
-    const names = Array.from({ length: 4500 }, (_, i) => `V${i}`)
-    expect(
-      await rejection(wrap(maskedFiles(1), { unsetEnvVars: names })),
-    ).toMatch(/bwrap accepts at most 9000/)
+    const error = await refused(
+      wrap(maskedFiles(1), { unsetEnvVars: envVarNames(4500) }),
+    )
+    expect(error.code).toBe('too_many_arguments')
+    expect(error.message).toMatch(
+      /has \d+ bwrap arguments and bwrap accepts at most 9000 \(about 3000 mounts\)/,
+    )
   })
 
-  it('refuses a mount path with a NUL byte, which bwrap would split into several options', async () => {
-    expect(
-      await rejection(
-        wrap(overLongProfile(), {
-          allowOnly: [BASE],
-          denyWithinAllow: [join(BASE, 'x\0--cap-add\0ALL')],
-        }),
-      ),
-    ).toMatch(/NUL byte/)
+  it('refuses an over-long profile whose mounts, passed through a file, would pass the 9000 arguments', async () => {
+    // The two argument counts where the profile fits bwrap's cap but `--args
+    // <fd>` would not. Each unset variable adds two words, so one of the two
+    // counts is reachable; the first wrap reports the count it reached, which
+    // gives the size of the rest of the profile. The command is over-long by
+    // itself, so the line does not fit whatever the kernel's page size.
+    const files = maskedFiles(20)
+    const command = 'a'.repeat(MAX_ARG_STRLEN)
+    const probe = 5000
+    const overflow = await refused(
+      wrap(files, { command, unsetEnvVars: envVarNames(probe) }),
+    )
+    expect(overflow.code).toBe('too_many_arguments')
+    const counted = overflow.message.match(/has (\d+) bwrap arguments/)
+    if (!counted) {
+      throw new Error(`no argument count in: ${overflow.message}`)
+    }
+    const rest = Number(counted[1]) - 2 * probe
+    const target = rest % 2 === 0 ? 9000 : 8999
+
+    const error = await refused(
+      wrap(files, {
+        command,
+        unsetEnvVars: envVarNames((target - rest) / 2),
+      }),
+    )
+    expect(error.code).toBe('too_many_arguments')
+    expect(error.message).toMatch(
+      /and, passed through a file, would exceed the 9000 arguments bwrap accepts/,
+    )
+  })
+
+  it('refuses a mount path with a NUL byte whether or not the profile fits the command line', async () => {
+    const nulInAPath = {
+      allowOnly: [BASE],
+      denyWithinAllow: [join(BASE, 'x\0--cap-add\0ALL')],
+    }
+    // The size decides the carrier, and neither carrier holds a NUL: the
+    // command line ends at it, a file of bwrap arguments splits on it.
+    for (const files of [maskedFiles(1), overLongProfile()]) {
+      const error = await refused(wrap(files, nulInAPath))
+      expect(error.code).toBe('nul_in_path')
+      expect(error.message).toMatch(
+        /contains a path with a NUL byte, which neither a command line nor a file of bwrap arguments can carry/,
+      )
+    }
   })
 
   it('holds one fd per pending profile and gives them all back at cleanup, a refused wrap included', () => {
@@ -282,7 +387,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       const fits = await wrap(small)
       console.log(JSON.stringify({
         fits: fits.includes('--ro-bind /dev/null') && !fits.includes('srt-args'),
-        refused: await outcome(wrap(overLong)),
+        refused: await refusal(wrap(overLong)),
       }))
     `,
       { TMPDIR: roTmp },
@@ -301,9 +406,17 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     )
     expect(seen).toEqual({
       fits: true,
-      refused: expect.stringMatching(
-        /cannot be passed through a file: no unnamed file could be opened for it \(.*read-only/s,
-      ),
+      refused: {
+        profileError: true,
+        name: 'LinuxSandboxProfileError',
+        code: 'args_file_unavailable',
+        cause: expect.stringMatching(
+          /^no unnamed file could be opened for it \(.*read-only/s,
+        ),
+        message: expect.stringMatching(
+          /cannot be passed through a file: no unnamed file could be opened for it \(.*read-only/s,
+        ),
+      },
     })
   })
 
