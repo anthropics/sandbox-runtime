@@ -111,6 +111,28 @@ export function gitDirDenyPaths(
 }
 
 /**
+ * What must stand in for `denyPath` where it does not exist, or undefined
+ * for a path git does not read this way. Denying an absent path means
+ * mounting something at it, and git reads whichever of these two it finds:
+ * it refuses to run at all against a `commondir` it cannot read, which an
+ * empty one and a bound /dev/null both are (git rejects a commondir it reads
+ * zero bytes from, and a bind mount carries nodev, so the device is
+ * unreadable). `.` is where git looks when a git directory has no commondir
+ * - the git directory itself - and no config.worktree reads the same as an
+ * empty one, so both placeholders leave git doing what it already does.
+ */
+export function gitRedirectPlaceholder(denyPath: string): string | undefined {
+  switch (path.basename(denyPath)) {
+    case 'commondir':
+      return '.\n'
+    case 'config.worktree':
+      return ''
+    default:
+      return undefined
+  }
+}
+
+/**
  * Deny paths for a `.git` file, the `gitdir:` pointer of a linked worktree or
  * submodule checkout: the file itself plus the hooks/ and config git reads
  * through it (the named git directory's, and for a linked worktree its

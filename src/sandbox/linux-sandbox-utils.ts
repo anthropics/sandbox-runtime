@@ -26,6 +26,7 @@ import {
 import {
   gitDirDenyPaths,
   gitFileDenyPaths,
+  gitRedirectPlaceholder,
   submoduleGitDirs,
 } from './mandatory-deny-paths.js'
 import type {
@@ -249,6 +250,31 @@ function hasFileAncestor(targetPath: string): boolean {
   }
 
   return false
+}
+
+/** Whether `filePath` is a regular file holding no bytes. */
+function isEmptyFile(filePath: string): boolean {
+  try {
+    const stat = fs.statSync(filePath)
+    return stat.isFile() && stat.size === 0
+  } catch {
+    return false
+  }
+}
+
+/**
+ * A read-only file holding `contents`, to bind where an absent deny path is
+ * one something else reads and /dev/null would not do - see
+ * {@link gitRedirectPlaceholder}. It gets a directory of its own so the
+ * sandboxed command cannot reach the mount source under a name it can write.
+ */
+function denyPlaceholderFile(contents: string): string {
+  const file = path.join(
+    fs.mkdtempSync(path.join(tmpdir(), 'claude-stub-')),
+    'placeholder',
+  )
+  fs.writeFileSync(file, contents, { mode: 0o444 })
+  return file
 }
 
 /**
@@ -1865,15 +1891,24 @@ async function generateFilesystemArgs(
       }
       return stubSkipVetoInputs
     }
+    const mandatoryDenyPaths = await linuxGetMandatoryDenyPaths(
+      ripgrepConfig,
+      mandatoryDenySearchDepth,
+      allowGitConfig,
+      abortSignal,
+    )
+    // What to bind where one of those is absent, keyed by the spelling the
+    // scan produced it with: a caller's own denyWrite that ends in the same
+    // name is not a git directory's and keeps the /dev/null placeholder.
+    const gitRedirectStubs = new Map<string, string>()
+    for (const denyPath of mandatoryDenyPaths) {
+      const contents = gitRedirectPlaceholder(denyPath)
+      if (contents !== undefined) gitRedirectStubs.set(denyPath, contents)
+    }
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
-      ...(await linuxGetMandatoryDenyPaths(
-        ripgrepConfig,
-        mandatoryDenySearchDepth,
-        allowGitConfig,
-        abortSignal,
-      )),
+      ...mandatoryDenyPaths,
     ]
 
     // Duplicate deny entries must be collapsed: a duplicate
@@ -2226,12 +2261,21 @@ async function generateFilesystemArgs(
               `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
           } else {
-            denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
+            // A placeholder git reads, where the path is one it reads: a
+            // commondir it cannot read makes git refuse to run at all, so
+            // every command in the repository would fail rather than just
+            // the write this deny is for. Everything else keeps /dev/null.
+            const gitRedirectStub = gitRedirectStubs.get(pathPattern)
+            const source =
+              gitRedirectStub === undefined
+                ? '/dev/null'
+                : denyPlaceholderFile(gitRedirectStub)
+            denyWriteArgs.push('--ro-bind', source, firstNonExistent)
             denyWriteRawDests.set(firstNonExistent, rawPath)
             bwrapMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
-              `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
+              `[Sandbox Linux] Mounted ${source} at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
           }
         } else if (ancestorIsWithinReadOnlyDeny) {
@@ -2277,7 +2321,20 @@ async function generateFilesystemArgs(
             )
           }
         }
-        denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
+        // A redirect file holding nothing git can read as one is bound from
+        // the placeholder rather than from itself. The usual way to find one
+        // is a previous wrap's own mount point for the absent case, which is
+        // an empty file until it is cleaned up: binding that would deny the
+        // same write and cost the repository every git command, since git
+        // refuses to run at all against a commondir it cannot read.
+        const gitRedirectStub = gitRedirectStubs.get(pathPattern)
+        denyWriteArgs.push(
+          '--ro-bind',
+          gitRedirectStub !== undefined && isEmptyFile(normalizedPath)
+            ? denyPlaceholderFile(gitRedirectStub)
+            : normalizedPath,
+          normalizedPath,
+        )
         denyWriteRawDests.set(normalizedPath, rawPath)
       } else {
         logForDebugging(
