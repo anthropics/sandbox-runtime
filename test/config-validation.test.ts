@@ -1,5 +1,6 @@
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, afterEach, spyOn } from 'bun:test'
 import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
+import * as platform from '../src/utils/platform.js'
 
 describe('Config Validation', () => {
   test('should validate a valid minimal config', () => {
@@ -348,6 +349,170 @@ describe('Config Validation', () => {
     if (result.success) {
       expect(result.data.ripgrep).toBeUndefined()
     }
+  })
+
+  describe('deny globs with a trailing separator', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    let platformSpy: ReturnType<typeof spyOn> | undefined
+
+    afterEach(() => {
+      platformSpy?.mockRestore()
+      platformSpy = undefined
+    })
+
+    // A slashed deny glob compiles to a pattern only a path ending in a
+    // separator could satisfy, so it denies nothing on either backend —
+    // fail-open, and with no diagnostic beyond a debug line about zero
+    // expansions.
+    test.each([['/data/*/'], ['/data/**/'], ['/data/[ab]/'], ['/data/?/']])(
+      'rejects denyRead %s',
+      spelling => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          filesystem: { ...base.filesystem, denyRead: [spelling] },
+        })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.message).toContain(spelling)
+          expect(result.error.issues[0]?.message).toContain('can match no path')
+          expect(result.error.issues[0]?.path).toEqual([
+            'filesystem',
+            'denyRead',
+            0,
+          ])
+        }
+      },
+    )
+
+    test('rejects a slashed denyWrite glob, naming the spelling to use', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: { ...base.filesystem, denyWrite: ['/data/*/'] },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toContain('Write "/data/*"')
+        expect(result.error.issues[0]?.path).toEqual([
+          'filesystem',
+          'denyWrite',
+          0,
+        ])
+      }
+    })
+
+    // A `mode: 'deny'` credential file is unioned into the read-deny set, so
+    // it takes the same glob branches and goes inert the same way.
+    test('rejects a slashed glob on a mode "deny" credential file', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        credentials: { files: [{ path: '~/.aws/*/', mode: 'deny' }] },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toContain('Write "~/.aws/*"')
+        expect(result.error.issues[0]?.path).toEqual([
+          'credentials',
+          'files',
+          0,
+          'path',
+        ])
+      }
+    })
+
+    test('accepts the slash-free glob spellings it points at', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: {
+          ...base.filesystem,
+          denyRead: ['/data/*', '/data/**'],
+          denyWrite: ['/data/*'],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    // Non-glob spellings are canonicalised at the sandbox chokepoint, and an
+    // allow that matches nothing fails closed — neither is rejected here.
+    test('leaves trailing-slash literals and allow globs alone', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: {
+          denyRead: ['/data/secrets/'],
+          allowRead: ['/data/*/'],
+          allowWrite: ['/work/*/'],
+          denyWrite: ['/data/secrets/'],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    // A relative spelling is resolved through path.resolve, which drops the
+    // trailing separator, so these globs are live rules.
+    test('accepts relative slashed globs, which normalisation strips', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: {
+          ...base.filesystem,
+          denyRead: ['build/*/', './*/', '*/'],
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    // filesystem.disabled drops every filesystem rule, credential file
+    // denies included, so an inert deny under it is not a hole.
+    test('accepts a slashed deny glob when filesystem.disabled', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: {
+          ...base.filesystem,
+          disabled: true,
+          denyRead: ['/data/*/'],
+          denyWrite: ['/data/*/'],
+        },
+        credentials: { files: [{ path: '~/.aws/*/', mode: 'deny' }] },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    // The Windows CI legs run only the winsrt and mux-proxy suites, so the
+    // Windows arm of the check is driven here instead.
+    test('Windows: accepts a bracketed literal keeping its directory marker', () => {
+      // `[` and `]` are legal Win32 filename characters, so this is a
+      // literal, and its trailing separator is the directory marker for a
+      // deny target that does not exist yet.
+      platformSpy = spyOn(platform, 'getPlatform').mockReturnValue('windows')
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: { ...base.filesystem, denyRead: ['C:/app/[prod]/'] },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test.each([['C:\\data\\*\\'], ['C:/data/*/']])(
+      'Windows: rejects the slashed glob %s',
+      spelling => {
+        platformSpy = spyOn(platform, 'getPlatform').mockReturnValue('windows')
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          filesystem: { ...base.filesystem, denyRead: [spelling] },
+        })
+        expect(result.success).toBe(false)
+      },
+    )
+
+    test('POSIX: rejects a bracketed glob, where [ and ] are metacharacters', () => {
+      platformSpy = spyOn(platform, 'getPlatform').mockReturnValue('linux')
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: { ...base.filesystem, denyRead: ['/data/[ab]/'] },
+      })
+      expect(result.success).toBe(false)
+    })
   })
 
   describe('bwrapPath / socatPath', () => {
