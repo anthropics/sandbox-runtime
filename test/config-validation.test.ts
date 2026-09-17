@@ -247,6 +247,38 @@ describe('Config Validation', () => {
     }
   })
 
+  test('should validate config with logViolationsToSystemLog', () => {
+    const config = {
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+      logViolationsToSystemLog: true,
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.logViolationsToSystemLog).toBe(true)
+    }
+  })
+
+  test('should reject non-boolean logViolationsToSystemLog', () => {
+    const config = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      logViolationsToSystemLog: 'yes',
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(false)
+  })
+
   test('should validate config with custom ripgrep command', () => {
     const config = {
       network: {

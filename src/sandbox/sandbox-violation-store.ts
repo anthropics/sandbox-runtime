@@ -11,6 +11,8 @@ export class SandboxViolationStore {
   private readonly maxSize = 100
   private listeners: Set<(violations: SandboxViolationEvent[]) => void> =
     new Set()
+  private eventListeners: Set<(violation: SandboxViolationEvent) => void> =
+    new Set()
 
   addViolation(violation: SandboxViolationEvent): void {
     // Every producer funnels through here (seatbelt log lines and seccomp
@@ -19,15 +21,33 @@ export class SandboxViolationStore {
     // to one physical, tag-free line so nothing can close an embedder's
     // <sandbox_violations> envelope early or smuggle terminal escapes
     // (C0, DEL and C1 — the latter covers 8-bit CSI/OSC introducers).
-    this.violations.push({
+    const stored: SandboxViolationEvent = {
       ...violation,
       line: sanitizeViolationText(violation.line).replace(/[<>]/g, ''),
-    })
+    }
+    this.violations.push(stored)
     this.totalCount++
     if (this.violations.length > this.maxSize) {
       this.violations = this.violations.slice(-this.maxSize)
     }
     this.notifyListeners()
+    this.eventListeners.forEach(listener => listener(stored))
+  }
+
+  /**
+   * Observe each violation as it is recorded, after sanitization and after
+   * the producer's ignoreViolations check. Unlike `subscribe`, the listener
+   * sees every event exactly once rather than the capped tail, so it suits
+   * forwarding sinks (system log, metrics) that must not miss or repeat.
+   * Returns an unsubscribe function.
+   */
+  onViolation(
+    listener: (violation: SandboxViolationEvent) => void,
+  ): () => void {
+    this.eventListeners.add(listener)
+    return () => {
+      this.eventListeners.delete(listener)
+    }
   }
 
   getViolations(limit?: number): SandboxViolationEvent[] {

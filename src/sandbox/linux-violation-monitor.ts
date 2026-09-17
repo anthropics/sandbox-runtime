@@ -134,6 +134,7 @@ export function startLinuxSandboxViolationMonitor(
       command,
       encodedCommand,
       timestamp: new Date(),
+      source: 'seccomp',
     }
     callback(violation)
   }
