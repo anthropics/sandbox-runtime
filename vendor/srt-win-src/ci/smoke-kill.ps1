@@ -70,7 +70,12 @@ function Get-TreePids { param([int] $Root)
   return $out
 }
 
-function Assert-Gone { param([int[]] $Pids, [string] $Tag, [int] $WaitSec = 5)
+# 20s, not 5: kill-on-close teardown is kernel-asynchronous, and on
+# loaded CI runners the last leaf can outlive the job handle close by
+# well over 5s — the recurring K1 "N survivor(s)" flake. The poll
+# exits as soon as the tree is gone, so the higher ceiling costs
+# nothing on healthy runs.
+function Assert-Gone { param([int[]] $Pids, [string] $Tag, [int] $WaitSec = 20)
   $deadline = [DateTime]::UtcNow.AddSeconds($WaitSec)
   do {
     $alive = @(Get-Process -Id $Pids -ea SilentlyContinue |
@@ -133,7 +138,7 @@ try {
   # ── K1: hard-kill broker → whole tree gone ────────────────────────
   $t = Start-Tree
   Stop-Process -Id $t.broker -Force
-  Assert-Gone -Pids $t.pids -Tag 'K1' -WaitSec 5
+  Assert-Gone -Pids $t.pids -Tag 'K1'
 
   # ── K2: graceful broker exit → whole tree gone ────────────────────
   # Short leaf (~7s): the child finishes, the runner returns its
@@ -145,7 +150,7 @@ try {
     throw 'K2: broker did not exit within 30s of a ~7s child'
   }
   Write-Host "K2: broker exited (code=$($t.proc.ExitCode))"
-  Assert-Gone -Pids $t.pids -Tag 'K2' -WaitSec 5
+  Assert-Gone -Pids $t.pids -Tag 'K2'
 }
 finally {
   & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-Null
