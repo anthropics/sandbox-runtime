@@ -355,11 +355,41 @@ export function expandWindowsEnvRefs(p: string): string {
 }
 
 /**
+ * Runs of `/` collapsed to one and `/./` components dropped, leaving the rest
+ * of the spelling (a trailing `/` or `/.`, a `..`) to the caller. POSIX only.
+ */
+function collapseInteriorSpellings(pathPattern: string): string {
+  return pathPattern.replace(/\/{2,}/g, '/').replace(/\/\.(?=\/)/g, '')
+}
+
+/**
+ * Says so when a `..` reaches a backend unfolded — realpath could not resolve
+ * the path (absent, or unreadable), and folding `..` lexically here could aim
+ * the rule past a symlink at a file the kernel would never reach. Debug-only
+ * (`SRT_DEBUG`), so a rule that matches nothing is silent by default. Called
+ * at every return of {@link normalizePathForSandbox} that can carry one, glob
+ * spellings included.
+ */
+function warnIfParentRefUnfolded(normalizedPath: string): string {
+  if (
+    getPlatform() !== 'windows' &&
+    /(?:^|\/)\.\.(?:\/|$)/.test(normalizedPath)
+  ) {
+    logForDebugging(
+      `[Sandbox] "${normalizedPath}" could not be resolved and still contains ` +
+        `a ".." component, so a rule spelled this way may not match.`,
+      { level: 'warn' },
+    )
+  }
+  return normalizedPath
+}
+
+/**
  * Normalize a path for use in sandbox configurations
  * Handles:
  * - Tilde (~) expansion for home directory
  * - Relative paths (./foo, ../foo, etc.) converted to absolute
- * - Absolute paths remain unchanged
+ * - POSIX: '//' runs, '/./' components and a trailing '/' or '/.' collapsed
  * - Symlinks are resolved to their real paths for non-glob patterns
  * - Glob patterns preserve wildcards after path normalization
  *
@@ -372,13 +402,13 @@ export function expandWindowsEnvRefs(p: string): string {
  * branches are skipped for it, so a component like `a[b` is resolved and
  * later compiled as the name it is. A spelling the caller wrote with `*`,
  * `?` or `[…]` in it keeps the character sniffing: there the brackets are
- * the glob syntax it asked for.
+ * the glob syntax it asked for. The interior collapse below is not one of
+ * the glob branches: `//` and `/./` are dead spellings either way.
  */
 export function normalizePathForSandbox(
   pathPattern: string,
   opts?: { literal?: boolean },
 ): string {
-  const cwd = process.cwd()
   const isGlobSpelling = (p: string): boolean =>
     !opts?.literal && containsGlobCharsForPlatform(p)
   // Windows pre-processing: expand `%USERPROFILE%` / `%HOMEDRIVE%` /
@@ -401,19 +431,20 @@ export function normalizePathForSandbox(
   // resolution. Consumers on the Linux and macOS paths compare spellings by
   // exact match and `path + '/'` prefixes — which a preserved slash silently
   // defeats ('<dir>//') — and the realpath-acceptance checks below treat a
-  // slash-only difference as a mismatch. bwrap binds and sbpl subpath
-  // filters treat 'dir' and 'dir/' identically, so only the comparisons
-  // change. Glob spellings are left untouched: a slash after a glob segment
-  // is semantic ('/x/*/' compiles to a different regex than '/x/*'). That
-  // regex matches nothing, which an allow may harmlessly be — so an allow
-  // keeps the spelling, while the same spelling as a deny is rejected at
-  // config validation (see sandbox-config.ts). On Windows a trailing
-  // separator is the directory marker for absent deny targets (srt#404) and
-  // must survive.
+  // slash-only difference as a mismatch. A Seatbelt `subpath` filter is the
+  // one place the two spellings really are interchangeable: a `literal`
+  // filter and a glob regex ending '/$' match nothing when the slash is
+  // there, and a bwrap bind tolerates it only for a directory (a slashed
+  // file path fails ENOTDIR at mount). Glob spellings are left untouched: a
+  // slash after a glob segment is semantic ('/x/*/' compiles to a different
+  // regex than '/x/*'). That regex matches nothing, which an allow may
+  // harmlessly be — so an allow keeps the spelling, while the same spelling
+  // as a deny is rejected at config validation (see sandbox-config.ts). On
+  // Windows a trailing separator is the directory marker for absent deny
+  // targets (srt#404) and must survive.
   if (
     getPlatform() !== 'windows' &&
     pathPattern.endsWith('/') &&
-    pathPattern !== '/' &&
     !isGlobSpelling(pathPattern)
   ) {
     pathPattern = pathPattern.replace(/\/+$/, '') || '/'
@@ -424,10 +455,31 @@ export function normalizePathForSandbox(
     // tilde was expanded above
   } else if (pathPattern.startsWith('./') || pathPattern.startsWith('../')) {
     // Convert relative to absolute based on current working directory
-    normalizedPath = path.resolve(cwd, pathPattern)
+    normalizedPath = path.resolve(process.cwd(), pathPattern)
   } else if (!path.isAbsolute(pathPattern)) {
     // Handle other relative paths (e.g., ".", "..", "foo/bar")
-    normalizedPath = path.resolve(cwd, pathPattern)
+    normalizedPath = path.resolve(process.cwd(), pathPattern)
+  }
+
+  // POSIX: collapse the interior spellings realpath would have removed, on the
+  // EXPANDED path — the trailing strip above runs before expansion and only
+  // ever touches a trailing run, and tilde expansion can put a run back
+  // (HOME='/home/u/' turns '~/x' into '/home/u//x'). Glob spellings need it
+  // for the same reason: '~/.aws//*.pem' compiles to a regex holding '//'.
+  //
+  // It matters on macOS: Seatbelt compares the kernel's canonical path, so a
+  // filter spelled with '//' or '/./' matches nothing, silently — which for a
+  // deny is exactly the absent-target case the deny exists for. bwrap
+  // tolerates the spelling, and the Linux backend rebuilds its destinations
+  // with path.dirname/join, so that argv was already right.
+  //
+  // Lexical only, and deliberately not path.normalize/path.resolve: those
+  // also fold '..', which through a symlinked component aims the rule at a
+  // different file than the kernel would reach. An absolute spelling's '..' is
+  // left to realpath below; a relative one was already folded lexically by the
+  // path.resolve above (pre-existing).
+  if (getPlatform() !== 'windows') {
+    normalizedPath = collapseInteriorSpellings(normalizedPath)
   }
 
   // For glob patterns, resolve symlinks for the directory portion only
@@ -450,14 +502,23 @@ export function normalizePathForSandbox(
         if (!isSymlinkOutsideBoundary(baseDir, resolvedBaseDir)) {
           // Reconstruct the pattern with the resolved directory
           const patternSuffix = normalizedPath.slice(baseDir.length)
-          return resolvedBaseDir + patternSuffix
+          return warnIfParentRefUnfolded(resolvedBaseDir + patternSuffix)
         }
         // If resolution would broaden scope, keep original pattern
       } catch {
         // If directory doesn't exist or can't be resolved, keep the original pattern
       }
     }
-    return normalizedPath
+    return warnIfParentRefUnfolded(normalizedPath)
+  }
+
+  // A trailing '/' or '/.' is not semantic outside a glob, and the empty
+  // string is not the filesystem root: an empty HOME makes expandTilde('~')
+  // empty, and '' || '/' would turn `allowWrite: ['~']` into a whole-
+  // filesystem grant.
+  if (getPlatform() !== 'windows' && normalizedPath !== '') {
+    normalizedPath =
+      normalizedPath.replace(/\/\.$/, '').replace(/\/+$/, '') || '/'
   }
 
   // Resolve symlinks to real paths to avoid bwrap issues
@@ -472,11 +533,36 @@ export function normalizePathForSandbox(
       normalizedPath = resolvedPath
     }
   } catch {
-    // If path doesn't exist or can't be resolved, keep the normalized path
+    // Absent, or unreadable: keep the normalized spelling.
   }
 
-  return normalizedPath
+  return warnIfParentRefUnfolded(normalizedPath)
 }
+
+/**
+ * What the sandbox itself needs writable: the child's stdio and the TMPDIR it
+ * is handed (generateProxyEnvVars). Kept whatever is read-denied.
+ */
+const SANDBOX_OWN_WRITE_PATHS: readonly string[] = [
+  '/dev/stdout',
+  '/dev/stderr',
+  '/dev/null',
+  '/dev/tty',
+  '/dev/dtracehelper',
+  '/dev/autofs_nowait',
+  '/tmp/claude',
+  '/private/tmp/claude',
+]
+
+/**
+ * Directories under the home directory made writable as a convenience the
+ * caller never asked for. Every entry is subject to the read-rule check in
+ * {@link getDefaultWritePaths}.
+ */
+const HOME_CONVENIENCE_WRITE_DIRS: readonly string[] = [
+  '.npm/_logs',
+  '.claude/debug',
+]
 
 /**
  * Get recommended system paths that should be writable for commands to work properly
@@ -484,23 +570,99 @@ export function normalizePathForSandbox(
  * WARNING: These default paths are intentionally broad for compatibility but may
  * allow access to files from other processes. In highly security-sensitive
  * environments, you should configure more restrictive write paths.
+ *
+ * With no argument this is the whole list. Given the read rules of a
+ * filesystem policy, a home convenience directory (~/.npm/_logs,
+ * ~/.claude/debug) is left out when a `denyRead` entry names it or a
+ * directory above it: kept, it would be bound back over that deny on Linux
+ * (readable and writable again) and stay writable on macOS, so the explicit
+ * denyRead wins over the implicit write allow. It is kept when an `allowRead`
+ * entry beneath that deny re-opens it, because the caller has already made it
+ * readable. A caller who wants it writable regardless lists it in
+ * `allowWrite`. What the sandbox itself needs (stdio, /tmp/claude) is never
+ * left out.
+ *
+ * Pass the entries as configured, not expanded. `dir/**` counts as `dir`,
+ * and a glob covers a directory when it matches that directory or one above
+ * it; nothing is listed from disk. On Linux, where the backend expands globs
+ * against the disk, two things follow: a glob that matches nothing there
+ * still counts (which only ever drops a convenience path), and a glob whose
+ * match is a symlink to one of these directories is not seen. A glob
+ * `allowRead` entry is not counted as re-opening anything.
  */
-export function getDefaultWritePaths(): string[] {
-  const homeDir = homedir()
-  const recommendedPaths = [
-    '/dev/stdout',
-    '/dev/stderr',
-    '/dev/null',
-    '/dev/tty',
-    '/dev/dtracehelper',
-    '/dev/autofs_nowait',
-    '/tmp/claude',
-    '/private/tmp/claude',
-    path.join(homeDir, '.npm/_logs'),
-    path.join(homeDir, '.claude/debug'),
+export function getDefaultWritePaths(readRules?: {
+  denyRead: readonly string[]
+  allowRead?: readonly string[]
+}): string[] {
+  const home = homedir()
+  const keptDirs =
+    !readRules || readRules.denyRead.length === 0
+      ? HOME_CONVENIENCE_WRITE_DIRS
+      : homeDirsNotReadDenied(home, readRules.denyRead, readRules.allowRead)
+  return [
+    ...SANDBOX_OWN_WRITE_PATHS,
+    ...keptDirs.map(rel => path.join(home, rel)),
   ]
+}
 
-  return recommendedPaths
+/**
+ * The {@link HOME_CONVENIENCE_WRITE_DIRS} no `denyRead` entry covers, or
+ * that an `allowRead` entry beneath the covering deny re-opens.
+ */
+function homeDirsNotReadDenied(
+  home: string,
+  denyRead: readonly string[],
+  allowRead: readonly string[] = [],
+): readonly string[] {
+  // Rules are compared as normalizePathForSandbox spells them, and on macOS
+  // that resolves /tmp and /var to /private/... for a path that exists. A
+  // convenience directory may not exist yet, so its second spelling is built
+  // from the home directory, which does.
+  const homes = [
+    ...new Set([home, normalizePathForSandbox(home, { literal: true })]),
+  ]
+  const denies = denyRead.map(entry => readRuleCovers(entry))
+  const reopened = allowRead
+    .map(entry => removeTrailingGlobSuffix(entry))
+    .filter(entry => !containsGlobCharsForPlatform(entry))
+    .map(entry => normalizePathForSandbox(entry, { literal: true }))
+  return HOME_CONVENIENCE_WRITE_DIRS.filter(rel => {
+    const spellings = homes.map(h => path.join(h, rel))
+    return !denies.some(
+      denyCovers =>
+        spellings.some(denyCovers) &&
+        !reopened.some(
+          allow =>
+            denyCovers(allow) && spellings.some(s => isAtOrUnder(s, allow)),
+        ),
+    )
+  })
+}
+
+/**
+ * Whether a read rule covers a path: the path is the rule's own or lies
+ * beneath it. `dir/**` is `dir`, and a glob covers whatever
+ * {@link denyGlobRegex} matches.
+ *
+ * Pattern or name is decided on what the caller wrote, before the spelling
+ * is resolved: `*`, `?` and `[…]` there are the syntax it asked for, while
+ * resolving splices in a cwd or home directory that may carry those
+ * characters in its own name. A spelling without them is normalized as the
+ * name it is.
+ */
+function readRuleCovers(entry: string): (p: string) => boolean {
+  const stripped = removeTrailingGlobSuffix(entry)
+  if (containsGlobCharsForPlatform(stripped)) {
+    try {
+      const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
+      return p => regex.test(p)
+    } catch {
+      // Brackets that do not form a valid class. The entry may be a literal
+      // file name, so it is compared as one.
+    }
+  }
+  const rule = normalizePathForSandbox(stripped, { literal: true })
+  return p => isAtOrUnder(p, rule)
 }
 
 /**
@@ -973,6 +1135,26 @@ export function globToRegex(globPattern: string): string {
       .replace(/__GLOBSTAR__/g, '.*') + // ** matches anything including /
     '$'
   )
+}
+
+/**
+ * Regex for a glob used in a DENY rule: {@link globToRegex} plus an optional
+ * `/…` tail, so the deny covers everything beneath each match the way
+ * `subpath` does for literals. Callers strip a trailing `/**` before the
+ * pattern gets here (removeTrailingGlobSuffix), so `**\/secrets/**` arrives
+ * as `**\/secrets` and, matched exactly, would deny only the directory
+ * vnode while `secrets/key` stayed readable. This is what the Linux backend
+ * already does (a deny masks the whole subtree). Only ever widens a deny.
+ *
+ * Takes a whole pattern, so every character in it is glob syntax: right for
+ * a spelling the caller wrote, which is what {@link readRuleCovers} passes.
+ * A pattern the library anchored at a directory of its own goes through the
+ * macOS `denyGlobEntryRegex`, which splices that directory back in escaped
+ * and calls this for the tail.
+ */
+export function denyGlobRegex(normalizedGlob: string): string {
+  // globToRegex() always returns '^…$'.
+  return globToRegex(normalizedGlob).slice(0, -1) + '(/.*)?$'
 }
 
 export interface ExpandGlobOptions {
