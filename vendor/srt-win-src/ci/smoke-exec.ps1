@@ -42,6 +42,37 @@ function Bind-Listener {
   throw "no free port among: $($Candidates -join ',')"
 }
 
+# One-line-per-fact machine state for the CI log: what the host is, how long
+# it has been up, and which processes are using CPU right now (a 1s delta, not
+# lifetime totals). Never fails the script.
+function Write-MachineSnapshot {
+  param([string] $Tag)
+  try {
+    $os  = Get-CimInstance Win32_OperatingSystem
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $ubr = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').UBR
+    Write-Host ("diag[{0}]: cpu='{1}' logical={2} mem={3:n0}MB free={4:n0}MB build={5}.{6} uptime={7:n0}s" -f
+      $Tag, $cpu.Name, $cpu.NumberOfLogicalProcessors,
+      ($os.TotalVisibleMemorySize / 1KB), ($os.FreePhysicalMemory / 1KB),
+      $os.BuildNumber, $ubr, ((Get-Date) - $os.LastBootUpTime).TotalSeconds)
+    $a = @{}
+    foreach ($q in Get-Process) { $a[$q.Id] = $q.CPU }
+    Start-Sleep -Seconds 1
+    Get-Process |
+      ForEach-Object {
+        [pscustomobject]@{ Id = $_.Id; Name = $_.ProcessName
+                           Delta = [double]$_.CPU - [double]$a[$_.Id] }
+      } |
+      Sort-Object Delta -Descending | Select-Object -First 6 |
+      ForEach-Object {
+        Write-Host ("diag[{0}]: busy pid={1} {2} cpu+{3:n2}s/1s" -f
+          $Tag, $_.Id, $_.Name, $_.Delta)
+      }
+  } catch {
+    Write-Host "diag[$Tag]: snapshot failed: $_"
+  }
+}
+
 function Run {
   param([string[]] $argv)
   & $Exe @argv
@@ -151,6 +182,28 @@ function RExec {
           $_.ProcessId, $_.ParentProcessId, $_.Name,
           (($_.UserModeTime + $_.KernelModeTime) / 1e7))
       }
+    # What each process the child started is waiting on, the machine's state,
+    # and anything the OS logged while it hung.
+    Get-CimInstance Win32_Process |
+      Where-Object { $_.ProcessId -eq $p.Id -or $_.CreationDate -ge $since } |
+      ForEach-Object {
+        try {
+          $waits = (Get-Process -Id $_.ProcessId -ErrorAction Stop).Threads |
+            Group-Object { "$($_.ThreadState)/$($_.WaitReason)" } |
+            ForEach-Object { "$($_.Name)x$($_.Count)" }
+          Write-Host "RExec timeout: threads pid=$($_.ProcessId) $($_.Name): $($waits -join ' ')"
+        } catch { }
+      }
+    Write-MachineSnapshot 'timeout'
+    Get-WinEvent -FilterHashtable @{ LogName = 'Application', 'System'
+                                     StartTime = $since.AddSeconds(-5) } `
+      -MaxEvents 25 -ErrorAction SilentlyContinue |
+      ForEach-Object {
+        # Provider and id only, never the message: event text is arbitrary
+        # and this log is public.
+        Write-Host ("RExec timeout: event {0:HH:mm:ss} {1} {2} id={3} level={4}" -f
+          $_.TimeCreated, $_.LogName, $_.ProviderName, $_.Id, $_.LevelDisplayName)
+      }
     try { $p.Kill($true) } catch { }
     $p.WaitForExit()
     Write-Host "RExec timeout: argv tail: $($tail -join ' ')"
@@ -243,6 +296,7 @@ try {
   # This is the first pwsh started as the sandbox user. 120s, and the
   # elapsed time in the log, to tell a slow first start from one that never
   # finishes.
+  Write-MachineSnapshot 'before-R5b'
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
     "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portInR); Write-Output CONNECTED } " +
