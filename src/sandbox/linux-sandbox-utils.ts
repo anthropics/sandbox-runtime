@@ -2233,14 +2233,6 @@ async function generateFilesystemArgs(
       allowGitConfig,
       abortSignal,
     )
-    // What to bind where one of those is absent, keyed by the spelling the
-    // scan produced it with: a caller's own denyWrite that ends in the same
-    // name is not a git directory's and keeps the /dev/null placeholder.
-    const gitRedirectStubs = new Map<string, string>()
-    for (const denyPath of mandatoryDenyPaths) {
-      const contents = gitRedirectPlaceholder(denyPath)
-      if (contents !== undefined) gitRedirectStubs.set(denyPath, contents)
-    }
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
@@ -2614,13 +2606,15 @@ async function generateFilesystemArgs(
           // of /dev/null. This prevents the component from appearing as a file
           // which breaks tools that expect to traverse it as a directory.
           const isIntermediate = firstNonExistent !== normalizedPath
-          // A placeholder git reads, where the leaf is a path it reads: a
-          // commondir it cannot read makes git refuse to run at all, so every
-          // command in the repository would fail rather than just the write
-          // this deny is for. Everything else keeps /dev/null.
+          // A placeholder git reads, where the leaf is one of the files it
+          // reads back (gitRedirectPlaceholder): /dev/null there makes git
+          // refuse to run in the repository at all, not just refuse the write
+          // this deny is for. Decided from the resolved path, which every
+          // spelling of one file shares, rather than from the deny entry:
+          // a caller's own denyWrite naming the same file must not miss it.
           const gitRedirectStub = isIntermediate
             ? undefined
-            : gitRedirectStubs.get(pathPattern)
+            : gitRedirectPlaceholder(normalizedPath)
           const source = isIntermediate
             ? (emptySource ??= ensureEmptyMountSourceDir())
             : gitRedirectStub === undefined
@@ -2713,7 +2707,7 @@ async function generateFilesystemArgs(
         // an empty file until it is cleaned up: binding that would deny the
         // same write and cost the repository every git command, since git
         // refuses to run at all against a commondir it cannot read.
-        const gitRedirectStub = gitRedirectStubs.get(pathPattern)
+        const gitRedirectStub = gitRedirectPlaceholder(normalizedPath)
         denyWriteArgs.push(
           '--ro-bind',
           gitRedirectStub !== undefined && isEmptyFile(normalizedPath)

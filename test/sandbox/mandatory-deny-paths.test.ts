@@ -1927,6 +1927,17 @@ describe('Git metadata deny paths - Unit Tests', () => {
     expect(gitRedirectPlaceholder('/repo/.git/hooks')).toBeUndefined()
   })
 
+  it('gives a placeholder to the denied files that need one, and no others', () => {
+    // Both lists come off one table, so a redirect file added to it is
+    // denied AND has a stand-in: neither can gain an entry the other misses,
+    // which is how a new one would end up mounted from /dev/null.
+    expect(
+      gitDirDenyPaths('/repo/.git', false).filter(
+        denyPath => gitRedirectPlaceholder(denyPath) !== undefined,
+      ),
+    ).toEqual(['/repo/.git/commondir', '/repo/.git/config.worktree'])
+  })
+
   it('follows a pointer to the git directory it names', () => {
     const gitDir = makeGitDir(join(dir, 'gitdir'))
     const pointer = makePointer('checkout', '../gitdir')
@@ -2480,20 +2491,36 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     return checkout
   }
 
-  function wrapIn(checkout: string, command = 'true'): Promise<string> {
+  function wrapIn(
+    checkout: string,
+    command = 'true',
+    denyWithinAllow: string[] = [],
+  ): Promise<string> {
     process.chdir(checkout)
     return wrapCommandWithSandboxLinux({
       command,
       needsNetworkRestriction: false,
       allowAllUnixSockets: true,
       readConfig: undefined,
-      writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+      writeConfig: { allowOnly: [checkout], denyWithinAllow },
     })
   }
 
-  /** What bwrap is given to mount at `dest`, of the words `--flag src dest`. */
-  function mountSource(command: string, dest: string): string | undefined {
-    return lastMountAt(command, dest)?.split(' ')[1]
+  /**
+   * What bwrap is given to mount at `dest`, of the words `--flag src dest`.
+   * Throws where nothing is mounted there, so an assertion about the source
+   * cannot pass, or read as undefined, on a wrap that emitted no such mount.
+   */
+  function mountSource(command: string, dest: string): string {
+    const mount = lastMountAt(command, dest)
+    if (mount === undefined) {
+      throw new Error(`nothing is mounted at ${dest}`)
+    }
+    const [, source, mounted] = mount.split(' ')
+    if (source === undefined || mounted !== dest) {
+      throw new Error(`the mount at ${dest} has no source: ${mount}`)
+    }
+    return source
   }
 
   it('binds a commondir that is not there from a placeholder holding "."', async () => {
@@ -2502,9 +2529,21 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
 
     const source = mountSource(await wrapIn(checkout), commondir)
 
-    expect(source).toBeDefined()
     expect(source).not.toBe('/dev/null')
-    expect(readFileSync(source as string, 'utf8')).toBe('.\n')
+    expect(readFileSync(source, 'utf8')).toBe('.\n')
+  })
+
+  it('reads the placeholder off the file, not off the deny entry', async () => {
+    // A caller's own deny for the same file comes first and wins the dedup,
+    // so the decision has to be made from the path the entry resolves to:
+    // made from the entry's spelling, this one missed and bound /dev/null,
+    // and the repository lost every git command for the length of the wrap.
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+
+    const command = await wrapIn(checkout, 'true', ['./.git/commondir/'])
+
+    expect(readFileSync(mountSource(command, commondir), 'utf8')).toBe('.\n')
   })
 
   it('binds a commondir that is there from itself', async () => {
@@ -2526,7 +2565,7 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     const source = mountSource(await wrapIn(checkout), commondir)
 
     expect(source).not.toBe(commondir)
-    expect(readFileSync(source as string, 'utf8')).toBe('.\n')
+    expect(readFileSync(source, 'utf8')).toBe('.\n')
   })
 
   it('leaves every other absent deny on /dev/null', async () => {

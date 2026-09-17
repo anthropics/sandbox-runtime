@@ -89,47 +89,75 @@ export interface SubmoduleScan {
 }
 
 /**
+ * The files inside a git directory that send git to a git directory or a
+ * config other than the one it opened, and what must stand in for one where
+ * it does not exist.
+ *
+ * Denying a path that is not there means mounting something at it, and git
+ * reads whichever of these two it finds: it refuses to run at all against a
+ * `commondir` it cannot read, which both an empty file and a bound /dev/null
+ * are (git rejects a commondir it reads zero bytes from, and a bind mount
+ * carries nodev, so the device is unreadable). Each placeholder is what git
+ * concludes with the file absent: `.` makes git resolve the git directory it
+ * opened as its own common directory, and an empty `config.worktree` reads as
+ * no worktree config at all.
+ *
+ * That is not invisible. The file's mere existence sets git's
+ * `different_commondir`, so `git rev-parse --git-common-dir` and `--git-path`
+ * print the absolute real path where they printed a relative one, and a
+ * script that compares `--git-dir` with `--git-common-dir` to decide "this is
+ * a linked worktree" answers yes for an ordinary repository while the deny
+ * stands. No content avoids that: the alternative is git refusing to run.
+ *
+ * An empty placeholder also says that an empty file at that path is a
+ * legitimate one to leave alone; a non-empty placeholder says the opposite,
+ * which is what lets the Linux backend repair an empty `commondir` (see
+ * `gitRedirectMountPoint` in src/sandbox/linux-sandbox-utils.ts).
+ */
+const GIT_REDIRECT_FILES: ReadonlyArray<{
+  name: string
+  placeholder: string
+  /** Denied even where the caller allows writes to the git config. */
+  deniedWithConfigAllowed: boolean
+}> = [
+  // Moves the hooks and config git reads to another directory entirely.
+  { name: 'commondir', placeholder: '.\n', deniedWithConfigAllowed: true },
+  // Read instead of `config` wherever extensions.worktreeConfig is on.
+  { name: 'config.worktree', placeholder: '', deniedWithConfigAllowed: false },
+]
+
+/**
  * The paths inside a git directory through which a write becomes code the
- * host's git runs later: hooks/ always, `commondir` always (it redirects the
- * hooks and config git reads to another directory entirely), and config plus
- * `config.worktree` (core.fsmonitor, core.editor, core.hooksPath and the
- * like, the latter read when extensions.worktreeConfig is on) unless the
- * caller allows config writes.
+ * host's git runs later: hooks/ always, config (core.fsmonitor, core.editor,
+ * core.hooksPath and the like) unless the caller allows config writes, and
+ * the redirect files of {@link GIT_REDIRECT_FILES}, each under the same
+ * condition as the file it redirects.
  */
 export function gitDirDenyPaths(
   gitDir: string,
   allowGitConfig: boolean,
 ): string[] {
-  const denyPaths = [path.join(gitDir, 'hooks'), path.join(gitDir, 'commondir')]
+  const redirectFiles = (deniedWithConfigAllowed: boolean): string[] =>
+    GIT_REDIRECT_FILES.filter(
+      file => file.deniedWithConfigAllowed === deniedWithConfigAllowed,
+    ).map(file => path.join(gitDir, file.name))
+
+  const denyPaths = [path.join(gitDir, 'hooks'), ...redirectFiles(true)]
   if (!allowGitConfig) {
-    denyPaths.push(
-      path.join(gitDir, 'config'),
-      path.join(gitDir, 'config.worktree'),
-    )
+    denyPaths.push(path.join(gitDir, 'config'), ...redirectFiles(false))
   }
   return denyPaths
 }
 
 /**
- * What must stand in for `denyPath` where it does not exist, or undefined
- * for a path git does not read this way. Denying an absent path means
- * mounting something at it, and git reads whichever of these two it finds:
- * it refuses to run at all against a `commondir` it cannot read, which an
- * empty one and a bound /dev/null both are (git rejects a commondir it reads
- * zero bytes from, and a bind mount carries nodev, so the device is
- * unreadable). `.` is where git looks when a git directory has no commondir
- * - the git directory itself - and no config.worktree reads the same as an
- * empty one, so both placeholders leave git doing what it already does.
+ * What must stand in for `denyPath` where it does not exist, or undefined for
+ * a path git does not read this way. Decided by the basename, so every
+ * spelling of one path - a tilde, a relative form, a trailing slash, a
+ * symlinked prefix - answers the same. See {@link GIT_REDIRECT_FILES}.
  */
 export function gitRedirectPlaceholder(denyPath: string): string | undefined {
-  switch (path.basename(denyPath)) {
-    case 'commondir':
-      return '.\n'
-    case 'config.worktree':
-      return ''
-    default:
-      return undefined
-  }
+  const name = path.basename(denyPath)
+  return GIT_REDIRECT_FILES.find(file => file.name === name)?.placeholder
 }
 
 /**
