@@ -3,7 +3,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
@@ -16,6 +16,7 @@ import {
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
   encodeSandboxedCommand,
+  attributionKeyFor,
   DANGEROUS_FILES,
   isAbsenceErrno,
   isAtOrUnder,
@@ -270,28 +271,24 @@ function findFirstNonExistentComponent(targetPath: string): string {
 }
 
 /**
- * Get mandatory deny paths using ripgrep (Linux only).
- * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
- * With --max-depth limiting, this is fast enough to run on each command without memoization.
+ * The part of the mandatory deny set that follows from the cwd alone: the
+ * dangerous files and directories resolved against it, plus `.git/hooks` and
+ * (unless the caller allows git config) `.git/config`.
+ * {@link linuxGetMandatoryDenyPaths} adds the nested matches its ripgrep scan
+ * finds on top of these. Split out so a consumer that must not scan — the
+ * violation monitor, which needs the same denies to judge a write bwrap
+ * refuses — reads the same definition rather than a copy of it.
  */
-async function linuxGetMandatoryDenyPaths(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
-  maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
+export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
-  abortSignal?: AbortSignal,
-): Promise<string[]> {
+): string[] {
   const cwd = process.cwd()
-  // Use provided signal or create a fallback controller
-  const fallbackController = new AbortController()
-  const signal = abortSignal ?? fallbackController.signal
-  const dangerousDirectories = getDangerousDirectories()
-
   // Note: Settings files are added at the callsite in sandbox-manager.ts
   const denyPaths = [
     // Dangerous files in CWD
     ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
     // Dangerous directories in CWD
-    ...dangerousDirectories.map(d => path.resolve(cwd, d)),
+    ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
   ]
 
   // Git hooks and config are only denied when .git exists as a directory.
@@ -316,6 +313,28 @@ async function linuxGetMandatoryDenyPaths(
       denyPaths.push(path.resolve(cwd, '.git/config'))
     }
   }
+
+  return denyPaths
+}
+
+/**
+ * Get mandatory deny paths using ripgrep (Linux only).
+ * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
+ * With --max-depth limiting, this is fast enough to run on each command without memoization.
+ */
+async function linuxGetMandatoryDenyPaths(
+  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
+  allowGitConfig = false,
+  abortSignal?: AbortSignal,
+): Promise<string[]> {
+  const cwd = process.cwd()
+  // Use provided signal or create a fallback controller
+  const fallbackController = new AbortController()
+  const signal = abortSignal ?? fallbackController.signal
+  const dangerousDirectories = getDangerousDirectories()
+
+  const denyPaths = linuxGetCwdMandatoryDenyPaths(allowGitConfig)
 
   // Build iglob args for all patterns in one ripgrep call
   const iglobArgs: string[] = []
@@ -463,46 +482,119 @@ function isStaleBwrapMountPoint(p: string): boolean {
   }
 }
 
-const CAP_SETFCAP = 31
+export const CAP_SETFCAP = 31
 
-/** Whether this process holds `cap` in its effective set (Linux). */
-function processHasEffectiveCapability(cap: number): boolean {
-  try {
-    const status = fs.readFileSync('/proc/self/status', 'utf8')
-    const capEff = status.match(/^CapEff:\s*([0-9a-fA-F]+)\s*$/m)
-    if (!capEff) return false
-    return ((BigInt('0x' + capEff[1]) >> BigInt(cap)) & 1n) === 1n
-  } catch {
-    return false
+// This process's bounding set unioned with its inheritable set, read once —
+// see processHasBoundingCapability for why those two. Only prctl(CAPBSET_DROP)
+// and capset move them and this library calls neither, and without the memo
+// the read is a synchronous open of /proc/self/status on the path of every
+// wrapped command. Only a successful read is stored, so a transient failure
+// does not latch "no capabilities" for the life of the process.
+let boundingCapabilities: bigint | undefined
+let capabilityReadFailureLogged = false
+
+/**
+ * Whether this process holds `cap` in its bounding or inheritable set (Linux).
+ *
+ * bwrap is reached by execve, and for a euid-0 caller the kernel recomputes
+ * the new permitted set from the bounding and inheritable sets, discarding
+ * what the caller itself had permitted. Those two sets are therefore what
+ * decides which capabilities bwrap holds when it writes its uid map; CapPrm
+ * and CapEff do not, and for any process itself reached by exec as root they
+ * merely repeat the union.
+ */
+export function processHasBoundingCapability(cap: number): boolean {
+  let bits = boundingCapabilities
+  if (bits === undefined) {
+    let failure = 'has no CapBnd or CapInh line'
+    try {
+      bits = boundingCapabilitiesFromStatus(
+        fs.readFileSync('/proc/self/status', 'utf8'),
+      )
+      boundingCapabilities = bits
+    } catch (e) {
+      failure = `could not be read (${String(e)})`
+    }
+    if (bits === undefined) {
+      if (!capabilityReadFailureLogged) {
+        capabilityReadFailureLogged = true
+        logForDebugging(
+          `[Sandbox Linux] /proc/self/status ${failure} - assuming this process holds no capabilities`,
+          { level: 'warn' },
+        )
+      }
+      return false
+    }
   }
+  return ((bits >> BigInt(cap)) & 1n) === 1n
 }
 
 /**
- * Capability arguments: the command holds no capability in bwrap's user
- * namespace. For a non-root caller that is bwrap's default and the drop is a
- * no-op; bwrap run by uid 0 hands the command every capability the caller
- * holds unless told otherwise, and inside bwrap's user namespace
- * CAP_SYS_ADMIN is enough to unmount a read-deny tmpfs or a write-deny bind,
- * or remount / read-write: the whole filesystem policy. The one exception,
- * for a root caller while the seccomp helper is in use and the caller has
- * it, is CAP_SETFCAP: the helper's nested user namespace must map uid 0,
- * which the kernel (5.12+) permits only when the namespace's creator held
- * CAP_SETFCAP. The helper loses it on entering that namespace, so the
- * command itself runs with no capability in bwrap's namespace and full ones
- * only in a nested namespace whose copies of these mounts are locked. A
- * non-root caller may not add a capability.
+ * The capability set an execve gives a euid-0 caller's child, parsed out of a
+ * `/proc/<pid>/status`: CapBnd unioned with CapInh. `undefined` when either
+ * line is absent. CapPrm and CapEff are deliberately not consulted — see
+ * processHasBoundingCapability.
  */
-function capabilityArgs(usesSeccompHelper: boolean): string[] {
+export function boundingCapabilitiesFromStatus(
+  status: string,
+): bigint | undefined {
+  const bounding = status.match(/^CapBnd:\s*([0-9a-fA-F]+)\s*$/m)
+  const inheritable = status.match(/^CapInh:\s*([0-9a-fA-F]+)\s*$/m)
+  return bounding && inheritable
+    ? BigInt('0x' + bounding[1]) | BigInt('0x' + inheritable[1])
+    : undefined
+}
+
+/**
+ * The bwrap capability list. Always `--cap-drop ALL`, which for a non-root
+ * caller is bwrap's default anyway. `--cap-add CAP_SETFCAP` for the whole
+ * bwrap invocation — the outer shell and the two socat relays hold it too —
+ * when the caller is uid 0, the seccomp helper is in use and the capability
+ * survives into bwrap: the helper's nested user namespace maps uid 0, which
+ * Linux 5.12 and the distribution kernels that backported it allow only from
+ * a creator holding CAP_SETFCAP. Under the helper a uid-0 caller's command
+ * therefore has a full set inside that nested namespace, which is
+ * identity-mapped to the caller's uid 0, and the filesystem policy there
+ * rests on the nested namespace's mount copies being locked. Without the
+ * helper (`allowAllUnixSockets`, or no usable helper binary) the command runs
+ * in bwrap's own namespaces and `--cap-drop ALL` is what stops it unmounting
+ * a deny.
+ *
+ * Pure: `hasSetfcap` is decided by the caller, which is also where the
+ * missing-capability case is reported once per process.
+ */
+export function capabilityArgs({
+  euid,
+  hasSetfcap,
+  usesSeccompHelper,
+}: {
+  euid: number | undefined
+  hasSetfcap: boolean
+  usesSeccompHelper: boolean
+}): string[] {
   const args = ['--cap-drop', 'ALL']
-  if (
-    usesSeccompHelper &&
-    process.geteuid?.() === 0 &&
-    processHasEffectiveCapability(CAP_SETFCAP)
-  ) {
-    args.push('--cap-add', 'CAP_SETFCAP')
-  }
+  if (euid !== 0) return args
+  if (!hasSetfcap) return args
+  if (usesSeccompHelper) args.push('--cap-add', 'CAP_SETFCAP')
   return args
 }
+
+// Latch for the predicted case: once per process, not once per command.
+let setfcapMissingLogged = false
+
+// A uid-0 caller whose bounding set lacks CAP_SETFCAP cannot sandbox
+// anything: bwrap's own --unshare-user writes a uid map containing uid 0, and
+// so does the seccomp helper's nested namespace, and a kernel that enforces
+// the requirement refuses both unless the namespace's creator held the
+// capability. allowAllUnixSockets does not avoid it — it only drops the
+// helper, not bwrap's own user namespace. Worded for both the predicted case
+// (the debug warning on the path of a wrapped command) and the confirmed one
+// (checkLinuxDependencies, after bubblewrap has actually refused).
+export const CAP_SETFCAP_MISSING_MESSAGE =
+  "running as uid 0 without CAP_SETFCAP in this process's capability bounding set - on " +
+  'kernels that enforce the CAP_SETFCAP requirement for mapping uid 0 into a user namespace ' +
+  '(Linux 5.12 and distribution backports) every sandboxed command fails while writing a uid ' +
+  'map ("Operation not permitted"). Grant CAP_SETFCAP to this process, or run as a non-root user'
 
 /**
  * Linux's per-argument cap, MAX_ARG_STRLEN: 32 pages, so 128 KiB on most
@@ -643,6 +735,57 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** Why a bubblewrap profile could not be run. */
+export type LinuxSandboxProfileErrorCode =
+  /** More arguments than bubblewrap parses, on the line or through a file. */
+  | 'too_many_arguments'
+  /** A mount path holds a NUL byte, which no carrier of arguments can hold. */
+  | 'nul_in_path'
+  /**
+   * No unnamed file could be opened to carry the mounts: passing (this
+   * process is out of descriptors) or lasting (no directory on this host
+   * takes one). The error on `.cause` names each directory tried and what it
+   * said.
+   */
+  | 'args_file_unavailable'
+  /** The line does not fit one shell argument even with the mounts in a file. */
+  | 'command_too_long'
+
+/**
+ * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
+ * configuration expands to is past a limit, or, for `command_too_long` and
+ * `nul_in_path`, what the caller passed in is. The command was not run and no
+ * profile file stays open, so do not run the per-command cleanup
+ * (`cleanupAfterCommand()`, `cleanupBwrapMountPoints()`) for a wrap that
+ * threw: it would release a second time, and a sandbox still running would
+ * lose its mount points. Branch on `.code`, never on `.message`, which
+ * carries the sizes of the moment. Other wrap-time failures (a shell that is
+ * not on PATH, a bridge socket that is gone) are plain Errors.
+ */
+export class LinuxSandboxProfileError extends Error {
+  readonly code: LinuxSandboxProfileErrorCode
+  declare readonly cause?: unknown
+  constructor(
+    code: LinuxSandboxProfileErrorCode,
+    message: string,
+    cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'LinuxSandboxProfileError'
+    this.code = code
+    if (cause !== undefined) {
+      // Non-enumerable, as a native `cause` is. Once the compile target is
+      // ES2022 this is `super(message, { cause })`.
+      Object.defineProperty(this, 'cause', {
+        value: cause,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      })
+    }
+  }
+}
+
 /**
  * The shell string that runs bwrap with `bwrapArgs`, which the caller runs
  * as one argument of `sh -c`. When that would not fit the kernel's
@@ -652,8 +795,7 @@ function errorText(error: unknown): string {
  * again through /proc. Every other word, the per-command environment and the
  * command among them, stays on the line. The result stays a simple command,
  * so a prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
- * Throws when the profile cannot run: too many words for bwrap, no unnamed
- * file to put the mounts in, or a line too long even without them.
+ * Throws {@link LinuxSandboxProfileError} when the profile cannot run.
  */
 function renderBwrapInvocation(
   bwrapBinary: string,
@@ -661,8 +803,18 @@ function renderBwrapInvocation(
   mounts: { start: number; end: number },
 ): string {
   if (bwrapArgs.length > BWRAP_MAX_ARGS) {
-    throw new Error(
-      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts); reduce the number of paths the configuration expands to`,
+    throw new LinuxSandboxProfileError(
+      'too_many_arguments',
+      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts); reduce what the configuration expands to: each path takes about three arguments, each environment variable two`,
+    )
+  }
+  const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
+  // A command line ends at a NUL and bwrap splits an args file on one, so the
+  // word is cut short on the line and becomes several options in the file.
+  if (mountWords.some(word => word.includes('\0'))) {
+    throw new LinuxSandboxProfileError(
+      'nul_in_path',
+      'Sandbox profile contains a path with a NUL byte, which neither a command line nor a file of bwrap arguments can carry',
     )
   }
   const inline = quote([bwrapBinary, ...bwrapArgs])
@@ -675,23 +827,19 @@ function renderBwrapInvocation(
   const tooLong = `Sandbox profile is too long for the command line (${inlineBytes} bytes; past ${limit - ARG_HEADROOM_BYTES} it goes through a file)`
   // `--args <fd>` are two more words.
   if (bwrapArgs.length + 2 > BWRAP_MAX_ARGS) {
-    throw new Error(
+    throw new LinuxSandboxProfileError(
+      'too_many_arguments',
       `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts`,
-    )
-  }
-  const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
-  if (mountWords.some(word => word.includes('\0'))) {
-    // bwrap splits the file on NUL: the word would become several options.
-    throw new Error(
-      `${tooLong} and contains a path with a NUL byte, which a file of bwrap arguments cannot carry`,
     )
   }
   let argsFd: number
   try {
     argsFd = openBwrapArgsProfile(mountWords)
   } catch (error) {
-    throw new Error(
+    throw new LinuxSandboxProfileError(
+      'args_file_unavailable',
       `${tooLong} and cannot be passed through a file: ${errorText(error)}`,
+      error,
     )
   }
   // /bin/sh opens the profile on the fd and execs bwrap, which reads it to
@@ -711,7 +859,8 @@ function renderBwrapInvocation(
   const viaArgsFileBytes = Buffer.byteLength(viaArgsFile, 'utf8')
   if (viaArgsFileBytes > limit) {
     closeBwrapArgsProfile(argsFd)
-    throw new Error(
+    throw new LinuxSandboxProfileError(
+      'command_too_long',
       `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})`,
     )
   }
@@ -907,11 +1056,13 @@ export function checkLinuxDependencies(
 
   // An explicit override is a directive, not a hint — if it doesn't exist,
   // surface that rather than silently falling back to PATH.
+  let usableBwrap: string | null = null
   if (bwrapPath) {
-    if (!isExecutable(bwrapPath))
-      errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
-  } else if (whichSync('bwrap') === null) {
-    errors.push('bubblewrap (bwrap) not installed')
+    if (isExecutable(bwrapPath)) usableBwrap = bwrapPath
+    else errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
+  } else {
+    usableBwrap = whichSync('bwrap')
+    if (usableBwrap === null) errors.push('bubblewrap (bwrap) not installed')
   }
 
   if (socatPath) {
@@ -928,7 +1079,78 @@ export function checkLinuxDependencies(
     warnings.push('seccomp not available - unix socket access not restricted')
   }
 
+  const uid0Error = uid0SandboxError({
+    euid: process.geteuid?.(),
+    hasSetfcap: processHasBoundingCapability(CAP_SETFCAP),
+    bwrap: usableBwrap,
+  })
+  if (uid0Error !== null) errors.push(uid0Error)
+
   return { warnings, errors }
+}
+
+/**
+ * Predict, then confirm. The prediction — uid 0 with no CAP_SETFCAP to hand
+ * to bwrap — is exact about the capability but not about the kernel, so ask
+ * bubblewrap itself before failing the caller's initialize(). An error, not a
+ * warning: if it holds, every sandboxed command fails.
+ *
+ * `bwrap === null` skips the probe: a missing or unusable bubblewrap is
+ * already its own dependency error, and a second one about capabilities would
+ * only misdirect.
+ */
+export function uid0SandboxError({
+  euid,
+  hasSetfcap,
+  bwrap,
+}: {
+  euid: number | undefined
+  hasSetfcap: boolean
+  bwrap: string | null
+}): string | null {
+  if (euid !== 0 || hasSetfcap || bwrap === null) return null
+  const refusal = probeUid0UserNamespace(bwrap)
+  if (refusal === null) return null
+  return refusal === ''
+    ? CAP_SETFCAP_MISSING_MESSAGE
+    : `${CAP_SETFCAP_MISSING_MESSAGE} (bubblewrap: ${refusal})`
+}
+
+// One probe result per bwrap binary: whether a uid-0 map is refused is a
+// property of the kernel and the binary, not of the moment. Keyed by path so
+// a caller that passes an explicit bwrapPath is not answered for another one.
+const uid0UserNamespaceProbes = new Map<string, string | null>()
+
+/**
+ * Run `bwrap --unshare-user --dev-bind / / true` once and report whether this
+ * kernel actually refuses to map uid 0. `null` means it does not, so there is
+ * nothing to report; otherwise bubblewrap's own first stderr line, or the
+ * empty string when the probe could not be run at all and the prediction
+ * stands unaided.
+ */
+function probeUid0UserNamespace(bwrap: string): string | null {
+  const cached = uid0UserNamespaceProbes.get(bwrap)
+  if (cached !== undefined) return cached
+
+  const probe = spawnSync(
+    bwrap,
+    ['--unshare-user', '--dev-bind', '/', '/', 'true'],
+    {
+      timeout: 5000,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      encoding: 'utf8',
+    },
+  )
+  const refusal =
+    probe.error === undefined && probe.status === 0
+      ? null
+      : ((probe.stderr ?? '')
+          .split('\n')
+          .map(line => line.trim())
+          .find(line => line.length > 0)
+          ?.slice(0, 200) ?? '')
+  uid0UserNamespaceProbes.set(bwrap, refusal)
+  return refusal
 }
 
 /**
@@ -2758,6 +2980,11 @@ async function generateFilesystemArgs(
  * - To use sandboxing without Unix socket blocking on unsupported architectures,
  *   set allowAllUnixSockets: true in your configuration
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
+ *
+ * CALLER OBLIGATION: the euid and capability decisions behind the returned
+ * string are made here, in the process that builds it, so the string must be
+ * run by a process with the same euid and the same capability bounding and
+ * inheritable sets.
  */
 export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
@@ -2824,6 +3051,14 @@ export async function wrapCommandWithSandboxLinux(
   // decrements so the count does not leak.
   activeSandboxCount++
 
+  // One encoded key for both carriers below (SRT_ENCODED_CMD for the seccomp
+  // observer, the proxy username for network denies), so a violation seen
+  // through either resolves to the same registry entry. macOS derives its log
+  // tag from a single key the same way.
+  const attributionKey = encodeSandboxedCommand(
+    attributionKeyFor(command, commandId),
+  )
+
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let applySeccompPrefix: string | undefined
 
@@ -2863,11 +3098,7 @@ export async function wrapCommandWithSandboxLinux(
         bwrapArgs.push('--setenv', 'SRT_OBSERVE_SOCK', observeSocketPath)
         // Tag events with the encoded command so the violation store can
         // associate them with this invocation (parity with macOS log tag).
-        bwrapArgs.push(
-          '--setenv',
-          'SRT_ENCODED_CMD',
-          encodeSandboxedCommand(commandId ?? command),
-        )
+        bwrapArgs.push('--setenv', 'SRT_ENCODED_CMD', attributionKey)
       } else {
         logForDebugging(
           '[Sandbox Linux] observe socket missing — supervisor not running; ' +
@@ -2951,7 +3182,7 @@ export async function wrapCommandWithSandboxLinux(
           caCertPath,
           proxyAuthToken,
           writeConfig === undefined,
-          encodeSandboxedCommand(commandId ?? command),
+          attributionKey,
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {
@@ -3024,15 +3255,22 @@ export async function wrapCommandWithSandboxLinux(
     // --unshare-user in both modes: bwrap only auto-creates a userns when
     // EUID != 0. A root parent in an unprivileged container (Docker's
     // default: EUID=0 without CAP_SYS_ADMIN) would otherwise try a direct
-    // clone and EPERM; a root parent WITH capabilities would leave the
-    // command holding them, CAP_SYS_ADMIN included, which unmounts any deny
-    // in this namespace — hence capabilityArgs in both modes as well.
-    // apply-seccomp creates its own nested userns to obtain CAP_SYS_ADMIN
-    // for its PID+mount unshare (see below); for a root caller that needs
-    // the one capability capabilityArgs keeps.
+    // clone and EPERM.
+    const euid = process.geteuid?.()
+    const hasSetfcap = processHasBoundingCapability(CAP_SETFCAP)
+    if (euid === 0 && !hasSetfcap && !setfcapMissingLogged) {
+      setfcapMissingLogged = true
+      logForDebugging(`[Sandbox Linux] ${CAP_SETFCAP_MISSING_MESSAGE}`, {
+        level: 'warn',
+      })
+    }
     bwrapArgs.push(
       '--unshare-user',
-      ...capabilityArgs(applySeccompPrefix !== undefined),
+      ...capabilityArgs({
+        euid,
+        hasSetfcap,
+        usesSeccompHelper: applySeccompPrefix !== undefined,
+      }),
     )
     if (!enableWeakerNestedSandbox) {
       // Mount fresh /proc if PID namespace is isolated (secure mode).
