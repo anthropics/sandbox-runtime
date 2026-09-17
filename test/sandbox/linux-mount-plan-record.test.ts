@@ -10,9 +10,12 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  wrapCommandWithSandboxLinux,
+  cleanupBwrapMountPoints,
+} from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
-import { countBinds } from '../helpers/bwrap-argv.js'
+import { countMounts } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
 // Argument-level checks, plus one "(live bwrap)" arm per symlink shape: this
@@ -30,6 +33,7 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
 
   const created: string[] = []
   afterEach(() => {
+    cleanupBwrapMountPoints({ force: true })
     for (const dir of created.splice(0)) {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -107,7 +111,11 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     const deniedTmpfs = wrapped.indexOf(`--tmpfs ${deniedDir} `)
     expect(deniedTmpfs).toBeGreaterThan(-1)
     expect(wrapped.lastIndexOf(writeRootBind)).toBeGreaterThan(deniedTmpfs)
-    expect(wrapped.indexOf(`--tmpfs ${secretLink} `)).toBeGreaterThan(
+    // The secret directory's tmpfs goes where the link leads, not on the
+    // link.
+    const secretDir = join(proj, 'a/t/w/secret-dir')
+    expect(wrapped).not.toContain(`--tmpfs ${secretLink} `)
+    expect(wrapped.indexOf(`--tmpfs ${secretDir} `)).toBeGreaterThan(
       wrapped.lastIndexOf(writeRootBind),
     )
     expect(wrapped.indexOf(`--ro-bind ${file} ${file}`)).toBeGreaterThan(
@@ -148,7 +156,7 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     // The pin sits beneath W's first (allow) bind and every tmpfs.
     expect(wrapped.indexOf(gitPin)).toBeLessThan(wrapped.indexOf(wBind))
     expect(wrapped.indexOf(gitPin)).toBeLessThan(
-      wrapped.indexOf(`--tmpfs ${join(proj, 's')}`),
+      wrapped.indexOf(`--tmpfs ${writeRoot}`),
     )
   })
 
@@ -179,7 +187,10 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     )
   })
 
-  it('keeps a symlink-spelled file mask when a denyWrite names its canonical location', async () => {
+  it('masks a symlink-spelled file where it resolves, and drops the denyWrite bind naming that location', async () => {
+    // The mask goes to the canonical location, so the write deny on that
+    // same location has nothing left to add: /dev/null is read-only, and
+    // re-binding the real file on top would undo the mask.
     const proj = tempTree({ 'data/secrets/key.pem': 'SECRET' })
     symlinkSync(join(proj, 'data/secrets'), join(proj, 'secrets'))
     const rawSpelling = join(proj, 'secrets', 'key.pem')
@@ -189,7 +200,8 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       readConfig: { denyOnly: [rawSpelling], allowWithinDeny: [] },
       writeConfig: { allowOnly: [proj], denyWithinAllow: [canonical] },
     })
-    expect(wrapped).toContain(`--ro-bind /dev/null ${rawSpelling}`)
+    expect(wrapped).toContain(`--ro-bind /dev/null ${canonical}`)
+    expect(wrapped).not.toContain(`--ro-bind /dev/null ${rawSpelling}`)
     expect(wrapped).not.toContain(`--ro-bind ${canonical} ${canonical}`)
   })
 
@@ -235,7 +247,7 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     const dataPin = `--ro-bind ${join(proj, 'data')} ${join(proj, 'data')}`
     expect(wrapped).toContain(parentPin)
     expect(wrapped).toContain(dataPin)
-    const maskBind = `--ro-bind /dev/null ${rawSpelling}`
+    const maskBind = `--ro-bind /dev/null ${join(canonicalParent, 'key.pem')}`
     const first = wrapped.indexOf(maskBind)
     expect(first).toBeGreaterThan(-1)
     // No pin lands over the mask, so it is never re-applied.
@@ -258,7 +270,6 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     return {
       proj,
       lib,
-      carveOut,
       wrap: (command: string) =>
         wrapCommandWithSandboxLinux({
           ...baseParams,
@@ -321,16 +332,16 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     }
   }
 
-  it('spells a read-deny mount by where it lands once an earlier tmpfs has hidden its symlink target', async () => {
+  it('emits one mount for a symlinked entry whose target an earlier tmpfs already hides', async () => {
+    // bin resolves to usr/bin, which the tmpfs on usr already hides, so a
+    // second mount there would be created inside that tmpfs and change
+    // nothing. Mounting on the link itself is what bubblewrap 0.12 refuses.
     const { bin, usr, wrap } = mergedUsrBothDenied()
 
     const wrapped = await wrap('true')
 
-    const usrTmpfs = wrapped.indexOf(`--tmpfs ${usr} `)
-    expect(usrTmpfs).toBeGreaterThan(-1)
-    expect(wrapped.indexOf(`--tmpfs ${join(usr, 'bin')} `)).toBeGreaterThan(
-      usrTmpfs,
-    )
+    expect(wrapped).toContain(`--tmpfs ${usr} `)
+    expect(wrapped).not.toContain(`--tmpfs ${join(usr, 'bin')} `)
     expect(wrapped).not.toContain(`--tmpfs ${bin} `)
   })
 
@@ -524,16 +535,20 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(wrapped).not.toContain('--ro-bind /etc /etc')
   })
 
-  it('keeps a deny bind under the target of a denyRead symlink that an earlier tmpfs already hid', async () => {
-    // home/u/sec -> work/proj/secrets, but home/u is hidden first, so the
-    // second tmpfs is created on the first and never reaches work/proj.
+  it('denies the target of a read-deny symlink whose route an earlier tmpfs hid, and drops the write deny the tmpfs covers', async () => {
+    // home/u/sec -> work/proj/secrets, and home/u is hidden first. The entry
+    // is mounted where it resolves, so the secrets directory is hidden even
+    // though the route that named it is inside the first tmpfs. The write
+    // deny under it then needs no bind: writes into a tmpfs never reach the
+    // host, and re-binding the host directory would undo the read deny.
     const proj = tempTree({
       'work/proj/secrets/token': 'T',
       'work/proj/src.ts': 'x',
       'home/u/other': 'o',
     })
-    symlinkSync(join(proj, 'work/proj/secrets'), join(proj, 'home/u/sec'))
-    const token = join(proj, 'work/proj/secrets/token')
+    const secrets = join(proj, 'work/proj/secrets')
+    symlinkSync(secrets, join(proj, 'home/u/sec'))
+    const token = join(secrets, 'token')
     const wrapped = await wrapCommandWithSandboxLinux({
       ...baseParams,
       readConfig: {
@@ -545,10 +560,11 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
         denyWithinAllow: [token],
       },
     })
-    expect(wrapped).toContain(`--ro-bind ${token} ${token}`)
+    expect(wrapped).toContain(`--tmpfs ${secrets} `)
+    expect(wrapped).not.toContain(`--ro-bind ${token} ${token}`)
   })
 
-  it('keeps a deny bind on the target of a denyRead file symlink route that an earlier tmpfs already hid', async () => {
+  it('masks the target of a read-deny file symlink whose route an earlier tmpfs hid', async () => {
     const proj = tempTree({ 'data/key': 'K', 'home/u/x': 'x' })
     symlinkSync(join(proj, 'data'), join(proj, 'home/u/lnk'))
     const key = join(proj, 'data/key')
@@ -560,7 +576,10 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       },
       writeConfig: { allowOnly: [join(proj, 'data')], denyWithinAllow: [key] },
     })
-    expect(wrapped).toContain(`--ro-bind ${key} ${key}`)
+    // The mask is stronger than the write deny at the same place, so that
+    // bind is dropped rather than landing on top of it.
+    expect(wrapped).toContain(`--ro-bind /dev/null ${key}`)
+    expect(wrapped).not.toContain(`--ro-bind ${key} ${key}`)
   })
 
   it('seeds pins from a read-denied directory', async () => {
@@ -666,7 +685,7 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       writeConfig: { allowOnly: ['/'], denyWithinAllow: ['/'] },
     })
     // Two: the base root mount, then the deny bind that holds it read-only.
-    expect(countBinds(wrapped, '--ro-bind', '/', '/')).toBe(2)
+    expect(countMounts(wrapped, '--ro-bind', '/', '/')).toBe(2)
     expect(wrapped).toContain(`--tmpfs ${join(proj, 'hidden')} `)
     expect(wrapped).not.toContain(`/dev/null ${join(process.cwd(), '.bashrc')}`)
     expect(wrapped).not.toContain(`--ro-bind ${process.cwd()} ${process.cwd()}`)

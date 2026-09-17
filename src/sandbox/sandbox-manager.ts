@@ -46,7 +46,9 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
+  linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
+import { expandReadDenyGlobLinux } from './read-deny-glob.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -78,14 +80,17 @@ import {
 import {
   getDefaultWritePaths,
   containsGlobChars,
+  globPatternBaseDir,
+  normalizePathForSandbox,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
-  sanitizeViolationText,
+  sanitizeUnregisteredCommandKey,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -204,16 +209,14 @@ function registerCleanup(): void {
 }
 
 /**
- * Attribution key → command text for every wrapped invocation, so each
- * producer can report (and ignoreViolations can match) the command an
- * event belongs to rather than the opaque key. The key is the commandId
- * when the embedder passes one, else the command itself; either way it is
- * stored as decodeSandboxedCommand yields it (its first 100 characters).
- * Bounded FIFO: the violation store itself only retains the last 100
- * events, so long-gone invocations don't need resolving.
+ * Attribution key to command text for every wrapped invocation, so each
+ * producer can report (and ignoreViolations can match) the command an event
+ * belongs to rather than the opaque key. Keys are held decoded because that
+ * is the form the carriers deliver. Bounded FIFO: the violation store itself
+ * only retains the last 100 events, so long-gone invocations need no entry.
  */
 const MAX_COMMAND_TEXTS = 1024
-const commandTextsById = new Map<string, string>()
+const commandTextsByKey = new Map<string, string>()
 
 /** Exported for testing. */
 export function registerCommandText(
@@ -221,29 +224,30 @@ export function registerCommandText(
   options: WrapWithSandboxOptions | undefined,
 ): void {
   const key = decodeSandboxedCommand(
-    encodeSandboxedCommand(options?.commandId ?? command),
+    encodeSandboxedCommand(attributionKeyFor(command, options?.commandId)),
   )
   const text = options?.commandText ?? command
-  commandTextsById.delete(key)
-  commandTextsById.set(key, text)
-  while (commandTextsById.size > MAX_COMMAND_TEXTS) {
-    const oldest = commandTextsById.keys().next().value
+  commandTextsByKey.delete(key)
+  commandTextsByKey.set(key, text)
+  while (commandTextsByKey.size > MAX_COMMAND_TEXTS) {
+    const oldest = commandTextsByKey.keys().next().value
     if (oldest === undefined) break
-    commandTextsById.delete(oldest)
+    commandTextsByKey.delete(oldest)
   }
 }
 
 /**
- * The command text for a decoded attribution key: the registered text when
- * the key belongs to an invocation this process wrapped (the embedder's
- * own, trusted text), else the key with control characters collapsed. The
- * decoded bytes arrive over carriers the sandboxed process can write to
- * (the observe socket's event field, the macOS log tag, the proxy
- * username), so a key that was never wrapped here is untrusted and every
- * producer's fallback sanitizes it alike. Exported for testing.
+ * The command text for a decoded attribution key. Keys arrive over carriers
+ * the sandboxed process can write (the observe socket's event field, the
+ * macOS log tag, the proxy username), so only a key this process registered
+ * carries the embedder's own text; anything else is untrusted bytes.
+ * Exported for testing.
  */
-export function resolveCommandText(decodedId: string): string {
-  return commandTextsById.get(decodedId) ?? sanitizeViolationText(decodedId)
+export function resolveCommandText(decodedKey: string): string {
+  return (
+    commandTextsByKey.get(decodedKey) ??
+    sanitizeUnregisteredCommandKey(decodedKey)
+  )
 }
 
 /**
@@ -259,9 +263,6 @@ function recordProxyViolation(
   line: string,
   encodedCommand: string | undefined,
 ): void {
-  // The proxy username is client-supplied inside the sandbox (only the
-  // password is authenticated), so the decoded key is untrusted bytes and
-  // resolves through the same registry-or-sanitize path as every producer.
   const command = encodedCommand
     ? resolveCommandText(decodeSandboxedCommand(encodedCommand))
     : undefined
@@ -695,17 +696,37 @@ async function initialize(
     logForDebugging('Started macOS sandbox log monitor')
   }
   if (enableLogMonitor && getPlatform() === 'linux') {
+    // The monitor compares paths the kernel reported, so its lists are
+    // expanded the way the wrapper expands them (getFsWriteConfig folds in
+    // the default write paths and drops the globs bwrap cannot take;
+    // normalizePathForSandbox resolves `~`, relative spellings and symlinks),
+    // plus the built-in write denies the wrapper always applies.
+    // It does not reproduce the wrapper's existence and boundary-symlink
+    // filters, nor the ripgrep scan for nested dangerous paths; and it still
+    // reports writes bwrap permits through `--dev`, `--proc` and the tmpfs
+    // over each read-denied directory. Started once, so both lists are fixed
+    // at the cwd and configuration of this call.
+    const monitoredWrites = getFsWriteConfig()
     linuxMonitor = startLinuxSandboxViolationMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       {
         // apply-seccomp's observer reports every write-intent syscall
         // (allowed or not). Only paths bwrap would actually refuse — outside
         // allowWrite or inside a denyWrite carve-out — go to the store.
-        allowWritePaths: [
-          ...getDefaultWritePaths(),
-          ...config.filesystem.allowWrite,
+        allowWritePaths: monitoredWrites.allowOnly.map(p =>
+          normalizePathForSandbox(p),
+        ),
+        denyWritePaths: [
+          ...monitoredWrites.denyWithinAllow.map(p =>
+            normalizePathForSandbox(p),
+          ),
+          // filesystem.disabled reaches the wrapper as `writeConfig ===
+          // undefined`, which skips every bind and the built-in denies with
+          // them, so the monitor must not judge by them either.
+          ...(config.filesystem.disabled
+            ? []
+            : linuxGetCwdMandatoryDenyPaths(getAllowGitConfig())),
         ],
-        denyWritePaths: config.filesystem.denyWrite,
         ignoreViolations: config.ignoreViolations,
         resolveCommandText,
       },
@@ -1207,38 +1228,46 @@ function unionDenyReadPaths(
 }
 
 /**
- * Resolve read-deny spellings for this platform: bubblewrap takes no
- * globs, so on Linux a caller's pattern is expanded to the paths it
- * matches. `literalPaths` are the ones the library resolved itself (a
- * masked credential file that degraded to deny) — each names one file on
- * disk, so it is passed through whatever characters it contains. Expanded
- * as a pattern, a name holding `[` matches nothing and the deny is lost.
+ * Strip a trailing `/**` from each read-path entry and, on Linux, replace
+ * any remaining glob with what `expandGlob` returns for it (bubblewrap takes
+ * concrete paths only). Other platforms match globs natively.
+ *
+ * `literalPaths` are the ones the library resolved itself (a masked
+ * credential file that degraded to deny) — each names one file on disk, so
+ * it is passed through whatever characters it contains. Expanded as a
+ * pattern, a name holding `[` matches nothing and the deny is lost.
  */
-function resolveDenyReadPaths(
-  rawDenyRead: readonly string[],
-  literalPaths: readonly string[],
+function resolveReadPathEntries(
+  paths: readonly string[],
+  expandGlob: (pattern: string) => string[],
+  literalPaths: readonly string[] = [],
 ): string[] {
   const literal = new Set(literalPaths)
-  const denyPaths: string[] = []
-  for (const p of rawDenyRead) {
+  return paths.flatMap(p => {
     const stripped = removeTrailingGlobSuffix(p)
-    if (
-      getPlatform() === 'linux' &&
+    return getPlatform() === 'linux' &&
       !literal.has(p) &&
       containsGlobChars(stripped)
-    ) {
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      denyPaths.push(...expanded)
-    } else {
-      denyPaths.push(stripped)
-    }
-  }
-  return denyPaths
+      ? expandGlob(p)
+      : [stripped]
+  })
 }
 
+function expandAllowReadGlob(pattern: string): string[] {
+  const expanded = expandGlobPattern(pattern)
+  logForDebugging(
+    `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
+  )
+  return expanded
+}
+
+/**
+ * The read policy of the initialized config, for inspection and display.
+ * On Linux, denyRead globs are collapsed to covering directory mounts against
+ * this config's allowRead and {@link getFsWriteConfig}'s allowOnly, so
+ * `denyOnly` is only sound alongside that write config and must not be handed
+ * to wrapCommandWithSandboxLinux with a different one.
+ */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
     return { denyOnly: [], allowWithinDeny: [] }
@@ -1250,29 +1279,25 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     config.credentials,
     config.network.allowedDomains,
   )
-  const denyPaths = resolveDenyReadPaths(
+  // allowRead (re-allow within denied regions) is resolved first: the
+  // denyRead glob expansion collapses against it.
+  const allowPaths = resolveReadPathEntries(
+    config.filesystem.allowRead ?? [],
+    expandAllowReadGlob,
+  )
+  const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
+  const unlistableDenyDirs = new Set<string>()
+  const denyPaths = resolveReadPathEntries(
     unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
+    pattern =>
+      expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
     credentialRestrictions.degradeToDenyPaths,
   )
-
-  // Process allowRead paths (re-allow within denied regions)
-  const allowPaths: string[] = []
-  for (const p of config.filesystem.allowRead ?? []) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded allowRead glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      allowPaths.push(...expanded)
-    } else {
-      allowPaths.push(stripped)
-    }
-  }
 
   return {
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
+    unlistableDenyDirs: [...unlistableDenyDirs],
   }
 }
 
@@ -1647,24 +1672,13 @@ async function wrapWithSandbox(
 
     // Credential deny paths are unioned with the caller's denyRead — never
     // replacing it — so explicit filesystem restrictions always survive.
-    const expandedDenyRead = resolveDenyReadPaths(
-      unionDenyReadPaths(
-        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-        credentialRestrictions,
-      ),
-      credentialRestrictions.degradeToDenyPaths,
+    // allowRead is resolved first: on Linux a denyRead glob's expansion is
+    // collapsed against the paths that re-expose contents under a denied
+    // directory (allowRead + allowWrite), so both must be final here.
+    const expandedAllowRead = resolveReadPathEntries(
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+      expandAllowReadGlob,
     )
-    const rawAllowRead =
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
-    const expandedAllowRead: string[] = []
-    for (const p of rawAllowRead) {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-        expandedAllowRead.push(...expandGlobPattern(p))
-      } else {
-        expandedAllowRead.push(stripped)
-      }
-    }
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
     // paths fall under a user-configured denyRead.
@@ -1675,9 +1689,21 @@ async function wrapWithSandbox(
     if (javaAgentJarPath) {
       expandedAllowRead.push(javaAgentJarPath)
     }
+    const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
+    const unlistableDenyDirs = new Set<string>()
+    const expandedDenyRead = resolveReadPathEntries(
+      unionDenyReadPaths(
+        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+        credentialRestrictions,
+      ),
+      pattern =>
+        expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
+      credentialRestrictions.degradeToDenyPaths,
+    )
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
+      unlistableDenyDirs: [...unlistableDenyDirs],
     }
   }
 
@@ -2272,6 +2298,7 @@ async function reset(): Promise<void> {
   javaAgentJarPath = undefined
   sentinelRegistry.clear()
   awsPairRegistry.clear()
+  commandTextsByKey.clear()
   maskedFileStore.dispose()
 }
 
@@ -2318,8 +2345,8 @@ function getLinuxGlobPatternWarnings(): string[] {
 
   const globPatterns: string[] = []
 
-  // Check filesystem paths for glob patterns
-  // Note: denyRead is excluded because globs are now expanded to concrete paths on Linux
+  // Write paths take no globs at all on Linux: bubblewrap binds concrete
+  // paths, and nothing expands them.
   const allPaths = [
     ...config.filesystem.allowWrite,
     ...config.filesystem.denyWrite,
@@ -2331,6 +2358,23 @@ function getLinuxGlobPatternWarnings(): string[] {
 
     // Only warn if there are still glob characters after removing trailing /**
     if (containsGlobChars(pathWithoutTrailingStar)) {
+      globPatterns.push(path)
+    }
+  }
+
+  // Read paths are expanded, so a glob there is supported — unless the
+  // pattern has no literal directory for the walk to start from (a wildcard
+  // in its first path component, `/**/*.pem`), which expands to nothing and
+  // leaves the entry unenforced.
+  for (const path of [
+    ...config.filesystem.denyRead,
+    ...(config.filesystem.allowRead ?? []),
+  ]) {
+    const baseDir = globPatternBaseDir(normalizePathForSandbox(path))
+    if (
+      containsGlobChars(removeTrailingGlobSuffix(path)) &&
+      (baseDir === '' || baseDir === '/')
+    ) {
       globPatterns.push(path)
     }
   }
