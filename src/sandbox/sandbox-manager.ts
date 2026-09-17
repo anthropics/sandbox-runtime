@@ -88,6 +88,7 @@ import {
   sanitizeViolationText,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
+import { createSystemLogViolationSink } from './system-log-violation-sink.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
 import type { GetBodySubstitutions } from './body-substitution.js'
 import {
@@ -132,6 +133,7 @@ let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
+let systemLogSinkUnsubscribe: (() => void) | undefined
 let parentProxy: ResolvedParentProxy | undefined
 /** Read live through {@link directLookup}, so a config update applies to the next dial. */
 let resolvedAddressGuard: ResolvedAddressGuard = createResolvedAddressGuard()
@@ -276,6 +278,7 @@ function recordProxyViolation(
     encodedCommand,
     command,
     timestamp: new Date(),
+    source: 'proxy',
   })
 }
 
@@ -714,6 +717,21 @@ async function initialize(
     // fs.existsSync(observeSocketPath) and degrades gracefully.
     void linuxMonitor.ready
     logForDebugging('Started Linux seccomp violation monitor')
+  }
+
+  // Forward store events to the system log when opted in. Subscribed
+  // independently of enableLogMonitor: proxy denials reach the store either
+  // way, and they are the events with no native log line. The flag is read
+  // live so updateConfig() can toggle it without a reset.
+  if (!systemLogSinkUnsubscribe) {
+    const sink = createSystemLogViolationSink()
+    if (sink) {
+      systemLogSinkUnsubscribe = sandboxViolationStore.onViolation(event => {
+        if (config?.logViolationsToSystemLog) {
+          sink.handle(event)
+        }
+      })
+    }
   }
 
   // Register cleanup handlers first time
@@ -2186,6 +2204,10 @@ async function reset(): Promise<void> {
   if (linuxMonitor) {
     linuxMonitor.stop()
     linuxMonitor = undefined
+  }
+  if (systemLogSinkUnsubscribe) {
+    systemLogSinkUnsubscribe()
+    systemLogSinkUnsubscribe = undefined
   }
 
   if (managerContext?.linuxBridge) {
