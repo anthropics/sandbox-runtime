@@ -192,6 +192,28 @@ jobs:
         if: matrix.os != 'windows'
         run: npm test
 
+      # bubblewrap 0.12 refuses a mount on a symlink destination, which the
+      # distribution's packaged bubblewrap accepts; run the suite against it
+      # as well so a profile that mounts on a link is caught here, not on a
+      # user's machine. Pinned by commit, not by the v0.12.0 tag, which the
+      # upstream repository can move.
+      - name: Build bubblewrap 0.12.0 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq meson ninja-build libcap-dev pkg-config
+          git clone --filter=blob:none https://github.com/containers/bubblewrap.git "$RUNNER_TEMP/bubblewrap"
+          cd "$RUNNER_TEMP/bubblewrap"
+          git checkout 2a76602a8c71f36c1527cf9fc3417d9149822e0c
+          meson setup _build --prefix="$RUNNER_TEMP/bwrap-0.12" -Dselinux=disabled -Dman=disabled -Dbash_completion=disabled -Dzsh_completion=disabled
+          ninja -C _build
+          ninja -C _build install
+          "$RUNNER_TEMP/bwrap-0.12/bin/bwrap" --version
+
+      - name: Run tests against bubblewrap 0.12.0 (Linux)
+        if: matrix.os == 'linux'
+        run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
+
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
