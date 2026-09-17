@@ -491,13 +491,7 @@ export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
 ): string[] {
   const cwd = process.cwd()
-  // Note: Settings files are added at the callsite in sandbox-manager.ts
-  const denyPaths = [
-    // Dangerous files in CWD
-    ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
-    // Dangerous directories in CWD
-    ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
-  ]
+  const denyPaths = cwdDangerousDenyPaths(cwd)
 
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
@@ -515,6 +509,57 @@ export function linuxGetCwdMandatoryDenyPaths(
   }
 
   return denyPaths
+}
+
+/**
+ * The deny paths `cwd` has whatever its `.git` turns out to be, and whatever
+ * can be read of it. Settings files are added at the callsite in
+ * src/sandbox/sandbox-manager.ts.
+ */
+function cwdDangerousDenyPaths(cwd: string): string[] {
+  return [
+    // Dangerous files in CWD
+    ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
+    // Dangerous directories in CWD
+    ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
+  ]
+}
+
+/**
+ * {@link linuxGetCwdMandatoryDenyPaths} for the violation monitor, which is
+ * started once for the session and must not fail over one repository: the
+ * same paths, or - where a `.git` pointer or a `commondir` names something
+ * that cannot be resolved the way git resolves it - this directory's plain
+ * deny paths, with a warning. Every wrap in such a repository still refuses
+ * its command outright, so what this decides is which refused write the
+ * monitor reports, never what bubblewrap enforces.
+ */
+export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
+  try {
+    return linuxGetCwdMandatoryDenyPaths(allowGitConfig)
+  } catch (err) {
+    const cwd = process.cwd()
+    const dotGitPath = path.resolve(cwd, '.git')
+    logForDebugging(
+      `[Sandbox Linux] Could not resolve ${dotGitPath} the way git does (${errorText(err)}); the violation monitor judges writes against ${cwd}'s plain deny paths instead. Every wrapped command in it is refused until that is fixed.`,
+      { level: 'warn' },
+    )
+    let isPointerFile = false
+    try {
+      isPointerFile = fs.statSync(dotGitPath).isFile()
+    } catch {
+      // Gone since, or unreachable: neither shape's denies apply.
+    }
+    return [
+      ...cwdDangerousDenyPaths(cwd),
+      // A pointer file is itself a deny, and what it leads to is exactly
+      // what could not be followed; a git directory's own hooks and config
+      // need nothing followed to name.
+      ...(isPointerFile
+        ? [dotGitPath]
+        : gitDirDenyPaths(dotGitPath, allowGitConfig)),
+    ]
+  }
 }
 
 /**

@@ -46,7 +46,7 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
-  linuxGetCwdMandatoryDenyPaths,
+  linuxGetMonitorCwdDenyPaths,
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinux } from './read-deny-glob.js'
 import {
@@ -702,7 +702,10 @@ async function initialize(
     // normalizePathForSandbox resolves `~`, relative spellings and symlinks),
     // plus the built-in write denies the wrapper always applies.
     // It does not reproduce the wrapper's existence and boundary-symlink
-    // filters, nor the ripgrep scan for nested dangerous paths; and it still
+    // filters, nor the ripgrep scan for nested dangerous paths; a repository
+    // whose git metadata cannot be resolved leaves it the cwd's plain denies
+    // rather than failing this whole start-up (every wrap there is still
+    // refused); and it still
     // reports writes bwrap permits through `--dev`, `--proc` and the tmpfs
     // over each read-denied directory. Started once, so both lists are fixed
     // at the cwd and configuration of this call.
@@ -730,7 +733,7 @@ async function initialize(
           // them, so the monitor must not judge by them either.
           ...(config.filesystem.disabled
             ? []
-            : linuxGetCwdMandatoryDenyPaths(getAllowGitConfig())),
+            : linuxGetMonitorCwdDenyPaths(getAllowGitConfig())),
         ],
         ignoreViolations: config.ignoreViolations,
         resolveCommandText,

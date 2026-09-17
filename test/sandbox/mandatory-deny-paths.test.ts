@@ -38,6 +38,8 @@ import {
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
+  linuxGetCwdMandatoryDenyPaths,
+  linuxGetMonitorCwdDenyPaths,
   GIT_REDIRECT_STORE_PREFIX,
   LinuxSandboxProfileError,
 } from '../../src/sandbox/linux-sandbox-utils.js'
@@ -2269,6 +2271,36 @@ describe('Git metadata deny paths - Unit Tests', () => {
 
     expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
   })
+
+  it.if(isLinux)(
+    'hands the monitor plain deny paths for a repository it cannot read',
+    () => {
+      // The violation monitor starts once for the session, so one
+      // repository whose metadata cannot be resolved must not take the whole
+      // start-up with it. Every wrap in it is still refused.
+      const worktreeGitDir = makeGitDir(join(dir, 'wt.git'))
+      writeFileSync(
+        join(worktreeGitDir, 'commondir'),
+        '../main.git'.padEnd(1024 * 1024 + 1, '\n'),
+      )
+      const pointer = makePointer('wt-checkout', worktreeGitDir)
+      const checkout = join(dir, 'wt-checkout')
+      const originalCwd = process.cwd()
+      process.chdir(checkout)
+      try {
+        expect(() => linuxGetCwdMandatoryDenyPaths(false)).toThrow(
+          GitMetadataError,
+        )
+
+        const monitored = linuxGetMonitorCwdDenyPaths(false)
+
+        expect(monitored).toContain(pointer)
+        expect(monitored).toContain(join(checkout, '.bashrc'))
+      } finally {
+        process.chdir(originalCwd)
+      }
+    },
+  )
 
   it.if(!isWindows)(
     'does not block on a FIFO left where a git directory keeps its commondir',
