@@ -18,6 +18,7 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { countMounts, lastIndexOfMount } from '../helpers/bwrap-argv.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 /**
@@ -70,6 +71,14 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
+  const runIn = (wrapped: string) =>
+    spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 15000,
+      cwd: PROJ,
+    })
+
   async function wrap(
     denyPaths: string[],
     readDenyPaths: string[] = [],
@@ -105,10 +114,12 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     // re-bound cwd — /dev/null file stubs and read-only empty-directory
     // stubs both require bwrap to create the mount point inside the
     // read-only mount. Re-binds of EXISTING paths onto themselves create
-    // nothing and are fine.
-    const afterReadOnlyRebind = command.slice(
-      command.lastIndexOf(cwdReadOnlyBind) + cwdReadOnlyBind.length,
-    )
+    // nothing and are fine. The slice starts at the argv words after that
+    // bind, never at a character offset a longer path could match inside.
+    const afterReadOnlyRebind = command
+      .split(/\s+/)
+      .slice(lastIndexOfMount(command, '--ro-bind', PROJ, PROJ) + 3)
+      .join(' ')
     expect(afterReadOnlyRebind).not.toContain(`/dev/null ${PROJ}/`)
     expect(afterReadOnlyRebind).not.toMatch(
       /--ro-bind \S*claude-empty-\S+ \S*\/proj\//,
@@ -116,26 +127,17 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   })
 
   it.skipIf(!BWRAP_CAN_NAMESPACE)(
-    'boots under a write-denied cwd and still blocks the absent dotfile',
+    'boots in a write-denied cwd and still refuses to create the dotfile',
     async () => {
-      // The runtime half: the pre-fix symptom was a startup abort with no
-      // command executed, and the deny must still hold (the absent dotfile
-      // stays uncreatable).
+      // The pre-fix symptom was a startup abort with no command executed.
       process.chdir(PROJ)
+      const booted = runIn(await wrap([PROJ]))
+      expect(booted.stderr ?? '').not.toMatch(/Read-only file system/i)
+      expect(booted.status).toBe(0)
+      expect(booted.stdout).toContain('hello')
 
-      const run = spawnSync(await wrap([PROJ]), {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 15000,
-        cwd: PROJ,
-      })
-      expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
-      expect(run.status).toBe(0)
-      expect(run.stdout).toContain('hello')
-
-      const denied = spawnSync(
+      const denied = runIn(
         await wrap([PROJ], [], [AREA], `touch ${join(PROJ, '.gitconfig')}`),
-        { shell: true, encoding: 'utf8', timeout: 15000, cwd: PROJ },
       )
       expect(denied.status).not.toBe(0)
       expect(existsSync(join(PROJ, '.gitconfig'))).toBe(false)
@@ -475,7 +477,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   })
 
   it.skipIf(!BWRAP_CAN_NAMESPACE)(
-    'boots with the read-denied dirs as unrelated siblings of the write-denied dir',
+    'starts with the read-denied siblings mounted beside the write-denied cwd',
     async () => {
       const homeDir = join(BASE, 'home')
       mkdirSync(join(homeDir, '.ssh'), { recursive: true })
@@ -484,13 +486,11 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       mkdirSync(runDir)
       process.chdir(PROJ)
 
-      const run = spawnSync(
+      const started = runIn(
         await wrap([PROJ], [join(homeDir, '.ssh')], [AREA, runDir]),
-        { shell: true, encoding: 'utf8', timeout: 15000, cwd: PROJ },
       )
-
-      expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
-      expect(run.status).toBe(0)
+      expect(started.stderr ?? '').not.toMatch(/Read-only file system/i)
+      expect(started.status).toBe(0)
     },
   )
 
@@ -530,23 +530,6 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     )
   })
 
-  it.skipIf(!BWRAP_CAN_NAMESPACE)(
-    'boots under a trailing-slash allow spelled at the denied dir',
-    async () => {
-      process.chdir(PROJ)
-
-      const run = spawnSync(await wrap([PROJ], [], [`${PROJ}/`]), {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 15000,
-        cwd: PROJ,
-      })
-
-      expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
-      expect(run.status).toBe(0)
-    },
-  )
-
   it('enforces denyWithinAllow under a glob-character trailing-slash allowOnly spelling', async () => {
     // normalizePathForSandbox leaves the trailing slash on any spelling it
     // takes for a glob, so a literal directory named with glob characters is
@@ -564,6 +547,17 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).toContain(`--bind '${area}' '${area}'`)
     expect(command).toContain(`--ro-bind '${secrets}' '${secrets}'`)
   })
+
+  it.skipIf(!BWRAP_CAN_NAMESPACE)(
+    'starts under a trailing-slash allow spelled at the denied dir',
+    async () => {
+      process.chdir(PROJ)
+
+      const started = runIn(await wrap([PROJ], [], [`${PROJ}/`]))
+      expect(started.stderr ?? '').not.toMatch(/Read-only file system/i)
+      expect(started.status).toBe(0)
+    },
+  )
 
   it('re-applies a denyWithinAllow bind under a trailing-slash allow re-bound over a denyRead tmpfs', async () => {
     // The emission filter drops deny binds hidden by a denyRead tmpfs
@@ -745,21 +739,38 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   )
 
   /**
-   * Run a `denyOnly: ['/']` wrap in which the first `failures` listings of
-   * '/' throw EMFILE, and report how many of them actually fired.
+   * A `denyOnly: ['/']` wrap, with the warnings it logged. allowRead keeps
+   * the root child the temp tree lives under out of the '/' deny expansion,
+   * so with a usable prediction no tmpfs lands anywhere near PROJ, nothing
+   * vetoes it and the stubs are skipped.
    */
-  async function wrapWithFailingRootListings(
-    failures: number,
+  async function wrapDenyingRoot(
     writeConfig: { allowOnly: string[]; denyWithinAllow: string[] } = {
       allowOnly: [AREA],
       denyWithinAllow: [PROJ],
     },
-  ): Promise<{ command: string; warnings: string[]; failed: number }> {
+  ): Promise<{ command: string; warnings: string[] }> {
     process.chdir(PROJ)
-    // The root child the temp tree lives under. allowRead keeps it out of
-    // the '/' deny expansion, so with a usable prediction no tmpfs lands
-    // anywhere near PROJ, nothing vetoes it and the stubs are skipped.
     const tmpRoot = `/${BASE.split('/')[1]}`
+    const { result: command, warnings } = await withCapturedWarnings(() =>
+      wrapCommandWithSandboxLinux({
+        command: 'echo hello',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
+        writeConfig,
+      }),
+    )
+    return { command, warnings }
+  }
+
+  /**
+   * The same wrap with the first `failures` listings of '/' throwing EMFILE,
+   * reporting how many of them actually fired.
+   */
+  async function wrapWithFailingRootListings(
+    failures: number,
+    writeConfig?: { allowOnly: string[]; denyWithinAllow: string[] },
+  ): Promise<{ command: string; warnings: string[]; failed: number }> {
     const realReaddirSync = fs.readdirSync
     let failed = 0
     const spy = spyOn(fs, 'readdirSync').mockImplementation(((
@@ -775,15 +786,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       return (realReaddirSync as (...a: unknown[]) => unknown)(p, ...rest)
     }) as typeof fs.readdirSync)
     try {
-      const { result: command, warnings } = await withCapturedWarnings(() =>
-        wrapCommandWithSandboxLinux({
-          command: 'echo hello',
-          needsNetworkRestriction: false,
-          readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
-          writeConfig,
-        }),
-      )
-      return { command, warnings, failed }
+      return { ...(await wrapDenyingRoot(writeConfig)), failed }
     } finally {
       spy.mockRestore()
     }
@@ -795,7 +798,8 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     // fail transiently (EMFILE/ENFILE). Reading that failure as "no read-deny
     // tmpfs" would skip stubs on evidence that never existed; treating one
     // failure as final keeps every placeholder, which is itself a start-up
-    // refusal under a read-only covering deny. So it is derived twice.
+    // refusal under a read-only covering deny. So the listing itself asks
+    // once more, and only a second failure is taken for an answer.
     const stub = `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`
 
     const transient = await wrapWithFailingRootListings(1)
@@ -872,18 +876,24 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(unusable.command).toContain(stub)
   })
 
+  /** What one wrap costs a root child whose location will not resolve: once
+   * normalizing the entry, in the single walk the deny loop and the stub
+   * prediction both read, and once for its canonical location, which caches.
+   * A retried failure adds exactly one, which is what the counts below are
+   * asserted against. */
+  const SETTLED_PROBE_LOOKUPS = 2
+
   /**
-   * Run a `denyOnly: ['/']` wrap with one extra, non-existent child listed
-   * under the root whose canonical location cannot be resolved for `code`.
-   * The shape of a dangling symlink under '/' (Ubuntu ships
-   * /initrd.img.old), without needing to create one.
+   * The same wrap with one extra, non-existent child listed under the root
+   * whose canonical location fails to resolve for `code` on its first
+   * `failures` lookups. The shape of a dangling symlink under '/' (Ubuntu
+   * ships /initrd.img.old), without needing to create one.
    */
   async function wrapWithUnresolvableRootChild(
     code: string,
+    failures = Number.POSITIVE_INFINITY,
   ): Promise<{ command: string; warnings: string[]; probeLookups: number }> {
-    process.chdir(PROJ)
     const probe = '/srt-unresolvable-probe'
-    const tmpRoot = `/${BASE.split('/')[1]}`
     const realReaddirSync = fs.readdirSync
     const realRealpathSync = fs.realpathSync
     let probeLookups = 0
@@ -906,21 +916,16 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       ) => {
         if (String(p) === probe) {
           probeLookups++
-          throw Object.assign(new Error(`${code}: cannot resolve`), { code })
+          if (probeLookups <= failures) {
+            throw Object.assign(new Error(`${code}: cannot resolve`), { code })
+          }
+          return probe
         }
         return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
       }) as typeof fs.realpathSync),
     ]
     try {
-      const { result: command, warnings } = await withCapturedWarnings(() =>
-        wrapCommandWithSandboxLinux({
-          command: 'echo hello',
-          needsNetworkRestriction: false,
-          readConfig: { denyOnly: ['/'], allowWithinDeny: [tmpRoot] },
-          writeConfig: { allowOnly: [AREA], denyWithinAllow: [PROJ] },
-        }),
-      )
-      return { command, warnings, probeLookups }
+      return { ...(await wrapDenyingRoot()), probeLookups }
     } finally {
       for (const spy of spies) spy.mockRestore()
     }
@@ -934,7 +939,9 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const { command, warnings, probeLookups } =
       await wrapWithUnresolvableRootChild('ENOENT')
 
-    expect(probeLookups).toBeGreaterThan(0)
+    // No retry: absence is settled, and asking again would only cost a
+    // syscall on a host whose root holds a dangling link.
+    expect(probeLookups).toBe(SETTLED_PROBE_LOOKUPS)
     expect(warnings.join('\n')).not.toContain('Read-deny prediction unusable')
     expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
     expect(command).not.toContain(
@@ -957,7 +964,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const stub = `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`
 
     const usable = await wrap([PROJ], [build])
-    expect(usable).toContain(`--tmpfs ${build} `)
+    expect(countMounts(usable, '--tmpfs', build)).toBeGreaterThan(0)
     expect(usable).not.toContain(stub)
 
     const realRealpathSync = fs.realpathSync
@@ -981,6 +988,23 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(unusable).toContain(stub)
   })
 
+  it('resolves a root child again when the first failure is transient', async () => {
+    // EIO is about the host, not the path: settling on the fallback after
+    // one such failure would record a guess, make the prediction unusable
+    // and stub the absent cwd dotfiles on a read-only cwd. EACCES, below,
+    // is the settled case that must not be retried into a pass.
+    const { command, warnings, probeLookups } =
+      await wrapWithUnresolvableRootChild('EIO', 1)
+
+    // Exactly one more lookup than a settled failure costs: the retry fired
+    // once, and its answer was cached rather than asked for again.
+    expect(probeLookups).toBe(SETTLED_PROBE_LOOKUPS + 1)
+    expect(warnings.join('\n')).not.toContain('Read-deny prediction unusable')
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+  })
+
   it('keeps the stubs when a root child cannot be looked at', async () => {
     // The other direction: a location that exists but cannot be resolved is
     // a guess about the prediction's own inputs, so the prediction is
@@ -988,7 +1012,9 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     const { command, warnings, probeLookups } =
       await wrapWithUnresolvableRootChild('EACCES')
 
-    expect(probeLookups).toBeGreaterThan(0)
+    // No retry here either: EACCES is settled, and retrying it would turn
+    // the same wrap into two lookups of a path that cannot be looked at.
+    expect(probeLookups).toBe(SETTLED_PROBE_LOOKUPS)
     expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
     expect(warnings.join('\n')).toContain('/srt-unresolvable-probe')
     expect(command).toContain(`--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`)

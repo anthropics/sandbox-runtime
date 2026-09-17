@@ -1083,6 +1083,46 @@ function buildSandboxCommand(
   }
 }
 
+/**
+ * The three classes an fs errno from a path lookup falls into, enumerated
+ * once because each leads somewhere different: ABSENCE, where the name
+ * resolves to no file and every consumer already treats the path as absent
+ * (isAbsenceErrno, in sandbox-utils.ts, where the glob walk classifies the
+ * same failures); TRANSIENT, a busy, unlucky or re-exporting host rather
+ * than a fact about the path, worth asking once more before the failure is
+ * taken for an answer; and SETTLED, a file that is there and cannot be
+ * looked at, and will not become readable while this wrap runs. Every code
+ * neither predicate names is settled, because nothing says it clears.
+ */
+function isTransientErrno(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code
+  return (
+    code === 'EIO' ||
+    code === 'ESTALE' ||
+    code === 'EMFILE' ||
+    code === 'ENFILE' ||
+    code === 'EAGAIN'
+  )
+}
+
+/**
+ * `attempt`, asked a second time when the first failure was transient and
+ * rethrown otherwise. Two caveats come with the second ask: a same-tick retry
+ * cannot clear descriptor exhaustion (EMFILE, ENFILE), so for those it is
+ * best effort. And on a soft-mounted network filesystem that is down, a
+ * transient-class errno arrives only after the mount's own timeout, so the
+ * retry can double that stall — a hard mount never returns at all, so the
+ * retry never runs there.
+ */
+function retryingTransient<T>(attempt: () => T): T {
+  try {
+    return attempt()
+  } catch (err) {
+    if (!isTransientErrno(err)) throw err
+  }
+  return attempt()
+}
+
 /** The top-level directories this wrap leaves to the kernel and to the
  * caller's own remounts. A cover must never take one — --proc and --dev
  * replace two of them after the pins are spliced in, and /sys is kernel
@@ -1130,7 +1170,7 @@ function ancestorPinArgs(
   for (const seed of seeds) {
     if (
       rootIsWriteRoot &&
-      KERNEL_TOP_LEVEL_DIRS.includes(`/${seed.split('/')[1] ?? ''}`)
+      KERNEL_TOP_LEVEL_DIRS.some(dir => isAtOrUnder(seed, dir))
     ) {
       continue
     }
@@ -1177,22 +1217,27 @@ type RestoredMount = { source: string; dest: string }
 
 /**
  * Mount a tmpfs over a read-denied directory, then restore the allowed write
- * paths and allowRead paths the tmpfs just wiped. Used by the denyRead loop
- * in generateFilesystemArgs and again when a late denyWrite ro-bind re-exposes
- * a read-denied directory and the tmpfs must be re-applied on top. Returns
- * the mounts it re-bound, writable and read-only.
+ * paths and allowRead paths the tmpfs just wiped. Returns the mounts it
+ * re-bound, writable and read-only, which is what a later pass re-emits when
+ * a denyWrite bind re-exposes this directory.
  */
 function pushReadDenyDirMounts(
   args: string[],
   unit: {
     /** Where the tmpfs lands, and the destination bwrap is handed for it:
-     *  a read deny is mounted where its path resolves (canonicalForm in the
-     *  caller), never on a symlink. */
+     *  a read deny is mounted where its path resolves (readDenyMountOf's
+     *  landing in the caller), never on a symlink. */
     landing: string
     allowedWritePaths: readonly string[]
     readAllowPaths: readonly string[]
-    /** Where a path resolves to (canonicalForm in the caller). */
-    resolved: (p: string) => string
+    /** Where a path resolves to, and whether that is a resolution at all:
+     * an unresolved answer is the spelling itself, which must never become a
+     * mount source (canonicalLocationOf in the caller). */
+    resolve: (p: string) => { canonical: string; resolved: boolean }
+    /** What the read section hides at or around a resolved target, other
+     * than this tmpfs and the denies above it (readDenialAround bound to
+     * this unit's landing in the caller). */
+    readDenialAround: (target: string) => string | undefined
     /** Where a path's name lives (nameLocationOf in the caller). */
     nameLocation: (p: string) => string
   },
@@ -1213,18 +1258,39 @@ function pushReadDenyDirMounts(
   // an entry whose last component is a symlink is ENOENT inside the sandbox
   // if restored only at its target), from the RESOLVED source: that is the
   // path both containment checks were made against, and naming it leaves
-  // bwrap nothing to re-resolve at mount time. The destination is always a
-  // plain path bwrap can create on the tmpfs, never a symlink whose target
-  // the tmpfs just hid.
+  // bwrap nothing to re-resolve at mount time.
   const restorePlacementOf = (p: string): RestoredMount | undefined => {
     const dest = unit.nameLocation(p)
     if (!isAtOrUnder(dest, landing)) return undefined
-    const source = unit.resolved(p)
+    const { canonical: source, resolved } = unit.resolve(p)
+    if (!resolved) {
+      logForDebugging(
+        `[Sandbox Linux] Not restoring ${p} over denyRead tmpfs ${landing}: nothing there resolves (absent, dangling or unreadable), so the only source available is the name itself`,
+        { level: 'warn' },
+      )
+      return undefined
+    }
     if (!isAtOrUnder(source, landing)) {
       logForDebugging(
         `[Sandbox Linux] Not restoring ${p} over denyRead tmpfs ${landing}: it resolves outside it, to ${source}`,
+        { level: 'warn' },
       )
       return undefined
+    }
+    // Restoring at the name from a DIFFERENT path is a second mount of the
+    // target's inode, which nothing landing on the target's own path covers,
+    // so such a restore is dropped whenever the read section hides anything
+    // at, inside or around that target: the deny wins, and the follow-up that
+    // gives the carve-out back has to bind the target at the target.
+    if (source !== dest) {
+      const denied = unit.readDenialAround(source)
+      if (denied !== undefined) {
+        logForDebugging(
+          `[Sandbox Linux] Not restoring ${p} over denyRead tmpfs ${landing}: it resolves to ${source}, and the read section denies or masks ${denied}`,
+          { level: 'warn' },
+        )
+        return undefined
+      }
     }
     return { source, dest }
   }
@@ -1248,12 +1314,6 @@ function pushReadDenyDirMounts(
   for (const allowPath of readAllowPaths) {
     const placement = restorePlacementOf(allowPath)
     if (placement === undefined) continue
-    if (!fs.existsSync(allowPath)) {
-      logForDebugging(
-        `[Sandbox Linux] Skipping non-existent read allow path: ${allowPath}`,
-      )
-      continue
-    }
     // Skip only if a write path was re-bound just above AND covers
     // allowPath. A write path that's an ancestor of the deny dir isn't
     // re-bound (it wasn't wiped), so allowPath under it still needs
@@ -1310,32 +1370,49 @@ async function generateFilesystemArgs(
   // spellings. Landings and allowed write paths are canonical, so the extra
   // spelling can only match more of them, never fewer.
   const denyWriteRawDests = new Map<string, string>()
-  // Where a mount given `p` lands. One resolution per path per wrap, so every
-  // predicate below sees the same answer, and none before the mandatory-deny
-  // scan's await: that scan can run arbitrarily long, and a realpath taken
-  // ahead of it would miss a symlink retargeted meanwhile.
+  // Where a mount given `p` lands: `p` fully resolved, every symlink on the
+  // way and not one hop. One resolution per path per wrap, so every predicate
+  // below sees the same answer, and none before the mandatory-deny scan's
+  // await: that scan can run arbitrarily long, and a realpath taken ahead of
+  // it would miss a symlink retargeted meanwhile.
   const canonicalFormCache = new Map<string, string>()
-  // Paths whose canonical location could not be LOOKED AT (EACCES, EIO,
-  // anything unrecognised), so the recorded spelling stands in for it. That
-  // is a guess, and the stub-skip prediction below refuses to conclude
-  // anything from a guess made about its own inputs. Plain absence is not a
-  // guess: nothing is there to resolve, and every consumer already treats
-  // such a path as absent (a dangling symlink under '/' is ordinary, and
-  // counting it would keep every deny placeholder on the whole host).
+  // Paths whose canonical location could not be LOOKED AT — a settled errno,
+  // or a transient one that outlived the retry — so the recorded spelling
+  // stands in for it. That is a guess, and the
+  // stub-skip prediction below refuses to conclude anything from a guess made
+  // about its own inputs. Plain absence is not a guess: nothing is there to
+  // resolve, and every consumer already treats such a path as absent (a
+  // dangling symlink under '/' is ordinary, and counting it would keep every
+  // deny placeholder on the whole host).
   const canonicalFormGuesses = new Set<string>()
+  // Paths canonicalForm answered with the spelling it was given because
+  // nothing could be resolved. A mount SOURCE must never be one of them:
+  // bwrap would resolve whatever sits at that name at mount time, after the
+  // containment checks ran against the name itself.
+  const canonicalFormUnresolved = new Set<string>()
   const canonicalForm = (p: string): string => {
     let canonical = canonicalFormCache.get(p)
     if (canonical === undefined) {
       try {
-        canonical = fs.realpathSync(p)
+        canonical = retryingTransient(() => fs.realpathSync(p))
       } catch (err) {
         canonical = p // vanished or unresolvable: the recorded form stands
+        canonicalFormUnresolved.add(p)
         if (!isAbsenceErrno(err)) canonicalFormGuesses.add(p)
       }
       canonicalFormCache.set(p, canonical)
     }
     return canonical
   }
+  /** Where `p` resolves to, beside whether anything was resolved at all.
+   * Answered together because the answer is the spelling itself when nothing
+   * was, and a mount source must never be one of those. */
+  const canonicalLocationOf = (
+    p: string,
+  ): { canonical: string; resolved: boolean } => ({
+    canonical: canonicalForm(p),
+    resolved: !canonicalFormUnresolved.has(p),
+  })
   /** `p` as recorded, plus its canonical location when that differs. */
   const mountForms = (p: string): string[] => {
     const canonical = canonicalForm(p)
@@ -1386,15 +1463,19 @@ async function generateFilesystemArgs(
   // directory above it that can. That hides more than was asked, never less:
   // a same-uid command can make a parent unsearchable (chmod 000) and undo it
   // again from inside the next sandbox, so "unreadable now" is not "absent".
+  // This is the widest blast radius a transient failure has, hence the retry:
+  // one unlucky EIO turns a file deny into a stand-in over its whole
+  // directory, and every carve-out beneath that is then refused.
   const readDenyTargetOf = (
     entry: string,
   ): { path: string; isDirectory: boolean; isStandIn: boolean } | undefined => {
     for (let candidate = entry; ; candidate = path.dirname(candidate)) {
       if (candidate === '/' && candidate !== entry) return undefined
       try {
+        const stats = retryingTransient(() => fs.statSync(candidate))
         return {
           path: candidate,
-          isDirectory: fs.statSync(candidate).isDirectory(),
+          isDirectory: stats.isDirectory(),
           isStandIn: candidate !== entry,
         }
       } catch (err) {
@@ -1462,7 +1543,8 @@ async function generateFilesystemArgs(
   // always hidden when there is a read policy: ssh is strict about config
   // file ownership and permissions, which can look wrong inside the sandbox
   // ("Bad owner or permissions" under OrbStack). Throws if '/' cannot be
-  // listed. Computed on first use, like readAllowPaths.
+  // listed, a transient failure having been retried once. Computed on first
+  // use, like readAllowPaths.
   let readDenyEntriesMemo: string[] | undefined
   const readDenyEntries = (): string[] => {
     if (readDenyEntriesMemo !== undefined) return readDenyEntriesMemo
@@ -1473,7 +1555,12 @@ async function generateFilesystemArgs(
         entries.push(p)
         continue
       }
-      for (const child of fs.readdirSync('/')) {
+      // The only call here that throws, and the list is memoised on success
+      // alone, so the retry belongs to it rather than to one of its callers:
+      // the stub-skip derivation catches a throw and gives up on the
+      // prediction, and the denyRead loop below does not catch one at all.
+      const children = retryingTransient(() => fs.readdirSync('/'))
+      for (const child of children) {
         if (KERNEL_TOP_LEVEL_DIRS.includes(`/${child}`)) continue
         const childLocation = canonicalForm('/' + child)
         const covered = readAllowPaths().some(allowPath =>
@@ -1494,12 +1581,49 @@ async function generateFilesystemArgs(
     readDenyEntriesMemo = entries
     return entries
   }
-  // Where the ancestor pins are spliced in once every mount is known, and in
-  // which flavour: beneath the allow binds, or after them under a '/' write
-  // root that would otherwise bury them (see ancestorPinArgs).
-  let ancestorPinPlan:
-    | { insertAt: number; rootIsWriteRoot: boolean }
-    | undefined
+  // Shallow-first by canonical depth, so a tmpfs over a directory lands
+  // before the tmpfs or /dev/null mask on anything inside it however either
+  // was spelled. That order is what lets a unit restore its write and
+  // allowRead paths unconditionally: nothing emitted so far can lie inside
+  // one. Sorted by spelling, a symlink-spelled entry could mount first inside
+  // a directory listed after it, whose restores would then bury it.
+  const canonicalDepth = (p: string): number =>
+    canonicalForm(p).split('/').length
+  type ReadDenyPlanEntry = {
+    normalizedPath: string
+    mount: ReturnType<typeof readDenyMountOf>
+    liftedFile: boolean
+  }
+  // What every denyRead entry mounts and where: ONE walk, whose answers the
+  // deny loop, the locations the carve-out gate below reads, and the
+  // stub-skip prediction all take, so none of them can disagree about where
+  // a deny lands. `mount` is undefined where nothing is mounted at all;
+  // `liftedFile` marks a file deny an allowRead entry naming that very file
+  // cancels — the entry mounts nothing in that case either. Lazy and
+  // memoised like readDenyEntries(): it resolves symlinks, so it must not run
+  // before the mandatory-deny scan's await.
+  let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
+  const readDenyPlan = (): ReadDenyPlanEntry[] =>
+    (readDenyPlanMemo ??= readDenyEntries()
+      .map(p => normalizePathForSandbox(p))
+      .sort((a, b) => canonicalDepth(a) - canonicalDepth(b))
+      .map(normalizedPath => {
+        const mount = readDenyMountOf(normalizedPath)
+        return {
+          normalizedPath,
+          mount,
+          liftedFile:
+            mount !== undefined &&
+            !mount.isDirectory &&
+            readAllowPaths().some(
+              allowPath => nameLocationOf(allowPath) === mount.landing,
+            ),
+        }
+      }))
+  // Where the ancestor pins are spliced in once every mount is known:
+  // beneath the allow binds, or after them under a '/' write root that would
+  // otherwise bury them (see ancestorPinArgs).
+  let ancestorPinInsertAt: number
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
@@ -1569,11 +1693,9 @@ async function generateFilesystemArgs(
       args.push('--bind', normalizedPath, normalizedPath)
       allowedWritePaths.push(normalizedPath)
     }
-    const rootIsWriteRoot = isAllowedWriteRoot('/')
-    ancestorPinPlan = {
-      insertAt: rootIsWriteRoot ? args.length : beneathAllowBinds,
-      rootIsWriteRoot,
-    }
+    ancestorPinInsertAt = isAllowedWriteRoot('/')
+      ? args.length
+      : beneathAllowBinds
 
     // Inputs for the covering-directory vetoes, computed at most once and
     // only when a deny path (absent or existing) lies strictly beneath a
@@ -1600,11 +1722,12 @@ async function generateFilesystemArgs(
            */
           allowedWritePathsBothForms: string[]
           /**
-           * Where the denyRead loop below would mount a tmpfs, from the same
-           * readDenyEntries() and the same landing rules it uses, keeping
-           * only the entries that are directories (the loop skips absent
-           * ones and gives a file entry a read-only /dev/null mask instead),
-           * in raw and canonical spellings. It over-predicts: the loop also
+           * Where the denyRead loop below would mount a tmpfs, read off the
+           * same readDenyPlan() walk that loop takes its own answers from,
+           * keeping only the entries that are directories (the loop skips
+           * the ones that mount nothing and gives a file entry a read-only
+           * /dev/null mask instead), in raw and canonical spellings. It
+           * over-predicts: the loop also
            * skips an entry whose landing an earlier tmpfs already hides.
            * That direction is the safe one, since every veto below turns a
            * predicted tmpfs into a KEPT placeholder. A read-denied tmpfs at
@@ -1617,17 +1740,9 @@ async function generateFilesystemArgs(
         }
       | {
           /**
-           * The derivation threw twice, or needed a canonical location it
-           * could not look at, so the prediction describes nothing and every
-           * covering directory is vetoed. It carries no arrays: neither can
-           * be read without narrowing on this flag first. A failure must not
-           * read as "no read-deny tmpfs" — the denyRead loop derives the
-           * same set again moments later with no catch of its own, so that
-           * wrap reaches bwrap with its placeholders skipped on a prediction
-           * that never held. The one transient cause (EMFILE/ENFILE on the
-           * root listing) is retried rather than landed on, because keeping
-           * every placeholder is itself a start-up refusal wherever a
-           * covering deny directory is read-only.
+           * The derivation threw, or needed a canonical location it could not
+           * look at. A failure must not read as "no read-deny tmpfs", so
+           * every covering directory is vetoed instead.
            */
           usable: false
         }
@@ -1636,59 +1751,49 @@ async function generateFilesystemArgs(
       if (stubSkipVetoInputs !== undefined) {
         return stubSkipVetoInputs
       }
-      let allowedWritePathsBothForms: string[] = []
-      let prospectiveReadDenyTmpfsDirsBothForms: string[] = []
-      let unreliableCause: string | undefined
-      // Derived twice before it is given up on. The only thing that throws
-      // here is the root listing in readDenyEntries(), whose failures are
-      // transient (EMFILE/ENFILE on a busy host) and which memoises nothing
-      // when it fails, so a second attempt sees the ordinary answer. A guess
-      // is retried with it but cannot be undone by one: it is a settled
-      // verdict about a path that exists and cannot be looked at.
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        unreliableCause = undefined
-        try {
-          allowedWritePathsBothForms = allowedWritePaths.flatMap(mountForms)
-          prospectiveReadDenyTmpfsDirsBothForms = readDenyEntries().flatMap(
-            entry => {
-              const mount = readDenyMountOf(normalizePathForSandbox(entry))
-              if (!mount?.isDirectory) return []
-              // The tmpfs hides its landing, and the spelling the entry
-              // resolved to when that differs. '/' is never a landing, and
-              // must not enter the prediction as a spelling either (a link
-              // to the root resolves there, and its holder is the landing):
-              // every covering directory lies under '/', so predicting a
-              // tmpfs there would veto every skip on the whole host.
-              return [
-                ...new Set([...mountForms(mount.named), mount.landing]),
-              ].filter(form => form !== '/')
-            },
-          )
-        } catch (err) {
-          unreliableCause = `deriving it threw ${attempt} time(s), last: ${err}`
-        }
-        if (unreliableCause === undefined) break
-      }
-      // Every canonicalForm call site runs inside this derivation or after
-      // the deny loop that triggers it, so a guess recorded by now was made
-      // about the derivation's own inputs. A future caller that resolves
-      // earlier can only add guesses here, which vetoes more skips, never
-      // fewer.
-      if (unreliableCause === undefined && canonicalFormGuesses.size > 0) {
-        unreliableCause = `no canonical location for ${[...canonicalFormGuesses].join(', ')}`
-      }
-      if (unreliableCause !== undefined) {
+      const unusable = (cause: string): StubSkipVetoInputs => {
         logForDebugging(
-          `[Sandbox Linux] Read-deny prediction unusable (${unreliableCause}); keeping every deny placeholder, which refuses to start wherever a covering deny directory is read-only: bubblewrap cannot create a placeholder's mount point there`,
+          `[Sandbox Linux] Read-deny prediction unusable (${cause}); keeping every deny placeholder, which refuses to start wherever a covering deny directory is read-only: bubblewrap cannot create a placeholder's mount point there`,
           { level: 'warn' },
         )
-        stubSkipVetoInputs = { usable: false }
-      } else {
-        stubSkipVetoInputs = {
-          usable: true,
-          allowedWritePathsBothForms,
-          prospectiveReadDenyTmpfsDirsBothForms,
-        }
+        return { usable: false }
+      }
+      // Single-shot: readDenyEntries() owns the retry for the one thing that
+      // throws here, its listing of '/'. A guess would survive a retry
+      // anyway, being a settled verdict about a path that cannot be looked at.
+      try {
+        const allowedWritePathsBothForms = allowedWritePaths.flatMap(mountForms)
+        const prospectiveReadDenyTmpfsDirsBothForms = readDenyPlan().flatMap(
+          ({ mount }) => {
+            if (!mount?.isDirectory) return []
+            // The tmpfs hides its landing, and the spelling the entry
+            // resolved to when that differs. '/' is never a landing, and
+            // must not enter the prediction as a spelling either (a link
+            // to the root resolves there, and its holder is the landing):
+            // every covering directory lies under '/', so predicting a
+            // tmpfs there would veto every skip on the whole host.
+            return [
+              ...new Set([...mountForms(mount.named), mount.landing]),
+            ].filter(form => form !== '/')
+          },
+        )
+        // Every canonicalForm call site runs inside this derivation or after
+        // the deny loop that triggers it, so a guess recorded by now was made
+        // about the derivation's own inputs. A future caller that resolves
+        // earlier can only add guesses here, which vetoes more skips, never
+        // fewer.
+        stubSkipVetoInputs =
+          canonicalFormGuesses.size > 0
+            ? unusable(
+                `no canonical location for ${[...canonicalFormGuesses].join(', ')}`,
+              )
+            : {
+                usable: true,
+                allowedWritePathsBothForms,
+                prospectiveReadDenyTmpfsDirsBothForms,
+              }
+      } catch (err) {
+        stubSkipVetoInputs = unusable(`deriving it threw: ${err}`)
       }
       return stubSkipVetoInputs
     }
@@ -2108,16 +2213,12 @@ async function generateFilesystemArgs(
   } else {
     // No write restrictions: Allow all writes
     args.push('--bind', '/', '/')
-    // The whole tree is the allowed write area and '/' is its only write
-    // root, which is exactly the shape the pins treat specially: this
-    // recursive bind would bury pins placed beneath it, so they go after it
-    // under one writable cover per top-level directory (see ancestorPinArgs).
-    // Without them the directory above a file mask or a read-deny tmpfs can
-    // be renamed aside and the protected path recreated unprotected.
-    // Recording '/' here is what makes the two predicates below say so; no
-    // path is ever restored for it, because no read-deny tmpfs lands at '/'.
+    // Recording '/' makes isWithinAnyAllowedWritePath and isAllowedWriteRoot
+    // say so, which is the '/'-write-root shape ancestorPinArgs treats
+    // specially. Nothing is ever restored for it: no read-deny tmpfs lands
+    // at '/'.
     allowedWritePaths.push('/')
-    ancestorPinPlan = { insertAt: args.length, rootIsWriteRoot: true }
+    ancestorPinInsertAt = args.length
   }
   // denyWriteArgs is emitted after the denyRead loop below.
 
@@ -2140,51 +2241,70 @@ async function generateFilesystemArgs(
   const fileMasks: Array<{ source: string; landing: string }> = []
 
   // Replay the tmpfs units in order (bwrap is last-mount-wins): is `location`
-  // beneath a unit's tmpfs and not brought back by a restore since? A
-  // restore counts wherever it lands and wherever it was spelled: a
-  // symlinked spelling brings back the same inode.
+  // beneath a unit's tmpfs and not brought back by a restore since? A restore
+  // counts only where it lands. One reached through a symlink puts the
+  // target's inode at the NAME; the target's own path is still under the
+  // tmpfs, and asking there must not answer "brought back".
   const isHiddenByTmpfs = (
     location: string,
     broughtBackBy: 'writes' | 'writes and reads',
   ): boolean => {
+    const broughtBack = (restored: readonly RestoredMount[]): boolean =>
+      restored.some(r => isAtOrUnder(location, r.dest))
     let hidden = false
     for (const unit of readDenyTmpfsUnits) {
       if (isAtOrUnder(location, unit.landing)) {
         hidden = true
       }
-      const restored =
-        broughtBackBy === 'writes'
-          ? unit.restoredWrites
-          : [...unit.restoredWrites, ...unit.restoredReads]
       if (
-        restored.some(r =>
-          mountForms(r.dest).some(form => isAtOrUnder(location, form)),
-        )
+        broughtBack(unit.restoredWrites) ||
+        (broughtBackBy === 'writes and reads' &&
+          broughtBack(unit.restoredReads))
       ) {
         hidden = false
       }
     }
     return hidden
   }
-  // Shallow-first by canonical depth, so a tmpfs over a directory lands
-  // before the tmpfs or /dev/null mask on anything inside it however either
-  // was spelled. That order is what lets a unit restore its write and
-  // allowRead paths unconditionally: nothing emitted so far can lie inside
-  // one. Sorted by spelling, a symlink-spelled entry could mount first inside
-  // a directory listed after it, whose restores would then bury it.
-  const canonicalDepth = (p: string): number =>
-    canonicalForm(p).split('/').length
-  const normalizedDenyPaths = readDenyEntries()
-    .map(p => normalizePathForSandbox(p))
-    .sort((a, b) => canonicalDepth(a) - canonicalDepth(b))
   // Entries a glob expansion produced for a directory it could not list.
   // What the pattern matches beneath an allowed path in there was never
   // found, so binding that path back over the tmpfs would show every one of
   // those matches unmasked.
   const unlistableDenyDirs = new Set(readConfig?.unlistableDenyDirs ?? [])
 
-  for (const normalizedPath of normalizedDenyPaths) {
-    const mount = readDenyMountOf(normalizedPath)
+  // Every location the read section hides, each one where its mount lands:
+  // one per entry that mounts something — a directory's tmpfs, the stand-in
+  // tmpfs of an entry that could not be inspected or that resolves to '/', a
+  // file's /dev/null mask — and one per masked credential file. An entry that
+  // mounts nothing hides nothing, and must not cost a carve-out; a stand-in
+  // hides where it lands, which is above the entry that asked for it. A
+  // landing the loop below then skips as already hidden stays in this list:
+  // it refuses a carve-out the mounts alone would have allowed, which is the
+  // safe direction and one comparison fewer.
+  const readDeniedLocations = [
+    ...readDenyPlan().flatMap(({ mount, liftedFile }) =>
+      mount === undefined || liftedFile ? [] : [mount.landing],
+    ),
+    ...(maskedFileBinds ?? []).map(mask => canonicalForm(mask.realPath)),
+  ]
+  // What the read section hides at, inside, or around `target`, ignoring the
+  // tmpfs landing at `landing` and every deny above it — those are what a
+  // carve-out restored into that tmpfs is the exception to. Everything else
+  // that overlaps the target wins over the carve-out. Both sides are resolved
+  // locations: every read deny mounts where its entry resolves, and `target`
+  // is what the carve-out resolves to, so no spelling has to be guessed at.
+  // Returns the offending location, for the debug line.
+  const readDenialAround = (
+    target: string,
+    landing: string,
+  ): string | undefined =>
+    readDeniedLocations.find(
+      denied =>
+        !isAtOrUnder(landing, denied) &&
+        (isAtOrUnder(denied, target) || isAtOrUnder(target, denied)),
+    )
+
+  for (const { normalizedPath, mount, liftedFile } of readDenyPlan()) {
     if (mount === undefined) {
       logForDebugging(
         `[Sandbox Linux] Read deny path mounts nothing this wrap can place (absent, or uninspectable, or a link to '/' with nothing but '/' holding it): ${normalizedPath}`,
@@ -2228,7 +2348,9 @@ async function generateFilesystemArgs(
         landing,
         allowedWritePaths: restoresNothing ? [] : allowedWritePaths,
         readAllowPaths: restoresNothing ? [] : readAllowPaths(),
-        resolved: canonicalForm,
+        resolve: canonicalLocationOf,
+        readDenialAround: restoreTarget =>
+          readDenialAround(restoreTarget, landing),
         nameLocation: nameLocationOf,
       })
       readDenyTmpfsUnits.push({ landing, ...restored })
@@ -2240,12 +2362,7 @@ async function generateFilesystemArgs(
       // of the file it points at. A directory allowRead does not un-deny a
       // file specifically listed in denyRead — otherwise denyRead: ['.env']
       // + allowRead: ['.'] silently drops the .env deny.
-      const deniedFile = canonicalForm(normalizedPath)
-      if (
-        readAllowPaths().some(
-          allowPath => nameLocationOf(allowPath) === deniedFile,
-        )
-      ) {
+      if (liftedFile) {
         logForDebugging(
           `[Sandbox Linux] Skipping read deny for re-allowed path: ${normalizedPath}`,
         )
@@ -2281,21 +2398,19 @@ async function generateFilesystemArgs(
   // each: a symlink spelling would pin the chain of the link, not of where
   // the mount sits. Deny binds, tmpfs units and masks are emitted later and
   // land on top of both pins and covers.
-  if (ancestorPinPlan !== undefined) {
-    const pinArgs = ancestorPinArgs(
-      [
-        ...denyWriteRawDests.keys(),
-        ...fileMasks.map(mask => mask.landing),
-        ...readDenyTmpfsUnits.map(unit => unit.landing),
-      ],
-      {
-        rootIsWriteRoot: ancestorPinPlan.rootIsWriteRoot,
-        isWithinAllowedWrite: isWithinAnyAllowedWritePath,
-        isAllowedWriteRoot,
-      },
-    )
-    args.splice(ancestorPinPlan.insertAt, 0, ...pinArgs)
-  }
+  const pinArgs = ancestorPinArgs(
+    [
+      ...denyWriteRawDests.keys(),
+      ...fileMasks.map(mask => mask.landing),
+      ...readDenyTmpfsUnits.map(unit => unit.landing),
+    ],
+    {
+      rootIsWriteRoot: isAllowedWriteRoot('/'),
+      isWithinAllowedWrite: isWithinAnyAllowedWritePath,
+      isAllowedWriteRoot,
+    },
+  )
+  args.splice(ancestorPinInsertAt, 0, ...pinArgs)
 
   // Emitting denyWrite last means these ro-binds layer on top of any write
   // paths the denyRead loop just re-bound. Before this ordering, tmpfs over
@@ -2320,6 +2435,9 @@ async function generateFilesystemArgs(
   for (let i = 0; i < denyWriteArgs.length; i += 3) {
     const dest = denyWriteArgs[i + 2]!
     const rawDest = denyWriteRawDests.get(dest) ?? dest
+    // A mask's landing, not its dest: the landing is where the mask's bind
+    // actually sits, and this deny's dest is canonical, so the two are
+    // comparable as written.
     if (fileMasks.some(mask => mask.landing === dest)) continue
     if (isHiddenByTmpfs(dest, 'writes')) {
       logForDebugging(
@@ -2339,14 +2457,14 @@ async function generateFilesystemArgs(
             continue
           }
           // A masked file needs no restore: its mask already holds it
-          // unreadable and unwritable. Binding the real file read-only here
-          // would land ABOVE that mask and leave the protection to the mask
-          // re-application below, which is one comparison away from not
-          // covering an equal path at all. Skipping keeps it local. A masked
-          // file strictly BENEATH a restored directory is the other case and
-          // stays: recording that directory is what puts its mask back on
-          // top. Masks and restores are both keyed by where they land, so
-          // one comparison answers for every spelling.
+          // unreadable and unwritable. A read-only bind of the real file here
+          // would land ABOVE that mask, and the re-application below would
+          // then have to put the mask back over a bind this loop only just
+          // emitted — so skipping saves both that bind and its emitted-dest
+          // entry. A masked file strictly BENEATH a restored directory is the
+          // other case and stays: recording that directory is what puts its
+          // mask back on top. Masks and restores are both keyed by where they
+          // land, so one comparison answers for every spelling.
           if (fileMasks.some(mask => mask.landing === writePath)) {
             logForDebugging(
               `[Sandbox Linux] Leaving a masked file to its mask inside dropped denyWrite bind ${dest}: ${writePath}`,
@@ -2381,11 +2499,10 @@ async function generateFilesystemArgs(
   // re-binds the denyRead loop emitted. A bind of '/' itself (allowOnly and
   // denyWithinAllow both naming it) contains every one of them, so
   // containment is root-aware. An allowed write path beneath such a tmpfs
-  // lies inside the emitted deny dest too, so the deny wins: it goes back in
-  // as an allowRead entry and comes back read-only, visible as it was after
-  // the first pass but not writable. Deeper units and masks under the same
-  // dest follow in the same order as the first pass, so nothing restored
-  // here stays on top of one.
+  // lies inside the emitted deny dest too, so the deny wins: it comes back
+  // read-only, visible as it was after the first pass but not writable.
+  // Deeper units and masks under the same dest follow in the same order as
+  // the first pass, so nothing restored here stays on top of one.
   for (const unit of readDenyTmpfsUnits) {
     const reExposingDest = emittedDenyWriteDests.find(dest =>
       isStrictlyUnder(unit.landing, dest),
@@ -2394,25 +2511,21 @@ async function generateFilesystemArgs(
       logForDebugging(
         `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${unit.landing}`,
       )
-      // The helper logs each restore as a read allow; say which of them are
-      // write paths losing their write access, and to which deny.
+      // Name the paths that lose their write access here, and to which deny.
       if (unit.restoredWrites.length > 0) {
         logForDebugging(
           `[Sandbox Linux] Restoring write paths read-only inside denyWrite bind ${reExposingDest}: ${unit.restoredWrites.map(w => w.dest).join(', ')}`,
         )
       }
-      pushReadDenyDirMounts(args, {
-        landing: unit.landing,
-        allowedWritePaths: [],
-        // Their destinations, not their sources: each goes back where the
-        // first pass put it, and restorePlacementOf re-derives the same
-        // source from the same cached resolution.
-        readAllowPaths: [...unit.restoredWrites, ...unit.restoredReads].map(
-          restored => restored.dest,
-        ),
-        resolved: canonicalForm,
-        nameLocation: nameLocationOf,
-      })
+      // The recorded pairs go back as they are: each restore returns to where
+      // the first pass put it, from the source it vetted then. Write paths
+      // come back read-only, being inside the deny that re-exposed the tmpfs.
+      // The tmpfs goes back at the unit's landing, which is the destination
+      // the first pass gave bwrap for it.
+      args.push('--tmpfs', unit.landing)
+      for (const restored of [...unit.restoredWrites, ...unit.restoredReads]) {
+        args.push('--ro-bind', restored.source, restored.dest)
+      }
     }
   }
   // Same problem for masked files: the mask landed before the denyWrite

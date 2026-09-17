@@ -17,7 +17,7 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
-import { bwrapCanNamespace } from '../helpers/bwrap.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
 /**
  * A bwrap profile too large for one shell argument (32 pages) has its mounts
