@@ -89,7 +89,7 @@ export function containsGlobCharsWin(p: string): boolean {
 }
 
 /** Platform-appropriate glob-char check. */
-function containsGlobCharsForPlatform(p: string): boolean {
+export function containsGlobCharsForPlatform(p: string): boolean {
   return getPlatform() === 'windows'
     ? containsGlobCharsWin(p)
     : containsGlobChars(p)
@@ -280,13 +280,13 @@ export function isSymlinkOutsideBoundary(
  * valid POSIX filename byte — `~\foo` is a legal relative filename
  * on Linux/macOS and must NOT tilde-expand there.
  */
-export function expandTilde(p: string): string {
-  if (p === '~') return homedir()
+export function expandTilde(p: string, home: string = homedir()): string {
+  if (p === '~') return home
   if (
     p.startsWith('~/') ||
     (process.platform === 'win32' && p.startsWith('~\\'))
   ) {
-    return homedir() + p.slice(1)
+    return home + p.slice(1)
   }
   return p
 }
