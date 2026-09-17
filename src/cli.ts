@@ -322,14 +322,20 @@ async function main(): Promise<void> {
           // we keep the existing shell-string path.
           let child
           if (process.platform === 'win32') {
-            // env carries the proxy vars the sandboxed child must inherit.
-            const { argv, env } =
-              await SandboxManager.wrapWithSandboxArgv(command)
-            child = spawn(argv[0], argv.slice(1), {
-              shell: false,
-              stdio: 'inherit',
-              env,
-            })
+            // spawnWrappedCommandWindows owns the stdin contract:
+            // with a proxy auth token, the broker's stdin is a pipe
+            // that carries the --env-stdin secret frame then EOF;
+            // without one it stays 'inherit'. The mode difference
+            // costs nothing either way — the sandboxed child's
+            // stdin is NEVER the broker's stdin (it is the
+            // broker→runner spec pipe at EOF; see spawn_runner in
+            // vendor/srt-win-src/src/logon.rs and std_handles in
+            // launch.rs), so no user input is lost by piping here.
+            const { spawnWrappedCommandWindows } = await import(
+              './sandbox/windows-sandbox-utils.js'
+            )
+            const wrapped = await SandboxManager.wrapWithSandboxArgv(command)
+            child = spawnWrappedCommandWindows(wrapped)
           } else {
             const sandboxedCommand =
               await SandboxManager.wrapWithSandbox(command)

@@ -6,7 +6,7 @@ import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import {
-  generateProxyEnvVars,
+  generateProxyEnvEntries,
   encodeSandboxedCommand,
   buildGitConfigEnv,
   normalizePathForSandbox,
@@ -112,6 +112,12 @@ export type WindowsSandboxErrorCode =
   | 'acl_grant_failed'
   /** `srt-win exec` argv would exceed CreateProcessW's 32 767-char limit. */
   | 'argv_too_long'
+  /**
+   * The `--env-stdin` secret-env frame would exceed srt-win's 4 MiB
+   * frame cap — a misconfiguration (the secret set is a handful of
+   * proxy URLs), surfaced before spawning anything.
+   */
+  | 'env_frame_too_large'
   /** Sandbox user account / credential not present — run install. */
   | 'not_provisioned'
   /**
@@ -360,18 +366,24 @@ export interface WindowsSandboxParams {
    *  `command`. See MacOSSandboxParams.commandId. */
   commandId?: string
   /**
-   * JS HTTP proxy port — fed to `generateProxyEnvVars` for the env
+   * JS HTTP proxy port — fed to `generateProxyEnvEntries` for the env
    * overlay. With the in-process proxy this is the mux front-end
    * port (same as `socksProxyPort`).
    */
   httpProxyPort?: number
   /**
-   * JS SOCKS proxy port — fed to `generateProxyEnvVars` for the env
+   * JS SOCKS proxy port — fed to `generateProxyEnvEntries` for the env
    * overlay. With the in-process proxy this is the mux front-end
    * port (same as `httpProxyPort`).
    */
   socksProxyPort?: number
-  /** Per-session proxy auth token; embedded in proxy env URLs. */
+  /**
+   * Per-session proxy auth token; embedded in proxy env URLs.
+   * Entries carrying it are delivered via the `--env-stdin` frame
+   * (returned as `stdinPayload`), never on `srt-win exec`'s argv or
+   * spawn env — command lines are freely readable by same-user
+   * sibling processes.
+   */
   proxyAuthToken?: string
   /**
    * `mode: 'mask'` credential env vars — sentinel values the
@@ -432,7 +444,7 @@ export interface WindowsSandboxParams {
   gitSafeDirectories?: readonly string[]
   /**
    * Path to the TLS-termination trust bundle (the MITM CA + system
-   * roots) — fed to {@link generateProxyEnvVars} so the child's
+   * roots) — fed to {@link generateProxyEnvEntries} so the child's
    * `NODE_EXTRA_CA_CERTS` / `CURL_CA_BUNDLE` / `SSL_CERT_FILE` /
    * etc. point at it. Backslashes are normalised to forward slashes
    * before emission so the value survives msys2 env conversion AND
@@ -692,8 +704,10 @@ function runSrtWinAsync(
     let stderr = ''
     child.stdout?.setEncoding('utf8').on('data', d => (stdout += d))
     child.stderr?.setEncoding('utf8').on('data', d => (stderr += d))
-    // Swallow EPIPE if the child dies before the stdin write drains.
-    child.stdin?.on('error', () => {}).end(opts.stdin)
+    // EPIPE (child died before the stdin write drained) is absorbed;
+    // any other stdin error re-emits as the child's 'error' event and
+    // rejects via the handler below.
+    writeStdinPayload(child, opts.stdin)
     child.once('error', e => {
       clearTimeout(timer)
       reject(
@@ -2001,25 +2015,39 @@ export function revokeWindowsAcl(opts: {
 
 /**
  * Build the spawn descriptor for running `command` inside the Windows
- * sandbox: an `argv` array plus the `env` to spawn it with.
+ * sandbox: an `argv` array, the `env` to spawn it with, and — when a
+ * proxy auth token is in play — a `stdinPayload` the caller must
+ * write to the spawned process's stdin.
  *
  * Caller MUST spawn the result with `{shell: false}` — that is the
  * security boundary that keeps untrusted bytes off the host's shell
  * (the inner `cmd.exe /c` runs INSIDE the sandbox; see
  * `vendor/srt-win-src/src/launch.rs` `build_cmdline` for the passthrough
- * rationale) — AND with the returned `env`.
+ * rationale) — AND with the returned `env`. When `stdinPayload` is
+ * set, the caller MUST additionally spawn with stdin piped and write
+ * the payload immediately — {@link spawnWrappedCommandWindows} owns
+ * both duties; `srt-win exec` reads the frame up front (before any
+ * per-exec side effect) and fails after 5s naming this contract
+ * rather than hanging if the write never comes. It carries the
+ * overlay entries whose values embed the per-session proxy auth
+ * token, framed as
+ * `<u32 LE length><JSON [[KEY,VALUE],…]>` for `--env-stdin`. Those
+ * entries are excluded from both the `--env` argv overlay and the
+ * returned spawn `env` — a process's command line is freely readable
+ * by same-user sibling processes, so the token must never ride argv.
  *
- * Proxy configuration is single-sourced by {@link generateProxyEnvVars}
+ * Proxy configuration is single-sourced by {@link generateProxyEnvEntries}
  * (the same canonical builder used on macOS/Linux). `srt-win exec`
  * takes no `--http-proxy` / `--socks-proxy` flags and synthesizes no
  * proxy env. The two-hop runner starts with the SANDBOX user's
  * profile env (`USERPROFILE`/`TEMP` isolated) and overlays exactly
- * what we pass as `--env` — built here from the broker's `PATH` plus
- * the generated proxy set.
+ * what we pass as `--env` plus the `--env-stdin` frame — built here
+ * from the broker's `PATH` plus the generated proxy set.
  */
 export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   argv: string[]
   env: NodeJS.ProcessEnv
+  stdinPayload?: Buffer
 } {
   const { exe, prependArgs } = p.srtWin ?? resolveSrtWin()
   // Generated proxy + CA-trust env. Single-sourced here so the
@@ -2034,16 +2062,21 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // trust comes from the registry write `srt-win user trust-ca`
   // did at install time; the env-var layer here covers the
   // OpenSSL-backed tools.
-  const generated = envListToObject(
-    generateProxyEnvVars(
-      p.httpProxyPort,
-      p.socksProxyPort,
-      p.caCertPath?.replace(/\\/g, '/'),
-      p.proxyAuthToken,
-      undefined,
-      encodeSandboxedCommand(p.commandId ?? p.command),
-    ),
+  const proxyEnv = generateProxyEnvEntries(
+    p.httpProxyPort,
+    p.socksProxyPort,
+    p.caCertPath?.replace(/\\/g, '/'),
+    p.proxyAuthToken,
+    undefined,
+    encodeSandboxedCommand(p.commandId ?? p.command),
   )
+  const generated = envListToObject(proxyEnv.env)
+  // Uppercased names of entries whose value embeds the per-session
+  // proxy auth token — tagged at the source (the sole builder that
+  // interpolates the credential), so this module never re-derives
+  // "is this value secret" by string matching. Drives BOTH the
+  // argv/stdin partition and the broker-env scrub below.
+  const secretKeySet = new Set(proxyEnv.secretKeys.map(k => k.toUpperCase()))
   // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it
   // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
   delete generated.TMPDIR
@@ -2094,8 +2127,23 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     ...generated,
     ...gitCfg,
   }
+  // Secret split: entries tagged token-bearing at the source
+  // (`secretKeySet`) must NOT ride argv — command lines are freely
+  // readable by same-user sibling processes. They go over `srt-win
+  // exec`'s own stdin instead (`--env-stdin`, length-prefixed JSON;
+  // see `runner::decode_env_frame`). Everything else stays on
+  // `--env` for debuggability. srt-win enforces the two channels'
+  // keys stay disjoint, which this single partition guarantees.
+  const secretEntries: [string, string][] = []
   for (const [k, v] of Object.entries(overlay)) {
-    if (v !== undefined) argv.push('--env', `${k}=${v}`)
+    if (v === undefined) continue
+    if (secretKeySet.has(k.toUpperCase())) secretEntries.push([k, v])
+    else argv.push('--env', `${k}=${v}`)
+  }
+  let stdinPayload: Buffer | undefined
+  if (secretEntries.length > 0) {
+    argv.push('--env-stdin')
+    stdinPayload = encodeEnvStdinFrame(secretEntries)
   }
   argv.push('--')
 
@@ -2124,15 +2172,126 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // broker process's environment never reaches the child. The
   // returned `env` is the spawn env for the broker (srt-win)
   // process only; the child sees the `--env` overlay built into
-  // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy).
-  const env: NodeJS.ProcessEnv = { ...process.env, ...generated }
-  return { argv, env }
+  // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy)
+  // plus the `--env-stdin` frame. Secret-tagged KEYS are scrubbed
+  // from the broker env by NAME (any case variant), not by value:
+  // the broker never needs them, its env is one more
+  // same-user-readable surface, and an ambient same-named var can
+  // carry a DIFFERENT secret we'd otherwise pass through — a stale
+  // export, or an OUTER sandbox session's token when nested.
+  const env: NodeJS.ProcessEnv = { ...process.env }
+  if (secretKeySet.size > 0) {
+    for (const k of Object.keys(env)) {
+      if (secretKeySet.has(k.toUpperCase())) delete env[k]
+    }
+  }
+  for (const [k, v] of Object.entries(generated)) {
+    if (v === undefined || secretKeySet.has(k.toUpperCase())) continue
+    env[k] = v
+  }
+  return { argv, env, stdinPayload }
+}
+
+/**
+ * srt-win's length-prefixed-frame sanity cap (`FRAME_CAP` in
+ * `vendor/srt-win-src/src/runner.rs`). A larger frame is rejected by
+ * the reader; {@link encodeEnvStdinFrame} rejects it writer-side
+ * first so the misconfiguration surfaces before anything spawns.
+ */
+export const ENV_STDIN_FRAME_CAP = 4 * 1024 * 1024
+
+/**
+ * Encode `--env-stdin` overlay entries as the frame `srt-win exec`
+ * reads from its stdin: `<u32 LE byte-length><JSON [[KEY,VALUE],…]>`.
+ * Canonical writer-side definition of the wire format — the reader
+ * is `runner::decode_env_frame` in `vendor/srt-win-src/src/runner.rs`
+ * (whose `encode_env_frame` test helper mirrors this).
+ */
+export function encodeEnvStdinFrame(entries: [string, string][]): Buffer {
+  const json = Buffer.from(JSON.stringify(entries), 'utf8')
+  if (json.length > ENV_STDIN_FRAME_CAP) {
+    throw new WindowsSandboxError(
+      'env_frame_too_large',
+      `--env-stdin frame is ${json.length} bytes; srt-win caps ` +
+        `frames at 4 MiB. The secret env set should be a handful ` +
+        `of proxy URLs — check what is being routed into it.`,
+    )
+  }
+  const frame = Buffer.alloc(4 + json.length)
+  frame.writeUInt32LE(json.length, 0)
+  json.copy(frame, 4)
+  return frame
+}
+
+/**
+ * Write `payload` (if any) to `child`'s stdin and close it,
+ * absorbing ONLY `EPIPE` — the child exiting before the write
+ * drains, where its exit code/stderr is the real diagnostic (e.g.
+ * an older `srt-win.exe` rejecting `--env-stdin` as an unknown
+ * argument). Any other stream error is re-emitted as the child's
+ * `'error'` event so callers' existing handlers surface it.
+ */
+export function writeStdinPayload(
+  child: {
+    stdin: NodeJS.WritableStream | null
+    emit(event: 'error', err: Error): boolean
+  },
+  payload?: Buffer | string,
+): void {
+  const sink = child.stdin
+  if (!sink) return
+  sink.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code !== 'EPIPE') child.emit('error', e)
+  })
+  if (payload === undefined) sink.end()
+  else sink.end(payload)
+}
+
+/**
+ * Spawn a {@link wrapCommandWithSandboxWindows} /
+ * `wrapWithSandboxArgv` result, owning the whole stdin contract so
+ * callers cannot get it wrong: stdin is piped and the secret
+ * `stdinPayload` frame written exactly when one exists, `inherit`
+ * otherwise. This is the sanctioned way to run the wrapped argv; a
+ * caller that spawns by hand MUST replicate this (pipe stdin +
+ * write the payload immediately) or `srt-win exec` fails the exec
+ * after 5s naming the contract. Note the mode dependence: without a
+ * proxy auth token the broker's stdin is the caller's own
+ * (inherited); with one it is a pipe that carries the frame and
+ * then EOF. Neither reaches the sandboxed CHILD, whose stdin is the
+ * broker→runner spec pipe at EOF (`spawn_runner` in
+ * `vendor/srt-win-src/src/logon.rs`; the child inherits the
+ * runner's std handles — `std_handles` in `launch.rs`).
+ */
+export function spawnWrappedCommandWindows(
+  wrapped: { argv: string[]; env: NodeJS.ProcessEnv; stdinPayload?: Buffer },
+  options: {
+    cwd?: string
+    stdout?: 'inherit' | 'pipe'
+    stderr?: 'inherit' | 'pipe'
+  } = {},
+): ReturnType<typeof spawn> {
+  const { argv, env, stdinPayload } = wrapped
+  // shell:false is the security boundary — the wrapped command must
+  // never transit the host's shell (see wrapCommandWithSandboxWindows).
+  const child = spawn(argv[0], argv.slice(1), {
+    shell: false,
+    cwd: options.cwd,
+    env,
+    stdio: [
+      stdinPayload ? 'pipe' : 'inherit',
+      options.stdout ?? 'inherit',
+      options.stderr ?? 'inherit',
+    ],
+  })
+  if (stdinPayload) writeStdinPayload(child, stdinPayload)
+  return child
 }
 
 /**
  * Parse a list of `KEY=VALUE` strings (as produced by
- * {@link generateProxyEnvVars}) into an object. Splits on the FIRST
- * `=` only, so values containing `=` survive intact.
+ * {@link generateProxyEnvEntries}) into an object. Splits on the
+ * FIRST `=` only, so values containing `=` survive intact.
  */
 function envListToObject(list: string[]): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}

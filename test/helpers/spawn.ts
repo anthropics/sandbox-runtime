@@ -6,6 +6,12 @@ type RunOpts = {
   timeout?: number
   cwd?: string
   env?: NodeJS.ProcessEnv
+  /**
+   * Bytes written to the child's stdin before EOF (like spawnSync's
+   * `input`). Used for `srt-win exec --env-stdin`'s secret-env frame
+   * (`wrapWithSandboxArgv`'s `stdinPayload`).
+   */
+  input?: Buffer | string
 }
 
 export type RunResult = {
@@ -40,9 +46,19 @@ export async function spawnAsync(
     ? spawn(cmd, args, { cwd: opts.cwd, env: opts.env })
     : spawn(cmd, { shell: opts.shell ?? true, cwd: opts.cwd, env: opts.env })
 
-  // Match spawnSync's default: when no `input` is given, the child sees
-  // EOF on stdin immediately. Without this, things like `su` wait for a
-  // password on the open pipe.
+  // Match spawnSync: write `input` (if any), then EOF. Without the
+  // end(), things like `su` wait for a password on the open pipe.
+  // EPIPE (child exited before reading the payload — its exit
+  // code/stderr is the real diagnostic) is absorbed ONLY when an
+  // `input` was actually written, mirroring
+  // src/sandbox/windows-sandbox-utils.ts `writeStdinPayload` (the
+  // production writer; local copy so this generic helper stays free
+  // of prod imports). Anything else re-emits on the child →
+  // unhandled 'error' → the test fails loudly.
+  child.stdin?.on('error', (e: NodeJS.ErrnoException) => {
+    if (opts.input === undefined || e.code !== 'EPIPE') child.emit('error', e)
+  })
+  if (opts.input !== undefined) child.stdin?.write(opts.input)
   child.stdin?.end()
 
   let stdout = ''

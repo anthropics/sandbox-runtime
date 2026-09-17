@@ -194,7 +194,9 @@ enum Cmd {
     /// The child inherits the runner's environment (= the sandbox
     /// user's `LOGON_WITH_PROFILE` defaults) with the `--env` overlay
     /// applied — proxy configuration is single-sourced by the caller
-    /// (TS `generateProxyEnvVars`) and passed here via `--env`.
+    /// (TS `generateProxyEnvEntries`) and passed here via `--env`, except
+    /// secret-bearing entries, which ride the `--env-stdin` frame so
+    /// they never appear on a command line.
     ///
     /// Requires `srt-win install` to have provisioned the user;
     /// otherwise exits **15**.
@@ -216,10 +218,26 @@ enum Cmd {
         /// profile environment when building the child's env block.
         /// Repeatable. The broker forwards exactly these — it does
         /// NOT enumerate its own environment for proxy/CA vars; the
-        /// caller (whose `generateProxyEnvVars` is the single
+        /// caller (whose `generateProxyEnvEntries` is the single
         /// source) passes them here explicitly.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Read one additional overlay frame from THIS process's
+        /// stdin: `<u32 LE length><JSON [[KEY,VALUE],…]>` (see
+        /// `runner::decode_env_frame`). Secret-bearing entries —
+        /// the per-session proxy auth token embedded in the proxy
+        /// URLs — ride here instead of `--env`: command lines are
+        /// freely readable by same-user sibling processes, so argv
+        /// must stay token-free. Frame keys must be DISJOINT from
+        /// `--env` keys (case-insensitive) — overlap is an error,
+        /// not a merge. The caller must pipe stdin and write the
+        /// frame immediately after spawning (the TS wrapper returns
+        /// it as `stdinPayload`): exec reads it up front, before
+        /// any per-exec side effect, rejects a console stdin
+        /// outright, and gives up after 5s naming this contract
+        /// rather than blocking forever.
+        #[arg(long = "env-stdin")]
+        env_stdin: bool,
         /// Suppress informational stderr (progress lines,
         /// per-exec-deny summary, seclogon-job note). Actual
         /// errors still print. The host sets this by default so
@@ -1373,6 +1391,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             deny_read,
             deny_write,
             env,
+            env_stdin,
             quiet,
             target,
         } => {
@@ -1396,6 +1415,45 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
+
+            // env_overlay = exactly what the caller passed via
+            // `--env`. The broker does not enumerate its own
+            // environment; the caller (whose proxy/CA-var builder
+            // is the single source) supplies the full overlay
+            // explicitly.
+            let mut env_overlay: Vec<(String, String)> = env
+                .iter()
+                .map(|kv| {
+                    kv.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "--env value '{kv}' has no '=' \
+                                 (expected KEY=VALUE)"
+                            )
+                        })
+                })
+                .collect::<anyhow::Result<_>>()?;
+            // `--env-stdin`: secret-bearing overlay entries (the
+            // per-session proxy auth token embedded in the proxy
+            // URLs) arrive as a length-prefixed JSON frame on THIS
+            // process's stdin, never on argv — command lines are
+            // freely readable by same-user sibling processes. Read
+            // UP FRONT, before the share-lock / per-exec deny-ACE
+            // stamps / broker DACL below, so a caller that never
+            // writes the frame wedges nothing but itself — no live
+            // ACEs sit on real filesystem paths while we wait. The
+            // read itself is guarded (console stdin rejected, 5s
+            // deadline) because the flag is library-facing: a
+            // downstream spawner may pass the argv through while
+            // ignoring the stdinPayload contract. Nothing else
+            // reads exec's stdin today; if that ever changes, note
+            // that `Stdin`'s buffered reader may pull post-frame
+            // bytes into this process's buffer.
+            if env_stdin {
+                let extra = read_env_stdin_frame()?;
+                env_overlay = srt_win::runner::merge_env_overlay(env_overlay, extra)?;
+            }
 
             // Share-lock current_exe() so a sandboxed child can't
             // rename/overwrite the broker binary mid-exec — see
@@ -1491,24 +1549,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             if let Err(e) = srt_win::self_protect::install_broker_dacl(Some(&real_user)) {
                 eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
             }
-            // env_overlay = exactly what the caller passed via
-            // `--env`. The broker does not enumerate its own
-            // environment; the caller (whose proxy/CA-var builder
-            // is the single source) supplies the full overlay
-            // explicitly.
-            let env_overlay: Vec<(String, String)> = env
-                .iter()
-                .map(|kv| {
-                    kv.split_once('=')
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "--env value '{kv}' has no '=' \
-                                 (expected KEY=VALUE)"
-                            )
-                        })
-                })
-                .collect::<anyhow::Result<_>>()?;
             if !quiet {
                 eprintln!(
                     "srt-win: launching runner as '{}' (overlay={} var(s))",
@@ -1561,6 +1601,60 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read the `--env-stdin` secret-env frame from this process's own
+/// stdin, defensively. The flag is library-facing: a downstream
+/// spawner can pass the wrapped argv through while ignoring the
+/// `stdinPayload` half of the contract, and that mistake must fail
+/// fast and loud, not hang:
+///
+/// - a CONSOLE stdin is rejected outright — the frame can only
+///   arrive on a pipe, and blocking here would eat the user's
+///   terminal keystrokes as a binary length prefix;
+/// - the read runs on a helper thread with a 5s deadline; on
+///   expiry we fail naming the contract instead of blocking
+///   forever. (The helper thread stays parked on the read, which
+///   is fine — the error path exits the process.)
+fn read_env_stdin_frame() -> anyhow::Result<Vec<(String, String)>> {
+    use anyhow::Context;
+    use windows::Win32::System::Console::{
+        CONSOLE_MODE, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+    };
+    let is_console = unsafe {
+        match GetStdHandle(STD_INPUT_HANDLE) {
+            Ok(h) => {
+                let mut mode = CONSOLE_MODE::default();
+                GetConsoleMode(h, &mut mode).is_ok()
+            }
+            Err(_) => false,
+        }
+    };
+    if is_console {
+        anyhow::bail!(
+            "exec: --env-stdin requires stdin to be a pipe carrying \
+             the <u32 LE length><JSON> secret-env frame, but stdin \
+             is a console. Spawn with stdin piped and write the \
+             frame (wrapWithSandboxArgv's `stdinPayload`) \
+             immediately after spawning, or drop --env-stdin."
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = srt_win::runner::decode_env_frame(&mut std::io::stdin().lock());
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(r) => r.context("exec: read --env-stdin overlay frame"),
+        Err(_) => anyhow::bail!(
+            "exec: timed out after 5s waiting for the --env-stdin \
+             frame — the caller passed --env-stdin but never wrote \
+             the <u32 LE length><JSON> secret-env frame to exec's \
+             stdin. wrapWithSandboxArgv callers must write \
+             `stdinPayload` immediately after spawning (or use the \
+             provided spawn helper)."
+        ),
+    }
 }
 
 fn is_elevated() -> anyhow::Result<bool> {
@@ -1805,5 +1899,100 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    /// Full exec-side delivery path, no VM needed: a hand-rolled
+    /// frame exactly as ci/smoke-env-stdin.ps1 writes it (u32 LE
+    /// byte length + compact JSON `[[K,V],…]`, NOT built with
+    /// `encode_env_frame` — independence from the canonical encoder
+    /// is the point) goes through `decode_env_frame` →
+    /// `merge_env_overlay` → `RunnerSpec` → `encode_cmd`, and the
+    /// token-bearing var must be present in the spec JSON the
+    /// runner would receive over the spec pipe.
+    #[test]
+    fn exec_env_stdin_frame_reaches_runner_spec() {
+        use srt_win::runner::{
+            RunnerCmd, RunnerSpec, decode_env_frame, encode_cmd, merge_env_overlay,
+        };
+        let token = "tokprobe0123456789abcdef0123456789abcdef";
+        let url = format!("http://sb:{token}@localhost:60080");
+        let json = format!(r#"[["HTTP_PROXY","{url}"],["HTTPS_PROXY","{url}"]]"#);
+        let mut frame = (json.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(json.as_bytes());
+
+        // `--env` args as the probe passes them, through the same
+        // split_once('=') parse the exec handler uses.
+        let env_args = [
+            "PATH=C:\\Windows\\System32".to_string(),
+            "PATHEXT=.COM;.EXE;.BAT;.CMD".to_string(),
+        ];
+        let base: Vec<(String, String)> = env_args
+            .iter()
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').expect("KEY=VALUE");
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+
+        let extra = decode_env_frame(&mut &frame[..]).expect("decode probe frame");
+        let overlay = merge_env_overlay(base, extra).expect("disjoint merge");
+        assert_eq!(overlay.len(), 4, "PATH + PATHEXT + 2 frame vars");
+
+        let spec_bytes = encode_cmd(&RunnerCmd::Exec(RunnerSpec {
+            argv: vec!["cmd.exe".into(), "/c".into(), "set".into()],
+            env_overlay: overlay,
+        }))
+        .expect("encode spec");
+        let spec_json = std::str::from_utf8(&spec_bytes[4..]).expect("utf8");
+        assert!(
+            spec_json.contains(&format!(r#"["HTTPS_PROXY","{url}"]"#)),
+            "token var missing from runner spec JSON: {spec_json}"
+        );
+        // And a decode round-trip of what the runner would parse.
+        let back: RunnerCmd = serde_json::from_slice(spec_bytes[4..].as_ref()).unwrap();
+        match back {
+            RunnerCmd::Exec(s) => {
+                assert!(
+                    s.env_overlay
+                        .iter()
+                        .any(|(k, v)| k == "HTTPS_PROXY" && v == &url),
+                    "HTTPS_PROXY lost across the spec pipe"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// `--env-stdin` on `exec` parses, defaults false, and composes
+    /// with `--env` (the TS wrapper emits both: plain entries via
+    /// `--env`, secret-bearing entries via the stdin frame).
+    #[test]
+    fn exec_env_stdin_flag_parses() {
+        let with = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--quiet",
+            "--env",
+            "PATH=C:\\bin",
+            "--env-stdin",
+            "--",
+            "cmd.exe",
+        ])
+        .expect("parse");
+        match with.cmd {
+            Cmd::Exec { env, env_stdin, .. } => {
+                assert!(env_stdin);
+                assert_eq!(env, ["PATH=C:\\bin"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(
+            without.cmd,
+            Cmd::Exec {
+                env_stdin: false,
+                ..
+            }
+        ));
     }
 }

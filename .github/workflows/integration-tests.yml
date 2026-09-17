@@ -125,6 +125,11 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-machine-store.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      - name: Smoke-test srt-win --env-stdin secret channel (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-env-stdin.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
