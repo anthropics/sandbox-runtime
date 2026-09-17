@@ -996,6 +996,29 @@ export const SrtWinConfigSchema = z.object({
 })
 
 /**
+ * MXC runner location (Windows only). Locates the `wxc-exec.exe`
+ * native runner that `@microsoft/mxc-sdk` ships prebuilt under
+ * `bin/<arch>/`. Parallel to {@link SrtWinConfigSchema} — a
+ * deployment knob, NOT a policy choice: srt selects between MXC
+ * BaseContainer and srt-win automatically at initialize() based on
+ * what the host's Windows build supports (`wxc-exec --probe`), and
+ * falls back to srt-win on any ambiguity. See
+ * `mxc-sandbox-utils.ts` `selectWindowsBackend`.
+ */
+export const MxcConfigSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Path to the wxc-exec.exe runner. When unset, resolved from ' +
+        'the installed @microsoft/mxc-sdk package ' +
+        '(bin/<arch>/wxc-exec.exe) or the MXC_BIN_DIR env var, ' +
+        "mirroring the SDK's own lookup order.",
+    ),
+})
+
+/**
  * Windows-specific configuration schema. See
  * `windows-sandbox-utils.ts` for the install flow these settings
  * must agree with.
@@ -1049,6 +1072,11 @@ export const WindowsConfigSchema = z.object({
     'How to locate/invoke the srt-win helper binary. `srtWin.path` is ' +
       'required to use the Windows sandbox — your own (multicall) binary, ' +
       'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
+  ),
+  mxc: MxcConfigSchema.optional().describe(
+    'Where to find the MXC wxc-exec.exe runner (backend selection ' +
+      'itself is automatic — BaseContainer-capable hosts use MXC, ' +
+      'all others use srt-win).',
   ),
 })
 
@@ -1422,5 +1450,6 @@ export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type GitConfig = z.infer<typeof GitConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
 export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
+export type MxcConfig = z.infer<typeof MxcConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

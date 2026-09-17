@@ -2132,9 +2132,10 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 /**
  * Parse a list of `KEY=VALUE` strings (as produced by
  * {@link generateProxyEnvVars}) into an object. Splits on the FIRST
- * `=` only, so values containing `=` survive intact.
+ * `=` only, so values containing `=` survive intact. Shared with the
+ * MXC backend's broker-env assembly.
  */
-function envListToObject(list: string[]): NodeJS.ProcessEnv {
+export function envListToObject(list: readonly string[]): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}
   for (const entry of list) {
     const eq = entry.indexOf('=')
