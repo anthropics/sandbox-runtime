@@ -24,6 +24,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
+import { indexOfMount, lastIndexOfMount } from '../helpers/bwrap-argv.js'
 import {
   wrapCommandWithSandboxMacOS,
   macGetMandatoryDenyEntries,
@@ -2385,8 +2386,21 @@ describe('Git metadata deny paths - Unit Tests', () => {
 
         // The covering deny is the `modules` beneath it, not the git directory
         // itself: denying that whole would take its objects, refs and index.
+        // An ancestor pin spells that same self-bind, so where it sits is
+        // what tells the two apart: pins are spliced in before the write
+        // root's own bind, which makes the tree writable again, and a deny
+        // bind is emitted after it.
         const command = await wrap('true')
-        expect(command).not.toContain(`--ro-bind ${bound} ${bound} `)
+        const writeRootBind = indexOfMount(
+          command,
+          '--bind',
+          checkout,
+          checkout,
+        )
+        expect(writeRootBind).toBeGreaterThan(-1)
+        expect(
+          lastIndexOfMount(command, '--ro-bind', bound, bound),
+        ).toBeLessThan(writeRootBind)
         expect(command).toContain(join(bound, 'modules'))
         expect(command).toContain(`--ro-bind ${join(bound, 'hooks')} `)
 

@@ -20,6 +20,14 @@
 export interface FsReadRestrictionConfig {
   denyOnly: string[]
   allowWithinDeny?: string[]
+  /**
+   * The `denyOnly` entries that stand for a directory a glob expansion could
+   * not list. Nothing is bound back beneath one — neither an
+   * `allowWithinDeny` path nor an allowed write path — because what the
+   * pattern matches under such a path was never found and would come back
+   * unmasked. Linux only: the other backends match globs natively.
+   */
+  unlistableDenyDirs?: string[]
 }
 
 /**
