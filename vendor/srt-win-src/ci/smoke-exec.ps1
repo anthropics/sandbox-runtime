@@ -122,7 +122,7 @@ Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 # timeout and (b) per-element ArgumentList quoting that survives
 # PATH-with-spaces.
 function RExec {
-  param([string[]] $tail)
+  param([string[]] $tail, [int] $TimeoutSec = 30)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
             '--env', "PATHEXT=$($env:PATHEXT)") + $tail
@@ -138,11 +138,25 @@ function RExec {
   # WaitForExit.
   $so = $p.StandardOutput.ReadToEndAsync()
   $se = $p.StandardError.ReadToEndAsync()
-  if (-not $p.WaitForExit(30000)) {
+  if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+    # Report through the host, not the exception: the error view truncates a
+    # long message, and the child's output and the processes it got as far as
+    # starting are what say where it stopped.
+    $since = $p.StartTime
+    Get-CimInstance Win32_Process |
+      Where-Object { $_.ProcessId -eq $p.Id -or $_.CreationDate -ge $since } |
+      Sort-Object CreationDate |
+      ForEach-Object {
+        Write-Host ("RExec timeout: proc pid={0} ppid={1} {2} cpu={3:n1}s" -f
+          $_.ProcessId, $_.ParentProcessId, $_.Name,
+          (($_.UserModeTime + $_.KernelModeTime) / 1e7))
+      }
     try { $p.Kill($true) } catch { }
     $p.WaitForExit()
-    throw ("RExec: TIMEOUT after 30s. argv: $($argv -join ' ')`n" +
-           "stderr: $($se.Result)`nstdout: $($so.Result)")
+    Write-Host "RExec timeout: argv tail: $($tail -join ' ')"
+    Write-Host "RExec timeout: stderr:`n$($se.Result)"
+    Write-Host "RExec timeout: stdout:`n$($so.Result)"
+    throw "RExec: TIMEOUT after ${TimeoutSec}s (child output above)"
   }
   $exit  = $p.ExitCode
   $raw   = $so.Result + $se.Result
@@ -226,9 +240,14 @@ try {
   # NetTCPIP module and falls back to a ping, and this is the first pwsh
   # started under the new sandbox profile, so the pair can outlast RExec's
   # 30s limit on a slow runner.
+  # This is the first pwsh started as the sandbox user. 120s, and the
+  # elapsed time in the log, to tell a slow first start from one that never
+  # finishes.
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
     "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portInR); Write-Output CONNECTED } " +
-    "catch { Write-Output blocked }")
+    "catch { Write-Output blocked }") 120
+  Write-Host "R5b: first pwsh as srt-sandbox took $([int]$sw.Elapsed.TotalSeconds)s"
   if ($r.out -notmatch 'CONNECTED') {
     throw "R5b: loopback to in-range port $portInR did not succeed. raw: $($r.raw)"
   }
