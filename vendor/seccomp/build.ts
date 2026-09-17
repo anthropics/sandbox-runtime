@@ -18,6 +18,9 @@ function toCArray(bytes: Buffer): string {
 }
 
 const cflags = ['-static', '-O2', '-Wall', '-Wextra']
+// apply-seccomp brokers connect()/bind() on worker threads when an
+// allowUnixSockets allowlist is configured.
+const applyCflags = [...cflags, '-pthread']
 
 const gen = join(OUT, 'seccomp-unix-block')
 run([
@@ -56,7 +59,7 @@ writeFileSync(
 
 run([
   'gcc',
-  ...cflags,
+  ...applyCflags,
   '-I',
   OUT,
   '-o',

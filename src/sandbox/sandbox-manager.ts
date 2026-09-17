@@ -1770,6 +1770,7 @@ async function wrapWithSandbox(
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
+        allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
