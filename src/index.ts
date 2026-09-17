@@ -3,6 +3,18 @@ export { SandboxManager } from './sandbox/sandbox-manager.js'
 export type { WrapWithSandboxOptions } from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 
+// Sandbox-Agent channel (sandbox side)
+export {
+  SandboxAgentChannel,
+  blockedMessageFromViolation,
+  AGENT_CHANNEL_PROTOCOL_VERSION,
+  SANDBOX_AGENT_CHANNEL_FD_ENV_VAR,
+} from './sandbox/agent-channel.js'
+export type {
+  AgentChannelResource,
+  AgentChannelBlockedMessage,
+} from './sandbox/agent-channel.js'
+
 // Configuration types and schemas
 export type {
   SandboxRuntimeConfig,

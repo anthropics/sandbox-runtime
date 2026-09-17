@@ -3,7 +3,15 @@ import { quote } from './utils/shell-quote.js'
 import { Command } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
-import { spawn } from 'child_process'
+import type { SandboxAskCallback } from './sandbox/sandbox-schemas.js'
+import type { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
+import {
+  SandboxAgentChannel,
+  blockedMessageFromViolation,
+  SANDBOX_AGENT_CHANNEL_FD_ENV_VAR,
+} from './sandbox/agent-channel.js'
+import { spawn, type StdioOptions } from 'child_process'
+import type { Duplex } from 'stream'
 import { logForDebugging } from './utils/debug.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
 import * as readline from 'readline'
@@ -22,6 +30,50 @@ function getDefaultConfigPath(): string {
 /**
  * Create a minimal default config if no config file exists
  */
+/**
+ * Forward new violations from the store to the agent as `blocked` messages.
+ * The subscribe callback re-delivers the whole in-memory tail on every
+ * change, so the store's monotonic total count is what identifies which
+ * entries are new.
+ *
+ * Identical messages are sent only once: platform monitors report the same
+ * boilerplate denial for every process (e.g. seatbelt's sysctl-read), and a
+ * once-notified agent gains nothing from repeats — an unthrottled stream
+ * can even feed back, since the agent's own handling of a message may trip
+ * further violations.
+ */
+function forwardViolationsToAgent(
+  store: SandboxViolationStore,
+  channel: SandboxAgentChannel,
+): void {
+  let seenTotal = store.getTotalCount()
+  const sent = new Set<string>()
+  const maxSentEntries = 1000
+  store.subscribe(violations => {
+    const total = store.getTotalCount()
+    if (total <= seenTotal) {
+      return
+    }
+    const fresh = violations.slice(-(total - seenTotal))
+    seenTotal = total
+    for (const violation of fresh) {
+      const blocked = blockedMessageFromViolation(violation.line)
+      if (!blocked) {
+        continue
+      }
+      const key = JSON.stringify(blocked)
+      if (sent.has(key)) {
+        continue
+      }
+      if (sent.size >= maxSentEntries) {
+        sent.clear()
+      }
+      sent.add(key)
+      channel.notifyBlocked(blocked)
+    }
+  })
+}
+
 function getDefaultConfig(): SandboxRuntimeConfig {
   return {
     network: {
@@ -180,6 +232,13 @@ async function main(): Promise<void> {
       'read config updates from file descriptor (JSON lines protocol)',
       parseInt,
     )
+    .option(
+      '--agent-channel',
+      'open the Sandbox-Agent channel to the wrapped command on the file ' +
+        `descriptor named by ${SANDBOX_AGENT_CHANNEL_FD_ENV_VAR}: the sandbox ` +
+        'asks the agent to decide requests the policy does not cover, and ' +
+        'reports blocked actions to it (newline-delimited JSON)',
+    )
     .allowUnknownOption()
     .action(
       async (
@@ -189,6 +248,7 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          agentChannel?: boolean
         },
       ) => {
         try {
@@ -240,9 +300,46 @@ async function main(): Promise<void> {
             }
           }
 
-          // Initialize sandbox with config
+          if (options.agentChannel && process.platform === 'win32') {
+            console.error('Error: --agent-channel is not supported on Windows.')
+            process.exit(1)
+          }
+
+          // The channel is constructed after spawn (its transport is one
+          // end of a socketpair created by spawn itself), but the ask
+          // callback must be registered at initialize time — so it
+          // late-binds to the instance. Asks that race the spawn are
+          // denied, same as asks that race the agent's hello.
+          let agentChannel: SandboxAgentChannel | undefined
+          const askAgentCallback: SandboxAskCallback | undefined =
+            options.agentChannel
+              ? async ({ host, port }) => {
+                  if (!agentChannel) {
+                    return false
+                  }
+                  const destination =
+                    port !== undefined ? `${host}:${port}` : host
+                  return agentChannel.ask(
+                    {
+                      type: 'network',
+                      host,
+                      ...(port !== undefined ? { port } : {}),
+                    },
+                    'connect',
+                    `Connecting to ${destination}`,
+                  )
+                }
+              : undefined
+
+          // Initialize sandbox with config. The violation monitors (macOS
+          // log stream / Linux seccomp observer) are what feed `blocked`
+          // notifications, so they are only started when the channel is on.
           logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
+          await SandboxManager.initialize(
+            runtimeConfig,
+            askAgentCallback,
+            Boolean(options.agentChannel),
+          )
 
           // Set up control fd for dynamic config updates if specified
           let controlReader: readline.Interface | null = null
@@ -333,14 +430,36 @@ async function main(): Promise<void> {
           } else {
             const sandboxedCommand =
               await SandboxManager.wrapWithSandbox(command)
+            // With --agent-channel, stdio slot 3 is a socketpair: the child
+            // keeps one end as fd 3 (named by SANDBOX_AGENT_CHANNEL_FD) and
+            // the parent end becomes the channel transport below.
+            const stdio: StdioOptions = options.agentChannel
+              ? ['inherit', 'inherit', 'inherit', 'pipe']
+              : 'inherit'
             child = spawn(sandboxedCommand, {
               shell: true,
-              stdio: 'inherit',
+              stdio,
+              env: options.agentChannel
+                ? { ...process.env, [SANDBOX_AGENT_CHANNEL_FD_ENV_VAR]: '3' }
+                : process.env,
             })
+            if (options.agentChannel) {
+              agentChannel = new SandboxAgentChannel(
+                child.stdio[3] as unknown as Duplex,
+              )
+              forwardViolationsToAgent(
+                SandboxManager.getSandboxViolationStore(),
+                agentChannel,
+              )
+            }
           }
 
           // Handle process exit
           child.on('exit', (code, signal) => {
+            // The agent is the child — once it exits nobody is listening,
+            // so resolve any in-flight asks as deny and drop the socket.
+            agentChannel?.close()
+
             // Clean up bwrap mount point artifacts before exiting.
             // On Linux, bwrap creates empty files on the host when protecting
             // non-existent deny paths. This removes them.
