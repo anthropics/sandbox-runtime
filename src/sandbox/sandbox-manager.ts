@@ -87,7 +87,6 @@ import {
   attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
-  normalizePathForSandbox,
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
