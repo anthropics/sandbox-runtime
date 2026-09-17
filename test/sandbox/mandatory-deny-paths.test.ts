@@ -11,6 +11,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import {
   chmodSync,
   mkdirSync,
+  readdirSync,
   mkdtempSync,
   renameSync,
   rmSync,
@@ -37,6 +38,8 @@ import {
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
+  GIT_REDIRECT_STORE_PREFIX,
+  LinuxSandboxProfileError,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   GitMetadataError,
@@ -312,14 +315,16 @@ describe.if(isSupportedPlatform)(
     }
 
     /**
-     * The write did not land. On Linux bwrap leaves the empty file it
-     * mounted over the absent deny path; on macOS nothing is created.
+     * The write did not land. On Linux the mount point for an absent deny
+     * path stays until the cleanup: bwrap's own empty file, or, for a file
+     * git reads back, the placeholder the wrap wrote there (`expected`). On
+     * macOS nothing is created.
      */
-    function expectNotWritten(absolutePath: string): void {
+    function expectNotWritten(absolutePath: string, expected = ''): void {
       const content = existsSync(absolutePath)
         ? readFileSync(absolutePath, 'utf8')
         : ''
-      expect(content).toBe('')
+      expect(content).toBe(isLinux ? expected : '')
     }
 
     async function runSandboxedWrite(
@@ -595,7 +600,7 @@ describe.if(isSupportedPlatform)(
         const result = await runSandboxedWrite('.git/commondir', 'decoy')
 
         expect(result.success).toBe(false)
-        expectNotWritten(join(TEST_DIR, '.git', 'commondir'))
+        expectNotWritten(join(TEST_DIR, '.git', 'commondir'), '.\n')
       })
 
       it("blocks creating a commondir in a submodule's git directory", async () => {
@@ -605,14 +610,17 @@ describe.if(isSupportedPlatform)(
         )
 
         expect(result.success).toBe(false)
-        expectNotWritten(join(TEST_DIR, '.git', 'modules', 'lib', 'commondir'))
+        expectNotWritten(
+          join(TEST_DIR, '.git', 'modules', 'lib', 'commondir'),
+          '.\n',
+        )
       })
 
       it("blocks creating a nested repository's commondir", async () => {
         const result = await runSandboxedWrite('nested/.git/commondir', 'decoy')
 
         expect(result.success).toBe(false)
-        expectNotWritten(join(TEST_DIR, 'nested', '.git', 'commondir'))
+        expectNotWritten(join(TEST_DIR, 'nested', '.git', 'commondir'), '.\n')
       })
 
       it('blocks creating .git/config.worktree', async () => {
@@ -2461,16 +2469,33 @@ describe('Git metadata deny paths - Unit Tests', () => {
   })
 })
 /**
- * Denying a path that is not there means mounting something at it, and two
- * of these the host's git reads: it refuses to run at all against a
- * `commondir` it cannot read, and /dev/null is unreadable through a bind
- * mount. So those denies bind a placeholder that says "nothing redirected"
- * instead, and they do it for an empty file too - bwrap's own mount point
- * for the absent case is one of those until it is cleaned up.
+ * Denying a path that is not there means mounting something at it, and two of
+ * these the host's git reads back: it refuses to run at all against a
+ * `commondir` it cannot read, and neither a bound /dev/null nor an empty file
+ * is one. So these denies write their own mount point, holding what git
+ * concludes with no file there, and bind a read-only copy of the same bytes
+ * over it: the host's git keeps working for as long as the command runs, and
+ * the sandbox's does too.
  */
 describe.if(isLinux)('Placeholders for the files git reads', () => {
+  /** Echoed by every command that runs for real, so nothing concludes
+   *  anything from a sandbox that never started. */
+  const BOOTED = 'BOOTED'
+  const LIVE = bwrapCanNamespace() && Bun.which('git') !== null
+  /** Enough to commit without a hook, an identity or a signature. */
+  const IDENT = [
+    '-c',
+    'user.name=t',
+    '-c',
+    'user.email=t@t',
+    '-c',
+    'commit.gpgsign=false',
+    '-c',
+    'core.hooksPath=/dev/null',
+  ]
   let dir: string
   const savedCwd = process.cwd()
+  const savedTmpdir = process.env.TMPDIR
 
   beforeEach(() => {
     dir = realpathSync(mkdtempSync(join(tmpdir(), 'git-redirect-')))
@@ -2478,7 +2503,11 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
 
   afterEach(() => {
     process.chdir(savedCwd)
+    // Forced cleanup also empties the placeholder store, so no case here
+    // leaves one of its directories behind.
     cleanupBwrapMountPoints({ force: true })
+    if (savedTmpdir === undefined) delete process.env.TMPDIR
+    else process.env.TMPDIR = savedTmpdir
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -2494,7 +2523,7 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
   function wrapIn(
     checkout: string,
     command = 'true',
-    denyWithinAllow: string[] = [],
+    opts: { denyWithinAllow?: string[]; allowOnly?: string[] } = {},
   ): Promise<string> {
     process.chdir(checkout)
     return wrapCommandWithSandboxLinux({
@@ -2502,7 +2531,10 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
       needsNetworkRestriction: false,
       allowAllUnixSockets: true,
       readConfig: undefined,
-      writeConfig: { allowOnly: [checkout], denyWithinAllow },
+      writeConfig: {
+        allowOnly: opts.allowOnly ?? [checkout],
+        denyWithinAllow: opts.denyWithinAllow ?? [],
+      },
     })
   }
 
@@ -2523,6 +2555,42 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     return source
   }
 
+  function git(
+    cwd: string,
+    args: string[],
+  ): { status: number | null; stdout: string } {
+    const result = spawnSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, LC_ALL: 'C' },
+    })
+    return { status: result.status, stdout: `${result.stdout}${result.stderr}` }
+  }
+
+  /** A repository with one commit, made by git itself. */
+  function gitRepo(name: string): string {
+    const repo = join(dir, name)
+    mkdirSync(repo, { recursive: true })
+    expect(
+      git(repo, ['-c', 'init.defaultBranch=main', 'init', '-q', '.']),
+    ).toMatchObject({ status: 0 })
+    writeFileSync(join(repo, 'index.js'), 'console.log(1)\n')
+    expect(git(repo, ['add', 'index.js'])).toMatchObject({ status: 0 })
+    expect(git(repo, [...IDENT, 'commit', '-q', '-m', 'one'])).toMatchObject({
+      status: 0,
+    })
+    return repo
+  }
+
+  async function waitFor(ready: () => boolean, what: string): Promise<void> {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      if (ready()) return
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    throw new Error(`timed out waiting for ${what}`)
+  }
+
   it('binds a commondir that is not there from a placeholder holding "."', async () => {
     const checkout = makeCheckout('repo')
     const commondir = join(checkout, '.git', 'commondir')
@@ -2531,6 +2599,9 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
 
     expect(source).not.toBe('/dev/null')
     expect(readFileSync(source, 'utf8')).toBe('.\n')
+    // The mount point is this wrapper's own rather than the empty file
+    // bubblewrap would make: it is what the HOST's git reads meanwhile.
+    expect(readFileSync(commondir, 'utf8')).toBe('.\n')
   })
 
   it('reads the placeholder off the file, not off the deny entry', async () => {
@@ -2541,7 +2612,9 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     const checkout = makeCheckout('repo')
     const commondir = join(checkout, '.git', 'commondir')
 
-    const command = await wrapIn(checkout, 'true', ['./.git/commondir/'])
+    const command = await wrapIn(checkout, 'true', {
+      denyWithinAllow: ['./.git/commondir/'],
+    })
 
     expect(readFileSync(mountSource(command, commondir), 'utf8')).toBe('.\n')
   })
@@ -2552,20 +2625,78 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     writeFileSync(commondir, '../..\n')
 
     expect(mountSource(await wrapIn(checkout), commondir)).toBe(commondir)
+
+    cleanupBwrapMountPoints({ force: true })
+    expect(readFileSync(commondir, 'utf8')).toBe('../..\n')
   })
 
-  it('binds a commondir left empty from the placeholder as well', async () => {
-    // What an earlier wrap's mount point for the absent case looks like
-    // until cleanup runs: an empty file, which git cannot read as a redirect
-    // either, so binding it would cost this repository every git command.
+  it('takes its own mount point away, and a changed one never', async () => {
     const checkout = makeCheckout('repo')
     const commondir = join(checkout, '.git', 'commondir')
-    writeFileSync(commondir, '')
+
+    await wrapIn(checkout)
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(commondir)).toBe(false)
+
+    // A mount point something has written a real redirect into is not this
+    // wrapper's to remove, the same way an empty one that gained content is
+    // not: the cleanup compares what is there with what it wrote.
+    await wrapIn(checkout)
+    writeFileSync(commondir, '../..\n')
+    cleanupBwrapMountPoints({ force: true })
+    expect(readFileSync(commondir, 'utf8')).toBe('../..\n')
+  })
+
+  it('repairs a commondir left empty rather than covering it', async () => {
+    // The shape bubblewrap's own ensure_file() leaves, which the wrap takes
+    // for a mount point an earlier sandbox left behind and covers with
+    // /dev/null — the one thing a commondir must never be covered with.
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+    writeFileSync(commondir, '', { mode: 0o444 })
 
     const source = mountSource(await wrapIn(checkout), commondir)
 
-    expect(source).not.toBe(commondir)
+    expect(source).not.toBe('/dev/null')
     expect(readFileSync(source, 'utf8')).toBe('.\n')
+    expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(commondir)).toBe(false)
+  })
+
+  it('binds a commondir already holding the placeholder from itself', async () => {
+    // What a killed process leaves: nothing in memory knows the file is a
+    // mount point, but nothing else writes exactly those bytes there, so
+    // the next wrap claims it, binds it from itself and removes it.
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+    writeFileSync(commondir, '.\n')
+
+    expect(mountSource(await wrapIn(checkout), commondir)).toBe(commondir)
+
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(commondir)).toBe(false)
+  })
+
+  it('leaves alone an empty config.worktree it did not leave there', async () => {
+    // An empty config.worktree reads as no worktree config at all, so one is
+    // legitimate and this wrapper never claims it — unless it has the shape
+    // bubblewrap leaves, which nothing writing a config on purpose does.
+    const checkout = makeCheckout('repo')
+    const legitimate = join(checkout, '.git', 'config.worktree')
+    writeFileSync(legitimate, '', { mode: 0o644 })
+
+    expect(mountSource(await wrapIn(checkout), legitimate)).toBe(legitimate)
+
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(legitimate)).toBe(true)
+
+    // The shape bubblewrap leaves, which nothing writing a config on
+    // purpose has: read-only, empty, one link.
+    chmodSync(legitimate, 0o444)
+    await wrapIn(checkout)
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(legitimate)).toBe(false)
   })
 
   it('leaves every other absent deny on /dev/null', async () => {
@@ -2576,56 +2707,259 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
     )
   })
 
-  it.if(bwrapCanNamespace() && Bun.which('git') !== null)(
+  it('mints one placeholder file for the process, not one per wrap', async () => {
+    process.env.TMPDIR = dir
+    const checkout = makeCheckout('repo')
+    const stores = (): string[] =>
+      readdirSync(dir).filter(entry =>
+        entry.startsWith(GIT_REDIRECT_STORE_PREFIX),
+      )
+    expect(stores()).toHaveLength(0)
+
+    for (let wrap = 0; wrap < 20; wrap++) {
+      await wrapIn(checkout)
+      // Not forced: the store is per process, so a batch of wraps ending
+      // must not empty it — and the mount point goes, so the next wrap
+      // takes the absent-path branch again.
+      cleanupBwrapMountPoints()
+    }
+
+    expect(stores()).toHaveLength(1)
+    // One file per distinct placeholder, whatever the number of wraps: the
+    // repository's absent commondir and its absent config.worktree.
+    expect(readdirSync(join(dir, stores()[0]!))).toHaveLength(2)
+  })
+
+  it('refuses the command when no placeholder can be written', async () => {
+    // Decided once, logged once, and fail-closed: /dev/null is the only
+    // deny left, and it costs the repository every git command. Refusing
+    // says so; sandboxing behind it would not.
+    const checkout = makeCheckout('repo')
+    // So that no deny needs the shared empty directory, whose own source
+    // this temp directory would break first.
+    mkdirSync(join(checkout, '.claude'))
+    const notADirectory = join(dir, 'not-a-directory')
+    writeFileSync(notADirectory, '')
+    process.env.TMPDIR = notADirectory
+
+    const refusal = await wrapIn(checkout).then(
+      () => undefined,
+      (err: unknown) => err,
+    )
+
+    expect(refusal).toBeInstanceOf(LinuxSandboxProfileError)
+    expect((refusal as LinuxSandboxProfileError).code).toBe(
+      'deny_placeholder_unavailable',
+    )
+  })
+
+  it.if(LIVE)(
+    'keeps the placeholder out of the reach of the sandboxed command',
+    async () => {
+      // The store sits under $TMPDIR, which is routinely inside an allowed
+      // write path; the bind exposes the source file itself, so a command
+      // able to rewrite it would choose what git reads at the denied path.
+      process.env.TMPDIR = dir
+      const repo = gitRepo('repo')
+      const commondir = join(repo, '.git', 'commondir')
+      const source = mountSource(
+        await wrapIn(repo, 'true', {
+          allowOnly: [repo, dir],
+        }),
+        commondir,
+      )
+      cleanupBwrapMountPoints()
+
+      const probe = [
+        `echo ${BOOTED}`,
+        `chmod 666 ${source} 2>&1 || echo CHMOD_REFUSED`,
+        `echo poison > ${source} 2>&1 || echo WRITE_REFUSED`,
+        `cat ${source}`,
+        `git rev-parse --git-common-dir`,
+      ].join('; ')
+      const command = await wrapIn(repo, probe, { allowOnly: [repo, dir] })
+      // Memoised by content, so the command names the source this wrap binds.
+      expect(mountSource(command, commondir)).toBe(source)
+
+      const run = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 30000,
+        cwd: repo,
+        env: { ...process.env, LC_ALL: 'C' },
+      })
+      const output = `${run.stdout}${run.stderr}`
+
+      expect(output).toContain(BOOTED)
+      expect(output).toContain('Read-only file system')
+      expect(output).toContain('CHMOD_REFUSED')
+      expect(output).toContain('WRITE_REFUSED')
+      expect(output).not.toContain('poison')
+      // git still resolves its own git directory as its common directory.
+      expect(output).toContain(join(repo, '.git'))
+    },
+  )
+
+  it.if(LIVE)(
+    "keeps the host's git working while a wrapped command runs",
+    async () => {
+      const sub = gitRepo('sub')
+      const repo = gitRepo('repo')
+      expect(
+        git(repo, [
+          '-c',
+          'protocol.file.allow=always',
+          ...IDENT,
+          'submodule',
+          'add',
+          '-q',
+          sub,
+          'lib',
+        ]),
+      ).toMatchObject({ status: 0 })
+      expect(git(repo, [...IDENT, 'commit', '-q', '-m', 'lib'])).toMatchObject({
+        status: 0,
+      })
+      expect(
+        git(repo, ['worktree', 'add', '-q', join(dir, 'wt')]),
+      ).toMatchObject({ status: 0 })
+      const commondir = join(repo, '.git', 'commondir')
+      const submoduleCommondir = join(
+        repo,
+        '.git',
+        'modules',
+        'lib',
+        'commondir',
+      )
+
+      // Runs until the host releases it, so the host's git is exercised with
+      // the sandbox up and the mount points in place.
+      const command = await wrapIn(
+        repo,
+        `echo ${BOOTED} > up; i=0; while [ ! -f release ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done; echo ${BOOTED}`,
+      )
+      const child = spawn(command, {
+        shell: true,
+        cwd: repo,
+        stdio: 'ignore',
+      })
+      try {
+        await waitFor(
+          () => existsSync(join(repo, 'up')),
+          'the sandbox to start',
+        )
+
+        // Both mount points are on the host, holding a redirect git accepts.
+        expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+        expect(readFileSync(submoduleCommondir, 'utf8')).toBe('.\n')
+        for (const args of [
+          ['status', '--porcelain'],
+          ['log', '--oneline'],
+          ['worktree', 'list'],
+          ['rev-parse', '--git-common-dir'],
+        ]) {
+          expect({ args, ...git(repo, args) }).toMatchObject({ status: 0 })
+        }
+        expect(
+          git(repo, [
+            ...IDENT,
+            'commit',
+            '--allow-empty',
+            '-q',
+            '-m',
+            'during',
+          ]),
+        ).toMatchObject({ status: 0 })
+        expect(git(join(repo, 'lib'), ['status', '--porcelain'])).toMatchObject(
+          {
+            status: 0,
+          },
+        )
+      } finally {
+        writeFileSync(join(repo, 'release'), '')
+        await new Promise(resolve => child.on('close', resolve))
+      }
+      expect(child.exitCode).toBe(0)
+
+      cleanupBwrapMountPoints()
+      expect(existsSync(commondir)).toBe(false)
+      expect(existsSync(submoduleCommondir)).toBe(false)
+      expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
+    },
+  )
+
+  it.if(LIVE)(
+    'leaves a killed wrap behind a commondir git reads, and repairs an empty one',
+    async () => {
+      const repo = gitRepo('repo')
+      const commondir = join(repo, '.git', 'commondir')
+
+      // What a killed process leaves now: the host's git works on it, and
+      // the next wrap takes it away.
+      writeFileSync(commondir, '.\n')
+      expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
+      expect(git(repo, ['log', '--oneline'])).toMatchObject({ status: 0 })
+      await wrapIn(repo)
+      cleanupBwrapMountPoints()
+      expect(existsSync(commondir)).toBe(false)
+
+      // What an older release leaves: git refuses every command in the
+      // repository until the next wrap rewrites it.
+      writeFileSync(commondir, '', { mode: 0o444 })
+      const broken = git(repo, ['status', '--porcelain'])
+      expect(broken.status).not.toBe(0)
+      expect(broken.stdout).toContain('commondir')
+
+      await wrapIn(repo)
+      expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+      expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
+      cleanupBwrapMountPoints()
+      expect(existsSync(commondir)).toBe(false)
+      expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
+    },
+  )
+
+  it.if(LIVE)(
     'leaves git working across wraps, and the commondir unwritable',
     async () => {
-      const checkout = join(dir, 'repo')
-      mkdirSync(checkout)
-      writeFileSync(join(checkout, 'index.js'), 'console.log(1)\n')
-      expect(
-        spawnSync('git', [
-          '-c',
-          'init.defaultBranch=main',
-          'init',
-          '-q',
-          checkout,
-        ]).status,
-      ).toBe(0)
+      const repo = gitRepo('repo')
 
       const run = (command: string) =>
         spawnSync(command, {
           shell: true,
           encoding: 'utf8',
-          timeout: 20000,
-          cwd: checkout,
+          timeout: 30000,
+          cwd: repo,
           env: { ...process.env, LC_ALL: 'C' },
         })
       // By name: the dotfile denies stub their absent paths, and the mount
       // points bwrap leaves for them are not files `git add -A` can stage.
       const commit = (file: string) =>
-        `git add ${file} && git -c user.name=t -c user.email=t@t ` +
-        `-c commit.gpgsign=false -c core.hooksPath=/dev/null ` +
+        `echo ${BOOTED} && git add ${file} && git ${IDENT.join(' ')} ` +
         `commit -q -m ${file} && echo COMMIT_OK`
 
-      const first = run(await wrapIn(checkout, commit('index.js')))
-      expect(first.stderr).toBe('')
+      writeFileSync(join(repo, 'one.js'), 'console.log(1)\n')
+      const first = run(await wrapIn(repo, commit('one.js')))
+      expect(first.stdout).toContain(BOOTED)
+      expect(first.status).toBe(0)
       expect(first.stdout).toContain('COMMIT_OK')
 
       // No cleanupBwrapMountPoints() in between: the first wrap's mount point
       // for the absent commondir is still sitting in the git directory, and
       // the second wrap's scan finds it there.
-      writeFileSync(join(checkout, 'two.js'), 'console.log(2)\n')
-      const second = run(await wrapIn(checkout, commit('two.js')))
-      expect(second.stderr).toBe('')
+      writeFileSync(join(repo, 'two.js'), 'console.log(2)\n')
+      const second = run(await wrapIn(repo, commit('two.js')))
+      expect(second.stdout).toContain(BOOTED)
+      expect(second.status).toBe(0)
       expect(second.stdout).toContain('COMMIT_OK')
 
       const write = run(
-        await wrapIn(checkout, 'echo ../decoy > .git/commondir || echo DENIED'),
+        await wrapIn(repo, 'echo ../decoy > .git/commondir || echo DENIED'),
       )
       expect(write.stdout).toContain('DENIED')
-      expect(existsSync(join(checkout, '.git', 'commondir'))).toBe(true)
+      expect(existsSync(join(repo, '.git', 'commondir'))).toBe(true)
       cleanupBwrapMountPoints({ force: true })
-      expect(existsSync(join(checkout, '.git', 'commondir'))).toBe(false)
+      expect(existsSync(join(repo, '.git', 'commondir'))).toBe(false)
     },
   )
 })
