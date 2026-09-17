@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import { indexOfMount, lastIndexOfMount } from '../helpers/bwrap-argv.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import {
   wrapCommandWithSandboxMacOS,
   macGetMandatoryDenyEntries,
@@ -1879,29 +1880,6 @@ describe('Git metadata deny paths - Unit Tests', () => {
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true })
   })
-
-  /** Whether bwrap can build the namespaces a wrapped command runs in here. */
-  let canNamespace: boolean | undefined
-  function bwrapCanNamespace(): boolean {
-    canNamespace ??=
-      spawnSync(
-        'bwrap',
-        [
-          '--unshare-pid',
-          '--unshare-user',
-          '--cap-drop',
-          'ALL',
-          '--ro-bind',
-          '/',
-          '/',
-          '--proc',
-          '/proc',
-          'true',
-        ],
-        { timeout: 5000 },
-      ).status === 0
-    return canNamespace
-  }
 
   /** A directory git would accept as a git directory. */
   function makeGitDir(gitDir: string): string {
