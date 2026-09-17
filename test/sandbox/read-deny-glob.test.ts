@@ -25,6 +25,7 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { countMounts, lastIndexOfMount } from '../helpers/bwrap-argv.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
@@ -640,9 +641,11 @@ describe.if(isLinux)(
         writeConfig: { allowOnly: [pnpmRoot], denyWithinAllow: [store] },
       })
 
-      const storeBind = wrapped.lastIndexOf(`--ro-bind ${store} ${store}`)
+      const storeBind = lastIndexOfMount(wrapped, '--ro-bind', store, store)
       expect(storeBind).toBeGreaterThan(-1)
-      expect(wrapped.lastIndexOf(`--tmpfs ${real} `)).toBeGreaterThan(storeBind)
+      expect(lastIndexOfMount(wrapped, '--tmpfs', real)).toBeGreaterThan(
+        storeBind,
+      )
     })
 
     it('does not re-apply a tmpfs over its carve-out when a denyWrite bind covers only the link spelling', async () => {
@@ -679,7 +682,7 @@ describe.if(isLinux)(
       expect(wrapped).toContain(mask)
       // One tmpfs on the target, and the mask is the last word on the file:
       // no carve-out re-bind after it.
-      expect(wrapped.split(`--tmpfs ${realdir} `)).toHaveLength(2)
+      expect(countMounts(wrapped, '--tmpfs', realdir)).toBe(1)
       expect(wrapped).toContain(carveOut)
       expect(wrapped.lastIndexOf(mask)).toBeGreaterThan(
         wrapped.lastIndexOf(carveOut),
@@ -696,7 +699,7 @@ describe.if(isLinux)(
         },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
-      expect(viaLink).toContain(`--tmpfs ${real} `)
+      expect(countMounts(viaLink, '--tmpfs', real)).toBeGreaterThan(0)
       expect(viaLink).toContain(
         `--ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
       )
@@ -712,7 +715,7 @@ describe.if(isLinux)(
         },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
-      expect(viaLink).toContain(`--tmpfs ${real} `)
+      expect(countMounts(viaLink, '--tmpfs', real)).toBeGreaterThan(0)
       expect(viaLink).toContain(
         `--ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
       )
@@ -736,7 +739,7 @@ describe.if(isLinux)(
 
     it('re-binds a carve-out written through a symlinked directory outside the denied one, at its target', async () => {
       const wrapped = await wrapCarveOutThroughOutsideLink('true')
-      expect(wrapped).toContain(`--tmpfs ${real} `)
+      expect(countMounts(wrapped, '--tmpfs', real)).toBeGreaterThan(0)
       expect(wrapped).toContain(
         `--ro-bind ${join(real, 'public')} ${join(real, 'public')}`,
       )
@@ -781,9 +784,9 @@ describe.if(isLinux)(
       it('does not bind a denied directory back through an allowRead symlink to it', async () => {
         const wrapped = await wrapAllowReadLinkToDeniedDir('true')
 
-        expect(wrapped).toContain(
-          `--tmpfs ${join(ROOT, 'g1', 'home', '.ssh')} `,
-        )
+        expect(
+          countMounts(wrapped, '--tmpfs', join(ROOT, 'g1', 'home', '.ssh')),
+        ).toBeGreaterThan(0)
         expect(wrapped).not.toContain(
           `--ro-bind ${join(ROOT, 'g1', 'proj', 'docs')}`,
         )
@@ -935,8 +938,10 @@ describe.if(isLinux)(
           const outside = join(ROOT, 's1', 'e')
           const wrapped = await wrapOutsideTree('true', index)
 
-          expect(wrapped).toContain(`--tmpfs ${denied} `)
-          expect(wrapped).toContain(`--tmpfs ${join(outside, 'sub')} `)
+          expect(countMounts(wrapped, '--tmpfs', denied)).toBeGreaterThan(0)
+          expect(
+            countMounts(wrapped, '--tmpfs', join(outside, 'sub')),
+          ).toBeGreaterThan(0)
           expect(wrapped).not.toContain(`--ro-bind ${join(denied, 'lnk')}`)
         })
 
@@ -1038,7 +1043,9 @@ describe.if(isLinux)(
         expect(wrapped).toContain(
           `--ro-bind /dev/null ${join(caseRoot, 't', 'f')}`,
         )
-        expect(wrapped).toContain(`--tmpfs ${join(caseRoot, 'a', 'b')} `)
+        expect(
+          countMounts(wrapped, '--tmpfs', join(caseRoot, 'a', 'b')),
+        ).toBeGreaterThan(0)
       })
 
       it.skipIf(!hasBwrap)(
@@ -1088,9 +1095,9 @@ describe.if(isLinux)(
         const wrapped = await wrapLinkBackUpToWriteRoot('true', reversed)
 
         expect(
-          wrapped.lastIndexOf(`--tmpfs ${join(writeRoot, 'secrets')} `),
+          lastIndexOfMount(wrapped, '--tmpfs', join(writeRoot, 'secrets')),
         ).toBeGreaterThan(
-          wrapped.lastIndexOf(`--bind ${writeRoot} ${writeRoot} `),
+          lastIndexOfMount(wrapped, '--bind', writeRoot, writeRoot),
         )
       })
 
@@ -1191,9 +1198,9 @@ describe.if(isLinux)(
       const hooks = join(caseRoot, 'elsewhere', 'hooks')
       const wrapped = await wrapDenyWriteThroughDeniedDir('true')
 
-      expect(wrapped).toContain(
-        `--tmpfs ${join(caseRoot, 'real', 'secretdir')} `,
-      )
+      expect(
+        countMounts(wrapped, '--tmpfs', join(caseRoot, 'real', 'secretdir')),
+      ).toBeGreaterThan(0)
       expect(wrapped).toContain(`--ro-bind ${hooks} ${hooks}`)
     })
 
@@ -1366,9 +1373,9 @@ describe.if(isLinux)(
       async () => {
         const pkg = join(ROOT, 's12', 'proj', 'pkg')
         try {
-          expect(await wrapUninspectableEntries('true')).toContain(
-            `--tmpfs ${pkg} `,
-          )
+          expect(
+            countMounts(await wrapUninspectableEntries('true'), '--tmpfs', pkg),
+          ).toBeGreaterThan(0)
         } finally {
           chmodSync(pkg, 0o755)
         }
@@ -1467,8 +1474,8 @@ describe.if(isLinux)(
 
       // The deny reaches the mount loop under the link's own spelling, where
       // the stand-in rule hides the nearest directory that can be inspected.
-      expect(wrapped).toContain(`--tmpfs ${certs} `)
-      expect(wrapped).not.toContain(`--tmpfs ${link} `)
+      expect(countMounts(wrapped, '--tmpfs', certs)).toBeGreaterThan(0)
+      expect(countMounts(wrapped, '--tmpfs', link)).toBe(0)
     })
 
     it.skipIf(!hasBwrap)(
@@ -1513,11 +1520,11 @@ describe.if(isLinux)(
       const img = join(ROOT, 's13', 'proj', 'img')
       const wrapped = await wrapLinkToRoot('true')
 
-      expect(wrapped).toContain(`--tmpfs ${img} `)
-      expect(wrapped).not.toContain(`--tmpfs ${join(img, 'build')} `)
+      expect(countMounts(wrapped, '--tmpfs', img)).toBeGreaterThan(0)
+      expect(countMounts(wrapped, '--tmpfs', join(img, 'build'))).toBe(0)
       // A --tmpfs / would wipe every mount before it and boot the command on
       // an empty tree, so it is never emitted, whatever a link resolves to.
-      expect(wrapped).not.toContain('--tmpfs / ')
+      expect(countMounts(wrapped, '--tmpfs', '/')).toBe(0)
     })
 
     it('keeps a link to / out of the read-deny prediction', async () => {
@@ -1543,8 +1550,10 @@ describe.if(isLinux)(
         mandatoryDenySearchDepth: 1,
       })
 
-      expect(wrapped).toContain(`--tmpfs ${join(proj, 'img')} `)
-      expect(wrapped).not.toContain('--tmpfs / ')
+      expect(
+        countMounts(wrapped, '--tmpfs', join(proj, 'img')),
+      ).toBeGreaterThan(0)
+      expect(countMounts(wrapped, '--tmpfs', '/')).toBe(0)
       // The absent deny path under the read-only bind of proj keeps no stub.
       expect(
         wrapped
@@ -1602,7 +1611,7 @@ describe.if(isLinux)(
       const proj = join(ROOT, 's14', 'work', 'proj')
       const wrapped = await wrapWriteDeniedCheckout('true')
 
-      const projBind = wrapped.lastIndexOf(`--ro-bind ${proj} ${proj}`)
+      const projBind = lastIndexOfMount(wrapped, '--ro-bind', proj, proj)
       expect(projBind).toBeGreaterThan(-1)
       // No stub: nothing is mounted at or beneath proj/.claude.
       expect(
@@ -1612,7 +1621,7 @@ describe.if(isLinux)(
           .filter(op => op.includes(` ${join(proj, '.claude')}`)),
       ).toEqual([])
       expect(
-        wrapped.lastIndexOf(`--tmpfs ${join(proj, 'pkg', 'build')} `),
+        lastIndexOfMount(wrapped, '--tmpfs', join(proj, 'pkg', 'build')),
       ).toBeGreaterThan(projBind)
     })
 
@@ -1685,7 +1694,7 @@ describe.if(isLinux)(
           readConfig: { denyOnly: [big, ...keys] },
           writeConfig: { allowOnly: [], denyWithinAllow: [] },
         })
-        expect(collapsed.split(`--tmpfs ${big} `)).toHaveLength(2)
+        expect(countMounts(collapsed, '--tmpfs', big)).toBe(1)
         expect(collapsed).not.toContain(`/dev/null ${big}/`)
       })
 
@@ -1776,7 +1785,9 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
         },
       )
 
-      expect(wrapped).toContain(`--tmpfs ${join(ROOT, 'pkg', 'a', 'build')} `)
+      expect(
+        countMounts(wrapped, '--tmpfs', join(ROOT, 'pkg', 'a', 'build')),
+      ).toBeGreaterThan(0)
       expect(wrapped).toContain(
         `--ro-bind /dev/null ${join(carveOut, 'ok.txt')}`,
       )
@@ -1811,7 +1822,7 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
     expect(wrapped.indexOf(pin)).toBeLessThan(
       wrapped.indexOf(`--bind ${ROOT} ${ROOT}`),
     )
-    expect(wrapped).toContain(`--tmpfs ${build} `)
+    expect(countMounts(wrapped, '--tmpfs', build)).toBeGreaterThan(0)
   })
 
   it.skipIf(!bwrapCanNamespace())(
@@ -1941,7 +1952,9 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
       )
 
       for (const pkg of PKGS) {
-        expect(wrapped).toContain(`--tmpfs ${join(ROOT, 'pkg', pkg, 'build')} `)
+        expect(
+          countMounts(wrapped, '--tmpfs', join(ROOT, 'pkg', pkg, 'build')),
+        ).toBeGreaterThan(0)
       }
       for (const pkg of PKGS) {
         expect(wrapped).not.toContain(

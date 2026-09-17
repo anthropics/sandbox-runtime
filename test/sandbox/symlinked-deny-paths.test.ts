@@ -17,6 +17,7 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { countMounts } from '../helpers/bwrap-argv.js'
 
 /**
  * The root's symlinks into /usr (/bin, /lib, /sbin on a usr-merged system),
@@ -184,8 +185,10 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     const result = await wrap([join(claudeLink, 'commands')], [claudeLink])
     const resolved = join(DOTFILES, 'claude', 'commands')
 
-    expect(result).toContain(`--tmpfs ${join(DOTFILES, 'claude')}`)
-    expect(result).not.toContain(`--tmpfs ${claudeLink}`)
+    expect(
+      countMounts(result, '--tmpfs', join(DOTFILES, 'claude')),
+    ).toBeGreaterThan(0)
+    expect(countMounts(result, '--tmpfs', claudeLink)).toBe(0)
     expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
   })
 
@@ -209,10 +212,10 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
         allowAllUnixSockets: true,
       })
 
-      expect(wrapped).not.toContain('--tmpfs /usr ')
-      expect(wrapped).not.toContain('--tmpfs /etc ')
+      expect(countMounts(wrapped, '--tmpfs', '/usr')).toBe(0)
+      expect(countMounts(wrapped, '--tmpfs', '/etc')).toBe(0)
       for (const target of USR_MERGED_ROOT_LINKS) {
-        expect(wrapped).not.toContain(`--tmpfs ${target} `)
+        expect(countMounts(wrapped, '--tmpfs', target)).toBe(0)
       }
       if (hasBwrap) {
         const run = spawnSync(wrapped, {
