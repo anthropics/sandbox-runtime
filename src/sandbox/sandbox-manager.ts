@@ -129,6 +129,12 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+/**
+ * The whole in-flight initialize() call, including the awaits (CA keygen,
+ * dependency probe) that happen before `initializationPromise` is claimed.
+ * Never rejects; the caller of initialize() gets the real outcome.
+ */
+let initializeInFlight: Promise<void> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
@@ -629,6 +635,32 @@ async function startMuxProxyServer(
 // ============================================================================
 
 async function initialize(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback?: SandboxAskCallback,
+  enableLogMonitor = false,
+): Promise<void> {
+  // initializeImpl awaits before it claims `initializationPromise`, so two
+  // overlapping calls would each run a full initialization (two CAs, two
+  // proxies, one of each orphaned). Run them one after another instead: the
+  // later call then sees the claim and coalesces.
+  while (initializeInFlight) await initializeInFlight
+  const run = initializeImpl(
+    runtimeConfig,
+    sandboxAskCallback,
+    enableLogMonitor,
+  )
+  const settled = run.then(
+    () => {},
+    () => {},
+  )
+  initializeInFlight = settled
+  void settled.then(() => {
+    if (initializeInFlight === settled) initializeInFlight = undefined
+  })
+  return run
+}
+
+async function initializeImpl(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
@@ -1509,6 +1541,8 @@ async function waitForNetworkInitialization(): Promise<boolean> {
   if (!config) {
     return false
   }
+  // The pre-claim phase of initialize() (CA keygen) can be in flight.
+  if (initializeInFlight) await initializeInFlight
   if (initializationPromise) {
     try {
       await initializationPromise
