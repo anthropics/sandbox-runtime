@@ -33,6 +33,7 @@ import {
   runsOnBun,
   writeHeadsAsLatin1,
 } from './emitted-connection.js'
+import { drainThenDestroy } from './drain-then-destroy.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
@@ -969,9 +970,9 @@ function destroyAfterDenial(req: IncomingMessage, res: ServerResponse): void {
 
 /**
  * After a deny: stop a forwarded body that is not the request itself (a
- * tee branch, a transform) at once, and the request once the answer is
- * out. A request without a body is its own body, and destroying it before
- * the answer is out would drop the answer.
+ * tee branch, a transform) at once, then drain what the client is still
+ * uploading (bounded) before the teardown, so the 403 goes out as a clean
+ * FIN instead of an RST the client never reads.
  */
 function endDeniedRequest(
   req: IncomingMessage,
@@ -979,9 +980,8 @@ function endDeniedRequest(
   body: Readable,
 ): void {
   if (body !== req) body.destroy()
-  destroyAfterDenial(req, res)
+  drainThenDestroy(req, res)
 }
-
 function forwardUpstreamGuarded(
   ...args: Parameters<typeof forwardUpstream>
 ): void {
