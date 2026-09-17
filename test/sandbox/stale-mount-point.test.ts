@@ -21,26 +21,12 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
+import { countMounts, lastMountAt } from '../helpers/bwrap-argv.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
-// Same probe as readonly-deny-dir-stubs.test.ts: the runtime arms need the
-// namespace and /proc surface the wrapped commands use.
-const BWRAP_CAN_NAMESPACE =
-  spawnSync(
-    'bwrap',
-    [
-      '--unshare-pid',
-      '--unshare-user',
-      '--cap-drop',
-      'ALL',
-      '--ro-bind',
-      '/',
-      '/',
-      '--proc',
-      '/proc',
-      'true',
-    ],
-    { timeout: 5000 },
-  ).status === 0
+/** Echoed first by every command that runs for real, so an assertion about
+ *  what the command did cannot pass on a sandbox that never started. */
+const BOOTED = 'BOOTED'
 
 function run(
   command: string,
@@ -55,10 +41,6 @@ function run(
   return { status: r.status, stdout: `${r.stdout}${r.stderr}` }
 }
 
-function escapeForRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
 /**
  * A denyWrite path that does not exist gets `--ro-bind /dev/null <path>`, and
  * bwrap creates the mount point for it on the host: an empty file, mode 0444.
@@ -71,6 +53,7 @@ function escapeForRegExp(s: string): string {
  * lock config file".
  */
 describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
+  const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
   let BASE: string
   let AREA: string // allowed write area
   let GIT_DIR: string
@@ -115,8 +98,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 
     const command = await wrap([LOCK])
 
-    expect(command).toContain(`--ro-bind /dev/null ${LOCK}`)
-    expect(command).not.toContain(`--ro-bind ${LOCK} ${LOCK}`)
+    expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
+    expect(countMounts(command, '--ro-bind', LOCK, LOCK)).toBe(0)
 
     cleanupBwrapMountPoints()
     expect(existsSync(LOCK)).toBe(false)
@@ -165,8 +148,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 
     const command = await wrap([LOCK])
 
-    expect(command).toContain(`--ro-bind ${LOCK} ${LOCK}`)
-    expect(command).not.toContain(`/dev/null ${LOCK}`)
+    expect(lastMountAt(command, LOCK)).toBe(`--ro-bind ${LOCK} ${LOCK}`)
+    expect(countMounts(command, '--ro-bind', '/dev/null', LOCK)).toBe(0)
     cleanupBwrapMountPoints()
     expect(existsSync(LOCK)).toBe(true)
   })
@@ -177,8 +160,8 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 
     const command = await wrap([outsideFile])
 
-    // Already read-only from --ro-bind / /: no bind of either kind.
-    expect(command).not.toContain(` ${outsideFile}`)
+    // Already read-only from --ro-bind / /: nothing is mounted there at all.
+    expect(lastMountAt(command, outsideFile)).toBeUndefined()
     cleanupBwrapMountPoints()
     expect(existsSync(outsideFile)).toBe(true)
   })
@@ -188,18 +171,20 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     async () => {
       plantLeftover(LOCK)
 
-      const overLeftover = run(
-        await wrap([LOCK], `echo x > ${LOCK}; echo rc=$?`),
-      )
+      const write = `echo ${BOOTED}; echo x > ${LOCK}; echo rc=$?`
+      const overLeftover = run(await wrap([LOCK], write))
+      expect(overLeftover.stdout).toContain(BOOTED)
       expect(overLeftover.stdout).toMatch(/rc=[1-9]/)
       expect(lstatSync(LOCK).size).toBe(0)
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(false)
 
       // Now the ordinary absent case: nothing can create it, nothing stays.
-      const command = await wrap([LOCK], `echo x > ${LOCK}; echo rc=$?`)
-      expect(command).toContain(`--ro-bind /dev/null ${LOCK}`)
-      expect(run(command).stdout).toMatch(/rc=[1-9]/)
+      const command = await wrap([LOCK], write)
+      expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
+      const absent = run(command)
+      expect(absent.stdout).toContain(BOOTED)
+      expect(absent.stdout).toMatch(/rc=[1-9]/)
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(false)
       // The neighbour it protects is still what it was.
@@ -243,9 +228,14 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
       expect(left.size).toBe(0)
       expect(left.mode & 0o222).toBe(0)
 
-      const command = await wrap([LOCK], `echo x > ${LOCK}; echo rc=$?`)
-      expect(command).toContain(`--ro-bind /dev/null ${LOCK}`)
-      expect(run(command).stdout).toMatch(/rc=[1-9]/)
+      const command = await wrap(
+        [LOCK],
+        `echo ${BOOTED}; echo x > ${LOCK}; echo rc=$?`,
+      )
+      expect(lastMountAt(command, LOCK)).toBe(`--ro-bind /dev/null ${LOCK}`)
+      const after = run(command)
+      expect(after.stdout).toContain(BOOTED)
+      expect(after.stdout).toMatch(/rc=[1-9]/)
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(false)
     },
@@ -261,6 +251,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 describe.if(isLinux)(
   'Mount points for deny paths that do not exist yet',
   () => {
+    const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
     let BASE: string
     let AREA: string // allowed write area
     let PROJ: string // a project with no .claude/, so two mandatory denies
@@ -326,32 +317,20 @@ describe.if(isLinux)(
     }
 
     /**
-     * The empty-directory sources a wrapped command binds onto `dest`. Read
-     * out of the whole shell-quoted string, anchored on the destination: a
-     * split on whitespace would cut a source path containing a space in two.
+     * The empty directory the LAST mount at `dest` binds from, or undefined
+     * when that mount is not a placeholder of this kind. lastMountAt reads
+     * whole argv words, so a destination the wrapper shell-quotes, or a
+     * profile that went to the argument file, is refused outright instead of
+     * reported as "nothing bound there".
      */
-    function emptySourcesFor(command: string, dest: string): string[] {
-      const bind = '--ro-bind '
-      const sources: string[] = []
-      for (const at of command.matchAll(
-        new RegExp(`(?<=\\s)${escapeForRegExp(dest)}(?=\\s|$)`, 'g'),
-      )) {
-        const from = command.lastIndexOf(bind, at.index)
-        const source = command.slice(from + bind.length, at.index - 1)
-        if (from !== -1 && source.includes('/claude-empty-')) {
-          sources.push(source)
-        }
-      }
-      return sources
-    }
-
-    /** How many times `token` stands on its own in a wrapped command. */
-    function tokenCount(command: string, token: string): number {
-      return [
-        ...command.matchAll(
-          new RegExp(`(?<![^\\s])${escapeForRegExp(token)}(?=\\s|$)`, 'g'),
-        ),
-      ].length
+    function placeholderSourceAt(
+      command: string,
+      dest: string,
+    ): string | undefined {
+      const [flag, source] = lastMountAt(command, dest)?.split(' ') ?? []
+      return flag === '--ro-bind' && source?.includes('/claude-empty-')
+        ? source
+        : undefined
     }
 
     function emptySourceDirs(): string[] {
@@ -364,11 +343,12 @@ describe.if(isLinux)(
       const sources: string[] = []
       for (let i = 0; i < 3; i++) {
         const command = await wrap()
-        const bound = emptySourcesFor(command, DOT_CLAUDE)
+        const source = placeholderSourceAt(command, DOT_CLAUDE)
+        expect(source).toBeDefined()
         // .claude/commands and .claude/agents share the missing component
         // <cwd>/.claude: one destination, one bind, one source.
-        expect(bound).toHaveLength(1)
-        sources.push(bound[0]!)
+        expect(countMounts(command, '--ro-bind', source!, DOT_CLAUDE)).toBe(1)
+        sources.push(source!)
       }
       expect(new Set(sources).size).toBe(1)
       expect(emptySourceDirs()).toEqual([basename(sources[0]!)])
@@ -378,10 +358,10 @@ describe.if(isLinux)(
 
       // A wrap after the cleanup makes a new one rather than binding a path
       // that is no longer there.
-      const bound = emptySourcesFor(await wrap(), DOT_CLAUDE)
-      expect(bound).toHaveLength(1)
-      expect(bound[0]).not.toBe(sources[0])
-      expect(existsSync(bound[0]!)).toBe(true)
+      const source = placeholderSourceAt(await wrap(), DOT_CLAUDE)
+      expect(source).toBeDefined()
+      expect(source).not.toBe(sources[0])
+      expect(existsSync(source!)).toBe(true)
     })
 
     it('emits one placeholder per destination, as a directory when the kinds collide', async () => {
@@ -390,9 +370,13 @@ describe.if(isLinux)(
       // for a directory at the same destination.
       const command = await wrap([DOT_CLAUDE])
 
-      expect(tokenCount(command, DOT_CLAUDE)).toBe(1)
-      expect(command).not.toContain(`--ro-bind /dev/null ${DOT_CLAUDE}`)
-      expect(emptySourcesFor(command, DOT_CLAUDE)).toHaveLength(1)
+      const source = placeholderSourceAt(command, DOT_CLAUDE)
+      expect(source).toBeDefined()
+      // One bind of the directory form, and no /dev/null one anywhere: the
+      // last mount at the destination being the directory form is not on its
+      // own enough, an earlier /dev/null bind there is the abort.
+      expect(countMounts(command, '--ro-bind', source!, DOT_CLAUDE)).toBe(1)
+      expect(countMounts(command, '--ro-bind', '/dev/null', DOT_CLAUDE)).toBe(0)
     })
 
     it.skipIf(!BWRAP_CAN_NAMESPACE)(
@@ -400,10 +384,10 @@ describe.if(isLinux)(
       async () => {
         // Two binds at one destination made bwrap refuse to start with
         // "Can't mkdir <dest>: Not a directory".
-        const started = run(await wrap([DOT_CLAUDE]), PROJ)
+        const started = run(await wrap([DOT_CLAUDE], `echo ${BOOTED}`), PROJ)
         expect(started.stdout).not.toMatch(/Not a directory/)
         expect(started.status).toBe(0)
-        expect(started.stdout).toContain('hello')
+        expect(started.stdout).toContain(BOOTED)
 
         // That run left the mount point on the host. Without taking it away
         // the next wrap sees an existing path and emits no placeholder at all,
@@ -413,21 +397,27 @@ describe.if(isLinux)(
 
         const denyCommand = await wrap(
           [DOT_CLAUDE],
-          `mkdir -p ${join(DOT_CLAUDE, 'commands')}`,
+          `echo ${BOOTED}; mkdir -p ${join(DOT_CLAUDE, 'commands')}; echo rc=$?`,
         )
-        expect(emptySourcesFor(denyCommand, DOT_CLAUDE)).toHaveLength(1)
+        const source = placeholderSourceAt(denyCommand, DOT_CLAUDE)
+        expect(source).toBeDefined()
+        expect(countMounts(denyCommand, '--ro-bind', source!, DOT_CLAUDE)).toBe(
+          1,
+        )
 
         // The deny still holds, and nothing is left on the host.
-        expect(run(denyCommand, PROJ).status).not.toBe(0)
+        const denied = run(denyCommand, PROJ)
+        expect(denied.stdout).toContain(BOOTED)
+        expect(denied.stdout).toMatch(/rc=[1-9]/)
         cleanupBwrapMountPoints({ force: true })
         expect(existsSync(DOT_CLAUDE)).toBe(false)
       },
     )
 
     it('reuses the source while it is still our own empty directory', async () => {
-      const first = emptySourcesFor(await wrap(), DOT_CLAUDE)[0]
+      const first = placeholderSourceAt(await wrap(), DOT_CLAUDE)
       expect(first).toBeDefined()
-      expect(emptySourcesFor(await wrap(), DOT_CLAUDE)[0]).toBe(first!)
+      expect(placeholderSourceAt(await wrap(), DOT_CLAUDE)).toBe(first!)
     })
 
     // The source sits under the system temp dir, which sandboxed commands
@@ -451,13 +441,16 @@ describe.if(isLinux)(
       ],
       ['its mode has been widened', (p: string) => chmodSync(p, 0o755)],
     ])('makes a fresh source when %s', async (_what, tamper) => {
-      const first = emptySourcesFor(await wrap(), DOT_CLAUDE)[0]!
+      const first = placeholderSourceAt(await wrap(), DOT_CLAUDE)!
       tamper(first)
 
       const command = await wrap()
-      const second = emptySourcesFor(command, DOT_CLAUDE)[0]!
+      const second = placeholderSourceAt(command, DOT_CLAUDE)!
       expect(second).not.toBe(first)
-      expect(command).not.toContain(first)
+      // Neither bound over the destination nor pinned: nothing in this wrap
+      // reaches the path that is no longer ours.
+      expect(countMounts(command, '--ro-bind', first, DOT_CLAUDE)).toBe(0)
+      expect(countMounts(command, '--ro-bind', first, first)).toBe(0)
       expect(lstatSync(second).isSymbolicLink()).toBe(false)
       expect(readdirSync(second)).toEqual([])
 
@@ -502,19 +495,22 @@ describe.if(isLinux)(
       const [first, second] = wrapped.stdout
         .split('\n')
         .filter(line => line.includes('--ro-bind'))
-        .map(line => emptySourcesFor(line, DOT_CLAUDE)[0])
+        .map(line => placeholderSourceAt(line, DOT_CLAUDE))
       expect(first).toBeDefined()
       expect(second).toBe(first!)
     })
 
     it('pins the source read-only, after every other mount', async () => {
       const command = await wrap()
-      const source = emptySourcesFor(command, DOT_CLAUDE)[0]!
+      const source = placeholderSourceAt(command, DOT_CLAUDE)!
 
       // Last, like the masked-file store's own pin, so nothing emitted after
-      // it can put a writable mount back over the source.
+      // it can put a writable mount back over the source — neither on the
+      // source nor on a directory above it, which the scan below is for.
+      // countMounts reads argv words and refuses a command whose profile went
+      // to the argument file, so that scan cannot pass for free on one.
       const pin = `--ro-bind ${source} ${source}`
-      expect(command).toContain(pin)
+      expect(countMounts(command, '--ro-bind', source, source)).toBe(1)
       const after = command.slice(command.lastIndexOf(pin) + pin.length)
       expect(after).not.toMatch(/--ro-bind |--bind |--dev-bind |--tmpfs /)
     })
@@ -525,19 +521,22 @@ describe.if(isLinux)(
         // With the temp dir writable, the source and the DENIED destination
         // are the same directory: a write to the source would appear at the
         // deny, in this sandbox and in every concurrent one sharing it.
-        const source = emptySourcesFor(
+        const source = placeholderSourceAt(
           await wrapWithWritableTempDir(),
           DOT_CLAUDE,
-        )[0]!
+        )!
         const planted = join(source, 'commands')
         const command = await wrapWithWritableTempDir(
-          `mkdir -p ${planted} 2>&1; echo "mkdir rc=$?"; ` +
+          `echo ${BOOTED}; ` +
+            `mkdir -p ${planted} 2>&1; echo "mkdir rc=$?"; ` +
             `echo ${SENTINEL} > ${join(planted, 'x.md')} 2>&1; ` +
             `cat ${join(DOT_CLAUDE, 'commands', 'x.md')} 2>&1`,
         )
-        expect(emptySourcesFor(command, DOT_CLAUDE)).toEqual([source])
+        expect(placeholderSourceAt(command, DOT_CLAUDE)).toBe(source)
+        expect(countMounts(command, '--ro-bind', source, DOT_CLAUDE)).toBe(1)
 
         const attempt = run(command, PROJ)
+        expect(attempt.stdout).toContain(BOOTED)
         expect(attempt.stdout).toMatch(/mkdir rc=[1-9]/)
         expect(attempt.stdout).not.toContain(SENTINEL)
         expect(readdirSync(source)).toEqual([])
