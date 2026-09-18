@@ -55,6 +55,13 @@ function Write-MachineSnapshot {
       $Tag, $cpu.Name, $cpu.NumberOfLogicalProcessors,
       ($os.TotalVisibleMemorySize / 1KB), ($os.FreePhysicalMemory / 1KB),
       $os.BuildNumber, $ubr, ((Get-Date) - $os.LastBootUpTime).TotalSeconds)
+    # Whether the .NET Framework native-image tasks have run on this machine.
+    Get-ScheduledTask -TaskPath '\Microsoft\Windows\.NET Framework\' -ErrorAction SilentlyContinue |
+      ForEach-Object {
+        $i = $_ | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
+        Write-Host ("diag[{0}]: ngen-task '{1}' state={2} lastRun={3:u} result={4}" -f
+          $Tag, $_.TaskName, $_.State, $i.LastRunTime, $i.LastTaskResult)
+      }
     Write-BusySample $Tag
   } catch {
     Write-Host "diag[$Tag]: snapshot failed: $_"
@@ -163,7 +170,10 @@ Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 # timeout and (b) per-element ArgumentList quoting that survives
 # PATH-with-spaces.
 function RExec {
-  param([string[]] $tail, [int] $TimeoutSec = 30)
+  # 120s: rows that start Windows PowerShell as the sandbox user can take 30s
+  # each when the machine has no .NET Framework native images yet (the process
+  # is CPU-bound in startup the whole time); a limit only matters on a hang.
+  param([string[]] $tail, [int] $TimeoutSec = 120)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
             '--env', "PATHEXT=$($env:PATHEXT)") + $tail
@@ -309,18 +319,15 @@ $inRangeR = Bind-Listener ($PortHi..($PortLo+5))
 $portInR  = $inRangeR.LocalEndpoint.Port
 try {
   # TcpClient, as in R5d/R5e, not Test-NetConnection: the cmdlet loads the
-  # NetTCPIP module and falls back to a ping, and this is the first pwsh
-  # started under the new sandbox profile, so the pair can outlast RExec's
-  # 30s limit on a slow runner.
-  # This is the first pwsh started as the sandbox user. 120s, and the
-  # elapsed time in the log, to tell a slow first start from one that never
-  # finishes.
+  # NetTCPIP module and falls back to a ping, which roughly doubles the row.
+  # This is the first Windows PowerShell started as the sandbox user; log how
+  # long it took.
   Write-MachineSnapshot 'before-R5b'
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
     "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portInR); Write-Output CONNECTED } " +
-    "catch { Write-Output blocked }") 120
-  Write-Host "R5b: first pwsh as srt-sandbox took $([int]$sw.Elapsed.TotalSeconds)s"
+    "catch { Write-Output blocked }")
+  Write-Host "R5b: first powershell.exe as srt-sandbox took $([int]$sw.Elapsed.TotalSeconds)s"
   if ($r.out -notmatch 'CONNECTED') {
     throw "R5b: loopback to in-range port $portInR did not succeed. raw: $($r.raw)"
   }
