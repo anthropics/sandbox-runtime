@@ -159,9 +159,12 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
-          # Verify bwrap can create namespaces
+          # Same argv as bwrapCanNamespace() in test/helpers/bwrap-namespace.ts,
+          # which whole suites use as `it.skipIf(!BWRAP_CAN_NAMESPACE)`. A host
+          # that cannot nest namespaces must red the leg here rather than skip
+          # those arms silently, so this runs unguarded.
           echo "Testing bwrap namespace creation..."
-          bwrap --ro-bind / / --unshare-net true && echo "✓ bwrap namespace creation works" || echo "✗ bwrap namespace creation still fails"
+          bwrap --unshare-pid --unshare-user --cap-drop ALL --ro-bind / / --proc /proc true
 
       - name: Install system dependencies (macOS)
         if: matrix.os == 'macos'
