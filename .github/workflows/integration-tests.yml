@@ -44,6 +44,12 @@ jobs:
           - { arch: arm64, runner: windows-11-arm, os: windows, probe: 4 }
           - { arch: arm64, runner: windows-11-arm, os: windows, probe: 5 }
           - { arch: arm64, runner: windows-11-arm, os: windows, probe: 6 }
+          # TEMPORARY, remove before merge: extra Windows x64 legs, to sample an
+          # intermittent `srt-win user status` timeout in winsrt P1.
+          - { arch: x86-64, runner: windows-latest, os: windows, probe: 2 }
+          - { arch: x86-64, runner: windows-latest, os: windows, probe: 3 }
+          - { arch: x86-64, runner: windows-latest, os: windows, probe: 4 }
+          - { arch: x86-64, runner: windows-latest, os: windows, probe: 5 }
 
     steps:
       - name: Checkout code
