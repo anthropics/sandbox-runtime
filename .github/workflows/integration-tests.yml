@@ -176,6 +176,12 @@ jobs:
         if: matrix.os == 'linux' && matrix.arch == 'x86-64'
         run: npx eslint .
 
+      # `npm run build` compiles src only. This is the one step that checks
+      # the types of test/, which bun strips at runtime.
+      - name: Typecheck
+        if: matrix.os != 'windows'
+        run: npm run typecheck
+
       - name: Build seccomp binaries (Linux)
         if: matrix.os == 'linux'
         run: npm run build:seccomp

@@ -476,6 +476,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     // still there under its own name. Answering for that name too would drop
     // every match beneath it: the same fail-open as reading it as absent.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-route-')))
+    const readdirSync = fs.readdirSync
+    const spy = spyOn(fs, 'readdirSync')
     try {
       mkdirSync(join(root, 'pkg', 'certs'), { recursive: true })
       writeFileSync(join(root, 'pkg', 'certs', 'id.pem'), 'KEY')
@@ -484,11 +486,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       // Whichever of the two names the walk reaches first fails; the other
       // has to be listed on its own account.
       const names = [join(root, 'pkg', 'certs'), join(root, 'lnk')]
-      const readdirSync = fs.readdirSync
       let failedOnce = false
-      using spy = spyOn(fs, 'readdirSync').mockImplementation(((
-        ...args: Parameters<typeof fs.readdirSync>
-      ) => {
+      spy.mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
         if (!failedOnce && names.includes(String(args[0]))) {
           failedOnce = true
           throw Object.assign(new Error('ELOOP: too many symbolic links'), {
@@ -509,6 +508,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         join(root, 'pkg', 'certs', 'id.pem'),
       ])
     } finally {
+      spy.mockRestore()
       rmSync(root, { recursive: true, force: true })
     }
   })
