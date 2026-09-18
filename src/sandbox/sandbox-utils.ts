@@ -234,19 +234,6 @@ export function isSymlinkOutsideBoundary(
   ) {
     return false
   }
-  // Also handle the reverse: /private/tmp/... resolving to itself
-  if (
-    normalizedOriginal.startsWith('/private/tmp/') &&
-    normalizedResolved === normalizedOriginal
-  ) {
-    return false
-  }
-  if (
-    normalizedOriginal.startsWith('/private/var/') &&
-    normalizedResolved === normalizedOriginal
-  ) {
-    return false
-  }
 
   // If resolved path is "/" it's outside expected boundaries
   if (normalizedResolved === '/') {
@@ -298,11 +285,9 @@ export function isSymlinkOutsideBoundary(
   const resolvedIsCanonical =
     canonicalOriginal !== normalizedOriginal &&
     normalizedResolved === canonicalOriginal
-  const resolvedIsSame = normalizedResolved === normalizedOriginal
 
   // If resolved path is not within expected tree, it's outside boundary
   if (
-    !resolvedIsSame &&
     !resolvedIsCanonical &&
     !resolvedStartsWithOriginal &&
     !resolvedStartsWithCanonical
