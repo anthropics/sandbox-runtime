@@ -280,8 +280,6 @@ describe('restriction pattern semantics', () => {
     it.if(isLinux)(
       'weaker branch passes --unshare-user and drops capabilities too',
       async () => {
-        // bwrap run by uid 0 keeps the caller's capabilities unless told to
-        // drop them; for a non-root caller the drop is a no-op.
         const result = await wrapCommandWithSandboxLinux({
           command,
           needsNetworkRestriction: false,
@@ -290,7 +288,8 @@ describe('restriction pattern semantics', () => {
           enableWeakerNestedSandbox: true,
         })
 
-        expect(result).toContain('--unshare-user --cap-drop ALL')
+        expect(result).toContain('--unshare-user')
+        expect(result).toContain('--cap-drop ALL')
         expect(result).toContain('--bind /proc /proc')
         expect(result).not.toContain('--proc /proc')
         if (process.geteuid?.() !== 0) {

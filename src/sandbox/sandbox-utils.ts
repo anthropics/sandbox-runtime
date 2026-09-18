@@ -65,6 +65,47 @@ export function isStrictlyUnder(p: string, dir: string): boolean {
   return p !== dir && isAtOrUnder(p, dir)
 }
 
+/** The proper ancestors of an absolute POSIX path, nearest first, ending at '/'. */
+export function* properAncestors(absolutePath: string): Generator<string> {
+  for (
+    let slash = absolutePath.lastIndexOf('/');
+    slash > 0;
+    slash = absolutePath.lastIndexOf('/', slash - 1)
+  ) {
+    yield absolutePath.slice(0, slash)
+  }
+  if (absolutePath !== '/') yield '/'
+}
+
+/**
+ * The spellings that name `candidatePath` for a mount comparison: as spelled,
+ * plus with every symlink resolved when that differs. A path that cannot be
+ * resolved (dangling, vanished) is named by its spelling alone.
+ */
+export function pathSpellings(candidatePath: string): string[] {
+  try {
+    const resolved = fs.realpathSync(candidatePath)
+    if (resolved !== candidatePath) return [candidatePath, resolved]
+  } catch {
+    // Dangling or vanished: only the spelling names it.
+  }
+  return [candidatePath]
+}
+
+/** An fs error that means the name resolves to no file — it is missing, or
+ * the path cannot name one at all — as opposed to one that means a file is
+ * there but could not be looked at (EACCES, EPERM, EIO, anything
+ * unrecognised). */
+export function isAbsenceErrno(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code
+  return (
+    code === 'ENOENT' ||
+    code === 'ENOTDIR' ||
+    code === 'ELOOP' ||
+    code === 'ENAMETOOLONG'
+  )
+}
+
 /**
  * Check if a path pattern contains glob characters
  */
@@ -89,7 +130,7 @@ export function containsGlobCharsWin(p: string): boolean {
 }
 
 /** Platform-appropriate glob-char check. */
-function containsGlobCharsForPlatform(p: string): boolean {
+export function containsGlobCharsForPlatform(p: string): boolean {
   return getPlatform() === 'windows'
     ? containsGlobCharsWin(p)
     : containsGlobChars(p)
@@ -314,18 +355,62 @@ export function expandWindowsEnvRefs(p: string): string {
 }
 
 /**
+ * Runs of `/` collapsed to one and `/./` components dropped, leaving the rest
+ * of the spelling (a trailing `/` or `/.`, a `..`) to the caller. POSIX only.
+ */
+function collapseInteriorSpellings(pathPattern: string): string {
+  return pathPattern.replace(/\/{2,}/g, '/').replace(/\/\.(?=\/)/g, '')
+}
+
+/**
+ * Says so when a `..` reaches a backend unfolded — realpath could not resolve
+ * the path (absent, or unreadable), and folding `..` lexically here could aim
+ * the rule past a symlink at a file the kernel would never reach. Debug-only
+ * (`SRT_DEBUG`), so a rule that matches nothing is silent by default. Called
+ * at every return of {@link normalizePathForSandbox} that can carry one, glob
+ * spellings included.
+ */
+function warnIfParentRefUnfolded(normalizedPath: string): string {
+  if (
+    getPlatform() !== 'windows' &&
+    /(?:^|\/)\.\.(?:\/|$)/.test(normalizedPath)
+  ) {
+    logForDebugging(
+      `[Sandbox] "${normalizedPath}" could not be resolved and still contains ` +
+        `a ".." component, so a rule spelled this way may not match.`,
+      { level: 'warn' },
+    )
+  }
+  return normalizedPath
+}
+
+/**
  * Normalize a path for use in sandbox configurations
  * Handles:
  * - Tilde (~) expansion for home directory
  * - Relative paths (./foo, ../foo, etc.) converted to absolute
- * - Absolute paths remain unchanged
+ * - POSIX: '//' runs, '/./' components and a trailing '/' or '/.' collapsed
  * - Symlinks are resolved to their real paths for non-glob patterns
  * - Glob patterns preserve wildcards after path normalization
  *
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
+ *
+ * `opts.literal` marks a path that names one file or directory rather
+ * than matching several: one the library computed itself, or a caller
+ * spelling that carried no glob character — resolving such a spelling can
+ * splice in a cwd or home directory whose own name does. The glob
+ * branches are skipped for it, so a component like `a[b` is resolved and
+ * later compiled as the name it is. A spelling the caller wrote with `*`,
+ * `?` or `[…]` in it keeps the character sniffing: there the brackets are
+ * the glob syntax it asked for. The interior collapse below is not one of
+ * the glob branches: `//` and `/./` are dead spellings either way.
  */
-export function normalizePathForSandbox(pathPattern: string): string {
-  const cwd = process.cwd()
+export function normalizePathForSandbox(
+  pathPattern: string,
+  opts?: { literal?: boolean },
+): string {
+  const isGlobSpelling = (p: string): boolean =>
+    !opts?.literal && containsGlobCharsForPlatform(p)
   // Windows pre-processing: expand `%USERPROFILE%` / `%HOMEDRIVE%` /
   // `%HOMEPATH%`, strip the `\\?\` / `\\?\UNC\` extended prefix (its
   // `?` is a literal, not a glob char), and uppercase the drive
@@ -338,7 +423,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
     // UNC literal: return as-is (separators normalised only) — no
     // stat/realpath. A UNC *glob* falls through to the glob walk
     // below (user-trusted share). See {@link isUncPath}.
-    if (isUncPath(pathPattern) && !containsGlobCharsWin(pathPattern)) {
+    if (isUncPath(pathPattern) && !isGlobSpelling(pathPattern)) {
       return path.win32.normalize(pathPattern)
     }
   }
@@ -346,17 +431,21 @@ export function normalizePathForSandbox(pathPattern: string): string {
   // resolution. Consumers on the Linux and macOS paths compare spellings by
   // exact match and `path + '/'` prefixes — which a preserved slash silently
   // defeats ('<dir>//') — and the realpath-acceptance checks below treat a
-  // slash-only difference as a mismatch. bwrap binds and sbpl subpath
-  // filters treat 'dir' and 'dir/' identically, so only the comparisons
-  // change. Glob spellings are left untouched: a slash after a glob segment
-  // is semantic ('/x/*/' compiles to a different regex than '/x/*'). On
+  // slash-only difference as a mismatch. A Seatbelt `subpath` filter is the
+  // one place the two spellings really are interchangeable: a `literal`
+  // filter and a glob regex ending '/$' match nothing when the slash is
+  // there, and a bwrap bind tolerates it only for a directory (a slashed
+  // file path fails ENOTDIR at mount). Glob spellings are left untouched: a
+  // slash after a glob segment is semantic ('/x/*/' compiles to a different
+  // regex than '/x/*'). That regex matches nothing, which an allow may
+  // harmlessly be — so an allow keeps the spelling, while the same spelling
+  // as a deny is rejected at config validation (see sandbox-config.ts). On
   // Windows a trailing separator is the directory marker for absent deny
   // targets (srt#404) and must survive.
   if (
     getPlatform() !== 'windows' &&
     pathPattern.endsWith('/') &&
-    pathPattern !== '/' &&
-    !containsGlobCharsForPlatform(pathPattern)
+    !isGlobSpelling(pathPattern)
   ) {
     pathPattern = pathPattern.replace(/\/+$/, '') || '/'
   }
@@ -366,14 +455,35 @@ export function normalizePathForSandbox(pathPattern: string): string {
     // tilde was expanded above
   } else if (pathPattern.startsWith('./') || pathPattern.startsWith('../')) {
     // Convert relative to absolute based on current working directory
-    normalizedPath = path.resolve(cwd, pathPattern)
+    normalizedPath = path.resolve(process.cwd(), pathPattern)
   } else if (!path.isAbsolute(pathPattern)) {
     // Handle other relative paths (e.g., ".", "..", "foo/bar")
-    normalizedPath = path.resolve(cwd, pathPattern)
+    normalizedPath = path.resolve(process.cwd(), pathPattern)
+  }
+
+  // POSIX: collapse the interior spellings realpath would have removed, on the
+  // EXPANDED path — the trailing strip above runs before expansion and only
+  // ever touches a trailing run, and tilde expansion can put a run back
+  // (HOME='/home/u/' turns '~/x' into '/home/u//x'). Glob spellings need it
+  // for the same reason: '~/.aws//*.pem' compiles to a regex holding '//'.
+  //
+  // It matters on macOS: Seatbelt compares the kernel's canonical path, so a
+  // filter spelled with '//' or '/./' matches nothing, silently — which for a
+  // deny is exactly the absent-target case the deny exists for. bwrap
+  // tolerates the spelling, and the Linux backend rebuilds its destinations
+  // with path.dirname/join, so that argv was already right.
+  //
+  // Lexical only, and deliberately not path.normalize/path.resolve: those
+  // also fold '..', which through a symlinked component aims the rule at a
+  // different file than the kernel would reach. An absolute spelling's '..' is
+  // left to realpath below; a relative one was already folded lexically by the
+  // path.resolve above (pre-existing).
+  if (getPlatform() !== 'windows') {
+    normalizedPath = collapseInteriorSpellings(normalizedPath)
   }
 
   // For glob patterns, resolve symlinks for the directory portion only
-  if (containsGlobCharsForPlatform(normalizedPath)) {
+  if (isGlobSpelling(normalizedPath)) {
     // Extract the static directory prefix before glob characters
     // (on Windows, `[`/`]` are literal so only split on `*`/`?`).
     const splitRe = getPlatform() === 'windows' ? /[*?]/ : /[*?[\]]/
@@ -392,14 +502,23 @@ export function normalizePathForSandbox(pathPattern: string): string {
         if (!isSymlinkOutsideBoundary(baseDir, resolvedBaseDir)) {
           // Reconstruct the pattern with the resolved directory
           const patternSuffix = normalizedPath.slice(baseDir.length)
-          return resolvedBaseDir + patternSuffix
+          return warnIfParentRefUnfolded(resolvedBaseDir + patternSuffix)
         }
         // If resolution would broaden scope, keep original pattern
       } catch {
         // If directory doesn't exist or can't be resolved, keep the original pattern
       }
     }
-    return normalizedPath
+    return warnIfParentRefUnfolded(normalizedPath)
+  }
+
+  // A trailing '/' or '/.' is not semantic outside a glob, and the empty
+  // string is not the filesystem root: an empty HOME makes expandTilde('~')
+  // empty, and '' || '/' would turn `allowWrite: ['~']` into a whole-
+  // filesystem grant.
+  if (getPlatform() !== 'windows' && normalizedPath !== '') {
+    normalizedPath =
+      normalizedPath.replace(/\/\.$/, '').replace(/\/+$/, '') || '/'
   }
 
   // Resolve symlinks to real paths to avoid bwrap issues
@@ -414,11 +533,36 @@ export function normalizePathForSandbox(pathPattern: string): string {
       normalizedPath = resolvedPath
     }
   } catch {
-    // If path doesn't exist or can't be resolved, keep the normalized path
+    // Absent, or unreadable: keep the normalized spelling.
   }
 
-  return normalizedPath
+  return warnIfParentRefUnfolded(normalizedPath)
 }
+
+/**
+ * What the sandbox itself needs writable: the child's stdio and the TMPDIR it
+ * is handed (generateProxyEnvVars). Kept whatever is read-denied.
+ */
+const SANDBOX_OWN_WRITE_PATHS: readonly string[] = [
+  '/dev/stdout',
+  '/dev/stderr',
+  '/dev/null',
+  '/dev/tty',
+  '/dev/dtracehelper',
+  '/dev/autofs_nowait',
+  '/tmp/claude',
+  '/private/tmp/claude',
+]
+
+/**
+ * Directories under the home directory made writable as a convenience the
+ * caller never asked for. Every entry is subject to the read-rule check in
+ * {@link getDefaultWritePaths}.
+ */
+const HOME_CONVENIENCE_WRITE_DIRS: readonly string[] = [
+  '.npm/_logs',
+  '.claude/debug',
+]
 
 /**
  * Get recommended system paths that should be writable for commands to work properly
@@ -426,23 +570,99 @@ export function normalizePathForSandbox(pathPattern: string): string {
  * WARNING: These default paths are intentionally broad for compatibility but may
  * allow access to files from other processes. In highly security-sensitive
  * environments, you should configure more restrictive write paths.
+ *
+ * With no argument this is the whole list. Given the read rules of a
+ * filesystem policy, a home convenience directory (~/.npm/_logs,
+ * ~/.claude/debug) is left out when a `denyRead` entry names it or a
+ * directory above it: kept, it would be bound back over that deny on Linux
+ * (readable and writable again) and stay writable on macOS, so the explicit
+ * denyRead wins over the implicit write allow. It is kept when an `allowRead`
+ * entry beneath that deny re-opens it, because the caller has already made it
+ * readable. A caller who wants it writable regardless lists it in
+ * `allowWrite`. What the sandbox itself needs (stdio, /tmp/claude) is never
+ * left out.
+ *
+ * Pass the entries as configured, not expanded. `dir/**` counts as `dir`,
+ * and a glob covers a directory when it matches that directory or one above
+ * it; nothing is listed from disk. On Linux, where the backend expands globs
+ * against the disk, two things follow: a glob that matches nothing there
+ * still counts (which only ever drops a convenience path), and a glob whose
+ * match is a symlink to one of these directories is not seen. A glob
+ * `allowRead` entry is not counted as re-opening anything.
  */
-export function getDefaultWritePaths(): string[] {
-  const homeDir = homedir()
-  const recommendedPaths = [
-    '/dev/stdout',
-    '/dev/stderr',
-    '/dev/null',
-    '/dev/tty',
-    '/dev/dtracehelper',
-    '/dev/autofs_nowait',
-    '/tmp/claude',
-    '/private/tmp/claude',
-    path.join(homeDir, '.npm/_logs'),
-    path.join(homeDir, '.claude/debug'),
+export function getDefaultWritePaths(readRules?: {
+  denyRead: readonly string[]
+  allowRead?: readonly string[]
+}): string[] {
+  const home = homedir()
+  const keptDirs =
+    !readRules || readRules.denyRead.length === 0
+      ? HOME_CONVENIENCE_WRITE_DIRS
+      : homeDirsNotReadDenied(home, readRules.denyRead, readRules.allowRead)
+  return [
+    ...SANDBOX_OWN_WRITE_PATHS,
+    ...keptDirs.map(rel => path.join(home, rel)),
   ]
+}
 
-  return recommendedPaths
+/**
+ * The {@link HOME_CONVENIENCE_WRITE_DIRS} no `denyRead` entry covers, or
+ * that an `allowRead` entry beneath the covering deny re-opens.
+ */
+function homeDirsNotReadDenied(
+  home: string,
+  denyRead: readonly string[],
+  allowRead: readonly string[] = [],
+): readonly string[] {
+  // Rules are compared as normalizePathForSandbox spells them, and on macOS
+  // that resolves /tmp and /var to /private/... for a path that exists. A
+  // convenience directory may not exist yet, so its second spelling is built
+  // from the home directory, which does.
+  const homes = [
+    ...new Set([home, normalizePathForSandbox(home, { literal: true })]),
+  ]
+  const denies = denyRead.map(entry => readRuleCovers(entry))
+  const reopened = allowRead
+    .map(entry => removeTrailingGlobSuffix(entry))
+    .filter(entry => !containsGlobCharsForPlatform(entry))
+    .map(entry => normalizePathForSandbox(entry, { literal: true }))
+  return HOME_CONVENIENCE_WRITE_DIRS.filter(rel => {
+    const spellings = homes.map(h => path.join(h, rel))
+    return !denies.some(
+      denyCovers =>
+        spellings.some(denyCovers) &&
+        !reopened.some(
+          allow =>
+            denyCovers(allow) && spellings.some(s => isAtOrUnder(s, allow)),
+        ),
+    )
+  })
+}
+
+/**
+ * Whether a read rule covers a path: the path is the rule's own or lies
+ * beneath it. `dir/**` is `dir`, and a glob covers whatever
+ * {@link denyGlobRegex} matches.
+ *
+ * Pattern or name is decided on what the caller wrote, before the spelling
+ * is resolved: `*`, `?` and `[…]` there are the syntax it asked for, while
+ * resolving splices in a cwd or home directory that may carry those
+ * characters in its own name. A spelling without them is normalized as the
+ * name it is.
+ */
+function readRuleCovers(entry: string): (p: string) => boolean {
+  const stripped = removeTrailingGlobSuffix(entry)
+  if (containsGlobCharsForPlatform(stripped)) {
+    try {
+      const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
+      return p => regex.test(p)
+    } catch {
+      // Brackets that do not form a valid class. The entry may be a literal
+      // file name, so it is compared as one.
+    }
+  }
+  const rule = normalizePathForSandbox(stripped, { literal: true })
+  return p => isAtOrUnder(p, rule)
 }
 
 /**
@@ -795,11 +1015,32 @@ export function buildPosixGitSafeDirEnv(opts: {
 }
 
 /**
+ * How much of an attribution key rides the carriers. A key is cut to this
+ * many characters before encoding, so two commands that share this much of
+ * a prefix share a key.
+ */
+export const SANDBOXED_COMMAND_KEY_LENGTH = 100
+
+/**
+ * The attribution key for an invocation: the caller's `commandId`, or the
+ * command itself when there is no usable id.
+ */
+export function attributionKeyFor(
+  command: string,
+  commandId: string | undefined,
+): string {
+  // Falsy, not `=== undefined`: every carrier drops an empty attribution, and
+  // a JavaScript caller's `null` would throw in encodeSandboxedCommand.
+  return !commandId ? command : commandId
+}
+
+/**
  * Encode a command for sandbox monitoring
- * Truncates to 100 chars and base64 encodes to avoid parsing issues
+ * Truncates to SANDBOXED_COMMAND_KEY_LENGTH chars and base64 encodes to
+ * avoid parsing issues
  */
 export function encodeSandboxedCommand(command: string): string {
-  const truncatedCommand = command.slice(0, 100)
+  const truncatedCommand = command.slice(0, SANDBOXED_COMMAND_KEY_LENGTH)
   return Buffer.from(truncatedCommand).toString('base64')
 }
 
@@ -813,18 +1054,32 @@ export function decodeSandboxedCommand(encodedCommand: string): string {
 /** Base proxy username; the auth token is the credential, this is a label. */
 export const PROXY_AUTH_USER = 'srt'
 
+/** RFC 1929 caps a SOCKS5 username at 255 bytes. */
+const MAX_PROXY_USERNAME_BYTES = 255
+
+/**
+ * The longest encodedCommand a carrier this process mints can hold: what is
+ * left of the username budget after `srt.`. Every carrier is bounded far more
+ * loosely than that (an HTTP proxy header budget is kilobytes), so a longer
+ * attribution field was not minted here and is stored by nobody.
+ */
+export const MAX_ENCODED_COMMAND_BYTES =
+  MAX_PROXY_USERNAME_BYTES - Buffer.byteLength(`${PROXY_AUTH_USER}.`)
+
 /**
  * Build the proxy username for a sandboxed command: `srt.<encodedCommand>`
  * so the proxy can attribute a denial to the invocation that triggered it,
- * or bare `srt` when there is nothing to attribute. RFC 1929 caps the
- * SOCKS5 username at 255 bytes; a multibyte command whose 100-code-unit
- * truncation still base64s past that would fail the SOCKS handshake, so
- * fall back to bare `srt` (attribution is lost, connectivity is not).
+ * or bare `srt` when there is nothing to attribute. A multibyte command whose
+ * 100-code-unit truncation still base64s past the username budget would fail
+ * the SOCKS handshake, so fall back to bare `srt` (attribution is lost,
+ * connectivity is not).
  */
 export function proxyUsernameFor(encodedCommand: string | undefined): string {
   if (!encodedCommand) return PROXY_AUTH_USER
   const user = `${PROXY_AUTH_USER}.${encodedCommand}`
-  return Buffer.byteLength(user) <= 255 ? user : PROXY_AUTH_USER
+  return Buffer.byteLength(user) <= MAX_PROXY_USERNAME_BYTES
+    ? user
+    : PROXY_AUTH_USER
 }
 
 /**
@@ -832,14 +1087,20 @@ export function proxyUsernameFor(encodedCommand: string | undefined): string {
  * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
  * The username is client-controlled inside the sandbox, so a forged suffix
  * can only misattribute a denial in the violation report — it cannot
- * authenticate (the token does that) or reach another command's data.
+ * authenticate (the token does that) or reach another command's data. A
+ * suffix past {@link MAX_ENCODED_COMMAND_BYTES} is longer than this process
+ * can mint, so it is dropped rather than stored: the denial is still
+ * recorded, unattributed.
  */
 export function encodedCommandFromProxyUser(
   username: string | undefined,
 ): string | undefined {
   if (!username || !username.startsWith(`${PROXY_AUTH_USER}.`)) return undefined
   const suffix = username.slice(PROXY_AUTH_USER.length + 1)
-  return suffix || undefined
+  if (!suffix || Buffer.byteLength(suffix) > MAX_ENCODED_COMMAND_BYTES) {
+    return undefined
+  }
+  return suffix
 }
 
 /**
@@ -876,6 +1137,26 @@ export function globToRegex(globPattern: string): string {
   )
 }
 
+/**
+ * Regex for a glob used in a DENY rule: {@link globToRegex} plus an optional
+ * `/…` tail, so the deny covers everything beneath each match the way
+ * `subpath` does for literals. Callers strip a trailing `/**` before the
+ * pattern gets here (removeTrailingGlobSuffix), so `**\/secrets/**` arrives
+ * as `**\/secrets` and, matched exactly, would deny only the directory
+ * vnode while `secrets/key` stayed readable. This is what the Linux backend
+ * already does (a deny masks the whole subtree). Only ever widens a deny.
+ *
+ * Takes a whole pattern, so every character in it is glob syntax: right for
+ * a spelling the caller wrote, which is what {@link readRuleCovers} passes.
+ * A pattern the library anchored at a directory of its own goes through the
+ * macOS `denyGlobEntryRegex`, which splices that directory back in escaped
+ * and calls this for the tail.
+ */
+export function denyGlobRegex(normalizedGlob: string): string {
+  // globToRegex() always returns '^…$'.
+  return globToRegex(normalizedGlob).slice(0, -1) + '(/.*)?$'
+}
+
 export interface ExpandGlobOptions {
   /**
    * Match case-insensitively. Set this on Windows where the
@@ -886,13 +1167,44 @@ export interface ExpandGlobOptions {
   caseInsensitive?: boolean
 }
 
+/** What one recursive walk of a glob's base directory found; see {@link walkGlobPattern}. */
+export interface GlobWalk {
+  /** Where the walk started, with symlinks resolved (the spelling itself
+   *  when it could not be resolved); '' when the pattern had no literal
+   *  directory to start from. */
+  baseLocation: string
+  /** Absolute paths matching the pattern. */
+  matches: string[]
+  /** With `withDirectoryForm`: directories (a symlink to one included)
+   *  matching the pattern without its trailing `/**`. */
+  directoryMatches: string[]
+  /** Every visited entry that is a symbolic link, by full path. With
+   *  `followSymlinkedDirectories` a match beneath one really lives outside
+   *  the tree it was found in. */
+  symlinks: Set<string>
+  /** Symbolic links whose target is there but could not be looked at, so
+   *  `realOf` has no entry for them. Unreadable now is not absent: a deny
+   *  expansion must cover such a link rather than drop it. */
+  uninspectableLinks: Set<string>
+  /** Directories the walk reached but could not list (any error but
+   *  absence). Whatever the pattern matches beneath them is missing from
+   *  `matches`; a deny expansion must cover them whole. */
+  unlisted: string[]
+  /** Where an entry of `matches`, `directoryMatches` or `unlisted` really
+   *  lives, for each one whose path passes through a symlink (above the walk,
+   *  on the way down, or the entry itself). A symlink that does not resolve
+   *  has no entry. */
+  realOf: Map<string, string>
+}
+
 /**
- * Expand a glob pattern into concrete file paths.
+ * Expand a glob pattern into the concrete paths matching it.
  *
  * Used on Linux (where bubblewrap doesn't support glob patterns
  * natively) and Windows (point-in-time expansion before `srt-win
- * acl stamp`). Resolves the static directory prefix, lists files
- * recursively, and filters using {@link globToRegex}.
+ * acl stamp`). A symlink is a match in its own right and is not
+ * descended into; {@link walkGlobPattern} is the read-deny expansion's
+ * richer view of the same walk.
  *
  * @param globPath - A path pattern containing glob characters (e.g., ~/test/*.env)
  * @returns Array of absolute paths matching the glob pattern
@@ -901,67 +1213,291 @@ export function expandGlobPattern(
   globPath: string,
   opts: ExpandGlobOptions = {},
 ): string[] {
-  // Normalize to `/` separators throughout so {@link globToRegex}
-  // (which treats `/` as the segment boundary) and the static-prefix
-  // split work on Windows paths. Gated to win32: `\` is a valid
-  // filename byte on POSIX, so rewriting it there would change the
-  // path (e.g. a Linux directory literally named `app\creds`).
-  const toFwd = (s: string) =>
-    process.platform === 'win32' ? s.replace(/\\/g, '/') : s
-  const normalizedPattern = toFwd(normalizePathForSandbox(globPath))
+  return walkGlobPattern(globPath, opts).matches
+}
 
-  // Extract the static directory prefix before any glob characters
-  const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
-  if (!staticPrefix || staticPrefix === '/') {
-    logForDebugging(`[Sandbox] Glob pattern too broad, skipping: ${globPath}`)
-    return []
+/**
+ * A test for whether `normalizedPattern` can match anything strictly beneath
+ * a directory, so the walk lists only directories that can hold a match
+ * (`proj/*.pem` lists `proj` alone). Segment by segment up to the first one
+ * that can span directories (`**`); from there on every directory qualifies.
+ * A pattern with no such segment matches at exactly its own depth. Errs
+ * towards descending: a bracket expression holding a `/` cannot be split
+ * into segments, so nothing is pruned for it.
+ */
+function globDescentFilter(
+  normalizedPattern: string,
+  flags: string,
+): (dir: string) => boolean {
+  if (/\[[^\]]*\/[^\]]*\]/.test(normalizedPattern)) return () => true
+  const segments = normalizedPattern.split('/')
+  const spanning = segments.findIndex(segment => segment.includes('**'))
+  const fixedDepth = spanning === -1 ? segments.length : spanning
+  const segmentRegexes = segments
+    .slice(0, fixedDepth)
+    .map(segment => new RegExp(globToRegex(segment), flags))
+  return dir => {
+    const dirSegments = dir.split('/')
+    if (spanning === -1 && dirSegments.length >= segments.length) return false
+    const compared = Math.min(dirSegments.length, fixedDepth)
+    for (let i = 0; i < compared; i++) {
+      if (!segmentRegexes[i]!.test(dirSegments[i]!)) return false
+    }
+    return true
   }
+}
 
-  // Get the base directory from the static prefix
-  const baseDir = staticPrefix.endsWith('/')
+/**
+ * The literal directory a glob's walk starts from: the static prefix before
+ * the pattern's first glob character, without its last path component when
+ * that component is not a directory of its own. '' or '/' means the pattern
+ * has no literal directory to start from (a wildcard in its first path
+ * component), which {@link walkGlobPattern} refuses to expand.
+ *
+ * @param normalizedPattern - a pattern already through
+ * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes})
+ */
+export function globPatternBaseDir(normalizedPattern: string): string {
+  const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
+  if (!staticPrefix) return ''
+  return staticPrefix.endsWith('/')
     ? staticPrefix.slice(0, -1)
     : path.dirname(staticPrefix)
+}
 
-  if (!fs.existsSync(baseDir)) {
-    logForDebugging(
-      `[Sandbox] Base directory for glob does not exist: ${baseDir}`,
-    )
-    return []
+/**
+ * Normalize to `/` separators so {@link globToRegex} (which treats `/` as the
+ * segment boundary) and the static-prefix split work on Windows paths. Gated
+ * to win32: `\` is a valid filename byte on POSIX, so rewriting it there
+ * would change the path (e.g. a Linux directory literally named `app\creds`).
+ */
+export function toForwardSlashes(s: string): string {
+  return process.platform === 'win32' ? s.replace(/\\/g, '/') : s
+}
+
+/**
+ * How many names for one real directory a single walk lists. Every name
+ * lists the same entries, and every match is reported where it really lives,
+ * so a further name adds only the spelling each match was found under — while
+ * n directories linking to each other offer about e*n! of them (n=10: 9.9M),
+ * which a sandboxed command with write access under the pattern's base can
+ * plant. Past this count a directory is recorded as unlisted rather than
+ * walked, so a deny expansion covers it whole instead of losing it.
+ */
+const GLOB_WALK_MAX_NAMES_PER_DIRECTORY = 8
+
+/**
+ * The walk behind {@link expandGlobPattern}: one listing of the pattern's
+ * static prefix, filtered by `globPath` and, with `withDirectoryForm`, by
+ * `globPath` without its trailing `/**`, with the symlinks seen recorded.
+ * With `followSymlinkedDirectories` it also lists through a symlinked
+ * directory and reports every match where it really lives.
+ */
+export function walkGlobPattern(
+  globPath: string,
+  opts: ExpandGlobOptions & {
+    withDirectoryForm?: boolean
+    followSymlinkedDirectories?: boolean
+  } = {},
+): GlobWalk {
+  const walk: GlobWalk = {
+    baseLocation: '',
+    matches: [],
+    directoryMatches: [],
+    symlinks: new Set(),
+    uninspectableLinks: new Set(),
+    unlisted: [],
+    realOf: new Map(),
   }
 
-  // Build regex from the normalized glob pattern
-  const regex = new RegExp(
-    globToRegex(normalizedPattern),
-    opts.caseInsensitive ? 'i' : '',
-  )
+  const normalizedPattern = toForwardSlashes(normalizePathForSandbox(globPath))
+  const baseDir = globPatternBaseDir(normalizedPattern)
+  if (baseDir === '' || baseDir === '/') {
+    logForDebugging(
+      `[Sandbox] Glob pattern has no literal directory to start from, skipping: ${globPath}`,
+      { level: 'warn' },
+    )
+    return walk
+  }
 
-  // List all entries recursively under the base directory
-  const results: string[] = []
+  // `s`: a name may hold a line terminator, which `.` alone does not match.
+  const flags = opts.caseInsensitive ? 'is' : 's'
+  const regex = new RegExp(globToRegex(normalizedPattern), flags)
+  const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
+  const directoryRegex =
+    opts.withDirectoryForm && directoryForm !== normalizedPattern
+      ? new RegExp(globToRegex(directoryForm), flags)
+      : undefined
+  const canHoldMatch = globDescentFilter(normalizedPattern, flags)
+
+  // One readdir per directory rather than readdirSync's `recursive` option,
+  // so an unreadable subtree or a symlink cycle costs only itself, not the
+  // whole pattern. A directory that is not there is not a case of its own:
+  // the listing below tells an absent directory from one that must be
+  // denied whole.
+  type Frame = {
+    dir: string
+    /** `dir` with every symlink resolved. */
+    real: string
+    /** The real directory each symlink on the way here was taken from. */
+    linkedFrom: readonly string[]
+  }
+  /** Successful listings, by real directory: a directory reached by a second
+   *  name holds the same entries. A failure is never cached — it can belong
+   *  to the route rather than to the directory (ELOOP, ENAMETOOLONG) and
+   *  would then answer for every other name. */
+  const listings = new Map<string, fs.Dirent[]>()
+  const namesWalked = new Map<string, number>()
+  const pending: Frame[] = []
+  /** Queue a directory to list, unless its real location already has
+   *  {@link GLOB_WALK_MAX_NAMES_PER_DIRECTORY} names in this walk. */
+  const queue = (frame: Frame): boolean => {
+    const walked = namesWalked.get(frame.real) ?? 0
+    if (walked >= GLOB_WALK_MAX_NAMES_PER_DIRECTORY) return false
+    namesWalked.set(frame.real, walked + 1)
+    pending.push(frame)
+    return true
+  }
+  /** Record a directory the walk refused to list under one more name. */
+  const refuseToWalk = (dir: string, real: string): void => {
+    logForDebugging(
+      `[Sandbox] Not listing ${dir} for glob pattern ${globPath}: ${real} already has ${GLOB_WALK_MAX_NAMES_PER_DIRECTORY} names in this walk, so it is covered whole instead`,
+      { level: 'warn' },
+    )
+    walk.unlisted.push(dir)
+    if (real !== dir) walk.realOf.set(dir, real)
+  }
+  /** Where a symlink leads and whether that is a directory. 'absent' when
+   *  nothing is there to descend into; 'uninspectable' when something is and
+   *  it could not be looked at, which is not the same thing: a same-uid
+   *  command can make a target unsearchable and undo that from inside the
+   *  next sandbox, so a deny must still cover the link. */
+  type LinkTarget =
+    | { real: string; isDirectory: boolean }
+    | 'absent'
+    | 'uninspectable'
+  const linkTargets = new Map<string, LinkTarget>()
+  const linkTargetOf = (linkPath: string, realLinkPath: string): LinkTarget => {
+    const cached = linkTargets.get(realLinkPath)
+    if (cached !== undefined) return cached
+    let target: LinkTarget
+    try {
+      target = {
+        isDirectory: fs.statSync(linkPath).isDirectory(),
+        real: fs.realpathSync(linkPath),
+      }
+    } catch (err) {
+      target = isAbsenceErrno(err) ? 'absent' : 'uninspectable'
+    }
+    linkTargets.set(realLinkPath, target)
+    return target
+  }
+
+  let baseReal = baseDir
   try {
-    const entries = fs.readdirSync(baseDir, {
-      recursive: true,
-      withFileTypes: true,
-    })
-
+    baseReal = fs.realpathSync(baseDir)
+  } catch {
+    // Not there, or a component of it cannot be resolved: list the spelling.
+  }
+  walk.baseLocation = baseReal
+  queue({ dir: baseDir, real: baseReal, linkedFrom: [] })
+  for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
+    const { dir, real, linkedFrom } = frame
+    let entries = listings.get(real)
+    if (entries === undefined) {
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true })
+      } catch (err) {
+        const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+        logForDebugging(
+          `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
+          { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
+        )
+        if (errorCode !== 'ENOENT') {
+          walk.unlisted.push(dir)
+          if (real !== dir) walk.realOf.set(dir, real)
+        }
+        continue
+      }
+      listings.set(real, entries)
+    }
     for (const entry of entries) {
-      // Build the full path for this entry
-      // entry.parentPath is the directory containing this entry (available in Node 20+/Bun)
-      // For compatibility, fall back to entry.path if parentPath is not available
-      const parentDir =
-        (entry as { parentPath?: string }).parentPath ??
-        (entry as { path?: string }).path ??
-        baseDir
-      const fullPath = path.join(parentDir, entry.name)
-
-      if (regex.test(toFwd(fullPath))) {
-        results.push(fullPath)
+      const fullPath = path.join(dir, entry.name)
+      const realPath = path.join(real, entry.name)
+      const candidate = toForwardSlashes(fullPath)
+      const isMatch = regex.test(candidate)
+      if (isMatch) walk.matches.push(fullPath)
+      if (entry.isDirectory()) {
+        const isDirectoryMatch = directoryRegex?.test(candidate) === true
+        if (isDirectoryMatch) walk.directoryMatches.push(fullPath)
+        if ((isMatch || isDirectoryMatch) && realPath !== fullPath) {
+          walk.realOf.set(fullPath, realPath)
+        }
+        if (
+          canHoldMatch(candidate) &&
+          !queue({ dir: fullPath, real: realPath, linkedFrom })
+        ) {
+          refuseToWalk(fullPath, realPath)
+        }
+        continue
+      }
+      if (!entry.isSymbolicLink()) {
+        if (isMatch && realPath !== fullPath) {
+          walk.realOf.set(fullPath, realPath)
+        }
+        continue
+      }
+      walk.symlinks.add(fullPath)
+      // Only the read-deny expansion lists through a symlinked directory: it
+      // has to cover what the pattern reaches by every name. The allowRead
+      // expansion and the Windows ACL stamp take the link itself and stop
+      // there, as the allow bind and the ACL they feed do — Windows does not
+      // follow reparse points at all, and the cycle check below compares
+      // POSIX-separated paths.
+      if (!opts.followSymlinkedDirectories) continue
+      const isDirectoryFormCandidate = directoryRegex?.test(candidate) === true
+      const descends = canHoldMatch(candidate)
+      if (!isMatch && !isDirectoryFormCandidate && !descends) continue
+      const target = linkTargetOf(fullPath, realPath)
+      if (target === 'absent') continue
+      if (target === 'uninspectable') {
+        // Where it leads is unknown, so it gets no real location and nothing
+        // is listed through it — but it is still a match, and a deny
+        // expansion covers it under its own spelling.
+        walk.uninspectableLinks.add(fullPath)
+        if (isDirectoryFormCandidate) walk.directoryMatches.push(fullPath)
+        continue
+      }
+      if (isMatch) walk.realOf.set(fullPath, target.real)
+      if (!target.isDirectory) continue
+      if (isDirectoryFormCandidate) {
+        walk.directoryMatches.push(fullPath)
+        walk.realOf.set(fullPath, target.real)
+      }
+      if (!descends) continue
+      // A link whose target is at or above a directory on the current
+      // descent (the real directory each earlier link was taken from, and
+      // this one) is never followed: that walk would not terminate.
+      const cycle = [...linkedFrom, real].some(from =>
+        isAtOrUnder(from, target.real),
+      )
+      if (cycle) {
+        logForDebugging(
+          `[Sandbox] Not following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}: it leads back into its own ancestry`,
+        )
+        continue
+      }
+      if (
+        !queue({
+          dir: fullPath,
+          real: target.real,
+          linkedFrom: [...linkedFrom, real],
+        })
+      ) {
+        refuseToWalk(fullPath, target.real)
       }
     }
-  } catch (err) {
-    logForDebugging(
-      `[Sandbox] Error expanding glob pattern ${globPath}: ${err}`,
-    )
   }
 
-  return results
+  return walk
 }

@@ -122,7 +122,10 @@ Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 # timeout and (b) per-element ArgumentList quoting that survives
 # PATH-with-spaces.
 function RExec {
-  param([string[]] $tail)
+  # 120s: a row that starts Windows PowerShell as the sandbox user can take
+  # over 30s on some hosted runner images (powershell.exe is CPU-bound in
+  # startup the whole time, then finishes). A limit only matters on a hang.
+  param([string[]] $tail, [int] $TimeoutSec = 120)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
             '--env', "PATHEXT=$($env:PATHEXT)") + $tail
@@ -138,11 +141,25 @@ function RExec {
   # WaitForExit.
   $so = $p.StandardOutput.ReadToEndAsync()
   $se = $p.StandardError.ReadToEndAsync()
-  if (-not $p.WaitForExit(30000)) {
+  if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+    # Report through the host, not the exception: the error view truncates a
+    # long message, and the child's output and the processes it got as far as
+    # starting are what say where it stopped.
+    $since = $p.StartTime
+    Get-CimInstance Win32_Process |
+      Where-Object { $_.ProcessId -eq $p.Id -or $_.CreationDate -ge $since } |
+      Sort-Object CreationDate |
+      ForEach-Object {
+        Write-Host ("RExec timeout: proc pid={0} ppid={1} {2} cpu={3:n1}s" -f
+          $_.ProcessId, $_.ParentProcessId, $_.Name,
+          (($_.UserModeTime + $_.KernelModeTime) / 1e7))
+      }
     try { $p.Kill($true) } catch { }
     $p.WaitForExit()
-    throw ("RExec: TIMEOUT after 30s. argv: $($argv -join ' ')`n" +
-           "stderr: $($se.Result)`nstdout: $($so.Result)")
+    Write-Host "RExec timeout: argv tail: $($tail -join ' ')"
+    Write-Host "RExec timeout: stderr:`n$($se.Result)"
+    Write-Host "RExec timeout: stdout:`n$($so.Result)"
+    throw "RExec: TIMEOUT after ${TimeoutSec}s (child output above)"
   }
   $exit  = $p.ExitCode
   $raw   = $so.Result + $se.Result
@@ -222,10 +239,16 @@ Write-Host "R5 ok: outbound blocked for srt-sandbox (curl exit=$($r.exit))"
 $inRangeR = Bind-Listener ($PortHi..($PortLo+5))
 $portInR  = $inRangeR.LocalEndpoint.Port
 try {
+  # TcpClient, as in R5d/R5e, not Test-NetConnection: the cmdlet loads the
+  # NetTCPIP module and falls back to a ping, which roughly doubles the row.
+  # This is the first Windows PowerShell started as the sandbox user; log how
+  # long it took.
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
-    "(Test-NetConnection 127.0.0.1 -Port $portInR " +
-    "-WarningAction SilentlyContinue).TcpTestSucceeded")
-  if ($r.out -notmatch '(?i)\bTrue\b') {
+    "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portInR); Write-Output CONNECTED } " +
+    "catch { Write-Output blocked }")
+  Write-Host "R5b: first powershell.exe as srt-sandbox took $([int]$sw.Elapsed.TotalSeconds)s"
+  if ($r.out -notmatch 'CONNECTED') {
     throw "R5b: loopback to in-range port $portInR did not succeed. raw: $($r.raw)"
   }
   Write-Host "R5b ok: in-range loopback permitted for srt-sandbox (port=$portInR)"
@@ -238,9 +261,9 @@ $outRange = Bind-Listener (50000, 50001, 50002, 49999)
 $portOut  = $outRange.LocalEndpoint.Port
 try {
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
-    "(Test-NetConnection 127.0.0.1 -Port $portOut " +
-    "-WarningAction SilentlyContinue).TcpTestSucceeded")
-  if ($r.out -match '(?i)\bTrue\b') {
+    "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portOut); Write-Output CONNECTED } " +
+    "catch { Write-Output blocked }")
+  if ($r.out -match 'CONNECTED') {
     throw "R5c: loopback to out-of-range port $portOut succeeded. raw: $($r.raw)"
   }
   # Sanity: prove the listener was actually live (reachable from
@@ -261,14 +284,22 @@ try {
 # would leave [::1] as a silent hole to every local service. Real
 # listener on [::1], child connect must be denied (an
 # AccessDenied/timeout, never a successful connect).
-$v6l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Loopback, 49998)
-$v6l.Start()
+# Ephemeral, not a fixed port: a bind inside one of Windows' per-machine
+# excluded port ranges fails with WSAEACCES. Re-draw if the OS hands out a
+# port inside the permit range.
+do {
+  $v6l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Loopback, 0)
+  $v6l.Start()
+  $portV6 = $v6l.LocalEndpoint.Port
+  $inPermit = $portV6 -ge $PortLo -and $portV6 -le $PortHi
+  if ($inPermit) { $v6l.Stop() }
+} while ($inPermit)
 try {
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
     "try { `$c = New-Object Net.Sockets.TcpClient([Net.Sockets.AddressFamily]::InterNetworkV6); " +
-    "`$c.Connect('::1', 49998); Write-Output CONNECTED } catch { Write-Output blocked }")
+    "`$c.Connect('::1', $portV6); Write-Output CONNECTED } catch { Write-Output blocked }")
   if ($r.out -match 'CONNECTED') {
-    throw "R5d: sandboxed connect to [::1]:49998 succeeded — v6 fence hole. raw: $($r.raw)"
+    throw "R5d: sandboxed connect to [::1]:$portV6 succeeded — v6 fence hole. raw: $($r.raw)"
   }
   Write-Host 'R5d ok: IPv6 loopback out-of-range blocked'
 } finally {

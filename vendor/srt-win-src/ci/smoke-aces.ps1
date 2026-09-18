@@ -77,8 +77,11 @@ function RExec {
   if (-not $p.WaitForExit(30000)) {
     try { $p.Kill($true) } catch { }
     $p.WaitForExit()
-    throw ("RExec: TIMEOUT after 30s. argv: $($argv -join ' ')`n" +
-           "stderr: $($se.Result)`nstdout: $($so.Result)")
+    # Through the host, not the exception: the error view truncates a long
+    # message, and the child's output is what says where it stopped.
+    Write-Host "RExec timeout: stderr:`n$($se.Result)"
+    Write-Host "RExec timeout: stdout:`n$($so.Result)"
+    throw "RExec: TIMEOUT after 30s (child output above)"
   }
   $exit  = $p.ExitCode
   $raw   = $so.Result + $se.Result
