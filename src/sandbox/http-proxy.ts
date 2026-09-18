@@ -27,6 +27,9 @@ import {
   terminateAndForward,
 } from './tls-terminate-proxy.js'
 import {
+  BodySubstitutionTooLargeError,
+  MAX_BODY_SUBSTITUTION_BUFFER_BYTES,
+  collectLimitedBody,
   prepareBodySubstitution,
   type GetBodySubstitutions,
 } from './body-substitution.js'
@@ -717,13 +720,16 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       const fwdHeaders = { ...stripHopByHop(req.headers), host: authority }
       options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
       // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
-      // the same config gate). May delete content-length from fwdHeaders.
-      const bodyTransform = prepareBodySubstitution(
+      // the same config gate). Length-changing pairs are buffered so
+      // Content-Length stays exact.
+      const bodyPlan = prepareBodySubstitution(
         options.getBodySubstitutionsPlaintext,
         req,
         fwdHeaders,
         hostname,
       )
+      let bodyTransform = bodyPlan?.transform
+      let substitutedBody: Buffer | undefined
 
       // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
       const mitmSocketPath = options.getMitmSocketPath?.(hostname)
@@ -780,6 +786,31 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         ) {
           body.destroy()
           return
+        }
+      }
+
+      if (bodyPlan?.mayChangeLength) {
+        const src = body.pipe(bodyPlan.transform)
+        body.on('error', err => bodyPlan.transform.destroy(err))
+        try {
+          substitutedBody = await collectLimitedBody(
+            src,
+            MAX_BODY_SUBSTITUTION_BUFFER_BYTES,
+          )
+          fwdHeaders['content-length'] = String(substitutedBody.length)
+          bodyTransform = undefined
+        } catch (err) {
+          if (err instanceof BodySubstitutionTooLargeError) {
+            res.writeHead(403, { 'Content-Type': 'text/plain' })
+            res.end(
+              `Masked-credential body substitution may change Content-Length, ` +
+                `so the proxy must buffer the body, but it exceeds the ` +
+                `${MAX_BODY_SUBSTITUTION_BUFFER_BYTES}-byte buffering limit; denied.`,
+            )
+            src.resume()
+            return
+          }
+          throw err
         }
       }
 
@@ -915,7 +946,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())
 
-      if (bodyTransform) {
+      if (substitutedBody !== undefined) {
+        proxyReq.end(substitutedBody)
+      } else if (bodyTransform) {
         // Errors on either side of the extra pipe stage tear the chain
         // down — a stalled half-open upstream would otherwise wait for the
         // client.
