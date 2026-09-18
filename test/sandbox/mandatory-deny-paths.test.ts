@@ -52,6 +52,7 @@ import {
   submoduleGitDirs,
 } from '../../src/sandbox/mandatory-deny-paths.js'
 import { isLinux, isSupportedPlatform, isWindows } from '../helpers/platform.js'
+import type { RipgrepConfig } from '../../src/utils/ripgrep.js'
 
 /**
  * Integration tests for mandatory deny paths.
@@ -768,7 +769,10 @@ describe.if(isSupportedPlatform)(
             },
           }).catch((e: unknown) => e)
 
-          expect(error).toBeInstanceOf(Error)
+          expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+          expect((error as LinuxSandboxProfileError).code).toBe(
+            'deny_scan_failed',
+          )
           expect((error as Error).message).toMatch(/did not finish/)
         },
       )
@@ -797,6 +801,166 @@ describe.if(isSupportedPlatform)(
           }
         },
       )
+
+      /**
+       * What the scan does when it fails, driven by a fake rg: the run that
+       * fails for real needs a directory this process cannot read, and as
+       * root — which CI is — there is none, so none of this would be
+       * exercised there. The last arm is the real thing, where the uid allows.
+       */
+      describe.if(isLinux)('when the scan fails', () => {
+        /** Echoed by every command that runs for real, so nothing concludes
+         *  anything from a sandbox that never started. */
+        const BOOTED = 'BOOTED'
+
+        const wrapWith = (
+          ripgrepConfig: RipgrepConfig,
+          abortSignal?: AbortSignal,
+        ): Promise<string> =>
+          wrapCommandWithSandboxLinux({
+            command: 'echo hi',
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: ['.'], denyWithinAllow: [] },
+            ripgrepConfig,
+            abortSignal,
+          })
+
+        /** A fake rg: `matches` NUL-terminated on stdout, `stderr`, exit 2. */
+        const failingRipgrep = (
+          matches: string[],
+          stderr: string,
+        ): RipgrepConfig => ({
+          command: '/bin/sh',
+          args: [
+            '-c',
+            `printf '%s\\0' ${matches.map(match => `'${match}'`).join(' ')}; ` +
+              `printf '%s\\n' '${stderr}' >&2; exit 2`,
+          ],
+        })
+
+        it('keeps what it listed and denies the directory it could not read', async () => {
+          const cwd = process.cwd()
+          const locked = join(cwd, 'locked')
+          const hooks = join(cwd, 'nested', '.git', 'hooks')
+          const config = join(cwd, 'nested', '.git', 'config')
+          mkdirSync(locked, { recursive: true })
+          try {
+            const command = await wrapWith(
+              failingRipgrep(
+                [config],
+                `rg: ${locked}: Permission denied (os error 13)`,
+              ),
+            )
+
+            // The nested repository the partial listing named is denied as
+            // if the run had finished, and what it could not read is denied
+            // whole, since a nested repository inside it would be unseen.
+            expect(lastMountAt(command, hooks)).toBe(
+              `--ro-bind ${hooks} ${hooks}`,
+            )
+            expect(lastMountAt(command, config)).toBe(
+              `--ro-bind ${config} ${config}`,
+            )
+            expect(lastMountAt(command, locked)).toBe(
+              `--ro-bind ${locked} ${locked}`,
+            )
+          } finally {
+            rmSync(locked, { recursive: true, force: true })
+          }
+        })
+
+        it('refuses the wrap when the failure names no path to deny', async () => {
+          // Nothing here stands in for a failure of this shape, so what the
+          // run never reached would stay writable.
+          const error = await wrapWith(
+            failingRipgrep(
+              [join(process.cwd(), 'nested', '.git', 'config')],
+              'rg: unrecognized option --frobnicate',
+            ),
+          ).catch((e: unknown) => e)
+
+          expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+          expect((error as LinuxSandboxProfileError).code).toBe(
+            'deny_scan_failed',
+          )
+          expect((error as Error).message).toMatch(
+            /failed for a reason no deny stands in for/,
+          )
+          expect((error as Error).message).toMatch(/was not run/)
+        })
+
+        it('refuses the wrap when the scan could not be run at all', async () => {
+          const error = await wrapWith({
+            command: join(TEST_DIR, 'no-such-ripgrep'),
+          }).catch((e: unknown) => e)
+
+          expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+          expect((error as LinuxSandboxProfileError).code).toBe(
+            'deny_scan_failed',
+          )
+          expect((error as Error).message).toMatch(/could not be run/)
+        })
+
+        it("lets the caller's own abort through as itself", async () => {
+          const controller = new AbortController()
+          controller.abort()
+
+          const error = await wrapWith(
+            { command: '/bin/sh', args: ['-c', 'true'] },
+            controller.signal,
+          ).catch((e: unknown) => e)
+
+          expect((error as Error).name).toBe('AbortError')
+          expect(error).not.toBeInstanceOf(LinuxSandboxProfileError)
+        })
+
+        it.if(process.getuid?.() !== 0 && bwrapCanNamespace())(
+          'denies a nested repository the real rg could not walk past',
+          async () => {
+            const cwd = process.cwd()
+            const blind = join(cwd, 'blind')
+            const hook = join(cwd, 'nested', '.git', 'hooks', 'pre-commit')
+            const wrap = (command: string): Promise<string> =>
+              wrapCommandWithSandboxLinux({
+                command,
+                needsNetworkRestriction: false,
+                allowAllUnixSockets: true,
+                readConfig: undefined,
+                writeConfig: { allowOnly: [cwd], denyWithinAllow: [] },
+              })
+            const run = (command: string) =>
+              spawnSync(command, {
+                shell: true,
+                encoding: 'utf8',
+                timeout: 30000,
+                cwd,
+              })
+
+            mkdirSync(blind, { recursive: true })
+            try {
+              // The first command leaves a directory the next command's scan
+              // cannot read: that scan fails, and the hooks of the nested
+              // repository beside it must be denied all the same.
+              const first = run(await wrap(`echo ${BOOTED} && chmod 000 blind`))
+              expect(first.stdout).toContain(BOOTED)
+              expect(first.status).toBe(0)
+              cleanupBwrapMountPoints({ force: true })
+
+              const second = run(
+                await wrap(`echo ${BOOTED}; echo X > ${hook} || echo DENIED`),
+              )
+              expect(second.stdout).toContain(BOOTED)
+              expect(second.stdout).toContain('DENIED')
+              expect(readFileSync(hook, 'utf8')).toBe(ORIGINAL_CONTENT)
+            } finally {
+              chmodSync(blind, 0o755)
+              rmSync(blind, { recursive: true, force: true })
+            }
+          },
+          60000,
+        )
+      })
 
       it('still lets a command create a .git file where none exists', async () => {
         mkdirSync('fresh-checkout', { recursive: true })

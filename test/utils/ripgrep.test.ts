@@ -82,6 +82,30 @@ describe('ripGrep', () => {
   })
 
   it.if(!isWindows)(
+    'carries what a failed run listed and what it said, whatever the uid',
+    async () => {
+      // What the caller denies comes off these two, and the run that
+      // produces them for real needs a directory this process cannot read —
+      // which as root there is none of. A fake rg fails the same way
+      // everywhere; the arm below does it with the real one where it can.
+      const error = await ripGrep([], '.', new AbortController().signal, {
+        command: '/bin/sh',
+        args: [
+          '-c',
+          'printf "/found/a\\0"; ' +
+            'printf "rg: /found/locked: Permission denied (os error 13)\\n" >&2; ' +
+            'exit 2',
+        ],
+      }).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(RipgrepError)
+      expect((error as RipgrepError).partialMatches).toEqual(['/found/a'])
+      expect((error as RipgrepError).stderr).toContain('/found/locked')
+      expect((error as RipgrepError).timedOut).toBe(false)
+    },
+  )
+
+  it.if(!isWindows)(
     'drops a path a killed run was cut off in the middle of',
     async () => {
       const dir = mkdtempSync(join(tmpdir(), 'rg-timeout-'))
