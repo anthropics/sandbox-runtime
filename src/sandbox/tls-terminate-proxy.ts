@@ -39,6 +39,7 @@ import {
   directRequestOptions,
   type DirectRequestOptions,
   formatAuthority,
+  sanitizeResponseHeaders,
   stripHopByHop,
 } from './parent-proxy.js'
 import { sha256Hex } from './aws-sigv4.js'
@@ -574,7 +575,19 @@ async function forwardUpstream(
         )
         res.destroy()
       })
-      res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
+      try {
+        res.writeHead(
+          upRes.statusCode ?? 502,
+          sanitizeResponseHeaders(stripHopByHop(upRes.headers)),
+        )
+      } catch (err) {
+        logForDebugging(
+          `[tls-terminate] failed to write response headers: ${(err as Error).message}`,
+          { level: 'error' },
+        )
+        res.destroy(err as Error)
+        return
+      }
       upRes.pipe(res)
     },
   )

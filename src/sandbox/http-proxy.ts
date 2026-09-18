@@ -44,6 +44,7 @@ import {
   openConnectTunnel,
   proxyAuthHeader,
   selectParentProxyUrl,
+  sanitizeResponseHeaders,
   shouldBypassParentProxy,
   stripBrackets,
   stripHopByHop,
@@ -832,7 +833,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
+            try {
+              res.writeHead(
+                proxyRes.statusCode!,
+                sanitizeResponseHeaders(stripHopByHop(proxyRes.headers)),
+              )
+            } catch (err) {
+              logForDebugging(
+                `Failed to write response headers: ${(err as Error).message}`,
+                { level: 'error' },
+              )
+              res.destroy(err as Error)
+              return
+            }
             proxyRes.pipe(res)
           },
         )
@@ -863,7 +876,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
+            try {
+              res.writeHead(
+                proxyRes.statusCode!,
+                sanitizeResponseHeaders(stripHopByHop(proxyRes.headers)),
+              )
+            } catch (err) {
+              logForDebugging(
+                `Failed to write response headers: ${(err as Error).message}`,
+                { level: 'error' },
+              )
+              res.destroy(err as Error)
+              return
+            }
             proxyRes.pipe(res)
           },
         )
@@ -904,7 +929,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
+            try {
+              res.writeHead(
+                proxyRes.statusCode!,
+                sanitizeResponseHeaders(stripHopByHop(proxyRes.headers)),
+              )
+            } catch (err) {
+              logForDebugging(
+                `Failed to write response headers: ${(err as Error).message}`,
+                { level: 'error' },
+              )
+              res.destroy(err as Error)
+              return
+            }
             proxyRes.pipe(res)
           },
         )

@@ -6,6 +6,8 @@ import {
   openConnectTunnel,
   redactUrl,
   resolveParentProxy,
+  sanitizeHeaderValue,
+  sanitizeResponseHeaders,
   selectParentProxyUrl,
   shouldBypassParentProxy,
   stripBrackets,
@@ -328,6 +330,35 @@ describe('parent-proxy: utilities', () => {
       'x-keep': 'keep',
     })
     expect(out).toEqual({ 'content-length': '42', 'x-keep': 'keep' })
+  })
+
+  test('sanitizeHeaderValue preserves ASCII and Latin-1 characters', () => {
+    expect(sanitizeHeaderValue('attachment; filename="report.pdf"')).toBe(
+      'attachment; filename="report.pdf"',
+    )
+    expect(sanitizeHeaderValue('café \u00e9\u00ff')).toBe('café \u00e9\u00ff')
+  })
+
+  test('sanitizeHeaderValue replaces characters > 0xFF with ?', () => {
+    expect(sanitizeHeaderValue('attachment; filename="中文名.pdf"')).toBe(
+      'attachment; filename="???.pdf"',
+    )
+    expect(sanitizeHeaderValue('test \u0100\u0101\u0102')).toBe('test ???')
+  })
+
+  test('sanitizeResponseHeaders sanitizes string and array headers', () => {
+    const raw = {
+      'content-disposition': 'attachment; filename="中文名.pdf"',
+      'set-cookie': ['valid=1', 'bad=\u0100'],
+      'content-type': 'application/pdf',
+      'x-empty': undefined,
+    }
+    const sanitized = sanitizeResponseHeaders(raw)
+    expect(sanitized).toEqual({
+      'content-disposition': 'attachment; filename="???.pdf"',
+      'set-cookie': ['valid=1', 'bad=?'],
+      'content-type': 'application/pdf',
+    })
   })
 
   test('isValidHost rejects null bytes (DNS-truncation bypass)', () => {
