@@ -56,6 +56,8 @@ describe.if(isSupportedPlatform)(
       // Create ALL dangerous files from DANGEROUS_FILES
       writeFileSync(join(TEST_DIR, '.bashrc'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.bash_profile'), ORIGINAL_CONTENT)
+      writeFileSync(join(TEST_DIR, '.bash_login'), ORIGINAL_CONTENT)
+      writeFileSync(join(TEST_DIR, '.bash_logout'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.gitconfig'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.gitmodules'), ORIGINAL_CONTENT)
       writeFileSync(join(TEST_DIR, '.zshrc'), ORIGINAL_CONTENT)
@@ -215,6 +217,20 @@ describe.if(isSupportedPlatform)(
 
         expect(result.success).toBe(false)
         expect(readFileSync('.bash_profile', 'utf8')).toBe(ORIGINAL_CONTENT)
+      })
+
+      it('blocks writes to .bash_login', async () => {
+        const result = await runSandboxedWrite('.bash_login', MODIFIED_CONTENT)
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('.bash_login', 'utf8')).toBe(ORIGINAL_CONTENT)
+      })
+
+      it('blocks writes to .bash_logout', async () => {
+        const result = await runSandboxedWrite('.bash_logout', MODIFIED_CONTENT)
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('.bash_logout', 'utf8')).toBe(ORIGINAL_CONTENT)
       })
 
       it('blocks writes to .zprofile', async () => {
