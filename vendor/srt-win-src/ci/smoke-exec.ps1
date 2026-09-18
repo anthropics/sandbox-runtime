@@ -42,72 +42,6 @@ function Bind-Listener {
   throw "no free port among: $($Candidates -join ',')"
 }
 
-# One-line-per-fact machine state for the CI log: what the host is, how long
-# it has been up, and which processes are using CPU right now (a 1s delta, not
-# lifetime totals). Never fails the script.
-function Write-MachineSnapshot {
-  param([string] $Tag)
-  try {
-    $os  = Get-CimInstance Win32_OperatingSystem
-    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-    $ubr = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').UBR
-    Write-Host ("diag[{0}]: cpu='{1}' logical={2} mem={3:n0}MB free={4:n0}MB build={5}.{6} uptime={7:n0}s" -f
-      $Tag, $cpu.Name, $cpu.NumberOfLogicalProcessors,
-      ($os.TotalVisibleMemorySize / 1KB), ($os.FreePhysicalMemory / 1KB),
-      $os.BuildNumber, $ubr, ((Get-Date) - $os.LastBootUpTime).TotalSeconds)
-    # Whether the .NET Framework native-image tasks have run on this machine.
-    Get-ScheduledTask -TaskPath '\Microsoft\Windows\.NET Framework\' -ErrorAction SilentlyContinue |
-      ForEach-Object {
-        $i = $_ | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
-        Write-Host ("diag[{0}]: ngen-task '{1}' state={2} lastRun={3:u} result={4}" -f
-          $Tag, $_.TaskName, $_.State, $i.LastRunTime, $i.LastTaskResult)
-      }
-    Write-BusySample $Tag
-  } catch {
-    Write-Host "diag[$Tag]: snapshot failed: $_"
-  }
-}
-
-# How many .NET Framework native images exist, and whether Windows PowerShell's
-# own assembly has one. Without it powershell.exe JIT-compiles at every start.
-function Write-NativeImageState {
-  param([string] $Tag)
-  try {
-    foreach ($d in Get-ChildItem "$env:SystemRoot\assembly" -Directory -Filter 'NativeImages_v4*' -ErrorAction SilentlyContinue) {
-      $all = @(Get-ChildItem $d.FullName -Directory -ErrorAction SilentlyContinue)
-      $sma = @($all | Where-Object { $_.Name -like 'System.Manaa*' -or $_.Name -like 'System.Management.A*' })
-      Write-Host ("diag[{0}]: native-images {1}: total={2} powershell-assembly={3}" -f
-        $Tag, $d.Name, $all.Count, $sma.Count)
-    }
-    $svc = @(Get-Process -Name mscorsvw, ngen, ngentask -ErrorAction SilentlyContinue)
-    Write-Host ("diag[{0}]: ngen processes running: {1}" -f $Tag, (($svc | ForEach-Object { $_.ProcessName }) -join ','))
-  } catch {
-    Write-Host "diag[$Tag]: native-image state failed: $_"
-  }
-}
-
-# The processes that used the most CPU over one second. Names and ids only.
-function Write-BusySample {
-  param([string] $Tag)
-  try {
-    $a = @{}
-    foreach ($q in Get-Process) { $a[$q.Id] = $q.CPU }
-    Start-Sleep -Seconds 1
-    Get-Process |
-      ForEach-Object {
-        [pscustomobject]@{ Id = $_.Id; Name = $_.ProcessName
-                           Delta = [double]$_.CPU - [double]$a[$_.Id] }
-      } |
-      Sort-Object Delta -Descending | Select-Object -First 6 |
-      ForEach-Object {
-        Write-Host ("diag[{0}]: busy pid={1} {2} cpu+{3:n2}s/1s" -f
-          $Tag, $_.Id, $_.Name, $_.Delta)
-      }
-  } catch {
-    Write-Host "diag[$Tag]: busy sample failed: $_"
-  }
-}
-
 function Run {
   param([string[]] $argv)
   & $Exe @argv
@@ -188,9 +122,9 @@ Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 # timeout and (b) per-element ArgumentList quoting that survives
 # PATH-with-spaces.
 function RExec {
-  # 120s: rows that start Windows PowerShell as the sandbox user can take 30s
-  # each when the machine has no .NET Framework native images yet (the process
-  # is CPU-bound in startup the whole time); a limit only matters on a hang.
+  # 120s: a row that starts Windows PowerShell as the sandbox user can take
+  # over 30s on some hosted runner images (powershell.exe is CPU-bound in
+  # startup the whole time, then finishes). A limit only matters on a hang.
   param([string[]] $tail, [int] $TimeoutSec = 120)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
@@ -207,16 +141,7 @@ function RExec {
   # WaitForExit.
   $so = $p.StandardOutput.ReadToEndAsync()
   $se = $p.StandardError.ReadToEndAsync()
-  # Wait in 5s slices. A child still running after a slice gets a busy-process
-  # sample in the log, so a slow launch shows what the machine was doing
-  # during it; a normal sub-5s row logs nothing extra.
-  $waited = [System.Diagnostics.Stopwatch]::StartNew()
-  $exited = $false
-  while (-not ($exited = $p.WaitForExit(5000))) {
-    if ($waited.Elapsed.TotalSeconds -ge $TimeoutSec) { break }
-    Write-BusySample ("waiting {0:n0}s" -f $waited.Elapsed.TotalSeconds)
-  }
-  if (-not $exited) {
+  if (-not $p.WaitForExit($TimeoutSec * 1000)) {
     # Report through the host, not the exception: the error view truncates a
     # long message, and the child's output and the processes it got as far as
     # starting are what say where it stopped.
@@ -228,28 +153,6 @@ function RExec {
         Write-Host ("RExec timeout: proc pid={0} ppid={1} {2} cpu={3:n1}s" -f
           $_.ProcessId, $_.ParentProcessId, $_.Name,
           (($_.UserModeTime + $_.KernelModeTime) / 1e7))
-      }
-    # What each process the child started is waiting on, the machine's state,
-    # and anything the OS logged while it hung.
-    Get-CimInstance Win32_Process |
-      Where-Object { $_.ProcessId -eq $p.Id -or $_.CreationDate -ge $since } |
-      ForEach-Object {
-        try {
-          $waits = (Get-Process -Id $_.ProcessId -ErrorAction Stop).Threads |
-            Group-Object { "$($_.ThreadState)/$($_.WaitReason)" } |
-            ForEach-Object { "$($_.Name)x$($_.Count)" }
-          Write-Host "RExec timeout: threads pid=$($_.ProcessId) $($_.Name): $($waits -join ' ')"
-        } catch { }
-      }
-    Write-MachineSnapshot 'timeout'
-    Get-WinEvent -FilterHashtable @{ LogName = 'Application', 'System'
-                                     StartTime = $since.AddSeconds(-5) } `
-      -MaxEvents 25 -ErrorAction SilentlyContinue |
-      ForEach-Object {
-        # Provider and id only, never the message: event text is arbitrary
-        # and this log is public.
-        Write-Host ("RExec timeout: event {0:HH:mm:ss} {1} {2} id={3} level={4}" -f
-          $_.TimeCreated, $_.LogName, $_.ProviderName, $_.Id, $_.LevelDisplayName)
       }
     try { $p.Kill($true) } catch { }
     $p.WaitForExit()
@@ -340,8 +243,6 @@ try {
   # NetTCPIP module and falls back to a ping, which roughly doubles the row.
   # This is the first Windows PowerShell started as the sandbox user; log how
   # long it took.
-  Write-MachineSnapshot 'before-R5b'
-  Write-NativeImageState 'before-R5b'
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
     "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portInR); Write-Output CONNECTED } " +
@@ -420,7 +321,6 @@ if ($r.out -notmatch 'AccessDenied') {
   throw "R5e: expected AccessDenied (WFP block), got: $($r.raw)"
 }
 Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
-Write-NativeImageState 'after-R5e'
 
 # ── R5f: non-interactive logon types refused for the sandbox account ─
 # The SMB redirector dials from kernel mode as SYSTEM, so the

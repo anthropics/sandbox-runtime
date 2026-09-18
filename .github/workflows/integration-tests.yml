@@ -8,7 +8,7 @@ on:
 
 jobs:
   integration-tests:
-    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})${{ matrix.probe && format(' probe {0}', matrix.probe) || '' }}
+    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -35,40 +35,10 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
             os: windows
-          # TEMPORARY, remove before merge: extra copies of the Windows arm64
-          # leg, to sample an intermittent hang in the srt-win exec smoke
-          # test faster. `probe` only changes the job name, so the required
-          # check above keeps its name.
-          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 2 }
-          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 3 }
-          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 4 }
-          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 5 }
-          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 6 }
-          # TEMPORARY, remove before merge: extra Windows x64 legs, to sample an
-          # intermittent `srt-win user status` timeout in winsrt P1.
-          - { arch: x86-64, runner: windows-latest, os: windows, probe: 2 }
-          - { arch: x86-64, runner: windows-latest, os: windows, probe: 3 }
-          - { arch: x86-64, runner: windows-latest, os: windows, probe: 4 }
-          - { arch: x86-64, runner: windows-latest, os: windows, probe: 5 }
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      # TEMPORARY, remove before merge: how long a bare Windows PowerShell
-      # takes to start on this machine, as the runner user, nothing else
-      # involved. pwsh 7 once for comparison.
-      - name: TEMPORARY — time a bare Windows PowerShell start
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: |
-          $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-          foreach ($i in 1..4) {
-            $t = Measure-Command { & $ps -NoProfile -NonInteractive -Command 'exit' }
-            Write-Host ("powershell.exe start #{0}: {1:n1}s" -f $i, $t.TotalSeconds)
-          }
-          $t = Measure-Command { & pwsh -NoProfile -NonInteractive -Command 'exit' }
-          Write-Host ("pwsh 7 start: {0:n1}s" -f $t.TotalSeconds)
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -252,7 +222,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.probe && format('-probe{0}', matrix.probe) || '' }}
+          name: test-results-${{ matrix.os }}-${{ matrix.arch }}
           path: |
             test-results/
             *.log

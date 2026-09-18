@@ -537,42 +537,24 @@ fn canonicalize_ace_targets(
 fn user_status_json() -> anyhow::Result<serde_json::Value> {
     use serde_json::json;
     use srt_win::{install, user};
-    // `SANDBOX_RUNTIME_WIN_DEBUG`: one stderr line per phase with the time
-    // since entry, so a status query that stalls shows which lookup it is in.
-    let dbg = std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some();
-    let t0 = std::time::Instant::now();
-    let mark = |what: &str| {
-        if dbg {
-            let ms = t0.elapsed().as_millis();
-            eprintln!("srt-win: user status: {what} done at {ms}ms");
-        }
-    };
-    mark("entry");
     let setup = install::read_setup().ok().flatten();
-    mark("read_setup");
     let name = setup
         .as_ref()
         .map(|s| s.sandbox_user.as_str())
         .unwrap_or(user::SANDBOX_USER);
     let st = user::status(name)?;
-    mark("user::status");
     let ca = install::read_ca_cert()?;
-    mark("read_ca_cert");
     let ca = ca.as_ref();
-    let cred_present = setup.is_some() && install::cred_present();
-    mark("cred_present");
-    let real_user_sid = srt_win::sid::current_user_sid()?;
-    mark("current_user_sid");
     Ok(json!({
         "user": st,
         // The HKLM Cred\Blob value (a SYSTEM/fleet install must
         // read as present from any user's session).
-        "cred_present": cred_present,
+        "cred_present": setup.is_some() && install::cred_present(),
         "marker_version": setup.as_ref().map(|s| s.marker_version),
         "marker_user_sid": setup.as_ref()
             .map(|s| s.sandbox_user_sid.as_str()),
         // The calling (real) user's SID — surfaced for diagnostics.
-        "real_user_sid": real_user_sid,
+        "real_user_sid": srt_win::sid::current_user_sid()?,
         "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
         "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
     }))

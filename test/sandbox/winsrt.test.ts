@@ -2518,11 +2518,6 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
     // of what P2/P3 write to the default location.
     const dir = mkdtempSync(join(tmpdir(), 'srt-persist-ca-'))
     const srtWin = TEST_SRT_WIN
-    // `user status` has timed out here (15s) right after `user trust-ca`;
-    // with the debug flag a timeout's message carries srt-win's per-phase
-    // timing lines.
-    const savedDebug = process.env.SANDBOX_RUNTIME_WIN_DEBUG
-    process.env.SANDBOX_RUNTIME_WIN_DEBUG = '1'
     try {
       const status = getWindowsSandboxUserStatus({ srtWin })
       const a = await ensurePersistentWindowsCa({ dir, status, srtWin })
@@ -2564,8 +2559,6 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
       expect(d.generated).toBe(true)
       expect(d.thumbprint).not.toBe(c.thumbprint)
     } finally {
-      if (savedDebug === undefined) delete process.env.SANDBOX_RUNTIME_WIN_DEBUG
-      else process.env.SANDBOX_RUNTIME_WIN_DEBUG = savedDebug
       rmSync(dir, { recursive: true, force: true })
     }
   }, 120_000)

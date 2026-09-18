@@ -174,32 +174,17 @@ pub fn deprovision(name: &str) -> Result<()> {
 /// Observe each piece of `name`'s provisioned state independently.
 /// Does not require elevation.
 pub fn status(name: &str) -> Result<UserStatus> {
-    // `SANDBOX_RUNTIME_WIN_DEBUG`: time each lookup (see `user_status_json`).
-    let dbg = std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some();
-    let t0 = std::time::Instant::now();
-    let mark = |what: &str| {
-        if dbg {
-            let ms = t0.elapsed().as_millis();
-            eprintln!("srt-win: user::status: {what} done at {ms}ms");
-        }
-    };
     let sid = sid::lookup_account_sid(name).ok();
-    mark("lookup user sid");
     let group_sid = sid::lookup_account_sid(SANDBOX_GROUP).ok();
-    mark("lookup group sid");
     let in_builtin_users = sid
         .as_deref()
         .map(|s| sam::is_member_of(SID_BUILTIN_USERS, s))
         .transpose()?
         .unwrap_or(false);
-    mark("is_member_of BUILTIN\\Users");
     let in_sandbox_group = match (&sid, &group_sid) {
         (Some(u), Some(g)) => sam::is_member_of(g, u)?,
         _ => false,
     };
-    mark("is_member_of sandbox group");
-    let hidden_from_logon = is_logon_ui_hidden(name);
-    mark("is_logon_ui_hidden");
     Ok(UserStatus {
         name: name.into(),
         exists: sid.is_some(),
@@ -208,7 +193,7 @@ pub fn status(name: &str) -> Result<UserStatus> {
         group_sid,
         in_builtin_users,
         in_sandbox_group,
-        hidden_from_logon,
+        hidden_from_logon: is_logon_ui_hidden(name),
     })
 }
 
