@@ -9,7 +9,11 @@
  */
 
 import forge from 'node-forge'
-import { sign as cryptoSign, X509Certificate } from 'node:crypto'
+import {
+  generateKeyPair,
+  sign as cryptoSign,
+  X509Certificate,
+} from 'node:crypto'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -118,7 +122,7 @@ export function caSubjectKeyId(caCert: forge.pki.Certificate): string {
  * but its `PrivateKey.sign()` is always pure JS: jsbn `BigInteger.modPow`
  * (~3000 Montgomery squarings for a 2048-bit modulus). On a JIT engine that's
  * ~50–70 ms per signature; on an interpreter or baseline-only tier it can be
- * an order of magnitude worse — and `generateEphemeralCA()` runs on the cold
+ * an order of magnitude worse — and ephemeral-CA generation runs on the cold
  * path of every process that constructs a SandboxManager. Native
  * `crypto.sign()` is ~1–2 ms and, because RSASSA-PKCS1-v1_5 is deterministic,
  * produces byte-identical output. See test/sandbox/mitm-ca.test.ts for the
@@ -160,20 +164,7 @@ export function rsaSha256SignNative(der: string, keyPem: string): string {
  * Pure factory: no module-level state. The caller (SandboxManager) owns the
  * returned object and its lifetime.
  */
-export function createMitmCA(opts: {
-  caCertPath?: string
-  caKeyPath?: string
-  /**
-   * PEM strings for the CA — used when the caller has already read /
-   * generated them (e.g. the Windows persistent-CA path). When set,
-   * `caCertPath`/`caKeyPath` are recorded on the returned {@link MitmCA}
-   * but NOT read from disk.
-   */
-  caCertPem?: string
-  caKeyPem?: string
-  /** PEM CA files appended to the trust bundle; unreadable paths skipped. */
-  extraCaCertPaths?: string[]
-}): MitmCA {
+export function createMitmCA(opts: CreateMitmCAOptions): MitmCA {
   if (opts.caCertPem && opts.caKeyPem) {
     const v = validateCaPair(opts.caCertPem, opts.caKeyPem)
     if (!v.ok) throw new Error(`tlsTerminate: CA PEM pair: ${v.reason}`)
@@ -191,7 +182,38 @@ export function createMitmCA(opts: {
       'tlsTerminate: caCertPath and caKeyPath must be provided together',
     )
   }
-  return generateEphemeralCA(opts.extraCaCertPaths)
+  return writeEphemeralCA(generateCa(), opts.extraCaCertPaths)
+}
+
+/**
+ * Async variant of {@link createMitmCA} with the same results and the same
+ * errors (as rejections). Only the ephemeral case differs: its RSA keypair
+ * is generated on libuv's thread pool ({@link generateCaAsync}) instead of
+ * blocking the event loop. Loading a supplied CA goes through createMitmCA
+ * unchanged.
+ */
+export async function createMitmCAAsync(
+  opts: CreateMitmCAOptions,
+): Promise<MitmCA> {
+  const generatesEphemeral =
+    !(opts.caCertPem && opts.caKeyPem) && !opts.caCertPath && !opts.caKeyPath
+  if (!generatesEphemeral) return createMitmCA(opts)
+  return writeEphemeralCA(await generateCaAsync(), opts.extraCaCertPaths)
+}
+
+export type CreateMitmCAOptions = {
+  caCertPath?: string
+  caKeyPath?: string
+  /**
+   * PEM strings for the CA — used when the caller has already read /
+   * generated them (e.g. the Windows persistent-CA path). When set,
+   * `caCertPath`/`caKeyPath` are recorded on the returned {@link MitmCA}
+   * but NOT read from disk.
+   */
+  caCertPem?: string
+  caKeyPem?: string
+  /** PEM CA files appended to the trust bundle; unreadable paths skipped. */
+  extraCaCertPaths?: string[]
 }
 
 /**
@@ -401,7 +423,7 @@ function loadCA(
 
 /**
  * Assemble a {@link MitmCA} from an already-parsed cert+key. Shared by
- * `loadCA` (explicit paths), `generateEphemeralCA`, and the Windows
+ * `loadCA` (explicit paths), `writeEphemeralCA`, and the Windows
  * persistent-CA path so trust-bundle/CRL/cache setup lives in one place.
  * `certPath`/`keyPath` are recorded verbatim; the trust bundle goes to a
  * fresh mkdtemp so it's always disposable.
@@ -461,10 +483,53 @@ export type GeneratedCa = {
  *   Default 825 (the CA/B Forum limit for publicly-trusted leaves; not
  *   binding on a private CA, but a reasonable rotation horizon).
  */
-export function generateCa(
-  opts: { cn?: string; validityDays?: number } = {},
+export function generateCa(opts: GenerateCaOptions = {}): GeneratedCa {
+  return buildCa(pki.rsa.generateKeyPair(CA_KEY_BITS), opts)
+}
+
+/**
+ * Async variant of {@link generateCa} with identical output: the same
+ * RSA-2048 / e=65537 key parameters, subject, validity and extensions.
+ * The keypair comes from `crypto.generateKeyPair` (libuv thread pool)
+ * rather than node-forge's `generateKeyPairSync` call, which blocks the
+ * event loop for ~50 ms. The PEM → forge conversion mirrors what
+ * node-forge's native path does after its sync call.
+ */
+export async function generateCaAsync(
+  opts: GenerateCaOptions = {},
+): Promise<GeneratedCa> {
+  const pems = await new Promise<{ publicKey: string; privateKey: string }>(
+    (resolve, reject) =>
+      generateKeyPair(
+        'rsa',
+        {
+          modulusLength: CA_KEY_BITS,
+          publicExponent: CA_KEY_PUBLIC_EXPONENT,
+          publicKeyEncoding: { type: 'spki', format: 'pem' },
+          privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+        },
+        (err, publicKey, privateKey) =>
+          err ? reject(err) : resolve({ publicKey, privateKey }),
+      ),
+  )
+  const keys = {
+    publicKey: pki.publicKeyFromPem(pems.publicKey),
+    privateKey: pki.privateKeyFromPem(pems.privateKey),
+  } as forge.pki.rsa.KeyPair
+  return buildCa(keys, opts)
+}
+
+const CA_KEY_BITS = 2048
+/** node-forge's default exponent for pki.rsa.generateKeyPair. */
+const CA_KEY_PUBLIC_EXPONENT = 0x10001
+
+type GenerateCaOptions = { cn?: string; validityDays?: number }
+
+/** Self-sign a CA certificate for `keys`; shared by both generateCa variants. */
+function buildCa(
+  keys: forge.pki.rsa.KeyPair,
+  opts: GenerateCaOptions,
 ): GeneratedCa {
-  const keys = pki.rsa.generateKeyPair(2048)
   const cert = pki.createCertificate()
   cert.publicKey = keys.publicKey
   cert.serialNumber = randomSerial()
@@ -575,8 +640,10 @@ export function validateCaPair(
   }
 }
 
-function generateEphemeralCA(extraCaCertPaths?: string[]): MitmCA {
-  const { certPem, keyPem, cert, key } = generateCa()
+function writeEphemeralCA(
+  { certPem, keyPem, cert, key }: GeneratedCa,
+  extraCaCertPaths?: string[],
+): MitmCA {
   // Write to disk so trust env vars (NODE_EXTRA_CA_CERTS etc.) can point at
   // a real path. mkdtemp gives us an unguessable per-process directory.
   const dir = mkdtempSync(join(tmpdir(), 'srt-ca-'))

@@ -18,6 +18,7 @@ import {
 import {
   certThumbprint,
   createMitmCA,
+  createMitmCAAsync,
   CRL_PATH,
   disposeMitmCA,
   type MitmCA,
@@ -134,6 +135,12 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+/**
+ * The whole in-flight initialize() call, including the awaits (CA keygen,
+ * dependency probe) that happen before `initializationPromise` is claimed.
+ * Never rejects; the caller of initialize() gets the real outcome.
+ */
+let initializeInFlight: Promise<void> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
@@ -634,6 +641,32 @@ async function initialize(
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
 ): Promise<void> {
+  // initializeImpl awaits before it claims `initializationPromise`, so two
+  // overlapping calls would each run a full initialization (two CAs, two
+  // proxies, one of each orphaned). Run them one after another instead: the
+  // later call then sees the claim and coalesces.
+  while (initializeInFlight) await initializeInFlight
+  const run = initializeImpl(
+    runtimeConfig,
+    sandboxAskCallback,
+    enableLogMonitor,
+  )
+  const settled = run.then(
+    () => {},
+    () => {},
+  )
+  initializeInFlight = settled
+  void settled.then(() => {
+    if (initializeInFlight === settled) initializeInFlight = undefined
+  })
+  return run
+}
+
+async function initializeImpl(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback?: SandboxAskCallback,
+  enableLogMonitor = false,
+): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
     await initializationPromise
@@ -666,7 +699,8 @@ async function initialize(
   // srt-win and fetched user status — the persistent CA is
   // generated-if-absent under windowsStateDir()/ca and
   // trusted in the sandbox user's Root store, then loaded here.
-  // Explicit paths (or non-Windows) go straight to createMitmCA.
+  // Explicit paths (or non-Windows) go straight to createMitmCAAsync, which
+  // generates an ephemeral CA's RSA key off the event loop.
   const tlsTerminate = runtimeConfig.network.tlsTerminate
   const useWindowsPersistentCa =
     getPlatform() === 'windows' &&
@@ -675,7 +709,7 @@ async function initialize(
     !tlsTerminate.caKeyPath
   mitmCA =
     tlsTerminate && !useWindowsPersistentCa
-      ? createMitmCA(tlsTerminate)
+      ? await createMitmCAAsync(tlsTerminate)
       : undefined
 
   // Check dependencies
@@ -1598,6 +1632,8 @@ async function waitForNetworkInitialization(): Promise<boolean> {
   if (!config) {
     return false
   }
+  // The pre-claim phase of initialize() (CA keygen) can be in flight.
+  if (initializeInFlight) await initializeInFlight
   if (initializationPromise) {
     try {
       await initializationPromise

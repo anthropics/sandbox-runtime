@@ -107,6 +107,7 @@ export type {
 // persistent-CA default) use these to generate and validate a pair.
 export {
   generateCa,
+  generateCaAsync,
   validateCaPair,
   certThumbprint,
 } from './sandbox/mitm-ca.js'
