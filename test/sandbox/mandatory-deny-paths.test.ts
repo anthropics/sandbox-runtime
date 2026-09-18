@@ -9,17 +9,28 @@ import {
 } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   mkdirSync,
+  readdirSync,
+  mkdtempSync,
+  renameSync,
   rmSync,
   writeFileSync,
   readFileSync,
   symlinkSync,
   existsSync,
   statSync,
+  realpathSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
+import {
+  indexOfMount,
+  lastIndexOfMount,
+  lastMountAt,
+} from '../helpers/bwrap-argv.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import {
   wrapCommandWithSandboxMacOS,
   macGetMandatoryDenyEntries,
@@ -27,8 +38,21 @@ import {
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
+  linuxGetCwdMandatoryDenyPaths,
+  linuxGetMonitorCwdDenyPaths,
+  GIT_REDIRECT_STORE_PREFIX,
+  LinuxSandboxProfileError,
 } from '../../src/sandbox/linux-sandbox-utils.js'
-import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
+import {
+  GitMetadataError,
+  MAX_SUBMODULE_WALK_DEPTH,
+  gitDirDenyPaths,
+  gitFileDenyPaths,
+  gitRedirectPlaceholder,
+  submoduleGitDirs,
+} from '../../src/sandbox/mandatory-deny-paths.js'
+import { isLinux, isSupportedPlatform, isWindows } from '../helpers/platform.js'
+import type { RipgrepConfig } from '../../src/utils/ripgrep.js'
 
 /**
  * Integration tests for mandatory deny paths.
@@ -45,6 +69,12 @@ describe.if(isSupportedPlatform)(
   'Mandatory Deny Paths - Integration Tests',
   () => {
     const TEST_DIR = join(tmpdir(), `mandatory-deny-integration-${Date.now()}`)
+    // A read-denied region outside cwd, so the read section emits its
+    // operation-specific unlink/create rules (which a deny has to survive).
+    const READ_DENY_DIR = join(
+      tmpdir(),
+      `mandatory-deny-readdeny-${Date.now()}`,
+    )
     const ORIGINAL_CONTENT = 'ORIGINAL'
     const MODIFIED_CONTENT = 'MODIFIED'
     let originalCwd: string
@@ -52,6 +82,8 @@ describe.if(isSupportedPlatform)(
     beforeAll(() => {
       originalCwd = process.cwd()
       mkdirSync(TEST_DIR, { recursive: true })
+      mkdirSync(READ_DENY_DIR, { recursive: true })
+      writeFileSync(join(READ_DENY_DIR, 'secret.txt'), ORIGINAL_CONTENT)
 
       // Create ALL dangerous files from DANGEROUS_FILES
       writeFileSync(join(TEST_DIR, '.bashrc'), ORIGINAL_CONTENT)
@@ -112,6 +144,98 @@ describe.if(isSupportedPlatform)(
       )
       writeFileSync(join(TEST_DIR, '.git', 'index'), ORIGINAL_CONTENT)
 
+      // A nested repository directly under cwd, with `nested/` gitignored:
+      // its config sits at the default scan depth, its hook files one past
+      // it, and an ignore file must not hide either from the scan.
+      mkdirSync(join(TEST_DIR, 'nested', '.git', 'hooks'), { recursive: true })
+      mkdirSync(join(TEST_DIR, 'nested', 'src'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'nested', '.git', 'HEAD'),
+        'ref: refs/heads/main',
+      )
+      writeFileSync(
+        join(TEST_DIR, 'nested', '.git', 'config'),
+        ORIGINAL_CONTENT,
+      )
+      writeFileSync(
+        join(TEST_DIR, 'nested', '.git', 'hooks', 'pre-commit'),
+        ORIGINAL_CONTENT,
+      )
+      writeFileSync(join(TEST_DIR, 'nested', 'src', 'ok.txt'), ORIGINAL_CONTENT)
+      writeFileSync(join(TEST_DIR, '.gitignore'), 'nested/\nlib/\n')
+      // The nested repository has a submodule of its own.
+      mkdirSync(join(TEST_DIR, 'nested', '.git', 'modules', 'dep', 'hooks'), {
+        recursive: true,
+      })
+      writeFileSync(
+        join(TEST_DIR, 'nested', '.git', 'modules', 'dep', 'HEAD'),
+        'ref: x',
+      )
+      // A submodule: its git directory lives under cwd's .git/modules and its
+      // checkout has a .git FILE pointing there.
+      mkdirSync(join(TEST_DIR, '.git', 'modules', 'lib', 'hooks'), {
+        recursive: true,
+      })
+      writeFileSync(join(TEST_DIR, '.git', 'modules', 'lib', 'HEAD'), 'ref: x')
+      writeFileSync(
+        join(TEST_DIR, '.git', 'modules', 'lib', 'config'),
+        ORIGINAL_CONTENT,
+      )
+      writeFileSync(
+        join(TEST_DIR, '.git', 'modules', 'lib', 'hooks', 'pre-commit'),
+        ORIGINAL_CONTENT,
+      )
+      mkdirSync(join(TEST_DIR, 'lib'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'lib', '.git'),
+        'gitdir: ../.git/modules/lib',
+      )
+      // A linked worktree of this repository checked out inside it: its
+      // .git file points at .git/worktrees/wt, whose commondir is the main
+      // .git, so the hooks a commit in the worktree runs are the main ones.
+      mkdirSync(join(TEST_DIR, '.git', 'worktrees', 'wt'), { recursive: true })
+      writeFileSync(join(TEST_DIR, '.git', 'worktrees', 'wt', 'HEAD'), 'ref: x')
+      writeFileSync(
+        join(TEST_DIR, '.git', 'worktrees', 'wt', 'commondir'),
+        '../..\n',
+      )
+      mkdirSync(join(TEST_DIR, 'wt-checkout'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'wt-checkout', '.git'),
+        `gitdir: ${join(TEST_DIR, '.git', 'worktrees', 'wt')}`,
+      )
+      // A checkout whose .git pointer carries 9,000 newline bytes after the
+      // path. git strips them and follows the pointer, so its target needs
+      // the same denies an unpadded pointer's does.
+      mkdirSync(join(TEST_DIR, 'padded-target', 'hooks'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'padded-target', 'HEAD'),
+        'ref: refs/heads/main',
+      )
+      writeFileSync(join(TEST_DIR, 'padded-target', 'config'), ORIGINAL_CONTENT)
+      mkdirSync(join(TEST_DIR, 'padded-checkout'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'padded-checkout', '.git'),
+        `gitdir: ${join(TEST_DIR, 'padded-target')}${'\n'.repeat(9000)}`,
+      )
+      // A nested .claude/commands one level down (a name spanning two
+      // segments), within reach only of a deeper scan.
+      mkdirSync(join(TEST_DIR, 'pkg', '.claude', 'commands'), {
+        recursive: true,
+      })
+      writeFileSync(
+        join(TEST_DIR, 'pkg', '.claude', 'commands', 'x.md'),
+        ORIGINAL_CONTENT,
+      )
+      // A working directory whose own location has a dangerous name in it.
+      mkdirSync(join(TEST_DIR, '.vscode', 'ext', 'foo', 'sub'), {
+        recursive: true,
+      })
+      writeFileSync(
+        join(TEST_DIR, '.vscode', 'ext', 'foo', 'sub', '.gitconfig'),
+        ORIGINAL_CONTENT,
+      )
+
       // Create safe file within .claude that SHOULD be writable (not commands/agents)
       writeFileSync(
         join(TEST_DIR, '.claude', 'some-other-file.txt'),
@@ -122,6 +246,7 @@ describe.if(isSupportedPlatform)(
     afterAll(() => {
       process.chdir(originalCwd)
       rmSync(TEST_DIR, { recursive: true, force: true })
+      rmSync(READ_DENY_DIR, { recursive: true, force: true })
     })
 
     beforeEach(() => {
@@ -136,16 +261,27 @@ describe.if(isSupportedPlatform)(
       cleanupBwrapMountPoints({ force: true })
     })
 
-    async function runSandboxedWrite(
-      filePath: string,
-      content: string,
+    interface SandboxRunOptions {
+      mandatoryDenySearchDepth?: number
+      allowGitConfig?: boolean
+      allowOnly?: string[]
+      /**
+       * A read config makes the read section emit its own
+       * operation-specific unlink/create rules, which the write section's
+       * denies have to survive.
+       */
+      readConfig?: { denyOnly: string[]; allowWithinDeny?: string[] }
+    }
+
+    async function runSandboxed(
+      command: string,
+      opts: SandboxRunOptions = {},
     ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
-      const command = `echo '${content}' > '${filePath}'`
 
       // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
-        allowOnly: ['.'],
+        allowOnly: opts.allowOnly ?? ['.'],
         denyWithinAllow: [], // Empty - relying on mandatory denies
       }
 
@@ -154,15 +290,18 @@ describe.if(isSupportedPlatform)(
         wrappedCommand = wrapCommandWithSandboxMacOS({
           command,
           needsNetworkRestriction: false,
-          readConfig: undefined,
+          readConfig: opts.readConfig,
           writeConfig,
+          allowGitConfig: opts.allowGitConfig,
         })
       } else {
         wrappedCommand = await wrapCommandWithSandboxLinux({
           command,
           needsNetworkRestriction: false,
-          readConfig: undefined,
+          readConfig: opts.readConfig,
           writeConfig,
+          mandatoryDenySearchDepth: opts.mandatoryDenySearchDepth,
+          allowGitConfig: opts.allowGitConfig,
         })
       }
 
@@ -176,6 +315,27 @@ describe.if(isSupportedPlatform)(
         success: result.status === 0,
         stderr: result.stderr || '',
       }
+    }
+
+    /**
+     * The write did not land. On Linux the mount point for an absent deny
+     * path stays until the cleanup: bwrap's own empty file, or, for a file
+     * git reads back, the placeholder the wrap wrote there (`expected`). On
+     * macOS nothing is created.
+     */
+    function expectNotWritten(absolutePath: string, expected = ''): void {
+      const content = existsSync(absolutePath)
+        ? readFileSync(absolutePath, 'utf8')
+        : ''
+      expect(content).toBe(isLinux ? expected : '')
+    }
+
+    async function runSandboxedWrite(
+      filePath: string,
+      content: string,
+      opts: SandboxRunOptions = {},
+    ): Promise<{ success: boolean; stderr: string }> {
+      return runSandboxed(`echo '${content}' > '${filePath}'`, opts)
     }
 
     describe('Dangerous files should be blocked', () => {
@@ -264,6 +424,709 @@ describe.if(isSupportedPlatform)(
         expect(readFileSync('.git/hooks/pre-commit', 'utf8')).toBe(
           ORIGINAL_CONTENT,
         )
+      })
+    })
+
+    describe('Nested repositories, submodules and worktree pointers', () => {
+      it("blocks writes to a nested repository's .git/config even when gitignored", async () => {
+        const result = await runSandboxedWrite(
+          'nested/.git/config',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('nested/.git/config', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+      })
+
+      it("blocks writes to a nested repository's existing hook at the default depth", async () => {
+        const result = await runSandboxedWrite(
+          'nested/.git/hooks/pre-commit',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('nested/.git/hooks/pre-commit', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+      })
+
+      it("blocks a nested repository's hooks when only its HEAD is within the scan depth", async () => {
+        // With allowGitConfig the scan does not look for .git/config, and the
+        // hook files lie one level past the default depth.
+        const result = await runSandboxedWrite(
+          'nested/.git/hooks/pre-commit',
+          MODIFIED_CONTENT,
+          { allowGitConfig: true },
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('nested/.git/hooks/pre-commit', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+      })
+
+      it('blocks creating a new hook in a nested repository', async () => {
+        const result = await runSandboxedWrite(
+          'nested/.git/hooks/post-checkout',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(existsSync('nested/.git/hooks/post-checkout')).toBe(false)
+      })
+
+      it('keeps the rest of a nested repository writable', async () => {
+        const result = await runSandboxedWrite(
+          'nested/src/ok.txt',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(true)
+        expect(readFileSync('nested/src/ok.txt', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
+        )
+      })
+
+      it.if(isLinux && process.getuid?.() !== 0)(
+        'keeps what the scan found when a directory under cwd is unreadable',
+        async () => {
+          mkdirSync('unreadable', { mode: 0o000 })
+          try {
+            const result = await runSandboxedWrite(
+              'nested/.git/config',
+              MODIFIED_CONTENT,
+            )
+
+            expect(result.success).toBe(false)
+            expect(readFileSync('nested/.git/config', 'utf8')).toBe(
+              ORIGINAL_CONTENT,
+            )
+          } finally {
+            chmodSync('unreadable', 0o755)
+            rmSync('unreadable', { recursive: true, force: true })
+          }
+        },
+      )
+
+      it("blocks writes to a submodule's config under .git/modules", async () => {
+        const result = await runSandboxedWrite(
+          '.git/modules/lib/config',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('.git/modules/lib/config', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+      })
+
+      it("blocks creating a hook in a submodule's git directory", async () => {
+        const result = await runSandboxedWrite(
+          '.git/modules/lib/hooks/post-checkout',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(existsSync('.git/modules/lib/hooks/post-checkout')).toBe(false)
+      })
+
+      it("blocks creating a hook in a nested repository's submodule", async () => {
+        const result = await runSandboxedWrite(
+          'nested/.git/modules/dep/hooks/post-checkout',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(existsSync('nested/.git/modules/dep/hooks/post-checkout')).toBe(
+          false,
+        )
+      })
+
+      it("blocks repointing a submodule checkout's .git file", async () => {
+        const result = await runSandboxedWrite(
+          'lib/.git',
+          'gitdir: /tmp/elsewhere',
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('lib/.git', 'utf8')).toBe(
+          'gitdir: ../.git/modules/lib',
+        )
+      })
+
+      it('blocks removing an existing .git pointer file', async () => {
+        const result = await runSandboxed('rm -f lib/.git', {
+          readConfig: { denyOnly: [READ_DENY_DIR] },
+        })
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('lib/.git', 'utf8')).toBe(
+          'gitdir: ../.git/modules/lib',
+        )
+      })
+
+      it('blocks renaming a file over an existing .git pointer', async () => {
+        writeFileSync(join(TEST_DIR, 'lib', 'decoy'), 'gitdir: /tmp/elsewhere')
+        try {
+          const result = await runSandboxed('mv -f lib/decoy lib/.git', {
+            readConfig: { denyOnly: [READ_DENY_DIR] },
+          })
+
+          expect(result.success).toBe(false)
+          expect(readFileSync('lib/.git', 'utf8')).toBe(
+            'gitdir: ../.git/modules/lib',
+          )
+        } finally {
+          rmSync(join(TEST_DIR, 'lib', 'decoy'), { force: true })
+        }
+      })
+
+      it('still removes an ordinary file with the same read config', async () => {
+        writeFileSync(join(TEST_DIR, 'lib', 'plain.txt'), ORIGINAL_CONTENT)
+        try {
+          const result = await runSandboxed('rm -f lib/plain.txt', {
+            readConfig: { denyOnly: [READ_DENY_DIR] },
+          })
+
+          expect(result.success).toBe(true)
+          expect(existsSync(join(TEST_DIR, 'lib', 'plain.txt'))).toBe(false)
+        } finally {
+          rmSync(join(TEST_DIR, 'lib', 'plain.txt'), { force: true })
+        }
+      })
+
+      it("blocks creating a commondir in the repository's git directory", async () => {
+        // git reads hooks and config through commondir, so a write here
+        // moves every deny below to a directory of the command's choosing.
+        const result = await runSandboxedWrite('.git/commondir', 'decoy')
+
+        expect(result.success).toBe(false)
+        expectNotWritten(join(TEST_DIR, '.git', 'commondir'), '.\n')
+      })
+
+      it("blocks creating a commondir in a submodule's git directory", async () => {
+        const result = await runSandboxedWrite(
+          '.git/modules/lib/commondir',
+          'decoy',
+        )
+
+        expect(result.success).toBe(false)
+        expectNotWritten(
+          join(TEST_DIR, '.git', 'modules', 'lib', 'commondir'),
+          '.\n',
+        )
+      })
+
+      it("blocks creating a nested repository's commondir", async () => {
+        const result = await runSandboxedWrite('nested/.git/commondir', 'decoy')
+
+        expect(result.success).toBe(false)
+        expectNotWritten(join(TEST_DIR, 'nested', '.git', 'commondir'), '.\n')
+      })
+
+      it('blocks creating .git/config.worktree', async () => {
+        // Read instead of .git/config wherever extensions.worktreeConfig is
+        // on, which `git sparse-checkout init` turns on.
+        const result = await runSandboxedWrite(
+          '.git/config.worktree',
+          'fsmonitor = touch pwned',
+        )
+
+        expect(result.success).toBe(false)
+        expectNotWritten(join(TEST_DIR, '.git', 'config.worktree'))
+      })
+
+      it('allows .git/config.worktree when allowGitConfig is true', async () => {
+        try {
+          const result = await runSandboxedWrite(
+            '.git/config.worktree',
+            'bare = false',
+            { allowGitConfig: true },
+          )
+
+          expect(result.success).toBe(true)
+        } finally {
+          rmSync(join(TEST_DIR, '.git', 'config.worktree'), { force: true })
+        }
+      })
+
+      it('finds a submodule git directory whose HEAD was moved aside', async () => {
+        const head = join(TEST_DIR, '.git', 'modules', 'lib', 'HEAD')
+        renameSync(head, `${head}.bak`)
+        try {
+          const result = await runSandboxedWrite(
+            '.git/modules/lib/hooks/pre-commit',
+            MODIFIED_CONTENT,
+          )
+
+          expect(result.success).toBe(false)
+          expect(
+            readFileSync(
+              join(TEST_DIR, '.git', 'modules', 'lib', 'hooks', 'pre-commit'),
+              'utf8',
+            ),
+          ).toBe(ORIGINAL_CONTENT)
+        } finally {
+          renameSync(`${head}.bak`, head)
+        }
+      })
+
+      it.if(isLinux)(
+        'finds a nested repository whose HEAD was moved aside',
+        async () => {
+          // With allowGitConfig the scan does not look for config either, and
+          // the hook files are one level past the default depth: the
+          // repository has to be recognised by whatever else its .git holds.
+          const head = join(TEST_DIR, 'nested', '.git', 'HEAD')
+          renameSync(head, `${head}.bak`)
+          try {
+            const result = await runSandboxedWrite(
+              'nested/.git/hooks/pre-commit',
+              MODIFIED_CONTENT,
+              { allowGitConfig: true },
+            )
+
+            expect(result.success).toBe(false)
+            expect(readFileSync('nested/.git/hooks/pre-commit', 'utf8')).toBe(
+              ORIGINAL_CONTENT,
+            )
+          } finally {
+            renameSync(`${head}.bak`, head)
+          }
+        },
+      )
+
+      it.if(isLinux)(
+        'does not follow a .git file that names an ordinary directory',
+        async () => {
+          // `gitdir: ..` from app/tools would otherwise make app/config and
+          // app/hooks — an ordinary Rails-shaped tree — read-only.
+          mkdirSync(join(TEST_DIR, 'app', 'config'), { recursive: true })
+          mkdirSync(join(TEST_DIR, 'app', 'tools'), { recursive: true })
+          writeFileSync(join(TEST_DIR, 'app', 'tools', '.git'), 'gitdir: ..')
+          try {
+            const result = await runSandboxedWrite(
+              'app/config/settings.yml',
+              MODIFIED_CONTENT,
+            )
+
+            expect(result.success).toBe(true)
+          } finally {
+            rmSync(join(TEST_DIR, 'app'), { recursive: true, force: true })
+          }
+        },
+      )
+
+      it.if(isLinux)(
+        'blocks filling in the git directory a dangling .git file names',
+        async () => {
+          mkdirSync(join(TEST_DIR, 'dangling'), { recursive: true })
+          writeFileSync(
+            join(TEST_DIR, 'dangling', '.git'),
+            'gitdir: ../dangling-gitdir',
+          )
+          try {
+            const result = await runSandboxed(
+              'mkdir -p dangling-gitdir/hooks && echo X > dangling-gitdir/hooks/pre-commit',
+            )
+
+            expect(result.success).toBe(false)
+            expect(
+              existsSync(
+                join(TEST_DIR, 'dangling-gitdir', 'hooks', 'pre-commit'),
+              ),
+            ).toBe(false)
+          } finally {
+            rmSync(join(TEST_DIR, 'dangling'), { recursive: true, force: true })
+            rmSync(join(TEST_DIR, 'dangling-gitdir'), {
+              recursive: true,
+              force: true,
+            })
+          }
+        },
+      )
+
+      it.if(isLinux)(
+        'refuses to sandbox at all when the scan does not finish',
+        async () => {
+          // One complete path, one the run was cut off in the middle of, and
+          // then a run that outlives its timeout: what it did not reach is
+          // unknown, so there is nothing safe to wrap the next command with.
+          const error = await wrapCommandWithSandboxLinux({
+            command: 'echo hi',
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: ['.'], denyWithinAllow: [] },
+            ripgrepConfig: {
+              command: '/bin/sh',
+              args: [
+                '-c',
+                'printf "%s\\0%s" "$PWD/a/.git/HEAD" "$PWD/b/.gi"; exec sleep 30',
+              ],
+              timeoutMs: 200,
+            },
+          }).catch((e: unknown) => e)
+
+          expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+          expect((error as LinuxSandboxProfileError).code).toBe(
+            'deny_scan_failed',
+          )
+          expect((error as Error).message).toMatch(/did not finish/)
+        },
+      )
+
+      it.if(isLinux && process.getuid?.() !== 0)(
+        'denies a directory the scan could not read',
+        async () => {
+          mkdirSync(join(TEST_DIR, 'locked', '.git', 'hooks'), {
+            recursive: true,
+          })
+          writeFileSync(
+            join(TEST_DIR, 'locked', '.git', 'HEAD'),
+            'ref: refs/heads/main',
+          )
+          chmodSync(join(TEST_DIR, 'locked'), 0o000)
+          try {
+            const result = await runSandboxed(
+              'chmod 755 locked && echo X > locked/.git/hooks/pre-commit',
+            )
+
+            expect(result.success).toBe(false)
+            expect(result.stderr).not.toBe('')
+          } finally {
+            chmodSync(join(TEST_DIR, 'locked'), 0o755)
+            rmSync(join(TEST_DIR, 'locked'), { recursive: true, force: true })
+          }
+        },
+      )
+
+      /**
+       * What the scan does when it fails, driven by a fake rg: the run that
+       * fails for real needs a directory this process cannot read, and as
+       * root — which CI is — there is none, so none of this would be
+       * exercised there. The last arm is the real thing, where the uid allows.
+       */
+      describe.if(isLinux)('when the scan fails', () => {
+        /** Echoed by every command that runs for real, so nothing concludes
+         *  anything from a sandbox that never started. */
+        const BOOTED = 'BOOTED'
+
+        const wrapWith = (
+          ripgrepConfig: RipgrepConfig,
+          abortSignal?: AbortSignal,
+        ): Promise<string> =>
+          wrapCommandWithSandboxLinux({
+            command: 'echo hi',
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: ['.'], denyWithinAllow: [] },
+            ripgrepConfig,
+            abortSignal,
+          })
+
+        /** A fake rg: `matches` NUL-terminated on stdout, `stderr`, exit 2. */
+        const failingRipgrep = (
+          matches: string[],
+          stderr: string,
+        ): RipgrepConfig => ({
+          command: '/bin/sh',
+          args: [
+            '-c',
+            `printf '%s\\0' ${matches.map(match => `'${match}'`).join(' ')}; ` +
+              `printf '%s\\n' '${stderr}' >&2; exit 2`,
+          ],
+        })
+
+        it('keeps what it listed and denies the directory it could not read', async () => {
+          const cwd = process.cwd()
+          const locked = join(cwd, 'locked')
+          const hooks = join(cwd, 'nested', '.git', 'hooks')
+          const config = join(cwd, 'nested', '.git', 'config')
+          mkdirSync(locked, { recursive: true })
+          try {
+            const command = await wrapWith(
+              failingRipgrep(
+                [config],
+                `rg: ${locked}: Permission denied (os error 13)`,
+              ),
+            )
+
+            // The nested repository the partial listing named is denied as
+            // if the run had finished, and what it could not read is denied
+            // whole, since a nested repository inside it would be unseen.
+            expect(lastMountAt(command, hooks)).toBe(
+              `--ro-bind ${hooks} ${hooks}`,
+            )
+            expect(lastMountAt(command, config)).toBe(
+              `--ro-bind ${config} ${config}`,
+            )
+            expect(lastMountAt(command, locked)).toBe(
+              `--ro-bind ${locked} ${locked}`,
+            )
+          } finally {
+            rmSync(locked, { recursive: true, force: true })
+          }
+        })
+
+        it('refuses the wrap when the failure names no path to deny', async () => {
+          // Nothing here stands in for a failure of this shape, so what the
+          // run never reached would stay writable.
+          const error = await wrapWith(
+            failingRipgrep(
+              [join(process.cwd(), 'nested', '.git', 'config')],
+              'rg: unrecognized option --frobnicate',
+            ),
+          ).catch((e: unknown) => e)
+
+          expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+          expect((error as LinuxSandboxProfileError).code).toBe(
+            'deny_scan_failed',
+          )
+          expect((error as Error).message).toMatch(
+            /failed for a reason no deny stands in for/,
+          )
+          expect((error as Error).message).toMatch(/was not run/)
+        })
+
+        it('refuses the wrap when the scan could not be run at all', async () => {
+          const error = await wrapWith({
+            command: join(TEST_DIR, 'no-such-ripgrep'),
+          }).catch((e: unknown) => e)
+
+          expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+          expect((error as LinuxSandboxProfileError).code).toBe(
+            'deny_scan_failed',
+          )
+          expect((error as Error).message).toMatch(/could not be run/)
+        })
+
+        it("lets the caller's own abort through as itself", async () => {
+          const controller = new AbortController()
+          controller.abort()
+
+          const error = await wrapWith(
+            { command: '/bin/sh', args: ['-c', 'true'] },
+            controller.signal,
+          ).catch((e: unknown) => e)
+
+          expect((error as Error).name).toBe('AbortError')
+          expect(error).not.toBeInstanceOf(LinuxSandboxProfileError)
+        })
+
+        it.if(process.getuid?.() !== 0 && bwrapCanNamespace())(
+          'denies a nested repository the real rg could not walk past',
+          async () => {
+            const cwd = process.cwd()
+            const blind = join(cwd, 'blind')
+            const hook = join(cwd, 'nested', '.git', 'hooks', 'pre-commit')
+            const wrap = (command: string): Promise<string> =>
+              wrapCommandWithSandboxLinux({
+                command,
+                needsNetworkRestriction: false,
+                allowAllUnixSockets: true,
+                readConfig: undefined,
+                writeConfig: { allowOnly: [cwd], denyWithinAllow: [] },
+              })
+            const run = (command: string) =>
+              spawnSync(command, {
+                shell: true,
+                encoding: 'utf8',
+                timeout: 30000,
+                cwd,
+              })
+
+            mkdirSync(blind, { recursive: true })
+            try {
+              // The first command leaves a directory the next command's scan
+              // cannot read: that scan fails, and the hooks of the nested
+              // repository beside it must be denied all the same.
+              const first = run(await wrap(`echo ${BOOTED} && chmod 000 blind`))
+              expect(first.stdout).toContain(BOOTED)
+              expect(first.status).toBe(0)
+              cleanupBwrapMountPoints({ force: true })
+
+              const second = run(
+                await wrap(`echo ${BOOTED}; echo X > ${hook} || echo DENIED`),
+              )
+              expect(second.stdout).toContain(BOOTED)
+              expect(second.stdout).toContain('DENIED')
+              expect(readFileSync(hook, 'utf8')).toBe(ORIGINAL_CONTENT)
+            } finally {
+              chmodSync(blind, 0o755)
+              rmSync(blind, { recursive: true, force: true })
+            }
+          },
+          60000,
+        )
+      })
+
+      it('still lets a command create a .git file where none exists', async () => {
+        mkdirSync('fresh-checkout', { recursive: true })
+        try {
+          const result = await runSandboxedWrite(
+            'fresh-checkout/.git',
+            'gitdir: ../.git/modules/fresh',
+          )
+
+          expect(result.success).toBe(true)
+          expect(readFileSync('fresh-checkout/.git', 'utf8').trim()).toBe(
+            'gitdir: ../.git/modules/fresh',
+          )
+        } finally {
+          rmSync('fresh-checkout', { recursive: true, force: true })
+        }
+      })
+
+      it('does not let a .git file be created outside the allowed write paths', async () => {
+        const opts = { allowOnly: [join(TEST_DIR, 'nested', 'src')] }
+        mkdirSync('unlisted', { recursive: true })
+        try {
+          const pointer = await runSandboxedWrite(
+            'unlisted/.git',
+            'gitdir: /tmp/elsewhere',
+            opts,
+          )
+          expect(pointer.success).toBe(false)
+          expect(existsSync('unlisted/.git')).toBe(false)
+
+          const control = await runSandboxedWrite(
+            'nested/src/ok.txt',
+            MODIFIED_CONTENT,
+            opts,
+          )
+          expect(control.success).toBe(true)
+        } finally {
+          rmSync('unlisted', { recursive: true, force: true })
+        }
+      })
+
+      describe('from a linked worktree checkout', () => {
+        const opts = { allowOnly: [TEST_DIR] }
+        beforeEach(() => {
+          process.chdir(join(TEST_DIR, 'wt-checkout'))
+        })
+        afterEach(() => {
+          rmSync(join(TEST_DIR, 'wt-checkout', 'notes.txt'), { force: true })
+        })
+
+        it("blocks the main repository's hooks, which the worktree's commits run", async () => {
+          const hook = join(TEST_DIR, '.git', 'hooks', 'pre-commit')
+          const denied = await runSandboxedWrite(hook, MODIFIED_CONTENT, opts)
+          expect(denied.success).toBe(false)
+          expect(readFileSync(hook, 'utf8')).toBe(ORIGINAL_CONTENT)
+
+          const control = await runSandboxedWrite(
+            'notes.txt',
+            MODIFIED_CONTENT,
+            opts,
+          )
+          expect(control.success).toBe(true)
+        })
+
+        it("blocks rewriting the worktree's commondir", async () => {
+          // It names the git directory whose hooks and config a commit here
+          // runs, so it chooses what the denies below apply to.
+          const commondir = join(
+            TEST_DIR,
+            '.git',
+            'worktrees',
+            'wt',
+            'commondir',
+          )
+          const denied = await runSandboxedWrite(commondir, '../../decoy', opts)
+
+          expect(denied.success).toBe(false)
+          expect(readFileSync(commondir, 'utf8')).toBe('../..\n')
+        })
+
+        it("blocks repointing the checkout's own .git file", async () => {
+          const original = readFileSync('.git', 'utf8')
+          const result = await runSandboxedWrite(
+            '.git',
+            'gitdir: /tmp/elsewhere',
+            opts,
+          )
+
+          expect(result.success).toBe(false)
+          expect(readFileSync('.git', 'utf8')).toBe(original)
+        })
+      })
+
+      describe('from a checkout whose pointer is padded with newlines', () => {
+        // git strips them from the end of the file and follows the pointer,
+        // so reading less of the file than git does would leave the target's
+        // hooks and config writable.
+        const opts = { allowOnly: [TEST_DIR] }
+        beforeEach(() => {
+          process.chdir(join(TEST_DIR, 'padded-checkout'))
+        })
+        afterEach(() => {
+          rmSync(join(TEST_DIR, 'padded-checkout', 'notes.txt'), {
+            force: true,
+          })
+        })
+
+        it("blocks the padded pointer's target, as an unpadded one's", async () => {
+          const config = join(TEST_DIR, 'padded-target', 'config')
+          const denied = await runSandboxedWrite(config, MODIFIED_CONTENT, opts)
+          expect(denied.success).toBe(false)
+          expect(readFileSync(config, 'utf8')).toBe(ORIGINAL_CONTENT)
+
+          const hook = join(TEST_DIR, 'padded-target', 'hooks', 'pre-commit')
+          const hookWrite = await runSandboxedWrite(
+            hook,
+            MODIFIED_CONTENT,
+            opts,
+          )
+          expect(hookWrite.success).toBe(false)
+          expectNotWritten(hook)
+
+          const control = await runSandboxedWrite(
+            'notes.txt',
+            MODIFIED_CONTENT,
+            opts,
+          )
+          expect(control.success).toBe(true)
+        })
+      })
+
+      it("matches dangerous names below cwd only, not in cwd's own location", async () => {
+        process.chdir(join(TEST_DIR, '.vscode', 'ext', 'foo'))
+
+        const denied = await runSandboxedWrite(
+          'sub/.gitconfig',
+          MODIFIED_CONTENT,
+        )
+        expect(denied.success).toBe(false)
+        expect(readFileSync('sub/.gitconfig', 'utf8')).toBe(ORIGINAL_CONTENT)
+
+        const control = await runSandboxedWrite('sub/ok.txt', MODIFIED_CONTENT)
+        expect(control.success).toBe(true)
+      })
+
+      it('denies a nested .claude/commands as a directory once the scan reaches it', async () => {
+        // pkg/.claude/commands/x.md is four segments deep: found with a
+        // depth of 4 (macOS matches by pattern at any depth), and then the
+        // whole directory is read-only, new files included.
+        const existing = await runSandboxedWrite(
+          'pkg/.claude/commands/x.md',
+          MODIFIED_CONTENT,
+          { mandatoryDenySearchDepth: 4 },
+        )
+        expect(existing.success).toBe(false)
+        expect(readFileSync('pkg/.claude/commands/x.md', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+
+        const created = await runSandboxedWrite(
+          'pkg/.claude/commands/new.md',
+          MODIFIED_CONTENT,
+          { mandatoryDenySearchDepth: 4 },
+        )
+        expect(created.success).toBe(false)
+        expect(existsSync('pkg/.claude/commands/new.md')).toBe(false)
       })
     })
 
@@ -926,10 +1789,10 @@ describe.if(isSupportedPlatform)(
               denyWithinAllow: [] as string[],
             }
 
-            // linuxGetMandatoryDenyPaths adds .git/hooks to deny list.
-            // .git exists as a file, so .git/hooks doesn't exist.
-            // The code will try to mount /dev/null at .git/hooks, but bwrap
-            // can't create a mount point there because .git is a file.
+            // .git is a pointer file here, so it goes through
+            // gitFileDenyPaths: the file itself and the hooks and config it
+            // leads to are denied, and nothing is mounted under the file
+            // (bwrap could not create a mount point there).
             const wrappedCommand = await wrapCommandWithSandboxLinux({
               command: 'echo hello',
               needsNetworkRestriction: false,
@@ -948,7 +1811,6 @@ describe.if(isSupportedPlatform)(
             // should not cause the sandbox to fail.
             expect(result.status).toBe(0)
             expect(result.stdout.trim()).toBe('hello')
-
             cleanupBwrapMountPoints()
           } finally {
             process.chdir(originalDir)
@@ -1184,4 +2046,1116 @@ describe('macGetMandatoryDenyEntries - Unit Tests', () => {
     )
     expect(hasGitConfigPattern).toBe(true)
   })
+})
+describe('Git metadata deny paths - Unit Tests', () => {
+  let dir: string
+
+  beforeEach(() => {
+    // Real, so a temporary directory that is itself reached through a
+    // symlink (macOS /var) does not make every path here two paths.
+    dir = realpathSync(mkdtempSync(join(tmpdir(), 'git-deny-paths-')))
+  })
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /** A directory git would accept as a git directory. */
+  function makeGitDir(gitDir: string): string {
+    mkdirSync(join(gitDir, 'hooks'), { recursive: true })
+    writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+    return gitDir
+  }
+
+  /** A checkout whose `.git` file holds exactly `contents`. */
+  function writePointer(checkout: string, contents: string | Buffer): string {
+    mkdirSync(join(dir, checkout), { recursive: true })
+    const pointer = join(dir, checkout, '.git')
+    writeFileSync(pointer, contents)
+    return pointer
+  }
+
+  function makePointer(checkout: string, target: string): string {
+    return writePointer(checkout, `gitdir: ${target}\n`)
+  }
+
+  it('denies commondir in every git directory, and config.worktree with config', () => {
+    expect(gitDirDenyPaths('/repo/.git', false)).toEqual([
+      '/repo/.git/hooks',
+      '/repo/.git/commondir',
+      '/repo/.git/config',
+      '/repo/.git/config.worktree',
+    ])
+    expect(gitDirDenyPaths('/repo/.git', true)).toEqual([
+      '/repo/.git/hooks',
+      '/repo/.git/commondir',
+    ])
+  })
+
+  it('gives the files git reads a placeholder that is no redirect', () => {
+    // `.` is the git directory itself, which is where git looks when there
+    // is no commondir, and no config.worktree reads as an empty one does.
+    expect(gitRedirectPlaceholder('/repo/.git/commondir')).toBe('.\n')
+    expect(gitRedirectPlaceholder('/repo/.git/config.worktree')).toBe('')
+    expect(gitRedirectPlaceholder('/repo/.git/config')).toBeUndefined()
+    expect(gitRedirectPlaceholder('/repo/.git/hooks')).toBeUndefined()
+  })
+
+  it('gives a placeholder to the denied files that need one, and no others', () => {
+    // Both lists come off one table, so a redirect file added to it is
+    // denied AND has a stand-in: neither can gain an entry the other misses,
+    // which is how a new one would end up mounted from /dev/null.
+    expect(
+      gitDirDenyPaths('/repo/.git', false).filter(
+        denyPath => gitRedirectPlaceholder(denyPath) !== undefined,
+      ),
+    ).toEqual(['/repo/.git/commondir', '/repo/.git/config.worktree'])
+  })
+
+  it('follows a pointer to the git directory it names', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = makePointer('checkout', '../gitdir')
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it("follows a linked worktree's commondir as well", () => {
+    const main = makeGitDir(join(dir, 'main.git'))
+    const worktreeGitDir = makeGitDir(join(dir, 'main.git', 'worktrees', 'wt'))
+    writeFileSync(join(worktreeGitDir, 'commondir'), '../..\n')
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(worktreeGitDir, false),
+      ...gitDirDenyPaths(main, false),
+    ])
+  })
+
+  it('leaves a pointer that names an ordinary directory alone', () => {
+    // `gitdir: ..` from app/tools would otherwise deny app/config and
+    // app/hooks, which are an ordinary tree and not a git directory.
+    mkdirSync(join(dir, 'app', 'config'), { recursive: true })
+    const pointer = makePointer(join('app', 'tools'), '..')
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([pointer])
+  })
+
+  it('blocks the git directory a dangling pointer names from being filled in', () => {
+    const pointer = makePointer('checkout', '../not-created-yet')
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(join(dir, 'not-created-yet'), false),
+    ])
+  })
+
+  it('follows a pointer padded with the newline bytes git strips', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer(
+      'checkout',
+      `gitdir: ${gitDir}${'\n'.repeat(9000)}`,
+    )
+
+    // git strips them from the end of the whole file, so this is a pointer
+    // it follows; reading less of the file than git does would leave the
+    // target's hooks and config out of the deny list.
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it('counts trailing spaces as part of the path, as git does', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const padded = `${gitDir}${' '.repeat(200)}`
+    const pointer = writePointer('checkout', `gitdir: ${padded}\n`)
+
+    // Nothing is trimmed but the newline, so the pointer names a directory
+    // that does not exist — denied against being created, not confused for
+    // the real git directory next to it.
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(padded, false),
+    ])
+  })
+
+  it('follows a pointer to a path no file can occupy nowhere', () => {
+    // Past the filesystem's name limit: git's own stat of it fails, and a
+    // sandboxed command cannot create a git directory there either, so
+    // there is nothing below the pointer to deny.
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer(
+      'checkout',
+      `gitdir: ${gitDir}${' '.repeat(9000)}\n`,
+    )
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([pointer])
+  })
+
+  it('follows a pointer of the largest size git accepts, and no larger', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const maxSize = 1024 * 1024
+    const head = `gitdir: ${gitDir}`
+
+    const atBound = writePointer(
+      'checkout',
+      head + '\n'.repeat(maxSize - head.length),
+    )
+    expect(statSync(atBound).size).toBe(maxSize)
+    expect(gitFileDenyPaths(atBound, false)).toEqual([
+      atBound,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+
+    // One byte more is a .git file git refuses outright, so it leads nowhere.
+    const pastBound = writePointer(
+      'past-bound',
+      head + '\n'.repeat(maxSize + 1 - head.length),
+    )
+    expect(statSync(pastBound).size).toBe(maxSize + 1)
+    expect(gitFileDenyPaths(pastBound, false)).toEqual([pastBound])
+  })
+
+  it.if(!isWindows)('takes a path that spans lines whole, as git does', () => {
+    // Only the newline bytes at the END of the file are stripped, so one in
+    // the middle is part of the directory name.
+    const gitDir = makeGitDir(join(dir, 'two\nlines'))
+    const pointer = writePointer('checkout', `gitdir: ${gitDir}\n`)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it('stops the path at the first NUL byte, as a C string does', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer(
+      'checkout',
+      `gitdir: ${gitDir}\0/../elsewhere\n`,
+    )
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it('strips a CRLF line ending', () => {
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer('checkout', `gitdir: ${gitDir}\r\n`)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(gitDir, false),
+    ])
+  })
+
+  it('refuses to sandbox at all on a path that is not valid UTF-8', () => {
+    // Decoded, those bytes name a different directory than git opens, so
+    // there is no deny list to be had — and sandboxing without one would
+    // leave the hooks git runs writable.
+    const gitDir = makeGitDir(join(dir, 'gitdir'))
+    const pointer = writePointer(
+      'checkout',
+      Buffer.concat([
+        Buffer.from(`gitdir: ${gitDir}`),
+        Buffer.from([0xff]),
+        Buffer.from('\n'),
+      ]),
+    )
+
+    expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+  })
+
+  it("follows a commondir padded past the pointer's own bound", () => {
+    const main = makeGitDir(join(dir, 'main.git'))
+    const worktreeGitDir = makeGitDir(join(dir, 'main.git', 'worktrees', 'wt'))
+    writeFileSync(
+      join(worktreeGitDir, 'commondir'),
+      `../..${'\n'.repeat(9000)}`,
+    )
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(worktreeGitDir, false),
+      ...gitDirDenyPaths(main, false),
+    ])
+  })
+
+  it('does not trim a commondir, which git reads byte for byte', () => {
+    const main = makeGitDir(join(dir, 'main.git'))
+    const worktreeGitDir = makeGitDir(join(dir, 'main.git', 'worktrees', 'wt'))
+    // A leading space makes this a relative path beginning with a space,
+    // which is where git looks too — not the main git directory.
+    writeFileSync(join(worktreeGitDir, 'commondir'), ` ${main}\n`)
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    const denyPaths = gitFileDenyPaths(pointer, false)
+    expect(denyPaths).toEqual([
+      pointer,
+      ...gitDirDenyPaths(worktreeGitDir, false),
+      ...gitDirDenyPaths(join(worktreeGitDir, ` ${main}`), false),
+    ])
+    expect(denyPaths).not.toContain(join(main, 'hooks'))
+  })
+
+  it.if(!isWindows)(
+    'denies where a .. after a symlink lands, and the lexical path too',
+    () => {
+      // checkout/hop is real/side, so the kernel reads hop/../evil as
+      // real/evil while folding it on paper gives checkout/evil. git opens
+      // the first; denying only the second leaves its hooks writable.
+      const physical = makeGitDir(join(dir, 'real', 'evil'))
+      mkdirSync(join(dir, 'real', 'side'), { recursive: true })
+      const pointer = writePointer('checkout', 'gitdir: hop/../evil\n')
+      symlinkSync(join(dir, 'real', 'side'), join(dir, 'checkout', 'hop'))
+
+      expect(gitFileDenyPaths(pointer, false)).toEqual([
+        pointer,
+        ...gitDirDenyPaths(join(dir, 'checkout', 'evil'), false),
+        ...gitDirDenyPaths(physical, false),
+      ])
+    },
+  )
+
+  it.if(!isWindows)('denies both when both are git directories', () => {
+    const lexical = makeGitDir(join(dir, 'checkout', 'evil'))
+    const physical = makeGitDir(join(dir, 'real', 'evil'))
+    mkdirSync(join(dir, 'real', 'side'), { recursive: true })
+    const pointer = writePointer('checkout', 'gitdir: hop/../evil\n')
+    symlinkSync(join(dir, 'real', 'side'), join(dir, 'checkout', 'hop'))
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(lexical, false),
+      ...gitDirDenyPaths(physical, false),
+    ])
+  })
+
+  it.if(!isWindows)('walks a chain of symlinks as the kernel does', () => {
+    // first is second, second is an absolute path to real/side/deeper.
+    const physical = makeGitDir(join(dir, 'real', 'evil'))
+    mkdirSync(join(dir, 'real', 'side', 'deeper'), { recursive: true })
+    const pointer = writePointer('checkout', 'gitdir: first/../../evil\n')
+    symlinkSync('second', join(dir, 'checkout', 'first'))
+    symlinkSync(
+      join(dir, 'real', 'side', 'deeper'),
+      join(dir, 'checkout', 'second'),
+    )
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(join(dir, 'evil'), false),
+      ...gitDirDenyPaths(physical, false),
+    ])
+  })
+
+  it.if(!isWindows)(
+    'takes the rest of a path as written past what is not there',
+    () => {
+      // The kernel cannot traverse a missing directory, so nothing after it
+      // redirects the path: gone/x is denied against being created, and so
+      // is the lexical checkout/x.
+      const pointer = writePointer('checkout', 'gitdir: hop/../x\n')
+      symlinkSync('gone/deeper', join(dir, 'checkout', 'hop'))
+
+      expect(gitFileDenyPaths(pointer, false)).toEqual([
+        pointer,
+        ...gitDirDenyPaths(join(dir, 'checkout', 'x'), false),
+        ...gitDirDenyPaths(join(dir, 'checkout', 'gone', 'x'), false),
+      ])
+    },
+  )
+
+  it.if(!isWindows)('denies what it can reach when symlinks loop', () => {
+    const pointer = writePointer('checkout', 'gitdir: loopA/../evil\n')
+    symlinkSync(join(dir, 'checkout', 'loopB'), join(dir, 'checkout', 'loopA'))
+    symlinkSync(join(dir, 'checkout', 'loopA'), join(dir, 'checkout', 'loopB'))
+
+    // Past the hop limit the walk stops on the loop itself, which is where
+    // the deny goes: the whole directory that still reads.
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(join(dir, 'checkout', 'evil'), false),
+      join(dir, 'checkout'),
+    ])
+  })
+
+  it.if(!isWindows)('resolves a commondir the same way', () => {
+    const worktreeGitDir = makeGitDir(join(dir, 'wt.git'))
+    const physical = makeGitDir(join(dir, 'real', 'common'))
+    mkdirSync(join(dir, 'real', 'side'), { recursive: true })
+    symlinkSync(join(dir, 'real', 'side'), join(worktreeGitDir, 'hop'))
+    writeFileSync(join(worktreeGitDir, 'commondir'), 'hop/../common\n')
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    expect(gitFileDenyPaths(pointer, false)).toEqual([
+      pointer,
+      ...gitDirDenyPaths(worktreeGitDir, false),
+      ...gitDirDenyPaths(join(worktreeGitDir, 'common'), false),
+      ...gitDirDenyPaths(physical, false),
+    ])
+  })
+
+  it.if(!isWindows)(
+    'resolves a .. against the directory the pointer file is really in',
+    () => {
+      // The checkout is reached through a symlink, so `..` pops the
+      // directory the kernel is in and not the one the path was spelled
+      // from — nested/target, not dir/target.
+      const physical = makeGitDir(join(dir, 'nested', 'target'))
+      mkdirSync(join(dir, 'nested', 'checkout'), { recursive: true })
+      symlinkSync(join(dir, 'nested', 'checkout'), join(dir, 'link'))
+      const pointer = join(dir, 'link', '.git')
+      writeFileSync(pointer, 'gitdir: ../target\n')
+
+      expect(gitFileDenyPaths(pointer, false)).toEqual([
+        pointer,
+        ...gitDirDenyPaths(join(dir, 'target'), false),
+        ...gitDirDenyPaths(physical, false),
+      ])
+    },
+  )
+
+  it('refuses to sandbox at all on a commondir past the size it reads', () => {
+    // git reads commondir whole and with no bound of its own, so one this
+    // large still names the git directory whose hooks a commit here runs.
+    const worktreeGitDir = makeGitDir(join(dir, 'wt.git'))
+    writeFileSync(
+      join(worktreeGitDir, 'commondir'),
+      '../main.git'.padEnd(1024 * 1024 + 1, '\n'),
+    )
+    const pointer = makePointer('wt-checkout', worktreeGitDir)
+
+    expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
+  })
+
+  it.if(isLinux)(
+    'hands the monitor plain deny paths for a repository it cannot read',
+    () => {
+      // The violation monitor starts once for the session, so one
+      // repository whose metadata cannot be resolved must not take the whole
+      // start-up with it. Every wrap in it is still refused.
+      const worktreeGitDir = makeGitDir(join(dir, 'wt.git'))
+      writeFileSync(
+        join(worktreeGitDir, 'commondir'),
+        '../main.git'.padEnd(1024 * 1024 + 1, '\n'),
+      )
+      const pointer = makePointer('wt-checkout', worktreeGitDir)
+      const checkout = join(dir, 'wt-checkout')
+      const originalCwd = process.cwd()
+      process.chdir(checkout)
+      try {
+        expect(() => linuxGetCwdMandatoryDenyPaths(false)).toThrow(
+          GitMetadataError,
+        )
+
+        const monitored = linuxGetMonitorCwdDenyPaths(false)
+
+        expect(monitored).toContain(pointer)
+        expect(monitored).toContain(join(checkout, '.bashrc'))
+      } finally {
+        process.chdir(originalCwd)
+      }
+    },
+  )
+
+  it.if(!isWindows)(
+    'does not block on a FIFO left where a git directory keeps its commondir',
+    () => {
+      const gitDir = makeGitDir(join(dir, 'gitdir'))
+      expect(spawnSync('mkfifo', [join(gitDir, 'commondir')]).status).toBe(0)
+      const pointer = makePointer('checkout', '../gitdir')
+
+      expect(gitFileDenyPaths(pointer, false)).toEqual([
+        pointer,
+        ...gitDirDenyPaths(gitDir, false),
+      ])
+    },
+  )
+
+  it.if(!isWindows)(
+    'does not block on a FIFO left where a pointer file goes',
+    () => {
+      mkdirSync(join(dir, 'checkout'), { recursive: true })
+      const pointer = join(dir, 'checkout', '.git')
+      expect(spawnSync('mkfifo', [pointer]).status).toBe(0)
+
+      expect(gitFileDenyPaths(pointer, false)).toEqual([pointer])
+    },
+  )
+
+  it('recognises a submodule git directory without a HEAD', () => {
+    const gitDir = join(dir, 'modules', 'lib')
+    mkdirSync(join(gitDir, 'hooks'), { recursive: true })
+
+    expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
+      gitDirs: [gitDir],
+      unreadableDirs: [],
+    })
+  })
+
+  it('walks a submodule name that spans several segments, and nested ones', () => {
+    const outer = makeGitDir(join(dir, 'modules', 'vendor', 'lib'))
+    const inner = makeGitDir(join(outer, 'modules', 'dep'))
+
+    const scan = submoduleGitDirs(join(dir, 'modules'))
+    expect(scan.gitDirs.sort()).toEqual([outer, inner].sort())
+  })
+
+  it.if(!isWindows)('follows a symlinked entry under modules', () => {
+    const gitDir = makeGitDir(join(dir, 'elsewhere'))
+    mkdirSync(join(dir, 'modules'), { recursive: true })
+    symlinkSync(gitDir, join(dir, 'modules', 'lib'))
+
+    expect(submoduleGitDirs(join(dir, 'modules')).gitDirs).toEqual([
+      join(dir, 'modules', 'lib'),
+    ])
+  })
+
+  it.if(!isWindows && process.getuid?.() !== 0)(
+    'denies a directory under modules it could not list',
+    () => {
+      const locked = join(dir, 'modules', 'locked')
+      makeGitDir(join(locked, 'deep'))
+      chmodSync(locked, 0o000)
+      try {
+        const scan = submoduleGitDirs(join(dir, 'modules'))
+        expect(scan.gitDirs).toEqual([])
+        expect(scan.unreadableDirs).toEqual([locked])
+      } finally {
+        chmodSync(locked, 0o755)
+      }
+    },
+  )
+
+  /** The directory the walk stops at: MAX_SUBMODULE_WALK_DEPTH levels down. */
+  function boundDir(): string {
+    return join(
+      dir,
+      'modules',
+      ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
+    )
+  }
+
+  it.each([
+    // A git directory below the bound is never seen, so what the walk would
+    // have descended into is denied whole in its place.
+    ['a plain directory', false, (bound: string) => bound],
+    // When the bound directory is a git directory itself it is BOTH: its own
+    // hooks and config are denied by path, and only the `modules` beneath it
+    // is denied whole — denying the git directory would take its objects,
+    // refs and index with it and stop git working in that submodule.
+    ['a git directory', true, (bound: string) => join(bound, 'modules')],
+  ])(
+    'stops the modules walk at its depth bound, with %s there',
+    (_label, boundIsGitDir, denied) => {
+      const bound = boundDir()
+      if (boundIsGitDir) makeGitDir(bound)
+      makeGitDir(join(bound, 'deep'))
+
+      expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
+        gitDirs: boundIsGitDir ? [bound] : [],
+        unreadableDirs: [denied(bound)],
+      })
+    },
+  )
+
+  it.if(isLinux)(
+    'keeps a bound git directory writable except for its hooks, config and modules',
+    async () => {
+      const checkout = join(dir, 'repo')
+      const gitDir = makeGitDir(join(checkout, '.git'))
+      const bound = join(
+        gitDir,
+        'modules',
+        ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
+      )
+      makeGitDir(bound)
+      mkdirSync(join(bound, 'objects'), { recursive: true })
+
+      const originalCwd = process.cwd()
+      process.chdir(checkout)
+      try {
+        const wrap = (command: string): Promise<string> =>
+          wrapCommandWithSandboxLinux({
+            command,
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+
+        // The covering deny is the `modules` beneath it, not the git directory
+        // itself: denying that whole would take its objects, refs and index.
+        // An ancestor pin spells that same self-bind, so where it sits is
+        // what tells the two apart: pins are spliced in before the write
+        // root's own bind, which makes the tree writable again, and a deny
+        // bind is emitted after it.
+        const command = await wrap('true')
+        const writeRootBind = indexOfMount(
+          command,
+          '--bind',
+          checkout,
+          checkout,
+        )
+        expect(writeRootBind).toBeGreaterThan(-1)
+        expect(
+          lastIndexOfMount(command, '--ro-bind', bound, bound),
+        ).toBeLessThan(writeRootBind)
+        expect(command).toContain(join(bound, 'modules'))
+        expect(command).toContain(`--ro-bind ${join(bound, 'hooks')} `)
+
+        // Where bwrap can run, prove it: what git needs writable in that
+        // submodule still is, and what makes a write into code is not.
+        if (bwrapCanNamespace()) {
+          const result = spawnSync(
+            await wrap(
+              `sh -c 'echo o > ${join(bound, 'objects', 'x')} && ` +
+                `! echo h > ${join(bound, 'hooks', 'x')} && ` +
+                `! echo c > ${join(bound, 'config')} && ` +
+                `! mkdir -p ${join(bound, 'modules', 'sub')} && ` +
+                `echo SRT_BOUND_OK'`,
+            ),
+            { shell: true, encoding: 'utf8', timeout: 30000, cwd: checkout },
+          )
+          expect(result.stdout).toContain('SRT_BOUND_OK')
+        }
+      } finally {
+        cleanupBwrapMountPoints({ force: true })
+        process.chdir(originalCwd)
+      }
+    },
+    60000,
+  )
+
+  it('denies the bound git directory by pattern on macOS, without contradiction', () => {
+    const checkout = join(dir, 'repo')
+    const gitDir = makeGitDir(join(checkout, '.git'))
+    const bound = join(
+      gitDir,
+      'modules',
+      ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
+    )
+    makeGitDir(bound)
+
+    const originalCwd = process.cwd()
+    process.chdir(checkout)
+    try {
+      // Profile generation is pure string building, so this runs anywhere.
+      const profile = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+      })
+      expect(profile).toContain(`(subpath "${join(bound, 'modules')}")`)
+      expect(profile).toContain(`(subpath "${join(bound, 'hooks')}")`)
+      // No deny covering the git directory whole, which would take its
+      // objects, refs and index with it.
+      expect(profile).not.toContain(`(subpath "${bound}")`)
+    } finally {
+      process.chdir(originalCwd)
+    }
+  })
+})
+/**
+ * Denying a path that is not there means mounting something at it, and two of
+ * these the host's git reads back: it refuses to run at all against a
+ * `commondir` it cannot read, and neither a bound /dev/null nor an empty file
+ * is one. So these denies write their own mount point, holding what git
+ * concludes with no file there, and bind a read-only copy of the same bytes
+ * over it: the host's git keeps working for as long as the command runs, and
+ * the sandbox's does too.
+ */
+describe.if(isLinux)('Placeholders for the files git reads', () => {
+  /** Echoed by every command that runs for real, so nothing concludes
+   *  anything from a sandbox that never started. */
+  const BOOTED = 'BOOTED'
+  const LIVE = bwrapCanNamespace() && Bun.which('git') !== null
+  /** Enough to commit without a hook, an identity or a signature. */
+  const IDENT = [
+    '-c',
+    'user.name=t',
+    '-c',
+    'user.email=t@t',
+    '-c',
+    'commit.gpgsign=false',
+    '-c',
+    'core.hooksPath=/dev/null',
+  ]
+  let dir: string
+  const savedCwd = process.cwd()
+  const savedTmpdir = process.env.TMPDIR
+
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), 'git-redirect-')))
+  })
+
+  afterEach(() => {
+    process.chdir(savedCwd)
+    // Forced cleanup also empties the placeholder store, so no case here
+    // leaves one of its directories behind.
+    cleanupBwrapMountPoints({ force: true })
+    if (savedTmpdir === undefined) delete process.env.TMPDIR
+    else process.env.TMPDIR = savedTmpdir
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  /** A checkout whose `.git` git would accept, wrapped with it as the cwd. */
+  function makeCheckout(name: string): string {
+    const checkout = join(dir, name)
+    mkdirSync(join(checkout, '.git', 'hooks'), { recursive: true })
+    writeFileSync(join(checkout, '.git', 'HEAD'), 'ref: refs/heads/main')
+    writeFileSync(join(checkout, '.git', 'config'), '[core]\n')
+    return checkout
+  }
+
+  function wrapIn(
+    checkout: string,
+    command = 'true',
+    opts: { denyWithinAllow?: string[]; allowOnly?: string[] } = {},
+  ): Promise<string> {
+    process.chdir(checkout)
+    return wrapCommandWithSandboxLinux({
+      command,
+      needsNetworkRestriction: false,
+      allowAllUnixSockets: true,
+      readConfig: undefined,
+      writeConfig: {
+        allowOnly: opts.allowOnly ?? [checkout],
+        denyWithinAllow: opts.denyWithinAllow ?? [],
+      },
+    })
+  }
+
+  /**
+   * What bwrap is given to mount at `dest`, of the words `--flag src dest`.
+   * Throws where nothing is mounted there, so an assertion about the source
+   * cannot pass, or read as undefined, on a wrap that emitted no such mount.
+   */
+  function mountSource(command: string, dest: string): string {
+    const mount = lastMountAt(command, dest)
+    if (mount === undefined) {
+      throw new Error(`nothing is mounted at ${dest}`)
+    }
+    const [, source, mounted] = mount.split(' ')
+    if (source === undefined || mounted !== dest) {
+      throw new Error(`the mount at ${dest} has no source: ${mount}`)
+    }
+    return source
+  }
+
+  function git(
+    cwd: string,
+    args: string[],
+  ): { status: number | null; stdout: string } {
+    const result = spawnSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, LC_ALL: 'C' },
+    })
+    return { status: result.status, stdout: `${result.stdout}${result.stderr}` }
+  }
+
+  /** A repository with one commit, made by git itself. */
+  function gitRepo(name: string): string {
+    const repo = join(dir, name)
+    mkdirSync(repo, { recursive: true })
+    expect(
+      git(repo, ['-c', 'init.defaultBranch=main', 'init', '-q', '.']),
+    ).toMatchObject({ status: 0 })
+    writeFileSync(join(repo, 'index.js'), 'console.log(1)\n')
+    expect(git(repo, ['add', 'index.js'])).toMatchObject({ status: 0 })
+    expect(git(repo, [...IDENT, 'commit', '-q', '-m', 'one'])).toMatchObject({
+      status: 0,
+    })
+    return repo
+  }
+
+  async function waitFor(ready: () => boolean, what: string): Promise<void> {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      if (ready()) return
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    throw new Error(`timed out waiting for ${what}`)
+  }
+
+  it('binds a commondir that is not there from a placeholder holding "."', async () => {
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+
+    const source = mountSource(await wrapIn(checkout), commondir)
+
+    expect(source).not.toBe('/dev/null')
+    expect(readFileSync(source, 'utf8')).toBe('.\n')
+    // The mount point is this wrapper's own rather than the empty file
+    // bubblewrap would make: it is what the HOST's git reads meanwhile.
+    expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+  })
+
+  it('reads the placeholder off the file, not off the deny entry', async () => {
+    // A caller's own deny for the same file comes first and wins the dedup,
+    // so the decision has to be made from the path the entry resolves to:
+    // made from the entry's spelling, this one missed and bound /dev/null,
+    // and the repository lost every git command for the length of the wrap.
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+
+    const command = await wrapIn(checkout, 'true', {
+      denyWithinAllow: ['./.git/commondir/'],
+    })
+
+    expect(readFileSync(mountSource(command, commondir), 'utf8')).toBe('.\n')
+  })
+
+  it('binds a commondir that is there from itself', async () => {
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+    writeFileSync(commondir, '../..\n')
+
+    expect(mountSource(await wrapIn(checkout), commondir)).toBe(commondir)
+
+    cleanupBwrapMountPoints({ force: true })
+    expect(readFileSync(commondir, 'utf8')).toBe('../..\n')
+  })
+
+  it('takes its own mount point away, and a changed one never', async () => {
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+
+    await wrapIn(checkout)
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(commondir)).toBe(false)
+
+    // A mount point something has written a real redirect into is not this
+    // wrapper's to remove, the same way an empty one that gained content is
+    // not: the cleanup compares what is there with what it wrote.
+    await wrapIn(checkout)
+    writeFileSync(commondir, '../..\n')
+    cleanupBwrapMountPoints({ force: true })
+    expect(readFileSync(commondir, 'utf8')).toBe('../..\n')
+  })
+
+  it('repairs a commondir left empty rather than covering it', async () => {
+    // The shape bubblewrap's own ensure_file() leaves, which the wrap takes
+    // for a mount point an earlier sandbox left behind and covers with
+    // /dev/null — the one thing a commondir must never be covered with.
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+    writeFileSync(commondir, '', { mode: 0o444 })
+
+    const source = mountSource(await wrapIn(checkout), commondir)
+
+    expect(source).not.toBe('/dev/null')
+    expect(readFileSync(source, 'utf8')).toBe('.\n')
+    expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(commondir)).toBe(false)
+  })
+
+  it('binds a commondir already holding the placeholder from itself', async () => {
+    // What a killed process leaves: nothing in memory knows the file is a
+    // mount point, but nothing else writes exactly those bytes there, so
+    // the next wrap claims it, binds it from itself and removes it.
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+    writeFileSync(commondir, '.\n')
+
+    expect(mountSource(await wrapIn(checkout), commondir)).toBe(commondir)
+
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(commondir)).toBe(false)
+  })
+
+  it('leaves alone an empty config.worktree it did not leave there', async () => {
+    // An empty config.worktree reads as no worktree config at all, so one is
+    // legitimate and this wrapper never claims it — unless it has the shape
+    // bubblewrap leaves, which nothing writing a config on purpose does.
+    const checkout = makeCheckout('repo')
+    const legitimate = join(checkout, '.git', 'config.worktree')
+    writeFileSync(legitimate, '', { mode: 0o644 })
+
+    expect(mountSource(await wrapIn(checkout), legitimate)).toBe(legitimate)
+
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(legitimate)).toBe(true)
+
+    // The shape bubblewrap leaves, which nothing writing a config on
+    // purpose has: read-only, empty, one link.
+    chmodSync(legitimate, 0o444)
+    await wrapIn(checkout)
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(legitimate)).toBe(false)
+  })
+
+  it('leaves every other absent deny on /dev/null', async () => {
+    const checkout = makeCheckout('repo')
+
+    expect(mountSource(await wrapIn(checkout), join(checkout, '.bashrc'))).toBe(
+      '/dev/null',
+    )
+  })
+
+  it('mints one placeholder file for the process, not one per wrap', async () => {
+    process.env.TMPDIR = dir
+    const checkout = makeCheckout('repo')
+    const stores = (): string[] =>
+      readdirSync(dir).filter(entry =>
+        entry.startsWith(GIT_REDIRECT_STORE_PREFIX),
+      )
+    expect(stores()).toHaveLength(0)
+
+    for (let wrap = 0; wrap < 20; wrap++) {
+      await wrapIn(checkout)
+      // Not forced: the store is per process, so a batch of wraps ending
+      // must not empty it — and the mount point goes, so the next wrap
+      // takes the absent-path branch again.
+      cleanupBwrapMountPoints()
+    }
+
+    expect(stores()).toHaveLength(1)
+    // One file per distinct placeholder, whatever the number of wraps: the
+    // repository's absent commondir and its absent config.worktree.
+    expect(readdirSync(join(dir, stores()[0]!))).toHaveLength(2)
+  })
+
+  it('refuses the command when no placeholder can be written', async () => {
+    // Decided once, logged once, and fail-closed: /dev/null is the only
+    // deny left, and it costs the repository every git command. Refusing
+    // says so; sandboxing behind it would not.
+    const checkout = makeCheckout('repo')
+    // So that no deny needs the shared empty directory, whose own source
+    // this temp directory would break first.
+    mkdirSync(join(checkout, '.claude'))
+    const notADirectory = join(dir, 'not-a-directory')
+    writeFileSync(notADirectory, '')
+    process.env.TMPDIR = notADirectory
+
+    const refusal = await wrapIn(checkout).then(
+      () => undefined,
+      (err: unknown) => err,
+    )
+
+    expect(refusal).toBeInstanceOf(LinuxSandboxProfileError)
+    expect((refusal as LinuxSandboxProfileError).code).toBe(
+      'deny_placeholder_unavailable',
+    )
+  })
+
+  it.if(LIVE)(
+    'keeps the placeholder out of the reach of the sandboxed command',
+    async () => {
+      // The store sits under $TMPDIR, which is routinely inside an allowed
+      // write path; the bind exposes the source file itself, so a command
+      // able to rewrite it would choose what git reads at the denied path.
+      process.env.TMPDIR = dir
+      const repo = gitRepo('repo')
+      const commondir = join(repo, '.git', 'commondir')
+      const source = mountSource(
+        await wrapIn(repo, 'true', {
+          allowOnly: [repo, dir],
+        }),
+        commondir,
+      )
+      cleanupBwrapMountPoints()
+
+      const probe = [
+        `echo ${BOOTED}`,
+        `chmod 666 ${source} 2>&1 || echo CHMOD_REFUSED`,
+        `echo poison > ${source} 2>&1 || echo WRITE_REFUSED`,
+        `cat ${source}`,
+        `git rev-parse --git-common-dir`,
+      ].join('; ')
+      const command = await wrapIn(repo, probe, { allowOnly: [repo, dir] })
+      // Memoised by content, so the command names the source this wrap binds.
+      expect(mountSource(command, commondir)).toBe(source)
+
+      const run = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 30000,
+        cwd: repo,
+        env: { ...process.env, LC_ALL: 'C' },
+      })
+      const output = `${run.stdout}${run.stderr}`
+
+      expect(output).toContain(BOOTED)
+      expect(output).toContain('Read-only file system')
+      expect(output).toContain('CHMOD_REFUSED')
+      expect(output).toContain('WRITE_REFUSED')
+      expect(output).not.toContain('poison')
+      // git still resolves its own git directory as its common directory.
+      expect(output).toContain(join(repo, '.git'))
+    },
+  )
+
+  it.if(LIVE)(
+    "keeps the host's git working while a wrapped command runs",
+    async () => {
+      const sub = gitRepo('sub')
+      const repo = gitRepo('repo')
+      expect(
+        git(repo, [
+          '-c',
+          'protocol.file.allow=always',
+          ...IDENT,
+          'submodule',
+          'add',
+          '-q',
+          sub,
+          'lib',
+        ]),
+      ).toMatchObject({ status: 0 })
+      expect(git(repo, [...IDENT, 'commit', '-q', '-m', 'lib'])).toMatchObject({
+        status: 0,
+      })
+      expect(
+        git(repo, ['worktree', 'add', '-q', join(dir, 'wt')]),
+      ).toMatchObject({ status: 0 })
+      const commondir = join(repo, '.git', 'commondir')
+      const submoduleCommondir = join(
+        repo,
+        '.git',
+        'modules',
+        'lib',
+        'commondir',
+      )
+
+      // Runs until the host releases it, so the host's git is exercised with
+      // the sandbox up and the mount points in place.
+      const command = await wrapIn(
+        repo,
+        `echo ${BOOTED} > up; i=0; while [ ! -f release ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done; echo ${BOOTED}`,
+      )
+      const child = spawn(command, {
+        shell: true,
+        cwd: repo,
+        stdio: 'ignore',
+      })
+      try {
+        await waitFor(
+          () => existsSync(join(repo, 'up')),
+          'the sandbox to start',
+        )
+
+        // Both mount points are on the host, holding a redirect git accepts.
+        expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+        expect(readFileSync(submoduleCommondir, 'utf8')).toBe('.\n')
+        for (const args of [
+          ['status', '--porcelain'],
+          ['log', '--oneline'],
+          ['worktree', 'list'],
+          ['rev-parse', '--git-common-dir'],
+        ]) {
+          expect({ args, ...git(repo, args) }).toMatchObject({ status: 0 })
+        }
+        expect(
+          git(repo, [
+            ...IDENT,
+            'commit',
+            '--allow-empty',
+            '-q',
+            '-m',
+            'during',
+          ]),
+        ).toMatchObject({ status: 0 })
+        expect(git(join(repo, 'lib'), ['status', '--porcelain'])).toMatchObject(
+          {
+            status: 0,
+          },
+        )
+      } finally {
+        writeFileSync(join(repo, 'release'), '')
+        await new Promise(resolve => child.on('close', resolve))
+      }
+      expect(child.exitCode).toBe(0)
+
+      cleanupBwrapMountPoints()
+      expect(existsSync(commondir)).toBe(false)
+      expect(existsSync(submoduleCommondir)).toBe(false)
+      expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
+    },
+  )
+
+  it.if(LIVE)(
+    'leaves a killed wrap behind a commondir git reads, and repairs an empty one',
+    async () => {
+      const repo = gitRepo('repo')
+      const commondir = join(repo, '.git', 'commondir')
+
+      // What a killed process leaves now: the host's git works on it, and
+      // the next wrap takes it away.
+      writeFileSync(commondir, '.\n')
+      expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
+      expect(git(repo, ['log', '--oneline'])).toMatchObject({ status: 0 })
+      await wrapIn(repo)
+      cleanupBwrapMountPoints()
+      expect(existsSync(commondir)).toBe(false)
+
+      // What an older release leaves: git refuses every command in the
+      // repository until the next wrap rewrites it.
+      writeFileSync(commondir, '', { mode: 0o444 })
+      const broken = git(repo, ['status', '--porcelain'])
+      expect(broken.status).not.toBe(0)
+      expect(broken.stdout).toContain('commondir')
+
+      await wrapIn(repo)
+      expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+      expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
+      cleanupBwrapMountPoints()
+      expect(existsSync(commondir)).toBe(false)
+      expect(git(repo, ['status', '--porcelain'])).toMatchObject({ status: 0 })
+    },
+  )
+
+  it.if(LIVE)(
+    'leaves git working across wraps, and the commondir unwritable',
+    async () => {
+      const repo = gitRepo('repo')
+
+      const run = (command: string) =>
+        spawnSync(command, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 30000,
+          cwd: repo,
+          env: { ...process.env, LC_ALL: 'C' },
+        })
+      // By name: the dotfile denies stub their absent paths, and the mount
+      // points bwrap leaves for them are not files `git add -A` can stage.
+      const commit = (file: string) =>
+        `echo ${BOOTED} && git add ${file} && git ${IDENT.join(' ')} ` +
+        `commit -q -m ${file} && echo COMMIT_OK`
+
+      writeFileSync(join(repo, 'one.js'), 'console.log(1)\n')
+      const first = run(await wrapIn(repo, commit('one.js')))
+      expect(first.stdout).toContain(BOOTED)
+      expect(first.status).toBe(0)
+      expect(first.stdout).toContain('COMMIT_OK')
+
+      // No cleanupBwrapMountPoints() in between: the first wrap's mount point
+      // for the absent commondir is still sitting in the git directory, and
+      // the second wrap's scan finds it there.
+      writeFileSync(join(repo, 'two.js'), 'console.log(2)\n')
+      const second = run(await wrapIn(repo, commit('two.js')))
+      expect(second.stdout).toContain(BOOTED)
+      expect(second.status).toBe(0)
+      expect(second.stdout).toContain('COMMIT_OK')
+
+      const write = run(
+        await wrapIn(repo, 'echo ../decoy > .git/commondir || echo DENIED'),
+      )
+      expect(write.stdout).toContain('DENIED')
+      expect(existsSync(join(repo, '.git', 'commondir'))).toBe(true)
+      cleanupBwrapMountPoints({ force: true })
+      expect(existsSync(join(repo, '.git', 'commondir'))).toBe(false)
+    },
+  )
 })
