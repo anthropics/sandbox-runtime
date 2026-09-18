@@ -629,6 +629,41 @@ static void install_forwarders(pid_t target) {
 }
 
 /*
+ * Fork, and return only in the child; the parent stays behind as a relay
+ * that forwards signals and exits with the child's status. Used when
+ * unshare(CLONE_NEWUSER) fails with EINVAL: it implies CLONE_THREAD, which
+ * the kernel refuses while the thread group is non-empty — a multicall
+ * embedder (seccomp.argv0) that just joined a helper thread, or still runs
+ * one. The forked child is single-threaded, and fork() (unlike a raw clone)
+ * runs the embedder's atfork handlers, so libc state stays consistent.
+ * `fds` are the parent's copies of descriptors the child now owns.
+ */
+static void continue_in_forked_child(const int *fds, int nfds) {
+    pid_t c = fork();
+    if (c < 0) {
+        die("apply-seccomp: fork");
+    }
+    if (c == 0) {
+        return;
+    }
+    for (int i = 0; i < nfds; i++) {
+        if (fds[i] >= 0) close(fds[i]);
+    }
+    install_forwarders(c);
+    int status;
+    for (;;) {
+        pid_t r = waitpid(c, &status, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r < 0) die("apply-seccomp: waitpid");
+        break;
+    }
+    if (WIFEXITED(status)) {
+        _exit(WEXITSTATUS(status));
+    }
+    _exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1);
+}
+
+/*
  * Wait for `main_child`, reaping any other children that exit first.
  * Returns as soon as `main_child` terminates — the caller then _exit()s,
  * which as PID 1 tears down the namespace and SIGKILLs any stragglers.
@@ -716,6 +751,20 @@ int main(int argc, char *argv[]) {
         uid_t uid = geteuid();
         gid_t gid = getegid();
 
+        /* Before raising dumpable below, so a relay left behind by the
+         * EINVAL fallback keeps the process's original dumpable state;
+         * unshare(CLONE_NEWUSER) itself does not change it. */
+        if (unshare(CLONE_NEWUSER) < 0) {
+            if (errno != EINVAL) {
+                die("apply-seccomp: unshare(CLONE_NEWUSER)");
+            }
+            const int fds[] = { sp[0], sp[1], host_proc_fd };
+            continue_in_forked_child(fds, 3);
+            if (unshare(CLONE_NEWUSER) < 0) {
+                die("apply-seccomp: unshare(CLONE_NEWUSER)");
+            }
+        }
+
         /* If this binary was exec'd without read permission (e.g. installed
          * mode 0111), the kernel marked the process non-dumpable, which
          * makes /proc/self/{setgroups,uid_map,gid_map} root-owned, so the
@@ -733,9 +782,6 @@ int main(int argc, char *argv[]) {
         int dumpable = prctl(PR_GET_DUMPABLE);
         (void)prctl(PR_SET_DUMPABLE, 1);
 
-        if (unshare(CLONE_NEWUSER) < 0) {
-            die("apply-seccomp: unshare(CLONE_NEWUSER)");
-        }
         if (write_file("/proc/self/setgroups", "deny") < 0) {
             die("apply-seccomp: write /proc/self/setgroups "
                 "(nested userns is capability-restricted; "
