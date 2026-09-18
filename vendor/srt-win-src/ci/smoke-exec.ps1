@@ -55,6 +55,16 @@ function Write-MachineSnapshot {
       $Tag, $cpu.Name, $cpu.NumberOfLogicalProcessors,
       ($os.TotalVisibleMemorySize / 1KB), ($os.FreePhysicalMemory / 1KB),
       $os.BuildNumber, $ubr, ((Get-Date) - $os.LastBootUpTime).TotalSeconds)
+    Write-BusySample $Tag
+  } catch {
+    Write-Host "diag[$Tag]: snapshot failed: $_"
+  }
+}
+
+# The processes that used the most CPU over one second. Names and ids only.
+function Write-BusySample {
+  param([string] $Tag)
+  try {
     $a = @{}
     foreach ($q in Get-Process) { $a[$q.Id] = $q.CPU }
     Start-Sleep -Seconds 1
@@ -69,7 +79,7 @@ function Write-MachineSnapshot {
           $Tag, $_.Id, $_.Name, $_.Delta)
       }
   } catch {
-    Write-Host "diag[$Tag]: snapshot failed: $_"
+    Write-Host "diag[$Tag]: busy sample failed: $_"
   }
 }
 
@@ -169,7 +179,16 @@ function RExec {
   # WaitForExit.
   $so = $p.StandardOutput.ReadToEndAsync()
   $se = $p.StandardError.ReadToEndAsync()
-  if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+  # Wait in 5s slices. A child still running after a slice gets a busy-process
+  # sample in the log, so a slow launch shows what the machine was doing
+  # during it; a normal sub-5s row logs nothing extra.
+  $waited = [System.Diagnostics.Stopwatch]::StartNew()
+  $exited = $false
+  while (-not ($exited = $p.WaitForExit(5000))) {
+    if ($waited.Elapsed.TotalSeconds -ge $TimeoutSec) { break }
+    Write-BusySample ("waiting {0:n0}s" -f $waited.Elapsed.TotalSeconds)
+  }
+  if (-not $exited) {
     # Report through the host, not the exception: the error view truncates a
     # long message, and the child's output and the processes it got as far as
     # starting are what say where it stopped.
