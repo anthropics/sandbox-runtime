@@ -1288,6 +1288,13 @@ function globPositions(
 }
 
 /**
+ * How many symbolic links one path lookup may cross (Linux's MAXSYMLINKS):
+ * past it the lookup fails with ELOOP for every process, so a spelling
+ * through more links than this names nothing a deny has to cover.
+ */
+const MAX_LINKS_IN_A_PATH = 40
+
+/**
  * The literal directory a glob's walk starts from: the static prefix before
  * the pattern's first glob character, without its last path component when
  * that component is not a directory of its own. '' or '/' means the pattern
@@ -1358,10 +1365,6 @@ export function walkGlobPattern(
       ? new RegExp(globToRegex(directoryForm), flags)
       : undefined
   const positions = globPositions(normalizedPattern, flags)
-  // A pattern that does not split is matched against real paths only: no two
-  // names for a directory can be told apart, so none but its own is listed.
-  const followLinks =
-    opts.followSymlinkedDirectories === true && positions.splits
   if (opts.followSymlinkedDirectories && !positions.splits) {
     logForDebugging(
       `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time, so it is matched against real paths only and not through symlinked directories`,
@@ -1375,10 +1378,15 @@ export function walkGlobPattern(
   // sets of positions are as many as the pattern has, whatever the tree
   // holds. One readdir per directory rather than readdirSync's `recursive`
   // option, so an unreadable subtree costs only itself, not the whole
-  // pattern. Every filesystem call names a real path — a spelling is only
-  // ever matched — so a chain of links cannot fail one (ELOOP). A directory
-  // that is not there is not a case of its own: the listing below tells an
-  // absent directory from one that must be denied whole.
+  // pattern. A directory that is not there is not a case of its own: the
+  // listing below tells an absent directory from one that must be denied
+  // whole.
+  //
+  // Directories are listed in order of the links their spelling crosses, so
+  // each is first reached by a spelling that crosses the fewest. That keeps
+  // {@link MAX_LINKS_IN_A_PATH} exact — a directory given up on has no
+  // spelling within it — and keeps the spellings, which every entry is
+  // matched under, short whatever chain of links the tree holds.
   type Frame = {
     dir: string
     /** `dir` with every symlink resolved. */
@@ -1386,7 +1394,25 @@ export function walkGlobPattern(
     positions: readonly number[]
   }
   const listed = new Set<string>()
-  const pending: Frame[] = []
+  let pending: Frame[] = []
+  /** Reached through one more link than the directories in `pending`. */
+  let throughALink: Frame[] = []
+  /** A filesystem call on a real path, and on the spelling that led to it
+   *  when that fails. The real path crosses no link, so a long chain of them
+   *  cannot fail the call (ELOOP); a spelling through a link can be short
+   *  enough to name where the real path is not (ENAMETOOLONG). */
+  const onRealPath = <T>(
+    real: string,
+    spelled: string,
+    call: (p: string) => T,
+  ): T => {
+    try {
+      return call(real)
+    } catch (err) {
+      if (spelled === real) throw err
+      return call(spelled)
+    }
+  }
   /** Where a symlink leads and whether that is a directory. 'absent' when
    *  nothing is there to descend into; 'uninspectable' when something is and
    *  it could not be looked at, which is not the same thing: a same-uid
@@ -1397,15 +1423,15 @@ export function walkGlobPattern(
     | 'absent'
     | 'uninspectable'
   const linkTargets = new Map<string, LinkTarget>()
-  const linkTargetOf = (realLinkPath: string): LinkTarget => {
+  const linkTargetOf = (linkPath: string, realLinkPath: string): LinkTarget => {
     const cached = linkTargets.get(realLinkPath)
     if (cached !== undefined) return cached
     let target: LinkTarget
     try {
-      target = {
-        isDirectory: fs.statSync(realLinkPath).isDirectory(),
-        real: fs.realpathSync(realLinkPath),
-      }
+      target = onRealPath(realLinkPath, linkPath, p => ({
+        isDirectory: fs.statSync(p).isDirectory(),
+        real: fs.realpathSync(p),
+      }))
     } catch (err) {
       target = isAbsenceErrno(err) ? 'absent' : 'uninspectable'
     }
@@ -1425,93 +1451,113 @@ export function walkGlobPattern(
     real: baseReal,
     positions: baseDir.split('/').reduce(positions.next, positions.start),
   })
-  for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
-    const { dir, real } = frame
-    const state = `${real}\0${frame.positions.join()}`
-    if (listed.has(state)) continue
-    listed.add(state)
-    let entries: fs.Dirent[]
-    try {
-      entries = fs.readdirSync(real, { withFileTypes: true })
-    } catch (err) {
-      const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
-      logForDebugging(
-        `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
-        { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
-      )
-      if (errorCode !== 'ENOENT') {
-        walk.unlisted.push(dir)
-        if (real !== dir) walk.realOf.set(dir, real)
-      }
-      continue
-    }
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name)
-      const realPath = path.join(real, entry.name)
-      const candidate = toForwardSlashes(fullPath)
-      const isMatch = regex.test(candidate)
-      if (isMatch) walk.matches.push(fullPath)
-      // Empty when the pattern can match nothing beneath this entry.
-      const beneath = positions.next(frame.positions, entry.name)
-      if (entry.isDirectory()) {
-        const isDirectoryMatch = directoryRegex?.test(candidate) === true
-        if (isDirectoryMatch) walk.directoryMatches.push(fullPath)
-        if ((isMatch || isDirectoryMatch) && realPath !== fullPath) {
-          walk.realOf.set(fullPath, realPath)
-        }
-        if (beneath.length > 0) {
-          pending.push({ dir: fullPath, real: realPath, positions: beneath })
-        }
-        continue
-      }
-      if (!entry.isSymbolicLink()) {
-        if (isMatch && realPath !== fullPath) {
-          walk.realOf.set(fullPath, realPath)
-        }
-        continue
-      }
-      walk.symlinks.add(fullPath)
-      // Only the read-deny expansion lists through a symlinked directory: it
-      // has to cover what the pattern reaches by every name. The allowRead
-      // expansion and the Windows ACL stamp take the link itself and stop
-      // there, as the allow bind and the ACL they feed do — Windows does not
-      // follow reparse points at all.
-      if (!followLinks) continue
-      const isDirectoryFormCandidate = directoryRegex?.test(candidate) === true
-      if (!isMatch && !isDirectoryFormCandidate && beneath.length === 0) {
-        continue
-      }
-      const target = linkTargetOf(realPath)
-      if (target === 'absent') continue
-      if (target === 'uninspectable') {
-        // Where it leads is unknown, so it gets no real location and nothing
-        // is listed through it — but it is still a match, and a deny
-        // expansion covers it under its own spelling.
-        walk.uninspectableLinks.add(fullPath)
-        if (isDirectoryFormCandidate) walk.directoryMatches.push(fullPath)
-        continue
-      }
-      if (isMatch) walk.realOf.set(fullPath, target.real)
-      if (!target.isDirectory) continue
-      if (isDirectoryFormCandidate) {
-        walk.directoryMatches.push(fullPath)
-        walk.realOf.set(fullPath, target.real)
-      }
-      if (beneath.length === 0) continue
-      // A link that leads up — to this directory or above it, or to the
-      // walk's base or above it — is not listed through: beneath it is a tree
-      // the pattern was never aimed at (`/`, a home directory).
-      if (
-        isAtOrUnder(real, target.real) ||
-        isAtOrUnder(baseReal, target.real)
-      ) {
-        logForDebugging(
-          `[Sandbox] Not following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}: it leads back up the tree`,
+  for (let links = 0; links <= MAX_LINKS_IN_A_PATH; links++) {
+    for (
+      let frame = pending.pop();
+      frame !== undefined;
+      frame = pending.pop()
+    ) {
+      const { dir, real } = frame
+      const state = `${real}\0${frame.positions.join()}`
+      if (listed.has(state)) continue
+      listed.add(state)
+      let entries: fs.Dirent[]
+      try {
+        entries = onRealPath(real, dir, p =>
+          fs.readdirSync(p, { withFileTypes: true }),
         )
+      } catch (err) {
+        const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+        logForDebugging(
+          `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
+          { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
+        )
+        if (errorCode !== 'ENOENT') {
+          walk.unlisted.push(dir)
+          if (real !== dir) walk.realOf.set(dir, real)
+        }
         continue
       }
-      pending.push({ dir: fullPath, real: target.real, positions: beneath })
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name)
+        const realPath = path.join(real, entry.name)
+        const candidate = toForwardSlashes(fullPath)
+        const isMatch = regex.test(candidate)
+        if (isMatch) walk.matches.push(fullPath)
+        if (entry.isDirectory()) {
+          const beneath = positions.next(frame.positions, entry.name)
+          const isDirectoryMatch = directoryRegex?.test(candidate) === true
+          if (isDirectoryMatch) walk.directoryMatches.push(fullPath)
+          if ((isMatch || isDirectoryMatch) && realPath !== fullPath) {
+            walk.realOf.set(fullPath, realPath)
+          }
+          if (beneath.length > 0) {
+            pending.push({ dir: fullPath, real: realPath, positions: beneath })
+          }
+          continue
+        }
+        if (!entry.isSymbolicLink()) {
+          if (isMatch && realPath !== fullPath) {
+            walk.realOf.set(fullPath, realPath)
+          }
+          continue
+        }
+        walk.symlinks.add(fullPath)
+        // Only the read-deny expansion lists through a symlinked directory: it
+        // has to cover what the pattern reaches by every name. The allowRead
+        // expansion and the Windows ACL stamp take the link itself and stop
+        // there, as the allow bind and the ACL they feed do — Windows does not
+        // follow reparse points at all.
+        if (!opts.followSymlinkedDirectories) continue
+        const isDirectoryFormCandidate =
+          directoryRegex?.test(candidate) === true
+        // A pattern that does not split is not listed through a link: no two
+        // names for a directory can be told apart, so none but its own is
+        // listed. A link that is itself a match still denies what it leads to.
+        const beneath = positions.splits
+          ? positions.next(frame.positions, entry.name)
+          : []
+        if (!isMatch && !isDirectoryFormCandidate && beneath.length === 0) {
+          continue
+        }
+        const target = linkTargetOf(fullPath, realPath)
+        if (target === 'absent') continue
+        if (target === 'uninspectable') {
+          // Where it leads is unknown, so it gets no real location and nothing
+          // is listed through it — but it is still a match, and a deny
+          // expansion covers it under its own spelling.
+          walk.uninspectableLinks.add(fullPath)
+          if (isDirectoryFormCandidate) walk.directoryMatches.push(fullPath)
+          continue
+        }
+        if (isMatch) walk.realOf.set(fullPath, target.real)
+        if (!target.isDirectory) continue
+        if (isDirectoryFormCandidate) {
+          walk.directoryMatches.push(fullPath)
+          walk.realOf.set(fullPath, target.real)
+        }
+        if (beneath.length === 0) continue
+        // A link that leads up — to this directory or above it, or to the
+        // walk's base or above it — is not listed through: beneath it is a tree
+        // the pattern was never aimed at (`/`, a home directory).
+        if (
+          isAtOrUnder(real, target.real) ||
+          isAtOrUnder(baseReal, target.real)
+        ) {
+          logForDebugging(
+            `[Sandbox] Not following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}: it leads back up the tree`,
+          )
+          continue
+        }
+        throughALink.push({
+          dir: fullPath,
+          real: target.real,
+          positions: beneath,
+        })
+      }
     }
+    pending = throughALink
+    throughALink = []
   }
 
   return walk

@@ -470,28 +470,57 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
-  it('lists a directory where it really is, however many links spell it', () => {
-    // d0/next -> d1, d1/next -> d2, …: the last directory is spelled through
-    // more links than one path lookup may cross (ELOOP past 40). Listed by
-    // that spelling it would read as a directory that cannot be listed, and
-    // a deny would hide it whole; it is listed where it really is.
+  it('follows a chain of links as far as a path lookup can, and no further', () => {
+    // d0/next -> d1, d1/next -> d2, …: one path lookup crosses at most 40
+    // links, so d40 is the last directory that has a name under d0 at all.
+    // The ones past it are neither listed nor given up on and denied whole:
+    // the pattern has no usable name for anything in them.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-chain-')))
-    const links = 45
     try {
-      for (let i = 0; i <= links; i++) mkdirSync(join(root, `d${i}`))
-      for (let i = 0; i < links; i++) {
+      for (let i = 0; i <= 45; i++) {
+        mkdirSync(join(root, `d${i}`))
+        writeFileSync(join(root, `d${i}`, 'id.pem'), 'KEY')
+      }
+      for (let i = 0; i < 45; i++) {
         symlinkSync(join('..', `d${i + 1}`), join(root, `d${i}`, 'next'))
       }
-      writeFileSync(join(root, `d${links}`, 'id.pem'), 'KEY')
 
       const walk = walkGlobPattern(join(root, 'd0', '**/*.pem'), {
         followSymlinkedDirectories: true,
       })
 
       expect(walk.unlisted).toEqual([])
-      expect(walk.matches.map(m => walk.realOf.get(m) ?? m)).toEqual([
-        join(root, `d${links}`, 'id.pem'),
-      ])
+      expect(walk.matches.map(m => walk.realOf.get(m) ?? m).sort()).toEqual(
+        Array.from({ length: 41 }, (_, i) =>
+          join(root, `d${i}`, 'id.pem'),
+        ).sort(),
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reaches a directory by the spelling that crosses the fewest links', () => {
+    // d45 is at the end of a chain too long to follow, and one link away
+    // through d0/short. Whichever the walk meets first, the short spelling
+    // is a name for it, so what it holds is found.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-fewest-')))
+    try {
+      for (let i = 0; i <= 45; i++) mkdirSync(join(root, `d${i}`))
+      for (let i = 0; i < 45; i++) {
+        symlinkSync(join('..', `d${i + 1}`), join(root, `d${i}`, 'next'))
+      }
+      symlinkSync(join('..', 'd45'), join(root, 'd0', 'short'))
+      writeFileSync(join(root, 'd45', 'id.pem'), 'KEY')
+
+      const walk = walkGlobPattern(join(root, 'd0', '**/*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.matches).toEqual([join(root, 'd0', 'short', 'id.pem')])
+      expect(walk.realOf.get(walk.matches[0]!)).toBe(
+        join(root, 'd45', 'id.pem'),
+      )
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -600,6 +629,17 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         followSymlinkedDirectories: true,
       })
       expect(throughLink.matches).toEqual([])
+
+      // A link that is itself a match is still resolved, so that a deny
+      // lands on what it leads to.
+      symlinkSync(join('cfg', 'id.pem'), join(root, 'alias.pem'))
+      const matchedLink = walkGlobPattern(join(root, 'a**.pem'), {
+        followSymlinkedDirectories: true,
+      })
+      expect(matchedLink.matches).toEqual([join(root, 'alias.pem')])
+      expect(matchedLink.realOf.get(join(root, 'alias.pem'))).toBe(
+        join(root, 'cfg', 'id.pem'),
+      )
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
