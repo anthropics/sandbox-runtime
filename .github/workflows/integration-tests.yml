@@ -8,7 +8,7 @@ on:
 
 jobs:
   integration-tests:
-    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})
+    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})${{ matrix.probe && format(' probe {0}', matrix.probe) || '' }}
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -27,14 +27,15 @@ jobs:
           - arch: arm64
             runner: macos-14
             os: macos
-          # Windows legs build srt-win, run the Rust smoke scripts,
-          # then the TS integration suite (test/sandbox/winsrt.test.ts).
-          - arch: x86-64
-            runner: windows-latest
-            os: windows
-          - arch: arm64
-            runner: windows-11-arm
-            os: windows
+          # TEMPORARY, DO NOT MERGE: the Windows legs are removed and the Linux
+          # and macOS legs repeated, to collect intermittent POSIX failures
+          # faster. `probe` only changes the job and artifact names.
+          - { arch: x86-64, runner: ubuntu-latest,    os: linux, probe: 2 }
+          - { arch: x86-64, runner: ubuntu-latest,    os: linux, probe: 3 }
+          - { arch: arm64,  runner: ubuntu-24.04-arm, os: linux, probe: 2 }
+          - { arch: arm64,  runner: ubuntu-24.04-arm, os: linux, probe: 3 }
+          - { arch: x86-64, runner: macos-15-large,   os: macos, probe: 2 }
+          - { arch: arm64,  runner: macos-14,         os: macos, probe: 2 }
 
     steps:
       - name: Checkout code
@@ -222,7 +223,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.os }}-${{ matrix.arch }}
+          name: test-results-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.probe && format('-probe{0}', matrix.probe) || '' }}
           path: |
             test-results/
             *.log
