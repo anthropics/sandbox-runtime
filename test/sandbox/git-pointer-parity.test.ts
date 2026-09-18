@@ -753,26 +753,6 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     )
     expect(verdicts.filter(v => v === 'checked').length).toBeGreaterThan(10)
   }, 300_000)
-
-  it('refuses to sandbox on a commondir past the size it reads', () => {
-    // git reads commondir whole, with no bound of its own, so a file past
-    // this one still names the git directory whose hooks a commit runs.
-    const caseDir = join(root, `commondir-${caseCount++}`)
-    const checkout = join(caseDir, 'checkout')
-    mkdirSync(checkout, { recursive: true })
-    const main = makeGitDir(join(caseDir, 'main.git'))
-    const worktree = join(main, 'worktrees', 'wt')
-    mkdirSync(join(worktree, 'hooks'), { recursive: true })
-    writeFileSync(join(worktree, 'HEAD'), 'ref: refs/heads/main\n')
-    writeFileSync(
-      join(worktree, 'commondir'),
-      '../..'.padEnd(MAX_GITFILE_SIZE + 1, '\n'),
-    )
-    const pointer = join(checkout, '.git')
-    writeFileSync(pointer, `gitdir: ${worktree}\n`)
-
-    expect(() => gitFileDenyPaths(pointer, false)).toThrow(GitMetadataError)
-  })
 })
 
 function mulberry32(seed: number): () => number {

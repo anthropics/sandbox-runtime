@@ -961,7 +961,7 @@ function asProfileRefusal<T>(produce: () => T): T {
 const bwrapMountPoints = new Map<string, string | undefined>()
 
 /** Temp-directory prefix of the store below, so it is nobody else's. */
-export const GIT_REDIRECT_STORE_PREFIX = 'srt-gitredirect-'
+const GIT_REDIRECT_STORE_PREFIX = 'srt-gitredirect-'
 
 // The placeholders the git redirect denies bind over their mount points: one
 // file per distinct content for the life of the process, rewritten on each

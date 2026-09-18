@@ -75,6 +75,31 @@ describe('ripGrep', () => {
     }
   })
 
+  it('leaves the ripgrep config file out of every run', async () => {
+    // RIPGREP_CONFIG_PATH routinely points inside a project, at a file a
+    // sandboxed command can write; one --max-filesize line in it is a scan
+    // that lists nothing and reports no error for it.
+    const dir = mkdtempSync(join(tmpdir(), 'rg-noconfig-'))
+    try {
+      const script = join(dir, 'echo-args.cjs')
+      writeFileSync(
+        script,
+        "process.stdout.write(process.argv.slice(2).join('\\0') + '\\0')",
+      )
+
+      const results = await ripGrep(
+        ['--files'],
+        dir,
+        new AbortController().signal,
+        { command: process.execPath, args: [script] },
+      )
+
+      expect(results).toContain('--no-config')
+    } finally {
+      rmSync(dir, { recursive: true })
+    }
+  })
+
   it('rejects on exit code > 1', () => {
     expect(
       ripGrep(['--invalid-flag-xyz'], '.', new AbortController().signal),
@@ -113,9 +138,12 @@ describe('ripGrep', () => {
         const error = await ripGrep([], dir, new AbortController().signal, {
           command: '/bin/sh',
           // A complete record, then a truncated one, then a run that outlives
-          // the timeout. exec so the kill reaches whatever holds stdout.
+          // the timeout. exec so the kill reaches whatever holds stdout. The
+          // budget is far past what starting a shell and printing two records
+          // takes on any machine: cut fine, the output would be the empty
+          // prefix of a run that had not got to writing it yet.
           args: ['-c', 'printf "/found/a\\0/trunc"; exec sleep 30'],
-          timeoutMs: 200,
+          timeoutMs: 5_000,
         }).catch((e: unknown) => e)
 
         expect(error).toBeInstanceOf(RipgrepError)
@@ -124,6 +152,27 @@ describe('ripGrep', () => {
       } finally {
         rmSync(dir, { recursive: true })
       }
+    },
+    30_000,
+  )
+
+  it.if(!isWindows)(
+    'calls a kill that is not the timeout what it was',
+    async () => {
+      // Ctrl-C to the process group, an OOM kill: a run that ended inside
+      // the time it was given did not run out of it, and reporting one as
+      // the other tells the operator to look at the wrong thing. Both refuse
+      // the wrap upstream either way.
+      const error = await ripGrep([], '.', new AbortController().signal, {
+        command: '/bin/sh',
+        args: ['-c', 'kill -TERM $$'],
+        timeoutMs: 60_000,
+      }).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(RipgrepError)
+      expect((error as RipgrepError).timedOut).toBe(false)
+      expect((error as Error).message).toContain('SIGTERM')
+      expect((error as Error).message).toContain('inside the 60000 ms')
     },
   )
 

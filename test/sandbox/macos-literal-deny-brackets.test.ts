@@ -526,7 +526,9 @@ describe.if(!isWindows)(
       // A spelling sniffed as a pattern keeps its brackets verbatim, since
       // they are the glob syntax it is taken to be asking for. An anchored
       // pattern escapes the part of it the library built.
-      for (const regex of emittedRegexes(profile())) {
+      const regexes = emittedRegexes(profile())
+      expect(regexes.length).toBeGreaterThan(0)
+      for (const regex of regexes) {
         for (const opening of ['s[m/', 'u[n/', 'a[b/']) {
           expect(regex).not.toContain(opening)
         }
@@ -693,7 +695,7 @@ describe.if(!isWindows)(
       const regexes = emittedRegexes(wrap(tree, 'true'))
       const anchored = regexes.filter(regex => regex.startsWith(`^${anchor}/`))
       expect(anchored.length).toBeGreaterThan(0)
-      // `**\/.git/hooks/**` covers a nested repository's hooks under the real
+      // `**/.git/hooks` covers a nested repository's hooks under the real
       // working directory, and nothing under the two directories the bracket
       // class would have matched instead.
       const nested = join(tree.work, 'vendor/lib/.git/hooks/pre-commit')
