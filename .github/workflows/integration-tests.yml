@@ -69,13 +69,19 @@ jobs:
       # without an explicit elevation step.
       - name: Setup Rust (Windows)
         if: matrix.os == 'windows'
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain@stable, pinned by commit: the ref is a
+        # branch, so a tag-shaped `@stable` still runs whatever that
+        # branch points at today. The cache below is shared with
+        # release.yml, so this job's supply chain is the release's too.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
+          toolchain: stable
           components: clippy
 
       - name: Rust build cache (Windows)
         if: matrix.os == 'windows'
-        uses: Swatinem/rust-cache@v2
+        # Swatinem/rust-cache@v2.9.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: vendor/srt-win-src
           # Shared with release.yml so tag-ref release builds restore
@@ -281,11 +287,14 @@ jobs:
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin
-              curl -fsSL https://bun.sh/install | bash
+              # node and npm come from the image instead of a second piped
+              # installer, and bun is pinned to the version the rest of the
+              # matrix runs (oven-sh/setup-bun above). The tree carries a
+              # dozen bun-version-specific workarounds, so "whatever bun
+              # shipped this morning" is not the runtime under test.
+              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin nodejs npm
+              curl -fsSL https://bun.sh/install | bash -s bun-v1.3.14
               export PATH="$HOME/.bun/bin:$PATH"
-              curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-              apt-get install -y -qq nodejs
               npm ci
               npm run build:seccomp
               npm run build

@@ -66,8 +66,15 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # This job builds the helper that runs elevated on a user's machine,
+      # so both actions are pinned by commit: `@stable` and `@v2` are a
+      # branch and a moving major tag in third-party repositories.
+      # dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      # Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: vendor/srt-win-src
           # Same key as integration-tests.yml so releases (tag refs)
