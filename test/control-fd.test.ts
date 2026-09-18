@@ -431,13 +431,29 @@ describe.skipIf(isWindows)('--control-fd', () => {
 
     // Write to stdin (fd 0)
     const stdin = child.stdin as Writable
-    stdin.write('hello from stdin\n')
+    // TEMPORARY: what this side of the pipe saw, with ms since the spawn.
+    const t0 = Date.now()
+    const parentSide: string[] = []
+    const note = (what: string) =>
+      parentSide.push(`${Date.now() - t0}ms ${what}`)
+    stdin.on('error', err => note(`stdin error: ${err.message}`))
+    stdin.on('close', () => note('stdin close'))
+    stdin.on('finish', () => note('stdin finish'))
+    const accepted = stdin.write('hello from stdin\n', err =>
+      note(`write callback: ${err ? err.message : 'ok'}`),
+    )
+    note(`write() returned ${accepted}`)
 
     expect(await exited).toBe(0)
+    note(
+      `at exit: destroyed=${stdin.destroyed} writableEnded=${stdin.writableEnded} ` +
+        `writableLength=${stdin.writableLength}`,
+    )
     if (!stdout.join('').includes('GOT: hello from stdin')) {
       throw new Error(
         `stdin did not reach the child. stdout=${JSON.stringify(stdout.join(''))} ` +
-          `stderr=${JSON.stringify(stderr.join(''))}`,
+          `stderr=${JSON.stringify(stderr.join(''))} ` +
+          `parent side: ${JSON.stringify(parentSide)}`,
       )
     }
   })
