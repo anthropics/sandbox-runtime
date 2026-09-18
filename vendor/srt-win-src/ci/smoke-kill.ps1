@@ -51,9 +51,13 @@ Run @('install','--sublayer-guid',$Sublayer,'--proxy-port-range',$PortRange)
 # self-protect denies the owner query to a non-elevated caller.
 
 function Get-TreePids { param([int] $Root)
-  # Single-snapshot BFS over Win32_Process on ParentProcessId.
+  # Single-snapshot BFS over Win32_Process on ParentProcessId. Windows keeps
+  # a process's ParentProcessId after that parent exits and recycles pids, so
+  # a process only counts as a child if it was created after its parent:
+  # otherwise an unrelated long-lived process whose dead parent's pid was
+  # reused inside the tree is reported as a survivor.
   $all = Get-CimInstance Win32_Process |
-         Select-Object ProcessId, ParentProcessId, Name
+         Select-Object ProcessId, ParentProcessId, Name, CreationDate
   $out  = New-Object System.Collections.Generic.List[object]
   $seen = New-Object System.Collections.Generic.HashSet[int]
   $q    = New-Object System.Collections.Generic.Queue[int]
@@ -61,7 +65,9 @@ function Get-TreePids { param([int] $Root)
   $out.Add(($all | Where-Object { $_.ProcessId -eq $Root }))
   while ($q.Count -gt 0) {
     $p = $q.Dequeue()
+    $born = ($all | Where-Object { $_.ProcessId -eq $p }).CreationDate
     foreach ($c in $all | Where-Object { $_.ParentProcessId -eq $p }) {
+      if ($born -and $c.CreationDate -and $c.CreationDate -lt $born) { continue }
       if ($seen.Add($c.ProcessId)) {
         $out.Add($c); $q.Enqueue($c.ProcessId)
       }

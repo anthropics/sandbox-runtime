@@ -1295,7 +1295,10 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
     await SandboxManager.initialize(createTestConfig())
     console.error('[winsrt beforeAll] done')
-  })
+    // Install and uninstall each run an elevated srt-win that can outlast
+    // bun's 5s default hook timeout; a hook that times out is killed
+    // mid-run and fails the suite.
+  }, 120_000)
 
   afterAll(async () => {
     await SandboxManager.reset()
@@ -1303,7 +1306,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       sublayerGuid: TEST_SUBLAYER,
       srtWin: TEST_SRT_WIN,
     })
-  })
+  }, 60_000)
 
   it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime

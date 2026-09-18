@@ -95,9 +95,9 @@ export function expandReadDenyGlobLinux(
     const holdMatches = new Set(walk.matches.map(m => parentOf(locationOf(m))))
     for (const dir of walk.directoryMatches) {
       // A directory-form match that is a symlink counts in its own right:
-      // one the walk did not list through (a link back into its own
-      // ancestry, or a second name for a directory already walked) has no
-      // match beneath it, yet denies everything it reaches.
+      // one the walk did not list through (a link back up the tree, or a
+      // further name for a directory already listed) has no match beneath
+      // it, yet denies everything it reaches.
       if (holdMatches.has(locationOf(dir)) || walk.symlinks.has(dir)) {
         candidates.add(dir)
       }
@@ -190,7 +190,7 @@ export function expandReadDenyGlobLinux(
     // that directory, not over anything the pattern names.
     if (walk.baseLocation !== '' && !isAtOrUnder(mount, walk.baseLocation)) {
       logForDebugging(
-        `[Sandbox Linux] denyRead glob "${globPattern}" hides ${mount}, outside ${walk.baseLocation}: reached through ${namedBy.get(mount)}`,
+        `[Sandbox Linux] denyRead glob "${globPattern}" hides ${mount}, outside ${walk.baseLocation}: reached through ${namedBy.get(mount) === mount ? 'a symlinked directory' : namedBy.get(mount)}`,
         { level: 'warn' },
       )
     }

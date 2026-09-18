@@ -9,6 +9,10 @@ import {
   buildMaskedFileBinds,
 } from '../../src/sandbox/credential-mask-files.js'
 import { SentinelRegistry } from '../../src/sandbox/credential-sentinel.js'
+import {
+  denyGlobRegex,
+  normalizePathForSandbox,
+} from '../../src/sandbox/sandbox-utils.js'
 import { isMacOS, isWindows } from '../helpers/platform.js'
 
 /**
@@ -391,6 +395,77 @@ describe.if(isMacOS)(
       // can refuse this write.
       const key = join(tree.work, 'secrets', 'key')
       expect(run(`echo x > ${JSON.stringify(key)}`, [tree.root])).not.toBe(0)
+    })
+  },
+)
+
+/**
+ * The deny-glob compiler exists twice on purpose: a string-taking one in
+ * `sandbox-utils.ts`, where a caller's configured spelling is all pattern,
+ * and the entry-taking wrapper here, which splices an anchor back in as an
+ * escaped literal. Taking the string one everywhere drops the anchor from
+ * every macOS deny regex and puts the bracket bypass back, so both halves
+ * are pinned: the anchor survives, and the wrapper stays in step with the
+ * helper it delegates to.
+ */
+describe.if(!isWindows)(
+  'macOS deny regexes: anchor and shared compiler',
+  () => {
+    let tree: BracketTree
+    let originalCwd: string
+
+    beforeAll(() => {
+      originalCwd = process.cwd()
+      tree = bracketTree('bracket-deny-anchor')
+      process.chdir(tree.work)
+    })
+
+    afterAll(() => {
+      process.chdir(originalCwd)
+      rmSync(tree.root, { recursive: true, force: true })
+    })
+
+    it('escapes the cwd brackets in every regex the profile emits', () => {
+      const regexes = emittedRegexes(wrap(tree, 'true'))
+      expect(regexes.length).toBeGreaterThan(0)
+      for (const regex of regexes) {
+        // The cwd reaches a regex only as an escaped literal: unescaped, its
+        // `a[b/c]d` is a one-character class and the rule matches nothing it
+        // was built from. Escaped, the segments read `a\[b` and `c\]d`.
+        expect(regex).not.toContain(`${BRACKET_SEGMENTS[0]}/`)
+        expect(regex).not.toContain(BRACKET_SEGMENTS[1])
+      }
+    })
+
+    it('anchors the mandatory subtree patterns at the cwd', () => {
+      const anchor = tree.work.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const regexes = emittedRegexes(wrap(tree, 'true'))
+      const anchored = regexes.filter(regex => regex.startsWith(`^${anchor}/`))
+      expect(anchored.length).toBeGreaterThan(0)
+      // `**\/.git/hooks/**` covers a nested repository's hooks under the real
+      // working directory, and nothing under the two directories the bracket
+      // class would have matched instead.
+      const nested = join(tree.work, 'vendor/lib/.git/hooks/pre-commit')
+      expect(anchored.some(regex => new RegExp(regex).test(nested))).toBe(true)
+      for (const decoy of ['abd', 'acd']) {
+        const sibling = join(tree.root, decoy, 'lib/.git/hooks/pre-commit')
+        for (const regex of regexes) {
+          expect(new RegExp(regex).test(sibling)).toBe(false)
+        }
+      }
+    })
+
+    it('compiles a caller glob through the shared string helper', () => {
+      const spelling = join(tree.root, 'logs', '*.pem')
+      const profile = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [spelling] },
+        writeConfig: undefined,
+      })
+      expect(emittedRegexes(profile)).toContain(
+        denyGlobRegex(normalizePathForSandbox(spelling)),
+      )
     })
   },
 )

@@ -248,17 +248,26 @@ try { Start-Service seclogon -ea Stop } catch {
 # isn't). stderr (the runner's BLOCKED/UNREACHABLE line) flows to
 # the host so it's in the CI log; stdout is JUST the JSON line.
 #
-# `--target 127.0.0.1:49999` (a local listener bound below) — OUT of
-# the WFP loopback permit range, so block-user fires when the fence
+# `--target` is a local listener bound below, OUT of the WFP loopback
+# permit range (50000-50001 here), so block-user fires when the fence
 # is active and the connect succeeds when it isn't. Deterministic;
 # no internet. This is the same shape as the product path
 # (`verifyWindowsWfpEgress` binds an ephemeral out-of-range loopback
 # listener and passes it as `--target`).
-$probePort = 49999
+#
+# Ephemeral, not a fixed port: Windows reserves blocks of the dynamic
+# range at boot (excluded port ranges, which differ per machine), and
+# a bind inside one fails with WSAEACCES. Re-draw if the OS hands out
+# a port inside the permit range.
+do {
+  $probeLsn = [System.Net.Sockets.TcpListener]::new(
+    [System.Net.IPAddress]::Loopback, 0)
+  $probeLsn.Start()
+  $probePort = $probeLsn.LocalEndpoint.Port
+  $inPermit = $probePort -ge 50000 -and $probePort -le 50001
+  if ($inPermit) { $probeLsn.Stop() }
+} while ($inPermit)
 $probeTgt = "127.0.0.1:$probePort"
-$probeLsn = [System.Net.Sockets.TcpListener]::new(
-  [System.Net.IPAddress]::Loopback, $probePort)
-$probeLsn.Start()
 function WfpVerify([string]$tgt) {
   $out = & $Exe wfp verify --target $tgt
   $ec = $LASTEXITCODE

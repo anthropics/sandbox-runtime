@@ -174,6 +174,52 @@ srt --debug curl https://example.com
 srt --settings /path/to/srt-settings.json npm install
 ```
 
+The settings file is optional — with no file at `~/.srt-settings.json`, `srt`
+runs with built-in defaults: no network access, no writes outside the default
+write paths, and unrestricted reads. A settings file that _is_ there but is
+empty, cannot be read, or does not validate is an error: `srt` says so and
+exits rather than falling back to those defaults, which are a different
+config rather than a weaker one — falling back would drop the file's
+`denyRead`, `allowRead` and credential rules along with everything else it
+said. The same goes for a file named with `--settings`, which must also
+exist.
+
+#### Updating the config while the command runs: `--control-fd`
+
+`--control-fd <fd>` reads config updates from a descriptor the caller has
+already opened, one JSON object per line in the same shape as the settings
+file. Each line replaces the whole config, but only the network lists
+(`allowedDomains` / `deniedDomains`) change what is already running: the
+proxy consults them per request. Filesystem rules are compiled into the
+sandbox at wrap time, so a line that changes them applies to nothing in the
+current run.
+
+```bash
+# fd 3 is the read end of a pipe the caller writes lines to
+srt --control-fd 3 -- npm test
+```
+
+- The descriptor must be an integer **3 or above** and readable — `0`-`2`
+  are the standard streams. srt exits with an error instead of running the
+  command when it cannot read the descriptor it was given, so a dead
+  channel never passes for a live one. A channel that dies before it has
+  delivered a single update takes the command down with it; one that dies
+  after says so and leaves the command running under the config last
+  applied.
+- A line that is not a valid config is reported on stderr and dropped; the
+  previous config stays in force.
+- srt **exits with the wrapped command** and does not wait for the writer
+  to close the descriptor. End of input is not an error either: the
+  command keeps running under the config last applied.
+- Give srt a **dedicated, read-only end**. srt puts a pipe or socket into
+  non-blocking mode, and that flag lives on the open file description, so
+  anything else holding the same description — a shell's `exec 3<fifo`, a
+  `pass_fds` of a descriptor the parent goes on using — gets `EAGAIN` from
+  its own blocking reads from then on.
+- On macOS and Linux the sandboxed command does not get the descriptor: srt
+  points that slot at `/dev/null` for the command, so nothing inside the
+  sandbox can read the updates or write a config of its own.
+
 ### As a library
 
 ```typescript
@@ -366,6 +412,8 @@ Uses two different patterns:
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
 
+A few paths are writable without being listed: the child's stdio and `/tmp/claude`, and as a convenience `~/.npm/_logs` and `~/.claude/debug`. Those two home directories are dropped when a `denyRead` entry covers them (and kept when an `allowRead` entry beneath that deny re-opens them), so list them in `allowWrite` if you want them writable under a home read-deny.
+
 **Path Syntax (macOS):**
 
 Paths support git-style glob patterns on macOS, similar to `.gitignore` syntax:
@@ -391,7 +439,7 @@ bubblewrap binds concrete paths, so glob support is narrower than on macOS:
 - `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the entries that exist when the command is wrapped, so a file that appears later is not covered. The pattern needs a literal directory to start from (a relative pattern starts at the current directory): one with a wildcard in its first path component, such as `/**/*.pem` or `/opt*/keys/**`, is skipped on Linux. Only directories the pattern can match beneath are listed (`certs/*.pem` lists `certs` alone).
 - A directory matched by a `denyRead` pattern ending in `/**` that holds at least one entry when the command is wrapped becomes one tmpfs mount, like a directory listed in `denyRead` literally: inside the sandbox it is an EMPTY WRITABLE directory, so a command that used to write through a read-denied `build/` still writes, into the tmpfs, and loses that output when the command exits. A file added to the directory on the host afterwards is hidden too. A matched directory that is empty when the command is wrapped gets no mount (a matched symlink to a directory always gets one, on the directory it leads to). An `allowRead` beneath a mounted directory is bound back over the tmpfs, but each entry beneath it that the pattern matches keeps its own mask: under a `/**` pattern that is every entry there, so only what is created beneath the `allowRead` later is readable.
 - A directory the expansion cannot list is denied as a whole, and nothing is bound back beneath the mount that hides it, `allowRead` and `allowWrite` paths included: what the pattern matches under them cannot be found. A `denyRead` entry that cannot be inspected (its parent directory is readable but not searchable, say), or that leads to `/`, hides the nearest directory above it instead, in the same way.
-- Symlinked directories are descended, one spelling per directory. Every `denyRead` mount goes where the path really is (bubblewrap 0.12 and later refuse to mount on a symlink), so an entry reached through a symlink is denied under every name that leads to it, and a link back up the tree denies everything it reaches, as a literal deny of the link would. A link that resolves to nothing is skipped. `allowRead` globs are not expanded through symlinks: they match the link itself.
+- Symlinked directories are descended. A directory is listed once for each way the pattern can carry on beneath it, however many links lead to it, so the cost of the expansion follows the size of the tree and the length of the pattern, not the number or length of the names its links offer; what is found through a link is reported, and denied, where it really is. A link that leads back up the tree (to the directory holding it or above, or to the pattern's starting directory or above) is not descended. A `**` written against other text (`**.pem`, `a**/x`) and a bracket expression that can match `/` span directories as they do on macOS, through symlinked directories too. Only a pattern that does not read as written is matched against real paths alone, with every directory under its starting directory listed: one with a wildcard inside a bracket expression (`[a*]`), or with a second `[` that nothing closes. A link that itself matches it still denies what it leads to. Every `denyRead` mount goes where the path really is (bubblewrap 0.12 and later refuse to mount on a symlink), so an entry reached through a symlink is denied under every name that leads to it, and a link back up the tree denies everything it reaches, as a literal deny of the link would. A link that resolves to nothing is skipped. `allowRead` globs are not expanded through symlinks: they match the link itself.
 - An `allowRead` or `allowWrite` path is bound back over a denied directory only where it really is, so no directory shows under a second name inside the sandbox.
 - `denyRead: ["/"]` denies each directory in `/` (`/proc`, `/dev` and `/sys` aside); a symlink there (`/bin`, `/lib` on a usr-merged system) gets no mount of its own, because what it leads to is denied together with the directory that holds it.
 

@@ -13,6 +13,7 @@ import {
   decodeSandboxedCommand,
   containsGlobChars,
   globToRegex,
+  denyGlobRegex,
   isStrictlyUnder as isPathStrictlyUnder,
   DANGEROUS_FILES,
   getDangerousDirectories,
@@ -160,35 +161,50 @@ function pathFilter(entry: PathEntry): string {
 }
 
 /**
- * The regex for a glob entry. An entry the library anchored at a directory
+ * Compiles `entry`'s pattern with one of the shared string compilers in
+ * `sandbox-utils.ts`. An entry the library anchored at a directory
  * (`anchor`) keeps that directory as a literal — the cwd is a name on disk
- * and may itself contain `[`, `*` or `?` — and only the pattern below it is
- * compiled as a glob.
+ * and may itself contain `[`, `*` or `?` — so only the tail below it goes
+ * through the compiler, and the anchor is spliced back in escaped. Every
+ * compiler there returns '^…$'.
+ *
+ * This is the whole difference between the entry-taking wrappers here and
+ * the string-taking compilers they call: those see a spelling in which
+ * every character is glob syntax, which is right for what a caller wrote
+ * and wrong for what the library computed.
  */
-function globRegex(entry: GlobPathEntry): string {
-  if (entry.anchor === undefined) return globToRegex(entry.path)
+function anchorRegex(
+  entry: GlobPathEntry,
+  compile: (glob: string) => string,
+): string {
+  if (entry.anchor === undefined) return compile(entry.path)
   const pattern = entry.path.slice(entry.anchor.length)
-  return `^${escapeRegexLiteral(entry.anchor)}${globToRegex(pattern).slice(1)}`
+  return `^${escapeRegexLiteral(entry.anchor)}${compile(pattern).slice(1)}`
+}
+
+/** The regex for a glob entry: {@link globToRegex}, anchor respected. */
+function globRegex(entry: GlobPathEntry): string {
+  return anchorRegex(entry, globToRegex)
 }
 
 /**
- * Regex for a glob used in a DENY rule: {@link globToRegex} plus an optional
- * `/…` tail, so the deny covers everything beneath each match the way
- * `subpath` does for literals. Callers strip a trailing `/**` before the
- * pattern gets here (removeTrailingGlobSuffix), so `**\/secrets/**` arrives
- * as `**\/secrets` and, matched exactly, would deny only the directory
- * vnode while `secrets/key` stayed readable. This is what the Linux backend
- * already does (a deny masks the whole subtree). Only ever widens a deny.
+ * The regex for a glob entry used in a DENY rule: {@link denyGlobRegex},
+ * anchor respected. That is {@link globToRegex} plus an optional `/…` tail,
+ * so the deny covers everything beneath each match the way `subpath` does
+ * for literals. Callers strip a trailing `/**` before the pattern gets here
+ * (removeTrailingGlobSuffix), so `**\/secrets/**` arrives as `**\/secrets`
+ * and, matched exactly, would deny only the directory vnode while
+ * `secrets/key` stayed readable. This is what the Linux backend already
+ * does (a deny masks the whole subtree). Only ever widens a deny.
  */
-function denyGlobRegex(entry: GlobPathEntry): string {
-  // globRegex() always returns '^…$'.
-  return globRegex(entry).slice(0, -1) + '(/.*)?$'
+function denyGlobEntryRegex(entry: GlobPathEntry): string {
+  return anchorRegex(entry, denyGlobRegex)
 }
 
-/** {@link pathFilter} for deny rules: globs get {@link denyGlobRegex}. */
+/** {@link pathFilter} for deny rules: globs get {@link denyGlobEntryRegex}. */
 function denyPathFilter(entry: PathEntry): string {
   return entry.glob
-    ? `(regex ${escapePath(denyGlobRegex(entry))})`
+    ? `(regex ${escapePath(denyGlobEntryRegex(entry))})`
     : `(subpath ${escapePath(entry.path)})`
 }
 
@@ -368,7 +384,7 @@ function lateReadDenyFilters(resolved: ResolvedReadConfig): {
       }
       continue
     }
-    const denyRegex = new RegExp(denyGlobRegex(deny))
+    const denyRegex = new RegExp(denyGlobEntryRegex(deny))
     if (denyRegex.test('/')) coversRoot = true
     const carveOuts = resolved.allows
       .filter(a => denyGlobCovers(denyRegex, a))
@@ -471,7 +487,7 @@ function generateReadDenyUnlinkRules(
             isStrictlyUnder({ path: w, glob: false }, baseDir),
         )
       if (!intersectsWriteRoot) continue
-      const denyRegex = new RegExp(denyGlobRegex(deny))
+      const denyRegex = new RegExp(denyGlobEntryRegex(deny))
       const carveOuts = [...allows, ...writeRoots]
         .filter(e => denyGlobCovers(denyRegex, e))
         .map(e => pathFilter(e))

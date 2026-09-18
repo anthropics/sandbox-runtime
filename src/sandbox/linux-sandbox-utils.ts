@@ -1959,9 +1959,12 @@ async function generateFilesystemArgs(
       // vetoes — matches by `allowedPath + '/'` prefix, which '<dir>//'
       // silently defeats. bwrap binds 'dir' and 'dir/' identically, so
       // normalizing the recorded spelling fixes every consumer at once
-      // instead of per-predicate. ('/' itself is kept.)
+      // instead of per-predicate. ('/' itself is kept; the empty spelling an
+      // empty $HOME expands '~' to is NOT the root, and falls out at the
+      // existence check below.)
+      const normalized = normalizePathForSandbox(pathPattern)
       const normalizedPath =
-        normalizePathForSandbox(pathPattern).replace(/\/+$/, '') || '/'
+        normalized === '' ? '' : normalized.replace(/\/+$/, '') || '/'
 
       logForDebugging(
         `[Sandbox Linux] Processing write path: ${pathPattern} -> ${normalizedPath}`,
