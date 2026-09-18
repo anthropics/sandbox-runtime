@@ -13,7 +13,7 @@ import {
   symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { join } from 'node:path'
 import {
   expandGlobPattern,
   expandTilde,
