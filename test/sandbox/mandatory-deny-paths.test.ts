@@ -44,6 +44,7 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   GitMetadataError,
+  SubmoduleDenyBudget,
   SubmoduleWalkBudgetError,
   gitDirDenyPaths,
   gitDirTreeDenyPaths,
@@ -3073,13 +3074,328 @@ describe('Git metadata deny paths - Unit Tests', () => {
       })
       expect(profile).toContain(`(subpath "${join(deep, 'hooks')}")`)
       // No deny covering the git directory whole, which would take its
-      // objects, refs and index with it.
+      // objects, refs and index with it. Seatbelt has no argument cap, so
+      // nothing is ever collapsed there.
       expect(profile).not.toContain(`(subpath "${deep}")`)
     } finally {
       process.chdir(originalCwd)
     }
   })
 })
+
+/**
+ * bubblewrap parses at most 9000 words and takes three for each mount, so a
+ * repository with thousands of submodules asks for more than it can be given.
+ * The ceiling is not this library's to lift; refusing every command in such a
+ * repository is the wrong answer to it, so the denies are degraded instead -
+ * precise while they fit, then a whole git directory at a time, then the
+ * `modules` directory whole. Seatbelt has no such cap, so none of this
+ * applies on macOS.
+ */
+describe.if(isSupportedPlatform)(
+  'Submodule denies past the argument cap',
+  () => {
+    let dir: string
+    const savedCwd = process.cwd()
+
+    beforeEach(() => {
+      dir = realpathSync(mkdtempSync(join(tmpdir(), 'srt-submodule-budget-')))
+    })
+
+    afterEach(() => {
+      process.chdir(savedCwd)
+      cleanupBwrapMountPoints({ force: true })
+      rmSync(dir, { recursive: true, force: true })
+    })
+
+    function makeGitDir(gitDir: string): string {
+      mkdirSync(join(gitDir, 'hooks'), { recursive: true })
+      writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+      writeFileSync(join(gitDir, 'config'), '[core]\n')
+      return gitDir
+    }
+
+    /** A repository whose .git/modules holds `count` submodule git directories,
+     *  named so that sorted order is the order they were made in. */
+    function makeSuperproject(count: number): {
+      checkout: string
+      subs: string[]
+    } {
+      const checkout = join(dir, 'repo')
+      const gitDir = makeGitDir(join(checkout, '.git'))
+      const subs: string[] = []
+      for (let i = 0; i < count; i++) {
+        subs.push(
+          makeGitDir(join(gitDir, 'modules', `s${String(i).padStart(5, '0')}`)),
+        )
+      }
+      return { checkout, subs }
+    }
+
+    it('keeps the precise denies that fit and denies the rest of the submodules whole', () => {
+      const { checkout, subs } = makeSuperproject(5)
+      const gitDir = join(checkout, '.git')
+      // One mount for every submodule at its cheapest, one for the `modules`
+      // directory's own ancestor pin, and enough left over to upgrade two of
+      // them to their four precise denies.
+      const budget = new SubmoduleDenyBudget(5 + 1 + 2 * 4)
+
+      const denies = gitDirTreeDenyPaths(gitDir, false, { budget })
+
+      expect(budget.preciseGitDirs).toBe(2)
+      expect(budget.wholeGitDirs).toBe(3)
+      expect(budget.wholeModulesDirs).toEqual([])
+      expect(budget.collapsed).toBe(true)
+      for (const sub of subs.slice(0, 2)) {
+        expect(denies).toContain(join(sub, 'hooks'))
+        expect(denies).toContain(join(sub, 'config'))
+        expect(denies).toContain(join(sub, 'commondir'))
+        expect(denies).toContain(join(sub, 'config.worktree'))
+        expect(denies).not.toContain(sub)
+      }
+      // The last in sorted order are the ones collapsed, so two wraps of one
+      // tree collapse the same submodules.
+      for (const sub of subs.slice(2)) {
+        expect(denies).toContain(sub)
+        expect(denies).not.toContain(join(sub, 'hooks'))
+      }
+      // The repository's own denies are never collapsed: it is one git
+      // directory however many submodules it has.
+      expect(denies).toContain(join(gitDir, 'hooks'))
+    })
+
+    it('denies the modules directory whole where not even one bind each fits', () => {
+      const { checkout, subs } = makeSuperproject(5)
+      const gitDir = join(checkout, '.git')
+      const modules = join(gitDir, 'modules')
+      const budget = new SubmoduleDenyBudget(5)
+
+      const denies = gitDirTreeDenyPaths(gitDir, false, { budget })
+
+      expect(budget.wholeModulesDirs).toEqual([modules])
+      expect(budget.preciseGitDirs).toBe(0)
+      expect(budget.wholeGitDirs).toBe(0)
+      expect(denies).toContain(modules)
+      for (const sub of subs) expect(denies).not.toContain(sub)
+      expect(denies).toContain(join(gitDir, 'hooks'))
+    })
+
+    it('serves the repositories that ask first, which is what a nested one gets', () => {
+      // One budget is spent across the whole wrap: the working directory's own
+      // repository first and the nested repositories the scan found after it,
+      // so it is the last of them that collapses.
+      const first = makeGitDir(join(dir, 'first', '.git'))
+      const second = makeGitDir(join(dir, 'second', '.git'))
+      for (const gitDir of [first, second]) {
+        for (let i = 0; i < 3; i++) makeGitDir(join(gitDir, 'modules', `s${i}`))
+      }
+      // Room for the first repository's three submodules precisely, and for
+      // one bind each of the second's.
+      const budget = new SubmoduleDenyBudget(3 + 1 + 3 * 4 + 3 + 1)
+
+      gitDirTreeDenyPaths(first, false, { budget })
+      expect(budget.preciseGitDirs).toBe(3)
+      expect(budget.wholeGitDirs).toBe(0)
+
+      const denies = gitDirTreeDenyPaths(second, false, { budget })
+      expect(budget.preciseGitDirs).toBe(3)
+      expect(budget.wholeGitDirs).toBe(3)
+      expect(denies).toContain(join(second, 'modules', 's2'))
+    })
+
+    it('leaves every submodule its precise denies where no budget is given', () => {
+      // Which is the macOS answer: its profile has no cap to stay under.
+      const { checkout, subs } = makeSuperproject(5)
+
+      const denies = gitDirTreeDenyPaths(join(checkout, '.git'), false)
+
+      for (const sub of subs) {
+        expect(denies).toContain(join(sub, 'hooks'))
+        expect(denies).not.toContain(sub)
+      }
+    })
+
+    it('says what it collapsed, once, naming the level', () => {
+      const budget = new SubmoduleDenyBudget(0)
+      expect(budget.collapsed).toBe(false)
+      budget.preciseGitDirs = 300
+      budget.wholeGitDirs = 1700
+      budget.wholeModulesDirs.push('/repo/.git/modules')
+
+      expect(budget.collapsed).toBe(true)
+      expect(budget.describeCollapse()).toContain('1700 of 2000')
+      expect(budget.describeCollapse()).toContain('/repo/.git/modules')
+    })
+
+    it.if(isLinux)(
+      'wraps a command in a repository with 2000 submodules',
+      async () => {
+        const { checkout, subs } = makeSuperproject(2000)
+        process.chdir(checkout)
+        const wrap = (): Promise<string> =>
+          wrapCommandWithSandboxLinux({
+            command: 'true',
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+
+        // Before this it was refused up front with too_many_arguments, and
+        // every command in the repository with it.
+        const command = await wrap()
+        expect(command).toContain('bwrap')
+
+        // The mounts are past what one command line carries at this size, so
+        // they are in the argument file bwrap reads - which is where its own
+        // cap on parsed words is spent. Under it, with room to spare for the
+        // handful still on the line.
+        const profile = /\/proc\/\d+\/fd\/\d+/.exec(command)?.[0]
+        expect(profile).toBeDefined()
+        const words = readFileSync(profile as string, 'utf8').split('\0')
+        words.pop()
+        expect(words.length).toBeLessThan(9000)
+
+        // The first submodules in sorted order keep their precise denies; the
+        // rest are denied whole, one read-only bind of the git directory each.
+        // (A git directory bound whole is spelled like its own ancestor pin, so
+        // what tells the two apart is whether the hooks have a deny of their
+        // own.)
+        const denied = new Set(words)
+        const precise = subs.filter(sub => denied.has(join(sub, 'hooks')))
+        expect(precise.length).toBeGreaterThan(0)
+        expect(precise.length).toBeLessThan(subs.length)
+        expect(precise).toEqual(subs.slice(0, precise.length))
+        for (const sub of subs.slice(precise.length))
+          expect(denied.has(sub)).toBe(true)
+        const last = subs[subs.length - 1] as string
+        expect(denied.has(last)).toBe(true)
+        expect(denied.has(join(last, 'hooks'))).toBe(false)
+
+        // Two wraps of one tree agree, so a second command in it is sandboxed
+        // exactly as the first was.
+        const again = await wrap()
+        const profileAgain = /\/proc\/\d+\/fd\/\d+/.exec(again)?.[0]
+        expect(readFileSync(profileAgain as string, 'utf8')).toBe(
+          readFileSync(profile as string, 'utf8'),
+        )
+
+        // The violation monitor judges a refused write against the working
+        // directory's own denies, which it works out for itself: it has to
+        // collapse where the wrap collapsed or it would report the wrong path.
+        const monitorDenies = new Set(linuxGetMonitorCwdDenyPaths(false))
+        expect(monitorDenies.has(join(subs[0] as string, 'hooks'))).toBe(true)
+        expect(monitorDenies.has(last)).toBe(true)
+
+        // Seatbelt has no such cap: every submodule keeps its precise denies
+        // there, whatever this repository costs bubblewrap. Read off the
+        // entries rather than the profile text, which folds same-shaped
+        // literals into alternation regexes at this size.
+        const macEntries = new Set(
+          macGetMandatoryDenyEntries(false).map(entry => entry.path),
+        )
+        for (const sub of [subs[0] as string, last]) {
+          expect(macEntries.has(join(sub, 'hooks'))).toBe(true)
+          expect(macEntries.has(sub)).toBe(false)
+        }
+      },
+      300000,
+    )
+
+    it.if(isLinux)(
+      'holds a collapsed submodule read-only while the rest of the tree works',
+      async () => {
+        const git = Bun.which('git')
+        if (!bwrapCanNamespace() || git === null) return
+
+        // Seven hundred real submodule git directories, made here rather than
+        // cloned: past what precise denies fit in, so the tail is collapsed.
+        const checkout = join(dir, 'repo')
+        mkdirSync(checkout, { recursive: true })
+        const run = (...args: string[]): void => {
+          const r = spawnSync(git, args, { encoding: 'utf8', timeout: 60000 })
+          expect(r.status).toBe(0)
+        }
+        run('-c', 'init.defaultBranch=main', 'init', '-q', checkout)
+        writeFileSync(join(checkout, 'index.js'), 'console.log(1)\n')
+        run('-C', checkout, 'add', 'index.js')
+        run(
+          '-C',
+          checkout,
+          '-c',
+          'user.name=t',
+          '-c',
+          'user.email=t@t',
+          '-c',
+          'commit.gpgsign=false',
+          '-c',
+          'core.hooksPath=/dev/null',
+          'commit',
+          '-q',
+          '-m',
+          'one',
+        )
+        const subs: string[] = []
+        for (let i = 0; i < 700; i++) {
+          subs.push(
+            makeGitDir(
+              join(
+                checkout,
+                '.git',
+                'modules',
+                `s${String(i).padStart(5, '0')}`,
+              ),
+            ),
+          )
+        }
+        process.chdir(checkout)
+
+        const collapsed = subs[subs.length - 1] as string
+        const precise = subs[0] as string
+        const command = await wrapCommandWithSandboxLinux({
+          command:
+            'echo BOOTED; ' +
+            `! echo x > ${join(collapsed, 'hooks', 'pre-commit')} || echo COLLAPSED_HOOK_WRITABLE; ` +
+            `! echo x > ${join(precise, 'hooks', 'pre-commit')} || echo PRECISE_HOOK_WRITABLE; ` +
+            // A rename of the collapsed git directory itself is what the
+            // ancestor pins are there to stop: the deny would otherwise move
+            // with it and a fresh directory take its place.
+            `! mv ${collapsed} ${collapsed}.moved || echo COLLAPSED_RENAMABLE; ` +
+            `echo ok > ${join(checkout, 'index.js')} || echo PROJECT_FILE_READONLY; ` +
+            `${git} status --porcelain > /dev/null || echo GIT_STATUS_FAILED; ` +
+            'echo DONE',
+          needsNetworkRestriction: false,
+          allowAllUnixSockets: true,
+          readConfig: undefined,
+          writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+        })
+        const result = spawnSync(command, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 120000,
+          cwd: checkout,
+        })
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(result.stdout).toContain('DONE')
+        expect(result.stdout).not.toContain('COLLAPSED_HOOK_WRITABLE')
+        expect(result.stdout).not.toContain('PRECISE_HOOK_WRITABLE')
+        expect(result.stdout).not.toContain('COLLAPSED_RENAMABLE')
+        expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+        expect(result.stdout).not.toContain('GIT_STATUS_FAILED')
+
+        // And the host's git still works in the superproject afterwards.
+        cleanupBwrapMountPoints({ force: true })
+        const status = spawnSync(git, ['status', '--porcelain'], {
+          cwd: checkout,
+          encoding: 'utf8',
+          timeout: 60000,
+        })
+        expect(status.status).toBe(0)
+      },
+      300000,
+    )
+  },
+)
 
 /**
  * Denying a path that is not there means mounting something at it, and two of

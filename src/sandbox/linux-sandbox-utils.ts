@@ -31,6 +31,7 @@ import {
 } from './sandbox-utils.js'
 import {
   GitMetadataError,
+  SubmoduleDenyBudget,
   SubmoduleWalkBudgetError,
   gitDirDenyPaths,
   gitDirTreeDenyPaths,
@@ -638,7 +639,7 @@ function denyScanFailed(
  */
 export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
-  options: { deadline?: number } = {},
+  options: { budget?: SubmoduleDenyBudget; deadline?: number } = {},
 ): string[] {
   const cwd = process.cwd()
   const denyPaths = cwdDangerousDenyPaths(cwd)
@@ -655,7 +656,17 @@ export function linuxGetCwdMandatoryDenyPaths(
     if (!isAbsenceErrno(err)) return [...denyPaths, dotGitPath]
   }
   if (dotGitStat?.isDirectory()) {
-    denyPaths.push(...gitDirTreeDenyPaths(dotGitPath, allowGitConfig, options))
+    denyPaths.push(
+      ...gitDirTreeDenyPaths(dotGitPath, allowGitConfig, {
+        // A caller with no budget of its own gets a whole one, which is what
+        // makes the violation monitor collapse exactly where the wrap did:
+        // both spend it on this directory first.
+        budget:
+          options.budget ??
+          new SubmoduleDenyBudget(SUBMODULE_DENY_MOUNT_BUDGET),
+        deadline: options.deadline,
+      }),
+    )
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
@@ -690,6 +701,8 @@ function cwdDangerousDenyPaths(cwd: string): string[] {
  */
 export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
   try {
+    // No budget of its own: linuxGetCwdMandatoryDenyPaths makes a whole one,
+    // which is the same one the wrap spends on this directory first.
     return linuxGetCwdMandatoryDenyPaths(allowGitConfig)
   } catch (err) {
     const cwd = process.cwd()
@@ -764,22 +777,27 @@ async function linuxGetMandatoryDenyPaths(
   const signal = abortSignal ?? fallbackController.signal
   const dangerousDirectories = getDangerousDirectories()
 
+  // Spent on the working directory's own submodules first and on the nested
+  // repositories the scan finds with what is left, so that the violation
+  // monitor - which sees only the working directory's half and makes a budget
+  // of its own - collapses exactly where this does.
+  const budget = new SubmoduleDenyBudget(SUBMODULE_DENY_MOUNT_BUDGET)
   const denyPaths = asProfileRefusal(() =>
-    linuxGetCwdMandatoryDenyPaths(allowGitConfig, { deadline }),
+    linuxGetCwdMandatoryDenyPaths(allowGitConfig, { budget, deadline }),
   )
 
   // Each nested repository the scan finds, once: the same walk the cwd's own
   // git directory already had above, which every file listed under it leads
-  // back to.
+  // back to. Collected rather than denied as they are met, because ripgrep
+  // lists a tree in whatever order its threads finish it in and the budget
+  // above is spent in the order it is asked: two wraps of one tree would
+  // otherwise collapse different repositories.
   const seenGitDirs = new Set<string>([path.resolve(cwd, '.git')])
+  const nestedGitDirs: string[] = []
   const denyGitDir = (gitDir: string): void => {
     if (seenGitDirs.has(gitDir)) return
     seenGitDirs.add(gitDir)
-    denyPaths.push(
-      ...asProfileRefusal(() =>
-        gitDirTreeDenyPaths(gitDir, allowGitConfig, { deadline }),
-      ),
-    )
+    nestedGitDirs.push(gitDir)
   }
   const walkScan = (collectGitDirs: boolean) =>
     walkScanDirectories(cwd, maxDepth, deadline, collectGitDirs)
@@ -930,6 +948,20 @@ async function linuxGetMandatoryDenyPaths(
     // can empty the directory of regular files and hide the repository from
     // the next command's scan, so the directories are found here instead.
     for (const gitDir of walkScan(true).gitDirs) denyGitDir(gitDir)
+  }
+
+  for (const gitDir of nestedGitDirs.sort()) {
+    denyPaths.push(
+      ...asProfileRefusal(() =>
+        gitDirTreeDenyPaths(gitDir, allowGitConfig, { budget, deadline }),
+      ),
+    )
+  }
+  if (budget.collapsed) {
+    logForDebugging(
+      `[Sandbox Linux] ${cwd} has more submodules than bubblewrap takes arguments for, so ${budget.describeCollapse()}`,
+      { level: 'warn' },
+    )
   }
 
   return [...new Set(denyPaths)]
@@ -1207,6 +1239,27 @@ const ARG_HEADROOM_BYTES = 4096
 /** bwrap's cap on parsed words, the command line and `--args` file together. */
 const BWRAP_MAX_ARGS = 9000
 
+/** Words bubblewrap takes for one mount: the option and its two paths. */
+const BWRAP_WORDS_PER_MOUNT = 3
+
+/**
+ * Mounts kept back from the submodule denies for everything else in the
+ * profile: the allow binds, the read denies and what they restore, the
+ * working directory's own denies, the nested repositories the scan finds and
+ * the mount sources pinned at the end. A wrap of a repository with one
+ * submodule and the default configuration emits a couple of dozen; the rest
+ * is room to spare, because a profile that overruns it is a refused command.
+ */
+const PROFILE_MOUNT_HEADROOM = 200
+
+/**
+ * What one wrap's submodule denies may take before they are collapsed. The
+ * ceiling is bubblewrap's own, so this is where it is turned into the mount
+ * count {@link SubmoduleDenyBudget} is spent in.
+ */
+const SUBMODULE_DENY_MOUNT_BUDGET =
+  Math.floor(BWRAP_MAX_ARGS / BWRAP_WORDS_PER_MOUNT) - PROFILE_MOUNT_HEADROOM
+
 /**
  * The fd the `--args` file is opened on: a single digit, since dash rejects
  * multi-digit redirections, and high, since embedders hand the command low
@@ -1304,7 +1357,13 @@ function errorText(error: unknown): string {
 
 /** Why a bubblewrap profile could not be run. */
 export type LinuxSandboxProfileErrorCode =
-  /** More arguments than bubblewrap parses, on the line or through a file. */
+  /**
+   * More arguments than bubblewrap parses, on the line or through a file.
+   * What a repository's submodules cost no longer reaches this: past what
+   * the profile has room for they are denied whole instead (see
+   * `SubmoduleDenyBudget`), so something else in the configuration is what
+   * gets a profile here now.
+   */
   | 'too_many_arguments'
   /** A mount path holds a NUL byte, which no carrier of arguments can hold. */
   | 'nul_in_path'

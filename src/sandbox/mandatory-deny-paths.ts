@@ -125,6 +125,91 @@ export interface SubmoduleScan {
 }
 
 /**
+ * What a wrap has left for its submodule denies, and what it has collapsed to
+ * stay inside that.
+ *
+ * bubblewrap parses a bounded number of words, the command line and an
+ * `--args` file together, and takes three of them for each mount: the option
+ * and its two paths. A repository with thousands of submodules asks for more
+ * mounts than that on its own — four denies and an ancestor pin per submodule
+ * git directory — and the ceiling is not this library's to lift. Refusing
+ * every command in such a repository is the wrong answer to it, so the denies
+ * are degraded instead, fail-closed and only as far as they have to be:
+ *
+ * 1. precise denies (`hooks`, `config`, `commondir`, `config.worktree`) while
+ *    they fit;
+ * 2. the submodule git directories that do not fit are denied WHOLE, one
+ *    read-only bind each. git writes inside those submodules fail read-only;
+ *    nothing else does. Which ones is settled by sorted order, the last
+ *    first, so two wraps of the same tree agree;
+ * 3. where even that does not fit, the enclosing `modules` directory is
+ *    denied whole and everything under it goes with it.
+ *
+ * A budget is spent across the whole wrap, working directory first, which is
+ * what lets the violation monitor - which sees only the working directory's
+ * half and makes its own budget - collapse exactly where the wrap did.
+ * macOS passes none: Seatbelt's profile has no such cap, so nothing there is
+ * collapsed.
+ */
+export class SubmoduleDenyBudget {
+  private mountsLeft: number
+  /** Submodule git directories left with their precise denies. */
+  preciseGitDirs = 0
+  /** Submodule git directories denied whole instead. */
+  wholeGitDirs = 0
+  /** `modules` directories denied whole, taking every submodule under each. */
+  readonly wholeModulesDirs: string[] = []
+
+  constructor(mounts: number) {
+    this.mountsLeft = mounts
+  }
+
+  /** Whether `mounts` are still there, without taking them. */
+  fits(mounts: number): boolean {
+    return mounts <= this.mountsLeft
+  }
+
+  /**
+   * Takes `mounts` whether they are there or not. For what a wrap must have
+   * however little is left: one bind over a whole `modules` directory is the
+   * least the denies under it can cost, and giving that up would leave a
+   * tree of writable hooks. Overspending here is what `too_many_arguments`
+   * is still there to catch.
+   */
+  spend(mounts: number): void {
+    this.mountsLeft -= mounts
+  }
+
+  /** Takes `mounts` where they are there, and says whether they were. */
+  take(mounts: number): boolean {
+    if (!this.fits(mounts)) return false
+    this.mountsLeft -= mounts
+    return true
+  }
+
+  /** Whether anything was collapsed, and so whether the wrap says so. */
+  get collapsed(): boolean {
+    return this.wholeGitDirs > 0 || this.wholeModulesDirs.length > 0
+  }
+
+  /** One line naming what was collapsed and at which level. */
+  describeCollapse(): string {
+    const parts: string[] = []
+    if (this.wholeGitDirs > 0) {
+      parts.push(
+        `${this.wholeGitDirs} of ${this.wholeGitDirs + this.preciseGitDirs} submodule git directories are denied whole rather than by path (git writes inside those submodules fail read-only; the other ${this.preciseGitDirs} keep their precise denies)`,
+      )
+    }
+    if (this.wholeModulesDirs.length > 0) {
+      parts.push(
+        `${this.wholeModulesDirs.join(', ')} ${this.wholeModulesDirs.length === 1 ? 'is' : 'are'} denied whole, taking every submodule under ${this.wholeModulesDirs.length === 1 ? 'it' : 'them'}`,
+      )
+    }
+    return parts.join('; ')
+  }
+}
+
+/**
  * The files inside a git directory that send git to a git directory or a
  * config other than the one it opened, and what must stand in for one where
  * it does not exist.
@@ -315,22 +400,82 @@ export function gitFileDenyPaths(
  * walk could not see through. Both backends produce their entries from this
  * one list.
  *
- * `deadline` bounds the walk (see {@link submoduleGitDirs}).
+ * `deadline` bounds the walk (see {@link submoduleGitDirs}). `budget` bounds
+ * how many mounts the submodule denies may take, and is what degrades them
+ * where a repository has more submodules than the backend can carry mounts
+ * for (see {@link SubmoduleDenyBudget}); it is spent as it goes, so a caller
+ * that passes one to several git directories gets the first served first.
  */
 export function gitDirTreeDenyPaths(
   gitDir: string,
   allowGitConfig: boolean,
-  options: { deadline?: number } = {},
+  options: { budget?: SubmoduleDenyBudget; deadline?: number } = {},
 ): string[] {
-  const modules = submoduleGitDirs(
-    path.join(gitDir, 'modules'),
-    options.deadline,
-  )
+  const modulesDir = path.join(gitDir, 'modules')
+  const modules = submoduleGitDirs(modulesDir, options.deadline)
   return [
     ...gitDirDenyPaths(gitDir, allowGitConfig),
-    ...modules.unreadableDirs,
-    ...modules.gitDirs.flatMap(dir => gitDirDenyPaths(dir, allowGitConfig)),
+    ...submoduleDenyPaths(modulesDir, modules, allowGitConfig, options.budget),
   ]
+}
+
+/**
+ * What the submodule git directories under `modulesDir` cost and what they
+ * are denied with, inside what `budget` has left. No budget means no ceiling
+ * to stay under and every one of them keeps its precise denies, which is the
+ * macOS answer and what the Linux wrap does until a repository is large
+ * enough to need otherwise. See {@link SubmoduleDenyBudget} for the order.
+ */
+function submoduleDenyPaths(
+  modulesDir: string,
+  modules: SubmoduleScan,
+  allowGitConfig: boolean,
+  budget: SubmoduleDenyBudget | undefined,
+): string[] {
+  const precise = (gitDir: string): string[] =>
+    gitDirDenyPaths(gitDir, allowGitConfig)
+  if (budget === undefined) {
+    return [...modules.unreadableDirs, ...modules.gitDirs.flatMap(precise)]
+  }
+
+  // A directory the walk could not see through is already a whole-directory
+  // deny and cannot be degraded further, so it is counted with the git
+  // directories at their cheapest form. One more mount for the `modules`
+  // directory itself, whose ancestor pin every deny under it shares.
+  const wholeMounts = modules.unreadableDirs.length + modules.gitDirs.length + 1
+  if (!budget.fits(wholeMounts)) {
+    // Even one bind each is past what is left: the whole tree goes behind one,
+    // the directories the walk could not see through included — except one
+    // recorded ABOVE `modules`, which is what the walk falls back to when
+    // `modules` itself stopped being reachable, and which this would not
+    // cover.
+    budget.spend(1)
+    budget.wholeModulesDirs.push(modulesDir)
+    const above = modules.unreadableDirs.filter(
+      dir => dir !== modulesDir && !dir.startsWith(`${modulesDir}${path.sep}`),
+    )
+    budget.spend(above.length)
+    return [modulesDir, ...above]
+  }
+
+  // Every one of them fits whole. Spend what is left upgrading them to their
+  // precise denies, in sorted order, so that the ones collapsed are the last
+  // — the deepest nested submodules among them — and two wraps agree. An
+  // upgrade costs one mount per deny path, the whole-directory bind it
+  // replaces paying for the git directory's own ancestor pin.
+  budget.spend(wholeMounts)
+  const denyPaths: string[] = [...modules.unreadableDirs]
+  for (const gitDir of modules.gitDirs) {
+    const denies = precise(gitDir)
+    if (budget.take(denies.length)) {
+      budget.preciseGitDirs += 1
+      denyPaths.push(...denies)
+      continue
+    }
+    budget.wholeGitDirs += 1
+    denyPaths.push(gitDir)
+  }
+  return denyPaths
 }
 
 /**
