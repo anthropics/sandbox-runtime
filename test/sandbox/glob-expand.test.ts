@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+import * as fc from 'fast-check'
 // The namespace of the same module production binds (sandbox-utils.ts does
 // `import * as fs from 'fs'`), so a spy on it is seen by the code under test.
 import * as fs from 'fs'
@@ -798,6 +799,76 @@ describe('parseWindowsSandboxError', () => {
 // Tests for globToRegex() after move to sandbox-utils.ts
 // ============================================================================
 
+/** One character against the body of a `[…]` set, ranges included. */
+function setContains(set: string, char: string): boolean {
+  for (let i = 0; i < set.length; i++) {
+    if (set[i + 1] === '-' && i + 2 < set.length) {
+      if (char >= set[i]! && char <= set[i + 2]!) return true
+      i += 2
+    } else if (set[i] === char) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * The documented glob syntax matched directly, by backtracking rather than
+ * by compiling a regex: `*` and `?` stop at a separator, `**` crosses them,
+ * `**\/` is zero or more directories, `[…]` is one character from the set.
+ * Shares nothing with {@link globToRegex}, so the property below is two
+ * implementations checking each other.
+ */
+function referenceGlobMatch(pattern: string, pathText: string): boolean {
+  if (pattern === '') return pathText === ''
+  if (pattern.startsWith('**/')) {
+    const rest = pattern.slice(3)
+    if (referenceGlobMatch(rest, pathText)) return true
+    for (let i = 0; i < pathText.length; i++) {
+      if (pathText[i] !== '/') continue
+      if (referenceGlobMatch(rest, pathText.slice(i + 1))) return true
+    }
+    return false
+  }
+  if (pattern.startsWith('**')) {
+    const rest = pattern.slice(2)
+    for (let i = 0; i <= pathText.length; i++) {
+      if (referenceGlobMatch(rest, pathText.slice(i))) return true
+    }
+    return false
+  }
+  const head = pattern[0]!
+  if (head === '*') {
+    for (let i = 0; i <= pathText.length; i++) {
+      if (i > 0 && pathText[i - 1] === '/') break
+      if (referenceGlobMatch(pattern.slice(1), pathText.slice(i))) return true
+    }
+    return false
+  }
+  if (head === '?') {
+    return (
+      pathText.length > 0 &&
+      pathText[0] !== '/' &&
+      referenceGlobMatch(pattern.slice(1), pathText.slice(1))
+    )
+  }
+  if (head === '[') {
+    const close = pattern.indexOf(']')
+    if (close > 1) {
+      return (
+        pathText.length > 0 &&
+        setContains(pattern.slice(1, close), pathText[0]!) &&
+        referenceGlobMatch(pattern.slice(close + 1), pathText.slice(1))
+      )
+    }
+  }
+  return (
+    pathText.length > 0 &&
+    pathText[0] === head &&
+    referenceGlobMatch(pattern.slice(1), pathText.slice(1))
+  )
+}
+
 describe('globToRegex (shared)', () => {
   it('should convert simple wildcard', () => {
     const regex = globToRegex('/tmp/test/*.env')
@@ -829,6 +900,96 @@ describe('globToRegex (shared)', () => {
     const regex = globToRegex('/tmp/test/**')
     expect(new RegExp(regex).test('/tmp/test/anything')).toBe(true)
     expect(new RegExp(regex).test('/tmp/test/sub/deep/file.txt')).toBe(true)
+  })
+
+  it('should match one character from a bracket set', () => {
+    const digits = globToRegex('/tmp/test/file[0-9].txt')
+    expect(new RegExp(digits).test('/tmp/test/file3.txt')).toBe(true)
+    expect(new RegExp(digits).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(digits).test('/tmp/test/file12.txt')).toBe(false)
+    expect(new RegExp(digits).test('/tmp/test/file.txt')).toBe(false)
+
+    const letters = globToRegex('/tmp/test/[a-z]bc.txt')
+    expect(new RegExp(letters).test('/tmp/test/abc.txt')).toBe(true)
+    expect(new RegExp(letters).test('/tmp/test/Abc.txt')).toBe(false)
+    expect(new RegExp(letters).test('/tmp/test/1bc.txt')).toBe(false)
+  })
+
+  it('never negates a bracket set: ^ and ! are members of it', () => {
+    // Both spellings used for negation elsewhere (regex `^`, gitignore `!`)
+    // land in the set as ordinary characters, so such a pattern matches
+    // fewer names than its author meant, not more.
+    const caret = globToRegex('/tmp/test/file[^0-9].txt')
+    expect(new RegExp(caret).test('/tmp/test/file^.txt')).toBe(true)
+    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(true)
+    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(false)
+
+    const bang = globToRegex('/tmp/test/file[!0-9].txt')
+    expect(new RegExp(bang).test('/tmp/test/file!.txt')).toBe(true)
+    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(true)
+    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(false)
+  })
+
+  it('treats a bracket that opens no set as a literal character', () => {
+    const unclosed = globToRegex('/tmp/test/file[abc.txt')
+    expect(new RegExp(unclosed).test('/tmp/test/file[abc.txt')).toBe(true)
+    expect(new RegExp(unclosed).test('/tmp/test/filea.txt')).toBe(false)
+
+    const stray = globToRegex('/tmp/test/file]a.txt')
+    expect(new RegExp(stray).test('/tmp/test/file]a.txt')).toBe(true)
+    expect(new RegExp(stray).test('/tmp/test/filea.txt')).toBe(false)
+  })
+
+  it.failing(
+    'keeps a component spelled like a globstar placeholder literal',
+    () => {
+      // globToRegex parks `**` under __GLOBSTAR__ / __GLOBSTAR_SLASH__ while
+      // it rewrites `*` and `?`, then restores them by name, so a directory
+      // actually called __GLOBSTAR__ comes back as a wildcard.
+      const parked = globToRegex('/tmp/__GLOBSTAR__/x')
+      expect(new RegExp(parked).test('/tmp/__GLOBSTAR__/x')).toBe(true)
+      expect(new RegExp(parked).test('/tmp/anything/x')).toBe(false)
+
+      const parkedSlash = globToRegex('/tmp/__GLOBSTAR_SLASH__x')
+      expect(new RegExp(parkedSlash).test('/tmp/__GLOBSTAR_SLASH__x')).toBe(
+        true,
+      )
+    },
+  )
+
+  it('agrees with a reference matcher over generated patterns and paths', () => {
+    // Segments are drawn from the documented syntax only; the corners the
+    // cases above pin (an unclosed bracket, a stray `]`, a negated set, a
+    // literal placeholder) are left out so a disagreement here means the
+    // documented syntax itself diverged.
+    const segment = fc.constantFrom(
+      'a',
+      'bc',
+      'a*',
+      '*b',
+      '*',
+      '?',
+      'a?c',
+      '[ab]',
+      '[0-9]',
+      '[a-c]c',
+      '**',
+    )
+    const pattern = fc
+      .array(segment, { minLength: 1, maxLength: 4 })
+      .map(parts => '/' + parts.join('/'))
+    const pathText = fc
+      .array(fc.constantFrom('a', 'b', 'c', 'bc', 'a1', 'abc', '0', 'ab'), {
+        minLength: 1,
+        maxLength: 4,
+      })
+      .map(parts => '/' + parts.join('/'))
+    fc.assert(
+      fc.property(pattern, pathText, (p, f) => {
+        return new RegExp(globToRegex(p)).test(f) === referenceGlobMatch(p, f)
+      }),
+      { numRuns: 200 },
+    )
   })
 })
 
