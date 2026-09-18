@@ -1,11 +1,22 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
+import {
+  isAbsenceErrno,
+  MAX_SYMLINK_RESOLUTION_DEPTH,
+} from './sandbox-utils.js'
 
-/** The path is absent, as opposed to unreadable or otherwise unverifiable. */
+/**
+ * The path is absent, as opposed to unreadable or otherwise unverifiable.
+ * Narrower than the shared {@link isAbsenceErrno} by two codes: ELOOP must
+ * read as unreadable here, so a symlink loop is denied whole rather than
+ * passed over as nothing, and ENAMETOOLONG has its own answer in
+ * {@link isUnusablePathError}.
+ */
 function isAbsenceError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code
-  return code === 'ENOENT' || code === 'ENOTDIR'
+  if (code === 'ELOOP' || code === 'ENAMETOOLONG') return false
+  return isAbsenceErrno(err)
 }
 
 /**
@@ -24,12 +35,6 @@ function isUnusablePathError(err: unknown): boolean {
  * one this large is read by git and not by this, and fails closed.
  */
 const MAX_GIT_METADATA_BYTES = 1024 * 1024
-
-/**
- * Symlink hops allowed while resolving one path, the limit Linux itself
- * applies before it gives up with ELOOP.
- */
-const MAX_SYMLINK_HOPS = 40
 
 /**
  * Depth bound for the `.git/modules` walk. A submodule's name is its path
@@ -64,8 +69,21 @@ type GitMetadata =
  * {@link gitFileDenyPaths}: sandboxing with a deny list that misses the hooks
  * and config git reads is worse than not sandboxing, which is the same call
  * the Linux backend makes for a scan that does not finish in time.
+ *
+ * The message names the file, because a sandboxed command can write one and
+ * the refusal is then lifted only by a command run outside the sandbox. On
+ * Linux the wrap turns this into a `LinuxSandboxProfileError` carrying
+ * `deny_git_metadata_unreadable`; on macOS it is the profile generator's own
+ * refusal and reaches the caller as itself. Branch on `.code`, not on the
+ * message.
  */
-export class GitMetadataError extends Error {}
+export class GitMetadataError extends Error {
+  readonly code = 'git_metadata_unreadable' as const
+  constructor(message: string) {
+    super(message)
+    this.name = 'GitMetadataError'
+  }
+}
 
 /** Directories found under a `.git/modules`, and what could not be read. */
 export interface SubmoduleScan {
@@ -182,47 +200,77 @@ export function gitFileDenyPaths(
   const denyPaths = [gitFile]
   try {
     const pointer = readGitMetadataFile(gitFile)
-    if (pointer.kind === 'too-large') {
-      // git refuses a .git file this large outright, so it leads nowhere.
-      logForDebugging(
-        `[Sandbox] ${gitFile} is larger than the ${MAX_GIT_METADATA_BYTES} bytes git accepts for a .git file, so git does not follow it either; denying only the file itself`,
-        { level: 'warn' },
-      )
-      return denyPaths
+    let target: string | undefined
+    switch (pointer.kind) {
+      case 'contents':
+        target = parseGitdirPointer(pointer.bytes, gitFile)
+        break
+      case 'too-large':
+        // git refuses a .git file this large outright, so it leads nowhere.
+        logForDebugging(
+          `[Sandbox] ${gitFile} is larger than the ${MAX_GIT_METADATA_BYTES} bytes git accepts for a .git file, so git does not follow it either; denying only the file itself`,
+          { level: 'warn' },
+        )
+        return denyPaths
+      case 'none':
+        break
     }
-    const target =
-      pointer.kind === 'contents'
-        ? parseGitdirPointer(pointer.bytes, gitFile)
-        : undefined
     if (target === undefined) return denyPaths
-    const gitDirs = gitMetadataTargets(path.dirname(gitFile), target)
-    for (const gitDir of gitDirs) {
-      denyPaths.push(...gitDirTargetDenyPaths(gitDir, allowGitConfig, gitFile))
+    const gitDirs = gitMetadataTargets(path.dirname(gitFile), target).map(
+      gitDir => ({ gitDir, kind: gitDirKind(gitDir) }),
+    )
+    for (const { gitDir, kind } of gitDirs) {
+      denyPaths.push(
+        ...gitDirTargetDenyPaths(gitDir, kind, allowGitConfig, gitFile),
+      )
     }
 
     // A linked worktree's git directory holds the path of the main one, whose
     // hooks and config its commits run. git reads it out of the directory it
     // opened, so each candidate above has its own.
-    for (const gitDir of gitDirs) {
+    for (const { gitDir, kind } of gitDirs) {
+      // Only a git directory has a commondir git reads; a directory this
+      // process could not list is already denied whole, and git, running as
+      // the same user, cannot read through it either.
+      if (kind !== 'git-dir') continue
       const commonFile = path.join(gitDir, 'commondir')
-      const common = readGitMetadataFile(commonFile)
-      if (common.kind === 'too-large') {
-        // git reads commondir whole, with no size limit of its own, so a
-        // file past this bound still names the directory whose hooks git
-        // runs.
+      let common: GitMetadata
+      try {
+        common = readGitMetadataFile(commonFile)
+      } catch (err) {
+        if (isAbsenceError(err)) continue
+        // The file is there and could not be read, so the directory whose
+        // hooks this worktree's commits run is unknown. Returning the denies
+        // gathered so far would leave that repository's hooks writable.
         throw new GitMetadataError(
-          `[Sandbox] ${commonFile} is larger than ${MAX_GIT_METADATA_BYTES} bytes; refusing to sandbox without the git directory it names`,
+          `[Sandbox] ${commonFile} could not be read (${String(err)}); refusing to sandbox without the git directory it names`,
         )
       }
-      const commonTarget =
-        common.kind === 'contents'
-          ? gitMetadataPath(common.bytes, commonFile)
-          : undefined
+      let commonTarget: string | undefined
+      switch (common.kind) {
+        case 'contents':
+          commonTarget = gitMetadataPath(common.bytes, commonFile)
+          break
+        case 'too-large':
+          // git reads commondir whole, with no size limit of its own, so a
+          // file past this bound still names the directory whose hooks git
+          // runs.
+          throw new GitMetadataError(
+            `[Sandbox] ${commonFile} is larger than ${MAX_GIT_METADATA_BYTES} bytes; refusing to sandbox without the git directory it names`,
+          )
+        case 'none':
+          break
+      }
       if (commonTarget === undefined) continue
       for (const commonDir of gitMetadataTargets(gitDir, commonTarget)) {
         if (commonDir === gitDir) continue
         denyPaths.push(
-          ...gitDirTargetDenyPaths(commonDir, allowGitConfig, commonFile),
+          ...gitDirTargetDenyPaths(
+            commonDir,
+            gitDirKind(commonDir),
+            allowGitConfig,
+            commonFile,
+          ),
         )
       }
     }
@@ -240,6 +288,26 @@ export function gitFileDenyPaths(
     }
   }
   return denyPaths
+}
+
+/**
+ * Every git directory a deny must cover once `gitDir` is one: its own hooks/
+ * and config, and the same for each submodule git directory under its
+ * `modules` (what a commit inside that submodule runs), plus whatever the
+ * walk could not see through. Both backends produce their entries from this
+ * one list.
+ */
+export function gitDirTreeDenyPaths(
+  gitDir: string,
+  allowGitConfig: boolean,
+): string[] {
+  const modules = submoduleGitDirs(path.join(gitDir, 'modules'))
+  return [
+    ...modules.unreadableDirs,
+    ...[gitDir, ...modules.gitDirs].flatMap(dir =>
+      gitDirDenyPaths(dir, allowGitConfig),
+    ),
+  ]
 }
 
 /**
@@ -349,10 +417,10 @@ function isDirectory(
  */
 function gitDirTargetDenyPaths(
   target: string,
+  kind: GitDirKind,
   allowGitConfig: boolean,
   source: string,
 ): string[] {
-  const kind = gitDirKind(target)
   switch (kind) {
     case 'git-dir':
     case 'absent':
@@ -560,7 +628,7 @@ function physicalPath(base: string, target: string): string {
     // the path folded past it would name a directory this cannot vouch for,
     // while the link itself reads as unreadable and is denied whole.
     hops += 1
-    if (hops > MAX_SYMLINK_HOPS) return next
+    if (hops > MAX_SYMLINK_RESOLUTION_DEPTH) return next
     // A link's own target is walked in its place, from the directory holding
     // it unless it is absolute.
     if (path.isAbsolute(link)) current = path.parse(link).root

@@ -18,11 +18,12 @@ import {
   isStrictlyUnder as isPathStrictlyUnder,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  isAbsenceErrno,
 } from './sandbox-utils.js'
 import {
   gitDirDenyPaths,
+  gitDirTreeDenyPaths,
   gitFileDenyPaths,
-  submoduleGitDirs,
 } from './mandatory-deny-paths.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
@@ -146,28 +147,33 @@ export function macGetMandatoryDenyEntries(
   // binds, and every string in them was read off the filesystem, so each
   // becomes a literal entry here.
   const dotGit = path.resolve(cwd, '.git')
-  entries.push(
-    ...gitDirDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
-  )
   let dotGitStat: fs.Stats | undefined
   try {
     dotGitStat = fs.statSync(dotGit)
-  } catch {
-    // no .git here
+  } catch (err) {
+    // Absent is the ordinary case. Anything else means a .git is there and
+    // could not be looked at, which is no reason to skip the enumeration: a
+    // literal entry is a subpath deny, so this denies it whole, as the Linux
+    // backend's bind of the same path does.
+    if (!isAbsenceErrno(err)) return [...entries, toLiteralPathEntry(dotGit)]
   }
-  if (dotGitStat?.isFile()) {
-    // cwd checked out as a linked worktree or submodule: .git is a pointer
-    // file. Nested pointer files are matched by vnode type instead
-    // (gitPointerFilter), which cannot follow them.
+  if (dotGitStat?.isDirectory()) {
     entries.push(
-      ...gitFileDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
+      ...gitDirTreeDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
     )
-  } else if (dotGitStat?.isDirectory()) {
-    const modules = submoduleGitDirs(path.join(dotGit, 'modules'))
-    entries.push(...modules.unreadableDirs.map(toLiteralPathEntry))
-    for (const gitDir of modules.gitDirs) {
+  } else {
+    // Absent, or a pointer file: the repository's own hooks and config are
+    // denied either way, so neither can be created under a .git that is not
+    // there yet.
+    entries.push(
+      ...gitDirDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
+    )
+    if (dotGitStat?.isFile()) {
+      // cwd checked out as a linked worktree or submodule: .git is a pointer
+      // file. Nested pointer files are matched by vnode type instead
+      // (gitPointerFilter), which cannot follow them.
       entries.push(
-        ...gitDirDenyPaths(gitDir, allowGitConfig).map(toLiteralPathEntry),
+        ...gitFileDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
       )
     }
   }

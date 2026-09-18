@@ -27,12 +27,14 @@ import {
   isAtOrUnder,
   isStrictlyUnder,
   getDangerousDirectories,
+  MAX_SYMLINK_RESOLUTION_DEPTH,
 } from './sandbox-utils.js'
 import {
+  GitMetadataError,
   gitDirDenyPaths,
+  gitDirTreeDenyPaths,
   gitFileDenyPaths,
   gitRedirectPlaceholder,
-  submoduleGitDirs,
 } from './mandatory-deny-paths.js'
 import type {
   FsReadRestrictionConfig,
@@ -154,9 +156,6 @@ function findSymlinkInPath(
 
   return null
 }
-
-/** Bounded depth for chasing dangling symlink chains (kernel ELOOP limit). */
-const MAX_SYMLINK_RESOLUTION_DEPTH = 40
 
 /**
  * Canonicalize a deny path through symlinks before any mask or bind is
@@ -571,25 +570,6 @@ function denyScanFailed(
 }
 
 /**
- * Every git directory a deny must cover once `gitDir` is one: its own
- * hooks/ and config, and the same for each submodule git directory under
- * its `modules` (what a commit inside that submodule runs), plus whatever
- * the walk could not see through.
- */
-function gitDirTreeDenyPaths(
-  gitDir: string,
-  allowGitConfig: boolean,
-): string[] {
-  const modules = submoduleGitDirs(path.join(gitDir, 'modules'))
-  return [
-    ...modules.unreadableDirs,
-    ...[gitDir, ...modules.gitDirs].flatMap(dir =>
-      gitDirDenyPaths(dir, allowGitConfig),
-    ),
-  ]
-}
-
-/**
  * The part of the mandatory deny set that follows from the cwd alone: the
  * dangerous files and directories resolved against it, and what its own
  * `.git` leads to — the repository's hooks, config and redirect files and
@@ -610,8 +590,12 @@ export function linuxGetCwdMandatoryDenyPaths(
   let dotGitStat: fs.Stats | undefined
   try {
     dotGitStat = fs.statSync(dotGitPath)
-  } catch {
-    // No .git: nothing is denied, since a mount at .git would block `git init`.
+  } catch (err) {
+    // Absent is the ordinary case, and nothing is denied then: a mount at
+    // .git would block `git init`. Anything else means a .git is there and
+    // could not be looked at, which is no reason to skip the enumeration —
+    // deny it whole instead.
+    if (!isAbsenceErrno(err)) return [...denyPaths, dotGitPath]
   }
   if (dotGitStat?.isDirectory()) {
     denyPaths.push(...gitDirTreeDenyPaths(dotGitPath, allowGitConfig))
@@ -657,22 +641,39 @@ export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
       `[Sandbox Linux] Could not resolve ${dotGitPath} the way git does (${errorText(err)}); the violation monitor judges writes against ${cwd}'s plain deny paths instead. Every wrapped command in it is refused until that is fixed.`,
       { level: 'warn' },
     )
-    let isPointerFile = false
-    try {
-      isPointerFile = fs.statSync(dotGitPath).isFile()
-    } catch {
-      // Gone since, or unreachable: neither shape's denies apply.
-    }
     return [
       ...cwdDangerousDenyPaths(cwd),
-      // A pointer file is itself a deny, and what it leads to is exactly
-      // what could not be followed; a git directory's own hooks and config
-      // need nothing followed to name.
-      ...(isPointerFile
-        ? [dotGitPath]
-        : gitDirDenyPaths(dotGitPath, allowGitConfig)),
+      ...monitorDotGitDenyPaths(cwd, allowGitConfig),
     ]
   }
+}
+
+/**
+ * What the monitor treats as denied under `cwd`'s own `.git`, without
+ * following anything: the same three answers the wrap gives for the shape
+ * `.git` turns out to be. Absent is none of them — the wrap denies nothing
+ * there either, since a mount at `.git` would block `git init`.
+ */
+function monitorDotGitDenyPaths(
+  cwd: string,
+  allowGitConfig: boolean,
+): string[] {
+  const dotGitPath = path.resolve(cwd, '.git')
+  let dotGitStat: fs.Stats | undefined
+  try {
+    dotGitStat = fs.statSync(dotGitPath)
+  } catch (err) {
+    // There and not inspectable: denied whole, as the wrap denies it.
+    return isAbsenceErrno(err) ? [] : [dotGitPath]
+  }
+  // A pointer file is itself a deny, and what it leads to is exactly what
+  // could not be followed; a git directory's own hooks and config need
+  // nothing followed to name.
+  if (dotGitStat.isFile()) return [dotGitPath]
+  if (dotGitStat.isDirectory()) {
+    return gitDirDenyPaths(dotGitPath, allowGitConfig)
+  }
+  return []
 }
 
 /**
@@ -706,7 +707,9 @@ async function linuxGetMandatoryDenyPaths(
   const signal = abortSignal ?? fallbackController.signal
   const dangerousDirectories = getDangerousDirectories()
 
-  const denyPaths = linuxGetCwdMandatoryDenyPaths(allowGitConfig)
+  const denyPaths = asProfileRefusal(() =>
+    linuxGetCwdMandatoryDenyPaths(allowGitConfig),
+  )
 
   // Each nested repository the scan finds, once: the same walk the cwd's own
   // git directory already had above, which every file listed under it leads
@@ -853,13 +856,45 @@ async function linuxGetMandatoryDenyPaths(
       denyGitDir(path.join(cwd, ...relative.slice(0, gitAt + 1)))
     } else if (relative.length > 1) {
       // cwd's own pointer file is handled above, before the scan.
-      denyPaths.push(...gitFileDenyPaths(match, allowGitConfig))
+      denyPaths.push(
+        ...asProfileRefusal(() => gitFileDenyPaths(match, allowGitConfig)),
+      )
     }
+  }
+
+  if (allowGitConfig) {
+    // The scan recognises a repository by a regular file directly inside its
+    // .git. With the config deny in place one is always there and cannot be
+    // removed from inside the sandbox; with config writes allowed a command
+    // can empty the directory of regular files and hide the repository from
+    // the next command's scan, so the directories are found here instead.
+    for (const gitDir of walkScan(true).gitDirs) denyGitDir(gitDir)
   }
 
   return [...new Set(denyPaths)]
 }
 
+/**
+ * Run `produce`, turning the refusal a git metadata file can raise into the
+ * wrap's own typed one. A `.git` pointer or a `commondir` whose target cannot
+ * be worked out the way git works it out refuses the command, and a
+ * sandboxed command can write one, so the refusal has to reach the caller as
+ * something it can branch on — and name the file, since lifting it takes a
+ * command run outside the sandbox.
+ */
+function asProfileRefusal<T>(produce: () => T): T {
+  try {
+    return produce()
+  } catch (err) {
+    if (!(err instanceof GitMetadataError)) throw err
+    logForDebugging(`[Sandbox Linux] ${err.message}`, { level: 'warn' })
+    throw new LinuxSandboxProfileError(
+      'deny_git_metadata_unreadable',
+      err.message,
+      err,
+    )
+  }
+}
 // Track mount points created by bwrap for non-existent deny paths.
 // When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
 // file on the host as a mount point. These persist after bwrap exits and must
@@ -1234,6 +1269,16 @@ export type LinuxSandboxProfileErrorCode =
    * so the command is refused instead.
    */
   | 'deny_scan_failed'
+  /**
+   * A `.git` pointer file or a `commondir` under the working directory names
+   * a git directory that cannot be worked out the way git works it out: its
+   * bytes are not valid UTF-8, it is larger than git reads, or it is there
+   * and could not be read. The hooks and config git runs through it are
+   * therefore unknown, so the command is refused rather than sandboxed
+   * without them. A sandboxed command can write such a file, and the
+   * message names it: the refusal is lifted only from outside the sandbox.
+   */
+  | 'deny_git_metadata_unreadable'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the

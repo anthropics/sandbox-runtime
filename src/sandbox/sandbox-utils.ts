@@ -92,6 +92,13 @@ export function pathSpellings(candidatePath: string): string[] {
   return [candidatePath]
 }
 
+/**
+ * Symlink hops allowed while resolving one path: the limit Linux itself
+ * applies before it gives up with ELOOP, so a chain this library walks by
+ * hand stops where the kernel's own walk would.
+ */
+export const MAX_SYMLINK_RESOLUTION_DEPTH = 40
+
 /** An fs error that means the name resolves to no file — it is missing, or
  * the path cannot name one at all — as opposed to one that means a file is
  * there but could not be looked at (EACCES, EPERM, EIO, anything
