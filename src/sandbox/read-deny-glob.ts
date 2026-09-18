@@ -190,7 +190,7 @@ export function expandReadDenyGlobLinux(
     // that directory, not over anything the pattern names.
     if (walk.baseLocation !== '' && !isAtOrUnder(mount, walk.baseLocation)) {
       logForDebugging(
-        `[Sandbox Linux] denyRead glob "${globPattern}" hides ${mount}, outside ${walk.baseLocation}: reached through ${namedBy.get(mount)}`,
+        `[Sandbox Linux] denyRead glob "${globPattern}" hides ${mount}, outside ${walk.baseLocation}: reached through ${namedBy.get(mount) === mount ? 'a symlinked directory' : namedBy.get(mount)}`,
         { level: 'warn' },
       )
     }

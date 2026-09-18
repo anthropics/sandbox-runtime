@@ -1180,9 +1180,7 @@ export interface GlobWalk {
   /** With `withDirectoryForm`: directories (a symlink to one included)
    *  matching the pattern without its trailing `/**`. */
   directoryMatches: string[]
-  /** Every visited entry that is a symbolic link, by full path. With
-   *  `followSymlinkedDirectories` a match beneath one really lives outside
-   *  the tree it was found in. */
+  /** Every visited entry that is a symbolic link, by full path. */
   symlinks: Set<string>
   /** Symbolic links whose target is there but could not be looked at, so
    *  `realOf` has no entry for them. Unreadable now is not absent: a deny
@@ -1193,9 +1191,10 @@ export interface GlobWalk {
    *  `matches`; a deny expansion must cover them whole. */
   unlisted: string[]
   /** Where an entry of `matches`, `directoryMatches` or `unlisted` really
-   *  lives, for each one whose path passes through a symlink (above the walk,
-   *  on the way down, or the entry itself). A symlink that does not resolve
-   *  has no entry. */
+   *  lives, for each one that is a symlink or is spelled through one above
+   *  the walk. A symlink that does not resolve has no entry, and neither has
+   *  what was found through a symlinked directory, which is reported where
+   *  it really lives to begin with. */
   realOf: Map<string, string>
 }
 
@@ -1218,140 +1217,38 @@ export function expandGlobPattern(
   return walkGlobPattern(globPath, opts).matches
 }
 
-/** One path component of a pattern: a `**`, or what a single name is
- *  matched against. */
-type GlobComponent = '**' | RegExp
-
 /**
- * The patterns `pattern` stands for once every `**` in them is a whole
- * component and nothing in them can match a `/`, each as its components.
- * {@link globToRegex} lets two things span a path separator, which a walk
- * that takes one name at a time cannot follow as written, and each is exactly
- * two patterns that it can:
+ * A pattern as an automaton that takes a path one name at a time, which is
+ * how a walk meets it. A position is a state of it: a place in the pattern
+ * where a path component can start.
  *
- * - a `**` written against other text: `X**Y` is `X*Y` or `X*` / `**` / `*Y`,
+ * What the pattern matches beneath a directory depends on the directory's
+ * spelling only through the positions that spelling leads to, so the walk
+ * lists a real directory once per position however many names lead to it,
+ * and lists no directory that has none (`proj/*.pem` lists `proj` alone).
+ * Beneath `**\/.env` every spelling has the same positions; beneath
+ * `**\/secrets/*.pem` a directory named `secrets` has one more.
+ *
+ * {@link globToRegex} lets two things span a path separator, and each is a
+ * choice between two readings that do not:
+ *
+ * - a `**` written against other text: `X**Y` is `X*Y`, or `X*` / `**` / `*Y`;
  *   and `X**` before a separator is `X` run into what follows, or
  *   `X*` / `**` / what follows;
  * - a bracket expression that can match `/`, such as `[+-9]`: the expression
  *   without the `/`, or a separator.
  *
- * Undefined for a pattern with a wildcard inside a bracket expression:
- * {@link globToRegex} rewrites that wildcard like any other, and what is left
- * no longer reads as one character.
- */
-function globAlternatives(
-  pattern: string,
-  flags: string,
-): GlobComponent[][] | undefined {
-  // What globToRegex makes of the pattern, piece by piece: `any` is its
-  // `.*`, `anyDirs` its `(.*/)?`, and a `source` matches within one name.
-  type Piece =
-    | 'any'
-    | 'anyDirs'
-    | '/'
-    | { source: string; canBeSeparator?: true }
-  const star = { source: '[^/]*' }
-  const sourceOf = (text: string): string => globToRegex(text).slice(1, -1)
-  const pieces: Piece[] = []
-  // A bracket expression first, the way a regular expression reads one:
-  // everything up to the first `]`. Then a run of `*` with the separator
-  // after it, since `**/` is one thing to globToRegex.
-  const tokenizer = /(\[[^\]]*\])|(\*+)(\/?)|(\/)|([^[*/]+|\[)/g
-  for (const match of pattern.matchAll(tokenizer)) {
-    const [text, bracket, stars, separatorAfterStars, separator] = match
-    if (bracket !== undefined) {
-      if (/[*?]/.test(bracket)) return undefined
-      const source = sourceOf(bracket)
-      pieces.push(
-        new RegExp(`^${source}$`, flags).test('/')
-          ? { source, canBeSeparator: true }
-          : { source },
-      )
-    } else if (stars !== undefined) {
-      // globToRegex takes `**/` first, so the last two of a run before a
-      // separator go with it. What is left of the run is `**` pairs from the
-      // left and then a `*`; a `.*` takes in a `.*` or `[^/]*` beside it.
-      const withSeparator = separatorAfterStars === '/' && stars.length >= 2
-      const left = stars.length - (withSeparator ? 2 : 0)
-      if (left >= 2) pieces.push('any')
-      else if (left === 1) pieces.push(star)
-      if (withSeparator) pieces.push('anyDirs')
-      else if (separatorAfterStars === '/') pieces.push('/')
-    } else if (separator !== undefined) {
-      pieces.push('/')
-    } else {
-      pieces.push({ source: sourceOf(text) })
-    }
-  }
-
-  type Token = '/' | '**' | { source: string }
-  let alternatives: Token[][] = [[]]
-  const append = (...choices: Token[][]): void => {
-    alternatives = alternatives.flatMap(tokens =>
-      choices.map(choice => [...tokens, ...choice]),
-    )
-  }
-  // `(.*/)?` adds nothing before another one or before a `.*`.
-  const kept = pieces.filter(
-    (piece, i) =>
-      piece !== 'anyDirs' ||
-      (pieces[i + 1] !== 'anyDirs' && pieces[i + 1] !== 'any'),
-  )
-  kept.forEach((piece, i) => {
-    const startsComponent = i === 0 || kept[i - 1] === '/'
-    if (piece === 'anyDirs') {
-      if (startsComponent) append(['**', '/'])
-      else append([], [star, '/', '**', '/'])
-    } else if (piece === 'any') {
-      if (startsComponent && i === kept.length - 1) append(['**'])
-      else append([star], [star, '/', '**', '/', star])
-    } else if (piece === '/') {
-      append(['/'])
-    } else if (piece.canBeSeparator) {
-      append([{ source: `(?!/)${piece.source}` }], ['/'])
-    } else {
-      append([piece])
-    }
-  })
-
-  const result: GlobComponent[][] = []
-  for (const tokens of alternatives) {
-    const components: GlobComponent[] = []
-    let sources: string[] | '**' = []
-    for (const token of [...tokens, '/' as const]) {
-      if (token === '/') {
-        components.push(
-          sources === '**' ? '**' : new RegExp(`^${sources.join('')}$`, flags),
-        )
-        sources = []
-      } else if (token === '**') {
-        if (sources === '**' || sources.length > 0) return undefined
-        sources = '**'
-      } else {
-        if (sources === '**') return undefined
-        sources.push(token.source)
-      }
-    }
-    result.push(components)
-  }
-  return result
-}
-
-/**
- * Where in a pattern the names beneath a directory carry on matching: the
- * pattern components the next name is matched against, given the directory's
- * own spelling, numbered across the pattern's {@link globAlternatives} and
- * those of its form without a trailing `/**`. What the pattern matches
- * beneath a directory depends on that spelling only through these positions,
- * so the walk lists a real directory once per set of them however many names
- * lead to it, and lists no directory that has none (`proj/*.pem` lists `proj`
- * alone). Beneath `**\/.env` every spelling has the same positions; beneath
- * `**\/secrets/*.pem` a directory named `secrets` has one more.
+ * A choice is a branch from the position it is met at, and the readings
+ * after it are shared, so the automaton grows with the pattern's length and
+ * not with the number of combinations.
  *
- * `splits` is false for the patterns {@link globAlternatives} has no answer
- * for. Their positions say nothing, so every directory is listed, an entry is
- * matched by its whole spelling, and {@link walkGlobPattern} does not list
- * such a pattern through symlinks.
+ * `splits` is false for a pattern this cannot be done for: one with a
+ * wildcard inside a bracket expression (globToRegex rewrites that wildcard
+ * like any other, and what is left no longer reads as one character), with a
+ * second `[` that nothing closes, or that spells one of globToRegex's
+ * placeholders. Its positions say nothing, so every directory is listed, an
+ * entry is matched by its whole spelling, and {@link walkGlobPattern} does
+ * not list such a pattern through symlinks.
  */
 interface GlobPositions {
   splits: boolean
@@ -1377,6 +1274,62 @@ interface GlobPositions {
   ) => boolean
 }
 
+/** What globToRegex makes of a pattern, piece by piece: `any` is its `.*`,
+ *  `anyDirs` its `(.*\/)?`, and a `source` matches within one name. Undefined
+ *  for the patterns {@link GlobPositions} does not split. */
+type GlobPiece =
+  | 'any'
+  | 'anyDirs'
+  | '/'
+  | { source: string; canBeSeparator?: true }
+
+function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
+  // globToRegex rewrites its own placeholders where a pattern spells one.
+  if (pattern.includes('__GLOBSTAR')) return undefined
+  const sourceOf = (text: string): string => globToRegex(text).slice(1, -1)
+  const pieces: GlobPiece[] = []
+  let unclosed = 0
+  // A bracket expression first, the way a regular expression reads one:
+  // everything up to the first `]`. Then a run of `*` with the separator
+  // after it, since `**/` is one thing to globToRegex.
+  const tokenizer = /(\[[^\]]*\])|(\*+)(\/?)|(\/)|([^[*/]+|\[)/g
+  for (const match of pattern.matchAll(tokenizer)) {
+    const [text, bracket, stars, separatorAfterStars, separator] = match
+    if (bracket !== undefined) {
+      if (/[*?]/.test(bracket)) return undefined
+      const source = sourceOf(bracket)
+      pieces.push(
+        new RegExp(`^${source}$`, flags).test('/')
+          ? { source, canBeSeparator: true }
+          : { source },
+      )
+    } else if (stars !== undefined) {
+      // globToRegex takes `**/` first, so the last two of a run before a
+      // separator go with it. What is left of the run is `**` pairs from the
+      // left and then a `*`; a `.*` takes in a `.*` or `[^/]*` beside it.
+      const withSeparator = separatorAfterStars === '/' && stars.length >= 2
+      const left = stars.length - (withSeparator ? 2 : 0)
+      if (left >= 2) pieces.push('any')
+      else if (left === 1) pieces.push({ source: '[^/]*' })
+      if (withSeparator) pieces.push('anyDirs')
+      else if (separatorAfterStars === '/') pieces.push('/')
+    } else if (separator !== undefined) {
+      pieces.push('/')
+    } else {
+      // globToRegex escapes the first `[` that nothing closes and no other:
+      // a second one reads on into whatever a later wildcard is rewritten to.
+      if (text === '[' && unclosed++ > 0) return undefined
+      pieces.push({ source: sourceOf(text) })
+    }
+  }
+  // `(.*/)?` adds nothing before another one or before a `.*`.
+  return pieces.filter(
+    (piece, i) =>
+      piece !== 'anyDirs' ||
+      (pieces[i + 1] !== 'anyDirs' && pieces[i + 1] !== 'any'),
+  )
+}
+
 function globPositions(
   normalizedPattern: string,
   flags: string,
@@ -1396,63 +1349,129 @@ function globPositions(
       directoryRegex?.test(spelled) === true,
   }
 
-  let whole: GlobComponent[][] | undefined
-  let withoutSuffix: GlobComponent[][] | undefined
+  // A `**`: any name leaves it where it is, and what follows it (`then`) can
+  // start at once. With nothing after it, every name beneath it matches.
+  type Globstar = { then: number | undefined }
+  // A component: one name, matched by one of these. `to` is the position
+  // after it, undefined where the pattern ends, which is a match.
+  type Component = { edges: { regex: RegExp; to: number | undefined }[] }
+  const states: (Globstar | Component)[] = []
+  const star = '[^/]*'
+
+  /** The automaton of one pattern, as the position it starts at. */
+  const build = (pieces: readonly GlobPiece[]): number => {
+    const memo = new Map<string, number>()
+    const globstar = (then: number | undefined): number =>
+      states.push({ then }) - 1
+    /** The position of a component that starts at `pieces[i]`, after a
+     *  `[^/]*` when `lead`. */
+    const componentAt = (i: number, lead: boolean): number => {
+      const key = `${i}${lead ? '*' : ''}`
+      const known = memo.get(key)
+      if (known !== undefined) return known
+      if (!lead && pieces[i] === 'anyDirs') {
+        const id = globstar(undefined)
+        memo.set(key, id)
+        ;(states[id] as Globstar).then = componentAt(i + 1, false)
+        return id
+      }
+      if (!lead && pieces[i] === 'any' && i === pieces.length - 1) {
+        const id = globstar(undefined)
+        memo.set(key, id)
+        return id
+      }
+      const component: Component = { edges: [] }
+      const id = states.push(component) - 1
+      memo.set(key, id)
+      const endsWith = (source: string, to: number | undefined): void => {
+        component.edges.push({ regex: new RegExp(`^${source}$`, flags), to })
+      }
+      let source = lead ? star : ''
+      for (let j = i; ; j++) {
+        const piece = pieces[j]
+        if (piece === undefined) {
+          endsWith(source, undefined)
+          break
+        }
+        if (piece === '/') {
+          endsWith(source, componentAt(j + 1, false))
+          break
+        }
+        if (piece === 'any') {
+          // Spanning separators: `X*` / `**` / `*Y`. Or not: `X*Y`.
+          endsWith(source + star, globstar(componentAt(j + 1, true)))
+          source += star
+        } else if (piece === 'anyDirs') {
+          // Spanning: `X*` / `**` / what follows. Or X run into it.
+          endsWith(source + star, globstar(componentAt(j + 1, false)))
+        } else if (piece.canBeSeparator) {
+          endsWith(source, componentAt(j + 1, false))
+          source += `(?!/)${piece.source}`
+        } else {
+          source += piece.source
+        }
+      }
+      return id
+    }
+    return componentAt(0, false)
+  }
+
+  let starts: number[]
+  let firstOfDirectoryForm: number
   try {
-    whole = globAlternatives(normalizedPattern, flags)
-    withoutSuffix = directoryRegex ? globAlternatives(directoryForm, flags) : []
+    const pieces = globPieces(normalizedPattern, flags)
+    const directoryPieces = directoryRegex
+      ? globPieces(directoryForm, flags)
+      : []
+    if (pieces === undefined || directoryPieces === undefined) return unsplit
+    starts = [build(pieces)]
+    firstOfDirectoryForm = states.length
+    if (directoryRegex) starts.push(build(directoryPieces))
   } catch {
     // A piece of the pattern that is no regular expression on its own.
+    return unsplit
   }
-  if (whole === undefined || withoutSuffix === undefined) return unsplit
 
-  // Every alternative laid end to end: a position is an index into these.
-  const components: GlobComponent[] = []
-  const isLast: boolean[] = []
-  const isDirectoryForm: boolean[] = []
-  const starts: number[] = []
-  for (const [alternatives, ofDirectoryForm] of [
-    [whole, false],
-    [withoutSuffix, true],
-  ] as const) {
-    for (const alternative of alternatives) {
-      starts.push(components.length)
-      alternative.forEach((component, i) => {
-        components.push(component)
-        isLast.push(i === alternative.length - 1)
-        isDirectoryForm.push(ofDirectoryForm)
-      })
+  const open = (into: Set<number>, position: number | undefined): void => {
+    for (let p = position; p !== undefined && !into.has(p); ) {
+      into.add(p)
+      const state = states[p]!
+      p = 'then' in state ? state.then : undefined
     }
   }
-  const fits = (p: number, name: string): boolean => {
-    const component = components[p]!
-    return component === '**' || component.test(name)
-  }
-  // A `**` that is not the last component also matches no name at all.
-  const close = (positions: Set<number>): readonly number[] => {
-    for (const p of positions) {
-      if (components[p] === '**' && !isLast[p]) positions.add(p + 1)
-    }
-    return [...positions].sort((x, y) => x - y)
-  }
+  const sorted = (positions: Set<number>): readonly number[] =>
+    [...positions].sort((x, y) => x - y)
   const endsAt = (
     positions: readonly number[],
     name: string,
     ofDirectoryForm: boolean,
   ): boolean =>
-    positions.some(
-      p => isLast[p] && isDirectoryForm[p] === ofDirectoryForm && fits(p, name),
-    )
+    positions.some(p => {
+      if (p >= firstOfDirectoryForm !== ofDirectoryForm) return false
+      const state = states[p]!
+      return 'then' in state
+        ? state.then === undefined
+        : state.edges.some(e => e.to === undefined && e.regex.test(name))
+    })
+  const start = new Set<number>()
+  for (const p of starts) open(start, p)
   return {
     splits: true,
-    start: close(new Set(starts)),
+    start: sorted(start),
     next: (positions, name) => {
       const next = new Set<number>()
       for (const p of positions) {
-        if (components[p] === '**') next.add(p)
-        else if (!isLast[p] && fits(p, name)) next.add(p + 1)
+        const state = states[p]!
+        if ('then' in state) open(next, p)
+        else {
+          for (const edge of state.edges) {
+            if (edge.to !== undefined && edge.regex.test(name)) {
+              open(next, edge.to)
+            }
+          }
+        }
       }
-      return close(next)
+      return sorted(next)
     },
     matches: (positions, name) => endsAt(positions, name, false),
     matchesDirectoryForm: (positions, name) => endsAt(positions, name, true),
@@ -1531,15 +1550,17 @@ export function walkGlobPattern(
     )
   }
 
-  // A search of the directories the pattern reaches, each listed once per set
-  // of positions: the names for one directory are as many as the routes the
-  // links offer (n directories linking to each other: about e*n!), while the
-  // sets of positions are as many as the pattern has, whatever the tree
-  // holds. One readdir per directory rather than readdirSync's `recursive`
-  // option, so an unreadable subtree costs only itself, not the whole
-  // pattern. A directory that is not there is not a case of its own: the
-  // listing below tells an absent directory from one that must be denied
-  // whole.
+  // A search of (directory, position): each real directory is listed once
+  // for each position a spelling of it leads to. The names for one directory
+  // are as many as the routes the links offer (n directories linking to each
+  // other: about e*n!), and the sets of positions a tree can lead to are as
+  // many as the subsets of them, while the positions are as many as the
+  // pattern has, whatever the tree holds. So the work is the size of the tree
+  // times the length of the pattern. One readdir per directory rather than
+  // readdirSync's `recursive` option, so an unreadable subtree costs only
+  // itself, not the whole pattern. A directory that is not there is not a
+  // case of its own: the listing below tells an absent directory from one
+  // that must be denied whole.
   //
   // Nothing here grows with the links a tree holds. An entry is matched from
   // its directory's positions and its own name, never against a spelling, and
@@ -1557,7 +1578,11 @@ export function walkGlobPattern(
     short: string
     positions: readonly number[]
   }
-  const listed = new Set<string>()
+  /** The positions each real directory has been listed for. */
+  const listedFor = new Map<string, Set<number>>()
+  /** Successful listings, by real directory: a second position reads the
+   *  same entries. */
+  const listings = new Map<string, fs.Dirent[]>()
   const pending: Frame[] = []
   /** A filesystem call on a real path, and on a shorter name for it when that
    *  fails. The real path crosses no link, so a long chain of them cannot
@@ -1615,14 +1640,19 @@ export function walkGlobPattern(
   })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real } = frame
-    const state = `${real}\0${frame.positions.join()}`
-    if (listed.has(state)) continue
-    listed.add(state)
-    let entries: fs.Dirent[]
+    let listed = listedFor.get(real)
+    if (listed === undefined) listedFor.set(real, (listed = new Set()))
+    // What a position finds beneath a directory does not depend on the
+    // others it came with, so only the ones new to this directory are taken.
+    const fresh = frame.positions.filter(p => !listed.has(p))
+    if (fresh.length === 0) continue
+    for (const p of fresh) listed.add(p)
+    let entries = listings.get(real)
     try {
-      entries = onRealPath(real, frame.short, p =>
+      entries ??= onRealPath(real, frame.short, p =>
         fs.readdirSync(p, { withFileTypes: true }),
       )
+      listings.set(real, entries)
     } catch (err) {
       const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
       logForDebugging(
@@ -1639,13 +1669,13 @@ export function walkGlobPattern(
       const fullPath = path.join(dir, entry.name)
       const realPath = path.join(real, entry.name)
       const candidate = toForwardSlashes(fullPath)
-      const isMatch = positions.matches(frame.positions, entry.name, candidate)
+      const isMatch = positions.matches(fresh, entry.name, candidate)
       if (isMatch) walk.matches.push(fullPath)
       if (entry.isDirectory()) {
-        const beneath = positions.next(frame.positions, entry.name)
+        const beneath = positions.next(fresh, entry.name)
         const isDirectoryMatch =
           opts.withDirectoryForm === true &&
-          positions.matchesDirectoryForm(frame.positions, entry.name, candidate)
+          positions.matchesDirectoryForm(fresh, entry.name, candidate)
         if (isDirectoryMatch) walk.directoryMatches.push(fullPath)
         if ((isMatch || isDirectoryMatch) && realPath !== fullPath) {
           walk.realOf.set(fullPath, realPath)
@@ -1675,13 +1705,11 @@ export function walkGlobPattern(
       if (!opts.followSymlinkedDirectories) continue
       const isDirectoryFormCandidate =
         opts.withDirectoryForm === true &&
-        positions.matchesDirectoryForm(frame.positions, entry.name, candidate)
+        positions.matchesDirectoryForm(fresh, entry.name, candidate)
       // A pattern that does not split is not listed through a link: no two
       // names for a directory can be told apart, so none but its own is
       // listed. A link that is itself a match still denies what it leads to.
-      const beneath = positions.splits
-        ? positions.next(frame.positions, entry.name)
-        : []
+      const beneath = positions.splits ? positions.next(fresh, entry.name) : []
       if (!isMatch && !isDirectoryFormCandidate && beneath.length === 0) {
         continue
       }

@@ -504,6 +504,41 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
+  it.if(isLinux)(
+    'looks at a link by a shorter name when its real path is too long to name',
+    () => {
+      // deep is a real directory whose path is a few bytes short of PATH_MAX,
+      // so deep/key.pem cannot be named by its real path at all, only through
+      // base/s. The link is a match, and what it leads to has to be found.
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-long-')))
+      let deep = join(root, 'deep')
+      while (deep.length < 4090) {
+        deep = join(deep, 'd'.repeat(Math.min(200, 4090 - deep.length - 1)))
+      }
+      const viaLink = join(root, 'base', 's', 'key.pem')
+      try {
+        mkdirSync(deep, { recursive: true })
+        mkdirSync(join(root, 'base'))
+        writeFileSync(join(root, 'secret.txt'), 'KEY')
+        symlinkSync(deep, join(root, 'base', 's'))
+        symlinkSync(join(root, 'secret.txt'), viaLink)
+        expect(join(deep, 'key.pem').length).toBeGreaterThan(4095)
+
+        const walk = walkGlobPattern(join(root, 'base', '*/*.pem'), {
+          followSymlinkedDirectories: true,
+        })
+
+        expect(walk.unlisted).toEqual([])
+        expect(walk.matches.map(m => walk.realOf.get(m))).toEqual([
+          join(root, 'secret.txt'),
+        ])
+      } finally {
+        rmSync(viaLink, { force: true })
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
   it('lists a directory once, whatever the number of names that lead to it', () => {
     // N packages that each link to every other. Every chain of distinct
     // packages spells the same N files differently, which is about e*N! of
