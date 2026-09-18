@@ -8,7 +8,7 @@ on:
 
 jobs:
   integration-tests:
-    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})
+    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})${{ matrix.probe && format(' probe {0}', matrix.probe) || '' }}
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -35,6 +35,15 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
             os: windows
+          # TEMPORARY, remove before merge: extra copies of the Windows arm64
+          # leg, to sample an intermittent hang in the srt-win exec smoke
+          # test faster. `probe` only changes the job name, so the required
+          # check above keeps its name.
+          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 2 }
+          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 3 }
+          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 4 }
+          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 5 }
+          - { arch: arm64, runner: windows-11-arm, os: windows, probe: 6 }
 
     steps:
       - name: Checkout code
@@ -222,7 +231,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.os }}-${{ matrix.arch }}
+          name: test-results-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.probe && format('-probe{0}', matrix.probe) || '' }}
           path: |
             test-results/
             *.log
