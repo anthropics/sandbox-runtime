@@ -319,10 +319,7 @@ export function terminateAndForward(
  * different client connections never share an upstream socket, and the
  * upstream connection lives exactly as long as the client's. One socket keeps
  * the client's request order on the wire: a pipelined request queues in the
- * agent until the previous response has finished. Bun before 1.4 pools
- * node:https connections process-wide and ignores `maxSockets`; its pool is
- * still keyed on host, port, servername and CA, so a socket is only ever
- * shared between client connections to the same target.
+ * agent until the previous response has finished.
  *
  * `ca` and `checkServerIdentity` are agent options, not request options — a
  * per-request `checkServerIdentity` makes Node open a new socket for every
