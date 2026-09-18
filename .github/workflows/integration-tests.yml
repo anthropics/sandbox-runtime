@@ -136,7 +136,12 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
-          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts
+          # These are listed explicitly because the non-Windows legs run the
+          # whole tree: winsrt-paths.property is the only property suite over
+          # the Windows path pipeline, glob-expand holds the UNC pass-raw
+          # block that runs on no other leg, and config-validation covers the
+          # schema on a real Windows host rather than under a platform spy.
+          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
