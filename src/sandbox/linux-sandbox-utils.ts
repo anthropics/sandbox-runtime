@@ -7,7 +7,11 @@ import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
-import { ripGrep, RipgrepError } from '../utils/ripgrep.js'
+import {
+  ripGrep,
+  RipgrepError,
+  DEFAULT_RIPGREP_TIMEOUT_MS,
+} from '../utils/ripgrep.js'
 import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
@@ -433,33 +437,118 @@ function indexOfSegmentRun(segments: string[], parts: string[]): number {
   )
 }
 
+/** The errno a walk of an unreadable directory ends on. */
+const EACCES = 13
+/** The errno a walk of something that has gone away ends on. */
+const ENOENT = 2
+
 /**
- * What a failed ripgrep run said about itself, in the two kinds of line it
- * can hold: the paths under `cwd` it could not read, and the lines that name
- * no such path. Denying the first is how the scan fails closed — their
- * contents are unknown, so a nested repository inside one must not stay
- * writable — while nothing here stands in for the second, which is why the
- * caller refuses the wrap over one. rg reports `<path>: <message>`; a path
- * holding `: ` is cut short at it, which denies an ancestor and so only ever
- * denies more.
+ * Every OS error code a failed ripgrep run mentioned, from the `(os error N)`
+ * tokens rg appends to each diagnostic. NO PATH IS EVER TAKEN FROM THIS TEXT:
+ * a directory's name is chosen by whoever created it and lands in stderr
+ * unescaped, so any path read out of a line can be a name rather than the
+ * file rg failed on. A name can only ADD tokens, and an unrecognised token
+ * refuses the wrap, so the worst a chosen name does is refuse.
  */
-function ripgrepFailureDiagnostics(
-  stderr: string,
-  cwd: string,
-): { unreadablePaths: string[]; linesNamingNoPath: string[] } {
-  const prefix = cwd + path.sep
-  const unreadablePaths = new Set<string>()
-  const linesNamingNoPath: string[] = []
-  for (const line of stderr.split('\n')) {
-    if (line.trim() === '') continue
-    const start = line.indexOf(prefix)
-    const rest = start === -1 ? '' : line.slice(start)
-    const end = rest.indexOf(': ')
-    const candidate = (end === -1 ? rest : rest.slice(0, end)).trimEnd()
-    if (candidate.length > prefix.length) unreadablePaths.add(candidate)
-    else linesNamingNoPath.push(line)
+function ripgrepFailureErrnos(stderr: string): Set<number> {
+  const errnos = new Set<number>()
+  for (const match of stderr.matchAll(/\(os error (\d+)\)/g)) {
+    errnos.add(Number(match[1]))
   }
-  return { unreadablePaths: [...unreadablePaths], linesNamingNoPath }
+  return errnos
+}
+
+/** At most `limit` characters of `text`, with what was dropped noted. */
+function truncated(text: string, limit = 400): string {
+  const collapsed = text.trim()
+  return collapsed.length <= limit
+    ? collapsed
+    : `${collapsed.slice(0, limit)}… (${collapsed.length - limit} more characters)`
+}
+
+/**
+ * The directories under `cwd` this process cannot read — cannot list at all,
+ * or holding an entry it cannot type — walked the way the scan walks:
+ * `readdir` with the kernel's own entry types, symlinks not followed,
+ * `node_modules` skipped as the scan's globs skip it, no deeper than the
+ * scan reaches. This is what stands in for parsing paths out of rg's stderr:
+ * the answer comes off the filesystem, so a directory NAME cannot add to it,
+ * aim it elsewhere, or empty it. `collectGitDirs` also gathers the `.git`
+ * directories the walk passes.
+ *
+ * Throws {@link LinuxSandboxProfileError} when `deadline` passes: the walk
+ * spends what is left of the scan's own time budget and no more.
+ */
+function walkScanDirectories(
+  cwd: string,
+  maxDepth: number,
+  deadline: number,
+  collectGitDirs = false,
+): { unreadableDirs: string[]; gitDirs: string[] } {
+  const unreadableDirs: string[] = []
+  const gitDirs: string[] = []
+
+  const isDirectory = (
+    entry: fs.Dirent,
+    child: string,
+  ): boolean | undefined => {
+    if (entry.isDirectory()) return true
+    if (
+      entry.isFile() ||
+      entry.isSymbolicLink() ||
+      entry.isFIFO() ||
+      entry.isSocket() ||
+      entry.isBlockDevice() ||
+      entry.isCharacterDevice()
+    ) {
+      return false
+    }
+    // The filesystem returned no type with the entry (DT_UNKNOWN), so ask.
+    try {
+      return fs.lstatSync(child).isDirectory()
+    } catch (err) {
+      // Gone since the listing: nothing there to walk or to deny.
+      return isAbsenceErrno(err) ? false : undefined
+    }
+  }
+
+  const walk = (dir: string, depth: number): void => {
+    if (Date.now() > deadline) {
+      throw denyScanFailed(
+        cwd,
+        'left too little of its time budget to walk what it could not report on',
+        new Error(`the walk stopped at ${dir}`),
+      )
+    }
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch (err) {
+      // Absent means it went away mid-walk, which leaves nothing to deny.
+      if (!isAbsenceErrno(err)) unreadableDirs.push(dir)
+      return
+    }
+    for (const entry of entries) {
+      // Excluded from the scan's globs, so rg never reports one either.
+      if (entry.name === 'node_modules') continue
+      const child = path.join(dir, entry.name)
+      const directory = isDirectory(entry, child)
+      if (directory === undefined) {
+        unreadableDirs.push(dir)
+        return
+      }
+      if (!directory) continue
+      if (collectGitDirs && entry.name === '.git' && depth + 2 <= maxDepth) {
+        // The depth the scan itself reaches a repository at: it recognises
+        // one by a file directly inside .git, one level further down.
+        gitDirs.push(child)
+      }
+      if (depth + 1 < maxDepth) walk(child, depth + 1)
+    }
+  }
+
+  walk(cwd, 0)
+  return { unreadableDirs, gitDirs }
 }
 
 /**
@@ -597,8 +686,9 @@ export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
  * deliver what is below the working directory aborts the wrap rather than
  * sandboxing with a deny list of unknown completeness: one that could not be
  * run at all, one that does not finish inside {@link ripGrep}'s timeout, and
- * one that fails for a reason no deny stands in for. The single failure that
- * is not fatal is a directory it could not read, which is denied whole.
+ * one that failed for a reason no deny stands in for. The failures that are
+ * not fatal are told apart by the `(os error N)` codes on stderr and never
+ * by the paths printed beside them — see {@link ripgrepFailureErrnos}.
  */
 async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: RipgrepConfig = { command: 'rg' },
@@ -607,6 +697,10 @@ async function linuxGetMandatoryDenyPaths(
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const cwd = process.cwd()
+  // The whole budget, scan and any walk of its own this has to make: a walk
+  // started because the scan failed spends what the scan left of it.
+  const deadline =
+    Date.now() + (ripgrepConfig.timeoutMs ?? DEFAULT_RIPGREP_TIMEOUT_MS)
   // Use provided signal or create a fallback controller
   const fallbackController = new AbortController()
   const signal = abortSignal ?? fallbackController.signal
@@ -623,6 +717,8 @@ async function linuxGetMandatoryDenyPaths(
     seenGitDirs.add(gitDir)
     denyPaths.push(...gitDirTreeDenyPaths(gitDir, allowGitConfig))
   }
+  const walkScan = (collectGitDirs: boolean) =>
+    walkScanDirectories(cwd, maxDepth, deadline, collectGitDirs)
 
   // Build iglob args for all patterns in one ripgrep call
   const iglobArgs: string[] = []
@@ -658,6 +754,11 @@ async function linuxGetMandatoryDenyPaths(
         '--max-depth',
         String(maxDepth),
         ...iglobArgs,
+        // The directory itself as well as what is under it: excluding only
+        // the contents leaves rg trying to open an unreadable node_modules,
+        // which fails the whole run over a directory nothing here wants.
+        '-g',
+        '!**/node_modules',
         '-g',
         '!**/node_modules/**',
       ],
@@ -680,28 +781,50 @@ async function linuxGetMandatoryDenyPaths(
       // an unreached nested repository would be one with writable hooks.
       throw denyScanFailed(cwd, 'did not finish', error)
     }
-    // An unreadable directory makes rg exit non-zero after listing the rest
-    // of the tree; those matches still count, and each directory it could not
-    // read is denied whole, since what it holds is unknown. That is the only
-    // failure a deny stands in for: where the run named something else, or
-    // nothing at all, whatever it did not reach would stay writable.
-    const { unreadablePaths, linesNamingNoPath } = ripgrepFailureDiagnostics(
-      error.stderr,
-      cwd,
+    // rg lists the rest of the tree and exits non-zero when an entry gets in
+    // its way, so the matches still count — but only where every code it
+    // reported is one a deny stands in for. Anything else, and anything that
+    // reported no code at all, leaves whatever the run did not reach unknown.
+    const errnos = ripgrepFailureErrnos(error.stderr)
+    const stoodInFor = [...errnos].every(
+      errno => errno === ENOENT || errno === EACCES,
     )
-    if (unreadablePaths.length === 0 || linesNamingNoPath.length > 0) {
+    if (errnos.size === 0 || !stoodInFor) {
       throw denyScanFailed(
         cwd,
-        'failed for a reason no deny stands in for',
+        `failed for a reason no deny stands in for: ${truncated(error.stderr) || '(nothing on stderr)'}`,
         error,
       )
     }
     matches = error.partialMatches
-    denyPaths.push(...unreadablePaths)
-    logForDebugging(
-      `[Sandbox] ripgrep scan of ${cwd} could not read ${unreadablePaths.length} of the directories under it, which are denied whole; the ${matches.length} paths it did list still count: ${error}`,
-      { level: 'warn' },
-    )
+    if (errnos.has(EACCES)) {
+      // A directory rg could not read holds an unknown tree, so it is denied
+      // whole. WHICH directories is settled by walking the filesystem, not by
+      // reading rg's stderr: a name in there is chosen by whoever made the
+      // directory. A walk finding none means the run failed over something
+      // this cannot see, so there is nothing to stand in for it.
+      const { unreadableDirs } = walkScan(false)
+      if (unreadableDirs.length === 0) {
+        throw denyScanFailed(
+          cwd,
+          `reported a directory it could not read, and none is there now: ${truncated(error.stderr)}`,
+          error,
+        )
+      }
+      denyPaths.push(...unreadableDirs)
+      logForDebugging(
+        `[Sandbox] ripgrep scan of ${cwd} could not read ${unreadableDirs.length} of the directories under it, which are denied whole; the ${matches.length} paths it did list still count: ${error}`,
+        { level: 'warn' },
+      )
+    } else {
+      // Every code was ENOENT: entries that went away while rg walked. There
+      // is nothing at those paths to deny, and mounting one would plant a
+      // file on the host where the command deleted one.
+      logForDebugging(
+        `[Sandbox] ripgrep scan of ${cwd} lost entries while it walked, which leaves nothing to deny; the ${matches.length} paths it did list still count: ${error}`,
+        { level: 'warn' },
+      )
+    }
   }
 
   const dirPatterns = dangerousDirectories.map(d =>

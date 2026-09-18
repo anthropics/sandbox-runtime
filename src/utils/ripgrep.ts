@@ -7,11 +7,14 @@ export interface RipgrepConfig {
   args?: string[]
   /** Override argv[0] when spawning (for multicall binaries that dispatch on argv[0]) */
   argv0?: string
-  /** How long the run may take before it is killed (default: 10 s). */
+  /**
+   * How long the run may take before it is killed (default:
+   * {@link DEFAULT_RIPGREP_TIMEOUT_MS}).
+   */
   timeoutMs?: number
 }
 
-const DEFAULT_RIPGREP_TIMEOUT_MS = 10_000
+export const DEFAULT_RIPGREP_TIMEOUT_MS = 10_000
 
 /**
  * Check if ripgrep (rg) is available synchronously
@@ -25,8 +28,10 @@ export function hasRipgrepSync(): boolean {
  * ripgrep exited with an error status. `partialMatches` is what it listed
  * before that: rg reports an unreadable directory with exit code 2 after
  * printing every match it could reach, and names each one in `stderr`.
- * `timedOut` says the run was killed instead of finishing, so what it listed
- * is a prefix of an unknown whole rather than everything it could reach.
+ * `timedOut` says the run lasted as long as it was given and was killed for
+ * it, so what it listed is a prefix of an unknown whole rather than
+ * everything it could reach. A run killed by anything else says so in its
+ * message and is not a timeout.
  */
 export class RipgrepError extends Error {
   readonly partialMatches: string[]
@@ -74,12 +79,21 @@ export async function ripGrep(
     timeoutMs = DEFAULT_RIPGREP_TIMEOUT_MS,
   } = config
 
-  const child = spawn(command, [...commandArgs, '--null', ...args, target], {
-    argv0,
-    signal: abortSignal,
-    timeout: timeoutMs,
-    windowsHide: true,
-  })
+  const startedAt = Date.now()
+  const child = spawn(
+    // --no-config: RIPGREP_CONFIG_PATH routinely points inside a project, at
+    // a file a sandboxed command can write, and one line of it
+    // (--max-filesize=1) is enough to make a scan return nothing at all and
+    // no error with it.
+    command,
+    [...commandArgs, '--no-config', '--null', ...args, target],
+    {
+      argv0,
+      signal: abortSignal,
+      timeout: timeoutMs,
+      windowsHide: true,
+    },
+  )
 
   const [stdout, stderr, exit] = await Promise.all([
     text(child.stdout),
@@ -100,17 +114,21 @@ export async function ripGrep(
     // Exit code 1 means "no matches found" - this is normal
     return []
   }
-  // A null exit code means the child was killed rather than exiting. An
-  // abort rejects through the error handler above, so here it is the timeout.
-  const timedOut = exit.code === null
-  throw new RipgrepError(
-    timedOut
-      ? `ripgrep was killed by ${exit.signal ?? 'a signal'} after ${timeoutMs} ms: ${stderr}`
-      : `ripgrep failed with exit code ${exit.code}: ${stderr}`,
-    matches,
-    stderr,
-    timedOut,
-  )
+  // A null exit code means the child was killed rather than exiting. The
+  // timeout is one reason for that and not the only one — a Ctrl-C to the
+  // process group, an OOM kill — so it is the one this claims only where the
+  // run actually lasted as long as it was given. The rest are reported as
+  // what they were; upstream refuses either way, with an accurate message.
+  const killed = exit.code === null
+  const elapsedMs = Date.now() - startedAt
+  const timedOut = killed && elapsedMs >= timeoutMs
+  const killedBy = exit.signal ?? 'a signal'
+  const failure = timedOut
+    ? `ripgrep was killed by ${killedBy} after ${elapsedMs} ms, the ${timeoutMs} ms it was given`
+    : killed
+      ? `ripgrep was killed by ${killedBy} after ${elapsedMs} ms, inside the ${timeoutMs} ms it was given`
+      : `ripgrep failed with exit code ${exit.code}`
+  throw new RipgrepError(`${failure}: ${stderr}`, matches, stderr, timedOut)
 }
 
 /** NUL-terminated records, dropping an unterminated (truncated) last one. */
