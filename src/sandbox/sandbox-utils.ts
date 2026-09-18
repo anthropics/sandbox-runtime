@@ -1217,33 +1217,73 @@ export function expandGlobPattern(
 }
 
 /**
- * A test for whether `normalizedPattern` can match anything strictly beneath
- * a directory, so the walk lists only directories that can hold a match
- * (`proj/*.pem` lists `proj` alone). Segment by segment up to the first one
- * that can span directories (`**`); from there on every directory qualifies.
- * A pattern with no such segment matches at exactly its own depth. Errs
- * towards descending: a bracket expression holding a `/` cannot be split
- * into segments, so nothing is pruned for it.
+ * Where in a pattern the names beneath a directory carry on matching: the
+ * indices of the pattern components the next name is matched against, given
+ * the directory's own spelling. What the pattern matches beneath a directory
+ * depends on that spelling only through these positions, so the walk lists a
+ * real directory once per set of them however many names lead to it, and
+ * lists no directory that has none (`proj/*.pem` lists `proj` alone). Beneath
+ * `**\/.env` every spelling has the same positions; beneath
+ * `**\/secrets/*.pem` a directory named `secrets` has one more.
+ *
+ * `splits` is false for a pattern that cannot be followed one component at a
+ * time: a `**` that is not a whole component, or a bracket expression that
+ * can match `/`. Its positions say nothing, so every directory is listed and
+ * {@link walkGlobPattern} does not list such a pattern through symlinks.
  */
-function globDescentFilter(
+interface GlobPositions {
+  splits: boolean
+  /** The positions beneath the root directory. */
+  start: readonly number[]
+  next: (positions: readonly number[], name: string) => readonly number[]
+}
+
+function globPositions(
   normalizedPattern: string,
   flags: string,
-): (dir: string) => boolean {
-  if (/\[[^\]]*\/[^\]]*\]/.test(normalizedPattern)) return () => true
+): GlobPositions {
+  const unsplit: GlobPositions = {
+    splits: false,
+    start: [0],
+    next: () => [0],
+  }
   const segments = normalizedPattern.split('/')
-  const spanning = segments.findIndex(segment => segment.includes('**'))
-  const fixedDepth = spanning === -1 ? segments.length : spanning
-  const segmentRegexes = segments
-    .slice(0, fixedDepth)
-    .map(segment => new RegExp(globToRegex(segment), flags))
-  return dir => {
-    const dirSegments = dir.split('/')
-    if (spanning === -1 && dirSegments.length >= segments.length) return false
-    const compared = Math.min(dirSegments.length, fixedDepth)
-    for (let i = 0; i < compared; i++) {
-      if (!segmentRegexes[i]!.test(dirSegments[i]!)) return false
+  const brackets = normalizedPattern.match(/\[[^\]]*\]/g) ?? []
+  let regexes: RegExp[]
+  try {
+    const splits =
+      segments.every(s => s === '**' || !s.includes('**')) &&
+      // globToRegex rewrites a wildcard inside a bracket expression too,
+      // which then no longer reads as one character.
+      brackets.every(
+        b => !/[*?]/.test(b) && !new RegExp(globToRegex(b), flags).test('/'),
+      )
+    if (!splits) return unsplit
+    regexes = segments.map(s => new RegExp(globToRegex(s), flags))
+  } catch {
+    // A component that is no regular expression on its own.
+    return unsplit
+  }
+
+  const last = segments.length - 1
+  // A `**` that is not the last component also matches no name at all.
+  const close = (positions: Set<number>): readonly number[] => {
+    for (const p of positions) {
+      if (segments[p] === '**' && p < last) positions.add(p + 1)
     }
-    return true
+    return [...positions].sort((x, y) => x - y)
+  }
+  return {
+    splits: true,
+    start: close(new Set([0])),
+    next: (positions, name) => {
+      const next = new Set<number>()
+      for (const p of positions) {
+        if (segments[p] === '**') next.add(p)
+        else if (p < last && regexes[p]!.test(name)) next.add(p + 1)
+      }
+      return close(next)
+    },
   }
 }
 
@@ -1274,17 +1314,6 @@ export function globPatternBaseDir(normalizedPattern: string): string {
 export function toForwardSlashes(s: string): string {
   return process.platform === 'win32' ? s.replace(/\\/g, '/') : s
 }
-
-/**
- * How many names for one real directory a single walk lists. Every name
- * lists the same entries, and every match is reported where it really lives,
- * so a further name adds only the spelling each match was found under — while
- * n directories linking to each other offer about e*n! of them (n=10: 9.9M),
- * which a sandboxed command with write access under the pattern's base can
- * plant. Past this count a directory is recorded as unlisted rather than
- * walked, so a deny expansion covers it whole instead of losing it.
- */
-const GLOB_WALK_MAX_NAMES_PER_DIRECTORY = 8
 
 /**
  * The walk behind {@link expandGlobPattern}: one listing of the pattern's
@@ -1328,45 +1357,36 @@ export function walkGlobPattern(
     opts.withDirectoryForm && directoryForm !== normalizedPattern
       ? new RegExp(globToRegex(directoryForm), flags)
       : undefined
-  const canHoldMatch = globDescentFilter(normalizedPattern, flags)
+  const positions = globPositions(normalizedPattern, flags)
+  // A pattern that does not split is matched against real paths only: no two
+  // names for a directory can be told apart, so none but its own is listed.
+  const followLinks =
+    opts.followSymlinkedDirectories === true && positions.splits
+  if (opts.followSymlinkedDirectories && !positions.splits) {
+    logForDebugging(
+      `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time, so it is matched against real paths only and not through symlinked directories`,
+      { level: 'warn' },
+    )
+  }
 
-  // One readdir per directory rather than readdirSync's `recursive` option,
-  // so an unreadable subtree or a symlink cycle costs only itself, not the
-  // whole pattern. A directory that is not there is not a case of its own:
-  // the listing below tells an absent directory from one that must be
-  // denied whole.
+  // A search of the directories the pattern reaches, each listed once per set
+  // of positions: the names for one directory are as many as the routes the
+  // links offer (n directories linking to each other: about e*n!), while the
+  // sets of positions are as many as the pattern has, whatever the tree
+  // holds. One readdir per directory rather than readdirSync's `recursive`
+  // option, so an unreadable subtree costs only itself, not the whole
+  // pattern. Every filesystem call names a real path — a spelling is only
+  // ever matched — so a chain of links cannot fail one (ELOOP). A directory
+  // that is not there is not a case of its own: the listing below tells an
+  // absent directory from one that must be denied whole.
   type Frame = {
     dir: string
     /** `dir` with every symlink resolved. */
     real: string
-    /** The real directory each symlink on the way here was taken from. */
-    linkedFrom: readonly string[]
+    positions: readonly number[]
   }
-  /** Successful listings, by real directory: a directory reached by a second
-   *  name holds the same entries. A failure is never cached — it can belong
-   *  to the route rather than to the directory (ELOOP, ENAMETOOLONG) and
-   *  would then answer for every other name. */
-  const listings = new Map<string, fs.Dirent[]>()
-  const namesWalked = new Map<string, number>()
+  const listed = new Set<string>()
   const pending: Frame[] = []
-  /** Queue a directory to list, unless its real location already has
-   *  {@link GLOB_WALK_MAX_NAMES_PER_DIRECTORY} names in this walk. */
-  const queue = (frame: Frame): boolean => {
-    const walked = namesWalked.get(frame.real) ?? 0
-    if (walked >= GLOB_WALK_MAX_NAMES_PER_DIRECTORY) return false
-    namesWalked.set(frame.real, walked + 1)
-    pending.push(frame)
-    return true
-  }
-  /** Record a directory the walk refused to list under one more name. */
-  const refuseToWalk = (dir: string, real: string): void => {
-    logForDebugging(
-      `[Sandbox] Not listing ${dir} for glob pattern ${globPath}: ${real} already has ${GLOB_WALK_MAX_NAMES_PER_DIRECTORY} names in this walk, so it is covered whole instead`,
-      { level: 'warn' },
-    )
-    walk.unlisted.push(dir)
-    if (real !== dir) walk.realOf.set(dir, real)
-  }
   /** Where a symlink leads and whether that is a directory. 'absent' when
    *  nothing is there to descend into; 'uninspectable' when something is and
    *  it could not be looked at, which is not the same thing: a same-uid
@@ -1377,14 +1397,14 @@ export function walkGlobPattern(
     | 'absent'
     | 'uninspectable'
   const linkTargets = new Map<string, LinkTarget>()
-  const linkTargetOf = (linkPath: string, realLinkPath: string): LinkTarget => {
+  const linkTargetOf = (realLinkPath: string): LinkTarget => {
     const cached = linkTargets.get(realLinkPath)
     if (cached !== undefined) return cached
     let target: LinkTarget
     try {
       target = {
-        isDirectory: fs.statSync(linkPath).isDirectory(),
-        real: fs.realpathSync(linkPath),
+        isDirectory: fs.statSync(realLinkPath).isDirectory(),
+        real: fs.realpathSync(realLinkPath),
       }
     } catch (err) {
       target = isAbsenceErrno(err) ? 'absent' : 'uninspectable'
@@ -1400,26 +1420,30 @@ export function walkGlobPattern(
     // Not there, or a component of it cannot be resolved: list the spelling.
   }
   walk.baseLocation = baseReal
-  queue({ dir: baseDir, real: baseReal, linkedFrom: [] })
+  pending.push({
+    dir: baseDir,
+    real: baseReal,
+    positions: baseDir.split('/').reduce(positions.next, positions.start),
+  })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
-    const { dir, real, linkedFrom } = frame
-    let entries = listings.get(real)
-    if (entries === undefined) {
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true })
-      } catch (err) {
-        const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
-        logForDebugging(
-          `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
-          { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
-        )
-        if (errorCode !== 'ENOENT') {
-          walk.unlisted.push(dir)
-          if (real !== dir) walk.realOf.set(dir, real)
-        }
-        continue
+    const { dir, real } = frame
+    const state = `${real}\0${frame.positions.join()}`
+    if (listed.has(state)) continue
+    listed.add(state)
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(real, { withFileTypes: true })
+    } catch (err) {
+      const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+      logForDebugging(
+        `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
+        { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
+      )
+      if (errorCode !== 'ENOENT') {
+        walk.unlisted.push(dir)
+        if (real !== dir) walk.realOf.set(dir, real)
       }
-      listings.set(real, entries)
+      continue
     }
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name)
@@ -1427,17 +1451,16 @@ export function walkGlobPattern(
       const candidate = toForwardSlashes(fullPath)
       const isMatch = regex.test(candidate)
       if (isMatch) walk.matches.push(fullPath)
+      // Empty when the pattern can match nothing beneath this entry.
+      const beneath = positions.next(frame.positions, entry.name)
       if (entry.isDirectory()) {
         const isDirectoryMatch = directoryRegex?.test(candidate) === true
         if (isDirectoryMatch) walk.directoryMatches.push(fullPath)
         if ((isMatch || isDirectoryMatch) && realPath !== fullPath) {
           walk.realOf.set(fullPath, realPath)
         }
-        if (
-          canHoldMatch(candidate) &&
-          !queue({ dir: fullPath, real: realPath, linkedFrom })
-        ) {
-          refuseToWalk(fullPath, realPath)
+        if (beneath.length > 0) {
+          pending.push({ dir: fullPath, real: realPath, positions: beneath })
         }
         continue
       }
@@ -1452,13 +1475,13 @@ export function walkGlobPattern(
       // has to cover what the pattern reaches by every name. The allowRead
       // expansion and the Windows ACL stamp take the link itself and stop
       // there, as the allow bind and the ACL they feed do — Windows does not
-      // follow reparse points at all, and the cycle check below compares
-      // POSIX-separated paths.
-      if (!opts.followSymlinkedDirectories) continue
+      // follow reparse points at all.
+      if (!followLinks) continue
       const isDirectoryFormCandidate = directoryRegex?.test(candidate) === true
-      const descends = canHoldMatch(candidate)
-      if (!isMatch && !isDirectoryFormCandidate && !descends) continue
-      const target = linkTargetOf(fullPath, realPath)
+      if (!isMatch && !isDirectoryFormCandidate && beneath.length === 0) {
+        continue
+      }
+      const target = linkTargetOf(realPath)
       if (target === 'absent') continue
       if (target === 'uninspectable') {
         // Where it leads is unknown, so it gets no real location and nothing
@@ -1474,28 +1497,20 @@ export function walkGlobPattern(
         walk.directoryMatches.push(fullPath)
         walk.realOf.set(fullPath, target.real)
       }
-      if (!descends) continue
-      // A link whose target is at or above a directory on the current
-      // descent (the real directory each earlier link was taken from, and
-      // this one) is never followed: that walk would not terminate.
-      const cycle = [...linkedFrom, real].some(from =>
-        isAtOrUnder(from, target.real),
-      )
-      if (cycle) {
+      if (beneath.length === 0) continue
+      // A link that leads up — to this directory or above it, or to the
+      // walk's base or above it — is not listed through: beneath it is a tree
+      // the pattern was never aimed at (`/`, a home directory).
+      if (
+        isAtOrUnder(real, target.real) ||
+        isAtOrUnder(baseReal, target.real)
+      ) {
         logForDebugging(
-          `[Sandbox] Not following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}: it leads back into its own ancestry`,
+          `[Sandbox] Not following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}: it leads back up the tree`,
         )
         continue
       }
-      if (
-        !queue({
-          dir: fullPath,
-          real: target.real,
-          linkedFrom: [...linkedFrom, real],
-        })
-      ) {
-        refuseToWalk(fullPath, target.real)
-      }
+      pending.push({ dir: fullPath, real: target.real, positions: beneath })
     }
   }
 
