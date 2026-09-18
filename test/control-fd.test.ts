@@ -410,10 +410,21 @@ describe.skipIf(isWindows)('--control-fd', () => {
 
   it('should allow stdin to pass through to child process', async () => {
     // Create a script that reads from stdin
-    const testScript = writeScript('read line\necho "GOT: $line"')
+    // TEMPORARY diagnostics: this test intermittently sees "GOT: " (empty).
+    // Report what fd 0 looked like to the child and how `read` ended.
+    const testScript = writeScript(
+      [
+        'grep -H flags /proc/self/fdinfo/0 >&2',
+        'ls -l /proc/self/fd/0 >&2',
+        'read line',
+        'rc=$?',
+        'echo "read rc=$rc" >&2',
+        'echo "GOT: $line"',
+      ].join('\n'),
+    )
 
     // Spawn with stdin as pipe (not inherit) so we can write to it
-    const { child, exited, stdout } = spawnSrt(
+    const { child, exited, stdout, stderr } = spawnSrt(
       ['--control-fd', '3', '--', testScript],
       ['pipe', 'pipe', 'pipe', 'pipe'],
     )
@@ -423,7 +434,12 @@ describe.skipIf(isWindows)('--control-fd', () => {
     stdin.write('hello from stdin\n')
 
     expect(await exited).toBe(0)
-    expect(stdout.join('')).toContain('GOT: hello from stdin')
+    if (!stdout.join('').includes('GOT: hello from stdin')) {
+      throw new Error(
+        `stdin did not reach the child. stdout=${JSON.stringify(stdout.join(''))} ` +
+          `stderr=${JSON.stringify(stderr.join(''))}`,
+      )
+    }
   })
 
   // A descriptor number that cannot carry a control channel is refused
