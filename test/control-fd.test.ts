@@ -410,52 +410,20 @@ describe.skipIf(isWindows)('--control-fd', () => {
 
   it('should allow stdin to pass through to child process', async () => {
     // Create a script that reads from stdin
-    // TEMPORARY diagnostics: this test intermittently sees "GOT: " (empty).
-    // Report what fd 0 looked like to the child and how `read` ended.
-    const testScript = writeScript(
-      [
-        'grep -H flags /proc/self/fdinfo/0 >&2',
-        'ls -l /proc/self/fd/0 >&2',
-        'read line',
-        'rc=$?',
-        'echo "read rc=$rc" >&2',
-        'echo "GOT: $line"',
-      ].join('\n'),
-    )
+    const testScript = writeScript('read line\necho "GOT: $line"')
 
     // Spawn with stdin as pipe (not inherit) so we can write to it
-    const { child, exited, stdout, stderr } = spawnSrt(
+    const { child, exited, stdout } = spawnSrt(
       ['--control-fd', '3', '--', testScript],
       ['pipe', 'pipe', 'pipe', 'pipe'],
     )
 
     // Write to stdin (fd 0)
     const stdin = child.stdin as Writable
-    // TEMPORARY: what this side of the pipe saw, with ms since the spawn.
-    const t0 = Date.now()
-    const parentSide: string[] = []
-    const note = (what: string) =>
-      parentSide.push(`${Date.now() - t0}ms ${what}`)
-    stdin.on('error', err => note(`stdin error: ${err.message}`))
-    stdin.on('close', () => note('stdin close'))
-    stdin.on('finish', () => note('stdin finish'))
-    const accepted = stdin.write('hello from stdin\n', err =>
-      note(`write callback: ${err ? err.message : 'ok'}`),
-    )
-    note(`write() returned ${accepted}`)
+    stdin.write('hello from stdin\n')
 
     expect(await exited).toBe(0)
-    note(
-      `at exit: destroyed=${stdin.destroyed} writableEnded=${stdin.writableEnded} ` +
-        `writableLength=${stdin.writableLength}`,
-    )
-    if (!stdout.join('').includes('GOT: hello from stdin')) {
-      throw new Error(
-        `stdin did not reach the child. stdout=${JSON.stringify(stdout.join(''))} ` +
-          `stderr=${JSON.stringify(stderr.join(''))} ` +
-          `parent side: ${JSON.stringify(parentSide)}`,
-      )
-    }
+    expect(stdout.join('')).toContain('GOT: hello from stdin')
   })
 
   // A descriptor number that cannot carry a control channel is refused
