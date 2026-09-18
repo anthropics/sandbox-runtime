@@ -36,6 +36,14 @@ jobs:
           - { arch: arm64,  runner: ubuntu-24.04-arm, os: linux, probe: 3 }
           - { arch: x86-64, runner: macos-15-large,   os: macos, probe: 2 }
           - { arch: arm64,  runner: macos-14,         os: macos, probe: 2 }
+          - { arch: x86-64, runner: ubuntu-latest,    os: linux, probe: 4 }
+          - { arch: x86-64, runner: ubuntu-latest,    os: linux, probe: 5 }
+          - { arch: x86-64, runner: ubuntu-latest,    os: linux, probe: 6 }
+          - { arch: arm64,  runner: ubuntu-24.04-arm, os: linux, probe: 4 }
+          - { arch: arm64,  runner: ubuntu-24.04-arm, os: linux, probe: 5 }
+          - { arch: arm64,  runner: ubuntu-24.04-arm, os: linux, probe: 6 }
+          - { arch: x86-64, runner: macos-15-large,   os: macos, probe: 3 }
+          - { arch: arm64,  runner: macos-14,         os: macos, probe: 3 }
 
     steps:
       - name: Checkout code
