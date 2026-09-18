@@ -434,27 +434,51 @@ function indexOfSegmentRun(segments: string[], parts: string[]): number {
 }
 
 /**
- * The paths under `cwd` a failed ripgrep run named in its diagnostics — the
- * directories it could not read. Denying them is how the scan fails closed:
- * their contents are unknown, so a nested repository inside one must not stay
- * writable. rg reports `<path>: <message>`; a path holding `: ` is cut short
- * at it, which denies an ancestor and so only ever denies more.
+ * What a failed ripgrep run said about itself, in the two kinds of line it
+ * can hold: the paths under `cwd` it could not read, and the lines that name
+ * no such path. Denying the first is how the scan fails closed — their
+ * contents are unknown, so a nested repository inside one must not stay
+ * writable — while nothing here stands in for the second, which is why the
+ * caller refuses the wrap over one. rg reports `<path>: <message>`; a path
+ * holding `: ` is cut short at it, which denies an ancestor and so only ever
+ * denies more.
  */
-function unreadablePathsFromRipgrepStderr(
+function ripgrepFailureDiagnostics(
   stderr: string,
   cwd: string,
-): string[] {
+): { unreadablePaths: string[]; linesNamingNoPath: string[] } {
   const prefix = cwd + path.sep
-  const paths = new Set<string>()
+  const unreadablePaths = new Set<string>()
+  const linesNamingNoPath: string[] = []
   for (const line of stderr.split('\n')) {
+    if (line.trim() === '') continue
     const start = line.indexOf(prefix)
-    if (start === -1) continue
-    const rest = line.slice(start)
+    const rest = start === -1 ? '' : line.slice(start)
     const end = rest.indexOf(': ')
     const candidate = (end === -1 ? rest : rest.slice(0, end)).trimEnd()
-    if (candidate.length > prefix.length) paths.add(candidate)
+    if (candidate.length > prefix.length) unreadablePaths.add(candidate)
+    else linesNamingNoPath.push(line)
   }
-  return [...paths]
+  return { unreadablePaths: [...unreadablePaths], linesNamingNoPath }
+}
+
+/**
+ * Refuse the wrap, naming what the scan did instead of delivering the deny
+ * paths below `cwd`. Sandboxing on a listing that stops somewhere unknown is
+ * how a nested repository keeps writable hooks, so the wrap is refused.
+ */
+function denyScanFailed(
+  cwd: string,
+  what: string,
+  cause: unknown,
+): LinuxSandboxProfileError {
+  const message =
+    `The ripgrep scan of ${cwd} ${what} (${errorText(cause)}), so what it ` +
+    `would have denied below there is unknown: the command was not run ` +
+    `rather than sandboxed behind a deny list that may leave a nested ` +
+    `repository's hooks writable`
+  logForDebugging(`[Sandbox Linux] ${message}`, { level: 'warn' })
+  return new LinuxSandboxProfileError('deny_scan_failed', message, cause)
 }
 
 /**
@@ -569,9 +593,12 @@ export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
  * Runs on each command without memoization. `--max-depth` keeps that to
  * milliseconds on ordinary trees, but `--no-ignore` means gitignored data
  * within the depth is walked too: measured at about +100 ms per command on a
- * tree with 150k ignored files three levels down. A scan that cannot finish
- * inside {@link ripGrep}'s timeout aborts the wrap rather than sandboxing
- * with a deny list of unknown completeness.
+ * tree with 150k ignored files three levels down. A scan that does not
+ * deliver what is below the working directory aborts the wrap rather than
+ * sandboxing with a deny list of unknown completeness: one that could not be
+ * run at all, one that does not finish inside {@link ripGrep}'s timeout, and
+ * one that fails for a reason no deny stands in for. The single failure that
+ * is not fatal is a directory it could not read, which is denied whole.
  */
 async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: RipgrepConfig = { command: 'rg' },
@@ -639,23 +666,40 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
-    if (error instanceof RipgrepError && error.timedOut) {
+    if (!(error instanceof RipgrepError)) {
+      // The run never got far enough to report anything of its own: the
+      // binary could not be spawned or this process is out of descriptors —
+      // the missing dependency the start-up check refuses on, met later — or
+      // the caller aborted, which is its own answer and travels as itself.
+      if ((error as { name?: unknown }).name === 'AbortError') throw error
+      throw denyScanFailed(cwd, 'could not be run', error)
+    }
+    if (error.timedOut) {
       // The command that runs next is the one that could have made the tree
       // slow to walk, so a truncated listing is not something to sandbox on:
       // an unreached nested repository would be one with writable hooks.
-      throw new Error(
-        `[Sandbox] ripgrep scan of ${cwd} did not finish; refusing to sandbox with mandatory denies of unknown completeness: ${error.message}`,
+      throw denyScanFailed(cwd, 'did not finish', error)
+    }
+    // An unreadable directory makes rg exit non-zero after listing the rest
+    // of the tree; those matches still count, and each directory it could not
+    // read is denied whole, since what it holds is unknown. That is the only
+    // failure a deny stands in for: where the run named something else, or
+    // nothing at all, whatever it did not reach would stay writable.
+    const { unreadablePaths, linesNamingNoPath } = ripgrepFailureDiagnostics(
+      error.stderr,
+      cwd,
+    )
+    if (unreadablePaths.length === 0 || linesNamingNoPath.length > 0) {
+      throw denyScanFailed(
+        cwd,
+        'failed for a reason no deny stands in for',
+        error,
       )
     }
-    if (error instanceof RipgrepError) {
-      // An unreadable directory makes rg exit non-zero after listing the rest
-      // of the tree; those matches still count, and each directory it could
-      // not read is denied whole, since what it holds is unknown.
-      matches = error.partialMatches
-      denyPaths.push(...unreadablePathsFromRipgrepStderr(error.stderr, cwd))
-    }
+    matches = error.partialMatches
+    denyPaths.push(...unreadablePaths)
     logForDebugging(
-      `[Sandbox] ripgrep scan failed, kept ${matches.length} partial matches; mandatory denies below cwd may be incomplete: ${error}`,
+      `[Sandbox] ripgrep scan of ${cwd} could not read ${unreadablePaths.length} of the directories under it, which are denied whole; the ${matches.length} paths it did list still count: ${error}`,
       { level: 'warn' },
     )
   }
@@ -1058,6 +1102,15 @@ export type LinuxSandboxProfileErrorCode =
    * Whatever the wrap did make is tracked and goes with the next cleanup.
    */
   | 'deny_placeholder_unavailable'
+  /**
+   * The ripgrep scan the mandatory denies below the working directory come
+   * from did not deliver them: it could not be run, it was killed before it
+   * finished, or it failed for a reason that names no path under the working
+   * directory to deny in its place. Sandboxing on what it did list would
+   * leave whatever it never reached — a nested repository's hooks — writable,
+   * so the command is refused instead.
+   */
+  | 'deny_scan_failed'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
