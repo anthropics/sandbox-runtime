@@ -30,7 +30,7 @@ run([
 ])
 
 const bpf: Record<string, Buffer> = {}
-for (const target of ['x86_64', 'aarch64']) {
+for (const target of ['x86_64', 'aarch64', 'powerpc64le']) {
   const tmp = join(OUT, target + '.bpf')
   run([gen, tmp, target])
   bpf[target] = readFileSync(tmp)
@@ -48,6 +48,10 @@ writeFileSync(
     '#elif defined(__aarch64__)\n' +
     'static const unsigned char unix_block_bpf[] = {\n' +
     toCArray(bpf.aarch64) +
+    '\n};\n' +
+    '#elif defined(__powerpc64__) && defined(_CALL_ELF) && _CALL_ELF == 2\n' +
+    'static const unsigned char unix_block_bpf[] = {\n' +
+    toCArray(bpf.powerpc64le) +
     '\n};\n' +
     '#else\n' +
     '#error "unsupported architecture for unix-block BPF filter"\n' +
