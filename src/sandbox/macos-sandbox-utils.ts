@@ -83,6 +83,27 @@ export interface MacOSSandboxParams {
 }
 
 /**
+ * Stock command-line tools whose purpose is sending Apple Events.
+ */
+const APPLE_EVENT_TOOL_PATHS = [
+  '/usr/bin/osascript',
+  '/usr/bin/osacompile',
+  '/usr/bin/automator',
+  '/usr/bin/shortcuts',
+] as const
+
+/**
+ * The OSA language components. Every AppleScript or JXA script — whether it
+ * reaches the API through osascript, NSAppleScript, OSAKit, or
+ * NSClassFromString("NSAppleScript") from an interpreter — is compiled by
+ * one of these bundles.
+ */
+const OSA_COMPONENT_PATHS = [
+  '/System/Library/Components/AppleScript.component',
+  '/System/Library/Components/JavaScript.component',
+] as const
+
+/**
  * The mandatory write denies (no filesystem scanning). Each name appears
  * twice: once as the path in the cwd, and once as a pattern for the same
  * name anywhere beneath it, which macOS matches via a regex.
@@ -1018,7 +1039,20 @@ function generateSandboxProfile({
           '(allow mach-lookup (global-name "com.apple.CoreServices.coreservicesd"))',
           '(allow mach-lookup (global-name "com.apple.coreservices.quarantine-resolver"))',
         ]
-      : []),
+      : [
+          '; Apple Events - (deny default) withholds appleevent-send and the',
+          '; appleeventsd mach-lookup, and macOS enforces both: a real event to',
+          '; a running app fails with -600 from inside this profile, and open',
+          '; fails at Launch Services. Denying exec of the stock scripting tools',
+          '; here, and read of the OSA components at the end of the profile, is',
+          '; defense in depth on top of that: it removes the scripting runtime',
+          '; instead of relying on every send path being checked.',
+          '(deny process-exec',
+          ...APPLE_EVENT_TOOL_PATHS.map(
+            toolPath => `  (literal ${escapePath(toolPath)})`,
+          ),
+          ')',
+        ]),
     ...(allowMachLookup && allowMachLookup.length > 0
       ? [
           '; User-specified XPC/Mach services',
@@ -1278,6 +1312,24 @@ function generateSandboxProfile({
     profile.push('  (literal "/dev/ptmx")')
     profile.push('  (regex #"^/dev/ttys")')
     profile.push(')')
+  }
+
+  if (!allowAppleEvents) {
+    // Last in the profile, because last match wins: the read section ends in
+    // (allow file-read*) layers — including any allowWithinDeny the caller
+    // wrote that covers /System — and the pty block adds another. None of
+    // them may re-open the components.
+    profile.push('')
+    profile.push(
+      '; OSA language components - denied so that no process in the sandbox',
+      '; can compile AppleScript or JXA (see OSA_COMPONENT_PATHS)',
+      ...renderRule(
+        'deny',
+        ['file-read*'],
+        new Set(OSA_COMPONENT_PATHS.map(p => `(subpath ${escapePath(p)})`)),
+        logTag,
+      ),
+    )
   }
 
   return profile.join('\n')
