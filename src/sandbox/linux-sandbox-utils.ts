@@ -272,51 +272,76 @@ function fileContentsWithin(file: string, limit: number): string | undefined {
   }
 }
 
+/** What the deny of a file git reads back binds, once `dest` is ready. */
+type GitRedirectBind =
+  /** Bind this over `dest`, the ordinary answer. */
+  | { bind: string }
+  /** Nothing can be put at `dest`: bind this git directory read-only. */
+  | { denyGitDirWhole: string }
+
 /**
  * Make `dest` ready for the read-only bind that denies it, where it is one
- * of the files git reads back (`gitRedirectPlaceholder` in
- * src/sandbox/mandatory-deny-paths.ts), and return what to bind there.
+ * of the files git reads back (`GIT_REDIRECT_FILES` in
+ * src/sandbox/mandatory-deny-paths.ts says which and why), and say what to
+ * bind. Called at emission time, because it writes on the HOST: a bind the
+ * emission drops must not have cost anything.
  *
- * bubblewrap makes the mount point for an absent destination itself, with
- * ensure_file(): an empty file — and that file is on the HOST, where it is
- * what every git command outside the sandbox reads for as long as this one
- * runs, and for good if this process is killed. git refuses to run at all in
- * a repository whose commondir it cannot read, so the mount point is made
- * here instead, holding the placeholder, and tracked for the cleanup. An
- * empty file already there is rewritten to the placeholder and tracked the
- * same way: no bytes at all is what git refuses, so nothing puts that there
- * on purpose. Where the placeholder is itself empty an empty file IS
- * legitimate, and only one of the shape bubblewrap leaves
- * ({@link isStaleBwrapMountPoint}) is taken for this wrapper's own.
+ * Three arms. Absent: the mount point is written here rather than left to
+ * bubblewrap, holding the placeholder — a mount point bubblewrap makes is
+ * empty, and git refuses to run at all against a `commondir` it cannot read
+ * — with bubblewrap's own read-only mode, so that a wrap killed before its
+ * cleanup leaves a file the next wrap can recognise. There, empty and in
+ * that shape: this wrapper's own to repair and remove. Anything else: the
+ * caller's file, and only the bind lands on it.
  *
- * What is bound over it is the store's copy rather than the file, so what
- * the sandboxed command reads there is not what a host process rewrites
- * between this call and the mount. A destination already holding the
- * placeholder, or a redirect git can read, is bound from itself instead.
+ * What is bound is the store's copy, never the mount point itself: a host
+ * process rewriting the file between this call and the mount would otherwise
+ * choose what the sandbox reads, and another process's cleanup could unlink
+ * the source out from under a live bind.
  *
- * Throws {@link LinuxSandboxProfileError} when neither can be prepared: what
- * is left is /dev/null, which costs the repository every git command inside
- * the sandbox and, through the mount point, outside it as well, so the
- * command is refused rather than run behind that.
+ * Throws {@link LinuxSandboxProfileError} when the placeholder cannot be
+ * prepared at all: what is left is /dev/null, which costs the repository
+ * every git command inside the sandbox and, through the mount point, outside
+ * it as well, so the command is refused rather than run behind that.
  */
-function gitRedirectMountPoint(dest: string, placeholder: string): string {
+function gitRedirectMountPoint(
+  dest: string,
+  placeholder: string,
+  storeFiles: Map<string, string>,
+): GitRedirectBind {
   const takeOwnership = (): void => {
-    redirectMountPointBytes.set(dest, placeholder)
-    bwrapMountPoints.add(dest)
+    bwrapMountPoints.set(dest, placeholder)
     registerExitCleanupHandler()
   }
+  const bindFromStore = (): GitRedirectBind => ({
+    bind: gitRedirectStoreFile(dest, placeholder, storeFiles),
+  })
 
+  let written = false
   try {
     // Exclusive: a file that appeared since the deny loop looked is never
-    // truncated, it falls to the existing-file arms below.
-    fs.writeFileSync(dest, placeholder, { flag: 'wx', mode: 0o644 })
-    takeOwnership()
-    logForDebugging(
-      `[Sandbox Linux] Wrote the mount point ${dest} holding ${JSON.stringify(placeholder)}, so git reads no redirect there while the command runs`,
-    )
-    return gitRedirectStoreFile(dest, placeholder)
+    // truncated, it falls to the existing-file arms below. Read-only, the
+    // mode bubblewrap's ensure_file() leaves, so that a process killed
+    // before the cleanup leaves a file the next wrap can recognise as one of
+    // these rather than as a file somebody meant to be there.
+    fs.writeFileSync(dest, placeholder, { flag: 'wx', mode: 0o444 })
+    written = true
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
+      // A git directory this process cannot write — a vendored checkout
+      // owned by another user, a read-only mount, one the command itself
+      // made unwritable. Refusing every command in the tree over that would
+      // be a brick a sandboxed command can plant; a read-only bind of the
+      // directory denies the file and every other way into it at once.
+      const gitDir = path.dirname(dest)
+      logForDebugging(
+        `[Sandbox Linux] ${gitDir} takes no mount point for ${path.basename(dest)} (${errorText(err)}); denying the git directory whole instead, which needs nothing written to it`,
+        { level: 'warn' },
+      )
+      return { denyGitDirWhole: gitDir }
+    }
+    if (code !== 'EEXIST') {
       throw placeholderUnavailable(
         dest,
         'its mount point could not be made',
@@ -324,9 +349,25 @@ function gitRedirectMountPoint(dest: string, placeholder: string): string {
       )
     }
   }
+  if (written) {
+    takeOwnership()
+    logForDebugging(
+      `[Sandbox Linux] Wrote the mount point ${dest} holding ${JSON.stringify(placeholder)}, so git reads no redirect there while the command runs`,
+    )
+    return bindFromStore()
+  }
 
   const contents = fileContentsWithin(dest, Buffer.byteLength(placeholder))
   if (contents === '' && placeholder !== '') {
+    if (!isStaleBwrapMountPoint(dest)) {
+      // Empty and not the shape bubblewrap leaves: a host git caught between
+      // creating the file and writing it owns this one. Cover it with the
+      // placeholder for the length of the command and leave the file alone.
+      logForDebugging(
+        `[Sandbox Linux] Binding ${JSON.stringify(placeholder)} over the empty ${dest}: it is not the shape bubblewrap leaves, so it is not this wrapper's to rewrite`,
+      )
+      return bindFromStore()
+    }
     try {
       // bubblewrap makes its mount points read-only (ensure_file(dest,
       // 0444)), and the process that owns one need not be root, so the mode
@@ -349,7 +390,7 @@ function gitRedirectMountPoint(dest: string, placeholder: string): string {
     logForDebugging(
       `[Sandbox Linux] Rewrote ${dest}, left empty by a sandbox that did not clean up, to ${JSON.stringify(placeholder)}: git reads no bytes there as a fault, not as "no redirect"`,
     )
-    return gitRedirectStoreFile(dest, placeholder)
+    return bindFromStore()
   }
   if (
     contents === placeholder &&
@@ -357,26 +398,40 @@ function gitRedirectMountPoint(dest: string, placeholder: string): string {
   ) {
     // This wrapper's own, left by a process that could not clean up: nothing
     // else writes exactly these bytes there, and for an empty placeholder
-    // nothing else leaves a file of that shape. Bound from itself — the
-    // swap would put back what is already in it — and removed with the rest.
+    // nothing else leaves a file of that shape. Removed with the rest, and
+    // bound from the store rather than from itself: another process wrapping
+    // a command in the same repository can claim and remove this same file,
+    // and a bind whose source is unlinked while the sandbox runs is a bind
+    // that no longer denies anything.
     takeOwnership()
     logForDebugging(
-      `[Sandbox Linux] ${dest} already holds the placeholder ${JSON.stringify(placeholder)} an earlier sandbox left; binding it from itself and taking it away with this wrap's mount points`,
+      `[Sandbox Linux] ${dest} already holds the placeholder ${JSON.stringify(placeholder)} an earlier sandbox left; binding the store's copy over it and taking it away with this wrap's mount points`,
     )
-    return dest
+    return bindFromStore()
   }
   logForDebugging(
     `[Sandbox Linux] Binding ${dest} from itself: what it holds is not the ${JSON.stringify(placeholder)} placeholder, so it is not this wrapper's to replace`,
   )
-  return dest
+  return { bind: dest }
 }
 
-/** The store's copy of `placeholder`, made on first use of that content. */
-function gitRedirectStoreFile(dest: string, placeholder: string): string {
+/**
+ * The store's copy of `placeholder`, made once per wrap: the store unlinks
+ * and rewrites the file on every call, which is what revalidates it, and one
+ * wrap needs one such check however many destinations share the content.
+ */
+function gitRedirectStoreFile(
+  dest: string,
+  placeholder: string,
+  storeFiles: Map<string, string>,
+): string {
+  const made = storeFiles.get(placeholder)
+  if (made !== undefined) return made
   try {
-    // Keyed by content, so one file serves every destination that needs it;
-    // the store rewrites it on each use, which is also what revalidates it.
-    return gitRedirectStore.write(placeholder, placeholder)
+    // Keyed by content, so one file serves every destination that needs it.
+    const file = gitRedirectStore.write(placeholder, placeholder)
+    storeFiles.set(placeholder, file)
+    return file
   } catch (err) {
     throw placeholderUnavailable(
       dest,
@@ -895,17 +950,15 @@ function asProfileRefusal<T>(produce: () => T): T {
     )
   }
 }
-// Track mount points created by bwrap for non-existent deny paths.
-// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
-// file on the host as a mount point. These persist after bwrap exits and must
-// be cleaned up explicitly.
-const bwrapMountPoints: Set<string> = new Set()
 
-// What this wrapper wrote at a mount point of its own making, keyed by a
-// path in bwrapMountPoints: the cleanup takes such a file away only while it
-// still holds exactly those bytes. Only the git redirect denies make one —
-// every other mount point is bwrap's, and empty (see gitRedirectMountPoint).
-const redirectMountPointBytes = new Map<string, string>()
+// Mount points on the host for deny paths that are not there, against the
+// bytes each holds. When bwrap does --ro-bind /dev/null /nonexistent/path it
+// creates an empty file on the host as a mount point, and it persists after
+// bwrap exits; the git redirect denies write their own instead, holding the
+// placeholder (see gitRedirectMountPoint). undefined is bwrap's, empty one.
+// The cleanup takes a file away only while it still holds what is recorded
+// here, so one something else has written to is left where it is.
+const bwrapMountPoints = new Map<string, string | undefined>()
 
 /** Temp-directory prefix of the store below, so it is nobody else's. */
 export const GIT_REDIRECT_STORE_PREFIX = 'srt-gitredirect-'
@@ -1445,10 +1498,6 @@ function registerExitCleanupHandler(): void {
  * handler and reset() where deferral is not meaningful. That is also what
  * empties the store of git redirect placeholders, which is per process.
  *
- * A mount point this wrapper wrote itself rather than left to bwrap (a git
- * redirect deny's, holding what {@link gitRedirectMountPoint} put there) is
- * removed while it still holds exactly that, as an empty one is.
- *
  * Also closes the `--args` profiles the wraps of this batch opened.
  */
 export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
@@ -1466,14 +1515,12 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     activeSandboxCount = 0
   }
 
-  for (const mountPoint of bwrapMountPoints) {
+  for (const [mountPoint, written] of bwrapMountPoints) {
     try {
-      // Only remove if it's still the empty file/directory bwrap created, or
-      // — for a mount point this wrapper wrote itself, which a git redirect
-      // deny does — the exact bytes it wrote there. If something else has
-      // written real content, leave it alone.
+      // Still empty, or still holding exactly what this wrote there: a
+      // mount point something else has taken over is not this one's to
+      // remove.
       const stat = fs.statSync(mountPoint)
-      const written = redirectMountPointBytes.get(mountPoint)
       const stillAsCreated =
         stat.size === 0 ||
         (written !== undefined &&
@@ -1500,7 +1547,6 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     }
   }
   bwrapMountPoints.clear()
-  redirectMountPointBytes.clear()
   if (opts?.force) {
     // The placeholders outlive a batch of wraps the way the masked-file
     // store's fakes do: what ends them is the session (or the process), not
@@ -2236,11 +2282,16 @@ async function generateFilesystemArgs(
   // at a directory this same call has just judged not ours.
   let emptySource: string | undefined
   // Deny destinations that are files git reads back, and the placeholder
-  // each needs, filled in by the loop below and acted on when the bind is
-  // emitted: preparing one writes a file on the HOST as well (see
-  // gitRedirectMountPoint), so a bind the emission drops as hidden by a
-  // read-deny tmpfs must not have cost anything.
+  // each needs; acted on at emission (gitRedirectMountPoint).
   const pendingGitRedirects = new Map<string, string>()
+  // The store file each placeholder content was written to, for this wrap:
+  // the store unlinks and rewrites on every call, which is what revalidates
+  // it, and one wrap needs that once however many destinations share it.
+  const gitRedirectStoreFiles = new Map<string, string>()
+  // Git directories this wrap denies whole because no mount point could be
+  // made inside them, so the second redirect file in one does not emit a
+  // second bind of the same directory.
+  const denyWholeGitDirs = new Set<string>()
   // The store directory a placeholder came from, pinned read-only with the
   // other mount sources at the end. Set only where one was actually used.
   let gitRedirectSourceDir: string | undefined
@@ -2972,11 +3023,8 @@ async function generateFilesystemArgs(
       // track it, so cleanupBwrapMountPoints() takes it away. Same gate as
       // that branch. Under a read-only denied directory nothing needs
       // covering (the file is already unwritable there), but it is still
-      // tracked: it is no more the caller's file for being there.
-      //
-      // Not for a file git reads back: /dev/null is exactly what it must not
-      // be covered with, and the existing-path branch below binds the
-      // placeholder over an empty one.
+      // tracked: it is no more the caller's file for being there. Not for a
+      // file git reads back, which gitRedirectMountPoint settles instead.
       if (
         (isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
           isWithinAnyAllowedWritePath(normalizedPath)) &&
@@ -2987,7 +3035,7 @@ async function generateFilesystemArgs(
           denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
           denyWriteRawDests.set(normalizedPath, rawPath)
         }
-        bwrapMountPoints.add(normalizedPath)
+        bwrapMountPoints.set(normalizedPath, undefined)
         registerExitCleanupHandler()
         logForDebugging(
           `[Sandbox Linux] Re-covering a mount point an earlier sandbox left behind: ${normalizedPath}`,
@@ -3053,19 +3101,13 @@ async function generateFilesystemArgs(
           // of /dev/null. This prevents the component from appearing as a file
           // which breaks tools that expect to traverse it as a directory.
           const isIntermediate = firstNonExistent !== normalizedPath
-          // A placeholder git reads, where the leaf is one of the files it
-          // reads back (gitRedirectPlaceholder): /dev/null there makes git
-          // refuse to run in the repository at all, not just refuse the write
-          // this deny is for. Decided from the resolved path, which every
-          // spelling of one file shares, rather than from the deny entry:
-          // a caller's own denyWrite naming the same file must not miss it.
+          // Decided from the resolved path, which every spelling of one file
+          // shares, rather than from the deny entry: a caller's own
+          // denyWrite naming the same file must not miss it. /dev/null
+          // stands in the buffer until gitRedirectMountPoint replaces it.
           const gitRedirectStub = isIntermediate
             ? undefined
             : gitRedirectPlaceholder(normalizedPath)
-          // The redirect source is not built here: it is a file on the host
-          // as well as a bind, and this bind may still be dropped below as
-          // hidden by a read-deny tmpfs. /dev/null stands in the buffer
-          // until the emission replaces it (pendingGitRedirects).
           const source = isIntermediate
             ? (emptySource ??= ensureEmptyMountSourceDir())
             : '/dev/null'
@@ -3108,7 +3150,7 @@ async function generateFilesystemArgs(
           // below a second spelling to test, and `dest` itself is always
           // tested.
           denyWriteRawDests.set(firstNonExistent, rawPath)
-          bwrapMountPoints.add(firstNonExistent)
+          bwrapMountPoints.set(firstNonExistent, undefined)
           registerExitCleanupHandler()
           logForDebugging(
             `[Sandbox Linux] Mounted ${
@@ -3162,14 +3204,9 @@ async function generateFilesystemArgs(
             )
           }
         }
-        // A file git reads back is bound from itself here only if it holds a
-        // redirect git can read. The usual way to find one that does not is
-        // a previous wrap's own mount point for the absent case, left empty
-        // by a process that could not clean up: binding that would deny the
-        // same write and cost the repository every git command, since git
-        // refuses to run at all against a commondir it cannot read. Which of
-        // the two it is is settled when the bind is emitted, along with what
-        // the host reads there (gitRedirectMountPoint).
+        // A file git reads back is not necessarily bound from itself: an
+        // empty one left by a killed wrap is a redirect git refuses. Which
+        // it is is settled at emission (gitRedirectMountPoint).
         const gitRedirectStub = gitRedirectPlaceholder(normalizedPath)
         if (gitRedirectStub !== undefined) {
           pendingGitRedirects.set(normalizedPath, gitRedirectStub)
@@ -3463,7 +3500,25 @@ async function generateFilesystemArgs(
     const pendingRedirect = pendingGitRedirects.get(dest)
     let source = denyWriteArgs[i + 1]!
     if (pendingRedirect !== undefined) {
-      source = gitRedirectMountPoint(dest, pendingRedirect)
+      const prepared = gitRedirectMountPoint(
+        dest,
+        pendingRedirect,
+        gitRedirectStoreFiles,
+      )
+      if ('denyGitDirWhole' in prepared) {
+        const gitDir = prepared.denyGitDirWhole
+        // Read-only over the directory itself: it needs nothing written to
+        // the host, and it denies every file inside at once — including the
+        // other redirect file, whose own turn in this loop then has nothing
+        // left to do.
+        if (!denyWholeGitDirs.has(gitDir)) {
+          denyWholeGitDirs.add(gitDir)
+          args.push('--ro-bind', gitDir, gitDir)
+          emittedDenyWriteDests.push(gitDir)
+        }
+        continue
+      }
+      source = prepared.bind
       if (source !== dest) gitRedirectSourceDir = path.dirname(source)
     }
     args.push(denyWriteArgs[i]!, source, dest)
@@ -3961,11 +4016,13 @@ export async function wrapCommandWithSandboxLinux(
 
     return wrappedCommand
   } catch (error) {
-    // Undo the activeSandboxCount increment — the caller won't call
-    // cleanupBwrapMountPoints() for a wrap that threw.
-    if (activeSandboxCount > 0) {
-      activeSandboxCount--
-    }
+    // The caller does not clean up after a wrap that threw, and this one may
+    // already have written mount points on the host — the files git reads
+    // back are written before bubblewrap is ever reached. No sandbox of this
+    // wrap is running, so the cleanup that undoes the activeSandboxCount
+    // increment takes them away with it; it still defers to any other wrap
+    // that is still up.
+    cleanupBwrapMountPoints()
     throw error
   }
 }
