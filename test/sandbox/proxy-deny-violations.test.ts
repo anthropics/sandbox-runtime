@@ -243,6 +243,9 @@ describe('HTTP proxy threads encodedCommand from Basic auth to filter()', () => 
         `Proxy-Authorization: Basic ${basic}\r\n` +
         `Connection: close\r\n\r\n`,
     )
+    // Consume the response: a socket nobody reads never reaches 'end', so it
+    // never emits 'close' (Node, and Bun from 1.4).
+    sock.resume()
     await once(sock, 'close')
 
     expect(reasons).toEqual(['denied by sandbox policy'])
