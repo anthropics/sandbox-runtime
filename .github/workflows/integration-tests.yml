@@ -125,6 +125,11 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-machine-store.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      - name: srt-win deny-alias probe (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/probe-deny-alias.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
