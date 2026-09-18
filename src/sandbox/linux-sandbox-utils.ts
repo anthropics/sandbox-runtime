@@ -31,6 +31,7 @@ import {
 } from './sandbox-utils.js'
 import {
   GitMetadataError,
+  SubmoduleWalkBudgetError,
   gitDirDenyPaths,
   gitDirTreeDenyPaths,
   gitFileDenyPaths,
@@ -637,6 +638,7 @@ function denyScanFailed(
  */
 export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
+  options: { deadline?: number } = {},
 ): string[] {
   const cwd = process.cwd()
   const denyPaths = cwdDangerousDenyPaths(cwd)
@@ -653,7 +655,7 @@ export function linuxGetCwdMandatoryDenyPaths(
     if (!isAbsenceErrno(err)) return [...denyPaths, dotGitPath]
   }
   if (dotGitStat?.isDirectory()) {
-    denyPaths.push(...gitDirTreeDenyPaths(dotGitPath, allowGitConfig))
+    denyPaths.push(...gitDirTreeDenyPaths(dotGitPath, allowGitConfig, options))
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
@@ -763,7 +765,7 @@ async function linuxGetMandatoryDenyPaths(
   const dangerousDirectories = getDangerousDirectories()
 
   const denyPaths = asProfileRefusal(() =>
-    linuxGetCwdMandatoryDenyPaths(allowGitConfig),
+    linuxGetCwdMandatoryDenyPaths(allowGitConfig, { deadline }),
   )
 
   // Each nested repository the scan finds, once: the same walk the cwd's own
@@ -773,7 +775,11 @@ async function linuxGetMandatoryDenyPaths(
   const denyGitDir = (gitDir: string): void => {
     if (seenGitDirs.has(gitDir)) return
     seenGitDirs.add(gitDir)
-    denyPaths.push(...gitDirTreeDenyPaths(gitDir, allowGitConfig))
+    denyPaths.push(
+      ...asProfileRefusal(() =>
+        gitDirTreeDenyPaths(gitDir, allowGitConfig, { deadline }),
+      ),
+    )
   }
   const walkScan = (collectGitDirs: boolean) =>
     walkScanDirectories(cwd, maxDepth, deadline, collectGitDirs)
@@ -941,6 +947,13 @@ function asProfileRefusal<T>(produce: () => T): T {
   try {
     return produce()
   } catch (err) {
+    if (err instanceof SubmoduleWalkBudgetError) {
+      // The same answer a ripgrep scan that runs out of its time gets, for
+      // the same reason: a listing that stops somewhere unknown is not
+      // something to sandbox on. The walk shares that budget.
+      logForDebugging(`[Sandbox Linux] ${err.message}`, { level: 'warn' })
+      throw new LinuxSandboxProfileError('deny_scan_failed', err.message, err)
+    }
     if (!(err instanceof GitMetadataError)) throw err
     logForDebugging(`[Sandbox Linux] ${err.message}`, { level: 'warn' })
     throw new LinuxSandboxProfileError(
@@ -1319,7 +1332,8 @@ export type LinuxSandboxProfileErrorCode =
    * finished, or it failed for a reason that names no path under the working
    * directory to deny in its place. Sandboxing on what it did list would
    * leave whatever it never reached — a nested repository's hooks — writable,
-   * so the command is refused instead.
+   * so the command is refused instead. The `.git/modules` walk spends the
+   * same budget and running out of it is the same answer.
    */
   | 'deny_scan_failed'
   /**

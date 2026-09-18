@@ -44,8 +44,9 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   GitMetadataError,
-  MAX_SUBMODULE_WALK_DEPTH,
+  SubmoduleWalkBudgetError,
   gitDirDenyPaths,
+  gitDirTreeDenyPaths,
   gitFileDenyPaths,
   gitRedirectPlaceholder,
   submoduleGitDirs,
@@ -2874,50 +2875,130 @@ describe('Git metadata deny paths - Unit Tests', () => {
     },
   )
 
-  /** The directory the walk stops at: MAX_SUBMODULE_WALK_DEPTH levels down. */
-  function boundDir(): string {
-    return join(
-      dir,
-      'modules',
-      ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
-    )
-  }
+  /**
+   * A submodule name is a path and submodules nest, so how deep a real tree
+   * can go is a question about the repository and not about this walk. There
+   * is no depth bound: what bounds the walk is the time it is given, and what
+   * stops it looping is where each directory really is.
+   */
+  it('walks a chain 200 directories deep, and denies every level of it', () => {
+    // A hundred submodules each nested inside the one above, which is two
+    // hundred directories of `<name>/modules` below .git/modules — far past
+    // any bound the walk used to have, and enough of its own stack to
+    // overflow a recursive one on some runtimes.
+    const gitDirs: string[] = []
+    let at = join(dir, 'modules')
+    for (let level = 0; level < 100; level++) {
+      at = join(at, 'x')
+      makeGitDir(at)
+      gitDirs.push(at)
+      at = join(at, 'modules')
+    }
 
-  it.each([
-    // A git directory below the bound is never seen, so what the walk would
-    // have descended into is denied whole in its place.
-    ['a plain directory', false, (bound: string) => bound],
-    // When the bound directory is a git directory itself it is BOTH: its own
-    // hooks and config are denied by path, and only the `modules` beneath it
-    // is denied whole — denying the git directory would take its objects,
-    // refs and index with it and stop git working in that submodule.
-    ['a git directory', true, (bound: string) => join(bound, 'modules')],
-  ])(
-    'stops the modules walk at its depth bound, with %s there',
-    (_label, boundIsGitDir, denied) => {
-      const bound = boundDir()
-      if (boundIsGitDir) makeGitDir(bound)
-      makeGitDir(join(bound, 'deep'))
+    const scan = submoduleGitDirs(join(dir, 'modules'))
+    expect(scan.unreadableDirs).toEqual([])
+    expect(scan.gitDirs).toEqual([...gitDirs].sort())
+    // Every level's hooks and config, not just the ones above a bound.
+    const denies = gitDirTreeDenyPaths(dir, false)
+    for (const gitDir of gitDirs) {
+      expect(denies).toContain(join(gitDir, 'hooks'))
+      expect(denies).toContain(join(gitDir, 'config'))
+    }
+  })
 
-      expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
-        gitDirs: boundIsGitDir ? [bound] : [],
-        unreadableDirs: [denied(bound)],
-      })
-    },
-  )
+  it.if(!isWindows)('ends at a symlink pointing back into the tree', () => {
+    // modules/a/back -> modules, which the walk would follow for ever if it
+    // did not record where each directory really is.
+    mkdirSync(join(dir, 'modules', 'a'), { recursive: true })
+    symlinkSync(join(dir, 'modules'), join(dir, 'modules', 'a', 'back'))
+    const gitDir = makeGitDir(join(dir, 'modules', 'a', 'lib'))
+
+    expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
+      gitDirs: [gitDir],
+      unreadableDirs: [],
+    })
+  })
+
+  it.if(!isWindows)('ends at a symlink loop, denying it whole', () => {
+    // A loop cannot be stat'ed at all (ELOOP), which reads as unreadable
+    // rather than as absent: the deepest directory the walk can reach for it
+    // is denied whole.
+    mkdirSync(join(dir, 'modules'), { recursive: true })
+    symlinkSync(join(dir, 'modules', 'b'), join(dir, 'modules', 'a'))
+    symlinkSync(join(dir, 'modules', 'a'), join(dir, 'modules', 'b'))
+
+    expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
+      gitDirs: [],
+      unreadableDirs: [join(dir, 'modules'), join(dir, 'modules')],
+    })
+  })
+
+  it('refuses rather than hand back a walk that ran out of its time', () => {
+    makeGitDir(join(dir, 'modules', 'a', 'lib'))
+    makeGitDir(join(dir, 'modules', 'b', 'lib'))
+
+    // A deadline already past: the first directory the walk takes off its
+    // stack is where it stops.
+    expect(() =>
+      submoduleGitDirs(join(dir, 'modules'), Date.now() - 1),
+    ).toThrow(SubmoduleWalkBudgetError)
+    const error = (() => {
+      try {
+        submoduleGitDirs(join(dir, 'modules'), Date.now() - 1)
+        return undefined
+      } catch (err) {
+        return err as SubmoduleWalkBudgetError
+      }
+    })()
+    expect(error?.name).toBe('SubmoduleWalkBudgetError')
+    expect(error?.code).toBe('submodule_walk_budget_exhausted')
+    expect(error?.message).toContain(join(dir, 'modules'))
+  })
 
   it.if(isLinux)(
-    'keeps a bound git directory writable except for its hooks, config and modules',
+    'refuses the wrap where the modules walk runs out of its time',
     async () => {
       const checkout = join(dir, 'repo')
       const gitDir = makeGitDir(join(checkout, '.git'))
-      const bound = join(
+      makeGitDir(join(gitDir, 'modules', 'lib'))
+
+      const originalCwd = process.cwd()
+      process.chdir(checkout)
+      try {
+        const error = await wrapCommandWithSandboxLinux({
+          command: 'echo hi',
+          needsNetworkRestriction: false,
+          readConfig: undefined,
+          writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          // The walk shares the scan's budget, so one millisecond of it is
+          // gone before the walk starts.
+          ripgrepConfig: { command: 'rg', timeoutMs: 1 },
+        }).catch((e: unknown) => e)
+
+        expect(error).toBeInstanceOf(LinuxSandboxProfileError)
+        expect((error as LinuxSandboxProfileError).code).toBe(
+          'deny_scan_failed',
+        )
+      } finally {
+        cleanupBwrapMountPoints({ force: true })
+        process.chdir(originalCwd)
+      }
+    },
+    30000,
+  )
+
+  it.if(isLinux)(
+    'keeps a deeply nested git directory writable except for its hooks and config',
+    async () => {
+      const checkout = join(dir, 'repo')
+      const gitDir = makeGitDir(join(checkout, '.git'))
+      const deep = join(
         gitDir,
         'modules',
-        ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
+        ...Array.from({ length: 12 }, () => 'x'),
       )
-      makeGitDir(bound)
-      mkdirSync(join(bound, 'objects'), { recursive: true })
+      makeGitDir(deep)
+      mkdirSync(join(deep, 'objects'), { recursive: true })
 
       const originalCwd = process.cwd()
       process.chdir(checkout)
@@ -2930,12 +3011,11 @@ describe('Git metadata deny paths - Unit Tests', () => {
             writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
           })
 
-        // The covering deny is the `modules` beneath it, not the git directory
-        // itself: denying that whole would take its objects, refs and index.
-        // An ancestor pin spells that same self-bind, so where it sits is
-        // what tells the two apart: pins are spliced in before the write
-        // root's own bind, which makes the tree writable again, and a deny
-        // bind is emitted after it.
+        // No deny covering the git directory whole, which would take its
+        // objects, refs and index with it. An ancestor pin spells that same
+        // self-bind, so where it sits is what tells the two apart: pins are
+        // spliced in before the write root's own bind, which makes the tree
+        // writable again, and a deny bind is emitted after it.
         const command = await wrap('true')
         const writeRootBind = indexOfMount(
           command,
@@ -2944,26 +3024,24 @@ describe('Git metadata deny paths - Unit Tests', () => {
           checkout,
         )
         expect(writeRootBind).toBeGreaterThan(-1)
-        expect(
-          lastIndexOfMount(command, '--ro-bind', bound, bound),
-        ).toBeLessThan(writeRootBind)
-        expect(command).toContain(join(bound, 'modules'))
-        expect(command).toContain(`--ro-bind ${join(bound, 'hooks')} `)
+        expect(lastIndexOfMount(command, '--ro-bind', deep, deep)).toBeLessThan(
+          writeRootBind,
+        )
+        expect(command).toContain(`--ro-bind ${join(deep, 'hooks')} `)
 
         // Where bwrap can run, prove it: what git needs writable in that
         // submodule still is, and what makes a write into code is not.
         if (bwrapCanNamespace()) {
           const result = spawnSync(
             await wrap(
-              `sh -c 'echo o > ${join(bound, 'objects', 'x')} && ` +
-                `! echo h > ${join(bound, 'hooks', 'x')} && ` +
-                `! echo c > ${join(bound, 'config')} && ` +
-                `! mkdir -p ${join(bound, 'modules', 'sub')} && ` +
-                `echo SRT_BOUND_OK'`,
+              `sh -c 'echo o > ${join(deep, 'objects', 'x')} && ` +
+                `! echo h > ${join(deep, 'hooks', 'x')} && ` +
+                `! echo c > ${join(deep, 'config')} && ` +
+                `echo SRT_DEEP_OK'`,
             ),
             { shell: true, encoding: 'utf8', timeout: 30000, cwd: checkout },
           )
-          expect(result.stdout).toContain('SRT_BOUND_OK')
+          expect(result.stdout).toContain('SRT_DEEP_OK')
         }
       } finally {
         cleanupBwrapMountPoints({ force: true })
@@ -2973,15 +3051,15 @@ describe('Git metadata deny paths - Unit Tests', () => {
     60000,
   )
 
-  it('denies the bound git directory by pattern on macOS, without contradiction', () => {
+  it('denies a deeply nested git directory by literal path on macOS', () => {
     const checkout = join(dir, 'repo')
     const gitDir = makeGitDir(join(checkout, '.git'))
-    const bound = join(
+    const deep = join(
       gitDir,
       'modules',
-      ...Array.from({ length: MAX_SUBMODULE_WALK_DEPTH }, () => 'x'),
+      ...Array.from({ length: 12 }, () => 'x'),
     )
-    makeGitDir(bound)
+    makeGitDir(deep)
 
     const originalCwd = process.cwd()
     process.chdir(checkout)
@@ -2993,16 +3071,16 @@ describe('Git metadata deny paths - Unit Tests', () => {
         readConfig: undefined,
         writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
       })
-      expect(profile).toContain(`(subpath "${join(bound, 'modules')}")`)
-      expect(profile).toContain(`(subpath "${join(bound, 'hooks')}")`)
+      expect(profile).toContain(`(subpath "${join(deep, 'hooks')}")`)
       // No deny covering the git directory whole, which would take its
       // objects, refs and index with it.
-      expect(profile).not.toContain(`(subpath "${bound}")`)
+      expect(profile).not.toContain(`(subpath "${deep}")`)
     } finally {
       process.chdir(originalCwd)
     }
   })
 })
+
 /**
  * Denying a path that is not there means mounting something at it, and two of
  * these the host's git reads back: it refuses to run at all against a

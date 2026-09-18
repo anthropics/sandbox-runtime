@@ -1,6 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
+import { DEFAULT_RIPGREP_TIMEOUT_MS } from '../utils/ripgrep.js'
 import {
   isAbsenceErrno,
   MAX_SYMLINK_RESOLUTION_DEPTH,
@@ -37,12 +38,13 @@ function isUnusablePathError(err: unknown): boolean {
 const MAX_GIT_METADATA_BYTES = 1024 * 1024
 
 /**
- * Depth bound for the `.git/modules` walk. A submodule's name is its path
- * (`vendor/lib`) and submodules nest, so the walk descends both name segments
- * and nested `modules` directories; this bounds a hostile or looping tree, not
- * a real one, and is deliberately unrelated to the ripgrep scan's depth.
+ * Time the `.git/modules` walk gets when the caller sets no deadline of its
+ * own — the macOS backend and the violation monitor, neither of which runs
+ * the ripgrep scan whose deadline the Linux wrap shares with it. The same
+ * figure the scan gets, for the same reason: a tree that takes longer than
+ * this to walk is one the command about to run could have made.
  */
-export const MAX_SUBMODULE_WALK_DEPTH = 10
+const DEFAULT_SUBMODULE_WALK_TIMEOUT_MS = DEFAULT_RIPGREP_TIMEOUT_MS
 
 /**
  * Entries whose presence makes a directory a git directory. git needs HEAD
@@ -85,19 +87,35 @@ export class GitMetadataError extends Error {
   }
 }
 
+/**
+ * The `.git/modules` walk ran out of the time it was given. The tree it was
+ * walking is one the command about to run could have made — a bind mount
+ * pointed back at its own ancestor gives every level a real path of its own,
+ * which the visited set cannot fold together — so a half-finished listing is
+ * not something to sandbox on: the submodule git directories it never reached
+ * would be left with writable hooks. The Linux wrap turns this into a
+ * `LinuxSandboxProfileError` carrying `deny_scan_failed`, the same answer the
+ * ripgrep scan's own overrun gets; on macOS it reaches the caller as itself.
+ */
+export class SubmoduleWalkBudgetError extends Error {
+  readonly code = 'submodule_walk_budget_exhausted' as const
+  constructor(message: string) {
+    super(message)
+    this.name = 'SubmoduleWalkBudgetError'
+  }
+}
+
 /** Directories found under a `.git/modules`, and what could not be read. */
 export interface SubmoduleScan {
-  /** The submodule git directories. */
+  /** The submodule git directories, sorted. */
   gitDirs: string[]
   /**
    * Directories the walk could not see through: what lies under them is
    * unknown, so they are denied whole rather than left writable with a git
-   * directory possibly inside. Three things produce one — a directory the walk
-   * could not list, an entry it could not stat, and, once per branch that
-   * reaches {@link MAX_SUBMODULE_WALK_DEPTH}, the `modules` beneath the
-   * directory it stopped at (or that directory itself, when it is not a git
-   * directory). For the first two the recorded path is the deepest ancestor
-   * this process can reach, which can be the `.git/modules` root itself.
+   * directory possibly inside. Two things produce one — a directory the walk
+   * could not list and an entry it could not stat — and the recorded path is
+   * the deepest ancestor this process can reach, which can be the
+   * `.git/modules` root itself. Sorted, like `gitDirs`.
    *
    * A whole-directory deny is read-only for everything beneath it, a
    * submodule's `objects`, `refs` and `index` included, so git writes inside a
@@ -296,77 +314,83 @@ export function gitFileDenyPaths(
  * `modules` (what a commit inside that submodule runs), plus whatever the
  * walk could not see through. Both backends produce their entries from this
  * one list.
+ *
+ * `deadline` bounds the walk (see {@link submoduleGitDirs}).
  */
 export function gitDirTreeDenyPaths(
   gitDir: string,
   allowGitConfig: boolean,
+  options: { deadline?: number } = {},
 ): string[] {
-  const modules = submoduleGitDirs(path.join(gitDir, 'modules'))
+  const modules = submoduleGitDirs(
+    path.join(gitDir, 'modules'),
+    options.deadline,
+  )
   return [
+    ...gitDirDenyPaths(gitDir, allowGitConfig),
     ...modules.unreadableDirs,
-    ...[gitDir, ...modules.gitDirs].flatMap(dir =>
-      gitDirDenyPaths(dir, allowGitConfig),
-    ),
+    ...modules.gitDirs.flatMap(dir => gitDirDenyPaths(dir, allowGitConfig)),
   ]
 }
 
 /**
  * Git directories of the submodules under `modulesDir` (a repository's
- * .git/modules), nested submodules included. A submodule's name is its path,
- * so one can sit several levels down (modules/vendor/lib), hence the walk.
+ * .git/modules), nested submodules included, sorted. A submodule's name is
+ * its path, so one can sit several levels down (modules/vendor/lib), hence
+ * the walk.
+ *
+ * Every directory is visited once, keyed by where it really is, so a symlink
+ * pointing back into the tree ends the branch that reached it rather than
+ * looping - but a bind mount gives the same directory a second real path, and
+ * one pointed at its own ancestor has no end the visited set can see. `deadline`
+ * is what bounds that, and running out of it throws
+ * {@link SubmoduleWalkBudgetError} rather than handing back a listing that
+ * stops somewhere unknown. Nothing bounds how DEEP a real tree may be: a
+ * submodule nested a hundred levels down has its hooks denied like any other,
+ * and the walk keeps its own stack so that such a tree cannot overflow this
+ * one's.
  */
-export function submoduleGitDirs(modulesDir: string): SubmoduleScan {
+export function submoduleGitDirs(
+  modulesDir: string,
+  deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
+): SubmoduleScan {
   const scan: SubmoduleScan = { gitDirs: [], unreadableDirs: [] }
-  collectSubmoduleGitDirs(modulesDir, 0, scan, new Set())
-  return scan
-}
-
-function collectSubmoduleGitDirs(
-  dir: string,
-  depth: number,
-  scan: SubmoduleScan,
-  visited: Set<string>,
-): void {
-  const entries = listDirectory(dir, scan)
-  if (entries === undefined) return
-  for (const entry of entries) {
-    const child = path.join(dir, entry.name)
-    // git accepts a symlinked entry under .git/modules, and Dirent.isDirectory
-    // is false for one, so the link is followed — and the realpath recorded,
-    // since a link back up would otherwise loop until the depth bound.
-    if (!isDirectory(entry, child, scan)) continue
-    const visitKey = realPathOrSelf(child)
-    if (visited.has(visitKey)) continue
-    visited.add(visitKey)
-
-    const childEntries = listDirectory(child, scan)
-    if (childEntries === undefined) continue
-    const isGitDir = childEntries.some(e => GIT_DIR_MARKERS.has(e.name))
-    if (isGitDir) scan.gitDirs.push(child)
-
-    if (depth + 1 >= MAX_SUBMODULE_WALK_DEPTH) {
-      // Nothing below here is inspected, so what the walk would have descended
-      // into is denied whole, like a directory it could not list: a submodule
-      // git directory nested deeper would otherwise keep its hooks and config
-      // writable. For a git directory that is the `modules` beneath it (absent
-      // or not — a sandboxed command must not be able to create one and hide a
-      // git directory inside), NOT the directory itself, whose objects, refs
-      // and index stay writable so git still works in that submodule.
-      const denied = isGitDir ? path.join(child, 'modules') : child
-      scan.unreadableDirs.push(denied)
-      logForDebugging(
-        `[Sandbox] Stopped the .git/modules walk below ${child} at depth ${MAX_SUBMODULE_WALK_DEPTH}, denying ${denied} whole`,
-        { level: 'warn' },
+  // Where the walk still has to look, and where it has already been. The root
+  // counts as visited: an entry linked straight back to it is then the same
+  // dead end as one linked to any other directory already walked.
+  const pending = [modulesDir]
+  const visited = new Set<string>([realPathOrSelf(modulesDir)])
+  while (pending.length > 0) {
+    const dir = pending.pop() as string
+    if (Date.now() > deadline) {
+      throw new SubmoduleWalkBudgetError(
+        `[Sandbox] The walk of ${modulesDir} ran out of the time it was given with ${pending.length + 1} directories left to look at (at ${dir}); refusing to sandbox on the submodule git directories it did reach`,
       )
-      continue
     }
-    collectSubmoduleGitDirs(
-      isGitDir ? path.join(child, 'modules') : child,
-      depth + 1,
-      scan,
-      visited,
-    )
+    const entries = listDirectory(dir, scan)
+    if (entries === undefined) continue
+    for (const entry of entries) {
+      const child = path.join(dir, entry.name)
+      // git accepts a symlinked entry under .git/modules, and
+      // Dirent.isDirectory is false for one, so the link is followed — and
+      // the real path recorded, since a link back up would otherwise loop.
+      if (!isDirectory(entry, child, scan)) continue
+      const visitKey = realPathOrSelf(child)
+      if (visited.has(visitKey)) continue
+      visited.add(visitKey)
+
+      const childEntries = listDirectory(child, scan)
+      if (childEntries === undefined) continue
+      const isGitDir = childEntries.some(e => GIT_DIR_MARKERS.has(e.name))
+      if (isGitDir) scan.gitDirs.push(child)
+      // A git directory keeps its own submodules under `modules`; anything
+      // else is a segment of a submodule name (`vendor` of `vendor/lib`).
+      pending.push(isGitDir ? path.join(child, 'modules') : child)
+    }
   }
+  scan.gitDirs.sort()
+  scan.unreadableDirs.sort()
+  return scan
 }
 
 /** Entries of `dir`, or undefined when it is absent or (recorded) unreadable. */
