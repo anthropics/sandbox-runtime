@@ -1,5 +1,4 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
-import { request as httpRequest } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import { connect, type AddressInfo, type Server, type Socket } from 'node:net'
 import type { LookupFunction } from 'node:net'
@@ -19,16 +18,6 @@ const CA_PEM = readFileSync(CA_CERT, 'utf8')
 const UPSTREAM_NAME = 'keepalive.localhost'
 
 type Reply = { status: number; body: string }
-
-// ClientRequest#reusedSocket is how the proxy tells a stale kept-alive socket
-// from any other upstream failure. A runtime whose client does not report it
-// answers 502, as for any upstream failure.
-const reportsReusedSocket = (() => {
-  const probe = httpRequest({ host: '127.0.0.1', port: 9, agent: false })
-  probe.on('error', () => {})
-  probe.destroy()
-  return probe.reusedSocket !== undefined
-})()
 
 /**
  * CONNECT through the proxy and complete the TLS handshake against the
@@ -176,14 +165,11 @@ describe('tls-terminate-proxy: upstream keep-alive', () => {
     expect(second.body).not.toBe(first.body)
   })
 
-  test.skipIf(!reportsReusedSocket)(
-    'a reused upstream connection dropped mid-request closes the client connection, not 502',
-    async () => {
-      const tls = await openTunnel(proxyPort, UPSTREAM_NAME, upstreamPort)
-      expect(await get(tls, '/a')).toMatchObject({ status: 200 })
-      const dropped = await get(tls, '/drop')
-      tls.destroy()
-      expect(dropped).toBe('closed')
-    },
-  )
+  test('a reused upstream connection dropped mid-request closes the client connection, not 502', async () => {
+    const tls = await openTunnel(proxyPort, UPSTREAM_NAME, upstreamPort)
+    expect(await get(tls, '/a')).toMatchObject({ status: 200 })
+    const dropped = await get(tls, '/drop')
+    tls.destroy()
+    expect(dropped).toBe('closed')
+  })
 })

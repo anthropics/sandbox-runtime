@@ -613,8 +613,11 @@ async function forwardUpstream(
       // The upstream closed the kept-alive socket as this request went out.
       // Close the client's connection rather than answer 502: that is what
       // the client would see on a direct keep-alive connection, and what its
-      // own retry policy is written for.
-      res.destroy()
+      // own retry policy is written for. Destroy the socket, not `res`: with
+      // no headers sent yet, Bun's res.destroy() answers `200 OK` with an
+      // empty body before closing, which would hand the client a fabricated
+      // success.
+      req.socket.destroy()
       return
     }
     respondUpstreamError(res, err)
