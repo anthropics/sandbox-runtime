@@ -773,6 +773,8 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
+**Note (Windows):** On Windows, mandatory deny paths cover existing files only and are rescanned per command (paths up to `mandatoryDenySearchDepth` components below the working directory, default 3, same counting as Linux, skipping `node_modules`), with the deny ACEs applied for the command's lifetime. A repo's `.git` directory and its ancestors up to the write-granted root are also pinned against rename/delete for the command's duration.
+
 **Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
 
 **Pinned directories (Linux):** Every existing ancestor of a protected path (a write-denied path, a read-denied file or directory, a masked credential file) up to the allowed write root covering it is made a mountpoint — "pinned" — and cannot be renamed or removed from inside the sandbox: `mv` or `rmdir` of such a directory (for example a nested repository's parent) fails with `EBUSY` ("Device or resource busy"), and `rm -rf` of a nested repository leaves the pinned directories and the protected files behind (as with `.git/hooks`). A pin is buried under the mounts above it, so it never appears on a lookup path: reads, writes, creation, renames and hard links inside or across a pinned directory are unaffected.
