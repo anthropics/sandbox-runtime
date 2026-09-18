@@ -15,10 +15,8 @@ import {
   expandGlobPattern,
   isUncPath,
 } from './sandbox-utils.js'
-// Re-export so existing tests (glob-expand.test.ts) and any
-// out-of-tree caller keep their import path. `buildGitConfigEnv` is
-// hoisted to sandbox-utils (cross-platform) but re-exported here for
-// the existing `src/index.ts` surface.
+// Kept on this module's surface for out-of-tree importers; the
+// implementations live in sandbox-utils.ts.
 export {
   containsGlobCharsWin,
   stripExtendedPathPrefix,
@@ -979,9 +977,8 @@ export async function verifyWindowsWfpEgress(
   }
   try {
     // 30s: first call after install may create the sandbox user's
-    // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW —
-    // same budget as windowsTrustCa, plus the runner's own 2s
-    // connect timeout.
+    // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
+    // the runner allows itself 2s to connect (runner.rs).
     const r = runSrtWin(['wfp', 'verify', '--target', target], {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
@@ -1438,11 +1435,7 @@ export interface WindowsInstallOptions {
   force?: boolean
   /**
    * How long to wait for the self-elevating install subprocess.
-   * Default 120 000 ms — the Windows UAC consent dialog auto-
-   * dismisses after ~2 minutes, so anything shorter risks killing
-   * the subprocess while a legitimate approval is still pending
-   * (elevation is not retracted when the parent dies, so a late
-   * approval after we've timed out would half-complete).
+   * Defaults to {@link INSTALL_TIMEOUT_MS}.
    */
   timeoutMs?: number
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
@@ -1463,11 +1456,17 @@ export interface WindowsInstallResult {
 }
 
 /**
- * Effective spawn budget for the self-elevating install/uninstall —
- * see {@link WindowsInstallOptions.timeoutMs} for the 120 s rationale.
+ * Default spawn budget for the self-elevating install/uninstall. The Windows
+ * UAC consent dialog auto-dismisses after ~2 minutes, so anything shorter
+ * risks killing the subprocess while a legitimate approval is still pending
+ * (elevation is not retracted when the parent dies, so a late approval after
+ * we have timed out would half-complete).
  */
+const INSTALL_TIMEOUT_MS = 120_000
+
+/** Effective spawn budget for the self-elevating install/uninstall. */
 function installTimeoutMs(opts: { timeoutMs?: number }): number {
-  return opts.timeoutMs ?? 120_000
+  return opts.timeoutMs ?? INSTALL_TIMEOUT_MS
 }
 
 function installArgs(opts: WindowsInstallOptions): string[] {
@@ -1633,7 +1632,7 @@ export function uninstallWindowsSandbox(
     keepUser?: boolean
     /**
      * How long to wait for the self-elevating uninstall subprocess.
-     * Default 120 000 ms — see {@link WindowsInstallOptions.timeoutMs}.
+     * Defaults to {@link INSTALL_TIMEOUT_MS}.
      */
     timeoutMs?: number
     srtWin?: SrtWinSpawn

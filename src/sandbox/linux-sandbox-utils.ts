@@ -7,7 +7,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
-import { ripGrep } from '../utils/ripgrep.js'
+import { ripGrep, type RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   generateProxyEnvVars,
@@ -74,7 +74,7 @@ export interface LinuxSandboxParams {
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
-  ripgrepConfig?: { command: string; args?: string[] }
+  ripgrepConfig?: RipgrepConfig
   /** Maximum directory depth to search for dangerous files (default: 3) */
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
@@ -232,7 +232,7 @@ function hasFileAncestor(targetPath: string): boolean {
     const nextPath = currentPath + path.sep + part
     try {
       const stat = fs.statSync(nextPath)
-      if (stat.isFile() || stat.isSymbolicLink()) {
+      if (stat.isFile()) {
         // This component exists as a file — nothing below it can be created
         return true
       }
@@ -323,7 +323,7 @@ export function linuxGetCwdMandatoryDenyPaths(
  * With --max-depth limiting, this is fast enough to run on each command without memoization.
  */
 async function linuxGetMandatoryDenyPaths(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  ripgrepConfig: RipgrepConfig = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
@@ -1648,7 +1648,7 @@ async function generateFilesystemArgs(
   writeConfig: FsWriteRestrictionConfig | undefined,
   maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
   maskedFileStoreDir: string | undefined,
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  ripgrepConfig: RipgrepConfig = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
@@ -2201,41 +2201,11 @@ async function generateFilesystemArgs(
     // exception: it contains every allowed write path, so
     // coveredBySafeReadOnlyDenyDir judges a vetoed '/' against the candidate
     // instead — see the branch there.
-    // Containment is root-aware
-    // (isAtOrUnder): '/' is a recordable covering directory when allowOnly
-    // and denyWithinAllow both name it, and '/' + '/' is a prefix of
-    // nothing, so a string-prefix test would judge it safe for every path
-    // and drop the binds the re-application passes below key off.
-    // Rationale: nothing host-backed and writable lands after the buffered
-    // read-only binds, so no later mount re-opens what a covering bind
-    // closed. What does land after them is a read-only restore of a write
-    // path inside a dropped deny bind, a re-applied tmpfs (whose contents
-    // never reach the host) with its restores read-only, a re-applied file
-    // mask, and the read-only bind of the fake-file store. (The ancestor
-    // pins and their covers are spliced in BEFORE the buffered deny binds,
-    // so neither is ever a writable emission on top of one; under a '/'
-    // write root a cover adds no access that root's own --bind / / had not
-    // already given. A buried pin survives a later mount that shadows it,
-    // but not one AT '/': that one the pivot promotes, and protection there
-    // is the deny's own EROFS. The caller adds --dev /dev after this
-    // function returns, and --bind /proc /proc under the weaker nested
-    // mode; neither is a deny path's subtree.) So the covering bind is the
-    // last word on its subtree unless a tmpfs ABOVE it drops that bind at
-    // emission as hidden-by-a-tmpfs and restores an allowed path around it:
-    // veto (ii). A tmpfs at or beneath the dir is NOT a veto: a path created
-    // inside a tmpfs never reaches the host, so a deny path beneath it needs
-    // no stub, and one elsewhere under the dir is unaffected by it. (The
-    // emission filter's
-    // other drop condition, fileMasks, holds file dests only — /dev/null
-    // read-deny masks and credential-mask fakes — while the pre-pass stat-verifies every
-    // recorded dir as a directory, so it cannot drop a recorded dir short of
-    // a dir→file race, which ends in bwrap refusing to start, not a silent
-    // gap.) Only existing read-deny directories become a tmpfs: absent and
-    // file-level read-denies count for nothing. If either condition could
-    // apply, keep the stub — the pre-existing abort is preferable to a
-    // silently creatable deny path. (An allow path bound before the
-    // denyWrite binds is not a vector by itself: the later read-only re-bind
-    // lands on top of it.)
+    // The skip rests on the emission order: nothing host-backed and writable
+    // lands after the buffered read-only binds, so a covering bind is the
+    // last word on its subtree unless a tmpfs above it drops that bind at
+    // emission. Where a veto could apply, keep the stub: the pre-existing
+    // abort is preferable to a silently creatable deny path.
     const coveringDirUnsafeVerdicts = new Map<string, boolean>()
     const coveringDirIsUnsafe = (denyDir: string): boolean => {
       const cached = coveringDirUnsafeVerdicts.get(denyDir)
@@ -2943,18 +2913,8 @@ async function generateFilesystemArgs(
  * This implementation uses a custom apply-seccomp binary to block Unix domain socket
  * creation for user commands while allowing network infrastructure:
  *
- * Stage 1: Outer bwrap - Network and filesystem isolation (NO seccomp)
- *   - Bubblewrap starts with isolated network namespace (--unshare-net)
- *   - Bubblewrap applies PID namespace isolation (--unshare-pid and --proc)
- *   - Filesystem restrictions are applied (read-only mounts, bind mounts, etc.)
- *   - Socat processes start and connect to Unix socket bridges (can use socket(AF_UNIX, ...))
- *
- * Stage 2: apply-seccomp - Nested PID namespace + seccomp filter
- *   - apply-seccomp creates a nested user+PID+mount namespace and remounts /proc
- *   - Inside, apply-seccomp becomes PID 1 (non-dumpable init/reaper)
- *   - Forks, sets PR_SET_NO_NEW_PRIVS, applies seccomp via prctl(PR_SET_SECCOMP)
- *   - Execs user command with seccomp active (cannot create new Unix sockets)
- *   - User command cannot see or ptrace bwrap/bash/socat (separate PID namespace)
+ * The two stages are described in README.md, "Unix Socket Restrictions
+ * (Linux)".
  *
  * This solves the conflict between:
  * - Security: Blocking arbitrary Unix socket creation in user commands

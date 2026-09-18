@@ -773,7 +773,7 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
-**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
+**Note (Linux):** A mandatory deny path that does not exist yet is blocked as well. bubblewrap covers it with a read-only `/dev/null`, or mounts an empty read-only directory at the first missing intermediate component, and those host mount points are removed by `cleanupAfterCommand()` — see "Write denies on paths that do not exist yet (Linux)" above. macOS uses glob patterns, which cover existing and new files alike.
 
 **Pinned directories (Linux):** Every existing ancestor of a protected path (a write-denied path, a read-denied file or directory, a masked credential file) up to the allowed write root covering it is made a mountpoint — "pinned" — and cannot be renamed or removed from inside the sandbox: `mv` or `rmdir` of such a directory (for example a nested repository's parent) fails with `EBUSY` ("Device or resource busy"), and `rm -rf` of a nested repository leaves the pinned directories and the protected files behind (as with `.git/hooks`). A pin is buried under the mounts above it, so it never appears on a lookup path: reads, writes, creation, renames and hard links inside or across a pinned directory are unaffected.
 
@@ -893,5 +893,3 @@ Users should be aware of potential risks that come from allowing broad domains l
 **Future improvements:**
 
 - **Proxychains support**: Add support for `proxychains` with `LD_PRELOAD` on Linux to intercept network calls at a lower level, making bypass more difficult
-
-- **Linux violation monitoring**: Implement automatic `strace`-based violation detection for Linux, integrated with the violation store. Currently, Linux users must manually run `strace` to see violations, unlike macOS which has automatic violation monitoring via the system log store
