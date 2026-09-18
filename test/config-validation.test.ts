@@ -3,20 +3,20 @@ import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 
 describe('Config Validation', () => {
-  test('should validate a valid minimal config', () => {
-    const config = {
-      network: {
-        allowedDomains: [],
-        deniedDomains: [],
-      },
-      filesystem: {
-        denyRead: [],
-        allowWrite: [],
-        denyWrite: [],
-      },
-    }
+  const validConfig = {
+    network: {
+      allowedDomains: [],
+      deniedDomains: [],
+    },
+    filesystem: {
+      denyRead: [],
+      allowWrite: [],
+      denyWrite: [],
+    },
+  }
 
-    const result = SandboxRuntimeConfigSchema.safeParse(config)
+  test('should validate a valid minimal config', () => {
+    const result = SandboxRuntimeConfigSchema.safeParse(validConfig)
     expect(result.success).toBe(true)
   })
 
@@ -122,6 +122,35 @@ describe('Config Validation', () => {
       filesystem: {
         denyRead: [],
       },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(false)
+  })
+
+  test('should reject unknown top-level keys', () => {
+    // A typo like `denyWriteTypo` must fail loudly instead of being
+    // silently stripped while the operator believes the policy is
+    // enforced (issue #434).
+    const config = {
+      ...validConfig,
+      denyWriteTypo: ['/Users/me'],
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      const messages = result.error.issues.map(issue => issue.message)
+      expect(messages.some(message => message.includes('denyWriteTypo'))).toBe(
+        true,
+      )
+    }
+  })
+
+  test('should still reject unknown top-level keys alongside valid config', () => {
+    const config = {
+      ...validConfig,
+      allowEverything: true,
     }
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)

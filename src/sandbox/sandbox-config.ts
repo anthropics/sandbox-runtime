@@ -1192,6 +1192,10 @@ export const SandboxRuntimeConfigSchema = z
         '`safe.directory` without adding them to `filesystem.allowWrite`.',
     ),
   })
+  // Reject unknown top-level keys so a typo like `denyWriteTypo` fails
+  // loudly instead of being silently stripped while the operator believes
+  // the policy is enforced. Same reasoning as the strict sub-schemas above.
+  .strict()
   .superRefine((cfg, ctx) => {
     // filesystem.disabled drops every filesystem rule, the credential file
     // denies included (getFsReadConfig, getFsWriteConfig and
