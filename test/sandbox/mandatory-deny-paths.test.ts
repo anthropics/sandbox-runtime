@@ -28,7 +28,7 @@ import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
-import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
+import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
  * Integration tests for mandatory deny paths.
@@ -373,6 +373,126 @@ describe.if(isSupportedPlatform)(
         )
       })
     })
+
+    // macOS builds the mandatory denies as glob strings for Seatbelt, so a
+    // depth-agnostic pattern like `**/.vscode/**` has no way to exclude
+    // node_modules the way the Linux backend's ripgrep scan does (`-g
+    // '!**/node_modules/**'`). These tests exercise the macOS-only
+    // node_modules re-allow; skipped on Linux since the ripgrep exclusion
+    // already covers this and would pass without exercising anything new.
+    describe.if(isMacOS)(
+      'node_modules exemption for depth-agnostic denies (macOS only)',
+      () => {
+        const NM_DANGEROUS_FILE = join('node_modules', 'some-pkg', '.mcp.json')
+        const NM_DANGEROUS_DIR_FILE = join(
+          'node_modules',
+          'some-pkg',
+          '.vscode',
+          'settings.json',
+        )
+        const NM_NEW_FILE = join(
+          'node_modules',
+          'other-pkg',
+          '.idea',
+          'new-file.xml',
+        )
+        const NESTED_OUTSIDE_NODE_MODULES = join(
+          'vendor',
+          'nested',
+          '.vscode',
+          'settings.json',
+        )
+
+        beforeAll(() => {
+          mkdirSync(join(TEST_DIR, 'node_modules', 'some-pkg', '.vscode'), {
+            recursive: true,
+          })
+          writeFileSync(join(TEST_DIR, NM_DANGEROUS_FILE), ORIGINAL_CONTENT)
+          writeFileSync(join(TEST_DIR, NM_DANGEROUS_DIR_FILE), ORIGINAL_CONTENT)
+          mkdirSync(join(TEST_DIR, 'node_modules', 'other-pkg', '.idea'), {
+            recursive: true,
+          })
+          mkdirSync(join(TEST_DIR, 'vendor', 'nested', '.vscode'), {
+            recursive: true,
+          })
+          writeFileSync(
+            join(TEST_DIR, NESTED_OUTSIDE_NODE_MODULES),
+            ORIGINAL_CONTENT,
+          )
+        })
+
+        it('allows overwriting a DANGEROUS_FILES name shipped by a dependency (file-write*)', async () => {
+          writeFileSync(NM_DANGEROUS_FILE, ORIGINAL_CONTENT)
+
+          const result = await runSandboxedWrite(
+            NM_DANGEROUS_FILE,
+            MODIFIED_CONTENT,
+          )
+
+          expect(result.success).toBe(true)
+          expect(readFileSync(NM_DANGEROUS_FILE, 'utf8').trim()).toBe(
+            MODIFIED_CONTENT,
+          )
+        })
+
+        it('allows overwriting a dangerous-directory name shipped by a dependency (file-write*)', async () => {
+          writeFileSync(NM_DANGEROUS_DIR_FILE, ORIGINAL_CONTENT)
+
+          const result = await runSandboxedWrite(
+            NM_DANGEROUS_DIR_FILE,
+            MODIFIED_CONTENT,
+          )
+
+          expect(result.success).toBe(true)
+          expect(readFileSync(NM_DANGEROUS_DIR_FILE, 'utf8').trim()).toBe(
+            MODIFIED_CONTENT,
+          )
+        })
+
+        it('allows creating a new file under a dangerous-directory name in node_modules (file-write-create)', async () => {
+          expect(existsSync(NM_NEW_FILE)).toBe(false)
+
+          const result = await runSandboxedWrite(NM_NEW_FILE, MODIFIED_CONTENT)
+
+          expect(result.success).toBe(true)
+          expect(readFileSync(NM_NEW_FILE, 'utf8').trim()).toBe(
+            MODIFIED_CONTENT,
+          )
+        })
+
+        it('allows removing a dangerous file shipped by a dependency (file-write-unlink)', async () => {
+          writeFileSync(NM_DANGEROUS_FILE, ORIGINAL_CONTENT)
+          const writeConfig = { allowOnly: ['.'], denyWithinAllow: [] }
+          const wrappedCommand = wrapCommandWithSandboxMacOS({
+            command: `rm '${NM_DANGEROUS_FILE}'`,
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig,
+          })
+
+          const result = spawnSync(wrappedCommand, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+
+          expect(result.status).toBe(0)
+          expect(existsSync(NM_DANGEROUS_FILE)).toBe(false)
+        })
+
+        it('still denies the same dangerous-directory name outside node_modules when nested (regression)', async () => {
+          const result = await runSandboxedWrite(
+            NESTED_OUTSIDE_NODE_MODULES,
+            MODIFIED_CONTENT,
+          )
+
+          expect(result.success).toBe(false)
+          expect(readFileSync(NESTED_OUTSIDE_NODE_MODULES, 'utf8')).toBe(
+            ORIGINAL_CONTENT,
+          )
+        })
+      },
+    )
 
     describe('allowGitConfig option', () => {
       async function runSandboxedWriteWithGitConfig(
