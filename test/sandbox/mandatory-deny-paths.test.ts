@@ -2882,14 +2882,20 @@ describe('Git metadata deny paths - Unit Tests', () => {
    * is no depth bound: what bounds the walk is the time it is given, and what
    * stops it looping is where each directory really is.
    */
-  it('walks a chain 200 directories deep, and denies every level of it', () => {
-    // A hundred submodules each nested inside the one above, which is two
-    // hundred directories of `<name>/modules` below .git/modules — far past
-    // any bound the walk used to have, and enough of its own stack to
-    // overflow a recursive one on some runtimes.
+  it('walks a chain hundreds of directories deep, and denies every level', () => {
+    // Submodules each nested inside the one above, two directories of
+    // `<name>/modules` per level — far past any bound the walk used to have,
+    // and enough of its own stack to overflow a recursive one on some
+    // runtimes. How many levels fit is what the platform's longest path
+    // leaves room for once the temporary directory has had its share: macOS
+    // stops at 1024 bytes, and a path past it cannot be opened at all.
+    const budget = getPlatform() === 'macos' ? 950 : 4000
+    const levels = Math.floor((budget - dir.length) / '/x/modules'.length)
+    expect(levels).toBeGreaterThan(50)
+
     const gitDirs: string[] = []
     let at = join(dir, 'modules')
-    for (let level = 0; level < 100; level++) {
+    for (let level = 0; level < levels; level++) {
       at = join(at, 'x')
       makeGitDir(at)
       gitDirs.push(at)
@@ -2961,7 +2967,12 @@ describe('Git metadata deny paths - Unit Tests', () => {
     async () => {
       const checkout = join(dir, 'repo')
       const gitDir = makeGitDir(join(checkout, '.git'))
-      makeGitDir(join(gitDir, 'modules', 'lib'))
+      // Enough submodules that the walk cannot get through them inside the
+      // millisecond below, whatever the machine: it is the walk that must
+      // run out here, not the scan, which runs after it.
+      for (let i = 0; i < 400; i++) {
+        makeGitDir(join(gitDir, 'modules', `s${String(i).padStart(4, '0')}`))
+      }
 
       const originalCwd = process.cwd()
       process.chdir(checkout)
@@ -2972,7 +2983,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
           readConfig: undefined,
           writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
           // The walk shares the scan's budget, so one millisecond of it is
-          // gone before the walk starts.
+          // all the walk gets.
           ripgrepConfig: { command: 'rg', timeoutMs: 1 },
         }).catch((e: unknown) => e)
 
@@ -2980,6 +2991,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
         expect((error as LinuxSandboxProfileError).code).toBe(
           'deny_scan_failed',
         )
+        expect((error as Error).message).toContain(join(gitDir, 'modules'))
       } finally {
         cleanupBwrapMountPoints({ force: true })
         process.chdir(originalCwd)
