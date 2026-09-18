@@ -644,7 +644,10 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
         'srt_win_timeout',
         `srt-win ${args.join(' ')} timed out after ` +
           `${opts.timeoutMs ?? 15_000}ms` +
-          (r.signal ? ` (killed by ${r.signal})` : ''),
+          (r.signal ? ` (killed by ${r.signal})` : '') +
+          // Whatever it wrote before the kill says how far it got (the
+          // SANDBOX_RUNTIME_WIN_DEBUG phase lines, when that is set).
+          (r.stderr?.trim() ? `; stderr: ${r.stderr.trim().slice(-2000)}` : ''),
         args[0],
       )
     }
