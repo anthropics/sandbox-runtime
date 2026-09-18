@@ -6,7 +6,10 @@
   for a sandboxed child (write denied, read allowed), that a session
   deny stamp + restore on the same path preserves the ambient floor
   (the `ambient_denies` fold-in at the recompose chokepoint), and
-  that uninstall removes it all.
+  that uninstall removes it all. Also covers the broker-time
+  `acl audit` sweep (AUD1): a third-party Everyone-writable dir under
+  the system drive is flagged and session-deny-stamped, a junction
+  sibling is skipped, and `acl restore` releases the stamp.
 
   Self-contained: installs under a fixed test-only sublayer GUID
   (distinct from the other smoke scripts). NOTE the ambient stamps
@@ -96,6 +99,56 @@ try {
   Assert-WriteDenied 'AM3: ambient deny lost after session stamp+restore round-trip'
   Write-Host 'AM3 ok: ambient floor survives session stamp+restore'
 
+  # -- AUD1: acl audit flags + stamps a third-party world-writable dir --
+  # Create an Everyone-writable dir directly under the system drive
+  # (a scanned root), a junction sibling pointing at it (must be
+  # skipped, never followed), run the audit, and assert: the dir is
+  # stamped, a sandboxed write into it is denied, the junction is
+  # not flagged, and `acl restore` releases the deny (the dir is
+  # Everyone-writable again for the sandbox account).
+  $auditDir  = Join-Path $env:SystemDrive "srt-ww-smoke-$([guid]::NewGuid().ToString('N'))"
+  $wwJunc = "$auditDir-junc"
+  New-Item -ItemType Directory -Path $auditDir | Out-Null
+  # Everyone: generic write, inheritable - the shape a sloppy
+  # third-party installer leaves behind.
+  icacls $auditDir /grant '*S-1-1-0:(OI)(CI)(GW)' | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "AUD1: icacls grant on $auditDir failed" }
+  New-Item -ItemType Junction -Path $wwJunc -Value $auditDir | Out-Null
+  # Parse stdout alone as the JSON document (the J helper captures
+  # stdout and lets stderr flow to the console) - no fishing the
+  # first '{'-line out of a merged stream, which broke whenever a
+  # stderr line contained '{'. J/Run throw on a non-zero exit.
+  $audit = J @('acl','audit','--holder-pid',"$PID",'--sandbox-user-sid',$sbSid,'--json')
+  $wwLeaf = Split-Path $auditDir -Leaf
+  if (-not ($audit.stamped | Where-Object { $_ -like "*$wwLeaf" })) {
+    throw "AUD1: acl audit did not stamp ${auditDir}: stamped=$($audit.stamped -join ', ')"
+  }
+  if ($audit.flagged | Where-Object { $_ -like "*$wwLeaf-junc" }) {
+    throw 'AUD1: acl audit flagged the junction (reparse points must be skipped)'
+  }
+  # Non-vacuous half: a regression that FOLLOWS reparse points would
+  # surface the junction under its target's canonical name and dedup
+  # away - the flagged-list check above cannot see that. The
+  # collection-time skip is counted, so require the counter to have
+  # registered our planted junction.
+  if (-not $audit.budget.reparseSkipped -or $audit.budget.reparseSkipped -lt 1) {
+    throw "AUD1: reparseSkipped=$($audit.budget.reparseSkipped) - the planted junction was not skip-counted (reparse handling regressed?)"
+  }
+  $probe = Join-Path $auditDir 'ww-probe.txt'
+  Assert-WriteDenied 'AUD1: sandboxed write into audited world-writable dir succeeded (must be denied)'
+  # Release: the audit denies are ordinary session holds under this
+  # holder PID, so `acl restore` removes them; the dir then accepts
+  # sandbox writes again via its own Everyone grant.
+  Run @('acl','restore','--holder-pid',$PID,'--sandbox-user-sid',$sbSid,'--json')
+  & $Exe exec --quiet -- $cmd /c "echo p > `"$probe`"" 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $probe)) {
+    throw 'AUD1: sandboxed write still denied after acl restore (audit deny not released)'
+  }
+  Remove-Item $probe -Force -ea SilentlyContinue
+  # Reset $probe for the later ambient sections that reuse it.
+  $probe = Join-Path $env:ProgramData "srt-ambient-smoke-$([guid]::NewGuid().ToString('N')).txt"
+  Write-Host 'AUD1 ok: acl audit stamped the world-writable dir, skipped the junction, restore released it'
+
   # ── AM4: --keep-user uninstall keeps the floor ───────────────────
   # Ambient stamps key on the ACCOUNT, not the sublayer: tearing down
   # one sublayer with --keep-user (what test suites do around a
@@ -133,6 +186,16 @@ try {
 }
 finally {
   & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-Null
+  # AUD1 leftovers: remove the junction FIRST (rmdir on a junction
+  # deletes the link, not the target), then the dir.
+  if ($wwJunc -and (Test-Path $wwJunc)) {
+    # Guarded: a transient AV/indexer handle here must not mask the
+    # real test error or skip the auditDir removal below.
+    try { (Get-Item $wwJunc).Delete() } catch { }
+  }
+  if ($auditDir -and (Test-Path $auditDir)) {
+    Remove-Item $auditDir -Recurse -Force -ea SilentlyContinue
+  }
 }
 
-Write-Host 'smoke-ambient: PASS (AM1/AM2/AM3/AM4/AM5)'
+Write-Host 'smoke-ambient: PASS (AM1/AM2/AM3/AUD1/AM4/AM5)'

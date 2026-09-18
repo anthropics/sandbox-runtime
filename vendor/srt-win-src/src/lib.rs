@@ -28,6 +28,7 @@ pub mod winsta;
 
 pub mod acl;
 pub mod ambient;
+pub mod audit;
 pub mod path_id;
 pub mod reg;
 pub mod state_db;
