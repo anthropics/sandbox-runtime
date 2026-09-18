@@ -68,6 +68,24 @@ function Write-MachineSnapshot {
   }
 }
 
+# How many .NET Framework native images exist, and whether Windows PowerShell's
+# own assembly has one. Without it powershell.exe JIT-compiles at every start.
+function Write-NativeImageState {
+  param([string] $Tag)
+  try {
+    foreach ($d in Get-ChildItem "$env:SystemRoot\assembly" -Directory -Filter 'NativeImages_v4*' -ErrorAction SilentlyContinue) {
+      $all = @(Get-ChildItem $d.FullName -Directory -ErrorAction SilentlyContinue)
+      $sma = @($all | Where-Object { $_.Name -like 'System.Manaa*' -or $_.Name -like 'System.Management.A*' })
+      Write-Host ("diag[{0}]: native-images {1}: total={2} powershell-assembly={3}" -f
+        $Tag, $d.Name, $all.Count, $sma.Count)
+    }
+    $svc = @(Get-Process -Name mscorsvw, ngen, ngentask -ErrorAction SilentlyContinue)
+    Write-Host ("diag[{0}]: ngen processes running: {1}" -f $Tag, (($svc | ForEach-Object { $_.ProcessName }) -join ','))
+  } catch {
+    Write-Host "diag[$Tag]: native-image state failed: $_"
+  }
+}
+
 # The processes that used the most CPU over one second. Names and ids only.
 function Write-BusySample {
   param([string] $Tag)
@@ -323,6 +341,7 @@ try {
   # This is the first Windows PowerShell started as the sandbox user; log how
   # long it took.
   Write-MachineSnapshot 'before-R5b'
+  Write-NativeImageState 'before-R5b'
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
     "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portInR); Write-Output CONNECTED } " +
@@ -401,6 +420,7 @@ if ($r.out -notmatch 'AccessDenied') {
   throw "R5e: expected AccessDenied (WFP block), got: $($r.raw)"
 }
 Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
+Write-NativeImageState 'after-R5e'
 
 # ── R5f: non-interactive logon types refused for the sandbox account ─
 # The SMB redirector dials from kernel mode as SYSTEM, so the
