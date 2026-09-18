@@ -189,6 +189,50 @@ jobs:
         if: matrix.os != 'windows'
         run: npm run build
 
+      # TEMPORARY, remove before merge: the --control-fd stdin test sees EOF on
+      # fd 0 about half the time on linux/x86-64 although the parent wrote the
+      # line and kept the pipe open. Trace the same scenario and print which
+      # process reads the line or shuts the socket down.
+      - name: TEMPORARY — strace the stdin passthrough (Linux x86-64)
+        if: matrix.os == 'linux' && matrix.arch == 'x86-64'
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y strace >/dev/null 2>&1 || true
+          cat > /tmp/stdin-harness.mjs <<'HARNESS'
+          import { spawn } from 'node:child_process'
+          import fs from 'node:fs'
+          const script = '/tmp/stdin-harness.sh'
+          fs.writeFileSync(script, '#!/bin/bash\nread line\necho "GOT: $line (rc=$?)"\n', { mode: 0o755 })
+          const child = spawn('node', ['dist/cli.js', '--control-fd', '3', '--', script], { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] })
+          let out = ''
+          child.stdout.on('data', d => (out += d))
+          child.stdin.write('hello from stdin\n')
+          child.on('exit', code => { console.log(`exit=${code} ${out.trim()}`); process.exit(0) })
+          HARNESS
+          plain=0
+          for i in $(seq 1 12); do
+            bun /tmp/stdin-harness.mjs > /tmp/plain.$i 2>&1 || true
+            grep -q "GOT: hello from stdin" /tmp/plain.$i || { plain=$((plain+1)); echo "untraced iteration $i FAILED: $(cat /tmp/plain.$i)"; }
+          done
+          echo "untraced iterations failed: $plain of 12"
+          fails=0
+          for i in $(seq 1 12); do
+            strace -f -qq -s 40 -e trace=execve,read,recvfrom,recvmsg,shutdown -o /tmp/st.$i bun /tmp/stdin-harness.mjs > /tmp/out.$i 2>&1 || true
+            if grep -q "GOT: hello from stdin" /tmp/out.$i; then
+              echo "iteration $i: ok ($(cat /tmp/out.$i))"
+            else
+              fails=$((fails+1))
+              echo "=== iteration $i FAILED: $(cat /tmp/out.$i)"
+              echo "--- who exec'd what (pid: program)"
+              grep -E "execve\(" /tmp/st.$i | sed -E 's/^([0-9]+) +execve\("([^"]+)".*/  \1: \2/' | head -30
+              echo "--- every read of the line, and every shutdown()"
+              grep -nE "hello from stdin|shutdown\(" /tmp/st.$i | head -20
+              echo "--- reads on fd 0 that returned 0 (EOF)"
+              grep -nE "(read|recvfrom)\(0, .*= 0$" /tmp/st.$i | head -10
+            fi
+          done
+          echo "strace iterations failed: $fails of 12"
+
       - name: Run tests
         if: matrix.os != 'windows'
         run: npm test
