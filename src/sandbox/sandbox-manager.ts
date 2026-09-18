@@ -539,6 +539,7 @@ function shouldTerminateTLSForHost(host: string): boolean {
 async function startMuxProxyServer(
   sandboxAskCallback: SandboxAskCallback | undefined,
   portRange: readonly [number, number] | undefined,
+  enableIpv6Http: boolean,
 ): Promise<number> {
   const injectCredentials = buildCredentialInjector()
   const injectBodyCredentials = buildBodyCredentialInjector()
@@ -620,8 +621,22 @@ async function startMuxProxyServer(
   if (muxPort === undefined) {
     throw new Error('Failed to get mux proxy server port')
   }
+  if (enableIpv6Http) {
+    await new Promise<void>((resolve, reject) => {
+      mux.ipv6Server.once('error', reject)
+      mux.ipv6Server.listen(
+        { host: '::1', port: muxPort, ipv6Only: true },
+        () => {
+          mux.ipv6Server.removeListener('error', reject)
+          resolve()
+        },
+      )
+    })
+  }
   mux.unref()
-  logForDebugging(`Mux proxy (HTTP+SOCKS) listening on localhost:${muxPort}`)
+  logForDebugging(
+    `Mux proxy listening on 127.0.0.1${enableIpv6Http ? ' and ::1' : ''}:${muxPort}`,
+  )
   return muxPort
 }
 
@@ -947,7 +962,13 @@ async function initialize(
         config.network.httpProxyPort === undefined ||
         config.network.socksProxyPort === undefined
       const muxPort = needLocalProxy
-        ? await startMuxProxyServer(sandboxAskCallback, portRange)
+        ? await startMuxProxyServer(
+            sandboxAskCallback,
+            portRange,
+            getPlatform() === 'macos' &&
+              config.network.httpProxyPort === undefined &&
+              config.network.httpProxyDualStack === true,
+          )
         : undefined
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
