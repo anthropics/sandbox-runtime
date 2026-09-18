@@ -220,6 +220,19 @@ describe('proxy auth + network deny semantics', () => {
       await spawnAsync('bash', ['-c', labelled])
       // Attributed under the opaque id…
       const found = store.getViolationsForCommand('inv-0001')
+      // TEMPORARY diagnostics: this intermittently finds nothing on macOS.
+      // Show what the store does hold, and under which key.
+      if (found.length === 0) {
+        const held = store.getViolations().map(v => ({
+          line: v.line,
+          command: v.command,
+          encodedCommand: v.encodedCommand,
+        }))
+        throw new Error(
+          `no violation attributed to inv-0001; store holds ${held.length}: ` +
+            JSON.stringify(held),
+        )
+      }
       expect(found.length).toBeGreaterThan(0)
       expect(found[0]!.line).toContain('blocked.test')
       // …but reported as the command the invocation represents.
