@@ -2851,59 +2851,103 @@ async function generateFilesystemArgs(
     // a later deny reaching the same destination can upgrade a /dev/null
     // placeholder to the directory form in place (see the emission below).
     const placeholderSourceArgIndex = new Map<string, number>()
+    /** What a deny entry is, to both passes over denyPaths below. */
+    type DenyPathClass =
+      /** Nothing to deny: --dev /dev has already replaced that tree. */
+      | { kind: 'skip' }
+      /** A symlink cycle, or a chain past the ELOOP bound. */
+      | { kind: 'unresolved'; raw: string }
+      /** A symlink appeared in the resolved path's existing prefix, at
+       *  `at`, inside an allowed write path. */
+      | { kind: 'masked-symlink'; raw: string; resolved: string; at: string }
+      | { kind: 'absent'; raw: string; resolved: string }
+      | { kind: 'directory'; raw: string; resolved: string }
+      | { kind: 'file'; raw: string; resolved: string }
+    /**
+     * The one filter chain both passes below apply. They walk the same
+     * denyPaths and must reach the same verdict about each entry in the same
+     * order: the pre-pass is sound only if it records exactly the directories
+     * the loop re-binds read-only, and a directory recorded but never
+     * re-bound suppresses stubs the sandbox still needs.
+     *
+     * Run once per entry per pass — twice in all, once before any stub
+     * decision and once to emit — so each pass judges the filesystem as it
+     * stands when it acts on it.
+     */
+    const classifyDenyPath = (pathPattern: string): DenyPathClass => {
+      const raw = normalizePathForSandbox(pathPattern)
+      if (raw.startsWith('/dev/')) return { kind: 'skip' }
+      // Resolve-before-mask: normalizePathForSandbox keeps the raw symlink
+      // path whenever resolution crosses isSymlinkOutsideBoundary (the
+      // common dotfiles case), so canonicalize here. Every mask/bind below
+      // must be computed against the resolved path — bwrap dest-resolves
+      // symlinks, so a mask on the raw path either aborts startup (dir
+      // symlink) or lands on the target inode anyway (file symlink). Writes
+      // through the original symlinked path resolve to the same denied
+      // target inside the mount namespace.
+      const resolved = resolveSymlinkedDenyPath(raw)
+      if (resolved === null) return { kind: 'unresolved', raw }
+      // A deny path can only now land in /dev (e.g. a symlink into it),
+      // where --dev /dev has already replaced the tree and a bind would
+      // either miss or fight the new devtmpfs.
+      if (resolved.startsWith('/dev/')) return { kind: 'skip' }
+      // Defense-in-depth: the resolved path should be symlink-free for its
+      // existing prefix, but the tree may change between resolution and this
+      // check. A hit fails closed — the loop masks the component and bwrap
+      // refuses to start rather than sandboxing with an unprotected deny
+      // path, and the pre-pass records no read-only re-bind for it.
+      const at = findSymlinkInPath(resolved, allowedWritePaths)
+      if (at) return { kind: 'masked-symlink', raw, resolved, at }
+      try {
+        return fs.statSync(resolved).isDirectory()
+          ? { kind: 'directory', raw, resolved }
+          : { kind: 'file', raw, resolved }
+      } catch {
+        // Absent, vanished, or behind a parent this process cannot search:
+        // all three are "not there" to the loop's own existence check too.
+        return { kind: 'absent', raw, resolved }
+      }
+    }
     // PRE-PASS (order-independent): record the directories the loop below
     // re-binds read-only, BEFORE any stub decision, so the read-only
     // conclusion does not depend on where an enclosing directory appears in
-    // the caller's denyWrite ordering. It applies the loop's own resolution,
-    // the same symlink re-check, and the same isWithinAnyAllowedWritePath
-    // gate as the --ro-bind emission, and it records every raw spelling each
-    // directory is reached through. A recorded directory is EVIDENCE for
-    // skipping a stub only if it also passes the guard's vetoes below (no
-    // read-deny tmpfs contains it in any spelling; no allowed write path is
-    // both beneath it and under such a tmpfs), which exclude every way its
-    // subtree could be writable in the sandbox. Keep the two passes in lockstep: a
-    // directory recorded here is either re-bound read-only by the loop or
-    // skipped because a recorded directory above it survived the vetoes and
-    // is bound in its place, so every record still stands for a bind that
-    // lands — unless a symlink appears in its path between the two passes,
-    // where the loop masks that component and emits no bind for the
-    // directory (the re-check below); an emitted one missing from the record
-    // only costs a spurious abort.
+    // the caller's denyWrite ordering. It takes the classification above and
+    // adds the same isWithinAnyAllowedWritePath gate as the --ro-bind
+    // emission, and it records every raw spelling each directory is reached
+    // through. A recorded directory is EVIDENCE for skipping a stub only if
+    // it also passes the guard's vetoes below (no read-deny tmpfs contains
+    // it in any spelling; no allowed write path is both beneath it and under
+    // such a tmpfs), which exclude every way its subtree could be writable
+    // in the sandbox. A directory recorded here is either re-bound read-only
+    // by the loop or skipped because a recorded directory above it survived
+    // the vetoes and is bound in its place, so every record still stands for
+    // a bind that lands — unless a symlink appears in its path between the
+    // two classifications, where the loop masks that component and emits no
+    // bind for the directory; an emitted one missing from the record only
+    // costs a spurious abort.
     for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern)
-      if (rawPath.startsWith('/dev/')) {
-        continue
-      }
-      const resolvedPath = resolveSymlinkedDenyPath(rawPath)
-      if (resolvedPath === null || resolvedPath.startsWith('/dev/')) {
-        continue
-      }
-      // Same defense-in-depth re-check as the loop: there the --ro-bind is
-      // replaced by a symlink mask, so such a directory must not be recorded
-      // as re-bound here.
-      if (findSymlinkInPath(resolvedPath, allowedWritePaths)) {
-        continue
-      }
-      let isDirectory = false
-      try {
-        isDirectory = fs.statSync(resolvedPath).isDirectory()
-      } catch {
-        continue // absent (or vanished): not a read-only re-bound directory
-      }
-      if (!isDirectory) {
-        continue
-      }
-      if (isWithinAnyAllowedWritePath(resolvedPath)) {
-        // Keep every spelling this dest is reached through (the
-        // re-application passes record the first-seen raw spelling beside
-        // the dest, which this pass cannot assume): the guard below treats
-        // the directory as unsafe if a read-deny tmpfs contains ANY of them.
-        let spellings = readOnlyDenyDirSpellings.get(resolvedPath)
-        if (spellings === undefined) {
-          spellings = new Set()
-          readOnlyDenyDirSpellings.set(resolvedPath, spellings)
-        }
-        spellings.add(rawPath)
+      const classified = classifyDenyPath(pathPattern)
+      switch (classified.kind) {
+        case 'skip':
+        case 'unresolved':
+        case 'masked-symlink':
+        case 'absent':
+        case 'file':
+          continue
+        case 'directory':
+          if (isWithinAnyAllowedWritePath(classified.resolved)) {
+            // Keep every spelling this dest is reached through (the
+            // re-application passes record the first-seen raw spelling beside
+            // the dest, which this pass cannot assume): the guard below treats
+            // the directory as unsafe if a read-deny tmpfs contains ANY of them.
+            let spellings = readOnlyDenyDirSpellings.get(classified.resolved)
+            if (spellings === undefined) {
+              spellings = new Set()
+              readOnlyDenyDirSpellings.set(classified.resolved, spellings)
+            }
+            spellings.add(classified.raw)
+          }
+          continue
       }
     }
     // Per-covering-dir veto verdict, computed once per recorded directory
@@ -3049,54 +3093,34 @@ async function generateFilesystemArgs(
       return covered
     }
     for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern)
-
-      // Skip /dev/* paths since --dev /dev already handles them
-      if (rawPath.startsWith('/dev/')) {
-        continue
-      }
-
-      // Resolve-before-mask: normalizePathForSandbox keeps the raw symlink
-      // path whenever resolution crosses isSymlinkOutsideBoundary (the
-      // common dotfiles case), so canonicalize here. Every mask/bind below
-      // must be computed against the resolved path — bwrap dest-resolves
-      // symlinks, so a mask on the raw path either aborts startup (dir
-      // symlink) or lands on the target inode anyway (file symlink). Writes
-      // through the original symlinked path resolve to the same denied
-      // target inside the mount namespace.
-      const normalizedPath = resolveSymlinkedDenyPath(rawPath)
-      if (normalizedPath === null) {
-        // Unresolvable: a symlink cycle, or a chain past the ELOOP bound.
+      const classified = classifyDenyPath(pathPattern)
+      if (classified.kind === 'skip') continue
+      if (classified.kind === 'unresolved') {
         // Fail closed. Dropping the deny here would sandbox the command with
         // the path unprotected, so instead mask the symlink component and let
         // bwrap refuse to start. When no component is a symlink inside an
         // allowed write path there is nothing to protect: the path is already
         // read-only from the initial --ro-bind / /.
         const unresolvableSymlink = findSymlinkInPath(
-          rawPath,
+          classified.raw,
           allowedWritePaths,
         )
         if (unresolvableSymlink && !seenDenyWrite.has(unresolvableSymlink)) {
           seenDenyWrite.add(unresolvableSymlink)
           denyWriteArgs.push('--ro-bind', '/dev/null', unresolvableSymlink)
-          denyWriteRawDests.set(unresolvableSymlink, rawPath)
+          denyWriteRawDests.set(unresolvableSymlink, classified.raw)
         }
         logForDebugging(
-          `[Sandbox Linux] Deny path could not be resolved through symlinks, failing closed: ${rawPath}`,
+          `[Sandbox Linux] Deny path could not be resolved through symlinks, failing closed: ${classified.raw}`,
         )
         continue
       }
+      const rawPath = classified.raw
+      const normalizedPath = classified.resolved
       if (normalizedPath !== rawPath) {
         logForDebugging(
           `[Sandbox Linux] Resolved symlinked deny path: ${rawPath} -> ${normalizedPath}`,
         )
-      }
-
-      // Re-check after resolution: a deny path can only now land in /dev (e.g.
-      // a symlink into it), where --dev /dev has already replaced the tree and
-      // a bind would either miss or fight the new devtmpfs.
-      if (normalizedPath.startsWith('/dev/')) {
-        continue
       }
 
       // Dedup post-resolution: distinct spellings (tilde vs absolute, via
@@ -3104,12 +3128,8 @@ async function generateFilesystemArgs(
       if (seenDenyWrite.has(normalizedPath)) continue
       seenDenyWrite.add(normalizedPath)
 
-      // Defense-in-depth: the resolved path should be symlink-free for its
-      // existing prefix, but the tree may change between resolution and this
-      // check. A hit still fails closed — bwrap refuses to start rather than
-      // sandboxing with an unprotected deny path.
-      const symlinkInPath = findSymlinkInPath(normalizedPath, allowedWritePaths)
-      if (symlinkInPath) {
+      if (classified.kind === 'masked-symlink') {
+        const symlinkInPath = classified.at
         if (!seenDenyWrite.has(symlinkInPath)) {
           seenDenyWrite.add(symlinkInPath)
           denyWriteArgs.push('--ro-bind', '/dev/null', symlinkInPath)
@@ -3156,173 +3176,180 @@ async function generateFilesystemArgs(
       // bwrap creates empty files on the host as mount points for these binds.
       // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
       // remove them after the command exits.
-      if (!fs.existsSync(normalizedPath)) {
-        // Fix 1 (worktree): If any existing component in the deny path is a
-        // file (not a directory), skip the deny entirely. You can't mkdir
-        // under a file, so the deny path can never be created. This handles
-        // git worktrees where .git is a file.
-        if (hasFileAncestor(normalizedPath)) {
-          logForDebugging(
-            `[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`,
-          )
-          continue
-        }
-
-        // Find the deepest existing ancestor directory
-        let ancestorPath = path.dirname(normalizedPath)
-        while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
-          ancestorPath = path.dirname(ancestorPath)
-        }
-
-        // Only protect if the existing ancestor is within an allowed write path.
-        // If not, the path is already read-only from --ro-bind / /.
-        // Same predicate as the pre-pass and the --ro-bind gate (equality on
-        // the absent normalizedPath itself is unreachable — allow entries
-        // exist, the deny path does not).
-        const ancestorIsWithinAllowedPath =
-          isWithinAnyAllowedWritePath(ancestorPath) ||
-          isWithinAnyAllowedWritePath(normalizedPath)
-
-        // An ancestor inside a directory that an earlier deny re-bound
-        // read-only (e.g. an explicit denyWrite on the project dir) is
-        // already read-only in the sandbox: the deny path cannot be created
-        // there, and stubbing it would make bwrap creat() a mount point
-        // inside that read-only mount and abort. The order-independent
-        // pre-pass above has already recorded every directory the loop
-        // re-binds read-only, so a covering directory deny is visible here
-        // regardless of where it appears in denyPaths. A recorded covering
-        // directory is evidence for skipping only if it survives the
-        // coveringDirIsUnsafe vetoes (see the INVARIANT at its definition).
-        // (Tested on the absent path itself: a recorded directory that
-        // covers it is at-or-above its deepest existing ancestor, since
-        // recorded directories exist.)
-        const ancestorIsWithinReadOnlyDeny =
-          coveredBySafeReadOnlyDenyDir(normalizedPath)
-
-        if (ancestorIsWithinAllowedPath && !ancestorIsWithinReadOnlyDeny) {
-          const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
-
-          // Fix 2: If firstNonExistent is an intermediate component (not the
-          // leaf deny path itself), mount a read-only empty directory instead
-          // of /dev/null. This prevents the component from appearing as a file
-          // which breaks tools that expect to traverse it as a directory.
-          const isIntermediate = firstNonExistent !== normalizedPath
-          // Decided from the resolved path, which every spelling of one file
-          // shares, rather than from the deny entry: a caller's own
-          // denyWrite naming the same file must not miss it. /dev/null
-          // stands in the buffer until gitRedirectMountPoint replaces it.
-          const gitRedirectStub = isIntermediate
-            ? undefined
-            : gitRedirectPlaceholder(normalizedPath)
-          const source = isIntermediate
-            ? (emptySource ??= ensureEmptyMountSourceDir())
-            : '/dev/null'
-
-          // One mount point per destination. Deny paths are deduplicated on
-          // the deny path, but a placeholder lands on the first MISSING
-          // component, so two denies sharing one arrive here with a single
-          // destination — denyWrite '<cwd>/.claude' together with the
-          // mandatory '<cwd>/.claude/commands', in a project with no
-          // `.claude/`. Two binds there make bwrap refuse to start when they
-          // disagree about the destination's kind ("Can't mkdir <dest>: Not a
-          // directory"). The directory form wins the disagreement: an empty
-          // read-only directory blocks creating the destination and everything
-          // below it exactly as /dev/null does, and stays traversable for the
-          // deeper deny that asked for a directory.
-          const placeholderAt = placeholderSourceArgIndex.get(firstNonExistent)
-          if (placeholderAt !== undefined) {
-            if (isIntermediate) {
-              denyWriteArgs[placeholderAt] = source
-              // The destination has to be a directory for the deeper deny,
-              // so it is no longer a file git reads back.
-              pendingGitRedirects.delete(firstNonExistent)
-            }
+      switch (classified.kind) {
+        case 'absent': {
+          // Fix 1 (worktree): If any existing component in the deny path is a
+          // file (not a directory), skip the deny entirely. You can't mkdir
+          // under a file, so the deny path can never be created. This handles
+          // git worktrees where .git is a file.
+          if (hasFileAncestor(normalizedPath)) {
             logForDebugging(
-              `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
+              `[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`,
             )
             continue
           }
-          denyWriteArgs.push('--ro-bind', source, firstNonExistent)
-          placeholderSourceArgIndex.set(
-            firstNonExistent,
-            denyWriteArgs.length - 2,
-          )
-          if (gitRedirectStub !== undefined) {
-            pendingGitRedirects.set(firstNonExistent, gitRedirectStub)
+
+          // Find the deepest existing ancestor directory
+          let ancestorPath = path.dirname(normalizedPath)
+          while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
+            ancestorPath = path.dirname(ancestorPath)
           }
-          // First writer wins for a destination several denies share (the
-          // reuse branch above returns before reaching this), and the record
-          // is purely additive: it only gives the tmpfs and mask comparisons
-          // below a second spelling to test, and `dest` itself is always
-          // tested.
-          denyWriteRawDests.set(firstNonExistent, rawPath)
-          bwrapMountPoints.set(firstNonExistent, undefined)
-          registerExitCleanupHandler()
-          logForDebugging(
-            `[Sandbox Linux] Mounted ${
-              isIntermediate
-                ? 'empty dir'
-                : gitRedirectStub === undefined
-                  ? '/dev/null'
-                  : 'a git redirect placeholder'
-            } at ${firstNonExistent} to block creation of ${normalizedPath}`,
-          )
-        } else if (ancestorIsWithinReadOnlyDeny) {
-          logForDebugging(
-            `[Sandbox Linux] Skipping non-existent deny path inside a read-only denied directory (already uncreatable): ${normalizedPath}`,
-          )
-        } else {
-          logForDebugging(
-            `[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`,
-          )
-        }
-        continue
-      }
 
-      // Only add deny binding if this path is within an allowed write path
-      // Otherwise it's already read-only from the initial --ro-bind / /
-      const isWithinAllowedPath = isWithinAnyAllowedWritePath(normalizedPath)
+          // Only protect if the existing ancestor is within an allowed write path.
+          // If not, the path is already read-only from --ro-bind / /.
+          // Same predicate as the pre-pass and the --ro-bind gate (equality on
+          // the absent normalizedPath itself is unreachable — allow entries
+          // exist, the deny path does not).
+          const ancestorIsWithinAllowedPath =
+            isWithinAnyAllowedWritePath(ancestorPath) ||
+            isWithinAnyAllowedWritePath(normalizedPath)
 
-      if (isWithinAllowedPath) {
-        // Already unwritable under a read-only denied directory (the
-        // existing-path twin of the stub skip above). Veto (ii) keeps the
-        // covering bind through the emission filter; a symlinked spelling
-        // keeps its own bind because the re-application passes below key
-        // off emitted raw spellings.
-        if (
-          rawPath === normalizedPath &&
-          coveredBySafeReadOnlyDenyDir(normalizedPath)
-        ) {
-          logForDebugging(
-            `[Sandbox Linux] Skipping deny path already under read-only denied directory: ${normalizedPath}`,
-          )
+          // An ancestor inside a directory that an earlier deny re-bound
+          // read-only (e.g. an explicit denyWrite on the project dir) is
+          // already read-only in the sandbox: the deny path cannot be created
+          // there, and stubbing it would make bwrap creat() a mount point
+          // inside that read-only mount and abort. The order-independent
+          // pre-pass above has already recorded every directory the loop
+          // re-binds read-only, so a covering directory deny is visible here
+          // regardless of where it appears in denyPaths. A recorded covering
+          // directory is evidence for skipping only if it survives the
+          // coveringDirIsUnsafe vetoes (see the INVARIANT at its definition).
+          // (Tested on the absent path itself: a recorded directory that
+          // covers it is at-or-above its deepest existing ancestor, since
+          // recorded directories exist.)
+          const ancestorIsWithinReadOnlyDeny =
+            coveredBySafeReadOnlyDenyDir(normalizedPath)
+
+          if (ancestorIsWithinAllowedPath && !ancestorIsWithinReadOnlyDeny) {
+            const firstNonExistent =
+              findFirstNonExistentComponent(normalizedPath)
+
+            // Fix 2: If firstNonExistent is an intermediate component (not the
+            // leaf deny path itself), mount a read-only empty directory instead
+            // of /dev/null. This prevents the component from appearing as a file
+            // which breaks tools that expect to traverse it as a directory.
+            const isIntermediate = firstNonExistent !== normalizedPath
+            // Decided from the resolved path, which every spelling of one file
+            // shares, rather than from the deny entry: a caller's own
+            // denyWrite naming the same file must not miss it. /dev/null
+            // stands in the buffer until gitRedirectMountPoint replaces it.
+            const gitRedirectStub = isIntermediate
+              ? undefined
+              : gitRedirectPlaceholder(normalizedPath)
+            const source = isIntermediate
+              ? (emptySource ??= ensureEmptyMountSourceDir())
+              : '/dev/null'
+
+            // One mount point per destination. Deny paths are deduplicated on
+            // the deny path, but a placeholder lands on the first MISSING
+            // component, so two denies sharing one arrive here with a single
+            // destination — denyWrite '<cwd>/.claude' together with the
+            // mandatory '<cwd>/.claude/commands', in a project with no
+            // `.claude/`. Two binds there make bwrap refuse to start when they
+            // disagree about the destination's kind ("Can't mkdir <dest>: Not a
+            // directory"). The directory form wins the disagreement: an empty
+            // read-only directory blocks creating the destination and everything
+            // below it exactly as /dev/null does, and stays traversable for the
+            // deeper deny that asked for a directory.
+            const placeholderAt =
+              placeholderSourceArgIndex.get(firstNonExistent)
+            if (placeholderAt !== undefined) {
+              if (isIntermediate) {
+                denyWriteArgs[placeholderAt] = source
+                // The destination has to be a directory for the deeper deny,
+                // so it is no longer a file git reads back.
+                pendingGitRedirects.delete(firstNonExistent)
+              }
+              logForDebugging(
+                `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
+              )
+              continue
+            }
+            denyWriteArgs.push('--ro-bind', source, firstNonExistent)
+            placeholderSourceArgIndex.set(
+              firstNonExistent,
+              denyWriteArgs.length - 2,
+            )
+            if (gitRedirectStub !== undefined) {
+              pendingGitRedirects.set(firstNonExistent, gitRedirectStub)
+            }
+            // First writer wins for a destination several denies share (the
+            // reuse branch above returns before reaching this), and the record
+            // is purely additive: it only gives the tmpfs and mask comparisons
+            // below a second spelling to test, and `dest` itself is always
+            // tested.
+            denyWriteRawDests.set(firstNonExistent, rawPath)
+            bwrapMountPoints.set(firstNonExistent, undefined)
+            registerExitCleanupHandler()
+            logForDebugging(
+              `[Sandbox Linux] Mounted ${
+                isIntermediate
+                  ? 'empty dir'
+                  : gitRedirectStub === undefined
+                    ? '/dev/null'
+                    : 'a git redirect placeholder'
+              } at ${firstNonExistent} to block creation of ${normalizedPath}`,
+            )
+          } else if (ancestorIsWithinReadOnlyDeny) {
+            logForDebugging(
+              `[Sandbox Linux] Skipping non-existent deny path inside a read-only denied directory (already uncreatable): ${normalizedPath}`,
+            )
+          } else {
+            logForDebugging(
+              `[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`,
+            )
+          }
           continue
         }
-        // A deny's read-only bind is emitted after every allow bind, so an
-        // allowed write path beneath it comes back read-only instead of
-        // stopping the sandbox from starting. Say so: the config asked for
-        // both and only the deny takes effect.
-        for (const buried of allowedWritePaths) {
-          if (isStrictlyUnder(buried, normalizedPath)) {
+        case 'directory':
+        case 'file': {
+          // Only add deny binding if this path is within an allowed write path
+          // Otherwise it's already read-only from the initial --ro-bind / /
+          const isWithinAllowedPath =
+            isWithinAnyAllowedWritePath(normalizedPath)
+
+          if (isWithinAllowedPath) {
+            // Already unwritable under a read-only denied directory (the
+            // existing-path twin of the stub skip above). Veto (ii) keeps the
+            // covering bind through the emission filter; a symlinked spelling
+            // keeps its own bind because the re-application passes below key
+            // off emitted raw spellings.
+            if (
+              rawPath === normalizedPath &&
+              coveredBySafeReadOnlyDenyDir(normalizedPath)
+            ) {
+              logForDebugging(
+                `[Sandbox Linux] Skipping deny path already under read-only denied directory: ${normalizedPath}`,
+              )
+              continue
+            }
+            // A deny's read-only bind is emitted after every allow bind, so an
+            // allowed write path beneath it comes back read-only instead of
+            // stopping the sandbox from starting. Say so: the config asked for
+            // both and only the deny takes effect.
+            for (const buried of allowedWritePaths) {
+              if (isStrictlyUnder(buried, normalizedPath)) {
+                logForDebugging(
+                  `[Sandbox Linux] Write deny ${normalizedPath} covers allowed write path ${buried}; ${buried} will be read-only`,
+                  { level: 'warn' },
+                )
+              }
+            }
+            // A file git reads back is not necessarily bound from itself: an
+            // empty one left by a killed wrap is a redirect git refuses. Which
+            // it is is settled at emission (gitRedirectMountPoint).
+            const gitRedirectStub = gitRedirectPlaceholder(normalizedPath)
+            if (gitRedirectStub !== undefined) {
+              pendingGitRedirects.set(normalizedPath, gitRedirectStub)
+            }
+            denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
+            denyWriteRawDests.set(normalizedPath, rawPath)
+          } else {
             logForDebugging(
-              `[Sandbox Linux] Write deny ${normalizedPath} covers allowed write path ${buried}; ${buried} will be read-only`,
-              { level: 'warn' },
+              `[Sandbox Linux] Skipping deny path not within allowed paths: ${normalizedPath}`,
             )
           }
         }
-        // A file git reads back is not necessarily bound from itself: an
-        // empty one left by a killed wrap is a redirect git refuses. Which
-        // it is is settled at emission (gitRedirectMountPoint).
-        const gitRedirectStub = gitRedirectPlaceholder(normalizedPath)
-        if (gitRedirectStub !== undefined) {
-          pendingGitRedirects.set(normalizedPath, gitRedirectStub)
-        }
-        denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
-        denyWriteRawDests.set(normalizedPath, rawPath)
-      } else {
-        logForDebugging(
-          `[Sandbox Linux] Skipping deny path not within allowed paths: ${normalizedPath}`,
-        )
       }
     }
   } else {
