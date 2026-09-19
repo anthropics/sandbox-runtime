@@ -3696,6 +3696,24 @@ describe.if(isSupportedPlatform)(
       })
 
       it.if(!isWindows)(
+        'keeps a repository denied whole for its own symlinked entry out of the plan',
+        () => {
+          // The git directory is denied whole because its `hooks` is a link.
+          // That is not a submodule deny, and it is no reason to give a
+          // repository with no submodules a `.git/modules` to degrade.
+          const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+          const shared = join(dir, 'repo', 'shared-hooks')
+          mkdirSync(shared, { recursive: true })
+          rmSync(join(gitDir, 'hooks'), { recursive: true })
+          symlinkSync(shared, join(gitDir, 'hooks'))
+          const denies = gitDirTreeDenies(gitDir, false)
+
+          expect(denies.linkedEntryDirs).toEqual([gitDir])
+          expect(repositorySubmodules(denies)).toBeUndefined()
+        },
+      )
+
+      it.if(!isWindows)(
         'keeps the deny of an entry whose real path is outside a modules directory denied whole',
         () => {
           // A read-only bind of `modules` covers what is really under it. An

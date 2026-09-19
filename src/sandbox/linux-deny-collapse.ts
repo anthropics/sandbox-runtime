@@ -15,9 +15,11 @@ export interface RepositorySubmodules {
   /** Sorted by path, which is the order a collapse works back through. */
   gitDirs: Array<{ gitDir: string } & GitDirDenies>
   /**
-   * The whole-directory denies of this repository: what the walk could not
+   * The whole-directory denies UNDER `modulesDir`: what the walk could not
    * see through, and the directories holding an entry it followed through a
-   * symlink. A bind of `modules` covers the ones really under it.
+   * symlink. A bind of `modules` covers the ones really under it. The git
+   * directory's own whole-deny is not one of these: it holds `modules`
+   * rather than sitting under it, and it is no reason to degrade anything.
    */
   wholeDirDenies: string[]
 }
@@ -58,7 +60,15 @@ export const NO_COLLAPSE: CollapseLevel = {
 export function repositorySubmodules(
   denies: GitDirTreeDenies,
 ): RepositorySubmodules | undefined {
-  const wholeDirDenies = [...denies.unreadableDirs, ...denies.linkedEntryDirs]
+  // Under `modules` only: a git directory denied whole because one of its OWN
+  // entries is a symlink is not a submodule deny, and a repository with
+  // nothing under `modules` must stay out of the plan altogether — an absent
+  // `.git/modules` is never denied, since a mount point planted at one stops
+  // `git submodule add` working in that repository.
+  const wholeDirDenies = [
+    ...denies.unreadableDirs,
+    ...denies.linkedEntryDirs,
+  ].filter(denyPath => isAtOrUnder(denyPath, denies.modulesDir))
   if (denies.submodules.length === 0 && wholeDirDenies.length === 0) {
     return undefined
   }
