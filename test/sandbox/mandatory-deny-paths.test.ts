@@ -45,6 +45,7 @@ import {
 import {
   GitMetadataError,
   SubmoduleWalkBudgetError,
+  gitDirDenies,
   gitDirDenyPaths,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
@@ -2288,6 +2289,41 @@ describe('macGetMandatoryDenyEntries - Unit Tests', () => {
     expect(hasHooksPatternTrue).toBe(true)
   })
 
+  it.if(!isWindows)(
+    'carries a symlinked entry as the link, the target and the git directory',
+    () => {
+      // A Seatbelt filter matches where the write lands, so the entry's own
+      // path covers the link and the target needs an entry of its own; the
+      // git directory whole is what keeps the link from being replaced,
+      // which on macOS the unlink re-deny of a literal entry does as well.
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mac-git-deny-')))
+      const saved = process.cwd()
+      try {
+        const gitDir = join(dir, '.git')
+        mkdirSync(gitDir, { recursive: true })
+        writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+        const shared = join(dir, 'shared-hooks')
+        mkdirSync(shared, { recursive: true })
+        symlinkSync(shared, join(gitDir, 'hooks'))
+        process.chdir(dir)
+
+        const paths = macGetMandatoryDenyEntries(false)
+          .filter(entry => !entry.glob)
+          .map(entry => entry.path)
+
+        expect(paths).toContain(join(gitDir, 'hooks'))
+        expect(paths).toContain(shared)
+        // Not the git directory whole: a Seatbelt filter matches the link's
+        // own path for a rename or an unlink, so the entry covers it, and
+        // git writes in the repository go on working.
+        expect(paths).not.toContain(gitDir)
+      } finally {
+        process.chdir(saved)
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
   it('defaults to blocking .git/config when no argument provided', () => {
     const patterns = macGetMandatoryDenyEntries().map(e => e.path)
 
@@ -2341,6 +2377,166 @@ describe('Git metadata deny paths - Unit Tests', () => {
       '/repo/.git/commondir',
     ])
   })
+
+  it.if(!isWindows)(
+    'denies a git directory whole where an entry is a symlink, and what the link leads to',
+    () => {
+      // The deny of the entry lands where the link points - the Linux bind
+      // resolves the path, a Seatbelt filter matches where the write goes -
+      // so the link's own path carries nothing, and it sits in a directory
+      // the sandbox can write. The git directory whole is the handle on it.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      const shared = join(dir, 'repo', 'shared-hooks')
+      mkdirSync(shared, { recursive: true })
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync(shared, join(gitDir, 'hooks'))
+
+      const denies = gitDirDenies(gitDir, false)
+
+      expect(denies.denyPaths).toEqual([
+        join(gitDir, 'hooks'),
+        shared,
+        join(gitDir, 'commondir'),
+        join(gitDir, 'config'),
+        join(gitDir, 'config.worktree'),
+      ])
+      // What a read-only bind of the git directory would not cover, and so
+      // what a degrade of it has to keep.
+      expect(denies.escapingDenyPaths).toEqual([shared])
+      // What holds the link, for the backend whose denies resolve.
+      expect(denies.linkedEntryDirs).toEqual([gitDir])
+    },
+  )
+
+  it.if(!isWindows)(
+    'leaves an ordinary git directory exactly as it was',
+    () => {
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      writeFileSync(join(gitDir, 'config'), '[core]\n')
+
+      expect(gitDirDenies(gitDir, false)).toEqual({
+        denyPaths: gitDirDenyPaths(gitDir, false),
+        escapingDenyPaths: [],
+        linkedEntryDirs: [],
+      })
+    },
+  )
+
+  it.if(!isWindows)(
+    'keeps a link inside the git directory out of the escaping set',
+    () => {
+      // hooks -> hooks.real, both under the git directory: the bind that
+      // denies the directory whole covers the target as well, so a degrade
+      // has nothing to keep.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      mkdirSync(join(gitDir, 'hooks.real'), { recursive: true })
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync(join(gitDir, 'hooks.real'), join(gitDir, 'hooks'))
+
+      const denies = gitDirDenies(gitDir, false)
+
+      expect(denies.linkedEntryDirs).toEqual([gitDir])
+      expect(denies.escapingDenyPaths).toEqual([])
+    },
+  )
+
+  it.if(!isWindows)(
+    'denies where a DANGLING entry lands, so the target cannot be created',
+    () => {
+      // The link is there and its target is not: a command can create the
+      // target and the host's git runs what it finds there. Denying the
+      // landing is what blocks creating it.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      const landing = join(dir, 'repo', 'not-there-yet')
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync(landing, join(gitDir, 'hooks'))
+
+      const denies = gitDirDenies(gitDir, false)
+
+      expect(denies.denyPaths).toContain(landing)
+      expect(denies.linkedEntryDirs).toEqual([gitDir])
+      expect(denies.escapingDenyPaths).toEqual([landing])
+    },
+  )
+
+  it.if(!isWindows)(
+    'follows a chain of dangling links to where a write through it would land',
+    () => {
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      const landing = join(dir, 'repo', 'end')
+      symlinkSync(landing, join(dir, 'repo', 'middle'))
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync(join(dir, 'repo', 'middle'), join(gitDir, 'hooks'))
+
+      expect(gitDirDenies(gitDir, false).denyPaths).toContain(landing)
+    },
+  )
+
+  it.if(!isWindows)(
+    'denies the git directory whole for an entry that is a symlink loop, and nothing behind it',
+    () => {
+      // A loop reaches nothing: there is nothing to deny at the other end,
+      // and nothing a command can create through it. Replacing the link is
+      // what the whole-directory deny is for.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync(join(gitDir, 'hooks'), join(gitDir, 'hooks'))
+
+      const denies = gitDirDenies(gitDir, false)
+
+      expect(denies.denyPaths).toEqual([
+        join(gitDir, 'commondir'),
+        join(gitDir, 'config'),
+        join(gitDir, 'config.worktree'),
+      ])
+      expect(denies.linkedEntryDirs).toEqual([gitDir])
+      expect(denies.escapingDenyPaths).toEqual([])
+    },
+  )
+
+  it.if(!isWindows && process.getuid?.() !== 0)(
+    'takes an entry it cannot look at for one that needs both denies',
+    () => {
+      // lstat refused: whether it is a link is unknown, so the entry keeps
+      // the deny it has (and keeps it through a degrade, in case it is one)
+      // and the git directory is denied whole as a link would need.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      chmodSync(gitDir, 0o000)
+      try {
+        const denies = gitDirDenies(gitDir, false)
+
+        expect(denies.denyPaths).toEqual(gitDirDenyPaths(gitDir, false))
+        expect(denies.linkedEntryDirs).toEqual([gitDir])
+        expect(denies.escapingDenyPaths).toEqual(gitDirDenyPaths(gitDir, false))
+      } finally {
+        chmodSync(gitDir, 0o755)
+      }
+    },
+  )
+
+  it.if(!isWindows)(
+    'denies the directory holding a symlinked modules entry, and where a dangling one lands',
+    () => {
+      // The walk follows the link and denies the git directory it reaches;
+      // the link itself stays replaceable in a writable `modules`, and a
+      // pointer that names it would then find whatever was put in its place.
+      const gitDir = makeGitDir(join(dir, 'repo', '.git'))
+      const modules = join(gitDir, 'modules')
+      const outside = makeGitDir(join(dir, 'elsewhere'))
+      mkdirSync(modules, { recursive: true })
+      symlinkSync(outside, join(modules, 'lib'))
+      const landing = join(dir, 'repo', 'not-there-yet')
+      symlinkSync(landing, join(modules, 'gone'))
+
+      const scan = submoduleGitDirs(modules)
+
+      expect(scan.linkedEntryDirs).toEqual([modules])
+      expect(scan.gitDirs).toEqual([join(modules, 'lib'), landing].sort())
+      const tree = gitDirTreeDenies(gitDir, false)
+      expect(tree.linkedEntryDirs).toEqual([modules])
+      expect(gitDirTreeDenyPaths(tree)).toContain(join(landing, 'hooks'))
+    },
+  )
 
   it('gives the files git reads a placeholder that is no redirect', () => {
     // `.` is the git directory itself, which is where git looks when there
@@ -2847,6 +3043,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
       gitDirs: [gitDir],
       unreadableDirs: [],
+      linkedEntryDirs: [],
     })
   })
 
@@ -2933,6 +3130,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
     expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
       gitDirs: [gitDir],
       unreadableDirs: [],
+      linkedEntryDirs: [join(dir, 'modules', 'a')],
     })
   })
 
@@ -2950,6 +3148,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
         gitDirs: [gitDir],
         unreadableDirs: [],
+        linkedEntryDirs: [],
       })
     },
   )
@@ -2966,20 +3165,24 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
         gitDirs: [gitDir],
         unreadableDirs: [],
+        linkedEntryDirs: [],
       })
     },
     30000,
   )
 
   it.if(!isWindows && process.getuid?.() !== 0)(
-    'denies where a symlinked entry leads, not the directory holding it, and once',
+    'denies where a symlinked entry leads, and the directory holding the link',
     () => {
-      // Two links into a directory this process cannot search. What is behind
-      // them is unknown, so the deny is the deepest directory that can be
+      // Two links into a directory this process cannot search. What is BEHIND
+      // them is unknown, so that deny is the deepest directory that can be
       // reached towards them - the locked directory itself - and not the
       // `modules` that holds the links, which would take every submodule
-      // beside them. One entry, not three: the same path is reached by the
-      // listing of `locked` and by each of the two links.
+      // beside them over one unreadable target. One entry, not three: the
+      // same path is reached by the listing of `locked` and by each of the
+      // two links. The links THEMSELVES are another matter: neither deny
+      // lands on a link's own path, and `modules` is writable, so the
+      // directory holding them is denied for their sake.
       const locked = join(dir, 'modules', 'locked')
       const sibling = makeGitDir(join(dir, 'modules', 'lib'))
       mkdirSync(locked, { recursive: true })
@@ -2990,6 +3193,7 @@ describe('Git metadata deny paths - Unit Tests', () => {
         expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
           gitDirs: [sibling],
           unreadableDirs: [locked],
+          linkedEntryDirs: [join(dir, 'modules')],
         })
       } finally {
         chmodSync(locked, 0o755)
@@ -3309,9 +3513,11 @@ describe.if(isSupportedPlatform)(
         modulesDir: string,
         gitDirNames: string[],
         extra: string[] = [],
+        escaping: (gitDir: string) => string[] = () => [],
       ): SubmoduleDenyPlan {
         const gitDirs = gitDirNames.map(name => {
           const gitDir = join(modulesDir, name)
+          const escapingDenyPaths = escaping(gitDir)
           return {
             gitDir,
             denyPaths: [
@@ -3319,12 +3525,14 @@ describe.if(isSupportedPlatform)(
               join(gitDir, 'commondir'),
               join(gitDir, 'config'),
               join(gitDir, 'config.worktree'),
+              ...escapingDenyPaths,
             ],
+            escapingDenyPaths,
           }
         })
         return {
           denyPaths: [...extra, ...gitDirs.flatMap(sub => sub.denyPaths)],
-          repositories: [{ modulesDir, gitDirs, unreadableDirs: [] }],
+          repositories: [{ modulesDir, gitDirs, wholeDirDenies: [] }],
         }
       }
 
@@ -3355,6 +3563,100 @@ describe.if(isSupportedPlatform)(
         expect(denies).toContain(join(modules, 'b'))
         expect(denies).not.toContain(join(modules, 'b', 'hooks'))
         expect(denies).not.toContain(join(modules, 'b', 'config'))
+      })
+
+      it('keeps what a symlinked entry leads to when the git directory goes whole', () => {
+        // The one read-only bind that replaces a submodule's precise denies
+        // covers what is under the git directory. A symlinked entry leads
+        // out of it, and dropping that deny leaves one write through the
+        // link landing on hooks the host's git runs.
+        const modules = join(dir, '.git', 'modules')
+        const planted = join(dir, 'planted')
+        const plan = planFor(modules, ['a', 'b'], [], gitDir =>
+          gitDir === join(modules, 'b') ? [planted] : [],
+        )
+
+        const denies = collapsedDenyPaths(plan, {
+          wholeGitDirs: 1,
+          wholeModulesDirs: 0,
+        })
+
+        expect(denies).toContain(join(modules, 'b'))
+        expect(denies).toContain(planted)
+        expect(denies).not.toContain(join(modules, 'b', 'hooks'))
+      })
+
+      it('keeps it under a modules directory denied whole as well', () => {
+        const modules = join(dir, '.git', 'modules')
+        const planted = join(dir, 'planted')
+        const plan = planFor(modules, ['a', 'b'], [], gitDir =>
+          gitDir === join(modules, 'b') ? [planted] : [],
+        )
+
+        const denies = collapsedDenyPaths(plan, {
+          wholeGitDirs: 2,
+          wholeModulesDirs: 1,
+        })
+
+        expect(denies).toContain(modules)
+        expect(denies).toContain(planted)
+        expect(denies).not.toContain(join(modules, 'b', 'hooks'))
+        expect(denies).not.toContain(join(modules, 'a', 'hooks'))
+      })
+
+      it('counts a kept deny as a mount the step does not give back', () => {
+        // Three denies each, of which one leads out of the git directory and
+        // is kept: a step gives back two mounts, not three, so one that has
+        // to find three takes both git directories.
+        const modules = join(dir, '.git', 'modules')
+        const gitDirs = ['a', 'b'].map(name => {
+          const gitDir = join(modules, name)
+          const planted = join(dir, 'planted', name)
+          return {
+            gitDir,
+            denyPaths: [join(gitDir, 'hooks'), planted, join(gitDir, 'config')],
+            escapingDenyPaths: [planted],
+          }
+        })
+        const plan: SubmoduleDenyPlan = {
+          denyPaths: gitDirs.flatMap(submodule => submodule.denyPaths),
+          repositories: [{ modulesDir: modules, gitDirs, wholeDirDenies: [] }],
+        }
+
+        expect(collapseFurther(plan, NO_COLLAPSE, 2)).toEqual({
+          wholeGitDirs: 1,
+          wholeModulesDirs: 0,
+        })
+        expect(collapseFurther(plan, NO_COLLAPSE, 3)).toEqual({
+          wholeGitDirs: 2,
+          wholeModulesDirs: 0,
+        })
+      })
+
+      it('adds the bind of a git directory that is a deny path already once', () => {
+        // A git directory holding a symlinked entry is denied whole by the
+        // producer, so it is in the list before any degrade reaches it.
+        const modules = join(dir, '.git', 'modules')
+        const gitDir = join(modules, 'b')
+        const plan = planFor(modules, ['a', 'b'])
+        const withWhole: SubmoduleDenyPlan = {
+          denyPaths: [gitDir, ...plan.denyPaths],
+          repositories: plan.repositories.map(repository => ({
+            ...repository,
+            gitDirs: repository.gitDirs.map(submodule =>
+              submodule.gitDir === gitDir
+                ? { ...submodule, denyPaths: [gitDir, ...submodule.denyPaths] }
+                : submodule,
+            ),
+          })),
+        }
+
+        const denies = collapsedDenyPaths(withWhole, {
+          wholeGitDirs: 1,
+          wholeModulesDirs: 0,
+        })
+
+        expect(denies.filter(deny => deny === gitDir)).toEqual([gitDir])
       })
 
       it('runs out, which is what too_many_arguments is left for', () => {
@@ -3726,6 +4028,133 @@ describe.if(isSupportedPlatform)(
         expect(result.stdout).toContain('DONE')
         expect(result.stdout).not.toContain('LINKED_HOOK_WRITABLE')
         expect(result.stdout).not.toContain('MODULES_WRITABLE')
+      },
+      300000,
+    )
+
+    it.if(LIVE)(
+      'holds both halves of a symlinked entry in a collapsed submodule',
+      async () => {
+        // Seven hundred submodule git directories, so the tail is collapsed
+        // to one read-only bind each. Two of the collapsed ones have a hooks
+        // that is a symlink: one to a directory inside the write root, one
+        // to a path that is not there yet. The bind covers the link and not
+        // what it leads to, and both halves have to hold.
+        const { checkout } = makeSuperproject(700)
+        const gitDir = join(checkout, '.git')
+        const planted = join(checkout, 'planted')
+        const landing = join(checkout, 'not-there-yet')
+        mkdirSync(planted, { recursive: true })
+        // Names sorting last, so the collapse takes these first.
+        const live = makeGitDir(join(gitDir, 'modules', 'zz-live'))
+        const dangling = makeGitDir(join(gitDir, 'modules', 'zz-dangling'))
+        for (const [sub, target] of [
+          [live, planted],
+          [dangling, landing],
+        ] as const) {
+          rmSync(join(sub, 'hooks'), { recursive: true })
+          symlinkSync(target, join(sub, 'hooks'))
+        }
+        process.chdir(checkout)
+
+        const command = await wrapCommandWithSandboxLinux({
+          command:
+            'echo BOOTED; ' +
+            `! echo x > ${join(planted, 'post-commit')} || echo THROUGH_LINK_WRITABLE; ` +
+            `! mkdir -p ${landing} || echo LANDING_CREATABLE; ` +
+            `! echo x > ${join(landing, 'post-commit')} || echo LANDING_WRITABLE; ` +
+            `! rm -f ${join(live, 'hooks')} || echo LINK_UNLINKABLE; ` +
+            `! mv ${join(live, 'hooks')} ${join(live, 'hooks.moved')} || echo LINK_RENAMABLE; ` +
+            `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+            'echo DONE',
+          needsNetworkRestriction: false,
+          allowAllUnixSockets: true,
+          readConfig: undefined,
+          writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+        })
+        const result = spawnSync(command, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 120000,
+          cwd: checkout,
+        })
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(result.stdout).toContain('DONE')
+        expect(result.stdout).not.toContain('THROUGH_LINK_WRITABLE')
+        expect(result.stdout).not.toContain('LANDING_CREATABLE')
+        expect(result.stdout).not.toContain('LANDING_WRITABLE')
+        expect(result.stdout).not.toContain('LINK_UNLINKABLE')
+        expect(result.stdout).not.toContain('LINK_RENAMABLE')
+        expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+        expect(existsSync(join(planted, 'post-commit'))).toBe(false)
+        // The landing itself is the wrap's own mount point, which is what
+        // blocks creating it; nothing of the command's is inside it.
+        expect(existsSync(join(landing, 'post-commit'))).toBe(false)
+      },
+      300000,
+    )
+
+    it.if(LIVE)(
+      'holds a symlinked hooks and a symlinked modules entry where nothing is degraded',
+      async () => {
+        // One small repository: every deny is precise. The links are what
+        // the precise denies cannot land on, so the git directory holding
+        // one, and the `modules` holding the other, are denied whole - and
+        // the repository still reads.
+        const git = Bun.which('git') as string
+        const checkout = join(dir, 'repo')
+        mkdirSync(checkout, { recursive: true })
+        const run = (...args: string[]): void => {
+          const r = spawnSync(git, args, { encoding: 'utf8', timeout: 60000 })
+          expect(r.status).toBe(0)
+        }
+        run('-c', 'init.defaultBranch=main', 'init', '-q', checkout)
+        const gitDir = join(checkout, '.git')
+        writeFileSync(join(checkout, 'f.txt'), 'one\n')
+        const shared = join(checkout, 'shared-hooks')
+        mkdirSync(shared, { recursive: true })
+        rmSync(join(gitDir, 'hooks'), { recursive: true })
+        symlinkSync(shared, join(gitDir, 'hooks'))
+        const outside = makeGitDir(join(dir, 'elsewhere'))
+        const entry = join(gitDir, 'modules', 'lib')
+        mkdirSync(join(gitDir, 'modules'), { recursive: true })
+        symlinkSync(outside, entry)
+        process.chdir(checkout)
+
+        const command = await wrapCommandWithSandboxLinux({
+          command:
+            'echo BOOTED; ' +
+            `! echo x > ${join(shared, 'post-commit')} || echo THROUGH_LINK_WRITABLE; ` +
+            `! rm -f ${join(gitDir, 'hooks')} || echo HOOKS_LINK_UNLINKABLE; ` +
+            `! mv ${join(gitDir, 'hooks')} ${join(gitDir, 'hooks.moved')} || echo HOOKS_LINK_RENAMABLE; ` +
+            `! rm -f ${entry} || echo MODULES_LINK_UNLINKABLE; ` +
+            `! echo x > ${join(outside, 'hooks', 'post-commit')} || echo LINKED_GIT_DIR_WRITABLE; ` +
+            `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+            `${git} -C ${checkout} status --porcelain > /dev/null || echo GIT_STATUS_FAILED; ` +
+            'echo DONE',
+          needsNetworkRestriction: false,
+          allowAllUnixSockets: true,
+          readConfig: undefined,
+          writeConfig: { allowOnly: [checkout, outside], denyWithinAllow: [] },
+        })
+        const result = spawnSync(command, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 120000,
+          cwd: checkout,
+        })
+
+        expect(result.stdout).toContain('BOOTED')
+        expect(result.stdout).toContain('DONE')
+        expect(result.stdout).not.toContain('THROUGH_LINK_WRITABLE')
+        expect(result.stdout).not.toContain('HOOKS_LINK_UNLINKABLE')
+        expect(result.stdout).not.toContain('HOOKS_LINK_RENAMABLE')
+        expect(result.stdout).not.toContain('MODULES_LINK_UNLINKABLE')
+        expect(result.stdout).not.toContain('LINKED_GIT_DIR_WRITABLE')
+        expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+        expect(result.stdout).not.toContain('GIT_STATUS_FAILED')
+        expect(readFileSync(join(checkout, 'f.txt'), 'utf8')).toBe('ok\n')
       },
       300000,
     )
