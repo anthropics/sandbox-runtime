@@ -135,8 +135,8 @@ function substitute(
   for (;;) {
     // Earliest match across all pairs (typically 1–3 sentinels per host).
     // Matching is earliest-position-then-registration-order, not
-    // longest-match — sound because no sentinel is a substring of another
-    // (registerWithSentinel's caller contract).
+    // longest-match — sound because no sentinel is a substring of another,
+    // which registerWithSentinel refuses to register.
     let matchIdx = -1
     let matchPair: SentinelBufferPair | undefined
     for (const p of pairs) {

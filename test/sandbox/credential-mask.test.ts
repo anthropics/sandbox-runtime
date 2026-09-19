@@ -125,6 +125,35 @@ describe('SentinelRegistry', () => {
     expect(reg.size).toBe(2)
   })
 
+  test('a caller-minted sentinel that nests with a registered one is refused', () => {
+    // Body substitution matches earliest-position-then-registration-order, so
+    // a nested pair would replace the wrong span, chunk-boundary-dependent.
+    const reg = new SentinelRegistry()
+    const outer = 'fake.jwt.abcdef0123456789'
+    reg.registerWithSentinel('A', outer, 'real-a', ['h.example.com'])
+    expect(() =>
+      reg.registerWithSentinel('B', outer.slice(5), 'real-b', [
+        'h.example.com',
+      ]),
+    ).toThrow(/nests with the one already registered for "A"/)
+    expect(() =>
+      reg.registerWithSentinel('C', `x${outer}x`, 'real-c', ['h.example.com']),
+    ).toThrow(/nests with the one already registered for "A"/)
+    // The refused registrations left nothing behind.
+    expect(reg.size).toBe(1)
+    expect(reg.lookupReal(outer)).toBe('real-a')
+  })
+
+  test('a caller-minted sentinel that nests with nothing registers', () => {
+    const reg = new SentinelRegistry()
+    reg.registerWithSentinel('A', 'fake.jwt.aaa', 'real-a', ['h.example.com'])
+    const b = reg.registerWithSentinel('B', 'fake.jwt.bbb', 'real-b', [
+      'h.example.com',
+    ])
+    expect(reg.lookupReal(b)).toBe('real-b')
+    expect(reg.size).toBe(2)
+  })
+
   test('clear drops every mapping', () => {
     const reg = new SentinelRegistry()
     const s = reg.register('T', 'x', [])

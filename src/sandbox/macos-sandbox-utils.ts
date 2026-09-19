@@ -1,5 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
+import * as fs from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -17,7 +18,14 @@ import {
   isStrictlyUnder as isPathStrictlyUnder,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  isAbsenceErrno,
 } from './sandbox-utils.js'
+import {
+  gitDirDenyPaths,
+  gitDirTreeDenies,
+  gitDirTreeDenyPaths,
+  gitFileDenyPaths,
+} from './mandatory-deny-paths.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 import type {
@@ -83,15 +91,19 @@ export interface MacOSSandboxParams {
 }
 
 /**
- * The mandatory write denies (no filesystem scanning). Each name appears
- * twice: once as the path in the cwd, and once as a pattern for the same
- * name anywhere beneath it, which macOS matches via a regex.
+ * The mandatory write denies. Each dangerous name appears twice: once as the
+ * path in the cwd, and once as a pattern for the same name anywhere beneath
+ * it, which macOS matches via a regex. The git denies add the working
+ * directory's own repository, read off disk — the `.git` pointer it may be,
+ * or the git directories under its `.git/modules` — so those depend on the
+ * tree at cwd.
  *
- * Both are anchored at the cwd, and the cwd is a name on disk that may
- * contain `[`, `*` or `?`. So the first is a literal entry, and the second
- * carries the cwd as its anchor — only the `**\/<name>` tail is pattern.
- * Compiled as one glob, a cwd like `a[b/c]d` would turn into a character
- * class and every one of these denies would match nothing.
+ * Every pattern here is anchored at the cwd and every path read off disk is a
+ * literal entry, because both are names a glob would misread: the cwd is a
+ * name on disk that may contain `[`, `*` or `?`, and a submodule's directory
+ * is named by whatever the sandboxed command put under `.git/modules`.
+ * Compiled as one glob, `a[b/c]d` turns into a character class and the deny
+ * matches nothing at all — including the very directory it was built from.
  */
 export function macGetMandatoryDenyEntries(
   allowGitConfig = false,
@@ -115,17 +127,74 @@ export function macGetMandatoryDenyEntries(
     entries.push(beneathCwd(`**/${dirName}/**`))
   }
 
-  // Git hooks are always blocked for security
-  entries.push(literal('.git/hooks'))
-  entries.push(beneathCwd('**/.git/hooks/**'))
+  // Nested repositories and the submodule git directories they keep under
+  // .git/modules/ are matched by pattern: there is no scan on macOS, and a
+  // glob covers a git directory that does not exist yet as well. The
+  // submodule name is a single segment here — a nested repository's
+  // `vendor/lib` submodule is not covered — because a `**` in the middle
+  // would also match any component named config or hooks (a branch named
+  // feature/config, a submodule named config), which fails ordinary git
+  // operations that worked before.
+  for (const gitDirPattern of ['**/.git', '**/.git/modules/*']) {
+    for (const pattern of gitDirDenyPaths(gitDirPattern, allowGitConfig)) {
+      entries.push(beneathCwd(pattern))
+    }
+  }
 
-  // Git config - conditionally blocked based on allowGitConfig setting
-  if (!allowGitConfig) {
-    entries.push(literal('.git/config'))
-    entries.push(beneathCwd('**/.git/config'))
+  // The working directory's own repository is enumerated instead: literals
+  // are exact whatever a submodule is named, and each one pins its
+  // directories against being renamed out from under the deny. The producers
+  // in mandatory-deny-paths.ts return the string arrays the Linux backend
+  // binds, and every string in them was read off the filesystem, so each
+  // becomes a literal entry here.
+  const dotGit = path.resolve(cwd, '.git')
+  let dotGitStat: fs.Stats | undefined
+  try {
+    dotGitStat = fs.statSync(dotGit)
+  } catch (err) {
+    // Absent is the ordinary case. Anything else means a .git is there and
+    // could not be looked at, which is no reason to skip the enumeration: a
+    // literal entry is a subpath deny, so this denies it whole, as the Linux
+    // backend's bind of the same path does.
+    if (!isAbsenceErrno(err)) return [...entries, toLiteralPathEntry(dotGit)]
+  }
+  if (dotGitStat?.isDirectory()) {
+    entries.push(
+      ...gitDirTreeDenyPaths(gitDirTreeDenies(dotGit, allowGitConfig)).map(
+        toLiteralPathEntry,
+      ),
+    )
+  } else {
+    // Absent, or a pointer file: the repository's own hooks and config are
+    // denied either way, so neither can be created under a .git that is not
+    // there yet.
+    entries.push(
+      ...gitDirDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
+    )
+    if (dotGitStat?.isFile()) {
+      // cwd checked out as a linked worktree or submodule: .git is a pointer
+      // file. Nested pointer files are matched by vnode type instead
+      // (gitPointerFilter), which cannot follow them.
+      entries.push(
+        ...gitFileDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
+      )
+    }
   }
 
   return entries
+}
+
+/**
+ * SBPL filter matching a regular file named `.git` anywhere under cwd, a
+ * `gitdir:` pointer. Matched by vnode type so a repository's .git DIRECTORY
+ * stays writable. Anchored at the cwd like the mandatory patterns, so a cwd
+ * whose own name holds a bracket is escaped into the regex rather than
+ * compiled as a character class that matches neither it nor anything under
+ * it.
+ */
+function gitPointerFilter(): string {
+  const cwd = normalizePathForSandbox(process.cwd(), { literal: true })
+  return `(require-all (vnode-type REGULAR-FILE) ${pathFilter(anchoredGlobEntry(cwd, '**/.git'))})`
 }
 
 export interface SandboxViolationEvent {
@@ -902,7 +971,25 @@ function generateWriteRules(
   for (const entry of ungrouped) {
     denyFilters.add(denyPathFilter(entry))
   }
+  const gitPointer = gitPointerFilter()
+  denyFilters.add(gitPointer)
   rules.push(...renderRule('deny', ['file-write*'], denyFilters, logTag))
+  // An existing pointer cannot be rewritten; `git worktree add` still creates
+  // new ones, but only inside the write roots, since this allow follows the
+  // denies. User and mandatory denies are re-applied to creation by the rule
+  // below, and removing or renaming over an existing pointer by the
+  // file-write-unlink deny after it.
+  if (allowFilters.size > 0) {
+    const createPointer = `(require-all ${gitPointer} (require-any ${[...allowFilters].join(' ')}))`
+    rules.push(
+      ...renderRule(
+        'allow',
+        ['file-write-create'],
+        new Set([createPointer]),
+        logTag,
+      ),
+    )
+  }
 
   // Block file movement to prevent bypass via mv/rename. A grouped path
   // contributes its regex, the pin for its parent directory, and the
@@ -923,6 +1010,15 @@ function generateWriteRules(
       moveFilters,
       logTag,
     ),
+  )
+
+  // Unlink only, so creating a pointer stays allowed: the rule above and the
+  // read section's re-allow of file-write-unlink for write roots would
+  // otherwise leave `rm lib/.git` and `mv evil lib/.git` open, which is the
+  // same rewrite the file-write* deny blocks. Emitted last; nothing after it
+  // in the profile re-allows unlink.
+  rules.push(
+    ...renderRule('deny', ['file-write-unlink'], new Set([gitPointer]), logTag),
   )
 
   return rules

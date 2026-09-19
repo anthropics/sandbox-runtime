@@ -952,6 +952,15 @@ export const RipgrepConfigSchema = z.object({
     .describe(
       'Override argv[0] when spawning (for multicall binaries that dispatch on argv[0])',
     ),
+  timeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      'How long one ripgrep run may take before it is killed, in milliseconds ' +
+        '(default: DEFAULT_RIPGREP_TIMEOUT_MS, 10000)',
+    ),
 })
 
 /**
