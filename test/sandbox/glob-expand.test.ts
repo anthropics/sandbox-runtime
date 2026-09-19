@@ -1073,33 +1073,39 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(unclosed).test('/tmp/test/file[abc.txt')).toBe(true)
     expect(new RegExp(unclosed).test('/tmp/test/filea.txt')).toBe(false)
 
+    // Every one of them, not only the first: two used to leave a regex that
+    // would not compile.
+    const twice = globToRegex('/tmp/test/file[a[b.txt')
+    expect(new RegExp(twice).test('/tmp/test/file[a[b.txt')).toBe(true)
+
+    // A set needs a member, so the `]` closing an empty one is a character
+    // of the path as well.
+    const empty = globToRegex('/tmp/test/file[]a.txt')
+    expect(new RegExp(empty).test('/tmp/test/file[]a.txt')).toBe(true)
+
     const stray = globToRegex('/tmp/test/file]a.txt')
     expect(new RegExp(stray).test('/tmp/test/file]a.txt')).toBe(true)
     expect(new RegExp(stray).test('/tmp/test/filea.txt')).toBe(false)
   })
 
-  it.failing(
-    'keeps a component spelled like a globstar placeholder literal',
-    () => {
-      // globToRegex parks `**` under __GLOBSTAR__ / __GLOBSTAR_SLASH__ while
-      // it rewrites `*` and `?`, then restores them by name, so a directory
-      // actually called __GLOBSTAR__ comes back as a wildcard.
-      const parked = globToRegex('/tmp/__GLOBSTAR__/x')
-      expect(new RegExp(parked).test('/tmp/__GLOBSTAR__/x')).toBe(true)
-      expect(new RegExp(parked).test('/tmp/anything/x')).toBe(false)
+  it('keeps a component spelled like a globstar placeholder literal', () => {
+    // `**` used to be parked under __GLOBSTAR__ / __GLOBSTAR_SLASH__ while
+    // `*` and `?` were rewritten, and restored by name afterwards, so a
+    // directory actually called __GLOBSTAR__ came back as a wildcard.
+    const parked = globToRegex('/tmp/__GLOBSTAR__/x')
+    expect(new RegExp(parked).test('/tmp/__GLOBSTAR__/x')).toBe(true)
+    expect(new RegExp(parked).test('/tmp/anything/x')).toBe(false)
 
-      const parkedSlash = globToRegex('/tmp/__GLOBSTAR_SLASH__x')
-      expect(new RegExp(parkedSlash).test('/tmp/__GLOBSTAR_SLASH__x')).toBe(
-        true,
-      )
-    },
-  )
+    const parkedSlash = globToRegex('/tmp/__GLOBSTAR_SLASH__x')
+    expect(new RegExp(parkedSlash).test('/tmp/__GLOBSTAR_SLASH__x')).toBe(true)
+  })
 
   it('agrees with a reference matcher over generated patterns and paths', () => {
     // Segments are drawn from the documented syntax only; the corners the
-    // cases above pin (an unclosed bracket, a stray `]`, a negated set, a
-    // literal placeholder) are left out so a disagreement here means the
-    // documented syntax itself diverged.
+    // cases above pin (an unclosed bracket, a stray `]`, a set with no
+    // members, a negated set) are left out so a disagreement here means the
+    // documented syntax itself diverged. The names include the spellings
+    // `**` was once parked under, which are now names like any other.
     const segment = fc.constantFrom(
       'a',
       'bc',
@@ -1111,16 +1117,29 @@ describe('globToRegex (shared)', () => {
       '[ab]',
       '[0-9]',
       '[a-c]c',
+      '__GLOBSTAR__',
+      '__GLOBSTAR_SLASH__b',
       '**',
     )
     const pattern = fc
       .array(segment, { minLength: 1, maxLength: 4 })
       .map(parts => '/' + parts.join('/'))
     const pathText = fc
-      .array(fc.constantFrom('a', 'b', 'c', 'bc', 'a1', 'abc', '0', 'ab'), {
-        minLength: 1,
-        maxLength: 4,
-      })
+      .array(
+        fc.constantFrom(
+          'a',
+          'b',
+          'c',
+          'bc',
+          'a1',
+          'abc',
+          '0',
+          'ab',
+          '__GLOBSTAR__',
+          '__GLOBSTAR_SLASH__b',
+        ),
+        { minLength: 1, maxLength: 4 },
+      )
       .map(parts => '/' + parts.join('/'))
     fc.assert(
       fc.property(pattern, pathText, (p, f) => {
