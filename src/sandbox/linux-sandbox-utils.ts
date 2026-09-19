@@ -1630,8 +1630,8 @@ export function cleanupBwrapMountPoints(opts?: {
           `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
         )
       } else if (stat.isDirectory()) {
-        // Empty directory mount points are created for intermediate
-        // components (Fix 2). Only remove if still empty.
+        // Empty directory mount points are created for a missing
+        // intermediate component. Only remove if still empty.
         const entries = fs.readdirSync(mountPoint)
         if (entries.length === 0) {
           fs.rmdirSync(mountPoint)
@@ -1979,16 +1979,9 @@ export async function initializeLinuxNetworkBridge(
       throw new Error('Linux bridge process died unexpectedly')
     }
 
-    try {
-      // fs already imported
-      if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSockPath)) {
-        logForDebugging(`Linux bridges ready after ${i + 1} attempts`)
-        break
-      }
-    } catch (err) {
-      logForDebugging(`Error checking sockets (attempt ${i + 1}): ${err}`, {
-        level: 'error',
-      })
+    if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSockPath)) {
+      logForDebugging(`Linux bridges ready after ${i + 1} attempts`)
+      break
     }
 
     if (i === maxAttempts - 1) {
@@ -2347,7 +2340,6 @@ async function generateFilesystemArgs(
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
-  // fs already imported
 
   // Collect normalized allowed write paths. Populated in the writeConfig
   // block, read again in the denyRead loop to re-bind writes under tmpfs.
@@ -3200,10 +3192,9 @@ async function generateFilesystemArgs(
       // remove them after the command exits.
       switch (classified.kind) {
         case 'absent': {
-          // Fix 1 (worktree): If any existing component in the deny path is a
-          // file (not a directory), skip the deny entirely. You can't mkdir
-          // under a file, so the deny path can never be created. This handles
-          // git worktrees where .git is a file.
+          // A git worktree's .git is a file, so .git/hooks under it can never
+          // be created: nothing to deny, and a bind under a file would abort
+          // bwrap. Same for any other existing component that is a file.
           if (hasFileAncestor(normalizedPath)) {
             logForDebugging(
               `[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`,
@@ -3246,10 +3237,9 @@ async function generateFilesystemArgs(
             const firstNonExistent =
               findFirstNonExistentComponent(normalizedPath)
 
-            // Fix 2: If firstNonExistent is an intermediate component (not the
-            // leaf deny path itself), mount a read-only empty directory instead
-            // of /dev/null. This prevents the component from appearing as a file
-            // which breaks tools that expect to traverse it as a directory.
+            // A missing INTERMEDIATE component gets an empty read-only
+            // directory, not /dev/null: tools traversing it need a directory,
+            // and a file there breaks them.
             const isIntermediate = firstNonExistent !== normalizedPath
             // Decided from the resolved path, which every spelling of one file
             // shares, rather than from the deny entry: a caller's own
