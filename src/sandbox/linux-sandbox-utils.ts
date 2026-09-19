@@ -7,7 +7,12 @@ import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
-import { ripGrep } from '../utils/ripgrep.js'
+import {
+  ripGrep,
+  RipgrepError,
+  DEFAULT_RIPGREP_TIMEOUT_MS,
+} from '../utils/ripgrep.js'
+import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   generateProxyEnvVars,
@@ -22,11 +27,34 @@ import {
   isAtOrUnder,
   isStrictlyUnder,
   getDangerousDirectories,
+  MAX_SYMLINK_RESOLUTION_DEPTH,
 } from './sandbox-utils.js'
+import {
+  GitMetadataError,
+  SubmoduleWalkBudgetError,
+  gitDirDenyPaths,
+  gitDirTreeDenies,
+  gitDirTreeDenyPaths,
+  gitFileDenyPaths,
+  gitRedirectPlaceholder,
+} from './mandatory-deny-paths.js'
+import type {
+  CollapseLevel,
+  RepositorySubmodules,
+  SubmoduleDenyPlan,
+} from './linux-deny-collapse.js'
+import {
+  NO_COLLAPSE,
+  collapseFurther,
+  collapsedDenyPaths,
+  describeCollapse,
+  repositorySubmodules,
+} from './linux-deny-collapse.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
+import { MaskedFileStore } from './credential-mask-files.js'
 import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
 import type { SeccompConfig } from './sandbox-config.js'
 
@@ -74,7 +102,7 @@ export interface LinuxSandboxParams {
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
-  ripgrepConfig?: { command: string; args?: string[] }
+  ripgrepConfig?: RipgrepConfig
   /** Maximum directory depth to search for dangerous files (default: 3) */
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
@@ -142,9 +170,6 @@ function findSymlinkInPath(
 
   return null
 }
-
-/** Bounded depth for chasing dangling symlink chains (kernel ELOOP limit). */
-const MAX_SYMLINK_RESOLUTION_DEPTH = 40
 
 /**
  * Canonicalize a deny path through symlinks before any mask or bind is
@@ -247,6 +272,209 @@ function hasFileAncestor(targetPath: string): boolean {
 }
 
 /**
+ * What `file` holds, when it is a regular file of no more than `limit`
+ * bytes; undefined for anything else, which is everything this needs to tell
+ * from the placeholders it compares against.
+ */
+function fileContentsWithin(file: string, limit: number): string | undefined {
+  try {
+    const stat = fs.lstatSync(file)
+    if (!stat.isFile() || stat.size > limit) return undefined
+    return fs.readFileSync(file, 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+/** What the deny of a file git reads back binds, once `dest` is ready. */
+type GitRedirectBind =
+  /** Bind this over `dest`, the ordinary answer. */
+  | { bind: string }
+  /** Nothing can be put at `dest`: bind this git directory read-only. */
+  | { denyGitDirWhole: string }
+
+/**
+ * Make `dest` ready for the read-only bind that denies it, where it is one
+ * of the files git reads back (`GIT_REDIRECT_FILES` in
+ * src/sandbox/mandatory-deny-paths.ts says which and why), and say what to
+ * bind. Called at emission time, because it writes on the HOST: a bind the
+ * emission drops must not have cost anything.
+ *
+ * Three arms. Absent: the mount point is written here rather than left to
+ * bubblewrap, holding the placeholder — a mount point bubblewrap makes is
+ * empty, and git refuses to run at all against a `commondir` it cannot read
+ * — with bubblewrap's own read-only mode, so that a wrap killed before its
+ * cleanup leaves a file the next wrap can recognise. There, empty and in
+ * that shape: this wrapper's own to repair and remove. Anything else: the
+ * caller's file, and only the bind lands on it.
+ *
+ * What is bound is the store's copy, never the mount point itself: a host
+ * process rewriting the file between this call and the mount would otherwise
+ * choose what the sandbox reads, and another process's cleanup could unlink
+ * the source out from under a live bind.
+ *
+ * Throws {@link LinuxSandboxProfileError} when the placeholder cannot be
+ * prepared at all: what is left is /dev/null, which costs the repository
+ * every git command inside the sandbox and, through the mount point, outside
+ * it as well, so the command is refused rather than run behind that.
+ */
+function gitRedirectMountPoint(
+  dest: string,
+  placeholder: string,
+  storeFiles: Map<string, string>,
+): GitRedirectBind {
+  const takeOwnership = (): void => {
+    bwrapMountPoints.set(dest, placeholder)
+    registerExitCleanupHandler()
+  }
+  const bindFromStore = (): GitRedirectBind => ({
+    bind: gitRedirectStoreFile(dest, placeholder, storeFiles),
+  })
+
+  let written = false
+  try {
+    // Exclusive: a file that appeared since the deny loop looked is never
+    // truncated, it falls to the existing-file arms below. Read-only, the
+    // mode bubblewrap's ensure_file() leaves, so that a process killed
+    // before the cleanup leaves a file the next wrap can recognise as one of
+    // these rather than as a file somebody meant to be there.
+    fs.writeFileSync(dest, placeholder, { flag: 'wx', mode: 0o444 })
+    written = true
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
+      // A git directory this process cannot write — a vendored checkout
+      // owned by another user, a read-only mount, one the command itself
+      // made unwritable. Refusing every command in the tree over that would
+      // be a brick a sandboxed command can plant; a read-only bind of the
+      // directory denies the file and every other way into it at once.
+      const gitDir = path.dirname(dest)
+      logForDebugging(
+        `[Sandbox Linux] ${gitDir} takes no mount point for ${path.basename(dest)} (${errorText(err)}); denying the git directory whole instead, which needs nothing written to it`,
+        { level: 'warn' },
+      )
+      return { denyGitDirWhole: gitDir }
+    }
+    if (code !== 'EEXIST') {
+      throw placeholderUnavailable(
+        dest,
+        'its mount point could not be made',
+        err,
+      )
+    }
+  }
+  if (written) {
+    takeOwnership()
+    logForDebugging(
+      `[Sandbox Linux] Wrote the mount point ${dest} holding ${JSON.stringify(placeholder)}, so git reads no redirect there while the command runs`,
+    )
+    return bindFromStore()
+  }
+
+  const contents = fileContentsWithin(dest, Buffer.byteLength(placeholder))
+  if (contents === '' && placeholder !== '') {
+    if (!isStaleBwrapMountPoint(dest)) {
+      // Empty and not the shape bubblewrap leaves: a host git caught between
+      // creating the file and writing it owns this one. Cover it with the
+      // placeholder for the length of the command and leave the file alone.
+      logForDebugging(
+        `[Sandbox Linux] Binding ${JSON.stringify(placeholder)} over the empty ${dest}: it is not the shape bubblewrap leaves, so it is not this wrapper's to rewrite`,
+      )
+      return bindFromStore()
+    }
+    try {
+      // bubblewrap makes its mount points read-only (ensure_file(dest,
+      // 0444)), and the process that owns one need not be root, so the mode
+      // it was left with is no reason to leave the repository broken.
+      try {
+        fs.writeFileSync(dest, placeholder)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EACCES') throw err
+        fs.chmodSync(dest, 0o644)
+        fs.writeFileSync(dest, placeholder)
+      }
+    } catch (err) {
+      throw placeholderUnavailable(
+        dest,
+        'the empty file left there could not be rewritten',
+        err,
+      )
+    }
+    takeOwnership()
+    logForDebugging(
+      `[Sandbox Linux] Rewrote ${dest}, left empty by a sandbox that did not clean up, to ${JSON.stringify(placeholder)}: git reads no bytes there as a fault, not as "no redirect"`,
+    )
+    return bindFromStore()
+  }
+  if (
+    contents === placeholder &&
+    (placeholder !== '' || isStaleBwrapMountPoint(dest))
+  ) {
+    // This wrapper's own, left by a process that could not clean up: nothing
+    // else writes exactly these bytes there, and for an empty placeholder
+    // nothing else leaves a file of that shape. Removed with the rest, and
+    // bound from the store rather than from itself: another process wrapping
+    // a command in the same repository can claim and remove this same file,
+    // and a bind whose source is unlinked while the sandbox runs is a bind
+    // that no longer denies anything.
+    takeOwnership()
+    logForDebugging(
+      `[Sandbox Linux] ${dest} already holds the placeholder ${JSON.stringify(placeholder)} an earlier sandbox left; binding the store's copy over it and taking it away with this wrap's mount points`,
+    )
+    return bindFromStore()
+  }
+  logForDebugging(
+    `[Sandbox Linux] Binding ${dest} from itself: what it holds is not the ${JSON.stringify(placeholder)} placeholder, so it is not this wrapper's to replace`,
+  )
+  return { bind: dest }
+}
+
+/**
+ * The store's copy of `placeholder`, made once per wrap: the store unlinks
+ * and rewrites the file on every call, which is what revalidates it, and one
+ * wrap needs one such check however many destinations share the content.
+ */
+function gitRedirectStoreFile(
+  dest: string,
+  placeholder: string,
+  storeFiles: Map<string, string>,
+): string {
+  const made = storeFiles.get(placeholder)
+  if (made !== undefined) return made
+  try {
+    // Keyed by content, so one file serves every destination that needs it.
+    const file = gitRedirectStore.write(placeholder, placeholder)
+    storeFiles.set(placeholder, file)
+    return file
+  } catch (err) {
+    throw placeholderUnavailable(
+      dest,
+      'no placeholder file could be written to the temporary directory',
+      err,
+    )
+  }
+}
+
+/** Refuse the wrap, once, naming what could not be prepared and why. */
+function placeholderUnavailable(
+  dest: string,
+  what: string,
+  cause: unknown,
+): LinuxSandboxProfileError {
+  const message =
+    `Cannot deny ${dest} without stopping git from working in that ` +
+    `repository: ${what} (${errorText(cause)}). git refuses to run at all ` +
+    `against a redirect file it cannot read, so the command was not run ` +
+    `rather than sandboxed behind a deny that breaks it`
+  logForDebugging(`[Sandbox Linux] ${message}`, { level: 'warn' })
+  return new LinuxSandboxProfileError(
+    'deny_placeholder_unavailable',
+    message,
+    cause,
+  )
+}
+
+/**
  * Find the first non-existent path component.
  * E.g., for "/existing/parent/nonexistent/child/file.txt" where /existing/parent exists,
  * returns "/existing/parent/nonexistent"
@@ -270,10 +498,152 @@ function findFirstNonExistentComponent(targetPath: string): string {
   return targetPath // Shouldn't reach here if called correctly
 }
 
+/** Where `parts` first occurs as consecutive segments of `segments`, or -1. */
+function indexOfSegmentRun(segments: string[], parts: string[]): number {
+  return segments.findIndex((_, i) =>
+    parts.every((part, j) => segments[i + j] === part),
+  )
+}
+
+/** The errno a walk of an unreadable directory ends on. */
+const EACCES = 13
+/** The errno a walk of something that has gone away ends on. */
+const ENOENT = 2
+
+/**
+ * Every OS error code a failed ripgrep run mentioned, from the `(os error N)`
+ * tokens rg appends to each diagnostic. NO PATH IS EVER TAKEN FROM THIS TEXT:
+ * a directory's name is chosen by whoever created it and lands in stderr
+ * unescaped, so any path read out of a line can be a name rather than the
+ * file rg failed on. A name can only ADD tokens, and an unrecognised token
+ * refuses the wrap, so the worst a chosen name does is refuse.
+ */
+function ripgrepFailureErrnos(stderr: string): Set<number> {
+  const errnos = new Set<number>()
+  for (const match of stderr.matchAll(/\(os error (\d+)\)/g)) {
+    errnos.add(Number(match[1]))
+  }
+  return errnos
+}
+
+/** At most `limit` characters of `text`, with what was dropped noted. */
+function truncated(text: string, limit = 400): string {
+  const collapsed = text.trim()
+  return collapsed.length <= limit
+    ? collapsed
+    : `${collapsed.slice(0, limit)}… (${collapsed.length - limit} more characters)`
+}
+
+/**
+ * The directories under `cwd` this process cannot read — cannot list at all,
+ * or holding an entry it cannot type — walked the way the scan walks:
+ * `readdir` with the kernel's own entry types, symlinks not followed,
+ * `node_modules` skipped as the scan's globs skip it, no deeper than the
+ * scan reaches. This is what stands in for parsing paths out of rg's stderr:
+ * the answer comes off the filesystem, so a directory NAME cannot add to it,
+ * aim it elsewhere, or empty it. `collectGitDirs` also gathers the `.git`
+ * directories the walk passes.
+ *
+ * Throws {@link LinuxSandboxProfileError} when `deadline` passes: the walk
+ * spends what is left of the scan's own time budget and no more.
+ */
+function walkScanDirectories(
+  cwd: string,
+  maxDepth: number,
+  deadline: number,
+  collectGitDirs = false,
+): { unreadableDirs: string[]; gitDirs: string[] } {
+  const unreadableDirs: string[] = []
+  const gitDirs: string[] = []
+
+  const isDirectory = (
+    entry: fs.Dirent,
+    child: string,
+  ): boolean | undefined => {
+    if (entry.isDirectory()) return true
+    if (
+      entry.isFile() ||
+      entry.isSymbolicLink() ||
+      entry.isFIFO() ||
+      entry.isSocket() ||
+      entry.isBlockDevice() ||
+      entry.isCharacterDevice()
+    ) {
+      return false
+    }
+    // The filesystem returned no type with the entry (DT_UNKNOWN), so ask.
+    try {
+      return fs.lstatSync(child).isDirectory()
+    } catch (err) {
+      // Gone since the listing: nothing there to walk or to deny.
+      return isAbsenceErrno(err) ? false : undefined
+    }
+  }
+
+  const walk = (dir: string, depth: number): void => {
+    if (Date.now() > deadline) {
+      throw denyScanFailed(
+        cwd,
+        'left too little of its time budget to walk what it could not report on',
+        new Error(`the walk stopped at ${dir}`),
+      )
+    }
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch (err) {
+      // Absent means it went away mid-walk, which leaves nothing to deny.
+      if (!isAbsenceErrno(err)) unreadableDirs.push(dir)
+      return
+    }
+    for (const entry of entries) {
+      // Excluded from the scan's globs, so rg never reports one either.
+      if (entry.name === 'node_modules') continue
+      const child = path.join(dir, entry.name)
+      const directory = isDirectory(entry, child)
+      if (directory === undefined) {
+        unreadableDirs.push(dir)
+        return
+      }
+      if (!directory) continue
+      if (collectGitDirs && entry.name === '.git' && depth + 2 <= maxDepth) {
+        // The depth the scan itself reaches a repository at: it recognises
+        // one by a file directly inside .git, one level further down.
+        gitDirs.push(child)
+      }
+      if (depth + 1 < maxDepth) walk(child, depth + 1)
+    }
+  }
+
+  walk(cwd, 0)
+  return { unreadableDirs, gitDirs }
+}
+
+/**
+ * Refuse the wrap, naming what the scan did instead of delivering the deny
+ * paths below `cwd`. Sandboxing on a listing that stops somewhere unknown is
+ * how a nested repository keeps writable hooks, so the wrap is refused.
+ */
+function denyScanFailed(
+  cwd: string,
+  what: string,
+  cause: unknown,
+): LinuxSandboxProfileError {
+  const message =
+    `The ripgrep scan of ${cwd} ${what} (${errorText(cause)}), so what it ` +
+    `would have denied below there is unknown: the command was not run ` +
+    `rather than sandboxed behind a deny list that may leave a nested ` +
+    `repository's hooks writable`
+  logForDebugging(`[Sandbox Linux] ${message}`, { level: 'warn' })
+  return new LinuxSandboxProfileError('deny_scan_failed', message, cause)
+}
+
 /**
  * The part of the mandatory deny set that follows from the cwd alone: the
- * dangerous files and directories resolved against it, plus `.git/hooks` and
- * (unless the caller allows git config) `.git/config`.
+ * dangerous files and directories resolved against it, and what its own
+ * `.git` leads to — the repository's hooks, config and redirect files and
+ * those of its submodule git directories, or, where `.git` is a pointer
+ * file, the file itself and the git directories it names.
  * {@link linuxGetMandatoryDenyPaths} adds the nested matches its ripgrep scan
  * finds on top of these. Split out so a consumer that must not scan — the
  * violation monitor, which needs the same denies to judge a write bwrap
@@ -282,59 +652,189 @@ function findFirstNonExistentComponent(targetPath: string): string {
 export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
 ): string[] {
+  return collapsedDenyPaths(
+    cwdMandatoryDenyPlan(allowGitConfig, undefined),
+    NO_COLLAPSE,
+  )
+}
+
+/** {@link linuxGetCwdMandatoryDenyPaths} with the working directory's own
+ *  submodules still separable, which is what a wrap whose profile does not
+ *  fit degrades. */
+function cwdMandatoryDenyPlan(
+  allowGitConfig: boolean,
+  deadline: number | undefined,
+): SubmoduleDenyPlan {
   const cwd = process.cwd()
-  // Note: Settings files are added at the callsite in sandbox-manager.ts
-  const denyPaths = [
+  const denyPaths = cwdDangerousDenyPaths(cwd)
+  const repositories: RepositorySubmodules[] = []
+
+  const dotGitPath = path.resolve(cwd, '.git')
+  let dotGitStat: fs.Stats | undefined
+  try {
+    dotGitStat = fs.statSync(dotGitPath)
+  } catch (err) {
+    // Absent is the ordinary case, and nothing is denied then: a mount at
+    // .git would block `git init`. Anything else means a .git is there and
+    // could not be looked at, which is no reason to skip the enumeration —
+    // deny it whole instead.
+    if (!isAbsenceErrno(err)) {
+      return { denyPaths: [...denyPaths, dotGitPath], repositories }
+    }
+  }
+  if (dotGitStat?.isDirectory()) {
+    const denies = gitDirTreeDenies(dotGitPath, allowGitConfig, { deadline })
+    denyPaths.push(...gitDirTreeDenyPaths(denies))
+    const repository = repositorySubmodules(denies)
+    if (repository !== undefined) repositories.push(repository)
+  } else if (dotGitStat?.isFile()) {
+    // A pointer file (linked worktree, submodule checkout) has no hooks/
+    // beneath it, and binding a path under a file makes bwrap fail.
+    denyPaths.push(...gitFileDenyPaths(dotGitPath, allowGitConfig))
+  }
+
+  return { denyPaths, repositories }
+}
+
+/**
+ * The deny paths `cwd` has whatever its `.git` turns out to be, and whatever
+ * can be read of it. Settings files are added at the callsite in
+ * src/sandbox/sandbox-manager.ts.
+ */
+function cwdDangerousDenyPaths(cwd: string): string[] {
+  return [
     // Dangerous files in CWD
     ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
     // Dangerous directories in CWD
     ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
   ]
+}
 
-  // Git hooks and config are only denied when .git exists as a directory.
-  // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
-  // .git/hooks can never exist — denying it would cause bwrap to fail.
-  // When .git doesn't exist at all, mounting at .git would block its
-  // creation and break git init.
-  const dotGitPath = path.resolve(cwd, '.git')
-  let dotGitIsDirectory = false
+/**
+ * {@link linuxGetCwdMandatoryDenyPaths} for the violation monitor, which is
+ * started once for the session and must not fail over one repository: the
+ * same paths, or - where the enumeration refuses - this directory's plain
+ * deny paths, with a warning naming which refusal it was. What this decides
+ * is which refused write the monitor reports, never what bubblewrap
+ * enforces.
+ *
+ * Nothing is collapsed here. A wrap collapses only where its own profile does
+ * not fit, which is measured per command, while this is computed once for the
+ * session: a command that forces a collapse later leaves the monitor naming
+ * the precise path under a submodule git directory the wrap has by then
+ * denied whole. The write is refused either way; the path in the report is
+ * the one inside it.
+ */
+export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
   try {
-    dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
-  } catch {
-    // .git doesn't exist
+    return linuxGetCwdMandatoryDenyPaths(allowGitConfig)
+  } catch (err) {
+    const cwd = process.cwd()
+    logForDebugging(
+      `[Sandbox Linux] ${monitorFallbackReason(cwd, err)}; the violation monitor judges writes against ${cwd}'s plain deny paths instead.`,
+      { level: 'warn' },
+    )
+    return [
+      ...cwdDangerousDenyPaths(cwd),
+      ...monitorDotGitDenyPaths(cwd, allowGitConfig),
+    ]
   }
+}
 
-  if (dotGitIsDirectory) {
-    // Git hooks always blocked for security
-    denyPaths.push(path.resolve(cwd, '.git/hooks'))
-
-    // Git config conditionally blocked based on allowGitConfig setting
-    if (!allowGitConfig) {
-      denyPaths.push(path.resolve(cwd, '.git/config'))
-    }
+/** Why the monitor is falling back, in the terms of the thing that failed:
+ *  the two refusals differ in what a wrapped command in this directory gets. */
+function monitorFallbackReason(cwd: string, err: unknown): string {
+  if (err instanceof SubmoduleWalkBudgetError) {
+    return `The walk of this repository's submodule git directories ran out of the time it was given (${errorText(err)}), which a wrap retakes from the clock and may well finish`
   }
+  return `Could not resolve ${path.resolve(cwd, '.git')} the way git does (${errorText(err)}). Every wrapped command in this directory is refused until that is fixed`
+}
 
-  return denyPaths
+/**
+ * What the monitor treats as denied under `cwd`'s own `.git`, without
+ * following anything: the same three answers the wrap gives for the shape
+ * `.git` turns out to be. Absent is none of them — the wrap denies nothing
+ * there either, since a mount at `.git` would block `git init`.
+ */
+function monitorDotGitDenyPaths(
+  cwd: string,
+  allowGitConfig: boolean,
+): string[] {
+  const dotGitPath = path.resolve(cwd, '.git')
+  let dotGitStat: fs.Stats | undefined
+  try {
+    dotGitStat = fs.statSync(dotGitPath)
+  } catch (err) {
+    // There and not inspectable: denied whole, as the wrap denies it.
+    return isAbsenceErrno(err) ? [] : [dotGitPath]
+  }
+  // A pointer file is itself a deny, and what it leads to is exactly what
+  // could not be followed; a git directory's own hooks and config need
+  // nothing followed to name.
+  if (dotGitStat.isFile()) return [dotGitPath]
+  if (dotGitStat.isDirectory()) {
+    return gitDirDenyPaths(dotGitPath, allowGitConfig)
+  }
+  return []
 }
 
 /**
  * Get mandatory deny paths using ripgrep (Linux only).
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
- * With --max-depth limiting, this is fast enough to run on each command without memoization.
+ *
+ * Runs on each command without memoization. `--max-depth` keeps that to
+ * milliseconds on ordinary trees, but `--no-ignore` means gitignored data
+ * within the depth is walked too: measured at about +100 ms per command on a
+ * tree with 150k ignored files three levels down. A scan that does not
+ * deliver what is below the working directory aborts the wrap rather than
+ * sandboxing with a deny list of unknown completeness: one that could not be
+ * run at all, one that does not finish inside {@link ripGrep}'s timeout, and
+ * one that failed for a reason no deny stands in for. The failures that are
+ * not fatal are told apart by the `(os error N)` codes on stderr and never
+ * by the paths printed beside them — see {@link ripgrepFailureErrnos}.
  */
 async function linuxGetMandatoryDenyPaths(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  ripgrepConfig: RipgrepConfig = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
-): Promise<string[]> {
+): Promise<SubmoduleDenyPlan> {
   const cwd = process.cwd()
+  const timeoutMs = ripgrepConfig.timeoutMs ?? DEFAULT_RIPGREP_TIMEOUT_MS
+  // What the scan gets, and what the walk of the working directory's own
+  // submodules that runs before it gets. Every walk made AFTER the scan takes
+  // a budget of its own of the same length: the scan has its own timeout, and
+  // a slow but successful one would otherwise refuse a repository whose
+  // submodules a walk given the time would have got through.
+  const deadline = Date.now() + timeoutMs
+  const walkDeadline = (): number => Date.now() + timeoutMs
   // Use provided signal or create a fallback controller
   const fallbackController = new AbortController()
   const signal = abortSignal ?? fallbackController.signal
   const dangerousDirectories = getDangerousDirectories()
 
-  const denyPaths = linuxGetCwdMandatoryDenyPaths(allowGitConfig)
+  // The working directory's own repository is the first the collapse works
+  // back through, so it is the last to lose its precise denies.
+  const plan = asProfileRefusal(() =>
+    cwdMandatoryDenyPlan(allowGitConfig, deadline),
+  )
+  const denyPaths = plan.denyPaths
+
+  // Each nested repository the scan finds, once: the same walk the cwd's own
+  // git directory already had above, which every file listed under it leads
+  // back to. Collected rather than denied as they are met, because ripgrep
+  // lists a tree in whatever order its threads finish it in and a collapse
+  // works back through them in the order they were served: two wraps of one
+  // tree would otherwise degrade different repositories.
+  const seenGitDirs = new Set<string>([path.resolve(cwd, '.git')])
+  const nestedGitDirs: string[] = []
+  const denyGitDir = (gitDir: string): void => {
+    if (seenGitDirs.has(gitDir)) return
+    seenGitDirs.add(gitDir)
+    nestedGitDirs.push(gitDir)
+  }
+  const walkScan = (collectGitDirs: boolean) =>
+    walkScanDirectories(cwd, maxDepth, walkDeadline(), collectGitDirs)
 
   // Build iglob args for all patterns in one ripgrep call
   const iglobArgs: string[] = []
@@ -344,13 +844,15 @@ async function linuxGetMandatoryDenyPaths(
   for (const dirName of dangerousDirectories) {
     iglobArgs.push('--iglob', `**/${dirName}/**`)
   }
-  // Git hooks always blocked in nested repos
-  iglobArgs.push('--iglob', '**/.git/hooks/**')
-
-  // Git config conditionally blocked in nested repos
-  if (!allowGitConfig) {
-    iglobArgs.push('--iglob', '**/.git/config')
-  }
+  // A nested repository is recognised by ANY regular file directly inside its
+  // .git directory, so its hooks/ and config are denied at the depth the
+  // repository itself is found, not one level further down where the hook
+  // files sit (with the default depth, a repository directly under cwd has
+  // .git/config within reach but .git/hooks/* beyond it). Detection must not
+  // depend on any one file the sandboxed command could move aside, nor on
+  // allowGitConfig, which governs what is denied and not what is found.
+  // A FILE named .git is a worktree/submodule pointer (gitFileDenyPaths).
+  iglobArgs.push('--iglob', '**/.git/*', '--iglob', '**/.git')
 
   // Single ripgrep call to find all dangerous paths in subdirectories
   // Limit depth for performance - deeply nested dangerous files are rare
@@ -361,9 +863,18 @@ async function linuxGetMandatoryDenyPaths(
       [
         '--files',
         '--hidden',
+        // .gitignore, .ignore and .rgignore are writable inside the sandbox:
+        // honouring them would let one command hide a nested repository
+        // from the next command's scan.
+        '--no-ignore',
         '--max-depth',
         String(maxDepth),
         ...iglobArgs,
+        // The directory itself as well as what is under it: excluding only
+        // the contents leaves rg trying to open an unreadable node_modules,
+        // which fails the whole run over a directory nothing here wants.
+        '-g',
+        '!**/node_modules',
         '-g',
         '!**/node_modules/**',
       ],
@@ -372,52 +883,173 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
-    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
-  }
-
-  // Process matches
-  for (const match of matches) {
-    const absolutePath = path.resolve(cwd, match)
-
-    // File inside a dangerous directory -> add the directory path
-    let foundDir = false
-    for (const dirName of [...dangerousDirectories, '.git']) {
-      const normalizedDirName = normalizeCaseForComparison(dirName)
-      const segments = absolutePath.split(path.sep)
-      const dirIndex = segments.findIndex(
-        s => normalizeCaseForComparison(s) === normalizedDirName,
+    if (!(error instanceof RipgrepError)) {
+      // The run never got far enough to report anything of its own: the
+      // binary could not be spawned or this process is out of descriptors —
+      // the missing dependency the start-up check refuses on, met later — or
+      // the caller aborted, which is its own answer and travels as itself.
+      if ((error as { name?: unknown }).name === 'AbortError') throw error
+      throw denyScanFailed(cwd, 'could not be run', error)
+    }
+    if (error.timedOut) {
+      // The command that runs next is the one that could have made the tree
+      // slow to walk, so a truncated listing is not something to sandbox on:
+      // an unreached nested repository would be one with writable hooks.
+      throw denyScanFailed(cwd, 'did not finish', error)
+    }
+    // rg lists the rest of the tree and exits non-zero when an entry gets in
+    // its way, so the matches still count — but only where every code it
+    // reported is one a deny stands in for. Anything else, and anything that
+    // reported no code at all, leaves whatever the run did not reach unknown.
+    const errnos = ripgrepFailureErrnos(error.stderr)
+    const stoodInFor = [...errnos].every(
+      errno => errno === ENOENT || errno === EACCES,
+    )
+    if (errnos.size === 0 || !stoodInFor) {
+      throw denyScanFailed(
+        cwd,
+        `failed for a reason no deny stands in for: ${truncated(error.stderr) || '(nothing on stderr)'}`,
+        error,
       )
-      if (dirIndex !== -1) {
-        // For .git, we want hooks/ or config, not the whole .git dir
-        if (dirName === '.git') {
-          const gitDir = segments.slice(0, dirIndex + 1).join(path.sep)
-          if (match.includes('.git/hooks')) {
-            denyPaths.push(path.join(gitDir, 'hooks'))
-          } else if (match.includes('.git/config')) {
-            denyPaths.push(path.join(gitDir, 'config'))
-          }
-        } else {
-          denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
-        }
-        foundDir = true
-        break
-      }
     }
-
-    // Dangerous file match
-    if (!foundDir) {
-      denyPaths.push(absolutePath)
+    matches = error.partialMatches
+    if (errnos.has(EACCES)) {
+      // A directory rg could not read holds an unknown tree, so it is denied
+      // whole. WHICH directories is settled by walking the filesystem, not by
+      // reading rg's stderr: a name in there is chosen by whoever made the
+      // directory. A walk finding none means the run failed over something
+      // this cannot see, so there is nothing to stand in for it.
+      const { unreadableDirs } = walkScan(false)
+      if (unreadableDirs.length === 0) {
+        throw denyScanFailed(
+          cwd,
+          `reported a directory it could not read, and none is there now: ${truncated(error.stderr)}`,
+          error,
+        )
+      }
+      denyPaths.push(...unreadableDirs)
+      logForDebugging(
+        `[Sandbox] ripgrep scan of ${cwd} could not read ${unreadableDirs.length} of the directories under it, which are denied whole; the ${matches.length} paths it did list still count: ${error}`,
+        { level: 'warn' },
+      )
+    } else {
+      // Every code was ENOENT: entries that went away while rg walked. There
+      // is nothing at those paths to deny, and mounting one would plant a
+      // file on the host where the command deleted one.
+      logForDebugging(
+        `[Sandbox] ripgrep scan of ${cwd} lost entries while it walked, which leaves nothing to deny; the ${matches.length} paths it did list still count: ${error}`,
+        { level: 'warn' },
+      )
     }
   }
 
-  return [...new Set(denyPaths)]
+  const dirPatterns = dangerousDirectories.map(d =>
+    normalizeCaseForComparison(d).split('/'),
+  )
+  for (const match of matches) {
+    // rg prefixes each match with its target, cwd, and does not follow
+    // symlinks, so every line is under it. Segments are compared relative to
+    // cwd, so a dangerous name in cwd's own location never counts.
+    const relative = path.relative(cwd, match).split(path.sep)
+    const lowered = relative.map(normalizeCaseForComparison)
+
+    const dirRun = dirPatterns
+      .map(parts => ({ parts, at: indexOfSegmentRun(lowered, parts) }))
+      .find(({ at }) => at !== -1)
+    if (dirRun) {
+      // The directory, not the file, so files created in it later are covered.
+      const end = dirRun.at + dirRun.parts.length
+      denyPaths.push(path.join(cwd, ...relative.slice(0, end)))
+      continue
+    }
+    const gitAt = lowered.indexOf('.git')
+    if (gitAt === -1) {
+      denyPaths.push(match)
+    } else if (gitAt < relative.length - 1) {
+      denyGitDir(path.join(cwd, ...relative.slice(0, gitAt + 1)))
+    } else if (relative.length > 1) {
+      // cwd's own pointer file is handled above, before the scan.
+      denyPaths.push(
+        ...asProfileRefusal(() => gitFileDenyPaths(match, allowGitConfig)),
+      )
+    }
+  }
+
+  if (allowGitConfig) {
+    // The scan recognises a repository by a regular file directly inside its
+    // .git. With the config deny in place one is always there and cannot be
+    // removed from inside the sandbox; with config writes allowed a command
+    // can empty the directory of regular files and hide the repository from
+    // the next command's scan, so the directories are found here instead.
+    for (const gitDir of walkScan(true).gitDirs) denyGitDir(gitDir)
+  }
+
+  for (const gitDir of nestedGitDirs.sort()) {
+    const denies = asProfileRefusal(() =>
+      gitDirTreeDenies(gitDir, allowGitConfig, { deadline: walkDeadline() }),
+    )
+    denyPaths.push(...gitDirTreeDenyPaths(denies))
+    const repository = repositorySubmodules(denies)
+    if (repository !== undefined) plan.repositories.push(repository)
+  }
+
+  // Deduplicated here rather than at emission: a checked-out submodule's
+  // `.git` pointer names the same git directory the walk of `.git/modules`
+  // reached, so the two produce the same deny paths, and a collapse of that
+  // git directory has to leave no copy of them behind.
+  return { ...plan, denyPaths: [...new Set(denyPaths)] }
 }
 
-// Track mount points created by bwrap for non-existent deny paths.
-// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
-// file on the host as a mount point. These persist after bwrap exits and must
-// be cleaned up explicitly.
-const bwrapMountPoints: Set<string> = new Set()
+/**
+ * Run `produce`, turning the refusal a git metadata file can raise into the
+ * wrap's own typed one. A `.git` pointer or a `commondir` whose target cannot
+ * be worked out the way git works it out refuses the command, and a
+ * sandboxed command can write one, so the refusal has to reach the caller as
+ * something it can branch on — and name the file, since lifting it takes a
+ * command run outside the sandbox.
+ */
+function asProfileRefusal<T>(produce: () => T): T {
+  try {
+    return produce()
+  } catch (err) {
+    if (err instanceof SubmoduleWalkBudgetError) {
+      // The same answer a ripgrep scan that runs out of its time gets, for
+      // the same reason: a listing that stops somewhere unknown is not
+      // something to sandbox on. The walk shares that budget.
+      logForDebugging(`[Sandbox Linux] ${err.message}`, { level: 'warn' })
+      throw new LinuxSandboxProfileError('deny_scan_failed', err.message, err)
+    }
+    if (!(err instanceof GitMetadataError)) throw err
+    logForDebugging(`[Sandbox Linux] ${err.message}`, { level: 'warn' })
+    throw new LinuxSandboxProfileError(
+      'deny_git_metadata_unreadable',
+      err.message,
+      err,
+    )
+  }
+}
+
+// Mount points on the host for deny paths that are not there, against the
+// bytes each holds. When bwrap does --ro-bind /dev/null /nonexistent/path it
+// creates an empty file on the host as a mount point, and it persists after
+// bwrap exits; the git redirect denies write their own instead, holding the
+// placeholder (see gitRedirectMountPoint). undefined is bwrap's, empty one.
+// The cleanup takes a file away only while it still holds what is recorded
+// here, so one something else has written to is left where it is.
+const bwrapMountPoints = new Map<string, string | undefined>()
+
+/** Temp-directory prefix of the store below, so it is nobody else's. */
+const GIT_REDIRECT_STORE_PREFIX = 'srt-gitredirect-'
+
+// The placeholders the git redirect denies bind over their mount points: one
+// file per distinct content for the life of the process, rewritten on each
+// use, and pinned read-only inside every sandbox that mounts one. It is the
+// masked-file store's own class for the reason that store exists — a bind
+// exposes the source file itself, so a command that can reach the source
+// under a name it can write chooses what git reads at the denied path.
+// Emptied by cleanupBwrapMountPoints({ force: true }), which reset() and the
+// process-exit handler call.
+const gitRedirectStore = new MaskedFileStore(GIT_REDIRECT_STORE_PREFIX)
 
 // The source of the empty-directory mount points: at most one at a time, made
 // on first use, reused while a sandbox is running, and removed with the mount
@@ -640,6 +1272,20 @@ const ARG_HEADROOM_BYTES = 4096
 /** bwrap's cap on parsed words, the command line and `--args` file together. */
 const BWRAP_MAX_ARGS = 9000
 
+/** Words bubblewrap takes for one mount: the option and its two paths. */
+const BWRAP_WORDS_PER_MOUNT = 3
+
+/**
+ * Words the wrap adds AFTER the mounts, which the mounts must leave room for.
+ * Fifteen today — `--dev /dev`, `--unshare-pid`, `--unshare-user` and at most
+ * four capability words, `--bind /proc /proc`, `--` with the shell and `-c`,
+ * and the one word the command itself is — plus the two `--args <fd>` takes
+ * when the mounts move off the command line, and a little over. Everything
+ * BEFORE the mounts is counted as it is, not estimated: the wrap has already
+ * built it when it asks for them.
+ */
+const BWRAP_TRAILING_WORDS = 24
+
 /**
  * The fd the `--args` file is opened on: a single digit, since dash rejects
  * multi-digit redirections, and high, since embedders hand the command low
@@ -737,7 +1383,14 @@ function errorText(error: unknown): string {
 
 /** Why a bubblewrap profile could not be run. */
 export type LinuxSandboxProfileErrorCode =
-  /** More arguments than bubblewrap parses, on the line or through a file. */
+  /**
+   * More arguments than bubblewrap parses, on the line or through a file.
+   * The submodule denies of a repository are degraded until the profile fits
+   * (see src/sandbox/linux-deny-collapse.ts), so what reaches this is a
+   * profile that does not fit with every one of them collapsed: the allow
+   * binds, the read denies and what they restore, the `denyWrite` entries
+   * the caller passed and the ancestor pins under them.
+   */
   | 'too_many_arguments'
   /** A mount path holds a NUL byte, which no carrier of arguments can hold. */
   | 'nul_in_path'
@@ -750,6 +1403,35 @@ export type LinuxSandboxProfileErrorCode =
   | 'args_file_unavailable'
   /** The line does not fit one shell argument even with the mounts in a file. */
   | 'command_too_long'
+  /**
+   * A deny path git reads back — a git directory's `commondir` or
+   * `config.worktree` — could not be given a stand-in git accepts: neither
+   * the mount point on the host nor the placeholder in the temporary
+   * directory could be written. Mounting /dev/null there instead would stop
+   * git working in that repository altogether, so the command is refused.
+   * Whatever the wrap did make is tracked and goes with the next cleanup.
+   */
+  | 'deny_placeholder_unavailable'
+  /**
+   * The ripgrep scan the mandatory denies below the working directory come
+   * from did not deliver them: it could not be run, it was killed before it
+   * finished, or it failed for a reason that names no path under the working
+   * directory to deny in its place. Sandboxing on what it did list would
+   * leave whatever it never reached — a nested repository's hooks — writable,
+   * so the command is refused instead. The `.git/modules` walk spends the
+   * same budget and running out of it is the same answer.
+   */
+  | 'deny_scan_failed'
+  /**
+   * A `.git` pointer file or a `commondir` under the working directory names
+   * a git directory that cannot be worked out the way git works it out: its
+   * bytes are not valid UTF-8, it is larger than git reads, or it is there
+   * and could not be read. The hooks and config git runs through it are
+   * therefore unknown, so the command is refused rather than sandboxed
+   * without them. A sandboxed command can write such a file, and the
+   * message names it: the refusal is lifted only from outside the sandbox.
+   */
+  | 'deny_git_metadata_unreadable'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
@@ -913,7 +1595,8 @@ function registerExitCleanupHandler(): void {
  * stops applying inside that sandbox.
  *
  * Pass `{ force: true }` to delete unconditionally — used by the process-exit
- * handler and reset() where deferral is not meaningful.
+ * handler and reset() where deferral is not meaningful. That is also what
+ * empties the store of git redirect placeholders, which is per process.
  *
  * Also closes the `--args` profiles the wraps of this batch opened.
  */
@@ -932,12 +1615,18 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     activeSandboxCount = 0
   }
 
-  for (const mountPoint of bwrapMountPoints) {
+  for (const [mountPoint, written] of bwrapMountPoints) {
     try {
-      // Only remove if it's still the empty file/directory bwrap created.
-      // If something else has written real content, leave it alone.
+      // Still empty, or still holding exactly what this wrote there: a
+      // mount point something else has taken over is not this one's to
+      // remove.
       const stat = fs.statSync(mountPoint)
-      if (stat.isFile() && stat.size === 0) {
+      const stillAsCreated =
+        stat.size === 0 ||
+        (written !== undefined &&
+          stat.size === Buffer.byteLength(written) &&
+          fs.readFileSync(mountPoint, 'utf8') === written)
+      if (stat.isFile() && stillAsCreated) {
         fs.unlinkSync(mountPoint)
         logForDebugging(
           `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
@@ -958,6 +1647,12 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     }
   }
   bwrapMountPoints.clear()
+  if (opts?.force) {
+    // The placeholders outlive a batch of wraps the way the masked-file
+    // store's fakes do: what ends them is the session (or the process), not
+    // a command. A live bind's source has to stay until then.
+    gitRedirectStore.dispose()
+  }
   if (emptyMountSourceDir !== undefined) {
     try {
       // rmdirSync, not a recursive remove: it neither follows a symlink nor
@@ -1641,18 +2336,127 @@ function pushReadDenyDirMounts(
 }
 
 /**
- * Generate filesystem bind mount arguments for bwrap
+ * Generate filesystem bind mount arguments for bwrap, inside `wordsAvailable`
+ * of bubblewrap's cap on parsed words.
+ *
+ * The mandatory-deny scan runs once. What it found is then built into mounts,
+ * counted, and — while the count is past what the caller has room for —
+ * degraded a step at a time and built again, each pass measuring the profile
+ * the previous one produced rather than predicting it: the ancestor pins a
+ * deny needs are known only once the deny list is complete, so the mounts a
+ * repository's submodules really cost cannot be worked out before this point
+ * (see src/sandbox/linux-deny-collapse.ts for what a step gives up, and
+ * `LinuxSandboxProfileErrorCode`'s `too_many_arguments` for what is left when
+ * there is nothing to degrade).
+ *
+ * A pass that is built and then degraded may already have written mount
+ * points on the host for the denies it dropped; they are recorded like any
+ * others and go with the same cleanup.
  */
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
   writeConfig: FsWriteRestrictionConfig | undefined,
   maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
   maskedFileStoreDir: string | undefined,
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  ripgrepConfig: RipgrepConfig = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  wordsAvailable: number = Number.POSITIVE_INFINITY,
 ): Promise<string[]> {
+  const plan =
+    writeConfig === undefined
+      ? undefined
+      : await linuxGetMandatoryDenyPaths(
+          ripgrepConfig,
+          mandatoryDenySearchDepth,
+          allowGitConfig,
+          abortSignal,
+        )
+  let level =
+    plan === undefined
+      ? NO_COLLAPSE
+      : collapseFloor(plan, writeConfig?.allowOnly ?? [], wordsAvailable)
+  for (;;) {
+    const args = buildFilesystemArgs(
+      readConfig,
+      writeConfig,
+      maskedFileBinds,
+      maskedFileStoreDir,
+      plan === undefined ? [] : collapsedDenyPaths(plan, level),
+    )
+    if (plan === undefined) return args
+    const degraded =
+      args.length <= wordsAvailable
+        ? undefined
+        : collapseFurther(
+            plan,
+            level,
+            Math.ceil((args.length - wordsAvailable) / BWRAP_WORDS_PER_MOUNT),
+          )
+    if (degraded !== undefined) {
+      level = degraded
+      continue
+    }
+    // Settled: either it fits, or there is nothing left to degrade and
+    // renderBwrapInvocation refuses it with too_many_arguments. One warning
+    // per wrap, naming what the profile it returns gave up.
+    const told = describeCollapse(plan, level)
+    if (told !== '') {
+      logForDebugging(
+        `[Sandbox Linux] The profile for this command did not fit what bubblewrap parses, so ${told}`,
+        { level: 'warn' },
+      )
+    }
+    return args
+  }
+}
+
+/**
+ * Where the passes above start: the level counting alone says the profile
+ * cannot do without, since every deny path inside the write allowlist takes
+ * a mount of its own and the ancestor pins beneath each are more on top.
+ * Without it a repository with ten thousand submodules is built out in full
+ * before anything is degraded, and a wrapped command can make such a tree:
+ * what one costs every command after it is not free to leave at whatever it
+ * comes to.
+ *
+ * It is not the answer, and the measurement above is: what it leaves out can
+ * only mean more collapsing, and the one way it can ask for too much — a
+ * deny path counted here that another deny turns out to cover — is a mount
+ * the profile saves rather than one it needs.
+ */
+function collapseFloor(
+  plan: SubmoduleDenyPlan,
+  allowOnly: string[],
+  wordsAvailable: number,
+): CollapseLevel {
+  const allowedWritePaths = allowOnly.map(p => normalizePathForSandbox(p))
+  const mounts = Math.floor(wordsAvailable / BWRAP_WORDS_PER_MOUNT)
+  let level = NO_COLLAPSE
+  for (;;) {
+    const denies = collapsedDenyPaths(plan, level).filter(denyPath =>
+      allowedWritePaths.some(allowedPath => isAtOrUnder(denyPath, allowedPath)),
+    ).length
+    if (denies <= mounts) return level
+    const degraded = collapseFurther(plan, level, denies - mounts)
+    if (degraded === undefined) return level
+    level = degraded
+  }
+}
+
+/**
+ * The mounts for one deny list: `mandatoryDenyPaths` are the mandatory denies
+ * as {@link generateFilesystemArgs} has settled them, and the caller's own
+ * `denyWithinAllow` entries are added to them here.
+ */
+function buildFilesystemArgs(
+  readConfig: FsReadRestrictionConfig | undefined,
+  writeConfig: FsWriteRestrictionConfig | undefined,
+  maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
+  maskedFileStoreDir: string | undefined,
+  mandatoryDenyPaths: string[],
+): string[] {
   const args: string[] = []
   // fs already imported
 
@@ -1686,11 +2490,25 @@ async function generateFilesystemArgs(
   // tampered with in between) would leave the binds already emitted pointing
   // at a directory this same call has just judged not ours.
   let emptySource: string | undefined
+  // Deny destinations that are files git reads back, and the placeholder
+  // each needs; acted on at emission (gitRedirectMountPoint).
+  const pendingGitRedirects = new Map<string, string>()
+  // The store file each placeholder content was written to, for this wrap:
+  // the store unlinks and rewrites on every call, which is what revalidates
+  // it, and one wrap needs that once however many destinations share it.
+  const gitRedirectStoreFiles = new Map<string, string>()
+  // Git directories this wrap denies whole because no mount point could be
+  // made inside them, so the second redirect file in one does not emit a
+  // second bind of the same directory.
+  const denyWholeGitDirs = new Set<string>()
+  // The store directory a placeholder came from, pinned read-only with the
+  // other mount sources at the end. Set only where one was actually used.
+  let gitRedirectSourceDir: string | undefined
   // Where a mount given `p` lands: `p` fully resolved, every symlink on the
-  // way and not one hop. One resolution per path per wrap, so every predicate
-  // below sees the same answer, and none before the mandatory-deny scan's
-  // await: that scan can run arbitrarily long, and a realpath taken ahead of
-  // it would miss a symlink retargeted meanwhile.
+  // way and not one hop. One resolution per path per pass, so every predicate
+  // below sees the same answer, and none before the mandatory-deny scan the
+  // caller runs first: that scan can run arbitrarily long, and a realpath
+  // taken ahead of it would miss a symlink retargeted meanwhile.
   const canonicalFormCache = new Map<string, string>()
   // Paths whose canonical location could not be LOOKED AT — a settled errno,
   // or a transient one that outlived the retry — so the recorded spelling
@@ -1917,7 +2735,7 @@ async function generateFilesystemArgs(
   // `liftedFile` marks a file deny an allowRead entry naming that very file
   // cancels — the entry mounts nothing in that case either. Lazy and
   // memoised like readDenyEntries(): it resolves symlinks, so it must not run
-  // before the mandatory-deny scan's await.
+  // before the mandatory-deny scan the caller runs first.
   let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
   const readDenyPlan = (): ReadDenyPlanEntry[] =>
     (readDenyPlanMemo ??= readDenyEntries()
@@ -2021,9 +2839,9 @@ async function generateFilesystemArgs(
     // recorded read-only deny dir — commands with no such covering directory
     // skip the extra stat/realpath/readdir syscalls entirely. Lazy
     // evaluation also means the derivation runs from inside the deny loop,
-    // AFTER the (unbounded) mandatory-deny ripgrep await below, keeping the
-    // snapshot as close as possible to the denyRead loop that later acts on
-    // the real filesystem.
+    // AFTER the (unbounded) mandatory-deny ripgrep scan the caller runs
+    // first, keeping the snapshot as close as possible to the denyRead loop
+    // that later acts on the real filesystem.
     type StubSkipVetoInputs =
       | {
           /** The derivation held; the arrays below describe this wrap. */
@@ -2119,12 +2937,7 @@ async function generateFilesystemArgs(
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
-      ...(await linuxGetMandatoryDenyPaths(
-        ripgrepConfig,
-        mandatoryDenySearchDepth,
-        allowGitConfig,
-        abortSignal,
-      )),
+      ...mandatoryDenyPaths,
     ]
 
     // Duplicate deny entries must be collapsed: a duplicate
@@ -2413,17 +3226,19 @@ async function generateFilesystemArgs(
       // track it, so cleanupBwrapMountPoints() takes it away. Same gate as
       // that branch. Under a read-only denied directory nothing needs
       // covering (the file is already unwritable there), but it is still
-      // tracked: it is no more the caller's file for being there.
+      // tracked: it is no more the caller's file for being there. Not for a
+      // file git reads back, which gitRedirectMountPoint settles instead.
       if (
         (isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
           isWithinAnyAllowedWritePath(normalizedPath)) &&
+        gitRedirectPlaceholder(normalizedPath) === undefined &&
         isStaleBwrapMountPoint(normalizedPath)
       ) {
         if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
           denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
           denyWriteRawDests.set(normalizedPath, rawPath)
         }
-        bwrapMountPoints.add(normalizedPath)
+        bwrapMountPoints.set(normalizedPath, undefined)
         registerExitCleanupHandler()
         logForDebugging(
           `[Sandbox Linux] Re-covering a mount point an earlier sandbox left behind: ${normalizedPath}`,
@@ -2489,6 +3304,13 @@ async function generateFilesystemArgs(
           // of /dev/null. This prevents the component from appearing as a file
           // which breaks tools that expect to traverse it as a directory.
           const isIntermediate = firstNonExistent !== normalizedPath
+          // Decided from the resolved path, which every spelling of one file
+          // shares, rather than from the deny entry: a caller's own
+          // denyWrite naming the same file must not miss it. /dev/null
+          // stands in the buffer until gitRedirectMountPoint replaces it.
+          const gitRedirectStub = isIntermediate
+            ? undefined
+            : gitRedirectPlaceholder(normalizedPath)
           const source = isIntermediate
             ? (emptySource ??= ensureEmptyMountSourceDir())
             : '/dev/null'
@@ -2506,7 +3328,12 @@ async function generateFilesystemArgs(
           // deeper deny that asked for a directory.
           const placeholderAt = placeholderSourceArgIndex.get(firstNonExistent)
           if (placeholderAt !== undefined) {
-            if (isIntermediate) denyWriteArgs[placeholderAt] = source
+            if (isIntermediate) {
+              denyWriteArgs[placeholderAt] = source
+              // The destination has to be a directory for the deeper deny,
+              // so it is no longer a file git reads back.
+              pendingGitRedirects.delete(firstNonExistent)
+            }
             logForDebugging(
               `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
@@ -2517,17 +3344,24 @@ async function generateFilesystemArgs(
             firstNonExistent,
             denyWriteArgs.length - 2,
           )
+          if (gitRedirectStub !== undefined) {
+            pendingGitRedirects.set(firstNonExistent, gitRedirectStub)
+          }
           // First writer wins for a destination several denies share (the
           // reuse branch above returns before reaching this), and the record
           // is purely additive: it only gives the tmpfs and mask comparisons
           // below a second spelling to test, and `dest` itself is always
           // tested.
           denyWriteRawDests.set(firstNonExistent, rawPath)
-          bwrapMountPoints.add(firstNonExistent)
+          bwrapMountPoints.set(firstNonExistent, undefined)
           registerExitCleanupHandler()
           logForDebugging(
             `[Sandbox Linux] Mounted ${
-              isIntermediate ? 'empty dir' : '/dev/null'
+              isIntermediate
+                ? 'empty dir'
+                : gitRedirectStub === undefined
+                  ? '/dev/null'
+                  : 'a git redirect placeholder'
             } at ${firstNonExistent} to block creation of ${normalizedPath}`,
           )
         } else if (ancestorIsWithinReadOnlyDeny) {
@@ -2572,6 +3406,13 @@ async function generateFilesystemArgs(
               { level: 'warn' },
             )
           }
+        }
+        // A file git reads back is not necessarily bound from itself: an
+        // empty one left by a killed wrap is a redirect git refuses. Which
+        // it is is settled at emission (gitRedirectMountPoint).
+        const gitRedirectStub = gitRedirectPlaceholder(normalizedPath)
+        if (gitRedirectStub !== undefined) {
+          pendingGitRedirects.set(normalizedPath, gitRedirectStub)
         }
         denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
         denyWriteRawDests.set(normalizedPath, rawPath)
@@ -2856,7 +3697,34 @@ async function generateFilesystemArgs(
       }
       continue
     }
-    args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
+    // This bind lands, so the file git reads at `dest` is settled now: the
+    // mount point on the host is written here, not left to bwrap, and the
+    // placeholder bound over it comes from the store.
+    const pendingRedirect = pendingGitRedirects.get(dest)
+    let source = denyWriteArgs[i + 1]!
+    if (pendingRedirect !== undefined) {
+      const prepared = gitRedirectMountPoint(
+        dest,
+        pendingRedirect,
+        gitRedirectStoreFiles,
+      )
+      if ('denyGitDirWhole' in prepared) {
+        const gitDir = prepared.denyGitDirWhole
+        // Read-only over the directory itself: it needs nothing written to
+        // the host, and it denies every file inside at once — including the
+        // other redirect file, whose own turn in this loop then has nothing
+        // left to do.
+        if (!denyWholeGitDirs.has(gitDir)) {
+          denyWholeGitDirs.add(gitDir)
+          args.push('--ro-bind', gitDir, gitDir)
+          emittedDenyWriteDests.push(gitDir)
+        }
+        continue
+      }
+      source = prepared.bind
+      if (source !== dest) gitRedirectSourceDir = path.dirname(source)
+    }
+    args.push(denyWriteArgs[i]!, source, dest)
     emittedDenyWriteDests.push(dest)
     // The tmpfs / mask re-application passes below ask "does this bind sit
     // above a read-denied path?". A bind at the resolved dest also re-exposes
@@ -2919,6 +3787,16 @@ async function generateFilesystemArgs(
   // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()).
   if (maskedFileStoreDir !== undefined) {
     args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
+  }
+
+  // INVARIANT, for the same reason and with the same remedy: the store of git
+  // redirect placeholders. A bind exposes the source file itself, so a
+  // command able to write it chooses what git reads at the DENIED path. The
+  // three mount sources here are siblings under the temp directory, each its
+  // own mkdtemp, so no one of these binds can cover another whatever the
+  // order; all three sit after every mount that could cover them.
+  if (gitRedirectSourceDir !== undefined) {
+    args.push('--ro-bind', gitRedirectSourceDir, gitRedirectSourceDir)
   }
 
   // INVARIANT, for the same reason: the empty directory the placeholders above
@@ -3239,6 +4117,9 @@ export async function wrapCommandWithSandboxLinux(
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      // What bubblewrap will parse, less the environment and network words
+      // already built above and the few that come after the mounts.
+      BWRAP_MAX_ARGS - bwrapArgs.length - BWRAP_TRAILING_WORDS,
     )
     const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)
@@ -3341,11 +4222,13 @@ export async function wrapCommandWithSandboxLinux(
 
     return wrappedCommand
   } catch (error) {
-    // Undo the activeSandboxCount increment — the caller won't call
-    // cleanupBwrapMountPoints() for a wrap that threw.
-    if (activeSandboxCount > 0) {
-      activeSandboxCount--
-    }
+    // The caller does not clean up after a wrap that threw, and this one may
+    // already have written mount points on the host — the files git reads
+    // back are written before bubblewrap is ever reached. No sandbox of this
+    // wrap is running, so the cleanup that undoes the activeSandboxCount
+    // increment takes them away with it; it still defers to any other wrap
+    // that is still up.
+    cleanupBwrapMountPoints()
     throw error
   }
 }

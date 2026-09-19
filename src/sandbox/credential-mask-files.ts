@@ -53,7 +53,9 @@ export interface MaskedFileBind {
 }
 
 /**
- * Manager-owned temp dir holding the fake files.
+ * Manager-owned temp dir holding the fake files. The Linux backend keeps a
+ * second store of its own for the placeholders its git redirect denies bind
+ * from, which need this same guarantee for this same reason.
  *
  * INVARIANT: this directory must never be writable from inside the sandbox.
  * The Linux layer enforces this by emitting `--ro-bind <dirPath> <dirPath>`
@@ -66,6 +68,13 @@ export interface MaskedFileBind {
 export class MaskedFileStore {
   private dir: string | undefined
   private readonly byKey = new Map<string, string>()
+  private readonly dirPrefix: string
+
+  /** `dirPrefix` names this store's temp directory, so what it holds is
+   * recognisable on disk and one store's directory is never another's. */
+  constructor(dirPrefix: string = MASKED_FILE_STORE_PREFIX) {
+    this.dirPrefix = dirPrefix
+  }
 
   /**
    * Write `sentinel` to a fake file for `key` and return its path.
@@ -75,7 +84,7 @@ export class MaskedFileStore {
    */
   write(key: string, sentinel: string): string {
     if (this.dir === undefined) {
-      this.dir = fs.mkdtempSync(join(tmpdir(), 'srt-credmask-'))
+      this.dir = fs.mkdtempSync(join(tmpdir(), this.dirPrefix))
     }
     let fakePath = this.byKey.get(key)
     if (fakePath === undefined) {
