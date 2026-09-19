@@ -1266,7 +1266,8 @@ interface GlobPositions {
     spelled: string,
   ) => boolean
   /** The same for the pattern without its trailing `/**`; never true for a
-   *  pattern that has none. */
+   *  pattern that has none, nor for a caller that did not ask for the
+   *  directory form, whose automaton is not built at all. */
   matchesDirectoryForm: (
     positions: readonly number[],
     name: string,
@@ -1330,16 +1331,41 @@ function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
   )
 }
 
+/**
+ * The most pieces a pattern may hand the automaton. It is built by recursion,
+ * one call per path component, so a pattern with thousands of them would
+ * overflow the stack before it matched anything; a path pattern that long is
+ * not one anybody wrote. Such a pattern is matched against real paths
+ * instead, which costs a listing of every directory beneath its base and
+ * denies no less.
+ */
+const MAX_GLOB_PIECES = 1024
+
 function globPositions(
   normalizedPattern: string,
   flags: string,
+  withDirectoryForm: boolean,
 ): GlobPositions {
-  const regex = new RegExp(globToRegex(normalizedPattern), flags)
-  const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
-  const directoryRegex =
-    directoryForm !== normalizedPattern
-      ? new RegExp(globToRegex(directoryForm), flags)
-      : undefined
+  const directoryForm = withDirectoryForm
+    ? removeTrailingGlobSuffix(normalizedPattern)
+    : normalizedPattern
+  let regex: RegExp
+  let directoryRegex: RegExp | undefined
+  try {
+    regex = new RegExp(globToRegex(normalizedPattern), flags)
+    directoryRegex =
+      directoryForm !== normalizedPattern
+        ? new RegExp(globToRegex(directoryForm), flags)
+        : undefined
+  } catch (err) {
+    // A pattern that is no regular expression matches nothing at all, so the
+    // entry it came from would deny nothing and say so nowhere. It is a
+    // configuration error and is raised as one, rather than read as a
+    // pattern that happens to match no path.
+    throw new Error(
+      `Glob pattern ${normalizedPattern} does not compile, so nothing can match it: ${err}`,
+    )
+  }
   const unsplit: GlobPositions = {
     splits: false,
     start: [0],
@@ -1370,9 +1396,12 @@ function globPositions(
       const known = memo.get(key)
       if (known !== undefined) return known
       if (!lead && pieces[i] === 'anyDirs') {
-        const id = globstar(undefined)
+        // Held before it is complete: what follows the `**` can lead back to
+        // this very position, which has to be in the memo by then.
+        const state: Globstar = { then: undefined }
+        const id = states.push(state) - 1
         memo.set(key, id)
-        ;(states[id] as Globstar).then = componentAt(i + 1, false)
+        state.then = componentAt(i + 1, false)
         return id
       }
       if (!lead && pieces[i] === 'any' && i === pieces.length - 1) {
@@ -1416,6 +1445,17 @@ function globPositions(
     return componentAt(0, false)
   }
 
+  /** The weaker reading, taken only where it is said out loud: the walk lists
+   *  every directory beneath the base and matches whole paths, which on a
+   *  deny path also means it descends no symlinked directory. */
+  const cannotBeSplit = (why: string): GlobPositions => {
+    logForDebugging(
+      `[Sandbox] Glob pattern ${normalizedPattern} cannot be read one path component at a time (${why}), so it is matched against real paths only`,
+      { level: 'warn' },
+    )
+    return unsplit
+  }
+
   let starts: number[]
   let firstOfDirectoryForm: number
   try {
@@ -1423,13 +1463,19 @@ function globPositions(
     const directoryPieces = directoryRegex
       ? globPieces(directoryForm, flags)
       : []
+    // A shape globPieces is documented not to take: the pattern reads as
+    // written, and every directory beneath the base is listed.
     if (pieces === undefined || directoryPieces === undefined) return unsplit
+    if (pieces.length + directoryPieces.length > MAX_GLOB_PIECES) {
+      return cannotBeSplit(`it has more than ${MAX_GLOB_PIECES} pieces`)
+    }
     starts = [build(pieces)]
     firstOfDirectoryForm = states.length
     if (directoryRegex) starts.push(build(directoryPieces))
-  } catch {
-    // A piece of the pattern that is no regular expression on its own.
-    return unsplit
+  } catch (err) {
+    // A piece of the pattern that is no regular expression on its own, or an
+    // automaton too deep to build.
+    return cannotBeSplit(String(err))
   }
 
   const open = (into: Set<number>, position: number | undefined): void => {
@@ -1439,8 +1485,6 @@ function globPositions(
       p = 'then' in state ? state.then : undefined
     }
   }
-  const sorted = (positions: Set<number>): readonly number[] =>
-    [...positions].sort((x, y) => x - y)
   const endsAt = (
     positions: readonly number[],
     name: string,
@@ -1457,7 +1501,7 @@ function globPositions(
   for (const p of starts) open(start, p)
   return {
     splits: true,
-    start: sorted(start),
+    start: [...start],
     next: (positions, name) => {
       const next = new Set<number>()
       for (const p of positions) {
@@ -1471,7 +1515,7 @@ function globPositions(
           }
         }
       }
-      return sorted(next)
+      return [...next]
     },
     matches: (positions, name) => endsAt(positions, name, false),
     matchesDirectoryForm: (positions, name) => endsAt(positions, name, true),
@@ -1570,7 +1614,11 @@ export function walkGlobPattern(
 
   // `s`: a name may hold a line terminator, which `.` alone does not match.
   const flags = opts.caseInsensitive ? 'is' : 's'
-  const positions = globPositions(normalizedPattern, flags)
+  const positions = globPositions(
+    normalizedPattern,
+    flags,
+    opts.withDirectoryForm === true,
+  )
   if (opts.followSymlinkedDirectories && !positions.splits) {
     logForDebugging(
       `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time, so it is matched against real paths only and not through symlinked directories`,

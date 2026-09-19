@@ -914,6 +914,23 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it('says so when a pattern is too long to read a component at a time', async () => {
+    // The automaton is built by recursion, once per path component, so a
+    // pattern with thousands of them would overflow the stack. Read as a
+    // pattern that simply does not split, it would quietly stop descending
+    // symlinked directories: a deny that covers less than it says. The
+    // reading is the same; that it was taken is now said out loud.
+    const pattern = '/tmp/' + 'a/'.repeat(4000) + '*.pem'
+    const { result, warnings } = await withCapturedWarnings(async () =>
+      walkGlobPattern(pattern, { followSymlinkedDirectories: true }),
+    )
+
+    expect(result.matches).toEqual([])
+    expect(
+      warnings.some(w => w.includes('pieces') && w.includes('real paths only')),
+    ).toBe(true)
+  })
 })
 
 // ============================================================================
