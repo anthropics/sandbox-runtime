@@ -364,6 +364,26 @@ describe.if(isLinux)(
       expect(existsSync(source!)).toBe(true)
     })
 
+    it('upgrades one placeholder without touching the binds buffered around it', async () => {
+      // The mandatory <cwd>/.claude/commands turns the /dev/null placeholder
+      // the denyWrite on <cwd>/.claude asked for into a directory, and that
+      // bind is buffered between two others. Each buffered bind carries its
+      // own source, so the upgrade reaches exactly one of them.
+      const before = join(PROJ, '.a-absent')
+      const after = join(PROJ, '.z-absent')
+
+      const command = await wrap([before, DOT_CLAUDE, after])
+
+      const source = placeholderSourceAt(command, DOT_CLAUDE)
+      expect(source).toBeDefined()
+      expect(countMounts(command, '--ro-bind', source!, DOT_CLAUDE)).toBe(1)
+      expect(countMounts(command, '--ro-bind', '/dev/null', DOT_CLAUDE)).toBe(0)
+      expect(countMounts(command, '--ro-bind', '/dev/null', before)).toBe(1)
+      expect(countMounts(command, '--ro-bind', '/dev/null', after)).toBe(1)
+      expect(countMounts(command, '--ro-bind', source!, before)).toBe(0)
+      expect(countMounts(command, '--ro-bind', source!, after)).toBe(0)
+    })
+
     it('emits one placeholder per destination, as a directory when the kinds collide', async () => {
       // denyWrite names the missing <cwd>/.claude itself, which asks for a
       // /dev/null placeholder, while the mandatory <cwd>/.claude/commands asks

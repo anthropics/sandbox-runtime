@@ -2352,9 +2352,30 @@ async function generateFilesystemArgs(
   // Collect normalized allowed write paths. Populated in the writeConfig
   // block, read again in the denyRead loop to re-bind writes under tmpfs.
   const allowedWritePaths: string[] = []
+  /** One buffered denyWrite bind. */
+  type DenyWriteBind = {
+    /** What the bind reads from. A /dev/null placeholder at an absent path
+     *  is upgraded in place to the empty directory when a deeper deny needs
+     *  the destination to be traversable. */
+    source: string
+    /** Where the bind lands: the deny path resolved. */
+    dest: string
+    /** The pre-resolution deny path `dest` came from. A bind at the resolved
+     *  dest also re-exposes whatever the symlinked spelling leads to, so the
+     *  re-application passes below compare a read deny's landing against
+     *  both spellings. Landings and allowed write paths are canonical, so
+     *  the extra spelling can only match more of them, never fewer. */
+    rawDest: string
+    /** Set where `dest` is a file git reads back: the placeholder it needs,
+     *  acted on at emission (gitRedirectMountPoint). */
+    gitRedirect?: string
+  }
   // denyWrite binds are buffered and emitted after denyRead processing so that
-  // a denyRead tmpfs over an ancestor directory doesn't wipe them out.
-  const denyWriteArgs: string[] = []
+  // a denyRead tmpfs over an ancestor directory doesn't wipe them out. They
+  // are kept as entries rather than words so that the emission below is the
+  // one place that knows a deny bind is spelled --ro-bind <source> <dest>,
+  // and so nothing has to index into a flat array to change one.
+  const denyWriteBinds: DenyWriteBind[] = []
   // Directories that a deny entry re-binds read-only inside the sandbox
   // (--ro-bind <dir> <dir>), keyed by resolved dest, with every raw
   // (pre-resolution) spelling each was reached through. A non-existent deny
@@ -2368,20 +2389,11 @@ async function generateFilesystemArgs(
   // beside its resolved dest, so the stub-skip guard tests a covering
   // directory in its canonical form AND every recorded spelling.
   const readOnlyDenyDirSpellings = new Map<string, Set<string>>()
-  // dest → the pre-resolution deny path it came from. A bind at the resolved
-  // dest also re-exposes whatever the symlinked spelling leads to, so the
-  // re-application passes below compare a read deny's landing against both
-  // spellings. Landings and allowed write paths are canonical, so the extra
-  // spelling can only match more of them, never fewer.
-  const denyWriteRawDests = new Map<string, string>()
   // The shared empty directory this call's placeholders bind from, resolved at
   // most once per wrap: resolving again mid-wrap (the cached path having been
   // tampered with in between) would leave the binds already emitted pointing
   // at a directory this same call has just judged not ours.
   let emptySource: string | undefined
-  // Deny destinations that are files git reads back, and the placeholder
-  // each needs; acted on at emission (gitRedirectMountPoint).
-  const pendingGitRedirects = new Map<string, string>()
   // The store file each placeholder content was written to, for this wrap:
   // the store unlinks and rewrites on every call, which is what revalidates
   // it, and one wrap needs that once however many destinations share it.
@@ -2847,10 +2859,11 @@ async function generateFilesystemArgs(
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
     // bwrap's ensure_file() falls through to creat() on a read-only mount.
     const seenDenyWrite = new Set<string>()
-    // Placeholder destination -> the index of its source in denyWriteArgs, so
-    // a later deny reaching the same destination can upgrade a /dev/null
-    // placeholder to the directory form in place (see the emission below).
-    const placeholderSourceArgIndex = new Map<string, number>()
+    // Placeholder destination -> its buffered bind, so a later deny reaching
+    // the same destination can upgrade a /dev/null placeholder to the
+    // directory form in place (see the emission below). Only placeholders
+    // are recorded: a deny of an existing path binds that path itself.
+    const placeholderBinds = new Map<string, DenyWriteBind>()
     /** What a deny entry is, to both passes over denyPaths below. */
     type DenyPathClass =
       /** Nothing to deny: --dev /dev has already replaced that tree. */
@@ -3107,8 +3120,11 @@ async function generateFilesystemArgs(
         )
         if (unresolvableSymlink && !seenDenyWrite.has(unresolvableSymlink)) {
           seenDenyWrite.add(unresolvableSymlink)
-          denyWriteArgs.push('--ro-bind', '/dev/null', unresolvableSymlink)
-          denyWriteRawDests.set(unresolvableSymlink, classified.raw)
+          denyWriteBinds.push({
+            source: '/dev/null',
+            dest: unresolvableSymlink,
+            rawDest: classified.raw,
+          })
         }
         logForDebugging(
           `[Sandbox Linux] Deny path could not be resolved through symlinks, failing closed: ${classified.raw}`,
@@ -3132,8 +3148,11 @@ async function generateFilesystemArgs(
         const symlinkInPath = classified.at
         if (!seenDenyWrite.has(symlinkInPath)) {
           seenDenyWrite.add(symlinkInPath)
-          denyWriteArgs.push('--ro-bind', '/dev/null', symlinkInPath)
-          denyWriteRawDests.set(symlinkInPath, rawPath)
+          denyWriteBinds.push({
+            source: '/dev/null',
+            dest: symlinkInPath,
+            rawDest: rawPath,
+          })
         }
         logForDebugging(
           `[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`,
@@ -3158,8 +3177,11 @@ async function generateFilesystemArgs(
         isStaleBwrapMountPoint(normalizedPath)
       ) {
         if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
-          denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
-          denyWriteRawDests.set(normalizedPath, rawPath)
+          denyWriteBinds.push({
+            source: '/dev/null',
+            dest: normalizedPath,
+            rawDest: rawPath,
+          })
         }
         bwrapMountPoints.set(normalizedPath, undefined)
         registerExitCleanupHandler()
@@ -3251,34 +3273,32 @@ async function generateFilesystemArgs(
             // read-only directory blocks creating the destination and everything
             // below it exactly as /dev/null does, and stays traversable for the
             // deeper deny that asked for a directory.
-            const placeholderAt =
-              placeholderSourceArgIndex.get(firstNonExistent)
-            if (placeholderAt !== undefined) {
+            const placeholder = placeholderBinds.get(firstNonExistent)
+            if (placeholder !== undefined) {
               if (isIntermediate) {
-                denyWriteArgs[placeholderAt] = source
+                placeholder.source = source
                 // The destination has to be a directory for the deeper deny,
                 // so it is no longer a file git reads back.
-                pendingGitRedirects.delete(firstNonExistent)
+                placeholder.gitRedirect = undefined
               }
               logForDebugging(
                 `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
               )
               continue
             }
-            denyWriteArgs.push('--ro-bind', source, firstNonExistent)
-            placeholderSourceArgIndex.set(
-              firstNonExistent,
-              denyWriteArgs.length - 2,
-            )
-            if (gitRedirectStub !== undefined) {
-              pendingGitRedirects.set(firstNonExistent, gitRedirectStub)
-            }
             // First writer wins for a destination several denies share (the
-            // reuse branch above returns before reaching this), and the record
-            // is purely additive: it only gives the tmpfs and mask comparisons
-            // below a second spelling to test, and `dest` itself is always
-            // tested.
-            denyWriteRawDests.set(firstNonExistent, rawPath)
+            // reuse branch above returns before reaching this), and the raw
+            // spelling recorded with it is purely additive: it only gives the
+            // tmpfs and mask comparisons below a second spelling to test, and
+            // `dest` itself is always tested.
+            const placeholderBind: DenyWriteBind = {
+              source,
+              dest: firstNonExistent,
+              rawDest: rawPath,
+              gitRedirect: gitRedirectStub,
+            }
+            denyWriteBinds.push(placeholderBind)
+            placeholderBinds.set(firstNonExistent, placeholderBind)
             bwrapMountPoints.set(firstNonExistent, undefined)
             registerExitCleanupHandler()
             logForDebugging(
@@ -3339,11 +3359,12 @@ async function generateFilesystemArgs(
             // empty one left by a killed wrap is a redirect git refuses. Which
             // it is is settled at emission (gitRedirectMountPoint).
             const gitRedirectStub = gitRedirectPlaceholder(normalizedPath)
-            if (gitRedirectStub !== undefined) {
-              pendingGitRedirects.set(normalizedPath, gitRedirectStub)
-            }
-            denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
-            denyWriteRawDests.set(normalizedPath, rawPath)
+            denyWriteBinds.push({
+              source: normalizedPath,
+              dest: normalizedPath,
+              rawDest: rawPath,
+              gitRedirect: gitRedirectStub,
+            })
           } else {
             logForDebugging(
               `[Sandbox Linux] Skipping deny path not within allowed paths: ${normalizedPath}`,
@@ -3364,7 +3385,7 @@ async function generateFilesystemArgs(
     allowedWritePaths.push('/')
     ancestorPinInsertAt = args.length
   }
-  // denyWriteArgs is emitted after the denyRead loop below.
+  // The buffered deny binds are emitted after the denyRead loop below.
 
   // Handle read restrictions by mounting tmpfs over denied paths.
   // Non-glob spellings arrive slash-free from normalizePathForSandbox — the
@@ -3544,7 +3565,7 @@ async function generateFilesystemArgs(
   // land on top of both pins and covers.
   const pinArgs = ancestorPinArgs(
     [
-      ...denyWriteRawDests.keys(),
+      ...denyWriteBinds.map(bind => bind.dest),
       ...fileMasks.map(mask => mask.landing),
       ...readDenyTmpfsUnits.map(unit => unit.landing),
     ],
@@ -3576,9 +3597,8 @@ async function generateFilesystemArgs(
   // Write paths already restored read-only by a dropped deny bind, so two
   // denies covering the same path emit one --ro-bind.
   const restoredReadOnlyWritePaths = new Set<string>()
-  for (let i = 0; i < denyWriteArgs.length; i += 3) {
-    const dest = denyWriteArgs[i + 2]!
-    const rawDest = denyWriteRawDests.get(dest) ?? dest
+  for (const bind of denyWriteBinds) {
+    const { dest, rawDest } = bind
     // A mask's landing, not its dest: the landing is where the mask's bind
     // actually sits, and this deny's dest is canonical, so the two are
     // comparable as written.
@@ -3632,12 +3652,11 @@ async function generateFilesystemArgs(
     // This bind lands, so the file git reads at `dest` is settled now: the
     // mount point on the host is written here, not left to bwrap, and the
     // placeholder bound over it comes from the store.
-    const pendingRedirect = pendingGitRedirects.get(dest)
-    let source = denyWriteArgs[i + 1]!
-    if (pendingRedirect !== undefined) {
+    let source = bind.source
+    if (bind.gitRedirect !== undefined) {
       const prepared = gitRedirectMountPoint(
         dest,
-        pendingRedirect,
+        bind.gitRedirect,
         gitRedirectStoreFiles,
       )
       if ('denyGitDirWhole' in prepared) {
@@ -3656,7 +3675,7 @@ async function generateFilesystemArgs(
       source = prepared.bind
       if (source !== dest) gitRedirectSourceDir = path.dirname(source)
     }
-    args.push(denyWriteArgs[i]!, source, dest)
+    args.push('--ro-bind', source, dest)
     emittedDenyWriteDests.push(dest)
     // The tmpfs / mask re-application passes below ask "does this bind sit
     // above a read-denied path?". A bind at the resolved dest also re-exposes
