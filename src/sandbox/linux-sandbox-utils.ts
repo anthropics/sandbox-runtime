@@ -2393,11 +2393,16 @@ async function generateFilesystemArgs(
   // The store directory a placeholder came from, pinned read-only with the
   // other mount sources at the end. Set only where one was actually used.
   let gitRedirectSourceDir: string | undefined
+  // Set where nothing is waiting on the mandatory-deny scan any more: after
+  // its await below, and at once where there is no write config to scan for.
+  // canonicalForm refuses to resolve until then — the scan can run
+  // arbitrarily long, and a realpath taken ahead of it would miss a symlink
+  // retargeted meanwhile. The lazy memos below are what keep every derivation
+  // on the right side of it.
+  let mandatoryDenyScanDone = false
   // Where a mount given `p` lands: `p` fully resolved, every symlink on the
   // way and not one hop. One resolution per path per wrap, so every predicate
-  // below sees the same answer, and none before the mandatory-deny scan's
-  // await: that scan can run arbitrarily long, and a realpath taken ahead of
-  // it would miss a symlink retargeted meanwhile.
+  // below sees the same answer.
   const canonicalFormCache = new Map<string, string>()
   // Paths whose canonical location could not be LOOKED AT — a settled errno,
   // or a transient one that outlived the retry — so the recorded spelling
@@ -2414,6 +2419,11 @@ async function generateFilesystemArgs(
   // containment checks ran against the name itself.
   const canonicalFormUnresolved = new Set<string>()
   const canonicalForm = (p: string): string => {
+    if (!mandatoryDenyScanDone) {
+      throw new Error(
+        `[Sandbox Linux] ${p} was resolved before the mandatory-deny scan finished: what a realpath taken now says can be stale by the time the mounts are built`,
+      )
+    }
     let canonical = canonicalFormCache.get(p)
     if (canonical === undefined) {
       try {
@@ -2623,8 +2633,7 @@ async function generateFilesystemArgs(
   // a deny lands. `mount` is undefined where nothing is mounted at all;
   // `liftedFile` marks a file deny an allowRead entry naming that very file
   // cancels — the entry mounts nothing in that case either. Lazy and
-  // memoised like readDenyEntries(): it resolves symlinks, so it must not run
-  // before the mandatory-deny scan's await.
+  // memoised like readDenyEntries().
   let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
   const readDenyPlan = (): ReadDenyPlanEntry[] =>
     (readDenyPlanMemo ??= readDenyEntries()
@@ -2726,11 +2735,9 @@ async function generateFilesystemArgs(
     // Inputs for the covering-directory vetoes, computed at most once and
     // only when a deny path (absent or existing) lies strictly beneath a
     // recorded read-only deny dir — commands with no such covering directory
-    // skip the extra stat/realpath/readdir syscalls entirely. Lazy
-    // evaluation also means the derivation runs from inside the deny loop,
-    // AFTER the (unbounded) mandatory-deny ripgrep await below, keeping the
-    // snapshot as close as possible to the denyRead loop that later acts on
-    // the real filesystem.
+    // skip the extra stat/realpath/readdir syscalls entirely. Running from
+    // inside the deny loop also keeps the snapshot as close as possible to
+    // the denyRead loop that later acts on the real filesystem.
     type StubSkipVetoInputs =
       | {
           /** The derivation held; the arrays below describe this wrap. */
@@ -2829,6 +2836,7 @@ async function generateFilesystemArgs(
       allowGitConfig,
       abortSignal,
     )
+    mandatoryDenyScanDone = true
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
@@ -3318,7 +3326,9 @@ async function generateFilesystemArgs(
       }
     }
   } else {
-    // No write restrictions: Allow all writes
+    // No write restrictions: Allow all writes. The mandatory-deny scan runs
+    // only for them, so nothing here is waiting on it.
+    mandatoryDenyScanDone = true
     args.push('--bind', '/', '/')
     // Recording '/' makes isWithinAnyAllowedWritePath and isAllowedWriteRoot
     // say so, which is the '/'-write-root shape ancestorPinArgs treats
