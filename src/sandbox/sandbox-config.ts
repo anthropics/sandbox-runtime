@@ -919,6 +919,15 @@ export const FilesystemConfigSchema = z.object({
   denyWrite: z
     .array(filesystemPathSchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
+  denyUnlink: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'macOS only: paths that remain writable but cannot be unlinked or renamed. ' +
+        'Use to protect trees such as `.git` that must stay writable for git operations ' +
+        'without allowing `rm -rf`. Rejected on Linux and Windows: bubblewrap cannot ' +
+        'deny unlink independently of write.',
+    ),
   allowGitConfig: z
     .boolean()
     .optional()
@@ -1205,6 +1214,22 @@ export const SandboxRuntimeConfigSchema = z
       for (const [idx, p] of cfg.filesystem.denyWrite.entries()) {
         addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyWrite', idx], ctx)
       }
+      for (const [idx, p] of (cfg.filesystem.denyUnlink ?? []).entries()) {
+        addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyUnlink', idx], ctx)
+      }
+    }
+
+    if (
+      (cfg.filesystem.denyUnlink?.length ?? 0) > 0 &&
+      getPlatform() !== 'macos'
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['filesystem', 'denyUnlink'],
+        message:
+          'filesystem.denyUnlink is macOS-only. Linux and Windows cannot deny ' +
+          'unlink while leaving a path writable; omit denyUnlink on this platform.',
+      })
     }
 
     const creds = cfg.credentials
