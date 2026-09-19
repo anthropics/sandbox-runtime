@@ -105,12 +105,8 @@ export class SentinelRegistry {
    * registered, the EXISTING sentinel is returned (and `sentinel` discarded)
    * so a re-register never invalidates a fake the sandboxed process has
    * already read. The caller must mint sentinels with enough entropy that
-   * collisions with real content are negligible (embed a uuid4). No
-   * registered sentinel may be a substring of any other registered sentinel:
-   * the body-substitution scan matches earliest-position-then-registration-
-   * order, not longest-match, so nested sentinels would make replacement
-   * chunk-boundary-dependent (still fail-safe — worst case a wrong fake
-   * reaches upstream, never a secret).
+   * collisions with real content are negligible (embed a uuid4). A sentinel
+   * that nests with one already registered is refused (see the check below).
    *
    * Caller-minted sentinels are used verbatim — never length-padded: a
    * shaped fake (e.g. a JWT) must keep its structure. They are therefore
@@ -128,6 +124,26 @@ export class SentinelRegistry {
       existing.realValue = realValue
       existing.injectHosts = injectHosts
       return existing.sentinel
+    }
+    // No registered sentinel may be a substring of another. The
+    // body-substitution scan matches earliest-position-then-registration-
+    // order, not longest-match, so a nested pair replaces the wrong span, and
+    // which one wins depends on where the streaming transform's chunk
+    // boundaries fall. Minted sentinels each carry their own uuid4 and cannot
+    // nest; a caller-minted one (a shaped fake) can, and is refused here
+    // rather than at the first body that carries it. Registration is once per
+    // credential at wrap time, so the scan costs nothing that matters.
+    for (const registered of this.bySentinel.values()) {
+      if (
+        registered.sentinel.includes(sentinel) ||
+        sentinel.includes(registered.sentinel)
+      ) {
+        throw new Error(
+          `Credential "${name}" was given a sentinel that nests with the one ` +
+            `already registered for "${registered.name}": body substitution ` +
+            `would replace the wrong span. Mint sentinels that embed a uuid4.`,
+        )
+      }
     }
     if (!sentinel.startsWith(SENTINEL_PREFIX)) {
       this.allSentinelsPrefixed = false
