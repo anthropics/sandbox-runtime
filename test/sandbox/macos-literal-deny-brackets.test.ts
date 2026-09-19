@@ -324,7 +324,6 @@ describe.if(isMacOS)(
 
     afterAll(() => {
       process.chdir(originalCwd)
-      openModulesTree(tree)
       rmSync(tree.root, { recursive: true, force: true })
     })
 
@@ -625,6 +624,7 @@ describe.if(isMacOS)(
 
     afterAll(() => {
       process.chdir(originalCwd)
+      openModulesTree(tree)
       rmSync(tree.root, { recursive: true, force: true })
     })
 

@@ -3036,6 +3036,9 @@ describe('Git metadata deny paths - Unit Tests', () => {
       SubmoduleWalkBudgetError,
     )
     expect(Date.now() - started).toBeLessThan(2000)
+    // Removed here rather than by the hook after it: fifty thousand entries
+    // take longer to take away on some filesystems than a hook is given.
+    rmSync(modules, { recursive: true, force: true })
   }, 120000)
 
   it.if(isLinux)(
