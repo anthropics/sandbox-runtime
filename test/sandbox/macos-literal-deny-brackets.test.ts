@@ -1,10 +1,10 @@
 import { describe, it, expect, afterAll, beforeAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   mkdirSync,
   realpathSync,
   rmSync,
-  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -433,10 +433,22 @@ function modulesTree(prefix: string): ModulesTree {
   writeFileSync(join(submodule, 'HEAD'), 'ref: refs/heads/main\n')
   writeFileSync(join(work, '.git', 'HEAD'), 'ref: refs/heads/main\n')
   mkdirSync(unreadable, { recursive: true })
-  // A loop the walk cannot stat, so it stops and denies the directory
-  // holding it whole — the same record an unlistable directory produces.
-  symlinkSync('loop', join(unreadable, 'loop'))
+  // A directory the walk cannot list, which is denied whole rather than left
+  // writable with a git directory possibly inside. Restored by
+  // `openModulesTree` before the tree is removed - and before a sandboxed
+  // write into it is what has to be refused.
+  chmodSync(unreadable, 0o000)
   return { root, work, submodule, unreadable }
+}
+
+/** A walk cannot be kept out of a directory it owns as root, so the record
+ *  the two cases below are about is not there for one. */
+const CAN_LOCK_A_DIRECTORY = process.getuid?.() !== 0
+
+/** Gives `tree.unreadable` its permissions back, so that what refuses a write
+ *  into it is the sandbox and not the mode, and so that it can be removed. */
+function openModulesTree(tree: ModulesTree): void {
+  chmodSync(tree.unreadable, 0o755)
 }
 
 /**
@@ -495,6 +507,7 @@ describe.if(!isWindows)(
 
     afterAll(() => {
       process.chdir(originalCwd)
+      openModulesTree(tree)
       rmSync(tree.root, { recursive: true, force: true })
     })
 
@@ -516,11 +529,14 @@ describe.if(!isWindows)(
       }
     })
 
-    it('denies the directory the walk stopped at by subpath', () => {
-      const text = profile()
-      expect(text).toContain(`(subpath ${JSON.stringify(tree.unreadable)})`)
-      expect(text).not.toContain(sniffedFilter(tree.unreadable, '(/.*)?$'))
-    })
+    it.if(CAN_LOCK_A_DIRECTORY)(
+      'denies the directory the walk could not list by subpath',
+      () => {
+        const text = profile()
+        expect(text).toContain(`(subpath ${JSON.stringify(tree.unreadable)})`)
+        expect(text).not.toContain(sniffedFilter(tree.unreadable, '(/.*)?$'))
+      },
+    )
 
     it('leaves no regex carrying a bracket read off the filesystem', () => {
       // A spelling sniffed as a pattern keeps its brackets verbatim, since
@@ -608,6 +624,7 @@ describe.if(isMacOS)(
 
     afterAll(() => {
       process.chdir(originalCwd)
+      openModulesTree(tree)
       rmSync(tree.root, { recursive: true, force: true })
     })
 
@@ -643,12 +660,32 @@ describe.if(isMacOS)(
       expect(result.stderr.toLowerCase()).toContain('operation not permitted')
     })
 
-    it('refuses a write in the directory the walk stopped at', () => {
-      const target = join(tree.unreadable, 'planted')
-      const result = run(`echo planted > ${JSON.stringify(target)}`)
-      expect(result.status).not.toBe(0)
-      expect(result.stderr.toLowerCase()).toContain('operation not permitted')
-    })
+    it.if(CAN_LOCK_A_DIRECTORY)(
+      'refuses a write in the directory the walk could not list',
+      () => {
+        const target = join(tree.unreadable, 'planted')
+        // The profile is built while the directory is locked, which is what
+        // puts the deny in it; the mode is then given back, so that what
+        // refuses the write is the sandbox.
+        const command = wrapCommandWithSandboxMacOS({
+          command: `echo planted > ${JSON.stringify(target)}`,
+          needsNetworkRestriction: false,
+          readConfig: undefined,
+          writeConfig: { allowOnly: [tree.root], denyWithinAllow: [] },
+        })
+        openModulesTree(tree)
+        const result = spawnSync(command, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 10000,
+          env: { ...process.env, LC_ALL: 'C' },
+        })
+        expect(result.status).not.toBe(0)
+        expect((result.stderr || '').toLowerCase()).toContain(
+          'operation not permitted',
+        )
+      },
+    )
   },
 )
 

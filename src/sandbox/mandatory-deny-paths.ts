@@ -10,9 +10,9 @@ import {
 /**
  * The path is absent, as opposed to unreadable or otherwise unverifiable.
  * Narrower than the shared {@link isAbsenceErrno} by two codes: ELOOP must
- * read as unreadable here, so a symlink loop is denied whole rather than
- * passed over as nothing, and ENAMETOOLONG has its own answer in
- * {@link isUnusablePathError}.
+ * read as unreadable here, so a `gitdir:` target that is a symlink loop is
+ * denied whole rather than passed over as nothing, and ENAMETOOLONG has its
+ * own answer in {@link isUnusablePathError}.
  */
 function isAbsenceError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code
@@ -37,14 +37,15 @@ function isUnusablePathError(err: unknown): boolean {
  */
 const MAX_GIT_METADATA_BYTES = 1024 * 1024
 
-/**
- * Time the `.git/modules` walk gets when the caller sets no deadline of its
- * own — the macOS backend and the violation monitor, neither of which runs
- * the ripgrep scan whose deadline the Linux wrap shares with it. The same
- * figure the scan gets, for the same reason: a tree that takes longer than
- * this to walk is one the command about to run could have made.
- */
+/** Time the `.git/modules` walk gets when the caller sets no deadline. */
 const DEFAULT_SUBMODULE_WALK_TIMEOUT_MS = DEFAULT_RIPGREP_TIMEOUT_MS
+
+/**
+ * How often the walk looks at the clock: once per this many entries, rather
+ * than once per directory, because one directory can hold as many entries as
+ * the whole rest of the walk.
+ */
+const WALK_DEADLINE_CHECK_INTERVAL = 128
 
 /**
  * Entries whose presence makes a directory a git directory. git needs HEAD
@@ -88,14 +89,11 @@ export class GitMetadataError extends Error {
 }
 
 /**
- * The `.git/modules` walk ran out of the time it was given. The tree it was
- * walking is one the command about to run could have made — a bind mount
- * pointed back at its own ancestor gives every level a real path of its own,
- * which the visited set cannot fold together — so a half-finished listing is
- * not something to sandbox on: the submodule git directories it never reached
- * would be left with writable hooks. The Linux wrap turns this into a
- * `LinuxSandboxProfileError` carrying `deny_scan_failed`, the same answer the
- * ripgrep scan's own overrun gets; on macOS it reaches the caller as itself.
+ * The `.git/modules` walk ran out of the time it was given, so the submodule
+ * git directories it never reached would have been left with writable hooks.
+ * The Linux wrap turns this into a `LinuxSandboxProfileError` carrying
+ * `deny_scan_failed`; on macOS it reaches the caller as itself. Branch on
+ * `.code`, not on the message.
  */
 export class SubmoduleWalkBudgetError extends Error {
   readonly code = 'submodule_walk_budget_exhausted' as const
@@ -113,9 +111,10 @@ export interface SubmoduleScan {
    * Directories the walk could not see through: what lies under them is
    * unknown, so they are denied whole rather than left writable with a git
    * directory possibly inside. Two things produce one — a directory the walk
-   * could not list and an entry it could not stat — and the recorded path is
-   * the deepest ancestor this process can reach, which can be the
-   * `.git/modules` root itself. Sorted, like `gitDirs`.
+   * could not list, and an entry whose target exists and could not be
+   * inspected — and the recorded path is the deepest ancestor this process can
+   * reach towards it, which can be the `.git/modules` root itself. Sorted and
+   * without duplicates, like `gitDirs`.
    *
    * A whole-directory deny is read-only for everything beneath it, a
    * submodule's `objects`, `refs` and `index` included, so git writes inside a
@@ -125,88 +124,20 @@ export interface SubmoduleScan {
 }
 
 /**
- * What a wrap has left for its submodule denies, and what it has collapsed to
- * stay inside that.
- *
- * bubblewrap parses a bounded number of words, the command line and an
- * `--args` file together, and takes three of them for each mount: the option
- * and its two paths. A repository with thousands of submodules asks for more
- * mounts than that on its own — four denies and an ancestor pin per submodule
- * git directory — and the ceiling is not this library's to lift. Refusing
- * every command in such a repository is the wrong answer to it, so the denies
- * are degraded instead, fail-closed and only as far as they have to be:
- *
- * 1. precise denies (`hooks`, `config`, `commondir`, `config.worktree`) while
- *    they fit;
- * 2. the submodule git directories that do not fit are denied WHOLE, one
- *    read-only bind each. git writes inside those submodules fail read-only;
- *    nothing else does. Which ones is settled by sorted order, the last
- *    first, so two wraps of the same tree agree;
- * 3. where even that does not fit, the enclosing `modules` directory is
- *    denied whole and everything under it goes with it.
- *
- * A budget is spent across the whole wrap, working directory first, which is
- * what lets the violation monitor - which sees only the working directory's
- * half and makes its own budget - collapse exactly where the wrap did.
- * macOS passes none: Seatbelt's profile has no such cap, so nothing there is
- * collapsed.
+ * What a git directory's tree is denied by, in the pieces a backend with a
+ * ceiling on how many mounts it can carry degrades it in (Linux:
+ * src/sandbox/linux-deny-collapse.ts). Every piece is a precise deny: nothing
+ * here is collapsed, on either backend.
  */
-export class SubmoduleDenyBudget {
-  private mountsLeft: number
-  /** Submodule git directories left with their precise denies. */
-  preciseGitDirs = 0
-  /** Submodule git directories denied whole instead. */
-  wholeGitDirs = 0
-  /** `modules` directories denied whole, taking every submodule under each. */
-  readonly wholeModulesDirs: string[] = []
-
-  constructor(mounts: number) {
-    this.mountsLeft = mounts
-  }
-
-  /** Whether `mounts` are still there, without taking them. */
-  fits(mounts: number): boolean {
-    return mounts <= this.mountsLeft
-  }
-
-  /**
-   * Takes `mounts` whether they are there or not. For what a wrap must have
-   * however little is left: one bind over a whole `modules` directory is the
-   * least the denies under it can cost, and giving that up would leave a
-   * tree of writable hooks. Overspending here is what `too_many_arguments`
-   * is still there to catch.
-   */
-  spend(mounts: number): void {
-    this.mountsLeft -= mounts
-  }
-
-  /** Takes `mounts` where they are there, and says whether they were. */
-  take(mounts: number): boolean {
-    if (!this.fits(mounts)) return false
-    this.mountsLeft -= mounts
-    return true
-  }
-
-  /** Whether anything was collapsed, and so whether the wrap says so. */
-  get collapsed(): boolean {
-    return this.wholeGitDirs > 0 || this.wholeModulesDirs.length > 0
-  }
-
-  /** One line naming what was collapsed and at which level. */
-  describeCollapse(): string {
-    const parts: string[] = []
-    if (this.wholeGitDirs > 0) {
-      parts.push(
-        `${this.wholeGitDirs} of ${this.wholeGitDirs + this.preciseGitDirs} submodule git directories are denied whole rather than by path (git writes inside those submodules fail read-only; the other ${this.preciseGitDirs} keep their precise denies)`,
-      )
-    }
-    if (this.wholeModulesDirs.length > 0) {
-      parts.push(
-        `${this.wholeModulesDirs.join(', ')} ${this.wholeModulesDirs.length === 1 ? 'is' : 'are'} denied whole, taking every submodule under ${this.wholeModulesDirs.length === 1 ? 'it' : 'them'}`,
-      )
-    }
-    return parts.join('; ')
-  }
+export interface GitDirTreeDenies {
+  /** The git directory's own hooks, config and redirect files. */
+  ownDenyPaths: string[]
+  /** `<gitDir>/modules`, whether or not the walk found anything under it. */
+  modulesDir: string
+  /** One per submodule git directory under `modulesDir`, sorted by path. */
+  submodules: Array<{ gitDir: string; denyPaths: string[] }>
+  /** What the walk could not see through; see {@link SubmoduleScan}. */
+  unreadableDirs: string[]
 }
 
 /**
@@ -397,85 +328,40 @@ export function gitFileDenyPaths(
  * Every git directory a deny must cover once `gitDir` is one: its own hooks/
  * and config, and the same for each submodule git directory under its
  * `modules` (what a commit inside that submodule runs), plus whatever the
- * walk could not see through. Both backends produce their entries from this
- * one list.
+ * walk could not see through. `deadline` bounds the walk (see
+ * {@link submoduleGitDirs}).
  *
- * `deadline` bounds the walk (see {@link submoduleGitDirs}). `budget` bounds
- * how many mounts the submodule denies may take, and is what degrades them
- * where a repository has more submodules than the backend can carry mounts
- * for (see {@link SubmoduleDenyBudget}); it is spent as it goes, so a caller
- * that passes one to several git directories gets the first served first.
+ * Kept apart rather than flattened so that a backend which cannot carry every
+ * mount can degrade the submodule denies and leave the rest alone;
+ * {@link gitDirTreeDenyPaths} is the flat form both backends emit when
+ * nothing has to be degraded.
  */
-export function gitDirTreeDenyPaths(
+export function gitDirTreeDenies(
   gitDir: string,
   allowGitConfig: boolean,
-  options: { budget?: SubmoduleDenyBudget; deadline?: number } = {},
-): string[] {
+  options: { deadline?: number } = {},
+): GitDirTreeDenies {
   const modulesDir = path.join(gitDir, 'modules')
   const modules = submoduleGitDirs(modulesDir, options.deadline)
-  return [
-    ...gitDirDenyPaths(gitDir, allowGitConfig),
-    ...submoduleDenyPaths(modulesDir, modules, allowGitConfig, options.budget),
-  ]
+  return {
+    ownDenyPaths: gitDirDenyPaths(gitDir, allowGitConfig),
+    modulesDir,
+    submodules: modules.gitDirs.map(submodule => ({
+      gitDir: submodule,
+      denyPaths: gitDirDenyPaths(submodule, allowGitConfig),
+    })),
+    unreadableDirs: modules.unreadableDirs,
+  }
 }
 
-/**
- * What the submodule git directories under `modulesDir` cost and what they
- * are denied with, inside what `budget` has left. No budget means no ceiling
- * to stay under and every one of them keeps its precise denies, which is the
- * macOS answer and what the Linux wrap does until a repository is large
- * enough to need otherwise. See {@link SubmoduleDenyBudget} for the order.
- */
-function submoduleDenyPaths(
-  modulesDir: string,
-  modules: SubmoduleScan,
-  allowGitConfig: boolean,
-  budget: SubmoduleDenyBudget | undefined,
-): string[] {
-  const precise = (gitDir: string): string[] =>
-    gitDirDenyPaths(gitDir, allowGitConfig)
-  if (budget === undefined) {
-    return [...modules.unreadableDirs, ...modules.gitDirs.flatMap(precise)]
-  }
-
-  // A directory the walk could not see through is already a whole-directory
-  // deny and cannot be degraded further, so it is counted with the git
-  // directories at their cheapest form. One more mount for the `modules`
-  // directory itself, whose ancestor pin every deny under it shares.
-  const wholeMounts = modules.unreadableDirs.length + modules.gitDirs.length + 1
-  if (!budget.fits(wholeMounts)) {
-    // Even one bind each is past what is left: the whole tree goes behind one,
-    // the directories the walk could not see through included — except one
-    // recorded ABOVE `modules`, which is what the walk falls back to when
-    // `modules` itself stopped being reachable, and which this would not
-    // cover.
-    budget.spend(1)
-    budget.wholeModulesDirs.push(modulesDir)
-    const above = modules.unreadableDirs.filter(
-      dir => dir !== modulesDir && !dir.startsWith(`${modulesDir}${path.sep}`),
-    )
-    budget.spend(above.length)
-    return [modulesDir, ...above]
-  }
-
-  // Every one of them fits whole. Spend what is left upgrading them to their
-  // precise denies, in sorted order, so that the ones collapsed are the last
-  // — the deepest nested submodules among them — and two wraps agree. An
-  // upgrade costs one mount per deny path, the whole-directory bind it
-  // replaces paying for the git directory's own ancestor pin.
-  budget.spend(wholeMounts)
-  const denyPaths: string[] = [...modules.unreadableDirs]
-  for (const gitDir of modules.gitDirs) {
-    const denies = precise(gitDir)
-    if (budget.take(denies.length)) {
-      budget.preciseGitDirs += 1
-      denyPaths.push(...denies)
-      continue
-    }
-    budget.wholeGitDirs += 1
-    denyPaths.push(gitDir)
-  }
-  return denyPaths
+/** {@link gitDirTreeDenies} as one list, which is what a backend with no
+ *  ceiling to stay under emits. */
+export function gitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
+  return [
+    ...denies.ownDenyPaths,
+    ...denies.unreadableDirs,
+    ...denies.submodules.flatMap(submodule => submodule.denyPaths),
+  ]
 }
 
 /**
@@ -499,49 +385,70 @@ export function submoduleGitDirs(
   modulesDir: string,
   deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
 ): SubmoduleScan {
-  const scan: SubmoduleScan = { gitDirs: [], unreadableDirs: [] }
-  // Where the walk still has to look, and where it has already been. The root
-  // counts as visited: an entry linked straight back to it is then the same
-  // dead end as one linked to any other directory already walked.
-  const pending = [modulesDir]
+  const walk: SubmoduleWalk = { gitDirs: [], unreadableDirs: new Set() }
+  // Where the walk still has to look, and where it has already been. A
+  // directory listed to see whether it is a git directory carries its entries
+  // with it, so that no directory is listed twice. The root counts as visited:
+  // an entry linked straight back to it is then the same dead end as one
+  // linked to any other directory already walked.
+  const pending: Array<{ dir: string; entries?: fs.Dirent[] }> = [
+    { dir: modulesDir },
+  ]
   const visited = new Set<string>([realPathOrSelf(modulesDir)])
-  while (pending.length > 0) {
-    const dir = pending.pop() as string
-    if (Date.now() > deadline) {
-      throw new SubmoduleWalkBudgetError(
-        `[Sandbox] The walk of ${modulesDir} ran out of the time it was given with ${pending.length + 1} directories left to look at (at ${dir}); refusing to sandbox on the submodule git directories it did reach`,
-      )
-    }
-    const entries = listDirectory(dir, scan)
+  let entriesSeen = 0
+  for (let item = pending.pop(); item !== undefined; item = pending.pop()) {
+    const entries = item.entries ?? listDirectory(item.dir, walk)
     if (entries === undefined) continue
     for (const entry of entries) {
-      const child = path.join(dir, entry.name)
+      if (
+        entriesSeen++ % WALK_DEADLINE_CHECK_INTERVAL === 0 &&
+        Date.now() > deadline
+      ) {
+        throw new SubmoduleWalkBudgetError(
+          `[Sandbox] The walk of ${modulesDir} ran out of the time it was given while listing ${item.dir}, with ${pending.length} directories still to look at; refusing to sandbox on the submodule git directories it did reach`,
+        )
+      }
+      const child = path.join(item.dir, entry.name)
       // git accepts a symlinked entry under .git/modules, and
       // Dirent.isDirectory is false for one, so the link is followed — and
       // the real path recorded, since a link back up would otherwise loop.
-      if (!isDirectory(entry, child, scan)) continue
+      if (!isDirectory(entry, child, walk)) continue
       const visitKey = realPathOrSelf(child)
       if (visited.has(visitKey)) continue
       visited.add(visitKey)
 
-      const childEntries = listDirectory(child, scan)
+      const childEntries = listDirectory(child, walk)
       if (childEntries === undefined) continue
       const isGitDir = childEntries.some(e => GIT_DIR_MARKERS.has(e.name))
-      if (isGitDir) scan.gitDirs.push(child)
+      if (isGitDir) walk.gitDirs.push(child)
       // A git directory keeps its own submodules under `modules`; anything
       // else is a segment of a submodule name (`vendor` of `vendor/lib`).
-      pending.push(isGitDir ? path.join(child, 'modules') : child)
+      pending.push(
+        isGitDir
+          ? { dir: path.join(child, 'modules') }
+          : { dir: child, entries: childEntries },
+      )
     }
   }
-  scan.gitDirs.sort()
-  scan.unreadableDirs.sort()
-  return scan
+  return {
+    gitDirs: walk.gitDirs.sort(),
+    unreadableDirs: [...walk.unreadableDirs].sort(),
+  }
+}
+
+/** What the walk has found so far. The deny paths a directory it could not
+ *  see through produces are a set: one unreadable entry and the next fold to
+ *  the same ancestor, and a repeated path is a mount the profile never pays
+ *  for but would otherwise be counted as one. */
+interface SubmoduleWalk {
+  gitDirs: string[]
+  unreadableDirs: Set<string>
 }
 
 /** Entries of `dir`, or undefined when it is absent or (recorded) unreadable. */
 function listDirectory(
   dir: string,
-  scan: SubmoduleScan,
+  walk: SubmoduleWalk,
 ): fs.Dirent[] | undefined {
   try {
     return fs.readdirSync(dir, { withFileTypes: true })
@@ -549,7 +456,7 @@ function listDirectory(
     // Absent is the common case: no submodules, or none nested in this one.
     if (!isAbsenceError(err)) {
       const denied = deepestReachableAncestor(dir) ?? dir
-      scan.unreadableDirs.push(denied)
+      walk.unreadableDirs.add(denied)
       logForDebugging(
         `[Sandbox] Could not list ${dir}, denying ${denied} whole: ${err}`,
         { level: 'warn' },
@@ -563,17 +470,51 @@ function listDirectory(
 function isDirectory(
   entry: fs.Dirent,
   entryPath: string,
-  scan: SubmoduleScan,
+  walk: SubmoduleWalk,
 ): boolean {
   if (entry.isDirectory()) return true
   if (!entry.isSymbolicLink()) return false
   try {
     return fs.statSync(entryPath).isDirectory()
   } catch (err) {
-    if (!isAbsenceError(err)) {
-      scan.unreadableDirs.push(deepestReachableAncestor(entryPath) ?? entryPath)
+    if (isAbsenceError(err) || isUnusablePathError(err)) return false
+    if ((err as NodeJS.ErrnoException).code === 'ELOOP') {
+      // A link that resolves back to itself reaches no directory at all, so
+      // there is nothing behind it to deny and nothing a command can put
+      // there without replacing the link, which the next wrap's walk sees.
+      // The link's own path cannot carry a read-only bind either: bubblewrap
+      // resolves a mount destination, and resolving this one is what just
+      // failed. Denying the directory that HOLDS it is the one answer that
+      // would be worse than none - a single link a command can write would
+      // take every submodule beside it read-only.
+      logForDebugging(
+        `[Sandbox] ${entryPath} is a symlink loop, which leads to nothing to deny: ${err}`,
+        { level: 'warn' },
+      )
+      return false
     }
+    // Something is there and could not be inspected. Fail closed on the
+    // deepest directory that can be reached TOWARDS IT rather than on the
+    // directory holding the link, which would again be every submodule
+    // beside it.
+    const denied =
+      deepestReachableAncestor(linkTarget(entryPath) ?? entryPath) ?? entryPath
+    walk.unreadableDirs.add(denied)
+    logForDebugging(
+      `[Sandbox] Could not follow ${entryPath}, denying ${denied} whole: ${err}`,
+      { level: 'warn' },
+    )
     return false
+  }
+}
+
+/** Where `link` points, resolved against the directory holding it, or
+ *  undefined when it cannot be read. */
+function linkTarget(link: string): string | undefined {
+  try {
+    return path.resolve(path.dirname(link), fs.readlinkSync(link))
+  } catch {
+    return undefined
   }
 }
 
@@ -808,13 +749,20 @@ function physicalPath(base: string, target: string): string {
 
 /**
  * The deepest ancestor of `target` (itself included) this process can still
- * stat. Denying that directory fails closed when the path below it cannot be
- * inspected: nothing under it is writable in the sandbox.
+ * stat as a directory. Denying that directory fails closed when the path
+ * below it cannot be inspected: nothing under it is writable in the sandbox.
+ *
+ * Symlinks are followed, so a link to a directory that cannot be listed is
+ * answered with the link's own path rather than with the directory holding
+ * it — the Linux deny loop puts the bind on the real target (see
+ * `resolveSymlinkedDenyPath`), and answering with the parent would let one
+ * unreadable directory anyone can plant a link to take every entry beside it
+ * read-only.
  */
 function deepestReachableAncestor(target: string): string | undefined {
   for (let dir = target; ; dir = path.dirname(dir)) {
     try {
-      if (fs.lstatSync(dir).isDirectory()) return dir
+      if (fs.statSync(dir).isDirectory()) return dir
     } catch {
       // Unreachable at this level; try the parent.
     }
