@@ -318,6 +318,33 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     expect([...unlistable]).toEqual([])
   })
 
+  it('denies whole what a pattern it cannot read a name at a time reaches', () => {
+    // `?[*].pem` cannot be followed one path component at a time, so no
+    // directory is listed through a symlink: what the pattern matches beyond
+    // one that leads out of the tree is found under no name at all. The
+    // directory it leads to is denied whole, and nothing is bound back
+    // beneath that mount, since what is in there was never enumerated.
+    const unsplit = caseRoot('unsplit')
+    mkdirSync(join(unsplit, 'proj', 'inner'), { recursive: true })
+    mkdirSync(join(unsplit, 'outside'))
+    writeFileSync(join(unsplit, 'proj', 'inner', 'a].pem'), '')
+    writeFileSync(join(unsplit, 'outside', 'b].pem'), '')
+    symlinkSync(join(unsplit, 'outside'), join(unsplit, 'proj', 'away'))
+
+    const unlistable = new Set<string>()
+    const mounts = expandReadDenyGlobLinux(
+      join(unsplit, 'proj', '**/?[*].pem'),
+      [],
+      unlistable,
+    )
+
+    expect(mounts).toEqual([
+      join(unsplit, 'outside'),
+      join(unsplit, 'proj', 'inner', 'a].pem'),
+    ])
+    expect([...unlistable]).toEqual([join(unsplit, 'outside')])
+  })
+
   it('lists every match where it really is when the base is a symlink', () => {
     // alias -> ROOT, sideways: normalizePathForSandbox keeps the link
     // spelling for the pattern, so every match is spelled through it. The

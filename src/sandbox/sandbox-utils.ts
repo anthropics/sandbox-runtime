@@ -1736,9 +1736,15 @@ export function walkGlobPattern(
         positions.matchesDirectoryForm(fresh, entry.name, candidate)
       // A pattern that does not split is not listed through a link: no two
       // names for a directory can be told apart, so none but its own is
-      // listed. A link that is itself a match still denies what it leads to.
+      // listed. A link that is itself a match still denies what it leads to,
+      // and one that leads out of the walk's tree is denied whole below.
       const beneath = positions.splits ? positions.next(fresh, entry.name) : []
-      if (!isMatch && !isDirectoryFormCandidate && beneath.length === 0) {
+      if (
+        positions.splits &&
+        !isMatch &&
+        !isDirectoryFormCandidate &&
+        beneath.length === 0
+      ) {
         continue
       }
       const shortPath = path.join(frame.short, entry.name)
@@ -1758,7 +1764,31 @@ export function walkGlobPattern(
         walk.directoryMatches.push(fullPath)
         walk.realOf.set(fullPath, target.real)
       }
-      if (beneath.length === 0) continue
+      if (beneath.length === 0) {
+        if (
+          !positions.splits &&
+          !isMatch &&
+          !isDirectoryFormCandidate &&
+          !isAtOrUnder(target.real, baseReal)
+        ) {
+          // The pattern is matched against whole paths and this link is not
+          // listed through, so what it matches in there is found by no other
+          // name either: the directory it leads to is denied whole rather
+          // than dropped. A target inside the walk's own tree is listed
+          // under its own name, which loses nothing.
+          const targetRecord = recordFor(target.real)
+          if (!targetRecord.unlisted) {
+            targetRecord.unlisted = true
+            walk.unlisted.push(fullPath)
+            logForDebugging(
+              `[Sandbox] Glob pattern ${globPath} cannot be followed through ${fullPath} -> ${target.real}, which lies outside ${baseReal}: denying it whole`,
+              { level: 'warn' },
+            )
+          }
+          walk.realOf.set(fullPath, target.real)
+        }
+        continue
+      }
       // A link that leads up — to this directory or above it, or to the
       // walk's base or above it — is not listed through: beneath it is a tree
       // the pattern was never aimed at (`/`, a home directory).
@@ -1771,6 +1801,11 @@ export function walkGlobPattern(
         )
         continue
       }
+      // Named here, because what is found beneath is reported where it
+      // really lives: this is the one line that says which link led there.
+      logForDebugging(
+        `[Sandbox] Following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}`,
+      )
       pending.push({
         dir: target.real,
         real: target.real,

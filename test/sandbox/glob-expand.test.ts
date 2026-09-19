@@ -781,6 +781,36 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it('denies whole what a pattern it cannot split reaches through a link', () => {
+    // `?[*].pem` cannot be read one name at a time, so no directory is
+    // listed through a link. What the pattern matches beneath one that leads
+    // out of the tree is then found under no name at all: the directory it
+    // leads to is denied whole rather than dropped. A link within the tree
+    // loses nothing, since every directory there is listed under its own
+    // name, and denying it whole would hide a tree that was walked.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unsplit-')))
+    try {
+      mkdirSync(join(root, 'proj', 'inner'), { recursive: true })
+      mkdirSync(join(root, 'outside'))
+      writeFileSync(join(root, 'proj', 'inner', 'a].pem'), 'KEY')
+      writeFileSync(join(root, 'outside', 'b].pem'), 'KEY')
+      symlinkSync(join(root, 'outside'), join(root, 'proj', 'away'))
+      symlinkSync(join(root, 'proj', 'inner'), join(root, 'proj', 'near'))
+
+      const walk = walkGlobPattern(join(root, 'proj', '**/?[*].pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.matches).toEqual([join(root, 'proj', 'inner', 'a].pem')])
+      expect(walk.unlisted).toEqual([join(root, 'proj', 'away')])
+      expect(walk.realOf.get(join(root, 'proj', 'away'))).toBe(
+        join(root, 'outside'),
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 // ============================================================================
