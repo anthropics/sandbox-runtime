@@ -811,6 +811,109 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it('does not let one name that fails to list answer for the others', () => {
+    // A listing can fail for a reason that has nothing to do with the
+    // directory: too many open files at that moment, or a real path too long
+    // to name, which the next name for it may be short enough to reach.
+    // Letting that failure answer for every later name drops every match
+    // beneath the directory — the same fail-open as reading it as absent.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-route-')))
+    try {
+      mkdirSync(join(root, 'pkg', 'certs'), { recursive: true })
+      writeFileSync(join(root, 'pkg', 'certs', 'id.pem'), 'KEY')
+      symlinkSync(join('pkg', 'certs'), join(root, 'lnk'))
+
+      const certs = join(root, 'pkg', 'certs')
+      const readdirSync = fs.readdirSync
+      const attempts: string[] = []
+      let failuresLeft = 1
+      using spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        const at = String(args[0])
+        if (at === certs) {
+          attempts.push(at)
+          if (failuresLeft > 0) {
+            failuresLeft--
+            throw Object.assign(new Error('EMFILE: too many open files'), {
+              code: 'EMFILE',
+            })
+          }
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+
+      const retried = walkGlobPattern(join(root, '**/*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+      // Two names lead to the directory; the second one lists it.
+      expect(spy).toHaveBeenCalled()
+      expect(attempts).toHaveLength(2)
+      expect(retried.matches.map(m => retried.realOf.get(m) ?? m)).toEqual([
+        join(root, 'pkg', 'certs', 'id.pem'),
+      ])
+      expect(retried.unlisted).toHaveLength(1)
+
+      // A directory that fails under every name is tried under each of them
+      // and named once, whatever the number of names.
+      attempts.length = 0
+      failuresLeft = Number.POSITIVE_INFINITY
+      const gone = walkGlobPattern(join(root, '**/*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+      expect(attempts).toHaveLength(2)
+      expect(gone.matches).toEqual([])
+      expect(gone.unlisted).toHaveLength(1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports the error of the path it looked at, not of a second name', () => {
+    // The walk lists the real path and falls back on a shorter name only
+    // when the real one is too long to be a name at all. Every other errno
+    // belongs to the directory: answered from a second name, an unreadable
+    // directory reads as absent and the deny it holds vanishes.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-errno-')))
+    try {
+      const real = join(root, 'deep', 'a', 'b', 'certs')
+      mkdirSync(real, { recursive: true })
+      writeFileSync(join(real, 'id.pem'), 'KEY')
+      symlinkSync(real, join(root, 's'))
+
+      const readdirSync = fs.readdirSync
+      const attempts: string[] = []
+      using spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        const at = String(args[0])
+        attempts.push(at)
+        if (at === real) {
+          throw Object.assign(new Error('EACCES: permission denied'), {
+            code: 'EACCES',
+          })
+        }
+        if (at === join(root, 's')) {
+          throw Object.assign(new Error('ENOENT: no such file or directory'), {
+            code: 'ENOENT',
+          })
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+
+      const walk = walkGlobPattern(join(root, 's', '*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(spy).toHaveBeenCalled()
+      expect(attempts).toEqual([real])
+      expect(walk.unlisted).toEqual([join(root, 's')])
+      expect(walk.realOf.get(join(root, 's'))).toBe(real)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 // ============================================================================

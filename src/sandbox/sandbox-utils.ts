@@ -1606,14 +1606,42 @@ export function walkGlobPattern(
     short: string
     positions: readonly number[]
   }
-  /** The positions each real directory has been listed for. */
-  const listedFor = new Map<string, Set<number>>()
-  /** Successful listings, by real directory: a second position reads the
-   *  same entries. */
-  const listings = new Map<string, fs.Dirent[]>()
+  /**
+   * What the walk knows about one real directory, whatever the names that
+   * lead to it. A listing failure is not recorded against its positions: the
+   * failure can belong to the name the listing was tried under (a chain past
+   * the ELOOP bound, a real path too long to name) while the directory is
+   * there under another, and letting that name answer for the others would
+   * drop every match beneath it — the same fail-open as reading it as absent.
+   * What the retries cost is one listing per name that leads to the
+   * directory, and each of those names is an entry of a directory that is
+   * itself listed once per position.
+   */
+  type DirectoryRecord = {
+    /** The positions it has been listed for, each of them successfully. */
+    listedFor: Set<number>
+    /** The entries a successful listing found: a second position reads them
+     *  again rather than the directory. */
+    entries?: fs.Dirent[]
+    /** Whether it is already in `walk.unlisted`, which names it once. */
+    unlisted?: true
+  }
+  const records = new Map<string, DirectoryRecord>()
+  const recordFor = (real: string): DirectoryRecord => {
+    let record = records.get(real)
+    if (record === undefined) {
+      records.set(real, (record = { listedFor: new Set() }))
+    }
+    return record
+  }
   const pending: Frame[] = []
-  /** A filesystem call on a real path, and on a shorter name for it when that
-   *  fails. The real path crosses no link, so a long chain of them cannot
+  /** A filesystem call on a real path, and on a shorter name for it when the
+   *  real path is too long to name. Nothing else is retried: every other
+   *  errno belongs to the object rather than to the name, and the second call
+   *  can answer for another object altogether, since the short name crosses
+   *  links a sandboxed command owns and can repoint between the two. An
+   *  unreadable directory read as absent is the fail-open this walk exists to
+   *  avoid. The real path crosses no link, so a long chain of them cannot
    *  fail the call (ELOOP). */
   const onRealPath = <T>(
     real: string,
@@ -1623,7 +1651,15 @@ export function walkGlobPattern(
     try {
       return call(real)
     } catch (err) {
-      if (short === real) throw err
+      if (
+        short === real ||
+        (err as NodeJS.ErrnoException | undefined)?.code !== 'ENAMETOOLONG'
+      ) {
+        throw err
+      }
+      logForDebugging(
+        `[Sandbox] ${real} is too long to name for glob pattern ${globPath}; looking at ${short} instead`,
+      )
       return call(short)
     }
   }
@@ -1668,31 +1704,33 @@ export function walkGlobPattern(
   })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real } = frame
-    let listed = listedFor.get(real)
-    if (listed === undefined) listedFor.set(real, (listed = new Set()))
+    const record = recordFor(real)
     // What a position finds beneath a directory does not depend on the
     // others it came with, so only the ones new to this directory are taken.
-    const fresh = frame.positions.filter(p => !listed.has(p))
+    const fresh = frame.positions.filter(p => !record.listedFor.has(p))
     if (fresh.length === 0) continue
-    for (const p of fresh) listed.add(p)
-    let entries = listings.get(real)
-    try {
-      entries ??= onRealPath(real, frame.short, p =>
-        fs.readdirSync(p, { withFileTypes: true }),
-      )
-      listings.set(real, entries)
-    } catch (err) {
-      const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
-      logForDebugging(
-        `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
-        { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
-      )
-      if (errorCode !== 'ENOENT') {
-        walk.unlisted.push(dir)
-        if (real !== dir) walk.realOf.set(dir, real)
+    let entries = record.entries
+    if (entries === undefined) {
+      try {
+        entries = onRealPath(real, frame.short, p =>
+          fs.readdirSync(p, { withFileTypes: true }),
+        )
+        record.entries = entries
+      } catch (err) {
+        const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+        logForDebugging(
+          `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
+          { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
+        )
+        if (errorCode !== 'ENOENT' && !record.unlisted) {
+          record.unlisted = true
+          walk.unlisted.push(dir)
+          if (real !== dir) walk.realOf.set(dir, real)
+        }
+        continue
       }
-      continue
     }
+    for (const p of fresh) record.listedFor.add(p)
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name)
       const realPath = path.join(real, entry.name)
