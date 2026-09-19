@@ -35,7 +35,7 @@ import {
   gitDirDenies,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
-  gitFileDenyPaths,
+  gitFileDenies,
   gitRedirectPlaceholder,
 } from './mandatory-deny-paths.js'
 import type { GitDirTreeDenies } from './mandatory-deny-paths.js'
@@ -691,7 +691,8 @@ function cwdMandatoryDenyPlan(
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
-    denyPaths.push(...gitFileDenyPaths(dotGitPath, allowGitConfig))
+    const pointer = gitFileDenies(dotGitPath, allowGitConfig)
+    denyPaths.push(...pointer.denyPaths, ...pointer.linkedEntryDirs)
   }
 
   return { denyPaths, repositories }
@@ -984,9 +985,10 @@ async function linuxGetMandatoryDenyPaths(
       denyGitDir(path.join(cwd, ...relative.slice(0, gitAt + 1)))
     } else if (relative.length > 1) {
       // cwd's own pointer file is handled above, before the scan.
-      denyPaths.push(
-        ...asProfileRefusal(() => gitFileDenyPaths(match, allowGitConfig)),
+      const pointer = asProfileRefusal(() =>
+        gitFileDenies(match, allowGitConfig),
       )
+      denyPaths.push(...pointer.denyPaths, ...pointer.linkedEntryDirs)
     }
   }
 

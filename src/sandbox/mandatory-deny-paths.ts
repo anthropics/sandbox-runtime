@@ -400,7 +400,32 @@ export function gitFileDenyPaths(
   gitFile: string,
   allowGitConfig: boolean,
 ): string[] {
+  return gitFileDenies(gitFile, allowGitConfig).denyPaths
+}
+
+/**
+ * {@link gitFileDenyPaths} with the whole-directory denies kept apart, as
+ * {@link gitDirDenies} keeps them: a git directory a pointer leads to is a
+ * git directory like any other, so an entry of it that is a symlink needs
+ * the directory holding the link denied whole on the backend whose denies
+ * resolve. Nothing else is enumerated through a pointer — a target's own
+ * `.git/modules` is not walked — so this is what it adds.
+ */
+export function gitFileDenies(
+  gitFile: string,
+  allowGitConfig: boolean,
+): GitDirDenies {
   const denyPaths = [gitFile]
+  const linkedEntryDirs: string[] = []
+  const targetDenies = (
+    target: string,
+    kind: GitDirKind,
+    source: string,
+  ): void => {
+    const denies = gitDirTargetDenies(target, kind, allowGitConfig, source)
+    denyPaths.push(...denies.denyPaths)
+    linkedEntryDirs.push(...denies.linkedEntryDirs)
+  }
   try {
     const pointer = readGitMetadataFile(gitFile)
     let target: string | undefined
@@ -414,18 +439,18 @@ export function gitFileDenyPaths(
           `[Sandbox] ${gitFile} is larger than the ${MAX_GIT_METADATA_BYTES} bytes git accepts for a .git file, so git does not follow it either; denying only the file itself`,
           { level: 'warn' },
         )
-        return denyPaths
+        return { denyPaths, escapingDenyPaths: [], linkedEntryDirs }
       case 'none':
         break
     }
-    if (target === undefined) return denyPaths
+    if (target === undefined) {
+      return { denyPaths, escapingDenyPaths: [], linkedEntryDirs }
+    }
     const gitDirs = gitMetadataTargets(path.dirname(gitFile), target).map(
       gitDir => ({ gitDir, kind: gitDirKind(gitDir) }),
     )
     for (const { gitDir, kind } of gitDirs) {
-      denyPaths.push(
-        ...gitDirTargetDenyPaths(gitDir, kind, allowGitConfig, gitFile),
-      )
+      targetDenies(gitDir, kind, gitFile)
     }
 
     // A linked worktree's git directory holds the path of the main one, whose
@@ -467,14 +492,7 @@ export function gitFileDenyPaths(
       if (commonTarget === undefined) continue
       for (const commonDir of gitMetadataTargets(gitDir, commonTarget)) {
         if (commonDir === gitDir) continue
-        denyPaths.push(
-          ...gitDirTargetDenyPaths(
-            commonDir,
-            gitDirKind(commonDir),
-            allowGitConfig,
-            commonFile,
-          ),
-        )
+        targetDenies(commonDir, gitDirKind(commonDir), commonFile)
       }
     }
   } catch (err) {
@@ -482,7 +500,7 @@ export function gitFileDenyPaths(
     // A dangling pointer names nothing git would read. A pointer this process
     // cannot read is one the host's git cannot read either, so the file
     // itself is the whole deny; an unreadable TARGET is denied whole by
-    // gitDirTargetDenyPaths instead.
+    // gitDirTargetDenies instead.
     if (!isAbsenceError(err)) {
       logForDebugging(
         `[Sandbox] Could not follow ${gitFile}, denying only the file itself: ${err}`,
@@ -490,7 +508,7 @@ export function gitFileDenyPaths(
       )
     }
   }
-  return denyPaths
+  return { denyPaths, escapingDenyPaths: [], linkedEntryDirs }
 }
 
 /**
@@ -745,42 +763,47 @@ function linkTarget(link: string): string | undefined {
 }
 
 /**
- * Deny paths for a directory a `gitdir:` or `commondir` names. An existing
+ * What a directory a `gitdir:` or `commondir` names is denied by. An existing
  * directory that is not a git directory is left alone: file content must not
  * be able to point the deny list at, say, a Rails `config/`. An absent one is
  * still denied, so the sandboxed command cannot create the target and fill it
  * with hooks before the host's git first uses it.
  */
-function gitDirTargetDenyPaths(
+function gitDirTargetDenies(
   target: string,
   kind: GitDirKind,
   allowGitConfig: boolean,
   source: string,
-): string[] {
+): GitDirDenies {
+  const only = (denyPaths: string[]): GitDirDenies => ({
+    denyPaths,
+    escapingDenyPaths: [],
+    linkedEntryDirs: [],
+  })
   switch (kind) {
     case 'git-dir':
     case 'absent':
-      return gitDirDenies(target, allowGitConfig).denyPaths
+      return gitDirDenies(target, allowGitConfig)
     case 'unreadable': {
       const denied = deepestReachableAncestor(target) ?? target
       logForDebugging(
         `[Sandbox] Could not read ${target} named by ${source}, denying ${denied} whole`,
         { level: 'warn' },
       )
-      return [denied]
+      return only([denied])
     }
     case 'unusable':
       logForDebugging(
         `[Sandbox] ${source} names ${target}, which is longer than the filesystem allows: no file can be there for git to read or for a command to create; denying only ${source}`,
         { level: 'warn' },
       )
-      return []
+      return only([])
     case 'other':
       logForDebugging(
         `[Sandbox] ${source} names ${target}, which is not a git directory; denying only ${source}`,
         { level: 'warn' },
       )
-      return []
+      return only([])
   }
 }
 
@@ -936,7 +959,7 @@ function gitMetadataTargets(base: string, target: string): string[] {
  * cannot. A component that cannot be walked — missing, unreadable, or a loop
  * past the hop limit — ends it, since the kernel cannot traverse one either
  * and nothing beyond it can redirect the path; the rest is taken as written
- * and classified by {@link gitDirTargetDenyPaths} like any other target.
+ * and classified by {@link gitDirTargetDenies} like any other target.
  */
 function physicalPath(base: string, target: string): string {
   let current = path.isAbsolute(target) ? path.parse(target).root : base

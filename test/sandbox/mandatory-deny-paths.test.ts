@@ -49,6 +49,7 @@ import {
   gitDirDenyPaths,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
+  gitFileDenies,
   gitFileDenyPaths,
   gitRedirectPlaceholder,
   submoduleGitDirs,
@@ -2511,6 +2512,28 @@ describe('Git metadata deny paths - Unit Tests', () => {
       } finally {
         chmodSync(gitDir, 0o755)
       }
+    },
+  )
+
+  it.if(!isWindows)(
+    'denies whole a git directory a pointer leads to, where an entry of it is a symlink',
+    () => {
+      // A pointer's target is a git directory like any other: the link
+      // inside it is replaceable where nothing holds the directory around
+      // it, and the backend whose denies resolve needs that held.
+      const gitDir = makeGitDir(join(dir, 'gitdir'))
+      const shared = join(dir, 'shared-hooks')
+      mkdirSync(shared, { recursive: true })
+      rmSync(join(gitDir, 'hooks'), { recursive: true })
+      symlinkSync(shared, join(gitDir, 'hooks'))
+      const pointer = makePointer('checkout', '../gitdir')
+
+      const denies = gitFileDenies(pointer, false)
+
+      expect(denies.denyPaths).toContain(shared)
+      expect(denies.linkedEntryDirs).toEqual([gitDir])
+      // The list a backend that needs none of that emits is what it was.
+      expect(gitFileDenyPaths(pointer, false)).toEqual(denies.denyPaths)
     },
   )
 
