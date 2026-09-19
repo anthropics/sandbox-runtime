@@ -31,13 +31,25 @@ import {
 } from './sandbox-utils.js'
 import {
   GitMetadataError,
-  SubmoduleDenyBudget,
   SubmoduleWalkBudgetError,
   gitDirDenyPaths,
+  gitDirTreeDenies,
   gitDirTreeDenyPaths,
   gitFileDenyPaths,
   gitRedirectPlaceholder,
 } from './mandatory-deny-paths.js'
+import type {
+  CollapseLevel,
+  RepositorySubmodules,
+  SubmoduleDenyPlan,
+} from './linux-deny-collapse.js'
+import {
+  NO_COLLAPSE,
+  collapseFurther,
+  collapsedDenyPaths,
+  describeCollapse,
+  repositorySubmodules,
+} from './linux-deny-collapse.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
@@ -639,10 +651,23 @@ function denyScanFailed(
  */
 export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
-  options: { budget?: SubmoduleDenyBudget; deadline?: number } = {},
 ): string[] {
+  return collapsedDenyPaths(
+    cwdMandatoryDenyPlan(allowGitConfig, undefined),
+    NO_COLLAPSE,
+  )
+}
+
+/** {@link linuxGetCwdMandatoryDenyPaths} with the working directory's own
+ *  submodules still separable, which is what a wrap whose profile does not
+ *  fit degrades. */
+function cwdMandatoryDenyPlan(
+  allowGitConfig: boolean,
+  deadline: number | undefined,
+): SubmoduleDenyPlan {
   const cwd = process.cwd()
   const denyPaths = cwdDangerousDenyPaths(cwd)
+  const repositories: RepositorySubmodules[] = []
 
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
@@ -653,27 +678,22 @@ export function linuxGetCwdMandatoryDenyPaths(
     // .git would block `git init`. Anything else means a .git is there and
     // could not be looked at, which is no reason to skip the enumeration —
     // deny it whole instead.
-    if (!isAbsenceErrno(err)) return [...denyPaths, dotGitPath]
+    if (!isAbsenceErrno(err)) {
+      return { denyPaths: [...denyPaths, dotGitPath], repositories }
+    }
   }
   if (dotGitStat?.isDirectory()) {
-    denyPaths.push(
-      ...gitDirTreeDenyPaths(dotGitPath, allowGitConfig, {
-        // A caller with no budget of its own gets a whole one, which is what
-        // makes the violation monitor collapse exactly where the wrap did:
-        // both spend it on this directory first.
-        budget:
-          options.budget ??
-          new SubmoduleDenyBudget(SUBMODULE_DENY_MOUNT_BUDGET),
-        deadline: options.deadline,
-      }),
-    )
+    const denies = gitDirTreeDenies(dotGitPath, allowGitConfig, { deadline })
+    denyPaths.push(...gitDirTreeDenyPaths(denies))
+    const repository = repositorySubmodules(denies)
+    if (repository !== undefined) repositories.push(repository)
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
     denyPaths.push(...gitFileDenyPaths(dotGitPath, allowGitConfig))
   }
 
-  return denyPaths
+  return { denyPaths, repositories }
 }
 
 /**
@@ -693,22 +713,25 @@ function cwdDangerousDenyPaths(cwd: string): string[] {
 /**
  * {@link linuxGetCwdMandatoryDenyPaths} for the violation monitor, which is
  * started once for the session and must not fail over one repository: the
- * same paths, or - where a `.git` pointer or a `commondir` names something
- * that cannot be resolved the way git resolves it - this directory's plain
- * deny paths, with a warning. Every wrap in such a repository still refuses
- * its command outright, so what this decides is which refused write the
- * monitor reports, never what bubblewrap enforces.
+ * same paths, or - where the enumeration refuses - this directory's plain
+ * deny paths, with a warning naming which refusal it was. What this decides
+ * is which refused write the monitor reports, never what bubblewrap
+ * enforces.
+ *
+ * Nothing is collapsed here. A wrap collapses only where its own profile does
+ * not fit, which is measured per command, while this is computed once for the
+ * session: a command that forces a collapse later leaves the monitor naming
+ * the precise path under a submodule git directory the wrap has by then
+ * denied whole. The write is refused either way; the path in the report is
+ * the one inside it.
  */
 export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
   try {
-    // No budget of its own: linuxGetCwdMandatoryDenyPaths makes a whole one,
-    // which is the same one the wrap spends on this directory first.
     return linuxGetCwdMandatoryDenyPaths(allowGitConfig)
   } catch (err) {
     const cwd = process.cwd()
-    const dotGitPath = path.resolve(cwd, '.git')
     logForDebugging(
-      `[Sandbox Linux] Could not resolve ${dotGitPath} the way git does (${errorText(err)}); the violation monitor judges writes against ${cwd}'s plain deny paths instead. Every wrapped command in it is refused until that is fixed.`,
+      `[Sandbox Linux] ${monitorFallbackReason(cwd, err)}; the violation monitor judges writes against ${cwd}'s plain deny paths instead.`,
       { level: 'warn' },
     )
     return [
@@ -716,6 +739,15 @@ export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
       ...monitorDotGitDenyPaths(cwd, allowGitConfig),
     ]
   }
+}
+
+/** Why the monitor is falling back, in the terms of the thing that failed:
+ *  the two refusals differ in what a wrapped command in this directory gets. */
+function monitorFallbackReason(cwd: string, err: unknown): string {
+  if (err instanceof SubmoduleWalkBudgetError) {
+    return `The walk of this repository's submodule git directories ran out of the time it was given (${errorText(err)}), which a wrap retakes from the clock and may well finish`
+  }
+  return `Could not resolve ${path.resolve(cwd, '.git')} the way git does (${errorText(err)}). Every wrapped command in this directory is refused until that is fixed`
 }
 
 /**
@@ -766,32 +798,34 @@ async function linuxGetMandatoryDenyPaths(
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
-): Promise<string[]> {
+): Promise<SubmoduleDenyPlan> {
   const cwd = process.cwd()
-  // The whole budget, scan and any walk of its own this has to make: a walk
-  // started because the scan failed spends what the scan left of it.
-  const deadline =
-    Date.now() + (ripgrepConfig.timeoutMs ?? DEFAULT_RIPGREP_TIMEOUT_MS)
+  const timeoutMs = ripgrepConfig.timeoutMs ?? DEFAULT_RIPGREP_TIMEOUT_MS
+  // What the scan gets, and what the walk of the working directory's own
+  // submodules that runs before it gets. Every walk made AFTER the scan takes
+  // a budget of its own of the same length: the scan has its own timeout, and
+  // a slow but successful one would otherwise refuse a repository whose
+  // submodules a walk given the time would have got through.
+  const deadline = Date.now() + timeoutMs
+  const walkDeadline = (): number => Date.now() + timeoutMs
   // Use provided signal or create a fallback controller
   const fallbackController = new AbortController()
   const signal = abortSignal ?? fallbackController.signal
   const dangerousDirectories = getDangerousDirectories()
 
-  // Spent on the working directory's own submodules first and on the nested
-  // repositories the scan finds with what is left, so that the violation
-  // monitor - which sees only the working directory's half and makes a budget
-  // of its own - collapses exactly where this does.
-  const budget = new SubmoduleDenyBudget(SUBMODULE_DENY_MOUNT_BUDGET)
-  const denyPaths = asProfileRefusal(() =>
-    linuxGetCwdMandatoryDenyPaths(allowGitConfig, { budget, deadline }),
+  // The working directory's own repository is the first the collapse works
+  // back through, so it is the last to lose its precise denies.
+  const plan = asProfileRefusal(() =>
+    cwdMandatoryDenyPlan(allowGitConfig, deadline),
   )
+  const denyPaths = plan.denyPaths
 
   // Each nested repository the scan finds, once: the same walk the cwd's own
   // git directory already had above, which every file listed under it leads
   // back to. Collected rather than denied as they are met, because ripgrep
-  // lists a tree in whatever order its threads finish it in and the budget
-  // above is spent in the order it is asked: two wraps of one tree would
-  // otherwise collapse different repositories.
+  // lists a tree in whatever order its threads finish it in and a collapse
+  // works back through them in the order they were served: two wraps of one
+  // tree would otherwise degrade different repositories.
   const seenGitDirs = new Set<string>([path.resolve(cwd, '.git')])
   const nestedGitDirs: string[] = []
   const denyGitDir = (gitDir: string): void => {
@@ -800,7 +834,7 @@ async function linuxGetMandatoryDenyPaths(
     nestedGitDirs.push(gitDir)
   }
   const walkScan = (collectGitDirs: boolean) =>
-    walkScanDirectories(cwd, maxDepth, deadline, collectGitDirs)
+    walkScanDirectories(cwd, maxDepth, walkDeadline(), collectGitDirs)
 
   // Build iglob args for all patterns in one ripgrep call
   const iglobArgs: string[] = []
@@ -951,20 +985,19 @@ async function linuxGetMandatoryDenyPaths(
   }
 
   for (const gitDir of nestedGitDirs.sort()) {
-    denyPaths.push(
-      ...asProfileRefusal(() =>
-        gitDirTreeDenyPaths(gitDir, allowGitConfig, { budget, deadline }),
-      ),
+    const denies = asProfileRefusal(() =>
+      gitDirTreeDenies(gitDir, allowGitConfig, { deadline: walkDeadline() }),
     )
-  }
-  if (budget.collapsed) {
-    logForDebugging(
-      `[Sandbox Linux] ${cwd} has more submodules than bubblewrap takes arguments for, so ${budget.describeCollapse()}`,
-      { level: 'warn' },
-    )
+    denyPaths.push(...gitDirTreeDenyPaths(denies))
+    const repository = repositorySubmodules(denies)
+    if (repository !== undefined) plan.repositories.push(repository)
   }
 
-  return [...new Set(denyPaths)]
+  // Deduplicated here rather than at emission: a checked-out submodule's
+  // `.git` pointer names the same git directory the walk of `.git/modules`
+  // reached, so the two produce the same deny paths, and a collapse of that
+  // git directory has to leave no copy of them behind.
+  return { ...plan, denyPaths: [...new Set(denyPaths)] }
 }
 
 /**
@@ -1243,22 +1276,15 @@ const BWRAP_MAX_ARGS = 9000
 const BWRAP_WORDS_PER_MOUNT = 3
 
 /**
- * Mounts kept back from the submodule denies for everything else in the
- * profile: the allow binds, the read denies and what they restore, the
- * working directory's own denies, the nested repositories the scan finds and
- * the mount sources pinned at the end. A wrap of a repository with one
- * submodule and the default configuration emits a couple of dozen; the rest
- * is room to spare, because a profile that overruns it is a refused command.
+ * Words the wrap adds AFTER the mounts, which the mounts must leave room for.
+ * Fifteen today — `--dev /dev`, `--unshare-pid`, `--unshare-user` and at most
+ * four capability words, `--bind /proc /proc`, `--` with the shell and `-c`,
+ * and the one word the command itself is — plus the two `--args <fd>` takes
+ * when the mounts move off the command line, and a little over. Everything
+ * BEFORE the mounts is counted as it is, not estimated: the wrap has already
+ * built it when it asks for them.
  */
-const PROFILE_MOUNT_HEADROOM = 200
-
-/**
- * What one wrap's submodule denies may take before they are collapsed. The
- * ceiling is bubblewrap's own, so this is where it is turned into the mount
- * count {@link SubmoduleDenyBudget} is spent in.
- */
-const SUBMODULE_DENY_MOUNT_BUDGET =
-  Math.floor(BWRAP_MAX_ARGS / BWRAP_WORDS_PER_MOUNT) - PROFILE_MOUNT_HEADROOM
+const BWRAP_TRAILING_WORDS = 24
 
 /**
  * The fd the `--args` file is opened on: a single digit, since dash rejects
@@ -1359,10 +1385,11 @@ function errorText(error: unknown): string {
 export type LinuxSandboxProfileErrorCode =
   /**
    * More arguments than bubblewrap parses, on the line or through a file.
-   * What a repository's submodules cost no longer reaches this: past what
-   * the profile has room for they are denied whole instead (see
-   * `SubmoduleDenyBudget`), so something else in the configuration is what
-   * gets a profile here now.
+   * The submodule denies of a repository are degraded until the profile fits
+   * (see src/sandbox/linux-deny-collapse.ts), so what reaches this is a
+   * profile that does not fit with every one of them collapsed: the allow
+   * binds, the read denies and what they restore, the `denyWrite` entries
+   * the caller passed and the ancestor pins under them.
    */
   | 'too_many_arguments'
   /** A mount path holds a NUL byte, which no carrier of arguments can hold. */
@@ -2309,7 +2336,22 @@ function pushReadDenyDirMounts(
 }
 
 /**
- * Generate filesystem bind mount arguments for bwrap
+ * Generate filesystem bind mount arguments for bwrap, inside `wordsAvailable`
+ * of bubblewrap's cap on parsed words.
+ *
+ * The mandatory-deny scan runs once. What it found is then built into mounts,
+ * counted, and — while the count is past what the caller has room for —
+ * degraded a step at a time and built again, each pass measuring the profile
+ * the previous one produced rather than predicting it: the ancestor pins a
+ * deny needs are known only once the deny list is complete, so the mounts a
+ * repository's submodules really cost cannot be worked out before this point
+ * (see src/sandbox/linux-deny-collapse.ts for what a step gives up, and
+ * `LinuxSandboxProfileErrorCode`'s `too_many_arguments` for what is left when
+ * there is nothing to degrade).
+ *
+ * A pass that is built and then degraded may already have written mount
+ * points on the host for the denies it dropped; they are recorded like any
+ * others and go with the same cleanup.
  */
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
@@ -2320,7 +2362,101 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  wordsAvailable: number = Number.POSITIVE_INFINITY,
 ): Promise<string[]> {
+  const plan =
+    writeConfig === undefined
+      ? undefined
+      : await linuxGetMandatoryDenyPaths(
+          ripgrepConfig,
+          mandatoryDenySearchDepth,
+          allowGitConfig,
+          abortSignal,
+        )
+  let level =
+    plan === undefined
+      ? NO_COLLAPSE
+      : collapseFloor(plan, writeConfig?.allowOnly ?? [], wordsAvailable)
+  for (;;) {
+    const args = buildFilesystemArgs(
+      readConfig,
+      writeConfig,
+      maskedFileBinds,
+      maskedFileStoreDir,
+      plan === undefined ? [] : collapsedDenyPaths(plan, level),
+    )
+    if (plan === undefined) return args
+    const degraded =
+      args.length <= wordsAvailable
+        ? undefined
+        : collapseFurther(
+            plan,
+            level,
+            Math.ceil((args.length - wordsAvailable) / BWRAP_WORDS_PER_MOUNT),
+          )
+    if (degraded !== undefined) {
+      level = degraded
+      continue
+    }
+    // Settled: either it fits, or there is nothing left to degrade and
+    // renderBwrapInvocation refuses it with too_many_arguments. One warning
+    // per wrap, naming what the profile it returns gave up.
+    const told = describeCollapse(plan, level)
+    if (told !== '') {
+      logForDebugging(
+        `[Sandbox Linux] The profile for this command did not fit what bubblewrap parses, so ${told}`,
+        { level: 'warn' },
+      )
+    }
+    return args
+  }
+}
+
+/**
+ * Where the passes above start: the level counting alone says the profile
+ * cannot do without, since every deny path inside the write allowlist takes
+ * a mount of its own and the ancestor pins beneath each are more on top.
+ * Without it a repository with ten thousand submodules is built out in full
+ * before anything is degraded, and a wrapped command can make such a tree:
+ * what one costs every command after it is not free to leave at whatever it
+ * comes to.
+ *
+ * It is not the answer, and the measurement above is: what it leaves out can
+ * only mean more collapsing, and the one way it can ask for too much — a
+ * deny path counted here that another deny turns out to cover — is a mount
+ * the profile saves rather than one it needs.
+ */
+function collapseFloor(
+  plan: SubmoduleDenyPlan,
+  allowOnly: string[],
+  wordsAvailable: number,
+): CollapseLevel {
+  const allowedWritePaths = allowOnly.map(p => normalizePathForSandbox(p))
+  const mounts = Math.floor(wordsAvailable / BWRAP_WORDS_PER_MOUNT)
+  let level = NO_COLLAPSE
+  for (;;) {
+    const denies = collapsedDenyPaths(plan, level).filter(denyPath =>
+      allowedWritePaths.some(allowedPath => isAtOrUnder(denyPath, allowedPath)),
+    ).length
+    if (denies <= mounts) return level
+    const degraded = collapseFurther(plan, level, denies - mounts)
+    if (degraded === undefined) return level
+    level = degraded
+  }
+}
+
+/**
+ * The mounts for one deny list: `mandatoryDenyPaths` are the mandatory denies
+ * as {@link generateFilesystemArgs} has settled them, and the caller's own
+ * `denyWithinAllow` entries are added to them here.
+ */
+function buildFilesystemArgs(
+  readConfig: FsReadRestrictionConfig | undefined,
+  writeConfig: FsWriteRestrictionConfig | undefined,
+  maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
+  maskedFileStoreDir: string | undefined,
+  mandatoryDenyPaths: string[],
+): string[] {
   const args: string[] = []
   // fs already imported
 
@@ -2369,10 +2505,10 @@ async function generateFilesystemArgs(
   // other mount sources at the end. Set only where one was actually used.
   let gitRedirectSourceDir: string | undefined
   // Where a mount given `p` lands: `p` fully resolved, every symlink on the
-  // way and not one hop. One resolution per path per wrap, so every predicate
-  // below sees the same answer, and none before the mandatory-deny scan's
-  // await: that scan can run arbitrarily long, and a realpath taken ahead of
-  // it would miss a symlink retargeted meanwhile.
+  // way and not one hop. One resolution per path per pass, so every predicate
+  // below sees the same answer, and none before the mandatory-deny scan the
+  // caller runs first: that scan can run arbitrarily long, and a realpath
+  // taken ahead of it would miss a symlink retargeted meanwhile.
   const canonicalFormCache = new Map<string, string>()
   // Paths whose canonical location could not be LOOKED AT — a settled errno,
   // or a transient one that outlived the retry — so the recorded spelling
@@ -2599,7 +2735,7 @@ async function generateFilesystemArgs(
   // `liftedFile` marks a file deny an allowRead entry naming that very file
   // cancels — the entry mounts nothing in that case either. Lazy and
   // memoised like readDenyEntries(): it resolves symlinks, so it must not run
-  // before the mandatory-deny scan's await.
+  // before the mandatory-deny scan the caller runs first.
   let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
   const readDenyPlan = (): ReadDenyPlanEntry[] =>
     (readDenyPlanMemo ??= readDenyEntries()
@@ -2703,9 +2839,9 @@ async function generateFilesystemArgs(
     // recorded read-only deny dir — commands with no such covering directory
     // skip the extra stat/realpath/readdir syscalls entirely. Lazy
     // evaluation also means the derivation runs from inside the deny loop,
-    // AFTER the (unbounded) mandatory-deny ripgrep await below, keeping the
-    // snapshot as close as possible to the denyRead loop that later acts on
-    // the real filesystem.
+    // AFTER the (unbounded) mandatory-deny ripgrep scan the caller runs
+    // first, keeping the snapshot as close as possible to the denyRead loop
+    // that later acts on the real filesystem.
     type StubSkipVetoInputs =
       | {
           /** The derivation held; the arrays below describe this wrap. */
@@ -2798,12 +2934,6 @@ async function generateFilesystemArgs(
       }
       return stubSkipVetoInputs
     }
-    const mandatoryDenyPaths = await linuxGetMandatoryDenyPaths(
-      ripgrepConfig,
-      mandatoryDenySearchDepth,
-      allowGitConfig,
-      abortSignal,
-    )
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
@@ -3987,6 +4117,9 @@ export async function wrapCommandWithSandboxLinux(
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      // What bubblewrap will parse, less the environment and network words
+      // already built above and the few that come after the mounts.
+      BWRAP_MAX_ARGS - bwrapArgs.length - BWRAP_TRAILING_WORDS,
     )
     const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)

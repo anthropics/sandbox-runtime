@@ -22,6 +22,7 @@ import {
 } from './sandbox-utils.js'
 import {
   gitDirDenyPaths,
+  gitDirTreeDenies,
   gitDirTreeDenyPaths,
   gitFileDenyPaths,
 } from './mandatory-deny-paths.js'
@@ -159,7 +160,9 @@ export function macGetMandatoryDenyEntries(
   }
   if (dotGitStat?.isDirectory()) {
     entries.push(
-      ...gitDirTreeDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
+      ...gitDirTreeDenyPaths(gitDirTreeDenies(dotGit, allowGitConfig)).map(
+        toLiteralPathEntry,
+      ),
     )
   } else {
     // Absent, or a pointer file: the repository's own hooks and config are
