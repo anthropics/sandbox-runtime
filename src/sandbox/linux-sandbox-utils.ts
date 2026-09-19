@@ -32,12 +32,13 @@ import {
 import {
   GitMetadataError,
   SubmoduleWalkBudgetError,
-  gitDirDenyPaths,
+  gitDirDenies,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
   gitFileDenyPaths,
   gitRedirectPlaceholder,
 } from './mandatory-deny-paths.js'
+import type { GitDirTreeDenies } from './mandatory-deny-paths.js'
 import type {
   CollapseLevel,
   RepositorySubmodules,
@@ -684,7 +685,7 @@ function cwdMandatoryDenyPlan(
   }
   if (dotGitStat?.isDirectory()) {
     const denies = gitDirTreeDenies(dotGitPath, allowGitConfig, { deadline })
-    denyPaths.push(...gitDirTreeDenyPaths(denies))
+    denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
     const repository = repositorySubmodules(denies)
     if (repository !== undefined) repositories.push(repository)
   } else if (dotGitStat?.isFile()) {
@@ -694,6 +695,19 @@ function cwdMandatoryDenyPlan(
   }
 
   return { denyPaths, repositories }
+}
+
+/**
+ * {@link gitDirTreeDenyPaths} plus the directories that have to be denied
+ * WHOLE because they hold an entry that is a symlink. Only this backend
+ * carries those: a bind lands on what a deny path resolves to, so the link's
+ * own path keeps nothing and the directory around it is the handle on it,
+ * while a Seatbelt filter matches the path as a rename or an unlink names it
+ * and needs no such thing (see `gitDirDenies` in
+ * src/sandbox/mandatory-deny-paths.ts).
+ */
+function linuxGitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
+  return [...gitDirTreeDenyPaths(denies), ...denies.linkedEntryDirs]
 }
 
 /**
@@ -773,7 +787,8 @@ function monitorDotGitDenyPaths(
   // nothing followed to name.
   if (dotGitStat.isFile()) return [dotGitPath]
   if (dotGitStat.isDirectory()) {
-    return gitDirDenyPaths(dotGitPath, allowGitConfig)
+    const denies = gitDirDenies(dotGitPath, allowGitConfig)
+    return [...denies.denyPaths, ...denies.linkedEntryDirs]
   }
   return []
 }
@@ -988,7 +1003,7 @@ async function linuxGetMandatoryDenyPaths(
     const denies = asProfileRefusal(() =>
       gitDirTreeDenies(gitDir, allowGitConfig, { deadline: walkDeadline() }),
     )
-    denyPaths.push(...gitDirTreeDenyPaths(denies))
+    denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
     const repository = repositorySubmodules(denies)
     if (repository !== undefined) plan.repositories.push(repository)
   }
