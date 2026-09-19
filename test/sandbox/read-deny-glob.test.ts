@@ -294,6 +294,30 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     expect(mounts).toEqual([join(shal, 'proj', 'vault')])
   })
 
+  it('leaves alone a directory that many links lead to', () => {
+    // shared/ is linked from twenty directories and holds nothing the
+    // pattern matches: the only mount is the file that does match, and
+    // nothing stands for a directory the expansion gave up on.
+    const many = caseRoot('many-names')
+    mkdirSync(join(many, 'shared', 'lib'), { recursive: true })
+    writeFileSync(join(many, 'shared', 'lib', 'index.js'), '')
+    writeFileSync(join(many, '.env'), '')
+    for (let i = 0; i < 20; i++) {
+      mkdirSync(join(many, `user${i}`))
+      symlinkSync(join('..', 'shared'), join(many, `user${i}`, 'shared'))
+    }
+
+    const unlistable = new Set<string>()
+    const mounts = expandReadDenyGlobLinux(
+      join(many, '**/.env'),
+      [],
+      unlistable,
+    )
+
+    expect(mounts).toEqual([join(many, '.env')])
+    expect([...unlistable]).toEqual([])
+  })
+
   it('lists every match where it really is when the base is a symlink', () => {
     // alias -> ROOT, sideways: normalizePathForSandbox keeps the link
     // spelling for the pattern, so every match is spelled through it. The
