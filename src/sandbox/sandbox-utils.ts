@@ -1481,9 +1481,13 @@ function globPositions(
 /**
  * The literal directory a glob's walk starts from: the static prefix before
  * the pattern's first glob character, without its last path component when
- * that component is not a directory of its own. '' or '/' means the pattern
- * has no literal directory to start from (a wildcard in its first path
- * component), which {@link walkGlobPattern} refuses to expand.
+ * that component is not a directory of its own. Never carries a trailing
+ * separator, except for the root itself: the walk splits this into path
+ * components, and the empty one a trailing separator leaves at the end is a
+ * name no position can consume, so the automaton would have nowhere to start
+ * and the pattern would match nothing at all. A root, and '' for a pattern
+ * with a wildcard in its first path component, are what
+ * {@link globBaseDirIsRoot} refuses.
  *
  * @param normalizedPattern - a pattern already through
  * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes})
@@ -1491,9 +1495,33 @@ function globPositions(
 export function globPatternBaseDir(normalizedPattern: string): string {
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
   if (!staticPrefix) return ''
-  return staticPrefix.endsWith('/')
+  const baseDir = staticPrefix.endsWith('/')
     ? staticPrefix.slice(0, -1)
     : path.dirname(staticPrefix)
+  // path.dirname keeps the separator of a root it returns: 'C:/' for
+  // 'C:/Users', '//server/share/' for a path on a share.
+  return baseDir.length > 1 && baseDir.endsWith('/')
+    ? baseDir.slice(0, -1)
+    : baseDir
+}
+
+/**
+ * Whether a base from {@link globPatternBaseDir} is one no walk starts from:
+ * nothing at all, or a filesystem root — '/', a drive root ('C:', what is
+ * left of 'C:/' without its separator) or the root of a UNC share
+ * ('//server/share'). A pattern whose only literal directory is a root would
+ * have the walk list a whole filesystem, which is not what the entry meant;
+ * `/**\/*.pem` and `C:/Users*\/id.pem` are the same case. A resolved POSIX
+ * path never begins with two separators, so the last two spellings are
+ * reachable on Windows alone.
+ */
+export function globBaseDirIsRoot(baseDir: string): boolean {
+  return (
+    baseDir === '' ||
+    baseDir === '/' ||
+    /^[A-Za-z]:[/\\]?$/.test(baseDir) ||
+    /^[/\\]{2}[^/\\]+[/\\][^/\\]+[/\\]?$/.test(baseDir)
+  )
 }
 
 /**
@@ -1532,9 +1560,9 @@ export function walkGlobPattern(
 
   const normalizedPattern = toForwardSlashes(normalizePathForSandbox(globPath))
   const baseDir = globPatternBaseDir(normalizedPattern)
-  if (baseDir === '' || baseDir === '/') {
+  if (globBaseDirIsRoot(baseDir)) {
     logForDebugging(
-      `[Sandbox] Glob pattern has no literal directory to start from, skipping: ${globPath}`,
+      `[Sandbox] Glob pattern has no literal directory below a filesystem root to start from, skipping: ${globPath}`,
       { level: 'warn' },
     )
     return walk

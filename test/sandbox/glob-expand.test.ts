@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
 // The namespace of the same module production binds (sandbox-utils.ts does
 // `import * as fs from 'fs'`), so a spy on it is seen by the code under test.
 import * as fs from 'fs'
+import * as path from 'path'
 import {
   chmodSync,
   mkdirSync,
@@ -13,15 +14,17 @@ import {
   symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, win32 } from 'node:path'
 import {
   expandGlobPattern,
   expandTilde,
+  globBaseDirIsRoot,
   globPatternBaseDir,
   globToRegex,
   normalizePathForSandbox,
   walkGlobPattern,
 } from '../../src/sandbox/sandbox-utils.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import {
   containsGlobCharsWin,
   expandWindowsFsPaths,
@@ -441,6 +444,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       const [, first, ...rest] = under.split('/')
       const fromRoot = ['', first!.slice(0, 1) + '*', ...rest].join('/')
       expect(globPatternBaseDir(normalizePathForSandbox(fromRoot))).toBe('/')
+      expect(globBaseDirIsRoot('/')).toBe(true)
 
       const walk = walkGlobPattern(fromRoot)
       expect(walk.matches).toEqual([])
@@ -454,6 +458,68 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+
+  it('takes a drive root and a share root for the roots they are', () => {
+    // The walk splits its base into path components, so a base that carries a
+    // separator ends in an empty name no position can consume: the automaton
+    // starts nowhere and the pattern matches nothing at all, with no error
+    // and no warning. A drive root and the root of a UNC share are the two
+    // bases that come back with one, and are refused like the POSIX root.
+    for (const root of [
+      '',
+      '/',
+      'C:',
+      'C:/',
+      'C:\\',
+      'c:/',
+      '//server/share',
+      '//server/share/',
+      '\\\\server\\share',
+    ]) {
+      expect(globBaseDirIsRoot(root)).toBe(true)
+    }
+    for (const dir of [
+      '/home/u',
+      'C:/Users',
+      'C:/Users/u',
+      '//server/share/keys',
+      '/s',
+    ]) {
+      expect(globBaseDirIsRoot(dir)).toBe(false)
+    }
+  })
+
+  it('leaves no separator on a base a Windows pattern starts from', () => {
+    // path.dirname keeps the separator of a root it returns: 'C:/' for
+    // 'C:/Users', '//server/share/' for a path on a share. Driven through
+    // win32's own semantics, so the case is pinned on every runner and not
+    // only where the suite meets a drive.
+    using dirname = spyOn(path, 'dirname').mockImplementation(win32.dirname)
+    const bases = [
+      'C:/Users*/id.pem',
+      'C:/Program*/keys/**',
+      'C:/*.pem',
+      '//server/share/x*/y',
+      '//server/share/*.pem',
+      'C:/Users/u/certs*/id.pem',
+    ].map(pattern => globPatternBaseDir(pattern))
+    expect(dirname).toHaveBeenCalled()
+
+    for (const base of bases) {
+      expect(base.split('/').at(-1)).not.toBe('')
+    }
+    // Every one of those but the last names a filesystem root, which the
+    // walk and the manager's warnings both refuse.
+    expect(bases.map(globBaseDirIsRoot)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+    ])
+    expect(bases.at(-1)).toBe('C:/Users/u')
   })
 
   it('matches a name that holds a line terminator', () => {
