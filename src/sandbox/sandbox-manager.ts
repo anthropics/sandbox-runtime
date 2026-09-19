@@ -1878,6 +1878,41 @@ async function wrapWithSandbox(
 }
 
 /**
+ * {@link wrapWithSandbox}, plus the cleanup that wrap owes as a handle:
+ * `release()` is this wrap's own {@link cleanupAfterCommand}, and calling it
+ * twice still cleans up once. Two bare `cleanupAfterCommand()` calls for one
+ * wrap would instead consume the deferral of another wrap that is still
+ * running and delete its mount points on the host from under it.
+ *
+ * Callers of {@link wrapWithSandboxArgv} keep pairing their wrap with
+ * `cleanupAfterCommand()` by hand.
+ */
+async function wrapWithSandboxScoped(
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<{ command: string; release: () => void }> {
+  const wrapped = await wrapWithSandbox(
+    command,
+    binShell,
+    customConfig,
+    abortSignal,
+    options,
+  )
+  let released = false
+  return {
+    command: wrapped,
+    release: () => {
+      if (released) return
+      released = true
+      cleanupAfterCommand()
+    },
+  }
+}
+
+/**
  * Wrap `command` for the sandbox and return a spawn descriptor:
  * `{ argv, env }`, suitable for
  * `spawn(argv[0], argv.slice(1), {shell: false, env})`.
@@ -2093,6 +2128,13 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
  * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
  * These persist after bwrap exits. This function removes them.
  *
+ * Call it exactly once per successful wrap, after the command it wrapped has
+ * exited, and never for a wrap that threw — that one has already released
+ * what it held. A second call for the same wrap takes the deferral of a
+ * concurrent wrap with it and deletes the mount points still holding that
+ * sandbox's deny rules; a missing call defers every deletion to process exit.
+ * {@link wrapWithSandboxScoped} pairs the two so neither can happen.
+ *
  * Safe to call on any platform — it's a no-op on macOS.
  * Also called automatically by reset() and on process exit as safety nets.
  */
@@ -2249,8 +2291,8 @@ async function reset(): Promise<void> {
   srtWinSpawn = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
-  // Clean up any leftover bwrap mount points. Force past the
-  // active-sandbox counter — reset() means the session is over.
+  // Clean up any leftover bwrap mount points. Force past every wrap still
+  // outstanding — reset() means the session is over.
   cleanupBwrapMountPoints({ force: true })
 
   // Stop log monitor
@@ -2475,6 +2517,13 @@ export interface ISandboxManager {
     abortSignal?: AbortSignal,
     options?: WrapWithSandboxOptions,
   ): Promise<string>
+  wrapWithSandboxScoped(
+    command: string,
+    binShell?: string,
+    customConfig?: Partial<SandboxRuntimeConfig>,
+    abortSignal?: AbortSignal,
+    options?: WrapWithSandboxOptions,
+  ): Promise<{ command: string; release: () => void }>
   wrapWithSandboxArgv(
     command: string,
     binShell?: string | WindowsBinShell,
@@ -2525,6 +2574,7 @@ export const SandboxManager: ISandboxManager = {
   getLinuxSocksSocketPath,
   waitForNetworkInitialization,
   wrapWithSandbox,
+  wrapWithSandboxScoped,
   wrapWithSandboxArgv,
   cleanupAfterCommand,
   reset,

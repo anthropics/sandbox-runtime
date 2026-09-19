@@ -321,6 +321,10 @@ async function main(): Promise<void> {
           // command bytes off the host shell. On other platforms
           // we keep the existing shell-string path.
           let child
+          // The cleanup this wrap owes, called once however the child ends.
+          // The argv path has no handle of its own, so it owes the plain one.
+          let releaseSandboxWrap = (): void =>
+            SandboxManager.cleanupAfterCommand()
           if (process.platform === 'win32') {
             // env carries the proxy vars the sandboxed child must inherit.
             const { argv, env } =
@@ -331,9 +335,9 @@ async function main(): Promise<void> {
               env,
             })
           } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
-            child = spawn(sandboxedCommand, {
+            const wrap = await SandboxManager.wrapWithSandboxScoped(command)
+            releaseSandboxWrap = wrap.release
+            child = spawn(wrap.command, {
               shell: true,
               stdio: 'inherit',
             })
@@ -344,7 +348,7 @@ async function main(): Promise<void> {
             // Clean up bwrap mount point artifacts before exiting.
             // On Linux, bwrap creates empty files on the host when protecting
             // non-existent deny paths. This removes them.
-            SandboxManager.cleanupAfterCommand()
+            releaseSandboxWrap()
 
             if (signal) {
               if (signal === 'SIGINT' || signal === 'SIGTERM') {
@@ -358,6 +362,9 @@ async function main(): Promise<void> {
           })
 
           child.on('error', error => {
+            // A command that never started still leaves this wrap's mount
+            // points on the host, and 'exit' does not follow 'error'.
+            releaseSandboxWrap()
             console.error(`Failed to execute command: ${error.message}`)
             process.exit(1)
           })

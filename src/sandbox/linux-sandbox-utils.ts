@@ -1525,12 +1525,35 @@ function renderBwrapInvocation(
   return viaArgsFile
 }
 
-// Number of wrapped commands that have been generated but whose cleanup has
-// not yet run. cleanupBwrapMountPoints() defers file deletion while this is
-// positive, because deleting a mount point file on the host while another
-// bwrap instance is still running detaches that instance's bind mount and
-// the deny rule stops applying inside it.
-let activeSandboxCount = 0
+/**
+ * One wrapped command that has been generated but whose cleanup has not run
+ * yet. Only its identity is ever read: releasing the same token twice takes
+ * nothing away the second time, so no cleanup can consume the deferral owed
+ * to a different wrap.
+ */
+export type SandboxWrapToken = symbol
+
+// The wraps still outstanding. cleanupBwrapMountPoints() defers file deletion
+// while any of them is, because deleting a mount point file on the host while
+// another bwrap instance is still running detaches that instance's bind mount
+// and the deny rule stops applying inside it.
+const activeWraps = new Set<SandboxWrapToken>()
+
+/**
+ * Give up one wrap's deferral: `wrap`'s own, or — for a caller that holds no
+ * token — the oldest wrap nobody has released yet. A token already released
+ * takes nothing away, so a second cleanup for one wrap cannot delete the
+ * mount points of another that is still running, and a cleanup with no wrap
+ * outstanding at all releases nothing rather than going negative.
+ */
+function releaseWrap(wrap: SandboxWrapToken | undefined): void {
+  if (wrap !== undefined) {
+    activeWraps.delete(wrap)
+    return
+  }
+  const oldest = activeWraps.values().next()
+  if (!oldest.done) activeWraps.delete(oldest.value)
+}
 
 let exitHandlerRegistered = false
 
@@ -1560,9 +1583,10 @@ function registerExitCleanupHandler(): void {
  * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
  * directory. It is also called automatically on process exit as a safety net.
  *
- * Each call decrements the active-sandbox counter that was incremented by
- * wrapCommandWithSandboxLinux(). File deletion is deferred until the counter
- * reaches zero. Deleting a mount point file on the host while another bwrap
+ * Each call gives up one wrap's deferral: `{ wrap }` releases that wrap's own
+ * token, and a call without one releases the oldest wrap nobody has released
+ * yet — the cleanup every caller owes per wrap. Deletion waits until no wrap
+ * is outstanding. Deleting a mount point file on the host while another bwrap
  * instance is still running detaches that instance's bind mount (the dentry
  * is unhashed, so path lookup no longer finds the mount) and the deny rule
  * stops applying inside that sandbox.
@@ -1573,19 +1597,20 @@ function registerExitCleanupHandler(): void {
  *
  * Also closes the `--args` profiles the wraps of this batch opened.
  */
-export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
+export function cleanupBwrapMountPoints(opts?: {
+  force?: boolean
+  wrap?: SandboxWrapToken
+}): void {
   if (!opts?.force) {
-    if (activeSandboxCount > 0) {
-      activeSandboxCount--
-    }
-    if (activeSandboxCount > 0) {
+    releaseWrap(opts?.wrap)
+    if (activeWraps.size > 0) {
       logForDebugging(
-        `[Sandbox Linux] Deferring mount point cleanup — ${activeSandboxCount} sandbox(es) still active`,
+        `[Sandbox Linux] Deferring mount point cleanup — ${activeWraps.size} sandbox(es) still active`,
       )
       return
     }
   } else {
-    activeSandboxCount = 0
+    activeWraps.clear()
   }
 
   for (const [mountPoint, written] of bwrapMountPoints) {
@@ -3796,11 +3821,12 @@ export async function wrapCommandWithSandboxLinux(
 
   // Mark this sandbox invocation as active. cleanupBwrapMountPoints() will
   // defer file deletion until this (and every other concurrent) invocation
-  // has been cleaned up. The matching decrement happens in
+  // has been released. The matching release happens in
   // cleanupBwrapMountPoints(), which the caller must invoke after the
-  // spawned command exits. If wrapping fails below, the catch block
-  // decrements so the count does not leak.
-  activeSandboxCount++
+  // spawned command exits. If wrapping fails below, the catch block releases
+  // this token, so the failure never consumes another wrap's deferral.
+  const wrapToken: SandboxWrapToken = Symbol('sandbox-wrap')
+  activeWraps.add(wrapToken)
 
   // One encoded key for both carriers below (SRT_ENCODED_CMD for the seccomp
   // observer, the proxy username for network denies), so a violation seen
@@ -4092,10 +4118,9 @@ export async function wrapCommandWithSandboxLinux(
     // The caller does not clean up after a wrap that threw, and this one may
     // already have written mount points on the host — the files git reads
     // back are written before bubblewrap is ever reached. No sandbox of this
-    // wrap is running, so the cleanup that undoes the activeSandboxCount
-    // increment takes them away with it; it still defers to any other wrap
-    // that is still up.
-    cleanupBwrapMountPoints()
+    // wrap is running, so releasing its own token takes them away with it; it
+    // still defers to any other wrap that is still up.
+    cleanupBwrapMountPoints({ wrap: wrapToken })
     throw error
   }
 }

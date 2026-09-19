@@ -3,7 +3,7 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
@@ -1016,4 +1016,58 @@ describe('allowWrite glob suffix handling', () => {
       }
     },
   )
+})
+
+describe.if(isLinux)('wrapWithSandboxScoped (Linux)', () => {
+  // The mount points a wrap registers are deleted once no wrap is
+  // outstanding, so a cleanup that runs twice for one wrap would take a
+  // concurrent wrap's deferral with it and delete the mount points still
+  // holding that sandbox's deny rules. release() is that wrap's own cleanup
+  // and counts once however often it is called.
+  it('cleans up once per wrap however often release is called', async () => {
+    const dir = join(tmpdir(), `srt-test-scoped-${Date.now()}`)
+    mkdirSync(dir, { recursive: true })
+    const first = join(dir, 'first-deny')
+    const second = join(dir, 'second-deny')
+
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [dir], denyWrite: [] },
+      })
+
+      const wrapFor = (denyWrite: string) =>
+        SandboxManager.wrapWithSandboxScoped('true', undefined, {
+          filesystem: {
+            denyRead: [],
+            allowWrite: [dir],
+            denyWrite: [denyWrite],
+          },
+        })
+      const firstWrap = await wrapFor(first)
+      const secondWrap = await wrapFor(second)
+      expect(firstWrap.command).toContain(`--ro-bind /dev/null ${first}`)
+      expect(secondWrap.command).toContain(`--ro-bind /dev/null ${second}`)
+
+      // Stand in for the sandboxes: bubblewrap creates each mount point as an
+      // empty file on the host when it runs.
+      writeFileSync(first, '')
+      writeFileSync(second, '')
+
+      secondWrap.release()
+      secondWrap.release()
+      secondWrap.release()
+      // The first wrap is still outstanding, so nothing is deleted yet.
+      expect(existsSync(first)).toBe(true)
+      expect(existsSync(second)).toBe(true)
+
+      firstWrap.release()
+      expect(existsSync(first)).toBe(false)
+      expect(existsSync(second)).toBe(false)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })

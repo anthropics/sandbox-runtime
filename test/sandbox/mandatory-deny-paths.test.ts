@@ -257,9 +257,10 @@ describe.if(isSupportedPlatform)(
     })
 
     afterEach(() => {
-      // Reset the active-sandbox counter and scrub any leftover mount points so
+      // Release every outstanding wrap and scrub any leftover mount points so
       // each test starts clean. Tests that don't explicitly call
-      // cleanupBwrapMountPoints() would otherwise leak the counter.
+      // cleanupBwrapMountPoints() would otherwise leave their wrap holding a
+      // deferral.
       cleanupBwrapMountPoints({ force: true })
     })
 
