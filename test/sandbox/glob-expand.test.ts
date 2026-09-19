@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
 // The namespace of the same module production binds (sandbox-utils.ts does
 // `import * as fs from 'fs'`), so a spy on it is seen by the code under test.
 import * as fs from 'fs'
+import * as path from 'path'
 import {
   chmodSync,
   mkdirSync,
@@ -13,15 +14,17 @@ import {
   symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, win32 } from 'node:path'
 import {
   expandGlobPattern,
   expandTilde,
+  globBaseDirIsRoot,
   globPatternBaseDir,
   globToRegex,
   normalizePathForSandbox,
   walkGlobPattern,
 } from '../../src/sandbox/sandbox-utils.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import {
   containsGlobCharsWin,
   expandWindowsFsPaths,
@@ -441,6 +444,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       const [, first, ...rest] = under.split('/')
       const fromRoot = ['', first!.slice(0, 1) + '*', ...rest].join('/')
       expect(globPatternBaseDir(normalizePathForSandbox(fromRoot))).toBe('/')
+      expect(globBaseDirIsRoot('/')).toBe(true)
 
       const walk = walkGlobPattern(fromRoot)
       expect(walk.matches).toEqual([])
@@ -454,6 +458,68 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+
+  it('takes a drive root and a share root for the roots they are', () => {
+    // The walk splits its base into path components, so a base that carries a
+    // separator ends in an empty name no position can consume: the automaton
+    // starts nowhere and the pattern matches nothing at all, with no error
+    // and no warning. A drive root and the root of a UNC share are the two
+    // bases that come back with one, and are refused like the POSIX root.
+    for (const root of [
+      '',
+      '/',
+      'C:',
+      'C:/',
+      'C:\\',
+      'c:/',
+      '//server/share',
+      '//server/share/',
+      '\\\\server\\share',
+    ]) {
+      expect(globBaseDirIsRoot(root)).toBe(true)
+    }
+    for (const dir of [
+      '/home/u',
+      'C:/Users',
+      'C:/Users/u',
+      '//server/share/keys',
+      '/s',
+    ]) {
+      expect(globBaseDirIsRoot(dir)).toBe(false)
+    }
+  })
+
+  it('leaves no separator on a base a Windows pattern starts from', () => {
+    // path.dirname keeps the separator of a root it returns: 'C:/' for
+    // 'C:/Users', '//server/share/' for a path on a share. Driven through
+    // win32's own semantics, so the case is pinned on every runner and not
+    // only where the suite meets a drive.
+    using dirname = spyOn(path, 'dirname').mockImplementation(win32.dirname)
+    const bases = [
+      'C:/Users*/id.pem',
+      'C:/Program*/keys/**',
+      'C:/*.pem',
+      '//server/share/x*/y',
+      '//server/share/*.pem',
+      'C:/Users/u/certs*/id.pem',
+    ].map(pattern => globPatternBaseDir(pattern))
+    expect(dirname).toHaveBeenCalled()
+
+    for (const base of bases) {
+      expect(base.split('/').at(-1)).not.toBe('')
+    }
+    // Every one of those but the last names a filesystem root, which the
+    // walk and the manager's warnings both refuse.
+    expect(bases.map(globBaseDirIsRoot)).toEqual([
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+    ])
+    expect(bases.at(-1)).toBe('C:/Users/u')
   })
 
   it('matches a name that holds a line terminator', () => {
@@ -513,7 +579,11 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-long-')))
       let deep = join(root, 'deep')
       while (deep.length < 4090) {
-        deep = join(deep, 'd'.repeat(Math.min(200, 4090 - deep.length - 1)))
+        // At least one character, whatever the length of the temporary
+        // directory: a zero-length name would join to the same path and the
+        // loop would never end.
+        const room = 4090 - deep.length - 1
+        deep = join(deep, 'd'.repeat(Math.max(1, Math.min(200, room))))
       }
       const viaLink = join(root, 'base', 's', 'key.pem')
       try {
@@ -672,13 +742,26 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       writeFileSync(join(root, 'outside', 'certsx.pem'), 'KEY')
       symlinkSync(join('..', 'outside'), join(root, 'proj', 'lnk'))
 
-      const walk = walkGlobPattern(join(root, 'proj', '*/cert[s/]x.pem'), {
-        followSymlinkedDirectories: true,
-      })
+      const found = (pattern: string): string[] => {
+        const walk = walkGlobPattern(join(root, 'proj', pattern), {
+          followSymlinkedDirectories: true,
+        })
+        return walk.matches.map(m => walk.realOf.get(m) ?? m).sort()
+      }
 
-      expect(walk.matches.map(m => walk.realOf.get(m) ?? m).sort()).toEqual([
+      expect(found('*/cert[s/]x.pem')).toEqual([
         join(root, 'outside', 'cert', 'x.pem'),
         join(root, 'outside', 'certsx.pem'),
+      ])
+      // A range holds the separator as readily as a set does: `+` is 0x2b,
+      // `/` 0x2f and `9` 0x39, so `[+-9]` is both readings too.
+      expect(found('*/cert[+-9]x.pem')).toEqual([
+        join(root, 'outside', 'cert', 'x.pem'),
+      ])
+      writeFileSync(join(root, 'outside', 'cert9x.pem'), 'KEY')
+      expect(found('*/cert[+-9]x.pem')).toEqual([
+        join(root, 'outside', 'cert', 'x.pem'),
+        join(root, 'outside', 'cert9x.pem'),
       ])
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -714,6 +797,156 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+
+  it('denies whole what a pattern it cannot split reaches through a link', () => {
+    // `?[*].pem` cannot be read one name at a time, so no directory is
+    // listed through a link. What the pattern matches beneath one that leads
+    // out of the tree is then found under no name at all: the directory it
+    // leads to is denied whole rather than dropped. A link within the tree
+    // loses nothing, since every directory there is listed under its own
+    // name, and denying it whole would hide a tree that was walked.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unsplit-')))
+    try {
+      mkdirSync(join(root, 'proj', 'inner'), { recursive: true })
+      mkdirSync(join(root, 'outside'))
+      writeFileSync(join(root, 'proj', 'inner', 'a].pem'), 'KEY')
+      writeFileSync(join(root, 'outside', 'b].pem'), 'KEY')
+      symlinkSync(join(root, 'outside'), join(root, 'proj', 'away'))
+      symlinkSync(join(root, 'proj', 'inner'), join(root, 'proj', 'near'))
+
+      const walk = walkGlobPattern(join(root, 'proj', '**/?[*].pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.matches).toEqual([join(root, 'proj', 'inner', 'a].pem')])
+      expect(walk.unlisted).toEqual([join(root, 'proj', 'away')])
+      expect(walk.realOf.get(join(root, 'proj', 'away'))).toBe(
+        join(root, 'outside'),
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not let one name that fails to list answer for the others', () => {
+    // A listing can fail for a reason that has nothing to do with the
+    // directory: too many open files at that moment, or a real path too long
+    // to name, which the next name for it may be short enough to reach.
+    // Letting that failure answer for every later name drops every match
+    // beneath the directory — the same fail-open as reading it as absent.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-route-')))
+    try {
+      mkdirSync(join(root, 'pkg', 'certs'), { recursive: true })
+      writeFileSync(join(root, 'pkg', 'certs', 'id.pem'), 'KEY')
+      symlinkSync(join('pkg', 'certs'), join(root, 'lnk'))
+
+      const certs = join(root, 'pkg', 'certs')
+      const readdirSync = fs.readdirSync
+      const attempts: string[] = []
+      let failuresLeft = 1
+      using spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        const at = String(args[0])
+        if (at === certs) {
+          attempts.push(at)
+          if (failuresLeft > 0) {
+            failuresLeft--
+            throw Object.assign(new Error('EMFILE: too many open files'), {
+              code: 'EMFILE',
+            })
+          }
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+
+      const retried = walkGlobPattern(join(root, '**/*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+      // Two names lead to the directory; the second one lists it.
+      expect(spy).toHaveBeenCalled()
+      expect(attempts).toHaveLength(2)
+      expect(retried.matches.map(m => retried.realOf.get(m) ?? m)).toEqual([
+        join(root, 'pkg', 'certs', 'id.pem'),
+      ])
+      expect(retried.unlisted).toHaveLength(1)
+
+      // A directory that fails under every name is tried under each of them
+      // and named once, whatever the number of names.
+      attempts.length = 0
+      failuresLeft = Number.POSITIVE_INFINITY
+      const gone = walkGlobPattern(join(root, '**/*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+      expect(attempts).toHaveLength(2)
+      expect(gone.matches).toEqual([])
+      expect(gone.unlisted).toHaveLength(1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('reports the error of the path it looked at, not of a second name', () => {
+    // The walk lists the real path and falls back on a shorter name only
+    // when the real one is too long to be a name at all. Every other errno
+    // belongs to the directory: answered from a second name, an unreadable
+    // directory reads as absent and the deny it holds vanishes.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-errno-')))
+    try {
+      const real = join(root, 'deep', 'a', 'b', 'certs')
+      mkdirSync(real, { recursive: true })
+      writeFileSync(join(real, 'id.pem'), 'KEY')
+      symlinkSync(real, join(root, 's'))
+
+      const readdirSync = fs.readdirSync
+      const attempts: string[] = []
+      using spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        const at = String(args[0])
+        attempts.push(at)
+        if (at === real) {
+          throw Object.assign(new Error('EACCES: permission denied'), {
+            code: 'EACCES',
+          })
+        }
+        if (at === join(root, 's')) {
+          throw Object.assign(new Error('ENOENT: no such file or directory'), {
+            code: 'ENOENT',
+          })
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+
+      const walk = walkGlobPattern(join(root, 's', '*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(spy).toHaveBeenCalled()
+      expect(attempts).toEqual([real])
+      expect(walk.unlisted).toEqual([join(root, 's')])
+      expect(walk.realOf.get(join(root, 's'))).toBe(real)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('says so when a pattern is too long to read a component at a time', async () => {
+    // The automaton is built by recursion, once per path component, so a
+    // pattern with thousands of them would overflow the stack. Read as a
+    // pattern that simply does not split, it would quietly stop descending
+    // symlinked directories: a deny that covers less than it says. The
+    // reading is the same; that it was taken is now said out loud.
+    const pattern = '/tmp/' + 'a/'.repeat(4000) + '*.pem'
+    const { result, warnings } = await withCapturedWarnings(async () =>
+      walkGlobPattern(pattern, { followSymlinkedDirectories: true }),
+    )
+
+    expect(result.matches).toEqual([])
+    expect(
+      warnings.some(w => w.includes('pieces') && w.includes('real paths only')),
+    ).toBe(true)
   })
 })
 
