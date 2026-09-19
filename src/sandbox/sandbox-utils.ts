@@ -1118,6 +1118,7 @@ const REGEX_METACHARACTER = /[.^$+{}()|\\]/
  * - ** matches any characters including / (e.g., src/**\/*.ts matches all .ts files in src/)
  * - ? matches any single character except / (e.g., file?.txt matches file1.txt)
  * - [abc] matches any character in the set (e.g., file[0-9].txt matches file3.txt)
+ * - [!abc] and [^abc] match any character outside the set, never a `/`
  *
  * The pattern is read once, left to right, and the regex is emitted as it
  * goes, so nothing of the pattern is ever parked under a marker and no text
@@ -1125,7 +1126,7 @@ const REGEX_METACHARACTER = /[.^$+{}()|\\]/
  * name and nothing else.
  *
  * A `[` that opens no set is a literal character: one that nothing closes,
- * and one whose set would hold no members (`[]`). `]` is never a
+ * and one whose set would hold no members (`[]`, `[!]`). `]` is never a
  * member of a set, because no spelling of it inside one reads the same to a
  * JavaScript regular expression and to the regex engine of a macOS sandbox
  * profile, which this same string is also compiled into.
@@ -1173,9 +1174,14 @@ export function globToRegex(globPattern: string): string {
         i++
         continue
       }
-      regex += '['
+      regex += set.negated ? '[^/' : '['
       inSet = true
       i = set.members
+      // A `-` first among the members would read as a range with that `/`.
+      if (set.negated && globPattern[i] === '-') {
+        regex += '\\-'
+        i++
+      }
       continue
     }
     regex += REGEX_METACHARACTER.test(char) ? `\\${char}` : char
@@ -1185,16 +1191,21 @@ export function globToRegex(globPattern: string): string {
 }
 
 /**
- * The set the `[` at `open` opens: where its members start. Undefined when
- * the `[` opens no set — nothing closes it, or the first thing after it is
- * the `]`, which closes the set here rather than standing for itself.
+ * The set the `[` at `open` opens: where its members start and whether a
+ * leading `!` or `^` negates it. Undefined when the `[` opens no set —
+ * nothing closes it, or the first thing after it is the `]`, which closes
+ * the set here rather than standing for itself.
  */
 function setOpenedAt(
   pattern: string,
   open: number,
-): { members: number } | undefined {
-  const members = open + 1
-  return pattern.indexOf(']', members) > members ? { members } : undefined
+): { members: number; negated: boolean } | undefined {
+  const lead = pattern[open + 1]
+  const negated = lead === '!' || lead === '^'
+  const members = open + (negated ? 2 : 1)
+  return pattern.indexOf(']', members) > members
+    ? { members, negated }
+    : undefined
 }
 
 /**

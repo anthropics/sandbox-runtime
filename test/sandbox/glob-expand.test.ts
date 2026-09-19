@@ -953,9 +953,10 @@ function setContains(set: string, char: string): boolean {
 /**
  * The documented glob syntax matched directly, by backtracking rather than
  * by compiling a regex: `*` and `?` stop at a separator, `**` crosses them,
- * `**\/` is zero or more directories, `[…]` is one character from the set.
- * Shares nothing with {@link globToRegex}, so the property below is two
- * implementations checking each other.
+ * `**\/` is zero or more directories, `[…]` is one character from the set
+ * and `[!…]` / `[^…]` one outside it, never a separator. Shares nothing with
+ * {@link globToRegex}, so the property below is two implementations checking
+ * each other.
  */
 function referenceGlobMatch(pattern: string, pathText: string): boolean {
   if (pattern === '') return pathText === ''
@@ -991,11 +992,16 @@ function referenceGlobMatch(pattern: string, pathText: string): boolean {
     )
   }
   if (head === '[') {
-    const close = pattern.indexOf(']')
-    if (close > 1) {
+    const negated = pattern[1] === '!' || pattern[1] === '^'
+    const members = negated ? 2 : 1
+    const close = pattern.indexOf(']', members)
+    if (close > members) {
+      const char = pathText[0]
+      const holds =
+        char !== undefined && setContains(pattern.slice(members, close), char)
       return (
-        pathText.length > 0 &&
-        setContains(pattern.slice(1, close), pathText[0]!) &&
+        char !== undefined &&
+        (negated ? !holds && char !== '/' : holds) &&
         referenceGlobMatch(pattern.slice(close + 1), pathText.slice(1))
       )
     }
@@ -1053,19 +1059,35 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(letters).test('/tmp/test/1bc.txt')).toBe(false)
   })
 
-  it('never negates a bracket set: ^ and ! are members of it', () => {
+  it('negates a bracket set written with ^ or !', () => {
     // Both spellings used for negation elsewhere (regex `^`, gitignore `!`)
-    // land in the set as ordinary characters, so such a pattern matches
-    // fewer names than its author meant, not more.
+    // negate the set rather than joining it as ordinary characters.
     const caret = globToRegex('/tmp/test/file[^0-9].txt')
-    expect(new RegExp(caret).test('/tmp/test/file^.txt')).toBe(true)
-    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(true)
-    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(true)
+    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(false)
 
     const bang = globToRegex('/tmp/test/file[!0-9].txt')
-    expect(new RegExp(bang).test('/tmp/test/file!.txt')).toBe(true)
-    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(true)
-    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(true)
+    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(false)
+
+    // The character that negates the set is not also a member of it.
+    expect(new RegExp(globToRegex('/tmp/[^^]')).test('/tmp/^')).toBe(false)
+    expect(new RegExp(globToRegex('/tmp/[!!]')).test('/tmp/!')).toBe(false)
+  })
+
+  it('keeps a negated bracket set within one path component', () => {
+    // A negated set is one character of a name, so it never stands for the
+    // separator between two the way `**` does.
+    const regex = globToRegex('/tmp/test[!x]file')
+    expect(new RegExp(regex).test('/tmp/test-file')).toBe(true)
+    expect(new RegExp(regex).test('/tmp/test/file')).toBe(false)
+
+    // A `-` first among the members is that character, not a range with the
+    // separator the set already excludes.
+    const dash = globToRegex('/tmp/test/[!-a]')
+    expect(new RegExp(dash).test('/tmp/test/b')).toBe(true)
+    expect(new RegExp(dash).test('/tmp/test/-')).toBe(false)
+    expect(new RegExp(dash).test('/tmp/test/a')).toBe(false)
   })
 
   it('treats a bracket that opens no set as a literal character', () => {
@@ -1103,9 +1125,9 @@ describe('globToRegex (shared)', () => {
   it('agrees with a reference matcher over generated patterns and paths', () => {
     // Segments are drawn from the documented syntax only; the corners the
     // cases above pin (an unclosed bracket, a stray `]`, a set with no
-    // members, a negated set) are left out so a disagreement here means the
-    // documented syntax itself diverged. The names include the spellings
-    // `**` was once parked under, which are now names like any other.
+    // members) are left out so a disagreement here means the documented
+    // syntax itself diverged. The names include the spellings `**` was once
+    // parked under, which are now names like any other.
     const segment = fc.constantFrom(
       'a',
       'bc',
@@ -1117,6 +1139,9 @@ describe('globToRegex (shared)', () => {
       '[ab]',
       '[0-9]',
       '[a-c]c',
+      '[!ab]',
+      '[^0-9]',
+      '[!a-c]c',
       '__GLOBSTAR__',
       '__GLOBSTAR_SLASH__b',
       '**',
