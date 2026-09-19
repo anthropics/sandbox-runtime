@@ -1,6 +1,8 @@
 import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
+import * as fs from 'fs'
 import * as path from 'path'
+import * as tty from 'tty'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
@@ -70,7 +72,20 @@ export interface MacOSSandboxParams {
    */
   degradeToDenyPaths?: readonly string[]
   ignoreViolations?: IgnoreViolationsConfig | undefined
+  /**
+   * Pseudo-terminal access. Unset and `false` grant `file-ioctl` on the
+   * terminals in `inheritedTtys`, which is what a TUI needs to enter raw mode.
+   * `true` grants every pty, for programs that allocate their own (tmux,
+   * script, node-pty).
+   */
   allowPty?: boolean
+  /**
+   * Terminals to grant `file-ioctl` on when `allowPty` is not `true`. The
+   * caller supplies them because it picks the child's stdio after this
+   * function returns; see {@link resolveInheritedStdioTtys}. Entries that are
+   * not pty slave devices are ignored.
+   */
+  inheritedTtys?: string[]
   allowGitConfig?: boolean
   /**
    * Directories to emit as `safe.directory` via `GIT_CONFIG_*` env
@@ -929,6 +944,80 @@ function generateWriteRules(
 }
 
 /**
+ * The probes {@link resolveInheritedStdioTtys} needs, injectable so a unit
+ * test can drive every path without a real pty on fd 0/1/2.
+ */
+export interface TtyProbes {
+  isatty: (fd: number) => boolean
+  /** Names under `/dev` that begin with `ttys`. */
+  listPtySlaves: () => string[]
+  rdevOfFd: (fd: number) => number
+  rdevOfPath: (devicePath: string) => number
+}
+
+const REAL_TTY_PROBES: TtyProbes = {
+  isatty: fd => tty.isatty(fd),
+  listPtySlaves: () =>
+    fs.readdirSync('/dev').filter(name => name.startsWith('ttys')),
+  rdevOfFd: fd => fs.fstatSync(fd).rdev,
+  rdevOfPath: devicePath => fs.statSync(devicePath).rdev,
+}
+
+/**
+ * Resolve every distinct pty this process holds on stdin, stdout or stderr,
+ * in that order. All three, because stdio can span two terminals and a
+ * program that reads keys from one while sizing the other needs both.
+ *
+ * Seatbelt matches ioctl rules on the device path, and the `/dev/tty` alias
+ * does not cover the pty slave (`/dev/ttysNNN`). Node has no `ttyname(3)` and
+ * `/dev/fd/N` does not resolve to the device on macOS, so each descriptor's
+ * device number is matched against the `/dev/ttys*` entries.
+ */
+export function resolveInheritedStdioTtys(
+  probes: TtyProbes = REAL_TTY_PROBES,
+): string[] {
+  const ttyFds = [0, 1, 2].filter(fd => probes.isatty(fd))
+  if (ttyFds.length === 0) return []
+
+  let slaves: string[]
+  try {
+    slaves = probes.listPtySlaves()
+  } catch (err) {
+    // Log it: a silent failure leaves no rule and a TUI stuck out of raw mode
+    logForDebugging(`[Sandbox macOS] cannot scan /dev for pty slaves: ${err}`)
+    return []
+  }
+
+  const found: string[] = []
+  for (const fd of ttyFds) {
+    let rdev: number
+    try {
+      rdev = probes.rdevOfFd(fd)
+    } catch (err) {
+      logForDebugging(`[Sandbox macOS] cannot fstat tty fd ${fd}: ${err}`)
+      continue
+    }
+    const match = slaves.find(name => {
+      try {
+        return probes.rdevOfPath(`/dev/${name}`) === rdev
+      } catch {
+        return false // racing device teardown; keep scanning
+      }
+    })
+    if (match === undefined) {
+      logForDebugging(
+        `[Sandbox macOS] fd ${fd} is a tty but no /dev/ttys* matches its ` +
+          `device number ${rdev}; it will get no ioctl rule`,
+      )
+      continue
+    }
+    const devicePath = `/dev/${match}`
+    if (!found.includes(devicePath)) found.push(devicePath)
+  }
+  return found
+}
+
+/**
  * Generate complete sandbox profile
  */
 function generateSandboxProfile({
@@ -943,6 +1032,7 @@ function generateSandboxProfile({
   allowLocalBinding,
   allowMachLookup,
   allowPty,
+  inheritedTtys,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
   allowAppleEvents = false,
@@ -960,6 +1050,7 @@ function generateSandboxProfile({
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
   allowPty?: boolean
+  inheritedTtys?: string[]
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
@@ -1266,6 +1357,10 @@ function generateSandboxProfile({
   }
 
   // Pseudo-terminal (pty) support
+  // Only pty slave paths may reach the (literal ...) rule below
+  const ttyGrants = (inheritedTtys ?? []).filter(device =>
+    /^\/dev\/ttys[0-9]+$/.test(device),
+  )
   if (allowPty) {
     profile.push('')
     profile.push('; Pseudo-terminal (pty) support')
@@ -1278,6 +1373,14 @@ function generateSandboxProfile({
     profile.push('  (literal "/dev/ptmx")')
     profile.push('  (regex #"^/dev/ttys")')
     profile.push(')')
+  } else if (ttyGrants.length > 0) {
+    // Without an ioctl rule on the inherited pty, TIOCSETA returns EPERM and no
+    // TUI can enter raw mode (#419, #391). ioctl is all raw mode needs.
+    profile.push('')
+    profile.push('; Pseudo-terminal (pty) support: inherited terminals only')
+    for (const device of ttyGrants) {
+      profile.push(`(allow file-ioctl (literal ${escapePath(device)}))`)
+    }
   }
 
   return profile.join('\n')
@@ -1316,6 +1419,7 @@ export function wrapCommandWithSandboxMacOS(
     maskedFileBinds,
     degradeToDenyPaths,
     allowPty,
+    inheritedTtys,
     allowGitConfig = false,
     gitSafeDirectories,
     enableWeakerNetworkIsolation = false,
@@ -1384,6 +1488,7 @@ export function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     allowMachLookup,
     allowPty,
+    inheritedTtys,
     allowGitConfig,
     enableWeakerNetworkIsolation,
     allowAppleEvents,
