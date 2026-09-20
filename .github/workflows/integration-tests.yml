@@ -218,6 +218,36 @@ jobs:
         if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
 
+      # The check release.yml runs before publishing, on one leg: the suite
+      # imports src/, so only an installed tarball says whether the package
+      # root a consumer imports loads at all. dist/ is the build step above.
+      - name: Import the packed package
+        if: matrix.os == 'linux' && matrix.arch == 'x86-64'
+        run: |
+          npm pack
+          PKG="$PWD/$(ls *.tgz)"
+          DIR="$RUNNER_TEMP/pkg-import"
+          mkdir -p "$DIR"
+          cd "$DIR"
+          npm init -y > /dev/null
+          npm install "$PKG"
+          cat > import-check.mjs <<'EOF'
+          import * as srt from '@anthropic-ai/sandbox-runtime'
+          const required = [
+            'SandboxManager',
+            'SandboxViolationStore',
+            'SandboxRuntimeConfigSchema',
+            'getDefaultWritePaths',
+          ]
+          const missing = required.filter(name => srt[name] === undefined)
+          if (missing.length > 0) {
+            console.error(`missing exports: ${missing.join(', ')}`)
+            process.exit(1)
+          }
+          console.log(`package root imported, ${Object.keys(srt).length} named exports`)
+          EOF
+          node import-check.mjs
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
