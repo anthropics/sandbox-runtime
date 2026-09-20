@@ -2392,6 +2392,150 @@ describe('macGetMandatoryDenyEntries - Unit Tests', () => {
     }
   })
 
+  it.if(!isWindows)(
+    "names a pointer's git directory by the landing as well as through the link",
+    () => {
+      // The link spelling holds the link's own name and nothing under it,
+      // because Seatbelt compares its filters against the path an operation
+      // resolved to; the landing holds every write that reaches the git
+      // directory, by either spelling. Both, or half the chain is open.
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mac-git-landing-')))
+      const saved = process.cwd()
+      try {
+        const checkout = join(dir, 'checkout')
+        mkdirSync(checkout, { recursive: true })
+        const gitDir = join(dir, 'real', 'gd')
+        mkdirSync(join(gitDir, 'hooks'), { recursive: true })
+        writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+        const hop = join(checkout, 'linkdir')
+        symlinkSync(join(dir, 'real'), hop)
+        writeFileSync(join(checkout, '.git'), 'gitdir: linkdir/gd\n')
+        process.chdir(checkout)
+
+        const paths = macGetMandatoryDenyEntries(false)
+          .filter(entry => !entry.glob)
+          .map(entry => entry.path)
+
+        // Through the link: the hop's own name, and the git directory's
+        // files as the pointer spells them.
+        expect(paths).toContain(hop)
+        expect(paths).toContain(join(hop, 'gd', 'hooks'))
+        expect(paths).toContain(join(hop, 'gd', 'config'))
+        // And the same files where the kernel puts them, absent ones
+        // included: `commondir` and `config.worktree` are not there, and
+        // creating one is what the deny blocks.
+        expect(paths).toContain(join(gitDir, 'hooks'))
+        expect(paths).toContain(join(gitDir, 'config'))
+        expect(paths).toContain(join(gitDir, 'commondir'))
+        expect(paths).toContain(join(gitDir, 'config.worktree'))
+        // One entry per spelling and no more.
+        expect(paths.length).toBe(new Set(paths).size)
+      } finally {
+        process.chdir(saved)
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.if(!isWindows)(
+    'names a submodule reached through a symlinked modules entry both ways',
+    () => {
+      // A symlinked ENTRY of `.git/modules` puts the whole submodule git
+      // directory behind a link, so every file denied inside it is spelled
+      // through that link. The entry's own name is what an unlink of it
+      // uses; where it leads is what a hook written into that submodule
+      // matches.
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mac-git-module-')))
+      const saved = process.cwd()
+      try {
+        const gitDir = join(dir, '.git')
+        mkdirSync(join(gitDir, 'modules'), { recursive: true })
+        writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+        const submodule = join(dir, 'elsewhere')
+        mkdirSync(join(submodule, 'hooks'), { recursive: true })
+        writeFileSync(join(submodule, 'HEAD'), 'ref: refs/heads/main')
+        const entry = join(gitDir, 'modules', 'lib')
+        symlinkSync(submodule, entry)
+        process.chdir(dir)
+
+        const paths = macGetMandatoryDenyEntries(false)
+          .filter(pathEntry => !pathEntry.glob)
+          .map(pathEntry => pathEntry.path)
+
+        expect(paths).toContain(join(entry, 'hooks'))
+        expect(paths).toContain(join(entry, 'config'))
+        expect(paths).toContain(join(submodule, 'hooks'))
+        expect(paths).toContain(join(submodule, 'config'))
+        expect(paths).toContain(join(submodule, 'config.worktree'))
+        expect(paths.length).toBe(new Set(paths).size)
+      } finally {
+        process.chdir(saved)
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.if(!isWindows)(
+    'names the hops of a symlinked entry once, landing and all',
+    () => {
+      // The chain of a symlinked entry is walked from a resolved directory,
+      // so each hop and the landing are already the paths the kernel reaches:
+      // nothing here has a second spelling, and nothing is named twice.
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mac-git-entry-')))
+      const saved = process.cwd()
+      try {
+        const gitDir = join(dir, '.git')
+        mkdirSync(gitDir, { recursive: true })
+        writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+        const landing = join(dir, '.githooks')
+        mkdirSync(landing, { recursive: true })
+        const hop = join(dir, 'hooks-link')
+        symlinkSync('.githooks', hop)
+        symlinkSync('../hooks-link', join(gitDir, 'hooks'))
+        process.chdir(dir)
+
+        const paths = macGetMandatoryDenyEntries(false)
+          .filter(pathEntry => !pathEntry.glob)
+          .map(pathEntry => pathEntry.path)
+
+        expect(paths).toContain(join(gitDir, 'hooks'))
+        expect(paths).toContain(hop)
+        expect(paths).toContain(landing)
+        expect(paths.length).toBe(new Set(paths).size)
+      } finally {
+        process.chdir(saved)
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.if(!isWindows)(
+    'leaves an ordinary repository named exactly once per path',
+    () => {
+      // Nothing on the way is a symlink, so the walk lands where the path was
+      // written and the second spelling is the first: no repository without
+      // one pays a single extra rule for this.
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mac-git-plain-')))
+      const saved = process.cwd()
+      try {
+        const gitDir = join(dir, '.git')
+        mkdirSync(join(gitDir, 'hooks'), { recursive: true })
+        writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+        process.chdir(dir)
+
+        const paths = macGetMandatoryDenyEntries(false)
+          .filter(entry => !entry.glob)
+          .map(entry => entry.path)
+
+        expect(paths).toContain(join(gitDir, 'hooks'))
+        expect(paths.length).toBe(new Set(paths).size)
+      } finally {
+        process.chdir(saved)
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
   it('defaults to blocking .git/config when no argument provided', () => {
     const patterns = macGetMandatoryDenyEntries().map(e => e.path)
 
