@@ -733,7 +733,13 @@ async function initialize(
           // them, so the monitor must not judge by them either.
           ...(config.filesystem.disabled
             ? []
-            : linuxGetMonitorCwdDenyPaths(getAllowGitConfig())),
+            : linuxGetMonitorCwdDenyPaths(
+                getAllowGitConfig(),
+                // The write roots decide which directory holding a symlink
+                // between a git entry and its target a wrap can bind: the
+                // monitor has to judge by the same ones.
+                monitoredWrites.allowOnly.map(p => normalizePathForSandbox(p)),
+              )),
         ],
         ignoreViolations: config.ignoreViolations,
         resolveCommandText,

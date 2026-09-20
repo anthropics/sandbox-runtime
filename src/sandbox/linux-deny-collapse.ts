@@ -1,5 +1,9 @@
 import * as fs from 'fs'
-import type { GitDirDenies, GitDirTreeDenies } from './mandatory-deny-paths.js'
+import type {
+  GitDirDenies,
+  GitDirTreeDenies,
+  GitEntryChainHop,
+} from './mandatory-deny-paths.js'
 import { isAtOrUnder } from './sandbox-utils.js'
 
 /**
@@ -36,6 +40,17 @@ export interface SubmoduleDenyPlan {
    * absent one is never denied and never costs anything.
    */
   repositories: RepositorySubmodules[]
+  /**
+   * Every symlink BETWEEN a git directory entry and what it leads to that the
+   * wrap found, in the order it found them. What this backend takes from one
+   * is the directory holding it, the only thing a bind can hold a link by;
+   * the link's own path is a deny path for the backend that holds a link by
+   * its name and is dropped here. Which holders a wrap can actually bind
+   * depends on where the write roots are, so it is decided there rather than
+   * here and nothing collapses them: see `chainHopDenies` and
+   * `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts.
+   */
+  chainHops: GitEntryChainHop[]
 }
 
 /**
@@ -207,31 +222,60 @@ function stepBack(
   return Math.max(taken, 1)
 }
 
-/** One line naming what `level` degraded, for the wrap's warning. */
+/**
+ * One line naming what `level` degraded, for the wrap's warning.
+ *
+ * What a whole-directory deny of the plan's own already covers is left out of
+ * it: a submodule under a `.git/modules` denied whole for an entry that is a
+ * symlink is read-only whole before anything is degraded, so its precise
+ * denies were never what held it and a collapse of it takes nothing away.
+ * Saying otherwise names a cost the profile did not pay here.
+ */
 export function describeCollapse(
   plan: SubmoduleDenyPlan,
   level: CollapseLevel,
 ): string {
   const order = collapsibleGitDirs(plan)
+  const alreadyWhole = coveredByWholeDirDeny(plan)
   const parts: string[] = []
   if (level.wholeGitDirs > 0) {
-    const collapsed = order.slice(order.length - level.wholeGitDirs)
-    const repositories = [
-      ...new Set(collapsed.map(entry => entry.modulesDir)),
-    ].join(', ')
-    parts.push(
-      `${level.wholeGitDirs} of the ${order.length} submodule git directories under ${repositories} are denied whole rather than by path, so git writes inside those submodules fail read-only`,
-    )
+    const collapsed = order
+      .slice(order.length - level.wholeGitDirs)
+      .filter(entry => !alreadyWhole(entry.gitDir))
+    if (collapsed.length > 0) {
+      const repositories = [
+        ...new Set(collapsed.map(entry => entry.modulesDir)),
+      ].join(', ')
+      parts.push(
+        `${collapsed.length} of the ${order.length} submodule git directories under ${repositories} are denied whole rather than by path, so git writes inside those submodules fail read-only`,
+      )
+    }
   }
   if (level.wholeModulesDirs > 0) {
     const collapsed = plan.repositories
       .slice(plan.repositories.length - level.wholeModulesDirs)
       .map(repository => repository.modulesDir)
-    parts.push(
-      `${collapsed.join(', ')} ${collapsed.length === 1 ? 'is' : 'are'} denied whole, taking every submodule under ${collapsed.length === 1 ? 'it' : 'them'}`,
-    )
+      .filter(modulesDir => !alreadyWhole(modulesDir))
+    if (collapsed.length > 0) {
+      parts.push(
+        `${collapsed.join(', ')} ${collapsed.length === 1 ? 'is' : 'are'} denied whole, taking every submodule under ${collapsed.length === 1 ? 'it' : 'them'}`,
+      )
+    }
   }
   return parts.join('; ')
+}
+
+/** Whether a path is read-only whole in this plan whatever it degrades: a
+ *  directory the walk could not see through, or one holding an entry that is
+ *  a symlink, covers everything really under it. */
+function coveredByWholeDirDeny(
+  plan: SubmoduleDenyPlan,
+): (candidate: string) => boolean {
+  const covers = plan.repositories
+    .flatMap(repository => repository.wholeDirDenies)
+    .map(underDirectory)
+  if (covers.length === 0) return () => false
+  return candidate => covers.some(under => under(candidate))
 }
 
 /** Every submodule git directory the plan may degrade, in the order a

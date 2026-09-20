@@ -104,6 +104,65 @@ export class SubmoduleWalkBudgetError extends Error {
   }
 }
 
+/**
+ * One symlink a chain walk went through, and the directory holding it.
+ *
+ * A bind cannot be put on a link — mounting at its own path resolves it — so
+ * the directory around it is the only handle the backend whose denies resolve
+ * has on it, while the backend that matches the name an unlink or a rename
+ * uses wants the link's own path. Both are here, so each backend can take
+ * what it holds a link by.
+ */
+interface ChainHop {
+  /** The link's own path, as the walk reached it. */
+  link: string
+  /** The directory the link sits in. */
+  holder: string
+}
+
+/** Where a chain walk landed, and what it went through; see
+ *  {@link resolveChain}. */
+interface ResolvedChain {
+  landing: string
+  /** In the order the walk met them: the first is the path the caller asked
+   *  about, the rest are what lies between it and the landing. */
+  hops: ChainHop[]
+}
+
+/**
+ * A symlink BETWEEN a git directory entry and what it leads to: a second hop
+ * of the entry's own link, or a symlinked directory component on the way.
+ *
+ * Neither end of the chain covers one. The entry's deny holds the entry and
+ * the landing's deny holds the landing, while a hop in between sits in an
+ * ordinary directory of the work tree: a command that retargets it, or
+ * renames it aside and puts its own directory there, moves what the chain
+ * resolves to without touching either end, and the host's git follows the
+ * chain afterwards.
+ */
+export interface GitEntryChainHop {
+  /** The git directory entry whose chain goes through it. */
+  entry: string
+  /**
+   * The link's own path, and a deny path of its own: that is what holds it
+   * on the backend which matches the name a rename or an unlink uses. The
+   * backend whose denies RESOLVE gets nothing from it — a bind at a link
+   * lands on what the link leads to, which for a symlinked directory
+   * component is a whole directory nothing asked to deny — and drops it: see
+   * `linuxGitDirTreeDenyPaths` in src/sandbox/linux-sandbox-utils.ts.
+   */
+  link: string
+  /**
+   * The directory holding the link: what that backend has to deny WHOLE to
+   * hold it, as it denies the entry's own git directory whole. Undefined
+   * where such a deny already covers the link — a hop inside the git
+   * directory, or inside the directory holding a `.git/modules` entry. Where
+   * it is a write root or the working directory there is nothing to bind
+   * over it; the Linux backend's own note says what happens then.
+   */
+  holder: string | undefined
+}
+
 /** Directories found under a `.git/modules`, and what could not be read. */
 export interface SubmoduleScan {
   /**
@@ -139,6 +198,13 @@ export interface SubmoduleScan {
    * and without duplicates.
    */
   linkedEntryDirs: string[]
+  /**
+   * The hops BETWEEN an entry the walk followed through a symlink and what
+   * it lands on. One inside the directory holding that entry names no holder
+   * of its own: `linkedEntryDirs` denies that whole already. See
+   * {@link GitEntryChainHop}.
+   */
+  chainHops: GitEntryChainHop[]
 }
 
 /**
@@ -158,6 +224,10 @@ export interface GitDirTreeDenies {
   unreadableDirs: string[]
   /** Directories holding a symlinked entry; see {@link SubmoduleScan}. */
   linkedEntryDirs: string[]
+  /** Every hop between a symlinked entry of this tree and what it leads to,
+   *  the git directory's own entries, the walked `.git/modules` entries and
+   *  the submodules' own alike. See {@link GitEntryChainHop}. */
+  chainHops: GitEntryChainHop[]
 }
 
 /**
@@ -247,6 +317,15 @@ export interface GitDirDenies {
    * an entry of a `.git/modules`.
    */
   linkedEntryDirs: string[]
+  /**
+   * The hops between a symlinked entry of this git directory and what it
+   * leads to. Each hop's own path is in `denyPaths` already, and in
+   * `escapingDenyPaths` where no bind of the git directory covers it; what
+   * is here besides is the directory holding each, which is what the backend
+   * whose denies resolve has to deny whole to hold the link. See
+   * {@link GitEntryChainHop}.
+   */
+  chainHops: GitEntryChainHop[]
 }
 
 /**
@@ -268,6 +347,14 @@ export interface GitDirDenies {
  * anything else that writes the index or an object fail read-only until the
  * link is gone.
  *
+ * A chain with more than one link in it is more than two things, and the hops
+ * BETWEEN the entry and the landing are neither of them: the entry's deny
+ * holds the entry, the landing's deny holds the landing, and a hop in an
+ * ordinary directory of the work tree moves what the chain resolves to
+ * without touching either end. Each hop's own path is therefore a deny path
+ * as well, and `chainHops` carries the directory holding each for the backend
+ * that needs one — see {@link GitEntryChainHop}.
+ *
  * An ordinary git directory costs one lstat per entry and is denied by exactly
  * what it always was.
  */
@@ -277,7 +364,36 @@ export function gitDirDenies(
 ): GitDirDenies {
   const denyPaths: string[] = []
   const escapingDenyPaths: string[] = []
+  const chainHops: GitEntryChainHop[] = []
   let denyWhole = false
+  // Resolved on the first symlinked entry and not before: an ordinary git
+  // directory must not pay a realpath for a question it never asks.
+  let realGitDir: string | undefined
+  const insideGitDir = (candidate: string): boolean => {
+    realGitDir ??= realPathOrSelf(gitDir)
+    return isAtOrUnder(candidate, realGitDir)
+  }
+  // The first hop IS the entry: its own path is a deny path already, and the
+  // directory holding it is this git directory, denied whole below. The rest
+  // lie between the two ends, and neither end holds them.
+  const holdChain = (entryPath: string, hops: ChainHop[]): void => {
+    for (const hop of hops.slice(1)) {
+      // A deny path like any other, for the backend that holds a link by its
+      // own name; the one that resolves its denies drops it again.
+      denyPaths.push(hop.link)
+      if (insideGitDir(hop.link)) {
+        chainHops.push({ entry: entryPath, link: hop.link, holder: undefined })
+        continue
+      }
+      // No bind of the git directory covers it, so a degrade must not drop it.
+      escapingDenyPaths.push(hop.link)
+      chainHops.push({
+        entry: entryPath,
+        link: hop.link,
+        holder: insideGitDir(hop.holder) ? undefined : hop.holder,
+      })
+    }
+  }
   for (const entryPath of gitDirDenyPaths(gitDir, allowGitConfig)) {
     const entry = gitDirEntry(entryPath)
     switch (entry.kind) {
@@ -290,9 +406,10 @@ export function gitDirDenies(
         // same place, while on macOS a filter matches where the write lands
         // and the target is the only one of the two that names it.
         denyPaths.push(entryPath, entry.target)
-        if (!isAtOrUnder(entry.target, realPathOrSelf(gitDir))) {
+        if (!insideGitDir(entry.target)) {
           escapingDenyPaths.push(entry.target)
         }
+        holdChain(entryPath, entry.hops)
         break
       case 'unreachable':
         // A loop, or a name no file can occupy: there is nothing behind it to
@@ -303,10 +420,13 @@ export function gitDirDenies(
       case 'unknown':
         // There and not classifiable. Fail closed both ways: the deny the
         // entry has anyway, kept through a degrade in case it is a link, and
-        // the whole-directory deny one would need.
+        // the whole-directory deny one would need. The hops behind it that
+        // COULD be read are held as a resolved chain's are; what lies past
+        // the one that could not is what the whole deny stands in for.
         denyWhole = true
         denyPaths.push(entryPath)
         escapingDenyPaths.push(entryPath)
+        holdChain(entryPath, entry.hops)
         break
     }
   }
@@ -314,6 +434,7 @@ export function gitDirDenies(
     denyPaths,
     escapingDenyPaths,
     linkedEntryDirs: denyWhole ? [gitDir] : [],
+    chainHops,
   }
 }
 
@@ -321,12 +442,13 @@ export function gitDirDenies(
 type GitDirEntry =
   /** Not a symlink, or nothing at all: the deny it has always had. */
   | { kind: 'plain' }
-  /** A symlink, resolved or dangling, that leads to `target`. */
-  | { kind: 'link'; target: string }
+  /** A symlink, resolved or dangling, leading to `target` through `hops`. */
+  | { kind: 'link'; target: string; hops: ChainHop[] }
   /** A symlink that reaches nothing: a loop, or a name no file can occupy. */
   | { kind: 'unreachable' }
-  /** There, and what it is could not be worked out. */
-  | { kind: 'unknown' }
+  /** There, and what it is could not be worked out; `hops` is as much of the
+   *  chain as the walk read before it stopped. */
+  | { kind: 'unknown'; hops: ChainHop[] }
 
 function gitDirEntry(entryPath: string): GitDirEntry {
   let stats: fs.Stats
@@ -343,9 +465,17 @@ function gitDirEntry(entryPath: string): GitDirEntry {
       `[Sandbox] Could not tell whether ${entryPath} is a symlink (${err}); denying the git directory holding it whole, and the entry as it stands`,
       { level: 'warn' },
     )
-    return { kind: 'unknown' }
+    return { kind: 'unknown', hops: [] }
   }
   if (!stats.isSymbolicLink()) return { kind: 'plain' }
+  // Walked from the directory holding the entry, itself resolved first, so
+  // that a symlink ABOVE the git directory - a /tmp, a home reached through a
+  // link - counts as where this repository lives and not as a hop of this
+  // chain. The landing is what walking the whole path from the root gives.
+  const chain = resolveChain(
+    physicalPath(path.parse(entryPath).root, path.dirname(entryPath)),
+    path.basename(entryPath),
+  )
   try {
     fs.statSync(entryPath)
   } catch (err) {
@@ -355,19 +485,16 @@ function gitDirEntry(entryPath: string): GitDirEntry {
     }
     if (!isAbsenceErrno(err)) {
       logForDebugging(
-        `[Sandbox] Could not follow ${entryPath} (${err}); denying the git directory holding it whole, and the entry as it stands`,
+        `[Sandbox] Could not follow ${entryPath} (${err}); denying the git directory holding it whole, the entry as it stands, and the hops of its chain that could be read`,
         { level: 'warn' },
       )
-      return { kind: 'unknown' }
+      return { kind: 'unknown', hops: chain.hops }
     }
     // Dangling, which is no reason to pass over it: nothing is there yet and
     // a command can put a hooks directory there for the host's git to find,
     // so the deny goes where the link lands and blocks creating it.
   }
-  return {
-    kind: 'link',
-    target: physicalPath(path.parse(entryPath).root, entryPath),
-  }
+  return { kind: 'link', target: chain.landing, hops: chain.hops }
 }
 
 /**
@@ -417,6 +544,7 @@ export function gitFileDenies(
 ): GitDirDenies {
   const denyPaths = [gitFile]
   const linkedEntryDirs: string[] = []
+  const chainHops: GitEntryChainHop[] = []
   const targetDenies = (
     target: string,
     kind: GitDirKind,
@@ -425,6 +553,7 @@ export function gitFileDenies(
     const denies = gitDirTargetDenies(target, kind, allowGitConfig, source)
     denyPaths.push(...denies.denyPaths)
     linkedEntryDirs.push(...denies.linkedEntryDirs)
+    chainHops.push(...denies.chainHops)
   }
   try {
     const pointer = readGitMetadataFile(gitFile)
@@ -439,12 +568,12 @@ export function gitFileDenies(
           `[Sandbox] ${gitFile} is larger than the ${MAX_GIT_METADATA_BYTES} bytes git accepts for a .git file, so git does not follow it either; denying only the file itself`,
           { level: 'warn' },
         )
-        return { denyPaths, escapingDenyPaths: [], linkedEntryDirs }
+        return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
       case 'none':
         break
     }
     if (target === undefined) {
-      return { denyPaths, escapingDenyPaths: [], linkedEntryDirs }
+      return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
     }
     const gitDirs = gitMetadataTargets(path.dirname(gitFile), target).map(
       gitDir => ({ gitDir, kind: gitDirKind(gitDir) }),
@@ -508,7 +637,7 @@ export function gitFileDenies(
       )
     }
   }
-  return { denyPaths, escapingDenyPaths: [], linkedEntryDirs }
+  return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
 }
 
 /**
@@ -545,17 +674,33 @@ export function gitDirTreeDenies(
       ...modules.linkedEntryDirs,
       ...submodules.flatMap(submodule => submodule.linkedEntryDirs),
     ],
+    chainHops: [
+      ...own.chainHops,
+      ...modules.chainHops,
+      ...submodules.flatMap(submodule => submodule.chainHops),
+    ],
   }
 }
 
 /** {@link gitDirTreeDenies} as one list, which is what a backend with no
  *  ceiling to stay under emits. */
 export function gitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
-  return [
+  const denyPaths = [
     ...denies.ownDenyPaths,
     ...denies.unreadableDirs,
     ...denies.submodules.flatMap(submodule => submodule.denyPaths),
   ]
+  // A hop of an entry under `.git/modules` has no other list to sit in, while
+  // a hop of a git directory's OWN entry is already in that directory's deny
+  // paths: named once either way, since a duplicate literal buys a backend
+  // nothing.
+  const named = new Set(denyPaths)
+  for (const hop of denies.chainHops) {
+    if (named.has(hop.link)) continue
+    named.add(hop.link)
+    denyPaths.push(hop.link)
+  }
+  return denyPaths
 }
 
 /**
@@ -583,6 +728,7 @@ export function submoduleGitDirs(
     gitDirs: [],
     unreadableDirs: new Set(),
     linkedEntryDirs: new Set(),
+    chainHops: [],
   }
   // Where the walk still has to look, and where it has already been. A
   // directory listed to see whether it is a git directory carries its entries
@@ -643,6 +789,7 @@ export function submoduleGitDirs(
     gitDirs: walk.gitDirs.sort(),
     unreadableDirs: [...walk.unreadableDirs].sort(),
     linkedEntryDirs: [...walk.linkedEntryDirs].sort(),
+    chainHops: walk.chainHops,
   }
 }
 
@@ -654,6 +801,7 @@ interface SubmoduleWalk {
   gitDirs: string[]
   unreadableDirs: Set<string>
   linkedEntryDirs: Set<string>
+  chainHops: GitEntryChainHop[]
 }
 
 /** What one entry of a walked directory is worth looking into. */
@@ -697,6 +845,9 @@ function listDirectory(
  * A command can plant such a link and leave every submodule beside it
  * read-only for the commands after it, which is the answer this makes to a
  * command that plants git directories too.
+ *
+ * A chain that goes through further links is held hop by hop as a git
+ * directory's own entry is: see {@link GitEntryChainHop}.
  */
 function walkEntry(
   entry: fs.Dirent,
@@ -705,19 +856,35 @@ function walkEntry(
 ): WalkEntry {
   if (entry.isDirectory()) return { kind: 'directory' }
   if (!entry.isSymbolicLink()) return { kind: 'skip' }
+  const holder = path.dirname(entryPath)
+  const chain = resolveChain(
+    physicalPath(path.parse(entryPath).root, holder),
+    entry.name,
+  )
+  // The first hop is the entry, whose holder joins `linkedEntryDirs` below;
+  // the rest lie between it and what it lands on, and that deny reaches
+  // neither them nor the directories they sit in.
+  const holdChain = (): void => {
+    for (const hop of chain.hops.slice(1)) {
+      walk.chainHops.push({
+        entry: entryPath,
+        link: hop.link,
+        holder: isAtOrUnder(hop.holder, holder) ? undefined : hop.holder,
+      })
+    }
+  }
   try {
     if (!fs.statSync(entryPath).isDirectory()) return { kind: 'skip' }
-    walk.linkedEntryDirs.add(path.dirname(entryPath))
+    walk.linkedEntryDirs.add(holder)
+    holdChain()
     return { kind: 'directory' }
   } catch (err) {
     if (isAbsenceError(err)) {
       // Dangling. Nothing is there to walk, and a command can create it: what
       // the link lands on is denied as a git directory that is not there yet.
-      walk.linkedEntryDirs.add(path.dirname(entryPath))
-      return {
-        kind: 'dangling',
-        landing: physicalPath(path.parse(entryPath).root, entryPath),
-      }
+      walk.linkedEntryDirs.add(holder)
+      holdChain()
+      return { kind: 'dangling', landing: chain.landing }
     }
     if (isUnusablePathError(err)) return { kind: 'skip' }
     if ((err as NodeJS.ErrnoException).code === 'ELOOP') {
@@ -743,7 +910,8 @@ function walkEntry(
     const denied =
       deepestReachableAncestor(linkTarget(entryPath) ?? entryPath) ?? entryPath
     walk.unreadableDirs.add(denied)
-    walk.linkedEntryDirs.add(path.dirname(entryPath))
+    walk.linkedEntryDirs.add(holder)
+    holdChain()
     logForDebugging(
       `[Sandbox] Could not follow ${entryPath}, denying ${denied} whole: ${err}`,
       { level: 'warn' },
@@ -779,6 +947,7 @@ function gitDirTargetDenies(
     denyPaths,
     escapingDenyPaths: [],
     linkedEntryDirs: [],
+    chainHops: [],
   })
   switch (kind) {
     case 'git-dir':
@@ -953,18 +1122,23 @@ function gitMetadataTargets(base: string, target: string): string[] {
 
 /**
  * Where the kernel lands walking `target` from `base`, symlinks followed as
- * it meets them. `path.resolve` folds `..` lexically, and `fs.realpathSync`
- * folds its argument the same way before resolving it, so neither answers
- * this; a walk also reaches a tail that does not exist yet, which realpath
- * cannot. A component that cannot be walked — missing, unreadable, or a loop
- * past the hop limit — ends it, since the kernel cannot traverse one either
- * and nothing beyond it can redirect the path; the rest is taken as written
- * and classified by {@link gitDirTargetDenies} like any other target.
+ * it meets them, and every symlink it went through on the way.
+ * `path.resolve` folds `..` lexically, and `fs.realpathSync` folds its
+ * argument the same way before resolving it, so neither answers this; a walk
+ * also reaches a tail that does not exist yet, which realpath cannot. A
+ * component that cannot be walked — missing, unreadable, or a loop past the
+ * hop limit — ends it, since the kernel cannot traverse one either and
+ * nothing beyond it can redirect the path; the rest is taken as written and
+ * classified by {@link gitDirTargetDenies} like any other target.
+ *
+ * The hops are what a caller protecting the landing still has to hold: each
+ * one is a name a command able to write the directory around it can point
+ * somewhere else, which moves the landing without touching either end.
  */
-function physicalPath(base: string, target: string): string {
+function resolveChain(base: string, target: string): ResolvedChain {
   let current = path.isAbsolute(target) ? path.parse(target).root : base
   let pending = target.split('/')
-  let hops = 0
+  const hops: ChainHop[] = []
   while (pending.length > 0) {
     const name = pending.shift()
     if (name === undefined || name === '' || name === '.') continue
@@ -977,23 +1151,33 @@ function physicalPath(base: string, target: string): string {
     try {
       if (fs.lstatSync(next).isSymbolicLink()) link = fs.readlinkSync(next)
     } catch {
-      return path.join(next, ...pending)
+      return { landing: path.join(next, ...pending), hops }
     }
     if (link === undefined) {
       current = next
       continue
     }
+    // `current` is where the walk really is, so the hop is recorded under
+    // the name the kernel reached it by rather than the one it was spelled
+    // from: that is the name an unlink or a rename of the link uses.
+    hops.push({ link: next, holder: current })
     // A loop is where the walk stops, and what it hands back: the rest of
     // the path folded past it would name a directory this cannot vouch for,
     // while the link itself reads as unreadable and is denied whole.
-    hops += 1
-    if (hops > MAX_SYMLINK_RESOLUTION_DEPTH) return next
+    if (hops.length > MAX_SYMLINK_RESOLUTION_DEPTH) {
+      return { landing: next, hops }
+    }
     // A link's own target is walked in its place, from the directory holding
     // it unless it is absolute.
     if (path.isAbsolute(link)) current = path.parse(link).root
     pending = [...link.split('/'), ...pending]
   }
-  return current
+  return { landing: current, hops }
+}
+
+/** {@link resolveChain} for a caller that wants only where the walk landed. */
+function physicalPath(base: string, target: string): string {
+  return resolveChain(base, target).landing
 }
 
 /**

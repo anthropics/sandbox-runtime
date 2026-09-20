@@ -38,7 +38,10 @@ import {
   gitFileDenies,
   gitRedirectPlaceholder,
 } from './mandatory-deny-paths.js'
-import type { GitDirTreeDenies } from './mandatory-deny-paths.js'
+import type {
+  GitDirTreeDenies,
+  GitEntryChainHop,
+} from './mandatory-deny-paths.js'
 import type {
   CollapseLevel,
   RepositorySubmodules,
@@ -652,11 +655,13 @@ function denyScanFailed(
  */
 export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
+  allowWritePaths: readonly string[] = [],
 ): string[] {
-  return collapsedDenyPaths(
-    cwdMandatoryDenyPlan(allowGitConfig, undefined),
-    NO_COLLAPSE,
-  )
+  const plan = cwdMandatoryDenyPlan(allowGitConfig, undefined)
+  return [
+    ...collapsedDenyPaths(plan, NO_COLLAPSE),
+    ...chainHopDenies(plan.chainHops, allowWritePaths).held,
+  ]
 }
 
 /** {@link linuxGetCwdMandatoryDenyPaths} with the working directory's own
@@ -669,6 +674,7 @@ function cwdMandatoryDenyPlan(
   const cwd = process.cwd()
   const denyPaths = cwdDangerousDenyPaths(cwd)
   const repositories: RepositorySubmodules[] = []
+  const chainHops: GitEntryChainHop[] = []
 
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
@@ -680,35 +686,134 @@ function cwdMandatoryDenyPlan(
     // could not be looked at, which is no reason to skip the enumeration —
     // deny it whole instead.
     if (!isAbsenceErrno(err)) {
-      return { denyPaths: [...denyPaths, dotGitPath], repositories }
+      return { denyPaths: [...denyPaths, dotGitPath], repositories, chainHops }
     }
   }
   if (dotGitStat?.isDirectory()) {
     const denies = gitDirTreeDenies(dotGitPath, allowGitConfig, { deadline })
     denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
+    chainHops.push(...denies.chainHops)
     const repository = repositorySubmodules(denies)
     if (repository !== undefined) repositories.push(repository)
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
     const pointer = gitFileDenies(dotGitPath, allowGitConfig)
-    denyPaths.push(...pointer.denyPaths, ...pointer.linkedEntryDirs)
+    denyPaths.push(
+      ...withoutChainHopLinks(pointer.denyPaths, pointer.chainHops),
+      ...pointer.linkedEntryDirs,
+    )
+    chainHops.push(...pointer.chainHops)
   }
 
-  return { denyPaths, repositories }
+  return { denyPaths, repositories, chainHops }
 }
 
 /**
  * {@link gitDirTreeDenyPaths} plus the directories that have to be denied
- * WHOLE because they hold an entry that is a symlink. Only this backend
- * carries those: a bind lands on what a deny path resolves to, so the link's
- * own path keeps nothing and the directory around it is the handle on it,
- * while a Seatbelt filter matches the path as a rename or an unlink names it
- * and needs no such thing (see `gitDirDenies` in
- * src/sandbox/mandatory-deny-paths.ts).
+ * WHOLE because they hold an entry that is a symlink, and minus the deny
+ * paths that name a symlink itself. Both follow from the same thing: a bind
+ * lands on what a deny path resolves to, so the link's own path keeps
+ * nothing and the directory around it is the handle on it, while a Seatbelt
+ * filter matches the path as a rename or an unlink names it and needs
+ * neither (see `gitDirDenies` in src/sandbox/mandatory-deny-paths.ts).
  */
 function linuxGitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
-  return [...gitDirTreeDenyPaths(denies), ...denies.linkedEntryDirs]
+  return [
+    ...withoutChainHopLinks(gitDirTreeDenyPaths(denies), denies.chainHops),
+    ...denies.linkedEntryDirs,
+  ]
+}
+
+/**
+ * `denyPaths` without the ones naming an intermediate hop of a chain. A bind
+ * there lands on whatever the link leads to — for a symlinked directory
+ * component a whole directory nothing asked to deny, and for a `.git/modules`
+ * entry the git directory it reaches — while holding the link itself, which
+ * is the point, is what the hop's HOLDER is denied whole for.
+ */
+function withoutChainHopLinks(
+  denyPaths: string[],
+  chainHops: readonly GitEntryChainHop[],
+): string[] {
+  if (chainHops.length === 0) return denyPaths
+  const links = new Set(chainHops.map(hop => hop.link))
+  return denyPaths.filter(denyPath => !links.has(denyPath))
+}
+
+/**
+ * Which of the symlinks BETWEEN a git directory entry and what it leads to
+ * this backend can hold, and which it cannot.
+ *
+ * A bind cannot be put on a link — the destination resolves — so the
+ * directory holding one is the whole handle, exactly as the git directory is
+ * the handle on the entry's own link. `held` is those directories, one
+ * read-only bind each, charged to the mount budget like any other deny.
+ *
+ * Three kinds are not in it. A hop a whole-directory deny already covers
+ * names no holder at all. A hop no allowed write path contains is read-only
+ * from the initial `--ro-bind / /` already, and a bind of the directory
+ * around it would buy nothing. A hop whose holder IS a write root or the
+ * working directory, or sits above one, has nothing that can be bound over it
+ * — the bind would take the whole tree read-only, and a repository laid out
+ * that way (`.git/hooks -> ../hooks-link`, with `hooks-link` in the
+ * repository root) is one the caller had before this library saw it, so
+ * refusing every command in it is the wrong answer too. That last kind comes
+ * back in `unheld`, for the warning that has to stand in for a bind.
+ */
+function chainHopDenies(
+  chainHops: readonly GitEntryChainHop[],
+  allowWritePaths: readonly string[],
+): { held: string[]; unheld: GitEntryChainHop[] } {
+  const held = new Set<string>()
+  const unheld: GitEntryChainHop[] = []
+  const cwd = process.cwd()
+  for (const hop of chainHops) {
+    const holder = hop.holder
+    if (holder === undefined) continue
+    if (!allowWritePaths.some(allowed => isAtOrUnder(holder, allowed))) {
+      continue
+    }
+    if (
+      isAtOrUnder(cwd, holder) ||
+      allowWritePaths.some(allowed => isAtOrUnder(allowed, holder))
+    ) {
+      unheld.push(hop)
+      continue
+    }
+    held.add(holder)
+  }
+  return { held: [...held], unheld }
+}
+
+/**
+ * `plan` with the directories holding a chain hop this backend can bind added
+ * to its deny paths, and one warning per wrap for the hops it cannot bind —
+ * the only channel a wrap has to say so. Ordinary trees have no hops at all
+ * and pay nothing here.
+ */
+function withChainHopDenies(
+  plan: SubmoduleDenyPlan,
+  allowWritePaths: readonly string[],
+): SubmoduleDenyPlan {
+  if (plan.chainHops.length === 0) return plan
+  const { held, unheld } = chainHopDenies(plan.chainHops, allowWritePaths)
+  if (unheld.length > 0) {
+    const told = unheld
+      .map(hop => `${hop.entry} reaches what it denies through ${hop.link}`)
+      .join('; ')
+    const holders = [...new Set(unheld.map(hop => hop.holder))].join(', ')
+    logForDebugging(
+      `[Sandbox Linux] ${told}. A read-only bind of the directory holding such a link is the only thing that holds it, and ${holders} is the working directory or a path this command may write, which binding read-only would take the whole tree with: a command in this sandbox can point the link somewhere else, and a git run on the host afterwards follows it there. Moving the link inside the git directory, or a denyWrite entry naming the directory holding it, closes that.`,
+      { level: 'warn' },
+    )
+  }
+  if (held.length === 0) return plan
+  const denied = new Set(plan.denyPaths)
+  return {
+    ...plan,
+    denyPaths: [...plan.denyPaths, ...held.filter(dir => !denied.has(dir))],
+  }
 }
 
 /**
@@ -740,9 +845,12 @@ function cwdDangerousDenyPaths(cwd: string): string[] {
  * denied whole. The write is refused either way; the path in the report is
  * the one inside it.
  */
-export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
+export function linuxGetMonitorCwdDenyPaths(
+  allowGitConfig: boolean,
+  allowWritePaths: readonly string[] = [],
+): string[] {
   try {
-    return linuxGetCwdMandatoryDenyPaths(allowGitConfig)
+    return linuxGetCwdMandatoryDenyPaths(allowGitConfig, allowWritePaths)
   } catch (err) {
     const cwd = process.cwd()
     logForDebugging(
@@ -751,7 +859,7 @@ export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
     )
     return [
       ...cwdDangerousDenyPaths(cwd),
-      ...monitorDotGitDenyPaths(cwd, allowGitConfig),
+      ...monitorDotGitDenyPaths(cwd, allowGitConfig, allowWritePaths),
     ]
   }
 }
@@ -774,6 +882,7 @@ function monitorFallbackReason(cwd: string, err: unknown): string {
 function monitorDotGitDenyPaths(
   cwd: string,
   allowGitConfig: boolean,
+  allowWritePaths: readonly string[],
 ): string[] {
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
@@ -789,7 +898,11 @@ function monitorDotGitDenyPaths(
   if (dotGitStat.isFile()) return [dotGitPath]
   if (dotGitStat.isDirectory()) {
     const denies = gitDirDenies(dotGitPath, allowGitConfig)
-    return [...denies.denyPaths, ...denies.linkedEntryDirs]
+    return [
+      ...withoutChainHopLinks(denies.denyPaths, denies.chainHops),
+      ...denies.linkedEntryDirs,
+      ...chainHopDenies(denies.chainHops, allowWritePaths).held,
+    ]
   }
   return []
 }
@@ -988,7 +1101,11 @@ async function linuxGetMandatoryDenyPaths(
       const pointer = asProfileRefusal(() =>
         gitFileDenies(match, allowGitConfig),
       )
-      denyPaths.push(...pointer.denyPaths, ...pointer.linkedEntryDirs)
+      denyPaths.push(
+        ...withoutChainHopLinks(pointer.denyPaths, pointer.chainHops),
+        ...pointer.linkedEntryDirs,
+      )
+      plan.chainHops.push(...pointer.chainHops)
     }
   }
 
@@ -1006,6 +1123,7 @@ async function linuxGetMandatoryDenyPaths(
       gitDirTreeDenies(gitDir, allowGitConfig, { deadline: walkDeadline() }),
     )
     denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
+    plan.chainHops.push(...denies.chainHops)
     const repository = repositorySubmodules(denies)
     if (repository !== undefined) plan.repositories.push(repository)
   }
@@ -2384,11 +2502,14 @@ async function generateFilesystemArgs(
   const plan =
     writeConfig === undefined
       ? undefined
-      : await linuxGetMandatoryDenyPaths(
-          ripgrepConfig,
-          mandatoryDenySearchDepth,
-          allowGitConfig,
-          abortSignal,
+      : withChainHopDenies(
+          await linuxGetMandatoryDenyPaths(
+            ripgrepConfig,
+            mandatoryDenySearchDepth,
+            allowGitConfig,
+            abortSignal,
+          ),
+          (writeConfig.allowOnly ?? []).map(p => normalizePathForSandbox(p)),
         )
   let level =
     plan === undefined
