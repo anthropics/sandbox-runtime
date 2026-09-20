@@ -2,7 +2,7 @@ import * as fs from 'fs'
 import type {
   GitDirDenies,
   GitDirTreeDenies,
-  GitEntryChainHop,
+  GitChainHop,
 } from './mandatory-deny-paths.js'
 import { isAtOrUnder } from './sandbox-utils.js'
 
@@ -41,8 +41,10 @@ export interface SubmoduleDenyPlan {
    */
   repositories: RepositorySubmodules[]
   /**
-   * Every symlink BETWEEN a git directory entry and what it leads to that the
-   * wrap found, in the order it found them. What this backend takes from one
+   * Every symlink a git directory is reached THROUGH that the wrap found —
+   * between an entry and what it leads to, or in the path a `gitdir:`
+   * pointer's value walks — in the order it found them. What this backend
+   * takes from one
    * is the directory holding it, the only thing a bind can hold a link by;
    * the link's own path is a deny path for the backend that holds a link by
    * its name and is dropped here. Which holders a wrap can actually bind
@@ -50,7 +52,7 @@ export interface SubmoduleDenyPlan {
    * here and nothing collapses them: see `chainHopDenies` and
    * `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts.
    */
-  chainHops: GitEntryChainHop[]
+  chainHops: GitChainHop[]
 }
 
 /**

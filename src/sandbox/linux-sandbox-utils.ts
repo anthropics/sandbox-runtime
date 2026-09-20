@@ -38,10 +38,7 @@ import {
   gitFileDenies,
   gitRedirectPlaceholder,
 } from './mandatory-deny-paths.js'
-import type {
-  GitDirTreeDenies,
-  GitEntryChainHop,
-} from './mandatory-deny-paths.js'
+import type { GitDirTreeDenies, GitChainHop } from './mandatory-deny-paths.js'
 import type {
   CollapseLevel,
   RepositorySubmodules,
@@ -674,7 +671,7 @@ function cwdMandatoryDenyPlan(
   const cwd = process.cwd()
   const denyPaths = cwdDangerousDenyPaths(cwd)
   const repositories: RepositorySubmodules[] = []
-  const chainHops: GitEntryChainHop[] = []
+  const chainHops: GitChainHop[] = []
 
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
@@ -734,7 +731,7 @@ function linuxGitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
  */
 function withoutChainHopLinks(
   denyPaths: string[],
-  chainHops: readonly GitEntryChainHop[],
+  chainHops: readonly GitChainHop[],
 ): string[] {
   if (chainHops.length === 0) return denyPaths
   const links = new Set(chainHops.map(hop => hop.link))
@@ -742,7 +739,8 @@ function withoutChainHopLinks(
 }
 
 /**
- * Which of the symlinks BETWEEN a git directory entry and what it leads to
+ * Which of the symlinks a git directory is reached THROUGH — between an entry
+ * and what it leads to, or in the path a `gitdir:` pointer's value walks —
  * this backend can hold, and which it cannot.
  *
  * A bind cannot be put on a link — the destination resolves — so the
@@ -762,11 +760,11 @@ function withoutChainHopLinks(
  * back in `unheld`, for the warning that has to stand in for a bind.
  */
 function chainHopDenies(
-  chainHops: readonly GitEntryChainHop[],
+  chainHops: readonly GitChainHop[],
   allowWritePaths: readonly string[],
-): { held: string[]; unheld: GitEntryChainHop[] } {
+): { held: string[]; unheld: GitChainHop[] } {
   const held = new Set<string>()
-  const unheld: GitEntryChainHop[] = []
+  const unheld: GitChainHop[] = []
   const cwd = process.cwd()
   for (const hop of chainHops) {
     const holder = hop.holder
@@ -800,11 +798,15 @@ function withChainHopDenies(
   const { held, unheld } = chainHopDenies(plan.chainHops, allowWritePaths)
   if (unheld.length > 0) {
     const told = unheld
-      .map(hop => `${hop.entry} reaches what it denies through ${hop.link}`)
+      .map(hop =>
+        hop.kind === 'pointer'
+          ? `the git directory ${hop.source} names is reached through ${hop.link}`
+          : `${hop.source} reaches what it denies through ${hop.link}`,
+      )
       .join('; ')
     const holders = [...new Set(unheld.map(hop => hop.holder))].join(', ')
     logForDebugging(
-      `[Sandbox Linux] ${told}. A read-only bind of the directory holding such a link is the only thing that holds it, and ${holders} is the working directory or a path this command may write, which binding read-only would take the whole tree with: a command in this sandbox can point the link somewhere else, and a git run on the host afterwards follows it there. Moving the link inside the git directory, or a denyWrite entry naming the directory holding it, closes that.`,
+      `[Sandbox Linux] ${told}. A read-only bind of the directory holding such a link is the only thing that holds it, and ${holders} is the working directory or a path this command may write, which binding read-only would take the whole tree with: a command in this sandbox can point the link somewhere else, and a git run on the host afterwards follows it there. Moving the link inside the git directory, spelling the pointer's path without it, or a denyWrite entry naming the directory holding it, closes that.`,
       { level: 'warn' },
     )
   }

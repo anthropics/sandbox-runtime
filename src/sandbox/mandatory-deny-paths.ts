@@ -130,19 +130,29 @@ interface ResolvedChain {
 }
 
 /**
- * A symlink BETWEEN a git directory entry and what it leads to: a second hop
- * of the entry's own link, or a symlinked directory component on the way.
+ * A symlink a git directory is reached THROUGH: a second hop of a symlinked
+ * entry's own link, a symlinked directory component on the way, or a
+ * component of the path a `gitdir:` pointer or a `commondir` names.
  *
- * Neither end of the chain covers one. The entry's deny holds the entry and
- * the landing's deny holds the landing, while a hop in between sits in an
- * ordinary directory of the work tree: a command that retargets it, or
- * renames it aside and puts its own directory there, moves what the chain
- * resolves to without touching either end, and the host's git follows the
- * chain afterwards.
+ * Neither end of such a chain covers one. The entry's or the pointer file's
+ * deny holds that end and the landing's deny holds the other, while a hop in
+ * between sits in an ordinary directory of the work tree: a command that
+ * retargets it, or renames it aside and puts its own directory there, moves
+ * what the chain resolves to without touching either end, and the host's git
+ * follows the chain afterwards.
  */
-export interface GitEntryChainHop {
-  /** The git directory entry whose chain goes through it. */
-  entry: string
+export interface GitChainHop {
+  /**
+   * Where the chain starts: a git directory ENTRY that is itself a symlink,
+   * or the VALUE of a `gitdir:` pointer or a `commondir`, which git walks the
+   * same way and a command redirects the same way. Held alike; the warning
+   * that stands in where one cannot be held says which, because what closes
+   * it differs.
+   */
+  kind: 'entry' | 'pointer'
+  /** The git directory entry, or the metadata file, whose chain goes
+   *  through it. */
+  source: string
   /**
    * The link's own path, and a deny path of its own: that is what holds it
    * on the backend which matches the name a rename or an unlink uses. The
@@ -202,9 +212,9 @@ export interface SubmoduleScan {
    * The hops BETWEEN an entry the walk followed through a symlink and what
    * it lands on. One inside the directory holding that entry names no holder
    * of its own: `linkedEntryDirs` denies that whole already. See
-   * {@link GitEntryChainHop}.
+   * {@link GitChainHop}.
    */
-  chainHops: GitEntryChainHop[]
+  chainHops: GitChainHop[]
 }
 
 /**
@@ -226,8 +236,8 @@ export interface GitDirTreeDenies {
   linkedEntryDirs: string[]
   /** Every hop between a symlinked entry of this tree and what it leads to,
    *  the git directory's own entries, the walked `.git/modules` entries and
-   *  the submodules' own alike. See {@link GitEntryChainHop}. */
-  chainHops: GitEntryChainHop[]
+   *  the submodules' own alike. See {@link GitChainHop}. */
+  chainHops: GitChainHop[]
 }
 
 /**
@@ -319,13 +329,14 @@ export interface GitDirDenies {
   linkedEntryDirs: string[]
   /**
    * The hops between a symlinked entry of this git directory and what it
-   * leads to. Each hop's own path is in `denyPaths` already, and in
-   * `escapingDenyPaths` where no bind of the git directory covers it; what
+   * leads to — and, from {@link gitFileDenies}, the ones in the path a
+   * pointer's value walks. Each hop's own path is in `denyPaths` already, and
+   * in `escapingDenyPaths` where no bind of the git directory covers it; what
    * is here besides is the directory holding each, which is what the backend
    * whose denies resolve has to deny whole to hold the link. See
-   * {@link GitEntryChainHop}.
+   * {@link GitChainHop}.
    */
-  chainHops: GitEntryChainHop[]
+  chainHops: GitChainHop[]
 }
 
 /**
@@ -353,7 +364,7 @@ export interface GitDirDenies {
  * ordinary directory of the work tree moves what the chain resolves to
  * without touching either end. Each hop's own path is therefore a deny path
  * as well, and `chainHops` carries the directory holding each for the backend
- * that needs one — see {@link GitEntryChainHop}.
+ * that needs one — see {@link GitChainHop}.
  *
  * An ordinary git directory costs one lstat per entry and is denied by exactly
  * what it always was.
@@ -364,7 +375,7 @@ export function gitDirDenies(
 ): GitDirDenies {
   const denyPaths: string[] = []
   const escapingDenyPaths: string[] = []
-  const chainHops: GitEntryChainHop[] = []
+  const chainHops: GitChainHop[] = []
   let denyWhole = false
   // Resolved on the first symlinked entry and not before: an ordinary git
   // directory must not pay a realpath for a question it never asks.
@@ -382,13 +393,19 @@ export function gitDirDenies(
       // own name; the one that resolves its denies drops it again.
       denyPaths.push(hop.link)
       if (insideGitDir(hop.link)) {
-        chainHops.push({ entry: entryPath, link: hop.link, holder: undefined })
+        chainHops.push({
+          kind: 'entry',
+          source: entryPath,
+          link: hop.link,
+          holder: undefined,
+        })
         continue
       }
       // No bind of the git directory covers it, so a degrade must not drop it.
       escapingDenyPaths.push(hop.link)
       chainHops.push({
-        entry: entryPath,
+        kind: 'entry',
+        source: entryPath,
         link: hop.link,
         holder: insideGitDir(hop.holder) ? undefined : hop.holder,
       })
@@ -516,7 +533,9 @@ export function gitRedirectPlaceholder(denyPath: string): string | undefined {
  *
  * A `..` in either path can land the kernel somewhere other than where the
  * path folds to on paper, so both directories are denied — see
- * {@link gitMetadataTargets}.
+ * {@link gitMetadataTargets} — and every symlink the walk of the path went
+ * through is denied as well, since a command that retargets one of those
+ * moves the directory git opens without touching the file or the landing.
  *
  * Throws {@link GitMetadataError} when the pointer or the `commondir` names
  * something this cannot resolve the way git does; the wrap is then refused
@@ -531,11 +550,12 @@ export function gitFileDenyPaths(
 }
 
 /**
- * {@link gitFileDenyPaths} with the whole-directory denies kept apart, as
- * {@link gitDirDenies} keeps them: a git directory a pointer leads to is a
- * git directory like any other, so an entry of it that is a symlink needs
- * the directory holding the link denied whole on the backend whose denies
- * resolve. Nothing else is enumerated through a pointer — a target's own
+ * {@link gitFileDenyPaths} with the whole-directory denies and the chain hops
+ * kept apart, as {@link gitDirDenies} keeps them: a git directory a pointer
+ * leads to is a git directory like any other, so an entry of it that is a
+ * symlink needs the directory holding the link denied whole on the backend
+ * whose denies resolve, and so does a link in the path the pointer's own
+ * value walks. Nothing else is enumerated through a pointer — a target's own
  * `.git/modules` is not walked — so this is what it adds.
  */
 export function gitFileDenies(
@@ -544,7 +564,7 @@ export function gitFileDenies(
 ): GitDirDenies {
   const denyPaths = [gitFile]
   const linkedEntryDirs: string[] = []
-  const chainHops: GitEntryChainHop[] = []
+  const chainHops: GitChainHop[] = []
   const targetDenies = (
     target: string,
     kind: GitDirKind,
@@ -554,6 +574,21 @@ export function gitFileDenies(
     denyPaths.push(...denies.denyPaths)
     linkedEntryDirs.push(...denies.linkedEntryDirs)
     chainHops.push(...denies.chainHops)
+  }
+  // A pointer's VALUE is a path git walks as the kernel does, so a symlink in
+  // it is held as a symlinked entry is: the file naming it is denied and the
+  // git directory it reaches is denied, while a command that retargets a link
+  // between the two moves where git lands without touching either end.
+  const holdChain = (source: string, hops: ChainHop[]): void => {
+    for (const hop of hops) {
+      denyPaths.push(hop.link)
+      chainHops.push({
+        kind: 'pointer',
+        source,
+        link: hop.link,
+        holder: hop.holder,
+      })
+    }
   }
   try {
     const pointer = readGitMetadataFile(gitFile)
@@ -575,9 +610,12 @@ export function gitFileDenies(
     if (target === undefined) {
       return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
     }
-    const gitDirs = gitMetadataTargets(path.dirname(gitFile), target).map(
-      gitDir => ({ gitDir, kind: gitDirKind(gitDir) }),
-    )
+    const targets = gitMetadataTargets(path.dirname(gitFile), target)
+    holdChain(gitFile, targets.hops)
+    const gitDirs = targets.gitDirs.map(gitDir => ({
+      gitDir,
+      kind: gitDirKind(gitDir),
+    }))
     for (const { gitDir, kind } of gitDirs) {
       targetDenies(gitDir, kind, gitFile)
     }
@@ -619,7 +657,9 @@ export function gitFileDenies(
           break
       }
       if (commonTarget === undefined) continue
-      for (const commonDir of gitMetadataTargets(gitDir, commonTarget)) {
+      const commonTargets = gitMetadataTargets(gitDir, commonTarget)
+      holdChain(commonFile, commonTargets.hops)
+      for (const commonDir of commonTargets.gitDirs) {
         if (commonDir === gitDir) continue
         targetDenies(commonDir, gitDirKind(commonDir), commonFile)
       }
@@ -801,7 +841,7 @@ interface SubmoduleWalk {
   gitDirs: string[]
   unreadableDirs: Set<string>
   linkedEntryDirs: Set<string>
-  chainHops: GitEntryChainHop[]
+  chainHops: GitChainHop[]
 }
 
 /** What one entry of a walked directory is worth looking into. */
@@ -847,7 +887,7 @@ function listDirectory(
  * command that plants git directories too.
  *
  * A chain that goes through further links is held hop by hop as a git
- * directory's own entry is: see {@link GitEntryChainHop}.
+ * directory's own entry is: see {@link GitChainHop}.
  */
 function walkEntry(
   entry: fs.Dirent,
@@ -867,7 +907,8 @@ function walkEntry(
   const holdChain = (): void => {
     for (const hop of chain.hops.slice(1)) {
       walk.chainHops.push({
-        entry: entryPath,
+        kind: 'entry',
+        source: entryPath,
         link: hop.link,
         holder: isAtOrUnder(hop.holder, holder) ? undefined : hop.holder,
       })
@@ -1099,25 +1140,44 @@ function gitMetadataPath(contents: Buffer, file: string): string | undefined {
   return decoded
 }
 
+/** Where a `gitdir:` or `commondir` value leads, and what it goes through;
+ *  see {@link gitMetadataTargets}. */
+interface GitMetadataTargets {
+  gitDirs: string[]
+  /** Every symlink the walk of the value went through, in the order it met
+   *  them. A link ABOVE the file holding the value is not one of them: the
+   *  base is resolved before the walk starts, so a checkout reached through a
+   *  symlink is where the repository lives rather than a hop of this chain. */
+  hops: ChainHop[]
+}
+
 /**
  * The git directories a `gitdir:` or `commondir` value read in `base` leads
  * to: the path as it folds on paper, which is the spelling these denies have
  * always used, and — when a `..` in it could send the kernel elsewhere — the
  * directory the kernel actually reaches. git hands the two strings to stat
  * joined and unnormalised, so a symlink is followed before a later `..`
- * applies and `a/link/../b` need not be `a/b`. Both are denied when they
- * differ: git opens one of them, and denying the other costs one bind.
+ * applies and `a/link/../b` need not be `a/b`; run against real git, it opens
+ * the kernel's landing and refuses when only the lexical one is a git
+ * directory (test/sandbox/git-pointer-parity.test.ts pins that). Both are
+ * denied when they differ: denying more than git follows costs one bind.
  */
-function gitMetadataTargets(base: string, target: string): string[] {
+function gitMetadataTargets(base: string, target: string): GitMetadataTargets {
   const lexical = path.resolve(base, target)
-  if (!target.split('/').includes('..')) return [lexical]
   const root = path.parse(lexical).root
-  const physical = physicalPath(physicalPath(root, base), target)
+  const chain = resolveChain(
+    // An absolute value starts at the root and never looks at the base, so
+    // resolving the base then is a walk that buys nothing.
+    path.isAbsolute(target) ? root : physicalPath(root, base),
+    target,
+  )
+  const hops = chain.hops
+  if (!target.split('/').includes('..')) return { gitDirs: [lexical], hops }
   // Both sides resolved the same way, so a base that merely spells itself
   // differently (a /var that is a symlink to /private/var) is no difference.
-  return physical === physicalPath(root, lexical)
-    ? [lexical]
-    : [lexical, physical]
+  return chain.landing === physicalPath(root, lexical)
+    ? { gitDirs: [lexical], hops }
+    : { gitDirs: [lexical, chain.landing], hops }
 }
 
 /**
@@ -1163,9 +1223,12 @@ function resolveChain(base: string, target: string): ResolvedChain {
     hops.push({ link: next, holder: current })
     // A loop is where the walk stops, and what it hands back: the rest of
     // the path folded past it would name a directory this cannot vouch for,
-    // while the link itself reads as unreadable and is denied whole.
+    // while the link itself reads as unreadable and is denied whole. Past
+    // the kernel's own limit the chain reaches nothing — git fails on it as
+    // this does — so there is nothing behind it to protect and no hop of it
+    // worth holding, which is the answer a symlinked ENTRY that loops gets.
     if (hops.length > MAX_SYMLINK_RESOLUTION_DEPTH) {
-      return { landing: next, hops }
+      return { landing: next, hops: [] }
     }
     // A link's own target is walked in its place, from the directory holding
     // it unless it is absolute.
