@@ -234,19 +234,6 @@ export function isSymlinkOutsideBoundary(
   ) {
     return false
   }
-  // Also handle the reverse: /private/tmp/... resolving to itself
-  if (
-    normalizedOriginal.startsWith('/private/tmp/') &&
-    normalizedResolved === normalizedOriginal
-  ) {
-    return false
-  }
-  if (
-    normalizedOriginal.startsWith('/private/var/') &&
-    normalizedResolved === normalizedOriginal
-  ) {
-    return false
-  }
 
   // If resolved path is "/" it's outside expected boundaries
   if (normalizedResolved === '/') {
@@ -298,11 +285,9 @@ export function isSymlinkOutsideBoundary(
   const resolvedIsCanonical =
     canonicalOriginal !== normalizedOriginal &&
     normalizedResolved === canonicalOriginal
-  const resolvedIsSame = normalizedResolved === normalizedOriginal
 
   // If resolved path is not within expected tree, it's outside boundary
   if (
-    !resolvedIsSame &&
     !resolvedIsCanonical &&
     !resolvedStartsWithOriginal &&
     !resolvedStartsWithCanonical
@@ -451,13 +436,10 @@ export function normalizePathForSandbox(
   }
   let normalizedPath = expandTilde(pathPattern)
 
-  if (normalizedPath !== pathPattern) {
-    // tilde was expanded above
-  } else if (pathPattern.startsWith('./') || pathPattern.startsWith('../')) {
-    // Convert relative to absolute based on current working directory
-    normalizedPath = path.resolve(process.cwd(), pathPattern)
-  } else if (!path.isAbsolute(pathPattern)) {
-    // Handle other relative paths (e.g., ".", "..", "foo/bar")
+  // A pattern with no tilde to expand and no root is resolved against the
+  // working directory; path.resolve covers './', '../', '.' and a bare
+  // relative name alike.
+  if (normalizedPath === pathPattern && !path.isAbsolute(pathPattern)) {
     normalizedPath = path.resolve(process.cwd(), pathPattern)
   }
 
@@ -526,10 +508,9 @@ export function normalizePathForSandbox(
   try {
     const resolvedPath = fs.realpathSync(normalizedPath)
 
-    // Only use resolved path if it doesn't cross boundary (e.g., symlink to parent dir)
-    if (isSymlinkOutsideBoundary(normalizedPath, resolvedPath)) {
-      // Symlink points outside expected boundaries - keep original path
-    } else {
+    // A symlink pointing outside the expected boundaries (e.g. to a parent
+    // directory) keeps the original path.
+    if (!isSymlinkOutsideBoundary(normalizedPath, resolvedPath)) {
       normalizedPath = resolvedPath
     }
   } catch {
@@ -859,12 +840,6 @@ export function generateProxyEnvVars(
       `DOCKER_HTTPS_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
     )
 
-    // Kubernetes kubectl - uses standard HTTPS_PROXY
-    // kubectl respects HTTPS_PROXY which we already set above
-
-    // AWS CLI - uses standard HTTPS_PROXY (v2 supports it well)
-    // AWS CLI v2 respects HTTPS_PROXY which we already set above
-
     // Google Cloud SDK - has specific proxy settings.
     // proxy/type names the protocol the *proxy* speaks, not the traffic it
     // tunnels. Our HTTP CONNECT proxy carries TLS to Google APIs, so the
@@ -880,13 +855,8 @@ export function generateProxyEnvVars(
       }
     }
 
-    // Azure CLI - uses HTTPS_PROXY
-    // Azure CLI respects HTTPS_PROXY which we already set above
-
-    // Terraform - uses standard HTTP/HTTPS proxy vars
-    // Terraform respects HTTP_PROXY/HTTPS_PROXY which we already set above
-
-    // gRPC: see GRPC_PROXY above, emitted outside this guard.
+    // kubectl, the AWS CLI, the Azure CLI, Terraform and gRPC read the
+    // standard vars already emitted; nothing tool-specific is needed.
   }
 
   // Do not set HTTP_PROXY/HTTPS_PROXY to SOCKS URLs in the SOCKS-only path:

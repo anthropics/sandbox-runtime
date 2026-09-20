@@ -667,11 +667,7 @@ export const Sigv4ConfigSchema = z
  * Credentials configuration schema for validation.
  *
  * Declares credential sources (files and environment variables) with a
- * per-source mode:
- * - `deny` blocks the source inside the sandbox (file reads are denied via the
- *   filesystem read-deny mechanism, env vars are unset in the child).
- *
- * Additional modes (e.g. `mask`) will be added in future releases.
+ * per-source mode; see {@link credentialModeSchema} for what each mode does.
  *
  * Only the sources declared here are affected; the section applies no
  * implicit restrictions beyond them.

@@ -1,6 +1,12 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -18,17 +24,22 @@ function runCli(
   args: string[],
   options?: { input?: string; debug?: boolean; home?: string },
 ) {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    // Default to a non-existent config to get default behavior; `home`
+    // points the default settings path at a directory the test set up.
+    HOME: options?.home ?? '/tmp/cli-test-nonexistent',
+    // Enable SRT_DEBUG if debug option is set
+    ...(options?.debug ? { SRT_DEBUG: 'true' } : {}),
+  }
+  // npm exports npm_package_version to its lifecycle scripts, so it is set
+  // whenever the suite runs under `npm test`. The CLI under test is a `srt`
+  // binary a user installed, which has no such variable.
+  delete env.npm_package_version
   const result = spawnSync('bun', ['run', getCliPath(), ...args], {
     encoding: 'utf-8',
     input: options?.input,
-    env: {
-      ...process.env,
-      // Default to a non-existent config to get default behavior; `home`
-      // points the default settings path at a directory the test set up.
-      HOME: options?.home ?? '/tmp/cli-test-nonexistent',
-      // Enable SRT_DEBUG if debug option is set
-      ...(options?.debug ? { SRT_DEBUG: 'true' } : {}),
-    },
+    env,
   })
   return {
     stdout: result.stdout,
@@ -38,6 +49,17 @@ function runCli(
 }
 
 describe('CLI', () => {
+  describe('--version', () => {
+    test('reports the version in the package manifest', () => {
+      const manifest: { version: string } = JSON.parse(
+        readFileSync(join(process.cwd(), 'package.json'), 'utf-8'),
+      )
+      const result = runCli(['--version'])
+      expect(result.stdout.trim()).toBe(manifest.version)
+      expect(result.status).toBe(0)
+    })
+  })
+
   describe('-c flag (command string mode)', () => {
     test('executes simple command with -c flag', () => {
       const result = runCli(['-c', 'echo hello'])
