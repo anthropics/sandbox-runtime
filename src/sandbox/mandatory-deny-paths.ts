@@ -1244,6 +1244,22 @@ function physicalPath(base: string, target: string): string {
 }
 
 /**
+ * Where the kernel lands walking `denyPath` from the root: the spelling a
+ * backend needs whose filters are matched against the path an operation
+ * RESOLVED to rather than the one it was spelled from (macOS Seatbelt — see
+ * `gitDiskDenyEntries` in src/sandbox/macos-sandbox-utils.ts). `denyPath`
+ * itself where nothing on the way is a symlink, which is every path of an
+ * ordinary repository.
+ *
+ * `fs.realpathSync` does not answer this: it throws on a path that is not
+ * there, and an absent `hooks` or `config.worktree` is exactly what these
+ * denies exist to stop a command from creating.
+ */
+export function physicalDenyPath(denyPath: string): string {
+  return physicalPath(path.parse(denyPath).root, denyPath)
+}
+
+/**
  * The deepest ancestor of `target` (itself included) this process can still
  * stat as a directory. Denying that directory fails closed when the path
  * below it cannot be inspected: nothing under it is writable in the sandbox.
