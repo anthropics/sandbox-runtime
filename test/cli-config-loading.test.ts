@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
+import { describe, it, expect, afterEach, beforeEach } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
@@ -17,48 +17,52 @@ describe('loadConfig', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true })
   })
 
-  it('should return null when file does not exist', () => {
+  // The caller has to tell a file that is not there — the one case that
+  // may fall back to the built-in defaults — from one that is there and
+  // did not load, so each of those gets its own kind.
+  it('should report missing when the file does not exist', () => {
     const result = loadConfig('/nonexistent/path/config.json')
-    expect(result).toBeNull()
+    expect(result).toEqual({ kind: 'missing' })
   })
 
-  it('should return null for empty file', () => {
+  it('should report unreadable, not missing, when the path is a directory', () => {
+    fs.mkdirSync(configPath)
+    const result = loadConfig(configPath)
+    expect(result.kind).toBe('unreadable')
+    expect(result.kind === 'unreadable' && result.reason).toContain('EISDIR')
+  })
+
+  it('should report empty for an empty file', () => {
     fs.writeFileSync(configPath, '')
-    const result = loadConfig(configPath)
-    expect(result).toBeNull()
+    expect(loadConfig(configPath)).toEqual({ kind: 'empty' })
   })
 
-  it('should return null for whitespace-only file', () => {
+  it('should report empty for a whitespace-only file', () => {
     fs.writeFileSync(configPath, '   \n\t  ')
-    const result = loadConfig(configPath)
-    expect(result).toBeNull()
+    expect(loadConfig(configPath)).toEqual({ kind: 'empty' })
   })
 
-  it('should return null and log error for invalid JSON', () => {
+  it('should report invalid for invalid JSON', () => {
     fs.writeFileSync(configPath, '{ invalid json }')
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     const result = loadConfig(configPath)
 
-    expect(result).toBeNull()
-    expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining('Invalid JSON'),
+    expect(result.kind).toBe('invalid')
+    expect(result.kind === 'invalid' && result.reason).toContain(
+      'is not valid JSON',
     )
-    consoleSpy.mockRestore()
   })
 
-  it('should return null and log Zod errors for invalid schema', () => {
+  it('should report invalid and name the failing keys for a schema mismatch', () => {
     // Valid JSON but missing required fields
     fs.writeFileSync(configPath, JSON.stringify({ network: {} }))
-    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
 
     const result = loadConfig(configPath)
 
-    expect(result).toBeNull()
-    expect(consoleSpy).toHaveBeenCalledWith(
-      expect.stringContaining('Invalid configuration'),
+    expect(result.kind).toBe('invalid')
+    expect(result.kind === 'invalid' && result.reason).toContain(
+      'network.allowedDomains',
     )
-    consoleSpy.mockRestore()
   })
 
   it('should return valid config for valid file', () => {
@@ -70,8 +74,10 @@ describe('loadConfig', () => {
 
     const result = loadConfig(configPath)
 
-    expect(result).not.toBeNull()
-    expect(result?.network.allowedDomains).toContain('example.com')
+    expect(result.kind).toBe('ok')
+    expect(
+      result.kind === 'ok' && result.config.network.allowedDomains,
+    ).toContain('example.com')
   })
 })
 
