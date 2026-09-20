@@ -1675,6 +1675,11 @@ async function generateFilesystemArgs(
   // beside its resolved dest, so the stub-skip guard tests a covering
   // directory in its canonical form AND every recorded spelling.
   const readOnlyDenyDirSpellings = new Map<string, Set<string>>()
+  // Resolved dests that at least one deny entry reaches through a symlink.
+  // The deny loop deduplicates on the resolved dest, so which spelling of a
+  // dest it sees is the caller's ordering; the skip below asks this instead
+  // of asking whether the entry in hand was symlinked.
+  const symlinkedDenySpellingDests = new Set<string>()
   // dest → the pre-resolution deny path it came from. A bind at the resolved
   // dest also re-exposes whatever the symlinked spelling leads to, so the
   // re-application passes below compare a read deny's landing against both
@@ -2168,6 +2173,9 @@ async function generateFilesystemArgs(
       if (findSymlinkInPath(resolvedPath, allowedWritePaths)) {
         continue
       }
+      if (resolvedPath !== rawPath) {
+        symlinkedDenySpellingDests.add(resolvedPath)
+      }
       let isDirectory = false
       try {
         isDirectory = fs.statSync(resolvedPath).isDirectory()
@@ -2519,11 +2527,14 @@ async function generateFilesystemArgs(
       if (isWithinAllowedPath) {
         // Already unwritable under a read-only denied directory (the
         // existing-path twin of the stub skip above). Veto (ii) keeps the
-        // covering bind through the emission filter; a symlinked spelling
-        // keeps its own bind because the re-application passes below key
-        // off emitted raw spellings.
+        // covering bind through the emission filter; a dest ANY deny entry
+        // reaches through a symlink keeps its own bind, because the
+        // re-application passes below key off emitted raw spellings. Asked
+        // of the dest, not of the entry in hand: the loop deduplicates on
+        // the dest, so a dest spelled both ways would otherwise be bound or
+        // not according to which spelling the caller listed first.
         if (
-          rawPath === normalizedPath &&
+          !symlinkedDenySpellingDests.has(normalizedPath) &&
           coveredBySafeReadOnlyDenyDir(normalizedPath)
         ) {
           logForDebugging(
