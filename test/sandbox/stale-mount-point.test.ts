@@ -44,13 +44,12 @@ function run(
 /**
  * A denyWrite path that does not exist gets `--ro-bind /dev/null <path>`, and
  * bwrap creates the mount point for it on the host: an empty file, mode 0444.
- * The wrapping process removes it after the command, from a set it keeps in
- * memory. A process killed before that (SIGKILL, OOM) leaves the file behind,
- * and it used to stay for good: every later wrap saw an existing file, bound
- * it onto itself and never removed it. For a path whose existence is its
- * meaning that is a lasting fault on the host: a leftover `.git/config.lock`
- * makes every `git config` write outside the sandbox fail with "could not
- * lock config file".
+ * A cleanup removes it once no sandbox relies on it. A process killed before
+ * it can clean up leaves the file behind, and it used to stay for good: every
+ * later wrap saw an existing file, bound it onto itself and never removed it.
+ * For a path whose existence is its meaning that is a lasting fault on the
+ * host: a leftover `.git/config.lock` makes every `git config` write outside
+ * the sandbox fail with "could not lock config file".
  */
 describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
   const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
@@ -105,15 +104,17 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     expect(existsSync(LOCK)).toBe(false)
   })
 
-  it('waits for every outstanding sandbox before it is removed', async () => {
+  it('goes on the first cleanup when no sandbox is running under it', async () => {
     plantLeftover(LOCK)
 
     await wrap([LOCK])
     await wrap([LOCK])
 
-    cleanupBwrapMountPoints()
-    // Unlinking it now would detach the second sandbox's bind.
-    expect(existsSync(LOCK)).toBe(true)
+    // Neither command was started, so nothing relies on the mount point: what
+    // keeps one is a sandbox holding its manifest's lock, not a count of the
+    // wraps this process has handed out. A command wrapped but not started by
+    // then refuses to start rather than running without its mount point (see
+    // mount-point-liveness.test.ts).
     cleanupBwrapMountPoints()
     expect(existsSync(LOCK)).toBe(false)
   })
@@ -236,6 +237,11 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
       const after = run(command)
       expect(after.stdout).toContain(BOOTED)
       expect(after.stdout).toMatch(/rc=[1-9]/)
+      // A manifest whose writer is gone and that no sandbox has locked counts
+      // as live for a moment, in case the sandbox it covers is starting: the
+      // killed process left one, so the cleanup that takes its mount point
+      // away is the first one after that.
+      await new Promise(resolve => setTimeout(resolve, 1000))
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(false)
     },
