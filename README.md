@@ -555,6 +555,8 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
 
+**Supported bubblewrap versions:** every mount plan srt builds starts on bubblewrap 0.4.0 and later. Two things need 0.5.0 or newer, both of them changes to how bubblewrap prepares the mount point for a file bind: a `denyRead` entry or credential mask naming a path that is not a regular file — a fifo, a socket, a device node — cannot be applied on an older bubblewrap, which creates a file at the destination instead of binding over what is there (that fails on a read-only mount and blocks on a fifo); and a mount point left behind by an interrupted sandbox (see "Write denies on paths that do not exist yet" below) is created with write bits there, so the next wrap does not recognise it as a leftover and leaves it on the host. `checkDependencies()` returns a warning naming the version it found when bubblewrap is older than 0.5.0; it is a warning, not a refusal. CI runs the whole suite against the bubblewrap Ubuntu ships and against 0.12.0, and the Linux mount-plan suites against 0.4.1 as well.
+
 **Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
 
 ```bash
