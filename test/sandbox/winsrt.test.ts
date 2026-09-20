@@ -1913,13 +1913,9 @@ describe.if(isWindows)(
     }, 90_000)
 
     it('H-denyWrite: child cannot write the denyWrite target', async () => {
-      // Was F2 under the same-user PROTECTED-stamp; re-expressed
-      // for the additive-DENY-ACE path. Asserts the WRITE-deny
-      // half only — the "child can still read" half is covered by
-      // smoke-aces A2 (lands with the SYNCHRONIZE-strip fix in
-      // the Rust same-user-removal PR; main's `DenyMask::WriteDeny`
-      // includes SYNCHRONIZE so a synchronous read open is also
-      // denied until then).
+      // denyWrite blocks writes and leaves reads open (acl.rs
+      // DenyMask::WriteDeny strips SYNCHRONIZE); this asserts the
+      // write half, smoke-aces A2 the read half.
       const hCfg = join(hScratch, 'cfg.txt')
       writeFileSync(hCfg, 'CONFIG-V1')
       const w = await rexecSandboxed(`echo POISONED>"${hCfg}"`, {
@@ -1947,12 +1943,9 @@ describe.if(isWindows)(
     }, 90_000)
 
     it('H-glob: per-exec denyRead glob — expanded TS-side, both denied, restored', async () => {
-      // Red→green for the per-exec/session-level glob asymmetry:
-      // before this PR a per-exec `glob-*.secret` reached
-      // `srt-win exec --deny-read` raw and `canonicalize_path`
-      // hard-failed; now `wrapWithSandboxArgv` routes it through
-      // `expandWindowsFsPaths` (same chokepoint as session-
-      // level) so the child sees two concrete `--deny-read` paths.
+      // Per-exec denyRead globs must go through expandWindowsFsPaths,
+      // the same chokepoint as session-level: srt-win's
+      // canonicalize_path rejects a raw glob.
       const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
       const a = join(dir, 'glob-a.secret')
       const b = join(dir, 'glob-b.secret')
