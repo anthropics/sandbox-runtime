@@ -2643,6 +2643,26 @@ async function generateFilesystemArgs(
   // those matches unmasked.
   const unlistableDenyDirs = new Set(readConfig?.unlistableDenyDirs ?? [])
 
+  // The credential masks, one fake per place they land. Two entries naming
+  // one file — '~/.netrc' and its absolute form, or a route through a
+  // symlinked directory — resolve to the same landing, and the last of them
+  // is the mask bubblewrap leaves in force there, so the last is the one
+  // kept. Keyed by landing, so the read-deny loop below can leave a
+  // destination a mask already covers to that mask.
+  const credentialMaskFakes = new Map<string, string>()
+  for (const { realPath, fakePath } of maskedFileBinds ?? []) {
+    credentialMaskFakes.set(canonicalForm(realPath), fakePath)
+  }
+  // Destinations a file mask has been placed at, or will be: one mount per
+  // destination. A second file mount lands on what the first one put there,
+  // which is a character device for a /dev/null mask, and bubblewrap before
+  // 0.5.0 refuses to start on that ("Can't create file at <dest>: Permission
+  // denied") because its ensure_file() only accepts a regular file as a
+  // mount point and creat()s anything else on a mount it has just made
+  // read-only. Seeded with the credential landings, which are emitted after
+  // this loop and win where both name one file.
+  const fileMaskLandings = new Set(credentialMaskFakes.keys())
+
   // Every location the read section hides, each one where its mount lands:
   // one per entry that mounts something — a directory's tmpfs, the stand-in
   // tmpfs of an entry that could not be inspected or that resolves to '/', a
@@ -2656,7 +2676,7 @@ async function generateFilesystemArgs(
     ...readDenyPlan().flatMap(({ mount, liftedFile }) =>
       mount === undefined || liftedFile ? [] : [mount.landing],
     ),
-    ...(maskedFileBinds ?? []).map(mask => canonicalForm(mask.realPath)),
+    ...credentialMaskFakes.keys(),
   ]
   // What the read section hides at, inside, or around `target`, ignoring the
   // tmpfs landing at `landing` and every deny above it — those are what a
@@ -2739,6 +2759,17 @@ async function generateFilesystemArgs(
         )
         continue
       }
+      // One mask per destination. Spellings of one file converge here —
+      // '~/x' and its absolute form, a trailing slash, a route through a
+      // symlinked directory, the same path arriving again from
+      // credentials.files — and each would otherwise mount over the last.
+      if (fileMaskLandings.has(landing)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny at a destination a file mask already covers: ${normalizedPath} -> ${landing}`,
+        )
+        continue
+      }
+      fileMaskLandings.add(landing)
       // For files, bind /dev/null instead of tmpfs, where the path resolves
       // like every other read-deny mount.
       args.push('--ro-bind', '/dev/null', landing)
@@ -2753,8 +2784,7 @@ async function generateFilesystemArgs(
   // (tilde-expanded, realpath'd) by the caller. The fake's parent dir is
   // explicitly ro-bound at the end of this function, so the bind source is
   // never writable from inside the sandbox.
-  for (const { realPath, fakePath } of maskedFileBinds ?? []) {
-    const landing = canonicalForm(realPath)
+  for (const [landing, fakePath] of credentialMaskFakes) {
     args.push('--ro-bind', fakePath, landing)
     fileMasks.push({ source: fakePath, landing })
   }
