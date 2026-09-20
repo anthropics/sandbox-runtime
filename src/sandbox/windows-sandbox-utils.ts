@@ -13,7 +13,10 @@ import {
   normalizePathForSandbox,
   containsGlobCharsWin,
   expandGlobPattern,
+  isAbsenceErrno,
   isUncPath,
+  DANGEROUS_FILES,
+  getDangerousDirectories,
 } from './sandbox-utils.js'
 // Re-export so existing tests (glob-expand.test.ts) and any
 // out-of-tree caller keep their import path. `buildGitConfigEnv` is
@@ -1722,6 +1725,60 @@ export function expandWindowsFsPaths(
     }
   }
   return [...out]
+}
+
+/**
+ * The mandatory write denies that follow from the working directory alone: the
+ * dangerous files and directories resolved against it, plus `.git/hooks` and
+ * (unless the caller allows git config) `.git/config`. The same two
+ * definitions the Linux and macOS backends read, so the three platforms
+ * protect the same names.
+ *
+ * Only paths that ARE THERE are returned. A Windows deny is an ACE and an ACE
+ * needs an object to sit on, so `srt-win acl stamp` answers a missing deny
+ * target by materializing a placeholder chain and stamping that — and a
+ * placeholder is permanent (`acl restore` strips the ACE and leaves the object,
+ * so a caller who wrote into one cannot lose data). That is the right answer
+ * for a `filesystem.denyWrite` entry someone asked for and the wrong one for a
+ * name nobody did: it would leave an empty `.mcp.json` or `.vscode\` behind in
+ * every working directory ever sandboxed. A name that appears later in the
+ * session is therefore not covered, which is what the README's Windows row of
+ * the mandatory-deny section says.
+ *
+ * The existence filter also covers what the Linux producer spells out as a
+ * separate `.git`-is-a-directory gate: where `.git` is a pointer file (a linked
+ * worktree or a submodule checkout) nothing exists beneath it.
+ *
+ * Nested repositories are not searched for. Linux finds them with a
+ * depth-limited ripgrep scan and macOS gets them from its glob patterns, while
+ * a Windows deny is one ACE per path with no pattern form.
+ */
+export function windowsGetCwdMandatoryDenyPaths(
+  allowGitConfig = false,
+): string[] {
+  const cwd = process.cwd()
+  const names = [
+    ...DANGEROUS_FILES,
+    ...getDangerousDirectories(),
+    '.git/hooks',
+    ...(allowGitConfig ? [] : ['.git/config']),
+  ]
+  return names.map(name => path.resolve(cwd, name)).filter(isThere)
+}
+
+/**
+ * Whether `p` names something to stamp. Absence is the ordinary answer and
+ * drops the path; anything else means something is there that could not be
+ * looked at, which is no reason to leave it writable — srt-win canonicalizes
+ * it and reports it as a bad input if it cannot.
+ */
+function isThere(p: string): boolean {
+  try {
+    fs.statSync(p)
+    return true
+  } catch (err) {
+    return !isAbsenceErrno(err)
+  }
 }
 
 /**
