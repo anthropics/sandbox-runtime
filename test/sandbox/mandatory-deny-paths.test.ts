@@ -2361,6 +2361,37 @@ describe('macGetMandatoryDenyEntries - Unit Tests', () => {
     }
   })
 
+  it.if(!isWindows)("names every hop of a pointer's own path", () => {
+    // The same answer where the chain is the VALUE of a `.git` pointer file
+    // rather than an entry of a git directory: each link the path goes
+    // through is a name of its own, and nothing is denied whole for it.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mac-git-pointer-')))
+    const saved = process.cwd()
+    try {
+      const checkout = join(dir, 'checkout')
+      mkdirSync(checkout, { recursive: true })
+      const gitDir = join(dir, 'real', 'gd')
+      mkdirSync(join(gitDir, 'hooks'), { recursive: true })
+      writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+      const hop = join(checkout, 'linkdir')
+      symlinkSync(join(dir, 'real'), hop)
+      writeFileSync(join(checkout, '.git'), 'gitdir: linkdir/gd\n')
+      process.chdir(checkout)
+
+      const paths = macGetMandatoryDenyEntries(false)
+        .filter(entry => !entry.glob)
+        .map(entry => entry.path)
+
+      expect(paths).toContain(join(checkout, '.git'))
+      expect(paths).toContain(hop)
+      expect(paths).toContain(join(hop, 'gd', 'hooks'))
+      expect(paths).not.toContain(checkout)
+    } finally {
+      process.chdir(saved)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('defaults to blocking .git/config when no argument provided', () => {
     const patterns = macGetMandatoryDenyEntries().map(e => e.path)
 
@@ -2518,7 +2549,8 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.escapingDenyPaths).toContain(middle)
       expect(denies.chainHops).toEqual([
         {
-          entry: join(gitDir, 'hooks'),
+          kind: 'entry',
+          source: join(gitDir, 'hooks'),
           link: middle,
           holder: join(dir, 'repo'),
         },
@@ -2550,7 +2582,12 @@ describe('Git metadata deny paths - Unit Tests', () => {
     // No bind of the git directory covers either, so a degrade keeps both.
     expect(denies.escapingDenyPaths).toEqual([landing, hop])
     expect(denies.chainHops).toEqual([
-      { entry: join(gitDir, 'hooks'), link: hop, holder: join(dir, 'repo') },
+      {
+        kind: 'entry',
+        source: join(gitDir, 'hooks'),
+        link: hop,
+        holder: join(dir, 'repo'),
+      },
     ])
   })
 
@@ -2573,7 +2610,12 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.denyPaths).toContain(join(real, 'hooks'))
       expect(denies.denyPaths).toContain(hop)
       expect(denies.chainHops).toEqual([
-        { entry: join(gitDir, 'hooks'), link: hop, holder: join(dir, 'repo') },
+        {
+          kind: 'entry',
+          source: join(gitDir, 'hooks'),
+          link: hop,
+          holder: join(dir, 'repo'),
+        },
       ])
     },
   )
@@ -2598,7 +2640,12 @@ describe('Git metadata deny paths - Unit Tests', () => {
       expect(denies.denyPaths).toContain(hop)
       expect(denies.escapingDenyPaths).toEqual([landing])
       expect(denies.chainHops).toEqual([
-        { entry: join(gitDir, 'hooks'), link: hop, holder: undefined },
+        {
+          kind: 'entry',
+          source: join(gitDir, 'hooks'),
+          link: hop,
+          holder: undefined,
+        },
       ])
       expect(denies.linkedEntryDirs).toEqual([gitDir])
     },
@@ -2627,7 +2674,8 @@ describe('Git metadata deny paths - Unit Tests', () => {
         expect(denies.linkedEntryDirs).toEqual([gitDir])
         expect(denies.chainHops).toEqual([
           {
-            entry: join(gitDir, 'hooks'),
+            kind: 'entry',
+            source: join(gitDir, 'hooks'),
             link: hop,
             holder: join(dir, 'repo'),
           },
@@ -2747,7 +2795,12 @@ describe('Git metadata deny paths - Unit Tests', () => {
 
       expect(scan.linkedEntryDirs).toEqual([modules])
       expect(scan.chainHops).toEqual([
-        { entry: join(modules, 'lib'), link: hop, holder: join(dir, 'repo') },
+        {
+          kind: 'entry',
+          source: join(modules, 'lib'),
+          link: hop,
+          holder: join(dir, 'repo'),
+        },
       ])
       // The hop's own path has no other list to sit in, so the flat form is
       // where a backend reads it.
@@ -2960,21 +3013,36 @@ describe('Git metadata deny paths - Unit Tests', () => {
   })
 
   it.if(!isWindows)(
-    'denies where a .. after a symlink lands, and the lexical path too',
+    'denies where a .. after a symlink lands, the lexical path and the link between',
     () => {
       // checkout/hop is real/side, so the kernel reads hop/../evil as
       // real/evil while folding it on paper gives checkout/evil. git opens
-      // the first; denying only the second leaves its hooks writable.
+      // the first; denying only the second leaves its hooks writable. The
+      // link itself is a third thing: retargeting it moves where git lands
+      // without touching the pointer file or either directory.
       const physical = makeGitDir(join(dir, 'real', 'evil'))
       mkdirSync(join(dir, 'real', 'side'), { recursive: true })
       const pointer = writePointer('checkout', 'gitdir: hop/../evil\n')
-      symlinkSync(join(dir, 'real', 'side'), join(dir, 'checkout', 'hop'))
+      const hop = join(dir, 'checkout', 'hop')
+      symlinkSync(join(dir, 'real', 'side'), hop)
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      const denies = gitFileDenies(pointer, false)
+
+      expect(denies.denyPaths).toEqual([
         pointer,
+        hop,
         ...gitDirDenyPaths(join(dir, 'checkout', 'evil'), false),
         ...gitDirDenyPaths(physical, false),
       ])
+      expect(denies.chainHops).toEqual([
+        {
+          kind: 'pointer',
+          source: pointer,
+          link: hop,
+          holder: join(dir, 'checkout'),
+        },
+      ])
+      expect(gitFileDenyPaths(pointer, false)).toEqual(denies.denyPaths)
     },
   )
 
@@ -2987,26 +3055,37 @@ describe('Git metadata deny paths - Unit Tests', () => {
 
     expect(gitFileDenyPaths(pointer, false)).toEqual([
       pointer,
+      join(dir, 'checkout', 'hop'),
       ...gitDirDenyPaths(lexical, false),
       ...gitDirDenyPaths(physical, false),
     ])
   })
 
   it.if(!isWindows)('walks a chain of symlinks as the kernel does', () => {
-    // first is second, second is an absolute path to real/side/deeper.
+    // first is second, second is an absolute path to real/side/deeper. Both
+    // links are on the way to what git opens, and each is held.
     const physical = makeGitDir(join(dir, 'real', 'evil'))
     mkdirSync(join(dir, 'real', 'side', 'deeper'), { recursive: true })
     const pointer = writePointer('checkout', 'gitdir: first/../../evil\n')
-    symlinkSync('second', join(dir, 'checkout', 'first'))
-    symlinkSync(
-      join(dir, 'real', 'side', 'deeper'),
-      join(dir, 'checkout', 'second'),
-    )
+    const first = join(dir, 'checkout', 'first')
+    const second = join(dir, 'checkout', 'second')
+    symlinkSync('second', first)
+    symlinkSync(join(dir, 'real', 'side', 'deeper'), second)
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    const denies = gitFileDenies(pointer, false)
+
+    expect(denies.denyPaths).toEqual([
       pointer,
+      first,
+      second,
       ...gitDirDenyPaths(join(dir, 'evil'), false),
       ...gitDirDenyPaths(physical, false),
+    ])
+    // In the order the walk met them, each named where the kernel reached it.
+    expect(denies.chainHops.map(hop => hop.link)).toEqual([first, second])
+    expect(denies.chainHops.map(hop => hop.holder)).toEqual([
+      join(dir, 'checkout'),
+      join(dir, 'checkout'),
     ])
   })
 
@@ -3015,14 +3094,26 @@ describe('Git metadata deny paths - Unit Tests', () => {
     () => {
       // The kernel cannot traverse a missing directory, so nothing after it
       // redirects the path: gone/x is denied against being created, and so
-      // is the lexical checkout/x.
+      // is the lexical checkout/x. The link it did read is held all the same.
       const pointer = writePointer('checkout', 'gitdir: hop/../x\n')
-      symlinkSync('gone/deeper', join(dir, 'checkout', 'hop'))
+      const hop = join(dir, 'checkout', 'hop')
+      symlinkSync('gone/deeper', hop)
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      const denies = gitFileDenies(pointer, false)
+
+      expect(denies.denyPaths).toEqual([
         pointer,
+        hop,
         ...gitDirDenyPaths(join(dir, 'checkout', 'x'), false),
         ...gitDirDenyPaths(join(dir, 'checkout', 'gone', 'x'), false),
+      ])
+      expect(denies.chainHops).toEqual([
+        {
+          kind: 'pointer',
+          source: pointer,
+          link: hop,
+          holder: join(dir, 'checkout'),
+        },
       ])
     },
   )
@@ -3034,26 +3125,46 @@ describe('Git metadata deny paths - Unit Tests', () => {
 
     // Past the hop limit the walk stops on the loop itself, which is where
     // the deny goes: the whole directory that still reads.
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    const denies = gitFileDenies(pointer, false)
+
+    expect(denies.denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(join(dir, 'checkout', 'evil'), false),
       join(dir, 'checkout'),
     ])
+    // A chain the kernel cannot walk either reaches nothing, so there is no
+    // hop to hold: the whole-directory deny is the whole answer, as it is
+    // for a symlinked entry that loops.
+    expect(denies.chainHops).toEqual([])
   })
 
   it.if(!isWindows)('resolves a commondir the same way', () => {
     const worktreeGitDir = makeGitDir(join(dir, 'wt.git'))
     const physical = makeGitDir(join(dir, 'real', 'common'))
+    const hop = join(worktreeGitDir, 'hop')
     mkdirSync(join(dir, 'real', 'side'), { recursive: true })
-    symlinkSync(join(dir, 'real', 'side'), join(worktreeGitDir, 'hop'))
+    symlinkSync(join(dir, 'real', 'side'), hop)
     writeFileSync(join(worktreeGitDir, 'commondir'), 'hop/../common\n')
     const pointer = makePointer('wt-checkout', worktreeGitDir)
 
-    expect(gitFileDenyPaths(pointer, false)).toEqual([
+    const denies = gitFileDenies(pointer, false)
+
+    expect(denies.denyPaths).toEqual([
       pointer,
       ...gitDirDenyPaths(worktreeGitDir, false),
+      hop,
       ...gitDirDenyPaths(join(worktreeGitDir, 'common'), false),
       ...gitDirDenyPaths(physical, false),
+    ])
+    // The file that named the path is the commondir, not the pointer: it is
+    // what a reader has to look at to see where the chain starts.
+    expect(denies.chainHops).toEqual([
+      {
+        kind: 'pointer',
+        source: join(worktreeGitDir, 'commondir'),
+        link: hop,
+        holder: worktreeGitDir,
+      },
     ])
   })
 
@@ -3069,11 +3180,102 @@ describe('Git metadata deny paths - Unit Tests', () => {
       const pointer = join(dir, 'link', '.git')
       writeFileSync(pointer, 'gitdir: ../target\n')
 
-      expect(gitFileDenyPaths(pointer, false)).toEqual([
+      const denies = gitFileDenies(pointer, false)
+
+      expect(denies.denyPaths).toEqual([
         pointer,
         ...gitDirDenyPaths(join(dir, 'target'), false),
         ...gitDirDenyPaths(physical, false),
       ])
+      // The link ABOVE the pointer file is where this checkout lives, not a
+      // hop of the chain its value walks: the walk starts where the kernel
+      // already is, so nothing here is held for it.
+      expect(denies.chainHops).toEqual([])
+    },
+  )
+
+  it.if(!isWindows)(
+    'holds a symlinked directory component of a value with no .. in it',
+    () => {
+      // `gitdir: linkdir/gd` reaches the git directory through `linkdir`,
+      // and git opens what the link leads to. Nothing else in the deny list
+      // names the link, so without this a command retargets it and every
+      // later git run in this checkout reads a git directory of its choosing.
+      makeGitDir(join(dir, 'realdir', 'gd'))
+      const pointer = writePointer('checkout', 'gitdir: linkdir/gd\n')
+      const hop = join(dir, 'checkout', 'linkdir')
+      symlinkSync(join(dir, 'realdir'), hop)
+
+      const denies = gitFileDenies(pointer, false)
+
+      expect(denies.denyPaths).toEqual([
+        pointer,
+        hop,
+        ...gitDirDenyPaths(join(hop, 'gd'), false),
+      ])
+      expect(denies.chainHops).toEqual([
+        {
+          kind: 'pointer',
+          source: pointer,
+          link: hop,
+          holder: join(dir, 'checkout'),
+        },
+      ])
+    },
+  )
+
+  it.if(!isWindows)('holds a link of a value that leads nowhere yet', () => {
+    // `mid` is there and what it names is not: the deny goes where the path
+    // lands, so a command cannot fill that git directory in, and the link is
+    // held so it cannot be aimed at one that already exists either.
+    const pointer = writePointer('checkout', 'gitdir: mid/gitdir\n')
+    const hop = join(dir, 'checkout', 'mid')
+    symlinkSync('gone', hop)
+
+    const denies = gitFileDenies(pointer, false)
+
+    expect(denies.denyPaths).toEqual([
+      pointer,
+      hop,
+      ...gitDirDenyPaths(join(hop, 'gitdir'), false),
+    ])
+    expect(denies.chainHops).toEqual([
+      {
+        kind: 'pointer',
+        source: pointer,
+        link: hop,
+        holder: join(dir, 'checkout'),
+      },
+    ])
+  })
+
+  it.if(!isWindows && process.getuid?.() !== 0)(
+    'holds the link it read where what lies past it cannot be',
+    () => {
+      // The chain runs into a directory this process cannot search, so the
+      // git directory is failed closed on the deepest ancestor it can reach
+      // and the link it DID read is held as any other is.
+      const locked = join(dir, 'checkout', 'locked')
+      mkdirSync(join(locked, 'inner'), { recursive: true })
+      const pointer = writePointer('checkout', 'gitdir: mid/gitdir\n')
+      const hop = join(dir, 'checkout', 'mid')
+      symlinkSync(join(locked, 'inner'), hop)
+      chmodSync(locked, 0o000)
+      try {
+        const denies = gitFileDenies(pointer, false)
+
+        expect(denies.denyPaths).toEqual([pointer, hop, join(dir, 'checkout')])
+        expect(denies.chainHops).toEqual([
+          {
+            kind: 'pointer',
+            source: pointer,
+            link: hop,
+            holder: join(dir, 'checkout'),
+          },
+        ])
+      } finally {
+        chmodSync(locked, 0o755)
+      }
     },
   )
 
@@ -4714,6 +4916,216 @@ describe.if(isSupportedPlatform)(
           // The host still resolves the chain where it did.
           expect(readlinkSync(hop)).toBe(landing)
           expect(existsSync(join(landing, 'post-commit'))).toBe(false)
+        },
+        300000,
+      )
+
+      /**
+       * A checkout whose `.git` is a POINTER FILE naming its git directory
+       * through `hop`: the same chain from the other producer, since a
+       * pointer's value is a path the kernel walks like any other.
+       */
+      function makePointerChain(holder: string): {
+        checkout: string
+        pointer: string
+        hop: string
+        gitDir: string
+      } {
+        const checkout = join(dir, 'repo')
+        const gitDir = makeGitDir(join(checkout, 'gitdir-real'))
+        mkdirSync(holder, { recursive: true })
+        const hop = join(holder, 'hop')
+        symlinkSync(gitDir, hop)
+        const pointer = join(checkout, '.git')
+        writeFileSync(pointer, `gitdir: ${hop}\n`)
+        return { checkout, pointer, hop, gitDir }
+      }
+
+      it.if(isLinux)(
+        "binds the directory holding a hop of a pointer's value read-only",
+        async () => {
+          const checkout = join(dir, 'repo')
+          const holder = join(checkout, 'links')
+          const { pointer, gitDir } = makePointerChain(holder)
+          process.chdir(checkout)
+
+          const command = await wrapCommandWithSandboxLinux({
+            command: 'true',
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+
+          const writeRootBind = indexOfMount(
+            command,
+            '--bind',
+            checkout,
+            checkout,
+          )
+          expect(writeRootBind).toBeGreaterThan(-1)
+          expect(
+            lastIndexOfMount(command, '--ro-bind', holder, holder),
+          ).toBeGreaterThan(writeRootBind)
+          // The two ends keep what they had: the pointer file itself, and the
+          // hooks of the git directory its value reaches — spelled where the
+          // deny RESOLVES to, which is what a bind can be put on.
+          expect(
+            lastIndexOfMount(command, '--ro-bind', pointer, pointer),
+          ).toBeGreaterThan(writeRootBind)
+          expect(
+            lastIndexOfMount(
+              command,
+              '--ro-bind',
+              join(gitDir, 'hooks'),
+              join(gitDir, 'hooks'),
+            ),
+          ).toBeGreaterThan(writeRootBind)
+        },
+        60000,
+      )
+
+      it.if(isLinux)(
+        "warns where the working directory holds a hop of a pointer's value",
+        async () => {
+          const checkout = join(dir, 'repo')
+          const { pointer, hop } = makePointerChain(checkout)
+          process.chdir(checkout)
+
+          const { result: command, warnings } = await withCapturedWarnings(() =>
+            wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+            }),
+          )
+
+          const writeRootBind = indexOfMount(
+            command,
+            '--bind',
+            checkout,
+            checkout,
+          )
+          expect(writeRootBind).toBeGreaterThan(-1)
+          expect(
+            lastIndexOfMount(command, '--ro-bind', checkout, checkout),
+          ).toBeLessThan(writeRootBind)
+          const told = warnings.join('\n')
+          // Named as what it is: the path a pointer file leads through.
+          expect(told).toContain(pointer)
+          expect(told).toContain(hop)
+        },
+        60000,
+      )
+
+      it.if(LIVE)(
+        "refuses every way to move a hop of a pointer's value a subdirectory holds",
+        async () => {
+          const git = Bun.which('git') as string
+          const checkout = join(dir, 'repo')
+          mkdirSync(checkout, { recursive: true })
+          const run = (...args: string[]): void => {
+            const r = spawnSync(git, args, { encoding: 'utf8', timeout: 60000 })
+            expect(r.status).toBe(0)
+          }
+          run('-c', 'init.defaultBranch=main', 'init', '-q', checkout)
+          // The repository git just made, reached through a link: its `.git`
+          // becomes the pointer file naming it.
+          const gitDir = join(checkout, 'gitdir-real')
+          renameSync(join(checkout, '.git'), gitDir)
+          const holder = join(checkout, 'links')
+          mkdirSync(holder, { recursive: true })
+          const hop = join(holder, 'hop')
+          symlinkSync(gitDir, hop)
+          const pointer = join(checkout, '.git')
+          writeFileSync(pointer, `gitdir: ${hop}\n`)
+          writeFileSync(join(checkout, 'f.txt'), 'one\n')
+          const evil = makeGitDir(join(checkout, 'evil-gitdir'))
+          process.chdir(checkout)
+
+          const command = await wrapCommandWithSandboxLinux({
+            command:
+              'echo BOOTED; ' +
+              `! ln -sfn ${evil} ${hop} || echo HOP_RETARGETABLE; ` +
+              `! mv ${hop} ${hop}.aside || echo HOP_RENAMABLE; ` +
+              `! rm -f ${hop} || echo HOP_UNLINKABLE; ` +
+              `! mkdir ${join(holder, 'other')} || echo HOLDER_WRITABLE; ` +
+              `! echo x > ${pointer} || echo POINTER_WRITABLE; ` +
+              `! echo x > ${join(gitDir, 'hooks', 'post-commit')} || echo HOOKS_WRITABLE; ` +
+              `echo ok > ${join(checkout, 'f.txt')} || echo PROJECT_FILE_READONLY; ` +
+              `${git} -C ${checkout} status --porcelain > /dev/null || echo GIT_STATUS_FAILED; ` +
+              'echo DONE',
+            needsNetworkRestriction: false,
+            allowAllUnixSockets: true,
+            readConfig: undefined,
+            writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+          })
+          const result = spawnSync(command, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).toContain('DONE')
+          expect(result.stdout).not.toContain('HOP_RETARGETABLE')
+          expect(result.stdout).not.toContain('HOP_RENAMABLE')
+          expect(result.stdout).not.toContain('HOP_UNLINKABLE')
+          expect(result.stdout).not.toContain('HOLDER_WRITABLE')
+          expect(result.stdout).not.toContain('POINTER_WRITABLE')
+          expect(result.stdout).not.toContain('HOOKS_WRITABLE')
+          expect(result.stdout).not.toContain('PROJECT_FILE_READONLY')
+          expect(result.stdout).not.toContain('GIT_STATUS_FAILED')
+          expect(readFileSync(join(checkout, 'f.txt'), 'utf8')).toBe('ok\n')
+          // The host still resolves the pointer where it did.
+          expect(readlinkSync(hop)).toBe(gitDir)
+        },
+        300000,
+      )
+
+      it.if(LIVE)(
+        "records that a hop of a pointer's value in the working directory can still be retargeted",
+        async () => {
+          // The same limit from the other producer, pinned as a fact: no bind
+          // holds a link the working directory itself holds, so the wrap warns
+          // and the retarget lands. The pointer file and the git directory it
+          // named are held all the same.
+          const checkout = join(dir, 'repo')
+          const { pointer, hop, gitDir } = makePointerChain(checkout)
+          const evil = makeGitDir(join(checkout, 'evil-gitdir'))
+          process.chdir(checkout)
+
+          const { result: command, warnings } = await withCapturedWarnings(() =>
+            wrapCommandWithSandboxLinux({
+              command:
+                'echo BOOTED; ' +
+                `ln -sfn ${evil} ${hop} || echo HOP_HELD; ` +
+                `! echo x > ${pointer} || echo POINTER_WRITABLE; ` +
+                `! echo x > ${join(gitDir, 'hooks', 'post-commit')} || echo HOOKS_WRITABLE; ` +
+                'echo DONE',
+              needsNetworkRestriction: false,
+              allowAllUnixSockets: true,
+              readConfig: undefined,
+              writeConfig: { allowOnly: [checkout], denyWithinAllow: [] },
+            }),
+          )
+          const result = spawnSync(command, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 120000,
+            cwd: checkout,
+          })
+
+          expect(warnings.join('\n')).toContain(hop)
+          expect(result.stdout).toContain('BOOTED')
+          expect(result.stdout).toContain('DONE')
+          expect(result.stdout).not.toContain('POINTER_WRITABLE')
+          expect(result.stdout).not.toContain('HOOKS_WRITABLE')
+          // Honestly recorded: the hop moved, so the host's git would now read
+          // the git directory the command chose.
+          expect(result.stdout).not.toContain('HOP_HELD')
+          expect(readlinkSync(hop)).toBe(evil)
         },
         300000,
       )

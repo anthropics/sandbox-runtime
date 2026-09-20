@@ -644,6 +644,54 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     )
   })
 
+  it('follows a .. after a symlink where the kernel lands, not where the path folds', () => {
+    // Both candidates are git directories git would accept, so which one it
+    // opens says what git's rule IS rather than which one happened to exist.
+    // It opens the kernel's landing: the link is followed and the `..`
+    // applied afterwards, which is the walk mandatory-deny-paths.ts makes.
+    const caseDir = join(root, `pointer-${caseCount++}`)
+    const checkout = join(caseDir, 'checkout')
+    mkdirSync(join(caseDir, 'real', 'side'), { recursive: true })
+    mkdirSync(checkout, { recursive: true })
+    const lexical = makeGitDir(join(checkout, 'evil'))
+    const physical = makeGitDir(join(caseDir, 'real', 'evil'))
+    const hop = join(checkout, 'hop')
+    symlinkSync(join(caseDir, 'real', 'side'), hop)
+    const pointer = join(checkout, '.git')
+    writeFileSync(pointer, 'gitdir: hop/../evil\n')
+
+    const opened = gitResolves(checkout, '--absolute-git-dir')
+    expect(opened).toBe(physical)
+    expect(opened).not.toBe(lexical)
+    // So the deny list has to carry that directory's hooks — and the link
+    // that decides which directory it is, since a command that retargets it
+    // moves where the next git run lands.
+    const denyPaths = gitFileDenyPaths(pointer, false)
+    expect(denyPaths).toContain(join(physical, 'hooks'))
+    expect(denyPaths).toContain(hop)
+    expect(assertParity('a .. after a symlink', pointer, checkout)).toBe(
+      'checked',
+    )
+  })
+
+  it('refuses a pointer that is a git directory only where the path folds', () => {
+    // The other half of the same rule: with the kernel's landing absent, git
+    // does not fall back to the lexical path, it refuses the checkout. The
+    // deny list names that path all the same — denying more than git follows
+    // is the safe direction, and the directory can still be created.
+    const caseDir = join(root, `pointer-${caseCount++}`)
+    const checkout = join(caseDir, 'checkout')
+    mkdirSync(join(caseDir, 'real', 'side'), { recursive: true })
+    mkdirSync(checkout, { recursive: true })
+    const lexical = makeGitDir(join(checkout, 'evil'))
+    symlinkSync(join(caseDir, 'real', 'side'), join(checkout, 'hop'))
+    const pointer = join(checkout, '.git')
+    writeFileSync(pointer, 'gitdir: hop/../evil\n')
+
+    expect(gitResolves(checkout, '--absolute-git-dir')).toBeUndefined()
+    expect(gitFileDenyPaths(pointer, false)).toContain(join(lexical, 'hooks'))
+  })
+
   // Linux only: the target has to exist for git to follow it, and macOS
   // filesystems refuse a name that is not valid UTF-8 (EILSEQ on mkdir). The
   // refusal itself is platform-independent and covered everywhere by the
