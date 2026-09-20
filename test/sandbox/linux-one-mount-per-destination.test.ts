@@ -314,6 +314,21 @@ describe.if(isLinux)('One mount per destination', () => {
     expect(command).not.toContain(`--ro-bind /dev/null ${SECRET}`)
   })
 
+  it('keeps the last fake where two entries name one file', async () => {
+    // bwrap applies mounts in order, so the second of two masks at one
+    // destination was the one in force; that is the one kept.
+    const command = await wrap({
+      maskedFileBinds: [
+        { realPath: SECRET, fakePath: join(FAKES, '0.fake') },
+        { realPath: join(LINK, 'secret.txt'), fakePath: join(FAKES, '1.fake') },
+      ],
+    })
+    expect(command).toContain(`--ro-bind ${join(FAKES, '1.fake')} ${SECRET}`)
+    expect(command).not.toContain(
+      `--ro-bind ${join(FAKES, '0.fake')} ${SECRET}`,
+    )
+  })
+
   it('re-applies a mask a write deny re-exposed, above that deny', async () => {
     const command = await wrap({ denyRead: [SECRET], denyWrite: [PROJ] })
     const argv = command.split(/\s+/)
