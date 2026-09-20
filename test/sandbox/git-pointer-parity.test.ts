@@ -594,7 +594,7 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
   ]
 
   it('resolves a corpus of pointer shapes the way git does', () => {
-    const verdicts = FIXED_CASES.map(runPointerCase)
+    const verdicts = FIXED_CASES.map(spec => runPointerCase(spec))
     // A corpus git followed nothing in would assert nothing at all.
     expect(verdicts.filter(v => v === 'checked').length).toBeGreaterThan(10)
   }, 120_000)
