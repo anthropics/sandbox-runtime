@@ -44,13 +44,12 @@ export interface SubmoduleDenyPlan {
    * Every symlink a git directory is reached THROUGH that the wrap found —
    * between an entry and what it leads to, or in the path a `gitdir:`
    * pointer's value walks — in the order it found them. What this backend
-   * takes from one
-   * is the directory holding it, the only thing a bind can hold a link by;
-   * the link's own path is a deny path for the backend that holds a link by
-   * its name and is dropped here. Which holders a wrap can actually bind
-   * depends on where the write roots are, so it is decided there rather than
-   * here and nothing collapses them: see `chainHopDenies` and
-   * `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts.
+   * takes from one is the directory holding it, the only thing a bind can
+   * hold a link by; the link's own path is a deny path for the backend that
+   * holds a link by its name and is dropped here. Which holders a wrap can
+   * actually bind depends on where the write roots are, so it is decided
+   * there rather than here and nothing collapses them: see `chainHopDenies`
+   * and `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts.
    */
   chainHops: GitChainHop[]
 }
