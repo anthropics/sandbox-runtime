@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+import { captured } from '../helpers/captured.js'
 import {
   createServer as createHttpServer,
   type IncomingHttpHeaders,
@@ -270,7 +271,7 @@ describe('header injection through the TLS-terminating proxy', () => {
   let upstreamPort: number
   let proxy: Server
   let proxyPort: number
-  let lastHeaders: IncomingHttpHeaders | undefined
+  const lastHeaders = captured<IncomingHttpHeaders>()
 
   beforeAll(async () => {
     const upCert = mintLeafCert(ca, '127.0.0.1')
@@ -280,7 +281,7 @@ describe('header injection through the TLS-terminating proxy', () => {
     upstream = createHttpsServer(
       { cert: upLeafOnly, key: upCert.keyPem },
       (req, res) => {
-        lastHeaders = req.headers
+        lastHeaders.value = req.headers
         res.writeHead(200, { 'content-type': 'text/plain' })
         res.end('ok')
       },
@@ -308,7 +309,7 @@ describe('header injection through the TLS-terminating proxy', () => {
   })
 
   test('upstream receives the real value when the client sends the sentinel', async () => {
-    lastHeaders = undefined
+    lastHeaders.clear()
     const r = await curlViaProxy(
       proxyPort,
       `https://127.0.0.1:${upstreamPort}/`,
@@ -316,20 +317,20 @@ describe('header injection through the TLS-terminating proxy', () => {
     )
     expect(r.exit).toBe(0)
     expect(r.status).toBe(200)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_TOKEN}`)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${REAL_TOKEN}`)
     // The real value never appears in anything the client (sandbox) sees.
     expect(r.body).not.toContain(REAL_TOKEN)
   })
 
   test('substitution covers arbitrary header names, not a fixed list', async () => {
-    lastHeaders = undefined
+    lastHeaders.clear()
     const r = await curlViaProxy(
       proxyPort,
       `https://127.0.0.1:${upstreamPort}/`,
       { headers: ['Private-Token: ' + sentinel] },
     )
     expect(r.exit).toBe(0)
-    expect(lastHeaders?.['private-token']).toBe(REAL_TOKEN)
+    expect(lastHeaders.value?.['private-token']).toBe(REAL_TOKEN)
   })
 
   test('a non-matching destination receives the sentinel unchanged', async () => {
@@ -342,7 +343,7 @@ describe('header injection through the TLS-terminating proxy', () => {
     const altUpstream = createHttpsServer(
       { cert: altLeaf, key: altCert.keyPem },
       (req, res) => {
-        lastHeaders = req.headers
+        lastHeaders.value = req.headers
         res.writeHead(200)
         res.end('ok')
       },
@@ -350,7 +351,7 @@ describe('header injection through the TLS-terminating proxy', () => {
     await new Promise<void>(r => altUpstream.listen(0, '127.0.0.1', r))
     const altPort = (altUpstream.address() as AddressInfo).port
     try {
-      lastHeaders = undefined
+      lastHeaders.clear()
       const r = await curlViaProxy(proxyPort, `https://localhost:${altPort}/`, {
         headers: ['Authorization: Bearer ' + sentinel],
         resolve: `localhost:${altPort}:127.0.0.1`,
@@ -358,8 +359,8 @@ describe('header injection through the TLS-terminating proxy', () => {
       expect(r.exit).toBe(0)
       expect(r.status).toBe(200)
       // Fails closed: the upstream sees the useless fake.
-      expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
-      expect(lastHeaders?.authorization).not.toContain(REAL_TOKEN)
+      expect(lastHeaders.value?.authorization).toBe(`Bearer ${sentinel}`)
+      expect(lastHeaders.value?.authorization).not.toContain(REAL_TOKEN)
     } finally {
       await new Promise<void>(r => altUpstream.close(() => r()))
     }
@@ -374,11 +375,11 @@ describe('header injection on the plain-HTTP path', () => {
 
   let upstream: Server
   let upstreamPort: number
-  let lastHeaders: IncomingHttpHeaders | undefined
+  const lastHeaders = captured<IncomingHttpHeaders>()
 
   beforeAll(async () => {
     upstream = createHttpServer((req, res) => {
-      lastHeaders = req.headers
+      lastHeaders.value = req.headers
       res.writeHead(200)
       res.end('ok')
     })
@@ -398,13 +399,13 @@ describe('header injection on the plain-HTTP path', () => {
     await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
     const port = (proxy.address() as AddressInfo).port
     try {
-      lastHeaders = undefined
+      lastHeaders.clear()
       const r = await curlViaProxy(port, `http://127.0.0.1:${upstreamPort}/`, {
         headers: ['Authorization: Bearer ' + sentinel],
       })
       expect(r.exit).toBe(0)
-      expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
-      expect(lastHeaders?.authorization).not.toContain(REAL_TOKEN)
+      expect(lastHeaders.value?.authorization).toBe(`Bearer ${sentinel}`)
+      expect(lastHeaders.value?.authorization).not.toContain(REAL_TOKEN)
     } finally {
       await new Promise<void>(r => proxy.close(() => r()))
     }
@@ -418,12 +419,12 @@ describe('header injection on the plain-HTTP path', () => {
     await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
     const port = (proxy.address() as AddressInfo).port
     try {
-      lastHeaders = undefined
+      lastHeaders.clear()
       const r = await curlViaProxy(port, `http://127.0.0.1:${upstreamPort}/`, {
         headers: ['Authorization: Bearer ' + sentinel],
       })
       expect(r.exit).toBe(0)
-      expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_TOKEN}`)
+      expect(lastHeaders.value?.authorization).toBe(`Bearer ${REAL_TOKEN}`)
     } finally {
       await new Promise<void>(r => proxy.close(() => r()))
     }
@@ -554,11 +555,11 @@ describe.if(isLinux)('end-to-end credential masking via SandboxManager', () => {
   const MASKED_VAR = 'SRT_TEST_E2E_TOKEN'
   let upstream: Server
   let upstreamPort: number
-  let lastHeaders: IncomingHttpHeaders | undefined
+  const lastHeaders = captured<IncomingHttpHeaders>()
 
   beforeAll(async () => {
     upstream = createHttpServer((req, res) => {
-      lastHeaders = req.headers
+      lastHeaders.value = req.headers
       res.writeHead(200)
       res.end('ok')
     })
@@ -603,13 +604,13 @@ describe.if(isLinux)('end-to-end credential masking via SandboxManager', () => {
       timeout: 10000,
       env: { ...process.env, [MASKED_VAR]: REAL_TOKEN },
     })
-    expect(inSandbox.stdout.trim()).toBe(sentinel)
+    expect(inSandbox.stdout.trim()).toBe(sentinel!)
 
     // A request carrying the sentinel through SandboxManager's proxy
     // reaches the upstream with the real value.
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
-    lastHeaders = undefined
+    lastHeaders.clear()
     const r = await curlViaProxy(
       proxyPort,
       `http://localhost:${upstreamPort}/`,
@@ -620,7 +621,7 @@ describe.if(isLinux)('end-to-end credential masking via SandboxManager', () => {
     )
     expect(r.exit).toBe(0)
     expect(r.status).toBe(200)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_TOKEN}`)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${REAL_TOKEN}`)
   }, 20000)
 
   test('a non-injectHost destination through the manager proxy receives the sentinel', async () => {
@@ -647,7 +648,7 @@ describe.if(isLinux)('end-to-end credential masking via SandboxManager', () => {
 
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
-    lastHeaders = undefined
+    lastHeaders.clear()
     const r = await curlViaProxy(
       proxyPort,
       `http://localhost:${upstreamPort}/`,
@@ -657,8 +658,8 @@ describe.if(isLinux)('end-to-end credential masking via SandboxManager', () => {
       },
     )
     expect(r.exit).toBe(0)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
-    expect(lastHeaders?.authorization).not.toContain(REAL_TOKEN)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${sentinel}`)
+    expect(lastHeaders.value?.authorization).not.toContain(REAL_TOKEN)
   }, 20000)
 })
 
@@ -682,21 +683,21 @@ describe.if(isLinux)('per-credential injectHosts via SandboxManager', () => {
   const GH_HOST = 'localhost'
   const NPM_HOST = 'npm.localhost'
 
-  let ghUp: Server, ghPort: number, ghHeaders: IncomingHttpHeaders | undefined
-  let npmUp: Server,
-    npmPort: number,
-    npmHeaders: IncomingHttpHeaders | undefined
+  let ghUp: Server, ghPort: number
+  let npmUp: Server, npmPort: number
+  const ghHeaders = captured<IncomingHttpHeaders>()
+  const npmHeaders = captured<IncomingHttpHeaders>()
   let ghSentinel: string, npmSentinel: string
   let proxyPort: number, authToken: string
 
   beforeAll(async () => {
     ghUp = createHttpServer((req, res) => {
-      ghHeaders = req.headers
+      ghHeaders.value = req.headers
       res.writeHead(200)
       res.end('ok')
     })
     npmUp = createHttpServer((req, res) => {
-      npmHeaders = req.headers
+      npmHeaders.value = req.headers
       res.writeHead(200)
       res.end('ok')
     })
@@ -742,45 +743,45 @@ describe.if(isLinux)('per-credential injectHosts via SandboxManager', () => {
   })
 
   test('GH sentinel swaps at its own per-entry injectHost', async () => {
-    ghHeaders = undefined
+    ghHeaders.clear()
     const r = await curlViaProxy(proxyPort, `http://${GH_HOST}:${ghPort}/`, {
       headers: ['Authorization: Bearer ' + ghSentinel],
       proxyAuth: `srt:${authToken}`,
     })
     expect(r.exit).toBe(0)
-    expect(ghHeaders?.authorization).toBe(`Bearer ${GH_REAL}`)
+    expect(ghHeaders.value?.authorization).toBe(`Bearer ${GH_REAL}`)
   }, 20000)
 
   test('NPM sentinel swaps only at its own per-entry injectHost', async () => {
-    npmHeaders = undefined
+    npmHeaders.clear()
     const r = await curlViaProxy(proxyPort, `http://${NPM_HOST}:${npmPort}/`, {
       headers: ['Authorization: Bearer ' + npmSentinel],
       proxyAuth: `srt:${authToken}`,
     })
     expect(r.exit).toBe(0)
-    expect(npmHeaders?.authorization).toBe(`Bearer ${NPM_REAL}`)
+    expect(npmHeaders.value?.authorization).toBe(`Bearer ${NPM_REAL}`)
 
     // Per-entry injectHosts is exclusive: NPM's sentinel sent to GH_HOST
     // (not in NPM's list) stays a fake.
-    ghHeaders = undefined
+    ghHeaders.clear()
     const r2 = await curlViaProxy(proxyPort, `http://${GH_HOST}:${ghPort}/`, {
       headers: ['Authorization: Bearer ' + npmSentinel],
       proxyAuth: `srt:${authToken}`,
     })
     expect(r2.exit).toBe(0)
-    expect(ghHeaders?.authorization).toBe(`Bearer ${npmSentinel}`)
-    expect(ghHeaders?.authorization).not.toContain(NPM_REAL)
+    expect(ghHeaders.value?.authorization).toBe(`Bearer ${npmSentinel}`)
+    expect(ghHeaders.value?.authorization).not.toContain(NPM_REAL)
   }, 20000)
 
   test("anti-laundering: GH sentinel sent to NPM's host is not swapped", async () => {
-    npmHeaders = undefined
+    npmHeaders.clear()
     const r = await curlViaProxy(proxyPort, `http://${NPM_HOST}:${npmPort}/`, {
       headers: ['Authorization: Bearer ' + ghSentinel],
       proxyAuth: `srt:${authToken}`,
     })
     expect(r.exit).toBe(0)
-    expect(npmHeaders?.authorization).toBe(`Bearer ${ghSentinel}`)
-    expect(npmHeaders?.authorization).not.toContain(GH_REAL)
+    expect(npmHeaders.value?.authorization).toBe(`Bearer ${ghSentinel}`)
+    expect(npmHeaders.value?.authorization).not.toContain(GH_REAL)
   }, 20000)
 })
 
@@ -798,17 +799,19 @@ describe.if(isLinux)(
     const HOST_A = 'localhost'
     const HOST_B = 'host-b.localhost'
 
-    let upA: Server, portA: number, hdrA: IncomingHttpHeaders | undefined
-    let upB: Server, portB: number, hdrB: IncomingHttpHeaders | undefined
+    let upA: Server, portA: number
+    let upB: Server, portB: number
+    const hdrA = captured<IncomingHttpHeaders>()
+    const hdrB = captured<IncomingHttpHeaders>()
 
     beforeAll(async () => {
       upA = createHttpServer((req, res) => {
-        hdrA = req.headers
+        hdrA.value = req.headers
         res.writeHead(200)
         res.end('ok')
       })
       upB = createHttpServer((req, res) => {
-        hdrB = req.headers
+        hdrB.value = req.headers
         res.writeHead(200)
         res.end('ok')
       })
@@ -844,13 +847,13 @@ describe.if(isLinux)(
       const proxyPort = SandboxManager.getProxyPort()!
       const authToken = SandboxManager.getProxyAuthToken()!
 
-      hdrA = undefined
+      hdrA.clear()
       const r = await curlViaProxy(proxyPort, `http://${HOST_A}:${portA}/`, {
         headers: ['Authorization: Bearer ' + sentinel],
         proxyAuth: `srt:${authToken}`,
       })
       expect(r.exit).toBe(0)
-      expect(hdrA?.authorization).toBe(`Bearer ${REAL}`)
+      expect(hdrA.value?.authorization).toBe(`Bearer ${REAL}`)
     }, 20000)
 
     test('without injectHosts, credential is injected at every allowedDomain', async () => {
@@ -874,21 +877,21 @@ describe.if(isLinux)(
       const proxyPort = SandboxManager.getProxyPort()!
       const authToken = SandboxManager.getProxyAuthToken()!
 
-      hdrA = undefined
+      hdrA.clear()
       const ra = await curlViaProxy(proxyPort, `http://${HOST_A}:${portA}/`, {
         headers: ['Authorization: Bearer ' + sentinel],
         proxyAuth: `srt:${authToken}`,
       })
       expect(ra.exit).toBe(0)
-      expect(hdrA?.authorization).toBe(`Bearer ${REAL}`)
+      expect(hdrA.value?.authorization).toBe(`Bearer ${REAL}`)
 
-      hdrB = undefined
+      hdrB.clear()
       const rb = await curlViaProxy(proxyPort, `http://${HOST_B}:${portB}/`, {
         headers: ['Authorization: Bearer ' + sentinel],
         proxyAuth: `srt:${authToken}`,
       })
       expect(rb.exit).toBe(0)
-      expect(hdrB?.authorization).toBe(`Bearer ${REAL}`)
+      expect(hdrB.value?.authorization).toBe(`Bearer ${REAL}`)
     }, 20000)
   },
 )
@@ -1048,11 +1051,11 @@ describe.if(isLinux)('end-to-end env decode masking via SandboxManager', () => {
 
   let upstream: Server
   let upstreamPort: number
-  let lastHeaders: IncomingHttpHeaders | undefined
+  const lastHeaders = captured<IncomingHttpHeaders>()
 
   beforeAll(async () => {
     upstream = createHttpServer((req, res) => {
-      lastHeaders = req.headers
+      lastHeaders.value = req.headers
       res.writeHead(200)
       res.end('ok')
     })
@@ -1100,7 +1103,7 @@ describe.if(isLinux)('end-to-end env decode masking via SandboxManager', () => {
 
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
-    lastHeaders = undefined
+    lastHeaders.clear()
     const r = await curlViaProxy(
       proxyPort,
       `http://${HOST_A}:${upstreamPort}/`,
@@ -1111,7 +1114,7 @@ describe.if(isLinux)('end-to-end env decode masking via SandboxManager', () => {
     )
     expect(r.exit).toBe(0)
     expect(r.status).toBe(200)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_JWT}`)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${REAL_JWT}`)
   }, 20000)
 
   test('a non-injectHost destination receives the fake JWT unchanged', async () => {
@@ -1120,7 +1123,7 @@ describe.if(isLinux)('end-to-end env decode masking via SandboxManager', () => {
 
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
-    lastHeaders = undefined
+    lastHeaders.clear()
     const r = await curlViaProxy(
       proxyPort,
       `http://${HOST_B}:${upstreamPort}/`,
@@ -1130,8 +1133,8 @@ describe.if(isLinux)('end-to-end env decode masking via SandboxManager', () => {
       },
     )
     expect(r.exit).toBe(0)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
-    expect(lastHeaders?.authorization).not.toContain(REAL_JWT)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${fakeJwt}`)
+    expect(lastHeaders.value?.authorization).not.toContain(REAL_JWT)
   }, 20000)
 })
 
@@ -1291,11 +1294,11 @@ describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
 
   let upstream: Server
   let upstreamPort: number
-  let lastHeaders: IncomingHttpHeaders | undefined
+  const lastHeaders = captured<IncomingHttpHeaders>()
 
   beforeAll(async () => {
     upstream = createHttpServer((req, res) => {
-      lastHeaders = req.headers
+      lastHeaders.value = req.headers
       res.writeHead(200)
       res.end('ok')
     })
@@ -1366,7 +1369,7 @@ describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
     // whole REAL token.
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
-    lastHeaders = undefined
+    lastHeaders.clear()
     const r = await curlViaProxy(
       proxyPort,
       `http://${HOST_A}:${upstreamPort}/`,
@@ -1377,7 +1380,7 @@ describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
     )
     expect(r.exit).toBe(0)
     expect(r.status).toBe(200)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_JWT}`)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${REAL_JWT}`)
   }, 20000)
 
   test('extracted-claim usage: the claim sentinel alone swaps to the real claim value', async () => {
@@ -1386,7 +1389,7 @@ describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
 
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
-    lastHeaders = undefined
+    lastHeaders.clear()
     const r = await curlViaProxy(
       proxyPort,
       `http://${HOST_A}:${upstreamPort}/`,
@@ -1396,7 +1399,7 @@ describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
       },
     )
     expect(r.exit).toBe(0)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${REAL_CLAIM}`)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${REAL_CLAIM}`)
   }, 20000)
 
   test('a non-injectHost destination receives the fake token and sentinel unchanged', async () => {
@@ -1404,23 +1407,23 @@ describe.if(isLinux)('end-to-end env maskClaims via SandboxManager', () => {
 
     const proxyPort = SandboxManager.getProxyPort()!
     const authToken = SandboxManager.getProxyAuthToken()!
-    lastHeaders = undefined
+    lastHeaders.clear()
     let r = await curlViaProxy(proxyPort, `http://${HOST_B}:${upstreamPort}/`, {
       headers: ['Authorization: Bearer ' + fakeJwt],
       proxyAuth: `srt:${authToken}`,
     })
     expect(r.exit).toBe(0)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${fakeJwt}`)
-    expect(lastHeaders?.authorization).not.toContain(REAL_CLAIM)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${fakeJwt}`)
+    expect(lastHeaders.value?.authorization).not.toContain(REAL_CLAIM)
 
-    lastHeaders = undefined
+    lastHeaders.clear()
     r = await curlViaProxy(proxyPort, `http://${HOST_B}:${upstreamPort}/`, {
       headers: ['Authorization: Bearer ' + claimOf(fakeJwt)],
       proxyAuth: `srt:${authToken}`,
     })
     expect(r.exit).toBe(0)
-    expect(lastHeaders?.authorization).toBe(`Bearer ${claimOf(fakeJwt)}`)
-    expect(lastHeaders?.authorization).not.toContain(REAL_CLAIM)
+    expect(lastHeaders.value?.authorization).toBe(`Bearer ${claimOf(fakeJwt)}`)
+    expect(lastHeaders.value?.authorization).not.toContain(REAL_CLAIM)
   }, 20000)
 })
 

@@ -24,6 +24,7 @@ import {
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
+import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
 import { randomBytes } from 'node:crypto'
@@ -733,7 +734,13 @@ async function initialize(
           // them, so the monitor must not judge by them either.
           ...(config.filesystem.disabled
             ? []
-            : linuxGetMonitorCwdDenyPaths(getAllowGitConfig())),
+            : linuxGetMonitorCwdDenyPaths(
+                getAllowGitConfig(),
+                // The write roots decide which directory holding a symlink
+                // between a git entry and its target a wrap can bind: the
+                // monitor has to judge by the same ones.
+                monitoredWrites.allowOnly.map(p => normalizePathForSandbox(p)),
+              )),
         ],
         ignoreViolations: config.ignoreViolations,
         resolveCommandText,
@@ -1033,10 +1040,9 @@ function isSandboxingEnabled(): boolean {
  * srt-win resolution failure) or the inputs for the Windows probe —
  * the only platform where the sync and async variants differ.
  */
-function checkDependenciesCommon(ripgrepConfig?: {
-  command: string
-  args?: string[]
-}):
+function checkDependenciesCommon(
+  ripgrepConfig?: RipgrepConfig,
+):
   | { done: SandboxDependencyCheck }
   | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
   if (!isSupportedPlatform()) {
@@ -1088,10 +1094,9 @@ function checkDependenciesCommon(ripgrepConfig?: {
  * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
  * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
  */
-function checkDependencies(ripgrepConfig?: {
-  command: string
-  args?: string[]
-}): SandboxDependencyCheck {
+function checkDependencies(
+  ripgrepConfig?: RipgrepConfig,
+): SandboxDependencyCheck {
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
   return checkWindowsDependencies(common.windows)
@@ -1104,10 +1109,9 @@ function checkDependencies(ripgrepConfig?: {
  * platforms the checks are native and this simply wraps the sync
  * result. Windows callers should prefer this variant.
  */
-async function checkDependenciesAsync(ripgrepConfig?: {
-  command: string
-  args?: string[]
-}): Promise<SandboxDependencyCheck> {
+async function checkDependenciesAsync(
+  ripgrepConfig?: RipgrepConfig,
+): Promise<SandboxDependencyCheck> {
   // Linux: resolve apply-seccomp first so its global-npm fallback
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
@@ -1285,6 +1289,23 @@ function resolveReadPathEntries(
   })
 }
 
+/**
+ * Strip a trailing `/**` and drop what is still a glob on Linux: bwrap needs
+ * real paths. macOS subpath matching is recursive, so the strip is harmless
+ * there and the filter never fires.
+ */
+function stripWriteGlobs(paths: readonly string[]): string[] {
+  return paths
+    .map(p => removeTrailingGlobSuffix(p))
+    .filter(p => {
+      if (getPlatform() === 'linux' && containsGlobChars(p)) {
+        logForDebugging(`[Sandbox] Skipping glob write pattern on Linux: ${p}`)
+        return false
+      }
+      return true
+    })
+}
+
 function expandAllowReadGlob(pattern: string): string[] {
   const expanded = expandGlobPattern(pattern)
   logForDebugging(
@@ -1342,27 +1363,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: ['/'], denyWithinAllow: [] }
   }
 
-  // Filter out glob patterns on Linux/WSL for allowWrite (bubblewrap doesn't support globs)
-  const allowPaths = config.filesystem.allowWrite
-    .map(path => removeTrailingGlobSuffix(path))
-    .filter(path => {
-      if (getPlatform() === 'linux' && containsGlobChars(path)) {
-        logForDebugging(`Skipping glob pattern on Linux/WSL: ${path}`)
-        return false
-      }
-      return true
-    })
-
-  // Filter out glob patterns on Linux/WSL for denyWrite (bubblewrap doesn't support globs)
-  const denyPaths = config.filesystem.denyWrite
-    .map(path => removeTrailingGlobSuffix(path))
-    .filter(path => {
-      if (getPlatform() === 'linux' && containsGlobChars(path)) {
-        logForDebugging(`Skipping glob pattern on Linux/WSL: ${path}`)
-        return false
-      }
-      return true
-    })
+  const allowPaths = stripWriteGlobs(config.filesystem.allowWrite)
+  const denyPaths = stripWriteGlobs(config.filesystem.denyWrite)
 
   const allowOnly = [
     ...defaultWritePathsUnder({
@@ -1542,7 +1544,7 @@ function getAllowAppleEvents(): boolean | undefined {
   return config?.allowAppleEvents
 }
 
-function getRipgrepConfig(): { command: string; args?: string[] } {
+function getRipgrepConfig(): RipgrepConfig {
   return config?.ripgrep ?? { command: 'rg' }
 }
 
@@ -1675,25 +1677,9 @@ async function wrapWithSandbox(
   // Get configs - use custom if provided, otherwise fall back to main config
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
-  //
-  // Strip trailing /** and filter remaining globs on Linux (bwrap needs
-  // real paths, not globs; macOS subpath matching is also recursive so
-  // stripping is harmless there).
   let writeConfig: FsWriteRestrictionConfig | undefined
   let readConfig: FsReadRestrictionConfig | undefined
   if (!fsDisabled) {
-    const stripWriteGlobs = (paths: string[]): string[] =>
-      paths
-        .map(p => removeTrailingGlobSuffix(p))
-        .filter(p => {
-          if (getPlatform() === 'linux' && containsGlobChars(p)) {
-            logForDebugging(
-              `[Sandbox] Skipping glob write pattern on Linux: ${p}`,
-            )
-            return false
-          }
-          return true
-        })
     const userAllowWrite = stripWriteGlobs(
       customConfig?.filesystem?.allowWrite ??
         config?.filesystem.allowWrite ??

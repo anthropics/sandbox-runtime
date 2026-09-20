@@ -11,12 +11,27 @@ import * as fs from 'fs'
 import * as net from 'net'
 import * as path from 'path'
 import * as os from 'os'
+import { createRequire } from 'module'
 
 /**
  * Get default config path
  */
 function getDefaultConfigPath(): string {
   return path.join(os.homedir(), '.srt-settings.json')
+}
+
+/**
+ * The version `--version` reports, read from the package's own manifest, which
+ * sits one directory above both src/cli.ts and dist/cli.js. There is no
+ * fallback: a manifest that cannot be read is a broken install, and a
+ * plausible-looking wrong version is worse than the throw, because the README
+ * pins behaviour to specific releases.
+ */
+function getPackageVersion(): string {
+  const manifest: { version: string } = createRequire(import.meta.url)(
+    '../package.json',
+  )
+  return manifest.version
 }
 
 /**
@@ -167,7 +182,7 @@ async function main(): Promise<void> {
     .description(
       'Run commands in a sandbox with network and filesystem restrictions',
     )
-    .version(process.env.npm_package_version || '1.0.0')
+    .version(getPackageVersion())
 
   // ── Windows install/uninstall ─────────────────────────────────
   // Self-elevating one-shot install (one UAC prompt). Also

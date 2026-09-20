@@ -1009,10 +1009,8 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(usable).not.toContain(stub)
 
     const realRealpathSync = fs.realpathSync
-    using spy = spyOn(fs, 'realpathSync').mockImplementation(((
-      p: fs.PathLike,
-      ...rest: unknown[]
-    ) => {
+    const spy = spyOn(fs, 'realpathSync')
+    spy.mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
       if (String(p) === build) {
         throw Object.assign(new Error('EACCES: cannot resolve'), {
           code: 'EACCES',
@@ -1020,13 +1018,17 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       }
       return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
     }) as typeof fs.realpathSync)
-    const { result: unusable, warnings } = await withCapturedWarnings(() =>
-      wrap([PROJ], [build]),
-    )
-    expect(spy).toHaveBeenCalled()
+    try {
+      const { result: unusable, warnings } = await withCapturedWarnings(() =>
+        wrap([PROJ], [build]),
+      )
+      expect(spy).toHaveBeenCalled()
 
-    expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
-    expect(unusable).toContain(stub)
+      expect(warnings.join('\n')).toContain('Read-deny prediction unusable')
+      expect(unusable).toContain(stub)
+    } finally {
+      spy.mockRestore()
+    }
   })
 
   it('resolves a root child again when the first failure is transient', async () => {

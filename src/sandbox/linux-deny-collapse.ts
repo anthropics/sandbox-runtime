@@ -1,5 +1,9 @@
 import * as fs from 'fs'
-import type { GitDirTreeDenies } from './mandatory-deny-paths.js'
+import type {
+  GitDirDenies,
+  GitDirTreeDenies,
+  GitChainHop,
+} from './mandatory-deny-paths.js'
 import { isAtOrUnder } from './sandbox-utils.js'
 
 /**
@@ -13,9 +17,15 @@ import { isAtOrUnder } from './sandbox-utils.js'
 export interface RepositorySubmodules {
   modulesDir: string
   /** Sorted by path, which is the order a collapse works back through. */
-  gitDirs: Array<{ gitDir: string; denyPaths: string[] }>
-  /** Directories the walk could not see through: whole-directory denies. */
-  unreadableDirs: string[]
+  gitDirs: Array<{ gitDir: string } & GitDirDenies>
+  /**
+   * The whole-directory denies UNDER `modulesDir`: what the walk could not
+   * see through, and the directories holding an entry it followed through a
+   * symlink. A bind of `modules` covers the ones really under it. The git
+   * directory's own whole-deny is not one of these: it holds `modules`
+   * rather than sitting under it, and it is no reason to degrade anything.
+   */
+  wholeDirDenies: string[]
 }
 
 /** What one wrap denies, and what of that can be degraded. */
@@ -30,6 +40,18 @@ export interface SubmoduleDenyPlan {
    * absent one is never denied and never costs anything.
    */
   repositories: RepositorySubmodules[]
+  /**
+   * Every symlink a git directory is reached THROUGH that the wrap found —
+   * between an entry and what it leads to, or in the path a `gitdir:`
+   * pointer's value walks — in the order it found them. What this backend
+   * takes from one is the directory holding it, the only thing a bind can
+   * hold a link by; the link's own path is a deny path for the backend that
+   * holds a link by its name and is dropped here. Which holders a wrap can
+   * actually bind depends on where the write roots are, so it is decided
+   * there rather than here and nothing collapses them: see `chainHopDenies`
+   * and `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts.
+   */
+  chainHops: GitChainHop[]
 }
 
 /**
@@ -54,13 +76,22 @@ export const NO_COLLAPSE: CollapseLevel = {
 export function repositorySubmodules(
   denies: GitDirTreeDenies,
 ): RepositorySubmodules | undefined {
-  if (denies.submodules.length === 0 && denies.unreadableDirs.length === 0) {
+  // Under `modules` only: a git directory denied whole because one of its OWN
+  // entries is a symlink is not a submodule deny, and a repository with
+  // nothing under `modules` must stay out of the plan altogether — an absent
+  // `.git/modules` is never denied, since a mount point planted at one stops
+  // `git submodule add` working in that repository.
+  const wholeDirDenies = [
+    ...denies.unreadableDirs,
+    ...denies.linkedEntryDirs,
+  ].filter(denyPath => isAtOrUnder(denyPath, denies.modulesDir))
+  if (denies.submodules.length === 0 && wholeDirDenies.length === 0) {
     return undefined
   }
   return {
     modulesDir: denies.modulesDir,
     gitDirs: denies.submodules,
-    unreadableDirs: denies.unreadableDirs,
+    wholeDirDenies,
   }
 }
 
@@ -72,8 +103,11 @@ export function repositorySubmodules(
  * A degraded submodule git directory's own deny paths are dropped from the
  * list wherever they sit and one read-only bind of the git directory is added
  * in their place; a `.git/modules` denied whole takes everything under it the
- * same way. A `.git` pointer file's own deny is never one of them: it names a
- * file, and a file has nothing to collapse into.
+ * same way. Two kinds of deny paths are NOT dropped: a `.git` pointer file's
+ * own, which names a file and has nothing to collapse into, and the ones the
+ * producer marked as leading out of the git directory — what an entry that is
+ * a symlink points at, which no bind of the directory holding the link
+ * covers.
  */
 export function collapsedDenyPaths(
   plan: SubmoduleDenyPlan,
@@ -109,22 +143,24 @@ export function collapsedDenyPaths(
       : () => false
     if (wholeModules) wholeBinds.push(repository.modulesDir)
     for (const submodule of repository.gitDirs) {
-      if (coveredByModules(submodule.gitDir)) {
-        for (const denyPath of submodule.denyPaths) covered.add(denyPath)
-        continue
+      const byModules = coveredByModules(submodule.gitDir)
+      if (!byModules && !wholeGitDirs.has(submodule.gitDir)) continue
+      const escaping = new Set(submodule.escapingDenyPaths)
+      for (const denyPath of submodule.denyPaths) {
+        if (!escaping.has(denyPath)) covered.add(denyPath)
       }
-      if (!wholeGitDirs.has(submodule.gitDir)) continue
-      for (const denyPath of submodule.denyPaths) covered.add(denyPath)
-      wholeBinds.push(submodule.gitDir)
+      if (!byModules) wholeBinds.push(submodule.gitDir)
     }
-    for (const unreadableDir of repository.unreadableDirs) {
-      if (coveredByModules(unreadableDir)) covered.add(unreadableDir)
+    for (const wholeDirDeny of repository.wholeDirDenies) {
+      if (coveredByModules(wholeDirDeny)) covered.add(wholeDirDeny)
     }
   }
-  return [
-    ...plan.denyPaths.filter(denyPath => !covered.has(denyPath)),
-    ...wholeBinds,
-  ]
+  // A git directory that is a deny path in its own right — one holding a
+  // symlinked entry — is both dropped as covered and added back as the bind
+  // that covers it, so the binds are added only where the list has lost them.
+  const kept = plan.denyPaths.filter(denyPath => !covered.has(denyPath))
+  const keptPaths = new Set(kept)
+  return [...kept, ...wholeBinds.filter(bind => !keptPaths.has(bind))]
 }
 
 /**
@@ -135,9 +171,10 @@ export function collapsedDenyPaths(
  * How much each step gives back is what the caller measures; the arithmetic
  * here only decides how many entries one step takes, so that a repository
  * with thousands of submodules is not rebuilt once per submodule. A
- * submodule git directory gives back one mount per deny path it loses, plus
- * the ancestor pin of the git directory itself, which the bind that replaces
- * them is.
+ * submodule git directory gives back one mount per deny path the bind that
+ * replaces them covers — a deny leading out of it is kept and gives back
+ * nothing — plus the ancestor pin of the git directory itself, which that
+ * bind is.
  */
 export function collapseFurther(
   plan: SubmoduleDenyPlan,
@@ -149,7 +186,11 @@ export function collapseFurther(
     const taken = stepBack(
       order.length - level.wholeGitDirs,
       mountsOver,
-      at => order[at]?.denyPaths.length ?? 0,
+      at => {
+        const submodule = order[at]
+        if (submodule === undefined) return 0
+        return submodule.denyPaths.length - submodule.escapingDenyPaths.length
+      },
     )
     return { ...level, wholeGitDirs: level.wholeGitDirs + taken }
   }
@@ -182,41 +223,68 @@ function stepBack(
   return Math.max(taken, 1)
 }
 
-/** One line naming what `level` degraded, for the wrap's warning. */
+/**
+ * One line naming what `level` degraded, for the wrap's warning.
+ *
+ * What a whole-directory deny of the plan's own already covers is left out of
+ * it: a submodule under a `.git/modules` denied whole for an entry that is a
+ * symlink is read-only whole before anything is degraded, so its precise
+ * denies were never what held it and a collapse of it takes nothing away.
+ * Saying otherwise names a cost the profile did not pay here.
+ */
 export function describeCollapse(
   plan: SubmoduleDenyPlan,
   level: CollapseLevel,
 ): string {
   const order = collapsibleGitDirs(plan)
+  const alreadyWhole = coveredByWholeDirDeny(plan)
   const parts: string[] = []
   if (level.wholeGitDirs > 0) {
-    const collapsed = order.slice(order.length - level.wholeGitDirs)
-    const repositories = [
-      ...new Set(collapsed.map(entry => entry.modulesDir)),
-    ].join(', ')
-    parts.push(
-      `${level.wholeGitDirs} of the ${order.length} submodule git directories under ${repositories} are denied whole rather than by path, so git writes inside those submodules fail read-only`,
-    )
+    const collapsed = order
+      .slice(order.length - level.wholeGitDirs)
+      .filter(entry => !alreadyWhole(entry.gitDir))
+    if (collapsed.length > 0) {
+      const repositories = [
+        ...new Set(collapsed.map(entry => entry.modulesDir)),
+      ].join(', ')
+      parts.push(
+        `${collapsed.length} of the ${order.length} submodule git directories under ${repositories} are denied whole rather than by path, so git writes inside those submodules fail read-only`,
+      )
+    }
   }
   if (level.wholeModulesDirs > 0) {
     const collapsed = plan.repositories
       .slice(plan.repositories.length - level.wholeModulesDirs)
       .map(repository => repository.modulesDir)
-    parts.push(
-      `${collapsed.join(', ')} ${collapsed.length === 1 ? 'is' : 'are'} denied whole, taking every submodule under ${collapsed.length === 1 ? 'it' : 'them'}`,
-    )
+      .filter(modulesDir => !alreadyWhole(modulesDir))
+    if (collapsed.length > 0) {
+      parts.push(
+        `${collapsed.join(', ')} ${collapsed.length === 1 ? 'is' : 'are'} denied whole, taking every submodule under ${collapsed.length === 1 ? 'it' : 'them'}`,
+      )
+    }
   }
   return parts.join('; ')
+}
+
+/** Whether a path is read-only whole in this plan whatever it degrades: a
+ *  directory the walk could not see through, or one holding an entry that is
+ *  a symlink, covers everything really under it. */
+function coveredByWholeDirDeny(
+  plan: SubmoduleDenyPlan,
+): (candidate: string) => boolean {
+  const covers = plan.repositories
+    .flatMap(repository => repository.wholeDirDenies)
+    .map(underDirectory)
+  if (covers.length === 0) return () => false
+  return candidate => covers.some(under => under(candidate))
 }
 
 /** Every submodule git directory the plan may degrade, in the order a
  *  collapse works back through: by repository as served, each repository's
  *  own sorted. */
-function collapsibleGitDirs(plan: SubmoduleDenyPlan): Array<{
-  modulesDir: string
-  gitDir: string
-  denyPaths: string[]
-}> {
+function collapsibleGitDirs(
+  plan: SubmoduleDenyPlan,
+): Array<{ modulesDir: string; gitDir: string } & GitDirDenies> {
   return plan.repositories.flatMap(repository =>
     repository.gitDirs.map(submodule => ({
       modulesDir: repository.modulesDir,

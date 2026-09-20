@@ -1,6 +1,5 @@
 import { spawn } from 'child_process'
 import { text } from 'node:stream/consumers'
-import { whichSync } from './which.js'
 
 export interface RipgrepConfig {
   command: string
@@ -15,14 +14,6 @@ export interface RipgrepConfig {
 }
 
 export const DEFAULT_RIPGREP_TIMEOUT_MS = 10_000
-
-/**
- * Check if ripgrep (rg) is available synchronously
- * Returns true if rg is installed, false otherwise
- */
-export function hasRipgrepSync(): boolean {
-  return whichSync('rg') !== null
-}
 
 /**
  * ripgrep exited with an error status. `partialMatches` is what it listed

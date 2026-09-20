@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'bun:test'
 import { chmodSync, mkdirSync, writeFileSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { basename, join } from 'path'
 import { ripGrep, RipgrepError } from '../../src/utils/ripgrep.js'
 import { isWindows } from '../helpers/platform.js'
 
@@ -69,7 +69,7 @@ describe('ripGrep', () => {
       })
       // Without argv0 override, process.argv0 defaults to the executable path
       expect(results[0]).not.toBe('rg')
-      expect(results[0]).toContain(process.execPath.split('/').pop())
+      expect(results[0]).toContain(basename(process.execPath))
     } finally {
       rmSync(dir, { recursive: true })
     }

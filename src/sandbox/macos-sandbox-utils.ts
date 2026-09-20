@@ -24,8 +24,10 @@ import {
   gitDirDenyPaths,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
-  gitFileDenyPaths,
+  gitFileDenies,
+  physicalDenyPath,
 } from './mandatory-deny-paths.js'
+import type { GitChainHop } from './mandatory-deny-paths.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 import type {
@@ -146,7 +148,9 @@ export function macGetMandatoryDenyEntries(
   // directories against being renamed out from under the deny. The producers
   // in mandatory-deny-paths.ts return the string arrays the Linux backend
   // binds, and every string in them was read off the filesystem, so each
-  // becomes a literal entry here.
+  // becomes a literal entry here — both of its spellings, since a filter and
+  // a bind hold a path that goes through a symlink by different ends (see
+  // gitDiskDenyEntries).
   const dotGit = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
   try {
@@ -156,31 +160,92 @@ export function macGetMandatoryDenyEntries(
     // could not be looked at, which is no reason to skip the enumeration: a
     // literal entry is a subpath deny, so this denies it whole, as the Linux
     // backend's bind of the same path does.
-    if (!isAbsenceErrno(err)) return [...entries, toLiteralPathEntry(dotGit)]
+    if (!isAbsenceErrno(err)) {
+      return [...entries, ...gitDiskDenyEntries([dotGit], [])]
+    }
   }
   if (dotGitStat?.isDirectory()) {
+    const tree = gitDirTreeDenies(dotGit, allowGitConfig)
     entries.push(
-      ...gitDirTreeDenyPaths(gitDirTreeDenies(dotGit, allowGitConfig)).map(
-        toLiteralPathEntry,
-      ),
+      ...gitDiskDenyEntries(gitDirTreeDenyPaths(tree), tree.chainHops),
     )
   } else {
     // Absent, or a pointer file: the repository's own hooks and config are
     // denied either way, so neither can be created under a .git that is not
     // there yet.
     entries.push(
-      ...gitDirDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
+      ...gitDiskDenyEntries(gitDirDenyPaths(dotGit, allowGitConfig), []),
     )
     if (dotGitStat?.isFile()) {
       // cwd checked out as a linked worktree or submodule: .git is a pointer
       // file. Nested pointer files are matched by vnode type instead
       // (gitPointerFilter), which cannot follow them.
-      entries.push(
-        ...gitFileDenyPaths(dotGit, allowGitConfig).map(toLiteralPathEntry),
-      )
+      const pointer = gitFileDenies(dotGit, allowGitConfig)
+      entries.push(...gitDiskDenyEntries(pointer.denyPaths, pointer.chainHops))
     }
   }
 
+  return entries
+}
+
+/**
+ * Literal entries for the deny paths a git producer read off disk: each as it
+ * was written, and the path the kernel lands on walking it, without
+ * duplicates.
+ *
+ * Seatbelt matches a filter against the path an operation RESOLVED to, while
+ * the path in the filter is compared as a string, so the two spellings of a
+ * path that goes through a symlink hold different halves of it. Measured with
+ * `(deny file-write* (subpath P))` and a `dlink` leading out of the tree:
+ *
+ *              P = dlink/sub  P = dlink   P = the landing
+ *   write P/f       lands       lands        REFUSED
+ *   write link/f    lands       lands        REFUSED
+ *   rm / mv dlink   lands      REFUSED        lands
+ *
+ * `literal` and `regex` filters answer the same, and so does `file-read*`.
+ * The path as written is therefore the only name an unlink or a rename of a
+ * link in it uses, and the landing the only one a write to what it leads to
+ * matches — a chain needs both ends named, and either alone leaves a hole.
+ *
+ * Emitted here rather than by the producers both backends share, because
+ * Linux has no such split: bwrap resolves a deny path before it binds and
+ * lands on the same directory whichever spelling it was handed.
+ *
+ * The two collapse to one entry wherever nothing on the way is a symlink,
+ * which is every path of an ordinary repository, and wherever the difference
+ * is only the `/tmp` and `/var` prefixes ({@link normalizePathForSandbox}
+ * canonicalises those onto `/private`, which is the spelling Seatbelt
+ * compares against).
+ *
+ * A CHAIN HOP is the exception, and gets its own path alone: what a hop leads
+ * to is a whole directory nothing asked to deny - the `/private/var` a
+ * `/var/folders` pointer walks through, the shared directory a `links/gd`
+ * value crosses - and denying it would take everything beside the git
+ * directory with it. The link's own name is the entire handle on a hop, which
+ * is why Linux drops it from its binds for the mirror-image reason (see
+ * `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts). What lies
+ * past the hop is protected by the git directory's own deny paths, which are
+ * in this same list and do get both spellings.
+ */
+function gitDiskDenyEntries(
+  denyPaths: readonly string[],
+  chainHops: readonly GitChainHop[],
+): PathEntry[] {
+  const hopLinks = new Set(chainHops.map(hop => hop.link))
+  const entries: PathEntry[] = []
+  const named = new Set<string>()
+  for (const denyPath of denyPaths) {
+    const spellings = hopLinks.has(denyPath)
+      ? [denyPath]
+      : [denyPath, physicalDenyPath(denyPath)]
+    for (const spelling of spellings) {
+      const entry = toLiteralPathEntry(spelling)
+      if (named.has(entry.path)) continue
+      named.add(entry.path)
+      entries.push(entry)
+    }
+  }
   return entries
 }
 

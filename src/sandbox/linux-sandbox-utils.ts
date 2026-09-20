@@ -11,8 +11,8 @@ import {
   ripGrep,
   RipgrepError,
   DEFAULT_RIPGREP_TIMEOUT_MS,
+  type RipgrepConfig,
 } from '../utils/ripgrep.js'
-import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   generateProxyEnvVars,
@@ -32,12 +32,13 @@ import {
 import {
   GitMetadataError,
   SubmoduleWalkBudgetError,
-  gitDirDenyPaths,
+  gitDirDenies,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
-  gitFileDenyPaths,
+  gitFileDenies,
   gitRedirectPlaceholder,
 } from './mandatory-deny-paths.js'
+import type { GitDirTreeDenies, GitChainHop } from './mandatory-deny-paths.js'
 import type {
   CollapseLevel,
   RepositorySubmodules,
@@ -257,7 +258,7 @@ function hasFileAncestor(targetPath: string): boolean {
     const nextPath = currentPath + path.sep + part
     try {
       const stat = fs.statSync(nextPath)
-      if (stat.isFile() || stat.isSymbolicLink()) {
+      if (stat.isFile()) {
         // This component exists as a file — nothing below it can be created
         return true
       }
@@ -651,11 +652,13 @@ function denyScanFailed(
  */
 export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
+  allowWritePaths: readonly string[] = [],
 ): string[] {
-  return collapsedDenyPaths(
-    cwdMandatoryDenyPlan(allowGitConfig, undefined),
-    NO_COLLAPSE,
-  )
+  const plan = cwdMandatoryDenyPlan(allowGitConfig, undefined)
+  return [
+    ...collapsedDenyPaths(plan, NO_COLLAPSE),
+    ...chainHopDenies(plan.chainHops, allowWritePaths).held,
+  ]
 }
 
 /** {@link linuxGetCwdMandatoryDenyPaths} with the working directory's own
@@ -668,6 +671,7 @@ function cwdMandatoryDenyPlan(
   const cwd = process.cwd()
   const denyPaths = cwdDangerousDenyPaths(cwd)
   const repositories: RepositorySubmodules[] = []
+  const chainHops: GitChainHop[] = []
 
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
@@ -679,21 +683,139 @@ function cwdMandatoryDenyPlan(
     // could not be looked at, which is no reason to skip the enumeration —
     // deny it whole instead.
     if (!isAbsenceErrno(err)) {
-      return { denyPaths: [...denyPaths, dotGitPath], repositories }
+      return { denyPaths: [...denyPaths, dotGitPath], repositories, chainHops }
     }
   }
   if (dotGitStat?.isDirectory()) {
     const denies = gitDirTreeDenies(dotGitPath, allowGitConfig, { deadline })
-    denyPaths.push(...gitDirTreeDenyPaths(denies))
+    denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
+    chainHops.push(...denies.chainHops)
     const repository = repositorySubmodules(denies)
     if (repository !== undefined) repositories.push(repository)
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
-    denyPaths.push(...gitFileDenyPaths(dotGitPath, allowGitConfig))
+    const pointer = gitFileDenies(dotGitPath, allowGitConfig)
+    denyPaths.push(
+      ...withoutChainHopLinks(pointer.denyPaths, pointer.chainHops),
+      ...pointer.linkedEntryDirs,
+    )
+    chainHops.push(...pointer.chainHops)
   }
 
-  return { denyPaths, repositories }
+  return { denyPaths, repositories, chainHops }
+}
+
+/**
+ * {@link gitDirTreeDenyPaths} plus the directories that have to be denied
+ * WHOLE because they hold an entry that is a symlink, and minus the deny
+ * paths that name a symlink itself. Both follow from the same thing: a bind
+ * lands on what a deny path resolves to, so the link's own path keeps
+ * nothing and the directory around it is the handle on it, while a Seatbelt
+ * filter matches the path as a rename or an unlink names it and needs
+ * neither (see `gitDirDenies` in src/sandbox/mandatory-deny-paths.ts).
+ */
+function linuxGitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
+  return [
+    ...withoutChainHopLinks(gitDirTreeDenyPaths(denies), denies.chainHops),
+    ...denies.linkedEntryDirs,
+  ]
+}
+
+/**
+ * `denyPaths` without the ones naming an intermediate hop of a chain. A bind
+ * there lands on whatever the link leads to — for a symlinked directory
+ * component a whole directory nothing asked to deny, and for a `.git/modules`
+ * entry the git directory it reaches — while holding the link itself, which
+ * is the point, is what the hop's HOLDER is denied whole for.
+ */
+function withoutChainHopLinks(
+  denyPaths: string[],
+  chainHops: readonly GitChainHop[],
+): string[] {
+  if (chainHops.length === 0) return denyPaths
+  const links = new Set(chainHops.map(hop => hop.link))
+  return denyPaths.filter(denyPath => !links.has(denyPath))
+}
+
+/**
+ * Which of the symlinks a git directory is reached THROUGH — between an entry
+ * and what it leads to, or in the path a `gitdir:` pointer's value walks —
+ * this backend can hold, and which it cannot.
+ *
+ * A bind cannot be put on a link — the destination resolves — so the
+ * directory holding one is the whole handle, exactly as the git directory is
+ * the handle on the entry's own link. `held` is those directories, one
+ * read-only bind each, charged to the mount budget like any other deny.
+ *
+ * Three kinds are not in it. A hop a whole-directory deny already covers
+ * names no holder at all. A hop no allowed write path contains is read-only
+ * from the initial `--ro-bind / /` already, and a bind of the directory
+ * around it would buy nothing. A hop whose holder IS a write root or the
+ * working directory, or sits above one, has nothing that can be bound over it
+ * — the bind would take the whole tree read-only, and a repository laid out
+ * that way (`.git/hooks -> ../hooks-link`, with `hooks-link` in the
+ * repository root) is one the caller had before this library saw it, so
+ * refusing every command in it is the wrong answer too. That last kind comes
+ * back in `unheld`, for the warning that has to stand in for a bind.
+ */
+function chainHopDenies(
+  chainHops: readonly GitChainHop[],
+  allowWritePaths: readonly string[],
+): { held: string[]; unheld: GitChainHop[] } {
+  const held = new Set<string>()
+  const unheld: GitChainHop[] = []
+  const cwd = process.cwd()
+  for (const hop of chainHops) {
+    const holder = hop.holder
+    if (holder === undefined) continue
+    if (!allowWritePaths.some(allowed => isAtOrUnder(holder, allowed))) {
+      continue
+    }
+    if (
+      isAtOrUnder(cwd, holder) ||
+      allowWritePaths.some(allowed => isAtOrUnder(allowed, holder))
+    ) {
+      unheld.push(hop)
+      continue
+    }
+    held.add(holder)
+  }
+  return { held: [...held], unheld }
+}
+
+/**
+ * `plan` with the directories holding a chain hop this backend can bind added
+ * to its deny paths, and one warning per wrap for the hops it cannot bind —
+ * the only channel a wrap has to say so. Ordinary trees have no hops at all
+ * and pay nothing here.
+ */
+function withChainHopDenies(
+  plan: SubmoduleDenyPlan,
+  allowWritePaths: readonly string[],
+): SubmoduleDenyPlan {
+  if (plan.chainHops.length === 0) return plan
+  const { held, unheld } = chainHopDenies(plan.chainHops, allowWritePaths)
+  if (unheld.length > 0) {
+    const told = unheld
+      .map(hop =>
+        hop.kind === 'pointer'
+          ? `the git directory ${hop.source} names is reached through ${hop.link}`
+          : `${hop.source} reaches what it denies through ${hop.link}`,
+      )
+      .join('; ')
+    const holders = [...new Set(unheld.map(hop => hop.holder))].join(', ')
+    logForDebugging(
+      `[Sandbox Linux] ${told}. A read-only bind of the directory holding such a link is the only thing that holds it, and ${holders} is the working directory or a path this command may write, which binding read-only would take the whole tree with: a command in this sandbox can point the link somewhere else, and a git run on the host afterwards follows it there. Moving the link inside the git directory, spelling the pointer's path without it, or a denyWrite entry naming the directory holding it, closes that.`,
+      { level: 'warn' },
+    )
+  }
+  if (held.length === 0) return plan
+  const denied = new Set(plan.denyPaths)
+  return {
+    ...plan,
+    denyPaths: [...plan.denyPaths, ...held.filter(dir => !denied.has(dir))],
+  }
 }
 
 /**
@@ -725,9 +847,12 @@ function cwdDangerousDenyPaths(cwd: string): string[] {
  * denied whole. The write is refused either way; the path in the report is
  * the one inside it.
  */
-export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
+export function linuxGetMonitorCwdDenyPaths(
+  allowGitConfig: boolean,
+  allowWritePaths: readonly string[] = [],
+): string[] {
   try {
-    return linuxGetCwdMandatoryDenyPaths(allowGitConfig)
+    return linuxGetCwdMandatoryDenyPaths(allowGitConfig, allowWritePaths)
   } catch (err) {
     const cwd = process.cwd()
     logForDebugging(
@@ -736,7 +861,7 @@ export function linuxGetMonitorCwdDenyPaths(allowGitConfig: boolean): string[] {
     )
     return [
       ...cwdDangerousDenyPaths(cwd),
-      ...monitorDotGitDenyPaths(cwd, allowGitConfig),
+      ...monitorDotGitDenyPaths(cwd, allowGitConfig, allowWritePaths),
     ]
   }
 }
@@ -759,6 +884,7 @@ function monitorFallbackReason(cwd: string, err: unknown): string {
 function monitorDotGitDenyPaths(
   cwd: string,
   allowGitConfig: boolean,
+  allowWritePaths: readonly string[],
 ): string[] {
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitStat: fs.Stats | undefined
@@ -773,7 +899,12 @@ function monitorDotGitDenyPaths(
   // nothing followed to name.
   if (dotGitStat.isFile()) return [dotGitPath]
   if (dotGitStat.isDirectory()) {
-    return gitDirDenyPaths(dotGitPath, allowGitConfig)
+    const denies = gitDirDenies(dotGitPath, allowGitConfig)
+    return [
+      ...withoutChainHopLinks(denies.denyPaths, denies.chainHops),
+      ...denies.linkedEntryDirs,
+      ...chainHopDenies(denies.chainHops, allowWritePaths).held,
+    ]
   }
   return []
 }
@@ -969,9 +1100,14 @@ async function linuxGetMandatoryDenyPaths(
       denyGitDir(path.join(cwd, ...relative.slice(0, gitAt + 1)))
     } else if (relative.length > 1) {
       // cwd's own pointer file is handled above, before the scan.
-      denyPaths.push(
-        ...asProfileRefusal(() => gitFileDenyPaths(match, allowGitConfig)),
+      const pointer = asProfileRefusal(() =>
+        gitFileDenies(match, allowGitConfig),
       )
+      denyPaths.push(
+        ...withoutChainHopLinks(pointer.denyPaths, pointer.chainHops),
+        ...pointer.linkedEntryDirs,
+      )
+      plan.chainHops.push(...pointer.chainHops)
     }
   }
 
@@ -988,7 +1124,8 @@ async function linuxGetMandatoryDenyPaths(
     const denies = asProfileRefusal(() =>
       gitDirTreeDenies(gitDir, allowGitConfig, { deadline: walkDeadline() }),
     )
-    denyPaths.push(...gitDirTreeDenyPaths(denies))
+    denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
+    plan.chainHops.push(...denies.chainHops)
     const repository = repositorySubmodules(denies)
     if (repository !== undefined) plan.repositories.push(repository)
   }
@@ -2361,11 +2498,14 @@ async function generateFilesystemArgs(
   const plan =
     writeConfig === undefined
       ? undefined
-      : await linuxGetMandatoryDenyPaths(
-          ripgrepConfig,
-          mandatoryDenySearchDepth,
-          allowGitConfig,
-          abortSignal,
+      : withChainHopDenies(
+          await linuxGetMandatoryDenyPaths(
+            ripgrepConfig,
+            mandatoryDenySearchDepth,
+            allowGitConfig,
+            abortSignal,
+          ),
+          (writeConfig.allowOnly ?? []).map(p => normalizePathForSandbox(p)),
         )
   // The scan has run, or there is no write config to run one for: either way
   // nothing below is waiting on it, and the passes may resolve paths.
@@ -3079,41 +3219,11 @@ function buildFilesystemArgs(
     // exception: it contains every allowed write path, so
     // coveredBySafeReadOnlyDenyDir judges a vetoed '/' against the candidate
     // instead — see the branch there.
-    // Containment is root-aware
-    // (isAtOrUnder): '/' is a recordable covering directory when allowOnly
-    // and denyWithinAllow both name it, and '/' + '/' is a prefix of
-    // nothing, so a string-prefix test would judge it safe for every path
-    // and drop the binds the re-application passes below key off.
-    // Rationale: nothing host-backed and writable lands after the buffered
-    // read-only binds, so no later mount re-opens what a covering bind
-    // closed. What does land after them is a read-only restore of a write
-    // path inside a dropped deny bind, a re-applied tmpfs (whose contents
-    // never reach the host) with its restores read-only, a re-applied file
-    // mask, and the read-only bind of the fake-file store. (The ancestor
-    // pins and their covers are spliced in BEFORE the buffered deny binds,
-    // so neither is ever a writable emission on top of one; under a '/'
-    // write root a cover adds no access that root's own --bind / / had not
-    // already given. A buried pin survives a later mount that shadows it,
-    // but not one AT '/': that one the pivot promotes, and protection there
-    // is the deny's own EROFS. The caller adds --dev /dev after this
-    // function returns, and --bind /proc /proc under the weaker nested
-    // mode; neither is a deny path's subtree.) So the covering bind is the
-    // last word on its subtree unless a tmpfs ABOVE it drops that bind at
-    // emission as hidden-by-a-tmpfs and restores an allowed path around it:
-    // veto (ii). A tmpfs at or beneath the dir is NOT a veto: a path created
-    // inside a tmpfs never reaches the host, so a deny path beneath it needs
-    // no stub, and one elsewhere under the dir is unaffected by it. (The
-    // emission filter's
-    // other drop condition, fileMasks, holds file dests only — /dev/null
-    // read-deny masks and credential-mask fakes — while the pre-pass stat-verifies every
-    // recorded dir as a directory, so it cannot drop a recorded dir short of
-    // a dir→file race, which ends in bwrap refusing to start, not a silent
-    // gap.) Only existing read-deny directories become a tmpfs: absent and
-    // file-level read-denies count for nothing. If either condition could
-    // apply, keep the stub — the pre-existing abort is preferable to a
-    // silently creatable deny path. (An allow path bound before the
-    // denyWrite binds is not a vector by itself: the later read-only re-bind
-    // lands on top of it.)
+    // The skip rests on the emission order: nothing host-backed and writable
+    // lands after the buffered read-only binds, so a covering bind is the
+    // last word on its subtree unless a tmpfs above it drops that bind at
+    // emission. Where a veto could apply, keep the stub: the pre-existing
+    // abort is preferable to a silently creatable deny path.
     const coveringDirUnsafeVerdicts = new Map<string, boolean>()
     const coveringDirIsUnsafe = (denyDir: string): boolean => {
       const cached = coveringDirUnsafeVerdicts.get(denyDir)
@@ -3873,18 +3983,8 @@ function buildFilesystemArgs(
  * This implementation uses a custom apply-seccomp binary to block Unix domain socket
  * creation for user commands while allowing network infrastructure:
  *
- * Stage 1: Outer bwrap - Network and filesystem isolation (NO seccomp)
- *   - Bubblewrap starts with isolated network namespace (--unshare-net)
- *   - Bubblewrap applies PID namespace isolation (--unshare-pid and --proc)
- *   - Filesystem restrictions are applied (read-only mounts, bind mounts, etc.)
- *   - Socat processes start and connect to Unix socket bridges (can use socket(AF_UNIX, ...))
- *
- * Stage 2: apply-seccomp - Nested PID namespace + seccomp filter
- *   - apply-seccomp creates a nested user+PID+mount namespace and remounts /proc
- *   - Inside, apply-seccomp becomes PID 1 (non-dumpable init/reaper)
- *   - Forks, sets PR_SET_NO_NEW_PRIVS, applies seccomp via prctl(PR_SET_SECCOMP)
- *   - Execs user command with seccomp active (cannot create new Unix sockets)
- *   - User command cannot see or ptrace bwrap/bash/socat (separate PID namespace)
+ * The two stages are described in README.md, "Unix Socket Restrictions
+ * (Linux)".
  *
  * This solves the conflict between:
  * - Security: Blocking arbitrary Unix socket creation in user commands
