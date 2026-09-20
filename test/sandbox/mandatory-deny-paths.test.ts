@@ -2437,6 +2437,41 @@ describe('macGetMandatoryDenyEntries - Unit Tests', () => {
     },
   )
 
+  it.if(!isWindows)('never denies what a chain HOP leads to', () => {
+    // A hop's own name is the whole handle on it: what it leads to is a
+    // directory nothing asked to deny - the `/private/var` a `/var/folders`
+    // pointer walks through - and denying that would take the checkout and
+    // everything beside it read-only. What lies past the hop is held by the
+    // git directory's own deny paths, which do carry both spellings.
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'mac-git-hop-')))
+    const saved = process.cwd()
+    try {
+      const checkout = join(dir, 'checkout')
+      mkdirSync(checkout, { recursive: true })
+      const shared = join(dir, 'shared')
+      const gitDir = join(shared, 'gd')
+      mkdirSync(join(gitDir, 'hooks'), { recursive: true })
+      writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/main')
+      const hop = join(checkout, 'linkdir')
+      symlinkSync(shared, hop)
+      writeFileSync(join(checkout, '.git'), 'gitdir: linkdir/gd\n')
+      process.chdir(checkout)
+
+      const paths = macGetMandatoryDenyEntries(false)
+        .filter(pathEntry => !pathEntry.glob)
+        .map(pathEntry => pathEntry.path)
+
+      expect(paths).toContain(hop)
+      expect(paths).toContain(join(gitDir, 'hooks'))
+      expect(paths).not.toContain(shared)
+      expect(paths).not.toContain(dir)
+      expect(paths).not.toContain(checkout)
+    } finally {
+      process.chdir(saved)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it.if(!isWindows)(
     'names a submodule reached through a symlinked modules entry both ways',
     () => {

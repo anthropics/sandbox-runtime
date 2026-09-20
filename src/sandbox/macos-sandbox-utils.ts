@@ -24,9 +24,10 @@ import {
   gitDirDenyPaths,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
-  gitFileDenyPaths,
+  gitFileDenies,
   physicalDenyPath,
 } from './mandatory-deny-paths.js'
+import type { GitChainHop } from './mandatory-deny-paths.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 import type {
@@ -159,27 +160,28 @@ export function macGetMandatoryDenyEntries(
     // could not be looked at, which is no reason to skip the enumeration: a
     // literal entry is a subpath deny, so this denies it whole, as the Linux
     // backend's bind of the same path does.
-    if (!isAbsenceErrno(err))
-      return [...entries, ...gitDiskDenyEntries([dotGit])]
+    if (!isAbsenceErrno(err)) {
+      return [...entries, ...gitDiskDenyEntries([dotGit], [])]
+    }
   }
   if (dotGitStat?.isDirectory()) {
+    const tree = gitDirTreeDenies(dotGit, allowGitConfig)
     entries.push(
-      ...gitDiskDenyEntries(
-        gitDirTreeDenyPaths(gitDirTreeDenies(dotGit, allowGitConfig)),
-      ),
+      ...gitDiskDenyEntries(gitDirTreeDenyPaths(tree), tree.chainHops),
     )
   } else {
     // Absent, or a pointer file: the repository's own hooks and config are
     // denied either way, so neither can be created under a .git that is not
     // there yet.
-    entries.push(...gitDiskDenyEntries(gitDirDenyPaths(dotGit, allowGitConfig)))
+    entries.push(
+      ...gitDiskDenyEntries(gitDirDenyPaths(dotGit, allowGitConfig), []),
+    )
     if (dotGitStat?.isFile()) {
       // cwd checked out as a linked worktree or submodule: .git is a pointer
       // file. Nested pointer files are matched by vnode type instead
       // (gitPointerFilter), which cannot follow them.
-      entries.push(
-        ...gitDiskDenyEntries(gitFileDenyPaths(dotGit, allowGitConfig)),
-      )
+      const pointer = gitFileDenies(dotGit, allowGitConfig)
+      entries.push(...gitDiskDenyEntries(pointer.denyPaths, pointer.chainHops))
     }
   }
 
@@ -215,12 +217,29 @@ export function macGetMandatoryDenyEntries(
  * is only the `/tmp` and `/var` prefixes ({@link normalizePathForSandbox}
  * canonicalises those onto `/private`, which is the spelling Seatbelt
  * compares against).
+ *
+ * A CHAIN HOP is the exception, and gets its own path alone: what a hop leads
+ * to is a whole directory nothing asked to deny - the `/private/var` a
+ * `/var/folders` pointer walks through, the shared directory a `links/gd`
+ * value crosses - and denying it would take everything beside the git
+ * directory with it. The link's own name is the entire handle on a hop, which
+ * is why Linux drops it from its binds for the mirror-image reason (see
+ * `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts). What lies
+ * past the hop is protected by the git directory's own deny paths, which are
+ * in this same list and do get both spellings.
  */
-function gitDiskDenyEntries(denyPaths: readonly string[]): PathEntry[] {
+function gitDiskDenyEntries(
+  denyPaths: readonly string[],
+  chainHops: readonly GitChainHop[],
+): PathEntry[] {
+  const hopLinks = new Set(chainHops.map(hop => hop.link))
   const entries: PathEntry[] = []
   const named = new Set<string>()
   for (const denyPath of denyPaths) {
-    for (const spelling of [denyPath, physicalDenyPath(denyPath)]) {
+    const spellings = hopLinks.has(denyPath)
+      ? [denyPath]
+      : [denyPath, physicalDenyPath(denyPath)]
+    for (const spelling of spellings) {
       const entry = toLiteralPathEntry(spelling)
       if (named.has(entry.path)) continue
       named.add(entry.path)
