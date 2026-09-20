@@ -214,6 +214,43 @@ jobs:
         if: matrix.os == 'linux'
         run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
 
+      # RHEL 8 and 9 ship bubblewrap 0.4.0 and 0.4.1, the oldest versions in
+      # current distribution use, and one of those refuses to start on a plan
+      # that mounts twice at one destination. Run the suites that build and
+      # run mount plans against 0.4.1 so such a plan is caught here rather
+      # than on a user's machine. Autotools, not meson, which that release
+      # predates. Pinned by commit, not by the v0.4.1 tag, which the upstream
+      # repository can move.
+      - name: Build bubblewrap 0.4.1 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq autoconf automake libtool libcap-dev pkg-config
+          git clone --filter=blob:none https://github.com/containers/bubblewrap.git "$RUNNER_TEMP/bubblewrap-0.4"
+          cd "$RUNNER_TEMP/bubblewrap-0.4"
+          git checkout 5feb64dc60c936a7f9e424df9478aae9b88ee48a
+          NOCONFIGURE=1 ./autogen.sh
+          ./configure --prefix="$RUNNER_TEMP/bwrap-0.4" --disable-man --disable-selinux
+          make
+          make install
+          "$RUNNER_TEMP/bwrap-0.4/bin/bwrap" --version
+
+      # test/sandbox/stale-mount-point.test.ts is not among these: it asserts
+      # the read-only mode bubblewrap gives a mount point it creates, which it
+      # does only from 0.5.0 on, and the recovery it covers keys off that mode.
+      - name: Run the mount-plan suites against bubblewrap 0.4.1 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          PATH="$RUNNER_TEMP/bwrap-0.4/bin:$PATH" bun test \
+            test/sandbox/linux-one-mount-per-destination.test.ts \
+            test/sandbox/readonly-deny-dir-binds.test.ts \
+            test/sandbox/readonly-deny-dir-stubs.test.ts \
+            test/sandbox/linux-ancestor-pin.test.ts \
+            test/sandbox/linux-mount-plan-record.test.ts \
+            test/sandbox/path-canonicalization.test.ts \
+            test/sandbox/credential-deny.test.ts \
+            test/sandbox/symlink-boundary.test.ts
+
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
