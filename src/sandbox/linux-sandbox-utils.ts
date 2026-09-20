@@ -1086,7 +1086,89 @@ export function checkLinuxDependencies(
   })
   if (uid0Error !== null) errors.push(uid0Error)
 
+  const outdated = outdatedBwrapWarning(usableBwrap)
+  if (outdated !== null) warnings.push(outdated)
+
   return { warnings, errors }
+}
+
+/**
+ * The oldest bubblewrap on which everything this library does holds. Every
+ * mount plan it builds starts on 0.4.0 and later; two behaviours need 0.5.0,
+ * both of them changes to how bubblewrap prepares the mount point for a file
+ * bind. Before 0.5.0 `ensure_file()` takes only a regular file for one and
+ * creates a file over anything else, so a mask on a fifo, socket or device
+ * node blocks or fails instead of binding over it; and it creates that file
+ * mode 0666 rather than 0444, so isStaleBwrapMountPoint does not recognise
+ * what an interrupted sandbox left behind and leaves it on the host.
+ */
+export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
+
+// One version per bwrap binary: it is a property of the binary, not of the
+// moment. Keyed by path so a caller that passes an explicit bwrapPath is not
+// answered for another one.
+const bwrapVersions = new Map<string, string | null>()
+
+/** The version `bwrap --version` reports, or null when it could not be asked. */
+function probeBwrapVersion(bwrap: string): string | null {
+  const cached = bwrapVersions.get(bwrap)
+  if (cached !== undefined) return cached
+
+  const probe = spawnSync(bwrap, ['--version'], {
+    timeout: 5000,
+    stdio: ['ignore', 'pipe', 'ignore'],
+    encoding: 'utf8',
+  })
+  const version =
+    probe.error === undefined && probe.status === 0
+      ? (/\d+(?:\.\d+)*/.exec(probe.stdout ?? '')?.[0] ?? null)
+      : null
+  bwrapVersions.set(bwrap, version)
+  return version
+}
+
+/** Negative when `a` is the older version. A missing or unreadable component
+ * counts as 0, so '0.5' and '0.5.0' compare equal and '0.5.0rc1' reads as
+ * 0.5.0 rather than sorting arbitrarily. */
+function compareVersions(a: string, b: string): number {
+  const partsOf = (version: string): number[] =>
+    version.split('.').map(part => {
+      const parsed = Number.parseInt(part, 10)
+      return Number.isNaN(parsed) ? 0 : parsed
+    })
+  const left = partsOf(a)
+  const right = partsOf(b)
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const difference = (left[i] ?? 0) - (right[i] ?? 0)
+    if (difference !== 0) return difference
+  }
+  return 0
+}
+
+/**
+ * A warning naming the bubblewrap version found, when it is older than
+ * OLDEST_FULLY_SUPPORTED_BWRAP_VERSION, and what that costs. Not an error:
+ * the sandbox starts and enforces on an older bubblewrap. A version that
+ * could not be asked for is not reported — a bubblewrap that does not answer
+ * `--version` is a different problem, and a guess would be noise on every run.
+ */
+function outdatedBwrapWarning(bwrap: string | null): string | null {
+  if (bwrap === null) return null
+  const version = probeBwrapVersion(bwrap)
+  if (
+    version === null ||
+    compareVersions(version, OLDEST_FULLY_SUPPORTED_BWRAP_VERSION) >= 0
+  ) {
+    return null
+  }
+  return (
+    `bubblewrap ${version} at ${bwrap} is older than ` +
+    `${OLDEST_FULLY_SUPPORTED_BWRAP_VERSION}: a denyRead entry or credential ` +
+    `mask naming a path that is not a regular file (a fifo, socket or device ` +
+    `node) cannot be applied on it, and a mount point an interrupted sandbox ` +
+    `left behind is not recognised as one and stays on the host. Everything ` +
+    `else is unaffected`
+  )
 }
 
 /**
