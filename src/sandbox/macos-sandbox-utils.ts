@@ -267,12 +267,15 @@ function anchoredGlobEntry(anchor: string, pattern: string): PathEntry {
 }
 
 /**
- * A spelling that came from the caller's config: `*`, `?` and `[…]` in
- * what the caller wrote are the glob syntax it asked for. The decision is
- * made on that raw spelling, because resolving a relative or `~` path can
- * splice in a cwd or home directory whose own name contains those
- * characters — read back, they would turn the caller's `secrets` into a
- * pattern that never matches the directory it was resolved to.
+ * A spelling that came from the caller's config. {@link containsGlobChars}
+ * decides whether `*`, `?` or (in a relative spelling) `[…]` are the glob
+ * syntax it asked for. The decision is made on that raw spelling, because
+ * resolving a relative or `~` path can splice in a cwd or home directory
+ * whose own name contains those characters — read back, they would turn
+ * the caller's `secrets` into a pattern that never matches the directory
+ * it was resolved to. Absolute / `~`-rooted spellings with brackets alone
+ * stay literal so a workspace named `project[1]` cannot void `denyRead`
+ * (#576).
  */
 function toPathEntry(pathPattern: string): PathEntry {
   return containsGlobChars(pathPattern)
