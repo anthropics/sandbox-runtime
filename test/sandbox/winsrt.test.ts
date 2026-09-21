@@ -12,6 +12,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -1931,6 +1932,133 @@ describe.if(isWindows)(
         )
       }
     }, 90_000)
+
+    // ── M1-M3: the mandatory write denies ──
+    // `computeWindowsFsAccessSet` unions them into the session stamp
+    // from the working directory `initialize()` runs in, so each row
+    // chdirs into its own tree first. Which paths the producer picks
+    // is covered platform-independently by
+    // test/sandbox/windows-mandatory-denies.test.ts; these rows are
+    // what the stamp then costs a sandboxed write.
+
+    /** A working directory carrying the mandatory names, all of them there. */
+    function mandatoryTree(): string {
+      const dir = mkdtempSync(join(tmpdir(), 'srt-mand-'))
+      mkdirSync(join(dir, '.git', 'hooks'), { recursive: true })
+      writeFileSync(join(dir, '.git', 'config'), 'CONFIG-V1')
+      writeFileSync(join(dir, '.git', 'hooks', 'pre-commit'), 'HOOK-V1')
+      writeFileSync(join(dir, '.bashrc'), 'RC-V1')
+      writeFileSync(join(dir, 'app.txt'), 'APP-V1')
+      return dir
+    }
+
+    async function rexecIn(dir: string, cmd: string, fs: FsOverrides) {
+      const saved = process.cwd()
+      process.chdir(dir)
+      try {
+        return await rexecSandboxed(cmd, fs)
+      } finally {
+        process.chdir(saved)
+      }
+    }
+
+    it('M1: allowWrite does not lift a mandatory deny; ordinary files still write', async () => {
+      const dir = mandatoryTree()
+      const hook = join(dir, '.git', 'hooks', 'pre-commit')
+      const rc = join(dir, '.bashrc')
+      const app = join(dir, 'app.txt')
+      try {
+        // The hooks directory is granted EXPLICITLY as well as by the
+        // tree root: srt-win writes the deny ahead of the allow, so
+        // the deny still wins.
+        const r = await rexecIn(
+          dir,
+          `echo POISON>"${hook}" & echo POISON>"${rc}" & echo OK>"${app}"`,
+          { allowWrite: [dir, join(dir, '.git', 'hooks')] },
+        )
+        const got = {
+          hook: readFileSync(hook, 'utf8'),
+          rc: readFileSync(rc, 'utf8'),
+          app: readFileSync(app, 'utf8'),
+        }
+        if (got.hook !== 'HOOK-V1' || got.rc !== 'RC-V1') {
+          throw new Error(
+            `M1: a mandatory deny target was modified — ` +
+              `${JSON.stringify(got)} exit=${r.status} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+        if (!got.app.startsWith('OK')) {
+          throw new Error(
+            `M1: an ordinary project file was NOT written — ` +
+              `${JSON.stringify(got)} exit=${r.status} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it('M2: allowGitConfig lifts the .git/config deny and leaves hooks denied', async () => {
+      const dir = mandatoryTree()
+      const hook = join(dir, '.git', 'hooks', 'pre-commit')
+      const cfg = join(dir, '.git', 'config')
+      try {
+        const r = await rexecIn(
+          dir,
+          `echo POISON>"${hook}" & echo REMOTE>"${cfg}"`,
+          { allowWrite: [dir], allowGitConfig: true },
+        )
+        const got = {
+          hook: readFileSync(hook, 'utf8'),
+          cfg: readFileSync(cfg, 'utf8'),
+        }
+        if (got.hook !== 'HOOK-V1') {
+          throw new Error(
+            `M2: allowGitConfig lifted the hooks deny — ` +
+              `${JSON.stringify(got)} exit=${r.status} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+        if (!got.cfg.startsWith('REMOTE')) {
+          throw new Error(
+            `M2: allowGitConfig did not lift the config deny — ` +
+              `${JSON.stringify(got)} exit=${r.status} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it.skipIf(sandboxReachable('git') === undefined)(
+      'M3: git status works with the mandatory denies stamped',
+      async () => {
+        const gitExe = sandboxReachable('git')!
+        const dir = mkdtempSync(join(tmpdir(), 'srt-mandgit-'))
+        try {
+          spawnSync(gitExe, ['init', '-q', dir], { timeout: 30_000 })
+          writeFileSync(join(dir, 'app.txt'), 'APP-V1')
+          const r = await rexecIn(
+            dir,
+            `"${gitExe}" -C "${dir}" status --porcelain`,
+            { allowWrite: [dir] },
+          )
+          if (r.status !== 0 || !r.stdout.includes('app.txt')) {
+            throw new Error(
+              `M3: git status failed under the mandatory denies — ` +
+                `exit=${r.status} stdout=${JSON.stringify(r.stdout)} ` +
+                `stderr=${JSON.stringify(r.stderr)}`,
+            )
+          }
+        } finally {
+          rmSync(dir, { recursive: true, force: true })
+        }
+      },
+      90_000,
+    )
 
     it('H7: no allowWrite — child has no rights on real-user file', async () => {
       const r = await rexecSandboxed(`type "${hSibling}"`, {})

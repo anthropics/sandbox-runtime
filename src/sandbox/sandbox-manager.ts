@@ -64,6 +64,7 @@ import {
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   expandWindowsFsPaths,
+  windowsGetCwdMandatoryDenyPaths,
   stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
@@ -1385,6 +1386,11 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
  * `READ|EXECUTE` ALLOW ACE, and `denyRead`/`denyWrite` become an
  * explicit DENY ACE for `<sb-SID>` on the target plus a
  * `(OI)(CI) FILE_DELETE_CHILD` DENY on its parent.
+ *
+ * `denyWrite` also carries the mandatory set
+ * ({@link windowsGetCwdMandatoryDenyPaths}), which no configuration
+ * lifts: a path that is denied and granted lands as both ACEs, and
+ * srt-win writes the deny ahead of the allow, so the deny wins.
  */
 function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   grantRead: string[]
@@ -1417,7 +1423,18 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
     ],
     { mode: 'deny' },
   )
-  const denyWrite = expand(fs?.denyWrite ?? [], { mode: 'deny' })
+  // The mandatory set is resolved once here, against the working directory
+  // `initialize()` runs in: on Windows the grants and denies are session-level
+  // (`srt-win acl stamp`), where on macOS and Linux they are rebuilt per wrap.
+  const denyWrite = expand(
+    [
+      ...new Set([
+        ...(fs?.denyWrite ?? []),
+        ...windowsGetCwdMandatoryDenyPaths(fs?.allowGitConfig ?? false),
+      ]),
+    ],
+    { mode: 'deny' },
+  )
   return {
     // `allowRead` also serves as `allowWithinDeny`: a file under a
     // denied dir gets an explicit ALLOW ACE for the sandbox user,
@@ -1437,7 +1454,10 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
  * expansion) when nothing relevant changed.
  */
 function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
-  // Keyed exactly on what {@link computeWindowsFsAccessSet} reads.
+  // Keyed on every CONFIG field {@link computeWindowsFsAccessSet}
+  // reads. The mandatory set it also resolves is keyed by
+  // `allowGitConfig` alone: the rest of it follows from the working
+  // directory, which the session keeps.
   // `network.allowedDomains` does NOT feed file-deny (only mask
   // injectHosts), so a network-only updateConfig hits the cache.
   return {
@@ -1446,6 +1466,7 @@ function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
     denyWrite: [...c.filesystem.denyWrite],
     allowRead: [...(c.filesystem.allowRead ?? [])],
     allowWrite: [...c.filesystem.allowWrite],
+    allowGitConfig: c.filesystem.allowGitConfig ?? false,
     credFiles: getCredentialDenyReadPaths(c.credentials),
   }
 }
@@ -1462,6 +1483,7 @@ function sameRawWindowsFsInputs(
 ): boolean {
   return (
     a.disabled === b.disabled &&
+    a.allowGitConfig === b.allowGitConfig &&
     setEq(a.denyRead, b.denyRead) &&
     setEq(a.denyWrite, b.denyWrite) &&
     setEq(a.allowRead, b.allowRead) &&
