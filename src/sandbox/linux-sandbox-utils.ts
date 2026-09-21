@@ -53,6 +53,7 @@ import {
   collapsedDenyPaths,
   describeCollapse,
   repositorySubmodules,
+  repositoryWorktrees,
 } from './linux-deny-collapse.js'
 import type {
   FsReadRestrictionConfig,
@@ -856,8 +857,7 @@ function cwdMandatoryDenyPlan(
     const denies = gitDirTreeDenies(dotGitPath, allowGitConfig, { deadline })
     denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
     chainHops.push(...denies.chainHops)
-    const repository = repositorySubmodules(denies)
-    if (repository !== undefined) repositories.push(repository)
+    repositories.push(...degradableGitDirs(denies))
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
@@ -870,6 +870,19 @@ function cwdMandatoryDenyPlan(
   }
 
   return { denyPaths, repositories, chainHops }
+}
+
+/**
+ * What of one repository's denies a wrap whose profile does not fit may
+ * degrade: its submodule git directories, then its linked worktrees'. A
+ * collapse works back from the end, so within a repository the worktrees' go
+ * first: a command in this working directory has less use for another
+ * checkout's HEAD and index than for a submodule's objects.
+ */
+function degradableGitDirs(denies: GitDirTreeDenies): RepositorySubmodules[] {
+  return [repositorySubmodules(denies), repositoryWorktrees(denies)].filter(
+    repository => repository !== undefined,
+  )
 }
 
 /**
@@ -1451,8 +1464,7 @@ async function linuxGetMandatoryDenyPaths(
     )
     denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
     plan.chainHops.push(...denies.chainHops)
-    const repository = repositorySubmodules(denies)
-    if (repository !== undefined) plan.repositories.push(repository)
+    plan.repositories.push(...degradableGitDirs(denies))
   }
 
   // Deduplicated here rather than at emission: a checked-out submodule's
