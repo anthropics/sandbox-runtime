@@ -207,6 +207,20 @@ export function collapseFurther(
   return undefined
 }
 
+/**
+ * The last level: every submodule git directory and every `.git/modules`
+ * denied whole, past which {@link collapseFurther} has nothing left to take.
+ * It is where the caller goes once a step has given nothing back, rather than
+ * on through entries that may all be like the ones it just took: see
+ * `generateFilesystemArgs` in src/sandbox/linux-sandbox-utils.ts.
+ */
+export function collapseEverything(plan: SubmoduleDenyPlan): CollapseLevel {
+  return {
+    wholeGitDirs: collapsibleGitDirs(plan).length,
+    wholeModulesDirs: plan.repositories.length,
+  }
+}
+
 /** How many entries before `from` it takes for `gives` to reach `mounts`, at
  *  least one: a step that degraded nothing would loop for ever. */
 function stepBack(

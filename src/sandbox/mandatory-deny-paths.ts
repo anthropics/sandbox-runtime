@@ -39,13 +39,16 @@ function isUnusablePathError(err: unknown): boolean {
  */
 const MAX_GIT_METADATA_BYTES = 1024 * 1024
 
-/** Time the `.git/modules` walk gets when the caller sets no deadline. */
+/** Time the `.git/modules` walk gets when the caller sets no deadline, and
+ *  the walk of a symlink chain or a pointer's value likewise. */
 const DEFAULT_SUBMODULE_WALK_TIMEOUT_MS = DEFAULT_RIPGREP_TIMEOUT_MS
 
 /**
  * How often the walk looks at the clock: once per this many entries, rather
  * than once per directory, because one directory can hold as many entries as
- * the whole rest of the walk.
+ * the whole rest of the walk. {@link resolveChain} counts path components the
+ * same way, for the same reason: one link's target, or one pointer's value,
+ * can hold as many as every other path put together.
  */
 const WALK_DEADLINE_CHECK_INTERVAL = 128
 
@@ -124,10 +127,12 @@ export class GitMetadataError extends Error {
 
 /**
  * The `.git/modules` walk ran out of the time it was given, so the submodule
- * git directories it never reached would have been left with writable hooks.
- * The Linux wrap turns this into a `LinuxSandboxProfileError` carrying
- * `deny_scan_failed`; on macOS it reaches the caller as itself. Branch on
- * `.code`, not on the message.
+ * git directories it never reached would have been left with writable hooks —
+ * or the walk of a symlink chain or of the path a `.git` pointer names did,
+ * which spends the same budget, so the git directory it never landed on would
+ * have been. The Linux wrap turns this into a `LinuxSandboxProfileError`
+ * carrying `deny_scan_failed`; on macOS it reaches the caller as itself.
+ * Branch on `.code`, not on the message.
  */
 export class SubmoduleWalkBudgetError extends Error {
   readonly code = 'submodule_walk_budget_exhausted' as const
@@ -421,11 +426,14 @@ export interface GitDirDenies {
  * its own: see the comment at the end of this function.
  *
  * An ordinary git directory costs one lstat per entry and is denied by exactly
- * what it always was.
+ * what it always was. `deadline` bounds the walk of the chain an entry that IS
+ * a symlink leads into (see {@link resolveChain}); past it this throws
+ * {@link SubmoduleWalkBudgetError}, as the `.git/modules` walk does.
  */
 export function gitDirDenies(
   gitDir: string,
   allowGitConfig: boolean,
+  deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
 ): GitDirDenies {
   const denyPaths: string[] = []
   const escapingDenyPaths: string[] = []
@@ -472,7 +480,7 @@ export function gitDirDenies(
     }
   }
   for (const entryPath of gitDirDenyPaths(gitDir, allowGitConfig)) {
-    const entry = gitDirEntry(entryPath)
+    const entry = gitDirEntry(entryPath, deadline)
     switch (entry.kind) {
       case 'plain':
         denyPaths.push(entryPath)
@@ -523,7 +531,7 @@ export function gitDirDenies(
   // for the backend whose denies resolve, where a bind at the link's own path
   // would land on the modules tree and take every submodule with it.
   const modulesPath = path.join(gitDir, 'modules')
-  const modules = gitDirEntry(modulesPath)
+  const modules = gitDirEntry(modulesPath, deadline)
   switch (modules.kind) {
     case 'plain':
       break
@@ -566,7 +574,7 @@ type GitDirEntry =
    *  chain as the walk read before it stopped. */
   | { kind: 'unknown'; hops: ChainHop[] }
 
-function gitDirEntry(entryPath: string): GitDirEntry {
+function gitDirEntry(entryPath: string, deadline: number): GitDirEntry {
   let stats: fs.Stats
   try {
     stats = fs.lstatSync(entryPath)
@@ -589,8 +597,9 @@ function gitDirEntry(entryPath: string): GitDirEntry {
   // link - counts as where this repository lives and not as a hop of this
   // chain. The landing is what walking the whole path from the root gives.
   const chain = resolveChain(
-    physicalPath(path.parse(entryPath).root, path.dirname(entryPath)),
+    physicalPath(path.parse(entryPath).root, path.dirname(entryPath), deadline),
     path.basename(entryPath),
+    deadline,
   )
   try {
     fs.statSync(entryPath)
@@ -639,7 +648,8 @@ export function gitRedirectPlaceholder(denyPath: string): string | undefined {
  * Throws {@link GitMetadataError} when the pointer or the `commondir` names
  * something this cannot resolve the way git does; the wrap is then refused
  * rather than applied with a deny list that may not cover the directory git
- * uses.
+ * uses. Throws {@link SubmoduleWalkBudgetError} where walking what they name
+ * takes longer than the `.git/modules` walk is given by default.
  */
 export function gitFileDenyPaths(
   gitFile: string,
@@ -656,10 +666,17 @@ export function gitFileDenyPaths(
  * whose denies resolve, and so does a link in the path the pointer's own
  * value walks. Nothing else is enumerated through a pointer — a target's own
  * `.git/modules` is not walked — so this is what it adds.
+ *
+ * `deadline` bounds the walk of the pointer's value and of the `commondir`'s,
+ * each of which can run to the megabyte the file may hold, and of any chain
+ * an entry of the git directories they lead to starts. Past it this throws
+ * {@link SubmoduleWalkBudgetError}: a value not walked to its end names a git
+ * directory this never found, so there is no list to hand back.
  */
 export function gitFileDenies(
   gitFile: string,
   allowGitConfig: boolean,
+  deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
 ): GitDirDenies {
   const denyPaths = [gitFile]
   const linkedEntryDirs: string[] = []
@@ -669,7 +686,13 @@ export function gitFileDenies(
     kind: GitDirKind,
     source: string,
   ): void => {
-    const denies = gitDirTargetDenies(target, kind, allowGitConfig, source)
+    const denies = gitDirTargetDenies(
+      target,
+      kind,
+      allowGitConfig,
+      source,
+      deadline,
+    )
     denyPaths.push(...denies.denyPaths)
     linkedEntryDirs.push(...denies.linkedEntryDirs)
     chainHops.push(...denies.chainHops)
@@ -702,6 +725,15 @@ export function gitFileDenies(
       { level: 'warn' },
     )
   }
+  // Looked at before the file is, whatever the file turns out to hold: a tree
+  // full of `.git` files is as many reads of up to a megabyte as a command
+  // cared to leave names for, and one that is no pointer starts no walk that
+  // would look at the clock for it.
+  if (Date.now() > deadline) {
+    throw new SubmoduleWalkBudgetError(
+      `[Sandbox] The time given for working out what the .git files lead to ran out before ${gitFile} was read; refusing to sandbox on the ones read before it`,
+    )
+  }
   try {
     const pointer = readGitMetadataFile(gitFile)
     let target: string | undefined
@@ -722,7 +754,7 @@ export function gitFileDenies(
     if (target === undefined) {
       return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
     }
-    const targets = gitMetadataTargets(path.dirname(gitFile), target)
+    const targets = gitMetadataTargets(path.dirname(gitFile), target, deadline)
     holdChain(gitFile, targets)
     const gitDirs = targets.gitDirs.map(gitDir => ({
       gitDir,
@@ -769,7 +801,7 @@ export function gitFileDenies(
           break
       }
       if (commonTarget === undefined) continue
-      const commonTargets = gitMetadataTargets(gitDir, commonTarget)
+      const commonTargets = gitMetadataTargets(gitDir, commonTarget, deadline)
       holdChain(commonFile, commonTargets)
       for (const commonDir of commonTargets.gitDirs) {
         if (commonDir === gitDir) continue
@@ -778,6 +810,9 @@ export function gitFileDenies(
     }
   } catch (err) {
     if (err instanceof GitMetadataError) throw err
+    // Out of time is not a pointer that could not be followed: what it names
+    // was not worked out, and the file alone is no deny for that.
+    if (err instanceof SubmoduleWalkBudgetError) throw err
     // A dangling pointer names nothing git would read. A pointer this process
     // cannot read is one the host's git cannot read either, so the file
     // itself is the whole deny; an unreadable TARGET is denied whole by
@@ -797,7 +832,8 @@ export function gitFileDenies(
  * and config, and the same for each submodule git directory under its
  * `modules` (what a commit inside that submodule runs), plus whatever the
  * walk could not see through. `deadline` bounds the walk (see
- * {@link submoduleGitDirs}).
+ * {@link submoduleGitDirs}) and, out of the same budget, the chains the
+ * entries of each git directory it found lead into (see {@link gitDirDenies}).
  *
  * Kept apart rather than flattened so that a backend which cannot carry every
  * mount can degrade the submodule denies and leave the rest alone;
@@ -810,11 +846,13 @@ export function gitDirTreeDenies(
   options: { deadline?: number } = {},
 ): GitDirTreeDenies {
   const modulesDir = path.join(gitDir, 'modules')
-  const modules = submoduleGitDirs(modulesDir, options.deadline)
-  const own = gitDirDenies(gitDir, allowGitConfig)
+  const deadline =
+    options.deadline ?? Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS
+  const modules = submoduleGitDirs(modulesDir, deadline)
+  const own = gitDirDenies(gitDir, allowGitConfig, deadline)
   const submodules = modules.gitDirs.map(submodule => ({
     gitDir: submodule,
-    ...gitDirDenies(submodule, allowGitConfig),
+    ...gitDirDenies(submodule, allowGitConfig, deadline),
   }))
   return {
     ownDenyPaths: own.denyPaths,
@@ -948,7 +986,7 @@ export function submoduleGitDirs(
       // git accepts a symlinked entry under .git/modules, and
       // Dirent.isDirectory is false for one, so the link is followed — and
       // the real path recorded, since a link back up would otherwise loop.
-      const found = walkEntry(entry, child, walk)
+      const found = walkEntry(entry, child, walk, deadline)
       if (found.kind === 'skip') continue
       if (found.kind === 'dangling') {
         // Where a link leads to nothing is denied as a git directory that is
@@ -1046,13 +1084,15 @@ function walkEntry(
   entry: fs.Dirent,
   entryPath: string,
   walk: SubmoduleWalk,
+  deadline: number,
 ): WalkEntry {
   if (entry.isDirectory()) return { kind: 'directory' }
   if (!entry.isSymbolicLink()) return { kind: 'skip' }
   const holder = path.dirname(entryPath)
   const chain = resolveChain(
-    physicalPath(path.parse(entryPath).root, holder),
+    physicalPath(path.parse(entryPath).root, holder, deadline),
     entry.name,
+    deadline,
   )
   // The first hop is the entry, whose holder joins `linkedEntryDirs` below;
   // the rest lie between it and what it lands on, and that deny reaches
@@ -1144,6 +1184,7 @@ function gitDirTargetDenies(
   kind: GitDirKind,
   allowGitConfig: boolean,
   source: string,
+  deadline: number,
 ): GitDirDenies {
   const only = (denyPaths: string[]): GitDirDenies => ({
     denyPaths,
@@ -1154,7 +1195,7 @@ function gitDirTargetDenies(
   switch (kind) {
     case 'git-dir':
     case 'absent':
-      return gitDirDenies(target, allowGitConfig)
+      return gitDirDenies(target, allowGitConfig, deadline)
     case 'unreadable': {
       const denied = deepestReachableAncestor(target) ?? target
       logForDebugging(
@@ -1335,14 +1376,19 @@ interface GitMetadataTargets {
  * as hops all the same: putting a directory in one of their places is what
  * makes such a chain reach anything at all.
  */
-function gitMetadataTargets(base: string, target: string): GitMetadataTargets {
+function gitMetadataTargets(
+  base: string,
+  target: string,
+  deadline: number,
+): GitMetadataTargets {
   const lexical = path.resolve(base, target)
   const root = path.parse(lexical).root
   const chain = resolveChain(
     // An absolute value starts at the root and never looks at the base, so
     // resolving the base then is a walk that buys nothing.
-    path.isAbsolute(target) ? root : physicalPath(root, base),
+    path.isAbsolute(target) ? root : physicalPath(root, base, deadline),
     target,
+    deadline,
   )
   const hops = chain.hops
   const resolved = chain.resolved
@@ -1352,7 +1398,7 @@ function gitMetadataTargets(base: string, target: string): GitMetadataTargets {
   }
   // Both sides resolved the same way, so a base that merely spells itself
   // differently (a /var that is a symlink to /private/var) is no difference.
-  return chain.landing === physicalPath(root, lexical)
+  return chain.landing === physicalPath(root, lexical, deadline)
     ? { gitDirs: [lexical], hops, resolved }
     : { gitDirs: [lexical, chain.landing], hops, resolved }
 }
@@ -1371,14 +1417,38 @@ function gitMetadataTargets(base: string, target: string): GitMetadataTargets {
  * The hops are what a caller protecting the landing still has to hold: each
  * one is a name a command able to write the directory around it can point
  * somewhere else, which moves the landing without touching either end.
+ *
+ * The hop limit bounds how many links are followed and nothing bounds how long
+ * each is: a link's target runs to a filesystem's four thousand bytes and a
+ * pointer's value to the megabyte its file may hold, every component of either
+ * is an lstat, and a command can leave as many of them as it likes. `deadline`
+ * is what bounds that, looked at as the components go by, and running out of
+ * it throws {@link SubmoduleWalkBudgetError} as the `.git/modules` walk does:
+ * a landing that was never reached is not one to work a deny out from.
  */
-function resolveChain(base: string, target: string): ResolvedChain {
+function resolveChain(
+  base: string,
+  target: string,
+  deadline: number,
+): ResolvedChain {
   let current = path.isAbsolute(target) ? path.parse(target).root : base
   let pending = target.split('/')
   const hops: ChainHop[] = []
   const named = new Set<string>()
   let followed = 0
+  let componentsSeen = 0
   while (pending.length > 0) {
+    // On the first component as well as every so many after it: a tree full
+    // of short chains is as many walks as a command cared to leave, and none
+    // of them is long enough to come round to a later look.
+    if (
+      componentsSeen++ % WALK_DEADLINE_CHECK_INTERVAL === 0 &&
+      Date.now() > deadline
+    ) {
+      throw new SubmoduleWalkBudgetError(
+        `[Sandbox] The walk of ${abridged(target)} from ${base} ran out of the time it was given at ${current}, ${followed} symlinks in and with ${pending.length} path components still to go; refusing to sandbox on a path that was not walked to where it leads`,
+      )
+    }
     const name = pending.shift()
     if (name === undefined || name === '' || name === '.') continue
     if (name === '..') {
@@ -1424,8 +1494,16 @@ function resolveChain(base: string, target: string): ResolvedChain {
 }
 
 /** {@link resolveChain} for a caller that wants only where the walk landed. */
-function physicalPath(base: string, target: string): string {
-  return resolveChain(base, target).landing
+function physicalPath(base: string, target: string, deadline: number): string {
+  return resolveChain(base, target, deadline).landing
+}
+
+/** `value` cut to what a message can carry: a pointer's value is as long as
+ *  its file, and the rest of it says nothing the start does not. */
+function abridged(value: string, limit = 200): string {
+  return value.length <= limit
+    ? value
+    : `${value.slice(0, limit)}… (${value.length - limit} more characters)`
 }
 
 /**
@@ -1439,9 +1517,15 @@ function physicalPath(base: string, target: string): string {
  * `fs.realpathSync` does not answer this: it throws on a path that is not
  * there, and an absent `hooks` or `config.worktree` is exactly what these
  * denies exist to stop a command from creating.
+ *
+ * Throws {@link SubmoduleWalkBudgetError} past `deadline`, which bounds the
+ * walk as it bounds every other (see {@link resolveChain}).
  */
-export function physicalDenyPath(denyPath: string): string {
-  return physicalPath(path.parse(denyPath).root, denyPath)
+export function physicalDenyPath(
+  denyPath: string,
+  deadline: number = Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS,
+): string {
+  return physicalPath(path.parse(denyPath).root, denyPath, deadline)
 }
 
 /**

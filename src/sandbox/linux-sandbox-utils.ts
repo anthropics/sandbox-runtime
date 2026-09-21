@@ -34,6 +34,7 @@ import {
   GitMetadataError,
   SubmoduleWalkBudgetError,
   gitDirDenies,
+  gitDirDenyPaths,
   gitDirTreeDenies,
   gitDirTreeDenyPaths,
   gitFileDenies,
@@ -47,6 +48,7 @@ import type {
 } from './linux-deny-collapse.js'
 import {
   NO_COLLAPSE,
+  collapseEverything,
   collapseFurther,
   collapsedDenyPaths,
   describeCollapse,
@@ -859,7 +861,7 @@ function cwdMandatoryDenyPlan(
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
-    const pointer = gitFileDenies(dotGitPath, allowGitConfig)
+    const pointer = gitFileDenies(dotGitPath, allowGitConfig, deadline)
     denyPaths.push(
       ...withoutChainHopLinks(pointer.denyPaths, pointer.chainHops),
       ...pointer.linkedEntryDirs.map(wholeDirDenyLanding),
@@ -1187,12 +1189,20 @@ function monitorDotGitDenyPaths(
   // nothing followed to name.
   if (dotGitStat.isFile()) return [dotGitPath]
   if (dotGitStat.isDirectory()) {
-    const denies = gitDirDenies(dotGitPath, allowGitConfig)
-    return [
-      ...withoutChainHopLinks(denies.denyPaths, denies.chainHops),
-      ...denies.linkedEntryDirs.map(wholeDirDenyLanding),
-      ...chainHopDenies(denies.chainHops, allowWritePaths).held,
-    ]
+    try {
+      const denies = gitDirDenies(dotGitPath, allowGitConfig)
+      return [
+        ...withoutChainHopLinks(denies.denyPaths, denies.chainHops),
+        ...denies.linkedEntryDirs.map(wholeDirDenyLanding),
+        ...chainHopDenies(denies.chainHops, allowWritePaths).held,
+      ]
+    } catch (err) {
+      // An entry that is a symlink into a chain too long to walk in the time
+      // there is. The entries' own names need nothing followed, and the
+      // monitor is not what fails over one repository.
+      if (!(err instanceof SubmoduleWalkBudgetError)) throw err
+      return gitDirDenyPaths(dotGitPath, allowGitConfig)
+    }
   }
   return []
 }
@@ -1383,6 +1393,11 @@ async function linuxGetMandatoryDenyPaths(
   const dirPatterns = dangerousDirectories.map(d =>
     normalizeCaseForComparison(d).split('/'),
   )
+  // The `.git` pointer files the scan listed have ONE budget between them,
+  // taken when the first is met. Each is a file a command can write, as large
+  // as git accepts and under as many names as it cares to link it by, so a
+  // budget apiece would bound nothing of what a tree full of them costs.
+  let pointersDeadline: number | undefined
   for (const match of matches) {
     // rg prefixes each match with its target, cwd, and does not follow
     // symlinks, so every line is under it. Segments are compared relative to
@@ -1407,7 +1422,11 @@ async function linuxGetMandatoryDenyPaths(
     } else if (relative.length > 1) {
       // cwd's own pointer file is handled above, before the scan.
       const pointer = asProfileRefusal(() =>
-        gitFileDenies(match, allowGitConfig),
+        gitFileDenies(
+          match,
+          allowGitConfig,
+          (pointersDeadline ??= walkDeadline()),
+        ),
       )
       denyPaths.push(
         ...withoutChainHopLinks(pointer.denyPaths, pointer.chainHops),
@@ -2814,7 +2833,9 @@ function pushReadDenyDirMounts(
  * repository's submodules really cost cannot be worked out before this point
  * (see src/sandbox/linux-deny-collapse.ts for what a step gives up, and
  * `LinuxSandboxProfileErrorCode`'s `too_many_arguments` for what is left when
- * there is nothing to degrade).
+ * there is nothing to degrade). A pass that comes out no shorter than the one
+ * before it is the last that is stepped to: the next is the last level, so
+ * the number of passes does not grow with what a repository holds.
  *
  * A pass that is built and then degraded may already have written mount
  * points on the host for the denies it dropped; they are recorded like any
@@ -2847,6 +2868,8 @@ async function generateFilesystemArgs(
     plan === undefined
       ? NO_COLLAPSE
       : collapseFloor(plan, writeConfig?.allowOnly ?? [], wordsAvailable)
+  // What the pass before this one came to, once there has been one.
+  let wordsBefore: number | undefined
   for (;;) {
     const args = buildFilesystemArgs(
       readConfig,
@@ -2856,7 +2879,7 @@ async function generateFilesystemArgs(
       plan === undefined ? [] : collapsedDenyPaths(plan, level),
     )
     if (plan === undefined) return args
-    const degraded =
+    let degraded =
       args.length <= wordsAvailable
         ? undefined
         : collapseFurther(
@@ -2864,7 +2887,25 @@ async function generateFilesystemArgs(
             level,
             Math.ceil((args.length - wordsAvailable) / BWRAP_WORDS_PER_MOUNT),
           )
+    // A pass no shorter than the one before it took entries that cost this
+    // profile nothing: submodule git directories no write root contains,
+    // say, which the read-only root holds without a mount of their own. How
+    // many more of those lie ahead is a number a command can choose, and
+    // finding out a step at a time is the whole profile built once per step,
+    // so the stepping stops and the next pass is the last level. Where the
+    // words over are ones no level gives back, that is where the steps were
+    // going anyway; where entries further on would have given some back, it
+    // degrades more than they strictly needed, and costs what it costs
+    // whatever the repository holds.
+    if (
+      degraded !== undefined &&
+      wordsBefore !== undefined &&
+      args.length >= wordsBefore
+    ) {
+      degraded = collapseEverything(plan)
+    }
     if (degraded !== undefined) {
+      wordsBefore = args.length
       level = degraded
       continue
     }
