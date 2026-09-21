@@ -30,6 +30,14 @@ let spawnSyncSpy: ReturnType<typeof spyOn>
 const bwrapExiting = (status: number, stderr = '') =>
   ({ status, signal: null, pid: 1, output: [], stdout: '', stderr }) as never
 
+// The one argument the seccomp helper is run with to ask what it supports.
+const HELPER_QUESTION = '--srt-helper-features'
+// Every spawn that was not that question, i.e. every probe of bubblewrap.
+const bwrapProbes = () =>
+  (spawnSyncSpy.mock.calls as unknown[][]).filter(
+    call => (call[1] as string[] | undefined)?.[0] !== HELPER_QUESTION,
+  )
+
 beforeEach(() => {
   whichSpy = spyOn(which, 'whichSync').mockImplementation(
     (bin: string) => `/usr/bin/${bin}`,
@@ -42,9 +50,19 @@ beforeEach(() => {
   euidSpy = process.geteuid
     ? spyOn(process, 'geteuid').mockReturnValue(1000)
     : undefined
-  spawnSyncSpy = spyOn(childProcess, 'spawnSync').mockReturnValue(
-    bwrapExiting(0),
-  )
+  // Answers the two questions checkLinuxDependencies asks of real binaries the
+  // way current ones do: the seccomp helper says it limits user namespaces,
+  // and bubblewrap's help lists --disable-userns. Anything else is the uid-0
+  // probe, which exits 0 unless a test says otherwise.
+  spawnSyncSpy = spyOn(childProcess, 'spawnSync').mockImplementation(((
+    _command: string,
+    args?: readonly string[],
+  ) =>
+    args?.[0] === HELPER_QUESTION
+      ? { ...(bwrapExiting(0) as object), stdout: 'userns-limit\n' }
+      : args?.[0] === '--help'
+        ? { ...(bwrapExiting(0) as object), stdout: '  --disable-userns\n' }
+        : bwrapExiting(0)) as never)
 })
 
 afterEach(() => {
@@ -60,8 +78,12 @@ describe('checkLinuxDependencies', () => {
 
     expect(result.errors).toEqual([])
     expect(result.warnings).toEqual([])
-    // A non-root caller is never asked about capabilities.
-    expect(spawnSyncSpy).not.toHaveBeenCalled()
+    expect(result.features).toEqual({ usernsLimit: true })
+    expect(result.details).toEqual([])
+    // A non-root caller is never asked about capabilities: the only thing
+    // ever run for it is the helper, to say what it supports (and that once
+    // per helper, so not again if an earlier test already asked this one).
+    expect(bwrapProbes()).toEqual([])
   })
 
   test('returns error when bwrap missing', () => {
@@ -118,7 +140,7 @@ describe('checkLinuxDependencies', () => {
 
       const result = checkLinuxDependencies()
 
-      expect(spawnSyncSpy.mock.calls.length > 0).toBe(lacksSetfcap)
+      expect(bwrapProbes().length > 0).toBe(lacksSetfcap)
       expect(result.errors).toEqual([])
       expect(result.warnings).toEqual([])
     },
@@ -133,7 +155,7 @@ describe('checkLinuxDependencies', () => {
     const result = checkLinuxDependencies()
 
     expect(result.errors).toEqual(['bubblewrap (bwrap) not installed'])
-    expect(spawnSyncSpy).not.toHaveBeenCalled()
+    expect(bwrapProbes()).toEqual([])
   })
 
   test('passes custom applyPath through to the resolver', () => {
