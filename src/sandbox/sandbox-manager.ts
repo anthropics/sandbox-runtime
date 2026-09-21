@@ -130,6 +130,13 @@ interface HostNetworkManagerContext {
 // ============================================================================
 
 let config: SandboxRuntimeConfig | undefined
+// Absolute path of the settings file this session was loaded from, if any.
+// srt trusts this file to define the sandbox on the NEXT run, so a sandboxed
+// process must not be able to rewrite it, even under a broad allowWrite grant
+// that covers its directory (e.g. allowWrite: ["~"]). getFsWriteConfig() denies
+// it within the allowed region. Read only while `config` is set, so a stale
+// value is never used (getFsWriteConfig() returns early when config is unset).
+let configuredSettingsPath: string | undefined
 let httpProxyServer: ReturnType<typeof createHttpProxyServer> | undefined
 let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
@@ -634,6 +641,7 @@ async function initialize(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
+  settingsPath?: string,
 ): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
@@ -643,6 +651,13 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+  // Protect the file this config was loaded from from being rewritten by the
+  // sandboxed process (see configuredSettingsPath). Embedders that pass their
+  // own config object and no path are responsible for their own config's
+  // location, matching how they already own their policy.
+  configuredSettingsPath = settingsPath
+    ? normalizePathForSandbox(settingsPath, { literal: true })
+    : undefined
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
@@ -1368,7 +1383,15 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
 
   return {
     allowOnly,
-    denyWithinAllow: denyPaths,
+    // Deny writes to the settings file within the allowed region. Without this,
+    // a broad grant that covers its directory (allowWrite: ["~"], "/", etc.)
+    // lets the sandboxed process rewrite the config that governs the next run
+    // — a persistent sandbox escape, e.g. by enabling allowAppleEvents. This is
+    // the denyWrite-over-allowWrite precedence applied automatically, so an
+    // operator does not have to remember to exclude it by hand.
+    denyWithinAllow: configuredSettingsPath
+      ? [...denyPaths, configuredSettingsPath]
+      : denyPaths,
   }
 }
 
@@ -1689,11 +1712,20 @@ async function wrapWithSandbox(
         }),
         ...userAllowWrite,
       ],
-      denyWithinAllow: stripWriteGlobs(
-        customConfig?.filesystem?.denyWrite ??
-          config?.filesystem.denyWrite ??
-          [],
-      ),
+      denyWithinAllow: [
+        ...stripWriteGlobs(
+          customConfig?.filesystem?.denyWrite ??
+            config?.filesystem.denyWrite ??
+            [],
+        ),
+        // Deny writes to the settings file this session was loaded from.
+        // Without this, a broad grant covering its directory (allowWrite:
+        // ["~"], "/", ...) lets the sandboxed process rewrite the policy that
+        // governs the next run — a persistent sandbox escape. denyWithinAllow
+        // takes precedence over allowOnly, applied here automatically so the
+        // operator need not exclude the file by hand.
+        ...(configuredSettingsPath ? [configuredSettingsPath] : []),
+      ],
     }
 
     // Credential deny paths are unioned with the caller's denyRead — never
@@ -2420,6 +2452,7 @@ export interface ISandboxManager {
     runtimeConfig: SandboxRuntimeConfig,
     sandboxAskCallback?: SandboxAskCallback,
     enableLogMonitor?: boolean,
+    settingsPath?: string,
   ): Promise<void>
   isSupportedPlatform(): boolean
   isSandboxingEnabled(): boolean
