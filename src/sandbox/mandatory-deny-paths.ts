@@ -56,6 +56,38 @@ const WALK_DEADLINE_CHECK_INTERVAL = 128
  */
 const GIT_DIR_MARKERS = new Set(['HEAD', 'config', 'hooks', 'objects'])
 
+/**
+ * Directories git itself keeps in a git directory: its objects, its refs and
+ * their logs, its hooks and `info`, the administrative directories of linked
+ * worktrees, and the stores git-lfs and rerere put beside them. The
+ * `.git/modules` walk goes on past a git directory (see
+ * {@link submoduleGitDirs}) and stays out of these: they are where a
+ * repository is large, and git keeps no submodule's git directory in any of
+ * them. `modules` is not one of them because it IS walked, as the place a git
+ * directory keeps its own submodules.
+ */
+const GIT_OWN_DIRECTORIES = new Set([
+  'objects',
+  'refs',
+  'logs',
+  'hooks',
+  'info',
+  'worktrees',
+  'lfs',
+  'rr-cache',
+])
+
+/**
+ * What tells a submodule's git directory that only has one of those names
+ * (`vendor/lfs`, `tools/hooks`) from git's own directory of that name: the
+ * two entries this file protects. Every git directory git makes has a
+ * `config`, and git puts neither name in a directory of its own, where
+ * `logs/HEAD` and `lfs/objects` rule the other two markers out. A linked
+ * worktree or a ref namespace that is itself NAMED one of the two is the
+ * exception: what holds it is walked for it, which only ever denies more.
+ */
+const GIT_PROTECTED_ENTRIES = new Set(['config', 'hooks'])
+
 /** What {@link gitDirKind} concluded about a `gitdir:`/`commondir` target. */
 type GitDirKind = 'git-dir' | 'absent' | 'other' | 'unreadable' | 'unusable'
 
@@ -829,6 +861,19 @@ export function gitDirTreeDenyPaths(denies: GitDirTreeDenies): string[] {
  * its path, so one can sit several levels down (modules/vendor/lib), hence
  * the walk.
  *
+ * A directory recorded as a git directory is walked on all the same. What
+ * makes it one is a name ({@link GIT_DIR_MARKERS}), and a segment of a
+ * submodule's name (`vendor` of `vendor/lib`) is an ordinary directory a
+ * sandboxed command can write: a walk that stopped at the first directory
+ * which looks like a git directory would let one empty `HEAD` left in `vendor`
+ * take the denies off every submodule beneath it for the commands that
+ * follow. git refuses a submodule whose git directory would sit inside
+ * another's, so in a tree git made there is nothing past a git directory to
+ * find, and looking costs one listing of each directory in it. The ones where
+ * a repository is large are not walked into beyond that listing: see
+ * {@link GIT_OWN_DIRECTORIES}. `modulesDir` itself, and a git directory's own
+ * `modules`, are never taken for a git directory whatever they hold.
+ *
  * Every directory is visited once, keyed by where it really is, so a symlink
  * pointing back into the tree ends the branch that reached it rather than
  * looping - but a bind mount gives the same directory a second real path, and
@@ -854,10 +899,14 @@ export function submoduleGitDirs(
   // directory listed to see whether it is a git directory carries its entries
   // with it, so that no directory is listed twice. The root counts as visited:
   // an entry linked straight back to it is then the same dead end as one
-  // linked to any other directory already walked.
-  const pending: Array<{ dir: string; entries?: fs.Dirent[] }> = [
-    { dir: modulesDir },
-  ]
+  // linked to any other directory already walked. `gitDir` says the directory
+  // was recorded as a git directory, so that some of its entries may be git's
+  // own.
+  const pending: Array<{
+    dir: string
+    entries?: fs.Dirent[]
+    gitDir?: boolean
+  }> = [{ dir: modulesDir }]
   const visited = new Set<string>([realPathOrSelf(modulesDir)])
   let entriesSeen = 0
   for (let item = pending.pop(); item !== undefined; item = pending.pop()) {
@@ -873,6 +922,29 @@ export function submoduleGitDirs(
         )
       }
       const child = path.join(item.dir, entry.name)
+      let childEntries: fs.Dirent[] | undefined
+      if (item.gitDir === true) {
+        // Queued when the git directory was recorded.
+        if (entry.name === 'modules') continue
+        // One of git's own directories by its name: walked on only where one
+        // listing of it shows something this file protects, which is what a
+        // submodule's git directory that has such a name shows and git's own
+        // directory never does. Listed before the entry is followed: following
+        // a symlink puts the directory holding it on the whole-directory
+        // denies (see walkEntry), and a git directory whose `objects` or
+        // `rr-cache` is a link to a shared store is an ordinary one.
+        if (
+          GIT_OWN_DIRECTORIES.has(entry.name) &&
+          (entry.isDirectory() || entry.isSymbolicLink())
+        ) {
+          childEntries = listDirectory(child, walk)
+          if (
+            childEntries?.some(e => GIT_PROTECTED_ENTRIES.has(e.name)) !== true
+          ) {
+            continue
+          }
+        }
+      }
       // git accepts a symlinked entry under .git/modules, and
       // Dirent.isDirectory is false for one, so the link is followed — and
       // the real path recorded, since a link back up would otherwise loop.
@@ -892,17 +964,18 @@ export function submoduleGitDirs(
       if (visited.has(visitKey)) continue
       visited.add(visitKey)
 
-      const childEntries = listDirectory(child, walk)
+      childEntries ??= listDirectory(child, walk)
       if (childEntries === undefined) continue
       const isGitDir = childEntries.some(e => GIT_DIR_MARKERS.has(e.name))
-      if (isGitDir) walk.gitDirs.push(child)
-      // A git directory keeps its own submodules under `modules`; anything
-      // else is a segment of a submodule name (`vendor` of `vendor/lib`).
-      pending.push(
-        isGitDir
-          ? { dir: path.join(child, 'modules') }
-          : { dir: child, entries: childEntries },
-      )
+      if (isGitDir) {
+        walk.gitDirs.push(child)
+        // A git directory keeps its own submodules under `modules`.
+        pending.push({ dir: path.join(child, 'modules') })
+      }
+      // Anything else is a segment of a submodule name (`vendor` of
+      // `vendor/lib`) - and a directory that looks like a git directory can
+      // be one as well, so what else it holds is looked at either way.
+      pending.push({ dir: child, entries: childEntries, gitDir: isGitDir })
     }
   }
   return {
