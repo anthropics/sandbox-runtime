@@ -317,12 +317,19 @@ describe.if(!isWindows)(
     const DETOUR = 'a/../'
 
     /**
-     * Sixteen links in `holder`, each leading to the next through eight hundred
+     * As many detours as a link's target has room for: a target runs to 4095
+     * bytes on Linux and to 1023 on macOS, and a longer one is refused with
+     * ENAMETOOLONG when the link is made.
+     */
+    const DETOURS_PER_LINK = process.platform === 'darwin' ? 200 : 800
+
+    /**
+     * Sixteen links in `holder`, each leading to the next through that many
      * detours and the last to a real directory: a chain the kernel follows in
-     * one stat, and a walk by hand takes some thirteen thousand lstats for.
-     * Sixteen is well inside the forty links the kernel follows, so that a
-     * stat through the chain answers the same way every time. Returns the
-     * first link.
+     * one stat, and a walk by hand takes thousands of lstats for (some
+     * thirteen thousand on Linux). Sixteen is well inside the forty links the
+     * kernel follows, so that a stat through the chain answers the same way
+     * every time. Returns the first link.
      */
     function makeLongChain(holder: string): string {
       const links = 16
@@ -330,7 +337,8 @@ describe.if(!isWindows)(
       mkdirSync(join(holder, 'end'))
       for (let i = 0; i < links; i++) {
         symlinkSync(
-          DETOUR.repeat(800) + (i + 1 < links ? `l${i + 1}` : 'end'),
+          DETOUR.repeat(DETOURS_PER_LINK) +
+            (i + 1 < links ? `l${i + 1}` : 'end'),
           join(holder, `l${i}`),
         )
       }
