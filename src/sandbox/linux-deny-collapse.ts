@@ -61,6 +61,16 @@ export interface SubmoduleDenyPlan {
    * and `withoutChainHopLinks` in src/sandbox/linux-sandbox-utils.ts.
    */
   chainHops: GitChainHop[]
+  /**
+   * The entries of the git directory the working directory's own `.git` is or
+   * names: `hooks`, `config`, `commondir`, `config.worktree`. Each is denied
+   * at its own path from the first wrap that saw the repository, so a link
+   * found at one was there before any command ran: the layout is the user's,
+   * where any other git directory a wrap finds - a nested repository, a
+   * submodule's - may be one an earlier command made. Absent for a plan that
+   * was not built from a working directory.
+   */
+  ownEntries?: string[]
 }
 
 /**

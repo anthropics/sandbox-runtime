@@ -5032,9 +5032,11 @@ describe.if(isSupportedPlatform)(
           readConfig: undefined,
           writeConfig: { allowOnly: [checkout, outside], denyWithinAllow: [] },
         })
-        // The whole tree behind one bind, and the linked entry - which that
-        // bind does not cover, since the deny lands where the link really
-        // points - behind one of its own.
+        // The whole tree behind one bind. The linked entry is not covered by
+        // it, since a deny lands where the link really points, and what it
+        // points at is a write root: binding that whole would take a
+        // directory the command was given away from it, so it keeps the
+        // denies of its own entries instead.
         const words = mountWords(command)
         const mounted = (source: string, dest: string): boolean =>
           words.some(
@@ -5046,7 +5048,13 @@ describe.if(isSupportedPlatform)(
         expect(mounted(join(gitDir, 'modules'), join(gitDir, 'modules'))).toBe(
           true,
         )
-        expect(mounted(outside, outside)).toBe(true)
+        expect(mounted(outside, outside)).toBe(false)
+        expect(mounted(join(outside, 'hooks'), join(outside, 'hooks'))).toBe(
+          true,
+        )
+        expect(mounted(join(outside, 'config'), join(outside, 'config'))).toBe(
+          true,
+        )
 
         const result = spawnSync(command, {
           shell: true,

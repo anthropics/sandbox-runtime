@@ -666,8 +666,9 @@ function truncated(text: string, limit = 400): string {
  * to deny for it: `unreadableAtDepthLimit` counts them, which is what says
  * the run's EACCES is accounted for.
  *
- * Throws {@link LinuxSandboxProfileError} when `deadline` passes: the walk
- * spends what is left of the scan's own time budget and no more.
+ * Throws {@link LinuxSandboxProfileError} when `deadline` passes. Every
+ * caller hands it a budget of its own, of the scan's length, rather than what
+ * a slow scan left: see `walkDeadline` in `linuxGetMandatoryDenyPaths`.
  */
 function walkScanDirectories(
   cwd: string,
@@ -853,11 +854,13 @@ function cwdMandatoryDenyPlan(
       return { denyPaths: [...denyPaths, dotGitPath], repositories, chainHops }
     }
   }
+  let ownEntries: string[] = []
   if (dotGitStat?.isDirectory()) {
     const denies = gitDirTreeDenies(dotGitPath, allowGitConfig, { deadline })
     denyPaths.push(...linuxGitDirTreeDenyPaths(denies))
     chainHops.push(...denies.chainHops)
     repositories.push(...degradableGitDirs(denies))
+    ownEntries = gitDirDenyPaths(dotGitPath, allowGitConfig)
   } else if (dotGitStat?.isFile()) {
     // A pointer file (linked worktree, submodule checkout) has no hooks/
     // beneath it, and binding a path under a file makes bwrap fail.
@@ -867,9 +870,15 @@ function cwdMandatoryDenyPlan(
       ...pointer.linkedEntryDirs.map(wholeDirDenyLanding),
     )
     chainHops.push(...pointer.chainHops)
+    // What the pointer names is this checkout's git directory, and the one
+    // its `commondir` names with it. No `modules` is walked from this end,
+    // so every entry met here is one of theirs.
+    ownEntries = pointer.chainHops
+      .filter(hop => hop.kind === 'entry')
+      .map(hop => hop.source)
   }
 
-  return { denyPaths, repositories, chainHops }
+  return { denyPaths, repositories, chainHops, ownEntries }
 }
 
 /**
@@ -1000,14 +1009,23 @@ function guardedDenyPlan(
   allowWritePaths: readonly string[],
 ): SubmoduleDenyPlan {
   const { held, unheld } = chainHopDenies(plan.chainHops, allowWritePaths)
+  const ownEntries = new Set(plan.ownEntries ?? [])
   const unresolvable = unheld.filter(
-    // A pointer's value is exempt: a `.git` file is something a sandboxed
-    // command may create, so refusing for one would let a command lock every
-    // later command out of the project by writing a looping pointer. What it
-    // could reach by re-pointing a link it is free to write, it can reach by
+    // Only for an entry of the working directory's own repository. Each of
+    // those is denied at its own path from the first wrap on, so a link there
+    // is the user's layout, and refusing is the answer that leaves nothing
+    // open. Everything else is exempt, because a command may have made it: a
+    // `.git` pointer file, a nested repository the scan found, a submodule's
+    // git directory, a `modules` that was not there. Refusing for one of
+    // those would let a command lock every later command out of the project
+    // with a few ordinary writes, and would protect nothing: what it could
+    // reach by re-pointing a link it is free to write, it can reach by
     // creating a nested repository outright, which pre-spawn scanning has
     // always missed.
-    hop => hop.kind === 'entry' && hop.chain === 'unresolvable',
+    hop =>
+      hop.kind === 'entry' &&
+      hop.chain === 'unresolvable' &&
+      ownEntries.has(hop.source),
   )
   if (unresolvable.length > 0) throw unresolvableGitEntry(unresolvable)
   if (unheld.length > 0) {
@@ -1025,10 +1043,26 @@ function guardedDenyPlan(
     )
   }
   const denied = new Set(plan.denyPaths)
+  const added = held.filter(dir => !denied.has(dir))
+  if (added.length > 0) {
+    // A holder is a directory nothing asked to deny: say which link put it
+    // there, so a subtree that turns read-only can be traced to its cause.
+    const why = new Set(
+      plan.chainHops
+        .filter(hop => hop.holder !== undefined && added.includes(hop.holder))
+        .map(
+          hop =>
+            `${hop.holder} holds ${hop.link}, which ${hop.source} is reached through`,
+        ),
+    )
+    logForDebugging(
+      `[Sandbox Linux] Bound read-only to hold a link: ${[...why].join('; ')}. Nothing in such a directory can be written by this command; removing the link, from outside the sandbox, lifts it.`,
+    )
+  }
   return {
     ...plan,
     denyPaths: withoutWorkTreeDenies(
-      [...plan.denyPaths, ...held.filter(dir => !denied.has(dir))],
+      [...plan.denyPaths, ...added],
       allowWritePaths,
     ),
   }
@@ -1061,8 +1095,14 @@ function guardedDenyPlan(
  *   locks the project silently. The command is REFUSED instead, naming the
  *   directory, which a `chmod` outside the sandbox puts right.
  *
- * Deny paths reach here spelled where they LAND, which is what a bind
- * resolves to; see `linuxGitDirTreeDenyPaths`.
+ * Each deny path is judged by where it LANDS, which is what a bind resolves
+ * to, and not by how it is spelled. The producers of a whole-directory deny
+ * spell theirs that way already (see `linuxGitDirTreeDenyPaths`), but the
+ * guard cannot rest on that: a git directory entry that is itself a link to
+ * the checkout (`hooks -> ../..`) is an ordinary deny path, spelled inside
+ * the git directory, and the deny loop binds the checkout for it all the
+ * same. Dropping only the landing would leave the entry's own path to put the
+ * bind back.
  */
 function withoutWorkTreeDenies(
   denyPaths: readonly string[],
@@ -1072,12 +1112,13 @@ function withoutWorkTreeDenies(
   const kept: string[] = []
   const dropped: string[] = []
   for (const denyPath of denyPaths) {
-    if (!coversWriteTree(denyPath, cwd, allowWritePaths)) {
+    const landing = wholeDirDenyLanding(denyPath)
+    if (!coversWriteTree(landing, cwd, allowWritePaths)) {
       kept.push(denyPath)
       continue
     }
     try {
-      fs.readdirSync(denyPath)
+      fs.readdirSync(landing)
     } catch (err) {
       const message =
         `[Sandbox Linux] ${denyPath} could not be listed (${errorText(err)}), ` +
@@ -1089,7 +1130,7 @@ function withoutWorkTreeDenies(
       logForDebugging(message, { level: 'warn' })
       throw new LinuxSandboxProfileError('deny_scan_failed', message, err)
     }
-    dropped.push(denyPath)
+    if (!dropped.includes(landing)) dropped.push(landing)
   }
   if (dropped.length > 0) {
     logForDebugging(
@@ -2834,6 +2875,42 @@ function pushReadDenyDirMounts(
 }
 
 /**
+ * `plan`'s deny paths at `level`. A level that degrades nothing is the list
+ * {@link guardedDenyPlan} already went over. One that does adds binds of its
+ * own - a submodule's git directory, a `modules` directory - spelled as the
+ * walk found them, and an entry the walk reached through a link can land
+ * anywhere, the checkout or another write root included
+ * (`.git/modules/x -> ../..`). So what a collapse adds goes past the same
+ * guard before it is emitted.
+ *
+ * A bind the guard takes back stood for the precise deny paths the collapse
+ * had folded into it, and those come back with it: they name entries of that
+ * directory, not the directory, so they take nothing whole, and without them
+ * the git directory behind the link would keep no deny at all.
+ */
+function collapsedForWrap(
+  plan: SubmoduleDenyPlan,
+  level: CollapseLevel,
+  allowOnly: readonly string[],
+): string[] {
+  const collapsed = collapsedDenyPaths(plan, level)
+  if (collapsed === plan.denyPaths) return collapsed
+  const kept = withoutWorkTreeDenies(
+    collapsed,
+    allowOnly.map(p => normalizePathForSandbox(p)),
+  )
+  if (kept.length === collapsed.length) return kept
+  const keptPaths = new Set(kept)
+  const takenBack = collapsed.filter(denyPath => !keptPaths.has(denyPath))
+  const folded = plan.denyPaths.filter(
+    denyPath =>
+      !keptPaths.has(denyPath) &&
+      takenBack.some(whole => isStrictlyUnder(denyPath, whole)),
+  )
+  return [...kept, ...folded]
+}
+
+/**
  * Generate filesystem bind mount arguments for bwrap, inside `wordsAvailable`
  * of bubblewrap's cap on parsed words.
  *
@@ -2888,7 +2965,9 @@ async function generateFilesystemArgs(
       writeConfig,
       maskedFileBinds,
       maskedFileStoreDir,
-      plan === undefined ? [] : collapsedDenyPaths(plan, level),
+      plan === undefined
+        ? []
+        : collapsedForWrap(plan, level, writeConfig?.allowOnly ?? []),
     )
     if (plan === undefined) return args
     let degraded =
