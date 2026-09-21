@@ -1059,6 +1059,7 @@ function checkDependenciesCommon(
       socatPath: config?.socatPath,
       allowAllUnixSockets: getAllowAllUnixSockets(),
       allowNestedUserNamespaces: getAllowNestedUserNamespaces(),
+      enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)

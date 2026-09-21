@@ -14,6 +14,7 @@ import {
   bwrapCanDisableUserns,
   checkLinuxDependencies,
   cleanupBwrapMountPoints,
+  planUsernsLimit,
   probeSeccompHelperFeatures,
   wrapCommandWithSandboxLinux,
 } from '../../src/sandbox/linux-sandbox-utils.js'
@@ -192,6 +193,81 @@ describe.if(isLinux)(
       'never gives bubblewrap --disable-userns beside the helper, which makes a namespace of its own',
       async () => {
         expect(await wrap('true')).not.toContain('--disable-userns')
+      },
+    )
+
+    // ---- one decision, shared by the wrap and the dependency check ------
+
+    it('decides who imposes the limit in one place', () => {
+      const bwrap = BWRAP_DISABLES_USERNS ? BWRAP : null
+      const plan = (
+        usesSeccompHelper: boolean,
+        allowNestedUserNamespaces?: boolean,
+        enableWeakerNestedSandbox?: boolean,
+      ) =>
+        planUsernsLimit({
+          usesSeccompHelper,
+          allowNestedUserNamespaces,
+          enableWeakerNestedSandbox,
+          bwrap,
+        })
+      expect(plan(true)).toEqual({ by: 'helper' })
+      // The helper's filter does not depend on /proc/sys being writable.
+      expect(plan(true, false, true)).toEqual({ by: 'helper' })
+      expect(plan(true, true)).toEqual({ by: 'nobody', because: 'allowed' })
+      expect(plan(false, true)).toEqual({ by: 'nobody', because: 'allowed' })
+      expect(plan(false, false, true)).toEqual({
+        by: 'nobody',
+        because: 'weaker-nested-sandbox',
+      })
+      expect(plan(false)).toEqual(
+        bwrap === null
+          ? { by: 'nobody', because: 'bwrap-cannot' }
+          : { by: 'bwrap' },
+      )
+    })
+
+    it('the dependency check never reports a limit the wrap would not impose', async () => {
+      // No helper and enableWeakerNestedSandbox: bubblewrap is not given the
+      // option there, so the check must not say the limit is in force.
+      const command = await wrapCommandWithSandboxLinux({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [], allowWithinDeny: [] },
+        writeConfig: { allowOnly: [PROJECT], denyWithinAllow: [] },
+        allowAllUnixSockets: true,
+        enableWeakerNestedSandbox: true,
+      })
+      expect(command).not.toContain('--disable-userns')
+      const check = checkLinuxDependencies({
+        allowAllUnixSockets: true,
+        enableWeakerNestedSandbox: true,
+      })
+      expect(check.features?.usernsLimit).toBe(false)
+      const detail = (check.details ?? []).find(
+        d => d.code === 'no_userns_limit_in_weaker_nested_sandbox',
+      )
+      expect(detail?.level).toBe('warning')
+      expect(check.warnings).toContain(detail?.message ?? 'no such warning')
+
+      // Given up on purpose: not in force, and not worth a warning.
+      const allowed = checkLinuxDependencies({
+        allowNestedUserNamespaces: true,
+      })
+      expect(allowed.features?.usernsLimit).toBe(false)
+      expect(allowed.details).toEqual([])
+    })
+
+    it.if(BWRAP_DISABLES_USERNS)(
+      'with no helper, the check reports the limit exactly when the wrap passes bubblewrap the option',
+      async () => {
+        expect(await wrap('true', { allowAllUnixSockets: true })).toContain(
+          '--disable-userns',
+        )
+        expect(
+          checkLinuxDependencies({ allowAllUnixSockets: true }).features
+            ?.usernsLimit,
+        ).toBe(true)
       },
     )
 

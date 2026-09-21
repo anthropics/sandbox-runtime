@@ -38,6 +38,9 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   // own namespaces, where --cap-drop ALL is the only thing between it and the
   // deny mounts.
   const CONFIG_NO_SECCOMP = join(WORK, 'srt-no-seccomp.json')
+  // The helper, with the command allowed namespaces of its own: the helper's
+  // namespace filter is left out, so the kernel's own refusals show again.
+  const CONFIG_NESTED_USERNS = join(WORK, 'srt-nested-userns.json')
   // umount(8) reports through /proc/self/mountinfo, which under the helper
   // belongs to another pid namespace; call the syscall so the kernel's own
   // errno is what the test reads.
@@ -101,6 +104,14 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
       }),
     )
     writeFileSync(
+      CONFIG_NESTED_USERNS,
+      JSON.stringify({
+        ...policy,
+        allowNestedUserNamespaces: true,
+        network: { allowedDomains: [], deniedDomains: [] },
+      }),
+    )
+    writeFileSync(
       CONFIG_NO_SECCOMP,
       JSON.stringify({
         ...policy,
@@ -145,11 +156,37 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   })
 
   // Under the helper the command holds a full capability set in the helper's
-  // nested user namespace, so what refuses the unmount is EINVAL: the mounts
-  // it inherited were copied across a user-namespace boundary and are locked.
+  // nested user namespace, and the first thing that refuses the unmount is
+  // the helper's namespace filter, which answers every call that changes a
+  // mount tree with EPERM before the kernel looks at the mount. For this
+  // caller, uid 0, that filter is the barrier that counts: it could raise the
+  // user-namespace limit again, and needs no new namespace to try.
   it('leaves the command no way to unmount a deny (seccomp helper)', () => {
     const out = join(DENIED, 'escaped')
     const r = srt(escapeAttempt(out))
+
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    expect(r.stdout).toContain('umount2 / rc=-1 errno=EPERM')
+    expect(r.stdout).toContain(`umount2 ${SECRET} rc=-1 errno=EPERM`)
+    refusedEveryStep(r.stdout)
+    expect(r.status).not.toBe(0)
+    expect(r.stdout).not.toContain('TOPSECRET')
+    expect(existsSync(out)).toBe(false)
+  })
+
+  it('refuses the command a user namespace of its own (seccomp helper)', () => {
+    const r = srt('echo SANDBOX-RAN; unshare -U true; echo "unshare-rc=$?"')
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    expect(r.stdout).toMatch(/^unshare-rc=[1-9][0-9]*$/m)
+  })
+
+  // With the filter left out, what refuses the unmount is the kernel: the
+  // mounts the command inherited were copied across a user-namespace boundary
+  // and are locked, which reads EINVAL. The two barriers are separate, and
+  // this is the older one still standing on its own.
+  it('leaves the command no way to unmount a deny (seccomp helper, namespaces allowed)', () => {
+    const out = join(DENIED, 'escaped-nested-userns')
+    const r = srt(escapeAttempt(out), CONFIG_NESTED_USERNS)
 
     expect(r.stdout).toContain('SANDBOX-RAN')
     expect(r.stdout).toContain('umount2 / rc=-1 errno=EINVAL')

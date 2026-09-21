@@ -1038,7 +1038,10 @@ export type SandboxFeatures = {
 
 export type SandboxDependencyDetail = {
   /** Stable, lower snake case. */
-  code: 'helper_lacks_userns_limit' | 'bwrap_lacks_disable_userns'
+  code:
+    | 'helper_lacks_userns_limit'
+    | 'bwrap_lacks_disable_userns'
+    | 'no_userns_limit_in_weaker_nested_sandbox'
   level: 'warning' | 'error'
   message: string
 }
@@ -1183,13 +1186,55 @@ function warnIfHelperLacksUsernsLimitOnce(
 }
 
 let noUsernsLimitLogged = false
-function warnNoUsernsLimitOnce(why: string): void {
+function warnNoUsernsLimitOnce(message: string): void {
   if (noUsernsLimitLogged) return
   noUsernsLimitLogged = true
-  logForDebugging(
-    `[Sandbox Linux] Nothing keeps a sandboxed command from creating user namespaces: ${why}`,
-    { level: 'warn' },
-  )
+  logForDebugging(`[Sandbox Linux] ${message}`, { level: 'warn' })
+}
+
+/**
+ * Who keeps a command from creating user namespaces, decided in one place so
+ * that what a wrap does and what the dependency check reports cannot differ.
+ *
+ * - `helper`: a seccomp helper is in the chain and imposes it (whether that
+ *   particular helper can is a separate question, which it is asked).
+ * - `bwrap`: no helper, so bubblewrap is given --disable-userns. Never beside
+ *   the helper, which makes a user namespace of its own and would be refused
+ *   it.
+ * - `nobody`: the configuration allows namespaces; or there is no helper and
+ *   bubblewrap cannot do it, either because this one has no such option (or is
+ *   setuid) or because enableWeakerNestedSandbox is on: bubblewrap imposes the
+ *   limit by writing a sysctl, the /proc/sys an unprivileged container shows
+ *   is read-only, and bubblewrap treats that as fatal.
+ */
+export type UsernsLimitPlan =
+  | { by: 'helper' }
+  | { by: 'bwrap' }
+  | {
+      by: 'nobody'
+      because: 'allowed' | 'weaker-nested-sandbox' | 'bwrap-cannot'
+    }
+
+export function planUsernsLimit({
+  usesSeccompHelper,
+  allowNestedUserNamespaces,
+  enableWeakerNestedSandbox,
+  bwrap,
+}: {
+  usesSeccompHelper: boolean
+  allowNestedUserNamespaces: boolean | undefined
+  enableWeakerNestedSandbox: boolean | undefined
+  /** The bubblewrap that will be run, or null when there is none. */
+  bwrap: string | null
+}): UsernsLimitPlan {
+  if (allowNestedUserNamespaces) return { by: 'nobody', because: 'allowed' }
+  if (usesSeccompHelper) return { by: 'helper' }
+  if (enableWeakerNestedSandbox) {
+    return { by: 'nobody', because: 'weaker-nested-sandbox' }
+  }
+  return bwrap !== null && bwrapCanDisableUserns(bwrap)
+    ? { by: 'bwrap' }
+    : { by: 'nobody', because: 'bwrap-cannot' }
 }
 
 const HELPER_LACKS_USERNS_LIMIT_MESSAGE =
@@ -1199,6 +1244,10 @@ const BWRAP_LACKS_DISABLE_USERNS_MESSAGE =
   'this bubblewrap cannot stop a sandboxed command creating user namespaces ' +
   '(--disable-userns needs bubblewrap 0.8.0 or later, not installed setuid) - ' +
   'with no seccomp helper in use, such a command can undo the write denies'
+const NO_USERNS_LIMIT_IN_WEAKER_NESTED_SANDBOX_MESSAGE =
+  'enableWeakerNestedSandbox is on and no seccomp helper is in use, so nothing ' +
+  'stops a sandboxed command creating user namespaces - such a command can ' +
+  'undo the write denies'
 
 /**
  * Options for Linux dependency checks. Explicit binary paths, when set,
@@ -1212,6 +1261,8 @@ export type LinuxDependencyOptions = {
   allowAllUnixSockets?: boolean
   /** The caller has given the limit up, so its absence is not worth one either. */
   allowNestedUserNamespaces?: boolean
+  /** Decides, with the two above, who imposes the limit: see planUsernsLimit. */
+  enableWeakerNestedSandbox?: boolean
 }
 
 function isExecutable(p: string): boolean {
@@ -1280,29 +1331,43 @@ export function checkLinuxDependencies(
   // the write denies rest on. With a helper it is the helper's doing; without
   // one, bubblewrap's.
   const details: SandboxDependencyDetail[] = []
-  let usernsLimit: SandboxFeatures['usernsLimit'] = 'unknown'
-  if (helperAvailable && opts?.allowAllUnixSockets !== true) {
+  const warn = (
+    code: SandboxDependencyDetail['code'],
+    message: string,
+  ): void => {
+    warnings.push(message)
+    details.push({ code, level: 'warning', message })
+  }
+  // The same decision the wrap makes, from the same inputs.
+  const plan = planUsernsLimit({
+    usesSeccompHelper: helperAvailable && opts?.allowAllUnixSockets !== true,
+    allowNestedUserNamespaces: opts?.allowNestedUserNamespaces,
+    enableWeakerNestedSandbox: opts?.enableWeakerNestedSandbox,
+    bwrap: usableBwrap,
+  })
+  let usernsLimit: SandboxFeatures['usernsLimit']
+  if (plan.by === 'helper') {
     const helperFeatures = probeSeccompHelperFeatures(seccompConfig)
-    if (helperFeatures !== null) {
-      usernsLimit = helperFeatures.has(HELPER_FEATURE_USERNS_LIMIT)
-      if (!usernsLimit && opts?.allowNestedUserNamespaces !== true) {
-        warnings.push(HELPER_LACKS_USERNS_LIMIT_MESSAGE)
-        details.push({
-          code: 'helper_lacks_userns_limit',
-          level: 'warning',
-          message: HELPER_LACKS_USERNS_LIMIT_MESSAGE,
-        })
-      }
+    usernsLimit =
+      helperFeatures === null
+        ? 'unknown'
+        : helperFeatures.has(HELPER_FEATURE_USERNS_LIMIT)
+    if (usernsLimit === false) {
+      warn('helper_lacks_userns_limit', HELPER_LACKS_USERNS_LIMIT_MESSAGE)
     }
-  } else if (usableBwrap !== null) {
-    usernsLimit = bwrapCanDisableUserns(usableBwrap)
-    if (!usernsLimit && opts?.allowNestedUserNamespaces !== true) {
-      warnings.push(BWRAP_LACKS_DISABLE_USERNS_MESSAGE)
-      details.push({
-        code: 'bwrap_lacks_disable_userns',
-        level: 'warning',
-        message: BWRAP_LACKS_DISABLE_USERNS_MESSAGE,
-      })
+  } else if (plan.by === 'bwrap') {
+    usernsLimit = true
+  } else {
+    // Nobody imposes it. Worth a warning unless that is what was asked for,
+    // or there is no bubblewrap at all, which is already an error above.
+    usernsLimit = false
+    if (plan.because === 'weaker-nested-sandbox') {
+      warn(
+        'no_userns_limit_in_weaker_nested_sandbox',
+        NO_USERNS_LIMIT_IN_WEAKER_NESTED_SANDBOX_MESSAGE,
+      )
+    } else if (plan.because === 'bwrap-cannot' && usableBwrap !== null) {
+      warn('bwrap_lacks_disable_userns', BWRAP_LACKS_DISABLE_USERNS_MESSAGE)
     }
   }
 
@@ -3487,34 +3552,27 @@ export async function wrapCommandWithSandboxLinux(
     // Whether the limit is known to be in force for this command, for the
     // summary line below: false also when it could not be found out.
     let usernsLimited = false
-    if (allowNestedUserNamespaces) {
+    const usernsPlan = planUsernsLimit({
+      usesSeccompHelper: applySeccompPrefix !== undefined,
+      allowNestedUserNamespaces,
+      enableWeakerNestedSandbox,
+      bwrap: bwrapPath ?? whichSync('bwrap'),
+    })
+    if (usernsPlan.by === 'helper') {
+      // Say so once if this helper cannot.
+      usernsLimited = !warnIfHelperLacksUsernsLimitOnce(seccompConfig)
+    } else if (usernsPlan.by === 'bwrap') {
+      bwrapArgs.push('--disable-userns')
+      usernsLimited = true
+    } else if (usernsPlan.because === 'allowed') {
       if (applySeccompPrefix) bwrapArgs.push('--setenv', NESTED_USERNS_ENV, '1')
       warnNestedUserNamespacesAllowedOnce()
-    } else if (applySeccompPrefix) {
-      // The helper does it. Say so once if this one cannot.
-      usernsLimited = !warnIfHelperLacksUsernsLimitOnce(seccompConfig)
     } else {
-      // No helper in the chain (allowAllUnixSockets, or no binary for this
-      // platform), so bubblewrap does it. Not alongside the helper: the
-      // helper makes a user namespace of its own and this would refuse it.
-      // Not under enableWeakerNestedSandbox: bubblewrap imposes the limit by
-      // writing a sysctl, and the /proc/sys an unprivileged container shows
-      // is read-only, which bubblewrap treats as fatal.
-      const bwrapBinary = bwrapPath ?? whichSync('bwrap')
-      if (
-        !enableWeakerNestedSandbox &&
-        bwrapBinary !== null &&
-        bwrapCanDisableUserns(bwrapBinary)
-      ) {
-        bwrapArgs.push('--disable-userns')
-        usernsLimited = true
-      } else {
-        warnNoUsernsLimitOnce(
-          enableWeakerNestedSandbox
-            ? 'enableWeakerNestedSandbox is on and there is no seccomp helper in use'
-            : BWRAP_LACKS_DISABLE_USERNS_MESSAGE,
-        )
-      }
+      warnNoUsernsLimitOnce(
+        usernsPlan.because === 'weaker-nested-sandbox'
+          ? NO_USERNS_LIMIT_IN_WEAKER_NESTED_SANDBOX_MESSAGE
+          : BWRAP_LACKS_DISABLE_USERNS_MESSAGE,
+      )
     }
 
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
