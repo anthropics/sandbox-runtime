@@ -953,9 +953,10 @@ function setContains(set: string, char: string): boolean {
 /**
  * The documented glob syntax matched directly, by backtracking rather than
  * by compiling a regex: `*` and `?` stop at a separator, `**` crosses them,
- * `**\/` is zero or more directories, `[…]` is one character from the set.
- * Shares nothing with {@link globToRegex}, so the property below is two
- * implementations checking each other.
+ * `**\/` is zero or more directories, `[…]` is one character from the set
+ * and `[!…]` / `[^…]` one outside it, never a separator. Shares nothing with
+ * {@link globToRegex}, so the property below is two implementations checking
+ * each other.
  */
 function referenceGlobMatch(pattern: string, pathText: string): boolean {
   if (pattern === '') return pathText === ''
@@ -991,11 +992,16 @@ function referenceGlobMatch(pattern: string, pathText: string): boolean {
     )
   }
   if (head === '[') {
-    const close = pattern.indexOf(']')
-    if (close > 1) {
+    const negated = pattern[1] === '!' || pattern[1] === '^'
+    const members = negated ? 2 : 1
+    const close = pattern.indexOf(']', members)
+    if (close > members) {
+      const char = pathText[0]
+      const holds =
+        char !== undefined && setContains(pattern.slice(members, close), char)
       return (
-        pathText.length > 0 &&
-        setContains(pattern.slice(1, close), pathText[0]!) &&
+        char !== undefined &&
+        (negated ? !holds && char !== '/' : holds) &&
         referenceGlobMatch(pattern.slice(close + 1), pathText.slice(1))
       )
     }
@@ -1004,6 +1010,46 @@ function referenceGlobMatch(pattern: string, pathText: string): boolean {
     pathText.length > 0 &&
     pathText[0] === head &&
     referenceGlobMatch(pattern.slice(1), pathText.slice(1))
+  )
+}
+
+/** The bodies of the bracket sets of a compiled regex: outside a set a
+ *  backslash takes the next character with it, and a set runs from a `[`
+ *  to the first `]` after it, which is where both engines end it as long
+ *  as no `]` is written inside one. */
+function compiledSets(regex: string): string[] {
+  const sets: string[] = []
+  for (let i = 0; i < regex.length; i++) {
+    if (regex[i] === '\\') i++
+    else if (regex[i] === '[') {
+      const close = regex.indexOf(']', i + 1)
+      sets.push(regex.slice(i + 1, close))
+      i = close
+    }
+  }
+  return sets
+}
+
+/**
+ * Whether a compiled set is written the way a JavaScript regular expression
+ * and the regex engine of a macOS sandbox profile read alike:
+ *
+ * - a `-` that is a member comes first, after the `^` of a negated set, and
+ *   is never all the set holds;
+ * - every other `-` is the middle of a range, neither end of which is a `-`,
+ *   so none comes just before the closing `]`;
+ * - there is no backslash, which that engine takes for a member, but in two
+ *   places: the pair that is a backslash member, and, in a set with no
+ *   leading `-`, the one that has always been written before each of
+ *   `. ^ $ + { } ( ) |`.
+ */
+function readsAlikeInBothEngines(set: string): boolean {
+  const plain = String.raw`(?:\\\\|[^\\\]-])`
+  const escaped = String.raw`(?:\\[.^$+{}()|\\]|[^\\\]-])`
+  const members = (one: string): string => `(?:${one}(?:-${one})?)`
+  return (
+    new RegExp(`^\\^?-${members(plain)}+$`).test(set) ||
+    new RegExp(`^\\^?${members(escaped)}+$`).test(set)
   )
 }
 
@@ -1053,19 +1099,189 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(letters).test('/tmp/test/1bc.txt')).toBe(false)
   })
 
-  it('never negates a bracket set: ^ and ! are members of it', () => {
+  it('negates a bracket set written with ^ or !', () => {
     // Both spellings used for negation elsewhere (regex `^`, gitignore `!`)
-    // land in the set as ordinary characters, so such a pattern matches
-    // fewer names than its author meant, not more.
+    // negate the set rather than joining it as ordinary characters.
     const caret = globToRegex('/tmp/test/file[^0-9].txt')
-    expect(new RegExp(caret).test('/tmp/test/file^.txt')).toBe(true)
-    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(true)
-    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(true)
+    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(false)
 
     const bang = globToRegex('/tmp/test/file[!0-9].txt')
-    expect(new RegExp(bang).test('/tmp/test/file!.txt')).toBe(true)
-    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(true)
-    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(true)
+    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(false)
+
+    // The character that negates the set is not also a member of it.
+    expect(new RegExp(globToRegex('/tmp/[^^]')).test('/tmp/^')).toBe(false)
+    expect(new RegExp(globToRegex('/tmp/[!!]')).test('/tmp/!')).toBe(false)
+  })
+
+  it('keeps a negated bracket set within one path component', () => {
+    // A negated set is one character of a name, so it never stands for the
+    // separator between two the way `**` does.
+    const regex = globToRegex('/tmp/test[!x]file')
+    expect(new RegExp(regex).test('/tmp/test-file')).toBe(true)
+    expect(new RegExp(regex).test('/tmp/test/file')).toBe(false)
+
+    // A `-` first among the members is that character, not a range with the
+    // separator the set already excludes.
+    const dash = globToRegex('/tmp/test/[!-a]')
+    expect(new RegExp(dash).test('/tmp/test/b')).toBe(true)
+    expect(new RegExp(dash).test('/tmp/test/-')).toBe(false)
+    expect(new RegExp(dash).test('/tmp/test/a')).toBe(false)
+  })
+
+  it('reads a `-` that stands for itself wherever the set has it', () => {
+    // What each set holds, spelled out from the glob: a `-` first or last in
+    // a set, or straight after a range, is that character; between two
+    // others it makes a range, and either end of a range may be a `-` too.
+    const sets: [body: string, holds: string][] = [
+      ['-', '-'],
+      ['a-', 'a-'],
+      ['-a', '-a'],
+      ['ab-', 'ab-'],
+      ['-a-', '-a'],
+      ['--', '-'],
+      ['---', '-'],
+      ['a-c-', 'abc-'],
+      ['-a-c', '-abc'],
+      ['a-c-e', 'abc-e'],
+      ['a-c--', 'abc-'],
+      ['--0', '-./0'],
+      ['--.', '-.'],
+      ['+--', '+,-'],
+      [',--', ',-'],
+      ['a-c--0', 'abc-./0'],
+      ['--0-', '-./0'],
+      ['-.', '-.'],
+      ['.-', '.-'],
+      ['$-', '$-'],
+      ['-^', '-^'],
+      ['\\-', '\\-'],
+      ['-\\', '-\\'],
+      ['[-', '[-'],
+    ]
+    const printable = Array.from({ length: 95 }, (_, i) =>
+      String.fromCharCode(32 + i),
+    )
+    for (const [body, holds] of sets) {
+      const inside = new RegExp(globToRegex(`/d/[${body}]`))
+      const outside = [
+        new RegExp(globToRegex(`/d/[!${body}]`)),
+        new RegExp(globToRegex(`/d/[^${body}]`)),
+      ]
+      for (const char of printable) {
+        const held = holds.includes(char)
+        expect([body, char, inside.test(`/d/${char}`)]).toEqual([
+          body,
+          char,
+          held,
+        ])
+        for (const regex of outside) {
+          expect([body, char, regex.test(`/d/${char}`)]).toEqual([
+            body,
+            char,
+            !held && char !== '/',
+          ])
+        }
+      }
+      // One character of one name, never none and never two.
+      expect(inside.test('/d/')).toBe(false)
+      expect(inside.test(`/d/${holds[0]}${holds[0]}`)).toBe(false)
+    }
+
+    // `]` is never a member, so these open no set and are their own text.
+    for (const text of ['/d/[]-]', '/d/[!]-]', '/d/[^]-]']) {
+      const regex = new RegExp(globToRegex(text))
+      expect(regex.test(text)).toBe(true)
+      expect(regex.test('/d/-')).toBe(false)
+      expect(regex.test('/d/]')).toBe(false)
+    }
+
+    // A range written backwards is no regular expression, with a `-` at
+    // either end of it as with any other character.
+    for (const body of ['c-a', 'a--', '--+', '.--', '-a--', 'a-c--+']) {
+      expect(() => new RegExp(globToRegex(`/d/[${body}]`))).toThrow()
+      expect(() => new RegExp(globToRegex(`/d/[!${body}]`))).toThrow()
+    }
+  })
+
+  it('writes that `-` first in its set and escapes nothing beside it', () => {
+    // The same string is a regular expression to JavaScript and to the regex
+    // engine of a macOS sandbox profile. Inside a set that engine takes a
+    // backslash for a member, so `[^/\-a]` was the range from `\` to `a`
+    // there and let a `-` through; and it refuses a set that ends in one
+    // character and a `-` (`[a-]`), which left a profile that would not
+    // load. First in the set, a `-` is the character to both.
+    expect(globToRegex('/d/[!-a]')).toBe('^/d/[^-/a]$')
+    expect(globToRegex('/d/[^-a]')).toBe('^/d/[^-/a]$')
+    expect(globToRegex('/d/[!-.]')).toBe('^/d/[^-/.]$')
+    expect(globToRegex('/d/[!-a-c]')).toBe('^/d/[^-/a-c]$')
+    expect(globToRegex('/d/[!a-]')).toBe('^/d/[^-/a]$')
+    expect(globToRegex('/d/[!-]')).toBe('^/d/[^-/]$')
+    expect(globToRegex('/d/[-a]')).toBe('^/d/[-a]$')
+    expect(globToRegex('/d/[a-]')).toBe('^/d/[-a]$')
+    expect(globToRegex('/d/[ab-]')).toBe('^/d/[-ab]$')
+    expect(globToRegex('/d/[a-c-]')).toBe('^/d/[-a-c]$')
+    expect(globToRegex('/d/[-a-c]')).toBe('^/d/[-a-c]$')
+    expect(globToRegex('/d/[a-c-e]')).toBe('^/d/[-a-ce]$')
+    expect(globToRegex('/d/[-a-]')).toBe('^/d/[-a]$')
+    // A set of nothing else is the character, and needs no set.
+    expect(globToRegex('/d/[-]')).toBe('^/d/-$')
+
+    // A range that starts or ends at a `-` is that `-` and the rest of the
+    // range, from `.` after it or up to `,` before it.
+    expect(globToRegex('/d/[--0]')).toBe('^/d/[-.-0]$')
+    expect(globToRegex('/d/[!--0]')).toBe('^/d/[^-/.-0]$')
+    expect(globToRegex('/d/[--.]')).toBe('^/d/[-.]$')
+    expect(globToRegex('/d/[+--]')).toBe('^/d/[-+-,]$')
+    expect(globToRegex('/d/[!+--]')).toBe('^/d/[^-/+-,]$')
+    expect(globToRegex('/d/[,--]')).toBe('^/d/[-,]$')
+
+    // A backslash is the one member that cannot be written plainly.
+    expect(globToRegex('/d/[\\-]')).toBe('^/d/[-\\\\]$')
+
+    // A set with no `-` of its own compiles to what it always did.
+    expect(globToRegex('/d/[a-c]')).toBe('^/d/[a-c]$')
+    expect(globToRegex('/d/[!a-c.]')).toBe('^/d/[^/a-c\\.]$')
+    expect(globToRegex('/d/[+-9]')).toBe('^/d/[\\+-9]$')
+  })
+
+  it('writes every set the way both regex engines read alike', () => {
+    expect(compiledSets('^/d/[^-/a]x\\[y[b-c]$')).toEqual(['^-/a', 'b-c'])
+    for (const bad of ['a-', '^/a-', 'ab-', '^/\\-a', 'a\\-', '-', '--0']) {
+      expect([bad, readsAlikeInBothEngines(bad)]).toEqual([bad, false])
+    }
+    for (const good of ['-a', '^-/a', '^-/.-0', '-a-c', '^/a-c\\.', '-\\\\']) {
+      expect([good, readsAlikeInBothEngines(good)]).toEqual([good, true])
+    }
+
+    // Every set body of up to four of these, in each of the three spellings.
+    // One that is no regular expression (a range written backwards) is left
+    // out: there is nothing of it for an engine to read.
+    const alphabet = ['-', 'a', 'c', '.', '0', '+', ',', '\\', '^', '$']
+    const misread: string[] = []
+    let bodies = ['']
+    let compiled = 0
+    for (let length = 1; length <= 4; length++) {
+      bodies = bodies.flatMap(body => alphabet.map(char => body + char))
+      for (const body of bodies) {
+        for (const lead of ['', '!', '^']) {
+          const glob = `/d/[${lead}${body}]x`
+          const regex = globToRegex(glob)
+          try {
+            new RegExp(regex)
+          } catch {
+            continue
+          }
+          compiled++
+          if (!compiledSets(regex).every(readsAlikeInBothEngines)) {
+            misread.push(`${glob} compiles to ${regex}`)
+          }
+        }
+      }
+    }
+    expect(compiled).toBeGreaterThan(30000)
+    expect(misread.slice(0, 10)).toEqual([])
   })
 
   it('treats a bracket that opens no set as a literal character', () => {
@@ -1073,34 +1289,54 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(unclosed).test('/tmp/test/file[abc.txt')).toBe(true)
     expect(new RegExp(unclosed).test('/tmp/test/filea.txt')).toBe(false)
 
+    // Every one of them, not only the first: two used to leave a regex that
+    // would not compile.
+    const twice = globToRegex('/tmp/test/file[a[b.txt')
+    expect(new RegExp(twice).test('/tmp/test/file[a[b.txt')).toBe(true)
+
+    // A set needs a member, so the `]` closing an empty one is a character
+    // of the path as well.
+    const empty = globToRegex('/tmp/test/file[]a.txt')
+    expect(new RegExp(empty).test('/tmp/test/file[]a.txt')).toBe(true)
+
     const stray = globToRegex('/tmp/test/file]a.txt')
     expect(new RegExp(stray).test('/tmp/test/file]a.txt')).toBe(true)
     expect(new RegExp(stray).test('/tmp/test/filea.txt')).toBe(false)
   })
 
-  it.failing(
-    'keeps a component spelled like a globstar placeholder literal',
-    () => {
-      // globToRegex parks `**` under __GLOBSTAR__ / __GLOBSTAR_SLASH__ while
-      // it rewrites `*` and `?`, then restores them by name, so a directory
-      // actually called __GLOBSTAR__ comes back as a wildcard.
-      const parked = globToRegex('/tmp/__GLOBSTAR__/x')
-      expect(new RegExp(parked).test('/tmp/__GLOBSTAR__/x')).toBe(true)
-      expect(new RegExp(parked).test('/tmp/anything/x')).toBe(false)
+  it('keeps a component spelled like a globstar placeholder literal', () => {
+    // `**` used to be parked under __GLOBSTAR__ / __GLOBSTAR_SLASH__ while
+    // `*` and `?` were rewritten, and restored by name afterwards, so a
+    // directory actually called __GLOBSTAR__ came back as a wildcard.
+    const parked = globToRegex('/tmp/__GLOBSTAR__/x')
+    expect(new RegExp(parked).test('/tmp/__GLOBSTAR__/x')).toBe(true)
+    expect(new RegExp(parked).test('/tmp/anything/x')).toBe(false)
 
-      const parkedSlash = globToRegex('/tmp/__GLOBSTAR_SLASH__x')
-      expect(new RegExp(parkedSlash).test('/tmp/__GLOBSTAR_SLASH__x')).toBe(
-        true,
-      )
-    },
-  )
+    const parkedSlash = globToRegex('/tmp/__GLOBSTAR_SLASH__x')
+    expect(new RegExp(parkedSlash).test('/tmp/__GLOBSTAR_SLASH__x')).toBe(true)
+  })
 
   it('agrees with a reference matcher over generated patterns and paths', () => {
     // Segments are drawn from the documented syntax only; the corners the
-    // cases above pin (an unclosed bracket, a stray `]`, a negated set, a
-    // literal placeholder) are left out so a disagreement here means the
-    // documented syntax itself diverged.
+    // cases above pin (an unclosed bracket, a stray `]`, a set with no
+    // members) are left out so a disagreement here means the documented
+    // syntax itself diverged. The names include the spellings `**` was once
+    // parked under, which are now names like any other. A `-` is drawn in
+    // every place a set can hold one (first, last, after a range, at either
+    // end of one) and, in `[]-]` and `[!]-]`, where it only looks like it.
     const segment = fc.constantFrom(
+      '[!-a]',
+      '[!-.]',
+      '[a-]',
+      '[!a-]',
+      '[--0]',
+      '[!--0]',
+      '[+--]',
+      '[-]',
+      '[a-c-]',
+      '[-a-c]',
+      '[]-]',
+      '[!]-]',
       'a',
       'bc',
       'a*',
@@ -1111,21 +1347,49 @@ describe('globToRegex (shared)', () => {
       '[ab]',
       '[0-9]',
       '[a-c]c',
+      '[!ab]',
+      '[^0-9]',
+      '[!a-c]c',
+      '__GLOBSTAR__',
+      '__GLOBSTAR_SLASH__b',
       '**',
     )
     const pattern = fc
       .array(segment, { minLength: 1, maxLength: 4 })
       .map(parts => '/' + parts.join('/'))
     const pathText = fc
-      .array(fc.constantFrom('a', 'b', 'c', 'bc', 'a1', 'abc', '0', 'ab'), {
-        minLength: 1,
-        maxLength: 4,
-      })
+      .array(
+        fc.constantFrom(
+          'a',
+          'b',
+          'c',
+          'bc',
+          'a1',
+          'abc',
+          '0',
+          'ab',
+          '-',
+          '.',
+          ',',
+          '+',
+          '[]-]',
+          '[!]-]',
+          '__GLOBSTAR__',
+          '__GLOBSTAR_SLASH__b',
+        ),
+        { minLength: 1, maxLength: 4 },
+      )
       .map(parts => '/' + parts.join('/'))
     fc.assert(
       fc.property(pattern, pathText, (p, f) => {
         return new RegExp(globToRegex(p)).test(f) === referenceGlobMatch(p, f)
       }),
+      { numRuns: 200 },
+    )
+    fc.assert(
+      fc.property(pattern, p =>
+        compiledSets(globToRegex(p)).every(readsAlikeInBothEngines),
+      ),
       { numRuns: 200 },
     )
   })

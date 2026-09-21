@@ -1073,6 +1073,10 @@ export function encodedCommandFromProxyUser(
   return suffix
 }
 
+/** A character a regex reads as syntax and a glob does not. `*`, `?`, `[`
+ *  and `]` are glob syntax and are emitted where they are met. */
+const REGEX_METACHARACTER = /[.^$+{}()|\\]/
+
 /**
  * Convert a glob pattern to a regular expression
  *
@@ -1084,27 +1088,150 @@ export function encodedCommandFromProxyUser(
  * - ** matches any characters including / (e.g., src/**\/*.ts matches all .ts files in src/)
  * - ? matches any single character except / (e.g., file?.txt matches file1.txt)
  * - [abc] matches any character in the set (e.g., file[0-9].txt matches file3.txt)
+ * - [!abc] and [^abc] match any character outside the set, never a `/`
+ *
+ * The pattern is read once, left to right, and the regex is emitted as it
+ * goes, so nothing of the pattern is ever parked under a marker and no text
+ * in it can be taken for one: a directory called `__GLOBSTAR__` is that
+ * name and nothing else.
+ *
+ * A `[` that opens no set is a literal character: one that nothing closes,
+ * and one whose set would hold no members (`[]`, `[!]`). `]` is never a
+ * member of a set, because no spelling of it inside one reads the same to a
+ * JavaScript regular expression and to the regex engine of a macOS sandbox
+ * profile, which this same string is also compiled into. A `-` that is a
+ * member is written first in its set, the one place where both read it as
+ * the character ({@link setWithDashFirst}).
  *
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
 export function globToRegex(globPattern: string): string {
-  return (
-    '^' +
-    globPattern
-      // Escape regex special characters (except glob chars * ? [ ])
-      .replace(/[.^$+{}()|\\]/g, '\\$&')
-      // Escape unclosed brackets (no matching ])
-      .replace(/\[([^\]]*?)$/g, '\\[$1')
-      // Convert glob patterns to regex (order matters - ** before *)
-      .replace(/\*\*\//g, '__GLOBSTAR_SLASH__') // Placeholder for **/
-      .replace(/\*\*/g, '__GLOBSTAR__') // Placeholder for **
-      .replace(/\*/g, '[^/]*') // * matches anything except /
-      .replace(/\?/g, '[^/]') // ? matches single character except /
-      // Restore placeholders
-      .replace(/__GLOBSTAR_SLASH__/g, '(.*/)?') // **/ matches zero or more dirs
-      .replace(/__GLOBSTAR__/g, '.*') + // ** matches anything including /
-    '$'
-  )
+  let regex = '^'
+  /** Inside a `[…]`, where `]` closes the set rather than standing for itself. */
+  let inSet = false
+  let i = 0
+  while (i < globPattern.length) {
+    const char = globPattern[i]!
+    if (char === '*') {
+      const run = i
+      while (globPattern[i] === '*') i++
+      // `**/` is one piece and takes the separator with it, so the last two
+      // stars of a run before one go there. What is left of the run is `**`
+      // pairs from the left and then a lone `*`.
+      const withSeparator = i - run >= 2 && globPattern[i] === '/'
+      let stars = i - run - (withSeparator ? 2 : 0)
+      for (; stars >= 2; stars -= 2) regex += '.*' // ** matches anything including /
+      if (stars === 1) regex += '[^/]*' // * matches anything except /
+      if (withSeparator) {
+        regex += '(.*/)?' // **/ matches zero or more dirs
+        i++
+      }
+      continue
+    }
+    if (char === '?') {
+      regex += '[^/]' // ? matches a single character except /
+      i++
+      continue
+    }
+    if (inSet && char === ']') {
+      regex += ']'
+      inSet = false
+      i++
+      continue
+    }
+    if (!inSet && char === '[') {
+      const set = setOpenedAt(globPattern, i)
+      if (set === undefined) {
+        regex += '\\['
+        i++
+        continue
+      }
+      const dashFirst = setWithDashFirst(
+        globPattern.slice(set.members, set.close),
+        set.negated,
+      )
+      if (dashFirst !== undefined) {
+        regex += dashFirst
+        i = set.close + 1
+        continue
+      }
+      regex += set.negated ? '[^/' : '['
+      inSet = true
+      i = set.members
+      // Only a set that holds a wildcard still gets here with a `-` first
+      // among its members, where it would read as a range with that `/`.
+      if (set.negated && globPattern[i] === '-') {
+        regex += '\\-'
+        i++
+      }
+      continue
+    }
+    regex += REGEX_METACHARACTER.test(char) ? `\\${char}` : char
+    i++
+  }
+  return regex + '$'
+}
+
+/**
+ * The set the `[` at `open` opens: where its members start, the `]` that
+ * closes it, and whether a leading `!` or `^` negates it. Undefined when the
+ * `[` opens no set — nothing closes it, or the first thing after it is the
+ * `]`, which closes the set here rather than standing for itself.
+ */
+function setOpenedAt(
+  pattern: string,
+  open: number,
+): { members: number; close: number; negated: boolean } | undefined {
+  const lead = pattern[open + 1]
+  const negated = lead === '!' || lead === '^'
+  const members = open + (negated ? 2 : 1)
+  const close = pattern.indexOf(']', members)
+  return close > members ? { members, close, negated } : undefined
+}
+
+/**
+ * The whole regex for a set in which a `-` stands for itself: one that is
+ * first or last among the members or comes straight after a range, or that
+ * a range starts or ends at. Undefined for a set with no such `-`, which is
+ * emitted a character at a time like any other text, to the string it always
+ * was; and for one that holds a wildcard, which is not read as a set at all.
+ *
+ * The two engines this string is compiled by read a `-` alike in one place
+ * only, first among the members. The regex engine of a macOS sandbox profile
+ * takes a backslash inside a set for a member, so `\-` escapes nothing there
+ * (`[^/\-a]` is the range from `\` to `a`, and lets a `-` through), and it
+ * refuses a set that ends in one character and a `-` (`[a-]`), and the whole
+ * profile with it. So the `-` goes first, ahead of the `/` a negated set
+ * excludes, and a range that starts or ends at one is written as the `-` and
+ * the rest of the range: from `.`, the character after it, or up to `,`, the
+ * one before. Behind that `-` a backslash is the only member that needs one
+ * in front of it, so the others are written as they are, a backslash before
+ * a `.` being one more member to that engine.
+ */
+function setWithDashFirst(body: string, negated: boolean): string | undefined {
+  if (/[*?]/.test(body)) return undefined
+  let dash = false
+  let members = ''
+  const member = (char: string): string => (char === '\\' ? '\\\\' : char)
+  for (let i = 0; i < body.length; i++) {
+    let low = body[i]!
+    let high = low
+    if (body[i + 1] === '-' && i + 2 < body.length) {
+      high = body[i + 2]!
+      i += 2
+    }
+    if (low === '-' || high === '-') {
+      dash = true
+      if (low === high) continue
+      if (low === '-') low = '.'
+      else high = ','
+    }
+    members += low === high ? member(low) : `${member(low)}-${member(high)}`
+  }
+  if (!dash) return undefined
+  if (negated) return `[^-/${members}]`
+  // Alone in its set, the `-` is as well written without one.
+  return members === '' ? '-' : `[-${members}]`
 }
 
 /**
@@ -1214,11 +1341,10 @@ export function expandGlobPattern(
  *
  * `splits` is false for a pattern this cannot be done for: one with a
  * wildcard inside a bracket expression (globToRegex rewrites that wildcard
- * like any other, and what is left no longer reads as one character), with a
- * second `[` that nothing closes, or that spells one of globToRegex's
- * placeholders. Its positions say nothing, so every directory is listed, an
- * entry is matched by its whole spelling, and {@link walkGlobPattern} does
- * not list such a pattern through symlinks.
+ * like any other, and what is left no longer reads as one character). Its
+ * positions say nothing, so every directory is listed, an entry is matched
+ * by its whole spelling, and {@link walkGlobPattern} does not list such a
+ * pattern through symlinks.
  */
 interface GlobPositions {
   splits: boolean
@@ -1254,11 +1380,8 @@ type GlobPiece =
   | { source: string; canBeSeparator?: true }
 
 function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
-  // globToRegex rewrites its own placeholders where a pattern spells one.
-  if (pattern.includes('__GLOBSTAR')) return undefined
   const sourceOf = (text: string): string => globToRegex(text).slice(1, -1)
   const pieces: GlobPiece[] = []
-  let unclosed = 0
   // A bracket expression first, the way a regular expression reads one:
   // everything up to the first `]`. Then a run of `*` with the separator
   // after it, since `**/` is one thing to globToRegex.
@@ -1286,9 +1409,6 @@ function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
     } else if (separator !== undefined) {
       pieces.push('/')
     } else {
-      // globToRegex escapes the first `[` that nothing closes and no other:
-      // a second one reads on into whatever a later wildcard is rewritten to.
-      if (text === '[' && unclosed++ > 0) return undefined
       pieces.push({ source: sourceOf(text) })
     }
   }
