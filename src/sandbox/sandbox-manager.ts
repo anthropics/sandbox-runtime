@@ -89,6 +89,7 @@ import {
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
+import { ownFilesWriteDenies } from './own-files.js'
 import {
   SandboxViolationStore,
   sanitizeUnregisteredCommandKey,
@@ -725,6 +726,9 @@ async function initialize(
         denyWritePaths: [
           ...monitoredWrites.denyWithinAllow.map(p =>
             normalizePathForSandbox(p),
+          ),
+          ...(monitoredWrites.literalDenyWithinAllow ?? []).map(p =>
+            normalizePathForSandbox(p, { literal: true }),
           ),
           // filesystem.disabled reaches the wrapper as `writeConfig ===
           // undefined`, which skips every bind and the built-in denies with
@@ -1369,6 +1373,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
   return {
     allowOnly,
     denyWithinAllow: denyPaths,
+    // The library's own files beside the caller's denies: see own-files.ts.
+    literalDenyWithinAllow: ownFilesWriteDenies(allowOnly),
   }
 }
 
@@ -1676,24 +1682,28 @@ async function wrapWithSandbox(
         config?.filesystem.allowWrite ??
         [],
     )
+    const allowOnly = [
+      ...defaultWritePathsUnder({
+        denyRead:
+          customConfig?.filesystem?.denyRead ??
+          config?.filesystem.denyRead ??
+          [],
+        allowRead:
+          customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+        credentials: customConfig?.credentials ?? config?.credentials,
+      }),
+      ...userAllowWrite,
+    ]
     writeConfig = {
-      allowOnly: [
-        ...defaultWritePathsUnder({
-          denyRead:
-            customConfig?.filesystem?.denyRead ??
-            config?.filesystem.denyRead ??
-            [],
-          allowRead:
-            customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
-          credentials: customConfig?.credentials ?? config?.credentials,
-        }),
-        ...userAllowWrite,
-      ],
+      allowOnly,
       denyWithinAllow: stripWriteGlobs(
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
           [],
       ),
+      // Whatever this wrap may write, the library's own files are not among
+      // it: see own-files.ts.
+      literalDenyWithinAllow: ownFilesWriteDenies(allowOnly),
     }
 
     // Credential deny paths are unioned with the caller's denyRead — never
