@@ -1796,7 +1796,7 @@ export interface WindowsAclStampOptions {
 /**
  * Apply the file-deny ACE set for one host session: an additive
  * `(D;OICI;mask;;;<sb-SID>)` on the target plus a
- * `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent — no
+ * `(D;;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent — no
  * PROTECTED rewrite, no SD snapshot. Idempotent and refcounted via
  * srt-win's `working_aces` table.
  *

@@ -278,7 +278,7 @@ enum UserCmd {
 enum AclCmd {
     /// Read `{denyRead:[…], denyWrite:[…]}` from stdin and add an
     /// additive `(D;OICI;mask;;;<sid>)` ACE for the sandbox user on
-    /// each target plus a `(D;OICI;FILE_DELETE_CHILD;;;<sid>)` on
+    /// each target plus a `(D;;FILE_DELETE_CHILD;;;<sid>)` on
     /// the parent — NO PROTECTED rewrite, no SD snapshot.
     /// Refcounted per holder; `acl restore` removes the ACE when
     /// the last holder releases. Globs are rejected; directory
