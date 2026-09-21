@@ -1377,7 +1377,12 @@ function buildSandboxCommand(
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    'trap "kill %1 %2 2>/dev/null; exit" EXIT',
+    // The trap saves the status the script is exiting with and exits with
+    // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
+    // keep the script's status, zsh takes the status of the trap's own last
+    // command (the kill), so under zsh a failing command reported 0. Single
+    // quotes, so $? and $rc are read when the trap runs, not when it is set.
+    "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
