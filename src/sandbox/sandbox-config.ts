@@ -476,10 +476,98 @@ export const CredentialFileConfigSchema = z.object({
  * the entry currently fails open — the real value stays in the sandbox
  * environment and a loud stderr warning names the variable.
  */
+/**
+ * Where the real value of a masked credential comes from.
+ *
+ * Without a `source`, a `mode: "mask"` entry reads its value from srt's own
+ * environment, so the plaintext has to be exported before srt can hide it:
+ * `export GH_TOKEN=$(op read op://vault/gh/token)` leaves the credential in
+ * the parent process, readable by every same-user process, which is the
+ * exposure masking exists to close. A `source` lets the value stay in the
+ * secret store until srt reads it, registers a sentinel and hands the
+ * sandbox the fake.
+ *
+ * `type` is the discriminator. Only `"command"` exists today; it is
+ * required so a later source kind can be added without changing the
+ * meaning of a config already written.
+ *
+ * The command runs **on the host, outside the sandbox, with srt's own
+ * privileges**, at wrap time. It must print the value on stdout and exit 0.
+ * See {@link CredentialSourceResolver} for resolution, caching and failure
+ * behaviour.
+ */
+export const CredentialSourceConfigSchema = z
+  .object({
+    type: z
+      .literal('command')
+      .describe(
+        'Source kind. Only "command" is supported; required so further ' +
+          'kinds can be added without reinterpreting existing configs.',
+      ),
+    command: z
+      .string()
+      .min(1)
+      .describe(
+        'Executable to run: a bare name resolved on PATH, or an absolute ' +
+          'path. Relative paths are rejected, because they resolve ' +
+          "against srt's working directory, not the settings file's. " +
+          'Never a shell string: it is not parsed for metacharacters.',
+      ),
+    args: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Arguments passed verbatim as argv, e.g. ' +
+          '["read", "op://vault/gh/token"]. Do not put a secret here: ' +
+          'argv is visible to every same-user process, which is the ' +
+          'exposure a source exists to avoid.',
+      ),
+    timeoutMs: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        'Budget for the command, default 10000. The child is SIGKILLed ' +
+          'at the deadline, but a grandchild holding its stdout can still ' +
+          'delay the wrap past it, so a source command should not fork ' +
+          'anything that outlives it.',
+      ),
+  })
+  .strict()
+
 export const CredentialEnvVarConfigSchema = z.object({
   name: envVarNameSchema.describe('Environment variable name'),
   mode: credentialModeSchema.describe(
     'Access mode for this environment variable',
+  ),
+  /**
+   * Where to read the real value from, instead of srt's environment.
+   *
+   * With a `source`, the host environment is **not** consulted for this
+   * variable: the source is the value. An exported copy does not win and
+   * does not act as a fallback. A `source` that resolves while a
+   * stale export sits alongside it would otherwise mask and inject
+   * whichever the operator did not mean, and that failure lands at the
+   * upstream as a 401 with nothing pointing back here.
+   *
+   * For the same reason a source that fails is fail-closed: the variable
+   * is unset inside the sandbox rather than left to fall through to
+   * whatever the host environment happens to hold, which would be the real
+   * credential, unmasked, in the one case the operator asked for it not to
+   * be. The failure is reported on stderr, and the command is not run
+   * again for the rest of the session.
+   *
+   * Only meaningful when `mode` is `"mask"`; rejected with `"deny"`, which
+   * unsets the variable and has no value to source. See the
+   * superRefine below.
+   */
+  source: CredentialSourceConfigSchema.optional().describe(
+    "Where to read the real value from, instead of srt's environment. " +
+      'With a source set, the host environment is not consulted for this ' +
+      'variable, and a source that fails unsets it inside the sandbox ' +
+      '(fail-closed) rather than falling back to the exported value. ' +
+      'Only meaningful when mode is "mask".',
   ),
   extract: extractPatternSchema
     .optional()
@@ -1306,6 +1394,20 @@ export const SandboxRuntimeConfigSchema = z
     }
     for (const [idx, v] of (creds.envVars ?? []).entries()) {
       checkMaskedEntry(v, ['credentials', 'envVars', idx])
+      // A deny entry unsets the variable inside the sandbox. There is no
+      // value to mask, so there is nothing for a source to supply:
+      // running a vault command only to throw the result away is never
+      // what was meant. Same posture as maskClaims-without-decode below.
+      if (v.source !== undefined && v.mode !== 'mask') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'envVars', idx, 'source'],
+          message:
+            `source requires mode "mask": a "${v.mode}" entry unsets ` +
+            `the variable and has no value to source. Set mode to ` +
+            `"mask", or remove source.`,
+        })
+      }
       // maskClaims names fields inside a decoded payload; without decode
       // there is no payload to look inside — reject the contradiction
       // loudly rather than silently masking nothing.
@@ -1461,6 +1563,9 @@ export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
 export type FilesystemConfig = z.infer<typeof FilesystemConfigSchema>
 export type CredentialMode = z.infer<typeof credentialModeSchema>
 export type CredentialFileConfig = z.infer<typeof CredentialFileConfigSchema>
+export type CredentialSourceConfig = z.infer<
+  typeof CredentialSourceConfigSchema
+>
 export type CredentialEnvVarConfig = z.infer<
   typeof CredentialEnvVarConfigSchema
 >
