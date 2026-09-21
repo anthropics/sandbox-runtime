@@ -409,14 +409,24 @@ jobs:
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              # node and npm come from the image instead of a second piped
-              # installer, and bun is pinned to the version the rest of the
-              # matrix runs (oven-sh/setup-bun above). The tree carries a
-              # dozen bun-version-specific workarounds, so "whatever bun
-              # shipped this morning" is not the runtime under test.
+              # node and npm come from the image, and bun is pinned to the
+              # version the rest of the matrix runs (oven-sh/setup-bun above).
+              # The tree carries a dozen bun-version-specific workarounds, so
+              # "whatever bun shipped this morning" is not the runtime under
+              # test.
               apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin nodejs npm
-              curl -fsSL https://bun.sh/install | bash -s bun-v1.4.2
-              export PATH="$HOME/.bun/bin:$PATH"
+              # The release archive, by checksum, rather than an installer
+              # piped into a shell.
+              case "$(uname -m)" in
+                x86_64) bun_zip=bun-linux-x64; bun_sha=36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913 ;;
+                aarch64) bun_zip=bun-linux-aarch64; bun_sha=54328bbc2d9c8e0c9f892c544d66c57a83b84139e34909e5ee81758f1ac8fda7 ;;
+                *) echo "no bun archive is pinned for $(uname -m)"; exit 1 ;;
+              esac
+              curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/${bun_zip}.zip"
+              echo "${bun_sha}  /tmp/bun.zip" | sha256sum -c -
+              unzip -q /tmp/bun.zip -d /tmp
+              install -m 0755 "/tmp/${bun_zip}/bun" /usr/local/bin/bun
+              bun --version
               npm ci
               npm run build:seccomp
               npm run build
@@ -428,7 +438,7 @@ jobs:
 
       # The same two runs on musl. The seccomp helper is static and built
       # here against musl's libseccomp, and bubblewrap, socat and ripgrep are
-      # Alpine's own builds. bun picks its musl build by itself. The checkout
+      # Alpine's own builds, and bun is its musl build. The checkout
       # is copied first: node_modules and the helper the step above left in
       # the workspace were built for glibc.
       - name: Run srt end-to-end as uid 0 in an Alpine container
@@ -445,8 +455,15 @@ jobs:
               mkdir /work
               tar -C /src --exclude=./node_modules --exclude=./dist --exclude=./vendor/seccomp/x64 --exclude=./vendor/seccomp/arm64 --exclude=./.git -cf - . | tar -C /work -xf -
               cd /work
-              curl -fsSL https://bun.sh/install | bash -s bun-v1.4.2
-              export PATH="$HOME/.bun/bin:$PATH"
+              case "$(uname -m)" in
+                x86_64) bun_zip=bun-linux-x64-musl; bun_sha=4835eca59d6da70f4674f5642f6e459dcadab773695b2ed9922d131057989742 ;;
+                aarch64) bun_zip=bun-linux-aarch64-musl; bun_sha=71760b6c8ea30623b81a4907cb815d48e2ea266f2e73e751534a44a0607950df ;;
+                *) echo "no bun archive is pinned for $(uname -m)"; exit 1 ;;
+              esac
+              curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/${bun_zip}.zip"
+              echo "${bun_sha}  /tmp/bun.zip" | sha256sum -c -
+              unzip -q /tmp/bun.zip -d /tmp
+              install -m 0755 "/tmp/${bun_zip}/bun" /usr/local/bin/bun
               bun --version
               npm ci
               npm run build:seccomp
