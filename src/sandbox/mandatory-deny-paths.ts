@@ -10,10 +10,11 @@ import {
 
 /**
  * The path is absent, as opposed to unreadable or otherwise unverifiable.
- * Narrower than the shared {@link isAbsenceErrno} by two codes: ELOOP must
- * read as unreadable here, so a `gitdir:` target that is a symlink loop is
- * denied whole rather than passed over as nothing, and ENAMETOOLONG has its
- * own answer in {@link isUnusablePathError}.
+ * Narrower than the shared {@link isAbsenceErrno} by two codes: an absent
+ * path is denied as one a command could still create, and a symlink loop is
+ * not that — it is walked instead, so that the links the walk went through
+ * before it gave up are held ({@link resolveChain}) — while ENAMETOOLONG has
+ * its own answer in {@link isUnusablePathError}.
  */
 function isAbsenceError(err: unknown): boolean {
   const code = (err as NodeJS.ErrnoException | undefined)?.code
@@ -124,9 +125,17 @@ interface ChainHop {
  *  {@link resolveChain}. */
 interface ResolvedChain {
   landing: string
-  /** In the order the walk met them: the first is the path the caller asked
-   *  about, the rest are what lies between it and the landing. */
+  /** In the order the walk met them and each named once: the first is the
+   *  path the caller asked about, the rest are what lies between it and the
+   *  landing. A loop meets the same link over and over; it is one hop. */
   hops: ChainHop[]
+  /**
+   * Whether the walk ran to the end of the path. False only where it gave up
+   * past the kernel's own hop limit — a loop, or a chain longer than the
+   * kernel follows — and `landing` is then just where it stopped, a path
+   * nothing can be reached through while the chain stands.
+   */
+  resolved: boolean
 }
 
 /**
@@ -150,6 +159,16 @@ export interface GitChainHop {
    * it differs.
    */
   kind: 'entry' | 'pointer'
+  /**
+   * Whether the chain this hop lies on reaches anything. `unresolvable` is a
+   * loop, or a chain past the kernel's hop limit: nothing is behind it, both
+   * ends of it are held by a deny that stands on nothing, and each link the
+   * walk DID go through is a name that makes the chain reach a real directory
+   * as soon as a command puts one in its place. A backend that cannot hold
+   * such a link has nothing left to fall back on and refuses the command; one
+   * whose chain resolves has the landing's own denies behind it and warns.
+   */
+  chain: 'resolved' | 'unresolvable'
   /** The git directory entry, or the metadata file, whose chain goes
    *  through it. */
   source: string
@@ -387,7 +406,11 @@ export function gitDirDenies(
   // The first hop IS the entry: its own path is a deny path already, and the
   // directory holding it is this git directory, denied whole below. The rest
   // lie between the two ends, and neither end holds them.
-  const holdChain = (entryPath: string, hops: ChainHop[]): void => {
+  const holdChain = (
+    entryPath: string,
+    hops: ChainHop[],
+    chain: GitChainHop['chain'],
+  ): void => {
     for (const hop of hops.slice(1)) {
       // A deny path like any other, for the backend that holds a link by its
       // own name; the one that resolves its denies drops it again.
@@ -395,6 +418,7 @@ export function gitDirDenies(
       if (insideGitDir(hop.link)) {
         chainHops.push({
           kind: 'entry',
+          chain,
           source: entryPath,
           link: hop.link,
           holder: undefined,
@@ -405,6 +429,7 @@ export function gitDirDenies(
       escapingDenyPaths.push(hop.link)
       chainHops.push({
         kind: 'entry',
+        chain,
         source: entryPath,
         link: hop.link,
         holder: insideGitDir(hop.holder) ? undefined : hop.holder,
@@ -426,13 +451,18 @@ export function gitDirDenies(
         if (!insideGitDir(entry.target)) {
           escapingDenyPaths.push(entry.target)
         }
-        holdChain(entryPath, entry.hops)
+        holdChain(entryPath, entry.hops, 'resolved')
         break
       case 'unreachable':
-        // A loop, or a name no file can occupy: there is nothing behind it to
-        // deny and nothing a command can create through it. The link itself
-        // is the whole hazard, and the whole-directory deny holds it.
+        // A loop, or a name no file can occupy: nothing is behind it to deny
+        // and nothing a command can create through it WHILE IT REACHES
+        // NOTHING. The entry's own link is held by the whole-directory deny,
+        // and every link the walk went through before it gave up is held like
+        // any other hop: each is a name a command can replace with a real
+        // directory, which makes the chain reach one and the host's git read
+        // what is put there.
         denyWhole = true
+        holdChain(entryPath, entry.hops, 'unresolvable')
         break
       case 'unknown':
         // There and not classifiable. Fail closed both ways: the deny the
@@ -443,7 +473,7 @@ export function gitDirDenies(
         denyWhole = true
         denyPaths.push(entryPath)
         escapingDenyPaths.push(entryPath)
-        holdChain(entryPath, entry.hops)
+        holdChain(entryPath, entry.hops, 'resolved')
         break
     }
   }
@@ -461,8 +491,9 @@ type GitDirEntry =
   | { kind: 'plain' }
   /** A symlink, resolved or dangling, leading to `target` through `hops`. */
   | { kind: 'link'; target: string; hops: ChainHop[] }
-  /** A symlink that reaches nothing: a loop, or a name no file can occupy. */
-  | { kind: 'unreachable' }
+  /** A symlink that reaches nothing: a loop, or a name no file can occupy.
+   *  `hops` is what the walk went through before it gave up. */
+  | { kind: 'unreachable'; hops: ChainHop[] }
   /** There, and what it is could not be worked out; `hops` is as much of the
    *  chain as the walk read before it stopped. */
   | { kind: 'unknown'; hops: ChainHop[] }
@@ -498,7 +529,7 @@ function gitDirEntry(entryPath: string): GitDirEntry {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException | undefined)?.code
     if (code === 'ELOOP' || isUnusablePathError(err)) {
-      return { kind: 'unreachable' }
+      return { kind: 'unreachable', hops: chain.hops }
     }
     if (!isAbsenceErrno(err)) {
       logForDebugging(
@@ -579,16 +610,29 @@ export function gitFileDenies(
   // it is held as a symlinked entry is: the file naming it is denied and the
   // git directory it reaches is denied, while a command that retargets a link
   // between the two moves where git lands without touching either end.
-  const holdChain = (source: string, hops: ChainHop[]): void => {
-    for (const hop of hops) {
+  //
+  // A value that reaches nothing names no git directory to deny, and the
+  // links the walk did go through are the whole of what a command can move.
+  // One warning says so, because a `.git` file is something a sandboxed
+  // command may create: refusing every later command, or denying the
+  // checkout whole for it, would make writing one a way to lock the session
+  // out of its own project.
+  const holdChain = (source: string, targets: GitMetadataTargets): void => {
+    for (const hop of targets.hops) {
       denyPaths.push(hop.link)
       chainHops.push({
         kind: 'pointer',
+        chain: targets.resolved ? 'resolved' : 'unresolvable',
         source,
         link: hop.link,
         holder: hop.holder,
       })
     }
+    if (targets.resolved) return
+    logForDebugging(
+      `[Sandbox] The path ${source} names cannot be walked to an end (a symlink loop, or more than the ${MAX_SYMLINK_RESOLUTION_DEPTH} hops the kernel follows), so git opens nothing through it either; denying ${source} and the ${targets.hops.length} link(s) the walk did go through, and nothing besides`,
+      { level: 'warn' },
+    )
   }
   try {
     const pointer = readGitMetadataFile(gitFile)
@@ -611,7 +655,7 @@ export function gitFileDenies(
       return { denyPaths, escapingDenyPaths: [], linkedEntryDirs, chainHops }
     }
     const targets = gitMetadataTargets(path.dirname(gitFile), target)
-    holdChain(gitFile, targets.hops)
+    holdChain(gitFile, targets)
     const gitDirs = targets.gitDirs.map(gitDir => ({
       gitDir,
       kind: gitDirKind(gitDir),
@@ -658,7 +702,7 @@ export function gitFileDenies(
       }
       if (commonTarget === undefined) continue
       const commonTargets = gitMetadataTargets(gitDir, commonTarget)
-      holdChain(commonFile, commonTargets.hops)
+      holdChain(commonFile, commonTargets)
       for (const commonDir of commonTargets.gitDirs) {
         if (commonDir === gitDir) continue
         targetDenies(commonDir, gitDirKind(commonDir), commonFile)
@@ -904,10 +948,11 @@ function walkEntry(
   // The first hop is the entry, whose holder joins `linkedEntryDirs` below;
   // the rest lie between it and what it lands on, and that deny reaches
   // neither them nor the directories they sit in.
-  const holdChain = (): void => {
+  const holdChain = (chainState: GitChainHop['chain']): void => {
     for (const hop of chain.hops.slice(1)) {
       walk.chainHops.push({
         kind: 'entry',
+        chain: chainState,
         source: entryPath,
         link: hop.link,
         holder: isAtOrUnder(hop.holder, holder) ? undefined : hop.holder,
@@ -917,14 +962,14 @@ function walkEntry(
   try {
     if (!fs.statSync(entryPath).isDirectory()) return { kind: 'skip' }
     walk.linkedEntryDirs.add(holder)
-    holdChain()
+    holdChain('resolved')
     return { kind: 'directory' }
   } catch (err) {
     if (isAbsenceError(err)) {
       // Dangling. Nothing is there to walk, and a command can create it: what
       // the link lands on is denied as a git directory that is not there yet.
       walk.linkedEntryDirs.add(holder)
-      holdChain()
+      holdChain('resolved')
       return { kind: 'dangling', landing: chain.landing }
     }
     if (isUnusablePathError(err)) return { kind: 'skip' }
@@ -936,7 +981,14 @@ function walkEntry(
       // resolves a mount destination, and resolving this one is what just
       // failed. Denying the directory that HOLDS it is the one answer that
       // would be worse than none - a single link a command can write would
-      // take every submodule beside it read-only.
+      // take every submodule beside it read-only. The links the loop goes
+      // THROUGH are left alone for a reason of their own: a `.git/modules` is
+      // writable in the sandbox, so putting a directory at one of them to
+      // make this entry reach it is no shorter a way to a planted submodule
+      // git directory than creating one outright, which is the recorded limit
+      // of scanning before a command rather than after it. A git directory's
+      // own entries are the other case: there, the whole-directory deny holds
+      // the entry and the hops are all that is left open.
       logForDebugging(
         `[Sandbox] ${entryPath} is a symlink loop, which leads to nothing to deny: ${err}`,
         { level: 'warn' },
@@ -952,7 +1004,7 @@ function walkEntry(
       deepestReachableAncestor(linkTarget(entryPath) ?? entryPath) ?? entryPath
     walk.unreadableDirs.add(denied)
     walk.linkedEntryDirs.add(holder)
-    holdChain()
+    holdChain('resolved')
     logForDebugging(
       `[Sandbox] Could not follow ${entryPath}, denying ${denied} whole: ${err}`,
       { level: 'warn' },
@@ -1143,12 +1195,15 @@ function gitMetadataPath(contents: Buffer, file: string): string | undefined {
 /** Where a `gitdir:` or `commondir` value leads, and what it goes through;
  *  see {@link gitMetadataTargets}. */
 interface GitMetadataTargets {
+  /** Empty where the walk reached no end: see {@link resolveChain}. */
   gitDirs: string[]
   /** Every symlink the walk of the value went through, in the order it met
    *  them. A link ABOVE the file holding the value is not one of them: the
    *  base is resolved before the walk starts, so a checkout reached through a
    *  symlink is where the repository lives rather than a hop of this chain. */
   hops: ChainHop[]
+  /** {@link ResolvedChain.resolved} for the walk of the value. */
+  resolved: boolean
 }
 
 /**
@@ -1161,6 +1216,15 @@ interface GitMetadataTargets {
  * the kernel's landing and refuses when only the lexical one is a git
  * directory (test/sandbox/git-pointer-parity.test.ts pins that). Both are
  * denied when they differ: denying more than git follows costs one bind.
+ *
+ * A value whose walk reaches no end names NO git directory. git opens nothing
+ * through it — it gives up on the same loop, and the lexical fold is not a
+ * fallback it takes — while the deepest directory a fail-closed deny could
+ * still reach towards it is usually the checkout itself, and denying that
+ * whole would take the project read-only over a `.git` file a sandboxed
+ * command is allowed to create. The links the walk did go through come back
+ * as hops all the same: putting a directory in one of their places is what
+ * makes such a chain reach anything at all.
  */
 function gitMetadataTargets(base: string, target: string): GitMetadataTargets {
   const lexical = path.resolve(base, target)
@@ -1172,12 +1236,16 @@ function gitMetadataTargets(base: string, target: string): GitMetadataTargets {
     target,
   )
   const hops = chain.hops
-  if (!target.split('/').includes('..')) return { gitDirs: [lexical], hops }
+  const resolved = chain.resolved
+  if (!resolved) return { gitDirs: [], hops, resolved }
+  if (!target.split('/').includes('..')) {
+    return { gitDirs: [lexical], hops, resolved }
+  }
   // Both sides resolved the same way, so a base that merely spells itself
   // differently (a /var that is a symlink to /private/var) is no difference.
   return chain.landing === physicalPath(root, lexical)
-    ? { gitDirs: [lexical], hops }
-    : { gitDirs: [lexical, chain.landing], hops }
+    ? { gitDirs: [lexical], hops, resolved }
+    : { gitDirs: [lexical, chain.landing], hops, resolved }
 }
 
 /**
@@ -1199,6 +1267,8 @@ function resolveChain(base: string, target: string): ResolvedChain {
   let current = path.isAbsolute(target) ? path.parse(target).root : base
   let pending = target.split('/')
   const hops: ChainHop[] = []
+  const named = new Set<string>()
+  let followed = 0
   while (pending.length > 0) {
     const name = pending.shift()
     if (name === undefined || name === '' || name === '.') continue
@@ -1211,7 +1281,7 @@ function resolveChain(base: string, target: string): ResolvedChain {
     try {
       if (fs.lstatSync(next).isSymbolicLink()) link = fs.readlinkSync(next)
     } catch {
-      return { landing: path.join(next, ...pending), hops }
+      return { landing: path.join(next, ...pending), hops, resolved: true }
     }
     if (link === undefined) {
       current = next
@@ -1219,23 +1289,29 @@ function resolveChain(base: string, target: string): ResolvedChain {
     }
     // `current` is where the walk really is, so the hop is recorded under
     // the name the kernel reached it by rather than the one it was spelled
-    // from: that is the name an unlink or a rename of the link uses.
-    hops.push({ link: next, holder: current })
-    // A loop is where the walk stops, and what it hands back: the rest of
-    // the path folded past it would name a directory this cannot vouch for,
-    // while the link itself reads as unreadable and is denied whole. Past
-    // the kernel's own limit the chain reaches nothing — git fails on it as
-    // this does — so there is nothing behind it to protect and no hop of it
-    // worth holding, which is the answer a symlinked ENTRY that loops gets.
-    if (hops.length > MAX_SYMLINK_RESOLUTION_DEPTH) {
-      return { landing: next, hops: [] }
+    // from: that is the name an unlink or a rename of the link uses. A loop
+    // arrives at the same link over and over and it is one name, so the hop
+    // count is not what bounds the walk.
+    if (!named.has(next)) {
+      named.add(next)
+      hops.push({ link: next, holder: current })
+    }
+    // Past the kernel's own limit the chain reaches nothing: git gives up on
+    // it exactly as this does, so there is nothing behind it to protect and
+    // the landing is only where the walk stopped. The links it went THROUGH
+    // are a different matter and come back — each is a name a command able to
+    // write the directory around it can point at a real directory, which
+    // makes the chain reach one and every deny worked out for it wrong — so
+    // the caller holds them and says so where it cannot.
+    if (++followed > MAX_SYMLINK_RESOLUTION_DEPTH) {
+      return { landing: next, hops, resolved: false }
     }
     // A link's own target is walked in its place, from the directory holding
     // it unless it is absolute.
     if (path.isAbsolute(link)) current = path.parse(link).root
     pending = [...link.split('/'), ...pending]
   }
-  return { landing: current, hops }
+  return { landing: current, hops, resolved: true }
 }
 
 /** {@link resolveChain} for a caller that wants only where the walk landed. */
