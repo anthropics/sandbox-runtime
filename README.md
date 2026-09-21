@@ -220,6 +220,37 @@ srt --control-fd 3 -- npm test
   points that slot at `/dev/null` for the command, so nothing inside the
   sandbox can read the updates or write a config of its own.
 
+#### Reporting what the sandbox refused: `--violations`
+
+`--violations <path>` appends each operation the sandbox refuses to the
+named file, one line per event, as it is recorded: a proxy deny reads
+`deny network-outbound host:port (reason)`, a refused file access on macOS
+is the seatbelt log line (`bash(1234) deny(1) file-write-create /the/path`),
+and on Linux the seccomp observer's line. Without the flag none of this is
+reported: the command sees `Operation not permitted` on its own stderr and
+srt says nothing — the only way to discover which endpoints or paths a
+program needs is to watch it get refused, and this is that watch.
+
+```bash
+srt --violations /tmp/srt-violations.log -- ./agent
+```
+
+- The file must be writable when srt starts. As with `--control-fd`, srt
+  exits with an error instead of running the command when it is not, so a
+  report that was asked for never silently goes nowhere.
+- The file is opened for append. Reusing a path across runs collects them
+  in one file; each line is written the moment the event is recorded,
+  since srt exits with the wrapped command and does not wait to flush.
+- The filesystem monitor (a `log stream` on macOS, the seccomp observer on
+  Linux) runs only when `--violations` is given, for as long as the
+  command does. Proxy denies are recorded either way. On Windows only proxy
+  denies are reported.
+- Events arrive from the kernel asynchronously. A command that exits within
+  a few milliseconds of a refusal can exit before its line lands; the
+  long-running programs the report exists for are not affected.
+- Lines honour `ignoreViolations` from the settings file, the same way the
+  library's `getViolationsForCommand` does.
+
 ### As a library
 
 ```typescript
