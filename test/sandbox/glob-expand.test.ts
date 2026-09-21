@@ -495,31 +495,35 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     // 'C:/Users', '//server/share/' for a path on a share. Driven through
     // win32's own semantics, so the case is pinned on every runner and not
     // only where the suite meets a drive.
-    using dirname = spyOn(path, 'dirname').mockImplementation(win32.dirname)
-    const bases = [
-      'C:/Users*/id.pem',
-      'C:/Program*/keys/**',
-      'C:/*.pem',
-      '//server/share/x*/y',
-      '//server/share/*.pem',
-      'C:/Users/u/certs*/id.pem',
-    ].map(pattern => globPatternBaseDir(pattern))
-    expect(dirname).toHaveBeenCalled()
+    const dirname = spyOn(path, 'dirname').mockImplementation(win32.dirname)
+    try {
+      const bases = [
+        'C:/Users*/id.pem',
+        'C:/Program*/keys/**',
+        'C:/*.pem',
+        '//server/share/x*/y',
+        '//server/share/*.pem',
+        'C:/Users/u/certs*/id.pem',
+      ].map(pattern => globPatternBaseDir(pattern))
+      expect(dirname).toHaveBeenCalled()
 
-    for (const base of bases) {
-      expect(base.split('/').at(-1)).not.toBe('')
+      for (const base of bases) {
+        expect(base.split('/').at(-1)).not.toBe('')
+      }
+      // Every one of those but the last names a filesystem root, which the
+      // walk and the manager's warnings both refuse.
+      expect(bases.map(globBaseDirIsRoot)).toEqual([
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+      ])
+      expect(bases.at(-1)).toBe('C:/Users/u')
+    } finally {
+      dirname.mockRestore()
     }
-    // Every one of those but the last names a filesystem root, which the
-    // walk and the manager's warnings both refuse.
-    expect(bases.map(globBaseDirIsRoot)).toEqual([
-      true,
-      true,
-      true,
-      true,
-      true,
-      false,
-    ])
-    expect(bases.at(-1)).toBe('C:/Users/u')
   })
 
   it('matches a name that holds a line terminator', () => {
@@ -845,7 +849,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       const readdirSync = fs.readdirSync
       const attempts: string[] = []
       let failuresLeft = 1
-      using spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      const spy = spyOn(fs, 'readdirSync').mockImplementation(((
         ...args: Parameters<typeof fs.readdirSync>
       ) => {
         const at = String(args[0])
@@ -860,28 +864,31 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         }
         return readdirSync(...args)
       }) as typeof fs.readdirSync)
+      try {
+        const retried = walkGlobPattern(join(root, '**/*.pem'), {
+          followSymlinkedDirectories: true,
+        })
+        // Two names lead to the directory; the second one lists it.
+        expect(spy).toHaveBeenCalled()
+        expect(attempts).toHaveLength(2)
+        expect(retried.matches.map(m => retried.realOf.get(m) ?? m)).toEqual([
+          join(root, 'pkg', 'certs', 'id.pem'),
+        ])
+        expect(retried.unlisted).toHaveLength(1)
 
-      const retried = walkGlobPattern(join(root, '**/*.pem'), {
-        followSymlinkedDirectories: true,
-      })
-      // Two names lead to the directory; the second one lists it.
-      expect(spy).toHaveBeenCalled()
-      expect(attempts).toHaveLength(2)
-      expect(retried.matches.map(m => retried.realOf.get(m) ?? m)).toEqual([
-        join(root, 'pkg', 'certs', 'id.pem'),
-      ])
-      expect(retried.unlisted).toHaveLength(1)
-
-      // A directory that fails under every name is tried under each of them
-      // and named once, whatever the number of names.
-      attempts.length = 0
-      failuresLeft = Number.POSITIVE_INFINITY
-      const gone = walkGlobPattern(join(root, '**/*.pem'), {
-        followSymlinkedDirectories: true,
-      })
-      expect(attempts).toHaveLength(2)
-      expect(gone.matches).toEqual([])
-      expect(gone.unlisted).toHaveLength(1)
+        // A directory that fails under every name is tried under each of them
+        // and named once, whatever the number of names.
+        attempts.length = 0
+        failuresLeft = Number.POSITIVE_INFINITY
+        const gone = walkGlobPattern(join(root, '**/*.pem'), {
+          followSymlinkedDirectories: true,
+        })
+        expect(attempts).toHaveLength(2)
+        expect(gone.matches).toEqual([])
+        expect(gone.unlisted).toHaveLength(1)
+      } finally {
+        spy.mockRestore()
+      }
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -901,7 +908,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
 
       const readdirSync = fs.readdirSync
       const attempts: string[] = []
-      using spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      const spy = spyOn(fs, 'readdirSync').mockImplementation(((
         ...args: Parameters<typeof fs.readdirSync>
       ) => {
         const at = String(args[0])
@@ -918,15 +925,18 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         }
         return readdirSync(...args)
       }) as typeof fs.readdirSync)
+      try {
+        const walk = walkGlobPattern(join(root, 's', '*.pem'), {
+          followSymlinkedDirectories: true,
+        })
 
-      const walk = walkGlobPattern(join(root, 's', '*.pem'), {
-        followSymlinkedDirectories: true,
-      })
-
-      expect(spy).toHaveBeenCalled()
-      expect(attempts).toEqual([real])
-      expect(walk.unlisted).toEqual([join(root, 's')])
-      expect(walk.realOf.get(join(root, 's'))).toBe(real)
+        expect(spy).toHaveBeenCalled()
+        expect(attempts).toEqual([real])
+        expect(walk.unlisted).toEqual([join(root, 's')])
+        expect(walk.realOf.get(join(root, 's'))).toBe(real)
+      } finally {
+        spy.mockRestore()
+      }
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
