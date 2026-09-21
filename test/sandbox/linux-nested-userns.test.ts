@@ -379,6 +379,9 @@ describe.if(isLinux)(
           "said('mount', libc.mount(None, None, None, 0, None))",
           "said('umount2', libc.umount2(None, 0))",
           "said('mount_setattr', libc.syscall(NR['mount_setattr'], -1, b'', 0, None, 0))",
+          // Newer than the libseccomp the helper is commonly built with, so
+          // it is in the filter by number; a kernel without it says ENOSYS.
+          "said('open_tree_attr', libc.syscall(467, AT_FDCWD, b'/', 0, None, 0))",
           // Not refused: a plain fork.
           'pid = os.fork()',
           'if pid == 0: os._exit(0)',
@@ -397,6 +400,7 @@ describe.if(isLinux)(
           'mount',
           'umount2',
           'mount_setattr',
+          'open_tree_attr',
         ]) {
           expect(said).toContain(`${call} EPERM`)
         }

@@ -71,7 +71,7 @@
  * fails the build rather than being left out: a filter missing one of these is
  * a filter that does not do what its name says.
  */
-static int add_namespace_rules(scmp_filter_ctx ctx) {
+static int add_namespace_rules(scmp_filter_ctx ctx, int native) {
     int rc;
 
     /* The flags word is arg0 of unshare(2), and of clone(2) on both
@@ -114,17 +114,17 @@ static int add_namespace_rules(scmp_filter_ctx ctx) {
 
     /* Joining another namespace, and the calls that change a mount tree, the
      * old interface and the fd-based one, as far as this libseccomp names
-     * them; one more follows where it can be named. */
+     * them. Two newer ones follow. */
     const char *refused[] = {
         "setns",      "mount",    "umount2",  "pivot_root",
         "open_tree",  "move_mount", "fsopen", "fsconfig",
-        "fsmount",    "fspick",   "mount_setattr",
+        "fsmount",    "fspick",
     };
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
         int nr = seccomp_syscall_resolve_name(refused[i]);
         if (nr == __NR_SCMP_ERROR) {
             fprintf(stderr,
-                    "Error: libseccomp does not know %s (2.5.2 or newer is needed)\n",
+                    "Error: libseccomp does not know %s\n",
                     refused[i]);
             return -1;
         }
@@ -136,23 +136,39 @@ static int add_namespace_rules(scmp_filter_ctx ctx) {
         }
     }
 
-    /* open_tree_attr(2), Linux 6.15: open_tree with the attribute changes of
-     * mount_setattr in one call. Refused where this libseccomp can name it.
-     * Where it cannot, it is left out rather than failing the build, because
-     * a call by bare number cannot be emitted for an architecture other than
-     * the builder's: what it could do needs CAP_SYS_ADMIN over the mount
-     * namespace, a tree it clones can only be attached with move_mount, which
-     * is refused above, and the kernel does not let the read-only flag of a
-     * mount copied across a user namespace be cleared, on a clone either. */
-    {
-        int nr = seccomp_syscall_resolve_name("open_tree_attr");
-        if (nr != __NR_SCMP_ERROR) {
-            rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
-            if (rc < 0) {
-                fprintf(stderr, "Error: Failed to add open_tree_attr rule: %s\n",
-                        strerror(-rc));
-                return -1;
+    /* Two calls newer than the libseccomp some builders have: mount_setattr
+     * (Linux 5.12, named from libseccomp 2.5.2) and open_tree_attr (Linux
+     * 6.15), which is open_tree with mount_setattr's changes in one call.
+     * Where the library cannot name one it goes in by number, which is the
+     * same on every architecture for each call added since Linux 5.1. That
+     * works only for the builder's own architecture: libseccomp translates
+     * a call between architectures by name, and refuses a bare number for
+     * another one. So for the other architecture the call is left out,
+     * which costs nothing: a build compiles in its own architecture's filter
+     * and no other. What either call could do needs CAP_SYS_ADMIN over the
+     * mount namespace, the kernel does not let the read-only flag of a mount
+     * copied across a user namespace be cleared, and a tree open_tree_attr
+     * clones can only be attached with move_mount, which is refused above. */
+    static const struct {
+        const char *name;
+        int nr;
+    } newer[] = {
+        { "mount_setattr", 442 },
+        { "open_tree_attr", 467 },
+    };
+    for (size_t i = 0; i < sizeof(newer) / sizeof(newer[0]); i++) {
+        int nr = seccomp_syscall_resolve_name(newer[i].name);
+        if (nr == __NR_SCMP_ERROR) {
+            if (!native) {
+                continue;
             }
+            nr = newer[i].nr;
+        }
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add %s rule: %s\n", newer[i].name,
+                    strerror(-rc));
+            return -1;
         }
     }
     return 0;
@@ -223,6 +239,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    int native = 1;
     if (arch_name != NULL) {
         uint32_t target;
         if (strcmp(arch_name, "x86_64") == 0) {
@@ -235,6 +252,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         if (target != seccomp_arch_native()) {
+            native = 0;
             rc = seccomp_arch_remove(ctx, SCMP_ARCH_NATIVE);
             if (rc == 0) rc = seccomp_arch_add(ctx, target);
             if (rc < 0) {
@@ -245,8 +263,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    rc = strcmp(rule_set, "namespaces") == 0 ? add_namespace_rules(ctx)
-                                            : add_unix_rules(ctx);
+    rc = strcmp(rule_set, "namespaces") == 0
+             ? add_namespace_rules(ctx, native)
+             : add_unix_rules(ctx);
     if (rc < 0) {
         seccomp_release(ctx);
         return 1;
