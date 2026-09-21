@@ -1055,12 +1055,20 @@ export function proxyUsernameFor(encodedCommand: string | undefined): string {
 /**
  * Inverse of {@link proxyUsernameFor}: extract the encodedCommand suffix
  * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
- * The username is client-controlled inside the sandbox, so a forged suffix
- * can only misattribute a denial in the violation report — it cannot
- * authenticate (the token does that) or reach another command's data. A
- * suffix past {@link MAX_ENCODED_COMMAND_BYTES} is longer than this process
- * can mint, so it is dropped rather than stored: the denial is still
- * recorded, unattributed.
+ * The username is presented by the client inside the sandbox. A forged
+ * suffix cannot authenticate (the token does that), but it decides two
+ * things: which invocation a denial is attributed to in the violation
+ * report, and which invocation's registered network allow list
+ * (`SandboxManager.registerCommandNetworkLists`) applies to the connection.
+ * The suffix is the ONLY thing binding a connection to such a list, so an id
+ * a list is registered under MUST be unguessable (at least 128 bits of
+ * randomness, never a counter, a timestamp or anything derived from the
+ * command), and even then a sandboxed process that presents another live
+ * invocation's id gets that invocation's allows: this is attribution, not a
+ * boundary between concurrent commands of one session. A suffix past
+ * {@link MAX_ENCODED_COMMAND_BYTES} is longer than this process can mint, so
+ * it is dropped rather than stored: the denial is still recorded,
+ * unattributed, and no registered list applies.
  */
 export function encodedCommandFromProxyUser(
   username: string | undefined,

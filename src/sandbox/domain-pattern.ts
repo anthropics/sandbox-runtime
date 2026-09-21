@@ -3,6 +3,10 @@
  * (sandbox-manager) and config-time validation (sandbox-config).
  * Lives in its own module so the schema can import it without pulling
  * in sandbox-manager (which imports the schema — circular).
+ *
+ * The validity check for a list entry lives here too, for the converse
+ * reason: the manager applies it to lists registered at run time, and gets it
+ * from here without loading the schema module.
  */
 
 import { isIP } from 'node:net'
@@ -72,6 +76,84 @@ function parsePortSuffix(suffix: string): number | undefined {
   const port = Number(suffix)
   return port > 65535 ? undefined : port
 }
+
+/**
+ * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
+ * protocols, paths, ports, and overly broad wildcards.
+ */
+export function isValidDomainPattern(val: string): boolean {
+  // A bare IPv6 literal as produced by splitDomainPatternPort for a
+  // bracketed entry (`[::1]`, `[2001:db8::1]:443` -> `::1`, `2001:db8::1`).
+  // Whether the *raw* entry was bracketed is enforced separately
+  // (hasValidIpv6Bracketing) before the split.
+  if (isIP(val) === 6) return true
+
+  // Reject protocols, paths, ports, etc.
+  if (val.includes('://') || val.includes('/') || val.includes(':')) {
+    return false
+  }
+
+  // Allow localhost
+  if (val === 'localhost') return true
+
+  // Allow wildcard domains like *.example.com
+  if (val.startsWith('*.')) {
+    const domain = val.slice(2)
+    // After the *. there must be a valid domain with at least one more dot
+    // e.g., *.example.com is valid, *.com is not (too broad)
+    if (
+      !domain.includes('.') ||
+      domain.startsWith('.') ||
+      domain.endsWith('.')
+    ) {
+      return false
+    }
+    // Count dots - must have at least 2 parts after the wildcard (e.g., example.com)
+    const parts = domain.split('.')
+    return parts.length >= 2 && parts.every(p => p.length > 0)
+  }
+
+  // Reject any other use of wildcards (e.g., *, *., etc.)
+  if (val.includes('*')) {
+    return false
+  }
+
+  // Regular domains must have at least one dot and only valid characters
+  return val.includes('.') && !val.startsWith('.') && !val.endsWith('.')
+}
+
+export const DOMAIN_PATTERN_MESSAGE =
+  'Invalid domain pattern. Must be a valid domain (e.g., "example.com"), a wildcard (e.g., "*.example.com"), or a bracketed IPv6 literal (e.g., "[::1]", "[2001:db8::1]:443"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
+
+/**
+ * Raw-entry rule applied before the port split: an entry with two or more
+ * colons is an IPv6 literal and must use RFC 3986 brackets (`[::1]`,
+ * `[::1]:443`). Unbracketed it is ambiguous (`2001:db8::1:443` is itself a
+ * valid 8-hextet address), so reject it and make the user say which they
+ * mean, rather than accept an entry that can silently match the wrong thing.
+ */
+export function hasValidIpv6Bracketing(val: string): boolean {
+  const first = val.indexOf(':')
+  const multiColon = first !== -1 && val.indexOf(':', first + 1) !== -1
+  return !multiColon || val.startsWith('[')
+}
+
+/**
+ * The check an allow-list entry gets: a domain pattern with an optional
+ * `:port` suffix. One function for both places such an entry arrives (the
+ * `network.allowedDomains` schema, and a per-command list registered with the
+ * manager at run time), so neither accepts what the other refuses.
+ */
+export function isValidAllowedDomainEntry(val: string): boolean {
+  return (
+    hasValidIpv6Bracketing(val) &&
+    isValidDomainPattern(splitDomainPatternPort(val).hostPattern)
+  )
+}
+
+export const ALLOWED_DOMAIN_ENTRY_MESSAGE =
+  DOMAIN_PATTERN_MESSAGE +
+  ' An optional ":port" suffix (1-65535) restricts the entry to that port.'
 
 /**
  * The IP-literal entries of an allow/deny list as `{ range, port? }` rules
