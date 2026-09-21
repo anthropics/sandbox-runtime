@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { unlink } from 'node:fs/promises'
 import { logForDebugging } from '../utils/debug.js'
 import { getPlatform } from '../utils/platform.js'
-import { listenInRange } from './listen-in-range.js'
+import { listenInRange, loopbackListenOptions } from './listen-in-range.js'
 
 /**
  * First-byte values that select the SOCKS handler. SOCKS5's greeting is
@@ -196,9 +196,12 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
       // The mux→backend hop originates from the parent process (not the
       // sandboxed child), so WFP doesn't strictly require it; staying in
       // range just keeps the port surface predictable.
+      // Exclusive for the same reason as the front-end: under `cluster` a
+      // shared handle would let one worker's backend serve another's traffic,
+      // which the pid-scoped unix socket path already prevents elsewhere.
       await listenInRange(
         opts.httpServer,
-        p => opts.httpServer.listen(p, '127.0.0.1'),
+        p => opts.httpServer.listen(loopbackListenOptions(p)),
         opts.httpBackendPortRange,
         new Set(),
       )
