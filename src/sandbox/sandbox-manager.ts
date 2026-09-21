@@ -1136,6 +1136,20 @@ async function checkDependenciesAsync(
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
   allowedDomains: readonly string[] | undefined,
+  options?: {
+    /**
+     * Skip everything derived from `credentials.envVars` and return only
+     * the file-derived paths.
+     *
+     * For a caller that reads only `denyReadPaths` / `degradeToDenyPaths`
+     * the env work was always waste, and with a `source` on an entry it
+     * stops being merely wasteful: masking would run the operator's vault
+     * command, on the main thread, from a getter the caller believes is
+     * pure, and prompt for biometrics where nobody asked for a
+     * credential.
+     */
+    fileRulesOnly?: boolean
+  },
 ): CredentialRestrictionConfig {
   if (!credentials) {
     return {
@@ -1168,13 +1182,15 @@ function getCredentialRestrictions(
   // pattern matched nothing with onExtractNoMatch: "deny" — merged into
   // unsetEnvVars below so the value is withheld rather than exposed.
   const { setEnvVars, resolvedValues, degradeToUnsetNames } =
-    buildMaskedEnvVars(
-      credentials.envVars ?? [],
-      defaultInjectHosts,
-      sentinelRegistry,
-      process.env,
-      credentialSourceResolver,
-    )
+    options?.fileRulesOnly
+      ? { setEnvVars: {}, resolvedValues: {}, degradeToUnsetNames: [] }
+      : buildMaskedEnvVars(
+          credentials.envVars ?? [],
+          defaultInjectHosts,
+          sentinelRegistry,
+          process.env,
+          credentialSourceResolver,
+        )
   unsetEnvVars.push(...degradeToUnsetNames)
 
   // Link masked AWS credentials into pairs so the proxy can re-sign
@@ -1189,16 +1205,16 @@ function getCredentialRestrictions(
   // sandbox signs with the placeholder secret against an upstream that
   // can only reject it. Sourced values win, matching the rule that a
   // source is the value for its variable.
-  registerAwsPairs(
-    credentials.envVars ?? [],
-    credentials.awsPairs,
-    defaultInjectHosts,
-    setEnvVars,
-    awsPairRegistry,
-    Object.keys(resolvedValues).length > 0
-      ? { ...process.env, ...resolvedValues }
-      : process.env,
-  )
+  if (!options?.fileRulesOnly) {
+    registerAwsPairs(
+      credentials.envVars ?? [],
+      credentials.awsPairs,
+      defaultInjectHosts,
+      setEnvVars,
+      awsPairRegistry,
+      { ...process.env, ...resolvedValues },
+    )
+  }
 
   // Masked files: read the real bytes on the host, register a sentinel,
   // write it to a fake file in the manager-owned temp dir. Missing/unreadable
@@ -1345,6 +1361,10 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   const credentialRestrictions = getCredentialRestrictions(
     config.credentials,
     config.network.allowedDomains,
+    // This getter uses only the file-derived paths below. Asking for the
+    // env work too would run a credential `source` command from a
+    // permission check or a render path.
+    { fileRulesOnly: true },
   )
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.

@@ -19,13 +19,17 @@
  * a vault CLI needs the network, the keychain and the user's session to do
  * its job, none of which it would have inside. What follows from it is that
  * whoever can write the settings file chooses a command srt will execute.
- * See the provenance rules in {@link resolveExecutable}, and `filesystem`
- * write rules covering the settings file itself.
+ * {@link resolveExecutable} narrows how that command can be aimed, but it
+ * is not a substitute for the file being unwritable: srt does not itself
+ * deny writes to the settings file it loaded, so an operator whose
+ * `allowWrite` region covers that file should exclude it by hand with
+ * `filesystem.denyWrite`.
  */
 
 import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 import { logForDebugging } from '../utils/debug.js'
+import { getPlatform } from '../utils/platform.js'
 import { whichSync } from '../utils/which.js'
 import type { CredentialSourceConfig } from './sandbox-config.js'
 
@@ -67,15 +71,81 @@ export type CredentialSourceErrorCode =
  *
  * The message never carries stdout, because a command can fail *after*
  * writing a partial credential.
+ *
+ * It does not carry the command's stderr either. stdout is the value
+ * channel and stderr is the diagnostic channel, but that is a convention a
+ * vault CLI follows, not one srt can verify, and the default warning path
+ * is the one that ends up in CI logs. Anything the command said goes in
+ * `detail`, which only the SRT_DEBUG path prints.
  */
 export class CredentialSourceError extends Error {
   constructor(
     readonly code: CredentialSourceErrorCode,
     message: string,
+    /**
+     * Output from the command explaining itself, already bounded. Printed
+     * only under SRT_DEBUG: it is third-party text from a process holding
+     * a credential, so it is diagnostics the operator opts into, never
+     * something srt volunteers.
+     */
+    readonly detail?: string,
   ) {
     super(message)
     this.name = 'CredentialSourceError'
   }
+}
+
+/**
+ * A cached failure, with the budget it was measured against when that
+ * budget is what produced it.
+ */
+interface CachedFailure {
+  readonly error: CredentialSourceError
+  /** Set only for a `timeout`; undefined for budget-independent failures. */
+  readonly timeoutMs?: number
+}
+
+/**
+ * Whether a cached failure answers a request with budget `budgetMs`.
+ *
+ * A non-timeout failure is a property of the command: `op read` against a
+ * locked vault fails the same way however long srt is willing to wait, so
+ * it carries to every request. A timeout is not. It says only "did not
+ * finish within N ms", which answers a request prepared to wait N ms or
+ * less and says nothing about one prepared to wait longer. Reusing it for
+ * a larger budget reports a limit the caller never set, and fails an entry
+ * that would have succeeded.
+ *
+ * Equal budgets still hit the cache, so the repeated-identical-wrap case
+ * the failure cache exists for is unaffected.
+ */
+function failureApplies(failure: CachedFailure, budgetMs: number): boolean {
+  return failure.timeoutMs === undefined || budgetMs <= failure.timeoutMs
+}
+
+/**
+ * A cached failure as the current caller should hear it.
+ *
+ * Reusing a timeout for a smaller budget is sound (see failureApplies) but
+ * the stored message names the budget that produced it, which this caller
+ * never set. An operator reading "timed out after 10000ms" under an entry
+ * configured for 1000ms raises the wrong number and pays for a fresh
+ * spawn. Restate it instead.
+ */
+function reportedAs(
+  failure: CachedFailure,
+  budgetMs: number,
+): CredentialSourceError {
+  if (failure.timeoutMs === undefined || failure.timeoutMs === budgetMs) {
+    return failure.error
+  }
+  return new CredentialSourceError(
+    'timeout',
+    `timed out after ${failure.timeoutMs}ms earlier this session, and ` +
+      `this entry's ${budgetMs}ms budget is no larger, so the command ` +
+      `was not run again`,
+    failure.error.detail,
+  )
 }
 
 /** Stable cache key for a source spec: the process it would run. */
@@ -103,7 +173,7 @@ function specKey(source: CredentialSourceConfig): string {
 function resolveExecutable(command: string): string {
   const hasSeparator =
     command.includes('/') ||
-    (process.platform === 'win32' && command.includes('\\'))
+    (getPlatform() === 'windows' && command.includes('\\'))
   if (hasSeparator) {
     if (!path.isAbsolute(command)) {
       throw new CredentialSourceError(
@@ -163,7 +233,14 @@ function decodeValue(stdout: Buffer): string {
 /** First line of a command's stderr, bounded, for an error message. */
 function firstStderrLine(stderr: Buffer | null): string {
   if (!stderr || stderr.length === 0) return ''
-  const line = stderr.toString('utf8').split('\n', 1)[0]!.trim()
+  // Bounded copy. Only the first line is ever kept, and stderr can be as
+  // large as the buffer cap: decoding a megabyte to keep 200 characters
+  // is wasted work on third-party text from a process holding a secret.
+  const line = stderr
+    .subarray(0, 512)
+    .toString('utf8')
+    .split('\n', 1)[0]!
+    .trim()
   if (line.length === 0) return ''
   return line.length > 200 ? `${line.slice(0, 200)}…` : line
 }
@@ -216,10 +293,18 @@ function runCommandSource(
       )
     }
     if (code === 'ENOBUFS') {
+      // The cap applies to stdout and stderr alike, so a command that
+      // printed a perfectly good value and then a megabyte of trace must
+      // not be told its value was too big.
+      const onStdout = (r.stdout?.length ?? 0) >= MAX_CREDENTIAL_SOURCE_BYTES
       throw new CredentialSourceError(
         'too_large',
-        `produced more than ${MAX_CREDENTIAL_SOURCE_BYTES} bytes on ` +
-          `stdout. A credential source must print the value alone.`,
+        onStdout
+          ? `produced more than ${MAX_CREDENTIAL_SOURCE_BYTES} bytes on ` +
+            `stdout. A credential source must print the value alone.`
+          : `produced more than ${MAX_CREDENTIAL_SOURCE_BYTES} bytes on ` +
+            `stderr, which shares the same cap. Quieten the command or ` +
+            `send its diagnostics elsewhere.`,
       )
     }
     throw new CredentialSourceError(
@@ -229,11 +314,10 @@ function runCommandSource(
   }
 
   if (r.status !== 0) {
-    const detail = firstStderrLine(r.stderr)
     throw new CredentialSourceError(
       'exit_status',
-      (r.status === null ? `was killed by ${r.signal}` : `exited ${r.status}`) +
-        (detail ? `: ${detail}` : ''),
+      r.status === null ? `was killed by ${r.signal}` : `exited ${r.status}`,
+      firstStderrLine(r.stderr) || undefined,
     )
   }
 
@@ -259,15 +343,18 @@ function runCommandSource(
  *
  * Failures are cached too, and for the same reason: a cancelled biometric
  * prompt that re-asks on every subsequent wrap is the same storm with a
- * worse mood. A failed source stays failed for the session.
+ * worse mood. A failed source stays failed for the session, except that a
+ * timeout is only cached against the budget that produced it, so a second
+ * entry willing to wait longer still gets its own attempt.
  *
  * Values live in process memory only, never written to disk and never
  * logged, and are dropped on teardown with the sentinel registry.
  */
 export class CredentialSourceResolver {
   private readonly values = new Map<string, string>()
-  private readonly failures = new Map<string, CredentialSourceError>()
+  private readonly failures = new Map<string, CachedFailure>()
   private readonly exePaths = new Map<string, string>()
+  private readonly reportedFailures = new Set<string>()
 
   /**
    * The real value for `source`, running its command at most once per
@@ -278,10 +365,13 @@ export class CredentialSourceResolver {
    */
   resolve(source: CredentialSourceConfig): string {
     const key = specKey(source)
+    const budgetMs = source.timeoutMs ?? DEFAULT_CREDENTIAL_SOURCE_TIMEOUT_MS
     const cached = this.values.get(key)
     if (cached !== undefined) return cached
     const failed = this.failures.get(key)
-    if (failed !== undefined) throw failed
+    if (failed !== undefined && failureApplies(failed, budgetMs)) {
+      throw reportedAs(failed, budgetMs)
+    }
 
     try {
       let exePath = this.exePaths.get(source.command)
@@ -300,9 +390,35 @@ export class CredentialSourceResolver {
               'spawn_failed',
               err instanceof Error ? err.message : String(err),
             )
-      this.failures.set(key, e)
+      // A timeout is only an answer to the budget it was measured against
+      // (see failureApplies); every other failure is budget-independent.
+      this.failures.set(key, {
+        error: e,
+        timeoutMs: e.code === 'timeout' ? budgetMs : undefined,
+      })
       throw e
     }
+  }
+
+  /**
+   * Claim the right to report `varName`'s source failure, true only for
+   * the first caller this session, so a warning is emitted once instead
+   * of once per wrapped command.
+   *
+   * This records the claim as it answers: a second caller is told no.
+   * Call it only where the report is actually about to be made.
+   *
+   * A failed source stays failed for the session, so the warning states a
+   * fact about the config that cannot change until it is fixed. Repeating
+   * it on every wrapped command is the same storm the value cache exists
+   * to stop, moved from the prompt into the log.
+   */
+  claimFailureReport(varName: string, source: CredentialSourceConfig): boolean {
+    // NUL cannot occur in an env var name, so the join is unambiguous.
+    const key = `${varName}\u0000${specKey(source)}`
+    if (this.reportedFailures.has(key)) return false
+    this.reportedFailures.add(key)
+    return true
   }
 
   /** Number of distinct sources resolved to a value this session. */
@@ -315,5 +431,6 @@ export class CredentialSourceResolver {
     this.values.clear()
     this.failures.clear()
     this.exePaths.clear()
+    this.reportedFailures.clear()
   }
 }

@@ -104,7 +104,7 @@ describe('CredentialSourceResolver', () => {
     expectSourceError(() => r.resolve(printing('tok\u0000en')), 'invalid_value')
   })
 
-  test('reports a non-zero exit with the first line of stderr', () => {
+  test('keeps the command stderr out of the message, in detail', () => {
     const r = new CredentialSourceResolver()
     const err = expectSourceError(
       () =>
@@ -115,10 +115,14 @@ describe('CredentialSourceResolver', () => {
           ),
         ),
       'exit_status',
-    )
-    expect(err.message).toContain('exited 3')
-    expect(err.message).toContain('could not read item')
-    expect(err.message).not.toContain('second line')
+    ) as CredentialSourceError
+    // The message is what the default warning path prints, so a command
+    // that put a secret on stderr must not reach it.
+    expect(err.message).toBe('exited 3')
+    expect(err.message).not.toContain('could not read item')
+    // The diagnostic is kept, first line only, for the SRT_DEBUG path.
+    expect(err.detail).toBe('could not read item')
+    expect(err.detail).not.toContain('second line')
   })
 
   test('reports a bare command name that is not on PATH', () => {
@@ -236,6 +240,78 @@ describe('CredentialSourceResolver caching', () => {
     expect(runs(marker)).toBe(1)
   })
 
+  test('a larger budget retries after a smaller one timed out', () => {
+    const marker = scratchFile('runs')
+    const r = new CredentialSourceResolver()
+    const slow = (timeoutMs: number) => ({
+      ...src(
+        `${SLEEP(600)};` +
+          `require("node:fs").appendFileSync(${JSON.stringify(marker)},"x");` +
+          `process.stdout.write("tok")`,
+      ),
+      timeoutMs,
+    })
+    // A timeout answers only the budget it was measured against. An entry
+    // prepared to wait longer is asking a different question.
+    expectSourceError(() => r.resolve(slow(200)), 'timeout')
+    expect(r.resolve(slow(9_000))).toBe('tok')
+    expect(runs(marker)).toBe(1)
+  })
+
+  test('a budget no larger than the one that timed out reuses the failure', () => {
+    const marker = scratchFile('runs')
+    const r = new CredentialSourceResolver()
+    const slow = (timeoutMs: number) => ({
+      ...src(
+        `${SLEEP(9_000)};` +
+          `require("node:fs").appendFileSync(${JSON.stringify(marker)},"x")`,
+      ),
+      timeoutMs,
+    })
+    expectSourceError(() => r.resolve(slow(400)), 'timeout')
+    // Equal and smaller budgets would time out too, so do not re-spawn.
+    expectSourceError(() => r.resolve(slow(400)), 'timeout')
+    expectSourceError(() => r.resolve(slow(100)), 'timeout')
+    expect(runs(marker)).toBe(0)
+  })
+
+  test('a non-timeout failure is cached whatever the budget', () => {
+    const marker = scratchFile('runs')
+    const r = new CredentialSourceResolver()
+    const failing = (timeoutMs: number) => ({
+      ...src(
+        `require("node:fs").appendFileSync(${JSON.stringify(marker)},"x");` +
+          `process.exit(1)`,
+      ),
+      timeoutMs,
+    })
+    // A locked vault fails the same way however long srt waits.
+    expectSourceError(() => r.resolve(failing(200)), 'exit_status')
+    expectSourceError(() => r.resolve(failing(60_000)), 'exit_status')
+    expect(runs(marker)).toBe(1)
+  })
+
+  test('claimFailureReport is true once per variable per session', () => {
+    const r = new CredentialSourceResolver()
+    const spec = printing('x')
+    expect(r.claimFailureReport('GH_TOKEN', spec)).toBe(true)
+    expect(r.claimFailureReport('GH_TOKEN', spec)).toBe(false)
+    // A second variable on the same source is its own report: the operator
+    // fixes these per entry.
+    expect(r.claimFailureReport('OTHER_TOKEN', spec)).toBe(true)
+    r.clear()
+    expect(r.claimFailureReport('GH_TOKEN', spec)).toBe(true)
+  })
+
+  test('a reused timeout does not quote a budget the caller never set', () => {
+    const r = new CredentialSourceResolver()
+    const slow = (timeoutMs: number) => ({ ...src(SLEEP(9_000)), timeoutMs })
+    expectSourceError(() => r.resolve(slow(500)), 'timeout')
+    const err = expectSourceError(() => r.resolve(slow(120)), 'timeout')
+    expect(err.message).toContain('120ms')
+    expect(err.message).toContain('earlier this session')
+  })
+
   test('clear() drops resolved values and cached failures', () => {
     const marker = scratchFile('runs')
     const r = new CredentialSourceResolver()
@@ -339,6 +415,127 @@ describe('buildMaskedEnvVars with a source', () => {
     } finally {
       warn.mockRestore()
     }
+  })
+
+  test('warns once per variable, not once per wrapped command', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const resolver = new CredentialSourceResolver()
+      const entries = [
+        {
+          name: 'GH_TOKEN',
+          mode: 'mask' as const,
+          source: src('process.exit(7)'),
+        },
+      ]
+      // getCredentialRestrictions() runs this per wrapped command.
+      for (let i = 0; i < 4; i++) {
+        buildMaskedEnvVars(
+          entries,
+          ['api.github.com'],
+          new SentinelRegistry(),
+          {},
+          resolver,
+        )
+      }
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  test('the warning does not carry what the command printed', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      buildMaskedEnvVars(
+        [
+          {
+            name: 'GH_TOKEN',
+            mode: 'mask',
+            source: src(
+              'process.stderr.write("ghp_leaked_via_stderr\\n");process.exit(1)',
+            ),
+          },
+        ],
+        ['api.github.com'],
+        new SentinelRegistry(),
+        {},
+        new CredentialSourceResolver(),
+      )
+      const msg = String(warn.mock.calls[0]![0])
+      expect(msg).toContain('GH_TOKEN')
+      expect(msg).toContain('exited 1')
+      expect(msg).not.toContain('ghp_leaked_via_stderr')
+      expect(msg).toContain('SRT_DEBUG')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  test('a sourced value that cannot be masked is withheld, not left absent', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const reg = new SentinelRegistry()
+      // decode "jwt" against a value that is not a JWT is a fail-open
+      // path. For an env-sourced entry that means "inherit the real
+      // value"; a sourced entry has nothing to inherit, and an exported
+      // copy alongside it must not be what gets inherited.
+      const { setEnvVars, resolvedValues, degradeToUnsetNames } =
+        buildMaskedEnvVars(
+          [
+            {
+              name: 'GH_TOKEN',
+              mode: 'mask',
+              decode: 'jwt',
+              source: printing('ghp_not_a_jwt'),
+            },
+          ],
+          ['api.github.com'],
+          reg,
+          { GH_TOKEN: 'ghp_real_and_exported' },
+          new CredentialSourceResolver(),
+        )
+      expect(degradeToUnsetNames).toEqual(['GH_TOKEN'])
+      expect(setEnvVars['GH_TOKEN']).toBeUndefined()
+      // Nothing downstream may see a value that was never masked.
+      expect(resolvedValues['GH_TOKEN']).toBeUndefined()
+      const msg = String(warn.mock.calls[0]![0])
+      expect(msg).toContain('UNSET')
+      expect(msg).not.toContain('UNPROTECTED')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  test('an env-sourced entry still fails open on the same path', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
+        [{ name: 'GH_TOKEN', mode: 'mask', decode: 'jwt' }],
+        ['api.github.com'],
+        new SentinelRegistry(),
+        { GH_TOKEN: 'ghp_not_a_jwt' },
+      )
+      expect(degradeToUnsetNames).toEqual([])
+      expect(setEnvVars['GH_TOKEN']).toBeUndefined()
+      expect(String(warn.mock.calls[0]![0])).toContain('UNPROTECTED')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  test('a credential named __proto__ still reaches resolvedValues', () => {
+    // envVarNameSchema admits it, and on a plain object the assignment
+    // would hit Object.prototype's setter and vanish.
+    const { resolvedValues } = buildMaskedEnvVars(
+      [{ name: '__proto__', mode: 'mask', source: printing('sourced') }],
+      ['api.example.com'],
+      new SentinelRegistry(),
+      {},
+      new CredentialSourceResolver(),
+    )
+    expect(Object.keys(resolvedValues)).toEqual(['__proto__'])
+    expect(resolvedValues['__proto__']).toBe('sourced')
   })
 
   test('reports only sourced values in resolvedValues', () => {

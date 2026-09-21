@@ -19,7 +19,10 @@ import { randomUUID } from 'node:crypto'
 import { logForDebugging } from '../utils/debug.js'
 import { maskJwtClaims, mintFakeJwt, verifyJwt } from './credential-decode.js'
 import { extractAndSubstitute } from './credential-extract.js'
-import { CredentialSourceResolver } from './credential-source.js'
+import {
+  CredentialSourceError,
+  CredentialSourceResolver,
+} from './credential-source.js'
 import type { CredentialEnvVarConfig } from './sandbox-config.js'
 import type { SentinelRegistry } from './credential-sentinel.js'
 
@@ -158,18 +161,53 @@ function readRealValue(
     // Resolver messages are sentence fragments about the command; some end
     // in a period and some do not, and run-on text hides the second
     // sentence, which is the one saying what srt did about it.
-    const detail = raw.endsWith('.') ? raw : `${raw}.`
+    const sentence = raw.endsWith('.') ? raw : `${raw}.`
+    // What the command said about itself is withheld from the warning and
+    // logged only under SRT_DEBUG. stderr is the diagnostic channel by
+    // convention, not by anything srt can enforce, and this warning is the
+    // one that reaches CI logs.
+    const said = err instanceof CredentialSourceError ? err.detail : undefined
     const msg =
       `[sandbox-runtime] WARNING: credentials.envVars entry ` +
       `"${v.name}" has a source that did not produce a value: ` +
-      `${v.source.command} ${detail} The variable is UNSET inside the ` +
+      `${v.source.command} ${sentence} The variable is UNSET inside the ` +
       `sandbox (fail-closed), so commands that need it will fail. Fix the ` +
       `source command, or remove the entry to inherit the variable from ` +
-      `the environment.`
-    console.warn(msg)
-    logForDebugging(msg, { level: 'warn' })
+      `the environment.` +
+      (said ? ` Set SRT_DEBUG to see what the command reported.` : '')
+    // Once per variable per session. The failure is cached, so it cannot
+    // change until the config is fixed, and repeating it on every wrapped
+    // command is the prompt storm again in the log.
+    if (resolver.claimFailureReport(v.name, v.source)) console.warn(msg)
+    logForDebugging(said ? `${msg} Command stderr: ${said}` : msg, {
+      level: 'warn',
+    })
     return { kind: 'unset' }
   }
+}
+
+/**
+ * How a fail-open path ends, and the sentence that reports it truthfully.
+ *
+ * "Fail open" here has always meant *leave the variable as it already
+ * was*: skip the entry, and the real value in `env` is inherited into the
+ * sandbox unmasked. A sourced value has no "as it already was" to leave
+ * it as. It is not in the environment, so the same skip makes the
+ * variable simply absent, which is not what the warning claims; and if an
+ * exported copy does sit alongside the source, the skip inherits that
+ * copy unmasked, which is the single outcome a source exists to prevent.
+ *
+ * So a sourced entry fails closed on these paths and says so. Withholding
+ * a credential breaks a command inside the sandbox; the alternative
+ * publishes one.
+ */
+function failOpenOutcome(sourced: boolean): string {
+  return sourced
+    ? `The variable is UNSET inside the sandbox (fail-closed): its value ` +
+        `came from a source, so there is no environment value to fall ` +
+        `back to.`
+    : `The variable is left UNPROTECTED (real value visible as-is inside ` +
+        `the sandbox).`
 }
 
 export function buildMaskedEnvVars(
@@ -180,8 +218,17 @@ export function buildMaskedEnvVars(
   resolver: CredentialSourceResolver = new CredentialSourceResolver(),
 ): MaskedEnvBuildResult {
   const setEnvVars: Record<string, string> = {}
-  const resolvedValues: Record<string, string> = {}
+  // Null-prototype: envVarNameSchema admits `__proto__`, and on a plain
+  // object that key hits Object.prototype's setter instead of creating an
+  // own property, so the value would vanish and the AWS overlay would
+  // silently skip a credential that was masked.
+  const resolvedValues: Record<string, string> = Object.create(null)
   const degradeToUnsetNames: string[] = []
+  /** Withhold a sourced entry that reached a fail-open path. */
+  const failClosed = (name: string) => {
+    delete resolvedValues[name]
+    degradeToUnsetNames.push(name)
+  }
   for (const v of envVars) {
     if (v.mode !== 'mask') continue
     const found = readRealValue(v, env, resolver)
@@ -209,11 +256,11 @@ export function buildMaskedEnvVars(
         const msg =
           `[sandbox-runtime] WARNING: credentials.envVars entry ` +
           `"${v.name}" has decode "jwt" but its value did not verify ` +
-          `as a JWT. The variable is left UNPROTECTED (real value ` +
-          `visible as-is inside the sandbox). Fix the config or remove ` +
-          `the entry.`
+          `as a JWT. ${failOpenOutcome(found.sourced)} Fix the config or ` +
+          `remove the entry.`
         console.warn(msg)
         logForDebugging(msg, { level: 'warn' })
+        if (found.sourced) failClosed(v.name)
         continue
       }
       if (v.maskClaims?.length) {
@@ -236,11 +283,12 @@ export function buildMaskedEnvVars(
             `[sandbox-runtime] WARNING: credentials.envVars entry ` +
             `"${v.name}" has maskClaims ` +
             `${JSON.stringify(v.maskClaims)} but none is present as a ` +
-            `string claim in its JWT value. The variable is left ` +
-            `UNPROTECTED (real value visible as-is inside the sandbox). ` +
-            `Fix the config or remove the entry.`
+            `string claim in its JWT value. ` +
+            `${failOpenOutcome(found.sourced)} Fix the config or remove ` +
+            `the entry.`
           console.warn(msg)
           logForDebugging(msg, { level: 'warn' })
+          if (found.sourced) failClosed(v.name)
           continue
         }
         const skipped = v.maskClaims.filter(c => !masked.claimSentinels.has(c))
@@ -314,11 +362,12 @@ export function buildMaskedEnvVars(
       const msg =
         `[sandbox-runtime] WARNING: credentials.envVars entry ` +
         `"${v.name}" has extract pattern "${v.extract}" that matched ` +
-        `nothing in the variable's value. The variable is left ` +
-        `UNPROTECTED (visible as-is inside the sandbox). Fix the regex, ` +
-        `set onExtractNoMatch to "deny" or "error", or remove the entry.`
+        `nothing in the variable's value. ` +
+        `${failOpenOutcome(found.sourced)} Fix the regex, set ` +
+        `onExtractNoMatch to "deny" or "error", or remove the entry.`
       console.warn(msg)
       logForDebugging(msg, { level: 'warn' })
+      if (found.sourced) failClosed(v.name)
       continue
     }
     setEnvVars[v.name] = extracted.fakeContent
