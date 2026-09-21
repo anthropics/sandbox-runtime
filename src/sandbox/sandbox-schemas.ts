@@ -45,6 +45,12 @@ export interface FsReadRestrictionConfig {
 export interface FsWriteRestrictionConfig {
   allowOnly: string[]
   denyWithinAllow: string[]
+  /**
+   * More paths to deny within `allowOnly`, which the library read off the
+   * disk itself. They are names, not spellings a caller wrote: `[`, `*` and
+   * `?` in them are characters of the name and never pattern syntax.
+   */
+  literalDenyWithinAllow?: string[]
 }
 
 /**

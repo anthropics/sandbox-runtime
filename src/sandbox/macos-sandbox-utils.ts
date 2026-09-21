@@ -889,6 +889,7 @@ function generateWriteRules(
   // the mandatory entries carry their own literal/glob split.
   const denyEntries = [
     ...(config.denyWithinAllow || []).map(toPathEntry),
+    ...(config.literalDenyWithinAllow ?? []).map(toLiteralPathEntry),
     ...macGetMandatoryDenyEntries(allowGitConfig),
   ]
 

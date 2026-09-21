@@ -727,6 +727,9 @@ async function initialize(
           ...monitoredWrites.denyWithinAllow.map(p =>
             normalizePathForSandbox(p),
           ),
+          ...(monitoredWrites.literalDenyWithinAllow ?? []).map(p =>
+            normalizePathForSandbox(p, { literal: true }),
+          ),
           // filesystem.disabled reaches the wrapper as `writeConfig ===
           // undefined`, which skips every bind and the built-in denies with
           // them, so the monitor must not judge by them either.
@@ -1369,8 +1372,9 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
 
   return {
     allowOnly,
-    // The library's own files with the caller's denies: see own-files.ts.
-    denyWithinAllow: [...denyPaths, ...ownFilesWriteDenies(allowOnly)],
+    denyWithinAllow: denyPaths,
+    // The library's own files beside the caller's denies: see own-files.ts.
+    literalDenyWithinAllow: ownFilesWriteDenies(allowOnly),
   }
 }
 
@@ -1692,16 +1696,14 @@ async function wrapWithSandbox(
     ]
     writeConfig = {
       allowOnly,
-      denyWithinAllow: [
-        ...stripWriteGlobs(
-          customConfig?.filesystem?.denyWrite ??
-            config?.filesystem.denyWrite ??
-            [],
-        ),
-        // Whatever this wrap may write, the library's own files are not
-        // among it: see own-files.ts.
-        ...ownFilesWriteDenies(allowOnly),
-      ],
+      denyWithinAllow: stripWriteGlobs(
+        customConfig?.filesystem?.denyWrite ??
+          config?.filesystem.denyWrite ??
+          [],
+      ),
+      // Whatever this wrap may write, the library's own files are not among
+      // it: see own-files.ts.
+      literalDenyWithinAllow: ownFilesWriteDenies(allowOnly),
     }
 
     // Credential deny paths are unioned with the caller's denyRead — never
