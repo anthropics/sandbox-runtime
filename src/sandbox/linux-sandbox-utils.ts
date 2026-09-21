@@ -274,17 +274,116 @@ function hasFileAncestor(targetPath: string): boolean {
 }
 
 /**
+ * How a name is opened in a git directory a command already running may be
+ * writing: one that made the directory after its own wrap has nothing of it
+ * mounted. A link there is refused rather than followed, because it leads
+ * wherever that command chose, and a FIFO there is not waited on.
+ */
+const NO_LINK_NO_WAIT = fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK
+
+/**
+ * What an open with {@link NO_LINK_NO_WAIT} ends on when the name holds
+ * something other than the file last seen there: a link, nothing, or a FIFO
+ * nobody reads.
+ */
+const NAME_HOLDS_SOMETHING_ELSE = new Set([
+  'ELOOP',
+  'EMLINK',
+  'ENOENT',
+  'ENXIO',
+])
+
+/**
  * What `file` holds, when it is a regular file of no more than `limit`
  * bytes; undefined for anything else, which is everything this needs to tell
- * from the placeholders it compares against.
+ * from the placeholders it compares against. With it, whether the file has
+ * the shape bubblewrap leaves (see {@link isStaleBwrapMountPoint}), asked of
+ * the descriptor the bytes came from so that both answers are one file's.
  */
-function fileContentsWithin(file: string, limit: number): string | undefined {
+function fileContentsWithin(
+  file: string,
+  limit: number,
+): { contents: string | undefined; bwrapShape: boolean } {
+  const nothing = { contents: undefined, bwrapShape: false }
+  let fd: number
   try {
-    const stat = fs.lstatSync(file)
-    if (!stat.isFile() || stat.size > limit) return undefined
-    return fs.readFileSync(file, 'utf8')
+    fd = fs.openSync(file, fs.constants.O_RDONLY | NO_LINK_NO_WAIT)
   } catch {
-    return undefined
+    return nothing
+  }
+  try {
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile() || stat.size > limit) return nothing
+    // One byte past the limit, so that a file that grew since the stat is
+    // not taken for the bytes it began with.
+    const buffer = Buffer.alloc(limit + 1)
+    let read = 0
+    while (read < buffer.length) {
+      const chunk = fs.readSync(fd, buffer, read, buffer.length - read, read)
+      if (chunk === 0) break
+      read += chunk
+    }
+    if (read > limit) return nothing
+    return {
+      contents: buffer.toString('utf8', 0, read),
+      bwrapShape: hasBwrapMountPointShape(stat),
+    }
+  } catch {
+    return nothing
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * Write `placeholder` into the empty mount point an earlier sandbox left at
+ * `dest`, and say whether that was done. The shape is checked and the bytes
+ * are written through descriptors on one file, opened following no link: a
+ * check of the path followed by a write to the path would, in this
+ * unsandboxed process, truncate whatever the name had been pointed at in
+ * between. False when the name no longer holds that mount point, which is
+ * then left exactly as found; throws what stopped the write otherwise.
+ */
+function rewriteStaleBwrapMountPoint(
+  dest: string,
+  placeholder: string,
+): boolean {
+  const fds: number[] = []
+  const open = (access: number): number => {
+    const fd = fs.openSync(dest, access | NO_LINK_NO_WAIT)
+    fds.push(fd)
+    return fd
+  }
+  try {
+    const readFd = open(fs.constants.O_RDONLY)
+    const found = fs.fstatSync(readFd)
+    if (!hasBwrapMountPointShape(found)) return false
+    let writeFd: number
+    try {
+      writeFd = open(fs.constants.O_WRONLY)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EACCES') throw err
+      // bubblewrap makes its mount points read-only (ensure_file(dest,
+      // 0444)), and the process that owns one need not be root, so the mode
+      // it was left with is no reason to leave the repository broken. Changed
+      // on the file whose shape was just checked, not on the name.
+      fs.fchmodSync(readFd, 0o644)
+      writeFd = open(fs.constants.O_WRONLY)
+    }
+    // The name may have changed hands between the two opens. The first
+    // descriptor is still open, so its inode number cannot have been given
+    // to another file meanwhile.
+    const opened = fs.fstatSync(writeFd)
+    if (opened.dev !== found.dev || opened.ino !== found.ino) return false
+    fs.ftruncateSync(writeFd, 0)
+    fs.writeSync(writeFd, placeholder, 0)
+    return true
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code !== undefined && NAME_HOLDS_SOMETHING_ELSE.has(code)) return false
+    throw err
+  } finally {
+    for (const fd of fds) fs.closeSync(fd)
   }
 }
 
@@ -309,6 +408,11 @@ type GitRedirectBind =
  * cleanup leaves a file the next wrap can recognise. There, empty and in
  * that shape: this wrapper's own to repair and remove. Anything else: the
  * caller's file, and only the bind lands on it.
+ *
+ * A name found taken is read, and repaired, through descriptors that follow
+ * no link, so that what is written is the file that was looked at whatever
+ * the name has been given to meanwhile; where it has been given to something
+ * else, that is left alone and the git directory is denied whole.
  *
  * What is bound is the store's copy, never the mount point itself: a host
  * process rewriting the file between this call and the mount would otherwise
@@ -373,9 +477,12 @@ function gitRedirectMountPoint(
     return bindFromStore()
   }
 
-  const contents = fileContentsWithin(dest, Buffer.byteLength(placeholder))
+  const { contents, bwrapShape } = fileContentsWithin(
+    dest,
+    Buffer.byteLength(placeholder),
+  )
   if (contents === '' && placeholder !== '') {
-    if (!isStaleBwrapMountPoint(dest)) {
+    if (!bwrapShape) {
       // Empty and not the shape bubblewrap leaves: a host git caught between
       // creating the file and writing it owns this one. Cover it with the
       // placeholder for the length of the command and leave the file alone.
@@ -384,17 +491,9 @@ function gitRedirectMountPoint(
       )
       return bindFromStore()
     }
+    let rewritten: boolean
     try {
-      // bubblewrap makes its mount points read-only (ensure_file(dest,
-      // 0444)), and the process that owns one need not be root, so the mode
-      // it was left with is no reason to leave the repository broken.
-      try {
-        fs.writeFileSync(dest, placeholder)
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EACCES') throw err
-        fs.chmodSync(dest, 0o644)
-        fs.writeFileSync(dest, placeholder)
-      }
+      rewritten = rewriteStaleBwrapMountPoint(dest, placeholder)
     } catch (err) {
       throw placeholderUnavailable(
         dest,
@@ -402,16 +501,25 @@ function gitRedirectMountPoint(
         err,
       )
     }
+    if (!rewritten) {
+      // Something has taken the name since it was read, and whatever that is
+      // is not this wrapper's to write through or to remove. The git
+      // directory is the command's to change right now, so refusing over it
+      // would be a brick that command can plant, the same as above.
+      const gitDir = path.dirname(dest)
+      logForDebugging(
+        `[Sandbox Linux] ${dest} stopped being the empty file an earlier sandbox left while it was being rewritten; leaving it as it is and denying the git directory ${gitDir} whole instead, which needs nothing written to it`,
+        { level: 'warn' },
+      )
+      return { denyGitDirWhole: gitDir }
+    }
     takeOwnership()
     logForDebugging(
       `[Sandbox Linux] Rewrote ${dest}, left empty by a sandbox that did not clean up, to ${JSON.stringify(placeholder)}: git reads no bytes there as a fault, not as "no redirect"`,
     )
     return bindFromStore()
   }
-  if (
-    contents === placeholder &&
-    (placeholder !== '' || isStaleBwrapMountPoint(dest))
-  ) {
+  if (contents === placeholder && (placeholder !== '' || bwrapShape)) {
     // This wrapper's own, left by a process that could not clean up: nothing
     // else writes exactly these bytes there, and for an empty placeholder
     // nothing else leaves a file of that shape. Removed with the rest, and
@@ -1437,16 +1545,20 @@ function ensureEmptyMountSourceDir(): string {
  */
 function isStaleBwrapMountPoint(p: string): boolean {
   try {
-    const stat = fs.lstatSync(p)
-    return (
-      stat.isFile() &&
-      stat.size === 0 &&
-      (stat.mode & 0o222) === 0 &&
-      stat.nlink === 1
-    )
+    return hasBwrapMountPointShape(fs.lstatSync(p))
   } catch {
     return false
   }
+}
+
+/** The shape {@link isStaleBwrapMountPoint} describes, asked of a stat. */
+function hasBwrapMountPointShape(stat: fs.Stats): boolean {
+  return (
+    stat.isFile() &&
+    stat.size === 0 &&
+    (stat.mode & 0o222) === 0 &&
+    stat.nlink === 1
+  )
 }
 
 export const CAP_SETFCAP = 31
@@ -1976,10 +2088,16 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
           stat.size === Buffer.byteLength(written) &&
           fs.readFileSync(mountPoint, 'utf8') === written)
       if (stat.isFile() && stillAsCreated) {
-        fs.unlinkSync(mountPoint)
-        logForDebugging(
-          `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
-        )
+        // The look above goes through a link and the unlink does not, so a
+        // name that has become a link to a file still as created is not the
+        // file that was looked at: left where it is.
+        const named = fs.lstatSync(mountPoint)
+        if (named.dev === stat.dev && named.ino === stat.ino) {
+          fs.unlinkSync(mountPoint)
+          logForDebugging(
+            `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
+          )
+        }
       } else if (stat.isDirectory()) {
         // Empty directory mount points are created for intermediate
         // components (Fix 2). Only remove if still empty.
