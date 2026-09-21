@@ -278,6 +278,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
           followSymlinkedDirectories: true,
         })
         expect(withDangling.uninspectableLinks).toEqual(new Set([link]))
+        // Neither link is a directory the walk failed to list.
+        expect(withDangling.unlisted).toEqual([])
       } finally {
         chmodSync(vault, 0o755)
         rmSync(root, { recursive: true, force: true })
@@ -460,26 +462,19 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
-  it('takes a drive root and a share root for the roots they are', () => {
-    // The walk splits its base into path components, so a base that carries a
-    // separator ends in an empty name no position can consume: the automaton
-    // starts nowhere and the pattern matches nothing at all, with no error
-    // and no warning. A drive root and the root of a UNC share are the two
-    // bases that come back with one, and are refused like the POSIX root.
-    for (const root of [
-      '',
-      '/',
-      'C:',
-      'C:/',
-      'C:\\',
-      'c:/',
-      '//server/share',
-      '//server/share/',
-      '\\\\server\\share',
-    ]) {
-      expect(globBaseDirIsRoot(root)).toBe(true)
+  it('starts no walk from the root, and starts one from a drive or a share', () => {
+    // '/' holds every filesystem the machine has mounted, and listing that is
+    // not what an entry meant. A drive root and the root of a UNC share are
+    // one volume each, which the entry names itself: `\\server\share\*.pem`
+    // is one directory listed.
+    for (const none of ['', '/']) {
+      expect(globBaseDirIsRoot(none)).toBe(true)
     }
     for (const dir of [
+      'C:',
+      'c:',
+      'D:',
+      '//server/share',
       '/home/u',
       'C:/Users',
       'C:/Users/u',
@@ -492,39 +487,97 @@ describe.if(!isWindows)('walkGlobPattern', () => {
 
   it('leaves no separator on a base a Windows pattern starts from', () => {
     // path.dirname keeps the separator of a root it returns: 'C:/' for
-    // 'C:/Users', '//server/share/' for a path on a share. Driven through
+    // 'C:/Users', '//server/share/' for a path on a share. Split into path
+    // components to seed the walk, either ends in an empty name no position
+    // can consume, and the pattern matches nothing at all. Driven through
     // win32's own semantics, so the case is pinned on every runner and not
     // only where the suite meets a drive.
     const dirname = spyOn(path, 'dirname').mockImplementation(win32.dirname)
     try {
-      const bases = [
+      const patterns = [
         'C:/Users*/id.pem',
         'C:/Program*/keys/**',
         'C:/*.pem',
+        'D:/**/*.key',
         '//server/share/x*/y',
         '//server/share/*.pem',
+        '//server/share/**/.env',
         'C:/Users/u/certs*/id.pem',
-      ].map(pattern => globPatternBaseDir(pattern))
+      ]
+      const bases = patterns.map(pattern => globPatternBaseDir(pattern))
       expect(dirname).toHaveBeenCalled()
 
-      for (const base of bases) {
-        expect(base.split('/').at(-1)).not.toBe('')
-      }
-      // Every one of those but the last names a filesystem root, which the
-      // walk and the manager's warnings both refuse.
-      expect(bases.map(globBaseDirIsRoot)).toEqual([
-        true,
-        true,
-        true,
-        true,
-        true,
-        false,
+      expect(bases).toEqual([
+        'C:',
+        'C:',
+        'C:',
+        'D:',
+        '//server/share',
+        '//server/share',
+        '//server/share',
+        'C:/Users/u',
       ])
-      expect(bases.at(-1)).toBe('C:/Users/u')
+      // A root of either kind is a base like any other: every one of these
+      // is walked.
+      expect(bases.map(globBaseDirIsRoot)).toEqual(patterns.map(() => false))
     } finally {
       dirname.mockRestore()
     }
   })
+
+  it.if(isLinux)(
+    'walks a pattern whose only literal directory is a drive root',
+    () => {
+      // A drive cannot be had on this runner, so one is stood up: a directory
+      // named `C:` in the working directory, which is what 'C:/…' then names,
+      // with path.dirname and path.isAbsolute answering as they do on
+      // Windows and 'C:/' resolving to itself. Everything else, the listing
+      // included, is the walk's own.
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-drive-')))
+      const cwd = process.cwd()
+      const realpathSync = fs.realpathSync
+      const spies = [
+        spyOn(path, 'dirname').mockImplementation(win32.dirname),
+        spyOn(path, 'isAbsolute').mockImplementation(win32.isAbsolute),
+        spyOn(fs, 'realpathSync').mockImplementation(((
+          ...args: Parameters<typeof fs.realpathSync>
+        ) =>
+          args[0] === 'C:/'
+            ? 'C:/'
+            : realpathSync(...args)) as typeof fs.realpathSync),
+      ]
+      try {
+        mkdirSync(join(root, 'C:', 'Users1', 'deep'), { recursive: true })
+        mkdirSync(join(root, 'C:', 'Other'))
+        writeFileSync(join(root, 'C:', 'top.pem'), 'KEY')
+        writeFileSync(join(root, 'C:', 'Users1', 'id.pem'), 'KEY')
+        writeFileSync(join(root, 'C:', 'Users1', 'deep', 'id.pem'), 'KEY')
+        writeFileSync(join(root, 'C:', 'Other', 'id.pem'), 'KEY')
+        process.chdir(root)
+
+        // A wildcard in the middle of the component below the root, at its
+        // start, and a `**` there.
+        const middle = walkGlobPattern('C:/Users*/id.pem')
+        expect(middle.matches).toEqual(['C:/Users1/id.pem'])
+        expect(walkGlobPattern('C:/*.pem').matches).toEqual(['C:/top.pem'])
+        expect(walkGlobPattern('C:/**/deep/*.pem').matches).toEqual([
+          'C:/Users1/deep/id.pem',
+        ])
+        // 'C:' on its own is the drive's current directory, not its root:
+        // what the filesystem is asked about is 'C:/'. Asked about 'C:', the
+        // stand-in answers with its real path instead.
+        expect(middle.baseLocation).toBe('C:/')
+        // What the ACL stamp is handed, which is nothing when the walk is.
+        expect(expandWindowsFsPaths(['C:/Users*/id.pem'])).toEqual([
+          'C:/Users1/id.pem',
+        ])
+      } finally {
+        process.chdir(cwd)
+        for (const spy of spies) spy.mockRestore()
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   it('matches a name that holds a line terminator', () => {
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-newline-')))
@@ -828,6 +881,38 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       expect(walk.realOf.get(join(root, 'proj', 'away'))).toBe(
         join(root, 'outside'),
       )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('leaves alone a link that leads up the tree from a pattern it cannot split', () => {
+    // What such a link leads to holds the base being walked. Denied whole,
+    // it would hide the base itself and everything beside it, which is what
+    // a pattern that does split already declines to do by not descending it.
+    // A link to a directory beside the base is still denied whole.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unsplit-up-')))
+    const proj = join(root, 'home', 'proj')
+    try {
+      mkdirSync(join(proj, 'inner'), { recursive: true })
+      mkdirSync(join(root, 'home', 'beside'))
+      writeFileSync(join(proj, 'inner', 'a].pem'), 'KEY')
+      writeFileSync(join(root, 'home', 'beside', 'b].pem'), 'KEY')
+      // To the base, to its parent and to the parent's parent.
+      symlinkSync(proj, join(proj, 'self'))
+      symlinkSync(join('..', '..'), join(proj, 'inner', 'up'))
+      symlinkSync(root, join(proj, 'inner', 'upper'))
+      symlinkSync(join('..', 'beside'), join(proj, 'away'))
+
+      const walk = walkGlobPattern(join(proj, '**/?[*].pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.matches).toEqual([join(proj, 'inner', 'a].pem')])
+      expect(walk.unlisted).toEqual([join(proj, 'away')])
+      expect([...walk.realOf]).toEqual([
+        [join(proj, 'away'), join(root, 'home', 'beside')],
+      ])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

@@ -1529,8 +1529,9 @@ function globPositions(
  * separator, except for the root itself: the walk splits this into path
  * components, and the empty one a trailing separator leaves at the end is a
  * name no position can consume, so the automaton would have nowhere to start
- * and the pattern would match nothing at all. A root, and '' for a pattern
- * with a wildcard in its first path component, are what
+ * and the pattern would match nothing at all. A drive root comes back as
+ * 'C:' and the root of a UNC share as '//server/share'. '/', and '' for a
+ * pattern with a wildcard in its first path component, are what
  * {@link globBaseDirIsRoot} refuses.
  *
  * @param normalizedPattern - a pattern already through
@@ -1551,21 +1552,18 @@ export function globPatternBaseDir(normalizedPattern: string): string {
 
 /**
  * Whether a base from {@link globPatternBaseDir} is one no walk starts from:
- * nothing at all, or a filesystem root — '/', a drive root ('C:', what is
- * left of 'C:/' without its separator) or the root of a UNC share
- * ('//server/share'). A pattern whose only literal directory is a root would
- * have the walk list a whole filesystem, which is not what the entry meant;
- * `/**\/*.pem` and `C:/Users*\/id.pem` are the same case. A resolved POSIX
- * path never begins with two separators, so the last two spellings are
- * reachable on Windows alone.
+ * nothing at all, or the root, '/'. A pattern whose only literal directory
+ * is the root (`/**\/*.pem`) would have the walk list every filesystem the
+ * machine has mounted, which is not what the entry meant.
+ *
+ * A drive root ('C:') and the root of a UNC share ('//server/share') are
+ * bases like any other. Each is one volume, which the entry names itself:
+ * `\\server\share\*.pem` and `C:\Users*\id.pem` list one directory, and a
+ * `**` right below one lists that volume, as the entry asks. Refused, every
+ * such pattern would go unenforced with a debug line as the only notice.
  */
 export function globBaseDirIsRoot(baseDir: string): boolean {
-  return (
-    baseDir === '' ||
-    baseDir === '/' ||
-    /^[A-Za-z]:[/\\]?$/.test(baseDir) ||
-    /^[/\\]{2}[^/\\]+[/\\][^/\\]+[/\\]?$/.test(baseDir)
-  )
+  return baseDir === '' || baseDir === '/'
 }
 
 /**
@@ -1606,7 +1604,7 @@ export function walkGlobPattern(
   const baseDir = globPatternBaseDir(normalizedPattern)
   if (globBaseDirIsRoot(baseDir)) {
     logForDebugging(
-      `[Sandbox] Glob pattern has no literal directory below a filesystem root to start from, skipping: ${globPath}`,
+      `[Sandbox] Glob pattern has no literal directory below the root to start from, skipping: ${globPath}`,
       { level: 'warn' },
     )
     return walk
@@ -1737,17 +1735,23 @@ export function walkGlobPattern(
     return target
   }
 
-  let baseReal = baseDir
+  // The base as the filesystem is asked about it. A drive root gets back the
+  // separator globPatternBaseDir took off it: 'C:' on its own names the
+  // drive's current directory, which is its root only while the process works
+  // on another drive. The positions are still reached from the base without
+  // one, which has no empty component at the end.
+  const baseSpelling = /^[A-Za-z]:$/.test(baseDir) ? `${baseDir}/` : baseDir
+  let baseReal = baseSpelling
   try {
-    baseReal = fs.realpathSync(baseDir)
+    baseReal = fs.realpathSync(baseSpelling)
   } catch {
     // Not there, or a component of it cannot be resolved: list the spelling.
   }
   walk.baseLocation = baseReal
   pending.push({
-    dir: baseDir,
+    dir: baseSpelling,
     real: baseReal,
-    short: baseDir.length < baseReal.length ? baseDir : baseReal,
+    short: baseSpelling.length < baseReal.length ? baseSpelling : baseReal,
     positions: baseDir.split('/').reduce(positions.next, positions.start),
   })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
@@ -1855,13 +1859,19 @@ export function walkGlobPattern(
           !positions.splits &&
           !isMatch &&
           !isDirectoryFormCandidate &&
-          !isAtOrUnder(target.real, baseReal)
+          !isAtOrUnder(target.real, baseReal) &&
+          !isAtOrUnder(baseReal, target.real)
         ) {
           // The pattern is matched against whole paths and this link is not
           // listed through, so what it matches in there is found by no other
           // name either: the directory it leads to is denied whole rather
           // than dropped. A target inside the walk's own tree is listed
-          // under its own name, which loses nothing.
+          // under its own name, which loses nothing. One that leads up, to
+          // the walk's base or above it, is left alone as it is below for a
+          // pattern that splits: what it leads to holds the tree being
+          // walked, and denied whole it would hide the base, everything
+          // beside it and every path bound back beneath it, over a link
+          // anything able to write the tree can make.
           const targetRecord = recordFor(target.real)
           if (!targetRecord.unlisted) {
             targetRecord.unlisted = true

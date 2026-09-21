@@ -345,6 +345,39 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     expect([...unlistable]).toEqual([join(unsplit, 'outside')])
   })
 
+  it('mounts nothing over what holds the tree for a link that leads up it', () => {
+    // The same pattern, and a link any command able to write the tree can
+    // make: proj/inner/up -> ../.. leads to the directory holding proj and
+    // everything beside it, proj/x -> ../.. to the one above that. Denied
+    // whole, either is a tmpfs over all of it, with nothing bound back
+    // beneath, for every later command. A pattern that can be followed does
+    // not descend such a link, and this one does not deny it; the link next
+    // to them, which leads out of the tree without leading up it, is still
+    // denied whole.
+    const upward = caseRoot('unsplit-up')
+    const proj = join(upward, 'home', 'proj')
+    mkdirSync(join(proj, 'inner'), { recursive: true })
+    mkdirSync(join(upward, 'home', 'beside'))
+    writeFileSync(join(proj, 'inner', 'a].pem'), '')
+    writeFileSync(join(upward, 'home', 'beside', 'b].pem'), '')
+    symlinkSync(join('..', '..'), join(proj, 'x'))
+    symlinkSync(join('..', '..'), join(proj, 'inner', 'up'))
+    symlinkSync(join('..', 'beside'), join(proj, 'away'))
+
+    const unlistable = new Set<string>()
+    const mounts = expandReadDenyGlobLinux(
+      join(proj, '**/?[*].pem'),
+      [],
+      unlistable,
+    )
+
+    expect(mounts).toEqual([
+      join(upward, 'home', 'beside'),
+      join(proj, 'inner', 'a].pem'),
+    ])
+    expect([...unlistable]).toEqual([join(upward, 'home', 'beside')])
+  })
+
   it('lists every match where it really is when the base is a symlink', () => {
     // alias -> ROOT, sideways: normalizePathForSandbox keeps the link
     // spelling for the pattern, so every match is spelled through it. The
