@@ -286,6 +286,11 @@ async function main(): Promise<void> {
         'protocol; give srt a dedicated read-only end — see the README)',
       parseControlFd,
     )
+    .option(
+      '--violations <path>',
+      'append each operation the sandbox refuses (network denies, and on ' +
+        'macOS/Linux refused file access) to this file, one line per event',
+    )
     .allowUnknownOption()
     .action(
       async (
@@ -295,6 +300,7 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          violations?: string
         },
       ) => {
         try {
@@ -426,9 +432,78 @@ async function main(): Promise<void> {
             controlStream.on('error', onControlError)
           }
 
-          // Initialize sandbox with config
+          // Refused operations the sandbox records — proxy denies on every
+          // platform, and the seatbelt log (macOS) or seccomp observer
+          // (Linux) lines once the filesystem monitor is on — go to
+          // --violations as they happen. Checked before anything is built,
+          // by the same rule as --control-fd: a caller that asked for the
+          // report gets an error, not a run whose refusals quietly go
+          // nowhere. Opened for append so a path reused across runs holds
+          // one file, and each line is on disk the moment it is recorded:
+          // srt exits with the wrapped command and never waits to flush.
+          if (options.violations !== undefined) {
+            const violationsPath = options.violations
+            let violationsWritten = 0
+            let violationsFileBroken = false
+            try {
+              fs.appendFileSync(violationsPath, '')
+            } catch (err) {
+              console.error(
+                `Error: --violations ${violationsPath} is not writable: ` +
+                  `${err instanceof Error ? err.message : String(err)}. ` +
+                  'Refusing to run the command without the report it asks for.',
+              )
+              process.exit(1)
+            }
+            const store = SandboxManager.getSandboxViolationStore()
+            // The store keeps its last 100 events but counts every one, so
+            // the count, not the array, says how many this file has not
+            // seen: listeners get the whole tail on each event, and its
+            // last (total - written) entries are exactly the new ones. The
+            // min is a belt: notification is one per event, so the tail
+            // always holds them.
+            store.subscribe(violations => {
+              if (violationsFileBroken) return
+              const total = store.getTotalCount()
+              const fresh = Math.min(
+                total - violationsWritten,
+                violations.length,
+              )
+              if (fresh <= 0) return
+              const text = violations
+                .slice(-fresh)
+                .map(v => `${v.line}\n`)
+                .join('')
+              try {
+                fs.appendFileSync(violationsPath, text)
+              } catch (err) {
+                // The report is a side channel of the run, not the run: a
+                // path that stops taking writes is said once, and the
+                // command goes on without it.
+                violationsFileBroken = true
+                console.error(
+                  `srt: cannot write --violations ${violationsPath}: ` +
+                    `${err instanceof Error ? err.message : String(err)}; ` +
+                    'no further violations will be reported',
+                )
+                return
+              }
+              violationsWritten = total
+            })
+          }
+
+          // Initialize sandbox with config. The third argument starts the
+          // filesystem violation monitor (a `log stream` on macOS, the
+          // seccomp observer on Linux), which lives as long as the command;
+          // it runs only when --violations asked for the report, so a run
+          // that nobody reads does not pay for it. Proxy denies are recorded
+          // either way.
           logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
+          await SandboxManager.initialize(
+            runtimeConfig,
+            undefined,
+            options.violations !== undefined,
+          )
 
           // Read config updates only now. The stream has been waiting
           // unread, so nothing the caller wrote meanwhile is lost, and an
