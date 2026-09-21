@@ -19,26 +19,39 @@ export const DEFAULT_RIPGREP_TIMEOUT_MS = 10_000
  * ripgrep exited with an error status. `partialMatches` is what it listed
  * before that: rg reports an unreadable directory with exit code 2 after
  * printing every match it could reach, and names each one in `stderr`.
- * `timedOut` says the run lasted as long as it was given and was killed for
- * it, so what it listed is a prefix of an unknown whole rather than
- * everything it could reach. A run killed by anything else says so in its
- * message and is not a timeout.
+ *
+ * `killed` says the run did not exit on its own — the timeout, an OOM kill, a
+ * signal to the process group — so what it listed is a prefix of an unknown
+ * whole rather than everything it could reach, whatever its stderr already
+ * held. `timedOut` is the one such kill this can name, the run having lasted
+ * as long as it was given; `killedBy` is the signal, where the platform
+ * reported one. A caller deciding whether a listing can be used at all wants
+ * `killed`: a run cut off inside its budget is as incomplete as one cut off
+ * at the end of it.
  */
 export class RipgrepError extends Error {
   readonly partialMatches: string[]
   readonly stderr: string
   readonly timedOut: boolean
+  readonly killed: boolean
+  readonly killedBy: NodeJS.Signals | undefined
 
   constructor(
     message: string,
-    partialMatches: string[],
-    stderr: string,
-    timedOut: boolean,
+    details: {
+      partialMatches: string[]
+      stderr: string
+      timedOut: boolean
+      killed: boolean
+      killedBy: NodeJS.Signals | undefined
+    },
   ) {
     super(message)
-    this.partialMatches = partialMatches
-    this.stderr = stderr
-    this.timedOut = timedOut
+    this.partialMatches = details.partialMatches
+    this.stderr = details.stderr
+    this.timedOut = details.timedOut
+    this.killed = details.killed
+    this.killedBy = details.killedBy
   }
 }
 
@@ -108,18 +121,24 @@ export async function ripGrep(
   // A null exit code means the child was killed rather than exiting. The
   // timeout is one reason for that and not the only one — a Ctrl-C to the
   // process group, an OOM kill — so it is the one this claims only where the
-  // run actually lasted as long as it was given. The rest are reported as
-  // what they were; upstream refuses either way, with an accurate message.
+  // run actually lasted as long as it was given. Either way the listing stops
+  // wherever the kill arrived, which is what `killed` carries and what a
+  // caller has to refuse on; the rest are reported as what they were.
   const killed = exit.code === null
   const elapsedMs = Date.now() - startedAt
   const timedOut = killed && elapsedMs >= timeoutMs
-  const killedBy = exit.signal ?? 'a signal'
   const failure = timedOut
-    ? `ripgrep was killed by ${killedBy} after ${elapsedMs} ms, the ${timeoutMs} ms it was given`
+    ? `ripgrep was killed by ${exit.signal ?? 'a signal'} after ${elapsedMs} ms, the ${timeoutMs} ms it was given`
     : killed
-      ? `ripgrep was killed by ${killedBy} after ${elapsedMs} ms, inside the ${timeoutMs} ms it was given`
+      ? `ripgrep was killed by ${exit.signal ?? 'a signal'} after ${elapsedMs} ms, inside the ${timeoutMs} ms it was given`
       : `ripgrep failed with exit code ${exit.code}`
-  throw new RipgrepError(`${failure}: ${stderr}`, matches, stderr, timedOut)
+  throw new RipgrepError(`${failure}: ${stderr}`, {
+    partialMatches: matches,
+    stderr,
+    timedOut,
+    killed,
+    killedBy: exit.signal ?? undefined,
+  })
 }
 
 /** NUL-terminated records, dropping an unterminated (truncated) last one. */

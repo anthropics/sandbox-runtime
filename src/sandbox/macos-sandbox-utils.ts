@@ -19,6 +19,7 @@ import {
   DANGEROUS_FILES,
   getDangerousDirectories,
   isAbsenceErrno,
+  coversWriteTree,
 } from './sandbox-utils.js'
 import {
   gitDirDenyPaths,
@@ -109,6 +110,7 @@ export interface MacOSSandboxParams {
  */
 export function macGetMandatoryDenyEntries(
   allowGitConfig = false,
+  allowWritePaths: readonly string[] = [],
 ): PathEntry[] {
   const cwd = normalizePathForSandbox(process.cwd(), { literal: true })
   const entries: PathEntry[] = []
@@ -161,27 +163,47 @@ export function macGetMandatoryDenyEntries(
     // literal entry is a subpath deny, so this denies it whole, as the Linux
     // backend's bind of the same path does.
     if (!isAbsenceErrno(err)) {
-      return [...entries, ...gitDiskDenyEntries([dotGit], [])]
+      return [
+        ...entries,
+        ...gitDiskDenyEntries([dotGit], [], cwd, allowWritePaths),
+      ]
     }
   }
   if (dotGitStat?.isDirectory()) {
     const tree = gitDirTreeDenies(dotGit, allowGitConfig)
     entries.push(
-      ...gitDiskDenyEntries(gitDirTreeDenyPaths(tree), tree.chainHops),
+      ...gitDiskDenyEntries(
+        gitDirTreeDenyPaths(tree),
+        tree.chainHops,
+        cwd,
+        allowWritePaths,
+      ),
     )
   } else {
     // Absent, or a pointer file: the repository's own hooks and config are
     // denied either way, so neither can be created under a .git that is not
     // there yet.
     entries.push(
-      ...gitDiskDenyEntries(gitDirDenyPaths(dotGit, allowGitConfig), []),
+      ...gitDiskDenyEntries(
+        gitDirDenyPaths(dotGit, allowGitConfig),
+        [],
+        cwd,
+        allowWritePaths,
+      ),
     )
     if (dotGitStat?.isFile()) {
       // cwd checked out as a linked worktree or submodule: .git is a pointer
       // file. Nested pointer files are matched by vnode type instead
       // (gitPointerFilter), which cannot follow them.
       const pointer = gitFileDenies(dotGit, allowGitConfig)
-      entries.push(...gitDiskDenyEntries(pointer.denyPaths, pointer.chainHops))
+      entries.push(
+        ...gitDiskDenyEntries(
+          pointer.denyPaths,
+          pointer.chainHops,
+          cwd,
+          allowWritePaths,
+        ),
+      )
     }
   }
 
@@ -231,20 +253,44 @@ export function macGetMandatoryDenyEntries(
 function gitDiskDenyEntries(
   denyPaths: readonly string[],
   chainHops: readonly GitChainHop[],
+  cwd: string,
+  allowWritePaths: readonly string[],
 ): PathEntry[] {
   const hopLinks = new Set(chainHops.map(hop => hop.link))
   const entries: PathEntry[] = []
   const named = new Set<string>()
+  const dropped: string[] = []
   for (const denyPath of denyPaths) {
     const spellings = hopLinks.has(denyPath)
       ? [denyPath]
       : [denyPath, physicalDenyPath(denyPath)]
+    // A literal entry is a subpath deny, so one naming the working directory
+    // or a write root - by either spelling - takes the whole tree read-only
+    // for every command after the one that arranged it, and a `.git` pointer
+    // naming the checkout or an entry linked at `..` is one write. Neither
+    // end of what such a deny was holding loses its own entry; see
+    // `withoutWorkTreeDenies` in src/sandbox/linux-sandbox-utils.ts, which
+    // makes the same call for the same reason.
+    if (
+      spellings.some(spelling =>
+        coversWriteTree(spelling, cwd, allowWritePaths),
+      )
+    ) {
+      dropped.push(denyPath)
+      continue
+    }
     for (const spelling of spellings) {
       const entry = toLiteralPathEntry(spelling)
       if (named.has(entry.path)) continue
       named.add(entry.path)
       entries.push(entry)
     }
+  }
+  if (dropped.length > 0) {
+    logForDebugging(
+      `[Sandbox macOS] ${dropped.join(', ')} would have been denied whole, and each is the working directory or a path this command may write: dropped, since denying one leaves every later command unable to write the project. What it was holding keeps the entries of its own two ends.`,
+      { level: 'warn' },
+    )
   }
   return entries
 }
@@ -1023,7 +1069,12 @@ function generateWriteRules(
   // the mandatory entries carry their own literal/glob split.
   const denyEntries = [
     ...(config.denyWithinAllow || []).map(toPathEntry),
-    ...macGetMandatoryDenyEntries(allowGitConfig),
+    ...macGetMandatoryDenyEntries(
+      allowGitConfig,
+      (config.allowOnly || []).map(allowed =>
+        normalizePathForSandbox(allowed, { literal: true }),
+      ),
+    ),
   ]
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)

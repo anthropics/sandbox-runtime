@@ -60,6 +60,30 @@ export function isAtOrUnder(p: string, dir: string): boolean {
   return p === dir || p.startsWith(dir === '/' ? '/' : dir + '/')
 }
 
+/**
+ * Whether denying `dir` WHOLE would take the tree a sandbox exists to let the
+ * command write: `dir` is the working directory, an ancestor of it, a path
+ * the caller allows writes to, or a directory holding one.
+ *
+ * A whole-directory deny is what both backends fall back on for a tree they
+ * cannot enumerate, or a link they have no other handle on. Every producer of
+ * one reads paths a sandboxed command can create - a `.git` pointer naming
+ * the checkout, a `.git/modules` entry linked at `../..`, a directory left
+ * unreadable - so one that lands here is a command leaving every command
+ * after it unable to write the project. `dir` must be where a deny would
+ * LAND, symlinks resolved, since that is what the deny covers.
+ */
+export function coversWriteTree(
+  dir: string,
+  cwd: string,
+  allowWritePaths: readonly string[],
+): boolean {
+  return (
+    isAtOrUnder(cwd, dir) ||
+    allowWritePaths.some(allowed => isAtOrUnder(allowed, dir))
+  )
+}
+
 /** `p` lies strictly beneath `dir` (isAtOrUnder, excluding `dir` itself). */
 export function isStrictlyUnder(p: string, dir: string): boolean {
   return p !== dir && isAtOrUnder(p, dir)
