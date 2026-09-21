@@ -9,7 +9,7 @@
     "srt": "dist/cli.js"
   },
   "engines": {
-    "node": ">=20.11.0"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc",

@@ -43,10 +43,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # The release line the legs build and test on. engines in
-          # package.json is >=20.11.0: that is the floor, and this does not
-          # pin it. The steps at the end of the job that run the built
-          # package under Node repeat on 20 and 24 for that reason.
+          # The release line the legs build and test on, and the engines
+          # floor in package.json (>=22). The steps at the end of the job
+          # that run the built package under Node repeat on 24, the line
+          # above it.
           node-version: '22'
 
       - name: Setup Bun
@@ -328,18 +328,6 @@ jobs:
       # with the node on PATH. It runs on each release line from the engines
       # floor up. Only these steps repeat, so the job matrix stays as it is.
       - name: Run the tests that use Node (Node 22)
-        if: matrix.os != 'windows'
-        run: |
-          node --version
-          npm run test:node
-
-      - name: Setup Node.js 20
-        if: matrix.os != 'windows'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: '20'
-
-      - name: Run the tests that use Node (Node 20)
         if: matrix.os != 'windows'
         run: |
           node --version

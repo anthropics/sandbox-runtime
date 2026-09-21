@@ -103,15 +103,15 @@ jobs:
     #
     # This is the one place the packed tarball is installed and imported,
     # and it does so under Node, so it runs once on each Node release line
-    # from the engines floor in package.json (>=20.11.0) up. publish waits
-    # for all three.
+    # from the engines floor in package.json (>=22) up. publish waits for
+    # both.
     name: Verify package (Windows / Node ${{ matrix.node }})
     needs: build-srt-win
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        node: ['20', '22', '24']
+        node: ['22', '24']
     env:
       # Husky's prepare hook chokes on Windows runners; skip it.
       HUSKY: '0'
@@ -184,7 +184,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # The package is built and packed here, so this stays inside its
-          # own engines range (>=20.11.0).
+          # own engines range (>=22).
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
