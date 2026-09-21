@@ -89,6 +89,7 @@ import {
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
+import { ownFilesWriteDenies } from './own-files.js'
 import {
   SandboxViolationStore,
   sanitizeUnregisteredCommandKey,
@@ -1368,7 +1369,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
 
   return {
     allowOnly,
-    denyWithinAllow: denyPaths,
+    // The library's own files with the caller's denies: see own-files.ts.
+    denyWithinAllow: [...denyPaths, ...ownFilesWriteDenies(allowOnly)],
   }
 }
 
@@ -1676,24 +1678,30 @@ async function wrapWithSandbox(
         config?.filesystem.allowWrite ??
         [],
     )
-    writeConfig = {
-      allowOnly: [
-        ...defaultWritePathsUnder({
-          denyRead:
-            customConfig?.filesystem?.denyRead ??
-            config?.filesystem.denyRead ??
-            [],
-          allowRead:
-            customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
-          credentials: customConfig?.credentials ?? config?.credentials,
-        }),
-        ...userAllowWrite,
-      ],
-      denyWithinAllow: stripWriteGlobs(
-        customConfig?.filesystem?.denyWrite ??
-          config?.filesystem.denyWrite ??
+    const allowOnly = [
+      ...defaultWritePathsUnder({
+        denyRead:
+          customConfig?.filesystem?.denyRead ??
+          config?.filesystem.denyRead ??
           [],
-      ),
+        allowRead:
+          customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+        credentials: customConfig?.credentials ?? config?.credentials,
+      }),
+      ...userAllowWrite,
+    ]
+    writeConfig = {
+      allowOnly,
+      denyWithinAllow: [
+        ...stripWriteGlobs(
+          customConfig?.filesystem?.denyWrite ??
+            config?.filesystem.denyWrite ??
+            [],
+        ),
+        // Whatever this wrap may write, the library's own files are not
+        // among it: see own-files.ts.
+        ...ownFilesWriteDenies(allowOnly),
+      ],
     }
 
     // Credential deny paths are unioned with the caller's denyRead — never
