@@ -426,9 +426,17 @@ async function main(): Promise<void> {
             controlStream.on('error', onControlError)
           }
 
-          // Initialize sandbox with config
+          // Initialize sandbox with config. Pass the settings path so the
+          // sandbox denies writes to the file it was loaded from — otherwise a
+          // broad allowWrite grant covering that file's directory lets the
+          // sandboxed process rewrite the policy for the next run.
           logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
+          await SandboxManager.initialize(
+            runtimeConfig,
+            undefined,
+            undefined,
+            configPath,
+          )
 
           // Read config updates only now. The stream has been waiting
           // unread, so nothing the caller wrote meanwhile is lost, and an
