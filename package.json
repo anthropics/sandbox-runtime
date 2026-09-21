@@ -19,7 +19,7 @@
     "clean": "rm -rf dist",
     "test": "bun test",
     "test:node": "node test/utils/which-node-test.mjs && bun test test/control-fd.test.ts",
-    "test:bundled": "tsc --noEmit -p test/smoke/tsconfig.json && bun build --compile --minify --bytecode test/smoke/embedder.ts --outfile dist/bundled-smoke && ./dist/bundled-smoke",
+    "test:bundled": "tsc --noEmit -p test/smoke/tsconfig.json && bun test/smoke/run-bundled.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint 'src/**/*.ts' --fix --cache --cache-location=node_modules/.cache/.eslintcache",
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",

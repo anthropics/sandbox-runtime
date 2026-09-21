@@ -6,10 +6,16 @@
  * would notice code that leans on a function's name, on its own source text,
  * or on a file that sits beside it on disk.
  *
- * It wraps real commands and checks what they did on the host. A compiled
- * program has no `vendor/` beside it, so the seccomp helper is named to the
- * library, as an embedder names its own copy: by SRT_SMOKE_APPLY_SECCOMP, or
- * else the one built in the checkout this is run from.
+ * It wraps real commands and checks what they did on the host, and that a
+ * refusal still carries the name and the code a caller branches on once every
+ * identifier has been shortened. The library is reached through `import()`, so
+ * that where the bundle is split into chunks it sits in one of its own.
+ *
+ * A compiled program has no package directory around it: no `vendor/`, no
+ * `node_modules`, no `package.json`, and `import.meta.url` names nothing on
+ * disk. The runner (run-bundled.ts) runs it from a directory of its own for
+ * that reason, and names the seccomp helper to it in SRT_SMOKE_APPLY_SECCOMP,
+ * as an embedder names its own copy to the library.
  */
 import { spawnSync } from 'node:child_process'
 import {
@@ -22,7 +28,6 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SandboxManager } from '../../dist/index.js'
 
 function check(what: string, ok: boolean, detail = ''): void {
   if (!ok) {
@@ -34,17 +39,17 @@ function check(what: string, ok: boolean, detail = ''): void {
 
 // Bytecode is CommonJS, which has no top-level await.
 async function main(): Promise<void> {
-  // Named by the caller, or the one this checkout built for this machine.
-  const built = join(
-    process.cwd(),
-    'vendor',
-    'seccomp',
-    process.arch === 'arm64' ? 'arm64' : 'x64',
-    'apply-seccomp',
+  const { SandboxManager, LinuxSandboxProfileError } = await import(
+    '../../dist/index.js'
   )
-  const applyPath =
-    process.env.SRT_SMOKE_APPLY_SECCOMP ??
-    (existsSync(built) ? built : undefined)
+  const applyPath = process.env.SRT_SMOKE_APPLY_SECCOMP
+  // Inside a container the host masks /proc, and a sandbox nested in one
+  // has to be the weaker kind the library has a setting for; the container
+  // job says so the way it says it to the suite it runs.
+  const nested =
+    process.env.SRT_E2E_DOCKER === '1'
+      ? { enableWeakerNestedSandbox: true }
+      : {}
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'srt-bundled-smoke-')))
   const work = join(root, 'work')
   const outside = join(root, 'outside')
@@ -60,6 +65,7 @@ async function main(): Promise<void> {
         denyWrite: [join(work, 'denied.txt')],
       },
       ...(applyPath === undefined ? {} : { seccomp: { applyPath } }),
+      ...nested,
     })
 
     // After initialize, so that the helper the configuration names is the
@@ -129,6 +135,41 @@ async function main(): Promise<void> {
       'the configuration reads back',
       config?.filesystem.allowWrite.includes(work) === true,
     )
+
+    if (process.platform === 'linux') {
+      // More absent deny paths than bubblewrap takes arguments for: the wrap
+      // is refused before anything is spawned or written.
+      SandboxManager.updateConfig({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [work],
+          denyWrite: Array.from({ length: 4000 }, (_, i) =>
+            join(work, `absent-${i}`),
+          ),
+        },
+        ...(applyPath === undefined ? {} : { seccomp: { applyPath } }),
+        ...nested,
+      })
+      const refusal: unknown = await SandboxManager.wrapWithSandbox(
+        'true',
+      ).then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      check(
+        'a profile that does not fit is refused with a typed error',
+        refusal instanceof LinuxSandboxProfileError,
+        String(refusal),
+      )
+      const typed = refusal as InstanceType<typeof LinuxSandboxProfileError>
+      check(
+        'which keeps its name and its code with every identifier shortened',
+        typed.name === 'LinuxSandboxProfileError' &&
+          typed.code === 'too_many_arguments',
+        `name ${typed.name}, code ${String(typed.code)}`,
+      )
+    }
     console.log('SMOKE OK')
   } finally {
     await SandboxManager.reset()
