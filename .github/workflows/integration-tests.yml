@@ -27,6 +27,12 @@ jobs:
           - arch: arm64
             runner: macos-14
             os: macos
+          # The newest macOS as well: the sandbox profile's own regex engine
+          # and what Seatbelt refuses have both moved between releases, and
+          # the two legs above stay on the images they name.
+          - arch: arm64-macos26
+            runner: macos-26
+            os: macos
           # Windows legs build srt-win, run the Rust smoke scripts,
           # then the TS integration suite (test/sandbox/winsrt.test.ts).
           - arch: x86-64
@@ -249,6 +255,15 @@ jobs:
         if: matrix.os != 'windows'
         run: npm test
 
+      # The suites run the sources unbundled. An application that embeds the
+      # library ships it minified and compiled to bytecode in one file, where
+      # a function's name, its source text and the files beside it are all
+      # gone. This compiles a small program that imports the built package
+      # that way and has it wrap real commands.
+      - name: Run the package bundled, minified and as bytecode
+        if: matrix.os != 'windows'
+        run: npm run test:bundled
+
       # bubblewrap 0.12 refuses a mount on a symlink destination, which the
       # distribution's packaged bubblewrap accepts; run the suite against it
       # as well so a profile that mounts on a link is caught here, not on a
@@ -409,4 +424,37 @@ jobs:
               bun test test/docker-weak-sandbox.test.ts
               echo "== as uid 0 without CAP_SYS_ADMIN"
               capsh --drop=cap_sys_admin -- -c "bun test test/docker-weak-sandbox.test.ts"
+            '
+
+      # The same two runs on musl. The seccomp helper is static and built
+      # here against musl's libseccomp, and bubblewrap, socat and ripgrep are
+      # Alpine's own builds. bun picks its musl build by itself. The checkout
+      # is copied first: node_modules and the helper the step above left in
+      # the workspace were built for glibc.
+      - name: Run srt end-to-end as uid 0 in an Alpine container
+        run: |
+          docker run --rm \
+            --cap-add SYS_ADMIN \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            -v "${{ github.workspace }}:/src:ro" \
+            -e SRT_E2E_DOCKER=1 \
+            alpine:3.22 \
+            sh -euc '
+              apk add --no-cache bash bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc musl-dev linux-headers libseccomp-dev libseccomp-static libcap-utils libstdc++ libgcc nodejs npm tar
+              mkdir /work
+              tar -C /src --exclude=./node_modules --exclude=./dist --exclude=./vendor/seccomp/x64 --exclude=./vendor/seccomp/arm64 --exclude=./.git -cf - . | tar -C /work -xf -
+              cd /work
+              curl -fsSL https://bun.sh/install | bash -s bun-v1.4.2
+              export PATH="$HOME/.bun/bin:$PATH"
+              bun --version
+              npm ci
+              npm run build:seccomp
+              npm run build
+              echo "== as uid 0 with CAP_SYS_ADMIN"
+              bun test test/docker-weak-sandbox.test.ts
+              echo "== as uid 0 without CAP_SYS_ADMIN"
+              capsh --drop=cap_sys_admin -- -c "bun test test/docker-weak-sandbox.test.ts"
+              echo "== bundled, minified and as bytecode"
+              npm run test:bundled
             '
