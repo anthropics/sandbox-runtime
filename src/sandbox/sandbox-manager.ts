@@ -1620,6 +1620,13 @@ export type WrapWithSandboxOptions = {
    * command text: keys are compared on their first 100 characters, so two
    * long commands sharing a prefix would otherwise cross-attribute, and a
    * rerun of the same text would inherit the earlier run's events.
+   *
+   * On Linux it is also the name under which the wrap records the mount
+   * points its command relies on: pass the same value to
+   * `cleanupAfterCommand({ commandId })` to have them removed as soon as that
+   * command is over, whatever other commands are still in flight. Only a
+   * value passed here counts for that; the `command` default does not, since
+   * two wraps in flight may share their text.
    */
   commandId?: string
   /**
@@ -2070,11 +2077,20 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
  * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
  * These persist after bwrap exits. This function removes them.
  *
- * Safe to call on any platform — it's a no-op on macOS.
+ * Call it once for each wrapped command, when that command is over. Two
+ * commands of one process may be in flight at once, and a call cannot tell
+ * which of them it is for, so with no argument nothing this process made is
+ * taken away until it has been called once for every wrap handed out: the
+ * command that has not started yet still needs what its wrap prepared. Pass
+ * the `commandId` the wrap was given (`WrapWithSandboxOptions.commandId`) to
+ * have that one command's mount points go at once, whatever else is running,
+ * which matters when some command runs for a long time.
+ *
+ * Safe to call on any platform: it does nothing except on Linux.
  * Also called automatically by reset() and on process exit as safety nets.
  */
-function cleanupAfterCommand(): void {
-  cleanupBwrapMountPoints()
+function cleanupAfterCommand(options?: { commandId?: string }): void {
+  cleanupBwrapMountPoints({ commandId: options?.commandId })
 }
 
 /**
@@ -2469,7 +2485,7 @@ export interface ISandboxManager {
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
   updateConfig(newConfig: SandboxRuntimeConfig): void
-  cleanupAfterCommand(): void
+  cleanupAfterCommand(options?: { commandId?: string }): void
   reset(): Promise<void>
 }
 

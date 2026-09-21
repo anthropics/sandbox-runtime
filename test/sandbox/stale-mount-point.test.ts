@@ -23,6 +23,7 @@ import {
 import { isLinux } from '../helpers/platform.js'
 import { countMounts, lastMountAt } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
 /** Echoed first by every command that runs for real, so an assertion about
  *  what the command did cannot pass on a sandbox that never started. */
@@ -44,15 +45,15 @@ function run(
 /**
  * A denyWrite path that does not exist gets `--ro-bind /dev/null <path>`, and
  * bwrap creates the mount point for it on the host: an empty file, mode 0444.
- * The wrapping process removes it after the command, from a set it keeps in
- * memory. A process killed before that (SIGKILL, OOM) leaves the file behind,
- * and it used to stay for good: every later wrap saw an existing file, bound
- * it onto itself and never removed it. For a path whose existence is its
- * meaning that is a lasting fault on the host: a leftover `.git/config.lock`
- * makes every `git config` write outside the sandbox fail with "could not
- * lock config file".
+ * A cleanup removes it once no sandbox relies on it. A process killed before
+ * it can clean up leaves the file behind, and it used to stay for good: every
+ * later wrap saw an existing file, bound it onto itself and never removed it.
+ * For a path whose existence is its meaning that is a lasting fault on the
+ * host: a leftover `.git/config.lock` makes every `git config` write outside
+ * the sandbox fail with "could not lock config file".
  */
 describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
+  usePrivateManifestDirectory()
   const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
   let BASE: string
   let AREA: string // allowed write area
@@ -105,15 +106,20 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
     expect(existsSync(LOCK)).toBe(false)
   })
 
-  it('waits for every outstanding sandbox before it is removed', async () => {
+  it('stays while a wrap of this process is outstanding, and goes with the last of them', async () => {
     plantLeftover(LOCK)
 
     await wrap([LOCK])
     await wrap([LOCK])
 
+    // Two wraps handed out, one cleaned up after: the other command may not
+    // have started yet, and a command that starts after its mount point or
+    // its manifest has gone either refuses to start or runs without its deny.
+    // A call cannot tell which command it is for, so this process gives up
+    // nothing of its own until it has been called for both.
     cleanupBwrapMountPoints()
-    // Unlinking it now would detach the second sandbox's bind.
     expect(existsSync(LOCK)).toBe(true)
+
     cleanupBwrapMountPoints()
     expect(existsSync(LOCK)).toBe(false)
   })
@@ -236,9 +242,15 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
       const after = run(command)
       expect(after.stdout).toContain(BOOTED)
       expect(after.stdout).toMatch(/rc=[1-9]/)
+      // A manifest whose writer is gone and that no sandbox has locked counts
+      // as live for half a second, in case the sandbox it covers is starting:
+      // the killed process left one, so the cleanup that takes its mount
+      // point away is the first one after that.
+      await new Promise(resolve => setTimeout(resolve, 600))
       cleanupBwrapMountPoints()
       expect(existsSync(LOCK)).toBe(false)
     },
+    30000,
   )
 })
 
@@ -251,6 +263,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
 describe.if(isLinux)(
   'Mount points for deny paths that do not exist yet',
   () => {
+    usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
     let BASE: string
     let AREA: string // allowed write area
