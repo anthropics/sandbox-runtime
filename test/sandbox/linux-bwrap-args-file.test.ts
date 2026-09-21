@@ -20,6 +20,7 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { LinuxSandboxProfileError } from '../../src/index.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
 describe('the bwrap profile error at the package root', () => {
   it('carries a name, a code, and a cause only when one is given', () => {
@@ -51,6 +52,7 @@ describe('the bwrap profile error at the package root', () => {
  * command line.
  */
 describe.if(isLinux)('bwrap --args for over-long profiles', () => {
+  usePrivateManifestDirectory()
   const MAX_ARG_STRLEN =
     32 * Number(spawnSync('getconf', ['PAGESIZE'], { encoding: 'utf8' }).stdout)
   // The largest rendering kept on the command line: the kernel's limit less
@@ -195,13 +197,21 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     // fit one argument itself.
     const scriptFile = join(BASE, 'isolated.ts')
     writeFileSync(scriptFile, script)
-    // A tmpdir of its own, so what a scenario leaves there goes with BASE.
+    // A tmpdir of its own, so what a scenario leaves there goes with BASE,
+    // and no runtime directory: the mount point manifests are then kept under
+    // that tmpdir, which is the arrangement several scenarios are about.
     mkdirSync(join(BASE, 'tmp'), { recursive: true })
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      TMPDIR: join(BASE, 'tmp'),
+      ...env,
+    }
+    delete childEnv.XDG_RUNTIME_DIR
     const argv = [...launcher, process.execPath, 'run', scriptFile]
     const run = spawnSync(argv[0]!, argv.slice(1), {
       cwd: BASE,
       encoding: 'utf8',
-      env: { ...process.env, TMPDIR: join(BASE, 'tmp'), ...env },
+      env: childEnv,
       timeout: 60000,
     })
     expect(run.stderr).toBe('')
@@ -238,7 +248,8 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     // environment is in it.
     expect(
       mounts.filter(
-        w => w.startsWith('--') && !/^--(ro-bind|bind|tmpfs)$/.test(w),
+        w =>
+          w.startsWith('--') && !/^--(ro-bind|ro-bind-try|bind|tmpfs)$/.test(w),
       ),
     ).toEqual([])
     expect(before).toContain(
@@ -377,6 +388,27 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     })
   })
 
+  it('keeps a pending profile through the clean-up after another command, and gives it back with the last', () => {
+    // A profile belongs to one wrap and nothing maps it back to a command, so
+    // none is closed while any wrap of this process is outstanding: the one
+    // that has not started yet reopens its profile through /proc when it does.
+    const seen = isolated(`
+      const openFds = () => fs.readdirSync('/proc/self/fd').length
+      // The runtime opens event-loop fds of its own on the first wrap.
+      await wrap(small)
+      cleanupBwrapMountPoints()
+      const baseline = openFds()
+      await wrap(overLong)
+      await wrap(overLong)
+      const held = openFds() - baseline
+      cleanupBwrapMountPoints()
+      const afterFirst = openFds() - baseline
+      cleanupBwrapMountPoints()
+      console.log(JSON.stringify({ held, afterFirst, afterSecond: openFds() - baseline }))
+    `)
+    expect(seen).toEqual({ held: 2, afterFirst: 2, afterSecond: 0 })
+  })
+
   it('refuses at wrap time, with the reason, when no directory takes an unnamed file', () => {
     // Both candidates read-only: tmpdir and /dev/shm. A profile that fits
     // needs neither and is unaffected.
@@ -448,7 +480,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
         const { spawnSync } = await import('node:child_process')
         const wrapped = await wrap(overLong, 'touch ${marker} 2>/dev/null && echo WROTE || echo DENIED')
         const argsPath = argsPathOf(wrapped)
-        // The runtime leaves a cache of its own there; nothing of ours.
+        // The runtime leaves a cache of its own there. Of ours there is one
+        // thing, and it is not the profile: the directory mount point
+        // manifests are kept in, which this wrap has none of and binds
+        // read-only only to keep other sandboxes' out of the command's reach.
         const namedUnderTmpdir = fs.readdirSync(process.env.TMPDIR, { recursive: true })
           .filter(entry => /srt|args|bwrap/.test(entry))
         // What a sandbox with the parent writable, or another process of
@@ -476,7 +511,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       )
       expect(seen).toEqual({
         argsPath: expect.stringMatching(/^\/proc\/\d+\/fd\/\d+$/),
-        namedUnderTmpdir: [],
+        // Empty, and bound with --ro-bind-try: it went aside with its parent
+        // before the command started, and status 0 below is that not
+        // mattering.
+        namedUnderTmpdir: [`srt-mount-points-${process.getuid?.() ?? 0}`],
         planted: null,
         status: 0,
         // The command ran under the profile that was wrapped, not one
