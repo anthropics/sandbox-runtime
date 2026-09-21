@@ -145,9 +145,61 @@ jobs:
           node verify.cjs
           Pop-Location
 
+  verify-package-import:
+    # Proves the package root of a packed tarball loads. `npm run build`
+    # succeeding says the sources compile, not that an installed
+    # dist/index.js imports: a specifier the build does not emit, a file
+    # left out of `files`, or an export removed from src/index.ts would
+    # otherwise reach npm, and the first consumer to hit it. The Windows
+    # job above covers a different thing (resolving and running the
+    # prebuilt srt-win.exe from an installed package).
+    name: Verify package import (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # The import runs the package's whole module graph, so it runs
+          # on a version `engines` claims support for (>=20.11.0).
+          node-version: '20'
+      - run: npm ci
+      - run: npm run build
+      - name: Pack, install into a clean dir, import the package root
+        run: |
+          npm pack
+          PKG="$PWD/$(ls *.tgz)"
+          DIR="$RUNNER_TEMP/pkg-import"
+          mkdir -p "$DIR"
+          cd "$DIR"
+          npm init -y > /dev/null
+          npm install "$PKG"
+          cat > import-check.mjs <<'EOF'
+          import * as srt from '@anthropic-ai/sandbox-runtime'
+          const required = [
+            'SandboxManager',
+            'SandboxViolationStore',
+            'SandboxRuntimeConfigSchema',
+            'getDefaultWritePaths',
+          ]
+          const missing = required.filter(name => srt[name] === undefined)
+          if (missing.length > 0) {
+            console.error(`missing exports: ${missing.join(', ')}`)
+            process.exit(1)
+          }
+          console.log(`package root imported, ${Object.keys(srt).length} named exports`)
+          EOF
+          node import-check.mjs
+
   publish:
     name: Publish to npm
-    needs: [build-seccomp, build-java-agent, build-srt-win, verify-package]
+    needs:
+      [
+        build-seccomp,
+        build-java-agent,
+        build-srt-win,
+        verify-package,
+        verify-package-import,
+      ]
     runs-on: ubuntu-latest
     environment: npm
     steps:
