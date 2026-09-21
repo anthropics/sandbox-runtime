@@ -596,6 +596,65 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       ).toThrow(SubmoduleWalkBudgetError)
     })
 
+    it("denies the same for a linked worktree a submodule's git directory keeps", () => {
+      // `git worktree add` inside a submodule puts the worktree's git
+      // directory under the SUBMODULE's, `.git/modules/<name>/worktrees/<id>`,
+      // and its `commondir` is as writable there as under the repository's
+      // own `.git/worktrees`.
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const submodule = makeGitDir(join(mainGitDir, 'modules', 'lib'))
+      const { worktreeGitDir } = makeLinkedWorktree(
+        submodule,
+        'wt',
+        join(dir, 'lib-wt'),
+      )
+
+      const denies = gitDirTreeDenies(mainGitDir, false)
+      const denyPaths = gitDirTreeDenyPaths(denies)
+
+      for (const name of ['commondir', 'gitdir', 'config.worktree']) {
+        expect(denyPaths).toContain(join(worktreeGitDir, name))
+      }
+      // They belong to the submodule, so a bind of its git directory, which
+      // they are all under, stands in for them where the profile is degraded.
+      const found = denies.submodules.find(each => each.gitDir === submodule)
+      expect(found?.denyPaths).toContain(join(worktreeGitDir, 'commondir'))
+      expect(found?.escapingDenyPaths).not.toContain(
+        join(worktreeGitDir, 'commondir'),
+      )
+    })
+
+    it("carries a submodule's linked worktrees into the macOS entries", () => {
+      const checkout = join(dir, 'main')
+      const mainGitDir = makeGitDir(join(checkout, '.git'))
+      const submodule = makeGitDir(join(mainGitDir, 'modules', 'lib'))
+      const { worktreeGitDir } = makeLinkedWorktree(
+        submodule,
+        'wt',
+        join(dir, 'lib-wt'),
+      )
+
+      process.chdir(checkout)
+      const literals = macGetMandatoryDenyEntries(false, [checkout])
+        .filter(entry => !entry.glob)
+        .map(entry => entry.path)
+
+      expect(literals).toContain(join(worktreeGitDir, 'commondir'))
+      expect(literals).toContain(join(worktreeGitDir, 'gitdir'))
+    })
+
+    it('costs a submodule with no linked worktrees nothing', () => {
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const submodule = makeGitDir(join(mainGitDir, 'modules', 'lib'))
+
+      const denies = gitDirTreeDenies(mainGitDir, false)
+
+      expect(gitDirTreeDenyPaths(denies)).toEqual([
+        ...gitDirDenyPaths(mainGitDir, false),
+        ...gitDirDenyPaths(submodule, false),
+      ])
+    })
+
     it('costs a repository with no linked worktrees nothing', () => {
       // An absent `.git/worktrees` is never denied: a mount point planted at
       // one stops `git worktree add` working in that repository.

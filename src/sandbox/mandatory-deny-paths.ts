@@ -92,6 +92,13 @@ const GIT_OWN_DIRECTORIES = new Set([
 const GIT_PROTECTED_ENTRIES = new Set(['config', 'hooks'])
 
 /**
+ * The entries of a git directory that are files: `config`, and the two that
+ * redirect git to another directory. `hooks` is the fourth entry denied, and a
+ * directory, which {@link GIT_OWN_DIRECTORIES} has.
+ */
+const GIT_ENTRY_FILES = new Set(['config', 'commondir', 'config.worktree'])
+
+/**
  * The narrower set {@link gitDirKind} goes by, for a directory that file
  * content names; see there for why `config` and `hooks` are not in it and
  * `commondir` is.
@@ -955,10 +962,39 @@ export function gitDirTreeDenies(
     options.deadline ?? Date.now() + DEFAULT_SUBMODULE_WALK_TIMEOUT_MS
   const modules = submoduleGitDirs(modulesDir, deadline)
   const own = gitDirDenies(gitDir, allowGitConfig, deadline)
-  const submodules = modules.gitDirs.map(submodule => ({
-    gitDir: submodule,
-    ...gitDirDenies(submodule, allowGitConfig, deadline),
-  }))
+  const submoduleUnreadableDirs: string[] = []
+  const submodules = modules.gitDirs.map(submodule => {
+    const own = gitDirDenies(submodule, allowGitConfig, deadline)
+    // `git worktree add` inside a submodule keeps the worktree's git directory
+    // under the SUBMODULE's, and its `commondir` redirects git there as one
+    // under the repository's own `worktrees` does. What is found belongs to
+    // the submodule: it is all under its git directory, so a bind of that
+    // stands in for it where the profile is degraded, except what a
+    // `commondir` names, which is kept as escaping.
+    const kept = worktreeGitDirs(submodule, allowGitConfig, deadline)
+    submoduleUnreadableDirs.push(...kept.unreadableDirs)
+    return {
+      gitDir: submodule,
+      denyPaths: [
+        ...own.denyPaths,
+        ...kept.gitDirs.flatMap(worktree => worktree.denyPaths),
+      ],
+      escapingDenyPaths: [
+        ...own.escapingDenyPaths,
+        ...kept.gitDirs.flatMap(worktree => worktree.escapingDenyPaths),
+      ],
+      linkedEntryDirs: [
+        ...own.linkedEntryDirs,
+        ...kept.linkedEntryDirs,
+        ...kept.gitDirs.flatMap(worktree => worktree.linkedEntryDirs),
+      ],
+      chainHops: [
+        ...own.chainHops,
+        ...kept.chainHops,
+        ...kept.gitDirs.flatMap(worktree => worktree.chainHops),
+      ],
+    }
+  })
   const worktrees = worktreeGitDirs(gitDir, allowGitConfig, deadline)
   return {
     ownDenyPaths: own.denyPaths,
@@ -966,7 +1002,11 @@ export function gitDirTreeDenies(
     submodules,
     worktreesDir: worktrees.worktreesDir,
     worktrees: worktrees.gitDirs,
-    unreadableDirs: [...modules.unreadableDirs, ...worktrees.unreadableDirs],
+    unreadableDirs: [
+      ...modules.unreadableDirs,
+      ...submoduleUnreadableDirs,
+      ...worktrees.unreadableDirs,
+    ],
     linkedEntryDirs: [
       ...own.linkedEntryDirs,
       ...modules.linkedEntryDirs,
@@ -1172,6 +1212,11 @@ export function submoduleGitDirs(
       if (item.gitDir === true) {
         // Queued when the git directory was recorded.
         if (entry.name === 'modules') continue
+        // A link at `config`, `commondir` or `config.worktree` is read as
+        // this git directory's entry by what denies it, which holds both ends
+        // of it (see gitDirDenies). Following it here as well would walk the
+        // same chain a second time and take what it leads to for a submodule.
+        if (entry.isSymbolicLink() && GIT_ENTRY_FILES.has(entry.name)) continue
         // One of git's own directories by its name: walked on only where one
         // listing of it shows something this file protects, which is what a
         // submodule's git directory that has such a name shows and git's own

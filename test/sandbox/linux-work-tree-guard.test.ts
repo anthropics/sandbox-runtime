@@ -360,13 +360,16 @@ describe.if(isLinux)('a git entry whose link chain is a loop', () => {
     // The link itself is held by the git directory around it.
     expect(readOnlyBinds(command)).toContain(nestedGitDir)
     expect(readOnlyBinds(command)).not.toContain(checkout)
-    expect(
-      warnings.filter(
-        w =>
-          w.includes(join(nestedGitDir, 'hooks')) &&
-          w.includes(join(checkout, 'a')),
-      ).length,
-    ).toBeGreaterThan(0)
+    const told = warnings.filter(
+      w =>
+        w.includes(join(nestedGitDir, 'hooks')) &&
+        w.includes(join(checkout, 'a')),
+    )
+    expect(told.length).toBeGreaterThan(0)
+    // Said as what it is: this chain reaches nothing, so there is nothing it
+    // "reaches what it denies through".
+    expect(told[0]).toContain('leads nowhere')
+    expect(told[0]).not.toContain('reaches what it denies')
   })
 
   it('warns and wraps for a modules that was not there', async () => {

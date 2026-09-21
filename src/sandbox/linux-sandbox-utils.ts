@@ -1033,7 +1033,9 @@ function guardedDenyPlan(
       .map(hop =>
         hop.kind === 'pointer'
           ? `the git directory ${hop.source} names is reached through ${hop.link}`
-          : `${hop.source} reaches what it denies through ${hop.link}`,
+          : hop.chain === 'unresolvable'
+            ? `${hop.source} leads nowhere, through ${hop.link}`
+            : `${hop.source} reaches what it denies through ${hop.link}`,
       )
       .join('; ')
     const holders = [...new Set(unheld.map(hop => hop.holder))].join(', ')

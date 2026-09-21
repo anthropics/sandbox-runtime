@@ -226,6 +226,30 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
     },
   )
 
+  it.if(!isWindows)(
+    'leaves a link at one of a git directory own entries to that directory',
+    () => {
+      // `config`, `commondir` and `config.worktree` are read as the git
+      // directory's entries, a link at one included, by what denies them, and
+      // both ends of such a link are held there. Followed here as well, the
+      // same chain would be walked a second time and what it leads to taken
+      // for a submodule of its own.
+      const sub = makeGitDir(join(modules, 'sub'))
+      const elsewhere = makeGitDir(join(dir, 'elsewhere'))
+      rmSync(join(sub, 'config'))
+      symlinkSync(elsewhere, join(sub, 'config'))
+      symlinkSync(elsewhere, join(sub, 'commondir'))
+      symlinkSync(elsewhere, join(sub, 'config.worktree'))
+
+      expect(submoduleGitDirs(modules)).toEqual({
+        gitDirs: [sub],
+        unreadableDirs: [],
+        linkedEntryDirs: [],
+        chainHops: [],
+      })
+    },
+  )
+
   it('walks what else a git directory holds, and finds nothing in an ordinary one', () => {
     // Directories that are neither git's own large ones nor `modules`: the
     // empty `branches` of an older template, a rebase in progress.
