@@ -385,6 +385,9 @@ export interface GitDirDenies {
  * as well, and `chainHops` carries the directory holding each for the backend
  * that needs one — see {@link GitChainHop}.
  *
+ * `modules` is checked for being a link as well, though it is no deny path of
+ * its own: see the comment at the end of this function.
+ *
  * An ordinary git directory costs one lstat per entry and is denied by exactly
  * what it always was.
  */
@@ -476,6 +479,39 @@ export function gitDirDenies(
         holdChain(entryPath, entry.hops, 'resolved')
         break
     }
+  }
+  // `modules` is not one of the deny paths - denying it whole would take
+  // every submodule git directory under it read-only, and each of those has
+  // precise denies of its own - but it is an entry like the others in the one
+  // respect that matters here: remove the link, put a directory of your own
+  // where it was, and every submodule git directory this repository keeps is
+  // one nothing denied. So it is held the way a chain hop is, and for the
+  // same reason: its own name, which is what a rename or an unlink of a link
+  // uses, and the directory holding it - this git directory - denied whole
+  // for the backend whose denies resolve, where a bind at the link's own path
+  // would land on the modules tree and take every submodule with it.
+  const modulesPath = path.join(gitDir, 'modules')
+  const modules = gitDirEntry(modulesPath)
+  switch (modules.kind) {
+    case 'plain':
+      break
+    case 'link':
+    case 'unknown':
+      denyWhole = true
+      denyPaths.push(modulesPath)
+      chainHops.push({
+        kind: 'entry',
+        chain: 'resolved',
+        source: modulesPath,
+        link: modulesPath,
+        holder: undefined,
+      })
+      holdChain(modulesPath, modules.hops, 'resolved')
+      break
+    case 'unreachable':
+      denyWhole = true
+      holdChain(modulesPath, modules.hops, 'unresolvable')
+      break
   }
   return {
     denyPaths,
