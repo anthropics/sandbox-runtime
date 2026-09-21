@@ -71,7 +71,8 @@
  * fails the build rather than being left out: a filter missing one of these is
  * a filter that does not do what its name says.
  */
-static int add_namespace_rules(scmp_filter_ctx ctx, int native) {
+static int add_namespace_rules(scmp_filter_ctx ctx, int native,
+                               const char *arch_name) {
     int rc;
 
     /* The flags word is arg0 of unshare(2), and of clone(2) on both
@@ -138,17 +139,17 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native) {
 
     /* Two calls newer than the libseccomp some builders have: mount_setattr
      * (Linux 5.12, named from libseccomp 2.5.2) and open_tree_attr (Linux
-     * 6.15), which is open_tree with mount_setattr's changes in one call.
-     * Where the library cannot name one it goes in by number, which is the
-     * same on every architecture for each call added since Linux 5.1. That
-     * works only for the builder's own architecture: libseccomp translates
-     * a call between architectures by name, and refuses a bare number for
-     * another one. So for the other architecture the call is left out,
-     * which costs nothing: a build compiles in its own architecture's filter
-     * and no other. What either call could do needs CAP_SYS_ADMIN over the
-     * mount namespace, the kernel does not let the read-only flag of a mount
-     * copied across a user namespace be cleared, and a tree open_tree_attr
-     * clones can only be attached with move_mount, which is refused above. */
+     * 6.15, named from 2.6.1), which is open_tree with mount_setattr's
+     * changes in one call. Where the library cannot name one it goes in by
+     * number, which is the same on every architecture for each call added
+     * since Linux 5.1. That works only for the builder's own architecture:
+     * libseccomp carries a call from one architecture to another by name and
+     * refuses a bare number for another one. Emitting for another
+     * architecture with a library that cannot name the call is therefore an
+     * error, never a filter with the call left out: a filter that is quietly
+     * weaker on one architecture is the one outcome worth a failed build. A
+     * libseccomp that names both, or generating each architecture's filter
+     * on that architecture, avoids it. */
     static const struct {
         const char *name;
         int nr;
@@ -160,7 +161,15 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native) {
         int nr = seccomp_syscall_resolve_name(newer[i].name);
         if (nr == __NR_SCMP_ERROR) {
             if (!native) {
-                continue;
+                const struct scmp_version *v = seccomp_version();
+                fprintf(stderr,
+                        "Error: libseccomp %u.%u.%u cannot name %s, and a call can "
+                        "go in by number only for the builder's own architecture, "
+                        "not for %s. Build with a libseccomp that names it, or "
+                        "generate this architecture's filter on that architecture.\n",
+                        v ? v->major : 0, v ? v->minor : 0, v ? v->micro : 0,
+                        newer[i].name, arch_name);
+                return -1;
             }
             nr = newer[i].nr;
         }
@@ -264,7 +273,7 @@ int main(int argc, char *argv[]) {
     }
 
     rc = strcmp(rule_set, "namespaces") == 0
-             ? add_namespace_rules(ctx, native)
+             ? add_namespace_rules(ctx, native, arch_name ? arch_name : "native")
              : add_unix_rules(ctx);
     if (rc < 0) {
         seccomp_release(ctx);
