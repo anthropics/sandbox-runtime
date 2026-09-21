@@ -280,6 +280,68 @@ const annotated = SandboxManager.annotateStderrWithSandboxFailures(
 )
 ```
 
+**Asking about a host no rule decides (the ask callback).** The second argument to `SandboxManager.initialize` is an optional `SandboxAskCallback`. It is asked about a destination that neither `network.deniedDomains`, nor `network.allowedDomains`, nor a per-command allow list (next section) decided, and it is never asked under `network.strictAllowlist`. Without a callback such a destination is denied. The callback resolves to one of:
+
+- `true` - allow the connection. Only the value `true` allows.
+- `false` - deny it. The violation line reports the generic reason `user denied`.
+- `{ allow: false, reason: '...' }` - deny it, and report `reason` in the violation line in place of the generic text, so that whoever reads the `<sandbox_violations>` block (a model included) learns why and what to do instead.
+
+Any other answer denies, whether it is truthy or not, and reports the generic reason. That includes an object that carries a `reason` without saying `allow: false`, such as `{ allow: true, reason: '...' }`: its reason is not reported.
+
+The reason is sanitized before it is stored, the way the rest of a violation line is. Each run of control characters (line breaks and tabs included) or of invisible ones (zero-width characters, the joiner among them, and bidi controls) becomes one space; `<` and `>` are removed, so `re-run with <host> listed` is stored as `re-run with host listed`; the ends are trimmed. The result is cut to 500 characters, counted as UTF-16 code units the way `String.prototype.length` counts them. A reason with nothing left after that falls back to `user denied`. Write it as one line of plain text.
+
+**Behaviour change in the first release after v0.0.77:** the filter used to allow on any truthy answer, so a callback that resolved to a truthy value other than `true` (`1`, a string, any object) allowed the connection. It now denies. For the same reason, `{ allow: false, reason }` returned to an older release would be read there as an allow, because an object is truthy. `SandboxManager.askCallbackDenyReason` is `true` on a release that understands the object: check it before returning one, and deny with a plain `false` where it is absent.
+
+```typescript
+const deny = (reason: string) =>
+  SandboxManager.askCallbackDenyReason
+    ? { allow: false as const, reason }
+    : false
+
+await SandboxManager.initialize(config, async ({ host, port }) => {
+  if (await userApproves(host, port)) return true
+  return deny(`${host} was not approved for this session`)
+})
+```
+
+**Per-command network allow lists (`registerCommandNetworkLists`).** One invocation can carry an allow list of its own, in addition to the configured one, for as long as it runs:
+
+```typescript
+import { randomBytes } from 'node:crypto'
+
+// 128 bits of randomness, 22 characters. See below for why nothing less will do.
+const commandId = randomBytes(16).toString('base64url')
+const wrapped = await SandboxManager.wrapWithSandbox(
+  command,
+  undefined,
+  undefined,
+  undefined,
+  { commandId },
+)
+
+SandboxManager.registerCommandNetworkLists(commandId, {
+  allowedDomains: ['registry.example.org', '*.cdn.example.org:443'],
+})
+const child = spawn(wrapped, { shell: true })
+const unregister = () => SandboxManager.unregisterCommandNetworkLists(commandId)
+child.once('exit', unregister)
+child.once('error', unregister) // the child never started
+```
+
+Entries use the grammar and the matcher of `network.allowedDomains` and get the same validation. `registerCommandNetworkLists` throws on an invalid entry, and on a `commandId` shorter than 22 characters. Registering an id again replaces its list; `unregisterCommandNetworkLists` is a no-op for an id that has none; `reset()` removes every registration.
+
+The order of evaluation for a connection is:
+
+1. a `network.deniedDomains` match denies;
+2. a `network.allowedDomains` match allows;
+3. `network.strictAllowlist` denies;
+4. a match in the list registered for the id the connection presents allows;
+5. the ask callback decides if there is one, and otherwise the connection is denied.
+
+So a per-command entry never overrides a configured `deniedDomains` entry, and is ignored entirely under `strictAllowlist`. It never enters `network.*` either: `getConfig()` and `getNetworkRestrictionConfig()` do not show it, and the default `injectHosts` scope of a masked credential, which is `network.allowedDomains`, does not grow. A host allowed this way still goes through the resolved-address check when it is dialed, and an IP literal in a per-command list adds no exemption there.
+
+What the id has to be, and what this feature is not: the proxy learns which invocation a connection belongs to from the proxy username, and the username is presented by the client inside the sandbox. The id is therefore the **only** thing binding a connection to an allow list. It **must** be unguessable: at least 128 bits of randomness, never a counter, a timestamp or anything derived from the command. A sandboxed process that presents another live invocation's id gets that invocation's allows, so this is attribution, not a boundary between concurrent commands of one session. Register just before spawning the wrapped command, and unregister when the child exits or never started: a registration that outlives its command widens the window in which its id is worth presenting. As with every attribution key, only the first 100 characters of an id take part.
+
 #### Available exports
 
 ```typescript
