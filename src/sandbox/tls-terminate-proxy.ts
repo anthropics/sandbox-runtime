@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Duplex, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
+import { drainThenDestroy } from './drain-then-destroy.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
@@ -384,19 +385,6 @@ function isStaleSocketError(err: Error): boolean {
   return code === 'ECONNRESET' || code === 'EPIPE'
 }
 
-/**
- * Destroy a denied client's request only after the 403 has flushed —
- * destroying the shared socket in the same tick can RST the response away.
- */
-function destroyAfterDenial(req: IncomingMessage, res: ServerResponse): void {
-  if (res.writableFinished || res.destroyed) {
-    req.destroy()
-    return
-  }
-  res.once('finish', () => req.destroy())
-  res.once('close', () => req.destroy())
-}
-
 function forwardUpstreamGuarded(
   ...args: Parameters<typeof forwardUpstream>
 ): void {
@@ -517,7 +505,7 @@ async function forwardUpstream(
   if (sigv4Plan?.action === 'deny') {
     respondDenied(res, sigv4Plan.reason)
     body.destroy()
-    if (body !== req) destroyAfterDenial(req, res)
+    if (body !== req) drainThenDestroy(req, res)
     return
   }
   if (sigv4Plan?.action === 'resign') {
@@ -576,7 +564,7 @@ async function forwardUpstream(
         `AWS SigV4 re-signing failed: ${(err as Error).message}`,
       )
       body.destroy()
-      if (body !== req) destroyAfterDenial(req, res)
+      if (body !== req) drainThenDestroy(req, res)
       return
     }
   }
