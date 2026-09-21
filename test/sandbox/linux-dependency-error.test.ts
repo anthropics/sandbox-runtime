@@ -35,7 +35,8 @@ const bwrapExiting = (status: number, stderr = '') =>
 // that are not that version probe.
 const capabilityProbes = (): unknown[] =>
   spawnSyncSpy.mock.calls.filter(
-    call => !(Array.isArray(call[1]) && call[1].includes('--version')),
+    (call: unknown[]) =>
+      !(Array.isArray(call[1]) && call[1].includes('--version')),
   )
 
 beforeEach(() => {

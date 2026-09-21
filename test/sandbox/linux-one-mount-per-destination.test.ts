@@ -339,12 +339,16 @@ describe.if(isLinux)('One mount per destination', () => {
         ? [index]
         : [],
     )
-    const denyBind = argv.findLastIndex(
-      (word, index) =>
-        word === '--ro-bind' &&
-        argv[index + 1] === PROJ &&
-        argv[index + 2] === PROJ,
-    )
+    // The last such bind. Array.prototype.findLastIndex is ES2023, and the
+    // tests compile against the ES2020 library.
+    const denyBind = argv
+      .map(
+        (word, index) =>
+          word === '--ro-bind' &&
+          argv[index + 1] === PROJ &&
+          argv[index + 2] === PROJ,
+      )
+      .lastIndexOf(true)
     expect(masks.length).toBe(2)
     expect(masks[0]).toBeLessThan(denyBind)
     expect(masks[1]).toBeGreaterThan(denyBind)
