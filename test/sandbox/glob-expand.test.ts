@@ -16,6 +16,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  containsGlobChars,
   expandGlobPattern,
   expandTilde,
   globPatternBaseDir,
@@ -788,6 +789,37 @@ describe('containsGlobCharsWin', () => {
   it('still routes * and ? to glob expansion', () => {
     expect(containsGlobCharsWin('C:\\app\\*.env')).toBe(true)
     expect(containsGlobCharsWin('C:\\app\\?.env')).toBe(true)
+  })
+})
+
+// ============================================================================
+// containsGlobChars — absolute / ~-rooted paths with [ ] alone are literal (#576)
+// ============================================================================
+
+describe('containsGlobChars', () => {
+  it('treats an absolute path with brackets alone as literal', () => {
+    expect(containsGlobChars('/w/project[1]/secret.txt')).toBe(false)
+    expect(containsGlobChars('/srv/[ab]/secrets')).toBe(false)
+  })
+
+  it('treats a ~-rooted path with brackets alone as literal', () => {
+    expect(containsGlobChars('~/project[1]/secret.txt')).toBe(false)
+  })
+
+  it('still treats a relative path with brackets as a glob', () => {
+    expect(containsGlobChars('[ab]/secrets')).toBe(true)
+    expect(containsGlobChars('logs/[0-9].txt')).toBe(true)
+  })
+
+  it('still routes * and ? to glob expansion on absolute paths', () => {
+    expect(containsGlobChars('/tmp/*.env')).toBe(true)
+    expect(containsGlobChars('/tmp/file?.txt')).toBe(true)
+    expect(containsGlobChars('/srv/[ab]/secret*')).toBe(true)
+  })
+
+  it('does not treat plain paths as globs', () => {
+    expect(containsGlobChars('/tmp/secret.txt')).toBe(false)
+    expect(containsGlobChars('relative/path')).toBe(false)
   })
 })
 
