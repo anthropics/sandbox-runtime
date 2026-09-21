@@ -14,6 +14,7 @@ import {
   bwrapCanDisableUserns,
   checkLinuxDependencies,
   cleanupBwrapMountPoints,
+  HELPER_FEATURES_PROBE_ARGUMENT,
   planUsernsLimit,
   probeSeccompHelperFeatures,
   wrapCommandWithSandboxLinux,
@@ -160,17 +161,18 @@ describe.if(isLinux)(
     })
 
     it.if(APPLY_SECCOMP !== null)(
-      'hands the helper the variable only when the configuration allows namespaces, and after clearing it',
+      'starts the helper with both variables assigned on its own command line, from the configuration',
       async () => {
-        expect(await wrap('true')).not.toContain(
-          '--setenv SRT_ALLOW_NESTED_USERNS',
+        // An assignment before a command holds whatever ran between bubblewrap
+        // clearing the variable and the helper starting, a shell start-up
+        // file the caller's environment names included.
+        const helper = APPLY_SECCOMP!
+        expect(await wrap('true')).toContain(
+          `SRT_ALLOW_NESTED_USERNS=0 SRT_HELPER_FEATURES=0 ${helper}`,
         )
-        const allowed = await wrap('true', { allowNestedUserNamespaces: true })
-        expect(allowed).toContain('--setenv SRT_ALLOW_NESTED_USERNS 1')
-        // bubblewrap applies environment operations in argument order.
         expect(
-          allowed.indexOf('--unsetenv SRT_ALLOW_NESTED_USERNS'),
-        ).toBeLessThan(allowed.indexOf('--setenv SRT_ALLOW_NESTED_USERNS 1'))
+          await wrap('true', { allowNestedUserNamespaces: true }),
+        ).toContain(`SRT_ALLOW_NESTED_USERNS=1 SRT_HELPER_FEATURES=0 ${helper}`)
       },
     )
 
@@ -289,6 +291,21 @@ describe.if(isLinux)(
       },
     )
 
+    it("asks with a name no PATH is searched for, and asks nothing of a helper that is part of the caller's binary", () => {
+      // A helper that does not know the question tries to run its argument,
+      // on the host. With a slash in it no PATH is searched, and nothing can
+      // be created in the root of procfs.
+      expect(HELPER_FEATURES_PROBE_ARGUMENT).toMatch(/^\/proc\/[^/]+$/)
+      // Its applyPath only has to mean something inside the sandbox, so it is
+      // not run from here at all: /bin/true would answer, and is not asked.
+      const embedded = { argv0: 'apply-seccomp', applyPath: '/bin/true' }
+      expect(probeSeccompHelperFeatures(embedded)).toBeNull()
+      expect(
+        checkLinuxDependencies({ seccompConfig: embedded }).features
+          ?.usernsLimit,
+      ).toBe('unknown')
+    })
+
     it('a helper that does not answer the question is reported by code, not only in words', () => {
       // Stands in for one built before the question existed: it ignores the
       // variable and fails to run the name it was given.
@@ -325,9 +342,9 @@ describe.if(isLinux)(
         })
         const said = `${result.stdout}${result.stderr}`
         expect(said).toContain('in-the-sandbox-namespaces: refused EBUSY')
-        expect(said).toMatch(
-          /new-namespaces: refused (EPERM|ENOSPC) at unshare/,
-        )
+        // EPERM, the filter's answer, which comes before the kernel looks at
+        // the limit (that one reads ENOSPC, as in the arm with no helper).
+        expect(said).toContain('new-namespaces: refused EPERM at unshare')
         expect(said).not.toContain('in-its-own-namespaces: replaced')
         expect(hostConfig()).toBe(ORIGINAL)
       },
@@ -335,30 +352,88 @@ describe.if(isLinux)(
     )
 
     it.if(CAN_RUN_CHAIN && APPLY_SECCOMP !== null)(
-      'with the helper: both means are in force, and clone3 sends its caller to clone (live bwrap)',
+      'with the helper: both means are in force, each call answered by the filter and not by the kernel (live bwrap)',
       async () => {
+        // Every call below is made so that the kernel, asked, would say
+        // something other than EPERM to a command with no capabilities: bad
+        // arguments are looked at before permission, open_tree of "/" needs
+        // none, and a second user namespace under a limit of zero is ENOSPC.
+        // So EPERM is the filter, and a filter missing a rule shows here.
+        const probe = [
+          'import ctypes, errno, os, platform',
+          'libc = ctypes.CDLL(None, use_errno=True)',
+          'arch = platform.machine()',
+          "NR = {'clone': {'x86_64': 56, 'aarch64': 220}[arch], 'setns': {'x86_64': 308, 'aarch64': 268}[arch],",
+          "      'unshare': {'x86_64': 272, 'aarch64': 97}[arch], 'clone3': 435, 'open_tree': 428, 'mount_setattr': 442}",
+          'def said(label, rc):',
+          "    print(label, 'ok' if rc >= 0 else errno.errorcode.get(ctypes.get_errno()))",
+          "print('limit', open('/proc/sys/user/max_user_namespaces').read().strip())",
+          'NEWUSER, SIGCHLD, AT_FDCWD = 0x10000000, 17, -100',
+          "said('unshare', libc.unshare(NEWUSER))",
+          // High bits set beside the flag: the rule masks, it does not compare.
+          "said('unshare-high-bits', libc.syscall(NR['unshare'], ctypes.c_ulong(NEWUSER | (1 << 40))))",
+          "said('clone', libc.syscall(NR['clone'], ctypes.c_ulong(NEWUSER | SIGCHLD), None, None, None, None))",
+          "said('clone3', libc.syscall(NR['clone3'], None, 0))",
+          "said('setns', libc.syscall(NR['setns'], -1, 0))",
+          "said('open_tree', libc.syscall(NR['open_tree'], AT_FDCWD, b'/', 0))",
+          "said('mount', libc.mount(None, None, None, 0, None))",
+          "said('umount2', libc.umount2(None, 0))",
+          "said('mount_setattr', libc.syscall(NR['mount_setattr'], -1, b'', 0, None, 0))",
+          // Not refused: a plain fork.
+          'pid = os.fork()',
+          'if pid == 0: os._exit(0)',
+          "said('fork', os.waitpid(pid, 0)[1])",
+        ].join('\n')
+        writeFileSync(join(BASE, 'probe.py'), probe)
+        const result = run(await wrap(`${PYTHON} ${join(BASE, 'probe.py')}`))
+        const said = `${result.stdout}${result.stderr}`
+        expect(said).toContain('limit 0')
+        for (const call of [
+          'unshare',
+          'unshare-high-bits',
+          'clone',
+          'setns',
+          'open_tree',
+          'mount',
+          'umount2',
+          'mount_setattr',
+        ]) {
+          expect(said).toContain(`${call} EPERM`)
+        }
+        expect(said).toContain('clone3 ENOSYS')
+        expect(said).toContain('fork ok')
+      },
+      60000,
+    )
+
+    it.if(CAN_RUN_CHAIN)(
+      "the same calls get the kernel's own answers where nothing refuses them, so EPERM above is the filter (live bwrap)",
+      async () => {
+        // The control for the test above: no helper, and namespaces allowed,
+        // so neither the filter nor bubblewrap's limit is there.
         const probe = [
           'import ctypes, errno, platform',
           'libc = ctypes.CDLL(None, use_errno=True)',
-          "print('limit', open('/proc/sys/user/max_user_namespaces').read().strip())",
-          // clone3 with a null argument: a kernel that ran it would say
-          // EFAULT or EINVAL, the filter says ENOSYS.
-          "rc = libc.syscall({'x86_64': 435, 'aarch64': 435}[platform.machine()], None, 0)",
-          "print('clone3', errno.errorcode.get(ctypes.get_errno()))",
-          "rc = libc.mount(b'tmpfs', b'/tmp', b'tmpfs', 0, None)",
-          "print('mount', errno.errorcode.get(ctypes.get_errno()))",
+          'arch = platform.machine()',
+          'def said(label, rc):',
+          "    print(label, 'ok' if rc >= 0 else errno.errorcode.get(ctypes.get_errno()))",
+          "said('setns', libc.syscall({'x86_64': 308, 'aarch64': 268}[arch], -1, 0))",
+          "said('open_tree', libc.syscall(428, -100, b'/', 0))",
+          "said('mount', libc.mount(None, None, None, 0, None))",
+          "said('mount_setattr', libc.syscall(442, -1, b'', 0, None, 0))",
         ].join('\n')
-        writeFileSync(join(BASE, 'probe.py'), probe)
+        writeFileSync(join(BASE, 'control.py'), probe)
         const result = run(
-          await wrap(
-            `${PYTHON} ${join(BASE, 'probe.py')}; unshare -Ur true; echo unshare-rc=$?`,
-          ),
+          await wrap(`${PYTHON} ${join(BASE, 'control.py')}`, {
+            allowAllUnixSockets: true,
+            allowNestedUserNamespaces: true,
+          }),
         )
         const said = `${result.stdout}${result.stderr}`
-        expect(said).toContain('limit 0')
-        expect(said).toContain('clone3 ENOSYS')
-        expect(said).toContain('mount EPERM')
-        expect(said).toMatch(/unshare-rc=[1-9]/)
+        expect(said).toContain('setns EBADF')
+        expect(said).toContain('open_tree ok')
+        expect(said).not.toContain('mount EPERM')
+        expect(said).not.toContain('mount_setattr EPERM')
       },
       60000,
     )
@@ -384,11 +459,15 @@ describe.if(isLinux)(
       'with the helper and namespaces allowed: the same chain does replace the file (live bwrap)',
       async () => {
         const result = run(
-          await wrap(`${PYTHON} ${SCRIPT} ${PROJECT}`, {
-            allowNestedUserNamespaces: true,
-          }),
+          await wrap(
+            `echo "seen=[\${SRT_ALLOW_NESTED_USERNS:-unset}]"; ${PYTHON} ${SCRIPT} ${PROJECT}`,
+            { allowNestedUserNamespaces: true },
+          ),
         )
         const said = `${result.stdout}${result.stderr}`
+        // The helper was told, and took the variable out again before the
+        // command: it is the helper's business, not the command's.
+        expect(said).toContain('seen=[unset]')
         expect(said).toContain('new-namespaces: ok')
         expect(said).toContain('in-its-own-namespaces: replaced')
         // This is what the refusals above prevent.

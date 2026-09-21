@@ -9,6 +9,7 @@ import {
   capabilityArgs,
   checkLinuxDependencies,
   getLinuxDependencyStatus,
+  HELPER_FEATURES_PROBE_ARGUMENT,
   processHasBoundingCapability,
   uid0SandboxError,
 } from '../../src/sandbox/linux-sandbox-utils.js'
@@ -31,7 +32,7 @@ const bwrapExiting = (status: number, stderr = '') =>
   ({ status, signal: null, pid: 1, output: [], stdout: '', stderr }) as never
 
 // The one argument the seccomp helper is run with to ask what it supports.
-const HELPER_QUESTION = '--srt-helper-features'
+const HELPER_QUESTION = HELPER_FEATURES_PROBE_ARGUMENT
 // Every spawn that was not that question, i.e. every probe of bubblewrap.
 const bwrapProbes = () =>
   (spawnSyncSpy.mock.calls as unknown[][]).filter(
