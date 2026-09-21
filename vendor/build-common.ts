@@ -3,7 +3,11 @@ import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const nodeArchToDir: Record<string, string> = { x64: 'x64', arm64: 'arm64' }
+const nodeArchToDir: Record<string, string> = {
+  x64: 'x64',
+  arm64: 'arm64',
+  ppc64: 'ppc64le', // Node.js reports 'ppc64' on ppc64le Linux; our BPF is LE-only
+}
 
 /**
  * Common preamble for `vendor/<helper>/build.ts` scripts: platform
