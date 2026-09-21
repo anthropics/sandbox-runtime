@@ -2,7 +2,11 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import { createServer as createHttpsServer } from 'node:https'
 import { connect, type AddressInfo, type Server, type Socket } from 'node:net'
 import type { LookupFunction } from 'node:net'
-import { connect as tlsConnect, type TLSSocket } from 'node:tls'
+import {
+  connect as tlsConnect,
+  type ConnectionOptions,
+  type TLSSocket,
+} from 'node:tls'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
@@ -36,8 +40,14 @@ function openTunnel(
     })
     raw.once('error', reject)
     raw.once('data', () => {
-      const tls = tlsConnect(
-        { socket: raw, ca: CA_PEM, servername: host },
+      // `connect` from 'node:tls' is untyped under the Bun type package with
+      // @types/node 22, so the options and the socket are typed here.
+      const tls: TLSSocket = tlsConnect(
+        {
+          socket: raw,
+          ca: CA_PEM,
+          servername: host,
+        } satisfies ConnectionOptions,
         () => resolve(tls),
       )
       tls.once('error', reject)

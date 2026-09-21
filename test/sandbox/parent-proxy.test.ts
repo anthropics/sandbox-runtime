@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { connect } from 'node:net'
+import type { ConnectionOptions } from 'node:tls'
 import {
   canonicalizeHost,
   isValidHost,
@@ -11,6 +12,16 @@ import {
   stripBrackets,
   stripHopByHop,
 } from '../../src/sandbox/parent-proxy.js'
+
+// Checked by `tsc -p tsconfig.test.json`, not at run time. The TLS dial in
+// parent-proxy.ts, and the tests that open a TLS connection themselves, pin
+// their options with `satisfies ConnectionOptions`, because `connect` from
+// 'node:tls' accepts any value under the Bun type package. That only checks
+// anything while ConnectionOptions is itself a real type. If it ever resolves
+// to an untyped value as well, the line below compiles, its directive goes
+// unused, and the typecheck fails.
+// @ts-expect-error -- 'servernme' is not an option, so this must not compile
+void ({ servernme: 'proxy.example' } satisfies ConnectionOptions)
 
 describe('parent-proxy: resolveParentProxy', () => {
   const saved: Record<string, string | undefined> = {}

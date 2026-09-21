@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.test.json",
+  "compilerOptions": {
+    "rootDir": "../.."
+  },
+  "include": ["embedder.ts", "run-bundled.ts"],
+  "exclude": []
+}
