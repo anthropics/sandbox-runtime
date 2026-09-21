@@ -171,8 +171,25 @@ describe('ripGrep', () => {
 
       expect(error).toBeInstanceOf(RipgrepError)
       expect((error as RipgrepError).timedOut).toBe(false)
+      // A caller deciding whether the listing can be used at all asks this,
+      // not `timedOut`: the run stopped where the kill arrived either way.
+      expect((error as RipgrepError).killed).toBe(true)
+      expect((error as RipgrepError).killedBy).toBe('SIGTERM')
       expect((error as Error).message).toContain('SIGTERM')
       expect((error as Error).message).toContain('inside the 60000 ms')
+    },
+  )
+
+  it.if(!isWindows)(
+    'says a run that exited on its own was not killed',
+    async () => {
+      const error = await ripGrep([], '.', new AbortController().signal, {
+        command: '/bin/sh',
+        args: ['-c', 'printf "/found/a\\0"; exit 2'],
+      }).catch((e: unknown) => e)
+
+      expect((error as RipgrepError).killed).toBe(false)
+      expect((error as RipgrepError).killedBy).toBeUndefined()
     },
   )
 

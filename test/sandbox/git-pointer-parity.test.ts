@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -196,7 +197,11 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
    * end in a space or hold a newline of its own — or undefined when it
    * failed, which for `rev-parse` here means it did not follow the pointer.
    */
-  function runGit(cwd: string, args: string[]): string | undefined {
+  function runGit(
+    cwd: string,
+    args: string[],
+    options: { runHooks?: boolean } = {},
+  ): string | undefined {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       HOME: root,
@@ -222,7 +227,17 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     }
     const result = spawnSync(
       'git',
-      ['-c', 'core.fsmonitor=', '-c', 'core.hooksPath=/dev/null', ...args],
+      [
+        '-c',
+        'core.fsmonitor=',
+        // Nothing here is about running hooks, and a target these cases
+        // write is not a directory to let git execute out of — except the
+        // one case that IS about a hooks link, which asks for them.
+        ...(options.runHooks === true
+          ? []
+          : ['-c', 'core.hooksPath=/dev/null']),
+        ...args,
+      ],
       { cwd, env, encoding: 'utf8' },
     )
     if (result.status !== 0) return undefined
@@ -691,6 +706,77 @@ describe.if(!isWindows && HAS_GIT)('git pointer parsing parity', () => {
     expect(gitResolves(checkout, '--absolute-git-dir')).toBeUndefined()
     expect(gitFileDenyPaths(pointer, false)).toContain(join(lexical, 'hooks'))
   })
+
+  it('opens nothing through a pointer value that runs into a loop', () => {
+    // What git does with one, recorded: it follows the value the way the
+    // kernel does, gives up on the loop, and does NOT fall back to anything -
+    // not the lexical fold, and not the checkout. So there is no directory
+    // whose hooks a deny has to cover, and the deny list says so: the pointer
+    // file, and the links the walk went through, which are what a command
+    // replaces to make the value reach a directory after all. The checkout
+    // itself is not denied, or a command that wrote this file would leave
+    // every command after it unable to write the project.
+    const caseDir = join(root, `pointer-${caseCount++}`)
+    const checkout = join(caseDir, 'checkout')
+    mkdirSync(checkout, { recursive: true })
+    makeGitDir(join(checkout, 'evil'))
+    const first = join(checkout, 'loopA')
+    const second = join(checkout, 'loopB')
+    symlinkSync('loopB', first)
+    symlinkSync('loopA', second)
+    const pointer = join(checkout, '.git')
+    writeFileSync(pointer, 'gitdir: loopA/../evil\n')
+
+    expect(gitResolves(checkout, '--absolute-git-dir')).toBeUndefined()
+
+    const denyPaths = gitFileDenyPaths(pointer, false)
+    expect(denyPaths).toEqual([pointer, first, second])
+    expect(denyPaths).not.toContain(checkout)
+  })
+
+  it('runs a hook again as soon as a looping hooks link reaches a directory', () => {
+    // The other half of what a loop means, against real git: while
+    // `.git/hooks` runs into one, git finds no hook there and commits
+    // without it - and the moment one of the LINKS is replaced by a
+    // directory, with the entry and the git directory untouched, the hook
+    // inside it is what git runs. That is why every link a looping chain
+    // went through is denied: they are the whole of what makes it reach
+    // anything.
+    const caseDir = join(root, `pointer-${caseCount++}`)
+    const checkout = join(caseDir, 'checkout')
+    mkdirSync(checkout, { recursive: true })
+    expect(runGit(checkout, ['init', '-q', '-b', 'main', '.'])).toBeDefined()
+    runGit(checkout, ['config', 'user.email', 'parity@example.invalid'])
+    runGit(checkout, ['config', 'user.name', 'Parity'])
+    const links = join(checkout, 'links')
+    mkdirSync(links, { recursive: true })
+    symlinkSync('b', join(links, 'a'))
+    symlinkSync('a', join(links, 'b'))
+    rmSync(join(checkout, '.git', 'hooks'), { recursive: true, force: true })
+    symlinkSync('../links/a', join(checkout, '.git', 'hooks'))
+    const ran = join(caseDir, 'hook-ran')
+    writeFileSync(join(checkout, 'f.txt'), 'one\n')
+    runGit(checkout, ['add', 'f.txt'])
+
+    expect(
+      runGit(checkout, ['commit', '-q', '-m', 'first'], { runHooks: true }),
+    ).toBeDefined()
+    expect(existsSync(ran)).toBe(false)
+
+    // One of the two links, replaced by a directory holding a hook.
+    rmSync(join(links, 'a'))
+    mkdirSync(join(links, 'a'), { recursive: true })
+    writeFileSync(join(links, 'a', 'pre-commit'), `#!/bin/sh\ntouch ${ran}\n`, {
+      mode: 0o755,
+    })
+    writeFileSync(join(checkout, 'f.txt'), 'two\n')
+    runGit(checkout, ['add', 'f.txt'])
+
+    expect(
+      runGit(checkout, ['commit', '-q', '-m', 'second'], { runHooks: true }),
+    ).toBeDefined()
+    expect(existsSync(ran)).toBe(true)
+  }, 120_000)
 
   // Linux only: the target has to exist for git to follow it, and macOS
   // filesystems refuse a name that is not valid UTF-8 (EILSEQ on mkdir). The
