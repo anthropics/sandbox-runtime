@@ -164,7 +164,8 @@ describe('prepareBodySubstitution', () => {
       fwd,
       'h',
     )
-    expect(t).toBeDefined()
+    expect(t?.transform).toBeDefined()
+    expect(t?.mayChangeLength).toBe(false)
   })
 
   test('no injectable pairs at the host → no transform, headers untouched', () => {
@@ -195,11 +196,12 @@ describe('prepareBodySubstitution', () => {
       fwd,
       'h',
     )
-    expect(t).toBeDefined()
+    expect(t?.transform).toBeDefined()
+    expect(t?.mayChangeLength).toBe(false)
     expect(fwd['content-length']).toBe('10')
   })
 
-  test('any non-length-matched pair deletes Content-Length (chunked fallback)', () => {
+  test('non-length-matched pairs keep Content-Length and flag mayChangeLength', () => {
     const fwd: IncomingHttpHeaders = { 'content-length': '10' }
     const t = prepareBodySubstitution(
       () => [pair(SENTINEL, REAL), pair('fake_value_odd-size', 'tiny')],
@@ -207,7 +209,8 @@ describe('prepareBodySubstitution', () => {
       fwd,
       'h',
     )
-    expect(t).toBeDefined()
-    expect(fwd['content-length']).toBeUndefined()
+    expect(t?.transform).toBeDefined()
+    expect(t?.mayChangeLength).toBe(true)
+    expect(fwd['content-length']).toBe('10')
   })
 })
