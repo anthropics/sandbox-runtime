@@ -174,6 +174,44 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(existsSync(out)).toBe(false)
   })
 
+  // This job's /proc is masked the way an unprivileged container's is, so the
+  // helper cannot mount a fresh one and the command still sees the helper's
+  // outer process, which shares its user namespace. The command holds a full
+  // capability set there; what keeps it out of that process is that the
+  // helper made itself non-dumpable before it forked.
+  it('cannot open the memory of the helper process it can see (seccomp helper)', () => {
+    const probe = join(WORK, 'helper-mem-probe.py')
+    writeFileSync(
+      probe,
+      [
+        'import os',
+        'seen = 0',
+        "for pid in filter(str.isdigit, os.listdir('/proc')):",
+        '    try:',
+        "        name = open('/proc/%s/comm' % pid).read().strip()",
+        '    except OSError:',
+        '        continue',
+        "    if name != 'apply-seccomp' or int(pid) == os.getpid():",
+        '        continue',
+        '    seen += 1',
+        "    for what in ('mem', 'environ'):",
+        '        try:',
+        "            os.close(os.open('/proc/%s/%s' % (pid, what), os.O_RDWR if what == 'mem' else os.O_RDONLY))",
+        "            print('helper %s OPENED' % what)",
+        '        except OSError as e:',
+        "            print('helper %s refused' % what)",
+        "print('helpers-seen=%d' % seen)",
+        '',
+      ].join('\n'),
+    )
+    const r = srt(`echo SANDBOX-RAN; python3 ${probe}`)
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    // If none is visible here the fresh /proc was mounted after all and there
+    // is nothing to reach; otherwise every one seen must refuse.
+    expect(r.stdout).toMatch(/^helpers-seen=\d+$/m)
+    expect(r.stdout).not.toContain('OPENED')
+  })
+
   it('refuses the command a user namespace of its own (seccomp helper)', () => {
     const r = srt('echo SANDBOX-RAN; unshare -U true; echo "unshare-rc=$?"')
     expect(r.stdout).toContain('SANDBOX-RAN')

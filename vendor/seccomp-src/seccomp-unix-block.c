@@ -112,8 +112,9 @@ static int add_namespace_rules(scmp_filter_ctx ctx) {
         }
     }
 
-    /* Joining another namespace, and every call that changes a mount tree:
-     * the old interface and the fd-based one. */
+    /* Joining another namespace, and the calls that change a mount tree, the
+     * old interface and the fd-based one, as far as this libseccomp names
+     * them; one more follows where it can be named. */
     const char *refused[] = {
         "setns",      "mount",    "umount2",  "pivot_root",
         "open_tree",  "move_mount", "fsopen", "fsconfig",
@@ -132,6 +133,26 @@ static int add_namespace_rules(scmp_filter_ctx ctx) {
             fprintf(stderr, "Error: Failed to add %s rule: %s\n", refused[i],
                     strerror(-rc));
             return -1;
+        }
+    }
+
+    /* open_tree_attr(2), Linux 6.15: open_tree with the attribute changes of
+     * mount_setattr in one call. Refused where this libseccomp can name it.
+     * Where it cannot, it is left out rather than failing the build, because
+     * a call by bare number cannot be emitted for an architecture other than
+     * the builder's: what it could do needs CAP_SYS_ADMIN over the mount
+     * namespace, a tree it clones can only be attached with move_mount, which
+     * is refused above, and the kernel does not let the read-only flag of a
+     * mount copied across a user namespace be cleared, on a clone either. */
+    {
+        int nr = seccomp_syscall_resolve_name("open_tree_attr");
+        if (nr != __NR_SCMP_ERROR) {
+            rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
+            if (rc < 0) {
+                fprintf(stderr, "Error: Failed to add open_tree_attr rule: %s\n",
+                        strerror(-rc));
+                return -1;
+            }
         }
     }
     return 0;

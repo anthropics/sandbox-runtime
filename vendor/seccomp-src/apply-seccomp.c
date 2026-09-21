@@ -12,7 +12,7 @@
  *
  *   bwrap init (PID 1)          <- outer PID ns, no seccomp
  *   \_ bash / socat ...         <- outer PID ns, no seccomp
- *      \_ apply-seccomp [outer] <- outer PID ns, waits for inner init
+ *      \_ apply-seccomp [outer] <- outer PID ns, PR_SET_DUMPABLE=0, waits
  *         ================================================= PID ns boundary
  *         \_ apply-seccomp [inner init] <- inner PID 1, PR_SET_DUMPABLE=0
  *            \_ user command            <- inner PID 2, seccomp applied
@@ -20,8 +20,15 @@
  * From the user command's point of view /proc contains only its own process
  * tree. The bwrap init, bash wrapper, and socat helpers are not addressable,
  * so they cannot be ptraced or patched via /proc/N/mem even on systems with
- * kernel.yama.ptrace_scope=0. The inner init (PID 1) sets PR_SET_DUMPABLE=0
- * so it cannot be ptraced either.
+ * kernel.yama.ptrace_scope=0. Both halves of this program are non-dumpable
+ * from before the first fork, so neither can be ptraced or written through
+ * /proc/N/mem. For the inner init that was always so. It matters for the
+ * outer half where the fresh /proc below cannot be mounted (a masked /proc
+ * underneath, the enableWeakerNestedSandbox case): the command then still
+ * sees the outer half, which shares its user namespace and is under no
+ * filter, and a command started by uid 0 holds the capabilities to reach
+ * into a dumpable process there. The outer half also takes the namespaces
+ * filter for itself, which costs it nothing it uses.
  *
  * Any failure to set up the nested namespaces aborts with a non-zero exit
  * status; we never fall back to running the command without isolation.
@@ -762,21 +769,19 @@ int main(int argc, char *argv[]) {
         uid_t uid = geteuid();
         gid_t gid = getegid();
 
-        /* If this binary was exec'd without read permission (e.g. installed
-         * mode 0111), the kernel marked the process non-dumpable, which
-         * makes /proc/self/{setgroups,uid_map,gid_map} root-owned, so the
-         * writes below would fail with EACCES. Temporarily flip dumpable
-         * on for the uid/gid mapping and restore it right after. While
-         * dumpable is 1, a same-uid process can ptrace us (under yama
-         * ptrace_scope=0) and dump the mapped pages that mode 0111 is
-         * meant to hide; the save/restore keeps that exposure to a
-         * few-syscall race window — the same unavoidable window runc and
-         * systemd accept for this pattern.
+        /* The map files below are owned by root while this process is
+         * non-dumpable, which it is when the binary was exec'd without read
+         * permission (installed mode 0111), so the writes would fail with
+         * EACCES. Dumpable for the mapping only: it is cleared for good
+         * before the first fork below, whatever it was on entry. While it is
+         * set a same-uid process can ptrace us (under yama ptrace_scope=0)
+         * and dump the mapped pages that mode 0111 is meant to hide, for the
+         * length of a few syscalls; runc and systemd accept the same window
+         * for this pattern.
          *
-         * prctl failures here are ignored: they are next to impossible for
-         * these calls, and if raising dumpable did fail the map writes
-         * below fail with their own clearer errors. */
-        int dumpable = prctl(PR_GET_DUMPABLE);
+         * A failure here is ignored: it is next to impossible for this call,
+         * and if it did fail the map writes below fail with their own
+         * clearer errors. */
         (void)prctl(PR_SET_DUMPABLE, 1);
 
         if (unshare(CLONE_NEWUSER) < 0) {
@@ -794,13 +799,21 @@ int main(int argc, char *argv[]) {
         if (write_file("/proc/self/gid_map", "%u %u 1\n", gid, gid) < 0) {
             die("apply-seccomp: write /proc/self/gid_map");
         }
-        /* PR_SET_DUMPABLE only accepts 0 or 1; if the saved value was
-         * SUID_DUMP_ROOT (2) — or the read above failed — restore the more
-         * restrictive 0. */
-        (void)prctl(PR_SET_DUMPABLE, dumpable == 1 ? 1 : 0);
         if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS) after userns");
         }
+    }
+
+    /* Non-dumpable from here on, in both halves: fork copies it, and nothing
+     * below execs until the worker does. It refuses ptrace and every
+     * /proc/<pid> file that asks the same question (mem, environ, root, cwd,
+     * fd, and process_vm_writev) to anything that does not hold
+     * CAP_SYS_PTRACE over the user namespace this process was exec'd in,
+     * which is bubblewrap's, where the command holds nothing. Whatever the
+     * flag was on entry, zero is the answer: a binary exec'd without read
+     * permission arrives with it cleared, and this only ever tightens. */
+    if (prctl(PR_SET_DUMPABLE, 0) < 0) {
+        die("apply-seccomp: prctl(PR_SET_DUMPABLE)");
     }
 
     pid_t child = fork();
@@ -811,8 +824,20 @@ int main(int argc, char *argv[]) {
     if (child > 0) {
         /* Outer stub: still in bwrap's PID namespace. Forward signals,
          * optionally service the USER_NOTIF observation fd, then relay the
-         * child's exit status. Never under either seccomp filter. */
+         * child's exit status. It never runs the command, and it takes the
+         * namespaces filter all the same (not the Unix-socket one: it has to
+         * connect to SRT_OBSERVE_SOCK), so that if something did get it to
+         * run other code, that code is no better placed than the command.
+         * Nothing here calls what that filter refuses. */
         if (sp[1] >= 0) close(sp[1]);
+        if (!allow_nested_userns) {
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+                die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS, stub)");
+            }
+            if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &namespace_prog) < 0) {
+                die("apply-seccomp: prctl(PR_SET_SECCOMP, stub)");
+            }
+        }
         install_forwarders(child);
 
         if (sp[0] >= 0) {
@@ -861,7 +886,8 @@ int main(int argc, char *argv[]) {
      * Inner init — PID 1 in the nested PID namespace.
      * ================================================================ */
 
-    /* Block ptrace and /proc/1/mem writes against this process. */
+    /* Block ptrace and /proc/1/mem writes against this process. Already so
+     * since before the fork; said again where it has always been said. */
     if (prctl(PR_SET_DUMPABLE, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_DUMPABLE)");
     }
@@ -871,10 +897,11 @@ int main(int argc, char *argv[]) {
         die("apply-seccomp: mount(MS_PRIVATE)");
     }
     /* EPERM here means a masked /proc is underneath (unprivileged Docker)
-     * and the kernel domination check refused the overmount. The nested
-     * userns above is the isolation boundary; this remount only hides
-     * outer PIDs from `ls /proc`. enableWeakerNestedSandbox targets
-     * exactly this environment. */
+     * and the kernel domination check refused the overmount, which
+     * enableWeakerNestedSandbox exists for. The command then still sees the
+     * outer half of this program in /proc. What keeps it out of that process
+     * is that the process is non-dumpable (above), not a namespace: the two
+     * share the user namespace made above. */
     if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0
         && errno != EPERM) {
         die("apply-seccomp: mount(/proc)");
@@ -922,9 +949,12 @@ int main(int argc, char *argv[]) {
      * rule's recompute into a gain and NO_NEW_PRIVS clamps a gain back to
      * what was held; dropping the bounding set has the same effect. Neither
      * is done here. What keeps the deny mounts in place for that worker is
-     * not its capabilities but that the nested mount namespace's copies of
-     * them are locked, having been created across a user-namespace
-     * boundary. */
+     * not its capabilities and not, by itself, that the nested mount
+     * namespace's copies of them are locked: a lock refuses the unmount of
+     * one of them, but the root of the tree is not locked, so the whole tree
+     * can be moved aside with pivot_root and dropped with a lazy unmount. It
+     * is the namespaces filter, which refuses those calls. With
+     * SRT_ALLOW_NESTED_USERNS=1 nothing does. */
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
     }
