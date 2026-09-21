@@ -26,6 +26,29 @@
  * Any failure to set up the nested namespaces aborts with a non-zero exit
  * status; we never fall back to running the command without isolation.
  *
+ * Keeping the command in these namespaces. The sandbox's write denies are
+ * read-only binds, and a bind protects a path only in the mount namespace it
+ * was made in. Creating a user namespace needs no capability and gives its
+ * creator a full set over a private copy of the mount tree, from which the
+ * binds can be detached as a whole; a directory descriptor opened beforehand
+ * then reaches the denied names with nothing over them. So the command is
+ * not allowed to make further namespaces, by two independent means: the
+ * `namespaces` seccomp filter (seccomp-unix-block.c), stacked on the
+ * Unix-socket one, and a limit of zero on user.max_user_namespaces in the
+ * user namespace this helper made for itself. The filter is what holds a
+ * command started by uid 0, which keeps its capabilities and could lift the
+ * limit; the limit is what still holds if a call is missing from the filter.
+ * SRT_ALLOW_NESTED_USERNS=1 in the environment turns both off, for a caller
+ * whose command has to make namespaces of its own (a browser's sandbox,
+ * rootless containers, a nested bubblewrap) and who accepts that such a
+ * command can then undo the write denies. The variable is read here, before
+ * the command exists, and removed from the command's environment.
+ *
+ * SRT_HELPER_FEATURES=1 makes this program print what it supports, one word a
+ * line, and exit 0 without doing anything else, so that a caller can tell a
+ * helper that has the namespace limit (`userns-limit`) from one built before
+ * it. A helper built before it ignores the variable and runs argv[1].
+ *
  * Compile: gcc -static -O2 -o apply-seccomp apply-seccomp.c
  */
 
@@ -658,6 +681,13 @@ static int reap_until(pid_t main_child) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Before the argc check: the probe is asked with no real command. */
+    const char *features = getenv("SRT_HELPER_FEATURES");
+    if (features && strcmp(features, "1") == 0) {
+        puts("userns-limit");
+        return 0;
+    }
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
         return 1;
@@ -665,11 +695,27 @@ int main(int argc, char *argv[]) {
 
     char **command_argv = &argv[1];
 
+    /* Read once, here, from the environment the caller built; the worker's
+     * copy is removed below so the command cannot hand it to a helper it
+     * starts itself (which would change nothing: a seccomp filter cannot be
+     * taken off and the limit cannot be raised without the capability). */
+    const char *allow_env = getenv("SRT_ALLOW_NESTED_USERNS");
+    int allow_nested_userns = allow_env && strcmp(allow_env, "1") == 0;
+    /* Set when path (b) below runs: the limit is written only in a user
+     * namespace this process made, never in the caller's. */
+    int made_userns = 0;
+
     _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
                    "BPF filter size must be a multiple of sock_filter");
     struct sock_fprog prog = {
         .len = (unsigned short)(sizeof(unix_block_bpf) / sizeof(struct sock_filter)),
         .filter = (struct sock_filter *)unix_block_bpf,
+    };
+    _Static_assert(sizeof(namespace_block_bpf) % sizeof(struct sock_filter) == 0,
+                   "BPF filter size must be a multiple of sock_filter");
+    struct sock_fprog namespace_prog = {
+        .len = (unsigned short)(sizeof(namespace_block_bpf) / sizeof(struct sock_filter)),
+        .filter = (struct sock_filter *)namespace_block_bpf,
     };
 
     /* ---- Optional observation: pre-fork setup --------------------------- */
@@ -736,6 +782,7 @@ int main(int argc, char *argv[]) {
         if (unshare(CLONE_NEWUSER) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWUSER)");
         }
+        made_userns = 1;
         if (write_file("/proc/self/setgroups", "deny") < 0) {
             die("apply-seccomp: write /proc/self/setgroups "
                 "(nested userns is capability-restricted; "
@@ -833,6 +880,31 @@ int main(int argc, char *argv[]) {
         die("apply-seccomp: mount(/proc)");
     }
 
+    /* No further user namespaces below this one. The sysctl is per user
+     * namespace and the path resolves to the table of the namespace the
+     * opener is in, so this writes OUR namespace's limit: only in path (b),
+     * where that namespace is one this process made (in path (a) it would be
+     * the caller's, and on a bare host the machine's). Zero, not one: the
+     * count a limit is compared with is the number of namespaces created
+     * beneath this one, so one would still let the command make the single
+     * namespace it needs. Writing it takes CAP_SYS_RESOURCE over this
+     * namespace, which this process holds as its creator and a command not
+     * started by uid 0 loses at exec.
+     *
+     * Not fatal: where /proc could not be mounted above (a masked /proc
+     * underneath, the enableWeakerNestedSandbox case) /proc/sys is commonly
+     * read-only, and the filter installed below refuses the same calls. */
+    if (!allow_nested_userns && made_userns
+        && write_file("/proc/sys/user/max_user_namespaces", "0") < 0) {
+        const char *debug = getenv("SRT_DEBUG");
+        if (debug && *debug) {
+            fprintf(stderr,
+                    "apply-seccomp: could not set user.max_user_namespaces (%s); "
+                    "the seccomp filter alone keeps the command from making namespaces\n",
+                    strerror(errno));
+        }
+    }
+
     /* Drop whatever bwrap's --cap-add left in the ambient set (today at most
      * CAP_SETFCAP, which path (b) above has already spent) so it cannot
      * survive the worker's exec.
@@ -875,6 +947,8 @@ int main(int argc, char *argv[]) {
     /* ---- Worker (inner PID 2): apply seccomp and exec. ---- */
     unsetenv("SRT_OBSERVE_SOCK");
     unsetenv("SRT_ENCODED_CMD");
+    unsetenv("SRT_ALLOW_NESTED_USERNS");
+    unsetenv("SRT_HELPER_FEATURES");
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }
@@ -883,6 +957,14 @@ int main(int argc, char *argv[]) {
      * NO_NEW_PRIVS (required) and before the unix-block filter / exec so only
      * the workload is observed. */
     install_observe_filter(sp[1]);
+    /* Two filters, stacked: the kernel runs every installed filter and takes
+     * the most restrictive answer, so their order does not matter to the
+     * command. This one first only because it is the one that may be left
+     * out. Installing a filter is not among the calls it refuses. */
+    if (!allow_nested_userns
+        && prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &namespace_prog) < 0) {
+        die("apply-seccomp: prctl(PR_SET_SECCOMP, namespaces)");
+    }
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0) {
         die("apply-seccomp: prctl(PR_SET_SECCOMP)");
     }

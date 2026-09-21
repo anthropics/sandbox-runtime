@@ -29,26 +29,41 @@ run([
   '-lseccomp',
 ])
 
-const bpf: Record<string, Buffer> = {}
+// Two filters per architecture, which apply-seccomp stacks: `unix` refuses
+// Unix-socket creation, `namespaces` keeps the command in the namespaces the
+// sandbox made for it (see seccomp-unix-block.c). Separate arrays so that a
+// command opted out of the second still gets the first.
+const RULE_SETS = ['unix', 'namespaces'] as const
+const bpf: Record<string, Record<string, Buffer>> = {}
 for (const target of ['x86_64', 'aarch64']) {
-  const tmp = join(OUT, target + '.bpf')
-  run([gen, tmp, target])
-  bpf[target] = readFileSync(tmp)
-  rmSync(tmp)
+  bpf[target] = {}
+  for (const rules of RULE_SETS) {
+    const tmp = join(OUT, `${target}.${rules}.bpf`)
+    run([gen, tmp, target, rules])
+    bpf[target][rules] = readFileSync(tmp)
+    rmSync(tmp)
+  }
 }
 rmSync(gen)
+
+function arrays(target: string): string {
+  return (
+    'static const unsigned char unix_block_bpf[] = {\n' +
+    toCArray(bpf[target].unix) +
+    '\n};\n' +
+    'static const unsigned char namespace_block_bpf[] = {\n' +
+    toCArray(bpf[target].namespaces) +
+    '\n};\n'
+  )
+}
 
 const header = join(OUT, 'unix-block-bpf.h')
 writeFileSync(
   header,
   '#if defined(__x86_64__)\n' +
-    'static const unsigned char unix_block_bpf[] = {\n' +
-    toCArray(bpf.x86_64) +
-    '\n};\n' +
+    arrays('x86_64') +
     '#elif defined(__aarch64__)\n' +
-    'static const unsigned char unix_block_bpf[] = {\n' +
-    toCArray(bpf.aarch64) +
-    '\n};\n' +
+    arrays('aarch64') +
     '#else\n' +
     '#error "unsupported architecture for unix-block BPF filter"\n' +
     '#endif\n',
