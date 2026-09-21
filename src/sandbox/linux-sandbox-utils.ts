@@ -11,9 +11,14 @@ import { ripGrep, type RipgrepConfig } from '../utils/ripgrep.js'
 import {
   collectMountPoints,
   discardMountPointManifest,
+  isBwrapFileMountPoint,
+  kindOfMountPoint,
   liveMountPoints,
+  mountPointManifestDirectories,
   publishMountPointManifest,
+  removePrivateManifestDirectory,
   type MountPointManifest,
+  type OwnManifestRelease,
 } from './bwrap-mount-manifests.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
@@ -458,33 +463,6 @@ function ensureEmptyMountSourceDir(): string {
   return emptyMountSourceDir
 }
 
-/**
- * Is `p` a mount point some sandbox made? bwrap makes the mount point for
- * `--ro-bind /dev/null <absent path>` with ensure_file(dest, 0444): an empty
- * regular file with no write bits. Files that only look similar are written by
- * their creators with write bits (a lockfile, an empty file materialised on
- * purpose: 0666 & ~umask) or have content or a second link. An empty read-only
- * DIRECTORY left the same way is not recognisable: it looks like anyone's
- * empty directory.
- *
- * Whether the sandbox that made it is still running is not asked here and is
- * not the caller's business: this wrap covers the path and names it in its own
- * manifest either way, and the manifests decide who may remove it.
- */
-function isBwrapMountPoint(p: string): boolean {
-  try {
-    const stat = fs.lstatSync(p)
-    return (
-      stat.isFile() &&
-      stat.size === 0 &&
-      (stat.mode & 0o222) === 0 &&
-      stat.nlink === 1
-    )
-  } catch {
-    return false
-  }
-}
-
 export const CAP_SETFCAP = 31
 
 // This process's bounding set unioned with its inheritable set, read once —
@@ -876,6 +854,16 @@ function renderBwrapInvocation(
 let exitHandlerRegistered = false
 
 /**
+ * Wraps handed to the caller and not yet cleaned up after. The caller is told
+ * to clean up once per command, when that command is over, so while this is
+ * above zero some command of this process may not have started yet, and what
+ * it relies on - its manifest, its --args profile - must still be there when
+ * it does. Nothing of this process's own is given up until the count is back
+ * at zero, unless the caller says which command it is cleaning up after.
+ */
+let activeSandboxCount = 0
+
+/**
  * Register cleanup handler for bwrap mount points
  */
 function registerExitCleanupHandler(): void {
@@ -897,25 +885,62 @@ function registerExitCleanupHandler(): void {
  * host filesystem as mount points for --ro-bind. These files persist after
  * bwrap exits. This function removes them.
  *
- * This should be called after each sandboxed command completes to prevent
+ * Call it once for each wrapped command, when that command is over, to keep
  * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
- * directory. It is also called automatically on process exit as a safety net.
+ * directory. It is also called on process exit as a safety net.
  *
- * A mount point is removed only when no running sandbox relies on it, which
- * the kernel answers rather than this process (see bwrap-mount-manifests.ts).
- * So the call is a garbage collect that any process may make at any time —
- * early, twice, or not at all — and it also takes away what other srt
- * processes have finished with. `force` is kept for callers that pass it and
- * makes no difference to what is removed.
+ * What it may take away, of what THIS process made:
+ * - with no `commandId`, nothing until it has been called once for every wrap
+ *   handed out: a command wrapped and not yet started still needs its
+ *   manifest and its --args profile, and nothing here can tell which command
+ *   the call is for. So one long-running command holds back the clean-up of
+ *   the ones that finished beside it;
+ * - with the `commandId` its wrap was given, what that one command relied on,
+ *   at once, whatever else is still running;
+ * - with `force`, everything: the process is ending, or the session is. That
+ *   includes the manifest directory itself where it is one only this process
+ *   knows, once nothing is left in it.
  *
- * It does not wait for a wrap whose command this process has not run yet: the
- * `--args` profiles below are closed, and a manifest this process wrote and
- * has no sandbox running under is released, so a command wrapped but not yet
- * started refuses to start (bwrap exits with "Unable to open lock file")
- * rather than running with a mount point another call has removed.
+ * In every case a mount point goes only when no running sandbox relies on it,
+ * which the kernel answers and not this process (see bwrap-mount-manifests.ts),
+ * and what other srt processes have finished with goes too. A call too many
+ * takes nothing from a running sandbox; it does count for some other wrap of
+ * this process, and if that wrap's command has not started by the time the
+ * count is back at zero it then refuses to start. Does nothing except on
+ * Linux.
  */
-export function cleanupBwrapMountPoints(_opts?: { force?: boolean }): void {
-  const removed = collectMountPoints()
+export function cleanupBwrapMountPoints(opts?: {
+  force?: boolean
+  commandId?: string
+}): void {
+  if (process.platform !== 'linux') {
+    return
+  }
+  let release: OwnManifestRelease
+  if (opts?.force) {
+    activeSandboxCount = 0
+    release = 'all'
+  } else {
+    if (activeSandboxCount > 0) {
+      activeSandboxCount--
+    }
+    release =
+      activeSandboxCount === 0
+        ? 'all'
+        : opts?.commandId !== undefined
+          ? { commandKey: opts.commandId }
+          : 'none'
+    if (release !== 'all') {
+      logForDebugging(
+        `[Sandbox Linux] ${activeSandboxCount} sandbox(es) of this process still outstanding - ` +
+          (release === 'none'
+            ? 'keeping what this process made'
+            : `releasing only what ${opts?.commandId} relied on`),
+      )
+    }
+  }
+
+  const removed = collectMountPoints(release)
   if (
     emptyMountSourceDir !== undefined &&
     removed.includes(emptyMountSourceDir)
@@ -923,8 +948,15 @@ export function cleanupBwrapMountPoints(_opts?: { force?: boolean }): void {
     emptyMountSourceDir = undefined
   }
 
-  for (const argsFd of [...bwrapArgsFds]) {
-    closeBwrapArgsProfile(argsFd)
+  // An --args profile belongs to one wrap and nothing maps it back to a
+  // command, so they go together, when nothing is outstanding.
+  if (release === 'all') {
+    for (const argsFd of [...bwrapArgsFds]) {
+      closeBwrapArgsProfile(argsFd)
+    }
+  }
+  if (opts?.force) {
+    removePrivateManifestDirectory()
   }
 }
 
@@ -1590,6 +1622,7 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  commandKey?: string,
 ): Promise<{ args: string[]; manifest: MountPointManifest | undefined }> {
   const args: string[] = []
   // fs already imported
@@ -2322,37 +2355,69 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Whether anything is at the path, asked once for the two branches
-      // below.
-      const pathExists = fs.existsSync(normalizedPath)
-
-      // A mount point another sandbox made (see isBwrapMountPoint, and the
-      // manifests, which name the ones a running sandbox relies on however
-      // they look on the host) is an absent deny path in all but name. Bound
-      // onto itself as an existing file it would never be named in this wrap's
-      // manifest, so never removed, and on the host its existence can be the
-      // whole meaning (a lockfile's). Cover it with /dev/null like the absent
-      // leaf below and name it, so a collect takes it away once no sandbox
-      // relies on it. Same gate as that branch. Under a read-only denied
-      // directory nothing needs covering (the file is already unwritable
-      // there), but it is still named: it is no more the caller's file for
-      // being there.
+      // A mount point another sandbox made is an absent deny path in all but
+      // name. Bound onto itself as an existing path it would never be named in
+      // this wrap's manifest, so it would go, with this sandbox still bound
+      // over it, as soon as the sandbox that made it was cleaned up after;
+      // and a leftover nobody names would never go at all, where on the host
+      // its existence can be the whole meaning (a lockfile's). There are two
+      // ways to know one, and what is done with it depends on its kind:
+      // - a FILE, by its shape (see isBwrapFileMountPoint), or because a live
+      //   manifest names the path and it is still an empty regular file. It is
+      //   covered with /dev/null like the absent leaf below, and named. Under
+      //   a read-only denied directory nothing needs covering (the file is
+      //   already unwritable there), but it is still named: it is no more the
+      //   caller's file for being there;
+      // - a DIRECTORY, only because a live manifest names it: an empty
+      //   directory looks like anyone's. It is the first missing component of
+      //   some other sandbox's deny. /dev/null cannot be bound over a
+      //   directory (bubblewrap refuses to start), so it is named and then
+      //   treated as the existing directory it is, further down: bound onto
+      //   itself read-only, which is also what the pre-pass above recorded it
+      //   as;
+      // - anything else a live manifest names (a file that has been written
+      //   to since, a link) is the caller's by now, and is neither.
+      // The shape is asked before the existence: another process's collect can
+      // take a leftover away at any moment, and a path found to exist and then
+      // found not to be a mount point because it has just gone would be bound
+      // onto itself as a file that is not there. And once more after it, when
+      // the two disagree: another sandbox starting on the same path makes its
+      // mount point at any moment too, and one made between the two questions
+      // would be bound onto itself as the caller's own file, named by this
+      // wrap nowhere, and gone from under it at that sandbox's clean-up.
+      let isFileMountPoint = isBwrapFileMountPoint(normalizedPath)
+      // Whether anything is at the path, asked once for the branches below.
+      const pathExists = isFileMountPoint || fs.existsSync(normalizedPath)
+      if (pathExists && !isFileMountPoint) {
+        isFileMountPoint = isBwrapFileMountPoint(normalizedPath)
+      }
       if (
-        (isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
-          isWithinAnyAllowedWritePath(normalizedPath)) &&
-        (isBwrapMountPoint(normalizedPath) ||
-          (pathExists &&
-            (liveMountPointsCache ??= liveMountPoints()).has(normalizedPath)))
+        isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
+        isWithinAnyAllowedWritePath(normalizedPath)
       ) {
-        if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
-          denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
-          denyWriteRawDests.set(normalizedPath, rawPath)
+        const kind = isFileMountPoint
+          ? 'file'
+          : pathExists &&
+              (liveMountPointsCache ??= liveMountPoints()).has(normalizedPath)
+            ? kindOfMountPoint(normalizedPath)
+            : undefined
+        if (kind === 'file') {
+          if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
+            denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
+            denyWriteRawDests.set(normalizedPath, rawPath)
+          }
+          mountPoints.push(normalizedPath)
+          logForDebugging(
+            `[Sandbox Linux] Re-covering a mount point another sandbox made: ${normalizedPath}`,
+          )
+          continue
         }
-        mountPoints.push(normalizedPath)
-        logForDebugging(
-          `[Sandbox Linux] Re-covering a mount point another sandbox made: ${normalizedPath}`,
-        )
-        continue
+        if (kind === 'directory') {
+          mountPoints.push(normalizedPath)
+          logForDebugging(
+            `[Sandbox Linux] Keeping a directory mount point another sandbox made for as long as this one runs: ${normalizedPath}`,
+          )
+        }
       }
 
       // Handle non-existent paths by mounting /dev/null to block creation.
@@ -2841,19 +2906,31 @@ async function generateFilesystemArgs(
   // could not be recorded are left on the host, since what this process cannot
   // record, no process may remove.
   //
-  // INVARIANT: the manifest directory must never be writable from inside the
+  // INVARIANT: a manifest directory must never be writable from inside a
   // sandbox — a command that could delete a manifest could make the mount
-  // points its own sandbox relies on look unused. Emitted after every allow
-  // and deny bind, for the same reason as the two stores below (all three are
-  // directories of their own, so their order among themselves does not
-  // matter). It is also what lets bwrap open the manifest:
-  // it does that inside the sandbox, after the mounts, so a profile with a
-  // tmpfs over the temp dir would otherwise leave nothing there to open.
+  // points a running sandbox relies on look unused, and one that could write
+  // a manifest could name any path at all for a collect on the host to
+  // remove. That holds for a sandbox whose own wrap names no manifest as much
+  // as for one that does, and for the directory some other process of this
+  // user keeps its manifests in as much as for this one's: the directory sits
+  // under the system temp dir wherever there is no $XDG_RUNTIME_DIR, which a
+  // caller's allowWrite commonly covers, and what is in it then belongs to
+  // OTHER sandboxes. So every wrap that restricts writes binds every one of
+  // them read-only (see mountPointManifestDirectories), and a wrap with mount
+  // points of its own adds the lock. Emitted after every allow and deny bind,
+  // for the same reason as the two stores below (they are all directories of
+  // their own, so their order among themselves does not matter). It is also
+  // what lets bwrap open the manifest: it does that inside the sandbox, after
+  // the mounts, so a profile with a tmpfs over the temp dir would otherwise
+  // leave nothing there to open.
   const manifest = publishMountPointManifest(
     mountPoints,
     emptySource === undefined ? [] : [emptySource],
+    commandKey,
   )
   if (manifest !== undefined) {
+    // This wrap needs the directory there: bubblewrap opens the manifest in
+    // it, after the mounts.
     args.push(
       '--ro-bind',
       manifest.dir,
@@ -2862,6 +2939,16 @@ async function generateFilesystemArgs(
       manifest.file,
     )
     registerExitCleanupHandler()
+  }
+  if (writeConfig !== undefined) {
+    // The others need only be kept out of the command's reach, so one that has
+    // gone by the time the command starts - a temp dir whose parent was
+    // replaced - is not an error.
+    for (const manifestDir of mountPointManifestDirectories()) {
+      if (manifestDir !== manifest?.dir) {
+        args.push('--ro-bind-try', manifestDir, manifestDir)
+      }
+    }
   }
 
   // INVARIANT: the fake-file store directory must never be writable from
@@ -2996,6 +3083,10 @@ export async function wrapCommandWithSandboxLinux(
   const attributionKey = encodeSandboxedCommand(
     attributionKeyFor(command, commandId),
   )
+
+  // Counted from here, for the clean-up the caller makes when the command is
+  // over; the catch below takes it back if no command comes of this wrap.
+  activeSandboxCount++
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let applySeccompPrefix: string | undefined
@@ -3177,6 +3268,9 @@ export async function wrapCommandWithSandboxLinux(
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      // Only an id the caller chose: the attribution key falls back to the
+      // command text, which two wraps in flight may share.
+      commandId,
     )
     // Held for the catch below: a wrap that produces no command has to let go
     // of the mount points it named.
@@ -3283,9 +3377,13 @@ export async function wrapCommandWithSandboxLinux(
     return wrappedCommand
   } catch (error) {
     // No command came of this wrap, so no sandbox can be running under its
-    // manifest and the mount points it named are no one's.
+    // manifest and the mount points it named are no one's, and the caller has
+    // nothing to clean up after.
     if (manifest !== undefined) {
       discardMountPointManifest(manifest.file)
+    }
+    if (activeSandboxCount > 0) {
+      activeSandboxCount--
     }
     throw error
   }
