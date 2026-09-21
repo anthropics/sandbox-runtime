@@ -96,7 +96,9 @@ function resolveDependency(
       return { found: candidate, passed }
     }
     passed.push(candidate)
-    if (dir === path.dirname(dir)) return { found: undefined, passed: [] }
+    // Not installed at all (an optional dependency, say): everywhere it was
+    // looked for is somewhere it could still be put.
+    if (dir === path.dirname(dir)) return { found: undefined, passed }
   }
 }
 
@@ -166,8 +168,8 @@ export function installedPackagePaths(moduleFile: string): string[] {
     ]) {
       if (packages.size >= MAX_PACKAGES) break walk
       const { found, passed } = resolveDependency(dir, name)
-      if (found === undefined) continue
       for (const earlier of passed) lookedAtFirst.add(firstMissing(earlier))
+      if (found === undefined) continue
       if (!packages.has(found)) {
         packages.add(found)
         pending.push(found)

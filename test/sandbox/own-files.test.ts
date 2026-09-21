@@ -128,6 +128,32 @@ describe('The library own files under a write path', () => {
       )
     })
 
+    it('counts everywhere a dependency that is not installed could be put', () => {
+      // Declared and absent, as an optional dependency may be: the loader
+      // would take a copy from any level on the way up.
+      const project = join(dir, 'project')
+      const root = makePackage(join(project, 'node_modules', 'lib'), {
+        name: 'lib',
+        optionalDependencies: { extra: '1' },
+      })
+      mkdirSync(join(root, 'dist', 'sandbox'), { recursive: true })
+
+      const found = installedPackagePaths(join(root, 'dist', 'sandbox', 'm.js'))
+      expect(found).toContain(root)
+      expect(found).toContain(join(project, 'node_modules', 'extra'))
+      expect(found).toContain(join(project, 'node_modules', 'node_modules'))
+      // Inside the package it is denied with the package.
+      expect(found).not.toContain(join(root, 'node_modules'))
+      // And of those, a wrap takes the ones it could be made in.
+      expect(ownFilesWriteDenies([project], found).sort()).toEqual(
+        [
+          root,
+          join(project, 'node_modules', 'extra'),
+          join(project, 'node_modules', 'node_modules'),
+        ].sort(),
+      )
+    })
+
     it('counts the launchers npm made for it, and no other', () => {
       const project = join(dir, 'project')
       const root = makePackage(join(project, 'node_modules', '@scope', 'lib'), {
