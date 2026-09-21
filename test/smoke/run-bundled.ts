@@ -11,6 +11,11 @@
  * around it then, which is how an embedded copy runs: a lookup that starts
  * from the library's own location finds nothing, and has to be one the
  * configuration already answered.
+ *
+ * On Linux each is run twice: told where the helper file is, and as a
+ * multicall executable that carries the helper and ripgrep itself and is
+ * started under their names (see embedder.ts), which is how an application
+ * that has both compiled in reaches them.
  */
 import { spawnSync } from 'node:child_process'
 import {
@@ -80,18 +85,30 @@ for (const form of FORMS) {
       env.SRT_SMOKE_APPLY_SECCOMP = helper
     }
 
-    console.log(`== ${form.name}`)
-    const run = spawnSync(program, [], {
-      cwd: home,
-      env,
-      encoding: 'utf8',
-      timeout: 300000,
-    })
-    process.stdout.write(run.stdout)
-    process.stderr.write(run.stderr)
-    if (run.status !== 0 || !run.stdout.includes('SMOKE OK')) {
-      console.error(`== ${form.name}: FAILED (status ${String(run.status)})`)
-      failed = true
+    const modes: Array<{ name: string; env: typeof env }> = [
+      { name: form.name, env },
+    ]
+    const ripgrep = Bun.which('rg')
+    if (env.SRT_SMOKE_APPLY_SECCOMP !== undefined && ripgrep !== null) {
+      modes.push({
+        name: `${form.name}, helper and ripgrep reached through argv0`,
+        env: { ...env, SRT_SMOKE_MULTICALL: '1', SRT_SMOKE_RG: ripgrep },
+      })
+    }
+    for (const mode of modes) {
+      console.log(`== ${mode.name}`)
+      const run = spawnSync(program, [], {
+        cwd: home,
+        env: mode.env,
+        encoding: 'utf8',
+        timeout: 300000,
+      })
+      process.stdout.write(run.stdout)
+      process.stderr.write(run.stderr)
+      if (run.status !== 0 || !run.stdout.includes('SMOKE OK')) {
+        console.error(`== ${mode.name}: FAILED (status ${String(run.status)})`)
+        failed = true
+      }
     }
   } finally {
     rmSync(home, { recursive: true, force: true })
