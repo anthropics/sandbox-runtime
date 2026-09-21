@@ -937,7 +937,13 @@ export const IgnoreViolationsConfigSchema = z
  * Ripgrep configuration schema
  */
 export const RipgrepConfigSchema = z.object({
-  command: z.string().describe('The ripgrep command to execute'),
+  command: z
+    .string()
+    .describe(
+      'The ripgrep command to execute. A bare name (the default "rg") is ' +
+        'looked up on PATH, passing over any copy inside an allowed write ' +
+        'path; a path is run as given.',
+    ),
   args: z
     .array(z.string())
     .optional()
@@ -1163,13 +1169,15 @@ export const SandboxRuntimeConfigSchema = z
       .optional()
       .describe(
         'Linux only: absolute path to the bwrap (bubblewrap) binary. ' +
-          'When set, this path is used directly instead of resolving "bwrap" via PATH.',
+          'When set, this path is used directly instead of resolving "bwrap" via PATH ' +
+          '(where a copy inside an allowed write path is passed over).',
       ),
     socatPath: binaryPathSchema
       .optional()
       .describe(
         'Linux only: absolute path to the socat binary. ' +
-          'When set, this path is used directly instead of resolving "socat" via PATH.',
+          'When set, this path is used directly instead of resolving "socat" via PATH ' +
+          '(where a copy inside an allowed write path is passed over).',
       ),
     javaAgentJarPath: binaryPathSchema
       .optional()

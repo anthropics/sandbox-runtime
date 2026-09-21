@@ -13,7 +13,9 @@ export interface RipgrepConfig {
  * @param args Command-line arguments to pass to rg
  * @param target Target directory or file to search
  * @param abortSignal AbortSignal to cancel the operation
- * @param config Ripgrep configuration (command and optional args)
+ * @param config Ripgrep configuration (command and optional args). The command
+ *   is spawned as given, so a bare name is looked up on PATH by the spawn
+ *   itself; the scan the library runs on the host passes the path it resolved.
  * @returns Array of matching lines (one per line of output)
  * @throws Error if ripgrep exits with non-zero status (except exit code 1 which means no matches)
  */
