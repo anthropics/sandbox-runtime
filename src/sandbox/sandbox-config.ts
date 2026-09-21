@@ -1119,6 +1119,17 @@ export const SandboxRuntimeConfigSchema = z
       .boolean()
       .optional()
       .describe('Enable weaker nested sandbox mode (for Docker environments)'),
+    allowNestedUserNamespaces: z
+      .boolean()
+      .optional()
+      .describe(
+        'Let the sandboxed command create user namespaces of its own (Linux only). ' +
+          'Needed by programs that sandbox themselves that way: a browser with its namespace sandbox, ' +
+          'rootless podman or buildah, a nested bubblewrap, `unshare -r` in a build script. ' +
+          'This gives up the write denies against a hostile command: a command that can create a ' +
+          'user namespace gets a private copy of the mount tree and can take the read-only binds ' +
+          'that enforce denyWrite and the mandatory denies out of its own view. Default: false.',
+      ),
     enableWeakerNetworkIsolation: z
       .boolean()
       .optional()
