@@ -2850,8 +2850,8 @@ function buildFilesystemArgs(
   // it, and one wrap needs that once however many destinations share it.
   const gitRedirectStoreFiles = new Map<string, string>()
   // Git directories this wrap denies whole because no mount point could be
-  // made inside them, so the second redirect file in one does not emit a
-  // second bind of the same directory.
+  // made inside them. The bind of one is the only deny bind it gets: every
+  // other deny destination inside it is dropped at emission.
   const denyWholeGitDirs = new Set<string>()
   // The store directory a placeholder came from, pinned read-only with the
   // other mount sources at the end. Set only where one was actually used.
@@ -3966,9 +3966,22 @@ function buildFilesystemArgs(
   // Write paths already restored read-only by a dropped deny bind, so two
   // denies covering the same path emit one --ro-bind.
   const restoredReadOnlyWritePaths = new Set<string>()
+  // Where the mounts this loop emits start. Every one is a three-word
+  // --ro-bind, which is what lets a git directory denied whole take back the
+  // ones inside it.
+  const denyBindsFrom = args.length
   for (let i = 0; i < denyWriteArgs.length; i += 3) {
     const dest = denyWriteArgs[i + 2]!
     const rawDest = denyWriteRawDests.get(dest) ?? dest
+    // Inside a git directory this loop has denied whole (below): that bind
+    // holds `dest` read-only already, and it is the only deny bind the
+    // directory takes. A placeholder here would need its mount point created
+    // on a read-only mount, which bubblewrap refuses to start over ("Can't
+    // create file at <dest>: Read-only file system"), and the directory's
+    // other redirect file would only find it unwritable a second time.
+    if ([...denyWholeGitDirs].some(gitDir => isStrictlyUnder(dest, gitDir))) {
+      continue
+    }
     // A mask's landing, not its dest: the landing is where the mask's bind
     // actually sits, and this deny's dest is canonical, so the two are
     // comparable as written.
@@ -4033,14 +4046,21 @@ function buildFilesystemArgs(
       if ('denyGitDirWhole' in prepared) {
         const gitDir = prepared.denyGitDirWhole
         // Read-only over the directory itself: it needs nothing written to
-        // the host, and it denies every file inside at once — including the
-        // other redirect file, whose own turn in this loop then has nothing
-        // left to do.
-        if (!denyWholeGitDirs.has(gitDir)) {
-          denyWholeGitDirs.add(gitDir)
-          args.push('--ro-bind', gitDir, gitDir)
-          emittedDenyWriteDests.push(gitDir)
+        // the host, and it denies every file inside at once, so it is the
+        // only deny bind the directory takes. The destinations inside it
+        // still to come are skipped at the top of this loop, and the ones
+        // already emitted are taken back out. This bind lands over those, so
+        // they deny nothing it does not, and a placeholder among them would
+        // have bubblewrap, which can write where this process cannot, make a
+        // mount point no cleanup of this process could remove. A mount point
+        // this pass has already written or claimed in there stays recorded
+        // like any other, and goes with the same cleanup.
+        denyWholeGitDirs.add(gitDir)
+        for (let at = args.length - 3; at >= denyBindsFrom; at -= 3) {
+          if (isStrictlyUnder(args[at + 2]!, gitDir)) args.splice(at, 3)
         }
+        args.push('--ro-bind', gitDir, gitDir)
+        emittedDenyWriteDests.push(gitDir)
         continue
       }
       source = prepared.bind

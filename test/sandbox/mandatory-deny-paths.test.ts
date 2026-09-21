@@ -6692,6 +6692,18 @@ describe.if(isLinux)('Placeholders for the files git reads', () => {
         expect(lastMountAt(command, gitDir)).toBe(
           `--ro-bind ${gitDir} ${gitDir}`,
         )
+        // A deny bind is emitted after the write root's own bind; an
+        // ancestor pin spells the same words before it.
+        const writeRootBind = indexOfMount(
+          command,
+          '--bind',
+          checkout,
+          checkout,
+        )
+        expect(writeRootBind).toBeGreaterThan(-1)
+        expect(
+          lastIndexOfMount(command, '--ro-bind', gitDir, gitDir),
+        ).toBeGreaterThan(writeRootBind)
         expect(existsSync(join(gitDir, 'commondir'))).toBe(false)
         expect(existsSync(join(gitDir, 'config.worktree'))).toBe(false)
       } finally {
