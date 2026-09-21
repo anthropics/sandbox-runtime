@@ -1099,7 +1099,9 @@ const REGEX_METACHARACTER = /[.^$+{}()|\\]/
  * and one whose set would hold no members (`[]`, `[!]`). `]` is never a
  * member of a set, because no spelling of it inside one reads the same to a
  * JavaScript regular expression and to the regex engine of a macOS sandbox
- * profile, which this same string is also compiled into.
+ * profile, which this same string is also compiled into. A `-` that is a
+ * member is written first in its set, the one place where both read it as
+ * the character ({@link setWithDashFirst}).
  *
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
@@ -1144,10 +1146,20 @@ export function globToRegex(globPattern: string): string {
         i++
         continue
       }
+      const dashFirst = setWithDashFirst(
+        globPattern.slice(set.members, set.close),
+        set.negated,
+      )
+      if (dashFirst !== undefined) {
+        regex += dashFirst
+        i = set.close + 1
+        continue
+      }
       regex += set.negated ? '[^/' : '['
       inSet = true
       i = set.members
-      // A `-` first among the members would read as a range with that `/`.
+      // Only a set that holds a wildcard still gets here with a `-` first
+      // among its members, where it would read as a range with that `/`.
       if (set.negated && globPattern[i] === '-') {
         regex += '\\-'
         i++
@@ -1161,21 +1173,65 @@ export function globToRegex(globPattern: string): string {
 }
 
 /**
- * The set the `[` at `open` opens: where its members start and whether a
- * leading `!` or `^` negates it. Undefined when the `[` opens no set —
- * nothing closes it, or the first thing after it is the `]`, which closes
- * the set here rather than standing for itself.
+ * The set the `[` at `open` opens: where its members start, the `]` that
+ * closes it, and whether a leading `!` or `^` negates it. Undefined when the
+ * `[` opens no set — nothing closes it, or the first thing after it is the
+ * `]`, which closes the set here rather than standing for itself.
  */
 function setOpenedAt(
   pattern: string,
   open: number,
-): { members: number; negated: boolean } | undefined {
+): { members: number; close: number; negated: boolean } | undefined {
   const lead = pattern[open + 1]
   const negated = lead === '!' || lead === '^'
   const members = open + (negated ? 2 : 1)
-  return pattern.indexOf(']', members) > members
-    ? { members, negated }
-    : undefined
+  const close = pattern.indexOf(']', members)
+  return close > members ? { members, close, negated } : undefined
+}
+
+/**
+ * The whole regex for a set in which a `-` stands for itself: one that is
+ * first or last among the members or comes straight after a range, or that
+ * a range starts or ends at. Undefined for a set with no such `-`, which is
+ * emitted a character at a time like any other text, to the string it always
+ * was; and for one that holds a wildcard, which is not read as a set at all.
+ *
+ * The two engines this string is compiled by read a `-` alike in one place
+ * only, first among the members. The regex engine of a macOS sandbox profile
+ * takes a backslash inside a set for a member, so `\-` escapes nothing there
+ * (`[^/\-a]` is the range from `\` to `a`, and lets a `-` through), and it
+ * refuses a set that ends in one character and a `-` (`[a-]`), and the whole
+ * profile with it. So the `-` goes first, ahead of the `/` a negated set
+ * excludes, and a range that starts or ends at one is written as the `-` and
+ * the rest of the range: from `.`, the character after it, or up to `,`, the
+ * one before. Behind that `-` a backslash is the only member that needs one
+ * in front of it, so the others are written as they are, a backslash before
+ * a `.` being one more member to that engine.
+ */
+function setWithDashFirst(body: string, negated: boolean): string | undefined {
+  if (/[*?]/.test(body)) return undefined
+  let dash = false
+  let members = ''
+  const member = (char: string): string => (char === '\\' ? '\\\\' : char)
+  for (let i = 0; i < body.length; i++) {
+    let low = body[i]!
+    let high = low
+    if (body[i + 1] === '-' && i + 2 < body.length) {
+      high = body[i + 2]!
+      i += 2
+    }
+    if (low === '-' || high === '-') {
+      dash = true
+      if (low === high) continue
+      if (low === '-') low = '.'
+      else high = ','
+    }
+    members += low === high ? member(low) : `${member(low)}-${member(high)}`
+  }
+  if (!dash) return undefined
+  if (negated) return `[^-/${members}]`
+  // Alone in its set, the `-` is as well written without one.
+  return members === '' ? '-' : `[-${members}]`
 }
 
 /**
