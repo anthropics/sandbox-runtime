@@ -56,10 +56,11 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   // The largest rendering kept on the command line: the kernel's limit less
   // the NUL, less the 4 KiB left for a prefix of the caller's own.
   const INLINE_MAX = MAX_ARG_STRLEN - 1 - 4096
-  // The one rendered shape: the profile's path, then the options left before
-  // and the words left after `--args 9`.
+  // The one rendered shape: the profile's path, bubblewrap by the absolute
+  // path it was found at, then the options left before and the words left
+  // after `--args 9`.
   const VIA_ARGS_FILE =
-    /^\/bin\/sh -c 'exec 9<"\$1" && shift && exec "\$@"' srt-args (\S+) bwrap (.*?) ?--args 9 (.*)$/s
+    /^\/bin\/sh -c 'exec 9<"\$1" && shift && exec "\$@"' srt-args (\S+) \/\S*\/bwrap (.*?) ?--args 9 (.*)$/s
   const MODULE = join(
     import.meta.dir,
     '../../src/sandbox/linux-sandbox-utils.ts',

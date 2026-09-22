@@ -23,7 +23,7 @@ import {
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
-import { whichSync } from '../utils/which.js'
+import { isPathQualified, whichSync } from '../utils/which.js'
 import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
@@ -50,6 +50,12 @@ import {
   linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinux } from './read-deny-glob.js'
+import {
+  describeUnavailableHostHelper,
+  findHostHelper,
+  hostSearchPath,
+  writableNamedHelperWarning,
+} from './host-helpers.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -956,8 +962,10 @@ async function initialize(
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
       // Async: the global-npm fallback spawns `npm root -g`.
       javaAgentJarPath =
-        (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
-        undefined
+        (await getJavaProxyAgentJarPathAsync(
+          config.javaAgentJarPath,
+          hostSearchPath(hostHelperWritePaths(), NPM_LOOKS_UP),
+        )) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -984,6 +992,7 @@ async function initialize(
           httpProxyPort,
           socksProxyPort,
           config.socatPath,
+          hostHelperWritePaths(),
         )
       }
 
@@ -1025,6 +1034,23 @@ function isSandboxingEnabled(): boolean {
   return config !== undefined
 }
 
+/** What `npm root -g` looks up on PATH: npm itself, and the node its script
+ *  is run by. */
+const NPM_LOOKS_UP = ['npm', 'node'] as const
+
+/**
+ * What a wrap under the initialized configuration lets the sandboxed command
+ * write, for finding the programs this library runs on the host outside it
+ * (see `findHostHelper`). `undefined` when no writes are restricted: the
+ * filesystem policy is off, or there is no configuration yet, in which case
+ * `initialize()` runs the dependency check again once there is one.
+ */
+function hostHelperWritePaths(): string[] | undefined {
+  return !config || config.filesystem.disabled
+    ? undefined
+    : getFsWriteConfig().allowOnly
+}
+
 /**
  * Platform-independent part of the dependency check. Returns either
  * a finished result (POSIX, unsupported platform, or a Windows
@@ -1049,14 +1075,36 @@ function checkDependenciesCommon(
     // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
     // profiles take regex patterns directly, so rg is never invoked there.
     const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
-    if (whichSync(rgToCheck.command) === null) {
-      errors.push(`ripgrep (${rgToCheck.command}) not found`)
+    const allowedWritePaths = hostHelperWritePaths()
+    const rgNotFound = `ripgrep (${rgToCheck.command}) not found`
+    if (isPathQualified(rgToCheck.command)) {
+      // Named outright: run as given, and reported when the sandboxed command
+      // may write it.
+      if (whichSync(rgToCheck.command) === null) errors.push(rgNotFound)
+      const warning = writableNamedHelperWarning(
+        'ripgrep.command',
+        rgToCheck.command,
+        allowedWritePaths,
+      )
+      if (warning !== undefined) warnings.push(warning)
+    } else {
+      // A bare name is looked for the way the wrap will look for it: on PATH,
+      // outside what the sandboxed command may write.
+      const search = findHostHelper(rgToCheck.command, allowedWritePaths)
+      if (search.path === null) {
+        errors.push(
+          search.skipped.length > 0
+            ? describeUnavailableHostHelper(rgToCheck.command, search)
+            : rgNotFound,
+        )
+      }
     }
 
     const linuxDeps = checkLinuxDependencies({
       seccompConfig: config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
+      allowedWritePaths,
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
@@ -1107,7 +1155,10 @@ async function checkDependenciesAsync(
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
   if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+    await getApplySeccompBinaryPathAsync(
+      config?.seccomp?.applyPath,
+      hostSearchPath(hostHelperWritePaths(), NPM_LOOKS_UP),
+    )
   }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done

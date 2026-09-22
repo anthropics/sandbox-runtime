@@ -15,15 +15,35 @@ let pendingGlobalNpmPaths: Promise<string[]> | null = null
 const NPM_ROOT_COMMAND = 'npm root -g'
 const NPM_ROOT_TIMEOUT_MS = 5000
 
+/** The environment `npm root -g` runs in: this process's, with `searchPath`
+ *  as its PATH where one is given. npm is a script that finds `node` by name,
+ *  so what it may be taken from has to hold for what it starts as well. */
+function npmEnvironment(searchPath: string | undefined): NodeJS.ProcessEnv {
+  return searchPath === undefined
+    ? process.env
+    : { ...process.env, PATH: searchPath }
+}
+
+/** Forget what `npm root -g` answered. For tests only: the answer is kept for
+ *  the life of the process, which is what a test of the look-up has to undo. */
+export function resetGlobalNpmPathsForTesting(): void {
+  cachedGlobalNpmPaths = null
+  pendingGlobalNpmPaths = null
+}
+
 /**
  * Get paths to check for globally installed @anthropic-ai/sandbox-runtime package.
  * This is used as a fallback when the binaries aren't bundled (e.g., native builds).
+ *
+ * `searchPath` is the PATH `npm`, and what it starts, are looked up on: the
+ * caller that knows what the sandboxed command may write passes one with
+ * those places left out (see `hostSearchPath`). Without it, this process's.
  *
  * Blocks the event loop on `npm root -g` (~100 ms) the first time it is
  * called in a process unless {@link getGlobalNpmPathsAsync} has already
  * filled the cache; initialize() goes through the async variant.
  */
-export function getGlobalNpmPaths(): string[] {
+export function getGlobalNpmPaths(searchPath?: string): string[] {
   if (cachedGlobalNpmPaths) return cachedGlobalNpmPaths
 
   let npmRoot: string | undefined
@@ -32,6 +52,7 @@ export function getGlobalNpmPaths(): string[] {
       encoding: 'utf8',
       timeout: NPM_ROOT_TIMEOUT_MS,
       stdio: ['pipe', 'pipe', 'ignore'],
+      env: npmEnvironment(searchPath),
     })
   } catch {
     // npm not available or failed
@@ -47,7 +68,7 @@ export function getGlobalNpmPaths(): string[] {
  * timed-out npm yields just the static fallback locations, as the sync
  * variant does.
  */
-export function getGlobalNpmPathsAsync(): Promise<string[]> {
+export function getGlobalNpmPathsAsync(searchPath?: string): Promise<string[]> {
   if (cachedGlobalNpmPaths) return Promise.resolve(cachedGlobalNpmPaths)
   if (pendingGlobalNpmPaths) return pendingGlobalNpmPaths
 
@@ -55,7 +76,11 @@ export function getGlobalNpmPathsAsync(): Promise<string[]> {
     try {
       const child = exec(
         NPM_ROOT_COMMAND,
-        { encoding: 'utf8', timeout: NPM_ROOT_TIMEOUT_MS },
+        {
+          encoding: 'utf8',
+          timeout: NPM_ROOT_TIMEOUT_MS,
+          env: npmEnvironment(searchPath),
+        },
         (err, stdout) => resolve(err ? undefined : stdout),
       )
       // Match execSync's closed stdin: npm never waits on it.
@@ -216,6 +241,7 @@ export function getApplySeccompBinaryPath(
  */
 export async function getApplySeccompBinaryPathAsync(
   seccompBinaryPath?: string,
+  searchPath?: string,
 ): Promise<string | null> {
   const cacheKey = seccompBinaryPath ?? ''
   if (applySeccompPathCache.has(cacheKey)) {
@@ -226,7 +252,7 @@ export async function getApplySeccompBinaryPathAsync(
   const result =
     local !== undefined
       ? local
-      : findGlobalApplySeccompPath(await getGlobalNpmPathsAsync())
+      : findGlobalApplySeccompPath(await getGlobalNpmPathsAsync(searchPath))
   applySeccompPathCache.set(cacheKey, result)
   return result
 }
