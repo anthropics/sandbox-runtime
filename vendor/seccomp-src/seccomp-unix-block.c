@@ -30,8 +30,12 @@
  *   ./seccomp-unix-block <output-file> [arch] [unix|namespaces]
  *
  * If arch is given (x86_64 or aarch64), the filter is generated for that
- * architecture instead of the native one. Lets a single-arch builder emit
- * filters for both x64 and arm64.
+ * architecture instead of the native one. For the `unix` rule set that lets
+ * a single-arch builder emit filters for both x64 and arm64. For `namespaces`
+ * it does only with a libseccomp that names every call in the filter (2.6.1
+ * and later); with an older one the other architecture's filter is refused,
+ * see add_namespace_rules. build.ts generates the builder's own architecture
+ * only.
  *
  * The third argument picks the rule set. `unix` (the default) is the filter
  * described above. `namespaces` is a second, separate filter that
@@ -67,9 +71,16 @@
 #define SRT_CLONE_NEWUSER 0x10000000UL
 
 /*
- * The rules of the `namespaces` filter. A syscall this libseccomp cannot name
- * fails the build rather than being left out: a filter missing one of these is
- * a filter that does not do what its name says.
+ * The rules of the `namespaces` filter. None is ever left out: a filter
+ * missing one of these is a filter that does not do what its name says. A
+ * call this libseccomp cannot name for the architecture fails the build,
+ * except the two newest, which go in by number where that can be done (below).
+ * "Cannot name" is any negative answer to the lookup: -1 is a name the library
+ * does not know, and a number below that is a name it knows and reports absent
+ * on the architecture. The plain seccomp_rule_add() takes such a number, adds
+ * nothing and returns success, and does the same with a call the builder's
+ * architecture has and the target has not. So every rule here goes in with
+ * seccomp_rule_add_exact(), which fails instead.
  */
 static int add_namespace_rules(scmp_filter_ctx ctx, int native,
                                const char *arch_name) {
@@ -82,13 +93,14 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
     const char *flag_calls[] = { "unshare", "clone" };
     for (size_t i = 0; i < sizeof(flag_calls) / sizeof(flag_calls[0]); i++) {
         int nr = seccomp_syscall_resolve_name(flag_calls[i]);
-        if (nr == __NR_SCMP_ERROR) {
-            fprintf(stderr, "Error: libseccomp does not know %s\n", flag_calls[i]);
+        if (nr < 0) {
+            fprintf(stderr, "Error: libseccomp cannot name %s on this architecture\n",
+                    flag_calls[i]);
             return -1;
         }
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), nr, 1,
-                              SCMP_A0(SCMP_CMP_MASKED_EQ, SRT_CLONE_NEWUSER,
-                                      SRT_CLONE_NEWUSER));
+        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), nr, 1,
+                                    SCMP_A0(SCMP_CMP_MASKED_EQ, SRT_CLONE_NEWUSER,
+                                            SRT_CLONE_NEWUSER));
         if (rc < 0) {
             fprintf(stderr, "Error: Failed to add %s rule: %s\n", flag_calls[i],
                     strerror(-rc));
@@ -102,11 +114,11 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
      * does cover; EPERM reads as a real failure and breaks thread creation. */
     {
         int nr = seccomp_syscall_resolve_name("clone3");
-        if (nr == __NR_SCMP_ERROR) {
-            fprintf(stderr, "Error: libseccomp does not know clone3\n");
+        if (nr < 0) {
+            fprintf(stderr, "Error: libseccomp cannot name clone3 on this architecture\n");
             return -1;
         }
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(ENOSYS), nr, 0);
+        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(ENOSYS), nr, 0);
         if (rc < 0) {
             fprintf(stderr, "Error: Failed to add clone3 rule: %s\n", strerror(-rc));
             return -1;
@@ -114,8 +126,8 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
     }
 
     /* Joining another namespace, and the calls that change a mount tree, the
-     * old interface and the fd-based one, as far as this libseccomp names
-     * them. Two newer ones follow. */
+     * old interface and the fd-based one. A libseccomp that cannot name one
+     * of these fails the build. The two calls newer than these follow. */
     const char *refused[] = {
         "setns",      "mount",    "umount2",  "pivot_root",
         "open_tree",  "move_mount", "fsopen", "fsconfig",
@@ -123,13 +135,13 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
     };
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
         int nr = seccomp_syscall_resolve_name(refused[i]);
-        if (nr == __NR_SCMP_ERROR) {
+        if (nr < 0) {
             fprintf(stderr,
-                    "Error: libseccomp does not know %s\n",
+                    "Error: libseccomp cannot name %s on this architecture\n",
                     refused[i]);
             return -1;
         }
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
+        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
         if (rc < 0) {
             fprintf(stderr, "Error: Failed to add %s rule: %s\n", refused[i],
                     strerror(-rc));
@@ -159,7 +171,7 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
     };
     for (size_t i = 0; i < sizeof(newer) / sizeof(newer[0]); i++) {
         int nr = seccomp_syscall_resolve_name(newer[i].name);
-        if (nr == __NR_SCMP_ERROR) {
+        if (nr < 0) {
             if (!native) {
                 const struct scmp_version *v = seccomp_version();
                 fprintf(stderr,
@@ -173,7 +185,7 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
             }
             nr = newer[i].nr;
         }
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
+        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), nr, 0);
         if (rc < 0) {
             fprintf(stderr, "Error: Failed to add %s rule: %s\n", newer[i].name,
                     strerror(-rc));

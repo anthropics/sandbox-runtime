@@ -25,10 +25,11 @@
  * /proc/N/mem. For the inner init that was always so. It matters for the
  * outer half where the fresh /proc below cannot be mounted (a masked /proc
  * underneath, the enableWeakerNestedSandbox case): the command then still
- * sees the outer half, which shares its user namespace and is under no
- * filter, and a command started by uid 0 holds the capabilities to reach
- * into a dumpable process there. The outer half also takes the namespaces
- * filter for itself, which costs it nothing it uses.
+ * sees the outer half, which shares its user namespace and does not have the
+ * command's filters, and a command started by uid 0 holds the capabilities
+ * to reach into a dumpable process there. The outer half also takes the
+ * namespaces filter for itself (not the Unix-socket one, and not when
+ * SRT_ALLOW_NESTED_USERNS=1), which costs it nothing it uses.
  *
  * Any failure to set up the nested namespaces aborts with a non-zero exit
  * status; we never fall back to running the command without isolation.
@@ -124,10 +125,12 @@
  * When SRT_OBSERVE_SOCK is set the worker installs a second seccomp filter
  * that traps write-intent filesystem syscalls to
  * SECCOMP_RET_USER_NOTIF, then ships the listener fd to the OUTER STUB over
- * a pre-fork socketpair. The outer stub is never under either filter, so it
- * services every notification with SECCOMP_USER_NOTIF_FLAG_CONTINUE — the
- * workload's behaviour is unchanged — and writes one JSON line per
- * observed call to the SRT_OBSERVE_SOCK unix socket (a Node net.Server).
+ * a pre-fork socketpair. The outer stub is under neither that filter nor the
+ * Unix-socket one (only the namespaces filter, which refuses nothing it
+ * calls), so it services every notification with
+ * SECCOMP_USER_NOTIF_FLAG_CONTINUE — the workload's behaviour is unchanged —
+ * and writes one JSON line per observed call to the SRT_OBSERVE_SOCK unix
+ * socket (a Node net.Server).
  *
  * Paths are read from the workload's address space with process_vm_readv.
  * That memory is ATTACKER-CONTROLLED and racy (the workload can rewrite the
@@ -344,11 +347,13 @@ static int recv_fd(int sock) {
  * filter with no listener, which makes matched syscalls fail ENOSYS).
  *
  * Audited syscalls between the seccomp() return and execve():
- *   sendmsg, close, close, prctl(PR_SET_SECCOMP), execve
- * None are in the observe match set (write-intent fs) and none are
- * in the unix-block set (socket(AF_UNIX)/io_uring), so the worker cannot
- * trap on itself before exec. perror()/snprintf() are deliberately avoided
- * post-filter to keep this set closed. */
+ *   sendmsg, close, close, prctl(PR_SET_SECCOMP) once for each of the
+ *   namespaces and unix-block filters, execve
+ * None are in the observe match set (write-intent fs), none are in the
+ * namespaces set (user-namespace creation, setns, the mount calls) and none
+ * are in the unix-block set (socket(AF_UNIX)/io_uring), so the worker cannot
+ * trap on itself, or be refused, before exec. perror()/snprintf() are
+ * deliberately avoided post-filter to keep this set closed. */
 static void install_observe_filter(int sp_fd) {
     if (sp_fd < 0) return;
 
@@ -513,8 +518,10 @@ static int connect_observe_sock(const char *path) {
 }
 
 /* Service the notify fd until the inner-init child exits. Runs in the OUTER
- * STUB, which never installed either seccomp filter. Always replies CONTINUE,
- * even when out_sock < 0, so a missing listener never wedges the workload. */
+ * STUB, which installed neither the observe nor the unix-block filter, only
+ * the namespaces one, and calls nothing that one refuses. Always replies
+ * CONTINUE, even when out_sock < 0, so a missing listener never wedges the
+ * workload. */
 static void supervise(pid_t child, int notify_fd, int out_sock,
                       const char *enc, int host_proc_fd) {
     struct seccomp_notif_sizes sz;
