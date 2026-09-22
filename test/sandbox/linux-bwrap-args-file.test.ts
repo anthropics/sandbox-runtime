@@ -357,8 +357,12 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   it('holds one fd per pending profile and gives them all back at cleanup, a refused wrap included', () => {
     const seen = isolated(`
       const openFds = () => fs.readdirSync('/proc/self/fd').length
-      // The runtime opens event-loop fds of its own on the first wrap.
+      // The runtime opens event-loop fds of its own on the first wrap. That
+      // wrap also runs a process and waits for it (the seccomp helper, asked
+      // what it supports), and the runtime closes such a process's pipes
+      // only on a later turn of the event loop.
       await wrap(small)
+      await new Promise(resolve => setTimeout(resolve, 0))
       const baseline = openFds()
       await wrap(overLong)
       await wrap(overLong)

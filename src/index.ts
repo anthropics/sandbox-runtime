@@ -45,6 +45,8 @@ export type {
 export type { SandboxViolationEvent } from './sandbox/macos-sandbox-utils.js'
 export {
   type SandboxDependencyCheck,
+  type SandboxDependencyDetail,
+  type SandboxFeatures,
   LinuxSandboxProfileError,
   type LinuxSandboxProfileErrorCode,
 } from './sandbox/linux-sandbox-utils.js'

@@ -29,28 +29,55 @@ run([
   '-lseccomp',
 ])
 
-const bpf: Record<string, Buffer> = {}
-for (const target of ['x86_64', 'aarch64']) {
-  const tmp = join(OUT, target + '.bpf')
-  run([gen, tmp, target])
-  bpf[target] = readFileSync(tmp)
-  rmSync(tmp)
+// Two filters, which apply-seccomp stacks: `unix` refuses Unix-socket
+// creation, `namespaces` keeps the command in the namespaces the sandbox made
+// for it (see seccomp-unix-block.c). Separate arrays so that a command opted
+// out of the second still gets the first.
+//
+// For this builder's own architecture only. The helper compiled below takes
+// the arrays of its own architecture and no other, and the generator can put
+// a call its libseccomp cannot name into a filter by number only for the
+// architecture it runs on, and refuses for another one rather than leave the
+// call out. A build that does emit for another architecture (it can: the
+// generator takes the architecture as an argument) needs a libseccomp that
+// names every call.
+const NATIVE_TARGET = { x64: 'x86_64', arm64: 'aarch64' }[
+  process.arch as string
+]
+if (NATIVE_TARGET === undefined) {
+  throw new Error(`no seccomp filters for ${process.arch}`)
+}
+const RULE_SETS = ['unix', 'namespaces'] as const
+const bpf: Record<string, Record<string, Buffer>> = {}
+for (const target of [NATIVE_TARGET]) {
+  bpf[target] = {}
+  for (const rules of RULE_SETS) {
+    const tmp = join(OUT, `${target}.${rules}.bpf`)
+    run([gen, tmp, target, rules])
+    bpf[target][rules] = readFileSync(tmp)
+    rmSync(tmp)
+  }
 }
 rmSync(gen)
+
+function arrays(target: string): string {
+  return (
+    'static const unsigned char unix_block_bpf[] = {\n' +
+    toCArray(bpf[target].unix) +
+    '\n};\n' +
+    'static const unsigned char namespace_block_bpf[] = {\n' +
+    toCArray(bpf[target].namespaces) +
+    '\n};\n'
+  )
+}
 
 const header = join(OUT, 'unix-block-bpf.h')
 writeFileSync(
   header,
-  '#if defined(__x86_64__)\n' +
-    'static const unsigned char unix_block_bpf[] = {\n' +
-    toCArray(bpf.x86_64) +
-    '\n};\n' +
-    '#elif defined(__aarch64__)\n' +
-    'static const unsigned char unix_block_bpf[] = {\n' +
-    toCArray(bpf.aarch64) +
-    '\n};\n' +
+  `#if defined(${NATIVE_TARGET === 'x86_64' ? '__x86_64__' : '__aarch64__'})\n` +
+    arrays(NATIVE_TARGET) +
     '#else\n' +
-    '#error "unsupported architecture for unix-block BPF filter"\n' +
+    '#error "these filters were generated for another architecture"\n' +
     '#endif\n',
 )
 

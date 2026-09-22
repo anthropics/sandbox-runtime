@@ -302,6 +302,9 @@ describe.if(isLinux)(
         needsNetworkRestriction: false,
         writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
         allowAllUnixSockets: true, // we invoke apply-seccomp ourselves here
+        // ... and it makes a user namespace of its own, which a wrap with no
+        // helper in it otherwise has bubblewrap refuse (--disable-userns).
+        allowNestedUserNamespaces: true,
       })
 
       const r = spawnSync('bash', ['-c', wrapped], {

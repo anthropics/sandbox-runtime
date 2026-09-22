@@ -6,10 +6,14 @@ import {
   CAP_SETFCAP,
   CAP_SETFCAP_MISSING_MESSAGE,
   boundingCapabilitiesFromStatus,
+  bwrapCanDisableUserns,
   capabilityArgs,
   checkLinuxDependencies,
   getLinuxDependencyStatus,
+  HELPER_FEATURES_PROBE_ARGUMENT,
+  probeSeccompHelperFeatures,
   processHasBoundingCapability,
+  resetProbeCachesForTesting,
   uid0SandboxError,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 
@@ -26,14 +30,31 @@ let applySpy: ReturnType<typeof spyOn>
 let euidSpy: ReturnType<typeof spyOn> | undefined
 let spawnSyncSpy: ReturnType<typeof spyOn>
 
+// Where the mocked PATH lookup finds everything. No such directory, so that
+// nothing this file is told about a binary there can be taken for an answer
+// about a real one: what bubblewrap supports is remembered by path.
+const installed = (bin: string) => `/nonexistent/bin/${bin}`
+
 // A bwrap that exits `status`, so the uid-0 probe never runs a real binary.
 const bwrapExiting = (status: number, stderr = '') =>
   ({ status, signal: null, pid: 1, output: [], stdout: '', stderr }) as never
 
-beforeEach(() => {
-  whichSpy = spyOn(which, 'whichSync').mockImplementation(
-    (bin: string) => `/usr/bin/${bin}`,
+// The one argument the seccomp helper is run with to ask what it supports. It
+// is asked inside bubblewrap, so that is the last word of a bubblewrap run.
+const HELPER_QUESTION = HELPER_FEATURES_PROBE_ARGUMENT
+// Every spawn that was not that question, i.e. every probe of bubblewrap itself.
+const bwrapProbes = () =>
+  (spawnSyncSpy.mock.calls as unknown[][]).filter(
+    call => (call[1] as string[] | undefined)?.at(-1) !== HELPER_QUESTION,
   )
+
+beforeEach(() => {
+  // What the helper and bubblewrap support is remembered for the life of the
+  // process, which is every test file of the run. Forgotten here, so that the
+  // mocks below are what gets asked whatever ran before, and again in
+  // afterEach, so that what they answered is not what a later file is told.
+  resetProbeCachesForTesting()
+  whichSpy = spyOn(which, 'whichSync').mockImplementation(installed)
   applySpy = spyOn(seccomp, 'getApplySeccompBinaryPath').mockReturnValue(
     '/path/to/apply-seccomp',
   )
@@ -42,12 +63,23 @@ beforeEach(() => {
   euidSpy = process.geteuid
     ? spyOn(process, 'geteuid').mockReturnValue(1000)
     : undefined
-  spawnSyncSpy = spyOn(childProcess, 'spawnSync').mockReturnValue(
-    bwrapExiting(0),
-  )
+  // Answers the two questions checkLinuxDependencies asks of real binaries the
+  // way current ones do: the seccomp helper says it limits user namespaces,
+  // and bubblewrap's help lists --disable-userns. Anything else is the uid-0
+  // probe, which exits 0 unless a test says otherwise.
+  spawnSyncSpy = spyOn(childProcess, 'spawnSync').mockImplementation(((
+    _command: string,
+    args?: readonly string[],
+  ) =>
+    args?.at(-1) === HELPER_QUESTION
+      ? { ...(bwrapExiting(0) as object), stdout: 'userns-limit\n' }
+      : args?.[0] === '--help'
+        ? { ...(bwrapExiting(0) as object), stdout: '  --disable-userns\n' }
+        : bwrapExiting(0)) as never)
 })
 
 afterEach(() => {
+  resetProbeCachesForTesting()
   whichSpy.mockRestore()
   applySpy.mockRestore()
   euidSpy?.mockRestore()
@@ -60,13 +92,17 @@ describe('checkLinuxDependencies', () => {
 
     expect(result.errors).toEqual([])
     expect(result.warnings).toEqual([])
-    // A non-root caller is never asked about capabilities.
-    expect(spawnSyncSpy).not.toHaveBeenCalled()
+    expect(result.features).toEqual({ usernsLimit: true })
+    expect(result.details).toEqual([])
+    // A non-root caller is never asked about capabilities: the only thing
+    // ever run for it is the helper, to say what it supports.
+    expect(bwrapProbes()).toEqual([])
+    expect(spawnSyncSpy).toHaveBeenCalledTimes(1)
   })
 
   test('returns error when bwrap missing', () => {
     whichSpy.mockImplementation((bin: string) =>
-      bin === 'bwrap' ? null : `/usr/bin/${bin}`,
+      bin === 'bwrap' ? null : installed(bin),
     )
 
     const result = checkLinuxDependencies()
@@ -77,7 +113,7 @@ describe('checkLinuxDependencies', () => {
 
   test('returns error when socat missing', () => {
     whichSpy.mockImplementation((bin: string) =>
-      bin === 'socat' ? null : `/usr/bin/${bin}`,
+      bin === 'socat' ? null : installed(bin),
     )
 
     const result = checkLinuxDependencies()
@@ -106,6 +142,95 @@ describe('checkLinuxDependencies', () => {
     )
   })
 
+  test('each probe is made once per binary, and again after the answers are forgotten', () => {
+    const helperQuestions = () =>
+      spawnSyncSpy.mock.calls.length - bwrapProbes().length
+    const helpRequests = () =>
+      bwrapProbes().filter(call => (call[1] as string[])[0] === '--help').length
+
+    checkLinuxDependencies()
+    checkLinuxDependencies()
+    expect(helperQuestions()).toBe(1)
+    // A file that exists, since bubblewrap's mode is looked at for real: only
+    // its help text is the mock's.
+    expect(bwrapCanDisableUserns('/bin/sh')).toBe(true)
+    expect(bwrapCanDisableUserns('/bin/sh')).toBe(true)
+    expect(helpRequests()).toBe(1)
+
+    resetProbeCachesForTesting()
+
+    checkLinuxDependencies()
+    expect(helperQuestions()).toBe(2)
+    expect(bwrapCanDisableUserns('/bin/sh')).toBe(true)
+    expect(helpRequests()).toBe(2)
+  })
+
+  test('the helper is asked in a user namespace or not at all, and for so long', () => {
+    checkLinuxDependencies()
+    const [, argv, options] = spawnSyncSpy.mock.calls[0] as [
+      string,
+      string[],
+      { timeout?: number },
+    ]
+    expect(argv.at(-1)).toBe(HELPER_QUESTION)
+    // Required, as it is for a wrap. Taken only where one can be had, the
+    // helper file would run in this process's own where none can.
+    expect(argv).toContain('--unshare-user')
+    expect(argv).not.toContain('--unshare-user-try')
+    expect(argv).not.toContain('--unshare-all')
+    expect(options.timeout).toBe(5000)
+  })
+
+  test('a helper that was given its time and said nothing is not asked again; one that could not be asked is', () => {
+    const helperQuestions = () =>
+      spawnSyncSpy.mock.calls.length - bwrapProbes().length
+    const answerTheQuestionWith = (answer: object) =>
+      spawnSyncSpy.mockImplementation(((
+        _command: string,
+        args?: readonly string[],
+      ) =>
+        args?.at(-1) === HELPER_QUESTION ? answer : bwrapExiting(0)) as never)
+
+    // Every asking of this one would hold the caller up for as long again.
+    answerTheQuestionWith({
+      ...(bwrapExiting(0) as object),
+      status: null,
+      signal: 'SIGTERM',
+      error: Object.assign(new Error('spawnSync bwrap ETIMEDOUT'), {
+        code: 'ETIMEDOUT',
+      }),
+    })
+    expect(checkLinuxDependencies().features).toEqual({
+      usernsLimit: 'unknown',
+    })
+    expect(checkLinuxDependencies().features).toEqual({
+      usernsLimit: 'unknown',
+    })
+    expect(helperQuestions()).toBe(1)
+
+    // A bubblewrap that fails, or is not there to run, costs nothing to try
+    // again, and may have been put right since.
+    resetProbeCachesForTesting()
+    answerTheQuestionWith(
+      bwrapExiting(1, 'bwrap: Creating new namespace failed: no permission\n'),
+    )
+    checkLinuxDependencies()
+    expect(checkLinuxDependencies().details).toEqual([])
+    expect(helperQuestions()).toBe(3)
+    answerTheQuestionWith({
+      ...(bwrapExiting(0) as object),
+      status: null,
+      error: Object.assign(new Error('spawnSync bwrap ENOENT'), {
+        code: 'ENOENT',
+      }),
+    })
+    checkLinuxDependencies()
+    expect(checkLinuxDependencies().features).toEqual({
+      usernsLimit: 'unknown',
+    })
+    expect(helperQuestions()).toBe(5)
+  })
+
   // Wired both ways without gating on the box: a uid-0 caller probes exactly
   // when this process's own bounding set lacks CAP_SETFCAP.
   test.if(process.geteuid !== undefined)(
@@ -113,12 +238,12 @@ describe('checkLinuxDependencies', () => {
     () => {
       euidSpy?.mockReturnValue(0)
       whichSpy.mockImplementation((bin: string) =>
-        bin === 'bwrap' ? '/usr/bin/bwrap-wiring' : `/usr/bin/${bin}`,
+        bin === 'bwrap' ? '/usr/bin/bwrap-wiring' : installed(bin),
       )
 
       const result = checkLinuxDependencies()
 
-      expect(spawnSyncSpy.mock.calls.length > 0).toBe(lacksSetfcap)
+      expect(bwrapProbes().length > 0).toBe(lacksSetfcap)
       expect(result.errors).toEqual([])
       expect(result.warnings).toEqual([])
     },
@@ -127,13 +252,13 @@ describe('checkLinuxDependencies', () => {
   test('a missing bwrap is blamed on the binary, not on capabilities', () => {
     euidSpy?.mockReturnValue(0)
     whichSpy.mockImplementation((bin: string) =>
-      bin === 'bwrap' ? null : `/usr/bin/${bin}`,
+      bin === 'bwrap' ? null : installed(bin),
     )
 
     const result = checkLinuxDependencies()
 
     expect(result.errors).toEqual(['bubblewrap (bwrap) not installed'])
-    expect(spawnSyncSpy).not.toHaveBeenCalled()
+    expect(bwrapProbes()).toEqual([])
   })
 
   test('passes custom applyPath through to the resolver', () => {
@@ -154,6 +279,25 @@ describe('checkLinuxDependencies', () => {
 
     expect(result.warnings).toEqual([])
     expect(applySpy).not.toHaveBeenCalled()
+  })
+
+  // The wrap takes an empty name for none and looks for the helper as a file,
+  // so the check has to as well.
+  test('an empty argv0 is no argv0: the helper is looked for as a file', () => {
+    const seccompConfig = { argv0: '' }
+    // And asked as a file is, where there is one.
+    expect(probeSeccompHelperFeatures(seccompConfig)).not.toBeNull()
+    expect(checkLinuxDependencies({ seccompConfig }).features).toEqual({
+      usernsLimit: true,
+    })
+
+    applySpy.mockReturnValue(null)
+    expect(checkLinuxDependencies({ seccompConfig }).warnings).toContain(
+      'seccomp not available - unix socket access not restricted',
+    )
+    expect(getLinuxDependencyStatus({ seccompConfig }).hasSeccompApply).toBe(
+      false,
+    )
   })
 
   test('explicit bwrapPath: skips PATH lookup, errors when not executable', () => {
@@ -370,7 +514,7 @@ describe('getLinuxDependencyStatus', () => {
 
   test('reports bwrap unavailable when not installed', () => {
     whichSpy.mockImplementation((bin: string) =>
-      bin === 'bwrap' ? null : `/usr/bin/${bin}`,
+      bin === 'bwrap' ? null : installed(bin),
     )
 
     const status = getLinuxDependencyStatus()
@@ -381,7 +525,7 @@ describe('getLinuxDependencyStatus', () => {
 
   test('reports socat unavailable when not installed', () => {
     whichSpy.mockImplementation((bin: string) =>
-      bin === 'socat' ? null : `/usr/bin/${bin}`,
+      bin === 'socat' ? null : installed(bin),
     )
 
     const status = getLinuxDependencyStatus()

@@ -1057,9 +1057,20 @@ function checkDependenciesCommon(
       seccompConfig: config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
+      allowAllUnixSockets: getAllowAllUnixSockets(),
+      allowNestedUserNamespaces: getAllowNestedUserNamespaces(),
+      enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
+    return {
+      done: {
+        errors,
+        warnings,
+        features: linuxDeps.features,
+        details: linuxDeps.details,
+      },
+    }
   } else if (platform === 'windows') {
     let srtWin: SrtWinSpawn
     try {
@@ -1527,6 +1538,10 @@ function getEnableWeakerNestedSandbox(): boolean | undefined {
   return config?.enableWeakerNestedSandbox
 }
 
+function getAllowNestedUserNamespaces(): boolean | undefined {
+  return config?.allowNestedUserNamespaces
+}
+
 function getEnableWeakerNetworkIsolation(): boolean | undefined {
   return config?.enableWeakerNetworkIsolation
 }
@@ -1822,6 +1837,7 @@ async function wrapWithSandbox(
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
+        allowNestedUserNamespaces: getAllowNestedUserNamespaces(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),

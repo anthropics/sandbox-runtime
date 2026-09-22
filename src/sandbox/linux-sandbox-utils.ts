@@ -4,7 +4,7 @@ import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
+import type { ChildProcess, SpawnSyncReturns } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, type RipgrepConfig } from '../utils/ripgrep.js'
@@ -72,6 +72,12 @@ export interface LinuxSandboxParams {
    */
   maskedFileStoreDir?: string
   enableWeakerNestedSandbox?: boolean
+  /**
+   * Let the command create user namespaces of its own. Off by default,
+   * because every write deny is a read-only bind and a bind holds only in the
+   * mount namespace it was made in: see {@link NESTED_USERNS_ENV}.
+   */
+  allowNestedUserNamespaces?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: RipgrepConfig
@@ -555,7 +561,10 @@ export function boundingCapabilitiesFromStatus(
  * a creator holding CAP_SETFCAP. Under the helper a uid-0 caller's command
  * therefore has a full set inside that nested namespace, which is
  * identity-mapped to the caller's uid 0, and the filesystem policy there
- * rests on the nested namespace's mount copies being locked. Without the
+ * rests on the helper's namespaces filter refusing the calls that change a
+ * mount tree: the nested namespace's mount copies are locked, which refuses
+ * the unmount of any one of them, but not the whole tree being moved aside
+ * with pivot_root and dropped with a lazy unmount. Without the
  * helper (`allowAllUnixSockets`, or no usable helper binary) the command runs
  * in bwrap's own namespaces and `--cap-drop ALL` is what stops it unmounting
  * a deny.
@@ -1005,7 +1014,401 @@ export type LinuxDependencyStatus = {
 export type SandboxDependencyCheck = {
   warnings: string[]
   errors: string[]
+  /**
+   * What was found, as data, for a caller that has to act on it rather than
+   * show it. Linux only; absent elsewhere.
+   */
+  features?: SandboxFeatures
+  /**
+   * The entries of `warnings` and `errors` that have a name a caller can
+   * match on. Every one of them is in those lists too, with the same text.
+   */
+  details?: SandboxDependencyDetail[]
 }
+
+export type SandboxFeatures = {
+  /**
+   * Whether a sandboxed command is kept from creating user namespaces of its
+   * own, which is what the write denies rest on (see
+   * {@link NESTED_USERNS_ENV}). `true`: the seccomp helper in use has the
+   * limit, or no helper is used and bubblewrap can impose it. `false`: nobody
+   * imposes it: the helper was asked and has not got it, the configuration
+   * gives it up (allowNestedUserNamespaces), or there is no helper and this
+   * bubblewrap cannot, or is not asked to under enableWeakerNestedSandbox.
+   * `'unknown'`: a helper is in the chain and could not be asked: one that is
+   * part of the caller's own binary and only reachable inside the sandbox, or
+   * one there was no working bubblewrap to ask inside of, or one that did not
+   * answer in time. The question is put in more namespaces than a wrap
+   * without network restriction needs, a network namespace among them, so
+   * this is also what a host that allows bubblewrap the others and not that
+   * one reads, though the limit is in force there.
+   */
+  usernsLimit: boolean | 'unknown'
+}
+
+export type SandboxDependencyDetail = {
+  /** Stable, lower snake case. */
+  code:
+    | 'helper_lacks_userns_limit'
+    | 'bwrap_lacks_disable_userns'
+    | 'no_userns_limit_in_weaker_nested_sandbox'
+  level: 'warning' | 'error'
+  message: string
+}
+
+/**
+ * Read by the seccomp helper, never by this process, and given its value on
+ * every wrap from the configuration alone, twice over: bubblewrap is told to
+ * remove what the caller's own environment holds under this name, and the
+ * helper's own command line starts with an assignment of it (see
+ * helperEnvironmentPrefix), which holds against a shell start-up file, such
+ * as one BASH_ENV names, putting it back between bubblewrap and the helper.
+ * So a value in the caller's environment decides nothing. What is outside
+ * that is a caller whose environment makes the intermediate shell run code
+ * of its choosing, which can do more than set a variable, and always could.
+ *
+ * What it switches. The write denies are read-only binds, and a bind protects
+ * a path only in the mount namespace it was made in. Creating a user
+ * namespace takes no capability and gives a full set over a private copy of
+ * the mount tree, from which the binds can be detached all at once; a
+ * directory opened beforehand then reaches the denied names with nothing over
+ * them. So by default the command cannot create one: the helper refuses the
+ * calls with a seccomp filter and sets user.max_user_namespaces to zero in
+ * the namespace it made, and where there is no helper bubblewrap is given
+ * --disable-userns. `1` here lifts all of that for a command that has to make
+ * namespaces itself. It does not change the helper keeping itself
+ * non-dumpable, which is not a limit on the command.
+ */
+const NESTED_USERNS_ENV = 'SRT_ALLOW_NESTED_USERNS'
+
+/** Asks the helper what it supports; see apply-seccomp.c. */
+const HELPER_FEATURES_ENV = 'SRT_HELPER_FEATURES'
+const HELPER_FEATURE_USERNS_LIMIT = 'userns-limit'
+/**
+ * What a helper that does not know the question is left trying to run. Nothing
+ * can be created in the root of procfs, by anyone, so this cannot exist.
+ */
+export const HELPER_FEATURES_PROBE_ARGUMENT = '/proc/srt-helper-features'
+
+/**
+ * Assignments the helper's own command line starts with, so that its two
+ * variables hold what the configuration says whatever ran between bubblewrap
+ * clearing them and the helper starting: the wrap reaches the helper through a
+ * shell, and a shell reads start-up files the caller's environment can name.
+ * An assignment before a command applies to that command alone and is made
+ * after any such file has been read. `0` reads as off to the helper, which
+ * acts only on `1`.
+ */
+function helperEnvironmentPrefix(allowNestedUserNamespaces: boolean): string {
+  return (
+    `${NESTED_USERNS_ENV}=${allowNestedUserNamespaces ? '1' : '0'} ` +
+    `${HELPER_FEATURES_ENV}=0 `
+  )
+}
+
+/**
+ * The name a helper that is part of the caller's own binary is reached under
+ * (`seccomp.argv0`), or undefined when the helper is a file of its own. An
+ * empty name is no name. The dependency check and the wrap both ask here, so
+ * they cannot take the same configuration two ways.
+ */
+function embeddedHelperArgv0(
+  seccompConfig?: SeccompConfig,
+): string | undefined {
+  return seccompConfig?.argv0 || undefined
+}
+
+/**
+ * The bubblewrap a probe or a wrap will run, or null when there is none. A
+ * function where looking it up costs something (on Node a PATH lookup is a
+ * process of its own) and the answer may not be needed: it is called only on
+ * the path that uses it.
+ */
+type BwrapSource = string | null | (() => string | null)
+
+function resolveBwrap(bwrap: BwrapSource): string | null {
+  return typeof bwrap === 'function' ? bwrap() : bwrap
+}
+
+/**
+ * What the helper is asked inside of. The file the helper is resolved to may
+ * be one a sandboxed command could write (a path the operator named inside a
+ * write root, a copy under the home directory), so it is run for this the way
+ * it is run for a command: by bubblewrap, never by this process. The
+ * confinement is fixed and takes nothing from the policy: nothing writable,
+ * devices of its own, namespaces of its own, the network one holding nothing
+ * but its own loopback, no capabilities. What is left to a file put in the
+ * helper's place is to read what this user can read, and to connect to a Unix
+ * socket that has a path.
+ *
+ * The user namespace is required, as it is for a wrap, and not taken where
+ * one can be had, as --unshare-all would: without one the file runs in this
+ * process's user namespace, and from there bubblewrap's own process, which
+ * stays in this mount namespace, can be reached through /proc and written
+ * through. Where none can be made no command can be wrapped either, so there
+ * is nobody the answer would be for. No fresh /proc: the helper answers at
+ * the top of main, before it would read anything there, and a container that
+ * does not allow a procfs mount would refuse the whole probe for it.
+ */
+const HELPER_PROBE_CONFINEMENT: readonly string[] = [
+  '--new-session',
+  '--die-with-parent',
+  '--unshare-user',
+  '--unshare-pid',
+  '--unshare-net',
+  '--unshare-ipc',
+  '--unshare-uts',
+  '--unshare-cgroup-try',
+  '--cap-drop',
+  'ALL',
+  '--ro-bind',
+  '/',
+  '/',
+  '--dev',
+  '/dev',
+  '--setenv',
+  HELPER_FEATURES_ENV,
+  '1',
+]
+
+// One answer per helper: what a binary supports does not change while this
+// process lives. Only an answer is kept. A probe that could not be made (no
+// bubblewrap yet, or one that fails) says nothing about the helper, and is
+// made again the next time somebody asks.
+const helperFeatureProbes = new Map<string, Set<string>>()
+// Except a helper that was given all of the time allowed and said nothing:
+// asking holds this process up for that long, and would on every wrap. It is
+// not asked again, and stays "could not be asked".
+const helperProbesTimedOut = new Set<string>()
+
+/**
+ * What the seccomp helper supports, by asking it: with
+ * {@link HELPER_FEATURES_ENV} set it prints one word a line and exits 0. It is
+ * asked inside bubblewrap (see HELPER_PROBE_CONFINEMENT), with nothing of this
+ * process's environment but PATH. A helper built before the question existed
+ * ignores the variable and tries to run its first argument. So that argument
+ * is an absolute path nothing can be put at (a name in the root of procfs):
+ * with a slash in it no PATH is searched, the exec fails, cleanly, and the
+ * answer is the empty set.
+ *
+ * `null` is "could not be asked": there is no helper, or no bubblewrap to ask
+ * it in, or bubblewrap could not set the confinement up or start the helper
+ * in it (which it reports under its own name), or the run failed without a
+ * word or timed out (which is the one of these that is not tried again).
+ * Never a reason to run the helper directly. And always
+ * `null` for a helper that is part of the caller's own binary (`argv0`): its
+ * `applyPath` only has to mean something inside the sandbox (a descriptor the
+ * wrapped command line opens, typically), and running that path from here
+ * would run whatever this process happens to have there. The caller that
+ * built the helper in can ask its own binary the same question.
+ */
+export function probeSeccompHelperFeatures(
+  seccompConfig?: SeccompConfig,
+  bwrap: BwrapSource = () => whichSync('bwrap'),
+): Set<string> | null {
+  if (embeddedHelperArgv0(seccompConfig) !== undefined) return null
+  const binary = getApplySeccompBinaryPath(seccompConfig?.applyPath)
+  if (!binary) return null
+  const cached = helperFeatureProbes.get(binary)
+  if (cached !== undefined) return cached
+  if (helperProbesTimedOut.has(binary)) return null
+  const bwrapBinary = resolveBwrap(bwrap)
+  if (bwrapBinary === null) return null
+
+  let probe: SpawnSyncReturns<string>
+  try {
+    probe = spawnSync(
+      bwrapBinary,
+      [
+        ...HELPER_PROBE_CONFINEMENT,
+        '--',
+        binary,
+        HELPER_FEATURES_PROBE_ARGUMENT,
+      ],
+      {
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8',
+        env: process.env.PATH === undefined ? {} : { PATH: process.env.PATH },
+      },
+    )
+  } catch {
+    // A path the runtime will not even try to run, an empty one for instance.
+    return null
+  }
+  if (probe.error !== undefined) {
+    if ((probe.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
+      helperProbesTimedOut.add(binary)
+    }
+    return null
+  }
+  if (typeof probe.status !== 'number') return null
+  let words: string[] = []
+  if (probe.status === 0) {
+    words = (probe.stdout ?? '')
+      .split('\n')
+      .map(word => word.trim())
+      .filter(word => word.length > 0)
+  } else {
+    // A helper that does not know the question says what it could not run.
+    // Bubblewrap's own failure, which it reports under its own name, or no
+    // word from anybody: nothing was asked.
+    const complaint = (probe.stderr ?? '').trim()
+    if (complaint.length === 0 || /^bwrap: /m.test(complaint)) return null
+  }
+  const answer = new Set(words)
+  helperFeatureProbes.set(binary, answer)
+  return answer
+}
+
+// Keyed by path, like the uid-0 probe below. Only an answer is kept, as above.
+const disableUsernsProbes = new Map<string, boolean>()
+
+/**
+ * Whether this bubblewrap takes --disable-userns (0.8.0 and later) and can
+ * honour it: the option does nothing a setuid bubblewrap can do, and such a
+ * binary refuses it outright. `false` too when it could not be asked, which
+ * is then asked again the next time.
+ */
+export function bwrapCanDisableUserns(bwrap: string): boolean {
+  const cached = disableUsernsProbes.get(bwrap)
+  if (cached !== undefined) return cached
+  let can: boolean
+  try {
+    if ((fs.statSync(bwrap).mode & 0o4000) !== 0) {
+      can = false
+    } else {
+      const help = spawnSync(bwrap, ['--help'], {
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8',
+      })
+      const text = `${help.stdout ?? ''}${help.stderr ?? ''}`
+      if (help.error !== undefined || text.trim().length === 0) return false
+      can = text.includes('--disable-userns')
+    }
+  } catch {
+    return false
+  }
+  disableUsernsProbes.set(bwrap, can)
+  return can
+}
+
+/**
+ * For tests only. Forgets what the helper and bubblewrap have been found to
+ * support. What is kept above lives as long as the process, and a test run is
+ * one process for every file in it: a test that answers these probes with a
+ * mock calls this before, so that it is not handed what an earlier file learnt
+ * from the real binaries, and after, so that no later file is handed the
+ * mock's.
+ */
+export function resetProbeCachesForTesting(): void {
+  helperFeatureProbes.clear()
+  helperProbesTimedOut.clear()
+  disableUsernsProbes.clear()
+}
+
+let nestedUsernsAllowedLogged = false
+function warnNestedUserNamespacesAllowedOnce(): void {
+  if (nestedUsernsAllowedLogged) return
+  nestedUsernsAllowedLogged = true
+  logForDebugging(
+    '[Sandbox Linux] allowNestedUserNamespaces is on: a sandboxed command may create user namespaces, ' +
+      'and one that does can undo the write denies',
+    { level: 'warn' },
+  )
+}
+
+let helperLacksUsernsLimitLogged = false
+/**
+ * Whether the helper in the chain imposes the limit: `true` or `false` where
+ * it could be asked, the latter said once in the log, and `'unknown'` where
+ * it could not (a helper that is part of the caller's binary, which the
+ * caller that built it knows about; no bubblewrap to ask it in).
+ */
+function helperUsernsLimit(
+  seccompConfig: SeccompConfig | undefined,
+  bwrap: BwrapSource,
+): boolean | 'unknown' {
+  const features = probeSeccompHelperFeatures(seccompConfig, bwrap)
+  if (features === null) return 'unknown'
+  if (features.has(HELPER_FEATURE_USERNS_LIMIT)) return true
+  if (!helperLacksUsernsLimitLogged) {
+    helperLacksUsernsLimitLogged = true
+    logForDebugging(`[Sandbox Linux] ${HELPER_LACKS_USERNS_LIMIT_MESSAGE}`, {
+      level: 'warn',
+    })
+  }
+  return false
+}
+
+let noUsernsLimitLogged = false
+function warnNoUsernsLimitOnce(message: string): void {
+  if (noUsernsLimitLogged) return
+  noUsernsLimitLogged = true
+  logForDebugging(`[Sandbox Linux] ${message}`, { level: 'warn' })
+}
+
+/**
+ * Who keeps a command from creating user namespaces, decided in one place so
+ * that what a wrap does and what the dependency check reports cannot differ.
+ *
+ * - `helper`: a seccomp helper is in the chain and imposes it (whether that
+ *   particular helper can is a separate question, which it is asked).
+ * - `bwrap`: no helper, so bubblewrap is given --disable-userns. Never beside
+ *   the helper, which makes a user namespace of its own and would be refused
+ *   it.
+ * - `nobody`: the configuration allows namespaces; or there is no helper and
+ *   bubblewrap cannot do it, either because this one has no such option (or is
+ *   setuid) or because enableWeakerNestedSandbox is on: bubblewrap imposes the
+ *   limit by writing a sysctl, the /proc/sys an unprivileged container shows
+ *   is read-only, and bubblewrap treats that as fatal.
+ */
+export type UsernsLimitPlan =
+  | { by: 'helper' }
+  | { by: 'bwrap' }
+  | {
+      by: 'nobody'
+      because: 'allowed' | 'weaker-nested-sandbox' | 'bwrap-cannot'
+    }
+
+export function planUsernsLimit({
+  usesSeccompHelper,
+  allowNestedUserNamespaces,
+  enableWeakerNestedSandbox,
+  bwrap,
+}: {
+  usesSeccompHelper: boolean
+  allowNestedUserNamespaces: boolean | undefined
+  enableWeakerNestedSandbox: boolean | undefined
+  /**
+   * The bubblewrap that will be run, or null when there is none. Looked at
+   * only where nothing above it has decided.
+   */
+  bwrap: BwrapSource
+}): UsernsLimitPlan {
+  if (allowNestedUserNamespaces) return { by: 'nobody', because: 'allowed' }
+  if (usesSeccompHelper) return { by: 'helper' }
+  if (enableWeakerNestedSandbox) {
+    return { by: 'nobody', because: 'weaker-nested-sandbox' }
+  }
+  const bwrapBinary = resolveBwrap(bwrap)
+  return bwrapBinary !== null && bwrapCanDisableUserns(bwrapBinary)
+    ? { by: 'bwrap' }
+    : { by: 'nobody', because: 'bwrap-cannot' }
+}
+
+const HELPER_LACKS_USERNS_LIMIT_MESSAGE =
+  'the seccomp helper in use was built before it limited user namespaces - ' +
+  'a sandboxed command that creates one can undo the write denies'
+const BWRAP_LACKS_DISABLE_USERNS_MESSAGE =
+  'this bubblewrap cannot stop a sandboxed command creating user namespaces ' +
+  '(--disable-userns needs bubblewrap 0.8.0 or later, not installed setuid) - ' +
+  'with no seccomp helper in use, such a command can undo the write denies'
+const NO_USERNS_LIMIT_IN_WEAKER_NESTED_SANDBOX_MESSAGE =
+  'enableWeakerNestedSandbox is on and no seccomp helper is in use, so nothing ' +
+  'stops a sandboxed command creating user namespaces - such a command can ' +
+  'undo the write denies'
 
 /**
  * Options for Linux dependency checks. Explicit binary paths, when set,
@@ -1015,6 +1418,12 @@ export type LinuxDependencyOptions = {
   seccompConfig?: SeccompConfig
   bwrapPath?: string
   socatPath?: string
+  /** No helper is in the chain then, so the limit is bubblewrap's to impose. */
+  allowAllUnixSockets?: boolean
+  /** The caller has given the limit up, so its absence is not worth one either. */
+  allowNestedUserNamespaces?: boolean
+  /** Decides, with the two above, who imposes the limit: see planUsernsLimit. */
+  enableWeakerNestedSandbox?: boolean
 }
 
 function isExecutable(p: string): boolean {
@@ -1038,9 +1447,10 @@ export function getLinuxDependencyStatus(
   return {
     hasBwrap: bwrapPath ? isExecutable(bwrapPath) : whichSync('bwrap') !== null,
     hasSocat: socatPath ? isExecutable(socatPath) : whichSync('socat') !== null,
-    hasSeccompApply: seccompConfig?.argv0
-      ? true
-      : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
+    hasSeccompApply:
+      embeddedHelperArgv0(seccompConfig) !== undefined
+        ? true
+        : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
   }
 }
 
@@ -1072,11 +1482,58 @@ export function checkLinuxDependencies(
     errors.push('socat not installed')
   }
 
-  if (
-    !seccompConfig?.argv0 &&
-    getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
-  ) {
+  const helperAvailable =
+    embeddedHelperArgv0(seccompConfig) !== undefined ||
+    getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null
+  if (!helperAvailable) {
     warnings.push('seccomp not available - unix socket access not restricted')
+  }
+
+  // Whether a command is kept from making user namespaces of its own, which
+  // the write denies rest on. With a helper it is the helper's doing; without
+  // one, bubblewrap's.
+  const details: SandboxDependencyDetail[] = []
+  const warn = (
+    code: SandboxDependencyDetail['code'],
+    message: string,
+  ): void => {
+    warnings.push(message)
+    details.push({ code, level: 'warning', message })
+  }
+  // The same decision the wrap makes, from the same inputs.
+  const plan = planUsernsLimit({
+    usesSeccompHelper: helperAvailable && opts?.allowAllUnixSockets !== true,
+    allowNestedUserNamespaces: opts?.allowNestedUserNamespaces,
+    enableWeakerNestedSandbox: opts?.enableWeakerNestedSandbox,
+    bwrap: usableBwrap,
+  })
+  let usernsLimit: SandboxFeatures['usernsLimit']
+  if (plan.by === 'helper') {
+    const helperFeatures = probeSeccompHelperFeatures(
+      seccompConfig,
+      usableBwrap,
+    )
+    usernsLimit =
+      helperFeatures === null
+        ? 'unknown'
+        : helperFeatures.has(HELPER_FEATURE_USERNS_LIMIT)
+    if (usernsLimit === false) {
+      warn('helper_lacks_userns_limit', HELPER_LACKS_USERNS_LIMIT_MESSAGE)
+    }
+  } else if (plan.by === 'bwrap') {
+    usernsLimit = true
+  } else {
+    // Nobody imposes it. Worth a warning unless that is what was asked for,
+    // or there is no bubblewrap at all, which is already an error above.
+    usernsLimit = false
+    if (plan.because === 'weaker-nested-sandbox') {
+      warn(
+        'no_userns_limit_in_weaker_nested_sandbox',
+        NO_USERNS_LIMIT_IN_WEAKER_NESTED_SANDBOX_MESSAGE,
+      )
+    } else if (plan.because === 'bwrap-cannot' && usableBwrap !== null) {
+      warn('bwrap_lacks_disable_userns', BWRAP_LACKS_DISABLE_USERNS_MESSAGE)
+    }
   }
 
   const uid0Error = uid0SandboxError({
@@ -1086,7 +1543,7 @@ export function checkLinuxDependencies(
   })
   if (uid0Error !== null) errors.push(uid0Error)
 
-  return { warnings, errors }
+  return { warnings, errors, features: { usernsLimit }, details }
 }
 
 /**
@@ -2970,6 +3427,7 @@ export async function wrapCommandWithSandboxLinux(
     maskedFileBinds,
     maskedFileStoreDir,
     enableWeakerNestedSandbox,
+    allowNestedUserNamespaces,
     allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
@@ -3030,10 +3488,15 @@ export async function wrapCommandWithSandboxLinux(
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
     if (!allowAllUnixSockets) {
-      applySeccompPrefix = resolveApplySeccompPrefix(
+      const helperCommand = resolveApplySeccompPrefix(
         seccompConfig?.applyPath,
-        seccompConfig?.argv0,
+        embeddedHelperArgv0(seccompConfig),
       )
+      applySeccompPrefix =
+        helperCommand === undefined
+          ? undefined
+          : helperEnvironmentPrefix(allowNestedUserNamespaces === true) +
+            helperCommand
 
       if (!applySeccompPrefix) {
         logForDebugging(
@@ -3246,6 +3709,46 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push('--bind', '/proc', '/proc')
     }
 
+    // ========== NO NAMESPACES OF THE COMMAND'S OWN ==========
+    // The write denies above hold only in this mount namespace, so by default
+    // the command is kept from leaving it (NESTED_USERNS_ENV says how and
+    // why). Both of the helper's variables are cleared whatever the caller's
+    // environment holds, and last among the environment operations, which
+    // bubblewrap applies in argument order; the helper's own command line
+    // then sets them again from the configuration (helperEnvironmentPrefix).
+    // SRT_HELPER_FEATURES reaching the helper would have it answer the
+    // question and not run the command.
+    bwrapArgs.push('--unsetenv', NESTED_USERNS_ENV)
+    bwrapArgs.push('--unsetenv', HELPER_FEATURES_ENV)
+    // Whether the limit is in force for this command, for the summary line
+    // below: 'unknown' where a helper is in the chain and could not be asked.
+    let usernsLimited: boolean | 'unknown' = false
+    // Found only if somebody needs it: bubblewrap itself is asked only with
+    // no helper in the chain, and a helper only until it has answered.
+    const bwrapBinary = (): string | null => bwrapPath ?? whichSync('bwrap')
+    const usernsPlan = planUsernsLimit({
+      usesSeccompHelper: applySeccompPrefix !== undefined,
+      allowNestedUserNamespaces,
+      enableWeakerNestedSandbox,
+      bwrap: bwrapBinary,
+    })
+    if (usernsPlan.by === 'helper') {
+      // Say so once if this helper cannot.
+      usernsLimited = helperUsernsLimit(seccompConfig, bwrapBinary)
+    } else if (usernsPlan.by === 'bwrap') {
+      bwrapArgs.push('--disable-userns')
+      usernsLimited = true
+    } else if (usernsPlan.because === 'allowed') {
+      // The helper is told on its own command line, above.
+      warnNestedUserNamespacesAllowedOnce()
+    } else {
+      warnNoUsernsLimitOnce(
+        usernsPlan.because === 'weaker-nested-sandbox'
+          ? NO_USERNS_LIMIT_IN_WEAKER_NESTED_SANDBOX_MESSAGE
+          : BWRAP_LACKS_DISABLE_USERNS_MESSAGE,
+      )
+    }
+
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
     // by creating a nested user namespace. This requires the host to permit
     // capability-bearing unprivileged user namespaces (the same requirement
@@ -3294,6 +3797,10 @@ export async function wrapCommandWithSandboxLinux(
       restrictions.push('filesystem')
     if (hasEnvRestrictions) restrictions.push('env')
     if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
+    if (usernsLimited === true) restrictions.push('no-nested-userns')
+    if (usernsLimited === 'unknown') {
+      restrictions.push('no-nested-userns(if the helper has it)')
+    }
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
