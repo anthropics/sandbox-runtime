@@ -614,6 +614,16 @@ describe('programs run on the host are found outside the allowed write paths', (
         ].join(':')
 
         expect(hostSearchPath([project])).toBe([safe, '/usr/bin'].join(':'))
+        // A directory nobody can write, whose `node` is a link to a file
+        // somebody can: left out for a child that looks `node` up, kept for
+        // one that does not.
+        const shims = dir('shims')
+        plant(join(project, 'node'))
+        symlinkSync(join(project, 'node'), join(shims, 'node'))
+        process.env.PATH = [shims, safe].join(':')
+        expect(hostSearchPath([project])).toBe([shims, safe].join(':'))
+        expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
+
         // Nothing the policy keeps the command from writing: nothing left out,
         // and the program inherits the PATH as it is.
         expect(hostSearchPath(undefined)).toBeUndefined()
@@ -626,7 +636,7 @@ describe('programs run on the host are found outside the allowed write paths', (
         process.env.PATH = `${projectBin}:${savedPath}`
 
         resetGlobalNpmPathsForTesting()
-        await getGlobalNpmPathsAsync(hostSearchPath([project]))
+        await getGlobalNpmPathsAsync(hostSearchPath([project], ['npm', 'node']))
         expect(existsSync(marker)).toBe(false)
 
         // The control: asked with the PATH as it is, the planted one answers,

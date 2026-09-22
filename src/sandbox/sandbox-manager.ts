@@ -964,7 +964,7 @@ async function initialize(
       javaAgentJarPath =
         (await getJavaProxyAgentJarPathAsync(
           config.javaAgentJarPath,
-          hostSearchPath(hostHelperWritePaths()),
+          hostSearchPath(hostHelperWritePaths(), NPM_LOOKS_UP),
         )) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
@@ -1033,6 +1033,10 @@ function isSandboxingEnabled(): boolean {
   // Sandboxing is enabled if config has been set (via initialize())
   return config !== undefined
 }
+
+/** What `npm root -g` looks up on PATH: npm itself, and the node its script
+ *  is run by. */
+const NPM_LOOKS_UP = ['npm', 'node'] as const
 
 /**
  * What a wrap under the initialized configuration lets the sandboxed command
@@ -1153,7 +1157,7 @@ async function checkDependenciesAsync(
   if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
     await getApplySeccompBinaryPathAsync(
       config?.seccomp?.applyPath,
-      hostSearchPath(hostHelperWritePaths()),
+      hostSearchPath(hostHelperWritePaths(), NPM_LOOKS_UP),
     )
   }
   const common = checkDependenciesCommon(ripgrepConfig)

@@ -205,19 +205,28 @@ export function findHostHelper(
  * The PATH to give a program the library starts on the host that does look-ups
  * of its own (`npm`, which is a script and finds `node` by name): this
  * process's PATH with every entry left out that a host helper would not be
- * taken from, by the same test. `undefined` where nothing is filtered, for
+ * taken from. An entry is judged as a directory, and then by the copy it
+ * holds of each of `programs`, the names the child is known to look up: what
+ * gets run is a file, and a link kept in a directory nobody can write may
+ * still lead to one somebody can. `undefined` where nothing is filtered, for
  * the child to inherit the PATH as it is.
  */
 export function hostSearchPath(
   allowedWritePaths: readonly string[] | undefined,
+  programs: readonly string[] = [],
 ): string | undefined {
   const writable = writableForms(allowedWritePaths)
   if (writable === undefined) return undefined
+  const acceptable = (entry: string): boolean =>
+    path.isAbsolute(entry) &&
+    refusalFor(entry, writable) === null &&
+    programs.every(program => {
+      const file = path.join(entry, program)
+      return !isExecutableFile(file) || refusalFor(file, writable) === null
+    })
   return (process.env.PATH ?? '')
     .split(path.delimiter)
-    .filter(
-      entry => path.isAbsolute(entry) && refusalFor(entry, writable) === null,
-    )
+    .filter(acceptable)
     .join(path.delimiter)
 }
 
