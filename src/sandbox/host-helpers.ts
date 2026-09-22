@@ -201,6 +201,26 @@ export function findHostHelper(
 }
 
 /** The option that names `helper` outright, for the message below. */
+/**
+ * The PATH to give a program the library starts on the host that does look-ups
+ * of its own (`npm`, which is a script and finds `node` by name): this
+ * process's PATH with every entry left out that a host helper would not be
+ * taken from, by the same test. `undefined` where nothing is filtered, for
+ * the child to inherit the PATH as it is.
+ */
+export function hostSearchPath(
+  allowedWritePaths: readonly string[] | undefined,
+): string | undefined {
+  const writable = writableForms(allowedWritePaths)
+  if (writable === undefined) return undefined
+  return (process.env.PATH ?? '')
+    .split(path.delimiter)
+    .filter(
+      entry => path.isAbsolute(entry) && refusalFor(entry, writable) === null,
+    )
+    .join(path.delimiter)
+}
+
 function optionNaming(helper: string): string {
   if (helper === 'bwrap') return 'bwrapPath'
   if (helper === 'socat') return 'socatPath'

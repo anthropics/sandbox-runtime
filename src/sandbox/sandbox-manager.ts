@@ -53,6 +53,7 @@ import { expandReadDenyGlobLinux } from './read-deny-glob.js'
 import {
   describeUnavailableHostHelper,
   findHostHelper,
+  hostSearchPath,
   writableNamedHelperWarning,
 } from './host-helpers.js'
 import {
@@ -961,8 +962,10 @@ async function initialize(
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
       // Async: the global-npm fallback spawns `npm root -g`.
       javaAgentJarPath =
-        (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
-        undefined
+        (await getJavaProxyAgentJarPathAsync(
+          config.javaAgentJarPath,
+          hostSearchPath(hostHelperWritePaths()),
+        )) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1148,7 +1151,10 @@ async function checkDependenciesAsync(
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
   if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+    await getApplySeccompBinaryPathAsync(
+      config?.seccomp?.applyPath,
+      hostSearchPath(hostHelperWritePaths()),
+    )
   }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done

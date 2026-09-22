@@ -14,8 +14,13 @@ import {
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import {
+  getGlobalNpmPathsAsync,
+  resetGlobalNpmPathsForTesting,
+} from '../../src/sandbox/generate-seccomp-filter.js'
+import {
   describeUnavailableHostHelper,
   findHostHelper,
+  hostSearchPath,
 } from '../../src/sandbox/host-helpers.js'
 import {
   LinuxSandboxProfileError,
@@ -30,7 +35,7 @@ import {
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { whichSync } from '../../src/utils/which.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
-import { isLinux } from '../helpers/platform.js'
+import { isLinux, isWindows } from '../helpers/platform.js'
 
 /**
  * The programs the library itself runs on the host are never taken from a
@@ -585,6 +590,53 @@ describe('programs run on the host are found outside the allowed write paths', (
       expect(existsSync(marker)).toBe(false)
     })
   })
+
+  // `npm root -g` finds a global install of this package where the helper or
+  // the JVM agent's jar is not beside the library. npm is a script and looks
+  // `node` up by name, so it is a PATH, not a file, that the rule is put to.
+  describe.if(!isWindows)(
+    'the PATH given to a program that searches it itself',
+    () => {
+      afterEach(() => {
+        resetGlobalNpmPathsForTesting()
+      })
+
+      it('leaves out what a host helper would not be taken from', () => {
+        const linked = join(safe, 'into-the-project')
+        symlinkSync(projectBin, linked)
+        process.env.PATH = [
+          projectBin,
+          'relative',
+          '',
+          linked,
+          safe,
+          '/usr/bin',
+        ].join(':')
+
+        expect(hostSearchPath([project])).toBe([safe, '/usr/bin'].join(':'))
+        // Nothing the policy keeps the command from writing: nothing left out,
+        // and the program inherits the PATH as it is.
+        expect(hostSearchPath(undefined)).toBeUndefined()
+        expect(hostSearchPath(['/'])).toBeUndefined()
+      })
+
+      it('keeps an npm the sandboxed command could have written from being run', async () => {
+        plant(join(projectBin, 'npm'))
+        plant(join(projectBin, 'node'))
+        process.env.PATH = `${projectBin}:${savedPath}`
+
+        resetGlobalNpmPathsForTesting()
+        await getGlobalNpmPathsAsync(hostSearchPath([project]))
+        expect(existsSync(marker)).toBe(false)
+
+        // The control: asked with the PATH as it is, the planted one answers,
+        // which is what the marker is there to show.
+        resetGlobalNpmPathsForTesting()
+        await getGlobalNpmPathsAsync()
+        expect(existsSync(marker)).toBe(true)
+      })
+    },
+  )
 
   describe('macOS: fixed locations, no search', () => {
     it('starts the wrapped command with /usr/bin/env', () => {
