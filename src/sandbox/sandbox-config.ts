@@ -130,6 +130,22 @@ const addressRangeSchema = z
   })
 
 /**
+ * Schema for an XPC/Mach service name in `allowMachLookup` / `allowMachRegister`.
+ * Both options share one spelling: an exact name, or a prefix ending in a
+ * single trailing "*" (a bare "*" matches every service).
+ */
+const machServiceNameSchema = z.string().refine(
+  val => {
+    const prefix = val.endsWith('*') ? val.slice(0, -1) : val
+    return !prefix.includes('*')
+  },
+  {
+    message:
+      'Wildcards are only allowed as a single trailing "*" (e.g., "com.example.*" or "*" for all services).',
+  },
+)
+
+/**
  * Schema for filesystem paths
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
@@ -767,21 +783,16 @@ export const NetworkConfigSchema = z.object({
     .optional()
     .describe('Whether to allow binding to local ports (default: false)'),
   allowMachLookup: z
-    .array(
-      z.string().refine(
-        val => {
-          const prefix = val.endsWith('*') ? val.slice(0, -1) : val
-          return !prefix.includes('*')
-        },
-        {
-          message:
-            'Wildcards are only allowed as a single trailing "*" (e.g., "com.example.*" or "*" for all services).',
-        },
-      ),
-    )
+    .array(machServiceNameSchema)
     .optional()
     .describe(
       'macOS only: Additional XPC/Mach service names to allow looking up. Supports trailing-wildcard prefix matching (e.g., "2BUA8C4S2C.com.1password.*"). Needed for tools like 1Password CLI, Playwright, or the iOS Simulator that communicate via XPC.',
+    ),
+  allowMachRegister: z
+    .array(machServiceNameSchema)
+    .optional()
+    .describe(
+      'macOS only: XPC/Mach service names the sandboxed process may register (bootstrap_check_in), the server-side counterpart of allowMachLookup and a separate Seatbelt operation. Same trailing-wildcard matching. Needed by Chromium-based browsers (Playwright, Puppeteer), which register their MachPortRendezvousServer and Crashpad ports, e.g. "com.google.chrome.for.testing.*".',
     ),
   httpProxyPort: z
     .number()

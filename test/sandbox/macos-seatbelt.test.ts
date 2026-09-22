@@ -1023,3 +1023,57 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     expect(result.status).toBe(0)
   })
 })
+
+describe.if(isMacOS)('macOS Seatbelt allowMachRegister', () => {
+  it('should emit global-name and global-name-prefix rules for configured services', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachRegister: [
+        'com.google.chrome.for.testing.MachPortRendezvousServer',
+        'org.chromium.crashpad.*',
+      ],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain(
+      '(allow mach-register (global-name "com.google.chrome.for.testing.MachPortRendezvousServer"))',
+    )
+    expect(wrappedCommand).toContain(
+      '(allow mach-register (global-name-prefix "org.chromium.crashpad."))',
+    )
+  })
+
+  it('should not grant mach-lookup to a service it only registers', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachRegister: ['com.example.registered.*'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).not.toContain(
+      '(allow mach-lookup (global-name-prefix "com.example.registered."))',
+    )
+  })
+
+  it('should emit a syntactically valid profile with allowMachRegister set', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachRegister: ['com.example.service', 'com.example.prefix.*', '*'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(result.status).toBe(0)
+  })
+})

@@ -50,6 +50,7 @@ export interface MacOSSandboxParams {
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  allowMachRegister?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   /** Environment variable names to unset for the sandboxed child (env -u) */
@@ -929,6 +930,22 @@ function generateWriteRules(
 }
 
 /**
+ * Build `(allow <operation> ...)` rules for user-configured Mach service
+ * names. A name ending in "*" matches by prefix, anything else exactly;
+ * `machServiceNameSchema` in sandbox-config.ts enforces that spelling.
+ */
+function machServiceRules(
+  operation: 'mach-lookup' | 'mach-register',
+  names: string[],
+): string[] {
+  return names.map(name =>
+    name.endsWith('*')
+      ? `(allow ${operation} (global-name-prefix ${escapePath(name.slice(0, -1))}))`
+      : `(allow ${operation} (global-name ${escapePath(name)}))`,
+  )
+}
+
+/**
  * Generate complete sandbox profile
  */
 function generateSandboxProfile({
@@ -942,6 +959,7 @@ function generateSandboxProfile({
   allowAllUnixSockets,
   allowLocalBinding,
   allowMachLookup,
+  allowMachRegister,
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
@@ -959,6 +977,7 @@ function generateSandboxProfile({
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  allowMachRegister?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
@@ -1022,11 +1041,13 @@ function generateSandboxProfile({
     ...(allowMachLookup && allowMachLookup.length > 0
       ? [
           '; User-specified XPC/Mach services',
-          ...allowMachLookup.map(name =>
-            name.endsWith('*')
-              ? `(allow mach-lookup (global-name-prefix ${escapePath(name.slice(0, -1))}))`
-              : `(allow mach-lookup (global-name ${escapePath(name)}))`,
-          ),
+          ...machServiceRules('mach-lookup', allowMachLookup),
+        ]
+      : []),
+    ...(allowMachRegister && allowMachRegister.length > 0
+      ? [
+          '; User-specified XPC/Mach services the sandbox may register',
+          ...machServiceRules('mach-register', allowMachRegister),
         ]
       : []),
     '',
@@ -1309,6 +1330,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    allowMachRegister,
     readConfig,
     writeConfig,
     unsetEnvVars,
@@ -1383,6 +1405,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    allowMachRegister,
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,
