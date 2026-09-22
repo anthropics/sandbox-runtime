@@ -587,6 +587,50 @@ describe('Config Validation', () => {
     })
   })
 
+  // A helper that is a file of its own is found and named by this process,
+  // like the two above. One that is part of the caller's binary (argv0) is
+  // only ever named inside the sandbox, and its path is passed on as given.
+  describe('seccomp.applyPath', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+    const parse = (seccomp: { applyPath?: string; argv0?: string }) =>
+      SandboxRuntimeConfigSchema.safeParse({ ...base, seccomp })
+
+    test('accepts an absolute path', () => {
+      expect(parse({ applyPath: '/opt/tools/apply-seccomp' }).success).toBe(
+        true,
+      )
+    })
+
+    test('rejects a relative or an empty path, and says where', () => {
+      for (const applyPath of ['apply-seccomp', './bin/apply-seccomp', '']) {
+        const result = parse({ applyPath })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.path).toEqual(['seccomp', 'applyPath'])
+        }
+      }
+      const relative = parse({ applyPath: 'apply-seccomp' })
+      if (!relative.success) {
+        expect(relative.error.issues[0]?.message).toContain('must be absolute')
+      }
+    })
+
+    test('takes the path as given beside argv0', () => {
+      for (const applyPath of ['/proc/self/fd/3', 'bin/multicall']) {
+        expect(parse({ argv0: 'apply-seccomp', applyPath }).success).toBe(true)
+      }
+    })
+
+    test('an empty argv0 is no argv0', () => {
+      expect(parse({ argv0: '', applyPath: 'bin/multicall' }).success).toBe(
+        false,
+      )
+    })
+  })
+
   describe('credentials', () => {
     const base = {
       network: { allowedDomains: [], deniedDomains: [] },

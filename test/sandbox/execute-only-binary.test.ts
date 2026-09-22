@@ -142,11 +142,12 @@ describe.if(isLinux && isUnprivileged)(
     it('is non-dumpable after setup for a readable copy as well', async () => {
       // Not only a matter of hiding an execute-only binary's pages. Where the
       // fresh /proc cannot be mounted (enableWeakerNestedSandbox) the command
-      // still sees the helper's outer half, which is under no seccomp filter
-      // that would stop it running other code and shares the command's user
-      // namespace; a dumpable one could be written through /proc/<pid>/mem
-      // by a command holding capabilities there. So the helper clears the
-      // flag before its first fork, whatever it was on entry.
+      // still sees the helper's outer half, which shares the command's user
+      // namespace and is under the namespaces filter at most, which would
+      // not stop it running other code; a dumpable one could be written
+      // through /proc/<pid>/mem by a command holding capabilities there. So
+      // the helper clears the flag before its first fork, whatever it was on
+      // entry.
       expect(await procOwnerDuringRun(0o755)).not.toBe(process.getuid!())
     })
   },
