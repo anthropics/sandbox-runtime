@@ -1,4 +1,5 @@
 import { createHttpProxyServer } from './http-proxy.js'
+import type { HostFilterVerdict } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { createMuxProxyServer, type MuxProxyServer } from './mux-proxy.js'
@@ -334,10 +335,18 @@ async function filterNetworkRequest(
   host: string,
   sandboxAskCallback: SandboxAskCallback | undefined,
   encodedCommand?: string,
-): Promise<boolean> {
-  const denied = (reason: string): false => {
+): Promise<HostFilterVerdict> {
+  // Every denial's reason goes to the violation line the model reads. Only
+  // a reason the deployer wrote themselves is handed on to the HTTP proxy,
+  // which writes it as the 403 body; the rest answer a bare `false` and
+  // keep the proxy's own generic text, so an unconfigured sandbox shows a
+  // client exactly what it showed before, and the body never tells a
+  // process inside the sandbox which class of rule stopped it.
+  const denied = (reason: string, configured?: string): HostFilterVerdict => {
     recordOutboundDeny(host, port, reason, encodedCommand)
-    return false
+    return configured === undefined
+      ? false
+      : { allow: false, reason: configured }
   }
 
   if (!config) {
@@ -370,10 +379,8 @@ async function filterNetworkRequest(
       // The matched entry's own reason when the caller supplied one, so the
       // model reads why this destination is off-limits (and the sanctioned
       // alternative) instead of a generic deny; keyed by the exact entry.
-      return denied(
-        config.network.deniedDomainReasons?.[deniedDomain] ??
-          'host is on the deny list',
-      )
+      const entryReason = config.network.deniedDomainReasons?.[deniedDomain]
+      return denied(entryReason ?? 'host is on the deny list', entryReason)
     }
   }
 
@@ -389,7 +396,11 @@ async function filterNetworkRequest(
   // allowlist deterministic enforcement: never fall through to the callback.
   if (!sandboxAskCallback || config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
-    return denied('host is not on the allow list')
+    const { allowlistDenyReason } = config.network
+    return denied(
+      allowlistDenyReason ?? 'host is not on the allow list',
+      allowlistDenyReason,
+    )
   }
 
   logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
@@ -576,8 +587,16 @@ async function startMuxProxyServer(
   })
 
   socksProxyServer = createSocksProxyServer({
-    filter: (port, host, encodedCommand) =>
-      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
+    // SOCKS5 has no field for a denial's text: the refusal is a reply code,
+    // so the verdict collapses to a boolean here. A port-22 destination
+    // still gets its reason in-band through probeUnauthenticated below.
+    filter: async (port, host, encodedCommand) =>
+      (await filterNetworkRequest(
+        port,
+        host,
+        sandboxAskCallback,
+        encodedCommand,
+      )) === true,
     parentProxy,
     lookupFor: directLookup,
     proxyAuthToken,

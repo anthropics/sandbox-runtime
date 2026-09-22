@@ -732,7 +732,17 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'Optional model-facing reason keyed by the exact deniedDomains entry it explains (e.g., {"github.com:22": "SSH pushes to GitHub are blocked; use an https remote"}). ' +
         'Reported in the <sandbox_violations> line when that entry denies a connection; entries without one use a generic reason. ' +
+        'It is also delivered to the sandboxed client itself — as the proxy 403 body, and as the SSH disconnect on the port-22 SOCKS path — so do not write anything there that a process inside the sandbox should not read. ' +
         'Keys are matched by exact entry string, so a key with no matching deniedDomains entry never fires.',
+    ),
+  allowlistDenyReason: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Optional reason reported when a host is denied because no allowedDomains entry matched it, in place of the generic "host is not on the allow list" in the <sandbox_violations> line. ' +
+        'Setting it also replaces the proxy 403 body, which is otherwise the unchanged "Connection blocked by network allowlist", so say that the block is policy and that retrying through another DNS server, proxy or VPN will not help. ' +
+        'A plain-HTTP client prints that body; a denied CONNECT (any https:// URL) is reported by curl, git and urllib3 as the bare 403 status, so an https:// client reads nothing of it.',
     ),
   strictAllowlist: z
     .boolean()
