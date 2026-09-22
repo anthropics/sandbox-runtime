@@ -50,9 +50,15 @@ import {
 /**
  * A host-allowlist verdict. Only `true` allows. `false` denies with the
  * generic {@link ALLOWLIST_DENY_REASON}; `{ allow: false, reason }` denies
- * with that reason, and the proxy writes it back as the 403 body so the
- * sandboxed client reads the policy that stopped it instead of a bare
- * `blocked-by-allowlist` tag it mistakes for a proxy or DNS fault.
+ * with that reason, which the proxy writes as the 403 body.
+ *
+ * How far that body travels depends on the path. A denied plain-HTTP
+ * request is an ordinary 403 and its client prints the reason, so there it
+ * replaces the `blocked-by-allowlist` tag an agent mistakes for a proxy or
+ * DNS fault. A denied CONNECT carries the same body, but curl, git and
+ * urllib3 discard a failed tunnel's body and report only the status, so an
+ * https:// client is not reached this way and the reason has to get to the
+ * model some other way (the violation store the embedder annotates with).
  */
 export type HostFilterVerdict = boolean | { allow: false; reason: string }
 
