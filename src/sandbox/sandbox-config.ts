@@ -1053,20 +1053,38 @@ export const WindowsConfigSchema = z.object({
 /**
  * Seccomp configuration schema (Linux only)
  */
-export const SeccompConfigSchema = z.object({
-  applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
-  argv0: z
-    .string()
-    .optional()
-    .describe(
-      'Invoke apply-seccomp as a multicall binary that dispatches on the ' +
-        'ARGV0 environment variable. When set, applyPath is used verbatim ' +
-        '(no existence check) and the invocation inside bwrap is prefixed ' +
-        'with ARGV0=<this value>. The caller is responsible for ensuring ' +
-        'applyPath resolves inside the bwrap namespace and that the target ' +
-        'binary implements the apply-seccomp interface when ARGV0 matches.',
-    ),
-})
+export const SeccompConfigSchema = z
+  .object({
+    applyPath: z
+      .string()
+      .optional()
+      .describe(
+        'Path to the apply-seccomp binary. Absolute, unless argv0 is set.',
+      ),
+    argv0: z
+      .string()
+      .optional()
+      .describe(
+        'Invoke apply-seccomp as a multicall binary that dispatches on the ' +
+          'ARGV0 environment variable. When set, applyPath is used verbatim ' +
+          '(no existence check) and the invocation inside bwrap is prefixed ' +
+          'with ARGV0=<this value>. The caller is responsible for ensuring ' +
+          'applyPath resolves inside the bwrap namespace and that the target ' +
+          'binary implements the apply-seccomp interface when ARGV0 matches.',
+      ),
+  })
+  .superRefine((seccomp, ctx) => {
+    // A helper that is a file of its own is looked up from this process and
+    // named on a command line, like bwrapPath and socatPath, so it takes their
+    // rule. With argv0 the path only has to mean something inside the sandbox
+    // and is passed on as given.
+    if (seccomp.argv0 || seccomp.applyPath === undefined) return
+    const result = binaryPathSchema.safeParse(seccomp.applyPath)
+    if (result.success) return
+    for (const issue of result.error.issues) {
+      ctx.addIssue({ ...issue, path: ['applyPath'] })
+    }
+  })
 
 /**
  * An inert deny is fail-open, so a deny glob whose trailing separator leaves

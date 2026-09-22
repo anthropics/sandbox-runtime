@@ -4,7 +4,7 @@ import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
+import type { ChildProcess, SpawnSyncReturns } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, type RipgrepConfig } from '../utils/ripgrep.js'
@@ -1031,10 +1031,17 @@ export type SandboxFeatures = {
    * Whether a sandboxed command is kept from creating user namespaces of its
    * own, which is what the write denies rest on (see
    * {@link NESTED_USERNS_ENV}). `true`: the seccomp helper in use has the
-   * limit, or no helper is used and bubblewrap can impose it. `false`: it was
-   * asked and has not. `'unknown'`: nothing could be asked: a helper that is
-   * part of the caller's own binary and only reachable inside the sandbox,
-   * for one.
+   * limit, or no helper is used and bubblewrap can impose it. `false`: nobody
+   * imposes it: the helper was asked and has not got it, the configuration
+   * gives it up (allowNestedUserNamespaces), or there is no helper and this
+   * bubblewrap cannot, or is not asked to under enableWeakerNestedSandbox.
+   * `'unknown'`: a helper is in the chain and could not be asked: one that is
+   * part of the caller's own binary and only reachable inside the sandbox, or
+   * one there was no working bubblewrap to ask inside of, or one that did not
+   * answer in time. The question is put in more namespaces than a wrap
+   * without network restriction needs, a network namespace among them, so
+   * this is also what a host that allows bubblewrap the others and not that
+   * one reads, though the limit is in force there.
    */
   usernsLimit: boolean | 'unknown'
 }
@@ -1069,7 +1076,8 @@ export type SandboxDependencyDetail = {
  * calls with a seccomp filter and sets user.max_user_namespaces to zero in
  * the namespace it made, and where there is no helper bubblewrap is given
  * --disable-userns. `1` here lifts all of that for a command that has to make
- * namespaces itself.
+ * namespaces itself. It does not change the helper keeping itself
+ * non-dumpable, which is not a limit on the command.
  */
 const NESTED_USERNS_ENV = 'SRT_ALLOW_NESTED_USERNS'
 
@@ -1098,85 +1106,206 @@ function helperEnvironmentPrefix(allowNestedUserNamespaces: boolean): string {
   )
 }
 
+/**
+ * The name a helper that is part of the caller's own binary is reached under
+ * (`seccomp.argv0`), or undefined when the helper is a file of its own. An
+ * empty name is no name. The dependency check and the wrap both ask here, so
+ * they cannot take the same configuration two ways.
+ */
+function embeddedHelperArgv0(
+  seccompConfig?: SeccompConfig,
+): string | undefined {
+  return seccompConfig?.argv0 || undefined
+}
+
+/**
+ * The bubblewrap a probe or a wrap will run, or null when there is none. A
+ * function where looking it up costs something (on Node a PATH lookup is a
+ * process of its own) and the answer may not be needed: it is called only on
+ * the path that uses it.
+ */
+type BwrapSource = string | null | (() => string | null)
+
+function resolveBwrap(bwrap: BwrapSource): string | null {
+  return typeof bwrap === 'function' ? bwrap() : bwrap
+}
+
+/**
+ * What the helper is asked inside of. The file the helper is resolved to may
+ * be one a sandboxed command could write (a path the operator named inside a
+ * write root, a copy under the home directory), so it is run for this the way
+ * it is run for a command: by bubblewrap, never by this process. The
+ * confinement is fixed and takes nothing from the policy: nothing writable,
+ * devices of its own, namespaces of its own, the network one holding nothing
+ * but its own loopback, no capabilities. What is left to a file put in the
+ * helper's place is to read what this user can read, and to connect to a Unix
+ * socket that has a path.
+ *
+ * The user namespace is required, as it is for a wrap, and not taken where
+ * one can be had, as --unshare-all would: without one the file runs in this
+ * process's user namespace, and from there bubblewrap's own process, which
+ * stays in this mount namespace, can be reached through /proc and written
+ * through. Where none can be made no command can be wrapped either, so there
+ * is nobody the answer would be for. No fresh /proc: the helper answers at
+ * the top of main, before it would read anything there, and a container that
+ * does not allow a procfs mount would refuse the whole probe for it.
+ */
+const HELPER_PROBE_CONFINEMENT: readonly string[] = [
+  '--new-session',
+  '--die-with-parent',
+  '--unshare-user',
+  '--unshare-pid',
+  '--unshare-net',
+  '--unshare-ipc',
+  '--unshare-uts',
+  '--unshare-cgroup-try',
+  '--cap-drop',
+  'ALL',
+  '--ro-bind',
+  '/',
+  '/',
+  '--dev',
+  '/dev',
+  '--setenv',
+  HELPER_FEATURES_ENV,
+  '1',
+]
+
 // One answer per helper: what a binary supports does not change while this
-// process lives. `null` is "could not be asked".
-const helperFeatureProbes = new Map<string, Set<string> | null>()
+// process lives. Only an answer is kept. A probe that could not be made (no
+// bubblewrap yet, or one that fails) says nothing about the helper, and is
+// made again the next time somebody asks.
+const helperFeatureProbes = new Map<string, Set<string>>()
+// Except a helper that was given all of the time allowed and said nothing:
+// asking holds this process up for that long, and would on every wrap. It is
+// not asked again, and stays "could not be asked".
+const helperProbesTimedOut = new Set<string>()
 
 /**
  * What the seccomp helper supports, by asking it: with
- * {@link HELPER_FEATURES_ENV} set it prints one word a line and exits 0. A
- * helper built before the question existed ignores the variable and tries to
- * run its first argument, on the host, outside any sandbox. So that argument
+ * {@link HELPER_FEATURES_ENV} set it prints one word a line and exits 0. It is
+ * asked inside bubblewrap (see HELPER_PROBE_CONFINEMENT), with nothing of this
+ * process's environment but PATH. A helper built before the question existed
+ * ignores the variable and tries to run its first argument. So that argument
  * is an absolute path nothing can be put at (a name in the root of procfs):
  * with a slash in it no PATH is searched, the exec fails, cleanly, and the
  * answer is the empty set.
  *
- * `null` when there is no helper to ask, when it could not be run, and
- * always for a helper that is part of the caller's own binary (`argv0`): its
- * `applyPath` only has to mean something inside the sandbox (a descriptor
- * the wrapped command line opens, typically), and running that path from
- * here would run whatever this process happens to have there. The caller
- * that built the helper in can ask its own binary the same question.
+ * `null` is "could not be asked": there is no helper, or no bubblewrap to ask
+ * it in, or bubblewrap could not set the confinement up or start the helper
+ * in it (which it reports under its own name), or the run failed without a
+ * word or timed out (which is the one of these that is not tried again).
+ * Never a reason to run the helper directly. And always
+ * `null` for a helper that is part of the caller's own binary (`argv0`): its
+ * `applyPath` only has to mean something inside the sandbox (a descriptor the
+ * wrapped command line opens, typically), and running that path from here
+ * would run whatever this process happens to have there. The caller that
+ * built the helper in can ask its own binary the same question.
  */
 export function probeSeccompHelperFeatures(
   seccompConfig?: SeccompConfig,
+  bwrap: BwrapSource = () => whichSync('bwrap'),
 ): Set<string> | null {
-  if (seccompConfig?.argv0) return null
+  if (embeddedHelperArgv0(seccompConfig) !== undefined) return null
   const binary = getApplySeccompBinaryPath(seccompConfig?.applyPath)
   if (!binary) return null
   const cached = helperFeatureProbes.get(binary)
   if (cached !== undefined) return cached
+  if (helperProbesTimedOut.has(binary)) return null
+  const bwrapBinary = resolveBwrap(bwrap)
+  if (bwrapBinary === null) return null
 
-  const probe = spawnSync(binary, [HELPER_FEATURES_PROBE_ARGUMENT], {
-    timeout: 5000,
-    stdio: ['ignore', 'pipe', 'ignore'],
-    encoding: 'utf8',
-    env: { ...process.env, [HELPER_FEATURES_ENV]: '1' },
-  })
-  const answer =
-    probe.error !== undefined
-      ? null
-      : new Set(
-          probe.status === 0
-            ? (probe.stdout ?? '')
-                .split('\n')
-                .map(word => word.trim())
-                .filter(word => word.length > 0)
-            : [],
-        )
+  let probe: SpawnSyncReturns<string>
+  try {
+    probe = spawnSync(
+      bwrapBinary,
+      [
+        ...HELPER_PROBE_CONFINEMENT,
+        '--',
+        binary,
+        HELPER_FEATURES_PROBE_ARGUMENT,
+      ],
+      {
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8',
+        env: process.env.PATH === undefined ? {} : { PATH: process.env.PATH },
+      },
+    )
+  } catch {
+    // A path the runtime will not even try to run, an empty one for instance.
+    return null
+  }
+  if (probe.error !== undefined) {
+    if ((probe.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
+      helperProbesTimedOut.add(binary)
+    }
+    return null
+  }
+  if (typeof probe.status !== 'number') return null
+  let words: string[] = []
+  if (probe.status === 0) {
+    words = (probe.stdout ?? '')
+      .split('\n')
+      .map(word => word.trim())
+      .filter(word => word.length > 0)
+  } else {
+    // A helper that does not know the question says what it could not run.
+    // Bubblewrap's own failure, which it reports under its own name, or no
+    // word from anybody: nothing was asked.
+    const complaint = (probe.stderr ?? '').trim()
+    if (complaint.length === 0 || /^bwrap: /m.test(complaint)) return null
+  }
+  const answer = new Set(words)
   helperFeatureProbes.set(binary, answer)
   return answer
 }
 
-// Keyed by path, like the uid-0 probe below.
+// Keyed by path, like the uid-0 probe below. Only an answer is kept, as above.
 const disableUsernsProbes = new Map<string, boolean>()
 
 /**
  * Whether this bubblewrap takes --disable-userns (0.8.0 and later) and can
  * honour it: the option does nothing a setuid bubblewrap can do, and such a
- * binary refuses it outright.
+ * binary refuses it outright. `false` too when it could not be asked, which
+ * is then asked again the next time.
  */
 export function bwrapCanDisableUserns(bwrap: string): boolean {
   const cached = disableUsernsProbes.get(bwrap)
   if (cached !== undefined) return cached
-  let can = false
+  let can: boolean
   try {
-    const setuid = (fs.statSync(bwrap).mode & 0o4000) !== 0
-    if (!setuid) {
+    if ((fs.statSync(bwrap).mode & 0o4000) !== 0) {
+      can = false
+    } else {
       const help = spawnSync(bwrap, ['--help'], {
         timeout: 5000,
         stdio: ['ignore', 'pipe', 'pipe'],
         encoding: 'utf8',
       })
-      can = `${help.stdout ?? ''}${help.stderr ?? ''}`.includes(
-        '--disable-userns',
-      )
+      const text = `${help.stdout ?? ''}${help.stderr ?? ''}`
+      if (help.error !== undefined || text.trim().length === 0) return false
+      can = text.includes('--disable-userns')
     }
   } catch {
-    can = false
+    return false
   }
   disableUsernsProbes.set(bwrap, can)
   return can
+}
+
+/**
+ * For tests only. Forgets what the helper and bubblewrap have been found to
+ * support. What is kept above lives as long as the process, and a test run is
+ * one process for every file in it: a test that answers these probes with a
+ * mock calls this before, so that it is not handed what an earlier file learnt
+ * from the real binaries, and after, so that no later file is handed the
+ * mock's.
+ */
+export function resetProbeCachesForTesting(): void {
+  helperFeatureProbes.clear()
+  helperProbesTimedOut.clear()
+  disableUsernsProbes.clear()
 }
 
 let nestedUsernsAllowedLogged = false
@@ -1194,11 +1323,14 @@ let helperLacksUsernsLimitLogged = false
 /**
  * Whether the helper in the chain imposes the limit: `true` or `false` where
  * it could be asked, the latter said once in the log, and `'unknown'` where
- * it could not (a helper that is part of the caller's binary): the caller
- * that built it knows.
+ * it could not (a helper that is part of the caller's binary, which the
+ * caller that built it knows about; no bubblewrap to ask it in).
  */
-function helperUsernsLimit(seccompConfig?: SeccompConfig): boolean | 'unknown' {
-  const features = probeSeccompHelperFeatures(seccompConfig)
+function helperUsernsLimit(
+  seccompConfig: SeccompConfig | undefined,
+  bwrap: BwrapSource,
+): boolean | 'unknown' {
+  const features = probeSeccompHelperFeatures(seccompConfig, bwrap)
   if (features === null) return 'unknown'
   if (features.has(HELPER_FEATURE_USERNS_LIMIT)) return true
   if (!helperLacksUsernsLimitLogged) {
@@ -1249,15 +1381,19 @@ export function planUsernsLimit({
   usesSeccompHelper: boolean
   allowNestedUserNamespaces: boolean | undefined
   enableWeakerNestedSandbox: boolean | undefined
-  /** The bubblewrap that will be run, or null when there is none. */
-  bwrap: string | null
+  /**
+   * The bubblewrap that will be run, or null when there is none. Looked at
+   * only where nothing above it has decided.
+   */
+  bwrap: BwrapSource
 }): UsernsLimitPlan {
   if (allowNestedUserNamespaces) return { by: 'nobody', because: 'allowed' }
   if (usesSeccompHelper) return { by: 'helper' }
   if (enableWeakerNestedSandbox) {
     return { by: 'nobody', because: 'weaker-nested-sandbox' }
   }
-  return bwrap !== null && bwrapCanDisableUserns(bwrap)
+  const bwrapBinary = resolveBwrap(bwrap)
+  return bwrapBinary !== null && bwrapCanDisableUserns(bwrapBinary)
     ? { by: 'bwrap' }
     : { by: 'nobody', because: 'bwrap-cannot' }
 }
@@ -1282,7 +1418,7 @@ export type LinuxDependencyOptions = {
   seccompConfig?: SeccompConfig
   bwrapPath?: string
   socatPath?: string
-  /** The helper is not used at all, so its absence is not worth a warning. */
+  /** No helper is in the chain then, so the limit is bubblewrap's to impose. */
   allowAllUnixSockets?: boolean
   /** The caller has given the limit up, so its absence is not worth one either. */
   allowNestedUserNamespaces?: boolean
@@ -1311,9 +1447,10 @@ export function getLinuxDependencyStatus(
   return {
     hasBwrap: bwrapPath ? isExecutable(bwrapPath) : whichSync('bwrap') !== null,
     hasSocat: socatPath ? isExecutable(socatPath) : whichSync('socat') !== null,
-    hasSeccompApply: seccompConfig?.argv0
-      ? true
-      : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
+    hasSeccompApply:
+      embeddedHelperArgv0(seccompConfig) !== undefined
+        ? true
+        : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
   }
 }
 
@@ -1346,7 +1483,7 @@ export function checkLinuxDependencies(
   }
 
   const helperAvailable =
-    seccompConfig?.argv0 !== undefined ||
+    embeddedHelperArgv0(seccompConfig) !== undefined ||
     getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null
   if (!helperAvailable) {
     warnings.push('seccomp not available - unix socket access not restricted')
@@ -1372,7 +1509,10 @@ export function checkLinuxDependencies(
   })
   let usernsLimit: SandboxFeatures['usernsLimit']
   if (plan.by === 'helper') {
-    const helperFeatures = probeSeccompHelperFeatures(seccompConfig)
+    const helperFeatures = probeSeccompHelperFeatures(
+      seccompConfig,
+      usableBwrap,
+    )
     usernsLimit =
       helperFeatures === null
         ? 'unknown'
@@ -3350,7 +3490,7 @@ export async function wrapCommandWithSandboxLinux(
     if (!allowAllUnixSockets) {
       const helperCommand = resolveApplySeccompPrefix(
         seccompConfig?.applyPath,
-        seccompConfig?.argv0,
+        embeddedHelperArgv0(seccompConfig),
       )
       applySeccompPrefix =
         helperCommand === undefined
@@ -3583,15 +3723,18 @@ export async function wrapCommandWithSandboxLinux(
     // Whether the limit is in force for this command, for the summary line
     // below: 'unknown' where a helper is in the chain and could not be asked.
     let usernsLimited: boolean | 'unknown' = false
+    // Found only if somebody needs it: bubblewrap itself is asked only with
+    // no helper in the chain, and a helper only until it has answered.
+    const bwrapBinary = (): string | null => bwrapPath ?? whichSync('bwrap')
     const usernsPlan = planUsernsLimit({
       usesSeccompHelper: applySeccompPrefix !== undefined,
       allowNestedUserNamespaces,
       enableWeakerNestedSandbox,
-      bwrap: bwrapPath ?? whichSync('bwrap'),
+      bwrap: bwrapBinary,
     })
     if (usernsPlan.by === 'helper') {
       // Say so once if this helper cannot.
-      usernsLimited = helperUsernsLimit(seccompConfig)
+      usernsLimited = helperUsernsLimit(seccompConfig, bwrapBinary)
     } else if (usernsPlan.by === 'bwrap') {
       bwrapArgs.push('--disable-userns')
       usernsLimited = true
