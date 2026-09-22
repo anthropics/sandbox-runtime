@@ -10,8 +10,25 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux } from '../helpers/platform.js'
+import { isMacOS } from '../helpers/platform.js'
 
 describe('generateProxyEnvVars', () => {
+  it.if(isMacOS)('uses the authenticated SOCKS client for Git SSH', () => {
+    const env = generateProxyEnvVars(3128, 1080, undefined, 'tok-123')
+    const command = env.find(value => value.startsWith('GIT_SSH_COMMAND='))
+
+    expect(command).toMatch(/socks5-proxy-command\.(ts|js)/)
+    expect(command).toContain('"srt" "tok-123" "%h" "%p"')
+    expect(command).not.toContain('nc -X 5')
+  })
+
+  it.if(isMacOS)('keeps BSD nc for unauthenticated Git SSH', () => {
+    const env = generateProxyEnvVars(3128, 1080)
+    expect(env).toContain(
+      "GIT_SSH_COMMAND=ssh -o ControlMaster=no -o ControlPath=none -o ProxyCommand='nc -X 5 -x localhost:1080 %h %p'",
+    )
+  })
+
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
     // gcloud's proxy/type only accepts http, http_no_tunnel, socks4, socks5.
     // Our local proxy is an HTTP CONNECT proxy regardless of the traffic it
