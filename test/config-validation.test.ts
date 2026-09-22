@@ -348,6 +348,13 @@ describe('Config Validation', () => {
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
     expect(result.success).toBe(true)
+    // Asserting the parsed value, not just success: zod strips a key the schema
+    // does not declare, so a schema without allowMachRegister would parse too.
+    expect(result.success && result.data.network?.allowMachRegister).toEqual([
+      'com.google.chrome.for.testing.*',
+      'org.chromium.crashpad.ReportHandler',
+      '*',
+    ])
   })
 
   test.each(['com.*.foo', 'com.example.**'])(
