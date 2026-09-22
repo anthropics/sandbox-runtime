@@ -624,6 +624,21 @@ describe('programs run on the host are found outside the allowed write paths', (
         expect(hostSearchPath([project])).toBe([shims, safe].join(':'))
         expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
 
+        // A link with nothing behind it yet, into where the command may
+        // write, counts the same: the command could put the file there.
+        const dangling = dir('dangling')
+        symlinkSync(join(project, 'not-there-yet'), join(dangling, 'npm'))
+        process.env.PATH = [dangling, safe].join(':')
+        expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
+
+        // `..` in an entry is resolved through the file system, not by its
+        // spelling: through a link, this one's `node` is another directory's.
+        const elsewhere = dir('elsewhere', 'bin')
+        symlinkSync(join(project, 'node'), join(base, 'elsewhere', 'node'))
+        symlinkSync(elsewhere, join(safe, 'jump'))
+        process.env.PATH = [`${safe}/jump/..`, safe].join(':')
+        expect(hostSearchPath([project], ['npm', 'node'])).toBe(safe)
+
         // Nothing the policy keeps the command from writing: nothing left out,
         // and the program inherits the PATH as it is.
         expect(hostSearchPath(undefined)).toBeUndefined()

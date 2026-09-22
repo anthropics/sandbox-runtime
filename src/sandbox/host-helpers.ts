@@ -221,8 +221,18 @@ export function hostSearchPath(
     path.isAbsolute(entry) &&
     refusalFor(entry, writable) === null &&
     programs.every(program => {
-      const file = path.join(entry, program)
-      return !isExecutableFile(file) || refusalFor(file, writable) === null
+      // Joined as the shell joins them, with no `..` folded away by spelling:
+      // the walk resolves one through the file system, as the kernel does.
+      const file = `${entry}${entry.endsWith('/') ? '' : '/'}${program}`
+      // Whatever is there is judged, executable today or not, a link with
+      // nothing behind it included: the command could supply the rest later.
+      // Only a name that is not there at all has nothing to say.
+      try {
+        fs.lstatSync(file)
+      } catch {
+        return true
+      }
+      return refusalFor(file, writable) === null
     })
   return (process.env.PATH ?? '')
     .split(path.delimiter)
