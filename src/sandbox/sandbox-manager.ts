@@ -1,4 +1,5 @@
 import { createHttpProxyServer } from './http-proxy.js'
+import type { HostFilterVerdict } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { createMuxProxyServer, type MuxProxyServer } from './mux-proxy.js'
@@ -334,10 +335,12 @@ async function filterNetworkRequest(
   host: string,
   sandboxAskCallback: SandboxAskCallback | undefined,
   encodedCommand?: string,
-): Promise<boolean> {
-  const denied = (reason: string): false => {
+): Promise<HostFilterVerdict> {
+  // The reason goes to two places: the violation line the model reads, and
+  // — for the HTTP proxy — the 403 body the sandboxed client reads.
+  const denied = (reason: string): { allow: false; reason: string } => {
     recordOutboundDeny(host, port, reason, encodedCommand)
-    return false
+    return { allow: false, reason }
   }
 
   if (!config) {
@@ -389,7 +392,9 @@ async function filterNetworkRequest(
   // allowlist deterministic enforcement: never fall through to the callback.
   if (!sandboxAskCallback || config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
-    return denied('host is not on the allow list')
+    return denied(
+      config.network.allowlistDenyReason ?? 'host is not on the allow list',
+    )
   }
 
   logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
@@ -576,8 +581,16 @@ async function startMuxProxyServer(
   })
 
   socksProxyServer = createSocksProxyServer({
-    filter: (port, host, encodedCommand) =>
-      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
+    // SOCKS5 has no field for a denial's text: the refusal is a reply code,
+    // so the verdict collapses to a boolean here. A port-22 destination
+    // still gets its reason in-band through probeUnauthenticated below.
+    filter: async (port, host, encodedCommand) =>
+      (await filterNetworkRequest(
+        port,
+        host,
+        sandboxAskCallback,
+        encodedCommand,
+      )) === true,
     parentProxy,
     lookupFor: directLookup,
     proxyAuthToken,

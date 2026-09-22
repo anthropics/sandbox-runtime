@@ -734,6 +734,14 @@ export const NetworkConfigSchema = z.object({
         'Reported in the <sandbox_violations> line when that entry denies a connection; entries without one use a generic reason. ' +
         'Keys are matched by exact entry string, so a key with no matching deniedDomains entry never fires.',
     ),
+  allowlistDenyReason: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Optional model-facing reason reported when a host is denied because no allowedDomains entry matched it, in place of the generic "host is not on the allow list". ' +
+        'Like a deniedDomainReasons entry it appears in the <sandbox_violations> line and is delivered in-band as the proxy 403 body, so say that the block is policy and that retrying through another DNS server, proxy or VPN will not help.',
+    ),
   strictAllowlist: z
     .boolean()
     .optional()
