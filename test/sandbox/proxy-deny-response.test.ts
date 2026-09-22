@@ -149,20 +149,52 @@ describe('the sandboxed client reads which policy denied it', () => {
     expect(resp).toContain(reason)
   })
 
-  it('names the allow list when nothing matched the host', async () => {
+  it('leaves the 403 body alone when no reason is configured', async () => {
     await SandboxManager.initialize({
       network: { allowedDomains: ['example.com'], deniedDomains: [] },
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
     const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
     const resp = await sendConnect(
       port,
       'off.test:443',
       SandboxManager.getProxyAuthToken()!,
     )
 
+    // The body README's Basic Usage shows, unchanged: only a reason the
+    // deployer configured varies it. The denial class stays where it
+    // always was, in the line the model reads.
     expect(resp).toContain('HTTP/1.1 403 Forbidden')
-    expect(resp).toContain('host is not on the allow list')
+    expect(resp).toContain('Connection blocked by network allowlist')
+    expect(resp).not.toContain('host is not on the allow list')
+    expect(store.getViolations().map(v => v.line)).toContain(
+      'deny network-outbound off.test:443 (host is not on the allow list)',
+    )
+  })
+
+  it('does not name the deny list to an unconfigured entry either', async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: ['github.com'],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const resp = await sendConnect(
+      port,
+      'github.com:443',
+      SandboxManager.getProxyAuthToken()!,
+    )
+
+    // Both host-level denials read the same from inside the sandbox, so a
+    // process there cannot classify the policy by probing for the body.
+    expect(resp).toContain('HTTP/1.1 403 Forbidden')
+    expect(resp).toContain('Connection blocked by network allowlist')
+    expect(resp).not.toContain('deny list')
   })
 
   it('uses network.allowlistDenyReason for an off-allowlist host, in both channels', async () => {
