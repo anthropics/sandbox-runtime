@@ -14,7 +14,11 @@ import {
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import { parseAddressRange } from './address.js'
-import { containsGlobCharsForPlatform } from './sandbox-utils.js'
+import {
+  containsGlobCharsForPlatform,
+  envNameComparisonKey,
+  findByEnvName,
+} from './sandbox-utils.js'
 import { getPlatform } from '../utils/platform.js'
 
 /**
@@ -1304,7 +1308,28 @@ export const SandboxRuntimeConfigSchema = z
         })
       }
     }
+    // Entry names must be unique under the platform's env semantics
+    // (envNameComparisonKey — on Windows env-var names are
+    // case-insensitive, so entries differing only in case name the SAME
+    // variable). Duplicates would mint conflicting mask values for one
+    // variable: each entry registers its own sentinel, only one spelling
+    // survives into the child env, and AWS SigV4 re-signing silently
+    // breaks when the registry binds a sentinel the child never holds.
+    const seenEnvVarNames = new Set<string>()
     for (const [idx, v] of (creds.envVars ?? []).entries()) {
+      const nameKey = envNameComparisonKey(v.name)
+      if (seenEnvVarNames.has(nameKey)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'envVars', idx, 'name'],
+          message:
+            `"${v.name}" duplicates another credentials.envVars entry — ` +
+            `entry names must be unique (on Windows, names differing ` +
+            `only in case refer to the same variable). Keep one entry ` +
+            `per variable.`,
+        })
+      }
+      seenEnvVarNames.add(nameKey)
       checkMaskedEntry(v, ['credentials', 'envVars', idx])
       // maskClaims names fields inside a decoded payload; without decode
       // there is no payload to look inside — reject the contradiction
@@ -1388,6 +1413,10 @@ export const SandboxRuntimeConfigSchema = z
     // re-signer needs the fake value to BE the sentinel (exact-match
     // trigger on the access key id in the credential scope) and the real
     // value to be the entire secret. extract/decode entries violate both.
+    // Names are compared under the platform's env semantics
+    // (envNameComparisonKey): on Windows env-var names are
+    // case-insensitive, so a pair slot and an envVars entry that differ
+    // only in case reference the same variable there.
     const seenPairVars = new Set<string>()
     for (const [idx, pair] of (creds.awsPairs ?? []).entries()) {
       const vars: Array<[string, string]> = [
@@ -1399,7 +1428,8 @@ export const SandboxRuntimeConfigSchema = z
       }
       for (const [field, name] of vars) {
         const path = ['credentials', 'awsPairs', idx, field]
-        if (seenPairVars.has(name)) {
+        const nameKey = envNameComparisonKey(name)
+        if (seenPairVars.has(nameKey)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path,
@@ -1409,8 +1439,8 @@ export const SandboxRuntimeConfigSchema = z
           })
           continue
         }
-        seenPairVars.add(name)
-        const entry = (creds.envVars ?? []).find(v => v.name === name)
+        seenPairVars.add(nameKey)
+        const entry = findByEnvName(creds.envVars ?? [], name)
         if (entry === undefined || entry.mode !== 'mask') {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,

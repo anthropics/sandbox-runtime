@@ -867,6 +867,79 @@ export function generateProxyEnvVars(
 }
 
 /**
+ * Fold an environment-variable NAME for a Windows comparison.
+ *
+ * Windows env names are case-insensitive — `GITHUB_TOKEN` and
+ * `GiThUb_ToKeN` name the SAME variable — so any name-vs-name or
+ * name-vs-key comparison that targets a Windows environment must fold
+ * case or a mixed-case spelling slips past a deny/mask entry. The fold
+ * is ASCII-only (a–z → A–Z; non-ASCII passes through untouched), so it
+ * is ordinal and deterministic — matching srt-win's
+ * `to_ascii_uppercase` overlay matching in `build_env_block`.
+ *
+ * POSIX env names are case-sensitive — do NOT use this for
+ * Linux/macOS comparisons; see {@link envNameComparisonKey}.
+ */
+export function windowsEnvNameKey(name: string): string {
+  return name.replace(/[a-z]/g, c => c.toUpperCase())
+}
+
+/**
+ * Fold an env-var name for comparison under the CURRENT platform's
+ * env semantics: Windows folds case ({@link windowsEnvNameKey});
+ * POSIX names are case-sensitive and pass through verbatim.
+ */
+export function envNameComparisonKey(name: string): string {
+  return getPlatform() === 'windows' ? windowsEnvNameKey(name) : name
+}
+
+/**
+ * Find the entry whose `name` names the same env variable as `name`
+ * under the current platform's env semantics (Windows folds case,
+ * POSIX is exact — see {@link envNameComparisonKey}). First match in
+ * entry order wins; config validation rejects fold-duplicate entry
+ * names, so validated configs have at most one match. The single
+ * matching rule shared by config validation and the runtime
+ * credential layers — keep both on this helper so they cannot
+ * diverge.
+ */
+export function findByEnvName<T extends { name: string }>(
+  entries: readonly T[],
+  name: string,
+): T | undefined {
+  const key = envNameComparisonKey(name)
+  return entries.find(e => envNameComparisonKey(e.name) === key)
+}
+
+/**
+ * Read `name` from an env record under the current platform's
+ * env-name semantics. An exact-key match always wins; on Windows a
+ * miss falls back to the first ordinal case-insensitive key match in
+ * the record's own key order (deterministic — mirrors Win32
+ * `GetEnvironmentVariableW`, which matches names case-insensitively).
+ * POSIX lookups stay exact.
+ *
+ * Needed because a plain-object env snapshot (a spread of
+ * `process.env`, or an explicitly passed record) does not carry
+ * Node's case-insensitive `process.env` magic on Windows.
+ */
+export function readEnvCaseAware(
+  env: Readonly<Record<string, string | undefined>>,
+  name: string,
+): string | undefined {
+  const exact = env[name]
+  if (exact !== undefined || getPlatform() !== 'windows') return exact
+  const key = windowsEnvNameKey(name)
+  for (const k of Object.keys(env)) {
+    if (windowsEnvNameKey(k) === key) {
+      const v = env[k]
+      if (v !== undefined) return v
+    }
+  }
+  return undefined
+}
+
+/**
  * `safe.directory` entries above this count collapse to a single
  * `safe.directory=*`. Keeps `GIT_CONFIG_COUNT` (and the argv it rides
  * on) bounded when the safe-dir set is wide.

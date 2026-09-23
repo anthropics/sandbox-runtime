@@ -1964,9 +1964,13 @@ async function wrapWithSandboxArgv(
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
       // mode:'deny' env vars are structurally absent (fresh
-      // srt-sandbox profile env). mode:'mask' sentinels are
-      // passed via the --env overlay so the sandboxed child sees
-      // the sentinel value, same as macOS/Linux.
+      // srt-sandbox profile env); the deny list is still threaded
+      // through so the overlay's ambient forwards are filtered
+      // against it (case-insensitively — Windows env names fold
+      // case). mode:'mask' sentinels are passed via the --env
+      // overlay so the sandboxed child sees the sentinel value,
+      // same as macOS/Linux.
+      unsetEnvVars: credentialRestrictions.unsetEnvVars,
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
