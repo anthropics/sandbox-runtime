@@ -332,6 +332,48 @@ describe('Config Validation', () => {
     },
   )
 
+  test('should accept valid allowMachRegister entries', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowMachRegister: [
+          'com.google.chrome.for.testing.*',
+          'org.chromium.crashpad.ReportHandler',
+          '*',
+        ],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+    // Asserting the parsed value, not just success: zod strips a key the schema
+    // does not declare, so a schema without allowMachRegister would parse too.
+    expect(result.success && result.data.network?.allowMachRegister).toEqual([
+      'com.google.chrome.for.testing.*',
+      'org.chromium.crashpad.ReportHandler',
+      '*',
+    ])
+  })
+
+  test.each(['com.*.foo', 'com.example.**'])(
+    'should reject allowMachRegister entry with non-trailing wildcard: %s',
+    entry => {
+      const config = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          allowMachRegister: [entry],
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      }
+
+      const result = SandboxRuntimeConfigSchema.safeParse(config)
+      expect(result.success).toBe(false)
+    },
+  )
+
   test('should use default ripgrep command when not specified', () => {
     const config = {
       network: {
