@@ -414,6 +414,10 @@ Uses two different patterns:
 
 A few paths are writable without being listed: the child's stdio and `/tmp/claude`, and as a convenience `~/.npm/_logs` and `~/.claude/debug`. Those two home directories are dropped when a `denyRead` entry covers them (and kept when an `allowRead` entry beneath that deny re-opens them), so list them in `allowWrite` if you want them writable under a home read-deny.
 
+**Automatic SSH key protection:**
+
+On initialization the runtime parses `~/.ssh/config` (including `Include` chains) and appends read denies for `IdentityFile`, `CertificateFile`, `ControlPath`, and `IdentityAgent` targets — keys often live outside `~/.ssh`, where a `denyRead` on the directory would not cover them — plus ssh's default key filenames (`~/.ssh/id_rsa`, `~/.ssh/id_ed25519`, etc.). Targets are denied whether or not they exist yet (a `ControlPath` socket appears only when the first master connection opens). This is additive only: it never removes configured protection, and a malformed ssh config never fails initialization. To make a specific key readable inside the sandbox, add an `allowRead` entry with the key's EXACT path — an `allowRead` on a parent directory does not override a file-specific deny (most-specific-wins).
+
 **Path Syntax (macOS):**
 
 Paths support git-style glob patterns on macOS, similar to `.gitignore` syntax:
