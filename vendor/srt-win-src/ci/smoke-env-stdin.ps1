@@ -281,10 +281,12 @@ try {
   Start-Sleep -Seconds 3
   $hostHits = Find-CmdlinesContaining $Token
   $brokerRows = Find-CmdlinesContaining '--env-stdin'
-  if (-not $p.WaitForExit(60000)) {
+  # 120s matches the RExec rows in smoke-exec.ps1: a cold Windows
+  # PowerShell start as the sandbox user can take 20-30s on some images.
+  if (-not $p.WaitForExit(120000)) {
     try { $p.Kill() } catch { }
     $p.WaitForExit()
-    throw "S2: exec TIMEOUT after 60s. stderr: $($se.Result)"
+    throw "S2: exec TIMEOUT after 120s. stderr: $($se.Result)"
   }
   $raw = $so.Result + "`n" + $se.Result
 
