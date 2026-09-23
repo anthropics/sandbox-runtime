@@ -508,18 +508,24 @@ async function main(): Promise<void> {
           // command bytes off the host shell. On other platforms
           // we keep the existing shell-string path.
           if (process.platform === 'win32') {
-            // env carries the proxy vars the sandboxed child must inherit.
-            const { argv, env } =
-              await SandboxManager.wrapWithSandboxArgv(command)
+            // spawnWrappedCommandWindows owns the stdin contract:
+            // with a proxy auth token, the broker's stdin is a pipe
+            // that carries the --env-stdin secret frame then EOF;
+            // without one it stays 'inherit'. The mode difference
+            // costs nothing either way — the sandboxed child's
+            // stdin is NEVER the broker's stdin (it is the
+            // broker→runner spec pipe at EOF; see spawn_runner in
+            // vendor/srt-win-src/src/logon.rs and std_handles in
+            // launch.rs), so no user input is lost by piping here.
+            const { spawnWrappedCommandWindows } = await import(
+              './sandbox/windows-sandbox-utils.js'
+            )
+            const wrapped = await SandboxManager.wrapWithSandboxArgv(command)
             // No slot to displace: libuv passes only the stdio array's
             // entries to the child as CRT descriptors, so the control fd
             // is not among them (an inheritable HANDLE still reaches the
             // child, but unnamed — nothing there can find it).
-            child = spawn(argv[0], argv.slice(1), {
-              shell: false,
-              stdio: 'inherit',
-              env,
-            })
+            child = spawnWrappedCommandWindows(wrapped)
           } else {
             const sandboxedCommand =
               await SandboxManager.wrapWithSandbox(command)
