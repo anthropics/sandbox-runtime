@@ -792,7 +792,7 @@ export const NetworkConfigSchema = z.object({
     .array(machServiceNameSchema)
     .optional()
     .describe(
-      'macOS only: XPC/Mach service names the sandboxed process may register (bootstrap_check_in), the server-side counterpart of allowMachLookup and a separate Seatbelt operation. Same trailing-wildcard matching. Needed by Chromium-based browsers (Playwright, Puppeteer), which register their MachPortRendezvousServer and Crashpad ports, e.g. "com.google.chrome.for.testing.*".',
+      'macOS only: XPC/Mach service names the sandboxed process may register (bootstrap_check_in), the server-side counterpart of allowMachLookup and a separate Seatbelt operation. Same trailing-wildcard matching. Needed by Chromium-based browsers (Playwright, Puppeteer), which register their MachPortRendezvousServer and Crashpad ports, e.g. "com.google.chrome.for.testing.*", or "org.chromium.Chromium.*" for Playwright\'s bundled Chromium. List the same names in allowMachLookup: without the matching lookup the browser hangs instead of failing.',
     ),
   httpProxyPort: z
     .number()

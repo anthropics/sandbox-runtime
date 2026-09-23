@@ -946,6 +946,50 @@ function machServiceRules(
 }
 
 /**
+ * Warn about names in `allowMachRegister` that no `allowMachLookup` entry
+ * covers. `mach-register` and `mach-lookup` are separate Seatbelt operations,
+ * so registering a name does not make it resolvable: the sandboxed process
+ * publishes the port and its own children are then denied the lookup. For the
+ * case this option exists for — a Chromium-based browser checking in its
+ * `MachPortRendezvousServer` — that denial does not surface as an error, it
+ * blocks the rendezvous and the browser hangs. Registering without the lookup
+ * is never useful, so say so rather than widening the lookup grant silently.
+ *
+ * A lookup pattern covers a register pattern when everything the register
+ * pattern can match is also matched by the lookup pattern: a prefix lookup
+ * (`"p*"`) covers any register name starting with `p`, and an exact lookup
+ * covers only the identical exact name.
+ */
+function warnMachRegisterWithoutLookup(
+  allowMachRegister: string[] | undefined,
+  allowMachLookup: string[] | undefined,
+): void {
+  if (!allowMachRegister?.length) return
+  const lookups = allowMachLookup ?? []
+  const uncovered = allowMachRegister.filter(
+    name =>
+      !lookups.some(lookup =>
+        lookup.endsWith('*')
+          ? name.startsWith(lookup.slice(0, -1))
+          : // This branch only runs for a lookup without a trailing "*", so an
+            // equal name cannot carry one either: no separate guard is needed.
+            name === lookup,
+      ),
+  )
+  if (!uncovered.length) return
+  const msg =
+    `[sandbox-runtime] WARNING: network.allowMachRegister lists ` +
+    `${uncovered.map(n => `"${n}"`).join(', ')} with no network.allowMachLookup ` +
+    `entry covering ${uncovered.length === 1 ? 'it' : 'them'}. Registering a ` +
+    `Mach name does not make it resolvable — mach-register and mach-lookup are ` +
+    `separate operations — so a Chromium-based browser will publish its ` +
+    `MachPortRendezvousServer and then hang waiting for children that cannot ` +
+    `look it up. List the same names in allowMachLookup.`
+  console.warn(msg)
+  logForDebugging(msg, { level: 'warn' })
+}
+
+/**
  * Generate complete sandbox profile
  */
 function generateSandboxProfile({
@@ -984,6 +1028,7 @@ function generateSandboxProfile({
   allowAppleEvents?: boolean
   logTag: string
 }): string {
+  warnMachRegisterWithoutLookup(allowMachRegister, allowMachLookup)
   const profile: string[] = [
     '(version 1)',
     `(deny default (with message "${logTag}"))`,
