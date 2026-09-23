@@ -174,6 +174,52 @@ function sandboxedStdio(
   return stdio
 }
 
+/**
+ * How long `--violations` waits after the child exits before srt does. The
+ * kernel's deny reaches the macOS log monitor a few milliseconds after the
+ * syscall, so a command refused on its last line can exit first.
+ */
+const VIOLATIONS_DRAIN_MS = 250
+
+/**
+ * Append every violation the store records from now on to `file`, one JSON
+ * object per line. The store keeps only its last entries and tells
+ * subscribers about all of them each time, so the total count decides which
+ * are new. A write that fails is reported once and never stops the command.
+ */
+function recordViolationsTo(file: string): void {
+  const store = SandboxManager.getSandboxViolationStore()
+  let written = store.getTotalCount()
+  let failed = false
+  store.subscribe(violations => {
+    const total = store.getTotalCount()
+    // slice(-0) is the whole array, so a count of zero has to be its own case.
+    const n = Math.min(total - written, violations.length)
+    written = total
+    if (n <= 0) return
+    const fresh = violations.slice(-n)
+    const lines = fresh
+      .map(v =>
+        JSON.stringify({
+          timestamp: v.timestamp.toISOString(),
+          line: v.line,
+          ...(v.command !== undefined ? { command: v.command } : {}),
+        }),
+      )
+      .join('\n')
+    try {
+      fs.appendFileSync(file, lines + '\n')
+    } catch (error) {
+      if (!failed) {
+        failed = true
+        console.error(
+          `srt: could not write violations to ${file}: ${(error as Error).message}`,
+        )
+      }
+    }
+  })
+}
+
 async function main(): Promise<void> {
   const program = new Command()
 
@@ -286,6 +332,11 @@ async function main(): Promise<void> {
         'protocol; give srt a dedicated read-only end — see the README)',
       parseControlFd,
     )
+    .option(
+      '--violations <path>',
+      'append each recorded sandbox violation to this file as a JSON line; ' +
+        'also turns on the kernel monitors, so filesystem denies are recorded',
+    )
     .allowUnknownOption()
     .action(
       async (
@@ -295,6 +346,7 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          violations?: string
         },
       ) => {
         try {
@@ -428,7 +480,20 @@ async function main(): Promise<void> {
 
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
+          // --violations turns on the log monitors, which initialize()
+          // leaves off by default; without them the store only ever holds
+          // proxy denies.
+          const violationsPath = options.violations
+            ? path.resolve(options.violations)
+            : undefined
+          await SandboxManager.initialize(
+            runtimeConfig,
+            undefined,
+            violationsPath !== undefined,
+          )
+          if (violationsPath !== undefined) {
+            recordViolationsTo(violationsPath)
+          }
 
           // Read config updates only now. The stream has been waiting
           // unread, so nothing the caller wrote meanwhile is lost, and an
@@ -529,6 +594,17 @@ async function main(): Promise<void> {
             })
           }
 
+          // With --violations, the last kernel deny of the run can still be
+          // on its way from the log monitor when the child exits (macOS
+          // delivers it through `log stream`). Give it a moment before
+          // exiting; without the flag, exit at once as before.
+          // Callers return right after it: unlike process.exit(), it comes
+          // back when the exit is deferred.
+          const exit = (status: number): void => {
+            if (violationsPath === undefined) process.exit(status)
+            setTimeout(() => process.exit(status), VIOLATIONS_DRAIN_MS)
+          }
+
           // Handle process exit
           child.on('exit', (code, signal) => {
             // Clean up bwrap mount point artifacts before exiting.
@@ -539,18 +615,17 @@ async function main(): Promise<void> {
             if (controlChannelFailed) {
               // srt killed the command over a dead control channel, so the
               // status it died with is not the run's result.
-              process.exit(1)
+              return exit(1)
             }
 
             if (signal) {
               if (signal === 'SIGINT' || signal === 'SIGTERM') {
-                process.exit(0)
-              } else {
-                console.error(`Process killed by signal: ${signal}`)
-                process.exit(1)
+                return exit(0)
               }
+              console.error(`Process killed by signal: ${signal}`)
+              return exit(1)
             }
-            process.exit(code ?? 0)
+            return exit(code ?? 0)
           })
 
           child.on('error', error => {
