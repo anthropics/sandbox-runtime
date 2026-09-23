@@ -220,6 +220,28 @@ srt --control-fd 3 -- npm test
   points that slot at `/dev/null` for the command, so nothing inside the
   sandbox can read the updates or write a config of its own.
 
+#### Reading what was refused: `--violations`
+
+`--violations <path>` appends each violation srt records to a file, one JSON
+object per line, while the command runs:
+
+```bash
+srt --settings ./srt-settings.json --violations ./violations.jsonl -- npm test
+```
+
+```json
+{"timestamp":"…","line":"deny network-outbound github.com:443 (host is not on the allow list)","command":"npm test"}
+```
+
+- It also turns on the kernel monitors, which are off by default on the CLI.
+  Without them only proxy denies are recorded; with them, on macOS, refused
+  filesystem operations are too.
+- A command refused on its last line exits before the monitor has delivered
+  that deny, so with the flag srt waits a moment (250 ms) after the command
+  exits. Without the flag nothing changes.
+- The file is created on the first violation, not before: no file means
+  nothing was refused.
+
 ### As a library
 
 ```typescript

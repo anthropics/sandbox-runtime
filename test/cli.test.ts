@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -272,6 +273,110 @@ describe('CLI', () => {
         expect(result.status).toBe(0)
         expect(result.stdout).toContain('no-settings-file')
       })
+    })
+  })
+
+  describe('--violations', () => {
+    // The store records violations whether or not anyone reads it; this flag
+    // is how a caller that runs the binary reads it. It also turns on the
+    // kernel monitors, which is what puts filesystem denies in the store.
+    const settingsFor = (dir: string, allowedDomains: string[]) =>
+      JSON.stringify({
+        network: { allowedDomains, deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [join(dir, 'ok')],
+          denyWrite: [],
+        },
+      })
+
+    const readLines = (file: string) =>
+      readFileSync(file, 'utf-8')
+        .split('\n')
+        .filter(Boolean)
+        .map(l => JSON.parse(l) as { line: string; command?: string })
+
+    test.if(process.platform === 'darwin')(
+      "records a refused write, even on the command's last line",
+      () => {
+        // /private/tmp, not tmpdir(): the default write allowlist covers the
+        // per-user temp dir, so a write there would not be refused.
+        const dir = mkdtempSync('/private/tmp/srt-cli-violations-')
+        mkdirSync(join(dir, 'ok'))
+        const settingsPath = join(dir, 'settings.json')
+        const out = join(dir, 'violations.jsonl')
+        writeFileSync(settingsPath, settingsFor(dir, []))
+        try {
+          const target = join(dir, 'outside.txt')
+          runCli([
+            '--settings',
+            settingsPath,
+            '--violations',
+            out,
+            '-c',
+            `echo x > ${target}`,
+          ])
+          const lines = readLines(out)
+          const write = lines.find(l => l.line.includes(target))
+          expect(write).toBeDefined()
+          expect(write!.line).toContain('deny')
+          expect(write!.command).toContain(target)
+        } finally {
+          rmSync(dir, { recursive: true, force: true })
+        }
+      },
+    )
+
+    test.if(process.platform === 'darwin' || process.platform === 'linux')(
+      'records a host the proxy refused',
+      () => {
+        const dir = mkdtempSync(join(tmpdir(), 'srt-cli-violations-'))
+        mkdirSync(join(dir, 'ok'))
+        const settingsPath = join(dir, 'settings.json')
+        const out = join(dir, 'violations.jsonl')
+        writeFileSync(settingsPath, settingsFor(dir, []))
+        try {
+          runCli([
+            '--settings',
+            settingsPath,
+            '--violations',
+            out,
+            '-c',
+            'curl -s -o /dev/null --max-time 5 http://example.com/',
+          ])
+          const lines = readLines(out)
+          expect(
+            lines.some(l =>
+              l.line.includes('deny network-outbound example.com:80'),
+            ),
+          ).toBe(true)
+        } finally {
+          rmSync(dir, { recursive: true, force: true })
+        }
+      },
+    )
+
+    test('writes nothing when nothing is refused', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'srt-cli-violations-'))
+      mkdirSync(join(dir, 'ok'))
+      const settingsPath = join(dir, 'settings.json')
+      const out = join(dir, 'violations.jsonl')
+      writeFileSync(settingsPath, settingsFor(dir, []))
+      try {
+        const result = runCli([
+          '--settings',
+          settingsPath,
+          '--violations',
+          out,
+          'echo',
+          'fine',
+        ])
+        expect(result.stdout.trim()).toBe('fine')
+        expect(result.status).toBe(0)
+        expect(existsSync(out)).toBe(false)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
     })
   })
 
