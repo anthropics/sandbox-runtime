@@ -223,13 +223,13 @@ export function isSymlinkOutsideBoundary(
   // /tmp/claude -> /private/tmp/claude is OK
   // /var/folders/... -> /private/var/folders/... is OK
   if (
-    normalizedOriginal.startsWith('/tmp/') &&
+    isAtOrUnder(normalizedOriginal, '/tmp') &&
     normalizedResolved === '/private' + normalizedOriginal
   ) {
     return false
   }
   if (
-    normalizedOriginal.startsWith('/var/') &&
+    isAtOrUnder(normalizedOriginal, '/var') &&
     normalizedResolved === '/private' + normalizedOriginal
   ) {
     return false
