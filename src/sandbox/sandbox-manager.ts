@@ -108,6 +108,8 @@ import {
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
+import { isIP } from 'node:net'
+import { isLoopbackName } from './address.js'
 import type { DirectLookup, ResolvedParentProxy } from './parent-proxy.js'
 import {
   createResolvedAddressGuard,
@@ -378,8 +380,15 @@ async function filterNetworkRequest(
   }
 
   // allowAllDomains short-circuits the allowlist after denies are checked,
-  // so explicit deniedDomains entries still take effect.
-  if (config.network.allowAllDomains) {
+  // so explicit deniedDomains entries still take effect. It covers hostnames
+  // only: the resolved-address guard trusts an allow-listed IP literal or
+  // loopback name as an explicit choice, so those must still earn an
+  // allowedDomains entry rather than ride the flag to IMDS or host loopback.
+  if (
+    config.network.allowAllDomains &&
+    !isIP(canonicalHost) &&
+    !isLoopbackName(canonicalHost)
+  ) {
     logForDebugging(`Allowed by allowAllDomains: ${host}:${port}`)
     return true
   }
