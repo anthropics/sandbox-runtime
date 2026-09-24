@@ -1144,6 +1144,24 @@ function generateSandboxProfile({
   if (!needsNetworkRestriction) {
     profile.push('(allow network*)')
   } else {
+    // getaddrinfo() sorts its results with libsystem_info's
+    // si_destination_compare(), which asks the kernel which local source
+    // address each candidate destination would be reached from. It does that
+    // over an AF_SYSTEM/SYSPROTO_CONTROL socket attached to the
+    // "com.apple.netsrc" kernel control. No packet leaves the host.
+    //
+    // The socket() half of that is already allowed above, by
+    // (allow system-socket (require-all (socket-domain AF_SYSTEM)
+    // (socket-protocol 2))) — protocol 2 is SYSPROTO_CONTROL. Only the
+    // matching connect() was missing, and Seatbelt bills connect() on a
+    // kernel-control socket as network-outbound, so it fell to (deny default)
+    // and the kernel logged a bare "deny(1) network-outbound" with no host and
+    // no path — indistinguishable from a real egress attempt for anything
+    // watching the violation log (#599).
+    //
+    // (control-name ...) is an exact match, so this admits that one control
+    // and nothing else; IP egress stays governed by the rules below.
+    profile.push('(allow network-outbound (control-name "com.apple.netsrc"))')
     // Allow local binding if requested.
     //
     // bind/inbound use (local ip "*:*") instead of "localhost:*" because modern
