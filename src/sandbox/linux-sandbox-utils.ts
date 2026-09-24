@@ -1170,7 +1170,7 @@ function probeUid0UserNamespace(bwrap: string): string | null {
  *
  * 3. Configure environment:
  *    - HTTP_PROXY=http://localhost:3128 for HTTP/HTTPS tools
- *    - GIT_SSH_COMMAND with socat for SSH through SOCKS5
+ *    - GIT_SSH_COMMAND with socat for SSH through HTTP CONNECT
  *
  * LIMITATION: Unlike macOS sandbox which can enforce domain-based allowlists at the kernel level,
  * Linux's --unshare-net provides only all-or-nothing network isolation. Domain filtering happens

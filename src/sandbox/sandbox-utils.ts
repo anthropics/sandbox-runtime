@@ -3,6 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import { whichSync } from '../utils/which.js'
 
 /**
  * Dangerous files that should be protected from writes.
@@ -796,12 +797,27 @@ export function generateProxyEnvVars(
     const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
     if (platform === 'macos') {
-      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
-      // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
-      // handshake — use git-over-https (HTTP_PROXY carries the credential).
-      envVars.push(
-        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
-      )
+      if (httpProxyPort && whichSync('socat')) {
+        // macOS with socat available: same HTTP CONNECT spelling as Linux.
+        // This is the only stock ProxyCommand tool that can authenticate to
+        // the proxy — BSD nc (below) cannot, so socat is what makes
+        // git-over-ssh work when proxyAuthToken is set. socat is not a
+        // required macOS dependency; detected per call, nc fallback below.
+        const socatAuth = proxyAuthToken
+          ? `,proxyauth=${userRaw}:${proxyAuthToken}`
+          : ''
+        envVars.push(
+          `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
+        )
+      } else {
+        // Fallback: BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
+        // auth, so when proxyAuthToken is set, git-over-ssh fails at the
+        // SOCKS handshake — install socat, or use git-over-https
+        // (HTTP_PROXY carries the credential).
+        envVars.push(
+          `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
+        )
+      }
     } else if (platform === 'linux' && httpProxyPort) {
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
       // socat is already a required Linux sandbox dependency, and PROXY: is
