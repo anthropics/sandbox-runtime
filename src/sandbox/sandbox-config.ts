@@ -740,6 +740,19 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'If true, hosts not in allowedDomains are denied without consulting the ask callback. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
     ),
+  allowAllDomains: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, permit network egress to any domain. deniedDomains is still ' +
+        'enforced (checked before the allow-all decision), so explicit denies ' +
+        'still take effect. IP literals and loopback names (localhost, ' +
+        '*.localhost) are not covered: they still need an allowedDomains ' +
+        'entry, and allowed hostnames remain subject to the resolved-address ' +
+        'check. Intended for environments where filesystem ' +
+        'restrictions are relied on as the primary boundary and the ' +
+        'allowlist would otherwise need to enumerate the entire public web.',
+    ),
   deniedResolvedAddresses: z
     .array(addressRangeSchema)
     .optional()
@@ -1213,10 +1226,16 @@ export const SandboxRuntimeConfigSchema = z
     // Host-scoped view of the allowlist (":port" suffixes dropped) —
     // injection is per-host, not per-port.
     const allowedHosts = cfg.network.allowedDomains.map(stripDomainPatternPort)
+    // allowAllDomains makes every host reachable regardless of the
+    // allowlist, so the reachability requirement on injectHosts is
+    // vacuous — without this, the masking recipe would demand allowlist
+    // entries that the flag makes meaningless.
+    const allowAll = cfg.network.allowAllDomains === true
     const checkSubset = (
       hosts: readonly string[],
       path: (string | number)[],
     ) => {
+      if (allowAll) return
       for (const [i, host] of hosts.entries()) {
         if (!isInjectHostCoveredByAllowedDomains(host, allowedHosts)) {
           ctx.addIssue({
@@ -1246,6 +1265,28 @@ export const SandboxRuntimeConfigSchema = z
       }
       if (entry.mode !== 'mask') return
       hasMasked = true
+      // Runtime default injectHosts is network.allowedDomains. Under
+      // allowAllDomains the allowlist no longer gates reachability and is
+      // typically empty — the default then resolves to no hosts at all
+      // and the credential would be masked but never injected (silent
+      // auth failure inside the sandbox). Require explicit injectHosts.
+      if (
+        allowAll &&
+        entry.injectHosts === undefined &&
+        allowedHosts.length === 0
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path,
+          message:
+            `This masked credential has no injectHosts, so it defaults to ` +
+            `network.allowedDomains — which is empty. With ` +
+            `network.allowAllDomains the allowlist does not gate ` +
+            `reachability, so the default would inject the credential ` +
+            `nowhere. List the hosts that should receive the real value ` +
+            `in injectHosts.`,
+        })
+      }
       // Credential substitution only runs on the TLS-terminated path, so a
       // host covered by tlsTerminate.excludeDomains can never receive the
       // real value — the upstream sees the placeholder. Reject the

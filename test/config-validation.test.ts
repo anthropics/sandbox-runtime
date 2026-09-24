@@ -89,6 +89,24 @@ describe('Config Validation', () => {
     expect(result.success).toBe(false)
   })
 
+  test('should validate config with allowAllDomains flag', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: ['evil.com'],
+        allowAllDomains: true,
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+  })
+
   test('should validate config with optional fields', () => {
     const config = {
       network: {
@@ -2119,5 +2137,109 @@ describe('Config Validation', () => {
         expect(result.success).toBe(false)
       })
     })
+  })
+})
+
+describe('allowAllDomains × credential masking', () => {
+  const base = {
+    network: { allowedDomains: [], deniedDomains: [], allowAllDomains: true },
+    filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+  }
+
+  test('accepts injectHosts not covered by allowedDomains', () => {
+    // The docs' masking recipe: default-allow networking, empty
+    // allowlist, credential injected only toward GitHub. Without the
+    // allowAll bypass the subset check would demand github.com in
+    // allowedDomains — entries the flag makes meaningless.
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      ...base,
+      network: { ...base.network, tlsTerminate: {} },
+      credentials: {
+        envVars: [
+          {
+            name: 'GH_TOKEN',
+            mode: 'mask',
+            injectHosts: ['github.com', '*.github.com'],
+          },
+        ],
+      },
+    })
+    expect(result.success).toBe(true)
+  })
+
+  test('without allowAllDomains the same config is still rejected', () => {
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      ...base,
+      network: { allowedDomains: [], deniedDomains: [], tlsTerminate: {} },
+      credentials: {
+        envVars: [
+          { name: 'GH_TOKEN', mode: 'mask', injectHosts: ['github.com'] },
+        ],
+      },
+    })
+    expect(result.success).toBe(false)
+  })
+
+  test('rejects a masked credential with no injectHosts and an empty allowlist', () => {
+    // Runtime default injectHosts = allowedDomains = [] — the credential
+    // would be masked but injected nowhere, a silent auth failure.
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      ...base,
+      network: { ...base.network, tlsTerminate: {} },
+      credentials: {
+        envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
+      },
+    })
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      const messages = result.error.issues.map(i => i.message).join('\n')
+      expect(messages).toContain('inject the credential nowhere')
+    }
+  })
+
+  test('accepts a masked credential with no injectHosts when allowedDomains is non-empty', () => {
+    // Default injectHosts = allowedDomains still names real hosts, so the
+    // credential is injectable — same as without allowAllDomains.
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      ...base,
+      network: {
+        ...base.network,
+        allowedDomains: ['api.github.com'],
+        tlsTerminate: {},
+      },
+      credentials: {
+        envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
+      },
+    })
+    expect(result.success).toBe(true)
+  })
+
+  test('still rejects injectHosts entirely covered by tlsTerminate.excludeDomains', () => {
+    // allowAllDomains does not rescue the terminated-path contradiction:
+    // an excluded host never gets injection regardless of reachability.
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      ...base,
+      network: {
+        ...base.network,
+        tlsTerminate: { excludeDomains: ['github.com'] },
+      },
+      credentials: {
+        envVars: [
+          { name: 'GH_TOKEN', mode: 'mask', injectHosts: ['github.com'] },
+        ],
+      },
+    })
+    expect(result.success).toBe(false)
+  })
+
+  test('still rejects an explicitly empty injectHosts', () => {
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      ...base,
+      network: { ...base.network, tlsTerminate: {} },
+      credentials: {
+        envVars: [{ name: 'GH_TOKEN', mode: 'mask', injectHosts: [] }],
+      },
+    })
+    expect(result.success).toBe(false)
   })
 })
