@@ -1,7 +1,7 @@
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import * as fs from 'node:fs'
-import { execSync } from 'node:child_process'
+import { exec, execSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { logForDebugging } from '../utils/debug.js'
 
@@ -10,28 +10,76 @@ const applySeccompPathCache = new Map<string, string | null>()
 
 // Cache for global npm paths (computed once per process)
 let cachedGlobalNpmPaths: string[] | null = null
+let pendingGlobalNpmPaths: Promise<string[]> | null = null
+
+const NPM_ROOT_COMMAND = 'npm root -g'
+const NPM_ROOT_TIMEOUT_MS = 5000
 
 /**
  * Get paths to check for globally installed @anthropic-ai/sandbox-runtime package.
  * This is used as a fallback when the binaries aren't bundled (e.g., native builds).
+ *
+ * Blocks the event loop on `npm root -g` (~100 ms) the first time it is
+ * called in a process unless {@link getGlobalNpmPathsAsync} has already
+ * filled the cache; initialize() goes through the async variant.
  */
-function getGlobalNpmPaths(): string[] {
+export function getGlobalNpmPaths(): string[] {
   if (cachedGlobalNpmPaths) return cachedGlobalNpmPaths
 
-  const paths: string[] = []
-
-  // Try to get the actual global npm root
+  let npmRoot: string | undefined
   try {
-    const npmRoot = execSync('npm root -g', {
+    npmRoot = execSync(NPM_ROOT_COMMAND, {
       encoding: 'utf8',
-      timeout: 5000,
+      timeout: NPM_ROOT_TIMEOUT_MS,
       stdio: ['pipe', 'pipe', 'ignore'],
-    }).trim()
-    if (npmRoot) {
-      paths.push(join(npmRoot, '@anthropic-ai', 'sandbox-runtime'))
-    }
+    })
   } catch {
     // npm not available or failed
+  }
+  cachedGlobalNpmPaths = buildGlobalNpmPaths(npmRoot)
+  return cachedGlobalNpmPaths
+}
+
+/**
+ * Async variant of {@link getGlobalNpmPaths}: runs `npm root -g` without
+ * blocking the event loop and shares the same per-process cache, so a
+ * later sync call returns immediately. Never rejects — a failed or
+ * timed-out npm yields just the static fallback locations, as the sync
+ * variant does.
+ */
+export function getGlobalNpmPathsAsync(): Promise<string[]> {
+  if (cachedGlobalNpmPaths) return Promise.resolve(cachedGlobalNpmPaths)
+  if (pendingGlobalNpmPaths) return pendingGlobalNpmPaths
+
+  pendingGlobalNpmPaths = new Promise<string | undefined>(resolve => {
+    try {
+      const child = exec(
+        NPM_ROOT_COMMAND,
+        { encoding: 'utf8', timeout: NPM_ROOT_TIMEOUT_MS },
+        (err, stdout) => resolve(err ? undefined : stdout),
+      )
+      // Match execSync's closed stdin: npm never waits on it.
+      child.stdin?.end()
+    } catch {
+      resolve(undefined)
+    }
+  }).then(npmRoot => {
+    // A sync call that ran while npm was in flight already filled the cache;
+    // keep its array so every caller sees the same one.
+    cachedGlobalNpmPaths ??= buildGlobalNpmPaths(npmRoot)
+    pendingGlobalNpmPaths = null
+    return cachedGlobalNpmPaths
+  })
+  return pendingGlobalNpmPaths
+}
+
+function buildGlobalNpmPaths(npmRootOutput: string | undefined): string[] {
+  const paths: string[] = []
+
+  // The actual global npm root, when npm answered
+  const npmRoot = npmRootOutput?.trim()
+  if (npmRoot) {
+    paths.push(join(npmRoot, '@anthropic-ai', 'sandbox-runtime'))
   }
 
   // Common global npm locations as fallbacks
@@ -75,7 +123,6 @@ function getGlobalNpmPaths(): string[] {
     ),
   )
 
-  cachedGlobalNpmPaths = paths
   return paths
 }
 
@@ -84,30 +131,17 @@ function getGlobalNpmPaths(): string[] {
  * Returns null for unsupported architectures
  */
 function getVendorArchitecture(): string | null {
-  const arch = process.arch as string
+  const arch = process.arch
   switch (arch) {
     case 'x64':
-    case 'x86_64':
       return 'x64'
     case 'arm64':
-    case 'aarch64':
       return 'arm64'
     case 'ia32':
-    case 'x86':
-      // TODO: Add support for 32-bit x86 (ia32)
-      // Currently blocked because the seccomp filter does not block the socketcall() syscall,
-      // which is used on 32-bit x86 for all socket operations (socket, socketpair, bind, connect, etc.).
-      // On 32-bit x86, the direct socket() syscall doesn't exist - instead, all socket operations
-      // are multiplexed through socketcall(SYS_SOCKET, ...), socketcall(SYS_SOCKETPAIR, ...), etc.
-      //
-      // To properly support 32-bit x86, we need to:
-      // 1. Build a separate i386 BPF filter (BPF bytecode is architecture-specific)
-      // 2. Modify vendor/seccomp-src/seccomp-unix-block.c to conditionally add rules that block:
-      //    - socketcall(SYS_SOCKET, [AF_UNIX, ...])
-      //    - socketcall(SYS_SOCKETPAIR, [AF_UNIX, ...])
-      // 3. This requires complex BPF logic to inspect socketcall's sub-function argument
-      //
-      // Until then, 32-bit x86 is not supported to avoid a security bypass.
+      // ia32 multiplexes every socket operation through socketcall(), whose
+      // sub-function argument the filter cannot inspect, so AF_UNIX is not
+      // blockable there. vendor/seccomp-src/seccomp-unix-block.c carries what
+      // supporting it would take.
       logForDebugging(
         `[SeccompFilter] 32-bit x86 (ia32) is not currently supported due to missing socketcall() syscall blocking. ` +
           `The current seccomp filter only blocks socket(AF_UNIX, ...), but on 32-bit x86, socketcall() can be used to bypass this.`,
@@ -165,12 +199,46 @@ export function getApplySeccompBinaryPath(
     return applySeccompPathCache.get(cacheKey)!
   }
 
-  const result = findApplySeccompPath(seccompBinaryPath)
+  const local = findLocalApplySeccompPath(seccompBinaryPath)
+  const result =
+    local !== undefined
+      ? local
+      : findGlobalApplySeccompPath(getGlobalNpmPaths())
   applySeccompPathCache.set(cacheKey, result)
   return result
 }
 
-function findApplySeccompPath(seccompBinaryPath?: string): string | null {
+/**
+ * Async variant of {@link getApplySeccompBinaryPath}: same lookup order and
+ * shared cache, but the global-npm fallback resolves `npm root -g` without
+ * blocking the event loop. Resolving once through here (as
+ * checkDependenciesAsync does) makes later sync calls cache hits.
+ */
+export async function getApplySeccompBinaryPathAsync(
+  seccompBinaryPath?: string,
+): Promise<string | null> {
+  const cacheKey = seccompBinaryPath ?? ''
+  if (applySeccompPathCache.has(cacheKey)) {
+    return applySeccompPathCache.get(cacheKey)!
+  }
+
+  const local = findLocalApplySeccompPath(seccompBinaryPath)
+  const result =
+    local !== undefined
+      ? local
+      : findGlobalApplySeccompPath(await getGlobalNpmPathsAsync())
+  applySeccompPathCache.set(cacheKey, result)
+  return result
+}
+
+/**
+ * Explicit path, then bundled/package locations. Returns the path when
+ * found, null when there is nothing to look for (unsupported architecture),
+ * or undefined to fall through to the global npm install.
+ */
+function findLocalApplySeccompPath(
+  seccompBinaryPath?: string,
+): string | null | undefined {
   // Check explicit path first (highest priority)
   if (seccompBinaryPath) {
     if (fs.existsSync(seccompBinaryPath)) {
@@ -206,8 +274,17 @@ function findApplySeccompPath(seccompBinaryPath?: string): string | null {
     }
   }
 
-  // Fallback: check global npm install (for native builds without bundled vendor)
-  for (const globalBase of getGlobalNpmPaths()) {
+  return undefined
+}
+
+/**
+ * Fallback: check global npm install (for native builds without bundled vendor)
+ */
+function findGlobalApplySeccompPath(globalBases: string[]): string | null {
+  const arch = getVendorArchitecture()
+  if (!arch) return null
+
+  for (const globalBase of globalBases) {
     const binaryPath = join(
       globalBase,
       'vendor',

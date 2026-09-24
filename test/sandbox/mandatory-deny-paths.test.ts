@@ -22,12 +22,16 @@ import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import {
   wrapCommandWithSandboxMacOS,
-  macGetMandatoryDenyPatterns,
+  macGetMandatoryDenyEntries,
 } from '../../src/sandbox/macos-sandbox-utils.js'
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  DANGEROUS_FILES,
+  getDangerousDirectories,
+} from '../../src/sandbox/sandbox-utils.js'
 import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
@@ -47,22 +51,17 @@ describe.if(isSupportedPlatform)(
     const TEST_DIR = join(tmpdir(), `mandatory-deny-integration-${Date.now()}`)
     const ORIGINAL_CONTENT = 'ORIGINAL'
     const MODIFIED_CONTENT = 'MODIFIED'
+    /** Written into every directory getDangerousDirectories() names. */
+    const DIRECTORY_PROBE_FILE = 'probe.txt'
     let originalCwd: string
 
     beforeAll(() => {
       originalCwd = process.cwd()
       mkdirSync(TEST_DIR, { recursive: true })
 
-      // Create ALL dangerous files from DANGEROUS_FILES
-      writeFileSync(join(TEST_DIR, '.bashrc'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.bash_profile'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.gitconfig'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.gitmodules'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.zshrc'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.zprofile'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.profile'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.ripgreprc'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.mcp.json'), ORIGINAL_CONTENT)
+      for (const name of DANGEROUS_FILES) {
+        writeFileSync(join(TEST_DIR, name), ORIGINAL_CONTENT)
+      }
 
       // Create .git with hooks and config
       mkdirSync(join(TEST_DIR, '.git', 'hooks'), { recursive: true })
@@ -73,28 +72,13 @@ describe.if(isSupportedPlatform)(
       )
       writeFileSync(join(TEST_DIR, '.git', 'HEAD'), 'ref: refs/heads/main')
 
-      // Create .vscode
-      mkdirSync(join(TEST_DIR, '.vscode'), { recursive: true })
-      writeFileSync(
-        join(TEST_DIR, '.vscode', 'settings.json'),
-        ORIGINAL_CONTENT,
-      )
-
-      // Create .idea
-      mkdirSync(join(TEST_DIR, '.idea'), { recursive: true })
-      writeFileSync(join(TEST_DIR, '.idea', 'workspace.xml'), ORIGINAL_CONTENT)
-
-      // Create .claude/commands and .claude/agents (should be blocked)
-      mkdirSync(join(TEST_DIR, '.claude', 'commands'), { recursive: true })
-      mkdirSync(join(TEST_DIR, '.claude', 'agents'), { recursive: true })
-      writeFileSync(
-        join(TEST_DIR, '.claude', 'commands', 'test.md'),
-        ORIGINAL_CONTENT,
-      )
-      writeFileSync(
-        join(TEST_DIR, '.claude', 'agents', 'test-agent.md'),
-        ORIGINAL_CONTENT,
-      )
+      for (const dir of getDangerousDirectories()) {
+        mkdirSync(join(TEST_DIR, dir), { recursive: true })
+        writeFileSync(
+          join(TEST_DIR, dir, DIRECTORY_PROBE_FILE),
+          ORIGINAL_CONTENT,
+        )
+      }
 
       // Create a safe file that SHOULD be writable
       writeFileSync(join(TEST_DIR, 'safe-file.txt'), ORIGINAL_CONTENT)
@@ -179,71 +163,14 @@ describe.if(isSupportedPlatform)(
     }
 
     describe('Dangerous files should be blocked', () => {
-      it('blocks writes to .bashrc', async () => {
-        const result = await runSandboxedWrite('.bashrc', MODIFIED_CONTENT)
+      for (const name of DANGEROUS_FILES) {
+        it(`blocks writes to ${name}`, async () => {
+          const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.bashrc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .gitconfig', async () => {
-        const result = await runSandboxedWrite('.gitconfig', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.gitconfig', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .zshrc', async () => {
-        const result = await runSandboxedWrite('.zshrc', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.zshrc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .mcp.json', async () => {
-        const result = await runSandboxedWrite('.mcp.json', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.mcp.json', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .bash_profile', async () => {
-        const result = await runSandboxedWrite(
-          '.bash_profile',
-          MODIFIED_CONTENT,
-        )
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.bash_profile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .zprofile', async () => {
-        const result = await runSandboxedWrite('.zprofile', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.zprofile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .profile', async () => {
-        const result = await runSandboxedWrite('.profile', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.profile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .gitmodules', async () => {
-        const result = await runSandboxedWrite('.gitmodules', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.gitmodules', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .ripgreprc', async () => {
-        const result = await runSandboxedWrite('.ripgreprc', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.ripgreprc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
+          expect(result.success).toBe(false)
+          expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
+        })
+      }
     })
 
     describe('Git hooks and config should be blocked', () => {
@@ -268,53 +195,15 @@ describe.if(isSupportedPlatform)(
     })
 
     describe('Dangerous directories should be blocked', () => {
-      it('blocks writes to .vscode/', async () => {
-        const result = await runSandboxedWrite(
-          '.vscode/settings.json',
-          MODIFIED_CONTENT,
-        )
+      for (const dir of getDangerousDirectories()) {
+        it(`blocks writes to ${dir}/`, async () => {
+          const target = `${dir}/${DIRECTORY_PROBE_FILE}`
+          const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.vscode/settings.json', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
-        )
-      })
-
-      it('blocks writes to .claude/commands/', async () => {
-        const result = await runSandboxedWrite(
-          '.claude/commands/test.md',
-          MODIFIED_CONTENT,
-        )
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.claude/commands/test.md', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
-        )
-      })
-
-      it('blocks writes to .claude/agents/', async () => {
-        const result = await runSandboxedWrite(
-          '.claude/agents/test-agent.md',
-          MODIFIED_CONTENT,
-        )
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.claude/agents/test-agent.md', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
-        )
-      })
-
-      it('blocks writes to .idea/', async () => {
-        const result = await runSandboxedWrite(
-          '.idea/workspace.xml',
-          MODIFIED_CONTENT,
-        )
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.idea/workspace.xml', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
-        )
-      })
+          expect(result.success).toBe(false)
+          expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
+        })
+      }
     })
 
     describe('Safe files should still be writable', () => {
@@ -1135,9 +1024,9 @@ describe.if(isSupportedPlatform)(
   },
 )
 
-describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
+describe('macGetMandatoryDenyEntries - Unit Tests', () => {
   it('includes .git/config in deny patterns when allowGitConfig is false', () => {
-    const patterns = macGetMandatoryDenyPatterns(false)
+    const patterns = macGetMandatoryDenyEntries(false).map(e => e.path)
 
     // Should include .git/config pattern
     const hasGitConfigPattern = patterns.some(
@@ -1147,7 +1036,7 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
   })
 
   it('excludes .git/config from deny patterns when allowGitConfig is true', () => {
-    const patterns = macGetMandatoryDenyPatterns(true)
+    const patterns = macGetMandatoryDenyEntries(true).map(e => e.path)
 
     // Should NOT include .git/config pattern
     const hasGitConfigPattern = patterns.some(
@@ -1157,8 +1046,12 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
   })
 
   it('always includes .git/hooks in deny patterns regardless of allowGitConfig', () => {
-    const patternsWithoutGitConfig = macGetMandatoryDenyPatterns(false)
-    const patternsWithGitConfig = macGetMandatoryDenyPatterns(true)
+    const patternsWithoutGitConfig = macGetMandatoryDenyEntries(false).map(
+      e => e.path,
+    )
+    const patternsWithGitConfig = macGetMandatoryDenyEntries(true).map(
+      e => e.path,
+    )
 
     // Both should include .git/hooks pattern
     const hasHooksPatternFalse = patternsWithoutGitConfig.some(p =>
@@ -1173,7 +1066,7 @@ describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
   })
 
   it('defaults to blocking .git/config when no argument provided', () => {
-    const patterns = macGetMandatoryDenyPatterns()
+    const patterns = macGetMandatoryDenyEntries().map(e => e.path)
 
     const hasGitConfigPattern = patterns.some(
       p => p.includes('.git/config') || p.endsWith('.git/config'),

@@ -51,7 +51,17 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.14
+          bun-version: 1.4.2
+
+      # The JVM proxy agent (vendor/java-proxy-agent) is built from source
+      # here, like the seccomp helper; test/sandbox/java-proxy-agent.test.ts
+      # then drives it in a real JVM and self-skips when jar or JDK is absent.
+      - name: Setup Java (macOS/Linux)
+        if: matrix.os != 'windows'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
 
       # ─── Windows: srt-win helper binary ─────────────────────────────
       # GitHub-hosted Windows runners run as a member of Administrators
@@ -59,13 +69,19 @@ jobs:
       # without an explicit elevation step.
       - name: Setup Rust (Windows)
         if: matrix.os == 'windows'
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain@stable, pinned by commit: the ref is a
+        # branch, so a tag-shaped `@stable` still runs whatever that
+        # branch points at today. The cache below is shared with
+        # release.yml, so this job's supply chain is the release's too.
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
+          toolchain: stable
           components: clippy
 
       - name: Rust build cache (Windows)
         if: matrix.os == 'windows'
-        uses: Swatinem/rust-cache@v2
+        # Swatinem/rust-cache@v2.9.2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: vendor/srt-win-src
           # Shared with release.yml so tag-ref release builds restore
@@ -105,6 +121,16 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-kill.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      - name: Smoke-test srt-win ambient write-deny lifecycle (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-ambient.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
+      - name: srt-win machine-store smoke (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-machine-store.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -116,7 +142,12 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
-          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts
+          # These are listed explicitly because the non-Windows legs run the
+          # whole tree: winsrt-paths.property is the only property suite over
+          # the Windows path pipeline, glob-expand holds the UNC pass-raw
+          # block that runs on no other leg, and config-validation covers the
+          # schema on a real Windows host rather than under a platform spy.
+          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
@@ -139,9 +170,12 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
-          # Verify bwrap can create namespaces
+          # Same argv as bwrapCanNamespace() in test/helpers/bwrap-namespace.ts,
+          # which whole suites use as `it.skipIf(!BWRAP_CAN_NAMESPACE)`. A host
+          # that cannot nest namespaces must red the leg here rather than skip
+          # those arms silently, so this runs unguarded.
           echo "Testing bwrap namespace creation..."
-          bwrap --ro-bind / / --unshare-net true && echo "✓ bwrap namespace creation works" || echo "✗ bwrap namespace creation still fails"
+          bwrap --unshare-pid --unshare-user --cap-drop ALL --ro-bind / / --proc /proc true
 
       - name: Install system dependencies (macOS)
         if: matrix.os == 'macos'
@@ -156,9 +190,19 @@ jobs:
         if: matrix.os == 'linux' && matrix.arch == 'x86-64'
         run: npx eslint .
 
+      # `npm run build` compiles src only. This is the one step that checks
+      # the types of test/, which bun strips at runtime.
+      - name: Typecheck
+        if: matrix.os != 'windows'
+        run: npm run typecheck
+
       - name: Build seccomp binaries (Linux)
         if: matrix.os == 'linux'
         run: npm run build:seccomp
+
+      - name: Build JVM proxy agent (macOS/Linux)
+        if: matrix.os != 'windows'
+        run: npm run build:java-agent
 
       - name: Build project
         if: matrix.os != 'windows'
@@ -167,6 +211,28 @@ jobs:
       - name: Run tests
         if: matrix.os != 'windows'
         run: npm test
+
+      # bubblewrap 0.12 refuses a mount on a symlink destination, which the
+      # distribution's packaged bubblewrap accepts; run the suite against it
+      # as well so a profile that mounts on a link is caught here, not on a
+      # user's machine. Pinned by commit, not by the v0.12.0 tag, which the
+      # upstream repository can move.
+      - name: Build bubblewrap 0.12.0 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq meson ninja-build libcap-dev pkg-config
+          git clone --filter=blob:none https://github.com/containers/bubblewrap.git "$RUNNER_TEMP/bubblewrap"
+          cd "$RUNNER_TEMP/bubblewrap"
+          git checkout 2a76602a8c71f36c1527cf9fc3417d9149822e0c
+          meson setup _build --prefix="$RUNNER_TEMP/bwrap-0.12" -Dselinux=disabled -Dman=disabled -Dbash_completion=disabled -Dzsh_completion=disabled
+          ninja -C _build
+          ninja -C _build install
+          "$RUNNER_TEMP/bwrap-0.12/bin/bwrap" --version
+
+      - name: Run tests against bubblewrap 0.12.0 (Linux)
+        if: matrix.os == 'linux'
+        run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
 
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
@@ -204,9 +270,15 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
-      - name: Run srt end-to-end in unprivileged container
+      # The suite runs twice in one container: first as uid 0 holding
+      # CAP_SYS_ADMIN (a root parent on a VM; the sandbox must drop it, or a
+      # sandboxed umount lifts any deny), then with it dropped (Docker's
+      # default set: the unprivileged container enableWeakerNestedSandbox
+      # exists for).
+      - name: Run srt end-to-end as uid 0 in a container
         run: |
           docker run --rm \
+            --cap-add SYS_ADMIN \
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
             -v "${{ github.workspace }}:/work" \
@@ -215,13 +287,19 @@ jobs:
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev
-              curl -fsSL https://bun.sh/install | bash
+              # node and npm come from the image instead of a second piped
+              # installer, and bun is pinned to the version the rest of the
+              # matrix runs (oven-sh/setup-bun above). The tree carries a
+              # dozen bun-version-specific workarounds, so "whatever bun
+              # shipped this morning" is not the runtime under test.
+              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin nodejs npm
+              curl -fsSL https://bun.sh/install | bash -s bun-v1.4.2
               export PATH="$HOME/.bun/bin:$PATH"
-              curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-              apt-get install -y -qq nodejs
               npm ci
               npm run build:seccomp
               npm run build
+              echo "== as uid 0 with CAP_SYS_ADMIN"
               bun test test/docker-weak-sandbox.test.ts
+              echo "== as uid 0 without CAP_SYS_ADMIN"
+              capsh --drop=cap_sys_admin -- -c "bun test test/docker-weak-sandbox.test.ts"
             '

@@ -9,18 +9,24 @@
 //!   sandbox user (which has no inherent rights on real-user-owned
 //!   files) can reach the working tree;
 //! - `stamp` ⇒ `(D;OICI;mask;;;<sb-SID>)` on the target plus
-//!   `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent.
+//!   `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent;
+//! - install-time ambient write-denies (`ambient.rs`) reuse the
+//!   `stamp` deny shape, recorded in `ambient_denies` with no holder
+//!   so they persist across sessions until `uninstall`.
 //!
 //! Restore = walk the path's explicit ACEs, drop any whose trustee
-//! is `<sb-SID>`, write back `UNPROTECTED` so inherited ACEs are
-//! re-derived. The single chokepoint is [`apply_sandbox_aces`]
-//! ([`SbAceSet`]): converge the path to exactly the wanted ALLOW +
-//! DENY for `<sb-SID>`, idempotently.
+//! is `<sb-SID>`, write back preserving the DACL's protection state
+//! (`UNPROTECTED` re-derives inherited ACEs; a `SE_DACL_PROTECTED`
+//! path keeps its severed inheritance). The single chokepoint is
+//! [`apply_sandbox_aces`] ([`SbAceSet`]): converge the path to
+//! exactly the wanted ALLOW + DENY for `<sb-SID>`, idempotently.
 //!
-//! The PROTECTED broker-only allow-list in [`stamp_dir_inheriting`]
-//! / [`build_init_mutex_sa`] is the ONE remaining `PROTECTED`
-//! consumer — it protects the state-DB directory and the named
-//! init-mutex from the sandbox child, not user files.
+//! The PROTECTED allow-lists in [`set_path_dacl_from_sddl`]'s
+//! callers are the ONE remaining `PROTECTED` consumer — they
+//! protect the state stores from the sandbox child, not user
+//! files. (Cross-broker serialization uses a file lock inside the
+//! protected session dir, not a named mutex — named objects are
+//! create-first squattable by a same-session sandbox child.)
 //!
 //! Globs are **rejected**. Directory targets get `(OI)(CI)` ACEs
 //! so the additive grant/deny inherits to the whole subtree.
@@ -34,15 +40,18 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     ACE_FLAGS, ACE_HEADER, ACE_REVISION, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
     AclSizeInformation, AddAccessAllowedAceEx, AddAccessDeniedAceEx, AddAce, CONTAINER_INHERIT_ACE,
-    DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid, InitializeAcl,
-    InitializeSecurityDescriptor, OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, UNPROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
 };
-use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+use windows::Win32::System::SystemServices::{
+    ACCESS_DENIED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
+};
 
 use crate::sid::LocalPsid;
 use crate::util::{OwnedSd, pcwstr, win32_ok, wstr};
@@ -53,6 +62,7 @@ use crate::util::{OwnedSd, pcwstr, win32_ok, wstr};
 pub const SID_OWNER_RIGHTS: &str = "S-1-3-4";
 pub const SID_SYSTEM: &str = "S-1-5-18";
 pub const SID_BUILTIN_ADMINS: &str = "S-1-5-32-544";
+pub const SID_BUILTIN_USERS: &str = "S-1-5-32-545";
 
 // ─── DACL builder primitives ────────────────────────────────────────
 // The policy functions below declare ACE lists as `&[Allow]`; this
@@ -331,10 +341,29 @@ pub(crate) fn read_file_dacl(canonical_path: &str) -> Result<(OwnedSd, *mut ACL)
     Ok((OwnedSd::from_raw(psd), dacl))
 }
 
+/// Whether `sd`'s DACL carries `SE_DACL_PROTECTED` — inheritance from
+/// the parent was deliberately severed (`icacls /inheritance:d`,
+/// hardened trees). [`apply_sandbox_aces`] preserves this bit on
+/// write-back: recomposing such a path with `UNPROTECTED_` would
+/// silently re-enable inheritance, durably re-admitting the parent's
+/// (often permissive — e.g. a data-drive root's `Authenticated
+/// Users:(M)`) inheritable ACEs.
+pub(crate) fn sd_dacl_protected(sd: &OwnedSd) -> Result<bool> {
+    // The binding's `pcontrol` is a bare `*mut u16` (the wire shape
+    // of `SECURITY_DESCRIPTOR_CONTROL`).
+    let mut control: u16 = 0;
+    let mut revision = 0u32;
+    unsafe { GetSecurityDescriptorControl(sd.ptr, &mut control, &mut revision) }
+        .context("GetSecurityDescriptorControl")?;
+    Ok(control & SE_DACL_PROTECTED.0 != 0)
+}
+
 /// Whether [`write_file_dacl`] sets `PROTECTED_` (block inheritance
-/// from the parent — used for the state-DB dir's allow-list) or
-/// `UNPROTECTED_DACL_SECURITY_INFORMATION` (re-derive inherited
-/// ACEs from the parent — used by [`apply_sandbox_aces`]).
+/// from the parent — the state-DB dir's allow-list, and
+/// [`apply_sandbox_aces`] on a path whose DACL was already
+/// protected) or `UNPROTECTED_DACL_SECURITY_INFORMATION` (re-derive
+/// inherited ACEs from the parent — [`apply_sandbox_aces`] on the
+/// common unprotected path).
 pub(crate) enum Protection {
     Protected,
     Unprotected,
@@ -479,6 +508,109 @@ pub fn set_path_dacl_from_sddl(path: &str, sddl: &str, label: &str) -> Result<()
         bail!("{label}: SDDL '{sddl}' yielded no DACL");
     }
     write_file_dacl(path, dacl, Protection::Protected).context(label.to_owned())
+}
+
+/// Open `path` for security-descriptor writes with NO-FOLLOW
+/// semantics and REJECT reparse points. `%ProgramData%`'s default
+/// DACL lets standard users pre-create directories — including as
+/// NTFS mount points / junctions targeting an arbitrary directory —
+/// so an elevated install that take-owns and re-ACLs by NAME can be
+/// redirected into re-ACLing a victim tree. Opening with
+/// `FILE_FLAG_OPEN_REPARSE_POINT` pins the object itself (no
+/// traversal), the attribute check rejects a planted reparse point,
+/// and the returned HANDLE is what the security writes below
+/// operate on — validate-then-use on the same object, not a name.
+pub fn open_for_security_no_follow(path: &str) -> Result<crate::util::OwnedHandle> {
+    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, OPEN_EXISTING,
+    };
+    let w = wstr(path);
+    let h = unsafe {
+        CreateFileW(
+            pcwstr(&w),
+            Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits() | 0x0008_0000, // + WRITE_OWNER
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .with_context(|| format!("CreateFileW('{path}', no-follow)"))?;
+    if h == INVALID_HANDLE_VALUE {
+        bail!("CreateFileW('{path}'): INVALID_HANDLE_VALUE");
+    }
+    let owned = crate::util::OwnedHandle(h);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(owned.0, &mut info) }
+        .with_context(|| format!("GetFileInformationByHandle('{path}')"))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        bail!(
+            "'{path}' is a reparse point (junction/symlink) — refusing \
+             to operate on a redirected store path; remove it and re-run"
+        );
+    }
+    Ok(owned)
+}
+
+/// Set OWNER = `BUILTIN\Administrators` on an open handle (see
+/// [`open_for_security_no_follow`] for why by-handle). Requires
+/// `SeTakeOwnershipPrivilege`/`SeRestorePrivilege` enabled unless
+/// the caller already owns the object.
+pub fn set_handle_owner_admins(h: &crate::util::OwnedHandle, label: &str) -> Result<()> {
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    let admins = crate::sid::LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
+    let r = unsafe {
+        SetSecurityInfo(
+            h.0,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(admins.as_psid()),
+            None,
+            None,
+            None,
+        )
+    };
+    win32_ok(r, &format!("SetSecurityInfo(owner, {label})"))
+}
+
+/// Write a PROTECTED DACL parsed from `sddl` onto an open handle
+/// (see [`open_for_security_no_follow`] for why by-handle).
+pub fn set_handle_dacl_from_sddl(
+    h: &crate::util::OwnedHandle,
+    sddl: &str,
+    label: &str,
+) -> Result<()> {
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows::Win32::Security::GetSecurityDescriptorDacl;
+    let sd = crate::util::OwnedSd::from_sddl(sddl)
+        .with_context(|| format!("{label}: build SD from SDDL"))?;
+    let mut present = windows::core::BOOL::from(false);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut defaulted = windows::core::BOOL::from(false);
+    unsafe {
+        GetSecurityDescriptorDacl(sd.ptr, &mut present, &mut dacl, &mut defaulted)
+            .with_context(|| format!("{label}: GetSecurityDescriptorDacl"))?;
+    }
+    if !present.as_bool() || dacl.is_null() {
+        bail!("{label}: SDDL '{sddl}' yielded no DACL");
+    }
+    let r = unsafe {
+        SetSecurityInfo(
+            h.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    win32_ok(r, &format!("SetSecurityInfo(dacl, {label})"))
 }
 
 // ─── Additive grants (working-tree access for the sandbox user) ─────
@@ -660,8 +792,17 @@ impl SbAceSet {
 /// exactly `set`. Idempotent — every existing explicit ACE for the
 /// SID (allow AND deny) is dropped, then `set`'s entries are
 /// prepended in canonical (deny-before-allow) order. Inherited ACEs
-/// are dropped too; `SetNamedSecurityInfoW` without `PROTECTED_`
-/// re-derives them from the parent.
+/// are dropped too; on the (common) unprotected DACL,
+/// `SetNamedSecurityInfoW` without `PROTECTED_` re-derives them from
+/// the parent. A `SE_DACL_PROTECTED` DACL (inheritance deliberately
+/// severed — its ACEs are normally all explicit, so nothing is
+/// dropped; a hand-crafted stray `INHERITED_ACE`-flagged entry is
+/// dropped and not re-derived, which fails closed) is written back
+/// `PROTECTED_`: recomposing it `UNPROTECTED_` would
+/// silently re-enable inheritance, and neither revoke nor restore
+/// could undo that — the parent's inheritable ACEs (e.g. a data-drive
+/// root's `Authenticated Users:(M)`) would durably re-open a path its
+/// admin had locked down.
 ///
 /// `SetEntriesInAclW(REVOKE_ACCESS)` is NOT used: per MSDN it
 /// removes `ACCESS_ALLOWED_ACE`/`SYSTEM_AUDIT_ACE` for the trustee,
@@ -676,10 +817,13 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
     let sid_bytes = sid.as_bytes();
-    // 1. Read the current DACL. `_sd` owns the buffer `old`/`keep`
-    //    point into; it's freed after step 4's write.
-    let (_sd, old) =
+    // 1. Read the current DACL and its protection state. `sd` owns
+    //    the buffer `old`/`keep` point into; it's freed after step
+    //    4's write.
+    let (sd, old) =
         read_file_dacl(canonical_path).with_context(|| format!("recompose '{canonical_path}'"))?;
+    let protected =
+        sd_dacl_protected(&sd).with_context(|| format!("recompose '{canonical_path}'"))?;
     // 2. Collect surviving explicit ACEs (drop inherited and any
     //    explicit ACE whose SID == sandbox_sid — allow AND deny).
     let kept = filter_aces(old, |hdr, body| {
@@ -688,27 +832,44 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     // 3. Build fresh ACL: set's entries (deny-first canonical order)
     //    then surviving explicit ACEs.
     let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[])?;
-    // 4. Write back. UNPROTECTED so the kernel re-derives inherited
-    //    ACEs from the parent.
-    write_file_dacl(canonical_path, new.as_ptr(), Protection::Unprotected)
+    // 4. Write back, preserving the DACL's protection state:
+    //    UNPROTECTED so the kernel re-derives inherited ACEs from the
+    //    parent, PROTECTED when inheritance was severed before we
+    //    touched the path (see doc comment).
+    let prot = if protected {
+        Protection::Protected
+    } else {
+        Protection::Unprotected
+    };
+    write_file_dacl(canonical_path, new.as_ptr(), prot)
         .with_context(|| format!("recompose '{canonical_path}'"))
 }
 
-/// `SECURITY_ATTRIBUTES` for the named init-mutex — real-user-only
-/// (`<current user>`/SYSTEM/Admins) so a sandbox child cannot open
-/// it (and therefore cannot stall stamps by sitting on the lock).
-/// `GENERIC_ALL` is the kernel-object equivalent of
-/// `FILE_ALL_ACCESS`; the kernel resolves it via the mutex's
-/// generic mapping at create time.
-pub fn build_init_mutex_sa() -> Result<OwnedSa> {
-    let user_sid = crate::sid::current_user_sid()?;
-    build_allow_dacl(&[
-        Allow(&user_sid, Mask::GENERIC_ALL, NO_INHERIT),
-        Allow(SID_SYSTEM, Mask::GENERIC_ALL, NO_INHERIT),
-        Allow(SID_BUILTIN_ADMINS, Mask::GENERIC_ALL, NO_INHERIT),
-        Allow::OWNER_RIGHTS,
-    ])?
-    .into_security_attributes()
+/// Whether `canonical_path` carries an EXPLICIT `(OI)(CI)` deny ACE
+/// for `sandbox_sid` covering at least the [`DenyMask::WriteDeny`]
+/// bits. Drift check for `srt-win status`'s ambient write-deny
+/// report and the install early-out's completeness check — a
+/// recorded install-time stamp whose on-disk ACE is gone (e.g. an
+/// `icacls /reset` by an admin) reads as absent, and an unrelated
+/// narrow deny on the same path (a `DenyDelete` placeholder, a
+/// parent-FDC ACE) must NOT count as the write-deny being intact.
+pub fn sandbox_deny_present(canonical_path: &str, sandbox_sid: &str) -> Result<bool> {
+    let sid = LocalPsid::from_string(sandbox_sid)
+        .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
+    let sid_bytes = sid.as_bytes();
+    let want_mask = DenyMask::WriteDeny.bits();
+    let want_flags = OICI.0 as u8;
+    let (_sd, dacl) = read_file_dacl(canonical_path)?;
+    let denies = filter_aces(dacl, |hdr, body| {
+        // ACCESS_DENIED_ACE layout: header (4) then Mask (u32 LE).
+        let mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        u32::from(hdr.AceType) == ACCESS_DENIED_ACE_TYPE
+            && hdr.AceFlags & INHERITED_ACE == 0
+            && hdr.AceFlags & want_flags == want_flags
+            && mask & want_mask == want_mask
+            && ace_sid_is(body, sid_bytes)
+    })?;
+    Ok(!denies.0.is_empty())
 }
 
 const INHERITED_ACE: u8 = 0x10;
@@ -748,13 +909,79 @@ mod tests {
         assert_eq!(ace_count(&d), 1);
     }
 
+    /// Grant → revoke on a `SE_DACL_PROTECTED` directory must leave
+    /// the protection bit (and the explicit ACE set) intact.
+    /// Regression: [`apply_sandbox_aces`] used to write back
+    /// `UNPROTECTED_` unconditionally, which re-enabled inheritance
+    /// on a deliberately severed path — durably re-admitting the
+    /// parent's inheritable ACEs (e.g. a data-drive root's
+    /// `Authenticated Users:(M)`), and revoke could not undo it.
     #[test]
-    fn init_mutex_sa_builds() {
-        let sa = build_init_mutex_sa().expect("build");
-        assert!(!sa.as_ptr().is_null());
-        // current_user / SY / BA / OWNER_RIGHTS = 4 ACEs (the
-        // current user is never SY/BA, so no dedup).
-        assert_eq!(ace_count(&sa._acl), 4);
+    fn recompose_preserves_dacl_protection() {
+        // Guests — a resolvable well-known SID that is never the
+        // test runner's own identity, standing in for the sandbox
+        // user (no account provisioning needed to write ACEs).
+        const FAKE_SB_SID: &str = "S-1-5-32-546";
+        let dir = std::env::temp_dir().join(format!("srtwin-prot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+
+        // Sever inheritance: protected DACL with an explicit
+        // owner-side allow (mirrors `icacls /inheritance:d` plus a
+        // lockdown to a fixed ACE set).
+        let user_sid = crate::sid::current_user_sid().unwrap();
+        let lockdown = build_allow_dacl(&[
+            Allow(&user_sid, Mask::FILE_ALL, OICI),
+            Allow(SID_SYSTEM, Mask::FILE_ALL, OICI),
+        ])
+        .unwrap();
+        write_file_dacl(path, lockdown.as_ptr(), Protection::Protected).unwrap();
+        let (sd, _) = read_file_dacl(path).unwrap();
+        assert!(sd_dacl_protected(&sd).unwrap(), "setup: DACL protected");
+
+        // Grant + revoke through the production chokepoint.
+        let grant = SbAceSet {
+            grant: Some(GrantMask::Modify),
+            ..Default::default()
+        };
+        apply_sandbox_aces(path, FAKE_SB_SID, grant).unwrap();
+        let (sd, dacl) = read_file_dacl(path).unwrap();
+        assert!(sd_dacl_protected(&sd).unwrap(), "protection survives grant");
+        let (aces, ..) = filter_aces(dacl, |hdr, _| hdr.AceFlags & INHERITED_ACE != 0).unwrap();
+        assert!(aces.is_empty(), "no inherited ACEs re-derived after grant");
+
+        apply_sandbox_aces(path, FAKE_SB_SID, SbAceSet::default()).unwrap();
+        let (sd, dacl) = read_file_dacl(path).unwrap();
+        assert!(
+            sd_dacl_protected(&sd).unwrap(),
+            "protection survives revoke"
+        );
+        let (aces, ..) = filter_aces(dacl, |hdr, _| hdr.AceFlags & INHERITED_ACE != 0).unwrap();
+        assert!(aces.is_empty(), "no inherited ACEs re-derived after revoke");
+
+        // The common case keeps its contract: an unprotected dir
+        // stays unprotected across the same round-trip, and its
+        // inherited ACEs (the parent's OICI lockdown entries
+        // propagate to it) really are re-derived by the
+        // `UNPROTECTED_` write-back — not merely "protection bit
+        // still clear".
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain_path = plain.to_str().unwrap();
+        apply_sandbox_aces(plain_path, FAKE_SB_SID, grant).unwrap();
+        apply_sandbox_aces(plain_path, FAKE_SB_SID, SbAceSet::default()).unwrap();
+        let (sd, dacl) = read_file_dacl(plain_path).unwrap();
+        assert!(
+            !sd_dacl_protected(&sd).unwrap(),
+            "unprotected dir stays unprotected"
+        );
+        let (aces, ..) = filter_aces(dacl, |hdr, _| hdr.AceFlags & INHERITED_ACE != 0).unwrap();
+        assert!(
+            !aces.is_empty(),
+            "inherited ACEs re-derived on the unprotected dir"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

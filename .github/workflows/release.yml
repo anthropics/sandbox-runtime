@@ -23,13 +23,32 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.1
+          bun-version: 1.4.2
       - run: sudo apt-get update && sudo apt-get install -y gcc libseccomp-dev
       - run: npm run build:seccomp
       - uses: actions/upload-artifact@v4
         with:
           name: seccomp-${{ matrix.arch }}
           path: vendor/seccomp/${{ matrix.arch }}
+          if-no-files-found: error
+
+  build-java-agent:
+    name: Build JVM proxy agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: npm run build:java-agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: java-proxy-agent
+          path: vendor/java-proxy-agent/srt-proxy-agent.jar
           if-no-files-found: error
 
   build-srt-win:
@@ -46,9 +65,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.14
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+          bun-version: 1.4.2
+      # This job builds the helper that runs elevated on a user's machine,
+      # so both actions are pinned by commit: `@stable` and `@v2` are a
+      # branch and a moving major tag in third-party repositories.
+      # dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      # Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: vendor/srt-win-src
           # Same key as integration-tests.yml so releases (tag refs)
@@ -121,7 +147,7 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: [build-seccomp, build-srt-win, verify-package]
+    needs: [build-seccomp, build-java-agent, build-srt-win, verify-package]
     runs-on: ubuntu-latest
     environment: npm
     steps:
@@ -163,6 +189,11 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          name: java-proxy-agent
+          path: vendor/java-proxy-agent
+
+      - uses: actions/download-artifact@v4
+        with:
           name: srt-win-x64
           path: vendor/srt-win/x64
       - uses: actions/download-artifact@v4
@@ -184,10 +215,10 @@ jobs:
           echo "::group::tarball contents"
           echo "$LIST"
           echo "::endgroup::"
-          for f in vendor/srt-win/x64/srt-win.exe vendor/srt-win/arm64/srt-win.exe vendor/seccomp/x64/apply-seccomp vendor/seccomp/arm64/apply-seccomp; do
+          for f in vendor/srt-win/x64/srt-win.exe vendor/srt-win/arm64/srt-win.exe vendor/seccomp/x64/apply-seccomp vendor/seccomp/arm64/apply-seccomp vendor/java-proxy-agent/srt-proxy-agent.jar; do
             grep -q "^package/$f$" <<<"$LIST" || { echo "::error::missing $f in tarball"; exit 1; }
           done
-          if grep -qE '^package/vendor/(srt-win-src|seccomp-src)/' <<<"$LIST"; then
+          if grep -qE '^package/vendor/(srt-win-src|seccomp-src|java-proxy-agent-src)/' <<<"$LIST"; then
             echo "::error::source dirs leaked into tarball"; exit 1
           fi
           if grep -q '^package/dist/vendor/' <<<"$LIST"; then

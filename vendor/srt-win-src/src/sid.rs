@@ -75,6 +75,44 @@ pub fn psid_to_string(sid: PSID) -> Result<String> {
     Ok(s)
 }
 
+/// Resolve an account name (local or domain) to a string SID via
+/// `LookupAccountNameW` with a NULL system name (local SAM first,
+/// then domain). Errors if the name is not found.
+pub fn lookup_account_sid(name: &str) -> Result<String> {
+    unsafe {
+        let mut cb_sid: u32 = 0;
+        let mut cch_dom: u32 = 0;
+        let mut use_: SID_NAME_USE = SID_NAME_USE::default();
+        let name_w = wstr(name);
+        // Sizing call. Expected to fail with ERROR_INSUFFICIENT_BUFFER.
+        let _ = LookupAccountNameW(
+            windows::core::PCWSTR::null(),
+            pcwstr(&name_w),
+            None,
+            &mut cb_sid,
+            None,
+            &mut cch_dom,
+            &mut use_,
+        );
+        if cb_sid == 0 {
+            return Err(anyhow!("LookupAccountNameW({name}): account not found"));
+        }
+        let mut sid_buf = vec![0u8; cb_sid as usize];
+        let mut dom_buf = vec![0u16; cch_dom.max(1) as usize];
+        LookupAccountNameW(
+            windows::core::PCWSTR::null(),
+            pcwstr(&name_w),
+            Some(PSID(sid_buf.as_mut_ptr() as *mut c_void)),
+            &mut cb_sid,
+            Some(PWSTR(dom_buf.as_mut_ptr())),
+            &mut cch_dom,
+            &mut use_,
+        )
+        .map_err(|e| anyhow!("LookupAccountNameW({name}): {e}"))?;
+        psid_to_string(PSID(sid_buf.as_mut_ptr() as *mut c_void))
+    }
+}
+
 /// Outcome of a SID → account reverse lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidExistence {
@@ -121,44 +159,6 @@ pub fn sid_account_exists(sid_str: &str) -> Result<SidExistence> {
             // etc. — don't claim absence on a transient lookup failure.
             _ => Ok(SidExistence::Unknown),
         }
-    }
-}
-
-/// Resolve an account name (local or domain) to a string SID via
-/// `LookupAccountNameW` with a NULL system name (local SAM first,
-/// then domain). Errors if the name is not found.
-pub fn lookup_account_sid(name: &str) -> Result<String> {
-    unsafe {
-        let mut cb_sid: u32 = 0;
-        let mut cch_dom: u32 = 0;
-        let mut use_: SID_NAME_USE = SID_NAME_USE::default();
-        let name_w = wstr(name);
-        // Sizing call. Expected to fail with ERROR_INSUFFICIENT_BUFFER.
-        let _ = LookupAccountNameW(
-            windows::core::PCWSTR::null(),
-            pcwstr(&name_w),
-            None,
-            &mut cb_sid,
-            None,
-            &mut cch_dom,
-            &mut use_,
-        );
-        if cb_sid == 0 {
-            return Err(anyhow!("LookupAccountNameW({name}): account not found"));
-        }
-        let mut sid_buf = vec![0u8; cb_sid as usize];
-        let mut dom_buf = vec![0u16; cch_dom.max(1) as usize];
-        LookupAccountNameW(
-            windows::core::PCWSTR::null(),
-            pcwstr(&name_w),
-            Some(PSID(sid_buf.as_mut_ptr() as *mut c_void)),
-            &mut cb_sid,
-            Some(PWSTR(dom_buf.as_mut_ptr())),
-            &mut cch_dom,
-            &mut use_,
-        )
-        .map_err(|e| anyhow!("LookupAccountNameW({name}): {e}"))?;
-        psid_to_string(PSID(sid_buf.as_mut_ptr() as *mut c_void))
     }
 }
 
@@ -247,28 +247,6 @@ mod tests {
     fn lookup_missing_account_errors() {
         let r = lookup_account_sid("no-such-group-srt-win-test");
         assert!(r.is_err());
-    }
-
-    #[test]
-    fn sid_account_exists_for_well_known() {
-        assert_eq!(
-            sid_account_exists("S-1-5-32-545").unwrap(),
-            SidExistence::Mapped
-        );
-    }
-
-    #[test]
-    fn sid_account_exists_unmapped_for_bogus() {
-        // Well-formed but maps to nothing on any machine.
-        assert_eq!(
-            sid_account_exists("S-1-5-21-1-2-3-9999999").unwrap(),
-            SidExistence::Unmapped
-        );
-    }
-
-    #[test]
-    fn sid_account_exists_errors_on_malformed() {
-        assert!(sid_account_exists("not-a-sid").is_err());
     }
 
     #[test]

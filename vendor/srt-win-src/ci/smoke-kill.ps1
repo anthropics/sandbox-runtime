@@ -51,9 +51,13 @@ Run @('install','--sublayer-guid',$Sublayer,'--proxy-port-range',$PortRange)
 # self-protect denies the owner query to a non-elevated caller.
 
 function Get-TreePids { param([int] $Root)
-  # Single-snapshot BFS over Win32_Process on ParentProcessId.
+  # Single-snapshot BFS over Win32_Process on ParentProcessId. Windows keeps
+  # a process's ParentProcessId after that parent exits and recycles pids, so
+  # a process only counts as a child if it was created after its parent:
+  # otherwise an unrelated long-lived process whose dead parent's pid was
+  # reused inside the tree is reported as a survivor.
   $all = Get-CimInstance Win32_Process |
-         Select-Object ProcessId, ParentProcessId, Name
+         Select-Object ProcessId, ParentProcessId, Name, CreationDate
   $out  = New-Object System.Collections.Generic.List[object]
   $seen = New-Object System.Collections.Generic.HashSet[int]
   $q    = New-Object System.Collections.Generic.Queue[int]
@@ -61,7 +65,9 @@ function Get-TreePids { param([int] $Root)
   $out.Add(($all | Where-Object { $_.ProcessId -eq $Root }))
   while ($q.Count -gt 0) {
     $p = $q.Dequeue()
+    $born = ($all | Where-Object { $_.ProcessId -eq $p }).CreationDate
     foreach ($c in $all | Where-Object { $_.ParentProcessId -eq $p }) {
+      if ($born -and $c.CreationDate -and $c.CreationDate -lt $born) { continue }
       if ($seen.Add($c.ProcessId)) {
         $out.Add($c); $q.Enqueue($c.ProcessId)
       }
@@ -106,8 +112,15 @@ function Start-Tree {
   $bpid = $p.Id
   # Poll until the leaf (`PING.EXE`) is present — a depth count
   # alone can be inflated by conhost.exe before the leaf spawns.
-  for ($i = 0; $i -lt 40; $i++) {
+  # 30s, not 10s: the leaf is two hops away (broker → seclogon
+  # logon → cmd → ping), and the first CreateProcessWithLogonW on a
+  # cold runner can take well over 10s building the sandbox user's
+  # profile — the recurring x86-64 "leaf never appeared" flake.
+  for ($i = 0; $i -lt 120; $i++) {
     Start-Sleep -Milliseconds 250
+    if ($p.HasExited) {
+      throw "Start-Tree: broker exited early with code $($p.ExitCode) before the leaf spawned (broker=$bpid)"
+    }
     $t = @(Get-TreePids $bpid)
     if (($t | Where-Object { $_.Name -match '^PING\.EXE$' })) {
       $pids = @($t | Select-Object -Expand ProcessId)
@@ -116,8 +129,10 @@ function Start-Tree {
       return [pscustomobject]@{ broker = $bpid; proc = $p; pids = $pids }
     }
   }
+  $t = @(Get-TreePids $bpid)
+  $names = ($t | ForEach-Object { "$($_.ProcessId)=$($_.Name)" }) -join ','
   try { $p.Kill($true) } catch { }
-  throw "Start-Tree: PING.EXE leaf never appeared (broker=$bpid)"
+  throw "Start-Tree: PING.EXE leaf never appeared in 30s (broker=$bpid, partial tree=[$names])"
 }
 
 try {

@@ -113,6 +113,93 @@ describe('splitDomainPatternPort', () => {
   })
 })
 
+describe('splitDomainPatternPort — IPv6 literals', () => {
+  test('bracketed literal, with and without port; host is bare + canonical', () => {
+    expect(splitDomainPatternPort('[::1]')).toEqual({
+      hostPattern: '::1',
+      port: undefined,
+    })
+    expect(splitDomainPatternPort('[::1]:443')).toEqual({
+      hostPattern: '::1',
+      port: 443,
+    })
+    // Canonical compression so it compares equal to canonicalizeHost(dest).
+    expect(splitDomainPatternPort('[2001:0db8:0000::0001]:8443')).toEqual({
+      hostPattern: '2001:db8::1',
+      port: 8443,
+    })
+    expect(splitDomainPatternPort('[fd00:ec2::254]')).toEqual({
+      hostPattern: 'fd00:ec2::254',
+      port: undefined,
+    })
+    // A zone id is meaningless for matching (a request can never carry one)
+    // and is dropped, so the entry matches the address on any interface.
+    expect(splitDomainPatternPort('[fe80::1%en0]:22')).toEqual({
+      hostPattern: 'fe80::1',
+      port: 22,
+    })
+    expect(splitDomainPatternPort('fe80::1%en0')).toEqual({
+      hostPattern: 'fe80::1',
+      port: undefined,
+    })
+  })
+
+  test('unbracketed multi-colon is never split (no hextet mistaken for a port)', () => {
+    // The pre-fix behaviour parsed this as host "fd00:ec2:" + port 254.
+    expect(splitDomainPatternPort('fd00:ec2::254')).toEqual({
+      hostPattern: 'fd00:ec2::254',
+      port: undefined,
+    })
+    expect(splitDomainPatternPort('::1')).toEqual({
+      hostPattern: '::1',
+      port: undefined,
+    })
+    // Not an address at all: left whole for validation to reject.
+    expect(splitDomainPatternPort('example.com:80:443')).toEqual({
+      hostPattern: 'example.com:80:443',
+      port: undefined,
+    })
+  })
+
+  test('malformed bracket forms are left whole', () => {
+    for (const s of ['[::1', '[::1]junk', '[::1]:', '[::1]:0', '[::1]:65536']) {
+      expect(splitDomainPatternPort(s)).toEqual({
+        hostPattern: s,
+        port: undefined,
+      })
+    }
+  })
+})
+
+describe('matchesDomainPatternWithPort — IPv6 literals', () => {
+  // filterNetworkRequest matches against canonicalizeHost(dest): bare,
+  // lowercase, compressed. These are the strings the matcher really sees.
+  test('bracketed deny entry matches the canonical destination', () => {
+    expect(matchesDomainPatternWithPort('::1', 443, '[::1]:443')).toBe(true)
+    expect(matchesDomainPatternWithPort('::1', 80, '[::1]:443')).toBe(false)
+    expect(matchesDomainPatternWithPort('::1', 80, '[::1]')).toBe(true)
+    expect(
+      matchesDomainPatternWithPort('fd00:ec2::254', 80, '[fd00:ec2::254]'),
+    ).toBe(true)
+    expect(
+      matchesDomainPatternWithPort(
+        '2001:db8::1',
+        8443,
+        '[2001:DB8:0:0::1]:8443',
+      ),
+    ).toBe(true)
+  })
+
+  test('unbracketed entry still matches its own canonical form on every port (fails closed for deny lists)', () => {
+    expect(
+      matchesDomainPatternWithPort('fd00:ec2::254', 254, 'fd00:ec2::254'),
+    ).toBe(true)
+    expect(
+      matchesDomainPatternWithPort('fd00:ec2::254', 80, 'fd00:ec2::254'),
+    ).toBe(true)
+  })
+})
+
 describe('matchesDomainPatternWithPort', () => {
   test('entry without port matches any port', () => {
     expect(matchesDomainPatternWithPort('example.com', 22, 'example.com')).toBe(

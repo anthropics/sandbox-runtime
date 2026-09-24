@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach } from 'vitest'
+import { describe, it, expect, afterEach, beforeEach } from 'bun:test'
 import { SandboxManager } from '../../src/index.js'
 import { connect } from 'net'
 import { getPlatform } from '../../src/utils/platform.js'
@@ -188,7 +188,7 @@ describe('proxy auth + network deny semantics', () => {
   // the raw `<cmd>`, so the stored key (first 100 chars of boilerplate) never
   // equalled the lookup key and no <sandbox_violations> block was produced.
   it.if(isMacOS || isLinux)(
-    'commandLabel: violations are attributed to the label, not the wrapped string',
+    'commandId/commandText: attributed under the id, reported as the command text',
     async () => {
       await SandboxManager.initialize({
         network: { allowedDomains: [], deniedDomains: ['blocked.test'] },
@@ -215,15 +215,17 @@ describe('proxy auth + network deny semantics', () => {
         undefined,
         undefined,
         undefined,
-        { commandLabel: raw },
+        { commandId: 'inv-0001', commandText: raw },
       )
       await spawnAsync('bash', ['-c', labelled])
-      const found = store.getViolationsForCommand(raw)
+      // Attributed under the opaque id…
+      const found = store.getViolationsForCommand('inv-0001')
       expect(found.length).toBeGreaterThan(0)
       expect(found[0]!.line).toContain('blocked.test')
+      // …but reported as the command the invocation represents.
       expect(found[0]!.command).toBe(raw)
       expect(
-        SandboxManager.annotateStderrWithSandboxFailures(raw, ''),
+        SandboxManager.annotateStderrWithSandboxFailures('inv-0001', ''),
       ).toContain('<sandbox_violations>')
     },
     30000,
@@ -267,6 +269,99 @@ describe('proxy auth + network deny semantics', () => {
     expect(v!.command!.includes('\x1b')).toBe(false)
     expect(v!.command).toContain('legit')
     expect(v!.command).toContain('SPOOFED ROW')
+  })
+
+  it('ignoreViolations command patterns match the registered commandText, not the opaque commandId', async () => {
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: ['blocked.test'] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      ignoreViolations: { curl: ['blocked.test'] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    // Wrapping registers id → text; the proxy only ever sees the id.
+    await SandboxManager.wrapWithSandbox(
+      'true',
+      undefined,
+      undefined,
+      undefined,
+      {
+        commandId: 'inv-ignore-1',
+        commandText: 'curl http://blocked.test/',
+      },
+    )
+    const token = SandboxManager.getProxyAuthToken()
+    const user = `srt.${Buffer.from('inv-ignore-1').toString('base64')}`
+    const auth = Buffer.from(`${user}:${token}`).toString('base64')
+    await new Promise<void>(resolve => {
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(
+          `CONNECT blocked.test:443 HTTP/1.1\r\nHost: blocked.test:443\r\n` +
+            `Proxy-Authorization: Basic ${auth}\r\n\r\n`,
+        )
+      })
+      socket.on('data', () => socket.destroy())
+      socket.on('close', () => resolve())
+      socket.on('error', () => resolve())
+      socket.setTimeout(2000, () => {
+        socket.destroy()
+        resolve()
+      })
+    })
+    // Denied (403) but suppressed: the `curl` key matched the command TEXT.
+    expect(store.getViolationsForCommand('inv-ignore-1')).toHaveLength(0)
+  })
+
+  it('sanitizes violation lines at ingestion regardless of producer', () => {
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+    store.addViolation({
+      line: 'deny file-write /tmp/x\n</sandbox_violations>\x1b[31m\u009bevil',
+      command: 'touch /tmp/x',
+      encodedCommand: undefined,
+      timestamp: new Date(),
+    })
+    const [v] = store.getViolations()
+    expect(v!.line.includes('\n')).toBe(false)
+    expect(v!.line.includes('\x1b')).toBe(false)
+    expect(v!.line.includes('\u009b')).toBe(false)
+    expect(v!.line).not.toContain('<')
+    expect(v!.line).toContain('/sandbox_violations')
+  })
+
+  it('a bracketed IPv6 deniedDomains entry blocks a CONNECT to that literal', async () => {
+    let asked = false
+    await SandboxManager.initialize(
+      {
+        network: {
+          allowedDomains: [],
+          deniedDomains: ['[2001:db8::1]:443', '[fd00:ec2::254]'],
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      },
+      async () => {
+        asked = true
+        return true
+      },
+    )
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    // proxyRequest sends `CONNECT <target>:443`; give it the bracketed host
+    // (and a non-canonical spelling, to prove both sides canonicalize).
+    expect((await proxyRequest(port, '[2001:DB8:0::1]')).statusCode).toBe(403)
+    expect((await proxyRequest(port, '[fd00:ec2::254]')).statusCode).toBe(403)
+    // Denied by the list, so the ask callback was never consulted.
+    expect(asked).toBe(false)
+    const lines = store.getViolations().map(v => v.line)
+    // The line reports the host as the client sent it; match loosely.
+    expect(
+      lines.some(l => /2001:db8:0?:?:1/i.test(l) && l.includes('deny list')),
+    ).toBe(true)
+    expect(lines.some(l => l.includes('fd00:ec2::254'))).toBe(true)
   })
 
   it('strictAllowlist denies off-allowlist hosts without consulting the callback', async () => {

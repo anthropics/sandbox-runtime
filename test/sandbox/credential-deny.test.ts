@@ -191,11 +191,16 @@ describe.if(isSupportedPlatform)(
     let platformDescriptor: PropertyDescriptor | undefined
 
     const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    // Matches a (deny file-read* (subpath "<path>")) rule. The profile is
-    // embedded byte-literal inside a single-quoted argument, so the inner
-    // quotes appear exactly as written (never backslash-escaped).
+    // Matches (subpath "<path>") as any of the filters listed under a
+    // (deny file-read* …) rule. The profile is embedded byte-literal inside
+    // a single-quoted argument, so the inner quotes appear exactly as
+    // written (never backslash-escaped).
     const denyReadRule = (p: string) =>
-      new RegExp(String.raw`\(deny file-read\*\s+\(subpath "` + escapeRegExp(p))
+      new RegExp(
+        String.raw`\(deny file-read\*(\n  \([^\n]*\))*\n  \(subpath "` +
+          escapeRegExp(p) +
+          '"',
+      )
 
     beforeAll(async () => {
       mkdirSync(TEST_DIR, { recursive: true })
@@ -215,12 +220,14 @@ describe.if(isSupportedPlatform)(
       platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
       Object.defineProperty(process, 'platform', { value: 'darwin' })
 
-      const config = loadConfig(SETTINGS_FILE)
-      if (!config) {
-        throw new Error(`Settings file failed to load: ${SETTINGS_FILE}`)
+      const loaded = loadConfig(SETTINGS_FILE)
+      if (loaded.kind !== 'ok') {
+        throw new Error(
+          `Settings file failed to load (${loaded.kind}): ${SETTINGS_FILE}`,
+        )
       }
       await SandboxManager.reset()
-      await SandboxManager.initialize(config)
+      await SandboxManager.initialize(loaded.config)
     })
 
     afterAll(async () => {
@@ -314,12 +321,14 @@ describe.if(isMacOS)('credential deny on macOS (sandbox-exec)', () => {
       }),
     )
 
-    const config = loadConfig(SETTINGS_FILE)
-    if (!config) {
-      throw new Error(`Settings file failed to load: ${SETTINGS_FILE}`)
+    const loaded = loadConfig(SETTINGS_FILE)
+    if (loaded.kind !== 'ok') {
+      throw new Error(
+        `Settings file failed to load (${loaded.kind}): ${SETTINGS_FILE}`,
+      )
     }
     await SandboxManager.reset()
-    await SandboxManager.initialize(config)
+    await SandboxManager.initialize(loaded.config)
   })
 
   afterAll(async () => {

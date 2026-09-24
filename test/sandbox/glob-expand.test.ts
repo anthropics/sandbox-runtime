@@ -1,17 +1,27 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+import * as fc from 'fast-check'
+// The namespace of the same module production binds (sandbox-utils.ts does
+// `import * as fs from 'fs'`), so a spy on it is seen by the code under test.
+import * as fs from 'fs'
 import {
+  chmodSync,
   mkdirSync,
+  mkdtempSync,
   writeFileSync,
   rmSync,
   existsSync,
   realpathSync,
+  symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   expandGlobPattern,
   expandTilde,
+  globPatternBaseDir,
   globToRegex,
+  normalizePathForSandbox,
+  walkGlobPattern,
 } from '../../src/sandbox/sandbox-utils.js'
 import {
   containsGlobCharsWin,
@@ -171,6 +181,541 @@ describe('expandGlobPattern', () => {
       expect(results.some(r => r.includes('/app/creds/'))).toBe(false)
     },
   )
+})
+
+describe.if(!isWindows)('walkGlobPattern', () => {
+  const RAW_BASE = join(tmpdir(), 'glob-walk-test-' + Date.now())
+
+  beforeAll(() => {
+    mkdirSync(join(RAW_BASE, 'a', 'build'), { recursive: true })
+    writeFileSync(join(RAW_BASE, 'a', 'build', '1.out'), '')
+    mkdirSync(join(RAW_BASE, 'elsewhere'))
+    symlinkSync(
+      join(RAW_BASE, 'elsewhere'),
+      join(RAW_BASE, 'a', 'build', 'link'),
+    )
+  })
+
+  afterAll(() => {
+    rmSync(RAW_BASE, { recursive: true, force: true })
+  })
+
+  it('evaluates the directory form over the same listing and records symlinks', () => {
+    const BASE = realPath(RAW_BASE)
+    const walk = walkGlobPattern(join(RAW_BASE, 'a', '**/build/**'), {
+      withDirectoryForm: true,
+      followSymlinkedDirectories: true,
+    })
+
+    expect(walk.matches).toContain(join(BASE, 'a', 'build', '1.out'))
+    expect(walk.directoryMatches).toEqual([join(BASE, 'a', 'build')])
+    expect([...walk.symlinks]).toEqual([join(BASE, 'a', 'build', 'link')])
+    // Only an entry reached through a symlink has a second, real location.
+    expect([...walk.realOf]).toEqual([
+      [join(BASE, 'a', 'build', 'link'), join(BASE, 'elsewhere')],
+    ])
+  })
+
+  it('lists no directory matches without the directory form', () => {
+    const walk = walkGlobPattern(join(RAW_BASE, 'a', '**/build/**'))
+    expect(walk.directoryMatches).toEqual([])
+  })
+
+  it('takes a symlinked directory as the match itself without the link option', () => {
+    // What the allowRead expansion and the Windows ACL stamp see: the link is
+    // a match of its own, and nothing under what it points at is listed, so a
+    // link planted in the tree cannot widen an allow list to another tree.
+    const BASE = realPath(RAW_BASE)
+    const link = join(BASE, 'a', 'build', 'link')
+    writeFileSync(join(BASE, 'elsewhere', 'outside.out'), '')
+    try {
+      const plain = walkGlobPattern(join(RAW_BASE, 'a', '**/build/**'))
+      expect(plain.matches).toContain(link)
+      expect(plain.matches).not.toContain(join(link, 'outside.out'))
+      expect(plain.realOf.get(link)).toBeUndefined()
+
+      const followed = walkGlobPattern(join(RAW_BASE, 'a', '**/build/**'), {
+        followSymlinkedDirectories: true,
+      })
+      // What is found through the link is reported where it really is.
+      expect(followed.matches).toContain(join(BASE, 'elsewhere', 'outside.out'))
+      expect(followed.matches).not.toContain(join(link, 'outside.out'))
+    } finally {
+      rmSync(join(BASE, 'elsewhere', 'outside.out'))
+    }
+  })
+
+  it.if(process.getuid?.() !== 0)(
+    'records a symlink whose target cannot be looked at, with no real location',
+    () => {
+      // chmod 000 on the directory holding the target, which a sandboxed
+      // command with write access there can do and undo: stat and realpath
+      // both answer EACCES, which is not "nothing is there".
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-eacces-')))
+      const vault = join(root, 'vault')
+      const link = join(root, 'certs', 'k')
+      try {
+        mkdirSync(join(vault, 'inner'), { recursive: true })
+        writeFileSync(join(vault, 'inner', 'k'), 'SECRET')
+        mkdirSync(join(root, 'certs'))
+        symlinkSync(join(vault, 'inner', 'k'), link)
+        chmodSync(vault, 0o000)
+
+        const walk = walkGlobPattern(join(root, 'certs', '*'), {
+          followSymlinkedDirectories: true,
+        })
+
+        expect(walk.matches).toEqual([link])
+        expect(walk.symlinks.has(link)).toBe(true)
+        expect(walk.uninspectableLinks.has(link)).toBe(true)
+        expect(walk.realOf.get(link)).toBeUndefined()
+
+        // A link that leads nowhere at all stays the other case.
+        symlinkSync(join(root, 'gone'), join(root, 'certs', 'dangling'))
+        const withDangling = walkGlobPattern(join(root, 'certs', '*'), {
+          followSymlinkedDirectories: true,
+        })
+        expect(withDangling.uninspectableLinks).toEqual(new Set([link]))
+      } finally {
+        chmodSync(vault, 0o755)
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('reports where a match beneath a symlinked base really is', () => {
+    // alias -> the tree, sideways: normalizePathForSandbox keeps the link
+    // spelling for the pattern, so every match is spelled through it and
+    // the walk reports where it really is.
+    const BASE = realPath(RAW_BASE)
+    const alias = join(
+      RAW_BASE,
+      '..',
+      'alias-' + Math.random().toString(36).slice(2),
+    )
+    symlinkSync(BASE, alias)
+    try {
+      const walk = walkGlobPattern(join(alias, '**/build/**'))
+      const match = join(alias, 'a', 'build', '1.out')
+      expect(walk.matches).toContain(match)
+      expect(walk.realOf.get(match)).toBe(join(BASE, 'a', 'build', '1.out'))
+    } finally {
+      rmSync(alias)
+    }
+  })
+
+  it('terminates on a symlink cycle and still lists the tree', () => {
+    // build/up -> ..: the link leads back up the tree, and is not listed
+    // through.
+    const cyc = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-cycle-')))
+    try {
+      mkdirSync(join(cyc, 'build'))
+      writeFileSync(join(cyc, 'build', '1.out'), '')
+      symlinkSync('..', join(cyc, 'build', 'up'))
+
+      const walk = walkGlobPattern(join(cyc, '**/build/**'), {
+        withDirectoryForm: true,
+      })
+
+      expect(walk.matches).toContain(join(cyc, 'build', '1.out'))
+      expect(walk.directoryMatches).toEqual([join(cyc, 'build')])
+      expect(walk.symlinks.has(join(cyc, 'build', 'up'))).toBe(true)
+      // The cycle is not re-entered: nothing appears twice.
+      expect(new Set(walk.matches).size).toBe(walk.matches.length)
+    } finally {
+      rmSync(cyc, { recursive: true, force: true })
+    }
+  })
+
+  it.if(process.getuid?.() !== 0)(
+    'records a directory it cannot list and still lists its siblings',
+    () => {
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-unlisted-')))
+      const locked = join(root, 'pkg', 'locked')
+      try {
+        mkdirSync(join(locked, 'build'), { recursive: true })
+        writeFileSync(join(locked, 'build', 'secret.out'), '')
+        mkdirSync(join(root, 'pkg', 'open', 'build'), { recursive: true })
+        writeFileSync(join(root, 'pkg', 'open', 'build', '1.out'), '')
+        // Searchable but not listable: what a sandboxed command with write
+        // access to the tree can leave behind for the next wrap.
+        chmodSync(locked, 0o311)
+
+        const walk = walkGlobPattern(join(root, '**/build/**'))
+
+        expect(walk.unlisted).toEqual([locked])
+        expect(walk.matches).toEqual([
+          join(root, 'pkg', 'open', 'build', '1.out'),
+        ])
+      } finally {
+        chmodSync(locked, 0o755)
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('finds nothing, and nothing unlisted, under a base that is not there', () => {
+    const walk = walkGlobPattern(join(RAW_BASE, 'nope', '*.env'))
+    expect(walk.matches).toEqual([])
+    expect(walk.unlisted).toEqual([])
+  })
+
+  it.if(process.getuid?.() !== 0)(
+    'reports a base directory it cannot reach as unlisted, not as absent',
+    () => {
+      // The pattern's base is there; an ancestor of it is not searchable, so
+      // nothing under it can be enumerated. Read as absent, the deny would
+      // vanish for as long as the mode stays that way — and a sandboxed
+      // command can set it and put it back.
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-base-')))
+      const closed = join(root, 'closed')
+      const base = join(closed, 'certs')
+      try {
+        mkdirSync(base, { recursive: true })
+        writeFileSync(join(base, 'id.pem'), 'KEY')
+        chmodSync(closed, 0o000)
+
+        const walk = walkGlobPattern(join(base, '*.pem'))
+
+        expect(walk.matches).toEqual([])
+        expect(walk.unlisted).toEqual([base])
+      } finally {
+        chmodSync(closed, 0o755)
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it.if(process.getuid?.() !== 0)(
+    'does not try to list a directory the pattern cannot match beneath',
+    () => {
+      // proj/*.pem matches at one depth only: a directory beneath proj can
+      // hold no match, so it is never listed and never reported as
+      // unlistable, whatever its mode.
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-prune-')))
+      const proj = join(root, 'proj')
+      try {
+        mkdirSync(join(proj, 'pgdata'), { recursive: true })
+        mkdirSync(join(proj, 'deep', 'x', 'locked'), { recursive: true })
+        writeFileSync(join(proj, 'top.pem'), '')
+        writeFileSync(join(proj, 'deep', 'x', 'nested.pem'), '')
+        chmodSync(join(proj, 'pgdata'), 0o000)
+        chmodSync(join(proj, 'deep', 'x', 'locked'), 0o311)
+
+        const walk = walkGlobPattern(join(proj, '*.pem'))
+        expect(walk.matches).toEqual([join(proj, 'top.pem')])
+        expect(walk.unlisted).toEqual([])
+
+        // A fixed-depth pattern descends only where its segments allow.
+        const nested = walkGlobPattern(join(proj, 'de*/x/*.pem'))
+        expect(nested.matches).toEqual([join(proj, 'deep', 'x', 'nested.pem')])
+        expect(nested.unlisted).toEqual([])
+
+        // From a ** on, every directory can hold a match again.
+        const spanning = walkGlobPattern(join(proj, 'deep/**/*.pem'))
+        expect(spanning.matches).toEqual([
+          join(proj, 'deep', 'x', 'nested.pem'),
+        ])
+        expect(spanning.unlisted).toEqual([join(proj, 'deep', 'x', 'locked')])
+      } finally {
+        chmodSync(join(proj, 'pgdata'), 0o755)
+        chmodSync(join(proj, 'deep', 'x', 'locked'), 0o755)
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('skips a pattern whose only literal directory is the root', () => {
+    // A wildcard in the first path component leaves '/' to start from. The
+    // fixture is real and the pattern matches it, so a walk that started at
+    // the root would find it: what this pins is the skip, not an empty tree.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-root-')))
+    try {
+      mkdirSync(join(root, 'keys'))
+      writeFileSync(join(root, 'keys', 'id.pem'), 'KEY')
+      const under = join(root, 'keys', '*.pem')
+      expect(expandGlobPattern(under)).toEqual([join(root, 'keys', 'id.pem')])
+
+      // Same file, named from a first-component wildcard: '/t*/…' on a Linux
+      // runner, and whatever the first component of the temporary directory
+      // is elsewhere.
+      const [, first, ...rest] = under.split('/')
+      const fromRoot = ['', first!.slice(0, 1) + '*', ...rest].join('/')
+      expect(globPatternBaseDir(normalizePathForSandbox(fromRoot))).toBe('/')
+
+      const walk = walkGlobPattern(fromRoot)
+      expect(walk.matches).toEqual([])
+      expect(walk.unlisted).toEqual([])
+
+      // A pattern with no literal component at all is the other half of the
+      // rule: no directory to start from, not even the root. (The walk
+      // resolves a relative pattern against the working directory first, so
+      // this shape reaches it only from a caller that does not.)
+      expect(globPatternBaseDir('*.pem')).toBe('')
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('matches a name that holds a line terminator', () => {
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-newline-')))
+    try {
+      mkdirSync(join(root, 'build'))
+      writeFileSync(join(root, 'build', 'a\nb.out'), '')
+      expect(expandGlobPattern(join(root, '**/build/**'))).toEqual([
+        join(root, 'build', 'a\nb.out'),
+      ])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('follows a chain of links to its end, under names no longer than real ones', () => {
+    // d0/next -> d1, d1/next -> d2, …: the spelling of the last directory
+    // crosses every link before it. A walk that carried that spelling would
+    // match each entry against a longer and longer path; what is found
+    // through a link is carried and reported by its real path instead.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-chain-')))
+    const links = 300
+    try {
+      for (let i = 0; i <= links; i++) {
+        mkdirSync(join(root, `d${i}`))
+        writeFileSync(join(root, `d${i}`, 'id.pem'), 'KEY')
+      }
+      for (let i = 0; i < links; i++) {
+        symlinkSync(join('..', `d${i + 1}`), join(root, `d${i}`, 'next'))
+      }
+
+      const walk = walkGlobPattern(join(root, 'd0', '**/*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.unlisted).toEqual([])
+      expect(walk.matches.sort()).toEqual(
+        Array.from({ length: links + 1 }, (_, i) =>
+          join(root, `d${i}`, 'id.pem'),
+        ).sort(),
+      )
+      const longest = join(root, `d${links}`, 'next').length
+      for (const seen of walk.symlinks) {
+        expect(seen.length).toBeLessThanOrEqual(longest)
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it.if(isLinux)(
+    'looks at a link by a shorter name when its real path is too long to name',
+    () => {
+      // deep is a real directory whose path is a few bytes short of PATH_MAX,
+      // so deep/key.pem cannot be named by its real path at all, only through
+      // base/s. The link is a match, and what it leads to has to be found.
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-long-')))
+      let deep = join(root, 'deep')
+      while (deep.length < 4090) {
+        deep = join(deep, 'd'.repeat(Math.min(200, 4090 - deep.length - 1)))
+      }
+      const viaLink = join(root, 'base', 's', 'key.pem')
+      try {
+        mkdirSync(deep, { recursive: true })
+        mkdirSync(join(root, 'base'))
+        writeFileSync(join(root, 'secret.txt'), 'KEY')
+        symlinkSync(deep, join(root, 'base', 's'))
+        symlinkSync(join(root, 'secret.txt'), viaLink)
+        expect(join(deep, 'key.pem').length).toBeGreaterThan(4095)
+
+        const walk = walkGlobPattern(join(root, 'base', '*/*.pem'), {
+          followSymlinkedDirectories: true,
+        })
+
+        expect(walk.unlisted).toEqual([])
+        expect(walk.matches.map(m => walk.realOf.get(m))).toEqual([
+          join(root, 'secret.txt'),
+        ])
+      } finally {
+        rmSync(viaLink, { force: true })
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('lists a directory once, whatever the number of names that lead to it', () => {
+    // N packages that each link to every other. Every chain of distinct
+    // packages spells the same N files differently, which is about e*N! of
+    // them (N=12: 1.3 billion) for a tree a sandboxed command can plant. The
+    // pattern cannot tell one of those names from another, so each directory
+    // is read once and none is given up on.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-names-')))
+    const names = Array.from({ length: 12 }, (_, i) => `p${i}`)
+    try {
+      for (const name of names) {
+        mkdirSync(join(root, name, 'node_modules'), { recursive: true })
+        writeFileSync(join(root, name, 'index.js'), '')
+      }
+      for (const from of names) {
+        for (const to of names) {
+          if (from !== to) {
+            symlinkSync(join(root, to), join(root, from, 'node_modules', to))
+          }
+        }
+      }
+      const listed: string[] = []
+      const readdirSync = fs.readdirSync
+      const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        listed.push(String(args[0]))
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      let walk
+      try {
+        walk = walkGlobPattern(join(root, '**/index.js'), {
+          followSymlinkedDirectories: true,
+        })
+      } finally {
+        readdirSpy.mockRestore()
+      }
+
+      // The root, and each package and its node_modules: once each.
+      expect(listed.sort()).toEqual(
+        [
+          root,
+          ...names.map(name => join(root, name)),
+          ...names.map(name => join(root, name, 'node_modules')),
+        ].sort(),
+      )
+      // Each file is found once, under whichever name reached it first.
+      expect(walk.matches.map(m => walk.realOf.get(m) ?? m).sort()).toEqual(
+        names.map(name => join(root, name, 'index.js')).sort(),
+      )
+      expect(walk.unlisted).toEqual([])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('lists a directory again under a name the pattern tells apart', () => {
+    // vault is reached by its own name, which matches nothing, and through
+    // config/secrets, the only spelling `**/secrets/*.pem` matches. However
+    // many links lead to it, those are the two ways the pattern can carry
+    // on beneath it, and both are listed.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-apart-')))
+    try {
+      mkdirSync(join(root, 'vault'))
+      writeFileSync(join(root, 'vault', 'id.pem'), 'KEY')
+      for (let i = 0; i < 20; i++) {
+        mkdirSync(join(root, `config${i}`))
+        symlinkSync(join('..', 'vault'), join(root, `config${i}`, 'secrets'))
+        symlinkSync(join('..', 'vault'), join(root, `config${i}`, 'other'))
+      }
+
+      const walk = walkGlobPattern(join(root, '**/secrets/*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.unlisted).toEqual([])
+      expect(walk.matches).toEqual([join(root, 'vault', 'id.pem')])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('follows a `**` written against text through a symlinked directory', () => {
+    // globToRegex lets `**.pem` and `ce**/x.pem` span directories. Each is
+    // two patterns the walk can follow a name at a time (`*.pem` or
+    // `*` / `**` / `*.pem`), so what they reach through a link is found like
+    // any other match: here certs leads out of the pattern's base.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-glued-')))
+    try {
+      mkdirSync(join(root, 'proj'))
+      mkdirSync(join(root, 'outside', 'deep'), { recursive: true })
+      writeFileSync(join(root, 'outside', 'x.pem'), 'KEY')
+      writeFileSync(join(root, 'outside', 'deep', 'y.pem'), 'KEY')
+      writeFileSync(join(root, 'proj', 'z.pem'), 'KEY')
+      symlinkSync(join('..', 'outside'), join(root, 'proj', 'certs'))
+
+      const found = (pattern: string): string[] => {
+        const walk = walkGlobPattern(join(root, 'proj', pattern), {
+          followSymlinkedDirectories: true,
+        })
+        expect(walk.unlisted).toEqual([])
+        return walk.matches.map(m => walk.realOf.get(m) ?? m).sort()
+      }
+
+      expect(found('**.pem')).toEqual([
+        join(root, 'outside', 'deep', 'y.pem'),
+        join(root, 'outside', 'x.pem'),
+        join(root, 'proj', 'z.pem'),
+      ])
+      expect(found('ce**/x.pem')).toEqual([join(root, 'outside', 'x.pem')])
+      expect(found('ce**y.pem')).toEqual([
+        join(root, 'outside', 'deep', 'y.pem'),
+      ])
+      // A run of three before a separator is a `*` and then a `**/`.
+      expect(found('***/y.pem')).toEqual([
+        join(root, 'outside', 'deep', 'y.pem'),
+      ])
+      expect(found('***/x.pem')).toEqual([join(root, 'outside', 'x.pem')])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('follows a bracket expression that can match a separator', () => {
+    // `[s/]` is an `s` within a name or a separator between two, and both
+    // readings are followed, through a link as well.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-bracket-')))
+    try {
+      mkdirSync(join(root, 'proj'))
+      mkdirSync(join(root, 'outside', 'cert'), { recursive: true })
+      writeFileSync(join(root, 'outside', 'cert', 'x.pem'), 'KEY')
+      writeFileSync(join(root, 'outside', 'certsx.pem'), 'KEY')
+      symlinkSync(join('..', 'outside'), join(root, 'proj', 'lnk'))
+
+      const walk = walkGlobPattern(join(root, 'proj', '*/cert[s/]x.pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.matches.map(m => walk.realOf.get(m) ?? m).sort()).toEqual([
+        join(root, 'outside', 'cert', 'x.pem'),
+        join(root, 'outside', 'certsx.pem'),
+      ])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('matches a pattern it cannot split against real paths only', () => {
+    // A wildcard inside a bracket expression is rewritten like any other, so
+    // `?[*].pem` reads as one character, any run of `[`, `^` or `/`, then
+    // `].pem`. Nothing can follow that a name at a time, and no two names
+    // for a directory can be told apart, so each is listed under its own
+    // name alone.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-split-')))
+    try {
+      mkdirSync(join(root, 'cfg'))
+      writeFileSync(join(root, 'cfg', 'a].pem'), 'KEY')
+      symlinkSync('cfg', join(root, 'lnk'))
+      symlinkSync(join('cfg', 'a].pem'), join(root, 'b].pem'))
+
+      const walk = walkGlobPattern(join(root, '**/?[*].pem'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.matches.sort()).toEqual([
+        join(root, 'b].pem'),
+        join(root, 'cfg', 'a].pem'),
+      ])
+      // A link that is itself a match is still resolved, so that a deny
+      // lands on what it leads to.
+      expect(walk.realOf.get(join(root, 'b].pem'))).toBe(
+        join(root, 'cfg', 'a].pem'),
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
 })
 
 // ============================================================================
@@ -392,6 +937,76 @@ describe('parseWindowsSandboxError', () => {
 // Tests for globToRegex() after move to sandbox-utils.ts
 // ============================================================================
 
+/** One character against the body of a `[…]` set, ranges included. */
+function setContains(set: string, char: string): boolean {
+  for (let i = 0; i < set.length; i++) {
+    if (set[i + 1] === '-' && i + 2 < set.length) {
+      if (char >= set[i]! && char <= set[i + 2]!) return true
+      i += 2
+    } else if (set[i] === char) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * The documented glob syntax matched directly, by backtracking rather than
+ * by compiling a regex: `*` and `?` stop at a separator, `**` crosses them,
+ * `**\/` is zero or more directories, `[…]` is one character from the set.
+ * Shares nothing with {@link globToRegex}, so the property below is two
+ * implementations checking each other.
+ */
+function referenceGlobMatch(pattern: string, pathText: string): boolean {
+  if (pattern === '') return pathText === ''
+  if (pattern.startsWith('**/')) {
+    const rest = pattern.slice(3)
+    if (referenceGlobMatch(rest, pathText)) return true
+    for (let i = 0; i < pathText.length; i++) {
+      if (pathText[i] !== '/') continue
+      if (referenceGlobMatch(rest, pathText.slice(i + 1))) return true
+    }
+    return false
+  }
+  if (pattern.startsWith('**')) {
+    const rest = pattern.slice(2)
+    for (let i = 0; i <= pathText.length; i++) {
+      if (referenceGlobMatch(rest, pathText.slice(i))) return true
+    }
+    return false
+  }
+  const head = pattern[0]!
+  if (head === '*') {
+    for (let i = 0; i <= pathText.length; i++) {
+      if (i > 0 && pathText[i - 1] === '/') break
+      if (referenceGlobMatch(pattern.slice(1), pathText.slice(i))) return true
+    }
+    return false
+  }
+  if (head === '?') {
+    return (
+      pathText.length > 0 &&
+      pathText[0] !== '/' &&
+      referenceGlobMatch(pattern.slice(1), pathText.slice(1))
+    )
+  }
+  if (head === '[') {
+    const close = pattern.indexOf(']')
+    if (close > 1) {
+      return (
+        pathText.length > 0 &&
+        setContains(pattern.slice(1, close), pathText[0]!) &&
+        referenceGlobMatch(pattern.slice(close + 1), pathText.slice(1))
+      )
+    }
+  }
+  return (
+    pathText.length > 0 &&
+    pathText[0] === head &&
+    referenceGlobMatch(pattern.slice(1), pathText.slice(1))
+  )
+}
+
 describe('globToRegex (shared)', () => {
   it('should convert simple wildcard', () => {
     const regex = globToRegex('/tmp/test/*.env')
@@ -423,6 +1038,96 @@ describe('globToRegex (shared)', () => {
     const regex = globToRegex('/tmp/test/**')
     expect(new RegExp(regex).test('/tmp/test/anything')).toBe(true)
     expect(new RegExp(regex).test('/tmp/test/sub/deep/file.txt')).toBe(true)
+  })
+
+  it('should match one character from a bracket set', () => {
+    const digits = globToRegex('/tmp/test/file[0-9].txt')
+    expect(new RegExp(digits).test('/tmp/test/file3.txt')).toBe(true)
+    expect(new RegExp(digits).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(digits).test('/tmp/test/file12.txt')).toBe(false)
+    expect(new RegExp(digits).test('/tmp/test/file.txt')).toBe(false)
+
+    const letters = globToRegex('/tmp/test/[a-z]bc.txt')
+    expect(new RegExp(letters).test('/tmp/test/abc.txt')).toBe(true)
+    expect(new RegExp(letters).test('/tmp/test/Abc.txt')).toBe(false)
+    expect(new RegExp(letters).test('/tmp/test/1bc.txt')).toBe(false)
+  })
+
+  it('never negates a bracket set: ^ and ! are members of it', () => {
+    // Both spellings used for negation elsewhere (regex `^`, gitignore `!`)
+    // land in the set as ordinary characters, so such a pattern matches
+    // fewer names than its author meant, not more.
+    const caret = globToRegex('/tmp/test/file[^0-9].txt')
+    expect(new RegExp(caret).test('/tmp/test/file^.txt')).toBe(true)
+    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(true)
+    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(false)
+
+    const bang = globToRegex('/tmp/test/file[!0-9].txt')
+    expect(new RegExp(bang).test('/tmp/test/file!.txt')).toBe(true)
+    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(true)
+    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(false)
+  })
+
+  it('treats a bracket that opens no set as a literal character', () => {
+    const unclosed = globToRegex('/tmp/test/file[abc.txt')
+    expect(new RegExp(unclosed).test('/tmp/test/file[abc.txt')).toBe(true)
+    expect(new RegExp(unclosed).test('/tmp/test/filea.txt')).toBe(false)
+
+    const stray = globToRegex('/tmp/test/file]a.txt')
+    expect(new RegExp(stray).test('/tmp/test/file]a.txt')).toBe(true)
+    expect(new RegExp(stray).test('/tmp/test/filea.txt')).toBe(false)
+  })
+
+  it.failing(
+    'keeps a component spelled like a globstar placeholder literal',
+    () => {
+      // globToRegex parks `**` under __GLOBSTAR__ / __GLOBSTAR_SLASH__ while
+      // it rewrites `*` and `?`, then restores them by name, so a directory
+      // actually called __GLOBSTAR__ comes back as a wildcard.
+      const parked = globToRegex('/tmp/__GLOBSTAR__/x')
+      expect(new RegExp(parked).test('/tmp/__GLOBSTAR__/x')).toBe(true)
+      expect(new RegExp(parked).test('/tmp/anything/x')).toBe(false)
+
+      const parkedSlash = globToRegex('/tmp/__GLOBSTAR_SLASH__x')
+      expect(new RegExp(parkedSlash).test('/tmp/__GLOBSTAR_SLASH__x')).toBe(
+        true,
+      )
+    },
+  )
+
+  it('agrees with a reference matcher over generated patterns and paths', () => {
+    // Segments are drawn from the documented syntax only; the corners the
+    // cases above pin (an unclosed bracket, a stray `]`, a negated set, a
+    // literal placeholder) are left out so a disagreement here means the
+    // documented syntax itself diverged.
+    const segment = fc.constantFrom(
+      'a',
+      'bc',
+      'a*',
+      '*b',
+      '*',
+      '?',
+      'a?c',
+      '[ab]',
+      '[0-9]',
+      '[a-c]c',
+      '**',
+    )
+    const pattern = fc
+      .array(segment, { minLength: 1, maxLength: 4 })
+      .map(parts => '/' + parts.join('/'))
+    const pathText = fc
+      .array(fc.constantFrom('a', 'b', 'c', 'bc', 'a1', 'abc', '0', 'ab'), {
+        minLength: 1,
+        maxLength: 4,
+      })
+      .map(parts => '/' + parts.join('/'))
+    fc.assert(
+      fc.property(pattern, pathText, (p, f) => {
+        return new RegExp(globToRegex(p)).test(f) === referenceGlobMatch(p, f)
+      }),
+      { numRuns: 200 },
+    )
   })
 })
 
@@ -592,6 +1297,34 @@ describe.if(isLinux)('getLinuxGlobPatternWarnings after fix', () => {
     // allowWrite and denyWrite globs should still produce warnings
     expect(warnings).toContain('/tmp/test/*.log')
     expect(warnings).toContain('/tmp/test/secret_*')
+
+    await SandboxManager.reset()
+  })
+
+  it('warns about a read pattern with no literal directory to start from', async () => {
+    // Expanded, such a pattern would have to start listing at '/', so it is
+    // skipped and the entry it came from is silently unenforced. That is the
+    // one read glob shape a user has to be told about.
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        denyRead: ['/**/*.pem', '/opt*/keys/**', '/tmp/test/*.env'],
+        allowRead: ['/et*/ssl'],
+        allowWrite: ['/tmp'],
+        denyWrite: [],
+      },
+    })
+
+    const warnings = SandboxManager.getLinuxGlobPatternWarnings()
+
+    expect(warnings.sort()).toEqual(
+      ['/**/*.pem', '/et*/ssl', '/opt*/keys/**'].sort(),
+    )
 
     await SandboxManager.reset()
   })

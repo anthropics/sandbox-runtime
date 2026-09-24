@@ -8,16 +8,15 @@ import { logForDebugging } from '../utils/debug.js'
 import {
   generateProxyEnvVars,
   encodeSandboxedCommand,
+  attributionKeyFor,
   buildGitConfigEnv,
   normalizePathForSandbox,
   containsGlobCharsWin,
   expandGlobPattern,
   isUncPath,
 } from './sandbox-utils.js'
-// Re-export so existing tests (glob-expand.test.ts) and any
-// out-of-tree caller keep their import path. `buildGitConfigEnv` is
-// hoisted to sandbox-utils (cross-platform) but re-exported here for
-// the existing `src/index.ts` surface.
+// Kept on this module's surface for out-of-tree importers; the
+// implementations live in sandbox-utils.ts.
 export {
   containsGlobCharsWin,
   stripExtendedPathPrefix,
@@ -98,6 +97,8 @@ export type WindowsSandboxErrorCode =
   | 'install_user_failed'
   /** `srt-win install` exit 13 — different config under this sublayer. */
   | 'install_config_conflict'
+  /** `srt-win install` exit 17 — ambient write-deny stamping failed. */
+  | 'install_ambient_failed'
   /** `srt-win install` was killed by the spawn timeout (UAC left open). */
   | 'install_timeout'
   /** `srt-win install` failed with an unmapped exit code. */
@@ -207,11 +208,11 @@ export interface WindowsSandboxUserStatus {
   inSandboxGroup: boolean
   hiddenFromLogon: boolean
   /**
-   * The credential row is present in `state.db` and readable by
-   * THIS process. False when not yet written, or when called from
-   * inside the sandbox (the state-DB directory carries an explicit
-   * DENY for `sandbox-runtime-users` — machine-scope DPAPI alone
-   * is not a confidentiality boundary).
+   * The credential blob (`HKLM\SOFTWARE\sandbox-runtime\Cred`) is
+   * present, decryptable, and readable by THIS process. False when
+   * not yet written, or when called from inside the sandbox (the
+   * Cred key carries an explicit DENY for `sandbox-runtime-users` —
+   * machine-scope DPAPI alone is not a confidentiality boundary).
    */
   credPresent: boolean
   /** Setup marker schema version, when the marker row exists. */
@@ -355,8 +356,8 @@ export function parseWindowsBinShell(
 export interface WindowsSandboxParams {
   command: string
   /** Attribution key encoded for violation correlation; defaults to
-   *  `command`. See MacOSSandboxParams.commandLabel. */
-  commandLabel?: string
+   *  `command`. See MacOSSandboxParams.commandId. */
+  commandId?: string
   /**
    * JS HTTP proxy port — fed to `generateProxyEnvVars` for the env
    * overlay. With the in-process proxy this is the mux front-end
@@ -976,9 +977,8 @@ export async function verifyWindowsWfpEgress(
   }
   try {
     // 30s: first call after install may create the sandbox user's
-    // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW —
-    // same budget as windowsTrustCa, plus the runner's own 2s
-    // connect timeout.
+    // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
+    // the runner allows itself 2s to connect (runner.rs).
     const r = runSrtWin(['wfp', 'verify', '--target', target], {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
@@ -1058,7 +1058,7 @@ export async function getWindowsSandboxUserStatusAsync(
  * Read back the persistent MITM CA the sandbox was installed with
  * (via `srt-win user trust-ca` / {@link windowsTrustCa}).
  * Returns `null` when no CA was installed. The PEM is what `srt-win
- * user status` reconstructs from the DER stored in `state.db`.
+ * user status` reconstructs from the DER recorded in the registry.
  *
  * On Windows, `tlsTerminate` requires this CA to be present in the
  * sandbox user's `CurrentUser\Root` (schannel-level trust is an
@@ -1081,7 +1081,7 @@ export function getWindowsSandboxCaCert(
 
 /**
  * Install (or replace) the MITM CA in the **sandbox user's**
- * `CurrentUser\Root` and record it in `state.db` (so
+ * `CurrentUser\Root` and record it in the registry (so
  * {@link getWindowsSandboxCaCert} surfaces its thumbprint + PEM).
  * Thin wrapper around `srt-win user trust-ca <path>`. Does NOT
  * require elevation. Persistent until {@link uninstallWindowsSandbox}
@@ -1134,17 +1134,21 @@ function checkTrustCaResult(caCertPath: string, r: RunResult): void {
 }
 
 /**
- * `%LOCALAPPDATA%\sandbox-runtime` — the same directory `srt-win`'s
- * `state_db::state_dir()` uses. Its DACL is stamped `(OI)(CI)`
- * real-user-only + explicit `sandbox-runtime-users` DENY on every
- * `state_db::open_db()` (i.e. at `srt-win install` and every `acl`
- * op), so anything created underneath it inherits broker-only
- * custody.
+ * The machine-wide state directory `%ProgramData%\sandbox-runtime`,
+ * mirroring `srt-win`'s `state_db::machine_store_dir()` exactly.
+ * Since the registry move it hosts only the managed CA key material
+ * (`ca\`), which must stay on the filesystem because the broker's
+ * unelevated generate-if-absent self-heal rewrites it; the
+ * credential, marker, and CA record live in
+ * `HKLM\SOFTWARE\sandbox-runtime`. Created and ACL'd by the
+ * elevated `srt-win install`: Administrators own it, BUILTIN\Users
+ * have modify, and the sandbox group carries an explicit
+ * `(OI)(CI)` DENY.
  */
 export function windowsStateDir(): string {
-  const base = process.env.LOCALAPPDATA
-  if (!base) throw new Error('LOCALAPPDATA is not set')
-  return path.win32.join(base, 'sandbox-runtime')
+  const programData = process.env.ProgramData
+  if (!programData) throw new Error('ProgramData is not set')
+  return path.win32.join(programData, 'sandbox-runtime')
 }
 
 /** Result of {@link ensurePersistentWindowsCa}. */
@@ -1184,10 +1188,13 @@ export type WindowsPersistentCa = {
 
 /**
  * Generate-if-absent a persistent MITM CA under
- * `%LOCALAPPDATA%\sandbox-runtime\ca\` and ensure it is trusted in
+ * `{windowsStateDir()}\ca\` and ensure it is trusted in
  * the sandbox user's `CurrentUser\Root`. Idempotent and unelevated:
  * a second call with a valid on-disk pair returns it with
- * `generated: false`.
+ * `generated: false`. On the machine store the `ca\` subdir is
+ * user-writable by design (BUILTIN\Users modify, inherited from the
+ * install-ACL'd store), so this self-heal keeps working without
+ * admin rights for every user of the machine.
  *
  * **Storage.** The pair lives in a single `ca.json = {certPem,
  * keyPem}` written atomically (tmp+rename) and re-read after every
@@ -1198,13 +1205,16 @@ export type WindowsPersistentCa = {
  *
  * **Key custody is broker-side.** The MITM proxy runs as the real
  * user, so the sandbox user never needs to read the key. The `ca/`
- * subdirectory inherits the state-DB directory's `(OI)(CI)`
- * real-user-only DACL + `sandbox-runtime-users` DENY (see
+ * subdirectory inherits the machine store's `(OI)(CI)` DACL, which
+ * carries an explicit `sandbox-runtime-users` DENY (see
  * {@link windowsStateDir}), so `ca.json`/`key.pem` are unreadable
- * from inside the sandbox with no per-file ACL work here. The
- * certificate reaches the sandboxed child via the schannel registry
- * write ({@link windowsTrustCa}) and the trust-bundle env vars —
- * never via these files.
+ * from inside the sandbox with no per-file ACL work here. The key
+ * IS readable (and replaceable) by other REAL local users — an
+ * accepted trade-off of the shared store: the sandbox account is
+ * network-confined by SID-keyed WFP filters regardless of who
+ * spawns it. The certificate reaches the sandboxed child via the
+ * schannel registry write ({@link windowsTrustCa}) and the
+ * trust-bundle env vars — never via these files.
  *
  * `SandboxManager.initialize()` calls this on Windows when
  * `tlsTerminate` is enabled without an explicit
@@ -1425,11 +1435,7 @@ export interface WindowsInstallOptions {
   force?: boolean
   /**
    * How long to wait for the self-elevating install subprocess.
-   * Default 120 000 ms — the Windows UAC consent dialog auto-
-   * dismisses after ~2 minutes, so anything shorter risks killing
-   * the subprocess while a legitimate approval is still pending
-   * (elevation is not retracted when the parent dies, so a late
-   * approval after we've timed out would half-complete).
+   * Defaults to {@link INSTALL_TIMEOUT_MS}.
    */
   timeoutMs?: number
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
@@ -1450,11 +1456,17 @@ export interface WindowsInstallResult {
 }
 
 /**
- * Effective spawn budget for the self-elevating install/uninstall —
- * see {@link WindowsInstallOptions.timeoutMs} for the 120 s rationale.
+ * Default spawn budget for the self-elevating install/uninstall. The Windows
+ * UAC consent dialog auto-dismisses after ~2 minutes, so anything shorter
+ * risks killing the subprocess while a legitimate approval is still pending
+ * (elevation is not retracted when the parent dies, so a late approval after
+ * we have timed out would half-complete).
  */
+const INSTALL_TIMEOUT_MS = 120_000
+
+/** Effective spawn budget for the self-elevating install/uninstall. */
 function installTimeoutMs(opts: { timeoutMs?: number }): number {
-  return opts.timeoutMs ?? 120_000
+  return opts.timeoutMs ?? INSTALL_TIMEOUT_MS
 }
 
 function installArgs(opts: WindowsInstallOptions): string[] {
@@ -1493,6 +1505,7 @@ function remapInstallTimeout(e: unknown): never {
 //   12 WFP install failed
 //   13 already installed with different config (use --force)
 //   14 sandbox-user provisioning failed
+//   17 ambient write-deny stamping failed
 //   1  other error (stderr has detail)
 // Throws on any failure code; the caller reads back state on 0/10.
 function throwOnInstallFailure(r: RunResult): void {
@@ -1519,6 +1532,13 @@ function throwOnInstallFailure(r: RunResult): void {
           `a different port range or sandbox-user name. Pass ` +
           `{force: true} to replace, or pick a different sublayerGuid. ` +
           `Output: ${out}`,
+      )
+    case 17:
+      throw new WindowsSandboxError(
+        'install_ambient_failed',
+        `srt-win install: ambient write-deny stamping failed (stock ` +
+          `world-writable system dirs could not be deny-stamped for the ` +
+          `sandbox user): ${out}`,
       )
     default:
       throw new WindowsSandboxError(
@@ -1612,7 +1632,7 @@ export function uninstallWindowsSandbox(
     keepUser?: boolean
     /**
      * How long to wait for the self-elevating uninstall subprocess.
-     * Default 120 000 ms — see {@link WindowsInstallOptions.timeoutMs}.
+     * Defaults to {@link INSTALL_TIMEOUT_MS}.
      */
     timeoutMs?: number
     srtWin?: SrtWinSpawn
@@ -2021,7 +2041,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
       p.caCertPath?.replace(/\\/g, '/'),
       p.proxyAuthToken,
       undefined,
-      encodeSandboxedCommand(p.commandLabel ?? p.command),
+      encodeSandboxedCommand(attributionKeyFor(p.command, p.commandId)),
     ),
   )
   // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it

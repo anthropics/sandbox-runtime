@@ -708,8 +708,11 @@ describe.if(isMacOS)(
         writeConfig,
       })
 
-      expect(wrappedCommand).toContain('deny file-write-create')
-      expect(wrappedCommand).toContain('deny file-write-unlink')
+      expect(wrappedCommand).toContain(
+        `(deny file-write-unlink file-write-create\n` +
+          `  (subpath ${JSON.stringify(TEST_DENIED_FILE)})\n` +
+          `  (literal ${JSON.stringify(TEST_DENIED_PARENT)})\n`,
+      )
     })
 
     it('should block creating a symlink at a non-existent protected ancestor', () => {

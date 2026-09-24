@@ -127,6 +127,7 @@ pub fn provision(name: &str, we_own_it: bool) -> Result<ProvisionedUser> {
     set_logon_ui_hidden(name, true)?;
 
     let group_sid = sid::lookup_account_sid(SANDBOX_GROUP).context("resolve sandbox group SID")?;
+    apply_logon_denials(&group_sid).context("stamp logon-type denials on the sandbox group")?;
     Ok(ProvisionedUser {
         username: name.into(),
         sid,
@@ -139,6 +140,14 @@ pub fn provision(name: &str, we_own_it: bool) -> Result<ProvisionedUser> {
 /// itself, [`SANDBOX_GROUP`], and the Winlogon hide value.
 /// Idempotent — every step tolerates already-absent state.
 pub fn deprovision(name: &str) -> Result<()> {
+    // LSA account-rights entries would linger in the policy DB after
+    // the group SID is deleted; strip them first. Best-effort — the
+    // group may already be gone on a re-run.
+    if let Ok(gsid) = sid::lookup_account_sid(SANDBOX_GROUP)
+        && let Err(e) = remove_logon_denials(&gsid)
+    {
+        eprintln!("srt-win: warning: removing logon denials: {e:#}");
+    }
     // Profile delete needs the SID *string*; resolve before
     // NetUserDel removes the SAM mapping. Failure to resolve (user
     // already gone) is fine — no profile to delete.
@@ -490,6 +499,123 @@ fn is_logon_ui_hidden(user: &str) -> bool {
     // Hidden iff the value exists AND is 0 (a value of 1 explicitly
     // shows the account; absence = default = shown).
     r != ERROR_FILE_NOT_FOUND && r.is_ok() && cb == 4 && u32::from_ne_bytes(data) == 0
+}
+
+/// The logon-type denials stamped on [`SANDBOX_GROUP`]. Everything
+/// except INTERACTIVE — which `CreateProcessWithLogonW`'s
+/// `LOGON_WITH_PROFILE` logon performs and the sandbox launch
+/// depends on (the account holds it via `BUILTIN\Users`).
+///
+/// - `SeDenyNetworkLogonRight`: the SMB redirector dials as SYSTEM
+///   from kernel mode, so the SID-keyed WFP fence never classifies
+///   its connects — red-teaming confirmed `net use \\127.0.0.1\IPC$`
+///   succeeded from inside the sandbox, and the same mechanism
+///   reaches remote shares (an exfil channel) and SMB-hosted RPC
+///   pipes. SMB *authenticates* as the sandbox account though, so
+///   denying it the network-logon right refuses the session at the
+///   server regardless of which process carried the bytes.
+///   CAVEAT (verified): LOOPBACK SMB stays reachable — NTLM
+///   loopback auth reuses the client's existing logon session, so
+///   no new network logon happens and the deny right never fires;
+///   `LogonUser(NETWORK)` (what any REMOTE server's LSA runs)
+///   returns 1385. Content behind loopback shares is still governed
+///   by the same NTFS ACLs the sandbox is stamped with.
+/// - `SeDenyBatchLogonRight`: a sandboxed child can REGISTER a
+///   scheduled task (the service's DACL allows it); the task then
+///   needs a batch logon to RUN. Denying it turns registration into
+///   inert persistence-spam.
+/// - `SeDenyServiceLogonRight` / `SeDenyRemoteInteractiveLogonRight`:
+///   no legitimate flow runs the account as a service or over RDP.
+const LOGON_DENIALS: [&str; 4] = [
+    "SeDenyNetworkLogonRight",
+    "SeDenyBatchLogonRight",
+    "SeDenyServiceLogonRight",
+    "SeDenyRemoteInteractiveLogonRight",
+];
+
+/// Open the local LSA policy, marshal [`LOGON_DENIALS`] as
+/// LSA_UNICODE_STRINGs (each backed by its OWN allocation so the
+/// pointers cannot dangle if the list grows), run `f`, and close the
+/// policy on every path.
+fn with_lsa_rights<F>(f: F) -> Result<()>
+where
+    F: FnOnce(
+        windows::Win32::Security::Authentication::Identity::LSA_HANDLE,
+        &[windows::Win32::Security::Authentication::Identity::LSA_UNICODE_STRING],
+    ) -> windows::Win32::Foundation::NTSTATUS,
+{
+    use windows::Win32::Security::Authentication::Identity::{
+        LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaClose, LsaNtStatusToWinError, LsaOpenPolicy,
+        POLICY_CREATE_ACCOUNT, POLICY_LOOKUP_NAMES,
+    };
+
+    let attrs = LSA_OBJECT_ATTRIBUTES::default();
+    let mut policy = Default::default();
+    let status = unsafe {
+        LsaOpenPolicy(
+            None,
+            &attrs,
+            (POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES) as u32,
+            &mut policy,
+        )
+    };
+    if status.is_err() {
+        let gle = unsafe { LsaNtStatusToWinError(status) };
+        anyhow::bail!("LsaOpenPolicy: win32 error {gle}");
+    }
+    // One owned buffer per right: growth of LOGON_DENIALS can never
+    // invalidate an earlier entry's Buffer pointer.
+    let bufs: Vec<(Vec<u16>, u16)> = LOGON_DENIALS
+        .iter()
+        .map(|r| crate::util::counted_utf16(r))
+        .collect();
+    let rights: Vec<LSA_UNICODE_STRING> = bufs
+        .iter()
+        .map(|(b, bytes)| LSA_UNICODE_STRING {
+            Length: *bytes,
+            MaximumLength: *bytes,
+            Buffer: windows::core::PWSTR(b.as_ptr() as *mut u16),
+        })
+        .collect();
+    let status = f(policy, &rights);
+    let ret = if status.is_err() {
+        let gle = unsafe { LsaNtStatusToWinError(status) };
+        Err(anyhow::anyhow!(
+            "LSA account-rights call: win32 error {gle}"
+        ))
+    } else {
+        Ok(())
+    };
+    unsafe {
+        let _ = LsaClose(policy);
+    }
+    ret
+}
+
+/// Stamp [`LOGON_DENIALS`] on `group_sid` via LSA policy. Idempotent
+/// (adding an already-held right succeeds). Applied to the GROUP so
+/// custom-named accounts (`--sandbox-user`) inherit without extra
+/// plumbing. Local LSA policy — domain GPO can overwrite user-right
+/// assignments on refresh, which is why the install path re-asserts
+/// this on EVERY run (including the already-installed early-out),
+/// not only at first provisioning.
+pub fn apply_logon_denials(group_sid: &str) -> Result<()> {
+    use windows::Win32::Security::Authentication::Identity::LsaAddAccountRights;
+    let psid = sid::LocalPsid::from_string(group_sid)?;
+    with_lsa_rights(|policy, rights| unsafe { LsaAddAccountRights(policy, psid.as_psid(), rights) })
+        .context("LsaAddAccountRights")
+}
+
+/// Remove [`LOGON_DENIALS`] from `group_sid` (uninstall hygiene —
+/// the group is deleted right after, but orphaned LSA account-rights
+/// entries linger in the policy database otherwise). Best-effort.
+pub fn remove_logon_denials(group_sid: &str) -> Result<()> {
+    use windows::Win32::Security::Authentication::Identity::LsaRemoveAccountRights;
+    let psid = sid::LocalPsid::from_string(group_sid)?;
+    with_lsa_rights(|policy, rights| unsafe {
+        LsaRemoveAccountRights(policy, psid.as_psid(), false, Some(rights))
+    })
+    .context("LsaRemoveAccountRights")
 }
 
 #[cfg(test)]

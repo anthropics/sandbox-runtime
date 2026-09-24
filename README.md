@@ -116,7 +116,7 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 
 **Filesystem Isolation** enforces read and write restrictions:
 
-- **Read** (deny-then-allow pattern): By default, read access is allowed everywhere. You can deny broad regions (e.g., `/Users`) and then re-allow specific paths within them (e.g., `.`). `allowRead` takes precedence over `denyRead` — the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
+- **Read** (deny-then-allow pattern): By default, read access is allowed everywhere. You can deny broad regions (e.g., `/Users`) and then re-allow specific paths within them (e.g., `.`). `allowRead` takes precedence over `denyRead` — the opposite of write, where `denyWrite` takes precedence over `allowWrite`. A `denyRead` entry that is more specific than the `allowRead` region it falls inside (e.g. `denyRead: ["**/.env"]` or `["./secrets"]` with `allowRead: ["."]`) still stays denied.
 - **Write** (allow-only pattern): By default, write access is denied everywhere. You must explicitly allow paths (e.g., `.`, `/tmp`). An empty allow list means no write access.
 
 **Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
@@ -174,6 +174,52 @@ srt --debug curl https://example.com
 srt --settings /path/to/srt-settings.json npm install
 ```
 
+The settings file is optional — with no file at `~/.srt-settings.json`, `srt`
+runs with built-in defaults: no network access, no writes outside the default
+write paths, and unrestricted reads. A settings file that _is_ there but is
+empty, cannot be read, or does not validate is an error: `srt` says so and
+exits rather than falling back to those defaults, which are a different
+config rather than a weaker one — falling back would drop the file's
+`denyRead`, `allowRead` and credential rules along with everything else it
+said. The same goes for a file named with `--settings`, which must also
+exist.
+
+#### Updating the config while the command runs: `--control-fd`
+
+`--control-fd <fd>` reads config updates from a descriptor the caller has
+already opened, one JSON object per line in the same shape as the settings
+file. Each line replaces the whole config, but only the network lists
+(`allowedDomains` / `deniedDomains`) change what is already running: the
+proxy consults them per request. Filesystem rules are compiled into the
+sandbox at wrap time, so a line that changes them applies to nothing in the
+current run.
+
+```bash
+# fd 3 is the read end of a pipe the caller writes lines to
+srt --control-fd 3 -- npm test
+```
+
+- The descriptor must be an integer **3 or above** and readable — `0`-`2`
+  are the standard streams. srt exits with an error instead of running the
+  command when it cannot read the descriptor it was given, so a dead
+  channel never passes for a live one. A channel that dies before it has
+  delivered a single update takes the command down with it; one that dies
+  after says so and leaves the command running under the config last
+  applied.
+- A line that is not a valid config is reported on stderr and dropped; the
+  previous config stays in force.
+- srt **exits with the wrapped command** and does not wait for the writer
+  to close the descriptor. End of input is not an error either: the
+  command keeps running under the config last applied.
+- Give srt a **dedicated, read-only end**. srt puts a pipe or socket into
+  non-blocking mode, and that flag lives on the open file description, so
+  anything else holding the same description — a shell's `exec 3<fifo`, a
+  `pass_fds` of a descriptor the parent goes on using — gets `EAGAIN` from
+  its own blocking reads from then on.
+- On macOS and Linux the sandboxed command does not get the descriptor: srt
+  points that slot at `/dev/null` for the command, so nothing inside the
+  sandbox can read the updates or write a config of its own.
+
 ### As a library
 
 ```typescript
@@ -215,7 +261,9 @@ child.on('exit', async code => {
 })
 ```
 
-**Violation attribution (`commandLabel`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key derived from the command string, and `annotateStderrWithSandboxFailures(cmd, stderr)` / `getViolationsForCommand(cmd)` look them up by that same key. If the string you *execute* is not the string you *look up by* — e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'` but query by the raw `<cmd>` — pass the lookup string as `commandLabel` so the two keys match; otherwise no `<sandbox_violations>` block is ever produced:
+**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you _execute_ is not the command the invocation _represents_ (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`. A `commandId` you pass to `wrapWithSandbox` must be the same non-empty string you then pass to `annotateStderrWithSandboxFailures` / `getViolationsForCommand`; an empty one is treated as no `commandId` at all, so the key is the command.
+
+Only the key is cut to 100 characters. As of v0.0.76 the reported `command` — and the text `ignoreViolations` command patterns are matched against — is the whole command for an invocation wrapped without a `commandId`, not its first 100 characters; a pattern can therefore only suppress more than it did before, never less. An attribution key no invocation of this process registered (the carriers are writable from inside the sandbox) is reported sanitized and cut to that same key length.
 
 ```typescript
 const wrapped = await SandboxManager.wrapWithSandbox(
@@ -223,10 +271,13 @@ const wrapped = await SandboxManager.wrapWithSandbox(
   undefined,
   undefined,
   undefined,
-  { commandLabel: rawCommand }, // what you'll look violations up by
+  { commandId: invocationId, commandText: rawCommand },
 )
 // ... run it ...
-const annotated = SandboxManager.annotateStderrWithSandboxFailures(rawCommand, stderr)
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(
+  invocationId,
+  stderr,
+)
 ```
 
 #### Available exports
@@ -302,9 +353,18 @@ srt --settings /path/to/srt-settings.json <command>
 Uses an **allow-only pattern** - all network access is denied by default.
 
 - `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access. An optional `:port` suffix (`api.example.com:443`, `*.example.com:8443`) restricts an entry to that destination port; entries without a port match any port.
+  - IPv6 literals must be bracketed, RFC 3986-style: `[::1]`, `[2001:db8::1]:443`. An unbracketed multi-colon entry is rejected as ambiguous (`2001:db8::1:443` is itself a valid address).
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains). Same `:port` suffix, and a bare `*` (or `*:22`) is accepted for deny-all.
-- `network.deniedDomainReasons` - Optional map from a `deniedDomains` entry (matched by exact string) to a model-facing reason that appears in the `<sandbox_violations>` line when that entry denies a connection — say what is blocked and the sanctioned alternative (e.g. `{"github.com:22": "SSH pushes to GitHub are blocked; use an https:// remote"}`). Entries without a reason report a generic one.
+- `network.deniedDomainReasons` - Optional map from a `deniedDomains` entry (matched by exact string) to a model-facing reason that appears in the `<sandbox_violations>` line when that entry denies a connection — say what is blocked and the sanctioned alternative (e.g. `{"github.com:22": "SSH pushes to GitHub are blocked; use an https:// remote"}`). Entries without a reason report a generic one. For SSH destinations (port 22), the reason is also delivered in-band: an SSH client tunneled through a no-auth SOCKS ProxyCommand (e.g. BSD `nc -X 5`) receives a pre-key-exchange SSH disconnect whose description is the reason, which OpenSSH prints verbatim — keep such reasons under ~400 ASCII characters, imperative first, since OpenSSH truncates and escapes non-ASCII.
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
+
+**Resolved-address check.** The allow/deny lists match by _name_, but whoever controls a permitted name's DNS (or any label under a permitted wildcard) controls what it resolves to. So before dialing an allowed **hostname** directly, the proxy resolves it once, drops any address in a denied set, and connects to a surviving address (the address that passed the check is the one dialed — there is no second lookup). If nothing survives, the connection is refused like any other policy denial: HTTP/CONNECT get `403` (`X-Proxy-Error: blocked-by-sandbox-runtime`, the reason in the body), SOCKS gets "connection not allowed by ruleset", and a `deny network-outbound host:port (resolved to a loopback address)` line — naming the class of address (loopback, link-local, this host's, cloud metadata, deny-listed, listed, …), not the address itself, which only the debug log carries — is recorded in the violation store.
+
+The denied set is: loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0/8`, `::`), link-local (`169.254.0.0/16`, `fe80::/10`), multicast (`224.0.0.0/4`, `ff00::/8`), broadcast, the cloud instance-metadata / platform endpoints that live outside link-local (`100.100.100.200`, `168.63.129.16`, `192.0.0.192`, `fd00:ec2::/32`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `fd00:42::42`), every address currently assigned to one of this host's own network interfaces (a service bound to `0.0.0.0` answers on the LAN or global address exactly as it does on loopback), every IP literal listed in `deniedDomains` (honouring its `:port` if it has one), and anything in `deniedResolvedAddresses`. IPv4 entries also match the IPv6 forms that carry an IPv4 address — IPv4-mapped, IPv4-compatible and IPv4-translated addresses, the NAT64 well-known prefix (`64:ff9b::/96`) and 6to4 (`2002::/16`) are judged by the IPv4 address they embed. The local-use NAT64 prefix `64:ff9b:1::/48` and network-specific prefixes are not decoded — their layout (RFC 6052 allows the IPv4 in several positions) can't be recognised from the address alone; on such a network, list the prefix's translations of the ranges you deny (e.g. `<prefix>::a00:0/104` for `10.0.0.0/8`). Addresses that reach this host without being assigned to it — a cloud instance's 1:1-NAT public address, a router port-forward, a container or VM host-gateway alias — are not covered automatically; list them in `deniedResolvedAddresses`.
+
+What the check leaves alone: allowlist entries that **are** IP literals (allow-listing `127.0.0.1:3000` is an explicit choice) — and, by the same token, a hostname may resolve to an otherwise-denied address when that IP literal (on that port) is itself in `allowedDomains`, since reaching it by name grants nothing the literal entry does not (an IP literal in `deniedDomains` still wins, exactly as it does for a literal request). So a dev setup where `myapp.test` maps to a local server via `/etc/hosts` allow-lists `["myapp.test", "127.0.0.1:3000"]`; there is no separate carve-out list. `localhost` and names under `.localhost` resolve to loopback (or an allow-listed literal) and nothing else. The check is not evaluated for connections routed through `parentProxy` (including one picked up from `HTTP_PROXY` / `HTTPS_PROXY` in srt's own environment) or `mitmProxy` — that hop resolves the name and owns its own address policy — and it only governs what the proxy dials: on macOS, `allowLocalBinding` separately lets the sandboxed process connect to loopback ports without going through the proxy at all.
+
+- `network.deniedResolvedAddresses` - Extra IP addresses / CIDR ranges (IPv4 or IPv6, unbracketed, any port) that allowed hostnames must not resolve to. Private-use space is not denied by default because allow-listing an intranet hostname is legitimate; list it here when allow-listed names must stay out of it, e.g. `["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"]`. List IPv4 and IPv6 ranges separately — an IPv6 range broad enough to cover the IPv4-mapped block (`::ffff:0:0/96`), such as `::/0`, matches IPv4 answers on some runtimes but not others, so do not rely on it to deny IPv4.
 
 **TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.
 
@@ -352,6 +412,8 @@ Uses two different patterns:
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
 
+A few paths are writable without being listed: the child's stdio and `/tmp/claude`, and as a convenience `~/.npm/_logs` and `~/.claude/debug`. Those two home directories are dropped when a `denyRead` entry covers them (and kept when an `allowRead` entry beneath that deny re-opens them), so list them in `allowWrite` if you want them writable under a home read-deny.
+
 **Path Syntax (macOS):**
 
 Paths support git-style glob patterns on macOS, similar to `.gitignore` syntax:
@@ -371,21 +433,34 @@ Examples:
 
 **Path Syntax (Linux):**
 
-**Linux currently does not support glob matching.** Use literal paths only:
+bubblewrap binds concrete paths, so glob support is narrower than on macOS:
+
+- `allowWrite` / `denyWrite` take literal paths. A trailing `/**` is dropped (`src/**` means `src`); any other glob pattern there is skipped.
+- `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the entries that exist when the command is wrapped, so a file that appears later is not covered. The pattern needs a literal directory to start from (a relative pattern starts at the current directory): one with a wildcard in its first path component, such as `/**/*.pem` or `/opt*/keys/**`, is skipped on Linux. Only directories the pattern can match beneath are listed (`certs/*.pem` lists `certs` alone).
+- A directory matched by a `denyRead` pattern ending in `/**` that holds at least one entry when the command is wrapped becomes one tmpfs mount, like a directory listed in `denyRead` literally: inside the sandbox it is an EMPTY WRITABLE directory, so a command that used to write through a read-denied `build/` still writes, into the tmpfs, and loses that output when the command exits. A file added to the directory on the host afterwards is hidden too. A matched directory that is empty when the command is wrapped gets no mount (a matched symlink to a directory always gets one, on the directory it leads to). An `allowRead` beneath a mounted directory is bound back over the tmpfs, but each entry beneath it that the pattern matches keeps its own mask: under a `/**` pattern that is every entry there, so only what is created beneath the `allowRead` later is readable.
+- A directory the expansion cannot list is denied as a whole, and nothing is bound back beneath the mount that hides it, `allowRead` and `allowWrite` paths included: what the pattern matches under them cannot be found. A `denyRead` entry that cannot be inspected (its parent directory is readable but not searchable, say), or that leads to `/`, hides the nearest directory above it instead, in the same way.
+- Symlinked directories are descended. A directory is listed once for each way the pattern can carry on beneath it, however many links lead to it, so the cost of the expansion follows the size of the tree and the length of the pattern, not the number or length of the names its links offer; what is found through a link is reported, and denied, where it really is. A link that leads back up the tree (to the directory holding it or above, or to the pattern's starting directory or above) is not descended. A `**` written against other text (`**.pem`, `a**/x`) and a bracket expression that can match `/` span directories as they do on macOS, through symlinked directories too. Only a pattern that does not read as written is matched against real paths alone, with every directory under its starting directory listed: one with a wildcard inside a bracket expression (`[a*]`), or with a second `[` that nothing closes. A link that itself matches it still denies what it leads to. Every `denyRead` mount goes where the path really is (bubblewrap 0.12 and later refuse to mount on a symlink), so an entry reached through a symlink is denied under every name that leads to it, and a link back up the tree denies everything it reaches, as a literal deny of the link would. A link that resolves to nothing is skipped. `allowRead` globs are not expanded through symlinks: they match the link itself.
+- An `allowRead` or `allowWrite` path is bound back over a denied directory only where it really is, so no directory shows under a second name inside the sandbox.
+- `denyRead: ["/"]` denies each directory in `/` (`/proc`, `/dev` and `/sys` aside); a symlink there (`/bin`, `/lib` on a usr-merged system) gets no mount of its own, because what it leads to is denied together with the directory that holds it.
+
+Examples:
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
+- `"denyRead": ["**/build/**"]` - Deny read to every `build/` directory under the current directory
 - `"denyRead": ["/home"], "allowRead": ["."]` - Deny read to all of `/home`, but re-allow the current directory
 
 **All platforms:**
 
 - Paths can be absolute (e.g., `/home/user/.ssh`) or relative to the current working directory (e.g., `./src`)
 - `~` expands to the user's home directory
+- A deny glob must not end in a separator: the separator becomes part of the compiled pattern, so the pattern can match no path. `denyRead`, `denyWrite` and a `mode: "deny"` credential file reject such an entry at config validation — write `/data/*`, or add a `**` segment to match at any depth.
 
 #### Other Configuration
 
 - `ignoreViolations` - Object mapping command patterns to arrays of paths where violations should be ignored
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
+- `javaAgentJarPath` - macOS/Linux: absolute path to `srt-proxy-agent.jar`, the JVM agent injected via `JAVA_TOOL_OPTIONS` (see "JVM tools" under Network Isolation). Only needed by consumers that bundle sandbox-runtime and ship the jar separately; a normal npm install finds it under `vendor/java-proxy-agent/`.
 - `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service.
 - `allowAppleEvents` - Allow sending Apple Events and Launch Services open requests from the macOS sandbox (boolean, default: false). Without this, commands like `open`, `osascript`, and anything that opens URLs or scripts other apps via AppleScript fail with AppleScript error `-600` ("Application isn't running") or LaunchServices errors (`-10822`, `-54`). **Security warning:** enabling this means the sandbox no longer provides code-execution isolation. A sandboxed command can launch other applications via `open` with no user prompt, and anything it launches runs outside the sandbox's filesystem and network restrictions; scripting already-running apps via Apple Events is additionally gated by the user's per-app TCC automation consent. Embedders should only source this option from trusted user-level configuration — never from project-local files in a checked-out repository, which would let an attacker-authored project elevate its own sandbox permissions.
 
@@ -488,6 +563,10 @@ sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
 or add an AppArmor profile that grants `userns` to the relevant binaries.
 
+**Running as root:** a caller with euid 0 needs `CAP_SETFCAP` in its capability bounding set. Bubblewrap's user namespace maps the caller's uid, and Linux 5.12 — and the older distribution kernels that backported the change — lets a namespace map uid 0 only when its creator held that capability; the seccomp isolation layer's nested namespace has the same requirement. Without it every sandboxed command fails with `Operation not permitted` while writing a uid map, and `initialize()` refuses to start once bubblewrap has confirmed it. Grant the capability to the calling process — it is in Docker's default set, but `capsh --drop=cap_setfcap` and a tightened `CapabilityBoundingSet=` remove it — or run as a non-root user, for which none of this applies. The bounding set is what counts, because bubblewrap is reached by `execve` and the kernel recomputes a root caller's permitted set from it.
+
+Prefer a non-root caller where there is the choice. Under the seccomp isolation layer a root caller's command still holds a full capability set inside the helper's nested user namespace, which is identity-mapped to the caller's uid 0; what holds the filesystem policy there is that the nested namespace's copies of the mounts are locked, not the command's capabilities. A non-root caller's command holds no capabilities at all.
+
 **Optional Linux dependencies (for seccomp fallback):**
 
 The package includes pre-generated seccomp BPF filters for x86-64 and arm architectures. These dependencies are only needed if you are on a different architecture where pre-generated filters are not available:
@@ -520,7 +599,7 @@ Run once per machine (self-elevates; one UAC prompt):
 npx @anthropic-ai/sandbox-runtime windows-install
 ```
 
-This provisions the `srt-sandbox` local user account (with a random password stored DPAPI-encrypted under `%LOCALAPPDATA%\sandbox-runtime\state.db`), the `sandbox-runtime-users` local group, and installs a machine-wide WFP filter set keyed on the `srt-sandbox` SID. It is **idempotent** — re-running it rotates the sandbox account's password and reconciles the filter set.
+This provisions the `srt-sandbox` local user account (with a random password stored DPAPI-encrypted in `HKLM\SOFTWARE\sandbox-runtime` — machine-wide, so fleet installs running as SYSTEM work and one user's rotation updates the copy the others read), the `sandbox-runtime-users` local group, and installs a machine-wide WFP filter set keyed on the `srt-sandbox` SID. It is **idempotent** — re-running it rotates the sandbox account's password and reconciles the filter set.
 
 **No logout is required.** The WFP filters key on the dedicated sandbox account's SID, so your own network, services, and every other principal on the machine are unaffected.
 
@@ -542,7 +621,7 @@ Running under a distinct user SID structurally closes the surrogate-spawn class 
 - `filesystem.allowRead` → an inheriting `READ|EXECUTE` ALLOW ACE
 - `filesystem.denyRead` / `filesystem.denyWrite` → an inheriting DENY ACE on the target, plus an inheriting `FILE_DELETE_CHILD` DENY on its parent — together with the withheld `FILE_DELETE_CHILD` on the working-tree grant, this stops the sandboxed process from renaming or deleting a denied path via its parent directory
 
-`reset()` removes every ACE this session added (refcounted across concurrent hosts via `state.db`; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit). Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered.
+`reset()` removes every ACE this session added (refcounted across this user's concurrent hosts via the per-user session DB; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit). Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered.
 
 ### TLS termination on Windows
 
@@ -579,7 +658,7 @@ The cross-platform `filesystem` and `network` blocks apply as described above. W
 npx @anthropic-ai/sandbox-runtime windows-uninstall
 ```
 
-Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, and clears the credential/setup marker from `state.db` (one UAC prompt). `%LOCALAPPDATA%\sandbox-runtime\state.db` itself is left in place (it is ACL-stamped broker-only); delete the directory manually for a full sweep.
+Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, and removes the `HKLM\SOFTWARE\sandbox-runtime` key (credential, marker, CA record) — one UAC prompt. `%ProgramData%\sandbox-runtime` (the CA key material) is left in place; delete it (and `%LOCALAPPDATA%\sandbox-runtime` per user) manually for a full sweep.
 
 ## Development
 
@@ -625,6 +704,8 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 
 - **Windows**: A WFP `ALE_AUTH_CONNECT` filter blocks every outbound connect from the `srt-sandbox` account except loopback to the configured proxy port range. The proxies bind inside that range. Environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, …) point tools at the proxies, but the WFP filter is the boundary — a process that ignores or unsets them is still fenced.
 
+**JVM tools (macOS/Linux):** the JVM ignores `HTTPS_PROXY`/`NO_PROXY` and has no environment variable for proxy credentials — proxy selection comes from the `https.proxyHost` system properties and the credential can only be supplied through `java.net.Authenticator`. So JVM-based tools (Bazel's gRPC remote cache, Gradle, Maven, …) would otherwise dial the target directly and fail, or reach the proxy without its token and get a 407. To close that gap srt injects a small `-javaagent` via `JAVA_TOOL_OPTIONS` (the env var carries only the jar path, the credential stays in `HTTPS_PROXY`). At JVM start the agent sets `http[s].proxyHost`/`Port` and `http.nonProxyHosts` from the proxy env vars, re-enables Basic auth for CONNECT tunnels, and installs an Authenticator for the proxy endpoint. Explicit `-D` proxy properties on the JVM command line still win, and any inherited `JAVA_TOOL_OPTIONS` is preserved (unless it is a denied credential env var). Every JVM prints a `Picked up JAVA_TOOL_OPTIONS: …` line to stderr as a result; a jlink'd runtime built without the `java.instrument` module cannot load agents and will refuse to start under the sandbox — unset `JAVA_TOOL_OPTIONS` in the command for such a tool. The jar ships in the npm package as `vendor/java-proxy-agent/srt-proxy-agent.jar` (source: `vendor/java-proxy-agent-src/`; built by the release workflow, or locally with `npm run build:java-agent` — needs a JDK ≥ 17). If it is not found, `JAVA_TOOL_OPTIONS` is left alone and JVMs behave as before; bundlers can point at their own copy with `javaAgentJarPath`.
+
 ### Filesystem Isolation
 
 Filesystem restrictions are enforced at the OS level:
@@ -646,7 +727,25 @@ Filesystem restrictions are enforced at the OS level:
   - Empty `allowWrite: []` = no write access (nothing allowed)
   - `denyWrite` creates exceptions within allowed paths (deny takes precedence)
 
-**Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas.
+**Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas. On Linux that also holds when the `denyWrite` entry is at or above the `allowWrite` one — `allowWrite: ["/", "/work"]` with `denyWrite: ["/"]` leaves `/work` read-only rather than writable — and with debug logging on (`SRT_DEBUG`) the wrap logs a warning naming both paths.
+
+**Read-side rules (Linux):** an entry is matched by the name it is, not by what it points at.
+
+- An `allowRead` entry re-allows the name it names, so a link planted at an allowed path cannot re-open a denied one. One that is itself a symlink is bound back at its own name, from the target it was checked against: the target's own path stays hidden, and the target's contents are reachable only through the name. A `denyRead` entry or a credential mask that overlaps that target — at it, inside it, or covering it — wins over the carve-out, which is then not restored at all: the name is absent inside the sandbox rather than serving what the deny hides. The denied directory the carve-out is being restored into is not such an overlap, nor is anything above it: those are what the carve-out is an exception to. Neither is an entry that denies nothing — one naming a path that is not there, or a file an `allowRead` entry lifts.
+- A `denyRead` of `/` together with an `allowRead` of `/` denies nothing: the root deny is expanded into the root's children, and the allow covers every one of them.
+- A `denyRead` entry naming a FILE is lifted only by an `allowRead` entry naming that same file. An `allowRead` entry that is a symlink to it names the link, so it does not cancel the deny of its target.
+- A `denyRead` entry that cannot be inspected (a parent made unsearchable, a dead network mount) hides the deepest directory above it that can be — never `/`, so when `/` is the only one left the entry mounts nothing and that deny is not enforced (the wrap logs which entry, and why, under `SRT_DEBUG`). Such a stand-in hides more than was written: nothing beneath it is readable, carve-outs named there included, and a carve-out elsewhere that resolves beneath it is not restored either.
+
+**Write denies on paths that do not exist yet (Linux):** bubblewrap can only deny a path by mounting over it, so for a `denyWrite` path that is absent under a writable directory it first creates a mount point there: an empty, read-only file (or an empty directory for a missing intermediate component) that is visible on the host for as long as a sandbox is alive and is removed afterwards. Host tools therefore see such a path as existing while a sandboxed command runs, which matters for paths whose existence is their meaning (a lockfile such as `.git/config.lock` makes `git config` report "could not lock config file"). A process that dies without an exit event (`SIGKILL`, OOM) cannot remove its mount points. An empty regular file with no write bits found at a `denyWrite` path under a writable directory is taken to be such a leftover: it is covered with `/dev/null` like an absent path and removed after the command. A leftover empty directory cannot be told from anyone else's and is left alone.
+
+**Note (Linux, large profiles):** The wrapped string runs as one argument of `sh -c`, which Linux caps at 32 pages (128 KiB with 4 KiB pages). A profile that would not fit, with 4 KiB to spare for a prefix of the caller's own, has its mounts written to an unnamed file (`O_TMPFILE`) that the wrapping process holds open and bubblewrap reads through `--args`. The string then reads `/bin/sh -c '…' srt-args /proc/<wrapping pid>/fd/<n> bwrap … --args 9 …`: still a simple command, which opens the profile on fd 9 and runs bubblewrap. The environment and the command stay on the command line; the file holds mount paths only.
+
+- The profile is never given a name, so nothing can be put in its place between the wrap and the execution — not a command the process sandboxed, not a sandbox another process of the same user started with tmpdir writable, not a rename of a directory above `TMPDIR`. Every sandbox this library starts has its own PID namespace and a fresh `/proc`, so none of them can reach `/proc/<wrapping pid>` either.
+- Not covered: another process of the same user running outside a sandbox can read a pending profile through `/proc`. It can already read the wrapping process's memory, so this gives it nothing new.
+- The string must be run while the process that produced it is alive, and before the runtime cleans up after that command (`cleanupAfterCommand()`), which is when the profile is released.
+- The profile needs a directory that takes an `O_TMPFILE` file — `os.tmpdir()`, else `/dev/shm` — and a readable `/proc/self/fd`. Without them an over-long profile is refused at wrap time with the reason; there is no fallback to a named file. Profiles that fit the command line do not use any of this.
+- bubblewrap parses at most 9000 arguments (about 3000 mounts). A profile past that, or a command too long for one argument by itself, fails at wrap time with an error.
+- Every one of these wrap-time refusals is a `LinuxSandboxProfileError`, exported from the package root, with a `LinuxSandboxProfileErrorCode` on `.code` to tell the cases apart; branch on `.code` rather than on the message. They say the configuration expands to a profile this host cannot run, except `command_too_long` and `nul_in_path`, which also fire on what the embedding program passed in. A wrap that threw has already released what it held: do not call `cleanupAfterCommand()` for it, or a sandbox still running loses its mount points.
 
 ### Mandatory Deny Paths (Auto-Protected Files)
 
@@ -674,7 +773,13 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
-**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
+**Note (Linux):** A mandatory deny path that does not exist yet is blocked as well. bubblewrap covers it with a read-only `/dev/null`, or mounts an empty read-only directory at the first missing intermediate component, and those host mount points are removed by `cleanupAfterCommand()` — see "Write denies on paths that do not exist yet (Linux)" above. macOS uses glob patterns, which cover existing and new files alike.
+
+**Pinned directories (Linux):** Every existing ancestor of a protected path (a write-denied path, a read-denied file or directory, a masked credential file) up to the allowed write root covering it is made a mountpoint — "pinned" — and cannot be renamed or removed from inside the sandbox: `mv` or `rmdir` of such a directory (for example a nested repository's parent) fails with `EBUSY` ("Device or resource busy"), and `rm -rf` of a nested repository leaves the pinned directories and the protected files behind (as with `.git/hooks`). A pin is buried under the mounts above it, so it never appears on a lookup path: reads, writes, creation, renames and hard links inside or across a pinned directory are unaffected.
+
+With `allowWrite: ["/"]` the pins reach every ancestor, including any other allowed write root that is one (`mv /work /work.bak` fails with `EBUSY` given `allowWrite: ["/", "/work"]` and a protected path inside `/work`). They stop below the top-level directory, which is bound writable over them, and that directory is the one new filesystem boundary: `mv` or `ln` between two top-level directories — say `/tmp` and `/home` — fails with `EXDEV` ("Invalid cross-device link"), as it does on any host where they are separate filesystems. `mv` falls back to a copy; `ln` and a raw `rename(2)` do not.
+
+A wrap that carries no write restrictions at all — `filesystem.disabled` with credential masks still in force, or a library caller passing no write config while a `denyRead` entry or a mask still seeds a pin — is the same shape: the whole tree is bound writable, so it gets the same pins and the same top-level covers, and the same `EXDEV` boundary applies there too.
 
 **Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
 
@@ -769,7 +874,7 @@ Note: Custom proxy configuration is not yet supported in the new configuration f
 
 ### Security Limitations
 
-- Network Sandboxing Limitations: The network filtering system operates by restricting the domains that processes are allowed to connect to. It does not otherwise inspect the traffic passing through the proxy and users are responsible for ensuring they only allow trusted domains in their policy.
+- Network Sandboxing Limitations: The network filtering system operates by restricting the domains that processes are allowed to connect to. It does not otherwise inspect the traffic passing through the proxy and users are responsible for ensuring they only allow trusted domains in their policy. Allowed hostnames are additionally checked against a denied set of resolved addresses before a direct dial (see **Resolved-address check** above), so a permitted name cannot be pointed at loopback, link-local, this host's own addresses or an IP you listed in `deniedDomains`; other private ranges are only covered if you list them in `deniedResolvedAddresses` (a wildcard entry on a domain whose DNS you do not control can otherwise be aimed at services on your LAN), and connections that leave through `parentProxy`/`mitmProxy` rely on that hop for the equivalent check.
 
 <Warning>
 Users should be aware of potential risks that come from allowing broad domains like `github.com` that may allow for data exfiltration. Also, in some cases it may be possible to bypass the network filtering through [domain fronting](https://en.wikipedia.org/wiki/Domain_fronting).
@@ -788,5 +893,3 @@ Users should be aware of potential risks that come from allowing broad domains l
 **Future improvements:**
 
 - **Proxychains support**: Add support for `proxychains` with `LD_PRELOAD` on Linux to intercept network calls at a lower level, making bypass more difficult
-
-- **Linux violation monitoring**: Implement automatic `strace`-based violation detection for Linux, integrated with the violation store. Currently, Linux users must manually run `strace` to see violations, unlike macOS which has automatic violation monitoring via the system log store

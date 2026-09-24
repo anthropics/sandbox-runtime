@@ -3,21 +3,31 @@
  * This is the main configuration interface that consumers pass to SandboxManager.initialize()
  */
 
+import { isIP } from 'node:net'
 import type { FilterRequestCallback } from './request-filter.js'
 
-import { isAbsolute } from 'node:path'
+import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
 import { z } from 'zod'
 import {
   isInjectHostCoveredByAllowedDomains,
   splitDomainPatternPort,
   stripDomainPatternPort,
 } from './domain-pattern.js'
+import { parseAddressRange } from './address.js'
+import { containsGlobCharsForPlatform } from './sandbox-utils.js'
+import { getPlatform } from '../utils/platform.js'
 
 /**
  * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
  * protocols, paths, ports, and overly broad wildcards.
  */
 function isValidDomainPattern(val: string): boolean {
+  // A bare IPv6 literal as produced by splitDomainPatternPort for a
+  // bracketed entry (`[::1]`, `[2001:db8::1]:443` → `::1`, `2001:db8::1`).
+  // Whether the *raw* entry was bracketed is enforced separately
+  // (hasValidIpv6Bracketing) before the split.
+  if (isIP(val) === 6) return true
+
   // Reject protocols, paths, ports, etc.
   if (val.includes('://') || val.includes('/') || val.includes(':')) {
     return false
@@ -53,7 +63,7 @@ function isValidDomainPattern(val: string): boolean {
 }
 
 const DOMAIN_PATTERN_MESSAGE =
-  'Invalid domain pattern. Must be a valid domain (e.g., "example.com") or wildcard (e.g., "*.example.com"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
+  'Invalid domain pattern. Must be a valid domain (e.g., "example.com"), a wildcard (e.g., "*.example.com"), or a bracketed IPv6 literal (e.g., "[::1]", "[2001:db8::1]:443"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -68,10 +78,25 @@ const domainPatternSchema = z
  * "*.npmjs.org:8443"). Used for allowedDomains / deniedDomains, where the
  * proxy knows the destination port; an entry without a port matches any port.
  */
+/**
+ * Raw-entry rule applied before the port split: an entry with two or more
+ * colons is an IPv6 literal and must use RFC 3986 brackets (`[::1]`,
+ * `[::1]:443`). Unbracketed it is ambiguous — `2001:db8::1:443` is itself a
+ * valid 8-hextet address — so reject it and make the user say which they
+ * mean, rather than accept an entry that can silently match the wrong thing.
+ */
+function hasValidIpv6Bracketing(val: string): boolean {
+  const first = val.indexOf(':')
+  const multiColon = first !== -1 && val.indexOf(':', first + 1) !== -1
+  return !multiColon || val.startsWith('[')
+}
+
 const domainPortPatternSchema = z
   .string()
   .refine(
-    val => isValidDomainPattern(splitDomainPatternPort(val).hostPattern),
+    val =>
+      hasValidIpv6Bracketing(val) &&
+      isValidDomainPattern(splitDomainPatternPort(val).hostPattern),
     {
       message:
         DOMAIN_PATTERN_MESSAGE +
@@ -85,6 +110,7 @@ const domainPortPatternSchema = z
  */
 const deniedDomainPatternSchema = z.string().refine(
   val => {
+    if (!hasValidIpv6Bracketing(val)) return false
     const { hostPattern } = splitDomainPatternPort(val)
     return hostPattern === '*' || isValidDomainPattern(hostPattern)
   },
@@ -94,6 +120,14 @@ const deniedDomainPatternSchema = z.string().refine(
       ' In deniedDomains a bare "*" (deny-all) is also accepted, and an optional ":port" suffix (1-65535) restricts the entry to that port.',
   },
 )
+
+/** IP literal or CIDR range (`10.0.0.0/8`, `fc00::/7`, `169.254.169.254`). */
+const addressRangeSchema = z
+  .string()
+  .refine(v => parseAddressRange(v) !== undefined, {
+    message:
+      'Invalid IP address or CIDR range. Use an IPv4/IPv6 literal or CIDR, e.g. "10.0.0.0/8", "192.168.1.10", "fc00::/7" (IPv6 unbracketed).',
+  })
 
 /**
  * Schema for filesystem paths
@@ -633,11 +667,7 @@ export const Sigv4ConfigSchema = z
  * Credentials configuration schema for validation.
  *
  * Declares credential sources (files and environment variables) with a
- * per-source mode:
- * - `deny` blocks the source inside the sandbox (file reads are denied via the
- *   filesystem read-deny mechanism, env vars are unset in the child).
- *
- * Additional modes (e.g. `mask`) will be added in future releases.
+ * per-source mode; see {@link credentialModeSchema} for what each mode does.
  *
  * Only the sources declared here are affected; the section applies no
  * implicit restrictions beyond them.
@@ -716,9 +746,22 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'If true, permit network egress to any domain. deniedDomains is still ' +
         'enforced (checked before the allow-all decision), so explicit denies ' +
-        'still take effect. Intended for environments where filesystem ' +
+        'still take effect. IP literals and loopback names (localhost, ' +
+        '*.localhost) are not covered: they still need an allowedDomains ' +
+        'entry, and allowed hostnames remain subject to the resolved-address ' +
+        'check. Intended for environments where filesystem ' +
         'restrictions are relied on as the primary boundary and the ' +
         'allowlist would otherwise need to enumerate the entire public web.',
+    ),
+  deniedResolvedAddresses: z
+    .array(addressRangeSchema)
+    .optional()
+    .describe(
+      'IP addresses / CIDR ranges (IPv4 or IPv6, unbracketed) that an allowed HOSTNAME must not resolve to, ' +
+        'in addition to the built-in set (see README "Resolved-address check") and any IP literal listed in ' +
+        'deniedDomains. A permitted name that resolves only into these is refused instead of dialed. A name may ' +
+        'resolve to a denied address only if that IP literal (and port) is itself in allowedDomains. Not evaluated ' +
+        'for connections routed through parentProxy (including one taken from HTTP_PROXY/HTTPS_PROXY) or mitmProxy (that hop resolves the name).',
     ),
   allowUnixSockets: z
     .array(z.string())
@@ -798,7 +841,7 @@ export const NetworkConfigSchema = z.object({
             'configured to trust this CA, and the TLS-terminating proxy uses ' +
             'it to sign per-host certificates. If omitted, on Windows SRT ' +
             'generates-if-absent a persistent CA under ' +
-            '%LOCALAPPDATA%\\sandbox-runtime\\ca\\ and trusts it in the ' +
+            '%ProgramData%\\sandbox-runtime\\ca\\ and trusts it in the ' +
             "sandbox user's Root store; on other platforms SRT generates " +
             'an ephemeral CA into a temp directory for the lifetime of the ' +
             'session.',
@@ -1039,6 +1082,37 @@ export const SeccompConfigSchema = z.object({
 })
 
 /**
+ * An inert deny is fail-open, so a deny glob whose trailing separator leaves
+ * it matching nothing is rejected; the same glob as an allow fails closed,
+ * so the allow lists keep the plain path schema.
+ */
+function addInertSlashedDenyGlobIssue(
+  value: string,
+  path: (string | number)[],
+  ctx: z.RefinementCtx,
+): void {
+  const onWindows = getPlatform() === 'windows'
+  const trailingSeparator = onWindows ? /[\\/]+$/ : /\/+$/
+  if (!trailingSeparator.test(value)) return
+  if (!containsGlobCharsForPlatform(value)) return
+  // Only absolute and `~`-rooted spellings reach a backend with the
+  // separator still attached: normalizePathForSandbox resolves a relative
+  // spelling through path.resolve, which drops it, so `build/*/` is live.
+  const rooted = onWindows
+    ? win32Path.isAbsolute(value)
+    : posixPath.isAbsolute(value)
+  if (!rooted && !value.startsWith('~')) return
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    path,
+    message:
+      `Deny glob "${value}" ends in a separator, so the pattern can match ` +
+      `no path. Write "${value.replace(trailingSeparator, '')}", or add a ` +
+      `"**" segment to match at any depth.`,
+  })
+}
+
+/**
  * Main configuration schema for Sandbox Runtime validation
  */
 export const SandboxRuntimeConfigSchema = z
@@ -1110,6 +1184,14 @@ export const SandboxRuntimeConfigSchema = z
         'Linux only: absolute path to the socat binary. ' +
           'When set, this path is used directly instead of resolving "socat" via PATH.',
       ),
+    javaAgentJarPath: binaryPathSchema
+      .optional()
+      .describe(
+        'macOS/Linux: absolute path to srt-proxy-agent.jar, the JVM agent ' +
+          'injected via JAVA_TOOL_OPTIONS so Java tools honor the proxy. ' +
+          'When set, used instead of looking under vendor/java-proxy-agent/. ' +
+          'For consumers that bundle sandbox-runtime and ship the jar separately.',
+      ),
     windows: WindowsConfigSchema.optional().describe(
       'Windows-specific settings (WFP sublayer, proxy port range).',
     ),
@@ -1120,6 +1202,20 @@ export const SandboxRuntimeConfigSchema = z
     ),
   })
   .superRefine((cfg, ctx) => {
+    // filesystem.disabled drops every filesystem rule, the credential file
+    // denies included (getFsReadConfig, getFsWriteConfig and
+    // computeWindowsFsAccessSet all short-circuit on it), so an inert deny
+    // under it is not a hole.
+    const fsEnforced = !cfg.filesystem.disabled
+    if (fsEnforced) {
+      for (const [idx, p] of cfg.filesystem.denyRead.entries()) {
+        addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyRead', idx], ctx)
+      }
+      for (const [idx, p] of cfg.filesystem.denyWrite.entries()) {
+        addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyWrite', idx], ctx)
+      }
+    }
+
     const creds = cfg.credentials
     if (!creds) return
 
@@ -1317,6 +1413,15 @@ export const SandboxRuntimeConfigSchema = z
             `directory. Use mode "deny" for "${f.path}", or point at the ` +
             `credential file inside it.`,
         })
+      }
+      // A `mode: 'deny'` path is unioned into the read-deny set and takes
+      // the same glob branches as filesystem.denyRead.
+      if (fsEnforced && f.mode === 'deny') {
+        addInertSlashedDenyGlobIssue(
+          f.path,
+          ['credentials', 'files', idx, 'path'],
+          ctx,
+        )
       }
     }
 
