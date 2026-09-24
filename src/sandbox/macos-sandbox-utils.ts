@@ -3,14 +3,18 @@ import { spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
+import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   normalizePathForSandbox,
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
+  attributionKeyFor,
   encodeSandboxedCommand,
   decodeSandboxedCommand,
   containsGlobChars,
   globToRegex,
+  denyGlobRegex,
+  isStrictlyUnder as isPathStrictlyUnder,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -40,6 +44,8 @@ export interface MacOSSandboxParams {
   proxyAuthToken?: string
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
+  /** Path to the JVM proxy agent jar; injected via JAVA_TOOL_OPTIONS. */
+  javaAgentJarPath?: string
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
@@ -56,6 +62,13 @@ export interface MacOSSandboxParams {
    * lands. fakePath is unused here.
    */
   maskedFileBinds?: Array<{ realPath: string; fakePath: string }>
+  /**
+   * Masked files that degraded to a read-deny because their extract
+   * pattern matched nothing under `onExtractNoMatch: 'deny'`. Denied as
+   * literals, like {@link maskedFileBinds}: each is a file the library
+   * opened, not a spelling to match.
+   */
+  degradeToDenyPaths?: readonly string[]
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
@@ -70,36 +83,49 @@ export interface MacOSSandboxParams {
 }
 
 /**
- * Get mandatory deny patterns as glob patterns (no filesystem scanning).
- * macOS sandbox profile supports regex/glob matching directly via globToRegex().
+ * The mandatory write denies (no filesystem scanning). Each name appears
+ * twice: once as the path in the cwd, and once as a pattern for the same
+ * name anywhere beneath it, which macOS matches via a regex.
+ *
+ * Both are anchored at the cwd, and the cwd is a name on disk that may
+ * contain `[`, `*` or `?`. So the first is a literal entry, and the second
+ * carries the cwd as its anchor — only the `**\/<name>` tail is pattern.
+ * Compiled as one glob, a cwd like `a[b/c]d` would turn into a character
+ * class and every one of these denies would match nothing.
  */
-export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
-  const cwd = process.cwd()
-  const denyPaths: string[] = []
+export function macGetMandatoryDenyEntries(
+  allowGitConfig = false,
+): PathEntry[] {
+  const cwd = normalizePathForSandbox(process.cwd(), { literal: true })
+  const entries: PathEntry[] = []
+  const literal = (relativePath: string): PathEntry =>
+    toLiteralPathEntry(path.resolve(cwd, relativePath))
+  const beneathCwd = (pattern: string): PathEntry =>
+    anchoredGlobEntry(cwd, pattern)
 
   // Dangerous files - static paths in CWD + glob patterns for subtree
   for (const fileName of DANGEROUS_FILES) {
-    denyPaths.push(path.resolve(cwd, fileName))
-    denyPaths.push(`**/${fileName}`)
+    entries.push(literal(fileName))
+    entries.push(beneathCwd(`**/${fileName}`))
   }
 
   // Dangerous directories
   for (const dirName of getDangerousDirectories()) {
-    denyPaths.push(path.resolve(cwd, dirName))
-    denyPaths.push(`**/${dirName}/**`)
+    entries.push(literal(dirName))
+    entries.push(beneathCwd(`**/${dirName}/**`))
   }
 
   // Git hooks are always blocked for security
-  denyPaths.push(path.resolve(cwd, '.git/hooks'))
-  denyPaths.push('**/.git/hooks/**')
+  entries.push(literal('.git/hooks'))
+  entries.push(beneathCwd('**/.git/hooks/**'))
 
   // Git config - conditionally blocked based on allowGitConfig setting
   if (!allowGitConfig) {
-    denyPaths.push(path.resolve(cwd, '.git/config'))
-    denyPaths.push('**/.git/config')
+    entries.push(literal('.git/config'))
+    entries.push(beneathCwd('**/.git/config'))
   }
 
-  return [...new Set(denyPaths)]
+  return entries
 }
 
 export interface SandboxViolationEvent {
@@ -125,13 +151,358 @@ function generateLogTag(command: string): string {
 }
 
 /**
- * SBPL path filter for a normalized path: `regex` for glob patterns,
+ * SBPL path filter for a normalized entry: `regex` for glob patterns,
  * `subpath` (the path and everything beneath it) otherwise.
  */
-function pathFilter(normalizedPath: string): string {
-  return containsGlobChars(normalizedPath)
-    ? `(regex ${escapePath(globToRegex(normalizedPath))})`
-    : `(subpath ${escapePath(normalizedPath)})`
+function pathFilter(entry: PathEntry): string {
+  return entry.glob
+    ? `(regex ${escapePath(globRegex(entry))})`
+    : `(subpath ${escapePath(entry.path)})`
+}
+
+/**
+ * Compiles `entry`'s pattern with one of the shared string compilers in
+ * `sandbox-utils.ts`. An entry the library anchored at a directory
+ * (`anchor`) keeps that directory as a literal — the cwd is a name on disk
+ * and may itself contain `[`, `*` or `?` — so only the tail below it goes
+ * through the compiler, and the anchor is spliced back in escaped. Every
+ * compiler there returns '^…$'.
+ *
+ * This is the whole difference between the entry-taking wrappers here and
+ * the string-taking compilers they call: those see a spelling in which
+ * every character is glob syntax, which is right for what a caller wrote
+ * and wrong for what the library computed.
+ */
+function anchorRegex(
+  entry: GlobPathEntry,
+  compile: (glob: string) => string,
+): string {
+  if (entry.anchor === undefined) return compile(entry.path)
+  const pattern = entry.path.slice(entry.anchor.length)
+  return `^${escapeRegexLiteral(entry.anchor)}${compile(pattern).slice(1)}`
+}
+
+/** The regex for a glob entry: {@link globToRegex}, anchor respected. */
+function globRegex(entry: GlobPathEntry): string {
+  return anchorRegex(entry, globToRegex)
+}
+
+/**
+ * The regex for a glob entry used in a DENY rule: {@link denyGlobRegex},
+ * anchor respected. That is {@link globToRegex} plus an optional `/…` tail,
+ * so the deny covers everything beneath each match the way `subpath` does
+ * for literals. Callers strip a trailing `/**` before the pattern gets here
+ * (removeTrailingGlobSuffix), so `**\/secrets/**` arrives as `**\/secrets`
+ * and, matched exactly, would deny only the directory vnode while
+ * `secrets/key` stayed readable. This is what the Linux backend already
+ * does (a deny masks the whole subtree). Only ever widens a deny.
+ */
+function denyGlobEntryRegex(entry: GlobPathEntry): string {
+  return anchorRegex(entry, denyGlobRegex)
+}
+
+/** {@link pathFilter} for deny rules: globs get {@link denyGlobEntryRegex}. */
+function denyPathFilter(entry: PathEntry): string {
+  return entry.glob
+    ? `(regex ${escapePath(denyGlobEntryRegex(entry))})`
+    : `(subpath ${escapePath(entry.path)})`
+}
+
+/**
+ * A concrete path shaped like the ones `entry` matches (every glob segment
+ * replaced by a literal `x`), used to test whether a deny regex covers the
+ * region an allow / write root points at. An anchored glob's anchor, and a
+ * literal entry's whole path, are names on disk and stay as they are.
+ */
+function entrySamplePath(entry: PathEntry): string {
+  if (!entry.glob) return entry.path
+  const anchor = entry.anchor ?? ''
+  return (
+    anchor + entry.path.slice(anchor.length).replace(/\[[^\]]*\]|[*?]+/g, 'x')
+  )
+}
+
+/**
+ * Narrow `filter` so it no longer matches anything covered by `carveOuts`
+ * (each an SBPL path filter). Used to re-emit a deny after the allows it
+ * would otherwise clobber, minus exactly the allow entries it overlaps —
+ * a deny minus carve-outs never matches anything the un-carved deny did
+ * not, so this stays deny-only.
+ */
+function carveFilter(filter: string, carveOuts: readonly string[]): string {
+  // Dedupe: the project dir is routinely both an allowRead entry and a
+  // write root.
+  const unique = [...new Set(carveOuts)]
+  if (unique.length === 0) return filter
+  const nots = unique.map(c => `(require-not ${c})`).join(' ')
+  return `(require-all ${filter} ${nots})`
+}
+
+/**
+ * One denyOnly / allowWithinDeny / allowWrite entry after normalization.
+ * Whether `path` is a pattern or a name on disk is decided once, by
+ * whoever produced the spelling — a caller's pattern or a path the library
+ * resolved — and is never re-derived from the characters in `path`: a
+ * resolved name may itself contain `[`, `*` or `?`.
+ */
+export type PathEntry =
+  | { glob: false; path: string }
+  | {
+      glob: true
+      path: string
+      /**
+       * Set when the library anchored this glob at a directory of its own
+       * (the cwd, for the mandatory `**\/<name>` patterns): the prefix of
+       * `path` that is a literal path rather than part of the pattern.
+       */
+      anchor?: string
+    }
+
+/** The {@link PathEntry} members that carry a pattern. */
+type GlobPathEntry = Extract<PathEntry, { glob: true }>
+
+/** A pattern the library joined onto a literal directory of its own. */
+function anchoredGlobEntry(anchor: string, pattern: string): PathEntry {
+  return { glob: true, path: path.join(anchor, pattern), anchor }
+}
+
+/**
+ * A spelling that came from the caller's config: `*`, `?` and `[…]` in
+ * what the caller wrote are the glob syntax it asked for. The decision is
+ * made on that raw spelling, because resolving a relative or `~` path can
+ * splice in a cwd or home directory whose own name contains those
+ * characters — read back, they would turn the caller's `secrets` into a
+ * pattern that never matches the directory it was resolved to.
+ */
+function toPathEntry(pathPattern: string): PathEntry {
+  return containsGlobChars(pathPattern)
+    ? { glob: true, path: normalizePathForSandbox(pathPattern) }
+    : {
+        glob: false,
+        path: normalizePathForSandbox(pathPattern, { literal: true }),
+      }
+}
+
+/**
+ * A path the library itself produced: joined onto the cwd, or resolved to
+ * a file it opened. It names one file or directory, so it compiles to a
+ * `subpath` filter whatever characters it contains — sniffed as a pattern,
+ * a component like `a[b` would become a character class and the filter
+ * would no longer match the path it was built from (the rule would be
+ * inert). Never use this for a caller's spelling.
+ */
+function toLiteralPathEntry(literalPath: string): PathEntry {
+  return {
+    path: normalizePathForSandbox(literalPath, { literal: true }),
+    glob: false,
+  }
+}
+
+/** Does a subtree-extended deny glob regex cover `entry`'s region? */
+function denyGlobCovers(denyRegex: RegExp, entry: PathEntry): boolean {
+  return denyRegex.test(entrySamplePath(entry))
+}
+
+/** Is `entry`'s region strictly inside the literal directory `dir`? */
+function isStrictlyUnder(entry: PathEntry, dir: string): boolean {
+  return isPathStrictlyUnder(entrySamplePath(entry), dir)
+}
+
+/**
+ * The read config with every entry normalized once, shared by the read
+ * section ({@link generateReadRules}) and the trailing unlink re-denies
+ * ({@link generateReadDenyUnlinkRules}) so both reason about the same
+ * spellings.
+ */
+interface ResolvedReadConfig {
+  denies: PathEntry[]
+  allows: PathEntry[]
+  writeRoots: PathEntry[]
+}
+
+function resolveReadConfig(
+  config: FsReadRestrictionConfig,
+  writeAllowPaths: readonly string[] | undefined,
+  /**
+   * Read denies the library resolved itself — the masked credential files,
+   * which macOS degrades to a deny. Already literal: each names the file
+   * that was found, not a pattern to match.
+   */
+  libraryDenies: readonly PathEntry[],
+): ResolvedReadConfig {
+  return {
+    denies: [...(config.denyOnly || []).map(toPathEntry), ...libraryDenies],
+    // Non-glob spellings arrive slash-free from normalizePathForSandbox —
+    // the nested-deny re-emit matches by `path + '/'` prefix, which a
+    // preserved trailing slash would defeat ('<dir>//').
+    allows: (config.allowWithinDeny || []).map(toPathEntry),
+    writeRoots: (writeAllowPaths || []).map(toPathEntry),
+  }
+}
+
+/**
+ * The denies that must land AFTER the allowWithinDeny allows, because
+ * Seatbelt is last-match-wins and the allow block would otherwise re-open
+ * them. Each comes back as the SBPL filter to emit:
+ *
+ * - A literal deny nested inside a literal allow (`~/proj/secrets` under
+ *   `~/proj`), re-emitted as-is.
+ * - Every glob deny, minus (`require-not`) each allow entry the glob's own
+ *   regex covers. A leaf-shaped glob (`**\/.env`, `/**\/*.key`) covers no
+ *   directory allow, so it comes back whole and beats the directory allows
+ *   it lands inside — the fix for globs being silently re-allowed. A
+ *   region-shaped glob (`~/**\/*` with allowRead carve-outs) covers its
+ *   carve-outs, so they are subtracted and its behavior is unchanged. A
+ *   glob that covers a specific FILE allow (a user carve-out, or the
+ *   TLS-termination trust bundle sandbox-manager adds to allowWithinDeny,
+ *   which a `/**\/*.crt` deny would otherwise sever) keeps that one file
+ *   readable without any allow being emitted after the denies.
+ *
+ * Every filter here is a deny or a narrower deny: nothing this function
+ * produces can make a path readable that is not readable today. Keep it
+ * that way — the moment an `(allow file-read* …)` is appended after this
+ * block, every deny above it has to be re-audited against it.
+ *
+ * The coverage test (denyGlobCovers) fails closed by construction: every
+ * carve-out is an entry the allow block above already allows, so an
+ * unnecessary carve-out only reproduces today's behavior for that entry,
+ * and a missed one (e.g. a glob allow whose sample path the deny regex
+ * happens not to match) leaves the deny wider — never opens anything.
+ */
+function lateReadDenyFilters(resolved: ResolvedReadConfig): {
+  filters: string[]
+  /** Some emitted glob deny matches "/" itself (a `/*`-shaped pattern). */
+  coversRoot: boolean
+} {
+  const filters: string[] = []
+  let coversRoot = false
+  const literalAllowDirs = resolved.allows.filter(a => !a.glob).map(a => a.path)
+  for (const deny of resolved.denies) {
+    if (!deny.glob) {
+      if (literalAllowDirs.some(a => isStrictlyUnder(deny, a))) {
+        filters.push(denyPathFilter(deny))
+      }
+      continue
+    }
+    const denyRegex = new RegExp(denyGlobEntryRegex(deny))
+    if (denyRegex.test('/')) coversRoot = true
+    const carveOuts = resolved.allows
+      .filter(a => denyGlobCovers(denyRegex, a))
+      .map(a => pathFilter(a))
+    filters.push(carveFilter(denyPathFilter(deny), carveOuts))
+  }
+  return { filters, coversRoot }
+}
+
+/**
+ * Directory that bounds where a glob can match: its static prefix, or "/"
+ * for a root-anchored pattern like `/**\/*.key`.
+ */
+function globBaseDir(normalizedGlob: string): string {
+  const staticPrefix = normalizedGlob.split(/[*?[\]]/)[0]
+  if (!staticPrefix || staticPrefix === '/') return '/'
+  return staticPrefix.endsWith('/')
+    ? staticPrefix.slice(0, -1)
+    : path.dirname(staticPrefix)
+}
+
+/**
+ * Directory that bounds where `entry` can match: the anchor the library
+ * set, the static prefix of a pattern, or the path itself when it names
+ * one file or directory.
+ */
+function entryBaseDir(entry: PathEntry): string {
+  if (!entry.glob) return entry.path
+  return entry.anchor ?? globBaseDir(entry.path)
+}
+
+/**
+ * Trailing `(deny file-write-unlink …)` for read-denied paths that the
+ * write section may have re-opened. Emitted at the very end of the profile.
+ *
+ * generateReadRules() blocks moving a read-denied path (and its ancestors)
+ * out from under its deny, but then re-allows file-write-unlink /
+ * file-write-create for every allowWrite root so `rm` works inside the
+ * project (#171). Any read-denied path INSIDE a write root is therefore
+ * movable again: `mv .env x; cat x`, or `mv secrets s2; cat s2/key`,
+ * defeats both glob and literal denies. This re-denies unlink (rename
+ * source / rm) — not create, so new files can still be made; a new `.env`
+ * is still read-denied by name — for:
+ *
+ * - every glob deny whose region intersects a write root, minus the allow
+ *   entries and write roots the glob itself covers (a region glob like
+ *   `~/**\/*` must not re-block `rm` inside carve-outs it was already
+ *   subtracting; a leaf glob like `**\/.env` covers none of them);
+ * - every literal deny strictly below a write root, minus any allow entry
+ *   or write root nested strictly inside it;
+ * - the literal ancestor directories of each of those (for a glob, its
+ *   static-prefix directory and that directory's ancestors) that sit
+ *   strictly below a write root — the directory vnodes only, so `rm` of
+ *   unrelated siblings still works but the enclosing directory cannot be
+ *   renamed out from under the deny. Ancestors at or above a write root
+ *   are left alone: the deny above already covers them, and re-denying the
+ *   root itself would block unrelated `rm`s.
+ *
+ * A literal deny not below any write root needs nothing: the read
+ * section's move-blocking deny still holds for it. Deny-only, like the
+ * rest of this file's read handling.
+ */
+function generateReadDenyUnlinkRules(
+  resolved: ResolvedReadConfig,
+  logTag: string,
+): string[] {
+  const { denies, allows, writeRoots } = resolved
+  if (writeRoots.length === 0) return []
+
+  const writeRootRegexes = writeRoots
+    .filter((w): w is GlobPathEntry => w.glob)
+    .map(w => new RegExp(globRegex(w)))
+  const literalWriteRoots = writeRoots.filter(w => !w.glob).map(w => w.path)
+  const strictlyBelowWriteRoot = (p: string): boolean =>
+    literalWriteRoots.some(w => isStrictlyUnder({ path: p, glob: false }, w)) ||
+    writeRootRegexes.some(re => re.test(p))
+  const carveOutsInside = (dir: string): string[] =>
+    [...allows, ...writeRoots]
+      .filter(e => isStrictlyUnder(e, dir))
+      .map(e => pathFilter(e))
+
+  const filters = new Set<string>()
+  const protectDirs = (dirs: string[]): void => {
+    for (const dir of dirs) {
+      if (strictlyBelowWriteRoot(dir)) {
+        filters.add(`(literal ${escapePath(dir)})`)
+      }
+    }
+  }
+
+  for (const deny of denies) {
+    if (deny.glob) {
+      const baseDir = entryBaseDir(deny)
+      const intersectsWriteRoot =
+        writeRootRegexes.length > 0 ||
+        literalWriteRoots.some(
+          w =>
+            baseDir === w ||
+            isStrictlyUnder({ path: baseDir, glob: false }, w) ||
+            isStrictlyUnder({ path: w, glob: false }, baseDir),
+        )
+      if (!intersectsWriteRoot) continue
+      const denyRegex = new RegExp(denyGlobEntryRegex(deny))
+      const carveOuts = [...allows, ...writeRoots]
+        .filter(e => denyGlobCovers(denyRegex, e))
+        .map(e => pathFilter(e))
+      filters.add(carveFilter(denyPathFilter(deny), carveOuts))
+      if (baseDir !== '/') {
+        protectDirs([baseDir, ...getAncestorDirectories(baseDir)])
+      }
+    } else {
+      if (!strictlyBelowWriteRoot(deny.path)) continue
+      filters.add(carveFilter(denyPathFilter(deny), carveOutsInside(deny.path)))
+      protectDirs(getAncestorDirectories(deny.path))
+    }
+  }
+
+  return renderRule('deny', ['file-write-unlink'], filters, logTag)
 }
 
 /**
@@ -177,6 +548,163 @@ function getAncestorDirectories(pathStr: string): string[] {
 }
 
 /**
+ * sandbox-exec rejects a string literal longer than 1025 bytes ("Error
+ * reading string"); the regexes built below stay well under that, since
+ * one oversized string invalidates the whole profile.
+ */
+const SBPL_STRING_MAX_BYTES = 900
+
+/**
+ * Below this many names, one regex is not shorter than the literal filters
+ * it would replace.
+ */
+const MIN_DENY_GROUP_SIZE = 4
+
+/** Escape a literal path component for use inside a regex. */
+function escapeRegexLiteral(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Literal deny paths of the shape `<dir>/<name>/<leaf>` that share `dir` and
+ * the same set of leaves, e.g. git's per-worktree registry
+ * `<gitdir>/worktrees/<name>/{commondir,config.worktree}` for every
+ * registered worktree.
+ */
+interface LiteralDenyGroup {
+  dir: string
+  names: string[]
+  leaves: string[]
+}
+
+/**
+ * Fold literal deny paths into {@link LiteralDenyGroup}s. Each group renders
+ * as one anchored regex per chunk of names instead of one `subpath` filter
+ * per path, so a directory with many same-shaped children costs bytes and
+ * profile compile time proportional to the names, not to the repeated
+ * absolute prefix (sandbox-exec compiles a few thousand path filters in
+ * seconds; a few dozen regexes in milliseconds). Globs, paths that do not
+ * fit a group of at least {@link MIN_DENY_GROUP_SIZE} names, and names too
+ * long for one regex are returned in `rest` unchanged.
+ */
+function groupLiteralDenyPaths(entries: readonly PathEntry[]): {
+  groups: LiteralDenyGroup[]
+  rest: PathEntry[]
+} {
+  const byDir = new Map<string, Map<string, Set<string>>>()
+  for (const entry of entries) {
+    if (entry.glob) continue
+    const entryPath = entry.path
+    const parent = path.dirname(entryPath)
+    const dir = path.dirname(parent)
+    if (dir === parent || parent === entryPath || dir === '/') continue
+    let names = byDir.get(dir)
+    if (!names) {
+      names = new Map()
+      byDir.set(dir, names)
+    }
+    const name = path.basename(parent)
+    let leaves = names.get(name)
+    if (!leaves) {
+      leaves = new Set()
+      names.set(name, leaves)
+    }
+    leaves.add(path.basename(entryPath))
+  }
+  const grouped = new Set<string>()
+  const groups: LiteralDenyGroup[] = []
+  for (const [dir, names] of byDir) {
+    const bySignature = new Map<string, LiteralDenyGroup>()
+    for (const [name, leafSet] of names) {
+      const leaves = [...leafSet].sort()
+      const signature = leaves.join('\0')
+      let group = bySignature.get(signature)
+      if (!group) {
+        group = { dir, names: [], leaves }
+        bySignature.set(signature, group)
+      }
+      group.names.push(name)
+    }
+    for (const group of bySignature.values()) {
+      const fixedLength =
+        regexLength(groupRegexPrefix(group)) + regexLength(groupDenyTail(group))
+      group.names = group.names.filter(
+        name =>
+          fixedLength + regexLength(escapeRegexLiteral(name)) <=
+          SBPL_STRING_MAX_BYTES,
+      )
+      if (group.names.length < MIN_DENY_GROUP_SIZE) continue
+      groups.push(group)
+      for (const name of group.names) {
+        for (const leaf of group.leaves) {
+          grouped.add(path.join(dir, name, leaf))
+        }
+      }
+    }
+  }
+  return {
+    groups,
+    rest: entries.filter(e => !grouped.has(e.path)),
+  }
+}
+
+/** Bytes a regex fragment occupies inside an SBPL string literal. */
+function regexLength(fragment: string): number {
+  return Buffer.byteLength(escapePath(fragment)) - 2
+}
+
+function groupRegexPrefix(group: LiteralDenyGroup): string {
+  return `^${escapeRegexLiteral(group.dir)}/(`
+}
+
+function groupDenyTail(group: LiteralDenyGroup): string {
+  return `)/(${group.leaves.map(escapeRegexLiteral).join('|')})(/.*)?$`
+}
+
+/**
+ * Regex filters for a {@link LiteralDenyGroup}, chunked so no regex exceeds
+ * {@link SBPL_STRING_MAX_BYTES}. `deny` matches each `<dir>/<name>/<leaf>`
+ * and everything beneath it (the `subpath` semantics of a literal deny);
+ * `pins` match each `<dir>/<name>` directory itself, the move-blocking
+ * literal a per-path deny would have added for its parent.
+ */
+function literalDenyGroupFilters(group: LiteralDenyGroup): {
+  deny: string[]
+  pins: string[]
+} {
+  const prefix = groupRegexPrefix(group)
+  const denyTail = groupDenyTail(group)
+  const pinTail = ')$'
+  const fixedLength = regexLength(prefix) + regexLength(denyTail)
+  const chunks: string[][] = []
+  let chunk: string[] = []
+  let chunkLength = 0
+  for (const name of group.names.map(escapeRegexLiteral)) {
+    const nameLength = regexLength(name) + (chunk.length === 0 ? 0 : 1)
+    if (
+      chunk.length > 0 &&
+      fixedLength + chunkLength + nameLength > SBPL_STRING_MAX_BYTES
+    ) {
+      chunks.push(chunk)
+      chunk = []
+      chunkLength = 0
+    }
+    chunk.push(name)
+    chunkLength += chunk.length === 1 ? regexLength(name) : nameLength
+  }
+  chunks.push(chunk)
+  const alternations = chunks.map(names => names.join('|'))
+  return {
+    deny: alternations.map(
+      names => `(regex ${escapePath(prefix + names + denyTail)})`,
+    ),
+    pins: alternations.map(
+      names => `(regex ${escapePath(prefix + names + pinTail)})`,
+    ),
+  }
+}
+
+/**
  * Generate deny rules for file movement (file-write-unlink) and creation
  * (file-write-create) to protect paths. This prevents bypassing read or write
  * restrictions by moving files/directories, and prevents replacing a
@@ -187,35 +715,37 @@ function getAncestorDirectories(pathStr: string): string[] {
  * protected paths commonly share most of their ancestors, and each distinct
  * filter both costs argv bytes and adds to sandbox-exec's compile time.
  *
- * @param pathPatterns - Array of path patterns to protect (can include globs)
+ * @param entries - Normalized entries to protect (literals and globs)
  * @param logTag - Log tag for sandbox violations
  * @returns Array of sandbox profile rule lines
  */
 function generateMoveBlockingRules(
-  pathPatterns: string[],
+  entries: readonly PathEntry[],
   logTag: string,
 ): string[] {
+  return renderRule(
+    'deny',
+    ['file-write-unlink', 'file-write-create'],
+    moveBlockingFilters(entries),
+    logTag,
+  )
+}
+
+/** The filters {@link generateMoveBlockingRules} emits, for normalized entries. */
+function moveBlockingFilters(entries: readonly PathEntry[]): Set<string> {
   const filters = new Set<string>()
 
-  for (const pathPattern of pathPatterns) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
-
+  for (const entry of entries) {
     // Block moving/renaming the denied path itself (or files matching the
-    // pattern)
-    filters.add(pathFilter(normalizedPath))
+    // pattern, and anything beneath them)
+    filters.add(denyPathFilter(entry))
 
-    let baseDir: string
-    if (containsGlobChars(normalizedPath)) {
-      // For glob patterns, block moves of the directory containing the
-      // pattern's static prefix, then of its ancestors
-      const staticPrefix = normalizedPath.split(/[*?[\]]/)[0]
-      if (!staticPrefix || staticPrefix === '/') continue
-      baseDir = staticPrefix.endsWith('/')
-        ? staticPrefix.slice(0, -1)
-        : path.dirname(staticPrefix)
+    const baseDir = entryBaseDir(entry)
+    if (entry.glob) {
+      // For glob patterns, block moves of the directory the pattern is
+      // bounded by, then of its ancestors
+      if (baseDir === '/') continue
       filters.add(`(literal ${escapePath(baseDir)})`)
-    } else {
-      baseDir = normalizedPath
     }
 
     // Block moves of ancestor directories
@@ -224,12 +754,7 @@ function generateMoveBlockingRules(
     }
   }
 
-  return renderRule(
-    'deny',
-    ['file-write-unlink', 'file-write-create'],
-    filters,
-    logTag,
-  )
+  return filters
 }
 
 /**
@@ -242,69 +767,57 @@ function generateMoveBlockingRules(
  *
  * In Seatbelt profiles, later rules take precedence, so we emit:
  *   (allow file-read*)        ← default: allow everything
- *   (deny file-read* ...)     ← deny broad regions
- *   (allow file-read* ...)    ← re-allow specific paths within denied regions
+ *   (deny file-read* ...)     ← deny everything in denyOnly
+ *   (allow file-read* ...)    ← re-allow allowWithinDeny
+ *   (deny file-read* ...)     ← re-emit the denies the allows would clobber:
+ *                               literal denies nested in an allow, and every
+ *                               glob deny minus the allows it covers
+ *                               (see lateReadDenyFilters)
+ *   (allow file-read* (literal "/"))  ← only if a deny covers "/" itself
+ *
+ * REVIEW INVARIANT: after the allowWithinDeny block, this function only
+ * ever adds denies (or narrows one with require-not). The one exception is
+ * the pre-existing literal-"/" re-allow, which matches exactly one vnode.
+ * Do not append another `(allow file-read* …)` layer here — every deny
+ * above it would then need re-auditing for re-open bypasses.
  */
 function generateReadRules(
-  config: FsReadRestrictionConfig | undefined,
+  resolved: ResolvedReadConfig | undefined,
   logTag: string,
-  writeAllowPaths?: string[],
 ): string[] {
-  if (!config) {
+  if (!resolved) {
     return [`(allow file-read*)`]
   }
 
   const rules: string[] = []
-  let deniesRoot = false
 
   // Start by allowing everything
   rules.push(`(allow file-read*)`)
 
   // Then deny specific paths
-  const denyFilters = new Set<string>()
-  for (const pathPattern of config.denyOnly || []) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
-    if (normalizedPath === '/') deniesRoot = true
-    denyFilters.add(pathFilter(normalizedPath))
-  }
+  const deniesRoot = resolved.denies.some(d => d.path === '/')
+  const denyFilters = new Set(resolved.denies.map(denyPathFilter))
   rules.push(...renderRule('deny', ['file-read*'], denyFilters, logTag))
 
-  // (subpath "/") denies the root inode itself; allowWithinDeny subpaths don't
-  // cover "/", so dyld aborts before exec. Re-allow the literal root so path
-  // traversal works. This exposes `ls /` dirent names but no subtree contents.
-  if (deniesRoot) {
-    rules.push(`(allow file-read* (literal "/"))`)
-  }
-
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
-  const allowedSubpaths: string[] = []
-  const allowFilters = new Set<string>()
-  for (const pathPattern of config.allowWithinDeny || []) {
-    // Non-glob spellings arrive slash-free from normalizePathForSandbox —
-    // the nested-deny re-emit below matches by `subpath + '/'` prefix,
-    // which a preserved trailing slash would defeat ('<dir>//').
-    const normalizedPath = normalizePathForSandbox(pathPattern)
-    if (!containsGlobChars(normalizedPath)) {
-      allowedSubpaths.push(normalizedPath)
-    }
-    allowFilters.add(pathFilter(normalizedPath))
-  }
+  const allowFilters = new Set(resolved.allows.map(a => pathFilter(a)))
   rules.push(...renderRule('allow', ['file-read*'], allowFilters, logTag))
 
-  // A literal denyOnly path nested inside a literal allowWithinDeny subpath
-  // would otherwise be re-allowed (last-match-wins). Re-emit it so the
-  // more-specific deny lands last. Glob denies aren't re-emitted: nesting
-  // of regex-vs-subpath isn't decidable here, and the schema's denyReadAlways
-  // is the explicit lever for that case.
-  const nestedDenyFilters = new Set<string>()
-  for (const denyPath of config.denyOnly || []) {
-    if (containsGlobChars(denyPath)) continue
-    const normalized = normalizePathForSandbox(denyPath)
-    if (allowedSubpaths.some(a => normalized.startsWith(a + '/'))) {
-      nestedDenyFilters.add(pathFilter(normalized))
-    }
+  // Denies the allow block would otherwise win over (last-match-wins) land
+  // here, after it. Must stay ahead of the file-read-metadata allow below.
+  const late = lateReadDenyFilters(resolved)
+  rules.push(
+    ...renderRule('deny', ['file-read*'], new Set(late.filters), logTag),
+  )
+
+  // (subpath "/") — or a re-emitted `/*`-shaped glob — denies the root inode
+  // itself; no allowWithinDeny entry covers "/", so dyld aborts before exec
+  // (#190). Re-allow the literal root, after the re-emitted denies so a
+  // glob landing later can't take it away again. This exposes `ls /` dirent
+  // names but no subtree contents.
+  if (deniesRoot || late.coversRoot) {
+    rules.push(`(allow file-read* (literal "/"))`)
   }
-  rules.push(...renderRule('deny', ['file-read*'], nestedDenyFilters, logTag))
 
   // Allow stat/lstat on all directories so that realpath() can traverse
   // path components within denied regions. Without this, C realpath() fails
@@ -312,12 +825,12 @@ function generateReadRules(
   // directory (e.g. /Users, /Users/chris) even if only a subdirectory like
   // ~/.local is in allowWithinDeny. This only allows metadata reads on
   // directories — not listing contents (readdir) or reading files.
-  if (config.denyOnly.length > 0) {
+  if (resolved.denies.length > 0) {
     rules.push(`(allow file-read-metadata`, `  (vnode-type DIRECTORY))`)
   }
 
   // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(config.denyOnly || [], logTag))
+  rules.push(...generateMoveBlockingRules(resolved.denies, logTag))
 
   // Re-allow file-write-unlink / file-write-create for paths that are explicitly
   // write-allowed. The move-blocking rules above emit broad
@@ -333,10 +846,11 @@ function generateReadRules(
   // generateMoveBlockingRules() runs later in the profile and re-denies
   // file-write-unlink for those paths (Seatbelt uses last-match-wins). This
   // depends on read rules being emitted before write rules in generateSandboxProfile().
-  const writeAllowFilters = new Set<string>()
-  for (const pathPattern of writeAllowPaths || []) {
-    writeAllowFilters.add(pathFilter(normalizePathForSandbox(pathPattern)))
-  }
+  //
+  // This re-allow also re-opens rename/rm of read-denied paths that sit
+  // INSIDE a write root; generateReadDenyUnlinkRules(), emitted at the end
+  // of the profile, takes those back.
+  const writeAllowFilters = new Set(resolved.writeRoots.map(pathFilter))
   rules.push(
     ...renderRule(
       'allow',
@@ -366,24 +880,50 @@ function generateWriteRules(
   // Generate allow rules
   const allowFilters = new Set<string>()
   for (const pathPattern of config.allowOnly || []) {
-    allowFilters.add(pathFilter(normalizePathForSandbox(pathPattern)))
+    allowFilters.add(pathFilter(toPathEntry(pathPattern)))
   }
   rules.push(...renderRule('allow', ['file-write*'], allowFilters, logTag))
 
-  // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
-  const denyPaths = [
-    ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(allowGitConfig),
+  // Combine user-specified and mandatory deny patterns (no ripgrep needed on
+  // macOS). The caller's spellings are patterns when they read as patterns;
+  // the mandatory entries carry their own literal/glob split.
+  const denyEntries = [
+    ...(config.denyWithinAllow || []).map(toPathEntry),
+    ...macGetMandatoryDenyEntries(allowGitConfig),
   ]
 
+  const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)
+  const groupFilters = groups.map(literalDenyGroupFilters)
+
   const denyFilters = new Set<string>()
-  for (const pathPattern of denyPaths) {
-    denyFilters.add(pathFilter(normalizePathForSandbox(pathPattern)))
+  for (const { deny } of groupFilters) {
+    for (const filter of deny) denyFilters.add(filter)
+  }
+  for (const entry of ungrouped) {
+    denyFilters.add(denyPathFilter(entry))
   }
   rules.push(...renderRule('deny', ['file-write*'], denyFilters, logTag))
 
-  // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(denyPaths, logTag))
+  // Block file movement to prevent bypass via mv/rename. A grouped path
+  // contributes its regex, the pin for its parent directory, and the
+  // literals for the group directory and its ancestors — the same set a
+  // per-path filter would add.
+  const moveFilters = moveBlockingFilters(ungrouped)
+  for (const [index, { deny, pins }] of groupFilters.entries()) {
+    for (const filter of [...deny, ...pins]) moveFilters.add(filter)
+    const { dir } = groups[index]
+    for (const ancestorDir of [dir, ...getAncestorDirectories(dir)]) {
+      moveFilters.add(`(literal ${escapePath(ancestorDir)})`)
+    }
+  }
+  rules.push(
+    ...renderRule(
+      'deny',
+      ['file-write-unlink', 'file-write-create'],
+      moveFilters,
+      logTag,
+    ),
+  )
 
   return rules
 }
@@ -393,6 +933,7 @@ function generateWriteRules(
  */
 function generateSandboxProfile({
   readConfig,
+  libraryDenyEntries,
   writeConfig,
   httpProxyPort,
   socksProxyPort,
@@ -408,6 +949,8 @@ function generateSandboxProfile({
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
+  /** Library-resolved read denies; see {@link resolveReadConfig}. */
+  libraryDenyEntries: readonly PathEntry[]
   writeConfig: FsWriteRestrictionConfig | undefined
   httpProxyPort?: number
   socksProxyPort?: number
@@ -691,14 +1234,36 @@ function generateSandboxProfile({
   // Read rules
   // Pass write-allowed paths so that move-blocking deny rules in the read section
   // can be overridden for paths where file deletion should be permitted.
-  const writeAllowPaths = writeConfig?.allowOnly
+  const resolvedRead =
+    readConfig || libraryDenyEntries.length > 0
+      ? resolveReadConfig(
+          readConfig ?? { denyOnly: [] },
+          writeConfig?.allowOnly,
+          libraryDenyEntries,
+        )
+      : undefined
   profile.push('; File read')
-  profile.push(...generateReadRules(readConfig, logTag, writeAllowPaths))
+  profile.push(...generateReadRules(resolvedRead, logTag))
   profile.push('')
 
   // Write rules
   profile.push('; File write')
   profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
+
+  // Read-denied paths inside write roots: the read section's unlink/create
+  // re-allow for write roots (and the write section's file-write* allows)
+  // must not leave them renameable. Last in the profile so nothing above
+  // can re-open them.
+  if (resolvedRead) {
+    const unlinkRules = generateReadDenyUnlinkRules(resolvedRead, logTag)
+    if (unlinkRules.length > 0) {
+      profile.push('')
+      profile.push(
+        '; File read: keep read-denied paths inside write roots in place',
+      )
+      profile.push(...unlinkRules)
+    }
+  }
 
   // Pseudo-terminal (pty) support
   if (allowPty) {
@@ -739,15 +1304,17 @@ export function wrapCommandWithSandboxMacOS(
     socksProxyPort,
     proxyAuthToken,
     caCertPath,
+    javaAgentJarPath,
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
-    readConfig: readConfigIn,
+    readConfig,
     writeConfig,
     unsetEnvVars,
     setEnvVars,
     maskedFileBinds,
+    degradeToDenyPaths,
     allowPty,
     allowGitConfig = false,
     gitSafeDirectories,
@@ -759,27 +1326,29 @@ export function wrapCommandWithSandboxMacOS(
   // SBPL cannot redirect a read to different bytes, so whole-file masking
   // degrades to read-deny on macOS: the sandboxed process gets EPERM
   // instead of the sentinel. The DYLD interposer (a later step) lifts
-  // this. Folding the masked paths into denyOnly here means the existing
-  // generateReadRules() emits the (deny file-read* …) rule unchanged.
-  let readConfig = readConfigIn
-  if (maskedFileBinds && maskedFileBinds.length > 0) {
+  // this. The paths go to generateReadRules() as LITERAL denies — each is
+  // a credential file the library located, not a spelling the caller wrote
+  // — and the existing (deny file-read* …) rule is emitted unchanged.
+  const maskedDenyPaths = maskedFileBinds?.map(b => b.realPath) ?? []
+  if (maskedDenyPaths.length > 0) {
     logForDebugging(
       '[Sandbox macOS] file mask degrades to deny on macOS until the ' +
         'interposer lands',
     )
-    readConfig = {
-      denyOnly: [
-        ...(readConfigIn?.denyOnly ?? []),
-        ...maskedFileBinds.map(b => b.realPath),
-      ],
-      allowWithinDeny: readConfigIn?.allowWithinDeny,
-    }
   }
+  // A masked file whose extract pattern stopped matching is denied the
+  // same way: the library opened both, so both are literals.
+  const libraryDenyEntries = [
+    ...maskedDenyPaths,
+    ...(degradeToDenyPaths ?? []),
+  ].map(toLiteralPathEntry)
 
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions =
+    (readConfig && readConfig.denyOnly.length > 0) ||
+    libraryDenyEntries.length > 0
   const hasWriteRestrictions = writeConfig !== undefined
   const hasEnvRestrictions =
     (unsetEnvVars !== undefined && unsetEnvVars.length > 0) ||
@@ -800,11 +1369,12 @@ export function wrapCommandWithSandboxMacOS(
   // Both correlation carriers (seatbelt log tag, proxy username) encode
   // the attribution key, which is the caller's commandId when the
   // executed string differs from the one violations are looked up by.
-  const attributionCommand = commandId ?? command
+  const attributionCommand = attributionKeyFor(command, commandId)
   const logTag = generateLogTag(attributionCommand)
 
   const profile = generateSandboxProfile({
     readConfig,
+    libraryDenyEntries,
     writeConfig,
     httpProxyPort,
     socksProxyPort,
@@ -830,23 +1400,37 @@ export function wrapCommandWithSandboxMacOS(
     encodeSandboxedCommand(attributionCommand),
   )
 
-  // Seatbelt's (remote ip "localhost:*") filter — used for the
-  // allowLocalBinding outbound rule above — matches 127.0.0.1 and ::1 but not
-  // the IPv4-mapped IPv6 form ::ffff:127.0.0.1. Modern Java defaults to
-  // AF_INET6 dual-stack sockets, so a Java client connecting to 127.0.0.1
-  // reaches the kernel as ::ffff:127.0.0.1 and is denied. Forcing the IPv4
-  // stack makes Java open AF_INET sockets so loopback connect matches the
-  // Seatbelt filter. The flag is appended after any inherited
-  // JAVA_TOOL_OPTIONS unless that var is on the credential-deny list, in
-  // which case the inherited value is dropped so the deny holds.
-  if (allowLocalBinding && needsNetworkRestriction) {
-    const flag = '-Djava.net.preferIPv4Stack=true'
-    const denied = (unsetEnvVars ?? []).includes('JAVA_TOOL_OPTIONS')
-    const inherited = denied ? '' : (process.env.JAVA_TOOL_OPTIONS ?? '')
-    const value = inherited.includes(flag)
-      ? inherited
-      : [inherited, flag].filter(Boolean).join(' ')
-    proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${value}`)
+  // JAVA_TOOL_OPTIONS carries two things for JVMs in the sandbox:
+  //
+  // - The proxy agent jar (see java-proxy-agent.ts): JVMs ignore the proxy
+  //   env vars above, so the agent translates them into system properties
+  //   plus an Authenticator for the proxy credential at JVM start.
+  // - -Djava.net.preferIPv4Stack=true whenever the profile lets the child
+  //   reach loopback at all (the proxy ports, or allowLocalBinding's
+  //   localhost:*): Seatbelt's (remote ip "localhost:N") filter matches
+  //   127.0.0.1 and ::1 but not the IPv4-mapped IPv6 form ::ffff:127.0.0.1.
+  //   Modern Java defaults to AF_INET6 dual-stack sockets, so a Java client
+  //   connecting to 127.0.0.1 reaches the kernel as ::ffff:127.0.0.1 and is
+  //   denied ("Operation not permitted") — including its connect to the
+  //   proxy the agent just pointed it at. Forcing the IPv4 stack makes Java
+  //   open AF_INET sockets so loopback connect matches the filter.
+  //
+  // Both are composed with any inherited JAVA_TOOL_OPTIONS unless that var
+  // is on the credential-deny list, in which case the inherited value is
+  // dropped so the deny holds.
+  const loopbackReachable =
+    needsNetworkRestriction &&
+    (allowLocalBinding ||
+      httpProxyPort !== undefined ||
+      socksProxyPort !== undefined)
+  const javaToolOptions = buildJavaToolOptions({
+    agentJarPath: javaAgentJarPath,
+    flags: loopbackReachable ? ['-Djava.net.preferIPv4Stack=true'] : [],
+    unsetEnvVars,
+    inherited: process.env.JAVA_TOOL_OPTIONS,
+  })
+  if (javaToolOptions !== undefined) {
+    proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${javaToolOptions}`)
   }
 
   // safe.directory (dubious-ownership) — `buildPosixGitSafeDirEnv`
@@ -901,8 +1485,8 @@ export function wrapCommandWithSandboxMacOS(
 
   logForDebugging(
     `[Sandbox macOS] Applied restrictions - network: ${!!(httpProxyPort || socksProxyPort)}, read: ${
-      readConfig
-        ? 'allowAllExcept' in readConfig
+      hasReadRestrictions
+        ? readConfig && 'allowAllExcept' in readConfig
           ? 'allowAllExcept'
           : 'denyAllExcept'
         : 'none'
@@ -924,11 +1508,14 @@ export function wrapCommandWithSandboxMacOS(
  */
 export function startMacOSSandboxLogMonitor(
   callback: SandboxViolationCallback,
-  ignoreViolations?: IgnoreViolationsConfig,
-  /** Map a decoded attribution key (commandId) to the command text it
-   *  represents; identity when omitted. Applied before ignoreViolations
-   *  matching and before the event's `command` is set. */
-  resolveCommandText: (decodedId: string) => string = id => id,
+  ignoreViolations: IgnoreViolationsConfig | undefined,
+  /** Map a decoded attribution key to the command text it represents, before
+   *  ignoreViolations matching and before the event's `command` is set. Only
+   *  the manager holds the registry that can do that, so it is required
+   *  rather than defaulted: a caller with no registry passes
+   *  `sanitizeUnregisteredCommandKey`, which treats the key as the untrusted
+   *  bytes it arrived as. */
+  resolveCommandText: (decodedKey: string) => string,
 ): () => void {
   // Pre-compile regex patterns for better performance
   const cmdExtractRegex = /CMD64_(.+?)_END/

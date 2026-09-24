@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
@@ -62,6 +68,10 @@ describe.if(isMacOS)('macOS Seatbelt profile size', () => {
     })
 
     expect(Buffer.byteLength(wrappedCommand)).toBeLessThan(MACOS_ARG_MAX / 2)
+
+    // Same-shaped groups fold into regexes: far below one filter per path.
+
+    expect(Buffer.byteLength(wrappedCommand)).toBeLessThan(64 * 1024)
   })
 
   it('spawns and enforces subpath, literal-ancestor and regex filters', () => {
@@ -90,5 +100,55 @@ describe.if(isMacOS)('macOS Seatbelt profile size', () => {
     expect(result.stderr).toContain(
       `${PROBED_GROUP}.moved: Operation not permitted`,
     )
+  })
+
+  // Glob denyRead entries are now rendered up to four times (base deny,
+  // re-emit after allowRead, move-blocking, trailing unlink re-deny). Pin
+  // the size at a few hundred of them, check the profile still compiles and
+  // enforces, and log how long wrapping + sandbox-exec startup take so a
+  // regression in either shows up in CI output.
+  it(`fits ${GROUPS * 2 + 100} glob denyRead entries and still enforces them`, () => {
+    const denyOnly: string[] = []
+    for (let i = 0; i < GROUPS; i++) {
+      denyOnly.push(
+        join(groupDir(i), '**', '*.secret'),
+        join(groupDir(i), '**', '.env'),
+      )
+    }
+    for (let i = 0; i < 100; i++) {
+      denyOnly.push(join(ALLOWED_DIR, `area${i}`, '**', 'credentials'))
+    }
+    const secretFile = join(PROBED_GROUP, 'x.secret')
+    const plainFile = join(PROBED_GROUP, 'x.plain')
+    writeFileSync(secretFile, 'SIZE_TEST_SECRET')
+    writeFileSync(plainFile, 'SIZE_TEST_PLAIN')
+
+    const wrapStart = performance.now()
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: `cat ${plainFile}; cat ${secretFile}; mv ${secretFile} ${secretFile}.moved; true`,
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly, allowWithinDeny: [ALLOWED_DIR] },
+      writeConfig: { allowOnly: [ALLOWED_DIR], denyWithinAllow: [] },
+    })
+    const wrapMs = performance.now() - wrapStart
+    expect(Buffer.byteLength(wrappedCommand)).toBeLessThan(MACOS_ARG_MAX / 2)
+
+    const spawnStart = performance.now()
+    const result = spawnSync('/bin/bash', ['-c', wrappedCommand], {
+      encoding: 'utf8',
+      timeout: 30000,
+    })
+    const spawnMs = performance.now() - spawnStart
+    console.log(
+      `[record] ${denyOnly.length} glob denies: profile ${Buffer.byteLength(wrappedCommand)} bytes, ` +
+        `wrap ${wrapMs.toFixed(1)}ms, sandbox-exec+command ${spawnMs.toFixed(0)}ms`,
+    )
+
+    expect(result.error).toBeUndefined()
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('SIZE_TEST_PLAIN')
+    expect(result.stdout).not.toContain('SIZE_TEST_SECRET')
+    expect(existsSync(secretFile)).toBe(true)
+    expect(existsSync(`${secretFile}.moved`)).toBe(false)
   })
 })

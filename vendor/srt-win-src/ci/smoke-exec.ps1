@@ -122,7 +122,10 @@ Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
 # timeout and (b) per-element ArgumentList quoting that survives
 # PATH-with-spaces.
 function RExec {
-  param([string[]] $tail)
+  # 120s: a row that starts Windows PowerShell as the sandbox user can take
+  # over 30s on some hosted runner images (powershell.exe is CPU-bound in
+  # startup the whole time, then finishes). A limit only matters on a hang.
+  param([string[]] $tail, [int] $TimeoutSec = 120)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
             '--env', "PATHEXT=$($env:PATHEXT)") + $tail
@@ -138,11 +141,25 @@ function RExec {
   # WaitForExit.
   $so = $p.StandardOutput.ReadToEndAsync()
   $se = $p.StandardError.ReadToEndAsync()
-  if (-not $p.WaitForExit(30000)) {
+  if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+    # Report through the host, not the exception: the error view truncates a
+    # long message, and the child's output and the processes it got as far as
+    # starting are what say where it stopped.
+    $since = $p.StartTime
+    Get-CimInstance Win32_Process |
+      Where-Object { $_.ProcessId -eq $p.Id -or $_.CreationDate -ge $since } |
+      Sort-Object CreationDate |
+      ForEach-Object {
+        Write-Host ("RExec timeout: proc pid={0} ppid={1} {2} cpu={3:n1}s" -f
+          $_.ProcessId, $_.ParentProcessId, $_.Name,
+          (($_.UserModeTime + $_.KernelModeTime) / 1e7))
+      }
     try { $p.Kill($true) } catch { }
     $p.WaitForExit()
-    throw ("RExec: TIMEOUT after 30s. argv: $($argv -join ' ')`n" +
-           "stderr: $($se.Result)`nstdout: $($so.Result)")
+    Write-Host "RExec timeout: argv tail: $($tail -join ' ')"
+    Write-Host "RExec timeout: stderr:`n$($se.Result)"
+    Write-Host "RExec timeout: stdout:`n$($so.Result)"
+    throw "RExec: TIMEOUT after ${TimeoutSec}s (child output above)"
   }
   $exit  = $p.ExitCode
   $raw   = $so.Result + $se.Result
@@ -222,10 +239,16 @@ Write-Host "R5 ok: outbound blocked for srt-sandbox (curl exit=$($r.exit))"
 $inRangeR = Bind-Listener ($PortHi..($PortLo+5))
 $portInR  = $inRangeR.LocalEndpoint.Port
 try {
+  # TcpClient, as in R5d/R5e, not Test-NetConnection: the cmdlet loads the
+  # NetTCPIP module and falls back to a ping, which roughly doubles the row.
+  # This is the first Windows PowerShell started as the sandbox user; log how
+  # long it took.
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
-    "(Test-NetConnection 127.0.0.1 -Port $portInR " +
-    "-WarningAction SilentlyContinue).TcpTestSucceeded")
-  if ($r.out -notmatch '(?i)\bTrue\b') {
+    "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portInR); Write-Output CONNECTED } " +
+    "catch { Write-Output blocked }")
+  Write-Host "R5b: first powershell.exe as srt-sandbox took $([int]$sw.Elapsed.TotalSeconds)s"
+  if ($r.out -notmatch 'CONNECTED') {
     throw "R5b: loopback to in-range port $portInR did not succeed. raw: $($r.raw)"
   }
   Write-Host "R5b ok: in-range loopback permitted for srt-sandbox (port=$portInR)"
@@ -238,9 +261,9 @@ $outRange = Bind-Listener (50000, 50001, 50002, 49999)
 $portOut  = $outRange.LocalEndpoint.Port
 try {
   $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
-    "(Test-NetConnection 127.0.0.1 -Port $portOut " +
-    "-WarningAction SilentlyContinue).TcpTestSucceeded")
-  if ($r.out -match '(?i)\bTrue\b') {
+    "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.1', $portOut); Write-Output CONNECTED } " +
+    "catch { Write-Output blocked }")
+  if ($r.out -match 'CONNECTED') {
     throw "R5c: loopback to out-of-range port $portOut succeeded. raw: $($r.raw)"
   }
   # Sanity: prove the listener was actually live (reachable from
@@ -256,17 +279,87 @@ try {
   $outRange.Stop()
 }
 
-# ── R6: child cannot read state.db (sandbox-runtime-users DENY) ──
-$stateDb = Join-Path $env:LOCALAPPDATA 'sandbox-runtime\state.db'
-if (-not (Test-Path $stateDb)) { throw "R6: $stateDb missing" }
-$r = RExec @('--', $cmd, '/c', "type `"$stateDb`"")
-if ($r.exit -eq 0) {
-  throw "R6: child READ state.db (DENY ACE not in effect?). raw: $($r.raw)"
+# ── R5d: IPv6 loopback out-of-range blocked ──────────────────────
+# The WFP fence must cover the v6 layers too: a v4-only filter set
+# would leave [::1] as a silent hole to every local service. Real
+# listener on [::1], child connect must be denied (an
+# AccessDenied/timeout, never a successful connect).
+# Ephemeral, not a fixed port: a bind inside one of Windows' per-machine
+# excluded port ranges fails with WSAEACCES. Re-draw if the OS hands out a
+# port inside the permit range.
+do {
+  $v6l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Loopback, 0)
+  $v6l.Start()
+  $portV6 = $v6l.LocalEndpoint.Port
+  $inPermit = $portV6 -ge $PortLo -and $portV6 -le $PortHi
+  if ($inPermit) { $v6l.Stop() }
+} while ($inPermit)
+try {
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+    "try { `$c = New-Object Net.Sockets.TcpClient([Net.Sockets.AddressFamily]::InterNetworkV6); " +
+    "`$c.Connect('::1', $portV6); Write-Output CONNECTED } catch { Write-Output blocked }")
+  if ($r.out -match 'CONNECTED') {
+    throw "R5d: sandboxed connect to [::1]:$portV6 succeeded — v6 fence hole. raw: $($r.raw)"
+  }
+  Write-Host 'R5d ok: IPv6 loopback out-of-range blocked'
+} finally {
+  $v6l.Stop()
 }
-if ($r.raw -notmatch '(?i)access is denied') {
+
+# ── R5e: loopback ALIAS (127.0.0.2) out-of-range blocked ─────────
+# 127.0.0.0/8 is all loopback; a filter keyed on 127.0.0.1 alone
+# would leave every other alias open. No listener needed — the
+# discriminating signal is AccessDenied (WFP) vs ConnectionRefused
+# (no filter, nothing listening).
+$r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+  "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.2', 49998); Write-Output CONNECTED } " +
+  "catch { Write-Output ('code=' + `$_.Exception.InnerException.SocketErrorCode) }")
+if ($r.out -match 'CONNECTED') {
+  throw "R5e: sandboxed connect to 127.0.0.2 succeeded. raw: $($r.raw)"
+}
+if ($r.out -notmatch 'AccessDenied') {
+  throw "R5e: expected AccessDenied (WFP block), got: $($r.raw)"
+}
+Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
+
+# ── R5f: non-interactive logon types refused for the sandbox account ─
+# The SMB redirector dials from kernel mode as SYSTEM, so the
+# SID-keyed WFP fence never sees its connects; the fix denies the
+# sandbox group every logon type except interactive. LOOPBACK SMB is
+# exempt by NTLM loopback-session reuse (no new logon occurs), so the
+# CI-provable check is LogonUser itself: type NETWORK/BATCH/SERVICE
+# must refuse with 1385 (what any remote server's LSA runs at SMB
+# session setup), INTERACTIVE must stay granted (the
+# CreateProcessWithLogonW launch depends on it).
+$pwPlain = (& $Exe user read-cred).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $pwPlain) { throw 'R5f: read-cred failed' }
+$lsig = '[DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool LogonUserW(string u, string d, string p, uint type, uint prov, out IntPtr tok);'
+$lt = Add-Type -MemberDefinition $lsig -Name R5fLogon -Namespace Srt -PassThru
+$sbUser = ((& $Exe user status | ConvertFrom-Json).user.name)
+foreach ($probe in @(@{n='NETWORK'; t=3; want=$false}, @{n='BATCH'; t=4; want=$false}, @{n='SERVICE'; t=5; want=$false}, @{n='INTERACTIVE'; t=2; want=$true})) {
+  $tok = [IntPtr]::Zero
+  $ok = [Srt.R5fLogon]::LogonUserW($sbUser, '.', $pwPlain, [uint32]$probe.t, 0, [ref]$tok)
+  $gle = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+  if ($probe.want -and -not $ok) { throw "R5f: $($probe.n) logon REFUSED (gle=$gle) - launch path broken" }
+  if (-not $probe.want -and $ok) { throw "R5f: $($probe.n) logon GRANTED - logon-type denial not in effect" }
+  if (-not $probe.want -and $gle -ne 1385) { Write-Host "R5f note: $($probe.n) refused with gle=$gle (expected 1385; still refused)" }
+}
+$pwPlain = $null
+Write-Host 'R5f ok: network/batch/service logons refused (1385), interactive granted'
+
+# ── R6: child cannot read the credential key (sandbox DENY) ──────
+# The Cred subkey's DACL is the load-bearing gate: machine-scope
+# DPAPI means readable = decryptable, and a child that learned its
+# own password could CreateProcessWithLogonW itself a fresh logon
+# session outside the job/desktop confinement.
+$r = RExec @('--', $cmd, '/c', 'reg query HKLM\SOFTWARE\sandbox-runtime\Cred /v Blob')
+if ($r.exit -eq 0) {
+  throw "R6: child READ the Cred registry key (DENY not in effect?). raw: $($r.raw)"
+}
+if ($r.raw -notmatch '(?i)access is denied|denied') {
   throw "R6: expected Access is denied. raw: $($r.raw)"
 }
-Write-Host 'R6 ok: child cannot read state.db (cred file gate holds)'
+Write-Host 'R6 ok: child cannot read the Cred registry key'
 
 # ── R7: cmd.exe /c passthrough — user-quoted payload survives ───
 # build_cmdline wraps the post-/c content in ONE outer "…" pair

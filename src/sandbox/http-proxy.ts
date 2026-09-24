@@ -11,9 +11,17 @@ import { encodedCommandFromProxyUser } from './sandbox-utils.js'
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
+  rawDenied,
+  respondDenied,
+  respondUpstreamError,
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
+
+const ALLOWLIST_DENY = [
+  'Connection blocked by network allowlist',
+  'blocked-by-allowlist',
+] as const
 import {
   peekForClientHello,
   terminateAndForward,
@@ -24,9 +32,15 @@ import {
 } from './body-substitution.js'
 import type { PlanSigv4 } from './credential-aws-pairs.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
+import { isResolvedAddressDenied } from './resolved-address-guard.js'
 import {
+  canonicalizeHost,
   connectViaParentProxy,
+  directRequestOptions,
+  type DirectRequestOptions,
   dialDirect,
+  formatAuthority,
+  type DirectLookup,
   openConnectTunnel,
   proxyAuthHeader,
   selectParentProxyUrl,
@@ -40,6 +54,12 @@ export interface HttpProxyServerOptions {
    * Host-allowlist decision. `encodedCommand` is the per-command suffix
    * parsed from the Proxy-Authorization username (`srt.<encodedCommand>`),
    * so the manager can attribute a denial to the invocation that made it.
+   *
+   * Receives the host exactly as the client spelled it (so denials and
+   * permission prompts show what the process asked for); the manager's
+   * filter canonicalizes internally. Every other hook below, and the
+   * upstream leg itself, get the {@link canonicalizeHost} spelling of an
+   * allowed host — see the note at the CONNECT handler's routing step.
    */
   filter(
     port: number,
@@ -52,6 +72,10 @@ export interface HttpProxyServerOptions {
    * Optional function to get the MITM proxy socket path for a given host.
    * If returns a socket path, the request will be routed through that MITM proxy.
    * If returns undefined, the request will be handled directly.
+   *
+   * Called with the canonical host; the CONNECT authority / absolute URI
+   * forwarded to the MITM socket carries the same canonical spelling, so
+   * the proxy behind the socket never has to re-derive it.
    */
   getMitmSocketPath?(host: string): string | undefined
 
@@ -163,6 +187,17 @@ export interface HttpProxyServerOptions {
   parentProxy?: ResolvedParentProxy
 
   /**
+   * Name resolution for DIRECT dials (opaque CONNECT tunnel, plain-HTTP
+   * forward, TLS-terminated upstream leg), bound per destination port and
+   * requesting command. The manager returns the resolved-address guard's
+   * lookup, which refuses (and records) an allow-listed hostname that
+   * resolves into denied address space; the proxy answers that with a 403.
+   * Not consulted for the mitmProxy or parentProxy routes — that hop
+   * resolves the name.
+   */
+  lookupFor?: DirectLookup
+
+  /**
    * Per-session bearer token. When set, every CONNECT and absolute-URI
    * request must carry `Proxy-Authorization: Basic
    * base64("srt[.<encodedCommand>]:<token>")` or it gets a 407. Without
@@ -233,6 +268,13 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     // Attach error handler immediately to prevent unhandled errors
     socket.on('error', err => {
       logForDebugging(`Client socket error: ${err.message}`, { level: 'error' })
+      // A failed write (e.g. EPIPE to a dead peer) must also release
+      // the descriptor: logging alone leaves the fd open for the life
+      // of the process, and an open dead-peer fd is what the runtime's
+      // EPIPE retry loop spun on (idle-CPU busy-loop incident).
+      // destroy() is idempotent, so overlap with the close handlers
+      // below is harmless.
+      socket.destroy()
     })
 
     // Track client liveness so we can abort the upstream dial if they bail.
@@ -241,10 +283,149 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       clientGone = true
     })
 
+    // EOF during the decision window is treated as abandonment — a
+    // half-closed client cannot run any bidirectional protocol over the
+    // tunnel it is waiting for — so close our side immediately, the
+    // same close every healthy cycle performs at teardown. Without
+    // this, an EOF'd socket survives an arbitrarily long filter await
+    // half-open (the host decision may be a model-classifier call or
+    // an interactive permission prompt), and the verdict write lands on
+    // a dead descriptor. The armed window runs from here through the
+    // filter await, the ClientHello peek (MITM path), and the upstream
+    // dial; it is disarmed only at tunnel handoff, where established
+    // tunnels forward FIN through pipe() and keep half-open semantics —
+    // a FIN during the dial tears the connection down rather than
+    // half-opening it, which is the cleaner teardown for a client that
+    // is gone.
+    //
+    // Deliberate tradeoff: a hypothetical pipelined send-and-FIN
+    // CONNECT client (payload + FIN up front, then read the response
+    // across the half-open socket) is also destroyed here. Accepting
+    // that means nothing is written once EOF has been observed
+    // (checked again at write time via readableEnded). EOF
+    // notification is best-effort on a paused socket, so the layered
+    // backstop matters: a write that still hits a dead peer errors,
+    // and the error handler above destroys the socket, releasing the
+    // descriptor. On runtimes whose EPIPE handling spins on dead-peer
+    // writes (the incident's Bun builds, pre oven-sh/bun#37076) this
+    // narrows the exposure from every abandoned decision to only those
+    // whose EOF was never notified.
+    const onDecisionWindowEof = () => {
+      clientGone = true
+      socket.destroy()
+    }
+    // 'end' only fires once the stream is being read: on a paused socket
+    // (which a CONNECT socket is, between the header parse and the tunnel
+    // handoff) a client FIN can sit unobserved for the whole decision.
+    // On the opaque path, capture decision-window data to put the socket
+    // into flowing mode — making EOF notification reliable across
+    // runtimes — and fold anything captured back into `head` at disarm
+    // so early tunnel bytes (a client that pipelines its first payload
+    // behind the CONNECT) are never lost.
+    //
+    // Deliberately NOT armed on the mitmCA path: the ClientHello peek
+    // and the terminating relay manage this socket's flow themselves
+    // (pull-mode reads chosen specifically because pause()/resume()
+    // cycles corrupt CONNECT-upgraded sockets under Bun — see
+    // relayPaused), and injecting a flowing-mode phase ahead of them
+    // breaks the terminating path outright. There, EOF detection during
+    // the decision stays best-effort ('close' fires on full close — the
+    // incident case — and the peek's own reads surface 'end' once it
+    // runs); the write-time guards and the error-handler backstop cover
+    // the remainder.
+    //
+    // Capture is bounded: the paused socket used to give free TCP
+    // backpressure, and an untrusted client streaming at line rate for
+    // the length of an interactive permission prompt must not balloon
+    // host memory. A legitimate pipelined first flight (an SSH banner)
+    // is tiny; blowing the cap is abandonment-grade abuse and closes
+    // the connection.
+    const MAX_DECISION_CAPTURE_BYTES = 64 * 1024
+    let decisionCaptureBytes = 0
+    let capturing = false
+    const decisionData: Buffer[] = []
+    const onDecisionData = (chunk: Buffer) => {
+      if (!capturing) return
+      decisionCaptureBytes += chunk.length
+      if (decisionCaptureBytes > MAX_DECISION_CAPTURE_BYTES) {
+        logForDebugging(
+          'CONNECT client exceeded pre-establishment capture cap; destroying',
+          { level: 'error' },
+        )
+        onDecisionWindowEof()
+        return
+      }
+      decisionData.push(chunk)
+    }
+    if (!options.mitmCA) {
+      capturing = true
+      socket.on('data', onDecisionData)
+    }
+    // EOF may already have been processed before this handler arms (a
+    // client that sent CONNECT and FIN together), and an already-emitted
+    // 'end' never re-fires — check the flag first.
+    if (socket.readableEnded) {
+      onDecisionWindowEof()
+    } else {
+      socket.once('end', onDecisionWindowEof)
+    }
+    // Stop capturing, folding captured bytes into `head`. The listener
+    // deliberately STAYS attached as a discarding sink: 'data' events
+    // broadcast to every listener, so the real consumer (pipe()) still
+    // receives everything, while removing the last listener from a
+    // flowing stream would silently DROP bytes arriving before the
+    // consumer attaches (e.g. during the awaited upstream dial). No
+    // pause() — pause/resume cycles corrupt CONNECT-upgraded sockets
+    // under Bun (see relayPaused).
+    const disarmDecisionCapture = () => {
+      capturing = false
+      if (decisionData.length) {
+        head = Buffer.concat([head, ...decisionData])
+        decisionData.length = 0
+      }
+    }
+    const disarmDecisionWindowEof = () => {
+      socket.removeListener('end', onDecisionWindowEof)
+      disarmDecisionCapture()
+    }
+    // Decision-phase status writes go through this guard: a verdict for
+    // a dead client is dropped, never written. The filter's work is not
+    // wasted — host-side allow/deny caches serve the client's retry.
+    const endWithStatus = (payload: string) => {
+      if (
+        clientGone ||
+        socket.destroyed ||
+        socket.readableEnded ||
+        !socket.writable
+      ) {
+        logForDebugging(
+          'CONNECT client gone before status write; dropping verdict and destroying socket',
+        )
+        socket.destroy()
+        return
+      }
+      // Disarm before writing: a FIN processed while this verdict is
+      // still queued (backpressured or slow client) would otherwise
+      // fire the armed 'end' handler and destroy() the unflushed write.
+      disarmDecisionWindowEof()
+      socket.end(payload)
+    }
+    // A client that sent CONNECT and FIN together (or closed before the
+    // handler ran) was destroyed at arm time: return before spending a
+    // decision — possibly an interactive permission prompt or a
+    // classifier call — on a connection that no longer exists.
+    if (clientGone || socket.destroyed) {
+      return
+    }
+
+    // Whether the MITM sniff path already wrote the 200 — hoisted so the
+    // catch below can see it: once the 200 is out, any HTTP status line
+    // would land inside what the client treats as tunnel payload.
+    let wrote200 = false
     try {
       const auth = checkAuth(req.headers['proxy-authorization'])
       if (!auth.ok) {
-        socket.end(
+        endWithStatus(
           'HTTP/1.1 407 Proxy Authentication Required\r\n' +
             'Proxy-Authenticate: Basic realm="srt"\r\n\r\n',
         )
@@ -255,30 +436,44 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         logForDebugging(`Invalid CONNECT request: ${req.url}`, {
           level: 'error',
         })
-        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
+        endWithStatus('HTTP/1.1 400 Bad Request\r\n\r\n')
         return
       }
-      const { hostname, port } = target
+      const { hostname: requestedHost, port } = target
 
       const allowed = await options.filter(
         port,
-        hostname,
+        requestedHost,
         socket,
         auth.encodedCommand,
       )
       if (!allowed) {
-        logForDebugging(`Connection blocked to ${hostname}:${port}`, {
+        logForDebugging(`Connection blocked to ${requestedHost}:${port}`, {
           level: 'error',
         })
-        socket.end(
-          'HTTP/1.1 403 Forbidden\r\n' +
-            'Content-Type: text/plain\r\n' +
-            'X-Proxy-Error: blocked-by-allowlist\r\n' +
-            '\r\n' +
-            'Connection blocked by network allowlist',
-        )
+        endWithStatus(rawDenied(...ALLOWLIST_DENY))
         return
       }
+      // The client may have died during the filter await (EOF destroy
+      // above, or full close): there is nothing left to establish.
+      if (clientGone || socket.destroyed) {
+        socket.destroy()
+        return
+      }
+
+      // From here on, use the spelling the allowlist actually evaluated.
+      // The filter canonicalizes before matching (so `Api.Example.com.`,
+      // `127.1`, `0x7f.0.0.1` are allowed iff their canonical forms are),
+      // and every decision below — TLS-termination exemption, MITM
+      // routing, parent-proxy bypass, credential injection, the leaf cert
+      // and upstream SNI, the authority we put on the wire — must key off
+      // that same spelling. Routing off the raw one let a trailing-dot
+      // FQDN pass the allowlist as `api.example.com`, miss every MITM
+      // pattern, and dial out directly. Same fallback as the filter for
+      // the (already-validated, so practically unreachable) case where
+      // canonicalization fails, so the two layers can never disagree.
+      const hostname = canonicalizeHost(requestedHost) ?? requestedHost
+      const lookup = options.lookupFor?.(port, auth.encodedCommand)
 
       // Decide upstream route:
       //   in-process TLS termination
@@ -287,12 +482,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       //   > direct
       // (tlsTerminate and mitmProxy are mutually exclusive at the config
       // layer, so the first two never both apply.)
-      let wrote200 = false
       if (
         options.mitmCA &&
         (options.shouldTerminateTLS?.(hostname, port) ?? true)
       ) {
-        if (clientGone) return
         // We can only terminate TLS. CONNECT also carries non-TLS streams —
         // notably SSH, where the sandbox's own GIT_SSH_COMMAND
         // routes `ssh` through this proxy via `socat - PROXY:`. Send 200 so
@@ -303,8 +496,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         wrote200 = true
         const peeked = await peekForClientHello(socket, head)
-        if (clientGone) return
+        if (clientGone || socket.destroyed) {
+          socket.destroy()
+          return
+        }
         if (peeked.isTLS) {
+          disarmDecisionWindowEof()
           terminateAndForward(
             options.mitmCA,
             options.filterRequest,
@@ -316,6 +513,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               hostname,
               port,
               upstreamCA: options.tlsTerminateUpstreamCA,
+              lookup,
               onFilterRequestDeny: options.onFilterRequestDenied
                 ? (method, url, reason) =>
                     options.onFilterRequestDenied!({
@@ -367,7 +565,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         } else if (parentUrl) {
           upstream = await connectViaParentProxy(parentUrl, hostname, port)
         } else {
-          upstream = await dialDirect(hostname, port)
+          upstream = await dialDirect(hostname, port, lookup)
         }
       } catch (err) {
         logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
@@ -376,19 +574,29 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // If we already sent 200 (mitmCA sniff path), an HTTP status line now
         // would land inside the tunnel as payload. Just close.
         if (wrote200) socket.destroy()
-        else socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+        else if (isResolvedAddressDenied(err)) {
+          endWithStatus(rawDenied(err.message))
+        } else endWithStatus('HTTP/1.1 502 Bad Gateway\r\n\r\n')
         return
       }
 
-      if (clientGone) {
+      if (clientGone || socket.destroyed) {
         upstream.on('error', () => {}) // swallow post-resolve errors
         upstream.destroy()
+        socket.destroy()
         return
       }
 
       if (!wrote200) {
         socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
       }
+      disarmDecisionWindowEof()
+      // An established tunnel relays each TCP direction independently: a
+      // client that half-closes (FIN after its request bytes) must still
+      // receive the upstream's reply. Without this, runtimes that default
+      // http-server sockets to allowHalfOpen=false auto-close the client
+      // side on FIN and the reply is lost.
+      socket.allowHalfOpen = true
       // Forward any bytes the client sent in the same packet as the CONNECT
       // (Node delivers these as the `head` buffer, not via the socket stream),
       // plus anything the ClientHello sniff consumed when mitmCA is on.
@@ -406,7 +614,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       upstream.on('close', () => socket.destroy())
     } catch (err) {
       logForDebugging(`Error handling CONNECT: ${err}`, { level: 'error' })
-      socket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n')
+      // Same rule as the 502 path: once the MITM sniff's 200 is out, a
+      // status line would corrupt the tunnel byte stream — just close.
+      if (wrote200) socket.destroy()
+      else endWithStatus('HTTP/1.1 500 Internal Server Error\r\n\r\n')
     }
   })
 
@@ -425,6 +636,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       logForDebugging(`Client response error: ${err.message}`, {
         level: 'error',
       })
+      // A failed response write (EPIPE to a dead peer) must release
+      // the descriptor — same rationale as the CONNECT handler's
+      // socket error handler. The res 'close' teardown listeners then
+      // handle the upstream leg.
+      res.socket?.destroy()
     })
     try {
       // Serve the empty CRL for Schannel's revocation check on MITM-minted
@@ -455,28 +671,31 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
       const url = new URL(req.url!)
-      const hostname = stripBrackets(url.hostname)
-      const port = url.port
-        ? parseInt(url.port, 10)
-        : url.protocol === 'https:'
-          ? 443
-          : 80
+      const isHttps = url.protocol === 'https:'
+      const defaultPort = isHttps ? 443 : 80
+      const requestedHost = stripBrackets(url.hostname)
+      const port = url.port ? parseInt(url.port, 10) : defaultPort
 
       const allowed = await options.filter(
         port,
-        hostname,
+        requestedHost,
         req.socket,
         auth.encodedCommand,
       )
       if (!allowed) {
-        logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
+        logForDebugging(`HTTP request blocked to ${requestedHost}:${port}`, {
           level: 'error',
         })
-        res.writeHead(403, {
-          'Content-Type': 'text/plain',
-          'X-Proxy-Error': 'blocked-by-allowlist',
-        })
-        res.end('Connection blocked by network allowlist')
+        // The client may have aborted during the filter await; a
+        // deny for a dead client is dropped, not written. Plain
+        // half-close (EOF after a complete request) is legal HTTP
+        // and still gets its verdict — only a destroyed socket is
+        // dead here.
+        if (req.socket.destroyed || res.destroyed) {
+          res.destroy()
+          return
+        }
+        respondDenied(res, ...ALLOWLIST_DENY)
         return
       }
 
@@ -484,7 +703,18 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // rather than dialing an upstream nobody will read from.
       if (req.socket.destroyed) return
 
-      const fwdHeaders = { ...stripHopByHop(req.headers), host: url.host }
+      // Same rule as the CONNECT handler: everything after the allow
+      // decision keys off the canonical spelling. The URL parser has
+      // already lowercased and IPv4-normalized `url.hostname`; what it
+      // leaves behind is the trailing dot, which is exactly the spelling
+      // that used to reach getMitmSocketPath / the upstream unchanged.
+      const hostname = canonicalizeHost(requestedHost) ?? requestedHost
+      // The authority we forward (request-target and Host header) is rebuilt
+      // from the canonical host so the MITM / parent proxy sees the host we
+      // allowlist-checked, not the client's spelling of it.
+      const authority = formatAuthority(hostname, port, defaultPort)
+
+      const fwdHeaders = { ...stripHopByHop(req.headers), host: authority }
       options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
       // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
       // the same config gate). May delete content-length from fwdHeaders.
@@ -502,7 +732,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         options.parentProxy &&
         !shouldBypassParentProxy(options.parentProxy, hostname)
           ? selectParentProxyUrl(options.parentProxy, {
-              isHttps: url.protocol === 'https:',
+              isHttps,
             })
           : undefined
 
@@ -510,7 +740,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // forwarding the client's raw req.url. This ensures the upstream proxy
       // sees exactly the host we allowlist-checked, closing URL-parser
       // differential bypasses.
-      const absUrl = `${url.protocol}//${url.host}${url.pathname}${url.search}`
+      const absUrl = `${url.protocol}//${authority}${url.pathname}${url.search}`
 
       // Per-request filter applies to plain HTTP too — otherwise a sandboxed
       // client could bypass it by using http:// where the upstream serves it.
@@ -570,6 +800,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         fwdHeaders['transfer-encoding'] = 'chunked'
       }
 
+      const failUpstream = (err: Error) => {
+        logForDebugging(`Proxy request failed: ${err.message}`, {
+          level: 'error',
+        })
+        respondUpstreamError(res, err)
+      }
       let proxyReq
       if (mitmSocketPath) {
         logForDebugging(
@@ -632,11 +868,28 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           },
         )
       } else {
-        const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest
-        proxyReq = requestFn(
-          {
+        // Vet and pick the upstream address before any request object exists
+        // (see directRequestOptions); the name stays in Host and, for TLS, SNI.
+        let direct: DirectRequestOptions
+        try {
+          direct = await directRequestOptions(
             hostname,
             port,
+            options.lookupFor?.(port, auth.encodedCommand),
+            isHttps,
+          )
+        } catch (err) {
+          failUpstream(err as Error)
+          return
+        }
+        if (res.destroyed || req.socket.destroyed) {
+          // Client went away during the dial.
+          body.destroy()
+          return
+        }
+        proxyReq = (isHttps ? httpsRequest : httpRequest)(
+          {
+            ...direct,
             path: url.pathname + url.search,
             method: req.method,
             headers: fwdHeaders,
@@ -657,17 +910,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         )
       }
 
-      proxyReq.on('error', err => {
-        logForDebugging(`Proxy request failed: ${err.message}`, {
-          level: 'error',
-        })
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'text/plain' })
-          res.end('Bad Gateway')
-        } else {
-          res.destroy()
-        }
-      })
+      proxyReq.on('error', failUpstream)
 
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())

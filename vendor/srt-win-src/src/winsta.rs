@@ -329,10 +329,7 @@ fn open_session_bno() -> Result<OwnedHandle> {
     unsafe { ProcessIdToSessionId(std::process::id(), &mut ts) }
         .context("ProcessIdToSessionId(broker)")?;
     let path = format!("\\Sessions\\{ts}\\BaseNamedObjects");
-    // `UNICODE_STRING` is a counted (not NUL-terminated) UTF-16
-    // buffer; `Length`/`MaximumLength` are in **bytes**.
-    let mut path_w: Vec<u16> = path.encode_utf16().collect();
-    let bytes = (path_w.len() * 2) as u16;
+    let (mut path_w, bytes) = crate::util::counted_utf16(&path);
     let name = UNICODE_STRING {
         Length: bytes,
         MaximumLength: bytes,

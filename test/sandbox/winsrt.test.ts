@@ -631,6 +631,31 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
 // resolveSrtWin's existence check passes on non-Windows hosts; the
 // spies intercept before any real process is spawned.
 
+describe('windowsStateDir (pure, all platforms)', () => {
+  // Mirrors srt-win's state_db::state_dir(): the machine-wide
+  // %ProgramData%\sandbox-runtime, a pure env-derived path (no fs
+  // probing — the elevated install creates it).
+  let savedProgramData: string | undefined
+
+  beforeAll(() => {
+    savedProgramData = process.env.ProgramData
+  })
+  afterAll(() => {
+    if (savedProgramData === undefined) delete process.env.ProgramData
+    else process.env.ProgramData = savedProgramData
+  })
+
+  it('joins %ProgramData%\\sandbox-runtime', () => {
+    process.env.ProgramData = 'C:\\ProgramData'
+    expect(windowsStateDir()).toBe('C:\\ProgramData\\sandbox-runtime')
+  })
+
+  it('throws when ProgramData is unset', () => {
+    delete process.env.ProgramData
+    expect(() => windowsStateDir()).toThrow('ProgramData')
+  })
+})
+
 describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   const RAW_USER = JSON.stringify({
     user: {
@@ -1133,7 +1158,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.user.inBuiltinUsers).toBe(true)
       expect(r.user.inSandboxGroup).toBe(true)
       expect(r.user.credPresent).toBe(true)
-      expect(r.user.markerVersion).toBe(1)
+      expect(r.user.markerVersion).toBe(2)
       expect(r.wfp.userSid).toBe(r.user.sid)
       // Combined `srt-win status` returns the same objects the two
       // per-noun calls do (one spawn instead of two).
@@ -1270,7 +1295,10 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
     await SandboxManager.initialize(createTestConfig())
     console.error('[winsrt beforeAll] done')
-  })
+    // Install and uninstall each run an elevated srt-win that can outlast
+    // bun's 5s default hook timeout; a hook that times out is killed
+    // mid-run and fails the suite.
+  }, 120_000)
 
   afterAll(async () => {
     await SandboxManager.reset()
@@ -1278,7 +1306,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       sublayerGuid: TEST_SUBLAYER,
       srtWin: TEST_SRT_WIN,
     })
-  })
+  }, 60_000)
 
   it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
@@ -1885,13 +1913,9 @@ describe.if(isWindows)(
     }, 90_000)
 
     it('H-denyWrite: child cannot write the denyWrite target', async () => {
-      // Was F2 under the same-user PROTECTED-stamp; re-expressed
-      // for the additive-DENY-ACE path. Asserts the WRITE-deny
-      // half only — the "child can still read" half is covered by
-      // smoke-aces A2 (lands with the SYNCHRONIZE-strip fix in
-      // the Rust same-user-removal PR; main's `DenyMask::WriteDeny`
-      // includes SYNCHRONIZE so a synchronous read open is also
-      // denied until then).
+      // denyWrite blocks writes and leaves reads open (acl.rs
+      // DenyMask::WriteDeny strips SYNCHRONIZE); this asserts the
+      // write half, smoke-aces A2 the read half.
       const hCfg = join(hScratch, 'cfg.txt')
       writeFileSync(hCfg, 'CONFIG-V1')
       const w = await rexecSandboxed(`echo POISONED>"${hCfg}"`, {
@@ -1919,12 +1943,9 @@ describe.if(isWindows)(
     }, 90_000)
 
     it('H-glob: per-exec denyRead glob — expanded TS-side, both denied, restored', async () => {
-      // Red→green for the per-exec/session-level glob asymmetry:
-      // before this PR a per-exec `glob-*.secret` reached
-      // `srt-win exec --deny-read` raw and `canonicalize_path`
-      // hard-failed; now `wrapWithSandboxArgv` routes it through
-      // `expandWindowsFsPaths` (same chokepoint as session-
-      // level) so the child sees two concrete `--deny-read` paths.
+      // Per-exec denyRead globs must go through expandWindowsFsPaths,
+      // the same chokepoint as session-level: srt-win's
+      // canonicalize_path rejects a raw glob.
       const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
       const a = join(dir, 'glob-a.secret')
       const b = join(dir, 'glob-b.secret')
@@ -2446,14 +2467,13 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
 //
 // Separate describe from G: G's beforeAll pins the fixture CA
 // (explicit caCertPath); this group exercises the no-explicit-path
-// branch that generates-if-absent under
-// `%LOCALAPPDATA%\sandbox-runtime\ca\`.
+// branch that generates-if-absent under `windowsStateDir()/ca`.
 // ────────────────────────────────────────────────────────────────────
 
 describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
   // bun evaluates describe bodies even under `.if(false)` — guard the
   // top-level const so `windowsStateDir()` (throws without
-  // LOCALAPPDATA) doesn't run on macOS/Linux.
+  // ProgramData) doesn't run on macOS/Linux.
   const caDir = isWindows ? join(windowsStateDir(), 'ca') : ''
 
   beforeAll(async () => {
@@ -2506,7 +2526,7 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
       expect(existsSync(a.keyPath)).toBe(true)
       // Second call: same PEMs, same thumb, no regenerate. `trusted`
       // is false — the first call's trust step recorded this thumb
-      // in state.db, so the reconcile finds it already installed.
+      // in install.db, so the reconcile finds it already installed.
       const b = await ensurePersistentWindowsCa({
         dir,
         status: getWindowsSandboxUserStatus({ srtWin }),

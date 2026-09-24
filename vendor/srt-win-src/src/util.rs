@@ -51,6 +51,17 @@ pub fn scrub_wstr(buf: &mut [u16]) {
     }
 }
 
+/// Encode `s` as a COUNTED (not NUL-terminated) UTF-16 buffer plus
+/// its length in BYTES — the shape `UNICODE_STRING` /
+/// `LSA_UNICODE_STRING` want in `Length`/`MaximumLength`. Callers
+/// build their (structurally identical, module-distinct) struct from
+/// the pair; the buffer must outlive it.
+pub fn counted_utf16(s: &str) -> (Vec<u16>, u16) {
+    let buf: Vec<u16> = s.encode_utf16().collect();
+    let bytes = (buf.len() * 2) as u16;
+    (buf, bytes)
+}
+
 /// Borrow a `Vec<u16>` from `wstr` as a `PCWSTR`.
 pub fn pcwstr(buf: &[u16]) -> PCWSTR {
     PCWSTR(buf.as_ptr())
@@ -199,4 +210,53 @@ impl Drop for OwnedSd {
             local_free(self.ptr.0);
         }
     }
+}
+
+/// Enable a named privilege (e.g. `SeRestorePrivilege`) in the
+/// current process token. Returns `Ok(true)` when the privilege is
+/// now enabled, `Ok(false)` when the token does not hold it at all
+/// (`ERROR_NOT_ALL_ASSIGNED` — e.g. a non-elevated caller); errors
+/// only on API failure. Enabling is process-wide and deliberately
+/// not reverted: the callers (install-time ambient stamping) are
+/// short-lived CLI invocations.
+pub fn enable_privilege(name: &str) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    use windows::Win32::Foundation::{ERROR_NOT_ALL_ASSIGNED, GetLastError, LUID};
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut luid = LUID::default();
+    let w = wstr(name);
+    unsafe { LookupPrivilegeValueW(PCWSTR::null(), pcwstr(&w), &mut luid) }
+        .with_context(|| format!("LookupPrivilegeValue('{name}')"))?;
+    let mut tok = HANDLE::default();
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut tok,
+        )
+    }
+    .context("OpenProcessToken(ADJUST_PRIVILEGES)")?;
+    let tp = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    let adjusted = unsafe { AdjustTokenPrivileges(tok, false, Some(&tp), 0, None, None) }
+        .with_context(|| format!("AdjustTokenPrivileges('{name}')"));
+    // Success return with ERROR_NOT_ALL_ASSIGNED means the token
+    // doesn't hold the privilege. Read it before CloseHandle can
+    // clobber the thread's last-error.
+    let assigned = unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED;
+    unsafe {
+        let _ = CloseHandle(tok);
+    }
+    adjusted?;
+    Ok(assigned)
 }

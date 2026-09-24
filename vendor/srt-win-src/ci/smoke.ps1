@@ -88,8 +88,9 @@ if (-not $us.user.group_exists)      { throw "install: sandbox-runtime-users gro
 if (-not $us.user.in_builtin_users)  { throw "install: sandbox user not in BUILTIN\Users" }
 if (-not $us.user.in_sandbox_group)  { throw "install: sandbox user not in sandbox-runtime-users" }
 if (-not $us.user.hidden_from_logon) { throw "install: sandbox user not hidden from Winlogon" }
-if (-not $us.cred_present)           { throw "install: credential not present in state DB" }
-if ($us.marker_version -ne 1)        { throw "install: setup marker version expected 1, got $($us.marker_version)" }
+if (-not $us.cred_present)           { throw "install: credential not present (HKLM Cred\Blob)" }
+# Keep in sync with SETUP_VERSION (vendor/srt-win-src/src/install.rs).
+if ($us.marker_version -ne 2)        { throw "install: setup marker version expected 2, got $($us.marker_version)" }
 if ($us.marker_user_sid -ne $us.user.sid) {
   throw "install: marker SID '$($us.marker_user_sid)' != live SID '$($us.user.sid)'"
 }
@@ -107,11 +108,11 @@ if ($pw -match '["\s\\`&|<>^]') {
   throw "user read-cred: password contains an excluded char: '$pw'"
 }
 
-# State-dir DACL: explicit DENY for sandbox-runtime-users. This is
-# the load-bearing gate on the credential file (machine-scope DPAPI
-# is not a confidentiality boundary — any local account can decrypt
-# a readable blob).
-$stateDir = Join-Path $env:LOCALAPPDATA 'sandbox-runtime'
+# State-dir DACL: explicit DENY for sandbox-runtime-users — the CA
+# key material lives under this dir and must be unreadable from
+# inside the sandbox. (Credential + marker live in
+# HKLM\SOFTWARE\sandbox-runtime now, asserted below.)
+$stateDir = Join-Path $env:ProgramData 'sandbox-runtime'
 $acl = Get-Acl $stateDir
 $deny = $acl.Access | Where-Object {
   $_.AccessControlType -eq 'Deny' -and
@@ -120,64 +121,75 @@ $deny = $acl.Access | Where-Object {
 if (-not $deny) {
   throw "install: state-dir DACL has no DENY for sandbox-runtime-users; got:`n$($acl.Access | Out-String)"
 }
-if (-not (Test-Path (Join-Path $stateDir 'state.db'))) {
-  throw "install: state.db missing at $stateDir"
+# Logon-type denials: the sandbox group must carry the four LSA
+# deny rights (everything except interactive, which the
+# CreateProcessWithLogonW launch needs). secedit is the only stock
+# read path for user-right assignments.
+$grpSid = $us.user.group_sid
+if (-not $grpSid) { throw 'install: user status carries no group_sid' }
+$seceditOut = Join-Path $env:TEMP 'srt-secedit.inf'
+Remove-Item $seceditOut -ea SilentlyContinue  # never read a stale export
+secedit /export /cfg $seceditOut /areas USER_RIGHTS | Out-Null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $seceditOut)) {
+  throw "install: secedit /export failed (exit $LASTEXITCODE)"
+}
+$rights = Get-Content $seceditOut -Raw
+foreach ($r in @('SeDenyNetworkLogonRight','SeDenyBatchLogonRight','SeDenyServiceLogonRight','SeDenyRemoteInteractiveLogonRight')) {
+  $line = ($rights -split "`n" | Where-Object { $_ -match "^$r" })
+  # secedit exports resolvable trustees by NAME, unresolvable as *SID.
+  if (-not $line -or ($line -notmatch 'sandbox-runtime-users' -and $line -notmatch [regex]::Escape($grpSid))) {
+    throw "install: $r does not include the sandbox group ($grpSid); got: $line"
+  }
+}
+$interactive = ($rights -split "`n" | Where-Object { $_ -match '^SeDenyInteractiveLogonRight' })
+if ($interactive -match 'sandbox-runtime-users' -or $interactive -match [regex]::Escape($grpSid)) {
+  throw "install: SeDenyInteractiveLogonRight includes the sandbox group - the launch path would be broken"
+}
+Remove-Item $seceditOut -ea SilentlyContinue
+Write-Host 'install ok: logon-type denials stamped on the sandbox group (interactive untouched)'
+
+# Registry store: base key present with marker + identity; Cred
+# subkey deny for the sandbox group and no BU write; Ca subkey BU
+# KEY_SET_VALUE (unelevated trust-ca) but sandbox-group DENY.
+$reg = Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -ea Stop
+if (-not $reg.MarkerVersion) { throw 'install: MarkerVersion missing from HKLM store' }
+$credAcl = Get-Acl 'HKLM:\SOFTWARE\sandbox-runtime\Cred'
+if (-not ($credAcl.Access | Where-Object { $_.AccessControlType -eq 'Deny' -and $_.IdentityReference.Value -match 'sandbox-runtime-users$' })) {
+  throw "install: Cred key has no sandbox-group DENY:`n$($credAcl.Access | Out-String)"
+}
+if ($credAcl.Access | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -match '\\Users$' -and ($_.RegistryRights -band [System.Security.AccessControl.RegistryRights]::SetValue) }) {
+  throw "install: Cred key is writable by BUILTIN\Users:`n$($credAcl.Access | Out-String)"
+}
+$caAcl = Get-Acl 'HKLM:\SOFTWARE\sandbox-runtime\Ca'
+if (-not ($caAcl.Access | Where-Object { $_.AccessControlType -eq 'Deny' -and $_.IdentityReference.Value -match 'sandbox-runtime-users$' })) {
+  throw "install: Ca key has no sandbox-group DENY:`n$($caAcl.Access | Out-String)"
+}
+if (-not ($caAcl.Access | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -match '\\Users$' -and ($_.RegistryRights -band [System.Security.AccessControl.RegistryRights]::SetValue) })) {
+  throw "install: Ca key lacks BUILTIN\Users SetValue (unelevated trust-ca broken):`n$($caAcl.Access | Out-String)"
 }
 
-# ── M1: schema-mismatch → .bak rename ──────────────────────────────
-# Patch state.db's header user_version (big-endian uint32 at byte
-# offset 60) to 1, then re-run install. open_db_at() sees v1≠SCHEMA,
-# renames the file to state.db.v1.<ts>.bak, and creates a fresh DB.
-# The .bak preserves the old cred/ca_cert rows for recovery; the
-# fresh DB requires re-provisioning, which re-install does here.
-$db = Join-Path $stateDir 'state.db'
-Remove-Item -ea SilentlyContinue (Join-Path $stateDir 'state.db-wal'),
-                                  (Join-Path $stateDir 'state.db-shm')
-$bytes = [System.IO.File]::ReadAllBytes($db)
-$bytes[60] = 0; $bytes[61] = 0; $bytes[62] = 0; $bytes[63] = 1
-[System.IO.File]::WriteAllBytes($db, $bytes)
-# M1b: open_db_ro() warns + returns None on v≠SCHEMA. Post fence
-# removal Ok(None) is fail-safe — `user status` reports
-# cred_present:false and exec exit-15s on it. Assert: exit 0 +
-# warning + cred_present:false in the JSON.
-$m1b = & $Exe user status 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) {
-  throw "M1b: user status on stale-schema DB expected exit 0 (warn+None); got $LASTEXITCODE. out: $m1b"
+# ── M1: stale/foreign marker → plain install completes ────────────
+# An admin (or an older build) leaves MarkerVersion at a value the
+# broker doesn't expect: read_cred refuses with "re-run install",
+# status still exits 0, and a plain (no --force) install falls
+# through the early-out and heals the marker.
+Set-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -Name MarkerVersion -Value 99
+$m1b = & $Exe user read-cred 2>&1 | Out-String
+if ($LASTEXITCODE -eq 0) { throw "M1b: read-cred succeeded on marker v99. out: $m1b" }
+if ($m1b -notmatch '(?i)marker version mismatch.*re-run') {
+  throw "M1b: expected marker-mismatch refusal. out: $m1b"
 }
-if ($m1b -notmatch '(?i)schema v1.*expected v\d+.*re-run.*install') {
-  throw "M1b: expected 'schema v1, expected vN; re-run install' warning. out: $m1b"
-}
-if ($m1b -notmatch '"cred_present"\s*:\s*false') {
-  throw "M1b: expected cred_present:false in status JSON. out: $m1b"
-}
-Write-Host "M1b ok: user status warns + reports not-provisioned on stale schema"
-# install (no --force): read_setup() → open_db_ro() → Ok(None) →
-# idempotent early-out FALLS THROUGH ("partial install detected …
-# completing"), reaching write_setup() → open_db_at() → .bak rename.
-# Regression-guard: "already installed; no changes" = open_db_ro()
-# lost the version check.
+$m1c = & $Exe user status 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { throw "M1c: user status on stale marker expected exit 0; got $LASTEXITCODE" }
+Write-Host "M1b ok: read-cred refuses + status survives a stale marker"
 $m1out = & $Exe @(@('install') + $isl + $pr) 2>&1 | Out-String
 if ($LASTEXITCODE -ne 0) { throw "M1: install exited $LASTEXITCODE. out: $m1out" }
 if ($m1out -match '(?i)already installed.*no changes') {
-  throw "M1: install short-circuited on stale-schema DB (open_db_ro missed user_version check). out: $m1out"
+  throw "M1: install short-circuited on a stale marker. out: $m1out"
 }
-if ($m1out -notmatch '(?i)partial install detected|completing') {
-  throw "M1: expected install to fall through with 'partial install detected'/'completing'. out: $m1out"
-}
-$bak = Get-ChildItem -Path $stateDir -Filter 'state.db.v1.*.bak' -ea Stop
-if (-not $bak) {
-  throw "M1: expected state.db.v1.*.bak in $stateDir; got: $(Get-ChildItem $stateDir | Out-String)"
-}
-$freshBytes = [System.IO.File]::ReadAllBytes($db)
-$freshVer = ([int]$freshBytes[60] -shl 24) -bor ([int]$freshBytes[61] -shl 16) -bor `
-            ([int]$freshBytes[62] -shl 8)  -bor  [int]$freshBytes[63]
-if ($freshVer -le 1) {
-  throw "M1: fresh state.db user_version expected >1 (current SCHEMA), got $freshVer"
-}
-# .bak inherits broker-only from the PROTECTED state dir (open_db
-# stamps the dir on every open); no per-file stamp.
-Write-Host "M1 ok: schema mismatch → $($bak[0].Name); fresh DB at v$freshVer"
-Remove-Item $bak.FullName, "$($bak[0].FullName)-wal", "$($bak[0].FullName)-shm" -ea SilentlyContinue
+$mv = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime').MarkerVersion
+if ($mv -eq 99) { throw "M1: marker not healed (still 99)" }
+Write-Host "M1 ok: stale marker healed by plain install (now v$mv)"
 # Re-install above re-wrote the cred; downstream rows (read-cred
 # etc.) already ran and don't depend on it.
 
@@ -236,17 +248,26 @@ try { Start-Service seclogon -ea Stop } catch {
 # isn't). stderr (the runner's BLOCKED/UNREACHABLE line) flows to
 # the host so it's in the CI log; stdout is JUST the JSON line.
 #
-# `--target 127.0.0.1:49999` (a local listener bound below) — OUT of
-# the WFP loopback permit range, so block-user fires when the fence
+# `--target` is a local listener bound below, OUT of the WFP loopback
+# permit range (50000-50001 here), so block-user fires when the fence
 # is active and the connect succeeds when it isn't. Deterministic;
 # no internet. This is the same shape as the product path
 # (`verifyWindowsWfpEgress` binds an ephemeral out-of-range loopback
 # listener and passes it as `--target`).
-$probePort = 49999
+#
+# Ephemeral, not a fixed port: Windows reserves blocks of the dynamic
+# range at boot (excluded port ranges, which differ per machine), and
+# a bind inside one fails with WSAEACCES. Re-draw if the OS hands out
+# a port inside the permit range.
+do {
+  $probeLsn = [System.Net.Sockets.TcpListener]::new(
+    [System.Net.IPAddress]::Loopback, 0)
+  $probeLsn.Start()
+  $probePort = $probeLsn.LocalEndpoint.Port
+  $inPermit = $probePort -ge 50000 -and $probePort -le 50001
+  if ($inPermit) { $probeLsn.Stop() }
+} while ($inPermit)
 $probeTgt = "127.0.0.1:$probePort"
-$probeLsn = [System.Net.Sockets.TcpListener]::new(
-  [System.Net.IPAddress]::Loopback, $probePort)
-$probeLsn.Start()
 function WfpVerify([string]$tgt) {
   $out = & $Exe wfp verify --target $tgt
   $ec = $LASTEXITCODE
@@ -410,7 +431,7 @@ Write-Host 'U1 ok: uninstall removes the recorded custom-name account'
 
 # ── U1c: --sandbox-user rejects a name we didn't create ────────────
 # `Administrators` resolves (as an alias) → the ownership guard at
-# ensure_user() entry fires (no state.db record) → provision() bails
+# ensure_user() entry fires (no HKLM setup record) → provision() bails
 # → exit 14.
 $u1c = & $Exe @(@('install', '--sandbox-user', 'Administrators') + $isl + $pr) 2>&1 | Out-String
 if ($LASTEXITCODE -ne 14) {

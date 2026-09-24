@@ -43,7 +43,11 @@ export type {
 
 // Platform-specific utilities
 export type { SandboxViolationEvent } from './sandbox/macos-sandbox-utils.js'
-export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
+export {
+  type SandboxDependencyCheck,
+  LinuxSandboxProfileError,
+  type LinuxSandboxProfileErrorCode,
+} from './sandbox/linux-sandbox-utils.js'
 
 // Windows install/status API
 export {

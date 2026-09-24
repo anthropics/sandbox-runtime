@@ -25,6 +25,7 @@ export default [
             'vendor/build-common.ts',
             'vendor/seccomp/build.ts',
             'vendor/srt-win/build.ts',
+            'vendor/java-proxy-agent/build.ts',
           ],
         },
         tsconfigRootDir: import.meta.dirname,

@@ -7,3 +7,4 @@ vendor/seccomp/arm64/
 vendor/srt-win/x64/
 vendor/srt-win/arm64/
 vendor/srt-win/target/
+vendor/java-proxy-agent/srt-proxy-agent.jar

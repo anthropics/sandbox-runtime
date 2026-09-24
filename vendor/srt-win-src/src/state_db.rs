@@ -2,9 +2,18 @@
 //! sandbox-user ACEs (grant ALLOW / stamp DENY) so the LAST broker
 //! to release a path can drop the ACE.
 //!
-//! Lives at `%LOCALAPPDATA%\sandbox-runtime\state.db` (rusqlite,
-//! WAL). The directory is ACL-stamped real-user-only `(OI)(CI)` on
-//! every open so the sandbox child cannot tamper with the refcount.
+//! TWO stores, split by scope and by writer:
+//!
+//! - SESSION store (`%LOCALAPPDATA%\sandbox-runtime\state.db`,
+//!   per-user): brokers / ace_holders / working_aces. These rows
+//!   DRIVE ACL mutations on the owning user's files, so they are
+//!   only trustworthy while only that user (and admins) can write
+//!   them — the directory is stamped real-user-only on every open.
+//! - MACHINE state (`HKLM\SOFTWARE\sandbox-runtime` — see
+//!   `crate::reg` — plus the `ca\` key material under
+//!   `%ProgramData%\sandbox-runtime`): install-owned, admin-written,
+//!   read unprivileged. Not this module's concern beyond
+//!   [`machine_store_dir`] and the recompose ambient fold-in.
 //!
 //! ## Disk-is-truth invariant
 //!
@@ -19,12 +28,13 @@
 //!
 //! ## Locking and crash safety
 //!
-//! Every `acl stamp|grant|restore|revoke|recover` runs under a
-//! single named mutex `Local\sandbox-runtime-acl-init`
-//! (real-user-only DACL). The mutex — NOT a DB transaction —
-//! serializes whole operations across brokers; `WAIT_ABANDONED`
-//! tells us the previous holder died mid-op (crash-recovery
-//! already runs unconditionally).
+//! Every `acl stamp|grant|restore|revoke|recover` runs under an
+//! exclusive file lock on `.acl-init.lock` in the per-user session
+//! dir (see `InitMutex::acquire` for why a file lock and not a
+//! named mutex). The lock — NOT a DB transaction — serializes
+//! whole operations across the user's brokers; the kernel drops it
+//! when a holder dies, and crash-recovery runs unconditionally at
+//! every acquire.
 //!
 //! There is deliberately NO single enclosing transaction. Each
 //! path's (FS mutation + row change) commits independently so a
@@ -37,15 +47,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{FILETIME, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    CreateMutexExW, GetCurrentProcess, GetProcessTimes, INFINITE, MUTEX_ALL_ACCESS, OpenProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION, ReleaseMutex, WaitForSingleObject,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    WaitForSingleObject,
 };
 
 use crate::acl::{self, SbAce};
 use crate::path_id::{self, FileId};
-use crate::util::{pcwstr, wstr};
 
 /// Holder PID — the LONG-LIVED process that owns a set of stamps
 /// (the Node host in production), NOT the ephemeral `srt-win acl`
@@ -62,17 +71,10 @@ impl std::str::FromStr for HolderPid {
     }
 }
 
-/// `Local\` = per–Terminal-Services-session namespace. Brokers for
-/// the SAME user in DIFFERENT TS sessions share the state DB
-/// (`%LOCALAPPDATA%`) but NOT this mutex — they would not exclude
-/// each other. `Global\` would, but creating it requires
-/// `SeCreateGlobalPrivilege`, which an unelevated broker may lack.
-/// The cross-session same-user case is rare enough that we accept
-/// the limitation for v1; revisit if a real use case appears.
-const MUTEX_NAME: &str = r"Local\sandbox-runtime-acl-init";
-const SCHEMA_VERSION: i64 = 7;
+/// Per-user session DB (brokers / ace_holders / working_aces).
+const SESSION_SCHEMA_VERSION: i64 = 8;
 
-const SCHEMA_SQL: &str = r#"
+const SESSION_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS brokers (
   pid                 INTEGER PRIMARY KEY,
   process_create_time INTEGER NOT NULL,
@@ -119,23 +121,6 @@ CREATE INDEX IF NOT EXISTS ace_holders_by_pid ON ace_holders (pid);
 CREATE TABLE IF NOT EXISTS placeholders (
   canonical_path TEXT PRIMARY KEY
 );
--- Install-time setup record: the sandbox user's DPAPI-encrypted
--- credential plus the setup marker. One row per provisioned
--- sandbox user (currently exactly one). Additive table — no
--- schema-version bump.
-CREATE TABLE IF NOT EXISTS sandbox_user (
-  username        TEXT    PRIMARY KEY,
-  user_sid        TEXT    NOT NULL,
-  group_sid       TEXT    NOT NULL,
-  cred            BLOB    NOT NULL,
-  marker_version  INTEGER NOT NULL,
-  created_at_unix INTEGER NOT NULL,
-  -- DER-encoded MITM CA certificate (`srt-win user trust-ca`).
-  -- NULL when no CA was installed. Persisted so `user status` can
-  -- surface the thumbprint + PEM to the host's tlsTerminate setup
-  -- without it having to re-read the original file.
-  ca_cert         BLOB
-);
 "#;
 
 /// Outcome of a crash-recovery pass.
@@ -146,76 +131,104 @@ pub struct RecoveryReport {
     pub aces_revoked: u32,
 }
 
-/// RAII guard for the init mutex. Releases on drop. The mutex
-/// HANDLE itself is closed too — `CreateMutexExW` returns a fresh
-/// handle every call (with `ERROR_ALREADY_EXISTS` set if the kernel
-/// object already existed), so each `acquire` owns its own handle.
+/// RAII guard for the init lock — an exclusive `LockFileEx` range
+/// lock on `.acl-init.lock` inside the per-user session dir.
+///
+/// A FILE lock, not a named mutex, on purpose: the sandbox child
+/// shares the broker's Terminal-Services session, and Windows named
+/// objects are first-come — a child could CREATE the well-known
+/// name before the broker and sit on it (create-first squatting
+/// bypasses any DACL we would put on our own object; confirmed
+/// empirically — a sandboxed `New-Object Threading.Mutex` held the
+/// old `Local\` name and stalled the owner's acl ops for the full
+/// timeout). The lock file lives in the session dir, whose DACL
+/// excludes the sandbox child, so there is nothing for it to squat;
+/// and the kernel releases file locks when the holder dies, which
+/// also retires the abandoned-mutex special case (crash recovery
+/// runs at every acquire regardless).
 struct InitMutex {
-    h: HANDLE,
+    file: std::fs::File,
 }
 impl Drop for InitMutex {
     fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Storage::FileSystem::UnlockFile;
         unsafe {
-            let _ = ReleaseMutex(self.h);
-            let _ = CloseHandle(self.h);
+            let _ = UnlockFile(HANDLE(self.file.as_raw_handle()), 0, 0, 1, 0);
         }
     }
 }
 
 impl InitMutex {
-    /// Create-or-open and acquire the init mutex. The mutex carries
-    /// a real-user-only DACL so a sandbox child cannot open it (and
-    /// therefore cannot stall stamps by sitting on the lock).
     fn acquire() -> Result<Self> {
-        let sa = acl::build_init_mutex_sa().context("build init-mutex SECURITY_ATTRIBUTES")?;
-        let name = wstr(MUTEX_NAME);
-        // Don't request CREATE_MUTEX_INITIAL_OWNER — if another
-        // broker already created the mutex this call opens it,
-        // and INITIAL_OWNER would silently NOT acquire in that
-        // case. A separate Wait gives a uniform code path and
-        // surfaces WAIT_ABANDONED.
-        let h = unsafe {
-            CreateMutexExW(
-                Some(sa.as_ptr()),
-                pcwstr(&name),
-                0, // dwFlags — no CREATE_MUTEX_INITIAL_OWNER
-                MUTEX_ALL_ACCESS.0,
-            )
-        }
-        .with_context(|| format!("CreateMutexExW({MUTEX_NAME})"))?;
-        // `sa` can drop now — the kernel object owns its SD.
-
-        let r = unsafe { WaitForSingleObject(h, INFINITE) };
-        match r {
-            WAIT_OBJECT_0 => {}
-            WAIT_ABANDONED => {
-                // Previous holder died while owning the mutex. We
-                // now own it. Crash-recovery (which the caller will
-                // run next) handles the cleanup; nothing extra here.
-                eprintln!(
-                    "srt-win: init-mutex WAIT_ABANDONED — previous \
-                     `srt-win acl` died mid-operation; running recovery"
-                );
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Storage::FileSystem::{
+            LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+        };
+        use windows::Win32::System::IO::OVERLAPPED;
+        let dir = session_store_dir()?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create_dir_all {}", dir.display()))?;
+        let path = dir.join(".acl-init.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // Never truncate: the file's only role is carrying the
+            // kernel byte-range lock; its content is irrelevant.
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open init-lock file {}", path.display()))?;
+        // Bounded, not infinite: crash-recovery under this lock is
+        // sub-second and real contention is a handful of concurrent
+        // acl ops for ONE user, so a minute means a wedged holder —
+        // fail the op loudly rather than hang.
+        const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
+        const POLL_MS: u64 = 100;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(ACQUIRE_TIMEOUT_MS);
+        loop {
+            let mut ov = OVERLAPPED::default();
+            let r = unsafe {
+                LockFileEx(
+                    HANDLE(file.as_raw_handle()),
+                    LOCK_FILE_FLAGS(LOCKFILE_EXCLUSIVE_LOCK.0 | LOCKFILE_FAIL_IMMEDIATELY.0),
+                    None,
+                    1,
+                    0,
+                    &mut ov,
+                )
+            };
+            if r.is_ok() {
+                return Ok(Self { file });
             }
-            other => {
-                let err = std::io::Error::last_os_error();
-                unsafe {
-                    let _ = CloseHandle(h);
-                }
+            if std::time::Instant::now() >= deadline {
                 bail!(
-                    "WaitForSingleObject({MUTEX_NAME}): unexpected {other:?} \
-                     ({err})"
+                    "init lock {} not acquired within {ACQUIRE_TIMEOUT_MS}ms — \
+                     another srt-win/broker is holding it (wedged?)",
+                    path.display(),
                 );
             }
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         }
-        Ok(Self { h })
     }
 }
 
-/// Open (creating if needed) the state DB at the default location.
-/// Stamps the parent directory real-user-only on EVERY open.
+/// The one seam through which install-time flows (ambient deny
+/// stamping/clearing) serialize against this user's brokers —
+/// acquire the session init lock without opening the session DB.
+pub fn acquire_session_lock() -> Result<impl Drop> {
+    InitMutex::acquire()
+}
+
+/// Open (creating if needed) the per-user SESSION DB. Stamps the
+/// parent directory real-user-only on EVERY open — the session
+/// store is the pre-split `%LOCALAPPDATA%` model: rows here are
+/// TRUSTED because only the owning user (and admins) can write
+/// them, which is exactly why session bookkeeping must not live in
+/// the Users-writable machine store.
 pub fn open_db() -> Result<Connection> {
-    let dir = state_dir()?;
+    let dir = session_store_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
     // Stamp the directory `(OI)(CI)` real-user-only so the sandbox
     // child cannot tamper with state.db / -wal / -shm. Done on
@@ -276,7 +289,11 @@ pub fn open_db() -> Result<Connection> {
             dir.display()
         );
     }
-    open_db_at(&dir.join("state.db"))
+    open_db_at(
+        &dir.join("state.db"),
+        SESSION_SCHEMA_SQL,
+        SESSION_SCHEMA_VERSION,
+    )
 }
 
 /// Filter on `release_aces` for the deny-ACE lifecycle.
@@ -306,12 +323,20 @@ fn query_vec<T, P: rusqlite::Params>(
     Ok(v)
 }
 
-/// Read-only open of the state DB at the default location. Returns
-/// `None` if `state.db` doesn't exist yet. No mutex, no
-/// `create_dir_all`, no dir-stamp, no schema apply — for the
-/// per-Bash-call hot path (`install::read_setup` / `read_ca_cert`).
+/// Read-only open of the per-user SESSION DB. Returns `None` if it
+/// doesn't exist yet. No mutex, no `create_dir_all`, no dir-stamp,
+/// no schema apply.
 pub fn open_db_ro() -> Result<Option<Connection>> {
-    let path = state_dir()?.join("state.db");
+    open_ro_at(&session_store_dir()?.join("state.db"))
+}
+
+fn open_ro_at(path: &std::path::Path) -> Result<Option<Connection>> {
+    let schema_version = SESSION_SCHEMA_VERSION;
+    let path = path.to_path_buf();
+    // Degrade, don't fail: a garbage/unreadable session DB must read
+    // as "nothing recorded" — an Err here would propagate through
+    // crash_recovery into every acl op for this user. The RW open
+    // path renames a corrupt file away and recreates it.
     match path.try_exists() {
         Ok(false) => return Ok(None),
         Ok(true) => {}
@@ -335,14 +360,23 @@ pub fn open_db_ro() -> Result<Option<Connection>> {
     // `Connection::open` and `execute_batch(SCHEMA_SQL)`): ver==0
     // and there's no `sandbox_user` row, so "not provisioned yet"
     // is the right answer.
-    let ver: i64 = conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .context("read user_version (RO)")?;
-    if ver != SCHEMA_VERSION {
+    let ver: i64 = match conn.query_row("PRAGMA user_version", [], |r| r.get(0)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "srt-win: state DB at {} is unreadable ({e}); treating \
+                 as not provisioned. Re-run `srt-win install` to \
+                 recreate it.",
+                path.display(),
+            );
+            return Ok(None);
+        }
+    };
+    if ver != schema_version {
         if ver != 0 {
             eprintln!(
                 "srt-win: state DB at {} is at schema v{ver} \
-                 (expected v{SCHEMA_VERSION}); treating as not \
+                 (expected v{schema_version}); treating as not \
                  provisioned. Re-run `srt-win install` to migrate.",
                 path.display(),
             );
@@ -352,28 +386,35 @@ pub fn open_db_ro() -> Result<Option<Connection>> {
     Ok(Some(conn))
 }
 
-/// Open at an arbitrary path. Tests use `:memory:` via
-/// `open_db_at(Path::new(":memory:"))`.
-pub(crate) fn open_db_at(path: &std::path::Path) -> Result<Connection> {
+/// Open at an arbitrary path with the given schema + version.
+/// Tests use `:memory:`.
+pub(crate) fn open_db_at(
+    path: &std::path::Path,
+    schema_sql: &str,
+    schema_version: i64,
+) -> Result<Connection> {
     // Schema mismatch → rename + recreate. No ALTER/DROP migration:
     // the old DB is preserved (debugging/recovery) at
     // state.db.v<old>.<ts>.bak alongside `path`, and a fresh DB is
-    // created at the expected schema. `acl recover` sweeps orphaned
-    // ACEs by trustee SID without the old rows. The `sandbox_user`
-    // row (cred + ca_cert) is in the renamed-away DB → the hint
-    // says re-run install + trust-ca. The .bak inherits the
-    // PROTECTED broker-only DACL from the state dir (stamped by
-    // [`open_db`]); no per-file stamp needed. Chokepoint here so
-    // direct callers (`clear_setup`, `trust_ca`) don't silently
-    // bump `user_version` on a stale DB.
+    // created at the expected schema. The next recovery converges
+    // from the fresh (empty) rows. A PRE-SPLIT per-user DB carried
+    // the DPAPI cred blob in its `sandbox_user` row (machine-scope:
+    // readable = decryptable), so the blob is scrubbed from the
+    // .bak below before anything else can read it. The .bak keeps
+    // its directory's DACL (real-user-only stamp); no per-file
+    // stamp.
     if path.exists() {
         let probe = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY);
         if let Ok(c) = probe {
+            // A garbage (non-SQLite) file fails the pragma — mark it
+            // ver -1 so it takes the rename-away path below instead
+            // of reaching the schema apply (which would hard-error
+            // forever on a file any local user can plant).
             let ver: i64 = c
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap_or(0);
+                .unwrap_or(-1);
             drop(c);
-            if ver != 0 && ver != SCHEMA_VERSION {
+            if ver != 0 && ver != schema_version {
                 let dir = path
                     .parent()
                     .ok_or_else(|| anyhow!("state DB path '{}' has no parent", path.display()))?;
@@ -412,9 +453,14 @@ pub(crate) fn open_db_at(path: &std::path::Path) -> Result<Connection> {
                     let to = dir.join(format!("{stem}.v{ver}.{ts}.bak{ext}"));
                     let _ = std::fs::rename(&p, &to);
                 }
+                // Best-effort cred scrub (pre-split schemas only —
+                // absent table/column is fine).
+                if let Ok(bc) = Connection::open(&bak) {
+                    let _ = bc.execute("UPDATE sandbox_user SET cred = x''", []);
+                }
                 eprintln!(
                     "srt-win: state DB at schema v{ver} found, expected \
-                     v{SCHEMA_VERSION}; renamed to {} and created fresh. \
+                     v{schema_version}; renamed to {} and created fresh. \
                      Re-run `srt-win install` (and `srt-win user \
                      trust-ca <pem>` if you use TLS termination) to \
                      re-provision. `srt-win acl recover` will sweep \
@@ -437,165 +483,49 @@ pub(crate) fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.execute_batch(SCHEMA_SQL).context("apply schema")?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    conn.execute_batch(schema_sql).context("apply schema")?;
+    conn.pragma_update(None, "user_version", schema_version)?;
     Ok(conn)
 }
 
-/// One row of the `sandbox_user` table — the install-time setup
-/// record: the sandbox user's DPAPI-encrypted credential plus the
-/// setup marker. Written by `srt-win install`, read by the
-/// non-elevated broker. The `ca_cert` column is read/written
-/// separately ([`read_ca_cert`] / [`set_ca_cert`]) so this struct
-/// carries exactly what [`write_setup_info`] owns.
-#[derive(Debug, Clone)]
-pub struct SetupInfo {
-    pub sandbox_user: String,
-    pub sandbox_user_sid: String,
-    pub sandbox_group_sid: String,
-    /// DPAPI ciphertext of the sandbox user's password.
-    pub cred: Vec<u8>,
-    pub marker_version: u32,
-    pub created_at_unix: u64,
+/// The machine-wide store dir: `%ProgramData%\sandbox-runtime` —
+/// since the move of credential/marker/identity/CA-record/ambient
+/// state to `HKLM\SOFTWARE\sandbox-runtime` ([`crate::reg`]), this
+/// hosts only the managed CA key material (`ca\`), which must stay
+/// on the filesystem because the broker's unelevated
+/// generate-if-absent self-heal rewrites it. Created (and ACL'd) by
+/// the elevated install (`install::provision_machine_store`); a
+/// pre-created directory is healed there by taking ownership and
+/// rewriting the DACL.
+pub fn machine_store_dir() -> Result<PathBuf> {
+    state_dir_from_base(std::env::var_os("ProgramData"), "ProgramData")
 }
 
-/// Write the setup record. `ON CONFLICT … DO UPDATE` (NOT
-/// `INSERT OR REPLACE`) so a re-install preserves any column this
-/// function doesn't own — currently `ca_cert`, whose only writer
-/// is [`set_ca_cert`]. Install is sequential under self-elevation,
-/// so the caller doesn't need [`with_init_lock`].
-pub fn write_setup_info(conn: &Connection, info: &SetupInfo) -> Result<()> {
-    // Single-row invariant: [`read_setup_info`] does `LIMIT 1`, so a
-    // `--force` re-install under a different `--sandbox-user` name
-    // must not leave the old row behind (the ON CONFLICT keys on
-    // username and would insert a second row). This DOES drop the
-    // old row's `ca_cert` — intentionally: the CA was written into
-    // the OLD user's `CurrentUser\Root` hive, so preserving the
-    // record for the NEW user would lie about a Root install that
-    // hasn't happened. Same-name re-install skips this DELETE and
-    // the ON CONFLICT below preserves `ca_cert`.
-    conn.execute(
-        "DELETE FROM sandbox_user WHERE username != ?1",
-        params![info.sandbox_user],
-    )
-    .context("DELETE stale sandbox_user row")?;
-    conn.execute(
-        "INSERT INTO sandbox_user \
-           (username, user_sid, group_sid, cred, marker_version, \
-            created_at_unix) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(username) DO UPDATE SET \
-           user_sid        = excluded.user_sid, \
-           group_sid       = excluded.group_sid, \
-           cred            = excluded.cred, \
-           marker_version  = excluded.marker_version, \
-           created_at_unix = excluded.created_at_unix",
-        params![
-            info.sandbox_user,
-            info.sandbox_user_sid,
-            info.sandbox_group_sid,
-            info.cred,
-            info.marker_version,
-            info.created_at_unix as i64,
-        ],
-    )
-    .context("UPSERT sandbox_user")?;
-    Ok(())
+/// The per-user SESSION dir: `%LOCALAPPDATA%\sandbox-runtime` —
+/// ACL-bookkeeping state (`state.db`: brokers/holders/working
+/// ACEs). Per-user by design: these rows DRIVE ACL mutations on the
+/// owning user's files, so they must only be writable by that user
+/// (and admins) — in a shared store any local user could seed rows
+/// for another user's broker to apply. Stamped real-user-only on
+/// every [`open_db`].
+pub fn session_store_dir() -> Result<PathBuf> {
+    state_dir_from_base(std::env::var_os("LOCALAPPDATA"), "LOCALAPPDATA")
 }
 
-/// Hydrate the setup record. `Ok(None)` when no install has run
-/// (no row, or the `sandbox_user` table itself absent —
-/// [`open_db_ro`] doesn't apply schema). Currently exactly one
-/// sandbox user is provisioned, so this reads the single row.
-pub fn read_setup_info(conn: &Connection) -> Result<Option<SetupInfo>> {
-    match conn
-        .query_row(
-            "SELECT username, user_sid, group_sid, cred, \
-                    marker_version, created_at_unix \
-             FROM sandbox_user LIMIT 1",
-            [],
-            |r| {
-                Ok(SetupInfo {
-                    sandbox_user: r.get(0)?,
-                    sandbox_user_sid: r.get(1)?,
-                    sandbox_group_sid: r.get(2)?,
-                    cred: r.get(3)?,
-                    marker_version: r.get(4)?,
-                    created_at_unix: r.get::<_, i64>(5)? as u64,
-                })
-            },
-        )
-        .optional()
-    {
-        Ok(v) => Ok(v),
-        Err(e) if missing_sandbox_user_table(&e) => Ok(None),
-        Err(e) => Err(anyhow!("SELECT sandbox_user: {e}")),
-    }
-}
-
-/// Read just the `ca_cert` column from the (single) row. `Ok(None)`
-/// when no install has run, no CA was recorded, or the table/column
-/// is absent.
-pub fn read_ca_cert(conn: &Connection) -> Result<Option<crate::cert_store::CertDer>> {
-    match conn
-        .query_row("SELECT ca_cert FROM sandbox_user LIMIT 1", [], |r| r.get(0))
-        .optional()
-    {
-        Ok(v) => Ok(v.flatten()),
-        Err(e) if missing_sandbox_user_table(&e) => Ok(None),
-        Err(e) => Err(anyhow!("SELECT sandbox_user.ca_cert: {e}")),
-    }
-}
-
-/// Overwrite just the `ca_cert` column on the (single) existing
-/// row. `srt-win user trust-ca` uses this to record a CA without
-/// re-provisioning. Fails when no install has run yet.
-pub fn set_ca_cert(conn: &Connection, der: &crate::cert_store::CertDer) -> Result<()> {
-    let n = conn
-        .execute("UPDATE sandbox_user SET ca_cert = ?1", params![der])
-        .context("UPDATE sandbox_user.ca_cert")?;
-    if n == 0 {
-        bail!("no sandbox-user row to attach CA to — run `srt-win install`");
-    }
-    Ok(())
-}
-
-/// `DELETE FROM sandbox_user` — uninstall clears the credential
-/// and marker in one go.
-pub fn clear_setup_info(conn: &Connection) -> Result<()> {
-    match conn.execute("DELETE FROM sandbox_user", []) {
-        Ok(_) => Ok(()),
-        Err(e) if missing_sandbox_user_table(&e) => Ok(()),
-        Err(e) => Err(anyhow!("clear_setup_info: {e}")),
-    }
-}
-
-fn missing_sandbox_user_table(e: &rusqlite::Error) -> bool {
-    matches!(
-        e,
-        rusqlite::Error::SqliteFailure(_, Some(m))
-            if m.contains("no such table") && m.contains("sandbox_user")
-    )
-}
-
-/// `%LOCALAPPDATA%\sandbox-runtime`. Errors if `LOCALAPPDATA` is
-/// unset, empty, or yields a non-absolute path — a relative state
-/// dir would put the broker-only-stamped DB in the CWD and break
-/// cross-broker refcounting/recovery.
-pub fn state_dir() -> Result<PathBuf> {
-    state_dir_from(std::env::var_os("LOCALAPPDATA"))
-}
-
-fn state_dir_from(local_app_data: Option<std::ffi::OsString>) -> Result<PathBuf> {
-    let base = local_app_data
+/// Errors if `var` (`%ProgramData%`) is unset,
+/// empty, or yields a non-absolute path — a relative state dir
+/// would put the ACL-protected DB in the CWD and break cross-broker
+/// refcounting/recovery.
+fn state_dir_from_base(base: Option<std::ffi::OsString>, var: &str) -> Result<PathBuf> {
+    let base = base
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("LOCALAPPDATA not set or empty"))?;
+        .ok_or_else(|| anyhow!("{var} not set or empty"))?;
     let dir = base.join("sandbox-runtime");
     if !dir.is_absolute() {
         bail!(
             "state-DB directory '{}' is not absolute \
-             (LOCALAPPDATA='{}'); refusing relative state path",
+             ({var}='{}'); refusing relative state path",
             dir.display(),
             base.display()
         );
@@ -614,12 +544,21 @@ pub fn with_init_lock<R>(
     force_recover: bool,
     f: impl FnOnce(&mut Locked) -> Result<R>,
 ) -> Result<(R, RecoveryReport)> {
-    let _mutex = InitMutex::acquire()?;
-    let conn = open_db()?;
-    let report = crash_recovery(&conn, force_recover)?;
+    let (_mutex, conn, report) = locked_recovered(force_recover)?;
     let mut locked = Locked { conn, holder_pid };
     let out = f(&mut locked)?;
     Ok((out, report))
+}
+
+/// The shared critical-section preamble of [`with_init_lock`] and
+/// [`with_install_lock`]: acquire the init mutex, open the DB, run
+/// crash recovery. Keep the mutex guard alive for the whole
+/// critical section.
+fn locked_recovered(force_recover: bool) -> Result<(InitMutex, Connection, RecoveryReport)> {
+    let mutex = InitMutex::acquire()?;
+    let conn = open_db()?;
+    let report = crash_recovery(&conn, force_recover)?;
+    Ok((mutex, conn, report))
 }
 
 /// View inside `with_init_lock`. Owns the `Connection`; each method
@@ -1096,6 +1035,15 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::DenyDelete => set.deny_delete = true,
         }
     }
+    // Install-time ambient write-deny (HKLM AmbientDenies) folds
+    // into every converge on the path, so session release/recovery
+    // cannot strip it. WriteDeny is the floor: a session's wider
+    // ReadDeny wins while its row is held, and the floor returns on
+    // release. The registry value is admin-written (HKLM\SOFTWARE
+    // default DACL), so the list is trustworthy as read.
+    if crate::install::ambient_deny_recorded(canon) {
+        set.deny.get_or_insert(acl::DenyMask::WriteDeny);
+    }
     acl::apply_sandbox_aces(canon, sandbox_sid, set)
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
 }
@@ -1197,7 +1145,12 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
     //     and one still-held kind keeps the held one. Sandbox SID
     //     comes from `read_setup_info` — when no sandbox user is
     //     provisioned, there are no `working_aces` rows to orphan.
-    if let Some(sb) = read_setup_info(conn)?.map(|s| s.sandbox_user_sid) {
+    // Identity comes from the VALIDATED machine-store read (name↔SID
+    // + sandbox-group membership against SAM), never from raw rows:
+    // the machine DB is Users-writable, and this SID is about to be
+    // written into DACLs. No valid identity → skip disk work
+    // entirely (the session rows stay put for a later recovery).
+    if let Some(sb) = crate::install::read_setup()?.map(|s| s.sandbox_user_sid) {
         let orphan_aces: Vec<(String, String, Vec<u8>)> = query_vec(
             conn,
             "SELECT g.canonical_path, g.kind, g.file_id \
@@ -1369,13 +1322,16 @@ mod tests {
         use std::ffi::OsString;
         // Unset or empty → error (var_os returns Some("") for a
         // present-but-empty var, which the old code accepted).
-        assert!(state_dir_from(None).is_err());
-        assert!(state_dir_from(Some(OsString::from(""))).is_err());
+        assert!(state_dir_from_base(None, "ProgramData").is_err());
+        assert!(state_dir_from_base(Some(OsString::from("")), "ProgramData").is_err());
         // Relative → error (would put the broker-only-stamped DB
         // in CWD).
-        assert!(state_dir_from(Some(OsString::from("rel"))).is_err());
+        assert!(state_dir_from_base(Some(OsString::from("rel")), "ProgramData").is_err());
         // Absolute → ok.
-        let ok = state_dir_from(Some(OsString::from(r"C:\Users\u\AppData\Local")));
+        let ok = state_dir_from_base(
+            Some(OsString::from(r"C:\Users\u\AppData\Local")),
+            "ProgramData",
+        );
         assert_eq!(
             ok.unwrap(),
             PathBuf::from(r"C:\Users\u\AppData\Local\sandbox-runtime")
@@ -1387,7 +1343,12 @@ mod tests {
     /// stamp (those are integration-tested via the G-rows in
     /// smoke-exec.ps1).
     fn with_mem_db<R>(f: impl FnOnce(&mut Locked) -> R) -> R {
-        let conn = open_db_at(std::path::Path::new(":memory:")).unwrap();
+        let conn = open_db_at(
+            std::path::Path::new(":memory:"),
+            SESSION_SCHEMA_SQL,
+            SESSION_SCHEMA_VERSION,
+        )
+        .unwrap();
         let mut db = Locked {
             conn,
             holder_pid: HolderPid(std::process::id()),
@@ -1425,18 +1386,23 @@ mod tests {
 
     #[test]
     fn schema_applies_in_memory() {
+        // Session schema: bookkeeping tables only — the setup
+        // record lives in the MACHINE schema since the store split.
         with_mem_db(|db| {
             let n: i64 = db
                 .conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type='table' \
                      AND name IN ('brokers','working_aces','ace_holders', \
-                                  'sandbox_user','placeholders')",
+                                  'placeholders','sandbox_user')",
                     [],
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(n, 5);
+            assert_eq!(
+                n, 4,
+                "session schema: 4 bookkeeping tables, no sandbox_user"
+            );
         });
     }
 

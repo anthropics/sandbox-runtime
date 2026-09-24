@@ -1,20 +1,11 @@
 import { spawn } from 'child_process'
 import { text } from 'node:stream/consumers'
-import { whichSync } from './which.js'
 
 export interface RipgrepConfig {
   command: string
   args?: string[]
   /** Override argv[0] when spawning (for multicall binaries that dispatch on argv[0]) */
   argv0?: string
-}
-
-/**
- * Check if ripgrep (rg) is available synchronously
- * Returns true if rg is installed, false otherwise
- */
-export function hasRipgrepSync(): boolean {
-  return whichSync('rg') !== null
 }
 
 /**

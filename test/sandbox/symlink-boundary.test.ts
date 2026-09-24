@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, rmSync, unlinkSync, lstatSync } from 'node:fs'
 import { join } from 'node:path'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import {
+  isAtOrUnder,
   isSymlinkOutsideBoundary,
   normalizePathForSandbox,
 } from '../../src/sandbox/sandbox-utils.js'
@@ -387,6 +388,17 @@ describe('isSymlinkOutsideBoundary Unit Tests', () => {
         isSymlinkOutsideBoundary('/private/var/data', '/private/var/data'),
       ).toBe(false)
     })
+  })
+})
+
+describe('isAtOrUnder', () => {
+  it('contains by path segment, root included', () => {
+    expect(isAtOrUnder('/a/b', '/a')).toBe(true)
+    expect(isAtOrUnder('/a', '/a')).toBe(true)
+    expect(isAtOrUnder('/ab', '/a')).toBe(false)
+    expect(isAtOrUnder('/x', '/')).toBe(true)
+    expect(isAtOrUnder('/', '/')).toBe(true)
+    expect(isAtOrUnder('/', '/a')).toBe(false)
   })
 })
 
