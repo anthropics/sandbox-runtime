@@ -260,18 +260,23 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
 
       // Started at pkg/a the same link leaves the pattern's tree. It is a
       // match, so what it leads to is still denied as a whole, but nothing
-      // is listed out there: x.txt beneath the carve-out was never found,
-      // so outside/ is handed back as a directory to bind nothing back
-      // beneath, like one that could not be listed.
+      // is listed out there: the carve-out is bound back as it is written,
+      // as beneath a directory denied literally, and x.txt beneath it has
+      // no mount of its own. Nothing is handed back as unlistable.
       const unlistable = new Set<string>()
+      const unfollowedLinks = new Map<string, string>()
       expect(
         expandReadDenyGlobLinux(
           join(ROOT, 'pkg', 'a', '**/build/**'),
           [join(OUTSIDE, 'pub')],
           unlistable,
+          { unfollowedLinks },
         ),
       ).toEqual([OUTSIDE, join(ROOT, 'pkg', 'a', 'build')])
-      expect([...unlistable]).toEqual([OUTSIDE])
+      expect([...unlistable]).toEqual([])
+      expect([...unfollowedLinks]).toEqual([
+        [join(ROOT, 'pkg', 'a', 'build', 'link'), OUTSIDE],
+      ])
     } finally {
       rmSync(join(OUTSIDE, 'pub'), { recursive: true })
     }
@@ -498,19 +503,31 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
       join(store, 'nm'),
     ])
 
-    // Started at proj, the first link leaves the tree: it is a match, so
-    // store/nm is denied as a whole, and the second link inside it is
-    // never seen. What lies behind it was not looked for, so store/nm is
-    // handed back as a directory to bind nothing back beneath.
-    const unlistable = new Set<string>()
-    expect(
-      expandReadDenyGlobLinux(
-        join(proj, '**/build/**'),
-        [join(store, 'keep', 'pub')],
-        unlistable,
-      ),
-    ).toEqual([join(store, 'nm')])
-    expect([...unlistable]).toEqual([join(store, 'nm')])
+    // Started at proj, the first link leaves the tree. It is a match, so
+    // store/nm is denied as a whole, and nothing is listed out there: the
+    // second link inside it is never seen, and store/keep, which only that
+    // link leads the pattern to, is not denied. That holds however the
+    // carve-out is written, and nothing is handed back as unlistable.
+    for (const carveOut of [
+      join(store, 'keep', 'pub'),
+      // Through the second link, which puts it beneath store/nm by name.
+      join(store, 'nm', 'keep', 'pub'),
+    ]) {
+      const unlistable = new Set<string>()
+      const unfollowedLinks = new Map<string, string>()
+      expect(
+        expandReadDenyGlobLinux(
+          join(proj, '**/build/**'),
+          [carveOut],
+          unlistable,
+          { unfollowedLinks },
+        ),
+      ).toEqual([join(store, 'nm')])
+      expect([...unlistable]).toEqual([])
+      expect([...unfollowedLinks]).toEqual([
+        [join(proj, 'build'), join(store, 'nm')],
+      ])
+    }
   })
 
   it('drops a matched link that does not resolve', () => {
