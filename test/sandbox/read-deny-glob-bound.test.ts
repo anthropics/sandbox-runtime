@@ -1019,6 +1019,52 @@ describe.if(isLinux)('a read-deny glob past its budget, at the manager', () => {
     expect(wrapped).not.toContain(join(OTHER, 'pkg0', '.env'))
   })
 
+  it('says in the read configuration which links its patterns left unfollowed', async () => {
+    const proj = join(ROOT, 'told')
+    mkdirSync(join(proj, 'src'), { recursive: true })
+    writeFileSync(join(proj, '.env'), '')
+    symlinkSync(OTHER, join(proj, 'bigtree'))
+    symlinkSync(join(proj, 'src'), join(proj, 'alias'))
+    const recursive = join(proj, '**/.env')
+    const shallow = join(proj, '*/.env')
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        // A literal entry and a pattern with nothing to say are in the list
+        // to show they add nothing.
+        denyRead: [recursive, join(proj, 'src'), shallow, join(PROJ, '*.key')],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+    try {
+      // Once for each pattern that came to the link and would have carried
+      // on beneath it; the link that stays in the tree is followed and is
+      // not among them.
+      expect(SandboxManager.getFsReadConfig().unfollowedDenyLinks).toEqual([
+        { pattern: recursive, link: join(proj, 'bigtree'), target: OTHER },
+        { pattern: shallow, link: join(proj, 'bigtree'), target: OTHER },
+      ])
+    } finally {
+      await SandboxManager.reset()
+    }
+
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        denyRead: [join(PROJ, '**/.env')],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+    try {
+      expect(SandboxManager.getFsReadConfig().unfollowedDenyLinks).toEqual([])
+    } finally {
+      await SandboxManager.reset()
+    }
+  })
+
   it('refuses the read configuration the same way', async () => {
     const pattern = join(PROJ, '**/.env')
     await SandboxManager.reset()

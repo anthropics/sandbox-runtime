@@ -39,6 +39,7 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
+  UnfollowedDenyLink,
 } from './sandbox-schemas.js'
 import {
   wrapCommandWithSandboxLinux,
@@ -1320,16 +1321,22 @@ function expandAllowReadGlob(pattern: string): string[] {
 function readDenyGlobExpander(
   reExposedPaths: readonly string[],
   unlistableDenyDirs: Set<string>,
+  unfollowedDenyLinks: UnfollowedDenyLink[],
 ): (pattern: string) => string[] {
   const budget = newGlobWalkBudget()
   return pattern => {
     try {
-      return expandReadDenyGlobLinux(
+      const unfollowedLinks = new Map<string, string>()
+      const expanded = expandReadDenyGlobLinux(
         pattern,
         reExposedPaths,
         unlistableDenyDirs,
-        { budget },
+        { budget, unfollowedLinks },
       )
+      for (const [link, target] of unfollowedLinks) {
+        unfollowedDenyLinks.push({ pattern, link, target })
+      }
+      return expanded
     } catch (error) {
       if (!(error instanceof GlobWalkBudgetError)) throw error
       throw new LinuxSandboxProfileError(
@@ -1372,9 +1379,14 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   )
   const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
   const unlistableDenyDirs = new Set<string>()
+  const unfollowedDenyLinks: UnfollowedDenyLink[] = []
   const denyPaths = resolveReadPathEntries(
     unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
-    readDenyGlobExpander(reExposedPaths, unlistableDenyDirs),
+    readDenyGlobExpander(
+      reExposedPaths,
+      unlistableDenyDirs,
+      unfollowedDenyLinks,
+    ),
     credentialRestrictions.degradeToDenyPaths,
   )
 
@@ -1382,6 +1394,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
+    unfollowedDenyLinks,
   }
 }
 
@@ -1757,18 +1770,24 @@ async function wrapWithSandbox(
     }
     const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
     const unlistableDenyDirs = new Set<string>()
+    const unfollowedDenyLinks: UnfollowedDenyLink[] = []
     const expandedDenyRead = resolveReadPathEntries(
       unionDenyReadPaths(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
         credentialRestrictions,
       ),
-      readDenyGlobExpander(reExposedPaths, unlistableDenyDirs),
+      readDenyGlobExpander(
+        reExposedPaths,
+        unlistableDenyDirs,
+        unfollowedDenyLinks,
+      ),
       credentialRestrictions.degradeToDenyPaths,
     )
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
       unlistableDenyDirs: [...unlistableDenyDirs],
+      unfollowedDenyLinks,
     }
   }
 

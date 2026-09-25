@@ -17,6 +17,20 @@
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
  */
+/**
+ * A symbolic link a `denyRead` pattern came to and did not list through,
+ * because it leads out of the pattern's tree. What the pattern would have
+ * matched beneath `target` is not denied.
+ */
+export interface UnfollowedDenyLink {
+  /** The `denyRead` entry being expanded. */
+  pattern: string
+  /** The link, as the walk spelled it. */
+  link: string
+  /** Where the link resolves. */
+  target: string
+}
+
 export interface FsReadRestrictionConfig {
   denyOnly: string[]
   allowWithinDeny?: string[]
@@ -29,6 +43,13 @@ export interface FsReadRestrictionConfig {
    * unmasked. Linux only: the other backends match globs natively.
    */
   unlistableDenyDirs?: string[]
+  /**
+   * The links the `denyRead` patterns left unfollowed, for a caller to tell
+   * its user what a pattern does not reach. It informs and restricts
+   * nothing: no backend reads it. Linux only: the other backends match
+   * patterns against resolved paths and walk nothing.
+   */
+  unfollowedDenyLinks?: UnfollowedDenyLink[]
 }
 
 /**
