@@ -8,6 +8,7 @@ export type {
   SandboxRuntimeConfig,
   NetworkConfig,
   FilesystemConfig,
+  FilesystemPathEntry,
   CredentialsConfig,
   CredentialFileConfig,
   CredentialEnvVarConfig,

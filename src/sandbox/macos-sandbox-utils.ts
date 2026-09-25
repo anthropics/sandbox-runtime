@@ -19,6 +19,7 @@ import {
   getDangerousDirectories,
 } from './sandbox-utils.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
+import { literalReadings, type PathListKind } from './path-entries.js'
 
 import type {
   FsReadRestrictionConfig,
@@ -162,16 +163,16 @@ function pathFilter(entry: PathEntry): string {
 
 /**
  * Compiles `entry`'s pattern with one of the shared string compilers in
- * `sandbox-utils.ts`. An entry the library anchored at a directory
- * (`anchor`) keeps that directory as a literal — the cwd is a name on disk
- * and may itself contain `[`, `*` or `?` — so only the tail below it goes
- * through the compiler, and the anchor is spliced back in escaped. Every
- * compiler there returns '^…$'.
+ * `sandbox-utils.ts`. An entry anchored at a directory (`anchor`) keeps
+ * that directory as a literal — the cwd, or a directory a caller's pattern
+ * lies beneath, is a name on disk and may itself contain `[`, `*` or `?` —
+ * so only the tail below it goes through the compiler, and the anchor is
+ * spliced back in escaped. Every compiler there returns '^…$'.
  *
  * This is the whole difference between the entry-taking wrappers here and
  * the string-taking compilers they call: those see a spelling in which
- * every character is glob syntax, which is right for what a caller wrote
- * and wrong for what the library computed.
+ * every character is glob syntax, which is right for the pattern reading
+ * of what a caller wrote and wrong for a name on disk.
  */
 function anchorRegex(
   entry: GlobPathEntry,
@@ -251,9 +252,11 @@ export type PathEntry =
       glob: true
       path: string
       /**
-       * Set when the library anchored this glob at a directory of its own
-       * (the cwd, for the mandatory `**\/<name>` patterns): the prefix of
-       * `path` that is a literal path rather than part of the pattern.
+       * Set when this glob is anchored at a directory that is a name on
+       * disk: the cwd, for the mandatory `**\/<name>` patterns, or a
+       * directory that exists and holds glob characters, for a caller's
+       * pattern beneath it. The prefix of `path` that is a literal path
+       * rather than part of the pattern.
        */
       anchor?: string
     }
@@ -267,12 +270,16 @@ function anchoredGlobEntry(anchor: string, pattern: string): PathEntry {
 }
 
 /**
- * A spelling that came from the caller's config: `*`, `?` and `[…]` in
- * what the caller wrote are the glob syntax it asked for. The decision is
- * made on that raw spelling, because resolving a relative or `~` path can
- * splice in a cwd or home directory whose own name contains those
- * characters — read back, they would turn the caller's `secrets` into a
- * pattern that never matches the directory it was resolved to.
+ * A spelling that came from the caller's config, read by its characters:
+ * with `*`, `?` or `[…]` in what the caller wrote it is a pattern. The
+ * decision is made on that raw spelling, because resolving a relative or
+ * `~` path can splice in a cwd or home directory whose own name contains
+ * those characters — read back, they would turn the caller's `secrets` into
+ * a pattern that never matches the directory it was resolved to.
+ *
+ * Those characters may also be part of a name that exists, and then the
+ * spelling is that name as well: {@link alsoReadAs} gives the readings this
+ * one leaves out.
  */
 function toPathEntry(pathPattern: string): PathEntry {
   return containsGlobChars(pathPattern)
@@ -289,13 +296,44 @@ function toPathEntry(pathPattern: string): PathEntry {
  * `subpath` filter whatever characters it contains — sniffed as a pattern,
  * a component like `a[b` would become a character class and the filter
  * would no longer match the path it was built from (the rule would be
- * inert). Never use this for a caller's spelling.
+ * inert). A path the caller marked literal is the same thing and comes
+ * through here too. Never use this for a spelling the caller did not mark.
  */
 function toLiteralPathEntry(literalPath: string): PathEntry {
   return {
     path: normalizePathForSandbox(literalPath, { literal: true }),
     glob: false,
   }
+}
+
+/**
+ * The readings a caller's spellings have beside {@link toPathEntry}'s: the
+ * name a spelling with glob characters also is, and its pattern beneath a
+ * directory that holds such characters in its own name. Empty for every
+ * spelling no part of which is such a name on disk.
+ */
+function alsoReadAs(
+  spellings: readonly string[] | undefined,
+  kind: PathListKind,
+): PathEntry[] {
+  return (spellings ?? []).flatMap(spelling => literalReadings(spelling, kind))
+}
+
+/**
+ * One of the caller's lists as entries: each spelling as its characters
+ * read, then the other readings of the spellings, then the paths that
+ * arrived marked literal.
+ */
+function callerEntries(
+  kind: PathListKind,
+  spellings: readonly string[] | undefined,
+  literalPaths: readonly string[] | undefined,
+): PathEntry[] {
+  return [
+    ...(spellings ?? []).map(toPathEntry),
+    ...alsoReadAs(spellings, kind),
+    ...(literalPaths ?? []).map(toLiteralPathEntry),
+  ]
 }
 
 /** Does a subtree-extended deny glob regex cover `entry`'s region? */
@@ -322,7 +360,7 @@ interface ResolvedReadConfig {
 
 function resolveReadConfig(
   config: FsReadRestrictionConfig,
-  writeAllowPaths: readonly string[] | undefined,
+  writeRoots: readonly PathEntry[],
   /**
    * Read denies the library resolved itself — the masked credential files,
    * which macOS degrades to a deny. Already literal: each names the file
@@ -331,12 +369,19 @@ function resolveReadConfig(
   libraryDenies: readonly PathEntry[],
 ): ResolvedReadConfig {
   return {
-    denies: [...(config.denyOnly || []).map(toPathEntry), ...libraryDenies],
+    denies: [
+      ...callerEntries('deny', config.denyOnly, config.literalDenyOnly),
+      ...libraryDenies,
+    ],
     // Non-glob spellings arrive slash-free from normalizePathForSandbox —
     // the nested-deny re-emit matches by `path + '/'` prefix, which a
     // preserved trailing slash would defeat ('<dir>//').
-    allows: (config.allowWithinDeny || []).map(toPathEntry),
-    writeRoots: (writeAllowPaths || []).map(toPathEntry),
+    allows: callerEntries(
+      'allow',
+      config.allowWithinDeny,
+      config.literalAllowWithinDeny,
+    ),
+    writeRoots: [...writeRoots],
   }
 }
 
@@ -864,12 +909,24 @@ function generateReadRules(
 }
 
 /**
+ * What a write config allows, as entries. Decided once per profile and
+ * handed to the read section and the write section alike, so the two cannot
+ * see different answers for one entry.
+ */
+function writeRootEntries(
+  config: FsWriteRestrictionConfig | undefined,
+): PathEntry[] {
+  return callerEntries('allow', config?.allowOnly, config?.literalAllowOnly)
+}
+
+/**
  * Generate filesystem write rules for sandbox profile
  */
 function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
-  allowGitConfig = false,
+  allowGitConfig: boolean,
+  writeRoots: readonly PathEntry[],
 ): string[] {
   if (!config) {
     return [`(allow file-write*)`]
@@ -879,8 +936,8 @@ function generateWriteRules(
 
   // Generate allow rules
   const allowFilters = new Set<string>()
-  for (const pathPattern of config.allowOnly || []) {
-    allowFilters.add(pathFilter(toPathEntry(pathPattern)))
+  for (const entry of writeRoots) {
+    allowFilters.add(pathFilter(entry))
   }
   rules.push(...renderRule('allow', ['file-write*'], allowFilters, logTag))
 
@@ -889,8 +946,10 @@ function generateWriteRules(
   // the mandatory entries carry their own literal/glob split.
   const denyEntries = [
     ...(config.denyWithinAllow || []).map(toPathEntry),
+    ...(config.literalDenyWithinAllow ?? []).map(toLiteralPathEntry),
     ...macGetMandatoryDenyEntries(allowGitConfig),
   ]
+  denyEntries.push(...alsoReadAs(config.denyWithinAllow, 'deny'))
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)
   const groupFilters = groups.map(literalDenyGroupFilters)
@@ -1231,6 +1290,7 @@ function generateSandboxProfile({
   }
   profile.push('')
 
+  const writeRoots = writeRootEntries(writeConfig)
   // Read rules
   // Pass write-allowed paths so that move-blocking deny rules in the read section
   // can be overridden for paths where file deletion should be permitted.
@@ -1238,7 +1298,7 @@ function generateSandboxProfile({
     readConfig || libraryDenyEntries.length > 0
       ? resolveReadConfig(
           readConfig ?? { denyOnly: [] },
-          writeConfig?.allowOnly,
+          writeRoots,
           libraryDenyEntries,
         )
       : undefined
@@ -1248,7 +1308,9 @@ function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
+  profile.push(
+    ...generateWriteRules(writeConfig, logTag, allowGitConfig, writeRoots),
+  )
 
   // Read-denied paths inside write roots: the read section's unlink/create
   // re-allow for write roots (and the write section's file-write* allows)
@@ -1347,7 +1409,9 @@ export function wrapCommandWithSandboxMacOS(
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
   const hasReadRestrictions =
-    (readConfig && readConfig.denyOnly.length > 0) ||
+    (readConfig &&
+      (readConfig.denyOnly.length > 0 ||
+        (readConfig.literalDenyOnly?.length ?? 0) > 0)) ||
     libraryDenyEntries.length > 0
   const hasWriteRestrictions = writeConfig !== undefined
   const hasEnvRestrictions =

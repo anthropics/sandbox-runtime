@@ -24,8 +24,9 @@ export {
   isUncPath,
 } from './sandbox-utils.js'
 import { certThumbprint, generateCa, validateCaPair } from './mitm-ca.js'
+import { literalReadings, markedLiteralPath } from './path-entries.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
-import type { SrtWinConfig } from './sandbox-config.js'
+import type { FilesystemPathEntry, SrtWinConfig } from './sandbox-config.js'
 
 /**
  * Windows sandbox backend.
@@ -1688,15 +1689,38 @@ export function uninstallWindowsSandbox(
  * `srt-win` soft-drops a missing UNC deny target rather than
  * materializing a placeholder chain on an SMB share. A UNC **glob**
  * still walks the share (user-trusted).
+ *
+ * `[` and `]` are characters of a name here, but the walk that expands a
+ * glob reads them as a character class on every platform. So a glob that
+ * lies beneath a directory with brackets in its name, which the walk alone
+ * would expand to nothing, is also expanded beneath that directory taken as
+ * the name it is (see path-entries.ts). A UNC glob is not: finding the
+ * directory would probe the share.
+ *
+ * An entry marked `{ path, literal: true }` is a literal whatever it holds.
+ * One that holds `*` or `?` is skipped: no Win32 name has them, so it names
+ * nothing that can exist, and `srt-win` refuses the characters outright.
  */
 export function expandWindowsFsPaths(
-  patterns: readonly string[],
+  patterns: readonly FilesystemPathEntry[],
   opts?: { mode?: 'grant' | 'deny' },
 ): string[] {
   const out = new Set<string>()
-  for (const raw of patterns) {
-    const norm = normalizePathForSandbox(raw)
-    const isGlob = containsGlobCharsWin(norm)
+  for (const entry of patterns) {
+    const marked = typeof entry !== 'string'
+    const raw = marked ? markedLiteralPath(entry) : entry
+    const norm = normalizePathForSandbox(
+      raw,
+      marked ? { literal: true } : undefined,
+    )
+    if (marked && containsGlobCharsWin(norm)) {
+      logForDebugging(
+        `[Sandbox Windows] Skipping a literal path that no file can have: ${norm}`,
+        { level: 'warn' },
+      )
+      continue
+    }
+    const isGlob = !marked && containsGlobCharsWin(norm)
     // UNC literal: pass raw (no stat) — see {@link isUncPath}. A
     // UNC glob falls through to expandGlobPattern below.
     if (isUncPath(norm) && !isGlob) {
@@ -1704,7 +1728,19 @@ export function expandWindowsFsPaths(
       continue
     }
     const candidates = isGlob
-      ? expandGlobPattern(norm, { caseInsensitive: true })
+      ? [
+          ...expandGlobPattern(norm, { caseInsensitive: true }),
+          ...literalReadings(raw, opts?.mode === 'deny' ? 'deny' : 'allow', {
+            isPattern: containsGlobCharsWin,
+          }).flatMap(reading =>
+            reading.glob
+              ? expandGlobPattern(reading.path, {
+                  caseInsensitive: true,
+                  anchor: reading.anchor,
+                })
+              : [],
+          ),
+        ]
       : [norm]
     for (const c of candidates) {
       const st = fs.statSync(c, { throwIfNoEntry: false })
