@@ -71,31 +71,38 @@ function collapseReadDenyLocations({
  * own, the directory written before its first wildcard, and not the project
  * it may lie in: `<project>/src/**\/.env` covers `<project>/src`, so
  * `src/shared -> ../shared` leads out of it. A symlinked directory that
- * leads out of the tree is not listed through. One that itself matches still
- * denies what it leads to, whole; where the pattern would carry on into that
- * directory, it is handed back through `unlistableDirs` like one that could
- * not be listed: what the pattern matches in there was not looked for. One
- * that does not match denies nothing, and a file that only a listing through
- * it would have found is not denied. That is not only a file out there: a
- * link out there can lead back into the tree, and a file in the tree that
- * the pattern matches by no name but the one through both links is not
- * found either.
+ * leads out of the tree is never listed through, whatever is re-exposed
+ * beneath what it leads to. One that itself matches still denies what it
+ * leads to, whole; a re-exposed path beneath that directory is bound back as
+ * written, as beneath a directory denied literally, and what the pattern
+ * would match under it through the link's name is not masked again. One that
+ * does not match denies nothing, and a file that only a listing through it
+ * would have found is not denied. That is not only a file out there: a link
+ * out there can lead back into the tree, and a file in the tree that the
+ * pattern matches by no name but the one through both links is not found
+ * either.
+ *
+ * A link out of the tree can only add to what the pattern covers: a file
+ * whose real path is in the tree and matches is found by walking the tree
+ * itself, whatever links exist. So no link a sandboxed command makes takes a
+ * mask away, and what is given up is what a link used to add. That includes
+ * what is written later beneath a directory that a command has moved out of
+ * the tree, leaving a link in its place: it lies outside the tree.
  *
  * Throws {@link GlobWalkBudgetError} when `budget` runs out before the walk
  * is done. There is no shorter list to fall back on: a caller that cannot
  * have the whole expansion must not run the command.
  *
  * @param unlistableDirs - receives the returned locations that hide something
- * the walk did not enumerate, whether by being that directory or by
- * covering it: a directory it could not list, or one out of the tree that a
- * matched link denies and the pattern would carry on into. The Linux wrapper
- * binds nothing back beneath one: what the pattern matches under an allowed
- * path in there was never found, and would come back unmasked.
+ * the walk could not enumerate, whether by being that directory or by
+ * covering it. The Linux wrapper binds nothing back beneath one: what the
+ * pattern matches under an allowed path in there was never found, and would
+ * come back unmasked.
  * @param opts.budget - what this expansion and the others handed the same
  * object may spend between them.
  * @param opts.unfollowedLinks - receives each symlinked directory that was
  * not listed through because it leads out of the pattern's tree, with the
- * directory it leads to.
+ * directory it leads to, in the order of their names.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
@@ -112,7 +119,12 @@ export function expandReadDenyGlobLinux(
     followSymlinkedDirectories: true,
     budget: opts.budget,
   })
-  for (const [link, target] of walk.unfollowedLinks) {
+  // In the order of their names, as the mounts are: the order a directory
+  // hands its entries back in is the filesystem's.
+  const unfollowed = [...walk.unfollowedLinks].sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  )
+  for (const [link, target] of unfollowed) {
     opts.unfollowedLinks?.set(link, target)
   }
   // Where a path the walk reported really lives: the denyRead loop mounts an
@@ -199,20 +211,11 @@ export function expandReadDenyGlobLinux(
     reExposedPaths: reExposed,
   })
 
-  // Which mounts stand for something the walk did not enumerate: a directory
-  // it could not list, or one a matched link leads to out of the tree, which
-  // is denied whole and was not listed. The directory itself when it
-  // survived the collapse, otherwise the kept ancestor that hides it. A link
-  // out of the tree that is no match denies nothing: where it leads is not
-  // a location, and nothing is reported for it, even where the mount of
-  // another match happens to hide it.
-  const unenumerated = [
-    ...walk.unlisted.map(locationOf),
-    ...[...walk.unfollowedLinks.values()].filter(target =>
-      locations.has(target),
-    ),
-  ]
-  for (const location of unenumerated) {
+  // Which mounts stand for something the walk could not enumerate: the
+  // unlistable directory itself when it survived the collapse, otherwise the
+  // kept ancestor that hides it.
+  for (const unlisted of walk.unlisted) {
+    const location = locationOf(unlisted)
     if (mounts.has(location)) {
       unlistableDirs?.add(location)
       continue
@@ -227,7 +230,7 @@ export function expandReadDenyGlobLinux(
 
   // One line for the whole expansion, with what it cost: a caller that times
   // its wraps takes the numbers from here.
-  const [firstUnfollowed] = walk.unfollowedLinks
+  const [firstUnfollowed] = unfollowed
   logForDebugging(
     `[Sandbox Linux] Expanded denyRead glob "${globPattern}" in ${Math.round(performance.now() - startedAt)} ms: ` +
       `${walk.matches.length} matches -> ${mounts.size} mounts; ` +

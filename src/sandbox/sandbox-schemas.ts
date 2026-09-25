@@ -20,12 +20,18 @@
 /**
  * A symbolic link a `denyRead` pattern came to and did not list through,
  * because it leads out of the pattern's tree. What the pattern would have
- * matched beneath `target` is not denied.
+ * matched beneath `target` is not denied. Where the link is itself a match,
+ * `target` is denied as a whole all the same, and what is not denied is what
+ * a further link in there leads to, and what lies beneath an allowed path in
+ * there, which is bound back as it is written.
  */
 export interface UnfollowedDenyLink {
   /** The `denyRead` entry being expanded. */
   pattern: string
-  /** The link, as the walk spelled it. */
+  /**
+   * The link, as the walk spelled it. One link can be in the list under two
+   * spellings, where the walk came to it by both.
+   */
   link: string
   /** Where the link resolves. */
   target: string
@@ -35,9 +41,8 @@ export interface FsReadRestrictionConfig {
   denyOnly: string[]
   allowWithinDeny?: string[]
   /**
-   * The `denyOnly` entries that stand for a directory a glob expansion did
-   * not list: one it could not, or one a matched symlink leads to out of the
-   * pattern's tree. Nothing is bound back beneath one — neither an
+   * The `denyOnly` entries that stand for a directory a glob expansion could
+   * not list. Nothing is bound back beneath one — neither an
    * `allowWithinDeny` path nor an allowed write path — because what the
    * pattern matches under such a path was never found and would come back
    * unmasked. Linux only: the other backends match globs natively.

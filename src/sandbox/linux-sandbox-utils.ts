@@ -2615,8 +2615,7 @@ async function generateFilesystemArgs(
     }
     return hidden
   }
-  // Entries a glob expansion produced for a directory it did not list: one
-  // it could not, or one a matched link leads to out of the pattern's tree.
+  // Entries a glob expansion produced for a directory it could not list.
   // What the pattern matches beneath an allowed path in there was never
   // found, so binding that path back over the tmpfs would show every one of
   // those matches unmasked.
@@ -2677,7 +2676,7 @@ async function generateFilesystemArgs(
     if (isDirectory) {
       // A stand-in for an entry this wrap cannot vouch for hides everything
       // beneath it: nothing under it can be vouched for either. So does a
-      // directory a glob expansion did not enumerate.
+      // directory a glob expansion could not enumerate.
       if (isStandIn) {
         logForDebugging(
           `[Sandbox Linux] Read deny path ${normalizedPath} cannot be mounted where it names; hiding ${landing} instead`,
@@ -2689,7 +2688,7 @@ async function generateFilesystemArgs(
         unlistableDenyDirs.has(landing)
       if (unlistable) {
         logForDebugging(
-          `[Sandbox Linux] Read-denied directory was not listed when the glob was expanded; restoring nothing beneath it: ${landing}`,
+          `[Sandbox Linux] Read-denied directory could not be listed when the glob was expanded; restoring nothing beneath it: ${landing}`,
           { level: 'warn' },
         )
       }
