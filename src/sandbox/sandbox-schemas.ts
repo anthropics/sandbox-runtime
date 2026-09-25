@@ -44,10 +44,17 @@ export interface FsReadRestrictionConfig {
    */
   unlistableDenyDirs?: string[]
   /**
-   * The links the `denyRead` patterns left unfollowed, for a caller to tell
-   * its user what a pattern does not reach. It informs and restricts
-   * nothing: no backend reads it. Linux only: the other backends match
-   * patterns against resolved paths and walk nothing.
+   * The links the `denyRead` patterns left unfollowed because they lead out
+   * of the pattern's tree, for a caller to tell its user what a pattern does
+   * not reach. It informs and restricts nothing: no backend reads it. Linux
+   * only: the other backends match patterns against resolved paths and walk
+   * nothing.
+   *
+   * Not every link a pattern does not list through is here. A link that
+   * leads back up the tree (to the pattern's starting directory or above
+   * it) is not listed through either, and a pattern that cannot be followed
+   * one path component at a time lists through no link at all; neither is
+   * reported in this list. Both say so in the debug log.
    */
   unfollowedDenyLinks?: UnfollowedDenyLink[]
 }
