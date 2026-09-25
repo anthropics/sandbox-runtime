@@ -63,7 +63,8 @@ function collapseReadDenyLocations({
  * `**\/build/**` yields one mount per `build/` directory. A match reached
  * through a symlink is listed where it really lives, and a directory the walk
  * could not list is denied whole. Sorted, so an ancestor precedes its
- * descendants.
+ * descendants. With `anchor`, the pattern is walked beneath that directory,
+ * which is taken as the name it is (see `ExpandGlobOptions.anchor`).
  *
  * @param unlistableDirs - receives the returned locations that hide something
  * the walk could not enumerate, whether by being that directory or by
@@ -75,10 +76,12 @@ export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
+  anchor?: string,
 ): string[] {
   const walk = walkGlobPattern(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
+    anchor,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.
@@ -156,8 +159,11 @@ export function expandReadDenyGlobLinux(
     addLocation(standIn, candidate)
   }
 
+  // Allow paths, which reach this backend as names whatever they hold.
   const reExposed = new Set(
-    reExposedPaths.flatMap(p => pathSpellings(normalizePathForSandbox(p))),
+    reExposedPaths.flatMap(p =>
+      pathSpellings(normalizePathForSandbox(p, { literal: true })),
+    ),
   )
   const mounts = collapseReadDenyLocations({
     locations,
