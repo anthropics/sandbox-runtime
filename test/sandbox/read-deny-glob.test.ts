@@ -244,19 +244,34 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     // pkg/a/build/link -> outside, with allowRead written against the
     // target: outside/ is denied as a whole, its carve-out and the
     // entries beneath keep their own mounts, and nothing else beneath it.
+    // The pattern starts at ROOT, which holds both ends of the link.
     mkdirSync(join(OUTSIDE, 'pub'))
     writeFileSync(join(OUTSIDE, 'pub', 'x.txt'), '')
     try {
-      const mounts = expandReadDenyGlobLinux(
-        join(ROOT, 'pkg', 'a', '**/build/**'),
-        [join(OUTSIDE, 'pub')],
-      )
+      const mounts = expandReadDenyGlobLinux(join(ROOT, '**/build/**'), [
+        join(OUTSIDE, 'pub'),
+      ])
 
       expect(mounts).toContain(join(ROOT, 'pkg', 'a', 'build'))
       expect(mounts).toContain(OUTSIDE)
       expect(mounts).toContain(join(OUTSIDE, 'pub'))
       expect(mounts).toContain(join(OUTSIDE, 'pub', 'x.txt'))
       expect(mounts).not.toContain(join(OUTSIDE, 'secret.txt'))
+
+      // Started at pkg/a the same link leaves the pattern's tree. It is a
+      // match, so what it leads to is still denied as a whole, but nothing
+      // is listed out there: x.txt beneath the carve-out was never found,
+      // so outside/ is handed back as a directory to bind nothing back
+      // beneath, like one that could not be listed.
+      const unlistable = new Set<string>()
+      expect(
+        expandReadDenyGlobLinux(
+          join(ROOT, 'pkg', 'a', '**/build/**'),
+          [join(OUTSIDE, 'pub')],
+          unlistable,
+        ),
+      ).toEqual([OUTSIDE, join(ROOT, 'pkg', 'a', 'build')])
+      expect([...unlistable]).toEqual([OUTSIDE])
     } finally {
       rmSync(join(OUTSIDE, 'pub'), { recursive: true })
     }
@@ -471,7 +486,8 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     symlinkSync(join(store, 'nm'), join(proj, 'build'))
     symlinkSync(join('..', 'keep'), join(store, 'nm', 'keep'))
 
-    const mounts = expandReadDenyGlobLinux(join(proj, '**/build/**'), [
+    // Started above both, so that the links stay inside the tree.
+    const mounts = expandReadDenyGlobLinux(join(chain, '**/build/**'), [
       join(store, 'keep', 'pub'),
     ])
 
@@ -481,6 +497,20 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
       join(store, 'keep', 'pub', 'y.txt'),
       join(store, 'nm'),
     ])
+
+    // Started at proj, the first link leaves the tree: it is a match, so
+    // store/nm is denied as a whole, and the second link inside it is
+    // never seen. What lies behind it was not looked for, so store/nm is
+    // handed back as a directory to bind nothing back beneath.
+    const unlistable = new Set<string>()
+    expect(
+      expandReadDenyGlobLinux(
+        join(proj, '**/build/**'),
+        [join(store, 'keep', 'pub')],
+        unlistable,
+      ),
+    ).toEqual([join(store, 'nm')])
+    expect([...unlistable]).toEqual([join(store, 'nm')])
   })
 
   it('drops a matched link that does not resolve', () => {
@@ -1995,10 +2025,12 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
 describe.if(isLinux)(
   'expandReadDenyGlobLinux (coverage behind a directory link)',
   () => {
-    // The walk descends symlinked directories and reports each match where it
-    // really lives, so a deny glob covers what it matches whichever spelling
-    // found it, and one mount stands for every spelling. These cases are the
-    // ones a walk that does not follow links loses outright.
+    // The walk descends the symlinked directories that stay inside the
+    // pattern's tree and reports each match where it really lives, so a deny
+    // glob covers what it matches there whichever spelling found it, and one
+    // mount stands for every spelling. These cases are the ones a walk that
+    // does not follow links loses outright. A link that leaves the tree is
+    // not descended: what lies behind it is for a pattern that names it.
     let ROOT: string
     let BASE: string
     let LNK: string
@@ -2090,34 +2122,71 @@ describe.if(isLinux)(
       },
     )
 
-    it('mounts a match behind a link whose target is outside the pattern base, at its target', () => {
+    it('does not look behind a link whose target is outside the pattern base', () => {
+      // config/prod -> ../shared/prod leaves config, where the pattern
+      // starts: the key behind it is not the pattern's to find.
+      const unfollowedLinks = new Map<string, string>()
       const mounts = expandReadDenyGlobLinux(
         join(ROOT, 'out', 'config', '*', 'key'),
         [],
+        undefined,
+        { unfollowedLinks },
       )
 
-      expect(mounts).toEqual([
+      expect(mounts).toEqual([join(ROOT, 'out', 'config', 'dev', 'key')])
+      expect([...unfollowedLinks]).toEqual([
+        [
+          join(ROOT, 'out', 'config', 'prod'),
+          join(ROOT, 'out', 'shared', 'prod'),
+        ],
+      ])
+      // A pattern that starts above both finds it, where it really is.
+      expect(
+        expandReadDenyGlobLinux(join(ROOT, 'out', '*', '*', 'key'), []),
+      ).toEqual([
         join(ROOT, 'out', 'config', 'dev', 'key'),
         join(ROOT, 'out', 'shared', 'prod', 'key'),
       ])
     })
 
-    it('mounts a match behind an absolute-target link outside the base, at its target', () => {
+    it('does not look behind an absolute-target link outside the base', () => {
+      // config/prod is written as an absolute path, and leaves config like
+      // the relative one: the link is met, and left.
+      const unfollowedLinks = new Map<string, string>()
       const mounts = expandReadDenyGlobLinux(
         join(ROOT, 'absout', 'config', '*', 'key'),
         [],
+        undefined,
+        { unfollowedLinks },
       )
 
-      expect(mounts).toEqual([join(ROOT, 'absout', 'elsewhere', 'prod', 'key')])
+      expect(mounts).toEqual([])
+      expect([...unfollowedLinks]).toEqual([
+        [
+          join(ROOT, 'absout', 'config', 'prod'),
+          join(ROOT, 'absout', 'elsewhere', 'prod'),
+        ],
+      ])
+      // A pattern that starts above both finds the key, where it really is.
+      expect(
+        expandReadDenyGlobLinux(join(ROOT, 'absout', 'con*', '*', 'key'), []),
+      ).toEqual([join(ROOT, 'absout', 'elsewhere', 'prod', 'key')])
     })
 
-    it('mounts a package linked out of node_modules where the package really is', () => {
-      const mounts = expandReadDenyGlobLinux(
-        join(ROOT, 'store', 'node_modules', '**', 'index.js'),
-        [],
-      )
+    it('leaves a package linked out of node_modules to a pattern that names where it is', () => {
+      // node_modules/pkg -> ../packages/pkg, as a workspace install leaves
+      // it: the package is not under node_modules, and a pattern that starts
+      // there does not reach it.
+      expect(
+        expandReadDenyGlobLinux(
+          join(ROOT, 'store', 'node_modules', '**', 'index.js'),
+          [],
+        ),
+      ).toEqual([join(ROOT, 'store', 'node_modules', 'other', 'index.js')])
 
-      expect(mounts).toEqual([
+      expect(
+        expandReadDenyGlobLinux(join(ROOT, 'store', '**', 'index.js'), []),
+      ).toEqual([
         join(ROOT, 'store', 'node_modules', 'other', 'index.js'),
         join(ROOT, 'store', 'packages', 'pkg', 'index.js'),
       ])

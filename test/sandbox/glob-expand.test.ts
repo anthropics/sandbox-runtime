@@ -234,12 +234,30 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       expect(plain.matches).not.toContain(join(link, 'outside.out'))
       expect(plain.realOf.get(link)).toBeUndefined()
 
+      // With the option the link is resolved, so that a deny lands on what
+      // it leads to. It leads out of a/, where the pattern starts, so what
+      // lies behind it is not listed under either name.
       const followed = walkGlobPattern(join(RAW_BASE, 'a', '**/build/**'), {
         followSymlinkedDirectories: true,
       })
-      // What is found through the link is reported where it really is.
-      expect(followed.matches).toContain(join(BASE, 'elsewhere', 'outside.out'))
+      expect(followed.matches).toContain(link)
+      expect(followed.realOf.get(link)).toBe(join(BASE, 'elsewhere'))
+      expect(followed.matches).not.toContain(
+        join(BASE, 'elsewhere', 'outside.out'),
+      )
       expect(followed.matches).not.toContain(join(link, 'outside.out'))
+      expect([...followed.unfollowedLinks]).toEqual([
+        [link, join(BASE, 'elsewhere')],
+      ])
+
+      // Started where both ends of the link are, what is found through it is
+      // reported where it really is.
+      const inside = walkGlobPattern(join(RAW_BASE, '**/build/**'), {
+        followSymlinkedDirectories: true,
+      })
+      expect(inside.matches).toContain(join(BASE, 'elsewhere', 'outside.out'))
+      expect(inside.matches).not.toContain(join(link, 'outside.out'))
+      expect([...inside.unfollowedLinks]).toEqual([])
     } finally {
       rmSync(join(BASE, 'elsewhere', 'outside.out'))
     }
@@ -475,6 +493,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     // crosses every link before it. A walk that carried that spelling would
     // match each entry against a longer and longer path; what is found
     // through a link is carried and reported by its real path instead.
+    // `d0*` names d0 alone and starts the walk at root, which holds the whole
+    // chain: every other directory is reached through the links only.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-chain-')))
     const links = 300
     try {
@@ -486,7 +506,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         symlinkSync(join('..', `d${i + 1}`), join(root, `d${i}`, 'next'))
       }
 
-      const walk = walkGlobPattern(join(root, 'd0', '**/*.pem'), {
+      const walk = walkGlobPattern(join(root, 'd0*', '**/*.pem'), {
         followSymlinkedDirectories: true,
       })
 
@@ -500,6 +520,16 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       for (const seen of walk.symlinks) {
         expect(seen.length).toBeLessThanOrEqual(longest)
       }
+
+      // Started at d0, the first link already leaves the tree, and the
+      // chain is not entered.
+      const fromFirst = walkGlobPattern(join(root, 'd0', '**/*.pem'), {
+        followSymlinkedDirectories: true,
+      })
+      expect(fromFirst.matches).toEqual([join(root, 'd0', 'id.pem')])
+      expect([...fromFirst.unfollowedLinks]).toEqual([
+        [join(root, 'd0', 'next'), join(root, 'd1')],
+      ])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -511,6 +541,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       // deep is a real directory whose path is a few bytes short of PATH_MAX,
       // so deep/key.pem cannot be named by its real path at all, only through
       // base/s. The link is a match, and what it leads to has to be found.
+      // `bas*` names base alone and starts the walk at root, which holds deep
+      // as well.
       const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-long-')))
       let deep = join(root, 'deep')
       while (deep.length < 4090) {
@@ -525,13 +557,22 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         symlinkSync(join(root, 'secret.txt'), viaLink)
         expect(join(deep, 'key.pem').length).toBeGreaterThan(4095)
 
-        const walk = walkGlobPattern(join(root, 'base', '*/*.pem'), {
+        const walk = walkGlobPattern(join(root, 'bas*', '*/*.pem'), {
           followSymlinkedDirectories: true,
         })
 
         expect(walk.unlisted).toEqual([])
         expect(walk.matches.map(m => walk.realOf.get(m))).toEqual([
           join(root, 'secret.txt'),
+        ])
+
+        // Started at base, base/s leaves the tree and is not listed through.
+        const fromBase = walkGlobPattern(join(root, 'base', '*/*.pem'), {
+          followSymlinkedDirectories: true,
+        })
+        expect(fromBase.matches).toEqual([])
+        expect([...fromBase.unfollowedLinks]).toEqual([
+          [join(root, 'base', 's'), deep],
         ])
       } finally {
         rmSync(viaLink, { force: true })
@@ -625,7 +666,9 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     // globToRegex lets `**.pem` and `ce**/x.pem` span directories. Each is
     // two patterns the walk can follow a name at a time (`*.pem` or
     // `*` / `**` / `*.pem`), so what they reach through a link is found like
-    // any other match: here certs leads out of the pattern's base.
+    // any other match: here certs leads to a directory beside proj, which
+    // the patterns name in no other way. `pro*` names proj alone and starts
+    // the walk at root, which holds both.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-glued-')))
     try {
       mkdirSync(join(root, 'proj'))
@@ -635,13 +678,14 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       writeFileSync(join(root, 'proj', 'z.pem'), 'KEY')
       symlinkSync(join('..', 'outside'), join(root, 'proj', 'certs'))
 
-      const found = (pattern: string): string[] => {
-        const walk = walkGlobPattern(join(root, 'proj', pattern), {
+      const foundFrom = (start: string, pattern: string): string[] => {
+        const walk = walkGlobPattern(join(root, start, pattern), {
           followSymlinkedDirectories: true,
         })
         expect(walk.unlisted).toEqual([])
         return walk.matches.map(m => walk.realOf.get(m) ?? m).sort()
       }
+      const found = (pattern: string): string[] => foundFrom('pro*', pattern)
 
       expect(found('**.pem')).toEqual([
         join(root, 'outside', 'deep', 'y.pem'),
@@ -657,6 +701,11 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         join(root, 'outside', 'deep', 'y.pem'),
       ])
       expect(found('***/x.pem')).toEqual([join(root, 'outside', 'x.pem')])
+
+      // Started at proj, certs leads out of the tree and is not listed
+      // through, however the pattern spans directories.
+      expect(foundFrom('proj', '**.pem')).toEqual([join(root, 'proj', 'z.pem')])
+      expect(foundFrom('proj', 'ce**/x.pem')).toEqual([])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -664,7 +713,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
 
   it('follows a bracket expression that can match a separator', () => {
     // `[s/]` is an `s` within a name or a separator between two, and both
-    // readings are followed, through a link as well.
+    // readings are followed, through a link as well. `pro*` names proj alone
+    // and starts the walk at root, which holds the link's target too.
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-bracket-')))
     try {
       mkdirSync(join(root, 'proj'))
@@ -673,13 +723,23 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       writeFileSync(join(root, 'outside', 'certsx.pem'), 'KEY')
       symlinkSync(join('..', 'outside'), join(root, 'proj', 'lnk'))
 
-      const walk = walkGlobPattern(join(root, 'proj', '*/cert[s/]x.pem'), {
+      const walk = walkGlobPattern(join(root, 'pro*', '*/cert[s/]x.pem'), {
         followSymlinkedDirectories: true,
       })
 
       expect(walk.matches.map(m => walk.realOf.get(m) ?? m).sort()).toEqual([
         join(root, 'outside', 'cert', 'x.pem'),
         join(root, 'outside', 'certsx.pem'),
+      ])
+
+      // Started at proj, the link leaves the tree and neither reading is
+      // followed through it.
+      const fromProj = walkGlobPattern(join(root, 'proj', '*/cert[s/]x.pem'), {
+        followSymlinkedDirectories: true,
+      })
+      expect(fromProj.matches).toEqual([])
+      expect([...fromProj.unfollowedLinks.keys()]).toEqual([
+        join(root, 'proj', 'lnk'),
       ])
     } finally {
       rmSync(root, { recursive: true, force: true })
