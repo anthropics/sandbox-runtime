@@ -48,6 +48,7 @@ import {
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
   linuxGetCwdMandatoryDenyPaths,
+  LinuxSandboxProfileError,
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinux } from './read-deny-glob.js'
 import {
@@ -85,6 +86,8 @@ import {
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  GlobWalkBudgetError,
+  newGlobWalkBudget,
   attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
@@ -1306,11 +1309,49 @@ function expandAllowReadGlob(pattern: string): string[] {
 }
 
 /**
+ * The expansion of every denyRead glob of one read configuration, on Linux.
+ * The patterns share one budget of directory entries and time, so a
+ * configuration costs at most that however many patterns it holds. When the
+ * budget runs out the returned function throws
+ * {@link LinuxSandboxProfileError} `deny_glob_too_large`: there is no deny
+ * list to go on with, since one cut short leaves readable what the pattern
+ * was written to hide.
+ */
+function readDenyGlobExpander(
+  reExposedPaths: readonly string[],
+  unlistableDenyDirs: Set<string>,
+): (pattern: string) => string[] {
+  const budget = newGlobWalkBudget()
+  return pattern => {
+    try {
+      return expandReadDenyGlobLinux(
+        pattern,
+        reExposedPaths,
+        unlistableDenyDirs,
+        { budget },
+      )
+    } catch (error) {
+      if (!(error instanceof GlobWalkBudgetError)) throw error
+      throw new LinuxSandboxProfileError(
+        'deny_glob_too_large',
+        `denyRead pattern "${pattern}" could not be expanded: the denyRead patterns of one configuration share ` +
+          `${error.maxEntries} directory entries and ${error.timeoutMs} ms, and the ${error.exhausted} ran out ` +
+          `with ${error.entries} entries looked at after ${error.elapsedMs} ms, while listing ${error.directory}; ` +
+          `narrow the pattern, or remove or move what it walks into`,
+        error,
+      )
+    }
+  }
+}
+
+/**
  * The read policy of the initialized config, for inspection and display.
  * On Linux, denyRead globs are collapsed to covering directory mounts against
  * this config's allowRead and {@link getFsWriteConfig}'s allowOnly, so
  * `denyOnly` is only sound alongside that write config and must not be handed
- * to wrapCommandWithSandboxLinux with a different one.
+ * to wrapCommandWithSandboxLinux with a different one. Throws
+ * {@link LinuxSandboxProfileError} `deny_glob_too_large` when the globs
+ * cannot be expanded within their budget, as the wrap does.
  */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
@@ -1333,8 +1374,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   const unlistableDenyDirs = new Set<string>()
   const denyPaths = resolveReadPathEntries(
     unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
-    pattern =>
-      expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
+    readDenyGlobExpander(reExposedPaths, unlistableDenyDirs),
     credentialRestrictions.degradeToDenyPaths,
   )
 
@@ -1722,8 +1762,7 @@ async function wrapWithSandbox(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
         credentialRestrictions,
       ),
-      pattern =>
-        expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
+      readDenyGlobExpander(reExposedPaths, unlistableDenyDirs),
       credentialRestrictions.degradeToDenyPaths,
     )
     readConfig = {

@@ -750,11 +750,19 @@ export type LinuxSandboxProfileErrorCode =
   | 'args_file_unavailable'
   /** The line does not fit one shell argument even with the mounts in a file. */
   | 'command_too_long'
+  /**
+   * The `denyRead` patterns could not be expanded within their budget of
+   * directory entries and time, so which paths to hide is not known. The
+   * error on `.cause` names the pattern, the directory being listed and what
+   * had been spent.
+   */
+  | 'deny_glob_too_large'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
  * configuration expands to is past a limit, or, for `command_too_long` and
- * `nul_in_path`, what the caller passed in is. The command was not run and no
+ * `nul_in_path`, what the caller passed in is; for `deny_glob_too_large` the
+ * profile could not be worked out at all. The command was not run and no
  * profile file stays open, so do not run the per-command cleanup
  * (`cleanupAfterCommand()`, `cleanupBwrapMountPoints()`) for a wrap that
  * threw: it would release a second time, and a sandbox still running would

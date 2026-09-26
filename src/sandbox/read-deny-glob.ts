@@ -1,5 +1,6 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
+  type GlobWalkBudget,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
@@ -65,20 +66,29 @@ function collapseReadDenyLocations({
  * could not list is denied whole. Sorted, so an ancestor precedes its
  * descendants.
  *
+ * Throws {@link GlobWalkBudgetError} when `budget` runs out before the walk
+ * is done. There is no shorter list to fall back on: a caller that cannot
+ * have the whole expansion must not run the command.
+ *
  * @param unlistableDirs - receives the returned locations that hide something
  * the walk could not enumerate, whether by being that directory or by
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
+ * @param opts.budget - what this expansion and the others handed the same
+ * object may spend between them.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
+  opts: { budget?: GlobWalkBudget } = {},
 ): string[] {
+  const startedAt = performance.now()
   const walk = walkGlobPattern(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
+    budget: opts.budget,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.
@@ -181,8 +191,12 @@ export function expandReadDenyGlobLinux(
     }
   }
 
+  // One line for the whole expansion, with what it cost: a caller that times
+  // its wraps takes the numbers from here.
   logForDebugging(
-    `[Sandbox Linux] Expanded denyRead glob "${globPattern}": ${walk.matches.length} matches -> ${mounts.size} mounts`,
+    `[Sandbox Linux] Expanded denyRead glob "${globPattern}" in ${Math.round(performance.now() - startedAt)} ms: ` +
+      `${walk.matches.length} matches -> ${mounts.size} mounts; ` +
+      `directories listed: ${walk.directoriesListed}, entries looked at: ${walk.entriesExamined}`,
   )
   for (const mount of mounts) {
     // A matched link decides what is hidden for the whole sandbox: a

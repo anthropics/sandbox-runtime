@@ -1137,6 +1137,87 @@ export interface ExpandGlobOptions {
   caseInsensitive?: boolean
 }
 
+/**
+ * The most directory entries the read-deny expansions of one read
+ * configuration look at, all its patterns together.
+ */
+export const GLOB_WALK_MAX_ENTRIES = 2_000_000
+
+/** The longest they take, all together, in milliseconds. */
+export const GLOB_WALK_TIMEOUT_MS = 10_000
+
+/**
+ * What the walks handed it may spend between them. One budget is meant to be
+ * shared: every walk draws on the same count and the same deadline, so the
+ * patterns of one configuration cannot each spend a full one.
+ */
+export interface GlobWalkBudget {
+  /** The directory entries the walks may look at, together. */
+  readonly maxEntries: number
+  /** When the budget was made, as a `performance.now()` reading. */
+  readonly startedAt: number
+  /** When the walks must be done, the same way. */
+  readonly deadline: number
+  /** The directory entries looked at so far. */
+  entries: number
+}
+
+/** A budget nothing has been spent from, its clock starting now. */
+export function newGlobWalkBudget(
+  limits: { maxEntries?: number; timeoutMs?: number } = {},
+): GlobWalkBudget {
+  const startedAt = performance.now()
+  return {
+    maxEntries: limits.maxEntries ?? GLOB_WALK_MAX_ENTRIES,
+    startedAt,
+    deadline: startedAt + (limits.timeoutMs ?? GLOB_WALK_TIMEOUT_MS),
+    entries: 0,
+  }
+}
+
+/**
+ * Thrown by {@link walkGlobPattern} when its budget runs out. What the walk
+ * had found by then is not handed back: for a deny expansion, a list cut
+ * short is a path left readable.
+ */
+export class GlobWalkBudgetError extends Error {
+  /** The pattern being walked, as the caller wrote it. */
+  readonly pattern: string
+  /** The directory the walk was listing. */
+  readonly directory: string
+  /** Which limit was reached. */
+  readonly exhausted: 'entries' | 'time'
+  /** The directory entries looked at under the budget, by this walk and the
+   *  ones before it. */
+  readonly entries: number
+  /** Milliseconds since the budget was made. */
+  readonly elapsedMs: number
+  /** The entries the budget allowed. */
+  readonly maxEntries: number
+  /** The milliseconds it allowed. */
+  readonly timeoutMs: number
+  constructor(
+    pattern: string,
+    directory: string,
+    exhausted: 'entries' | 'time',
+    budget: GlobWalkBudget,
+  ) {
+    const elapsedMs = Math.round(performance.now() - budget.startedAt)
+    const timeoutMs = Math.round(budget.deadline - budget.startedAt)
+    super(
+      `Glob pattern ${pattern} was not walked to the end: ${budget.entries} directory entries looked at in ${elapsedMs} ms (the budget is ${budget.maxEntries} entries and ${timeoutMs} ms), stopped while listing ${directory}`,
+    )
+    this.name = 'GlobWalkBudgetError'
+    this.pattern = pattern
+    this.directory = directory
+    this.exhausted = exhausted
+    this.entries = budget.entries
+    this.elapsedMs = elapsedMs
+    this.maxEntries = budget.maxEntries
+    this.timeoutMs = timeoutMs
+  }
+}
+
 /** What one recursive walk of a glob's base directory found; see {@link walkGlobPattern}. */
 export interface GlobWalk {
   /** Where the walk started, with symlinks resolved (the spelling itself
@@ -1166,6 +1247,11 @@ export interface GlobWalk {
    *  what was found through a symlinked directory, which is reported where
    *  it really lives to begin with. */
   realOf: Map<string, string>
+  /** How many directories were listed. */
+  directoriesListed: number
+  /** How many directory entries were looked at: each entry once for every
+   *  listing of its directory the pattern called for. */
+  entriesExamined: number
 }
 
 /**
@@ -1482,12 +1568,18 @@ export function toForwardSlashes(s: string): string {
  * `globPath` without its trailing `/**`, with the symlinks seen recorded.
  * With `followSymlinkedDirectories` it also lists through a symlinked
  * directory and reports every match where it really lives.
+ *
+ * With a `budget` the walk throws {@link GlobWalkBudgetError} once the budget
+ * is spent, and returns nothing. The clock is read before each listing and
+ * at each entry, so what is not cut short is one step: a filesystem call
+ * that blocks, or a name that is slow to match.
  */
 export function walkGlobPattern(
   globPath: string,
   opts: ExpandGlobOptions & {
     withDirectoryForm?: boolean
     followSymlinkedDirectories?: boolean
+    budget?: GlobWalkBudget
   } = {},
 ): GlobWalk {
   const walk: GlobWalk = {
@@ -1498,6 +1590,8 @@ export function walkGlobPattern(
     uninspectableLinks: new Set(),
     unlisted: [],
     realOf: new Map(),
+    directoriesListed: 0,
+    entriesExamined: 0,
   }
 
   const normalizedPattern = toForwardSlashes(normalizePathForSandbox(globPath))
@@ -1554,6 +1648,25 @@ export function walkGlobPattern(
    *  same entries. */
   const listings = new Map<string, fs.Dirent[]>()
   const pending: Frame[] = []
+  /** Counts one more entry of `dir` looked at, or none before a listing, and
+   *  throws once the budget is spent. The clock is read every time, before
+   *  each listing and at each entry: what an entry costs is not bounded (a
+   *  name can be slow to match, a link slow to resolve), so a stride of
+   *  entries between readings would be no bound on the time either. Called
+   *  outside every `try` here, so a spent budget is never taken for a
+   *  directory that could not be listed. */
+  const spend = (dir: string, entries: 0 | 1): void => {
+    walk.entriesExamined += entries
+    const budget = opts.budget
+    if (budget === undefined) return
+    budget.entries += entries
+    if (budget.entries > budget.maxEntries) {
+      throw new GlobWalkBudgetError(globPath, dir, 'entries', budget)
+    }
+    if (performance.now() >= budget.deadline) {
+      throw new GlobWalkBudgetError(globPath, dir, 'time', budget)
+    }
+  }
   /** A filesystem call on a real path, and on a shorter name for it when that
    *  fails. The real path crosses no link, so a long chain of them cannot
    *  fail the call (ELOOP). */
@@ -1617,6 +1730,7 @@ export function walkGlobPattern(
     const fresh = frame.positions.filter(p => !listed.has(p))
     if (fresh.length === 0) continue
     for (const p of fresh) listed.add(p)
+    spend(dir, 0)
     let entries = listings.get(real)
     try {
       entries ??= onRealPath(real, frame.short, p =>
@@ -1636,6 +1750,7 @@ export function walkGlobPattern(
       continue
     }
     for (const entry of entries) {
+      spend(dir, 1)
       const fullPath = path.join(dir, entry.name)
       const realPath = path.join(real, entry.name)
       const candidate = toForwardSlashes(fullPath)
@@ -1722,5 +1837,6 @@ export function walkGlobPattern(
     }
   }
 
+  walk.directoriesListed = listings.size
   return walk
 }
