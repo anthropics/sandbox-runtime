@@ -32,7 +32,6 @@ export type {
   CredentialRestrictionConfig,
   NetworkRestrictionConfig,
   NetworkHostPattern,
-  UnfollowedDenyLink,
 } from './sandbox/sandbox-schemas.js'
 
 // Per-request filter

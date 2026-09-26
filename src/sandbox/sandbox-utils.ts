@@ -1247,11 +1247,6 @@ export interface GlobWalk {
    *  what was found through a symlinked directory, which is reported where
    *  it really lives to begin with. */
   realOf: Map<string, string>
-  /** With `followSymlinkedDirectories`: the symlinked directories the
-   *  pattern could match beneath that were not listed through because they
-   *  lead out of the tree, each with the directory it leads to. One that is
-   *  itself a match is in `matches` or `directoryMatches` all the same. */
-  unfollowedLinks: Map<string, string>
   /** How many directories were listed. */
   directoriesListed: number
   /** How many directory entries were looked at: each entry once for every
@@ -1572,12 +1567,7 @@ export function toForwardSlashes(s: string): string {
  * static prefix, filtered by `globPath` and, with `withDirectoryForm`, by
  * `globPath` without its trailing `/**`, with the symlinks seen recorded.
  * With `followSymlinkedDirectories` it also lists through a symlinked
- * directory that stays inside the tree and reports every match where it
- * really lives. The tree is the walk's base, the pattern's static prefix,
- * and what lies beneath it, wherever a project around it begins. A link that
- * leaves the tree is not listed through: what it leads to is a tree the
- * pattern does not name, of any size, and a command allowed to write beneath
- * the base can plant one. It is still a match under its own name.
+ * directory and reports every match where it really lives.
  *
  * With a `budget` the walk throws {@link GlobWalkBudgetError} once the budget
  * is spent, and returns nothing. The clock is read before each listing and
@@ -1600,7 +1590,6 @@ export function walkGlobPattern(
     uninspectableLinks: new Set(),
     unlisted: [],
     realOf: new Map(),
-    unfollowedLinks: new Map(),
     directoriesListed: 0,
     entriesExamined: 0,
   }
@@ -1794,10 +1783,10 @@ export function walkGlobPattern(
       }
       walk.symlinks.add(fullPath)
       // Only the read-deny expansion lists through a symlinked directory: it
-      // has to cover what the pattern reaches inside its tree by every name
-      // that leads there. The allowRead expansion and the Windows ACL stamp
-      // take the link itself and stop there, as the allow bind and the ACL
-      // they feed do — Windows does not follow reparse points at all.
+      // has to cover what the pattern reaches by every name. The allowRead
+      // expansion and the Windows ACL stamp take the link itself and stop
+      // there, as the allow bind and the ACL they feed do — Windows does not
+      // follow reparse points at all.
       if (!opts.followSymlinkedDirectories) continue
       const isDirectoryFormCandidate =
         opts.withDirectoryForm === true &&
@@ -1836,17 +1825,6 @@ export function walkGlobPattern(
       ) {
         logForDebugging(
           `[Sandbox] Not following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}: it leads back up the tree`,
-        )
-        continue
-      }
-      // Neither is a link that leaves the tree, judged by where it resolves
-      // and not by how it is written. Whatever it matched by its own name is
-      // recorded above and still denies the target; only the listing of a
-      // tree the pattern does not name is left out.
-      if (!isAtOrUnder(target.real, baseReal)) {
-        walk.unfollowedLinks.set(fullPath, target.real)
-        logForDebugging(
-          `[Sandbox] Not following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}: it leads out of ${baseReal}`,
         )
         continue
       }
