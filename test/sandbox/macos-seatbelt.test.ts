@@ -982,6 +982,28 @@ describe.if(isMacOS)('macOS Seatbelt Process Enumeration', () => {
       expect(parseInt(pid.trim(), 10)).toBeGreaterThan(0)
     }
   })
+
+  it('should allow reading kern.hv_vmm_present (required by Chromium startup)', () => {
+    // Chromium-based browsers PCHECK sysctlbyname("kern.hv_vmm_present") in
+    // base::IsVirtualMachine() during startup (base/mac/mac_util.mm). If the
+    // sysctl is denied, the browser aborts before launching, which breaks
+    // allowBrowserProcess support for any modern Chrome/Chromium.
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'sysctl -n kern.hv_vmm_present',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(result.status).toBe(0)
+    expect(['0', '1']).toContain(result.stdout.trim())
+  })
 })
 
 describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
