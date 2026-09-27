@@ -132,7 +132,28 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     })
     client.on('error', () => upstream.destroy())
     client.once('close', () => upstream.destroy())
-    upstream.once('close', () => client.destroy())
+    upstream.once('close', () => {
+      if (client.destroyed) return
+      if (upstream.readableEnded) {
+        client.end()
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const resetTimer = () => {
+          if (timer) clearTimeout(timer)
+          timer = setTimeout(() => {
+            if (!client.destroyed) client.destroy()
+          }, 30_000)
+          if (typeof timer.unref === 'function') timer.unref()
+        }
+        client.on('drain', resetTimer)
+        client.once('close', () => {
+          if (timer) clearTimeout(timer)
+          client.off('drain', resetTimer)
+        })
+        resetTimer()
+      } else {
+        client.destroy()
+      }
+    })
     client.pipe(upstream)
     upstream.pipe(client)
   }
