@@ -611,7 +611,18 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         socket.destroy()
       })
       socket.on('close', () => upstream.destroy())
-      upstream.on('close', () => socket.destroy())
+      upstream.on('close', () => {
+        if (socket.destroyed) return
+        if (upstream.readableEnded) {
+          socket.end()
+          const timer = setTimeout(() => {
+            if (!socket.destroyed) socket.destroy()
+          }, 5000)
+          if (typeof timer.unref === 'function') timer.unref()
+        } else {
+          socket.destroy()
+        }
+      })
     } catch (err) {
       logForDebugging(`Error handling CONNECT: ${err}`, { level: 'error' })
       // Same rule as the 502 path: once the MITM sniff's 200 is out, a
