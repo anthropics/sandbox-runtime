@@ -222,7 +222,28 @@ export function createSocksProxyServer(
         sendStatus('REQUEST_GRANTED')
         upstream.pipe(conn.socket)
         conn.socket.pipe(upstream)
-        upstream.on('close', () => conn.socket.destroy())
+        upstream.on('close', () => {
+          if (conn.socket.destroyed) return
+          if (upstream.readableEnded) {
+            conn.socket.end()
+            let timer: ReturnType<typeof setTimeout> | undefined
+            const resetTimer = () => {
+              if (timer) clearTimeout(timer)
+              timer = setTimeout(() => {
+                if (!conn.socket.destroyed) conn.socket.destroy()
+              }, 30_000)
+              if (typeof timer.unref === 'function') timer.unref()
+            }
+            conn.socket.on('drain', resetTimer)
+            conn.socket.once('close', () => {
+              if (timer) clearTimeout(timer)
+              conn.socket.off('drain', resetTimer)
+            })
+            resetTimer()
+          } else {
+            conn.socket.destroy()
+          }
+        })
       })
       .catch(err => {
         logForDebugging(
