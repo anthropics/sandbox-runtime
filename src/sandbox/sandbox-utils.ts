@@ -580,10 +580,34 @@ export function getDefaultWritePaths(readRules?: {
     !readRules || readRules.denyRead.length === 0
       ? HOME_CONVENIENCE_WRITE_DIRS
       : homeDirsNotReadDenied(home, readRules.denyRead, readRules.allowRead)
-  return [
-    ...SANDBOX_OWN_WRITE_PATHS,
-    ...keptDirs.map(rel => path.join(home, rel)),
-  ]
+  const keptOwnWritePaths =
+    !readRules || readRules.denyRead.length === 0
+      ? SANDBOX_OWN_WRITE_PATHS
+      : sandboxOwnWritePathsNotReadDenied(
+          readRules.denyRead,
+          readRules.allowRead,
+        )
+  return [...keptOwnWritePaths, ...keptDirs.map(rel => path.join(home, rel))]
+}
+
+function sandboxOwnWritePathsNotReadDenied(
+  denyRead: readonly string[],
+  allowRead: readonly string[] = [],
+): readonly string[] {
+  const denies = denyRead.map(entry => readRuleCovers(entry))
+  const reopened = allowRead
+    .map(entry => removeTrailingGlobSuffix(entry))
+    .filter(entry => !containsGlobCharsForPlatform(entry))
+    .map(entry => normalizePathForSandbox(entry, { literal: true }))
+  return SANDBOX_OWN_WRITE_PATHS.filter(p => {
+    if (!p.includes('tmp/claude')) return true
+    const norm = normalizePathForSandbox(p, { literal: true })
+    return !denies.some(
+      denyCovers =>
+        denyCovers(norm) &&
+        !reopened.some(allow => denyCovers(allow) && isAtOrUnder(norm, allow)),
+    )
+  })
 }
 
 /**

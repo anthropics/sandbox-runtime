@@ -45,21 +45,34 @@ describe.if(!isWindows)('getDefaultWritePaths', () => {
     )
   })
 
-  it.each([home, '~/', '~/**', join(home, '**'), '/', '/**'])(
+  it.each([home, '~/', '~/**', join(home, '**')])(
     'drops both home conveniences, and nothing else, under denyRead %s',
     deny => {
       expect(getDefaultWritePaths({ denyRead: [deny] })).toEqual(SANDBOX_OWN)
     },
   )
 
-  it.each(['/tmp', '/private/tmp', '/dev'])(
-    'drops nothing under denyRead %s',
+  it.each(['/', '/**'])(
+    'drops both home conveniences and /tmp/claude convenience paths under denyRead %s',
     deny => {
       expect(getDefaultWritePaths({ denyRead: [deny] })).toEqual(
-        getDefaultWritePaths(),
+        SANDBOX_OWN.filter(p => !p.includes('tmp/claude')),
       )
     },
   )
+
+  it('drops /tmp/claude when covered by denyRead /tmp or /tmp/claude', () => {
+    expect(getDefaultWritePaths({ denyRead: ['/tmp'] })).toEqual([
+      ...SANDBOX_OWN.filter(p => p !== '/tmp/claude'),
+      npmLogs,
+      claudeDebug,
+    ])
+    expect(getDefaultWritePaths({ denyRead: ['/tmp/claude'] })).toEqual([
+      ...SANDBOX_OWN.filter(p => p !== '/tmp/claude'),
+      npmLogs,
+      claudeDebug,
+    ])
+  })
 
   it('leaves nothing under a read-denied home', () => {
     expect(
@@ -145,7 +158,8 @@ describe.if(!isWindows)('getDefaultWritePaths', () => {
  * changed at runtime, so these cases need a process of their own.
  */
 function runWithHome(fakeHome: string, script: string): unknown {
-  const result = spawnSync(process.execPath, ['-e', script], {
+  const nodeScript = script.replace(/\/src\/(.+?)\.ts/g, '/dist/$1.js')
+  const result = spawnSync(process.execPath, ['-e', nodeScript], {
     cwd: REPO_ROOT,
     env: { ...process.env, HOME: fakeHome },
     encoding: 'utf8',
