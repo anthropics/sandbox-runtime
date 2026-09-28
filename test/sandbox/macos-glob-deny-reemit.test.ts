@@ -141,6 +141,37 @@ describe.if(!isWindows)('macOS read profile: glob denies vs allowRead', () => {
     expect(allowGlob).not.toContain('^/work/proj[^/]*(/.*)?$')
   })
 
+  it('re-emits a literal deny that a glob allow reaches into', () => {
+    // A glob allow is not a literal allow directory, so the deny used not to
+    // come back after it and `<root>/**/*` re-opened the denied file.
+    for (const allow of ['/work/**', '/work/**/*', '/work/proj/*']) {
+      const read = readSection(
+        wrap({
+          denyOnly: ['/work/proj/secrets'],
+          allowWithinDeny: [allow],
+        }),
+      )
+      const filter = '(subpath "/work/proj/secrets")'
+      expect(read.indexOf(filter)).toBeLessThan(allowBlockIndex(read))
+      const late = lateBlock(read)
+      expect(late).toContain(HEADERS.denyRead)
+      expect(late).toContain(filter)
+    }
+  })
+
+  it('leaves a literal deny alone when no allow can reach it', () => {
+    const read = readSection(
+      wrap({
+        denyOnly: ['/work/proj/secrets'],
+        allowWithinDeny: ['/elsewhere/**/*'],
+      }),
+    )
+    // The deny is still emitted in the base layer, just not re-emitted: there
+    // is no allow after it that could have opened it again.
+    expect(read).toContain('(subpath "/work/proj/secrets")')
+    expect(lateBlock(read)).not.toContain('(subpath "/work/proj/secrets")')
+  })
+
   it('carves the allows a region-shaped glob covers out of its re-emit', () => {
     const read = readSection(
       wrap({
