@@ -188,16 +188,36 @@ exist.
 
 `--control-fd <fd>` reads config updates from a descriptor the caller has
 already opened, one JSON object per line in the same shape as the settings
-file. Each line replaces the whole config, but only the network lists
-(`allowedDomains` / `deniedDomains`) change what is already running: the
-proxy consults them per request. Filesystem rules are compiled into the
-sandbox at wrap time, so a line that changes them applies to nothing in the
-current run.
+file. Each line replaces the whole config and is validated against the same
+schema, so a line is a complete config rather than a patch: `network` and
+`filesystem` are required, and a key the line leaves out goes back to its
+default.
 
 ```bash
 # fd 3 is the read end of a pipe the caller writes lines to
 srt --control-fd 3 -- npm test
 ```
+
+What an accepted line changes in the run already under way:
+
+- The network lists — `network.allowedDomains`, `deniedDomains` and
+  `deniedResolvedAddresses` — take effect on the next connection, on every
+  platform: the proxy consults them per request, and the resolved-address
+  check is rebuilt from the same line.
+- `credentials.sigv4` takes effect on the next request, for the same
+  reason: the signing hook reads the policies per request rather than
+  capturing them when the proxy starts.
+- Everything else is kept for the next `srt` run and changes nothing in
+  this one. The filesystem rules were compiled into the seatbelt profile,
+  the bubblewrap argv or the Windows ACEs when the command was wrapped, the
+  credential masks were built there too, and the running proxy servers
+  captured `network.parentProxy` when they started.
+- On Windows, a line whose file-access set (`filesystem.*` together with
+  `credentials.files`) differs from the one applied at startup changes
+  nothing: the ACL grant is session-wide, the set applied at startup stays
+  in force, and srt reports the difference only under `SRT_DEBUG`.
+
+How srt reads the channel, and what it refuses:
 
 - The descriptor must be an integer **3 or above** and readable — `0`-`2`
   are the standard streams. srt exits with an error instead of running the
@@ -207,7 +227,11 @@ srt --control-fd 3 -- npm test
   after says so and leaves the command running under the config last
   applied.
 - A line that is not a valid config is reported on stderr and dropped; the
-  previous config stays in force.
+  previous config stays in force. The line itself goes to the debug log
+  rather than to the terminal, and a blank line is ignored silently.
+- srt starts reading only once the sandbox is up, so an update written
+  before then waits in the channel rather than being lost — and cannot be
+  overwritten by the config the sandbox starts with.
 - srt **exits with the wrapped command** and does not wait for the writer
   to close the descriptor. End of input is not an error either: the
   command keeps running under the config last applied.
@@ -218,7 +242,9 @@ srt --control-fd 3 -- npm test
   its own blocking reads from then on.
 - On macOS and Linux the sandboxed command does not get the descriptor: srt
   points that slot at `/dev/null` for the command, so nothing inside the
-  sandbox can read the updates or write a config of its own.
+  sandbox can read the updates or write a config of its own. On Windows the
+  command is spawned with the three standard streams alone, so the control
+  descriptor is not among the descriptors it is handed.
 
 ### As a library
 
@@ -462,6 +488,13 @@ Examples:
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
 - `javaAgentJarPath` - macOS/Linux: absolute path to `srt-proxy-agent.jar`, the JVM agent injected via `JAVA_TOOL_OPTIONS` (see "JVM tools" under Network Isolation). Only needed by consumers that bundle sandbox-runtime and ship the jar separately; a normal npm install finds it under `vendor/java-proxy-agent/`.
 - `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service.
+- `allowPty` - macOS only: allow pseudo-terminal operations (boolean, default: false). The seatbelt profile then carries `(allow pseudo-tty)` plus read, write and `ioctl` on `/dev/ptmx` and `/dev/ttys*`, which a command that allocates a pty of its own needs. Not read on Linux or Windows.
+- `bwrapPath` - Linux only: absolute path to the `bwrap` (bubblewrap) binary, used instead of resolving `bwrap` on `PATH`. A path that is not executable is a dependency error, and no `PATH` lookup is tried after it.
+- `socatPath` - Linux only: absolute path to the `socat` binary, used instead of resolving `socat` on `PATH`, with the same rule for a path that is not executable.
+- `seccomp` - Linux only: `applyPath` points at the `apply-seccomp` binary instead of the packaged one. `argv0` invokes it as a multicall binary that dispatches on the `ARGV0` environment variable; `applyPath` is then used verbatim (no existence check) and must resolve inside the bubblewrap namespace.
+- `ripgrep` - How to invoke ripgrep for the deny-path scan (default: `{ "command": "rg" }`). `args` are passed before srt's own arguments, and `argv0` overrides `argv[0]` for a multicall binary.
+- `git.safeDirectories` - Directories git should treat as `safe.directory` inside the sandbox, where the working tree is owned by another user — the repository top level when the command runs from a subdirectory, say. Injected through `GIT_CONFIG_*` environment variables, and it grants no write access of its own.
+- `credentials` - Environment variables (`credentials.envVars`) and files (`credentials.files`) the sandboxed command must not read the real values of. `mode: "deny"` withholds the value; `mode: "mask"` puts a sentinel in its place inside the sandbox and has the proxy substitute the real value back on egress to the hosts that entry's `injectHosts` lists (default: `network.allowedDomains`). Masking requires `network.tlsTerminate`, so the real value only leaves over a verified TLS connection, unless `credentials.allowPlaintextInject` opts out.
 - `allowAppleEvents` - Allow sending Apple Events and Launch Services open requests from the macOS sandbox (boolean, default: false). Without this, commands like `open`, `osascript`, and anything that opens URLs or scripts other apps via AppleScript fail with AppleScript error `-600` ("Application isn't running") or LaunchServices errors (`-10822`, `-54`). **Security warning:** enabling this means the sandbox no longer provides code-execution isolation. A sandboxed command can launch other applications via `open` with no user prompt, and anything it launches runs outside the sandbox's filesystem and network restrictions; scripting already-running apps via Apple Events is additionally gated by the user's per-app TCC automation consent. Embedders should only source this option from trusted user-level configuration — never from project-local files in a checked-out repository, which would let an attacker-authored project elevate its own sandbox permissions.
 
 ### Common Configuration Recipes
