@@ -20,13 +20,13 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
       - run: sudo apt-get update && sudo apt-get install -y gcc libseccomp-dev
       - run: npm run build:seccomp
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: seccomp-${{ matrix.arch }}
           path: vendor/seccomp/${{ matrix.arch }}
@@ -36,16 +36,16 @@ jobs:
     name: Build JVM proxy agent
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: '21'
       - run: npm run build:java-agent
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: java-proxy-agent
           path: vendor/java-proxy-agent/srt-proxy-agent.jar
@@ -62,8 +62,8 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
       # This job builds the helper that runs elevated on a user's machine,
@@ -89,7 +89,7 @@ jobs:
           if (-not (Test-Path $exe)) { throw "$exe not found" }
           & $exe --version
           if ($LASTEXITCODE -ne 0) { throw "srt-win.exe --version exited $LASTEXITCODE" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: srt-win-${{ matrix.arch }}
           path: vendor/srt-win/${{ matrix.arch }}
@@ -100,18 +100,27 @@ jobs:
     # prebuilt binary from inside an installed package. The arm64
     # binary and seccomp binaries are not exercised here — the
     # publish job's tarball-contents check covers their presence.
-    name: Verify package (Windows)
+    #
+    # This is the one place the packed tarball is installed and imported,
+    # and it does so under Node, so it runs once on each Node release line
+    # from the engines floor in package.json (>=22) up. publish waits for
+    # both.
+    name: Verify package (Windows / Node ${{ matrix.node }})
     needs: build-srt-win
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
     env:
       # Husky's prepare hook chokes on Windows runners; skip it.
       HUSKY: '0'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '20'
-      - uses: actions/download-artifact@v4
+          node-version: ${{ matrix.node }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: srt-win-x64
           path: vendor/srt-win/x64
@@ -151,7 +160,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -172,36 +181,46 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '18'
+          # The package is built and packed here, so this stays inside its
+          # own engines range (>=22).
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: seccomp-x64
           path: vendor/seccomp/x64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: seccomp-arm64
           path: vendor/seccomp/arm64
       - run: chmod +x vendor/seccomp/*/apply-seccomp
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: java-proxy-agent
           path: vendor/java-proxy-agent
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: srt-win-x64
           path: vendor/srt-win/x64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: srt-win-arm64
           path: vendor/srt-win/arm64
 
-      - run: npm install
+      # `npm ci` installs exactly what package-lock.json records and fails
+      # when package.json has moved away from it, so what is built and
+      # published here is what CI tested. setup-node wrote an .npmrc that
+      # reads the registry token from NODE_AUTH_TOKEN, which only the publish
+      # step sets; left unset, npm sends the unexpanded placeholder as the
+      # token, and an empty value makes this install anonymous instead.
+      - run: npm ci
+        env:
+          NODE_AUTH_TOKEN: ''
 
       - name: Build, pack, verify contents
         # `npm pack` does NOT run prepublishOnly (only directory-mode
