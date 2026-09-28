@@ -352,6 +352,47 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(command).not.toContain(`--ro-bind /dev/null ${absentDeny}`)
   })
 
+  it('emits the same deny mounts whichever order the deny paths are listed in', async () => {
+    // The pre-pass and the deny loop walk the same list and must reach the
+    // same verdict about each entry: a directory one records and the other
+    // does not re-bind read-only would suppress a stub the sandbox needs,
+    // and only under some orderings. Which mounts come out is what the
+    // pre-pass makes order-independent, so the two orderings must agree.
+    const outside = join(BASE, 'outside')
+    mkdirSync(join(outside, 'kept'), { recursive: true })
+    symlinkSync(outside, join(AREA, 'link'))
+    mkdirSync(join(PROJ, 'sub'), { recursive: true })
+    const denies = [
+      PROJ,
+      join(PROJ, '.gitconfig'),
+      join(PROJ, 'sub'),
+      join(PROJ, 'sub', 'absent'),
+      join(AREA, 'link', 'kept'),
+      join(AREA, 'other', 'absent'),
+      '/dev/null',
+    ]
+    const mountsOf = (command: string) =>
+      [...command.matchAll(/--(?:ro-)?bind (\S+) (\S+)/g)]
+        .map(mount => `${mount[1]} ${mount[2]}`)
+        .sort()
+
+    const forward = mountsOf(await wrap(denies))
+    const backward = mountsOf(await wrap([...denies].reverse()))
+
+    expect(backward).toEqual(forward)
+    // Not vacuous, and the skip is specific rather than global: the
+    // covering directory is bound read-only, the absent entries beneath it
+    // are left unstubbed, and the absent entry outside it still gets its
+    // empty-directory placeholder.
+    expect(forward).toContain(`${PROJ} ${PROJ}`)
+    expect(
+      forward.filter(mount => mount.startsWith(`/dev/null ${PROJ}/`)),
+    ).toEqual([])
+    expect(
+      forward.some(mount => mount.endsWith(` ${join(AREA, 'other')}`)),
+    ).toBe(true)
+  })
+
   it('skips the stub when a denyRead directory sits under the covering deny dir with no allowed write path beneath it', async () => {
     // A read-denied directory strictly inside the write-denied dir is
     // re-applied as a tmpfs after that dir's read-only bind. All that adds

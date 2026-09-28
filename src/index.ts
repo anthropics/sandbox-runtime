@@ -48,6 +48,17 @@ export {
   LinuxSandboxProfileError,
   type LinuxSandboxProfileErrorCode,
 } from './sandbox/linux-sandbox-utils.js'
+// The macOS profile generator's own wrap-time refusal: a `.git` pointer or a
+// `commondir` whose target cannot be worked out the way git works it out. On
+// Linux the same condition arrives as a LinuxSandboxProfileError carrying
+// `deny_git_metadata_unreadable`.
+// The other refusal the shared producers raise: the `.git/modules` walk ran
+// out of the time it was given, which on Linux arrives as a
+// LinuxSandboxProfileError carrying `deny_scan_failed`.
+export {
+  GitMetadataError,
+  SubmoduleWalkBudgetError,
+} from './sandbox/mandatory-deny-paths.js'
 
 // Windows install/status API
 export {
