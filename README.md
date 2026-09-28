@@ -534,6 +534,10 @@ srt "jest --no-watchman"
 
 Watchman accesses files outside the sandbox boundaries, which will trigger permission errors. Disabling it allows Jest to run with the built-in file watcher instead.
 
+**Exit status under zsh (Linux):** From the first release after v0.0.77, a wrap that restricts the network reports the wrapped command's own exit status when `binShell` is zsh. Up to v0.0.77 a failing command could report 0 there: the wrapper's cleanup trap ended with a bare `exit`, which zsh resolves to the status of the trap's last command. bash (the default) and dash were not affected.
+
+**zod 4 in the same dependency tree:** The `zod` dependency range is `^3.25.0`. The library imports `zod/v3`, which exists from zod 3.25 on, so that it keeps the v3 API where a dependency tree resolves `zod` to version 4.
+
 ## Platform Support
 
 - **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
@@ -573,7 +577,7 @@ Prefer a non-root caller where there is the choice. Under the seccomp isolation 
 
 What stops working as a result is whatever sandboxes itself with user namespaces: Chromium's and Electron's namespace sandbox, rootless podman and buildah, a nested bubblewrap or `srt`, `unshare -r` in a build script. They fail with `EPERM` (`unshare: unshare failed: Operation not permitted`); a nested bubblewrap blames a kernel setting and suggests a `sysctl`, which does not apply here. A root caller's command also loses `mount`, `umount` and `setns` for purposes of its own (`unshare -m`, `nsenter`, `ip netns exec`), and a direct `clone3` call has no fallback. The cure is `allowNestedUserNamespaces: true`, at the price stated under that option. Known limits:
 
-- With no seccomp helper in the chain (`allowAllUnixSockets`, or no helper for the architecture) nothing limits namespaces.
+- With no seccomp helper in the chain (`allowAllUnixSockets`, or no helper for the architecture) bubblewrap is given `--disable-userns` instead, which refuses a new user namespace (`ENOSPC`, `No space left on device`) and nothing else. That needs bubblewrap 0.8.0 or later, not installed setuid, and `enableWeakerNestedSandbox` off; where it cannot be done nothing limits namespaces, and a warning is logged once per process.
 - A helper built before this release (an embedder's own, through `seccomp.applyPath` or `seccomp.argv0`) imposes no limit, and nothing says so: rebuild it from this release's `vendor/seccomp-src`.
 
 **Optional Linux dependencies (for seccomp fallback):**

@@ -1,22 +1,26 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  bwrapCanDisableUserns,
   cleanupBwrapMountPoints,
   wrapCommandWithSandboxLinux,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
+import { whichSync } from '../../src/utils/which.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
@@ -105,6 +109,17 @@ describe.if(isLinux)(
       BWRAP_CAN_NAMESPACE &&
       PYTHON !== null &&
       (process.arch === 'x64' || process.arch === 'arm64')
+    const BWRAP = whichSync('bwrap')
+    // Bubblewrap's own word, had by using the option, not that of the function
+    // under test: gated on that, a probe that wrongly said no would turn every
+    // arm below that needs the option into a skip.
+    const BWRAP_DISABLES_USERNS =
+      BWRAP !== null &&
+      spawnSync(
+        BWRAP,
+        ['--unshare-user', '--disable-userns', '--ro-bind', '/', '/', 'true'],
+        { stdio: 'ignore', timeout: 5000 },
+      ).status === 0
 
     beforeEach(() => {
       BASE = realpathSync(mkdtempSync(join(tmpdir(), 'nested-userns-')))
@@ -127,6 +142,8 @@ describe.if(isLinux)(
       options: {
         allowNestedUserNamespaces?: boolean
         allowAllUnixSockets?: boolean
+        enableWeakerNestedSandbox?: boolean
+        bwrapPath?: string
       } = {},
     ): Promise<string> {
       return wrapCommandWithSandboxLinux({
@@ -149,6 +166,19 @@ describe.if(isLinux)(
 
     const hostConfig = () =>
       readFileSync(join(PROJECT, '.git', 'config'), 'utf8')
+
+    // A stand-in for bubblewrap that prints `help` whatever it is asked.
+    function fakeBwrap(name: string, help: string, mode = 0o755): string {
+      const path = join(BASE, name)
+      writeFileSync(path, `#!/bin/sh\ncat <<'EOF'\n${help}\nEOF\n`)
+      // Not through writeFileSync's mode, which the umask would trim.
+      chmodSync(path, mode)
+      return path
+    }
+    const HELP_WITHOUT = 'usage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]\n'
+    const HELP_WITH =
+      HELP_WITHOUT +
+      '    --disable-userns             Disable further use of user namespaces inside sandbox'
 
     // The seccomp lines of a process's status file, which anyone may read.
     function seccompStatus(pid: number | 'self') {
@@ -210,6 +240,106 @@ describe.if(isLinux)(
         const command = await wrap('true', { allowNestedUserNamespaces })
         expect(command).toContain('--unsetenv SRT_ALLOW_NESTED_USERNS')
       }
+    })
+
+    it.if(BWRAP_DISABLES_USERNS)(
+      'gives bubblewrap --disable-userns exactly when there is no helper and namespaces are not allowed',
+      async () => {
+        expect(await wrap('true', { allowAllUnixSockets: true })).toContain(
+          '--disable-userns',
+        )
+        expect(
+          await wrap('true', {
+            allowAllUnixSockets: true,
+            allowNestedUserNamespaces: true,
+          }),
+        ).not.toContain('--disable-userns')
+        // Bubblewrap would die on an unprivileged container's /proc/sys.
+        expect(
+          await wrap('true', {
+            allowAllUnixSockets: true,
+            enableWeakerNestedSandbox: true,
+          }),
+        ).not.toContain('--disable-userns')
+      },
+    )
+
+    it.if(APPLY_SECCOMP !== null)(
+      'never gives bubblewrap --disable-userns beside the helper, which makes a namespace of its own',
+      async () => {
+        expect(await wrap('true')).not.toContain('--disable-userns')
+      },
+    )
+
+    // ---- what bubblewrap is found to support ----------------------------
+
+    it('takes the option from the help of a bubblewrap that is not setuid, and from nowhere else', () => {
+      expect(bwrapCanDisableUserns(fakeBwrap('old', HELP_WITHOUT))).toBe(false)
+      expect(bwrapCanDisableUserns(fakeBwrap('new', HELP_WITH))).toBe(true)
+      // Such a binary lists the option and refuses it.
+      const setuid = fakeBwrap('setuid', HELP_WITH, 0o4755)
+      expect(statSync(setuid).mode & 0o4000).toBe(0o4000)
+      expect(bwrapCanDisableUserns(setuid)).toBe(false)
+      expect(bwrapCanDisableUserns(join(BASE, 'no-such-bwrap'))).toBe(false)
+    })
+
+    it('a bubblewrap that did not say is asked again, and one that did is not', () => {
+      const bwrap = fakeBwrap('silent-at-first', '')
+      expect(bwrapCanDisableUserns(bwrap)).toBe(false)
+      // Not having been able to ask is not an answer to keep.
+      fakeBwrap('silent-at-first', HELP_WITH)
+      expect(bwrapCanDisableUserns(bwrap)).toBe(true)
+      // What a binary supports is: one answer for the life of the process.
+      fakeBwrap('silent-at-first', HELP_WITHOUT)
+      expect(bwrapCanDisableUserns(bwrap)).toBe(true)
+    })
+
+    it('with no helper, only a bubblewrap that can impose the limit is given the option', async () => {
+      for (const bwrapPath of [
+        fakeBwrap('old', HELP_WITHOUT),
+        fakeBwrap('setuid', HELP_WITH, 0o4755),
+      ]) {
+        expect(
+          await wrap('true', { allowAllUnixSockets: true, bwrapPath }),
+        ).not.toContain('--disable-userns')
+      }
+      expect(
+        await wrap('true', {
+          allowAllUnixSockets: true,
+          bwrapPath: fakeBwrap('new', HELP_WITH),
+        }),
+      ).toContain('--disable-userns')
+    })
+
+    it('says once per process that nothing limits namespaces, and only where that is so', () => {
+      // A process of its own: the warning is given once in each.
+      const script = `
+        import { wrapCommandWithSandboxLinux } from ${JSON.stringify(join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'))}
+        const wrap = bwrapPath => wrapCommandWithSandboxLinux({
+          command: 'true',
+          needsNetworkRestriction: false,
+          writeConfig: { allowOnly: [], denyWithinAllow: [] },
+          allowAllUnixSockets: true,
+          bwrapPath,
+        })
+        await wrap(${JSON.stringify(fakeBwrap('new', HELP_WITH))})
+        console.error('-- limited above, not below --')
+        await wrap(${JSON.stringify(fakeBwrap('old', HELP_WITHOUT))})
+        await wrap(${JSON.stringify(fakeBwrap('setuid', HELP_WITH, 0o4755))})
+      `
+      const child = spawnSync(process.execPath, ['-e', script], {
+        encoding: 'utf8',
+        timeout: 60000,
+        env: { ...process.env, SRT_DEBUG: '1' },
+      })
+      expect(child.status).toBe(0)
+      const [limited, notLimited] = child.stderr.split(
+        '-- limited above, not below --',
+      )
+      const warnings = (said?: string) =>
+        (said ?? '').split('\n').filter(l => /undo the write denies/.test(l))
+      expect(warnings(limited)).toEqual([])
+      expect(warnings(notLimited)).toHaveLength(1)
     })
 
     // ---- the helper's outer half ------------------------------------------
@@ -428,6 +558,25 @@ describe.if(isLinux)(
         expect(said).toContain('in-its-own-namespaces: replaced')
         // This is what the refusals above prevent.
         expect(hostConfig()).toContain('planted = true')
+      },
+      60000,
+    )
+
+    it.if(CAN_RUN_CHAIN && BWRAP_DISABLES_USERNS)(
+      'without the helper: bubblewrap refuses the new namespace and the file is not replaced (live bwrap)',
+      async () => {
+        const result = run(
+          await wrap(`${PYTHON} ${SCRIPT} ${PROJECT}`, {
+            allowAllUnixSockets: true,
+          }),
+        )
+        const said = `${result.stdout}${result.stderr}`
+        expect(said).not.toContain('bwrap:')
+        expect(said).toContain('in-the-sandbox-namespaces: refused EBUSY')
+        expect(said).toMatch(
+          /new-namespaces: refused (ENOSPC|EPERM) at unshare/,
+        )
+        expect(hostConfig()).toBe(ORIGINAL)
       },
       60000,
     )
