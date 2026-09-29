@@ -2512,9 +2512,18 @@ describe.if(isWindows)(
           ['-NoProfile', '-Command', `(Get-Acl -LiteralPath '${p}').Owner`],
           { encoding: 'utf8', timeout: 30_000 },
         ).stdout.trim()
+      // The host may have been locked out of the file: that is a result, not
+      // a reason to stop.
+      const asTheHost = (p: string) => {
+        try {
+          return JSON.stringify(readFileSync(p, 'utf8').trim())
+        } catch (e) {
+          return `UNREADABLE BY THE HOST (${(e as NodeJS.ErrnoException).code})`
+        }
+      }
       const say = (what: string, r: RunResult, p: string) =>
         console.log(
-          `PROBE owner, ${what}: exit ${r.status} | ${JSON.stringify((r.stdout + r.stderr).replace(/\s+/g, ' ').trim().slice(0, 900))} | content now ${JSON.stringify(readFileSync(p, 'utf8').trim())} | the account's ACEs ${JSON.stringify(ownAces(p).map(a => a.trim().replace(/^.*srt-sandbox:/, '')))}`,
+          `PROBE owner, ${what}: exit ${r.status} | ${JSON.stringify((r.stdout + r.stderr).replace(/\s+/g, ' ').trim().slice(0, 900))} | content now ${asTheHost(p)} | icacls as the host: ${JSON.stringify(dacl(p).replace(/\s+/g, ' ').trim().slice(-220))}`,
         )
       const strip = (p: string, word: string) =>
         `icacls "${p}" /remove:d *${sbSid} & echo ${word}>"${p}"`
@@ -2642,8 +2651,12 @@ describe.if(isWindows)(
           )
         })
       } finally {
-        rmSync(dir, { recursive: true, force: true })
-        rmSync(other, { recursive: true, force: true })
+        // Take back whatever the account locked, or nothing can be removed.
+        for (const d of [dir, other]) {
+          spawnSync('takeown', ['/f', d, '/r', '/d', 'y'], { timeout: 60_000 })
+          spawnSync('icacls', [d, '/reset', '/t', '/c'], { timeout: 60_000 })
+          rmSync(d, { recursive: true, force: true })
+        }
       }
     }, 300_000)
 
