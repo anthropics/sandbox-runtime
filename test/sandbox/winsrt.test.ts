@@ -14,6 +14,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -1312,7 +1313,14 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[1]])
 
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
+    const probeStart = performance.now()
     await SandboxManager.initialize(createTestConfig())
+    const probeTook = Math.round(performance.now() - probeStart)
+    console.log(
+      `PROBE network group: initialize() ${probeTook} ms, cwd ${process.cwd()}, ` +
+        `${readdirSync(process.cwd(), { recursive: true }).length} entries under it, ` +
+        `filesystem ${JSON.stringify(createTestConfig().filesystem)}`,
+    )
     console.error('[winsrt beforeAll] done')
     // Install and uninstall each run an elevated srt-win that can outlast
     // bun's 5s default hook timeout; a hook that times out is killed
@@ -2250,7 +2258,18 @@ describe.if(isWindows)(
               createFsTestConfig({ allowWrite: [dir] }),
             ),
           )
-          for (const nth of ['first', 'second', 'third']) {
+          for (const nth of [
+            'first',
+            'second',
+            'third',
+            '4th',
+            '5th',
+            '6th',
+            '7th',
+            '8th',
+            '9th',
+            '10th',
+          ]) {
             ran.push(
               await timeInto(took, `${nth} command`, () =>
                 runSandboxed('echo M6-RAN', 120_000),
@@ -2262,6 +2281,33 @@ describe.if(isWindows)(
         }
         await timeInto(took, 'reset()', () => SandboxManager.reset())
         console.log(`M6: ${inWords(took)}`)
+        // PROBE, not for merging: what one DACL write on this directory costs
+        // by the kind of ACE, through the same system routine.
+        const probe: Took = {}
+        const icacls = (...args: string[]) => {
+          const r = spawnSync('icacls', [dir, ...args], {
+            encoding: 'utf8',
+            timeout: 120_000,
+          })
+          if (r.status !== 0)
+            throw new Error(`icacls ${args.join(' ')}: ${r.stdout}${r.stderr}`)
+          return Promise.resolve()
+        }
+        for (const round of [1, 2]) {
+          await timeInto(probe, `object-only deny #${round}`, () =>
+            icacls('/deny', `*${sbSid}:(DC)`),
+          )
+          await timeInto(probe, `its removal #${round}`, () =>
+            icacls('/remove:d', `*${sbSid}`),
+          )
+          await timeInto(probe, `inheritable deny #${round}`, () =>
+            icacls('/deny', `*${sbSid}:(OI)(CI)(DC)`),
+          )
+          await timeInto(probe, `its removal #${round} `, () =>
+            icacls('/remove:d', `*${sbSid}`),
+          )
+        }
+        console.log(`PROBE M6 tree: ${inWords(probe)}`)
         if (error !== undefined) throw error
         const bad = ran.find(
           r => r.status !== 0 || !r.stdout.includes('M6-RAN'),
