@@ -2363,6 +2363,63 @@ describe.if(isWindows)(
           `${older.stdout}${older.stderr}PROBE SetFileSecurityW exit ${older.status}`,
         )
         rmSync(ps1, { force: true })
+        // PROBE, not for merging: can the auto-inherit flag be kept, and what
+        // does a later propagating write on the PARENT do to a directory that
+        // has lost it?
+        const ps2 = join(tmpdir(), `srt-probe2-${process.pid}.ps1`)
+        writeFileSync(
+          ps2,
+          [
+            'param([string]$Dir, [string]$Sid)',
+            "$ErrorActionPreference = 'Stop'",
+            'Add-Type -TypeDefinition @"',
+            'using System;',
+            'using System.Runtime.InteropServices;',
+            'public static class Sec2 {',
+            '  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]',
+            '  public static extern bool SetFileSecurityW(string lpFileName, uint SecurityInformation, byte[] pSecurityDescriptor);',
+            '}',
+            '"@',
+            'function Dacl($p) { ((Get-Acl -LiteralPath $p).Sddl -replace "^.*?D:", "D:") -replace "S-1-5-21-[0-9-]+", "<sid>" }',
+            'function Put($path, $acl, [bool]$req) {',
+            '  $bytes = $acl.GetSecurityDescriptorBinaryForm()',
+            '  # Control is the little-endian word at offset 2: REQ 0x0100, AUTO_INHERITED 0x0400.',
+            '  if ($req) { $bytes[3] = $bytes[3] -bor 0x05 }',
+            '  if (-not [Sec2]::SetFileSecurityW($path, 4, $bytes)) {',
+            '    throw ("SetFileSecurityW failed: " + [Runtime.InteropServices.Marshal]::GetLastWin32Error())',
+            '  }',
+            '}',
+            '$id = New-Object System.Security.Principal.SecurityIdentifier($Sid)',
+            '$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($id, "DeleteSubdirectoriesAndFiles", "None", "None", "Deny")',
+            '# 1. put the flag back on the tree root by an ordinary propagating write, then try with REQ',
+            'icacls $Dir /grant "*${Sid}:(RX)" | Out-Null; icacls $Dir /remove:g "*${Sid}" | Out-Null',
+            '"PROBE AI 1 after an ordinary propagating write: " + (Dacl $Dir)',
+            '$acl = Get-Acl -LiteralPath $Dir; $acl.AddAccessRule($rule); Put $Dir $acl $true',
+            '"PROBE AI 1 with the deny, REQ set: " + (Dacl $Dir)',
+            '$acl = Get-Acl -LiteralPath $Dir; [void]$acl.RemoveAccessRule($rule); Put $Dir $acl $true',
+            '"PROBE AI 1 after its removal, REQ set: " + (Dacl $Dir)',
+            '# 2. two sibling directories: d0 loses the flag, d1 keeps it; then the PARENT gains and loses an inheritable grant',
+            '$lost = Join-Path $Dir "d0"; $kept = Join-Path $Dir "d1"',
+            '$acl = Get-Acl -LiteralPath $lost; $acl.AddAccessRule($rule); Put $lost $acl $false',
+            '$acl = Get-Acl -LiteralPath $lost; [void]$acl.RemoveAccessRule($rule); Put $lost $acl $false',
+            'function Both($label) {',
+            '  "PROBE AI 2 ${label}: d0 (flag lost) " + (Dacl $lost) + " | d0\\f0 " + (Dacl (Join-Path $lost "f0"))',
+            '  "PROBE AI 2 ${label}: d1 (flag kept) " + (Dacl $kept) + " | d1\\f0 " + (Dacl (Join-Path $kept "f0"))',
+            '}',
+            "Both 'before'",
+            'icacls $Dir /grant "*${Sid}:(OI)(CI)(M)" | Out-Null',
+            "Both 'parent granted (OI)(CI)(M)'",
+            'icacls $Dir /remove:g "*${Sid}" | Out-Null',
+            "Both 'parent grant removed'",
+          ].join('\r\n'),
+        )
+        const flag = spawnSync(
+          'pwsh',
+          ['-NoProfile', '-File', ps2, '-Dir', dir, '-Sid', sbSid],
+          { encoding: 'utf8', timeout: 180_000 },
+        )
+        console.log(`${flag.stdout}${flag.stderr}PROBE AI exit ${flag.status}`)
+        rmSync(ps2, { force: true })
         if (error !== undefined) throw error
         const bad = ran.find(
           r => r.status !== 0 || !r.stdout.includes('M6-RAN'),
