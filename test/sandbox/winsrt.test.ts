@@ -2513,7 +2513,7 @@ describe.if(isWindows)(
         ).stdout.trim()
       const say = (what: string, r: RunResult, p: string) =>
         console.log(
-          `PROBE owner, ${what}: exit ${r.status} | ${JSON.stringify((r.stdout + r.stderr).replace(/\s+/g, ' ').trim().slice(0, 260))} | content now ${JSON.stringify(readFileSync(p, 'utf8').trim())} | the account's ACEs ${JSON.stringify(ownAces(p).map(a => a.trim().replace(/^.*srt-sandbox:/, '')))}`,
+          `PROBE owner, ${what}: exit ${r.status} | ${JSON.stringify((r.stdout + r.stderr).replace(/\s+/g, ' ').trim().slice(0, 900))} | content now ${JSON.stringify(readFileSync(p, 'utf8').trim())} | the account's ACEs ${JSON.stringify(ownAces(p).map(a => a.trim().replace(/^.*srt-sandbox:/, '')))}`,
         )
       const strip = (p: string, word: string) =>
         `icacls "${p}" /remove:d *${sbSid} & echo ${word}>"${p}"`
@@ -2574,28 +2574,23 @@ describe.if(isWindows)(
             users,
           )
           // icacls reads attributes and lists the parent first, which the
-          // account cannot do here, so its refusal proves little. The bare
-          // call opens the file for WRITE_DAC alone.
+          // account cannot do here, so its refusal proves little. This asks
+          // for the DACL to be set and reads nothing first.
           const ps3 = join(other, 'retake.ps1')
           writeFileSync(
             ps3,
             [
               'param([string]$Path, [string]$Sid)',
-              'Add-Type -TypeDefinition @"',
-              'using System;',
-              'using System.Runtime.InteropServices;',
-              'public static class Sec3 {',
-              '  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]',
-              '  public static extern bool SetFileSecurityW(string lpFileName, uint SecurityInformation, byte[] pSecurityDescriptor);',
-              '}',
-              '"@',
-              '$sd = New-Object System.Security.AccessControl.RawSecurityDescriptor("D:(A;;FA;;;$Sid)")',
-              '$bytes = New-Object byte[] $sd.BinaryLength',
-              '$sd.GetBinaryForm($bytes, 0)',
-              '$ok = [Sec3]::SetFileSecurityW($Path, 4, $bytes)',
-              '$err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()',
-              '"SetFileSecurityW returned $ok (last error $err)"',
-              'try { Set-Content -LiteralPath $Path -Value "POISON-3" -ErrorAction Stop; "write ok" } catch { "write failed: $($_.Exception.Message)" }',
+              '"got path=[$Path] sid=[$Sid] cwd=[$(Get-Location)] temp=[$env:TEMP] as=[$([Security.Principal.WindowsIdentity]::GetCurrent().Name)]"',
+              '# No compile step, and nothing read from the file first: a fresh, protected DACL applied by path.',
+              'try {',
+              '  $fs = New-Object System.Security.AccessControl.FileSecurity',
+              '  $fs.SetSecurityDescriptorSddlForm("D:P(A;;FA;;;$Sid)", [System.Security.AccessControl.AccessControlSections]::Access)',
+              '  [System.IO.File]::SetAccessControl($Path, $fs)',
+              '  "SetAccessControl OK"',
+              '} catch { "SetAccessControl FAILED: $($_.Exception.GetType().Name): $($_.Exception.Message)" }',
+              'try { [System.IO.File]::WriteAllText($Path, "POISON-3"); "write OK" }',
+              'catch { "write FAILED: $($_.Exception.GetType().Name): $($_.Exception.Message)" }',
             ].join('\r\n'),
           )
           const bare = (p: string) =>
