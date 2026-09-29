@@ -3,6 +3,9 @@ name: Release
 on:
   release:
     types: [published]
+  # Runs every job except publish. The `package` artifact holds the
+  # tarball a release from that commit would publish.
+  pull_request:
 
 permissions:
   contents: read
@@ -86,72 +89,17 @@ jobs:
           path: vendor/srt-win/${{ matrix.arch }}
           if-no-files-found: error
 
-  verify-package:
-    # Proves getSrtWinPath() resolves and runs the host-arch (x64)
-    # prebuilt binary from inside an installed package. The arm64
-    # binary and seccomp binaries are not exercised here — the
-    # publish job's tarball-contents check covers their presence.
-    name: Verify package (Windows)
-    needs: build-srt-win
-    runs-on: windows-latest
-    env:
-      # Husky's prepare hook chokes on Windows runners; skip it.
-      HUSKY: '0'
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: '20'
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: srt-win-x64
-          path: vendor/srt-win/x64
-      - run: npm ci
-      - run: npm run build
-      - name: Pack, install into clean dir, resolve+run srt-win.exe
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          npm pack
-          $pkg = (Get-ChildItem *.tgz).FullName
-          $tmp = Join-Path $env:RUNNER_TEMP "pkg-verify"
-          New-Item -ItemType Directory -Force $tmp | Out-Null
-          Push-Location $tmp
-          npm init -y | Out-Null
-          npm install $pkg
-          # Package is ESM-only ("type":"module"); use dynamic import().
-          # End-to-end: getSrtWinPath() from the installed package resolves
-          # vendor/srt-win/<arch>/srt-win.exe under node_modules and runs it.
-          Set-Content -Path verify.cjs -Value @"
-          const { spawnSync } = require('child_process');
-          import('@anthropic-ai/sandbox-runtime').then(m => {
-            const p = m.getSrtWinPath();
-            console.log('resolved:', p);
-            const r = spawnSync(p, ['--version'], { encoding: 'utf8' });
-            console.log((r.stdout || '') + (r.stderr || ''));
-            if (r.status !== 0) throw new Error('exit ' + r.status + ': ' + r.stderr);
-          }).catch(e => { console.error(e); process.exit(1); });
-          "@
-          node verify.cjs
-          Pop-Location
-
-  publish:
-    name: Publish to npm
-    needs: [build-seccomp, build-java-agent, build-srt-win, verify-package]
+  pack:
+    name: Pack
+    needs: [build-seccomp, build-java-agent, build-srt-win]
     runs-on: ubuntu-latest
-    environment: npm
-    permissions:
-      contents: read
-      # npm trusted publishing exchanges this job's OIDC token for a
-      # short-lived publish credential.
-      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
       - name: Verify release tag is on main
+        if: github.event_name == 'release'
         run: |
           git fetch origin main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
@@ -160,6 +108,7 @@ jobs:
           fi
 
       - name: Verify tag matches package.json version
+        if: github.event_name == 'release'
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PKG_VERSION=$(node -p "require('./package.json').version")
@@ -170,10 +119,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          # Trusted publishing needs npm >= 11.5.1. Node 24 is the first
-          # release line that ships npm 11.
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -203,8 +149,7 @@ jobs:
 
       - name: Build, pack, verify contents
         # `npm pack` does NOT run prepublishOnly (only directory-mode
-        # `npm publish` does), so run it explicitly first — the packed
-        # tarball is then byte-identical to what publishes below.
+        # `npm publish` does), so run it explicitly first.
         run: |
           npm run prepublishOnly
           npm pack
@@ -222,11 +167,77 @@ jobs:
           if grep -q '^package/dist/vendor/' <<<"$LIST"; then
             echo "::error::dist/vendor/ duplicated in tarball"; exit 1
           fi
-          echo "PKG=$PKG" >> "$GITHUB_ENV"
 
-      - name: Publish to npm
-        # Publish the exact tarball verified above. Publishing a
-        # tarball (vs the directory) skips prepublishOnly, so no
-        # rebuild happens between verify and publish. Trusted publishing
-        # attaches provenance without --provenance.
-        run: npm publish "$PKG" --access public
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package
+          path: '*.tgz'
+          if-no-files-found: error
+
+  verify-package:
+    # Installs the packed tarball and proves getSrtWinPath() resolves and
+    # runs the host-arch (x64) prebuilt binary from inside it. The arm64
+    # binary and seccomp binaries are not exercised here — the pack
+    # job's tarball-contents check covers their presence.
+    name: Verify package (Windows)
+    needs: pack
+    runs-on: windows-latest
+    permissions: {}
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package
+      - name: Install into clean dir, resolve+run srt-win.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $pkg = (Get-ChildItem *.tgz).FullName
+          $tmp = Join-Path $env:RUNNER_TEMP "pkg-verify"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          Push-Location $tmp
+          npm init -y | Out-Null
+          npm install $pkg
+          # Package is ESM-only ("type":"module"); use dynamic import().
+          # End-to-end: getSrtWinPath() from the installed package resolves
+          # vendor/srt-win/<arch>/srt-win.exe under node_modules and runs it.
+          Set-Content -Path verify.cjs -Value @"
+          const { spawnSync } = require('child_process');
+          import('@anthropic-ai/sandbox-runtime').then(m => {
+            const p = m.getSrtWinPath();
+            console.log('resolved:', p);
+            const r = spawnSync(p, ['--version'], { encoding: 'utf8' });
+            console.log((r.stdout || '') + (r.stderr || ''));
+            if (r.status !== 0) throw new Error('exit ' + r.status + ': ' + r.stderr);
+          }).catch(e => { console.error(e); process.exit(1); });
+          "@
+          node verify.cjs
+          Pop-Location
+
+  publish:
+    # Checks nothing out and builds nothing: publishes the tarball that
+    # pack uploaded and verify-package installed.
+    name: Publish to npm
+    if: github.event_name == 'release'
+    needs: [pack, verify-package]
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      # npm trusted publishing exchanges this job's OIDC token for a
+      # short-lived publish credential.
+      id-token: write
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # Trusted publishing needs npm >= 11.5.1. Node 24 is the first
+          # release line that ships npm 11.
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package
+      # Trusted publishing attaches provenance without --provenance.
+      - run: npm publish ./*.tgz --access public
