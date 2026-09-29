@@ -240,7 +240,7 @@ pub fn set_ambient_denies(sandbox_sid: &str, raw_paths: &[String]) -> Result<Amb
             }
         };
         match crate::acl::apply_sandbox_aces(&canon, sandbox_sid, deny_only) {
-            Ok(()) => {
+            Ok(_) => {
                 if !recorded.contains(&canon) {
                     recorded.push(canon.clone());
                 }
@@ -274,7 +274,7 @@ pub fn clear_ambient_denies(sandbox_sid: &str) -> Result<usize> {
     for canon in recorded {
         let had = crate::acl::sandbox_deny_present(&canon, sandbox_sid).unwrap_or(false);
         match crate::acl::apply_sandbox_aces(&canon, sandbox_sid, crate::acl::SbAceSet::default()) {
-            Ok(()) => {
+            Ok(_) => {
                 if had {
                     removed += 1;
                 }

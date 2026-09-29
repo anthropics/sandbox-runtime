@@ -315,7 +315,9 @@ enum AclCmd {
     /// `MODIFY_NO_FDC` for `write`). Additive — the path's
     /// existing DACL and inheritance are untouched. Refcounted per
     /// holder; `acl revoke` removes the ACE when the last holder
-    /// releases.
+    /// releases. With `denyRead`/`denyWrite` too, their directory-level
+    /// ACEs (`acl stamp --dirs-only`) go in the same batch, so that a
+    /// directory that carries both is written once.
     Grant {
         /// Holder PID (see `acl stamp`).
         #[arg(long)]
@@ -332,6 +334,9 @@ enum AclCmd {
         holder_pid: u32,
         #[arg(long)]
         sandbox_user_sid: String,
+        /// `acl restore` in the same batch.
+        #[arg(long)]
+        with_denies: bool,
         #[arg(long)]
         json: bool,
     },
@@ -377,11 +382,16 @@ struct AclStampInput {
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct AclGrantInput {
     #[serde(default)]
     read: Vec<String>,
     #[serde(default)]
     write: Vec<String>,
+    #[serde(default)]
+    deny_read: Vec<String>,
+    #[serde(default)]
+    deny_write: Vec<String>,
 }
 
 /// One per-path entry of `acl revoke --json` / `acl restore
@@ -443,7 +453,7 @@ fn canonicalize_ace_targets(
     inputs: &[(&[String], srt_win::acl::SbAce)],
 ) -> anyhow::Result<AceTargets> {
     use anyhow::anyhow;
-    use srt_win::acl::SbAce;
+    use srt_win::acl::{GrantMask, SbAce};
     use srt_win::path_id::{
         CanonError, canonical_parent_of, canonicalize_path, create_placeholder_chain, is_unc_path,
         strip_extended_prefix,
@@ -457,20 +467,20 @@ fn canonicalize_ace_targets(
     // a FILE"). Strip any `\\?\` prefix and normalize `/`→`\`
     // before counting so `\\?\C:\y` and `C:/y` depth-compare
     // correctly, and trim a trailing separator so it doesn't skew
-    // the sort.
+    // the sort. Grants before all: their roots bound the pin chains.
     let mut flat: Vec<(&String, SbAce)> = inputs
         .iter()
         .flat_map(|(list, ace)| list.iter().map(move |p| (p, *ace)))
         .collect();
-    flat.sort_by_cached_key(|(p, _)| {
-        std::cmp::Reverse(
-            strip_extended_prefix(p)
-                .trim_end_matches(['\\', '/'])
-                .bytes()
-                .filter(|b| *b == b'\\' || *b == b'/')
-                .count(),
-        )
+    flat.sort_by_cached_key(|(p, ace)| {
+        let depth = strip_extended_prefix(p)
+            .trim_end_matches(['\\', '/'])
+            .bytes()
+            .filter(|b| *b == b'\\' || *b == b'/')
+            .count();
+        (!matches!(ace, SbAce::Grant(_)), std::cmp::Reverse(depth))
     });
+    let mut roots = Vec::new();
     for (p, ace) in flat {
         let canon = match canonicalize_path(p) {
             Ok((c, _is_dir)) => c,
@@ -533,6 +543,9 @@ fn canonicalize_ace_targets(
             }
         };
         targets.push((canon.clone(), ace));
+        if ace == SbAce::Grant(GrantMask::Modify) {
+            roots.push(canon.clone());
+        }
         // Full-chain hold (see doc). Duplicates across inputs are
         // harmless — `apply_aces` is idempotent per
         // `(path, kind, holder)`.
@@ -542,7 +555,7 @@ fn canonicalize_ace_targets(
                 targets.push((anc.clone(), SbAce::DenyDelete));
             }
             // Pin real ancestors below the grant root; never above it.
-            if let Some(root) = db.grant_root_of(&canon)? {
+            if let Some(root) = db.grant_root_of(&canon, &roots)? {
                 let mut cur = canonical_parent_of(&canon);
                 while let Some(anc) = cur.filter(|a| *a != root && a.len() > root.len()) {
                     if !placeholders.contains(&anc) {
@@ -663,6 +676,7 @@ impl Drop for PerExecRestore {
     fn drop(&mut self) {
         use srt_win::state_db;
         let (failed, err) = match state_db::with_init_lock(self.holder, false, |db| {
+            db.quiet = self.quiet;
             db.release_aces(&self.sandbox_sid, state_db::KIND_DENY)
         }) {
             Ok(((_, failed), _)) => (failed, None),
@@ -1250,17 +1264,24 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 serde_json::from_str(&buf).context("parse stdin JSON {read:[…], write:[…]}")?;
             let ((at, witnesses, failed), report) =
                 state_db::with_init_lock(holder, false, |db| {
-                    let at = canonicalize_ace_targets(
+                    let mut at = canonicalize_ace_targets(
                         db,
                         "grant",
                         &[
                             (&input.read, acl::SbAce::Grant(acl::GrantMask::ReadOnly)),
                             (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
+                            (&input.deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
+                            (
+                                &input.deny_write,
+                                acl::SbAce::Deny(acl::DenyMask::WriteDeny),
+                            ),
                         ],
                     )?;
                     for (p, e) in &at.bad_inputs {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
+                    at.targets
+                        .retain(|(_, a)| a.session_held() || matches!(a, acl::SbAce::Grant(_)));
                     let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
                     Ok((at, w, f))
                 })?;
@@ -1310,13 +1331,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 AclCmd::Revoke {
                     holder_pid,
                     sandbox_user_sid,
+                    with_denies,
                     json,
                 },
         } => {
             use srt_win::state_db;
             let holder = state_db::HolderPid(holder_pid);
+            let mut kinds = state_db::KIND_GRANT.to_vec();
+            if with_denies {
+                kinds.extend(state_db::KIND_DENY);
+            }
             let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
-                db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
+                db.release_aces(&sandbox_user_sid, &kinds)
             })?;
             eprintln!(
                 "srt-win: acl revoke — {} path(s){}; recovery \
@@ -1499,6 +1525,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let own = state_db::HolderPid(std::process::id());
                 let ((at, _w, failed), _r) = state_db::with_init_lock(own, false, |db| {
                     db.session = session_holder_pid.map(state_db::HolderPid);
+                    db.quiet = quiet;
                     let at = canonicalize_ace_targets(
                         db,
                         "deny",

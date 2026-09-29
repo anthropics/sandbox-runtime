@@ -661,7 +661,10 @@ pub enum SbAce {
     /// of every denied target so the sandbox user cannot `del`/`ren`
     /// it via parent-FDC even when the parent carries an inherited
     /// `BUILTIN\Users:(F)` (which the sandbox user, a Users member,
-    /// would otherwise pick up).
+    /// would otherwise pick up). Its inherited copies matter too:
+    /// under such an ACE they are all that keeps a pinned directory
+    /// further down in place, a [`SbAce::DenyPin`] having no FDC deny
+    /// of its own above it.
     DenyFdc,
     /// `(D;;DELETE|WRITE_DAC;;;<sb>)` — object-only (`NO_INHERIT`)
     /// deny on a placeholder INTERMEDIATE directory. Blocks the
@@ -831,7 +834,9 @@ impl SbAceSet {
 ///
 /// Both grant and deny carry `(OI)(CI)` so directory targets cover
 /// the subtree; on a file the inheritance flags are inert.
-pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<()> {
+///
+/// Returns whether the DACL was written.
+pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<bool> {
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
     let sid_bytes = sid.as_bytes();
@@ -856,7 +861,7 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     // that ACEs stripped from outside (`icacls /reset`, the sandbox
     // user on a directory it owns) are put back by the next command.
     if same_explicit_aces(old, new.as_ptr())? {
-        return Ok(());
+        return Ok(false);
     }
     // 4. Write back, preserving the DACL's protection state:
     //    UNPROTECTED so the kernel re-derives inherited ACEs from the
@@ -868,7 +873,8 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
         Protection::Unprotected
     };
     write_file_dacl(canonical_path, new.as_ptr(), prot)
-        .with_context(|| format!("recompose '{canonical_path}'"))
+        .with_context(|| format!("recompose '{canonical_path}'"))?;
+    Ok(true)
 }
 
 /// Whether `old`'s explicit ACEs are exactly `new`'s ACEs, byte for

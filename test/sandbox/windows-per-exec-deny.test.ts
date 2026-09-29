@@ -16,7 +16,7 @@ import { windowsGetMandatoryDenyPaths } from '../../src/sandbox/windows-sandbox-
 import { computeWindowsPerExecDenySet } from '../../src/sandbox/sandbox-manager.js'
 
 // Which paths a Windows command is denied: plain path computations, so these
-// run on every platform. What a deny costs a sandboxed write is M1-M12 of
+// run on every platform. What a deny costs a sandboxed write is M1-M16 of
 // test/sandbox/winsrt.test.ts.
 
 let root: string

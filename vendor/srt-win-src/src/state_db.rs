@@ -45,7 +45,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{FILETIME, HANDLE, WAIT_OBJECT_0};
@@ -550,6 +550,7 @@ pub fn with_init_lock<R>(
         conn,
         holder_pid,
         session: None,
+        quiet: false,
     };
     let out = f(&mut locked)?;
     Ok((out, report))
@@ -582,6 +583,31 @@ pub struct Locked {
     /// Holder of the [`SbAce::session_held`] rows an `exec` records:
     /// the host whose session it runs in. `None`: `holder_pid`.
     pub session: Option<HolderPid>,
+    /// Do not report the DACLs written: `exec --quiet`, whose stderr is
+    /// the child's.
+    pub quiet: bool,
+}
+
+/// The distinct paths of `(path, carries a grant)` rows, in the order to
+/// write them.
+///
+/// INVARIANT: at no instant may the sandbox user hold Modify on a root
+/// while a recorded deny under that root is absent from disk: another
+/// process of that user may be running (a child that outlived its command,
+/// another session), and a write on a directory takes seconds. So a batch
+/// that ADDS writes the grant roots LAST (a kill leaves denies without a
+/// grant: harmless), and one that RELEASES writes them FIRST.
+fn path_order<'a>(
+    rows: impl Iterator<Item = (&'a str, bool)>,
+    grants_first: bool,
+) -> Vec<(&'a str, bool)> {
+    let mut by_path = BTreeMap::new();
+    for (p, grant) in rows {
+        *by_path.entry(p).or_insert(false) |= grant;
+    }
+    let mut paths: Vec<_> = by_path.into_iter().collect();
+    paths.sort_by_key(|&(_, grant)| grant != grants_first);
+    paths
 }
 
 impl Locked {
@@ -676,7 +702,8 @@ impl Locked {
     /// holders.
     ///
     /// Every row is recorded first, so that each path is then written
-    /// at most once, and not at all by a batch that rolls back.
+    /// at most once ([`path_order`]), and not at all by a batch that
+    /// rolls back.
     ///
     /// All-or-nothing per batch (via [`Self::with_broker_registration`]).
     pub fn apply_aces(
@@ -697,23 +724,44 @@ impl Locked {
                 }
             }
             if failed == 0 {
-                failed = db.converge(witnesses.iter().map(|w| w.canon.as_str()), sandbox_sid);
+                // By the rows, not by this batch: a root stripped from
+                // outside gets its grant back with this write.
+                let granted: Vec<String> = query_vec(
+                    &db.conn,
+                    "SELECT canonical_path FROM working_aces WHERE kind = 'grant'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let rows = witnesses
+                    .iter()
+                    .map(|w| (w.canon.as_str(), granted.contains(&w.canon)));
+                // Stops at the first failure: no grant above a deny
+                // that could not be written.
+                if !path_order(rows, false)
+                    .into_iter()
+                    .all(|(p, _)| db.converge(p, sandbox_sid))
+                {
+                    failed = 1;
+                }
             }
             Ok((witnesses, failed))
         })
     }
 
-    /// [`recompose_at`] each distinct path once. Returns how many
-    /// failed.
-    fn converge<'a>(&self, paths: impl Iterator<Item = &'a str>, sandbox_sid: &str) -> usize {
-        let mut failed = 0usize;
-        for p in paths.collect::<BTreeSet<_>>() {
-            if let Err(e) = recompose_at(&self.conn, p, sandbox_sid) {
+    /// [`recompose_at`], reported. Returns whether it succeeded.
+    fn converge(&self, canon: &str, sandbox_sid: &str) -> bool {
+        match recompose_at(&self.conn, canon, sandbox_sid) {
+            Ok(wrote) => {
+                if wrote && !self.quiet {
+                    eprintln!("srt-win: DACL written: '{canon}'");
+                }
+                true
+            }
+            Err(e) => {
                 eprintln!("srt-win: WARNING: {e:#}");
-                failed += 1;
+                false
             }
         }
-        failed
     }
 
     /// Upsert the holder row and the `working_aces` row. The caller
@@ -936,32 +984,41 @@ impl Locked {
         })
     }
 
-    /// Drop `holds` of `holder_pid`: every row first, so that each
-    /// path is then written at most once. Per-path catch-and-continue.
+    /// Drop `holds` of `holder_pid`, ONE PATH AT A TIME ([`path_order`]):
+    /// all its rows, then its one write. A kill leaves every path not yet
+    /// reached its rows, for recovery to go by.
     fn release_holds(
         &self,
         holds: &[(String, String)],
         sandbox_sid: &str,
     ) -> (Vec<(String, AceRelease)>, usize) {
         let mut out = Vec::with_capacity(holds.len());
-        let mut paths = Vec::new();
         let mut failed = 0usize;
-        for (canon, kind) in holds {
-            match self.drop_hold(canon, kind) {
-                Ok((r, at)) => {
-                    out.push((canon.clone(), r));
-                    paths.extend(at);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "srt-win: WARNING: release {kind} '{canon}': \
-                         {e:#}; ACE left in place"
-                    );
-                    failed += 1;
+        let rows = holds.iter().map(|(c, k)| (c.as_str(), k == "grant"));
+        for (p, grant) in path_order(rows, true) {
+            let mut at = BTreeSet::new();
+            for (canon, kind) in holds.iter().filter(|(c, _)| c == p) {
+                match self.drop_hold(canon, kind) {
+                    Ok((r, to)) => {
+                        out.push((canon.clone(), r));
+                        at.extend(to);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "srt-win: WARNING: release {kind} '{canon}': \
+                             {e:#}; ACE left in place"
+                        );
+                        failed += 1;
+                    }
                 }
             }
+            let bad = at.iter().filter(|a| !self.converge(a, sandbox_sid)).count();
+            failed += bad;
+            // A grant that may still be on disk keeps the denies under it.
+            if grant && bad > 0 {
+                break;
+            }
         }
-        failed += self.converge(paths.iter().map(String::as_str), sandbox_sid);
         (out, failed)
     }
 
@@ -1039,15 +1096,17 @@ impl Locked {
     }
     /// Deepest held modify-grant that is a STRICT ancestor of `canon`
     /// — the upper bound of the pin chain. Read-only grants carry no
-    /// DELETE, so they are not roots.
-    pub fn grant_root_of(&self, canon: &str) -> Result<Option<String>> {
-        let all: Vec<String> = query_vec(
+    /// DELETE, so they are not roots. `also`: modify-grants about to be
+    /// recorded.
+    pub fn grant_root_of(&self, canon: &str, also: &[String]) -> Result<Option<String>> {
+        let mut all: Vec<String> = query_vec(
             &self.conn,
             "SELECT canonical_path FROM working_aces \
              WHERE kind = 'grant' AND mask = 'modify'",
             [],
             |r| r.get(0),
         )?;
+        all.extend_from_slice(also);
         let cb = canon.as_bytes();
         Ok(all
             .into_iter()
@@ -1061,7 +1120,7 @@ impl Locked {
 /// for sandbox-user ACE state — every add/drop/crash-recover routes
 /// here so a path with both a grant AND a deny (or a parent that is
 /// both granted and `deny_fdc`'d) is handled consistently.
-fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()> {
+fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<bool> {
     let rows: Vec<(String, String)> = query_vec(
         conn,
         "SELECT kind, mask FROM working_aces \
@@ -1205,32 +1264,39 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        for (canon, kind, fid) in orphan_aces {
-            conn.execute(
-                "DELETE FROM working_aces \
-                 WHERE canonical_path = ?1 AND kind = ?2",
-                params![&canon, &kind],
-            )
-            .context("DELETE working_aces (orphan)")?;
-            let want = FileId::from_bytes(&fid)?;
-            match identity_gate(&canon, want) {
-                IdGate::Match => {
-                    if let Err(e) = recompose_at(conn, &canon, &sb) {
-                        eprintln!(
-                            "srt-win: orphaned {kind} '{canon}': \
-                             recompose failed ({e:#})"
-                        );
-                        continue;
+        // As `release_holds`: one path at a time, in `path_order`.
+        let rows = orphan_aces
+            .iter()
+            .map(|(c, k, _)| (c.as_str(), k == "grant"));
+        for (p, grant) in path_order(rows, true) {
+            let mut at = BTreeSet::new();
+            for (canon, kind, fid) in orphan_aces.iter().filter(|(c, ..)| c == p) {
+                conn.execute(
+                    "DELETE FROM working_aces \
+                     WHERE canonical_path = ?1 AND kind = ?2",
+                    params![canon, kind],
+                )
+                .context("DELETE working_aces (orphan)")?;
+                let want = FileId::from_bytes(fid)?;
+                match identity_gate(canon, want) {
+                    IdGate::Match => at.extend([canon.clone()]),
+                    IdGate::Mismatch if kind == "grant" => {
+                        at.extend(path_id::locate_by_file_id(&want))
                     }
+                    _ => {} // gone/substituted — nothing on disk to do
                 }
-                IdGate::Mismatch if kind == "grant" => {
-                    if let Some(at) = path_id::locate_by_file_id(&want) {
-                        let _ = recompose_at(conn, &at, &sb);
-                    }
-                }
-                _ => {} // gone/substituted — nothing on disk to do
+                report.aces_revoked += 1;
             }
-            report.aces_revoked += 1;
+            let mut bad = false;
+            for a in &at {
+                if let Err(e) = recompose_at(conn, a, &sb) {
+                    eprintln!("srt-win: orphaned '{a}': recompose failed ({e:#})");
+                    bad = true;
+                }
+            }
+            if grant && bad {
+                break;
+            }
         }
     }
     let _ = force; // reserved for a future "force-recompose" mode
@@ -1396,6 +1462,7 @@ mod tests {
             conn,
             holder_pid: HolderPid(std::process::id()),
             session: None,
+            quiet: false,
         };
         f(&mut db)
     }
@@ -1466,6 +1533,19 @@ mod tests {
     }
 
     #[test]
+    fn grant_roots_are_written_last_when_adding_and_first_when_releasing() {
+        let order = |grants_first| -> Vec<&str> {
+            let rows = [("w", false), (r"w\.git", false), ("w", true), ("r", true)];
+            path_order(rows.into_iter(), grants_first)
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect()
+        };
+        assert_eq!(order(false), [r"w\.git", "r", "w"]);
+        assert_eq!(order(true), ["r", "w", r"w\.git"]);
+    }
+
+    #[test]
     fn grant_root_of_picks_deepest_modify_grant() {
         with_mem_db(|db| {
             for (p, m) in [
@@ -1483,14 +1563,25 @@ mod tests {
                     .unwrap();
             }
             let root = db
-                .grant_root_of(r"\\?\C:\proj\pkg\app\ro\.git\config")
+                .grant_root_of(r"\\?\C:\proj\pkg\app\ro\.git\config", &[])
                 .unwrap();
             assert_eq!(root.as_deref(), Some(r"\\?\C:\proj\pkg"));
             assert_eq!(
-                db.grant_root_of(r"\\?\C:\proj\pkg").unwrap().as_deref(),
+                db.grant_root_of(r"\\?\C:\proj\pkg", &[])
+                    .unwrap()
+                    .as_deref(),
                 Some(r"\\?\C:\proj")
             );
-            assert!(db.grant_root_of(r"\\?\C:\project\x").unwrap().is_none());
+            assert!(
+                db.grant_root_of(r"\\?\C:\project\x", &[])
+                    .unwrap()
+                    .is_none()
+            );
+            let also = [r"\\?\C:\project".to_string()];
+            assert_eq!(
+                db.grant_root_of(r"\\?\C:\project\x", &also).unwrap(),
+                Some(also[0].clone())
+            );
         });
     }
 }

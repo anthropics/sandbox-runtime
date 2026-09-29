@@ -2011,6 +2011,14 @@ export interface WindowsAclGrantOptions {
   write: readonly string[]
   /** Paths to grant `FILE_GENERIC_READ|EXECUTE` on (`allowRead`). */
   read: readonly string[]
+  /**
+   * Denies whose directory-level ACEs
+   * ({@link WindowsAclStampOptions.dirsOnly}) go in the same batch, so that
+   * a directory that carries both a grant and one of those is written once.
+   */
+  denyRead?: readonly string[]
+  /** See {@link denyRead}. */
+  denyWrite?: readonly string[]
   /** SID of the dedicated sandbox user — {@link WindowsSandboxUserStatus.sid}. */
   sandboxUserSid: string
   /** Long-lived host PID the holds are tied to. Default: this process. */
@@ -2032,7 +2040,12 @@ export interface WindowsAclGrantOptions {
  */
 export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
   const holder = opts.holderPid ?? process.pid
-  const stdin = JSON.stringify({ read: opts.read, write: opts.write })
+  const stdin = JSON.stringify({
+    read: opts.read,
+    write: opts.write,
+    denyRead: opts.denyRead ?? [],
+    denyWrite: opts.denyWrite ?? [],
+  })
   const r = runSrtWin(
     [
       'acl',
@@ -2058,11 +2071,13 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 /**
  * Release this holder's grants and remove the sandbox-user ACE on
  * any path whose refcount falls to zero. Best-effort (does not
- * throw); logs anomalies.
+ * throw); logs anomalies. `withDenies`: {@link restoreWindowsAcl} in the
+ * same batch, so that a directory that carries both is written once.
  */
 export function revokeWindowsAcl(opts: {
   sandboxUserSid: string
   holderPid?: number
+  withDenies?: boolean
   srtWin?: SrtWinSpawn
 }): WindowsAclAceOutcome[] | undefined {
   const holder = opts.holderPid ?? process.pid
@@ -2075,16 +2090,16 @@ export function revokeWindowsAcl(opts: {
         `${holder}`,
         '--sandbox-user-sid',
         opts.sandboxUserSid,
+        ...(opts.withDenies ? ['--with-denies'] : []),
         '--json',
       ],
       { timeoutMs: 60_000, srtWin: opts.srtWin },
     )
-    if (!r.ok) {
-      logForDebugging(
-        `[Sandbox Windows] acl revoke exited non-zero: ${r.stderr}`,
-        { level: 'error' },
-      )
-    }
+    logForDebugging(
+      `[Sandbox Windows] acl revoke ${r.ok ? 'done' : 'exited non-zero'}: ` +
+        r.stderr,
+      { level: r.ok ? 'info' : 'error' },
+    )
     return r.json
   } catch (e) {
     logForDebugging(`[Sandbox Windows] acl revoke: ${(e as Error).message}`, {

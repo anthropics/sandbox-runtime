@@ -65,8 +65,6 @@ import {
   parseWindowsBinShell,
   expandWindowsFsPaths,
   windowsGetMandatoryDenyPaths,
-  stampWindowsAcl,
-  restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
   getWindowsSandboxUserStatusAsync,
@@ -154,8 +152,7 @@ let javaAgentJarPath: string | undefined
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
 let proxyAuthToken: string | undefined
 // Windows: the resolved grant set that was actually applied at
-// initialize(). `undefined` means none was (gates running
-// `acl revoke` at reset()).
+// initialize(). `undefined` means none was.
 let windowsFsStampedSet:
   | ReturnType<typeof computeWindowsFsAccessSet>
   | undefined
@@ -868,13 +865,24 @@ async function initialize(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
-      if (acc.grantRead.length > 0 || acc.grantWrite.length > 0) {
+      // With the denies known now, so that the first command does not pay
+      // for their directory-level ACEs.
+      const deny = computeWindowsPerExecDenySet(
+        runtimeConfig,
+        undefined,
+        process.cwd(),
+      )
+      const granted = acc.grantRead.length > 0 || acc.grantWrite.length > 0
+      if (granted || deny.denyRead.length > 0 || deny.denyWrite.length > 0) {
         grantWindowsAcl({
           sandboxUserSid: sb,
           read: acc.grantRead,
           write: acc.grantWrite,
+          ...deny,
           srtWin,
         })
+      }
+      if (granted) {
         // Recorded after success: the catch below clears `config`.
         windowsFsStampedSet = acc
         logForDebugging(
@@ -883,24 +891,17 @@ async function initialize(
             `${acc.grantRead.length} grantRead`,
         )
       }
-      // For the denies known now, so that the first command does not pay
-      // for them. After the grants, whose roots bound the pins.
-      const deny = computeWindowsPerExecDenySet(
-        runtimeConfig,
-        undefined,
-        process.cwd(),
-      )
-      if (deny.denyRead.length > 0 || deny.denyWrite.length > 0) {
-        stampWindowsAcl({ sandboxUserSid: sb, ...deny, dirsOnly: true, srtWin })
-      }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
     } catch (e) {
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
       if (windowsFsSbUserSid) {
-        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
-        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
+        revokeWindowsAcl({
+          sandboxUserSid: windowsFsSbUserSid,
+          withDenies: true,
+          srtWin,
+        })
       }
       windowsFsSbUserSid = undefined
       config = undefined
@@ -1392,7 +1393,7 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
  * `srt-win exec --deny-*` under the exec's PID, so a `.git` the host
  * creates or rewrites between commands is covered by the next one. Only
  * the ACEs on the directories above the targets outlive the command:
- * `dirsOnly` of {@link stampWindowsAcl}.
+ * `denyRead` of {@link grantWindowsAcl}.
  *
  * A grant of the same path or of one above it does not lift a deny:
  * srt-win writes a path's deny ahead of its allow. A grant BENEATH a
@@ -2166,25 +2167,21 @@ async function reset(): Promise<void> {
     // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
     // post-. Either is non-anomalous.
     const ok = new Set(['revoked', 'stillHeld', 'restored', 'alreadyOriginal'])
-    const log = (kind: string, e: { path: string; status: string }) => {
+    // The grants, and the directory-level denies: initialize()'s, and
+    // whatever this session's commands have added since.
+    for (const e of revokeWindowsAcl({
+      sandboxUserSid: sb,
+      withDenies: true,
+      srtWin,
+    }) ?? []) {
       if (!ok.has(e.status)) {
         logForDebugging(
-          `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
+          `[Sandbox Windows] release: '${e.path}' ${e.status} — ` +
             `ACE may be left in place; resolve and run ` +
             `\`srt-win acl recover\` to clear`,
           { level: 'warn' },
         )
       }
-    }
-    if (windowsFsStampedSet) {
-      for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-        log('grant revoke', e)
-      }
-    }
-    // The directory-level denies: initialize()'s, and whatever this
-    // session's commands have added since.
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('deny restore', e)
     }
   }
   windowsFsStampedSet = undefined
