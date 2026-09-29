@@ -2505,6 +2505,90 @@ describe.if(isWindows)(
       }
     }, 600_000)
 
+    it('M6: PROBE, not for merging: what the sandbox account can do to a file it owns', async () => {
+      // Prints only. Is an owner's right to rewrite the DACL granted whatever
+      // the DACL says? A file the account made, a deny that names WRITE_DAC
+      // and WRITE_OWNER, then the account tries to take the deny off: in the
+      // session, and after reset() from a session in another directory.
+      const dir = mkdtempSync(join(tmpdir(), 'srt-probeown-'))
+      const other = mkdtempSync(join(tmpdir(), 'srt-probeown2-'))
+      const owned = join(dir, 'made-by-the-account.txt')
+      const users = join(dir, 'made-by-the-user.txt')
+      const owner = (p: string) =>
+        spawnSync(
+          'pwsh',
+          ['-NoProfile', '-Command', `(Get-Acl -LiteralPath '${p}').Owner`],
+          { encoding: 'utf8', timeout: 30_000 },
+        ).stdout.trim()
+      const say = (what: string, r: RunResult, p: string) =>
+        console.log(
+          `PROBE owner, ${what}: exit ${r.status} | ${JSON.stringify((r.stdout + r.stderr).replace(/\s+/g, ' ').trim().slice(0, 260))} | content now ${JSON.stringify(readFileSync(p, 'utf8').trim())} | the account's ACEs ${JSON.stringify(ownAces(p).map(a => a.trim().replace(/^.*srt-sandbox:/, '')))}`,
+        )
+      const strip = (p: string, word: string) =>
+        `icacls "${p}" /remove:d *${sbSid} & echo ${word}>"${p}"`
+      try {
+        writeFileSync(users, 'V1')
+        await inSession(dir, { allowWrite: [dir] }, async () => {
+          await runSandboxed(`echo V1>"${owned}"`)
+          console.log(
+            `PROBE owner: made-by-the-account.txt is owned by ${owner(owned)}; made-by-the-user.txt by ${owner(users)}`,
+          )
+          for (const p of [owned, users]) {
+            spawnSync(
+              'icacls',
+              [p, '/deny', `*${sbSid}:(WDAC,WO,WD,AD,WEA,WA,DE)`],
+              {
+                encoding: 'utf8',
+                timeout: 30_000,
+              },
+            )
+          }
+          say(
+            'in the session, its OWN file',
+            await runSandboxed(strip(owned, 'POISON-1')),
+            owned,
+          )
+          say(
+            "in the session, the USER's file (control)",
+            await runSandboxed(strip(users, 'POISON-1')),
+            users,
+          )
+        })
+        // Both denies back on, no grant anywhere near.
+        for (const p of [owned, users]) {
+          writeFileSync(p, 'V2')
+          spawnSync(
+            'icacls',
+            [p, '/deny', `*${sbSid}:(WDAC,WO,WD,AD,WEA,WA,DE)`],
+            {
+              encoding: 'utf8',
+              timeout: 30_000,
+            },
+          )
+        }
+        console.log(
+          `PROBE owner, after reset(): made-by-the-account.txt is owned by ${owner(owned)}, the account's ACEs ${JSON.stringify(ownAces(owned).map(a => a.trim().replace(/^.*srt-sandbox:/, '')))}`,
+        )
+        await inSession(other, { allowWrite: [other] }, async () => {
+          const retake = (p: string) =>
+            `icacls "${p}" /remove:d *${sbSid} & icacls "${p}" /grant *${sbSid}:(F) & echo POISON-2>"${p}"`
+          say(
+            'after reset(), from a session elsewhere, its OWN file',
+            await runSandboxed(retake(owned)),
+            owned,
+          )
+          say(
+            "after reset(), from a session elsewhere, the USER's file (control)",
+            await runSandboxed(retake(users)),
+            users,
+          )
+        })
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+        rmSync(other, { recursive: true, force: true })
+      }
+    }, 300_000)
+
     it('M7: a junction under a mandatory name does not lift the read deny on its target', async () => {
       const dir = mandatoryTree()
       const secrets = join(dir, 'secrets')
