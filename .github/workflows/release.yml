@@ -6,8 +6,9 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
+# Every job builds from a clean runner: no toolchain, dependency or
+# build-output cache is restored.
 jobs:
   build-seccomp:
     name: Build seccomp (${{ matrix.arch }})
@@ -20,13 +21,14 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
+          no-cache: true
       - run: sudo apt-get update && sudo apt-get install -y gcc libseccomp-dev
       - run: npm run build:seccomp
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: seccomp-${{ matrix.arch }}
           path: vendor/seccomp/${{ matrix.arch }}
@@ -36,16 +38,17 @@ jobs:
     name: Build JVM proxy agent
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
-      - uses: actions/setup-java@v4
+          no-cache: true
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
           java-version: '21'
       - run: npm run build:java-agent
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: java-proxy-agent
           path: vendor/java-proxy-agent/srt-proxy-agent.jar
@@ -62,25 +65,13 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
-      # This job builds the helper that runs elevated on a user's machine,
-      # so both actions are pinned by commit: `@stable` and `@v2` are a
-      # branch and a moving major tag in third-party repositories.
-      # dtolnay/rust-toolchain@stable
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-        with:
-          toolchain: stable
-      # Swatinem/rust-cache@v2.9.2
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          workspaces: vendor/srt-win-src
-          # Same key as integration-tests.yml so releases (tag refs)
-          # restore the cache main pushes have warmed. Without a
-          # shared key the release ref never sees a saved cache.
-          shared-key: srt-win
+          no-cache: true
+      # Installs the version named in rust-toolchain.toml.
+      - run: rustup toolchain install
       - run: npm run build:srt-win
       - name: Verify srt-win.exe runs
         shell: pwsh
@@ -89,7 +80,7 @@ jobs:
           if (-not (Test-Path $exe)) { throw "$exe not found" }
           & $exe --version
           if ($LASTEXITCODE -ne 0) { throw "srt-win.exe --version exited $LASTEXITCODE" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: srt-win-${{ matrix.arch }}
           path: vendor/srt-win/${{ matrix.arch }}
@@ -107,11 +98,11 @@ jobs:
       # Husky's prepare hook chokes on Windows runners; skip it.
       HUSKY: '0'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: srt-win-x64
           path: vendor/srt-win/x64
@@ -150,8 +141,13 @@ jobs:
     needs: [build-seccomp, build-java-agent, build-srt-win, verify-package]
     runs-on: ubuntu-latest
     environment: npm
+    permissions:
+      contents: read
+      # npm trusted publishing exchanges this job's OIDC token for a
+      # short-lived publish credential.
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -172,36 +168,38 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '18'
+          # Trusted publishing needs npm >= 11.5.1. Node 24 is the first
+          # release line that ships npm 11.
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: seccomp-x64
           path: vendor/seccomp/x64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: seccomp-arm64
           path: vendor/seccomp/arm64
       - run: chmod +x vendor/seccomp/*/apply-seccomp
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: java-proxy-agent
           path: vendor/java-proxy-agent
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: srt-win-x64
           path: vendor/srt-win/x64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: srt-win-arm64
           path: vendor/srt-win/arm64
 
-      - run: npm install
+      - run: npm ci
 
       - name: Build, pack, verify contents
         # `npm pack` does NOT run prepublishOnly (only directory-mode
@@ -229,7 +227,6 @@ jobs:
       - name: Publish to npm
         # Publish the exact tarball verified above. Publishing a
         # tarball (vs the directory) skips prepublishOnly, so no
-        # rebuild happens between verify and publish.
-        run: npm publish "$PKG" --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # rebuild happens between verify and publish. Trusted publishing
+        # attaches provenance without --provenance.
+        run: npm publish "$PKG" --access public
