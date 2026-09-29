@@ -158,6 +158,20 @@ jobs:
           # schema on a real Windows host rather than under a platform spy.
           bun test test/sandbox/winsrt.test.ts test/sandbox/windows-per-exec-deny.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
 
+      - name: PROBE, not for merging (M6 again with real-time protection on)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Remove-MpPreference -ExclusionPath 'C:\', 'D:\'
+            Set-MpPreference -DisableRealtimeMonitoring $false
+            Start-Sleep -Seconds 20
+          } catch { "could not change the antivirus settings: $_" }
+          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AntivirusEnabled, OnAccessProtectionEnabled | Format-List
+          "Exclusions now: " + ((Get-MpPreference).ExclusionPath -join '; ')
+          bun test test/sandbox/winsrt.test.ts -t "M6:"
+
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
         shell: pwsh

@@ -2308,6 +2308,61 @@ describe.if(isWindows)(
           )
         }
         console.log(`PROBE M6 tree: ${inWords(probe)}`)
+        // PROBE, not for merging: the older call, which is documented not to
+        // propagate. What does it cost here, and what does it do to the
+        // auto-inherit flag and to a child's ACEs?
+        const ps1 = join(tmpdir(), `srt-probe-${process.pid}.ps1`)
+        writeFileSync(
+          ps1,
+          [
+            'param([string]$Dir, [string]$Sid)',
+            "$ErrorActionPreference = 'Stop'",
+            'Add-Type -TypeDefinition @"',
+            'using System;',
+            'using System.Runtime.InteropServices;',
+            'public static class Sec {',
+            '  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]',
+            '  public static extern bool SetFileSecurityW(string lpFileName, uint SecurityInformation, byte[] pSecurityDescriptor);',
+            '}',
+            '"@',
+            '$child = Join-Path $Dir "d0\\f0"',
+            'function Show($label) {',
+            '  "PROBE SetFileSecurityW ${label}: dir " + (Get-Acl -LiteralPath $Dir).Sddl',
+            '  "PROBE SetFileSecurityW ${label}: child " + (Get-Acl -LiteralPath $child).Sddl',
+            '}',
+            'function Put($acl) {',
+            '  $bytes = $acl.GetSecurityDescriptorBinaryForm()',
+            '  $t = Measure-Command {',
+            '    if (-not [Sec]::SetFileSecurityW($Dir, 4, $bytes)) {',
+            '      throw ("SetFileSecurityW failed: " + [Runtime.InteropServices.Marshal]::GetLastWin32Error())',
+            '    }',
+            '  }',
+            '  [int]$t.TotalMilliseconds',
+            '}',
+            "Show 'before'",
+            '$id = New-Object System.Security.Principal.SecurityIdentifier($Sid)',
+            '$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($id, "DeleteSubdirectoriesAndFiles", "None", "None", "Deny")',
+            'foreach ($round in 1, 2) {',
+            '  $acl = Get-Acl -LiteralPath $Dir',
+            '  $acl.AddAccessRule($rule)',
+            '  "PROBE SetFileSecurityW round ${round}: object-only deny " + (Put $acl) + " ms"',
+            "  if ($round -eq 1) { Show 'with the deny' }",
+            '  $acl = Get-Acl -LiteralPath $Dir',
+            '  [void]$acl.RemoveAccessRule($rule)',
+            '  "PROBE SetFileSecurityW round ${round}: its removal " + (Put $acl) + " ms"',
+            '}',
+            "Show 'after'",
+          ].join('\r\n'),
+        )
+        const older = spawnSync(
+          'pwsh',
+          ['-NoProfile', '-File', ps1, '-Dir', dir, '-Sid', sbSid],
+          { encoding: 'utf8', timeout: 120_000 },
+        )
+        console.log(
+          `${older.stdout}${older.stderr}PROBE SetFileSecurityW exit ${older.status}`,
+        )
+        rmSync(ps1, { force: true })
         if (error !== undefined) throw error
         const bad = ran.find(
           r => r.status !== 0 || !r.stdout.includes('M6-RAN'),
