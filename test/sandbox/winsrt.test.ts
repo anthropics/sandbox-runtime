@@ -15,6 +15,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -2581,7 +2582,9 @@ describe.if(isWindows)(
             ps3,
             [
               'param([string]$Path, [string]$Sid)',
-              '"got path=[$Path] sid=[$Sid] cwd=[$(Get-Location)] temp=[$env:TEMP] as=[$([Security.Principal.WindowsIdentity]::GetCurrent().Name)]"',
+              '"got path=[$Path] sid=[$Sid] temp=[$env:TEMP] as=[$([Security.Principal.WindowsIdentity]::GetCurrent().Name)]"',
+              '# PowerShell cannot work from a directory whose parents it may not list: go home first.',
+              '[Environment]::CurrentDirectory = $env:TEMP; Set-Location -LiteralPath $env:TEMP',
               '# No compile step, and nothing read from the file first: a fresh, protected DACL applied by path.',
               'try {',
               '  $fs = New-Object System.Security.AccessControl.FileSecurity',
@@ -2593,8 +2596,30 @@ describe.if(isWindows)(
               'catch { "write FAILED: $($_.Exception.GetType().Name): $($_.Exception.Message)" }',
             ].join('\r\n'),
           )
+          // The long name with the \\?\ prefix: passed through as it is, so
+          // nothing has to list a parent to expand RUNNER~1.
+          const verbatim = (p: string) => `\\\\?\\${realpathSync.native(p)}`
           const bare = (p: string) =>
-            `powershell -NoProfile -ExecutionPolicy Bypass -File "${ps3}" "${p}" ${sbSid}`
+            `powershell -NoProfile -ExecutionPolicy Bypass -File "${ps3}" "${verbatim(p)}" ${sbSid}`
+          const py = join(other, 'retake.py')
+          writeFileSync(
+            py,
+            [
+              'import ctypes, sys',
+              'path, sid = sys.argv[1], sys.argv[2]',
+              "adv = ctypes.WinDLL('advapi32', use_last_error=True)",
+              'sd = ctypes.c_void_p()',
+              "ok = adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(ctypes.c_wchar_p('D:P(A;;FA;;;%s)' % sid), 1, ctypes.byref(sd), None)",
+              "print('convert returned', ok, 'last error', ctypes.get_last_error())",
+              'ok = adv.SetFileSecurityW(ctypes.c_wchar_p(path), 4, sd)',
+              "print('SetFileSecurityW returned', ok, 'last error', ctypes.get_last_error())",
+              'try:',
+              "    open(path, 'w').write('POISON-4'); print('write OK')",
+              'except Exception as e:',
+              "    print('write FAILED', repr(e))",
+            ].join('\r\n'),
+          )
+          const raw = (p: string) => `python "${py}" "${verbatim(p)}" ${sbSid}`
           say(
             'after reset(), from a session elsewhere, the BARE CALL on its OWN file',
             await runSandboxed(bare(owned), 120_000),
@@ -2603,6 +2628,16 @@ describe.if(isWindows)(
           say(
             "after reset(), from a session elsewhere, the BARE CALL on the USER's file (control)",
             await runSandboxed(bare(users), 120_000),
+            users,
+          )
+          say(
+            'after reset(), from a session elsewhere, PYTHON ctypes on its OWN file',
+            await runSandboxed(raw(owned), 120_000),
+            owned,
+          )
+          say(
+            "after reset(), from a session elsewhere, PYTHON ctypes on the USER's file (control)",
+            await runSandboxed(raw(users), 120_000),
             users,
           )
         })
