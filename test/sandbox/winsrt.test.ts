@@ -2388,6 +2388,66 @@ describe.if(isWindows)(
       }
     }, 600_000)
 
+    it('M6: PROBE, not for merging: an embedder that denies names at every level up to the home directory', async () => {
+      // A stand-in home with 20,000 files that have nothing to do with the
+      // project, a project of 100 files, and denies on ABSENT names at each
+      // level from the project up to the home.
+      const home = mkdtempSync(join(tmpdir(), 'srt-probehome-'))
+      const proj = join(home, 'src', 'proj')
+      for (let d = 0; d < 200; d++) {
+        mkdirSync(join(home, 'other', `d${d}`), { recursive: true })
+        for (let f = 0; f < 100; f++) {
+          writeFileSync(join(home, 'other', `d${d}`, `f${f}`), 'x')
+        }
+      }
+      mkdirSync(proj, { recursive: true })
+      for (let f = 0; f < 100; f++) writeFileSync(join(proj, `f${f}`), 'x')
+      const levels = [home, join(home, 'src'), proj, join(home, '.claude')]
+      const shapes: Record<string, string[]> = {
+        'no denies (baseline)': [],
+        'denies at every level': [
+          join(home, '.mcp.json'),
+          join(home, 'src', '.mcp.json'),
+          join(proj, '.mcp.json'),
+          join(home, '.claude', 'settings.json'),
+          join(home, '.claude', 'skills') + '\\',
+        ],
+      }
+      const saved = process.cwd()
+      process.chdir(proj)
+      try {
+        for (const [shape, denyWrite] of Object.entries(shapes)) {
+          const took: Took = {}
+          let held = ''
+          try {
+            await timeInto(took, 'initialize()', () =>
+              SandboxManager.initialize(
+                createFsTestConfig({ allowWrite: [proj], denyWrite }),
+              ),
+            )
+            await timeInto(took, 'one command', () =>
+              runSandboxed('echo PROBE-RAN', 120_000),
+            )
+            held = levels
+              .map(
+                l =>
+                  `${l.slice(home.length) || '<home>'}: ${JSON.stringify(existsSync(l) ? ownAces(l).map(a => a.trim().replace(/^.*srt-sandbox:/, '')) : 'absent')}`,
+              )
+              .join('; ')
+          } catch (e) {
+            held = `THREW ${String(e).slice(0, 300)}`
+          }
+          await timeInto(took, 'reset()', () => SandboxManager.reset())
+          console.log(
+            `PROBE embedder shape, ${shape}: ${inWords(took)} | the sandbox account's own ACEs in the session: ${held}`,
+          )
+        }
+      } finally {
+        process.chdir(saved)
+        rmSync(home, { recursive: true, force: true })
+      }
+    }, 600_000)
+
     it('M7: a junction under a mandatory name does not lift the read deny on its target', async () => {
       const dir = mandatoryTree()
       const secrets = join(dir, 'secrets')
