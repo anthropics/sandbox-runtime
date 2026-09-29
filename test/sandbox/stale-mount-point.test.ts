@@ -481,7 +481,7 @@ describe.if(isLinux)('A mount point an earlier sandbox left behind', () => {
         [
           `import { spawnSync } from 'node:child_process'`,
           `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(
-            join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+            join(import.meta.dir, '../helpers/isolated/library.ts'),
           )}`,
           `const command = await wrapCommandWithSandboxLinux({`,
           `  command: 'true',`,
@@ -751,7 +751,7 @@ describe.if(isLinux)(
         script,
         [
           `import { wrapCommandWithSandboxLinux } from ${JSON.stringify(
-            join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+            join(import.meta.dir, '../helpers/isolated/library.ts'),
           )}`,
           `process.umask(0o200)`,
           `for (let i = 0; i < 2; i++) {`,

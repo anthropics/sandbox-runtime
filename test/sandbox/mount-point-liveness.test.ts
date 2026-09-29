@@ -34,7 +34,11 @@ import {
 } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { isLinux } from '../helpers/platform.js'
-import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
+import {
+  inPrivateNamespace,
+  makePlaces,
+  usePrivateManifestDirectory,
+} from '../helpers/private-manifest-directory.js'
 
 /**
  * A denyWrite path that does not exist is blocked by binding over a mount point
@@ -51,7 +55,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
   const runtime = usePrivateManifestDirectory()
   const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
   const LIBRARY = JSON.stringify(
-    join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+    join(import.meta.dir, '../helpers/isolated/library.ts'),
   )
   let BASE: string
   let AREA: string // the allowed write area
@@ -528,7 +532,11 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
 
       // What a process without a runtime directory has recorded there.
       const manifest = join(theirs, '4242-0123456789abcdef.json')
-      writeFileSync(manifest, '{"version":1,"paths":[]}', { mode: 0o600 })
+      writeFileSync(
+        manifest,
+        '{"version":1,"pid":4242,"start":"1","created":0,"paths":[],"sources":[]}',
+        { mode: 0o600 },
+      )
       const late = withARuntimeDirectory(
         attacker(
           'late.ts',
@@ -754,7 +762,7 @@ describe.if(isLinux)('A mount point a running sandbox relies on', () => {
       try {
         // The shell is found once, so in a copy of the library of its own.
         const fresh = (await import(
-          `${JSON.parse(LIBRARY)}?${basename(sh)}`
+          `../../src/sandbox/linux-sandbox-utils.ts?${basename(sh)}`
         )) as {
           wrapCommandWithSandboxLinux: typeof wrapCommandWithSandboxLinux
         }
@@ -1481,7 +1489,7 @@ describe.if(isLinux)(
     usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
     const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+      join(import.meta.dir, '../helpers/isolated/library.ts'),
     )
     let BASE: string
     let AREA: string // the allowed write area
@@ -1879,7 +1887,7 @@ describe.if(isLinux)(
     const runtime = usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
     const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+      join(import.meta.dir, '../helpers/isolated/library.ts'),
     )
     let BASE: string
     let AREA: string
@@ -2409,7 +2417,7 @@ describe.if(isLinux)(
         ...rest: unknown[]
       ) => {
         const names = (readdir as (...args: unknown[]) => unknown)(dir, ...rest)
-        if (dir === shared[0]) {
+        if (dir === shared[1]) {
           for (const name of shared) {
             fs.rmdirSync(name)
             writeFileSync(name, '')
@@ -2676,7 +2684,7 @@ describe.if(isLinux)(
     usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
     const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+      join(import.meta.dir, '../helpers/isolated/library.ts'),
     )
     const UID = isLinux ? process.getuid!() : 0
     let BASE: string
@@ -2975,7 +2983,7 @@ describe.if(isLinux)(
     usePrivateManifestDirectory()
     const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
     const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+      join(import.meta.dir, '../helpers/isolated/library.ts'),
     )
     const UID = isLinux ? process.getuid!() : 0
     let BASE: string
@@ -3192,7 +3200,7 @@ describe.if(isLinux)(
         'true',
       ]).status === 0
     const LIBRARY = JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'),
+      join(import.meta.dir, '../helpers/isolated/library.ts'),
     )
     let BASE: string
     let AREA: string
@@ -3313,3 +3321,200 @@ describe.if(isLinux)(
     )
   },
 )
+
+/**
+ * Where the manifests go follows from the user id, whatever the environment
+ * says. The child processes here load the library itself and work the places
+ * out with nothing put in their way, in a mount namespace in which directories
+ * of the test's own stand at /var/tmp, /run/user and /tmp.
+ */
+describe.if(isLinux)('The manifest directories at their real names', () => {
+  usePrivateManifestDirectory()
+  const BWRAP_CAN_NAMESPACE = bwrapCanNamespace()
+  const UID = isLinux ? process.getuid!() : 0
+  const PLACES = [
+    ['/var/tmp', `srt-mount-points-${UID}`],
+    ['/run/user', `${UID}/srt-mount-points`],
+    ['/tmp', `srt-mount-points-${UID}`],
+  ]
+    .filter(([system]) => existsSync(system!))
+    .map(([system, place]) => join(system!, place!))
+  let BASE: string
+  let ROOT: string // what stands at those names is under here
+  let AREA: string
+  let LOCK: string // a denyWrite path, absent to begin with
+
+  beforeEach(() => {
+    BASE = realpathSync(mkdtempSync(join(tmpdir(), 'mount-point-places-')))
+    ROOT = join(BASE, 'root')
+    makePlaces(ROOT)
+    AREA = join(BASE, 'area')
+    mkdirSync(AREA)
+    LOCK = join(AREA, 'guard.lock')
+  })
+
+  afterEach(() => rmSync(BASE, { recursive: true, force: true }))
+
+  /**
+   * Starts a process with a runtime directory and a temp dir of its own, named
+   * after `name`, that wraps `command`, runs it, cleans up after it and prints
+   * what it said.
+   */
+  function running(
+    name: string,
+    command: string,
+    allowOnly: string[],
+  ): { said: Promise<string> } {
+    const file = join(BASE, `${name}.ts`)
+    writeFileSync(
+      file,
+      [
+        `import { spawnSync } from 'node:child_process'`,
+        `import { wrapCommandWithSandboxLinux, cleanupBwrapMountPoints } from ${JSON.stringify(join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'))}`,
+        `const wrapped = await wrapCommandWithSandboxLinux({`,
+        `  command: ${JSON.stringify(command)},`,
+        `  needsNetworkRestriction: false,`,
+        `  readConfig: { denyOnly: [] },`,
+        `  writeConfig: { allowOnly: ${JSON.stringify(allowOnly)}, denyWithinAllow: [${JSON.stringify(LOCK)}] },`,
+        `})`,
+        `const r = spawnSync(wrapped, { shell: true, encoding: 'utf8', timeout: 60000 })`,
+        `cleanupBwrapMountPoints()`,
+        `console.log(String(r.stdout ?? '') + String(r.stderr ?? ''))`,
+      ].join('\n'),
+    )
+    const env = { ...process.env }
+    for (const variable of ['XDG_RUNTIME_DIR', 'TMPDIR']) {
+      env[variable] = join(BASE, `${name}-${variable}`)
+      mkdirSync(env[variable], { mode: 0o700 })
+    }
+    const argv = [...inPrivateNamespace(ROOT, [BASE]), process.execPath, file]
+    const child = spawn(argv[0]!, argv.slice(1), {
+      env,
+      stdio: ['ignore', 'pipe', 'inherit'],
+      // Outside every allowed write path, so no mount points for cwd.
+      cwd: import.meta.dir,
+    })
+    let out = ''
+    child.stdout.on('data', (data: Buffer) => (out += data.toString()))
+    return {
+      said: new Promise(resolve => child.on('close', () => resolve(out))),
+    }
+  }
+
+  async function until(file: string): Promise<void> {
+    const deadline = Date.now() + 30000
+    while (!existsSync(file)) {
+      if (Date.now() > deadline) throw new Error(`${file} never came`)
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+  }
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'can be neither made, written, moved aside, removed nor replaced from inside a sandbox that may write all around them',
+    async () => {
+      // None is there when the wrap begins. A command that could make one, as
+      // the same user and with the right mode, would be believed.
+      const attempts = PLACES.flatMap(place => [
+        `touch ${dirname(place)}/beside; echo beside=$?`,
+        `mkdir -m 700 ${place}; echo make=$?`,
+        `touch ${place}/forged.json; echo write=$?`,
+        `mv ${place} ${place}.aside; echo aside=$?`,
+        `rmdir ${place}; echo remove=$?`,
+        `mkdir -m 700 ${place}.mine; mv -T ${place}.mine ${place}; echo replace=$?`,
+      ])
+      const said = await running(
+        'attempts',
+        `exec 2>/dev/null; ${attempts.join('; ')}`,
+        [AREA, ...PLACES.map(place => dirname(place))],
+      ).said
+      expect(said.trim().split('\n')).toEqual(
+        PLACES.flatMap(() => [
+          'beside=0',
+          ...['make', 'write', 'aside', 'remove', 'replace'].map(what =>
+            expect.stringMatching(new RegExp(`^${what}=[1-9]`)),
+          ),
+        ]),
+      )
+      for (const place of PLACES) {
+        expect(lstatSync(join(ROOT, place)).mode & 0o40777).toBe(0o40700)
+        expect(readdirSync(join(ROOT, place))).toEqual([])
+        expect(existsSync(join(ROOT, `${place}.aside`))).toBe(false)
+      }
+    },
+    90000,
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE && existsSync('/run/user'))(
+    'are read under a /run/user/UID that a sandboxed command has opened to others',
+    async () => {
+      // The name in /var/tmp is taken, so the manifest goes under
+      // /run/user/UID, which the command may write. What a killed process left
+      // in /tmp names the same path: a clean-up that no longer read the first
+      // would take the mount point from under the sandbox.
+      writeFileSync(join(ROOT, `/var/tmp/srt-mount-points-${UID}`), '')
+      const first = running(
+        'first',
+        [
+          `chmod 0777 /run/user/${UID}; echo chmod=$?`,
+          `echo up > ${AREA}/up; while [ ! -e ${AREA}/end ]; do sleep 0.05; done`,
+          `echo pwned > ${LOCK}; echo rc=$?`,
+        ].join('; '),
+        [AREA, `/run/user/${UID}`],
+      )
+      await until(join(AREA, 'up'))
+      expect(
+        readdirSync(join(ROOT, `/run/user/${UID}/srt-mount-points`)),
+      ).toHaveLength(2)
+      const left = join(ROOT, `/tmp/srt-mount-points-${UID}`)
+      writeFileSync(
+        join(left, '4194000-00.json'),
+        JSON.stringify({
+          version: 1,
+          pid: 4194000,
+          start: '1',
+          ns: readlinkSync('/proc/self/ns/pid'),
+          created: 1,
+          paths: [LOCK],
+          sources: [],
+        }),
+        { mode: 0o600 },
+      )
+      await running('second', 'true', [AREA]).said
+      expect(readdirSync(left)).toEqual([])
+      expect(lstatSync(LOCK).size).toBe(0)
+      writeFileSync(join(AREA, 'end'), '')
+      const said = await first.said
+      expect(said).toContain('chmod=0')
+      expect(said).toMatch(/rc=[1-9]/)
+      expect(existsSync(LOCK)).toBe(false)
+    },
+    90000,
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'keep a mount point for the sandbox of a process with another runtime directory and temp dir',
+    async () => {
+      // The second wrap finds the mount point of the first. Unless it reads
+      // that one's manifest it takes it for the user's own file and names it
+      // nowhere, and the first process's clean-up takes it from under it.
+      const waitFor = (name: string): string =>
+        `echo up > ${AREA}/up-${name}; while [ ! -e ${AREA}/end-${name} ]; do sleep 0.05; done`
+      const first = running('first', waitFor('first'), [AREA])
+      await until(join(AREA, 'up-first'))
+      const second = running(
+        'second',
+        `${waitFor('second')}; echo pwned > ${LOCK}; echo rc=$?`,
+        [AREA],
+      )
+      await until(join(AREA, 'up-second'))
+      writeFileSync(join(AREA, 'end-first'), '')
+      await first.said
+      expect(lstatSync(LOCK).size).toBe(0)
+      writeFileSync(join(AREA, 'end-second'), '')
+      expect(await second.said).toMatch(/rc=[1-9]/)
+      expect(existsSync(LOCK)).toBe(false)
+      expect(readdirSync(join(ROOT, PLACES[0]!))).toEqual([])
+    },
+    90000,
+  )
+})

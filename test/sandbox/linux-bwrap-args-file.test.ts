@@ -69,10 +69,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     `^${literally(STEP_SHELL)} '(?:${literally(RECORD_STEP)} && )?exec 9<"\\$1" && shift && exec "\\$@"' srt-args (?:\\S+\\.started )?(\\S+) bwrap (.*?) ?--args 9 (.*)$`,
     's',
   )
-  const MODULE = join(
-    import.meta.dir,
-    '../../src/sandbox/linux-sandbox-utils.ts',
-  )
+  const MODULE = join(import.meta.dir, '../helpers/isolated/library.ts')
 
   let BASE: string
   const savedCwd = process.cwd()

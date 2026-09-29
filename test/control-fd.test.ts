@@ -11,8 +11,8 @@ import * as path from 'path'
 import { type Writable } from 'stream'
 import { isLinux, isWindows } from './helpers/platform.js'
 
-// Get the path to the built CLI
-const CLI_PATH = path.join(process.cwd(), 'dist', 'cli.js')
+// Get the path to the built CLI, kept out of the user's own mount point manifests
+const CLI_PATH = path.join(process.cwd(), 'test/helpers/isolated/dist-cli.mjs')
 
 // srt is expected to exit on its own shortly after the wrapped command
 // (which runs for well under a second) finishes; a hang is a failure, not

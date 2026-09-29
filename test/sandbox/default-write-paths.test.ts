@@ -193,7 +193,7 @@ describe.if(isLinux || isMacOS)(
       mkdirSync(join(fakeHome, NPM_LOGS), { recursive: true })
       const { allowOnly, wrapped, reopened } = runWithHome(
         fakeHome,
-        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+        `const { SandboxManager } = await import('./test/helpers/isolated/manager.ts')
        const filesystem = { denyRead: ['~/.npm'], allowWrite: [], denyWrite: [] }
        await SandboxManager.initialize({
          network: { allowedDomains: [], deniedDomains: [] },

@@ -3095,7 +3095,7 @@ async function generateFilesystemArgs(
   // it pinned. Emitted after every allow and deny bind, like the two stores
   // below.
   //
-  // Each is bound where it really is, not at the name the environment gave:
+  // Each is bound where it really is, not at the name it was worked out as:
   // bubblewrap makes a bind's destination by name inside the new root, and a
   // link with an absolute target on the way leads nowhere from there.
   const names = [...mountPoints, ...mountPointsReliedOn()]
