@@ -16,7 +16,7 @@ import { windowsGetMandatoryDenyPaths } from '../../src/sandbox/windows-sandbox-
 import { computeWindowsPerExecDenySet } from '../../src/sandbox/sandbox-manager.js'
 
 // Which paths a Windows command is denied: plain path computations, so these
-// run on every platform. What a deny costs a sandboxed write is M1-M16 of
+// run on every platform. What a deny costs a sandboxed write is M1-M22 of
 // test/sandbox/winsrt.test.ts.
 
 let root: string
@@ -143,25 +143,31 @@ describe('computeWindowsPerExecDenySet', () => {
       network: { allowedDomains: [], deniedDomains: [] },
     }) as never
 
-  it('merges mandatory, session and per-exec denies', () => {
+  it("keeps the session's own denies apart from what only customConfig asks for", () => {
     repo(root)
-    const secret = join(root, 'secret.txt')
-    const notes = join(root, 'notes.txt')
-    writeFileSync(secret, '')
-    writeFileSync(notes, '')
-    const set = computeWindowsPerExecDenySet(
-      cfg({ denyRead: [secret] }),
-      { filesystem: { denyWrite: [notes] } } as never,
-      root,
+    const [secret, notes, key] = ['secret.txt', 'notes.txt', 'key.txt'].map(n =>
+      join(root, n),
     )
-    expect(set.denyRead).toEqual([secret])
-    expect(set.denyWrite).toEqual(
-      expect.arrayContaining([
-        notes,
-        join(root, '.git', 'hooks'),
-        join(root, '.git', 'config'),
-      ]),
-    )
+    for (const f of [secret, notes, key]) writeFileSync(f, '')
+    const hooks = join(root, '.git', 'hooks')
+    expect(
+      computeWindowsPerExecDenySet(
+        cfg({ denyRead: [secret] }),
+        // `secret` and `hooks` are the session's already.
+        {
+          filesystem: {
+            denyRead: [key, secret],
+            denyWrite: [notes, hooks, key],
+          },
+        } as never,
+        root,
+      ),
+    ).toEqual({
+      denyRead: [secret],
+      denyWrite: [hooks, join(root, '.git', 'config')],
+      extraDenyRead: [key],
+      extraDenyWrite: [notes],
+    })
   })
 
   it('a denyRead target is not duplicated as denyWrite', () => {
@@ -188,18 +194,21 @@ describe('computeWindowsPerExecDenySet', () => {
 
   it('filesystem.disabled yields an empty set', () => {
     repo(root)
-    expect(
-      computeWindowsPerExecDenySet(cfg({ disabled: true }), undefined, root),
-    ).toEqual({
+    const none = {
       denyRead: [],
       denyWrite: [],
-    })
+      extraDenyRead: [],
+      extraDenyWrite: [],
+    }
+    expect(
+      computeWindowsPerExecDenySet(cfg({ disabled: true }), undefined, root),
+    ).toEqual(none)
     expect(
       computeWindowsPerExecDenySet(
         cfg({}),
         { filesystem: { disabled: true } } as never,
         root,
       ),
-    ).toEqual({ denyRead: [], denyWrite: [] })
+    ).toEqual(none)
   })
 })

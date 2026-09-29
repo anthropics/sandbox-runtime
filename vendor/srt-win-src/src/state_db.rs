@@ -73,7 +73,13 @@ impl std::str::FromStr for HolderPid {
 }
 
 /// Per-user session DB (brokers / ace_holders / working_aces).
-const SESSION_SCHEMA_VERSION: i64 = 9;
+///
+/// INVARIANT: never bump it. [`open_db_at`] renames away a DB whose
+/// version differs from its own, in EITHER direction, and shipped
+/// binaries do the same: an old and a new srt-win side by side would
+/// throw each other's records away in turn, grants included. A change
+/// that needs telling apart takes a second number they do not look at.
+const SESSION_SCHEMA_VERSION: i64 = 8;
 
 const SESSION_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS brokers (
@@ -550,6 +556,7 @@ pub fn with_init_lock<R>(
         conn,
         holder_pid,
         session: None,
+        extras: false,
         quiet: false,
     };
     let out = f(&mut locked)?;
@@ -580,9 +587,12 @@ fn locked_recovered(force_recover: bool) -> Result<(InitMutex, Connection, Recov
 pub struct Locked {
     conn: Connection,
     holder_pid: HolderPid,
-    /// Holder of the [`SbAce::session_held`] rows an `exec` records:
-    /// the host whose session it runs in. `None`: `holder_pid`.
+    /// Holder of the rows an `exec` records that outlive it: the host
+    /// whose session it runs in. `None`: `holder_pid`.
     pub session: Option<HolderPid>,
+    /// The batch is a command's own extras, not the session's set: only
+    /// its [`SbAce::session_held`] rows outlive the `exec`.
+    pub extras: bool,
     /// Do not report the DACLs written: `exec --quiet`, whose stderr is
     /// the child's.
     pub quiet: bool,
@@ -591,12 +601,14 @@ pub struct Locked {
 /// The distinct paths of `(path, carries a grant)` rows, in the order to
 /// write them.
 ///
-/// INVARIANT: at no instant may the sandbox user hold Modify on a root
-/// while a recorded deny under that root is absent from disk: another
-/// process of that user may be running (a child that outlived its command,
-/// another session), and a write on a directory takes seconds. So a batch
-/// that ADDS writes the grant roots LAST (a kill leaves denies without a
-/// grant: harmless), and one that RELEASES writes them FIRST.
+/// INVARIANT: while the sandbox user holds Modify on a root, every deny the
+/// session has ever derived under that root is on disk, save a target the
+/// HOST has replaced since the session's last command. Another process of
+/// that user may be running at any time (a child that outlived its command,
+/// another session's or user's), and a write on a directory takes seconds.
+/// So a batch that ADDS writes the grant roots LAST (a kill leaves denies
+/// without a grant: harmless), one that RELEASES writes them FIRST, and
+/// nothing of a session's own set is released before its grants are.
 fn path_order<'a>(
     rows: impl Iterator<Item = (&'a str, bool)>,
     grants_first: bool,
@@ -613,7 +625,7 @@ fn path_order<'a>(
 impl Locked {
     fn holder_of(&self, ace: SbAce) -> HolderPid {
         self.session
-            .filter(|_| ace.session_held())
+            .filter(|_| !self.extras || ace.session_held())
             .unwrap_or(self.holder_pid)
     }
 
@@ -796,13 +808,14 @@ impl Locked {
             .query_row(params![canon, want.kind()], |r| r.get(0))
             .optional()
             .context("SELECT working_aces")?;
-        // A replaced DIRECTORY (the host removed and recreated `.git`)
-        // is stamped afresh, the row taking its id: refusing would fail
-        // every later command of the session, and keeping the old row
-        // would leave the new directory unpinned.
+        // A replaced object under a DENY (git rewrites `.git\config` by
+        // rename; the host removed and recreated `.git`) is stamped
+        // afresh, the row taking its id: refusing would fail every later
+        // command, of other sessions too, and keeping the old row would
+        // leave the new object uncovered.
         if let Some(fid) = &prior
             && FileId::from_bytes(fid)? != cur_id
-            && !want.session_held()
+            && matches!(want, SbAce::Grant(_))
         {
             bail!(
                 "'{canon}': file_id changed since prior {} — path \
@@ -821,15 +834,24 @@ impl Locked {
         // and partial-failure rollback (`with_broker_registration`)
         // would leak its row. SQLite's UPSERT `changes()` returns
         // 1 for both branches, so probe first.
-        let already_held: bool = self
+        let held: Option<String> = self
             .conn
             .prepare_cached(
-                "SELECT 1 FROM ace_holders WHERE \
-                 canonical_path = ?1 AND kind = ?2 AND pid = ?3 \
-                 LIMIT 1",
+                "SELECT want_mask FROM ace_holders WHERE \
+                 canonical_path = ?1 AND kind = ?2 AND pid = ?3",
             )?
-            .exists(params![canon, want.kind(), pid])
+            .query_row(params![canon, want.kind(), pid], |r| r.get(0))
+            .optional()
             .context("SELECT ace_holders (held?)")?;
+        // A deny only widens while its holder lives. A path that the
+        // configuration moves from denyRead to denyWrite stays unreadable;
+        // so does a read-denied directory that arrives a second time as a
+        // write deny, through a junction a sandboxed command planted
+        // under a mandatory name.
+        let want = match &held {
+            Some(m) if matches!(want, SbAce::Deny(_)) => want.max(SbAce::parse(want.kind(), m)?),
+            _ => want,
+        };
         self.conn
             .prepare_cached(
                 "INSERT INTO ace_holders \
@@ -840,7 +862,7 @@ impl Locked {
             )?
             .execute(params![canon, want.kind(), pid, want.as_str()])
             .context("UPSERT ace_holders")?;
-        let holder_added = !already_held;
+        let holder_added = held.is_none();
         let eff = self.effective_ace(canon, want.kind())?.unwrap_or(want);
         self.conn
             .prepare_cached(
@@ -1462,6 +1484,7 @@ mod tests {
             conn,
             holder_pid: HolderPid(std::process::id()),
             session: None,
+            extras: false,
             quiet: false,
         };
         f(&mut db)
@@ -1493,6 +1516,11 @@ mod tests {
             // Holds intact (would be 0 with INSERT OR REPLACE).
             assert_eq!(db.my_ace_holds(None).unwrap().len(), 2);
         });
+    }
+
+    #[test]
+    fn the_schema_version_is_never_bumped() {
+        assert_eq!(SESSION_SCHEMA_VERSION, 8);
     }
 
     #[test]
@@ -1530,6 +1558,28 @@ mod tests {
     fn aliveness_bogus_pid_is_dead() {
         // PID 0x7FFF_FFFE is well above any plausible live PID.
         assert!(!is_process_alive(0x7FFF_FFFE, 0));
+    }
+
+    #[test]
+    fn a_holders_deny_only_widens() {
+        use acl::DenyMask::{ReadDeny, WriteDeny};
+        let f = std::env::temp_dir().join(format!("srtwin-widen-{}", std::process::id()));
+        std::fs::write(&f, "x").unwrap();
+        let Ok((canon, _)) = path_id::canonicalize_path(f.to_str().unwrap()) else {
+            panic!("canonicalize {f:?}");
+        };
+        with_mem_db(|db| {
+            db.register_broker().unwrap();
+            for (asked, held) in [
+                (WriteDeny, WriteDeny),
+                (ReadDeny, ReadDeny),
+                (WriteDeny, ReadDeny),
+            ] {
+                let w = db.record_ace(&canon, SbAce::Deny(asked)).unwrap();
+                assert_eq!(w.ace, SbAce::Deny(held), "asked {asked:?}");
+            }
+        });
+        std::fs::remove_file(&f).ok();
     }
 
     #[test]

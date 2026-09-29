@@ -160,6 +160,9 @@ async function runSandboxed(
 
 type RunResult = { stdout: string; stderr: string; status: number | null }
 
+const writtenIn = (stderr: string) =>
+  [...stderr.matchAll(/DACL written: '([^']+)'/g)].map(m => m[1])
+
 /** The paths whose DACL srt-win says it wrote while `f` ran, in order. */
 async function daclWrites(f: () => Promise<unknown>): Promise<string[]> {
   const debug = process.env.SRT_DEBUG
@@ -167,12 +170,7 @@ async function daclWrites(f: () => Promise<unknown>): Promise<string[]> {
   const spy = spyOn(console, 'error').mockImplementation(() => {})
   try {
     await f()
-    return [
-      ...spy.mock.calls
-        .flat()
-        .join('\n')
-        .matchAll(/DACL written: '([^']+)'/g),
-    ].map(m => m[1])
+    return writtenIn(spy.mock.calls.flat().join('\n'))
   } finally {
     spy.mockRestore()
     if (debug === undefined) delete process.env.SRT_DEBUG
@@ -356,6 +354,30 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       srtWin,
     })
     expect(off.argv).not.toContain('--quiet')
+  })
+
+  it("argv: the session's denies apart from the command's own", () => {
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'x',
+      sessionHolderPid: 4242,
+      sessionDenyRead: ['sr'],
+      sessionDenyWrite: ['sw'],
+      denyRead: ['r'],
+      denyWrite: ['w'],
+      srtWin: resolveSrtWin({ path: process.execPath }),
+    })
+    const after = (flag: string) => argv[argv.indexOf(flag) + 1]
+    expect(
+      [
+        '--session-deny-read',
+        '--session-deny-write',
+        '--deny-read',
+        '--deny-write',
+      ].map(after),
+    ).toEqual(['sr', 'sw', 'r', 'w'])
+    expect(argv.indexOf('--session-deny-write')).toBeLessThan(
+      argv.indexOf('--'),
+    )
   })
 
   it('argv: --session-holder-pid only when given, before --', () => {
@@ -1324,7 +1346,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       const cfg = createTestConfig()
       cfg.filesystem.denyRead = [f]
       await SandboxManager.initialize(cfg)
-      // The deny itself is applied per command and covered by H6.
+      // The deny itself is covered by H6.
       await SandboxManager.reset()
     } finally {
       rmSync(scratch, { recursive: true, force: true })
@@ -2014,7 +2036,7 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    // ── M1-M16: the mandatory write denies ──
+    // ── M1-M22: the mandatory write denies ──
     // Resolved at each wrap from the working directory, so each row
     // chdirs into its own tree first. Which paths are picked is in
     // test/sandbox/windows-per-exec-deny.test.ts; these rows are what
@@ -2332,9 +2354,16 @@ describe.if(isWindows)(
             '10th',
           ]) {
             ran.push(
-              await timeInto(took, `${nth} command`, () =>
-                runSandboxed('echo M6-RAN', 120_000),
-              ),
+              await timeInto(took, `${nth} command`, async () => {
+                const w =
+                  await SandboxManager.wrapWithSandboxArgv('echo M6-RAN')
+                // Not --quiet: srt-win then says which DACLs it wrote.
+                return spawnAsync(
+                  w.argv[0],
+                  w.argv.slice(1).filter(a => a !== '--quiet'),
+                  { env: w.env, timeout: 120_000 },
+                )
+              }),
             )
           }
         } catch (e) {
@@ -2344,12 +2373,17 @@ describe.if(isWindows)(
           timeInto(took, 'reset()', () => SandboxManager.reset()),
         )
         // `.` is the working directory.
-        const [added, removed] = [written, released].map(paths =>
+        const [added, between, removed] = [
+          written,
+          ran.flatMap(r => writtenIn(r.stderr)),
+          released,
+        ].map(paths =>
           paths.map(p => p.replace(/^.*srt-mandbig-[^\\]+/, '.')).join(', '),
         )
         const line =
           `grants only: ${inWords(base)}; with the denies: ${inWords(took)}; ` +
-          `DACLs written by its initialize(): ${added}; by its reset(): ${removed}`
+          `DACLs written by its initialize(): ${added}; ` +
+          `by its commands: ${between || 'none'}; by its reset(): ${removed}`
         console.log(`M6: ${line}`)
         if (error !== undefined) throw error
         const bad = ran.find(
@@ -2362,10 +2396,23 @@ describe.if(isWindows)(
               `stderr=${JSON.stringify(bad.stderr)}`,
           )
         }
-        if (added !== '.\\.git, .' || removed !== '., .\\.git') {
+        const denied = [
+          '.git',
+          '.git\\config',
+          '.git\\hooks',
+          '.gitconfig',
+          '.vscode',
+        ]
+          .map(p => `.\\${p}`)
+          .join(', ')
+        if (
+          added !== `${denied}, .` ||
+          between !== '' ||
+          removed !== `., ${denied}`
+        ) {
           throw new Error(
-            `M6: ${line}: wanted each directory once, the grant root last ` +
-              `when adding and first when releasing`,
+            `M6: ${line}: wanted each path once, the grant root last when ` +
+              `adding and first when releasing, and none by a command`,
           )
         }
         // 500 ms: so that noise on a fast leg does not fail the ratio.
@@ -2756,6 +2803,241 @@ describe.if(isWindows)(
         }
       }, 90_000)
     }
+
+    // ── M17-M22: what holds while no command of the session runs ──
+    // Every sandboxed process on the machine runs as one account.
+
+    /** `command`, run by a SECOND HOST PROCESS in a session of its own in `cwd`. */
+    async function secondHost(cwd: string, command: string) {
+      const r = await spawnAsync(
+        process.execPath,
+        [
+          join(import.meta.dir, '..', 'helpers', 'windows-second-host.ts'),
+          JSON.stringify({
+            cwd,
+            command,
+            config: createFsTestConfig({ allowWrite: [cwd] }),
+          }),
+        ],
+        { timeout: 120_000 },
+      )
+      try {
+        return JSON.parse(r.stdout) as RunResult
+      } catch {
+        throw new Error(`the second host failed: ${JSON.stringify(r)}`)
+      }
+    }
+    const read = (p: string) => (existsSync(p) ? readFileSync(p, 'utf8') : null)
+
+    it('M17: between two commands .git\\hooks and a denyRead file carry their denies', async () => {
+      const dir = mandatoryTree()
+      const secret = join(dir, 'secret.txt')
+      try {
+        writeFileSync(secret, 'SECRET-V1')
+        const idle = await inSession(
+          dir,
+          { allowWrite: [dir], denyRead: [secret] },
+          async () => {
+            await runSandboxed('echo 1')
+            return [join(dir, '.git', 'hooks'), secret].map(ownAces)
+          },
+        )
+        if (!idle.every(aces => aces.some(l => l.includes('(DENY)')))) {
+          throw new Error(
+            `M17: the sandbox account's ACEs on .git\\hooks and on secret.txt ` +
+              `while the session is idle: ${JSON.stringify(idle)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it("M18: while a session is idle, another host's command can neither write its hook nor read its secret", async () => {
+      const dir = mandatoryTree()
+      const other = mkdtempSync(join(tmpdir(), 'srt-other-'))
+      const hook = join(dir, '.git', 'hooks', 'pre-commit')
+      const secret = join(dir, 'secret.txt')
+      const own = join(other, 'own.txt')
+      try {
+        writeFileSync(secret, 'SECRET-V1')
+        const r = await inSession(
+          dir,
+          { allowWrite: [dir], denyRead: [secret] },
+          async () => {
+            await runSandboxed('echo 1')
+            return secondHost(
+              other,
+              `echo POISON>"${hook}" & type "${secret}" & echo OK>"${own}"`,
+            )
+          },
+        )
+        const got = { hook: read(hook), own: read(own) }
+        if (
+          got.hook !== 'HOOK-V1' ||
+          r.stdout.includes('SECRET-V1') ||
+          !got.own?.startsWith('OK')
+        ) {
+          throw new Error(
+            `M18: wanted the hook kept, the secret unread and own.txt written — ` +
+              `${JSON.stringify(got)} exit=${r.status} ` +
+              `stdout=${JSON.stringify(r.stdout)} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+        rmSync(other, { recursive: true, force: true })
+      }
+    }, 180_000)
+
+    it('M19: a denied file the host replaces by rename is UNCOVERED until the next command of its session', async () => {
+      const dir = mandatoryTree()
+      const other = mkdtempSync(join(tmpdir(), 'srt-other-'))
+      const cfg = join(dir, '.git', 'config')
+      try {
+        const got = await inSession(dir, { allowWrite: [dir] }, async () => {
+          await runSandboxed('echo 1')
+          writeFileSync(`${cfg}.lock`, 'CONFIG-V2')
+          renameSync(`${cfg}.lock`, cfg)
+          await secondHost(other, `echo FIRST>"${cfg}"`)
+          const uncovered = read(cfg)
+          await runSandboxed('echo 2')
+          await secondHost(other, `echo SECOND>"${cfg}"`)
+          return { uncovered, covered: read(cfg) }
+        })
+        // A known limit, pinned: the first write LANDS.
+        if (
+          !got.uncovered?.startsWith('FIRST') ||
+          !got.covered?.startsWith('FIRST')
+        ) {
+          throw new Error(
+            `M19: wanted the write before the session's next command to land ` +
+              `(a known limit) and the one after it refused — ` +
+              JSON.stringify(got),
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+        rmSync(other, { recursive: true, force: true })
+      }
+    }, 300_000)
+
+    it('M20: a deny that updateConfig() drops holds until reset(), and is gone after it', async () => {
+      const dir = mandatoryTree()
+      const notes = join(dir, 'notes.txt')
+      const app = join(dir, 'app.txt')
+      try {
+        writeFileSync(notes, 'NOTES-V1')
+        const r = await inSession(
+          dir,
+          { allowWrite: [dir], denyWrite: [notes] },
+          () => {
+            SandboxManager.updateConfig(
+              createFsTestConfig({ allowWrite: [dir] }),
+            )
+            return runSandboxed(`echo POISON>"${notes}" & echo OK>"${app}"`)
+          },
+        )
+        const got = {
+          notes: read(notes),
+          app: read(app),
+          afterReset: ownAces(notes),
+        }
+        if (
+          got.notes !== 'NOTES-V1' ||
+          !got.app?.startsWith('OK') ||
+          got.afterReset.length > 0
+        ) {
+          throw new Error(
+            `M20: wanted notes.txt kept, app.txt written and no ACE left after ` +
+              `reset() — ${JSON.stringify(got)} exit=${r.status} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it('M21: a deny from customConfig is gone when its command ends', async () => {
+      const dir = mandatoryTree()
+      const extra = join(dir, 'extra.txt')
+      try {
+        writeFileSync(extra, 'EXTRA-V1')
+        const got = await inSession(dir, { allowWrite: [dir] }, async () => {
+          const w = await SandboxManager.wrapWithSandboxArgv(
+            `echo POISON>"${extra}"`,
+            undefined,
+            {
+              filesystem: { denyRead: [], allowWrite: [], denyWrite: [extra] },
+            },
+          )
+          await spawnAsync(w.argv[0], w.argv.slice(1), {
+            env: w.env,
+            timeout: 60_000,
+          })
+          const [during, idle] = [read(extra), ownAces(extra)]
+          await runSandboxed(`echo LATER>"${extra}"`)
+          return { during, idle, later: read(extra) }
+        })
+        if (
+          got.during !== 'EXTRA-V1' ||
+          got.idle.length > 0 ||
+          !got.later?.startsWith('LATER')
+        ) {
+          throw new Error(
+            `M21: wanted extra.txt kept by that command, then no ACE on it and ` +
+              `the next command's write landed — ${JSON.stringify(got)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
+
+    it('M22: with Users: Full control on the root, a write deny cannot be stripped from inside', async () => {
+      const dir = mandatoryTree()
+      const hooks = join(dir, '.git', 'hooks')
+      const app = join(dir, 'app.txt')
+      try {
+        spawnSync('icacls', [dir, '/grant', '*S-1-5-32-545:(OI)(CI)(F)'], {
+          timeout: 10_000,
+        })
+        const [r, held] = await inSession(
+          dir,
+          { allowWrite: [dir] },
+          async () =>
+            [
+              await runSandboxed(
+                `icacls "${hooks}" /remove:d *${sbSid} & ` +
+                  `echo POISON>"${join(hooks, 'pre-commit')}" & ` +
+                  `echo OK>"${app}"`,
+              ),
+              ownAces(hooks),
+            ] as const,
+        )
+        const got = {
+          hook: read(join(hooks, 'pre-commit')),
+          app: read(app),
+          held,
+        }
+        if (
+          got.hook !== 'HOOK-V1' ||
+          !held.some(l => l.includes('(DENY)')) ||
+          !got.app?.startsWith('OK')
+        ) {
+          throw new Error(
+            `M22: wanted the deny and the hook kept, and app.txt written — ` +
+              `${JSON.stringify(got)} exit=${r.status} ` +
+              `stdout=${JSON.stringify(r.stdout)} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }, 90_000)
 
     it('H7: no allowWrite — child has no rights on real-user file', async () => {
       const r = await rexecSandboxed(`type "${hSibling}"`, {})

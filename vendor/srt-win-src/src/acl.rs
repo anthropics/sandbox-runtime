@@ -83,6 +83,7 @@ impl Mask {
     pub const DELETE: Self = Self(0x0001_0000);
     pub const READ_CONTROL: Self = Self(0x0002_0000);
     pub const WRITE_DAC: Self = Self(0x0004_0000);
+    pub const WRITE_OWNER: Self = Self(0x0008_0000);
     pub const SYNCHRONIZE: Self = Self(0x0010_0000);
 
     // Generic — resolved via the object's GENERIC_MAPPING.
@@ -658,13 +659,10 @@ pub enum SbAce {
     Grant(GrantMask),
     Deny(DenyMask),
     /// `(D;OICI;FILE_DELETE_CHILD;;;<sb>)` — applied to the parent
-    /// of every denied target so the sandbox user cannot `del`/`ren`
-    /// it via parent-FDC even when the parent carries an inherited
-    /// `BUILTIN\Users:(F)` (which the sandbox user, a Users member,
-    /// would otherwise pick up). Its inherited copies matter too:
-    /// under such an ACE they are all that keeps a pinned directory
-    /// further down in place, a [`SbAce::DenyPin`] having no FDC deny
-    /// of its own above it.
+    /// of every denied target and of every [`SbAce::DenyPin`] so the
+    /// sandbox user cannot `del`/`ren` it via parent-FDC even when the
+    /// parent carries an inherited `BUILTIN\Users:(F)` (which the
+    /// sandbox user, a Users member, would otherwise pick up).
     DenyFdc,
     /// `(D;;DELETE|WRITE_DAC;;;<sb>)` — object-only (`NO_INHERIT`)
     /// deny on a placeholder INTERMEDIATE directory. Blocks the
@@ -676,8 +674,7 @@ pub enum SbAce {
     DenyDelete,
     /// Same ACE on a REAL directory between a `Deny` target and its
     /// modify-grant root, so the ancestor chain cannot be renamed
-    /// aside. No parent-FDC side ACE: on the grant root, the topmost
-    /// pin's parent, it would re-propagate over the whole tree.
+    /// aside.
     DenyPin,
 }
 
@@ -700,9 +697,19 @@ impl DenyMask {
             // read open. FILE_WRITE_ATTRIBUTES is already in
             // FILE_GENERIC_WRITE; the explicit `.with()` is
             // belt-and-braces (it survives a constant change).
+            // WRITE_DAC and WRITE_OWNER: where a group gives the
+            // sandbox user Full control it could strip this very ACE.
+            // FILE_DELETE_CHILD: it overrides the DELETE deny a denied
+            // directory's children inherit, and the parent's FDC deny
+            // does not reach a protected DACL. (An srt-win with another
+            // mask rewrites a shared path's ACE, and this one rewrites
+            // it back: harmless, each writes a deny.)
             DenyMask::WriteDeny => Mask::FILE_GENERIC_WRITE
                 .with(Mask::DELETE)
                 .with(Mask::FILE_WRITE_ATTRIBUTES)
+                .with(Mask::WRITE_DAC)
+                .with(Mask::WRITE_OWNER)
+                .with(Mask::FILE_DELETE_CHILD)
                 .without(Mask::SYNCHRONIZE)
                 .without(Mask::READ_CONTROL)
                 .bits(),
@@ -712,8 +719,8 @@ impl DenyMask {
 
 impl SbAce {
     /// The directory-level denies. Writing one re-propagates through
-    /// the directory's tree, so they are held for the session and not
-    /// per command; the `Deny` on each target is per command.
+    /// the directory's tree, so the session holds even those that only
+    /// a command's own extras need.
     pub fn session_held(self) -> bool {
         matches!(self, SbAce::DenyFdc | SbAce::DenyPin)
     }
@@ -1065,6 +1072,12 @@ mod tests {
         assert_ne!(m.bits() & Mask::DELETE.bits(), 0, "must carry DELETE");
         assert_eq!(m.bits() & Mask::FILE_DELETE_CHILD.bits(), 0);
         assert_eq!(m.bits() & 0xffe0_0000, 0, "stray high bits");
+
+        let w = DenyMask::WriteDeny.bits();
+        let denied = Mask::WRITE_DAC | Mask::WRITE_OWNER | Mask::DELETE | Mask::FILE_DELETE_CHILD;
+        assert_eq!(w & denied.bits(), denied.bits());
+        let read = Mask::SYNCHRONIZE | Mask::READ_CONTROL | Mask::FILE_GENERIC_READ;
+        assert_eq!(w & read.bits(), 0, "a write deny leaves reads open");
 
         let ow = Allow::OWNER_RIGHTS.1;
         assert_eq!(ow.bits(), Mask::READ_CONTROL.bits());

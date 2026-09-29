@@ -406,10 +406,20 @@ export interface WindowsSandboxParams {
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
-   * PID that holds the directory-level ACEs the denies need (see
-   * {@link WindowsAclStampOptions.dirsOnly}), so that they outlive the
-   * command; its {@link restoreWindowsAcl} releases them. Default: the
-   * `srt-win exec` process, which releases them as the child exits.
+   * The session's own read denies, re-derived for this command: as
+   * {@link denyRead}, but held under {@link sessionHolderPid} and not
+   * released as the child exits. One that is stamped already is not
+   * written; a new or replaced one is stamped afresh.
+   */
+  sessionDenyRead?: readonly string[]
+  /** See {@link sessionDenyRead}. */
+  sessionDenyWrite?: readonly string[]
+  /**
+   * PID that holds what outlives the command: {@link sessionDenyRead},
+   * {@link sessionDenyWrite}, and the directory-level ACEs of every deny
+   * ({@link WindowsAclStampOptions.dirsOnly}). Its
+   * {@link restoreWindowsAcl} releases them. Default: the `srt-win exec`
+   * process, which releases them as the child exits.
    */
   sessionHolderPid?: number
   /**
@@ -1882,9 +1892,7 @@ export interface WindowsAclStampOptions {
   /**
    * Only the directory-level ACEs of the targets: the
    * `FILE_DELETE_CHILD` deny on each parent and the pins on the
-   * directories above. Windows re-propagates a directory's DACL through
-   * its whole tree at every write, so these are worth holding for a
-   * session while the deny on each target is per command.
+   * directories above.
    */
   dirsOnly?: boolean
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
@@ -2012,9 +2020,8 @@ export interface WindowsAclGrantOptions {
   /** Paths to grant `FILE_GENERIC_READ|EXECUTE` on (`allowRead`). */
   read: readonly string[]
   /**
-   * Denies whose directory-level ACEs
-   * ({@link WindowsAclStampOptions.dirsOnly}) go in the same batch, so that
-   * a directory that carries both a grant and one of those is written once.
+   * {@link stampWindowsAcl} in the same batch, ahead of the grants, so that
+   * a directory that carries both a grant and a deny is written once.
    */
   denyRead?: readonly string[]
   /** See {@link denyRead}. */
@@ -2191,6 +2198,10 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   if (p.quiet !== false) argv.push('--quiet')
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
+  for (const d of p.sessionDenyRead ?? []) argv.push('--session-deny-read', d)
+  for (const d of p.sessionDenyWrite ?? []) {
+    argv.push('--session-deny-write', d)
+  }
   if (p.sessionHolderPid !== undefined) {
     argv.push('--session-holder-pid', `${p.sessionHolderPid}`)
   }

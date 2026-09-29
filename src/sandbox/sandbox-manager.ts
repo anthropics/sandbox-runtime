@@ -865,8 +865,7 @@ async function initialize(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
-      // With the denies known now, so that the first command does not pay
-      // for their directory-level ACEs.
+      // With the denies known now: they hold from here to reset().
       const deny = computeWindowsPerExecDenySet(
         runtimeConfig,
         undefined,
@@ -878,7 +877,8 @@ async function initialize(
           sandboxUserSid: sb,
           read: acc.grantRead,
           write: acc.grantWrite,
-          ...deny,
+          denyRead: deny.denyRead,
+          denyWrite: deny.denyWrite,
           srtWin,
         })
       }
@@ -1364,7 +1364,7 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
 /**
  * Session-level grant set: `allowWrite` → `MODIFY_NO_FDC`, `allowRead`
  * → `READ|EXECUTE` ALLOW ACEs for `<sb-SID>`, globs expanded at
- * initialize(). Denies are per exec — {@link computeWindowsPerExecDenySet}.
+ * initialize(). The denies: {@link computeWindowsPerExecDenySet}.
  */
 function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   grantRead: string[]
@@ -1388,12 +1388,15 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
 }
 
 /**
- * Deny set for one exec: session + per-exec `denyRead`/`denyWrite`,
- * credential files, and the mandatory set under `cwd`. Applied via
- * `srt-win exec --deny-*` under the exec's PID, so a `.git` the host
- * creates or rewrites between commands is covered by the next one. Only
- * the ACEs on the directories above the targets outlive the command:
- * `denyRead` of {@link grantWindowsAcl}.
+ * The denies of one command. `denyRead`/`denyWrite` are the session's own:
+ * configured, credential files, and the mandatory set under `cwd`.
+ * initialize() stamps them and every command re-derives and refreshes them
+ * (`srt-win exec --session-deny-*`), so a `.git` the host creates or
+ * rewrites between commands is covered by the next one. They are HELD UNTIL
+ * reset(), one the configuration has since dropped included: every
+ * sandboxed process on the machine runs as one account, and the session's
+ * grant is on disk between its commands too. `extra*` is what only `custom`
+ * asks for, held by that command alone.
  *
  * A grant of the same path or of one above it does not lift a deny:
  * srt-win writes a path's deny ahead of its allow. A grant BENEATH a
@@ -1404,38 +1407,45 @@ export function computeWindowsPerExecDenySet(
   c: SandboxRuntimeConfig | undefined,
   custom: Partial<SandboxRuntimeConfig> | undefined,
   cwd: string,
-): { denyRead: string[]; denyWrite: string[] } {
+): {
+  denyRead: string[]
+  denyWrite: string[]
+  extraDenyRead: string[]
+  extraDenyWrite: string[]
+} {
   const sessFs = c?.filesystem
   const fsCfg = custom?.filesystem
   if (sessFs?.disabled || fsCfg?.disabled) {
-    return { denyRead: [], denyWrite: [] }
+    return {
+      denyRead: [],
+      denyWrite: [],
+      extraDenyRead: [],
+      extraDenyWrite: [],
+    }
   }
-  const expand = expandWindowsFsPaths
-  const denyRead = expand(
-    [
-      ...new Set([
-        ...(sessFs?.denyRead ?? []),
-        ...(fsCfg?.denyRead ?? []),
-        ...getCredentialDenyReadPaths(c?.credentials),
-        ...getCredentialDenyReadPaths(custom?.credentials),
-      ]),
-    ],
-    { mode: 'deny' },
-  )
+  const expand = (paths: readonly string[]) =>
+    expandWindowsFsPaths([...new Set(paths)], { mode: 'deny' })
+  const denyRead = expand([
+    ...(sessFs?.denyRead ?? []),
+    ...getCredentialDenyReadPaths(c?.credentials),
+  ])
   const mandatory = windowsGetMandatoryDenyPaths(cwd, {
     maxDepth: c?.mandatoryDenySearchDepth ?? 3,
     allowGitConfig: c?.filesystem?.allowGitConfig ?? false,
   })
   const read = new Set(denyRead)
   const denyWrite = [
-    ...new Set([
-      ...expand([...(sessFs?.denyWrite ?? []), ...(fsCfg?.denyWrite ?? [])], {
-        mode: 'deny',
-      }),
-      ...mandatory,
-    ]),
+    ...new Set([...expand(sessFs?.denyWrite ?? []), ...mandatory]),
   ].filter(p => !read.has(p))
-  return { denyRead, denyWrite }
+  const extraDenyRead = expand([
+    ...(fsCfg?.denyRead ?? []),
+    ...getCredentialDenyReadPaths(custom?.credentials),
+  ]).filter(p => !read.has(p))
+  const covered = new Set([...denyRead, ...denyWrite, ...extraDenyRead])
+  const extraDenyWrite = expand(fsCfg?.denyWrite ?? []).filter(
+    p => !covered.has(p),
+  )
+  return { denyRead, denyWrite, extraDenyRead, extraDenyWrite }
 }
 
 /**
@@ -1930,10 +1940,19 @@ async function wrapWithSandboxArgv(
       // passed via the --env overlay so the sandboxed child sees
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
-      denyRead: perExec.denyRead,
-      denyWrite: perExec.denyWrite,
-      // Only a session has a reset() to release them.
-      sessionHolderPid: windowsFsSbUserSid ? process.pid : undefined,
+      // Only a session has a reset() to release what outlives the command.
+      ...(windowsFsSbUserSid
+        ? {
+            sessionHolderPid: process.pid,
+            sessionDenyRead: perExec.denyRead,
+            sessionDenyWrite: perExec.denyWrite,
+            denyRead: perExec.extraDenyRead,
+            denyWrite: perExec.extraDenyWrite,
+          }
+        : {
+            denyRead: [...perExec.denyRead, ...perExec.extraDenyRead],
+            denyWrite: [...perExec.denyWrite, ...perExec.extraDenyWrite],
+          }),
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
       // roots the sandbox user has MODIFY on plus any repo top-level
@@ -2167,8 +2186,8 @@ async function reset(): Promise<void> {
     // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
     // post-. Either is non-anomalous.
     const ok = new Set(['revoked', 'stillHeld', 'restored', 'alreadyOriginal'])
-    // The grants, and the directory-level denies: initialize()'s, and
-    // whatever this session's commands have added since.
+    // The grants, and the denies: initialize()'s, and whatever this
+    // session's commands have added since.
     for (const e of revokeWindowsAcl({
       sandboxUserSid: sb,
       withDenies: true,
