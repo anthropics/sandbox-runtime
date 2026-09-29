@@ -2573,6 +2573,43 @@ describe.if(isWindows)(
             await runSandboxed(retake(users)),
             users,
           )
+          // icacls reads attributes and lists the parent first, which the
+          // account cannot do here, so its refusal proves little. The bare
+          // call opens the file for WRITE_DAC alone.
+          const ps3 = join(other, 'retake.ps1')
+          writeFileSync(
+            ps3,
+            [
+              'param([string]$Path, [string]$Sid)',
+              'Add-Type -TypeDefinition @"',
+              'using System;',
+              'using System.Runtime.InteropServices;',
+              'public static class Sec3 {',
+              '  [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]',
+              '  public static extern bool SetFileSecurityW(string lpFileName, uint SecurityInformation, byte[] pSecurityDescriptor);',
+              '}',
+              '"@',
+              '$sd = New-Object System.Security.AccessControl.RawSecurityDescriptor("D:(A;;FA;;;$Sid)")',
+              '$bytes = New-Object byte[] $sd.BinaryLength',
+              '$sd.GetBinaryForm($bytes, 0)',
+              '$ok = [Sec3]::SetFileSecurityW($Path, 4, $bytes)',
+              '$err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()',
+              '"SetFileSecurityW returned $ok (last error $err)"',
+              'try { Set-Content -LiteralPath $Path -Value "POISON-3" -ErrorAction Stop; "write ok" } catch { "write failed: $($_.Exception.Message)" }',
+            ].join('\r\n'),
+          )
+          const bare = (p: string) =>
+            `powershell -NoProfile -ExecutionPolicy Bypass -File "${ps3}" "${p}" ${sbSid}`
+          say(
+            'after reset(), from a session elsewhere, the BARE CALL on its OWN file',
+            await runSandboxed(bare(owned), 120_000),
+            owned,
+          )
+          say(
+            "after reset(), from a session elsewhere, the BARE CALL on the USER's file (control)",
+            await runSandboxed(bare(users), 120_000),
+            users,
+          )
         })
       } finally {
         rmSync(dir, { recursive: true, force: true })
