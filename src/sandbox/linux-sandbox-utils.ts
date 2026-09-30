@@ -283,7 +283,9 @@ export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
 ): string[] {
   const cwd = process.cwd()
-  // Note: Settings files are added at the callsite in sandbox-manager.ts
+  // The settings file this session was loaded from is denied separately, in
+  // getFsWriteConfig() (sandbox-manager.ts), because its path is $HOME- or
+  // caller-anchored rather than cwd-anchored like the entries below.
   const denyPaths = [
     // Dangerous files in CWD
     ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
