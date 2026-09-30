@@ -48,6 +48,9 @@ export {
   LinuxSandboxProfileError,
   type LinuxSandboxProfileErrorCode,
 } from './sandbox/linux-sandbox-utils.js'
+// The mount points a running sandbox relies on (Linux), as a snapshot, for an
+// embedder that removes paths itself after a command to leave out.
+export { liveMountPoints } from './sandbox/bwrap-mount-manifests.js'
 
 // Windows install/status API
 export {
