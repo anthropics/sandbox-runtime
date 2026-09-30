@@ -1153,7 +1153,7 @@ export const SandboxRuntimeConfigSchema = z
       .max(10)
       .optional()
       .describe(
-        'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
+        'Maximum directory depth to search for dangerous files on Linux and Windows (default: 3). ' +
           'Higher values provide more protection but slower performance.',
       ),
     allowPty: z
@@ -1195,7 +1195,7 @@ export const SandboxRuntimeConfigSchema = z
   .superRefine((cfg, ctx) => {
     // filesystem.disabled drops every filesystem rule, the credential file
     // denies included (getFsReadConfig, getFsWriteConfig and
-    // computeWindowsFsAccessSet all short-circuit on it), so an inert deny
+    // computeWindowsPerExecDenySet all short-circuit on it), so an inert deny
     // under it is not a hole.
     const fsEnforced = !cfg.filesystem.disabled
     if (fsEnforced) {

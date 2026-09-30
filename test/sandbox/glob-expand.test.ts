@@ -1051,6 +1051,23 @@ describe('parseWindowsSandboxError', () => {
     expect(err?.message).toContain('DRIVE_REMOTE')
   })
 
+  it('parses a deny that could not be stamped, with its paths', () => {
+    const failed = [{ path: 'C:\\w\\.mcp.json', code: 'failed', reason: 'why' }]
+    const line = (f: unknown) =>
+      `noise\n${JSON.stringify({ code: 'acl_stamp_failed', message: 'm', failed: f })}\n`
+    expect(parseWindowsSandboxError(line(failed))).toMatchObject({
+      code: 'acl_stamp_failed',
+      subcommand: 'exec',
+      message: 'm',
+      failed,
+    })
+    const taken = [{ ...failed[0], code: 'takeover_failed' }]
+    expect(parseWindowsSandboxError(line(taken))).toMatchObject({
+      code: 'acl_takeover_failed',
+      failed: taken,
+    })
+  })
+
   it('returns undefined when no typed-error line present', () => {
     expect(parseWindowsSandboxError('srt-win: error: something\n')).toBe(
       undefined,

@@ -9,7 +9,7 @@
 //!   sandbox user (which has no inherent rights on real-user-owned
 //!   files) can reach the working tree;
 //! - `stamp` ⇒ `(D;OICI;mask;;;<sb-SID>)` on the target plus
-//!   `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent;
+//!   `(D;OICI;FILE_DELETE_CHILD|WRITE_DAC|WRITE_OWNER;;;<sb-SID>)` on the parent;
 //! - install-time ambient write-denies (`ambient.rs`) reuse the
 //!   `stamp` deny shape, recorded in `ambient_denies` with no holder
 //!   so they persist across sessions until `uninstall`.
@@ -34,13 +34,15 @@
 use anyhow::{Context, Result, anyhow, bail};
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
     ACE_FLAGS, ACE_HEADER, ACE_REVISION, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
     AclSizeInformation, AddAccessAllowedAceEx, AddAccessDeniedAceEx, AddAce, CONTAINER_INHERIT_ACE,
-    DACL_SECURITY_INFORMATION, GetAce, GetAclInformation, GetLengthSid,
+    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
     GetSecurityDescriptorControl, InitializeAcl, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorControl,
@@ -83,6 +85,7 @@ impl Mask {
     pub const DELETE: Self = Self(0x0001_0000);
     pub const READ_CONTROL: Self = Self(0x0002_0000);
     pub const WRITE_DAC: Self = Self(0x0004_0000);
+    pub const WRITE_OWNER: Self = Self(0x0008_0000);
     pub const SYNCHRONIZE: Self = Self(0x0010_0000);
 
     // Generic — resolved via the object's GENERIC_MAPPING.
@@ -633,7 +636,7 @@ pub fn set_handle_dacl_from_sddl(
 /// cannot be deleted via parent-FDC even where the only sb-user
 /// access comes from this grant). `ReadOnly` is
 /// [`Mask::FILE_READ_EXEC`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GrantMask {
     ReadOnly,
     Modify,
@@ -641,7 +644,7 @@ pub enum GrantMask {
 
 /// Per-deny mask. `ReadDeny` denies everything; `WriteDeny` leaves
 /// read+execute. The bits are the *denied* rights.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DenyMask {
     WriteDeny,
     ReadDeny,
@@ -657,20 +660,24 @@ pub enum DenyMask {
 pub enum SbAce {
     Grant(GrantMask),
     Deny(DenyMask),
-    /// `(D;OICI;FILE_DELETE_CHILD;;;<sb>)` — applied to the parent
-    /// of every denied target so the sandbox user cannot `del`/`ren`
-    /// it via parent-FDC even when the parent carries an inherited
-    /// `BUILTIN\Users:(F)` (which the sandbox user, a Users member,
-    /// would otherwise pick up).
+    /// `(D;OICI;FILE_DELETE_CHILD|WRITE_DAC|WRITE_OWNER;;;<sb>)` — applied to the parent
+    /// of every denied target and of every [`SbAce::DenyPin`] so the
+    /// sandbox user cannot `del`/`ren` it via parent-FDC even when the
+    /// parent carries an inherited `BUILTIN\Users:(F)` (which the
+    /// sandbox user, a Users member, would otherwise pick up).
     DenyFdc,
-    /// `(D;;DELETE;;;<sb>)` — object-only (`NO_INHERIT`) DELETE deny
-    /// on a placeholder INTERMEDIATE directory. Blocks the sandbox
-    /// from renaming/rmdir'ing the intermediate (which would bypass
-    /// the leaf's stamp) without leaking any semantics onto children:
-    /// a full-mask `(OI)(CI)` deny here would deny reads over the
-    /// whole subtree if the placeholder later becomes a real user
-    /// directory.
+    /// `(D;;DELETE|WRITE_DAC|WRITE_OWNER;;;<sb>)` — object-only (`NO_INHERIT`)
+    /// deny on a placeholder INTERMEDIATE directory. Blocks the
+    /// sandbox from renaming/rmdir'ing the intermediate (which would
+    /// bypass the leaf's stamp) without leaking any semantics onto
+    /// children: a full-mask `(OI)(CI)` deny here would deny reads
+    /// over the whole subtree if the placeholder later becomes a
+    /// real user directory.
     DenyDelete,
+    /// Same ACE on a REAL directory between a `Deny` target and its
+    /// modify-grant root, so the ancestor chain cannot be renamed
+    /// aside.
+    DenyPin,
 }
 
 impl GrantMask {
@@ -692,9 +699,19 @@ impl DenyMask {
             // read open. FILE_WRITE_ATTRIBUTES is already in
             // FILE_GENERIC_WRITE; the explicit `.with()` is
             // belt-and-braces (it survives a constant change).
+            // WRITE_DAC and WRITE_OWNER: where a group gives the
+            // sandbox user Full control it could strip this very ACE.
+            // FILE_DELETE_CHILD: it overrides the DELETE deny a denied
+            // directory's children inherit, and the parent's FDC deny
+            // does not reach a protected DACL. (An srt-win with another
+            // mask rewrites a shared path's ACE, and this one rewrites
+            // it back: harmless, each writes a deny.)
             DenyMask::WriteDeny => Mask::FILE_GENERIC_WRITE
                 .with(Mask::DELETE)
                 .with(Mask::FILE_WRITE_ATTRIBUTES)
+                .with(Mask::WRITE_DAC)
+                .with(Mask::WRITE_OWNER)
+                .with(Mask::FILE_DELETE_CHILD)
                 .without(Mask::SYNCHRONIZE)
                 .without(Mask::READ_CONTROL)
                 .bits(),
@@ -703,6 +720,12 @@ impl DenyMask {
 }
 
 impl SbAce {
+    /// The directory-level denies. Writing one re-propagates through
+    /// the directory's tree, so the session holds even those that only
+    /// a command's own extras need.
+    pub fn session_held(self) -> bool {
+        matches!(self, SbAce::DenyFdc | SbAce::DenyPin)
+    }
     /// `'grant' | 'deny' | 'deny_fdc'` — the row's `kind` column.
     pub fn kind(self) -> &'static str {
         match self {
@@ -710,6 +733,7 @@ impl SbAce {
             SbAce::Deny(_) => "deny",
             SbAce::DenyFdc => "deny_fdc",
             SbAce::DenyDelete => "deny_delete",
+            SbAce::DenyPin => "deny_pin",
         }
     }
     /// `'read' | 'modify' | 'denyRead' | 'denyWrite' | 'fdc'` — the
@@ -723,6 +747,7 @@ impl SbAce {
             SbAce::Deny(DenyMask::WriteDeny) => "denyWrite",
             SbAce::DenyFdc => "fdc",
             SbAce::DenyDelete => "delete",
+            SbAce::DenyPin => "pin",
         }
     }
     pub fn parse(kind: &str, mask: &str) -> Result<Self> {
@@ -733,6 +758,7 @@ impl SbAce {
             ("deny", "denyWrite") => SbAce::Deny(DenyMask::WriteDeny),
             ("deny_fdc", _) => SbAce::DenyFdc,
             ("deny_delete", _) => SbAce::DenyDelete,
+            ("deny_pin", _) => SbAce::DenyPin,
             (k, m) => bail!("unknown SbAce kind={k:?} mask={m:?}"),
         })
     }
@@ -768,21 +794,31 @@ pub struct SbAceSet {
 impl SbAceSet {
     /// The set's entries as [`NewAce`]s for `sid`, in canonical
     /// deny → deny-fdc → allow order. `Deny`/`DenyFdc`/`Grant` carry
-    /// [`OICI`]; `DenyDelete` is object-only ([`NO_INHERIT`]) — see
-    /// [`SbAce::DenyDelete`].
-    fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
+    /// [`OICI`] on a directory; `DenyDelete`/`DenyPin` is object-only
+    /// ([`NO_INHERIT`]) — see [`SbAce::DenyDelete`]. Windows drops the
+    /// inheritance flags of an ACE written on a file, so one built with
+    /// them would never compare equal to what is read back.
+    ///
+    /// INVARIANT: every deny here names WRITE_DAC and WRITE_OWNER, so
+    /// that each of these carries that deny in an ACE OF ITS OWN, never
+    /// by inheritance: every denied target, every pin, every pin's
+    /// parent, and so the grant root above them. Where a group gives
+    /// the sandbox user Full control it could otherwise strip the ACE.
+    fn head_aces(&self, sid: PSID, dir: bool) -> Vec<NewAce> {
+        let oici = if dir { OICI } else { NO_INHERIT };
+        let acl_too = |m: Mask| m.with(Mask::WRITE_DAC).with(Mask::WRITE_OWNER).bits();
         let mut v = Vec::with_capacity(4);
         if let Some(m) = self.deny {
-            v.push(NewAce::Deny(sid, m.bits(), OICI));
+            v.push(NewAce::Deny(sid, m.bits(), oici));
         }
         if self.deny_delete {
-            v.push(NewAce::Deny(sid, Mask::DELETE.bits(), NO_INHERIT));
+            v.push(NewAce::Deny(sid, acl_too(Mask::DELETE), NO_INHERIT));
         }
         if self.deny_fdc {
-            v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));
+            v.push(NewAce::Deny(sid, acl_too(Mask::FILE_DELETE_CHILD), oici));
         }
         if let Some(m) = self.grant {
-            v.push(NewAce::Allow(sid, m.bits(), OICI));
+            v.push(NewAce::Allow(sid, m.bits(), oici));
         }
         v
     }
@@ -812,8 +848,36 @@ impl SbAceSet {
 /// manually.
 ///
 /// Both grant and deny carry `(OI)(CI)` so directory targets cover
-/// the subtree; on a file the inheritance flags are inert.
-pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<()> {
+/// the subtree.
+///
+/// Returns whether the DACL was written.
+pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<bool> {
+    converge_aces(canonical_path, sandbox_sid, set, false, false, || Ok(()))
+}
+
+/// [`apply_sandbox_aces`] for a write that must not stay half done.
+/// `before_write` runs ahead of one. `force` writes without the skip: a
+/// write propagates afresh through a directory's tree, where an earlier
+/// one may have been killed.
+pub fn apply_sandbox_aces_marked(
+    canonical_path: &str,
+    sandbox_sid: &str,
+    set: SbAceSet,
+    force: bool,
+    before_write: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
+    converge_aces(canonical_path, sandbox_sid, set, force, false, before_write)
+}
+
+/// `unprotect`: write it back `UNPROTECTED_` whatever it was.
+fn converge_aces(
+    canonical_path: &str,
+    sandbox_sid: &str,
+    set: SbAceSet,
+    force: bool,
+    unprotect: bool,
+    before_write: impl FnOnce() -> Result<()>,
+) -> Result<bool> {
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
     let sid_bytes = sid.as_bytes();
@@ -831,18 +895,133 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     })?;
     // 3. Build fresh ACL: set's entries (deny-first canonical order)
     //    then surviving explicit ACEs.
-    let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[])?;
+    let dir = Path::new(canonical_path).is_dir();
+    let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid(), dir), &kept, &[])?;
+    // Nothing would change: skip the write, which on a directory
+    // re-propagates through its whole tree. INVARIANT: judged against
+    // the DACL just read from DISK, never against the state DB, so
+    // that ACEs stripped from outside (`icacls /reset`, the sandbox
+    // user on a directory it owns) are put back by the next command.
+    if !force && !(protected && unprotect) && same_explicit_aces(old, new.as_ptr())? {
+        return Ok(false);
+    }
     // 4. Write back, preserving the DACL's protection state:
     //    UNPROTECTED so the kernel re-derives inherited ACEs from the
     //    parent, PROTECTED when inheritance was severed before we
     //    touched the path (see doc comment).
-    let prot = if protected {
+    let prot = if protected && !unprotect {
         Protection::Protected
     } else {
         Protection::Unprotected
     };
+    before_write()?;
     write_file_dacl(canonical_path, new.as_ptr(), prot)
-        .with_context(|| format!("recompose '{canonical_path}'"))
+        .with_context(|| format!("recompose '{canonical_path}'"))?;
+    Ok(true)
+}
+
+/// The context of every error from [`take_over`]: the object.
+#[derive(Debug)]
+pub struct TakeOverFailed(pub String);
+
+impl std::fmt::Display for TakeOverFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot take '{}' over from the sandbox user", self.0)
+    }
+}
+
+/// Make the calling user the owner of `canonical_path`, and with `deep`
+/// of everything beneath it, wherever the sandbox user is.
+///
+/// THREAT: an owner is granted WRITE_DAC whatever the DACL says, so the
+/// sandbox user can take a deny off anything it made, and honest
+/// commands make denied names all the time (`git clone`, a hook
+/// installer, scaffolding). An owner that cannot be read counts as the
+/// sandbox user: it may have locked the caller out.
+///
+/// What is taken over also loses the sandbox user's explicit ACEs and
+/// `SE_DACL_PROTECTED`: its owner could write its DACL as it liked, and
+/// `D:P(A;;FA;;;<sb>)` on a child would outlive the take-over, out of
+/// the inherited deny's reach. Elsewhere the flag is kept as an
+/// administrator's deliberate lock-down; on this object it is not one.
+///
+/// Permanent, so no row and no restore. Links are neither entered nor
+/// touched.
+pub fn take_over(canonical_path: &str, sandbox_sid: &str, deep: bool) -> Result<()> {
+    let sb = LocalPsid::from_string(sandbox_sid)?;
+    let me = LocalPsid::from_string(&crate::sid::current_user_sid()?)?;
+    let mut todo = vec![PathBuf::from(canonical_path)];
+    while let Some(p) = todo.pop() {
+        take_one(&p, sandbox_sid, &sb, &me, deep.then_some(&mut todo))
+            .with_context(|| TakeOverFailed(p.display().to_string()))?;
+    }
+    Ok(())
+}
+
+fn take_one(
+    p: &Path,
+    sandbox_sid: &str,
+    sb: &LocalPsid,
+    me: &LocalPsid,
+    beneath: Option<&mut Vec<PathBuf>>,
+) -> Result<()> {
+    let w: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+    let mut owner = PSID::default();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let r = unsafe {
+        GetNamedSecurityInfoW(
+            pcwstr(&w),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut psd,
+        )
+    };
+    win32_ok(r, "GetNamedSecurityInfoW(owner)")?;
+    // Owns the buffer `owner` points into.
+    let _sd = OwnedSd::from_raw(psd);
+    if unsafe { EqualSid(owner, sb.as_psid()) }.is_ok() {
+        let r = unsafe {
+            SetNamedSecurityInfoW(
+                pcwstr(&w),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(me.as_psid()),
+                None,
+                None,
+                None,
+            )
+        };
+        win32_ok(r, "SetNamedSecurityInfoW(owner)")?;
+        let p = p.to_str().context("not UTF-8")?;
+        converge_aces(p, sandbox_sid, SbAceSet::default(), false, true, || Ok(()))?;
+    }
+    if let Some(todo) = beneath.filter(|_| p.is_dir()) {
+        for e in std::fs::read_dir(p)? {
+            let e = e?;
+            if !e.file_type()?.is_symlink() {
+                todo.push(e.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `old`'s explicit ACEs are exactly `new`'s ACEs, byte for
+/// byte and in order. `old`'s inherited ACEs do not count: a write
+/// does not carry them, the system re-derives them.
+fn same_explicit_aces(old: *const ACL, new: *const ACL) -> Result<bool> {
+    fn bytes(k: &KeptAces) -> Vec<&[u8]> {
+        k.0.iter()
+            .map(|&(p, n)| unsafe { std::slice::from_raw_parts(p as *const u8, n as usize) })
+            .collect()
+    }
+    let old = filter_aces(old, |hdr, _| hdr.AceFlags & INHERITED_ACE == 0)?;
+    let new = filter_aces(new, |_, _| true)?;
+    Ok(bytes(&old) == bytes(&new))
 }
 
 /// Whether `canonical_path` carries an EXPLICIT `(OI)(CI)` deny ACE
@@ -985,12 +1164,120 @@ mod tests {
     }
 
     #[test]
+    fn a_dacl_write_is_skipped_only_for_the_same_explicit_aces() {
+        let (sb, sy) = (
+            LocalPsid::from_string("S-1-5-32-546").unwrap(),
+            LocalPsid::from_string(SID_SYSTEM).unwrap(),
+        );
+        let deny = || NewAce::Deny(sb.as_psid(), Mask::FILE_DELETE_CHILD.bits(), OICI);
+        let allow = |flags| NewAce::Allow(sy.as_psid(), Mask::FILE_ALL.bits(), flags);
+        let inherited = ACE_FLAGS(OICI.0 | INHERITED_ACE as u32);
+        let same = |on_disk: &[NewAce], to_write: &[NewAce]| {
+            let acl =
+                |a| rebuild_acl(ACL_REVISION, a, &(Vec::new(), 0, ACL_REVISION), &[]).unwrap();
+            same_explicit_aces(acl(on_disk).as_ptr(), acl(to_write).as_ptr()).unwrap()
+        };
+        let want = [deny(), allow(OICI)];
+        assert!(same(&[deny(), allow(OICI)], &want), "the same");
+        assert!(
+            same(&[deny(), allow(OICI), allow(inherited)], &want),
+            "inherited ACEs do not count"
+        );
+        assert!(!same(&[allow(OICI), deny()], &want), "another order");
+        assert!(
+            !same(&[deny(), allow(OICI), allow(NO_INHERIT)], &want),
+            "a superset"
+        );
+        assert!(!same(&[allow(OICI)], &want), "our ACE stripped");
+    }
+
+    #[test]
+    fn what_is_taken_over_loses_the_sandbox_users_aces_and_its_protection() {
+        const SB: &str = "S-1-5-32-546";
+        let dir = std::env::temp_dir().join(format!("srtwin-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        std::fs::write(&file, "x").unwrap();
+        let path = file.to_str().unwrap();
+        let me = crate::sid::current_user_sid().unwrap();
+        let mine = Allow(&me, Mask::FILE_ALL, NO_INHERIT);
+        let repair =
+            || converge_aces(path, SB, SbAceSet::default(), false, true, || Ok(())).unwrap();
+        // With an ACE of the sandbox user's, and protected alone.
+        for aces in [&[Allow(SB, Mask::FILE_ALL, NO_INHERIT), mine][..], &[mine]] {
+            let dacl = build_allow_dacl(aces).unwrap();
+            write_file_dacl(path, dacl.as_ptr(), Protection::Protected).unwrap();
+            assert!(repair(), "written");
+            let (sd, dacl) = read_file_dacl(path).unwrap();
+            assert!(!sd_dacl_protected(&sd).unwrap(), "no longer protected");
+            let count = |f: &dyn Fn(&ACE_HEADER, &[u8]) -> bool| {
+                filter_aces(dacl, |hdr, body| f(hdr, body)).unwrap().0.len()
+            };
+            let sb = LocalPsid::from_string(SB).unwrap();
+            assert_eq!(count(&|_, body| ace_sid_is(body, sb.as_bytes())), 0);
+            assert_ne!(count(&|hdr, _| hdr.AceFlags & INHERITED_ACE != 0), 0);
+            assert_eq!(
+                count(&|hdr, _| hdr.AceFlags & INHERITED_ACE == 0),
+                1,
+                "mine stays"
+            );
+            assert!(!repair(), "nothing is left to write");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_second_converge_writes_nothing_on_a_file_or_a_directory() {
+        let dir = std::env::temp_dir().join(format!("srtwin-flags-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        std::fs::write(&file, "x").unwrap();
+        let set = SbAceSet {
+            grant: Some(GrantMask::Modify),
+            deny: Some(DenyMask::WriteDeny),
+            ..Default::default()
+        };
+        for p in [&file, &dir] {
+            let apply = || apply_sandbox_aces(p.to_str().unwrap(), "S-1-5-32-546", set).unwrap();
+            assert!(apply(), "{p:?}: the first converge writes");
+            assert!(!apply(), "{p:?}: the second finds what the first wrote");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_deny_names_write_dac_and_write_owner() {
+        let sb = LocalPsid::from_string("S-1-5-32-546").unwrap();
+        let set = SbAceSet {
+            grant: None,
+            deny: Some(DenyMask::WriteDeny),
+            deny_fdc: true,
+            deny_delete: true,
+        };
+        let both = (Mask::WRITE_DAC | Mask::WRITE_OWNER).bits();
+        let aces = set.head_aces(sb.as_psid(), true);
+        assert_eq!(aces.len(), 3);
+        for a in aces {
+            let NewAce::Deny(_, mask, _) = a else {
+                panic!("an allow");
+            };
+            assert_eq!(mask & both, both, "{mask:#x}");
+        }
+    }
+
+    #[test]
     fn mask_consts_regression() {
         let m = Mask::MODIFY_NO_FDC;
         assert_eq!(m.bits(), 0x0013_01bf);
         assert_ne!(m.bits() & Mask::DELETE.bits(), 0, "must carry DELETE");
         assert_eq!(m.bits() & Mask::FILE_DELETE_CHILD.bits(), 0);
         assert_eq!(m.bits() & 0xffe0_0000, 0, "stray high bits");
+
+        let w = DenyMask::WriteDeny.bits();
+        let denied = Mask::WRITE_DAC | Mask::WRITE_OWNER | Mask::DELETE | Mask::FILE_DELETE_CHILD;
+        assert_eq!(w & denied.bits(), denied.bits());
+        let read = Mask::SYNCHRONIZE | Mask::READ_CONTROL | Mask::FILE_GENERIC_READ;
+        assert_eq!(w & read.bits(), 0, "a write deny leaves reads open");
 
         let ow = Allow::OWNER_RIGHTS.1;
         assert_eq!(ow.bits(), Mask::READ_CONTROL.bits());

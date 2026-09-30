@@ -314,57 +314,48 @@ try {
   }
   Write-Host 'A29 ok: per-exec broker hard-killed → recover reaps + restores'
 
-  # ── A30: hardlink guard — refuse any multi-link Deny target ─────
+  # ── A30: hardlinks — a deny holds under every name of the file ──
   # NTFS hardlinks share one security descriptor across distinct
-  # canonical paths, but `ace_holders` is PATH-keyed. A Deny on
-  # one alias is invisible to a holder of another — releasing it
-  # would write the SHARED DACL back without the deny while the
-  # other holder's child is still running. `ensure_ace` refuses
-  # `links > 1` for ALL Deny callers (per-exec and session-level
-  # `acl stamp` alike — no `refuse_escalation` distinction under
-  # the additive-ACE model).
+  # canonical paths, while `ace_holders` is PATH-keyed. A converge
+  # counts the rows of EVERY name of the file, so one name's release
+  # leaves what a holder of another still needs.
   $d30  = Join-Path $Root 'a30'
   New-Item -ItemType Directory -Path $d30 | Out-Null
   $f30  = Join-Path $d30 'orig.txt'
   $f30L = Join-Path $d30 'alias.txt'
   'A30-DATA' | Set-Content -Encoding ASCII $f30
   New-Item -ItemType HardLink -Path $f30L -Target $f30 | Out-Null
-  # (a) per-exec --deny-read on a hardlinked file → refused.
-  $r = RExec @('--deny-read', $f30L, '--', $cmd, '/c', 'exit 0')
-  if ($r.exit -eq 0) {
-    throw ("A30(a): per-exec --deny-read on a hardlinked file " +
-           "SUCCEEDED — links>1 gate did not fire. raw: $($r.raw)")
-  }
-  if ($r.raw -notmatch '(?i)deny refused.*has 2 hardlink') {
-    throw "A30(a): expected hardlink refuse; got: $($r.raw)"
-  }
-  if (Has-SbAce $f30L) {
-    throw 'A30(a): hardlinked file was stamped despite refuse'
-  }
-  # (b) session-level `acl stamp` on the original → ALSO refused.
-  #     (Same chokepoint; under the additive-ACE model session
-  #     stamps go through ensure_ace too.)
-  $b30 = (ConvertTo-Json -Compress @{ denyWrite = @($f30) }) `
-         | & $Exe acl stamp --holder-pid $PID `
-                  --sandbox-user-sid $sbSid 2>&1 | Out-String
-  if ($LASTEXITCODE -eq 0) {
-    throw ("A30(b): session acl stamp on a hardlinked file " +
-           "SUCCEEDED — expected refuse. out: $b30")
-  }
-  if ($b30 -notmatch '(?i)deny refused.*has 2 hardlink') {
-    throw "A30(b): expected hardlink refuse; got: $b30"
+  # (a) per-exec --deny-read on one name denies the other, and is
+  #     gone when the exec ends.
+  $r = RExec @('--deny-read', $f30L, '--', $cmd, '/c', "type `"$f30`"")
+  if ($r.out -match 'A30-DATA') {
+    throw "A30(a): read through the file's other name. raw: $($r.raw)"
   }
   if (Has-SbAce $f30) {
-    throw 'A30(b): original was stamped despite refuse'
+    throw 'A30(a): the per-exec deny outlived its exec'
   }
-  # The grant on $Root inherits into $d30, so a child without a
-  # deny can still read — confirms neither alias was stamped.
+  # (b) A session holds one name. A per-exec deny on the other,
+  #     released as its exec ends, leaves the session's.
+  Stamp @{ denyWrite = @($f30) }
+  $r = RExec @('--deny-write', $f30L, '--', $cmd, '/c', 'exit 0')
+  if ($r.exit -ne 0) {
+    throw "A30(b): exec with --deny-write on the other name failed. raw: $($r.raw)"
+  }
+  if (-not (Has-SbAce $f30)) {
+    throw "A30(b): one name's release stripped the deny another name's holder needs"
+  }
+  Restore $PID
+  if (Has-SbAce $f30) {
+    throw 'A30(b): the deny outlived its last holder'
+  }
+  # The grant on $Root inherits into $d30: with no deny left, a child
+  # reads. Without this, (a) would pass for a child that never ran.
   $rR = RExec @('--', $cmd, '/c', "type `"$f30`"")
   if ($rR.out -notmatch 'A30-DATA') {
-    throw "A30: child denied read — refuse leaked an ACE. raw: $($rR.raw)"
+    throw "A30: child denied read with no deny held. raw: $($rR.raw)"
   }
-  Write-Host ('A30 ok: hardlink guard — per-exec AND session ' +
-              'acl stamp refuse multi-link Deny targets')
+  Write-Host ('A30 ok: hardlinks — denied under every name; one ' +
+              "name's release leaves another's deny")
 
   # ── A31: non-existent deny target → placeholder-create + stamp ──
   # `acl stamp` mkdirs each missing intermediate + creates an empty

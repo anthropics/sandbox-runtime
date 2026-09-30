@@ -61,10 +61,18 @@ impl std::error::Error for CanonError {}
 /// `ERROR_FILE_NOT_FOUND` (2) or `ERROR_PATH_NOT_FOUND` (3).
 pub fn is_not_found(e: &anyhow::Error) -> bool {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    root_is(e, &[ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND])
+}
+
+/// The same for `ERROR_ACCESS_DENIED` (5).
+pub fn is_access_denied(e: &anyhow::Error) -> bool {
+    root_is(e, &[windows::Win32::Foundation::ERROR_ACCESS_DENIED])
+}
+
+fn root_is(e: &anyhow::Error, any_of: &[windows::Win32::Foundation::WIN32_ERROR]) -> bool {
     e.root_cause()
         .downcast_ref::<windows::core::Error>()
-        .map(|we| we.code())
-        .is_some_and(|c| c == ERROR_FILE_NOT_FOUND.into() || c == ERROR_PATH_NOT_FOUND.into())
+        .is_some_and(|we| any_of.iter().any(|c| we.code() == (*c).into()))
 }
 
 /// True iff `p` names a UNC network path (`\\server\share\…`,
@@ -453,38 +461,6 @@ pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
     let h = open_for_metadata(canonical_path)
         .with_context(|| format!("open '{canonical_path}' for file_id"))?;
     file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))
-}
-
-/// `(file_id, NumberOfLinks, is_dir)` from ONE metadata open.
-/// `links > 1` on a non-directory means an alternate hardlink
-/// name exists; the additive-ACE refcount in `state_db` is
-/// PATH-keyed, so releasing one alias would strip the SHARED
-/// DACL while another alias's holder still expects it denied.
-/// Directory `NumberOfLinks` counts subdirs (NTFS has no dir
-/// hardlinks), so callers gate the check on `!is_dir`.
-pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)> {
-    use windows::Win32::Storage::FileSystem::{
-        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
-    };
-    let h = open_for_metadata(canonical_path)
-        .with_context(|| format!("open '{canonical_path}' for file_id+links"))?;
-    let id = file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))?;
-    let mut std_info = FILE_STANDARD_INFO::default();
-    unsafe {
-        GetFileInformationByHandleEx(
-            h.raw(),
-            FileStandardInfo,
-            (&mut std_info as *mut FILE_STANDARD_INFO).cast(),
-            size_of::<FILE_STANDARD_INFO>() as u32,
-        )
-    }
-    .with_context(|| {
-        format!(
-            "GetFileInformationByHandleEx(FileStandardInfo) \
-             '{canonical_path}'"
-        )
-    })?;
-    Ok((id, std_info.NumberOfLinks, std_info.Directory))
 }
 
 /// Best-effort: locate the CURRENT path of a file by its captured

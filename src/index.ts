@@ -89,6 +89,7 @@ export type {
   WindowsSandboxStatus,
   WindowsBinShell,
   MappedDriveCwdError,
+  WindowsAclFailure,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,

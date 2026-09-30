@@ -200,10 +200,9 @@ enum Cmd {
     /// otherwise exits **15**.
     Exec {
         /// Per-exec read-deny: add an additive `(D;OICI;FA;;;<sb>)`
-        /// ACE for the sandbox user on `<PATH>` (and a parent
-        /// `FILE_DELETE_CHILD` DENY) for the lifetime of this exec
-        /// — under THIS process's PID as holder, released after the
-        /// child exits. Repeatable. Same chokepoint as `acl stamp`;
+        /// ACE for the sandbox user on `<PATH>` for the lifetime of
+        /// this exec — under THIS process's PID as holder, released
+        /// after the child exits. Repeatable. Same chokepoint as `acl stamp`;
         /// fails the exec if any path cannot be stamped (per-exec
         /// is "deny THIS one command", so a missing path is a
         /// caller error, not a skip).
@@ -212,6 +211,22 @@ enum Cmd {
         /// Per-exec write-deny — see `--deny-read`.
         #[arg(long = "deny-write")]
         deny_write: Vec<String>,
+        /// The session's own read denies, re-derived for this
+        /// command: as `--deny-read`, but held under
+        /// `--session-holder-pid` and NOT released when this exec
+        /// ends. A target that is stamped already is not written; a
+        /// new or replaced one is stamped afresh. Repeatable.
+        #[arg(long = "session-deny-read", requires = "session_holder_pid")]
+        session_deny_read: Vec<String>,
+        /// See `--session-deny-read`.
+        #[arg(long = "session-deny-write", requires = "session_holder_pid")]
+        session_deny_write: Vec<String>,
+        /// Holder of what outlives this exec: the `--session-deny-*`
+        /// set, and the directory-level ACEs of every deny (the
+        /// parent `FILE_DELETE_CHILD` DENY, the ancestor pins). Its
+        /// `acl restore` releases them.
+        #[arg(long)]
+        session_holder_pid: Option<u32>,
         /// `KEY=VALUE` pair overlaid on the sandbox-user runner's
         /// profile environment when building the child's env block.
         /// Repeatable. The broker forwards exactly these — it does
@@ -278,7 +293,7 @@ enum UserCmd {
 enum AclCmd {
     /// Read `{denyRead:[…], denyWrite:[…]}` from stdin and add an
     /// additive `(D;OICI;mask;;;<sid>)` ACE for the sandbox user on
-    /// each target plus a `(D;OICI;FILE_DELETE_CHILD;;;<sid>)` on
+    /// each target plus a `(D;OICI;FILE_DELETE_CHILD…;;;<sid>)` on
     /// the parent — NO PROTECTED rewrite, no SD snapshot.
     /// Refcounted per holder; `acl restore` removes the ACE when
     /// the last holder releases. Globs are rejected; directory
@@ -298,6 +313,14 @@ enum AclCmd {
         /// (`srt-win user status` → `marker_user_sid`).
         #[arg(long)]
         sandbox_user_sid: String,
+        /// Only the directory-level ACEs of the targets (see `exec
+        /// --session-holder-pid`), not the DENY on the targets.
+        #[arg(long)]
+        dirs_only: bool,
+        /// Emit `{"failed":[{path, code, reason}]}` on stdout: what
+        /// could not be protected, skipped inputs included.
+        #[arg(long)]
+        json: bool,
     },
     /// Read `{read:[…], write:[…]}` from stdin and add an
     /// inheritable `(OI)(CI)` ALLOW ACE for `--sandbox-user-sid` on
@@ -305,7 +328,9 @@ enum AclCmd {
     /// `MODIFY_NO_FDC` for `write`). Additive — the path's
     /// existing DACL and inheritance are untouched. Refcounted per
     /// holder; `acl revoke` removes the ACE when the last holder
-    /// releases.
+    /// releases. With `denyRead`/`denyWrite` too, `acl stamp` goes in
+    /// the same batch, so that a directory that carries both is
+    /// written once.
     Grant {
         /// Holder PID (see `acl stamp`).
         #[arg(long)]
@@ -314,6 +339,9 @@ enum AclCmd {
         /// (`srt-win user status` → `marker_user_sid`).
         #[arg(long)]
         sandbox_user_sid: String,
+        /// As `acl stamp --json`.
+        #[arg(long)]
+        json: bool,
     },
     /// Drop the holder's claim on every granted path; remove the
     /// sandbox-user ACE on any path whose refcount falls to zero.
@@ -322,6 +350,9 @@ enum AclCmd {
         holder_pid: u32,
         #[arg(long)]
         sandbox_user_sid: String,
+        /// `acl restore` in the same batch.
+        #[arg(long)]
+        with_denies: bool,
         #[arg(long)]
         json: bool,
     },
@@ -367,11 +398,16 @@ struct AclStampInput {
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct AclGrantInput {
     #[serde(default)]
     read: Vec<String>,
     #[serde(default)]
     write: Vec<String>,
+    #[serde(default)]
+    deny_read: Vec<String>,
+    #[serde(default)]
+    deny_write: Vec<String>,
 }
 
 /// One per-path entry of `acl revoke --json` / `acl restore
@@ -387,7 +423,7 @@ struct AceTargets {
     /// `(canonical_path, ace)` to hand to `apply_aces`.
     targets: Vec<(String, srt_win::acl::SbAce)>,
     /// Inputs that could not be canonicalized (soft-skip → exit 2).
-    bad_inputs: Vec<(String, String)>,
+    bad_inputs: Vec<srt_win::state_db::AceFailure>,
 }
 
 /// Canonicalize `(paths, ace)` pairs for `acl grant`/`acl stamp`
@@ -404,7 +440,11 @@ struct AceTargets {
 /// [`placeholder_ancestors_of`], any earlier holder's — get
 /// [`SbAce::DenyDelete`], so every holder holds the FULL chain and
 /// releasing any one holder cannot strip an intermediate another
-/// holder still depends on.
+/// holder still depends on. Real ancestors strictly between the
+/// target and its enclosing modify-grant root get
+/// [`SbAce::DenyPin`], and the parent of every denied or pinned object
+/// [`SbAce::DenyFdc`], so that the sandbox user cannot `del`/`ren` it
+/// through a parent that carries an inherited `BUILTIN\Users:(F)`.
 ///
 /// A `Deny` target the broker cannot create (`PermissionDenied` —
 /// e.g. under `Program Files` non-elevated) or that names a UNC
@@ -414,6 +454,10 @@ struct AceTargets {
 /// denied is possible but rare. A `Grant` on a missing path stays
 /// a soft-skip (nothing to grant on).
 ///
+/// INVARIANT: no grant above a deny that never became a target. A
+/// skipped `Deny` input takes every `Grant` of the call with it; the
+/// denies that resolved are still stamped.
+///
 /// Runs under `with_init_lock` so placeholder creation, its DB
 /// record, and the ancestor-discovery query are all serialized
 /// with `apply_aces`.
@@ -421,39 +465,44 @@ struct AceTargets {
 /// [`create_placeholder_chain`]: srt_win::path_id::create_placeholder_chain
 /// [`placeholder_ancestors_of`]: srt_win::state_db::Locked::placeholder_ancestors_of
 /// [`SbAce::DenyDelete`]: srt_win::acl::SbAce::DenyDelete
+/// [`SbAce::DenyPin`]: srt_win::acl::SbAce::DenyPin
+/// [`SbAce::DenyFdc`]: srt_win::acl::SbAce::DenyFdc
 fn canonicalize_ace_targets(
     db: &srt_win::state_db::Locked,
     label: &str,
     inputs: &[(&[String], srt_win::acl::SbAce)],
 ) -> anyhow::Result<AceTargets> {
     use anyhow::anyhow;
-    use srt_win::acl::SbAce;
+    use srt_win::acl::{GrantMask, SbAce};
     use srt_win::path_id::{
-        CanonError, canonicalize_path, create_placeholder_chain, is_unc_path, strip_extended_prefix,
+        CanonError, canonical_parent_of, canonicalize_path, create_placeholder_chain,
+        is_access_denied, is_unc_path, strip_extended_prefix,
     };
+    use srt_win::state_db::AceFailure;
     use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
+    let mut deny_skipped = false;
     // Deepest-first so overlapping non-existent denies (`['y',
     // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
     // `y` FILE (which would then fail `y\secret` with "ancestor is
     // a FILE"). Strip any `\\?\` prefix and normalize `/`→`\`
     // before counting so `\\?\C:\y` and `C:/y` depth-compare
     // correctly, and trim a trailing separator so it doesn't skew
-    // the sort.
+    // the sort. Grants before all: their roots bound the pin chains.
     let mut flat: Vec<(&String, SbAce)> = inputs
         .iter()
         .flat_map(|(list, ace)| list.iter().map(move |p| (p, *ace)))
         .collect();
-    flat.sort_by_cached_key(|(p, _)| {
-        std::cmp::Reverse(
-            strip_extended_prefix(p)
-                .trim_end_matches(['\\', '/'])
-                .bytes()
-                .filter(|b| *b == b'\\' || *b == b'/')
-                .count(),
-        )
+    flat.sort_by_cached_key(|(p, ace)| {
+        let depth = strip_extended_prefix(p)
+            .trim_end_matches(['\\', '/'])
+            .bytes()
+            .filter(|b| *b == b'\\' || *b == b'/')
+            .count();
+        (!matches!(ace, SbAce::Grant(_)), std::cmp::Reverse(depth))
     });
+    let mut roots = Vec::new();
     for (p, ace) in flat {
         let canon = match canonicalize_path(p) {
             Ok((c, _is_dir)) => c,
@@ -504,26 +553,66 @@ fn canonicalize_ace_targets(
                                  create there either"
                             );
                         } else {
-                            bad_inputs.push((p.clone(), format!("{e:#}")));
+                            bad_inputs.push(AceFailure::new(p, &e, "bad_input"));
+                            deny_skipped = true;
                         }
                         continue;
                     }
                 }
             }
-            Err(CanonError::NotFound(e) | CanonError::Other(e)) => {
-                bad_inputs.push((p.clone(), format!("{e:#}")));
+            Err(CanonError::NotFound(mut e) | CanonError::Other(mut e)) => {
+                deny_skipped |= matches!(ace, SbAce::Deny(_));
+                // Under a modify-grant, what the caller may not even
+                // open is the sandbox user's doing: it owns the object
+                // and has locked the caller out. Elsewhere it is a
+                // system object, and no advice to delete it is due.
+                if matches!(ace, SbAce::Deny(_))
+                    && is_access_denied(&e)
+                    && let Some((dir, name)) =
+                        p.trim_end_matches(['\\', '/']).rsplit_once(['\\', '/'])
+                    && let Ok((dir, _)) = canonicalize_path(dir)
+                    && db
+                        .grant_root_of(&format!(r"{dir}\{name}"), &roots)?
+                        .is_some()
+                {
+                    e = e.context(srt_win::acl::TakeOverFailed(p.clone()));
+                }
+                bad_inputs.push(AceFailure::new(p, &e, "bad_input"));
                 continue;
             }
         };
         targets.push((canon.clone(), ace));
+        if ace == SbAce::Grant(GrantMask::Modify) {
+            roots.push(canon.clone());
+        }
         // Full-chain hold (see doc). Duplicates across inputs are
         // harmless — `apply_aces` is idempotent per
         // `(path, kind, holder)`.
         if matches!(ace, SbAce::Deny(_)) {
-            for anc in db.placeholder_ancestors_of(&canon)? {
-                targets.push((anc, SbAce::DenyDelete));
+            let placeholders = db.placeholder_ancestors_of(&canon)?;
+            for anc in &placeholders {
+                targets.push((anc.clone(), SbAce::DenyDelete));
+            }
+            // Pin real ancestors below the grant root; never above it.
+            if let Some(root) = db.grant_root_of(&canon, &roots)? {
+                let mut cur = canonical_parent_of(&canon);
+                while let Some(anc) = cur.filter(|a| *a != root && a.len() > root.len()) {
+                    if !placeholders.contains(&anc) {
+                        targets.push((anc.clone(), SbAce::DenyPin));
+                    }
+                    cur = canonical_parent_of(&anc);
+                }
             }
         }
+    }
+    let fdc: Vec<_> = targets
+        .iter()
+        .filter(|(_, a)| matches!(a, SbAce::Deny(_) | SbAce::DenyDelete | SbAce::DenyPin))
+        .filter_map(|(c, _)| Some((canonical_parent_of(c)?, SbAce::DenyFdc)))
+        .collect();
+    targets.extend(fdc);
+    if deny_skipped {
+        targets.retain(|(_, a)| !matches!(a, SbAce::Grant(_)));
     }
     Ok(AceTargets {
         targets,
@@ -613,6 +702,7 @@ impl Drop for PerExecRestore {
     fn drop(&mut self) {
         use srt_win::state_db;
         let (failed, err) = match state_db::with_init_lock(self.holder, false, |db| {
+            db.quiet = self.quiet;
             db.release_aces(&self.sandbox_sid, state_db::KIND_DENY)
         }) {
             Ok(((_, failed), _)) => (failed, None),
@@ -1110,6 +1200,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 AclCmd::Stamp {
                     holder_pid,
                     sandbox_user_sid,
+                    dirs_only,
+                    json,
                 },
         } => {
             // Deny is an additive DENY ACE for the sandbox user
@@ -1123,7 +1215,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 .context("parse stdin JSON {denyRead:[…], denyWrite:[…]}")?;
             let ((at, witnesses, failed), report) =
                 state_db::with_init_lock(holder, false, |db| {
-                    let at = canonicalize_ace_targets(
+                    let mut at = canonicalize_ace_targets(
                         db,
                         "deny",
                         &[
@@ -1134,8 +1226,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             ),
                         ],
                     )?;
-                    for (p, e) in &at.bad_inputs {
-                        eprintln!("srt-win: skipped: '{p}': {e}");
+                    if dirs_only {
+                        at.targets.retain(|(_, a)| a.session_held());
                     }
                     let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
                     Ok((at, w, f))
@@ -1144,6 +1236,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets,
                 bad_inputs,
             } = at;
+            let (bad_inputs, failed) = {
+                let n = (bad_inputs.len(), failed.len());
+                if json {
+                    let failed: Vec<_> = bad_inputs.into_iter().chain(failed).collect();
+                    println!("{}", json!({ "failed": failed }));
+                }
+                n
+            };
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl stamp (deny-ace) — {} target(s) → {} \
@@ -1152,8 +1252,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets.len(),
                 witnesses.len(),
                 fresh,
-                if !bad_inputs.is_empty() {
-                    format!(", {} skipped", bad_inputs.len())
+                if bad_inputs > 0 {
+                    format!(", {bad_inputs} skipped")
                 } else {
                     String::new()
                 },
@@ -1172,11 +1272,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     targets.len(),
                 ));
             }
-            if !bad_inputs.is_empty() {
+            if bad_inputs > 0 {
                 eprintln!(
-                    "srt-win: {} input path(s) skipped (see above); \
-                     exiting 2 (partial)",
-                    bad_inputs.len()
+                    "srt-win: {bad_inputs} input path(s) skipped (see above); \
+                     exiting 2 (partial)"
                 );
                 std::process::exit(2);
             }
@@ -1186,6 +1285,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 AclCmd::Grant {
                     holder_pid,
                     sandbox_user_sid,
+                    json,
                 },
         } => {
             use srt_win::{acl, state_db};
@@ -1202,11 +1302,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         &[
                             (&input.read, acl::SbAce::Grant(acl::GrantMask::ReadOnly)),
                             (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
+                            (&input.deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
+                            (
+                                &input.deny_write,
+                                acl::SbAce::Deny(acl::DenyMask::WriteDeny),
+                            ),
                         ],
                     )?;
-                    for (p, e) in &at.bad_inputs {
-                        eprintln!("srt-win: skipped: '{p}': {e}");
-                    }
                     let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
                     Ok((at, w, f))
                 })?;
@@ -1214,6 +1316,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets,
                 bad_inputs,
             } = at;
+            let (bad_inputs, failed) = {
+                let n = (bad_inputs.len(), failed.len());
+                if json {
+                    let failed: Vec<_> = bad_inputs.into_iter().chain(failed).collect();
+                    println!("{}", json!({ "failed": failed }));
+                }
+                n
+            };
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl grant — {} path(s) ({} fresh, {} \
@@ -1222,8 +1332,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 targets.len(),
                 fresh,
                 witnesses.len() - fresh,
-                if !bad_inputs.is_empty() {
-                    format!(", {} skipped", bad_inputs.len())
+                if bad_inputs > 0 {
+                    format!(", {bad_inputs} skipped")
                 } else {
                     String::new()
                 },
@@ -1242,11 +1352,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     targets.len(),
                 ));
             }
-            if !bad_inputs.is_empty() {
+            if bad_inputs > 0 {
                 eprintln!(
-                    "srt-win: {} input path(s) skipped (see above); \
-                     exiting 2 (partial)",
-                    bad_inputs.len()
+                    "srt-win: {bad_inputs} input path(s) skipped (see above); \
+                     exiting 2 (partial)"
                 );
                 std::process::exit(2);
             }
@@ -1256,13 +1365,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 AclCmd::Revoke {
                     holder_pid,
                     sandbox_user_sid,
+                    with_denies,
                     json,
                 },
         } => {
             use srt_win::state_db;
             let holder = state_db::HolderPid(holder_pid);
+            let mut kinds = state_db::KIND_GRANT.to_vec();
+            if with_denies {
+                kinds.extend(state_db::KIND_DENY);
+            }
             let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
-                db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
+                db.release_aces(&sandbox_user_sid, &kinds)
             })?;
             eprintln!(
                 "srt-win: acl revoke — {} path(s){}; recovery \
@@ -1372,6 +1486,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Exec {
             deny_read,
             deny_write,
+            session_deny_read,
+            session_deny_write,
+            session_holder_pid,
             env,
             quiet,
             target,
@@ -1428,49 +1545,70 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // direct connect). Standalone `srt-win exec` callers
             // should run `srt-win wfp verify` once per session.
 
-            // Per-exec file deny — `--deny-read`/`--deny-write`. The
-            // session-level stamp (under `--holder-pid`) is applied
-            // once at the host's `initialize()`; these flags add
-            // PER-EXEC paths via the same additive DENY-ACE path as
-            // session `acl stamp`, under THIS exec process's own
-            // PID as a DISTINCT holder. Release downgrades the mask
-            // from the remaining holders' MAX(want_mask). Any stamp
-            // error (glob, canon-fail, apply-fail) FAILS the exec
-            // rather than running the child with an incomplete deny
-            // set.
-            let per_exec_guard = if deny_read.is_empty() && deny_write.is_empty() {
-                None
-            } else {
+            // File denies, via the same additive DENY-ACE path as `acl
+            // stamp`. THREAT: every sandboxed process on the machine
+            // runs as one account, and one spawned out of band outlives
+            // its command, while the session's grant stays on disk. So
+            // the session's own set is only ever REFRESHED here, under
+            // `--session-holder-pid`, and never released before that
+            // holder's `acl restore`. Only this command's extras are
+            // held by THIS process and released after the child exits.
+            // Any stamp error (glob, canon-fail, apply-fail) FAILS the
+            // exec rather than running the child with an incomplete
+            // deny set.
+            let denies = [
+                (&session_deny_read, &session_deny_write, false),
+                (&deny_read, &deny_write, true),
+            ];
+            if denies
+                .iter()
+                .any(|(r, w, _)| !r.is_empty() || !w.is_empty())
+            {
                 use srt_win::{acl, state_db};
                 let own = state_db::HolderPid(std::process::id());
-                let ((at, _w, failed), _r) = state_db::with_init_lock(own, false, |db| {
-                    let at = canonicalize_ace_targets(
-                        db,
-                        "deny",
-                        &[
-                            (&deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
-                            (&deny_write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
-                        ],
-                    )?;
-                    if let Some((p, e)) = at.bad_inputs.first() {
-                        return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
+                let ((n, failed), _r) = state_db::with_init_lock(own, false, |db| {
+                    db.session = session_holder_pid.map(state_db::HolderPid);
+                    db.quiet = quiet;
+                    let mut n = 0;
+                    for (read, write, extras) in denies {
+                        db.extras = extras;
+                        let at = canonicalize_ace_targets(
+                            db,
+                            "deny",
+                            &[
+                                (read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
+                                (write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
+                            ],
+                        )?;
+                        n += at.targets.len();
+                        let mut failed = at.bad_inputs;
+                        if failed.is_empty() {
+                            failed = db.apply_aces(&sb_sid, &at.targets)?.1;
+                        }
+                        if !failed.is_empty() {
+                            return Ok((n, failed));
+                        }
                     }
-                    let (w, f) = db.apply_aces(&sb_sid, &at.targets)?;
-                    Ok((at, w, f))
+                    Ok((n, vec![]))
                 })
                 .context("per-exec deny-ace")?;
-                let n = at.targets.len();
-                if failed > 0 {
-                    return Err(anyhow!(
-                        "per-exec deny: {failed} of {n} path(s) \
-                         could not be stamped; rolled back"
-                    ));
+                if !failed.is_empty() {
+                    // Typed, as `mapped_drive_cwd` below.
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "code": "acl_stamp_failed",
+                            "message": format!(
+                                "per-exec deny: {} path(s) could not be \
+                                 stamped; rolled back",
+                                failed.len()
+                            ),
+                            "failed": failed,
+                        })
+                    );
+                    drop(cred);
+                    std::process::exit(18);
                 }
-                let guard = PerExecRestore {
-                    holder: own,
-                    sandbox_sid: sb_sid.clone(),
-                    quiet,
-                };
                 if !quiet {
                     eprintln!(
                         "srt-win: per-exec deny (deny-ace): \
@@ -1478,8 +1616,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         own.0,
                     );
                 }
-                Some(guard)
-            };
+            }
+            let per_exec_guard =
+                (!deny_read.is_empty() || !deny_write.is_empty()).then(|| PerExecRestore {
+                    holder: srt_win::state_db::HolderPid(std::process::id()),
+                    sandbox_sid: sb_sid.clone(),
+                    quiet,
+                });
 
             // Self-protect the BROKER (real user) before the logon.
             // The runner self-protects too; this covers the
@@ -1805,5 +1948,17 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    /// Without it the exec itself would hold them, with nothing to
+    /// release them.
+    #[test]
+    fn session_denies_need_their_holder() {
+        let parse = |holder: &[&str]| {
+            let head = ["srt-win", "exec", "--session-deny-write", "x"];
+            Cli::try_parse_from([&head, holder, &["--", "cmd.exe"]].concat())
+        };
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--session-holder-pid", "1"]).is_ok());
     }
 }
