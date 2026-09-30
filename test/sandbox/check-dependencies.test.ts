@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import * as which from '../../src/utils/which.js'
 import * as platform from '../../src/utils/platform.js'
+import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 
 // SandboxManager.checkDependencies() must only require ripgrep on Linux,
@@ -55,6 +56,48 @@ describe('SandboxManager.checkDependencies: ripgrep', () => {
   })
 })
 
+describe('SandboxManager.checkDependencies: seccomp', () => {
+  let applySpy: ReturnType<typeof spyOn>
+
+  beforeEach(() => {
+    platformSpy.mockReturnValue('linux')
+    whichSpy.mockImplementation((bin: string) => `/usr/bin/${bin}`)
+    applySpy = spyOn(seccomp, 'getApplySeccompBinaryPath').mockImplementation(
+      (path?: string) =>
+        path === '/custom/apply-seccomp' ? '/custom/apply-seccomp' : null,
+    )
+  })
+
+  afterEach(() => {
+    applySpy.mockRestore()
+  })
+
+  test('linux: warns when seccomp helper missing without explicit config', () => {
+    const result = SandboxManager.checkDependencies()
+    expect(result.warnings).toContain(
+      'seccomp not available - unix socket access not restricted',
+    )
+  })
+
+  test('linux: honours explicit seccompConfig.applyPath', () => {
+    const result = SandboxManager.checkDependencies(undefined, {
+      applyPath: '/custom/apply-seccomp',
+    })
+    expect(result.warnings).not.toContain(
+      'seccomp not available - unix socket access not restricted',
+    )
+  })
+
+  test('linux: honours explicit seccompConfig.argv0', () => {
+    const result = SandboxManager.checkDependencies(undefined, {
+      argv0: 'custom-argv0',
+    })
+    expect(result.warnings).not.toContain(
+      'seccomp not available - unix socket access not restricted',
+    )
+  })
+})
+
 describe('SandboxManager.checkDependenciesAsync', () => {
   test('returns a Promise and matches the sync result (POSIX)', async () => {
     platformSpy.mockReturnValue('linux')
@@ -78,5 +121,33 @@ describe('SandboxManager.checkDependenciesAsync', () => {
     })
 
     expect(result.errors).toContain('ripgrep (custom-rg) not found')
+  })
+
+  test('linux: honours explicit seccompConfig.applyPath in async check', async () => {
+    platformSpy.mockReturnValue('linux')
+    whichSpy.mockImplementation((bin: string) => `/usr/bin/${bin}`)
+    const applyAsyncSpy = spyOn(
+      seccomp,
+      'getApplySeccompBinaryPathAsync',
+    ).mockResolvedValue('/custom/apply-seccomp')
+    const applySyncSpy = spyOn(
+      seccomp,
+      'getApplySeccompBinaryPath',
+    ).mockImplementation((path?: string) =>
+      path === '/custom/apply-seccomp' ? '/custom/apply-seccomp' : null,
+    )
+
+    try {
+      const result = await SandboxManager.checkDependenciesAsync(undefined, {
+        applyPath: '/custom/apply-seccomp',
+      })
+      expect(applyAsyncSpy).toHaveBeenCalledWith('/custom/apply-seccomp')
+      expect(result.warnings).not.toContain(
+        'seccomp not available - unix socket access not restricted',
+      )
+    } finally {
+      applyAsyncSpy.mockRestore()
+      applySyncSpy.mockRestore()
+    }
   })
 })
