@@ -318,6 +318,32 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     expect([...unlistable]).toEqual([])
   })
 
+  it('denies nothing for a link out of the tree when the pattern cannot be read a name at a time', () => {
+    // `id[*].pem` cannot be followed one path component at a time, so no
+    // directory is listed through a symlink, and what such a pattern would
+    // match through one goes undenied: a known gap. Denying whole what every
+    // link out of the tree leads to is no cure: with vendor/sdk/conf -> /usr
+    // that masks /usr, and no command starts.
+    const unsplit = caseRoot('unsplit')
+    mkdirSync(join(unsplit, 'proj', 'vendor', 'sdk'), { recursive: true })
+    mkdirSync(join(unsplit, 'outside'))
+    writeFileSync(join(unsplit, 'outside', 'x'), '')
+    symlinkSync(
+      join(unsplit, 'outside'),
+      join(unsplit, 'proj', 'vendor', 'sdk', 'conf'),
+    )
+
+    const unlistable = new Set<string>()
+    const mounts = expandReadDenyGlobLinux(
+      join(unsplit, 'proj', 'id[*].pem'),
+      [],
+      unlistable,
+    )
+
+    expect(mounts).toEqual([])
+    expect([...unlistable]).toEqual([])
+  })
+
   it('lists every match where it really is when the base is a symlink', () => {
     // alias -> ROOT, sideways: normalizePathForSandbox keeps the link
     // spelling for the pattern, so every match is spelled through it. The
