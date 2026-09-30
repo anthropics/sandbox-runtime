@@ -509,6 +509,8 @@ async function main(): Promise<void> {
           // we keep the existing shell-string path.
           if (process.platform === 'win32') {
             // env carries the proxy vars the sandboxed child must inherit.
+            // No inheritsStdio here: it only drives the macOS terminal grant,
+            // and this branch is Windows-only.
             const { argv, env } =
               await SandboxManager.wrapWithSandboxArgv(command)
             // No slot to displace: libuv passes only the stdio array's
@@ -521,8 +523,13 @@ async function main(): Promise<void> {
               env,
             })
           } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
+            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+              command,
+              undefined,
+              undefined,
+              undefined,
+              { inheritsStdio: true },
+            )
             child = spawn(sandboxedCommand, {
               shell: true,
               stdio: sandboxedStdio(controlFd),
