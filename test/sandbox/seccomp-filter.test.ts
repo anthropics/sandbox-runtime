@@ -87,7 +87,7 @@ describe.if(isLinux)('Sandbox Integration', () => {
       seccompConfig: { applyPath: real },
     })
 
-    expect(wrappedCommand).toContain(real)
+    expect(wrappedCommand).toContain(real!)
   })
 
   it('argv0 mode: builds ARGV0 prefix and uses applyPath verbatim', async () => {
