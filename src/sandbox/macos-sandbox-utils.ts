@@ -50,6 +50,8 @@ export interface MacOSSandboxParams {
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  allowIokitRegistryEntryClass?: string[]
+  allowIokitUserClientClass?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   /** Environment variable names to unset for the sandboxed child (env -u) */
@@ -942,6 +944,8 @@ function generateSandboxProfile({
   allowAllUnixSockets,
   allowLocalBinding,
   allowMachLookup,
+  allowIokitRegistryEntryClass,
+  allowIokitUserClientClass,
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
@@ -959,6 +963,8 @@ function generateSandboxProfile({
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  allowIokitRegistryEntryClass?: string[]
+  allowIokitUserClientClass?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
@@ -1041,6 +1047,16 @@ function generateSandboxProfile({
     '  (iokit-registry-entry-class "IOSurfaceRootUserClient")',
     '  (iokit-registry-entry-class "RootDomainUserClient")',
     '  (iokit-user-client-class "IOSurfaceSendRight")',
+    ...(allowIokitRegistryEntryClass && allowIokitRegistryEntryClass.length > 0
+      ? allowIokitRegistryEntryClass.map(
+          cls => `  (iokit-registry-entry-class ${escapePath(cls)})`,
+        )
+      : []),
+    ...(allowIokitUserClientClass && allowIokitUserClientClass.length > 0
+      ? allowIokitUserClientClass.map(
+          cls => `  (iokit-user-client-class ${escapePath(cls)})`,
+        )
+      : []),
     ')',
     '',
     '; IOKit properties',
@@ -1309,6 +1325,8 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    allowIokitRegistryEntryClass,
+    allowIokitUserClientClass,
     readConfig,
     writeConfig,
     unsetEnvVars,
@@ -1383,6 +1401,8 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    allowIokitRegistryEntryClass,
+    allowIokitUserClientClass,
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,
