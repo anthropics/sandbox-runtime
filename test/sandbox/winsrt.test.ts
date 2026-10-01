@@ -2332,7 +2332,8 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
         ` require('https').get({host:'example.com',path:'/',socket:sock,agent:false},`,
         `  r=>{console.log('STATUS:'+r.statusCode);process.exit(r.statusCode===200?0:1)})`,
         ` .on('error',e=>{console.error('TLS:'+(e.code||e.message));process.exit(2)})`,
-        `}).on('error',e=>{console.error('CONN:'+(e.code||e.message));process.exit(3)}).end()`,
+        // Every address tried, not only the first error: `localhost` is two.
+        `}).on('error',e=>{console.error('CONN:'+(e.code||e.message)+' '+(e.errors||[e]).map(x=>x.code+'@'+x.address+':'+x.port).join(','));process.exit(3)}).end()`,
       ].join('')
       const r = await runSandboxedUntil(
         `"${NODE}" -e "${script}"`,
