@@ -44,12 +44,14 @@ const jarPathCache = new Map<string, string | null>()
  */
 export async function getJavaProxyAgentJarPathAsync(
   explicitPath?: string,
+  searchPath?: string,
 ): Promise<string | null> {
   const key = explicitPath ?? ''
   const cached = jarPathCache.get(key)
   if (cached !== undefined) return cached
   const found =
-    findLocalJar(explicitPath) ?? findGlobalJar(await getGlobalNpmPathsAsync())
+    findLocalJar(explicitPath) ??
+    findGlobalJar(await getGlobalNpmPathsAsync(searchPath))
   jarPathCache.set(key, found)
   return found
 }

@@ -59,7 +59,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
   // The one rendered shape: the profile's path, then the options left before
   // and the words left after `--args 9`.
   const VIA_ARGS_FILE =
-    /^\/bin\/sh -c 'exec 9<"\$1" && shift && exec "\$@"' srt-args (\S+) bwrap (.*?) ?--args 9 (.*)$/s
+    /^\/bin\/sh -c 'exec 9<"\$1" && shift && exec "\$@"' srt-args (\S+) \/\S*\/bwrap (.*?) ?--args 9 (.*)$/s
   const MODULE = join(
     import.meta.dir,
     '../../src/sandbox/linux-sandbox-utils.ts',

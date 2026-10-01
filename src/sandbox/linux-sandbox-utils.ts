@@ -1,6 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
-import { whichSync } from '../utils/which.js'
+import { isPathQualified, whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
@@ -9,6 +9,11 @@ import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
+import {
+  describeUnavailableHostHelper,
+  findHostHelper,
+  writableNamedHelperWarning,
+} from './host-helpers.js'
 import {
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
@@ -88,9 +93,9 @@ export interface LinuxSandboxParams {
   gitSafeDirectories?: readonly string[]
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
-  /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
+  /** Absolute path to bwrap (default: "bwrap" as `findHostHelper` finds it) */
   bwrapPath?: string
-  /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
+  /** Absolute path to the socat binary (default: "socat", found likewise) */
   socatPath?: string
   /** Filesystem unix socket bound by the Linux violation monitor. When set,
    *  the socket is bind-mounted into the sandbox and apply-seccomp is told
@@ -841,11 +846,21 @@ export type LinuxSandboxProfileErrorCode =
   | 'args_file_unavailable'
   /** The line does not fit one shell argument even with the mounts in a file. */
   | 'command_too_long'
+  /**
+   * A program this library runs on the host (bubblewrap, socat, ripgrep) has
+   * no copy on PATH outside the paths the command may write. The message
+   * names each copy passed over and why, and `.cause` holds the same:
+   * `{ helper, skipped: { path, reason, writePath? }[] }`. Lifted by such a
+   * copy on PATH, or by naming the helper (`bwrapPath`, `socatPath`,
+   * `ripgrep.command`).
+   */
+  | 'host_helper_unavailable'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
  * configuration expands to is past a limit, or, for `command_too_long` and
- * `nul_in_path`, what the caller passed in is. The command was not run and no
+ * `nul_in_path`, what the caller passed in is, or (`host_helper_unavailable`)
+ * a program the wrap runs is not to be had. The command was not run and no
  * profile file stays open, so do not run the per-command cleanup
  * (`cleanupAfterCommand()`, `cleanupBwrapMountPoints()`) for a wrap that
  * threw: it would release a second time, and a sandbox still running would
@@ -874,6 +889,40 @@ export class LinuxSandboxProfileError extends Error {
         enumerable: false,
       })
     }
+  }
+}
+
+/**
+ * The absolute path `findHostHelper` gives for `helper`. Throws the typed
+ * refusal when there is none, never going on under the bare name.
+ */
+function requireHostHelper(
+  helper: string,
+  allowedWritePaths: readonly string[] | undefined,
+): string {
+  const search = findHostHelper(helper, allowedWritePaths)
+  if (search.path === null) {
+    throw new LinuxSandboxProfileError(
+      'host_helper_unavailable',
+      describeUnavailableHostHelper(helper, search),
+      { helper, skipped: search.skipped },
+    )
+  }
+  return search.path
+}
+
+/**
+ * `ripgrepConfig` for the scan, which runs on the host: a bare `command`
+ * becomes where `requireHostHelper` finds it, a path is run as given.
+ */
+function hostRipgrepConfig(
+  ripgrepConfig: RipgrepConfig,
+  allowedWritePaths: readonly string[] | undefined,
+): RipgrepConfig {
+  if (isPathQualified(ripgrepConfig.command)) return ripgrepConfig
+  return {
+    ...ripgrepConfig,
+    command: requireHostHelper(ripgrepConfig.command, allowedWritePaths),
   }
 }
 
@@ -1106,6 +1155,12 @@ export type LinuxDependencyOptions = {
   seccompConfig?: SeccompConfig
   bwrapPath?: string
   socatPath?: string
+  /**
+   * What the sandboxed command may write (a wrap's `writeConfig.allowOnly`):
+   * bwrap and socat are looked for on PATH outside it, as the wrap does, and
+   * an explicit path inside it is warned about. Omitted: nothing restricted.
+   */
+  allowedWritePaths?: readonly string[]
 }
 
 function isExecutable(p: string): boolean {
@@ -1123,12 +1178,14 @@ function isExecutable(p: string): boolean {
 export function getLinuxDependencyStatus(
   opts?: LinuxDependencyOptions,
 ): LinuxDependencyStatus {
-  const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
+  const { seccompConfig, bwrapPath, socatPath, allowedWritePaths } = opts ?? {}
+  const onPath = (helper: string): boolean =>
+    findHostHelper(helper, allowedWritePaths).path !== null
   // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
   // the on-disk lookup and trust that applyPath resolves inside bwrap.
   return {
-    hasBwrap: bwrapPath ? isExecutable(bwrapPath) : whichSync('bwrap') !== null,
-    hasSocat: socatPath ? isExecutable(socatPath) : whichSync('socat') !== null,
+    hasBwrap: bwrapPath ? isExecutable(bwrapPath) : onPath('bwrap'),
+    hasSocat: socatPath ? isExecutable(socatPath) : onPath('socat'),
     hasSeccompApply: seccompConfig?.argv0
       ? true
       : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
@@ -1141,9 +1198,25 @@ export function getLinuxDependencyStatus(
 export function checkLinuxDependencies(
   opts?: LinuxDependencyOptions,
 ): SandboxDependencyCheck {
-  const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
+  const { seccompConfig, bwrapPath, socatPath, allowedWritePaths } = opts ?? {}
   const errors: string[] = []
   const warnings: string[] = []
+
+  // Found as the wrap will find it (see `findHostHelper`). A copy passed over
+  // is named, so the caller learns at start-up that it will not be run.
+  // INVARIANT: `notInstalled` is said of a helper that is nowhere on PATH and
+  // of nothing else, in the same words as ever: embedders match on them.
+  const onPath = (helper: string, notInstalled: string): string | null => {
+    const search = findHostHelper(helper, allowedWritePaths)
+    if (search.path === null) {
+      errors.push(
+        search.skipped.length > 0
+          ? describeUnavailableHostHelper(helper, search)
+          : notInstalled,
+      )
+    }
+    return search.path
+  }
 
   // An explicit override is a directive, not a hint — if it doesn't exist,
   // surface that rather than silently falling back to PATH.
@@ -1152,15 +1225,14 @@ export function checkLinuxDependencies(
     if (isExecutable(bwrapPath)) usableBwrap = bwrapPath
     else errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
   } else {
-    usableBwrap = whichSync('bwrap')
-    if (usableBwrap === null) errors.push('bubblewrap (bwrap) not installed')
+    usableBwrap = onPath('bwrap', 'bubblewrap (bwrap) not installed')
   }
 
   if (socatPath) {
     if (!isExecutable(socatPath))
       errors.push(`socat not executable at ${socatPath}`)
-  } else if (whichSync('socat') === null) {
-    errors.push('socat not installed')
+  } else {
+    onPath('socat', 'socat not installed')
   }
 
   if (
@@ -1168,6 +1240,16 @@ export function checkLinuxDependencies(
     getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
   ) {
     warnings.push('seccomp not available - unix socket access not restricted')
+  }
+
+  // A directive is followed wherever it points; a writable one is reported.
+  for (const [option, file] of [
+    ['bwrapPath', bwrapPath],
+    ['socatPath', socatPath],
+    ['seccomp.applyPath', seccompConfig?.applyPath],
+  ] as const) {
+    const warning = writableNamedHelperWarning(option, file, allowedWritePaths)
+    if (warning !== undefined) warnings.push(warning)
   }
 
   const uid0Error = uid0SandboxError({
@@ -1213,11 +1295,14 @@ export function uid0SandboxError({
 const uid0UserNamespaceProbes = new Map<string, string | null>()
 
 /**
- * Run `bwrap --unshare-user --dev-bind / / true` once and report whether this
+ * Run bwrap under `--unshare-user --dev-bind / /` once and report whether this
  * kernel actually refuses to map uid 0. `null` means it does not, so there is
  * nothing to report; otherwise bubblewrap's own first stderr line, or the
  * empty string when the probe could not be run at all and the prediction
  * stands unaided.
+ *
+ * The command run inside is bubblewrap's own `--version`, by its path: a bare
+ * name is looked up on PATH, and this runs as uid 0 with everything writable.
  */
 function probeUid0UserNamespace(bwrap: string): string | null {
   const cached = uid0UserNamespaceProbes.get(bwrap)
@@ -1225,7 +1310,7 @@ function probeUid0UserNamespace(bwrap: string): string | null {
 
   const probe = spawnSync(
     bwrap,
-    ['--unshare-user', '--dev-bind', '/', '/', 'true'],
+    ['--unshare-user', '--dev-bind', '/', '/', bwrap, '--version'],
     {
       timeout: 5000,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -1274,8 +1359,11 @@ export async function initializeLinuxNetworkBridge(
   httpProxyPort: number,
   socksProxyPort: number,
   socatPath?: string,
+  /** What the sandboxed command may write (see `findHostHelper`). */
+  allowedWritePaths?: readonly string[],
 ): Promise<LinuxNetworkBridgeContext> {
-  const socat = socatPath ?? 'socat'
+  // The bridges run on the host for as long as the sandbox is up.
+  const socat = socatPath ?? requireHostHelper('socat', allowedWritePaths)
   const socketId = randomBytes(8).toString('hex')
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
   // Only allocated when ports differ; in the mux case the SOCKS side
@@ -1457,14 +1545,15 @@ function buildSandboxCommand(
   socksSocketPath: string,
   userCommand: string,
   applySeccompPrefix: string | undefined,
-  shell?: string,
-  socatPath?: string,
+  shell: string | undefined,
+  socatPath: string,
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
-  // Host filesystem is bind-mounted into the sandbox, so an explicit
-  // socatPath resolves to the same binary inside bwrap.
-  const socat = quote([socatPath ?? 'socat'])
+  // Host filesystem is bind-mounted into the sandbox, so socat's host path
+  // names the same binary inside bwrap. Never the bare name: these listeners
+  // start before the seccomp filter is applied.
+  const socat = quote([socatPath])
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
@@ -2216,7 +2305,7 @@ async function generateFilesystemArgs(
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
       ...(await linuxGetMandatoryDenyPaths(
-        ripgrepConfig,
+        hostRipgrepConfig(ripgrepConfig, writeConfig.allowOnly),
         mandatoryDenySearchDepth,
         allowGitConfig,
         abortSignal,
@@ -3125,6 +3214,11 @@ export async function wrapCommandWithSandboxLinux(
   let applySeccompPrefix: string | undefined
 
   try {
+    // Found before anything else is done: a wrap that must refuse for want of
+    // it has then scanned nothing and recorded no mount point.
+    const bwrapBinary =
+      bwrapPath ?? requireHostHelper('bwrap', writeConfig?.allowOnly)
+
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
@@ -3354,6 +3448,8 @@ export async function wrapCommandWithSandboxLinux(
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
     // Resolve the full path to the shell binary since bwrap doesn't use $PATH
+    // The shell runs inside the sandbox, so the plain search over the whole
+    // PATH is right for it, writable entries included.
     const shellName = binShell || 'bash'
     const shell = whichSync(shellName)
     if (!shell) {
@@ -3371,7 +3467,7 @@ export async function wrapCommandWithSandboxLinux(
         command,
         applySeccompPrefix,
         shell,
-        socatPath,
+        socatPath ?? requireHostHelper('socat', writeConfig?.allowOnly),
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
@@ -3381,11 +3477,7 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = renderBwrapInvocation(
-      bwrapPath ?? 'bwrap',
-      bwrapArgs,
-      mounts,
-    )
+    const wrappedCommand = renderBwrapInvocation(bwrapBinary, bwrapArgs, mounts)
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')

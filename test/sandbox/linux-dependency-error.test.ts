@@ -124,6 +124,25 @@ describe('checkLinuxDependencies', () => {
     },
   )
 
+  // Nothing is looked up by name on the way.
+  test.if(process.geteuid !== undefined)(
+    'a uid-0 probe of an explicit bwrapPath runs that binary outside and inside',
+    () => {
+      euidSpy?.mockReturnValue(0)
+
+      const result = checkLinuxDependencies({ bwrapPath: '/bin/sh' })
+
+      expect(
+        spawnSyncSpy.mock.calls.map((call: unknown[]) => [
+          call[0],
+          ...(call[1] as string[]).slice(-2),
+        ]),
+      ).toEqual(lacksSetfcap ? [['/bin/sh', '/bin/sh', '--version']] : [])
+      expect(result.errors).toEqual([])
+      expect(whichSpy).not.toHaveBeenCalledWith('bwrap')
+    },
+  )
+
   test('a missing bwrap is blamed on the binary, not on capabilities', () => {
     euidSpy?.mockReturnValue(0)
     whichSpy.mockImplementation((bin: string) =>
@@ -198,12 +217,15 @@ describe('uid0SandboxError', () => {
         bwrap: '/usr/bin/bwrap-refuses',
       }),
     ).toBe(`${CAP_SETFCAP_MISSING_MESSAGE} (bubblewrap: ${REFUSAL})`)
+    // The command inside is the same bubblewrap by its path, never a bare name.
+    expect(spawnSyncSpy.mock.calls[0]?.[0]).toBe('/usr/bin/bwrap-refuses')
     expect(spawnSyncSpy.mock.calls[0]?.[1]).toEqual([
       '--unshare-user',
       '--dev-bind',
       '/',
       '/',
-      'true',
+      '/usr/bin/bwrap-refuses',
+      '--version',
     ])
   })
 
