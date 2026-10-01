@@ -7,7 +7,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
-import { ripGrep } from '../utils/ripgrep.js'
+import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   generateProxyEnvVars,
@@ -74,7 +74,7 @@ export interface LinuxSandboxParams {
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
-  ripgrepConfig?: { command: string; args?: string[] }
+  ripgrepConfig?: RipgrepConfig
   /** Maximum directory depth to search for dangerous files (default: 3) */
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
@@ -232,7 +232,7 @@ function hasFileAncestor(targetPath: string): boolean {
     const nextPath = currentPath + path.sep + part
     try {
       const stat = fs.statSync(nextPath)
-      if (stat.isFile() || stat.isSymbolicLink()) {
+      if (stat.isFile()) {
         // This component exists as a file — nothing below it can be created
         return true
       }
@@ -318,12 +318,75 @@ export function linuxGetCwdMandatoryDenyPaths(
 }
 
 /**
+ * The directories below `cwd`, down to `maxDepth`, that ripgrep said it could
+ * not read, that this process cannot read either, and whose mode is this
+ * user's to change. What is in one is not known, so the caller denies it whole.
+ * Exported for testing.
+ */
+export function unreadableDirectories(
+  stderr: string,
+  cwd: string,
+  maxDepth: number,
+): string[] {
+  const found: string[] = []
+  const tried = new Set<string>()
+  for (const line of stderr.split('\n')) {
+    // How a message is worded depends on ripgrep's version and on how many
+    // threads it has, so what stands before each ": " is tried.
+    const said = line.startsWith('rg: ') ? line.slice(4) : line
+    for (
+      let cut = said.indexOf(': ');
+      cut !== -1;
+      cut = said.indexOf(': ', cut + 1)
+    ) {
+      for (
+        let dir = path.resolve(cwd, said.slice(0, cut));
+        dir.startsWith(cwd + path.sep) && !tried.has(dir);
+        dir = path.dirname(dir)
+      ) {
+        tried.add(dir)
+        try {
+          // THREAT: the text is only a hint. A name can hold a newline and a
+          // whole message of its own, and a bind of `link/x` would bring what
+          // the link leads to INTO the sandbox. So: a directory, with no link
+          // on the way to it, that cannot be read from here. And this user's:
+          // nobody else's mode can be given back from inside, and there can
+          // be thousands of those (`/home`), each of them a mount.
+          const stat = fs.lstatSync(dir)
+          if (
+            !stat.isDirectory() ||
+            stat.uid !== process.getuid?.() ||
+            fs.realpathSync(dir) !== dir
+          ) {
+            break
+          }
+        } catch (error) {
+          // What cannot be looked at, because what holds it cannot be
+          // searched, is stood in for by the directory above it.
+          if ((error as NodeJS.ErrnoException).code === 'EACCES') continue
+          break
+        }
+        try {
+          fs.accessSync(dir, fs.constants.R_OK | fs.constants.X_OK)
+        } catch {
+          if (path.relative(cwd, dir).split(path.sep).length <= maxDepth) {
+            found.push(dir)
+          }
+        }
+        break
+      }
+    }
+  }
+  return found
+}
+
+/**
  * Get mandatory deny paths using ripgrep (Linux only).
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
  * With --max-depth limiting, this is fast enough to run on each command without memoization.
  */
 async function linuxGetMandatoryDenyPaths(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  ripgrepConfig: RipgrepConfig = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
@@ -344,8 +407,9 @@ async function linuxGetMandatoryDenyPaths(
   for (const dirName of dangerousDirectories) {
     iglobArgs.push('--iglob', `**/${dirName}/**`)
   }
-  // Git hooks always blocked in nested repos
-  iglobArgs.push('--iglob', '**/.git/hooks/**')
+  // Git hooks always blocked in nested repos. A repository is known by its
+  // HEAD, so that its hooks are denied before there are any.
+  iglobArgs.push('--iglob', '**/.git/hooks/**', '--iglob', '**/.git/HEAD')
 
   // Git config conditionally blocked in nested repos
   if (!allowGitConfig) {
@@ -355,14 +419,26 @@ async function linuxGetMandatoryDenyPaths(
   // Single ripgrep call to find all dangerous paths in subdirectories
   // Limit depth for performance - deeply nested dangerous files are rare
   // and the security benefit doesn't justify the traversal cost
+  //
+  // ripgrep lists files, and its depth is the file's. `sub/.vscode/x` and
+  // `sub/.git/config` lie at `maxDepth`; `sub/.git/hooks/pre-commit`, of the
+  // same directory, one level further down.
   let matches: string[] = []
   try {
     matches = await ripGrep(
       [
         '--files',
         '--hidden',
+        // INVARIANT: no file decides what is listed. An ignore file that names
+        // a directory hides all beneath it, and a configuration file can add
+        // any flag; both are files in or above the tree.
+        '--no-ignore',
+        '--no-config',
+        // Into a pipe ripgrep writes by the block, and killed it drops the
+        // block: it would have listed nothing.
+        '--line-buffered',
         '--max-depth',
-        String(maxDepth),
+        String(maxDepth + 1),
         ...iglobArgs,
         '-g',
         '!**/node_modules/**',
@@ -372,42 +448,57 @@ async function linuxGetMandatoryDenyPaths(
       ripgrepConfig,
     )
   } catch (error) {
-    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`)
+    // Stopped, it found nothing: the caller must not be handed a command
+    // without the denies it would have found.
+    signal.throwIfAborted()
+    // INVARIANT: what ripgrep listed counts, however it ended. It exits 2 if
+    // there was a directory it could not read, having listed the rest, and is
+    // killed after ten seconds. What it had not come to by then is not denied.
+    if (error instanceof RipgrepError) {
+      matches = error.listed
+      // A read-only bind also keeps the command from giving the mode back.
+      denyPaths.push(...unreadableDirectories(error.stderr, cwd, maxDepth))
+    }
+    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`, {
+      level: 'warn',
+    })
   }
 
-  // Process matches
+  // The names a match can lie under, by path component.
+  const directoryNames = [
+    ...dangerousDirectories,
+    '.git/hooks',
+    '.git/config',
+    '.git/HEAD',
+  ].map(name => normalizeCaseForComparison(name).split('/'))
   for (const match of matches) {
-    const absolutePath = path.resolve(cwd, match)
-
-    // File inside a dangerous directory -> add the directory path
-    let foundDir = false
-    for (const dirName of [...dangerousDirectories, '.git']) {
-      const normalizedDirName = normalizeCaseForComparison(dirName)
-      const segments = absolutePath.split(path.sep)
-      const dirIndex = segments.findIndex(
-        s => normalizeCaseForComparison(s) === normalizedDirName,
-      )
-      if (dirIndex !== -1) {
-        // For .git, we want hooks/ or config, not the whole .git dir
-        if (dirName === '.git') {
-          const gitDir = segments.slice(0, dirIndex + 1).join(path.sep)
-          if (match.includes('.git/hooks')) {
-            denyPaths.push(path.join(gitDir, 'hooks'))
-          } else if (match.includes('.git/config')) {
-            denyPaths.push(path.join(gitDir, 'config'))
-          }
-        } else {
-          denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
+    const segments = path
+      .relative(cwd, path.resolve(cwd, match))
+      .split(path.sep)
+    const lower = segments.map(normalizeCaseForComparison)
+    // Where the dangerous name begins and how long it is: the first of
+    // `directoryNames` on the way down, else the file itself.
+    let at = segments.length - 1
+    let length = 1
+    // How deep the directory holding the name, `at`, may lie. One level less
+    // for `directoryNames`, all alike: each costs mounts that keep what holds
+    // it from being renamed or removed, and bwrap's start grows with them.
+    let deepest = maxDepth - 1
+    search: for (let i = 0; i < lower.length; i++) {
+      for (const name of directoryNames) {
+        if (name.every((component, k) => lower[i + k] === component)) {
+          at = i
+          length = name.length
+          deepest = maxDepth - 2
+          break search
         }
-        foundDir = true
-        break
       }
     }
-
-    // Dangerous file match
-    if (!foundDir) {
-      denyPaths.push(absolutePath)
-    }
+    if (at > deepest) continue
+    const found = segments.slice(0, at + length)
+    if (lower[at] === '.git' && lower[at + 1] === 'head')
+      found[at + 1] = 'hooks'
+    denyPaths.push(path.join(cwd, ...found))
   }
 
   return [...new Set(denyPaths)]
@@ -1377,7 +1468,12 @@ function buildSandboxCommand(
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    'trap "kill %1 %2 2>/dev/null; exit" EXIT',
+    // The trap saves the status the script is exiting with and exits with
+    // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
+    // keep the script's status, zsh takes the status of the trap's own last
+    // command (the kill), so under zsh a failing command reported 0. Single
+    // quotes, so $? and $rc are read when the trap runs, not when it is set.
+    "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
@@ -1648,7 +1744,7 @@ async function generateFilesystemArgs(
   writeConfig: FsWriteRestrictionConfig | undefined,
   maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
   maskedFileStoreDir: string | undefined,
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  ripgrepConfig: RipgrepConfig = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
@@ -2201,41 +2297,11 @@ async function generateFilesystemArgs(
     // exception: it contains every allowed write path, so
     // coveredBySafeReadOnlyDenyDir judges a vetoed '/' against the candidate
     // instead — see the branch there.
-    // Containment is root-aware
-    // (isAtOrUnder): '/' is a recordable covering directory when allowOnly
-    // and denyWithinAllow both name it, and '/' + '/' is a prefix of
-    // nothing, so a string-prefix test would judge it safe for every path
-    // and drop the binds the re-application passes below key off.
-    // Rationale: nothing host-backed and writable lands after the buffered
-    // read-only binds, so no later mount re-opens what a covering bind
-    // closed. What does land after them is a read-only restore of a write
-    // path inside a dropped deny bind, a re-applied tmpfs (whose contents
-    // never reach the host) with its restores read-only, a re-applied file
-    // mask, and the read-only bind of the fake-file store. (The ancestor
-    // pins and their covers are spliced in BEFORE the buffered deny binds,
-    // so neither is ever a writable emission on top of one; under a '/'
-    // write root a cover adds no access that root's own --bind / / had not
-    // already given. A buried pin survives a later mount that shadows it,
-    // but not one AT '/': that one the pivot promotes, and protection there
-    // is the deny's own EROFS. The caller adds --dev /dev after this
-    // function returns, and --bind /proc /proc under the weaker nested
-    // mode; neither is a deny path's subtree.) So the covering bind is the
-    // last word on its subtree unless a tmpfs ABOVE it drops that bind at
-    // emission as hidden-by-a-tmpfs and restores an allowed path around it:
-    // veto (ii). A tmpfs at or beneath the dir is NOT a veto: a path created
-    // inside a tmpfs never reaches the host, so a deny path beneath it needs
-    // no stub, and one elsewhere under the dir is unaffected by it. (The
-    // emission filter's
-    // other drop condition, fileMasks, holds file dests only — /dev/null
-    // read-deny masks and credential-mask fakes — while the pre-pass stat-verifies every
-    // recorded dir as a directory, so it cannot drop a recorded dir short of
-    // a dir→file race, which ends in bwrap refusing to start, not a silent
-    // gap.) Only existing read-deny directories become a tmpfs: absent and
-    // file-level read-denies count for nothing. If either condition could
-    // apply, keep the stub — the pre-existing abort is preferable to a
-    // silently creatable deny path. (An allow path bound before the
-    // denyWrite binds is not a vector by itself: the later read-only re-bind
-    // lands on top of it.)
+    // The skip rests on the emission order: nothing host-backed and writable
+    // lands after the buffered read-only binds, so a covering bind is the
+    // last word on its subtree unless a tmpfs above it drops that bind at
+    // emission. Where a veto could apply, keep the stub: the pre-existing
+    // abort is preferable to a silently creatable deny path.
     const coveringDirUnsafeVerdicts = new Map<string, boolean>()
     const coveringDirIsUnsafe = (denyDir: string): boolean => {
       const cached = coveringDirUnsafeVerdicts.get(denyDir)
@@ -2439,11 +2505,14 @@ async function generateFilesystemArgs(
       // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
       // remove them after the command exits.
       if (!fs.existsSync(normalizedPath)) {
-        // Fix 1 (worktree): If any existing component in the deny path is a
-        // file (not a directory), skip the deny entirely. You can't mkdir
+        // Fix 1 (worktree): If any existing component above the deny path is
+        // a file (not a directory), skip the deny entirely. You can't mkdir
         // under a file, so the deny path can never be created. This handles
-        // git worktrees where .git is a file.
-        if (hasFileAncestor(normalizedPath)) {
+        // git worktrees where .git is a file. Asked of what lies above the
+        // path, not of the path: another sandbox's bubblewrap may have made a
+        // mount point at it since the look above, and a file there is no
+        // reason to leave it unbound.
+        if (hasFileAncestor(path.dirname(normalizedPath))) {
           logForDebugging(
             `[Sandbox Linux] Skipping deny path with file ancestor (cannot create paths under a file): ${normalizedPath}`,
           )
@@ -2943,18 +3012,8 @@ async function generateFilesystemArgs(
  * This implementation uses a custom apply-seccomp binary to block Unix domain socket
  * creation for user commands while allowing network infrastructure:
  *
- * Stage 1: Outer bwrap - Network and filesystem isolation (NO seccomp)
- *   - Bubblewrap starts with isolated network namespace (--unshare-net)
- *   - Bubblewrap applies PID namespace isolation (--unshare-pid and --proc)
- *   - Filesystem restrictions are applied (read-only mounts, bind mounts, etc.)
- *   - Socat processes start and connect to Unix socket bridges (can use socket(AF_UNIX, ...))
- *
- * Stage 2: apply-seccomp - Nested PID namespace + seccomp filter
- *   - apply-seccomp creates a nested user+PID+mount namespace and remounts /proc
- *   - Inside, apply-seccomp becomes PID 1 (non-dumpable init/reaper)
- *   - Forks, sets PR_SET_NO_NEW_PRIVS, applies seccomp via prctl(PR_SET_SECCOMP)
- *   - Execs user command with seccomp active (cannot create new Unix sockets)
- *   - User command cannot see or ptrace bwrap/bash/socat (separate PID namespace)
+ * The two stages are described in README.md, "Unix Socket Restrictions
+ * (Linux)".
  *
  * This solves the conflict between:
  * - Security: Blocking arbitrary Unix socket creation in user commands

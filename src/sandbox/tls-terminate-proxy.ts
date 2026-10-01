@@ -10,10 +10,11 @@
  */
 
 import {
+  Agent as HttpsAgent,
   createServer as createHttpsServer,
   request as httpsRequest,
 } from 'node:https'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
 import { connect } from 'node:net'
 import type { LookupFunction } from 'node:net'
 import { checkServerIdentity } from 'node:tls'
@@ -174,8 +175,9 @@ export type TerminateTarget = {
 
 /**
  * Terminate the client's TLS on `socket`, parse the decrypted HTTP/1.1
- * stream, and forward each request to `target` over a fresh upstream TLS
- * connection.
+ * stream, and forward each request to `target` over an upstream TLS
+ * connection kept alive for the life of the client's connection (see
+ * {@link createUpstreamLeg}).
  *
  * Preconditions: the caller has already validated `target` against the
  * domain allowlist; this function does not re-check it.
@@ -216,6 +218,8 @@ export function terminateAndForward(
     },
   })
 
+  const leg = createUpstreamLeg(target)
+
   inner.on('request', (req, res) => {
     // A client abort mid-request destroys req/res with an error; with no
     // listener it escapes as an uncaughtException (the runtime emits it
@@ -237,6 +241,7 @@ export function terminateAndForward(
       req,
       res,
       target,
+      leg,
       planSigv4,
       maxSigv4BodyBytes,
     )
@@ -269,6 +274,7 @@ export function terminateAndForward(
   const sockPath = innerSocketPath()
   const cleanup = () => {
     inner.close()
+    leg.agent.destroy()
     unlink(sockPath, () => {})
   }
   inner.on('error', err => {
@@ -306,6 +312,79 @@ export function terminateAndForward(
 }
 
 /**
+ * The upstream leg of one client connection: a keep-alive agent capped at one
+ * socket, and the vetted upstream address.
+ *
+ * One agent per client connection rather than a shared pool, so requests from
+ * different client connections never share an upstream socket, and the
+ * upstream connection lives exactly as long as the client's. One socket keeps
+ * the client's request order on the wire: a pipelined request queues in the
+ * agent until the previous response has finished.
+ *
+ * `ca` and `checkServerIdentity` are agent options, not request options — a
+ * per-request `checkServerIdentity` makes Node open a new socket for every
+ * request. The target is fixed for the connection, so nothing is lost.
+ *
+ * The address is vetted once (see directRequestOptions) and then reused: a
+ * second probe could pick a different record of a multi-address name, which
+ * is a different agent key and so a new socket. A redial after the upstream
+ * closes an idle socket goes to the same vetted literal. Any upstream failure
+ * forgets the address, so the next request vets again.
+ */
+type UpstreamLeg = {
+  agent: HttpsAgent
+  address(): Promise<DirectRequestOptions>
+  forgetAddress(): void
+}
+
+function createUpstreamLeg(target: TerminateTarget): UpstreamLeg {
+  const agent = new HttpsAgent({
+    keepAlive: true,
+    maxSockets: 1,
+    // We're a TLS-terminating proxy, not a trust boundary for the upstream
+    // server's identity — the runtime verifies it normally (system roots and
+    // NODE_EXTRA_CA_CERTS). Pin the identity to the tunnel's target so the
+    // check does not depend on how a runtime derives it from the Host header
+    // (some verify against `Host` verbatim, so a non-default port would
+    // never match a SAN); `servername` still carries the name for SNI.
+    checkServerIdentity: (_host, cert) =>
+      checkServerIdentity(target.hostname, cert),
+    ...(target.upstreamCA ? { ca: target.upstreamCA } : {}),
+  })
+  let vetted: Promise<DirectRequestOptions> | undefined
+  return {
+    agent,
+    address() {
+      if (!vetted) {
+        const probe = directRequestOptions(
+          target.hostname,
+          target.port,
+          target.lookup,
+          true,
+        )
+        vetted = probe
+        probe.catch(() => {
+          if (vetted === probe) vetted = undefined
+        })
+      }
+      return vetted
+    },
+    forgetAddress() {
+      vetted = undefined
+    },
+  }
+}
+
+/**
+ * True for the failure a reused keep-alive socket produces when the upstream
+ * closed it while the request was on its way.
+ */
+function isStaleSocketError(err: Error): boolean {
+  const code = (err as NodeJS.ErrnoException).code
+  return code === 'ECONNRESET' || code === 'EPIPE'
+}
+
+/**
  * Destroy a denied client's request only after the 403 has flushed —
  * destroying the shared socket in the same tick can RST the response away.
  */
@@ -339,6 +418,7 @@ async function forwardUpstream(
   req: IncomingMessage,
   res: ServerResponse,
   target: TerminateTarget,
+  leg: UpstreamLeg,
   planSigv4?: PlanSigv4,
   maxSigv4BodyBytes: number = MAX_SIGV4_RESIGN_BODY_BYTES,
 ): Promise<void> {
@@ -520,23 +600,30 @@ async function forwardUpstream(
     fwdHeaders['transfer-encoding'] = 'chunked'
   }
 
-  const failUpstream = (err: Error) => {
+  const failUpstream = (err: Error, sent?: ClientRequest) => {
     logForDebugging(
       `[tls-terminate] upstream ${target.hostname}:${target.port} failed: ${err.message}`,
       { level: 'error' },
     )
+    leg.forgetAddress()
+    if (sent?.reusedSocket && !res.headersSent && isStaleSocketError(err)) {
+      // The upstream closed the kept-alive socket as this request went out.
+      // Close the client's connection rather than answer 502: that is what
+      // the client would see on a direct keep-alive connection, and what its
+      // own retry policy is written for. Destroy the socket, not `res`: with
+      // no headers sent yet, Bun's res.destroy() answers `200 OK` with an
+      // empty body before closing, which would hand the client a fabricated
+      // success.
+      req.socket.destroy()
+      return
+    }
     respondUpstreamError(res, err)
   }
-  // Vet and pick the upstream address first (see directRequestOptions); the
+  // Vet and pick the upstream address first (see createUpstreamLeg); the
   // name stays in Host and SNI.
   let direct: DirectRequestOptions
   try {
-    direct = await directRequestOptions(
-      target.hostname,
-      target.port,
-      target.lookup,
-      true,
-    )
+    direct = await leg.address()
   } catch (err) {
     failUpstream(err as Error)
     return
@@ -551,18 +638,10 @@ async function forwardUpstream(
   const upstream = httpsRequest(
     {
       ...direct,
+      agent: leg.agent,
       path,
       method: req.method,
       headers: fwdHeaders,
-      // We're a TLS-terminating proxy, not a trust boundary for the upstream
-      // server's identity — the runtime verifies it normally (system roots and
-      // NODE_EXTRA_CA_CERTS). Pin the identity to the tunnel's target so the
-      // check does not depend on how a runtime derives it from the Host header
-      // (some verify against `Host` verbatim, so a non-default port would
-      // never match a SAN); `servername` still carries the name for SNI.
-      checkServerIdentity: (_host, cert) =>
-        checkServerIdentity(target.hostname, cert),
-      ...(target.upstreamCA ? { ca: target.upstreamCA } : {}),
     },
     upRes => {
       // The response stream errors independently of the ClientRequest;
@@ -579,7 +658,7 @@ async function forwardUpstream(
     },
   )
 
-  upstream.on('error', failUpstream)
+  upstream.on('error', err => failUpstream(err, upstream))
 
   res.on('close', () => upstream.destroy())
   if (bufferedBody !== undefined) {

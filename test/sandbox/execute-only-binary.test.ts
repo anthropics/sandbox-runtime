@@ -66,14 +66,37 @@ function runCopy(mode: number): {
 /* Spawn a copy running `sleep`, wait for setup to finish, and return the
  * uid owning the outer helper's /proc entries — root iff dumpable is 0. */
 async function procOwnerDuringRun(mode: number): Promise<number> {
-  const child = spawn(makeCopy(mode), ['/bin/sleep', '3'], { stdio: 'ignore' })
+  const child = spawn(makeCopy(mode), ['/bin/sleep', '3'], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  let stderr = ''
+  child.stderr.on('data', (d: Buffer) => (stderr += d.toString()))
+  // Listen from the start. A helper that exits, or fails to spawn, during the
+  // wait below has already emitted its event by the time the finally block
+  // runs; a listener attached there never fires and the test times out
+  // without saying why.
+  const ended = new Promise<string>(resolve => {
+    child.once('exit', (code, signal) =>
+      resolve(`exited (code=${code}, signal=${signal})`),
+    )
+    child.once('error', err => resolve(`failed to spawn: ${err.message}`))
+  })
   try {
     // Namespace setup is a handful of syscalls; 500ms is ample margin.
-    await new Promise(resolve => setTimeout(resolve, 500))
+    const early = await Promise.race([
+      ended,
+      new Promise<undefined>(resolve => setTimeout(resolve, 500)),
+    ])
+    if (early !== undefined) {
+      throw new Error(
+        `apply-seccomp copy (mode ${mode.toString(8)}) ${early} before its ` +
+          `/proc entry could be checked; stderr: ${stderr.trim() || '(empty)'}`,
+      )
+    }
     return statSync(`/proc/${child.pid}/environ`).uid
   } finally {
     child.kill('SIGKILL')
-    await new Promise(resolve => child.on('exit', resolve))
+    await ended
   }
 }
 

@@ -11,12 +11,27 @@ import * as fs from 'fs'
 import * as net from 'net'
 import * as path from 'path'
 import * as os from 'os'
+import { createRequire } from 'module'
 
 /**
  * Get default config path
  */
 function getDefaultConfigPath(): string {
   return path.join(os.homedir(), '.srt-settings.json')
+}
+
+/**
+ * The version `--version` reports, read from the package's own manifest, which
+ * sits one directory above both src/cli.ts and dist/cli.js. There is no
+ * fallback: a manifest that cannot be read is a broken install, and a
+ * plausible-looking wrong version is worse than the throw, because the README
+ * pins behaviour to specific releases.
+ */
+function getPackageVersion(): string {
+  const manifest: { version: string } = createRequire(import.meta.url)(
+    '../package.json',
+  )
+  return manifest.version
 }
 
 /**
@@ -167,7 +182,7 @@ async function main(): Promise<void> {
     .description(
       'Run commands in a sandbox with network and filesystem restrictions',
     )
-    .version(process.env.npm_package_version || '1.0.0')
+    .version(getPackageVersion())
 
   // ── Windows install/uninstall ─────────────────────────────────
   // Self-elevating one-shot install (one UAC prompt). Also
@@ -411,6 +426,20 @@ async function main(): Promise<void> {
             controlStream.on('error', onControlError)
           }
 
+          // Until there is a child to pass an interrupt on to, it stops the
+          // run. The library's own handlers, which initialize() installs, only
+          // clean up: left to them the command would be run all the same.
+          const interrupted = new AbortController()
+          const interrupt = (signal: NodeJS.Signals): void =>
+            interrupted.abort(new Error(`interrupted by ${signal}`))
+          process.once('SIGINT', interrupt)
+          process.once('SIGTERM', interrupt)
+          const aboutToSpawn = (): void => {
+            interrupted.signal.throwIfAborted()
+            process.off('SIGINT', interrupt)
+            process.off('SIGTERM', interrupt)
+          }
+
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')
           await SandboxManager.initialize(runtimeConfig)
@@ -500,14 +529,21 @@ async function main(): Promise<void> {
             // entries to the child as CRT descriptors, so the control fd
             // is not among them (an inheritable HANDLE still reaches the
             // child, but unnamed — nothing there can find it).
+            aboutToSpawn()
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
               stdio: 'inherit',
               env,
             })
           } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
+            // The wrap can take seconds over a large tree.
+            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+              command,
+              undefined,
+              undefined,
+              interrupted.signal,
+            )
+            aboutToSpawn()
             child = spawn(sandboxedCommand, {
               shell: true,
               stdio: sandboxedStdio(controlFd),

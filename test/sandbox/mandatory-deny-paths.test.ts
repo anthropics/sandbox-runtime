@@ -6,10 +6,13 @@ import {
   afterAll,
   beforeEach,
   afterEach,
+  spyOn,
 } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   mkdirSync,
+  rmdirSync,
   rmSync,
   writeFileSync,
   readFileSync,
@@ -27,7 +30,12 @@ import {
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
+  unreadableDirectories,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  DANGEROUS_FILES,
+  getDangerousDirectories,
+} from '../../src/sandbox/sandbox-utils.js'
 import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
@@ -47,22 +55,17 @@ describe.if(isSupportedPlatform)(
     const TEST_DIR = join(tmpdir(), `mandatory-deny-integration-${Date.now()}`)
     const ORIGINAL_CONTENT = 'ORIGINAL'
     const MODIFIED_CONTENT = 'MODIFIED'
+    /** Written into every directory getDangerousDirectories() names. */
+    const DIRECTORY_PROBE_FILE = 'probe.txt'
     let originalCwd: string
 
     beforeAll(() => {
       originalCwd = process.cwd()
       mkdirSync(TEST_DIR, { recursive: true })
 
-      // Create ALL dangerous files from DANGEROUS_FILES
-      writeFileSync(join(TEST_DIR, '.bashrc'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.bash_profile'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.gitconfig'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.gitmodules'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.zshrc'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.zprofile'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.profile'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.ripgreprc'), ORIGINAL_CONTENT)
-      writeFileSync(join(TEST_DIR, '.mcp.json'), ORIGINAL_CONTENT)
+      for (const name of DANGEROUS_FILES) {
+        writeFileSync(join(TEST_DIR, name), ORIGINAL_CONTENT)
+      }
 
       // Create .git with hooks and config
       mkdirSync(join(TEST_DIR, '.git', 'hooks'), { recursive: true })
@@ -73,28 +76,13 @@ describe.if(isSupportedPlatform)(
       )
       writeFileSync(join(TEST_DIR, '.git', 'HEAD'), 'ref: refs/heads/main')
 
-      // Create .vscode
-      mkdirSync(join(TEST_DIR, '.vscode'), { recursive: true })
-      writeFileSync(
-        join(TEST_DIR, '.vscode', 'settings.json'),
-        ORIGINAL_CONTENT,
-      )
-
-      // Create .idea
-      mkdirSync(join(TEST_DIR, '.idea'), { recursive: true })
-      writeFileSync(join(TEST_DIR, '.idea', 'workspace.xml'), ORIGINAL_CONTENT)
-
-      // Create .claude/commands and .claude/agents (should be blocked)
-      mkdirSync(join(TEST_DIR, '.claude', 'commands'), { recursive: true })
-      mkdirSync(join(TEST_DIR, '.claude', 'agents'), { recursive: true })
-      writeFileSync(
-        join(TEST_DIR, '.claude', 'commands', 'test.md'),
-        ORIGINAL_CONTENT,
-      )
-      writeFileSync(
-        join(TEST_DIR, '.claude', 'agents', 'test-agent.md'),
-        ORIGINAL_CONTENT,
-      )
+      for (const dir of getDangerousDirectories()) {
+        mkdirSync(join(TEST_DIR, dir), { recursive: true })
+        writeFileSync(
+          join(TEST_DIR, dir, DIRECTORY_PROBE_FILE),
+          ORIGINAL_CONTENT,
+        )
+      }
 
       // Create a safe file that SHOULD be writable
       writeFileSync(join(TEST_DIR, 'safe-file.txt'), ORIGINAL_CONTENT)
@@ -136,12 +124,18 @@ describe.if(isSupportedPlatform)(
       cleanupBwrapMountPoints({ force: true })
     })
 
-    async function runSandboxedWrite(
+    function runSandboxedWrite(
       filePath: string,
       content: string,
     ): Promise<{ success: boolean; stderr: string }> {
+      return runSandboxed(`echo '${content}' > '${filePath}'`)
+    }
+
+    async function runSandboxed(
+      command: string,
+      ripgrepArgs: string[] = [],
+    ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
-      const command = `echo '${content}' > '${filePath}'`
 
       // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
@@ -163,6 +157,7 @@ describe.if(isSupportedPlatform)(
           needsNetworkRestriction: false,
           readConfig: undefined,
           writeConfig,
+          ripgrepConfig: { command: 'rg', args: ripgrepArgs },
         })
       }
 
@@ -179,71 +174,14 @@ describe.if(isSupportedPlatform)(
     }
 
     describe('Dangerous files should be blocked', () => {
-      it('blocks writes to .bashrc', async () => {
-        const result = await runSandboxedWrite('.bashrc', MODIFIED_CONTENT)
+      for (const name of DANGEROUS_FILES) {
+        it(`blocks writes to ${name}`, async () => {
+          const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.bashrc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .gitconfig', async () => {
-        const result = await runSandboxedWrite('.gitconfig', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.gitconfig', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .zshrc', async () => {
-        const result = await runSandboxedWrite('.zshrc', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.zshrc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .mcp.json', async () => {
-        const result = await runSandboxedWrite('.mcp.json', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.mcp.json', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .bash_profile', async () => {
-        const result = await runSandboxedWrite(
-          '.bash_profile',
-          MODIFIED_CONTENT,
-        )
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.bash_profile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .zprofile', async () => {
-        const result = await runSandboxedWrite('.zprofile', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.zprofile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .profile', async () => {
-        const result = await runSandboxedWrite('.profile', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.profile', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .gitmodules', async () => {
-        const result = await runSandboxedWrite('.gitmodules', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.gitmodules', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
-
-      it('blocks writes to .ripgreprc', async () => {
-        const result = await runSandboxedWrite('.ripgreprc', MODIFIED_CONTENT)
-
-        expect(result.success).toBe(false)
-        expect(readFileSync('.ripgreprc', 'utf8')).toBe(ORIGINAL_CONTENT)
-      })
+          expect(result.success).toBe(false)
+          expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
+        })
+      }
     })
 
     describe('Git hooks and config should be blocked', () => {
@@ -268,53 +206,340 @@ describe.if(isSupportedPlatform)(
     })
 
     describe('Dangerous directories should be blocked', () => {
-      it('blocks writes to .vscode/', async () => {
-        const result = await runSandboxedWrite(
-          '.vscode/settings.json',
-          MODIFIED_CONTENT,
-        )
+      for (const dir of getDangerousDirectories()) {
+        it(`blocks writes to ${dir}/`, async () => {
+          const target = `${dir}/${DIRECTORY_PROBE_FILE}`
+          const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.vscode/settings.json', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
-        )
+          expect(result.success).toBe(false)
+          expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
+        })
+      }
+    })
+
+    describe('The same names below the working directory', () => {
+      /** What holds files the host runs or trusts, and a file in each. */
+      const heldIn = new Map([
+        ['.git/hooks', 'pre-commit'],
+        ...getDangerousDirectories().map(
+          dir => [dir, DIRECTORY_PROBE_FILE] as const,
+        ),
+      ])
+      const existing = [
+        ...DANGEROUS_FILES,
+        '.git/config',
+        ...[...heldIn].map(([dir, file]) => `${dir}/${file}`),
+      ]
+      const populate = (container: string): void => {
+        for (const dir of heldIn.keys()) {
+          mkdirSync(join(TEST_DIR, container, dir), { recursive: true })
+        }
+        for (const name of [...existing, 'safe-file.txt']) {
+          writeFileSync(join(TEST_DIR, container, name), ORIGINAL_CONTENT)
+        }
+      }
+      // How far the default depth reaches on Linux: every name in `sub`, and
+      // the files alone in `a/b`.
+      const covered = [
+        ['sub', existing],
+        ['a/b', DANGEROUS_FILES],
+      ] as const
+      const beyond = 'a/b/c'
+      beforeAll(() => ['sub', 'a/b', beyond].forEach(populate))
+
+      for (const [container, names] of covered) {
+        for (const name of names) {
+          it(`blocks writes to ${container}/${name}`, async () => {
+            const target = `${container}/${name}`
+            const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+            expect(result.success).toBe(false)
+            expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
+          })
+        }
+        it(`allows writes to ${container}/safe-file.txt`, async () => {
+          const target = `${container}/safe-file.txt`
+          const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+          expect(result.success).toBe(true)
+          expect(readFileSync(target, 'utf8').trim()).toBe(MODIFIED_CONTENT)
+        })
+      }
+
+      for (const dir of heldIn.keys()) {
+        it(`blocks a new file in sub/${dir}/`, async () => {
+          const target = `sub/${dir}/new-file`
+          const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+          expect(result.success).toBe(false)
+          expect(existsSync(target)).toBe(false)
+        })
+      }
+
+      for (const state of ['empty', 'missing']) {
+        it(`blocks a new hook in a repository whose hooks directory is ${state}`, async () => {
+          const repository = `hooks-${state}`
+          const hooks = `${repository}/.git/hooks`
+          mkdirSync(join(TEST_DIR, repository, '.git'), { recursive: true })
+          writeFileSync(
+            join(TEST_DIR, repository, '.git', 'HEAD'),
+            'ref: refs/heads/main',
+          )
+          if (state === 'empty') mkdirSync(join(TEST_DIR, hooks))
+
+          const result = await runSandboxed(
+            `mkdir -p '${hooks}' && echo x > '${hooks}/pre-commit'`,
+          )
+
+          expect(result.success).toBe(false)
+          expect(existsSync(`${hooks}/pre-commit`)).toBe(false)
+          // The rest of the repository is still the command's to write.
+          expect(
+            (await runSandboxedWrite(`${repository}/.git/HEAD`, 'x')).success,
+          ).toBe(true)
+        })
+      }
+
+      for (const [file, line] of [
+        ['.gitignore', 'sub/'],
+        ['.ignore', '*'],
+      ] as const) {
+        it(`blocks them all the same when ${file} holds ${line}`, async () => {
+          writeFileSync(join(TEST_DIR, file), `${line}\n`)
+          try {
+            for (const name of ['sub/.bashrc', 'sub/.git/hooks/pre-commit']) {
+              const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
+
+              expect([name, result.success]).toEqual([name, false])
+              expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
+            }
+          } finally {
+            rmSync(join(TEST_DIR, file))
+          }
+        })
+      }
+
+      it.if(isLinux)(
+        "blocks them all the same whatever ripgrep's configuration file says",
+        async () => {
+          const configuration = join(TEST_DIR, 'ripgrep-configuration')
+          writeFileSync(configuration, '--glob=!sub\n')
+          process.env.RIPGREP_CONFIG_PATH = configuration
+          try {
+            const result = await runSandboxedWrite(
+              'sub/.bashrc',
+              MODIFIED_CONTENT,
+            )
+
+            expect(result.success).toBe(false)
+            expect(readFileSync('sub/.bashrc', 'utf8')).toBe(ORIGINAL_CONTENT)
+          } finally {
+            delete process.env.RIPGREP_CONFIG_PATH
+            rmSync(configuration)
+          }
+        },
+      )
+
+      it('blocks them all the same beside a directory that cannot be read', async () => {
+        const unreadable = join(TEST_DIR, 'unreadable')
+        mkdirSync(unreadable, { mode: 0o000 })
+        try {
+          for (const name of ['sub/.bashrc', 'sub/.git/hooks/pre-commit']) {
+            const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
+
+            expect([name, result.success]).toEqual([name, false])
+            expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
+          }
+        } finally {
+          rmdirSync(unreadable)
+        }
       })
 
-      it('blocks writes to .claude/commands/', async () => {
-        const result = await runSandboxedWrite(
-          '.claude/commands/test.md',
-          MODIFIED_CONTENT,
-        )
+      for (const [directory, mode] of [
+        ['locked', 0o000],
+        ['locked/.git', 0o000],
+        // As deep as one of the names can itself lie.
+        ['locked/.claude/commands', 0o000],
+        // Can be listed, and nothing in it looked at.
+        ['locked', 0o444],
+        // The other way about.
+        ['locked', 0o111],
+      ] as const) {
+        // With one thread, as on one CPU, ripgrep words what it says otherwise.
+        for (const threads of [[], ['-j1']]) {
+          it(`blocks them all the same in locked/ when ${directory} has mode ${mode.toString(8)} (rg ${threads.join()})`, async () => {
+            const names = [
+              '.bashrc',
+              '.git/config',
+              '.git/hooks/pre-commit',
+              `.claude/commands/${DIRECTORY_PROBE_FILE}`,
+            ]
+            populate('locked')
+            try {
+              for (const name of names) {
+                // Each time: a command that is not held gives the mode back.
+                chmodSync(join(TEST_DIR, directory), mode)
+                const result = await runSandboxed(
+                  `chmod 755 locked '${directory}'; echo x > 'locked/${name}'`,
+                  threads,
+                )
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.claude/commands/test.md', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
-        )
-      })
+                expect([name, result.success]).toEqual([name, false])
+              }
+            } finally {
+              chmodSync(join(TEST_DIR, directory), 0o755)
+            }
+            for (const name of names) {
+              expect(readFileSync(`locked/${name}`, 'utf8')).toBe(
+                ORIGINAL_CONTENT,
+              )
+            }
+          })
+        }
+      }
 
-      it('blocks writes to .claude/agents/', async () => {
-        const result = await runSandboxedWrite(
-          '.claude/agents/test-agent.md',
-          MODIFIED_CONTENT,
-        )
+      // root reads a directory of any mode.
+      it.if(isLinux && process.getuid?.() !== 0)(
+        'takes what ripgrep says it could not read for a hint only',
+        async () => {
+          const project = join(TEST_DIR, 'hints')
+          const outside = join(TEST_DIR, 'hints-outside')
+          for (const directory of [
+            join(project, 'is-readable'),
+            join(project, 'really-locked'),
+            join(project, 'locked: too'),
+            join(project, 'one-thread'),
+            join(project, 'no-prefix'),
+            join(project, 'listed-only/child'),
+            join(project, 'entered-only'),
+            join(project, 'a/b/c/too-deep'),
+            join(outside, 'behind-a-link'),
+          ]) {
+            mkdirSync(directory, { recursive: true })
+          }
+          symlinkSync(outside, join(project, 'link'))
+          const locked = [
+            join(project, 'really-locked'),
+            join(project, 'locked: too'),
+            join(project, 'one-thread'),
+            join(project, 'no-prefix'),
+            join(project, 'a/b/c/too-deep'),
+            join(outside, 'behind-a-link'),
+          ]
+          // What a name in the tree could make ripgrep say.
+          const said = [
+            'is-readable',
+            'really-locked',
+            'a/b/c/too-deep',
+            'link/behind-a-link',
+            '../hints-outside/behind-a-link',
+            'not-there/at-all',
+            'entered-only/not-there',
+            'locked: too',
+            'listed-only/child',
+          ].map(
+            name => `rg: ${project}/${name}: Permission denied (os error 13)`,
+          )
+          said.push(
+            `rg: ${project}/one-thread: IO error for operation on ${project}/one-thread: Permission denied (os error 13)`,
+            `${project}/no-prefix: Permission denied (os error 13)`,
+          )
+          const standIn = join(TEST_DIR, 'says-it-could-not-read')
+          const asked = join(TEST_DIR, 'was-asked')
+          writeFileSync(
+            standIn,
+            [
+              '#!/bin/sh',
+              `printf '%s\\n' "$@" > '${asked}'`,
+              ...said.map(line => `echo '${line}' >&2`),
+              'exit 2',
+            ].join('\n'),
+            { mode: 0o755 },
+          )
+          process.chdir(project)
+          locked.forEach(directory => chmodSync(directory, 0o000))
+          chmodSync(join(project, 'listed-only'), 0o444)
+          chmodSync(join(project, 'entered-only'), 0o111)
+          try {
+            const wrapped = await wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig: { allowOnly: ['.'], denyWithinAllow: [] },
+              ripgrepConfig: { command: standIn },
+            })
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.claude/agents/test-agent.md', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
-        )
-      })
+            expect(unreadableDirectories(said.join('\n'), project, 3)).toEqual([
+              join(project, 'really-locked'),
+              join(project, 'locked: too'),
+              join(project, 'listed-only'),
+              join(project, 'one-thread'),
+              join(project, 'no-prefix'),
+            ])
+            // Nobody else's mode can be given back from inside.
+            const uid = process.getuid!()
+            const getuid = spyOn(process, 'getuid').mockReturnValue(uid + 1)
+            try {
+              expect(
+                unreadableDirectories(said.join('\n'), project, 3),
+              ).toEqual([])
+            } finally {
+              getuid.mockRestore()
+            }
+            expect(wrapped).toContain('really-locked')
+            expect(readFileSync(asked, 'utf8').split('\n')).toEqual(
+              expect.arrayContaining([
+                '--no-ignore',
+                '--no-config',
+                '--line-buffered',
+              ]),
+            )
+          } finally {
+            for (const directory of [
+              ...locked,
+              join(project, 'listed-only'),
+              join(project, 'entered-only'),
+            ]) {
+              chmodSync(directory, 0o755)
+            }
+          }
+        },
+      )
 
-      it('blocks writes to .idea/', async () => {
-        const result = await runSandboxedWrite(
-          '.idea/workspace.xml',
-          MODIFIED_CONTENT,
-        )
+      it.if(isLinux)(
+        'takes no directory above the working directory for one of the names',
+        async () => {
+          const project = join(TEST_DIR, 'above', '.idea', 'project')
+          mkdirSync(join(project, 'sub'), { recursive: true })
+          writeFileSync(join(project, 'sub', '.bashrc'), ORIGINAL_CONTENT)
+          process.chdir(project)
 
-        expect(result.success).toBe(false)
-        expect(readFileSync('.idea/workspace.xml', 'utf8')).toBe(
-          ORIGINAL_CONTENT,
+          expect((await runSandboxedWrite('sub/.bashrc', 'x')).success).toBe(
+            false,
+          )
+          expect((await runSandboxedWrite('safe-file.txt', 'x')).success).toBe(
+            true,
+          )
+        },
+      )
+
+      for (const [container, names] of [
+        ['a/b', existing.filter(name => name.includes('/'))],
+        [beyond, existing],
+      ] as const) {
+        it.if(isLinux)(
+          `looks no deeper than the depth says: ${names.length} names in ${container}/`,
+          async () => {
+            for (const name of names) {
+              const target = `${container}/${name}`
+              const result = await runSandboxedWrite(target, MODIFIED_CONTENT)
+
+              expect([target, result.success]).toEqual([target, true])
+            }
+          },
+          60_000,
         )
-      })
+      }
     })
 
     describe('Safe files should still be writable', () => {

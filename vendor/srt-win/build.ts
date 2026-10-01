@@ -8,7 +8,14 @@ const { SRC, OUT } = setup({
   srcDirName: 'srt-win-src',
 })
 
-run(['cargo', 'build', '--release', '--manifest-path', join(SRC, 'Cargo.toml')])
+run([
+  'cargo',
+  'build',
+  '--release',
+  '--locked',
+  '--manifest-path',
+  join(SRC, 'Cargo.toml'),
+])
 
 const built = join(SRC, 'target', 'release', 'srt-win.exe')
 if (!existsSync(built)) {

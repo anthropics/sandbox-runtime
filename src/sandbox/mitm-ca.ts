@@ -115,14 +115,10 @@ export function caSubjectKeyId(caCert: forge.pki.Certificate): string {
  * instead of node-forge's pure-JS RSA.
  *
  * node-forge routes RSA *keypair generation* to native `crypto` when available,
- * but its `PrivateKey.sign()` is always pure JS: jsbn `BigInteger.modPow`
- * (~3000 Montgomery squarings for a 2048-bit modulus). On a JIT engine that's
- * ~50–70 ms per signature; on an interpreter or baseline-only tier it can be
- * an order of magnitude worse — and `generateEphemeralCA()` runs on the cold
- * path of every process that constructs a SandboxManager. Native
- * `crypto.sign()` is ~1–2 ms and, because RSASSA-PKCS1-v1_5 is deterministic,
- * produces byte-identical output. See test/sandbox/mitm-ca.test.ts for the
- * byte-for-byte equivalence check.
+ * but its `PrivateKey.sign()` is always pure JS, which is slow enough to matter
+ * because `generateEphemeralCA()` runs on the cold path of every process that
+ * constructs a SandboxManager. RSASSA-PKCS1-v1_5 is deterministic, so native
+ * `crypto.sign()` yields identical bytes.
  */
 export function signCertificateNative(
   cert: forge.pki.Certificate,

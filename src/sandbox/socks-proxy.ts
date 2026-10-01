@@ -209,10 +209,11 @@ export function createSocksProxyServer(
   })
 
   // Track every injected client socket so close() can tear them down
-  // immediately. A SOCKS connection mid-`dialDirect()` (30s timeout) or
-  // mid-relay would otherwise hold reset() open past bun's test timeout.
-  // The library's internal net.Server is never .listen()ed — the mux owns
-  // accept — so there's no listener to close; we only destroy sockets.
+  // immediately. A SOCKS connection still inside `dialDirect()`
+  // (CONNECT_TIMEOUT_MS, parent-proxy.ts) or mid-relay would otherwise hold
+  // reset() open until it expires. The library's internal net.Server is never
+  // .listen()ed — the mux owns accept — so there's no listener to close; we
+  // only destroy sockets.
   const openSockets = new Set<Socket>()
 
   return {
