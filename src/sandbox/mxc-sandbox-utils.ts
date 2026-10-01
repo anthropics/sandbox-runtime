@@ -97,17 +97,17 @@ import type { WindowsBinShell } from './windows-sandbox-utils.js'
 import type { MxcConfig } from './sandbox-config.js'
 
 // ────────────────────────────────────────────────────────────────────────
-// Structural subset of @microsoft/mxc-sdk@0.7 that srt actually uses.
+// Structural subset of @microsoft/mxc-sdk@0.9 that srt actually uses.
 //
 // The SDK is an optionalDependency (Windows-only, ~40 MB with
 // the bundled runners) loaded via dynamic import, so its types cannot
 // be `import type`d unconditionally on macOS/Linux dev machines. These
 // interfaces mirror sdk/node/src/types.ts for policy version
-// 0.7.0-alpha; keep them in step with the pinned SDK minor.
+// 0.9.0-alpha; keep them in step with the pinned SDK minor.
 // ────────────────────────────────────────────────────────────────────────
 
 /** MXC config schema version srt targets. See SDK Compatibility table. */
-export const MXC_POLICY_VERSION = '0.7.0-alpha'
+export const MXC_POLICY_VERSION = '0.9.0-alpha'
 
 /** Mirrors @microsoft/mxc-sdk `SandboxPolicy` (fields srt sets). */
 export interface MxcSandboxPolicy {
@@ -118,10 +118,13 @@ export interface MxcSandboxPolicy {
     deniedPaths?: string[]
   }
   network?: {
-    allowOutbound?: boolean
-    allowLocalNetwork?: boolean
-    proxy?: { localhost: number }
+    egress?: { default?: 'allow' | 'deny' }
+    ingress?: {
+      default?: 'allow' | 'deny'
+      hostLoopback?: 'allow' | 'deny'
+    }
   }
+  runtimeConfig?: { networkProxy?: string }
   ui?: { allowWindows?: boolean }
   timeoutMs?: number
 }
@@ -137,6 +140,14 @@ export interface MxcContainerConfig {
   version: string
   containment?: string
   process: { commandLine: string; cwd?: string; env?: string[] }
+  network?: {
+    egress?: { default?: 'allow' | 'deny' }
+    ingress?: {
+      default?: 'allow' | 'deny'
+      hostLoopback?: 'allow' | 'deny'
+    }
+  }
+  runtimeConfig?: { networkProxy?: string }
 }
 
 /** The SDK entry point srt calls. */
@@ -440,7 +451,8 @@ export async function buildMxcContainerConfig(
   const sdk = await loadMxcSdk()
 
   const systemDrive = `${process.env.SystemDrive ?? 'C:'}\\`
-  const readonlyPaths = [systemDrive, ...(p.allowRead ?? [])]
+  const workingDirectory = p.cwd ?? process.cwd()
+  const readonlyPaths = [systemDrive, workingDirectory, ...(p.allowRead ?? [])]
   const temp = process.env.TEMP ?? process.env.TMP
   const readwritePaths = [
     ...(p.allowWrite ?? []),
@@ -451,10 +463,21 @@ export async function buildMxcContainerConfig(
   const policy: MxcSandboxPolicy = {
     version: MXC_POLICY_VERSION,
     filesystem: { readonlyPaths, readwritePaths, deniedPaths },
-    network:
+    network: {
+      egress: { default: 'deny' },
+      ingress:
+        p.httpProxyPort !== undefined
+          ? { default: 'allow', hostLoopback: 'allow' }
+          : { default: 'deny', hostLoopback: 'deny' },
+    },
+    runtimeConfig:
       p.httpProxyPort !== undefined
-        ? { allowOutbound: false, proxy: { localhost: p.httpProxyPort } }
-        : { allowOutbound: false },
+        ? {
+            networkProxy: `http://${
+              p.proxyAuthToken ? `srt:${p.proxyAuthToken}@` : ''
+            }127.0.0.1:${p.httpProxyPort}`,
+          }
+        : undefined,
     // Shells need UI: upstream documents that PowerShell (5.1 and 7)
     // fails at startup under `ui.allowWindows: false` because of
     // win32k calls. cmd.exe is fine either way.
@@ -472,7 +495,7 @@ export async function buildMxcContainerConfig(
   const cfg = sdk.buildSandboxPayload(
     commandLine,
     policy,
-    p.cwd ?? process.cwd(),
+    workingDirectory,
     undefined,
     'process',
   )
@@ -509,6 +532,7 @@ const CHILD_BASE_ENV_VARS = [
   'PATHEXT',
   'TEMP',
   'TMP',
+  'LOCALAPPDATA',
   'USERPROFILE',
   'NUMBER_OF_PROCESSORS',
   'PROCESSOR_ARCHITECTURE',
@@ -589,7 +613,11 @@ export async function wrapCommandWithSandboxMxc(
     p.proxyAuthToken,
   )
   const cfg = await buildMxcContainerConfig(p, proxyEnv)
-  const argv = [p.mxc.exe, '--config-base64', encodeMxcConfig(cfg)]
+  const argv = [p.mxc.exe]
+  if (process.env.SRT_DEBUG) {
+    argv.push('--debug')
+  }
+  argv.push('--config-base64', encodeMxcConfig(cfg))
 
   // Same CreateProcessW 32 767-WCHAR ceiling as srt-win — here the
   // whole policy (every path list) is inside ONE base64 argv element,

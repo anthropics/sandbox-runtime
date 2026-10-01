@@ -176,11 +176,12 @@ async function runSandboxed(
     customConfig?: Partial<SandboxRuntimeConfig>
     cwd?: string
     extraBrokerEnv?: Record<string, string>
+    binShell?: string
   } = {},
 ): Promise<RunResult> {
   const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
     command,
-    undefined,
+    opts.binShell,
     opts.customConfig,
     undefined,
     opts.cwd,
@@ -310,7 +311,11 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
       // 1.1.1.1:443 answers instantly when reachable, so exit 0 here
       // means the egress fence does not bind raw sockets — the
       // cooperative-proxy failure mode.
-      const r = await runSandboxed(connectProbeCmd('1.1.1.1', 443))
+      const r = await runSandboxed(connectProbeCmd('1.1.1.1', 443), {
+        // Node requires Win32k during startup. Selecting PowerShell enables
+        // ui.allowWindows for this probe without weakening the session policy.
+        binShell: 'powershell',
+      })
       // A missing PROBE-START means the child never ran (spawn/env
       // problem), NOT a network verdict — deliberate: a silent
       // can't-even-start must read as red, never as "blocked".
@@ -339,7 +344,9 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
         port = (server.address() as AddressInfo).port
       }
       try {
-        const r = await runSandboxed(connectProbeCmd('127.0.0.1', port))
+        const r = await runSandboxed(connectProbeCmd('127.0.0.1', port), {
+          binShell: 'powershell',
+        })
         // See B3: PROBE-START missing = child never ran, not blocked.
         expect(r.stdout).toContain('PROBE-START')
         expect(r.stdout).not.toContain('CONNECTED')
@@ -354,11 +361,16 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
   it.skipIf(!hasTool('node'))(
     'B5: loopback to the proxy port is reachable',
     async () => {
-      // The load-bearing MXC question: the mux proxy is a plain host
-      // process, not an AppContainer peer.
-      const port = SandboxManager.getProxyPort()
-      expect(port).toBeDefined()
-      const r = await runSandboxed(connectProbeCmd('127.0.0.1', port!))
+      const js =
+        `const n=require('net');const u=new URL(process.env.HTTP_PROXY);` +
+        `console.log('PROBE-START');const s=n.connect(Number(u.port),u.hostname);` +
+        `const t=setTimeout(()=>{process.exitCode=2;s.destroy()},5000);` +
+        `s.on('connect',()=>{console.log('CONNECTED');process.exitCode=0;` +
+        `clearTimeout(t);s.destroy()});s.on('error',e=>{console.error(String(e));` +
+        `process.exitCode=1;clearTimeout(t)})`
+      const r = await runSandboxed(`node -e "${js}"`, {
+        binShell: 'powershell',
+      })
       expectStatus('B5', r, [0])
       expect(r.stdout).toContain('CONNECTED')
     },
@@ -600,6 +612,16 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
 
   beforeAll(async () => {
     await SandboxManager.reset()
+    // The first describe's afterAll rmSync()'s the whole fixture tree, but
+    // createBoundaryConfig() still lists deny-read/cred/deny-write (and their
+    // parent dirs) in deniedPaths/filesystem. A denied path whose parent
+    // directory no longer exists is rejected by the OS at container creation
+    // (ERROR_PATH_NOT_FOUND), failing every G exec at launch. Recreate the
+    // fixture so the boundary config the tls describe reuses is valid.
+    mkdirSync(allowWriteDir, { recursive: true })
+    writeFileSync(denyReadFile, FIXTURE_SECRET)
+    writeFileSync(denyWriteFile, 'original-content')
+    writeFileSync(credFile, FIXTURE_SECRET)
     try {
       await SandboxManager.initialize({
         ...createBoundaryConfig(),
@@ -641,9 +663,7 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
     await SandboxManager.reset()
   }, 60_000)
 
-  const GIT_CURL = 'C:\\Program Files\\Git\\mingw64\\bin\\curl.exe'
-
-  it.skipIf(!existsSync(GIT_CURL))(
+  it.skipIf(!hasTool('node'))(
     'G1: OpenSSL-backed client trusts the MITM leaf via env CA',
     async () => {
       if (!mxcSelected) {
@@ -652,12 +672,18 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
         )
         return
       }
-      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-        `"${GIT_CURL}" -fsS -o NUL https://example.com`,
-      )
-      const r = await spawnAsync(argv[0], argv.slice(1), {
-        timeout: 60_000,
-        env,
+      const js =
+        `const c=require('child_process');const u=new URL(process.env.HTTPS_PROXY);` +
+        `const r=c.spawnSync('openssl',['s_client','-proxy',u.hostname+':'+u.port,` +
+        `'-proxy_user',decodeURIComponent(u.username),'-proxy_pass',` +
+        `'pass:'+decodeURIComponent(u.password),'-connect','example.com:443',` +
+        `'-servername','example.com','-CAfile',process.env.SSL_CERT_FILE,` +
+        `'-verify_return_error','-brief'],{input:'Q\\n',encoding:'utf8'});` +
+        `process.stdout.write(r.stdout||'');process.stderr.write(r.stderr||'');` +
+        `process.exitCode=r.status??1`
+      const r = await runSandboxed(`node -e "${js}"`, {
+        binShell: 'powershell',
+        timeoutMs: 60_000,
       })
       expectStatus('G1', r, [0])
     },
