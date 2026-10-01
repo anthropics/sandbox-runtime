@@ -43,10 +43,9 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          # Node 20 (Active LTS): Node 18 has no official windows-arm64
-          # build, so setup-node fails on the win/arm64 leg. engines is
-          # >=18.0.0 — this only pins the CI test version, not the floor.
-          node-version: '20'
+          # The oldest Node that `engines` in package.json allows, so that
+          # what the package promises is what is tested.
+          node-version: '22.12.0'
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
