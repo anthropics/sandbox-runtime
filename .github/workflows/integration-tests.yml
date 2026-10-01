@@ -43,7 +43,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          # The newest release of the oldest line that `engines` allows.
+          # The newest release of the oldest line that `engines` allows. Not
+          # 22.12.0 itself: these tests also run `node` inside the sandbox,
+          # and on Windows that release tries only `::1` for `localhost`,
+          # where the proxy listens on 127.0.0.1. The floor itself is run by
+          # the package check in release.yml.
           node-version: '22'
 
       - name: Setup Bun
