@@ -2333,7 +2333,11 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
         `  r=>{console.log('STATUS:'+r.statusCode);process.exit(r.statusCode===200?0:1)})`,
         ` .on('error',e=>{console.error('TLS:'+(e.code||e.message));process.exit(2)})`,
         // Every address tried, not only the first error: `localhost` is two.
-        `}).on('error',e=>{console.error('CONN:'+(e.code||e.message)+' '+(e.errors||[e]).map(x=>x.code+'@'+x.address+':'+x.port).join(','));process.exit(3)}).end()`,
+        `}).on('error',e=>require('dns').lookup(u.hostname,{all:true},(_,found)=>{`,
+        ` console.error('CONN:'+(e.code||e.message)+' tried '+(e.errors||[e]).map(x=>x.code+'@'+x.address+':'+x.port).join(',')`,
+        `  +'; '+u.hostname+' is '+JSON.stringify((found||[]).map(x=>x.address))`,
+        `  +'; node '+process.version+', autoSelectFamily '+require('net').getDefaultAutoSelectFamily());`,
+        ` process.exit(3)})).end()`,
       ].join('')
       const r = await runSandboxedUntil(
         `"${NODE}" -e "${script}"`,
