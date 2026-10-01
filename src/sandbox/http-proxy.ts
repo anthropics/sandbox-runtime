@@ -6,6 +6,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
 import { URL } from 'node:url'
+import { inspect } from 'node:util'
 import { logForDebugging } from '../utils/debug.js'
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
@@ -33,6 +34,34 @@ import {
   stripBrackets,
   stripHopByHop,
 } from './parent-proxy.js'
+
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    const details = error as Error & {
+      code?: unknown
+      errno?: unknown
+      syscall?: unknown
+      address?: unknown
+      port?: unknown
+      cause?: unknown
+    }
+    return inspect(
+      {
+        name: details.name,
+        message: details.message,
+        code: details.code,
+        errno: details.errno,
+        syscall: details.syscall,
+        address: details.address,
+        port: details.port,
+        cause: details.cause,
+        stack: details.stack,
+      },
+      { depth: 4, breakLength: Infinity },
+    )
+  }
+  return inspect(error, { depth: 4, breakLength: Infinity })
+}
 
 export interface HttpProxyServerOptions {
   filter(
@@ -321,7 +350,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           upstream = await dialDirect(hostname, port)
         }
       } catch (err) {
-        logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
+        logForDebugging(`CONNECT tunnel failed: ${describeError(err)}`, {
           level: 'error',
         })
         // If we already sent 200 (mitmCA sniff path), an HTTP status line now
@@ -348,7 +377,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       socket.pipe(upstream)
 
       upstream.on('error', err => {
-        logForDebugging(`CONNECT tunnel failed: ${err.message}`, {
+        logForDebugging(`CONNECT tunnel failed: ${describeError(err)}`, {
           level: 'error',
         })
         socket.destroy()
