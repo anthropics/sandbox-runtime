@@ -1141,12 +1141,19 @@ export interface ExpandGlobOptions {
  *  pattern, reads the same entries. */
 export type GlobWalkListings = Map<string, fs.Dirent[]>
 
+/** Finished walks, by their options and pattern. */
+export type GlobWalks = Map<string, GlobWalk>
+
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
   followSymlinkedDirectories?: boolean
   /** Handed to every walk of one configuration, so that patterns with a
    *  base in common list each directory once between them. */
   listings?: GlobWalkListings
+  /** A walk found here is handed back as it is, and a finished one is put
+   *  here: for a caller that starts over and should walk no pattern twice.
+   *  What such a walk reports is as old as the walk. */
+  walks?: GlobWalks
 }
 
 /** Work that can be left between two steps and taken up again. */
@@ -1543,6 +1550,18 @@ export function* walkGlobPatternSteps(
   globPath: string,
   opts: GlobWalkOptions = {},
 ): Steps<GlobWalk> {
+  // The options that shape a walk, then its pattern.
+  const walkKey =
+    [
+      opts.withDirectoryForm,
+      opts.followSymlinkedDirectories,
+      opts.caseInsensitive,
+    ]
+      .map(on => (on ? '1' : '0'))
+      .join('') + globPath
+  const walked = opts.walks?.get(walkKey)
+  if (walked !== undefined) return walked
+
   const walk: GlobWalk = {
     baseLocation: '',
     matches: [],
@@ -1785,5 +1804,6 @@ export function* walkGlobPatternSteps(
     }
   }
 
+  opts.walks?.set(walkKey, walk)
   return walk
 }
