@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+import { captured } from '../helpers/captured.js'
 import { spawn, spawnSync } from 'node:child_process'
 import {
   createServer as createHttpServer,
@@ -461,16 +462,16 @@ describe.if(isLinux)(
 
     let upstream: Server
     let upstreamPort: number
-    let lastHeaders: IncomingHttpHeaders | undefined
-    let lastBody: string | undefined
+    const lastHeaders = captured<IncomingHttpHeaders>()
+    const lastBody = captured<string>()
 
     beforeAll(async () => {
       upstream = createHttpServer((req, res) => {
-        lastHeaders = req.headers
+        lastHeaders.value = req.headers
         let body = ''
         req.on('data', c => (body += c))
         req.on('end', () => {
-          lastBody = body
+          lastBody.value = body
           res.writeHead(200)
           res.end('ok')
         })
@@ -553,13 +554,13 @@ describe.if(isLinux)(
       expect(sentinel).not.toContain(DB_PASSWORD)
 
       // Proxy leg: the sentinel reaches HOST_A as the real password.
-      lastHeaders = undefined
+      lastHeaders.clear()
       const exit = await curlViaManagerProxy(
         `http://${HOST_A}:${upstreamPort}/`,
         sentinel,
       )
       expect(exit).toBe(0)
-      expect(lastHeaders?.authorization).toBe(`Bearer ${DB_PASSWORD}`)
+      expect(lastHeaders.value?.authorization).toBe(`Bearer ${DB_PASSWORD}`)
     }, 20000)
 
     test('a sentinel in a POST body reaches the injectHost as the real password', async () => {
@@ -571,16 +572,16 @@ describe.if(isLinux)(
 
       // Body leg: the tool POSTs the credential in a JSON payload instead
       // of a header; the manager proxy substitutes in the body stream.
-      lastHeaders = undefined
-      lastBody = undefined
+      lastHeaders.clear()
+      lastBody.clear()
       const exit = await curlViaManagerProxy(
         `http://${HOST_A}:${upstreamPort}/`,
         sentinel,
         `{"password":"${sentinel}"}`,
       )
       expect(exit).toBe(0)
-      expect(lastBody).toBe(`{"password":"${DB_PASSWORD}"}`)
-      expect(lastHeaders?.authorization).toBe(`Bearer ${DB_PASSWORD}`)
+      expect(lastBody.value).toBe(`{"password":"${DB_PASSWORD}"}`)
+      expect(lastHeaders.value?.authorization).toBe(`Bearer ${DB_PASSWORD}`)
     }, 20000)
 
     test('a non-injectHost destination receives the sentinel unchanged', async () => {
@@ -592,14 +593,14 @@ describe.if(isLinux)(
       // HOST_B is allowlisted but NOT in this entry's injectHosts. The
       // proxy resolves it to loopback (a `.localhost` name) and forwards
       // the sentinel as-is — fails closed.
-      lastHeaders = undefined
+      lastHeaders.clear()
       const exit = await curlViaManagerProxy(
         `http://${HOST_B}:${upstreamPort}/`,
         sentinel,
       )
       expect(exit).toBe(0)
-      expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
-      expect(lastHeaders?.authorization).not.toContain(DB_PASSWORD)
+      expect(lastHeaders.value?.authorization).toBe(`Bearer ${sentinel}`)
+      expect(lastHeaders.value?.authorization).not.toContain(DB_PASSWORD)
     }, 20000)
   },
 )

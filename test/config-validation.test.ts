@@ -1,6 +1,7 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
 import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
+import { isWindows } from './helpers/platform.js'
 
 describe('Config Validation', () => {
   test('should validate a valid minimal config', () => {
@@ -368,25 +369,34 @@ describe('Config Validation', () => {
     // separator could satisfy, so it denies nothing on either backend —
     // fail-open, and with no diagnostic beyond a debug line about zero
     // expansions.
-    test.each([['/data/*/'], ['/data/**/'], ['/data/[ab]/'], ['/data/?/']])(
+    function expectSlashedDenyGlobRejected(spelling: string): void {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: { ...base.filesystem, denyRead: [spelling] },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toContain(spelling)
+        expect(result.error.issues[0]?.message).toContain('can match no path')
+        expect(result.error.issues[0]?.path).toEqual([
+          'filesystem',
+          'denyRead',
+          0,
+        ])
+      }
+    }
+
+    test.each([['/data/*/'], ['/data/**/'], ['/data/?/']])(
       'rejects denyRead %s',
-      spelling => {
-        const result = SandboxRuntimeConfigSchema.safeParse({
-          ...base,
-          filesystem: { ...base.filesystem, denyRead: [spelling] },
-        })
-        expect(result.success).toBe(false)
-        if (!result.success) {
-          expect(result.error.issues[0]?.message).toContain(spelling)
-          expect(result.error.issues[0]?.message).toContain('can match no path')
-          expect(result.error.issues[0]?.path).toEqual([
-            'filesystem',
-            'denyRead',
-            0,
-          ])
-        }
-      },
+      spelling => expectSlashedDenyGlobRejected(spelling),
     )
+
+    // `[` and `]` are legal characters in a Windows filename, so
+    // containsGlobCharsWin reads a bracket spelling as a literal path and
+    // there is no inert pattern to reject.
+    test.if(!isWindows)('rejects denyRead /data/[ab]/', () => {
+      expectSlashedDenyGlobRejected('/data/[ab]/')
+    })
 
     test('rejects a slashed denyWrite glob, naming the spelling to use', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({

@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, beforeEach } from 'vitest'
+import { describe, it, expect, afterEach, beforeEach } from 'bun:test'
 import { SandboxManager } from '../../src/index.js'
 import { connect } from 'net'
 import { getPlatform } from '../../src/utils/platform.js'
