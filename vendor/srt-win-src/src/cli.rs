@@ -382,6 +382,18 @@ struct AceReleaseEntry {
     status: &'static str,
 }
 
+/// Strip the trailing-separator "directory" marker for probing an
+/// existing object. A volume root (`C:\`) keeps its separator —
+/// trimmed it would be the drive-RELATIVE `C:`.
+fn trim_dir_marker(p: &str) -> &str {
+    let t = p.trim_end_matches(['\\', '/']);
+    if t.is_empty() || t.ends_with(':') {
+        p
+    } else {
+        t
+    }
+}
+
 /// Output of [`canonicalize_ace_targets`].
 struct AceTargets {
     /// `(canonical_path, ace)` to hand to `apply_aces`.
@@ -396,6 +408,13 @@ struct AceTargets {
 /// targets are accepted (the inheritable ACE covers the subtree;
 /// stamping a root is allowed because the additive ACE on `C:\` is
 /// wide but not destructive — the user can remove it).
+///
+/// A trailing `\`/`/` is a CREATION hint (missing target ⇒
+/// directory placeholder), not an assertion about an existing
+/// object: existing targets are probed with the marker stripped,
+/// so a dir-marked path that exists as a FILE gets the ACE bound
+/// to the file (with an info line) instead of failing the path —
+/// the embedder's config snapshot can race the filesystem.
 ///
 /// A `Deny` target that does not exist is materialized via
 /// [`create_placeholder_chain`] (trailing `\`/`/` ⇒ directory
@@ -455,8 +474,21 @@ fn canonicalize_ace_targets(
         )
     });
     for (p, ace) in flat {
-        let canon = match canonicalize_path(p) {
-            Ok((c, _is_dir)) => c,
+        let has_marker = p.ends_with(['\\', '/']);
+        // Probe with the dir marker stripped — `dir\` and `dir`
+        // name the same object, and `file\` would fail CreateFileW
+        // even though the file is a perfectly deniable target.
+        let canon = match canonicalize_path(trim_dir_marker(p)) {
+            Ok((c, is_dir)) => {
+                if has_marker && !is_dir {
+                    eprintln!(
+                        "srt-win: {label} target '{p}' is dir-marked \
+                         but exists as a file; applying the {label} \
+                         to the file"
+                    );
+                }
+                c
+            }
             Err(CanonError::Glob) => {
                 return Err(anyhow!(
                     "Windows fs {label} requires explicit file \
@@ -472,8 +504,7 @@ fn canonicalize_ace_targets(
                     );
                     continue;
                 }
-                let leaf_is_dir = p.ends_with(['\\', '/']);
-                match create_placeholder_chain(p, leaf_is_dir, |c| db.record_placeholder(c)) {
+                match create_placeholder_chain(p, has_marker, |c| db.record_placeholder(c)) {
                     Ok((leaf_canon, chain)) => {
                         if !chain.is_empty() {
                             eprintln!(
@@ -1723,6 +1754,47 @@ fn maybe_self_elevate(args: &[OsString]) -> anyhow::Result<Option<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dir-marker (trailing separator) × existing-object matrix.
+    /// The marker is a creation hint, never an assertion: existing
+    /// targets are probed with it stripped, so `file\` binds the
+    /// ACE to the file and `dir\` names the same object as `dir`.
+    /// (missing × marker — file vs dir placeholder — is covered by
+    /// `path_id::tests::placeholder_chain_round_trip`.)
+    #[test]
+    fn dir_marker_matrix() {
+        use srt_win::path_id::canonicalize_path;
+        // Pure trim rows: marker stripped, either separator; a
+        // volume root keeps its separator (else drive-relative).
+        assert_eq!(trim_dir_marker(r"C:\a\b\"), r"C:\a\b");
+        assert_eq!(trim_dir_marker("C:/a/b/"), "C:/a/b");
+        assert_eq!(trim_dir_marker(r"C:\a\b"), r"C:\a\b");
+        assert_eq!(trim_dir_marker(r"C:\"), r"C:\");
+        assert_eq!(trim_dir_marker("C:/"), "C:/");
+
+        let base = std::env::temp_dir().join(format!("srt-dm-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("d")).unwrap();
+        std::fs::write(base.join("f.txt"), b"x").unwrap();
+        let file = base.join("f.txt").display().to_string();
+        let dir = base.join("d").display().to_string();
+
+        // marker + FILE: raw fails CreateFileW (why the trim
+        // exists); trimmed probe names the file.
+        let marked_file = format!("{file}\\");
+        assert!(canonicalize_path(&marked_file).is_err());
+        let (canon, is_dir) = canonicalize_path(trim_dir_marker(&marked_file)).unwrap();
+        assert!(!is_dir);
+        assert_eq!(canon, canonicalize_path(&file).unwrap().0);
+
+        // marker + DIR: same object as without the marker.
+        let marked_dir = format!("{dir}\\");
+        let (canon_m, is_dir_m) = canonicalize_path(trim_dir_marker(&marked_dir)).unwrap();
+        let (canon_u, is_dir_u) = canonicalize_path(&dir).unwrap();
+        assert!(is_dir_m && is_dir_u);
+        assert_eq!(canon_m, canon_u);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     /// `run_from_args` strips the `argv[1]` sentinel before clap so
     /// the same argv shape works whether the embedder's dispatcher
