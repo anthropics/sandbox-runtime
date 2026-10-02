@@ -1,10 +1,14 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
+  type GlobWalkListings,
+  type GlobWalks,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
   properAncestors,
-  walkGlobPattern,
+  type Steps,
+  finish,
+  walkGlobPatternSteps,
 } from './sandbox-utils.js'
 
 /**
@@ -70,15 +74,41 @@ function collapseReadDenyLocations({
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
+ * @param listings - one map for all the patterns of a configuration.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
+  listings?: GlobWalkListings,
 ): string[] {
-  const walk = walkGlobPattern(globPattern, {
+  return finish(
+    expandReadDenyGlobLinuxSteps(
+      globPattern,
+      reExposedPaths,
+      unlistableDirs,
+      listings,
+    ),
+  )
+}
+
+/**
+ * {@link expandReadDenyGlobLinux}, in the walk's steps. With `walks`, a
+ * pattern walked before is not walked again; what follows the walk is done
+ * anew each time, since `reExposedPaths` may differ.
+ */
+export function* expandReadDenyGlobLinuxSteps(
+  globPattern: string,
+  reExposedPaths: readonly string[],
+  unlistableDirs?: Set<string>,
+  listings?: GlobWalkListings,
+  walks?: GlobWalks,
+): Steps<string[]> {
+  const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
+    listings,
+    walks,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.

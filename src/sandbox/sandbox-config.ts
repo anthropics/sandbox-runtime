@@ -7,7 +7,11 @@ import { isIP } from 'node:net'
 import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
-import { z } from 'zod'
+// The 'zod/v3' subpath, not bare 'zod': it exists from zod 3.25 on and is the
+// v3 API under both zod 3.25+ and zod 4. Where a consumer's dependency tree
+// resolves this package's zod to version 4, the bare import would hand these
+// schemas the v4 API they are not written against.
+import { z } from 'zod/v3'
 import {
   isInjectHostCoveredByAllowedDomains,
   splitDomainPatternPort,
@@ -1155,7 +1159,9 @@ export const SandboxRuntimeConfigSchema = z
       .max(10)
       .optional()
       .describe(
-        'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
+        'How deep below the working directory dangerous names are looked for on Linux (default: 3): ' +
+          'a dangerous file down to this depth, and a dangerous directory, or the hooks and ' +
+          'config of a repository, one level higher up. ' +
           'Higher values provide more protection but slower performance.',
       ),
     allowPty: z

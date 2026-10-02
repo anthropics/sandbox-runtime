@@ -533,6 +533,10 @@ srt "jest --no-watchman"
 
 Watchman accesses files outside the sandbox boundaries, which will trigger permission errors. Disabling it allows Jest to run with the built-in file watcher instead.
 
+**Exit status under zsh (Linux):** From the first release after v0.0.77, a wrap that restricts the network reports the wrapped command's own exit status when `binShell` is zsh. Up to v0.0.77 a failing command could report 0 there: the wrapper's cleanup trap ended with a bare `exit`, which zsh resolves to the status of the trap's last command. bash (the default) and dash were not affected.
+
+**zod 4 in the same dependency tree:** The `zod` dependency range is `^3.25.0`. The library imports `zod/v3`, which exists from zod 3.25 on, so that it keeps the v3 API where a dependency tree resolves `zod` to version 4.
+
 ## Platform Support
 
 - **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
@@ -555,6 +559,8 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Ubuntu/Debian: `apt-get install ripgrep`
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
+
+**Supported bubblewrap versions:** 0.4.0 and later, except that two things need 0.5.0 or newer, both of them changes to how bubblewrap prepares the mount point for a file bind: a `denyRead` entry or credential mask naming a path that is not a regular file — a fifo, a socket, a device node — cannot be applied on an older bubblewrap, which creates a file at the destination instead of binding over what is there (that fails on a read-only mount and blocks on a fifo); and a mount point left behind by an interrupted sandbox (see "Write denies on paths that do not exist yet" below) is created with write bits there, so the next wrap does not recognise it as a leftover and leaves it on the host. `checkDependencies()` runs `bwrap --version` (keeping the answer for the life of the process) and returns a warning naming the version it found when bubblewrap is older than 0.5.0; it is a warning, not a refusal. CI runs the whole suite against the bubblewrap Ubuntu ships and against 0.12.0, and the Linux mount-plan suites against 0.4.1 as well.
 
 **Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
 
@@ -732,6 +738,8 @@ Filesystem restrictions are enforced at the OS level:
 
 **Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas. On Linux that also holds when the `denyWrite` entry is at or above the `allowWrite` one — `allowWrite: ["/", "/work"]` with `denyWrite: ["/"]` leaves `/work` read-only rather than writable — and with debug logging on (`SRT_DEBUG`) the wrap logs a warning naming both paths.
 
+**Writes through links (Linux and macOS):** a write is judged by where it lands, after symbolic links are followed. A link inside an allowed write path that leads out of it gives a command nothing: the write is refused. A link that leads into an allowed write path works like any other name for that place. A hard link is a second name for the file itself: on Linux a file outside the allowed write paths that already has a hard link inside one can be written through it, and a sandboxed command cannot create such a link. On macOS nothing is promised for such a file.
+
 **Read-side rules (Linux):** an entry is matched by the name it is, not by what it points at.
 
 - An `allowRead` entry re-allows the name it names, so a link planted at an allowed path cannot re-open a denied one. One that is itself a symlink is bound back at its own name, from the target it was checked against: the target's own path stays hidden, and the target's contents are reachable only through the name. A `denyRead` entry or a credential mask that overlaps that target — at it, inside it, or covering it — wins over the carve-out, which is then not restored at all: the name is absent inside the sandbox rather than serving what the deny hides. The denied directory the carve-out is being restored into is not such an overlap, nor is anything above it: those are what the carve-out is an exception to. Neither is an entry that denies nothing — one naming a path that is not there, or a file an `allowRead` entry lifts.
@@ -784,7 +792,7 @@ With `allowWrite: ["/"]` the pins reach every ancestor, including any other allo
 
 A wrap that carries no write restrictions at all — `filesystem.disabled` with credential masks still in force, or a library caller passing no write config while a `denyRead` entry or a mask still seeds a pin — is the same shape: the whole tree is bound writable, so it gets the same pins and the same top-level covers, and the same `EXDEV` boundary applies there too.
 
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
+**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance: a dangerous file is found down to `a/b/.bashrc`, and a dangerous directory, or the hooks and config of a repository, one level higher up (`a/.vscode`, `a/.claude/commands`, `a/.git/hooks`). Ignore files (`.gitignore`, `.ignore`) do not hide anything from it, and a directory of the user's own that it cannot read is denied whole. A dangerous directory other than a repository's hooks is only seen if it holds a file directly: below the working directory, one that is empty or does not exist yet can be filled. A repository that has no `hooks` directory has an empty file in its place while a command runs, which stops `git init` from being run again there and a hook from being installed. You can configure this with `mandatoryDenySearchDepth`:
 
 ```json
 {

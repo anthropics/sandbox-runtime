@@ -18,10 +18,14 @@ import { join } from 'node:path'
 import {
   expandGlobPattern,
   expandTilde,
+  finish,
+  finishInTurns,
   globPatternBaseDir,
   globToRegex,
   normalizePathForSandbox,
+  type Steps,
   walkGlobPattern,
+  walkGlobPatternSteps,
 } from '../../src/sandbox/sandbox-utils.js'
 import {
   containsGlobCharsWin,
@@ -595,6 +599,74 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
+  it('lists a directory once for all the patterns handed the same listings', () => {
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-shared-')))
+    try {
+      mkdirSync(join(root, 'a', 'b'), { recursive: true })
+      writeFileSync(join(root, 'a', '.env'), '')
+      writeFileSync(join(root, 'a', 'b', 'id.pem'), '')
+      writeFileSync(join(root, 'a', 'b', 'notes.txt'), '')
+      const patterns = ['**/.env', '**/*.pem', '**/*.key'].map(p =>
+        join(root, p),
+      )
+      const alone = patterns.map(p => walkGlobPattern(p).matches)
+
+      const listed: string[] = []
+      const readdirSync = fs.readdirSync
+      const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        listed.push(String(args[0]))
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      let together
+      try {
+        const listings = new Map()
+        together = patterns.map(p => walkGlobPattern(p, { listings }).matches)
+      } finally {
+        readdirSpy.mockRestore()
+      }
+
+      expect(listed.sort()).toEqual(
+        [root, join(root, 'a'), join(root, 'a', 'b')].sort(),
+      )
+      expect(together).toEqual(alone)
+      expect(together.flat().sort()).toEqual(
+        [join(root, 'a', '.env'), join(root, 'a', 'b', 'id.pem')].sort(),
+      )
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('walks no pattern again that it is handed the walk of', () => {
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-kept-')))
+    try {
+      mkdirSync(join(root, 'a', 'b'), { recursive: true })
+      writeFileSync(join(root, 'a', 'b', 'id.pem'), '')
+      const pattern = join(root, '**/*.pem')
+      const stepsOf = (steps: Steps<unknown>): number => {
+        let taken = 0
+        while (!steps.next().done) taken++
+        return taken
+      }
+      const walks = new Map()
+      const first = walkGlobPattern(pattern, { walks })
+      expect(first.matches).toEqual([join(root, 'a', 'b', 'id.pem')])
+      expect(stepsOf(walkGlobPatternSteps(pattern, { walks }))).toBe(0)
+      expect(walkGlobPattern(pattern, { walks })).toBe(first)
+      // The same pattern with other options is another walk.
+      expect(
+        stepsOf(
+          walkGlobPatternSteps(pattern, { walks, withDirectoryForm: true }),
+        ),
+      ).toBeGreaterThan(0)
+      expect(walks.size).toBe(2)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('lists a directory again under a name the pattern tells apart', () => {
     // vault is reached by its own name, which matches nothing, and through
     // config/secrets, the only spelling `**/secrets/*.pem` matches. However
@@ -721,6 +793,88 @@ describe.if(!isWindows)('walkGlobPattern', () => {
 // ============================================================================
 // expandTilde — `~\` form is Windows-only
 // ============================================================================
+
+describe('finishInTurns', () => {
+  /** `count` steps of about `ms` each; returns how many it took. */
+  function* busy(
+    count: number,
+    ms: number,
+    taken = { steps: 0 },
+  ): Steps<number> {
+    for (let i = 0; i < count; i++) {
+      const until = performance.now() + ms
+      while (performance.now() < until);
+      taken.steps++
+      yield
+    }
+    return taken.steps
+  }
+
+  it('lets the event loop have a turn while the steps go on', async () => {
+    const taken = { steps: 0 }
+    let stepsWhenTheTimerFired = -1
+    setTimeout(() => (stepsWhenTheTimerFired = taken.steps), 0)
+    expect(await finishInTurns(busy(30, 3, taken))).toBe(30)
+    expect(stepsWhenTheTimerFired).toBeGreaterThan(0)
+    expect(stepsWhenTheTimerFired).toBeLessThan(30)
+  })
+
+  it('takes no step for a signal already aborted', async () => {
+    const taken = { steps: 0 }
+    const reason = new Error('stopped')
+    expect(
+      await finishInTurns(busy(3, 0, taken), AbortSignal.abort(reason)).catch(
+        (e: unknown) => e,
+      ),
+    ).toBe(reason)
+    expect(taken.steps).toBe(0)
+  })
+
+  it("stops at the next turn with the signal's reason", async () => {
+    const taken = { steps: 0 }
+    const controller = new AbortController()
+    const reason = new Error('stopped')
+    setTimeout(() => controller.abort(reason), 0)
+    expect(
+      await finishInTurns(busy(30, 3, taken), controller.signal).catch(
+        (e: unknown) => e,
+      ),
+    ).toBe(reason)
+    expect(taken.steps).toBeLessThan(30)
+  })
+
+  it('hands nothing out when the signal is aborted in the last step', async () => {
+    const controller = new AbortController()
+    const reason = new Error('stopped')
+    function* abortsAtTheEnd(): Steps<string> {
+      yield
+      controller.abort(reason)
+      return 'done'
+    }
+    expect(
+      await finishInTurns(abortsAtTheEnd(), controller.signal).catch(
+        (e: unknown) => e,
+      ),
+    ).toBe(reason)
+  })
+
+  it('finds what the walk finds on the spot', async () => {
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-turns-')))
+    try {
+      mkdirSync(join(root, 'a', 'b'), { recursive: true })
+      writeFileSync(join(root, 'a', 'b', 'id.pem'), '')
+      symlinkSync(join(root, 'a'), join(root, 'link'))
+      const opts = { followSymlinkedDirectories: true, withDirectoryForm: true }
+      const pattern = join(root, '**/*.pem')
+      const inTurns = await finishInTurns(walkGlobPatternSteps(pattern, opts))
+      expect(inTurns).toEqual(walkGlobPattern(pattern, opts))
+      expect(inTurns).toEqual(finish(walkGlobPatternSteps(pattern, opts)))
+      expect(inTurns.matches).toEqual([join(root, 'a', 'b', 'id.pem')])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('expandTilde', () => {
   it.if(!isWindows)(
@@ -1183,6 +1337,338 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
     expect(readConfig.denyOnly).not.toContain(join(realTestDir, 'readme.txt'))
 
     await SandboxManager.reset()
+  })
+
+  it('lists a directory once for all the denyRead patterns of a configuration', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: ['*.env', '*.txt', '*.pem'].map(p => join(RAW_TEST_DIR, p)),
+        allowWrite: ['/tmp'],
+        denyWrite: [],
+      },
+    })
+
+    const realTestDir = realPath(RAW_TEST_DIR)
+    const timesListedBy = async (call: () => unknown): Promise<number> => {
+      let times = 0
+      const readdirSync = fs.readdirSync
+      const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        if (String(args[0]) === realTestDir) times++
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      try {
+        await call()
+      } finally {
+        readdirSpy.mockRestore()
+      }
+      return times
+    }
+    try {
+      expect(await timesListedBy(() => SandboxManager.getFsReadConfig())).toBe(
+        1,
+      )
+      expect(
+        await timesListedBy(() => SandboxManager.wrapWithSandbox('true')),
+      ).toBe(1)
+    } finally {
+      await SandboxManager.reset()
+    }
+  })
+
+  for (const list of ['denyRead', 'allowRead'] as const) {
+    it(`gives up a wrap whose signal is aborted while a ${list} pattern is walked`, async () => {
+      const { SandboxManager } = await import(
+        '../../src/sandbox/sandbox-manager.js'
+      )
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-abort-')))
+      const dirs = Array.from({ length: 12 }, (_, i) => join(root, `d${i}`))
+      for (const dir of dirs) mkdirSync(dir)
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: list === 'denyRead' ? [join(root, '**/*.pem')] : [root],
+          allowRead: list === 'allowRead' ? [join(root, '**/*.pem')] : [],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      })
+
+      // Each listing takes longer than a turn, and the third one aborts.
+      const controller = new AbortController()
+      const reason = new Error('stopped')
+      let listed = 0
+      const readdirSync = fs.readdirSync
+      const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        if (String(args[0]).startsWith(root)) {
+          if (++listed === 3) controller.abort(reason)
+          const until = performance.now() + 15
+          while (performance.now() < until);
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      try {
+        expect(
+          await SandboxManager.wrapWithSandbox(
+            'true',
+            undefined,
+            undefined,
+            controller.signal,
+          ).catch((e: unknown) => e),
+        ).toBe(reason)
+        expect(listed).toBe(3)
+      } finally {
+        readdirSpy.mockRestore()
+        await SandboxManager.reset()
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+  }
+
+  it('wraps by one configuration when that is replaced in a turn', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-replaced-')))
+    for (let i = 0; i < 6; i++) {
+      mkdirSync(join(root, 'tree', `d${i}`), { recursive: true })
+    }
+    mkdirSync(join(root, '.git'))
+    for (const name of ['first', 'second', '.git/config']) {
+      writeFileSync(join(root, name), '')
+    }
+    // They differ in what the wrap reads before its first turn and after its
+    // last: put together, the first's write list and the second's
+    // allowGitConfig would leave .git/config writable, which neither does.
+    const network = { allowedDomains: [], deniedDomains: [] }
+    const allowRead = [join(root, 'tree', '**/*.pem')]
+    const first = {
+      network,
+      filesystem: {
+        denyRead: [join(root, 'first')],
+        allowRead,
+        allowWrite: [root],
+        denyWrite: [],
+      },
+    }
+    const second = {
+      network,
+      filesystem: {
+        denyRead: [join(root, 'second')],
+        allowRead,
+        allowWrite: [],
+        denyWrite: [],
+        allowGitConfig: true,
+      },
+    }
+
+    const cwd = process.cwd()
+    process.chdir(root)
+    await SandboxManager.reset()
+    await SandboxManager.initialize(first)
+
+    // Each listing takes longer than a turn; the configuration is replaced
+    // while the allowRead pattern, the first to be walked, is under way.
+    let listed = 0
+    const readdirSync = fs.readdirSync
+    const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      if (String(args[0]).startsWith(root)) {
+        if (++listed === 2) SandboxManager.updateConfig(second)
+        const until = performance.now() + 15
+        while (performance.now() < until);
+      }
+      return readdirSync(...args)
+    }) as typeof fs.readdirSync)
+    try {
+      const disturbed = await SandboxManager.wrapWithSandbox('true')
+      readdirSpy.mockRestore()
+
+      expect(listed).toBeGreaterThan(2)
+      expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+      expect(disturbed).toContain(join(root, 'second'))
+      expect(disturbed).not.toContain(join(root, 'first'))
+    } finally {
+      readdirSpy.mockRestore()
+      process.chdir(cwd)
+      await SandboxManager.reset()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  for (const list of ['denyRead', 'allowRead'] as const) {
+    it(`asks the disk nothing again for a ${list} pattern when the wrap starts over`, async () => {
+      const { SandboxManager } = await import(
+        '../../src/sandbox/sandbox-manager.js'
+      )
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-over-')))
+      for (let i = 0; i < 6; i++) mkdirSync(join(root, `d${i}`))
+      writeFileSync(join(root, 'd0', 'id.pem'), '')
+      const link = join(root, 'link')
+      symlinkSync(join(root, 'd0'), link)
+      const configured = (allowWrite: string[]) => ({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: list === 'denyRead' ? [join(root, '**/*.pem')] : [root],
+          allowRead: list === 'allowRead' ? [join(root, '**/*.pem')] : [],
+          allowWrite,
+          denyWrite: [],
+        },
+      })
+      // Each listing takes longer than a turn; `duringSecond` runs in the
+      // second one. A denyRead walk resolves the link it meets, so a pattern
+      // walked again shows there even when its listings were kept.
+      const wrapAsking = async (
+        duringSecond?: () => void,
+      ): Promise<[string, string[]]> => {
+        const asked: string[] = []
+        let listed = 0
+        const { readdirSync, realpathSync } = fs
+        const spies = [
+          spyOn(fs, 'readdirSync').mockImplementation(((
+            ...args: Parameters<typeof fs.readdirSync>
+          ) => {
+            if (String(args[0]).startsWith(root)) {
+              asked.push(`list ${String(args[0])}`)
+              if (++listed === 2) duringSecond?.()
+              const until = performance.now() + 15
+              while (performance.now() < until);
+            }
+            return readdirSync(...args)
+          }) as typeof fs.readdirSync),
+          spyOn(fs, 'realpathSync').mockImplementation(((
+            ...args: Parameters<typeof fs.realpathSync>
+          ) => {
+            if (String(args[0]) === link) asked.push('resolve link')
+            return realpathSync(...args)
+          }) as typeof fs.realpathSync),
+        ]
+        try {
+          return [await SandboxManager.wrapWithSandbox('true'), asked.sort()]
+        } finally {
+          for (const spy of spies) spy.mockRestore()
+        }
+      }
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize(configured([]))
+      try {
+        const [disturbed, asked] = await wrapAsking(() =>
+          SandboxManager.updateConfig(configured([root])),
+        )
+        const [undisturbed, askedAlone] = await wrapAsking()
+        expect(asked).toEqual(askedAlone)
+        expect(asked).toContain(`list ${join(root, 'd5')}`)
+        expect(asked.includes('resolve link')).toBe(list === 'denyRead')
+        expect(disturbed).toBe(undisturbed)
+      } finally {
+        await SandboxManager.reset()
+        rmSync(root, { recursive: true, force: true })
+      }
+    })
+  }
+
+  it('walks without a turn once a wrap has started over twice', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-churn-')))
+    for (let n = 0; n < 8; n++) {
+      mkdirSync(join(root, `t${n}`, 'd'), { recursive: true })
+      writeFileSync(join(root, `t${n}`, 'd', 'id.pem'), '')
+    }
+    // Each configuration's pattern has a base no other one lists.
+    const configured = (n: number) => ({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        denyRead: [join(root, `t${n}`, '**/*.pem')],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize(configured(0))
+
+    // Each listing takes longer than a turn and leaves a new configuration
+    // for the next turn to bring. The first attempt walks t0 and the second
+    // t1, each with a turn between its two listings; the third walks t3
+    // with none, so the configurations its listings leave come too late.
+    let replaced = 0
+    const listed: string[] = []
+    const readdirSync = fs.readdirSync
+    const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      if (String(args[0]).startsWith(root)) {
+        listed.push(String(args[0]).slice(root.length + 1))
+        setImmediate(() => SandboxManager.updateConfig(configured(++replaced)))
+        const until = performance.now() + 15
+        while (performance.now() < until);
+      }
+      return readdirSync(...args)
+    }) as typeof fs.readdirSync)
+    try {
+      const wrapped = await SandboxManager.wrapWithSandbox('true')
+      readdirSpy.mockRestore()
+
+      expect(listed).toEqual(['t0', 't0/d', 't1', 't1/d', 't3', 't3/d'])
+      expect(wrapped).toContain(join(root, 't3', 'd', 'id.pem'))
+      expect(wrapped).not.toContain(join(root, 't1', 'd', 'id.pem'))
+    } finally {
+      readdirSpy.mockRestore()
+      await new Promise(resolve => setImmediate(resolve))
+      await SandboxManager.reset()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('gives up a wrap whose signal is aborted while the mandatory denies are looked for', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-scan-')))
+    // Stands in for ripgrep, and outlasts the abort.
+    const slowScan = join(root, 'slow-scan')
+    writeFileSync(slowScan, '#!/bin/sh\nsleep 5\n', { mode: 0o755 })
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [root], denyWrite: [] },
+      ripgrep: { command: slowScan },
+    })
+    const controller = new AbortController()
+    const reason = new Error('stopped')
+    setTimeout(() => controller.abort(reason), 200)
+    try {
+      expect(
+        await SandboxManager.wrapWithSandbox(
+          'true',
+          undefined,
+          undefined,
+          controller.signal,
+        ).catch((e: unknown) => e),
+      ).toBe(reason)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 
   it('should pass non-glob paths through unchanged on Linux', async () => {

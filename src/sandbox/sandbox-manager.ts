@@ -51,7 +51,7 @@ import {
   cleanupBwrapMountPoints,
   linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
-import { expandReadDenyGlobLinux } from './read-deny-glob.js'
+import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -86,7 +86,12 @@ import {
   globPatternBaseDir,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
-  expandGlobPattern,
+  walkGlobPatternSteps,
+  type GlobWalkListings,
+  type GlobWalks,
+  type Steps,
+  finish,
+  finishInTurns,
   attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
@@ -1277,20 +1282,26 @@ function unionDenyReadPaths(
  * it is passed through whatever characters it contains. Expanded as a
  * pattern, a name holding `[` matches nothing and the deny is lost.
  */
-function resolveReadPathEntries(
+function* resolveReadPathEntries(
   paths: readonly string[],
-  expandGlob: (pattern: string) => string[],
+  expandGlob: (pattern: string) => Steps<string[]>,
   literalPaths: readonly string[] = [],
-): string[] {
+): Steps<string[]> {
   const literal = new Set(literalPaths)
-  return paths.flatMap(p => {
+  const resolved: string[] = []
+  for (const p of paths) {
     const stripped = removeTrailingGlobSuffix(p)
-    return getPlatform() === 'linux' &&
+    if (
+      getPlatform() === 'linux' &&
       !literal.has(p) &&
       containsGlobChars(stripped)
-      ? expandGlob(p)
-      : [stripped]
-  })
+    ) {
+      resolved.push(...(yield* expandGlob(p)))
+    } else {
+      resolved.push(stripped)
+    }
+  }
+  return resolved
 }
 
 /**
@@ -1310,8 +1321,11 @@ function stripWriteGlobs(paths: readonly string[]): string[] {
     })
 }
 
-function expandAllowReadGlob(pattern: string): string[] {
-  const expanded = expandGlobPattern(pattern)
+function* expandAllowReadGlob(
+  pattern: string,
+  walks?: GlobWalks,
+): Steps<string[]> {
+  const expanded = (yield* walkGlobPatternSteps(pattern, { walks })).matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -1338,17 +1352,27 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   )
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.
-  const allowPaths = resolveReadPathEntries(
-    config.filesystem.allowRead ?? [],
-    expandAllowReadGlob,
+  const allowPaths = finish(
+    resolveReadPathEntries(
+      config.filesystem.allowRead ?? [],
+      expandAllowReadGlob,
+    ),
   )
   const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
   const unlistableDenyDirs = new Set<string>()
-  const denyPaths = resolveReadPathEntries(
-    unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
-    pattern =>
-      expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
-    credentialRestrictions.degradeToDenyPaths,
+  const listings: GlobWalkListings = new Map()
+  const denyPaths = finish(
+    resolveReadPathEntries(
+      unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
+      pattern =>
+        expandReadDenyGlobLinuxSteps(
+          pattern,
+          reExposedPaths,
+          unlistableDenyDirs,
+          listings,
+        ),
+      credentialRestrictions.degradeToDenyPaths,
+    ),
   )
 
   return {
@@ -1653,7 +1677,37 @@ export type WrapWithSandboxOptions = {
   commandText?: string
 }
 
+/** What a wrap has found on disk so far, which it keeps when it starts over. */
+type WrapFindings = {
+  listings: GlobWalkListings
+  walks: GlobWalks
+  /** How many times the wrap has started over. */
+  restarts: number
+}
+
+/** A wrap that has started over this many times walks without giving the
+ *  thread back. */
+const RESTARTS_IN_TURNS = 2
+
 async function wrapWithSandbox(
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
+  return wrapWithSandboxKeeping(
+    { listings: new Map(), walks: new Map(), restarts: 0 },
+    command,
+    binShell,
+    customConfig,
+    abortSignal,
+    options,
+  )
+}
+
+async function wrapWithSandboxKeeping(
+  found: WrapFindings,
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
@@ -1663,6 +1717,14 @@ async function wrapWithSandbox(
   const platform = getPlatform()
   const commandId = options?.commandId
   registerCommandText(command, options)
+  const startedWith = config
+  const walked = <T>(steps: Steps<T>): T | Promise<T> => {
+    if (found.restarts < RESTARTS_IN_TURNS) {
+      return finishInTurns(steps, abortSignal)
+    }
+    abortSignal?.throwIfAborted()
+    return finish(steps)
+  }
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -1722,9 +1784,13 @@ async function wrapWithSandbox(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
-    const expandedAllowRead = resolveReadPathEntries(
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
-      expandAllowReadGlob,
+    const expandedAllowRead = await walked(
+      resolveReadPathEntries(
+        customConfig?.filesystem?.allowRead ??
+          config?.filesystem.allowRead ??
+          [],
+        pattern => expandAllowReadGlob(pattern, found.walks),
+      ),
     )
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
@@ -1738,14 +1804,24 @@ async function wrapWithSandbox(
     }
     const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
     const unlistableDenyDirs = new Set<string>()
-    const expandedDenyRead = resolveReadPathEntries(
-      unionDenyReadPaths(
-        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-        credentialRestrictions,
+    const expandedDenyRead = await walked(
+      resolveReadPathEntries(
+        unionDenyReadPaths(
+          customConfig?.filesystem?.denyRead ??
+            config?.filesystem.denyRead ??
+            [],
+          credentialRestrictions,
+        ),
+        pattern =>
+          expandReadDenyGlobLinuxSteps(
+            pattern,
+            reExposedPaths,
+            unlistableDenyDirs,
+            found.listings,
+            found.walks,
+          ),
+        credentialRestrictions.degradeToDenyPaths,
       ),
-      pattern =>
-        expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
-      credentialRestrictions.degradeToDenyPaths,
     )
     readConfig = {
       denyOnly: expandedDenyRead,
@@ -1776,6 +1852,30 @@ async function wrapWithSandbox(
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
     await waitForNetworkInitialization()
+  }
+
+  // INVARIANT: one wrap, one configuration. updateConfig() can run in any of
+  // the turns above, and what was read before it must not be put together
+  // with what is read after it: the write list of one configuration with the
+  // allowGitConfig of another is a policy nobody chose. So the wrap starts
+  // over. Nothing from here to the platform's wrapper awaits.
+  //
+  // INVARIANT: starting over costs only what is new, and ends. An embedder
+  // can replace the configuration many times during one walk, mostly with
+  // the same content. So the wrap keeps what it has listed and walked: an
+  // attempt with no pattern new to it takes no turn of the event loop, and
+  // after RESTARTS_IN_TURNS the new ones are walked without a turn as well.
+  // What is kept is as old as its walk, and misses a path made since, as one
+  // long walk misses a path made behind it.
+  if (config !== startedWith) {
+    return wrapWithSandboxKeeping(
+      { ...found, restarts: found.restarts + 1 },
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
   }
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
