@@ -15,6 +15,7 @@ import type {
 } from 'node:http'
 import { PassThrough, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
+import { drainThenDestroy } from './drain-then-destroy.js'
 import { isResolvedAddressDenied } from './resolved-address-guard.js'
 
 export type RequestDecision = {
@@ -64,20 +65,6 @@ export const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
  * (<sandbox_violations>), so it names the policy, not the internal hook.
  */
 export const DEFAULT_DENY_REASON = 'denied by sandbox policy'
-
-/**
- * Destroy a denied client's request only after the 403 has flushed —
- * destroying the shared socket in the same tick can RST the response
- * away (observed on Node; the unread request body makes close send RST).
- */
-function destroyAfterResponse(req: IncomingMessage, res: ServerResponse): void {
-  if (res.writableFinished || res.destroyed) {
-    req.destroy()
-    return
-  }
-  res.once('finish', () => req.destroy())
-  res.once('close', () => req.destroy())
-}
 
 /**
  * Build a `Request`, run the callback, and if denied write the 403 response
@@ -169,7 +156,7 @@ export async function decideAndRespond(
     // The shim breaks the old fromWeb→tee→toWeb cancel cascade that used
     // to destroy req; without this a denied client keeps uploading into a
     // stalled pipe and holds the connection open.
-    if (forUpstream !== req) destroyAfterResponse(req, res)
+    if (forUpstream !== req) drainThenDestroy(req, res)
     return null
   }
 
@@ -200,7 +187,7 @@ export async function decideAndRespond(
   onDeny?.(method, url, decision.reason ?? DEFAULT_DENY_REASON)
   deny(res, decision)
   forUpstream.destroy()
-  if (forUpstream !== req) destroyAfterResponse(req, res)
+  if (forUpstream !== req) drainThenDestroy(req, res)
   return null
 }
 
