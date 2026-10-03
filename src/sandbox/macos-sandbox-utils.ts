@@ -289,13 +289,24 @@ function toPathEntry(pathPattern: string): PathEntry {
  * `subpath` filter whatever characters it contains — sniffed as a pattern,
  * a component like `a[b` would become a character class and the filter
  * would no longer match the path it was built from (the rule would be
- * inert). Never use this for a caller's spelling.
+ * inert). Never use this for a spelling the caller did not mark literal.
  */
 function toLiteralPathEntry(literalPath: string): PathEntry {
   return {
     path: normalizePathForSandbox(literalPath, { literal: true }),
     glob: false,
   }
+}
+
+/** One of the caller's lists as entries: spellings, then marked paths. */
+function callerEntries(
+  spellings: readonly string[] | undefined,
+  literalPaths: readonly string[] | undefined,
+): PathEntry[] {
+  return [
+    ...(spellings ?? []).map(toPathEntry),
+    ...(literalPaths ?? []).map(toLiteralPathEntry),
+  ]
 }
 
 /** Does a subtree-extended deny glob regex cover `entry`'s region? */
@@ -322,7 +333,7 @@ interface ResolvedReadConfig {
 
 function resolveReadConfig(
   config: FsReadRestrictionConfig,
-  writeAllowPaths: readonly string[] | undefined,
+  writeRoots: readonly PathEntry[],
   /**
    * Read denies the library resolved itself — the masked credential files,
    * which macOS degrades to a deny. Already literal: each names the file
@@ -331,12 +342,18 @@ function resolveReadConfig(
   libraryDenies: readonly PathEntry[],
 ): ResolvedReadConfig {
   return {
-    denies: [...(config.denyOnly || []).map(toPathEntry), ...libraryDenies],
+    denies: [
+      ...callerEntries(config.denyOnly, config.literalDenyOnly),
+      ...libraryDenies,
+    ],
     // Non-glob spellings arrive slash-free from normalizePathForSandbox —
     // the nested-deny re-emit matches by `path + '/'` prefix, which a
     // preserved trailing slash would defeat ('<dir>//').
-    allows: (config.allowWithinDeny || []).map(toPathEntry),
-    writeRoots: (writeAllowPaths || []).map(toPathEntry),
+    allows: callerEntries(
+      config.allowWithinDeny,
+      config.literalAllowWithinDeny,
+    ),
+    writeRoots: [...writeRoots],
   }
 }
 
@@ -864,12 +881,23 @@ function generateReadRules(
 }
 
 /**
+ * What a write config allows, as entries: read once per profile, for the
+ * read and the write section alike, so neither can miss the marked paths.
+ */
+function writeRootEntries(
+  config: FsWriteRestrictionConfig | undefined,
+): PathEntry[] {
+  return callerEntries(config?.allowOnly, config?.literalAllowOnly)
+}
+
+/**
  * Generate filesystem write rules for sandbox profile
  */
 function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
-  allowGitConfig = false,
+  allowGitConfig: boolean,
+  writeRoots: readonly PathEntry[],
 ): string[] {
   if (!config) {
     return [`(allow file-write*)`]
@@ -879,8 +907,8 @@ function generateWriteRules(
 
   // Generate allow rules
   const allowFilters = new Set<string>()
-  for (const pathPattern of config.allowOnly || []) {
-    allowFilters.add(pathFilter(toPathEntry(pathPattern)))
+  for (const entry of writeRoots) {
+    allowFilters.add(pathFilter(entry))
   }
   rules.push(...renderRule('allow', ['file-write*'], allowFilters, logTag))
 
@@ -889,6 +917,7 @@ function generateWriteRules(
   // the mandatory entries carry their own literal/glob split.
   const denyEntries = [
     ...(config.denyWithinAllow || []).map(toPathEntry),
+    ...(config.literalDenyWithinAllow ?? []).map(toLiteralPathEntry),
     ...macGetMandatoryDenyEntries(allowGitConfig),
   ]
 
@@ -1231,6 +1260,7 @@ function generateSandboxProfile({
   }
   profile.push('')
 
+  const writeRoots = writeRootEntries(writeConfig)
   // Read rules
   // Pass write-allowed paths so that move-blocking deny rules in the read section
   // can be overridden for paths where file deletion should be permitted.
@@ -1238,7 +1268,7 @@ function generateSandboxProfile({
     readConfig || libraryDenyEntries.length > 0
       ? resolveReadConfig(
           readConfig ?? { denyOnly: [] },
-          writeConfig?.allowOnly,
+          writeRoots,
           libraryDenyEntries,
         )
       : undefined
@@ -1248,7 +1278,9 @@ function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
+  profile.push(
+    ...generateWriteRules(writeConfig, logTag, allowGitConfig, writeRoots),
+  )
 
   // Read-denied paths inside write roots: the read section's unlink/create
   // re-allow for write roots (and the write section's file-write* allows)
@@ -1347,7 +1379,9 @@ export function wrapCommandWithSandboxMacOS(
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
   const hasReadRestrictions =
-    (readConfig && readConfig.denyOnly.length > 0) ||
+    (readConfig &&
+      (readConfig.denyOnly.length > 0 ||
+        (readConfig.literalDenyOnly?.length ?? 0) > 0)) ||
     libraryDenyEntries.length > 0
   const hasWriteRestrictions = writeConfig !== undefined
   const hasEnvRestrictions =

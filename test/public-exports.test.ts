@@ -64,6 +64,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'windowsStateDir',
   'windowsTrustCa',
   'windowsTrustCaAsync',
+  'writeRootsOf',
 ]
 
 describe('package entry point', () => {

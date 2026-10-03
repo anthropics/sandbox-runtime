@@ -14,6 +14,7 @@ import {
   containsGlobCharsWin,
   expandGlobPattern,
   isUncPath,
+  markedLiteralPath,
 } from './sandbox-utils.js'
 // Kept on this module's surface for out-of-tree importers; the
 // implementations live in sandbox-utils.ts.
@@ -25,7 +26,7 @@ export {
 } from './sandbox-utils.js'
 import { certThumbprint, generateCa, validateCaPair } from './mitm-ca.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
-import type { SrtWinConfig } from './sandbox-config.js'
+import type { FilesystemPathEntry, SrtWinConfig } from './sandbox-config.js'
 
 /**
  * Windows sandbox backend.
@@ -1688,15 +1689,31 @@ export function uninstallWindowsSandbox(
  * `srt-win` soft-drops a missing UNC deny target rather than
  * materializing a placeholder chain on an SMB share. A UNC **glob**
  * still walks the share (user-trusted).
+ *
+ * An entry marked `{ path, literal: true }` is a literal whatever it holds.
+ * One that holds `*` or `?` is skipped: no Win32 name has them, and
+ * `srt-win` refuses the characters outright.
  */
 export function expandWindowsFsPaths(
-  patterns: readonly string[],
+  patterns: readonly FilesystemPathEntry[],
   opts?: { mode?: 'grant' | 'deny' },
 ): string[] {
   const out = new Set<string>()
-  for (const raw of patterns) {
-    const norm = normalizePathForSandbox(raw)
-    const isGlob = containsGlobCharsWin(norm)
+  for (const entry of patterns) {
+    const marked = typeof entry !== 'string'
+    const raw = marked ? markedLiteralPath(entry) : entry
+    const norm = normalizePathForSandbox(
+      raw,
+      marked ? { literal: true } : undefined,
+    )
+    if (marked && containsGlobCharsWin(norm)) {
+      logForDebugging(
+        `[Sandbox Windows] Skipping a literal path that no file can have: ${norm}`,
+        { level: 'warn' },
+      )
+      continue
+    }
+    const isGlob = !marked && containsGlobCharsWin(norm)
     // UNC literal: pass raw (no stat) — see {@link isUncPath}. A
     // UNC glob falls through to expandGlobPattern below.
     if (isUncPath(norm) && !isGlob) {

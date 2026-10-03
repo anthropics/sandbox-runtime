@@ -3,6 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import type { FilesystemPathEntry } from './sandbox-config.js'
 
 /**
  * Dangerous files that should be protected from writes.
@@ -134,6 +135,30 @@ export function containsGlobCharsForPlatform(p: string): boolean {
   return getPlatform() === 'windows'
     ? containsGlobCharsWin(p)
     : containsGlobChars(p)
+}
+
+/**
+ * The path of an entry that is not a spelling. Throws unless the entry is
+ * `{ path: string, literal: true }`: a config built in code skips the
+ * schema, and reading `{ path }` either way would be a guess about a deny.
+ */
+export function markedLiteralPath(
+  entry: Exclude<FilesystemPathEntry, string>,
+): string {
+  const candidate: { path?: unknown; literal?: unknown } | null = entry
+  if (
+    candidate === null ||
+    typeof candidate !== 'object' ||
+    typeof candidate.path !== 'string' ||
+    candidate.path === '' ||
+    candidate.literal !== true
+  ) {
+    throw new TypeError(
+      'A filesystem path entry must be a path, or { path, literal: true }; ' +
+        `got ${JSON.stringify(entry) ?? String(entry)}`,
+    )
+  }
+  return candidate.path
 }
 
 /**
@@ -381,14 +406,15 @@ function warnIfParentRefUnfolded(normalizedPath: string): string {
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
  *
  * `opts.literal` marks a path that names one file or directory rather
- * than matching several: one the library computed itself, or a caller
- * spelling that carried no glob character — resolving such a spelling can
- * splice in a cwd or home directory whose own name does. The glob
- * branches are skipped for it, so a component like `a[b` is resolved and
- * later compiled as the name it is. A spelling the caller wrote with `*`,
- * `?` or `[…]` in it keeps the character sniffing: there the brackets are
- * the glob syntax it asked for. The interior collapse below is not one of
- * the glob branches: `//` and `/./` are dead spellings either way.
+ * than matching several: one the library computed itself, one the caller
+ * marked literal, or a caller spelling that carried no glob character —
+ * resolving such a spelling can splice in a cwd or home directory whose own
+ * name does. The glob branches are skipped for it, so a component like
+ * `a[b` is resolved and later compiled as the name it is. A spelling the
+ * caller wrote with `*`, `?` or `[…]` in it and did not mark keeps the
+ * character sniffing: there the brackets are the glob syntax it asked for.
+ * The interior collapse below is not one of the glob branches: `//` and
+ * `/./` are dead spellings either way.
  */
 export function normalizePathForSandbox(
   pathPattern: string,
@@ -570,10 +596,12 @@ const HOME_CONVENIENCE_WRITE_DIRS: readonly string[] = [
  * still counts (which only ever drops a convenience path), and a glob whose
  * match is a symlink to one of these directories is not seen. A glob
  * `allowRead` entry is not counted as re-opening anything.
+ *
+ * An entry marked `{ path, literal: true }` is a name whatever it holds.
  */
 export function getDefaultWritePaths(readRules?: {
-  denyRead: readonly string[]
-  allowRead?: readonly string[]
+  denyRead: readonly FilesystemPathEntry[]
+  allowRead?: readonly FilesystemPathEntry[]
 }): string[] {
   const home = homedir()
   const keptDirs =
@@ -592,8 +620,8 @@ export function getDefaultWritePaths(readRules?: {
  */
 function homeDirsNotReadDenied(
   home: string,
-  denyRead: readonly string[],
-  allowRead: readonly string[] = [],
+  denyRead: readonly FilesystemPathEntry[],
+  allowRead: readonly FilesystemPathEntry[] = [],
 ): readonly string[] {
   // Rules are compared as normalizePathForSandbox spells them, and on macOS
   // that resolves /tmp and /var to /private/... for a path that exists. A
@@ -604,8 +632,11 @@ function homeDirsNotReadDenied(
   ]
   const denies = denyRead.map(entry => readRuleCovers(entry))
   const reopened = allowRead
-    .map(entry => removeTrailingGlobSuffix(entry))
-    .filter(entry => !containsGlobCharsForPlatform(entry))
+    .flatMap(entry => {
+      if (typeof entry !== 'string') return [markedLiteralPath(entry)]
+      const stripped = removeTrailingGlobSuffix(entry)
+      return containsGlobCharsForPlatform(stripped) ? [] : [stripped]
+    })
     .map(entry => normalizePathForSandbox(entry, { literal: true }))
   return HOME_CONVENIENCE_WRITE_DIRS.filter(rel => {
     const spellings = homes.map(h => path.join(h, rel))
@@ -629,9 +660,15 @@ function homeDirsNotReadDenied(
  * is resolved: `*`, `?` and `[…]` there are the syntax it asked for, while
  * resolving splices in a cwd or home directory that may carry those
  * characters in its own name. A spelling without them is normalized as the
- * name it is.
+ * name it is, and so is an entry marked literal, whatever it holds.
  */
-function readRuleCovers(entry: string): (p: string) => boolean {
+function readRuleCovers(entry: FilesystemPathEntry): (p: string) => boolean {
+  if (typeof entry !== 'string') {
+    const rule = normalizePathForSandbox(markedLiteralPath(entry), {
+      literal: true,
+    })
+    return p => isAtOrUnder(p, rule)
+  }
   const stripped = removeTrailingGlobSuffix(entry)
   if (containsGlobCharsForPlatform(stripped)) {
     try {

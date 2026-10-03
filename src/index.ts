@@ -8,6 +8,7 @@ export type {
   SandboxRuntimeConfig,
   NetworkConfig,
   FilesystemConfig,
+  FilesystemPathEntry,
   CredentialsConfig,
   CredentialFileConfig,
   CredentialEnvVarConfig,
@@ -124,6 +125,7 @@ export {
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'
+export { writeRootsOf } from './sandbox/path-entries.js'
 
 // Platform utilities
 export { getWslVersion } from './utils/platform.js'

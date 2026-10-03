@@ -16,10 +16,17 @@
  *   one — stays denied.
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
+ *
+ * A `literal…` list holds MORE entries for the list it is named after: the
+ * paths the caller marked `{ path, literal: true }`, names that no backend
+ * expands or compiles. The key is absent when there are none. Whatever reads
+ * `denyOnly` to learn what is denied has to read `literalDenyOnly` too.
  */
 export interface FsReadRestrictionConfig {
   denyOnly: string[]
   allowWithinDeny?: string[]
+  literalDenyOnly?: string[]
+  literalAllowWithinDeny?: string[]
   /**
    * The `denyOnly` entries that stand for a directory a glob expansion could
    * not list. Nothing is bound back beneath one — neither an
@@ -41,10 +48,16 @@ export interface FsReadRestrictionConfig {
  *
  * This is maximally restrictive by default - only explicitly allowed paths are writable.
  * Note: Empty `allowOnly` means NO paths are writable (unlike read's empty denyOnly).
+ *
+ * A `literal…` list holds MORE entries for the list it is named after, as in
+ * {@link FsReadRestrictionConfig}: what the command may write is `allowOnly`
+ * and `literalAllowOnly` together.
  */
 export interface FsWriteRestrictionConfig {
   allowOnly: string[]
+  literalAllowOnly?: string[]
   denyWithinAllow: string[]
+  literalDenyWithinAllow?: string[]
 }
 
 /**

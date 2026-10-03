@@ -14,7 +14,8 @@ import {
   symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
+import type { FilesystemPathEntry } from '../../src/sandbox/sandbox-config.js'
 import {
   expandGlobPattern,
   expandTilde,
@@ -1083,6 +1084,105 @@ describe('expandWindowsFsPaths literal branch', () => {
     expect(/[\\/]$/.test(out[0])).toBe(false)
   })
 })
+
+// ============================================================================
+// expandWindowsFsPaths — beneath a directory with brackets in its name
+// ============================================================================
+
+/**
+ * `[` and `]` are characters of a name on Windows: a path that holds them
+ * and no `*` or `?` is a literal, marked or not. Pinned here on every host;
+ * the spellings only Windows has are in the suite below.
+ */
+describe('expandWindowsFsPaths beneath a directory named [WIP] project', () => {
+  let root: string
+  let project: string
+
+  beforeAll(() => {
+    root = realPath(mkdtempSync(join(tmpdir(), 'win-literal-')))
+    project = join(root, '[WIP] project')
+    mkdirSync(join(project, 'keep'), { recursive: true })
+  })
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('takes a path inside it for the path it is', () => {
+    const kept = join(project, 'keep')
+    expect(expandWindowsFsPaths([kept])).toEqual([kept])
+    expect(expandWindowsFsPaths([kept], { mode: 'deny' })).toEqual([kept])
+  })
+
+  it('passes a deny for a path inside it that is not there yet, and drops the grant', () => {
+    const notYet = join(project, 'not-yet')
+    expect(expandWindowsFsPaths([notYet], { mode: 'deny' })).toEqual([notYet])
+    expect(expandWindowsFsPaths([notYet], { mode: 'grant' })).toEqual([])
+  })
+
+  it('takes a marked entry for a literal, whatever it holds', () => {
+    const kept = join(project, 'keep')
+    const marked: FilesystemPathEntry = { path: kept, literal: true }
+    expect(expandWindowsFsPaths([marked])).toEqual([kept])
+    const notYet: FilesystemPathEntry = {
+      path: join(project, '[later]'),
+      literal: true,
+    }
+    expect(expandWindowsFsPaths([notYet], { mode: 'deny' })).toEqual([
+      join(project, '[later]'),
+    ])
+    expect(expandWindowsFsPaths([notYet], { mode: 'grant' })).toEqual([])
+  })
+
+  it('skips a marked entry with a character no Windows name can hold', () => {
+    // srt-win refuses `*` and `?` outright, and nothing can have the name.
+    for (const path of [`${project}/*.env`, join(project, 'what?')]) {
+      const marked: FilesystemPathEntry = { path, literal: true }
+      expect(expandWindowsFsPaths([marked], { mode: 'deny' })).toEqual([])
+      expect(expandWindowsFsPaths([marked], { mode: 'grant' })).toEqual([])
+    }
+  })
+
+  it('refuses an entry that is neither a path nor a marked path', () => {
+    for (const entry of [
+      { path: project },
+      { path: project, literal: false },
+    ]) {
+      expect(() =>
+        expandWindowsFsPaths([entry as unknown as FilesystemPathEntry]),
+      ).toThrow(TypeError)
+    }
+  })
+})
+
+describe.if(isWindows)(
+  'expandWindowsFsPaths beneath a bracketed directory, as Windows spells paths',
+  () => {
+    let root: string
+    let project: string
+
+    beforeAll(() => {
+      root = mkdtempSync(join(tmpdir(), 'win-literal-'))
+      project = join(root, '[WIP] project')
+      mkdirSync(join(project, 'sub'), { recursive: true })
+    })
+
+    afterAll(() => {
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('takes a marked path spelled with backslashes, and skips one with a wildcard', () => {
+      const out = expandWindowsFsPaths(
+        [
+          { path: `${project}\\sub`, literal: true },
+          { path: `${project}\\*.env`, literal: true },
+        ],
+        { mode: 'deny' },
+      )
+      expect(out.map(p => basename(p))).toEqual(['sub'])
+    })
+  },
+)
 
 // ============================================================================
 // isUncPath — broker never stats `\\server\…` with real-user creds
