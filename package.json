@@ -1,6 +1,6 @@
 {
   "name": "@carderne/sandbox-runtime",
-  "version": "0.0.73",
+  "version": "0.0.74",
   "description": "Anthropic Sandbox Runtime (ASRT) - A general-purpose tool for wrapping security boundaries around arbitrary processes",
   "type": "module",
   "main": "./dist/index.js",
