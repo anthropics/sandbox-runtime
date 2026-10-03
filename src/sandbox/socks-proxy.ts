@@ -187,7 +187,18 @@ export function createSocksProxyServer(
         sendStatus('REQUEST_GRANTED')
         upstream.pipe(conn.socket)
         conn.socket.pipe(upstream)
-        upstream.on('close', () => conn.socket.destroy())
+        upstream.on('close', () => {
+          if (conn.socket.destroyed) return
+          if (upstream.readableEnded) {
+            conn.socket.end()
+            const timer = setTimeout(() => {
+              if (!conn.socket.destroyed) conn.socket.destroy()
+            }, 5000)
+            if (typeof timer.unref === 'function') timer.unref()
+          } else {
+            conn.socket.destroy()
+          }
+        })
       })
       .catch(err => {
         logForDebugging(
