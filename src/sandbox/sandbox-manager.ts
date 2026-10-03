@@ -1037,6 +1037,7 @@ function isSandboxingEnabled(): boolean {
  */
 function checkDependenciesCommon(
   ripgrepConfig?: RipgrepConfig,
+  seccompConfig?: SeccompConfig,
 ):
   | { done: SandboxDependencyCheck }
   | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
@@ -1058,7 +1059,7 @@ function checkDependenciesCommon(
     }
 
     const linuxDeps = checkLinuxDependencies({
-      seccompConfig: config?.seccomp,
+      seccompConfig: seccompConfig ?? config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
     })
@@ -1087,12 +1088,14 @@ function checkDependenciesCommon(
 /**
  * Check sandbox dependencies for the current platform
  * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
+ * @param seccompConfig - Linux apply-seccomp location to check. If not provided, uses config from initialization or the bundled/global lookup
  * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
  */
 function checkDependencies(
   ripgrepConfig?: RipgrepConfig,
+  seccompConfig?: SeccompConfig,
 ): SandboxDependencyCheck {
-  const common = checkDependenciesCommon(ripgrepConfig)
+  const common = checkDependenciesCommon(ripgrepConfig, seccompConfig)
   if ('done' in common) return common.done
   return checkWindowsDependencies(common.windows)
 }
@@ -1106,14 +1109,16 @@ function checkDependencies(
  */
 async function checkDependenciesAsync(
   ripgrepConfig?: RipgrepConfig,
+  seccompConfig?: SeccompConfig,
 ): Promise<SandboxDependencyCheck> {
   // Linux: resolve apply-seccomp first so its global-npm fallback
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
-  if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+  const seccomp = seccompConfig ?? config?.seccomp
+  if (getPlatform() === 'linux' && !seccomp?.argv0) {
+    await getApplySeccompBinaryPathAsync(seccomp?.applyPath)
   }
-  const common = checkDependenciesCommon(ripgrepConfig)
+  const common = checkDependenciesCommon(ripgrepConfig, seccompConfig)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
 }
@@ -2536,14 +2541,14 @@ export interface ISandboxManager {
   ): Promise<void>
   isSupportedPlatform(): boolean
   isSandboxingEnabled(): boolean
-  checkDependencies(ripgrepConfig?: {
-    command: string
-    args?: string[]
-  }): SandboxDependencyCheck
-  checkDependenciesAsync(ripgrepConfig?: {
-    command: string
-    args?: string[]
-  }): Promise<SandboxDependencyCheck>
+  checkDependencies(
+    ripgrepConfig?: { command: string; args?: string[] },
+    seccompConfig?: SeccompConfig,
+  ): SandboxDependencyCheck
+  checkDependenciesAsync(
+    ripgrepConfig?: { command: string; args?: string[] },
+    seccompConfig?: SeccompConfig,
+  ): Promise<SandboxDependencyCheck>
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
