@@ -1023,3 +1023,39 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     expect(result.status).toBe(0)
   })
 })
+
+describe('macOS Seatbelt denyUnlink profile', () => {
+  it('emits unlink/create denies for denyUnlink after the write-root re-allow', () => {
+    const writeRoot = '/tmp/proj'
+    const gitDir = '/tmp/proj/.git'
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: false,
+      // a read deny is required for generateReadRules() to emit the
+      // write-root unlink re-allow that denyUnlink has to land after
+      readConfig: { denyOnly: ['/tmp/secrets'] },
+      writeConfig: {
+        allowOnly: [writeRoot],
+        denyWithinAllow: [],
+        denyUnlink: [gitDir],
+      },
+    })
+
+    expect(wrappedCommand).toContain(
+      '; File write: deny unlink/rename inside write-allowed paths',
+    )
+    expect(wrappedCommand).toContain(
+      `(deny file-write-unlink file-write-create\n` +
+        `  (subpath ${JSON.stringify(gitDir)})\n` +
+        `  (literal ${JSON.stringify(writeRoot)})\n`,
+    )
+    const reallow = wrappedCommand.indexOf(
+      '(allow file-write-unlink file-write-create',
+    )
+    const denyUnlink = wrappedCommand.indexOf(
+      '; File write: deny unlink/rename inside write-allowed paths',
+    )
+    expect(reallow).toBeGreaterThan(-1)
+    expect(denyUnlink).toBeGreaterThan(reallow)
+  })
+})

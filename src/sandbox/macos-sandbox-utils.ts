@@ -1265,6 +1265,19 @@ function generateSandboxProfile({
     }
   }
 
+  // Last-match-wins against the write-root file-write-unlink re-allow: a
+  // denyUnlink path stays writable (file-write* still matches) but cannot
+  // be rm'd or renamed. Specific file-write-unlink denies are not overridden
+  // by a later (allow file-write*) wildcard.
+  const denyUnlink = writeConfig?.denyUnlink ?? []
+  if (denyUnlink.length > 0) {
+    profile.push('')
+    profile.push('; File write: deny unlink/rename inside write-allowed paths')
+    profile.push(
+      ...generateMoveBlockingRules(denyUnlink.map(toPathEntry), logTag),
+    )
+  }
+
   // Pseudo-terminal (pty) support
   if (allowPty) {
     profile.push('')

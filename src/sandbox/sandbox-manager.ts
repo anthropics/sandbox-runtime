@@ -1389,6 +1389,7 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
   return {
     allowOnly,
     denyWithinAllow: denyPaths,
+    denyUnlink: config.filesystem.denyUnlink,
   }
 }
 
@@ -1767,6 +1768,11 @@ async function wrapWithSandboxAgain(
       denyWithinAllow: stripWriteGlobs(
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
+          [],
+      ),
+      denyUnlink: stripWriteGlobs(
+        customConfig?.filesystem?.denyUnlink ??
+          config?.filesystem.denyUnlink ??
           [],
       ),
     }
