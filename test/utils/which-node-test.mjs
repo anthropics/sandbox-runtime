@@ -62,4 +62,21 @@ assert.strictEqual(
 )
 console.log('✓ Output matches which command')
 
+// Test 5: Absolute paths should not depend on an external `which` process
+const absoluteNodePath = whichSync(process.execPath)
+assert.strictEqual(
+  absoluteNodePath,
+  process.execPath,
+  'whichSync should accept an executable absolute path directly',
+)
+console.log('✓ Accepted executable absolute path directly')
+
+// Test 6: Missing absolute paths should still be rejected
+assert.strictEqual(
+  whichSync('/path/that/does/not/exist'),
+  null,
+  'whichSync should reject a missing absolute path',
+)
+console.log('✓ Rejected missing absolute path')
+
 console.log('\n✅ All Node.js fallback tests passed!')
