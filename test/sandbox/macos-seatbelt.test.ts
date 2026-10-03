@@ -1023,3 +1023,48 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     expect(result.status).toBe(0)
   })
 })
+
+describe.if(isMacOS)('macOS Seatbelt allowIokit classes', () => {
+  it('should emit iokit-registry-entry-class and iokit-user-client-class rules for configured classes', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowIokitRegistryEntryClass: ['CustomRegistryEntryClient'],
+      allowIokitUserClientClass: ['AGXDeviceUserClient'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain(
+      '(iokit-registry-entry-class "IOSurfaceRootUserClient")',
+    )
+    expect(wrappedCommand).toContain(
+      '(iokit-registry-entry-class "CustomRegistryEntryClient")',
+    )
+    expect(wrappedCommand).toContain(
+      '(iokit-user-client-class "IOSurfaceSendRight")',
+    )
+    expect(wrappedCommand).toContain(
+      '(iokit-user-client-class "AGXDeviceUserClient")',
+    )
+  })
+
+  it('should emit a syntactically valid profile with allowIokit classes set', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowIokitRegistryEntryClass: ['CustomRegistryEntryClient'],
+      allowIokitUserClientClass: ['AGXDeviceUserClient'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(result.status).toBe(0)
+  })
+})
