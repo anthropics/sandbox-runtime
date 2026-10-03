@@ -487,7 +487,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         (options.shouldTerminateTLS?.(hostname, port) ?? true)
       ) {
         // We can only terminate TLS. CONNECT also carries non-TLS streams —
-        // notably SSH on Linux, where the sandbox's own GIT_SSH_COMMAND
+        // notably SSH, where the sandbox's own GIT_SSH_COMMAND
         // routes `ssh` through this proxy via `socat - PROXY:`. Send 200 so
         // the client transmits its first bytes, sniff for a ClientHello, and
         // only terminate if it is one. Non-TLS falls through to the opaque

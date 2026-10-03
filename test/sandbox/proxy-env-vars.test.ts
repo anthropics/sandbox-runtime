@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -6,6 +6,8 @@ import {
   generateProxyEnvVars,
   CA_TRUST_VARS,
 } from '../../src/sandbox/sandbox-utils.js'
+import * as which from '../../src/utils/which.js'
+import * as platform from '../../src/utils/platform.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
@@ -95,6 +97,72 @@ describe('generateProxyEnvVars', () => {
       for (const v of CA_TRUST_VARS) {
         expect(env.some(e => e.startsWith(`${v}=`))).toBe(false)
       }
+    })
+  })
+
+  describe('GIT_SSH_COMMAND on macOS', () => {
+    // The proxy requires per-session auth when SRT owns it, and BSD nc has
+    // no SOCKS5 auth — so with socat available, macOS must emit the same
+    // authenticated HTTP CONNECT spelling as Linux, or git-over-ssh dies at
+    // the SOCKS handshake. The nc spelling is only a fallback for hosts
+    // without socat.
+    const MUX = '-o ControlMaster=no -o ControlPath=none'
+    let whichSpy: ReturnType<typeof spyOn>
+    let platformSpy: ReturnType<typeof spyOn>
+
+    beforeEach(() => {
+      whichSpy = spyOn(which, 'whichSync')
+      platformSpy = spyOn(platform, 'getPlatform')
+      platformSpy.mockReturnValue('macos')
+    })
+
+    afterEach(() => {
+      whichSpy.mockRestore()
+      platformSpy.mockRestore()
+    })
+
+    const socatPresent = (bin: string) =>
+      bin === 'socat' ? '/opt/homebrew/bin/socat' : `/usr/bin/${bin}`
+    const socatAbsent = (bin: string) =>
+      bin === 'socat' ? null : `/usr/bin/${bin}`
+
+    it('uses socat with proxyauth when socat is on PATH and auth is set', () => {
+      whichSpy.mockImplementation(socatPresent)
+      const env = generateProxyEnvVars(3128, 1080, undefined, 'tok')
+      expect(env).toContain(
+        `GIT_SSH_COMMAND=ssh ${MUX} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=3128,proxyauth=srt:tok'`,
+      )
+    })
+
+    it('carries per-command attribution in the proxyauth username', () => {
+      whichSpy.mockImplementation(socatPresent)
+      const env = generateProxyEnvVars(
+        3128,
+        1080,
+        undefined,
+        'tok',
+        undefined,
+        'dGVzdA',
+      )
+      expect(env).toContain(
+        `GIT_SSH_COMMAND=ssh ${MUX} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=3128,proxyauth=srt.dGVzdA:tok'`,
+      )
+    })
+
+    it('omits proxyauth when no auth token is configured', () => {
+      whichSpy.mockImplementation(socatPresent)
+      const env = generateProxyEnvVars(3128, 1080)
+      expect(env).toContain(
+        `GIT_SSH_COMMAND=ssh ${MUX} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=3128'`,
+      )
+    })
+
+    it('falls back to the nc spelling when socat is not installed', () => {
+      whichSpy.mockImplementation(socatAbsent)
+      const env = generateProxyEnvVars(3128, 1080, undefined, 'tok')
+      expect(env).toContain(
+        `GIT_SSH_COMMAND=ssh ${MUX} -o ProxyCommand='nc -X 5 -x localhost:1080 %h %p'`,
+      )
     })
   })
 

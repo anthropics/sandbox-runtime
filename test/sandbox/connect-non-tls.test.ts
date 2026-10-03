@@ -7,7 +7,7 @@ import { looksLikeClientHello } from '../../src/sandbox/tls-terminate-proxy.js'
 
 /**
  * Regression: with tlsTerminate on, every CONNECT was handed to the
- * TLS terminator regardless of port/protocol. The Linux sandbox routes
+ * TLS terminator regardless of port/protocol. The sandbox routes
  * `git push` over SSH through this proxy via
  *   GIT_SSH_COMMAND=ssh -o ProxyCommand='socat - PROXY:localhost:%h:%p,...'
  * which is `CONNECT github.com:22` — not TLS. The terminator replied with a
