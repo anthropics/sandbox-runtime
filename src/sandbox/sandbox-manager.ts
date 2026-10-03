@@ -1038,6 +1038,7 @@ function createManager(legacySingleton: boolean): ISandboxManager {
     return {
       allowOnly,
       denyWithinAllow: denyPaths,
+      denyMandatoryCwdFiles: config.filesystem.denyMandatoryCwdFiles,
     }
   }
 

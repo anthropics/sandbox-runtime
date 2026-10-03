@@ -260,6 +260,7 @@ async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   abortSignal?: AbortSignal,
+  denyCwdFiles: boolean = true,
 ): Promise<string[]> {
   const cwd = process.cwd()
   // Use provided signal or create a fallback controller
@@ -269,8 +270,13 @@ async function linuxGetMandatoryDenyPaths(
 
   // Note: Settings files are added at the callsite in sandbox-manager.ts
   const denyPaths = [
-    // Dangerous files in CWD
-    ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
+    // Dangerous files in CWD. Denying a path that does not exist requires
+    // mounting /dev/null over it, which makes the name visible to readdir
+    // and leaves a zero-length char device in the working tree for the
+    // lifetime of the command. Opt out via denyMandatoryCwdFiles: false.
+    // The ripgrep scan below is unaffected and still denies these names at
+    // any depth when they already exist.
+    ...(denyCwdFiles ? DANGEROUS_FILES.map(f => path.resolve(cwd, f)) : []),
     // Dangerous directories in CWD
     ...dangerousDirectories.map(d => path.resolve(cwd, d)),
   ]
@@ -936,6 +942,7 @@ async function generateFilesystemArgs(
         ripgrepConfig,
         mandatoryDenySearchDepth,
         abortSignal,
+        writeConfig.denyMandatoryCwdFiles ?? true,
       )),
     ]
 
