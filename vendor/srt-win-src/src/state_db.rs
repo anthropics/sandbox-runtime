@@ -39,7 +39,7 @@
 //! There is deliberately NO single enclosing transaction. Each
 //! path's (FS mutation + row change) commits independently so a
 //! failure on path Y can't revert path X. The one ordering rule is
-//! record-first: upsert, THEN `SetNamedSecurityInfoW`. A crash
+//! record-first: upsert, THEN the file-security write. A crash
 //! between leaves a row whose ACE hasn't been written; the next
 //! call re-derives and reapplies.
 
@@ -1403,6 +1403,148 @@ mod tests {
                 n, 4,
                 "session schema: 4 bookkeeping tables, no sandbox_user"
             );
+        });
+    }
+
+    /// Real filesystem ACEs with an isolated in-memory ledger. Synthetic
+    /// holder rows model refcounts without provisioning accounts or touching
+    /// the user's session DB. The separate CLI smoke covers real broker PIDs.
+    struct AclFixture(PathBuf);
+
+    impl AclFixture {
+        const SID: &'static str = "S-1-5-32-546";
+
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "srt-db-acl-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(std::fs::canonicalize(path).unwrap())
+        }
+
+        fn file(&self, name: &str) -> String {
+            let path = self.0.join(name);
+            std::fs::write(&path, "sentinel").unwrap();
+            path_id::canonicalize_path(path.to_str().unwrap())
+                .unwrap()
+                .0
+        }
+
+        fn ace_count(&self, path: &str) -> usize {
+            let sid = crate::sid::LocalPsid::from_string(Self::SID).unwrap();
+            let (_sd, dacl) = acl::read_file_dacl(path).unwrap();
+            acl::filter_aces(dacl, |_, body| acl::ace_sid_is(body, sid.as_bytes()))
+                .unwrap()
+                .0
+                .len()
+        }
+    }
+
+    impl Drop for AclFixture {
+        fn drop(&mut self) {
+            if std::fs::canonicalize(&self.0).ok().as_ref() == Some(&self.0) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn parent_fdc_refcounts_across_holders_and_siblings() {
+        let fixture = AclFixture::new();
+        let a = fixture.file("a.txt");
+        let b = fixture.file("b.txt");
+        let parent = path_id::canonical_parent_of(&a).unwrap();
+        with_mem_db(|db| {
+            let holder_a = db.holder_pid;
+            let holder_b = HolderPid(0x7fff_fffe);
+            let deny = SbAce::Deny(acl::DenyMask::WriteDeny);
+            let (_, failed) = db
+                .apply_aces(AclFixture::SID, &[(a.clone(), deny), (b.clone(), deny)])
+                .unwrap();
+            assert_eq!(failed, 0);
+            assert_eq!(
+                db.my_ace_holds(None).unwrap().len(),
+                3,
+                "one parent hold for siblings"
+            );
+            assert_eq!(fixture.ace_count(&parent), 1);
+
+            db.conn
+                .execute("INSERT INTO brokers VALUES (?1, 0, 0)", params![holder_b.0])
+                .unwrap();
+            db.holder_pid = holder_b;
+            assert!(
+                db.ensure_ace(&a, deny, AclFixture::SID)
+                    .unwrap()
+                    .holder_added
+            );
+            assert!(
+                db.ensure_ace(&parent, SbAce::DenyFdc, AclFixture::SID)
+                    .unwrap()
+                    .holder_added
+            );
+            db.holder_pid = holder_a;
+            let (_, failed) = db.release_aces(AclFixture::SID, KIND_DENY).unwrap();
+            assert_eq!(failed, 0);
+            assert_eq!(
+                fixture.ace_count(&parent),
+                1,
+                "live holder lost parent protection"
+            );
+            assert_eq!(fixture.ace_count(&a), 1);
+            assert_eq!(fixture.ace_count(&b), 0);
+
+            db.holder_pid = holder_b;
+            let (_, failed) = db.release_aces(AclFixture::SID, KIND_DENY).unwrap();
+            assert_eq!(failed, 0);
+            assert_eq!(fixture.ace_count(&parent), 0);
+            assert_eq!(fixture.ace_count(&a), 0);
+            let rows: i64 = db
+                .conn
+                .query_row("SELECT count(*) FROM working_aces", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+        });
+    }
+
+    #[test]
+    fn failed_batch_keeps_preexisting_parent_protection() {
+        let fixture = AclFixture::new();
+        let held = fixture.file("held.txt");
+        let fresh = fixture.file("fresh.txt");
+        let linked = fixture.file("linked.txt");
+        std::fs::hard_link(&linked, fixture.0.join("alias.txt")).unwrap();
+        let parent = path_id::canonical_parent_of(&held).unwrap();
+        with_mem_db(|db| {
+            let deny = SbAce::Deny(acl::DenyMask::WriteDeny);
+            assert_eq!(
+                db.apply_aces(AclFixture::SID, &[(held.clone(), deny)])
+                    .unwrap()
+                    .1,
+                0
+            );
+            let (_, failed) = db
+                .apply_aces(
+                    AclFixture::SID,
+                    &[(fresh.clone(), deny), (linked.clone(), deny)],
+                )
+                .unwrap();
+            assert_eq!(failed, 1, "hardlinked deny must fail");
+            assert_eq!(fixture.ace_count(&parent), 1);
+            assert_eq!(fixture.ace_count(&held), 1);
+            assert_eq!(
+                fixture.ace_count(&fresh),
+                0,
+                "failed batch leaked a fresh deny"
+            );
+            assert_eq!(db.my_ace_holds(None).unwrap().len(), 2);
+            assert_eq!(db.release_aces(AclFixture::SID, KIND_DENY).unwrap().1, 0);
+            assert_eq!(fixture.ace_count(&parent), 0);
         });
     }
 

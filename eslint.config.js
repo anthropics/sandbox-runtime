@@ -22,6 +22,7 @@ export default [
           allowDefaultProject: [
             'eslint.config.js',
             'test/utils/which-node-test.mjs',
+            'vendor/srt-win-src/ci/smoke-acl-parent.mjs',
             'vendor/build-common.ts',
             'vendor/seccomp/build.ts',
             'vendor/srt-win/build.ts',
