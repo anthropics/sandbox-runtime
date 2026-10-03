@@ -385,6 +385,33 @@ describe('proxy auth + network deny semantics', () => {
     expect((await proxyRequest(port, 'nope.net')).statusCode).toBe(403)
     expect(asked).toBe(false)
   })
+
+  it('allowAllDomains admits hostnames but not IP literals or loopback names', async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowAllDomains: true,
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    expect((await proxyRequest(port, 'example.com')).allowed).toBe(true)
+    for (const host of [
+      '169.254.169.254',
+      '127.0.0.1',
+      '127.1',
+      '[::1]',
+      '[::ffff:127.0.0.1]',
+      'localhost',
+      'foo.localhost',
+    ]) {
+      expect({ host, ...(await proxyRequest(port, host)) }).toMatchObject({
+        host,
+        statusCode: 403,
+      })
+    }
+  })
 })
 
 describe('SandboxManager.updateConfig', () => {
