@@ -1849,6 +1849,10 @@ async function generateFilesystemArgs(
   // beside its resolved dest, so the stub-skip guard tests a covering
   // directory in its canonical form AND every recorded spelling.
   const readOnlyDenyDirSpellings = new Map<string, Set<string>>()
+  // Resolved dests that at least one deny entry reaches through a symlink.
+  // Asked of the dest, not of the entry in hand: the deny loop deduplicates
+  // on the dest, so which spelling it sees is the caller's ordering.
+  const symlinkedDenySpellingDests = new Set<string>()
   // dest → the pre-resolution deny path it came from. A bind at the resolved
   // dest also re-exposes whatever the symlinked spelling leads to, so the
   // re-application passes below compare a read deny's landing against both
@@ -2342,6 +2346,9 @@ async function generateFilesystemArgs(
       if (findSymlinkInPath(resolvedPath, allowedWritePaths)) {
         continue
       }
+      if (resolvedPath !== rawPath) {
+        symlinkedDenySpellingDests.add(resolvedPath)
+      }
       let isDirectory = false
       try {
         isDirectory = fs.statSync(resolvedPath).isDirectory()
@@ -2696,11 +2703,11 @@ async function generateFilesystemArgs(
       if (isWithinAllowedPath) {
         // Already unwritable under a read-only denied directory (the
         // existing-path twin of the stub skip above). Veto (ii) keeps the
-        // covering bind through the emission filter; a symlinked spelling
-        // keeps its own bind because the re-application passes below key
-        // off emitted raw spellings.
+        // covering bind through the emission filter; a dest ANY deny entry
+        // reaches through a symlink keeps its own bind, so that the plan does
+        // not depend on which spelling of it the loop sees first.
         if (
-          rawPath === normalizedPath &&
+          !symlinkedDenySpellingDests.has(normalizedPath) &&
           coveredBySafeReadOnlyDenyDir(normalizedPath)
         ) {
           logForDebugging(
