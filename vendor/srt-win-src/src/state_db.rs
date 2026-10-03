@@ -263,7 +263,7 @@ pub fn open_db() -> Result<Connection> {
     let deny_sid = match crate::sid::lookup_account_sid(crate::user::SANDBOX_GROUP) {
         Ok(s) => Some(s),
         Err(e) => {
-            match crate::sid::sid_account_exists("S-1-5-32-545") {
+            match crate::sid::sid_account_exists(crate::acl::SID_BUILTIN_USERS) {
                 // BUILTIN\Users always maps; if it does, SAM is up
                 // and the sandbox group is genuinely absent.
                 Ok(crate::sid::SidExistence::Mapped) => None,
@@ -296,8 +296,10 @@ pub fn open_db() -> Result<Connection> {
     )
 }
 
-/// Filter on `release_aces` for the deny-ACE lifecycle.
-pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete"];
+/// Filter on `release_aces` for the deny-ACE lifecycle. Includes
+/// the world-writable audit's `deny_audit` holds — `acl restore`
+/// releases them like any other session deny.
+pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", "deny_audit"];
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
 
@@ -694,6 +696,20 @@ impl Locked {
                 // and stamping the parent first just to release
                 // it in the same pass wastes a SetSecurityInfo
                 // round-trip and clutters the failure output.
+                //
+                // `DenyAudit` deliberately takes NO parent-FDC
+                // stamp: the FDC parent-stamp protects deny
+                // TARGETS from being renamed/deleted away, but
+                // the audit's parents (the drive root's dirs,
+                // %TEMP%'s parent, deep PATH ancestors) can be
+                // huge trees, and `SetNamedSecurityInfoW` would
+                // materialize the inheritable ACE across every
+                // unprotected descendant at every session start
+                // (and strip it at reset) — unbounded cost the
+                // scan budgets don't cover. The `(OI)(CI)` deny
+                // on the flagged dir itself covers the planting
+                // threat, and rename-away by the sandbox is
+                // already denied by the deny mask's DELETE bit.
                 if one(canon, *ace)
                     && matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete)
                     && let Some(p) = path_id::canonical_parent_of(canon)
@@ -721,7 +737,7 @@ impl Locked {
         // Refuse Deny on multi-link files; Grant is fail-open so
         // an early release is safe, and `DenyFdc` only targets
         // directories.
-        if matches!(want, SbAce::Deny(_)) && !is_dir && links > 1 {
+        if matches!(want, SbAce::Deny(_) | SbAce::DenyAudit) && !is_dir && links > 1 {
             bail!(
                 "deny refused: '{canon}' has {links} hardlink(s); \
                  ace_holders rows are path-keyed, so releasing an \
@@ -975,6 +991,25 @@ impl Locked {
         Ok((out, failed))
     }
 
+    /// Canonical paths of live session write grants —
+    /// `working_aces` rows with `kind='grant'` at the effective
+    /// `'modify'` mask. The world-writable audit's allow-list: a
+    /// path a session deliberately opened for sandbox writes (the
+    /// working tree) must not be write-deny-stamped by the audit.
+    pub fn granted_write_paths(&self) -> Result<Vec<String>> {
+        // Bound to the enum's own serialization so a mask-token
+        // rename cannot silently desynchronize this filter from
+        // what apply_aces writes.
+        let write_mask = acl::SbAce::Grant(acl::GrantMask::Modify).as_str();
+        query_vec(
+            &self.conn,
+            "SELECT canonical_path FROM working_aces \
+             WHERE kind = 'grant' AND mask = ?1",
+            params![write_mask],
+            |r| r.get(0),
+        )
+    }
+
     /// Record a placeholder component `acl stamp` is about to
     /// create (see the `placeholders` table comment). Idempotent
     /// (`INSERT OR IGNORE`); called intent-first — before the
@@ -1033,6 +1068,7 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::Deny(d) => set.deny = Some(d),
             SbAce::DenyFdc => set.deny_fdc = true,
             SbAce::DenyDelete => set.deny_delete = true,
+            SbAce::DenyAudit => set.deny_audit = true,
         }
     }
     // Install-time ambient write-deny (HKLM AmbientDenies) folds

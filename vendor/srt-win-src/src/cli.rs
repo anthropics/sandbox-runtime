@@ -18,6 +18,8 @@
 //!   wfp    status | verify | uninstall — inspect/probe/remove WFP filters
 //!   acl    stamp | grant | restore | revoke | recover
 //!                                       — additive sandbox-user ACEs
+//!   acl audit                          — bounded world-writable-dir
+//!                                         audit + session deny stamps
 //!   exec   -- <target> [args...]       — spawn under the two-hop
 //!                                         sandbox-user lockdown
 //!
@@ -352,6 +354,43 @@ enum AclCmd {
         /// Emit `{"deadBrokers": N, "acesRevoked": N}` on stdout.
         /// (Not the per-path array — recover sweeps by trustee SID
         /// and does not enumerate paths.)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Bounded, unelevated world-writable-directory audit — the
+    /// dynamic complement to the install-time ambient deny list.
+    ///
+    /// Scans a fixed root set (top-level dirs of `%SystemDrive%`,
+    /// `%TEMP%`, `%PUBLIC%`, the broker's `PATH` entries, the cwd's
+    /// immediate children; local fixed drives only, reparse points
+    /// never followed) for directories whose DACL carries an
+    /// EXPLICIT ALLOW granting write to Everyone / BUILTIN\Users /
+    /// Authenticated Users (or a NULL DACL), and stamps each hit
+    /// with an additive `(OI)(CI)` deny for the sandbox SID — the
+    /// denyWrite mask plus WRITE_DAC/WRITE_OWNER, so the world
+    /// grant that flagged the dir cannot be used to strip the deny
+    /// (`audit.rs` module doc). Recorded as a session hold under
+    /// `--holder-pid` (released by `acl restore`, reaped by crash
+    /// recovery). NULL-DACL dirs are reported but never stamped
+    /// (stamping would materialize a DACL that restore cannot
+    /// return to NULL). Best-effort: per-path stamp failures (the
+    /// broker lacks WRITE_DAC on a dir it does not own) are
+    /// reported, never fatal. Hard budgets — 2s wall, 50k DACL
+    /// reads, 1000 entries per listed dir — bound the scan; hitting
+    /// one is reported on stderr, never silent. Exit 0 unless the
+    /// state DB / init lock itself fails (the scan's only fallible
+    /// step of its own is converting the three constant well-known
+    /// SIDs, which is practically unreachable).
+    Audit {
+        /// Holder PID the audit denies are held under (see `acl
+        /// stamp` — normally the long-lived Node host).
+        #[arg(long)]
+        holder_pid: u32,
+        /// SID to deny — the dedicated sandbox user
+        /// (`srt-win user status` → `marker_user_sid`).
+        #[arg(long)]
+        sandbox_user_sid: String,
+        /// Emit a one-line JSON result object on stdout.
         #[arg(long)]
         json: bool,
     },
@@ -1362,6 +1401,82 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
         }
 
+        // ─── acl audit ─────────────────────────────────────────────
+        Cmd::Acl {
+            sub:
+                AclCmd::Audit {
+                    holder_pid,
+                    sandbox_user_sid,
+                    json,
+                },
+        } => {
+            use srt_win::{audit, state_db};
+            let (out, report) =
+                audit::audit_and_stamp(state_db::HolderPid(holder_pid), &sandbox_user_sid)?;
+            eprintln!(
+                "srt-win: acl audit — {} candidate(s), {} probed, {} \
+                 flagged, {} stamped{}{}; recovery pruned {} dead \
+                 broker(s), revoked {} orphan ACE(s)",
+                out.candidates,
+                out.probed,
+                out.flagged.len(),
+                out.stamped.len(),
+                if out.failed.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} FAILED (left unstamped)", out.failed.len())
+                },
+                if out.null_dacl_refused == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " (of which {} NULL-DACL, stamp refused by policy)",
+                        out.null_dacl_refused
+                    )
+                },
+                report.dead_brokers,
+                report.aces_revoked,
+            );
+            // No silent caps: every bounded/skipped class is
+            // spelled out when it fired.
+            let b = &out.budget;
+            if b.wall_expired
+                || b.dacl_exhausted
+                || b.skipped_budget > 0
+                || b.dirs_truncated > 0
+                || b.unreadable > 0
+                || b.reparse_skipped > 0
+                || b.remote_skipped > 0
+                || b.roots_skipped_non_local > 0
+            {
+                eprintln!(
+                    "srt-win: acl audit: partial coverage — \
+                     wall_expired={}, dacl_reads={} (exhausted={}), \
+                     {} candidate(s) skipped on budget, {} dir \
+                     listing(s) truncated at {} entries, {} \
+                     unreadable, {} reparse-point(s) skipped, {} \
+                     non-local path(s) skipped, {} scan root(s) \
+                     skipped as non-local",
+                    b.wall_expired,
+                    b.dacl_reads,
+                    b.dacl_exhausted,
+                    b.skipped_budget,
+                    b.dirs_truncated,
+                    srt_win::audit::MAX_DIR_ENTRIES,
+                    b.unreadable,
+                    b.reparse_skipped,
+                    b.remote_skipped,
+                    b.roots_skipped_non_local,
+                );
+            }
+            if json {
+                // `AuditOutcome` derives `Serialize` (camelCase,
+                // `probed` → `scanned`) — the JSON contract lives on
+                // the struct, mirrored by TS `WindowsWwAuditResult`.
+                println!("{}", serde_json::to_string(&out)?);
+            }
+        }
+
         // ─── runner ────────────────────────────────────────────────
         Cmd::Runner => {
             let code = srt_win::runner::run()?;
@@ -1794,6 +1909,51 @@ mod tests {
                 sublayer_guid: Some(_)
             }
         ));
+    }
+
+    /// `acl audit` parses with its required args and the `--json`
+    /// flag defaulting off.
+    #[test]
+    fn acl_audit_parses() {
+        let c = Cli::try_parse_from([
+            "srt-win",
+            "acl",
+            "audit",
+            "--holder-pid",
+            "1234",
+            "--sandbox-user-sid",
+            "S-1-5-21-1-2-3-1000",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            c.cmd,
+            Cmd::Acl {
+                sub: AclCmd::Audit {
+                    holder_pid: 1234,
+                    json: false,
+                    ..
+                }
+            }
+        ));
+        let j = Cli::try_parse_from([
+            "srt-win",
+            "acl",
+            "audit",
+            "--holder-pid",
+            "1",
+            "--sandbox-user-sid",
+            "S-1-1-0",
+            "--json",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            j.cmd,
+            Cmd::Acl {
+                sub: AclCmd::Audit { json: true, .. }
+            }
+        ));
+        // Both args are required.
+        assert!(Cli::try_parse_from(["srt-win", "acl", "audit"]).is_err());
     }
 
     /// `--quiet` on `exec` parses and defaults false. Placement
