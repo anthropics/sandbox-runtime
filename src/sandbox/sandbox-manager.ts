@@ -93,6 +93,7 @@ import {
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
+import { ownInstallWarning } from './own-files.js'
 import {
   SandboxViolationStore,
   sanitizeUnregisteredCommandKey,
@@ -140,6 +141,7 @@ let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
+let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
@@ -1081,6 +1083,12 @@ function checkDependenciesCommon(
     }
   }
 
+  // The library itself writable from inside the sandbox: see own-files.ts.
+  const ownInstall = config?.filesystem.disabled
+    ? undefined
+    : ownInstallWarning(getFsWriteConfig().allowOnly)
+  if (ownInstall !== undefined) warnings.push(ownInstall)
+
   return { done: { errors, warnings } }
 }
 
@@ -1769,6 +1777,14 @@ async function wrapWithSandboxAgain(
           config?.filesystem.denyWrite ??
           [],
       ),
+    }
+    // For a caller that never reads checkDependencies(), the CLI among them.
+    if (!ownInstallLogged) {
+      ownInstallLogged = true
+      const ownInstall = ownInstallWarning(writeConfig.allowOnly)
+      if (ownInstall !== undefined) {
+        logForDebugging(ownInstall, { level: 'warn' })
+      }
     }
 
     // Credential deny paths are unioned with the caller's denyRead — never
