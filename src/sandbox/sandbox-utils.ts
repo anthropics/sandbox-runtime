@@ -3,6 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import { DEFAULT_SANDBOX_TMPDIR } from './sandbox-temp-dir.js'
 
 /**
  * Dangerous files that should be protected from writes.
@@ -359,8 +360,8 @@ export function getDefaultWritePaths(): string[] {
     '/dev/tty',
     '/dev/dtracehelper',
     '/dev/autofs_nowait',
-    '/tmp/claude',
-    '/private/tmp/claude',
+    DEFAULT_SANDBOX_TMPDIR,
+    `/private${DEFAULT_SANDBOX_TMPDIR}`,
     path.join(homeDir, '.npm/_logs'),
     path.join(homeDir, '.claude/debug'),
   ]
@@ -409,14 +410,14 @@ export function generateProxyEnvVars(
   // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
   // allows (getDefaultWritePaths). When filesystem policy is disabled
   // (writeConfig === undefined → skipTmpdir), the host TMPDIR is already
-  // writable and /tmp/claude may not exist, so leave it untouched.
+  // writable, so leave it untouched.
   // CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is kept for
   // backwards compatibility (#141).
   if (!skipTmpdir) {
     const tmpdir =
       process.env.CLAUDE_CODE_TMPDIR ||
       process.env.CLAUDE_TMPDIR ||
-      '/tmp/claude'
+      DEFAULT_SANDBOX_TMPDIR
     envVars.push(`TMPDIR=${tmpdir}`)
   }
 

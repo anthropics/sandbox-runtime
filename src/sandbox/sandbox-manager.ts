@@ -72,6 +72,10 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
+import {
+  DEFAULT_SANDBOX_TMPDIR,
+  ensureSandboxTempDirectory,
+} from './sandbox-temp-dir.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
 import {
   canonicalizeHost,
@@ -1266,6 +1270,10 @@ function createManager(legacySingleton: boolean): ISandboxManager {
         ? (customConfig.filesystem.disabled ?? false)
         : (config?.filesystem.disabled ?? false)
 
+    if (!fsDisabled && (platform === 'macos' || platform === 'linux')) {
+      ensureSandboxTempDirectory(DEFAULT_SANDBOX_TMPDIR)
+    }
+
     // Credential env handling is independent of filesystem policy: unsetEnvVars /
     // setEnvVars must be applied even when fsDisabled (the credential file
     // deny-reads are dropped, but env scrubbing still happens).
@@ -1276,7 +1284,7 @@ function createManager(legacySingleton: boolean): ISandboxManager {
 
     // Get configs - use custom if provided, otherwise fall back to main config
     // If neither exists, defaults to empty arrays (most restrictive)
-    // Always include default system write paths (like /dev/null, /tmp/claude)
+    // Always include default system write paths (like /dev/null, /tmp/agents)
     //
     // Strip trailing /** and filter remaining globs on Linux (bwrap needs
     // real paths, not globs; macOS subpath matching is also recursive so
