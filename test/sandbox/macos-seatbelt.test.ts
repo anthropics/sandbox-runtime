@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import {
   existsSync,
   mkdirSync,
@@ -1010,6 +1011,133 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
       command: 'true',
       needsNetworkRestriction: true,
       allowMachLookup: ['com.example.service', 'com.example.prefix.*', '*'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(result.status).toBe(0)
+  })
+})
+
+describe.if(isMacOS)(
+  'macOS Seatbelt allowMachRegister without a covering lookup',
+  () => {
+    const wrap = (
+      allowMachRegister: string[],
+      allowMachLookup?: string[],
+    ): Promise<{ result: string; warnings: string[] }> =>
+      withCapturedWarnings(async () =>
+        wrapCommandWithSandboxMacOS({
+          command: 'true',
+          needsNetworkRestriction: true,
+          allowMachRegister,
+          allowMachLookup,
+          readConfig: undefined,
+          writeConfig: undefined,
+        }),
+      )
+
+    it('warns when a registered name has no lookup at all', async () => {
+      const { warnings } = await wrap(['org.chromium.Chromium.*'])
+      expect(warnings.join('\n')).toContain('"org.chromium.Chromium.*"')
+      expect(warnings.join('\n')).toContain('allowMachLookup')
+    })
+
+    it('stays quiet when a prefix lookup covers the registered name', async () => {
+      const { warnings } = await wrap(
+        ['org.chromium.Chromium.MachPortRendezvousServer'],
+        ['org.chromium.*'],
+      )
+      expect(warnings).toEqual([])
+    })
+
+    it('stays quiet when an exact lookup equals the registered name', async () => {
+      const name = 'com.example.exact'
+      const { warnings } = await wrap([name], [name])
+      expect(warnings).toEqual([])
+    })
+
+    it('warns when the lookup is narrower than the registered pattern', async () => {
+      // Registering a whole prefix but only looking up one leaf leaves the rest
+      // of the prefix unresolvable, which is the hang this warning is about.
+      const { warnings } = await wrap(
+        ['com.example.prefix.*'],
+        ['com.example.prefix.one'],
+      )
+      expect(warnings.join('\n')).toContain('"com.example.prefix.*"')
+    })
+
+    it('names every uncovered entry and leaves the covered ones out', async () => {
+      const { warnings } = await wrap(
+        ['com.covered.*', 'com.bare.one', 'com.bare.two'],
+        ['com.covered.*'],
+      )
+      const text = warnings.join('\n')
+      expect(text).toContain('"com.bare.one"')
+      expect(text).toContain('"com.bare.two"')
+      expect(text).not.toContain('"com.covered.*"')
+    })
+
+    it('still emits the register rules it warned about', async () => {
+      // The warning is advisory: the profile is unchanged, so an operator who
+      // meant what they wrote still gets the grant they asked for.
+      const { result, warnings } = await wrap(['com.example.unpaired.*'])
+      expect(warnings.some(w => w.includes('"com.example.unpaired.*"'))).toBe(
+        true,
+      )
+      expect(result).toContain(
+        '(allow mach-register (global-name-prefix "com.example.unpaired."))',
+      )
+    })
+  },
+)
+
+describe.if(isMacOS)('macOS Seatbelt allowMachRegister', () => {
+  it('should emit global-name and global-name-prefix rules for configured services', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachRegister: [
+        'com.google.chrome.for.testing.MachPortRendezvousServer',
+        'org.chromium.crashpad.*',
+      ],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain(
+      '(allow mach-register (global-name "com.google.chrome.for.testing.MachPortRendezvousServer"))',
+    )
+    expect(wrappedCommand).toContain(
+      '(allow mach-register (global-name-prefix "org.chromium.crashpad."))',
+    )
+  })
+
+  it('should not grant mach-lookup to a service it only registers', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachRegister: ['com.example.registered.*'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).not.toContain(
+      '(allow mach-lookup (global-name-prefix "com.example.registered."))',
+    )
+  })
+
+  it('should emit a syntactically valid profile with allowMachRegister set', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachRegister: ['com.example.service', 'com.example.prefix.*', '*'],
       readConfig: undefined,
       writeConfig: undefined,
     })
