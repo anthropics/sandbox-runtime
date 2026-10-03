@@ -29,9 +29,9 @@
  * Usage:
  *   ./seccomp-unix-block <output-file> [arch]
  *
- * If arch is given (x86_64 or aarch64), the filter is generated for that
- * architecture instead of the native one. Lets a single-arch builder emit
- * filters for both x64 and arm64.
+ * If arch is given (x86_64, aarch64, or powerpc64le), the filter is generated
+ * for that architecture instead of the native one. Lets a single-arch builder
+ * emit filters for all supported targets.
  *
  * Dependencies:
  *   - libseccomp (libseccomp-dev package on Debian/Ubuntu)
@@ -53,7 +53,7 @@ int main(int argc, char *argv[]) {
     int rc;
 
     if (argc < 2 || argc > 3) {
-        fprintf(stderr, "Usage: %s <output-file> [x86_64|aarch64]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <output-file> [x86_64|aarch64|powerpc64le]\n", argv[0]);
         return 1;
     }
 
@@ -73,6 +73,8 @@ int main(int argc, char *argv[]) {
             target = SCMP_ARCH_X86_64;
         } else if (strcmp(arch_name, "aarch64") == 0) {
             target = SCMP_ARCH_AARCH64;
+        } else if (strcmp(arch_name, "powerpc64le") == 0) {
+            target = SCMP_ARCH_PPC64LE;
         } else {
             fprintf(stderr, "Error: Unsupported arch '%s'\n", arch_name);
             seccomp_release(ctx);
