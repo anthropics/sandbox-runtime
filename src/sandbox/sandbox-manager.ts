@@ -1,10 +1,14 @@
 import {
+  hasNameReading,
   literalReadLists,
   literalWriteLists,
   reExposedBy,
+  readRulesOf,
   samePathEntries,
   spelledOf,
+  withOtherReadings,
   writeRootsOf,
+  type PathListKind,
 } from './path-entries.js'
 import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
@@ -719,7 +723,9 @@ async function initialize(
     // filters, nor the ripgrep scan for nested dangerous paths; and it still
     // reports writes bwrap permits through `--dev`, `--proc` and the tmpfs
     // over each read-denied directory. Started once, so both lists are fixed
-    // at the cwd and configuration of this call.
+    // at the cwd and configuration of this call, and at the disk as it is
+    // now: an entry with glob characters that becomes the name of a path
+    // later is applied by the next wrap and stays unknown here.
     const monitoredWrites = getFsWriteConfig()
     linuxMonitor = startLinuxSandboxViolationMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
@@ -1239,7 +1245,8 @@ function getCredentialDenyReadPaths(
  * expansion and no credential masking, because getFsWriteConfig() is a
  * getter callers reach from permission checks and render paths. A mask entry
  * that degrades to a deny is a file and cannot cover a directory, so
- * leaving those out changes nothing.
+ * leaving those out changes nothing. An entry with glob characters that is
+ * also the name of a path counts as that name too.
  */
 function defaultWritePathsUnder({
   denyRead,
@@ -1250,10 +1257,9 @@ function defaultWritePathsUnder({
   allowRead: readonly FilesystemPathEntry[] | undefined
   credentials: CredentialsConfig | undefined
 }): string[] {
-  return getDefaultWritePaths({
-    denyRead: [...denyRead, ...getCredentialDenyReadPaths(credentials)],
-    allowRead,
-  })
+  return getDefaultWritePaths(
+    readRulesOf(denyRead, allowRead, getCredentialDenyReadPaths(credentials)),
+  )
 }
 
 /**
@@ -1274,8 +1280,9 @@ function unionDenyReadPaths(
  * Strip a trailing `/**` from each read-path entry and, on Linux, replace
  * any remaining glob with what `expandGlob` returns for it (bubblewrap takes
  * concrete paths only). Other platforms match globs natively.
- * Entries the caller marked literal are not in the result: they travel in
- * the `literal…` lists.
+ * On Linux the entry's other readings are added (see `withOtherReadings`);
+ * elsewhere the backend decides them. Entries the caller marked literal are
+ * not in the result: they travel in the `literal…` lists.
  *
  * `literalPaths` are the ones the library resolved itself (a masked
  * credential file that degraded to deny) — each names one file on disk, so
@@ -1283,8 +1290,9 @@ function unionDenyReadPaths(
  * pattern, a name holding `[` matches nothing and the deny is lost.
  */
 function* resolveReadPathEntries(
+  kind: PathListKind,
   paths: readonly FilesystemPathEntry[],
-  expandGlob: (pattern: string) => Steps<string[]>,
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
   literalPaths: readonly string[] = [],
 ): Steps<string[]> {
   const literal = new Set(literalPaths)
@@ -1296,7 +1304,9 @@ function* resolveReadPathEntries(
       !literal.has(p) &&
       containsGlobChars(stripped)
     ) {
-      resolved.push(...(yield* expandGlob(p)))
+      resolved.push(
+        ...(yield* withOtherReadings(p, stripped, kind, expandGlob)),
+      )
     } else {
       resolved.push(stripped)
     }
@@ -1308,13 +1318,21 @@ function* resolveReadPathEntries(
  * Strip a trailing `/**` and drop what is still a glob on Linux: bwrap needs
  * real paths. macOS subpath matching is recursive, so the strip is harmless
  * there and the filter never fires.
+ * A glob that is also the name of a path that exists is kept, as that name.
  * Marked entries are not in the result, as in {@link resolveReadPathEntries}.
  */
-function stripWriteGlobs(paths: readonly FilesystemPathEntry[]): string[] {
+function stripWriteGlobs(
+  kind: PathListKind,
+  paths: readonly FilesystemPathEntry[],
+): string[] {
   return spelledOf(paths)
     .map(p => removeTrailingGlobSuffix(p))
     .filter(p => {
-      if (getPlatform() === 'linux' && containsGlobChars(p)) {
+      if (
+        getPlatform() === 'linux' &&
+        containsGlobChars(p) &&
+        !hasNameReading(p, kind)
+      ) {
         logForDebugging(`[Sandbox] Skipping glob write pattern on Linux: ${p}`)
         return false
       }
@@ -1322,8 +1340,11 @@ function stripWriteGlobs(paths: readonly FilesystemPathEntry[]): string[] {
     })
 }
 
-function* expandAllowReadGlob(pattern: string): Steps<string[]> {
-  const expanded = (yield* walkGlobPatternSteps(pattern)).matches
+function* expandAllowReadGlob(
+  pattern: string,
+  anchor?: string,
+): Steps<string[]> {
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor })).matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -1353,6 +1374,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   // denyRead glob expansion collapses against it.
   const allowPaths = finish(
     resolveReadPathEntries(
+      'allow',
       config.filesystem.allowRead ?? [],
       expandAllowReadGlob,
     ),
@@ -1366,16 +1388,17 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   const listings: GlobWalkListings = new Map()
   const denyPaths = finish(
     resolveReadPathEntries(
+      'deny',
       unionDenyReadPaths(
         spelledOf(config.filesystem.denyRead),
         credentialRestrictions,
       ),
-      pattern =>
+      (pattern, anchor) =>
         expandReadDenyGlobLinuxSteps(
           pattern,
           reExposedPaths,
           unlistableDenyDirs,
-          { listings },
+          { anchor, listings },
         ),
       credentialRestrictions.degradeToDenyPaths,
     ),
@@ -1401,8 +1424,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: ['/'], denyWithinAllow: [] }
   }
 
-  const allowPaths = stripWriteGlobs(config.filesystem.allowWrite)
-  const denyPaths = stripWriteGlobs(config.filesystem.denyWrite)
+  const allowPaths = stripWriteGlobs('allow', config.filesystem.allowWrite)
+  const denyPaths = stripWriteGlobs('deny', config.filesystem.denyWrite)
 
   const allowOnly = [
     ...defaultWritePathsUnder({
@@ -1772,6 +1795,7 @@ async function wrapWithSandboxAgain(
   let readConfig: FsReadRestrictionConfig | undefined
   if (!fsDisabled) {
     const userAllowWrite = stripWriteGlobs(
+      'allow',
       customConfig?.filesystem?.allowWrite ??
         config?.filesystem.allowWrite ??
         [],
@@ -1790,6 +1814,7 @@ async function wrapWithSandboxAgain(
         ...userAllowWrite,
       ],
       denyWithinAllow: stripWriteGlobs(
+        'deny',
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
           [],
@@ -1807,6 +1832,7 @@ async function wrapWithSandboxAgain(
     // directory (allowRead + allowWrite), so both must be final here.
     const expandedAllowRead = await walked(
       resolveReadPathEntries(
+        'allow',
         customConfig?.filesystem?.allowRead ??
           config?.filesystem.allowRead ??
           [],
@@ -1833,18 +1859,19 @@ async function wrapWithSandboxAgain(
     const listings: GlobWalkListings = new Map()
     const expandedDenyRead = await walked(
       resolveReadPathEntries(
+        'deny',
         unionDenyReadPaths(
           spelledOf(
             customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
           ),
           credentialRestrictions,
         ),
-        pattern =>
+        (pattern, anchor) =>
           expandReadDenyGlobLinuxSteps(
             pattern,
             reExposedPaths,
             unlistableDenyDirs,
-            { listings },
+            { anchor, listings },
           ),
         credentialRestrictions.degradeToDenyPaths,
       ),
@@ -2511,7 +2538,9 @@ function annotateStderrWithSandboxFailures(
  * sandboxing is disabled.
  *
  * Patterns ending with /** are excluded since they work as subpaths.
- * So are entries marked literal.
+ * So are entries marked literal. An entry that is also the name of a path
+ * that exists is still returned: what is returned must not depend on what
+ * is on the disk, which a sandboxed command can change.
  */
 function getLinuxGlobPatternWarnings(): string[] {
   // Only warn on Linux/WSL (bubblewrap doesn't support globs)

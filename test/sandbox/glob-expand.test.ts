@@ -15,6 +15,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
+import { literalReadings } from '../../src/sandbox/path-entries.js'
 import type { FilesystemPathEntry } from '../../src/sandbox/sandbox-config.js'
 import {
   expandGlobPattern,
@@ -1090,18 +1091,28 @@ describe('expandWindowsFsPaths literal branch', () => {
 // ============================================================================
 
 /**
- * `[` and `]` are characters of a name on Windows: a path that holds them
- * and no `*` or `?` is a literal, marked or not. Pinned here on every host;
- * the spellings only Windows has are in the suite below.
+ * `[` and `]` are characters of a name on Windows, but the walk that expands
+ * a pattern reads them as a character class: beneath such a directory it
+ * finds nothing on its own, and the deny or grant is lost. Pinned here on
+ * every host; the spellings only Windows has are in the suite below.
  */
 describe('expandWindowsFsPaths beneath a directory named [WIP] project', () => {
   let root: string
   let project: string
+  let envFiles: string[]
 
   beforeAll(() => {
     root = realPath(mkdtempSync(join(tmpdir(), 'win-literal-')))
     project = join(root, '[WIP] project')
     mkdirSync(join(project, 'keep'), { recursive: true })
+    mkdirSync(join(project, 'sub', 'deep'), { recursive: true })
+    envFiles = [
+      join(project, '.env'),
+      join(project, 'sub', '.env'),
+      join(project, 'sub', 'deep', '.env'),
+    ]
+    for (const file of envFiles) writeFileSync(file, '')
+    writeFileSync(join(project, 'sub', 'readme'), '')
   })
 
   afterAll(() => {
@@ -1118,6 +1129,51 @@ describe('expandWindowsFsPaths beneath a directory named [WIP] project', () => {
     const notYet = join(project, 'not-yet')
     expect(expandWindowsFsPaths([notYet], { mode: 'deny' })).toEqual([notYet])
     expect(expandWindowsFsPaths([notYet], { mode: 'grant' })).toEqual([])
+  })
+
+  it.each(['deny', 'grant'] as const)(
+    'expands a pattern beneath it (%s)',
+    mode => {
+      expect(
+        expandWindowsFsPaths([`${project}/**/.env`], { mode }).sort(),
+      ).toEqual([...envFiles].sort())
+      expect(
+        expandWindowsFsPaths([`${project}/sub/*`], { mode }).sort(),
+      ).toEqual(
+        [
+          join(project, 'sub', '.env'),
+          join(project, 'sub', 'deep'),
+          join(project, 'sub', 'readme'),
+        ].sort(),
+      )
+    },
+  )
+
+  it.each(['deny', 'grant'] as const)(
+    'expands a /** beneath it, the one wildcard the entry has (%s)',
+    mode => {
+      // Without `*` or `?` the rest is no pattern to Windows, and the walk
+      // still reads its brackets as a class.
+      expect(
+        expandWindowsFsPaths([`${project}/sub/**`], { mode }).sort(),
+      ).toEqual(
+        [
+          join(project, 'sub', '.env'),
+          join(project, 'sub', 'deep'),
+          join(project, 'sub', 'deep', '.env'),
+          join(project, 'sub', 'readme'),
+        ].sort(),
+      )
+      expect(expandWindowsFsPaths([`${project}/**`], { mode })).toHaveLength(7)
+    },
+  )
+
+  it('lists a path once that more than one reading finds', () => {
+    const out = expandWindowsFsPaths(
+      [`${project}/**/.env`, `${project}/*/.env`, join(project, 'sub', '.env')],
+      { mode: 'deny' },
+    )
+    expect(out.sort()).toEqual([...envFiles].sort())
   })
 
   it('takes a marked entry for a literal, whatever it holds', () => {
@@ -1153,6 +1209,38 @@ describe('expandWindowsFsPaths beneath a directory named [WIP] project', () => {
       ).toThrow(TypeError)
     }
   })
+
+  it.if(!isWindows)(
+    'does not expand a grant beneath a link that has the name the pattern spells',
+    () => {
+      const work = join(root, 'work')
+      mkdirSync(join(root, 'vault', 'pub'), { recursive: true })
+      mkdirSync(work, { recursive: true })
+      writeFileSync(join(root, 'vault', 'pub', 'key'), '')
+      symlinkSync(join(root, 'vault'), join(work, '[ab]'))
+      const pattern = `${work}/[ab]/pub/*`
+      expect(expandWindowsFsPaths([pattern], { mode: 'grant' })).toEqual([])
+      expect(expandWindowsFsPaths([pattern], { mode: 'deny' })).toEqual([
+        join(work, '[ab]', 'pub', 'key'),
+      ])
+    },
+  )
+
+  it.if(!isWindows)(
+    'does not expand a grant beneath a link that lies between such a directory and the first wildcard',
+    () => {
+      const work = join(root, 'work-with-link-inside')
+      const vault = join(root, 'vault-behind-link')
+      mkdirSync(join(vault, 'deep', 'pub'), { recursive: true })
+      mkdirSync(join(work, '[ab]'), { recursive: true })
+      symlinkSync(vault, join(work, '[ab]', 'mid'))
+      const pattern = `${work}/[ab]/mid/*/pub`
+      expect(expandWindowsFsPaths([pattern], { mode: 'grant' })).toEqual([])
+      expect(expandWindowsFsPaths([pattern], { mode: 'deny' })).toEqual([
+        join(work, '[ab]', 'mid', 'deep', 'pub'),
+      ])
+    },
+  )
 })
 
 describe.if(isWindows)(
@@ -1164,11 +1252,48 @@ describe.if(isWindows)(
     beforeAll(() => {
       root = mkdtempSync(join(tmpdir(), 'win-literal-'))
       project = join(root, '[WIP] project')
-      mkdirSync(join(project, 'sub'), { recursive: true })
+      mkdirSync(join(project, 'sub', 'deep'), { recursive: true })
+      for (const dir of ['', 'sub', join('sub', 'deep')]) {
+        writeFileSync(join(project, dir, '.env'), '')
+      }
+      writeFileSync(join(project, 'sub', 'readme'), '')
     })
 
     afterAll(() => {
       rmSync(root, { recursive: true, force: true })
+    })
+
+    /** Every result names an existing `.env`, and there are three of them. */
+    function expectTheEnvFiles(out: string[]): void {
+      expect(out.map(p => basename(p))).toEqual(['.env', '.env', '.env'])
+      expect(new Set(out.map(p => p.toLowerCase())).size).toBe(3)
+      for (const p of out) expect(existsSync(p)).toBe(true)
+    }
+
+    it('expands a pattern spelled with a drive letter and backslashes', () => {
+      expect(project).toMatch(/^[A-Za-z]:\\/)
+      expectTheEnvFiles(
+        expandWindowsFsPaths([`${project}\\**\\.env`], { mode: 'deny' }),
+      )
+    })
+
+    it('expands one spelled with forward slashes and a lower-case drive letter', () => {
+      const spelled =
+        project[0]!.toLowerCase() + project.slice(1).replace(/\\/g, '/')
+      expectTheEnvFiles(
+        expandWindowsFsPaths([`${spelled}/**/.env`], { mode: 'deny' }),
+      )
+      expectTheEnvFiles(
+        expandWindowsFsPaths([`${spelled}/**/.env`], { mode: 'grant' }),
+      )
+    })
+
+    it('expands one spelled with mixed separators and the extended-length prefix', () => {
+      expectTheEnvFiles(
+        expandWindowsFsPaths([`\\\\?\\${project}/sub/..\\**/.env`], {
+          mode: 'deny',
+        }),
+      )
     })
 
     it('takes a marked path spelled with backslashes, and skips one with a wildcard', () => {
@@ -1180,6 +1305,22 @@ describe.if(isWindows)(
         { mode: 'deny' },
       )
       expect(out.map(p => basename(p))).toEqual(['sub'])
+    })
+
+    it('gives a UNC pattern no reading that would probe the share', () => {
+      // Deciding on a reading looks at the disk, and looking at a UNC path
+      // is a request to the host it names.
+      for (const unc of [
+        '\\\\srt-no-such-host\\share\\[WIP] project\\**\\.env',
+        '\\\\?\\UNC\\srt-no-such-host\\share\\[WIP] project\\*.env',
+        '//srt-no-such-host/share/[WIP] project/*.env',
+      ]) {
+        for (const kind of ['deny', 'allow'] as const) {
+          expect(
+            literalReadings(unc, kind, { isPattern: containsGlobCharsWin }),
+          ).toEqual([])
+        }
+      }
     })
   },
 )

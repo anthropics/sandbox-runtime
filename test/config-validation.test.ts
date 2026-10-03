@@ -433,6 +433,27 @@ describe('Config Validation', () => {
       }
     })
 
+    test.if(!isWindows)(
+      'points a deny inside a folder named like a pattern at the spelling read both ways',
+      () => {
+        // Whether the folder exists is for the disk to say, which validation
+        // does not ask, so the separator is refused here as in any pattern.
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          filesystem: {
+            ...base.filesystem,
+            denyWrite: ['/work/[WIP] project/keep/'],
+          },
+        })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.message).toContain(
+            'Write "/work/[WIP] project/keep", which is also read as the path of that name',
+          )
+        }
+      },
+    )
+
     test('accepts the slash-free glob spellings it points at', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,

@@ -1099,7 +1099,9 @@ export const SeccompConfigSchema = z.object({
 /**
  * An inert deny is fail-open, so a deny glob whose trailing separator leaves
  * it matching nothing is rejected; the same glob as an allow fails closed,
- * so the allow lists keep the plain path schema.
+ * so the allow lists keep the plain path schema. Such an entry may also be
+ * the name of a path (`/w/[WIP]/keep/`), but only the disk can say so and
+ * validation does not ask it: the message gives the spelling read both ways.
  */
 function addInertSlashedDenyGlobIssue(
   value: string,
@@ -1121,9 +1123,10 @@ function addInertSlashedDenyGlobIssue(
     code: z.ZodIssueCode.custom,
     path,
     message:
-      `Deny glob "${value}" ends in a separator, so the pattern can match ` +
-      `no path. Write "${value.replace(trailingSeparator, '')}", or add a ` +
-      `"**" segment to match at any depth.`,
+      `Deny glob "${value}" ends in a separator, so as a pattern it can ` +
+      `match no path. Write "${value.replace(trailingSeparator, '')}", ` +
+      `which is also read as the path of that name where it exists, or add ` +
+      `a "**" segment to match at any depth.`,
   })
 }
 

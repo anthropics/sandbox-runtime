@@ -1,24 +1,58 @@
 /**
- * The entries of `denyRead`, `allowRead`, `allowWrite` and `denyWrite` as
- * configured: a spelling, which is a pattern when it holds `*`, `?`, `[` or
- * `]`, or a path marked `{ path, literal: true }`, which is the name and
- * nothing else, whatever it holds.
+ * How an entry of `denyRead`, `allowRead`, `allowWrite` or `denyWrite` is
+ * read: as the pattern its characters spell, as the path they name, or both.
  *
- * Marked paths travel beside the spellings, in the `literal…` lists of the
- * restriction configs, so that no backend reads their characters again.
+ * An entry with `*`, `?`, `[` or `]` is a pattern. A directory may hold those
+ * in its own name (`[WIP] project`), so such an entry is ALSO read as what it
+ * names wherever the part that holds the characters exists on disk. An entry
+ * marked `{ path, literal: true }` is the name and nothing else.
+ *
+ * The decision is made by the functions here only, for each stage that
+ * needs it (the manager and the wrapper's fold on Linux, the profile builder
+ * on macOS, `expandWindowsFsPaths` on Windows). One wrap may ask about an
+ * entry more than once, and the disk may change in between.
  */
 
 import * as fs from 'node:fs'
+import * as path from 'node:path'
+import { getPlatform } from '../utils/platform.js'
 import {
+  collapseInteriorSpellings,
   containsGlobChars,
+  containsGlobCharsForPlatform,
   expandTilde,
+  expandWindowsEnvRefs,
+  isAbsenceErrno,
+  isUncPath,
   markedLiteralPath,
+  normalizePathForSandbox,
+  removeTrailingGlobSuffix,
+  type Steps,
+  stripExtendedPathPrefix,
+  toForwardSlashes,
 } from './sandbox-utils.js'
 import type { FilesystemPathEntry } from './sandbox-config.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
+
+/**
+ * Which way a list cuts. A deny takes every reading that may hold, since one
+ * more can only deny more; an allow takes one only for a path that is there
+ * exactly as spelled.
+ */
+export type PathListKind = 'allow' | 'deny'
+
+/** One reading of an entry, shaped as the macOS builder's `PathEntry`. */
+export type PathReading =
+  /** The entry is the name of this path. */
+  | { glob: false; path: string }
+  /**
+   * The entry is a pattern beneath `anchor`, a directory taken as the name it
+   * is: `path` is `anchor` plus the tail, and only the tail is pattern.
+   */
+  | { glob: true; path: string; anchor: string }
 
 /**
  * The spellings and the marked paths of a list, apart. Throws on an entry
@@ -60,15 +94,238 @@ export function samePathEntries(
 }
 
 /**
- * Whether something is at `spelling`, as the kernel resolves it. `realpath`
- * cannot be asked: it folds a `..` by the text first.
+ * The spelling made absolute as {@link normalizePathForSandbox} does for a
+ * pattern: no symlink resolved, a trailing separator kept. Undefined for a
+ * Windows UNC path, which is never probed (see {@link isUncPath}).
  */
-function isThereAsSpelled(spelling: string): boolean {
+function spelledAbsolute(spelling: string): string | undefined {
+  const onWindows = getPlatform() === 'windows'
+  let spelled = spelling
+  if (onWindows) {
+    spelled = stripExtendedPathPrefix(expandWindowsEnvRefs(spelled))
+    if (isUncPath(spelled)) return undefined
+  }
+  const expanded = expandTilde(spelled)
+  const absolute =
+    expanded === spelled && !path.isAbsolute(spelled)
+      ? path.resolve(process.cwd(), spelled)
+      : expanded
+  return onWindows
+    ? toForwardSlashes(absolute)
+    : collapseInteriorSpellings(absolute)
+}
+
+/**
+ * Whether something may be at `p`, for a deny. A symbolic link counts,
+ * dangling or not, and so does a path that cannot be looked at: otherwise a
+ * command running as the same user could switch the deny off by making a
+ * parent unsearchable, and undo that inside the next sandbox.
+ */
+function mayBeThere(p: string): boolean {
   try {
-    fs.lstatSync(expandTilde(spelling))
+    fs.lstatSync(p)
     return true
+  } catch (err) {
+    return !isAbsenceErrno(err)
+  }
+}
+
+/**
+ * Whether `p` is there and is not a symbolic link, for an allow. Whoever can
+ * write the directory that holds `p` can plant a link of that name, and the
+ * allow would open what it points at. What cannot be looked at is not there.
+ */
+function isThereUnlinked(p: string): boolean {
+  try {
+    return !fs.lstatSync(p).isSymbolicLink()
   } catch {
     return false
+  }
+}
+
+/** Whether a pattern can be walked beneath `p`, under the rule of `kind`. */
+function isDirectoryFor(kind: PathListKind, p: string): boolean {
+  try {
+    return kind === 'allow'
+      ? fs.lstatSync(p).isDirectory()
+      : fs.statSync(p).isDirectory()
+  } catch (err) {
+    return kind === 'deny' && !isAbsenceErrno(err)
+  }
+}
+
+/**
+ * The readings a caller's spelling has BESIDE the one its characters give
+ * it. Empty for a spelling that is no pattern, and for a pattern none of
+ * whose glob characters are part of a name on disk: that costs one `lstat`.
+ *
+ * A trailing `/**` is set aside first. Of the components that hold glob
+ * characters, the leading ones that exist on disk as spelled are names:
+ *
+ * - When all of them exist, the entry is also the NAME it spells. What
+ *   follows the last of them need not exist.
+ * - When a pattern follows an existing one, the entry is also that pattern
+ *   BENEATH the directory. There is one such reading per existing component,
+ *   the longest first, so creating or removing a directory adds or removes a
+ *   reading and never turns one into another.
+ *
+ * Whether a spelling is a pattern is decided on what the caller wrote
+ * (`isPattern`); which components hold glob characters, by
+ * {@link containsGlobChars} on every platform, since those are what the
+ * pattern compiler and the walk take for syntax.
+ *
+ * A component exists for a deny as {@link mayBeThere} has it. For an allow
+ * no component from the first with glob characters on may be a symbolic
+ * link or beyond looking at: a name to its end, a pattern up to its first
+ * pattern component, from where the walk of an allow goes through no link.
+ */
+export function literalReadings(
+  spelling: string,
+  kind: PathListKind,
+  opts: { isPattern?: (spelling: string) => boolean } = {},
+): PathReading[] {
+  const isPattern = opts.isPattern ?? containsGlobCharsForPlatform
+  let stripped = removeTrailingGlobSuffix(spelling)
+  if (!isPattern(stripped)) {
+    // Where `[` and `]` are no pattern syntax (Windows), `<dir>/**` is a
+    // pattern by its `/**` alone, and the walk still reads the brackets as a
+    // class: the `/**` stays on, as a pattern beneath the directory.
+    if (stripped === spelling || !containsGlobChars(stripped)) return []
+    stripped = spelling
+  }
+  const spelled = spelledAbsolute(stripped)
+  if (spelled === undefined) return []
+
+  const parts = spelled.split('/')
+  const globAt = parts.flatMap((part, i) =>
+    containsGlobChars(part) ? [i] : [],
+  )
+  const first = globAt[0]
+  const last = globAt[globAt.length - 1]
+  if (first === undefined || last === undefined) return []
+  const prefix = (i: number): string => parts.slice(0, i + 1).join('/') || '/'
+
+  const isThere = kind === 'deny' ? mayBeThere : isThereUnlinked
+  let reach = first - 1
+  while (reach < last && isThere(prefix(reach + 1))) reach++
+  if (reach < first) return []
+
+  const readings: PathReading[] = []
+  if (
+    reach === last &&
+    (kind === 'deny' || restIsUnlinked(last, parts.length - 1, prefix))
+  ) {
+    readings.push({
+      glob: false,
+      path: normalizePathForSandbox(stripped, { literal: true }),
+    })
+  }
+
+  // The tail keeps a trailing separator, which makes a pattern match nothing
+  // (`/x/*/`): stripped, an allow spelled so would match every child. The
+  // `/**` set aside above goes back on, for the walk's directory form.
+  const setAside = stripped === spelling ? '' : '/**'
+  for (let n = globAt.length - 2; n >= 0; n--) {
+    const at = globAt[n]!
+    if (at > reach) continue
+    // As far as the directory's own name goes on: up to the next component
+    // with glob characters, or to where the disk ends.
+    const next = globAt[n + 1]!
+    let end = Math.min(next - 1, reach)
+    while (end >= at && !isDirectoryFor(kind, prefix(end))) end--
+    if (end < at) continue
+    // The walk resolves what the tail spells before its first pattern
+    // component: a link there would have an allow list what it points at.
+    if (kind === 'allow' && !restIsUnlinked(end, next - 1, prefix)) continue
+    const anchor = normalizePathForSandbox(prefix(end), { literal: true })
+    readings.push({
+      glob: true,
+      anchor,
+      path: anchor + spelled.slice(prefix(end).length) + setAside,
+    })
+  }
+  return readings
+}
+
+/**
+ * Whether no component after `from`, up to `to`, is a symbolic link or
+ * beyond looking at. What is not there yet is neither.
+ */
+function restIsUnlinked(
+  from: number,
+  to: number,
+  prefix: (i: number) => string,
+): boolean {
+  for (let i = from + 1; i <= to; i++) {
+    try {
+      if (fs.lstatSync(prefix(i)).isSymbolicLink()) return false
+    } catch (err) {
+      return isAbsenceErrno(err)
+    }
+  }
+  return true
+}
+
+/** Whether a spelling that reads as a pattern is also the name of a path. */
+export function hasNameReading(spelling: string, kind: PathListKind): boolean {
+  return literalReadings(spelling, kind).some(reading => !reading.glob)
+}
+
+/**
+ * What a Linux read entry resolves to: what `expandGlob` returns for the
+ * pattern, then what the entry's other readings add. `name` is the entry as
+ * a name, in the caller's spelling.
+ */
+export function* withOtherReadings(
+  spelling: string,
+  name: string,
+  kind: PathListKind,
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
+): Steps<string[]> {
+  const expansion = yield* expandGlob(spelling)
+  const seen = new Set(expansion)
+  const added: string[] = []
+  for (const reading of literalReadings(spelling, kind)) {
+    const found = reading.glob
+      ? yield* expandGlob(reading.path, reading.anchor)
+      : [name]
+    for (const p of found) {
+      if (seen.has(p)) continue
+      seen.add(p)
+      added.push(p)
+    }
+  }
+  return [...expansion, ...added]
+}
+
+/**
+ * The read rules `getDefaultWritePaths()` is given: the entries, the
+ * credential denies, and the name each spelling also is, as a marked path.
+ */
+export function readRulesOf(
+  denyRead: readonly FilesystemPathEntry[],
+  allowRead: readonly FilesystemPathEntry[] | undefined,
+  credentialDenies: readonly string[],
+): {
+  denyRead: FilesystemPathEntry[]
+  allowRead: FilesystemPathEntry[] | undefined
+} {
+  const withNames = (
+    entries: readonly FilesystemPathEntry[],
+    kind: PathListKind,
+  ): FilesystemPathEntry[] => [
+    ...entries,
+    ...spelledOf(entries).flatMap(spelling =>
+      literalReadings(spelling, kind).flatMap(
+        (reading): FilesystemPathEntry[] =>
+          reading.glob ? [] : [{ path: reading.path, literal: true }],
+      ),
+    ),
+  ]
+  return {
+    denyRead: withNames([...denyRead, ...credentialDenies], 'deny'),
+    allowRead:
+      allowRead === undefined ? undefined : withNames(allowRead, 'allow'),
   }
 }
 
@@ -162,10 +419,10 @@ export function readNamesOf(
 
 /**
  * The same for a write config; see {@link readNamesOf}. A string of
- * `allowOnly` that holds glob characters is kept only when something is
- * there under that very spelling. Any other is a pattern and no name:
- * resolving a name folds a `..` by the text, so `/home/*\/../.ssh` would
- * make `/home/.ssh` writable where nothing is named `*`.
+ * `allowOnly` that holds glob characters is kept only when it is also the
+ * name of a path (see {@link literalReadings}). Any other is a pattern and
+ * no name: resolving a name folds a `..` by the text, so `/home/*\/../.ssh`
+ * would make `/home/.ssh` writable where nothing is named `*`.
  */
 export function writeNamesOf(
   config: FsWriteRestrictionConfig | undefined,
@@ -176,7 +433,7 @@ export function writeNamesOf(
     ...rest,
     allowOnly: writeRootsOf({
       allowOnly: (config.allowOnly || []).filter(
-        p => !containsGlobChars(p) || isThereAsSpelled(p),
+        p => !containsGlobChars(p) || hasNameReading(p, 'allow'),
       ),
       literalAllowOnly,
     }),

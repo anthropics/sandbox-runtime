@@ -368,7 +368,7 @@ export function expandWindowsEnvRefs(p: string): string {
  * Runs of `/` collapsed to one and `/./` components dropped, leaving the rest
  * of the spelling (a trailing `/` or `/.`, a `..`) to the caller. POSIX only.
  */
-function collapseInteriorSpellings(pathPattern: string): string {
+export function collapseInteriorSpellings(pathPattern: string): string {
   return pathPattern.replace(/\/{2,}/g, '/').replace(/\/\.(?=\/)/g, '')
 }
 
@@ -407,14 +407,14 @@ function warnIfParentRefUnfolded(normalizedPath: string): string {
  *
  * `opts.literal` marks a path that names one file or directory rather
  * than matching several: one the library computed itself, one the caller
- * marked literal, or a caller spelling that carried no glob character —
+ * marked literal, a caller spelling that carried no glob character —
  * resolving such a spelling can splice in a cwd or home directory whose own
- * name does. The glob branches are skipped for it, so a component like
- * `a[b` is resolved and later compiled as the name it is. A spelling the
- * caller wrote with `*`, `?` or `[…]` in it and did not mark keeps the
- * character sniffing: there the brackets are the glob syntax it asked for.
- * The interior collapse below is not one of the glob branches: `//` and
- * `/./` are dead spellings either way.
+ * name does — or the name a spelling with glob characters also is (see
+ * path-entries.ts). The glob branches are skipped for it, so a component
+ * like `a[b` is resolved and later compiled as the name it is. Without it,
+ * a spelling with `*`, `?` or `[…]` in it keeps the character sniffing, its
+ * pattern reading. The interior collapse below is not one of the glob
+ * branches: `//` and `/./` are dead spellings either way.
  */
 export function normalizePathForSandbox(
   pathPattern: string,
@@ -597,7 +597,9 @@ const HOME_CONVENIENCE_WRITE_DIRS: readonly string[] = [
  * match is a symlink to one of these directories is not seen. A glob
  * `allowRead` entry is not counted as re-opening anything.
  *
- * An entry marked `{ path, literal: true }` is a name whatever it holds.
+ * An entry marked `{ path, literal: true }` is a name whatever it holds. A
+ * spelling is read by its characters alone: the name it also is when that
+ * exists on disk is for the caller to add as a marked entry.
  */
 export function getDefaultWritePaths(readRules?: {
   denyRead: readonly FilesystemPathEntry[]
@@ -1154,10 +1156,10 @@ export function globToRegex(globPattern: string): string {
  * already does (a deny masks the whole subtree). Only ever widens a deny.
  *
  * Takes a whole pattern, so every character in it is glob syntax: right for
- * a spelling the caller wrote, which is what {@link readRuleCovers} passes.
- * A pattern the library anchored at a directory of its own goes through the
- * macOS `denyGlobEntryRegex`, which splices that directory back in escaped
- * and calls this for the tail.
+ * the pattern reading of a spelling the caller wrote, which is what
+ * {@link readRuleCovers} passes. A pattern anchored at a directory that is a
+ * name on disk goes through the macOS `denyGlobEntryRegex`, which splices
+ * that directory back in escaped and calls this for the tail.
  */
 export function denyGlobRegex(normalizedGlob: string): string {
   // globToRegex() always returns '^…$'.

@@ -19,6 +19,7 @@ import {
   getDangerousDirectories,
 } from './sandbox-utils.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
+import { literalReadings, type PathListKind } from './path-entries.js'
 
 import type {
   FsReadRestrictionConfig,
@@ -162,8 +163,8 @@ function pathFilter(entry: PathEntry): string {
 
 /**
  * Compiles `entry`'s pattern with one of the shared string compilers in
- * `sandbox-utils.ts`. An entry the library anchored at a directory
- * (`anchor`) keeps that directory as a literal — the cwd is a name on disk
+ * `sandbox-utils.ts`. An entry anchored at a directory
+ * (`anchor`) keeps that directory as a literal — it is a name on disk
  * and may itself contain `[`, `*` or `?` — so only the tail below it goes
  * through the compiler, and the anchor is spliced back in escaped. Every
  * compiler there returns '^…$'.
@@ -171,7 +172,7 @@ function pathFilter(entry: PathEntry): string {
  * This is the whole difference between the entry-taking wrappers here and
  * the string-taking compilers they call: those see a spelling in which
  * every character is glob syntax, which is right for what a caller wrote
- * and wrong for what the library computed.
+ * as a pattern and wrong for a name on disk.
  */
 function anchorRegex(
   entry: GlobPathEntry,
@@ -251,8 +252,9 @@ export type PathEntry =
       glob: true
       path: string
       /**
-       * Set when the library anchored this glob at a directory of its own
-       * (the cwd, for the mandatory `**\/<name>` patterns): the prefix of
+       * Set when this glob is anchored at a directory that is a name on
+       * disk (the cwd, for the mandatory `**\/<name>` patterns, or an
+       * existing one that holds glob characters): the prefix of
        * `path` that is a literal path rather than part of the pattern.
        */
       anchor?: string
@@ -268,11 +270,12 @@ function anchoredGlobEntry(anchor: string, pattern: string): PathEntry {
 
 /**
  * A spelling that came from the caller's config: `*`, `?` and `[…]` in
- * what the caller wrote are the glob syntax it asked for. The decision is
+ * what the caller wrote are read as glob syntax here. The decision is
  * made on that raw spelling, because resolving a relative or `~` path can
  * splice in a cwd or home directory whose own name contains those
  * characters — read back, they would turn the caller's `secrets` into a
  * pattern that never matches the directory it was resolved to.
+ * {@link alsoReadAs} gives the readings this one leaves out.
  */
 function toPathEntry(pathPattern: string): PathEntry {
   return containsGlobChars(pathPattern)
@@ -298,13 +301,26 @@ function toLiteralPathEntry(literalPath: string): PathEntry {
   }
 }
 
-/** One of the caller's lists as entries: spellings, then marked paths. */
+/**
+ * The readings a caller's spellings have beside {@link toPathEntry}'s; see
+ * {@link literalReadings}.
+ */
+function alsoReadAs(
+  spellings: readonly string[] | undefined,
+  kind: PathListKind,
+): PathEntry[] {
+  return (spellings ?? []).flatMap(spelling => literalReadings(spelling, kind))
+}
+
+/** One of the caller's lists as entries, in every reading each has. */
 function callerEntries(
+  kind: PathListKind,
   spellings: readonly string[] | undefined,
   literalPaths: readonly string[] | undefined,
 ): PathEntry[] {
   return [
     ...(spellings ?? []).map(toPathEntry),
+    ...alsoReadAs(spellings, kind),
     ...(literalPaths ?? []).map(toLiteralPathEntry),
   ]
 }
@@ -343,13 +359,14 @@ function resolveReadConfig(
 ): ResolvedReadConfig {
   return {
     denies: [
-      ...callerEntries(config.denyOnly, config.literalDenyOnly),
+      ...callerEntries('deny', config.denyOnly, config.literalDenyOnly),
       ...libraryDenies,
     ],
     // Non-glob spellings arrive slash-free from normalizePathForSandbox —
     // the nested-deny re-emit matches by `path + '/'` prefix, which a
     // preserved trailing slash would defeat ('<dir>//').
     allows: callerEntries(
+      'allow',
       config.allowWithinDeny,
       config.literalAllowWithinDeny,
     ),
@@ -881,13 +898,13 @@ function generateReadRules(
 }
 
 /**
- * What a write config allows, as entries: read once per profile, for the
- * read and the write section alike, so neither can miss the marked paths.
+ * What a write config allows, as entries. Decided once per profile and
+ * handed to the read and the write section, so the two see the same answer.
  */
 function writeRootEntries(
   config: FsWriteRestrictionConfig | undefined,
 ): PathEntry[] {
-  return callerEntries(config?.allowOnly, config?.literalAllowOnly)
+  return callerEntries('allow', config?.allowOnly, config?.literalAllowOnly)
 }
 
 /**
@@ -920,6 +937,7 @@ function generateWriteRules(
     ...(config.literalDenyWithinAllow ?? []).map(toLiteralPathEntry),
     ...macGetMandatoryDenyEntries(allowGitConfig),
   ]
+  denyEntries.push(...alsoReadAs(config.denyWithinAllow, 'deny'))
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)
   const groupFilters = groups.map(literalDenyGroupFilters)

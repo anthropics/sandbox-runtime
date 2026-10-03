@@ -25,6 +25,7 @@ export {
   isUncPath,
 } from './sandbox-utils.js'
 import { certThumbprint, generateCa, validateCaPair } from './mitm-ca.js'
+import { literalReadings } from './path-entries.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
 import type { FilesystemPathEntry, SrtWinConfig } from './sandbox-config.js'
 
@@ -1690,6 +1691,12 @@ export function uninstallWindowsSandbox(
  * materializing a placeholder chain on an SMB share. A UNC **glob**
  * still walks the share (user-trusted).
  *
+ * `[` and `]` are characters of a name here, but the walk that expands a
+ * glob reads them as a character class. So a glob beneath a directory with
+ * brackets in its name is also expanded beneath that directory taken as the
+ * name it is (see path-entries.ts). A UNC glob is not: finding the directory
+ * would probe the share.
+ *
  * An entry marked `{ path, literal: true }` is a literal whatever it holds.
  * One that holds `*` or `?` is skipped: no Win32 name has them, and
  * `srt-win` refuses the characters outright.
@@ -1721,7 +1728,19 @@ export function expandWindowsFsPaths(
       continue
     }
     const candidates = isGlob
-      ? expandGlobPattern(norm, { caseInsensitive: true })
+      ? [
+          ...expandGlobPattern(norm, { caseInsensitive: true }),
+          ...literalReadings(raw, opts?.mode === 'deny' ? 'deny' : 'allow', {
+            isPattern: containsGlobCharsWin,
+          }).flatMap(reading =>
+            reading.glob
+              ? expandGlobPattern(reading.path, {
+                  caseInsensitive: true,
+                  anchor: reading.anchor,
+                })
+              : [],
+          ),
+        ]
       : [norm]
     for (const c of candidates) {
       const st = fs.statSync(c, { throwIfNoEntry: false })

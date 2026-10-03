@@ -10,12 +10,15 @@ import {
 } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { connect } from 'node:net'
@@ -30,6 +33,8 @@ import {
 } from '../../src/sandbox/linux-violation-monitor.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import {
+  literalReadings,
+  type PathReading,
   readNamesOf,
   samePathEntries,
   splitPathEntries,
@@ -37,18 +42,25 @@ import {
   writeRootsOf,
 } from '../../src/sandbox/path-entries.js'
 import type { FilesystemPathEntry } from '../../src/sandbox/sandbox-config.js'
-import { getDefaultWritePaths } from '../../src/sandbox/sandbox-utils.js'
+import {
+  containsGlobCharsWin,
+  denyGlobRegex,
+  expandGlobPattern,
+  getDefaultWritePaths,
+  globToRegex,
+  normalizePathForSandbox,
+} from '../../src/sandbox/sandbox-utils.js'
 import {
   loadConfig,
   loadConfigFromString,
 } from '../../src/utils/config-loader.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
-import { isLinux, isWindows } from '../helpers/platform.js'
+import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
 
 /**
- * Entries marked `{ path, literal: true }`, and what the Linux wrapper does
- * with a name that holds `*`, `?`, `[` or `]`: see
- * src/sandbox/path-entries.ts.
+ * Entries inside a directory with `*`, `?`, `[` or `]` in its name, which
+ * match nothing when read as a pattern alone, and entries marked
+ * `{ path, literal: true }`: see src/sandbox/path-entries.ts.
  *
  * The Linux suites run real commands under bubblewrap. The macOS suites read
  * the generated profile on any POSIX host; none runs it under sandbox-exec.
@@ -69,11 +81,28 @@ function q(p: string): string {
   return `'${p.replace(/'/g, `'\\''`)}'`
 }
 
+function escapedForRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** The filter a spelling compiles to when read as a pattern. */
+function patternFilter(spelling: string, kind: 'allow' | 'deny'): string {
+  const compile = kind === 'deny' ? denyGlobRegex : globToRegex
+  return `(regex ${JSON.stringify(compile(normalizePathForSandbox(spelling)))})`
+}
+
 const subpath = (p: string): string => `(subpath ${JSON.stringify(p)})`
+const literalFilter = (p: string): string => `(literal ${JSON.stringify(p)})`
 
 function emittedRegexes(profile: string): RegExp[] {
   return [...profile.matchAll(/\(regex ("(?:[^"\\]|\\.)*")\)/g)].map(
     match => new RegExp(JSON.parse(match[1]!) as string),
+  )
+}
+
+function emittedSubpaths(profile: string): string[] {
+  return [...profile.matchAll(/\(subpath ("(?:[^"\\]|\\.)*")\)/g)].map(
+    match => JSON.parse(match[1]!) as string,
   )
 }
 
@@ -83,6 +112,18 @@ function ruleOf(profile: string, head: string): string {
   if (start < 0) return ''
   const end = profile.indexOf('(with message', start)
   return profile.slice(start, end)
+}
+
+function macProfile(
+  readConfig: { denyOnly: string[]; allowWithinDeny?: string[] } | undefined,
+  writeConfig: { allowOnly: string[]; denyWithinAllow: string[] } | undefined,
+): string {
+  return wrapCommandWithSandboxMacOS({
+    command: 'true',
+    needsNetworkRestriction: false,
+    readConfig,
+    writeConfig,
+  })
 }
 
 const noNetwork = { allowedDomains: [], deniedDomains: [] }
@@ -145,6 +186,401 @@ async function sandboxed(
   expect(result.stdout).toContain('BOOTED')
   return { stdout: result.stdout, stderr: result.stderr }
 }
+
+// ============================================================================
+// Deciding the reading
+// ============================================================================
+
+describe.if(!isWindows)('literalReadings', () => {
+  let root: string
+  let project: string
+  const savedCwd = process.cwd()
+
+  beforeAll(() => {
+    root = freshRoot()
+    project = join(root, PROJECT)
+    mkdirSync(join(project, 'keep'), { recursive: true })
+    mkdirSync(join(project, 'src'), { recursive: true })
+    mkdirSync(join(project, '[ab]'), { recursive: true })
+    writeFileSync(join(project, 'file'), '')
+    mkdirSync(join(root, 'plain', '[ab]'), { recursive: true })
+    mkdirSync(join(root, 'plain', 'a'), { recursive: true })
+    mkdirSync(join(root, 'plain', 'b'), { recursive: true })
+    mkdirSync(join(root, 'star'), { recursive: true })
+    writeFileSync(join(root, 'star', '*.env'), '')
+    writeFileSync(join(root, 'star', 'a.env'), '')
+    for (const name of [
+      'open[bracket',
+      'close]bracket',
+      'build*',
+      'notes (draft?)',
+      'curly{a,b}',
+    ]) {
+      mkdirSync(join(root, name, 'out'), { recursive: true })
+    }
+    mkdirSync(join(root, 'target', 'keep'), { recursive: true })
+    symlinkSync(join(root, 'target'), join(root, 'li[n]k'))
+    symlinkSync(join(root, 'nowhere'), join(root, 'dang[l]ing'))
+    mkdirSync(join(project, 'real'), { recursive: true })
+    symlinkSync(join(root, 'target'), join(project, 'linked'))
+  })
+
+  afterAll(() => {
+    process.chdir(savedCwd)
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  afterEach(() => {
+    process.chdir(savedCwd)
+  })
+
+  const name = (path: string): PathReading => ({ glob: false, path })
+  const beneath = (anchor: string, tail: string): PathReading => ({
+    glob: true,
+    anchor,
+    path: anchor + tail,
+  })
+  const bothKinds = (spelling: string) => ({
+    deny: literalReadings(spelling, 'deny'),
+    allow: literalReadings(spelling, 'allow'),
+  })
+  const forBoth = (readings: PathReading[]) => ({
+    deny: readings,
+    allow: readings,
+  })
+
+  it('reads a path inside the folder as the name it spells', () => {
+    expect(bothKinds(project)).toEqual(forBoth([name(project)]))
+    expect(bothKinds(join(project, 'keep'))).toEqual(
+      forBoth([name(join(project, 'keep'))]),
+    )
+  })
+
+  it('does not ask for what follows the glob characters to exist', () => {
+    const notYet = join(project, 'keep', 'not-there-yet')
+    expect(bothKinds(notYet)).toEqual(forBoth([name(notYet)]))
+  })
+
+  it('reads a pattern beneath the folder as that pattern beneath its name', () => {
+    expect(bothKinds(`${project}/**/.env`)).toEqual(
+      forBoth([beneath(project, '/**/.env')]),
+    )
+    expect(bothKinds(`${project}/*.pem`)).toEqual(
+      forBoth([beneath(project, '/*.pem')]),
+    )
+  })
+
+  it('takes the longest run of directories that exists as the anchor', () => {
+    expect(bothKinds(`${project}/src/**/.env`)).toEqual(
+      forBoth([beneath(join(project, 'src'), '/**/.env')]),
+    )
+    expect(bothKinds(`${project}/absent/**/.env`)).toEqual(
+      forBoth([beneath(project, '/absent/**/.env')]),
+    )
+  })
+
+  it('reads a wildcard as a name only when a file has that very name', () => {
+    expect(bothKinds(join(root, 'star', '*.env'))).toEqual(
+      forBoth([name(join(root, 'star', '*.env'))]),
+    )
+    expect(bothKinds(join(root, 'plain', '*.env'))).toEqual(forBoth([]))
+  })
+
+  it('sets a trailing /** aside for the decision and gives it back to a pattern', () => {
+    expect(bothKinds(`${project}/**`)).toEqual(forBoth([name(project)]))
+    expect(bothKinds(`${project}/keep/**`)).toEqual(
+      forBoth([name(join(project, 'keep'))]),
+    )
+    expect(bothKinds(`${project}/**/build/**`)).toEqual(
+      forBoth([beneath(project, '/**/build/**')]),
+    )
+  })
+
+  it('keeps the /** on where brackets alone make no pattern', () => {
+    // As Windows reads an entry: only `*` and `?` make one a pattern, and
+    // the walk reads brackets as a class all the same.
+    const asOnWindows = { isPattern: containsGlobCharsWin }
+    for (const kind of ['deny', 'allow'] as const) {
+      expect(literalReadings(`${project}/**`, kind, asOnWindows)).toEqual([
+        beneath(project, '/**'),
+      ])
+      expect(literalReadings(`${project}/keep/**`, kind, asOnWindows)).toEqual([
+        beneath(join(project, 'keep'), '/**'),
+      ])
+      expect(literalReadings(`${project}/keep`, kind, asOnWindows)).toEqual([])
+      expect(literalReadings(`${root}/plain/**`, kind, asOnWindows)).toEqual([])
+    }
+  })
+
+  it('strips a trailing separator from a name and keeps it in a pattern', () => {
+    expect(bothKinds(`${project}/keep/`)).toEqual(
+      forBoth([name(join(project, 'keep'))]),
+    )
+    expect(bothKinds(`${project}/*/`)).toEqual(
+      forBoth([beneath(project, '/*/')]),
+    )
+  })
+
+  it('folds a parent reference in a name', () => {
+    expect(bothKinds(`${project}/keep/../src`)).toEqual(
+      forBoth([name(join(project, 'src'))]),
+    )
+  })
+
+  it('leaves a relative name inside a bracketed cwd alone', () => {
+    process.chdir(project)
+    // No glob character in what the caller wrote: it is a name already.
+    expect(bothKinds('./keep')).toEqual(forBoth([]))
+    expect(bothKinds('keep')).toEqual(forBoth([]))
+  })
+
+  it('reads a relative pattern inside a bracketed cwd beneath the cwd', () => {
+    process.chdir(project)
+    expect(bothKinds('**/.env')).toEqual(
+      forBoth([beneath(project, '/**/.env')]),
+    )
+    expect(bothKinds('./*.env')).toEqual(forBoth([beneath(project, '/*.env')]))
+    expect(bothKinds('src/**/.env')).toEqual(
+      forBoth([beneath(join(project, 'src'), '/**/.env')]),
+    )
+  })
+
+  it('reads a ~ spelling beneath a home directory with brackets in its name', () => {
+    const home = join(root, PROJECT)
+    const script = `
+      const { literalReadings } = await import(${JSON.stringify(
+        join(import.meta.dir, '../../src/sandbox/path-entries.ts'),
+      )})
+      console.log(JSON.stringify({
+        name: literalReadings('~/keep', 'deny'),
+        pattern: literalReadings('~/**/.env', 'deny'),
+        allow: literalReadings('~/src/*.ts', 'allow'),
+      }))`
+    const result = spawnSync(process.execPath, ['-e', script], {
+      env: { ...process.env, HOME: home },
+      encoding: 'utf8',
+      timeout: WRAP_TIMEOUT_MS,
+    })
+    expect(result.status).toBe(0)
+    expect(JSON.parse(result.stdout.trim().split('\n').at(-1) ?? '')).toEqual({
+      name: [],
+      pattern: [beneath(home, '/**/.env')],
+      allow: [beneath(join(home, 'src'), '/*.ts')],
+    })
+  })
+
+  it.each(['open[bracket', 'close]bracket', 'build*', 'notes (draft?)'])(
+    'reads a path inside a directory named %p as a name',
+    dir => {
+      const inside = join(root, dir, 'out')
+      expect(bothKinds(inside)).toEqual(forBoth([name(inside)]))
+    },
+  )
+
+  it('adds nothing for braces, which are no glob characters', () => {
+    expect(bothKinds(join(root, 'curly{a,b}', 'out'))).toEqual(forBoth([]))
+  })
+
+  it('adds nothing for an entry without glob characters', () => {
+    expect(bothKinds(join(root, 'plain', 'a'))).toEqual(forBoth([]))
+    expect(bothKinds(join(root, 'absent'))).toEqual(forBoth([]))
+  })
+
+  it('adds nothing for a pattern none of which exists as a name', () => {
+    expect(bothKinds(join(root, 'plain', '**', '.env'))).toEqual(forBoth([]))
+    expect(bothKinds(join(root, '[nope]', 'x'))).toEqual(forBoth([]))
+    expect(bothKinds(join(root, 'plain', '[xy]', 'key'))).toEqual(forBoth([]))
+  })
+
+  it('reads [ab] as the class and as the directory of that name', () => {
+    // The class is the pattern reading every entry has; this adds the name.
+    const inClass = join(root, 'plain', '[ab]', 'secret')
+    expect(bothKinds(inClass)).toEqual(forBoth([name(inClass)]))
+  })
+
+  it('gives one reading for each name the entry may hold, the longest first', () => {
+    expect(bothKinds(`${project}/[ab]/secret`)).toEqual(
+      forBoth([
+        name(join(project, '[ab]', 'secret')),
+        beneath(project, '/[ab]/secret'),
+      ]),
+    )
+    expect(bothKinds(`${project}/[ab]/**/.env`)).toEqual(
+      forBoth([
+        beneath(join(project, '[ab]'), '/**/.env'),
+        beneath(project, '/[ab]/**/.env'),
+      ]),
+    )
+  })
+
+  it('never turns one reading into another when a directory appears', () => {
+    const entry = `${project}/[cd]/**/.env`
+    const before = literalReadings(entry, 'deny')
+    expect(before).toEqual([beneath(project, '/[cd]/**/.env')])
+    mkdirSync(join(project, '[cd]'))
+    try {
+      const after = literalReadings(entry, 'deny')
+      expect(after).toEqual([
+        beneath(join(project, '[cd]'), '/**/.env'),
+        ...before,
+      ])
+    } finally {
+      rmSync(join(project, '[cd]'), { recursive: true, force: true })
+    }
+  })
+
+  it.if(isMacOS)('names the anchor in the form a profile goes by', () => {
+    // /tmp is a link to /private/tmp, and a profile's rules go by real paths.
+    const held = mkdtempSync('/tmp/literal-anchor-')
+    try {
+      mkdirSync(join(held, '[deep] p'))
+      expect(literalReadings(`${held}/[deep] p/**/.env`, 'deny')).toEqual([
+        beneath(`/private${held}/[deep] p`, '/**/.env'),
+      ])
+    } finally {
+      rmSync(held, { recursive: true, force: true })
+    }
+  })
+
+  it('anchors a pattern at the nearest directory when a file is in the way', () => {
+    // The walk then finds the file where it looked for a directory.
+    expect(literalReadings(`${project}/file/**/x`, 'deny')).toEqual([
+      beneath(project, '/file/**/x'),
+    ])
+  })
+
+  describe('a prefix that is a symbolic link', () => {
+    it('counts for a deny, which can only deny more', () => {
+      const inside = join(root, 'li[n]k', 'keep')
+      expect(literalReadings(inside, 'deny')).toEqual([name(inside)])
+      expect(literalReadings(`${root}/li[n]k/**/x`, 'deny')).toEqual([
+        beneath(join(root, 'li[n]k'), '/**/x'),
+      ])
+    })
+
+    it('does not count for an allow, which would open what it points at', () => {
+      expect(literalReadings(join(root, 'li[n]k', 'keep'), 'allow')).toEqual([])
+      expect(literalReadings(join(root, 'li[n]k'), 'allow')).toEqual([])
+      expect(literalReadings(`${root}/li[n]k/**/x`, 'allow')).toEqual([])
+    })
+
+    it('counts for a deny when it dangles, as a name and not as a directory', () => {
+      const dangling = join(root, 'dang[l]ing')
+      expect(literalReadings(dangling, 'deny')).toEqual([name(dangling)])
+      expect(literalReadings(`${dangling}/**/x`, 'deny')).toEqual([])
+      expect(literalReadings(dangling, 'allow')).toEqual([])
+      expect(literalReadings(`${dangling}/**/x`, 'allow')).toEqual([])
+    })
+
+    it('ends the name of an allow wherever it lies after the glob characters', () => {
+      const through = join(project, 'linked', 'keep')
+      expect(literalReadings(through, 'deny')).toEqual([name(through)])
+      expect(literalReadings(through, 'allow')).toEqual([])
+      expect(literalReadings(join(project, 'real', 'keep'), 'allow')).toEqual([
+        name(join(project, 'real', 'keep')),
+      ])
+    })
+
+    it('ends the pattern of an allow when it lies before the first pattern component', () => {
+      // The walk would start at `linked`, resolved, and list what it points at.
+      for (const tail of ['/linked/*/x', '/linked/*', '/real/../linked/**/x']) {
+        expect(literalReadings(project + tail, 'allow')).toEqual([])
+      }
+      expect(literalReadings(`${project}/linked/*/x`, 'deny')).toEqual([
+        beneath(join(project, 'linked'), '/*/x'),
+      ])
+      // Not there yet is no link, and neither is a directory.
+      expect(literalReadings(`${project}/absent/sub/*`, 'allow')).toEqual([
+        beneath(project, '/absent/sub/*'),
+      ])
+      expect(literalReadings(`${project}/real/*/x`, 'allow')).toEqual([
+        beneath(join(project, 'real'), '/*/x'),
+      ])
+      // From the first pattern component on, the walk meets the link itself
+      // and does not list it.
+      expect(literalReadings(`${project}/*/linked/x`, 'allow')).toEqual([
+        beneath(project, '/*/linked/x'),
+      ])
+    })
+  })
+
+  it.skipIf(process.getuid?.() === 0)(
+    'takes a path it cannot look at as present for a deny and absent for an allow',
+    () => {
+      const locked = join(root, 'locked')
+      const inside = join(locked, '[x]', 'secret')
+      mkdirSync(join(locked, '[x]'), { recursive: true })
+      chmodSync(locked, 0o000)
+      try {
+        expect(literalReadings(inside, 'deny')).toEqual([name(inside)])
+        expect(literalReadings(inside, 'allow')).toEqual([])
+      } finally {
+        chmodSync(locked, 0o755)
+      }
+    },
+  )
+
+  describe('a pattern beneath the folder', () => {
+    let ordinary: string
+
+    beforeAll(() => {
+      ordinary = join(root, 'ordinary')
+      for (const base of [project, ordinary]) {
+        mkdirSync(join(base, 'deep', 'er'), { recursive: true })
+        for (const file of ['a]x', 'deep/a]x', 'deep/er/b]x', 'deep/.env']) {
+          writeFileSync(join(base, file), '')
+        }
+      }
+    })
+
+    const found = (base: string, tail: string, kind: 'allow' | 'deny') =>
+      literalReadings(base + tail, kind)
+        .flatMap(reading =>
+          reading.glob
+            ? expandGlobPattern(reading.path, { anchor: reading.anchor })
+            : [],
+        )
+        .map(match => match.slice(base.length))
+        .sort()
+
+    it.each(['/**/.env', '/deep/*', '/**/er/*', '/*/*]x'])(
+      'finds for %p what the same pattern finds beneath an ordinary folder',
+      tail => {
+        const expected = expandGlobPattern(ordinary + tail)
+          .map(match => match.slice(ordinary.length))
+          .sort()
+        expect(expected.length).toBeGreaterThan(0)
+        expect(found(project, tail, 'deny')).toEqual(expected)
+        expect(found(project, tail, 'allow')).toEqual(expected)
+      },
+    )
+
+    it.each([
+      ['/**/[a*]x', ['/a]x', '/deep/a]x']],
+      ['/[a*]x', ['/a]x']],
+      ['/deep/[a*]x', ['/deep/a]x']],
+    ])(
+      'matches %p, which cannot be split, by its spelling from the anchor on',
+      (tail, expected) => {
+        // A wildcard inside a bracket expression: the walk matches such a
+        // pattern against whole paths, which beneath an anchor start at it.
+        expect(
+          expandGlobPattern(ordinary + tail)
+            .map(match => match.slice(ordinary.length))
+            .sort(),
+        ).toEqual(expected)
+        expect(found(project, tail, 'deny')).toEqual(expected)
+        expect(found(project, tail, 'allow')).toEqual(expected)
+      },
+    )
+
+    it('keeps a trailing separator, with which a pattern matches nothing', () => {
+      expect(expandGlobPattern(`${ordinary}/*/`)).toEqual([])
+      expect(found(project, '/*/', 'allow')).toEqual([])
+      expect(found(project, '/*/', 'deny')).toEqual([])
+    })
+  })
+})
 
 describe('path entries as configured', () => {
   it('tells spellings from marked paths', () => {
@@ -379,8 +815,18 @@ describe.if(isLinux)(
       root = freshRoot()
       project = join(root, PROJECT)
       mkdirSync(join(project, 'keep'), { recursive: true })
+      mkdirSync(join(project, 'real'), { recursive: true })
+      mkdirSync(join(project, 'secrets', 'public'), { recursive: true })
+      mkdirSync(join(project, 'sub', 'deep'), { recursive: true })
       writeFileSync(join(project, 'keep', 'file'), 'original\n')
+      writeFileSync(join(project, 'real', 'file'), 'original\n')
       writeFileSync(join(project, 'secret.txt'), 'SECRET-FILE\n')
+      writeFileSync(join(project, 'secrets', 'key'), 'SECRET-DIR\n')
+      writeFileSync(join(project, 'secrets', 'public', 'ok'), 'PUBLIC\n')
+      writeFileSync(join(project, '.env'), 'ENV-TOP\n')
+      writeFileSync(join(project, 'sub', '.env'), 'ENV-SUB\n')
+      writeFileSync(join(project, 'sub', 'deep', '.env'), 'ENV-DEEP\n')
+      writeFileSync(join(project, 'sub', 'readme'), 'README\n')
       // Outside every allowed path, so the scan for dangerous files in the
       // working directory adds no binds of its own.
       process.chdir(root)
@@ -391,6 +837,198 @@ describe.if(isLinux)(
       SandboxManager.cleanupAfterCommand()
       await SandboxManager.reset()
       rmSync(root, { recursive: true, force: true })
+    })
+
+    it.skipIf(!CAN_RUN)(
+      'makes the project writable when it is allowed',
+      async () => {
+        const { stdout } = await sandboxed(
+          { allowWrite: [project] },
+          `echo hi > ${q(join(project, 'new'))} && echo WROTE`,
+          { cwd: root },
+        )
+        expect(stdout).toContain('WROTE')
+        expect(readFileSync(join(project, 'new'), 'utf8')).toBe('hi\n')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'enforces a denyWrite inside it',
+      async () => {
+        const kept = join(project, 'keep', 'file')
+        const { stdout } = await sandboxed(
+          { allowWrite: [root], denyWrite: [join(project, 'keep')] },
+          `echo tampered > ${q(kept)} && echo WROTE; ` +
+            `echo fine > ${q(join(project, 'sub', 'other'))} && echo SIBLING`,
+          { cwd: root },
+        )
+        expect(stdout).not.toContain('WROTE')
+        expect(stdout).toContain('SIBLING')
+        expect(readFileSync(kept, 'utf8')).toBe('original\n')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'hides a denyRead file and a denyRead directory inside it',
+      async () => {
+        const { stdout } = await sandboxed(
+          { denyRead: [join(project, 'secret.txt'), join(project, 'secrets')] },
+          `cat ${q(join(project, 'secret.txt'))} ${q(join(project, 'secrets', 'key'))}; ` +
+            `cat ${q(join(project, 'sub', 'readme'))}`,
+          { cwd: root },
+        )
+        expect(stdout).not.toContain('SECRET-FILE')
+        expect(stdout).not.toContain('SECRET-DIR')
+        expect(stdout).toContain('README')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'opens an allowRead carve-out inside a denied directory',
+      async () => {
+        const { stdout } = await sandboxed(
+          {
+            denyRead: [join(project, 'secrets')],
+            allowRead: [join(project, 'secrets', 'public')],
+          },
+          `cat ${q(join(project, 'secrets', 'key'))} ${q(join(project, 'secrets', 'public', 'ok'))}`,
+          { cwd: root },
+        )
+        expect(stdout).not.toContain('SECRET-DIR')
+        expect(stdout).toContain('PUBLIC')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'opens what an allowRead pattern beneath it matches',
+      async () => {
+        const { stdout } = await sandboxed(
+          {
+            denyRead: [join(project, 'secrets')],
+            allowRead: [`${project}/secrets/pub*`],
+          },
+          `cat ${q(join(project, 'secrets', 'key'))} ${q(join(project, 'secrets', 'public', 'ok'))}`,
+          { cwd: root },
+        )
+        expect(stdout).not.toContain('SECRET-DIR')
+        expect(stdout).toContain('PUBLIC')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN).each(['build*', 'notes (draft?)'])(
+      'opens a carve-out inside a folder named %p, whose name a pattern matches as itself',
+      async name => {
+        // The deny is spelled without a `/**`: with one it is the pattern as
+        // well, under which every entry beneath keeps a mask of its own.
+        const folder = join(root, name)
+        mkdirSync(join(folder, 'secrets', 'public'), { recursive: true })
+        writeFileSync(join(folder, 'secrets', 'key'), 'SECRET-DIR\n')
+        writeFileSync(join(folder, 'secrets', 'public', 'ok'), 'PUBLIC\n')
+        const { stdout } = await sandboxed(
+          {
+            denyRead: [join(folder, 'secrets')],
+            allowRead: [join(folder, 'secrets', 'public')],
+          },
+          `cat ${q(join(folder, 'secrets', 'key'))} ${q(join(folder, 'secrets', 'public', 'ok'))}`,
+          { cwd: root },
+        )
+        expect(stdout).not.toContain('SECRET-DIR')
+        expect(stdout).toContain('PUBLIC')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'masks .env at every depth for a recursive deny beneath it',
+      async () => {
+        const { stdout } = await sandboxed(
+          { denyRead: [`${project}/**/.env`] },
+          `cat ${q(join(project, '.env'))} ${q(join(project, 'sub', '.env'))} ${q(join(project, 'sub', 'deep', '.env'))}; ` +
+            `cat ${q(join(project, 'sub', 'readme'))}`,
+          { cwd: root },
+        )
+        expect(stdout).not.toMatch(/ENV-(TOP|SUB|DEEP)/)
+        expect(stdout).toContain('README')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'masks the same for a relative recursive deny when it is the cwd',
+      async () => {
+        process.chdir(project)
+        const { stdout } = await sandboxed(
+          { denyRead: ['**/.env'] },
+          `cat .env sub/.env sub/deep/.env; cat sub/readme`,
+          { cwd: project },
+        )
+        expect(stdout).not.toMatch(/ENV-(TOP|SUB|DEEP)/)
+        expect(stdout).toContain('README')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'applies a deny beneath an allow that is spelled through a parent reference',
+      async () => {
+        // The allow is recorded where it resolves to: left as spelled, the
+        // deny beneath it would be judged outside every allowed path.
+        const denied = join(project, 'real', 'file')
+        const { stdout } = await sandboxed(
+          {
+            allowWrite: [`${project}/keep/../real`],
+            denyWrite: [denied],
+          },
+          `echo tampered > ${q(denied)} && echo WROTE; ` +
+            `echo fine > ${q(join(project, 'real', 'other'))} && echo SIBLING`,
+          { cwd: root },
+        )
+        expect(stdout).not.toContain('WROTE')
+        expect(stdout).toContain('SIBLING')
+        expect(readFileSync(denied, 'utf8')).toBe('original\n')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it('keeps the entries in the write config and resolves the read ones', async () => {
+      await initialize({
+        denyRead: [join(project, 'secret.txt'), `${project}/**/.env`],
+        allowRead: [join(project, 'secrets', 'public')],
+        allowWrite: [project],
+        denyWrite: [join(project, 'keep'), `${project}/**/*.lock`],
+      })
+      const write = SandboxManager.getFsWriteConfig()
+      expect(write.allowOnly).toContain(project)
+      // Write lists take no pattern on Linux, beneath this folder or any other.
+      expect(write.denyWithinAllow).toEqual([join(project, 'keep')])
+      const read = SandboxManager.getFsReadConfig()
+      expect(read.denyOnly).toEqual([
+        join(project, 'secret.txt'),
+        join(project, '.env'),
+        join(project, 'sub', '.env'),
+        join(project, 'sub', 'deep', '.env'),
+      ])
+      expect(read.allowWithinDeny).toEqual([join(project, 'secrets', 'public')])
+    })
+
+    it('still reports every write entry whose pattern is not applied', async () => {
+      // Whether an entry is also a name depends on the disk, which the
+      // command can change; what is reported does not.
+      await initialize({
+        allowWrite: [project, { path: join(root, 'marked*'), literal: true }],
+        denyWrite: [join(project, 'keep'), `${project}/**/*.lock`],
+        denyRead: [`${project}/**/.env`, { path: '/*/x', literal: true }],
+      })
+      expect(SandboxManager.getLinuxGlobPatternWarnings()).toEqual([
+        project,
+        join(project, 'keep'),
+        `${project}/**/*.lock`,
+      ])
     })
 
     it.skipIf(!CAN_RUN)(
@@ -456,8 +1094,799 @@ describe.if(isLinux)(
       },
       WRAP_TIMEOUT_MS,
     )
+
+    it.skipIf(!CAN_RUN)(
+      'makes a path writable that is spelled through a folder that is not there, as beneath any folder',
+      async () => {
+        // The project's own name holds the glob characters and exists, so the
+        // string is a name, and a name is resolved, parent reference and all.
+        const { stdout } = await sandboxed(
+          { allowWrite: [`${project}/absent/../real`] },
+          `echo hi > ${q(join(project, 'real', 'new'))} && echo WROTE; ` +
+            `echo hi > ${q(join(project, 'keep', 'new'))} && echo ESCAPED`,
+          { cwd: root },
+        )
+        expect(stdout).toContain('WROTE')
+        expect(stdout).not.toContain('ESCAPED')
+      },
+      WRAP_TIMEOUT_MS,
+    )
   },
 )
+
+/**
+ * What exists is looked at on every wrap, and an earlier command may have
+ * put it there: nothing it creates may switch a deny off, and a link with
+ * the name an entry spells is not the path an allow takes.
+ */
+describe.if(isLinux)(
+  'Linux: what a command can change before the next wrap',
+  () => {
+    const CAN_RUN = bwrapCanNamespace()
+    const savedCwd = process.cwd()
+    let root: string
+    let work: string
+    let vault: string
+
+    beforeEach(() => {
+      root = freshRoot()
+      work = join(root, 'work')
+      vault = join(root, 'vault')
+      mkdirSync(join(work, 'proj', 'pub'), { recursive: true })
+      mkdirSync(join(vault, 'pub'), { recursive: true })
+      mkdirSync(join(vault, 'deep', 'pub'), { recursive: true })
+      writeFileSync(join(work, 'proj', 'pub', 'ok'), 'PROJECT-PUBLIC\n')
+      writeFileSync(join(vault, 'pub', 'key'), 'VAULT-SECRET\n')
+      writeFileSync(join(vault, 'deep', 'pub', 'key'), 'VAULT-DEEP-SECRET\n')
+      process.chdir(root)
+    })
+
+    afterEach(async () => {
+      process.chdir(savedCwd)
+      SandboxManager.cleanupAfterCommand()
+      await SandboxManager.reset()
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    const readVault = (): string =>
+      `cat ${q(join(vault, 'pub', 'key'))} ${q(join(vault, 'deep', 'pub', 'key'))} 2>/dev/null; echo END`
+
+    it.skipIf(!CAN_RUN).each([
+      ['work/*/pub', '*'],
+      ['work/*/**/pub', '*'],
+      ['work/[ab]/pub', '[ab]'],
+      ['work/?/pub', '?'],
+    ])(
+      'does not open a denied directory through a link named like %p spells it',
+      async (entry, linkName) => {
+        const policy = {
+          denyRead: [vault],
+          allowRead: [join(root, entry)],
+          allowWrite: [work],
+        }
+        // The command may write `work`, so it can plant the link itself.
+        const planted = await sandboxed(
+          policy,
+          `ln -s ${q(vault)} ${q(join(work, linkName))} && echo PLANTED`,
+          { cwd: root },
+        )
+        expect(planted.stdout).toContain('PLANTED')
+        await initialize(policy)
+        const allowed = SandboxManager.getFsReadConfig().allowWithinDeny ?? []
+        expect(allowed.filter(p => p.includes(linkName))).toEqual([])
+        const { stdout } = await sandboxed(policy, readVault(), { cwd: root })
+        expect(stdout).not.toContain('SECRET')
+        expect(stdout).toContain('END')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'does not open one through a link further along the path either',
+      async () => {
+        const policy = {
+          denyRead: [vault],
+          allowRead: [join(work, '[ab]', 'mid', 'pub')],
+          allowWrite: [work],
+        }
+        const planted = await sandboxed(
+          policy,
+          `mkdir ${q(join(work, '[ab]'))} && ln -s ${q(vault)} ${q(join(work, '[ab]', 'mid'))} && echo PLANTED`,
+          { cwd: root },
+        )
+        expect(planted.stdout).toContain('PLANTED')
+        const { stdout } = await sandboxed(policy, readVault(), { cwd: root })
+        expect(stdout).not.toContain('SECRET')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN).each([
+      ['[ab]/mid/*/pub', '[ab]', 'mid'],
+      ['[ab]/mid/**/key', '[ab]', 'mid'],
+      ['*/dist/*', '*', 'dist'],
+    ])(
+      'does not open a denied directory through a link that a pattern spelled %p starts beneath',
+      async (entry, dirName, linkName) => {
+        // The command made the directory the entry spells, and the link
+        // inside it is what the pattern would be walked from.
+        const policy = {
+          denyRead: [vault],
+          allowRead: [join(work, entry)],
+          allowWrite: [work],
+        }
+        const planted = await sandboxed(
+          policy,
+          `mkdir ${q(join(work, dirName))} && ln -s ${q(vault)} ${q(join(work, dirName, linkName))} && echo PLANTED`,
+          { cwd: root },
+        )
+        expect(planted.stdout).toContain('PLANTED')
+        await initialize(policy)
+        expect(SandboxManager.getFsReadConfig().allowWithinDeny).toEqual([])
+        const { stdout } = await sandboxed(policy, readVault(), { cwd: root })
+        expect(stdout).not.toContain('SECRET')
+        expect(stdout).toContain('END')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN)(
+      'hides a file for a read deny spelled through a link with glob characters in its name',
+      async () => {
+        // For a deny a link of that name counts: the entry names the file,
+        // by whichever of its names the command asks for it.
+        const target = join(root, 'target')
+        mkdirSync(target)
+        writeFileSync(join(target, 'token'), 'THROUGH-LINK\n')
+        symlinkSync(target, join(root, 'li[n]k'))
+        const entry = join(root, 'li[n]k', 'token')
+        const policy = { denyRead: [entry] }
+        await initialize(policy)
+        expect(SandboxManager.getFsReadConfig().denyOnly).toEqual([entry])
+        const { stdout } = await sandboxed(
+          policy,
+          `cat ${q(entry)} ${q(join(target, 'token'))} 2>/dev/null; echo END`,
+          { cwd: root },
+        )
+        expect(stdout).not.toContain('THROUGH-LINK')
+        expect(stdout).toContain('END')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it('adds no name for a write allow spelled through a link with glob characters in its name', async () => {
+      symlinkSync(vault, join(work, '[ab]'))
+      await initialize({
+        allowWrite: [join(work, '[ab]', 'pub'), join(work, '[ab]')],
+      })
+      expect(
+        SandboxManager.getFsWriteConfig().allowOnly.filter(p =>
+          p.startsWith(root),
+        ),
+      ).toEqual([])
+    })
+
+    it.skipIf(!CAN_RUN)(
+      'keeps a class deny in force when a directory with the name of the class appears',
+      async () => {
+        const bracketed = join(root, PROJECT)
+        mkdirSync(join(bracketed, 'a'), { recursive: true })
+        writeFileSync(join(bracketed, 'a', '.env'), 'ENV-A\n')
+        const policy = {
+          denyRead: [`${bracketed}/[ab]/**/.env`],
+          allowWrite: [bracketed],
+        }
+        const read = `cat ${q(join(bracketed, 'a', '.env'))} ${q(join(bracketed, '[ab]', '.env'))} 2>/dev/null; echo END`
+        expect(
+          (await sandboxed(policy, read, { cwd: root })).stdout,
+        ).not.toContain('ENV-')
+        const made = await sandboxed(
+          policy,
+          `mkdir ${q(join(bracketed, '[ab]'))} && echo ENV-LITERAL > ${q(join(bracketed, '[ab]', '.env'))} && echo MADE`,
+          { cwd: root },
+        )
+        expect(made.stdout).toContain('MADE')
+        expect(
+          (await sandboxed(policy, read, { cwd: root })).stdout,
+        ).not.toContain('ENV-')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN || process.getuid?.() === 0)(
+      'keeps a write deny in force when the folder cannot be looked at',
+      async () => {
+        const locked = join(root, 'locked')
+        const kept = join(locked, PROJECT, 'keep')
+        mkdirSync(kept, { recursive: true })
+        writeFileSync(join(kept, 'file'), 'original\n')
+        chmodSync(locked, 0o000)
+        try {
+          // The command runs as the same user, so it can undo the chmod.
+          const { stdout } = await sandboxed(
+            { allowWrite: [root], denyWrite: [kept] },
+            `chmod 755 ${q(locked)}; echo tampered > ${q(join(kept, 'file'))} && echo WROTE; echo END`,
+            { cwd: root },
+          )
+          expect(stdout).not.toContain('WROTE')
+          expect(stdout).toContain('END')
+        } finally {
+          chmodSync(locked, 0o755)
+        }
+        expect(readFileSync(join(kept, 'file'), 'utf8')).toBe('original\n')
+      },
+      WRAP_TIMEOUT_MS,
+    )
+
+    it.skipIf(!CAN_RUN || process.getuid?.() === 0)(
+      'takes any write deny with glob characters for the path it spells when the folder cannot be looked at',
+      async () => {
+        // Whether anything in the folder has the name cannot be told, so a
+        // pattern is also applied like a path that is not there: the name is
+        // kept from being created, and what it would match is not denied.
+        const locked = join(root, 'locked')
+        const elsewhere = join(root, 'elsewhere')
+        mkdirSync(locked)
+        mkdirSync(elsewhere)
+        writeFileSync(join(locked, 'a.pem'), 'original\n')
+        const wrapsWith = async (
+          name: string,
+          cwd: string,
+        ): Promise<{ denied: string[]; stdout: string }> => {
+          const policy = {
+            allowWrite: [root],
+            denyWrite: [join(locked, name)],
+          }
+          chmodSync(locked, 0o000)
+          // Where the wrap looks for dangerous names is the process's own.
+          process.chdir(cwd)
+          try {
+            await initialize(policy)
+            const denied = SandboxManager.getFsWriteConfig().denyWithinAllow
+            const { stdout } = await sandboxed(
+              policy,
+              `chmod 755 ${q(locked)}; echo x > ${q(join(locked, name))} && echo CREATED; ` +
+                `echo t >> ${q(join(locked, 'a.pem'))} && echo WROTE; echo END`,
+              { cwd },
+            )
+            return { denied, stdout }
+          } finally {
+            process.chdir(root)
+            chmodSync(locked, 0o755)
+          }
+        }
+        const leftBy = async (name: string): Promise<string[]> => {
+          const policy = {
+            allowWrite: [root],
+            denyWrite: [join(locked, name)],
+          }
+          chmodSync(locked, 0o000)
+          try {
+            await sandboxed(policy, 'echo RAN', { cwd: root })
+          } finally {
+            chmodSync(locked, 0o755)
+          }
+          const left = readdirSync(locked).filter(entry => entry !== 'a.pem')
+          for (const entry of left) {
+            rmSync(join(locked, entry), { recursive: true, force: true })
+          }
+          return left
+        }
+
+        for (const name of ['absent', '*.pem']) {
+          const { denied, stdout } = await wrapsWith(name, elsewhere)
+          expect(denied).toEqual([join(locked, name)])
+          expect(stdout).not.toContain('CREATED')
+          expect(stdout).toContain('WROTE')
+          expect(stdout).toContain('END')
+          expect(existsSync(join(locked, name))).toBe(false)
+
+          // Below the working directory the folder is denied whole, because
+          // the scan for dangerous names could not read it either: its mode
+          // cannot be given back, so what the pattern would match is safe too.
+          const below = await wrapsWith(name, root)
+          expect(below.denied).toEqual([join(locked, name)])
+          expect(below.stdout).not.toContain('CREATED')
+          expect(below.stdout).not.toContain('WROTE')
+          expect(below.stdout).toContain('END')
+          expect(existsSync(join(locked, name))).toBe(false)
+        }
+        // The folder cannot be cleaned by the host while it cannot be looked
+        // at, for a name and for a pattern alike.
+        const leftByName = await leftBy('absent')
+        expect(await leftBy('*.pem')).toEqual(
+          leftByName.map(entry => (entry === 'absent' ? '*.pem' : entry)),
+        )
+      },
+      WRAP_TIMEOUT_MS,
+    )
+  },
+)
+
+// ============================================================================
+// macOS: the generated profile
+// ============================================================================
+
+describe.if(!isWindows)(
+  'macOS profile: entries inside a folder named [WIP] project',
+  () => {
+    let root: string
+    let project: string
+
+    beforeAll(() => {
+      root = freshRoot()
+      project = join(root, PROJECT)
+      mkdirSync(join(project, 'keep'), { recursive: true })
+      mkdirSync(join(project, 'secrets', 'public'), { recursive: true })
+      mkdirSync(join(project, 'sub'), { recursive: true })
+      writeFileSync(join(project, 'secret.txt'), '')
+      writeFileSync(join(project, '.env'), '')
+    })
+
+    afterAll(() => {
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('allows writes to the project by subpath', () => {
+      const profile = macProfile(undefined, {
+        allowOnly: [project],
+        denyWithinAllow: [],
+      })
+      const allow = ruleOf(profile, '(allow file-write*')
+      expect(allow).toContain(subpath(project))
+      // The pattern reading is still there, as for any entry.
+      expect(allow).toContain(patternFilter(project, 'allow'))
+    })
+
+    it('denies a write inside it by subpath, and pins the folder', () => {
+      const kept = join(project, 'keep')
+      const profile = macProfile(undefined, {
+        allowOnly: [root],
+        denyWithinAllow: [kept],
+      })
+      expect(ruleOf(profile, '(deny file-write*')).toContain(subpath(kept))
+      const pinned = ruleOf(
+        profile,
+        '(deny file-write-unlink file-write-create',
+      )
+      expect(pinned).toContain(subpath(kept))
+      expect(pinned).toContain(literalFilter(project))
+      expect(profile).toContain(patternFilter(kept, 'deny'))
+    })
+
+    it('denies a read of a file and of a directory inside it by subpath', () => {
+      const file = join(project, 'secret.txt')
+      const dir = join(project, 'secrets')
+      const profile = macProfile({ denyOnly: [file, dir] }, undefined)
+      const deny = ruleOf(profile, '(deny file-read*')
+      expect(deny).toContain(subpath(file))
+      expect(deny).toContain(subpath(dir))
+      expect(deny).toContain(patternFilter(file, 'deny'))
+    })
+
+    it('re-allows a carve-out inside a denied directory by subpath', () => {
+      const dir = join(project, 'secrets')
+      const open = join(dir, 'public')
+      const profile = macProfile(
+        { denyOnly: [dir], allowWithinDeny: [open] },
+        undefined,
+      )
+      expect(ruleOf(profile, '(allow file-read*\n')).toContain(subpath(open))
+      // A deny nested in an allow lands again after it; here the allow is the
+      // nested one, so the deny is not repeated by name.
+      const denies = profile.split('(deny file-read*\n')
+      expect(denies[1]).toContain(subpath(dir))
+    })
+
+    it('denies a recursive pattern beneath it with the folder escaped', () => {
+      const profile = macProfile(
+        { denyOnly: [`${project}/**/.env`] },
+        undefined,
+      )
+      const anchored = `^${escapedForRegex(project)}/(.*/)?\\.env(/.*)?$`
+      expect(profile).toContain(`(regex ${JSON.stringify(anchored)})`)
+      expect(profile).toContain(patternFilter(`${project}/**/.env`, 'deny'))
+      const regexes = emittedRegexes(profile)
+      for (const denied of [
+        '.env',
+        'sub/.env',
+        'sub/deep/.env',
+        '.env/inside',
+      ]) {
+        expect(regexes.some(re => re.test(join(project, denied)))).toBe(true)
+      }
+      expect(regexes.some(re => re.test(join(project, 'sub', 'readme')))).toBe(
+        false,
+      )
+      expect(
+        ruleOf(profile, '(deny file-write-unlink file-write-create'),
+      ).toContain(literalFilter(project))
+    })
+
+    it('takes the project as a write root for the rules that keep denied paths in place', () => {
+      const profile = macProfile(
+        { denyOnly: [join(project, 'secrets')] },
+        { allowOnly: [project], denyWithinAllow: [] },
+      )
+      expect(
+        ruleOf(profile, '(allow file-write-unlink file-write-create'),
+      ).toContain(subpath(project))
+      const tail = profile.slice(
+        profile.indexOf('keep read-denied paths inside write roots in place'),
+      )
+      expect(tail).toContain(subpath(join(project, 'secrets')))
+    })
+
+    it('adds no reading for a link with the name an allow spells', () => {
+      const work = join(root, 'work')
+      mkdirSync(join(root, 'vault', 'pub'), { recursive: true })
+      mkdirSync(work, { recursive: true })
+      symlinkSync(join(root, 'vault'), join(work, '[ab]'))
+      const entry = join(work, '[ab]', 'pub')
+      const asAllow = macProfile(
+        { denyOnly: [join(root, 'vault')], allowWithinDeny: [entry] },
+        { allowOnly: [entry], denyWithinAllow: [] },
+      )
+      expect(emittedSubpaths(asAllow)).not.toContain(entry)
+      expect(emittedSubpaths(asAllow)).not.toContain(join(root, 'vault', 'pub'))
+      const asDeny = macProfile({ denyOnly: [entry] }, undefined)
+      expect(ruleOf(asDeny, '(deny file-read*')).toContain(subpath(entry))
+      const asWriteDeny = macProfile(undefined, {
+        allowOnly: [root],
+        denyWithinAllow: [entry],
+      })
+      expect(ruleOf(asWriteDeny, '(deny file-write*')).toContain(subpath(entry))
+    })
+
+    it('compiles an entry as before when none of it is a name on disk', () => {
+      const profile = macProfile(
+        { denyOnly: ['/srv/[ab]/secrets', '/srv/**/.env'] },
+        { allowOnly: ['/srv/build*'], denyWithinAllow: ['/srv/*.lock'] },
+      )
+      expect(
+        emittedSubpaths(profile).filter(p => p.startsWith('/srv')),
+      ).toEqual([])
+    })
+  },
+)
+
+// ============================================================================
+// Both readings are both
+// ============================================================================
+
+describe.if(!isWindows)('an entry that is a pattern and a name', () => {
+  const CAN_RUN = isLinux && bwrapCanNamespace()
+  const savedCwd = process.cwd()
+  let root: string
+  let entry: string
+  const dirs = ['[ab]', 'a', 'b', 'c']
+
+  beforeAll(() => {
+    root = freshRoot()
+    entry = join(root, '[ab]', 'secret')
+    for (const dir of dirs) {
+      mkdirSync(join(root, dir), { recursive: true })
+      writeFileSync(join(root, dir, 'secret'), `SECRET-${dir}\n`)
+    }
+    process.chdir(root)
+  })
+
+  afterAll(async () => {
+    process.chdir(savedCwd)
+    await SandboxManager.reset()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it.if(isLinux)(
+    'resolves to the class matches and to the name on Linux',
+    async () => {
+      await initialize({ denyRead: [entry] })
+      expect(SandboxManager.getFsReadConfig().denyOnly.sort()).toEqual(
+        ['[ab]', 'a', 'b'].map(dir => join(root, dir, 'secret')).sort(),
+      )
+    },
+  )
+
+  it.if(isLinux)(
+    'lists a path once that the pattern and the name both give',
+    async () => {
+      const starred = join(root, 'c', '*')
+      writeFileSync(starred, '')
+      try {
+        await initialize({ denyRead: [starred], allowRead: [starred] })
+        const read = SandboxManager.getFsReadConfig()
+        const both = [join(root, 'c', '*'), join(root, 'c', 'secret')].sort()
+        expect([...read.denyOnly].sort()).toEqual(both)
+        expect([...(read.allowWithinDeny ?? [])].sort()).toEqual(both)
+      } finally {
+        rmSync(starred)
+      }
+    },
+  )
+
+  it.skipIf(!CAN_RUN)(
+    'denies all three under bubblewrap',
+    async () => {
+      const { stdout } = await sandboxed(
+        { denyRead: [entry] },
+        dirs.map(dir => `cat ${q(join(root, dir, 'secret'))}`).join('; '),
+        { cwd: root },
+      )
+      expect(stdout).not.toMatch(/SECRET-(\[ab\]|a|b)\n/)
+      expect(stdout).toContain('SECRET-c')
+    },
+    WRAP_TIMEOUT_MS,
+  )
+
+  it('covers all three in the macOS profile', () => {
+    const profile = macProfile({ denyOnly: [entry] }, undefined)
+    const deny = ruleOf(profile, '(deny file-read*')
+    const regexes = emittedRegexes(deny)
+    const subpaths = emittedSubpaths(deny)
+    const covered = (p: string): boolean =>
+      regexes.some(re => re.test(p)) ||
+      subpaths.some(s => p === s || p.startsWith(s + '/'))
+    for (const dir of ['[ab]', 'a', 'b']) {
+      expect(covered(join(root, dir, 'secret'))).toBe(true)
+    }
+    expect(covered(join(root, 'c', 'secret'))).toBe(false)
+  })
+})
+
+// ============================================================================
+// Entries with no such name on disk: nothing changes
+// ============================================================================
+
+/**
+ * Ordinary entries and patterns, under a root that does not exist: no glob
+ * character of theirs can be part of a name on disk, so each has its
+ * pattern reading alone, and what it resolves to is pinned byte for byte.
+ */
+describe.if(!isWindows)(
+  'entries none of which is a name with glob characters',
+  () => {
+    const ROOT = '/srt-literal-path-entries'
+    const lists = {
+      denyRead: [
+        `${ROOT}/secrets`,
+        `${ROOT}/home/.ssh/**`,
+        `${ROOT}/proj/**/.env`,
+        `${ROOT}/proj/*.pem`,
+        `${ROOT}/proj/[ab]/key`,
+        `${ROOT}/proj/file?.txt`,
+        `${ROOT}/proj/**/build/**`,
+      ],
+      allowRead: [
+        `${ROOT}/secrets/public`,
+        `${ROOT}/proj/**/public`,
+        `${ROOT}/home/.ssh/known_hosts`,
+      ],
+      allowWrite: [
+        `${ROOT}/proj`,
+        `${ROOT}/out/**`,
+        `${ROOT}/build/*`,
+        `${ROOT}/cache/[0-9]`,
+      ],
+      denyWrite: [
+        `${ROOT}/proj/.git`,
+        `${ROOT}/proj/**/node_modules`,
+        `${ROOT}/proj/locked/**`,
+        `${ROOT}/proj/?.lock`,
+      ],
+    }
+    const savedCwd = process.cwd()
+
+    beforeAll(() => {
+      // The built-in write denies are spelled from the working directory and
+      // its ancestors. From the root they are the same on every host.
+      process.chdir('/')
+    })
+
+    afterAll(async () => {
+      process.chdir(savedCwd)
+      await SandboxManager.reset()
+    })
+
+    it.if(isLinux)(
+      'gives the read and write config it gave before',
+      async () => {
+        await initialize(lists)
+        const read = SandboxManager.getFsReadConfig()
+        expect(read.denyOnly).toEqual([
+          '/srt-literal-path-entries/secrets',
+          '/srt-literal-path-entries/home/.ssh',
+        ])
+        expect(read.allowWithinDeny).toEqual([
+          '/srt-literal-path-entries/secrets/public',
+          '/srt-literal-path-entries/home/.ssh/known_hosts',
+        ])
+        expect(read.unlistableDenyDirs).toEqual([])
+        expect(Object.keys(read).sort()).toEqual([
+          'allowWithinDeny',
+          'denyOnly',
+          'unlistableDenyDirs',
+        ])
+
+        const write = SandboxManager.getFsWriteConfig()
+        expect(write.allowOnly).toEqual([
+          ...getDefaultWritePaths(),
+          '/srt-literal-path-entries/proj',
+          '/srt-literal-path-entries/out',
+        ])
+        expect(write.denyWithinAllow).toEqual([
+          '/srt-literal-path-entries/proj/.git',
+          '/srt-literal-path-entries/proj/locked',
+        ])
+        expect('literalAllowOnly' in write).toBe(false)
+        // Absent or empty: the two mean the same for this list.
+        expect(write.literalDenyWithinAllow ?? []).toEqual([])
+
+        expect(SandboxManager.getLinuxGlobPatternWarnings()).toEqual([
+          '/srt-literal-path-entries/build/*',
+          '/srt-literal-path-entries/cache/[0-9]',
+          '/srt-literal-path-entries/proj/**/node_modules',
+          '/srt-literal-path-entries/proj/?.lock',
+        ])
+      },
+    )
+
+    it('gives the macOS file rules it gave before', () => {
+      const wrapped = macProfile(
+        { denyOnly: lists.denyRead, allowWithinDeny: lists.allowRead },
+        { allowOnly: lists.allowWrite, denyWithinAllow: lists.denyWrite },
+      )
+      expect(fileRulesOf(wrapped)).toBe(EXPECTED_MACOS_FILE_RULES)
+    })
+  },
+)
+
+/** The file rules of a wrapped command's profile, log tag replaced. */
+function fileRulesOf(wrapped: string): string {
+  const from = wrapped.indexOf('; File read')
+  const to = wrapped.indexOf("' ", from)
+  return wrapped.slice(from, to).replace(/CMD64_.*?_SBX/g, '<tag>')
+}
+
+const EXPECTED_MACOS_FILE_RULES = String.raw`; File read
+(allow file-read*)
+(deny file-read*
+  (subpath "/srt-literal-path-entries/secrets")
+  (regex "^/srt-literal-path-entries/home/\\.ssh/.*(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?\\.env(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/[^/]*\\.pem(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/[ab]/key(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/file[^/]\\.txt(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?build/.*(/.*)?$")
+  (with message "<tag>"))
+(allow file-read*
+  (subpath "/srt-literal-path-entries/secrets/public")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?public$")
+  (subpath "/srt-literal-path-entries/home/.ssh/known_hosts")
+  (with message "<tag>"))
+(deny file-read*
+  (require-all (regex "^/srt-literal-path-entries/home/\\.ssh/.*(/.*)?$") (require-not (subpath "/srt-literal-path-entries/home/.ssh/known_hosts")))
+  (regex "^/srt-literal-path-entries/proj/(.*/)?\\.env(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/[^/]*\\.pem(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/[ab]/key(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/file[^/]\\.txt(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?build/.*(/.*)?$")
+  (with message "<tag>"))
+(allow file-read-metadata
+  (vnode-type DIRECTORY))
+(deny file-write-unlink file-write-create
+  (subpath "/srt-literal-path-entries/secrets")
+  (literal "/srt-literal-path-entries")
+  (regex "^/srt-literal-path-entries/home/\\.ssh/.*(/.*)?$")
+  (literal "/srt-literal-path-entries/home/.ssh")
+  (literal "/srt-literal-path-entries/home")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?\\.env(/.*)?$")
+  (literal "/srt-literal-path-entries/proj")
+  (regex "^/srt-literal-path-entries/proj/[^/]*\\.pem(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/[ab]/key(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/file[^/]\\.txt(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?build/.*(/.*)?$")
+  (with message "<tag>"))
+(allow file-write-unlink file-write-create
+  (subpath "/srt-literal-path-entries/proj")
+  (regex "^/srt-literal-path-entries/out/.*$")
+  (regex "^/srt-literal-path-entries/build/[^/]*$")
+  (regex "^/srt-literal-path-entries/cache/[0-9]$")
+  (with message "<tag>"))
+
+; File write
+(allow file-write*
+  (subpath "/srt-literal-path-entries/proj")
+  (regex "^/srt-literal-path-entries/out/.*$")
+  (regex "^/srt-literal-path-entries/build/[^/]*$")
+  (regex "^/srt-literal-path-entries/cache/[0-9]$")
+  (with message "<tag>"))
+(deny file-write*
+  (subpath "/srt-literal-path-entries/proj/.git")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?node_modules(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/locked/.*(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/[^/]\\.lock(/.*)?$")
+  (subpath "/.gitconfig")
+  (regex "^/(.*/)?\\.gitconfig(/.*)?$")
+  (subpath "/.gitmodules")
+  (regex "^/(.*/)?\\.gitmodules(/.*)?$")
+  (subpath "/.bashrc")
+  (regex "^/(.*/)?\\.bashrc(/.*)?$")
+  (subpath "/.bash_profile")
+  (regex "^/(.*/)?\\.bash_profile(/.*)?$")
+  (subpath "/.zshrc")
+  (regex "^/(.*/)?\\.zshrc(/.*)?$")
+  (subpath "/.zprofile")
+  (regex "^/(.*/)?\\.zprofile(/.*)?$")
+  (subpath "/.profile")
+  (regex "^/(.*/)?\\.profile(/.*)?$")
+  (subpath "/.ripgreprc")
+  (regex "^/(.*/)?\\.ripgreprc(/.*)?$")
+  (subpath "/.mcp.json")
+  (regex "^/(.*/)?\\.mcp\\.json(/.*)?$")
+  (subpath "/.vscode")
+  (regex "^/(.*/)?\\.vscode/.*(/.*)?$")
+  (subpath "/.idea")
+  (regex "^/(.*/)?\\.idea/.*(/.*)?$")
+  (subpath "/.claude/commands")
+  (regex "^/(.*/)?\\.claude/commands/.*(/.*)?$")
+  (subpath "/.claude/agents")
+  (regex "^/(.*/)?\\.claude/agents/.*(/.*)?$")
+  (subpath "/.git/hooks")
+  (regex "^/(.*/)?\\.git/hooks/.*(/.*)?$")
+  (subpath "/.git/config")
+  (regex "^/(.*/)?\\.git/config(/.*)?$")
+  (with message "<tag>"))
+(deny file-write-unlink file-write-create
+  (subpath "/srt-literal-path-entries/proj/.git")
+  (literal "/srt-literal-path-entries/proj")
+  (literal "/srt-literal-path-entries")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?node_modules(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/locked/.*(/.*)?$")
+  (literal "/srt-literal-path-entries/proj/locked")
+  (regex "^/srt-literal-path-entries/proj/[^/]\\.lock(/.*)?$")
+  (subpath "/.gitconfig")
+  (regex "^/(.*/)?\\.gitconfig(/.*)?$")
+  (subpath "/.gitmodules")
+  (regex "^/(.*/)?\\.gitmodules(/.*)?$")
+  (subpath "/.bashrc")
+  (regex "^/(.*/)?\\.bashrc(/.*)?$")
+  (subpath "/.bash_profile")
+  (regex "^/(.*/)?\\.bash_profile(/.*)?$")
+  (subpath "/.zshrc")
+  (regex "^/(.*/)?\\.zshrc(/.*)?$")
+  (subpath "/.zprofile")
+  (regex "^/(.*/)?\\.zprofile(/.*)?$")
+  (subpath "/.profile")
+  (regex "^/(.*/)?\\.profile(/.*)?$")
+  (subpath "/.ripgreprc")
+  (regex "^/(.*/)?\\.ripgreprc(/.*)?$")
+  (subpath "/.mcp.json")
+  (regex "^/(.*/)?\\.mcp\\.json(/.*)?$")
+  (subpath "/.vscode")
+  (regex "^/(.*/)?\\.vscode/.*(/.*)?$")
+  (subpath "/.idea")
+  (regex "^/(.*/)?\\.idea/.*(/.*)?$")
+  (subpath "/.claude/commands")
+  (literal "/.claude")
+  (regex "^/(.*/)?\\.claude/commands/.*(/.*)?$")
+  (subpath "/.claude/agents")
+  (regex "^/(.*/)?\\.claude/agents/.*(/.*)?$")
+  (subpath "/.git/hooks")
+  (literal "/.git")
+  (regex "^/(.*/)?\\.git/hooks/.*(/.*)?$")
+  (subpath "/.git/config")
+  (regex "^/(.*/)?\\.git/config(/.*)?$")
+  (with message "<tag>"))
+
+; File read: keep read-denied paths inside write roots in place
+(deny file-write-unlink
+  (require-all (regex "^/srt-literal-path-entries/home/\\.ssh/.*(/.*)?$") (require-not (subpath "/srt-literal-path-entries/home/.ssh/known_hosts")))
+  (regex "^/srt-literal-path-entries/proj/(.*/)?\\.env(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/[^/]*\\.pem(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/[ab]/key(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/file[^/]\\.txt(/.*)?$")
+  (regex "^/srt-literal-path-entries/proj/(.*/)?build/.*(/.*)?$")
+  (with message "<tag>"))`
 
 // ============================================================================
 // The marker
@@ -924,6 +2353,9 @@ describe.if(!isWindows)(
     const { getDefaultWritePaths } = await import(${JSON.stringify(
       join(import.meta.dir, '../../src/sandbox/sandbox-utils.ts'),
     )})
+    const { SandboxManager } = await import(${JSON.stringify(
+      join(import.meta.dir, '../../src/sandbox/sandbox-manager.ts'),
+    )})
     const kept = paths => paths.filter(p => p.endsWith('/debug') || p.endsWith('/_logs')).map(p => p.split('/').slice(-2).join('/'))
     ${body}`
 
@@ -941,8 +2373,10 @@ describe.if(!isWindows)(
 
     beforeAll(() => {
       root = freshRoot()
-      mkdirSync(join(root, 'home', '.claude', 'debug'), { recursive: true })
-      mkdirSync(join(root, 'home', '.npm', '_logs'), { recursive: true })
+      for (const home of ['home', '[home]']) {
+        mkdirSync(join(root, home, '.claude', 'debug'), { recursive: true })
+        mkdirSync(join(root, home, '.npm', '_logs'), { recursive: true })
+      }
     })
 
     afterAll(() => {
@@ -966,6 +2400,30 @@ describe.if(!isWindows)(
         denied: ['.npm/_logs'],
         reopened: ['.npm/_logs', '.claude/debug'],
         asPattern: ['.npm/_logs', '.claude/debug'],
+      })
+    })
+
+    it('counts a deny spelled inside a home directory with brackets in its name', () => {
+      const home = join(root, '[home]')
+      expect(
+        under(
+          home,
+          `const config = filesystem => ({ network: { allowedDomains: [], deniedDomains: [] }, filesystem: { allowWrite: [], denyWrite: [], ...filesystem } })
+        await SandboxManager.initialize(config({ denyRead: [${JSON.stringify(join(home, '.claude'))}] }), undefined, false)
+        const denied = kept(SandboxManager.getFsWriteConfig().allowOnly)
+        await SandboxManager.reset()
+        await SandboxManager.initialize(config({
+          denyRead: [${JSON.stringify(join(home, '.claude'))}],
+          allowRead: [${JSON.stringify(join(home, '.claude', 'debug'))}],
+        }), undefined, false)
+        const reopened = kept(SandboxManager.getFsWriteConfig().allowOnly)
+        await SandboxManager.reset()
+        console.log(JSON.stringify({ denied, reopened }))
+        process.exit(0)`,
+        ),
+      ).toEqual({
+        denied: ['.npm/_logs'],
+        reopened: ['.npm/_logs', '.claude/debug'],
       })
     })
   },
