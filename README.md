@@ -819,7 +819,7 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 4. **Two-stage application using apply-seccomp binary**:
    - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
-   - Network bridging processes (socat) start inside the sandbox (need Unix sockets)
+   - Network bridging processes (socat) start inside the sandbox (need Unix sockets), and the wrapper waits until both listen
    - apply-seccomp creates a nested user+PID+mount namespace and remounts `/proc`
    - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
    - apply-seccomp forks, applies the seccomp filter via `prctl()`, and execs the user command
