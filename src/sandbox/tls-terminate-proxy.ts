@@ -219,6 +219,9 @@ export function terminateAndForward(
   })
 
   const leg = createUpstreamLeg(target)
+  // Settles once the latest request has been handed to the agent or dropped;
+  // the next request waits for it (see forwardUpstream).
+  let previous: Promise<void> = Promise.resolve()
 
   inner.on('request', (req, res) => {
     // A client abort mid-request destroys req/res with an error; with no
@@ -234,7 +237,7 @@ export function terminateAndForward(
         level: 'error',
       })
     })
-    forwardUpstreamGuarded(
+    previous = forwardUpstreamGuarded(
       filterRequest,
       mutateHeaders,
       getBodySubstitutions,
@@ -242,6 +245,7 @@ export function terminateAndForward(
       res,
       target,
       leg,
+      previous,
       planSigv4,
       maxSigv4BodyBytes,
     )
@@ -317,9 +321,10 @@ export function terminateAndForward(
  *
  * One agent per client connection rather than a shared pool, so requests from
  * different client connections never share an upstream socket, and the
- * upstream connection lives exactly as long as the client's. One socket keeps
- * the client's request order on the wire: a pipelined request queues in the
- * agent until the previous response has finished.
+ * upstream connection lives exactly as long as the client's. One socket sends
+ * requests in the order they reach the agent, a pipelined one queueing until
+ * the previous response has finished; forwardUpstream hands them over in the
+ * order the client sent them.
  *
  * `ca` and `checkServerIdentity` are agent options, not request options — a
  * per-request `checkServerIdentity` makes Node open a new socket for every
@@ -399,11 +404,12 @@ function destroyAfterDenial(req: IncomingMessage, res: ServerResponse): void {
 
 function forwardUpstreamGuarded(
   ...args: Parameters<typeof forwardUpstream>
-): void {
+): Promise<void> {
   // Fire-and-forget from the request handler: a rejection (e.g. a
   // synchronous throw writing a denial to a client that already reset)
-  // must not become an unhandledRejection.
-  forwardUpstream(...args).catch(err => {
+  // must not become an unhandledRejection, nor keep the next request
+  // waiting for its turn.
+  return forwardUpstream(...args).catch(err => {
     logForDebugging(
       `[tls-terminate] forwardUpstream failed: ${(err as Error).message}`,
       { level: 'error' },
@@ -419,6 +425,7 @@ async function forwardUpstream(
   res: ServerResponse,
   target: TerminateTarget,
   leg: UpstreamLeg,
+  previous: Promise<void>,
   planSigv4?: PlanSigv4,
   maxSigv4BodyBytes: number = MAX_SIGV4_RESIGN_BODY_BYTES,
 ): Promise<void> {
@@ -628,8 +635,16 @@ async function forwardUpstream(
     failUpstream(err as Error)
     return
   }
+  // Hand requests to the agent in the order the client sent them. They arrive
+  // in that order, but the awaits above (filterRequest, SigV4 body buffering,
+  // the dial) can finish in any order, and the agent sends in the order it is
+  // given requests. An overtaking request would also hold the agent's only
+  // socket while the inner server holds its response back behind the earlier
+  // one's; on Node that stalls both once the held response passes the
+  // high-water mark and the pipe from upstream pauses.
+  await previous
   if (res.destroyed || req.socket.destroyed) {
-    // Client went away during the dial.
+    // Client went away during the dial or while waiting its turn.
     body.destroy()
     return
   }
