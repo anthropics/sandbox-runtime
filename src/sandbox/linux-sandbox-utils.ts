@@ -72,6 +72,8 @@ export interface LinuxSandboxParams {
    */
   maskedFileStoreDir?: string
   enableWeakerNestedSandbox?: boolean
+  /** Lets the command undo the write denies: see {@link NESTED_USERNS_ENV}. */
+  allowNestedUserNamespaces?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: RipgrepConfig
@@ -646,7 +648,9 @@ export function boundingCapabilitiesFromStatus(
  * a creator holding CAP_SETFCAP. Under the helper a uid-0 caller's command
  * therefore has a full set inside that nested namespace, which is
  * identity-mapped to the caller's uid 0, and the filesystem policy there
- * rests on the nested namespace's mount copies being locked. Without the
+ * rests on the helper's namespaces filter refusing the calls that change a
+ * mount tree: the nested namespace's locked mount copies refuse the unmount
+ * of any one of them, not the whole tree being moved aside. Without the
  * helper (`allowAllUnixSockets`, or no usable helper binary) the command runs
  * in bwrap's own namespaces and `--cap-drop ALL` is what stops it unmounting
  * a deny.
@@ -1499,6 +1503,28 @@ export async function initializeLinuxNetworkBridge(
     httpProxyPort,
     socksProxyPort,
   }
+}
+
+/**
+ * Read by the seccomp helper, never by this process. The write denies are
+ * read-only binds, and a bind protects a path only in the mount namespace it
+ * was made in. Creating a user namespace takes no capability and gives a full
+ * set over a private copy of the mount tree, from which the binds can be
+ * detached all at once; a directory opened beforehand then reaches the denied
+ * names. So by default the helper refuses the calls with a seccomp filter and
+ * sets user.max_user_namespaces to zero in the namespace it made. `1` lifts
+ * both.
+ */
+const NESTED_USERNS_ENV = 'SRT_ALLOW_NESTED_USERNS'
+
+/**
+ * The assignment the helper's command line starts with, so that the variable
+ * holds what the configuration says: the wrap reaches the helper through a
+ * shell, whose start-up files (BASH_ENV) could set it after bubblewrap cleared
+ * it, and an assignment before a command is made after those.
+ */
+function helperEnvironmentPrefix(allowNestedUserNamespaces: boolean): string {
+  return `${NESTED_USERNS_ENV}=${allowNestedUserNamespaces ? '1' : '0'} `
 }
 
 /**
@@ -3170,6 +3196,7 @@ export async function wrapCommandWithSandboxLinux(
     maskedFileBinds,
     maskedFileStoreDir,
     enableWeakerNestedSandbox,
+    allowNestedUserNamespaces,
     allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
@@ -3242,6 +3269,9 @@ export async function wrapCommandWithSandboxLinux(
           { level: 'warn' },
         )
       } else {
+        applySeccompPrefix =
+          helperEnvironmentPrefix(allowNestedUserNamespaces === true) +
+          applySeccompPrefix
         logForDebugging(
           '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
         )
@@ -3445,6 +3475,11 @@ export async function wrapCommandWithSandboxLinux(
       // fresh proc mount is what an unprivileged container refuses.
       bwrapArgs.push('--bind', '/proc', '/proc')
     }
+
+    // The caller's environment decides nothing about the command's namespaces:
+    // the variable is cleared after every other environment operation, which
+    // bubblewrap applies in argument order, and helperEnvironmentPrefix sets it.
+    bwrapArgs.push('--unsetenv', NESTED_USERNS_ENV)
 
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
     // by creating a nested user namespace. This requires the host to permit

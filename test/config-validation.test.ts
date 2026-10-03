@@ -108,11 +108,30 @@ describe('Config Validation', () => {
         'git push': ['/usr/bin/nc'],
       },
       enableWeakerNestedSandbox: true,
+      allowNestedUserNamespaces: true,
       enableWeakerNetworkIsolation: false,
     }
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
     expect(result.success).toBe(true)
+    expect(result.data?.allowNestedUserNamespaces).toBe(true)
+  })
+
+  test('allowNestedUserNamespaces is a boolean, and absent unless given', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+    expect(
+      SandboxRuntimeConfigSchema.safeParse(base).data
+        ?.allowNestedUserNamespaces,
+    ).toBeUndefined()
+    expect(
+      SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        allowNestedUserNamespaces: 'yes',
+      }).success,
+    ).toBe(false)
   })
 
   test('should reject missing required fields', () => {
