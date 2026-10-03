@@ -763,6 +763,129 @@ describe.if(!isWindows)('walkGlobPattern', () => {
 })
 
 // ============================================================================
+// A pattern walked beneath an anchor
+// ============================================================================
+
+/**
+ * The glob dialect has no escape, so a directory whose own name holds `[`,
+ * `*` or `?` cannot be spelled inside a pattern: `anchor` says where the name
+ * ends and the pattern starts.
+ */
+describe.if(!isWindows)('a pattern walked beneath an anchor', () => {
+  let root: string
+  let ordinary: string
+  const named = ['[WIP] project', 'build*', 'notes (draft?)']
+
+  beforeAll(() => {
+    root = realPath(mkdtempSync(join(tmpdir(), 'glob-anchor-')))
+    ordinary = join(root, 'ordinary')
+    // `buildX` and `W` are what `build*` and `[WIP]` match as patterns.
+    for (const base of [...named, 'ordinary', 'buildX', 'W project']) {
+      mkdirSync(join(root, base, 'deep', 'er'), { recursive: true })
+      for (const file of ['a]x', 'deep/a]x', 'deep/er/b]x', 'deep/.env']) {
+        writeFileSync(join(root, base, file), '')
+      }
+    }
+  })
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  const beneath = (base: string, found: string[]): string[] =>
+    found.map(match => match.slice(base.length)).sort()
+
+  describe.each(named)('a directory named %p', name => {
+    it.each(['/**/.env', '/deep/*', '/de*/.env', '/**/er/*', '/*/*]x'])(
+      'finds for %p what the same tail finds beneath an ordinary directory',
+      tail => {
+        const anchor = join(root, name)
+        const expected = beneath(ordinary, expandGlobPattern(ordinary + tail))
+        expect(expected.length).toBeGreaterThan(0)
+        expect(
+          beneath(anchor, expandGlobPattern(anchor + tail, { anchor })),
+        ).toEqual(expected)
+      },
+    )
+
+    it.each([
+      ['/**/[a*]x', ['/a]x', '/deep/a]x']],
+      ['/[a*]x', ['/a]x']],
+      ['/deep/[a*]x', ['/deep/a]x']],
+    ])(
+      'matches %p, which cannot be split, by its spelling from the anchor on',
+      (tail, expected) => {
+        // A wildcard inside a bracket expression: the walk matches such a
+        // pattern against whole paths, which beneath an anchor start at it.
+        const anchor = join(root, name)
+        expect(beneath(ordinary, expandGlobPattern(ordinary + tail))).toEqual(
+          expected,
+        )
+        expect(
+          beneath(anchor, expandGlobPattern(anchor + tail, { anchor })),
+        ).toEqual(expected)
+      },
+    )
+  })
+
+  it.each([
+    [
+      'another directory of the same length',
+      (a: string) => a.replace(/.$/, '_'),
+    ],
+    ['a longer path than the pattern', (a: string) => `${a}/deep/.env/more`],
+    ['a name cut short', (a: string) => a.slice(0, -1)],
+    ['the root', () => '/'],
+    ['nothing', () => ''],
+  ])('throws for an anchor that is %s', (_what, wrong) => {
+    // The tail is cut by length: taken as it comes, a wrong anchor would walk
+    // another directory and hand back what the tail matches there.
+    const anchor = join(root, '[WIP] project')
+    expect(() =>
+      expandGlobPattern(`${anchor}/deep/.env`, { anchor: wrong(anchor) }),
+    ).toThrow(TypeError)
+  })
+
+  it('reads no character of the anchor as pattern', () => {
+    // Without the anchor the same strings are patterns from end to end.
+    const starred = join(root, 'build*')
+    expect(expandGlobPattern(`${starred}/deep/.env`).sort()).toEqual([
+      join(root, 'build*', 'deep', '.env'),
+      join(root, 'buildX', 'deep', '.env'),
+    ])
+    expect(
+      expandGlobPattern(`${starred}/deep/.e*`, { anchor: starred }),
+    ).toEqual([join(root, 'build*', 'deep', '.env')])
+    const bracketed = join(root, '[WIP] project')
+    expect(expandGlobPattern(`${bracketed}/deep/.e*`)).toEqual([
+      join(root, 'W project', 'deep', '.env'),
+    ])
+    expect(
+      expandGlobPattern(`${bracketed}/deep/.e*`, { anchor: bracketed }),
+    ).toEqual([join(bracketed, 'deep', '.env')])
+  })
+
+  it('keeps a trailing separator, with which a pattern matches nothing', () => {
+    const anchor = join(root, '[WIP] project')
+    expect(expandGlobPattern(`${ordinary}/*/`)).toEqual([])
+    expect(expandGlobPattern(`${anchor}/*/`, { anchor })).toEqual([])
+  })
+
+  it('starts at the anchor plus the directory the tail itself starts from', () => {
+    const anchor = join(root, '[WIP] project')
+    expect(walkGlobPattern(`${anchor}/deep/*`, { anchor }).baseLocation).toBe(
+      join(anchor, 'deep'),
+    )
+    const walk = walkGlobPattern(`${anchor}/**/er/**`, {
+      anchor,
+      withDirectoryForm: true,
+    })
+    expect(walk.baseLocation).toBe(anchor)
+    expect(walk.directoryMatches).toEqual([join(anchor, 'deep', 'er')])
+  })
+})
+
+// ============================================================================
 // expandTilde — `~\` form is Windows-only
 // ============================================================================
 
