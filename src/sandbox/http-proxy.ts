@@ -611,7 +611,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         socket.destroy()
       })
       socket.on('close', () => upstream.destroy())
-      upstream.on('close', () => socket.destroy())
+      // When the upstream closes, pipe() propagates its graceful end as
+      // socket.end(), which flushes everything relayed before sending FIN.
+      // destroy() here instead would discard bytes still queued in the
+      // client socket's write buffer — truncating responses from servers
+      // that close right after writing (HTTP/1.1 `Connection: close`).
+      // end() is a no-op when the pipe (or the error path above) already
+      // closed the socket, and a flush-then-FIN otherwise; the client's
+      // own close then destroys the upstream via the handler above.
+      upstream.on('close', () => socket.end())
     } catch (err) {
       logForDebugging(`Error handling CONNECT: ${err}`, { level: 'error' })
       // Same rule as the 502 path: once the MITM sniff's 200 is out, a

@@ -187,7 +187,11 @@ export function createSocksProxyServer(
         sendStatus('REQUEST_GRANTED')
         upstream.pipe(conn.socket)
         conn.socket.pipe(upstream)
-        upstream.on('close', () => conn.socket.destroy())
+        // end(), not destroy(): flush relayed bytes still queued in the
+        // client socket before closing, so an upstream that closes right
+        // after writing doesn't get its final bytes discarded (see the
+        // matching teardown in http-proxy.ts).
+        upstream.on('close', () => conn.socket.end())
       })
       .catch(err => {
         logForDebugging(
