@@ -107,15 +107,37 @@ export function isAbsenceErrno(err: unknown): boolean {
 }
 
 /**
- * Check if a path pattern contains glob characters
+ * Check if a path pattern contains glob characters that mean the caller
+ * asked for pattern matching.
+ *
+ * `*` and `?` always count. `[` / `]` count only in a spelling that is not
+ * already rooted (`/` or `~`): an absolute or `~`-rooted path whose only
+ * "glob" characters are brackets is treated as a literal name. Closed
+ * `[…]` in directory names is common (e.g. `path.join` onto a workspace)
+ * and compiling it as a character class silently voids `denyRead` and
+ * strips an `allowWrite` of its subtree (see #576). Classification runs
+ * on the raw caller spelling, before tilde/cwd expansion, so a `~/.ssh`
+ * deny under a bracketed `$HOME` stays literal the way 0.0.77 already
+ * arranged.
+ *
+ * Intentional character classes still work in relative patterns
+ * (`[ab]/secrets`) and alongside `*` / `?` in absolute ones
+ * (`/tmp/file[0-9].*`). An absolute spelling with brackets alone
+ * (`/tmp/project[1]/secret.txt`) is a literal path.
  */
 export function containsGlobChars(pathPattern: string): boolean {
-  return (
-    pathPattern.includes('*') ||
-    pathPattern.includes('?') ||
-    pathPattern.includes('[') ||
-    pathPattern.includes(']')
-  )
+  if (pathPattern.includes('*') || pathPattern.includes('?')) {
+    return true
+  }
+  if (!pathPattern.includes('[') && !pathPattern.includes(']')) {
+    return false
+  }
+  // Brackets alone: glob only when the spelling is not already rooted.
+  // `~` is included because classification happens before tilde expansion.
+  if (pathPattern.startsWith('/') || pathPattern.startsWith('~')) {
+    return false
+  }
+  return true
 }
 
 /**
@@ -382,13 +404,15 @@ function warnIfParentRefUnfolded(normalizedPath: string): string {
  *
  * `opts.literal` marks a path that names one file or directory rather
  * than matching several: one the library computed itself, or a caller
- * spelling that carried no glob character — resolving such a spelling can
- * splice in a cwd or home directory whose own name does. The glob
- * branches are skipped for it, so a component like `a[b` is resolved and
- * later compiled as the name it is. A spelling the caller wrote with `*`,
- * `?` or `[…]` in it keeps the character sniffing: there the brackets are
- * the glob syntax it asked for. The interior collapse below is not one of
- * the glob branches: `//` and `/./` are dead spellings either way.
+ * spelling that {@link containsGlobChars} did not classify as a pattern —
+ * resolving such a spelling can splice in a cwd or home directory whose
+ * own name does. The glob branches are skipped for it, so a component
+ * like `a[b` is resolved and later compiled as the name it is. A spelling
+ * the caller wrote with `*` or `?`, or a relative spelling with `[…]`,
+ * keeps the character sniffing. An absolute or `~`-rooted spelling whose
+ * only "glob" characters are brackets is literal (see #576). The interior
+ * collapse below is not one of the glob branches: `//` and `/./` are dead
+ * spellings either way.
  */
 export function normalizePathForSandbox(
   pathPattern: string,
