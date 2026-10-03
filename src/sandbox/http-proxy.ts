@@ -18,10 +18,8 @@ import {
   type MutateForwardedHeaders,
 } from './request-filter.js'
 
-const ALLOWLIST_DENY = [
-  'Connection blocked by network allowlist',
-  'blocked-by-allowlist',
-] as const
+const ALLOWLIST_DENY_REASON = 'Connection blocked by network allowlist'
+const ALLOWLIST_DENY_TAG = 'blocked-by-allowlist'
 import {
   peekForClientHello,
   terminateAndForward,
@@ -49,11 +47,27 @@ import {
   stripHopByHop,
 } from './parent-proxy.js'
 
+/**
+ * A host-allowlist verdict. Only `true` allows. `false` denies with the
+ * generic {@link ALLOWLIST_DENY_REASON}; `{ allow: false, reason }` denies
+ * with that reason, which the proxy writes as the 403 body.
+ *
+ * How far that body travels depends on the path. A denied plain-HTTP
+ * request is an ordinary 403 and its client prints the reason, so there it
+ * replaces the `blocked-by-allowlist` tag an agent mistakes for a proxy or
+ * DNS fault. A denied CONNECT carries the same body, but curl, git and
+ * urllib3 discard a failed tunnel's body and report only the status, so an
+ * https:// client is not reached this way and the reason has to get to the
+ * model some other way (the violation store the embedder annotates with).
+ */
+export type HostFilterVerdict = boolean | { allow: false; reason: string }
+
 export interface HttpProxyServerOptions {
   /**
    * Host-allowlist decision. `encodedCommand` is the per-command suffix
    * parsed from the Proxy-Authorization username (`srt.<encodedCommand>`),
    * so the manager can attribute a denial to the invocation that made it.
+   * See {@link HostFilterVerdict} for answering with a reason.
    *
    * Receives the host exactly as the client spelled it (so denials and
    * permission prompts show what the process asked for); the manager's
@@ -66,7 +80,7 @@ export interface HttpProxyServerOptions {
     host: string,
     socket: Socket | Duplex,
     encodedCommand?: string,
-  ): Promise<boolean> | boolean
+  ): Promise<HostFilterVerdict> | HostFilterVerdict
 
   /**
    * Optional function to get the MITM proxy socket path for a given host.
@@ -441,17 +455,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
       const { hostname: requestedHost, port } = target
 
-      const allowed = await options.filter(
+      const verdict = await options.filter(
         port,
         requestedHost,
         socket,
         auth.encodedCommand,
       )
-      if (!allowed) {
-        logForDebugging(`Connection blocked to ${requestedHost}:${port}`, {
-          level: 'error',
-        })
-        endWithStatus(rawDenied(...ALLOWLIST_DENY))
+      if (verdict !== true) {
+        const reason = allowlistDenyReason(verdict)
+        logForDebugging(
+          `Connection blocked to ${requestedHost}:${port}: ${reason}`,
+          { level: 'error' },
+        )
+        endWithStatus(rawDenied(reason, ALLOWLIST_DENY_TAG))
         return
       }
       // The client may have died during the filter await (EOF destroy
@@ -676,16 +692,18 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       const requestedHost = stripBrackets(url.hostname)
       const port = url.port ? parseInt(url.port, 10) : defaultPort
 
-      const allowed = await options.filter(
+      const verdict = await options.filter(
         port,
         requestedHost,
         req.socket,
         auth.encodedCommand,
       )
-      if (!allowed) {
-        logForDebugging(`HTTP request blocked to ${requestedHost}:${port}`, {
-          level: 'error',
-        })
+      if (verdict !== true) {
+        const reason = allowlistDenyReason(verdict)
+        logForDebugging(
+          `HTTP request blocked to ${requestedHost}:${port}: ${reason}`,
+          { level: 'error' },
+        )
         // The client may have aborted during the filter await; a
         // deny for a dead client is dropped, not written. Plain
         // half-close (EOF after a complete request) is legal HTTP
@@ -695,7 +713,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           res.destroy()
           return
         }
-        respondDenied(res, ...ALLOWLIST_DENY)
+        respondDenied(res, reason, ALLOWLIST_DENY_TAG)
         return
       }
 
@@ -949,6 +967,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
  * Parse a CONNECT request-target into host + port. Handles both plain
  * `host:port` and bracketed IPv6 `[::1]:port`.
  */
+/**
+ * What to write back for a host-allowlist verdict that is not `true`. Only
+ * `true` allows: `{ allow: false }` is a truthy object, so a truthiness
+ * test on the verdict would tunnel the connection it denies.
+ */
+function allowlistDenyReason(
+  verdict: Exclude<HostFilterVerdict, true>,
+): string {
+  return verdict === false || !verdict.reason
+    ? ALLOWLIST_DENY_REASON
+    : verdict.reason
+}
+
 function parseConnectTarget(
   target: string,
 ): { hostname: string; port: number } | undefined {
