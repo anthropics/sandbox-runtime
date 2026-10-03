@@ -95,6 +95,7 @@ import {
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
+  sanitizeDenialReason,
   sanitizeUnregisteredCommandKey,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
@@ -107,6 +108,8 @@ import {
   resolveParentProxy,
 } from './parent-proxy.js'
 import {
+  ALLOWED_DOMAIN_ENTRY_MESSAGE,
+  isValidAllowedDomainEntry,
   matchesDomainPattern,
   matchesDomainPatternWithPort,
   stripDomainPatternPort,
@@ -256,6 +259,82 @@ export function resolveCommandText(decodedKey: string): string {
 }
 
 /**
+ * The shortest commandId a per-command allow list may be registered under:
+ * 16 random bytes (128 bits) as unpadded base64url. The floor only turns away
+ * what is too short to hold 128 bits: it cannot tell a random id from a
+ * predictable one of the same length.
+ */
+const MIN_NETWORK_LISTS_COMMAND_ID_LENGTH = 22
+
+/**
+ * Attribution key to the network allow list registered for one invocation
+ * (registerCommandNetworkLists), keyed the way commandTextsByKey is because
+ * the proxy username delivers both. The embedder removes an entry when its
+ * command is gone. Not bounded the way commandTextsByKey is: dropping the
+ * oldest entry would silently take a list away from a running command.
+ */
+const commandNetworkListsByKey = new Map<string, { allowedDomains: string[] }>()
+
+function registerCommandNetworkLists(
+  commandId: string,
+  lists: { allowedDomains?: string[] },
+): void {
+  // The floor is measured on the key the map holds, not on the raw id, and
+  // less U+FFFD: every unpaired surrogate becomes one, so it carries nothing.
+  const key =
+    typeof commandId === 'string'
+      ? decodeSandboxedCommand(encodeSandboxedCommand(commandId))
+      : ''
+  // The id is not echoed in either message: it is what stands between a
+  // sandboxed process and this list, and error text ends up in logs.
+  if (key.replace(/\ufffd/g, '').length < MIN_NETWORK_LISTS_COMMAND_ID_LENGTH) {
+    throw new Error(
+      `registerCommandNetworkLists: commandId must be a string of at least ` +
+        `${MIN_NETWORK_LISTS_COMMAND_ID_LENGTH} characters, unpaired ` +
+        `surrogates not counted. The id is the ` +
+        `only thing that binds a proxy connection to this allow list, and ` +
+        `the sandboxed process chooses which id it presents, so it must be ` +
+        `random (at least 128 bits, e.g. 16 random bytes as base64url) and ` +
+        `never derived from the command text, a counter or the time.`,
+    )
+  }
+  const allowedDomains = lists?.allowedDomains ?? []
+  if (!Array.isArray(allowedDomains)) {
+    throw new Error(
+      'registerCommandNetworkLists: allowedDomains must be an array of strings.',
+    )
+  }
+  for (const entry of allowedDomains) {
+    if (typeof entry !== 'string' || !isValidAllowedDomainEntry(entry)) {
+      throw new Error(
+        `registerCommandNetworkLists: invalid allowedDomains entry ` +
+          `${JSON.stringify(entry)}. ${ALLOWED_DOMAIN_ENTRY_MESSAGE}`,
+      )
+    }
+  }
+  commandNetworkListsByKey.set(
+    key,
+    // Copied, so the caller cannot change what was validated.
+    { allowedDomains: [...allowedDomains] },
+  )
+  // An external HTTP proxy is handed no username, so no connection names an id.
+  if (config?.network.httpProxyPort !== undefined) {
+    logForDebugging(
+      'registerCommandNetworkLists: network.httpProxyPort is set (an ' +
+        'external proxy), so this list will never apply',
+      { level: 'warn' },
+    )
+  }
+}
+
+function unregisterCommandNetworkLists(commandId: string): void {
+  if (typeof commandId !== 'string') return
+  commandNetworkListsByKey.delete(
+    decodeSandboxedCommand(encodeSandboxedCommand(commandId)),
+  )
+}
+
+/**
  * Record a proxy-side denial in the violation store so the model sees a
  * structured <sandbox_violations> block alongside the raw 403 / SOCKS
  * failure in stderr — parity with the macOS seatbelt log monitor and the
@@ -333,6 +412,29 @@ function redactUrlForViolation(url: string): string {
   }
 }
 
+/** Whether an ask-callback answer is one of the two documented denials. */
+function isDeclaredDenial(answer: unknown): boolean {
+  return (
+    answer === false ||
+    (typeof answer === 'object' &&
+      answer !== null &&
+      (answer as { allow?: unknown }).allow === false)
+  )
+}
+
+/**
+ * The reason an ask-callback answer gives for denying, sanitized, or
+ * undefined when it gives none that can be shown. Only
+ * `{ allow: false, reason }` supplies one: a reason on any other object was
+ * not written as the explanation of a denial.
+ */
+function denialReasonOf(answer: unknown): string | undefined {
+  if (typeof answer !== 'object' || answer === null) return undefined
+  const { allow, reason } = answer as { allow?: unknown; reason?: unknown }
+  if (allow !== false || typeof reason !== 'string') return undefined
+  return sanitizeDenialReason(reason) || undefined
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
@@ -389,22 +491,51 @@ async function filterNetworkRequest(
     }
   }
 
-  // No matching rules - ask user or deny. strictAllowlist makes the
-  // allowlist deterministic enforcement: never fall through to the callback.
-  if (!sandboxAskCallback || config.network.strictAllowlist) {
+  // strictAllowlist makes the configured allowlist deterministic enforcement:
+  // neither a per-command allow list nor the callback below can widen it.
+  if (config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
     return denied('host is not on the allow list')
   }
 
-  logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
+  // The allow list registered for the invocation the proxy username names.
+  // Coming after both configured lists, it lifts the default deny for that
+  // one command and never a configured deniedDomains entry. The username is
+  // presented by the sandboxed client: see registerCommandNetworkLists.
+  const perCommand = encodedCommand
+    ? commandNetworkListsByKey.get(decodeSandboxedCommand(encodedCommand))
+    : undefined
+  for (const allowedDomain of perCommand?.allowedDomains ?? []) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {
+      logForDebugging(`Allowed by per-command rule: ${host}:${port}`)
+      return true
+    }
+  }
+
+  if (!sandboxAskCallback) {
+    logForDebugging(`No matching rule, denying: ${host}:${port}`)
+    return denied('host is not on the allow list')
+  }
+
+  logForDebugging(`No matching rule, asking user: ${host}:${port}`)
   try {
-    const userAllowed = await sandboxAskCallback({ host, port })
-    if (userAllowed) {
+    // Held as unknown: a JavaScript caller is not bound by the declared type.
+    const answer: unknown = await sandboxAskCallback({ host, port })
+    // Only `true` allows: an object is how a callback denies with a reason,
+    // and a truthiness test here would read every such denial as an allow.
+    if (answer === true) {
       logForDebugging(`User allowed: ${host}:${port}`)
       return true
     }
+    if (!isDeclaredDenial(answer)) {
+      logForDebugging(
+        `Ask callback answered neither a boolean nor { allow: false, reason }; treating it as a denial: ${host}:${port}`,
+        { level: 'warn' },
+      )
+    }
     logForDebugging(`User denied: ${host}:${port}`)
-    return denied('user denied')
+    // The callback's own reason, when it gave one, says what to do instead.
+    return denied(denialReasonOf(answer) ?? 'user denied')
   } catch (error) {
     logForDebugging(`Error in permission callback: ${error}`, {
       level: 'error',
@@ -1640,6 +1771,9 @@ export type WrapWithSandboxOptions = {
    * command text: keys are compared on their first 100 characters, so two
    * long commands sharing a prefix would otherwise cross-attribute, and a
    * rerun of the same text would inherit the earlier run's events.
+   *
+   * An id that a network allow list is registered under must also be
+   * unguessable: see `registerCommandNetworkLists`.
    */
   commandId?: string
   /**
@@ -2438,6 +2572,7 @@ async function reset(): Promise<void> {
   sentinelRegistry.clear()
   awsPairRegistry.clear()
   commandTextsByKey.clear()
+  commandNetworkListsByKey.clear()
   maskedFileStore.dispose()
 }
 
@@ -2573,6 +2708,60 @@ export interface ISandboxManager {
     cwd?: string,
     options?: WrapWithSandboxOptions,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
+  /**
+   * Register the network allow list of one invocation, under the `commandId`
+   * its wrap was given ({@link WrapWithSandboxOptions}). Entries are matched
+   * and validated as `network.allowedDomains` entries are; an invalid one
+   * throws. Registering an id again replaces its list.
+   *
+   * Order of evaluation for a connection: a configured `deniedDomains` match
+   * denies; a configured `allowedDomains` match allows;
+   * `network.strictAllowlist` denies; a match in the list registered for the
+   * id the connection presents allows; then the ask callback decides if
+   * there is one, and otherwise the connection is denied. So a per-command
+   * entry never overrides a configured `deniedDomains` entry and is ignored
+   * entirely under `strictAllowlist`. It also never enters `network.*`, so
+   * the default `injectHosts` scope of a masked credential does not grow.
+   *
+   * The proxy reads the id from the proxy username, which the sandboxed
+   * client presents, so the id is the ONLY thing binding a connection to an
+   * allow list. It MUST be unguessable: at least 128 bits of randomness (16
+   * random bytes as base64url, 22 characters; a shorter id throws), never a
+   * counter, a timestamp or anything derived from the command. Presenting
+   * another live invocation's id gets that invocation's allows: this is
+   * attribution, not a boundary between concurrent commands of one session.
+   *
+   * Register just before spawning the wrapped command, and unregister when
+   * the child exits or never started: a registration that outlives its
+   * command widens the window in which its id is worth presenting.
+   *
+   * As with every attribution key, only the first 100 characters of an id
+   * take part, and a list under an id whose encoded form does not fit in the
+   * proxy username (possible only with non-ASCII ids) never applies. An
+   * unpaired surrogate does not count towards the 22 characters.
+   *
+   * No list applies while `network.httpProxyPort` names an external proxy:
+   * the wrap gives that proxy no username, so no connection carries an id.
+   * Registering still succeeds, and every connection is decided as if no list
+   * existed.
+   */
+  registerCommandNetworkLists(
+    commandId: string,
+    lists: { allowedDomains?: string[] },
+  ): void
+  /**
+   * Remove the list registered for `commandId`. A no-op for an id that has
+   * none. `reset()` removes them all.
+   */
+  unregisterCommandNetworkLists(commandId: string): void
+  /**
+   * True when the network filter understands an ask callback's
+   * `{ allow: false, reason }` answer (see {@link SandboxAskCallback}). Read
+   * it before returning that object: releases up to v0.0.77 allow on any
+   * truthy answer, so there the object would be read as an allow. Where this
+   * is absent, deny with a plain `false`.
+   */
+  readonly askCallbackDenyReason: true
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
@@ -2616,6 +2805,9 @@ export const SandboxManager: ISandboxManager = {
   waitForNetworkInitialization,
   wrapWithSandbox,
   wrapWithSandboxArgv,
+  registerCommandNetworkLists,
+  unregisterCommandNetworkLists,
+  askCallbackDenyReason: true,
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,

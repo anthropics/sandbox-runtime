@@ -91,9 +91,11 @@ export interface CredentialRestrictionConfig {
  *
  * Note: Empty `allowedHosts` means no host matches an allow rule (unlike
  * read's empty denyOnly). Whether an unmatched host is denied outright
- * depends on the ask callback: deniedHosts are checked first and deny
- * unconditionally; a host matching neither list falls through to the
- * registered SandboxAskCallback when one exists, and is denied only when
+ * depends on what else may decide it: deniedHosts are checked first and deny
+ * unconditionally; a host matching neither list is denied under
+ * `network.strictAllowlist`, else allowed by a matching per-command list
+ * (`SandboxManager.registerCommandNetworkLists`), else falls through to the
+ * registered SandboxAskCallback when one exists, and is denied when
  * no callback is registered. Hosts needing a hard block-all regardless of
  * callback behavior should use a `deniedHosts` wildcard.
  *
@@ -113,6 +115,22 @@ export type NetworkHostPattern = {
   port: number | undefined
 }
 
+/**
+ * Asked about a host that no configured rule and no per-command allow list
+ * decided (never asked under `network.strictAllowlist`). Only `true` allows.
+ * `{ allow: false, reason }` denies with that reason, which the violation
+ * line reports. `false` and every other answer, truthy or not, deny with the
+ * generic reason "user denied": a `reason` on an object that does not say
+ * `allow: false` is not reported.
+ *
+ * The reason is sanitized like the rest of a violation line (runs of control
+ * or invisible characters become one space, `<` and `>` are removed, the
+ * ends are trimmed) and cut to 500 UTF-16 code units, so write it as one
+ * line of plain text. With nothing left, "user denied" is reported.
+ *
+ * Check `SandboxManager.askCallbackDenyReason` before returning an object:
+ * a release without it reads any truthy answer as an allow.
+ */
 export type SandboxAskCallback = (
   params: NetworkHostPattern,
-) => Promise<boolean>
+) => Promise<boolean | { allow: false; reason: string }>

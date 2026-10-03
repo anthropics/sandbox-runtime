@@ -1055,12 +1055,14 @@ export function proxyUsernameFor(encodedCommand: string | undefined): string {
 /**
  * Inverse of {@link proxyUsernameFor}: extract the encodedCommand suffix
  * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
- * The username is client-controlled inside the sandbox, so a forged suffix
- * can only misattribute a denial in the violation report — it cannot
- * authenticate (the token does that) or reach another command's data. A
+ * The username is presented by the client inside the sandbox. A forged
+ * suffix cannot authenticate (the token does that), but it decides which
+ * invocation a denial is attributed to in the violation report and which
+ * registered network allow list applies to the connection: see
+ * `SandboxManager.registerCommandNetworkLists` for what that asks of an id. A
  * suffix past {@link MAX_ENCODED_COMMAND_BYTES} is longer than this process
  * can mint, so it is dropped rather than stored: the denial is still
- * recorded, unattributed.
+ * recorded, unattributed, and no registered list applies.
  */
 export function encodedCommandFromProxyUser(
   username: string | undefined,
