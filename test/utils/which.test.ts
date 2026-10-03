@@ -45,4 +45,13 @@ describe('whichSync', () => {
     const bunWhichResult = globalThis.Bun.which('ls')
     expect(whichSyncResult).toBe(bunWhichResult)
   })
+
+  it('returns a path-qualified executable without shelling out to which', () => {
+    const result = whichSync(process.execPath)
+    expect(result).toBe(process.execPath)
+  })
+
+  it('returns null for a missing path-qualified executable', () => {
+    expect(whichSync('/definitely/missing/srt-bin-xyz')).toBeNull()
+  })
 })
