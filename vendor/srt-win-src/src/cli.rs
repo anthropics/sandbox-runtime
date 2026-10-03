@@ -382,12 +382,44 @@ struct AceReleaseEntry {
     status: &'static str,
 }
 
+/// Post-apply TOCTOU check for reparse-traversing deny spellings:
+/// between planning (canonicalize) and the lock landing, a sandboxed
+/// child could re-point the link, leaving the spelling resolving to
+/// an object the deny never covered. The lock prevents FURTHER
+/// re-points, so one re-resolve after apply closes the window:
+/// fail the stamp (ACEs stay for recovery) rather than report a
+/// deny that does not hold.
+fn verify_reparse_spellings(verifies: &[(String, String)]) -> anyhow::Result<()> {
+    for (spelling, canon) in verifies {
+        match srt_win::path_id::canonicalize_path(spelling) {
+            Ok((now, _)) if now == *canon => {}
+            Ok((now, _)) => anyhow::bail!(
+                "deny target '{spelling}' was re-pointed during the stamp \
+                 (resolved '{canon}' at planning, '{now}' after) — the \
+                 deny does not cover the current target; re-run the stamp"
+            ),
+            Err(e) => anyhow::bail!(
+                "deny target '{spelling}' could not be re-verified after \
+                 the stamp: {e:#}"
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Output of [`canonicalize_ace_targets`].
 struct AceTargets {
     /// `(canonical_path, ace)` to hand to `apply_aces`.
     targets: Vec<(String, srt_win::acl::SbAce)>,
     /// Inputs that could not be canonicalized (soft-skip → exit 2).
     bad_inputs: Vec<(String, String)>,
+    /// Deny spellings that traversed a reparse point, with the canon
+    /// each resolved to at stamp-planning time. After `apply_aces`,
+    /// [`verify_reparse_spellings`] re-resolves each and fails the
+    /// stamp if a racing re-point moved the spelling to an object
+    /// the deny never covered (the lock lands too late for that one
+    /// window; fail-closed beats a silently uncovered spelling).
+    reparse_verifies: Vec<(String, String)>,
 }
 
 /// Canonicalize `(paths, ace)` pairs for `acl grant`/`acl stamp`
@@ -434,6 +466,7 @@ fn canonicalize_ace_targets(
     use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
+    let mut reparse_verifies = Vec::new();
     // Deepest-first so overlapping non-existent denies (`['y',
     // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
     // `y` FILE (which would then fail `y\secret` with "ancestor is
@@ -523,11 +556,28 @@ fn canonicalize_ace_targets(
             for anc in db.placeholder_ancestors_of(&canon)? {
                 targets.push((anc, SbAce::DenyDelete));
             }
+            // A deny whose SPELLING rides through reparse points
+            // stamps only the resolved object; lock each traversed
+            // link so the child cannot re-point or delete+recreate
+            // it to make the denied spelling resolve elsewhere
+            // (probe-deny-alias DA3b/DA4).
+            let links = srt_win::path_id::reparse_components(p);
+            if !links.is_empty() {
+                reparse_verifies.push((p.clone(), canon.clone()));
+            }
+            for link in links {
+                eprintln!(
+                    "srt-win: deny target '{p}' traverses reparse \
+                     point '{link}'; locking the link object"
+                );
+                targets.push((link, SbAce::DenyReparseLock));
+            }
         }
     }
     Ok(AceTargets {
         targets,
         bad_inputs,
+        reparse_verifies,
     })
 }
 
@@ -1138,11 +1188,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
                     let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                    verify_reparse_spellings(&at.reparse_verifies)?;
                     Ok((at, w, f))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
+                reparse_verifies: _,
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
@@ -1208,11 +1260,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
                     let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                    verify_reparse_spellings(&at.reparse_verifies)?;
                     Ok((at, w, f))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
+                reparse_verifies: _,
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
@@ -1456,6 +1510,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
                     }
                     let (w, f) = db.apply_aces(&sb_sid, &at.targets)?;
+                    verify_reparse_spellings(&at.reparse_verifies)?;
                     Ok((at, w, f))
                 })
                 .context("per-exec deny-ace")?;

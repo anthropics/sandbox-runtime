@@ -1033,6 +1033,7 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::Deny(d) => set.deny = Some(d),
             SbAce::DenyFdc => set.deny_fdc = true,
             SbAce::DenyDelete => set.deny_delete = true,
+            SbAce::DenyReparseLock => set.deny_reparse_lock = true,
         }
     }
     // Install-time ambient write-deny (HKLM AmbientDenies) folds
