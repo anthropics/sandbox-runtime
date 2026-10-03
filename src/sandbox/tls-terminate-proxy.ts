@@ -502,13 +502,14 @@ async function forwardUpstream(
   mutateHeaders?.(fwdHeaders, target.hostname)
   // Masked-credential substitution in the request body, mirroring the
   // header substitution above. undefined → the bare pipe below, exactly as
-  // before. May delete content-length from fwdHeaders (chunked fallback).
-  const bodyTransform = prepareBodySubstitution(
+  // before. Length-changing pairs are buffered so Content-Length stays exact.
+  const bodyPlan = prepareBodySubstitution(
     getBodySubstitutions,
     req,
     fwdHeaders,
     target.hostname,
   )
+  let bodyTransform = bodyPlan?.transform
 
   // SigV4 re-signing runs after substitution so the new signature covers
   // the headers as they actually go upstream (real access key id, real
@@ -577,6 +578,33 @@ async function forwardUpstream(
       )
       body.destroy()
       if (body !== req) destroyAfterDenial(req, res)
+      return
+    }
+  }
+
+  if (bodyPlan?.mayChangeLength && bufferedBody === undefined) {
+    const src = body.pipe(bodyPlan.transform)
+    body.on('error', err => bodyPlan.transform.destroy(err))
+    try {
+      bufferedBody = await collectBody(src, maxSigv4BodyBytes)
+      fwdHeaders['content-length'] = String(bufferedBody.length)
+      bodyTransform = undefined
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) {
+        respondDenied(
+          res,
+          `Masked-credential body substitution may change Content-Length, ` +
+            `so the proxy must buffer the body, but it exceeds the ` +
+            `${maxSigv4BodyBytes}-byte buffering limit; denied.`,
+        )
+        src.resume()
+        return
+      }
+      logForDebugging(
+        `[tls-terminate] failed to buffer body for substitution: ${(err as Error).message}`,
+        { level: 'error' },
+      )
+      res.destroy()
       return
     }
   }
