@@ -1530,7 +1530,7 @@ function resolveApplySeccompPrefix(
  * Build the command that runs inside the sandbox.
  * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
  */
-function buildSandboxCommand(
+export function buildSandboxCommand(
   httpSocketPath: string,
   socksSocketPath: string,
   userCommand: string,
@@ -1543,14 +1543,12 @@ function buildSandboxCommand(
   // Host filesystem is bind-mounted into the sandbox, so an explicit
   // socatPath resolves to the same binary inside bwrap.
   const socat = quote([socatPath ?? 'socat'])
+  const httpSocketArg = quote([`UNIX-CONNECT:${httpSocketPath}`])
+  const socksSocketArg = quote([`UNIX-CONNECT:${socksSocketPath}`])
   const socatCommands = [
-    `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
-    `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    // The trap saves the status the script is exiting with and exits with
-    // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
-    // keep the script's status, zsh takes the status of the trap's own last
-    // command (the kill), so under zsh a failing command reported 0. Single
-    // quotes, so $? and $rc are read when the trap runs, not when it is set.
+    `${socat} TCP-LISTEN:3128,fork,reuseaddr ${httpSocketArg} >/dev/null 2>&1 &`,
+    `${socat} TCP-LISTEN:1080,fork,reuseaddr ${socksSocketArg} >/dev/null 2>&1 &`,
+    `for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do ${socat} -u /dev/null TCP:127.0.0.1:3128 >/dev/null 2>&1 && break; sleep 0.01 2>/dev/null || true; done`,
     "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
   ]
 
