@@ -8,6 +8,7 @@ export type {
   SandboxRuntimeConfig,
   NetworkConfig,
   FilesystemConfig,
+  FilesystemPathEntry,
   CredentialsConfig,
   CredentialFileConfig,
   CredentialEnvVarConfig,
@@ -48,6 +49,9 @@ export {
   LinuxSandboxProfileError,
   type LinuxSandboxProfileErrorCode,
 } from './sandbox/linux-sandbox-utils.js'
+// The mount points a running sandbox relies on (Linux), as a snapshot, for an
+// embedder that removes paths itself after a command to leave out.
+export { liveMountPoints } from './sandbox/bwrap-mount-manifests.js'
 
 // Windows install/status API
 export {
@@ -124,6 +128,7 @@ export {
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'
+export { writeRootsOf } from './sandbox/path-entries.js'
 
 // Platform utilities
 export { getWslVersion } from './utils/platform.js'

@@ -51,6 +51,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'installWindowsSandbox',
   'installWindowsSandboxAsync',
   'isUncPath',
+  'liveMountPoints',
   'parseWindowsBinShell',
   'parseWindowsSandboxError',
   'resolveSrtWin',
@@ -64,6 +65,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'windowsStateDir',
   'windowsTrustCa',
   'windowsTrustCaAsync',
+  'writeRootsOf',
 ]
 
 describe('package entry point', () => {

@@ -2,7 +2,7 @@ import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { run, setup } from '../build-common.js'
 
-const { SRC, OUT } = setup({
+const { SRC, OUT, arch } = setup({
   importMetaUrl: import.meta.url,
   requirePlatform: 'linux',
   srcDirName: 'seccomp-src',
@@ -29,11 +29,16 @@ run([
   '-lseccomp',
 ])
 
+// The two filters apply-seccomp stacks (see seccomp-unix-block.c), as separate
+// arrays so that a command opted out of `namespaces` keeps `unix`. For the
+// builder's own architecture only: the generator can put a call its libseccomp
+// cannot name into a filter by number for that architecture alone.
+const target = arch === 'x64' ? 'x86_64' : 'aarch64'
 const bpf: Record<string, Buffer> = {}
-for (const target of ['x86_64', 'aarch64']) {
-  const tmp = join(OUT, target + '.bpf')
-  run([gen, tmp, target])
-  bpf[target] = readFileSync(tmp)
+for (const rules of ['unix', 'namespaces']) {
+  const tmp = join(OUT, `${target}.${rules}.bpf`)
+  run([gen, tmp, target, rules])
+  bpf[rules] = readFileSync(tmp)
   rmSync(tmp)
 }
 rmSync(gen)
@@ -41,16 +46,15 @@ rmSync(gen)
 const header = join(OUT, 'unix-block-bpf.h')
 writeFileSync(
   header,
-  '#if defined(__x86_64__)\n' +
+  `#if defined(__${target}__)\n` +
     'static const unsigned char unix_block_bpf[] = {\n' +
-    toCArray(bpf.x86_64) +
+    toCArray(bpf.unix) +
     '\n};\n' +
-    '#elif defined(__aarch64__)\n' +
-    'static const unsigned char unix_block_bpf[] = {\n' +
-    toCArray(bpf.aarch64) +
+    'static const unsigned char namespace_block_bpf[] = {\n' +
+    toCArray(bpf.namespaces) +
     '\n};\n' +
     '#else\n' +
-    '#error "unsupported architecture for unix-block BPF filter"\n' +
+    '#error "these filters were generated for another architecture"\n' +
     '#endif\n',
 )
 

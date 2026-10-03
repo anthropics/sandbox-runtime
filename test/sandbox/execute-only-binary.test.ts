@@ -139,8 +139,13 @@ describe.if(isLinux && isUnprivileged)(
       expect(await procOwnerDuringRun(0o111)).toBe(0)
     })
 
-    it('preserves dumpable for a readable copy (save/restore, not force-0)', async () => {
-      expect(await procOwnerDuringRun(0o755)).toBe(process.getuid!())
+    it('is non-dumpable after setup for a readable copy as well', async () => {
+      // Not only a matter of hiding an execute-only binary's pages. Where the
+      // fresh /proc cannot be mounted (enableWeakerNestedSandbox) the command
+      // still sees the helper's outer half, and could write a dumpable one
+      // through /proc/<pid>/mem. So the helper clears the flag before its
+      // first fork, whatever it was on entry.
+      expect(await procOwnerDuringRun(0o755)).not.toBe(process.getuid!())
     })
   },
 )

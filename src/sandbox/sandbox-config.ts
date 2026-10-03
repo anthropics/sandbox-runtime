@@ -3,7 +3,6 @@
  * This is the main configuration interface that consumers pass to SandboxManager.initialize()
  */
 
-import { isIP } from 'node:net'
 import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
@@ -13,61 +12,18 @@ import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
 // schemas the v4 API they are not written against.
 import { z } from 'zod/v3'
 import {
+  ALLOWED_DOMAIN_ENTRY_MESSAGE,
+  DOMAIN_PATTERN_MESSAGE,
+  hasValidIpv6Bracketing,
   isInjectHostCoveredByAllowedDomains,
+  isValidAllowedDomainEntry,
+  isValidDomainPattern,
   splitDomainPatternPort,
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import { parseAddressRange } from './address.js'
 import { containsGlobCharsForPlatform } from './sandbox-utils.js'
 import { getPlatform } from '../utils/platform.js'
-
-/**
- * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
- * protocols, paths, ports, and overly broad wildcards.
- */
-function isValidDomainPattern(val: string): boolean {
-  // A bare IPv6 literal as produced by splitDomainPatternPort for a
-  // bracketed entry (`[::1]`, `[2001:db8::1]:443` → `::1`, `2001:db8::1`).
-  // Whether the *raw* entry was bracketed is enforced separately
-  // (hasValidIpv6Bracketing) before the split.
-  if (isIP(val) === 6) return true
-
-  // Reject protocols, paths, ports, etc.
-  if (val.includes('://') || val.includes('/') || val.includes(':')) {
-    return false
-  }
-
-  // Allow localhost
-  if (val === 'localhost') return true
-
-  // Allow wildcard domains like *.example.com
-  if (val.startsWith('*.')) {
-    const domain = val.slice(2)
-    // After the *. there must be a valid domain with at least one more dot
-    // e.g., *.example.com is valid, *.com is not (too broad)
-    if (
-      !domain.includes('.') ||
-      domain.startsWith('.') ||
-      domain.endsWith('.')
-    ) {
-      return false
-    }
-    // Count dots - must have at least 2 parts after the wildcard (e.g., example.com)
-    const parts = domain.split('.')
-    return parts.length >= 2 && parts.every(p => p.length > 0)
-  }
-
-  // Reject any other use of wildcards (e.g., *, *., etc.)
-  if (val.includes('*')) {
-    return false
-  }
-
-  // Regular domains must have at least one dot and only valid characters
-  return val.includes('.') && !val.startsWith('.') && !val.endsWith('.')
-}
-
-const DOMAIN_PATTERN_MESSAGE =
-  'Invalid domain pattern. Must be a valid domain (e.g., "example.com"), a wildcard (e.g., "*.example.com"), or a bracketed IPv6 literal (e.g., "[::1]", "[2001:db8::1]:443"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -81,32 +37,11 @@ const domainPatternSchema = z
  * Domain pattern with an optional `:port` suffix (e.g., "example.com:443",
  * "*.npmjs.org:8443"). Used for allowedDomains / deniedDomains, where the
  * proxy knows the destination port; an entry without a port matches any port.
+ * The check and its message live in domain-pattern.ts, which says why.
  */
-/**
- * Raw-entry rule applied before the port split: an entry with two or more
- * colons is an IPv6 literal and must use RFC 3986 brackets (`[::1]`,
- * `[::1]:443`). Unbracketed it is ambiguous — `2001:db8::1:443` is itself a
- * valid 8-hextet address — so reject it and make the user say which they
- * mean, rather than accept an entry that can silently match the wrong thing.
- */
-function hasValidIpv6Bracketing(val: string): boolean {
-  const first = val.indexOf(':')
-  const multiColon = first !== -1 && val.indexOf(':', first + 1) !== -1
-  return !multiColon || val.startsWith('[')
-}
-
 const domainPortPatternSchema = z
   .string()
-  .refine(
-    val =>
-      hasValidIpv6Bracketing(val) &&
-      isValidDomainPattern(splitDomainPatternPort(val).hostPattern),
-    {
-      message:
-        DOMAIN_PATTERN_MESSAGE +
-        ' An optional ":port" suffix (1-65535) restricts the entry to that port.',
-    },
-  )
+  .refine(isValidAllowedDomainEntry, { message: ALLOWED_DOMAIN_ENTRY_MESSAGE })
 
 /**
  * deniedDomains entry: a domainPortPattern, or a bare "*" / "*:port"
@@ -137,6 +72,28 @@ const addressRangeSchema = z
  * Schema for filesystem paths
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
+
+/**
+ * An entry of `denyRead`, `allowRead`, `allowWrite` or `denyWrite`: a
+ * spelling, which is a pattern when it reads as one, or a path marked
+ * `literal: true`, which never is. An object without the mark, or with a
+ * key this does not know, is refused rather than read either way.
+ */
+const filesystemPathEntrySchema = z.union(
+  [
+    filesystemPathSchema,
+    z.object({ path: filesystemPathSchema, literal: z.literal(true) }).strict(),
+  ],
+  {
+    errorMap: (issue, ctx) =>
+      issue.code === z.ZodIssueCode.invalid_union
+        ? {
+            message:
+              'Expected a path, or { "path": "<path>", "literal": true }',
+          }
+        : { message: ctx.defaultError },
+  },
+)
 
 /**
  * Schema for an absolute path to an external binary.
@@ -319,7 +276,7 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(
     'Path to a credential file or directory. Supports the same path forms as ' +
-      'filesystem.denyRead (absolute paths and ~ expansion).',
+      'a string in filesystem.denyRead (absolute paths and ~ expansion).',
   ),
   mode: credentialModeSchema.describe('Access mode for this path'),
   extract: extractPatternSchema
@@ -742,7 +699,7 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      'If true, hosts not in allowedDomains are denied without consulting the ask callback. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
+      'If true, hosts not in allowedDomains are denied without consulting the ask callback, and a per-command allow list (registerCommandNetworkLists) is ignored. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
     ),
   deniedResolvedAddresses: z
     .array(addressRangeSchema)
@@ -905,19 +862,33 @@ export const FilesystemConfigSchema = z.object({
         'is trusted with full host filesystem access. Network and credential-env restrictions ' +
         'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',
     ),
-  denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
+  denyRead: z
+    .array(filesystemPathEntrySchema)
+    .describe('Paths denied for reading'),
   allowRead: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .optional()
     .describe(
       'Paths to re-allow reading within denied regions (takes precedence over denyRead). ' +
         'Use with denyRead to deny a broad region then allow back specific subdirectories.',
     ),
+  denyReadGlobBudget: z
+    .object({
+      maxEntries: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional(),
+    })
+    .strict()
+    .optional()
+    .describe(
+      'Linux: what expanding the denyRead globs of one configuration may spend, all of them together, ' +
+        'before the wrap is refused: directory entries looked at (default 20,000,000) and ' +
+        'milliseconds (default 60,000).',
+    ),
   allowWrite: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .describe('Paths allowed for writing'),
   denyWrite: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
   allowGitConfig: z
     .boolean()
@@ -941,7 +912,13 @@ export const IgnoreViolationsConfigSchema = z
  * Ripgrep configuration schema
  */
 export const RipgrepConfigSchema = z.object({
-  command: z.string().describe('The ripgrep command to execute'),
+  command: z
+    .string()
+    .describe(
+      'The ripgrep command to execute. A bare name (the default "rg") is ' +
+        'looked up on PATH, passing over any copy inside an allowed write ' +
+        'path; a path is run as given.',
+    ),
   args: z
     .array(z.string())
     .optional()
@@ -1075,7 +1052,9 @@ export const SeccompConfigSchema = z.object({
 /**
  * An inert deny is fail-open, so a deny glob whose trailing separator leaves
  * it matching nothing is rejected; the same glob as an allow fails closed,
- * so the allow lists keep the plain path schema.
+ * so the allow lists keep the plain path schema. Such an entry may also be
+ * the name of a path (`/w/[WIP]/keep/`), but only the disk can say so and
+ * validation does not ask it: the message gives the spelling read both ways.
  */
 function addInertSlashedDenyGlobIssue(
   value: string,
@@ -1097,9 +1076,10 @@ function addInertSlashedDenyGlobIssue(
     code: z.ZodIssueCode.custom,
     path,
     message:
-      `Deny glob "${value}" ends in a separator, so the pattern can match ` +
-      `no path. Write "${value.replace(trailingSeparator, '')}", or add a ` +
-      `"**" segment to match at any depth.`,
+      `Deny glob "${value}" ends in a separator, so as a pattern it can ` +
+      `match no path. Write "${value.replace(trailingSeparator, '')}", ` +
+      `which is also read as the path of that name where it exists, or add ` +
+      `a "**" segment to match at any depth.`,
   })
 }
 
@@ -1123,6 +1103,15 @@ export const SandboxRuntimeConfigSchema = z
       .boolean()
       .optional()
       .describe('Enable weaker nested sandbox mode (for Docker environments)'),
+    allowNestedUserNamespaces: z
+      .boolean()
+      .optional()
+      .describe(
+        'Let the sandboxed command create user namespaces of its own (Linux only), as a browser ' +
+          'sandbox, rootless podman or a nested bubblewrap does. This gives up the write denies against ' +
+          'a hostile command, which can then take the read-only binds that enforce denyWrite and the ' +
+          'mandatory denies out of its own view. Default: false.',
+      ),
     enableWeakerNetworkIsolation: z
       .boolean()
       .optional()
@@ -1169,13 +1158,15 @@ export const SandboxRuntimeConfigSchema = z
       .optional()
       .describe(
         'Linux only: absolute path to the bwrap (bubblewrap) binary. ' +
-          'When set, this path is used directly instead of resolving "bwrap" via PATH.',
+          'When set, this path is used directly instead of resolving "bwrap" via PATH ' +
+          '(where a copy inside an allowed write path is passed over).',
       ),
     socatPath: binaryPathSchema
       .optional()
       .describe(
         'Linux only: absolute path to the socat binary. ' +
-          'When set, this path is used directly instead of resolving "socat" via PATH.',
+          'When set, this path is used directly instead of resolving "socat" via PATH ' +
+          '(where a copy inside an allowed write path is passed over).',
       ),
     javaAgentJarPath: binaryPathSchema
       .optional()
@@ -1201,10 +1192,14 @@ export const SandboxRuntimeConfigSchema = z
     // under it is not a hole.
     const fsEnforced = !cfg.filesystem.disabled
     if (fsEnforced) {
+      // A marked entry is never a glob, so a separator at its end is the
+      // end of a name.
       for (const [idx, p] of cfg.filesystem.denyRead.entries()) {
+        if (typeof p !== 'string') continue
         addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyRead', idx], ctx)
       }
       for (const [idx, p] of cfg.filesystem.denyWrite.entries()) {
+        if (typeof p !== 'string') continue
         addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyWrite', idx], ctx)
       }
     }
@@ -1465,6 +1460,7 @@ export type MitmProxyConfig = z.infer<typeof MitmProxyConfigSchema>
 export type ParentProxyConfig = z.infer<typeof ParentProxyConfigSchema>
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
 export type FilesystemConfig = z.infer<typeof FilesystemConfigSchema>
+export type FilesystemPathEntry = z.infer<typeof filesystemPathEntrySchema>
 export type CredentialMode = z.infer<typeof credentialModeSchema>
 export type CredentialFileConfig = z.infer<typeof CredentialFileConfigSchema>
 export type CredentialEnvVarConfig = z.infer<

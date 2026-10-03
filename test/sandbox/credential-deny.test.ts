@@ -138,7 +138,7 @@ describe('macOS env -u preamble generation', () => {
     })
 
     expect(
-      wrapped.startsWith('env -u GH_TOKEN -u AWS_SECRET_ACCESS_KEY '),
+      wrapped.startsWith('/usr/bin/env -u GH_TOKEN -u AWS_SECRET_ACCESS_KEY '),
     ).toBe(true)
     // The -u flags must precede the VAR=VALUE assignments and sandbox-exec.
     expect(wrapped.indexOf('-u GH_TOKEN')).toBeLessThan(
@@ -245,7 +245,7 @@ describe.if(isSupportedPlatform)(
         'printenv MY_API_TOKEN',
       )
 
-      expect(wrapped.startsWith('env -u MY_API_TOKEN ')).toBe(true)
+      expect(wrapped.startsWith('/usr/bin/env -u MY_API_TOKEN ')).toBe(true)
       // -u must precede the first NAME=VALUE assignment and sandbox-exec so
       // BSD env still treats it as an option.
       expect(wrapped.indexOf('-u MY_API_TOKEN')).toBeLessThan(

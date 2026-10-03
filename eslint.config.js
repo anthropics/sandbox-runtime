@@ -42,6 +42,17 @@ export default [
     },
   },
   {
+    // Imports the BUILT package, so it is typechecked after the build and by
+    // a project of its own (see `npm run test:bundled`).
+    files: ['test/smoke/**/*.ts'],
+    languageOptions: {
+      parserOptions: {
+        project: './test/smoke/tsconfig.json',
+        projectService: false,
+      },
+    },
+  },
+  {
     plugins: {
       'eslint-plugin-n': pluginNode,
       import: pluginImport,
@@ -130,6 +141,27 @@ export default [
     },
     linterOptions: {
       reportUnusedDisableDirectives: false,
+    },
+  },
+  {
+    // bubblewrap takes no patterns, so every path that reaches the Linux
+    // backend is a name. normalizePathForSandbox with one argument decides
+    // pattern or name from the characters of the path, which would read a
+    // name with `[`, `*` or `?` in it as a pattern again.
+    files: [
+      'src/sandbox/linux-sandbox-utils.ts',
+      'src/sandbox/read-deny-glob.ts',
+    ],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector:
+            "CallExpression[callee.name='normalizePathForSandbox'][arguments.length=1]",
+          message:
+            'Every path here is a name: pass { literal: true }, so that glob characters in it are not read as a pattern.',
+        },
+      ],
     },
   },
   prettierRecommended,

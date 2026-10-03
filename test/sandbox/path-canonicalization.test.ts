@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { normalizePathForSandbox } from '../../src/sandbox/sandbox-utils.js'
+import { whichSync } from '../../src/utils/which.js'
 import { isWindows } from '../helpers/platform.js'
 
 /**
@@ -39,7 +40,8 @@ afterAll(() => {
  * normalizePathForSandbox in a child with $HOME set to `home`: $HOME is read
  * once at start-up, so it cannot be changed in this process. The environment
  * is scrubbed so the parent's SRT_DEBUG does not put sandbox debug output on
- * the child's stderr.
+ * the child's stderr. The wrap is told which helpers to run: it allows writes
+ * to the home directory, and passes over a copy on PATH that lies inside it.
  */
 function normalizeWithHome(
   home: string,
@@ -61,6 +63,10 @@ function normalizeWithHome(
         `const argv = process.platform === 'linux' ? await linux.wrapCommandWithSandboxLinux({\n` +
         `  command: 'true', needsNetworkRestriction: false, readConfig: undefined,\n` +
         `  writeConfig: { allowOnly: ['~'], denyWithinAllow: [] },\n` +
+        `  ...${JSON.stringify({
+          bwrapPath: whichSync('bwrap') ?? undefined,
+          ripgrepConfig: { command: whichSync('rg') ?? 'rg' },
+        })},\n` +
         `}) : ''\n` +
         `console.log(JSON.stringify({ homedir: os.homedir(), results: ${JSON.stringify(
           patterns,

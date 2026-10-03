@@ -173,6 +173,49 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
   })
 })
 
+describe.if(!isWindows)('expandReadDenyGlobLinux (beneath an anchor)', () => {
+  let ROOT: string
+  let PROJECT: string
+
+  beforeAll(() => {
+    ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'deny-glob-anchor-')))
+    // A directory a pattern reads as a character class, and `W project`,
+    // which is what that class matches.
+    PROJECT = join(ROOT, '[WIP] project')
+    for (const base of [PROJECT, join(ROOT, 'W project')]) {
+      mkdirSync(join(base, 'pkg', 'build', 'sub'), { recursive: true })
+      writeFileSync(join(base, 'pkg', 'build', 'sub', '1.out'), '')
+      writeFileSync(join(base, 'pkg', '.env'), '')
+    }
+    mkdirSync(join(ROOT, 'elsewhere'))
+    writeFileSync(join(ROOT, 'elsewhere', '.env'), '')
+    symlinkSync(join(ROOT, 'elsewhere'), join(PROJECT, 'link'))
+  })
+
+  afterAll(() => {
+    rmSync(ROOT, { recursive: true, force: true })
+  })
+
+  it('walks the pattern beneath the directory of that name and no other', () => {
+    expect(expandReadDenyGlobLinux(`${PROJECT}/**/build/**`, [])).toEqual([
+      join(ROOT, 'W project', 'pkg', 'build'),
+    ])
+    expect(
+      expandReadDenyGlobLinux(`${PROJECT}/**/build/**`, [], undefined, {
+        anchor: PROJECT,
+      }),
+    ).toEqual([join(PROJECT, 'pkg', 'build')])
+  })
+
+  it('lists a match found through a link beneath the anchor where it really lives', () => {
+    expect(
+      expandReadDenyGlobLinux(`${PROJECT}/**/.env`, [], undefined, {
+        anchor: PROJECT,
+      }),
+    ).toEqual([join(PROJECT, 'pkg', '.env'), join(ROOT, 'elsewhere', '.env')])
+  })
+})
+
 describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
   let ROOT: string
   let OUTSIDE: string
@@ -315,6 +358,32 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     )
 
     expect(mounts).toEqual([join(many, '.env')])
+    expect([...unlistable]).toEqual([])
+  })
+
+  it('denies nothing for a link out of the tree when the pattern cannot be read a name at a time', () => {
+    // `id[*].pem` cannot be followed one path component at a time, so no
+    // directory is listed through a symlink, and what such a pattern would
+    // match through one goes undenied: a known gap. Denying whole what every
+    // link out of the tree leads to is no cure: with vendor/sdk/conf -> /usr
+    // that masks /usr, and no command starts.
+    const unsplit = caseRoot('unsplit')
+    mkdirSync(join(unsplit, 'proj', 'vendor', 'sdk'), { recursive: true })
+    mkdirSync(join(unsplit, 'outside'))
+    writeFileSync(join(unsplit, 'outside', 'x'), '')
+    symlinkSync(
+      join(unsplit, 'outside'),
+      join(unsplit, 'proj', 'vendor', 'sdk', 'conf'),
+    )
+
+    const unlistable = new Set<string>()
+    const mounts = expandReadDenyGlobLinux(
+      join(unsplit, 'proj', 'id[*].pem'),
+      [],
+      unlistable,
+    )
+
+    expect(mounts).toEqual([])
     expect([...unlistable]).toEqual([])
   })
 

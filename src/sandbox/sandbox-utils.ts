@@ -3,6 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import type { FilesystemPathEntry } from './sandbox-config.js'
 
 /**
  * Dangerous files that should be protected from writes.
@@ -134,6 +135,30 @@ export function containsGlobCharsForPlatform(p: string): boolean {
   return getPlatform() === 'windows'
     ? containsGlobCharsWin(p)
     : containsGlobChars(p)
+}
+
+/**
+ * The path of an entry that is not a spelling. Throws unless the entry is
+ * `{ path: string, literal: true }`: a config built in code skips the
+ * schema, and reading `{ path }` either way would be a guess about a deny.
+ */
+export function markedLiteralPath(
+  entry: Exclude<FilesystemPathEntry, string>,
+): string {
+  const candidate: { path?: unknown; literal?: unknown } | null = entry
+  if (
+    candidate === null ||
+    typeof candidate !== 'object' ||
+    typeof candidate.path !== 'string' ||
+    candidate.path === '' ||
+    candidate.literal !== true
+  ) {
+    throw new TypeError(
+      'A filesystem path entry must be a path, or { path, literal: true }; ' +
+        `got ${JSON.stringify(entry) ?? String(entry)}`,
+    )
+  }
+  return candidate.path
 }
 
 /**
@@ -343,7 +368,7 @@ export function expandWindowsEnvRefs(p: string): string {
  * Runs of `/` collapsed to one and `/./` components dropped, leaving the rest
  * of the spelling (a trailing `/` or `/.`, a `..`) to the caller. POSIX only.
  */
-function collapseInteriorSpellings(pathPattern: string): string {
+export function collapseInteriorSpellings(pathPattern: string): string {
   return pathPattern.replace(/\/{2,}/g, '/').replace(/\/\.(?=\/)/g, '')
 }
 
@@ -381,14 +406,15 @@ function warnIfParentRefUnfolded(normalizedPath: string): string {
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
  *
  * `opts.literal` marks a path that names one file or directory rather
- * than matching several: one the library computed itself, or a caller
- * spelling that carried no glob character — resolving such a spelling can
- * splice in a cwd or home directory whose own name does. The glob
- * branches are skipped for it, so a component like `a[b` is resolved and
- * later compiled as the name it is. A spelling the caller wrote with `*`,
- * `?` or `[…]` in it keeps the character sniffing: there the brackets are
- * the glob syntax it asked for. The interior collapse below is not one of
- * the glob branches: `//` and `/./` are dead spellings either way.
+ * than matching several: one the library computed itself, one the caller
+ * marked literal, a caller spelling that carried no glob character —
+ * resolving such a spelling can splice in a cwd or home directory whose own
+ * name does — or the name a spelling with glob characters also is (see
+ * path-entries.ts). The glob branches are skipped for it, so a component
+ * like `a[b` is resolved and later compiled as the name it is. Without it,
+ * a spelling with `*`, `?` or `[…]` in it keeps the character sniffing, its
+ * pattern reading. The interior collapse below is not one of the glob
+ * branches: `//` and `/./` are dead spellings either way.
  */
 export function normalizePathForSandbox(
   pathPattern: string,
@@ -570,10 +596,14 @@ const HOME_CONVENIENCE_WRITE_DIRS: readonly string[] = [
  * still counts (which only ever drops a convenience path), and a glob whose
  * match is a symlink to one of these directories is not seen. A glob
  * `allowRead` entry is not counted as re-opening anything.
+ *
+ * An entry marked `{ path, literal: true }` is a name whatever it holds. A
+ * spelling is read by its characters alone: the name it also is when that
+ * exists on disk is for the caller to add as a marked entry.
  */
 export function getDefaultWritePaths(readRules?: {
-  denyRead: readonly string[]
-  allowRead?: readonly string[]
+  denyRead: readonly FilesystemPathEntry[]
+  allowRead?: readonly FilesystemPathEntry[]
 }): string[] {
   const home = homedir()
   const keptDirs =
@@ -592,8 +622,8 @@ export function getDefaultWritePaths(readRules?: {
  */
 function homeDirsNotReadDenied(
   home: string,
-  denyRead: readonly string[],
-  allowRead: readonly string[] = [],
+  denyRead: readonly FilesystemPathEntry[],
+  allowRead: readonly FilesystemPathEntry[] = [],
 ): readonly string[] {
   // Rules are compared as normalizePathForSandbox spells them, and on macOS
   // that resolves /tmp and /var to /private/... for a path that exists. A
@@ -604,8 +634,11 @@ function homeDirsNotReadDenied(
   ]
   const denies = denyRead.map(entry => readRuleCovers(entry))
   const reopened = allowRead
-    .map(entry => removeTrailingGlobSuffix(entry))
-    .filter(entry => !containsGlobCharsForPlatform(entry))
+    .flatMap(entry => {
+      if (typeof entry !== 'string') return [markedLiteralPath(entry)]
+      const stripped = removeTrailingGlobSuffix(entry)
+      return containsGlobCharsForPlatform(stripped) ? [] : [stripped]
+    })
     .map(entry => normalizePathForSandbox(entry, { literal: true }))
   return HOME_CONVENIENCE_WRITE_DIRS.filter(rel => {
     const spellings = homes.map(h => path.join(h, rel))
@@ -629,9 +662,15 @@ function homeDirsNotReadDenied(
  * is resolved: `*`, `?` and `[…]` there are the syntax it asked for, while
  * resolving splices in a cwd or home directory that may carry those
  * characters in its own name. A spelling without them is normalized as the
- * name it is.
+ * name it is, and so is an entry marked literal, whatever it holds.
  */
-function readRuleCovers(entry: string): (p: string) => boolean {
+function readRuleCovers(entry: FilesystemPathEntry): (p: string) => boolean {
+  if (typeof entry !== 'string') {
+    const rule = normalizePathForSandbox(markedLiteralPath(entry), {
+      literal: true,
+    })
+    return p => isAtOrUnder(p, rule)
+  }
   const stripped = removeTrailingGlobSuffix(entry)
   if (containsGlobCharsForPlatform(stripped)) {
     try {
@@ -1055,12 +1094,14 @@ export function proxyUsernameFor(encodedCommand: string | undefined): string {
 /**
  * Inverse of {@link proxyUsernameFor}: extract the encodedCommand suffix
  * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
- * The username is client-controlled inside the sandbox, so a forged suffix
- * can only misattribute a denial in the violation report — it cannot
- * authenticate (the token does that) or reach another command's data. A
+ * The username is presented by the client inside the sandbox. A forged
+ * suffix cannot authenticate (the token does that), but it decides which
+ * invocation a denial is attributed to in the violation report and which
+ * registered network allow list applies to the connection: see
+ * `SandboxManager.registerCommandNetworkLists` for what that asks of an id. A
  * suffix past {@link MAX_ENCODED_COMMAND_BYTES} is longer than this process
  * can mint, so it is dropped rather than stored: the denial is still
- * recorded, unattributed.
+ * recorded, unattributed, and no registered list applies.
  */
 export function encodedCommandFromProxyUser(
   username: string | undefined,
@@ -1073,6 +1114,9 @@ export function encodedCommandFromProxyUser(
   return suffix
 }
 
+/** A character that is syntax to a regex and, unlike `*?[]`, not to a glob. */
+const REGEX_METACHARACTER = /[.^$+{}()|\\]/
+
 /**
  * Convert a glob pattern to a regular expression
  *
@@ -1084,27 +1128,135 @@ export function encodedCommandFromProxyUser(
  * - ** matches any characters including / (e.g., src/**\/*.ts matches all .ts files in src/)
  * - ? matches any single character except / (e.g., file?.txt matches file1.txt)
  * - [abc] matches any character in the set (e.g., file[0-9].txt matches file3.txt)
+ * - [!abc] and [^abc] match any character outside the set, never a `/`
+ *
+ * The pattern is read once, left to right, and the regex is emitted as it
+ * goes, so no literal text in the pattern is ever read as a wildcard.
+ *
+ * A `[` that opens no set is a literal character: one that nothing closes,
+ * or whose set would hold no members (`[]`, `[!]`). The string is compiled
+ * by JavaScript and by the regex engine of a macOS sandbox profile, so `]`
+ * is never a member of a set, no spelling of it reading the same to both,
+ * and the other members are written the way both read ({@link setRegex}).
  *
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
 export function globToRegex(globPattern: string): string {
-  return (
-    '^' +
-    globPattern
-      // Escape regex special characters (except glob chars * ? [ ])
-      .replace(/[.^$+{}()|\\]/g, '\\$&')
-      // Escape unclosed brackets (no matching ])
-      .replace(/\[([^\]]*?)$/g, '\\[$1')
-      // Convert glob patterns to regex (order matters - ** before *)
-      .replace(/\*\*\//g, '__GLOBSTAR_SLASH__') // Placeholder for **/
-      .replace(/\*\*/g, '__GLOBSTAR__') // Placeholder for **
-      .replace(/\*/g, '[^/]*') // * matches anything except /
-      .replace(/\?/g, '[^/]') // ? matches single character except /
-      // Restore placeholders
-      .replace(/__GLOBSTAR_SLASH__/g, '(.*/)?') // **/ matches zero or more dirs
-      .replace(/__GLOBSTAR__/g, '.*') + // ** matches anything including /
-    '$'
-  )
+  let regex = '^'
+  /** Inside a `[…]`, where `]` closes the set rather than standing for itself. */
+  let inSet = false
+  let i = 0
+  while (i < globPattern.length) {
+    const char = globPattern[i]!
+    if (char === '*') {
+      const run = i
+      while (globPattern[i] === '*') i++
+      // The last two stars of a run before a separator go with it, as `**/`;
+      // the rest of the run is `**` pairs from the left and then a lone `*`.
+      const withSeparator = i - run >= 2 && globPattern[i] === '/'
+      let stars = i - run - (withSeparator ? 2 : 0)
+      for (; stars >= 2; stars -= 2) regex += '.*' // ** matches anything including /
+      if (stars === 1) regex += '[^/]*' // * matches anything except /
+      if (withSeparator) {
+        regex += '(.*/)?' // **/ matches zero or more dirs
+        i++
+      }
+      continue
+    }
+    if (char === '?') {
+      regex += '[^/]' // ? matches a single character except /
+      i++
+      continue
+    }
+    if (inSet && char === ']') {
+      regex += ']'
+      inSet = false
+      i++
+      continue
+    }
+    if (!inSet && char === '[') {
+      const set = setOpenedAt(globPattern, i)
+      if (set === undefined) {
+        regex += '\\['
+        i++
+        continue
+      }
+      const body = globPattern.slice(set.members, set.close)
+      if (!/[*?]/.test(body)) {
+        regex += setRegex(body, set.negated)
+        i = set.close + 1
+        continue
+      }
+      // A set that holds a wildcard is not read as one, but a `-` first in
+      // it stays first, not a range from the `/`.
+      const lead = set.negated && body[0] === '-' ? '-' : ''
+      regex += set.negated ? `[^${lead}/` : '['
+      inSet = true
+      i = set.members + lead.length
+      continue
+    }
+    regex += REGEX_METACHARACTER.test(char) ? `\\${char}` : char
+    i++
+  }
+  return regex + '$'
+}
+
+/**
+ * The set the `[` at `open` opens: where its members start, the `]` that
+ * closes it, and whether a leading `!` or `^` negates it. Undefined when
+ * nothing closes it or it would hold no members.
+ */
+function setOpenedAt(
+  pattern: string,
+  open: number,
+): { members: number; close: number; negated: boolean } | undefined {
+  const lead = pattern[open + 1]
+  const negated = lead === '!' || lead === '^'
+  const members = open + (negated ? 2 : 1)
+  const close = pattern.indexOf(']', members)
+  return close > members ? { members, close, negated } : undefined
+}
+
+/**
+ * The regex for a set with no wildcard in it, written the way JavaScript
+ * and the regex engine of a macOS sandbox profile read alike.
+ *
+ * That engine takes a backslash inside a set for a member (`[^/\$]` leaves
+ * out `\` as well as `$`), so a member is written as it is, and a backslash
+ * doubled, which is one `\` to both. Nothing else needs more: `]` is never a
+ * member, and no set that is not negated starts with a `^`, `[^` opening a
+ * negated one in the glob.
+ *
+ * That engine also refuses a set that ends in one character and a `-`
+ * (`[a-]`), and the whole profile with it. Only first among the members do
+ * both read a `-` alike, so one that stands for itself (first, last,
+ * straight after a range, or at either end of one) goes there, ahead of the
+ * `/` of a negated set, and a range that starts or ends at one is the `-`
+ * and the rest of the range, from `.` or up to `,`.
+ */
+function setRegex(body: string, negated: boolean): string {
+  let dash = false
+  let members = ''
+  const member = (char: string): string => (char === '\\' ? '\\\\' : char)
+  for (let i = 0; i < body.length; i++) {
+    let low = body[i]!
+    let high = low
+    if (body[i + 1] === '-' && i + 2 < body.length) {
+      high = body[i + 2]!
+      i += 2
+    }
+    if (low === '-' || high === '-') {
+      dash = true
+      if (low === high) continue
+      if (low === '-') low = '.'
+      else high = ','
+    }
+    members += low === high ? member(low) : `${member(low)}-${member(high)}`
+  }
+  const lead = dash ? '-' : ''
+  if (negated) return `[^${lead}/${members}]`
+  // Alone in its set, the `-` is as well written without one.
+  return members === '' ? '-' : `[${lead}${members}]`
 }
 
 /**
@@ -1117,10 +1269,10 @@ export function globToRegex(globPattern: string): string {
  * already does (a deny masks the whole subtree). Only ever widens a deny.
  *
  * Takes a whole pattern, so every character in it is glob syntax: right for
- * a spelling the caller wrote, which is what {@link readRuleCovers} passes.
- * A pattern the library anchored at a directory of its own goes through the
- * macOS `denyGlobEntryRegex`, which splices that directory back in escaped
- * and calls this for the tail.
+ * the pattern reading of a spelling the caller wrote, which is what
+ * {@link readRuleCovers} passes. A pattern anchored at a directory that is a
+ * name on disk goes through the macOS `denyGlobEntryRegex`, which splices
+ * that directory back in escaped and calls this for the tail.
  */
 export function denyGlobRegex(normalizedGlob: string): string {
   // globToRegex() always returns '^…$'.
@@ -1135,6 +1287,92 @@ export interface ExpandGlobOptions {
    * don't need it).
    */
   caseInsensitive?: boolean
+  /**
+   * A directory the pattern is walked beneath, taken as the name it is: a
+   * leading run of `globPath` that exists on disk and may itself hold `[`,
+   * `*` or `?`. Only what follows it is pattern. The glob dialect has no
+   * escape, so this is the one way to say where such a name ends. A
+   * `TypeError` is thrown for one that is empty or the root, or that
+   * `globPath` does not start with, up to a separator.
+   */
+  anchor?: string
+}
+
+/** The most directory entries the read-deny expansions of one read
+ *  configuration look at, all its patterns together, unless
+ *  `filesystem.denyReadGlobBudget` sets another. */
+export const GLOB_WALK_MAX_ENTRIES = 20_000_000
+
+/** The longest they take, all together, in milliseconds; likewise. */
+export const GLOB_WALK_TIMEOUT_MS = 60_000
+
+/**
+ * What the walks handed it may spend between them: one count and one
+ * deadline, so the patterns of one configuration cannot each spend a full one.
+ */
+export interface GlobWalkBudget {
+  /** The directory entries the walks may look at, together. */
+  readonly maxEntries: number
+  /** When the budget was made, as a `performance.now()` reading. */
+  readonly startedAt: number
+  /** When the walks must be done, the same way. */
+  readonly deadline: number
+  /** The directory entries looked at so far. */
+  entries: number
+}
+
+/** A budget nothing has been spent from, its clock starting now. */
+export function newGlobWalkBudget(
+  limits: { maxEntries?: number; timeoutMs?: number } = {},
+): GlobWalkBudget {
+  const startedAt = performance.now()
+  return {
+    maxEntries: limits.maxEntries ?? GLOB_WALK_MAX_ENTRIES,
+    startedAt,
+    deadline: startedAt + (limits.timeoutMs ?? GLOB_WALK_TIMEOUT_MS),
+    entries: 0,
+  }
+}
+
+/**
+ * Thrown by {@link walkGlobPattern} when its budget runs out. What it had
+ * found is not handed back: a deny list cut short is a path left readable.
+ */
+export class GlobWalkBudgetError extends Error {
+  /** The pattern being walked, as the caller wrote it. */
+  readonly pattern: string
+  /** The directory the walk was listing. */
+  readonly directory: string
+  /** Which limit was reached. */
+  readonly exhausted: 'entries' | 'time'
+  /** The entries looked at under the budget, by this walk and those before. */
+  readonly entries: number
+  /** Milliseconds since the budget was made. */
+  readonly elapsedMs: number
+  /** The entries the budget allowed. */
+  readonly maxEntries: number
+  /** The milliseconds it allowed. */
+  readonly timeoutMs: number
+  constructor(
+    pattern: string,
+    directory: string,
+    exhausted: 'entries' | 'time',
+    budget: GlobWalkBudget,
+  ) {
+    const elapsedMs = Math.round(performance.now() - budget.startedAt)
+    const timeoutMs = Math.round(budget.deadline - budget.startedAt)
+    super(
+      `Glob pattern ${pattern} was not walked to the end: ${budget.entries} directory entries looked at in ${elapsedMs} ms (the budget is ${budget.maxEntries} entries and ${timeoutMs} ms), stopped while listing ${directory}`,
+    )
+    this.name = 'GlobWalkBudgetError'
+    this.pattern = pattern
+    this.directory = directory
+    this.exhausted = exhausted
+    this.entries = budget.entries
+    this.elapsedMs = elapsedMs
+    this.maxEntries = budget.maxEntries
+    this.timeoutMs = timeoutMs
+  }
 }
 
 /** Successful listings, by real directory: a second position, or a second
@@ -1144,6 +1382,7 @@ export type GlobWalkListings = Map<string, fs.Dirent[]>
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
   followSymlinkedDirectories?: boolean
+  budget?: GlobWalkBudget
   /** Handed to every walk of one configuration, so that patterns with a
    *  base in common list each directory once between them. */
   listings?: GlobWalkListings
@@ -1204,9 +1443,10 @@ export interface GlobWalk {
    *  `realOf` has no entry for them. Unreadable now is not absent: a deny
    *  expansion must cover such a link rather than drop it. */
   uninspectableLinks: Set<string>
-  /** Directories the walk reached but could not list (any error but
-   *  absence). Whatever the pattern matches beneath them is missing from
-   *  `matches`; a deny expansion must cover them whole. */
+  /** Directories the walk could not list (any error but absence) under a
+   *  name it reached them by, each named once. What the pattern matches
+   *  beneath one can be missing from `matches`; a deny expansion must cover
+   *  them whole. */
   unlisted: string[]
   /** Where an entry of `matches`, `directoryMatches` or `unlisted` really
    *  lives, for each one that is a symlink or is spelled through one above
@@ -1214,6 +1454,11 @@ export interface GlobWalk {
    *  what was found through a symlinked directory, which is reported where
    *  it really lives to begin with. */
   realOf: Map<string, string>
+  /** How many directories were listed. */
+  directoriesListed: number
+  /** How many directory entries were looked at: each entry once for every
+   *  listing of its directory the pattern called for. */
+  entriesExamined: number
 }
 
 /**
@@ -1262,14 +1507,17 @@ export function expandGlobPattern(
  *
  * `splits` is false for a pattern this cannot be done for: one with a
  * wildcard inside a bracket expression (globToRegex rewrites that wildcard
- * like any other, and what is left no longer reads as one character), with a
- * second `[` that nothing closes, or that spells one of globToRegex's
- * placeholders. Its positions say nothing, so every directory is listed, an
- * entry is matched by its whole spelling, and {@link walkGlobPattern} does
- * not list such a pattern through symlinks.
+ * like any other, and what is left no longer reads as one character); and for
+ * one that is not split: over {@link MAX_GLOB_PIECES} pieces, or with a piece
+ * that does not compile on its own (`whyNot` says which). Its positions say
+ * nothing, so every directory is listed, an entry is matched by its whole
+ * spelling, and {@link walkGlobPattern} does not list such a pattern through
+ * symlinks.
  */
 interface GlobPositions {
   splits: boolean
+  /** Why a pattern of a shape that splits was not, for the walk's warning. */
+  whyNot?: string
   /** The positions beneath the root directory. */
   start: readonly number[]
   next: (positions: readonly number[], name: string) => readonly number[]
@@ -1284,7 +1532,7 @@ interface GlobPositions {
     spelled: string,
   ) => boolean
   /** The same for the pattern without its trailing `/**`; never true for a
-   *  pattern that has none. */
+   *  pattern that has none, nor when the directory form was not asked for. */
   matchesDirectoryForm: (
     positions: readonly number[],
     name: string,
@@ -1302,11 +1550,8 @@ type GlobPiece =
   | { source: string; canBeSeparator?: true }
 
 function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
-  // globToRegex rewrites its own placeholders where a pattern spells one.
-  if (pattern.includes('__GLOBSTAR')) return undefined
   const sourceOf = (text: string): string => globToRegex(text).slice(1, -1)
   const pieces: GlobPiece[] = []
-  let unclosed = 0
   // A bracket expression first, the way a regular expression reads one:
   // everything up to the first `]`. Then a run of `*` with the separator
   // after it, since `**/` is one thing to globToRegex.
@@ -1334,9 +1579,6 @@ function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
     } else if (separator !== undefined) {
       pieces.push('/')
     } else {
-      // globToRegex escapes the first `[` that nothing closes and no other:
-      // a second one reads on into whatever a later wildcard is rewritten to.
-      if (text === '[' && unclosed++ > 0) return undefined
       pieces.push({ source: sourceOf(text) })
     }
   }
@@ -1348,16 +1590,34 @@ function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
   )
 }
 
+/** The most pieces a pattern is split into, which bounds the recursion that
+ *  builds the automaton (one call per path component). A longer pattern is
+ *  matched against real paths instead. */
+const MAX_GLOB_PIECES = 1024
+
 function globPositions(
   normalizedPattern: string,
   flags: string,
+  withDirectoryForm: boolean,
 ): GlobPositions {
-  const regex = new RegExp(globToRegex(normalizedPattern), flags)
-  const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
-  const directoryRegex =
-    directoryForm !== normalizedPattern
-      ? new RegExp(globToRegex(directoryForm), flags)
-      : undefined
+  const directoryForm = withDirectoryForm
+    ? removeTrailingGlobSuffix(normalizedPattern)
+    : normalizedPattern
+  let regex: RegExp
+  let directoryRegex: RegExp | undefined
+  try {
+    regex = new RegExp(globToRegex(normalizedPattern), flags)
+    directoryRegex =
+      directoryForm !== normalizedPattern
+        ? new RegExp(globToRegex(directoryForm), flags)
+        : undefined
+  } catch (err) {
+    // A pattern that is no regular expression would match nothing and deny
+    // nothing, silently: it is raised as the configuration error it is.
+    throw new Error(
+      `Glob pattern ${normalizedPattern} does not compile, so nothing can match it: ${err}`,
+    )
+  }
   const unsplit: GlobPositions = {
     splits: false,
     start: [0],
@@ -1388,9 +1648,12 @@ function globPositions(
       const known = memo.get(key)
       if (known !== undefined) return known
       if (!lead && pieces[i] === 'anyDirs') {
-        const id = globstar(undefined)
+        // Held before it is complete: what follows the `**` can lead back to
+        // this very position, which has to be in the memo by then.
+        const state: Globstar = { then: undefined }
+        const id = states.push(state) - 1
         memo.set(key, id)
-        ;(states[id] as Globstar).then = componentAt(i + 1, false)
+        state.then = componentAt(i + 1, false)
         return id
       }
       if (!lead && pieces[i] === 'any' && i === pieces.length - 1) {
@@ -1441,13 +1704,21 @@ function globPositions(
     const directoryPieces = directoryRegex
       ? globPieces(directoryForm, flags)
       : []
+    // A shape globPieces is documented not to take.
     if (pieces === undefined || directoryPieces === undefined) return unsplit
+    if (pieces.length + directoryPieces.length > MAX_GLOB_PIECES) {
+      return {
+        ...unsplit,
+        whyNot: `it has more than ${MAX_GLOB_PIECES} pieces`,
+      }
+    }
     starts = [build(pieces)]
     firstOfDirectoryForm = states.length
     if (directoryRegex) starts.push(build(directoryPieces))
-  } catch {
-    // A piece of the pattern that is no regular expression on its own.
-    return unsplit
+  } catch (err) {
+    // A piece of the pattern that is no regular expression on its own, or an
+    // automaton too deep to build.
+    return { ...unsplit, whyNot: String(err) }
   }
 
   const open = (into: Set<number>, position: number | undefined): void => {
@@ -1457,8 +1728,6 @@ function globPositions(
       p = 'then' in state ? state.then : undefined
     }
   }
-  const sorted = (positions: Set<number>): readonly number[] =>
-    [...positions].sort((x, y) => x - y)
   const endsAt = (
     positions: readonly number[],
     name: string,
@@ -1475,7 +1744,7 @@ function globPositions(
   for (const p of starts) open(start, p)
   return {
     splits: true,
-    start: sorted(start),
+    start: [...start],
     next: (positions, name) => {
       const next = new Set<number>()
       for (const p of positions) {
@@ -1489,7 +1758,7 @@ function globPositions(
           }
         }
       }
-      return sorted(next)
+      return [...next]
     },
     matches: (positions, name) => endsAt(positions, name, false),
     matchesDirectoryForm: (positions, name) => endsAt(positions, name, true),
@@ -1499,19 +1768,39 @@ function globPositions(
 /**
  * The literal directory a glob's walk starts from: the static prefix before
  * the pattern's first glob character, without its last path component when
- * that component is not a directory of its own. '' or '/' means the pattern
- * has no literal directory to start from (a wildcard in its first path
- * component), which {@link walkGlobPattern} refuses to expand.
+ * that component is not a directory of its own. Never carries a trailing
+ * separator, except for the root itself: split into path components, it
+ * would end in an empty name no position can consume, and the pattern would
+ * match nothing. A drive root comes back as 'C:', the root of a UNC share as
+ * '//server/share'. '/', and '' for a pattern with a wildcard in its first
+ * path component, are what {@link globBaseDirIsRoot} refuses.
  *
  * @param normalizedPattern - a pattern already through
- * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes})
+ * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes}),
+ * or the tail of one that is walked beneath an anchor
  */
 export function globPatternBaseDir(normalizedPattern: string): string {
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
   if (!staticPrefix) return ''
-  return staticPrefix.endsWith('/')
+  const baseDir = staticPrefix.endsWith('/')
     ? staticPrefix.slice(0, -1)
     : path.dirname(staticPrefix)
+  // path.dirname keeps the separator of a root it returns ('C:/').
+  return baseDir.length > 1 && baseDir.endsWith('/')
+    ? baseDir.slice(0, -1)
+    : baseDir
+}
+
+/**
+ * Whether a base from {@link globPatternBaseDir} is one no walk starts from:
+ * nothing at all, or the root, '/', from which a walk (`/**\/*.pem`) would
+ * list every filesystem the machine has mounted. A drive root ('C:') and the
+ * root of a UNC share ('//server/share') are bases like any other: each is
+ * one volume, which the entry names itself. Refused, every such pattern
+ * would go unenforced.
+ */
+export function globBaseDirIsRoot(baseDir: string): boolean {
+  return baseDir === '' || baseDir === '/'
 }
 
 /**
@@ -1530,6 +1819,9 @@ export function toForwardSlashes(s: string): string {
  * `globPath` without its trailing `/**`, with the symlinks seen recorded.
  * With `followSymlinkedDirectories` it also lists through a symlinked
  * directory and reports every match where it really lives.
+ *
+ * With a `budget` it throws {@link GlobWalkBudgetError} once that is spent.
+ * One step is not cut short: a filesystem call that blocks, or a slow match.
  */
 export function walkGlobPattern(
   globPath: string,
@@ -1551,13 +1843,37 @@ export function* walkGlobPatternSteps(
     uninspectableLinks: new Set(),
     unlisted: [],
     realOf: new Map(),
+    directoriesListed: 0,
+    entriesExamined: 0,
   }
 
-  const normalizedPattern = toForwardSlashes(normalizePathForSandbox(globPath))
-  const baseDir = globPatternBaseDir(normalizedPattern)
-  if (baseDir === '' || baseDir === '/') {
+  // Beneath an anchor the pattern is the tail alone, so no character of the
+  // anchor is compiled; the walk starts at the anchor plus the tail's base.
+  const anchor =
+    opts.anchor === undefined ? undefined : toForwardSlashes(opts.anchor)
+  const normalizedPattern =
+    anchor === undefined
+      ? toForwardSlashes(normalizePathForSandbox(globPath))
+      : toForwardSlashes(globPath).slice(anchor.length)
+  // The tail is cut by length, so a wrong anchor would walk another directory
+  // and hand back its matches. Thrown, not skipped: a skipped deny is lost.
+  if (
+    anchor !== undefined &&
+    (!/[^/]/.test(anchor) ||
+      !toForwardSlashes(globPath).startsWith(anchor) ||
+      !(anchor.endsWith('/') || /^(\/|$)/.test(normalizedPattern)))
+  ) {
+    throw new TypeError(
+      `Glob pattern ${globPath} does not lie beneath the anchor ${opts.anchor}`,
+    )
+  }
+  const patternBaseDir = globPatternBaseDir(normalizedPattern)
+  const baseDirBelowAnchor = patternBaseDir === '/' ? '' : patternBaseDir
+  const baseDir =
+    anchor === undefined ? patternBaseDir : anchor + baseDirBelowAnchor
+  if (globBaseDirIsRoot(baseDir)) {
     logForDebugging(
-      `[Sandbox] Glob pattern has no literal directory to start from, skipping: ${globPath}`,
+      `[Sandbox] Glob pattern has no literal directory below the root to start from, skipping: ${globPath}`,
       { level: 'warn' },
     )
     return walk
@@ -1565,10 +1881,16 @@ export function* walkGlobPatternSteps(
 
   // `s`: a name may hold a line terminator, which `.` alone does not match.
   const flags = opts.caseInsensitive ? 'is' : 's'
-  const positions = globPositions(normalizedPattern, flags)
+  const positions = globPositions(
+    normalizedPattern,
+    flags,
+    opts.withDirectoryForm === true,
+  )
   if (opts.followSymlinkedDirectories && !positions.splits) {
+    // The weaker reading, said out loud where it costs coverage.
+    const why = positions.whyNot === undefined ? '' : ` (${positions.whyNot})`
     logForDebugging(
-      `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time, so it is matched against real paths only and not through symlinked directories`,
+      `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time${why}, so it is matched against real paths only and not through symlinked directories`,
       { level: 'warn' },
     )
   }
@@ -1601,12 +1923,44 @@ export function* walkGlobPatternSteps(
     short: string
     positions: readonly number[]
   }
-  /** The positions each real directory has been listed for. */
-  const listedFor = new Map<string, Set<number>>()
+  /**
+   * What the walk knows about one real directory, whatever the names that
+   * lead to it. A listing failure is not recorded against its positions: it
+   * can belong to the name the listing was tried under (a real path too long
+   * to name) while the directory is there under another, and letting that
+   * name answer for the others would drop every match beneath it.
+   */
+  type DirectoryRecord = {
+    /** The positions it has been listed for, each of them successfully. */
+    listedFor: Set<number>
+    /** Whether it is already in `walk.unlisted`, which names it once. */
+    unlisted?: true
+  }
+  const records = new Map<string, DirectoryRecord>()
   const listings: GlobWalkListings = opts.listings ?? new Map()
   const pending: Frame[] = []
-  /** A filesystem call on a real path, and on a shorter name for it when that
-   *  fails. The real path crosses no link, so a long chain of them cannot
+  /** Counts one more entry of `dir` looked at, or none before a listing, and
+   *  throws once the budget is spent. The clock is read every time: what one
+   *  entry costs is not bounded, so a stride would not bound the time. Called
+   *  outside every `try` here, so a spent budget is never taken for a
+   *  directory that could not be listed. */
+  const spend = (dir: string, entries: 0 | 1): void => {
+    walk.entriesExamined += entries
+    const budget = opts.budget
+    if (budget === undefined) return
+    budget.entries += entries
+    if (budget.entries > budget.maxEntries) {
+      throw new GlobWalkBudgetError(globPath, dir, 'entries', budget)
+    }
+    if (performance.now() >= budget.deadline) {
+      throw new GlobWalkBudgetError(globPath, dir, 'time', budget)
+    }
+  }
+  /** A filesystem call on a real path, and on a shorter name for it when the
+   *  real path is too long to name. Nothing else is retried: every other
+   *  errno belongs to the object, and the short name crosses links a
+   *  sandboxed command can repoint, so an unreadable directory could read as
+   *  absent. The real path crosses no link, so a long chain of them cannot
    *  fail the call (ELOOP). */
   const onRealPath = <T>(
     real: string,
@@ -1616,7 +1970,15 @@ export function* walkGlobPatternSteps(
     try {
       return call(real)
     } catch (err) {
-      if (short === real) throw err
+      if (
+        short === real ||
+        (err as NodeJS.ErrnoException | undefined)?.code !== 'ENAMETOOLONG'
+      ) {
+        throw err
+      }
+      logForDebugging(
+        `[Sandbox] ${real} is too long to name for glob pattern ${globPath}; looking at ${short} instead`,
+      )
       return call(short)
     }
   }
@@ -1646,48 +2008,63 @@ export function* walkGlobPatternSteps(
     return target
   }
 
-  let baseReal = baseDir
+  // The base as the filesystem is asked about it: a drive root gets back its
+  // separator, since 'C:' on its own names the drive's current directory.
+  // The positions are still reached from the base without one.
+  const baseSpelling = /^[A-Za-z]:$/.test(baseDir) ? `${baseDir}/` : baseDir
+  let baseReal = baseSpelling
   try {
-    baseReal = fs.realpathSync(baseDir)
+    baseReal = fs.realpathSync(baseSpelling)
   } catch {
     // Not there, or a component of it cannot be resolved: list the spelling.
   }
   walk.baseLocation = baseReal
   pending.push({
-    dir: baseDir,
+    dir: baseSpelling,
     real: baseReal,
-    short: baseDir.length < baseReal.length ? baseDir : baseReal,
-    positions: baseDir.split('/').reduce(positions.next, positions.start),
+    short: baseSpelling.length < baseReal.length ? baseSpelling : baseReal,
+    positions: (anchor === undefined ? baseDir : baseDirBelowAnchor)
+      .split('/')
+      .reduce(positions.next, positions.start),
   })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real } = frame
-    let listed = listedFor.get(real)
-    if (listed === undefined) listedFor.set(real, (listed = new Set()))
+    const record: DirectoryRecord = records.get(real) ?? {
+      listedFor: new Set(),
+    }
+    records.set(real, record)
     // What a position finds beneath a directory does not depend on the
     // others it came with, so only the ones new to this directory are taken.
-    const fresh = frame.positions.filter(p => !listed.has(p))
+    const fresh = frame.positions.filter(p => !record.listedFor.has(p))
     if (fresh.length === 0) continue
     yield
-    for (const p of fresh) listed.add(p)
+    // After the step, in which time can have passed, and before the listing.
+    spend(dir, 0)
     let entries = listings.get(real)
-    try {
-      entries ??= onRealPath(real, frame.short, p =>
-        fs.readdirSync(p, { withFileTypes: true }),
-      )
-      listings.set(real, entries)
-    } catch (err) {
-      const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
-      logForDebugging(
-        `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
-        { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
-      )
-      if (errorCode !== 'ENOENT') {
-        walk.unlisted.push(dir)
-        if (real !== dir) walk.realOf.set(dir, real)
+    if (entries === undefined) {
+      try {
+        entries = onRealPath(real, frame.short, p =>
+          fs.readdirSync(p, { withFileTypes: true }),
+        )
+        listings.set(real, entries)
+      } catch (err) {
+        const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+        logForDebugging(
+          `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
+          { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
+        )
+        if (errorCode !== 'ENOENT' && !record.unlisted) {
+          record.unlisted = true
+          walk.unlisted.push(dir)
+          if (real !== dir) walk.realOf.set(dir, real)
+        }
+        continue
       }
-      continue
     }
+    for (const p of fresh) record.listedFor.add(p)
     for (const entry of entries) {
+      // Before the skip below: an entry it passes over was looked at too.
+      spend(dir, 1)
       // Nearly every entry of a large tree: a plain file the pattern does not
       // match, which nothing below records. A pattern that splits is matched
       // by name, so no path need be spelled to find that out.
@@ -1701,7 +2078,14 @@ export function* walkGlobPatternSteps(
       }
       const fullPath = path.join(dir, entry.name)
       const realPath = path.join(real, entry.name)
-      const candidate = toForwardSlashes(fullPath)
+      // A pattern that does not split is matched by its whole spelling, and
+      // beneath an anchor that is the spelling from the anchor on. It is never
+      // listed through a link, so every path it sees starts with the anchor.
+      const spelled = toForwardSlashes(fullPath)
+      const candidate =
+        anchor !== undefined && spelled.startsWith(anchor)
+          ? spelled.slice(anchor.length)
+          : spelled
       const isMatch = positions.matches(fresh, entry.name, candidate)
       if (isMatch) walk.matches.push(fullPath)
       if (entry.isDirectory()) {
@@ -1776,6 +2160,10 @@ export function* walkGlobPatternSteps(
         )
         continue
       }
+      // The one line that names the link: matches are reported by real path.
+      logForDebugging(
+        `[Sandbox] Following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}`,
+      )
       pending.push({
         dir: target.real,
         real: target.real,
@@ -1785,5 +2173,9 @@ export function* walkGlobPatternSteps(
     }
   }
 
+  // Not `records.size`: that counts a directory that could not be listed too.
+  for (const record of records.values()) {
+    if (record.listedFor.size > 0) walk.directoriesListed++
+  }
   return walk
 }
