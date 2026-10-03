@@ -832,6 +832,7 @@ function createManager(legacySingleton: boolean): ISandboxManager {
         seccompConfig: config?.seccomp,
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        enableWeakerNestedSandbox: config?.enableWeakerNestedSandbox,
       })
       errors.push(...linuxDeps.errors)
       warnings.push(...linuxDeps.warnings)

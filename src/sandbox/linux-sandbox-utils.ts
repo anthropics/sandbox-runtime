@@ -3,7 +3,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
@@ -463,6 +463,60 @@ export type LinuxDependencyOptions = {
   seccompConfig?: SeccompConfig
   bwrapPath?: string
   socatPath?: string
+  /**
+   * When false (the default secure mode), dependency checks probe whether
+   * bwrap can mount a private /proc. This fails in unprivileged containers
+   * (e.g. Docker's default), where the fix is to enable the weaker nested
+   * sandbox. Skip the probe when the weaker mode is already requested.
+   */
+  enableWeakerNestedSandbox?: boolean
+}
+
+// Probing spawns bwrap, so cache the result per resolved binary for the
+// lifetime of the process.
+const procMountProbeCache = new Map<string, boolean>()
+
+/**
+ * Probe whether bwrap can mount a private /proc with the same namespace flags
+ * the secure path uses (`--unshare-user --cap-drop ALL --unshare-pid --proc
+ * /proc`). Returns true when the mount succeeds. In unprivileged containers
+ * this fails with "Can't mount proc on /newroot/proc: Operation not
+ * permitted", which otherwise surfaces cryptically on every command.
+ */
+export function canMountPrivateProc(bwrapPath?: string): boolean {
+  const bwrap = bwrapPath ?? 'bwrap'
+  const cached = procMountProbeCache.get(bwrap)
+  if (cached !== undefined) return cached
+
+  const trueBin = whichSync('true') ?? '/bin/true'
+  const result = spawnSync(
+    bwrap,
+    [
+      '--ro-bind',
+      '/',
+      '/',
+      '--unshare-user',
+      '--cap-drop',
+      'ALL',
+      '--unshare-pid',
+      '--proc',
+      '/proc',
+      '--',
+      trueBin,
+    ],
+    { stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, encoding: 'utf8' },
+  )
+
+  // On spawn failure (e.g. bwrap missing) don't claim a proc-mount problem;
+  // the missing-binary check reports that separately.
+  const ok =
+    result.error !== undefined
+      ? true
+      : result.status === 0 ||
+        !/Operation not permitted|Can't mount proc/i.test(result.stderr ?? '')
+
+  procMountProbeCache.set(bwrap, ok)
+  return ok
 }
 
 function isExecutable(p: string): boolean {
@@ -523,6 +577,24 @@ export function checkLinuxDependencies(
     getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
   ) {
     warnings.push('seccomp not available - unix socket access not restricted')
+  }
+
+  // Secure mode mounts a private /proc (--proc /proc). In unprivileged
+  // containers that EPERMs, and every sandboxed command then fails with an
+  // opaque "bwrap: Can't mount proc on /newroot/proc". Probe once and point
+  // at the fix instead. Only when bwrap is actually present.
+  if (
+    !opts?.enableWeakerNestedSandbox &&
+    errors.length === 0 &&
+    !canMountPrivateProc(bwrapPath)
+  ) {
+    errors.push(
+      'bubblewrap cannot mount a private /proc, which is expected in ' +
+        "unprivileged containers (e.g. Docker's default). Set " +
+        '"enableWeakerNestedSandbox": true in the sandbox config to run here ' +
+        '(note: this weakens isolation), or grant the container the required ' +
+        'namespace privileges.',
+    )
   }
 
   return { warnings, errors }
