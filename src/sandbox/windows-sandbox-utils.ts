@@ -14,6 +14,7 @@ import {
   containsGlobCharsWin,
   expandGlobPattern,
   isUncPath,
+  windowsEnvNameKey,
 } from './sandbox-utils.js'
 // Kept on this module's surface for out-of-tree importers; the
 // implementations live in sandbox-utils.ts.
@@ -378,12 +379,27 @@ export interface WindowsSandboxParams {
    * Threaded through the `--env` overlay so the runner forwards
    * them into the child's fresh profile env (the broker's own
    * environment never reaches the child, so an `env -u`-style
-   * scrub is structurally moot — there is no `unsetEnvVars`).
+   * scrub of inherited vars is structurally moot — see
+   * {@link unsetEnvVars}).
    * Applied BEFORE the proxy assignments so the sandbox's own
    * proxy plumbing survives even if a caller masks one of those
    * names — same precedence as macOS/Linux.
    */
   setEnvVars?: Readonly<Record<string, string>>
+  /**
+   * `mode: 'deny'` credential env-var names. On Windows the deny is
+   * already structural — the child starts from a fresh `srt-sandbox`
+   * profile env, never the broker's — so unlike POSIX there is no
+   * inherited environment to scrub. This list exists as the
+   * belt-and-braces guarantee at the overlay chokepoint: any ambient
+   * host value the overlay forwards (today PATH/PATHEXT) is filtered
+   * against it, matched ordinal case-insensitively because Windows
+   * env names are case-insensitive — a deny of `GITHUB_TOKEN` also
+   * covers a host spelling of `GiThUb_ToKeN`. Masked sentinels and
+   * the sandbox's own plumbing (proxy/git sets) still override a
+   * deny of the same name — the POSIX `env -u … VAR=…` precedence.
+   */
+  unsetEnvVars?: readonly string[]
   /**
    * Per-exec read-deny paths, applied via an additive
    * `(D;OICI;FA;;;<sb-SID>)` ACE under the `srt-win exec`
@@ -2087,15 +2103,47 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // same precedence as the macOS/Linux `env -u … VAR=…
   // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
   // (which composes against setEnvVars) wins.
-  const overlay: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    PATHEXT: process.env.PATHEXT,
-    ...(p.setEnvVars ?? {}),
-    ...generated,
-    ...gitCfg,
+  //
+  // Windows env-var names are case-insensitive, so the overlay is
+  // keyed on an ordinal case fold (windowsEnvNameKey — the same
+  // ASCII fold srt-win's build_env_block uses to match overlay
+  // entries against the profile base):
+  //  - the ambient forwards (PATH/PATHEXT) are filtered against the
+  //    `mode: 'deny'` names case-insensitively, so a denied name
+  //    cannot ride the overlay under a case-variant spelling;
+  //  - case-variant spellings carrying DIFFERENT values collapse to
+  //    the later writer (srt-win preserves duplicates verbatim, and
+  //    which one the child's getenv resolves would otherwise depend
+  //    on env-block sort order) — so the precedence above holds
+  //    across spellings too;
+  //  - same-value case twins (HTTP_PROXY/http_proxy, deliberately
+  //    both emitted for case-SENSITIVE lookups by POSIX-ported
+  //    tools under msys2) are all kept.
+  type OverlayGroup = { value: string; members: Map<string, string> }
+  const overlay = new Map<string, OverlayGroup>()
+  const overlayPut = (name: string, value: string | undefined): void => {
+    if (value === undefined) return
+    const key = windowsEnvNameKey(name)
+    const group = overlay.get(key)
+    if (group === undefined || group.value !== value) {
+      overlay.set(key, { value, members: new Map([[name, value]]) })
+    } else {
+      group.members.set(name, value)
+    }
   }
-  for (const [k, v] of Object.entries(overlay)) {
-    if (v !== undefined) argv.push('--env', `${k}=${v}`)
+  const denyKeys = new Set((p.unsetEnvVars ?? []).map(windowsEnvNameKey))
+  for (const ambient of ['PATH', 'PATHEXT'] as const) {
+    if (!denyKeys.has(windowsEnvNameKey(ambient))) {
+      overlayPut(ambient, process.env[ambient])
+    }
+  }
+  for (const [k, v] of Object.entries(p.setEnvVars ?? {})) overlayPut(k, v)
+  for (const [k, v] of Object.entries(generated)) overlayPut(k, v)
+  for (const [k, v] of Object.entries(gitCfg)) overlayPut(k, v)
+  for (const group of overlay.values()) {
+    for (const [k, v] of group.members) {
+      argv.push('--env', `${k}=${v}`)
+    }
   }
   argv.push('--')
 

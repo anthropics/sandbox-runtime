@@ -12,6 +12,7 @@ import {
   SENTINEL_PREFIX,
 } from '../../src/sandbox/credential-sentinel.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import * as platform from '../../src/utils/platform.js'
 import { isLinux } from '../helpers/platform.js'
 
 /**
@@ -604,3 +605,71 @@ describe.if(isLinux)(
     }, 20000)
   },
 )
+
+describe('env-name case semantics: Windows folds, POSIX stays exact', () => {
+  // Windows env-var names are case-insensitive — `GiThUb_ToKeN` in the
+  // host env IS the `GITHUB_TOKEN` a credentials entry names — so the
+  // mask lookup must fold case there (ordinal/ASCII, mirroring Win32
+  // GetEnvironmentVariableW). POSIX env names are case-sensitive and a
+  // mixed-case spelling is a DIFFERENT variable: the lookup must stay
+  // exact or masking would clobber unrelated vars.
+  const mockPlatform = (p: 'windows' | 'linux' | 'macos') => {
+    const spy = spyOn(platform, 'getPlatform')
+    spy.mockReturnValue(p)
+    return spy
+  }
+
+  test('win32: mixed-case host spelling matches the mask entry', () => {
+    const spy = mockPlatform('windows')
+    try {
+      const reg = new SentinelRegistry()
+      const { setEnvVars } = buildMaskedEnvVars(
+        [{ name: 'GITHUB_TOKEN', mode: 'mask' }],
+        ['api.github.com'],
+        reg,
+        { GiThUb_ToKeN: 'ghp_real_secret' },
+      )
+      const fake = setEnvVars['GITHUB_TOKEN']!
+      expect(fake.startsWith(SENTINEL_PREFIX)).toBe(true)
+      expect(reg.lookupReal(fake)).toBe('ghp_real_secret')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test('win32: an exact-spelling key wins over a case-variant', () => {
+    const spy = mockPlatform('windows')
+    try {
+      const reg = new SentinelRegistry()
+      const { setEnvVars } = buildMaskedEnvVars(
+        [{ name: 'GITHUB_TOKEN', mode: 'mask' }],
+        ['api.github.com'],
+        reg,
+        { GiThUb_ToKeN: 'variant', GITHUB_TOKEN: 'exact' },
+      )
+      expect(reg.lookupReal(setEnvVars['GITHUB_TOKEN']!)).toBe('exact')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  test('POSIX: mixed-case host spelling does NOT match (case-sensitive)', () => {
+    const spy = mockPlatform('linux')
+    try {
+      const reg = new SentinelRegistry()
+      const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
+        [{ name: 'GITHUB_TOKEN', mode: 'mask' }],
+        ['api.github.com'],
+        reg,
+        { GiThUb_ToKeN: 'ghp_real_secret' },
+      )
+      // Nothing to protect under POSIX semantics: no sentinel, no
+      // set-var, no degrade — the entry is skipped entirely.
+      expect(setEnvVars).toEqual({})
+      expect(degradeToUnsetNames).toEqual([])
+      expect(reg.size).toBe(0)
+    } finally {
+      spy.mockRestore()
+    }
+  })
+})
