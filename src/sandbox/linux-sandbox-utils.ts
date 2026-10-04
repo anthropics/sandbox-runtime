@@ -281,14 +281,14 @@ function findFirstNonExistentComponent(targetPath: string): string {
  */
 export function linuxGetCwdMandatoryDenyPaths(
   allowGitConfig = false,
+  root: string = process.cwd(),
 ): string[] {
-  const cwd = process.cwd()
   // Note: Settings files are added at the callsite in sandbox-manager.ts
   const denyPaths = [
-    // Dangerous files in CWD
-    ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
-    // Dangerous directories in CWD
-    ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
+    // Dangerous files in root
+    ...DANGEROUS_FILES.map(f => path.resolve(root, f)),
+    // Dangerous directories in root
+    ...getDangerousDirectories().map(d => path.resolve(root, d)),
   ]
 
   // Git hooks and config are only denied when .git exists as a directory.
@@ -296,7 +296,7 @@ export function linuxGetCwdMandatoryDenyPaths(
   // .git/hooks can never exist — denying it would cause bwrap to fail.
   // When .git doesn't exist at all, mounting at .git would block its
   // creation and break git init.
-  const dotGitPath = path.resolve(cwd, '.git')
+  const dotGitPath = path.resolve(root, '.git')
   let dotGitIsDirectory = false
   try {
     dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
@@ -306,11 +306,11 @@ export function linuxGetCwdMandatoryDenyPaths(
 
   if (dotGitIsDirectory) {
     // Git hooks always blocked for security
-    denyPaths.push(path.resolve(cwd, '.git/hooks'))
+    denyPaths.push(path.resolve(root, '.git/hooks'))
 
     // Git config conditionally blocked based on allowGitConfig setting
     if (!allowGitConfig) {
-      denyPaths.push(path.resolve(cwd, '.git/config'))
+      denyPaths.push(path.resolve(root, '.git/config'))
     }
   }
 
@@ -390,14 +390,27 @@ async function linuxGetMandatoryDenyPaths(
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  scanRoots: string[] = [process.cwd()],
 ): Promise<string[]> {
-  const cwd = process.cwd()
   // Use provided signal or create a fallback controller
   const fallbackController = new AbortController()
   const signal = abortSignal ?? fallbackController.signal
   const dangerousDirectories = getDangerousDirectories()
 
-  const denyPaths = linuxGetCwdMandatoryDenyPaths(allowGitConfig)
+  const deduplicatedRoots = [
+    ...new Set(scanRoots.map(r => path.resolve(r))),
+  ].filter(r => {
+    try {
+      return fs.existsSync(r) && fs.statSync(r).isDirectory()
+    } catch {
+      return false
+    }
+  })
+  if (deduplicatedRoots.length === 0) {
+    deduplicatedRoots.push(process.cwd())
+  }
+
+  const denyPaths: string[] = []
 
   // Build iglob args for all patterns in one ripgrep call
   const iglobArgs: string[] = []
@@ -416,89 +429,93 @@ async function linuxGetMandatoryDenyPaths(
     iglobArgs.push('--iglob', '**/.git/config')
   }
 
-  // Single ripgrep call to find all dangerous paths in subdirectories
-  // Limit depth for performance - deeply nested dangerous files are rare
-  // and the security benefit doesn't justify the traversal cost
-  //
-  // ripgrep lists files, and its depth is the file's. `sub/.vscode/x` and
-  // `sub/.git/config` lie at `maxDepth`; `sub/.git/hooks/pre-commit`, of the
-  // same directory, one level further down.
-  let matches: string[] = []
-  try {
-    matches = await ripGrep(
-      [
-        '--files',
-        '--hidden',
-        // INVARIANT: no file decides what is listed. An ignore file that names
-        // a directory hides all beneath it, and a configuration file can add
-        // any flag; both are files in or above the tree.
-        '--no-ignore',
-        '--no-config',
-        // Into a pipe ripgrep writes by the block, and killed it drops the
-        // block: it would have listed nothing.
-        '--line-buffered',
-        '--max-depth',
-        String(maxDepth + 1),
-        ...iglobArgs,
-        '-g',
-        '!**/node_modules/**',
-      ],
-      cwd,
-      signal,
-      ripgrepConfig,
-    )
-  } catch (error) {
-    // Stopped, it found nothing: the caller must not be handed a command
-    // without the denies it would have found.
-    signal.throwIfAborted()
-    // INVARIANT: what ripgrep listed counts, however it ended. It exits 2 if
-    // there was a directory it could not read, having listed the rest, and is
-    // killed after ten seconds. What it had not come to by then is not denied.
-    if (error instanceof RipgrepError) {
-      matches = error.listed
-      // A read-only bind also keeps the command from giving the mode back.
-      denyPaths.push(...unreadableDirectories(error.stderr, cwd, maxDepth))
-    }
-    logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`, {
-      level: 'warn',
-    })
-  }
+  for (const root of deduplicatedRoots) {
+    denyPaths.push(...linuxGetCwdMandatoryDenyPaths(allowGitConfig, root))
 
-  // The names a match can lie under, by path component.
-  const directoryNames = [
-    ...dangerousDirectories,
-    '.git/hooks',
-    '.git/config',
-    '.git/HEAD',
-  ].map(name => normalizeCaseForComparison(name).split('/'))
-  for (const match of matches) {
-    const segments = path
-      .relative(cwd, path.resolve(cwd, match))
-      .split(path.sep)
-    const lower = segments.map(normalizeCaseForComparison)
-    // Where the dangerous name begins and how long it is: the first of
-    // `directoryNames` on the way down, else the file itself.
-    let at = segments.length - 1
-    let length = 1
-    // How deep the directory holding the name, `at`, may lie. One level less
-    // for `directoryNames`, all alike: each costs mounts that keep what holds
-    // it from being renamed or removed, and bwrap's start grows with them.
-    let deepest = maxDepth - 1
-    search: for (let i = 0; i < lower.length; i++) {
-      for (const name of directoryNames) {
-        if (name.every((component, k) => lower[i + k] === component)) {
-          at = i
-          length = name.length
-          deepest = maxDepth - 2
-          break search
+    // Single ripgrep call to find all dangerous paths in subdirectories
+    // Limit depth for performance - deeply nested dangerous files are rare
+    // and the security benefit doesn't justify the traversal cost
+    //
+    // ripgrep lists files, and its depth is the file's. `sub/.vscode/x` and
+    // `sub/.git/config` lie at `maxDepth`; `sub/.git/hooks/pre-commit`, of the
+    // same directory, one level further down.
+    let matches: string[] = []
+    try {
+      matches = await ripGrep(
+        [
+          '--files',
+          '--hidden',
+          // INVARIANT: no file decides what is listed. An ignore file that names
+          // a directory hides all beneath it, and a configuration file can add
+          // any flag; both are files in or above the tree.
+          '--no-ignore',
+          '--no-config',
+          // Into a pipe ripgrep writes by the block, and killed it drops the
+          // block: it would have listed nothing.
+          '--line-buffered',
+          '--max-depth',
+          String(maxDepth + 1),
+          ...iglobArgs,
+          '-g',
+          '!**/node_modules/**',
+        ],
+        root,
+        signal,
+        ripgrepConfig,
+      )
+    } catch (error) {
+      // Stopped, it found nothing: the caller must not be handed a command
+      // without the denies it would have found.
+      signal.throwIfAborted()
+      // INVARIANT: what ripgrep listed counts, however it ended. It exits 2 if
+      // there was a directory it could not read, having listed the rest, and is
+      // killed after ten seconds. What it had not come to by then is not denied.
+      if (error instanceof RipgrepError) {
+        matches = error.listed
+        // A read-only bind also keeps the command from giving the mode back.
+        denyPaths.push(...unreadableDirectories(error.stderr, root, maxDepth))
+      }
+      logForDebugging(`[Sandbox] ripgrep scan failed: ${error}`, {
+        level: 'warn',
+      })
+    }
+
+    // The names a match can lie under, by path component.
+    const directoryNames = [
+      ...dangerousDirectories,
+      '.git/hooks',
+      '.git/config',
+      '.git/HEAD',
+    ].map(name => normalizeCaseForComparison(name).split('/'))
+    for (const match of matches) {
+      const segments = path
+        .relative(root, path.resolve(root, match))
+        .split(path.sep)
+      const lower = segments.map(normalizeCaseForComparison)
+      // Where the dangerous name begins and how long it is: the first of
+      // `directoryNames` on the way down, else the file itself.
+      let at = segments.length - 1
+      let length = 1
+      // How deep the directory holding the name, `at`, may lie. One level less
+      // for `directoryNames`, all alike: each costs mounts that keep what holds
+      // it from being renamed or removed, and bwrap's start grows with them.
+      let deepest = maxDepth - 1
+      search: for (let i = 0; i < lower.length; i++) {
+        for (const name of directoryNames) {
+          if (name.every((component, k) => lower[i + k] === component)) {
+            at = i
+            length = name.length
+            deepest = maxDepth - 2
+            break search
+          }
         }
       }
+      if (at > deepest) continue
+      const found = segments.slice(0, at + length)
+      if (lower[at] === '.git' && lower[at + 1] === 'head')
+        found[at + 1] = 'hooks'
+      denyPaths.push(path.join(root, ...found))
     }
-    if (at > deepest) continue
-    const found = segments.slice(0, at + length)
-    if (lower[at] === '.git' && lower[at + 1] === 'head')
-      found[at + 1] = 'hooks'
-    denyPaths.push(path.join(cwd, ...found))
   }
 
   return [...new Set(denyPaths)]
@@ -2290,6 +2307,18 @@ async function generateFilesystemArgs(
       }
       return stubSkipVetoInputs
     }
+
+    // Collect all roots to scan for mandatory deny paths (CWD + all allowedWrite paths)
+    const scanRoots = [
+      process.cwd(),
+      ...allowedWritePaths.filter(p => {
+        try {
+          return fs.statSync(p).isDirectory()
+        } catch {
+          return false
+        }
+      }),
+    ]
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
@@ -2298,6 +2327,7 @@ async function generateFilesystemArgs(
         mandatoryDenySearchDepth,
         allowGitConfig,
         abortSignal,
+        scanRoots,
       )),
     ]
 
