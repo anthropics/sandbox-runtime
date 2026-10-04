@@ -38,6 +38,11 @@ import type {
   CredentialEnvVarConfig,
   Sigv4Config,
 } from './sandbox-config.js'
+import {
+  envNameComparisonKey,
+  findByEnvName,
+  readEnvCaseAware,
+} from './sandbox-utils.js'
 
 /** Conventional env var names the AWS SDKs and CLI read credentials from. */
 export const AWS_ACCESS_KEY_ID_VAR = 'AWS_ACCESS_KEY_ID'
@@ -113,19 +118,25 @@ export function registerAwsPairs(
   env: Record<string, string | undefined> = process.env,
 ): void {
   const specs: AwsPairConfig[] = [...(awsPairs ?? [])]
+  // All name comparisons below go through envNameComparisonKey: on
+  // Windows env-var names are case-insensitive, so a spec/entry/host
+  // spelling that differs only in case still names the same variable;
+  // POSIX comparisons stay exact.
   const explicitNames = new Set(
-    specs.flatMap(p => [
-      p.accessKeyIdVar,
-      p.secretAccessKeyVar,
-      ...(p.sessionTokenVar ? [p.sessionTokenVar] : []),
-    ]),
+    specs
+      .flatMap(p => [
+        p.accessKeyIdVar,
+        p.secretAccessKeyVar,
+        ...(p.sessionTokenVar ? [p.sessionTokenVar] : []),
+      ])
+      .map(envNameComparisonKey),
   )
   const conventional = [
     AWS_ACCESS_KEY_ID_VAR,
     AWS_SECRET_ACCESS_KEY_VAR,
     AWS_SESSION_TOKEN_VAR,
   ]
-  if (!conventional.some(n => explicitNames.has(n))) {
+  if (!conventional.some(n => explicitNames.has(envNameComparisonKey(n)))) {
     specs.push({
       accessKeyIdVar: AWS_ACCESS_KEY_ID_VAR,
       secretAccessKeyVar: AWS_SECRET_ACCESS_KEY_VAR,
@@ -135,22 +146,33 @@ export function registerAwsPairs(
 
   // A variable is usable as a pair member when it has a whole-value
   // mask entry AND was actually masked at runtime (set in the host env).
-  const wholeValueEntry = (name: string) =>
-    envVars.find(
-      v =>
-        v.name === name &&
-        v.mode === 'mask' &&
-        v.extract === undefined &&
-        v.decode === undefined,
-    )
-  const maskedSentinel = (name: string): string | undefined =>
-    wholeValueEntry(name) !== undefined ? setEnvVars[name] : undefined
+  // findByEnvName is the same matching rule config validation uses (on
+  // Windows a spec spelling that differs only in case still names the
+  // entry's variable); the found entry must itself be whole-value mask
+  // — validation rejects fold-duplicate entry names, so there is never
+  // a second fold-equal entry to fall back to.
+  const wholeValueEntry = (name: string) => {
+    const entry = findByEnvName(envVars, name)
+    return entry !== undefined &&
+      entry.mode === 'mask' &&
+      entry.extract === undefined &&
+      entry.decode === undefined
+      ? entry
+      : undefined
+  }
+  // setEnvVars is keyed by the ENTRY's spelling, which on Windows may
+  // differ in case from the spec's — read it under the matched entry's
+  // own name so the sentinel can only ever come from that entry.
+  const maskedSentinel = (name: string): string | undefined => {
+    const entry = wholeValueEntry(name)
+    return entry !== undefined ? setEnvVars[entry.name] : undefined
+  }
 
   for (const spec of specs) {
     const akidSentinel = maskedSentinel(spec.accessKeyIdVar)
     const secretMasked = maskedSentinel(spec.secretAccessKeyVar) !== undefined
-    const realAkid = env[spec.accessKeyIdVar]
-    const realSecret = env[spec.secretAccessKeyVar]
+    const realAkid = readEnvCaseAware(env, spec.accessKeyIdVar)
+    const realSecret = readEnvCaseAware(env, spec.secretAccessKeyVar)
     if (
       akidSentinel === undefined ||
       !secretMasked ||
@@ -178,7 +200,7 @@ export function registerAwsPairs(
         : undefined
     const realSessionToken =
       sessionSentinel !== undefined && spec.sessionTokenVar !== undefined
-        ? env[spec.sessionTokenVar]
+        ? readEnvCaseAware(env, spec.sessionTokenVar)
         : undefined
 
     registry.register({
