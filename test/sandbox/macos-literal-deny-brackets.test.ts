@@ -118,15 +118,41 @@ describe.if(!isWindows)(
       }
     })
 
-    it('still compiles a bracket pattern the caller wrote as a regex', () => {
+    it('compiles an absolute path with brackets as a literal subpath', () => {
+      // Absolute spellings with brackets alone are names on disk (#576),
+      // not character classes — otherwise denyRead silently matches nothing.
       const profile = wrapCommandWithSandboxMacOS({
         command: 'true',
         needsNetworkRestriction: false,
         readConfig: { denyOnly: ['/srv/[ab]/secrets'] },
         writeConfig: undefined,
       })
-      expect(profile).toContain('(regex "^/srv/[ab]/secrets(/.*)?$")')
-      expect(profile).not.toContain('(subpath "/srv/[ab]/secrets")')
+      expect(profile).toContain('(subpath "/srv/[ab]/secrets")')
+      expect(profile).not.toContain('(regex "^/srv/[ab]/secrets(/.*)?$")')
+    })
+
+    it('still compiles a relative bracket pattern the caller wrote as a regex', () => {
+      const profile = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['[ab]/secrets'] },
+        writeConfig: undefined,
+      })
+      // Relative spelling: brackets remain glob syntax. After resolve against
+      // cwd the path is absolute, but classification used the raw spelling.
+      expect(emittedRegexes(profile).some(r => r.includes('[ab]'))).toBe(true)
+      expect(profile).not.toMatch(/\(subpath "[^"]*\[ab\]\/secrets"\)/)
+    })
+
+    it('still compiles an absolute pattern that also has a wildcard as a regex', () => {
+      const profile = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['/srv/[ab]/secret*'] },
+        writeConfig: undefined,
+      })
+      expect(profile).toContain('(regex "^/srv/[ab]/secret[^/]*(/.*)?$")')
+      expect(profile).not.toContain('(subpath "/srv/[ab]/secret*")')
     })
   },
 )
@@ -466,6 +492,59 @@ describe.if(!isWindows)(
       expect(emittedRegexes(profile)).toContain(
         denyGlobRegex(normalizePathForSandbox(spelling)),
       )
+    })
+  },
+)
+
+/**
+ * Issue #576: a caller-supplied absolute path containing `[…]` (typical of
+ * `path.join(workspaceRoot, …)` when the workspace name has brackets) must
+ * compile as a literal `subpath`, not as a character-class regex that
+ * matches the wrong path and silently voids denyRead — and as a write root
+ * it must keep the subtree coverage `subpath` gives, not a vnode-exact regex.
+ */
+describe.if(!isWindows)(
+  'macOS profile: absolute literal paths with brackets (#576)',
+  () => {
+    const secret = '/tmp/srt-576-project[1]/secret.txt'
+    const workspace = '/tmp/srt-576-project[1]'
+
+    it('denyRead of an absolute bracket path emits subpath, not a class regex', () => {
+      const profile = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [secret] },
+        writeConfig: undefined,
+      })
+      expect(profile).toContain(`(subpath ${JSON.stringify(secret)})`)
+      // The buggy compilation: [1] as a character class matching "1".
+      expect(profile).not.toContain(
+        '(regex "^/tmp/srt-576-project[1]/secret.txt(/.*)?$")',
+      )
+      for (const regex of emittedRegexes(profile)) {
+        // No emitted deny regex should be the non-matching class form.
+        expect(regex).not.toBe('^/tmp/srt-576-project[1]/secret.txt(/.*)?$')
+      }
+    })
+
+    it('allowWrite of an absolute bracket path emits subpath (subtree)', () => {
+      const profile = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: { allowOnly: [workspace], denyWithinAllow: [] },
+      })
+      expect(profile).toContain(`(subpath ${JSON.stringify(workspace)})`)
+      // Vnode-exact regex would lose the subtree (bug 2 of #576).
+      expect(profile).not.toContain('(regex "^/tmp/srt-576-project[1]$")')
+    })
+
+    it('the pre-fix class regex would not have matched the real path', () => {
+      // Documents why classification matters: globToRegex leaves a closed
+      // [1] as a character class, so the filter matches …project1/… instead.
+      const buggy = new RegExp('^/tmp/srt-576-project[1]/secret.txt(/.*)?$')
+      expect(buggy.test(secret)).toBe(false)
+      expect(buggy.test('/tmp/srt-576-project1/secret.txt')).toBe(true)
     })
   },
 )
