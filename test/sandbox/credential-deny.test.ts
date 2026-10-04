@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
   existsSync,
+  mkdtempSync,
   mkdirSync,
   rmSync,
   symlinkSync,
@@ -10,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import { _test as sshConfigDenyTest } from '../../src/sandbox/ssh-config-deny.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { normalizePathForSandbox } from '../../src/sandbox/sandbox-utils.js'
@@ -20,9 +22,24 @@ import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
  * Tests for the `credentials` config section (mode: deny).
  *
  * File entries with mode: deny are unioned into the read-deny set; env var
- * entries with mode: deny are unset inside the sandbox. Only explicitly
- * declared sources are restricted — the block applies no implicit defaults.
+ * entries with mode: deny are unset inside the sandbox. The credentials
+ * block itself applies no implicit defaults; the separate ssh-config key
+ * protection contributes its own denyRead arm (pointed at an empty temp
+ * home below so these exact-set assertions stay hermetic).
+ *
+ * HOME is pointed at an empty temp dir for the whole file: the exact-set
+ * assertions below would otherwise pick up the runner's real ~/.ssh via the
+ * ssh-config key protection (which is additive by design and covered by its
+ * own suite).
  */
+const hermeticHome = mkdtempSync(join(tmpdir(), 'cred-deny-home-'))
+beforeAll(() => {
+  sshConfigDenyTest.homedirOverride = hermeticHome
+})
+afterAll(() => {
+  sshConfigDenyTest.homedirOverride = undefined
+  rmSync(hermeticHome, { recursive: true, force: true })
+})
 
 function baseConfig(
   overrides: Partial<SandboxRuntimeConfig> = {},
