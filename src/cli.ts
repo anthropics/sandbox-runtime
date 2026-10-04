@@ -587,6 +587,17 @@ async function main(): Promise<void> {
           process.on('SIGTERM', () => {
             child?.kill('SIGTERM')
           })
+
+          // Forward terminal resize events (SIGWINCH) to the sandboxed child
+          if (process.platform !== 'win32') {
+            process.on('SIGWINCH', () => {
+              try {
+                child?.kill('SIGWINCH')
+              } catch {
+                // Ignore if child has already exited
+              }
+            })
+          }
         } catch (error) {
           console.error(
             `Error: ${error instanceof Error ? error.message : String(error)}`,

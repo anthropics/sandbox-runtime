@@ -366,4 +366,65 @@ describe('CLI', () => {
       }, 60_000)
     }
   })
+
+  describe.if(process.platform !== 'win32')('SIGWINCH forwarding', () => {
+    test('forwards SIGWINCH to the sandboxed child process', async () => {
+      const child = spawn(
+        'bun',
+        [
+          'run',
+          getCliPath(),
+          '--',
+          'sh',
+          '-c',
+          'trap "echo WINCH_RECEIVED" WINCH; echo READY; while :; do sleep 1; done',
+        ],
+        { env: { ...process.env, SRT_DEBUG: 'false' } },
+      )
+
+      let stdout = ''
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error('Timed out waiting for READY')),
+          10_000,
+        )
+        child.stdout.on('data', (chunk: Buffer) => {
+          stdout += String(chunk)
+          if (stdout.includes('READY')) {
+            clearTimeout(timeout)
+            resolve()
+          }
+        })
+        child.on('error', reject)
+      })
+
+      // Send SIGWINCH to the srt CLI process
+      child.kill('SIGWINCH')
+
+      // Wait for WINCH_RECEIVED in stdout
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `Timed out waiting for WINCH_RECEIVED, got stdout: ${stdout}`,
+              ),
+            ),
+          10_000,
+        )
+        child.stdout.on('data', (chunk: Buffer) => {
+          stdout += String(chunk)
+          if (stdout.includes('WINCH_RECEIVED')) {
+            clearTimeout(timeout)
+            resolve()
+          }
+        })
+        child.on('error', reject)
+      })
+
+      expect(stdout).toContain('WINCH_RECEIVED')
+      child.kill('SIGTERM')
+      await new Promise(resolve => child.on('exit', resolve))
+    }, 25_000)
+  })
 })
