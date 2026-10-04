@@ -315,6 +315,43 @@ describe('Config Validation', () => {
     expect(result.success).toBe(true)
   })
 
+  describe('denyUnlink', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        denyRead: [],
+        allowWrite: ['/tmp/proj'],
+        denyWrite: [],
+        denyUnlink: ['/tmp/proj/.git'],
+      },
+    }
+    let platformSpy: ReturnType<typeof spyOn> | undefined
+    afterEach(() => {
+      platformSpy?.mockRestore()
+      platformSpy = undefined
+    })
+
+    test('accepts denyUnlink on macOS', () => {
+      platformSpy = spyOn(platform, 'getPlatform').mockReturnValue('macos')
+      const result = SandboxRuntimeConfigSchema.safeParse(base)
+      expect(result.success).toBe(true)
+    })
+
+    test.each(['linux', 'windows'] as const)(
+      'rejects denyUnlink on %s',
+      plat => {
+        platformSpy = spyOn(platform, 'getPlatform').mockReturnValue(plat)
+        const result = SandboxRuntimeConfigSchema.safeParse(base)
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(
+            result.error.issues.some(i => i.path[1] === 'denyUnlink'),
+          ).toBe(true)
+        }
+      },
+    )
+  })
+
   test.each(['com.*.foo', 'com.example.**'])(
     'should reject allowMachLookup entry with non-trailing wildcard: %s',
     entry => {

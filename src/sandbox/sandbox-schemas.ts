@@ -38,6 +38,9 @@ export interface FsReadRestrictionConfig {
  * - `{allowOnly: [], denyWithinAllow: []}` = maximally restrictive (deny ALL writes)
  * - `{allowOnly: [...paths], denyWithinAllow: [...]}` = allow writes only to these paths,
  *   with exceptions for denyWithinAllow
+ * - `denyUnlink` (macOS only) = paths that stay writable but cannot be
+ *   unlinked or renamed. Linux/Windows reject a non-empty list at config
+ *   parse: bwrap cannot express "writable but not deletable".
  *
  * This is maximally restrictive by default - only explicitly allowed paths are writable.
  * Note: Empty `allowOnly` means NO paths are writable (unlike read's empty denyOnly).
@@ -45,6 +48,7 @@ export interface FsReadRestrictionConfig {
 export interface FsWriteRestrictionConfig {
   allowOnly: string[]
   denyWithinAllow: string[]
+  denyUnlink?: string[]
 }
 
 /**
