@@ -54,6 +54,7 @@ import type {
   NetworkRestrictionConfig,
 } from './sandbox-schemas.js'
 import {
+  WorkingDirectoryChanged,
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
@@ -98,6 +99,7 @@ import {
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
   walkGlobPatternSteps,
+  workingDirectory,
   type GlobWalkListings,
   type Steps,
   finish,
@@ -1721,15 +1723,6 @@ const RESTARTS_IN_TURNS = 2
 /** In place of what a walk finds: the configuration was replaced under it. */
 const REPLACED = Symbol('replaced')
 
-/** `process.cwd()`, or undefined where that throws: it has been removed. */
-function workingDirectory(): string | undefined {
-  try {
-    return process.cwd()
-  } catch {
-    return undefined
-  }
-}
-
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
@@ -2043,6 +2036,10 @@ async function wrapWithSandboxAgain(
         socatPath: config?.socatPath,
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
+      }).catch((err: unknown) => {
+        // It awaits once more, for its scan: see the invariant above.
+        if (err instanceof WorkingDirectoryChanged) return startOver()
+        throw err
       })
 
     case 'windows':

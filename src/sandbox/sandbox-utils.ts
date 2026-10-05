@@ -93,6 +93,15 @@ export function pathSpellings(candidatePath: string): string[] {
   return [candidatePath]
 }
 
+/** `process.cwd()`, or undefined where that throws: it has been removed. */
+export function workingDirectory(): string | undefined {
+  try {
+    return process.cwd()
+  } catch {
+    return undefined
+  }
+}
+
 /** An fs error that means the name resolves to no file — it is missing, or
  * the path cannot name one at all — as opposed to one that means a file is
  * there but could not be looked at (EACCES, EPERM, EIO, anything

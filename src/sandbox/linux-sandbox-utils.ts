@@ -23,6 +23,7 @@ import {
   isAtOrUnder,
   isStrictlyUnder,
   getDangerousDirectories,
+  workingDirectory,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -875,6 +876,18 @@ export class LinuxSandboxProfileError extends Error {
         enumerable: false,
       })
     }
+  }
+}
+
+/**
+ * Thrown by the wrap when the host changed its working directory while the
+ * mandatory denies were looked for. Nothing has been handed out or left on
+ * the host by then. `SandboxManager` starts the wrap over.
+ */
+export class WorkingDirectoryChanged extends Error {
+  constructor() {
+    super('The working directory changed while the command was being wrapped')
+    this.name = 'WorkingDirectoryChanged'
   }
 }
 
@@ -1829,6 +1842,7 @@ async function generateFilesystemArgs(
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
+  const startedIn = workingDirectory()
   // fs already imported
 
   // Collect normalized allowed write paths. Populated in the writeConfig
@@ -2300,6 +2314,9 @@ async function generateFilesystemArgs(
         abortSignal,
       )),
     ]
+    // INVARIANT: one plan, one working directory. A relative entry is resolved
+    // against it on both sides of the await above, the only one here.
+    if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
 
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and

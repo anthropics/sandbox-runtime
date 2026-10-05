@@ -2060,6 +2060,45 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
     },
   )
 
+  it('wraps from one working directory when the host changes it while the mandatory denies are looked for', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-scan-cd-')))
+    mkdirSync(join(root, 'from'))
+    mkdirSync(join(root, 'to'))
+    // Stands in for ripgrep: says that it ran, finds nothing, and takes long
+    // enough for the host to move meanwhile.
+    const scans = join(root, 'scans')
+    const slowScan = join(root, 'slow-scan')
+    writeFileSync(slowScan, `#!/bin/sh\necho ran >> ${scans}\nsleep 0.4\n`, {
+      mode: 0o755,
+    })
+    const cwd = process.cwd()
+    process.chdir(join(root, 'from'))
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['.'], denyWrite: [] },
+      ripgrep: { command: slowScan },
+    })
+    const moving = setTimeout(() => process.chdir(join(root, 'to')), 150)
+    try {
+      const disturbed = await SandboxManager.wrapWithSandbox('true')
+
+      expect(fs.readFileSync(scans, 'utf8')).toBe('ran\nran\n')
+      expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+      expect(disturbed).toContain(join(root, 'to'))
+      expect(disturbed).not.toContain(join(root, 'from'))
+    } finally {
+      clearTimeout(moving)
+      process.chdir(cwd)
+      await SandboxManager.reset()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('starts over for a configuration object that is installed a second time', async () => {
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
