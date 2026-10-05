@@ -384,6 +384,36 @@ export function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders {
   return out
 }
 
+/**
+ * Replace characters outside Latin-1 (> 0xFF) with '?' in a header value.
+ * Node's ServerResponse.writeHead validates header values and throws
+ * TypeError [ERR_INVALID_CHAR] on any character code > 0xFF (#490).
+ */
+export function sanitizeHeaderValue(v: string): string {
+  // eslint-disable-next-line no-control-regex -- matching Latin-1 range
+  return v.replace(/[^\x00-\xFF]/g, '?')
+}
+
+/**
+ * Sanitize response headers before forwarding to a ServerResponse via `writeHead`.
+ * Prevents ERR_INVALID_CHAR exceptions when an upstream server returns non-Latin1
+ * headers (e.g. raw UTF-8 in Content-Disposition).
+ */
+export function sanitizeResponseHeaders(
+  headers: IncomingHttpHeaders,
+): IncomingHttpHeaders {
+  const out: IncomingHttpHeaders = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) continue
+    if (Array.isArray(value)) {
+      out[key] = value.map(sanitizeHeaderValue)
+    } else {
+      out[key] = sanitizeHeaderValue(value)
+    }
+  }
+  return out
+}
+
 /** Remove surrounding square brackets from an IPv6 literal. */
 export function stripBrackets(host: string): string {
   return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host
