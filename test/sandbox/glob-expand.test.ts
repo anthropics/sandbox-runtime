@@ -2003,6 +2003,121 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
     )
   }
 
+  // As above: the third listing is in the middle of the walk, the seventh is
+  // its last.
+  it.each([3, 7])(
+    'wraps from one working directory when the host changes it in a turn (in listing %d)',
+    async at => {
+      const { SandboxManager } = await import(
+        '../../src/sandbox/sandbox-manager.js'
+      )
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-chdir-')))
+      for (let i = 0; i < 6; i++)
+        mkdirSync(join(root, 'tree', `d${i}`), { recursive: true })
+      mkdirSync(join(root, 'from'))
+      mkdirSync(join(root, 'to'))
+      const cwd = process.cwd()
+      process.chdir(join(root, 'from'))
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [join(root, 'tree', '**/*.pem')],
+          allowWrite: ['.'],
+          denyWrite: [],
+        },
+      })
+
+      const listed: string[] = []
+      const readdirSync = fs.readdirSync
+      const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        if (String(args[0]).startsWith(join(root, 'tree'))) {
+          if (listed.push(String(args[0])) === at) {
+            process.chdir(join(root, 'to'))
+          }
+          const until = performance.now() + 15
+          while (performance.now() < until);
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      try {
+        const disturbed = await SandboxManager.wrapWithSandbox('true')
+        readdirSpy.mockRestore()
+
+        expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+        expect(disturbed).toContain(join(root, 'to'))
+        expect(disturbed).not.toContain(join(root, 'from'))
+        expect(listed.length).toBe(at + 7)
+      } finally {
+        readdirSpy.mockRestore()
+        process.chdir(cwd)
+        await SandboxManager.reset()
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('starts over for a configuration object that is installed a second time', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    const DIRECTORIES = 24
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-again-')))
+    for (let i = 0; i < DIRECTORIES; i++) mkdirSync(join(root, `d${i}`))
+    // initialize() keeps this very object, so it is the same one afterwards.
+    const same = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        denyRead: [join(root, '**/*.pem')],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize(same)
+
+    // In the third listing, with `root` long listed, the host writes a file
+    // there, and then resets and initializes in the turns that follow.
+    const listed: string[] = []
+    let listedWhenInstalled: number | undefined
+    let installed: Promise<void> | undefined
+    const readdirSync = fs.readdirSync
+    const readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      if (String(args[0]).startsWith(root)) {
+        if (listed.push(String(args[0])) === 3) {
+          writeFileSync(join(root, 'key.pem'), '')
+          installed = SandboxManager.reset().then(() => {
+            const initialized = SandboxManager.initialize(same)
+            listedWhenInstalled = listed.length
+            return initialized
+          })
+        }
+        const until = performance.now() + 15
+        while (performance.now() < until);
+      }
+      return readdirSync(...args)
+    }) as typeof fs.readdirSync)
+    try {
+      const disturbed = await SandboxManager.wrapWithSandbox('true')
+      readdirSpy.mockRestore()
+
+      // While the first attempt was still walking, or this shows nothing.
+      expect(listedWhenInstalled).toBeLessThan(1 + DIRECTORIES)
+      expect(disturbed).toContain(join(root, 'key.pem'))
+    } finally {
+      readdirSpy.mockRestore()
+      await installed
+      await SandboxManager.reset()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('walks without a turn once a wrap has started over twice', async () => {
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
