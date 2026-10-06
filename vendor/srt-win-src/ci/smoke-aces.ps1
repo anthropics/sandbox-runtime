@@ -448,6 +448,67 @@ try {
   }
   $a.RemoveAccessRule($rule) | Out-Null; Set-Acl $unw $a
   Write-Host 'A31(e) ok: broker-unwritable deny target soft-drops'
+
+  # ── A32: ancestors of a grant are statable, by read-attributes only ──
+  # `git` and Node's realpath stat every component of the working
+  # directory. $Root sits under the profile, whose folders the sandbox
+  # user cannot otherwise stat; the `acl grant` of $Root above gives
+  # each such ancestor an object-only RA|SYNCHRONIZE ACE, released by
+  # `acl revoke`. Runs last: it revokes $PID's grants.
+  $ancestors = @()
+  $d = Split-Path $Root -Parent
+  while ($d -and (Split-Path $d -Parent)) {
+    $ancestors += $d
+    $d = Split-Path $d -Parent
+  }
+  function Sb-Aces { param([string] $path)
+    (Get-Acl $path).Access | Where-Object {
+      -not $_.IsInherited -and
+      $_.IdentityReference.Translate(
+        [System.Security.Principal.SecurityIdentifier]) -eq $sbAcct
+    }
+  }
+  # Path stat (`GetFileAttributesEx`, as git does) and handle stat
+  # (`CreateFileW`, as libuv does without `GetFileInformationByName`).
+  # cmd's `if exist` lists the parent instead.
+  $probe = Join-Path $Root 'a32-stat.ps1'
+  Set-Content -Path $probe -Value @'
+Add-Type -Namespace A32 -Name K -MemberDefinition @"
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern IntPtr CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);
+[DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+"@
+foreach ($a in $args) {
+  if (-not [IO.Directory]::Exists($a)) { 'STAT_FAIL path ' + $a }
+  $h = [A32.K]::CreateFileW($a, 0x80, 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+  if ($h -eq [IntPtr](-1)) { 'STAT_FAIL handle ' + $a } else { [void][A32.K]::CloseHandle($h) }
+}
+'PROBE_DONE'
+'@
+  $r = RExec (@('--', $pwsh, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $probe) + $ancestors)
+  if ($r.out -notmatch 'PROBE_DONE' -or $r.out -match 'STAT_FAIL') {
+    throw "A32: child cannot stat every ancestor of `$Root. raw: $($r.raw)"
+  }
+  foreach ($a in $ancestors) {
+    foreach ($ace in @(Sb-Aces $a)) {
+      if ($ace.AccessControlType -ne 'Allow' -or
+          $ace.FileSystemRights -ne 'ReadAttributes, Synchronize' -or
+          $ace.InheritanceFlags -ne 'None') {
+        throw ("A32: ancestor '$a' has a wider sandbox ACE: " +
+               "$($ace.AccessControlType) $($ace.FileSystemRights) " +
+               "$($ace.InheritanceFlags)")
+      }
+    }
+  }
+  & $Exe acl revoke --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 |
+    Out-String | Write-Host -NoNewline
+  foreach ($a in $ancestors) {
+    if (@(Sb-Aces $a).Count -gt 0) {
+      throw "A32: sandbox ACE left on ancestor '$a' after revoke"
+    }
+  }
+  Write-Host ('A32 ok: ancestors of a grant statable through ' +
+              'object-only read-attributes, removed on revoke')
 }
 finally {
   & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
@@ -457,4 +518,4 @@ finally {
   & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-Null
 }
 
-Write-Host 'smoke-aces: PASS (A2/A2(reg)/A4/A5/A13/A28/A29/A30/A31)'
+Write-Host 'smoke-aces: PASS (A2/A2(reg)/A4/A5/A13/A28/A29/A30/A31/A32)'

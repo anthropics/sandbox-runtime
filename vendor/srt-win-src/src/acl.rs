@@ -35,6 +35,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::ffi::c_void;
 use std::mem::size_of;
 use windows::Win32::Security::Authorization::{
+    AUTHZ_ACCESS_REPLY, AUTHZ_ACCESS_REQUEST, AUTHZ_CLIENT_CONTEXT_HANDLE,
+    AUTHZ_RESOURCE_MANAGER_HANDLE, AUTHZ_RM_FLAG_NO_AUDIT, AuthzAccessCheck, AuthzFreeContext,
+    AuthzFreeResourceManager, AuthzInitializeContextFromSid, AuthzInitializeResourceManager,
     GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
@@ -52,6 +55,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::SystemServices::{
     ACCESS_DENIED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
 };
+use windows::core::PCWSTR;
 
 use crate::sid::LocalPsid;
 use crate::util::{OwnedSd, pcwstr, win32_ok, wstr};
@@ -90,6 +94,10 @@ impl Mask {
 
     // File/dir-specific.
     pub const FILE_DELETE_CHILD: Self = Self(0x0000_0040);
+    pub const FILE_READ_ATTRIBUTES: Self = Self(0x0000_0080);
+    /// What a handle-based stat needs: `CreateFileW` always adds
+    /// `SYNCHRONIZE | FILE_READ_ATTRIBUTES` to the requested access.
+    pub const FILE_STAT: Self = Self(0x0010_0080);
     pub const FILE_ALL: Self = Self(FILE_ALL_ACCESS.0);
     pub const FILE_WRITE_ATTRIBUTES: Self = Self(0x0000_0100);
     pub const FILE_GENERIC_READ: Self = Self(FILE_GENERIC_READ.0);
@@ -671,6 +679,11 @@ pub enum SbAce {
     /// whole subtree if the placeholder later becomes a real user
     /// directory.
     DenyDelete,
+    /// `(A;;FILE_READ_ATTRIBUTES|SYNCHRONIZE;;;<sb>)`: object-only
+    /// allow on an ancestor of a granted path that the sandbox user
+    /// could not otherwise stat (`git` and Node's `realpath` stat every
+    /// path component). Grants no listing and no contents.
+    ReadAttrs,
 }
 
 impl GrantMask {
@@ -710,6 +723,7 @@ impl SbAce {
             SbAce::Deny(_) => "deny",
             SbAce::DenyFdc => "deny_fdc",
             SbAce::DenyDelete => "deny_delete",
+            SbAce::ReadAttrs => "read_attrs",
         }
     }
     /// `'read' | 'modify' | 'denyRead' | 'denyWrite' | 'fdc'` — the
@@ -723,6 +737,7 @@ impl SbAce {
             SbAce::Deny(DenyMask::WriteDeny) => "denyWrite",
             SbAce::DenyFdc => "fdc",
             SbAce::DenyDelete => "delete",
+            SbAce::ReadAttrs => "attrs",
         }
     }
     pub fn parse(kind: &str, mask: &str) -> Result<Self> {
@@ -733,6 +748,7 @@ impl SbAce {
             ("deny", "denyWrite") => SbAce::Deny(DenyMask::WriteDeny),
             ("deny_fdc", _) => SbAce::DenyFdc,
             ("deny_delete", _) => SbAce::DenyDelete,
+            ("read_attrs", _) => SbAce::ReadAttrs,
             (k, m) => bail!("unknown SbAce kind={k:?} mask={m:?}"),
         })
     }
@@ -763,15 +779,16 @@ pub struct SbAceSet {
     pub deny: Option<DenyMask>,
     pub deny_fdc: bool,
     pub deny_delete: bool,
+    pub read_attrs: bool,
 }
 
 impl SbAceSet {
     /// The set's entries as [`NewAce`]s for `sid`, in canonical
     /// deny → deny-fdc → allow order. `Deny`/`DenyFdc`/`Grant` carry
-    /// [`OICI`]; `DenyDelete` is object-only ([`NO_INHERIT`]) — see
-    /// [`SbAce::DenyDelete`].
+    /// [`OICI`]; `DenyDelete` and `ReadAttrs` are object-only
+    /// ([`NO_INHERIT`]) — see [`SbAce::DenyDelete`].
     fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
-        let mut v = Vec::with_capacity(4);
+        let mut v = Vec::with_capacity(5);
         if let Some(m) = self.deny {
             v.push(NewAce::Deny(sid, m.bits(), OICI));
         }
@@ -784,7 +801,27 @@ impl SbAceSet {
         if let Some(m) = self.grant {
             v.push(NewAce::Allow(sid, m.bits(), OICI));
         }
+        if self.read_attrs {
+            v.push(NewAce::Allow(sid, Mask::FILE_STAT.bits(), NO_INHERIT));
+        }
         v
+    }
+
+    /// The raw bytes of [`Self::head_aces`] for `sid`, to compare
+    /// with what is on disk.
+    fn ace_bytes(&self, sid: &LocalPsid) -> Result<Vec<Vec<u8>>> {
+        let acl = rebuild_acl(
+            ACL_REVISION,
+            &self.head_aces(sid.as_psid()),
+            &(Vec::new(), 0, ACL_REVISION),
+            &[],
+        )?;
+        let mut out = Vec::new();
+        filter_aces(acl.as_ptr(), |_, body| {
+            out.push(body.to_vec());
+            false
+        })?;
+        Ok(out)
     }
 }
 
@@ -843,6 +880,293 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     };
     write_file_dacl(canonical_path, new.as_ptr(), prot)
         .with_context(|| format!("recompose '{canonical_path}'"))
+}
+
+/// [`apply_sandbox_aces`] after a change to a [`SbAce::ReadAttrs`] hold
+/// only. An object that already matches `set` is left alone, even when
+/// it carries an inheritable grant whose descendants a full converge
+/// would re-derive.
+pub fn apply_read_attrs(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<()> {
+    let sid = LocalPsid::from_string(sandbox_sid)
+        .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
+    if apply_object_only(canonical_path, &sid, set)? {
+        return Ok(());
+    }
+    apply_sandbox_aces(canonical_path, sandbox_sid, set)
+}
+
+/// [`apply_read_attrs`] without walking the subtree.
+/// `SetNamedSecurityInfoW` re-propagates a directory's inheritable ACEs
+/// to every descendant even when only an object-only ACE changed
+/// (minutes on a profile-sized tree), and so does `SetSecurityInfo`
+/// unless the handle was opened `MAXIMUM_ALLOWED`, an open that fails
+/// with a sharing violation on a profile root. `SetKernelObjectSecurity`
+/// writes the one object only. Returns `false` (caller takes the
+/// propagating path) when the sandbox ACEs on disk differ from `set` by
+/// more than the ReadAttrs ACE, for a junction or symlink, a protected
+/// DACL carrying inherited entries, or a handle or DACL that cannot be
+/// read.
+fn apply_object_only(path: &str, sid: &LocalPsid, set: SbAceSet) -> Result<bool> {
+    use windows::Win32::Security::Authorization::GetSecurityInfo;
+    use windows::Win32::Security::{
+        SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SECURITY_DESCRIPTOR_CONTROL,
+        SetKernelObjectSecurity, SetSecurityDescriptorControl,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx,
+        OPEN_EXISTING,
+    };
+    let w = wstr(path);
+    let Ok(h) = (unsafe {
+        CreateFileW(
+            pcwstr(&w),
+            Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits() | Mask::FILE_READ_ATTRIBUTES.bits(),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }) else {
+        return Ok(false);
+    };
+    let h = crate::util::OwnedHandle(h);
+    // Junctions and symlinks take the propagating path; other reparse
+    // points (OneDrive's cloud folders) are ordinary folders here.
+    const NAME_SURROGATE: u32 = 0x2000_0000;
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+    if unsafe {
+        GetFileInformationByHandleEx(
+            h.0,
+            FileAttributeTagInfo,
+            &mut tag as *mut _ as *mut c_void,
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    }
+    .is_err()
+        || (tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            && tag.ReparseTag & NAME_SURROGATE != 0)
+    {
+        return Ok(false);
+    }
+    let mut old: *mut ACL = std::ptr::null_mut();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    let r = unsafe {
+        GetSecurityInfo(
+            h.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut old),
+            None,
+            Some(&mut psd),
+        )
+    };
+    if r.is_err() {
+        return Ok(false);
+    }
+    let sd = OwnedSd::from_raw(psd);
+    let protected = sd_dacl_protected(&sd)?;
+    let sid_bytes = sid.as_bytes();
+    let (mut on_disk, mut blocked) = (Vec::new(), false);
+    // Unlike the propagating path, keep inherited ACEs: nothing
+    // re-derives them here.
+    let kept = filter_aces(old, |hdr, body| {
+        let inherited = hdr.AceFlags & INHERITED_ACE != 0;
+        let sb = ace_sid_is(body, sid_bytes);
+        if sb && !inherited {
+            on_disk.push(body.to_vec());
+        }
+        blocked |= protected && inherited;
+        inherited || !sb
+    })?;
+    let toggled = SbAceSet {
+        read_attrs: !set.read_attrs,
+        ..set
+    };
+    if blocked {
+        return Ok(false);
+    }
+    if on_disk == set.ace_bytes(sid)? {
+        return Ok(true);
+    }
+    if on_disk != toggled.ace_bytes(sid)? {
+        return Ok(false);
+    }
+    let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[])?;
+    // Carry the DACL's protected and auto-inherited bits over unchanged.
+    let (mut control, mut revision) = (0u16, 0u32);
+    unsafe { GetSecurityDescriptorControl(sd.ptr, &mut control, &mut revision) }
+        .context("GetSecurityDescriptorControl")?;
+    // The kernel clears auto-inherited on a protected DACL unless the
+    // request asks for it.
+    let mut want = control & (SE_DACL_PROTECTED.0 | SE_DACL_AUTO_INHERITED.0);
+    if want & SE_DACL_AUTO_INHERITED.0 != 0 {
+        want |= SE_DACL_AUTO_INHERIT_REQ.0;
+    }
+    let bits = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
+    let mut abs = SECURITY_DESCRIPTOR::default();
+    let asd = PSECURITY_DESCRIPTOR(&mut abs as *mut _ as *mut c_void);
+    unsafe {
+        InitializeSecurityDescriptor(asd, SECURITY_DESCRIPTOR_REVISION)
+            .context("InitializeSecurityDescriptor")?;
+        SetSecurityDescriptorDacl(asd, true, Some(new.as_ptr()), false).context("set DACL")?;
+        SetSecurityDescriptorControl(asd, bits, SECURITY_DESCRIPTOR_CONTROL(want))
+            .context("set DACL control")?;
+        SetKernelObjectSecurity(h.0, DACL_SECURITY_INFORMATION, asd)
+            .with_context(|| format!("SetKernelObjectSecurity('{path}')"))?;
+    }
+    Ok(true)
+}
+
+/// Answers whether the sandbox user can stat a path without any of
+/// srt-win's own ACEs, to decide which ancestors of a grant need
+/// [`SbAce::ReadAttrs`]. Uses an Authz client context built from the
+/// sandbox SID (its SAM groups: `Everyone`, `Users`, …), so no logon.
+pub struct StatProbe {
+    rm: AUTHZ_RESOURCE_MANAGER_HANDLE,
+    ctx: AUTHZ_CLIENT_CONTEXT_HANDLE,
+    sid: LocalPsid,
+    admins: LocalPsid,
+}
+
+impl StatProbe {
+    pub fn new(sandbox_sid: &str) -> Result<Self> {
+        let sid = LocalPsid::from_string(sandbox_sid)
+            .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
+        let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
+        let mut rm = AUTHZ_RESOURCE_MANAGER_HANDLE::default();
+        unsafe {
+            AuthzInitializeResourceManager(
+                AUTHZ_RM_FLAG_NO_AUDIT.0,
+                None,
+                None,
+                None,
+                PCWSTR::null(),
+                &mut rm,
+            )
+        }
+        .context("AuthzInitializeResourceManager")?;
+        let mut ctx = AUTHZ_CLIENT_CONTEXT_HANDLE::default();
+        if let Err(e) = unsafe {
+            AuthzInitializeContextFromSid(
+                0,
+                sid.as_psid(),
+                rm,
+                None,
+                Default::default(),
+                None,
+                &mut ctx,
+            )
+        } {
+            let _ = unsafe { AuthzFreeResourceManager(rm) };
+            return Err(e).context("AuthzInitializeContextFromSid");
+        }
+        Ok(Self {
+            rm,
+            ctx,
+            sid,
+            admins,
+        })
+    }
+
+    /// [`Mask::FILE_STAT`] on `path`. `FILE_LIST_DIRECTORY` on the
+    /// parent is not enough: it implies `FILE_READ_ATTRIBUTES` for a
+    /// path query (`GetFileAttributesExW`) but not `SYNCHRONIZE`, so a
+    /// handle-based stat (libuv before `GetFileInformationByName`)
+    /// still fails.
+    pub fn can_stat(&self, path: &str) -> Result<bool> {
+        let want = Mask::FILE_STAT.bits();
+        Ok(self.granted(path)? & want == want)
+    }
+
+    /// The sandbox user's maximum access to `path` with the sandbox
+    /// SID's own ACEs (any session's grants, inherited or explicit)
+    /// left out, so one holder's decision never rests on another
+    /// holder's refcounted ACE. ALLOW ACEs for `Administrators` are
+    /// left out too: the child token has that group deny-only.
+    fn granted(&self, path: &str) -> Result<u32> {
+        use windows::Win32::Security::{
+            GROUP_SECURITY_INFORMATION, SetSecurityDescriptorGroup, SetSecurityDescriptorOwner,
+        };
+        use windows::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
+        let w = wstr(path);
+        let (mut owner, mut group) = (PSID::default(), PSID::default());
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        let r = unsafe {
+            GetNamedSecurityInfoW(
+                pcwstr(&w),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                Some(&mut owner),
+                Some(&mut group),
+                Some(&mut dacl),
+                None,
+                &mut psd,
+            )
+        };
+        win32_ok(r, &format!("GetNamedSecurityInfoW('{path}')"))?;
+        let _sd = OwnedSd::from_raw(psd);
+        if dacl.is_null() {
+            return Ok(Mask::FILE_ALL.bits());
+        }
+        let (sb, admins) = (self.sid.as_bytes(), self.admins.as_bytes());
+        let kept = filter_aces(dacl, |hdr, body| {
+            !ace_sid_is(body, sb)
+                && !(u32::from(hdr.AceType) == ACCESS_ALLOWED_ACE_TYPE && ace_sid_is(body, admins))
+        })?;
+        let acl = rebuild_acl(kept.2, &[], &kept, &[])?;
+        let mut abs = SECURITY_DESCRIPTOR::default();
+        let asd = PSECURITY_DESCRIPTOR(&mut abs as *mut _ as *mut c_void);
+        unsafe {
+            InitializeSecurityDescriptor(asd, SECURITY_DESCRIPTOR_REVISION)
+                .context("InitializeSecurityDescriptor")?;
+            SetSecurityDescriptorOwner(asd, Some(owner), false).context("set owner")?;
+            SetSecurityDescriptorGroup(asd, Some(group), false).context("set group")?;
+            SetSecurityDescriptorDacl(asd, true, Some(acl.as_ptr()), false).context("set DACL")?;
+        }
+        let req = AUTHZ_ACCESS_REQUEST {
+            DesiredAccess: MAXIMUM_ALLOWED,
+            ..Default::default()
+        };
+        let (mut granted, mut err) = (0u32, 0u32);
+        let mut reply = AUTHZ_ACCESS_REPLY {
+            ResultListLength: 1,
+            GrantedAccessMask: &mut granted,
+            Error: &mut err,
+            ..Default::default()
+        };
+        unsafe {
+            AuthzAccessCheck(
+                Default::default(),
+                self.ctx,
+                &req,
+                None,
+                asd,
+                None,
+                &mut reply,
+                None,
+            )
+        }
+        .with_context(|| format!("AuthzAccessCheck('{path}')"))?;
+        if err != 0 && err != windows::Win32::Foundation::ERROR_ACCESS_DENIED.0 {
+            bail!("AuthzAccessCheck('{path}'): reply error {err}");
+        }
+        Ok(granted)
+    }
+}
+
+impl Drop for StatProbe {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = AuthzFreeContext(self.ctx);
+            let _ = AuthzFreeResourceManager(self.rm);
+        }
+    }
 }
 
 /// Whether `canonical_path` carries an EXPLICIT `(OI)(CI)` deny ACE
@@ -996,5 +1320,288 @@ mod tests {
         assert_eq!(ow.bits(), Mask::READ_CONTROL.bits());
         assert_ne!(ow.bits(), 0);
         assert_eq!(ow.bits() & Mask::WRITE_DAC.bits(), 0);
+    }
+
+    /// `(AceType, AceFlags, mask)` of each ACE on `path` for `sid`.
+    fn aces_for(path: &str, sid: &str) -> Vec<(u8, u8, u32)> {
+        let s = LocalPsid::from_string(sid).unwrap();
+        let (_sd, dacl) = read_file_dacl(path).unwrap();
+        let mut out = Vec::new();
+        filter_aces(dacl, |hdr, body| {
+            if ace_sid_is(body, s.as_bytes()) {
+                let mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+                out.push((hdr.AceType, hdr.AceFlags, mask));
+            }
+            false
+        })
+        .unwrap();
+        out
+    }
+
+    /// The DACL's protected and auto-inherited control bits.
+    fn dacl_control(path: &str) -> u16 {
+        use windows::Win32::Security::SE_DACL_AUTO_INHERITED;
+        let (sd, _) = read_file_dacl(path).unwrap();
+        let (mut c, mut r) = (0u16, 0u32);
+        unsafe { GetSecurityDescriptorControl(sd.ptr, &mut c, &mut r) }.unwrap();
+        c & (SE_DACL_PROTECTED.0 | SE_DACL_AUTO_INHERITED.0)
+    }
+
+    fn inherited_count(path: &str) -> usize {
+        let (_sd, dacl) = read_file_dacl(path).unwrap();
+        filter_aces(dacl, |hdr, _| hdr.AceFlags & INHERITED_ACE != 0)
+            .unwrap()
+            .0
+            .len()
+    }
+
+    /// Prepend an ALLOW ACE with `SetFileSecurityW`, which writes the
+    /// one object and never propagates to children. Keeps the DACL's
+    /// control bits.
+    fn add_allow_no_propagate(path: &str, sid: &str, m: Mask, flags: ACE_FLAGS) {
+        use windows::Win32::Security::{
+            SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERITED, SECURITY_DESCRIPTOR_CONTROL,
+            SetFileSecurityW, SetSecurityDescriptorControl,
+        };
+        let s = LocalPsid::from_string(sid).unwrap();
+        let mut want = dacl_control(path);
+        if want & SE_DACL_AUTO_INHERITED.0 != 0 {
+            want |= SE_DACL_AUTO_INHERIT_REQ.0;
+        }
+        let bits = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED | SE_DACL_AUTO_INHERIT_REQ;
+        let (_sd, dacl) = read_file_dacl(path).unwrap();
+        let kept = filter_aces(dacl, |_, _| true).unwrap();
+        let head = [NewAce::Allow(s.as_psid(), m.bits(), flags)];
+        let acl = rebuild_acl(kept.2, &head, &kept, &[]).unwrap();
+        let mut abs = SECURITY_DESCRIPTOR::default();
+        let psd = PSECURITY_DESCRIPTOR(&mut abs as *mut _ as *mut c_void);
+        let w = wstr(path);
+        unsafe {
+            InitializeSecurityDescriptor(psd, SECURITY_DESCRIPTOR_REVISION).unwrap();
+            SetSecurityDescriptorDacl(psd, true, Some(acl.as_ptr()), false).unwrap();
+            SetSecurityDescriptorControl(psd, bits, SECURITY_DESCRIPTOR_CONTROL(want)).unwrap();
+            assert!(SetFileSecurityW(pcwstr(&w), DACL_SECURITY_INFORMATION, psd).as_bool());
+        }
+    }
+
+    /// Set (or delete) a third-party, non-name-surrogate reparse tag on
+    /// an empty directory.
+    fn set_test_reparse_tag(path: &str, set: bool) {
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_GENERIC_WRITE, FILE_SHARE_READ, OPEN_EXISTING,
+        };
+        use windows::Win32::System::IO::DeviceIoControl;
+        const TAG: u32 = 0x0000_1234;
+        let code: u32 = if set { 0x0009_00A4 } else { 0x0009_00AC };
+        // REPARSE_GUID_DATA_BUFFER: tag, data length, reserved, GUID, data.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&TAG.to_le_bytes());
+        buf.extend_from_slice(&(if set { 4u16 } else { 0 }).to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&[0x5a; 16]);
+        if set {
+            buf.extend_from_slice(&[1, 2, 3, 4]);
+        }
+        let w = wstr(path);
+        let h = unsafe {
+            CreateFileW(
+                pcwstr(&w),
+                FILE_GENERIC_WRITE.0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+        }
+        .unwrap();
+        let h = crate::util::OwnedHandle(h);
+        let mut n = 0u32;
+        unsafe {
+            DeviceIoControl(
+                h.0,
+                code,
+                Some(buf.as_ptr() as *const c_void),
+                buf.len() as u32,
+                None,
+                0,
+                Some(&mut n),
+                None,
+            )
+        }
+        .unwrap();
+    }
+
+    /// A `ReadAttrs`-only converge writes one object-only ACE and
+    /// leaves descendants alone; a propagating write on an ancestor
+    /// re-walks its whole subtree (minutes on a profile-sized tree).
+    #[test]
+    fn read_attrs_is_object_only_and_does_not_propagate() {
+        const FAKE_SB_SID: &str = "S-1-5-32-546"; // Guests
+        const MARKER_SID: &str = "S-1-5-32-551"; // Backup Operators
+        let dir = std::env::temp_dir().join(format!("srtwin-ra-{}", std::process::id()));
+        let child = dir.join("c");
+        std::fs::create_dir_all(&child).unwrap();
+        let (p, c) = (dir.to_str().unwrap(), child.to_str().unwrap());
+        // An inheritable ACE the child has not received: any
+        // propagation from the parent hands it down.
+        add_allow_no_propagate(p, MARKER_SID, Mask::FILE_READ_EXEC, OICI);
+        assert!(
+            aces_for(c, MARKER_SID).is_empty(),
+            "setup: child lacks marker"
+        );
+        let inherited = inherited_count(p);
+        let control = dacl_control(p);
+        assert_eq!(
+            control,
+            windows::Win32::Security::SE_DACL_AUTO_INHERITED.0,
+            "setup: unprotected, auto-inherited"
+        );
+
+        let ra = SbAceSet {
+            read_attrs: true,
+            ..Default::default()
+        };
+        apply_read_attrs(p, FAKE_SB_SID, ra).unwrap();
+        // A second holder's converge of the same set writes nothing.
+        apply_read_attrs(p, FAKE_SB_SID, ra).unwrap();
+        assert_eq!(
+            aces_for(p, FAKE_SB_SID),
+            vec![(0, 0, Mask::FILE_STAT.bits())],
+            "one explicit, non-inheritable read-attributes allow"
+        );
+        assert_eq!(aces_for(p, MARKER_SID).len(), 1, "parent keeps its ACEs");
+        assert_eq!(inherited_count(p), inherited, "parent keeps inherited ACEs");
+        assert_eq!(dacl_control(p), control, "control bits kept");
+        assert!(aces_for(c, MARKER_SID).is_empty(), "no propagation on add");
+        assert!(aces_for(c, FAKE_SB_SID).is_empty());
+
+        apply_read_attrs(p, FAKE_SB_SID, SbAceSet::default()).unwrap();
+        assert!(aces_for(p, FAKE_SB_SID).is_empty(), "release removes it");
+        assert!(
+            aces_for(c, MARKER_SID).is_empty(),
+            "no propagation on release"
+        );
+
+        // Control: a propagating converge does reach the child.
+        let grant = SbAceSet {
+            grant: Some(GrantMask::ReadOnly),
+            ..Default::default()
+        };
+        apply_sandbox_aces(p, FAKE_SB_SID, grant).unwrap();
+        assert!(!aces_for(c, MARKER_SID).is_empty(), "control: propagates");
+
+        // An ancestor that already carries an inheritable grant (a
+        // nested grant from another holder) still toggles ReadAttrs
+        // without a walk.
+        const MARKER2_SID: &str = "S-1-5-32-550"; // Print Operators
+        add_allow_no_propagate(p, MARKER2_SID, Mask::FILE_READ_EXEC, OICI);
+        let grant_ra = SbAceSet {
+            read_attrs: true,
+            ..grant
+        };
+        apply_read_attrs(p, FAKE_SB_SID, grant_ra).unwrap();
+        assert_eq!(aces_for(p, FAKE_SB_SID).len(), 2, "grant + read-attributes");
+        // Another holder's ReadAttrs hold on the same folder writes nothing.
+        apply_read_attrs(p, FAKE_SB_SID, grant_ra).unwrap();
+        apply_read_attrs(p, FAKE_SB_SID, grant).unwrap();
+        assert_eq!(aces_for(p, FAKE_SB_SID).len(), 1, "read-attributes removed");
+        assert!(aces_for(c, MARKER2_SID).is_empty(), "no propagation");
+        // Any other converge still re-derives descendants.
+        apply_sandbox_aces(p, FAKE_SB_SID, grant_ra).unwrap();
+        assert!(
+            !aces_for(c, MARKER2_SID).is_empty(),
+            "full converge propagates"
+        );
+
+        // A junction takes the propagating path instead of failing.
+        let j = dir.join("j");
+        let out = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J", j.to_str().unwrap(), c])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "mklink /J");
+        apply_read_attrs(j.to_str().unwrap(), FAKE_SB_SID, SbAceSet::default()).unwrap();
+
+        // Any other reparse point (OneDrive's cloud tag) is written in
+        // place, not re-derived from the parent.
+        const MARKER3_SID: &str = "S-1-5-32-548"; // Account Operators
+        let cloud = dir.join("cloud");
+        std::fs::create_dir(&cloud).unwrap();
+        let cloud = cloud.to_str().unwrap();
+        add_allow_no_propagate(p, MARKER3_SID, Mask::FILE_READ_EXEC, OICI);
+        set_test_reparse_tag(cloud, true);
+        let stat = (0, 0, Mask::FILE_STAT.bits());
+        apply_read_attrs(cloud, FAKE_SB_SID, ra).unwrap();
+        assert!(aces_for(cloud, FAKE_SB_SID).contains(&stat), "cloud folder");
+        apply_read_attrs(cloud, FAKE_SB_SID, SbAceSet::default()).unwrap();
+        assert!(!aces_for(cloud, FAKE_SB_SID).contains(&stat));
+        assert!(aces_for(cloud, MARKER3_SID).is_empty(), "no re-derive");
+        set_test_reparse_tag(cloud, false);
+
+        // A protected DACL (a profile root) stays protected.
+        let prot = dir.join("prot");
+        std::fs::create_dir(&prot).unwrap();
+        let prot = prot.to_str().unwrap();
+        let mine = crate::sid::current_user_sid().unwrap();
+        let own = build_allow_dacl(&[Allow(&mine, Mask::FILE_ALL, OICI)]).unwrap();
+        write_file_dacl(prot, own.as_ptr(), Protection::Protected).unwrap();
+        let control = dacl_control(prot);
+        assert_eq!(
+            control,
+            SE_DACL_PROTECTED.0 | windows::Win32::Security::SE_DACL_AUTO_INHERITED.0,
+            "setup: protected, auto-inherited"
+        );
+        apply_read_attrs(prot, FAKE_SB_SID, ra).unwrap();
+        assert_eq!(aces_for(prot, FAKE_SB_SID).len(), 1);
+        assert_eq!(dacl_control(prot), control, "still protected");
+        apply_read_attrs(prot, FAKE_SB_SID, SbAceSet::default()).unwrap();
+        assert_eq!(dacl_control(prot), control, "still protected");
+
+        std::fs::remove_dir(&j).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`StatProbe`] wants `FILE_READ_ATTRIBUTES | SYNCHRONIZE` on the
+    /// path, and ignores the sandbox
+    /// SID's own ACEs (another holder's refcounted grant).
+    #[test]
+    fn stat_probe_ignores_sandbox_aces() {
+        const EVERYONE: &str = "S-1-1-0";
+        // The probe's Authz context needs a real account; the
+        // runner's own SID stands in for the sandbox user.
+        let me = crate::sid::current_user_sid().unwrap();
+        let dir = std::env::temp_dir().join(format!("srtwin-probe-{}", std::process::id()));
+        let c1 = dir.join("c1");
+        std::fs::create_dir_all(&c1).unwrap();
+        let (p, c1) = (dir.to_str().unwrap(), c1.to_str().unwrap());
+        // SYSTEM only, inherited by the child. The runner stays
+        // owner, so it keeps READ_CONTROL and WRITE_DAC.
+        let lockdown = build_allow_dacl(&[Allow(SID_SYSTEM, Mask::FILE_ALL, OICI)]).unwrap();
+        write_file_dacl(p, lockdown.as_ptr(), Protection::Protected).unwrap();
+        let probe = StatProbe::new(&me).unwrap();
+        assert!(!probe.can_stat(c1).unwrap(), "locked: no stat");
+        // Listing the parent allows a path stat only, not a handle open.
+        add_allow_no_propagate(p, EVERYONE, Mask(0x0001), NO_INHERIT); // FILE_LIST_DIRECTORY
+        assert!(!probe.can_stat(c1).unwrap(), "parent list is not enough");
+
+        let ra = SbAceSet {
+            read_attrs: true,
+            ..Default::default()
+        };
+        apply_sandbox_aces(c1, &me, ra).unwrap();
+        assert!(!probe.can_stat(c1).unwrap(), "own ACE is ignored");
+        add_allow_no_propagate(c1, EVERYONE, Mask::FILE_READ_ATTRIBUTES, NO_INHERIT);
+        assert!(!probe.can_stat(c1).unwrap(), "read-attributes alone");
+        add_allow_no_propagate(c1, EVERYONE, Mask::SYNCHRONIZE, NO_INHERIT);
+        assert!(
+            probe.can_stat(c1).unwrap(),
+            "read-attributes and synchronize"
+        );
+
+        let empty = build_allow_dacl(&[]).unwrap();
+        write_file_dacl(p, empty.as_ptr(), Protection::Unprotected).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

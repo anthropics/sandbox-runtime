@@ -299,7 +299,7 @@ pub fn open_db() -> Result<Connection> {
 /// Filter on `release_aces` for the deny-ACE lifecycle.
 pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete"];
 /// Filter on `release_aces` for the grant lifecycle.
-pub const KIND_GRANT: &[&str] = &["grant"];
+pub const KIND_GRANT: &[&str] = &["grant", "read_attrs"];
 
 /// `prepare → query_map → collect` with one error context. Shared
 /// by every "list of T from one query" site so error plumbing is
@@ -799,7 +799,7 @@ impl Locked {
                 eff.as_str()
             ])
             .context("UPSERT working_aces")?;
-        recompose_at(&self.conn, canon, sandbox_sid)?;
+        recompose_at(&self.conn, canon, sandbox_sid, want == SbAce::ReadAttrs)?;
         Ok(AceWitness {
             canon: canon.to_string(),
             ace: eff,
@@ -833,7 +833,12 @@ impl Locked {
     /// object is NOT touched — except for `Grant`, where we
     /// best-effort `locate_by_file_id` and revoke at the moved path
     /// so the sandbox user does not keep stale access.
-    fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
+    pub fn release_one_ace(
+        &self,
+        canon: &str,
+        kind: &str,
+        sandbox_sid: &str,
+    ) -> Result<AceRelease> {
         self.conn
             .prepare_cached(
                 "DELETE FROM ace_holders WHERE canonical_path = ?1 \
@@ -875,14 +880,15 @@ impl Locked {
         let want_id = FileId::from_bytes(&fid)?;
         match identity_gate(canon, want_id) {
             IdGate::Match => {
-                recompose_at(&self.conn, canon, sandbox_sid)?;
+                let ra = kind == SbAce::ReadAttrs.kind();
+                recompose_at(&self.conn, canon, sandbox_sid, ra)?;
                 Ok(match new_eff {
                     Some(e) if e.as_str() == stored => AceRelease::StillHeld,
                     Some(_) => AceRelease::Downgraded,
                     None => AceRelease::Revoked,
                 })
             }
-            IdGate::Mismatch if kind == "grant" => {
+            IdGate::Mismatch if KIND_GRANT.contains(&kind) => {
                 // The granted object moved. The ALLOW ACE travels
                 // with the inode → the sandbox user still has
                 // access at the new path. Chase by file_id and
@@ -895,7 +901,8 @@ impl Locked {
                             "srt-win: grant '{canon}': file_id moved \
                              to '{at}'; revoking there"
                         );
-                        recompose_at(&self.conn, &at, sandbox_sid)?;
+                        let ra = kind == SbAce::ReadAttrs.kind();
+                        recompose_at(&self.conn, &at, sandbox_sid, ra)?;
                         AceRelease::Relocated { moved_to: at }
                     }
                     None => {
@@ -927,7 +934,7 @@ impl Locked {
 
     /// `(canon, kind)` rows held by this holder, optionally filtered
     /// to one set of kinds.
-    fn my_ace_holds(&self, kinds: Option<&[&str]>) -> Result<Vec<(String, String)>> {
+    pub fn my_ace_holds(&self, kinds: Option<&[&str]>) -> Result<Vec<(String, String)>> {
         let all: Vec<(String, String)> = query_vec(
             &self.conn,
             "SELECT canonical_path, kind FROM ace_holders \
@@ -1018,7 +1025,14 @@ impl Locked {
 /// for sandbox-user ACE state — every add/drop/crash-recover routes
 /// here so a path with both a grant AND a deny (or a parent that is
 /// both granted and `deny_fdc`'d) is handled consistently.
-fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()> {
+/// `read_attrs_only`: the caller changed a [`SbAce::ReadAttrs`] hold
+/// only (see [`acl::apply_read_attrs`]).
+fn recompose_at(
+    conn: &Connection,
+    canon: &str,
+    sandbox_sid: &str,
+    read_attrs_only: bool,
+) -> Result<()> {
     let rows: Vec<(String, String)> = query_vec(
         conn,
         "SELECT kind, mask FROM working_aces \
@@ -1033,6 +1047,7 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::Deny(d) => set.deny = Some(d),
             SbAce::DenyFdc => set.deny_fdc = true,
             SbAce::DenyDelete => set.deny_delete = true,
+            SbAce::ReadAttrs => set.read_attrs = true,
         }
     }
     // Install-time ambient write-deny (HKLM AmbientDenies) folds
@@ -1044,8 +1059,12 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
     if crate::install::ambient_deny_recorded(canon) {
         set.deny.get_or_insert(acl::DenyMask::WriteDeny);
     }
-    acl::apply_sandbox_aces(canon, sandbox_sid, set)
-        .with_context(|| format!("recompose '{canon}' ({set:?})"))
+    if read_attrs_only {
+        acl::apply_read_attrs(canon, sandbox_sid, set)
+    } else {
+        acl::apply_sandbox_aces(canon, sandbox_sid, set)
+    }
+    .with_context(|| format!("recompose '{canon}' ({set:?})"))
 }
 
 /// Sealed proof that [`Locked::apply_aces`] converged `canon` to
@@ -1172,7 +1191,8 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
             let want = FileId::from_bytes(&fid)?;
             match identity_gate(&canon, want) {
                 IdGate::Match => {
-                    if let Err(e) = recompose_at(conn, &canon, &sb) {
+                    let ra = kind == SbAce::ReadAttrs.kind();
+                    if let Err(e) = recompose_at(conn, &canon, &sb, ra) {
                         eprintln!(
                             "srt-win: orphaned {kind} '{canon}': \
                              recompose failed ({e:#})"
@@ -1180,9 +1200,10 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
                         continue;
                     }
                 }
-                IdGate::Mismatch if kind == "grant" => {
+                IdGate::Mismatch if KIND_GRANT.contains(&kind.as_str()) => {
                     if let Some(at) = path_id::locate_by_file_id(&want) {
-                        let _ = recompose_at(conn, &at, &sb);
+                        let ra = kind == SbAce::ReadAttrs.kind();
+                        let _ = recompose_at(conn, &at, &sb, ra);
                     }
                 }
                 _ => {} // gone/substituted — nothing on disk to do
