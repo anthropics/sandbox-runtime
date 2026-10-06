@@ -9,6 +9,7 @@ import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
+import { readNamesOf, writeNamesOf } from './path-entries.js'
 import {
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
@@ -22,6 +23,7 @@ import {
   isAtOrUnder,
   isStrictlyUnder,
   getDangerousDirectories,
+  workingDirectory,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -878,6 +880,18 @@ export class LinuxSandboxProfileError extends Error {
 }
 
 /**
+ * Thrown by the wrap when the host changed its working directory while the
+ * mandatory denies were looked for. Nothing has been handed out or left on
+ * the host by then. `SandboxManager` starts the wrap over.
+ */
+export class WorkingDirectoryChanged extends Error {
+  constructor() {
+    super('The working directory changed while the command was being wrapped')
+    this.name = 'WorkingDirectoryChanged'
+  }
+}
+
+/**
  * The shell string that runs bwrap with `bwrapArgs`, which the caller runs
  * as one argument of `sh -c`. When that would not fit the kernel's
  * per-argument cap, the words in `mounts` (a slice of `bwrapArgs`) go to an
@@ -1177,7 +1191,85 @@ export function checkLinuxDependencies(
   })
   if (uid0Error !== null) errors.push(uid0Error)
 
+  const outdated = outdatedBwrapWarning(usableBwrap)
+  if (outdated !== null) warnings.push(outdated)
+
   return { warnings, errors }
+}
+
+/**
+ * The oldest bubblewrap on which everything this library does holds. Mount
+ * plans start on 0.4.0 and later, but before 0.5.0 `ensure_file()` takes
+ * only a regular file as a file bind's mount point, so a mask on a fifo,
+ * socket or device node blocks or fails; and it creates one mode 0666 rather
+ * than 0444, so isStaleBwrapMountPoint leaves what an interrupted sandbox
+ * left behind on the host.
+ */
+export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
+
+// Keyed by path, so a caller that passes an explicit bwrapPath is not
+// answered for another binary. Only an answer is kept: after a probe that
+// failed or timed out, the next call asks again.
+const bwrapVersions = new Map<string, string>()
+
+/** The version `bwrap --version` reports, or null when it could not be asked. */
+function probeBwrapVersion(bwrap: string): string | null {
+  const cached = bwrapVersions.get(bwrap)
+  if (cached !== undefined) return cached
+
+  const probe = spawnSync(bwrap, ['--version'], {
+    timeout: 5000,
+    stdio: ['ignore', 'pipe', 'ignore'],
+    encoding: 'utf8',
+  })
+  const version =
+    probe.error === undefined && probe.status === 0
+      ? (/\d+(?:\.\d+)*/.exec(probe.stdout ?? '')?.[0] ?? null)
+      : null
+  if (version !== null) bwrapVersions.set(bwrap, version)
+  return version
+}
+
+/** Negative when `a` is the older version. A missing or unreadable component
+ * counts as 0, so '0.5' and '0.5.0' compare equal. */
+function compareVersions(a: string, b: string): number {
+  const partsOf = (version: string): number[] =>
+    version.split('.').map(part => {
+      const parsed = Number.parseInt(part, 10)
+      return Number.isNaN(parsed) ? 0 : parsed
+    })
+  const left = partsOf(a)
+  const right = partsOf(b)
+  for (let i = 0; i < Math.max(left.length, right.length); i++) {
+    const difference = (left[i] ?? 0) - (right[i] ?? 0)
+    if (difference !== 0) return difference
+  }
+  return 0
+}
+
+/**
+ * A warning naming a bubblewrap older than
+ * OLDEST_FULLY_SUPPORTED_BWRAP_VERSION, and what that costs. Not an error:
+ * the sandbox starts and enforces on it. A version that could not be asked
+ * for is not reported: a guess would be noise on every run.
+ */
+function outdatedBwrapWarning(bwrap: string | null): string | null {
+  if (bwrap === null) return null
+  const version = probeBwrapVersion(bwrap)
+  if (
+    version === null ||
+    compareVersions(version, OLDEST_FULLY_SUPPORTED_BWRAP_VERSION) >= 0
+  ) {
+    return null
+  }
+  return (
+    `bubblewrap ${version} at ${bwrap} is older than ` +
+    `${OLDEST_FULLY_SUPPORTED_BWRAP_VERSION}: a denyRead entry or credential ` +
+    `mask naming a path that is not a regular file (a fifo, socket or device ` +
+    `node) cannot be applied on it, and a mount point an interrupted sandbox ` +
+    `left behind is not recognised as one and stays on the host. Everything ` +
+    `else is unaffected`
+  )
 }
 
 /**
@@ -1449,6 +1541,50 @@ function resolveApplySeccompPrefix(
 }
 
 /**
+ * Shell lines that return once both relays listen, given their process ids in
+ * `$_srt_http` and `$_srt_socks`. The relays are started in the background,
+ * and a command that connects at once got there first: its first connection
+ * was refused.
+ *
+ * The network namespace counts its TCP sockets in use, and a listening one
+ * counts from the moment it listens. The namespace is new and only the two
+ * relays make a socket in it before the command runs, one each, so two in
+ * use are the two relays listening. Not `/proc/net/tcp`, which names the
+ * ports: one read of it walks the host's whole connection table (5 ms on a
+ * machine with 256 GB).
+ *
+ * It gives up, and the command starts as it did before, when a relay has
+ * exited, when a file cannot be read, and after 0.3 s by `/proc/uptime`,
+ * which counts in hundredths (the `1` in front keeps a leading zero from
+ * being read as octal).
+ *
+ * INVARIANT: these lines start no program. They run before the seccomp
+ * filter is on, so anything found on `PATH` here would run without it. That
+ * is why they poll without a pause: `sleep` is a program in all three
+ * shells.
+ *
+ * No `!`: shell-quote would put a backslash before it that the shell keeps.
+ * No `%1`: dash resolves no job outside an interactive shell.
+ */
+const RELAYS_LISTEN = [
+  '_srt_since=',
+  'while [ -r /proc/net/sockstat ] && kill -0 "$_srt_http" "$_srt_socks" 2>/dev/null; do',
+  '  _srt_up=0',
+  '  for _srt_counts in /proc/net/sockstat /proc/net/sockstat6; do',
+  '    [ -r "$_srt_counts" ] || continue',
+  '    while read -r _srt_kind _srt_skip _srt_inuse _srt_skip; do',
+  '      case "$_srt_kind" in TCP: | TCP6:) _srt_up=$((_srt_up + _srt_inuse)); break ;; esac',
+  '    done < "$_srt_counts"',
+  '  done',
+  '  [ "$_srt_up" -lt 2 ] || break',
+  '  read -r _srt_now _srt_skip 2>/dev/null < /proc/uptime || break',
+  '  _srt_now=1${_srt_now%.*}${_srt_now#*.}',
+  '  [ "$((_srt_now - ${_srt_since:=$_srt_now}))" -lt 30 ] || break',
+  'done',
+  'unset _srt_since _srt_now _srt_up _srt_counts _srt_kind _srt_skip _srt_inuse _srt_http _srt_socks',
+]
+
+/**
  * Build the command that runs inside the sandbox.
  * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
  */
@@ -1467,13 +1603,16 @@ function buildSandboxCommand(
   const socat = quote([socatPath ?? 'socat'])
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+    '_srt_http=$!',
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+    '_srt_socks=$!',
     // The trap saves the status the script is exiting with and exits with
     // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
     // keep the script's status, zsh takes the status of the trap's own last
     // command (the kill), so under zsh a failing command reported 0. Single
     // quotes, so $? and $rc are read when the trap runs, not when it is set.
     "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
+    ...RELAYS_LISTEN,
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
@@ -1750,6 +1889,7 @@ async function generateFilesystemArgs(
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
+  const startedIn = workingDirectory()
   // fs already imported
 
   // Collect normalized allowed write paths. Populated in the writeConfig
@@ -1867,7 +2007,7 @@ async function generateFilesystemArgs(
   let readAllowPathsMemo: string[] | undefined
   const readAllowPaths = (): string[] =>
     (readAllowPathsMemo ??= (readConfig?.allowWithinDeny || []).map(p =>
-      normalizePathForSandbox(p),
+      normalizePathForSandbox(p, { literal: true }),
     ))
   // What the read section mounts for one denyRead entry: a tmpfs (directory)
   // or a /dev/null mask (anything else) on the entry itself; nothing when it
@@ -1963,7 +2103,7 @@ async function generateFilesystemArgs(
     if (!readConfig) return []
     const entries: string[] = []
     for (const p of readConfig.denyOnly || []) {
-      if (normalizePathForSandbox(p) !== '/') {
+      if (normalizePathForSandbox(p, { literal: true }) !== '/') {
         entries.push(p)
         continue
       }
@@ -2017,7 +2157,7 @@ async function generateFilesystemArgs(
   let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
   const readDenyPlan = (): ReadDenyPlanEntry[] =>
     (readDenyPlanMemo ??= readDenyEntries()
-      .map(p => normalizePathForSandbox(p))
+      .map(p => normalizePathForSandbox(p, { literal: true }))
       .sort((a, b) => canonicalDepth(a) - canonicalDepth(b))
       .map(normalizedPath => {
         const mount = readDenyMountOf(normalizedPath)
@@ -2045,10 +2185,9 @@ async function generateFilesystemArgs(
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
-      // normalizePathForSandbox already strips a trailing slash from every
-      // spelling it does not take for a glob; this strip covers the ones it
-      // exempts — a literal directory named with glob characters, spelled
-      // '<dir>/[id]/'. Allow paths are recorded slash-free because every
+      // Every path here is a name, and normalizePathForSandbox strips a
+      // name's trailing slash; the strip below stays as a guard. Allow paths
+      // are recorded slash-free because every
       // downstream comparison — the deny loop's within-allowlist gate,
       // findSymlinkInPath's mask scoping, the emission filter's re-expose
       // check, the denyRead re-bind and its allowRead skip, and the stub-skip
@@ -2058,7 +2197,7 @@ async function generateFilesystemArgs(
       // instead of per-predicate. ('/' itself is kept; the empty spelling an
       // empty $HOME expands '~' to is NOT the root, and falls out at the
       // existence check below.)
-      const normalized = normalizePathForSandbox(pathPattern)
+      const normalized = normalizePathForSandbox(pathPattern, { literal: true })
       const normalizedPath =
         normalized === '' ? '' : normalized.replace(/\/+$/, '') || '/'
 
@@ -2222,6 +2361,9 @@ async function generateFilesystemArgs(
         abortSignal,
       )),
     ]
+    // INVARIANT: one plan, one working directory. A relative entry is resolved
+    // against it on both sides of the await above, the only one here.
+    if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
 
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
@@ -2250,7 +2392,7 @@ async function generateFilesystemArgs(
     // directory (the re-check below); an emitted one missing from the record
     // only costs a spurious abort.
     for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern)
+      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
       if (rawPath.startsWith('/dev/')) {
         continue
       }
@@ -2399,7 +2541,7 @@ async function generateFilesystemArgs(
       return covered
     }
     for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern)
+      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (rawPath.startsWith('/dev/')) {
@@ -2712,6 +2854,21 @@ async function generateFilesystemArgs(
   // those matches unmasked.
   const unlistableDenyDirs = new Set(readConfig?.unlistableDenyDirs ?? [])
 
+  // The credential masks, one fake per landing. Where two entries name one
+  // file ('~/.netrc' and its absolute form), the last is kept: it is the
+  // mask bubblewrap would leave in force there.
+  const credentialMaskFakes = new Map<string, string>()
+  for (const { realPath, fakePath } of maskedFileBinds ?? []) {
+    credentialMaskFakes.set(canonicalForm(realPath), fakePath)
+  }
+  // Destinations a file mask has been placed at, or will be: one mount per
+  // destination. A second file mount lands on what the first put there, a
+  // character device for a /dev/null mask, which bubblewrap before 0.5.0
+  // does not take as a mount point: it refuses to start ("Can't create file
+  // at <dest>: Permission denied"). Seeded with the credential landings,
+  // which are emitted after this loop and win where both name one file.
+  const fileMaskLandings = new Set(credentialMaskFakes.keys())
+
   // Every location the read section hides, each one where its mount lands:
   // one per entry that mounts something — a directory's tmpfs, the stand-in
   // tmpfs of an entry that could not be inspected or that resolves to '/', a
@@ -2725,7 +2882,7 @@ async function generateFilesystemArgs(
     ...readDenyPlan().flatMap(({ mount, liftedFile }) =>
       mount === undefined || liftedFile ? [] : [mount.landing],
     ),
-    ...(maskedFileBinds ?? []).map(mask => canonicalForm(mask.realPath)),
+    ...credentialMaskFakes.keys(),
   ]
   // What the read section hides at, inside, or around `target`, ignoring the
   // tmpfs landing at `landing` and every deny above it — those are what a
@@ -2808,6 +2965,15 @@ async function generateFilesystemArgs(
         )
         continue
       }
+      // One mask per destination (see fileMaskLandings): spellings of one
+      // file converge here, and each would otherwise mount over the last.
+      if (fileMaskLandings.has(landing)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny at a destination a file mask already covers: ${normalizedPath} -> ${landing}`,
+        )
+        continue
+      }
+      fileMaskLandings.add(landing)
       // For files, bind /dev/null instead of tmpfs, where the path resolves
       // like every other read-deny mount.
       args.push('--ro-bind', '/dev/null', landing)
@@ -2822,8 +2988,7 @@ async function generateFilesystemArgs(
   // (tilde-expanded, realpath'd) by the caller. The fake's parent dir is
   // explicitly ro-bound at the end of this function, so the bind source is
   // never writable from inside the sandbox.
-  for (const { realPath, fakePath } of maskedFileBinds ?? []) {
-    const landing = canonicalForm(realPath)
+  for (const [landing, fakePath] of credentialMaskFakes) {
     args.push('--ro-bind', fakePath, landing)
     fileMasks.push({ source: fakePath, landing })
   }
@@ -3062,8 +3227,6 @@ export async function wrapCommandWithSandboxLinux(
     proxyAuthToken,
     caCertPath,
     javaAgentJarPath,
-    readConfig,
-    writeConfig,
     unsetEnvVars,
     setEnvVars,
     maskedFileBinds,
@@ -3081,6 +3244,12 @@ export async function wrapCommandWithSandboxLinux(
     observeSocketPath,
     abortSignal,
   } = params
+  // bubblewrap takes no patterns, so every path here is a name. The literal
+  // lists are folded into the lists they belong to, once, so that nothing
+  // below can read a list and miss them; a pattern in `allowOnly` that is no
+  // name is dropped by the fold (see writeNamesOf).
+  const readConfig = readNamesOf(params.readConfig)
+  const writeConfig = writeNamesOf(params.writeConfig)
 
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
