@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import pkg from '../package.json' with { type: 'json' }
 import { quote } from './utils/shell-quote.js'
 import { Command, InvalidArgumentError } from 'commander'
 import { SandboxManager } from './index.js'
@@ -11,7 +12,6 @@ import * as fs from 'fs'
 import * as net from 'net'
 import * as path from 'path'
 import * as os from 'os'
-import { createRequire } from 'module'
 
 /**
  * Get default config path
@@ -21,17 +21,15 @@ function getDefaultConfigPath(): string {
 }
 
 /**
- * The version `--version` reports, read from the package's own manifest, which
- * sits one directory above both src/cli.ts and dist/cli.js. There is no
- * fallback: a manifest that cannot be read is a broken install, and a
- * plausible-looking wrong version is worse than the throw, because the README
- * pins behaviour to specific releases.
+ * The version `--version` reports, from the package's own manifest, which
+ * sits one directory above both src/cli.ts and dist/cli.js. A static import
+ * rather than a runtime require, so a single-file build (`bun build
+ * --compile`) embeds it instead of looking for a package.json beside the
+ * binary. There is still no fallback: a plausible-looking wrong version is
+ * worse than failing, because the README pins behaviour to specific releases.
  */
 function getPackageVersion(): string {
-  const manifest: { version: string } = createRequire(import.meta.url)(
-    '../package.json',
-  )
-  return manifest.version
+  return pkg.version
 }
 
 /**

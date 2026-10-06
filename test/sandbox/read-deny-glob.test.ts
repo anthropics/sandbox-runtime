@@ -16,10 +16,7 @@ import {
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-  expandReadDenyGlobLinux,
-  expandReadDenyGlobLinuxSteps,
-} from '../../src/sandbox/read-deny-glob.js'
+import { expandReadDenyGlobLinux } from '../../src/sandbox/read-deny-glob.js'
 import { expandGlobPattern } from '../../src/sandbox/sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
@@ -64,37 +61,6 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
       join(ROOT, 'build-cache'),
       join(build, '1.out'),
       join(build, 'sub'),
-    ])
-  })
-
-  it('walks a pattern once when handed its walk, and collapses it anew', () => {
-    const build = join(ROOT, 'build')
-    const walks = new Map()
-    // No listings are handed over: only the kept walk can save the steps.
-    const expand = (reExposedPaths: string[]): [number, string[]] => {
-      const steps = expandReadDenyGlobLinuxSteps(
-        join(ROOT, 'build*/**'),
-        reExposedPaths,
-        undefined,
-        undefined,
-        walks,
-      )
-      for (let taken = 0; ; taken++) {
-        const step = steps.next()
-        if (step.done) return [taken, step.value]
-      }
-    }
-    const [walked, mounts] = expand([])
-    expect(walked).toBeGreaterThan(0)
-    expect(mounts).toEqual([build, join(ROOT, 'build-cache')])
-    expect(expand([build])).toEqual([
-      0,
-      [
-        build,
-        join(ROOT, 'build-cache'),
-        join(build, '1.out'),
-        join(build, 'sub'),
-      ],
     ])
   })
 
@@ -204,6 +170,49 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
     } finally {
       rmSync(many, { recursive: true, force: true })
     }
+  })
+})
+
+describe.if(!isWindows)('expandReadDenyGlobLinux (beneath an anchor)', () => {
+  let ROOT: string
+  let PROJECT: string
+
+  beforeAll(() => {
+    ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'deny-glob-anchor-')))
+    // A directory a pattern reads as a character class, and `W project`,
+    // which is what that class matches.
+    PROJECT = join(ROOT, '[WIP] project')
+    for (const base of [PROJECT, join(ROOT, 'W project')]) {
+      mkdirSync(join(base, 'pkg', 'build', 'sub'), { recursive: true })
+      writeFileSync(join(base, 'pkg', 'build', 'sub', '1.out'), '')
+      writeFileSync(join(base, 'pkg', '.env'), '')
+    }
+    mkdirSync(join(ROOT, 'elsewhere'))
+    writeFileSync(join(ROOT, 'elsewhere', '.env'), '')
+    symlinkSync(join(ROOT, 'elsewhere'), join(PROJECT, 'link'))
+  })
+
+  afterAll(() => {
+    rmSync(ROOT, { recursive: true, force: true })
+  })
+
+  it('walks the pattern beneath the directory of that name and no other', () => {
+    expect(expandReadDenyGlobLinux(`${PROJECT}/**/build/**`, [])).toEqual([
+      join(ROOT, 'W project', 'pkg', 'build'),
+    ])
+    expect(
+      expandReadDenyGlobLinux(`${PROJECT}/**/build/**`, [], undefined, {
+        anchor: PROJECT,
+      }),
+    ).toEqual([join(PROJECT, 'pkg', 'build')])
+  })
+
+  it('lists a match found through a link beneath the anchor where it really lives', () => {
+    expect(
+      expandReadDenyGlobLinux(`${PROJECT}/**/.env`, [], undefined, {
+        anchor: PROJECT,
+      }),
+    ).toEqual([join(PROJECT, 'pkg', '.env'), join(ROOT, 'elsewhere', '.env')])
   })
 })
 

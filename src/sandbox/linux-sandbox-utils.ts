@@ -10,6 +10,7 @@ import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
+import { readNamesOf, writeNamesOf } from './path-entries.js'
 import {
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
@@ -23,6 +24,7 @@ import {
   isAtOrUnder,
   isStrictlyUnder,
   getDangerousDirectories,
+  workingDirectory,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -883,6 +885,18 @@ export class LinuxSandboxProfileError extends Error {
         enumerable: false,
       })
     }
+  }
+}
+
+/**
+ * Thrown by the wrap when the host changed its working directory while the
+ * mandatory denies were looked for. Nothing has been handed out or left on
+ * the host by then. `SandboxManager` starts the wrap over.
+ */
+export class WorkingDirectoryChanged extends Error {
+  constructor() {
+    super('The working directory changed while the command was being wrapped')
+    this.name = 'WorkingDirectoryChanged'
   }
 }
 
@@ -1779,6 +1793,50 @@ function resolveApplySeccompPrefix(
 }
 
 /**
+ * Shell lines that return once both relays listen, given their process ids in
+ * `$_srt_http` and `$_srt_socks`. The relays are started in the background,
+ * and a command that connects at once got there first: its first connection
+ * was refused.
+ *
+ * The network namespace counts its TCP sockets in use, and a listening one
+ * counts from the moment it listens. The namespace is new and only the two
+ * relays make a socket in it before the command runs, one each, so two in
+ * use are the two relays listening. Not `/proc/net/tcp`, which names the
+ * ports: one read of it walks the host's whole connection table (5 ms on a
+ * machine with 256 GB).
+ *
+ * It gives up, and the command starts as it did before, when a relay has
+ * exited, when a file cannot be read, and after 0.3 s by `/proc/uptime`,
+ * which counts in hundredths (the `1` in front keeps a leading zero from
+ * being read as octal).
+ *
+ * INVARIANT: these lines start no program. They run before the seccomp
+ * filter is on, so anything found on `PATH` here would run without it. That
+ * is why they poll without a pause: `sleep` is a program in all three
+ * shells.
+ *
+ * No `!`: shell-quote would put a backslash before it that the shell keeps.
+ * No `%1`: dash resolves no job outside an interactive shell.
+ */
+const RELAYS_LISTEN = [
+  '_srt_since=',
+  'while [ -r /proc/net/sockstat ] && kill -0 "$_srt_http" "$_srt_socks" 2>/dev/null; do',
+  '  _srt_up=0',
+  '  for _srt_counts in /proc/net/sockstat /proc/net/sockstat6; do',
+  '    [ -r "$_srt_counts" ] || continue',
+  '    while read -r _srt_kind _srt_skip _srt_inuse _srt_skip; do',
+  '      case "$_srt_kind" in TCP: | TCP6:) _srt_up=$((_srt_up + _srt_inuse)); break ;; esac',
+  '    done < "$_srt_counts"',
+  '  done',
+  '  [ "$_srt_up" -lt 2 ] || break',
+  '  read -r _srt_now _srt_skip 2>/dev/null < /proc/uptime || break',
+  '  _srt_now=1${_srt_now%.*}${_srt_now#*.}',
+  '  [ "$((_srt_now - ${_srt_since:=$_srt_now}))" -lt 30 ] || break',
+  'done',
+  'unset _srt_since _srt_now _srt_up _srt_counts _srt_kind _srt_skip _srt_inuse _srt_http _srt_socks',
+]
+
+/**
  * Build the command that runs inside the sandbox.
  * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
  */
@@ -1803,24 +1861,15 @@ function buildSandboxCommand(
     ...(httpSocketPath
       ? [
           `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+          '_srt_http=$!',
         ]
       : []),
     ...(socksSocketPath
       ? [
           `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+          '_srt_socks=$!',
         ]
       : []),
-    ...(exposeLoopbackPorts ?? []).map(
-      // PRE-EXISTING BUG FIX (minimal, flagged): the bind-mounted socketPath
-      // already exists on the host as an empty placeholder regular file (see
-      // initializeLinuxPortForwardBridges), needed so bwrap's --bind precheck
-      // passes. socat's UNIX-LISTEN refuses to bind when the target path
-      // already exists ("File exists"), even with `reuseaddr` — only
-      // `unlink-early` makes it remove the placeholder and create the real
-      // socket in its place.
-      ({ port, socketPath }) =>
-        `${socat} UNIX-LISTEN:${socketPath},fork,reuseaddr,unlink-early TCP:127.0.0.1:${port} >/dev/null 2>&1 &`,
-    ),
     // The trap saves the status the script is exiting with and exits with
     // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
     // keep the script's status, zsh takes the status of the trap's own last
@@ -1828,6 +1877,14 @@ function buildSandboxCommand(
     // quotes, so $? and $rc are read when the trap runs, not when it is set,
     // and $(jobs -p) includes however many bridge jobs have been started.
     "trap 'rc=$?; kill $(jobs -p) 2>/dev/null; exit $rc' EXIT",
+    // Wait before starting loopback bridges so only the two proxy relays
+    // contribute TCP sockets to the readiness count.
+    ...(httpSocketPath && socksSocketPath ? RELAYS_LISTEN : []),
+    ...(exposeLoopbackPorts ?? []).map(
+      // Replace the bind-mounted placeholder with the actual Unix socket.
+      ({ port, socketPath }) =>
+        `${socat} UNIX-LISTEN:${socketPath},fork,reuseaddr,unlink-early TCP:127.0.0.1:${port} >/dev/null 2>&1 &`,
+    ),
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
@@ -2104,6 +2161,7 @@ async function generateFilesystemArgs(
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
+  const startedIn = workingDirectory()
   // fs already imported
 
   // Collect normalized allowed write paths. Populated in the writeConfig
@@ -2221,7 +2279,7 @@ async function generateFilesystemArgs(
   let readAllowPathsMemo: string[] | undefined
   const readAllowPaths = (): string[] =>
     (readAllowPathsMemo ??= (readConfig?.allowWithinDeny || []).map(p =>
-      normalizePathForSandbox(p),
+      normalizePathForSandbox(p, { literal: true }),
     ))
   // What the read section mounts for one denyRead entry: a tmpfs (directory)
   // or a /dev/null mask (anything else) on the entry itself; nothing when it
@@ -2317,7 +2375,7 @@ async function generateFilesystemArgs(
     if (!readConfig) return []
     const entries: string[] = []
     for (const p of readConfig.denyOnly || []) {
-      if (normalizePathForSandbox(p) !== '/') {
+      if (normalizePathForSandbox(p, { literal: true }) !== '/') {
         entries.push(p)
         continue
       }
@@ -2371,7 +2429,7 @@ async function generateFilesystemArgs(
   let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
   const readDenyPlan = (): ReadDenyPlanEntry[] =>
     (readDenyPlanMemo ??= readDenyEntries()
-      .map(p => normalizePathForSandbox(p))
+      .map(p => normalizePathForSandbox(p, { literal: true }))
       .sort((a, b) => canonicalDepth(a) - canonicalDepth(b))
       .map(normalizedPath => {
         const mount = readDenyMountOf(normalizedPath)
@@ -2399,10 +2457,9 @@ async function generateFilesystemArgs(
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
-      // normalizePathForSandbox already strips a trailing slash from every
-      // spelling it does not take for a glob; this strip covers the ones it
-      // exempts — a literal directory named with glob characters, spelled
-      // '<dir>/[id]/'. Allow paths are recorded slash-free because every
+      // Every path here is a name, and normalizePathForSandbox strips a
+      // name's trailing slash; the strip below stays as a guard. Allow paths
+      // are recorded slash-free because every
       // downstream comparison — the deny loop's within-allowlist gate,
       // findSymlinkInPath's mask scoping, the emission filter's re-expose
       // check, the denyRead re-bind and its allowRead skip, and the stub-skip
@@ -2412,7 +2469,7 @@ async function generateFilesystemArgs(
       // instead of per-predicate. ('/' itself is kept; the empty spelling an
       // empty $HOME expands '~' to is NOT the root, and falls out at the
       // existence check below.)
-      const normalized = normalizePathForSandbox(pathPattern)
+      const normalized = normalizePathForSandbox(pathPattern, { literal: true })
       const normalizedPath =
         normalized === '' ? '' : normalized.replace(/\/+$/, '') || '/'
 
@@ -2576,6 +2633,9 @@ async function generateFilesystemArgs(
         abortSignal,
       )),
     ]
+    // INVARIANT: one plan, one working directory. A relative entry is resolved
+    // against it on both sides of the await above, the only one here.
+    if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
 
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
@@ -2604,7 +2664,7 @@ async function generateFilesystemArgs(
     // directory (the re-check below); an emitted one missing from the record
     // only costs a spurious abort.
     for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern)
+      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
       if (rawPath.startsWith('/dev/')) {
         continue
       }
@@ -2753,7 +2813,7 @@ async function generateFilesystemArgs(
       return covered
     }
     for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern)
+      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (rawPath.startsWith('/dev/')) {
@@ -3439,8 +3499,6 @@ export async function wrapCommandWithSandboxLinux(
     proxyAuthToken,
     caCertPath,
     javaAgentJarPath,
-    readConfig,
-    writeConfig,
     unsetEnvVars,
     setEnvVars,
     maskedFileBinds,
@@ -3459,6 +3517,12 @@ export async function wrapCommandWithSandboxLinux(
     abortSignal,
     exposeLoopbackPorts,
   } = params
+  // bubblewrap takes no patterns, so every path here is a name. The literal
+  // lists are folded into the lists they belong to, once, so that nothing
+  // below can read a list and miss them; a pattern in `allowOnly` that is no
+  // name is dropped by the fold (see writeNamesOf).
+  const readConfig = readNamesOf(params.readConfig)
+  const writeConfig = writeNamesOf(params.writeConfig)
 
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions

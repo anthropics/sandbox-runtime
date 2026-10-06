@@ -296,6 +296,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # For the container below, which runs the built CLI with it.
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+
       - name: Enable unprivileged user namespaces on host
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
@@ -313,19 +319,23 @@ jobs:
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
             -v "${{ github.workspace }}:/work" \
+            -v "$(dirname "$(dirname "$(command -v node)")")":/opt/node:ro \
             -w /work \
             -e SRT_E2E_DOCKER=1 \
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              # node and npm come from the image instead of a second piped
-              # installer, and bun is pinned to the version the rest of the
-              # matrix runs (oven-sh/setup-bun above). The tree carries a
-              # dozen bun-version-specific workarounds, so "whatever bun
-              # shipped this morning" is not the runtime under test.
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin nodejs npm
+              # node and npm are those of the runner, bound in: no second
+              # piped installer, and not those of the image, which has Node
+              # 18, below what engines in package.json allows. bun is pinned
+              # to the version the rest of the matrix runs (oven-sh/setup-bun
+              # above). The tree carries a dozen bun-version-specific
+              # workarounds, so "whatever bun shipped this morning" is not
+              # the runtime under test.
+              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin
               curl -fsSL https://bun.sh/install | bash -s bun-v1.4.2
-              export PATH="$HOME/.bun/bin:$PATH"
+              export PATH="/opt/node/bin:$HOME/.bun/bin:$PATH"
+              node --version
               npm ci
               npm run build:seccomp
               npm run build
