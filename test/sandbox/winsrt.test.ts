@@ -2613,3 +2613,165 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
     expect(`${r.stdout} ${r.stderr}`).toMatch(/denied|Access is denied/i)
   }, 30_000)
 })
+
+// These subprocess fixtures also run on Linux/macOS. Their delayed native
+// stand-in catches event-loop stalls without requiring an installed sandbox.
+describe('Windows ACL lifecycle (all platforms)', () => {
+  // Native process startup can take longer under Windows antivirus scanning.
+  const lifecycleTest = (name: string, run: () => Promise<void>) =>
+    it(name, run, 15_000)
+  async function runLifecycle(mode: string) {
+    const scratch = mkdtempSync(join(tmpdir(), 'srt-acl-lifecycle-'))
+    const logPath = join(scratch, 'commands.jsonl')
+    try {
+      const result = await spawnAsync(
+        process.execPath,
+        [
+          join(import.meta.dir, '../fixtures/windows-acl-lifecycle.ts'),
+          mode,
+          logPath,
+        ],
+        { timeout: 10_000 },
+      )
+      expect(result.status).toBe(0)
+      const commands = readFileSync(logPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map(
+          line =>
+            JSON.parse(line) as {
+              command: string
+              argv: string[]
+              input: string
+            },
+        )
+      const report = result.stdout.trim()
+        ? (JSON.parse(result.stdout) as {
+            calls: { command: string; async: boolean; ticks: number }[]
+            order: string[]
+            error?: { code: string; message: string }
+            callsAtCompletion: number
+          })
+        : undefined
+      return { ...result, commands, report }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  }
+
+  function expectAsyncCalls(
+    result: Awaited<ReturnType<typeof runLifecycle>>,
+    commands: string[],
+  ) {
+    expect(result.commands.map(call => call.command)).toEqual(commands)
+    expect(result.report).toBeDefined()
+    expect(result.report!.callsAtCompletion).toBe(commands.length)
+    expect(result.report!.calls).toHaveLength(commands.length)
+    expect(result.report!.order).toEqual(
+      commands.flatMap(command => [`${command}:start`, `${command}:end`]),
+    )
+    for (const call of result.report!.calls) {
+      expect(call.async).toBe(true)
+      // A timer in the embedding process must tick while EACH real child
+      // is running. The synchronous implementation leaves this at zero.
+      expect(call.ticks).toBeGreaterThan(0)
+    }
+  }
+
+  lifecycleTest(
+    'keeps the host responsive through ordered initialize and reset ACLs',
+    async () => {
+      const result = await runLifecycle('success')
+      expectAsyncCalls(result, ['grant', 'stamp', 'revoke', 'restore'])
+      expect(result.report!.error).toBeUndefined()
+      expect(JSON.parse(result.commands[0].input)).toEqual({
+        read: ['readable'],
+        write: ['workspace'],
+      })
+      expect(JSON.parse(result.commands[1].input)).toEqual({
+        denyRead: ['secret'],
+        denyWrite: ['readonly'],
+      })
+      for (const call of result.commands) {
+        expect(call.argv).toContain('S-1-5-21-test')
+        expect(call.argv[call.argv.indexOf('--holder-pid') + 1]).toMatch(
+          /^\d+$/,
+        )
+      }
+    },
+  )
+
+  for (const command of ['grant', 'stamp']) {
+    lifecycleTest(
+      `awaits asynchronous rollback after a partial ${command} failure`,
+      async () => {
+        const result = await runLifecycle(`fail-${command}`)
+        expectAsyncCalls(
+          result,
+          command === 'grant'
+            ? ['grant', 'revoke', 'restore']
+            : ['grant', 'stamp', 'revoke', 'restore'],
+        )
+        expect(result.report!.error?.code).toBe(`acl_${command}_failed`)
+        expect(result.report!.error?.message).toContain('some inputs skipped')
+      },
+    )
+  }
+
+  for (const command of ['revoke', 'restore']) {
+    lifecycleTest(
+      `preserves per-path diagnostics when ${command} exits nonzero`,
+      async () => {
+        const result = await runLifecycle(`fail-${command}`)
+        expectAsyncCalls(result, ['grant', 'stamp', 'revoke', 'restore'])
+        expect(result.report!.error).toBeUndefined()
+        expect(result.stderr).toContain('leftChanged')
+        expect(result.stderr).toContain(
+          command === 'restore'
+            ? 'outcomes preserved'
+            : 'acl revoke exited non-zero',
+        )
+      },
+    )
+  }
+
+  lifecycleTest(
+    'waits for pending ACL setup before concurrent reset and initializes only once',
+    async () => {
+      const result = await runLifecycle('concurrent-reset')
+      expectAsyncCalls(result, ['grant', 'stamp', 'revoke', 'restore'])
+      expect(result.report!.error).toBeUndefined()
+    },
+  )
+
+  lifecycleTest(
+    'finishes teardown before a new initialization grants access',
+    async () => {
+      const result = await runLifecycle('reinitialize')
+      expectAsyncCalls(result, [
+        'grant',
+        'stamp',
+        'revoke',
+        'restore',
+        'grant',
+        'stamp',
+        'revoke',
+        'restore',
+      ])
+      expect(result.report!.error).toBeUndefined()
+    },
+  )
+
+  lifecycleTest(
+    'runs both synchronous ACL cleanup commands on explicit process exit',
+    async () => {
+      const result = await runLifecycle('exit')
+      expect(result.commands.map(call => call.command)).toEqual([
+        'grant',
+        'stamp',
+        'revoke',
+        'restore',
+      ])
+    },
+  )
+})
