@@ -40,6 +40,7 @@ import {
   directRequestOptions,
   type DirectRequestOptions,
   formatAuthority,
+  relayResponseHead,
   stripHopByHop,
 } from './parent-proxy.js'
 import { sha256Hex } from './aws-sigv4.js'
@@ -653,8 +654,7 @@ async function forwardUpstream(
         )
         res.destroy()
       })
-      res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
-      upRes.pipe(res)
+      if (relayResponseHead(res, upRes)) upRes.pipe(res)
     },
   )
 

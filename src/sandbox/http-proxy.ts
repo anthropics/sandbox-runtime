@@ -43,6 +43,7 @@ import {
   type DirectLookup,
   openConnectTunnel,
   proxyAuthHeader,
+  relayResponseHead,
   selectParentProxyUrl,
   shouldBypassParentProxy,
   stripBrackets,
@@ -835,8 +836,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
-            proxyRes.pipe(res)
+            if (relayResponseHead(res, proxyRes)) proxyRes.pipe(res)
           },
         )
       } else if (parentUrl) {
@@ -866,8 +866,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
-            proxyRes.pipe(res)
+            if (relayResponseHead(res, proxyRes)) proxyRes.pipe(res)
           },
         )
       } else {
@@ -907,8 +906,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               })
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
-            proxyRes.pipe(res)
+            if (relayResponseHead(res, proxyRes)) proxyRes.pipe(res)
           },
         )
       }
