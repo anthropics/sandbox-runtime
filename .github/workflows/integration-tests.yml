@@ -64,6 +64,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+          # Its javac pattern stays on for the whole job and takes every
+          # `file:line: warning:` for its own, autotools' included, which the
+          # build of bubblewrap 0.4.1 below prints.
+          problem-matcher: false
 
       # ─── Windows: srt-win helper binary ─────────────────────────────
       # GitHub-hosted Windows runners run as a member of Administrators
