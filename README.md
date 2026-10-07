@@ -290,7 +290,7 @@ Any other answer denies, whether it is truthy or not, and reports the generic re
 
 The reason is sanitized before it is stored, the way the rest of a violation line is. Each run of control characters (line breaks and tabs included) or of invisible ones (zero-width characters, the joiner among them, and bidi controls) becomes one space; `<` and `>` are removed, so `re-run with <host> listed` is stored as `re-run with host listed`; the ends are trimmed. The result is cut to 500 characters, counted as UTF-16 code units the way `String.prototype.length` counts them. A reason with nothing left after that falls back to `user denied`. Write it as one line of plain text.
 
-**Behaviour change in 0.0.79:** the filter used to allow on any truthy answer, so a callback that resolved to a truthy value other than `true` (`1`, a string, any object) allowed the connection. It now denies. For the same reason, `{ allow: false, reason }` returned to an older release would be read there as an allow, because an object is truthy. `SandboxManager.askCallbackDenyReason` is `true` on a release that understands the object: check it before returning one, and deny with a plain `false` where it is absent.
+**Behaviour change in the first release after 0.0.79:** the filter used to allow on any truthy answer, so a callback that resolved to a truthy value other than `true` (`1`, a string, any object) allowed the connection. It now denies. For the same reason, `{ allow: false, reason }` returned to an older release would be read there as an allow, because an object is truthy. `SandboxManager.askCallbackDenyReason` is `true` on a release that understands the object: check it before returning one, and deny with a plain `false` where it is absent.
 
 ```typescript
 const deny = (reason: string) =>
@@ -888,7 +888,7 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 4. **Two-stage application using apply-seccomp binary**:
    - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
-   - Network bridging processes (socat) start inside the sandbox (need Unix sockets)
+   - Network bridging processes (socat) start inside the sandbox (need Unix sockets), and the wrapper waits until both listen
    - apply-seccomp creates a nested user+PID+mount namespace and remounts `/proc`
    - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
    - apply-seccomp forks, applies the seccomp filter via `prctl()`, and execs the user command

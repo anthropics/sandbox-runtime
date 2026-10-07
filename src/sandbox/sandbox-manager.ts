@@ -54,6 +54,7 @@ import type {
   NetworkRestrictionConfig,
 } from './sandbox-schemas.js'
 import {
+  WorkingDirectoryChanged,
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
@@ -98,6 +99,7 @@ import {
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
   walkGlobPatternSteps,
+  workingDirectory,
   type GlobWalkListings,
   type Steps,
   finish,
@@ -150,6 +152,10 @@ interface HostNetworkManagerContext {
 // ============================================================================
 
 let config: SandboxRuntimeConfig | undefined
+/** How many times a configuration has been installed. A wrap tells by this
+ *  as well as by the object: initialize() keeps the caller's own, which can
+ *  be handed to it again. */
+let configInstalls = 0
 let httpProxyServer: ReturnType<typeof createHttpProxyServer> | undefined
 let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
@@ -791,6 +797,7 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+  configInstalls++
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
@@ -1880,6 +1887,12 @@ async function wrapWithSandboxAgain(
   const commandId = options?.commandId
   registerCommandText(command, options)
   const startedWith = config
+  const startedAt = configInstalls
+  const startedIn = workingDirectory()
+  const movedOn = (): boolean =>
+    config !== startedWith ||
+    configInstalls !== startedAt ||
+    workingDirectory() !== startedIn
   const startOver = (): Promise<string> =>
     wrapWithSandboxAgain(
       restarts + 1,
@@ -1889,11 +1902,11 @@ async function wrapWithSandboxAgain(
       abortSignal,
       options,
     )
-  /** `steps`, left as soon as the configuration is seen to be replaced:
-   *  what they would go on to find is for a wrap that starts over anyway. */
+  /** `steps`, left as soon as the host is seen to have moved on: what they
+   *  would go on to find is for a wrap that starts over anyway. */
   function* whileCurrent<T>(steps: Steps<T>): Steps<T | typeof REPLACED> {
     for (;;) {
-      if (config !== startedWith) return REPLACED
+      if (movedOn()) return REPLACED
       const step = steps.next()
       if (step.done) return step.value
       yield
@@ -2061,6 +2074,10 @@ async function wrapWithSandboxAgain(
   // allowGitConfig of another is a policy nobody chose. So the wrap starts
   // over. Nothing from here to the platform's wrapper awaits.
   //
+  // And one working directory, which a relative entry is resolved against
+  // wherever it is read: a `.` bound back from where the host has gone to,
+  // over denies walked from where it was, uncovers what they matched.
+  //
   // INVARIANT: what a wrap hands out was read from the disk after its
   // configuration was installed. A host that writes a file and then installs
   // a rule that denies it finds it denied by every wrap that goes by that
@@ -2075,7 +2092,7 @@ async function wrapWithSandboxAgain(
   // proof that the wrap ends: a promise continuation, or anything at all
   // while the network is still being initialized, can replace it between the
   // walk and this check, and the wrap then starts over once more.
-  if (config !== startedWith) return startOver()
+  if (movedOn()) return startOver()
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
@@ -2153,6 +2170,10 @@ async function wrapWithSandboxAgain(
         socatPath: config?.socatPath,
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
+      }).catch((err: unknown) => {
+        // It awaits once more, for its scan: see the invariant above.
+        if (err instanceof WorkingDirectoryChanged) return startOver()
+        throw err
       })
 
     case 'windows':
@@ -2374,6 +2395,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   const { filterRequest, ...rest } = newConfig.network
   config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
+  configInstalls++
   resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
