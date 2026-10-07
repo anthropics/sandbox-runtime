@@ -18,6 +18,9 @@ import { isMacOS, isWindows } from '../helpers/platform.js'
 describe.if(!isWindows)('system symlink root boundaries', () => {
   it.each(['/tmp', '/var'])('accepts the exact canonical root for %s', root => {
     expect(isSymlinkOutsideBoundary(root, '/private' + root)).toBe(false)
+    expect(isSymlinkOutsideBoundary(root, '/private' + root + '/child')).toBe(
+      false,
+    )
     expect(isSymlinkOutsideBoundary(root + '/', '/private' + root + '/')).toBe(
       false,
     )
@@ -31,6 +34,8 @@ describe.if(!isWindows)('system symlink root boundaries', () => {
     ['/var', '/private'],
     ['/tmp', '/private/var'],
     ['/var', '/private/tmp'],
+    ['/tmp', '/private/tmp-other'],
+    ['/var', '/private/var-other'],
     ['/tmp-other', '/private/tmp-other'],
     ['/various', '/private/various'],
     ['/tmp/child', '/private/tmp'],

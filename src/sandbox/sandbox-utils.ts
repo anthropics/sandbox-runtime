@@ -256,9 +256,9 @@ export function isSymlinkOutsideBoundary(
   // Also check the canonical form of the original path for macOS
   // e.g., /tmp/claude should also be checked as /private/tmp/claude
   let canonicalOriginal = normalizedOriginal
-  if (normalizedOriginal.startsWith('/tmp/')) {
+  if (isAtOrUnder(normalizedOriginal, '/tmp')) {
     canonicalOriginal = '/private' + normalizedOriginal
-  } else if (normalizedOriginal.startsWith('/var/')) {
+  } else if (isAtOrUnder(normalizedOriginal, '/var')) {
     canonicalOriginal = '/private' + normalizedOriginal
   }
 
