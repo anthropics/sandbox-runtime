@@ -16,7 +16,7 @@
  */
 
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
-import { Transform } from 'node:stream'
+import { Transform, type Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 import { BODYLESS_METHODS } from './request-filter.js'
 
@@ -50,17 +50,23 @@ export function allLengthMatched(
  * method, no credential injectable at `destHost`, or a Content-Encoding the
  * byte scan cannot see through.
  *
- * When substitution can change the body length (some injectable sentinel is
- * not length-matched with its real value — e.g. a caller-minted JWT-shaped
- * fake), Content-Length is deleted from `fwdHeaders` so the outbound
- * request re-frames as chunked; otherwise Content-Length stays verbatim.
+ * When substitution *can* change the body length, callers must buffer the
+ * substituted body and set an exact Content-Length. Do not drop
+ * Content-Length here: most requests to a host with a short credential
+ * never contain a sentinel, and deleting the header reframes every upload
+ * as chunked (GitHub release assets return 400 Bad Content-Length).
  */
+export type BodySubstitutionPlan = {
+  transform: Transform
+  mayChangeLength: boolean
+}
+
 export function prepareBodySubstitution(
   getBodySubstitutions: GetBodySubstitutions | undefined,
   req: IncomingMessage,
   fwdHeaders: IncomingHttpHeaders,
   destHost: string,
-): Transform | undefined {
+): BodySubstitutionPlan | undefined {
   if (getBodySubstitutions === undefined) return undefined
   // A bodyless-method request can still carry a declared body (GET-with-body
   // APIs are legal HTTP and forwarded today) — skip only when there is
@@ -87,10 +93,10 @@ export function prepareBodySubstitution(
     )
     return undefined
   }
-  if (!allLengthMatched(pairs)) {
-    delete fwdHeaders['content-length']
+  return {
+    transform: createBodySubstitutionTransform(pairs),
+    mayChangeLength: !allLengthMatched(pairs),
   }
-  return createBodySubstitutionTransform(pairs)
 }
 
 /**
@@ -161,4 +167,36 @@ function substitute(
     out: Buffer.concat(parts),
     tail: Buffer.from(work.subarray(tailStart)),
   }
+}
+
+/** Cap for buffering a length-changing substituted body before setting Content-Length. */
+export const MAX_BODY_SUBSTITUTION_BUFFER_BYTES = 64 * 1024 * 1024
+
+export class BodySubstitutionTooLargeError extends Error {}
+
+export function collectLimitedBody(
+  body: Readable,
+  maxBytes: number,
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let total = 0
+    const onData = (c: Buffer) => {
+      total += c.length
+      if (total > maxBytes) {
+        chunks.length = 0
+        body.removeListener('data', onData)
+        reject(
+          new BodySubstitutionTooLargeError(
+            `request body exceeds ${maxBytes} bytes`,
+          ),
+        )
+        return
+      }
+      chunks.push(c)
+    }
+    body.on('data', onData)
+    body.once('end', () => resolve(Buffer.concat(chunks)))
+    body.once('error', reject)
+  })
 }
