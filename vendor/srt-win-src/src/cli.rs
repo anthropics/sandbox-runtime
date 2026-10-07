@@ -531,6 +531,82 @@ fn canonicalize_ace_targets(
     })
 }
 
+/// Give the sandbox user [`SbAce::ReadAttrs`] on each ancestor of a
+/// granted path that it could not otherwise stat, up to (not
+/// including) the volume root. Best-effort per ancestor: a failure is
+/// logged and leaves the grant itself in place. Released with the
+/// grants (`acl revoke`).
+///
+/// [`SbAce::ReadAttrs`]: srt_win::acl::SbAce::ReadAttrs
+fn grant_ancestor_attrs(
+    db: &srt_win::state_db::Locked,
+    sandbox_sid: &str,
+    targets: &[(String, srt_win::acl::SbAce)],
+) {
+    use srt_win::acl::{SbAce, StatProbe};
+    use srt_win::path_id::{canonical_parent_of, is_unc_path};
+    let probe = match StatProbe::new(sandbox_sid) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("srt-win: WARNING: ancestor read-attributes skipped: {e:#}");
+            return;
+        }
+    };
+    let granted: std::collections::HashSet<&str> =
+        targets.iter().map(|(p, _)| p.as_str()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut held = 0usize;
+    let ra = [SbAce::ReadAttrs.kind()];
+    let holds = || -> Option<std::collections::HashSet<String>> {
+        match db.my_ace_holds(Some(&ra)) {
+            Ok(v) => Some(v.into_iter().map(|(p, _)| p).collect()),
+            Err(e) => {
+                eprintln!("srt-win: WARNING: read-attributes holds: {e:#}");
+                None
+            }
+        }
+    };
+    let held_before = holds();
+    for (canon, _) in targets.iter().filter(|(p, _)| !is_unc_path(p)) {
+        let mut next = canonical_parent_of(canon);
+        while let Some(anc) = next {
+            next = canonical_parent_of(&anc);
+            if !seen.insert(anc.clone()) {
+                break;
+            }
+            if granted.contains(anc.as_str()) {
+                continue;
+            }
+            match probe.can_stat(&anc) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("srt-win: WARNING: read-attributes '{anc}': {e:#}");
+                    continue;
+                }
+            }
+            match db.apply_aces(sandbox_sid, &[(anc.clone(), SbAce::ReadAttrs)]) {
+                Ok((_, 0)) => held += 1,
+                // Roll back only a hold this call added: the converge failed
+                // after the holder row went in.
+                Ok(_)
+                    if held_before.as_ref().is_some_and(|b| !b.contains(&anc))
+                        && holds().is_some_and(|now| now.contains(&anc)) =>
+                {
+                    if let Err(e) = db.release_one_ace(&anc, ra[0], sandbox_sid) {
+                        eprintln!("srt-win: WARNING: read-attributes '{anc}' left in place: {e:#}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("srt-win: WARNING: read-attributes '{anc}': {e:#}"),
+            }
+        }
+    }
+    if held > 0 {
+        eprintln!("srt-win: acl grant — read-attributes on {held} ancestor(s)");
+    }
+}
+
 /// Build the `user status` JSON object (sandbox-user provisioning
 /// state + credential/marker/CA rows from `state.db`). Shared by
 /// `user status` and the top-level combined `status`.
@@ -1208,6 +1284,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
                     let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                    if f == 0 {
+                        grant_ancestor_attrs(db, &sandbox_user_sid, &at.targets);
+                    }
                     Ok((at, w, f))
                 })?;
             let AceTargets {
