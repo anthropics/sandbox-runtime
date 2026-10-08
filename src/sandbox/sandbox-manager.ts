@@ -2759,7 +2759,11 @@ function getLinuxGlobPatternWarnings(): string[] {
   // in its first path component, `/**/*.pem`), which expands to nothing and
   // leaves the entry unenforced.
   for (const path of [
-    ...config.filesystem.denyRead,
+    ...new Set([
+      ...config.filesystem.denyRead,
+      // Joins the read denies, and is skipped like one of them.
+      ...getCredentialDenyReadPaths(config.credentials),
+    ]),
     ...(config.filesystem.allowRead ?? []),
   ]) {
     if (typeof path !== 'string') continue
