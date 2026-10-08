@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import pkg from '../package.json' with { type: 'json' }
 import { quote } from './utils/shell-quote.js'
 import { Command, InvalidArgumentError } from 'commander'
 import { SandboxManager } from './index.js'
@@ -11,7 +12,6 @@ import * as fs from 'fs'
 import * as net from 'net'
 import * as path from 'path'
 import * as os from 'os'
-import { createRequire } from 'module'
 
 /**
  * Get default config path
@@ -21,17 +21,15 @@ function getDefaultConfigPath(): string {
 }
 
 /**
- * The version `--version` reports, read from the package's own manifest, which
- * sits one directory above both src/cli.ts and dist/cli.js. There is no
- * fallback: a manifest that cannot be read is a broken install, and a
- * plausible-looking wrong version is worse than the throw, because the README
- * pins behaviour to specific releases.
+ * The version `--version` reports, from the package's own manifest, which
+ * sits one directory above both src/cli.ts and dist/cli.js. A static import
+ * rather than a runtime require, so a single-file build (`bun build
+ * --compile`) embeds it instead of looking for a package.json beside the
+ * binary. There is still no fallback: a plausible-looking wrong version is
+ * worse than failing, because the README pins behaviour to specific releases.
  */
 function getPackageVersion(): string {
-  const manifest: { version: string } = createRequire(import.meta.url)(
-    '../package.json',
-  )
-  return manifest.version
+  return pkg.version
 }
 
 /**
@@ -266,6 +264,19 @@ async function main(): Promise<void> {
         console.error(`Error: ${(e as Error).message}`)
         process.exit(1)
       }
+    })
+
+  program
+    .command('proxy')
+    .description(
+      'Run only the HTTP proxy, deciding every request through an external decider on inherited fds.',
+    )
+    .allowUnknownOption()
+    .helpOption(false)
+    .argument('[args...]')
+    .action(async (args: string[]) => {
+      const { runProxyCli } = await import('./proxy-cli.js')
+      await runProxyCli(args)
     })
 
   // Default command - run command in sandbox

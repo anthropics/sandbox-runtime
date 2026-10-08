@@ -3,6 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import type { FilesystemPathEntry } from './sandbox-config.js'
 
 /**
  * Dangerous files that should be protected from writes.
@@ -92,6 +93,15 @@ export function pathSpellings(candidatePath: string): string[] {
   return [candidatePath]
 }
 
+/** `process.cwd()`, or undefined where that throws: it has been removed. */
+export function workingDirectory(): string | undefined {
+  try {
+    return process.cwd()
+  } catch {
+    return undefined
+  }
+}
+
 /** An fs error that means the name resolves to no file — it is missing, or
  * the path cannot name one at all — as opposed to one that means a file is
  * there but could not be looked at (EACCES, EPERM, EIO, anything
@@ -134,6 +144,30 @@ export function containsGlobCharsForPlatform(p: string): boolean {
   return getPlatform() === 'windows'
     ? containsGlobCharsWin(p)
     : containsGlobChars(p)
+}
+
+/**
+ * The path of an entry that is not a spelling. Throws unless the entry is
+ * `{ path: string, literal: true }`: a config built in code skips the
+ * schema, and reading `{ path }` either way would be a guess about a deny.
+ */
+export function markedLiteralPath(
+  entry: Exclude<FilesystemPathEntry, string>,
+): string {
+  const candidate: { path?: unknown; literal?: unknown } | null = entry
+  if (
+    candidate === null ||
+    typeof candidate !== 'object' ||
+    typeof candidate.path !== 'string' ||
+    candidate.path === '' ||
+    candidate.literal !== true
+  ) {
+    throw new TypeError(
+      'A filesystem path entry must be a path, or { path, literal: true }; ' +
+        `got ${JSON.stringify(entry) ?? String(entry)}`,
+    )
+  }
+  return candidate.path
 }
 
 /**
@@ -343,7 +377,7 @@ export function expandWindowsEnvRefs(p: string): string {
  * Runs of `/` collapsed to one and `/./` components dropped, leaving the rest
  * of the spelling (a trailing `/` or `/.`, a `..`) to the caller. POSIX only.
  */
-function collapseInteriorSpellings(pathPattern: string): string {
+export function collapseInteriorSpellings(pathPattern: string): string {
   return pathPattern.replace(/\/{2,}/g, '/').replace(/\/\.(?=\/)/g, '')
 }
 
@@ -381,14 +415,15 @@ function warnIfParentRefUnfolded(normalizedPath: string): string {
  * Returns the absolute path with symlinks resolved (or normalized glob pattern)
  *
  * `opts.literal` marks a path that names one file or directory rather
- * than matching several: one the library computed itself, or a caller
- * spelling that carried no glob character — resolving such a spelling can
- * splice in a cwd or home directory whose own name does. The glob
- * branches are skipped for it, so a component like `a[b` is resolved and
- * later compiled as the name it is. A spelling the caller wrote with `*`,
- * `?` or `[…]` in it keeps the character sniffing: there the brackets are
- * the glob syntax it asked for. The interior collapse below is not one of
- * the glob branches: `//` and `/./` are dead spellings either way.
+ * than matching several: one the library computed itself, one the caller
+ * marked literal, a caller spelling that carried no glob character —
+ * resolving such a spelling can splice in a cwd or home directory whose own
+ * name does — or the name a spelling with glob characters also is (see
+ * path-entries.ts). The glob branches are skipped for it, so a component
+ * like `a[b` is resolved and later compiled as the name it is. Without it,
+ * a spelling with `*`, `?` or `[…]` in it keeps the character sniffing, its
+ * pattern reading. The interior collapse below is not one of the glob
+ * branches: `//` and `/./` are dead spellings either way.
  */
 export function normalizePathForSandbox(
   pathPattern: string,
@@ -570,10 +605,14 @@ const HOME_CONVENIENCE_WRITE_DIRS: readonly string[] = [
  * still counts (which only ever drops a convenience path), and a glob whose
  * match is a symlink to one of these directories is not seen. A glob
  * `allowRead` entry is not counted as re-opening anything.
+ *
+ * An entry marked `{ path, literal: true }` is a name whatever it holds. A
+ * spelling is read by its characters alone: the name it also is when that
+ * exists on disk is for the caller to add as a marked entry.
  */
 export function getDefaultWritePaths(readRules?: {
-  denyRead: readonly string[]
-  allowRead?: readonly string[]
+  denyRead: readonly FilesystemPathEntry[]
+  allowRead?: readonly FilesystemPathEntry[]
 }): string[] {
   const home = homedir()
   const keptDirs =
@@ -592,8 +631,8 @@ export function getDefaultWritePaths(readRules?: {
  */
 function homeDirsNotReadDenied(
   home: string,
-  denyRead: readonly string[],
-  allowRead: readonly string[] = [],
+  denyRead: readonly FilesystemPathEntry[],
+  allowRead: readonly FilesystemPathEntry[] = [],
 ): readonly string[] {
   // Rules are compared as normalizePathForSandbox spells them, and on macOS
   // that resolves /tmp and /var to /private/... for a path that exists. A
@@ -604,8 +643,11 @@ function homeDirsNotReadDenied(
   ]
   const denies = denyRead.map(entry => readRuleCovers(entry))
   const reopened = allowRead
-    .map(entry => removeTrailingGlobSuffix(entry))
-    .filter(entry => !containsGlobCharsForPlatform(entry))
+    .flatMap(entry => {
+      if (typeof entry !== 'string') return [markedLiteralPath(entry)]
+      const stripped = removeTrailingGlobSuffix(entry)
+      return containsGlobCharsForPlatform(stripped) ? [] : [stripped]
+    })
     .map(entry => normalizePathForSandbox(entry, { literal: true }))
   return HOME_CONVENIENCE_WRITE_DIRS.filter(rel => {
     const spellings = homes.map(h => path.join(h, rel))
@@ -629,9 +671,15 @@ function homeDirsNotReadDenied(
  * is resolved: `*`, `?` and `[…]` there are the syntax it asked for, while
  * resolving splices in a cwd or home directory that may carry those
  * characters in its own name. A spelling without them is normalized as the
- * name it is.
+ * name it is, and so is an entry marked literal, whatever it holds.
  */
-function readRuleCovers(entry: string): (p: string) => boolean {
+function readRuleCovers(entry: FilesystemPathEntry): (p: string) => boolean {
+  if (typeof entry !== 'string') {
+    const rule = normalizePathForSandbox(markedLiteralPath(entry), {
+      literal: true,
+    })
+    return p => isAtOrUnder(p, rule)
+  }
   const stripped = removeTrailingGlobSuffix(entry)
   if (containsGlobCharsForPlatform(stripped)) {
     try {
@@ -1055,12 +1103,14 @@ export function proxyUsernameFor(encodedCommand: string | undefined): string {
 /**
  * Inverse of {@link proxyUsernameFor}: extract the encodedCommand suffix
  * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
- * The username is client-controlled inside the sandbox, so a forged suffix
- * can only misattribute a denial in the violation report — it cannot
- * authenticate (the token does that) or reach another command's data. A
+ * The username is presented by the client inside the sandbox. A forged
+ * suffix cannot authenticate (the token does that), but it decides which
+ * invocation a denial is attributed to in the violation report and which
+ * registered network allow list applies to the connection: see
+ * `SandboxManager.registerCommandNetworkLists` for what that asks of an id. A
  * suffix past {@link MAX_ENCODED_COMMAND_BYTES} is longer than this process
  * can mint, so it is dropped rather than stored: the denial is still
- * recorded, unattributed.
+ * recorded, unattributed, and no registered list applies.
  */
 export function encodedCommandFromProxyUser(
   username: string | undefined,
@@ -1117,10 +1167,10 @@ export function globToRegex(globPattern: string): string {
  * already does (a deny masks the whole subtree). Only ever widens a deny.
  *
  * Takes a whole pattern, so every character in it is glob syntax: right for
- * a spelling the caller wrote, which is what {@link readRuleCovers} passes.
- * A pattern the library anchored at a directory of its own goes through the
- * macOS `denyGlobEntryRegex`, which splices that directory back in escaped
- * and calls this for the tail.
+ * the pattern reading of a spelling the caller wrote, which is what
+ * {@link readRuleCovers} passes. A pattern anchored at a directory that is a
+ * name on disk goes through the macOS `denyGlobEntryRegex`, which splices
+ * that directory back in escaped and calls this for the tail.
  */
 export function denyGlobRegex(normalizedGlob: string): string {
   // globToRegex() always returns '^…$'.
@@ -1135,11 +1185,21 @@ export interface ExpandGlobOptions {
    * don't need it).
    */
   caseInsensitive?: boolean
+  /**
+   * A directory the pattern is walked beneath, taken as the name it is: a
+   * leading run of `globPath` that exists on disk and may itself hold `[`,
+   * `*` or `?`. Only what follows it is pattern. The glob dialect has no
+   * escape, so this is the one way to say where such a name ends. A
+   * `TypeError` is thrown for one that is empty or the root, or that
+   * `globPath` does not start with, up to a separator.
+   */
+  anchor?: string
 }
 
-/** Successful listings, by real directory: a second position, or a second
- *  pattern, reads the same entries. */
-export type GlobWalkListings = Map<string, fs.Dirent[]>
+/** What listing a real directory gave, its entries or the error that has it
+ *  denied whole: a second position, or a second pattern, reads the same
+ *  answer. */
+export type GlobWalkListings = Map<string, fs.Dirent[] | Error>
 
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
@@ -1504,7 +1564,8 @@ function globPositions(
  * component), which {@link walkGlobPattern} refuses to expand.
  *
  * @param normalizedPattern - a pattern already through
- * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes})
+ * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes}),
+ * or the tail of one that is walked beneath an anchor
  */
 export function globPatternBaseDir(normalizedPattern: string): string {
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
@@ -1553,8 +1614,30 @@ export function* walkGlobPatternSteps(
     realOf: new Map(),
   }
 
-  const normalizedPattern = toForwardSlashes(normalizePathForSandbox(globPath))
-  const baseDir = globPatternBaseDir(normalizedPattern)
+  // Beneath an anchor the pattern is the tail alone, so no character of the
+  // anchor is compiled; the walk starts at the anchor plus the tail's base.
+  const anchor =
+    opts.anchor === undefined ? undefined : toForwardSlashes(opts.anchor)
+  const normalizedPattern =
+    anchor === undefined
+      ? toForwardSlashes(normalizePathForSandbox(globPath))
+      : toForwardSlashes(globPath).slice(anchor.length)
+  // The tail is cut by length, so a wrong anchor would walk another directory
+  // and hand back its matches. Thrown, not skipped: a skipped deny is lost.
+  if (
+    anchor !== undefined &&
+    (!/[^/]/.test(anchor) ||
+      !toForwardSlashes(globPath).startsWith(anchor) ||
+      !(anchor.endsWith('/') || /^(\/|$)/.test(normalizedPattern)))
+  ) {
+    throw new TypeError(
+      `Glob pattern ${globPath} does not lie beneath the anchor ${opts.anchor}`,
+    )
+  }
+  const patternBaseDir = globPatternBaseDir(normalizedPattern)
+  const baseDirBelowAnchor = patternBaseDir === '/' ? '' : patternBaseDir
+  const baseDir =
+    anchor === undefined ? patternBaseDir : anchor + baseDirBelowAnchor
   if (baseDir === '' || baseDir === '/') {
     logForDebugging(
       `[Sandbox] Glob pattern has no literal directory to start from, skipping: ${globPath}`,
@@ -1657,7 +1740,9 @@ export function* walkGlobPatternSteps(
     dir: baseDir,
     real: baseReal,
     short: baseDir.length < baseReal.length ? baseDir : baseReal,
-    positions: baseDir.split('/').reduce(positions.next, positions.start),
+    positions: (anchor === undefined ? baseDir : baseDirBelowAnchor)
+      .split('/')
+      .reduce(positions.next, positions.start),
   })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real } = frame
@@ -1669,11 +1754,15 @@ export function* walkGlobPatternSteps(
     if (fresh.length === 0) continue
     yield
     for (const p of fresh) listed.add(p)
-    let entries = listings.get(real)
+    let entries: fs.Dirent[]
     try {
-      entries ??= onRealPath(real, frame.short, p =>
-        fs.readdirSync(p, { withFileTypes: true }),
-      )
+      const known = listings.get(real)
+      if (known instanceof Error) throw known
+      entries =
+        known ??
+        onRealPath(real, frame.short, p =>
+          fs.readdirSync(p, { withFileTypes: true }),
+        )
       listings.set(real, entries)
     } catch (err) {
       const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
@@ -1682,6 +1771,10 @@ export function* walkGlobPatternSteps(
         { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
       )
       if (errorCode !== 'ENOENT') {
+        // Kept, or every pattern would try the directory again: one that
+        // would have cleared meanwhile hides more. An absence is not kept. It
+        // is the one answer that denies nothing, so each pattern asks.
+        listings.set(real, err instanceof Error ? err : new Error(String(err)))
         walk.unlisted.push(dir)
         if (real !== dir) walk.realOf.set(dir, real)
       }
@@ -1701,7 +1794,14 @@ export function* walkGlobPatternSteps(
       }
       const fullPath = path.join(dir, entry.name)
       const realPath = path.join(real, entry.name)
-      const candidate = toForwardSlashes(fullPath)
+      // A pattern that does not split is matched by its whole spelling, and
+      // beneath an anchor that is the spelling from the anchor on. It is never
+      // listed through a link, so every path it sees starts with the anchor.
+      const spelled = toForwardSlashes(fullPath)
+      const candidate =
+        anchor !== undefined && spelled.startsWith(anchor)
+          ? spelled.slice(anchor.length)
+          : spelled
       const isMatch = positions.matches(fresh, entry.name, candidate)
       if (isMatch) walk.matches.push(fullPath)
       if (entry.isDirectory()) {

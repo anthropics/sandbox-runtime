@@ -73,20 +73,21 @@ function collapseReadDenyLocations({
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
- * @param listings - one map for all the patterns of a configuration.
+ * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
+ * @param opts.listings - one map for all the patterns of a configuration.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  listings?: GlobWalkListings,
+  opts: { anchor?: string; listings?: GlobWalkListings } = {},
 ): string[] {
   return finish(
     expandReadDenyGlobLinuxSteps(
       globPattern,
       reExposedPaths,
       unlistableDirs,
-      listings,
+      opts,
     ),
   )
 }
@@ -96,12 +97,13 @@ export function* expandReadDenyGlobLinuxSteps(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  listings?: GlobWalkListings,
+  opts: { anchor?: string; listings?: GlobWalkListings } = {},
 ): Steps<string[]> {
   const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
-    listings,
+    anchor: opts.anchor,
+    listings: opts.listings,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.
@@ -179,8 +181,11 @@ export function* expandReadDenyGlobLinuxSteps(
     addLocation(standIn, candidate)
   }
 
+  // Allow paths, which reach this backend as names whatever they hold.
   const reExposed = new Set(
-    reExposedPaths.flatMap(p => pathSpellings(normalizePathForSandbox(p))),
+    reExposedPaths.flatMap(p =>
+      pathSpellings(normalizePathForSandbox(p, { literal: true })),
+    ),
   )
   const mounts = collapseReadDenyLocations({
     locations,

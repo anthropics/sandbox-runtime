@@ -252,6 +252,47 @@ try {
     & $Exe acl recover 2>&1 | Out-Null
   }
 
+  # ── A32: one path in BOTH deny lists keeps the read deny ────────
+  # One holder, one batch: unlike A13, where two holders meet and
+  # `effective_ace` takes the max over their rows.
+  $f32 = Join-Path $Root 'a32.txt'
+  'A32-DATA' | Set-Content -Encoding ASCII $f32
+  $d32 = Join-Path $Root 'a32dir'
+  $null = New-Item -ItemType Directory -Path $d32
+  $i32 = Join-Path $d32 'inside.txt'
+  'A32-INSIDE' | Set-Content -Encoding ASCII $i32
+  $h32 = Start-Process -FilePath $cmd -PassThru -WindowStyle Hidden `
+         -ArgumentList '/c','timeout','/t','120','/nobreak'
+  try {
+    Stamp @{ denyRead = @($f32, $d32); denyWrite = @($f32, $d32) } $h32.Id
+    foreach ($p in @($f32, $i32)) {
+      $r = RExec @('--', $cmd, '/c', "type `"$p`"")
+      if ($r.exit -eq 0 -or $r.out -match 'A32-') {
+        throw "A32: '$p' is in denyRead and denyWrite and the child " +
+              "READ it. raw: $($r.raw)"
+      }
+    }
+    $r = RExec @('--', $cmd, '/c', "echo nope> `"$f32`"")
+    if ($r.exit -eq 0) {
+      throw "A32: child WRITE succeeded (should be denied). raw: $($r.raw)"
+    }
+  } finally {
+    Stop-Process -Id $h32.Id -Force -ea SilentlyContinue
+    & $Exe acl recover 2>&1 | Out-Null
+  }
+  # The same for one command's own lists, in the other order.
+  $r = RExec @('--deny-write', $f32, '--deny-read', $f32, '--',
+               $cmd, '/c', "type `"$f32`"")
+  if ($r.exit -eq 0 -or $r.out -match 'A32-') {
+    throw "A32: per-exec --deny-write and --deny-read on one file and " +
+          "the child READ it. raw: $($r.raw)"
+  }
+  $r = RExec @('--', $cmd, '/c', "type `"$f32`"")
+  if ($r.out -notmatch 'A32-DATA') {
+    throw "A32: still denied once nothing holds it. raw: $($r.raw)"
+  }
+  Write-Host 'A32 ok: a path in both deny lists — read denied, write denied'
+
   # ── A28: per-exec error after stamp → PerExecRestore Drop runs ──
   $f28 = Join-Path $Root 'a28.txt'
   'A28-DATA' | Set-Content -Encoding ASCII $f28
