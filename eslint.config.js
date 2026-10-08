@@ -84,14 +84,14 @@ export default [
       'eslint-plugin-n/no-unsupported-features/es-builtins': [
         'error',
         {
-          version: '>=20.11.0',
+          version: '>=22.12.0',
           ignores: [],
         },
       ],
       'eslint-plugin-n/no-unsupported-features/node-builtins': [
         'error',
         {
-          version: '>=20.11.0',
+          version: '>=22.12.0',
           // Web-standard Request/Headers/ReadableStream and the
           // Readable.toWeb/fromWeb adapters are available since Node 18.0.0
           // (the rule flags them as experimental until 21–23) and stable in
@@ -102,9 +102,8 @@ export default [
             'ReadableStream',
             'stream.Readable.toWeb',
             'stream.Readable.fromWeb',
-            // Backported to ^20.11.0 and ^21.2.0; the rule's semver
-            // intersection rejects `>=20.11.0` because that range
-            // includes 21.0.x/22.0-22.15 which lack it.
+            // In the 22 line only from 22.16.0, by the rule's data, so
+            // `>=22.12.0` does not cover it.
             'import.meta.dirname',
           ],
         },
@@ -131,6 +130,27 @@ export default [
     },
     linterOptions: {
       reportUnusedDisableDirectives: false,
+    },
+  },
+  {
+    // bubblewrap takes no patterns, so every path that reaches the Linux
+    // backend is a name. normalizePathForSandbox with one argument decides
+    // pattern or name from the characters of the path, which would read a
+    // name with `[`, `*` or `?` in it as a pattern again.
+    files: [
+      'src/sandbox/linux-sandbox-utils.ts',
+      'src/sandbox/read-deny-glob.ts',
+    ],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector:
+            "CallExpression[callee.name='normalizePathForSandbox'][arguments.length=1]",
+          message:
+            'Every path here is a name: pass { literal: true }, so that glob characters in it are not read as a pattern.',
+        },
+      ],
     },
   },
   prettierRecommended,

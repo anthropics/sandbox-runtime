@@ -173,6 +173,49 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
   })
 })
 
+describe.if(!isWindows)('expandReadDenyGlobLinux (beneath an anchor)', () => {
+  let ROOT: string
+  let PROJECT: string
+
+  beforeAll(() => {
+    ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'deny-glob-anchor-')))
+    // A directory a pattern reads as a character class, and `W project`,
+    // which is what that class matches.
+    PROJECT = join(ROOT, '[WIP] project')
+    for (const base of [PROJECT, join(ROOT, 'W project')]) {
+      mkdirSync(join(base, 'pkg', 'build', 'sub'), { recursive: true })
+      writeFileSync(join(base, 'pkg', 'build', 'sub', '1.out'), '')
+      writeFileSync(join(base, 'pkg', '.env'), '')
+    }
+    mkdirSync(join(ROOT, 'elsewhere'))
+    writeFileSync(join(ROOT, 'elsewhere', '.env'), '')
+    symlinkSync(join(ROOT, 'elsewhere'), join(PROJECT, 'link'))
+  })
+
+  afterAll(() => {
+    rmSync(ROOT, { recursive: true, force: true })
+  })
+
+  it('walks the pattern beneath the directory of that name and no other', () => {
+    expect(expandReadDenyGlobLinux(`${PROJECT}/**/build/**`, [])).toEqual([
+      join(ROOT, 'W project', 'pkg', 'build'),
+    ])
+    expect(
+      expandReadDenyGlobLinux(`${PROJECT}/**/build/**`, [], undefined, {
+        anchor: PROJECT,
+      }),
+    ).toEqual([join(PROJECT, 'pkg', 'build')])
+  })
+
+  it('lists a match found through a link beneath the anchor where it really lives', () => {
+    expect(
+      expandReadDenyGlobLinux(`${PROJECT}/**/.env`, [], undefined, {
+        anchor: PROJECT,
+      }),
+    ).toEqual([join(PROJECT, 'pkg', '.env'), join(ROOT, 'elsewhere', '.env')])
+  })
+})
+
 describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
   let ROOT: string
   let OUTSIDE: string
@@ -342,6 +385,75 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
 
     expect(mounts).toEqual([])
     expect([...unlistable]).toEqual([])
+  })
+
+  describe('a directory with two names that does not list', () => {
+    /** The mounts of two patterns handed the same listings, with the first
+     *  `failures` listings of pkg/certs, which lnk leads to as well, failing
+     *  with `code`. */
+    function expandWith(
+      code: string,
+      failures: number,
+    ): {
+      certs: string
+      mounts: string[][]
+      unlistable: string[]
+      tries: number
+    } {
+      const root = caseRoot('two-names')
+      const certs = join(root, 'pkg', 'certs')
+      mkdirSync(certs, { recursive: true })
+      writeFileSync(join(certs, 'id.pem'), '')
+      symlinkSync(join('pkg', 'certs'), join(root, 'lnk'))
+      let tries = 0
+      const readdirSync = fs.readdirSync
+      const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        if (String(args[0]) === certs && ++tries <= failures) {
+          throw Object.assign(new Error(code), { code })
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      try {
+        const listings = new Map()
+        const unlistable = new Set<string>()
+        const mounts = ['*.pem', '*.key'].map(name =>
+          expandReadDenyGlobLinux(join(root, '**', name), [], unlistable, {
+            listings,
+          }),
+        )
+        return { certs, mounts, unlistable: [...unlistable], tries }
+      } finally {
+        spy.mockRestore()
+      }
+    }
+
+    it('lets a failure kept in shared listings answer for the second name, the directory being denied whole', () => {
+      // A walk by itself tries a directory under each name that leads to it
+      // (glob-expand: "does not let one name that fails to list answer for
+      // the others"). Between the patterns of one configuration a failure is
+      // kept, and the directory is denied whole for each of them.
+      const { certs, mounts, unlistable, tries } = expandWith('EMFILE', 1)
+
+      expect(tries).toBe(1)
+      expect(mounts).toEqual([[certs], [certs]])
+      expect(unlistable).toEqual([certs])
+    })
+
+    it('denies nothing for one that answers that it is not there', () => {
+      const { mounts, unlistable } = expandWith('ENOENT', Infinity)
+
+      expect(mounts).toEqual([[], []])
+      expect(unlistable).toEqual([])
+    })
+
+    it('asks under the second name when it was not there under the first', () => {
+      const { certs, mounts, unlistable } = expandWith('ENOENT', 1)
+
+      expect(mounts).toEqual([[join(certs, 'id.pem')], []])
+      expect(unlistable).toEqual([])
+    })
   })
 
   it('lists every match where it really is when the base is a symlink', () => {
@@ -2014,6 +2126,38 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
       expect(wrapped).toContain(`--ro-bind /dev/null ${literalFile}`)
     } finally {
       await SandboxManager.reset()
+    }
+  })
+
+  it('mounts nothing for a pattern whose base is not there, beneath a write root', async () => {
+    // Denied, a base made between the walk and the mounts, as here, would be
+    // an empty tmpfs over a part of the write root, and what the command
+    // writes there would be lost.
+    const absent = join(ROOT, 'absent')
+    const wrap = (denyRead: string[]): Promise<string> =>
+      SandboxManager.wrapWithSandbox('echo hello', undefined, {
+        filesystem: { denyRead, allowWrite: [ROOT], denyWrite: [] },
+      })
+    const readdirSync = fs.readdirSync
+    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      try {
+        return readdirSync(...args)
+      } finally {
+        if (String(args[0]) === absent) mkdirSync(absent)
+      }
+    }) as typeof fs.readdirSync)
+    try {
+      const wrapped = await wrap([join(absent, '**/*.out')])
+      spy.mockRestore()
+
+      expect(existsSync(absent)).toBe(true)
+      expect(wrapped).toBe(await wrap([]))
+    } finally {
+      spy.mockRestore()
+      await SandboxManager.reset()
+      rmSync(absent, { recursive: true, force: true })
     }
   })
 })

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect, beforeAll } from 'bun:test'
 import { existsSync } from 'node:fs'
 import { whichSync } from '../../src/utils/which.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
@@ -11,13 +11,10 @@ import { isLinux } from '../helpers/platform.js'
 describe.if(isLinux)('Linux Sandbox Dependencies', () => {
   it('checkLinuxDependencies reports no errors with bwrap + socat + apply-seccomp', () => {
     const depCheck = checkLinuxDependencies()
-    expect(depCheck).toHaveProperty('errors')
     expect(depCheck).toHaveProperty('warnings')
-
-    if (depCheck.errors.length === 0) {
-      expect(whichSync('bwrap')).not.toBeNull()
-      expect(whichSync('socat')).not.toBeNull()
-    }
+    expect(depCheck.errors).toEqual([])
+    expect(whichSync('bwrap')).not.toBeNull()
+    expect(whichSync('socat')).not.toBeNull()
   })
 })
 
@@ -37,8 +34,14 @@ describe.if(isLinux)('Apply Seccomp Binary', () => {
 
   it('prefers an explicit valid path over the default', () => {
     const real = getApplySeccompBinaryPath()
-    if (!real) return
-    expect(getApplySeccompBinaryPath(real)).toBe(real)
+    const arch = process.arch
+    if (arch !== 'x64' && arch !== 'arm64') {
+      expect(real).toBeNull()
+      return
+    }
+
+    expect(real).toBeTruthy()
+    expect(getApplySeccompBinaryPath(real!)).toBe(real)
   })
 
   it('falls back to the default when an explicit path does not exist', () => {
@@ -54,9 +57,14 @@ describe.if(isLinux)('Apply Seccomp Binary', () => {
 })
 
 describe.if(isLinux)('Sandbox Integration', () => {
-  it('wraps filesystem-restricted commands with bwrap', async () => {
-    if (checkLinuxDependencies().errors.length > 0) return
+  beforeAll(() => {
+    // Every test below wraps a command with bwrap. Without the dependencies
+    // they would each pass having wrapped nothing, which is the failure
+    // this block exists to catch.
+    expect(checkLinuxDependencies().errors).toEqual([])
+  })
 
+  it('wraps filesystem-restricted commands with bwrap', async () => {
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: 'ls /',
       needsNetworkRestriction: false,
@@ -68,10 +76,9 @@ describe.if(isLinux)('Sandbox Integration', () => {
   })
 
   it('threads a custom apply-seccomp path through seccompConfig', async () => {
-    if (checkLinuxDependencies().errors.length > 0) return
-
     const real = getApplySeccompBinaryPath()
-    if (!real) return
+    expect(real).toBeTruthy()
+    if (real === null) throw new Error('apply-seccomp path did not resolve')
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: 'echo test',
@@ -84,8 +91,6 @@ describe.if(isLinux)('Sandbox Integration', () => {
   })
 
   it('argv0 mode: builds ARGV0 prefix and uses applyPath verbatim', async () => {
-    if (checkLinuxDependencies().errors.length > 0) return
-
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: 'echo test',
       needsNetworkRestriction: false,
@@ -98,8 +103,6 @@ describe.if(isLinux)('Sandbox Integration', () => {
   })
 
   it('argv0 mode: shell-quotes argv0 and applyPath', async () => {
-    if (checkLinuxDependencies().errors.length > 0) return
-
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: 'echo test',
       needsNetworkRestriction: false,
@@ -118,8 +121,6 @@ describe.if(isLinux)('Sandbox Integration', () => {
   })
 
   it('argv0 mode: rejects argv0 without applyPath', () => {
-    if (checkLinuxDependencies().errors.length > 0) return
-
     expect(
       wrapCommandWithSandboxLinux({
         command: 'echo test',

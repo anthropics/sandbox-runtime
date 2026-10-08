@@ -23,10 +23,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
-import {
-  getGlobalNpmPaths,
-  getGlobalNpmPathsAsync,
-} from './generate-seccomp-filter.js'
+import { getGlobalNpmPathsAsync } from './generate-seccomp-filter.js'
 
 export const JAVA_PROXY_AGENT_JAR_NAME = 'srt-proxy-agent.jar'
 
@@ -41,20 +38,9 @@ const jarPathCache = new Map<string, string | null>()
  * 4. a global npm install of the package (native builds without vendor/).
  * Returns null when nothing is found; callers then leave JAVA_TOOL_OPTIONS
  * alone (JVMs are simply not proxy-aware, as before) rather than failing.
- */
-export function getJavaProxyAgentJarPath(explicitPath?: string): string | null {
-  const key = explicitPath ?? ''
-  const cached = jarPathCache.get(key)
-  if (cached !== undefined) return cached
-  const found = findLocalJar(explicitPath) ?? findGlobalJar(getGlobalNpmPaths())
-  jarPathCache.set(key, found)
-  return found
-}
-
-/**
- * Async variant of {@link getJavaProxyAgentJarPath}, used by initialize():
- * same lookup order and cache, but the global-npm fallback resolves
- * `npm root -g` without blocking the event loop.
+ *
+ * The global-npm fallback resolves `npm root -g` without blocking the event
+ * loop.
  */
 export async function getJavaProxyAgentJarPathAsync(
   explicitPath?: string,

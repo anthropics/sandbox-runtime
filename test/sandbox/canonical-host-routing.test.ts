@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test'
+import { SERVES_EMITTED_CONNECTIONS } from '../helpers/emitted-connections.js'
 import { once } from 'node:events'
 import { unlinkSync } from 'node:fs'
 import {
@@ -404,31 +405,34 @@ describe.if(!isWindows)(
       expect(parent.connects).toEqual(['upstream.invalid:80'])
     })
 
-    it('CONNECT: the tlsTerminate exemption hook is consulted with the canonical host', async () => {
-      const ca = createMitmCA({})
-      const exemptionSaw: string[] = []
-      try {
-        proxy = createHttpProxyServer({
-          filter: () => true,
-          mitmCA: ca,
-          shouldTerminateTLS: host => {
-            exemptionSaw.push(host)
-            return false
-          },
-          // Exempted → opaque tunnel → normal routing, which we point at the
-          // recorder so the test needs no real upstream.
-          getMitmSocketPath: () => mitm.socketPath,
-        })
-        const port = await listen(proxy)
-        expect(await rawConnect(port, 'Pinned.invalid.:443')).toMatch(
-          /^HTTP\/1\.1 200 /,
-        )
-        expect(exemptionSaw).toEqual(['pinned.invalid'])
-        expect(mitm.connects).toEqual(['pinned.invalid:443'])
-      } finally {
-        await disposeMitmCA(ca)
-      }
-    })
+    it.skipIf(!SERVES_EMITTED_CONNECTIONS)(
+      'CONNECT: the tlsTerminate exemption hook is consulted with the canonical host',
+      async () => {
+        const ca = createMitmCA({})
+        const exemptionSaw: string[] = []
+        try {
+          proxy = createHttpProxyServer({
+            filter: () => true,
+            mitmCA: ca,
+            shouldTerminateTLS: host => {
+              exemptionSaw.push(host)
+              return false
+            },
+            // Exempted → opaque tunnel → normal routing, which we point at the
+            // recorder so the test needs no real upstream.
+            getMitmSocketPath: () => mitm.socketPath,
+          })
+          const port = await listen(proxy)
+          expect(await rawConnect(port, 'Pinned.invalid.:443')).toMatch(
+            /^HTTP\/1\.1 200 /,
+          )
+          expect(exemptionSaw).toEqual(['pinned.invalid'])
+          expect(mitm.connects).toEqual(['pinned.invalid:443'])
+        } finally {
+          await disposeMitmCA(ca)
+        }
+      },
+    )
   },
 )
 

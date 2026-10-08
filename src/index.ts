@@ -8,6 +8,7 @@ export type {
   SandboxRuntimeConfig,
   NetworkConfig,
   FilesystemConfig,
+  FilesystemPathEntry,
   CredentialsConfig,
   CredentialFileConfig,
   CredentialEnvVarConfig,
@@ -38,6 +39,7 @@ export type {
 export type {
   FilterRequestCallback,
   RequestDecision,
+  RequestInfo,
   MutateForwardedHeaders,
 } from './sandbox/request-filter.js'
 
@@ -124,6 +126,7 @@ export {
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'
+export { writeRootsOf } from './sandbox/path-entries.js'
 
 // Platform utilities
 export { getWslVersion } from './utils/platform.js'
