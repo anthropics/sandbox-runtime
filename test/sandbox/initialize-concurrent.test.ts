@@ -101,6 +101,27 @@ test('initialization waits for an in-flight reset', async () => {
   expect(SandboxManager.getProxyPort()).toBe(32102)
 })
 
+test('dependency failure does not publish a config or TLS CA', async () => {
+  const previousConfig = SandboxManager.getConfig()
+  const previousCA = SandboxManager.getMitmCA()
+  const platformSpy = spyOn(platform, 'getPlatform').mockReturnValue('unknown')
+  overrideEmittedConnectionProbe(() => true)
+  cleanup.push(
+    () => platformSpy.mockRestore(),
+    () => overrideEmittedConnectionProbe(undefined),
+  )
+  const config: SandboxRuntimeConfig = {
+    network: { allowedDomains: [], deniedDomains: [], tlsTerminate: {} },
+    filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+  }
+  const [result] = await Promise.allSettled([SandboxManager.initialize(config)])
+  expect(result?.status).toBe('rejected')
+  if (result?.status === 'rejected')
+    expect(String(result.reason)).toContain('Unsupported platform')
+  expect(SandboxManager.getConfig()).toEqual(previousConfig)
+  expect(SandboxManager.getMitmCA()).toBe(previousCA)
+})
+
 test('an invalid address range does not publish a rejected config', async () => {
   const previousConfig = SandboxManager.getConfig()
   const previouslyEnabled = SandboxManager.isSandboxingEnabled()

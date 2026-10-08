@@ -846,6 +846,13 @@ async function initializeOnce(
   }
   if (runtimeConfig.network.tlsTerminate) assertTlsTerminationSupported()
   const nextGuard = createResolvedAddressGuard(runtimeConfig.network)
+  // Probe the candidate config without publishing it or creating a CA.
+  const deps = await checkDependenciesForConfig(runtimeConfig)
+  if (deps.errors.length > 0) {
+    throw new Error(
+      `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
+    )
+  }
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
@@ -882,14 +889,6 @@ async function initializeOnce(
   parentProxy = nextParentProxy
   resolvedAddressGuard = nextGuard
   mitmCA = nextMitmCA
-
-  // Check dependencies
-  const deps = await checkDependenciesAsync()
-  if (deps.errors.length > 0) {
-    throw new Error(
-      `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
-    )
-  }
 
   // Start log monitor for macOS if enabled
   if (enableLogMonitor && getPlatform() === 'macos') {
@@ -1242,6 +1241,7 @@ function isSandboxingEnabled(): boolean {
  */
 function checkDependenciesCommon(
   ripgrepConfig?: RipgrepConfig,
+  candidateConfig = config,
 ):
   | { done: SandboxDependencyCheck }
   | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
@@ -1257,22 +1257,23 @@ function checkDependenciesCommon(
     // ripgrep is Linux-only: it's used by linuxGetMandatoryDenyPaths() to
     // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
     // profiles take regex patterns directly, so rg is never invoked there.
-    const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
+    const rgToCheck = ripgrepConfig ??
+      candidateConfig?.ripgrep ?? { command: 'rg' }
     if (whichSync(rgToCheck.command) === null) {
       errors.push(`ripgrep (${rgToCheck.command}) not found`)
     }
 
     const linuxDeps = checkLinuxDependencies({
-      seccompConfig: config?.seccomp,
-      bwrapPath: config?.bwrapPath,
-      socatPath: config?.socatPath,
+      seccompConfig: candidateConfig?.seccomp,
+      bwrapPath: candidateConfig?.bwrapPath,
+      socatPath: candidateConfig?.socatPath,
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   } else if (platform === 'windows') {
     let srtWin: SrtWinSpawn
     try {
-      srtWin = resolveSrtWin(config?.windows?.srtWin)
+      srtWin = resolveSrtWin(candidateConfig?.windows?.srtWin)
     } catch (e) {
       errors.push((e as Error).message)
       return { done: { errors, warnings } }
@@ -1280,7 +1281,8 @@ function checkDependenciesCommon(
     return {
       windows: {
         sublayerGuid:
-          config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
+          candidateConfig?.windows?.sublayerGuid ??
+          candidateConfig?.windows?.wfpSublayerGuid,
         srtWin,
       },
     }
@@ -1312,13 +1314,20 @@ function checkDependencies(
 async function checkDependenciesAsync(
   ripgrepConfig?: RipgrepConfig,
 ): Promise<SandboxDependencyCheck> {
+  return checkDependenciesForConfig(config, ripgrepConfig)
+}
+
+async function checkDependenciesForConfig(
+  candidateConfig: SandboxRuntimeConfig | undefined,
+  ripgrepConfig?: RipgrepConfig,
+): Promise<SandboxDependencyCheck> {
   // Linux: resolve apply-seccomp first so its global-npm fallback
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
-  if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+  if (getPlatform() === 'linux' && !candidateConfig?.seccomp?.argv0) {
+    await getApplySeccompBinaryPathAsync(candidateConfig?.seccomp?.applyPath)
   }
-  const common = checkDependenciesCommon(ripgrepConfig)
+  const common = checkDependenciesCommon(ripgrepConfig, candidateConfig)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
 }
