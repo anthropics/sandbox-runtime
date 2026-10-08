@@ -164,6 +164,7 @@ let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 // Covers dependency checks and provisioning as well as network startup.
 let initializationAttempt: Promise<void> | undefined
+let resetAttempt: Promise<void> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
@@ -807,6 +808,7 @@ async function initialize(
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
 ): Promise<void> {
+  if (resetAttempt) await resetAttempt
   if (initializationAttempt) {
     await initializationAttempt
     return
@@ -1206,7 +1208,7 @@ async function initializeOnce(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
-      await reset().catch(e => {
+      await resetResources().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
         })
@@ -2579,6 +2581,25 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  if (resetAttempt) {
+    await resetAttempt
+    return
+  }
+  const attempt = (async () => {
+    // Let startup finish (including its own failure cleanup) before teardown,
+    // so a pending continuation cannot restore context after reset returns.
+    await initializationAttempt?.catch(() => {})
+    await resetResources()
+  })()
+  resetAttempt = attempt
+  try {
+    await attempt
+  } finally {
+    if (resetAttempt === attempt) resetAttempt = undefined
+  }
+}
+
+async function resetResources(): Promise<void> {
   // Windows: release this session's sandbox-user ACEs. Best-effort
   // — log anomalies rather than throw, so teardown always
   // completes. Leftover ACEs are recoverable later via
