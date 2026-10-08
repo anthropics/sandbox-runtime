@@ -1,6 +1,6 @@
 {
   "name": "@anthropic-ai/sandbox-runtime",
-  "version": "0.0.77",
+  "version": "0.0.79",
   "description": "Anthropic Sandbox Runtime (ASRT) - A general-purpose tool for wrapping security boundaries around arbitrary processes",
   "type": "module",
   "main": "./dist/index.js",
@@ -9,13 +9,15 @@
     "srt": "dist/cli.js"
   },
   "engines": {
-    "node": ">=20.11.0"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "build": "tsc",
     "build:seccomp": "bun vendor/seccomp/build.ts",
     "build:srt-win": "bun vendor/srt-win/build.ts",
     "build:java-agent": "bun vendor/java-proxy-agent/build.ts",
+    "build:srt-proxy": "bun build src/proxy-main.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --no-compile-autoload-tsconfig --no-compile-autoload-package-json --outfile dist/srt-proxy",
+    "build:srt-proxy-node": "bun build src/proxy-main.ts --target=node --format=esm --outfile dist/srt-proxy.mjs",
     "clean": "rm -rf dist",
     "test": "bun test",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
@@ -29,7 +31,7 @@
     "@pondwader/socks5-server": "^1.0.10",
     "commander": "^12.1.0",
     "node-forge": "^1.4.0",
-    "zod": "^3.24.1"
+    "zod": "^3.25.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",

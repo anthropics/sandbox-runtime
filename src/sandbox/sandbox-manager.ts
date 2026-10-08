@@ -1,4 +1,17 @@
+import {
+  hasNameReading,
+  literalReadLists,
+  literalWriteLists,
+  reExposedBy,
+  readRulesOf,
+  samePathEntries,
+  spelledOf,
+  withOtherReadings,
+  writeRootsOf,
+  type PathListKind,
+} from './path-entries.js'
 import { createHttpProxyServer } from './http-proxy.js'
+import { assertTlsTerminationSupported } from './emitted-connection.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { createMuxProxyServer, type MuxProxyServer } from './mux-proxy.js'
@@ -30,6 +43,7 @@ import * as fs from 'fs'
 import { randomBytes } from 'node:crypto'
 import type {
   CredentialsConfig,
+  FilesystemPathEntry,
   SandboxRuntimeConfig,
   SeccompConfig,
 } from './sandbox-config.js'
@@ -41,6 +55,7 @@ import type {
   NetworkRestrictionConfig,
 } from './sandbox-schemas.js'
 import {
+  WorkingDirectoryChanged,
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
@@ -49,7 +64,7 @@ import {
   cleanupBwrapMountPoints,
   linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
-import { expandReadDenyGlobLinux } from './read-deny-glob.js'
+import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -84,13 +99,19 @@ import {
   globPatternBaseDir,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
-  expandGlobPattern,
+  walkGlobPatternSteps,
+  workingDirectory,
+  type GlobWalkListings,
+  type Steps,
+  finish,
+  finishInTurns,
   attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
+  sanitizeDenialReason,
   sanitizeUnregisteredCommandKey,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
@@ -103,6 +124,8 @@ import {
   resolveParentProxy,
 } from './parent-proxy.js'
 import {
+  ALLOWED_DOMAIN_ENTRY_MESSAGE,
+  isValidAllowedDomainEntry,
   matchesDomainPattern,
   matchesDomainPatternWithPort,
   stripDomainPatternPort,
@@ -130,6 +153,10 @@ interface HostNetworkManagerContext {
 // ============================================================================
 
 let config: SandboxRuntimeConfig | undefined
+/** How many times a configuration has been installed. A wrap tells by this
+ *  as well as by the object: initialize() keeps the caller's own, which can
+ *  be handed to it again. */
+let configInstalls = 0
 let httpProxyServer: ReturnType<typeof createHttpProxyServer> | undefined
 let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
@@ -252,6 +279,82 @@ export function resolveCommandText(decodedKey: string): string {
 }
 
 /**
+ * The shortest commandId a per-command allow list may be registered under:
+ * 16 random bytes (128 bits) as unpadded base64url. The floor only turns away
+ * what is too short to hold 128 bits: it cannot tell a random id from a
+ * predictable one of the same length.
+ */
+const MIN_NETWORK_LISTS_COMMAND_ID_LENGTH = 22
+
+/**
+ * Attribution key to the network allow list registered for one invocation
+ * (registerCommandNetworkLists), keyed the way commandTextsByKey is because
+ * the proxy username delivers both. The embedder removes an entry when its
+ * command is gone. Not bounded the way commandTextsByKey is: dropping the
+ * oldest entry would silently take a list away from a running command.
+ */
+const commandNetworkListsByKey = new Map<string, { allowedDomains: string[] }>()
+
+function registerCommandNetworkLists(
+  commandId: string,
+  lists: { allowedDomains?: string[] },
+): void {
+  // The floor is measured on the key the map holds, not on the raw id, and
+  // less U+FFFD: every unpaired surrogate becomes one, so it carries nothing.
+  const key =
+    typeof commandId === 'string'
+      ? decodeSandboxedCommand(encodeSandboxedCommand(commandId))
+      : ''
+  // The id is not echoed in either message: it is what stands between a
+  // sandboxed process and this list, and error text ends up in logs.
+  if (key.replace(/\ufffd/g, '').length < MIN_NETWORK_LISTS_COMMAND_ID_LENGTH) {
+    throw new Error(
+      `registerCommandNetworkLists: commandId must be a string of at least ` +
+        `${MIN_NETWORK_LISTS_COMMAND_ID_LENGTH} characters, unpaired ` +
+        `surrogates not counted. The id is the ` +
+        `only thing that binds a proxy connection to this allow list, and ` +
+        `the sandboxed process chooses which id it presents, so it must be ` +
+        `random (at least 128 bits, e.g. 16 random bytes as base64url) and ` +
+        `never derived from the command text, a counter or the time.`,
+    )
+  }
+  const allowedDomains = lists?.allowedDomains ?? []
+  if (!Array.isArray(allowedDomains)) {
+    throw new Error(
+      'registerCommandNetworkLists: allowedDomains must be an array of strings.',
+    )
+  }
+  for (const entry of allowedDomains) {
+    if (typeof entry !== 'string' || !isValidAllowedDomainEntry(entry)) {
+      throw new Error(
+        `registerCommandNetworkLists: invalid allowedDomains entry ` +
+          `${JSON.stringify(entry)}. ${ALLOWED_DOMAIN_ENTRY_MESSAGE}`,
+      )
+    }
+  }
+  commandNetworkListsByKey.set(
+    key,
+    // Copied, so the caller cannot change what was validated.
+    { allowedDomains: [...allowedDomains] },
+  )
+  // An external HTTP proxy is handed no username, so no connection names an id.
+  if (config?.network.httpProxyPort !== undefined) {
+    logForDebugging(
+      'registerCommandNetworkLists: network.httpProxyPort is set (an ' +
+        'external proxy), so this list will never apply',
+      { level: 'warn' },
+    )
+  }
+}
+
+function unregisterCommandNetworkLists(commandId: string): void {
+  if (typeof commandId !== 'string') return
+  commandNetworkListsByKey.delete(
+    decodeSandboxedCommand(encodeSandboxedCommand(commandId)),
+  )
+}
+
+/**
  * Record a proxy-side denial in the violation store so the model sees a
  * structured <sandbox_violations> block alongside the raw 403 / SOCKS
  * failure in stderr — parity with the macOS seatbelt log monitor and the
@@ -329,6 +432,29 @@ function redactUrlForViolation(url: string): string {
   }
 }
 
+/** Whether an ask-callback answer is one of the two documented denials. */
+function isDeclaredDenial(answer: unknown): boolean {
+  return (
+    answer === false ||
+    (typeof answer === 'object' &&
+      answer !== null &&
+      (answer as { allow?: unknown }).allow === false)
+  )
+}
+
+/**
+ * The reason an ask-callback answer gives for denying, sanitized, or
+ * undefined when it gives none that can be shown. Only
+ * `{ allow: false, reason }` supplies one: a reason on any other object was
+ * not written as the explanation of a denial.
+ */
+function denialReasonOf(answer: unknown): string | undefined {
+  if (typeof answer !== 'object' || answer === null) return undefined
+  const { allow, reason } = answer as { allow?: unknown; reason?: unknown }
+  if (allow !== false || typeof reason !== 'string') return undefined
+  return sanitizeDenialReason(reason) || undefined
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
@@ -385,22 +511,51 @@ async function filterNetworkRequest(
     }
   }
 
-  // No matching rules - ask user or deny. strictAllowlist makes the
-  // allowlist deterministic enforcement: never fall through to the callback.
-  if (!sandboxAskCallback || config.network.strictAllowlist) {
+  // strictAllowlist makes the configured allowlist deterministic enforcement:
+  // neither a per-command allow list nor the callback below can widen it.
+  if (config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
     return denied('host is not on the allow list')
   }
 
-  logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
+  // The allow list registered for the invocation the proxy username names.
+  // Coming after both configured lists, it lifts the default deny for that
+  // one command and never a configured deniedDomains entry. The username is
+  // presented by the sandboxed client: see registerCommandNetworkLists.
+  const perCommand = encodedCommand
+    ? commandNetworkListsByKey.get(decodeSandboxedCommand(encodedCommand))
+    : undefined
+  for (const allowedDomain of perCommand?.allowedDomains ?? []) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {
+      logForDebugging(`Allowed by per-command rule: ${host}:${port}`)
+      return true
+    }
+  }
+
+  if (!sandboxAskCallback) {
+    logForDebugging(`No matching rule, denying: ${host}:${port}`)
+    return denied('host is not on the allow list')
+  }
+
+  logForDebugging(`No matching rule, asking user: ${host}:${port}`)
   try {
-    const userAllowed = await sandboxAskCallback({ host, port })
-    if (userAllowed) {
+    // Held as unknown: a JavaScript caller is not bound by the declared type.
+    const answer: unknown = await sandboxAskCallback({ host, port })
+    // Only `true` allows: an object is how a callback denies with a reason,
+    // and a truthiness test here would read every such denial as an allow.
+    if (answer === true) {
       logForDebugging(`User allowed: ${host}:${port}`)
       return true
     }
+    if (!isDeclaredDenial(answer)) {
+      logForDebugging(
+        `Ask callback answered neither a boolean nor { allow: false, reason }; treating it as a denial: ${host}:${port}`,
+        { level: 'warn' },
+      )
+    }
     logForDebugging(`User denied: ${host}:${port}`)
-    return denied('user denied')
+    // The callback's own reason, when it gave one, says what to do instead.
+    return denied(denialReasonOf(answer) ?? 'user denied')
   } catch (error) {
     logForDebugging(`Error in permission callback: ${error}`, {
       level: 'error',
@@ -550,6 +705,12 @@ async function startMuxProxyServer(
     mitmCA,
     shouldTerminateTLS: shouldTerminateTLSForHost,
     filterRequest: config?.network.filterRequest,
+    plaintextHeaderSet: config?.network.allowPlaintextHeaderSet,
+    stripResponseHeaders: config?.network.stripResponseHeaders,
+    refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
+    requireHostMatch: config?.network.requireHostMatch,
+    maxTerminatedTunnels: config?.network.tlsTerminate?.maxTunnels,
+    tlsHandshakeTimeoutMs: config?.network.tlsTerminate?.handshakeTimeoutMs,
     onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
       recordProxyViolation(
         `deny http-request ${method} ${redactUrlForViolation(url)} (${reason})`,
@@ -581,6 +742,15 @@ async function startMuxProxyServer(
     parentProxy,
     lookupFor: directLookup,
     proxyAuthToken,
+    // A SOCKS tunnel is opaque, so the option that keeps opaque CONNECT
+    // tunnels off the HTTP side must close this side of the port too.
+    refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
+    onTunnelRefused: (port, host, encodedCommand) => {
+      recordProxyViolation(
+        `deny socks-tunnel ${host}:${port} (refuseOpaqueTunnels)`,
+        encodedCommand,
+      )
+    },
     probeUnauthenticated: async (port, host) => {
       // Explicit deny rules only: an unauthenticated peer must never reach
       // the ask callback, and a merely off-list host gets the generic
@@ -643,6 +813,7 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+  configInstalls++
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
@@ -662,6 +833,9 @@ async function initialize(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
+  // Before any CA, proxy or sandbox is set up: a runtime that cannot
+  // terminate TLS in-process fails here, not on each tunnel.
+  if (runtimeConfig.network.tlsTerminate) assertTlsTerminationSupported()
   // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
   // defer CA creation until the Windows block below has resolved
   // srt-win and fetched user status — the persistent CA is
@@ -699,14 +873,16 @@ async function initialize(
   if (enableLogMonitor && getPlatform() === 'linux') {
     // The monitor compares paths the kernel reported, so its lists are
     // expanded the way the wrapper expands them (getFsWriteConfig folds in
-    // the default write paths and drops the globs bwrap cannot take;
+    // the default write paths and drops the patterns, so only names are left;
     // normalizePathForSandbox resolves `~`, relative spellings and symlinks),
     // plus the built-in write denies the wrapper always applies.
     // It does not reproduce the wrapper's existence and boundary-symlink
     // filters, nor the ripgrep scan for nested dangerous paths; and it still
     // reports writes bwrap permits through `--dev`, `--proc` and the tmpfs
     // over each read-denied directory. Started once, so both lists are fixed
-    // at the cwd and configuration of this call.
+    // at the cwd and configuration of this call, and at the disk as it is
+    // now: an entry with glob characters that becomes the name of a path
+    // later is applied by the next wrap and stays unknown here.
     const monitoredWrites = getFsWriteConfig()
     linuxMonitor = startLinuxSandboxViolationMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
@@ -719,12 +895,15 @@ async function initialize(
         // out because it is read-denied sits under that deny's writable
         // tmpfs, so a write there is permitted and is not a violation.
         allowWritePaths: [
-          ...monitoredWrites.allowOnly,
+          ...writeRootsOf(monitoredWrites),
           ...(config.filesystem.disabled ? [] : getDefaultWritePaths()),
-        ].map(p => normalizePathForSandbox(p)),
+        ].map(p => normalizePathForSandbox(p, { literal: true })),
         denyWritePaths: [
           ...monitoredWrites.denyWithinAllow.map(p =>
-            normalizePathForSandbox(p),
+            normalizePathForSandbox(p, { literal: true }),
+          ),
+          ...(monitoredWrites.literalDenyWithinAllow ?? []).map(p =>
+            normalizePathForSandbox(p, { literal: true }),
           ),
           // filesystem.disabled reaches the wrapper as `writeConfig ===
           // undefined`, which skips every bind and the built-in denies with
@@ -1223,21 +1402,21 @@ function getCredentialDenyReadPaths(
  * expansion and no credential masking, because getFsWriteConfig() is a
  * getter callers reach from permission checks and render paths. A mask entry
  * that degrades to a deny is a file and cannot cover a directory, so
- * leaving those out changes nothing.
+ * leaving those out changes nothing. An entry with glob characters that is
+ * also the name of a path counts as that name too.
  */
 function defaultWritePathsUnder({
   denyRead,
   allowRead,
   credentials,
 }: {
-  denyRead: readonly string[]
-  allowRead: readonly string[] | undefined
+  denyRead: readonly FilesystemPathEntry[]
+  allowRead: readonly FilesystemPathEntry[] | undefined
   credentials: CredentialsConfig | undefined
 }): string[] {
-  return getDefaultWritePaths({
-    denyRead: [...denyRead, ...getCredentialDenyReadPaths(credentials)],
-    allowRead,
-  })
+  return getDefaultWritePaths(
+    readRulesOf(denyRead, allowRead, getCredentialDenyReadPaths(credentials)),
+  )
 }
 
 /**
@@ -1258,38 +1437,68 @@ function unionDenyReadPaths(
  * Strip a trailing `/**` from each read-path entry and, on Linux, replace
  * any remaining glob with what `expandGlob` returns for it (bubblewrap takes
  * concrete paths only). Other platforms match globs natively.
+ * On Linux the entry's other readings are added (see `withOtherReadings`);
+ * elsewhere the backend decides them. Entries the caller marked literal are
+ * not in the result: they travel in the `literal…` lists.
  *
  * `literalPaths` are the ones the library resolved itself (a masked
  * credential file that degraded to deny) — each names one file on disk, so
  * it is passed through whatever characters it contains. Expanded as a
  * pattern, a name holding `[` matches nothing and the deny is lost.
+ *
+ * Each path once, where it first came up: every `**` pattern over one base
+ * returns the directories it could not list, and the Linux wrapper looks at
+ * every entry it is given.
  */
-function resolveReadPathEntries(
-  paths: readonly string[],
-  expandGlob: (pattern: string) => string[],
+function* resolveReadPathEntries(
+  kind: PathListKind,
+  paths: readonly FilesystemPathEntry[],
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
   literalPaths: readonly string[] = [],
-): string[] {
+): Steps<string[]> {
   const literal = new Set(literalPaths)
-  return paths.flatMap(p => {
+  const resolved = new Set<string>()
+  for (const p of spelledOf(paths)) {
     const stripped = removeTrailingGlobSuffix(p)
-    return getPlatform() === 'linux' &&
+    if (
+      getPlatform() === 'linux' &&
       !literal.has(p) &&
       containsGlobChars(stripped)
-      ? expandGlob(p)
-      : [stripped]
-  })
+    ) {
+      for (const found of yield* withOtherReadings(
+        p,
+        stripped,
+        kind,
+        expandGlob,
+      )) {
+        resolved.add(found)
+      }
+    } else {
+      resolved.add(stripped)
+    }
+  }
+  return [...resolved]
 }
 
 /**
  * Strip a trailing `/**` and drop what is still a glob on Linux: bwrap needs
  * real paths. macOS subpath matching is recursive, so the strip is harmless
  * there and the filter never fires.
+ * A glob that is also the name of a path that exists is kept, as that name.
+ * Marked entries are not in the result, as in {@link resolveReadPathEntries}.
  */
-function stripWriteGlobs(paths: readonly string[]): string[] {
-  return paths
+function stripWriteGlobs(
+  kind: PathListKind,
+  paths: readonly FilesystemPathEntry[],
+): string[] {
+  return spelledOf(paths)
     .map(p => removeTrailingGlobSuffix(p))
     .filter(p => {
-      if (getPlatform() === 'linux' && containsGlobChars(p)) {
+      if (
+        getPlatform() === 'linux' &&
+        containsGlobChars(p) &&
+        !hasNameReading(p, kind)
+      ) {
         logForDebugging(`[Sandbox] Skipping glob write pattern on Linux: ${p}`)
         return false
       }
@@ -1297,8 +1506,11 @@ function stripWriteGlobs(paths: readonly string[]): string[] {
     })
 }
 
-function expandAllowReadGlob(pattern: string): string[] {
-  const expanded = expandGlobPattern(pattern)
+function* expandAllowReadGlob(
+  pattern: string,
+  anchor?: string,
+): Steps<string[]> {
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor })).matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -1308,9 +1520,10 @@ function expandAllowReadGlob(pattern: string): string[] {
 /**
  * The read policy of the initialized config, for inspection and display.
  * On Linux, denyRead globs are collapsed to covering directory mounts against
- * this config's allowRead and {@link getFsWriteConfig}'s allowOnly, so
+ * this config's allowRead and {@link getFsWriteConfig}'s write roots, so
  * `denyOnly` is only sound alongside that write config and must not be handed
- * to wrapCommandWithSandboxLinux with a different one.
+ * to wrapCommandWithSandboxLinux with a different one. Marked entries are
+ * in the `literal…` lists, as spelled: pass the object on whole.
  */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
@@ -1325,23 +1538,46 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   )
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.
-  const allowPaths = resolveReadPathEntries(
-    config.filesystem.allowRead ?? [],
-    expandAllowReadGlob,
+  const allowPaths = finish(
+    resolveReadPathEntries(
+      'allow',
+      config.filesystem.allowRead ?? [],
+      expandAllowReadGlob,
+    ),
   )
-  const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
+  const reExposedPaths = reExposedBy(
+    allowPaths,
+    config.filesystem.allowRead,
+    getFsWriteConfig(),
+  )
   const unlistableDenyDirs = new Set<string>()
-  const denyPaths = resolveReadPathEntries(
-    unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
-    pattern =>
-      expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
-    credentialRestrictions.degradeToDenyPaths,
+  const listings: GlobWalkListings = new Map()
+  const denyPaths = finish(
+    resolveReadPathEntries(
+      'deny',
+      unionDenyReadPaths(
+        spelledOf(config.filesystem.denyRead),
+        credentialRestrictions,
+      ),
+      (pattern, anchor) =>
+        expandReadDenyGlobLinuxSteps(
+          pattern,
+          reExposedPaths,
+          unlistableDenyDirs,
+          { anchor, listings },
+        ),
+      credentialRestrictions.degradeToDenyPaths,
+    ),
   )
 
   return {
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
+    ...literalReadLists(
+      config.filesystem.denyRead,
+      config.filesystem.allowRead,
+    ),
   }
 }
 
@@ -1354,8 +1590,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: ['/'], denyWithinAllow: [] }
   }
 
-  const allowPaths = stripWriteGlobs(config.filesystem.allowWrite)
-  const denyPaths = stripWriteGlobs(config.filesystem.denyWrite)
+  const allowPaths = stripWriteGlobs('allow', config.filesystem.allowWrite)
+  const denyPaths = stripWriteGlobs('deny', config.filesystem.denyWrite)
 
   const allowOnly = [
     ...defaultWritePathsUnder({
@@ -1369,6 +1605,10 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
   return {
     allowOnly,
     denyWithinAllow: denyPaths,
+    ...literalWriteLists(
+      config.filesystem.allowWrite,
+      config.filesystem.denyWrite,
+    ),
   }
 }
 
@@ -1450,23 +1690,17 @@ function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   }
 }
 
-function setEq(a: readonly string[], b: readonly string[]): boolean {
-  if (a.length !== b.length) return false
-  const s = new Set(a)
-  return b.every(x => s.has(x))
-}
-
 function sameRawWindowsFsInputs(
   a: ReturnType<typeof rawWindowsFsInputs>,
   b: ReturnType<typeof rawWindowsFsInputs>,
 ): boolean {
   return (
     a.disabled === b.disabled &&
-    setEq(a.denyRead, b.denyRead) &&
-    setEq(a.denyWrite, b.denyWrite) &&
-    setEq(a.allowRead, b.allowRead) &&
-    setEq(a.allowWrite, b.allowWrite) &&
-    setEq(a.credFiles, b.credFiles)
+    samePathEntries(a.denyRead, b.denyRead) &&
+    samePathEntries(a.denyWrite, b.denyWrite) &&
+    samePathEntries(a.allowRead, b.allowRead) &&
+    samePathEntries(a.allowWrite, b.allowWrite) &&
+    samePathEntries(a.credFiles, b.credFiles)
   )
 }
 
@@ -1620,6 +1854,9 @@ export type WrapWithSandboxOptions = {
    * command text: keys are compared on their first 100 characters, so two
    * long commands sharing a prefix would otherwise cross-attribute, and a
    * rerun of the same text would inherit the earlier run's events.
+   *
+   * An id that a network allow list is registered under must also be
+   * unguessable: see `registerCommandNetworkLists`.
    */
   commandId?: string
   /**
@@ -1632,7 +1869,33 @@ export type WrapWithSandboxOptions = {
   commandText?: string
 }
 
+/** A wrap that has started over this many times walks without giving the
+ *  thread back. */
+const RESTARTS_IN_TURNS = 2
+
+/** In place of what a walk finds: the configuration was replaced under it. */
+const REPLACED = Symbol('replaced')
+
 async function wrapWithSandbox(
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
+  return wrapWithSandboxAgain(
+    0,
+    command,
+    binShell,
+    customConfig,
+    abortSignal,
+    options,
+  )
+}
+
+/** {@link wrapWithSandbox}, having started over `restarts` times. */
+async function wrapWithSandboxAgain(
+  restarts: number,
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
@@ -1642,6 +1905,41 @@ async function wrapWithSandbox(
   const platform = getPlatform()
   const commandId = options?.commandId
   registerCommandText(command, options)
+  const startedWith = config
+  const startedAt = configInstalls
+  const startedIn = workingDirectory()
+  const movedOn = (): boolean =>
+    config !== startedWith ||
+    configInstalls !== startedAt ||
+    workingDirectory() !== startedIn
+  const startOver = (): Promise<string> =>
+    wrapWithSandboxAgain(
+      restarts + 1,
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
+  /** `steps`, left as soon as the host is seen to have moved on: what they
+   *  would go on to find is for a wrap that starts over anyway. */
+  function* whileCurrent<T>(steps: Steps<T>): Steps<T | typeof REPLACED> {
+    for (;;) {
+      if (movedOn()) return REPLACED
+      const step = steps.next()
+      if (step.done) return step.value
+      yield
+    }
+  }
+  const walked = <T>(
+    steps: Steps<T>,
+  ): T | typeof REPLACED | Promise<T | typeof REPLACED> => {
+    if (restarts < RESTARTS_IN_TURNS) {
+      return finishInTurns(whileCurrent(steps), abortSignal)
+    }
+    abortSignal?.throwIfAborted()
+    return finish(steps)
+  }
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -1672,6 +1970,7 @@ async function wrapWithSandbox(
   let readConfig: FsReadRestrictionConfig | undefined
   if (!fsDisabled) {
     const userAllowWrite = stripWriteGlobs(
+      'allow',
       customConfig?.filesystem?.allowWrite ??
         config?.filesystem.allowWrite ??
         [],
@@ -1690,9 +1989,14 @@ async function wrapWithSandbox(
         ...userAllowWrite,
       ],
       denyWithinAllow: stripWriteGlobs(
+        'deny',
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
           [],
+      ),
+      ...literalWriteLists(
+        customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite,
+        customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite,
       ),
     }
 
@@ -1701,10 +2005,16 @@ async function wrapWithSandbox(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
-    const expandedAllowRead = resolveReadPathEntries(
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
-      expandAllowReadGlob,
+    const expandedAllowRead = await walked(
+      resolveReadPathEntries(
+        'allow',
+        customConfig?.filesystem?.allowRead ??
+          config?.filesystem.allowRead ??
+          [],
+        expandAllowReadGlob,
+      ),
     )
+    if (expandedAllowRead === REPLACED) return startOver()
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
     // paths fall under a user-configured denyRead.
@@ -1715,21 +2025,41 @@ async function wrapWithSandbox(
     if (javaAgentJarPath) {
       expandedAllowRead.push(javaAgentJarPath)
     }
-    const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
-    const unlistableDenyDirs = new Set<string>()
-    const expandedDenyRead = resolveReadPathEntries(
-      unionDenyReadPaths(
-        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-        credentialRestrictions,
-      ),
-      pattern =>
-        expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
-      credentialRestrictions.degradeToDenyPaths,
+    const reExposedPaths = reExposedBy(
+      expandedAllowRead,
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+      writeConfig,
     )
+    const unlistableDenyDirs = new Set<string>()
+    const listings: GlobWalkListings = new Map()
+    const expandedDenyRead = await walked(
+      resolveReadPathEntries(
+        'deny',
+        unionDenyReadPaths(
+          spelledOf(
+            customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+          ),
+          credentialRestrictions,
+        ),
+        (pattern, anchor) =>
+          expandReadDenyGlobLinuxSteps(
+            pattern,
+            reExposedPaths,
+            unlistableDenyDirs,
+            { anchor, listings },
+          ),
+        credentialRestrictions.degradeToDenyPaths,
+      ),
+    )
+    if (expandedDenyRead === REPLACED) return startOver()
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
       unlistableDenyDirs: [...unlistableDenyDirs],
+      ...literalReadLists(
+        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+        customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+      ),
     }
   }
 
@@ -1756,6 +2086,32 @@ async function wrapWithSandbox(
   if (needsNetworkProxy) {
     await waitForNetworkInitialization()
   }
+
+  // INVARIANT: one wrap, one configuration. updateConfig() can run in any of
+  // the turns above, and what was read before it must not be put together
+  // with what is read after it: the write list of one configuration with the
+  // allowGitConfig of another is a policy nobody chose. So the wrap starts
+  // over. Nothing from here to the platform's wrapper awaits.
+  //
+  // And one working directory, which a relative entry is resolved against
+  // wherever it is read: a `.` bound back from where the host has gone to,
+  // over denies walked from where it was, uncovers what they matched.
+  //
+  // INVARIANT: what a wrap hands out was read from the disk after its
+  // configuration was installed. A host that writes a file and then installs
+  // a rule that denies it finds it denied by every wrap that goes by that
+  // rule. So a wrap that starts over keeps nothing of what it has listed or
+  // walked, the same rules included. A configuration installed after this
+  // check is the next wrap's.
+  //
+  // An embedder can replace the configuration many times during one walk.
+  // After RESTARTS_IN_TURNS the wrap walks without a turn of the event loop,
+  // so no timer or I/O callback replaces it meanwhile. That holds the thread
+  // for one walk, as every wrap did before the walk took turns. It is not a
+  // proof that the wrap ends: a promise continuation, or anything at all
+  // while the network is still being initialized, can replace it between the
+  // walk and this check, and the wrap then starts over once more.
+  if (movedOn()) return startOver()
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
@@ -1833,6 +2189,10 @@ async function wrapWithSandbox(
         socatPath: config?.socatPath,
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
+      }).catch((err: unknown) => {
+        // It awaits once more, for its scan: see the invariant above.
+        if (err instanceof WorkingDirectoryChanged) return startOver()
+        throw err
       })
 
     case 'windows':
@@ -2054,6 +2414,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   const { filterRequest, ...rest } = newConfig.network
   config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
+  configInstalls++
   resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
@@ -2325,6 +2686,7 @@ async function reset(): Promise<void> {
   sentinelRegistry.clear()
   awsPairRegistry.clear()
   commandTextsByKey.clear()
+  commandNetworkListsByKey.clear()
   maskedFileStore.dispose()
 }
 
@@ -2361,6 +2723,9 @@ function annotateStderrWithSandboxFailures(
  * sandboxing is disabled.
  *
  * Patterns ending with /** are excluded since they work as subpaths.
+ * So are entries marked literal. An entry that is also the name of a path
+ * that exists is still returned: what is returned must not depend on what
+ * is on the disk, which a sandboxed command can change.
  */
 function getLinuxGlobPatternWarnings(): string[] {
   // Only warn on Linux/WSL (bubblewrap doesn't support globs)
@@ -2379,6 +2744,7 @@ function getLinuxGlobPatternWarnings(): string[] {
   ]
 
   for (const path of allPaths) {
+    if (typeof path !== 'string') continue
     // Strip trailing /** since that's just a subpath (directory and everything under it)
     const pathWithoutTrailingStar = removeTrailingGlobSuffix(path)
 
@@ -2396,6 +2762,7 @@ function getLinuxGlobPatternWarnings(): string[] {
     ...config.filesystem.denyRead,
     ...(config.filesystem.allowRead ?? []),
   ]) {
+    if (typeof path !== 'string') continue
     const baseDir = globPatternBaseDir(normalizePathForSandbox(path))
     if (
       containsGlobChars(removeTrailingGlobSuffix(path)) &&
@@ -2460,6 +2827,60 @@ export interface ISandboxManager {
     cwd?: string,
     options?: WrapWithSandboxOptions,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
+  /**
+   * Register the network allow list of one invocation, under the `commandId`
+   * its wrap was given ({@link WrapWithSandboxOptions}). Entries are matched
+   * and validated as `network.allowedDomains` entries are; an invalid one
+   * throws. Registering an id again replaces its list.
+   *
+   * Order of evaluation for a connection: a configured `deniedDomains` match
+   * denies; a configured `allowedDomains` match allows;
+   * `network.strictAllowlist` denies; a match in the list registered for the
+   * id the connection presents allows; then the ask callback decides if
+   * there is one, and otherwise the connection is denied. So a per-command
+   * entry never overrides a configured `deniedDomains` entry and is ignored
+   * entirely under `strictAllowlist`. It also never enters `network.*`, so
+   * the default `injectHosts` scope of a masked credential does not grow.
+   *
+   * The proxy reads the id from the proxy username, which the sandboxed
+   * client presents, so the id is the ONLY thing binding a connection to an
+   * allow list. It MUST be unguessable: at least 128 bits of randomness (16
+   * random bytes as base64url, 22 characters; a shorter id throws), never a
+   * counter, a timestamp or anything derived from the command. Presenting
+   * another live invocation's id gets that invocation's allows: this is
+   * attribution, not a boundary between concurrent commands of one session.
+   *
+   * Register just before spawning the wrapped command, and unregister when
+   * the child exits or never started: a registration that outlives its
+   * command widens the window in which its id is worth presenting.
+   *
+   * As with every attribution key, only the first 100 characters of an id
+   * take part, and a list under an id whose encoded form does not fit in the
+   * proxy username (possible only with non-ASCII ids) never applies. An
+   * unpaired surrogate does not count towards the 22 characters.
+   *
+   * No list applies while `network.httpProxyPort` names an external proxy:
+   * the wrap gives that proxy no username, so no connection carries an id.
+   * Registering still succeeds, and every connection is decided as if no list
+   * existed.
+   */
+  registerCommandNetworkLists(
+    commandId: string,
+    lists: { allowedDomains?: string[] },
+  ): void
+  /**
+   * Remove the list registered for `commandId`. A no-op for an id that has
+   * none. `reset()` removes them all.
+   */
+  unregisterCommandNetworkLists(commandId: string): void
+  /**
+   * True when the network filter understands an ask callback's
+   * `{ allow: false, reason }` answer (see {@link SandboxAskCallback}). Read
+   * it before returning that object: releases up to v0.0.77 allow on any
+   * truthy answer, so there the object would be read as an allow. Where this
+   * is absent, deny with a plain `false`.
+   */
+  readonly askCallbackDenyReason: true
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
@@ -2503,6 +2924,9 @@ export const SandboxManager: ISandboxManager = {
   waitForNetworkInitialization,
   wrapWithSandbox,
   wrapWithSandboxArgv,
+  registerCommandNetworkLists,
+  unregisterCommandNetworkLists,
+  askCallbackDenyReason: true,
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,

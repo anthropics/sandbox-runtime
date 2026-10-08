@@ -220,6 +220,10 @@ srt --control-fd 3 -- npm test
   points that slot at `/dev/null` for the command, so nothing inside the
   sandbox can read the updates or write a config of its own.
 
+### As a standalone proxy with an external decider: `srt proxy`
+
+`srt proxy` (or the single-file `srt-proxy` executable built by `bun run build:srt-proxy`) runs only SRT's HTTP proxy, with no sandboxed child, for a host that runs the workload elsewhere. It accepts on a listening socket the host hands in, terminates every CONNECT in-process, and forwards a request only when a separate decider process, reached over another inherited descriptor, allows it. See [docs/srt-proxy.md](docs/srt-proxy.md) for the command line, the decider protocol and the security model.
+
 ### As a library
 
 ```typescript
@@ -279,6 +283,70 @@ const annotated = SandboxManager.annotateStderrWithSandboxFailures(
   stderr,
 )
 ```
+
+**Asking about a host no rule decides (the ask callback).** The second argument to `SandboxManager.initialize` is an optional `SandboxAskCallback`. It is asked about a destination that neither `network.deniedDomains`, nor `network.allowedDomains`, nor a per-command allow list (next section) decided, and it is never asked under `network.strictAllowlist`. Without a callback such a destination is denied. The callback resolves to one of:
+
+- `true` - allow the connection. Only the value `true` allows.
+- `false` - deny it. The violation line reports the generic reason `user denied`.
+- `{ allow: false, reason: '...' }` - deny it, and report `reason` in the violation line in place of the generic text, so that whoever reads the `<sandbox_violations>` block (a model included) learns why and what to do instead.
+
+Any other answer denies, whether it is truthy or not, and reports the generic reason. That includes an object that carries a `reason` without saying `allow: false`, such as `{ allow: true, reason: '...' }`: its reason is not reported.
+
+The reason is sanitized before it is stored, the way the rest of a violation line is. Each run of control characters (line breaks and tabs included) or of invisible ones (zero-width characters, the joiner among them, and bidi controls) becomes one space; `<` and `>` are removed, so `re-run with <host> listed` is stored as `re-run with host listed`; the ends are trimmed. The result is cut to 500 characters, counted as UTF-16 code units the way `String.prototype.length` counts them. A reason with nothing left after that falls back to `user denied`. Write it as one line of plain text.
+
+**Behaviour change in the first release after 0.0.79:** the filter used to allow on any truthy answer, so a callback that resolved to a truthy value other than `true` (`1`, a string, any object) allowed the connection. It now denies. For the same reason, `{ allow: false, reason }` returned to an older release would be read there as an allow, because an object is truthy. `SandboxManager.askCallbackDenyReason` is `true` on a release that understands the object: check it before returning one, and deny with a plain `false` where it is absent.
+
+```typescript
+const deny = (reason: string) =>
+  SandboxManager.askCallbackDenyReason
+    ? { allow: false as const, reason }
+    : false
+
+await SandboxManager.initialize(config, async ({ host, port }) => {
+  if (await userApproves(host, port)) return true
+  return deny(`${host} was not approved for this session`)
+})
+```
+
+**Per-command network allow lists (`registerCommandNetworkLists`).** One invocation can carry an allow list of its own, in addition to the configured one, for as long as it runs:
+
+```typescript
+import { randomBytes } from 'node:crypto'
+
+// 128 bits of randomness, 22 characters. See below for why nothing less will do.
+const commandId = randomBytes(16).toString('base64url')
+const wrapped = await SandboxManager.wrapWithSandbox(
+  command,
+  undefined,
+  undefined,
+  undefined,
+  { commandId },
+)
+
+SandboxManager.registerCommandNetworkLists(commandId, {
+  allowedDomains: ['registry.example.org', '*.cdn.example.org:443'],
+})
+const child = spawn(wrapped, { shell: true })
+const unregister = () => SandboxManager.unregisterCommandNetworkLists(commandId)
+child.once('exit', unregister)
+child.once('error', unregister) // the child never started
+```
+
+Entries use the grammar and the matcher of `network.allowedDomains` and get the same validation. `registerCommandNetworkLists` throws on an invalid entry, and on a `commandId` shorter than 22 characters (an unpaired surrogate does not count). Registering an id again replaces its list; `unregisterCommandNetworkLists` is a no-op for an id that has none; `reset()` removes every registration.
+
+The order of evaluation for a connection is:
+
+1. a `network.deniedDomains` match denies;
+2. a `network.allowedDomains` match allows;
+3. `network.strictAllowlist` denies;
+4. a match in the list registered for the id the connection presents allows;
+5. the ask callback decides if there is one, and otherwise the connection is denied.
+
+So a per-command entry never overrides a configured `deniedDomains` entry, and is ignored entirely under `strictAllowlist`. It never enters `network.*` either: `getConfig()` and `getNetworkRestrictionConfig()` do not show it, and the default `injectHosts` scope of a masked credential, which is `network.allowedDomains`, does not grow. A host allowed this way still goes through the resolved-address check when it is dialed, and an IP literal in a per-command list adds no exemption there.
+
+What the id has to be, and what this feature is not: the proxy learns which invocation a connection belongs to from the proxy username, and the username is presented by the client inside the sandbox. The id is therefore the **only** thing binding a connection to an allow list. It **must** be unguessable: at least 128 bits of randomness, never a counter, a timestamp or anything derived from the command. A sandboxed process that presents another live invocation's id gets that invocation's allows, so this is attribution, not a boundary between concurrent commands of one session. Register just before spawning the wrapped command, and unregister when the child exits or never started: a registration that outlives its command widens the window in which its id is worth presenting. As with every attribution key, only the first 100 characters of an id take part. Keep ids ASCII: a list under a non-ASCII id whose encoded form does not fit in the proxy username (255 bytes) registers and never applies.
+
+No list applies while `network.httpProxyPort` names an external proxy: the wrap gives that proxy no username, so no connection carries an id. `registerCommandNetworkLists` still succeeds (and says so in one line under `SRT_DEBUG`), and every connection is decided as if no list existed.
 
 #### Available exports
 
@@ -366,12 +434,16 @@ What the check leaves alone: allowlist entries that **are** IP literals (allow-l
 
 - `network.deniedResolvedAddresses` - Extra IP addresses / CIDR ranges (IPv4 or IPv6, unbracketed, any port) that allowed hostnames must not resolve to. Private-use space is not denied by default because allow-listing an intranet hostname is legitimate; list it here when allow-listed names must stay out of it, e.g. `["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"]`. List IPv4 and IPv6 ranges separately — an IPv6 range broad enough to cover the IPv4-mapped block (`::ffff:0:0/96`), such as `::/0`, matches IPv4 answers on some runtimes but not others, so do not rely on it to deny IPv4.
 
-**TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.
+**TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify. It needs Node, or Bun 1.4 or later; on an older Bun, `SandboxManager.initialize` throws. See [TLS Termination](#tls-termination) for how it works, its limits, and what changed from the per-tunnel listener it replaced.
 
 - `network.tlsTerminate.excludeDomains` - Domain patterns (same syntax as `allowedDomains`) that are **not** terminated. Matching CONNECTs are tunnelled opaquely instead: they are still subject to the domain allowlist, but the client inside the sandbox completes its own TLS handshake with the real upstream, and `filterRequest` / credential injection do not apply to their HTTPS traffic. Use this for the two cases TLS termination fundamentally breaks:
   - **mTLS upstreams** - only the in-sandbox client holds the client certificate, so the proxy cannot re-originate the connection on its behalf.
   - **Certificate-pinning clients** - clients that verify the upstream's identity themselves (custom CAs, SAN pinning) and reject the MITM certificate.
 - `network.tlsTerminate.extraCaCertPaths` - Paths to PEM CA certificate files appended to that trust bundle, after the MITM CA and the host's regular roots. Excluded (non-terminated) hosts are verified by the client inside the sandbox, and the trust env vars SRT sets (`SSL_CERT_FILE`, `GIT_SSL_CAINFO`, ...) _replace_ each tool's own trust configuration, so a site-local root (e.g. an internal mTLS CA) must be in the bundle or those hosts can never be verified. Only the `CERTIFICATE` blocks of each file are copied into the bundle (anything else, e.g. a private key in a combined PEM, is never exposed to the sandbox); files that are missing, unreadable, or contain no PEM `CERTIFICATE` block are skipped, so it is safe to list paths that exist on only some hosts.
+- `network.tlsTerminate.maxTunnels` - At most this many CONNECT tunnels are TLS-terminated at once (integer, 1 to 65536, default 256). Past it a CONNECT is answered `503` with `X-Proxy-Error: too-many-tunnels`. A tunnel holds its slot from its CONNECT until it closes, so idle keep-alive tunnels count. The slot is taken before the client's first bytes are seen, so at the cap a non-TLS CONNECT (such as SSH) to a host that would be terminated is refused too; one that turns out not to carry TLS frees its slot. Hosts in `excludeDomains` do not count.
+- `network.tlsTerminate.handshakeTimeoutMs` - A tunnel to be terminated must finish its TLS handshake within this many milliseconds of its CONNECT (integer, 100 to 600000, default 10000), or it is closed and its slot freed. A CONNECT whose client sends nothing is closed at the deadline too. A tunnel past its handshake is never timed out by it.
+
+These two are read when the proxy starts; `updateConfig` does not change them.
 
 ```json
 {
@@ -385,6 +457,17 @@ What the check leaves alone: allowlist entries that **are** IP literals (allow-l
   }
 }
 ```
+
+**Request rewriting** (with `network.filterRequest`, set by library consumers): an allow decision may also carry header edits (`removeHeaders`, `setHeaders`) and an `onResponse` observer, and a deny decision may choose its status (403 by default). These options are read when the proxy starts; `updateConfig` does not change them.
+
+- `network.allowPlaintextHeaderSet` - Let an allow decision set headers on plain-HTTP requests. Off by default: a header set there would travel in cleartext, so while it is off an allow decision that carries `setHeaders` is refused with 403, and nothing is forwarded, for every request the proxy receives in cleartext (an absolute `https://` URI included). An allow without `setHeaders` is unaffected and removals always apply. The callback's second argument reports `scheme: 'http'` for these requests.
+- `network.stripResponseHeaders` - Response headers never passed back to the sandboxed client, matched case-insensitively with `-`, `_` and `.` folded (e.g. `["set-cookie"]`).
+- `network.refuseOpaqueTunnels` - Refuse every tunnel `filterRequest` cannot see into: an HTTP CONNECT that would not be TLS-terminated or carries no TLS, and every SOCKS CONNECT. Requires `tlsTerminate` to serve HTTPS at all, and stops CONNECT-carried SSH (such as `GIT_SSH_COMMAND`) through the proxy. Refusals are recorded as violations.
+- `network.requireHostMatch` - Answer 421 to a request whose Host header, TLS server name or absolute-form authority does not name the host and port it is sent to, before `filterRequest` is asked. Refusals are recorded as violations.
+
+While `filterRequest` is set, the request target is normalised once (dot segments and `%2e` resolved, a run of leading slashes collapsed to one), and that value is both what the callback sees and what is forwarded, on plain HTTP and inside a terminated tunnel. A target that is not origin form, an absolute `http(s)` URI, or `*` for `OPTIONS` is answered 400.
+
+While `filterRequest` is set, `TRACE` and `TRACK` requests are answered 405 before it is asked, on plain HTTP and inside a terminated tunnel, because their response would echo a header the decision set back to the client. Node's and Bun 1.4's HTTP parsers already answer `TRACK` 400 before the proxy sees it; under Bun 1.3 the connection is closed without an answer. Refusals are recorded as violations.
 
 **Unix Socket Settings** (platform-specific behavior):
 
@@ -435,7 +518,7 @@ Examples:
 
 bubblewrap binds concrete paths, so glob support is narrower than on macOS:
 
-- `allowWrite` / `denyWrite` take literal paths. A trailing `/**` is dropped (`src/**` means `src`); any other glob pattern there is skipped.
+- `allowWrite` / `denyWrite` take literal paths. A trailing `/**` is dropped (`src/**` means `src`); any other glob pattern there is skipped, unless the entry is also the name of a path that exists (see "All platforms" below), and then that path is what is applied.
 - `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the entries that exist when the command is wrapped, so a file that appears later is not covered. The pattern needs a literal directory to start from (a relative pattern starts at the current directory): one with a wildcard in its first path component, such as `/**/*.pem` or `/opt*/keys/**`, is skipped on Linux. Only directories the pattern can match beneath are listed (`certs/*.pem` lists `certs` alone).
 - A directory matched by a `denyRead` pattern ending in `/**` that holds at least one entry when the command is wrapped becomes one tmpfs mount, like a directory listed in `denyRead` literally: inside the sandbox it is an EMPTY WRITABLE directory, so a command that used to write through a read-denied `build/` still writes, into the tmpfs, and loses that output when the command exits. A file added to the directory on the host afterwards is hidden too. A matched directory that is empty when the command is wrapped gets no mount (a matched symlink to a directory always gets one, on the directory it leads to). An `allowRead` beneath a mounted directory is bound back over the tmpfs, but each entry beneath it that the pattern matches keeps its own mask: under a `/**` pattern that is every entry there, so only what is created beneath the `allowRead` later is readable.
 - A directory the expansion cannot list is denied as a whole, and nothing is bound back beneath the mount that hides it, `allowRead` and `allowWrite` paths included: what the pattern matches under them cannot be found. A `denyRead` entry that cannot be inspected (its parent directory is readable but not searchable, say), or that leads to `/`, hides the nearest directory above it instead, in the same way.
@@ -455,6 +538,11 @@ Examples:
 - Paths can be absolute (e.g., `/home/user/.ssh`) or relative to the current working directory (e.g., `./src`)
 - `~` expands to the user's home directory
 - A deny glob must not end in a separator: the separator becomes part of the compiled pattern, so the pattern can match no path. `denyRead`, `denyWrite` and a `mode: "deny"` credential file reject such an entry at config validation — write `/data/*`, or add a `**` segment to match at any depth.
+- A directory may have `*`, `?`, `[` or `]` in its name (`[WIP] project`, `notes (draft?)`). An entry with those characters is read as a pattern, as described above, and **also** as the path it spells when the part of it that holds those characters exists on disk. With a folder `/work/[WIP] project` there, `/work/[WIP] project/keep` is both the pattern and the path, and `/work/[WIP] project/**/.env` is both the pattern and the pattern `**/.env` beneath that folder. A deny covers every reading and an allow allows every reading. What exists is looked at when the command is wrapped (on Windows, at `initialize()`), so a folder created later counts from the next command on (on Windows, from the next `initialize()`). For a deny, a symbolic link of that name counts as existing, and so does a path that cannot be looked at, whatever the entry: beneath a directory that cannot be searched when the command is wrapped, an ordinary pattern such as `/locked/*.pem` is also taken for the path it spells, and denied like any path there that cannot be looked at. For an allow the path has to be there as itself: if any component, from the first one with such a character on, is a symbolic link, the entry is a pattern only.
+- A `*` or `?` in a folder's name also matches itself as a pattern, and so does a `[` or `]` without its partner, so inside `build*` or `notes (draft?)` the pattern reading of an entry finds the path too. That shows in a deny ending in `/**`: it is applied as the pattern it is, under which on Linux every entry beneath the directory keeps its own mask (see above) and an `allowRead` beneath it opens only what is created later. Write such a deny without the `/**`.
+- To name a path and nothing else, write `{ "path": "/work/*.env", "literal": true }` in place of the string. Such an entry is never a pattern, whether or not the path exists, so it can deny a file that is not there yet in a folder that is not there yet. `~` and relative paths are resolved as for a string, symbolic links are followed as for any path without such characters (a marked allow has no check for them), and a `/**` at the end is part of the name. `denyRead`, `allowRead`, `allowWrite` and `denyWrite` take this form; `credentials.files` does not. An object without `"literal": true`, or with any other key, is rejected.
+- Not covered: on Linux, `allowWrite` and `denyWrite` still take no patterns, so a pattern beneath such a folder is skipped there, and `getLinuxGlobPatternWarnings()` still names every write entry with those characters that is not marked, whether or not it is applied as a path. On Linux, a `denyRead` for a path that does not exist when the command is wrapped hides nothing in that command, marked or not. On Linux, the violation monitor takes its lists at `initialize()`: a folder created later counts for the commands wrapped after it, and the monitor does not learn of it. On macOS, an allow that is also the name of a path allows everything beneath that path, as any name does, where its pattern allows only what it matches: under `allowWrite: ["/work/*"]` a command can create a folder named `*` in `/work`, or rename one to that, and from the next command on write everything in it (under `allowRead`, read everything in it, whatever a `denyRead` pattern covers there). On Windows, `*` and `?` cannot be part of a name, so a marked path that holds one is skipped, and a UNC pattern is read as a pattern only, because finding out what exists would mean asking the share.
+- For embedders: the four lists of `SandboxRuntimeConfig` are of type `FilesystemPathEntry[]`, which is `(string | { path: string; literal: true })[]`, and `getConfig()` gives entries back in the form they were given. Code that reads an entry as a string stops compiling; `typeof entry === 'string' ? entry : entry.path` is its path. Three things change without a compile error. A list joined into text prints `[object Object]` for a marked entry. `getFsReadConfig()` and `getFsWriteConfig()` carry marked entries in `literalDenyOnly`, `literalAllowWithinDeny`, `literalAllowOnly` and `literalDenyWithinAllow`, each of which may be absent when it has no entries, so hand those objects on whole instead of rebuilding them from `denyOnly` and `allowOnly`; `writeRootsOf(getFsWriteConfig())` is every path the command may write. And an empty `denyOnly` no longer means that nothing is read-denied. `getDefaultWritePaths()` and `expandWindowsFsPaths()` take the lists as configured. `wrapCommandWithSandboxLinux()` takes every path it is handed for a name, as bubblewrap does, and skips a string in `allowOnly` that has such characters and is not the name of a path by the rule above.
 
 #### Other Configuration
 
@@ -532,6 +620,10 @@ srt "jest --no-watchman"
 
 Watchman accesses files outside the sandbox boundaries, which will trigger permission errors. Disabling it allows Jest to run with the built-in file watcher instead.
 
+**Exit status under zsh (Linux):** From the first release after v0.0.77, a wrap that restricts the network reports the wrapped command's own exit status when `binShell` is zsh. Up to v0.0.77 a failing command could report 0 there: the wrapper's cleanup trap ended with a bare `exit`, which zsh resolves to the status of the trap's last command. bash (the default) and dash were not affected.
+
+**zod 4 in the same dependency tree:** The `zod` dependency range is `^3.25.0`. The library imports `zod/v3`, which exists from zod 3.25 on, so that it keeps the v3 API where a dependency tree resolves `zod` to version 4.
+
 ## Platform Support
 
 - **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
@@ -554,6 +646,8 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Ubuntu/Debian: `apt-get install ripgrep`
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
+
+**Supported bubblewrap versions:** 0.4.0 and later, except that two things need 0.5.0 or newer, both of them changes to how bubblewrap prepares the mount point for a file bind: a `denyRead` entry or credential mask naming a path that is not a regular file — a fifo, a socket, a device node — cannot be applied on an older bubblewrap, which creates a file at the destination instead of binding over what is there (that fails on a read-only mount and blocks on a fifo); and a mount point left behind by an interrupted sandbox (see "Write denies on paths that do not exist yet" below) is created with write bits there, so the next wrap does not recognise it as a leftover and leaves it on the host. `checkDependencies()` runs `bwrap --version` (keeping the answer for the life of the process) and returns a warning naming the version it found when bubblewrap is older than 0.5.0; it is a warning, not a refusal. CI runs the whole suite against the bubblewrap Ubuntu ships and against 0.12.0, and the Linux mount-plan suites against 0.4.1 as well.
 
 **Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
 
@@ -621,7 +715,7 @@ Running under a distinct user SID structurally closes the surrogate-spawn class 
 - `filesystem.allowRead` → an inheriting `READ|EXECUTE` ALLOW ACE
 - `filesystem.denyRead` / `filesystem.denyWrite` → an inheriting DENY ACE on the target, plus an inheriting `FILE_DELETE_CHILD` DENY on its parent — together with the withheld `FILE_DELETE_CHILD` on the working-tree grant, this stops the sandboxed process from renaming or deleting a denied path via its parent directory
 
-`reset()` removes every ACE this session added (refcounted across this user's concurrent hosts via the per-user session DB; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit). Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered.
+`reset()` removes every ACE this session added (refcounted across this user's concurrent hosts via the per-user session DB; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit). Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered. In an entry without `*` or `?`, `[` and `]` are characters of the name. In a pattern they are read as a character class, as on the other platforms, and the pattern is also expanded beneath a folder that has them in its name.
 
 ### TLS termination on Windows
 
@@ -706,6 +800,31 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 
 **JVM tools (macOS/Linux):** the JVM ignores `HTTPS_PROXY`/`NO_PROXY` and has no environment variable for proxy credentials — proxy selection comes from the `https.proxyHost` system properties and the credential can only be supplied through `java.net.Authenticator`. So JVM-based tools (Bazel's gRPC remote cache, Gradle, Maven, …) would otherwise dial the target directly and fail, or reach the proxy without its token and get a 407. To close that gap srt injects a small `-javaagent` via `JAVA_TOOL_OPTIONS` (the env var carries only the jar path, the credential stays in `HTTPS_PROXY`). At JVM start the agent sets `http[s].proxyHost`/`Port` and `http.nonProxyHosts` from the proxy env vars, re-enables Basic auth for CONNECT tunnels, and installs an Authenticator for the proxy endpoint. Explicit `-D` proxy properties on the JVM command line still win, and any inherited `JAVA_TOOL_OPTIONS` is preserved (unless it is a denied credential env var). Every JVM prints a `Picked up JAVA_TOOL_OPTIONS: …` line to stderr as a result; a jlink'd runtime built without the `java.instrument` module cannot load agents and will refuse to start under the sandbox — unset `JAVA_TOOL_OPTIONS` in the command for such a tool. The jar ships in the npm package as `vendor/java-proxy-agent/srt-proxy-agent.jar` (source: `vendor/java-proxy-agent-src/`; built by the release workflow, or locally with `npm run build:java-agent` — needs a JDK ≥ 17). If it is not found, `JAVA_TOOL_OPTIONS` is left alone and JVMs behave as before; bundlers can point at their own copy with `javaAgentJarPath`.
 
+### TLS Termination
+
+With `network.tlsTerminate`, a CONNECT to an allowed host that is not in `excludeDomains` is answered `200`, and the client's first bytes are read. If they are a TLS ClientHello, the TLS is terminated in the SRT process, on the tunnel's own socket: the leaf certificate is minted for the server name read from the ClientHello (for the CONNECT target when there is none, and always with `requireHostMatch`), and the decrypted connection is handed to an HTTP server that never listens. Each request on it goes through `filterRequest` and the credential hooks and is forwarded upstream over a separate, certificate-verified TLS connection. The decrypted traffic, and the credentials injected into it, stay inside the SRT process and leave it only re-encrypted, to that verified upstream. Nothing is opened that another process could connect to: there is no per-tunnel listener and no per-tunnel socket file. A CONNECT whose first bytes are not TLS is tunnelled opaquely, as before (or refused, with `refuseOpaqueTunnels`).
+
+**Runtime requirement.** Handing a decrypted connection to an HTTP server needs an `http.Server` that serves a connection passed to it with `emit('connection')`. Node's does, and Bun's does from 1.4. On an older Bun, `SandboxManager.initialize` with `network.tlsTerminate` set throws before it starts anything, with an error that names the runtime found:
+
+```
+tlsTerminate needs Node, or Bun 1.4 or later (this is Bun 1.3.13)
+```
+
+A program built with `bun build --compile` runs on the Bun that built it, so build it with Bun 1.4 or later. Without `tlsTerminate`, nothing changes on any runtime. Should a tunnel still reach the proxy on such a runtime, it is closed rather than left hanging.
+
+**Limits.** At most `maxTunnels` tunnels (default 256) are terminated at once, and each must finish its handshake within `handshakeTimeoutMs` (default 10 s) of its CONNECT; see [Network Configuration](#network-configuration). Leaf certificates share one key per CA, and the proxy keeps those of the 256 most recently used host names.
+
+**Memory held for slow peers.** A response to a client that is not reading waits once about 1 MiB is queued for that client, or once all tunnels together have 256 MiB queued, on Node and Bun alike. A request body to an upstream that is not reading is held back by the runtime under Node. Under Bun, the proxy does it itself (it pauses a tunnel once 4 MiB of its request body is buffered, or once the shared 256 MiB is used), but that only works on a connection the proxy is handed by its host. The proxy `SandboxManager` runs accepts its own connections, and Bun keeps reading such a tunnel while it is paused. So under Bun an upload to an upstream that has stopped reading is buffered in the SRT process without bound. This is a limitation of the runtime. Use Node where a sandboxed process may upload more than the host can hold.
+
+**Changes a `tlsTerminate` user can observe.** On a supported runtime, compared with the per-tunnel listener:
+
+- The tunnel cap: past `maxTunnels`, a CONNECT is answered `503` (`X-Proxy-Error: too-many-tunnels`), whether or not it would have carried TLS.
+- The handshake deadline: a tunnel that has not finished its TLS handshake within `handshakeTimeoutMs` of its CONNECT is closed.
+- The server name passed to `filterRequest` (`sni`) is lower-cased.
+- With `requireHostMatch`, the leaf certificate is always the CONNECT target's, whatever server name the client asks for (a name that does not match gets `421`, as before).
+- A ClientHello whose server name cannot be read as a plain DNS name (letters, digits and inner hyphens in dot-separated labels, with no trailing dot; for example one with an underscore) gets the CONNECT target's leaf certificate instead of one minted for that name. With `requireHostMatch`, its requests are answered `421`.
+- Under Bun, an HTTP/1.1 request without a `Host` header inside a tunnel is answered `400`, as Node's parser already does.
+
 ### Filesystem Isolation
 
 Filesystem restrictions are enforced at the OS level:
@@ -728,6 +847,8 @@ Filesystem restrictions are enforced at the OS level:
   - `denyWrite` creates exceptions within allowed paths (deny takes precedence)
 
 **Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas. On Linux that also holds when the `denyWrite` entry is at or above the `allowWrite` one — `allowWrite: ["/", "/work"]` with `denyWrite: ["/"]` leaves `/work` read-only rather than writable — and with debug logging on (`SRT_DEBUG`) the wrap logs a warning naming both paths.
+
+**Writes through links (Linux and macOS):** a write is judged by where it lands, after symbolic links are followed. A link inside an allowed write path that leads out of it gives a command nothing: the write is refused. A link that leads into an allowed write path works like any other name for that place. A hard link is a second name for the file itself: on Linux a file outside the allowed write paths that already has a hard link inside one can be written through it, and a sandboxed command cannot create such a link. On macOS nothing is promised for such a file.
 
 **Read-side rules (Linux):** an entry is matched by the name it is, not by what it points at.
 
@@ -781,7 +902,7 @@ With `allowWrite: ["/"]` the pins reach every ancestor, including any other allo
 
 A wrap that carries no write restrictions at all — `filesystem.disabled` with credential masks still in force, or a library caller passing no write config while a `denyRead` entry or a mask still seeds a pin — is the same shape: the whole tree is bound writable, so it gets the same pins and the same top-level covers, and the same `EXDEV` boundary applies there too.
 
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
+**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance: a dangerous file is found down to `a/b/.bashrc`, and a dangerous directory, or the hooks and config of a repository, one level higher up (`a/.vscode`, `a/.claude/commands`, `a/.git/hooks`). Ignore files (`.gitignore`, `.ignore`) do not hide anything from it, and a directory of the user's own that it cannot read is denied whole. A dangerous directory other than a repository's hooks is only seen if it holds a file directly: below the working directory, one that is empty or does not exist yet can be filled. A repository that has no `hooks` directory has an empty file in its place while a command runs, which stops `git init` from being run again there and a hook from being installed. You can configure this with `mandatoryDenySearchDepth`:
 
 ```json
 {
@@ -811,7 +932,7 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 4. **Two-stage application using apply-seccomp binary**:
    - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
-   - Network bridging processes (socat) start inside the sandbox (need Unix sockets)
+   - Network bridging processes (socat) start inside the sandbox (need Unix sockets), and the wrapper waits until both listen
    - apply-seccomp creates a nested user+PID+mount namespace and remounts `/proc`
    - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
    - apply-seccomp forks, applies the seccomp filter via `prctl()`, and execs the user command

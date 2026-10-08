@@ -143,10 +143,34 @@ function sanitizeViolationText(text: string): string {
  * that (an HTTP proxy header budget is kilobytes).
  */
 export function sanitizeUnregisteredCommandKey(decodedKey: string): string {
-  const cut = sanitizeViolationText(decodedKey).slice(
-    0,
+  return cutBetweenCharacters(
+    sanitizeViolationText(decodedKey),
     SANDBOXED_COMMAND_KEY_LENGTH,
   )
+}
+
+/**
+ * How much of a denial reason supplied by the ask callback a violation line
+ * carries, in UTF-16 code units: a few sentences fit, a document does not.
+ */
+export const MAX_DENIAL_REASON_LENGTH = 500
+
+/**
+ * A denial reason the ask callback supplied, as a violation line may carry
+ * it: sanitized first, so the cut counts what is displayed, then cut so that
+ * one answer cannot flood the text a model reads. The end is trimmed after
+ * the cut: the reason sits inside parentheses, where the store's own trim of
+ * the line's ends does not reach.
+ */
+export function sanitizeDenialReason(reason: string): string {
+  return cutBetweenCharacters(
+    sanitizeViolationText(reason),
+    MAX_DENIAL_REASON_LENGTH,
+  ).trimEnd()
+}
+
+function cutBetweenCharacters(text: string, length: number): string {
+  const cut = text.slice(0, length)
   // A cut by UTF-16 code unit can land between a surrogate pair; the lone
   // high surrogate left behind renders as a replacement character.
   return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut

@@ -78,12 +78,13 @@ describe.if(isLinux)('Sandbox Integration', () => {
   it('threads a custom apply-seccomp path through seccompConfig', async () => {
     const real = getApplySeccompBinaryPath()
     expect(real).toBeTruthy()
+    if (real === null) throw new Error('apply-seccomp path did not resolve')
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: 'echo test',
       needsNetworkRestriction: false,
       writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-      seccompConfig: { applyPath: real! },
+      seccompConfig: { applyPath: real },
     })
 
     expect(wrappedCommand).toContain(real)

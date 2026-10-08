@@ -1,10 +1,13 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
+  type GlobWalkListings,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
   properAncestors,
-  walkGlobPattern,
+  type Steps,
+  finish,
+  walkGlobPatternSteps,
 } from './sandbox-utils.js'
 
 /**
@@ -70,15 +73,37 @@ function collapseReadDenyLocations({
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
+ * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
+ * @param opts.listings - one map for all the patterns of a configuration.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
+  opts: { anchor?: string; listings?: GlobWalkListings } = {},
 ): string[] {
-  const walk = walkGlobPattern(globPattern, {
+  return finish(
+    expandReadDenyGlobLinuxSteps(
+      globPattern,
+      reExposedPaths,
+      unlistableDirs,
+      opts,
+    ),
+  )
+}
+
+/** {@link expandReadDenyGlobLinux}, in the walk's steps. */
+export function* expandReadDenyGlobLinuxSteps(
+  globPattern: string,
+  reExposedPaths: readonly string[],
+  unlistableDirs?: Set<string>,
+  opts: { anchor?: string; listings?: GlobWalkListings } = {},
+): Steps<string[]> {
+  const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
+    anchor: opts.anchor,
+    listings: opts.listings,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.
@@ -156,8 +181,11 @@ export function expandReadDenyGlobLinux(
     addLocation(standIn, candidate)
   }
 
+  // Allow paths, which reach this backend as names whatever they hold.
   const reExposed = new Set(
-    reExposedPaths.flatMap(p => pathSpellings(normalizePathForSandbox(p))),
+    reExposedPaths.flatMap(p =>
+      pathSpellings(normalizePathForSandbox(p, { literal: true })),
+    ),
   )
   const mounts = collapseReadDenyLocations({
     locations,
