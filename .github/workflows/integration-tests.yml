@@ -253,9 +253,6 @@ jobs:
           make install
           "$RUNNER_TEMP/bwrap-0.4/bin/bwrap" --version
 
-      # test/sandbox/stale-mount-point.test.ts is not among these: it asserts
-      # the read-only mode bubblewrap gives a mount point it creates, which it
-      # does only from 0.5.0 on, and the recovery it covers keys off that mode.
       - name: Run the mount-plan suites against bubblewrap 0.4.1 (Linux)
         if: matrix.os == 'linux'
         run: |
@@ -267,7 +264,8 @@ jobs:
             test/sandbox/linux-mount-plan-record.test.ts \
             test/sandbox/path-canonicalization.test.ts \
             test/sandbox/credential-deny.test.ts \
-            test/sandbox/symlink-boundary.test.ts
+            test/sandbox/symlink-boundary.test.ts \
+            test/sandbox/stale-mount-point.test.ts
 
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
