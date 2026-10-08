@@ -1,6 +1,7 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
 import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
+import { isWindows } from './helpers/platform.js'
 
 describe('Config Validation', () => {
   test('should validate a valid minimal config', () => {
@@ -368,25 +369,34 @@ describe('Config Validation', () => {
     // separator could satisfy, so it denies nothing on either backend —
     // fail-open, and with no diagnostic beyond a debug line about zero
     // expansions.
-    test.each([['/data/*/'], ['/data/**/'], ['/data/[ab]/'], ['/data/?/']])(
+    function expectSlashedDenyGlobRejected(spelling: string): void {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: { ...base.filesystem, denyRead: [spelling] },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toContain(spelling)
+        expect(result.error.issues[0]?.message).toContain('can match no path')
+        expect(result.error.issues[0]?.path).toEqual([
+          'filesystem',
+          'denyRead',
+          0,
+        ])
+      }
+    }
+
+    test.each([['/data/*/'], ['/data/**/'], ['/data/?/']])(
       'rejects denyRead %s',
-      spelling => {
-        const result = SandboxRuntimeConfigSchema.safeParse({
-          ...base,
-          filesystem: { ...base.filesystem, denyRead: [spelling] },
-        })
-        expect(result.success).toBe(false)
-        if (!result.success) {
-          expect(result.error.issues[0]?.message).toContain(spelling)
-          expect(result.error.issues[0]?.message).toContain('can match no path')
-          expect(result.error.issues[0]?.path).toEqual([
-            'filesystem',
-            'denyRead',
-            0,
-          ])
-        }
-      },
+      spelling => expectSlashedDenyGlobRejected(spelling),
     )
+
+    // `[` and `]` are legal characters in a Windows filename, so
+    // containsGlobCharsWin reads a bracket spelling as a literal path and
+    // there is no inert pattern to reject.
+    test.if(!isWindows)('rejects denyRead /data/[ab]/', () => {
+      expectSlashedDenyGlobRejected('/data/[ab]/')
+    })
 
     test('rejects a slashed denyWrite glob, naming the spelling to use', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
@@ -422,6 +432,27 @@ describe('Config Validation', () => {
         ])
       }
     })
+
+    test.if(!isWindows)(
+      'points a deny inside a folder named like a pattern at the spelling read both ways',
+      () => {
+        // Whether the folder exists is for the disk to say, which validation
+        // does not ask, so the separator is refused here as in any pattern.
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          filesystem: {
+            ...base.filesystem,
+            denyWrite: ['/work/[WIP] project/keep/'],
+          },
+        })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.message).toContain(
+            'Write "/work/[WIP] project/keep", which is also read as the path of that name',
+          )
+        }
+      },
+    )
 
     test('accepts the slash-free glob spellings it points at', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
@@ -510,6 +541,121 @@ describe('Config Validation', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
         filesystem: { ...base.filesystem, denyRead: ['/data/[ab]/'] },
+      })
+      expect(result.success).toBe(false)
+    })
+  })
+
+  describe('path entries marked literal', () => {
+    type List = 'denyRead' | 'allowRead' | 'allowWrite' | 'denyWrite'
+    const lists: List[] = ['denyRead', 'allowRead', 'allowWrite', 'denyWrite']
+
+    function parse(list: List, entry: unknown) {
+      return SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [],
+          denyWrite: [],
+          [list]: [entry],
+        },
+      })
+    }
+
+    test.each(lists)('%s takes a path marked literal beside a string', list => {
+      const marked = { path: '/work/*.env', literal: true as const }
+      const result = parse(list, marked)
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.filesystem[list]).toEqual([marked])
+      const plain = parse(list, '/work/keep')
+      expect(plain.success && plain.data.filesystem[list]).toEqual([
+        '/work/keep',
+      ])
+    })
+
+    test.each(lists)(
+      '%s takes ~ and relative spellings marked literal',
+      list => {
+        for (const path of ['~/notes (draft?)', './build*', '[WIP] project']) {
+          expect(parse(list, { path, literal: true }).success).toBe(true)
+        }
+      },
+    )
+
+    test.each([
+      ['no mark', { path: '/work/x' }],
+      ['a mark that is false', { path: '/work/x', literal: false }],
+      ['a mark that is a string', { path: '/work/x', literal: 'true' }],
+      ['a mark that is a number', { path: '/work/x', literal: 1 }],
+      ['no path', { literal: true }],
+      ['a path that is not a string', { path: ['/work/x'], literal: true }],
+      ['a number', 42],
+      ['null', null],
+      ['a list', ['/work/x']],
+    ])('refuses an entry with %s', (_what, entry) => {
+      for (const list of lists) {
+        const result = parse(list, entry)
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.path.slice(0, 3)).toEqual([
+            'filesystem',
+            list,
+            0,
+          ])
+        }
+      }
+    })
+
+    test('says what an entry may be when it is neither', () => {
+      const result = parse('denyRead', { path: '/work/x', literal: false })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toBe(
+          'Expected a path, or { "path": "<path>", "literal": true }',
+        )
+      }
+    })
+
+    test('refuses a key it does not know, rather than ignore it', () => {
+      const result = parse('denyRead', {
+        path: '/work/x',
+        literal: true,
+        recursive: true,
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.code).toBe('unrecognized_keys')
+      }
+    })
+
+    test('refuses an empty path, marked or not, with the same message', () => {
+      for (const entry of ['', { path: '', literal: true }]) {
+        const result = parse('allowWrite', entry)
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.message).toBe('Path cannot be empty')
+        }
+      }
+    })
+
+    test('takes a separator at the end of a marked deny, which is no glob', () => {
+      // The same spelling as a string is a pattern that can match no path,
+      // and is refused; marked, it is a name and the separator ends it.
+      for (const list of ['denyRead', 'denyWrite'] as const) {
+        expect(parse(list, '/data/*/').success).toBe(false)
+        expect(parse(list, { path: '/data/*/', literal: true }).success).toBe(
+          true,
+        )
+      }
+    })
+
+    test('does not take the mark on a credential file', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        credentials: {
+          files: [{ path: { path: '~/.netrc', literal: true }, mode: 'deny' }],
+        },
       })
       expect(result.success).toBe(false)
     })
@@ -2107,6 +2253,51 @@ describe('Config Validation', () => {
           },
         })
         expect(result.success).toBe(false)
+      })
+    })
+
+    describe('maxTunnels and handshakeTimeoutMs', () => {
+      const parse = (tlsTerminate: Record<string, unknown>) =>
+        SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: { ...base.network, tlsTerminate },
+        })
+
+      test('are optional and round-trip when given', () => {
+        const none = parse({})
+        expect(none.success).toBe(true)
+        if (none.success) {
+          expect(none.data.network.tlsTerminate?.maxTunnels).toBeUndefined()
+          expect(
+            none.data.network.tlsTerminate?.handshakeTimeoutMs,
+          ).toBeUndefined()
+        }
+        const given = parse({ maxTunnels: 1024, handshakeTimeoutMs: 30_000 })
+        expect(given.success).toBe(true)
+        if (given.success) {
+          expect(given.data.network.tlsTerminate?.maxTunnels).toBe(1024)
+          expect(given.data.network.tlsTerminate?.handshakeTimeoutMs).toBe(
+            30_000,
+          )
+        }
+      })
+
+      test('accept their bounds', () => {
+        for (const v of [1, 65536]) {
+          expect(parse({ maxTunnels: v }).success).toBe(true)
+        }
+        for (const v of [100, 600_000]) {
+          expect(parse({ handshakeTimeoutMs: v }).success).toBe(true)
+        }
+      })
+
+      test('reject a value that is not a positive integer in range', () => {
+        for (const v of [0, -1, 1.5, 65537, '256', null]) {
+          expect(parse({ maxTunnels: v }).success).toBe(false)
+        }
+        for (const v of [0, 99, 1500.5, 600_001, '10000', null]) {
+          expect(parse({ handshakeTimeoutMs: v }).success).toBe(false)
+        }
       })
     })
   })

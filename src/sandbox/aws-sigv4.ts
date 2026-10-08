@@ -161,6 +161,10 @@ export function uriEncode(s: string): string {
  * percent-encoded once more on top of its wire encoding ('/' preserved).
  * Matches the AWS SDK signer (smithy SignatureV4.getCanonicalPath) and
  * awslabs/aws-sigv4-proxy, which disables path escaping for s3 only.
+ *
+ * rawPath is the target the proxy forwards, so the signature covers the
+ * path on the wire: the client's bytes unchanged when no filterRequest is
+ * configured, the normalized target when one is.
  */
 export function canonicalUri(rawPath: string, service: string): string {
   if (rawPath === '') return '/'

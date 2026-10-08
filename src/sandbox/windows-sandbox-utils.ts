@@ -14,11 +14,10 @@ import {
   containsGlobCharsWin,
   expandGlobPattern,
   isUncPath,
+  markedLiteralPath,
 } from './sandbox-utils.js'
-// Re-export so existing tests (glob-expand.test.ts) and any
-// out-of-tree caller keep their import path. `buildGitConfigEnv` is
-// hoisted to sandbox-utils (cross-platform) but re-exported here for
-// the existing `src/index.ts` surface.
+// Kept on this module's surface for out-of-tree importers; the
+// implementations live in sandbox-utils.ts.
 export {
   containsGlobCharsWin,
   stripExtendedPathPrefix,
@@ -26,8 +25,9 @@ export {
   isUncPath,
 } from './sandbox-utils.js'
 import { certThumbprint, generateCa, validateCaPair } from './mitm-ca.js'
+import { literalReadings } from './path-entries.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
-import type { SrtWinConfig } from './sandbox-config.js'
+import type { FilesystemPathEntry, SrtWinConfig } from './sandbox-config.js'
 
 /**
  * Windows sandbox backend.
@@ -979,9 +979,8 @@ export async function verifyWindowsWfpEgress(
   }
   try {
     // 30s: first call after install may create the sandbox user's
-    // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW —
-    // same budget as windowsTrustCa, plus the runner's own 2s
-    // connect timeout.
+    // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
+    // the runner allows itself 2s to connect (runner.rs).
     const r = runSrtWin(['wfp', 'verify', '--target', target], {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
@@ -1438,11 +1437,7 @@ export interface WindowsInstallOptions {
   force?: boolean
   /**
    * How long to wait for the self-elevating install subprocess.
-   * Default 120 000 ms — the Windows UAC consent dialog auto-
-   * dismisses after ~2 minutes, so anything shorter risks killing
-   * the subprocess while a legitimate approval is still pending
-   * (elevation is not retracted when the parent dies, so a late
-   * approval after we've timed out would half-complete).
+   * Defaults to {@link INSTALL_TIMEOUT_MS}.
    */
   timeoutMs?: number
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
@@ -1463,11 +1458,17 @@ export interface WindowsInstallResult {
 }
 
 /**
- * Effective spawn budget for the self-elevating install/uninstall —
- * see {@link WindowsInstallOptions.timeoutMs} for the 120 s rationale.
+ * Default spawn budget for the self-elevating install/uninstall. The Windows
+ * UAC consent dialog auto-dismisses after ~2 minutes, so anything shorter
+ * risks killing the subprocess while a legitimate approval is still pending
+ * (elevation is not retracted when the parent dies, so a late approval after
+ * we have timed out would half-complete).
  */
+const INSTALL_TIMEOUT_MS = 120_000
+
+/** Effective spawn budget for the self-elevating install/uninstall. */
 function installTimeoutMs(opts: { timeoutMs?: number }): number {
-  return opts.timeoutMs ?? 120_000
+  return opts.timeoutMs ?? INSTALL_TIMEOUT_MS
 }
 
 function installArgs(opts: WindowsInstallOptions): string[] {
@@ -1633,7 +1634,7 @@ export function uninstallWindowsSandbox(
     keepUser?: boolean
     /**
      * How long to wait for the self-elevating uninstall subprocess.
-     * Default 120 000 ms — see {@link WindowsInstallOptions.timeoutMs}.
+     * Defaults to {@link INSTALL_TIMEOUT_MS}.
      */
     timeoutMs?: number
     srtWin?: SrtWinSpawn
@@ -1689,15 +1690,37 @@ export function uninstallWindowsSandbox(
  * `srt-win` soft-drops a missing UNC deny target rather than
  * materializing a placeholder chain on an SMB share. A UNC **glob**
  * still walks the share (user-trusted).
+ *
+ * `[` and `]` are characters of a name here, but the walk that expands a
+ * glob reads them as a character class. So a glob beneath a directory with
+ * brackets in its name is also expanded beneath that directory taken as the
+ * name it is (see path-entries.ts). A UNC glob is not: finding the directory
+ * would probe the share.
+ *
+ * An entry marked `{ path, literal: true }` is a literal whatever it holds.
+ * One that holds `*` or `?` is skipped: no Win32 name has them, and
+ * `srt-win` refuses the characters outright.
  */
 export function expandWindowsFsPaths(
-  patterns: readonly string[],
+  patterns: readonly FilesystemPathEntry[],
   opts?: { mode?: 'grant' | 'deny' },
 ): string[] {
   const out = new Set<string>()
-  for (const raw of patterns) {
-    const norm = normalizePathForSandbox(raw)
-    const isGlob = containsGlobCharsWin(norm)
+  for (const entry of patterns) {
+    const marked = typeof entry !== 'string'
+    const raw = marked ? markedLiteralPath(entry) : entry
+    const norm = normalizePathForSandbox(
+      raw,
+      marked ? { literal: true } : undefined,
+    )
+    if (marked && containsGlobCharsWin(norm)) {
+      logForDebugging(
+        `[Sandbox Windows] Skipping a literal path that no file can have: ${norm}`,
+        { level: 'warn' },
+      )
+      continue
+    }
+    const isGlob = !marked && containsGlobCharsWin(norm)
     // UNC literal: pass raw (no stat) — see {@link isUncPath}. A
     // UNC glob falls through to expandGlobPattern below.
     if (isUncPath(norm) && !isGlob) {
@@ -1705,7 +1728,19 @@ export function expandWindowsFsPaths(
       continue
     }
     const candidates = isGlob
-      ? expandGlobPattern(norm, { caseInsensitive: true })
+      ? [
+          ...expandGlobPattern(norm, { caseInsensitive: true }),
+          ...literalReadings(raw, opts?.mode === 'deny' ? 'deny' : 'allow', {
+            isPattern: containsGlobCharsWin,
+          }).flatMap(reading =>
+            reading.glob
+              ? expandGlobPattern(reading.path, {
+                  caseInsensitive: true,
+                  anchor: reading.anchor,
+                })
+              : [],
+          ),
+        ]
       : [norm]
     for (const c of candidates) {
       const st = fs.statSync(c, { throwIfNoEntry: false })

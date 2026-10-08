@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import pkg from '../package.json' with { type: 'json' }
 import { quote } from './utils/shell-quote.js'
 import { Command, InvalidArgumentError } from 'commander'
 import { SandboxManager } from './index.js'
@@ -17,6 +18,18 @@ import * as os from 'os'
  */
 function getDefaultConfigPath(): string {
   return path.join(os.homedir(), '.srt-settings.json')
+}
+
+/**
+ * The version `--version` reports, from the package's own manifest, which
+ * sits one directory above both src/cli.ts and dist/cli.js. A static import
+ * rather than a runtime require, so a single-file build (`bun build
+ * --compile`) embeds it instead of looking for a package.json beside the
+ * binary. There is still no fallback: a plausible-looking wrong version is
+ * worse than failing, because the README pins behaviour to specific releases.
+ */
+function getPackageVersion(): string {
+  return pkg.version
 }
 
 /**
@@ -167,7 +180,7 @@ async function main(): Promise<void> {
     .description(
       'Run commands in a sandbox with network and filesystem restrictions',
     )
-    .version(process.env.npm_package_version || '1.0.0')
+    .version(getPackageVersion())
 
   // ── Windows install/uninstall ─────────────────────────────────
   // Self-elevating one-shot install (one UAC prompt). Also
@@ -251,6 +264,19 @@ async function main(): Promise<void> {
         console.error(`Error: ${(e as Error).message}`)
         process.exit(1)
       }
+    })
+
+  program
+    .command('proxy')
+    .description(
+      'Run only the HTTP proxy, deciding every request through an external decider on inherited fds.',
+    )
+    .allowUnknownOption()
+    .helpOption(false)
+    .argument('[args...]')
+    .action(async (args: string[]) => {
+      const { runProxyCli } = await import('./proxy-cli.js')
+      await runProxyCli(args)
     })
 
   // Default command - run command in sandbox
@@ -411,6 +437,20 @@ async function main(): Promise<void> {
             controlStream.on('error', onControlError)
           }
 
+          // Until there is a child to pass an interrupt on to, it stops the
+          // run. The library's own handlers, which initialize() installs, only
+          // clean up: left to them the command would be run all the same.
+          const interrupted = new AbortController()
+          const interrupt = (signal: NodeJS.Signals): void =>
+            interrupted.abort(new Error(`interrupted by ${signal}`))
+          process.once('SIGINT', interrupt)
+          process.once('SIGTERM', interrupt)
+          const aboutToSpawn = (): void => {
+            interrupted.signal.throwIfAborted()
+            process.off('SIGINT', interrupt)
+            process.off('SIGTERM', interrupt)
+          }
+
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')
           await SandboxManager.initialize(runtimeConfig)
@@ -500,14 +540,21 @@ async function main(): Promise<void> {
             // entries to the child as CRT descriptors, so the control fd
             // is not among them (an inheritable HANDLE still reaches the
             // child, but unnamed — nothing there can find it).
+            aboutToSpawn()
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
               stdio: 'inherit',
               env,
             })
           } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
+            // The wrap can take seconds over a large tree.
+            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+              command,
+              undefined,
+              undefined,
+              interrupted.signal,
+            )
+            aboutToSpawn()
             child = spawn(sandboxedCommand, {
               shell: true,
               stdio: sandboxedStdio(controlFd),

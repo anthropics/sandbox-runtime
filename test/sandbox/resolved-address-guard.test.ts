@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { testWithTls } from '../helpers/emitted-connections.js'
 import {
   createResolvedAddressGuard,
   isResolvedAddressDenied,
@@ -941,6 +942,8 @@ describe('resolved-address-guard: through the proxy servers', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolved-address-guard: TLS-terminated upstream leg', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const it = testWithTls
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
   const UP_HOST = 'devbox.example.com'
   let upstream: ReturnType<typeof createHttpsServer>
@@ -1011,6 +1014,10 @@ describe('resolved-address-guard: TLS-terminated upstream leg', () => {
       '-sS',
       '--proxy',
       `http://127.0.0.1:${proxyPort}`,
+      // An empty list overrides NO_PROXY, which would send curl around
+      // the proxy under test for 127.0.0.1.
+      '--noproxy',
+      '',
       '--cacert',
       CA_CERT,
       '--max-time',

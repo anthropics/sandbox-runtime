@@ -64,7 +64,22 @@ export interface SocksProxyServerOptions {
     port: number,
     host: string,
   ): Promise<{ deniedReason?: string }>
+
+  /**
+   * When true, every SOCKS CONNECT is refused at the handshake with
+   * "general SOCKS server failure", before the allowlist is consulted and
+   * before anything is dialled. A SOCKS tunnel is opaque, so nothing sent
+   * through it could pass the HTTP proxy's filterRequest. Set it together
+   * with HttpProxyServerOptions.refuseOpaqueTunnels.
+   */
+  refuseOpaqueTunnels?: boolean
+
+  /** Called for each CONNECT refused under refuseOpaqueTunnels. */
+  onTunnelRefused?(port: number, host: string, encodedCommand?: string): void
 }
+
+// VER, REP=0x01 (general SOCKS server failure), RSV, ATYP=IPv4, 0.0.0.0:0.
+const SOCKS_REPLY_GENERAL_FAILURE = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0])
 
 export interface SocksProxyWrapper {
   /**
@@ -100,7 +115,27 @@ export function createSocksProxyServer(
     })
   }
 
-  socksServer.setRulesetValidator(async conn => {
+  socksServer.setRulesetValidator(conn => {
+    if (options.refuseOpaqueTunnels) {
+      logForDebugging(
+        `SOCKS CONNECT to ${JSON.stringify(conn.destAddress)}:${conn.destPort} refused (refuseOpaqueTunnels)`,
+      )
+      options.onTunnelRefused?.(
+        conn.destPort,
+        conn.destAddress,
+        encodedCommandFromProxyUser(conn.username),
+      )
+      // Answered here rather than through the library's deny, whose reply
+      // claims a ruleset refusal of this destination.
+      conn.socket.end(SOCKS_REPLY_GENERAL_FAILURE, () => conn.socket.destroy())
+      return undefined
+    }
+    return validateDestination(conn)
+  })
+
+  async function validateDestination(
+    conn: Parameters<NonNullable<typeof socksServer.rulesetValidator>>[0],
+  ): Promise<boolean> {
     try {
       const hostname = conn.destAddress
       const port = conn.destPort
@@ -140,7 +175,7 @@ export function createSocksProxyServer(
       })
       return false
     }
-  })
+  }
 
   // Override the default connection handler so we can route through a parent
   // HTTP proxy when one is configured. The default handler does a straight
@@ -209,10 +244,11 @@ export function createSocksProxyServer(
   })
 
   // Track every injected client socket so close() can tear them down
-  // immediately. A SOCKS connection mid-`dialDirect()` (30s timeout) or
-  // mid-relay would otherwise hold reset() open past bun's test timeout.
-  // The library's internal net.Server is never .listen()ed — the mux owns
-  // accept — so there's no listener to close; we only destroy sockets.
+  // immediately. A SOCKS connection still inside `dialDirect()`
+  // (CONNECT_TIMEOUT_MS, parent-proxy.ts) or mid-relay would otherwise hold
+  // reset() open until it expires. The library's internal net.Server is never
+  // .listen()ed — the mux owns accept — so there's no listener to close; we
+  // only destroy sockets.
   const openSockets = new Set<Socket>()
 
   return {

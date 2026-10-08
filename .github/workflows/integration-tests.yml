@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - arch: x86-64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             os: linux
           - arch: arm64
             runner: ubuntu-24.04-arm
@@ -38,18 +38,20 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # Node 20 (Active LTS): Node 18 has no official windows-arm64
-          # build, so setup-node fails on the win/arm64 leg. engines is
-          # >=18.0.0 — this only pins the CI test version, not the floor.
-          node-version: '20'
+          # The newest release of the oldest line that `engines` allows. Not
+          # 22.12.0 itself: these tests also run `node` inside the sandbox,
+          # and on Windows that release tries only `::1` for `localhost`,
+          # where the proxy listens on 127.0.0.1. The floor itself is run by
+          # the package check in release.yml.
+          node-version: '22'
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.2
 
@@ -58,10 +60,14 @@ jobs:
       # then drives it in a real JVM and self-skips when jar or JDK is absent.
       - name: Setup Java (macOS/Linux)
         if: matrix.os != 'windows'
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: '21'
+          # Its javac pattern stays on for the whole job and takes every
+          # `file:line: warning:` for its own, autotools' included, which the
+          # build of bubblewrap 0.4.1 below prints.
+          problem-matcher: false
 
       # ─── Windows: srt-win helper binary ─────────────────────────────
       # GitHub-hosted Windows runners run as a member of Administrators
@@ -69,18 +75,14 @@ jobs:
       # without an explicit elevation step.
       - name: Setup Rust (Windows)
         if: matrix.os == 'windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+        # Installs the version and components named in rust-toolchain.toml.
+        run: rustup toolchain install
 
       - name: Rust build cache (Windows)
         if: matrix.os == 'windows'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: vendor/srt-win-src
-          # Shared with release.yml so tag-ref release builds restore
-          # the cache main pushes warm here.
-          shared-key: srt-win
 
       - name: Build srt-win (Windows)
         if: matrix.os == 'windows'
@@ -91,9 +93,9 @@ jobs:
           # be masked by `cargo clippy` exiting 0 on the next line.
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build  --release --manifest-path vendor/srt-win-src/Cargo.toml
-          cargo test   --release --manifest-path vendor/srt-win-src/Cargo.toml
-          cargo clippy --release --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
+          cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
+          cargo test   --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
+          cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
 
       - name: Smoke-test srt-win install lifecycle (Windows)
         if: matrix.os == 'windows'
@@ -136,7 +138,12 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
-          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts
+          # These are listed explicitly because the non-Windows legs run the
+          # whole tree: winsrt-paths.property is the only property suite over
+          # the Windows path pipeline, glob-expand holds the UNC pass-raw
+          # block that runs on no other leg, and config-validation covers the
+          # schema on a real Windows host rather than under a platform spy.
+          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
@@ -159,9 +166,12 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
-          # Verify bwrap can create namespaces
+          # Same argv as bwrapCanNamespace() in test/helpers/bwrap-namespace.ts,
+          # which whole suites use as `it.skipIf(!BWRAP_CAN_NAMESPACE)`. A host
+          # that cannot nest namespaces must red the leg here rather than skip
+          # those arms silently, so this runs unguarded.
           echo "Testing bwrap namespace creation..."
-          bwrap --ro-bind / / --unshare-net true && echo "✓ bwrap namespace creation works" || echo "✗ bwrap namespace creation still fails"
+          bwrap --unshare-pid --unshare-user --cap-drop ALL --ro-bind / / --proc /proc true
 
       - name: Install system dependencies (macOS)
         if: matrix.os == 'macos'
@@ -175,6 +185,12 @@ jobs:
       - name: Lint (ESLint)
         if: matrix.os == 'linux' && matrix.arch == 'x86-64'
         run: npx eslint .
+
+      # `npm run build` compiles src only. This is the one step that checks
+      # the types of test/, which bun strips at runtime.
+      - name: Typecheck
+        if: matrix.os != 'windows'
+        run: npm run typecheck
 
       - name: Build seccomp binaries (Linux)
         if: matrix.os == 'linux'
@@ -214,43 +230,52 @@ jobs:
         if: matrix.os == 'linux'
         run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
 
+      # RHEL 8 and 9 ship bubblewrap 0.4.0 and 0.4.1, the oldest versions in
+      # current distribution use, and both refuse to start on a plan that
+      # masks again a file a read deny has masked: before 0.5.0 a file bind's
+      # mount point has to be a regular file, and that mask leaves /dev/null
+      # there. Run the suites that build and run mount plans against 0.4.1,
+      # the first of which starts bubblewrap on configurations that name one
+      # file twice, so such a plan is caught here rather than on a user's
+      # machine. Autotools, not meson, which that release predates. Pinned by
+      # commit, not by the v0.4.1 tag, which the upstream repository can move.
+      - name: Build bubblewrap 0.4.1 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -qq autoconf automake libtool libcap-dev pkg-config
+          git clone --filter=blob:none https://github.com/containers/bubblewrap.git "$RUNNER_TEMP/bubblewrap-0.4"
+          cd "$RUNNER_TEMP/bubblewrap-0.4"
+          git checkout 5feb64dc60c936a7f9e424df9478aae9b88ee48a
+          NOCONFIGURE=1 ./autogen.sh
+          ./configure --prefix="$RUNNER_TEMP/bwrap-0.4" --disable-man --disable-selinux
+          make
+          make install
+          "$RUNNER_TEMP/bwrap-0.4/bin/bwrap" --version
+
+      # test/sandbox/stale-mount-point.test.ts is not among these: it asserts
+      # the read-only mode bubblewrap gives a mount point it creates, which it
+      # does only from 0.5.0 on, and the recovery it covers keys off that mode.
+      - name: Run the mount-plan suites against bubblewrap 0.4.1 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          PATH="$RUNNER_TEMP/bwrap-0.4/bin:$PATH" bun test \
+            test/sandbox/linux-one-mount-per-destination.test.ts \
+            test/sandbox/readonly-deny-dir-binds.test.ts \
+            test/sandbox/readonly-deny-dir-stubs.test.ts \
+            test/sandbox/linux-ancestor-pin.test.ts \
+            test/sandbox/linux-mount-plan-record.test.ts \
+            test/sandbox/path-canonicalization.test.ts \
+            test/sandbox/credential-deny.test.ts \
+            test/sandbox/symlink-boundary.test.ts
+
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
 
-      # The check release.yml runs before publishing, on one leg: the suite
-      # imports src/, so only an installed tarball says whether the package
-      # root a consumer imports loads at all. dist/ is the build step above.
-      - name: Import the packed package
-        if: matrix.os == 'linux' && matrix.arch == 'x86-64'
-        run: |
-          npm pack
-          PKG="$PWD/$(ls *.tgz)"
-          DIR="$RUNNER_TEMP/pkg-import"
-          mkdir -p "$DIR"
-          cd "$DIR"
-          npm init -y > /dev/null
-          npm install "$PKG"
-          cat > import-check.mjs <<'EOF'
-          import * as srt from '@anthropic-ai/sandbox-runtime'
-          const required = [
-            'SandboxManager',
-            'SandboxViolationStore',
-            'SandboxRuntimeConfigSchema',
-            'getDefaultWritePaths',
-          ]
-          const missing = required.filter(name => srt[name] === undefined)
-          if (missing.length > 0) {
-            console.error(`missing exports: ${missing.join(', ')}`)
-            process.exit(1)
-          }
-          console.log(`package root imported, ${Object.keys(srt).length} named exports`)
-          EOF
-          node import-check.mjs
-
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-results-${{ matrix.os }}-${{ matrix.arch }}
           path: |
@@ -267,13 +292,19 @@ jobs:
       matrix:
         include:
           - arch: x86-64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # For the container below, which runs the built CLI with it.
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
 
       - name: Enable unprivileged user namespaces on host
         run: |
@@ -292,16 +323,23 @@ jobs:
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
             -v "${{ github.workspace }}:/work" \
+            -v "$(dirname "$(dirname "$(command -v node)")")":/opt/node:ro \
             -w /work \
             -e SRT_E2E_DOCKER=1 \
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
+              # node and npm are those of the runner, bound in: no second
+              # piped installer, and not those of the image, which has Node
+              # 18, below what engines in package.json allows. bun is pinned
+              # to the version the rest of the matrix runs (oven-sh/setup-bun
+              # above). The tree carries a dozen bun-version-specific
+              # workarounds, so "whatever bun shipped this morning" is not
+              # the runtime under test.
               apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin
-              curl -fsSL https://bun.sh/install | bash
-              export PATH="$HOME/.bun/bin:$PATH"
-              curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-              apt-get install -y -qq nodejs
+              curl -fsSL https://bun.sh/install | bash -s bun-v1.4.2
+              export PATH="/opt/node/bin:$HOME/.bun/bin:$PATH"
+              node --version
               npm ci
               npm run build:seccomp
               npm run build

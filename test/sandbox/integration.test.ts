@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
+import { bwrapCanNamespaceNetwork } from '../helpers/bwrap-namespace.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
@@ -1357,4 +1358,74 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     // through the proxy despite the ControlMaster config.
     expect(output).toContain('permission denied (publickey)')
   }, 20000)
+})
+
+// ============================================================================
+// Exit status of a network-restricted wrap
+// ============================================================================
+
+/**
+ * With network restrictions the command runs as the last line of an inner
+ * script that starts the two socat bridges and stops them from an EXIT trap.
+ * Shells disagree on what `exit` without an operand means inside that trap:
+ * bash and dash exit with the status the script was already exiting with,
+ * zsh exits with the status of the trap's own last command. The inner script
+ * runs under the caller's binShell, so each shell is its own case, and so is
+ * each form the script's last line takes: through the seccomp helper, or
+ * `eval` when allowAllUnixSockets leaves the helper out.
+ */
+describe.if(isLinux)('Exit status of a network-restricted wrap', () => {
+  const CAN_RESTRICT_NETWORK =
+    bwrapCanNamespaceNetwork() && Bun.which('socat') !== null
+
+  const configFor = (allowAllUnixSockets: boolean): SandboxRuntimeConfig => ({
+    network: {
+      allowedDomains: ['example.com'],
+      deniedDomains: [],
+      allowAllUnixSockets,
+    },
+    filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+  })
+
+  beforeAll(async () => {
+    await SandboxManager.reset()
+    if (CAN_RESTRICT_NETWORK) {
+      await SandboxManager.initialize(configFor(false))
+    }
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+  })
+
+  async function exitStatusOf(
+    command: string,
+    shell: string,
+  ): Promise<number | null> {
+    const wrapped = await SandboxManager.wrapWithSandbox(command, shell)
+    // Only the script that bridges the network carries the trap.
+    expect(wrapped).toContain('--unshare-net')
+    expect(wrapped).toContain('TCP-LISTEN:3128')
+    const result = await spawnAsync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    return result.status
+  }
+
+  for (const shell of ['bash', 'zsh']) {
+    for (const allowAllUnixSockets of [false, true]) {
+      const lastLine = allowAllUnixSockets ? 'eval' : 'the seccomp helper'
+      it.skipIf(!CAN_RESTRICT_NETWORK || Bun.which(shell) === null)(
+        `${shell}, command run through ${lastLine}: reports the command's own status`,
+        async () => {
+          SandboxManager.updateConfig(configFor(allowAllUnixSockets))
+          expect(await exitStatusOf("sh -c 'exit 7'", shell)).toBe(7)
+          expect(await exitStatusOf('true', shell)).toBe(0)
+        },
+        30000,
+      )
+    }
+  }
 })
