@@ -33,10 +33,13 @@ export type LeafCert = {
  * The cache lives on `ca.leafCerts`.
  */
 export function mintLeafCert(ca: MitmCA, hostname: string): LeafCert {
-  const cached = ca.leafCerts.get(hostname)
+  const cached = cacheGet(ca.leafCerts, hostname)
   if (cached) return cached
 
-  const keys = pki.rsa.generateKeyPair(2048)
+  // One key for every leaf of this CA, as mitmproxy does: a new host name
+  // then costs a signature, not an RSA key generation that would hold up
+  // every other tunnel. The key never leaves this process.
+  const keys = (ca.leafKeyPair ??= pki.rsa.generateKeyPair(2048))
   const cert = pki.createCertificate()
   cert.publicKey = keys.publicKey
   cert.serialNumber = randomSerial()
@@ -86,7 +89,7 @@ export function mintLeafCert(ca: MitmCA, hostname: string): LeafCert {
     certPem: pki.certificateToPem(cert) + ca.certPem,
     keyPem: pki.privateKeyToPem(keys.privateKey),
   }
-  ca.leafCerts.set(hostname, leaf)
+  cacheSet(ca.leafCerts, hostname, leaf, ca.cacheLimit ?? LEAF_CACHE_LIMIT)
   logForDebugging(`[mitm-leaf] minted RSA leaf for ${hostname}`)
   return leaf
 }
@@ -97,11 +100,11 @@ export function mintLeafCert(ca: MitmCA, hostname: string): LeafCert {
  * `ca.secureContexts`.
  */
 export function secureContextFor(ca: MitmCA, hostname: string): SecureContext {
-  const cached = ca.secureContexts.get(hostname)
+  const cached = cacheGet(ca.secureContexts, hostname)
   if (cached) return cached
   const { certPem, keyPem } = mintLeafCert(ca, hostname)
   const ctx = createSecureContext({ cert: certPem, key: keyPem })
-  ca.secureContexts.set(hostname, ctx)
+  cacheSet(ca.secureContexts, hostname, ctx, ca.cacheLimit ?? LEAF_CACHE_LIMIT)
   return ctx
 }
 
@@ -133,4 +136,33 @@ function clampValidity(caCert: forge.pki.Certificate, notBefore: Date): Date {
   const max = new Date(notBefore)
   max.setDate(max.getDate() + 99)
   return caEnd < max ? new Date(caEnd) : max
+}
+
+/**
+ * At most this many host names' leaf certs (and secure contexts) are kept
+ * per CA, the least recently used going first: each costs an RSA key, and
+ * the names come from the clients.
+ */
+const LEAF_CACHE_LIMIT = 256
+
+function cacheGet<V>(cache: Map<string, V>, key: string): V | undefined {
+  const value = cache.get(key)
+  if (value !== undefined) {
+    cache.delete(key)
+    cache.set(key, value)
+  }
+  return value
+}
+
+function cacheSet<V>(
+  cache: Map<string, V>,
+  key: string,
+  value: V,
+  limit: number,
+): void {
+  cache.set(key, value)
+  for (const oldest of cache.keys()) {
+    if (cache.size <= limit) break
+    cache.delete(oldest)
+  }
 }

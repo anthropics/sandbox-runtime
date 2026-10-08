@@ -60,6 +60,10 @@ export type MitmCA = {
   leafCerts: Map<string, LeafCert>
   /** Per-hostname cache of TLS SecureContexts wrapping the leaf certs. */
   secureContexts: Map<string, SecureContext>
+  /** How many host names the two caches above keep (default 256). */
+  cacheLimit?: number
+  /** The key pair every leaf minted against this CA uses (see mintLeafCert). */
+  leafKeyPair?: forge.pki.rsa.KeyPair
   /**
    * DER-encoded empty CRL signed by this CA. Schannel (Windows System32
    * curl, git's default backend, cargo) checks revocation on every leaf and
