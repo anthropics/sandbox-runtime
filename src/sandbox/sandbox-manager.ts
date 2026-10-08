@@ -33,6 +33,7 @@ import {
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
+  disposeMitmCASync,
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
@@ -230,7 +231,26 @@ function registerCleanup(): void {
         level: 'error',
       })
     })
-  process.once('exit', cleanupHandler)
+  process.once('exit', () => {
+    void cleanupHandler()
+    // On 'exit' reset() gets as far as its first await, so what it takes out
+    // of the temp directory later than that goes here. After it, because on
+    // Windows it starts by revoking a grant on the trust-bundle directory.
+    // Only paths this process made and still holds: never a listing of the
+    // temp directory, never a path out of the configuration.
+    if (mitmCA) disposeMitmCASync(mitmCA)
+    muxProxyServer?.removeBackendSocketSync()
+    maskedFileStore.dispose()
+    // A bridge told to end removes its own socket, but not every time.
+    const bridge = managerContext?.linuxBridge
+    for (const path of [bridge?.httpSocketPath, bridge?.socksSocketPath]) {
+      try {
+        if (path) fs.rmSync(path, { force: true })
+      } catch {
+        // Best effort: an 'exit' handler must not throw.
+      }
+    }
+  })
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
   cleanupRegistered = true
@@ -804,6 +824,22 @@ async function initialize(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
+): Promise<void> {
+  try {
+    await initializeSteps(runtimeConfig, sandboxAskCallback, enableLogMonitor)
+  } catch (error) {
+    // Here, not at reset() or 'exit': a step can fail before the clean-up is
+    // registered, and the next call makes a CA of its own.
+    if (mitmCA) disposeMitmCASync(mitmCA)
+    mitmCA = undefined
+    throw error
+  }
+}
+
+async function initializeSteps(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  enableLogMonitor: boolean,
 ): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
