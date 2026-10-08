@@ -162,6 +162,8 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+// Covers dependency checks and provisioning as well as network startup.
+let initializationAttempt: Promise<void> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
@@ -805,37 +807,56 @@ async function initialize(
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
 ): Promise<void> {
+  if (initializationAttempt) {
+    await initializationAttempt
+    return
+  }
+  const attempt = initializeOnce(
+    runtimeConfig,
+    sandboxAskCallback,
+    enableLogMonitor,
+  )
+  initializationAttempt = attempt
+  try {
+    await attempt
+  } finally {
+    if (initializationAttempt === attempt) initializationAttempt = undefined
+  }
+}
+
+async function initializeOnce(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback?: SandboxAskCallback,
+  enableLogMonitor = false,
+): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
     await initializationPromise
     return
   }
 
-  // Store config for use by other functions
-  config = runtimeConfig
-  configInstalls++
-
-  // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
-  // start our own listeners (which will later shadow those vars in the child).
-  parentProxy = resolveParentProxy(runtimeConfig.network.parentProxy)
-  if (parentProxy) {
-    logForDebugging(
-      `Parent proxy configured: http=${redactUrl(parentProxy.httpUrl)} ` +
-        `https=${redactUrl(parentProxy.httpsUrl)}`,
-    )
-  }
-  resolvedAddressGuard = createResolvedAddressGuard(runtimeConfig.network)
-
-  // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
-  // tlsTerminate is explicit opt-in, so a bad config is a hard error.
+  // Reject incompatible TLS modes and unsupported runtimes before publishing
+  // the config: a rejected initialization must not enable sandboxing.
   if (runtimeConfig.network.tlsTerminate && runtimeConfig.network.mitmProxy) {
     throw new Error(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
-  // Before any CA, proxy or sandbox is set up: a runtime that cannot
-  // terminate TLS in-process fails here, not on each tunnel.
   if (runtimeConfig.network.tlsTerminate) assertTlsTerminationSupported()
+  const nextGuard = createResolvedAddressGuard(runtimeConfig.network)
+
+  // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
+  // start our own listeners (which will later shadow those vars in the child).
+  const nextParentProxy = resolveParentProxy(runtimeConfig.network.parentProxy)
+  if (nextParentProxy) {
+    logForDebugging(
+      `Parent proxy configured: http=${redactUrl(nextParentProxy.httpUrl)} ` +
+        `https=${redactUrl(nextParentProxy.httpsUrl)}`,
+    )
+  }
+
+  // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
+  // tlsTerminate is explicit opt-in, so a bad config is a hard error.
   // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
   // defer CA creation until the Windows block below has resolved
   // srt-win and fetched user status — the persistent CA is
@@ -848,10 +869,17 @@ async function initialize(
     tlsTerminate !== undefined &&
     !tlsTerminate.caCertPath &&
     !tlsTerminate.caKeyPath
-  mitmCA =
+  const nextMitmCA =
     tlsTerminate && !useWindowsPersistentCa
       ? createMitmCA(tlsTerminate)
       : undefined
+
+  // Publish only after synchronous configuration validation succeeds.
+  config = runtimeConfig
+  configInstalls++
+  parentProxy = nextParentProxy
+  resolvedAddressGuard = nextGuard
+  mitmCA = nextMitmCA
 
   // Check dependencies
   const deps = await checkDependenciesAsync()
@@ -1178,7 +1206,7 @@ async function initialize(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
-      reset().catch(e => {
+      await reset().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
         })
