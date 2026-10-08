@@ -24,6 +24,7 @@ import {
   finishInTurns,
   globPatternBaseDir,
   globToRegex,
+  type GlobWalkListings,
   normalizePathForSandbox,
   type Steps,
   walkGlobPattern,
@@ -816,6 +817,261 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       )
     } finally {
       rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+// ============================================================================
+// Listings that give no types
+// ============================================================================
+
+describe.if(!isWindows)('a walk over listings that give no types', () => {
+  let root: string
+  let data: string
+  const QUESTIONS = ['lstatSync', 'statSync', 'realpathSync'] as const
+  type Failing = Partial<Record<(typeof QUESTIONS)[number], string>>
+
+  beforeAll(() => {
+    root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-untyped-')))
+    data = join(root, 'data')
+    mkdirSync(join(data, 'x', 'deep'), { recursive: true })
+    mkdirSync(join(root, 'outside'))
+    for (const dir of [data, join(data, 'x'), join(data, 'x', 'deep')]) {
+      writeFileSync(join(dir, '.env'), '')
+    }
+    writeFileSync(join(root, 'outside', '.env'), '')
+    writeFileSync(join(data, 'note.txt'), '')
+    symlinkSync(join(root, 'outside'), join(data, 'x', 'link'))
+    symlinkSync('round', join(data, 'x', 'round'))
+  })
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  /**
+   * Has `root` listed the way some file systems list: names, and no types
+   * (unless `typed`). The calls in `failing` fail beneath it, with that code.
+   * `asked` is every call made beneath it, as `<call> <path from root>`, but
+   * for those about a pattern's own spelling.
+   */
+  function mounted(failing: Failing = {}, typed = false) {
+    const asked: string[] = []
+    const beneathRoot = (call: string, p: unknown): boolean => {
+      if (!String(p).startsWith(root + '/') || String(p).includes('*')) {
+        return false
+      }
+      asked.push(`${call} ${String(p).slice(root.length + 1)}`)
+      return true
+    }
+    const no = (): boolean => false
+    const readdirSync = fs.readdirSync
+    const spies = [
+      spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        const entries = readdirSync(...args)
+        if (!beneathRoot('readdirSync', args[0]) || typed) return entries
+        return entries.map(({ name }) => ({
+          name,
+          isFile: no,
+          isDirectory: no,
+          isSymbolicLink: no,
+          isFIFO: no,
+          isSocket: no,
+          isCharacterDevice: no,
+          isBlockDevice: no,
+        })) as typeof entries
+      }) as typeof fs.readdirSync),
+      ...QUESTIONS.map(question => {
+        const real = fs[question] as (...args: unknown[]) => unknown
+        return spyOn(fs, question).mockImplementation(((...args: unknown[]) => {
+          const code = failing[question]
+          if (beneathRoot(question, args[0]) && code !== undefined) {
+            throw Object.assign(new Error(code), { code })
+          }
+          return real(...args)
+        }) as never)
+      }),
+    ]
+    return { asked, restore: () => spies.forEach(spy => spy.mockRestore()) }
+  }
+
+  /** The read-deny walk of each pattern beneath `data`, on such a mount. */
+  function walked(
+    patterns: string[],
+    failing?: Failing,
+    listings?: GlobWalkListings,
+  ) {
+    const mount = mounted(failing)
+    try {
+      const walks = patterns.map(pattern =>
+        walkGlobPattern(join(data, pattern), {
+          withDirectoryForm: true,
+          followSymlinkedDirectories: true,
+          listings,
+        }),
+      )
+      return { walks, asked: mount.asked }
+    } finally {
+      mount.restore()
+    }
+  }
+  const everyEntry = [
+    'data/.env',
+    'data/note.txt',
+    'data/x',
+    'data/x/.env',
+    'data/x/deep',
+    'data/x/deep/.env',
+    'data/x/link',
+    'data/x/round',
+    'outside/.env',
+  ]
+  const lstatsIn = (asked: string[]): string[] =>
+    asked.flatMap(call => call.match(/^lstatSync (.*)/s)?.[1] ?? []).sort()
+
+  it('asks nothing about an entry that was listed with its type', () => {
+    const mount = mounted({}, true)
+    try {
+      expect(walkGlobPattern(join(data, '**/.env')).matches).toHaveLength(3)
+    } finally {
+      mount.restore()
+    }
+    expect(mount.asked.filter(call => /^l?statSync /.test(call))).toEqual([])
+  })
+
+  // With lstat failing, `x` and `deep` are directories and `.env` a file by
+  // stat; `link` is a link because it leads elsewhere, `round` by its ELOOP.
+  for (const [how, failing] of [
+    ['by lstat', {}],
+    ['by where each entry leads, when lstat fails', { lstatSync: 'EIO' }],
+  ] as const) {
+    it(`finds what it finds where types are given, ${how}`, () => {
+      const typed = walkGlobPattern(join(data, '**/.env'), {
+        withDirectoryForm: true,
+        followSymlinkedDirectories: true,
+      })
+      const { walks, asked } = walked(['**/.env'], failing)
+
+      expect(walks).toEqual([typed])
+      expect(typed.matches.sort()).toEqual([
+        join(data, '.env'),
+        join(data, 'x', '.env'),
+        join(data, 'x', 'deep', '.env'),
+        join(root, 'outside', '.env'),
+      ])
+      expect([...typed.symlinks].sort()).toEqual([
+        join(data, 'x', 'link'),
+        join(data, 'x', 'round'),
+      ])
+      expect(typed.unlisted).toEqual([])
+      expect(lstatsIn(asked)).toEqual(everyEntry)
+    })
+  }
+
+  it('asks once for all the patterns handed the same listings', () => {
+    const patterns = ['**/.env', '**/*.txt', '**/deep/**']
+    const alone = walked(patterns)
+    const together = walked(patterns, {}, new Map())
+
+    expect(together.walks).toEqual(alone.walks)
+    expect(lstatsIn(together.asked)).toEqual(everyEntry)
+    expect(lstatsIn(alone.asked)).toHaveLength(3 * everyEntry.length)
+  })
+
+  it('matches an entry that is gone since it was listed by its name alone', () => {
+    const { walks, asked } = walked(['**/.env', '**/x/**'], {
+      lstatSync: 'ENOENT',
+      statSync: 'ENOENT',
+    })
+
+    expect(walks.map(walk => walk.matches)).toEqual([[join(data, '.env')], []])
+    for (const walk of walks) {
+      expect(walk.unlisted).toEqual([])
+      expect(walk.directoryMatches).toEqual([])
+    }
+    expect(asked).not.toContain('readdirSync data/x')
+  })
+
+  it.each([
+    ['statSync', 'ESTALE'],
+    ['realpathSync', 'EACCES'],
+  ])(
+    'leaves an entry it can learn nothing about to be denied whole (%s: %s)',
+    (call, code) => {
+      const { walks, asked } = walked(
+        ['**/.env', '**/*.pem', '*.env'],
+        { lstatSync: 'EIO', [call]: code },
+        new Map(),
+      )
+
+      // Any of them may be a directory with a match beneath it.
+      const entries = ['.env', 'note.txt', 'x']
+      expect(walks[0]!.matches).toEqual([join(data, '.env')])
+      for (const walk of walks.slice(0, 2)) {
+        expect(walk.unlisted.sort()).toEqual(entries.map(e => join(data, e)))
+      }
+      // Not for a pattern that matches nothing beneath it.
+      expect(walks[2]!.unlisted).toEqual([])
+      expect(asked).not.toContain('readdirSync data/x')
+      expect(lstatsIn(asked)).toEqual(entries.map(e => `data/${e}`))
+    },
+  )
+
+  it('says where such an entry really is beneath a symlinked base', () => {
+    const alias = join(root, 'alias')
+    symlinkSync(data, alias)
+    const mount = mounted({ lstatSync: 'EIO', statSync: 'ESTALE' })
+    try {
+      const walk = walkGlobPattern(join(alias, '**/.env'))
+      expect(walk.unlisted).toContain(join(alias, 'x'))
+      expect(walk.realOf.get(join(alias, 'x'))).toBe(join(data, 'x'))
+    } finally {
+      mount.restore()
+      rmSync(alias)
+    }
+  })
+
+  it.if(isLinux)('denies what it finds for a configuration', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        denyRead: ['**/.env', '**/*.pem', '**/*.key'].map(p => join(data, p)),
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+    const found = [
+      join(data, '.env'),
+      join(data, 'x', '.env'),
+      join(data, 'x', 'deep', '.env'),
+      join(root, 'outside', '.env'),
+    ]
+    let mount = mounted()
+    try {
+      expect(SandboxManager.getFsReadConfig().denyOnly.sort()).toEqual(found)
+      // Once for the three rules together.
+      expect(lstatsIn(mount.asked.splice(0))).toEqual(everyEntry)
+      const wrapped = await SandboxManager.wrapWithSandbox('true')
+      expect(lstatsIn(mount.asked)).toEqual(everyEntry)
+      for (const file of found) {
+        expect(wrapped).toContain(`--ro-bind /dev/null ${file}`)
+      }
+
+      mount.restore()
+      mount = mounted({ lstatSync: 'EIO', statSync: 'ESTALE' })
+      const unknown = ['.env', 'note.txt', 'x'].map(name => join(data, name))
+      const readConfig = SandboxManager.getFsReadConfig()
+      expect(readConfig.denyOnly.sort()).toEqual(unknown)
+      expect(readConfig.unlistableDenyDirs?.sort()).toEqual(unknown)
+    } finally {
+      mount.restore()
+      await SandboxManager.reset()
     }
   })
 })
