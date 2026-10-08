@@ -621,6 +621,17 @@ describe('path entries as configured', () => {
     expect(samePathEntries([marked], [marked, marked])).toBe(false)
   })
 
+  it('detects a changed path when another entry is duplicated', () => {
+    const a = ['/a', '/b']
+    const b = ['/a', '/a']
+    expect(samePathEntries(a, b)).toBe(false)
+    expect(samePathEntries(b, a)).toBe(false)
+    const marked = { path: '/a', literal: true as const }
+    expect(samePathEntries([marked, '/b'], [marked, marked])).toBe(false)
+    expect(samePathEntries(['/a', '/a', '/b'], ['/b', '/b', '/a'])).toBe(false)
+    expect(samePathEntries(['/a', '/a', '/b'], ['/b', '/a', '/a'])).toBe(true)
+  })
+
   it('folds the literal lists into the lists they are more entries of', () => {
     expect(
       readNamesOf({
