@@ -859,7 +859,7 @@ export function generateProxyEnvVars(
       const basic = Buffer.from(`${userRaw}:${proxyAuthToken}`)
       envVars.push(
         `SRT_SSH_PROXY_COMMAND=${sshConnectScript(socksProxyPort, basic.toString('base64'))}`,
-        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand="/bin/sh -c 'eval \\"\\$SRT_SSH_PROXY_COMMAND\\"' sh '%h' %p"`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand="/bin/sh -c 'eval \\"\\\${SRT_SSH_PROXY_COMMAND:?unset, but GIT_SSH_COMMAND needs it}\\"' sh '%h' %p"`,
       )
     } else if (platform === 'macos') {
       // A SOCKS listener that wants no token of ours, an external one

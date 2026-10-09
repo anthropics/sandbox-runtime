@@ -340,6 +340,12 @@ describe.skipIf(NO_SCRIPT !== '')(`sshConnectScript${NO_SCRIPT}`, () => {
         'a;b',
         'a*',
         'a?',
+        'a,b',
+        'a#b',
+        'a+b',
+        'a=b',
+        'a~b',
+        'a^b',
         '[::1]',
         'a:22 HTTP/1.1',
         'b\u00fccher.example',
@@ -380,6 +386,34 @@ describe.skipIf(NO_SCRIPT !== '')(`sshConnectScript${NO_SCRIPT}`, () => {
       expect((await t.leaveLikeSsh()).code).toBe(1)
       expect(t.stderr()).toBe('sandbox proxy: bad host\n')
       expect(proxy.received).toHaveLength(0)
+    },
+    TEST_MS,
+  )
+
+  it(
+    'takes nothing but a status of 200 for a tunnel, and prints any other as it came',
+    async () => {
+      for (const status of [
+        '403 200 Connection Established',
+        '2000 x',
+        '200',
+        '403 a%sb\\n',
+      ]) {
+        const proxy = await tcp(
+          answer(`HTTP/1.1 ${status}\r\n\r\nSSH-2.0-no\r\n`),
+        )
+        const t = runScript(
+          sshConnectScript(proxy.port, basicOf(TOKEN), NC!),
+          'a.example',
+          '22',
+        )
+        const { code } = await t.leaveLikeSsh()
+        expect([code, t.stdout().toString(), t.stderr()]).toEqual([
+          1,
+          '',
+          `sandbox proxy: a.example:22: ${status}\n`,
+        ])
+      }
     },
     TEST_MS,
   )
@@ -490,41 +524,53 @@ describe.skipIf(NO_SCRIPT !== '')(`sshConnectScript${NO_SCRIPT}`, () => {
     TEST_MS,
   )
 
-  it(
-    'no process of a live tunnel has the credential in its arguments, and none outlives ssh',
+  // Through the manager's own listener, the one this script is emitted for.
+  it.skipIf(NO_SANDBOX !== '')(
+    `no process of a live tunnel has the credential in its arguments, and none outlives ssh${NO_SANDBOX}`,
     async () => {
+      // A far side that never leaves: it is the listener that has to end the
+      // tunnel, at the end of what nc sends.
       const far = await tcp(sock => sock.write('up'))
-      servers[servers.length - 1]!.on('connection', (sock: Socket) =>
-        sock.on('end', () => sock.end()),
-      )
-      const proxy = await startProxy(far.port)
-      closers.push(proxy.close)
-      // See the head of this file.
-      const nc = isMacOS ? NC! : `${NC} -N`
-      const t = runScript(
-        sshConnectScript(proxy.port, basicOf(TOKEN), nc),
-        '127.0.0.1',
-        String(far.port),
-      )
-      const ps = (): string =>
-        spawnSync('ps', ['-A', '-ww', '-o', 'args'], { encoding: 'utf8' })
-          .stdout
-      t.child.stdin.write('hello')
-      await until('the tunnel', () => t.stdout().length > 0)
-      const live = ps()
-      expect(live).toContain(`${nc} 127.0.0.1 ${proxy.port}`)
-      expect(live).not.toContain(TOKEN)
-      expect(live).not.toContain(basicOf(TOKEN))
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: [`127.0.0.1:${far.port}`],
+          deniedDomains: [],
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      try {
+        const port = SandboxManager.getProxyPort()!
+        const token = SandboxManager.getProxyAuthToken()!
+        // See the head of this file.
+        const nc = isMacOS ? NC! : `${NC} -N`
+        const t = runScript(
+          sshConnectScript(port, basicOf(token), nc),
+          '127.0.0.1',
+          String(far.port),
+        )
+        const ps = (): string =>
+          spawnSync('ps', ['-A', '-ww', '-o', 'args'], { encoding: 'utf8' })
+            .stdout
+        t.child.stdin.write('hello')
+        await until('the tunnel', () => t.stdout().length > 0)
+        const live = ps()
+        expect(live).toContain(`${nc} 127.0.0.1 ${port}`)
+        expect(live).not.toContain(token)
+        expect(live).not.toContain(basicOf(token))
 
-      // ssh killed: both its ends of the pipes go at once.
-      t.child.stdin.destroy()
-      t.child.stdout.destroy()
-      await until(
-        'the helpers to leave',
-        () => !ps().includes(` 127.0.0.1 ${proxy.port}`),
-      )
-      await t.exited
-      expect(t.stderr()).toBe('')
+        // ssh killed: both its ends of the pipes go at once.
+        t.child.stdin.destroy()
+        t.child.stdout.destroy()
+        await until(
+          'the helpers to leave',
+          () => !ps().includes(` 127.0.0.1 ${port}`),
+        )
+        await t.exited
+        expect(t.stderr()).toBe('')
+      } finally {
+        await SandboxManager.reset()
+      }
     },
     TEST_MS,
   )
@@ -567,6 +613,22 @@ describe.skipIf(NO_SCRIPT !== '')(`sshConnectScript${NO_SCRIPT}`, () => {
           plain.child.stdin.end()
           expect([await plain.exited, plain.stderr()]).toEqual([0, ''])
           expect(proxy.received.map(String)).toEqual([headFor('a.example:22')])
+
+          // The pair broken: the variable lost on the way here, or emptied.
+          const broken: Array<Record<string, string>> = [
+            {},
+            { SRT_SSH_PROXY_COMMAND: '' },
+          ]
+          for (const lost of broken) {
+            const t = hold(
+              [shell, '-c', expandedBySsh(command, 'a.example', '22')],
+              lost,
+            )
+            expect((await t.leaveLikeSsh()).code).not.toBe(0)
+            expect(t.stderr()).toMatch(
+              /^[^\n]*SRT_SSH_PROXY_COMMAND: unset, but GIT_SSH_COMMAND needs it\n$/,
+            )
+          }
 
           // OpenSSH 9.6 and later refuse these themselves; earlier ones hand
           // them over. (A single quote ends the word in any spelling.)
@@ -718,6 +780,10 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
         'GlobalKnownHostsFile /dev/null',
         'StrictHostKeyChecking yes',
         'BatchMode yes',
+        // What the injected value has to switch off: a sandbox lets ssh make
+        // no such socket, and ssh does not go on without it.
+        'ControlMaster auto',
+        `ControlPath ${dir}/mux-%C`,
         '',
       ].join('\n'),
     )
@@ -808,6 +874,23 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
         expect(r.status).toBe(128)
         expect(r.stderr).toContain(
           `sandbox proxy: 127.0.0.1:${sshdPort}: 407 Proxy Authentication Required\n`,
+        )
+      },
+      TEST_MS,
+    )
+
+    it(
+      'the script lost on the way: what is left of the pair names it',
+      async () => {
+        const { GIT_SSH_COMMAND } = macosVars(proxy.port)
+        const r = await run(
+          '/bin/sh',
+          { GIT_SSH_COMMAND: GIT_SSH_COMMAND! },
+          ...['ls-remote', '--upload-pack', packs.upload, url(), 'main'],
+        )
+        expect(r.status).toBe(128)
+        expect(r.stderr).toContain(
+          'SRT_SSH_PROXY_COMMAND: unset, but GIT_SSH_COMMAND needs it\n',
         )
       },
       TEST_MS,

@@ -221,7 +221,7 @@ describe('generateProxyEnvVars', () => {
             'case $why in "200 "*) exec /bin/cat;; esac; ' +
             'why=${why%?}; no "$1:$2: ${why:-no answer}"; } & ' +
             'exec >&-; wait $!',
-          GIT_SSH_COMMAND: `${MUX_OFF} -o ProxyCommand="/bin/sh -c 'eval \\"\\$SRT_SSH_PROXY_COMMAND\\"' sh '%h' %p"`,
+          GIT_SSH_COMMAND: `${MUX_OFF} -o ProxyCommand="/bin/sh -c 'eval \\"\\\${SRT_SSH_PROXY_COMMAND:?unset, but GIT_SSH_COMMAND needs it}\\"' sh '%h' %p"`,
         })
         // What ends up in arguments names neither the token nor its encoding.
         expect(vars.GIT_SSH_COMMAND).not.toContain('tok')

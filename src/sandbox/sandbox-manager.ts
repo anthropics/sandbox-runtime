@@ -455,6 +455,14 @@ function denialReasonOf(answer: unknown): string | undefined {
   return sanitizeDenialReason(reason) || undefined
 }
 
+/** Own keys only: an entry can be spelled `constructor`. */
+function deniedDomainReason(entry: string): string {
+  const reasons = config?.network.deniedDomainReasons ?? {}
+  return Object.prototype.hasOwnProperty.call(reasons, entry)
+    ? reasons[entry]!
+    : 'host is on the deny list'
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
@@ -498,10 +506,7 @@ async function filterNetworkRequest(
       // The matched entry's own reason when the caller supplied one, so the
       // model reads why this destination is off-limits (and the sanctioned
       // alternative) instead of a generic deny; keyed by the exact entry.
-      return denied(
-        config.network.deniedDomainReasons?.[deniedDomain] ??
-          'host is on the deny list',
-      )
+      return denied(deniedDomainReason(deniedDomain))
     }
   }
 
@@ -767,9 +772,7 @@ async function startMuxProxyServer(
       const canonical = canonicalizeHost(host) ?? host
       for (const entry of config.network.deniedDomains) {
         if (matchesDomainPatternWithPort(canonical, port, entry)) {
-          const reason =
-            config.network.deniedDomainReasons?.[entry] ??
-            'host is on the deny list'
+          const reason = deniedDomainReason(entry)
           recordOutboundDeny(host, port, reason)
           return { deniedReason: reason }
         }

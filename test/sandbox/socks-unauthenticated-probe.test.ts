@@ -110,6 +110,29 @@ describe('SOCKS unauthenticated probe', () => {
     expect(text).toContain('requires authentication')
   })
 
+  it('the manager: a deny entry spelled like a member of Object.prototype is refused for the generic reason', async () => {
+    const names = ['constructor', 'valueOf', '__proto__', 'hasOwnProperty']
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: names,
+        deniedDomainReasons: { 'other.test': 'not this one' },
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    try {
+      for (const host of names) {
+        const out = await drive(SandboxManager.getSocksProxyPort()!, {
+          host,
+          port: 22,
+        })
+        expect(out.toString('latin1')).toContain('host is on the deny list')
+      }
+    } finally {
+      await SandboxManager.reset()
+    }
+  })
+
   it('non-22 target: plain SOCKS refusal, no SSH bytes, no tunnel', async () => {
     const port = await startServer({ deniedReason: 'nope' })
     const out = await drive(port, { host: 'denied.test', port: 443 })

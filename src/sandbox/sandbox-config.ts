@@ -692,7 +692,7 @@ export const NetworkConfigSchema = z.object({
     .optional()
     .describe(
       'Optional model-facing reason keyed by the exact deniedDomains entry it explains (e.g., {"github.com:22": "SSH pushes to GitHub are blocked; use an https remote"}). ' +
-        'Reported in the <sandbox_violations> line when that entry denies a connection; entries without one use a generic reason. ' +
+        'Reported in the <sandbox_violations> line when that entry denies a connection, and to the sandboxed client as the status phrase of the 403 that answers its CONNECT; entries without one use a generic reason. ' +
         'Keys are matched by exact entry string, so a key with no matching deniedDomains entry never fires.',
     ),
   strictAllowlist: z

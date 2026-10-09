@@ -864,7 +864,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // would land inside the tunnel as payload. Just close.
         if (wrote200) socket.destroy()
         else if (isResolvedAddressDenied(err)) {
-          endWithStatus(rawDenied(err.message, markFor('address_not_allowed')))
+          endWithStatus(
+            rawDenied(err.message, markFor('address_not_allowed'), err.reason),
+          )
         } else endWithStatus('HTTP/1.1 502 Bad Gateway\r\n\r\n')
         return
       }
