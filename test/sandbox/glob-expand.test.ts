@@ -1261,13 +1261,13 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         ownSpelling: ['h/cfg/.env'],
       })),
       {
-        when: 'a link that matches fails by the real path and leads elsewhere by the short name: covered as spelled',
+        when: 'a link that matches fails by the real path and leads elsewhere by the short name: covered as spelled, that place besides',
         answers: {
           'statSync ~/cfg/.env': 'EACCES',
           'statSync h/cfg/.env': '=store/decoy',
           'realpathSync h/cfg/.env': '=store/decoy',
         },
-        found: LINK_AS_SPELLED,
+        found: [...LINK_AS_SPELLED, 'store/decoy'],
         ownSpelling: ['h/cfg/.env'],
       },
       {
@@ -1316,6 +1316,9 @@ describe.if(!isWindows)('walkGlobPattern', () => {
   it('names the pattern that is no regular expression', () => {
     const walk = (): unknown => walkGlobPattern('/tmp/certs/[z-a]*.pem')
     expect(walk).toThrow(SyntaxError)
+    expect(walk).toThrow(
+      expect.objectContaining({ cause: expect.any(SyntaxError) }),
+    )
     expect(walk).toThrow(
       /^Glob pattern \S*\/certs\/\[z-a\]\*\.pem does not compile/,
     )

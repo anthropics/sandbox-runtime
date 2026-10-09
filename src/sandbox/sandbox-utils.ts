@@ -1963,6 +1963,13 @@ export function* walkGlobPatternSteps(
       }
       // Nothing is listed through a link that leads nobody knows where.
       if (target === 'uninspectable') continue
+      // Where the short name alone says it leads is denied besides.
+      if (
+        unread &&
+        (isMatch || (isDirectoryFormCandidate && target.isDirectory))
+      ) {
+        walk.matches.push(target.real)
+      }
       if (isMatch && !unread) walk.realOf.set(fullPath, target.real)
       if (!target.isDirectory) continue
       if (isDirectoryFormCandidate && !unread) {

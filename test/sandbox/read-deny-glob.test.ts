@@ -457,6 +457,102 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     })
   })
 
+  describe('a link that matches and is read by its short name alone', () => {
+    // proj/vendor is shorter than what it leads to, so what lies in there is
+    // spelled by its real path and has a short name besides. Its real path
+    // failing, a link stays covered as spelled, which beneath a directory the
+    // pattern denies is no mount at all: where it leads is not in there.
+    const V = 'out/of/the/tree/vendor'
+    const CLEAN = ['far.txt', `${V}/secrets`, 'store/dir', 'store/key.txt']
+    let root: string
+
+    beforeAll(() => {
+      root = caseRoot('short-name-link')
+      for (const dir of [
+        `${V}/secrets`,
+        `${V}/alt`,
+        `${V}/file`,
+        'store/dir',
+        'decoy',
+        'proj',
+      ]) {
+        mkdirSync(join(root, dir), { recursive: true })
+      }
+      for (const file of [
+        `${V}/secrets/token.txt`,
+        'store/key.txt',
+        'store/dir/f',
+        'far.txt',
+        'decoy.txt',
+      ]) {
+        writeFileSync(join(root, file), '')
+      }
+      symlinkSync(join(root, V), join(root, 'proj/vendor'))
+      // In a denied directory; of the directory form; behind that one.
+      symlinkSync(join(root, 'store/key.txt'), join(root, V, 'secrets/key.pem'))
+      symlinkSync(join(root, 'store/dir'), join(root, V, 'alt/secrets'))
+      symlinkSync(join(root, 'far.txt'), join(root, 'store/dir/more'))
+      // Of the directory form by its name, and no directory: denies nothing.
+      symlinkSync(join(root, 'decoy.txt'), join(root, V, 'file/secrets'))
+    })
+
+    /** What `proj/**\/secrets/**` denies while `answers` holds: by call and
+     *  name, the errno it fails with or, after `=`, the path that answers. */
+    function expandWhile(answers: Record<string, string>): string[] {
+      const spies = (['statSync', 'realpathSync'] as const).map(fn => {
+        const call = fs[fn] as (...args: unknown[]) => unknown
+        return spyOn(fs, fn).mockImplementation(((
+          p: unknown,
+          ...rest: unknown[]
+        ) => {
+          const answer = answers[`${fn} ${String(p).slice(root.length + 1)}`]
+          if (answer === undefined) return call(p, ...rest)
+          if (answer[0] === '=')
+            return call(join(root, answer.slice(1)), ...rest)
+          throw Object.assign(new Error(answer), { code: answer })
+        }) as never)
+      })
+      try {
+        return expandReadDenyGlobLinux(join(root, 'proj/**/secrets/**'), [])
+          .map(p => p.slice(root.length + 1))
+          .sort()
+      } finally {
+        for (const spy of spies) spy.mockRestore()
+      }
+    }
+
+    it.each(
+      ['statSync', 'realpathSync'].flatMap(call =>
+        ['EACCES', 'EMFILE'].map(code => [call, code] as const),
+      ),
+    )('denies where it leads besides (%s, %s)', (call, code) => {
+      expect(expandWhile({})).toEqual(CLEAN)
+      expect(expandWhile({ [`${call} ${V}/secrets/key.pem`]: code })).toEqual(
+        CLEAN,
+      )
+      // Of the directory form: whole, with what lies behind it, and as spelled.
+      expect(expandWhile({ [`${call} ${V}/alt/secrets`]: code })).toEqual(
+        [...CLEAN, `${V}/alt/secrets`].sort(),
+      )
+      expect(expandWhile({ [`${call} ${V}/file/secrets`]: code })).toEqual(
+        [...CLEAN, `${V}/file/secrets`].sort(),
+      )
+    })
+
+    it('denies a decoy besides, and nothing less for it', () => {
+      expect(
+        expandWhile({
+          [`statSync ${V}/secrets/key.pem`]: 'EACCES',
+          'statSync proj/vendor/secrets/key.pem': '=decoy.txt',
+          'realpathSync proj/vendor/secrets/key.pem': '=decoy.txt',
+          [`statSync ${V}/alt/secrets`]: 'EACCES',
+          'statSync proj/vendor/alt/secrets': '=decoy',
+          'realpathSync proj/vendor/alt/secrets': '=decoy',
+        }),
+      ).toEqual(['decoy', 'decoy.txt', `${V}/alt/secrets`, `${V}/secrets`])
+    })
+  })
+
   it('lists every match where it really is when the base is a symlink', () => {
     // alias -> ROOT, sideways: normalizePathForSandbox keeps the link
     // spelling for the pattern, so every match is spelled through it. The
