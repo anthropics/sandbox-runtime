@@ -39,6 +39,7 @@ export type {
 export type {
   FilterRequestCallback,
   RequestDecision,
+  RequestInfo,
   MutateForwardedHeaders,
 } from './sandbox/request-filter.js'
 

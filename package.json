@@ -16,6 +16,8 @@
     "build:seccomp": "bun vendor/seccomp/build.ts",
     "build:srt-win": "bun vendor/srt-win/build.ts",
     "build:java-agent": "bun vendor/java-proxy-agent/build.ts",
+    "build:srt-proxy": "bun build src/proxy-main.ts --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --no-compile-autoload-tsconfig --no-compile-autoload-package-json --outfile dist/srt-proxy",
+    "build:srt-proxy-node": "bun build src/proxy-main.ts --target=node --format=esm --outfile dist/srt-proxy.mjs",
     "clean": "rm -rf dist",
     "test": "bun test",
     "test:node": "node test/utils/which-node-test.mjs && bun test test/control-fd.test.ts",

@@ -246,6 +246,10 @@ How srt reads the channel, and what it refuses:
   command is spawned with the three standard streams alone, so the control
   descriptor is not among the descriptors it is handed.
 
+### As a standalone proxy with an external decider: `srt proxy`
+
+`srt proxy` (or the single-file `srt-proxy` executable built by `bun run build:srt-proxy`) runs only SRT's HTTP proxy, with no sandboxed child, for a host that runs the workload elsewhere. It accepts on a listening socket the host hands in, terminates every CONNECT in-process, and forwards a request only when a separate decider process, reached over another inherited descriptor, allows it. See [docs/srt-proxy.md](docs/srt-proxy.md) for the command line, the decider protocol and the security model.
+
 ### As a library
 
 ```typescript
@@ -457,12 +461,16 @@ What the check leaves alone: allowlist entries that **are** IP literals (allow-l
 
 - `network.deniedResolvedAddresses` - Extra IP addresses / CIDR ranges (IPv4 or IPv6, unbracketed, any port) that allowed hostnames must not resolve to. Private-use space is not denied by default because allow-listing an intranet hostname is legitimate; list it here when allow-listed names must stay out of it, e.g. `["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"]`. List IPv4 and IPv6 ranges separately — an IPv6 range broad enough to cover the IPv4-mapped block (`::ffff:0:0/96`), such as `::/0`, matches IPv4 answers on some runtimes but not others, so do not rely on it to deny IPv4.
 
-**TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.
+**TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify. It needs Node, or Bun 1.4 or later; on an older Bun, `SandboxManager.initialize` throws. See [TLS Termination](#tls-termination) for how it works, its limits, and what changed from the per-tunnel listener it replaced.
 
 - `network.tlsTerminate.excludeDomains` - Domain patterns (same syntax as `allowedDomains`) that are **not** terminated. Matching CONNECTs are tunnelled opaquely instead: they are still subject to the domain allowlist, but the client inside the sandbox completes its own TLS handshake with the real upstream, and `filterRequest` / credential injection do not apply to their HTTPS traffic. Use this for the two cases TLS termination fundamentally breaks:
   - **mTLS upstreams** - only the in-sandbox client holds the client certificate, so the proxy cannot re-originate the connection on its behalf.
   - **Certificate-pinning clients** - clients that verify the upstream's identity themselves (custom CAs, SAN pinning) and reject the MITM certificate.
 - `network.tlsTerminate.extraCaCertPaths` - Paths to PEM CA certificate files appended to that trust bundle, after the MITM CA and the host's regular roots. Excluded (non-terminated) hosts are verified by the client inside the sandbox, and the trust env vars SRT sets (`SSL_CERT_FILE`, `GIT_SSL_CAINFO`, ...) _replace_ each tool's own trust configuration, so a site-local root (e.g. an internal mTLS CA) must be in the bundle or those hosts can never be verified. Only the `CERTIFICATE` blocks of each file are copied into the bundle (anything else, e.g. a private key in a combined PEM, is never exposed to the sandbox); files that are missing, unreadable, or contain no PEM `CERTIFICATE` block are skipped, so it is safe to list paths that exist on only some hosts.
+- `network.tlsTerminate.maxTunnels` - At most this many CONNECT tunnels are TLS-terminated at once (integer, 1 to 65536, default 256). Past it a CONNECT is answered `503` with `X-Proxy-Error: too-many-tunnels`. A tunnel holds its slot from its CONNECT until it closes, so idle keep-alive tunnels count. The slot is taken before the client's first bytes are seen, so at the cap a non-TLS CONNECT (such as SSH) to a host that would be terminated is refused too; one that turns out not to carry TLS frees its slot. Hosts in `excludeDomains` do not count.
+- `network.tlsTerminate.handshakeTimeoutMs` - A tunnel to be terminated must finish its TLS handshake within this many milliseconds of its CONNECT (integer, 100 to 600000, default 10000), or it is closed and its slot freed. A CONNECT whose client sends nothing is closed at the deadline too. A tunnel past its handshake is never timed out by it.
+
+These two are read when the proxy starts; `updateConfig` does not change them.
 
 ```json
 {
@@ -476,6 +484,17 @@ What the check leaves alone: allowlist entries that **are** IP literals (allow-l
   }
 }
 ```
+
+**Request rewriting** (with `network.filterRequest`, set by library consumers): an allow decision may also carry header edits (`removeHeaders`, `setHeaders`) and an `onResponse` observer, and a deny decision may choose its status (403 by default). These options are read when the proxy starts; `updateConfig` does not change them.
+
+- `network.allowPlaintextHeaderSet` - Let an allow decision set headers on plain-HTTP requests. Off by default: a header set there would travel in cleartext, so while it is off an allow decision that carries `setHeaders` is refused with 403, and nothing is forwarded, for every request the proxy receives in cleartext (an absolute `https://` URI included). An allow without `setHeaders` is unaffected and removals always apply. The callback's second argument reports `scheme: 'http'` for these requests.
+- `network.stripResponseHeaders` - Response headers never passed back to the sandboxed client, matched case-insensitively with `-`, `_` and `.` folded (e.g. `["set-cookie"]`).
+- `network.refuseOpaqueTunnels` - Refuse every tunnel `filterRequest` cannot see into: an HTTP CONNECT that would not be TLS-terminated or carries no TLS, and every SOCKS CONNECT. Requires `tlsTerminate` to serve HTTPS at all, and stops CONNECT-carried SSH (such as `GIT_SSH_COMMAND`) through the proxy. Refusals are recorded as violations.
+- `network.requireHostMatch` - Answer 421 to a request whose Host header, TLS server name or absolute-form authority does not name the host and port it is sent to, before `filterRequest` is asked. Refusals are recorded as violations.
+
+While `filterRequest` is set, the request target is normalised once (dot segments and `%2e` resolved, a run of leading slashes collapsed to one), and that value is both what the callback sees and what is forwarded, on plain HTTP and inside a terminated tunnel. A target that is not origin form, an absolute `http(s)` URI, or `*` for `OPTIONS` is answered 400.
+
+While `filterRequest` is set, `TRACE` and `TRACK` requests are answered 405 before it is asked, on plain HTTP and inside a terminated tunnel, because their response would echo a header the decision set back to the client. Node's and Bun 1.4's HTTP parsers already answer `TRACK` 400 before the proxy sees it; under Bun 1.3 the connection is closed without an answer. Refusals are recorded as violations.
 
 **Unix Socket Settings** (platform-specific behavior):
 
@@ -834,6 +853,31 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 - **Windows**: A WFP `ALE_AUTH_CONNECT` filter blocks every outbound connect from the `srt-sandbox` account except loopback to the configured proxy port range. The proxies bind inside that range. Environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, …) point tools at the proxies, but the WFP filter is the boundary — a process that ignores or unsets them is still fenced.
 
 **JVM tools (macOS/Linux):** the JVM ignores `HTTPS_PROXY`/`NO_PROXY` and has no environment variable for proxy credentials — proxy selection comes from the `https.proxyHost` system properties and the credential can only be supplied through `java.net.Authenticator`. So JVM-based tools (Bazel's gRPC remote cache, Gradle, Maven, …) would otherwise dial the target directly and fail, or reach the proxy without its token and get a 407. To close that gap srt injects a small `-javaagent` via `JAVA_TOOL_OPTIONS` (the env var carries only the jar path, the credential stays in `HTTPS_PROXY`). At JVM start the agent sets `http[s].proxyHost`/`Port` and `http.nonProxyHosts` from the proxy env vars, re-enables Basic auth for CONNECT tunnels, and installs an Authenticator for the proxy endpoint. Explicit `-D` proxy properties on the JVM command line still win, and any inherited `JAVA_TOOL_OPTIONS` is preserved (unless it is a denied credential env var). Every JVM prints a `Picked up JAVA_TOOL_OPTIONS: …` line to stderr as a result; a jlink'd runtime built without the `java.instrument` module cannot load agents and will refuse to start under the sandbox — unset `JAVA_TOOL_OPTIONS` in the command for such a tool. The jar ships in the npm package as `vendor/java-proxy-agent/srt-proxy-agent.jar` (source: `vendor/java-proxy-agent-src/`; built by the release workflow, or locally with `npm run build:java-agent` — needs a JDK ≥ 17). If it is not found, `JAVA_TOOL_OPTIONS` is left alone and JVMs behave as before; bundlers can point at their own copy with `javaAgentJarPath`.
+
+### TLS Termination
+
+With `network.tlsTerminate`, a CONNECT to an allowed host that is not in `excludeDomains` is answered `200`, and the client's first bytes are read. If they are a TLS ClientHello, the TLS is terminated in the SRT process, on the tunnel's own socket: the leaf certificate is minted for the server name read from the ClientHello (for the CONNECT target when there is none, and always with `requireHostMatch`), and the decrypted connection is handed to an HTTP server that never listens. Each request on it goes through `filterRequest` and the credential hooks and is forwarded upstream over a separate, certificate-verified TLS connection. The decrypted traffic, and the credentials injected into it, stay inside the SRT process and leave it only re-encrypted, to that verified upstream. Nothing is opened that another process could connect to: there is no per-tunnel listener and no per-tunnel socket file. A CONNECT whose first bytes are not TLS is tunnelled opaquely, as before (or refused, with `refuseOpaqueTunnels`).
+
+**Runtime requirement.** Handing a decrypted connection to an HTTP server needs an `http.Server` that serves a connection passed to it with `emit('connection')`. Node's does, and Bun's does from 1.4. On an older Bun, `SandboxManager.initialize` with `network.tlsTerminate` set throws before it starts anything, with an error that names the runtime found:
+
+```
+tlsTerminate needs Node, or Bun 1.4 or later (this is Bun 1.3.13)
+```
+
+A program built with `bun build --compile` runs on the Bun that built it, so build it with Bun 1.4 or later. Without `tlsTerminate`, nothing changes on any runtime. Should a tunnel still reach the proxy on such a runtime, it is closed rather than left hanging.
+
+**Limits.** At most `maxTunnels` tunnels (default 256) are terminated at once, and each must finish its handshake within `handshakeTimeoutMs` (default 10 s) of its CONNECT; see [Network Configuration](#network-configuration). Leaf certificates share one key per CA, and the proxy keeps those of the 256 most recently used host names.
+
+**Memory held for slow peers.** A response to a client that is not reading waits once about 1 MiB is queued for that client, or once all tunnels together have 256 MiB queued, on Node and Bun alike. A request body to an upstream that is not reading is held back by the runtime under Node. Under Bun, the proxy does it itself (it pauses a tunnel once 4 MiB of its request body is buffered, or once the shared 256 MiB is used), but that only works on a connection the proxy is handed by its host. The proxy `SandboxManager` runs accepts its own connections, and Bun keeps reading such a tunnel while it is paused. So under Bun an upload to an upstream that has stopped reading is buffered in the SRT process without bound. This is a limitation of the runtime. Use Node where a sandboxed process may upload more than the host can hold.
+
+**Changes a `tlsTerminate` user can observe.** On a supported runtime, compared with the per-tunnel listener:
+
+- The tunnel cap: past `maxTunnels`, a CONNECT is answered `503` (`X-Proxy-Error: too-many-tunnels`), whether or not it would have carried TLS.
+- The handshake deadline: a tunnel that has not finished its TLS handshake within `handshakeTimeoutMs` of its CONNECT is closed.
+- The server name passed to `filterRequest` (`sni`) is lower-cased.
+- With `requireHostMatch`, the leaf certificate is always the CONNECT target's, whatever server name the client asks for (a name that does not match gets `421`, as before).
+- A ClientHello whose server name cannot be read as a plain DNS name (letters, digits and inner hyphens in dot-separated labels, with no trailing dot; for example one with an underscore) gets the CONNECT target's leaf certificate instead of one minted for that name. With `requireHostMatch`, its requests are answered `421`.
+- Under Bun, an HTTP/1.1 request without a `Host` header inside a tunnel is answered `400`, as Node's parser already does.
 
 ### Filesystem Isolation
 

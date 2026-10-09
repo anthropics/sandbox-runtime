@@ -1,5 +1,9 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import {
+  SERVES_EMITTED_CONNECTIONS,
+  testWithTls,
+} from '../helpers/emitted-connections.js'
+import {
   createServer as createHttpServer,
   type IncomingMessage,
   type ServerResponse,
@@ -66,6 +70,8 @@ function exchange(
 // pin the end-to-end 502 outcome without reaching writeHead. The
 // relayResponseHead cases below exercise the writeHead failure directly.
 describe('invalid upstream status line', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
   const lookup = ((_hostname, options, callback) => {
     if (typeof options === 'object' && options.all)
@@ -99,7 +105,7 @@ describe('invalid upstream status line', () => {
     tlsPort = await listen(tlsUpstream)
     proxy = createHttpProxyServer({
       filter: () => true,
-      mitmCA: ca,
+      mitmCA: SERVES_EMITTED_CONNECTIONS ? ca : undefined,
       tlsTerminateUpstreamCA: CA_PEM,
       lookupFor: () => lookup,
     })

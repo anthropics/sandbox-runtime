@@ -382,18 +382,19 @@ export function proxyAuthHeader(proxyUrl: URL): string | undefined {
  * `502 Bad Gateway` instead: nothing from the upstream head or body is
  * relayed, and the upstream connection is closed.
  *
+ * `headers` is what to send in place of the upstream's own headers with the
+ * hop-by-hop ones removed, for a caller that has filtered them further.
+ *
  * Returns true when the head was written and the body should be piped,
  * false when the response was replaced by the 502.
  */
 export function relayResponseHead(
   res: ServerResponse,
   upstreamRes: IncomingMessage,
+  headers: IncomingHttpHeaders = stripHopByHop(upstreamRes.headers),
 ): boolean {
   try {
-    res.writeHead(
-      upstreamRes.statusCode ?? 502,
-      stripHopByHop(upstreamRes.headers),
-    )
+    res.writeHead(upstreamRes.statusCode ?? 502, headers)
     return true
   } catch (err) {
     logForDebugging(
@@ -418,20 +419,29 @@ export function relayResponseHead(
 /**
  * Strip hop-by-hop and proxy-specific headers before forwarding upstream.
  * Also strips any headers named in the incoming `Connection` header, per
- * RFC 7230 §6.1.
+ * RFC 9110 §7.6.1. With `folded`, a name also matches in any spelling of
+ * `-`, `_` and `.` (`Proxy_Authorization`, `keep.alive`), for upstreams
+ * that read those separators as one.
  */
-export function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders {
+export function stripHopByHop(
+  h: IncomingHttpHeaders,
+  { folded = false }: { folded?: boolean } = {},
+): IncomingHttpHeaders {
+  const norm = (name: string): string => {
+    const lower = name.trim().toLowerCase()
+    return folded ? lower.replace(/[_.]/g, '-') : lower
+  }
   const extra = new Set<string>()
   const connHeader = h.connection
   if (connHeader) {
     for (const tok of String(connHeader).split(',')) {
-      extra.add(tok.trim().toLowerCase())
+      extra.add(norm(tok))
     }
   }
   const out: IncomingHttpHeaders = {}
   for (const [k, v] of Object.entries(h)) {
-    const lk = k.toLowerCase()
-    if (!HOP_BY_HOP.has(lk) && !extra.has(lk)) out[k] = v
+    const nk = norm(k)
+    if (!HOP_BY_HOP.has(nk) && !extra.has(nk)) out[k] = v
   }
   return out
 }

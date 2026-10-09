@@ -2274,5 +2274,50 @@ describe('Config Validation', () => {
         expect(result.success).toBe(false)
       })
     })
+
+    describe('maxTunnels and handshakeTimeoutMs', () => {
+      const parse = (tlsTerminate: Record<string, unknown>) =>
+        SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: { ...base.network, tlsTerminate },
+        })
+
+      test('are optional and round-trip when given', () => {
+        const none = parse({})
+        expect(none.success).toBe(true)
+        if (none.success) {
+          expect(none.data.network.tlsTerminate?.maxTunnels).toBeUndefined()
+          expect(
+            none.data.network.tlsTerminate?.handshakeTimeoutMs,
+          ).toBeUndefined()
+        }
+        const given = parse({ maxTunnels: 1024, handshakeTimeoutMs: 30_000 })
+        expect(given.success).toBe(true)
+        if (given.success) {
+          expect(given.data.network.tlsTerminate?.maxTunnels).toBe(1024)
+          expect(given.data.network.tlsTerminate?.handshakeTimeoutMs).toBe(
+            30_000,
+          )
+        }
+      })
+
+      test('accept their bounds', () => {
+        for (const v of [1, 65536]) {
+          expect(parse({ maxTunnels: v }).success).toBe(true)
+        }
+        for (const v of [100, 600_000]) {
+          expect(parse({ handshakeTimeoutMs: v }).success).toBe(true)
+        }
+      })
+
+      test('reject a value that is not a positive integer in range', () => {
+        for (const v of [0, -1, 1.5, 65537, '256', null]) {
+          expect(parse({ maxTunnels: v }).success).toBe(false)
+        }
+        for (const v of [0, 99, 1500.5, 600_001, '10000', null]) {
+          expect(parse({ handshakeTimeoutMs: v }).success).toBe(false)
+        }
+      })
+    })
   })
 })

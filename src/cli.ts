@@ -266,6 +266,19 @@ async function main(): Promise<void> {
       }
     })
 
+  program
+    .command('proxy')
+    .description(
+      'Run only the HTTP proxy, deciding every request through an external decider on inherited fds.',
+    )
+    .allowUnknownOption()
+    .helpOption(false)
+    .argument('[args...]')
+    .action(async (args: string[]) => {
+      const { runProxyCli } = await import('./proxy-cli.js')
+      await runProxyCli(args)
+    })
+
   // Default command - run command in sandbox
   program
     .argument('[command...]', 'command to run in the sandbox')

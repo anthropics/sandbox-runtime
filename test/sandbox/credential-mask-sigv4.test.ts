@@ -12,7 +12,10 @@
  * aws-sigv4.test.ts; these tests pin the proxy plumbing around it.
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { test, expect, beforeAll, afterAll } from 'bun:test'
+// Every case here runs a proxy configured to terminate TLS, so each is
+// skipped where this runtime cannot terminate it in-process.
+import { describeWithTls as describe } from '../helpers/emitted-connections.js'
 import { createServer as createHttpsServer } from 'node:https'
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
 import type { Server, AddressInfo } from 'node:net'
@@ -117,6 +120,10 @@ async function curlViaProxy(
     '-sS',
     '--proxy',
     `http://127.0.0.1:${proxyPort}`,
+    // An empty list overrides NO_PROXY, which would send curl around
+    // the proxy under test for 127.0.0.1.
+    '--noproxy',
+    '',
     '--max-time',
     '10',
     '-D',
