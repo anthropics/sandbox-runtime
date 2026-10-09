@@ -12,6 +12,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import {
   chmodSync,
   mkdirSync,
+  readdirSync,
   rmdirSync,
   rmSync,
   writeFileSync,
@@ -31,11 +32,13 @@ import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
   unreadableDirectories,
+  type LinuxSandboxParams,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from '../../src/sandbox/sandbox-utils.js'
+import { manifestOf } from '../helpers/bwrap-argv.js'
 import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
@@ -1076,6 +1079,272 @@ describe.if(isSupportedPlatform)(
             rmSync(raceDir, { recursive: true, force: true })
           }
         }, 15000)
+
+        // The caller runs no cleanup for a wrap that threw, so what was
+        // deferred to that wrap has nobody else to let go of it. A command that
+        // ran is collected by its own record; what waits for the count is the
+        // manifest of one that was wrapped and never started.
+
+        const wrapInCwd = (
+          command: string,
+          failing?: Partial<LinuxSandboxParams>,
+        ): Promise<string> =>
+          wrapCommandWithSandboxLinux({
+            command,
+            needsNetworkRestriction: false,
+            readConfig: undefined,
+            writeConfig: { allowOnly: ['.'], denyWithinAllow: [] },
+            enableWeakerNestedSandbox: true,
+            allowAllUnixSockets: true,
+            ...failing,
+          })
+
+        it.each(['aborted', 'refused'])(
+          'runs the cleanup deferred to a wrap that is then %s',
+          async how => {
+            const raceDir = join(TEST_DIR, 'race-test-4')
+            mkdirSync(raceDir, { recursive: true })
+            process.chdir(raceDir)
+
+            try {
+              const manifestA = manifestOf(await wrapInCwd('true')) ?? ''
+              expect(existsSync(manifestA)).toBe(true)
+
+              // B is still looking for the mandatory denies when A's caller
+              // cleans up, and nothing tells that call from one for B.
+              const controller = new AbortController()
+              const wrappedB = wrapInCwd('true', {
+                abortSignal: controller.signal,
+                binShell: how === 'refused' ? 'no-such-shell' : undefined,
+              })
+              cleanupBwrapMountPoints()
+              expect(existsSync(manifestA)).toBe(true)
+
+              if (how === 'aborted') controller.abort(new Error('stopped'))
+              expect(await wrappedB.catch((e: unknown) => e)).toBeInstanceOf(
+                Error,
+              )
+              expect(existsSync(manifestA)).toBe(false)
+              expect(readdirSync(raceDir)).toEqual([])
+            } finally {
+              process.chdir(TEST_DIR)
+              rmSync(raceDir, { recursive: true, force: true })
+            }
+          },
+        )
+
+        it('forgets the mount points planned by a wrap that is then refused', async () => {
+          const raceDir = join(TEST_DIR, 'race-test-6')
+          mkdirSync(raceDir, { recursive: true })
+          process.chdir(raceDir)
+
+          try {
+            expect(
+              await wrapInCwd('true', { binShell: 'no-such-shell' }).catch(
+                (e: unknown) => e,
+              ),
+            ).toBeInstanceOf(Error)
+
+            // bwrap never ran, so this is no mount point: the host made it.
+            writeFileSync('.mcp.json', '')
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            cleanupBwrapMountPoints()
+            expect(readdirSync(raceDir)).toEqual(['.mcp.json'])
+          } finally {
+            process.chdir(TEST_DIR)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        })
+
+        it.each([
+          ['aborted', 'counted along with it'],
+          ['aborted', 'started since a forced cleanup'],
+          ['handed out', 'started since a forced cleanup'],
+        ])(
+          'a wrap that is %s leaves the mount points of a running sandbox %s',
+          async (how, which) => {
+            const raceDir = join(TEST_DIR, 'race-test-5')
+            mkdirSync(raceDir, { recursive: true })
+            process.chdir(raceDir)
+            // Stands in for ripgrep, and goes on until told to end.
+            const heldScan = join(raceDir, 'held-scan')
+            writeFileSync(
+              heldScan,
+              `#!/bin/sh\nuntil [ -e '${raceDir}/scanned' ]; do sleep 0.1; done\n`,
+              { mode: 0o755 },
+            )
+
+            try {
+              const controller = new AbortController()
+              const wrappedB = wrapInCwd('true', {
+                abortSignal: controller.signal,
+                ripgrepConfig: { command: heldScan },
+              })
+              if (which !== 'counted along with it') {
+                cleanupBwrapMountPoints({ force: true })
+              }
+
+              // C runs throughout, and tries a denied name once told to.
+              const childC = spawn(
+                await wrapInCwd(
+                  'until [ -e go ]; do sleep 0.1; done; echo WRITTEN > .bashrc',
+                ),
+                { shell: true },
+              )
+              const exitC = new Promise<void>(resolve => {
+                childC.on('exit', () => resolve())
+              })
+              while (!existsSync('.bashrc')) {
+                await new Promise(r => setTimeout(r, 50))
+              }
+
+              if (how === 'aborted') {
+                controller.abort(new Error('stopped'))
+                expect(await wrappedB.catch((e: unknown) => e)).toBeInstanceOf(
+                  Error,
+                )
+              } else {
+                writeFileSync('scanned', '')
+                spawnSync(await wrappedB, { shell: true, timeout: 10000 })
+                cleanupBwrapMountPoints()
+              }
+              expect(existsSync('.bashrc')).toBe(true)
+
+              // C is still counted, so the next command to end defers to it.
+              spawnSync(await wrapInCwd('true'), {
+                shell: true,
+                timeout: 10000,
+              })
+              cleanupBwrapMountPoints()
+              expect(existsSync('.bashrc')).toBe(true)
+
+              writeFileSync('go', '')
+              await exitC
+              expect(readFileSync('.bashrc', 'utf8')).toBe('')
+
+              cleanupBwrapMountPoints()
+              expect(existsSync('.bashrc')).toBe(false)
+            } finally {
+              process.chdir(TEST_DIR)
+              rmSync(raceDir, { recursive: true, force: true })
+            }
+          },
+          15000,
+        )
+
+        // A running sandbox answers for its own mount points, so what a count
+        // that is one short costs is the start of a command that is wrapped and
+        // has not started: bubblewrap refuses to start without its manifest.
+        it.each(['aborted', 'handed out'])(
+          'a wrap from before a forced cleanup that is %s leaves the manifest of a command wrapped since',
+          async how => {
+            const raceDir = join(TEST_DIR, 'race-test-9')
+            mkdirSync(raceDir, { recursive: true })
+            process.chdir(raceDir)
+            const heldScan = join(raceDir, 'held-scan')
+            writeFileSync(
+              heldScan,
+              `#!/bin/sh\nuntil [ -e '${raceDir}/scanned' ]; do sleep 0.1; done\n`,
+              { mode: 0o755 },
+            )
+
+            try {
+              const controller = new AbortController()
+              const wrappedB = wrapInCwd('true', {
+                abortSignal: controller.signal,
+                ripgrepConfig: { command: heldScan },
+              })
+              cleanupBwrapMountPoints({ force: true })
+              const commandC = await wrapInCwd('echo STARTED')
+
+              if (how === 'aborted') {
+                controller.abort(new Error('stopped'))
+                expect(await wrappedB.catch((e: unknown) => e)).toBeInstanceOf(
+                  Error,
+                )
+              } else {
+                writeFileSync('scanned', '')
+                spawnSync(await wrappedB, { shell: true, timeout: 10000 })
+                cleanupBwrapMountPoints()
+              }
+
+              const ranC = spawnSync(commandC, {
+                shell: true,
+                encoding: 'utf8',
+                timeout: 10000,
+              })
+              expect(ranC.stdout).toContain('STARTED')
+              cleanupBwrapMountPoints()
+              expect(existsSync('.bashrc')).toBe(false)
+            } finally {
+              process.chdir(TEST_DIR)
+              rmSync(raceDir, { recursive: true, force: true })
+            }
+          },
+          15000,
+        )
+
+        it('leaves nothing of a directory mount point that another sandbox was wrapped under', async () => {
+          const raceDir = join(TEST_DIR, 'race-test-7')
+          mkdirSync(raceDir, { recursive: true })
+          process.chdir(raceDir)
+
+          try {
+            const childT = spawn(
+              await wrapInCwd('until [ -e go ]; do sleep 0.1; done'),
+              { shell: true },
+            )
+            const exitT = new Promise<void>(resolve => {
+              childT.on('exit', () => resolve())
+            })
+            while (!existsSync('.claude')) {
+              await new Promise(r => setTimeout(r, 50))
+            }
+
+            // T's .claude is there by now, so X's mount points go inside it.
+            // They are collected once X has ended; the directory is T's still.
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            cleanupBwrapMountPoints()
+            expect(readdirSync('.claude')).toEqual([])
+
+            writeFileSync('go', '')
+            await exitT
+            cleanupBwrapMountPoints()
+            expect(readdirSync(raceDir)).toEqual(['go'])
+
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            cleanupBwrapMountPoints()
+            expect(readdirSync(raceDir)).toEqual(['go'])
+          } finally {
+            process.chdir(TEST_DIR)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        }, 15000)
+
+        it('takes only its own where the host has written at a mount point or inside one', async () => {
+          const raceDir = join(TEST_DIR, 'race-test-8')
+          mkdirSync(raceDir, { recursive: true })
+          process.chdir(raceDir)
+
+          try {
+            // The second is wrapped with the first's .claude there.
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            spawnSync(await wrapInCwd('true'), { shell: true, timeout: 10000 })
+            expect(readdirSync('.claude')).not.toEqual([])
+            writeFileSync('.claude/kept', '')
+            rmSync('.bashrc')
+            writeFileSync('.bashrc', 'kept')
+
+            cleanupBwrapMountPoints()
+            cleanupBwrapMountPoints()
+            expect(readdirSync(raceDir).sort()).toEqual(['.bashrc', '.claude'])
+            expect(readdirSync('.claude')).toEqual(['kept'])
+            expect(readFileSync('.bashrc', 'utf8')).toBe('kept')
+          } finally {
+            process.chdir(TEST_DIR)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        })
 
         it('non-existent .git/hooks deny does not turn .git into a file, breaking git', async () => {
           // When .git doesn't exist yet, denying .git/hooks causes

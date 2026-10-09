@@ -1124,6 +1124,10 @@ let exitHandlerRegistered = false
  */
 let activeSandboxCount = 0
 
+// Forced cleanups so far. One zeroes the count under a wrap still in flight,
+// which from then on has nothing in it to give back.
+let forcedCleanups = 0
+
 /**
  * Register cleanup handler for bwrap mount points
  */
@@ -1177,6 +1181,7 @@ export function cleanupBwrapMountPoints(opts?: {
   let release: OwnManifestRelease
   if (opts?.force) {
     activeSandboxCount = 0
+    forcedCleanups++
     release = 'all'
   } else {
     if (activeSandboxCount > 0) {
@@ -3735,6 +3740,7 @@ export async function wrapCommandWithSandboxLinux(
   // Counted from here, for the clean-up the caller makes when the command is
   // over; the catch below takes it back if no command comes of this wrap.
   activeSandboxCount++
+  const countedAfter = forcedCleanups
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let applySeccompPrefix: string | undefined
@@ -4072,15 +4078,20 @@ export async function wrapCommandWithSandboxLinux(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
     )
 
+    // INVARIANT: a wrap that hands out a command is in the count when it does,
+    // whatever a forced cleanup did meanwhile: its caller gives one back.
+    if (forcedCleanups !== countedAfter) activeSandboxCount++
     return wrappedCommand
   } catch (error) {
     // No command came of this wrap, so no sandbox starts under its manifest.
     if (manifest !== undefined) {
       discardMountPointManifest(manifest.file)
     }
-    if (activeSandboxCount > 0) {
-      activeSandboxCount--
-    }
+    // Its place in the count goes back through the clean-up: a command that
+    // ended meanwhile left to this wrap what goes when none is outstanding.
+    // After a forced cleanup the count is of other wraps only: one taken from
+    // it has a command that has not started refused its start.
+    if (forcedCleanups === countedAfter) cleanupBwrapMountPoints()
     throw error
   }
 }
