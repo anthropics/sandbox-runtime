@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect, spyOn } from 'bun:test'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -6,10 +6,11 @@ import {
   generateProxyEnvVars,
   CA_TRUST_VARS,
 } from '../../src/sandbox/sandbox-utils.js'
+import * as platform from '../../src/utils/platform.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
-import { isLinux } from '../helpers/platform.js'
+import { isLinux, isWindows } from '../helpers/platform.js'
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
@@ -167,5 +168,141 @@ describe('generateProxyEnvVars', () => {
         }
       },
     )
+  })
+
+  describe('GIT_SSH_COMMAND', () => {
+    const MUX_OFF = 'ssh -o ControlMaster=no -o ControlPath=none'
+    const NC_SOCKS = `${MUX_OFF} -o ProxyCommand='nc -X 5 -x localhost:1080 %h %p'`
+
+    /** The ssh variables `generateProxyEnvVars` emits on `os`, by name. */
+    function sshVars(
+      os: platform.Platform,
+      ...args: Parameters<typeof generateProxyEnvVars>
+    ): Record<string, string> {
+      const spy = spyOn(platform, 'getPlatform').mockReturnValue(os)
+      try {
+        return Object.fromEntries(
+          generateProxyEnvVars(...args)
+            .filter(v => /^(GIT_SSH_COMMAND|SRT_SSH_PROXY_COMMAND)=/.test(v))
+            .map(v => [
+              v.slice(0, v.indexOf('=')),
+              v.slice(v.indexOf('=') + 1),
+            ]),
+        )
+      } finally {
+        spy.mockRestore()
+      }
+    }
+
+    it('macOS, one port for both protocols and a token: an authenticated CONNECT, the credential in a variable of its own', () => {
+      for (const [encodedCommand, user] of [
+        [undefined, 'srt'],
+        ['Zm9v+/8=', 'srt.Zm9v+/8='],
+      ] as const) {
+        const basic = Buffer.from(`${user}:tok`).toString('base64')
+        const vars = sshVars(
+          'macos',
+          3128,
+          3128,
+          undefined,
+          'tok',
+          false,
+          encodedCommand,
+        )
+        expect(vars).toEqual({
+          SRT_SSH_PROXY_COMMAND:
+            'LC_ALL=C; no() { printf "sandbox proxy: %s\\n" "$*" >&2; exit 1; }; ' +
+            'case $1 in ""|*[!A-Za-z0-9._:-]*) no bad host;; *:*) set -- "[$1]" "$2";; esac; ' +
+            'case $2 in ""|*[!0-9]*) no bad port;; esac; ' +
+            'exec 3<&0; ' +
+            `{ printf "CONNECT %s HTTP/1.1\\r\\nHost: %s\\r\\nProxy-Authorization: Basic ${basic}\\r\\n\\r\\n" "$1:$2" "$1:$2"; exec /bin/cat <&3; } | ` +
+            '/usr/bin/nc 127.0.0.1 3128 | ' +
+            '{ read -r v why; while read -r v; do case $v in ""|?) break;; esac; done; ' +
+            'case $why in "200 "*) exec /bin/cat;; esac; ' +
+            'why=${why%?}; no "$1:$2: ${why:-no answer}"; } & ' +
+            'exec >&-; wait $!',
+          GIT_SSH_COMMAND: `${MUX_OFF} -o ProxyCommand="/bin/sh -c 'eval \\"\\$SRT_SSH_PROXY_COMMAND\\"' sh '%h' %p"`,
+        })
+        // What ends up in arguments names neither the token nor its encoding.
+        expect(vars.GIT_SSH_COMMAND).not.toContain('tok')
+        expect(vars.GIT_SSH_COMMAND).not.toContain(basic)
+      }
+    })
+
+    it('macOS without a token, with a SOCKS port of its own, or without an HTTP port: nc over SOCKS, as before', () => {
+      const cases: Array<Parameters<typeof generateProxyEnvVars>> = [
+        [1080, 1080],
+        [3128, 1080],
+        [3128, 1080, undefined, 'tok'],
+        [undefined, 1080, undefined, 'tok'],
+      ]
+      for (const args of cases) {
+        expect(sshVars('macos', ...args)).toEqual({ GIT_SSH_COMMAND: NC_SOCKS })
+      }
+    })
+
+    // The ports and the token are the manager's own, on any host: what macOS
+    // would be given for them follows from those three alone.
+    it.skipIf(isWindows)(
+      'macOS: ssh leaves nc over SOCKS only for the listener nc cannot use, the one of the library',
+      async () => {
+        for (const [httpProxyPort, socksProxyPort] of [
+          [undefined, undefined],
+          [undefined, 41080],
+          [43128, undefined],
+          [43128, 41080],
+        ]) {
+          try {
+            await SandboxManager.initialize({
+              network: {
+                allowedDomains: ['example.com'],
+                deniedDomains: [],
+                httpProxyPort,
+                socksProxyPort,
+              },
+              filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+            })
+            const socks = SandboxManager.getSocksProxyPort()!
+            const vars = sshVars(
+              'macos',
+              SandboxManager.getProxyPort(),
+              socks,
+              undefined,
+              SandboxManager.getProxyAuthToken(),
+            )
+            if (httpProxyPort === undefined && socksProxyPort === undefined) {
+              expect(vars.SRT_SSH_PROXY_COMMAND).toContain(
+                `| /usr/bin/nc 127.0.0.1 ${socks} |`,
+              )
+              expect(vars.GIT_SSH_COMMAND).toContain('SRT_SSH_PROXY_COMMAND')
+            } else {
+              expect(socks).toBe(socksProxyPort ?? socks)
+              expect(vars).toEqual({
+                GIT_SSH_COMMAND: `${MUX_OFF} -o ProxyCommand='nc -X 5 -x localhost:${socks} %h %p'`,
+              })
+            }
+          } finally {
+            await SandboxManager.reset()
+          }
+        }
+      },
+    )
+
+    it('Linux: socat, unchanged', () => {
+      expect(sshVars('linux', 3128, 1080)).toEqual({
+        GIT_SSH_COMMAND: `${MUX_OFF} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=3128'`,
+      })
+      expect(
+        sshVars('linux', 3128, 1080, undefined, 'tok', false, 'Zm9v'),
+      ).toEqual({
+        GIT_SSH_COMMAND: `${MUX_OFF} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=3128,proxyauth=srt.Zm9v:tok'`,
+      })
+      expect(sshVars('linux', undefined, 1080, undefined, 'tok')).toEqual({})
+    })
+
+    it('Windows, and no SOCKS port: not set', () => {
+      expect(sshVars('windows', 3128, 3128, undefined, 'tok')).toEqual({})
+      expect(sshVars('macos', 3128, undefined, undefined, 'tok')).toEqual({})
+    })
   })
 })

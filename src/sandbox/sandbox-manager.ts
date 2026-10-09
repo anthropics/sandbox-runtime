@@ -460,9 +460,11 @@ async function filterNetworkRequest(
   host: string,
   sandboxAskCallback: SandboxAskCallback | undefined,
   encodedCommand?: string,
+  explain?: (reason: string) => void,
 ): Promise<boolean> {
   const denied = (reason: string): false => {
     recordOutboundDeny(host, port, reason, encodedCommand)
+    explain?.(reason)
     return false
   }
 
@@ -699,8 +701,14 @@ async function startMuxProxyServer(
   const injectCredentials = buildCredentialInjector()
   const injectBodyCredentials = buildBodyCredentialInjector()
   httpProxyServer = createHttpProxyServer({
-    filter: (port, host, _socket, encodedCommand) =>
-      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
+    filter: (port, host, _socket, encodedCommand, explain) =>
+      filterNetworkRequest(
+        port,
+        host,
+        sandboxAskCallback,
+        encodedCommand,
+        explain,
+      ),
     getMitmSocketPath,
     mitmCA,
     shouldTerminateTLS: shouldTerminateTLSForHost,

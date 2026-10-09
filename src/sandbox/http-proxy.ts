@@ -76,12 +76,16 @@ export interface HttpProxyServerOptions {
    * filter canonicalizes internally. Every other hook below, and the
    * upstream leg itself, get the {@link canonicalizeHost} spelling of an
    * allowed host — see the note at the CONNECT handler's routing step.
+   *
+   * `explain`, called before a refusal, gives the reason: the status phrase
+   * a refused CONNECT is answered with.
    */
   filter(
     port: number,
     host: string,
     socket: Socket | Duplex,
     encodedCommand?: string,
+    explain?: (reason: string) => void,
   ): Promise<boolean> | boolean
 
   /**
@@ -649,17 +653,21 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
       const { hostname: requestedHost, port } = target
 
+      let reason: string | undefined
       const allowed = await options.filter(
         port,
         requestedHost,
         socket,
         auth.encodedCommand,
+        given => {
+          reason = given
+        },
       )
       if (!allowed) {
         logForDebugging(`Connection blocked to ${requestedHost}:${port}`, {
           level: 'error',
         })
-        endWithStatus(rawDenied(...allowlistDeny))
+        endWithStatus(rawDenied(...allowlistDeny, reason))
         return
       }
       // The client may have died during the filter await (EOF destroy

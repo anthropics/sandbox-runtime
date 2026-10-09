@@ -137,6 +137,42 @@ describe('HTTP proxy threads encodedCommand from Basic auth to filter()', () => 
     expect(seen).toEqual([enc])
   })
 
+  it('answers a refused CONNECT with the reason filter() gave as the status phrase, cut to one bounded line', async () => {
+    const reasons = [
+      'use an https:// remote',
+      'a\r\nX-Injected: 1\r\n\r\nb\x00\x1b[31m\x7f\x9fc',
+      'x'.repeat(401),
+      undefined,
+    ]
+    proxy = createHttpProxyServer({
+      filter: (_port, _host, _socket, _encodedCommand, explain) => {
+        const reason = reasons.shift()
+        if (reason !== undefined) explain?.(reason)
+        return false
+      },
+      proxyAuthToken: 'sekrit',
+      denyHeader: 'X-Deny',
+    })
+    proxy.listen(0, '127.0.0.1')
+    await once(proxy, 'listening')
+    const port = (proxy.address() as { port: number }).port
+
+    for (const phrase of [
+      'use an https:// remote',
+      'a X-Injected: 1 b [31m c',
+      'x'.repeat(400),
+      'Forbidden',
+    ]) {
+      expect(await sendConnect(port, 'srt', 'sekrit', 'blocked.test:22')).toBe(
+        `HTTP/1.1 403 ${phrase}\r\n` +
+          'Content-Type: text/plain\r\n' +
+          'X-Deny: host_not_allowed\r\n' +
+          '\r\n' +
+          'Connection blocked by network allowlist',
+      )
+    }
+  })
+
   it('still authenticates and passes undefined for bare "srt"', async () => {
     const TOKEN = 'sekrit'
     const seen: Array<string | undefined> = []
