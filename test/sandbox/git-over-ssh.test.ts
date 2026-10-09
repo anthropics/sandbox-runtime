@@ -722,8 +722,10 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
       ].join('\n'),
     )
 
-    git('init', '-q', '--bare', join(dir, 'repo.git'))
-    git('init', '-q', join(dir, 'work'))
+    // Named: where `init.defaultBranch` says otherwise, the far side's HEAD
+    // would name a branch that is not there, and a clone checks nothing out.
+    git('init', '-q', '--bare', '-b', 'main', join(dir, 'repo.git'))
+    git('init', '-q', '-b', 'main', join(dir, 'work'))
     writeFileSync(join(dir, 'work', 'blob'), randomBytes(BLOB_BYTES))
     blobSha256 = sha256(join(dir, 'work', 'blob'))
     head = commit('blob')
@@ -982,11 +984,21 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
         TEST_MS,
       )
 
-      /** How the ProxyCommand of this spelling words a 403. */
-      const refusal = (port: number, reason: string): string =>
+      /**
+       * How the ProxyCommand of this spelling words a 403. What socat shows
+       * of one is its own matter: 1.8.0.0 nothing, 1.8.1.3 the status phrase.
+       */
+      const refusal = (port: number, reason: string): string | RegExp =>
         vars === injected && isLinux
-          ? ` CONNECT 127.0.0.1:${port}: ${reason}\n` // socat
+          ? new RegExp(
+              `( CONNECT 127\\.0\\.0\\.1:${port}: ${reason}\n|^)Connection closed by UNKNOWN port 65535`,
+              'm',
+            )
           : `sandbox proxy: 127.0.0.1:${port}: 403 ${reason}\n`
+      const expectRefusal = (stderr: string, words: string | RegExp): void => {
+        if (typeof words === 'string') expect(stderr).toContain(words)
+        else expect(stderr).toMatch(words)
+      }
 
       it(
         `${spelling}: a destination on the deny list is refused in the words configured for it`,
@@ -997,7 +1009,7 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
           )
           expect(r.status).toBe(128)
           expect(r.ms).toBeLessThan(PROMPT_MS)
-          expect(r.stderr).toContain(refusal(deniedPort, DENY_REASON))
+          expectRefusal(r.stderr, refusal(deniedPort, DENY_REASON))
         },
         TEST_MS,
       )
@@ -1013,7 +1025,7 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
           expect(r.status).toBe(128)
           expect(r.ms).toBeLessThan(PROMPT_MS)
           expect(r.stdout).toBe('')
-          expect(r.stderr).toContain(refusal(other, ASK_REASON))
+          expectRefusal(r.stderr, refusal(other, ASK_REASON))
           if (vars === injected) {
             // The user name that went with the token names the command.
             expect(

@@ -746,8 +746,8 @@ const DEFAULT_DENY_TAG = 'blocked-by-sandbox-runtime'
  * The proxy's standard policy-denial response as raw bytes, for paths that
  * answer on a bare socket (CONNECT): 403 with an `X-Proxy-Error` tag and
  * the reason as the body. `phrase` is the status line's: of a refused CONNECT
- * that is the part clients show (socat and the script in GIT_SSH_COMMAND
- * among them), not the body. It is cut to one bounded line.
+ * that is the part clients show (the script in GIT_SSH_COMMAND among
+ * them), not the body. It is cut to one bounded line.
  */
 /**
  * The header that marks a denial: `X-Proxy-Error: <tag>` for a tag, or a
