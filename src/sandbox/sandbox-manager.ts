@@ -1307,10 +1307,14 @@ function checkDependenciesCommon(
   }
 
   // The library itself writable from inside the sandbox: see own-files.ts.
-  const ownInstall = config?.filesystem.disabled
-    ? undefined
-    : ownInstallWarning(writeRootsOf(getFsWriteConfig()))
-  if (ownInstall !== undefined) warnings.push(ownInstall)
+  if (!config?.filesystem.disabled) {
+    try {
+      const ownInstall = ownInstallWarning(writeRootsOf(getFsWriteConfig()))
+      if (ownInstall !== undefined) warnings.push(ownInstall)
+    } catch {
+      // It only advises: whoever enforces a config says what is wrong with it.
+    }
+  }
 
   return { done: { errors, warnings } }
 }
@@ -2108,9 +2112,13 @@ async function wrapWithSandboxAgain(
     // For a caller that never reads checkDependencies(), the CLI among them.
     if (!ownInstallLogged) {
       ownInstallLogged = true
-      const ownInstall = ownInstallWarning(writeRootsOf(writeConfig))
-      if (ownInstall !== undefined) {
-        logForDebugging(ownInstall, { level: 'warn' })
+      try {
+        const ownInstall = ownInstallWarning(writeRootsOf(writeConfig))
+        if (ownInstall !== undefined) {
+          logForDebugging(ownInstall, { level: 'warn' })
+        }
+      } catch {
+        // It only advises, as in checkDependenciesCommon().
       }
     }
 

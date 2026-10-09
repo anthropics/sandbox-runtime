@@ -2337,16 +2337,21 @@ describe.if(!isWindows)('an entry marked literal', () => {
       denyRead: [{ path: starred } as unknown as FilesystemPathEntry],
     }
     const refusal = 'must be a path, or { path, literal: true }'
-    // At once: the dependency check of initialize() reads the write config.
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the matcher is a promise
-    await expect(initialize(halfMarked)).rejects.toThrow(refusal)
+    if (isLinux) {
+      // At once: the dependency check of initialize() looks for the host's
+      // helpers outside the write paths, so it reads the write config.
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the matcher is a promise
+      await expect(initialize(halfMarked)).rejects.toThrow(refusal)
 
-    // And wherever it is read, for one that comes in by updateConfig().
-    await initialize({})
-    SandboxManager.updateConfig({
-      network: noNetwork,
-      filesystem: { allowWrite: [], denyWrite: [], ...halfMarked },
-    })
+      // And wherever it is read, for one that comes in by updateConfig().
+      await initialize({})
+      SandboxManager.updateConfig({
+        network: noNetwork,
+        filesystem: { allowWrite: [], denyWrite: [], ...halfMarked },
+      })
+    } else {
+      await initialize(halfMarked)
+    }
     expect(() => SandboxManager.getFsReadConfig()).toThrow(refusal)
     expect(() => SandboxManager.getFsWriteConfig()).toThrow(refusal)
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
