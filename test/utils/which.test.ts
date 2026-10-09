@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'bun:test'
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { whichSync } from '../../src/utils/which.js'
 
 /**
@@ -53,5 +56,41 @@ describe('whichSync', () => {
 
   it('returns null for a missing path-qualified executable', () => {
     expect(whichSync('/definitely/missing/srt-bin-xyz')).toBeNull()
+  })
+
+  it('returns a path-qualified regular executable file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'which-exec-'))
+    try {
+      const bin = join(dir, 'tool')
+      writeFileSync(bin, '#!/bin/sh\necho ok\n')
+      chmodSync(bin, 0o755)
+      expect(whichSync(bin)).toBe(bin)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('returns null for a path-qualified directory even when it is executable', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'which-dir-'))
+    try {
+      // Directories need the execute/search bit; confirm +x is set so this
+      // would have passed a bare accessSync(X_OK) check.
+      chmodSync(dir, 0o755)
+      expect(whichSync(dir)).toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('throws for a path-qualified regular file without execute permission', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'which-nox-'))
+    try {
+      const file = join(dir, 'not-exec')
+      writeFileSync(file, 'not executable\n')
+      chmodSync(file, 0o644)
+      expect(() => whichSync(file)).toThrow(/Failed to resolve executable.*EACCES/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

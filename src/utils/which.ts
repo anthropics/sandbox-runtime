@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { accessSync, constants } from 'node:fs'
+import { accessSync, constants, statSync } from 'node:fs'
 import path from 'node:path'
 
 function isPathQualified(bin: string): boolean {
@@ -8,6 +8,9 @@ function isPathQualified(bin: string): boolean {
 
 function resolvePathQualified(bin: string): string | null {
   try {
+    if (!statSync(bin).isFile()) {
+      return null
+    }
     accessSync(bin, constants.X_OK)
     return bin
   } catch (err) {
