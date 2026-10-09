@@ -137,6 +137,11 @@ function getVendorArchitecture(): string | null {
       return 'x64'
     case 'arm64':
       return 'arm64'
+    case 'ppc64':
+      // Node.js reports 'ppc64' on ppc64le Linux; the BPF filter and
+      // apply-seccomp build target the ELFv2 little-endian ABI only, so the
+      // vendor directory is named explicitly.
+      return 'ppc64le'
     case 'ia32':
       // ia32 multiplexes every socket operation through socketcall(), whose
       // sub-function argument the filter cannot inspect, so AF_UNIX is not
