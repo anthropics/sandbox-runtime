@@ -870,8 +870,9 @@ export type LinuxSandboxProfileErrorCode =
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
- * configuration expands to is past a limit, or, for `command_too_long` and
- * `nul_in_path`, what the caller passed in is; for `deny_glob_too_large` the
+ * configuration expands to, with the mandatory denies of the working
+ * directory, is past a limit, or, for `command_too_long` and `nul_in_path`,
+ * what the caller passed in is; for `deny_glob_too_large` the
  * profile could not be worked out at all, for `host_helper_unavailable` a
  * program the wrap runs is not to be had, and for the two `mount_points_`
  * codes other sandboxes' mount points cannot be told or do not hold still.
@@ -1014,7 +1015,7 @@ export class WorkingDirectoryChanged extends Error {
 function renderBwrapInvocation(
   bwrapBinary: string,
   bwrapArgs: string[],
-  mounts: { start: number; end: number },
+  mounts: { start: number; end: number; mandatoryDenyArgs: number },
   started?: string,
 ): string {
   /** What the string's own shell does, to the file it is given as "$1". */
@@ -1041,10 +1042,14 @@ function renderBwrapInvocation(
           ...steps.map(step => step.file),
           ...words,
         ])
+  // Whose the arguments are and what lowers each share: the mandatory denies
+  // follow from what the working directory holds, not from the configuration.
+  const shares = (): string =>
+    `${mounts.mandatoryDenyArgs} of its arguments are built-in write protection, in no list of the configuration: shell and tool settings and each git repository's hooks and config, in and below the working directory, and the directories holding them. For fewer, run from a directory with fewer repositories in it, or allow writing to fewer of them; a lower mandatoryDenySearchDepth leaves the deeper ones unprotected. The other ${bwrapArgs.length - mounts.mandatoryDenyArgs} are what the configuration expands to: each path takes about three arguments, each environment variable two`
   if (bwrapArgs.length > BWRAP_MAX_ARGS) {
     throw new LinuxSandboxProfileError(
       'too_many_arguments',
-      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts); reduce what the configuration expands to: each path takes about three arguments, each environment variable two`,
+      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts). ${shares()}`,
     )
   }
   const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
@@ -1068,7 +1073,7 @@ function renderBwrapInvocation(
   if (bwrapArgs.length + 2 > BWRAP_MAX_ARGS) {
     throw new LinuxSandboxProfileError(
       'too_many_arguments',
-      `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts`,
+      `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts. ${shares()}`,
     )
   }
   let argsFd: number
@@ -2130,6 +2135,8 @@ async function generateFilesystemArgs(
       manifest: MountPointManifest | undefined
       /** Where the manifest's started record is, as the binds spell its directory. */
       started: string | undefined
+      /** How many of them are the mandatory denies'. */
+      mandatoryDenyArgs: number
     }
   | undefined
 > {
@@ -2167,6 +2174,8 @@ async function generateFilesystemArgs(
   // denyWrite binds are buffered and emitted after denyRead processing so that
   // a denyRead tmpfs over an ancestor directory doesn't wipe them out.
   const denyWriteArgs: string[] = []
+  // Where the mandatory denies' binds begin in it: after the configuration's.
+  let mandatoryDenyArgsStart = Infinity
   // Directories that a deny entry re-binds read-only inside the sandbox
   // (--ro-bind <dir> <dir>), keyed by resolved dest, with every raw
   // (pre-resolution) spelling each was reached through. A non-existent deny
@@ -2628,8 +2637,9 @@ async function generateFilesystemArgs(
       return stubSkipVetoInputs
     }
     // Deny writes within allowed paths (user-specified + mandatory denies)
+    const configuredDenyPaths = writeConfig.denyWithinAllow || []
     const denyPaths = [
-      ...(writeConfig.denyWithinAllow || []),
+      ...configuredDenyPaths,
       ...(await linuxGetMandatoryDenyPaths(
         hostRipgrepConfig(ripgrepConfig, writeConfig.allowOnly),
         mandatoryDenySearchDepth,
@@ -2819,7 +2829,10 @@ async function generateFilesystemArgs(
       }
       return covered
     }
-    for (const pathPattern of denyPaths) {
+    for (const [index, pathPattern] of denyPaths.entries()) {
+      if (index === configuredDenyPaths.length) {
+        mandatoryDenyArgsStart = denyWriteArgs.length
+      }
       const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
 
       // Skip /dev/* paths since --dev /dev already handles them
@@ -3339,6 +3352,20 @@ async function generateFilesystemArgs(
     },
   )
   args.splice(ancestorPinInsertAt, 0, ...pinArgs)
+  // What the mandatory denies cost, for the refusal of a profile with too many
+  // arguments: the pins above them here, their own binds as they are emitted.
+  const pinned = new Set(pinArgs)
+  const mandatoryDenyPins = new Set<string>()
+  for (let i = mandatoryDenyArgsStart; i < denyWriteArgs.length; i += 3) {
+    for (
+      let dir = path.dirname(denyWriteArgs[i + 2]!);
+      dir !== '/' && !mandatoryDenyPins.has(dir);
+      dir = path.dirname(dir)
+    ) {
+      if (pinned.has(dir)) mandatoryDenyPins.add(dir)
+    }
+  }
+  let mandatoryDenyArgs = 3 * mandatoryDenyPins.size
 
   // Emitting denyWrite last means these ro-binds layer on top of any write
   // paths the denyRead loop just re-bound. Before this ordering, tmpfs over
@@ -3414,6 +3441,7 @@ async function generateFilesystemArgs(
       continue
     }
     args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
+    if (i >= mandatoryDenyArgsStart) mandatoryDenyArgs += 3
     emittedDenyWriteDests.push(dest)
     // The tmpfs / mask re-application passes below ask "does this bind sit
     // above a read-denied path?". A bind at the resolved dest also re-exposes
@@ -3620,7 +3648,7 @@ async function generateFilesystemArgs(
     args.push('--ro-bind', dir, dir)
   }
 
-  return { args, onTheLine, manifest, started }
+  return { args, onTheLine, manifest, started, mandatoryDenyArgs }
 }
 
 /**
@@ -3952,6 +3980,7 @@ export async function wrapCommandWithSandboxLinux(
     const mounts = {
       start: bwrapArgs.length + filesystem.onTheLine,
       end: bwrapArgs.length + filesystem.args.length,
+      mandatoryDenyArgs: filesystem.mandatoryDenyArgs,
     }
     bwrapArgs.push(...filesystem.args)
 
