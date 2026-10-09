@@ -26,7 +26,10 @@ import {
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { literalReadings } from '../../src/sandbox/path-entries.js'
-import type { FilesystemPathEntry } from '../../src/sandbox/sandbox-config.js'
+import type {
+  FilesystemPathEntry,
+  SandboxRuntimeConfig,
+} from '../../src/sandbox/sandbox-config.js'
 import type { ISandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
   expandGlobPattern,
@@ -2599,6 +2602,75 @@ describe.if(isLinux)('getLinuxGlobPatternWarnings after fix', () => {
 
     await SandboxManager.reset()
   })
+
+  const initialized = async (
+    config: Pick<SandboxRuntimeConfig, 'filesystem' | 'credentials'>,
+  ) => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      ...config,
+    })
+    return SandboxManager
+  }
+
+  it('warns about such a pattern as the path of a credential file deny', async () => {
+    // It joins the read denies and is skipped like one of them.
+    const SandboxManager = await initialized({
+      filesystem: {
+        denyRead: ['/**/.netrc'],
+        allowWrite: ['/tmp/test/*.log'],
+        denyWrite: [],
+      },
+      credentials: {
+        files: [
+          { path: '/**/.netrc', mode: 'deny' },
+          { path: '/*/token', mode: 'deny' },
+          { path: '/tmp/test/*.key', mode: 'deny' },
+          // Always the name of one file.
+          { path: '/*/masked', mode: 'mask' },
+        ],
+      },
+    })
+
+    expect(SandboxManager.getLinuxGlobPatternWarnings()).toEqual([
+      '/tmp/test/*.log',
+      '/**/.netrc',
+      '/*/token',
+    ])
+
+    await SandboxManager.reset()
+  })
+
+  it.each(['denyRead', 'allowRead'] as const)(
+    'tells such a pattern from every other %s entry',
+    async list => {
+      const skipped = ['/**/.ssh/**', '/*/x', '/*', '/*/**', '/ho*/x']
+      const applied: FilesystemPathEntry[] = [
+        '**/.ssh/**', // starts at the working directory
+        '~/**/.env',
+        '/home/**/x',
+        '/home/x',
+        '/**', // `/`, once the trailing `/**` is dropped
+        { path: '/**/.ssh/**', literal: true },
+      ]
+      const SandboxManager = await initialized({
+        filesystem: {
+          denyRead: [],
+          allowWrite: [],
+          denyWrite: [],
+          [list]: [...applied, ...skipped],
+        },
+      })
+
+      expect(SandboxManager.getLinuxGlobPatternWarnings()).toEqual(skipped)
+
+      await SandboxManager.reset()
+    },
+  )
 })
 
 // ============================================================================
