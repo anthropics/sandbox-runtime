@@ -489,6 +489,65 @@ describe.if(isMacOS)('macOS denyRead nested under allowRead', () => {
   })
 })
 
+describe.if(isMacOS)('macOS literal denyRead inside a glob allowRead', () => {
+  const RAW_BASE = join(tmpdir(), 'literal-deny-glob-allow-' + Date.now())
+  let BASE = ''
+
+  const SECRET = 'LITERAL_DENY_SECRET_' + Date.now()
+  const PLAIN = 'PLAIN_CONTENT_OK'
+
+  beforeAll(() => {
+    if (!isMacOS) return
+    rmSync(RAW_BASE, { recursive: true, force: true })
+    mkdirSync(join(RAW_BASE, 'project', 'secrets'), { recursive: true })
+    BASE = realpathSync(RAW_BASE)
+    writeFileSync(join(BASE, 'project', 'secrets', 'key'), SECRET)
+    writeFileSync(join(BASE, 'project', 'main.c'), PLAIN)
+  })
+
+  afterAll(() => {
+    rmSync(RAW_BASE, { recursive: true, force: true })
+  })
+
+  function run(
+    command: string,
+    allow: string,
+  ): { status: number | null; stdout: string } {
+    const wrapped = wrapCommandWithSandboxMacOS({
+      command,
+      needsNetworkRestriction: false,
+      readConfig: {
+        denyOnly: [join(RAW_BASE, 'project', 'secrets')],
+        allowWithinDeny: [allow],
+      },
+      writeConfig: undefined,
+    })
+    const r = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    expect(r.error).toBeUndefined()
+    return { status: r.status, stdout: r.stdout }
+  }
+
+  it.each([
+    ['a subtree glob', '**'],
+    ['a file glob below it', '**/*'],
+  ])('a literal deny survives an allowRead written as %s', (_label, suffix) => {
+    const allow = join(RAW_BASE, suffix)
+
+    const denied = run(`cat ${join(BASE, 'project', 'secrets', 'key')}`, allow)
+    expect(denied.status).not.toBe(0)
+    expect(denied.stdout).not.toContain(SECRET)
+
+    // and the rest of the allowed region is still readable
+    const allowed = run(`cat ${join(BASE, 'project', 'main.c')}`, allow)
+    expect(allowed.status).toBe(0)
+    expect(allowed.stdout).toContain(PLAIN)
+  })
+})
+
 describe('rm in allowWrite under denyRead ancestor (issue #171)', () => {
   const TEST_BASE_DIR = join(tmpdir(), 'rm-under-denyread-' + Date.now())
   const TEST_PROJECT_DIR = join(TEST_BASE_DIR, 'project')

@@ -14,6 +14,7 @@ import {
   containsGlobChars,
   globToRegex,
   denyGlobRegex,
+  isAtOrUnder,
   isStrictlyUnder as isPathStrictlyUnder,
   DANGEROUS_FILES,
   getDangerousDirectories,
@@ -413,7 +414,20 @@ function lateReadDenyFilters(resolved: ResolvedReadConfig): {
   const literalAllowDirs = resolved.allows.filter(a => !a.glob).map(a => a.path)
   for (const deny of resolved.denies) {
     if (!deny.glob) {
-      if (literalAllowDirs.some(a => isStrictlyUnder(deny, a))) {
+      // A literal deny has to come back after every allow that can reach into
+      // it, not only after a literal allow directory above it. A glob allow is
+      // not in literalAllowDirs, and `<root>/**/*` matches the file under
+      // `<root>/secrets` and re-opens it. A glob can only match below its own
+      // base directory, so the globs that can reach are the ones whose base
+      // directory is on the same branch as the deny.
+      const reopened =
+        literalAllowDirs.some(a => isStrictlyUnder(deny, a)) ||
+        resolved.allows.some(a => {
+          if (!a.glob) return false
+          const base = entryBaseDir(a)
+          return isAtOrUnder(base, deny.path) || isAtOrUnder(deny.path, base)
+        })
+      if (reopened) {
         filters.push(denyPathFilter(deny))
       }
       continue
