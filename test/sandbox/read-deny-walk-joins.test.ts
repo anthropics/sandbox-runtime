@@ -103,44 +103,68 @@ describe('the read-deny walk: budget, shared listings and steps together', () =>
     }
   })
 
-  it('lets a failure kept in shared listings answer for a second name, the directory being denied whole', () => {
-    // A walk by itself tries a directory under each name that leads to it
-    // (glob-expand: "does not let one name that fails to list answer for the
-    // others"). Between the patterns of one configuration a failure is kept.
-    // Nothing is lost by that: the first failure has the directory denied
-    // whole, so what a second name would find lies beneath a deny already.
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'walk-joins-name-')))
-    const certs = join(root, 'pkg', 'certs')
-    mkdirSync(certs, { recursive: true })
-    writeFileSync(join(certs, 'id.pem'), '')
-    symlinkSync(join('pkg', 'certs'), join(root, 'lnk'))
-    let attempts = 0
-    const readdirSync = fs.readdirSync
-    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
-      ...args: Parameters<typeof fs.readdirSync>
-    ) => {
-      if (String(args[0]) === certs && ++attempts === 1) {
-        throw Object.assign(new Error('EMFILE: too many open files'), {
-          code: 'EMFILE',
-        })
-      }
-      return readdirSync(...args)
-    }) as typeof fs.readdirSync)
-    try {
-      const listings: GlobWalkListings = new Map()
-      for (const name of ['*.pem', '*.key']) {
-        expect(
+  // A walk by itself tries a directory under each name that leads to it
+  // (glob-expand: "does not let one name that fails to list answer for the
+  // others"). Between the patterns of one configuration, what the first
+  // pattern got is kept, and which of two things that is depends on the name
+  // the walk came by:
+  // - its own: there is no shorter name to ask, so the failure is kept, and
+  //   has the directory denied whole by every pattern that follows;
+  // - a shorter one, through a link: the real path fails, the shorter name
+  //   lists. The pattern that saw the failure has the directory denied whole
+  //   all the same, and what was listed is kept, so a later pattern reads
+  //   entries and adds only what it matches among them.
+  // Nothing is lost either way: a configuration denies what any of its
+  // patterns gives. The walk takes the entry listed last first.
+  it.each([
+    ['its own name, so that the failure is kept', 'lnk', 2],
+    ['a shorter name, so that what that lists is kept', 'pkg', 1],
+  ])(
+    'has a directory that failed to list denied whole for the configuration, reached by %s',
+    (_how, listedFirst, patternsThatGiveIt) => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'walk-joins-name-')))
+      const certs = join(root, 'pkg', 'certs')
+      mkdirSync(certs, { recursive: true })
+      writeFileSync(join(certs, 'id.pem'), '')
+      symlinkSync(join('pkg', 'certs'), join(root, 'lnk'))
+      let attempts = 0
+      const readdirSync = fs.readdirSync
+      const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        if (String(args[0]) === certs && ++attempts === 1) {
+          throw Object.assign(new Error('EMFILE: too many open files'), {
+            code: 'EMFILE',
+          })
+        }
+        const entries = readdirSync(...args) as unknown as fs.Dirent[]
+        return String(args[0]) === root
+          ? entries.sort((x, y) =>
+              x.name === listedFirst ? -1 : y.name === listedFirst ? 1 : 0,
+            )
+          : entries
+      }) as unknown as typeof fs.readdirSync)
+      try {
+        const listings: GlobWalkListings = new Map()
+        const found = ['*.pem', '*.key'].map(name =>
           expandReadDenyGlobLinux(join(root, '**', name), [], undefined, {
             listings,
           }),
-        ).toEqual([certs])
+        )
+        // The pattern that saw the failure, whichever name it came by.
+        expect(found[0]).toEqual([certs])
+        expect(found[1]).toEqual(patternsThatGiveIt === 2 ? [certs] : [])
+        expect([...new Set(found.flat())]).toEqual([certs])
+        expect(listings.get(certs) instanceof Error).toBe(
+          patternsThatGiveIt === 2,
+        )
+        expect(attempts).toBe(1)
+      } finally {
+        spy.mockRestore()
+        rmSync(root, { recursive: true, force: true })
       }
-      expect(attempts).toBe(1)
-    } finally {
-      spy.mockRestore()
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
+    },
+  )
 
   describe.if(isLinux)('through the wrap', () => {
     const network = { allowedDomains: [], deniedDomains: [] }
