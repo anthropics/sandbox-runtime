@@ -1517,17 +1517,13 @@ export function expandGlobPattern(
  *
  * `splits` is false for a pattern this cannot be done for: one with a
  * wildcard inside a bracket expression (globToRegex rewrites that wildcard
- * like any other, and what is left no longer reads as one character); and for
- * one that is not split: over {@link MAX_GLOB_PIECES} pieces, or with a piece
- * that does not compile on its own (`whyNot` says which). Its positions say
- * nothing, so every directory is listed, an entry is matched by its whole
- * spelling, and {@link walkGlobPattern} does not list such a pattern through
- * symlinks.
+ * like any other, and what is left no longer reads as one character). Its
+ * positions say nothing, so every directory is listed, an entry is matched by
+ * its whole spelling, and {@link walkGlobPattern} does not list such a pattern
+ * through symlinks.
  */
 interface GlobPositions {
   splits: boolean
-  /** Why a pattern of a shape that splits was not, for the walk's warning. */
-  whyNot?: string
   /** The positions beneath the root directory. */
   start: readonly number[]
   next: (positions: readonly number[], name: string) => readonly number[]
@@ -1542,7 +1538,7 @@ interface GlobPositions {
     spelled: string,
   ) => boolean
   /** The same for the pattern without its trailing `/**`; never true for a
-   *  pattern that has none, nor when the directory form was not asked for. */
+   *  pattern that has none. */
   matchesDirectoryForm: (
     positions: readonly number[],
     name: string,
@@ -1600,19 +1596,11 @@ function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
   )
 }
 
-/** The most pieces a pattern is split into, which bounds the recursion that
- *  builds the automaton (one call per path component). A longer pattern is
- *  matched against real paths instead. */
-const MAX_GLOB_PIECES = 1024
-
 function globPositions(
   normalizedPattern: string,
   flags: string,
-  withDirectoryForm: boolean,
 ): GlobPositions {
-  const directoryForm = withDirectoryForm
-    ? removeTrailingGlobSuffix(normalizedPattern)
-    : normalizedPattern
+  const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
   let regex: RegExp
   let directoryRegex: RegExp | undefined
   try {
@@ -1658,12 +1646,9 @@ function globPositions(
       const known = memo.get(key)
       if (known !== undefined) return known
       if (!lead && pieces[i] === 'anyDirs') {
-        // Held before it is complete: what follows the `**` can lead back to
-        // this very position, which has to be in the memo by then.
-        const state: Globstar = { then: undefined }
-        const id = states.push(state) - 1
+        const id = globstar(undefined)
         memo.set(key, id)
-        state.then = componentAt(i + 1, false)
+        ;(states[id] as Globstar).then = componentAt(i + 1, false)
         return id
       }
       if (!lead && pieces[i] === 'any' && i === pieces.length - 1) {
@@ -1714,21 +1699,13 @@ function globPositions(
     const directoryPieces = directoryRegex
       ? globPieces(directoryForm, flags)
       : []
-    // A shape globPieces is documented not to take.
     if (pieces === undefined || directoryPieces === undefined) return unsplit
-    if (pieces.length + directoryPieces.length > MAX_GLOB_PIECES) {
-      return {
-        ...unsplit,
-        whyNot: `it has more than ${MAX_GLOB_PIECES} pieces`,
-      }
-    }
     starts = [build(pieces)]
     firstOfDirectoryForm = states.length
     if (directoryRegex) starts.push(build(directoryPieces))
-  } catch (err) {
-    // A piece of the pattern that is no regular expression on its own, or an
-    // automaton too deep to build.
-    return { ...unsplit, whyNot: String(err) }
+  } catch {
+    // A piece of the pattern that is no regular expression on its own.
+    return unsplit
   }
 
   const open = (into: Set<number>, position: number | undefined): void => {
@@ -1738,6 +1715,8 @@ function globPositions(
       p = 'then' in state ? state.then : undefined
     }
   }
+  const sorted = (positions: Set<number>): readonly number[] =>
+    [...positions].sort((x, y) => x - y)
   const endsAt = (
     positions: readonly number[],
     name: string,
@@ -1754,7 +1733,7 @@ function globPositions(
   for (const p of starts) open(start, p)
   return {
     splits: true,
-    start: [...start],
+    start: sorted(start),
     next: (positions, name) => {
       const next = new Set<number>()
       for (const p of positions) {
@@ -1768,7 +1747,7 @@ function globPositions(
           }
         }
       }
-      return [...next]
+      return sorted(next)
     },
     matches: (positions, name) => endsAt(positions, name, false),
     matchesDirectoryForm: (positions, name) => endsAt(positions, name, true),
@@ -1891,16 +1870,10 @@ export function* walkGlobPatternSteps(
 
   // `s`: a name may hold a line terminator, which `.` alone does not match.
   const flags = opts.caseInsensitive ? 'is' : 's'
-  const positions = globPositions(
-    normalizedPattern,
-    flags,
-    opts.withDirectoryForm === true,
-  )
+  const positions = globPositions(normalizedPattern, flags)
   if (opts.followSymlinkedDirectories && !positions.splits) {
-    // The weaker reading, said out loud where it costs coverage.
-    const why = positions.whyNot === undefined ? '' : ` (${positions.whyNot})`
     logForDebugging(
-      `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time${why}, so it is matched against real paths only and not through symlinked directories`,
+      `[Sandbox] Glob pattern ${globPath} cannot be followed one path component at a time, so it is matched against real paths only and not through symlinked directories`,
       { level: 'warn' },
     )
   }
@@ -2050,41 +2023,41 @@ export function* walkGlobPatternSteps(
     yield
     // After the step, in which time can have passed, and before the listing.
     spend(dir, 0)
-    const known = listings.get(real)
-    let entries = known instanceof Error ? undefined : known
-    if (entries === undefined) {
-      try {
-        if (known instanceof Error) throw known
-        entries = onRealPath(real, frame.short, p =>
+    let entries: fs.Dirent[]
+    try {
+      const known = listings.get(real)
+      if (known instanceof Error) throw known
+      entries =
+        known ??
+        onRealPath(real, frame.short, p =>
           fs.readdirSync(p, { withFileTypes: true }),
         )
-        listings.set(real, entries)
-      } catch (err) {
-        const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
-        logForDebugging(
-          `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
-          { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
-        )
-        if (errorCode !== 'ENOENT') {
-          // Kept, or every pattern would try the directory again: one that
-          // would have cleared meanwhile hides more. An absence is not kept.
-          // It is the one answer that denies nothing, so each pattern asks.
-          // Nor is anything kept in a walk's own map: there a second name
-          // for the directory still gets its try (see `listedFor`).
-          if (opts.listings !== undefined) {
-            listings.set(
-              real,
-              err instanceof Error ? err : new Error(String(err)),
-            )
-          }
-          if (!record.unlisted) {
-            record.unlisted = true
-            walk.unlisted.push(dir)
-            if (real !== dir) walk.realOf.set(dir, real)
-          }
+      listings.set(real, entries)
+    } catch (err) {
+      const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+      logForDebugging(
+        `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
+        { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
+      )
+      if (errorCode !== 'ENOENT') {
+        // Kept, or every pattern would try the directory again: one that
+        // would have cleared meanwhile hides more. An absence is not kept. It
+        // is the one answer that denies nothing, so each pattern asks, under
+        // each name. Nor is anything kept in a walk's own map: there a second
+        // name for the directory still gets its try (see `listedFor`).
+        if (opts.listings !== undefined) {
+          listings.set(
+            real,
+            err instanceof Error ? err : new Error(String(err)),
+          )
         }
-        continue
+        if (!record.unlisted) {
+          record.unlisted = true
+          walk.unlisted.push(dir)
+          if (real !== dir) walk.realOf.set(dir, real)
+        }
       }
+      continue
     }
     for (const p of fresh) record.listedFor.add(p)
     for (const entry of entries) {

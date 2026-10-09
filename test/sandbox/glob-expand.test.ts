@@ -34,7 +34,6 @@ import {
   walkGlobPattern,
   walkGlobPatternSteps,
 } from '../../src/sandbox/sandbox-utils.js'
-import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import {
   containsGlobCharsWin,
   expandWindowsFsPaths,
@@ -1085,20 +1084,10 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     }
   })
 
-  it('says so when a pattern is too long to read a component at a time', async () => {
-    // A pattern with thousands of components is read as one that does not
-    // split, which descends no symlinked directory: a deny that covers less
-    // than it says, unless the reading is said out loud.
-    const pattern = '/tmp/' + 'a/'.repeat(4000) + '*.pem'
-    const { result, warnings } = await withCapturedWarnings(async () =>
-      walkGlobPattern(pattern, { followSymlinkedDirectories: true }),
+  it('names the pattern that is no regular expression', () => {
+    expect(() => walkGlobPattern('/tmp/certs/[z-a]*.pem')).toThrow(
+      /^Glob pattern \S*\/certs\/\[z-a\]\*\.pem does not compile/,
     )
-
-    expect(result.matches).toEqual([])
-    // Once, with the reason in it.
-    const said = warnings.filter(w => w.includes('real paths only'))
-    expect(said).toHaveLength(1)
-    expect(said[0]).toContain('pieces')
   })
 })
 
