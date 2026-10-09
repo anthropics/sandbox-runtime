@@ -1,4 +1,14 @@
-import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+/// <reference lib="es2021.weakref" />
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  beforeEach,
+  afterAll,
+  afterEach,
+  spyOn,
+} from 'bun:test'
 import * as fc from 'fast-check'
 // The namespace of the same module production binds (sandbox-utils.ts does
 // `import * as fs from 'fs'`), so a spy on it is seen by the code under test.
@@ -17,6 +27,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { literalReadings } from '../../src/sandbox/path-entries.js'
 import type { FilesystemPathEntry } from '../../src/sandbox/sandbox-config.js'
+import type { ISandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
   expandGlobPattern,
   expandTilde,
@@ -2298,6 +2309,207 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
     expect(readConfig.denyOnly[0]).toBe(realTestDir)
 
     await SandboxManager.reset()
+  })
+})
+
+// ============================================================================
+// Tests for wraps asked for while another one walks, on Linux
+// ============================================================================
+
+describe.if(isLinux)('wrapWithSandbox while another wrap walks', () => {
+  let SandboxManager: ISandboxManager
+  const cwd = process.cwd()
+  let root: string
+  /** The tree each listing was in: `a`, `b` or `c`, three listings each. */
+  let listed: string
+  /** Runs in each listing, with how many there have been and what it found. */
+  let inListing: (nth: number, entries: object) => void
+  let readdirSpy: { mockClear(): void; mockRestore(): void }
+
+  const configured = (denyRead: string[], allowWrite: string[]) => ({
+    network: { allowedDomains: [], deniedDomains: [] },
+    filesystem: {
+      denyRead: denyRead.map(pattern => join(root, pattern)),
+      allowWrite,
+      denyWrite: [],
+    },
+  })
+  /** A wrap that walks `tree`, whatever is configured. */
+  const wrapWalking = (tree: string, signal?: AbortSignal): Promise<string> =>
+    SandboxManager.wrapWithSandbox(
+      'true',
+      undefined,
+      { filesystem: configured([`${tree}/**/*.pem`], []).filesystem },
+      signal,
+    )
+
+  beforeEach(async () => {
+    ;({ SandboxManager } = await import('../../src/sandbox/sandbox-manager.js'))
+    root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-line-')))
+    for (const tree of ['a', 'b', 'c']) {
+      mkdirSync(join(root, tree, 'from'), { recursive: true })
+      mkdirSync(join(root, tree, 'to'))
+    }
+    listed = ''
+    inListing = () => {}
+    // Each listing takes longer than a turn.
+    const readdirSync = fs.readdirSync
+    readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      const entries = readdirSync(...args)
+      if (String(args[0]).startsWith(root)) {
+        listed += String(args[0])[root.length + 1]
+        inListing(listed.length, entries)
+        const until = performance.now() + 15
+        while (performance.now() < until);
+      }
+      return entries
+    }) as typeof fs.readdirSync)
+    process.chdir(join(root, 'c', 'from'))
+    await SandboxManager.reset()
+    await SandboxManager.initialize(configured(['b/**/.env'], ['.', root]))
+  })
+
+  afterEach(async () => {
+    readdirSpy.mockRestore()
+    process.chdir(cwd)
+    await SandboxManager.reset()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('walks for one wrap at a time, in the order they were asked for', async () => {
+    await Promise.all(['a', 'b', 'c'].map(tree => wrapWalking(tree)))
+    expect(listed).toBe('aaabbbccc')
+  })
+
+  // Aborted before it is asked for, and while it waits.
+  it.each([0, 2])(
+    'gives up an aborted wrap before its place comes, and goes on to the next (aborted after %d listings)',
+    async at => {
+      const controller = new AbortController()
+      const reason = new Error('stopped')
+      inListing = nth => {
+        if (nth === at) controller.abort(reason)
+      }
+      inListing(0, [])
+      let listedWhenGivenUp = ''
+      const [, givenUp] = await Promise.all([
+        wrapWalking('a'),
+        wrapWalking('b', controller.signal).catch((e: unknown) => {
+          listedWhenGivenUp = listed
+          return e
+        }),
+        wrapWalking('c'),
+      ])
+      expect(givenUp).toBe(reason)
+      expect(listedWhenGivenUp.length).toBeLessThan(3)
+      expect(listed).toBe('aaaccc')
+    },
+  )
+
+  it('goes on to the next when the wrap that walks is aborted, and when it throws', async () => {
+    const controller = new AbortController()
+    inListing = nth => {
+      if (nth === 2) controller.abort(new Error('stopped'))
+    }
+    const outcomes = await Promise.allSettled([
+      wrapWalking('a', controller.signal),
+      // Neither a path nor a marked one.
+      SandboxManager.wrapWithSandbox('true', undefined, {
+        filesystem: { denyRead: [{} as never], allowWrite: [], denyWrite: [] },
+      }),
+      wrapWalking('b'),
+    ])
+    expect(outcomes.map(outcome => outcome.status)).toEqual([
+      'rejected',
+      'rejected',
+      'fulfilled',
+    ])
+    expect(listed).toBe('aabbb')
+  })
+
+  // What the host does in the second listing of `a`, with a wrap by the
+  // configuration waiting. That one has read nothing yet, so it walks `b` once;
+  // the wrap that was walking starts over, behind it.
+  it.each([
+    [
+      'the configuration installed',
+      () => {
+        writeFileSync(join(root, 'b', 'key.pem'), '')
+        SandboxManager.updateConfig(configured(['b/**/.env', 'b/**/*.pem'], []))
+      },
+      'b/key.pem',
+      'c/from',
+    ],
+    [
+      'the working directory the host moved to',
+      () => process.chdir(join(root, 'c', 'to')),
+      'c/to',
+      'c/from',
+    ],
+  ])('goes by %s while it waited', async (_, disturb, holds, lacks) => {
+    inListing = nth => {
+      if (nth === 2) disturb()
+    }
+    const [, waited] = await Promise.all([
+      wrapWalking('a'),
+      SandboxManager.wrapWithSandbox('true'),
+    ])
+    expect(listed).toBe('aabbbaaa')
+    expect(waited).toContain(join(root, holds))
+    expect(waited).not.toContain(join(root, lacks))
+    expect(waited).toBe(await SandboxManager.wrapWithSandbox('true'))
+  })
+
+  it('keeps the order through a reset()', async () => {
+    let reset: Promise<void> | undefined
+    inListing = nth => {
+      if (nth === 2) reset = SandboxManager.reset()
+    }
+    // Either may find the network bridge gone, as any wrap during a reset().
+    await Promise.allSettled([wrapWalking('a'), wrapWalking('b')])
+    await reset
+    expect(listed).toBe('aaabbb')
+  })
+
+  it('has walked, and let go of what it listed, before the mandatory denies are looked for', async () => {
+    // Stands in for ripgrep: says that it runs, and goes on until told.
+    const scans = join(root, 'scans')
+    const enough = join(root, 'enough')
+    const slowScan = join(root, 'slow-scan')
+    writeFileSync(
+      slowScan,
+      `#!/bin/sh\necho ran >> ${scans}\nfor i in $(seq 300); do [ -e ${enough} ] && exit; sleep 0.01; done\n`,
+      { mode: 0o755 },
+    )
+    writeFileSync(scans, '')
+    SandboxManager.updateConfig({
+      ...configured([], []),
+      ripgrep: { command: slowScan },
+    })
+    const listings: WeakRef<object>[] = []
+    inListing = (_, entries) => listings.push(new WeakRef(entries))
+
+    let wrapped = 0
+    const wrapping = Promise.all(
+      ['a', 'b'].map(tree => wrapWalking(tree).then(() => wrapped++)),
+    )
+    try {
+      while (fs.readFileSync(scans, 'utf8') !== 'ran\nran\n') await Bun.sleep(5)
+      // The second has walked while the first was scanning.
+      expect(wrapped).toBe(0)
+      readdirSpy.mockClear() // It keeps what each call returned.
+      Bun.gc(true)
+      // Not none: a collector that reads the stack can take a stale word for a
+      // reference. Held by the wraps, it would be all six.
+      expect(listings.filter(l => l.deref() !== undefined).length).toBeLessThan(
+        6,
+      )
+    } finally {
+      writeFileSync(enough, '')
+      await wrapping
+    }
   })
 })
 
