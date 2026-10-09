@@ -1384,10 +1384,13 @@ export class GlobWalkBudgetError extends Error {
   }
 }
 
-/** What listing a real directory gave, its entries or the error that has it
- *  denied whole: a second position, or a second pattern, reads the same
- *  answer. */
-export type GlobWalkListings = Map<string, fs.Dirent[] | Error>
+/** What the walk reads of a listed entry. */
+type GlobWalkEntry = Pick<fs.Dirent, 'name' | 'isDirectory' | 'isSymbolicLink'>
+
+/** What listing a real directory gave, its entries with their types or the
+ *  error that has it denied whole: a second position, or a second pattern,
+ *  reads the same answer. */
+export type GlobWalkListings = Map<string, GlobWalkEntry[] | Error>
 
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
@@ -1454,9 +1457,9 @@ export interface GlobWalk {
    *  expansion must cover such a link rather than drop it. */
   uninspectableLinks: Set<string>
   /** Directories the walk could not list (any error but absence) under a
-   *  name it reached them by, each named once. What the pattern matches
-   *  beneath one can be missing from `matches`; a deny expansion must cover
-   *  them whole. */
+   *  name it reached them by, each named once, and entries that may be one
+   *  for all it could learn. What the pattern matches beneath one can be
+   *  missing from `matches`; a deny expansion must cover them whole. */
   unlisted: string[]
   /** Where an entry of `matches`, `directoryMatches` or `unlisted` really
    *  lives, for each one that is a symlink or is spelled through one above
@@ -1990,6 +1993,64 @@ export function* walkGlobPatternSteps(
     linkTargets.set(realLinkPath, target)
     return target
   }
+  /** An entry of the directory `real`, listed under the name `listedAs`, with
+   *  its type. Some file systems list names without one (some NFS and FUSE
+   *  mounts, XFS with ftype=0). Every `is…()` of such an entry answers false,
+   *  and taken at its word a directory would be passed over with all the
+   *  pattern matches beneath it. So it is asked for, at the cost of one call;
+   *  an entry that was listed with a type costs none. */
+  const withType = (
+    entry: fs.Dirent,
+    listedAs: string,
+    real: string,
+  ): GlobWalkEntry => {
+    if (
+      entry.isFile() ||
+      entry.isDirectory() ||
+      entry.isSymbolicLink() ||
+      entry.isFIFO() ||
+      entry.isSocket() ||
+      entry.isCharacterDevice() ||
+      entry.isBlockDevice()
+    ) {
+      return entry
+    }
+    const { name } = entry
+    const spelled = path.join(listedAs, name)
+    let type: 'directory' | 'link' | 'other' = 'other'
+    try {
+      const stats = fs.lstatSync(spelled)
+      if (stats.isDirectory()) type = 'directory'
+      else if (stats.isSymbolicLink()) type = 'link'
+    } catch {
+      try {
+        // Where it leads can still tell: only a link leads away from its place.
+        const isDirectory = fs.statSync(spelled).isDirectory()
+        if (fs.realpathSync(spelled) !== path.join(real, name)) type = 'link'
+        else if (isDirectory) type = 'directory'
+      } catch (err) {
+        // Only links make a circle. One that is not there is gone since it was
+        // listed, which leaves its name to be matched: kept, that denies no
+        // less than a listing made a moment later. Any other may be a
+        // directory, and is taken for one whose listing has failed: it is not
+        // gone into, and is denied whole where the pattern reaches beneath it.
+        const code = (err as NodeJS.ErrnoException | undefined)?.code
+        if (code === 'ELOOP') type = 'link'
+        else if (code !== 'ENOENT') {
+          type = 'directory'
+          listings.set(
+            path.join(real, name),
+            err instanceof Error ? err : new Error(String(err)),
+          )
+        }
+      }
+    }
+    return {
+      name,
+      isDirectory: () => type === 'directory',
+      isSymbolicLink: () => type === 'link',
+    }
+  }
 
   // The base as the filesystem is asked about it: a drive root gets back its
   // separator, since 'C:' on its own names the drive's current directory.
@@ -2023,14 +2084,16 @@ export function* walkGlobPatternSteps(
     yield
     // After the step, in which time can have passed, and before the listing.
     spend(dir, 0)
-    let entries: fs.Dirent[]
+    let entries: GlobWalkEntry[]
     try {
       const known = listings.get(real)
       if (known instanceof Error) throw known
       entries =
         known ??
         onRealPath(real, frame.short, p =>
-          fs.readdirSync(p, { withFileTypes: true }),
+          fs
+            .readdirSync(p, { withFileTypes: true })
+            .map(entry => withType(entry, p, real)),
         )
       listings.set(real, entries)
     } catch (err) {
@@ -2043,8 +2106,10 @@ export function* walkGlobPatternSteps(
         // Kept, or every pattern would try the directory again: one that
         // would have cleared meanwhile hides more. An absence is not kept. It
         // is the one answer that denies nothing, so each pattern asks, under
-        // each name. Nor is anything kept in a walk's own map: there a second
-        // name for the directory still gets its try (see `listedFor`).
+        // each name. Nor is it kept in a walk's own map: there a second name
+        // for the directory still gets its try (see `listedFor`). What
+        // `withType` could not learn is kept in either: that is all that says
+        // the entry may be a directory.
         if (opts.listings !== undefined) {
           listings.set(
             real,
