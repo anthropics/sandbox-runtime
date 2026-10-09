@@ -51,6 +51,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'installWindowsSandbox',
   'installWindowsSandboxAsync',
   'isUncPath',
+  'liveMountPoints',
   'parseWindowsBinShell',
   'parseWindowsSandboxError',
   'resolveSrtWin',

@@ -52,7 +52,7 @@ describe('a body that keeps arriving after a deny', () => {
             }, i * 10)
           }
         })
-        t.on('data', d => (out += d))
+        t.on('data', (d: Buffer) => (out += d))
         t.on('close', () => resolve(out))
         t.on('error', () => resolve(out))
       })

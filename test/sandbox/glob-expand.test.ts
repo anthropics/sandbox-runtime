@@ -1,8 +1,19 @@
-import { describe, it, expect, beforeAll, afterAll, spyOn } from 'bun:test'
+/// <reference lib="es2021.weakref" />
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  beforeEach,
+  afterAll,
+  afterEach,
+  spyOn,
+} from 'bun:test'
 import * as fc from 'fast-check'
 // The namespace of the same module production binds (sandbox-utils.ts does
 // `import * as fs from 'fs'`), so a spy on it is seen by the code under test.
 import * as fs from 'fs'
+import * as path from 'path'
 import {
   chmodSync,
   mkdirSync,
@@ -14,16 +25,22 @@ import {
   symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, join, win32 } from 'node:path'
 import { literalReadings } from '../../src/sandbox/path-entries.js'
-import type { FilesystemPathEntry } from '../../src/sandbox/sandbox-config.js'
+import type {
+  FilesystemPathEntry,
+  SandboxRuntimeConfig,
+} from '../../src/sandbox/sandbox-config.js'
+import type { ISandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
   expandGlobPattern,
   expandTilde,
   finish,
   finishInTurns,
+  globBaseDirIsRoot,
   globPatternBaseDir,
   globToRegex,
+  type GlobWalkListings,
   normalizePathForSandbox,
   type Steps,
   walkGlobPattern,
@@ -189,6 +206,116 @@ describe('expandGlobPattern', () => {
   )
 })
 
+describe('globPatternBaseDir', () => {
+  // The walk consumes the base a component at a time, so one with a component
+  // more or fewer than the pattern spells before its first wildcard matches
+  // nothing.
+  it.each([
+    // A root comes without its separator, whatever the host's dirname does.
+    ['C:/Users*/id.pem', 'C:'],
+    ['C:/*.pem', 'C:'],
+    ['D:/**/*.key', 'D:'],
+    ['//server/share/x*/y', '//server/share'],
+    ['//server/share/*.pem', '//server/share'],
+    ['C:/Users/u/certs*/id.pem', 'C:/Users/u'],
+    // A doubled separator is an empty component, of the base as well. A home
+    // directory that is a drive root makes one out of `~/*.pem`.
+    ['C:/a//*.pem', 'C:/a/'],
+    ['C:/a//x*', 'C:/a/'],
+    ['C:/a///**/*.pem', 'C:/a//'],
+    ['H://*.pem', 'H:/'],
+    ['H://x*', 'H:/'],
+    ['//server/share//*.key', '//server/share/'],
+    ['/a//*.pem', '/a/'],
+  ])('starts %p from %p', (pattern, base) => {
+    expect(globPatternBaseDir(pattern)).toBe(base)
+    expect(globBaseDirIsRoot(base)).toBe(false)
+  })
+})
+
+describe('a pattern with a doubled separator before its first wildcard', () => {
+  let root: string
+
+  beforeAll(() => {
+    root = realPath(mkdtempSync(join(tmpdir(), 'glob-doubled-')))
+    mkdirSync(join(root, 'a', 'sub'), { recursive: true })
+    writeFileSync(join(root, 'a', 'x.pem'), '')
+    writeFileSync(join(root, 'a', 'sub', 'y.pem'), '')
+  })
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it.each([
+    ['/a//*.pem', ['x.pem']],
+    ['/a//x*', ['x.pem']],
+    ['/a///*.pem', ['x.pem']],
+    ['/a//**/*.pem', ['x.pem', 'y.pem']],
+  ])('finds what the tail %p matches beneath an anchor', (tail, names) => {
+    const found = expandGlobPattern(root + tail, { anchor: root })
+    expect(found.map(p => basename(p)).sort()).toEqual(names)
+    for (const p of found) expect(existsSync(p)).toBe(true)
+  })
+
+  // Nothing collapses the separators of a Windows path before the walk.
+  it.if(isWindows).each([
+    ['backslashes', '\\a\\\\*.pem'],
+    ['forward slashes', '/a//*.pem'],
+    ['one of each', '\\a\\/*.pem'],
+    ['a wildcard further into the component', '\\a\\\\x*'],
+  ])('stamps what it matches, spelled with %s', (_how, tail) => {
+    for (const mode of ['deny', 'grant'] as const) {
+      expect(
+        expandWindowsFsPaths([root + tail], { mode }).map(p => basename(p)),
+      ).toEqual(['x.pem'])
+    }
+  })
+})
+
+describe.if(isWindows)(
+  'a pattern whose only literal directory is a drive root',
+  () => {
+    // Beneath the working directory, whose spelling holds no short (8.3) name:
+    // below the first wildcard a component is matched against a listing.
+    let dir: string
+    let drive: string
+    let components: string[]
+
+    beforeAll(() => {
+      dir = mkdtempSync(join(process.cwd(), 'glob-drive-'))
+      writeFileSync(join(dir, 'id.pem'), '')
+      drive = dir.slice(0, 2)
+      components = dir.slice(3).split('\\')
+    })
+
+    afterAll(() => {
+      rmSync(dir, { recursive: true, force: true })
+    })
+
+    it.each([
+      [
+        'a wildcard inside the first component',
+        '\\',
+        (c: string) => c[0] + '*',
+      ],
+      ['a wildcard for the first component', '\\', () => '*'],
+      ['forward slashes', '/', (c: string) => c[0] + '*'],
+      // What `~\x*` comes to when the home directory is a drive root.
+      ['a doubled separator after the root', '\\/', (c: string) => c[0] + '*'],
+    ])('walks one with %s', (_what, afterTheRoot, first) => {
+      expect(dir).toMatch(/^[A-Za-z]:\\[^\\]+\\/)
+      const pattern =
+        drive +
+        afterTheRoot +
+        [first(components[0]!), ...components.slice(1), '*.pem'].join('\\')
+      const found = expandWindowsFsPaths([pattern], { mode: 'deny' })
+      expect(found.map(p => basename(p))).toEqual(['id.pem'])
+      expect(existsSync(found[0]!)).toBe(true)
+    })
+  },
+)
+
 describe.if(!isWindows)('walkGlobPattern', () => {
   const RAW_BASE = join(tmpdir(), 'glob-walk-test-' + Date.now())
 
@@ -282,6 +409,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
           followSymlinkedDirectories: true,
         })
         expect(withDangling.uninspectableLinks).toEqual(new Set([link]))
+        // Neither link is a directory the walk failed to list.
+        expect(withDangling.unlisted).toEqual([])
       } finally {
         chmodSync(vault, 0o755)
         rmSync(root, { recursive: true, force: true })
@@ -448,6 +577,7 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       const [, first, ...rest] = under.split('/')
       const fromRoot = ['', first!.slice(0, 1) + '*', ...rest].join('/')
       expect(globPatternBaseDir(normalizePathForSandbox(fromRoot))).toBe('/')
+      expect(globBaseDirIsRoot('/')).toBe(true)
 
       const walk = walkGlobPattern(fromRoot)
       expect(walk.matches).toEqual([])
@@ -462,6 +592,78 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       rmSync(root, { recursive: true, force: true })
     }
   })
+
+  it('starts no walk from the root, and starts one from a drive or a share', () => {
+    // '/' holds every filesystem the machine has mounted. A drive root and
+    // the root of a UNC share are one volume each, which the entry names.
+    for (const none of ['', '/']) {
+      expect(globBaseDirIsRoot(none)).toBe(true)
+    }
+    for (const dir of [
+      'C:',
+      'c:',
+      'D:',
+      '//server/share',
+      '/home/u',
+      'C:/Users',
+      'C:/Users/u',
+      '//server/share/keys',
+      '/s',
+    ]) {
+      expect(globBaseDirIsRoot(dir)).toBe(false)
+    }
+  })
+
+  it.if(isLinux)(
+    'walks a pattern whose only literal directory is a drive root',
+    () => {
+      // A drive stood up on this runner: a directory named `C:` in the
+      // working directory, with path.dirname and path.isAbsolute answering as
+      // on Windows and 'C:/' resolving to itself. The listing is the walk's.
+      const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-drive-')))
+      const cwd = process.cwd()
+      const realpathSync = fs.realpathSync
+      const spies = [
+        spyOn(path, 'dirname').mockImplementation(win32.dirname),
+        spyOn(path, 'isAbsolute').mockImplementation(win32.isAbsolute),
+        spyOn(fs, 'realpathSync').mockImplementation(((
+          ...args: Parameters<typeof fs.realpathSync>
+        ) =>
+          args[0] === 'C:/'
+            ? 'C:/'
+            : realpathSync(...args)) as typeof fs.realpathSync),
+      ]
+      try {
+        mkdirSync(join(root, 'C:', 'Users1', 'deep'), { recursive: true })
+        mkdirSync(join(root, 'C:', 'Other'))
+        writeFileSync(join(root, 'C:', 'top.pem'), 'KEY')
+        writeFileSync(join(root, 'C:', 'Users1', 'id.pem'), 'KEY')
+        writeFileSync(join(root, 'C:', 'Users1', 'deep', 'id.pem'), 'KEY')
+        writeFileSync(join(root, 'C:', 'Other', 'id.pem'), 'KEY')
+        process.chdir(root)
+
+        // A wildcard inside the first component, at its start, and a `**`.
+        const middle = walkGlobPattern('C:/Users*/id.pem')
+        expect(middle.matches).toEqual(['C:/Users1/id.pem'])
+        expect(walkGlobPattern('C:/*.pem').matches).toEqual(['C:/top.pem'])
+        expect(walkGlobPattern('C:/**/deep/*.pem').matches).toEqual([
+          'C:/Users1/deep/id.pem',
+        ])
+        // 'C:' on its own is the drive's current directory, not its root:
+        // what the filesystem is asked about is 'C:/'. Asked about 'C:', the
+        // stand-in answers with its real path instead.
+        expect(middle.baseLocation).toBe('C:/')
+        // What the ACL stamp is handed, which is nothing when the walk is.
+        expect(expandWindowsFsPaths(['C:/Users*/id.pem'])).toEqual([
+          'C:/Users1/id.pem',
+        ])
+      } finally {
+        process.chdir(cwd)
+        for (const spy of spies) spy.mockRestore()
+        rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
 
   it('matches a name that holds a line terminator', () => {
     const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-newline-')))
@@ -520,7 +722,10 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-long-')))
       let deep = join(root, 'deep')
       while (deep.length < 4090) {
-        deep = join(deep, 'd'.repeat(Math.min(200, 4090 - deep.length - 1)))
+        // At least one character: a zero-length name would join to the same
+        // path and the loop would never end.
+        const room = 4090 - deep.length - 1
+        deep = join(deep, 'd'.repeat(Math.max(1, Math.min(200, room))))
       }
       const viaLink = join(root, 'base', 's', 'key.pem')
       try {
@@ -775,13 +980,25 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       writeFileSync(join(root, 'outside', 'certsx.pem'), 'KEY')
       symlinkSync(join('..', 'outside'), join(root, 'proj', 'lnk'))
 
-      const walk = walkGlobPattern(join(root, 'proj', '*/cert[s/]x.pem'), {
-        followSymlinkedDirectories: true,
-      })
+      const found = (pattern: string): string[] => {
+        const walk = walkGlobPattern(join(root, 'proj', pattern), {
+          followSymlinkedDirectories: true,
+        })
+        return walk.matches.map(m => walk.realOf.get(m) ?? m).sort()
+      }
 
-      expect(walk.matches.map(m => walk.realOf.get(m) ?? m).sort()).toEqual([
+      expect(found('*/cert[s/]x.pem')).toEqual([
         join(root, 'outside', 'cert', 'x.pem'),
         join(root, 'outside', 'certsx.pem'),
+      ])
+      // A range holds the separator as a set does: `[+-9]` spans `/`.
+      expect(found('*/cert[+-9]x.pem')).toEqual([
+        join(root, 'outside', 'cert', 'x.pem'),
+      ])
+      writeFileSync(join(root, 'outside', 'cert9x.pem'), 'KEY')
+      expect(found('*/cert[+-9]x.pem')).toEqual([
+        join(root, 'outside', 'cert', 'x.pem'),
+        join(root, 'outside', 'cert9x.pem'),
       ])
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -816,6 +1033,588 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       )
     } finally {
       rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('follows a placeholder name and a second unclosed `[` through a link', () => {
+    // Both are plain text to globToRegex, so the walk splits such a pattern
+    // like any other: certs leads out of the pattern's base.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-text-')))
+    try {
+      mkdirSync(join(root, 'outside'))
+      writeFileSync(join(root, 'outside', 'x.pem'), 'KEY')
+      for (const name of ['__GLOBSTAR__', 'a[b[c']) {
+        mkdirSync(join(root, 'proj', name), { recursive: true })
+        symlinkSync(
+          join('..', '..', 'outside'),
+          join(root, 'proj', name, 'certs'),
+        )
+
+        const walk = walkGlobPattern(join(root, 'proj', name, '*/x.pem'), {
+          followSymlinkedDirectories: true,
+        })
+
+        expect([name, walk.matches]).toEqual([
+          name,
+          [join(root, 'outside', 'x.pem')],
+        ])
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('does not let one name that fails to list answer for the others', () => {
+    // A listing can fail for a reason that has nothing to do with the
+    // directory (too many open files at that moment). Letting that failure
+    // answer for every later name drops every match beneath the directory.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-route-')))
+    try {
+      mkdirSync(join(root, 'pkg', 'certs'), { recursive: true })
+      writeFileSync(join(root, 'pkg', 'certs', 'id.pem'), 'KEY')
+      // No shorter than the real path, which is then all that is ever asked.
+      symlinkSync(join('pkg', 'certs'), join(root, 'link-to-certs'))
+
+      const certs = join(root, 'pkg', 'certs')
+      const readdirSync = fs.readdirSync
+      const attempts: string[] = []
+      let failuresLeft = 1
+      const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        const at = String(args[0])
+        if (at === certs) {
+          attempts.push(at)
+          if (failuresLeft > 0) {
+            failuresLeft--
+            throw Object.assign(new Error('EMFILE: too many open files'), {
+              code: 'EMFILE',
+            })
+          }
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      try {
+        const retried = walkGlobPattern(join(root, '**/*.pem'), {
+          followSymlinkedDirectories: true,
+        })
+        // Two names lead to the directory; the second one lists it.
+        expect(spy).toHaveBeenCalled()
+        expect(attempts).toHaveLength(2)
+        expect(retried.matches.map(m => retried.realOf.get(m) ?? m)).toEqual([
+          join(root, 'pkg', 'certs', 'id.pem'),
+        ])
+        expect(retried.unlisted).toHaveLength(1)
+
+        // Failing under every name, it is tried under each and named once.
+        attempts.length = 0
+        failuresLeft = Number.POSITIVE_INFINITY
+        const gone = walkGlobPattern(join(root, '**/*.pem'), {
+          followSymlinkedDirectories: true,
+        })
+        expect(attempts).toHaveLength(2)
+        expect(gone.matches).toEqual([])
+        expect(gone.unlisted).toHaveLength(1)
+      } finally {
+        spy.mockRestore()
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  describe('what has a name shorter than its real path', () => {
+    // h -> a/long/way/home is the base of the pattern, so every directory and
+    // link beneath it has a short name, through h, beside its real path. The
+    // real path is asked first. The short name crosses a link that a sandboxed
+    // command can repoint, so what it says is added and takes nothing back.
+    let root: string
+    /** `~` is the real home; everything else is spelled from the root. */
+    const at = (p: string): string =>
+      join(root, p.replace(/^~/, 'a/long/way/home'))
+
+    beforeAll(() => {
+      root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-short-')))
+      for (const dir of [
+        '~/proj',
+        '~/cfg',
+        'store/in',
+        'store/vendor',
+        'empty',
+      ]) {
+        mkdirSync(at(dir), { recursive: true })
+      }
+      for (const file of [
+        '~/proj/.env',
+        'store/in/.env',
+        'store/vendor/.env',
+        'store/key',
+        'store/decoy',
+      ]) {
+        writeFileSync(at(file), '')
+      }
+      symlinkSync(at('~'), at('h'))
+      // Leads out from beneath proj; is passed through; is itself a match.
+      symlinkSync(at('store/in'), at('~/proj/out'))
+      symlinkSync(at('store/vendor'), at('~/vendor'))
+      symlinkSync(at('store/key'), at('~/cfg/.env'))
+    })
+
+    afterAll(() => {
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    /**
+     * The walk of `h/**\/.env` while `answers` holds. A key is a call and the
+     * name it is made on; the value is the errno it fails with or, after `=`,
+     * the path it is answered from, the link above having been repointed.
+     */
+    function walkWhile(
+      answers: Record<string, string>,
+      listings?: GlobWalkListings,
+    ): { found: string[]; whole: string[]; ownSpelling: string[] } {
+      const spies = (['readdirSync', 'statSync', 'realpathSync'] as const).map(
+        fn => {
+          const call = fs[fn] as (...args: unknown[]) => unknown
+          return spyOn(fs, fn).mockImplementation(((
+            p: unknown,
+            ...rest: unknown[]
+          ) => {
+            const [, answer] =
+              Object.entries(answers).find(([on]) => {
+                const [onFn, onPath] = on.split(' ')
+                return onFn === fn && at(onPath!) === String(p)
+              }) ?? []
+            if (answer === undefined) return call(p, ...rest)
+            if (answer.startsWith('='))
+              return call(at(answer.slice(1)), ...rest)
+            throw Object.assign(new Error(answer), { code: answer })
+          }) as never)
+        },
+      )
+      try {
+        const walk = walkGlobPattern(join(at('h'), '**/.env'), {
+          followSymlinkedDirectories: true,
+          listings,
+        })
+        const located = (paths: Iterable<string>): string[] =>
+          [...paths].map(p => walk.realOf.get(p) ?? p).sort()
+        return {
+          found: located(walk.matches),
+          whole: located(walk.unlisted),
+          ownSpelling: [...walk.uninspectableLinks],
+        }
+      } finally {
+        for (const spy of spies) spy.mockRestore()
+      }
+    }
+
+    const ALL = [
+      '~/proj/.env',
+      'store/in/.env',
+      'store/key',
+      'store/vendor/.env',
+    ]
+    const BUT_PROJ = ['store/key', 'store/vendor/.env']
+    const LINK_AS_SPELLED = [
+      ...ALL.filter(p => p !== 'store/key'),
+      'h/cfg/.env',
+    ]
+
+    it.each<{
+      when: string
+      answers: Record<string, string>
+      found: string[]
+      whole?: string[]
+      ownSpelling?: string[]
+    }>([
+      { when: 'everything answers', answers: {}, found: ALL },
+      {
+        when: 'a directory is not there by its real path: the short name is asked',
+        answers: { 'readdirSync ~/proj': 'ENOENT' },
+        found: ALL,
+      },
+      {
+        when: 'a directory is too long to name by its real path: likewise',
+        answers: { 'readdirSync ~/proj': 'ENAMETOOLONG' },
+        found: ALL,
+      },
+      ...['EMFILE', 'ENOTDIR'].map(code => ({
+        when: `a listing answers ${code} by the real path: denied whole, and what the short name lists is added`,
+        answers: { 'readdirSync ~/proj': code },
+        found: ALL,
+        whole: ['~/proj'],
+      })),
+      {
+        when: 'it fails and the short name leads to an empty directory by now: denied whole',
+        answers: {
+          'readdirSync ~/proj': 'EACCES',
+          'readdirSync h/proj': '=empty',
+        },
+        found: BUT_PROJ,
+        whole: ['~/proj'],
+      },
+      ...[
+        ['EACCES', 'ENOENT'],
+        ['ENOENT', 'EACCES'],
+        ['ENAMETOOLONG', 'ENOENT'],
+      ].map(([real, short]) => ({
+        when: `a listing answers ${real} by the real path and ${short} by the short name: denied whole`,
+        answers: { 'readdirSync ~/proj': real!, 'readdirSync h/proj': short! },
+        found: BUT_PROJ,
+        whole: ['~/proj'],
+      })),
+      {
+        when: 'a directory is not there under either name: nothing is denied',
+        answers: {
+          'readdirSync ~/proj': 'ENOENT',
+          'readdirSync h/proj': 'ENOENT',
+        },
+        found: BUT_PROJ,
+      },
+      ...['statSync', 'realpathSync'].flatMap(call => [
+        {
+          when: `${call} of a link passed through says ENOENT by the real path: followed by the short name`,
+          answers: { [`${call} ~/vendor`]: 'ENOENT' },
+          found: ALL,
+        },
+        {
+          when: `${call} of a link passed through fails by the real path: followed by the short name`,
+          answers: { [`${call} ~/vendor`]: 'EIO' },
+          found: ALL,
+          ownSpelling: ['h/vendor'],
+        },
+      ]),
+      ...['ENOENT', 'ENOTDIR'].map(code => ({
+        when: `a link that matches answers ${code}, an absence, by its real path: the short name is asked`,
+        answers: { 'statSync ~/cfg/.env': code },
+        found: ALL,
+      })),
+      ...[
+        ['EACCES', 'ENOENT'],
+        ['ENOENT', 'EACCES'],
+      ].map(([real, short]) => ({
+        when: `a link that matches answers ${real} by the real path and ${short} by the short name: covered as spelled`,
+        answers: {
+          'statSync ~/cfg/.env': real!,
+          'statSync h/cfg/.env': short!,
+        },
+        found: LINK_AS_SPELLED,
+        ownSpelling: ['h/cfg/.env'],
+      })),
+      {
+        when: 'a link that matches fails by the real path and leads elsewhere by the short name: covered as spelled',
+        answers: {
+          'statSync ~/cfg/.env': 'EACCES',
+          'statSync h/cfg/.env': '=store/decoy',
+          'realpathSync h/cfg/.env': '=store/decoy',
+        },
+        found: LINK_AS_SPELLED,
+        ownSpelling: ['h/cfg/.env'],
+      },
+      {
+        when: 'a link that matches leads nowhere under either name: it has no location',
+        answers: {
+          'statSync ~/cfg/.env': 'ENOENT',
+          'statSync h/cfg/.env': 'ENOENT',
+        },
+        found: LINK_AS_SPELLED,
+      },
+    ])('$when', ({ answers, found, whole = [], ownSpelling = [] }) => {
+      expect(walkWhile(answers)).toEqual({
+        found: found.map(at).sort(),
+        whole: whole.map(at),
+        ownSpelling: ownSpelling.map(at),
+      })
+    })
+
+    it('hands the next pattern what the short name listed, the directory being denied whole already', () => {
+      const listings: GlobWalkListings = new Map()
+      const answers = { 'readdirSync ~/proj': 'EMFILE' }
+      expect(walkWhile(answers, listings).whole).toEqual([at('~/proj')])
+      // Handed the failure, it would not find what proj links out to.
+      expect(walkWhile(answers, listings)).toEqual({
+        found: ALL.map(at).sort(),
+        whole: [],
+        ownSpelling: [],
+      })
+    })
+
+    it('follows a link whose real path the runtime does not resolve', () => {
+      // Nothing is made to fail here: Bun's realpathSync answers ENOENT for a
+      // path with a backslash in it, and takes the same link by another name.
+      mkdirSync(at('proj/back\\slash'), { recursive: true })
+      symlinkSync(at('store/vendor'), at('proj/back\\slash/certs'))
+      symlinkSync(at('proj/back\\slash'), at('zz'))
+
+      const walk = walkGlobPattern(join(at('zz'), '**/.env'), {
+        followSymlinkedDirectories: true,
+      })
+
+      expect(walk.matches).toEqual([at('store/vendor/.env')])
+    })
+  })
+
+  it('names the pattern that is no regular expression', () => {
+    const walk = (): unknown => walkGlobPattern('/tmp/certs/[z-a]*.pem')
+    expect(walk).toThrow(SyntaxError)
+    expect(walk).toThrow(
+      /^Glob pattern \S*\/certs\/\[z-a\]\*\.pem does not compile/,
+    )
+  })
+})
+
+// ============================================================================
+// Listings that give no types
+// ============================================================================
+
+describe.if(!isWindows)('a walk over listings that give no types', () => {
+  let root: string
+  let data: string
+  const QUESTIONS = ['lstatSync', 'statSync', 'realpathSync'] as const
+  type Failing = Partial<Record<(typeof QUESTIONS)[number], string>>
+
+  beforeAll(() => {
+    root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-untyped-')))
+    data = join(root, 'data')
+    mkdirSync(join(data, 'x', 'deep'), { recursive: true })
+    mkdirSync(join(root, 'outside'))
+    for (const dir of [data, join(data, 'x'), join(data, 'x', 'deep')]) {
+      writeFileSync(join(dir, '.env'), '')
+    }
+    writeFileSync(join(root, 'outside', '.env'), '')
+    writeFileSync(join(data, 'note.txt'), '')
+    symlinkSync(join(root, 'outside'), join(data, 'x', 'link'))
+    symlinkSync('round', join(data, 'x', 'round'))
+  })
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  /**
+   * Has `root` listed the way some file systems list: names, and no types
+   * (unless `typed`). The calls in `failing` fail beneath it, with that code.
+   * `asked` is every call made beneath it, as `<call> <path from root>`, but
+   * for those about a pattern's own spelling.
+   */
+  function mounted(failing: Failing = {}, typed = false) {
+    const asked: string[] = []
+    const beneathRoot = (call: string, p: unknown): boolean => {
+      if (!String(p).startsWith(root + '/') || String(p).includes('*')) {
+        return false
+      }
+      asked.push(`${call} ${String(p).slice(root.length + 1)}`)
+      return true
+    }
+    const no = (): boolean => false
+    const readdirSync = fs.readdirSync
+    const spies = [
+      spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        const entries = readdirSync(...args)
+        if (!beneathRoot('readdirSync', args[0]) || typed) return entries
+        return entries.map(({ name }) => ({
+          name,
+          isFile: no,
+          isDirectory: no,
+          isSymbolicLink: no,
+          isFIFO: no,
+          isSocket: no,
+          isCharacterDevice: no,
+          isBlockDevice: no,
+        })) as typeof entries
+      }) as typeof fs.readdirSync),
+      ...QUESTIONS.map(question => {
+        const real = fs[question] as (...args: unknown[]) => unknown
+        return spyOn(fs, question).mockImplementation(((...args: unknown[]) => {
+          const code = failing[question]
+          if (beneathRoot(question, args[0]) && code !== undefined) {
+            throw Object.assign(new Error(code), { code })
+          }
+          return real(...args)
+        }) as never)
+      }),
+    ]
+    return { asked, restore: () => spies.forEach(spy => spy.mockRestore()) }
+  }
+
+  /** The read-deny walk of each pattern beneath `data`, on such a mount. */
+  function walked(
+    patterns: string[],
+    failing?: Failing,
+    listings?: GlobWalkListings,
+  ) {
+    const mount = mounted(failing)
+    try {
+      const walks = patterns.map(pattern =>
+        walkGlobPattern(join(data, pattern), {
+          withDirectoryForm: true,
+          followSymlinkedDirectories: true,
+          listings,
+        }),
+      )
+      return { walks, asked: mount.asked }
+    } finally {
+      mount.restore()
+    }
+  }
+  const everyEntry = [
+    'data/.env',
+    'data/note.txt',
+    'data/x',
+    'data/x/.env',
+    'data/x/deep',
+    'data/x/deep/.env',
+    'data/x/link',
+    'data/x/round',
+    'outside/.env',
+  ]
+  const lstatsIn = (asked: string[]): string[] =>
+    asked.flatMap(call => call.match(/^lstatSync (.*)/s)?.[1] ?? []).sort()
+
+  it('asks nothing about an entry that was listed with its type', () => {
+    const mount = mounted({}, true)
+    try {
+      expect(walkGlobPattern(join(data, '**/.env')).matches).toHaveLength(3)
+    } finally {
+      mount.restore()
+    }
+    expect(mount.asked.filter(call => /^l?statSync /.test(call))).toEqual([])
+  })
+
+  // With lstat failing, `x` and `deep` are directories and `.env` a file by
+  // stat; `link` is a link because it leads elsewhere, `round` by its ELOOP.
+  for (const [how, failing] of [
+    ['by lstat', {}],
+    ['by where each entry leads, when lstat fails', { lstatSync: 'EIO' }],
+  ] as const) {
+    it(`finds what it finds where types are given, ${how}`, () => {
+      const typed = walkGlobPattern(join(data, '**/.env'), {
+        withDirectoryForm: true,
+        followSymlinkedDirectories: true,
+      })
+      const { walks, asked } = walked(['**/.env'], failing)
+
+      expect(walks).toEqual([typed])
+      expect(typed.matches.sort()).toEqual([
+        join(data, '.env'),
+        join(data, 'x', '.env'),
+        join(data, 'x', 'deep', '.env'),
+        join(root, 'outside', '.env'),
+      ])
+      expect([...typed.symlinks].sort()).toEqual([
+        join(data, 'x', 'link'),
+        join(data, 'x', 'round'),
+      ])
+      expect(typed.unlisted).toEqual([])
+      expect(lstatsIn(asked)).toEqual(everyEntry)
+    })
+  }
+
+  it('asks once for all the patterns handed the same listings', () => {
+    const patterns = ['**/.env', '**/*.txt', '**/deep/**']
+    const alone = walked(patterns)
+    const together = walked(patterns, {}, new Map())
+
+    expect(together.walks).toEqual(alone.walks)
+    expect(lstatsIn(together.asked)).toEqual(everyEntry)
+    expect(lstatsIn(alone.asked)).toHaveLength(3 * everyEntry.length)
+  })
+
+  it('matches an entry that is gone since it was listed by its name alone', () => {
+    const { walks, asked } = walked(['**/.env', '**/x/**'], {
+      lstatSync: 'ENOENT',
+      statSync: 'ENOENT',
+    })
+
+    expect(walks.map(walk => walk.matches)).toEqual([[join(data, '.env')], []])
+    for (const walk of walks) {
+      expect(walk.unlisted).toEqual([])
+      expect(walk.directoryMatches).toEqual([])
+    }
+    expect(asked).not.toContain('readdirSync data/x')
+  })
+
+  it.each([
+    ['statSync', 'ESTALE'],
+    ['realpathSync', 'EACCES'],
+  ])(
+    'leaves an entry it can learn nothing about to be denied whole (%s: %s)',
+    (call, code) => {
+      const { walks, asked } = walked(
+        ['**/.env', '**/*.pem', '*.env'],
+        { lstatSync: 'EIO', [call]: code },
+        new Map(),
+      )
+
+      // Any of them may be a directory with a match beneath it.
+      const entries = ['.env', 'note.txt', 'x']
+      expect(walks[0]!.matches).toEqual([join(data, '.env')])
+      for (const walk of walks.slice(0, 2)) {
+        expect(walk.unlisted.sort()).toEqual(entries.map(e => join(data, e)))
+      }
+      // Not for a pattern that matches nothing beneath it.
+      expect(walks[2]!.unlisted).toEqual([])
+      expect(asked).not.toContain('readdirSync data/x')
+      expect(lstatsIn(asked)).toEqual(entries.map(e => `data/${e}`))
+    },
+  )
+
+  it('says where such an entry really is beneath a symlinked base', () => {
+    const alias = join(root, 'alias')
+    symlinkSync(data, alias)
+    const mount = mounted({ lstatSync: 'EIO', statSync: 'ESTALE' })
+    try {
+      const walk = walkGlobPattern(join(alias, '**/.env'))
+      expect(walk.unlisted).toContain(join(alias, 'x'))
+      expect(walk.realOf.get(join(alias, 'x'))).toBe(join(data, 'x'))
+    } finally {
+      mount.restore()
+      rmSync(alias)
+    }
+  })
+
+  it.if(isLinux)('denies what it finds for a configuration', async () => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: {
+        denyRead: ['**/.env', '**/*.pem', '**/*.key'].map(p => join(data, p)),
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+    const found = [
+      join(data, '.env'),
+      join(data, 'x', '.env'),
+      join(data, 'x', 'deep', '.env'),
+      join(root, 'outside', '.env'),
+    ]
+    let mount = mounted()
+    try {
+      expect(SandboxManager.getFsReadConfig().denyOnly.sort()).toEqual(found)
+      // Once for the three rules together.
+      expect(lstatsIn(mount.asked.splice(0))).toEqual(everyEntry)
+      const wrapped = await SandboxManager.wrapWithSandbox('true')
+      expect(lstatsIn(mount.asked)).toEqual(everyEntry)
+      for (const file of found) {
+        expect(wrapped).toContain(`--ro-bind /dev/null ${file}`)
+      }
+
+      mount.restore()
+      mount = mounted({ lstatSync: 'EIO', statSync: 'ESTALE' })
+      const unknown = ['.env', 'note.txt', 'x'].map(name => join(data, name))
+      const readConfig = SandboxManager.getFsReadConfig()
+      expect(readConfig.denyOnly.sort()).toEqual(unknown)
+      expect(readConfig.unlistableDenyDirs?.sort()).toEqual(unknown)
+    } finally {
+      mount.restore()
+      await SandboxManager.reset()
     }
   })
 })
@@ -1499,9 +2298,10 @@ function setContains(set: string, char: string): boolean {
 /**
  * The documented glob syntax matched directly, by backtracking rather than
  * by compiling a regex: `*` and `?` stop at a separator, `**` crosses them,
- * `**\/` is zero or more directories, `[…]` is one character from the set.
- * Shares nothing with {@link globToRegex}, so the property below is two
- * implementations checking each other.
+ * `**\/` is zero or more directories, `[…]` is one character from the set
+ * and `[!…]` / `[^…]` one outside it, never a separator. Shares nothing with
+ * {@link globToRegex}, so the property below is two implementations checking
+ * each other.
  */
 function referenceGlobMatch(pattern: string, pathText: string): boolean {
   if (pattern === '') return pathText === ''
@@ -1537,11 +2337,16 @@ function referenceGlobMatch(pattern: string, pathText: string): boolean {
     )
   }
   if (head === '[') {
-    const close = pattern.indexOf(']')
-    if (close > 1) {
+    const negated = pattern[1] === '!' || pattern[1] === '^'
+    const members = negated ? 2 : 1
+    const close = pattern.indexOf(']', members)
+    if (close > members) {
+      const char = pathText[0]
+      const holds =
+        char !== undefined && setContains(pattern.slice(members, close), char)
       return (
-        pathText.length > 0 &&
-        setContains(pattern.slice(1, close), pathText[0]!) &&
+        char !== undefined &&
+        (negated ? !holds && char !== '/' : holds) &&
         referenceGlobMatch(pattern.slice(close + 1), pathText.slice(1))
       )
     }
@@ -1551,6 +2356,37 @@ function referenceGlobMatch(pattern: string, pathText: string): boolean {
     pathText[0] === head &&
     referenceGlobMatch(pattern.slice(1), pathText.slice(1))
   )
+}
+
+/** The bodies of the bracket sets of a compiled regex. Outside a set a
+ *  backslash takes the next character with it; a set runs from a `[` to the
+ *  first `]` after it, none being written inside one. */
+function compiledSets(regex: string): string[] {
+  const sets: string[] = []
+  for (let i = 0; i < regex.length; i++) {
+    if (regex[i] === '\\') i++
+    else if (regex[i] === '[') {
+      const close = regex.indexOf(']', i + 1)
+      sets.push(regex.slice(i + 1, close))
+      i = close
+    }
+  }
+  return sets
+}
+
+/**
+ * Whether a compiled set is written the way a JavaScript regular expression
+ * and the regex engine of a macOS sandbox profile read alike:
+ *
+ * - a `-` that is a member comes first, after the `^` of a negated set, and
+ *   is never all the set holds;
+ * - every other `-` is the middle of a range with no `-` at either end;
+ * - a backslash, a member to that engine, is written only doubled, as that
+ *   member.
+ */
+function readsAlikeInBothEngines(set: string): boolean {
+  const one = String.raw`(?:\\\\|[^\\\]-])`
+  return new RegExp(`^\\^?-?(?:${one}(?:-${one})?)+$`).test(set)
 }
 
 describe('globToRegex (shared)', () => {
@@ -1599,19 +2435,211 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(letters).test('/tmp/test/1bc.txt')).toBe(false)
   })
 
-  it('never negates a bracket set: ^ and ! are members of it', () => {
+  it('negates a bracket set written with ^ or !', () => {
     // Both spellings used for negation elsewhere (regex `^`, gitignore `!`)
-    // land in the set as ordinary characters, so such a pattern matches
-    // fewer names than its author meant, not more.
+    // negate the set rather than joining it as ordinary characters.
     const caret = globToRegex('/tmp/test/file[^0-9].txt')
-    expect(new RegExp(caret).test('/tmp/test/file^.txt')).toBe(true)
-    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(true)
-    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(true)
+    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(false)
 
     const bang = globToRegex('/tmp/test/file[!0-9].txt')
-    expect(new RegExp(bang).test('/tmp/test/file!.txt')).toBe(true)
-    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(true)
-    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(true)
+    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(false)
+
+    // The character that negates the set is not also a member of it.
+    expect(new RegExp(globToRegex('/tmp/[^^]')).test('/tmp/^')).toBe(false)
+    expect(new RegExp(globToRegex('/tmp/[!!]')).test('/tmp/!')).toBe(false)
+  })
+
+  it('keeps a negated bracket set within one path component', () => {
+    // A negated set is one character of a name, never the separator.
+    const regex = globToRegex('/tmp/test[!x]file')
+    expect(new RegExp(regex).test('/tmp/test-file')).toBe(true)
+    expect(new RegExp(regex).test('/tmp/test/file')).toBe(false)
+
+    // A leading `-` is that character, not a range from the excluded `/`.
+    const dash = globToRegex('/tmp/test/[!-a]')
+    expect(new RegExp(dash).test('/tmp/test/b')).toBe(true)
+    expect(new RegExp(dash).test('/tmp/test/-')).toBe(false)
+    expect(new RegExp(dash).test('/tmp/test/a')).toBe(false)
+  })
+
+  it('reads each member as itself, and a `-` wherever it stands for itself', () => {
+    // What each set holds: a `-` first, last or straight after a range is
+    // itself; between two characters it makes a range, and either may be `-`.
+    const sets: [body: string, holds: string][] = [
+      ['$', '$'],
+      ['a-c.', 'abc.'],
+      ['.^$+{}()|', '.^$+{}()|'],
+      ['+-0', '+,-./0'],
+      ['\\', '\\'],
+      ['[.', '[.'],
+      ['-', '-'],
+      ['a-', 'a-'],
+      ['-a', '-a'],
+      ['ab-', 'ab-'],
+      ['-a-', '-a'],
+      ['--', '-'],
+      ['---', '-'],
+      ['a-c-', 'abc-'],
+      ['-a-c', '-abc'],
+      ['a-c-e', 'abc-e'],
+      ['a-c--', 'abc-'],
+      ['--0', '-./0'],
+      ['--.', '-.'],
+      ['+--', '+,-'],
+      [',--', ',-'],
+      ['a-c--0', 'abc-./0'],
+      ['--0-', '-./0'],
+      ['-.', '-.'],
+      ['.-', '.-'],
+      ['$-', '$-'],
+      ['-^', '-^'],
+      ['\\-', '\\-'],
+      ['-\\', '-\\'],
+      ['[-', '[-'],
+    ]
+    const printable = Array.from({ length: 95 }, (_, i) =>
+      String.fromCharCode(32 + i),
+    )
+    for (const [body, holds] of sets) {
+      const inside = new RegExp(globToRegex(`/d/[${body}]`))
+      const outside = [
+        new RegExp(globToRegex(`/d/[!${body}]`)),
+        new RegExp(globToRegex(`/d/[^${body}]`)),
+      ]
+      for (const char of printable) {
+        const held = holds.includes(char)
+        expect([body, char, inside.test(`/d/${char}`)]).toEqual([
+          body,
+          char,
+          held,
+        ])
+        for (const regex of outside) {
+          expect([body, char, regex.test(`/d/${char}`)]).toEqual([
+            body,
+            char,
+            !held && char !== '/',
+          ])
+        }
+      }
+      // One character of one name, never none and never two.
+      expect(inside.test('/d/')).toBe(false)
+      expect(inside.test(`/d/${holds[0]}${holds[0]}`)).toBe(false)
+    }
+
+    // `]` is never a member, so these open no set and are their own text.
+    for (const text of ['/d/[]-]', '/d/[!]-]', '/d/[^]-]']) {
+      const regex = new RegExp(globToRegex(text))
+      expect(regex.test(text)).toBe(true)
+      expect(regex.test('/d/-')).toBe(false)
+      expect(regex.test('/d/]')).toBe(false)
+    }
+
+    // A range written backwards is no regular expression, `-` at an end or not.
+    for (const body of ['c-a', 'a--', '--+', '.--', '-a--', 'a-c--+']) {
+      expect(() => new RegExp(globToRegex(`/d/[${body}]`))).toThrow()
+      expect(() => new RegExp(globToRegex(`/d/[!${body}]`))).toThrow()
+    }
+  })
+
+  it('writes that `-` first in its set and escapes no member but a backslash', () => {
+    // The regex engine of a macOS sandbox profile reads `[^/\-a]` as a range
+    // and refuses `[a-]`; first in the set a `-` is the character to it too.
+    expect(globToRegex('/d/[!-a]')).toBe('^/d/[^-/a]$')
+    expect(globToRegex('/d/[^-a]')).toBe('^/d/[^-/a]$')
+    expect(globToRegex('/d/[!-.]')).toBe('^/d/[^-/.]$')
+    expect(globToRegex('/d/[!-a-c]')).toBe('^/d/[^-/a-c]$')
+    expect(globToRegex('/d/[!a-]')).toBe('^/d/[^-/a]$')
+    expect(globToRegex('/d/[!-]')).toBe('^/d/[^-/]$')
+    expect(globToRegex('/d/[-a]')).toBe('^/d/[-a]$')
+    expect(globToRegex('/d/[a-]')).toBe('^/d/[-a]$')
+    expect(globToRegex('/d/[ab-]')).toBe('^/d/[-ab]$')
+    expect(globToRegex('/d/[a-c-]')).toBe('^/d/[-a-c]$')
+    expect(globToRegex('/d/[-a-c]')).toBe('^/d/[-a-c]$')
+    expect(globToRegex('/d/[a-c-e]')).toBe('^/d/[-a-ce]$')
+    expect(globToRegex('/d/[-a-]')).toBe('^/d/[-a]$')
+    // A set of nothing else is the character, and needs no set.
+    expect(globToRegex('/d/[-]')).toBe('^/d/-$')
+
+    // A range that starts or ends at a `-` is that `-` and the rest of it.
+    expect(globToRegex('/d/[--0]')).toBe('^/d/[-.-0]$')
+    expect(globToRegex('/d/[!--0]')).toBe('^/d/[^-/.-0]$')
+    expect(globToRegex('/d/[--.]')).toBe('^/d/[-.]$')
+    expect(globToRegex('/d/[+--]')).toBe('^/d/[-+-,]$')
+    expect(globToRegex('/d/[!+--]')).toBe('^/d/[^-/+-,]$')
+    expect(globToRegex('/d/[,--]')).toBe('^/d/[-,]$')
+
+    // A backslash is the one member not written as it is: before another
+    // character it would be one more member to that engine.
+    expect(globToRegex('/d/[\\-]')).toBe('^/d/[-\\\\]$')
+    expect(globToRegex('/d/[!\\]')).toBe('^/d/[^/\\\\]$')
+    expect(globToRegex('/d/[a-c]')).toBe('^/d/[a-c]$')
+    expect(globToRegex('/d/[!a-c.]')).toBe('^/d/[^/a-c.]$')
+    expect(globToRegex('/d/[!$]')).toBe('^/d/[^/$]$')
+    expect(globToRegex('/d/[+-9]')).toBe('^/d/[+-9]$')
+    expect(globToRegex('/d/[.^$+{}()|]')).toBe('^/d/[.^$+{}()|]$')
+
+    // A set that holds a wildcard is not read as one, and keeps its `-` first.
+    expect(globToRegex('/d/[!-*]')).toBe('^/d/[^-/[^/]*]$')
+  })
+
+  it('writes every set the way both regex engines read alike', () => {
+    expect(compiledSets('^/d/[^-/a]x\\[y[b-c]$')).toEqual(['^-/a', 'b-c'])
+    for (const bad of [
+      'a-',
+      '^/a-',
+      'ab-',
+      '^/\\-a',
+      'a\\-',
+      '-',
+      '--0',
+      '^/\\$',
+      '^/a-c\\.',
+      '\\+-9',
+    ]) {
+      expect([bad, readsAlikeInBothEngines(bad)]).toEqual([bad, false])
+    }
+    for (const good of [
+      '-a',
+      '^-/a',
+      '^-/.-0',
+      '-a-c',
+      '^/a-c.',
+      '-\\\\',
+      '^/$',
+      '+-9',
+      '^/\\\\',
+    ]) {
+      expect([good, readsAlikeInBothEngines(good)]).toEqual([good, true])
+    }
+
+    // Every set body of up to four of these, in each of the three spellings,
+    // except one that is no regular expression (a range written backwards).
+    const alphabet = ['-', 'a', 'c', '.', '0', '+', ',', '\\', '^', '$']
+    const misread: string[] = []
+    let bodies = ['']
+    let compiled = 0
+    for (let length = 1; length <= 4; length++) {
+      bodies = bodies.flatMap(body => alphabet.map(char => body + char))
+      for (const body of bodies) {
+        for (const lead of ['', '!', '^']) {
+          const glob = `/d/[${lead}${body}]x`
+          const regex = globToRegex(glob)
+          try {
+            new RegExp(regex)
+          } catch {
+            continue
+          }
+          compiled++
+          if (!compiledSets(regex).every(readsAlikeInBothEngines)) {
+            misread.push(`${glob} compiles to ${regex}`)
+          }
+        }
+      }
+    }
+    expect(compiled).toBeGreaterThan(30000)
+    expect(misread.slice(0, 10)).toEqual([])
   })
 
   it('treats a bracket that opens no set as a literal character', () => {
@@ -1619,34 +2647,49 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(unclosed).test('/tmp/test/file[abc.txt')).toBe(true)
     expect(new RegExp(unclosed).test('/tmp/test/filea.txt')).toBe(false)
 
+    // Every one of them, not only the first.
+    const twice = globToRegex('/tmp/test/file[a[b.txt')
+    expect(new RegExp(twice).test('/tmp/test/file[a[b.txt')).toBe(true)
+
+    // A set needs a member, so `[]` is two characters of the path.
+    const empty = globToRegex('/tmp/test/file[]a.txt')
+    expect(new RegExp(empty).test('/tmp/test/file[]a.txt')).toBe(true)
+
     const stray = globToRegex('/tmp/test/file]a.txt')
     expect(new RegExp(stray).test('/tmp/test/file]a.txt')).toBe(true)
     expect(new RegExp(stray).test('/tmp/test/filea.txt')).toBe(false)
   })
 
-  it.failing(
-    'keeps a component spelled like a globstar placeholder literal',
-    () => {
-      // globToRegex parks `**` under __GLOBSTAR__ / __GLOBSTAR_SLASH__ while
-      // it rewrites `*` and `?`, then restores them by name, so a directory
-      // actually called __GLOBSTAR__ comes back as a wildcard.
-      const parked = globToRegex('/tmp/__GLOBSTAR__/x')
-      expect(new RegExp(parked).test('/tmp/__GLOBSTAR__/x')).toBe(true)
-      expect(new RegExp(parked).test('/tmp/anything/x')).toBe(false)
+  it('keeps a component spelled like a globstar placeholder literal', () => {
+    // A rewrite that parks `**` under a marker and restores it by name
+    // turns a directory actually called __GLOBSTAR__ into a wildcard.
+    const parked = globToRegex('/tmp/__GLOBSTAR__/x')
+    expect(new RegExp(parked).test('/tmp/__GLOBSTAR__/x')).toBe(true)
+    expect(new RegExp(parked).test('/tmp/anything/x')).toBe(false)
 
-      const parkedSlash = globToRegex('/tmp/__GLOBSTAR_SLASH__x')
-      expect(new RegExp(parkedSlash).test('/tmp/__GLOBSTAR_SLASH__x')).toBe(
-        true,
-      )
-    },
-  )
+    const parkedSlash = globToRegex('/tmp/__GLOBSTAR_SLASH__x')
+    expect(new RegExp(parkedSlash).test('/tmp/__GLOBSTAR_SLASH__x')).toBe(true)
+  })
 
   it('agrees with a reference matcher over generated patterns and paths', () => {
     // Segments are drawn from the documented syntax only; the corners the
-    // cases above pin (an unclosed bracket, a stray `]`, a negated set, a
-    // literal placeholder) are left out so a disagreement here means the
-    // documented syntax itself diverged.
+    // cases above pin (an unclosed bracket, a stray `]`, a set with no
+    // members) are left out so a disagreement here means the documented
+    // syntax itself diverged. A `-` is drawn in every place a set can hold
+    // one and, in `[]-]` and `[!]-]`, where it only looks like it.
     const segment = fc.constantFrom(
+      '[!-a]',
+      '[!-.]',
+      '[a-]',
+      '[!a-]',
+      '[--0]',
+      '[!--0]',
+      '[+--]',
+      '[-]',
+      '[a-c-]',
+      '[-a-c]',
+      '[]-]',
+      '[!]-]',
       'a',
       'bc',
       'a*',
@@ -1657,21 +2700,49 @@ describe('globToRegex (shared)', () => {
       '[ab]',
       '[0-9]',
       '[a-c]c',
+      '[!ab]',
+      '[^0-9]',
+      '[!a-c]c',
+      '__GLOBSTAR__',
+      '__GLOBSTAR_SLASH__b',
       '**',
     )
     const pattern = fc
       .array(segment, { minLength: 1, maxLength: 4 })
       .map(parts => '/' + parts.join('/'))
     const pathText = fc
-      .array(fc.constantFrom('a', 'b', 'c', 'bc', 'a1', 'abc', '0', 'ab'), {
-        minLength: 1,
-        maxLength: 4,
-      })
+      .array(
+        fc.constantFrom(
+          'a',
+          'b',
+          'c',
+          'bc',
+          'a1',
+          'abc',
+          '0',
+          'ab',
+          '-',
+          '.',
+          ',',
+          '+',
+          '[]-]',
+          '[!]-]',
+          '__GLOBSTAR__',
+          '__GLOBSTAR_SLASH__b',
+        ),
+        { minLength: 1, maxLength: 4 },
+      )
       .map(parts => '/' + parts.join('/'))
     fc.assert(
       fc.property(pattern, pathText, (p, f) => {
         return new RegExp(globToRegex(p)).test(f) === referenceGlobMatch(p, f)
       }),
+      { numRuns: 200 },
+    )
+    fc.assert(
+      fc.property(pattern, p =>
+        compiledSets(globToRegex(p)).every(readsAlikeInBothEngines),
+      ),
       { numRuns: 200 },
     )
   })
@@ -1680,6 +2751,11 @@ describe('globToRegex (shared)', () => {
 // ============================================================================
 // Tests for getFsReadConfig with glob expansion on Linux
 // ============================================================================
+
+// A wrap that names mount points names a manifest of its own for them, so two
+// wraps by one policy differ in that name and in nothing else.
+const withoutManifestName = (wrapped: string): string =>
+  wrapped.replace(/(srt-mount-points\/)\d+-[0-9a-f]{16}/g, '$1MANIFEST')
 
 describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
   const RAW_BASE_DIR = join(tmpdir(), 'fsread-glob-test-' + Date.now())
@@ -2047,7 +3123,9 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
         const disturbed = await SandboxManager.wrapWithSandbox('true')
         readdirSpy.mockRestore()
 
-        expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+        expect(withoutManifestName(disturbed)).toBe(
+          withoutManifestName(await SandboxManager.wrapWithSandbox('true')),
+        )
         expect(disturbed).toContain(join(root, 'to'))
         expect(disturbed).not.toContain(join(root, 'from'))
         expect(listed.length).toBe(at + 7)
@@ -2088,7 +3166,9 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
       const disturbed = await SandboxManager.wrapWithSandbox('true')
 
       expect(fs.readFileSync(scans, 'utf8')).toBe('ran\nran\n')
-      expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+      expect(withoutManifestName(disturbed)).toBe(
+        withoutManifestName(await SandboxManager.wrapWithSandbox('true')),
+      )
       expect(disturbed).toContain(join(root, 'to'))
       expect(disturbed).not.toContain(join(root, 'from'))
     } finally {
@@ -2302,6 +3382,209 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
 })
 
 // ============================================================================
+// Tests for wraps asked for while another one walks, on Linux
+// ============================================================================
+
+describe.if(isLinux)('wrapWithSandbox while another wrap walks', () => {
+  let SandboxManager: ISandboxManager
+  const cwd = process.cwd()
+  let root: string
+  /** The tree each listing was in: `a`, `b` or `c`, three listings each. */
+  let listed: string
+  /** Runs in each listing, with how many there have been and what it found. */
+  let inListing: (nth: number, entries: object) => void
+  let readdirSpy: { mockClear(): void; mockRestore(): void }
+
+  const configured = (denyRead: string[], allowWrite: string[]) => ({
+    network: { allowedDomains: [], deniedDomains: [] },
+    filesystem: {
+      denyRead: denyRead.map(pattern => join(root, pattern)),
+      allowWrite,
+      denyWrite: [],
+    },
+  })
+  /** A wrap that walks `tree`, whatever is configured. */
+  const wrapWalking = (tree: string, signal?: AbortSignal): Promise<string> =>
+    SandboxManager.wrapWithSandbox(
+      'true',
+      undefined,
+      { filesystem: configured([`${tree}/**/*.pem`], []).filesystem },
+      signal,
+    )
+
+  beforeEach(async () => {
+    ;({ SandboxManager } = await import('../../src/sandbox/sandbox-manager.js'))
+    root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-line-')))
+    for (const tree of ['a', 'b', 'c']) {
+      mkdirSync(join(root, tree, 'from'), { recursive: true })
+      mkdirSync(join(root, tree, 'to'))
+    }
+    listed = ''
+    inListing = () => {}
+    // Each listing takes longer than a turn.
+    const readdirSync = fs.readdirSync
+    readdirSpy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      const entries = readdirSync(...args)
+      if (String(args[0]).startsWith(root)) {
+        listed += String(args[0])[root.length + 1]
+        inListing(listed.length, entries)
+        const until = performance.now() + 15
+        while (performance.now() < until);
+      }
+      return entries
+    }) as typeof fs.readdirSync)
+    process.chdir(join(root, 'c', 'from'))
+    await SandboxManager.reset()
+    await SandboxManager.initialize(configured(['b/**/.env'], ['.', root]))
+  })
+
+  afterEach(async () => {
+    readdirSpy.mockRestore()
+    process.chdir(cwd)
+    await SandboxManager.reset()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('walks for one wrap at a time, in the order they were asked for', async () => {
+    await Promise.all(['a', 'b', 'c'].map(tree => wrapWalking(tree)))
+    expect(listed).toBe('aaabbbccc')
+  })
+
+  // Aborted before it is asked for, and while it waits.
+  it.each([0, 2])(
+    'gives up an aborted wrap before its place comes, and goes on to the next (aborted after %d listings)',
+    async at => {
+      const controller = new AbortController()
+      const reason = new Error('stopped')
+      inListing = nth => {
+        if (nth === at) controller.abort(reason)
+      }
+      inListing(0, [])
+      let listedWhenGivenUp = ''
+      const [, givenUp] = await Promise.all([
+        wrapWalking('a'),
+        wrapWalking('b', controller.signal).catch((e: unknown) => {
+          listedWhenGivenUp = listed
+          return e
+        }),
+        wrapWalking('c'),
+      ])
+      expect(givenUp).toBe(reason)
+      expect(listedWhenGivenUp.length).toBeLessThan(3)
+      expect(listed).toBe('aaaccc')
+    },
+  )
+
+  it('goes on to the next when the wrap that walks is aborted, and when it throws', async () => {
+    const controller = new AbortController()
+    inListing = nth => {
+      if (nth === 2) controller.abort(new Error('stopped'))
+    }
+    const outcomes = await Promise.allSettled([
+      wrapWalking('a', controller.signal),
+      // Neither a path nor a marked one.
+      SandboxManager.wrapWithSandbox('true', undefined, {
+        filesystem: { denyRead: [{} as never], allowWrite: [], denyWrite: [] },
+      }),
+      wrapWalking('b'),
+    ])
+    expect(outcomes.map(outcome => outcome.status)).toEqual([
+      'rejected',
+      'rejected',
+      'fulfilled',
+    ])
+    expect(listed).toBe('aabbb')
+  })
+
+  // What the host does in the second listing of `a`, with a wrap by the
+  // configuration waiting. That one has read nothing yet, so it walks `b` once;
+  // the wrap that was walking starts over, behind it.
+  it.each([
+    [
+      'the configuration installed',
+      () => {
+        writeFileSync(join(root, 'b', 'key.pem'), '')
+        SandboxManager.updateConfig(configured(['b/**/.env', 'b/**/*.pem'], []))
+      },
+      'b/key.pem',
+      'c/from',
+    ],
+    [
+      'the working directory the host moved to',
+      () => process.chdir(join(root, 'c', 'to')),
+      'c/to',
+      'c/from',
+    ],
+  ])('goes by %s while it waited', async (_, disturb, holds, lacks) => {
+    inListing = nth => {
+      if (nth === 2) disturb()
+    }
+    const [, waited] = await Promise.all([
+      wrapWalking('a'),
+      SandboxManager.wrapWithSandbox('true'),
+    ])
+    expect(listed).toBe('aabbbaaa')
+    expect(waited).toContain(join(root, holds))
+    expect(waited).not.toContain(join(root, lacks))
+    expect(withoutManifestName(waited)).toBe(
+      withoutManifestName(await SandboxManager.wrapWithSandbox('true')),
+    )
+  })
+
+  it('keeps the order through a reset()', async () => {
+    let reset: Promise<void> | undefined
+    inListing = nth => {
+      if (nth === 2) reset = SandboxManager.reset()
+    }
+    // Either may find the network bridge gone, as any wrap during a reset().
+    await Promise.allSettled([wrapWalking('a'), wrapWalking('b')])
+    await reset
+    expect(listed).toBe('aaabbb')
+  })
+
+  it('has walked, and let go of what it listed, before the mandatory denies are looked for', async () => {
+    // Stands in for ripgrep: says that it runs, and goes on until told.
+    const scans = join(root, 'scans')
+    const enough = join(root, 'enough')
+    const slowScan = join(root, 'slow-scan')
+    writeFileSync(
+      slowScan,
+      `#!/bin/sh\necho ran >> ${scans}\nfor i in $(seq 300); do [ -e ${enough} ] && exit; sleep 0.01; done\n`,
+      { mode: 0o755 },
+    )
+    writeFileSync(scans, '')
+    SandboxManager.updateConfig({
+      ...configured([], []),
+      ripgrep: { command: slowScan },
+    })
+    const listings: WeakRef<object>[] = []
+    inListing = (_, entries) => listings.push(new WeakRef(entries))
+
+    let wrapped = 0
+    const wrapping = Promise.all(
+      ['a', 'b'].map(tree => wrapWalking(tree).then(() => wrapped++)),
+    )
+    try {
+      while (fs.readFileSync(scans, 'utf8') !== 'ran\nran\n') await Bun.sleep(5)
+      // The second has walked while the first was scanning.
+      expect(wrapped).toBe(0)
+      readdirSpy.mockClear() // It keeps what each call returned.
+      Bun.gc(true)
+      // Not none: a collector that reads the stack can take a stale word for a
+      // reference. Held by the wraps, it would be all six.
+      expect(listings.filter(l => l.deref() !== undefined).length).toBeLessThan(
+        6,
+      )
+    } finally {
+      writeFileSync(enough, '')
+      await wrapping
+    }
+  })
+})
+
+// ============================================================================
 // Tests for getLinuxGlobPatternWarnings
 // ============================================================================
 
@@ -2387,6 +3670,75 @@ describe.if(isLinux)('getLinuxGlobPatternWarnings after fix', () => {
 
     await SandboxManager.reset()
   })
+
+  const initialized = async (
+    config: Pick<SandboxRuntimeConfig, 'filesystem' | 'credentials'>,
+  ) => {
+    const { SandboxManager } = await import(
+      '../../src/sandbox/sandbox-manager.js'
+    )
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: [], deniedDomains: [] },
+      ...config,
+    })
+    return SandboxManager
+  }
+
+  it('warns about such a pattern as the path of a credential file deny', async () => {
+    // It joins the read denies and is skipped like one of them.
+    const SandboxManager = await initialized({
+      filesystem: {
+        denyRead: ['/**/.netrc'],
+        allowWrite: ['/tmp/test/*.log'],
+        denyWrite: [],
+      },
+      credentials: {
+        files: [
+          { path: '/**/.netrc', mode: 'deny' },
+          { path: '/*/token', mode: 'deny' },
+          { path: '/tmp/test/*.key', mode: 'deny' },
+          // Always the name of one file.
+          { path: '/*/masked', mode: 'mask' },
+        ],
+      },
+    })
+
+    expect(SandboxManager.getLinuxGlobPatternWarnings()).toEqual([
+      '/tmp/test/*.log',
+      '/**/.netrc',
+      '/*/token',
+    ])
+
+    await SandboxManager.reset()
+  })
+
+  it.each(['denyRead', 'allowRead'] as const)(
+    'tells such a pattern from every other %s entry',
+    async list => {
+      const skipped = ['/**/.ssh/**', '/*/x', '/*', '/*/**', '/ho*/x']
+      const applied: FilesystemPathEntry[] = [
+        '**/.ssh/**', // starts at the working directory
+        '~/**/.env',
+        '/home/**/x',
+        '/home/x',
+        '/**', // `/`, once the trailing `/**` is dropped
+        { path: '/**/.ssh/**', literal: true },
+      ]
+      const SandboxManager = await initialized({
+        filesystem: {
+          denyRead: [],
+          allowWrite: [],
+          denyWrite: [],
+          [list]: [...applied, ...skipped],
+        },
+      })
+
+      expect(SandboxManager.getLinuxGlobPatternWarnings()).toEqual(skipped)
+
+      await SandboxManager.reset()
+    },
+  )
 })
 
 // ============================================================================

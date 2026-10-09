@@ -10,7 +10,7 @@
 
 import forge from 'node-forge'
 import { sign as cryptoSign, X509Certificate } from 'node:crypto'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -196,14 +196,11 @@ export function createMitmCA(opts: {
 
 /**
  * Remove the SRT-owned temp directories for this CA: the trust-bundle dir
- * always, and the cert/key dir too when SRT generated the CA (for an
- * ephemeral CA they are the same directory). User-supplied CA files are
- * left alone.
+ * always, and the cert/key dir, a directory of its own, too when SRT
+ * generated the CA. User-supplied CA files are left alone.
  */
 export async function disposeMitmCA(ca: MitmCA): Promise<void> {
-  const dirs = new Set([dirname(ca.trustBundlePath)])
-  if (ca.ephemeral) dirs.add(dirname(ca.certPath))
-  for (const dir of dirs) {
+  for (const dir of ownedDirs(ca)) {
     try {
       await rm(dir, { recursive: true, force: true })
     } catch (err) {
@@ -212,6 +209,29 @@ export async function disposeMitmCA(ca: MitmCA): Promise<void> {
       })
     }
   }
+}
+
+/**
+ * {@link disposeMitmCA} in one synchronous step, as a process 'exit' handler
+ * needs it: nothing awaited runs there. Harmless before, during or after the
+ * asynchronous one.
+ */
+export function disposeMitmCASync(ca: MitmCA): void {
+  for (const dir of ownedDirs(ca)) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch (err) {
+      logForDebugging(`[mitm-ca] cleanup failed: ${(err as Error).message}`, {
+        level: 'warn',
+      })
+    }
+  }
+}
+
+function ownedDirs(ca: MitmCA): Set<string> {
+  const dirs = new Set([dirname(ca.trustBundlePath)])
+  if (ca.ephemeral) dirs.add(dirname(ca.certPath))
+  return dirs
 }
 
 /**

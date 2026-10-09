@@ -33,10 +33,11 @@ import {
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
+  disposeMitmCASync,
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
-import { whichSync } from '../utils/which.js'
+import { isPathQualified, whichSync } from '../utils/which.js'
 import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
@@ -63,8 +64,15 @@ import {
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
   linuxGetCwdMandatoryDenyPaths,
+  LinuxSandboxProfileError,
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
+import {
+  describeUnavailableHostHelper,
+  findHostHelper,
+  hostSearchPath,
+  writableNamedHelperWarning,
+} from './host-helpers.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -96,12 +104,15 @@ import {
 import {
   getDefaultWritePaths,
   containsGlobChars,
+  globBaseDirIsRoot,
   globPatternBaseDir,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
+  GlobWalkBudgetError,
   walkGlobPatternSteps,
   workingDirectory,
   type GlobWalkListings,
+  newGlobWalkBudget,
   type Steps,
   finish,
   finishInTurns,
@@ -109,6 +120,7 @@ import {
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
+import { ownInstallWarning } from './own-files.js'
 import {
   SandboxViolationStore,
   sanitizeDenialReason,
@@ -163,6 +175,7 @@ let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
+let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
@@ -230,7 +243,26 @@ function registerCleanup(): void {
         level: 'error',
       })
     })
-  process.once('exit', cleanupHandler)
+  process.once('exit', () => {
+    void cleanupHandler()
+    // On 'exit' reset() gets as far as its first await, so what it takes out
+    // of the temp directory later than that goes here. After it, because on
+    // Windows it starts by revoking a grant on the trust-bundle directory.
+    // Only paths this process made and still holds: never a listing of the
+    // temp directory, never a path out of the configuration.
+    if (mitmCA) disposeMitmCASync(mitmCA)
+    muxProxyServer?.removeBackendSocketSync()
+    maskedFileStore.dispose()
+    // A bridge told to end removes its own socket, but not every time.
+    const bridge = managerContext?.linuxBridge
+    for (const path of [bridge?.httpSocketPath, bridge?.socksSocketPath]) {
+      try {
+        if (path) fs.rmSync(path, { force: true })
+      } catch {
+        // Best effort: an 'exit' handler must not throw.
+      }
+    }
+  })
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
   cleanupRegistered = true
@@ -805,6 +837,22 @@ async function initialize(
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
 ): Promise<void> {
+  try {
+    await initializeSteps(runtimeConfig, sandboxAskCallback, enableLogMonitor)
+  } catch (error) {
+    // Here, not at reset() or 'exit': a step can fail before the clean-up is
+    // registered, and the next call makes a CA of its own.
+    if (mitmCA) disposeMitmCASync(mitmCA)
+    mitmCA = undefined
+    throw error
+  }
+}
+
+async function initializeSteps(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  enableLogMonitor: boolean,
+): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
     await initializationPromise
@@ -1135,8 +1183,10 @@ async function initialize(
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
       // Async: the global-npm fallback spawns `npm root -g`.
       javaAgentJarPath =
-        (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
-        undefined
+        (await getJavaProxyAgentJarPathAsync(
+          config.javaAgentJarPath,
+          hostSearchPath(hostHelperWritePaths(), NPM_LOOKS_UP),
+        )) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1163,6 +1213,7 @@ async function initialize(
           httpProxyPort,
           socksProxyPort,
           config.socatPath,
+          hostHelperWritePaths(),
         )
       }
 
@@ -1204,6 +1255,21 @@ function isSandboxingEnabled(): boolean {
   return config !== undefined
 }
 
+/** What `npm root -g` looks up on PATH: npm, and the node that runs it. */
+const NPM_LOOKS_UP = ['npm', 'node'] as const
+
+/**
+ * What a wrap under the initialized configuration lets the sandboxed command
+ * write (see `findHostHelper`). `undefined` when no writes are restricted:
+ * the filesystem policy is off, or there is no configuration yet, and then
+ * `initialize()` runs the dependency check again once there is one.
+ */
+function hostHelperWritePaths(): string[] | undefined {
+  return !config || config.filesystem.disabled
+    ? undefined
+    : writeRootsOf(getFsWriteConfig())
+}
+
 /**
  * Platform-independent part of the dependency check. Returns either
  * a finished result (POSIX, unsupported platform, or a Windows
@@ -1228,14 +1294,34 @@ function checkDependenciesCommon(
     // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
     // profiles take regex patterns directly, so rg is never invoked there.
     const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
-    if (whichSync(rgToCheck.command) === null) {
-      errors.push(`ripgrep (${rgToCheck.command}) not found`)
+    const allowedWritePaths = hostHelperWritePaths()
+    const rgNotFound = `ripgrep (${rgToCheck.command}) not found`
+    if (isPathQualified(rgToCheck.command)) {
+      // Named outright: run as given, and warned about when writable.
+      if (whichSync(rgToCheck.command) === null) errors.push(rgNotFound)
+      const warning = writableNamedHelperWarning(
+        'ripgrep.command',
+        rgToCheck.command,
+        allowedWritePaths,
+      )
+      if (warning !== undefined) warnings.push(warning)
+    } else {
+      // A bare name is looked for the way the wrap will look for it.
+      const search = findHostHelper(rgToCheck.command, allowedWritePaths)
+      if (search.path === null) {
+        errors.push(
+          search.skipped.length > 0
+            ? describeUnavailableHostHelper(rgToCheck.command, search)
+            : rgNotFound,
+        )
+      }
     }
 
     const linuxDeps = checkLinuxDependencies({
       seccompConfig: config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
+      allowedWritePaths,
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
@@ -1253,6 +1339,16 @@ function checkDependenciesCommon(
           config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
         srtWin,
       },
+    }
+  }
+
+  // The library itself writable from inside the sandbox: see own-files.ts.
+  if (!config?.filesystem.disabled) {
+    try {
+      const ownInstall = ownInstallWarning(writeRootsOf(getFsWriteConfig()))
+      if (ownInstall !== undefined) warnings.push(ownInstall)
+    } catch {
+      // It only advises: whoever enforces a config says what is wrong with it.
     }
   }
 
@@ -1286,7 +1382,10 @@ async function checkDependenciesAsync(
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
   if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+    await getApplySeccompBinaryPathAsync(
+      config?.seccomp?.applyPath,
+      hostSearchPath(hostHelperWritePaths(), NPM_LOOKS_UP),
+    )
   }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
@@ -1403,7 +1502,8 @@ function getCredentialDenyReadPaths(
  * getter callers reach from permission checks and render paths. A mask entry
  * that degrades to a deny is a file and cannot cover a directory, so
  * leaving those out changes nothing. An entry with glob characters that is
- * also the name of a path counts as that name too.
+ * also the name of a path counts as that name too. The credential denies are
+ * judged apart, with no `allowRead`: they have no exceptions.
  */
 function defaultWritePathsUnder({
   denyRead,
@@ -1414,23 +1514,37 @@ function defaultWritePathsUnder({
   allowRead: readonly FilesystemPathEntry[] | undefined
   credentials: CredentialsConfig | undefined
 }): string[] {
-  return getDefaultWritePaths(
-    readRulesOf(denyRead, allowRead, getCredentialDenyReadPaths(credentials)),
+  const underCredentialDenies = getDefaultWritePaths(
+    readRulesOf([], undefined, getCredentialDenyReadPaths(credentials)),
+  )
+  return getDefaultWritePaths(readRulesOf(denyRead, allowRead, [])).filter(p =>
+    underCredentialDenies.includes(p),
   )
 }
 
 /**
- * Union the explicit `filesystem.denyRead` with credential-derived
- * deny paths. The single source of "what files does this config
- * want read-denied" — all platforms route through here so a new
- * credential kind that contributes deny paths reaches every
- * backend.
+ * The explicit `filesystem.denyRead` and the credential-derived deny paths,
+ * each through {@link resolveReadPathEntries}. The single source of "what
+ * files does this config want read-denied" on macOS and Linux, so a new
+ * credential kind that contributes deny paths reaches both. The credential
+ * ones are also returned apart, for the precedence the backends give them.
  */
-function unionDenyReadPaths(
-  denyRead: readonly string[],
+function* resolveReadDenies(
+  denyRead: readonly FilesystemPathEntry[] = [],
   credentialRestrictions: CredentialRestrictionConfig,
-): string[] {
-  return [...new Set([...denyRead, ...credentialRestrictions.denyReadPaths])]
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
+): Steps<Pick<FsReadRestrictionConfig, 'denyOnly' | 'credentialDenyOnly'>> {
+  const listed = yield* resolveReadPathEntries('deny', denyRead, expandGlob)
+  const credentialDenyOnly = yield* resolveReadPathEntries(
+    'deny',
+    credentialRestrictions.denyReadPaths,
+    expandGlob,
+    credentialRestrictions.degradeToDenyPaths,
+  )
+  return {
+    denyOnly: [...new Set([...listed, ...credentialDenyOnly])],
+    ...(credentialDenyOnly.length > 0 && { credentialDenyOnly }),
+  }
 }
 
 /**
@@ -1518,12 +1632,51 @@ function* expandAllowReadGlob(
 }
 
 /**
+ * The expansion of every denyRead glob of one read configuration, on Linux,
+ * all on one budget of `limits` (`filesystem.denyReadGlobBudget`) and listing
+ * each directory once between them, in `listings`, which a caller that goes
+ * on to other work hands in to empty it afterwards. When the budget runs out
+ * the returned function throws {@link LinuxSandboxProfileError}
+ * `deny_glob_too_large`.
+ */
+function readDenyGlobExpander(
+  reExposedPaths: readonly string[],
+  unlistableDenyDirs: Set<string>,
+  limits: SandboxRuntimeConfig['filesystem']['denyReadGlobBudget'],
+  listings: GlobWalkListings = new Map(),
+): (pattern: string, anchor?: string) => Steps<string[]> {
+  const budget = newGlobWalkBudget(limits)
+  return function* (pattern, anchor) {
+    try {
+      // Both: a walk beneath an anchor draws on the budget like any other.
+      return yield* expandReadDenyGlobLinuxSteps(
+        pattern,
+        reExposedPaths,
+        unlistableDenyDirs,
+        { anchor, budget, listings },
+      )
+    } catch (error) {
+      if (!(error instanceof GlobWalkBudgetError)) throw error
+      throw new LinuxSandboxProfileError(
+        'deny_glob_too_large',
+        `denyRead pattern "${pattern}" could not be expanded: the denyRead patterns of one configuration share ` +
+          `${error.maxEntries} directory entries and ${error.timeoutMs} ms, and the ${error.exhausted} ran out ` +
+          `with ${error.entries} entries looked at after ${error.elapsedMs} ms, while listing ${error.directory}; ` +
+          `narrow the pattern, remove or move what it walks into, or raise filesystem.denyReadGlobBudget`,
+        error,
+      )
+    }
+  }
+}
+
+/**
  * The read policy of the initialized config, for inspection and display.
  * On Linux, denyRead globs are collapsed to covering directory mounts against
  * this config's allowRead and {@link getFsWriteConfig}'s write roots, so
  * `denyOnly` is only sound alongside that write config and must not be handed
  * to wrapCommandWithSandboxLinux with a different one. Marked entries are
- * in the `literal…` lists, as spelled: pass the object on whole.
+ * in the `literal…` lists, as spelled: pass the object on whole. Throws
+ * {@link LinuxSandboxProfileError} `deny_glob_too_large` as the wrap does.
  */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
@@ -1551,27 +1704,20 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     getFsWriteConfig(),
   )
   const unlistableDenyDirs = new Set<string>()
-  const listings: GlobWalkListings = new Map()
   const denyPaths = finish(
-    resolveReadPathEntries(
-      'deny',
-      unionDenyReadPaths(
-        spelledOf(config.filesystem.denyRead),
-        credentialRestrictions,
+    resolveReadDenies(
+      config.filesystem.denyRead,
+      credentialRestrictions,
+      readDenyGlobExpander(
+        reExposedPaths,
+        unlistableDenyDirs,
+        config.filesystem.denyReadGlobBudget,
       ),
-      (pattern, anchor) =>
-        expandReadDenyGlobLinuxSteps(
-          pattern,
-          reExposedPaths,
-          unlistableDenyDirs,
-          { anchor, listings },
-        ),
-      credentialRestrictions.degradeToDenyPaths,
     ),
   )
 
   return {
-    denyOnly: denyPaths,
+    ...denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
     ...literalReadLists(
@@ -1761,6 +1907,10 @@ function getEnableWeakerNestedSandbox(): boolean | undefined {
   return config?.enableWeakerNestedSandbox
 }
 
+function getAllowNestedUserNamespaces(): boolean | undefined {
+  return config?.allowNestedUserNamespaces
+}
+
 function getEnableWeakerNetworkIsolation(): boolean | undefined {
   return config?.enableWeakerNetworkIsolation
 }
@@ -1855,6 +2005,15 @@ export type WrapWithSandboxOptions = {
    * long commands sharing a prefix would otherwise cross-attribute, and a
    * rerun of the same text would inherit the earlier run's events.
    *
+   * On Linux it is also the name under which the wrap records the mount
+   * points its command relies on: pass the same value to
+   * `cleanupAfterCommand({ commandId })` to let go of them at once when the
+   * command will never be started, whatever other commands are still in
+   * flight (a command that ran is let go of by any cleanup once it has
+   * ended). It has to be unique among the wraps in flight. Only a value passed
+   * here counts for that; the `command` default does not, since two wraps in
+   * flight may share their text.
+   *
    * An id that a network allow list is registered under must also be
    * unguessable: see `registerCommandNetworkLists`.
    */
@@ -1875,6 +2034,47 @@ const RESTARTS_IN_TURNS = 2
 
 /** In place of what a walk finds: the configuration was replaced under it. */
 const REPLACED = Symbol('replaced')
+
+/** Whether a wrap is walking, and the ones waiting to, first come first. */
+let walking = false
+const waitingToWalk: (() => void)[] = []
+
+/**
+ * Resolves once no other wrap is walking, with what says that this one's walk
+ * has ended; only the first call of it counts. Walks that take turns on one
+ * thread end no sooner for it, while each keeps all it has listed until it
+ * ends and has its turn before the event loop gets one: the memory and the
+ * thread held would both grow with the wraps in flight.
+ * Rejects with `signal`'s reason as soon as that is aborted during the wait.
+ * Nothing else takes a wrap out of the line, reset() included.
+ */
+async function waitToWalk(signal?: AbortSignal): Promise<() => void> {
+  if (walking) {
+    signal?.throwIfAborted()
+    await new Promise<void>((resolve, reject) => {
+      const go = (): void => {
+        signal?.removeEventListener('abort', leave)
+        resolve()
+      }
+      const leave = (): void => {
+        waitingToWalk.splice(waitingToWalk.indexOf(go), 1)
+        reject(signal?.reason)
+      }
+      waitingToWalk.push(go)
+      signal?.addEventListener('abort', leave, { once: true })
+    })
+  }
+  walking = true
+  let ended = false
+  return () => {
+    if (ended) return
+    ended = true
+    // Handed on while `walking` stays set, so that no newcomer gets in first.
+    const next = waitingToWalk.shift()
+    if (next) next()
+    else walking = false
+  }
+}
 
 async function wrapWithSandbox(
   command: string,
@@ -1902,6 +2102,35 @@ async function wrapWithSandboxAgain(
   abortSignal?: AbortSignal,
   options?: WrapWithSandboxOptions,
 ): Promise<string> {
+  // INVARIANT: an attempt waits before it reads anything, so that it goes by
+  // the configuration, the working directory and the disk it finds afterwards.
+  const walkEnded = await waitToWalk(abortSignal)
+  try {
+    return await wrapWithSandboxOnce(
+      walkEnded,
+      restarts,
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
+  } finally {
+    walkEnded()
+  }
+}
+
+/** One attempt of {@link wrapWithSandboxAgain}, which calls `walkEnded` once
+ *  it walks no more. */
+async function wrapWithSandboxOnce(
+  walkEnded: () => void,
+  restarts: number,
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
   const platform = getPlatform()
   const commandId = options?.commandId
   registerCommandText(command, options)
@@ -1912,8 +2141,10 @@ async function wrapWithSandboxAgain(
     config !== startedWith ||
     configInstalls !== startedAt ||
     workingDirectory() !== startedIn
-  const startOver = (): Promise<string> =>
-    wrapWithSandboxAgain(
+  const startOver = (): Promise<string> => {
+    // The next attempt waits like any other wrap, behind the ones there are.
+    walkEnded()
+    return wrapWithSandboxAgain(
       restarts + 1,
       command,
       binShell,
@@ -1921,6 +2152,7 @@ async function wrapWithSandboxAgain(
       abortSignal,
       options,
     )
+  }
   /** `steps`, left as soon as the host is seen to have moved on: what they
    *  would go on to find is for a wrap that starts over anyway. */
   function* whileCurrent<T>(steps: Steps<T>): Steps<T | typeof REPLACED> {
@@ -1999,6 +2231,18 @@ async function wrapWithSandboxAgain(
         customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite,
       ),
     }
+    // For a caller that never reads checkDependencies(), the CLI among them.
+    if (!ownInstallLogged) {
+      ownInstallLogged = true
+      try {
+        const ownInstall = ownInstallWarning(writeRootsOf(writeConfig))
+        if (ownInstall !== undefined) {
+          logForDebugging(ownInstall, { level: 'warn' })
+        }
+      } catch {
+        // It only advises, as in checkDependenciesCommon().
+      }
+    }
 
     // Credential deny paths are unioned with the caller's denyRead — never
     // replacing it — so explicit filesystem restrictions always survive.
@@ -2017,14 +2261,16 @@ async function wrapWithSandboxAgain(
     if (expandedAllowRead === REPLACED) return startOver()
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
-    // paths fall under a user-configured denyRead.
+    // paths fall under a user-configured denyRead or credential entry.
+    const ownAllowWithinDeny: string[] = []
     if (mitmCA) {
-      expandedAllowRead.push(mitmCA.certPath, mitmCA.trustBundlePath)
+      ownAllowWithinDeny.push(mitmCA.certPath, mitmCA.trustBundlePath)
     }
     // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
     if (javaAgentJarPath) {
-      expandedAllowRead.push(javaAgentJarPath)
+      ownAllowWithinDeny.push(javaAgentJarPath)
     }
+    expandedAllowRead.push(...ownAllowWithinDeny)
     const reExposedPaths = reExposedBy(
       expandedAllowRead,
       customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
@@ -2033,28 +2279,26 @@ async function wrapWithSandboxAgain(
     const unlistableDenyDirs = new Set<string>()
     const listings: GlobWalkListings = new Map()
     const expandedDenyRead = await walked(
-      resolveReadPathEntries(
-        'deny',
-        unionDenyReadPaths(
-          spelledOf(
-            customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
-          ),
-          credentialRestrictions,
+      resolveReadDenies(
+        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+        credentialRestrictions,
+        readDenyGlobExpander(
+          reExposedPaths,
+          unlistableDenyDirs,
+          customConfig?.filesystem?.denyReadGlobBudget ??
+            config?.filesystem.denyReadGlobBudget,
+          listings,
         ),
-        (pattern, anchor) =>
-          expandReadDenyGlobLinuxSteps(
-            pattern,
-            reExposedPaths,
-            unlistableDenyDirs,
-            { anchor, listings },
-          ),
-        credentialRestrictions.degradeToDenyPaths,
       ),
     )
+    // Emptied by hand: a runtime may keep what this function has named for as
+    // long as it is suspended, which is until the scan below has ended.
+    listings.clear()
     if (expandedDenyRead === REPLACED) return startOver()
     readConfig = {
-      denyOnly: expandedDenyRead,
+      ...expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
+      ...(ownAllowWithinDeny.length > 0 && { ownAllowWithinDeny }),
       unlistableDenyDirs: [...unlistableDenyDirs],
       ...literalReadLists(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
@@ -2062,6 +2306,8 @@ async function wrapWithSandboxAgain(
       ),
     }
   }
+  // Nothing below walks, and what it waits for is not this thread.
+  walkEnded()
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:
@@ -2178,6 +2424,7 @@ async function wrapWithSandboxAgain(
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
+        allowNestedUserNamespaces: getAllowNestedUserNamespaces(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
@@ -2431,11 +2678,19 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
  * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
  * These persist after bwrap exits. This function removes them.
  *
- * Safe to call on any platform — it's a no-op on macOS.
+ * Call it once for each wrapped command, when that command is over. Every
+ * call removes what commands that ran and have ended relied on, this
+ * process's and other processes'. A command that was wrapped and has not
+ * started is let go of only once it has been called for every wrap handed
+ * out, because a call cannot tell which command it is for; pass the
+ * `commandId` the wrap was given (`WrapWithSandboxOptions.commandId`) to let
+ * go of that one at once.
+ *
+ * Safe to call on any platform: it does nothing except on Linux.
  * Also called automatically by reset() and on process exit as safety nets.
  */
-function cleanupAfterCommand(): void {
-  cleanupBwrapMountPoints()
+function cleanupAfterCommand(options?: { commandId?: string }): void {
+  cleanupBwrapMountPoints({ commandId: options?.commandId })
 }
 
 /**
@@ -2755,18 +3010,22 @@ function getLinuxGlobPatternWarnings(): string[] {
   }
 
   // Read paths are expanded, so a glob there is supported — unless the
-  // pattern has no literal directory for the walk to start from (a wildcard
-  // in its first path component, `/**/*.pem`), which expands to nothing and
-  // leaves the entry unenforced.
+  // pattern has no literal directory below the root for the walk to start
+  // from (a wildcard in its first path component, `/**/*.pem`), which
+  // expands to nothing and leaves the entry unenforced.
   for (const path of [
-    ...config.filesystem.denyRead,
+    ...new Set([
+      ...config.filesystem.denyRead,
+      // Joins the read denies, and is skipped like one of them.
+      ...getCredentialDenyReadPaths(config.credentials),
+    ]),
     ...(config.filesystem.allowRead ?? []),
   ]) {
     if (typeof path !== 'string') continue
     const baseDir = globPatternBaseDir(normalizePathForSandbox(path))
     if (
       containsGlobChars(removeTrailingGlobSuffix(path)) &&
-      (baseDir === '' || baseDir === '/')
+      globBaseDirIsRoot(baseDir)
     ) {
       globPatterns.push(path)
     }
@@ -2798,6 +3057,8 @@ export interface ISandboxManager {
     command: string
     args?: string[]
   }): Promise<SandboxDependencyCheck>
+  /** On Linux it expands the `denyRead` globs, and throws
+   *  {@link LinuxSandboxProfileError} `deny_glob_too_large` as the wrap does. */
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
@@ -2890,7 +3151,7 @@ export interface ISandboxManager {
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
   updateConfig(newConfig: SandboxRuntimeConfig): void
-  cleanupAfterCommand(): void
+  cleanupAfterCommand(options?: { commandId?: string }): void
   reset(): Promise<void>
 }
 

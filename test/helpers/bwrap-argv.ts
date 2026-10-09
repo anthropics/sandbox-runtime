@@ -1,9 +1,26 @@
+import { existsSync, realpathSync } from 'node:fs'
+import { basename } from 'node:path'
 import { quote } from '../../src/utils/shell-quote.js'
 
 /** The $0 renderBwrapInvocation gives the shell that opens an over-long
  * profile's argument file. Its presence means the mount words are in that
  * file and not in the command. */
 const ARGS_FILE_ARGV0 = 'srt-args'
+
+/**
+ * How a wrapped command that takes steps of its own before bubblewrap begins, on
+ * this host: bash where it is at one of its two usual places, else /bin/sh.
+ */
+export const STEP_SHELL = ((): string => {
+  const bash =
+    ['/bin/bash', '/usr/bin/bash'].find(shell => existsSync(shell)) ??
+    ['/bin/sh'].find(shell => basename(realpathSync(shell)) === 'bash')
+  return bash === undefined ? '/bin/sh -c' : `${bash} -p -c`
+})()
+
+/** The step that puts the command on its manifest's started record. */
+export const RECORD_STEP =
+  'read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1" && shift'
 
 /** The mount flags this generator emits with a source and a destination. */
 const MOUNT_FLAGS = ['--bind', '--ro-bind']
@@ -71,6 +88,24 @@ function runIndices(command: string, words: readonly string[]): number[] {
     if (words.every((word, offset) => argv[i + offset] === word)) found.push(i)
   }
   return found
+}
+
+/**
+ * The manifest the wrap recorded its mount points in, by the started record
+ * the command's own shell is given, or `undefined` for a wrap that recorded
+ * none.
+ */
+export function manifestOf(command: string): string | undefined {
+  const id = / srt(?:-args)? (\S+)\.started /.exec(command)?.[1]
+  return id === undefined ? undefined : `${id}.json`
+}
+
+/**
+ * The bubblewrap the command runs, as the wrap spelled it: the first word, or
+ * the word after the steps the command's own shell takes first.
+ */
+export function bwrapOf(command: string): string | undefined {
+  return command.split(' ').find(word => /(^|\/)bwrap$/.test(word))
 }
 
 /** How many times that whole mount appears. */

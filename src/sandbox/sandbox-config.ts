@@ -945,6 +945,18 @@ export const FilesystemConfigSchema = z.object({
       'Paths to re-allow reading within denied regions (takes precedence over denyRead). ' +
         'Use with denyRead to deny a broad region then allow back specific subdirectories.',
     ),
+  denyReadGlobBudget: z
+    .object({
+      maxEntries: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional(),
+    })
+    .strict()
+    .optional()
+    .describe(
+      'Linux: what expanding the denyRead globs of one configuration may spend, all of them together, ' +
+        'before the wrap is refused: directory entries looked at (default 20,000,000) and ' +
+        'milliseconds (default 60,000).',
+    ),
   allowWrite: z
     .array(filesystemPathEntrySchema)
     .describe('Paths allowed for writing'),
@@ -973,7 +985,13 @@ export const IgnoreViolationsConfigSchema = z
  * Ripgrep configuration schema
  */
 export const RipgrepConfigSchema = z.object({
-  command: z.string().describe('The ripgrep command to execute'),
+  command: z
+    .string()
+    .describe(
+      'The ripgrep command to execute. A bare name (the default "rg") is ' +
+        'looked up on PATH, passing over any copy inside an allowed write ' +
+        'path; a path is run as given.',
+    ),
   args: z
     .array(z.string())
     .optional()
@@ -1158,6 +1176,15 @@ export const SandboxRuntimeConfigSchema = z
       .boolean()
       .optional()
       .describe('Enable weaker nested sandbox mode (for Docker environments)'),
+    allowNestedUserNamespaces: z
+      .boolean()
+      .optional()
+      .describe(
+        'Let the sandboxed command create user namespaces of its own (Linux only), as a browser ' +
+          'sandbox, rootless podman or a nested bubblewrap does. This gives up the write denies against ' +
+          'a hostile command, which can then take the read-only binds that enforce denyWrite and the ' +
+          'mandatory denies out of its own view. Default: false.',
+      ),
     enableWeakerNetworkIsolation: z
       .boolean()
       .optional()
@@ -1204,13 +1231,15 @@ export const SandboxRuntimeConfigSchema = z
       .optional()
       .describe(
         'Linux only: absolute path to the bwrap (bubblewrap) binary. ' +
-          'When set, this path is used directly instead of resolving "bwrap" via PATH.',
+          'When set, this path is used directly instead of resolving "bwrap" via PATH ' +
+          '(where a copy inside an allowed write path is passed over).',
       ),
     socatPath: binaryPathSchema
       .optional()
       .describe(
         'Linux only: absolute path to the socat binary. ' +
-          'When set, this path is used directly instead of resolving "socat" via PATH.',
+          'When set, this path is used directly instead of resolving "socat" via PATH ' +
+          '(where a copy inside an allowed write path is passed over).',
       ),
     javaAgentJarPath: binaryPathSchema
       .optional()

@@ -14,7 +14,9 @@ import {
   containsGlobChars,
   globToRegex,
   denyGlobRegex,
+  isAtOrUnder,
   isStrictlyUnder as isPathStrictlyUnder,
+  pathSpellings,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -343,8 +345,34 @@ function isStrictlyUnder(entry: PathEntry, dir: string): boolean {
  */
 interface ResolvedReadConfig {
   denies: PathEntry[]
+  /** Those of `denies` whose only exceptions are `ownAllows`. */
+  credentialDenies: ReadonlySet<PathEntry>
   allows: PathEntry[]
+  /** Those of `allows` the library adds for files of its own. */
+  ownAllows: PathEntry[]
   writeRoots: PathEntry[]
+}
+
+/**
+ * A deny entry, and the same entry where its path really is when a link on
+ * the way leads elsewhere: Seatbelt compares the kernel's canonical path. Of
+ * a pattern, the directory it starts from is what is resolved. The root is
+ * never a second location.
+ */
+function withCanonicalLocation(entry: PathEntry): PathEntry[] {
+  const base = entryBaseDir(entry)
+  const canonical = pathSpellings(base)[1]
+  if (canonical === undefined || canonical === '/') return [entry]
+  return [
+    entry,
+    entry.glob
+      ? {
+          glob: true,
+          path: canonical + entry.path.slice(base.length),
+          anchor: canonical,
+        }
+      : { glob: false, path: canonical },
+  ]
 }
 
 function resolveReadConfig(
@@ -357,11 +385,21 @@ function resolveReadConfig(
    */
   libraryDenies: readonly PathEntry[],
 ): ResolvedReadConfig {
+  const credentialDenies = [
+    ...callerEntries('deny', config.credentialDenyOnly, undefined),
+    ...libraryDenies,
+  ].flatMap(withCanonicalLocation)
   return {
     denies: [
-      ...callerEntries('deny', config.denyOnly, config.literalDenyOnly),
-      ...libraryDenies,
+      ...callerEntries(
+        'deny',
+        config.denyOnly.filter(p => !config.credentialDenyOnly?.includes(p)),
+        config.literalDenyOnly,
+      ).flatMap(withCanonicalLocation),
+      ...credentialDenies,
     ],
+    credentialDenies: new Set(credentialDenies),
+    ownAllows: (config.ownAllowWithinDeny ?? []).map(toLiteralPathEntry),
     // Non-glob spellings arrive slash-free from normalizePathForSandbox —
     // the nested-deny re-emit matches by `path + '/'` prefix, which a
     // preserved trailing slash would defeat ('<dir>//').
@@ -391,6 +429,8 @@ function resolveReadConfig(
  *   TLS-termination trust bundle sandbox-manager adds to allowWithinDeny,
  *   which a `/**\/*.crt` deny would otherwise sever) keeps that one file
  *   readable without any allow being emitted after the denies.
+ * - Every credential deny, literal or glob, minus the library's own files
+ *   that it covers.
  *
  * Every filter here is a deny or a narrower deny: nothing this function
  * produces can make a path readable that is not readable today. Keep it
@@ -412,15 +452,21 @@ function lateReadDenyFilters(resolved: ResolvedReadConfig): {
   let coversRoot = false
   const literalAllowDirs = resolved.allows.filter(a => !a.glob).map(a => a.path)
   for (const deny of resolved.denies) {
+    const isCredential = resolved.credentialDenies.has(deny)
     if (!deny.glob) {
-      if (literalAllowDirs.some(a => isStrictlyUnder(deny, a))) {
+      if (isCredential) {
+        const carveOuts = resolved.ownAllows
+          .filter(a => isAtOrUnder(a.path, deny.path))
+          .map(a => pathFilter(a))
+        filters.push(carveFilter(denyPathFilter(deny), carveOuts))
+      } else if (literalAllowDirs.some(a => isStrictlyUnder(deny, a))) {
         filters.push(denyPathFilter(deny))
       }
       continue
     }
     const denyRegex = new RegExp(denyGlobEntryRegex(deny))
     if (denyRegex.test('/')) coversRoot = true
-    const carveOuts = resolved.allows
+    const carveOuts = (isCredential ? resolved.ownAllows : resolved.allows)
       .filter(a => denyGlobCovers(denyRegex, a))
       .map(a => pathFilter(a))
     filters.push(carveFilter(denyPathFilter(deny), carveOuts))
@@ -480,12 +526,15 @@ function entryBaseDir(entry: PathEntry): string {
  * A literal deny not below any write root needs nothing: the read
  * section's move-blocking deny still holds for it. Deny-only, like the
  * rest of this file's read handling.
+ *
+ * A credential deny is emitted wherever it lies and with nothing subtracted,
+ * and a write root among its ancestors is kept in place with them.
  */
 function generateReadDenyUnlinkRules(
   resolved: ResolvedReadConfig,
   logTag: string,
 ): string[] {
-  const { denies, allows, writeRoots } = resolved
+  const { denies, credentialDenies, writeRoots } = resolved
   if (writeRoots.length === 0) return []
 
   const writeRootRegexes = writeRoots
@@ -495,21 +544,22 @@ function generateReadDenyUnlinkRules(
   const strictlyBelowWriteRoot = (p: string): boolean =>
     literalWriteRoots.some(w => isStrictlyUnder({ path: p, glob: false }, w)) ||
     writeRootRegexes.some(re => re.test(p))
-  const carveOutsInside = (dir: string): string[] =>
-    [...allows, ...writeRoots]
-      .filter(e => isStrictlyUnder(e, dir))
-      .map(e => pathFilter(e))
 
   const filters = new Set<string>()
-  const protectDirs = (dirs: string[]): void => {
+  const protectDirs = (dirs: string[], withWriteRoots: boolean): void => {
     for (const dir of dirs) {
-      if (strictlyBelowWriteRoot(dir)) {
+      if (
+        strictlyBelowWriteRoot(dir) ||
+        (withWriteRoots && literalWriteRoots.includes(dir))
+      ) {
         filters.add(`(literal ${escapePath(dir)})`)
       }
     }
   }
 
   for (const deny of denies) {
+    const isCredential = credentialDenies.has(deny)
+    const exceptions = isCredential ? [] : [...resolved.allows, ...writeRoots]
     if (deny.glob) {
       const baseDir = entryBaseDir(deny)
       const intersectsWriteRoot =
@@ -522,17 +572,20 @@ function generateReadDenyUnlinkRules(
         )
       if (!intersectsWriteRoot) continue
       const denyRegex = new RegExp(denyGlobEntryRegex(deny))
-      const carveOuts = [...allows, ...writeRoots]
+      const carveOuts = exceptions
         .filter(e => denyGlobCovers(denyRegex, e))
         .map(e => pathFilter(e))
       filters.add(carveFilter(denyPathFilter(deny), carveOuts))
       if (baseDir !== '/') {
-        protectDirs([baseDir, ...getAncestorDirectories(baseDir)])
+        protectDirs([baseDir, ...getAncestorDirectories(baseDir)], isCredential)
       }
     } else {
-      if (!strictlyBelowWriteRoot(deny.path)) continue
-      filters.add(carveFilter(denyPathFilter(deny), carveOutsInside(deny.path)))
-      protectDirs(getAncestorDirectories(deny.path))
+      if (!isCredential && !strictlyBelowWriteRoot(deny.path)) continue
+      const carveOuts = exceptions
+        .filter(e => isStrictlyUnder(e, deny.path))
+        .map(e => pathFilter(e))
+      filters.add(carveFilter(denyPathFilter(deny), carveOuts))
+      protectDirs(getAncestorDirectories(deny.path), isCredential)
     }
   }
 
@@ -1503,6 +1556,7 @@ export function wrapCommandWithSandboxMacOS(
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
   // Resolve the full path to the shell binary
+  // It runs under sandbox-exec, so the plain search of the whole PATH is right
   const shellName = binShell || 'bash'
   const shell = whichSync(shellName)
   if (!shell) {
@@ -1522,8 +1576,10 @@ export function wrapCommandWithSandboxMacOS(
 
   // Use `env` command to set environment variables - each VAR=value is a separate
   // argument that quote() escapes properly, avoiding shell quoting issues
+  // env runs on the host, ahead of sandbox-exec, so it is named by its fixed
+  // path: a bare name would be whatever file PATH holds under it.
   const wrappedCommand = quote([
-    'env',
+    '/usr/bin/env',
     ...unsetEnvArgs,
     ...setEnvArgs,
     ...proxyEnvArgs,
@@ -1575,7 +1631,8 @@ export function startMacOSSandboxLogMonitor(
 
   // Stream and filter kernel logs for all sandbox violations
   // We can't filter by specific logTag since it's dynamic per command
-  const logProcess = spawn('log', [
+  // By its fixed path, not through PATH: the monitor runs on the host.
+  const logProcess = spawn('/usr/bin/log', [
     'stream',
     '--predicate',
     `(eventMessage ENDSWITH "${sessionSuffix}")`,

@@ -1,6 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
-import { whichSync } from '../utils/which.js'
+import { isPathQualified, whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
@@ -8,8 +8,26 @@ import type { ChildProcess } from 'node:child_process'
 import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
+import {
+  collectMountPoints,
+  discardMountPointManifest,
+  keepTrackOfMountSource,
+  kindOfMountPoint,
+  mountPointManifestDirectories,
+  namedMountPoints,
+  publishMountPointManifest,
+  removePrivateManifestDirectory,
+  type MountPointManifest,
+  type NamedMountPoints,
+  type OwnManifestRelease,
+} from './bwrap-mount-manifests.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
 import { readNamesOf, writeNamesOf } from './path-entries.js'
+import {
+  describeUnavailableHostHelper,
+  findHostHelper,
+  writableNamedHelperWarning,
+} from './host-helpers.js'
 import {
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
@@ -74,6 +92,8 @@ export interface LinuxSandboxParams {
    */
   maskedFileStoreDir?: string
   enableWeakerNestedSandbox?: boolean
+  /** Lets the command undo the write denies: see {@link NESTED_USERNS_ENV}. */
+  allowNestedUserNamespaces?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: RipgrepConfig
@@ -90,9 +110,9 @@ export interface LinuxSandboxParams {
   gitSafeDirectories?: readonly string[]
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
-  /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
+  /** Absolute path to bwrap (default: "bwrap" as `findHostHelper` finds it) */
   bwrapPath?: string
-  /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
+  /** Absolute path to the socat binary (default: "socat", found likewise) */
   socatPath?: string
   /** Filesystem unix socket bound by the Linux violation monitor. When set,
    *  the socket is bind-mounted into the sandbox and apply-seccomp is told
@@ -506,12 +526,6 @@ async function linuxGetMandatoryDenyPaths(
   return [...new Set(denyPaths)]
 }
 
-// Track mount points created by bwrap for non-existent deny paths.
-// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
-// file on the host as a mount point. These persist after bwrap exits and must
-// be cleaned up explicitly.
-const bwrapMountPoints: Set<string> = new Set()
-
 // The source of the empty-directory mount points: at most one at a time, made
 // on first use, reused while a sandbox is running, and removed with the mount
 // points — never before, because a live bind's source must stay.
@@ -547,32 +561,9 @@ function ensureEmptyMountSourceDir(): string {
   // directory lands on 0500. Set the mode here rather than let the check
   // above reject the directory this call has just made.
   fs.chmodSync(emptyMountSourceDir, 0o700)
+  // The wrap may throw before a manifest names it.
+  keepTrackOfMountSource(emptyMountSourceDir)
   return emptyMountSourceDir
-}
-
-/**
- * Is `p` a mount point an earlier sandbox left behind? bwrap makes the mount
- * point for `--ro-bind /dev/null <absent path>` with ensure_file(dest, 0444):
- * an empty regular file with no write bits. The set above lives in memory, so
- * a process that dies without an 'exit' event (SIGKILL, OOM) leaves the file
- * on the host with nothing left that knows what it is. Files that only look
- * similar are written by their creators with write bits (a lockfile, an empty
- * file materialised on purpose: 0666 & ~umask) or have content or a second
- * link. An empty read-only DIRECTORY left the same way is not recognisable:
- * it looks like anyone's empty directory.
- */
-function isStaleBwrapMountPoint(p: string): boolean {
-  try {
-    const stat = fs.lstatSync(p)
-    return (
-      stat.isFile() &&
-      stat.size === 0 &&
-      (stat.mode & 0o222) === 0 &&
-      stat.nlink === 1
-    )
-  } catch {
-    return false
-  }
 }
 
 export const CAP_SETFCAP = 31
@@ -648,7 +639,9 @@ export function boundingCapabilitiesFromStatus(
  * a creator holding CAP_SETFCAP. Under the helper a uid-0 caller's command
  * therefore has a full set inside that nested namespace, which is
  * identity-mapped to the caller's uid 0, and the filesystem policy there
- * rests on the nested namespace's mount copies being locked. Without the
+ * rests on the helper's namespaces filter refusing the calls that change a
+ * mount tree: the nested namespace's locked mount copies refuse the unmount
+ * of any one of them, not the whole tree being moved aside. Without the
  * helper (`allowAllUnixSockets`, or no usable helper binary) the command runs
  * in bwrap's own namespaces and `--cap-drop ALL` is what stops it unmounting
  * a deny.
@@ -843,17 +836,56 @@ export type LinuxSandboxProfileErrorCode =
   | 'args_file_unavailable'
   /** The line does not fit one shell argument even with the mounts in a file. */
   | 'command_too_long'
+  /**
+   * The `denyRead` patterns could not be expanded within their budget, so
+   * which paths to hide is not known. The error on `.cause` names the
+   * pattern, the directory being listed and what had been spent.
+   */
+  | 'deny_glob_too_large'
+  /**
+   * A program this library runs on the host (bubblewrap, socat, ripgrep) has
+   * no copy on PATH outside the paths the command may write. The message
+   * names each copy passed over and why, and `.cause` holds the same:
+   * `{ helper, skipped: { path, reason, writePath? }[] }`. Lifted by such a
+   * copy on PATH, or by naming the helper (`bwrapPath`, `socatPath`,
+   * `ripgrep.command`).
+   */
+  | 'host_helper_unavailable'
+  /** More mount points than one manifest holds. */
+  | 'too_many_mount_points'
+  /**
+   * The mount point manifests cannot be read, so a path cannot be told from a
+   * mount point a running sandbox relies on. It ends by itself: when this
+   * process has descriptors again, when what sits among them and is no manifest
+   * is an hour old, when the process on a record with no manifest has ended.
+   * `.cause` is the file and the reason, which the message holds too.
+   */
+  | 'mount_points_unreadable'
+  /**
+   * Other sandboxes' mount points kept being made or removed under what the
+   * profile relies on, or their manifests kept moving while they were read,
+   * each time the wrap planned it. Passing: wrap again.
+   */
+  | 'mount_points_changed'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
- * configuration expands to is past a limit, or, for `command_too_long` and
- * `nul_in_path`, what the caller passed in is. The command was not run and no
- * profile file stays open, so do not run the per-command cleanup
- * (`cleanupAfterCommand()`, `cleanupBwrapMountPoints()`) for a wrap that
- * threw: it would release a second time, and a sandbox still running would
- * lose its mount points. Branch on `.code`, never on `.message`, which
- * carries the sizes of the moment. Other wrap-time failures (a shell that is
- * not on PATH, a bridge socket that is gone) are plain Errors.
+ * configuration expands to, with the mandatory denies of the working
+ * directory, is past a limit, or, for `command_too_long` and `nul_in_path`,
+ * what the caller passed in is; for `deny_glob_too_large` the
+ * profile could not be worked out at all, for `host_helper_unavailable` a
+ * program the wrap runs is not to be had, and for the two `mount_points_`
+ * codes other sandboxes' mount points cannot be told or do not hold still.
+ * The command was not run and no
+ * profile file stays open; the wrap has already let go of the mount points it
+ * had named and is not counted among the commands to clean up after. So do not
+ * make the per-command cleanup call (`cleanupAfterCommand()`,
+ * `cleanupBwrapMountPoints()`) for a wrap that threw: it counts for another
+ * wrap of this process, whose command is then refused its start if it has not
+ * started yet. It takes nothing from a running sandbox. Branch on `.code`,
+ * never on `.message`, which carries the sizes of the moment. Other wrap-time
+ * failures (a shell that is not on PATH, a bridge socket that is gone) are
+ * plain Errors.
  */
 export class LinuxSandboxProfileError extends Error {
   readonly code: LinuxSandboxProfileErrorCode
@@ -879,6 +911,75 @@ export class LinuxSandboxProfileError extends Error {
   }
 }
 
+let stepShell: string[] | undefined
+
+/**
+ * The shell the returned string runs its own steps in, before bubblewrap: found
+ * once, bash at one of its two usual places, else /bin/sh, which is bash too on
+ * some systems (NixOS, Guix).
+ *
+ * bash, because where /bin/sh is dash the environment is rebuilt from the
+ * shell's variables, and every entry whose name is no identifier (`a.b`,
+ * `INPUT_GITHUB-TOKEN`, an exported function) is lost to the command.
+ *
+ * THREAT: this shell runs on the host, unsandboxed, in an environment a
+ * sandboxed command may have had a hand in. So `-p`: plain `bash -c` imports
+ * exported functions, and one named `shift`, `read`, `printf` or `exec` would
+ * run in place of the step's own word; it also reads the file `$BASH_ENV`
+ * names. And never a PATH look-up or the caller's `binShell`: a copy planted in
+ * a writable PATH directory would be run out here.
+ */
+function shellForSteps(): string[] {
+  if (stepShell === undefined) {
+    const isBash = (shell: string): boolean => {
+      try {
+        return path.basename(fs.realpathSync(shell)) === 'bash'
+      } catch {
+        return false
+      }
+    }
+    const bash =
+      ['/bin/bash', '/usr/bin/bash'].find(isExecutable) ??
+      ['/bin/sh'].find(isBash)
+    stepShell = bash === undefined ? ['/bin/sh', '-c'] : [bash, '-p', '-c']
+  }
+  return stepShell
+}
+
+/**
+ * The absolute path `findHostHelper` gives for `helper`. Throws the typed
+ * refusal when there is none, never going on under the bare name.
+ */
+function requireHostHelper(
+  helper: string,
+  allowedWritePaths: readonly string[] | undefined,
+): string {
+  const search = findHostHelper(helper, allowedWritePaths)
+  if (search.path === null) {
+    throw new LinuxSandboxProfileError(
+      'host_helper_unavailable',
+      describeUnavailableHostHelper(helper, search),
+      { helper, skipped: search.skipped },
+    )
+  }
+  return search.path
+}
+
+/**
+ * `ripgrepConfig` for the scan, which runs on the host: a bare `command`
+ * becomes where `requireHostHelper` finds it, a path is run as given.
+ */
+function hostRipgrepConfig(
+  ripgrepConfig: RipgrepConfig,
+  allowedWritePaths: readonly string[] | undefined,
+): RipgrepConfig {
+  if (isPathQualified(ripgrepConfig.command)) return ripgrepConfig
+  return {
+    ...ripgrepConfig,
+    command: requireHostHelper(ripgrepConfig.command, allowedWritePaths),
+  }
+}
+
 /**
  * Thrown by the wrap when the host changed its working directory while the
  * mandatory denies were looked for. Nothing has been handed out or left on
@@ -900,17 +1001,55 @@ export class WorkingDirectoryChanged extends Error {
  * again through /proc. Every other word, the per-command environment and the
  * command among them, stays on the line. The result stays a simple command,
  * so a prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
+ *
+ * With `started`, the record of a wrap that named mount points, the string is
+ * a shell that appends its own /proc/self/stat line to that record and then
+ * execs bwrap in its place: the pid on record is bwrap's, written before bwrap
+ * has made a mount. Read by the shell itself, a redirection on a builtin: a
+ * child's line would be that of a process gone at once. Not /proc/$$: under an
+ * outer /proc `$$` is nobody there, or an unrelated process. Appended, not
+ * written over, so that every run of the string is on record while it lasts.
+ * One shell does both where both are needed.
  * Throws {@link LinuxSandboxProfileError} when the profile cannot run.
  */
 function renderBwrapInvocation(
   bwrapBinary: string,
   bwrapArgs: string[],
-  mounts: { start: number; end: number },
+  mounts: { start: number; end: number; mandatoryDenyArgs: number },
+  started?: string,
 ): string {
+  /** What the string's own shell does, to the file it is given as "$1". */
+  type Step = { run: string; file: string }
+  const record: Step[] =
+    started === undefined
+      ? []
+      : [
+          {
+            run: 'read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"',
+            file: started,
+          },
+        ]
+  /** `words`, run by a shell named `name` once it has taken `steps`. */
+  const afterSteps = (steps: Step[], name: string, words: string[]): string =>
+    steps.length === 0
+      ? quote(words)
+      : quote([
+          ...shellForSteps(),
+          [...steps.map(step => `${step.run} && shift`), 'exec "$@"'].join(
+            ' && ',
+          ),
+          name,
+          ...steps.map(step => step.file),
+          ...words,
+        ])
+  // Whose the arguments are and what lowers each share: the mandatory denies
+  // follow from what the working directory holds, not from the configuration.
+  const shares = (): string =>
+    `${mounts.mandatoryDenyArgs} of its arguments are built-in write protection, in no list of the configuration: shell and tool settings and each git repository's hooks and config, in and below the working directory, and the directories holding them. For fewer, run from a directory with fewer repositories in it, or allow writing to fewer of them; a lower mandatoryDenySearchDepth leaves the deeper ones unprotected. The other ${bwrapArgs.length - mounts.mandatoryDenyArgs} are what the configuration expands to: each path takes about three arguments, each environment variable two`
   if (bwrapArgs.length > BWRAP_MAX_ARGS) {
     throw new LinuxSandboxProfileError(
       'too_many_arguments',
-      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts); reduce what the configuration expands to: each path takes about three arguments, each environment variable two`,
+      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts). ${shares()}`,
     )
   }
   const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
@@ -922,7 +1061,7 @@ function renderBwrapInvocation(
       'Sandbox profile contains a path with a NUL byte, which neither a command line nor a file of bwrap arguments can carry',
     )
   }
-  const inline = quote([bwrapBinary, ...bwrapArgs])
+  const inline = afterSteps(record, 'srt', [bwrapBinary, ...bwrapArgs])
   const inlineBytes = Buffer.byteLength(inline, 'utf8')
   const limit = maxArgStrlen() - 1
   if (inlineBytes <= limit - ARG_HEADROOM_BYTES) {
@@ -934,7 +1073,7 @@ function renderBwrapInvocation(
   if (bwrapArgs.length + 2 > BWRAP_MAX_ARGS) {
     throw new LinuxSandboxProfileError(
       'too_many_arguments',
-      `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts`,
+      `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts. ${shares()}`,
     )
   }
   let argsFd: number
@@ -947,20 +1086,25 @@ function renderBwrapInvocation(
       error,
     )
   }
-  // /bin/sh opens the profile on the fd and execs bwrap, which reads it to
+  // The shell opens the profile on the fd and execs bwrap, which reads it to
   // EOF and closes it before running the command.
-  const viaArgsFile = quote([
-    '/bin/sh',
-    '-c',
-    `exec ${BWRAP_ARGS_FD}<"$1" && shift && exec "$@"`,
+  const viaArgsFile = afterSteps(
+    [
+      ...record,
+      {
+        run: `exec ${BWRAP_ARGS_FD}<"$1"`,
+        file: bwrapArgsProfilePath(argsFd),
+      },
+    ],
     'srt-args',
-    bwrapArgsProfilePath(argsFd),
-    bwrapBinary,
-    ...bwrapArgs.slice(0, mounts.start),
-    '--args',
-    String(BWRAP_ARGS_FD),
-    ...bwrapArgs.slice(mounts.end),
-  ])
+    [
+      bwrapBinary,
+      ...bwrapArgs.slice(0, mounts.start),
+      '--args',
+      String(BWRAP_ARGS_FD),
+      ...bwrapArgs.slice(mounts.end),
+    ],
+  )
   const viaArgsFileBytes = Buffer.byteLength(viaArgsFile, 'utf8')
   if (viaArgsFileBytes > limit) {
     closeBwrapArgsProfile(argsFd)
@@ -975,14 +1119,19 @@ function renderBwrapInvocation(
   return viaArgsFile
 }
 
-// Number of wrapped commands that have been generated but whose cleanup has
-// not yet run. cleanupBwrapMountPoints() defers file deletion while this is
-// positive, because deleting a mount point file on the host while another
-// bwrap instance is still running detaches that instance's bind mount and
-// the deny rule stops applying inside it.
+let exitHandlerRegistered = false
+
+/**
+ * Wraps handed to the caller and not yet cleaned up after. While above zero,
+ * some command of this process may not have started, and its manifest and
+ * --args profile must still be there when it does; so no manifest of a command
+ * that has not started is released unless the caller names the command.
+ */
 let activeSandboxCount = 0
 
-let exitHandlerRegistered = false
+// Forced cleanups so far. One zeroes the count under a wrap still in flight,
+// which from then on has nothing in it to give back.
+let forcedCleanups = 0
 
 /**
  * Register cleanup handler for bwrap mount points
@@ -1006,92 +1155,76 @@ function registerExitCleanupHandler(): void {
  * host filesystem as mount points for --ro-bind. These files persist after
  * bwrap exits. This function removes them.
  *
- * This should be called after each sandboxed command completes to prevent
+ * Call it once for each wrapped command, when that command is over, to keep
  * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
- * directory. It is also called automatically on process exit as a safety net.
+ * directory. It is also called on process exit as a safety net.
  *
- * Each call decrements the active-sandbox counter that was incremented by
- * wrapCommandWithSandboxLinux(). File deletion is deferred until the counter
- * reaches zero. Deleting a mount point file on the host while another bwrap
- * instance is still running detaches that instance's bind mount (the dentry
- * is unhashed, so path lookup no longer finds the mount) and the deny rule
- * stops applying inside that sandbox.
+ * A command that has run is judged by its own record: every call, in any
+ * process, collects what it relied on once it has ended, whatever else is
+ * outstanding. What only this process can say is that a command which has NOT
+ * started is over, and what it releases of those:
  *
- * Pass `{ force: true }` to delete unconditionally — used by the process-exit
- * handler and reset() where deferral is not meaningful.
+ * - with no `commandId`: none until it has been called once for every wrap
+ *   handed out, since nothing can tell which command the call is for;
+ * - with the `commandId` its wrap was given: that command's, at once;
+ * - with `force`: all, because the process or session is ending.
  *
- * Also closes the `--args` profiles the wraps of this batch opened.
+ * The --args profiles go when none is outstanding. A mount point goes only when
+ * no running sandbox relies on it, which each sandbox's own process answers
+ * (see bwrap-mount-manifests.ts). A call too many takes nothing from a running
+ * sandbox, but counts for another wrap of this process, whose command is then
+ * refused its start if it has not started by the time the count reaches zero.
+ * Does nothing except on Linux.
  */
-export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
-  if (!opts?.force) {
+export function cleanupBwrapMountPoints(opts?: {
+  force?: boolean
+  commandId?: string
+}): void {
+  if (process.platform !== 'linux') {
+    return
+  }
+  let release: OwnManifestRelease
+  if (opts?.force) {
+    activeSandboxCount = 0
+    forcedCleanups++
+    release = 'all'
+  } else {
     if (activeSandboxCount > 0) {
       activeSandboxCount--
     }
-    if (activeSandboxCount > 0) {
+    release =
+      activeSandboxCount === 0
+        ? 'all'
+        : opts?.commandId !== undefined
+          ? { commandKey: opts.commandId }
+          : 'none'
+    if (release !== 'all') {
       logForDebugging(
-        `[Sandbox Linux] Deferring mount point cleanup — ${activeSandboxCount} sandbox(es) still active`,
+        `[Sandbox Linux] ${activeSandboxCount} sandbox(es) of this process still outstanding - ` +
+          (release === 'none'
+            ? 'keeping what this process made'
+            : `releasing only what ${opts?.commandId} relied on`),
       )
-      return
-    }
-  } else {
-    activeSandboxCount = 0
-  }
-
-  for (const mountPoint of bwrapMountPoints) {
-    try {
-      // Only remove if it's still the empty file/directory bwrap created.
-      // If something else has written real content, leave it alone.
-      const stat = fs.statSync(mountPoint)
-      if (stat.isFile() && stat.size === 0) {
-        fs.unlinkSync(mountPoint)
-        logForDebugging(
-          `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
-        )
-      } else if (stat.isDirectory()) {
-        // Empty directory mount points are created for intermediate
-        // components (Fix 2). Only remove if still empty.
-        const entries = fs.readdirSync(mountPoint)
-        if (entries.length === 0) {
-          fs.rmdirSync(mountPoint)
-          logForDebugging(
-            `[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`,
-          )
-        }
-      }
-    } catch {
-      // Ignore cleanup errors — the file may have already been removed
-    }
-  }
-  bwrapMountPoints.clear()
-  if (emptyMountSourceDir !== undefined) {
-    try {
-      // rmdirSync, not a recursive remove: it neither follows a symlink nor
-      // descends, so a path that is no longer our empty directory is left
-      // exactly as found.
-      fs.rmdirSync(emptyMountSourceDir)
-      logForDebugging(
-        `[Sandbox Linux] Cleaned up the empty-directory mount source: ${emptyMountSourceDir}`,
-      )
-      emptyMountSourceDir = undefined
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code
-      if (code === 'ENOTEMPTY') {
-        logForDebugging(
-          `[Sandbox Linux] Left the empty-directory mount source behind, something has written into it: ${emptyMountSourceDir}`,
-        )
-      }
-      // Forget the path only when there is nothing left to remove. ENOTEMPTY,
-      // EACCES and EBUSY (a forced cleanup while a live sandbox still pins the
-      // source) leave it ours to try again; the revalidation on next use
-      // decides whether it can be reused.
-      if (code === 'ENOENT' || code === 'ENOTDIR') {
-        emptyMountSourceDir = undefined
-      }
     }
   }
 
-  for (const argsFd of [...bwrapArgsFds]) {
-    closeBwrapArgsProfile(argsFd)
+  const removed = collectMountPoints(release)
+  if (
+    emptyMountSourceDir !== undefined &&
+    removed.includes(emptyMountSourceDir)
+  ) {
+    emptyMountSourceDir = undefined
+  }
+
+  // An --args profile belongs to one wrap and nothing maps it back to a
+  // command, so they go together, when nothing is outstanding.
+  if (release === 'all') {
+    for (const argsFd of [...bwrapArgsFds]) {
+      closeBwrapArgsProfile(argsFd)
+    }
+  }
+  if (opts?.force) {
+    removePrivateManifestDirectory()
   }
 }
 
@@ -1120,6 +1253,12 @@ export type LinuxDependencyOptions = {
   seccompConfig?: SeccompConfig
   bwrapPath?: string
   socatPath?: string
+  /**
+   * What the sandboxed command may write (a wrap's `writeConfig.allowOnly`):
+   * bwrap and socat are looked for on PATH outside it, as the wrap does, and
+   * an explicit path inside it is warned about. Omitted: nothing restricted.
+   */
+  allowedWritePaths?: readonly string[]
 }
 
 function isExecutable(p: string): boolean {
@@ -1137,12 +1276,14 @@ function isExecutable(p: string): boolean {
 export function getLinuxDependencyStatus(
   opts?: LinuxDependencyOptions,
 ): LinuxDependencyStatus {
-  const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
+  const { seccompConfig, bwrapPath, socatPath, allowedWritePaths } = opts ?? {}
+  const onPath = (helper: string): boolean =>
+    findHostHelper(helper, allowedWritePaths).path !== null
   // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
   // the on-disk lookup and trust that applyPath resolves inside bwrap.
   return {
-    hasBwrap: bwrapPath ? isExecutable(bwrapPath) : whichSync('bwrap') !== null,
-    hasSocat: socatPath ? isExecutable(socatPath) : whichSync('socat') !== null,
+    hasBwrap: bwrapPath ? isExecutable(bwrapPath) : onPath('bwrap'),
+    hasSocat: socatPath ? isExecutable(socatPath) : onPath('socat'),
     hasSeccompApply: seccompConfig?.argv0
       ? true
       : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
@@ -1155,9 +1296,25 @@ export function getLinuxDependencyStatus(
 export function checkLinuxDependencies(
   opts?: LinuxDependencyOptions,
 ): SandboxDependencyCheck {
-  const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
+  const { seccompConfig, bwrapPath, socatPath, allowedWritePaths } = opts ?? {}
   const errors: string[] = []
   const warnings: string[] = []
+
+  // Found as the wrap will find it (see `findHostHelper`). A copy passed over
+  // is named, so the caller learns at start-up that it will not be run.
+  // INVARIANT: `notInstalled` is said of a helper that is nowhere on PATH and
+  // of nothing else, in the same words as ever: embedders match on them.
+  const onPath = (helper: string, notInstalled: string): string | null => {
+    const search = findHostHelper(helper, allowedWritePaths)
+    if (search.path === null) {
+      errors.push(
+        search.skipped.length > 0
+          ? describeUnavailableHostHelper(helper, search)
+          : notInstalled,
+      )
+    }
+    return search.path
+  }
 
   // An explicit override is a directive, not a hint — if it doesn't exist,
   // surface that rather than silently falling back to PATH.
@@ -1166,15 +1323,14 @@ export function checkLinuxDependencies(
     if (isExecutable(bwrapPath)) usableBwrap = bwrapPath
     else errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
   } else {
-    usableBwrap = whichSync('bwrap')
-    if (usableBwrap === null) errors.push('bubblewrap (bwrap) not installed')
+    usableBwrap = onPath('bwrap', 'bubblewrap (bwrap) not installed')
   }
 
   if (socatPath) {
     if (!isExecutable(socatPath))
       errors.push(`socat not executable at ${socatPath}`)
-  } else if (whichSync('socat') === null) {
-    errors.push('socat not installed')
+  } else {
+    onPath('socat', 'socat not installed')
   }
 
   if (
@@ -1182,6 +1338,16 @@ export function checkLinuxDependencies(
     getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
   ) {
     warnings.push('seccomp not available - unix socket access not restricted')
+  }
+
+  // A directive is followed wherever it points; a writable one is reported.
+  for (const [option, file] of [
+    ['bwrapPath', bwrapPath],
+    ['socatPath', socatPath],
+    ['seccomp.applyPath', seccompConfig?.applyPath],
+  ] as const) {
+    const warning = writableNamedHelperWarning(option, file, allowedWritePaths)
+    if (warning !== undefined) warnings.push(warning)
   }
 
   const uid0Error = uid0SandboxError({
@@ -1201,16 +1367,17 @@ export function checkLinuxDependencies(
  * The oldest bubblewrap on which everything this library does holds. Mount
  * plans start on 0.4.0 and later, but before 0.5.0 `ensure_file()` takes
  * only a regular file as a file bind's mount point, so a mask on a fifo,
- * socket or device node blocks or fails; and it creates one mode 0666 rather
- * than 0444, so isStaleBwrapMountPoint leaves what an interrupted sandbox
- * left behind on the host.
+ * socket or device node blocks or fails.
  */
 export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
 
 // Keyed by path, so a caller that passes an explicit bwrapPath is not
-// answered for another binary. Only an answer is kept: after a probe that
-// failed or timed out, the next call asks again.
-const bwrapVersions = new Map<string, string>()
+// answered for another binary. A probe that got no answer is kept too, as
+// null: it can block for the whole timeout, and callers ask several times
+// during one start-up.
+// INVARIANT: the version decides a warning and nothing else. No mount plan may
+// rest on it: one slow start would then decide for the life of the process.
+const bwrapVersions = new Map<string, string | null>()
 
 /** The version `bwrap --version` reports, or null when it could not be asked. */
 function probeBwrapVersion(bwrap: string): string | null {
@@ -1226,7 +1393,7 @@ function probeBwrapVersion(bwrap: string): string | null {
     probe.error === undefined && probe.status === 0
       ? (/\d+(?:\.\d+)*/.exec(probe.stdout ?? '')?.[0] ?? null)
       : null
-  if (version !== null) bwrapVersions.set(bwrap, version)
+  bwrapVersions.set(bwrap, version)
   return version
 }
 
@@ -1266,9 +1433,7 @@ function outdatedBwrapWarning(bwrap: string | null): string | null {
     `bubblewrap ${version} at ${bwrap} is older than ` +
     `${OLDEST_FULLY_SUPPORTED_BWRAP_VERSION}: a denyRead entry or credential ` +
     `mask naming a path that is not a regular file (a fifo, socket or device ` +
-    `node) cannot be applied on it, and a mount point an interrupted sandbox ` +
-    `left behind is not recognised as one and stays on the host. Everything ` +
-    `else is unaffected`
+    `node) cannot be applied on it. Everything else is unaffected`
   )
 }
 
@@ -1305,11 +1470,14 @@ export function uid0SandboxError({
 const uid0UserNamespaceProbes = new Map<string, string | null>()
 
 /**
- * Run `bwrap --unshare-user --dev-bind / / true` once and report whether this
+ * Run bwrap under `--unshare-user --dev-bind / /` once and report whether this
  * kernel actually refuses to map uid 0. `null` means it does not, so there is
  * nothing to report; otherwise bubblewrap's own first stderr line, or the
  * empty string when the probe could not be run at all and the prediction
  * stands unaided.
+ *
+ * The command run inside is bubblewrap's own `--version`, by its path: a bare
+ * name is looked up on PATH, and this runs as uid 0 with everything writable.
  */
 function probeUid0UserNamespace(bwrap: string): string | null {
   const cached = uid0UserNamespaceProbes.get(bwrap)
@@ -1317,7 +1485,7 @@ function probeUid0UserNamespace(bwrap: string): string | null {
 
   const probe = spawnSync(
     bwrap,
-    ['--unshare-user', '--dev-bind', '/', '/', 'true'],
+    ['--unshare-user', '--dev-bind', '/', '/', bwrap, '--version'],
     {
       timeout: 5000,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -1366,8 +1534,11 @@ export async function initializeLinuxNetworkBridge(
   httpProxyPort: number,
   socksProxyPort: number,
   socatPath?: string,
+  /** What the sandboxed command may write (see `findHostHelper`). */
+  allowedWritePaths?: readonly string[],
 ): Promise<LinuxNetworkBridgeContext> {
-  const socat = socatPath ?? 'socat'
+  // The bridges run on the host for as long as the sandbox is up.
+  const socat = socatPath ?? requireHostHelper('socat', allowedWritePaths)
   const socketId = randomBytes(8).toString('hex')
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
   // Only allocated when ports differ; in the mux case the SOCKS side
@@ -1516,6 +1687,60 @@ export async function initializeLinuxNetworkBridge(
 }
 
 /**
+ * Read by the seccomp helper, never by this process. The write denies are
+ * read-only binds, and a bind protects a path only in the mount namespace it
+ * was made in. Creating a user namespace takes no capability and gives a full
+ * set over a private copy of the mount tree, from which the binds can be
+ * detached all at once; a directory opened beforehand then reaches the denied
+ * names. So by default the helper refuses the calls with a seccomp filter and
+ * sets user.max_user_namespaces to zero in the namespace it made. `1` lifts
+ * both. A wrap with no helper gives bubblewrap --disable-userns instead.
+ */
+const NESTED_USERNS_ENV = 'SRT_ALLOW_NESTED_USERNS'
+
+/**
+ * The assignment the helper's command line starts with, so that the variable
+ * holds what the configuration says: the wrap reaches the helper through a
+ * shell, whose start-up files (BASH_ENV) could set it after bubblewrap cleared
+ * it, and an assignment before a command is made after those.
+ */
+function helperEnvironmentPrefix(allowNestedUserNamespaces: boolean): string {
+  return `${NESTED_USERNS_ENV}=${allowNestedUserNamespaces ? '1' : '0'} `
+}
+
+// Keyed by path, like the uid-0 probe. Only an answer is kept: a probe that
+// failed is made again the next time.
+const disableUsernsProbes = new Map<string, boolean>()
+
+/**
+ * Whether this bubblewrap lists --disable-userns (0.8.0 and later) and can
+ * honour it: a setuid bubblewrap refuses the option outright.
+ */
+export function bwrapCanDisableUserns(bwrap: string): boolean {
+  const cached = disableUsernsProbes.get(bwrap)
+  if (cached !== undefined) return cached
+  let can = false
+  try {
+    if ((fs.statSync(bwrap).mode & 0o4000) === 0) {
+      const help = spawnSync(bwrap, ['--help'], {
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8',
+      })
+      const text = `${help.stdout ?? ''}${help.stderr ?? ''}`
+      if (help.error !== undefined || text.trim() === '') return false
+      can = text.includes('--disable-userns')
+    }
+  } catch {
+    return false
+  }
+  disableUsernsProbes.set(bwrap, can)
+  return can
+}
+
+let noUsernsLimitLogged = false
+
+/**
  * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
  * multicall-binary prefix that dispatches on the ARGV0 env var.
  *
@@ -1593,14 +1818,15 @@ function buildSandboxCommand(
   socksSocketPath: string,
   userCommand: string,
   applySeccompPrefix: string | undefined,
-  shell?: string,
-  socatPath?: string,
+  shell: string | undefined,
+  socatPath: string,
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
-  // Host filesystem is bind-mounted into the sandbox, so an explicit
-  // socatPath resolves to the same binary inside bwrap.
-  const socat = quote([socatPath ?? 'socat'])
+  // Host filesystem is bind-mounted into the sandbox, so socat's host path
+  // names the same binary inside bwrap. Never the bare name: these listeners
+  // start before the seccomp filter is applied.
+  const socat = quote([socatPath])
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     '_srt_http=$!',
@@ -1677,7 +1903,8 @@ const KERNEL_TOP_LEVEL_DIRS = ['/proc', '/dev', '/sys']
 
 /**
  * A self-bind ("pin") for every directory between a seed (where a deny bind,
- * file mask or read-deny tmpfs lands) and the allowed write root covering it,
+ * file mask or read-deny tmpfs lands, or a directory of this library's own
+ * that is bound read-only) and the allowed write root covering it,
  * shallow-first, which makes each one a mountpoint the kernel refuses to
  * rename or remove. A directory that is not there is skipped: bwrap cannot
  * bind a missing source and there is nothing to rename. One that exists but
@@ -1876,7 +2103,19 @@ function pushReadDenyDirMounts(
 }
 
 /**
- * Generate filesystem bind mount arguments for bwrap
+ * How often a wrap plans its mounts before it gives up because what a plan
+ * relied on had changed by the time its manifest was published.
+ */
+const MOUNT_PLAN_ATTEMPTS = 3
+
+/** Thrown in a plan that cannot be finished and may be the next time. */
+class MountPlanFailed extends Error {}
+
+/**
+ * Generate filesystem bind mount arguments for bwrap. `undefined`, with its
+ * manifest let go of, when what the plan relied on on the host had changed by
+ * the time that was published: the caller plans again, as it does when this
+ * throws {@link MountPlanFailed}.
  */
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
@@ -1887,10 +2126,47 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
-): Promise<string[]> {
+  commandKey?: string,
+): Promise<
+  | {
+      args: string[]
+      /** How many of them, from the first, have to stay on the command line. */
+      onTheLine: number
+      manifest: MountPointManifest | undefined
+      /** Where the manifest's started record is, as the binds spell its directory. */
+      started: string | undefined
+      /** How many of them are the mandatory denies'. */
+      mandatoryDenyArgs: number
+    }
+  | undefined
+> {
   const args: string[] = []
   const startedIn = workingDirectory()
   // fs already imported
+
+  // The mount points on the host this wrap relies on: placeholders bwrap makes
+  // for absent deny paths, and another sandbox's that this wrap covers again.
+  const mountPoints: string[] = []
+  // What the manifests name, as of the last time it was asked.
+  let named: NamedMountPoints | undefined
+  const whatIsNamedNow = (ownManifest?: string): ReadonlySet<string> => {
+    const now = namedMountPoints(named, ownManifest)
+    if ('inDoubt' in now) {
+      if (now.keptChanging) {
+        throw new MountPlanFailed(now.inDoubt)
+      }
+      // Not "treat what is there as named": naming what may be the caller's
+      // own makes it removable, from under a sandbox that bound it as that.
+      // The reason names the file: this refuses every wrap while it lasts.
+      throw new LinuxSandboxProfileError(
+        'mount_points_unreadable',
+        `The mount point manifests cannot be read (${now.inDoubt}), so what is at a denied path cannot be told from a mount point a running sandbox relies on`,
+        now.inDoubt,
+      )
+    }
+    named = now
+    return named.paths
+  }
 
   // Collect normalized allowed write paths. Populated in the writeConfig
   // block, read again in the denyRead loop to re-bind writes under tmpfs.
@@ -1898,6 +2174,8 @@ async function generateFilesystemArgs(
   // denyWrite binds are buffered and emitted after denyRead processing so that
   // a denyRead tmpfs over an ancestor directory doesn't wipe them out.
   const denyWriteArgs: string[] = []
+  // Where the mandatory denies' binds begin in it: after the configuration's.
+  let mandatoryDenyArgsStart = Infinity
   // Directories that a deny entry re-binds read-only inside the sandbox
   // (--ro-bind <dir> <dir>), keyed by resolved dest, with every raw
   // (pre-resolution) spelling each was reached through. A non-existent deny
@@ -2013,6 +2291,16 @@ async function generateFilesystemArgs(
     (readAllowPathsMemo ??= (readConfig?.allowWithinDeny || []).map(p =>
       normalizePathForSandbox(p, { literal: true }),
     ))
+  let ownReadAllowPathsMemo: string[] | undefined
+  const ownReadAllowPaths = (): string[] =>
+    (ownReadAllowPathsMemo ??= (readConfig?.ownAllowWithinDeny ?? []).map(p =>
+      normalizePathForSandbox(p, { literal: true }),
+    ))
+  // The denyOnly entries that are credential denies, as they are spelled
+  // there, and what may be an exception to a read deny of either kind.
+  const credentialDenies = new Set(readConfig?.credentialDenyOnly)
+  const readExceptionsTo = (isCredential: boolean): string[] =>
+    isCredential ? ownReadAllowPaths() : readAllowPaths()
   // What the read section mounts for one denyRead entry: a tmpfs (directory)
   // or a /dev/null mask (anything else) on the entry itself; nothing when it
   // is not there; and, when it cannot be inspected, a tmpfs on the deepest
@@ -2116,10 +2404,11 @@ async function generateFilesystemArgs(
       // the stub-skip derivation catches a throw and gives up on the
       // prediction, and the denyRead loop below does not catch one at all.
       const children = retryingTransient(() => fs.readdirSync('/'))
+      const isCredential = credentialDenies.has(p)
       for (const child of children) {
         if (KERNEL_TOP_LEVEL_DIRS.includes(`/${child}`)) continue
         const childLocation = canonicalForm('/' + child)
-        const covered = readAllowPaths().some(allowPath =>
+        const covered = readExceptionsTo(isCredential).some(allowPath =>
           isAtOrUnder(childLocation, nameLocationOf(allowPath)),
         )
         if (covered) {
@@ -2129,6 +2418,7 @@ async function generateFilesystemArgs(
           continue
         }
         entries.push('/' + child)
+        if (isCredential) credentialDenies.add('/' + child)
       }
     }
     if (fs.existsSync('/etc/ssh/ssh_config.d')) {
@@ -2149,6 +2439,7 @@ async function generateFilesystemArgs(
     normalizedPath: string
     mount: ReturnType<typeof readDenyMountOf>
     liftedFile: boolean
+    isCredential: boolean
   }
   // What every denyRead entry mounts and where: ONE walk, whose answers the
   // deny loop, the locations the carve-out gate below reads, and the
@@ -2161,17 +2452,24 @@ async function generateFilesystemArgs(
   let readDenyPlanMemo: ReadDenyPlanEntry[] | undefined
   const readDenyPlan = (): ReadDenyPlanEntry[] =>
     (readDenyPlanMemo ??= readDenyEntries()
-      .map(p => normalizePathForSandbox(p, { literal: true }))
-      .sort((a, b) => canonicalDepth(a) - canonicalDepth(b))
-      .map(normalizedPath => {
+      .map(p => ({
+        normalizedPath: normalizePathForSandbox(p, { literal: true }),
+        isCredential: credentialDenies.has(p),
+      }))
+      .sort(
+        (a, b) =>
+          canonicalDepth(a.normalizedPath) - canonicalDepth(b.normalizedPath),
+      )
+      .map(({ normalizedPath, isCredential }) => {
         const mount = readDenyMountOf(normalizedPath)
         return {
           normalizedPath,
           mount,
+          isCredential,
           liftedFile:
             mount !== undefined &&
             !mount.isDirectory &&
-            readAllowPaths().some(
+            readExceptionsTo(isCredential).some(
               allowPath => nameLocationOf(allowPath) === mount.landing,
             ),
         }
@@ -2180,12 +2478,15 @@ async function generateFilesystemArgs(
   // beneath the allow binds, or after them under a '/' write root that would
   // otherwise bury them (see ancestorPinArgs).
   let ancestorPinInsertAt: number
+  // Just past the bind of the root.
+  let afterRootBind: number
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
     // Write restrictions: Start with read-only root, then allow writes to specific paths
     args.push('--ro-bind', '/', '/')
     const beneathAllowBinds = args.length
+    afterRootBind = beneathAllowBinds
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
@@ -2356,10 +2657,11 @@ async function generateFilesystemArgs(
       return stubSkipVetoInputs
     }
     // Deny writes within allowed paths (user-specified + mandatory denies)
+    const configuredDenyPaths = writeConfig.denyWithinAllow || []
     const denyPaths = [
-      ...(writeConfig.denyWithinAllow || []),
+      ...configuredDenyPaths,
       ...(await linuxGetMandatoryDenyPaths(
-        ripgrepConfig,
+        hostRipgrepConfig(ripgrepConfig, writeConfig.allowOnly),
         mandatoryDenySearchDepth,
         allowGitConfig,
         abortSignal,
@@ -2374,8 +2676,8 @@ async function generateFilesystemArgs(
     // bwrap's ensure_file() falls through to creat() on a read-only mount.
     const seenDenyWrite = new Set<string>()
     // Placeholder destination -> the index of its source in denyWriteArgs, so
-    // a later deny reaching the same destination can upgrade a /dev/null
-    // placeholder to the directory form in place (see the emission below).
+    // a later deny at or under that destination can upgrade a /dev/null
+    // placeholder to the directory form in place.
     const placeholderSourceArgIndex = new Map<string, number>()
     // PRE-PASS (order-independent): record the directories the loop below
     // re-binds read-only, BEFORE any stub decision, so the read-only
@@ -2547,7 +2849,10 @@ async function generateFilesystemArgs(
       }
       return covered
     }
-    for (const pathPattern of denyPaths) {
+    for (const [index, pathPattern] of denyPaths.entries()) {
+      if (index === configuredDenyPaths.length) {
+        mandatoryDenyArgsStart = denyWriteArgs.length
+      }
       const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
 
       // Skip /dev/* paths since --dev /dev already handles them
@@ -2620,30 +2925,80 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // A mount point an earlier sandbox left on the host (see
-      // isStaleBwrapMountPoint) is an absent deny path in all but name. Bound
-      // onto itself as an existing file it would never be tracked, so never
-      // removed, and on the host its existence can be the whole meaning (a
-      // lockfile's). Cover it with /dev/null like the absent leaf below and
-      // track it, so cleanupBwrapMountPoints() takes it away. Same gate as
-      // that branch. Under a read-only denied directory nothing needs
-      // covering (the file is already unwritable there), but it is still
-      // tracked: it is no more the caller's file for being there.
-      if (
-        (isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
-          isWithinAnyAllowedWritePath(normalizedPath)) &&
-        isStaleBwrapMountPoint(normalizedPath)
+      // INVARIANT: a plan agrees with itself. Each deny path takes its own look
+      // at the host, and another sandbox's bubblewrap can make `.claude` between
+      // two of them: the later deny would then get a mount point of its own
+      // inside the read-only directory this plan has put at `.claude`, which
+      // bubblewrap cannot make. So what lies at or under a placeholder of this
+      // plan is covered by it, whatever is on the host by now.
+      //
+      // One mount point per destination, too: two binds on one make bwrap refuse
+      // to start when they disagree about its kind ("Can't mkdir <dest>: Not a
+      // directory"). The directory form wins: an empty read-only directory
+      // blocks creating the destination and everything below it exactly as
+      // /dev/null does, and stays traversable for the deeper deny.
+      let placeholder = normalizedPath
+      while (
+        placeholder !== '/' &&
+        !placeholderSourceArgIndex.has(placeholder)
       ) {
-        if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
-          denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
-          denyWriteRawDests.set(normalizedPath, rawPath)
+        placeholder = path.dirname(placeholder)
+      }
+      const placeholderAt = placeholderSourceArgIndex.get(placeholder)
+      if (placeholderAt !== undefined) {
+        if (placeholder !== normalizedPath) {
+          denyWriteArgs[placeholderAt] = emptySource ??=
+            ensureEmptyMountSourceDir()
         }
-        bwrapMountPoints.add(normalizedPath)
-        registerExitCleanupHandler()
         logForDebugging(
-          `[Sandbox Linux] Re-covering a mount point an earlier sandbox left behind: ${normalizedPath}`,
+          `[Sandbox Linux] Reusing the mount point at ${placeholder} to block creation of ${normalizedPath}`,
         )
         continue
+      }
+
+      // A mount point another sandbox made is an absent deny path in all but
+      // name: bound onto itself it would not be named in this wrap's manifest
+      // and would go, with this sandbox still bound over it, when its maker is
+      // cleaned up after. Only a manifest says that a path is one; what no
+      // manifest names is the caller's own and is never removed. An empty FILE
+      // that a manifest names is covered with /dev/null and named here. A
+      // DIRECTORY is bound onto itself further down, since /dev/null cannot be
+      // bound over one, and is named with the other directories this profile
+      // relies on, where the manifest is published.
+      //
+      // The shape is asked before the existence, and once more when the two
+      // disagree: another process can remove or make a mount point at any
+      // moment.
+      let isEmptyFile = kindOfMountPoint(normalizedPath) === 'file'
+      // Asked once for the branches below.
+      let pathExists = isEmptyFile || fs.existsSync(normalizedPath)
+      if (pathExists && !isEmptyFile) {
+        isEmptyFile = kindOfMountPoint(normalizedPath) === 'file'
+      }
+      if (
+        isEmptyFile &&
+        (isWithinAnyAllowedWritePath(path.dirname(normalizedPath)) ||
+          isWithinAnyAllowedWritePath(normalizedPath))
+      ) {
+        // A reading that names the path is believed whenever it was taken. One
+        // that does not is believed only if taken after the file was seen: a
+        // sandbox publishes its manifest before bubblewrap makes the file, so
+        // an older reading would miss a sandbox that started since.
+        if (
+          named?.paths.has(normalizedPath) ||
+          whatIsNamedNow().has(normalizedPath)
+        ) {
+          if (!coveredBySafeReadOnlyDenyDir(normalizedPath)) {
+            denyWriteArgs.push('--ro-bind', '/dev/null', normalizedPath)
+            denyWriteRawDests.set(normalizedPath, rawPath)
+          }
+          mountPoints.push(normalizedPath)
+          logForDebugging(
+            `[Sandbox Linux] Re-covering a mount point another sandbox made: ${normalizedPath}`,
+          )
+          continue
+        }
+        pathExists = fs.existsSync(normalizedPath)
       }
 
       // Handle non-existent paths by mounting /dev/null to block creation.
@@ -2651,9 +3006,9 @@ async function generateFilesystemArgs(
       // doesn't exist yet, bypassing the deny rule entirely.
       //
       // bwrap creates empty files on the host as mount points for these binds.
-      // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
-      // remove them after the command exits.
-      if (!fs.existsSync(normalizedPath)) {
+      // This wrap names them in its manifest, so a collect can remove them
+      // once no running sandbox relies on them.
+      if (!pathExists) {
         // Fix 1 (worktree): If any existing component above the deny path is
         // a file (not a directory), skip the deny entirely. You can't mkdir
         // under a file, so the deny path can never be created. This handles
@@ -2711,38 +3066,17 @@ async function generateFilesystemArgs(
             ? (emptySource ??= ensureEmptyMountSourceDir())
             : '/dev/null'
 
-          // One mount point per destination. Deny paths are deduplicated on
-          // the deny path, but a placeholder lands on the first MISSING
-          // component, so two denies sharing one arrive here with a single
-          // destination — denyWrite '<cwd>/.claude' together with the
-          // mandatory '<cwd>/.claude/commands', in a project with no
-          // `.claude/`. Two binds there make bwrap refuse to start when they
-          // disagree about the destination's kind ("Can't mkdir <dest>: Not a
-          // directory"). The directory form wins the disagreement: an empty
-          // read-only directory blocks creating the destination and everything
-          // below it exactly as /dev/null does, and stays traversable for the
-          // deeper deny that asked for a directory.
-          const placeholderAt = placeholderSourceArgIndex.get(firstNonExistent)
-          if (placeholderAt !== undefined) {
-            if (isIntermediate) denyWriteArgs[placeholderAt] = source
-            logForDebugging(
-              `[Sandbox Linux] Reusing the mount point at ${firstNonExistent} to block creation of ${normalizedPath}`,
-            )
-            continue
-          }
           denyWriteArgs.push('--ro-bind', source, firstNonExistent)
           placeholderSourceArgIndex.set(
             firstNonExistent,
             denyWriteArgs.length - 2,
           )
-          // First writer wins for a destination several denies share (the
-          // reuse branch above returns before reaching this), and the record
-          // is purely additive: it only gives the tmpfs and mask comparisons
-          // below a second spelling to test, and `dest` itself is always
-          // tested.
+          // First writer wins for a destination several denies share (the later
+          // ones do not get this far), and the record is purely additive: it
+          // only gives the tmpfs and mask comparisons below a second spelling to
+          // test, and `dest` itself is always tested.
           denyWriteRawDests.set(firstNonExistent, rawPath)
-          bwrapMountPoints.add(firstNonExistent)
-          registerExitCleanupHandler()
+          mountPoints.push(firstNonExistent)
           logForDebugging(
             `[Sandbox Linux] Mounted ${
               isIntermediate ? 'empty dir' : '/dev/null'
@@ -2807,7 +3141,7 @@ async function generateFilesystemArgs(
     // specially. Nothing is ever restored for it: no read-deny tmpfs lands
     // at '/'.
     allowedWritePaths.push('/')
-    ancestorPinInsertAt = args.length
+    ancestorPinInsertAt = afterRootBind = args.length
   }
   // denyWriteArgs is emitted after the denyRead loop below.
 
@@ -2908,6 +3242,21 @@ async function generateFilesystemArgs(
         (isAtOrUnder(denied, target) || isAtOrUnder(target, denied)),
     )
 
+  // What a tmpfs unit binds back. A path whose name lives at or beneath the
+  // landing of a credential deny is bound back by no unit, the library's own
+  // files apart. A path above such a landing is, and the credential deny,
+  // being deeper, is mounted after it.
+  const credentialLandings = readDenyPlan().flatMap(
+    ({ mount, isCredential }) =>
+      mount !== undefined && isCredential ? [mount.landing] : [],
+  )
+  const outsideCredentials = (p: string): boolean =>
+    !credentialLandings.some(at => isAtOrUnder(nameLocationOf(p), at))
+  const restorableReadPaths = readAllowPaths().filter(
+    p => outsideCredentials(p) || ownReadAllowPaths().includes(p),
+  )
+  const restorableWritePaths = allowedWritePaths.filter(outsideCredentials)
+
   for (const { normalizedPath, mount, liftedFile } of readDenyPlan()) {
     if (mount === undefined) {
       logForDebugging(
@@ -2950,8 +3299,8 @@ async function generateFilesystemArgs(
       const restoresNothing = isStandIn || unlistable
       const restored = pushReadDenyDirMounts(args, {
         landing,
-        allowedWritePaths: restoresNothing ? [] : allowedWritePaths,
-        readAllowPaths: restoresNothing ? [] : readAllowPaths(),
+        allowedWritePaths: restoresNothing ? [] : restorableWritePaths,
+        readAllowPaths: restoresNothing ? [] : restorableReadPaths,
         resolve: canonicalLocationOf,
         readDenialAround: restoreTarget =>
           readDenialAround(restoreTarget, landing),
@@ -3010,11 +3359,26 @@ async function generateFilesystemArgs(
   // each: a symlink spelling would pin the chain of the link, not of where
   // the mount sits. Deny binds, tmpfs units and masks are emitted later and
   // land on top of both pins and covers.
+  //
+  // This library's own read-only directories are seeds as well (the manifest
+  // directories, the fake-file store, the empty placeholder source): a
+  // read-only bind protects one only while its name still leads to it, and
+  // with the temp dir strictly inside a write root a command could otherwise
+  // rename the temp dir aside and make the name again.
+  const manifestDirs =
+    writeConfig !== undefined
+      ? mountPointManifestDirectories(
+          mountPoints.length > 0 || emptySource !== undefined,
+        )
+      : []
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
       ...fileMasks.map(mask => mask.landing),
       ...readDenyTmpfsUnits.map(unit => unit.landing),
+      ...[...manifestDirs, maskedFileStoreDir, emptySource].flatMap(dir =>
+        dir === undefined ? [] : [canonicalForm(dir)],
+      ),
     ],
     {
       rootIsWriteRoot: isAllowedWriteRoot('/'),
@@ -3023,6 +3387,20 @@ async function generateFilesystemArgs(
     },
   )
   args.splice(ancestorPinInsertAt, 0, ...pinArgs)
+  // What the mandatory denies cost, for the refusal of a profile with too many
+  // arguments: the pins above them here, their own binds as they are emitted.
+  const pinned = new Set(pinArgs)
+  const mandatoryDenyPins = new Set<string>()
+  for (let i = mandatoryDenyArgsStart; i < denyWriteArgs.length; i += 3) {
+    for (
+      let dir = path.dirname(denyWriteArgs[i + 2]!);
+      dir !== '/' && !mandatoryDenyPins.has(dir);
+      dir = path.dirname(dir)
+    ) {
+      if (pinned.has(dir)) mandatoryDenyPins.add(dir)
+    }
+  }
+  let mandatoryDenyArgs = 3 * mandatoryDenyPins.size
 
   // Emitting denyWrite last means these ro-binds layer on top of any write
   // paths the denyRead loop just re-bound. Before this ordering, tmpfs over
@@ -3098,6 +3476,7 @@ async function generateFilesystemArgs(
       continue
     }
     args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
+    if (i >= mandatoryDenyArgsStart) mandatoryDenyArgs += 3
     emittedDenyWriteDests.push(dest)
     // The tmpfs / mask re-application passes below ask "does this bind sit
     // above a read-denied path?". A bind at the resolved dest also re-exposes
@@ -3152,14 +3531,142 @@ async function generateFilesystemArgs(
     }
   }
 
+  // What on the host the profile takes to be there: what it binds from or
+  // mounts on, and the directory each of its mount points is made in, which
+  // bubblewrap would make again, unpinned and named by nothing, if it were gone.
+  // Not for a wrap that restricts no write: it has no mount point of its own,
+  // and the manifests are not kept out of its command's reach either.
+  const madeIn = new Set(mountPoints.map(made => path.dirname(made)))
+  const boundFrom = new Set<string>()
+  if (writeConfig !== undefined) {
+    args.forEach((word, i) => {
+      if (word === '--bind' || word === '--ro-bind' || word === '--tmpfs') {
+        boundFrom.add(args[i + 1]!)
+      }
+    })
+  }
+  // Those of them, and the directories above them, that a manifest names:
+  // another sandbox's mount points, which go when no live manifest names them.
+  // A file among them was made again after the deny loop took it for the
+  // caller's own.
+  const mountPointsReliedOn = (ownManifest?: string): string[] => {
+    const found = new Set<string>()
+    const namedNow = boundFrom.size > 0 ? whatIsNamedNow(ownManifest) : found
+    for (const relied of namedNow.size > 0 ? [...madeIn, ...boundFrom] : []) {
+      for (let dir = relied; dir !== '/'; dir = path.dirname(dir)) {
+        if (namedNow.has(dir)) found.add(dir)
+      }
+    }
+    return [...found].filter(relied => kindOfMountPoint(relied) !== undefined)
+  }
+
+  // Name the mount points this wrap relies on before the sandbox can start.
+  // Those that could be recorded nowhere are this process's to remove.
+  //
+  // INVARIANT: the manifest names every path the profile relies on that a
+  // clean-up could remove, its own mount points and other sandboxes' alike, on
+  // a reading taken after the last look at the host above. A directory it left
+  // out (the one a placeholder is nested in, a pin) goes with its maker, and the
+  // command is then refused its start or, once the pin is mounted, loses it.
+  //
+  // INVARIANT: a manifest directory must never be writable from inside a
+  // sandbox. A command that could delete a manifest could make a running
+  // sandbox's mount points look unused, and one that could write a manifest
+  // could name any path for a collect on the host to remove. This holds for
+  // every wrap that restricts writes, whether or not it names a manifest, and
+  // for every directory some process of this user keeps manifests in, so each
+  // is bound read-only (see mountPointManifestDirectories) with what lies above
+  // it pinned. Emitted after every allow and deny bind, like the two stores
+  // below.
+  //
+  // Each is bound where it really is, not at the name the environment gave:
+  // bubblewrap makes a bind's destination by name inside the new root, and a
+  // link with an absolute target on the way leads nowhere from there.
+  const names = [...mountPoints, ...mountPointsReliedOn()]
+  const manifest = publishMountPointManifest(
+    names,
+    emptySource === undefined ? [] : [emptySource],
+    commandKey,
+  )
+  if (manifest === 'too-large') {
+    throw new LinuxSandboxProfileError(
+      'too_many_mount_points',
+      `Sandbox profile relies on ${names.length} mount points, more than one manifest holds; reduce the write denies on paths that do not exist`,
+    )
+  }
+  // From here a clean-up keeps what the manifest names. Until here any of it
+  // could go, or be made again by a sandbox that no reading above knew of. So
+  // the wrap looks again, this once, and plans afresh if anything is amiss.
+  // What cannot be looked at counts as there: bubblewrap does not start on what
+  // it cannot bind.
+  const isThere = (relied: string, asDirectory: boolean): boolean => {
+    try {
+      return fs.statSync(relied).isDirectory() || !asDirectory
+    } catch (err) {
+      return !isAbsenceErrno(err)
+    }
+  }
+  let holds = false
+  try {
+    holds =
+      [...boundFrom].every(relied => isThere(relied, false)) &&
+      [...madeIn].every(relied => isThere(relied, true)) &&
+      mountPointsReliedOn(manifest?.file).every(dir => names.includes(dir)) &&
+      // Else settled on since the pins were made: nothing is pinned above it.
+      (manifest === undefined || manifestDirs.includes(manifest.dir))
+  } finally {
+    if (!holds && manifest !== undefined) {
+      discardMountPointManifest(manifest.file)
+    }
+  }
+  if (!holds) {
+    return undefined
+  }
+  let started: string | undefined
+  let onTheLine = 0
+  if (manifest !== undefined) {
+    const dir = canonicalForm(manifest.dir)
+    const file = path.join(dir, path.basename(manifest.file))
+    started = path.join(dir, path.basename(manifest.started))
+    // INVARIANT: the manifest is the first thing bound after the root, and its
+    // bind is on the command line, not in an --args file. bubblewrap looks up
+    // every bind source before it makes anything, so a command started once a
+    // clean-up has claimed its manifest fails there ("Can't find source path")
+    // wherever the bind stands. First is for the claim that lands after that
+    // look: bubblewrap then fails at this bind ("Can't get type of source"),
+    // and bound any later it would by then have made mount points on the host
+    // that nothing names or removes. On the line, because the --args file is
+    // opened by a descriptor number that another wrap's file may have by then.
+    args.splice(afterRootBind, 0, '--ro-bind', file, file)
+    onTheLine = afterRootBind + 3
+    args.push('--ro-bind', dir, dir)
+  }
+  if (names.length > 0 || emptySource !== undefined) {
+    registerExitCleanupHandler()
+  }
+  if (writeConfig !== undefined) {
+    // The others need only be kept out of the command's reach, so one that has
+    // gone by the time the command starts - a temp dir whose parent was
+    // replaced - is not an error.
+    for (const manifestDir of manifestDirs) {
+      if (manifestDir !== manifest?.dir) {
+        const dir = canonicalForm(manifestDir)
+        args.push('--ro-bind-try', dir, dir)
+      }
+    }
+  }
+
   // INVARIANT: the fake-file store directory must never be writable from
   // inside the sandbox. If it were, a sandboxed process could plant a
   // symlink at a fake path and a later host-side write() would follow it,
   // or replace a fake's content so the bind exposes attacker bytes. Emit
   // last so it overlays any earlier --bind that covers the store dir
-  // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()).
+  // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()). Bound
+  // where it really is, like the manifest directories above and for the same
+  // reason.
   if (maskedFileStoreDir !== undefined) {
-    args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
+    const dir = canonicalForm(maskedFileStoreDir)
+    args.push('--ro-bind', dir, dir)
   }
 
   // INVARIANT, for the same reason: the empty directory the placeholders above
@@ -3167,14 +3674,16 @@ async function generateFilesystemArgs(
   // the system temp dir, so a caller's allowWrite or a host $TMPDIR under a
   // default write path makes it writable — and a placeholder binds it onto a
   // DENIED destination, so a write to the source lands at the deny. Emit last,
-  // like the store, to overlay any earlier --bind that covers it. A same-uid
-  // process on the host can still swap the source between wrap and run, which
-  // is outside what this library defends against.
+  // like the store, to overlay any earlier --bind that covers it, and where it
+  // really is, like the store. A same-uid process on the host can still swap
+  // the source between wrap and run, which is outside what this library
+  // defends against.
   if (emptySource !== undefined) {
-    args.push('--ro-bind', emptySource, emptySource)
+    const dir = canonicalForm(emptySource)
+    args.push('--ro-bind', dir, dir)
   }
 
-  return args
+  return { args, onTheLine, manifest, started, mandatoryDenyArgs }
 }
 
 /**
@@ -3218,7 +3727,8 @@ async function generateFilesystemArgs(
  * CALLER OBLIGATION: the euid and capability decisions behind the returned
  * string are made here, in the process that builds it, so the string must be
  * run by a process with the same euid and the same capability bounding and
- * inheritable sets.
+ * inheritable sets, and in the same PID namespace: a command that names mount
+ * points records its own pid, which a clean-up asks after from here.
  */
 export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
@@ -3239,6 +3749,7 @@ export async function wrapCommandWithSandboxLinux(
     maskedFileBinds,
     maskedFileStoreDir,
     enableWeakerNestedSandbox,
+    allowNestedUserNamespaces,
     allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
@@ -3281,14 +3792,6 @@ export async function wrapCommandWithSandboxLinux(
     return command
   }
 
-  // Mark this sandbox invocation as active. cleanupBwrapMountPoints() will
-  // defer file deletion until this (and every other concurrent) invocation
-  // has been cleaned up. The matching decrement happens in
-  // cleanupBwrapMountPoints(), which the caller must invoke after the
-  // spawned command exits. If wrapping fails below, the catch block
-  // decrements so the count does not leak.
-  activeSandboxCount++
-
   // One encoded key for both carriers below (SRT_ENCODED_CMD for the seccomp
   // observer, the proxy username for network denies), so a violation seen
   // through either resolves to the same registry entry. macOS derives its log
@@ -3297,10 +3800,23 @@ export async function wrapCommandWithSandboxLinux(
     attributionKeyFor(command, commandId),
   )
 
+  // Counted from here, for the clean-up the caller makes when the command is
+  // over; the catch below takes it back if no command comes of this wrap.
+  activeSandboxCount++
+  const countedAfter = forcedCleanups
+
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let applySeccompPrefix: string | undefined
+  // The manifest naming the mount points this wrap relies on, dropped again if
+  // no command comes of it.
+  let manifest: MountPointManifest | undefined
 
   try {
+    // Found before anything else is done: a wrap that must refuse for want of
+    // it has then scanned nothing and recorded no mount point.
+    const bwrapBinary =
+      bwrapPath ?? requireHostHelper('bwrap', writeConfig?.allowOnly)
+
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
@@ -3317,6 +3833,9 @@ export async function wrapCommandWithSandboxLinux(
           { level: 'warn' },
         )
       } else {
+        applySeccompPrefix =
+          helperEnvironmentPrefix(allowNestedUserNamespaces === true) +
+          applySeccompPrefix
         logForDebugging(
           '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
         )
@@ -3465,19 +3984,40 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
-    const fsArgs = await generateFilesystemArgs(
-      readConfig,
-      writeConfig,
-      maskedFileBinds,
-      maskedFileStoreDir,
-      ripgrepConfig,
-      mandatoryDenySearchDepth,
-      allowGitConfig,
-      abortSignal,
-    )
-    const mountsStart = bwrapArgs.length
-    bwrapArgs.push(...fsArgs)
-    const mounts = { start: mountsStart, end: bwrapArgs.length }
+    let filesystem: Awaited<ReturnType<typeof generateFilesystemArgs>>
+    for (let left = MOUNT_PLAN_ATTEMPTS; filesystem === undefined; left--) {
+      if (left === 0) {
+        throw new LinuxSandboxProfileError(
+          'mount_points_changed',
+          `What the sandbox profile relies on on the host changed under each of ${MOUNT_PLAN_ATTEMPTS} plans: other sandboxes' mount points, or their manifests, are being made and removed there`,
+        )
+      }
+      filesystem = await generateFilesystemArgs(
+        readConfig,
+        writeConfig,
+        maskedFileBinds,
+        maskedFileStoreDir,
+        ripgrepConfig,
+        mandatoryDenySearchDepth,
+        allowGitConfig,
+        abortSignal,
+        // Only an id the caller chose: the attribution key falls back to the
+        // command text, which two wraps in flight may share.
+        commandId,
+      ).catch((error: unknown) => {
+        if (!(error instanceof MountPlanFailed)) throw error
+        return undefined
+      })
+    }
+    // Held for the catch below: a wrap that produces no command has to let go
+    // of the mount points it named.
+    manifest = filesystem.manifest
+    const mounts = {
+      start: bwrapArgs.length + filesystem.onTheLine,
+      end: bwrapArgs.length + filesystem.args.length,
+      mandatoryDenyArgs: filesystem.mandatoryDenyArgs,
+    }
+    bwrapArgs.push(...filesystem.args)
 
     // Always bind /dev
     bwrapArgs.push('--dev', '/dev')
@@ -3521,6 +4061,31 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push('--bind', '/proc', '/proc')
     }
 
+    // The caller's environment decides nothing about the command's namespaces:
+    // the variable is cleared after every other environment operation, which
+    // bubblewrap applies in argument order, and helperEnvironmentPrefix sets it.
+    bwrapArgs.push('--unsetenv', NESTED_USERNS_ENV)
+
+    // With no helper to refuse user namespaces, bubblewrap is asked to. Never
+    // beside the helper, which makes one of its own, and not under
+    // enableWeakerNestedSandbox: bubblewrap does it by writing a sysctl, and
+    // dies on the read-only /proc/sys of an unprivileged container.
+    if (applySeccompPrefix === undefined && !allowNestedUserNamespaces) {
+      // Asked of the copy this wrap runs, never of PATH's: the probe runs it
+      // on the host.
+      if (!enableWeakerNestedSandbox && bwrapCanDisableUserns(bwrapBinary)) {
+        bwrapArgs.push('--disable-userns')
+      } else if (!noUsernsLimitLogged) {
+        noUsernsLimitLogged = true
+        logForDebugging(
+          '[Sandbox Linux] no seccomp helper in use, and bubblewrap cannot disable user namespaces ' +
+            '(needs 0.8.0 or later, not setuid, and no enableWeakerNestedSandbox) - ' +
+            'a sandboxed command that creates one can undo the write denies',
+          { level: 'warn' },
+        )
+      }
+    }
+
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
     // by creating a nested user namespace. This requires the host to permit
     // capability-bearing unprivileged user namespaces (the same requirement
@@ -3530,6 +4095,8 @@ export async function wrapCommandWithSandboxLinux(
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
     // Resolve the full path to the shell binary since bwrap doesn't use $PATH
+    // The shell runs inside the sandbox, so the plain search over the whole
+    // PATH is right for it, writable entries included.
     const shellName = binShell || 'bash'
     const shell = whichSync(shellName)
     if (!shell) {
@@ -3547,7 +4114,7 @@ export async function wrapCommandWithSandboxLinux(
         command,
         applySeccompPrefix,
         shell,
-        socatPath,
+        socatPath ?? requireHostHelper('socat', writeConfig?.allowOnly),
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
@@ -3558,9 +4125,10 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     const wrappedCommand = renderBwrapInvocation(
-      bwrapPath ?? 'bwrap',
+      bwrapBinary,
       bwrapArgs,
       mounts,
+      filesystem.started,
     )
 
     const restrictions = []
@@ -3574,13 +4142,20 @@ export async function wrapCommandWithSandboxLinux(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
     )
 
+    // INVARIANT: a wrap that hands out a command is in the count when it does,
+    // whatever a forced cleanup did meanwhile: its caller gives one back.
+    if (forcedCleanups !== countedAfter) activeSandboxCount++
     return wrappedCommand
   } catch (error) {
-    // Undo the activeSandboxCount increment — the caller won't call
-    // cleanupBwrapMountPoints() for a wrap that threw.
-    if (activeSandboxCount > 0) {
-      activeSandboxCount--
+    // No command came of this wrap, so no sandbox starts under its manifest.
+    if (manifest !== undefined) {
+      discardMountPointManifest(manifest.file)
     }
+    // Its place in the count goes back through the clean-up: a command that
+    // ended meanwhile left to this wrap what goes when none is outstanding.
+    // After a forced cleanup the count is of other wraps only: one taken from
+    // it has a command that has not started refused its start.
+    if (forcedCleanups === countedAfter) cleanupBwrapMountPoints()
     throw error
   }
 }

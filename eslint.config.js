@@ -42,6 +42,17 @@ export default [
     },
   },
   {
+    // Imports the BUILT package, so it is typechecked after the build and by
+    // a project of its own (see `npm run test:bundled`).
+    files: ['test/smoke/**/*.ts'],
+    languageOptions: {
+      parserOptions: {
+        project: './test/smoke/tsconfig.json',
+        projectService: false,
+      },
+    },
+  },
+  {
     plugins: {
       'eslint-plugin-n': pluginNode,
       import: pluginImport,

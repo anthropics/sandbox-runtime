@@ -1,5 +1,6 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
+  type GlobWalkBudget,
   type GlobWalkListings,
   isAtOrUnder,
   normalizePathForSandbox,
@@ -68,19 +69,28 @@ function collapseReadDenyLocations({
  * could not list is denied whole. Sorted, so an ancestor precedes its
  * descendants.
  *
+ * Throws {@link GlobWalkBudgetError} when `budget` runs out. There is no
+ * shorter list to fall back on: the caller must not run the command.
+ *
  * @param unlistableDirs - receives the returned locations that hide something
  * the walk could not enumerate, whether by being that directory or by
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
  * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
- * @param opts.listings - one map for all the patterns of a configuration.
+ * @param opts.budget - shared with every expansion handed the same object.
+ * @param opts.listings - likewise: one map for all the patterns of a
+ * configuration.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: { anchor?: string; listings?: GlobWalkListings } = {},
+  opts: {
+    anchor?: string
+    budget?: GlobWalkBudget
+    listings?: GlobWalkListings
+  } = {},
 ): string[] {
   return finish(
     expandReadDenyGlobLinuxSteps(
@@ -97,12 +107,18 @@ export function* expandReadDenyGlobLinuxSteps(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: { anchor?: string; listings?: GlobWalkListings } = {},
+  opts: {
+    anchor?: string
+    budget?: GlobWalkBudget
+    listings?: GlobWalkListings
+  } = {},
 ): Steps<string[]> {
+  const startedAt = performance.now()
   const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
     anchor: opts.anchor,
+    budget: opts.budget,
     listings: opts.listings,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
@@ -209,8 +225,11 @@ export function* expandReadDenyGlobLinuxSteps(
     }
   }
 
+  // One line per expansion: a caller that times its wraps reads the cost here.
   logForDebugging(
-    `[Sandbox Linux] Expanded denyRead glob "${globPattern}": ${walk.matches.length} matches -> ${mounts.size} mounts`,
+    `[Sandbox Linux] Expanded denyRead glob "${globPattern}" in ${Math.round(performance.now() - startedAt)} ms: ` +
+      `${walk.matches.length} matches -> ${mounts.size} mounts; ` +
+      `directories listed: ${walk.directoriesListed}, entries looked at: ${walk.entriesExamined}`,
   )
   for (const mount of mounts) {
     // A matched link decides what is hidden for the whole sandbox: a

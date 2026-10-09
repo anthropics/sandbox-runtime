@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   readlinkSync,
   realpathSync,
   rmSync,
@@ -19,7 +20,9 @@ import {
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { LinuxSandboxProfileError } from '../../src/index.js'
 import { isLinux } from '../helpers/platform.js'
+import { manifestOf, RECORD_STEP, STEP_SHELL } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
 describe('the bwrap profile error at the package root', () => {
   it('carries a name, a code, and a cause only when one is given', () => {
@@ -51,15 +54,21 @@ describe('the bwrap profile error at the package root', () => {
  * command line.
  */
 describe.if(isLinux)('bwrap --args for over-long profiles', () => {
+  usePrivateManifestDirectory()
   const MAX_ARG_STRLEN =
     32 * Number(spawnSync('getconf', ['PAGESIZE'], { encoding: 'utf8' }).stdout)
   // The largest rendering kept on the command line: the kernel's limit less
   // the NUL, less the 4 KiB left for a prefix of the caller's own.
   const INLINE_MAX = MAX_ARG_STRLEN - 1 - 4096
   // The one rendered shape: the profile's path, then the options left before
-  // and the words left after `--args 9`.
-  const VIA_ARGS_FILE =
-    /^\/bin\/sh -c 'exec 9<"\$1" && shift && exec "\$@"' srt-args (\S+) bwrap (.*?) ?--args 9 (.*)$/s
+  // and the words left after `--args 9`. A wrap that named mount points has
+  // the same shell put itself on the manifest's record first.
+  const literally = (text: string): string =>
+    text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')
+  const VIA_ARGS_FILE = new RegExp(
+    `^${literally(STEP_SHELL)} '(?:${literally(RECORD_STEP)} && )?exec 9<"\\$1" && shift && exec "\\$@"' srt-args (?:\\S+\\.started )?(\\S+) \\/\\S*\\/bwrap (.*?) ?--args 9 (.*)$`,
+    's',
+  )
   const MODULE = join(
     import.meta.dir,
     '../../src/sandbox/linux-sandbox-utils.ts',
@@ -151,6 +160,36 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     return thrown
   }
 
+  // `count` of what the mandatory-deny scan takes for a repository, directly
+  // inside the working directory.
+  function repositories(count: number): string[] {
+    return Array.from({ length: count }, (_, i) => {
+      const repository = join(BASE, `repo-${i}`)
+      mkdirSync(join(repository, '.git', 'hooks'), { recursive: true })
+      writeFileSync(join(repository, '.git', 'config'), '')
+      writeFileSync(join(repository, '.git', 'HEAD'), '')
+      return repository
+    })
+  }
+
+  // The two shares a refusal for too many arguments states.
+  function sharesIn(error: LinuxSandboxProfileError): {
+    total: number
+    mandatory: number
+  } {
+    expect(error.code).toBe('too_many_arguments')
+    const said = error.message.match(
+      /\. (\d+) of its arguments are built-in write protection, .*\. The other (\d+) are what the configuration expands to: /,
+    )
+    if (!said) {
+      throw new Error(`no shares in: ${error.message}`)
+    }
+    return {
+      total: Number(said[1]) + Number(said[2]),
+      mandatory: Number(said[1]),
+    }
+  }
+
   function argsPathOf(wrapped: string): string {
     const rendered = wrapped.match(VIA_ARGS_FILE)
     expect(rendered).not.toBeNull()
@@ -195,13 +234,21 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     // fit one argument itself.
     const scriptFile = join(BASE, 'isolated.ts')
     writeFileSync(scriptFile, script)
-    // A tmpdir of its own, so what a scenario leaves there goes with BASE.
+    // A tmpdir of its own, so what a scenario leaves there goes with BASE,
+    // and no runtime directory: the mount point manifests are then kept under
+    // that tmpdir, which is the arrangement several scenarios are about.
     mkdirSync(join(BASE, 'tmp'), { recursive: true })
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      TMPDIR: join(BASE, 'tmp'),
+      ...env,
+    }
+    delete childEnv.XDG_RUNTIME_DIR
     const argv = [...launcher, process.execPath, 'run', scriptFile]
     const run = spawnSync(argv[0]!, argv.slice(1), {
       cwd: BASE,
       encoding: 'utf8',
-      env: { ...process.env, TMPDIR: join(BASE, 'tmp'), ...env },
+      env: childEnv,
       timeout: 60000,
     })
     expect(run.stderr).toBe('')
@@ -238,7 +285,8 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     // environment is in it.
     expect(
       mounts.filter(
-        w => w.startsWith('--') && !/^--(ro-bind|bind|tmpfs)$/.test(w),
+        w =>
+          w.startsWith('--') && !/^--(ro-bind|ro-bind-try|bind|tmpfs)$/.test(w),
       ),
     ).toEqual([])
     expect(before).toContain(
@@ -336,6 +384,58 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     expect(error.message).toMatch(
       /and, passed through a file, would exceed the 9000 arguments bwrap accepts/,
     )
+    expect(sharesIn(error).total).toBe(target)
+  })
+
+  it('tells the arguments of the mandatory denies from those of the configuration', async () => {
+    // The variables carry every profile here past the cap.
+    const shares = async (
+      opts: Parameters<typeof wrap>[1] = {},
+      variables = 4500,
+    ) => {
+      const error = await refused(
+        wrap([], {
+          allowOnly: [BASE],
+          unsetEnvVars: envVarNames(variables),
+          ...opts,
+        }),
+      )
+      const said = sharesIn(error)
+      expect(error.message).toContain(`has ${said.total} bwrap arguments`)
+      return said
+    }
+
+    const none = await shares()
+    const [first, second] = repositories(10)
+    // Hooks, config, and a pin on each of the two directories above them.
+    const ten = await shares()
+    expect(ten).toEqual({
+      total: none.total + 10 * 12,
+      mandatory: none.mandatory + 10 * 12,
+    })
+
+    // What the configuration adds is not theirs: two words a variable, and a
+    // bind and a pin for a write deny of its own.
+    expect(await shares({}, 4600)).toEqual({
+      total: ten.total + 200,
+      mandatory: ten.mandatory,
+    })
+    mkdirSync(join(BASE, 'own'))
+    writeFileSync(join(BASE, 'own', 'file'), '')
+    expect(
+      await shares({ denyWithinAllow: [join(BASE, 'own', 'file')] }),
+    ).toEqual({ total: ten.total + 6, mandatory: ten.mandatory })
+
+    // Each thing the refusal advises lowers their share.
+    expect((await shares({ allowOnly: [first!, second!] })).mandatory).toBe(
+      // A write root is no pin.
+      2 * 9,
+    )
+    expect((await shares({ mandatoryDenySearchDepth: 2 })).mandatory).toBe(
+      none.mandatory,
+    )
+    process.chdir(first!)
+    expect((await shares()).mandatory).toBeLessThan(ten.mandatory)
   })
 
   it('refuses a mount path with a NUL byte whether or not the profile fits the command line', async () => {
@@ -376,6 +476,33 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       afterCleanup: 0,
     })
   })
+
+  it.each([
+    ['that names no command', ''],
+    ['that names one', `{ commandId: 'another' }`],
+  ])(
+    'keeps a pending profile through a clean-up %s, and gives it back with the last',
+    (_how, first) => {
+      // A profile belongs to one wrap and nothing maps it back to a command, so
+      // none is closed while any wrap of this process is outstanding.
+      const seen = isolated(`
+      const openFds = () => fs.readdirSync('/proc/self/fd').length
+      // The runtime opens event-loop fds of its own on the first wrap.
+      await wrap(small)
+      cleanupBwrapMountPoints()
+      const baseline = openFds()
+      await wrap(overLong)
+      await wrap(overLong)
+      const held = openFds() - baseline
+      cleanupBwrapMountPoints(${first})
+      const afterFirst = openFds() - baseline
+      cleanupBwrapMountPoints()
+      console.log(JSON.stringify({ held, afterFirst, afterSecond: openFds() - baseline }))
+    `)
+      expect(seen).toEqual({ held: 2, afterFirst: 2, afterSecond: 0 })
+    },
+    30000,
+  )
 
   it('refuses at wrap time, with the reason, when no directory takes an unnamed file', () => {
     // Both candidates read-only: tmpdir and /dev/shm. A profile that fits
@@ -448,7 +575,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
         const { spawnSync } = await import('node:child_process')
         const wrapped = await wrap(overLong, 'touch ${marker} 2>/dev/null && echo WROTE || echo DENIED')
         const argsPath = argsPathOf(wrapped)
-        // The runtime leaves a cache of its own there; nothing of ours.
+        // The runtime leaves a cache of its own there. Of ours there is one
+        // thing, and it is not the profile: the directory mount point
+        // manifests are kept in, which this wrap has none of and binds
+        // read-only only to keep other sandboxes' out of the command's reach.
         const namedUnderTmpdir = fs.readdirSync(process.env.TMPDIR, { recursive: true })
           .filter(entry => /srt|args|bwrap/.test(entry))
         // What a sandbox with the parent writable, or another process of
@@ -476,7 +606,10 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       )
       expect(seen).toEqual({
         argsPath: expect.stringMatching(/^\/proc\/\d+\/fd\/\d+$/),
-        namedUnderTmpdir: [],
+        // Empty, and bound with --ro-bind-try: it went aside with its parent
+        // before the command started, and status 0 below is that not
+        // mattering.
+        namedUnderTmpdir: [`srt-mount-points-${process.getuid?.() ?? 0}`],
         planted: null,
         status: 0,
         // The command ran under the profile that was wrapped, not one
@@ -512,6 +645,12 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       expect(argsPathOf(wrapped)).toMatch(
         new RegExp(`^/proc/${process.pid}/fd/\\d+$`),
       )
+      // This wrap names mount points, under the temp dir: one shell puts the
+      // command on record and opens the profile.
+      expect(wrapped).toMatch(
+        / srt-args \S+\/srt-mount-points\/\d+-[0-9a-f]{16}\.started \/proc\/\d+\/fd\/\d+ \/\S*\/bwrap /,
+      )
+      expect(wrapped.split(`${STEP_SHELL} `)).toHaveLength(2)
       const run = spawnSync(`timeout 60 ${wrapped} && echo AFTER`, {
         shell: true,
         encoding: 'utf8',
@@ -526,6 +665,46 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
         'AFTER',
       ])
       expect(readFileSync(files[0]!, 'utf8')).toBe('secret\n')
+    },
+    60_000,
+  )
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'refuses a string run after its clean-up, though its descriptor number now holds the profile of a later wrap',
+    async () => {
+      // The manifest's bind is what refuses such a start. In the file, it would
+      // be the later wrap's manifest that is bound, and the command would run
+      // under that wrap's profile.
+      const files = overLongProfile()
+      const [A, B] = [join(BASE, 'a'), join(BASE, 'b')]
+      const inArea = (area: string): Promise<string> => {
+        mkdirSync(area)
+        return wrap(files, {
+          allowOnly: [area],
+          denyWithinAllow: [join(area, 'absent.lock')],
+          command: `echo ran; touch ${join(B, 'written')}`,
+        })
+      }
+      const first = await inArea(A)
+      const manifest = manifestOf(first)!
+      expect(first.match(VIA_ARGS_FILE)![2]).toEndWith(
+        ` --ro-bind / / --ro-bind ${manifest} ${manifest}`,
+      )
+      cleanupBwrapMountPoints()
+      const second = await inArea(B)
+      expect(argsPathOf(second)).toBe(argsPathOf(first))
+
+      const run = spawnSync(first, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 60000,
+      })
+      expect(run.status).not.toBe(0)
+      expect(run.stderr).toContain(`Can't find source path ${manifest}`)
+      expect(run.stdout).toBe('')
+      // Nothing was made for it, in either place.
+      expect(readdirSync(A)).toEqual([])
+      expect(readdirSync(B)).toEqual([])
     },
     60_000,
   )
