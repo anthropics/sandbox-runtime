@@ -207,7 +207,7 @@ function viaTls(
           ),
         )
       })
-      t.on('data', d => (raw += d))
+      t.on('data', (d: Buffer) => (raw += d))
       t.on('error', reject)
       t.on('close', () => resolve(parse(raw)))
     }

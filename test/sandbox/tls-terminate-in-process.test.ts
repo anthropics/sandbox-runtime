@@ -123,7 +123,7 @@ async function tlsSetup(extra: { requireHostMatch?: boolean } = {}) {
             `GET ${requestTarget} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
           ),
         )
-        t.on('data', y => (out += y))
+        t.on('data', (y: Buffer) => (out += y))
         t.on('close', () => resolve(out))
         t.on('error', () => resolve(out))
       }
@@ -299,7 +299,7 @@ async function stalledClientResponse(): Promise<{
         }, 2000)
       })
       let n = 0
-      t.on('data', d => (n += d.length))
+      t.on('data', (d: Buffer) => (n += d.length))
       t.on('close', () => resolve(n))
       t.on('error', () => resolve(n))
     })
@@ -381,7 +381,10 @@ function sendWithSni(
         socket: c,
         ca: s.ca,
         servername,
-        checkServerIdentity: (_host, cert) => {
+        checkServerIdentity: (
+          _host: string,
+          cert: { subject: { CN: string } },
+        ) => {
           cn = String(cert.subject.CN)
           return undefined
         },
@@ -392,7 +395,7 @@ function sendWithSni(
           `GET /sni HTTP/1.1\r\nHost: ${s.target}\r\nConnection: close\r\n\r\n`,
         ),
       )
-      t.on('data', d => (out += d))
+      t.on('data', (d: Buffer) => (out += d))
       t.on('close', () => resolve({ raw: out, cn }))
       t.on('error', () => resolve({ raw: out, cn }))
     })

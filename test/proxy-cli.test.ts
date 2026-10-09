@@ -319,7 +319,7 @@ describe('srt-proxy entry', () => {
                 'GET /x HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n',
               ),
             )
-            t.on('data', y => (out += y))
+            t.on('data', (y: Buffer) => (out += y))
             t.on('close', () => resolve(out))
             t.on('error', reject)
           }

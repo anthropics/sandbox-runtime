@@ -611,7 +611,7 @@ function viaTunnel(
       })
       let out = ''
       t.on('secureConnect', () => t.write(raw(target)))
-      t.on('data', x => (out += x))
+      t.on('data', (x: Buffer) => (out += x))
       t.on('error', () => resolve(out))
       t.on('close', () => resolve(out))
     }
@@ -948,7 +948,7 @@ describe('hop-by-hop headers and request trailers never reach the upstream', () 
           t.on('secureConnect', () =>
             t.write(hopRequest('/hop', '/hop', target)),
           )
-          t.on('data', y => {
+          t.on('data', (y: Buffer) => {
             out += y
             if (out.includes('ok')) t.end()
           })
@@ -1032,7 +1032,7 @@ async function tlsSetup(decide: Parameters<typeof fakeDecider>[1]) {
             `GET ${requestTarget} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
           ),
         )
-        t.on('data', y => (out += y))
+        t.on('data', (y: Buffer) => (out += y))
         t.on('close', () => resolve(out))
         t.on('error', () => resolve(out))
       }
@@ -1564,7 +1564,7 @@ describe('an upload in a TLS-terminated tunnel to a slow upstream is not buffere
             setTimeout(() => (sentDuringStall = sent), 2500)
           })
           let out = ''
-          t.on('data', y => (out += y))
+          t.on('data', (y: Buffer) => (out += y))
           t.on('close', () => resolve(out))
           t.on('error', () => resolve(out))
         }
@@ -1745,7 +1745,7 @@ async function stalledClientResponse(): Promise<{
         }, 2000)
       })
       let n = 0
-      t.on('data', d => (n += d.length))
+      t.on('data', (d: Buffer) => (n += d.length))
       t.on('close', () => resolve(n))
       t.on('error', () => resolve(n))
     })
@@ -1827,7 +1827,10 @@ function sendWithSni(
         socket: c,
         ca: s.ca,
         servername,
-        checkServerIdentity: (_host, cert) => {
+        checkServerIdentity: (
+          _host: string,
+          cert: { subject: { CN: string } },
+        ) => {
           cn = String(cert.subject.CN)
           return undefined
         },
@@ -1838,7 +1841,7 @@ function sendWithSni(
           `GET /sni HTTP/1.1\r\nHost: ${s.target}\r\nConnection: close\r\n\r\n`,
         ),
       )
-      t.on('data', d => (out += d))
+      t.on('data', (d: Buffer) => (out += d))
       t.on('close', () => resolve({ raw: out, cn }))
       t.on('error', () => resolve({ raw: out, cn }))
     })

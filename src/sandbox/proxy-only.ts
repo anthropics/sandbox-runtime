@@ -308,9 +308,11 @@ export function openFdStreams(fd: number): {
         write(chunk: Buffer, _encoding, callback) {
           try {
             sink ??= file.writer()
-            sink.write(chunk)
-            // On a broken pipe flush() throws rather than rejects.
-            Promise.resolve(sink.flush()).then(() => callback(), callback)
+            // write() may give a promise, whose failure has to reach the
+            // callback too. On a broken pipe flush() throws rather than rejects.
+            Promise.resolve(sink.write(chunk))
+              .then(() => sink?.flush())
+              .then(() => callback(), callback)
           } catch (err) {
             callback(err as Error)
           }
