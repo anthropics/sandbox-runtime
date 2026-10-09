@@ -1615,8 +1615,9 @@ function globPositions(
   } catch (err) {
     // A pattern that is no regular expression would match nothing and deny
     // nothing, silently: it is raised as the configuration error it is.
-    throw new Error(
+    throw new SyntaxError(
       `Glob pattern ${normalizedPattern} does not compile, so nothing can match it: ${err}`,
+      { cause: err },
     )
   }
   const unsplit: GlobPositions = {
@@ -1760,12 +1761,13 @@ function globPositions(
 /**
  * The literal directory a glob's walk starts from: the static prefix before
  * the pattern's first glob character, without its last path component when
- * that component is not a directory of its own. Never carries a trailing
- * separator, except for the root itself: split into path components, it
- * would end in an empty name no position can consume, and the pattern would
- * match nothing. A drive root comes back as 'C:', the root of a UNC share as
- * '//server/share'. '/', and '' for a pattern with a wildcard in its first
- * path component, are what {@link globBaseDirIsRoot} refuses.
+ * that component is not a directory of its own. Split at its separators it
+ * is the pattern's own leading components, the empty one of a doubled
+ * separator ('C:/a//*.pem': 'C:/a/') included: the walk consumes them one by
+ * one, and a base with one more or one fewer matches nothing. A drive root
+ * comes back as 'C:', the root of a UNC share as '//server/share'. '/', and
+ * '' for a pattern with a wildcard in its first path component, are what
+ * {@link globBaseDirIsRoot} refuses.
  *
  * @param normalizedPattern - a pattern already through
  * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes}),
@@ -1774,13 +1776,11 @@ function globPositions(
 export function globPatternBaseDir(normalizedPattern: string): string {
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
   if (!staticPrefix) return ''
-  const baseDir = staticPrefix.endsWith('/')
+  // The pattern is spelled with '/' on every host. Windows' own dirname keeps
+  // the separator of a root it returns ('C:/'), which no component stands for.
+  return staticPrefix.endsWith('/')
     ? staticPrefix.slice(0, -1)
-    : path.dirname(staticPrefix)
-  // path.dirname keeps the separator of a root it returns ('C:/').
-  return baseDir.length > 1 && baseDir.endsWith('/')
-    ? baseDir.slice(0, -1)
-    : baseDir
+    : path.posix.dirname(staticPrefix)
 }
 
 /**
@@ -1942,39 +1942,58 @@ export function* walkGlobPatternSteps(
       throw new GlobWalkBudgetError(globPath, dir, 'time', budget)
     }
   }
-  /** A filesystem call on a real path, and on a shorter name for it when the
-   *  real path is too long to name. Nothing else is retried: every other
-   *  errno belongs to the object, and the short name crosses links a
-   *  sandboxed command can repoint, so an unreadable directory could read as
-   *  absent. The real path crosses no link, so a long chain of them cannot
-   *  fail the call (ELOOP). */
+  const codeOf = (err: unknown): string | undefined =>
+    (err as NodeJS.ErrnoException | undefined)?.code
+  /**
+   * A filesystem call on a real path and, when that fails, on a shorter name
+   * for it. The real path crosses no link, so a long chain of them cannot fail
+   * the call (ELOOP) and nothing can lead it elsewhere. It can still fail for
+   * a reason that is not the object's: a path too long to name, a busy host,
+   * a runtime whose call does not take the name. So the short name is asked
+   * after every failure. But it crosses links a sandboxed command can repoint,
+   * at an empty directory or at nothing, so what it says is only ever ADDED to
+   * what the real path said:
+   * - a real path that failed with anything but `absent` or ENAMETOOLONG says
+   *   that something is there and was not read. `unread` is called, and the
+   *   caller covers that whole whatever the short name answers;
+   * - of two failures the one thrown is the one that is not `absent`, so
+   *   "could not be read" never comes out as "is not there".
+   */
   const onRealPath = <T>(
     real: string,
     short: string,
     call: (p: string) => T,
+    absent: (err: unknown) => boolean,
+    unread: () => void,
   ): T => {
     try {
       return call(real)
-    } catch (err) {
-      if (
-        short === real ||
-        (err as NodeJS.ErrnoException | undefined)?.code !== 'ENAMETOOLONG'
-      ) {
-        throw err
+    } catch (first) {
+      if (short === real) throw first
+      let answer: T
+      try {
+        answer = call(short)
+      } catch (second) {
+        throw absent(first) && !absent(second) ? second : first
       }
-      logForDebugging(
-        `[Sandbox] ${real} is too long to name for glob pattern ${globPath}; looking at ${short} instead`,
-      )
-      return call(short)
+      if (!absent(first) && codeOf(first) !== 'ENAMETOOLONG') {
+        logForDebugging(
+          `[Sandbox] ${real} could not be read for glob pattern ${globPath}, so it is covered whole, whatever ${short} leads to: ${first}`,
+          { level: 'warn' },
+        )
+        unread()
+      }
+      return answer
     }
   }
   /** Where a symlink leads and whether that is a directory. 'absent' when
    *  nothing is there to descend into; 'uninspectable' when something is and
    *  it could not be looked at, which is not the same thing: a same-uid
    *  command can make a target unsearchable and undo that from inside the
-   *  next sandbox, so a deny must still cover the link. */
+   *  next sandbox, so a deny must still cover the link. `unread` when only the
+   *  short name said where it leads: both, see {@link onRealPath}. */
   type LinkTarget =
-    | { real: string; isDirectory: boolean }
+    | { real: string; isDirectory: boolean; unread: boolean }
     | 'absent'
     | 'uninspectable'
   const linkTargets = new Map<string, LinkTarget>()
@@ -1983,10 +2002,18 @@ export function* walkGlobPatternSteps(
     if (cached !== undefined) return cached
     let target: LinkTarget
     try {
-      target = onRealPath(realLinkPath, linkPath, p => ({
-        isDirectory: fs.statSync(p).isDirectory(),
-        real: fs.realpathSync(p),
-      }))
+      let unread = false
+      const found = onRealPath(
+        realLinkPath,
+        linkPath,
+        p => ({
+          isDirectory: fs.statSync(p).isDirectory(),
+          real: fs.realpathSync(p),
+        }),
+        isAbsenceErrno,
+        () => (unread = true),
+      )
+      target = { ...found, unread }
     } catch (err) {
       target = isAbsenceErrno(err) ? 'absent' : 'uninspectable'
     }
@@ -2084,20 +2111,33 @@ export function* walkGlobPatternSteps(
     yield
     // After the step, in which time can have passed, and before the listing.
     spend(dir, 0)
+    // Once. What one pattern denies is denied for the whole configuration, so
+    // what the short name listed is kept for the next pattern like any other.
+    const denyWhole = (): void => {
+      if (record.unlisted) return
+      record.unlisted = true
+      walk.unlisted.push(dir)
+      if (real !== dir) walk.realOf.set(dir, real)
+    }
     let entries: GlobWalkEntry[]
     try {
       const known = listings.get(real)
       if (known instanceof Error) throw known
       entries =
         known ??
-        onRealPath(real, frame.short, p =>
-          fs
-            .readdirSync(p, { withFileTypes: true })
-            .map(entry => withType(entry, p, real)),
+        onRealPath(
+          real,
+          frame.short,
+          p =>
+            fs
+              .readdirSync(p, { withFileTypes: true })
+              .map(entry => withType(entry, p, real)),
+          err => codeOf(err) === 'ENOENT',
+          denyWhole,
         )
       listings.set(real, entries)
     } catch (err) {
-      const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+      const errorCode = codeOf(err)
       logForDebugging(
         `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
         { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
@@ -2116,11 +2156,7 @@ export function* walkGlobPatternSteps(
             err instanceof Error ? err : new Error(String(err)),
           )
         }
-        if (!record.unlisted) {
-          record.unlisted = true
-          walk.unlisted.push(dir)
-          if (real !== dir) walk.realOf.set(dir, real)
-        }
+        denyWhole()
       }
       continue
     }
@@ -2196,17 +2232,19 @@ export function* walkGlobPatternSteps(
       const shortPath = path.join(frame.short, entry.name)
       const target = linkTargetOf(shortPath, realPath)
       if (target === 'absent') continue
-      if (target === 'uninspectable') {
-        // Where it leads is unknown, so it gets no real location and nothing
-        // is listed through it — but it is still a match, and a deny
+      const unread = target === 'uninspectable' || target.unread
+      if (unread) {
+        // Where it leads is unknown, or known from the short name alone, so it
+        // gets no real location — but it is still a match, and a deny
         // expansion covers it under its own spelling.
         walk.uninspectableLinks.add(fullPath)
         if (isDirectoryFormCandidate) walk.directoryMatches.push(fullPath)
-        continue
       }
-      if (isMatch) walk.realOf.set(fullPath, target.real)
+      // Nothing is listed through a link that leads nobody knows where.
+      if (target === 'uninspectable') continue
+      if (isMatch && !unread) walk.realOf.set(fullPath, target.real)
       if (!target.isDirectory) continue
-      if (isDirectoryFormCandidate) {
+      if (isDirectoryFormCandidate && !unread) {
         walk.directoryMatches.push(fullPath)
         walk.realOf.set(fullPath, target.real)
       }

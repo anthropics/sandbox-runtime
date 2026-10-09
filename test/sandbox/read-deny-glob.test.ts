@@ -389,8 +389,9 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
 
   describe('a directory with two names that does not list', () => {
     /** The mounts of two patterns handed the same listings, with the first
-     *  `failures` listings of pkg/certs, which lnk leads to as well, failing
-     *  with `code`. */
+     *  `failures` listings of pkg/certs failing with `code`. A link leads to
+     *  it as well, by no shorter a name, so its real path is all that is
+     *  ever asked. */
     function expandWith(
       code: string,
       failures: number,
@@ -404,7 +405,7 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
       const certs = join(root, 'pkg', 'certs')
       mkdirSync(certs, { recursive: true })
       writeFileSync(join(certs, 'id.pem'), '')
-      symlinkSync(join('pkg', 'certs'), join(root, 'lnk'))
+      symlinkSync(join('pkg', 'certs'), join(root, 'link-to-certs'))
       let tries = 0
       const readdirSync = fs.readdirSync
       const spy = spyOn(fs, 'readdirSync').mockImplementation(((
