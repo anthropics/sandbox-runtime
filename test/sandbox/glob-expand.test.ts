@@ -183,7 +183,7 @@ describe('expandGlobPattern', () => {
       const bsDir = join(RAW_TEST_DIR, 'app\\creds')
       mkdirSync(bsDir, { recursive: true })
       writeFileSync(join(bsDir, 'key.pem'), 'k')
-      const realBsDir = realPath(bsDir)
+      const realBsDir = join(TEST_DIR, 'app\\creds')
 
       const results = expandGlobPattern(join(bsDir, '*.pem'))
       expect(results).toContain(join(realBsDir, 'key.pem'))
