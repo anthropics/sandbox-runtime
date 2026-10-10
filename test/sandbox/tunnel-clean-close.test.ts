@@ -123,7 +123,7 @@ describe('Tunnel clean close response flushing (#606)', () => {
     }
   })
 
-  it('flushes queued bytes to a slow/paused client that resumes reading', async () => {
+  it('flushes queued bytes to a slow/paused client that resumes reading (>5s old cutoff)', async () => {
     const proxy = createHttpProxyServer({
       filter: () => true,
     })
@@ -158,13 +158,13 @@ describe('Tunnel clean close response flushing (#606)', () => {
             chunks.push(data)
           }
 
-          // Simulate temporary backpressure/pause after receiving initial data
+          // Simulate temporary backpressure/pause (>5s old cutoff) after receiving initial data
           if (!paused && chunks.length > 0) {
             paused = true
             client.pause()
             setTimeout(() => {
               client.resume()
-            }, 1000)
+            }, 6500)
           }
         })
         client.on('close', resolve)
@@ -177,5 +177,5 @@ describe('Tunnel clean close response flushing (#606)', () => {
     } finally {
       await new Promise<void>(resolve => proxy.close(() => resolve()))
     }
-  })
+  }, 15000)
 })
