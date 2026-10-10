@@ -38,6 +38,7 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::Shell::DeleteProfileW;
 use windows::core::{PCWSTR, PWSTR};
 
+use crate::acl::SID_BUILTIN_USERS;
 use crate::util::{pcwstr, wstr};
 use crate::{sam, sid};
 
@@ -90,10 +91,6 @@ pub struct UserStatus {
 
 const WINLOGON_USERLIST: &str =
     r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList";
-
-/// `BUILTIN\Users` — well-known SID that's stable across locales,
-/// unlike the *name* "Users" / "Benutzer" / "Utilisateurs".
-const SID_BUILTIN_USERS: &str = "S-1-5-32-545";
 
 /// Create [`SANDBOX_GROUP`] and the local user `name` (idempotent),
 /// set a fresh random password (rotated only if `we_own_it` — see
