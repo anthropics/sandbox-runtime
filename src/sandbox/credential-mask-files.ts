@@ -18,7 +18,8 @@
  * {@link extractAndSubstitute} and {@link CredentialFileConfigSchema}.
  *
  * On macOS, SBPL cannot redirect reads, so masked files degrade to
- * `mode: "deny"` (see macos-sandbox-utils.ts).
+ * `mode: "deny"` (see macos-sandbox-utils.ts). On Windows an ACL cannot
+ * either (see `windowsMaskedFileDenies` in sandbox-manager.ts).
  */
 
 import { randomUUID } from 'node:crypto'

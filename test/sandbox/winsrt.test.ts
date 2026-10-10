@@ -2,6 +2,7 @@ import {
   afterAll,
   afterEach,
   beforeAll,
+  beforeEach,
   describe,
   expect,
   it,
@@ -12,24 +13,31 @@ import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { isMacOS, isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type {
+  CredentialFileConfig,
   SandboxRuntimeConfig,
   SrtWinConfig,
 } from '../../src/sandbox/sandbox-config.js'
 import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
 import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
+import { certThumbprint } from '../../src/sandbox/mitm-ca.js'
+import * as platform from '../../src/utils/platform.js'
+import * as winUtils from '../../src/sandbox/windows-sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
@@ -50,11 +58,15 @@ import {
   windowsStateDir,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
+  rankWindowsFsAccess,
   resolveSrtWin,
   buildGitConfigEnv,
   SRT_WIN_DISPATCH_ARG1,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   VENDORED_SRT_WIN_EXE,
+  type WindowsAclGrantOptions,
+  type WindowsAclStampOptions,
+  type WindowsFsAccessSet,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
 /**
@@ -653,6 +665,453 @@ describe('windowsStateDir (pure, all platforms)', () => {
   it('throws when ProgramData is unset', () => {
     delete process.env.ProgramData
     expect(() => windowsStateDir()).toThrow('ProgramData')
+  })
+})
+
+describe('rankWindowsFsAccess (pure, all platforms)', () => {
+  type Lists = Parameters<typeof rankWindowsFsAccess>[0]
+  const rank = (lists: Partial<Lists>): WindowsFsAccessSet =>
+    rankWindowsFsAccess({
+      allowRead: [],
+      allowWrite: [],
+      denyRead: [],
+      denyWrite: [],
+      credentialDeny: [],
+      ...lists,
+    })
+
+  // On no disk, so compared as spelled.
+  const W = 'C:\\srt-w'
+  const D = 'C:\\srt-w\\d'
+  const SUB = 'C:\\srt-w\\d\\sub'
+  const SUB2 = 'C:\\srt-w\\d\\sub2'
+  const BESIDE = 'C:\\srt-w\\dx'
+
+  it.each<[string, Partial<Lists>, Partial<WindowsFsAccessSet>]>([
+    [
+      'allowWrite around a denyWrite: write',
+      { allowWrite: [W], denyWrite: [D] },
+      { grantWrite: [W], denyWrite: [D] },
+    ],
+    [
+      'allowWrite beside a denyWrite: write',
+      { allowWrite: [BESIDE], denyWrite: [D] },
+      { grantWrite: [BESIDE], denyWrite: [D] },
+    ],
+    [
+      'allowWrite beneath a denyWrite: read',
+      { allowWrite: [SUB], denyWrite: [D] },
+      { grantRead: [SUB], denyWrite: [D] },
+    ],
+    [
+      'allowWrite at a denyWrite: read',
+      { allowWrite: [D], denyWrite: [D] },
+      { grantRead: [D], denyWrite: [D] },
+    ],
+    [
+      'allowWrite around and beneath a denyWrite: write, read',
+      { allowWrite: [W, SUB], denyWrite: [D] },
+      { grantWrite: [W], grantRead: [SUB], denyWrite: [D] },
+    ],
+    [
+      'a path in allowRead too is granted once',
+      { allowRead: [SUB], allowWrite: [SUB], denyWrite: [D] },
+      { grantRead: [SUB], denyWrite: [D] },
+    ],
+    [
+      'allowRead beneath a denyWrite: read',
+      { allowRead: [SUB], denyWrite: [D] },
+      { grantRead: [SUB], denyWrite: [D] },
+    ],
+    [
+      'allowRead at and beneath a denyRead: read',
+      { allowRead: [D, SUB], denyRead: [D] },
+      { grantRead: [D, SUB], denyRead: [D] },
+    ],
+    [
+      'allowWrite beneath a denyRead: write',
+      { allowWrite: [SUB], denyRead: [D] },
+      { grantWrite: [SUB], denyRead: [D] },
+    ],
+    [
+      'allowRead and allowWrite around a credential deny: read, write',
+      { allowRead: [W], allowWrite: [W], credentialDeny: [D] },
+      { grantRead: [W], grantWrite: [W], denyRead: [D] },
+    ],
+    [
+      'allowRead and allowWrite at or beneath a credential deny: nothing',
+      { allowRead: [D, SUB], allowWrite: [D, SUB2], credentialDeny: [D] },
+      { denyRead: [D] },
+    ],
+    [
+      'allowWrite beneath a denyWrite and a credential deny: nothing',
+      { allowWrite: [SUB], denyWrite: [D], credentialDeny: [W] },
+      { denyRead: [W], denyWrite: [D] },
+    ],
+    [
+      'a credential deny that is in denyRead too is stamped once',
+      { allowRead: [SUB], denyRead: [D], credentialDeny: [D] },
+      { denyRead: [D] },
+    ],
+    [
+      'a held write grant beneath a denyWrite: write-denied at its own path',
+      {
+        denyWrite: [D],
+        held: { grantRead: [SUB2], grantWrite: [W, SUB, BESIDE] },
+      },
+      { denyWrite: [D, SUB] },
+    ],
+    [
+      'held grants at or beneath a credential deny: read-denied at their own',
+      {
+        credentialDeny: [D],
+        held: { grantRead: [W, D, SUB], grantWrite: [SUB2, BESIDE] },
+      },
+      { denyRead: [D, SUB, SUB2] },
+    ],
+    [
+      'held grants beneath a denyRead: as they are',
+      { denyRead: [D], held: { grantRead: [SUB], grantWrite: [SUB2] } },
+      { denyRead: [D] },
+    ],
+  ])('%s', (_name, lists, want) => {
+    expect(rank(lists)).toEqual({
+      grantRead: [],
+      grantWrite: [],
+      denyRead: [],
+      denyWrite: [],
+      ...want,
+    })
+  })
+
+  const isBeneath = (deny: string, grant: string): boolean =>
+    rank({ allowRead: [grant], credentialDeny: [deny] }).grantRead.length === 0
+
+  it.each<[string, string, boolean]>([
+    [D, 'c:\\SRT-W\\D\\Sub', true],
+    [D + '\\', SUB, true],
+    ['C:/srt-w/d', SUB, true],
+    [D, 'C:/srt-w//d/sub/', true],
+    ['C:\\srt-w\\x\\..\\d', SUB, true],
+    ['\\\\?\\' + D, SUB, true],
+    ['C:\\', SUB, true],
+    [D, BESIDE, false],
+    [D, 'D:\\srt-w\\d\\sub', false],
+    [SUB, D, false],
+    ['\\\\srv\\share\\d', '\\\\SRV\\Share\\D\\sub', true],
+    ['\\\\?\\UNC\\srv\\share\\d', '\\\\srv\\share\\d\\sub', true],
+    ['\\\\srv\\share\\d', '\\\\srv\\share2\\d\\sub', false],
+  ])('as spelled, beneath %p is %p: %p', (deny, grant, beneath) => {
+    expect(isBeneath(deny, grant)).toBe(beneath)
+  })
+
+  it('a UNC path is not looked up', () => {
+    const lookup = spyOn(realpathSync, 'native')
+    try {
+      expect(isBeneath('\\\\srv\\share', '//srv/share/sub')).toBe(true)
+      expect(isBeneath('\\\\?\\UNC\\srv\\share', D)).toBe(false)
+      expect(lookup.mock.calls).toEqual([[D]])
+    } finally {
+      lookup.mockRestore()
+    }
+  })
+
+  describe('on disk', () => {
+    let spelled: string
+    let root: string
+
+    beforeAll(() => {
+      spelled = mkdtempSync(join(tmpdir(), 'srt-rank-'))
+      root = realpathSync.native(spelled)
+      mkdirSync(join(root, 'd', 'sub'), { recursive: true })
+      mkdirSync(join(root, 'e', 'sub'), { recursive: true })
+      symlinkSync(join(root, 'd'), join(root, 'to-d'), 'junction')
+      symlinkSync(join(root, 'e'), join(root, 'd', 'to-e'), 'junction')
+    })
+
+    afterAll(() => {
+      try {
+        rmSync(root, { recursive: true, force: true })
+      } catch {
+        // Not every runtime removes a junction.
+      }
+    })
+
+    it.each<[string, string, boolean]>([
+      ['d', 'd/sub', true],
+      ['d', 'e/sub', false],
+      ['d', 'to-d/sub', true],
+      ['to-d', 'd/sub', true],
+      ['to-d', 'to-d', true],
+      ['e', 'd/to-e/sub', true],
+      ['d', 'd/to-e/sub', false],
+      ['absent', 'd/sub', false],
+    ])('beneath %p is %p: %p', (deny, grant, beneath) => {
+      expect(isBeneath(join(root, deny), join(root, grant))).toBe(beneath)
+    })
+
+    it('a path counts as it resolves, however the temp folder is spelled', () => {
+      console.error(`[winsrt rank] spelled=${spelled} resolved=${root}`)
+      expect(isBeneath(join(spelled, 'd'), join(root, 'd', 'sub'))).toBe(true)
+      expect(isBeneath(join(root, 'd'), join(spelled, 'd', 'sub'))).toBe(true)
+      expect(
+        isBeneath(join(root, 'd').toUpperCase(), join(root, 'd', 'sub')),
+      ).toBe(true)
+    })
+
+    it('a path is handed on as it was spelled', () => {
+      const grant = join(root, 'to-d', 'sub')
+      expect(
+        rank({ allowWrite: [grant], denyWrite: [join(root, 'd')] }).grantRead,
+      ).toEqual([grant])
+    })
+  })
+})
+
+// The manager's Windows path with the helper calls recorded, not made. Not on
+// Windows: the L-rows below make them there, and initialize() under a stub
+// would use up the one egress check a process makes.
+describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
+  const spies: Array<ReturnType<typeof spyOn>> = []
+  let granted: WindowsAclGrantOptions | undefined
+  let stamped: WindowsAclStampOptions | undefined
+  let root: string
+  let d: string
+  let sub: string
+  let sub2: string
+  let token: string
+
+  const configOf = (
+    filesystem: Partial<SandboxRuntimeConfig['filesystem']>,
+    files: CredentialFileConfig[] = [],
+  ): SandboxRuntimeConfig => ({
+    // External proxy ports: nothing is bound.
+    network: {
+      allowedDomains: [],
+      deniedDomains: [],
+      httpProxyPort: 1,
+      socksProxyPort: 1,
+    },
+    filesystem: { denyRead: [], allowWrite: [], denyWrite: [], ...filesystem },
+    credentials: { files },
+    windows: { srtWin: { path: process.execPath } },
+  })
+
+  /** The values of `flag` in what one command is wrapped to. */
+  const flagged = async (
+    flag: '--deny-read' | '--deny-write',
+    customConfig?: Partial<SandboxRuntimeConfig>,
+  ): Promise<string[]> => {
+    const { argv } = await SandboxManager.wrapWithSandboxArgv(
+      'rem',
+      undefined,
+      customConfig,
+    )
+    return argv.flatMap((a, i) => (a === flag ? [argv[i + 1]] : []))
+  }
+
+  beforeEach(() => {
+    granted = stamped = undefined
+    root = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-handed-')))
+    d = join(root, 'd')
+    sub = join(d, 'sub')
+    sub2 = join(d, 'sub2')
+    token = join(d, 'token')
+    mkdirSync(sub, { recursive: true })
+    mkdirSync(sub2)
+    writeFileSync(token, 'token-content')
+    spies.push(
+      spyOn(platform, 'getPlatform').mockReturnValue('windows'),
+      spyOn(winUtils, 'checkWindowsDependenciesAsync').mockResolvedValue({
+        errors: [],
+        warnings: [],
+      }),
+      spyOn(winUtils, 'getWindowsSandboxUserStatusAsync').mockResolvedValue({
+        provisioned: true,
+        sid: 'S-1-5-21-1',
+        groupExists: true,
+        inBuiltinUsers: true,
+        inSandboxGroup: true,
+        hiddenFromLogon: true,
+        credPresent: true,
+        realUserSid: 'S-1-5-21-3',
+        caCertThumb: certThumbprint(readFileSync(CA_CERT, 'utf8')),
+        caCertPem: readFileSync(CA_CERT, 'utf8'),
+      }),
+      spyOn(winUtils, 'verifyWindowsWfpEgress').mockResolvedValue({
+        target: '',
+        stderr: '',
+      }),
+      spyOn(winUtils, 'grantWindowsAcl').mockImplementation(o => {
+        granted = o
+      }),
+      spyOn(winUtils, 'stampWindowsAcl').mockImplementation(o => {
+        stamped = o
+      }),
+      spyOn(winUtils, 'revokeWindowsAcl').mockReturnValue([]),
+      spyOn(winUtils, 'restoreWindowsAcl').mockReturnValue([]),
+    )
+  })
+
+  afterEach(async () => {
+    await SandboxManager.reset()
+    for (const spy of spies.splice(0)) spy.mockRestore()
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('the session: an allowWrite beneath a denyWrite is a read grant', async () => {
+    await SandboxManager.initialize(
+      configOf({ allowWrite: [root, sub], denyWrite: [d] }),
+    )
+    expect(granted).toMatchObject({ read: [sub], write: [root] })
+    expect(stamped).toMatchObject({ denyRead: [], denyWrite: [d] })
+  })
+
+  it('the session: an allowRead beneath a denyRead is granted', async () => {
+    await SandboxManager.initialize(
+      configOf({ allowRead: [sub], denyRead: [d] }),
+    )
+    expect(granted).toMatchObject({ read: [sub], write: [] })
+    expect(stamped).toMatchObject({ denyRead: [d], denyWrite: [] })
+  })
+
+  it('the session: nothing is granted beneath a credential deny', async () => {
+    await SandboxManager.initialize(
+      configOf({ allowRead: [sub], allowWrite: [root, sub2] }, [
+        { path: d, mode: 'deny' },
+      ]),
+    )
+    expect(granted).toMatchObject({ read: [], write: [root] })
+    expect(stamped).toMatchObject({ denyRead: [d], denyWrite: [] })
+  })
+
+  it.each<[string, Omit<CredentialFileConfig, 'path'>]>([
+    ['masked', { mode: 'mask' }],
+    [
+      'masked with no match',
+      { mode: 'mask', extract: 'absent-(text)', onExtractNoMatch: 'deny' },
+    ],
+  ])('the session: a %s file is a credential deny', async (_name, entry) => {
+    await SandboxManager.initialize(
+      configOf({ allowRead: [token], allowWrite: [root] }, [
+        { path: token, ...entry },
+      ]),
+    )
+    expect(granted).toMatchObject({ read: [], write: [root] })
+    expect(stamped).toMatchObject({ denyRead: [token], denyWrite: [] })
+    expect(await flagged('--deny-read')).toEqual([])
+  })
+
+  it('the session: filesystem.disabled leaves a masked file denied, and that alone', async () => {
+    await SandboxManager.initialize(
+      configOf({ disabled: true, allowWrite: [root], denyWrite: [d] }, [
+        { path: token, mode: 'mask' },
+        { path: sub, mode: 'deny' },
+      ]),
+    )
+    expect(granted).toBeUndefined()
+    expect(stamped).toMatchObject({ denyRead: [token], denyWrite: [] })
+  })
+
+  it('onExtractNoMatch "error": initialize() resolves and the wrap throws', async () => {
+    await SandboxManager.initialize(
+      configOf({ allowWrite: [root] }, [
+        {
+          path: token,
+          mode: 'mask',
+          extract: 'absent-(text)',
+          onExtractNoMatch: 'error',
+        },
+      ]),
+    )
+    expect(granted).toMatchObject({ write: [root] })
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+    await expect(flagged('--deny-read')).rejects.toThrow(/onExtractNoMatch/)
+  })
+
+  it('one command: a file masked since initialize() is denied', async () => {
+    const late = join(root, 'late')
+    await SandboxManager.initialize(
+      configOf({ allowWrite: [root] }, [{ path: late, mode: 'mask' }]),
+    )
+    expect(stamped).toBeUndefined()
+    expect(await flagged('--deny-read')).toEqual([])
+    writeFileSync(late, 'late-content')
+    expect(await flagged('--deny-read')).toEqual([late])
+  })
+
+  it('one command: a masked file of its own is denied, filesystem.disabled or not', async () => {
+    await SandboxManager.initialize(configOf({ allowWrite: [root] }))
+    const credentials = { files: [{ path: token, mode: 'mask' as const }] }
+    expect(await flagged('--deny-read', { credentials })).toEqual([token])
+    expect(
+      await flagged('--deny-read', {
+        credentials,
+        filesystem: {
+          disabled: true,
+          denyRead: [sub],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      }),
+    ).toEqual([token])
+  })
+
+  it("one command: its denyWrite reaches the session's write grants beneath it", async () => {
+    await SandboxManager.initialize(
+      configOf({ allowRead: [sub2], allowWrite: [root, sub] }),
+    )
+    const filesystem = { denyRead: [], allowWrite: [], denyWrite: [d] }
+    expect(await flagged('--deny-write', { filesystem })).toEqual([d, sub])
+    expect(await flagged('--deny-read', { filesystem })).toEqual([])
+  })
+
+  it("one command: its credential deny reaches the session's grants beneath it", async () => {
+    await SandboxManager.initialize(
+      configOf({ allowRead: [sub], allowWrite: [root, sub2] }),
+    )
+    const credentials = { files: [{ path: d, mode: 'deny' as const }] }
+    expect(await flagged('--deny-read', { credentials })).toEqual([
+      d,
+      sub,
+      sub2,
+    ])
+  })
+
+  it("one command: its denyRead leaves the session's grants beneath it", async () => {
+    await SandboxManager.initialize(
+      configOf({ allowRead: [sub], allowWrite: [sub2] }),
+    )
+    const filesystem = { denyRead: [d], allowWrite: [], denyWrite: [] }
+    expect(await flagged('--deny-read', { filesystem })).toEqual([d])
+    expect(await flagged('--deny-write', { filesystem })).toEqual([])
+  })
+
+  it('one command: a credential deny on a path the session read-denies', async () => {
+    await SandboxManager.initialize(
+      configOf({ allowRead: [sub], denyRead: [d] }),
+    )
+    const credentials = { files: [{ path: d, mode: 'deny' as const }] }
+    expect(await flagged('--deny-read', { credentials })).toEqual([sub])
+  })
+
+  it("the library's trust bundle is granted beneath a credential deny", async () => {
+    const above = { path: tmpdir(), mode: 'deny' as const }
+    const base = configOf({ allowRead: [sub] }, [above])
+    await SandboxManager.initialize({
+      ...base,
+      network: {
+        ...base.network,
+        tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
+      },
+    })
+    const own = dirname(SandboxManager.getMitmCA()!.trustBundlePath)
+    expect(granted).toMatchObject({ read: [own], write: [] })
+    expect(
+      await flagged('--deny-read', {
+        credentials: { files: [{ path: dirname(own), mode: 'deny' }] },
+      }),
+    ).not.toContain(own)
   })
 })
 
@@ -2030,6 +2489,309 @@ describe.if(isWindows)(
       }
       rmSync(hScratch, { recursive: true, force: true })
     }, 30_000)
+
+    // ── L-rows: how the lists rank against each other ──
+    // A tree per row: d\own.txt, d\sub\in.txt, beside\b.txt, and to-d, a
+    // junction to d. Each row logs what it ran, so a job log tells a row
+    // that ran from one that was skipped.
+    describe('L-rows: how the lists rank', () => {
+      let spelled: string
+      let root: string
+      const at = (rel: string): string => join(root, rel)
+      const CONTENT: Record<string, string> = {
+        'd/own.txt': 'IN-D',
+        'd/sub/in.txt': 'IN-SUB',
+        'beside/b.txt': 'IN-BESIDE',
+      }
+
+      beforeEach(() => {
+        spelled = mkdtempSync(join(tmpdir(), 'srt-l-'))
+        root = realpathSync.native(spelled)
+        for (const [rel, content] of Object.entries(CONTENT)) {
+          mkdirSync(dirname(at(rel)), { recursive: true })
+          writeFileSync(at(rel), content)
+        }
+        symlinkSync(at('d'), at('to-d'), 'junction')
+      })
+
+      afterEach(() => {
+        try {
+          rmSync(root, { recursive: true, force: true })
+        } catch {
+          // Not every runtime removes a junction.
+        }
+      })
+
+      type Expected = {
+        /** A file of CONTENT, and whether the command reads it. */
+        reads?: Record<string, boolean>
+        /** A file, there or not, and whether the command writes it. */
+        writes?: Record<string, boolean>
+      }
+
+      /** One command that tries all of `expected`, held against it. */
+      async function tryAll(
+        id: string,
+        expected: Expected,
+        customConfig?: Partial<SandboxRuntimeConfig>,
+      ): Promise<void> {
+        const reads = Object.entries(expected.reads ?? {})
+        const writes = Object.entries(expected.writes ?? {})
+        const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+          [
+            'echo RAN',
+            // `type` lists the folder first; `<` opens the file alone.
+            ...reads.map(([rel]) => `type "${at(rel)}" & more < "${at(rel)}"`),
+            ...writes.map(([rel]) => `echo WROTE>"${at(rel)}"`),
+          ].join(' & '),
+          undefined,
+          customConfig,
+        )
+        const r = await spawnAsync(argv[0], argv.slice(1), {
+          env,
+          timeout: 60_000,
+        })
+        const found = {
+          reads: Object.fromEntries(
+            reads.map(([rel]) => [rel, r.stdout.includes(CONTENT[rel])]),
+          ),
+          writes: Object.fromEntries(
+            writes.map(([rel]) => [
+              rel,
+              existsSync(at(rel)) &&
+                readFileSync(at(rel), 'utf8').includes('WROTE'),
+            ]),
+          ),
+        }
+        console.error(
+          `[winsrt ${id}] ran: exit=${r.status} found=${JSON.stringify(found)} ` +
+            `stderr=${JSON.stringify(r.stderr)}`,
+        )
+        expect(r.stdout).toContain('RAN')
+        expect(found).toEqual({
+          reads: expected.reads ?? {},
+          writes: expected.writes ?? {},
+        })
+      }
+
+      /** `run` in a session of these lists, which leaves no ACE behind. */
+      async function inSession(
+        fs: FsOverrides,
+        files: CredentialFileConfig[],
+        run: () => Promise<void>,
+      ): Promise<void> {
+        await SandboxManager.initialize({
+          ...createFsTestConfig(fs),
+          credentials: { files },
+        })
+        try {
+          await run()
+        } finally {
+          await SandboxManager.reset()
+        }
+        for (const rel of ['.', 'beside', 'd', 'd/own.txt', 'd/sub']) {
+          const acl = spawnSync('icacls', [at(rel)], {
+            encoding: 'utf8',
+            timeout: 5_000,
+          }).stdout
+          expect(acl).toContain(root)
+          expect(acl).not.toContain(sbSid)
+          expect(acl).not.toContain('srt-sandbox')
+        }
+      }
+
+      type Lists = Partial<
+        Record<'allowRead' | 'allowWrite' | 'denyRead' | 'denyWrite', string[]>
+      >
+      it.each<[string, string, Lists, CredentialFileConfig[], Expected]>([
+        [
+          'L1',
+          'a denyWrite inside an allowWrite: written around, read within',
+          { allowWrite: ['.'], denyWrite: ['d'] },
+          [],
+          {
+            reads: { 'd/own.txt': true, 'd/sub/in.txt': true },
+            writes: {
+              'new.txt': true,
+              'd/new.txt': false,
+              'd/sub/new.txt': false,
+            },
+          },
+        ],
+        [
+          'L2',
+          'an allowWrite beneath a denyWrite: read, not written; beside it: written',
+          { allowWrite: ['d/sub', 'beside'], denyWrite: ['d'] },
+          [],
+          {
+            reads: { 'd/sub/in.txt': true, 'beside/b.txt': true },
+            writes: {
+              'd/sub/new.txt': false,
+              'd/sub/in.txt': false,
+              'beside/new.txt': true,
+            },
+          },
+        ],
+        [
+          'L3',
+          'an allowWrite around and beneath a denyWrite: written around alone',
+          { allowWrite: ['.', 'd/sub'], denyWrite: ['d'] },
+          [],
+          {
+            reads: { 'd/sub/in.txt': true },
+            writes: { 'new.txt': true, 'd/sub/new.txt': false },
+          },
+        ],
+        [
+          'L4',
+          'an allowWrite beneath a denyWrite, named through a junction',
+          { allowWrite: ['to-d/sub'], denyWrite: ['d'] },
+          [],
+          {
+            reads: { 'd/sub/in.txt': true },
+            writes: { 'd/sub/new.txt': false },
+          },
+        ],
+        [
+          'L5',
+          'an allowRead beneath a denyRead: read',
+          { allowRead: ['d/sub', 'beside'], denyRead: ['d'] },
+          [],
+          {
+            reads: {
+              'd/sub/in.txt': true,
+              'd/own.txt': false,
+              'beside/b.txt': true,
+            },
+          },
+        ],
+        [
+          'L6',
+          'a credential deny inside an allowWrite: neither read nor written',
+          { allowWrite: ['.'] },
+          [{ path: 'd', mode: 'deny' }],
+          {
+            reads: {
+              'd/own.txt': false,
+              'd/sub/in.txt': false,
+              'beside/b.txt': true,
+            },
+            writes: { 'd/new.txt': false, 'new.txt': true },
+          },
+        ],
+        [
+          'L7',
+          'an allowRead beneath a credential deny: not read',
+          { allowRead: ['d/sub', 'beside'] },
+          [{ path: 'd', mode: 'deny' }],
+          { reads: { 'd/sub/in.txt': false, 'beside/b.txt': true } },
+        ],
+        [
+          'L8',
+          'an allowWrite beneath a credential deny: neither read nor written',
+          { allowWrite: ['d/sub', 'beside'] },
+          [{ path: 'd', mode: 'deny' }],
+          {
+            reads: { 'd/sub/in.txt': false, 'beside/b.txt': true },
+            writes: { 'd/sub/new.txt': false, 'beside/new.txt': true },
+          },
+        ],
+        [
+          'L9',
+          'a masked file inside an allowWrite: neither read nor written',
+          { allowWrite: ['.'] },
+          [{ path: 'd/own.txt', mode: 'mask' }],
+          {
+            reads: { 'd/own.txt': false, 'd/sub/in.txt': true },
+            writes: { 'd/own.txt': false, 'd/new.txt': true },
+          },
+        ],
+        [
+          'L10',
+          'a masked file that is an allowRead too: not read',
+          { allowRead: ['d/own.txt', 'beside'] },
+          [{ path: 'd/own.txt', mode: 'mask' }],
+          { reads: { 'd/own.txt': false, 'beside/b.txt': true } },
+        ],
+        [
+          'L11',
+          'a masked file with no match, to be denied: not read',
+          { allowWrite: ['.'] },
+          [
+            {
+              path: 'd/own.txt',
+              mode: 'mask',
+              extract: 'absent-(text)',
+              onExtractNoMatch: 'deny',
+            },
+          ],
+          { reads: { 'd/own.txt': false, 'd/sub/in.txt': true } },
+        ],
+      ])(
+        '%s: %s',
+        async (id, _name, lists, files, expected) => {
+          await inSession(
+            Object.fromEntries(
+              Object.entries(lists).map(([list, rels]) => [list, rels.map(at)]),
+            ),
+            files.map(f => ({ ...f, path: at(f.path) })),
+            () => tryAll(id, expected),
+          )
+        },
+        90_000,
+      )
+
+      it('L12: an allowWrite beneath a denyWrite, each spelled its own way', async () => {
+        console.error(`[winsrt L12] spelled=${spelled} resolved=${root}`)
+        await inSession(
+          {
+            allowWrite: [at('d/sub').toUpperCase()],
+            denyWrite: [join(spelled, 'd')],
+          },
+          [],
+          () =>
+            tryAll('L12', {
+              reads: { 'd/sub/in.txt': true },
+              writes: { 'd/sub/new.txt': false },
+            }),
+        )
+      }, 90_000)
+
+      it("L13: one command's denyWrite over the session's allowWrite, for that command", async () => {
+        await inSession({ allowWrite: [at('d/sub')] }, [], async () => {
+          await tryAll(
+            'L13 with',
+            {
+              reads: { 'd/sub/in.txt': true },
+              writes: { 'd/sub/new.txt': false },
+            },
+            {
+              filesystem: {
+                denyRead: [],
+                allowWrite: [],
+                denyWrite: [at('d')],
+              },
+            },
+          )
+          await tryAll('L13 without', { writes: { 'd/sub/new.txt': true } })
+        })
+      }, 120_000)
+
+      it("L14: one command's credential deny over the session's grants, for that command", async () => {
+        await inSession(
+          { allowRead: [at('d/sub')], allowWrite: [at('beside')] },
+          [],
+          async () => {
+            await tryAll(
+              'L14 with',
+              { reads: { 'd/sub/in.txt': false, 'beside/b.txt': true } },
+              { credentials: { files: [{ path: at('d'), mode: 'deny' }] } },
+            )
+            await tryAll('L14 without', { reads: { 'd/sub/in.txt': true } })
+          },
+        )
+      }, 120_000)
+    })
   },
 )
 
@@ -2464,6 +3226,39 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     },
     120_000,
   )
+
+  // Last: it replaces the session the rows above share.
+  it('G10: beneath a credential deny the trust bundle is read, what lies beside it is not', async () => {
+    const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-g10-')))
+    const beside = join(scratch, 'beside.txt')
+    writeFileSync(beside, 'IN-BESIDE')
+    await SandboxManager.reset()
+    const temp = process.env.TEMP
+    try {
+      // The bundle gets a folder of its own in the temp folder.
+      process.env.TEMP = scratch
+      await SandboxManager.initialize({
+        ...createTlsTestConfig(['example.com']),
+        credentials: { files: [{ path: scratch, mode: 'deny' }] },
+      })
+      const bundle = SandboxManager.getMitmCA()!.trustBundlePath
+      expect(dirname(dirname(bundle))).toBe(scratch)
+      const r = await runSandboxed(
+        `echo RAN & type "%SSL_CERT_FILE:/=\\%" & type "${beside}"`,
+      )
+      console.error(
+        `[winsrt G10] ran: exit=${r.status} bundle=${bundle} ` +
+          `stdout=${r.stdout.length} chars stderr=${JSON.stringify(r.stderr)}`,
+      )
+      expect(r.stdout).toContain('RAN')
+      expect(r.stdout).toContain('-----BEGIN CERTIFICATE-----')
+      expect(r.stdout).not.toContain('IN-BESIDE')
+    } finally {
+      process.env.TEMP = temp
+      await SandboxManager.reset()
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  }, 120_000)
 })
 
 // ────────────────────────────────────────────────────────────────────
