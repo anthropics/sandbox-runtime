@@ -1967,15 +1967,10 @@ async function generateFilesystemArgs(
   // names the link, and re-allows nothing the link points at.
   const nameLocationOf = (p: string): string => nameLocation(p, canonicalForm)
   // Whether a canonical path lies inside the write allowlist, and so
-  // whether it is denied, stubbed and pinned at all: a path outside it is
-  // left read-only by the initial --ro-bind / /. The deny pre-pass, the deny
-  // loop's --ro-bind gate and the ancestor-pin walk MUST share it: the
-  // pre-pass is only sound if it records exactly the directories the loop
-  // re-binds read-only (a recorded directory that is never re-bound read-only
-  // would suppress stubs unsafely; a re-bound directory missing from the
-  // record only costs an abort). allowedWritePaths entries are canonical (the
-  // allow loop drops a symlink-spelled one) and recorded with trailing
-  // slashes stripped.
+  // whether it is stubbed and pinned at all: a path outside it is left
+  // read-only by the initial --ro-bind / /. allowedWritePaths entries are
+  // canonical (the allow loop drops a symlink-spelled one) and recorded with
+  // trailing slashes stripped.
   //
   // Containment is root-aware (isAtOrUnder) because '/' is a legal allowOnly
   // entry that the allow loop binds writable: an `allowedPath + '/'` prefix
@@ -1986,6 +1981,18 @@ async function generateFilesystemArgs(
   const isWithinAnyAllowedWritePath = (candidatePath: string): boolean =>
     allowedWritePaths.some(allowedPath =>
       isAtOrUnder(candidatePath, allowedPath),
+    )
+  // Whether an existing deny path gets its own --ro-bind: it lies inside the
+  // write allowlist, or an allowed write path lies beneath it, whose --bind
+  // the deny's then covers. The deny pre-pass and the deny loop's --ro-bind
+  // gate MUST share it: the pre-pass is only sound if it records exactly the
+  // directories the loop re-binds read-only (a recorded directory that is
+  // never re-bound read-only would suppress stubs unsafely; a re-bound
+  // directory missing from the record only costs an abort).
+  const meetsAnyAllowedWritePath = (candidatePath: string): boolean =>
+    isWithinAnyAllowedWritePath(candidatePath) ||
+    allowedWritePaths.some(allowedPath =>
+      isStrictlyUnder(allowedPath, candidatePath),
     )
   const isAllowedWriteRoot = (candidatePath: string): boolean =>
     allowedWritePaths.includes(candidatePath)
@@ -2385,7 +2392,7 @@ async function generateFilesystemArgs(
     // re-binds read-only, BEFORE any stub decision, so the read-only
     // conclusion does not depend on where an enclosing directory appears in
     // the caller's denyWrite ordering. It applies the loop's own resolution,
-    // the same symlink re-check, and the same isWithinAnyAllowedWritePath
+    // the same symlink re-check, and the same meetsAnyAllowedWritePath
     // gate as the --ro-bind emission, and it records every raw spelling each
     // directory is reached through. A recorded directory is EVIDENCE for
     // skipping a stub only if it also passes the guard's vetoes below (no
@@ -2426,7 +2433,7 @@ async function generateFilesystemArgs(
       if (!isDirectory) {
         continue
       }
-      if (isWithinAnyAllowedWritePath(resolvedPath)) {
+      if (meetsAnyAllowedWritePath(resolvedPath)) {
         // Keep every spelling this dest is reached through (the
         // re-application passes record the first-seen raw spelling beside
         // the dest, which this pass cannot assume): the guard below treats
@@ -2501,6 +2508,19 @@ async function generateFilesystemArgs(
     // Materialized once: the pre-pass above fully populates the map and the
     // deny loop never mutates it.
     const readOnlyDenyDirs = [...readOnlyDenyDirSpellings.keys()]
+    // The allowed write paths with no recorded directory above them.
+    // INVARIANT: one strictly beneath a recorded directory is never writable,
+    // whatever the vetoes say of that directory's own bind. Emitted, that bind
+    // (or the one above that it is skipped for) covers the path; dropped as
+    // hidden by a read-deny tmpfs, that tmpfs has wiped the path's allow bind,
+    // and the emission filter puts a read-only bind on every write path a unit
+    // restored beneath the dropped dest. No writable mount follows either.
+    const uncoveredWritePaths = allowedWritePaths.filter(
+      allowedPath =>
+        !readOnlyDenyDirs.some(denyDir =>
+          isStrictlyUnder(allowedPath, denyDir),
+        ),
+    )
     // Is `candidate` already unwritable in the sandbox: strictly under a
     // recorded read-only deny directory that survives every
     // coveringDirIsUnsafe veto? Strictly, because a deny equal to a recorded
@@ -2661,9 +2681,9 @@ async function generateFilesystemArgs(
 
         // Only protect if the existing ancestor is within an allowed write path.
         // If not, the path is already read-only from --ro-bind / /.
-        // Same predicate as the pre-pass and the --ro-bind gate (equality on
-        // the absent normalizedPath itself is unreachable — allow entries
-        // exist, the deny path does not).
+        // (Equality on the absent normalizedPath itself is unreachable, and
+        // so is an allow entry beneath it — allow entries exist, the deny
+        // path does not.)
         const ancestorIsWithinAllowedPath =
           isWithinAnyAllowedWritePath(ancestorPath) ||
           isWithinAnyAllowedWritePath(normalizedPath)
@@ -2680,9 +2700,13 @@ async function generateFilesystemArgs(
         // coveringDirIsUnsafe vetoes (see the INVARIANT at its definition).
         // (Tested on the absent path itself: a recorded directory that
         // covers it is at-or-above its deepest existing ancestor, since
-        // recorded directories exist.)
+        // recorded directories exist.) So is a path that only covered write
+        // paths hold (see uncoveredWritePaths).
         const ancestorIsWithinReadOnlyDeny =
-          coveredBySafeReadOnlyDenyDir(normalizedPath)
+          coveredBySafeReadOnlyDenyDir(normalizedPath) ||
+          !uncoveredWritePaths.some(allowedPath =>
+            isAtOrUnder(normalizedPath, allowedPath),
+          )
 
         if (ancestorIsWithinAllowedPath && !ancestorIsWithinReadOnlyDeny) {
           const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
@@ -2745,11 +2769,10 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Only add deny binding if this path is within an allowed write path
-      // Otherwise it's already read-only from the initial --ro-bind / /
-      const isWithinAllowedPath = isWithinAnyAllowedWritePath(normalizedPath)
-
-      if (isWithinAllowedPath) {
+      // Only add deny binding if this path is within an allowed write path or
+      // holds one. Otherwise all of it is already read-only from the initial
+      // --ro-bind / /
+      if (meetsAnyAllowedWritePath(normalizedPath)) {
         // Already unwritable under a read-only denied directory (the
         // existing-path twin of the stub skip above). Veto (ii) keeps the
         // covering bind through the emission filter; a dest ANY deny entry
@@ -3085,6 +3108,7 @@ async function generateFilesystemArgs(
       // restored writable beneath it: that path is inside this write deny, so
       // restore it read-only, where the unit left it. Emitting the dest's own
       // bind instead would expose the read-denied directory around it.
+      // uncoveredWritePaths counts on this restore.
       for (const unit of readDenyTmpfsUnits) {
         for (const writeMount of unit.restoredWrites) {
           const writePath = writeMount.dest
