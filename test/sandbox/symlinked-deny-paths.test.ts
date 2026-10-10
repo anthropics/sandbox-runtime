@@ -18,6 +18,7 @@ import {
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { countMounts } from '../helpers/bwrap-argv.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 /**
  * The root's symlinks into /usr (/bin, /lib, /sbin on a usr-merged system),
@@ -152,6 +153,114 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     // A directory is what stands in for the first missing component.
     expect(countMounts(result, '--ro-bind', '/dev/null', linkTarget)).toBe(0)
     expect(result).toMatch(new RegExp(`--ro-bind \\S+ ${linkTarget} `))
+  })
+
+  /** The placeholders beneath PROJ: what stands in, by where. */
+  const placeholders = (result: string): Record<string, string> =>
+    Object.fromEntries(
+      [...result.matchAll(/--ro-bind (\S+) (\S+)/g)]
+        .filter(([, from, at]) => from !== at && at!.startsWith(`${PROJ}/`))
+        .map(([, from, at]) => [
+          at!.slice(PROJ.length + 1),
+          from === '/dev/null' ? 'file' : 'directory',
+        ]),
+    )
+
+  it.each([
+    [
+      'a directory a dangling hop lacks',
+      { hop: 'lacking/in', name: 'hop/../made' },
+      { lacking: 'directory' },
+    ],
+    [
+      'what the last of three dangling hops lacks',
+      { hop: 'two/x', two: 'three/y', three: 'lacking/z', name: 'hop/made' },
+      { lacking: 'directory' },
+    ],
+    [
+      'the names that only lead down from it',
+      { name: 'lacking/./in//deep/../../made' },
+      { lacking: 'directory' },
+    ],
+    [
+      'a hop that is not there, and where the way leads if that is a directory',
+      { name: 'hop/../made' },
+      { hop: 'file', made: 'file' },
+    ],
+    [
+      'each name the way goes up from at once',
+      { name: 'one/../two/./../three/in' },
+      { one: 'file', two: 'file', three: 'directory' },
+    ],
+  ])('puts a placeholder on %s', async (_, links, expected) => {
+    for (const [link, target] of Object.entries(links)) {
+      symlinkSync(target, join(PROJ, link))
+    }
+
+    expect(placeholders(await wrap([join(PROJ, 'name')]))).toEqual(expected)
+  })
+
+  it('denies what is there where the way leads past a name that is not', async () => {
+    mkdirSync(join(PROJ, 'kept'))
+    symlinkSync('hop/../kept', join(PROJ, 'name'))
+
+    const result = await wrap([join(PROJ, 'name')])
+
+    expect(placeholders(result)).toEqual({ hop: 'file' })
+    expect(
+      countMounts(result, '--ro-bind', join(PROJ, 'kept'), join(PROJ, 'kept')),
+    ).toBe(1)
+  })
+
+  it('denies the root where the way leads there past a name that is not', async () => {
+    symlinkSync(
+      `hop/..${'/..'.repeat(PROJ.split('/').length)}`,
+      join(PROJ, 'name'),
+    )
+
+    const result = await wrapCommandWithSandboxLinux({
+      command: 'true',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: { allowOnly: ['/'], denyWithinAllow: [join(PROJ, 'name')] },
+    })
+
+    // Beside the one that every plan starts with.
+    expect(countMounts(result, '--ro-bind', '/', '/')).toBe(2)
+  })
+
+  it.each([
+    ['comes round to itself', 'name', 'ELOOP'],
+    [
+      'goes up from one missing name after another, without end',
+      'x/../name',
+      'too many names',
+    ],
+    ['leads through a name that is no text', Buffer.of(0x6e, 0xff), 'EILSEQ'],
+    // root searches a directory of any mode.
+    ...(process.getuid?.() === 0
+      ? []
+      : [
+          [
+            'leads into a directory that cannot be searched',
+            'shut/x',
+            'EACCES',
+          ],
+        ]),
+  ])('masks the link and says why where the way %s', async (_, target, why) => {
+    symlinkSync(target, join(PROJ, 'name'))
+    mkdirSync(join(PROJ, 'shut'), { mode: 0o600 })
+
+    const { result, warnings } = await withCapturedWarnings(() =>
+      wrap([join(PROJ, 'name')]),
+    )
+
+    expect(
+      countMounts(result, '--ro-bind', '/dev/null', join(PROJ, 'name')),
+    ).toBe(1)
+    expect(warnings.filter(said => said.includes('cannot be settled'))).toEqual(
+      [expect.stringMatching(new RegExp(`${join(PROJ, 'name')} .*${why}`))],
+    )
   })
 
   it('fails closed on a symlink cycle rather than dropping the deny', async () => {

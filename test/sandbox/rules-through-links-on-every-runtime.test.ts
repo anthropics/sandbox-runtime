@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -56,9 +55,10 @@ afterEach(() => {
 
 /**
  * Which of `files`, given from `root`, a command run by the CLI can read, or
- * append to. The CLI is ended hard past its time, and the command runs behind
+ * append to, by its own account: a placeholder is gone when it has ended. The CLI is ended hard past its time, and the command runs behind
  * an `echo BOOTED`, so neither can read as a command that was refused: a
- * sandbox that is to refuse to start is said not to `boot`.
+ * sandbox that is to refuse to start is said not to `boot`. What the command
+ * does `first`, it does in `root`.
  */
 function reach(
   argv: readonly string[],
@@ -66,6 +66,7 @@ function reach(
   does: 'read' | 'append',
   files: string[],
   boots: boolean | 'or not' = true,
+  first = 'true',
 ): string[] {
   const settings = join(root, 'settings.json')
   writeFileSync(
@@ -76,28 +77,23 @@ function reach(
       ...policy,
     }),
   )
-  const command = ['echo BOOTED']
+  const command = ['echo BOOTED', `( ${first} ) 2>/dev/null`]
     .concat(
       files.map(file =>
         does === 'read'
           ? `cat '${root}/${file}'`
-          : `echo ${APPENDED} >> '${root}/${file}'`,
+          : `( echo ${APPENDED} >> '${root}/${file}' ) && echo '<${file}>'`,
       ),
     )
     .join('; ')
   const { stdout, error } = spawnSync(
     argv[0]!,
     [...argv.slice(1), CLI_PATH, '-s', settings, '-c', command],
-    { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' },
+    { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', cwd: root },
   )
   expect(error).toBeUndefined()
   if (boots !== 'or not') expect(stdout.includes('BOOTED')).toBe(boots)
-  return files.filter(file =>
-    does === 'read'
-      ? stdout.includes(`<${file}>`)
-      : existsSync(join(root, file)) &&
-        readFileSync(join(root, file), 'utf8').includes(APPENDED),
-  )
+  return files.filter(file => stdout.includes(`<${file}>`))
 }
 
 const denyRead = (...entries: string[]) => ({
@@ -253,5 +249,136 @@ describe.if(isLinux && canRun).each(RUNTIMES)(
       },
       60_000,
     )
+  },
+)
+
+/**
+ * A way can be cut short at a name that is not there: a directory a target
+ * lacks, a link on the way that is missing or dangles in its turn. Whoever
+ * makes that name decides where the way goes on, so it is what is held.
+ */
+describe.if(isLinux && canRun).each(RUNTIMES)(
+  'a write deny on a link whose way is cut short, in %s',
+  (_, argv) => {
+    const bytes = `"$(printf 'n\\377')"`
+
+    it.each([
+      [
+        'the directories a dangling hop lacks',
+        { hop: 'lacking/in', name: 'hop/../made' },
+        'mkdir -p lacking/in',
+      ],
+      [
+        'a hop that is not there, as a link',
+        { name: 'hop/../made' },
+        'ln -s elsewhere/in hop',
+      ],
+      [
+        'a hop that is not there, as a directory',
+        { name: 'hop/../made' },
+        'mkdir hop',
+      ],
+      [
+        'what a dangling hop leads to, as a link',
+        { hop: 'lacking', name: 'hop/../made' },
+        'ln -s elsewhere/in lacking',
+      ],
+      [
+        'what the second of two dangling hops lacks',
+        { hop: 'second/x', second: 'lacking/y', name: 'hop/made' },
+        'mkdir -p lacking/y/x',
+      ],
+      [
+        'what the third of three dangling hops lacks',
+        {
+          hop: 'second/x',
+          second: 'third/y',
+          third: 'lacking/z',
+          name: 'hop/../made',
+        },
+        'mkdir -p lacking/z/y/x',
+      ],
+      [
+        'a name that a built-in deny holds as a directory',
+        { name: '.claude/../made' },
+        'true',
+      ],
+    ])(
+      'holds when the command makes %s',
+      (_, links, first) => {
+        for (const [link, target] of Object.entries(links)) {
+          symlinkSync(target, join(root, link))
+        }
+
+        expect(
+          reach(
+            argv,
+            denyWrite(join(root, 'name')),
+            'append',
+            ['name', 'here/file'],
+            true,
+            first,
+          ),
+        ).toEqual(['here/file'])
+      },
+      60_000,
+    )
+
+    it('holds where a hop leads out of the write root', () => {
+      symlinkSync('../../lacking/in', join(root, 'here/hop'))
+      symlinkSync('hop/made', join(root, 'here/name'))
+      const policy = {
+        filesystem: {
+          denyRead: [],
+          allowWrite: [join(root, 'here')],
+          denyWrite: [join(root, 'here/name')],
+        },
+      }
+
+      expect(
+        reach(
+          argv,
+          policy,
+          'append',
+          ['here/name', 'here/file'],
+          true,
+          'mkdir -p lacking/in',
+        ),
+      ).toEqual(['here/file'])
+    }, 60_000)
+
+    it('lets nothing run that could write it where a hop leads to a name that is no text', () => {
+      symlinkSync(
+        Buffer.concat([Buffer.from('n'), Buffer.of(0xff), Buffer.from('/in')]),
+        join(root, 'hop'),
+      )
+      symlinkSync('hop/../made', join(root, 'name'))
+
+      expect(
+        reach(
+          argv,
+          denyWrite(join(root, 'name')),
+          'append',
+          ['name'],
+          false,
+          `mkdir -p ${bytes}/in`,
+        ),
+      ).toEqual([])
+    }, 60_000)
+
+    it('leaves the rest of the project to a command where a built-in deny is a link to what is not built yet', () => {
+      symlinkSync('build/vscode', join(root, '.vscode'))
+
+      expect(
+        reach(
+          argv,
+          denyWrite(join(root, 'not-there')),
+          'append',
+          ['.vscode/settings.json', 'build/vscode/settings.json', 'here/file'],
+          true,
+          'mkdir -p build/vscode',
+        ),
+      ).toEqual(['here/file'])
+    }, 60_000)
   },
 )

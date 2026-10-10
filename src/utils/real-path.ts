@@ -45,6 +45,23 @@ export function realPathOf(p: string): string {
   const from = path.isAbsolute(p) ? '' : process.cwd()
   const folded = path.resolve(from, p)
   if (!(from + p).includes('\\')) return textOf(fs.realpathSync.native, folded)
+  const { real, notThere } = wayTo(folded)
+  if (notThere !== undefined) throw notThere
+  return real || '/'
+}
+
+/**
+ * The kernel's way to `folded`, an absolute path with no `.`, `..` or `//` of
+ * its own: name by name, split at `/` alone, every link followed. `real` is
+ * as far as it leads, '' being the root. `rest` is what it has not come to:
+ * nothing, or first the name that is not there, with what the kernel said of
+ * it. Whatever else stops the way is thrown. POSIX only.
+ */
+export function wayTo(folded: string): {
+  real: string
+  rest: string[]
+  notThere?: unknown
+} {
   let real = ''
   let links = 0
   const rest = folded.split('/')
@@ -56,21 +73,29 @@ export function realPathOf(p: string): string {
       continue
     }
     const next = `${real}/${name}`
-    if (!fs.lstatSync(next).isSymbolicLink()) {
+    let isLink: boolean
+    try {
+      isLink = fs.lstatSync(next).isSymbolicLink()
+    } catch (notThere) {
+      const { code } = notThere as NodeJS.ErrnoException
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw notThere
+      return { real, rest: [name, ...rest], notThere }
+    }
+    if (!isLink) {
       real = next
       continue
     }
     if (++links > MAX_LINKS) {
       throw Object.assign(
         new Error(
-          `ELOOP: too many symbolic links encountered, realpath '${p}'`,
+          `ELOOP: too many symbolic links encountered, realpath '${folded}'`,
         ),
-        { code: 'ELOOP', syscall: 'realpath', path: p },
+        { code: 'ELOOP', syscall: 'realpath', path: folded },
       )
     }
     const target = textOf(fs.readlinkSync, next)
     if (target.startsWith('/')) real = ''
     rest.unshift(...target.split('/'))
   }
-  return real || '/'
+  return { real, rest }
 }

@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
-import { realPathOf } from '../../src/utils/real-path.js'
+import { realPathOf, wayTo } from '../../src/utils/real-path.js'
 import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
 
 /** What a call gives: its value, or the code of what it throws. */
@@ -244,6 +244,24 @@ describe.if(!isWindows)('realPathOf', () => {
     process.chdir(at(cwd))
 
     expect(realPathOf(given)).toBe(resolve(at(real)))
+  })
+
+  it.each([
+    ['plain/file', 'plain/file', []],
+    ['a\\b/out/file', 'plain/file', []],
+    ['plain/not-there/in', 'plain', ['not-there', 'in']],
+    ['plain/file/in/deep', 'plain/file', ['in', 'deep']],
+    ['a\\b/nowhere/in', 'a\\b', ['not-there', 'in']],
+    ['plain/out/not-there/../x', 'a/b', ['not-there', '..', 'x']],
+  ])('the way to %s leads as far as %s and leaves %j', (to, real, rest) => {
+    expect(wayTo(at(to))).toMatchObject({ real: at(real), rest })
+  })
+
+  it.each([
+    ['a\\b/round', 'ELOOP'],
+    ['a\\b/up-from-a-file', 'ENOTDIR'],
+  ])('the way to %s fails with %s', (to, code) => {
+    expect(answer(() => wayTo(at(to)).real)).toBe(code)
   })
 
   it('is the root for the root', () => {
