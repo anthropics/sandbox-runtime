@@ -79,10 +79,12 @@ import {
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   expandWindowsFsPaths,
-  stampWindowsAcl,
+  stampWindowsAclAsync,
   restoreWindowsAcl,
-  grantWindowsAcl,
+  restoreWindowsAclAsync,
+  grantWindowsAclAsync,
   revokeWindowsAcl,
+  revokeWindowsAclAsync,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
@@ -162,7 +164,8 @@ let httpProxyServer: ReturnType<typeof createHttpProxyServer> | undefined
 let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
-let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+let initializationPromise: Promise<void> | undefined
+let resetPromise: Promise<void> | undefined
 let cleanupRegistered = false
 let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
@@ -232,7 +235,13 @@ function registerCleanup(): void {
         level: 'error',
       })
     })
-  process.once('exit', cleanupHandler)
+  // An exit listener cannot await subprocesses. Keep the synchronous ACL
+  // release here; explicit reset and signal handlers use the async path.
+  process.once('exit', () => {
+    void resetInternal(true).catch(e => {
+      logForDebugging(`Cleanup failed on exit ${e}`, { level: 'error' })
+    })
+  })
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
   cleanupRegistered = true
@@ -807,13 +816,36 @@ async function initialize(
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
 ): Promise<void> {
-  // Return if already initializing
-  if (initializationPromise) {
-    await initializationPromise
-    return
+  if (resetPromise) await resetPromise
+  if (!initializationPromise) {
+    // Keep config available immediately, including to wrappers that wait for
+    // initialization themselves.
+    config = runtimeConfig
+    // Cover the ACL phase as well as network setup so a reset cannot clear
+    // the holder identity while an asynchronous grant or stamp is pending.
+    initializationPromise = Promise.resolve()
+      .then(() =>
+        initializeInternal(runtimeConfig, sandboxAskCallback, enableLogMonitor),
+      )
+      .catch(async error => {
+        await resetInternal().catch(e => {
+          logForDebugging(`Cleanup failed during initialization ${e}`, {
+            level: 'error',
+          })
+        })
+        initializationPromise = undefined
+        config = undefined
+        throw error
+      })
   }
+  await initializationPromise
+}
 
-  // Store config for use by other functions
+async function initializeInternal(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  enableLogMonitor: boolean,
+): Promise<void> {
   config = runtimeConfig
   configInstalls++
 
@@ -1051,7 +1083,7 @@ async function initialize(
       // the time the deny stamp runs. The two are independent
       // refcounted state-DB sets keyed on the same holder PID.
       if (acc.grantRead.length > 0 || acc.grantWrite.length > 0) {
-        grantWindowsAcl({
+        await grantWindowsAclAsync({
           sandboxUserSid: sb,
           read: acc.grantRead,
           write: acc.grantWrite,
@@ -1059,7 +1091,7 @@ async function initialize(
         })
       }
       if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
-        stampWindowsAcl({
+        await stampWindowsAclAsync({
           sandboxUserSid: sb,
           denyRead: acc.denyRead,
           denyWrite: acc.denyWrite,
@@ -1091,9 +1123,10 @@ async function initialize(
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
-      if (windowsFsSbUserSid) {
-        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
-        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
+      const sandboxUserSid = windowsFsSbUserSid
+      if (sandboxUserSid) {
+        await revokeWindowsAclAsync({ sandboxUserSid, srtWin })
+        await restoreWindowsAclAsync({ sandboxUserSid, srtWin })
       }
       windowsFsSbUserSid = undefined
       config = undefined
@@ -1102,7 +1135,7 @@ async function initialize(
   }
 
   // Initialize network infrastructure
-  initializationPromise = (async () => {
+  await (async () => {
     try {
       // On Windows the WFP loopback permit covers a fixed port
       // range, so the proxies must bind inside it. Other platforms
@@ -1177,19 +1210,10 @@ async function initialize(
       logForDebugging('Network infrastructure initialized')
       return context
     } catch (error) {
-      // Clear state on error so initialization can be retried
-      initializationPromise = undefined
       managerContext = undefined
-      reset().catch(e => {
-        logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
-          level: 'error',
-        })
-      })
       throw error
     }
   })()
-
-  await initializationPromise
 }
 
 function isSupportedPlatform(): boolean {
@@ -2583,11 +2607,26 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  if (!resetPromise) {
+    const initializing = initializationPromise
+    resetPromise = (async () => {
+      // Failed initialization already releases partial ACLs. Still complete
+      // teardown, and do not replace its error with a reset error.
+      await initializing?.catch(() => {})
+      await resetInternal()
+    })().finally(() => {
+      resetPromise = undefined
+    })
+  }
+  await resetPromise
+}
+
+async function resetInternal(syncWindowsAcl = false): Promise<void> {
   // Windows: release this session's sandbox-user ACEs. Best-effort
   // — log anomalies rather than throw, so teardown always
   // completes. Leftover ACEs are recoverable later via
   // `srt-win acl recover` (which sweeps by trustee SID).
-  if (windowsFsStampedSet && windowsFsSbUserSid) {
+  if ((windowsFsStampedSet || syncWindowsAcl) && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
@@ -2606,12 +2645,15 @@ async function reset(): Promise<void> {
         )
       }
     }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('grant revoke', e)
-    }
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('deny restore', e)
-    }
+    const opts = { sandboxUserSid: sb, srtWin }
+    const revoked = syncWindowsAcl
+      ? revokeWindowsAcl(opts)
+      : await revokeWindowsAclAsync(opts)
+    for (const e of revoked ?? []) log('grant revoke', e)
+    const restored = syncWindowsAcl
+      ? restoreWindowsAcl(opts)
+      : await restoreWindowsAclAsync(opts)
+    for (const e of restored ?? []) log('deny restore', e)
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
