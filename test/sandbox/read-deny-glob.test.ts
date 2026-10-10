@@ -460,10 +460,19 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
   describe('a link that matches and is read by its short name alone', () => {
     // proj/vendor is shorter than what it leads to, so what lies in there is
     // spelled by its real path and has a short name besides. Its real path
-    // failing, a link stays covered as spelled, which beneath a directory the
-    // pattern denies is no mount at all: where it leads is not in there.
+    // failing, a link stays in the list as spelled, beneath a directory the
+    // pattern denies as well: where it leads is not in there.
     const V = 'out/of/the/tree/vendor'
-    const CLEAN = ['far.txt', `${V}/secrets`, 'store/dir', 'store/key.txt']
+    const CLEAN = [
+      'far.txt',
+      'far2.txt',
+      `${V}/root`,
+      `${V}/secrets`,
+      'proj',
+      'store/dir',
+      'store/key.txt',
+      'store/sub',
+    ]
     let root: string
 
     beforeAll(() => {
@@ -472,7 +481,10 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
         `${V}/secrets`,
         `${V}/alt`,
         `${V}/file`,
+        `${V}/up`,
+        `${V}/root`,
         'store/dir',
+        'store/sub',
         'decoy',
         'proj',
       ]) {
@@ -482,7 +494,9 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
         `${V}/secrets/token.txt`,
         'store/key.txt',
         'store/dir/f',
+        'store/sub/g',
         'far.txt',
+        'far2.txt',
         'decoy.txt',
       ]) {
         writeFileSync(join(root, file), '')
@@ -494,11 +508,20 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
       symlinkSync(join(root, 'far.txt'), join(root, 'store/dir/more'))
       // Of the directory form by its name, and no directory: denies nothing.
       symlinkSync(join(root, 'decoy.txt'), join(root, V, 'file/secrets'))
+      // A match that is a directory, and what lies behind it.
+      symlinkSync(join(root, 'store/sub'), join(root, V, 'secrets/sub'))
+      symlinkSync(join(root, 'far2.txt'), join(root, 'store/sub/more'))
+      // Of the directory form, to the base and to the root: not listed through.
+      symlinkSync(join(root, 'proj'), join(root, V, 'up/secrets'))
+      symlinkSync('/', join(root, V, 'root/secrets'))
     })
 
     /** What `proj/**\/secrets/**` denies while `answers` holds: by call and
      *  name, the errno it fails with or, after `=`, the path that answers. */
-    function expandWhile(answers: Record<string, string>): string[] {
+    function expandWhile(
+      answers: Record<string, string>,
+      tail = '**/secrets/**',
+    ): string[] {
       const spies = (['statSync', 'realpathSync'] as const).map(fn => {
         const call = fs[fn] as (...args: unknown[]) => unknown
         return spyOn(fs, fn).mockImplementation(((
@@ -513,9 +536,9 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
         }) as never)
       })
       try {
-        return expandReadDenyGlobLinux(join(root, 'proj/**/secrets/**'), [])
-          .map(p => p.slice(root.length + 1))
-          .sort()
+        return expandReadDenyGlobLinux(join(root, 'proj', tail), []).map(p =>
+          p.slice(root.length + 1),
+        )
       } finally {
         for (const spy of spies) spy.mockRestore()
       }
@@ -527,16 +550,25 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
       ),
     )('denies where it leads besides (%s, %s)', (call, code) => {
       expect(expandWhile({})).toEqual(CLEAN)
-      expect(expandWhile({ [`${call} ${V}/secrets/key.pem`]: code })).toEqual(
-        CLEAN,
-      )
-      // Of the directory form: whole, with what lies behind it, and as spelled.
-      expect(expandWhile({ [`${call} ${V}/alt/secrets`]: code })).toEqual(
-        [...CLEAN, `${V}/alt/secrets`].sort(),
-      )
-      expect(expandWhile({ [`${call} ${V}/file/secrets`]: code })).toEqual(
-        [...CLEAN, `${V}/file/secrets`].sort(),
-      )
+      for (const link of [
+        'secrets/key.pem',
+        'secrets/sub',
+        'alt/secrets',
+        'file/secrets',
+        'up/secrets',
+        'root/secrets',
+      ]) {
+        expect([link, expandWhile({ [`${call} ${V}/${link}`]: code })]).toEqual(
+          [link, [...CLEAN, `${V}/${link}`].sort()],
+        )
+      }
+      // A match with nothing of the pattern left beneath it.
+      expect(
+        expandWhile(
+          { [`${call} ${V}/secrets/sub`]: code },
+          'vendor/secrets/s*',
+        ),
+      ).toEqual(['proj/vendor/secrets/sub', 'store/sub'])
     })
 
     it('denies a decoy besides, and nothing less for it', () => {
@@ -549,9 +581,78 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
           'statSync proj/vendor/alt/secrets': '=decoy',
           'realpathSync proj/vendor/alt/secrets': '=decoy',
         }),
-      ).toEqual(['decoy', 'decoy.txt', `${V}/alt/secrets`, `${V}/secrets`])
+      ).toEqual(
+        [
+          ...CLEAN.filter(
+            p => !['store/dir', 'store/key.txt', 'far.txt'].includes(p),
+          ),
+          'decoy',
+          'decoy.txt',
+          `${V}/alt/secrets`,
+          `${V}/secrets/key.pem`,
+        ].sort(),
+      )
+    })
+
+    it('keeps it as spelled beneath whatever the short name says it leads to', () => {
+      expect(
+        expandWhile({
+          [`statSync ${V}/secrets/key.pem`]: 'EACCES',
+          'statSync proj/vendor/secrets/key.pem': `=${V}`,
+          'realpathSync proj/vendor/secrets/key.pem': `=${V}`,
+        }),
+      ).toEqual(
+        [
+          ...CLEAN.filter(p => !p.startsWith(V) && p !== 'store/key.txt'),
+          V,
+          `${V}/secrets/key.pem`,
+        ].sort(),
+      )
+    })
+
+    it('keeps one that cannot be inspected under either name as spelled', () => {
+      expect(
+        expandWhile({
+          [`statSync ${V}/secrets/key.pem`]: 'EACCES',
+          'statSync proj/vendor/secrets/key.pem': 'EACCES',
+        }),
+      ).toEqual(
+        [
+          ...CLEAN.filter(p => p !== 'store/key.txt'),
+          `${V}/secrets/key.pem`,
+        ].sort(),
+      )
     })
   })
+
+  it.if(isLinux && process.getuid?.() !== 0)(
+    'keeps a link as spelled, with where its short name leads, when no real path answers',
+    () => {
+      // Nothing is made to fail. The working directory lies behind one that
+      // cannot be searched, so what is in it answers by /proc/self/cwd alone,
+      // which this runtime resolves.
+      const root = caseRoot('no-real-path')
+      const work = join(root, 'gate/work')
+      const secrets = join(work, 'deep/er/dir/secrets')
+      mkdirSync(secrets, { recursive: true })
+      writeFileSync(join(secrets, 'token.txt'), '')
+      writeFileSync(join(root, 'key.txt'), '')
+      symlinkSync(join(root, 'key.txt'), join(secrets, 'key.pem'))
+      symlinkSync('deep/er/dir', join(work, 'l'))
+      const cwd = process.cwd()
+      process.chdir(work)
+      chmodSync(join(root, 'gate'), 0o000)
+      try {
+        expect(realpathSync('/proc/self/cwd')).toBe(work)
+        expect(
+          expandReadDenyGlobLinux('/proc/self/cwd/*/secrets/**', []),
+        ).toEqual([work, join(secrets, 'key.pem'), join(root, 'key.txt')])
+      } finally {
+        chmodSync(join(root, 'gate'), 0o755)
+        process.chdir(cwd)
+      }
+    },
+  )
 
   it('lists every match where it really is when the base is a symlink', () => {
     // alias -> ROOT, sideways: normalizePathForSandbox keeps the link
