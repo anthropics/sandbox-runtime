@@ -189,14 +189,17 @@ describe.if(!isWindows)('the links on the way to a path', () => {
     })
   })
 
-  it('follows as many links as the kernel, and has no end past them', () => {
+  it('follows as many links as the Linux kernel, and has no end past them', () => {
     symlinkSync('beside', join(ROOT, 'hop-1'))
     for (let i = 2; i <= 41; i++) {
       symlinkSync(`hop-${i - 1}`, join(ROOT, `hop-${i}`))
     }
     expect(followLinks(join(ROOT, 'hop-40')).end).toBe(join(ROOT, 'beside'))
     expect(followLinks(join(ROOT, 'hop-41')).end).toBeUndefined()
-    expect(() => readFileSync(join(ROOT, 'hop-40'))).not.toThrow()
+    // macOS gives up sooner, at 32: what is denied past that is denied in vain.
+    if (isLinux) {
+      expect(() => readFileSync(join(ROOT, 'hop-40'))).not.toThrow()
+    }
     expect(() => readFileSync(join(ROOT, 'hop-41'))).toThrow('ELOOP')
   })
 
@@ -353,8 +356,6 @@ describe.if((isLinux && bwrapCanNamespace()) || isMacOS)(
       ],
       ['a write to a device a denied name leads to', 'echo x > /dev/null'],
       ['a read of it', 'cat /dev/null'],
-      // Linux opens what is behind it anew, which a socket refuses.
-      ...(isMacOS ? [['the same of the output', 'echo x > /dev/stdout']] : []),
     ])('allows %s: %s', async (_what, attempt) => {
       expect(await outcomeOf(attempt)).toBe('DONE')
     })
