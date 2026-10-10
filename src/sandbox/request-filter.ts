@@ -18,6 +18,7 @@ import { isIP } from 'node:net'
 import { PassThrough, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 import { isResolvedAddressDenied } from './resolved-address-guard.js'
+import { sanitizeDenialReason } from './sandbox-violation-store.js'
 
 export type RequestDecision = {
   action: 'allow' | 'deny'
@@ -745,7 +746,11 @@ const DEFAULT_DENY_TAG = 'blocked-by-sandbox-runtime'
 /**
  * The proxy's standard policy-denial response as raw bytes, for paths that
  * answer on a bare socket (CONNECT): 403 with an `X-Proxy-Error` tag and
- * the reason as the body.
+ * the reason as the body. `phrase` is the status line's: of a refused CONNECT
+ * that is the part clients show (the script in GIT_SSH_COMMAND among
+ * them), not the body. It is cleaned and cut as a violation line's reason
+ * is. What is not ASCII becomes `?`: many clients read a status line as
+ * Latin-1, where UTF-8 shows as noise, C1 controls among it.
  */
 /**
  * The header that marks a denial: `X-Proxy-Error: <tag>` for a tag, or a
@@ -762,10 +767,11 @@ function denyMarkHeader(mark: DenyMark): [string, string] {
 export function rawDenied(
   reason: string,
   tag: DenyMark = DEFAULT_DENY_TAG,
+  phrase = 'Forbidden',
 ): string {
   const [name, value] = denyMarkHeader(tag)
   return (
-    'HTTP/1.1 403 Forbidden\r\n' +
+    `HTTP/1.1 403 ${sanitizeDenialReason(String(phrase)).replace(/[^ -~]/gu, '?')}\r\n` +
     'Content-Type: text/plain\r\n' +
     `${name}: ${value}\r\n` +
     '\r\n' +

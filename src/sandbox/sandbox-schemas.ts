@@ -142,9 +142,10 @@ export type NetworkHostPattern = {
  * Asked about a host that no configured rule and no per-command allow list
  * decided (never asked under `network.strictAllowlist`). Only `true` allows.
  * `{ allow: false, reason }` denies with that reason, which the violation
- * line reports. `false` and every other answer, truthy or not, deny with the
- * generic reason "user denied": a `reason` on an object that does not say
- * `allow: false` is not reported.
+ * line reports, and which the sandboxed client reads as the status phrase of
+ * the 403 that answers its CONNECT. `false` and every other answer, truthy
+ * or not, deny with the generic reason "user denied": a `reason` on an
+ * object that does not say `allow: false` is not reported.
  *
  * The reason is sanitized like the rest of a violation line (runs of control
  * or invisible characters become one space, `<` and `>` are removed, the

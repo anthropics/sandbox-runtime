@@ -858,10 +858,27 @@ export function generateProxyEnvVars(
     // configured ControlPath.
     const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
-    if (platform === 'macos') {
-      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
-      // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
-      // handshake — use git-over-https (HTTP_PROXY carries the credential).
+    if (
+      platform === 'macos' &&
+      proxyAuthToken &&
+      httpProxyPort === socksProxyPort
+    ) {
+      // macOS, and the SOCKS listener is the library's own, which serves both
+      // protocols on one port and wants the token: BSD nc has no SOCKS
+      // authentication to give it, and is refused. So an HTTP CONNECT with
+      // the credential, as on Linux, from what macOS ships. The script
+      // travels in a variable of its own: that keeps the token out of the
+      // arguments of ssh and of what it starts, and the script out of git's
+      // `sh -c`, ssh's % expansion and `$SHELL -c` (the user's shell, be it
+      // fish or tcsh), which see plain and single-quoted words only.
+      const basic = Buffer.from(`${userRaw}:${proxyAuthToken}`)
+      envVars.push(
+        `SRT_SSH_PROXY_COMMAND=${sshConnectScript(socksProxyPort, basic.toString('base64'))}`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand="/bin/sh -c 'eval \\"\\\${SRT_SSH_PROXY_COMMAND:?unset, but GIT_SSH_COMMAND needs it}\\"' sh '%h' %p"`,
+      )
+    } else if (platform === 'macos') {
+      // A SOCKS listener that wants no token of ours, an external one
+      // included: BSD nc's SOCKS5 support (-X 5 -x).
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )
@@ -927,6 +944,43 @@ export function generateProxyEnvVars(
   // already carries the route for clients that read it.
 
   return envVars
+}
+
+/**
+ * A POSIX sh script for an ssh ProxyCommand (`$1` host, `$2` port): an HTTP
+ * CONNECT through the proxy on 127.0.0.1:`proxyPort` with the Basic
+ * credential `basic`, then stdin and stdout relayed by `nc`.
+ *
+ * The host comes from a git URL, which a repository chooses. It is never
+ * script text or printf's format, and one that could end the request line is
+ * refused before anything is sent.
+ *
+ * The response head is read here, so a refusal is one line on stderr, with
+ * the status line's own words. The pipeline runs in the background (hence
+ * stdin as fd 3) so that this shell can close its own copy of stdout: held,
+ * it would keep an end of file from ssh.
+ *
+ * `nc` is the one macOS ships, by path: it leaves when the network side
+ * ends, which is how ssh learns of it. Current OpenBSD and Debian ones stay
+ * until their stdin ends too, and ssh would wait.
+ */
+export function sshConnectScript(
+  proxyPort: number,
+  basic: string,
+  nc = '/usr/bin/nc',
+): string {
+  return (
+    'LC_ALL=C; no() { printf "sandbox proxy: %s\\n" "$*" >&2; exit 1; }; ' +
+    'case $1 in ""|*[!A-Za-z0-9._:-]*) no bad host;; *:*) set -- "[$1]" "$2";; esac; ' +
+    'case $2 in ""|*[!0-9]*) no bad port;; esac; ' +
+    'exec 3<&0; ' +
+    `{ printf "CONNECT %s HTTP/1.1\\r\\nHost: %s\\r\\nProxy-Authorization: Basic ${basic}\\r\\n\\r\\n" "$1:$2" "$1:$2"; exec /bin/cat <&3; } | ` +
+    `${nc} 127.0.0.1 ${proxyPort} | ` +
+    '{ read -r v why; while read -r v; do case $v in ""|?) break;; esac; done; ' +
+    'case $why in "200 "*) exec /bin/cat;; esac; ' +
+    'why=${why%?}; no "$1:$2: ${why:-no answer}"; } & ' +
+    'exec >&-; wait $!'
+  )
 }
 
 /**
@@ -1282,10 +1336,10 @@ export interface GlobWalk {
    *  `realOf` has no entry for them. Unreadable now is not absent: a deny
    *  expansion must cover such a link rather than drop it. */
   uninspectableLinks: Set<string>
-  /** Directories the walk reached but could not list (any error but
-   *  absence), and entries that may be one for all it could learn. Whatever
-   *  the pattern matches beneath them is missing from `matches`; a deny
-   *  expansion must cover them whole. */
+  /** Directories the walk could not list (any error but absence) under a
+   *  name it reached them by, each named once, and entries that may be one
+   *  for all it could learn. What the pattern matches beneath one can be
+   *  missing from `matches`; a deny expansion must cover them whole. */
   unlisted: string[]
   /** Where an entry of `matches`, `directoryMatches` or `unlisted` really
    *  lives, for each one that is a symlink or is spelled through one above
@@ -1431,12 +1485,23 @@ function globPositions(
   normalizedPattern: string,
   flags: string,
 ): GlobPositions {
-  const regex = new RegExp(globToRegex(normalizedPattern), flags)
   const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
-  const directoryRegex =
-    directoryForm !== normalizedPattern
-      ? new RegExp(globToRegex(directoryForm), flags)
-      : undefined
+  let regex: RegExp
+  let directoryRegex: RegExp | undefined
+  try {
+    regex = new RegExp(globToRegex(normalizedPattern), flags)
+    directoryRegex =
+      directoryForm !== normalizedPattern
+        ? new RegExp(globToRegex(directoryForm), flags)
+        : undefined
+  } catch (err) {
+    // A pattern that is no regular expression would match nothing and deny
+    // nothing, silently: it is raised as the configuration error it is.
+    throw new SyntaxError(
+      `Glob pattern ${normalizedPattern} does not compile, so nothing can match it: ${err}`,
+      { cause: err },
+    )
+  }
   const unsplit: GlobPositions = {
     splits: false,
     start: [0],
@@ -1578,9 +1643,13 @@ function globPositions(
 /**
  * The literal directory a glob's walk starts from: the static prefix before
  * the pattern's first glob character, without its last path component when
- * that component is not a directory of its own. '' or '/' means the pattern
- * has no literal directory to start from (a wildcard in its first path
- * component), which {@link walkGlobPattern} refuses to expand.
+ * that component is not a directory of its own. Split at its separators it
+ * is the pattern's own leading components, the empty one of a doubled
+ * separator ('C:/a//*.pem': 'C:/a/') included: the walk consumes them one by
+ * one, and a base with one more or one fewer matches nothing. A drive root
+ * comes back as 'C:', the root of a UNC share as '//server/share'. '/', and
+ * '' for a pattern with a wildcard in its first path component, are what
+ * {@link globBaseDirIsRoot} refuses.
  *
  * @param normalizedPattern - a pattern already through
  * {@link normalizePathForSandbox} (and, on Windows, {@link toForwardSlashes}),
@@ -1589,9 +1658,23 @@ function globPositions(
 export function globPatternBaseDir(normalizedPattern: string): string {
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
   if (!staticPrefix) return ''
+  // The pattern is spelled with '/' on every host. Windows' own dirname keeps
+  // the separator of a root it returns ('C:/'), which no component stands for.
   return staticPrefix.endsWith('/')
     ? staticPrefix.slice(0, -1)
-    : path.dirname(staticPrefix)
+    : path.posix.dirname(staticPrefix)
+}
+
+/**
+ * Whether a base from {@link globPatternBaseDir} is one no walk starts from:
+ * nothing at all, or the root, '/', from which a walk (`/**\/*.pem`) would
+ * list every filesystem the machine has mounted. A drive root ('C:') and the
+ * root of a UNC share ('//server/share') are bases like any other: each is
+ * one volume, which the entry names itself. Refused, every such pattern
+ * would go unenforced.
+ */
+export function globBaseDirIsRoot(baseDir: string): boolean {
+  return baseDir === '' || baseDir === '/'
 }
 
 /**
@@ -1657,9 +1740,9 @@ export function* walkGlobPatternSteps(
   const baseDirBelowAnchor = patternBaseDir === '/' ? '' : patternBaseDir
   const baseDir =
     anchor === undefined ? patternBaseDir : anchor + baseDirBelowAnchor
-  if (baseDir === '' || baseDir === '/') {
+  if (globBaseDirIsRoot(baseDir)) {
     logForDebugging(
-      `[Sandbox] Glob pattern has no literal directory to start from, skipping: ${globPath}`,
+      `[Sandbox] Glob pattern has no literal directory below the root to start from, skipping: ${globPath}`,
       { level: 'warn' },
     )
     return walk
@@ -1703,32 +1786,74 @@ export function* walkGlobPatternSteps(
     short: string
     positions: readonly number[]
   }
-  /** The positions each real directory has been listed for. */
-  const listedFor = new Map<string, Set<number>>()
+  /**
+   * What the walk knows about one real directory, whatever the names that
+   * lead to it. A listing failure is not recorded against its positions: it
+   * can belong to the name the listing was tried under (a real path too long
+   * to name) while the directory is there under another, and letting that
+   * name answer for the others would drop every match beneath it.
+   */
+  type DirectoryRecord = {
+    /** The positions it has been listed for, each of them successfully. */
+    listedFor: Set<number>
+    /** Whether it is already in `walk.unlisted`, which names it once. */
+    unlisted?: true
+  }
+  const records = new Map<string, DirectoryRecord>()
   const listings: GlobWalkListings = opts.listings ?? new Map()
   const pending: Frame[] = []
-  /** A filesystem call on a real path, and on a shorter name for it when that
-   *  fails. The real path crosses no link, so a long chain of them cannot
-   *  fail the call (ELOOP). */
+  const codeOf = (err: unknown): string | undefined =>
+    (err as NodeJS.ErrnoException | undefined)?.code
+  /**
+   * A filesystem call on a real path and, when that fails, on a shorter name
+   * for it. The real path crosses no link, so a long chain of them cannot fail
+   * the call (ELOOP) and nothing can lead it elsewhere. It can still fail for
+   * a reason that is not the object's: a path too long to name, a busy host,
+   * a runtime whose call does not take the name. So the short name is asked
+   * after every failure. But it crosses links a sandboxed command can repoint,
+   * at an empty directory or at nothing, so what it says is only ever ADDED to
+   * what the real path said:
+   * - a real path that failed with anything but `absent` or ENAMETOOLONG says
+   *   that something is there and was not read. `unread` is called, and the
+   *   caller covers that whole whatever the short name answers;
+   * - of two failures the one thrown is the one that is not `absent`, so
+   *   "could not be read" never comes out as "is not there".
+   */
   const onRealPath = <T>(
     real: string,
     short: string,
     call: (p: string) => T,
+    absent: (err: unknown) => boolean,
+    unread: () => void,
   ): T => {
     try {
       return call(real)
-    } catch (err) {
-      if (short === real) throw err
-      return call(short)
+    } catch (first) {
+      if (short === real) throw first
+      let answer: T
+      try {
+        answer = call(short)
+      } catch (second) {
+        throw absent(first) && !absent(second) ? second : first
+      }
+      if (!absent(first) && codeOf(first) !== 'ENAMETOOLONG') {
+        logForDebugging(
+          `[Sandbox] ${real} could not be read for glob pattern ${globPath}, so it is covered whole, whatever ${short} leads to: ${first}`,
+          { level: 'warn' },
+        )
+        unread()
+      }
+      return answer
     }
   }
   /** Where a symlink leads and whether that is a directory. 'absent' when
    *  nothing is there to descend into; 'uninspectable' when something is and
    *  it could not be looked at, which is not the same thing: a same-uid
    *  command can make a target unsearchable and undo that from inside the
-   *  next sandbox, so a deny must still cover the link. */
+   *  next sandbox, so a deny must still cover the link. `unread` when only the
+   *  short name said where it leads: both, see {@link onRealPath}. */
   type LinkTarget =
-    | { real: string; isDirectory: boolean }
+    | { real: string; isDirectory: boolean; unread: boolean }
     | 'absent'
     | 'uninspectable'
   const linkTargets = new Map<string, LinkTarget>()
@@ -1737,10 +1862,18 @@ export function* walkGlobPatternSteps(
     if (cached !== undefined) return cached
     let target: LinkTarget
     try {
-      target = onRealPath(realLinkPath, linkPath, p => ({
-        isDirectory: fs.statSync(p).isDirectory(),
-        real: realPathOf(p),
-      }))
+      let unread = false
+      const found = onRealPath(
+        realLinkPath,
+        linkPath,
+        p => ({
+          isDirectory: fs.statSync(p).isDirectory(),
+          real: realPathOf(p),
+        }),
+        isAbsenceErrno,
+        () => (unread = true),
+      )
+      target = { ...found, unread }
     } catch (err) {
       target = isAbsenceErrno(err) ? 'absent' : 'uninspectable'
     }
@@ -1806,45 +1939,63 @@ export function* walkGlobPatternSteps(
     }
   }
 
-  let baseReal = baseDir
+  // The base as the filesystem is asked about it: a drive root gets back its
+  // separator, since 'C:' on its own names the drive's current directory.
+  // The positions are still reached from the base without one.
+  const baseSpelling = /^[A-Za-z]:$/.test(baseDir) ? `${baseDir}/` : baseDir
+  let baseReal = baseSpelling
   try {
-    baseReal = realPathOf(baseDir)
+    baseReal = realPathOf(baseSpelling)
   } catch {
     // Not there, or a component of it cannot be resolved: list the spelling.
   }
   walk.baseLocation = baseReal
   pending.push({
-    dir: baseDir,
+    dir: baseSpelling,
     real: baseReal,
-    short: baseDir.length < baseReal.length ? baseDir : baseReal,
+    short: baseSpelling.length < baseReal.length ? baseSpelling : baseReal,
     positions: (anchor === undefined ? baseDir : baseDirBelowAnchor)
       .split('/')
       .reduce(positions.next, positions.start),
   })
   for (let frame = pending.pop(); frame !== undefined; frame = pending.pop()) {
     const { dir, real } = frame
-    let listed = listedFor.get(real)
-    if (listed === undefined) listedFor.set(real, (listed = new Set()))
+    const record: DirectoryRecord = records.get(real) ?? {
+      listedFor: new Set(),
+    }
+    records.set(real, record)
     // What a position finds beneath a directory does not depend on the
     // others it came with, so only the ones new to this directory are taken.
-    const fresh = frame.positions.filter(p => !listed.has(p))
+    const fresh = frame.positions.filter(p => !record.listedFor.has(p))
     if (fresh.length === 0) continue
     yield
-    for (const p of fresh) listed.add(p)
+    // Once. What one pattern denies is denied for the whole configuration, so
+    // what the short name listed is kept for the next pattern like any other.
+    const denyWhole = (): void => {
+      if (record.unlisted) return
+      record.unlisted = true
+      walk.unlisted.push(dir)
+      if (real !== dir) walk.realOf.set(dir, real)
+    }
     let entries: GlobWalkEntry[]
     try {
       const known = listings.get(real)
       if (known instanceof Error) throw known
       entries =
         known ??
-        onRealPath(real, frame.short, p =>
-          fs
-            .readdirSync(p, { withFileTypes: true })
-            .map(entry => withType(entry, p, real)),
+        onRealPath(
+          real,
+          frame.short,
+          p =>
+            fs
+              .readdirSync(p, { withFileTypes: true })
+              .map(entry => withType(entry, p, real)),
+          err => codeOf(err) === 'ENOENT',
+          denyWhole,
         )
       listings.set(real, entries)
     } catch (err) {
-      const errorCode = (err as NodeJS.ErrnoException | undefined)?.code
+      const errorCode = codeOf(err)
       logForDebugging(
         `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
         { level: errorCode === 'ENOENT' ? 'info' : 'warn' },
@@ -1852,13 +2003,20 @@ export function* walkGlobPatternSteps(
       if (errorCode !== 'ENOENT') {
         // Kept, or every pattern would try the directory again: one that
         // would have cleared meanwhile hides more. An absence is not kept. It
-        // is the one answer that denies nothing, so each pattern asks.
-        listings.set(real, err instanceof Error ? err : new Error(String(err)))
-        walk.unlisted.push(dir)
-        if (real !== dir) walk.realOf.set(dir, real)
+        // is the one answer that denies nothing, so each pattern asks, under
+        // each name. Nor is anything kept in a walk's own map: there a second
+        // name for the directory still gets its try (see `listedFor`).
+        if (opts.listings !== undefined) {
+          listings.set(
+            real,
+            err instanceof Error ? err : new Error(String(err)),
+          )
+        }
+        denyWhole()
       }
       continue
     }
+    for (const p of fresh) record.listedFor.add(p)
     for (const entry of entries) {
       // Nearly every entry of a large tree: a plain file the pattern does not
       // match, which nothing below records. A pattern that splits is matched
@@ -1928,17 +2086,26 @@ export function* walkGlobPatternSteps(
       const shortPath = path.join(frame.short, entry.name)
       const target = linkTargetOf(shortPath, realPath)
       if (target === 'absent') continue
-      if (target === 'uninspectable') {
-        // Where it leads is unknown, so it gets no real location and nothing
-        // is listed through it — but it is still a match, and a deny
+      const unread = target === 'uninspectable' || target.unread
+      if (unread) {
+        // Where it leads is unknown, or known from the short name alone, so it
+        // gets no real location — but it is still a match, and a deny
         // expansion covers it under its own spelling.
         walk.uninspectableLinks.add(fullPath)
         if (isDirectoryFormCandidate) walk.directoryMatches.push(fullPath)
-        continue
       }
-      if (isMatch) walk.realOf.set(fullPath, target.real)
+      // Nothing is listed through a link that leads nobody knows where.
+      if (target === 'uninspectable') continue
+      // Where the short name alone says it leads is denied besides.
+      if (
+        unread &&
+        (isMatch || (isDirectoryFormCandidate && target.isDirectory))
+      ) {
+        walk.matches.push(target.real)
+      }
+      if (isMatch && !unread) walk.realOf.set(fullPath, target.real)
       if (!target.isDirectory) continue
-      if (isDirectoryFormCandidate) {
+      if (isDirectoryFormCandidate && !unread) {
         walk.directoryMatches.push(fullPath)
         walk.realOf.set(fullPath, target.real)
       }
@@ -1955,6 +2122,10 @@ export function* walkGlobPatternSteps(
         )
         continue
       }
+      // The one line that names the link: matches are reported by real path.
+      logForDebugging(
+        `[Sandbox] Following symlink ${fullPath} -> ${target.real} for glob pattern ${globPath}`,
+      )
       pending.push({
         dir: target.real,
         real: target.real,
