@@ -630,10 +630,12 @@ function readPem(path: string, label: string, field: string): string {
 }
 
 export function randomSerial(): string {
-  // 16 random bytes, high bit cleared so the DER INTEGER stays positive.
-  const bytes = random.getBytesSync(16)
-  const hex = util.bytesToHex(bytes)
-  const firstNibble = parseInt(hex[0]!, 16) & 0x7
+  // 16 random bytes whose first two bits are 01. The high bit is clear so
+  // that the DER INTEGER is positive, and the next is set so that it has no
+  // leading zero byte: a parser refuses an INTEGER with more of them than the
+  // sign needs, and with it the whole certificate.
+  const hex = util.bytesToHex(random.getBytesSync(16))
+  const firstNibble = (parseInt(hex[0]!, 16) & 0x3) | 0x4
   return firstNibble.toString(16) + hex.slice(1)
 }
 
