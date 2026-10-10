@@ -14,7 +14,10 @@ import {
   containsGlobChars,
   globToRegex,
   denyGlobRegex,
+  isAtOrUnder,
   isStrictlyUnder as isPathStrictlyUnder,
+  nameLocation,
+  pathSpellings,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -343,8 +346,38 @@ function isStrictlyUnder(entry: PathEntry, dir: string): boolean {
  */
 interface ResolvedReadConfig {
   denies: PathEntry[]
+  /** Those of `denies` whose only exceptions are `ownAllows`. */
+  credentialDenies: ReadonlySet<PathEntry>
   allows: PathEntry[]
+  /** Those of `allows` the library adds for files of its own. */
+  ownAllows: PathEntry[]
   writeRoots: PathEntry[]
+}
+
+/**
+ * A read entry under both spellings of its path: as written, and with the
+ * links on the way resolved. A deny is resolved to its end. An allow is a
+ * name, so its last component stays as written. Of a pattern, the directory
+ * it starts from is what is resolved. The root is never a second spelling.
+ */
+function inBothSpellings(kind: PathListKind, entry: PathEntry): PathEntry[] {
+  const resolved = (p: string): string => pathSpellings(p)[1] ?? p
+  const base = entryBaseDir(entry)
+  const canonical =
+    kind === 'deny' || entry.glob
+      ? resolved(base)
+      : nameLocation(base, resolved)
+  if (canonical === base || canonical === '/') return [entry]
+  return [
+    entry,
+    entry.glob
+      ? {
+          glob: true,
+          path: canonical + entry.path.slice(base.length),
+          anchor: canonical,
+        }
+      : { glob: false, path: canonical },
+  ]
 }
 
 function resolveReadConfig(
@@ -357,11 +390,23 @@ function resolveReadConfig(
    */
   libraryDenies: readonly PathEntry[],
 ): ResolvedReadConfig {
+  const credentialDenies = [
+    ...callerEntries('deny', config.credentialDenyOnly, undefined),
+    ...libraryDenies,
+  ].flatMap(entry => inBothSpellings('deny', entry))
   return {
     denies: [
-      ...callerEntries('deny', config.denyOnly, config.literalDenyOnly),
-      ...libraryDenies,
+      ...callerEntries(
+        'deny',
+        config.denyOnly.filter(p => !config.credentialDenyOnly?.includes(p)),
+        config.literalDenyOnly,
+      ).flatMap(entry => inBothSpellings('deny', entry)),
+      ...credentialDenies,
     ],
+    credentialDenies: new Set(credentialDenies),
+    ownAllows: (config.ownAllowWithinDeny ?? [])
+      .map(toLiteralPathEntry)
+      .flatMap(entry => inBothSpellings('allow', entry)),
     // Non-glob spellings arrive slash-free from normalizePathForSandbox —
     // the nested-deny re-emit matches by `path + '/'` prefix, which a
     // preserved trailing slash would defeat ('<dir>//').
@@ -369,7 +414,7 @@ function resolveReadConfig(
       'allow',
       config.allowWithinDeny,
       config.literalAllowWithinDeny,
-    ),
+    ).flatMap(entry => inBothSpellings('allow', entry)),
     writeRoots: [...writeRoots],
   }
 }
@@ -391,6 +436,8 @@ function resolveReadConfig(
  *   TLS-termination trust bundle sandbox-manager adds to allowWithinDeny,
  *   which a `/**\/*.crt` deny would otherwise sever) keeps that one file
  *   readable without any allow being emitted after the denies.
+ * - Every credential deny, literal or glob, minus the library's own files
+ *   that it covers.
  *
  * Every filter here is a deny or a narrower deny: nothing this function
  * produces can make a path readable that is not readable today. Keep it
@@ -412,15 +459,21 @@ function lateReadDenyFilters(resolved: ResolvedReadConfig): {
   let coversRoot = false
   const literalAllowDirs = resolved.allows.filter(a => !a.glob).map(a => a.path)
   for (const deny of resolved.denies) {
+    const isCredential = resolved.credentialDenies.has(deny)
     if (!deny.glob) {
-      if (literalAllowDirs.some(a => isStrictlyUnder(deny, a))) {
+      if (isCredential) {
+        const carveOuts = resolved.ownAllows
+          .filter(a => isAtOrUnder(a.path, deny.path))
+          .map(a => pathFilter(a))
+        filters.push(carveFilter(denyPathFilter(deny), carveOuts))
+      } else if (literalAllowDirs.some(a => isStrictlyUnder(deny, a))) {
         filters.push(denyPathFilter(deny))
       }
       continue
     }
     const denyRegex = new RegExp(denyGlobEntryRegex(deny))
     if (denyRegex.test('/')) coversRoot = true
-    const carveOuts = resolved.allows
+    const carveOuts = (isCredential ? resolved.ownAllows : resolved.allows)
       .filter(a => denyGlobCovers(denyRegex, a))
       .map(a => pathFilter(a))
     filters.push(carveFilter(denyPathFilter(deny), carveOuts))
@@ -480,12 +533,15 @@ function entryBaseDir(entry: PathEntry): string {
  * A literal deny not below any write root needs nothing: the read
  * section's move-blocking deny still holds for it. Deny-only, like the
  * rest of this file's read handling.
+ *
+ * A credential deny is emitted wherever it lies and with nothing subtracted,
+ * and a write root among its ancestors is kept in place with them.
  */
 function generateReadDenyUnlinkRules(
   resolved: ResolvedReadConfig,
   logTag: string,
 ): string[] {
-  const { denies, allows, writeRoots } = resolved
+  const { denies, credentialDenies, writeRoots } = resolved
   if (writeRoots.length === 0) return []
 
   const writeRootRegexes = writeRoots
@@ -495,21 +551,22 @@ function generateReadDenyUnlinkRules(
   const strictlyBelowWriteRoot = (p: string): boolean =>
     literalWriteRoots.some(w => isStrictlyUnder({ path: p, glob: false }, w)) ||
     writeRootRegexes.some(re => re.test(p))
-  const carveOutsInside = (dir: string): string[] =>
-    [...allows, ...writeRoots]
-      .filter(e => isStrictlyUnder(e, dir))
-      .map(e => pathFilter(e))
 
   const filters = new Set<string>()
-  const protectDirs = (dirs: string[]): void => {
+  const protectDirs = (dirs: string[], withWriteRoots: boolean): void => {
     for (const dir of dirs) {
-      if (strictlyBelowWriteRoot(dir)) {
+      if (
+        strictlyBelowWriteRoot(dir) ||
+        (withWriteRoots && literalWriteRoots.includes(dir))
+      ) {
         filters.add(`(literal ${escapePath(dir)})`)
       }
     }
   }
 
   for (const deny of denies) {
+    const isCredential = credentialDenies.has(deny)
+    const exceptions = isCredential ? [] : [...resolved.allows, ...writeRoots]
     if (deny.glob) {
       const baseDir = entryBaseDir(deny)
       const intersectsWriteRoot =
@@ -522,17 +579,20 @@ function generateReadDenyUnlinkRules(
         )
       if (!intersectsWriteRoot) continue
       const denyRegex = new RegExp(denyGlobEntryRegex(deny))
-      const carveOuts = [...allows, ...writeRoots]
+      const carveOuts = exceptions
         .filter(e => denyGlobCovers(denyRegex, e))
         .map(e => pathFilter(e))
       filters.add(carveFilter(denyPathFilter(deny), carveOuts))
       if (baseDir !== '/') {
-        protectDirs([baseDir, ...getAncestorDirectories(baseDir)])
+        protectDirs([baseDir, ...getAncestorDirectories(baseDir)], isCredential)
       }
     } else {
-      if (!strictlyBelowWriteRoot(deny.path)) continue
-      filters.add(carveFilter(denyPathFilter(deny), carveOutsInside(deny.path)))
-      protectDirs(getAncestorDirectories(deny.path))
+      if (!isCredential && !strictlyBelowWriteRoot(deny.path)) continue
+      const carveOuts = exceptions
+        .filter(e => isStrictlyUnder(e, deny.path))
+        .map(e => pathFilter(e))
+      filters.add(carveFilter(denyPathFilter(deny), carveOuts))
+      protectDirs(getAncestorDirectories(deny.path), isCredential)
     }
   }
 
