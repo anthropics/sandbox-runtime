@@ -111,12 +111,20 @@ describe('SOCKS unauthenticated probe', () => {
   })
 
   it('the manager: a deny entry spelled like a member of Object.prototype is refused for the generic reason', async () => {
-    const names = ['constructor', 'valueOf', '__proto__', 'hasOwnProperty']
+    // And one whose key is there with nothing behind it, as a caller that
+    // builds the map from optional reasons leaves it.
+    const names = [
+      ...['constructor', 'valueOf', '__proto__', 'hasOwnProperty'],
+      'no-reason.test',
+    ]
     await SandboxManager.initialize({
       network: {
         allowedDomains: [],
         deniedDomains: names,
-        deniedDomainReasons: { 'other.test': 'not this one' },
+        deniedDomainReasons: {
+          'other.test': 'not this one',
+          'no-reason.test': undefined as unknown as string,
+        },
       },
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })

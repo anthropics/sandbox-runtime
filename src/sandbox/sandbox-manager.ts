@@ -458,9 +458,8 @@ function denialReasonOf(answer: unknown): string | undefined {
 /** Own keys only: an entry can be spelled `constructor`. */
 function deniedDomainReason(entry: string): string {
   const reasons = config?.network.deniedDomainReasons ?? {}
-  return Object.prototype.hasOwnProperty.call(reasons, entry)
-    ? reasons[entry]!
-    : 'host is on the deny list'
+  const own = Object.prototype.hasOwnProperty.call(reasons, entry)
+  return (own ? reasons[entry] : undefined) ?? 'host is on the deny list'
 }
 
 async function filterNetworkRequest(
