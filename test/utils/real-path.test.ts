@@ -240,8 +240,10 @@ describe.if(!isWindows)('property: realPathOf', () => {
     import fs from 'node:fs'
     const { realPathOf } = await import(process.argv[1])
     const answer = call => { try { return call() } catch (error) { return error.code } }
-    console.log(JSON.stringify(JSON.parse(fs.readFileSync(0, 'utf8')).map(p =>
-      [answer(() => realPathOf(p)), answer(() => fs.realpathSync(p))])))`
+    const { paths, askNode } = JSON.parse(fs.readFileSync(0, 'utf8'))
+    console.log(JSON.stringify(paths.map(p => [
+      (askNode || p.includes('\\\\')) && answer(() => realPathOf(p)),
+      askNode && answer(() => fs.realpathSync(p))])))`
   /** The file the kernel finds at `p`, or the code it refuses with. */
   const fileAt = (p: string): string =>
     answer(() => {
@@ -298,7 +300,11 @@ describe.if(!isWindows)('property: realPathOf', () => {
             const paths = questions.map(([from, way]) =>
               [pick(made, from), ...way].join('/').replace(/\/+$/, ''),
             )
-            const { stdout } = spawnSync(
+            // Node folds a link's target in text, so where one goes up from
+            // behind a name its own answer can differ, or never come. It is
+            // also what realPathOf gives there for a name with no backslash.
+            const askNode = !upBehindAName
+            const { stdout, stderr, error } = spawnSync(
               'node',
               [
                 '--experimental-strip-types',
@@ -308,8 +314,13 @@ describe.if(!isWindows)('property: realPathOf', () => {
                 IN_NODE,
                 resolve(import.meta.dirname, '../../src/utils/real-path.ts'),
               ],
-              { input: JSON.stringify(paths), encoding: 'utf8' },
+              {
+                input: JSON.stringify({ paths, askNode }),
+                encoding: 'utf8',
+                timeout: 20_000,
+              },
             )
+            expect([error, stderr]).toEqual([undefined, ''])
             const inNode = JSON.parse(stdout) as string[][]
             paths.forEach((p, i) => {
               const real = answer(() => realPathOf(p))
@@ -325,10 +336,10 @@ describe.if(!isWindows)('property: realPathOf', () => {
                 ])
               }
               const [there, own] = inNode[i]!
-              expect([p, there]).toEqual([p, real])
-              // Node folds a link's target in text, so one that goes up from
-              // behind a name is not asked of it.
-              if (!upBehindAName) expect([p, own]).toEqual([p, real])
+              if (askNode || p.includes('\\')) {
+                expect([p, there]).toEqual([p, real])
+              }
+              if (askNode) expect([p, own]).toEqual([p, real])
             })
           } finally {
             fs.rmSync(root, { recursive: true, force: true })
