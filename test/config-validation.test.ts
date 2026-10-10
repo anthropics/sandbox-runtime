@@ -332,6 +332,49 @@ describe('Config Validation', () => {
     },
   )
 
+  test('should accept valid allowIokitRegistryEntryClass and allowIokitUserClientClass entries', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowIokitRegistryEntryClass: [
+          'IOSurfaceRootUserClient',
+          'RootDomainUserClient',
+        ],
+        allowIokitUserClientClass: [
+          'AGXDeviceUserClient',
+          'IOSurfaceSendRight',
+        ],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+  })
+
+  test('should reject empty strings in allowIokitRegistryEntryClass or allowIokitUserClientClass', () => {
+    const config1 = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowIokitRegistryEntryClass: [''],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+    expect(SandboxRuntimeConfigSchema.safeParse(config1).success).toBe(false)
+
+    const config2 = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowIokitUserClientClass: [''],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+    expect(SandboxRuntimeConfigSchema.safeParse(config2).success).toBe(false)
+  })
+
   test('should use default ripgrep command when not specified', () => {
     const config = {
       network: {

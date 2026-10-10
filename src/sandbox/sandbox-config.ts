@@ -744,6 +744,18 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'macOS only: Additional XPC/Mach service names to allow looking up. Supports trailing-wildcard prefix matching (e.g., "2BUA8C4S2C.com.1password.*"). Needed for tools like 1Password CLI, Playwright, or the iOS Simulator that communicate via XPC.',
     ),
+  allowIokitRegistryEntryClass: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'macOS only: Additional IOKit registry entry classes to allow in iokit-open (e.g., "IOSurfaceRootUserClient").',
+    ),
+  allowIokitUserClientClass: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'macOS only: Additional IOKit user client classes to allow in iokit-open (e.g., "AGXDeviceUserClient"). Needed for GPU/Metal device access.',
+    ),
   httpProxyPort: z
     .number()
     .int()
