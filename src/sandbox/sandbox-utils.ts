@@ -107,6 +107,49 @@ export function nameLocation(
   return `${parent === '/' ? '' : parent}/${path.basename(p)}`
 }
 
+/** As many links as the kernel follows on the way to one path. */
+const MAX_LINKS_FOLLOWED = 40
+
+/**
+ * The absolute path `p` walked name by name: the symbolic links met on the
+ * way, each where it lies, and where the way ends. A `..` in a link's target
+ * is the parent of the directory reached, as it is to the kernel. A name that
+ * is not there is taken as written, so a dangling link ends at the path a
+ * write through it would create. There is no end past the number of links the
+ * kernel follows, nor past a target that is no text.
+ */
+export function followLinks(p: string): {
+  links: string[]
+  end: string | undefined
+} {
+  const links: string[] = []
+  const rest = path.resolve(p).split('/')
+  // No link in it.
+  let reached = ''
+  for (let name = rest.shift(); name !== undefined; name = rest.shift()) {
+    if (name === '' || name === '.') continue
+    if (name === '..') {
+      reached = reached.slice(0, reached.lastIndexOf('/'))
+      continue
+    }
+    const next = `${reached}/${name}`
+    let target: string
+    try {
+      target = fs.readlinkSync(next)
+    } catch {
+      reached = next
+      continue
+    }
+    links.push(next)
+    if (links.length > MAX_LINKS_FOLLOWED || target.includes('\uFFFD')) {
+      return { links, end: undefined }
+    }
+    if (target.startsWith('/')) reached = ''
+    rest.unshift(...target.split('/'))
+  }
+  return { links, end: reached || '/' }
+}
+
 /** `process.cwd()`, or undefined where that throws: it has been removed. */
 export function workingDirectory(): string | undefined {
   try {

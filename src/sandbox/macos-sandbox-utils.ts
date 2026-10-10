@@ -14,6 +14,7 @@ import {
   containsGlobChars,
   globToRegex,
   denyGlobRegex,
+  followLinks,
   isAtOrUnder,
   isStrictlyUnder as isPathStrictlyUnder,
   nameLocation,
@@ -367,9 +368,17 @@ function inBothSpellings(kind: PathListKind, entry: PathEntry): PathEntry[] {
     kind === 'deny' || entry.glob
       ? resolved(base)
       : nameLocation(base, resolved)
-  if (canonical === base || canonical === '/') return [entry]
+  return [entry, ...startingFrom(canonical, entry)]
+}
+
+/**
+ * `entry` with `canonical` for the path it is, or for the directory its
+ * pattern starts from; nothing where that is no other spelling, or the root.
+ */
+function startingFrom(canonical: string, entry: PathEntry): PathEntry[] {
+  const base = entryBaseDir(entry)
+  if (canonical === base || canonical === '/') return []
   return [
-    entry,
     entry.glob
       ? {
           glob: true,
@@ -992,12 +1001,18 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on
   // macOS). The caller's spellings are patterns when they read as patterns;
   // the mandatory entries carry their own literal/glob split.
-  const denyEntries = [
+  const walked = [
     ...(config.denyWithinAllow || []).map(toPathEntry),
     ...(config.literalDenyWithinAllow ?? []).map(toLiteralPathEntry),
     ...macGetMandatoryDenyEntries(allowGitConfig),
-  ]
-  denyEntries.push(...alsoReadAs(config.denyWithinAllow, 'deny'))
+    ...alsoReadAs(config.denyWithinAllow, 'deny'),
+  ].map(entry => ({ entry, ...followLinks(entryBaseDir(entry)) }))
+  // As written, and where the links on the way lead, there or not: that is the
+  // path Seatbelt compares a write through them with.
+  const denyEntries = walked.flatMap(({ entry, end }) => [
+    entry,
+    ...(end === undefined ? [] : startingFrom(end, entry)),
+  ])
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)
   const groupFilters = groups.map(literalDenyGroupFilters)
@@ -1021,6 +1036,13 @@ function generateWriteRules(
     const { dir } = groups[index]
     for (const ancestorDir of [dir, ...getAncestorDirectories(dir)]) {
       moveFilters.add(`(literal ${escapePath(ancestorDir)})`)
+    }
+  }
+  // Each of those links stays where it lies: whoever replaces one decides
+  // what the denied name leads to.
+  for (const link of new Set(walked.flatMap(({ links }) => links))) {
+    for (const kept of [link, ...getAncestorDirectories(link)]) {
+      moveFilters.add(`(literal ${escapePath(kept)})`)
     }
   }
   rules.push(

@@ -63,6 +63,7 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
+  getLinuxUnheldLinks,
   linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
@@ -3045,6 +3046,12 @@ export interface ISandboxManager {
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
+  /**
+   * Linux: the symbolic links on the way to a write-denied path that a
+   * command wrapped by this process could replace, for the embedder to show
+   * or to look at again afterwards. Empty where every one was held in place.
+   */
+  getLinuxUnheldLinks(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
   getSentinelRegistry(): SentinelRegistry
@@ -3097,6 +3104,7 @@ export const SandboxManager: ISandboxManager = {
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
+  getLinuxUnheldLinks,
   getConfig,
   updateConfig,
 } as const

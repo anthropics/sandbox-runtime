@@ -19,6 +19,7 @@ import {
   encodeSandboxedCommand,
   attributionKeyFor,
   DANGEROUS_FILES,
+  followLinks,
   isAbsenceErrno,
   isAtOrUnder,
   isStrictlyUnder,
@@ -1503,6 +1504,48 @@ export async function initializeLinuxNetworkBridge(
   }
 }
 
+// Keyed by how the helper is run. Only an answer is kept: a probe that failed
+// is made again the next time.
+const holdsLinksProbes = new Map<string, boolean>()
+
+/**
+ * Whether the seccomp helper takes `--hold-link`. The one in use need not be
+ * the one this package ships, and one built from older sources takes the word
+ * for the command to run.
+ */
+function seccompHelperHoldsLinks(
+  applyPath: string | undefined,
+  argv0: string | undefined,
+): boolean {
+  const helper = argv0 ? applyPath : getApplySeccompBinaryPath(applyPath)
+  if (!helper) return false
+  const key = JSON.stringify([helper, argv0])
+  const cached = holdsLinksProbes.get(key)
+  if (cached !== undefined) return cached
+  const probe = spawnSync(helper, ['--holds-links'], {
+    timeout: 5000,
+    stdio: 'ignore',
+    // THREAT: this runs outside any sandbox, and an older helper looks the
+    // word up on PATH as a program. So there is nowhere to find one.
+    env: { PATH: '/dev/null', ...(argv0 ? { ARGV0: argv0 } : {}) },
+  })
+  if (probe.error !== undefined || probe.status === null) return false
+  holdsLinksProbes.set(key, probe.status === 0)
+  return probe.status === 0
+}
+
+const unheldLinks = new Set<string>()
+
+/**
+ * The symbolic links that a write deny of some command wrapped so far leads
+ * through, that lie in a directory that command could write to, and that
+ * nothing kept in place there: the command could put something else at the
+ * name. See "Write denies and symbolic links" in README.md.
+ */
+export function getLinuxUnheldLinks(): string[] {
+  return [...unheldLinks]
+}
+
 /**
  * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
  * multicall-binary prefix that dispatches on the ARGV0 env var.
@@ -1875,7 +1918,11 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
-): Promise<{ args: string[]; mandatoryDenyArgs: number }> {
+): Promise<{
+  args: string[]
+  mandatoryDenyArgs: number
+  linksToHold: string[]
+}> {
   const args: string[] = []
   const startedIn = workingDirectory()
   // fs already imported
@@ -1888,6 +1935,9 @@ async function generateFilesystemArgs(
   const denyWriteArgs: string[] = []
   // Where the mandatory denies' binds begin in it: after the configuration's.
   let mandatoryDenyArgsStart = Infinity
+  // Every symbolic link on the way to a write-denied path, where it lies. The
+  // deny's own mount is where they lead, and bubblewrap can put none on a link.
+  const linksToDenies = new Set<string>()
   // Directories that a deny entry re-binds read-only inside the sandbox
   // (--ro-bind <dir> <dir>), keyed by resolved dest, with every raw
   // (pre-resolution) spelling each was reached through. A non-existent deny
@@ -2564,6 +2614,7 @@ async function generateFilesystemArgs(
       if (rawPath.startsWith('/dev/')) {
         continue
       }
+      for (const link of followLinks(rawPath).links) linksToDenies.add(link)
 
       // Resolve-before-mask: normalizePathForSandbox keeps the raw symlink
       // path whenever resolution crosses isSymlinkOutsideBoundary (the
@@ -3025,9 +3076,21 @@ async function generateFilesystemArgs(
   // each: a symlink spelling would pin the chain of the link, not of where
   // the mount sits. Deny binds, tmpfs units and masks are emitted later and
   // land on top of both pins and covers.
+  //
+  // A link is held where the command could replace it: whoever replaces one
+  // decides what the denied name leads to. That is in a directory it can write
+  // to, and sees as it is on the host. The directories above a held link are
+  // pinned like those above a mount.
+  const linksToHold = [...linksToDenies].filter(
+    link =>
+      isWithinAnyAllowedWritePath(path.dirname(link)) &&
+      !KERNEL_TOP_LEVEL_DIRS.some(dir => isAtOrUnder(link, dir)) &&
+      !isHiddenByTmpfs(path.dirname(link), 'writes and reads'),
+  )
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
+      ...linksToHold,
       ...fileMasks.map(mask => mask.landing),
       ...readDenyTmpfsUnits.map(unit => unit.landing),
     ],
@@ -3204,7 +3267,7 @@ async function generateFilesystemArgs(
     args.push('--ro-bind', emptySource, emptySource)
   }
 
-  return { args, mandatoryDenyArgs }
+  return { args, mandatoryDenyArgs, linksToHold }
 }
 
 /**
@@ -3496,7 +3559,11 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
-    const { args: fsArgs, mandatoryDenyArgs } = await generateFilesystemArgs(
+    const {
+      args: fsArgs,
+      mandatoryDenyArgs,
+      linksToHold,
+    } = await generateFilesystemArgs(
       readConfig,
       writeConfig,
       maskedFileBinds,
@@ -3506,6 +3573,21 @@ export async function wrapCommandWithSandboxLinux(
       allowGitConfig,
       abortSignal,
     )
+    if (
+      linksToHold.length > 0 &&
+      applySeccompPrefix !== undefined &&
+      seccompHelperHoldsLinks(seccompConfig?.applyPath, seccompConfig?.argv0)
+    ) {
+      applySeccompPrefix += `${quote(linksToHold.flatMap(link => ['--hold-link', link]))} `
+    } else {
+      for (const link of linksToHold) {
+        unheldLinks.add(link)
+        logForDebugging(
+          `[Sandbox Linux] A write deny leads through the symbolic link ${link}, which the command can replace: holding it takes a seccomp helper with --hold-link`,
+          { level: 'warn' },
+        )
+      }
+    }
     const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)
     const mounts = {
