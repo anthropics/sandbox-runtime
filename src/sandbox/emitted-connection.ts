@@ -35,9 +35,8 @@ export function overrideEmittedConnectionProbe(
 
 /** The runtime, as the start-up error names it. */
 function runtimeName(): string {
-  const bun = (globalThis as { Bun?: { version?: unknown } }).Bun
-  if (bun !== undefined) return `Bun ${String(bun.version)}`
-  return `Node ${process.version}`
+  const bun = process.versions.bun
+  return bun !== undefined ? `Bun ${bun}` : `Node ${process.version}`
 }
 
 /**
