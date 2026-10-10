@@ -156,7 +156,7 @@ const ParentProxyConfigSchema = z.object({
  * - `mask` — the sandboxed process sees a per-session sentinel value; the
  *   host proxy substitutes sentinel→real on egress to `injectHosts`.
  *   For files this is whole-file masking (Linux only; degrades to `deny`
- *   on macOS — see {@link CredentialFileConfigSchema}).
+ *   on macOS and Windows — see {@link CredentialFileConfigSchema}).
  */
 const credentialModeSchema = z.enum(['deny', 'mask'])
 
@@ -271,7 +271,7 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
  * `extract`/`decode`) currently degrades to `mode: "deny"` (the file is
- * unreadable inside the sandbox).
+ * unreadable inside the sandbox). Nor can an ACL, so on Windows it does too.
  */
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(

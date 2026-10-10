@@ -82,7 +82,7 @@ export interface FsWriteRestrictionConfig {
  * - `maskedFileBinds`: (realPath → fakePath) pairs for whole-file masking;
  *   the platform layer binds fakePath over realPath read-only so the
  *   sandbox reads a sentinel instead of the real bytes (Linux only —
- *   macOS degrades these to denyReadPaths).
+ *   macOS and Windows degrade these to read denies).
  * - `maskedFileStoreDir`: host directory holding the fake files. The
  *   Linux layer ro-binds it over itself so the sandbox cannot tamper
  *   with the bind sources regardless of allowWrite.
