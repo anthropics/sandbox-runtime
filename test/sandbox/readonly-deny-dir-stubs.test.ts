@@ -895,7 +895,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
   ): Promise<{ command: string; warnings: string[]; probeLookups: number }> {
     const probe = '/srt-unresolvable-probe'
     const realReaddirSync = fs.readdirSync
-    const realRealpathSync = fs.realpathSync
+    const realRealpathSync = fs.realpathSync.native
     let probeLookups = 0
     const spies = [
       spyOn(fs, 'readdirSync').mockImplementation(((
@@ -910,7 +910,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
           ? [...real, probe.slice(1)]
           : real
       }) as typeof fs.readdirSync),
-      spyOn(fs, 'realpathSync').mockImplementation(((
+      spyOn(fs.realpathSync, 'native').mockImplementation(((
         p: fs.PathLike,
         ...rest: unknown[]
       ) => {
@@ -922,7 +922,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
           return probe
         }
         return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
-      }) as typeof fs.realpathSync),
+      }) as typeof fs.realpathSync.native),
     ]
     try {
       return { ...(await wrapDenyingRoot()), probeLookups }
@@ -967,8 +967,8 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
     expect(countMounts(usable, '--tmpfs', build)).toBeGreaterThan(0)
     expect(usable).not.toContain(stub)
 
-    const realRealpathSync = fs.realpathSync
-    const spy = spyOn(fs, 'realpathSync')
+    const realRealpathSync = fs.realpathSync.native
+    const spy = spyOn(fs.realpathSync, 'native')
     spy.mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
       if (String(p) === build) {
         throw Object.assign(new Error('EACCES: cannot resolve'), {
@@ -976,7 +976,7 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
         })
       }
       return (realRealpathSync as (...a: unknown[]) => unknown)(p, ...rest)
-    }) as typeof fs.realpathSync)
+    }) as typeof fs.realpathSync.native)
     try {
       const { result: unusable, warnings } = await withCapturedWarnings(() =>
         wrap([PROJ], [build]),

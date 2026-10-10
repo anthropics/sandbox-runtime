@@ -212,10 +212,21 @@ function resolveSymlinkedDenyPath(targetPath: string): string | null {
     if (linkTarget === null) {
       return path.join(resolvedAncestor, ...remainder)
     }
-    current = path.join(
-      path.resolve(path.dirname(firstMissing), linkTarget),
-      ...remainder.slice(1),
-    )
+    // U+FFFD may stand for bytes that are no text, and no string spells where
+    // those lead, so no mount can be put there.
+    if (linkTarget.includes('\uFFFD')) return null
+    // The target is read as the kernel reads it: `..` is the parent of where
+    // the way has led, so each name is resolved before the next is taken.
+    let led = linkTarget.startsWith('/') ? '/' : resolvedAncestor
+    const names = [...linkTarget.split('/'), ...remainder.slice(1)]
+    try {
+      for (; names.length > 0; names.shift()) {
+        led = realPathOf(path.join(led, names[0]))
+      }
+    } catch {
+      // The next name is missing, or dangling in its turn.
+    }
+    current = path.join(led, ...names)
   }
   return null // symlink chain too long or cyclic
 }

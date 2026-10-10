@@ -887,8 +887,18 @@ describe.if(!isWindows)('a walk over listings that give no types', () => {
         })) as typeof entries
       }) as typeof fs.readdirSync),
       ...QUESTIONS.map(question => {
-        const real = fs[question] as (...args: unknown[]) => unknown
-        return spyOn(fs, question).mockImplementation(((...args: unknown[]) => {
+        // The real path is asked of the `native` form.
+        const [holder, name] =
+          question === 'realpathSync'
+            ? ([fs.realpathSync, 'native'] as const)
+            : ([fs, question] as const)
+        const real = (holder as Record<string, unknown>)[name] as (
+          ...args: unknown[]
+        ) => unknown
+        return spyOn(
+          holder as Record<string, unknown>,
+          name,
+        ).mockImplementation(((...args: unknown[]) => {
           const code = failing[question]
           if (beneathRoot(question, args[0]) && code !== undefined) {
             throw Object.assign(new Error(code), { code })

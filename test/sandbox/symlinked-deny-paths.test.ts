@@ -142,6 +142,18 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     expect(result).toContain(`--ro-bind /dev/null ${linkTarget}`)
   })
 
+  it('lands beneath where a dangling symlink leads for a path beneath the link', async () => {
+    const danglingLink = join(PROJ, 'settings')
+    const linkTarget = join(AREA, 'nowhere')
+    symlinkSync(linkTarget, danglingLink)
+
+    const result = await wrap([join(danglingLink, '.mcp.json')])
+
+    // A directory is what stands in for the first missing component.
+    expect(countMounts(result, '--ro-bind', '/dev/null', linkTarget)).toBe(0)
+    expect(result).toMatch(new RegExp(`--ro-bind \\S+ ${linkTarget} `))
+  })
+
   it('fails closed on a symlink cycle rather than dropping the deny', async () => {
     // An unresolvable deny path must not silently disappear: masking the
     // symlink makes bwrap refuse to start, rather than sandboxing the

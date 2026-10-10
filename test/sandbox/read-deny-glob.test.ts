@@ -1497,7 +1497,7 @@ describe.if(isLinux)(
         })
       }
       const realStat = fs.statSync
-      const realRealpath = fs.realpathSync
+      const realRealpath = fs.realpathSync.native
       const spies = [
         spyOn(fs, 'statSync').mockImplementation(((
           p: fs.PathLike,
@@ -1509,7 +1509,7 @@ describe.if(isLinux)(
                 p,
                 ...rest,
               )) as typeof fs.statSync),
-        spyOn(fs, 'realpathSync').mockImplementation(((
+        spyOn(fs.realpathSync, 'native').mockImplementation(((
           p: fs.PathLike,
           ...rest: unknown[]
         ) =>
@@ -1518,7 +1518,7 @@ describe.if(isLinux)(
             : (realRealpath as (...a: unknown[]) => unknown)(
                 p,
                 ...rest,
-              )) as typeof fs.realpathSync),
+              )) as typeof fs.realpathSync.native),
       ]
       try {
         const wrapped = await wrapCommandWithSandboxLinux({
