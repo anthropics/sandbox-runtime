@@ -1102,6 +1102,16 @@ export const SeccompConfigSchema = z.object({
         'applyPath resolves inside the bwrap namespace and that the target ' +
         'binary implements the apply-seccomp interface when ARGV0 matches.',
     ),
+  holdsLinks: z
+    .boolean()
+    .optional()
+    .describe(
+      'Whether the helper takes --hold-link, by which the symbolic links on ' +
+        'the way to denied paths are kept in place. Taken at its word: ' +
+        'nothing is run to find out. Not set, a helper the library found ' +
+        'for itself is asked (--holds-links), and one named by applyPath is ' +
+        'handed no link. false also serves to turn holding off.',
+    ),
 })
 
 /**

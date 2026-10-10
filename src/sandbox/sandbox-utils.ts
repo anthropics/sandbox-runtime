@@ -110,18 +110,38 @@ export function nameLocation(
 /** As many links as the kernel follows on the way to one path. */
 const MAX_LINKS_FOLLOWED = 40
 
+/** What a look at a name fails with where it is settled that no link is there:
+ * nothing is, it is no link by now, or no call takes the name (a NUL byte). */
+const NO_LINK_THERE = ['ENOENT', 'ENOTDIR', 'EINVAL', 'ERR_INVALID_ARG_VALUE']
+
 /**
  * The absolute path `p` walked name by name: the symbolic links met on the
- * way, each where it lies, and where the way ends. A `..` in a link's target
- * is the parent of the directory reached, as it is to the kernel. A name that
- * is not there is taken as written, so a dangling link ends at the path a
- * write through it would create. There is no end past the number of links the
- * kernel follows, nor past a target that is no text.
+ * way, each where it lies, and where the way ends.
+ *
+ * A `.`, `..` or `//` in `p` itself is folded in text before anything is
+ * looked at, as everywhere a configured name is read: `link/..` is the
+ * directory that holds the link, which is not where the kernel goes. A `..` in
+ * a link's target is read as the kernel reads it, the parent of the directory
+ * reached.
+ *
+ * A name that is not there is taken as written, so a dangling link ends at the
+ * path a write through it would create. There is no end past the number of
+ * links the kernel follows, nor past a target that is no text.
+ *
+ * INVARIANT: "could not look" is never "no link". Only a name that is not
+ * there (ENOENT, ENOTDIR), is no link, or is one no call takes (a NUL byte)
+ * counts as none. On any other failure the walk stops with no end, and
+ * `unsearched` is the directory reached, in which it could not look: a
+ * same-uid command can take a directory's search bit away and give it back
+ * from inside the next sandbox. Never the root, which stands in for nothing.
+ *
+ * `looked` holds what stands at each name looked at, a link's target or null.
+ * One map for the paths of one wrap has a directory they share looked at once.
  */
-export function followLinks(p: string): {
-  links: string[]
-  end: string | undefined
-} {
+export function followLinks(
+  p: string,
+  looked: Map<string, string | null> = new Map(),
+): { links: string[]; end: string | undefined; unsearched?: string } {
   const links: string[] = []
   const rest = path.resolve(p).split('/')
   // No link in it.
@@ -133,10 +153,24 @@ export function followLinks(p: string): {
       continue
     }
     const next = `${reached}/${name}`
-    let target: string
-    try {
-      target = fs.readlinkSync(next)
-    } catch {
+    let target = looked.get(next)
+    if (target === undefined) {
+      try {
+        // Nearly every name is no link, and asking one for its target throws.
+        target = fs.lstatSync(next, { throwIfNoEntry: false })?.isSymbolicLink()
+          ? fs.readlinkSync(next)
+          : null
+      } catch (err) {
+        if (
+          !NO_LINK_THERE.includes((err as NodeJS.ErrnoException).code ?? '')
+        ) {
+          return { links, end: undefined, unsearched: reached || undefined }
+        }
+        target = null
+      }
+      looked.set(next, target)
+    }
+    if (target === null) {
       reached = next
       continue
     }

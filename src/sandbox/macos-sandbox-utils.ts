@@ -374,10 +374,18 @@ function inBothSpellings(kind: PathListKind, entry: PathEntry): PathEntry[] {
 /**
  * `entry` with `canonical` for the path it is, or for the directory its
  * pattern starts from; nothing where that is no other spelling, or the root.
+ * Nor among the devices, as on Linux: a name blanked with a link to /dev/null
+ * would take /dev/null from every command.
  */
 function startingFrom(canonical: string, entry: PathEntry): PathEntry[] {
   const base = entryBaseDir(entry)
-  if (canonical === base || canonical === '/') return []
+  if (
+    canonical === base ||
+    canonical === '/' ||
+    isAtOrUnder(canonical, '/dev')
+  ) {
+    return []
+  }
   return [
     entry.glob
       ? {
@@ -1001,17 +1009,20 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on
   // macOS). The caller's spellings are patterns when they read as patterns;
   // the mandatory entries carry their own literal/glob split.
+  const looked = new Map<string, string | null>()
   const walked = [
     ...(config.denyWithinAllow || []).map(toPathEntry),
     ...(config.literalDenyWithinAllow ?? []).map(toLiteralPathEntry),
     ...macGetMandatoryDenyEntries(allowGitConfig),
     ...alsoReadAs(config.denyWithinAllow, 'deny'),
-  ].map(entry => ({ entry, ...followLinks(entryBaseDir(entry)) }))
+  ].map(entry => ({ entry, ...followLinks(entryBaseDir(entry), looked) }))
   // As written, and where the links on the way lead, there or not: that is the
-  // path Seatbelt compares a write through them with.
-  const denyEntries = walked.flatMap(({ entry, end }) => [
+  // path Seatbelt compares a write through them with. A directory the walk
+  // could not look in is denied whole, its mode with it.
+  const denyEntries = walked.flatMap(({ entry, end, unsearched }) => [
     entry,
     ...(end === undefined ? [] : startingFrom(end, entry)),
+    ...(unsearched === undefined ? [] : [toLiteralPathEntry(unsearched)]),
   ])
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)
@@ -1041,6 +1052,7 @@ function generateWriteRules(
   // Each of those links stays where it lies: whoever replaces one decides
   // what the denied name leads to.
   for (const link of new Set(walked.flatMap(({ links }) => links))) {
+    if (isAtOrUnder(link, '/dev')) continue
     for (const kept of [link, ...getAncestorDirectories(link)]) {
       moveFilters.add(`(literal ${escapePath(kept)})`)
     }

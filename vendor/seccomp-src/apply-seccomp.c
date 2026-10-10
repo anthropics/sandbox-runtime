@@ -1,7 +1,7 @@
 /*
  * apply-seccomp.c - Apply seccomp BPF filter in an isolated PID namespace
  *
- * Usage: apply-seccomp [--hold-link <path>]... <command> [args...]
+ * Usage: apply-seccomp [--hold-link <path> <target>]... <command> [args...]
  *        apply-seccomp --holds-links
  *
  * This program applies a baked-in seccomp BPF filter, isolates the
@@ -76,6 +76,13 @@
 
 #ifndef SECCOMP_MODE_FILTER
 #define SECCOMP_MODE_FILTER 2
+#endif
+
+#ifndef MS_NOSYMFOLLOW
+#define MS_NOSYMFOLLOW 256
+#endif
+#ifndef ST_NOSYMFOLLOW
+#define ST_NOSYMFOLLOW 0x2000
 #endif
 
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
@@ -713,17 +720,21 @@ static void die_holding(const char *path, const char *why) {
 }
 
 /*
- * Mount the symbolic link at `path` on itself, read-only. A name that is a
- * mount point cannot be unlinked, renamed or renamed over (EBUSY), and the
- * directory that holds it stays as writable as it was. The link reads and
- * leads as before.
+ * Mount the symbolic link at `path` on itself, read-only. unlink and rename
+ * refuse a name that is a mount point in the caller's mount namespace (EBUSY),
+ * and the directory that holds it stays as writable as it was. The link reads
+ * and leads as before.
+ *
+ * `target` is what the link said when the denies were placed by it, or "" for
+ * no word on that. One that says something else by now leads past them.
  *
  * mount(2) follows a link at its target, so the link is named through a
  * descriptor of itself: the kernel does not follow what /proc/self/fd/N leads
- * to any further.
+ * to any further. What is looked at and what is mounted are one descriptor.
  */
-static void hold_link(const char *path) {
+static void hold_link(const char *path, const char *target) {
     char self[32];
+    char says[PATH_MAX];
     struct stat st;
     struct statvfs fs;
 
@@ -734,6 +745,14 @@ static void hold_link(const char *path) {
     if (!S_ISLNK(st.st_mode)) {
         die_holding(path, "not a symbolic link");
     }
+    ssize_t length = readlinkat(fd, "", says, sizeof(says));
+    if (length < 0) {
+        die_holding(path, strerror(errno));
+    }
+    if (*target && ((size_t)length != strlen(target) ||
+                    memcmp(says, target, (size_t)length) != 0)) {
+        die_holding(path, "leads elsewhere than it did");
+    }
     snprintf(self, sizeof(self), "/proc/self/fd/%d", fd);
     if (mount(self, self, NULL, MS_BIND, NULL) < 0) {
         die_holding(path, strerror(errno));
@@ -743,15 +762,17 @@ static void hold_link(const char *path) {
     /* Read-only, nosuid and nodev are all the flags bubblewrap ever adds. One
      * that the command starts applies its flags to every mount it finds, by
      * path, which for this mount leads elsewhere; it leaves a mount that has
-     * them already alone. noexec is locked where the mount came with it, and
-     * a remount keeps the access-time flags by itself. Opened anew: the first
-     * descriptor is of what now lies beneath the mount. */
+     * them already alone. The flags the mount came with are given again:
+     * noexec is locked, and without nosymfollow the link would lead where it
+     * did not. A remount keeps the access-time flags by itself. Opened anew:
+     * the first descriptor is of what now lies beneath the mount. */
     fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0 || fstatvfs(fd, &fs) < 0) {
         die_holding(path, strerror(errno));
     }
     unsigned long flags = MS_RDONLY | MS_NOSUID | MS_NODEV;
     if (fs.f_flag & ST_NOEXEC) flags |= MS_NOEXEC;
+    if (fs.f_flag & ST_NOSYMFOLLOW) flags |= MS_NOSYMFOLLOW;
     snprintf(self, sizeof(self), "/proc/self/fd/%d", fd);
     if (mount(NULL, self, NULL, MS_REMOUNT | MS_BIND | flags, NULL) < 0) {
         die_holding(path, strerror(errno));
@@ -764,16 +785,17 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     int links = 0;
-    while (2 * links + 2 < argc && strcmp(argv[2 * links + 1], "--hold-link") == 0) {
+    while (3 * links + 3 < argc && strcmp(argv[3 * links + 1], "--hold-link") == 0) {
         links++;
     }
-    if (argc < 2 * links + 2) {
-        fprintf(stderr, "Usage: %s [--hold-link <path>]... <command> [args...]\n",
+    if (argc < 3 * links + 2) {
+        fprintf(stderr,
+                "Usage: %s [--hold-link <path> <target>]... <command> [args...]\n",
                 argv[0]);
         return 1;
     }
 
-    char **command_argv = &argv[2 * links + 1];
+    char **command_argv = &argv[3 * links + 1];
 
     _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
                    "BPF filter size must be a multiple of sock_filter");
@@ -828,8 +850,9 @@ int main(int argc, char *argv[]) {
         if (links > 0) {
             /* INVARIANT: a user namespace is entered after the last hold. The
              * mount namespace made below is then a copy made across that
-             * boundary, in which every mount is locked: a command started by
-             * uid 0 holds all capabilities in its user namespace, and could
+             * boundary, in which every mount is locked: it cannot be
+             * unmounted, which is all a lock refuses. A command started by uid
+             * 0 holds all capabilities in its user namespace, and could
              * unmount what was mounted in a mount namespace of that one. */
             if (unshare(CLONE_NEWNS) < 0) {
                 die("apply-seccomp: unshare(CLONE_NEWNS)");
@@ -838,7 +861,7 @@ int main(int argc, char *argv[]) {
                 die("apply-seccomp: mount(MS_PRIVATE)");
             }
             for (int i = 0; i < links; i++) {
-                hold_link(argv[2 * i + 2]);
+                hold_link(argv[3 * i + 2], argv[3 * i + 3]);
             }
             enter_user_namespace();
         }
