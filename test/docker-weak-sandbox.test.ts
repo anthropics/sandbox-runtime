@@ -139,6 +139,12 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     )
   })
 
+  it('seccomp blocks AF_VSOCK socket creation', () => {
+    const r = srt('python3 -c "import socket; socket.socket(socket.AF_VSOCK)"')
+    expect(r.status).not.toBe(0)
+    expect(r.stderr.toLowerCase()).toContain('operation not permitted')
+  })
+
   it('seccomp allows AF_INET socket creation', () => {
     const r = srt('python3 -c "import socket; socket.socket(socket.AF_INET)"')
     expect(r.status).toBe(0)

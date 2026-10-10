@@ -2,9 +2,9 @@
  * Seccomp BPF filter generator to block Unix domain socket creation
  *
  * This program generates a seccomp-bpf filter that blocks the socket() syscall
- * when called with AF_UNIX as the domain argument. This prevents creation of
- * Unix domain sockets while allowing all other socket types (AF_INET, AF_INET6, etc.)
- * and all other syscalls.
+ * when called with AF_UNIX or AF_VSOCK as the domain argument. This prevents creation
+ * of Unix domain sockets and VM sockets while allowing all other socket types
+ * (AF_INET, AF_INET6, etc.) and all other syscalls.
  *
  * The filter is exported in a format compatible with bubblewrap's --seccomp flag.
  *
@@ -104,9 +104,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Add rule to block socket(AF_VSOCK, ...) */
+    /* The network namespace does not fence VM sockets: on a machine with a
+     * vsock transport one connects straight out of the sandbox, past the
+     * proxies. No socketpair() rule is needed: the family has none. */
+    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
+                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_VSOCK));
+    if (rc < 0) {
+        fprintf(stderr, "Error: Failed to add AF_VSOCK rule: %s\n", strerror(-rc));
+        seccomp_release(ctx);
+        return 1;
+    }
+
     /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets
      * in kernel context without going through the socket() syscall, bypassing
-     * the rule above. seccomp cannot inspect io_uring SQEs (they live in a
+     * the rules above. seccomp cannot inspect io_uring SQEs (they live in a
      * shared-memory ring), so the only safe option is to deny ring creation
      * and use. Blocking all three syscalls also covers the case of an
      * inherited ring fd. */

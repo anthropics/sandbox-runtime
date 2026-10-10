@@ -3224,6 +3224,9 @@ async function generateFilesystemArgs(
  * The seccomp-bpf filter blocks socket(AF_UNIX, ...) syscalls, preventing:
  * - Creating new Unix domain socket file descriptors
  *
+ * It also blocks socket(AF_VSOCK, ...): the network namespace does not fence
+ * VM sockets, so one would reach out of the sandbox past the proxies.
+ *
  * Security limitations:
  * - Does NOT block operations (bind, connect, sendto, etc.) on inherited Unix socket FDs
  * - Does NOT prevent passing Unix socket FDs via SCM_RIGHTS
