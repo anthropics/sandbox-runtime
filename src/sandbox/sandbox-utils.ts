@@ -696,13 +696,8 @@ function readRuleCovers(entry: FilesystemPathEntry): (p: string) => boolean {
   }
   const stripped = removeTrailingGlobSuffix(entry)
   if (containsGlobCharsForPlatform(stripped)) {
-    try {
-      const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
-      return p => regex.test(p)
-    } catch {
-      // Brackets that do not form a valid class. The entry may be a literal
-      // file name, so it is compared as one.
-    }
+    const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
+    return p => regex.test(p)
   }
   const rule = normalizePathForSandbox(stripped, { literal: true })
   return p => isAtOrUnder(p, rule)
@@ -1203,12 +1198,45 @@ export function encodedCommandFromProxyUser(
  * - ? matches any single character except / (e.g., file?.txt matches file1.txt)
  * - [abc] matches any character in the set (e.g., file[0-9].txt matches file3.txt)
  *
+ * Brackets that would not compile, because a range in them runs backwards
+ * (`[user-id]`: `r-i`) or a second `[` is left open, are the text they are, as
+ * POSIX reads a `[` that opens no set. The rest of the pattern keeps its
+ * meaning. So what is returned always compiles, and no entry keeps a sandbox
+ * from starting.
+ *
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
 export function globToRegex(globPattern: string): string {
+  // Every other part is a bracket expression, up to the first `]` as a regular
+  // expression reads one. The last part holds each `[` that is left open.
+  const sources = globPattern.split(/(\[[^\]]*\])/).map(part => {
+    const source = globPartToRegex(part)
+    if (isRegex(source)) return source
+    logForDebugging(
+      `[Sandbox] The brackets in ${part} spell no set of characters, so they are read as text: ${globPattern}`,
+      { level: 'warn' },
+    )
+    return part
+      .split(/([[\]])/)
+      .map((text, i) => (i % 2 ? `\\${text}` : globPartToRegex(text)))
+      .join('')
+  })
+  return `^${sources.join('')}$`
+}
+
+function isRegex(source: string): boolean {
+  try {
+    new RegExp(source)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** {@link globToRegex} for one bracket expression, or for what lies between two. */
+function globPartToRegex(part: string): string {
   return (
-    '^' +
-    globPattern
+    part
       // Escape regex special characters (except glob chars * ? [ ])
       .replace(/[.^$+{}()|\\]/g, '\\$&')
       // Escape unclosed brackets (no matching ])
@@ -1220,8 +1248,7 @@ export function globToRegex(globPattern: string): string {
       .replace(/\?/g, '[^/]') // ? matches single character except /
       // Restore placeholders
       .replace(/__GLOBSTAR_SLASH__/g, '(.*/)?') // **/ matches zero or more dirs
-      .replace(/__GLOBSTAR__/g, '.*') + // ** matches anything including /
-    '$'
+      .replace(/__GLOBSTAR__/g, '.*') // ** matches anything including /
   )
 }
 
@@ -1448,11 +1475,18 @@ function globPieces(pattern: string, flags: string): GlobPiece[] | undefined {
     if (bracket !== undefined) {
       if (/[*?]/.test(bracket)) return undefined
       const source = sourceOf(bracket)
-      pieces.push(
-        new RegExp(`^${source}$`, flags).test('/')
-          ? { source, canBeSeparator: true }
-          : { source },
-      )
+      const regex = new RegExp(`^${source}$`, flags)
+      if (regex.test(bracket)) {
+        // Read as the text it is, where a separator is one like any other.
+        for (const [i, name] of source.split('/').entries()) {
+          if (i > 0) pieces.push('/')
+          pieces.push({ source: name })
+        }
+      } else {
+        pieces.push(
+          regex.test('/') ? { source, canBeSeparator: true } : { source },
+        )
+      }
     } else if (stars !== undefined) {
       // globToRegex takes `**/` first, so the last two of a run before a
       // separator go with it. What is left of the run is `**` pairs from the
@@ -1484,23 +1518,12 @@ function globPositions(
   normalizedPattern: string,
   flags: string,
 ): GlobPositions {
+  const regex = new RegExp(globToRegex(normalizedPattern), flags)
   const directoryForm = removeTrailingGlobSuffix(normalizedPattern)
-  let regex: RegExp
-  let directoryRegex: RegExp | undefined
-  try {
-    regex = new RegExp(globToRegex(normalizedPattern), flags)
-    directoryRegex =
-      directoryForm !== normalizedPattern
-        ? new RegExp(globToRegex(directoryForm), flags)
-        : undefined
-  } catch (err) {
-    // A pattern that is no regular expression would match nothing and deny
-    // nothing, silently: it is raised as the configuration error it is.
-    throw new SyntaxError(
-      `Glob pattern ${normalizedPattern} does not compile, so nothing can match it: ${err}`,
-      { cause: err },
-    )
-  }
+  const directoryRegex =
+    directoryForm !== normalizedPattern
+      ? new RegExp(globToRegex(directoryForm), flags)
+      : undefined
   const unsplit: GlobPositions = {
     splits: false,
     start: [0],

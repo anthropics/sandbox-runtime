@@ -32,7 +32,8 @@ import { isWindows } from '../helpers/platform.js'
 
 /** Names that put the interesting readings next to each other: a bracket set
  *  that can match a separator (`[+-9]` spans `/`), a `**` written against
- *  text, and a name that is a prefix of another. */
+ *  text, a name that is a prefix of another, and brackets that spell no set
+ *  (`b-a` runs backwards). */
 const NAME = fc.constantFrom(
   'a',
   'b',
@@ -43,6 +44,7 @@ const NAME = fc.constantFrom(
   'y.pem',
   'a9',
   's',
+  '[b-a]',
 )
 
 const SEGMENT = fc.constantFrom(
@@ -60,6 +62,7 @@ const SEGMENT = fc.constantFrom(
   '[+-9]',
   '[a*]',
   '**.pem',
+  '[b-a]',
 )
 
 const LAST_SEGMENT = fc.constantFrom(

@@ -33,6 +33,7 @@ import type {
 } from '../../src/sandbox/sandbox-config.js'
 import type { ISandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
+  denyGlobRegex,
   expandGlobPattern,
   expandTilde,
   finish,
@@ -54,6 +55,7 @@ import {
   parseWindowsSandboxError,
   WindowsSandboxError,
 } from '../../src/sandbox/windows-sandbox-utils.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 import { spawnSync } from 'node:child_process'
 
@@ -1327,15 +1329,34 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     })
   })
 
-  it('names the pattern that is no regular expression', () => {
-    const walk = (): unknown => walkGlobPattern('/tmp/certs/[z-a]*.pem')
-    expect(walk).toThrow(SyntaxError)
-    expect(walk).toThrow(
-      expect.objectContaining({ cause: expect.any(SyntaxError) }),
-    )
-    expect(walk).toThrow(
-      /^Glob pattern \S*\/certs\/\[z-a\]\*\.pem does not compile/,
-    )
+  it('follows brackets that spell no set of characters a name at a time', () => {
+    // Through a link, which only a pattern that splits into names is listed
+    // through; the second pair of brackets holds a separator.
+    const root = realPath(mkdtempSync(join(tmpdir(), 'glob-walk-no-set-')))
+    try {
+      mkdirSync(join(root, 'store', '[z-a]', 'x[b-a'), { recursive: true })
+      mkdirSync(join(root, 'store', 'z'))
+      mkdirSync(join(root, 'proj'))
+      writeFileSync(join(root, 'store', '[z-a]', 'x[b-a', 'c]y.pem'), '')
+      writeFileSync(join(root, 'store', '[z-a]', 'x[b-ac]y.pem'), '')
+      writeFileSync(join(root, 'store', 'z', 'id.pem'), '')
+      writeFileSync(join(root, 'store', '[z-a]', 'id.pem'), '')
+      symlinkSync(join(root, 'store'), join(root, 'proj', 'link'))
+      const found = (tail: string): string[] =>
+        walkGlobPattern(join(root, 'proj', tail), {
+          followSymlinkedDirectories: true,
+        }).matches
+
+      expect(found('**/[z-a]/*.pem').sort()).toEqual([
+        join(root, 'store', '[z-a]', 'id.pem'),
+        join(root, 'store', '[z-a]', 'x[b-ac]y.pem'),
+      ])
+      expect(found('**/x[b-a/c]y.pem')).toEqual([
+        join(root, 'store', '[z-a]', 'x[b-a', 'c]y.pem'),
+      ])
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 
@@ -1998,6 +2019,21 @@ describe('expandWindowsFsPaths beneath a directory named [WIP] project', () => {
     },
   )
 
+  it.each(['deny', 'grant'] as const)(
+    'expands a pattern with brackets that spell no set of characters (%s)',
+    mode => {
+      // `r-i` runs backwards. At any depth, where no reading as a name reaches.
+      const route = join(root, 'app', 'users', '[user-id]')
+      mkdirSync(route, { recursive: true })
+      writeFileSync(join(route, 'page.tsx'), '')
+      for (const pattern of [`${route}/*.tsx`, `${root}/**/[user-id]/*.tsx`]) {
+        expect(expandWindowsFsPaths([pattern], { mode })).toEqual([
+          join(route, 'page.tsx'),
+        ])
+      }
+    },
+  )
+
   it('lists a path once that more than one reading finds', () => {
     const out = expandWindowsFsPaths(
       [`${project}/**/.env`, `${project}/*/.env`, join(project, 'sub', '.env')],
@@ -2396,6 +2432,88 @@ describe('globToRegex (shared)', () => {
     const stray = globToRegex('/tmp/test/file]a.txt')
     expect(new RegExp(stray).test('/tmp/test/file]a.txt')).toBe(true)
     expect(new RegExp(stray).test('/tmp/test/filea.txt')).toBe(false)
+  })
+
+  it.each([
+    '[z-a]',
+    '[user-id]',
+    'backup[2024-01-15]',
+    '[[z-a]',
+    '[z-a]]',
+    '[a-.]',
+    'a[b[c',
+  ])('reads brackets that spell no set as the text they are: %s', name => {
+    const regex = new RegExp(globToRegex(`/tmp/${name}/x`))
+    expect(regex.test(`/tmp/${name}/x`)).toBe(true)
+    for (const char of name) expect(regex.test(`/tmp/${char}/x`)).toBe(false)
+  })
+
+  it('keeps the rest of such a pattern a pattern', () => {
+    const regex = new RegExp(globToRegex('/tmp/**/[user-id]/file[0-9]?.*'))
+    expect(regex.test('/tmp/[user-id]/file3x.env')).toBe(true)
+    expect(regex.test('/tmp/a/b/[user-id]/file3x.env')).toBe(true)
+    expect(regex.test('/tmp/[user-id]/file[0-9]x.env')).toBe(false)
+    expect(regex.test('/tmp/u/file3x.env')).toBe(false)
+
+    const within = new RegExp(globToRegex('/tmp/[z-a*.]'))
+    expect(within.test('/tmp/[z-a and more.]')).toBe(true)
+    expect(within.test('/tmp/[z-a/more.]')).toBe(false)
+    expect(within.test('/tmp/[z-a and more!]')).toBe(false)
+  })
+
+  it('says under SRT_DEBUG which brackets it reads as text', async () => {
+    const { warnings } = await withCapturedWarnings(() =>
+      Promise.resolve(globToRegex('/tmp/[ab]/[user-id]/*')),
+    )
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toContain('The brackets in [user-id] spell no set')
+    expect(warnings[0]).toEndWith(': /tmp/[ab]/[user-id]/*')
+  })
+
+  it('gives a regular expression whatever it is given', () => {
+    const text = fc
+      .array(fc.constantFrom(...'[[]]--**??//\\^!().az', '__GLOBSTAR__'), {
+        maxLength: 10,
+      })
+      .map(parts => parts.join(''))
+    fc.assert(
+      fc.property(text, pattern => {
+        new RegExp(globToRegex(pattern), 'is')
+        new RegExp(denyGlobRegex(pattern))
+      }),
+      { seed: 20261010, numRuns: 5000 },
+    )
+  })
+
+  it('matches the path a generated pattern spells, and not one a set would', () => {
+    // A segment, a name it matches, and for brackets that spell no set a name
+    // they would match as one.
+    const segment = fc.constantFrom<[string, string, string?]>(
+      ['a', 'a'],
+      ['*', 'xy'],
+      ['?', 'x'],
+      ['**', 'p/q'],
+      ['[ab]c', 'bc'],
+      ['[z-a]', '[z-a]', 'z'],
+      ['[user-id]', '[user-id]', 'u'],
+      ['v[9-0]*', 'v[9-0].1', 'v9.1'],
+      ['[ab][b-a]', 'a[b-a]', 'ab'],
+    )
+    fc.assert(
+      fc.property(fc.array(segment, { minLength: 1, maxLength: 5 }), parts => {
+        const regex = new RegExp(
+          globToRegex('/' + parts.map(([glob]) => glob).join('/')),
+        )
+        const names = parts.map(([, name]) => name)
+        expect(regex.test('/' + names.join('/'))).toBe(true)
+        for (const [i, [, , asSet]] of parts.entries()) {
+          if (asSet === undefined) continue
+          const other = names.map((name, j) => (j === i ? asSet : name))
+          expect(regex.test('/' + other.join('/'))).toBe(false)
+        }
+      }),
+      { seed: 20261010, numRuns: 500 },
+    )
   })
 
   it.failing(
