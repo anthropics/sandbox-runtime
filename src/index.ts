@@ -127,6 +127,8 @@ export {
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'
 export { writeRootsOf } from './sandbox/path-entries.js'
+// Where the library takes a path to be: for a caller that judges paths itself.
+export { realPathOf } from './utils/real-path.js'
 
 // Platform utilities
 export { getWslVersion } from './utils/platform.js'

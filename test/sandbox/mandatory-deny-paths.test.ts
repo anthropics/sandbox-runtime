@@ -410,6 +410,7 @@ describe.if(isSupportedPlatform)(
             join(project, 'is-readable'),
             join(project, 'really-locked'),
             join(project, 'locked: too'),
+            join(project, 'locked\\so'),
             join(project, 'one-thread'),
             join(project, 'no-prefix'),
             join(project, 'listed-only/child'),
@@ -423,6 +424,7 @@ describe.if(isSupportedPlatform)(
           const locked = [
             join(project, 'really-locked'),
             join(project, 'locked: too'),
+            join(project, 'locked\\so'),
             join(project, 'one-thread'),
             join(project, 'no-prefix'),
             join(project, 'a/b/c/too-deep'),
@@ -438,6 +440,7 @@ describe.if(isSupportedPlatform)(
             'not-there/at-all',
             'entered-only/not-there',
             'locked: too',
+            'locked\\so',
             'listed-only/child',
           ].map(
             name => `rg: ${project}/${name}: Permission denied (os error 13)`,
@@ -474,6 +477,7 @@ describe.if(isSupportedPlatform)(
             expect(unreadableDirectories(said.join('\n'), project, 3)).toEqual([
               join(project, 'really-locked'),
               join(project, 'locked: too'),
+              join(project, 'locked\\so'),
               join(project, 'listed-only'),
               join(project, 'one-thread'),
               join(project, 'no-prefix'),

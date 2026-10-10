@@ -973,6 +973,18 @@ describe.if(!isWindows)('a walk over listings that give no types', () => {
     })
   }
 
+  it('leaves a directory with a backslash in its name to be denied whole when lstat fails', () => {
+    const named = join(data, 'na\\me')
+    mkdirSync(named)
+    try {
+      const { walks } = walked(['**/.env'], { lstatSync: 'EIO' })
+
+      expect(walks[0]!.unlisted).toEqual([named])
+    } finally {
+      rmSync(named, { recursive: true })
+    }
+  })
+
   it('asks once for all the patterns handed the same listings', () => {
     const patterns = ['**/.env', '**/*.txt', '**/deep/**']
     const alone = walked(patterns)
