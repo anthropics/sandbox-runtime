@@ -22,6 +22,7 @@ import {
   buildMaskedFileBinds,
 } from './credential-mask-files.js'
 import { buildMaskedEnvVars } from './credential-mask-env.js'
+import { CredentialSourceResolver } from './credential-source.js'
 import {
   AwsPairRegistry,
   createSigv4Planner,
@@ -216,6 +217,13 @@ const sentinelRegistry = new SentinelRegistry()
 // the fake access key id. Same lifecycle and secrecy posture as the
 // sentinel registry.
 const awsPairRegistry = new AwsPairRegistry()
+// Per-session cache of credential `source` command results. The cache is
+// load-bearing, not an optimisation: getCredentialRestrictions() runs once
+// per wrapped command and again on every getFsReadConfig(), so without it
+// a session that runs N commands re-runs its vault CLI N+ times, a
+// biometric prompt storm for any backend that asks. Same secrecy posture
+// and lifecycle as the sentinel registry: memory only, cleared on reset().
+const credentialSourceResolver = new CredentialSourceResolver()
 // Temp dir holding the sentinel-content fake files for masked credential
 // files. Created lazily on first masked file; removed on reset().
 const maskedFileStore = new MaskedFileStore()
@@ -1366,6 +1374,20 @@ async function checkDependenciesAsync(
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
   allowedDomains: readonly string[] | undefined,
+  options?: {
+    /**
+     * Skip everything derived from `credentials.envVars` and return only
+     * the file-derived paths.
+     *
+     * For a caller that reads only `denyReadPaths` / `degradeToDenyPaths`
+     * the env work was always waste, and with a `source` on an entry it
+     * stops being merely wasteful: masking would run the operator's vault
+     * command, on the main thread, from a getter the caller believes is
+     * pure, and prompt for biometrics where nobody asked for a
+     * credential.
+     */
+    fileRulesOnly?: boolean
+  },
 ): CredentialRestrictionConfig {
   if (!credentials) {
     return {
@@ -1397,23 +1419,40 @@ function getCredentialRestrictions(
   // the sandbox. degradeToUnsetNames carries variables whose extract
   // pattern matched nothing with onExtractNoMatch: "deny" — merged into
   // unsetEnvVars below so the value is withheld rather than exposed.
-  const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
-    credentials.envVars ?? [],
-    defaultInjectHosts,
-    sentinelRegistry,
-  )
+  const { setEnvVars, resolvedValues, degradeToUnsetNames } =
+    options?.fileRulesOnly
+      ? { setEnvVars: {}, resolvedValues: {}, degradeToUnsetNames: [] }
+      : buildMaskedEnvVars(
+          credentials.envVars ?? [],
+          defaultInjectHosts,
+          sentinelRegistry,
+          process.env,
+          credentialSourceResolver,
+        )
   unsetEnvVars.push(...degradeToUnsetNames)
 
   // Link masked AWS credentials into pairs so the proxy can re-sign
   // SigV4 requests (the signature is derived from the secret; header
   // substitution alone cannot fix it).
-  registerAwsPairs(
-    credentials.envVars ?? [],
-    credentials.awsPairs,
-    defaultInjectHosts,
-    setEnvVars,
-    awsPairRegistry,
-  )
+  //
+  // registerAwsPairs reads the real key id and secret out of an
+  // environment, so a sourced AWS credential (masked, but by design
+  // absent from process.env) has to be overlaid here. Without the
+  // overlay the pair is not registered and nothing says so: both vars
+  // ARE masked, so the half-masked warning does not apply, and the
+  // sandbox signs with the placeholder secret against an upstream that
+  // can only reject it. Sourced values win, matching the rule that a
+  // source is the value for its variable.
+  if (!options?.fileRulesOnly) {
+    registerAwsPairs(
+      credentials.envVars ?? [],
+      credentials.awsPairs,
+      defaultInjectHosts,
+      setEnvVars,
+      awsPairRegistry,
+      { ...process.env, ...resolvedValues },
+    )
+  }
 
   // Masked files: read the real bytes on the host, register a sentinel,
   // write it to a fake file in the manager-owned temp dir. Missing/unreadable
@@ -1609,6 +1648,10 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   const credentialRestrictions = getCredentialRestrictions(
     config.credentials,
     config.network.allowedDomains,
+    // This getter uses only the file-derived paths below. Asking for the
+    // env work too would run a credential `source` command from a
+    // permission check or a render path.
+    { fileRulesOnly: true },
   )
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.
@@ -2842,6 +2885,7 @@ async function reset(): Promise<void> {
   javaAgentJarPath = undefined
   sentinelRegistry.clear()
   awsPairRegistry.clear()
+  credentialSourceResolver.clear()
   commandTextsByKey.clear()
   commandNetworkListsByKey.clear()
   maskedFileStore.dispose()
