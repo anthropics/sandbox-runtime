@@ -1509,11 +1509,11 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     // The WORKDIR /app shape: a protected path one level below '/' has no
     // ancestor to pin, and the cover is the only thing that keeps its
     // top-level directory a mountpoint. /usr holds no other protected path,
-    // so the cover can only come from this deny.
+    // so the cover can only come from this deny, whether or not this user can
+    // have a mount point made in /usr.
     const absent = '/usr/srt-ancestor-pin-probe'
     const command = await wrap({ allowWrite: ['/'], denyWrite: [absent] })
 
-    expect(command).toContain(`--ro-bind /dev/null ${absent}`)
     expect(command).toContain('--bind /usr /usr')
     expect(command).not.toContain('--ro-bind /usr /usr')
   })
@@ -1529,8 +1529,6 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       denyWrite: [`/proc/${probe}`, `/sys/${probe}`, `/usr/${probe}`],
     })
 
-    expect(command).toContain(`--ro-bind /dev/null /proc/${probe}`)
-    expect(command).toContain(`--ro-bind /dev/null /sys/${probe}`)
     expect(command).toContain('--bind /usr /usr')
     expect(command).not.toContain('--bind /proc /proc')
     expect(command).not.toContain('--bind /sys /sys')
