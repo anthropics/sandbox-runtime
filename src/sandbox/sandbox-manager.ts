@@ -1935,6 +1935,47 @@ const RESTARTS_IN_TURNS = 2
 /** In place of what a walk finds: the configuration was replaced under it. */
 const REPLACED = Symbol('replaced')
 
+/** Whether a wrap is walking, and the ones waiting to, first come first. */
+let walking = false
+const waitingToWalk: (() => void)[] = []
+
+/**
+ * Resolves once no other wrap is walking, with what says that this one's walk
+ * has ended; only the first call of it counts. Walks that take turns on one
+ * thread end no sooner for it, while each keeps all it has listed until it
+ * ends and has its turn before the event loop gets one: the memory and the
+ * thread held would both grow with the wraps in flight.
+ * Rejects with `signal`'s reason as soon as that is aborted during the wait.
+ * Nothing else takes a wrap out of the line, reset() included.
+ */
+async function waitToWalk(signal?: AbortSignal): Promise<() => void> {
+  if (walking) {
+    signal?.throwIfAborted()
+    await new Promise<void>((resolve, reject) => {
+      const go = (): void => {
+        signal?.removeEventListener('abort', leave)
+        resolve()
+      }
+      const leave = (): void => {
+        waitingToWalk.splice(waitingToWalk.indexOf(go), 1)
+        reject(signal?.reason)
+      }
+      waitingToWalk.push(go)
+      signal?.addEventListener('abort', leave, { once: true })
+    })
+  }
+  walking = true
+  let ended = false
+  return () => {
+    if (ended) return
+    ended = true
+    // Handed on while `walking` stays set, so that no newcomer gets in first.
+    const next = waitingToWalk.shift()
+    if (next) next()
+    else walking = false
+  }
+}
+
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
@@ -1961,6 +2002,35 @@ async function wrapWithSandboxAgain(
   abortSignal?: AbortSignal,
   options?: WrapWithSandboxOptions,
 ): Promise<string> {
+  // INVARIANT: an attempt waits before it reads anything, so that it goes by
+  // the configuration, the working directory and the disk it finds afterwards.
+  const walkEnded = await waitToWalk(abortSignal)
+  try {
+    return await wrapWithSandboxOnce(
+      walkEnded,
+      restarts,
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
+  } finally {
+    walkEnded()
+  }
+}
+
+/** One attempt of {@link wrapWithSandboxAgain}, which calls `walkEnded` once
+ *  it walks no more. */
+async function wrapWithSandboxOnce(
+  walkEnded: () => void,
+  restarts: number,
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
   const platform = getPlatform()
   const commandId = options?.commandId
   registerCommandText(command, options)
@@ -1971,8 +2041,10 @@ async function wrapWithSandboxAgain(
     config !== startedWith ||
     configInstalls !== startedAt ||
     workingDirectory() !== startedIn
-  const startOver = (): Promise<string> =>
-    wrapWithSandboxAgain(
+  const startOver = (): Promise<string> => {
+    // The next attempt waits like any other wrap, behind the ones there are.
+    walkEnded()
+    return wrapWithSandboxAgain(
       restarts + 1,
       command,
       binShell,
@@ -1980,6 +2052,7 @@ async function wrapWithSandboxAgain(
       abortSignal,
       options,
     )
+  }
   /** `steps`, left as soon as the host is seen to have moved on: what they
    *  would go on to find is for a wrap that starts over anyway. */
   function* whileCurrent<T>(steps: Steps<T>): Steps<T | typeof REPLACED> {
@@ -2118,6 +2191,9 @@ async function wrapWithSandboxAgain(
           ),
       ),
     )
+    // Emptied by hand: a runtime may keep what this function has named for as
+    // long as it is suspended, which is until the scan below has ended.
+    listings.clear()
     if (expandedDenyRead === REPLACED) return startOver()
     readConfig = {
       ...expandedDenyRead,
@@ -2130,6 +2206,8 @@ async function wrapWithSandboxAgain(
       ),
     }
   }
+  // Nothing below walks, and what it waits for is not this thread.
+  walkEnded()
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:
