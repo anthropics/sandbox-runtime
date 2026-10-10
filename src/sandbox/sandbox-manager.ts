@@ -97,6 +97,7 @@ import {
 import {
   getDefaultWritePaths,
   containsGlobChars,
+  globBaseDirIsRoot,
   globPatternBaseDir,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
@@ -2901,9 +2902,9 @@ function getLinuxGlobPatternWarnings(): string[] {
   }
 
   // Read paths are expanded, so a glob there is supported — unless the
-  // pattern has no literal directory for the walk to start from (a wildcard
-  // in its first path component, `/**/*.pem`), which expands to nothing and
-  // leaves the entry unenforced.
+  // pattern has no literal directory below the root for the walk to start
+  // from (a wildcard in its first path component, `/**/*.pem`), which
+  // expands to nothing and leaves the entry unenforced.
   for (const path of [
     ...new Set([
       ...config.filesystem.denyRead,
@@ -2916,7 +2917,7 @@ function getLinuxGlobPatternWarnings(): string[] {
     const baseDir = globPatternBaseDir(normalizePathForSandbox(path))
     if (
       containsGlobChars(removeTrailingGlobSuffix(path)) &&
-      (baseDir === '' || baseDir === '/')
+      globBaseDirIsRoot(baseDir)
     ) {
       globPatterns.push(path)
     }
