@@ -443,6 +443,7 @@ srt --settings /path/to/srt-settings.json <command>
     "npm": ["/private/tmp"]
   },
   "enableWeakerNestedSandbox": false,
+  "allowNestedUserNamespaces": false,
   "enableWeakerNetworkIsolation": false,
   "allowAppleEvents": false
 }
@@ -582,6 +583,7 @@ Examples:
 
 - `ignoreViolations` - Object mapping command patterns to arrays of paths where violations should be ignored
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
+- `allowNestedUserNamespaces` - Linux: let the sandboxed command create user namespaces of its own (boolean, default: false). By default it cannot: see "The command stays in the namespaces made for it" under Platform-Specific Dependencies. Turn it on only where the commands run have to sandbox themselves that way (a browser with its namespace sandbox, rootless podman or buildah, a nested bubblewrap, `unshare -r` in a build script), and treat `denyWrite` and the mandatory denies as not holding against any command run under it.
 - `javaAgentJarPath` - macOS/Linux: absolute path to `srt-proxy-agent.jar`, the JVM agent injected via `JAVA_TOOL_OPTIONS` (see "JVM tools" under Network Isolation). Only needed by consumers that bundle sandbox-runtime and ship the jar separately; a normal npm install finds it under `vendor/java-proxy-agent/`.
 - `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service.
 - `allowPty` - macOS only: allow pseudo-terminal operations (boolean, default: false). The seatbelt profile then carries `(allow pseudo-tty)` plus read, write and `ioctl` on `/dev/ptmx` and `/dev/ttys*`, which a command that allocates a pty of its own needs. Not read on Linux or Windows.
@@ -700,7 +702,14 @@ or add an AppArmor profile that grants `userns` to the relevant binaries.
 
 **Running as root:** a caller with euid 0 needs `CAP_SETFCAP` in its capability bounding set. Bubblewrap's user namespace maps the caller's uid, and Linux 5.12 — and the older distribution kernels that backported the change — lets a namespace map uid 0 only when its creator held that capability; the seccomp isolation layer's nested namespace has the same requirement. Without it every sandboxed command fails with `Operation not permitted` while writing a uid map, and `initialize()` refuses to start once bubblewrap has confirmed it. Grant the capability to the calling process — it is in Docker's default set, but `capsh --drop=cap_setfcap` and a tightened `CapabilityBoundingSet=` remove it — or run as a non-root user, for which none of this applies. The bounding set is what counts, because bubblewrap is reached by `execve` and the kernel recomputes a root caller's permitted set from it.
 
-Prefer a non-root caller where there is the choice. Under the seccomp isolation layer a root caller's command still holds a full capability set inside the helper's nested user namespace, which is identity-mapped to the caller's uid 0; what holds the filesystem policy there is that the nested namespace's copies of the mounts are locked, not the command's capabilities. A non-root caller's command holds no capabilities at all.
+Prefer a non-root caller where there is the choice. Under the seccomp isolation layer a root caller's command still holds a full capability set inside the helper's nested user namespace, which is identity-mapped to the caller's uid 0; what holds the filesystem policy there is the helper's namespaces filter (next paragraph), not the command's capabilities: the nested namespace's copies of the mounts are locked, which refuses the unmount of any one deny but not the whole tree being moved aside with `pivot_root`. A non-root caller's command holds no capabilities at all.
+
+**The command stays in the namespaces made for it.** Every write deny on Linux is a read-only bind mount, and a bind protects a path only in the mount namespace it was made in. Creating a user namespace takes no capability and gives its creator a full capability set over a private copy of the mount tree, from which the binds can be removed; so a sandboxed command may not create one. The seccomp isolation layer enforces that with a second filter beside the Unix-socket one, which refuses `unshare` and `clone` with the user-namespace flag, `setns`, `mount`, `umount2`, `pivot_root` and the newer mount calls (`EPERM`), and `clone3` (`ENOSYS`, which sends libc and the language runtimes to `clone`), and with `user.max_user_namespaces` set to zero in the helper's own user namespace.
+
+What stops working as a result is whatever sandboxes itself with user namespaces: Chromium's and Electron's namespace sandbox, rootless podman and buildah, a nested bubblewrap or `srt`, `unshare -r` in a build script. They fail with `EPERM` (`unshare: unshare failed: Operation not permitted`); a nested bubblewrap blames a kernel setting and suggests a `sysctl`, which does not apply here. A root caller's command also loses `mount`, `umount` and `setns` for purposes of its own (`unshare -m`, `nsenter`, `ip netns exec`), and a direct `clone3` call has no fallback. The cure is `allowNestedUserNamespaces: true`, at the price stated under that option. Known limits:
+
+- With no seccomp helper in the chain (`allowAllUnixSockets`, or no helper for the architecture) nothing limits namespaces.
+- A helper built before this release (an embedder's own, through `seccomp.applyPath` or `seccomp.argv0`) imposes no limit, and nothing says so: rebuild it from this release's `vendor/seccomp-src`.
 
 **Optional Linux dependencies (for seccomp fallback):**
 

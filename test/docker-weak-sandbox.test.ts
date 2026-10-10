@@ -151,19 +151,56 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   })
 
   // Under the helper the command holds a full capability set in the helper's
-  // nested user namespace, so what refuses the unmount is EINVAL: the mounts
-  // it inherited were copied across a user-namespace boundary and are locked.
+  // nested user namespace, and what refuses the unmount is the helper's
+  // namespaces filter (EPERM), before the kernel looks at the locked mount.
   it('leaves the command no way to unmount a deny (seccomp helper)', () => {
     const out = join(DENIED, 'escaped')
     const r = srt(escapeAttempt(out))
 
     expect(r.stdout).toContain('SANDBOX-RAN')
-    expect(r.stdout).toContain('umount2 / rc=-1 errno=EINVAL')
-    expect(r.stdout).toContain(`umount2 ${SECRET} rc=-1 errno=EINVAL`)
+    expect(r.stdout).toContain('umount2 / rc=-1 errno=EPERM')
+    expect(r.stdout).toContain(`umount2 ${SECRET} rc=-1 errno=EPERM`)
     refusedEveryStep(r.stdout)
     expect(r.status).not.toBe(0)
     expect(r.stdout).not.toContain('TOPSECRET')
     expect(existsSync(out)).toBe(false)
+  })
+
+  // This job's /proc is masked, so the helper cannot mount a fresh one and
+  // the command still sees the helper's outer process, which shares its user
+  // namespace. The command holds a full capability set there; what keeps it
+  // out is that the helper made itself non-dumpable before it forked.
+  it('cannot open the memory of the helper process it can see (seccomp helper)', () => {
+    const probe = join(WORK, 'helper-mem-probe.py')
+    writeFileSync(
+      probe,
+      [
+        'import os',
+        'seen = 0',
+        "for pid in filter(str.isdigit, os.listdir('/proc')):",
+        '    try:',
+        "        name = open('/proc/%s/comm' % pid).read().strip()",
+        '    except OSError:',
+        '        continue',
+        "    if name != 'apply-seccomp' or int(pid) == os.getpid():",
+        '        continue',
+        '    seen += 1',
+        "    for what in ('mem', 'environ'):",
+        '        try:',
+        "            os.close(os.open('/proc/%s/%s' % (pid, what), os.O_RDWR if what == 'mem' else os.O_RDONLY))",
+        "            print('helper %s OPENED' % what)",
+        '        except OSError as e:',
+        "            print('helper %s refused' % what)",
+        "print('helpers-seen=%d' % seen)",
+        '',
+      ].join('\n'),
+    )
+    const r = srt(`echo SANDBOX-RAN; python3 ${probe}`)
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    // If none is visible here the fresh /proc was mounted after all and there
+    // is nothing to reach; otherwise every one seen must refuse.
+    expect(r.stdout).toMatch(/^helpers-seen=\d+$/m)
+    expect(r.stdout).not.toContain('OPENED')
   })
 
   // Without the helper there is no nested namespace and no locked copies:
