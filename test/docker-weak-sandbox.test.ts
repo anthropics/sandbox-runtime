@@ -19,8 +19,10 @@ import { spawnSync } from 'node:child_process'
 import {
   mkdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
   readFileSync,
+  readlinkSync,
   existsSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -33,6 +35,7 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   const ALLOWED = join(WORK, 'allowed')
   const DENIED = join(WORK, 'denied')
   const SECRET = join(WORK, 'secret')
+  const LINK = join(ALLOWED, 'link')
   const CONFIG = join(WORK, 'srt.json')
   // Same policy without the seccomp helper: the command then runs in bwrap's
   // own namespaces, where --cap-drop ALL is the only thing between it and the
@@ -71,6 +74,7 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     mkdirSync(DENIED, { recursive: true })
     mkdirSync(SECRET, { recursive: true })
     writeFileSync(join(SECRET, 'key'), 'TOPSECRET')
+    symlinkSync('leads-to', LINK)
     writeFileSync(
       UMOUNT_PROBE,
       [
@@ -78,7 +82,8 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)",
         'for target in sys.argv[1:]:',
         '    ctypes.set_errno(0)',
-        '    rc = libc.umount2(target.encode(), 0)',
+        // UMOUNT_NOFOLLOW, which also reaches a mount on a symbolic link.
+        '    rc = libc.umount2(target.encode(), 8)',
         '    e = ctypes.get_errno()',
         "    print('umount2 %s rc=%d errno=%s (%s)' % (",
         '        target, rc, errno.errorcode.get(e, str(e)), os.strerror(e)))',
@@ -89,7 +94,7 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
       filesystem: {
         denyRead: [SECRET],
         allowWrite: [ALLOWED],
-        denyWrite: [],
+        denyWrite: [LINK],
       },
       enableWeakerNestedSandbox: true,
     }
@@ -164,6 +169,17 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(r.status).not.toBe(0)
     expect(r.stdout).not.toContain('TOPSECRET')
     expect(existsSync(out)).toBe(false)
+  })
+
+  it('keeps a write-denied symbolic link in place', () => {
+    const r = srt(
+      `echo SANDBOX-RAN; python3 ${UMOUNT_PROBE} ${LINK}; rm ${LINK} 2>&1`,
+    )
+
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    expect(r.stdout).toContain(`umount2 ${LINK} rc=-1 errno=EINVAL`)
+    expect(r.stdout).toContain('Device or resource busy')
+    expect(readlinkSync(LINK)).toBe('leads-to')
   })
 
   // Without the helper there is no nested namespace and no locked copies:
