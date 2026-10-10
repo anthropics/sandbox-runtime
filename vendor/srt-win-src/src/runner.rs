@@ -9,8 +9,8 @@
 //! mitigations, handle whitelist), or — at install time — writes
 //! the MITM CA into the sandbox user's `CurrentUser\Root` (see
 //! [`crate::cert_store`]). The child inherits the runner's stdio,
-//! which are the broker's pipes, so stdout/stderr flow broker ←
-//! runner ← child without an extra pump.
+//! which are the broker's pipes, so stdin flows broker → child and
+//! stdout/stderr flow broker ← child without an extra pump.
 //!
 //! All state-DB work happens in the **broker**, never here: the
 //! state-DB directory carries an explicit DENY for
@@ -19,6 +19,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
 use crate::launch;
 
@@ -70,11 +71,15 @@ pub struct RunnerSpec {
 
 /// Read a 4-byte little-endian length prefix followed by that many
 /// bytes of JSON from stdin. The length prefix lets the runner know
-/// when the spec ends without the broker closing the write end
-/// (which it does anyway — the prefix is just robustness against a
-/// future stdin-after-spec use).
+/// when the spec ends without the broker closing the write end: for
+/// `Exec` the broker keeps relaying the caller's stdin after the
+/// spec, and the child inherits this handle to read the rest.
 fn read_cmd_from_stdin() -> Result<RunnerCmd> {
-    let mut stdin = std::io::stdin().lock();
+    // Unbuffered: `std::io::stdin()` reads ahead, which would take
+    // bytes past the spec that belong to the child.
+    let mut stdin = std::mem::ManuallyDrop::new(unsafe {
+        std::fs::File::from_raw_handle(std::io::stdin().as_raw_handle())
+    });
     let mut len_buf = [0u8; 4];
     stdin
         .read_exact(&mut len_buf)
