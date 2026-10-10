@@ -146,14 +146,27 @@ jobs:
           name: srt-win-arm64
           path: vendor/srt-win/arm64
 
-      - run: npm ci
+      # Only tsc may run from node_modules beside the binaries downloaded
+      # above. A git dependency runs its code on install even with
+      # --ignore-scripts, and the build's `npm run` puts node_modules/.bin
+      # first on PATH, where a dependency could plant its own rm or tsc.
+      - name: Install dependencies, link tsc
+        run: |
+          if [ "$(npm config get allow-git)" = undefined ]; then
+            echo "::error::npm older than 11.9 ignores --allow-git"; exit 1
+          fi
+          npm ci --ignore-scripts --no-bin-links --allow-git=none
+          # No -p: fail if npm linked any bin.
+          mkdir node_modules/.bin
+          ln -s ../typescript/bin/tsc node_modules/.bin/tsc
 
       - name: Build, pack, verify contents
         # `npm pack` does NOT run prepublishOnly (only directory-mode
         # `npm publish` does), so run it explicitly first.
         run: |
           npm run prepublishOnly
-          npm pack
+          # --ignore-scripts skips `prepare` (husky).
+          npm pack --ignore-scripts
           PKG=$(ls *.tgz)
           LIST=$(tar -tzf "$PKG" | sort)
           echo "::group::tarball contents"
