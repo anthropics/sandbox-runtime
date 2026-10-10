@@ -1589,10 +1589,18 @@ function buildSandboxCommand(
   // Host filesystem is bind-mounted into the sandbox, so an explicit
   // socatPath resolves to the same binary inside bwrap.
   const socat = quote([socatPath ?? 'socat'])
+  // The addresses are quoted for the same reason the binary is: this string is
+  // shell source that the inner `<shell> -c` re-parses, and the socket paths sit
+  // under tmpdir(), which is whatever TMPDIR says. A space there splits the
+  // address into two words, socat is handed a third address and exits, and
+  // `>/dev/null 2>&1` swallows the message, so the command runs on with a relay
+  // that never bound.
+  const httpAddress = quote([`UNIX-CONNECT:${httpSocketPath}`])
+  const socksAddress = quote([`UNIX-CONNECT:${socksSocketPath}`])
   const socatCommands = [
-    `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+    `${socat} TCP-LISTEN:3128,fork,reuseaddr ${httpAddress} >/dev/null 2>&1 &`,
     '_srt_http=$!',
-    `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+    `${socat} TCP-LISTEN:1080,fork,reuseaddr ${socksAddress} >/dev/null 2>&1 &`,
     '_srt_socks=$!',
     // The trap saves the status the script is exiting with and exits with
     // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
