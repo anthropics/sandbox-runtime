@@ -3,6 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
+import { realPathOf } from '../utils/real-path.js'
 import type { FilesystemPathEntry } from './sandbox-config.js'
 
 /**
@@ -85,7 +86,7 @@ export function* properAncestors(absolutePath: string): Generator<string> {
  */
 export function pathSpellings(candidatePath: string): string[] {
   try {
-    const resolved = fs.realpathSync(candidatePath)
+    const resolved = realPathOf(candidatePath)
     if (resolved !== candidatePath) return [candidatePath, resolved]
   } catch {
     // Dangling or vanished: only the spelling names it.
@@ -504,11 +505,11 @@ export function normalizePathForSandbox(
   // tolerates the spelling, and the Linux backend rebuilds its destinations
   // with path.dirname/join, so that argv was already right.
   //
-  // Lexical only, and deliberately not path.normalize/path.resolve: those
-  // also fold '..', which through a symlinked component aims the rule at a
-  // different file than the kernel would reach. An absolute spelling's '..' is
-  // left to realpath below; a relative one was already folded lexically by the
-  // path.resolve above (pre-existing).
+  // Lexical only, and deliberately not path.normalize/path.resolve, which
+  // also fold '..'. An absolute spelling's '..' is left to realPathOf below:
+  // that folds it in text too, and answers only for a path that is there, so
+  // one that is not keeps its '..' as written. A relative one was already
+  // folded lexically by the path.resolve above (pre-existing).
   if (getPlatform() !== 'windows') {
     normalizedPath = collapseInteriorSpellings(normalizedPath)
   }
@@ -528,7 +529,7 @@ export function normalizePathForSandbox(
 
       // Try to resolve symlinks for the base directory
       try {
-        const resolvedBaseDir = fs.realpathSync(baseDir)
+        const resolvedBaseDir = realPathOf(baseDir)
         // Validate that resolution stays within expected boundaries
         if (!isSymlinkOutsideBoundary(baseDir, resolvedBaseDir)) {
           // Reconstruct the pattern with the resolved directory
@@ -555,7 +556,7 @@ export function normalizePathForSandbox(
   // Resolve symlinks to real paths to avoid bwrap issues
   // Validate that the resolution stays within expected boundaries
   try {
-    const resolvedPath = fs.realpathSync(normalizedPath)
+    const resolvedPath = realPathOf(normalizedPath)
 
     // A symlink pointing outside the expected boundaries (e.g. to a parent
     // directory) keeps the original path.
@@ -1867,7 +1868,7 @@ export function* walkGlobPatternSteps(
         linkPath,
         p => ({
           isDirectory: fs.statSync(p).isDirectory(),
-          real: fs.realpathSync(p),
+          real: realPathOf(p),
         }),
         isAbsenceErrno,
         () => (unread = true),
@@ -1912,7 +1913,7 @@ export function* walkGlobPatternSteps(
       try {
         // Where it leads can still tell: only a link leads away from its place.
         const isDirectory = fs.statSync(spelled).isDirectory()
-        if (fs.realpathSync(spelled) !== path.join(real, name)) type = 'link'
+        if (realPathOf(spelled) !== path.join(real, name)) type = 'link'
         else if (isDirectory) type = 'directory'
       } catch (err) {
         // Only links make a circle. One that is not there is gone since it was
@@ -1944,7 +1945,7 @@ export function* walkGlobPatternSteps(
   const baseSpelling = /^[A-Za-z]:$/.test(baseDir) ? `${baseDir}/` : baseDir
   let baseReal = baseSpelling
   try {
-    baseReal = fs.realpathSync(baseSpelling)
+    baseReal = realPathOf(baseSpelling)
   } catch {
     // Not there, or a component of it cannot be resolved: list the spelling.
   }

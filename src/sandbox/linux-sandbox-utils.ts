@@ -1,5 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
+import { realPathOf } from '../utils/real-path.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
@@ -174,7 +175,7 @@ function resolveSymlinkedDenyPath(targetPath: string): string | null {
   let current = targetPath
   for (let i = 0; i < MAX_SYMLINK_RESOLUTION_DEPTH; i++) {
     try {
-      return fs.realpathSync(current)
+      return realPathOf(current)
     } catch {
       // Some component is missing or dangling — canonicalize manually below.
     }
@@ -192,7 +193,7 @@ function resolveSymlinkedDenyPath(targetPath: string): string | null {
       remainder.unshift(path.basename(ancestor))
       ancestor = parent
       try {
-        resolvedAncestor = fs.realpathSync(ancestor)
+        resolvedAncestor = realPathOf(ancestor)
       } catch {
         // Keep walking up.
       }
@@ -359,7 +360,7 @@ export function unreadableDirectories(
           if (
             !stat.isDirectory() ||
             stat.uid !== process.getuid?.() ||
-            fs.realpathSync(dir) !== dir
+            realPathOf(dir) !== dir
           ) {
             break
           }
@@ -1940,7 +1941,7 @@ async function generateFilesystemArgs(
     let canonical = canonicalFormCache.get(p)
     if (canonical === undefined) {
       try {
-        canonical = retryingTransient(() => fs.realpathSync(p))
+        canonical = retryingTransient(() => realPathOf(p))
       } catch (err) {
         canonical = p // vanished or unresolvable: the recorded form stands
         canonicalFormUnresolved.add(p)
@@ -2232,7 +2233,7 @@ async function generateFilesystemArgs(
       // bwrap follows symlinks, so --bind on a symlink makes the target writable
       // This could unexpectedly expose paths the user didn't intend to allow
       try {
-        const resolvedPath = fs.realpathSync(normalizedPath)
+        const resolvedPath = realPathOf(normalizedPath)
         // Trim trailing slashes before comparing: realpathSync never returns
         // a trailing slash, but normalizedPath may have one, which would cause
         // a false mismatch and incorrectly treat the path as a symlink.

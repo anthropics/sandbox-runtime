@@ -196,7 +196,7 @@ describe('expandGlobPattern', () => {
       const bsDir = join(RAW_TEST_DIR, 'app\\creds')
       mkdirSync(bsDir, { recursive: true })
       writeFileSync(join(bsDir, 'key.pem'), 'k')
-      const realBsDir = realPath(bsDir)
+      const realBsDir = join(TEST_DIR, 'app\\creds')
 
       const results = expandGlobPattern(join(bsDir, '*.pem'))
       expect(results).toContain(join(realBsDir, 'key.pem'))
@@ -1487,6 +1487,18 @@ describe.if(!isWindows)('a walk over listings that give no types', () => {
       expect(lstatsIn(asked)).toEqual(everyEntry)
     })
   }
+
+  it('leaves a directory with a backslash in its name to be denied whole when lstat fails', () => {
+    const named = join(data, 'na\\me')
+    mkdirSync(named)
+    try {
+      const { walks } = walked(['**/.env'], { lstatSync: 'EIO' })
+
+      expect(walks[0]!.unlisted).toEqual([named])
+    } finally {
+      rmSync(named, { recursive: true })
+    }
+  })
 
   it('asks once for all the patterns handed the same listings', () => {
     const patterns = ['**/.env', '**/*.txt', '**/deep/**']

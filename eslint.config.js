@@ -153,5 +153,19 @@ export default [
       ],
     },
   },
+  {
+    // Runtimes differ in what realpathSync does with a backslash in a name.
+    files: ['src/**/*.ts'],
+    ignores: ['src/utils/real-path.ts'],
+    rules: {
+      'no-restricted-properties': [
+        'error',
+        ...['realpathSync', 'realpath'].map(property => ({
+          property,
+          message: 'Ask realPathOf (src/utils/real-path.ts) instead.',
+        })),
+      ],
+    },
+  },
   prettierRecommended,
 ]
