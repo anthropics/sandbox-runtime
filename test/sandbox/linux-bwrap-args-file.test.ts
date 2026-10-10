@@ -151,6 +151,36 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     return thrown
   }
 
+  // `count` of what the mandatory-deny scan takes for a repository, directly
+  // inside the working directory.
+  function repositories(count: number): string[] {
+    return Array.from({ length: count }, (_, i) => {
+      const repository = join(BASE, `repo-${i}`)
+      mkdirSync(join(repository, '.git', 'hooks'), { recursive: true })
+      writeFileSync(join(repository, '.git', 'config'), '')
+      writeFileSync(join(repository, '.git', 'HEAD'), '')
+      return repository
+    })
+  }
+
+  // The two shares a refusal for too many arguments states.
+  function sharesIn(error: LinuxSandboxProfileError): {
+    total: number
+    mandatory: number
+  } {
+    expect(error.code).toBe('too_many_arguments')
+    const said = error.message.match(
+      /\. (\d+) of its arguments are built-in write protection, .*\. The other (\d+) are what the configuration expands to: /,
+    )
+    if (!said) {
+      throw new Error(`no shares in: ${error.message}`)
+    }
+    return {
+      total: Number(said[1]) + Number(said[2]),
+      mandatory: Number(said[1]),
+    }
+  }
+
   function argsPathOf(wrapped: string): string {
     const rendered = wrapped.match(VIA_ARGS_FILE)
     expect(rendered).not.toBeNull()
@@ -336,6 +366,58 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     expect(error.message).toMatch(
       /and, passed through a file, would exceed the 9000 arguments bwrap accepts/,
     )
+    expect(sharesIn(error).total).toBe(target)
+  })
+
+  it('tells the arguments of the mandatory denies from those of the configuration', async () => {
+    // The variables carry every profile here past the cap.
+    const shares = async (
+      opts: Parameters<typeof wrap>[1] = {},
+      variables = 4500,
+    ) => {
+      const error = await refused(
+        wrap([], {
+          allowOnly: [BASE],
+          unsetEnvVars: envVarNames(variables),
+          ...opts,
+        }),
+      )
+      const said = sharesIn(error)
+      expect(error.message).toContain(`has ${said.total} bwrap arguments`)
+      return said
+    }
+
+    const none = await shares()
+    const [first, second] = repositories(10)
+    // Hooks, config, and a pin on each of the two directories above them.
+    const ten = await shares()
+    expect(ten).toEqual({
+      total: none.total + 10 * 12,
+      mandatory: none.mandatory + 10 * 12,
+    })
+
+    // What the configuration adds is not theirs: two words a variable, and a
+    // bind and a pin for a write deny of its own.
+    expect(await shares({}, 4600)).toEqual({
+      total: ten.total + 200,
+      mandatory: ten.mandatory,
+    })
+    mkdirSync(join(BASE, 'own'))
+    writeFileSync(join(BASE, 'own', 'file'), '')
+    expect(
+      await shares({ denyWithinAllow: [join(BASE, 'own', 'file')] }),
+    ).toEqual({ total: ten.total + 6, mandatory: ten.mandatory })
+
+    // Each thing the refusal advises lowers their share.
+    expect((await shares({ allowOnly: [first!, second!] })).mandatory).toBe(
+      // A write root is no pin.
+      2 * 9,
+    )
+    expect((await shares({ mandatoryDenySearchDepth: 2 })).mandatory).toBe(
+      none.mandatory,
+    )
+    process.chdir(first!)
+    expect((await shares()).mandatory).toBeLessThan(ten.mandatory)
   })
 
   it('refuses a mount path with a NUL byte whether or not the profile fits the command line', async () => {

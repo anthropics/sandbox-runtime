@@ -93,6 +93,20 @@ export function pathSpellings(candidatePath: string): string[] {
   return [candidatePath]
 }
 
+/**
+ * Where the name `p` lives: its parent directories as `canonicalOf` resolves
+ * them, its last component as written. An allowRead entry is read so: one
+ * that is a symlink names the link, and nothing the link points at.
+ */
+export function nameLocation(
+  p: string,
+  canonicalOf: (dir: string) => string,
+): string {
+  if (p === '/') return p
+  const parent = canonicalOf(path.dirname(p))
+  return `${parent === '/' ? '' : parent}/${path.basename(p)}`
+}
+
 /** `process.cwd()`, or undefined where that throws: it has been removed. */
 export function workingDirectory(): string | undefined {
   try {
@@ -1196,10 +1210,13 @@ export interface ExpandGlobOptions {
   anchor?: string
 }
 
-/** What listing a real directory gave, its entries or the error that has it
- *  denied whole: a second position, or a second pattern, reads the same
- *  answer. */
-export type GlobWalkListings = Map<string, fs.Dirent[] | Error>
+/** What the walk reads of a listed entry. */
+type GlobWalkEntry = Pick<fs.Dirent, 'name' | 'isDirectory' | 'isSymbolicLink'>
+
+/** What listing a real directory gave, its entries with their types or the
+ *  error that has it denied whole: a second position, or a second pattern,
+ *  reads the same answer. */
+export type GlobWalkListings = Map<string, GlobWalkEntry[] | Error>
 
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
@@ -1265,9 +1282,9 @@ export interface GlobWalk {
    *  expansion must cover such a link rather than drop it. */
   uninspectableLinks: Set<string>
   /** Directories the walk could not list (any error but absence) under a
-   *  name it reached them by, each named once. What the pattern matches
-   *  beneath one can be missing from `matches`; a deny expansion must cover
-   *  them whole. */
+   *  name it reached them by, each named once, and entries that may be one
+   *  for all it could learn. What the pattern matches beneath one can be
+   *  missing from `matches`; a deny expansion must cover them whole. */
   unlisted: string[]
   /** Where an entry of `matches`, `directoryMatches` or `unlisted` really
    *  lives, for each one that is a symlink or is spelled through one above
@@ -1808,6 +1825,64 @@ export function* walkGlobPatternSteps(
     linkTargets.set(realLinkPath, target)
     return target
   }
+  /** An entry of the directory `real`, listed under the name `listedAs`, with
+   *  its type. Some file systems list names without one (some NFS and FUSE
+   *  mounts, XFS with ftype=0). Every `is…()` of such an entry answers false,
+   *  and taken at its word a directory would be passed over with all the
+   *  pattern matches beneath it. So it is asked for, at the cost of one call;
+   *  an entry that was listed with a type costs none. */
+  const withType = (
+    entry: fs.Dirent,
+    listedAs: string,
+    real: string,
+  ): GlobWalkEntry => {
+    if (
+      entry.isFile() ||
+      entry.isDirectory() ||
+      entry.isSymbolicLink() ||
+      entry.isFIFO() ||
+      entry.isSocket() ||
+      entry.isCharacterDevice() ||
+      entry.isBlockDevice()
+    ) {
+      return entry
+    }
+    const { name } = entry
+    const spelled = path.join(listedAs, name)
+    let type: 'directory' | 'link' | 'other' = 'other'
+    try {
+      const stats = fs.lstatSync(spelled)
+      if (stats.isDirectory()) type = 'directory'
+      else if (stats.isSymbolicLink()) type = 'link'
+    } catch {
+      try {
+        // Where it leads can still tell: only a link leads away from its place.
+        const isDirectory = fs.statSync(spelled).isDirectory()
+        if (fs.realpathSync(spelled) !== path.join(real, name)) type = 'link'
+        else if (isDirectory) type = 'directory'
+      } catch (err) {
+        // Only links make a circle. One that is not there is gone since it was
+        // listed, which leaves its name to be matched: kept, that denies no
+        // less than a listing made a moment later. Any other may be a
+        // directory, and is taken for one whose listing has failed: it is not
+        // gone into, and is denied whole where the pattern reaches beneath it.
+        const code = (err as NodeJS.ErrnoException | undefined)?.code
+        if (code === 'ELOOP') type = 'link'
+        else if (code !== 'ENOENT') {
+          type = 'directory'
+          listings.set(
+            path.join(real, name),
+            err instanceof Error ? err : new Error(String(err)),
+          )
+        }
+      }
+    }
+    return {
+      name,
+      isDirectory: () => type === 'directory',
+      isSymbolicLink: () => type === 'link',
+    }
+  }
 
   // The base as the filesystem is asked about it: a drive root gets back its
   // separator, since 'C:' on its own names the drive's current directory.
@@ -1847,7 +1922,7 @@ export function* walkGlobPatternSteps(
       walk.unlisted.push(dir)
       if (real !== dir) walk.realOf.set(dir, real)
     }
-    let entries: fs.Dirent[]
+    let entries: GlobWalkEntry[]
     try {
       const known = listings.get(real)
       if (known instanceof Error) throw known
@@ -1856,7 +1931,10 @@ export function* walkGlobPatternSteps(
         onRealPath(
           real,
           frame.short,
-          p => fs.readdirSync(p, { withFileTypes: true }),
+          p =>
+            fs
+              .readdirSync(p, { withFileTypes: true })
+              .map(entry => withType(entry, p, real)),
           err => codeOf(err) === 'ENOENT',
           denyWhole,
         )

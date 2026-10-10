@@ -28,6 +28,16 @@ export interface FsReadRestrictionConfig {
   literalDenyOnly?: string[]
   literalAllowWithinDeny?: string[]
   /**
+   * The `denyOnly` entries that come from `credentials.files`. Their only
+   * exceptions are the `ownAllowWithinDeny` paths. Absent when there are none.
+   */
+  credentialDenyOnly?: string[]
+  /**
+   * The `allowWithinDeny` entries the library adds for files of its own that
+   * a command is pointed at. Absent when there are none.
+   */
+  ownAllowWithinDeny?: string[]
+  /**
    * The `denyOnly` entries that stand for a directory a glob expansion could
    * not list. Nothing is bound back beneath one — neither an
    * `allowWithinDeny` path nor an allowed write path — because what the
