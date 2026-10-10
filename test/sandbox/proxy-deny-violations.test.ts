@@ -137,6 +137,48 @@ describe('HTTP proxy threads encodedCommand from Basic auth to filter()', () => 
     expect(seen).toEqual([enc])
   })
 
+  it('answers a refused CONNECT with the reason filter() gave as the status phrase: cleaned and cut as a violation line is, and ASCII', async () => {
+    const cases: Array<[unknown, string]> = [
+      ['use an https:// remote', 'use an https:// remote'],
+      [
+        'a\r\nX-Injected: 1\r\n\r\nb\x00\x1b[31m\x7f\x9fc',
+        'a X-Injected: 1 b [31m c',
+      ],
+      // What a violation line is cleaned of besides the controls.
+      ['a\u2028b\u2029c\u202ed\u200be\u{e0041}f <g>', 'a b c d e f g'],
+      ['x'.repeat(501), 'x'.repeat(500)],
+      // Cut between characters, not inside one.
+      ['x'.repeat(499) + '\u{1f600}', 'x'.repeat(499)],
+      ['caf\u00e9 \u2014 \u{1f600}!', 'caf? ? ?!'],
+      // From a caller no type binds.
+      [Object, 'function Object() { [native code] }'],
+      [undefined, 'Forbidden'],
+    ]
+    const reasons = cases.map(([reason]) => reason)
+    proxy = createHttpProxyServer({
+      filter: (_port, _host, _socket, _encodedCommand, explain) => {
+        const reason = reasons.shift()
+        if (reason !== undefined) explain?.(reason as string)
+        return false
+      },
+      proxyAuthToken: 'sekrit',
+      denyHeader: 'X-Deny',
+    })
+    proxy.listen(0, '127.0.0.1')
+    await once(proxy, 'listening')
+    const port = (proxy.address() as { port: number }).port
+
+    for (const [, phrase] of cases) {
+      expect(await sendConnect(port, 'srt', 'sekrit', 'blocked.test:22')).toBe(
+        `HTTP/1.1 403 ${phrase}\r\n` +
+          'Content-Type: text/plain\r\n' +
+          'X-Deny: host_not_allowed\r\n' +
+          '\r\n' +
+          'Connection blocked by network allowlist',
+      )
+    }
+  })
+
   it('still authenticates and passes undefined for bare "srt"', async () => {
     const TOKEN = 'sekrit'
     const seen: Array<string | undefined> = []

@@ -857,10 +857,27 @@ export function generateProxyEnvVars(
     // configured ControlPath.
     const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
-    if (platform === 'macos') {
-      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
-      // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
-      // handshake — use git-over-https (HTTP_PROXY carries the credential).
+    if (
+      platform === 'macos' &&
+      proxyAuthToken &&
+      httpProxyPort === socksProxyPort
+    ) {
+      // macOS, and the SOCKS listener is the library's own, which serves both
+      // protocols on one port and wants the token: BSD nc has no SOCKS
+      // authentication to give it, and is refused. So an HTTP CONNECT with
+      // the credential, as on Linux, from what macOS ships. The script
+      // travels in a variable of its own: that keeps the token out of the
+      // arguments of ssh and of what it starts, and the script out of git's
+      // `sh -c`, ssh's % expansion and `$SHELL -c` (the user's shell, be it
+      // fish or tcsh), which see plain and single-quoted words only.
+      const basic = Buffer.from(`${userRaw}:${proxyAuthToken}`)
+      envVars.push(
+        `SRT_SSH_PROXY_COMMAND=${sshConnectScript(socksProxyPort, basic.toString('base64'))}`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand="/bin/sh -c 'eval \\"\\\${SRT_SSH_PROXY_COMMAND:?unset, but GIT_SSH_COMMAND needs it}\\"' sh '%h' %p"`,
+      )
+    } else if (platform === 'macos') {
+      // A SOCKS listener that wants no token of ours, an external one
+      // included: BSD nc's SOCKS5 support (-X 5 -x).
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )
@@ -926,6 +943,43 @@ export function generateProxyEnvVars(
   // already carries the route for clients that read it.
 
   return envVars
+}
+
+/**
+ * A POSIX sh script for an ssh ProxyCommand (`$1` host, `$2` port): an HTTP
+ * CONNECT through the proxy on 127.0.0.1:`proxyPort` with the Basic
+ * credential `basic`, then stdin and stdout relayed by `nc`.
+ *
+ * The host comes from a git URL, which a repository chooses. It is never
+ * script text or printf's format, and one that could end the request line is
+ * refused before anything is sent.
+ *
+ * The response head is read here, so a refusal is one line on stderr, with
+ * the status line's own words. The pipeline runs in the background (hence
+ * stdin as fd 3) so that this shell can close its own copy of stdout: held,
+ * it would keep an end of file from ssh.
+ *
+ * `nc` is the one macOS ships, by path: it leaves when the network side
+ * ends, which is how ssh learns of it. Current OpenBSD and Debian ones stay
+ * until their stdin ends too, and ssh would wait.
+ */
+export function sshConnectScript(
+  proxyPort: number,
+  basic: string,
+  nc = '/usr/bin/nc',
+): string {
+  return (
+    'LC_ALL=C; no() { printf "sandbox proxy: %s\\n" "$*" >&2; exit 1; }; ' +
+    'case $1 in ""|*[!A-Za-z0-9._:-]*) no bad host;; *:*) set -- "[$1]" "$2";; esac; ' +
+    'case $2 in ""|*[!0-9]*) no bad port;; esac; ' +
+    'exec 3<&0; ' +
+    `{ printf "CONNECT %s HTTP/1.1\\r\\nHost: %s\\r\\nProxy-Authorization: Basic ${basic}\\r\\n\\r\\n" "$1:$2" "$1:$2"; exec /bin/cat <&3; } | ` +
+    `${nc} 127.0.0.1 ${proxyPort} | ` +
+    '{ read -r v why; while read -r v; do case $v in ""|?) break;; esac; done; ' +
+    'case $why in "200 "*) exec /bin/cat;; esac; ' +
+    'why=${why%?}; no "$1:$2: ${why:-no answer}"; } & ' +
+    'exec >&-; wait $!'
+  )
 }
 
 /**
