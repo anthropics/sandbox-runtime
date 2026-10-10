@@ -218,6 +218,24 @@ describe.if(isLinux || isMacOS)(
       // A per-call allowRead of the directory keeps its write allow.
       expect(grantsWrite(reopened, join(fakeHome, NPM_LOGS))).toBe(true)
     })
+
+    it.if(isLinux)('is covered by a denyWrite entry above it', () => {
+      mkdirSync(join(fakeHome, NPM_LOGS), { recursive: true })
+      const wrapped = runWithHome(
+        fakeHome,
+        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+       console.log(JSON.stringify(await SandboxManager.wrapWithSandbox('true', undefined, {
+         filesystem: { denyRead: [], allowWrite: [], denyWrite: ['~/.npm'] },
+       })))`,
+      ) as string
+
+      const npm = join(fakeHome, '.npm')
+      expect(grantsWrite(wrapped, join(fakeHome, NPM_LOGS))).toBe(true)
+      expect(wrapped.indexOf(`--ro-bind ${npm} ${npm}`)).toBeGreaterThan(
+        wrapped.indexOf(`--bind ${npm}/_logs ${npm}/_logs`),
+      )
+      expect(wrapped).not.toContain(`--ro-bind ${fakeHome}/.claude`)
+    })
   },
 )
 
