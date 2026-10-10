@@ -963,6 +963,10 @@ function renderBwrapInvocation(
 // the deny rule stops applying inside it.
 let activeSandboxCount = 0
 
+// Forced cleanups so far. One zeroes the count under a wrap still in flight,
+// which from then on has nothing in it to give back.
+let forcedCleanups = 0
+
 let exitHandlerRegistered = false
 
 /**
@@ -1016,9 +1020,13 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     }
   } else {
     activeSandboxCount = 0
+    forcedCleanups++
   }
 
-  for (const mountPoint of bwrapMountPoints) {
+  // Deepest first: a sandbox wrapped while another's directory mount point is
+  // there gets its own inside it, and a directory goes only when it is empty.
+  const deepestFirst = [...bwrapMountPoints].sort((a, b) => b.length - a.length)
+  for (const mountPoint of deepestFirst) {
     try {
       // Only remove if it's still the empty file/directory bwrap created.
       // If something else has written real content, leave it alone.
@@ -1187,9 +1195,12 @@ export function checkLinuxDependencies(
 export const OLDEST_FULLY_SUPPORTED_BWRAP_VERSION = '0.5.0'
 
 // Keyed by path, so a caller that passes an explicit bwrapPath is not
-// answered for another binary. Only an answer is kept: after a probe that
-// failed or timed out, the next call asks again.
-const bwrapVersions = new Map<string, string>()
+// answered for another binary. A probe that got no answer is kept too, as
+// null: it can block for the whole timeout, and callers ask several times
+// during one start-up.
+// INVARIANT: the version decides a warning and nothing else. No mount plan may
+// rest on it: one slow start would then decide for the life of the process.
+const bwrapVersions = new Map<string, string | null>()
 
 /** The version `bwrap --version` reports, or null when it could not be asked. */
 function probeBwrapVersion(bwrap: string): string | null {
@@ -1205,7 +1216,7 @@ function probeBwrapVersion(bwrap: string): string | null {
     probe.error === undefined && probe.status === 0
       ? (/\d+(?:\.\d+)*/.exec(probe.stdout ?? '')?.[0] ?? null)
       : null
-  if (version !== null) bwrapVersions.set(bwrap, version)
+  bwrapVersions.set(bwrap, version)
   return version
 }
 
@@ -3307,6 +3318,7 @@ export async function wrapCommandWithSandboxLinux(
   // spawned command exits. If wrapping fails below, the catch block
   // decrements so the count does not leak.
   activeSandboxCount++
+  const countedAfter = forcedCleanups
 
   // One encoded key for both carriers below (SRT_ENCODED_CMD for the seccomp
   // observer, the proxy username for network denies), so a violation seen
@@ -3597,13 +3609,17 @@ export async function wrapCommandWithSandboxLinux(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
     )
 
+    // INVARIANT: a wrap that hands out a command is in the count when it does,
+    // whatever a forced cleanup did meanwhile: its caller gives one back.
+    if (forcedCleanups !== countedAfter) activeSandboxCount++
     return wrappedCommand
   } catch (error) {
     // Undo the activeSandboxCount increment — the caller won't call
-    // cleanupBwrapMountPoints() for a wrap that threw.
-    if (activeSandboxCount > 0) {
-      activeSandboxCount--
-    }
+    // cleanupBwrapMountPoints() for a wrap that threw. A command that ended
+    // meanwhile deferred its removal to this wrap, so it runs here. After a
+    // forced cleanup the count is of other sandboxes only: one taken from it
+    // has their mount points removed while they run.
+    if (forcedCleanups === countedAfter) cleanupBwrapMountPoints()
     throw error
   }
 }

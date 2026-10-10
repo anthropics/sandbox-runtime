@@ -33,6 +33,7 @@ import {
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
+  disposeMitmCASync,
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
@@ -233,7 +234,26 @@ function registerCleanup(): void {
         level: 'error',
       })
     })
-  process.once('exit', cleanupHandler)
+  process.once('exit', () => {
+    void cleanupHandler()
+    // On 'exit' reset() gets as far as its first await, so what it takes out
+    // of the temp directory later than that goes here. After it, because on
+    // Windows it starts by revoking a grant on the trust-bundle directory.
+    // Only paths this process made and still holds: never a listing of the
+    // temp directory, never a path out of the configuration.
+    if (mitmCA) disposeMitmCASync(mitmCA)
+    muxProxyServer?.removeBackendSocketSync()
+    maskedFileStore.dispose()
+    // A bridge told to end removes its own socket, but not every time.
+    const bridge = managerContext?.linuxBridge
+    for (const path of [bridge?.httpSocketPath, bridge?.socksSocketPath]) {
+      try {
+        if (path) fs.rmSync(path, { force: true })
+      } catch {
+        // Best effort: an 'exit' handler must not throw.
+      }
+    }
+  })
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
   cleanupRegistered = true
@@ -458,14 +478,23 @@ function denialReasonOf(answer: unknown): string | undefined {
   return sanitizeDenialReason(reason) || undefined
 }
 
+/** Own keys only: an entry can be spelled `constructor`. */
+function deniedDomainReason(entry: string): string {
+  const reasons = config?.network.deniedDomainReasons ?? {}
+  const own = Object.prototype.hasOwnProperty.call(reasons, entry)
+  return (own ? reasons[entry] : undefined) ?? 'host is on the deny list'
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
   sandboxAskCallback: SandboxAskCallback | undefined,
   encodedCommand?: string,
+  explain?: (reason: string) => void,
 ): Promise<boolean> {
   const denied = (reason: string): false => {
     recordOutboundDeny(host, port, reason, encodedCommand)
+    explain?.(reason)
     return false
   }
 
@@ -499,10 +528,7 @@ async function filterNetworkRequest(
       // The matched entry's own reason when the caller supplied one, so the
       // model reads why this destination is off-limits (and the sanctioned
       // alternative) instead of a generic deny; keyed by the exact entry.
-      return denied(
-        config.network.deniedDomainReasons?.[deniedDomain] ??
-          'host is on the deny list',
-      )
+      return denied(deniedDomainReason(deniedDomain))
     }
   }
 
@@ -702,8 +728,14 @@ async function startMuxProxyServer(
   const injectCredentials = buildCredentialInjector()
   const injectBodyCredentials = buildBodyCredentialInjector()
   httpProxyServer = createHttpProxyServer({
-    filter: (port, host, _socket, encodedCommand) =>
-      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
+    filter: (port, host, _socket, encodedCommand, explain) =>
+      filterNetworkRequest(
+        port,
+        host,
+        sandboxAskCallback,
+        encodedCommand,
+        explain,
+      ),
     getMitmSocketPath,
     mitmCA,
     shouldTerminateTLS: shouldTerminateTLSForHost,
@@ -762,9 +794,7 @@ async function startMuxProxyServer(
       const canonical = canonicalizeHost(host) ?? host
       for (const entry of config.network.deniedDomains) {
         if (matchesDomainPatternWithPort(canonical, port, entry)) {
-          const reason =
-            config.network.deniedDomainReasons?.[entry] ??
-            'host is on the deny list'
+          const reason = deniedDomainReason(entry)
           recordOutboundDeny(host, port, reason)
           return { deniedReason: reason }
         }
@@ -807,6 +837,22 @@ async function initialize(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
+): Promise<void> {
+  try {
+    await initializeSteps(runtimeConfig, sandboxAskCallback, enableLogMonitor)
+  } catch (error) {
+    // Here, not at reset() or 'exit': a step can fail before the clean-up is
+    // registered, and the next call makes a CA of its own.
+    if (mitmCA) disposeMitmCASync(mitmCA)
+    mitmCA = undefined
+    throw error
+  }
+}
+
+async function initializeSteps(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  enableLogMonitor: boolean,
 ): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
@@ -1900,6 +1946,47 @@ const RESTARTS_IN_TURNS = 2
 /** In place of what a walk finds: the configuration was replaced under it. */
 const REPLACED = Symbol('replaced')
 
+/** Whether a wrap is walking, and the ones waiting to, first come first. */
+let walking = false
+const waitingToWalk: (() => void)[] = []
+
+/**
+ * Resolves once no other wrap is walking, with what says that this one's walk
+ * has ended; only the first call of it counts. Walks that take turns on one
+ * thread end no sooner for it, while each keeps all it has listed until it
+ * ends and has its turn before the event loop gets one: the memory and the
+ * thread held would both grow with the wraps in flight.
+ * Rejects with `signal`'s reason as soon as that is aborted during the wait.
+ * Nothing else takes a wrap out of the line, reset() included.
+ */
+async function waitToWalk(signal?: AbortSignal): Promise<() => void> {
+  if (walking) {
+    signal?.throwIfAborted()
+    await new Promise<void>((resolve, reject) => {
+      const go = (): void => {
+        signal?.removeEventListener('abort', leave)
+        resolve()
+      }
+      const leave = (): void => {
+        waitingToWalk.splice(waitingToWalk.indexOf(go), 1)
+        reject(signal?.reason)
+      }
+      waitingToWalk.push(go)
+      signal?.addEventListener('abort', leave, { once: true })
+    })
+  }
+  walking = true
+  let ended = false
+  return () => {
+    if (ended) return
+    ended = true
+    // Handed on while `walking` stays set, so that no newcomer gets in first.
+    const next = waitingToWalk.shift()
+    if (next) next()
+    else walking = false
+  }
+}
+
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
@@ -1926,6 +2013,35 @@ async function wrapWithSandboxAgain(
   abortSignal?: AbortSignal,
   options?: WrapWithSandboxOptions,
 ): Promise<string> {
+  // INVARIANT: an attempt waits before it reads anything, so that it goes by
+  // the configuration, the working directory and the disk it finds afterwards.
+  const walkEnded = await waitToWalk(abortSignal)
+  try {
+    return await wrapWithSandboxOnce(
+      walkEnded,
+      restarts,
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
+  } finally {
+    walkEnded()
+  }
+}
+
+/** One attempt of {@link wrapWithSandboxAgain}, which calls `walkEnded` once
+ *  it walks no more. */
+async function wrapWithSandboxOnce(
+  walkEnded: () => void,
+  restarts: number,
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
   const platform = getPlatform()
   const commandId = options?.commandId
   registerCommandText(command, options)
@@ -1936,8 +2052,10 @@ async function wrapWithSandboxAgain(
     config !== startedWith ||
     configInstalls !== startedAt ||
     workingDirectory() !== startedIn
-  const startOver = (): Promise<string> =>
-    wrapWithSandboxAgain(
+  const startOver = (): Promise<string> => {
+    // The next attempt waits like any other wrap, behind the ones there are.
+    walkEnded()
+    return wrapWithSandboxAgain(
       restarts + 1,
       command,
       binShell,
@@ -1945,6 +2063,7 @@ async function wrapWithSandboxAgain(
       abortSignal,
       options,
     )
+  }
   /** `steps`, left as soon as the host is seen to have moved on: what they
    *  would go on to find is for a wrap that starts over anyway. */
   function* whileCurrent<T>(steps: Steps<T>): Steps<T | typeof REPLACED> {
@@ -2083,6 +2202,9 @@ async function wrapWithSandboxAgain(
           ),
       ),
     )
+    // Emptied by hand: a runtime may keep what this function has named for as
+    // long as it is suspended, which is until the scan below has ended.
+    listings.clear()
     if (expandedDenyRead === REPLACED) return startOver()
     readConfig = {
       ...expandedDenyRead,
@@ -2095,6 +2217,8 @@ async function wrapWithSandboxAgain(
       ),
     }
   }
+  // Nothing below walks, and what it waits for is not this thread.
+  walkEnded()
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:

@@ -188,16 +188,39 @@ exist.
 
 `--control-fd <fd>` reads config updates from a descriptor the caller has
 already opened, one JSON object per line in the same shape as the settings
-file. Each line replaces the whole config, but only the network lists
-(`allowedDomains` / `deniedDomains`) change what is already running: the
-proxy consults them per request. Filesystem rules are compiled into the
-sandbox at wrap time, so a line that changes them applies to nothing in the
-current run.
+file. Each line replaces the whole config and is validated against the same
+schema, so a line is a complete config rather than a patch: `network` and
+`filesystem` are required, and a key the line leaves out goes back to its
+default.
 
 ```bash
 # fd 3 is the read end of a pipe the caller writes lines to
 srt --control-fd 3 -- npm test
 ```
+
+What an accepted line changes once the command is running:
+
+- The network lists — `network.allowedDomains`, `deniedDomains` (with
+  `deniedDomainReasons`) and `deniedResolvedAddresses` — take effect on the
+  next connection, on every platform: the proxy consults them per request,
+  and the resolved-address check is rebuilt from the same line. So do
+  `network.mitmProxy` and `network.tlsTerminate.excludeDomains`, which it
+  reads per request too.
+- `credentials.sigv4` takes effect on the next request, provided srt
+  started with a `credentials` block: the signing hook is installed only
+  then, and reads the policies per request rather than capturing them.
+- Nothing else changes. The filesystem rules are already in the seatbelt
+  profile, the bubblewrap argv or the Windows ACEs, the credential masks
+  were built when the command was wrapped, and the running proxy servers
+  captured `network.parentProxy`, and whether TLS is terminated at all,
+  when they started.
+- On Windows, srt notices a line whose file-access set (`filesystem.*`
+  together with `credentials.files`) differs from the one applied at
+  startup, and says so only under `SRT_DEBUG`: the ACL grant is
+  session-wide, so the set applied at startup stays in force. The rest of
+  the line is applied as above.
+
+How srt reads the channel, and what it refuses:
 
 - The descriptor must be an integer **3 or above** and readable — `0`-`2`
   are the standard streams. srt exits with an error instead of running the
@@ -207,7 +230,16 @@ srt --control-fd 3 -- npm test
   after says so and leaves the command running under the config last
   applied.
 - A line that is not a valid config is reported on stderr and dropped; the
-  previous config stays in force.
+  previous config stays in force. The line itself goes to the debug log
+  rather than to the terminal, and a blank line is ignored silently.
+- srt starts reading only once the sandbox is up, so an update written
+  before then waits in the channel rather than being lost — and cannot be
+  overwritten by the config the sandbox starts with. Such a line may be read
+  while the command is still being wrapped, and is then the config it is
+  wrapped with, filesystem rules included. Whether it is read that early
+  depends on how long the wrap takes (on Linux, a deny glob over a large
+  tree is long enough), so a rule the command must start under belongs in
+  the settings file.
 - srt **exits with the wrapped command** and does not wait for the writer
   to close the descriptor. End of input is not an error either: the
   command keeps running under the config last applied.
@@ -218,7 +250,9 @@ srt --control-fd 3 -- npm test
   its own blocking reads from then on.
 - On macOS and Linux the sandboxed command does not get the descriptor: srt
   points that slot at `/dev/null` for the command, so nothing inside the
-  sandbox can read the updates or write a config of its own.
+  sandbox can read the updates or write a config of its own. On Windows the
+  command is spawned with the three standard streams alone, so the control
+  descriptor is not among the descriptors it is handed.
 
 ### As a standalone proxy with an external decider: `srt proxy`
 
@@ -288,7 +322,7 @@ const annotated = SandboxManager.annotateStderrWithSandboxFailures(
 
 - `true` - allow the connection. Only the value `true` allows.
 - `false` - deny it. The violation line reports the generic reason `user denied`.
-- `{ allow: false, reason: '...' }` - deny it, and report `reason` in the violation line in place of the generic text, so that whoever reads the `<sandbox_violations>` block (a model included) learns why and what to do instead.
+- `{ allow: false, reason: '...' }` - deny it, and report `reason` in the violation line in place of the generic text, so that whoever reads the `<sandbox_violations>` block (a model included) learns why and what to do instead. The sandboxed client reads it too, as the status phrase of the `403` that answers its CONNECT.
 
 Any other answer denies, whether it is truthy or not, and reports the generic reason. That includes an object that carries a `reason` without saying `allow: false`, such as `{ allow: true, reason: '...' }`: its reason is not reported.
 
@@ -423,10 +457,10 @@ Uses an **allow-only pattern** - all network access is denied by default.
 - `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access. An optional `:port` suffix (`api.example.com:443`, `*.example.com:8443`) restricts an entry to that destination port; entries without a port match any port.
   - IPv6 literals must be bracketed, RFC 3986-style: `[::1]`, `[2001:db8::1]:443`. An unbracketed multi-colon entry is rejected as ambiguous (`2001:db8::1:443` is itself a valid address).
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains). Same `:port` suffix, and a bare `*` (or `*:22`) is accepted for deny-all.
-- `network.deniedDomainReasons` - Optional map from a `deniedDomains` entry (matched by exact string) to a model-facing reason that appears in the `<sandbox_violations>` line when that entry denies a connection — say what is blocked and the sanctioned alternative (e.g. `{"github.com:22": "SSH pushes to GitHub are blocked; use an https:// remote"}`). Entries without a reason report a generic one. For SSH destinations (port 22), the reason is also delivered in-band: an SSH client tunneled through a no-auth SOCKS ProxyCommand (e.g. BSD `nc -X 5`) receives a pre-key-exchange SSH disconnect whose description is the reason, which OpenSSH prints verbatim — keep such reasons under ~400 ASCII characters, imperative first, since OpenSSH truncates and escapes non-ASCII.
+- `network.deniedDomainReasons` - Optional map from a `deniedDomains` entry (matched by exact string) to a model-facing reason that appears in the `<sandbox_violations>` line when that entry denies a connection — say what is blocked and the sanctioned alternative (e.g. `{"github.com:22": "SSH pushes to GitHub are blocked; use an https:// remote"}`). Entries without a reason report a generic one. For SSH destinations (port 22), the reason is also delivered in-band: an SSH client tunneled through a no-auth SOCKS ProxyCommand (e.g. BSD `nc -X 5`) receives a pre-key-exchange SSH disconnect whose description is the reason, which OpenSSH prints verbatim — keep such reasons under ~400 ASCII characters, imperative first, since OpenSSH truncates and escapes non-ASCII. A client that does authenticate, as the `GIT_SSH_COMMAND` srt injects does, gets the reason on any port as the status phrase of the `403` that answers its CONNECT, which is what that command, and many an HTTP client, prints. There it is cleaned and cut as in the violation line, and every non-ASCII character becomes `?`, since clients disagree on how to read one in a status line.
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
 
-**Resolved-address check.** The allow/deny lists match by _name_, but whoever controls a permitted name's DNS (or any label under a permitted wildcard) controls what it resolves to. So before dialing an allowed **hostname** directly, the proxy resolves it once, drops any address in a denied set, and connects to a surviving address (the address that passed the check is the one dialed — there is no second lookup). If nothing survives, the connection is refused like any other policy denial: HTTP/CONNECT get `403` (`X-Proxy-Error: blocked-by-sandbox-runtime`, the reason in the body), SOCKS gets "connection not allowed by ruleset", and a `deny network-outbound host:port (resolved to a loopback address)` line — naming the class of address (loopback, link-local, this host's, cloud metadata, deny-listed, listed, …), not the address itself, which only the debug log carries — is recorded in the violation store.
+**Resolved-address check.** The allow/deny lists match by _name_, but whoever controls a permitted name's DNS (or any label under a permitted wildcard) controls what it resolves to. So before dialing an allowed **hostname** directly, the proxy resolves it once, drops any address in a denied set, and connects to a surviving address (the address that passed the check is the one dialed — there is no second lookup). If nothing survives, the connection is refused like any other policy denial: HTTP/CONNECT get `403` (`X-Proxy-Error: blocked-by-sandbox-runtime`, the reason in the body and, for a CONNECT, as the status phrase), SOCKS gets "connection not allowed by ruleset", and a `deny network-outbound host:port (resolved to a loopback address)` line — naming the class of address (loopback, link-local, this host's, cloud metadata, deny-listed, listed, …), not the address itself, which only the debug log carries — is recorded in the violation store.
 
 The denied set is: loopback (`127.0.0.0/8`, `::1`), unspecified (`0.0.0.0/8`, `::`), link-local (`169.254.0.0/16`, `fe80::/10`), multicast (`224.0.0.0/4`, `ff00::/8`), broadcast, the cloud instance-metadata / platform endpoints that live outside link-local (`100.100.100.200`, `168.63.129.16`, `192.0.0.192`, `fd00:ec2::/32`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`, `fd00:42::42`), every address currently assigned to one of this host's own network interfaces (a service bound to `0.0.0.0` answers on the LAN or global address exactly as it does on loopback), every IP literal listed in `deniedDomains` (honouring its `:port` if it has one), and anything in `deniedResolvedAddresses`. IPv4 entries also match the IPv6 forms that carry an IPv4 address — IPv4-mapped, IPv4-compatible and IPv4-translated addresses, the NAT64 well-known prefix (`64:ff9b::/96`) and 6to4 (`2002::/16`) are judged by the IPv4 address they embed. The local-use NAT64 prefix `64:ff9b:1::/48` and network-specific prefixes are not decoded — their layout (RFC 6052 allows the IPv4 in several positions) can't be recognised from the address alone; on such a network, list the prefix's translations of the ranges you deny (e.g. `<prefix>::a00:0/104` for `10.0.0.0/8`). Addresses that reach this host without being assigned to it — a cloud instance's 1:1-NAT public address, a router port-forward, a container or VM host-gateway alias — are not covered automatically; list them in `deniedResolvedAddresses`.
 
@@ -550,6 +584,13 @@ Examples:
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
 - `javaAgentJarPath` - macOS/Linux: absolute path to `srt-proxy-agent.jar`, the JVM agent injected via `JAVA_TOOL_OPTIONS` (see "JVM tools" under Network Isolation). Only needed by consumers that bundle sandbox-runtime and ship the jar separately; a normal npm install finds it under `vendor/java-proxy-agent/`.
 - `enableWeakerNetworkIsolation` - Allow access to `com.apple.trustd.agent` in the macOS sandbox (boolean, default: false). This is needed for Go programs (`gh`, `gcloud`, `terraform`, `kubectl`, etc.) to verify TLS certificates when using `httpProxyPort` with a MITM proxy and custom CA. **Security warning:** enabling this opens a potential data exfiltration vector through the trustd service.
+- `allowPty` - macOS only: allow pseudo-terminal operations (boolean, default: false). The seatbelt profile then carries `(allow pseudo-tty)` plus read, write and `ioctl` on `/dev/ptmx` and `/dev/ttys*`, which a command that allocates a pty of its own needs. Not read on Linux or Windows.
+- `bwrapPath` - Linux only: absolute path to the `bwrap` (bubblewrap) binary, used instead of resolving `bwrap` on `PATH`. A path that is not executable is a dependency error, and no `PATH` lookup is tried after it.
+- `socatPath` - Linux only: absolute path to the `socat` binary, used instead of resolving `socat` on `PATH`, with the same rule for a path that is not executable.
+- `seccomp` - Linux only: `applyPath` points at the `apply-seccomp` binary to use instead of the packaged one, which is still used when nothing exists at that path. `argv0` invokes it as a multicall binary that dispatches on the `ARGV0` environment variable; `applyPath` is then used verbatim (no existence check) and must resolve inside the bubblewrap namespace.
+- `ripgrep` - Linux only: how to invoke ripgrep for the deny-path scan (default: `{ "command": "rg" }`). `args` are passed before srt's own arguments, and `argv0` overrides `argv[0]` for a multicall binary.
+- `git.safeDirectories` - Directories git should treat as `safe.directory` inside the sandbox, where the working tree is owned by another user — the repository top level when the command runs from a subdirectory, say. Injected through `GIT_CONFIG_*` environment variables, and it grants no write access of its own.
+- `credentials` - Environment variables (`credentials.envVars`) and files (`credentials.files`) the sandboxed command must not read the real values of. `mode: "deny"` withholds the value; `mode: "mask"` puts a sentinel in its place inside the sandbox and has the proxy substitute the real value back on egress to the hosts that entry's `injectHosts` lists (default: `network.allowedDomains`). Masking requires `network.tlsTerminate`, so the real value only leaves over a verified TLS connection, unless `credentials.allowPlaintextInject` opts out. Files are masked on Linux only; macOS denies a masked file instead.
 - `allowAppleEvents` - Allow sending Apple Events and Launch Services open requests from the macOS sandbox (boolean, default: false). Without this, commands like `open`, `osascript`, and anything that opens URLs or scripts other apps via AppleScript fail with AppleScript error `-600` ("Application isn't running") or LaunchServices errors (`-10822`, `-54`). **Security warning:** enabling this means the sandbox no longer provides code-execution isolation. A sandboxed command can launch other applications via `open` with no user prompt, and anything it launches runs outside the sandbox's filesystem and network restrictions; scripting already-running apps via Apple Events is additionally gated by the user's per-app TCC automation consent. Embedders should only source this option from trusted user-level configuration — never from project-local files in a checked-out repository, which would let an attacker-authored project elevate its own sandbox permissions.
 
 ### Common Configuration Recipes
@@ -647,7 +688,7 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
 
-**Supported bubblewrap versions:** 0.4.0 and later, except that one thing needs 0.5.0 or newer, a change to how bubblewrap prepares the mount point for a file bind: a `denyRead` entry or credential mask naming a path that is not a regular file — a fifo, a socket, a device node — cannot be applied on an older bubblewrap, which creates a file at the destination instead of binding over what is there (that fails on a read-only mount and blocks on a fifo). `checkDependencies()` runs `bwrap --version` (keeping the answer for the life of the process) and returns a warning naming the version it found when bubblewrap is older than 0.5.0; it is a warning, not a refusal. CI runs the whole suite against the bubblewrap Ubuntu ships and against 0.12.0, and the Linux mount-plan suites against 0.4.1 as well.
+**Supported bubblewrap versions:** 0.4.0 and later, except that one thing needs 0.5.0 or newer, a change to how bubblewrap prepares the mount point for a file bind: a `denyRead` entry or credential mask naming a path that is not a regular file — a fifo, a socket, a device node — cannot be applied on an older bubblewrap, which creates a file at the destination instead of binding over what is there (that fails on a read-only mount and blocks on a fifo). `checkDependencies()` runs `bwrap --version` (once for each path of `bwrap`: the answer, or that there was none, is kept for the life of the process) and returns a warning naming the version it found when bubblewrap is older than 0.5.0; it is a warning, not a refusal. CI runs the whole suite against the bubblewrap Ubuntu ships and against 0.12.0, and the Linux mount-plan suites against 0.4.1 as well.
 
 **Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
 
@@ -797,6 +838,8 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 - **macOS**: The Seatbelt profile allows communication only to specific localhost ports where the proxies listen. All other network access is blocked.
 
 - **Windows**: A WFP `ALE_AUTH_CONNECT` filter blocks every outbound connect from the `srt-sandbox` account except loopback to the configured proxy port range. The proxies bind inside that range. Environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, …) point tools at the proxies, but the WFP filter is the boundary — a process that ignores or unsets them is still fenced.
+
+**git over SSH (macOS/Linux):** `ssh` reads no proxy variable, so srt sets `GIT_SSH_COMMAND` to an `ssh` whose `ProxyCommand` opens an HTTP CONNECT through the proxy and presents its token: `socat` on Linux, and on macOS a `/bin/sh` script around `/usr/bin/nc`, carried in `SRT_SSH_PROXY_COMMAND`, which keeps the token out of the arguments of `ssh` and of what it starts. (On macOS, a `socksProxyPort` or `httpProxyPort` of your own keeps `nc -X 5` to the SOCKS port.) The destination is held to `allowedDomains` / `deniedDomains` like any other: `github.com` admits port 22, `github.com:443` does not. On macOS a refusal is one line on stderr before ssh's own, with the proxy's reason: `sandbox proxy: github.com:22: 403 host is not on the allow list`. On Linux it is up to `socat`: 1.8.1 prints the reason, 1.8.0 nothing. What ssh needs to authenticate is a separate matter: its agent's socket has to be in `allowUnixSockets`, and its keys readable. An `ssh` that git does not start is not covered.
 
 **JVM tools (macOS/Linux):** the JVM ignores `HTTPS_PROXY`/`NO_PROXY` and has no environment variable for proxy credentials — proxy selection comes from the `https.proxyHost` system properties and the credential can only be supplied through `java.net.Authenticator`. So JVM-based tools (Bazel's gRPC remote cache, Gradle, Maven, …) would otherwise dial the target directly and fail, or reach the proxy without its token and get a 407. To close that gap srt injects a small `-javaagent` via `JAVA_TOOL_OPTIONS` (the env var carries only the jar path, the credential stays in `HTTPS_PROXY`). At JVM start the agent sets `http[s].proxyHost`/`Port` and `http.nonProxyHosts` from the proxy env vars, re-enables Basic auth for CONNECT tunnels, and installs an Authenticator for the proxy endpoint. Explicit `-D` proxy properties on the JVM command line still win, and any inherited `JAVA_TOOL_OPTIONS` is preserved (unless it is a denied credential env var). Every JVM prints a `Picked up JAVA_TOOL_OPTIONS: …` line to stderr as a result; a jlink'd runtime built without the `java.instrument` module cannot load agents and will refuse to start under the sandbox — unset `JAVA_TOOL_OPTIONS` in the command for such a tool. The jar ships in the npm package as `vendor/java-proxy-agent/srt-proxy-agent.jar` (source: `vendor/java-proxy-agent-src/`; built by the release workflow, or locally with `npm run build:java-agent` — needs a JDK ≥ 17). If it is not found, `JAVA_TOOL_OPTIONS` is left alone and JVMs behave as before; bundlers can point at their own copy with `javaAgentJarPath`.
 
