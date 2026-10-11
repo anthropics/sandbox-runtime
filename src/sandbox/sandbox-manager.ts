@@ -2297,7 +2297,8 @@ async function wrapWithSandboxOnce(
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
-        allowMachLookup: getAllowMachLookup(),
+        allowMachLookup:
+          customConfig?.network?.allowMachLookup ?? getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),

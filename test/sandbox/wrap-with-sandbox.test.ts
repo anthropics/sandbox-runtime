@@ -169,6 +169,51 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
   })
 })
 
+// Profile generation only: do not initialize proxies or execute the wrapped command.
+describe.if(isMacOS)('wrapWithSandbox Mach lookup overrides', () => {
+  const sessionService = 'com.example.srt.session'
+  const invocationService = 'com.example.srt.invocation'
+
+  beforeAll(() => {
+    SandboxManager.updateConfig({
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowMachLookup: [sessionService],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+  })
+
+  it.each<{ name: string; allowMachLookup: string[] | undefined }>([
+    { name: 'omitted', allowMachLookup: undefined },
+    { name: 'replaced', allowMachLookup: [invocationService] },
+    { name: 'cleared', allowMachLookup: [] },
+  ])('uses the expected Mach list when $name', async ({ allowMachLookup }) => {
+    const sessionConfig = structuredClone(SandboxManager.getConfig())
+    const wrapped = await SandboxManager.wrapWithSandbox('true', undefined, {
+      network: { allowedDomains: [], deniedDomains: [], allowMachLookup },
+    })
+    const expected = allowMachLookup ?? [sessionService]
+    for (const service of [sessionService, invocationService]) {
+      const rule = `(allow mach-lookup (global-name "${service}"))`
+      if (expected.includes(service)) expect(wrapped).toContain(rule)
+      else expect(wrapped).not.toContain(rule)
+    }
+
+    expect(SandboxManager.getConfig()).toEqual(sessionConfig)
+    const subsequent = await SandboxManager.wrapWithSandbox('true')
+    expect(subsequent).toContain(
+      `(allow mach-lookup (global-name "${sessionService}"))`,
+    )
+    expect(subsequent).not.toContain(invocationService)
+  })
+})
+
 /**
  * Tests for restriction pattern semantics
  *
