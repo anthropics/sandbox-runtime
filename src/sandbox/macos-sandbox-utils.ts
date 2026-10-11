@@ -367,7 +367,15 @@ function inBothSpellings(kind: PathListKind, entry: PathEntry): PathEntry[] {
     kind === 'deny' || entry.glob
       ? resolved(base)
       : nameLocation(base, resolved)
-  if (canonical === base || canonical === '/') return [entry]
+  // Nor among the devices: a rule on a name blanked with a link to /dev/null
+  // would be one on /dev/null for every command.
+  if (
+    canonical === base ||
+    canonical === '/' ||
+    isAtOrUnder(canonical, '/dev')
+  ) {
+    return [entry]
+  }
   return [
     entry,
     entry.glob
