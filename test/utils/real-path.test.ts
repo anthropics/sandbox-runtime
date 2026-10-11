@@ -12,8 +12,8 @@ import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
-import { realPathOf } from '../../src/utils/real-path.js'
-import { isWindows } from '../helpers/platform.js'
+import { realPathOf, wayTo } from '../../src/utils/real-path.js'
+import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
 
 /** What a call gives: its value, or the code of what it throws. */
 function answer(call: () => string): string {
@@ -22,6 +22,51 @@ function answer(call: () => string): string {
   } catch (error) {
     return String((error as NodeJS.ErrnoException).code)
   }
+}
+
+/** The file the kernel finds at `p`, or the code it refuses with. */
+function fileAt(p: string): string {
+  return answer(() => {
+    const { dev, ino } = fs.statSync(p)
+    return `${dev}:${ino}`
+  })
+}
+
+/**
+ * For each of `paths`, in Node: what realPathOf gives, what the C library
+ * gives for the name folded in text and, if asked for, Node's own answer. The
+ * child is ended hard: a call that does not return hears no signal.
+ */
+function inNode(paths: string[], askNode = false): string[][] {
+  const { stdout, stderr, error } = spawnSync(
+    'node',
+    [
+      '--max-old-space-size=256',
+      '--experimental-strip-types',
+      '--no-warnings',
+      '--input-type=module',
+      '-e',
+      `
+    import fs from 'node:fs'
+    import path from 'node:path'
+    const { realPathOf } = await import(process.argv[1])
+    const answer = call => { try { return call() } catch (error) { return error.code } }
+    const { paths, askNode } = JSON.parse(fs.readFileSync(0, 'utf8'))
+    console.log(JSON.stringify(paths.map(p => [
+      answer(() => realPathOf(p)),
+      answer(() => fs.realpathSync.native(path.resolve(p))),
+      askNode && answer(() => fs.realpathSync(p))])))`,
+      resolve(import.meta.dirname, '../../src/utils/real-path.ts'),
+    ],
+    {
+      input: JSON.stringify({ paths, askNode }),
+      encoding: 'utf8',
+      timeout: 20_000,
+      killSignal: 'SIGKILL',
+    },
+  )
+  expect([error, stderr]).toEqual([undefined, ''])
+  return JSON.parse(stdout) as string[][]
 }
 
 describe.if(!isWindows)('realPathOf', () => {
@@ -35,6 +80,7 @@ describe.if(!isWindows)('realPathOf', () => {
     for (const dir of [
       'a\\b/in',
       'a/b/in',
+      'a/up-and-in/in',
       'alone\\',
       'plain/in',
       'shut\\/in',
@@ -44,6 +90,7 @@ describe.if(!isWindows)('realPathOf', () => {
     for (const file of [
       'a\\b/file',
       'a/b/file',
+      'a/file',
       'alone\\/file',
       'plain/file',
       'file',
@@ -63,6 +110,9 @@ describe.if(!isWindows)('realPathOf', () => {
       ['a\\b/file-as-a-directory', 'file/'],
       ['a\\b/up-from-shut', '../shut\\/..'],
       ['a\\b/1', 'file'],
+      ['plain/out', '../a/b'],
+      ['plain/up-behind-a-link', 'out/../file'],
+      ['plain/up-and-in', 'out/../up-and-in/in'],
     ]) {
       fs.symlinkSync(target!, at(link!))
     }
@@ -77,7 +127,7 @@ describe.if(!isWindows)('realPathOf', () => {
     fs.rmSync(root, { recursive: true, force: true })
   })
 
-  it.each([
+  const IS = [
     // The name itself, with another file where slashes would lead or none.
     ['a\\b', 'a\\b'],
     ['a\\b/file', 'a\\b/file'],
@@ -91,6 +141,8 @@ describe.if(!isWindows)('realPathOf', () => {
     // In a link's target `..` is the parent of where the way has led.
     ['a\\b/up-behind-a-link', 'file'],
     ['a\\b/slashes', 'a\\b/in'],
+    ['plain/up-behind-a-link', 'a/file'],
+    ['plain/up-and-in', 'a/up-and-in/in'],
     // In the name given they are folded in text.
     ['a\\b/out/../file', 'a\\b/file'],
     ['a\\b/file/../in', 'a\\b/in'],
@@ -98,11 +150,17 @@ describe.if(!isWindows)('realPathOf', () => {
     ['a\\b/./in//', 'a\\b/in'],
     ['a\\b/..', ''],
     ['a\\b/file/', 'a\\b/file'],
-  ])('%s is %s', (given, real) => {
+    ['plain/out/../file', 'plain/file'],
+    ['plain/file/../in', 'plain/in'],
+    ['plain/not-there/..', 'plain'],
+    ['plain/./in//', 'plain/in'],
+    ['plain/file/', 'plain/file'],
+  ] as const
+  it.each(IS)('%s is %s', (given, real) => {
     expect(realPathOf(at(given))).toBe(resolve(at(real)))
   })
 
-  it.each([
+  const FAILS = [
     ['a\\b/not-there', 'ENOENT'],
     ['not\\there', 'ENOENT'],
     ['a\\b/nowhere', 'ENOENT'],
@@ -115,9 +173,49 @@ describe.if(!isWindows)('realPathOf', () => {
     ['a\\b/round/in', 'ELOOP'],
     ['a\\b/41', 'ELOOP'],
     [`a\\b/${'n'.repeat(256)}`, 'ENAMETOOLONG'],
-  ])('%s fails with %s', (given, code) => {
+    ['plain/not-there', 'ENOENT'],
+    ['plain/file/in', 'ENOTDIR'],
+    [`plain/${'n'.repeat(256)}`, 'ENAMETOOLONG'],
+  ] as const
+  it.each(FAILS)('%s fails with %s', (given, code) => {
     expect(answer(() => realPathOf(at(given)))).toBe(code)
   })
+
+  it('gives all of that in Node too', () => {
+    expect(
+      inNode([...IS, ...FAILS].map(([given]) => at(given))).map(
+        ([there]) => there,
+      ),
+    ).toEqual([
+      ...IS.map(([, real]) => resolve(at(real))),
+      ...FAILS.map(([, code]) => code),
+    ])
+  }, 30_000)
+
+  // macOS lets no such name be made.
+  it.if(isLinux)(
+    'refuses a way through a name that is no text, and takes U+FFFD in a name for itself, in Node too',
+    () => {
+      const bytes = Buffer.concat([Buffer.from('../bytes-'), Buffer.of(0xff)])
+      fs.mkdirSync(Buffer.concat([Buffer.from(at('plain/')), bytes]))
+      fs.mkdirSync(at('bytes-\uFFFD'))
+      const rows = ['plain', 'a\\b'].flatMap(dir => {
+        fs.symlinkSync(bytes, at(`${dir}/to-bytes`))
+        fs.symlinkSync('../bytes-\uFFFD', at(`${dir}/to-text`))
+        return [
+          [at(`${dir}/to-bytes`), 'EILSEQ'],
+          [at(`${dir}/to-text`), at('bytes-\uFFFD')],
+        ] as const
+      })
+      const expected = rows.map(([, real]) => real)
+
+      expect(rows.map(([p]) => answer(() => realPathOf(p)))).toEqual(expected)
+      expect(inNode(rows.map(([p]) => p)).map(([there]) => there)).toEqual(
+        expected,
+      )
+    },
+    30_000,
+  )
 
   // root searches a directory of any mode.
   it.if(process.getuid?.() !== 0).each(['shut\\/in', 'a\\b/up-from-shut'])(
@@ -148,6 +246,39 @@ describe.if(!isWindows)('realPathOf', () => {
     expect(realPathOf(given)).toBe(resolve(at(real)))
   })
 
+  it.each([
+    ['plain/file', 'plain/file', []],
+    ['a\\b/out/file', 'plain/file', []],
+    ['plain/not-there/in', 'plain', ['not-there', 'in']],
+    ['plain/file/in/deep', 'plain/file', ['in', 'deep']],
+    ['a\\b/nowhere/in', 'a\\b', ['not-there', 'in']],
+    ['plain/out/not-there/../x', 'a/b', ['not-there', '..', 'x']],
+  ])('the way to %s leads as far as %s and leaves %j', (to, real, rest) => {
+    expect(wayTo(at(to))).toMatchObject({ real: at(real), rest })
+  })
+
+  // root searches a directory of any mode.
+  it.if(process.getuid?.() !== 0).each([
+    ['shut\\/in/deep', ['in', 'deep']],
+    ['a\\b/up-from-shut/x', ['..', 'x']],
+  ])(
+    'the way to %s stops at the directory that is shut and leaves %j',
+    (to, rest) => {
+      expect(wayTo(at(to))).toMatchObject({
+        real: at('shut\\'),
+        rest,
+        notThere: { code: 'EACCES' },
+      })
+    },
+  )
+
+  it.each([
+    ['a\\b/round', 'ELOOP'],
+    ['a\\b/up-from-a-file', 'ENOTDIR'],
+  ])('the way to %s fails with %s', (to, code) => {
+    expect(answer(() => wayTo(at(to)).real)).toBe(code)
+  })
+
   it('is the root for the root', () => {
     fs.symlinkSync('/', at('a\\b/root'))
 
@@ -157,16 +288,23 @@ describe.if(!isWindows)('realPathOf', () => {
   })
 
   describe('what it asks', () => {
-    const CALLS = ['realpathSync', 'lstatSync', 'readlinkSync'] as const
     function asked(given: string): string[] {
       const calls: string[] = []
-      const spies = CALLS.map(call => {
-        const real = fs[call] as (...args: unknown[]) => unknown
-        return spyOn(fs, call).mockImplementation(((...args: unknown[]) => {
+      const watch = (holder: object, call: string) => {
+        const held = holder as Record<string, (...args: unknown[]) => unknown>
+        const real = held[call]!
+        return spyOn(held, call).mockImplementation((...args: unknown[]) => {
           calls.push(`${call} ${String(args[0])}`)
           return real(...args)
-        }) as never)
-      })
+        })
+      }
+      const native = watch(fs.realpathSync, 'native')
+      const spies = [
+        native,
+        Object.assign(watch(fs, 'realpathSync'), { native }),
+        watch(fs, 'lstatSync'),
+        watch(fs, 'readlinkSync'),
+      ]
       try {
         realPathOf(given)
       } finally {
@@ -176,9 +314,9 @@ describe.if(!isWindows)('realPathOf', () => {
     }
 
     it.each(['plain/file', 'to-it/file', 'plain/../plain//in/'])(
-      'hands %s, which holds no backslash, to realpathSync as it is',
+      'asks once about %s, which holds no backslash, folded in text',
       given => {
-        expect(asked(at(given))[0]).toBe(`realpathSync ${at(given)}`)
+        expect(asked(at(given))).toEqual([`native ${resolve(at(given))}`])
       },
     )
 
@@ -203,7 +341,7 @@ describe.if(!isWindows)('realPathOf', () => {
       const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
       Object.defineProperty(process, 'platform', { value: 'win32' })
       try {
-        expect(asked(at('to-it'))).toContain(`realpathSync ${at('to-it')}`)
+        expect(asked(at('to-it//'))).toEqual([`realpathSync ${at('to-it//')}`])
         expect(answer(() => asked(at('a\\b')).join())).not.toContain(
           'lstatSync',
         )
@@ -212,6 +350,38 @@ describe.if(!isWindows)('realPathOf', () => {
       }
     })
   })
+})
+
+// How a volume that folds case, and a volume mounted into another, are spelled
+// is the system's to say: logged, and held to naming the same file.
+describe.if(isMacOS)('realPathOf on macOS', () => {
+  it('names the file it was asked about, in Node too', () => {
+    const root = fs.mkdtempSync(join(tmpdir(), 'Real-Path-'))
+    try {
+      fs.writeFileSync(join(root, 'File'), '')
+      const paths = [
+        root,
+        join(root, 'File'),
+        join(root, 'file'),
+        join(root.toLowerCase(), 'FILE'),
+        join('/System/Volumes/Data', fs.realpathSync(root), 'File'),
+      ].filter(p => fs.existsSync(p))
+      const answers = inNode(paths)
+      paths.forEach((p, i) => {
+        const [here, there] = [realPathOf(p), answers[i]![0]!]
+        console.log(
+          `${p}: ${here}${there === here ? '' : `; in Node ${there}`}`,
+        )
+        expect([p, fileAt(here), fileAt(there)]).toEqual([
+          p,
+          fileAt(p),
+          fileAt(p),
+        ])
+      })
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  }, 30_000)
 })
 
 /**
@@ -236,26 +406,12 @@ describe.if(!isWindows)('property: realPathOf', () => {
     way: segments(4),
     fromRoot: fc.boolean(),
   })
-  const IN_NODE = `
-    import fs from 'node:fs'
-    const { realPathOf } = await import(process.argv[1])
-    const answer = call => { try { return call() } catch (error) { return error.code } }
-    const { paths, askNode } = JSON.parse(fs.readFileSync(0, 'utf8'))
-    console.log(JSON.stringify(paths.map(p => [
-      (askNode || p.includes('\\\\')) && answer(() => realPathOf(p)),
-      askNode && answer(() => fs.realpathSync(p))])))`
-  /** The file the kernel finds at `p`, or the code it refuses with. */
-  const fileAt = (p: string): string =>
-    answer(() => {
-      const { dev, ino } = fs.statSync(p)
-      return `${dev}:${ino}`
-    })
   const linksOnTheWayTo = (p: string): string[] =>
     [...p.matchAll(/(?<=.)\/|$/g)]
       .map(cut => p.slice(0, cut.index))
       .filter(upTo => fs.lstatSync(upTo).isSymbolicLink())
 
-  it('leads where the kernel leads and crosses no link, and is what Node gives', () => {
+  it('leads where the kernel leads and crosses no link, in Node too, and is what the C library gives', () => {
     fc.assert(
       fc.property(
         fc.constantFrom('real-path-', 'real\\path-'),
@@ -296,32 +452,13 @@ describe.if(!isWindows)('property: realPathOf', () => {
               }
               made.push(p)
             }
-            // What a slash after a file's name does is each runtime's own.
             const paths = questions.map(([from, way]) =>
-              [pick(made, from), ...way].join('/').replace(/\/+$/, ''),
+              [pick(made, from), ...way].join('/'),
             )
             // Node folds a link's target in text, so where one goes up from
-            // behind a name its own answer can differ, or never come. It is
-            // also what realPathOf gives there for a name with no backslash.
+            // behind a name its own answer can differ, or never come.
             const askNode = !upBehindAName
-            const { stdout, stderr, error } = spawnSync(
-              'node',
-              [
-                '--experimental-strip-types',
-                '--no-warnings',
-                '--input-type=module',
-                '-e',
-                IN_NODE,
-                resolve(import.meta.dirname, '../../src/utils/real-path.ts'),
-              ],
-              {
-                input: JSON.stringify({ paths, askNode }),
-                encoding: 'utf8',
-                timeout: 20_000,
-              },
-            )
-            expect([error, stderr]).toEqual([undefined, ''])
-            const inNode = JSON.parse(stdout) as string[][]
+            const answers = inNode(paths, askNode)
             paths.forEach((p, i) => {
               const real = answer(() => realPathOf(p))
               expect([p, real.startsWith('/') ? fileAt(real) : real]).toEqual([
@@ -335,10 +472,14 @@ describe.if(!isWindows)('property: realPathOf', () => {
                   [],
                 ])
               }
-              const [there, own] = inNode[i]!
-              if (askNode || p.includes('\\')) {
-                expect([p, there]).toEqual([p, real])
+              const [there, library, own] = answers[i]!
+              // Not every C library asks whether what a link's target goes on
+              // from is a directory.
+              if (isMacOS && real === 'ENOTDIR') {
+                if (library !== real) console.log(`${p}: ${library}`)
+                return
               }
+              expect([p, there, library]).toEqual([p, real, real])
               if (askNode) expect([p, own]).toEqual([p, real])
             })
           } finally {

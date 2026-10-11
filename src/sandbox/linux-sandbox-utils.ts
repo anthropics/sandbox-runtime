@@ -1,6 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf } from '../utils/real-path.js'
+import { realPathOf, wayTo } from '../utils/real-path.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
@@ -147,8 +147,8 @@ function findSymlinkInPath(
   return null
 }
 
-/** Bounded depth for chasing dangling symlink chains (kernel ELOOP limit). */
-const MAX_SYMLINK_RESOLUTION_DEPTH = 40
+/** As many missing names as one way is followed up from again. */
+const MAX_MISSING_NAMES_PASSED = 40
 
 /**
  * Canonicalize a deny path through symlinks before any mask or bind is
@@ -159,11 +159,24 @@ const MAX_SYMLINK_RESOLUTION_DEPTH = 40
  * directory" for relative link targets, ENOENT for absolute ones.
  *
  * Resolution: realpath when the full path exists; otherwise canonicalize the
- * deepest existing ancestor and re-join the missing components. A dangling
- * symlink along the way is chain-walked (bounded) so the deny lands where a
- * write through the link would actually create the file. Returns null when
- * the path cannot be canonicalized (e.g. a symlink cycle); callers should
- * skip such paths rather than emit a mask bwrap will reject.
+ * deepest existing ancestor and re-join the missing components.
+ *
+ * A dangling symlink along the way is followed as the kernel follows it, name
+ * by name, to the first name that is not there. What lies beyond that name is
+ * undecided, since whoever makes it decides where the way goes on. So the
+ * answer ends with it, and with the name that follows it if one does, which
+ * makes a directory of it: the caller's placeholder on the first missing
+ * component then keeps the whole way from coming about.
+ *
+ * A way that goes up again at once from the missing name is let pass by a
+ * directory put there as a placeholder. So that name goes to `alsoDenied`, to
+ * be denied for itself, and the way is followed on from where it would lead.
+ *
+ * A directory on the way that cannot be searched is the answer itself: what
+ * lies in it cannot be told, and denied whole it keeps its place and its mode.
+ *
+ * Returns null when the path cannot be canonicalized (a symlink cycle, a name
+ * that is no text). Callers fail closed on it.
  *
  * Unlike normalizePathForSandbox, this intentionally applies no
  * isSymlinkOutsideBoundary check: that check exists so allow paths can't
@@ -171,53 +184,70 @@ const MAX_SYMLINK_RESOLUTION_DEPTH = 40
  * removes access, and the mask must land on the inode that writes through
  * the symlink actually reach.
  */
-function resolveSymlinkedDenyPath(targetPath: string): string | null {
-  let current = targetPath
-  for (let i = 0; i < MAX_SYMLINK_RESOLUTION_DEPTH; i++) {
-    try {
-      return realPathOf(current)
-    } catch {
-      // Some component is missing or dangling — canonicalize manually below.
-    }
+function resolveSymlinkedDenyPath(
+  targetPath: string,
+  alsoDenied?: string[],
+): string | null {
+  try {
+    return realPathOf(targetPath)
+  } catch {
+    // Some component is missing or dangling — canonicalize manually below.
+  }
 
-    // Find the deepest ancestor that fully resolves, collecting the missing
-    // suffix components (leaf first, so unshift keeps them in path order).
-    let ancestor = current
-    const remainder: string[] = []
-    let resolvedAncestor: string | null = null
-    while (resolvedAncestor === null) {
-      const parent = path.dirname(ancestor)
-      if (parent === ancestor) {
-        return null // reached the root without resolving anything
-      }
-      remainder.unshift(path.basename(ancestor))
-      ancestor = parent
-      try {
-        resolvedAncestor = realPathOf(ancestor)
-      } catch {
-        // Keep walking up.
-      }
+  // Find the deepest ancestor that fully resolves, collecting the missing
+  // suffix components (leaf first, so unshift keeps them in path order).
+  let ancestor = targetPath
+  const remainder: string[] = []
+  let resolvedAncestor: string | null = null
+  while (resolvedAncestor === null) {
+    const parent = path.dirname(ancestor)
+    if (parent === ancestor) {
+      return null // reached the root without resolving anything
     }
-
-    // The first missing component may be a dangling symlink (lstat succeeds,
-    // realpath fails). Follow it and loop to re-canonicalize; otherwise the
-    // remainder is genuinely non-existent and the re-joined path is final.
-    const firstMissing = path.join(resolvedAncestor, remainder[0])
-    let linkTarget: string | null = null
+    remainder.unshift(path.basename(ancestor))
+    ancestor = parent
     try {
-      linkTarget = fs.readlinkSync(firstMissing)
+      resolvedAncestor = realPathOf(ancestor)
     } catch {
-      // Not a symlink — nothing left to resolve.
+      // Keep walking up.
     }
-    if (linkTarget === null) {
-      return path.join(resolvedAncestor, ...remainder)
+  }
+
+  // The first missing component may be a dangling symlink (lstat succeeds,
+  // realpath fails); otherwise the remainder is genuinely non-existent and
+  // the re-joined path is final.
+  const rejoined = path.join(resolvedAncestor, ...remainder)
+  try {
+    fs.readlinkSync(path.join(resolvedAncestor, remainder[0]))
+  } catch {
+    return rejoined // Not a symlink — nothing left to resolve.
+  }
+  let why: unknown = 'it goes up from too many names that are not there'
+  try {
+    let onward = rejoined
+    for (let i = 0; i < MAX_MISSING_NAMES_PASSED; i++) {
+      const { real, rest, notThere } = wayTo(onward)
+      if ((notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES') {
+        return real || '/'
+      }
+      const names = rest.filter(name => name !== '' && name !== '.')
+      if (names[1] !== '..') {
+        return [real, ...names.slice(0, 2)].join('/') || '/'
+      }
+      alsoDenied?.push(`${real}/${names[0]}`)
+      onward = [real, ...names.slice(2)].join('/')
     }
-    current = path.join(
-      path.resolve(path.dirname(firstMissing), linkTarget),
-      ...remainder.slice(1),
+  } catch (err) {
+    why = err
+  }
+  // Said by the pass that acts on it, not by the one that gathers.
+  if (alsoDenied === undefined) {
+    logForDebugging(
+      `[Sandbox Linux] Where a write to ${targetPath} would land cannot be settled: ${why}. The link on the way is masked instead, which can keep the sandbox from starting.`,
+      { level: 'warn' },
     )
   }
-  return null // symlink chain too long or cyclic
+  return null
 }
 
 /**
@@ -1945,7 +1975,13 @@ async function generateFilesystemArgs(
       } catch (err) {
         canonical = p // vanished or unresolvable: the recorded form stands
         canonicalFormUnresolved.add(p)
-        if (!isAbsenceErrno(err)) canonicalFormGuesses.add(p)
+        if (!isAbsenceErrno(err)) {
+          canonicalFormGuesses.add(p)
+          logForDebugging(
+            `[Sandbox Linux] Where ${p} really is cannot be told, so what is mounted for it is mounted on this spelling, which bubblewrap may refuse: ${err}`,
+            { level: 'warn' },
+          )
+        }
       }
       canonicalFormCache.set(p, canonical)
     }
@@ -2408,7 +2444,7 @@ async function generateFilesystemArgs(
       if (rawPath.startsWith('/dev/')) {
         continue
       }
-      const resolvedPath = resolveSymlinkedDenyPath(rawPath)
+      const resolvedPath = resolveSymlinkedDenyPath(rawPath, denyPaths)
       if (resolvedPath === null || resolvedPath.startsWith('/dev/')) {
         continue
       }
