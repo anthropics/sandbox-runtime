@@ -2222,21 +2222,23 @@ async function wrapWithSandboxOnce(
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:
-  // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
-  // 2. OR config has network.allowedDomains defined (even if empty array = block all)
-  // An empty allowedDomains array means "no domains allowed" = block all network access
+  // 1. customConfig has network.allowedDomains defined (even if empty array)
+  // 2. OR config has network.allowedDomains defined (even if empty array)
+  // An empty allowedDomains array still requests network restrictions.
+  // Custom lists do not replace the live proxy's session allow/deny lists.
+  // A custom empty list does not revoke session allowances.
   const hasNetworkConfig =
     customConfig?.network?.allowedDomains !== undefined ||
     config?.network?.allowedDomains !== undefined
 
   // Network RESTRICTION is needed whenever network config is specified
-  // This includes empty allowedDomains which means "block all network"
+  // This includes empty allowedDomains arrays.
   const needsNetworkRestriction = hasNetworkConfig
 
   // Network PROXY is needed whenever network config is specified
   // Even with empty allowedDomains, we route through proxy so that:
   // 1. updateConfig() can enable network access for already-running processes
-  // 2. The proxy blocks all requests when allowlist is empty
+  // 2. The proxy enforces session policy and can ask for approval.
   const needsNetworkProxy = hasNetworkConfig
 
   // Wait for network initialization only if proxy is actually needed
@@ -2273,6 +2275,25 @@ async function wrapWithSandboxOnce(
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
+  const allowUnixSockets =
+    customConfig?.network?.allowUnixSockets ?? getAllowUnixSockets()
+  const allowAllUnixSockets =
+    customConfig?.network?.allowAllUnixSockets ?? getAllowAllUnixSockets()
+  const allowLocalBinding =
+    customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()
+  const allowMachLookup =
+    customConfig?.network?.allowMachLookup ?? getAllowMachLookup()
+  const allowGitConfig =
+    customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig()
+  const enableWeakerNestedSandbox =
+    customConfig?.enableWeakerNestedSandbox ?? getEnableWeakerNestedSandbox()
+  const enableWeakerNetworkIsolation =
+    customConfig?.enableWeakerNetworkIsolation ??
+    getEnableWeakerNetworkIsolation()
+  const allowAppleEvents =
+    customConfig?.allowAppleEvents ?? getAllowAppleEvents()
+  const mandatoryDenySearchDepth =
+    customConfig?.mandatoryDenySearchDepth ?? getMandatoryDenySearchDepth()
   const gitSafeDirectories = getGitSafeDirectories(customConfig)
 
   switch (platform) {
@@ -2294,17 +2315,16 @@ async function wrapWithSandboxOnce(
         setEnvVars: credentialRestrictions.setEnvVars,
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         degradeToDenyPaths: credentialRestrictions.degradeToDenyPaths,
-        allowUnixSockets: getAllowUnixSockets(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
-        allowMachLookup:
-          customConfig?.network?.allowMachLookup ?? getAllowMachLookup(),
+        allowUnixSockets,
+        allowAllUnixSockets,
+        allowLocalBinding,
+        allowMachLookup,
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
         gitSafeDirectories,
-        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
-        allowAppleEvents: getAllowAppleEvents(),
+        enableWeakerNetworkIsolation,
+        allowAppleEvents,
         binShell,
       })
 
@@ -2335,12 +2355,12 @@ async function wrapWithSandboxOnce(
         setEnvVars: credentialRestrictions.setEnvVars,
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
-        enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
+        enableWeakerNestedSandbox,
+        allowAllUnixSockets,
         binShell,
         ripgrepConfig: getRipgrepConfig(),
-        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
+        mandatoryDenySearchDepth,
+        allowGitConfig,
         gitSafeDirectories,
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
@@ -2974,6 +2994,8 @@ export interface ISandboxManager {
   getLinuxHttpSocketPath(): string | undefined
   getLinuxSocksSocketPath(): string | undefined
   waitForNetworkInitialization(): Promise<boolean>
+  /** Command-policy overrides only, not proxy/infrastructure configuration.
+   * See README's per-command policy table for supported fields and platforms. */
   wrapWithSandbox(
     command: string,
     binShell?: string,
