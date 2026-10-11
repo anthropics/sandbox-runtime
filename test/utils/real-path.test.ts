@@ -257,6 +257,21 @@ describe.if(!isWindows)('realPathOf', () => {
     expect(wayTo(at(to))).toMatchObject({ real: at(real), rest })
   })
 
+  // root searches a directory of any mode.
+  it.if(process.getuid?.() !== 0).each([
+    ['shut\\/in/deep', ['in', 'deep']],
+    ['a\\b/up-from-shut/x', ['..', 'x']],
+  ])(
+    'the way to %s stops at the directory that is shut and leaves %j',
+    (to, rest) => {
+      expect(wayTo(at(to))).toMatchObject({
+        real: at('shut\\'),
+        rest,
+        notThere: { code: 'EACCES' },
+      })
+    },
+  )
+
   it.each([
     ['a\\b/round', 'ELOOP'],
     ['a\\b/up-from-a-file', 'ENOTDIR'],

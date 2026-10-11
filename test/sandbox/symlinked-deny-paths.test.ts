@@ -237,19 +237,8 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       'too many names',
     ],
     ['leads through a name that is no text', Buffer.of(0x6e, 0xff), 'EILSEQ'],
-    // root searches a directory of any mode.
-    ...(process.getuid?.() === 0
-      ? []
-      : [
-          [
-            'leads into a directory that cannot be searched',
-            'shut/x',
-            'EACCES',
-          ],
-        ]),
   ])('masks the link and says why where the way %s', async (_, target, why) => {
     symlinkSync(target, join(PROJ, 'name'))
-    mkdirSync(join(PROJ, 'shut'), { mode: 0o600 })
 
     const { result, warnings } = await withCapturedWarnings(() =>
       wrap([join(PROJ, 'name')]),
@@ -262,6 +251,40 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       [expect.stringMatching(new RegExp(`${join(PROJ, 'name')} .*${why}`))],
     )
   })
+
+  // root searches a directory of any mode.
+  it.if(process.getuid?.() !== 0).each([
+    ['into', 'shut/x'],
+    ['deep into', 'shut/in/deep/x'],
+    ['up from', 'shut/../made'],
+    ['through a missing name and into', 'gone/../shut/x'],
+  ])(
+    'denies a directory that cannot be searched whole where the way leads %s it',
+    async (_, target) => {
+      symlinkSync(target, join(PROJ, 'name'))
+      mkdirSync(join(PROJ, 'shut'), { mode: 0o600 })
+
+      const result = await wrap([join(PROJ, 'name')])
+
+      const shut = join(PROJ, 'shut')
+      expect(countMounts(result, '--ro-bind', shut, shut)).toBe(1)
+      expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
+    },
+  )
+
+  it.if(process.getuid?.() !== 0)(
+    'mounts nothing for a directory that cannot be searched where the command cannot write',
+    async () => {
+      const shut = join(BASE, 'shut')
+      symlinkSync(join(shut, 'x'), join(PROJ, 'name'))
+      mkdirSync(shut, { mode: 0o600 })
+
+      const result = await wrap([join(PROJ, 'name')])
+
+      expect(result).not.toContain(shut)
+      expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
+    },
+  )
 
   it('fails closed on a symlink cycle rather than dropping the deny', async () => {
     // An unresolvable deny path must not silently disappear: masking the

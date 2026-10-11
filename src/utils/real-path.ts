@@ -54,8 +54,9 @@ export function realPathOf(p: string): string {
  * The kernel's way to `folded`, an absolute path with no `.`, `..` or `//` of
  * its own: name by name, split at `/` alone, every link followed. `real` is
  * as far as it leads, '' being the root. `rest` is what it has not come to:
- * nothing, or first the name that is not there, with what the kernel said of
- * it. Whatever else stops the way is thrown. POSIX only.
+ * nothing, or first the name that is not there, or that `real` lets nobody
+ * look for (EACCES), with what the kernel said of it. Whatever else stops the
+ * way is thrown. POSIX only.
  */
 export function wayTo(folded: string): {
   real: string
@@ -68,7 +69,14 @@ export function wayTo(folded: string): {
   for (let name = rest.shift(); name !== undefined; name = rest.shift()) {
     if (name === '' || name === '.' || name === '..') {
       // Only a directory that can be searched has them: ENOTDIR, EACCES.
-      fs.lstatSync(`${real}/.`)
+      try {
+        fs.lstatSync(`${real}/.`)
+      } catch (notThere) {
+        if ((notThere as NodeJS.ErrnoException).code !== 'EACCES') {
+          throw notThere
+        }
+        return { real, rest: [name, ...rest], notThere }
+      }
       if (name === '..') real = real.slice(0, real.lastIndexOf('/'))
       continue
     }
@@ -78,7 +86,9 @@ export function wayTo(folded: string): {
       isLink = fs.lstatSync(next).isSymbolicLink()
     } catch (notThere) {
       const { code } = notThere as NodeJS.ErrnoException
-      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw notThere
+      if (code !== 'ENOENT' && code !== 'ENOTDIR' && code !== 'EACCES') {
+        throw notThere
+      }
       return { real, rest: [name, ...rest], notThere }
     }
     if (!isLink) {

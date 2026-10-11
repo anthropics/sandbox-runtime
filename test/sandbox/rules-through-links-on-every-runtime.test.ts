@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
+  accessSync,
+  chmodSync,
+  constants,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -365,6 +368,75 @@ describe.if(isLinux && canRun).each(RUNTIMES)(
         ),
       ).toEqual([])
     }, 60_000)
+
+    // root searches a directory of any mode.
+    it.if(process.getuid?.() !== 0)(
+      'holds a directory that is shut at the wrap, mode and all',
+      () => {
+        mkdirSync(join(root, 'shut/in'), { recursive: true })
+        symlinkSync('shut/in/made', join(root, 'name'))
+        chmodSync(join(root, 'shut'), 0o000)
+
+        try {
+          expect(
+            reach(
+              argv,
+              denyWrite(join(root, 'name')),
+              'append',
+              ['name', 'shut/in/made', 'here/file'],
+              true,
+              'chmod 755 shut || { mv shut aside && mkdir -p shut/in; }',
+            ),
+          ).toEqual(['here/file'])
+        } finally {
+          chmodSync(join(root, 'shut'), 0o755)
+        }
+      },
+      60_000,
+    )
+
+    const anothers = ['/etc/ssl/private', '/var/lib/private', '/root'].find(
+      dir => {
+        try {
+          accessSync(dir, constants.X_OK)
+          return false
+        } catch (error) {
+          return (error as NodeJS.ErrnoException).code === 'EACCES'
+        }
+      },
+    )
+
+    it.if(anothers !== undefined).each(['.mcp.json', '.vscode', 'name'])(
+      'starts where %s is a link into a directory another user keeps shut',
+      name => {
+        symlinkSync(`${anothers}/in/made`, join(root, name))
+
+        expect(
+          reach(argv, denyWrite(join(root, 'name')), 'append', [
+            name,
+            'here/file',
+          ]),
+        ).toEqual(['here/file'])
+      },
+      60_000,
+    )
+
+    it.if(anothers !== undefined)(
+      'starts where such a directory lies in a write path, too',
+      () => {
+        symlinkSync(`${anothers}/in/made`, join(root, 'name'))
+        const filesystem = {
+          denyRead: [],
+          allowWrite: ['/'],
+          denyWrite: [join(root, 'name')],
+        }
+
+        expect(
+          reach(argv, { filesystem }, 'append', ['name', 'here/file']),
+        ).toEqual(['here/file'])
+      },
+      60_000,
+    )
 
     it('leaves the rest of the project to a command where a built-in deny is a link to what is not built yet', () => {
       symlinkSync('build/vscode', join(root, '.vscode'))

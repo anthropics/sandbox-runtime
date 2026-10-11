@@ -172,9 +172,11 @@ const MAX_MISSING_NAMES_PASSED = 40
  * directory put there as a placeholder. So that name goes to `alsoDenied`, to
  * be denied for itself, and the way is followed on from where it would lead.
  *
+ * A directory on the way that cannot be searched is the answer itself: what
+ * lies in it cannot be told, and denied whole it keeps its place and its mode.
+ *
  * Returns null when the path cannot be canonicalized (a symlink cycle, a name
- * that is no text, a directory that cannot be searched). Callers fail closed
- * on it.
+ * that is no text). Callers fail closed on it.
  *
  * Unlike normalizePathForSandbox, this intentionally applies no
  * isSymlinkOutsideBoundary check: that check exists so allow paths can't
@@ -224,7 +226,10 @@ function resolveSymlinkedDenyPath(
   try {
     let onward = rejoined
     for (let i = 0; i < MAX_MISSING_NAMES_PASSED; i++) {
-      const { real, rest } = wayTo(onward)
+      const { real, rest, notThere } = wayTo(onward)
+      if ((notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES') {
+        return real || '/'
+      }
       const names = rest.filter(name => name !== '' && name !== '.')
       if (names[1] !== '..') {
         return [real, ...names.slice(0, 2)].join('/') || '/'
