@@ -485,6 +485,15 @@ function deniedDomainReason(entry: string): string {
   return (own ? reasons[entry] : undefined) ?? 'host is on the deny list'
 }
 
+/**
+ * The reason an off-allowlist destination is refused. It has no
+ * `deniedDomains` entry to key a `deniedDomainReasons` text on, so the
+ * deployer names it once for every such denial.
+ */
+function allowlistDenyReason(): string {
+  return config?.network.allowlistDenyReason ?? 'host is not on the allow list'
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
@@ -544,7 +553,7 @@ async function filterNetworkRequest(
   // neither a per-command allow list nor the callback below can widen it.
   if (config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
-    return denied('host is not on the allow list')
+    return denied(allowlistDenyReason())
   }
 
   // The allow list registered for the invocation the proxy username names.
@@ -563,7 +572,7 @@ async function filterNetworkRequest(
 
   if (!sandboxAskCallback) {
     logForDebugging(`No matching rule, denying: ${host}:${port}`)
-    return denied('host is not on the allow list')
+    return denied(allowlistDenyReason())
   }
 
   logForDebugging(`No matching rule, asking user: ${host}:${port}`)

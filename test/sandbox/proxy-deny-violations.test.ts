@@ -263,6 +263,63 @@ describe('HTTP proxy threads encodedCommand from Basic auth to filter()', () => 
     ])
   })
 
+  async function sendPlainHttp(
+    proxyPort: number,
+    token: string,
+    target = 'blocked.test',
+  ): Promise<string> {
+    const sock = connect(proxyPort, '127.0.0.1')
+    await once(sock, 'connect')
+    const basic = Buffer.from(`srt:${token}`).toString('base64')
+    sock.write(
+      `GET http://${target}/x HTTP/1.1\r\n` +
+        `Host: ${target}\r\n` +
+        `Proxy-Authorization: Basic ${basic}\r\n` +
+        `Connection: close\r\n\r\n`,
+    )
+    const chunks: Buffer[] = []
+    sock.on('data', d => chunks.push(d))
+    await once(sock, 'close')
+    return Buffer.concat(chunks).toString('utf8')
+  }
+
+  it('answers a refused plain-HTTP request with the reason filter() gave as the body', async () => {
+    proxy = createHttpProxyServer({
+      filter: (_port, _host, _socket, _encodedCommand, explain) => {
+        explain?.('use the internal mirror instead')
+        return false
+      },
+      proxyAuthToken: 'sekrit',
+      denyHeader: 'X-Deny',
+    })
+    proxy.listen(0, '127.0.0.1')
+    await once(proxy, 'listening')
+    const port = (proxy.address() as { port: number }).port
+
+    const resp = await sendPlainHttp(port, 'sekrit')
+
+    expect(resp).toContain('HTTP/1.1 403')
+    expect(resp).toContain('X-Deny: host_not_allowed')
+    expect(resp.split('\r\n\r\n')[1]).toBe('use the internal mirror instead\n')
+  })
+
+  it('keeps the generic body when filter() explains nothing', async () => {
+    proxy = createHttpProxyServer({
+      filter: () => false,
+      proxyAuthToken: 'sekrit',
+    })
+    proxy.listen(0, '127.0.0.1')
+    await once(proxy, 'listening')
+    const port = (proxy.address() as { port: number }).port
+
+    const resp = await sendPlainHttp(port, 'sekrit')
+
+    expect(resp).toContain('X-Proxy-Error: blocked-by-allowlist')
+    expect(resp.split('\r\n\r\n')[1]).toBe(
+      'Connection blocked by network allowlist\n',
+    )
+  })
+
   it('uses the default policy reason when filterRequest denies without one', async () => {
     const TOKEN = 'sekrit'
     const reasons: string[] = []

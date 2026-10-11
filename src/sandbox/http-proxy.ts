@@ -976,11 +976,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       const requestedHost = stripBrackets(url.hostname)
       const port = url.port ? parseInt(url.port, 10) : defaultPort
 
+      let reason: string | undefined
       const allowed = await options.filter(
         port,
         requestedHost,
         req.socket,
         auth.encodedCommand,
+        given => {
+          reason = given
+        },
       )
       if (!allowed) {
         logForDebugging(`HTTP request blocked to ${requestedHost}:${port}`, {
@@ -995,7 +999,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           res.destroy()
           return
         }
-        respondDenied(res, ...allowlistDeny)
+        // A plain-HTTP client reads the body, which is why the reason goes
+        // there rather than into the status phrase a refused CONNECT has to
+        // make do with. curl prints it; a CONNECT failure hides the phrase
+        // behind -v.
+        respondDenied(res, reason ?? allowlistDeny[0], allowlistDeny[1])
         return
       }
 
