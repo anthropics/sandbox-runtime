@@ -55,6 +55,8 @@ const BRACKETS_LINK = join(VAULT, 'link-to-brackets')
 const VAULT_LINK = join(ROOT, 'link-to-vault')
 const LINKED_DIR = join(VAULT_LINK, 'dir')
 const ROOT_LINK = join(ROOT, 'link-to-root')
+const NULL_LINK = join(ROOT, 'link-to-null')
+const DEV_LINK = join(ROOT, 'link-to-dev')
 const JAR = join(ROOT, 'agent', 'agent.jar')
 
 const CREDENTIAL = {
@@ -120,6 +122,8 @@ describe.if(!isWindows)('precedence between the read lists', () => {
     symlinkSync(BRACKETS, BRACKETS_LINK)
     symlinkSync(VAULT, VAULT_LINK)
     symlinkSync('/', ROOT_LINK)
+    symlinkSync('/dev/null', NULL_LINK)
+    symlinkSync('/dev', DEV_LINK)
   })
 
   afterAll(async () => {
@@ -229,6 +233,25 @@ describe.if(!isWindows)('precedence between the read lists', () => {
         })
       })
     }
+
+    // Linux: an older bubblewrap refuses the mount this makes on /dev/null.
+    it.if(isMacOS).each<[Kind, string]>([
+      ['denyRead', NULL_LINK],
+      ['credential deny', NULL_LINK],
+      ['credential mask', NULL_LINK],
+      ['denyRead', DEV_LINK],
+      ['denyRead', join(DEV_LINK, '*')],
+    ])(
+      '%s on a link to a device leaves the device: %s',
+      async (kind, entry) => {
+        const wrapped = await SandboxManager.wrapWithSandbox(
+          'echo ran; cat /dev/null && echo read; cat < /dev/null && echo opened',
+          undefined,
+          configOf(kind, entry, {}),
+        )
+        expect(stdoutOf(wrapped)).toBe('ran\nread\nopened\n')
+      },
+    )
 
     it('the lists of the session rank as those of one command', async () => {
       for (const [kind, stdout] of [
@@ -680,6 +703,29 @@ describe.if(!isWindows)('precedence between the read lists', () => {
         }
         expect(denies(profile, SIBLING)).toBe(false)
       }
+    })
+
+    it.each([NULL_LINK, DEV_LINK, join(DEV_LINK, '*'), join(DEV_LINK, 'null')])(
+      'a deny on a link to a device is one on the link alone: %s',
+      entry => {
+        for (const as of [(c: FsReadRestrictionConfig) => c, asCredential]) {
+          const config = as({ denyOnly: [entry] })
+          expect(denies(profileOf(config), '/dev/null')).toBe(false)
+          expect(denies(profileOf(config), join(DEV_LINK, 'null'))).toBe(
+            entry !== NULL_LINK,
+          )
+          expect(unlinkDenies(config, [ROOT])).not.toContain('"/dev')
+        }
+        expect(denies(profileOf({ denyOnly: [NULL_LINK] }), NULL_LINK)).toBe(
+          true,
+        )
+      },
+    )
+
+    it('a masked link to a device is denied as the link alone', () => {
+      const profile = profileOf({ denyOnly: [] }, { masked: NULL_LINK })
+      expect(denies(profile, NULL_LINK)).toBe(true)
+      expect(denies(profile, '/dev/null')).toBe(false)
     })
 
     it('a masked file is denied under both spellings of its path', () => {
