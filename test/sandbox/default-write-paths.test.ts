@@ -106,6 +106,44 @@ describe.if(!isWindows)('getDefaultWritePaths', () => {
     ).toEqual(getDefaultWritePaths())
   })
 
+  it('takes a pattern too large to compile as one that covers', () => {
+    expect(
+      getDefaultWritePaths({ denyRead: ['/x/' + 'a'.repeat(1 << 20) + '*'] }),
+    ).toEqual(SANDBOX_OWN)
+  })
+
+  // The engines differ in when they find a pattern too large.
+  it.each([
+    ['node', 'node'],
+    ['bun', process.execPath],
+  ])(
+    'getFsWriteConfig() answers for such a pattern, in %s',
+    (_, runtime) => {
+      const { stdout, stderr } = spawnSync(
+        runtime,
+        [
+          '-e',
+          `import('./dist/index.js').then(async ({ SandboxManager }) => {
+             await SandboxManager.initialize({
+               network: { allowedDomains: [], deniedDomains: [] },
+               filesystem: {
+                 denyRead: ['/x/' + 'a'.repeat(1 << 20) + '*'],
+                 allowWrite: [],
+                 denyWrite: [],
+               },
+             })
+             const { allowOnly } = SandboxManager.getFsWriteConfig()
+             await SandboxManager.reset()
+             process.stdout.write(JSON.stringify(allowOnly), () => process.exit(0))
+           })`,
+        ],
+        { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000 },
+      )
+      expect([stderr, JSON.parse(stdout || 'null')]).toEqual(['', SANDBOX_OWN])
+    },
+    60_000,
+  )
+
   it.each([
     {
       name: 'an allowRead above the directory, beneath the deny',

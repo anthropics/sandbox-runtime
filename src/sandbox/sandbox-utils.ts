@@ -696,8 +696,15 @@ function readRuleCovers(entry: FilesystemPathEntry): (p: string) => boolean {
   }
   const stripped = removeTrailingGlobSuffix(entry)
   if (containsGlobCharsForPlatform(stripped)) {
-    const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
-    return p => regex.test(p)
+    try {
+      const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
+      // V8 finds a pattern too large only when it first runs it.
+      regex.test('')
+      return p => regex.test(p)
+    } catch {
+      // Too large to compile. What it covers cannot be told, so it covers.
+      return () => true
+    }
   }
   const rule = normalizePathForSandbox(stripped, { literal: true })
   return p => isAtOrUnder(p, rule)
