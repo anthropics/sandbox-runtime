@@ -957,6 +957,12 @@ export const FilesystemConfigSchema = z.object({
     .describe(
       'Allow writes to .git/config files (default: false). Enables git remote URL updates while keeping .git/hooks protected.',
     ),
+  allowGitCommonDir: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow writes to the verified Git common directory for linked worktrees on macOS and Linux (default: false). No effect in the main worktree. Hooks and config remain protected unless allowGitConfig enables config writes.',
+    ),
 })
 
 /**

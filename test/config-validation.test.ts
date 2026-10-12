@@ -102,6 +102,8 @@ describe('Config Validation', () => {
         denyRead: ['/etc/shadow'],
         allowWrite: ['/tmp'],
         denyWrite: ['/etc'],
+        allowGitConfig: true,
+        allowGitCommonDir: true,
       },
       ignoreViolations: {
         '*': ['/usr/bin'],
@@ -113,6 +115,26 @@ describe('Config Validation', () => {
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
     expect(result.success).toBe(true)
+  })
+
+  test('validates allowGitCommonDir as an optional boolean', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+    for (const value of [true, false, undefined]) {
+      const parsed = SandboxRuntimeConfigSchema.parse({
+        ...base,
+        filesystem: { ...base.filesystem, allowGitCommonDir: value },
+      })
+      expect(parsed.filesystem.allowGitCommonDir).toBe(value)
+    }
+    expect(
+      SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        filesystem: { ...base.filesystem, allowGitCommonDir: 'true' },
+      }).success,
+    ).toBe(false)
   })
 
   test('should reject missing required fields', () => {

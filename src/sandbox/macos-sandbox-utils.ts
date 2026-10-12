@@ -20,6 +20,9 @@ import {
   pathSpellings,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  getGitDirs,
+  getGitCommonDirDenyPaths,
+  resolveGitCommonDirWriteAccess,
 } from './sandbox-utils.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 import { literalReadings, type PathListKind } from './path-entries.js'
@@ -76,6 +79,8 @@ export interface MacOSSandboxParams {
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
+  /** Linked worktrees only: allow writes to the verified Git common directory. */
+  allowGitCommonDir?: boolean
   /**
    * Directories to emit as `safe.directory` via `GIT_CONFIG_*` env
    * vars — see {@link buildPosixGitSafeDirEnv}.
@@ -129,6 +134,11 @@ export function macGetMandatoryDenyEntries(
     entries.push(beneathCwd('**/.git/config'))
   }
 
+  entries.push(
+    ...getGitCommonDirDenyPaths(getGitDirs(), allowGitConfig).map(
+      toLiteralPathEntry,
+    ),
+  )
   return entries
 }
 
@@ -1420,18 +1430,21 @@ export function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     allowMachLookup,
     readConfig,
-    writeConfig,
     unsetEnvVars,
     setEnvVars,
     maskedFileBinds,
     degradeToDenyPaths,
     allowPty,
     allowGitConfig = false,
+    allowGitCommonDir = false,
     gitSafeDirectories,
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
   } = params
+  const writeConfig = allowGitCommonDir
+    ? resolveGitCommonDirWriteAccess(params.writeConfig, true, allowGitConfig)
+    : params.writeConfig
 
   // SBPL cannot redirect a read to different bytes, so whole-file masking
   // degrades to read-deny on macOS: the sandboxed process gets EPERM
