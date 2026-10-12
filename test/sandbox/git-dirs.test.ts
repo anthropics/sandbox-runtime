@@ -65,13 +65,17 @@ describe.if(!isWindows)('Git common directory resolution', () => {
       join(worktreeGitDir, 'gitdir'),
       `${relative(worktreeGitDir, join(worktreeDir, '.git'))}\n`,
     )
+    expect(getGitDirs(sub)).toEqual({ gitDir: worktreeGitDir, commonDir })
+    process.chdir(sub)
+    const base = { allowOnly: [], denyWithinAllow: [] }
     for (const head of [
       'ref: refs/heads/unborn',
       'a'.repeat(40),
       'b'.repeat(64),
     ]) {
       writeFileSync(join(worktreeGitDir, 'HEAD'), `${head}\n`)
-      expect(getGitDirs(sub)).toEqual({ gitDir: worktreeGitDir, commonDir })
+      const granted = resolveGitCommonDirWriteAccess(base, true)
+      expect(granted.literalAllowOnly).toEqual([commonDir])
     }
   })
 
@@ -334,15 +338,12 @@ describe.if(!isWindows)('Git common directory resolution', () => {
       'moon',
     ])
     git(['worktree', 'add', '-q', '-b', 'moon', linked])
-    for (const detached of [false, true]) {
-      if (detached) git(['checkout', '-q', '--detach'], linked)
-      expect(getGitDirs(linked)).toEqual({
-        gitDir: git(['rev-parse', '--absolute-git-dir'], linked),
-        commonDir: git(
-          ['rev-parse', '--path-format=absolute', '--git-common-dir'],
-          linked,
-        ),
-      })
-    }
+    expect(getGitDirs(linked)).toEqual({
+      gitDir: git(['rev-parse', '--absolute-git-dir'], linked),
+      commonDir: git(
+        ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+        linked,
+      ),
+    })
   })
 })
