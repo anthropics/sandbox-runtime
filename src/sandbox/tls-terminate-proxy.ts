@@ -26,6 +26,7 @@ import {
   type ByteBudget,
   markEndsGracefully,
   runsOnBun,
+  writeHeadsAsLatin1,
 } from './emitted-connection.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
@@ -544,6 +545,7 @@ export function terminateAndForward(
         ),
       )
     })
+    writeHeadsAsLatin1(tls)
     inner.emit('connection', tls)
     keepFlushedHeaderBatches(tls)
   }

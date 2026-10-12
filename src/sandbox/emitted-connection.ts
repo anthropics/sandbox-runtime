@@ -127,6 +127,19 @@ export function keepFlushedHeaderBatches(sock: Socket): void {
 }
 
 /**
+ * A header string holds one char per byte, as the HTTP parser read it from
+ * the upstream, and Node's server names latin1 when it writes a response's
+ * head. Bun's server for an emitted connection names no encoding, so the
+ * socket's default applies: as UTF-8, every header byte from 0x80 up would
+ * reach the client as two. So latin1 is made the default of a socket about
+ * to be emitted. Anything else written to it with no encoding named has to
+ * be bytes or ASCII (see respondDenied).
+ */
+export function writeHeadsAsLatin1(sock: Socket): void {
+  if (runsOnBun()) sock.setDefaultEncoding('latin1')
+}
+
+/**
  * Bytes a proxy's connections together may hold for slow parties (request
  * bodies waiting for an upstream, responses waiting for a client). Each
  * connection adds what it holds to `used`; past `limit`, every one of

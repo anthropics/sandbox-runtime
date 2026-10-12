@@ -32,7 +32,10 @@ import {
   type Decider,
 } from './decider-client.js'
 import { matchesDomainPatternWithPort } from './domain-pattern.js'
-import { keepFlushedHeaderBatches } from './emitted-connection.js'
+import {
+  keepFlushedHeaderBatches,
+  writeHeadsAsLatin1,
+} from './emitted-connection.js'
 import { createHttpProxyServer, markHandedInConnection } from './http-proxy.js'
 import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
 import { canonicalizeHost, type DirectLookup } from './parent-proxy.js'
@@ -211,6 +214,7 @@ export function startProxyOnly(opts: ProxyOnlyOptions): ProxyOnly {
             return
           }
           markHandedInConnection(sock)
+          writeHeadsAsLatin1(sock)
           server.emit('connection', sock)
           keepFlushedHeaderBatches(sock)
         })

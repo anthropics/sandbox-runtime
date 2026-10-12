@@ -801,7 +801,9 @@ export function respondDenied(
     'Content-Type': 'text/plain',
     [name]: value,
   })
-  res.end(reason + '\n')
+  // As bytes: a server may pass a string on to a socket whose default
+  // encoding is not UTF-8 (see writeHeadsAsLatin1).
+  res.end(Buffer.from(reason + '\n'))
 }
 
 /**
