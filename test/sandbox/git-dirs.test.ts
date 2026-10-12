@@ -294,10 +294,12 @@ describe.if(!isWindows)('Git common directory resolution', () => {
       ).toContain(`${target}-real`)
     }
     const alias = join(fixture.commonDir, 'worktrees', 'alias')
-    symlinkSync('..', alias)
+    symlinkSync('../objects', alias)
     const denies = getGitCommonDirDenyPaths(getGitDirs(fixture.worktreeDir))
     expect(denies).toContain(join(alias, 'config.worktree'))
-    expect(denies).toContain(join(fixture.commonDir, 'config.worktree'))
+    expect(denies).toContain(
+      join(fixture.commonDir, 'objects', 'config.worktree'),
+    )
   })
 
   it('agrees with Git for a real linked checkout without reading personal config', () => {
