@@ -9,7 +9,7 @@
 //!   sandbox user (which has no inherent rights on real-user-owned
 //!   files) can reach the working tree;
 //! - `stamp` ⇒ `(D;OICI;mask;;;<sb-SID>)` on the target plus
-//!   `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent;
+//!   `(D;;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent;
 //! - install-time ambient write-denies (`ambient.rs`) reuse the
 //!   `stamp` deny shape, recorded in `ambient_denies` with no holder
 //!   so they persist across sessions until `uninstall`.
@@ -20,6 +20,8 @@
 //! path keeps its severed inheritance). The single chokepoint is
 //! [`apply_sandbox_aces`] ([`SbAceSet`]): converge the path to
 //! exactly the wanted ALLOW + DENY for `<sb-SID>`, idempotently.
+//! Object-only changes retain inherited ACEs and avoid subtree
+//! propagation; inheritable changes still converge descendants.
 //!
 //! The PROTECTED allow-lists in [`set_path_dacl_from_sddl`]'s
 //! callers are the ONE remaining `PROTECTED` consumer — they
@@ -619,8 +621,8 @@ pub fn set_handle_dacl_from_sddl(
 // rights on real-user-owned files. `acl grant` adds an inheritable
 // ALLOW ACE for the sandbox user's SID on a path (typically the
 // working-tree root) so the child can read/write there; `acl stamp
-// --sandbox-user-sid` adds an explicit DENY ACE on a path (and a
-// `(OI)(CI)` `FILE_DELETE_CHILD` DENY on its parent) so the child
+// --sandbox-user-sid` adds an explicit DENY ACE on a path (and
+// an object-only `FILE_DELETE_CHILD` DENY on its parent) so the child
 // can NOT read/write/delete it even when an inherited
 // `BUILTIN\Users` ACE would otherwise allow. Both are ADDITIVE
 // (the path keeps its own explicit ACEs and inheritance);
@@ -650,18 +652,19 @@ pub enum DenyMask {
 /// One explicit ACE the sandbox user holds on a path. The
 /// separate-user FS model is entirely additive: `acl grant` adds
 /// ALLOW ACEs, `acl stamp --sandbox-user-sid` adds DENY ACEs (plus
-/// a `(OI)(CI)` `FILE_DELETE_CHILD` DENY on the parent). Restore
+/// an object-only `FILE_DELETE_CHILD` DENY on the parent). Restore
 /// drops the SID's ACEs via walk-and-filter — no PROTECTED rewrite,
 /// no SD snapshot, no calibration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SbAce {
     Grant(GrantMask),
     Deny(DenyMask),
-    /// `(D;OICI;FILE_DELETE_CHILD;;;<sb>)` — applied to the parent
+    /// `(D;;FILE_DELETE_CHILD;;;<sb>)` — applied to the parent
     /// of every denied target so the sandbox user cannot `del`/`ren`
     /// it via parent-FDC even when the parent carries an inherited
     /// `BUILTIN\Users:(F)` (which the sandbox user, a Users member,
-    /// would otherwise pick up).
+    /// would otherwise pick up). It must not inherit into unrelated
+    /// siblings; denied trees carry their own inheritable FDC deny.
     DenyFdc,
     /// `(D;;DELETE;;;<sb>)` — object-only (`NO_INHERIT`) DELETE deny
     /// on a placeholder INTERMEDIATE directory. Blocks the sandbox
@@ -767,19 +770,29 @@ pub struct SbAceSet {
 
 impl SbAceSet {
     /// The set's entries as [`NewAce`]s for `sid`, in canonical
-    /// deny → deny-fdc → allow order. `Deny`/`DenyFdc`/`Grant` carry
-    /// [`OICI`]; `DenyDelete` is object-only ([`NO_INHERIT`]) — see
-    /// [`SbAce::DenyDelete`].
+    /// deny → deny-fdc → allow order. `Deny`/`Grant` carry [`OICI`];
+    /// `DenyFdc`/`DenyDelete` apply only to the object itself.
     fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
         let mut v = Vec::with_capacity(4);
         if let Some(m) = self.deny {
-            v.push(NewAce::Deny(sid, m.bits(), OICI));
+            // With the parent-FDC deny now object-only, a denied
+            // directory must itself deny FDC throughout its subtree:
+            // DELETE on a child alone does not block parent-FDC.
+            v.push(NewAce::Deny(
+                sid,
+                m.bits() | Mask::FILE_DELETE_CHILD.bits(),
+                OICI,
+            ));
         }
         if self.deny_delete {
             v.push(NewAce::Deny(sid, Mask::DELETE.bits(), NO_INHERIT));
         }
         if self.deny_fdc {
-            v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));
+            v.push(NewAce::Deny(
+                sid,
+                Mask::FILE_DELETE_CHILD.bits(),
+                NO_INHERIT,
+            ));
         }
         if let Some(m) = self.grant {
             v.push(NewAce::Allow(sid, m.bits(), OICI));
@@ -788,11 +801,110 @@ impl SbAceSet {
     }
 }
 
+/// Update only object-local sandbox ACEs without walking the subtree.
+///
+/// `SetNamedSecurityInfoW`, even with only a non-inheritable ACE
+/// changed, propagates the DACL's OTHER inheritable ACEs. On a
+/// profile-root parent this can exceed the CLI's initialization
+/// deadline. `SetSecurityInfo` documents that a MAXIMUM_ALLOWED
+/// handle suppresses propagation. Use it only when no inheritable
+/// sandbox ACE is being added, changed or removed; in particular,
+/// old OICI parent-FDC ACEs must take the propagating cleanup path.
+/// https://learn.microsoft.com/windows/win32/api/aclapi/nf-aclapi-setsecurityinfo
+fn try_apply_object_aces(path: &str, sid: &LocalPsid, set: SbAceSet) -> Result<bool> {
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SetSecurityInfo};
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    };
+    use windows::Win32::System::SystemServices::MAXIMUM_ALLOWED;
+
+    // Grants and full denies must still converge the subtree, even
+    // if the root ACE already matches (descendants may have drifted).
+    if set.grant.is_some() || set.deny.is_some() {
+        return Ok(false);
+    }
+    let name = wstr(path);
+    let handle = unsafe {
+        CreateFileW(
+            pcwstr(&name),
+            MAXIMUM_ALLOWED,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    };
+    // MAXIMUM_ALLOWED may conflict with a caller's sharing mode.
+    // The normal path can still perform a narrower security open.
+    let Ok(handle) = handle else { return Ok(false) };
+    let handle = crate::util::OwnedHandle(handle);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.raw(), &mut info) }
+        .with_context(|| format!("GetFileInformationByHandle('{path}')"))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        bail!("recompose '{path}': refusing a reparse point");
+    }
+    let mut old: *mut ACL = std::ptr::null_mut();
+    let mut raw_sd = PSECURITY_DESCRIPTOR::default();
+    win32_ok(
+        unsafe {
+            GetSecurityInfo(
+                handle.raw(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut old),
+                None,
+                Some(&mut raw_sd),
+            )
+        },
+        &format!("GetSecurityInfo('{path}')"),
+    )?;
+    let sd = OwnedSd::from_raw(raw_sd);
+    let protected = sd_dacl_protected(&sd)?;
+    let mut needs_propagation = false;
+    let kept = filter_aces(old, |hdr, body| {
+        let inherited = hdr.AceFlags & INHERITED_ACE != 0;
+        let sandbox = ace_sid_is(body, sid.as_bytes());
+        needs_propagation |=
+            (!inherited && sandbox && hdr.AceFlags & OICI.0 as u8 != 0) || (protected && inherited);
+        inherited || !sandbox
+    })?;
+    if needs_propagation {
+        return Ok(false);
+    }
+    let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[])?;
+    // Keep the inherited ACEs and the protection state we just read
+    // from THIS handle. Do not request UNPROTECTED re-inheritance.
+    // Like the propagating writer, Windows may set the DACL's
+    // AUTO_INHERITED bookkeeping bit; PROTECTED remains unchanged.
+    win32_ok(
+        unsafe {
+            SetSecurityInfo(
+                handle.raw(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(new.as_ptr()),
+                None,
+            )
+        },
+        &format!("SetSecurityInfo(object-only, '{path}')"),
+    )?;
+    Ok(true)
+}
+
 /// Converge `canonical_path`'s explicit ACEs for `sandbox_sid` to
 /// exactly `set`. Idempotent — every existing explicit ACE for the
 /// SID (allow AND deny) is dropped, then `set`'s entries are
-/// prepended in canonical (deny-before-allow) order. Inherited ACEs
-/// are dropped too; on the (common) unprotected DACL,
+/// prepended in canonical (deny-before-allow) order. Object-only
+/// changes use [`try_apply_object_aces`], retaining inherited ACEs.
+/// Otherwise inherited ACEs are dropped; on an unprotected DACL,
 /// `SetNamedSecurityInfoW` without `PROTECTED_` re-derives them from
 /// the parent. A `SE_DACL_PROTECTED` DACL (inheritance deliberately
 /// severed — its ACEs are normally all explicit, so nothing is
@@ -816,6 +928,9 @@ impl SbAceSet {
 pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<()> {
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
+    if try_apply_object_aces(canonical_path, &sid, set)? {
+        return Ok(());
+    }
     let sid_bytes = sid.as_bytes();
     // 1. Read the current DACL and its protection state. `sd` owns
     //    the buffer `old`/`keep` point into; it's freed after step
