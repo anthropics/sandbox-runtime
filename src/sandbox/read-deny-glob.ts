@@ -75,12 +75,18 @@ function collapseReadDenyLocations({
  * come back unmasked.
  * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
  * @param opts.listings - one map for all the patterns of a configuration.
+ * @param opts.matchedLinks - receives the matches that are symbolic links, by
+ * name: what is returned for one is where it leads.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: { anchor?: string; listings?: GlobWalkListings } = {},
+  opts: {
+    anchor?: string
+    listings?: GlobWalkListings
+    matchedLinks?: Set<string>
+  } = {},
 ): string[] {
   return finish(
     expandReadDenyGlobLinuxSteps(
@@ -97,7 +103,11 @@ export function* expandReadDenyGlobLinuxSteps(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: { anchor?: string; listings?: GlobWalkListings } = {},
+  opts: {
+    anchor?: string
+    listings?: GlobWalkListings
+    matchedLinks?: Set<string>
+  } = {},
 ): Steps<string[]> {
   const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
@@ -137,6 +147,7 @@ export function* expandReadDenyGlobLinuxSteps(
     if (!namedBy.has(location)) namedBy.set(location, candidate)
   }
   for (const candidate of candidates) {
+    if (walk.symlinks.has(candidate)) opts.matchedLinks?.add(candidate)
     if (walk.symlinks.has(candidate) && !walk.realOf.has(candidate)) {
       if (!walk.uninspectableLinks.has(candidate)) {
         // A link that resolves to nothing denies nothing, and bwrap cannot

@@ -1321,9 +1321,9 @@ describe.if(isLinux)(
     it.skipIf(!CAN_RUN || process.getuid?.() === 0)(
       'takes any write deny with glob characters for the path it spells when the folder cannot be looked at',
       async () => {
-        // Whether anything in the folder has the name cannot be told, so a
-        // pattern is also applied like a path that is not there: the name is
-        // kept from being created, and what it would match is not denied.
+        // Whether anything in the folder has the name cannot be told, nor
+        // what: so the folder is denied whole, wherever it lies. Its mode
+        // cannot be given back, so what the pattern would match is safe too.
         const locked = join(root, 'locked')
         const elsewhere = join(root, 'elsewhere')
         mkdirSync(locked)
@@ -1377,13 +1377,12 @@ describe.if(isLinux)(
           const { denied, stdout } = await wrapsWith(name, elsewhere)
           expect(denied).toEqual([join(locked, name)])
           expect(stdout).not.toContain('CREATED')
-          expect(stdout).toContain('WROTE')
+          expect(stdout).not.toContain('WROTE')
           expect(stdout).toContain('END')
           expect(existsSync(join(locked, name))).toBe(false)
 
-          // Below the working directory the folder is denied whole, because
-          // the scan for dangerous names could not read it either: its mode
-          // cannot be given back, so what the pattern would match is safe too.
+          // Below the working directory the scan for dangerous names, which
+          // could not read it either, comes to the same.
           const below = await wrapsWith(name, root)
           expect(below.denied).toEqual([join(locked, name)])
           expect(below.stdout).not.toContain('CREATED')
@@ -1391,12 +1390,10 @@ describe.if(isLinux)(
           expect(below.stdout).toContain('END')
           expect(existsSync(join(locked, name))).toBe(false)
         }
-        // The folder cannot be cleaned by the host while it cannot be looked
-        // at, for a name and for a pattern alike.
-        const leftByName = await leftBy('absent')
-        expect(await leftBy('*.pem')).toEqual(
-          leftByName.map(entry => (entry === 'absent' ? '*.pem' : entry)),
-        )
+        // Nothing is made in a folder the host could not clean while it cannot
+        // be looked at, for a name and for a pattern alike.
+        expect(await leftBy('absent')).toEqual([])
+        expect(await leftBy('*.pem')).toEqual([])
       },
       WRAP_TIMEOUT_MS,
     )

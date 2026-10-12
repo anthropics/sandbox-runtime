@@ -1,7 +1,8 @@
 /*
  * apply-seccomp.c - Apply seccomp BPF filter in an isolated PID namespace
  *
- * Usage: apply-seccomp <command> [args...]
+ * Usage: apply-seccomp [--hold-link <path> <target>]... <command> [args...]
+ *        apply-seccomp --holds-links
  *
  * This program applies a baked-in seccomp BPF filter, isolates the
  * target command in a nested user+PID+mount namespace so it cannot see or
@@ -26,6 +27,10 @@
  * Any failure to set up the nested namespaces aborts with a non-zero exit
  * status; we never fall back to running the command without isolation.
  *
+ * --hold-link keeps a symbolic link where it is: see hold_link(). The second
+ * form exits 0 and does nothing else. A build that lacks the option takes the
+ * word for a command, finds none, and exits 1.
+ *
  * Compile: gcc -static -O2 -o apply-seccomp apply-seccomp.c
  */
 
@@ -45,6 +50,8 @@
 #include <sys/prctl.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/uio.h>
@@ -69,6 +76,13 @@
 
 #ifndef SECCOMP_MODE_FILTER
 #define SECCOMP_MODE_FILTER 2
+#endif
+
+#ifndef MS_NOSYMFOLLOW
+#define MS_NOSYMFOLLOW 256
+#endif
+#ifndef ST_NOSYMFOLLOW
+#define ST_NOSYMFOLLOW 0x2000
 #endif
 
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
@@ -657,13 +671,131 @@ static int reap_until(pid_t main_child) {
     }
 }
 
+/* A new user namespace, with this process's uid and gid mapped to themselves
+ * and every capability in it. */
+static void enter_user_namespace(void) {
+    uid_t uid = geteuid();
+    gid_t gid = getegid();
+
+    /* If this binary was exec'd without read permission (e.g. installed
+     * mode 0111), the kernel marked the process non-dumpable, which
+     * makes /proc/self/{setgroups,uid_map,gid_map} root-owned, so the
+     * writes below would fail with EACCES. Temporarily flip dumpable
+     * on for the uid/gid mapping and restore it right after. While
+     * dumpable is 1, a same-uid process can ptrace us (under yama
+     * ptrace_scope=0) and dump the mapped pages that mode 0111 is
+     * meant to hide; the save/restore keeps that exposure to a
+     * few-syscall race window — the same unavoidable window runc and
+     * systemd accept for this pattern.
+     *
+     * prctl failures here are ignored: they are next to impossible for
+     * these calls, and if raising dumpable did fail the map writes
+     * below fail with their own clearer errors. */
+    int dumpable = prctl(PR_GET_DUMPABLE);
+    (void)prctl(PR_SET_DUMPABLE, 1);
+
+    if (unshare(CLONE_NEWUSER) < 0) {
+        die("apply-seccomp: unshare(CLONE_NEWUSER)");
+    }
+    if (write_file("/proc/self/setgroups", "deny") < 0) {
+        die("apply-seccomp: write /proc/self/setgroups "
+            "(nested userns is capability-restricted; "
+            "caller must provide CAP_SYS_ADMIN)");
+    }
+    if (write_file("/proc/self/uid_map", "%u %u 1\n", uid, uid) < 0) {
+        die("apply-seccomp: write /proc/self/uid_map");
+    }
+    if (write_file("/proc/self/gid_map", "%u %u 1\n", gid, gid) < 0) {
+        die("apply-seccomp: write /proc/self/gid_map");
+    }
+    /* PR_SET_DUMPABLE only accepts 0 or 1; if the saved value was
+     * SUID_DUMP_ROOT (2) — or the read above failed — restore the more
+     * restrictive 0. */
+    (void)prctl(PR_SET_DUMPABLE, dumpable == 1 ? 1 : 0);
+}
+
+static void die_holding(const char *path, const char *why) {
+    fprintf(stderr, "apply-seccomp: --hold-link %s: %s\n", path, why);
+    _exit(1);
+}
+
+/*
+ * Mount the symbolic link at `path` on itself, read-only. unlink and rename
+ * refuse a name that is a mount point in the caller's mount namespace (EBUSY),
+ * and the directory that holds it stays as writable as it was. The link reads
+ * and leads as before.
+ *
+ * `target` is what the link said when the denies were placed by it, or "" for
+ * no word on that. One that says something else by now leads past them.
+ *
+ * mount(2) follows a link at its target, so the link is named through a
+ * descriptor of itself: the kernel does not follow what /proc/self/fd/N leads
+ * to any further. What is looked at and what is mounted are one descriptor.
+ */
+static void hold_link(const char *path, const char *target) {
+    char self[32];
+    char says[PATH_MAX];
+    struct stat st;
+    struct statvfs fs;
+
+    int fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &st) < 0) {
+        die_holding(path, strerror(errno));
+    }
+    if (!S_ISLNK(st.st_mode)) {
+        die_holding(path, "not a symbolic link");
+    }
+    ssize_t length = readlinkat(fd, "", says, sizeof(says));
+    if (length < 0) {
+        die_holding(path, strerror(errno));
+    }
+    if (*target && ((size_t)length != strlen(target) ||
+                    memcmp(says, target, (size_t)length) != 0)) {
+        die_holding(path, "leads elsewhere than it did");
+    }
+    snprintf(self, sizeof(self), "/proc/self/fd/%d", fd);
+    if (mount(self, self, NULL, MS_BIND, NULL) < 0) {
+        die_holding(path, strerror(errno));
+    }
+    close(fd);
+
+    /* Read-only, nosuid and nodev are all the flags bubblewrap ever adds. One
+     * that the command starts applies its flags to every mount it finds, by
+     * path, which for this mount leads elsewhere; it leaves a mount that has
+     * them already alone. The flags the mount came with are given again:
+     * noexec is locked, and without nosymfollow the link would lead where it
+     * did not. A remount keeps the access-time flags by itself. Opened anew:
+     * the first descriptor is of what now lies beneath the mount. */
+    fd = open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0 || fstatvfs(fd, &fs) < 0) {
+        die_holding(path, strerror(errno));
+    }
+    unsigned long flags = MS_RDONLY | MS_NOSUID | MS_NODEV;
+    if (fs.f_flag & ST_NOEXEC) flags |= MS_NOEXEC;
+    if (fs.f_flag & ST_NOSYMFOLLOW) flags |= MS_NOSYMFOLLOW;
+    snprintf(self, sizeof(self), "/proc/self/fd/%d", fd);
+    if (mount(NULL, self, NULL, MS_REMOUNT | MS_BIND | flags, NULL) < 0) {
+        die_holding(path, strerror(errno));
+    }
+    close(fd);
+}
+
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
+    if (argc == 2 && strcmp(argv[1], "--holds-links") == 0) {
+        return 0;
+    }
+    int links = 0;
+    while (3 * links + 3 < argc && strcmp(argv[3 * links + 1], "--hold-link") == 0) {
+        links++;
+    }
+    if (argc < 3 * links + 2) {
+        fprintf(stderr,
+                "Usage: %s [--hold-link <path> <target>]... <command> [args...]\n",
+                argv[0]);
         return 1;
     }
 
-    char **command_argv = &argv[1];
+    char **command_argv = &argv[3 * links + 1];
 
     _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
                    "BPF filter size must be a multiple of sock_filter");
@@ -693,7 +825,8 @@ int main(int argc, char *argv[]) {
      *       map uid/gid, then unshare. This also works when apply-seccomp is
      *       run standalone outside bwrap.
      *
-     * Path (a) is tried first. If we don't have the cap, the
+     * Path (a) is tried first, unless there are links to hold, which takes
+     * (b): see the invariant there. If we don't have the cap, the
      * kernel returns EPERM and we fall through to (b). Path (b) can itself
      * fail on hosts where unprivileged user namespaces are gated by an LSM
      * (Ubuntu 24.04's AppArmor restriction, for example) — the unshare
@@ -708,49 +841,30 @@ int main(int argc, char *argv[]) {
         ? open("/proc", O_PATH | O_DIRECTORY | O_CLOEXEC)
         : -1;
 
-    if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
-        if (errno != EPERM) {
+    if (links > 0 || unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
+        if (links == 0 && errno != EPERM) {
             die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS)");
         }
 
-        uid_t uid = geteuid();
-        gid_t gid = getegid();
-
-        /* If this binary was exec'd without read permission (e.g. installed
-         * mode 0111), the kernel marked the process non-dumpable, which
-         * makes /proc/self/{setgroups,uid_map,gid_map} root-owned, so the
-         * writes below would fail with EACCES. Temporarily flip dumpable
-         * on for the uid/gid mapping and restore it right after. While
-         * dumpable is 1, a same-uid process can ptrace us (under yama
-         * ptrace_scope=0) and dump the mapped pages that mode 0111 is
-         * meant to hide; the save/restore keeps that exposure to a
-         * few-syscall race window — the same unavoidable window runc and
-         * systemd accept for this pattern.
-         *
-         * prctl failures here are ignored: they are next to impossible for
-         * these calls, and if raising dumpable did fail the map writes
-         * below fail with their own clearer errors. */
-        int dumpable = prctl(PR_GET_DUMPABLE);
-        (void)prctl(PR_SET_DUMPABLE, 1);
-
-        if (unshare(CLONE_NEWUSER) < 0) {
-            die("apply-seccomp: unshare(CLONE_NEWUSER)");
+        enter_user_namespace();
+        if (links > 0) {
+            /* INVARIANT: a user namespace is entered after the last hold. The
+             * mount namespace made below is then a copy made across that
+             * boundary, in which every mount is locked: it cannot be
+             * unmounted, which is all a lock refuses. A command started by uid
+             * 0 holds all capabilities in its user namespace, and could
+             * unmount what was mounted in a mount namespace of that one. */
+            if (unshare(CLONE_NEWNS) < 0) {
+                die("apply-seccomp: unshare(CLONE_NEWNS)");
+            }
+            if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+                die("apply-seccomp: mount(MS_PRIVATE)");
+            }
+            for (int i = 0; i < links; i++) {
+                hold_link(argv[3 * i + 2], argv[3 * i + 3]);
+            }
+            enter_user_namespace();
         }
-        if (write_file("/proc/self/setgroups", "deny") < 0) {
-            die("apply-seccomp: write /proc/self/setgroups "
-                "(nested userns is capability-restricted; "
-                "caller must provide CAP_SYS_ADMIN)");
-        }
-        if (write_file("/proc/self/uid_map", "%u %u 1\n", uid, uid) < 0) {
-            die("apply-seccomp: write /proc/self/uid_map");
-        }
-        if (write_file("/proc/self/gid_map", "%u %u 1\n", gid, gid) < 0) {
-            die("apply-seccomp: write /proc/self/gid_map");
-        }
-        /* PR_SET_DUMPABLE only accepts 0 or 1; if the saved value was
-         * SUID_DUMP_ROOT (2) — or the read above failed — restore the more
-         * restrictive 0. */
-        (void)prctl(PR_SET_DUMPABLE, dumpable == 1 ? 1 : 0);
         if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS) after userns");
         }
