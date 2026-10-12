@@ -11,7 +11,12 @@
 
 import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
 import { createServer as createHttpServer } from 'node:http'
-import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
+import type {
+  ClientRequest,
+  IncomingMessage,
+  Server,
+  ServerResponse,
+} from 'node:http'
 import type { LookupFunction, Socket } from 'node:net'
 import { checkServerIdentity, TLSSocket } from 'node:tls'
 import type { TLSSocketOptions } from 'node:tls'
@@ -261,6 +266,22 @@ const MAX_QUEUED_FOR_CLIENT = 1 << 20
  */
 const MAX_BUFFERED_REQUEST_BODY = 4 << 20
 
+/** How long a tunnel may stay as it is before boundTunnel closes it. */
+export type TunnelTimeouts = {
+  /** From the ClientHello to the first request's whole head. */
+  firstRequestMs: number
+  /** From a response to the next request's whole head; `Keep-Alive: timeout` says it. */
+  keepAliveMs: number
+  /** Between two looks at a request not all in, or held back for its upstream: has it moved? */
+  stalledMs: number
+}
+
+export const TUNNEL_TIMEOUTS: TunnelTimeouts = {
+  firstRequestMs: 10_000,
+  keepAliveMs: 5_000,
+  stalledMs: 300_000,
+}
+
 export type TerminateTarget = {
   /**
    * Canonical (see canonicalizeHost) CONNECT target: what the allowlist
@@ -308,6 +329,8 @@ export type TerminateTarget = {
   onHandshakeProbe?: (isDone: () => boolean) => void
   /** Shared across a proxy's tunnels: bytes they may hold for slow parties (see ByteBudget). */
   byteBudget?: ByteBudget
+  /** In place of TUNNEL_TIMEOUTS (see HttpProxyServerOptions.tunnelTimeouts). */
+  timeouts?: Partial<TunnelTimeouts>
 }
 
 /**
@@ -340,12 +363,14 @@ export function terminateAndForward(
   // The tunnel's one connection is its client's, so the server name in its
   // ClientHello is the tunnel's (read below, before the handshake).
   let serverName: ServerName = { kind: 'absent' }
+  const timeouts = { ...TUNNEL_TIMEOUTS, ...target.timeouts }
   // Never listens: the TLS socket below is handed to it.
-  const inner = createHttpServer(
-    target.maxHeaderSize !== undefined
+  const inner = createHttpServer({
+    keepAliveTimeout: timeouts.keepAliveMs,
+    ...(target.maxHeaderSize !== undefined
       ? { maxHeaderSize: target.maxHeaderSize }
-      : {},
-  )
+      : {}),
+  })
 
   // Needs an http.Server that serves a connection handed to it (Node, Bun
   // 1.4 and later: such a server has a 'connection' listener of its own).
@@ -496,7 +521,9 @@ export function terminateAndForward(
     tls.once('data', onEstablished)
     // Neither event comes for a client that finishes the handshake and then
     // stays quiet where 'secure' is not said, so a deadline asks instead.
-    target.onHandshakeProbe?.(() => established || isTlsHandshakeDone(tls))
+    const handshakeDone = (): boolean => established || isTlsHandshakeDone(tls)
+    target.onHandshakeProbe?.(handshakeDone)
+    boundTunnel(inner, tls, socket, timeouts, handshakeDone)
     tls.once('secure', () => {
       onEstablished()
       // Where the runtime reports the name its TLS layer took, it must be
@@ -549,6 +576,85 @@ export function terminateAndForward(
     inner.emit('connection', tls)
     keepFlushedHeaderBatches(tls)
   }
+}
+
+/**
+ * Close a tunnel that would otherwise stay open, and hold its slot, for as
+ * long as its client or its upstream leaves it so. Its server never listens,
+ * so of a server's connection timeouts the runtime applies keepAliveTimeout
+ * alone (Node) or none (Bun).
+ *
+ * - No response owed (no request yet, between two, part of a head): ended
+ *   with close_notify and a FIN, and destroyed if it is still there as long
+ *   again.
+ * - A request not all in, or the tunnel paused for an upstream that takes no
+ *   more of one, so that not even its client's leaving is seen: destroyed
+ *   once it has not moved from one `stalledMs` to the next.
+ *
+ * A whole request that waits for its response is left alone: the tunnel is
+ * read meanwhile, so it closes when its client does.
+ *
+ * @internal Exported for its test.
+ */
+export function boundTunnel(
+  inner: Server,
+  tls: TLSSocket,
+  socket: Duplex,
+  { firstRequestMs, keepAliveMs, stalledMs }: TunnelTimeouts,
+  handshakeDone: () => boolean,
+): void {
+  let owed = 0
+  let idle: ReturnType<typeof setTimeout>
+  const endWhenIdleFor = (ms: number): void => {
+    idle = setTimeout(() => {
+      // A handshake under way has a deadline of its own.
+      if (!handshakeDone()) return endWhenIdleFor(ms)
+      // Ended, and still here: not every client answers an end, and not
+      // every runtime closes the socket under a TLS socket it ends.
+      if (tls.writableEnded) return void socket.destroy()
+      logForDebugging(`[tls-terminate] tunnel idle for ${ms} ms; closed`)
+      tls.end()
+      endWhenIdleFor(ms)
+    }, ms)
+    idle.unref?.()
+  }
+  endWhenIdleFor(firstRequestMs)
+
+  let receiving: IncomingMessage | undefined
+  // A request moves when bytes are read, and when a paused tunnel is taken
+  // up again (what is read then, a runtime may have read ahead and counted).
+  let resumed = 0
+  tls.on('resume', () => resumed++)
+  let moved = 0
+  const stalled = setInterval(() => {
+    const before = moved
+    moved = tls.bytesRead + resumed
+    if (moved !== before) return
+    if (!tls.isPaused() && receiving?.complete !== false) return
+    logForDebugging(
+      `[tls-terminate] a request has not moved for ${stalledMs} ms; tunnel closed`,
+    )
+    socket.destroy()
+  }, stalledMs)
+  stalled.unref?.()
+
+  inner.on('request', (req, res) => {
+    owed++
+    clearTimeout(idle)
+    receiving = req
+    // Once the answer is out nothing reads the request on (an upstream that
+    // answered or failed early took part of it), and a runtime's server
+    // leaves alone a request that was being read. The rest is dropped, so
+    // that the tunnel is read on: to the next request, or its client's end.
+    res.once('finish', () => req.unpipe().resume())
+    res.once('close', () => {
+      if (--owed === 0 && !socket.destroyed) endWhenIdleFor(keepAliveMs)
+    })
+  })
+  socket.once('close', () => {
+    clearTimeout(idle)
+    clearInterval(stalled)
+  })
 }
 
 /**

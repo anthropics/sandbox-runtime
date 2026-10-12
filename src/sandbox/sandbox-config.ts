@@ -879,13 +879,16 @@ export const NetworkConfigSchema = z.object({
         .describe(
           'At most this many CONNECT tunnels are TLS-terminated at once ' +
             '(default 256); past it a CONNECT is answered 503 with ' +
-            '"X-Proxy-Error: too-many-tunnels". A tunnel holds its slot from ' +
-            'its CONNECT until it closes, so idle keep-alive tunnels count; ' +
+            '"X-Proxy-Error: too-many-tunnels", and the refusal is recorded ' +
+            'as a violation, once per command until half the slots are free ' +
+            'again. A tunnel holds its slot from its CONNECT until it ' +
+            'closes, so idle keep-alive tunnels count until they are closed ' +
+            '(5 s after a response); ' +
             'one that turns out not to carry TLS frees it. The slot is taken ' +
             'before the first bytes are seen, so at the cap a non-TLS CONNECT ' +
             '(SSH, say) to a host that would be terminated is refused too. ' +
-            'Hosts in excludeDomains do not count. Read when the proxy ' +
-            'starts; updateConfig does not change it.',
+            'Hosts in excludeDomains do not count. Read at each CONNECT, so ' +
+            'updateConfig changes it for the tunnels that follow.',
         ),
       handshakeTimeoutMs: z
         .number()
@@ -897,8 +900,8 @@ export const NetworkConfigSchema = z.object({
           'A tunnel to be TLS-terminated must finish its TLS handshake ' +
             'within this many milliseconds of its CONNECT (default 10000), ' +
             'or it is closed and its slot freed. A tunnel past its handshake ' +
-            'is never timed out by it. Read when the proxy starts; ' +
-            'updateConfig does not change it.',
+            'is never timed out by it. Read at each CONNECT, so ' +
+            'updateConfig changes it for the tunnels that follow.',
         ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {

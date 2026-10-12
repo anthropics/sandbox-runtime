@@ -21,6 +21,7 @@ export default [
         projectService: {
           allowDefaultProject: [
             'eslint.config.js',
+            'test/fixtures/tunnel-ends.mjs',
             'test/utils/which-node-test.mjs',
             'vendor/build-common.ts',
             'vendor/seccomp/build.ts',

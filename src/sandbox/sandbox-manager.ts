@@ -744,11 +744,18 @@ async function startMuxProxyServer(
     stripResponseHeaders: config?.network.stripResponseHeaders,
     refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
     requireHostMatch: config?.network.requireHostMatch,
-    maxTerminatedTunnels: config?.network.tlsTerminate?.maxTunnels,
-    tlsHandshakeTimeoutMs: config?.network.tlsTerminate?.handshakeTimeoutMs,
+    // Read at each CONNECT, so that updateConfig changes them.
+    get maxTerminatedTunnels() {
+      return config?.network.tlsTerminate?.maxTunnels
+    },
+    get tlsHandshakeTimeoutMs() {
+      return config?.network.tlsTerminate?.handshakeTimeoutMs
+    },
     onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
+      // A refused CONNECT comes with its authority (`host:port`), not a URL.
+      const target = method === 'CONNECT' ? url : redactUrlForViolation(url)
       recordProxyViolation(
-        `deny http-request ${method} ${redactUrlForViolation(url)} (${reason})`,
+        `deny http-request ${method} ${target} (${reason})`,
         encodedCommand,
       )
     },

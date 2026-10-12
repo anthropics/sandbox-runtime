@@ -284,17 +284,19 @@ addresses and the private ranges (`10/8`, `172.16/12`, `192.168/16`,
 ### Limits and backpressure
 
 The memory and CPU a client can make the proxy spend are bounded by the
-limits below. Slots are not: there is no request-head deadline and no idle
-deadline, so once its TLS handshake is done a client can hold a tunnel open
-indefinitely by sending nothing or half a request head, and it can do the
-same on a plain connection; plain connections are not capped in number. The
-proxy serves a single sandboxed client, so a client that exhausts its slots
-denies service only to itself.
+limits below, and so is the time a tunnel holds its slot with no request
+moving on it. A plain connection has no request-head deadline and no idle
+deadline, so a client can hold one open indefinitely by sending nothing or
+half a request head; plain connections are not capped in number. The proxy
+serves a single sandboxed client, so a client that exhausts its slots denies
+service only to itself.
 
 | Resource                                                           | Limit                                                                                                       |
 | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | TLS-terminated tunnels at once                                     | 256; past it, 503 before the 200                                                                            |
 | Time to finish a tunnel's TLS handshake                            | 10 s after the CONNECT; then the tunnel is closed and its slot freed                                        |
+| A tunnel with no request on it                                     | closed 10 s after its ClientHello, or 5 s after its last response (`Keep-Alive: timeout=5`)                 |
+| A request not all in, or held back for its upstream                | the tunnel is closed 300 to 600 s after it last moved. A whole request may wait for its response for ever   |
 | Request head                                                       | 2 MiB                                                                                                       |
 | Request body the decider sees (`need_body`)                        | `max`, at most 32 MiB                                                                                       |
 | Request bodies held for the decider at once                        | 64 MiB, counting each at its Content-Length or else at `max`; past it, 503 `decider_unavailable`            |
@@ -303,8 +305,8 @@ denies service only to itself.
 | Per connection                                                     | 1 MiB queued for the client; under Bun, 4 MiB of request body (Node's own backpressure bounds it otherwise) |
 | Leaf certificates                                                  | the 256 most recently used names; all share one key, so a new name costs a signature, not a key generation  |
 
-The tunnel cap and the handshake deadline are fixed in srt-proxy. SRT's full
-sandbox mode sets them with `network.tlsTerminate.maxTunnels` and
+These are fixed in srt-proxy. SRT's full sandbox mode sets the tunnel cap and
+the handshake deadline with `network.tlsTerminate.maxTunnels` and
 `handshakeTimeoutMs` (see the [README](../README.md#tls-termination)).
 
 A slow upstream holds back the client's upload, and a slow client holds back
