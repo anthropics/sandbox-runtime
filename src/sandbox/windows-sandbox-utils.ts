@@ -1774,6 +1774,9 @@ function windowsPathKey(p: string): string {
   let resolved = p
   if (!isUncPath(p)) {
     try {
+      // The final-path lookup itself, which also resolves 8.3 names and the
+      // case on disk.
+      // eslint-disable-next-line no-restricted-properties
       resolved = fs.realpathSync.native(p)
     } catch {
       // Not there, so nothing lies beneath it either.
