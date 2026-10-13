@@ -1066,16 +1066,15 @@ async function forwardUpstream(
     )
     return
   }
+  // RFC 9112 3.3: the target URI of the asterisk form (`OPTIONS *`) has an
+  // empty path. Put behind the authority, the `*` would be read into the host.
+  const url = `https://${authority}${path === '*' ? '' : path}`
   let body: Readable = req
   let decision: RequestDecision | undefined
   const sni = target.clientServerName ?? serverNameOf(req)
   if (target.requireHostMatch && target.clientServerNameUnreadable) {
     const why = 'TLS server name could not be read'
-    target.onFilterRequestDeny?.(
-      req.method ?? 'GET',
-      `https://${authority}${path}`,
-      why,
-    )
+    target.onFilterRequestDeny?.(req.method ?? 'GET', url, why)
     respondDenied(res, why, markFor('misdirected'), 421)
     return
   }
@@ -1087,11 +1086,7 @@ async function forwardUpstream(
       absoluteFormAuthority(req.url),
     )
     if (why !== undefined) {
-      target.onFilterRequestDeny?.(
-        req.method ?? 'GET',
-        `https://${authority}${path}`,
-        why,
-      )
+      target.onFilterRequestDeny?.(req.method ?? 'GET', url, why)
       respondDenied(res, why, markFor('misdirected'), 421)
       return
     }
@@ -1118,7 +1113,7 @@ async function forwardUpstream(
       filterRequest,
       req,
       res,
-      `https://${authority}${path}`,
+      url,
       ac.signal,
       target.onFilterRequestDeny,
       {

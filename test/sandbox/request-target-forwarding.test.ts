@@ -8,7 +8,8 @@ import {
   connect as tlsConnect,
   createServer as createTlsServer,
 } from 'node:tls'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import {
@@ -29,6 +30,7 @@ import {
 } from '../../src/sandbox/credential-aws-pairs.js'
 import { signSigv4, UNSIGNED_PAYLOAD } from '../../src/sandbox/aws-sigv4.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import { spawnAsync } from '../helpers/spawn.js'
 
 const FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
 const CA_CERT = join(FIXTURE_DIR, 'ca.crt')
@@ -554,6 +556,23 @@ describe('request target forwarding', () => {
       expect(denied).toHaveLength(1)
       expect(denied[0]!.url.replace(/\d+$/, '')).toBe(origin)
       expect(denied[0]!.reason).toBe('malformed request-target')
+    },
+  )
+
+  test.each(['default', 'asSpelled', 'normalize'] as const)(
+    'with a hook, %s: OPTIONS * is judged under its own host, and sent as it is',
+    async mode => {
+      const authority = `${UPSTREAM_NAME}:${tlsPort}`
+      const [asked, arrived] = [hookSeen.length, tlsSeen.length]
+      const reply = await exchange(
+        await tunnel(hookPort[mode]),
+        `OPTIONS * HTTP/1.1\r\nHost: ${authority}\r\n\r\n`,
+      )
+      expect(reply.status).toBe(200)
+      expect(tlsSeen.slice(arrived)).toEqual(['*'])
+      const [seen] = hookSeen.slice(asked)
+      expect(seen!.url).toBe(`https://${authority}/`)
+      expect(seen!.info!.requestTarget).toBe('*')
     },
   )
 
@@ -1245,11 +1264,14 @@ describe('refuseUnparsedRequest', () => {
     expect(socket.readableLength).toBe(answer)
   })
 
-  test('the socket goes as soon as the answer is out', async () => {
+  test('the socket is ended at once, and goes a second later', async () => {
     const socket = new PassThrough({ autoDestroy: false })
     socket.resume()
     refuseUnparsedRequest(parseError('x', 0), socket, true)
-    await new Promise(r => setTimeout(r, 50))
+    expect(socket.writableEnded).toBe(true)
+    await new Promise(r => setTimeout(r, 500))
+    expect(socket.destroyed).toBe(false)
+    await new Promise(r => setTimeout(r, 700))
     expect(socket.destroyed).toBe(true)
   })
 
@@ -1428,5 +1450,53 @@ describe('network.ambiguousRequestTarget', () => {
           '(malformed request-target: percent-encode its bytes outside printable ASCII)',
       ])
     },
+  )
+
+  // By a client in a process of its own, busy with its upload: one that shares
+  // this event loop reads the answer the moment it is there. And through the
+  // manager's proxy, mux and all.
+  test.skipIf(Bun.which('curl') === null)(
+    'in a tunnel, one with a body on its way still gets its answer',
+    async () => {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: ['127.0.0.1'],
+          deniedDomains: [],
+          tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      const store = SandboxManager.getSandboxViolationStore()
+      store.clear()
+      const dir = mkdtempSync(join(tmpdir(), 'refused-upload-'))
+      try {
+        writeFileSync(join(dir, 'body'), Buffer.alloc(256 << 10))
+        for (let n = 0; n < 8; n++) {
+          const curl = await spawnAsync(
+            'curl',
+            [
+              ...['-sk', '-m', '10', '--noproxy', ''],
+              '-x',
+              `http://srt:${SandboxManager.getProxyAuthToken()}@127.0.0.1:${SandboxManager.getProxyPort()}`,
+              ...['--data-binary', `@${join(dir, 'body')}`],
+              // As given: what curl makes of such a byte in a URL differs by
+              // version.
+              ...['--request-target', '/caf\u00e9'],
+              `https://127.0.0.1:${port}/`,
+            ],
+            { encoding: 'utf8', timeout: 15_000 },
+          )
+          expect([curl.status, curl.stdout]).toEqual([
+            0,
+            'malformed request-target: percent-encode its bytes outside printable ASCII\n',
+          ])
+        }
+        expect(store.getViolations()).toHaveLength(8)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+    60_000,
   )
 })

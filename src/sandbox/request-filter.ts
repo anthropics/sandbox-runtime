@@ -723,9 +723,10 @@ export function refuseUnparsedRequest(
     'HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n' +
       `${name}: ${value}\r\nContent-Length: ${refused.reason.length + 1}\r\n` +
       `Connection: close\r\n\r\n${refused.reason}\n`,
-    () => socket.destroy(),
   )
-  // A flush that never ends must not keep the socket.
+  // Ended, and destroyed a second later: a body still on its way is read and
+  // dropped meanwhile. Unread, it would turn the close into a reset, and the
+  // reset would discard the answer.
   setTimeout(() => socket.destroy(), 1000).unref?.()
   return refused
 }
