@@ -808,11 +808,14 @@ function hostNameEntry(body: Buffer): ServerName {
  * the client ends its side, or after a grace period. Until then what the
  * client sends is read and dropped, since unread input when the socket
  * closes turns the close into a reset, and a reset discards what the
- * client has not read yet. A backstop covers a client that stops reading.
+ * client has not read yet. A client that has not taken it all in
+ * `stalledMs` is cut: what is queued leaves the queue all at once, so one
+ * that reads slowly cannot be told from one that has stopped.
  */
 export function closeAfterFlush(
   socket: Duplex,
   done: (how: string) => void,
+  stalledMs = TUNNEL_TIMEOUTS.stalledMs,
 ): void {
   if (socket.destroyed) {
     done('the client, earlier')
@@ -824,13 +827,16 @@ export function closeAfterFlush(
   const close = (how: string): void => {
     if (settled) return
     settled = true
-    clearTimeout(backstop)
+    clearTimeout(stalled)
     clearTimeout(grace)
     if (!socket.destroyed) socket.destroy()
     done(how)
   }
-  const backstop = setTimeout(() => close('the 30 s backstop'), 30_000)
-  backstop.unref?.()
+  const stalled = setTimeout(
+    () => close(`not flushed in ${stalledMs} ms`),
+    stalledMs,
+  )
+  stalled.unref?.()
   let grace: ReturnType<typeof setTimeout> | undefined
   const onFinish = (): void => {
     finished = true
