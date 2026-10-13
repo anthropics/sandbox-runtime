@@ -88,7 +88,7 @@ test('the first refusal of each command is logged and passed on, naming the limi
   })
   const reason =
     "the sandbox's limit of 2 TLS-terminated tunnels at once is reached; " +
-    'network.tlsTerminate.maxTunnels raises it'
+    "the limit is network.tlsTerminate.maxTunnels in the sandbox's configuration"
   expect(p.denials[0]).toEqual({
     method: 'CONNECT',
     url: 'a.test:443',

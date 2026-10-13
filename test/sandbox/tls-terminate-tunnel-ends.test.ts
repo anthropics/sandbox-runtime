@@ -29,6 +29,7 @@ type Outcome = {
   heldBytes: number
   upstream?: number
   slotFreeAfterMs?: number | 'held'
+  missing?: number | unknown[]
 }
 
 const RUNS = [
@@ -78,6 +79,7 @@ test('the default timeouts', () => {
   expect(TUNNEL_TIMEOUTS).toEqual({
     firstRequestMs: 10_000,
     keepAliveMs: 5_000,
+    keepAliveMarginMs: 1_000,
     stalledMs: 300_000,
   })
 })
@@ -115,17 +117,29 @@ describe('with stand-ins', () => {
   afterEach(() => {
     for (const socket of sockets.splice(0)) socket.emit('close')
   })
-  /** A tunnel bounded to 40 ms each way, and what is done to it. */
-  function tunnel(paused = false, handshakeDone = () => true) {
+  /**
+   * A tunnel idle after `idleMs` and stalled after `stalledMs`, its parts,
+   * and what is done to it.
+   */
+  function tunnel({
+    idleMs = 40,
+    paused = false,
+    handshakeDone = (): boolean => true,
+    stalledMs = 60_000,
+  } = {}) {
     const done: string[] = []
     const inner = part()
     const socket = part({
+      writableLength: 0,
       destroyed: false,
       destroy: () => done.push('destroy'),
     })
     sockets.push(socket)
+    const outbound = part({ writableLength: 0 })
     const tls = part({
       bytesRead: 7,
+      bytesWritten: 0,
+      writableLength: 0,
       isPaused: () => paused,
       writableEnded: false,
       end: () =>
@@ -134,16 +148,28 @@ describe('with stand-ins', () => {
     boundTunnel(
       inner as never,
       tls as never,
+      outbound as never,
       socket as never,
-      { firstRequestMs: 40, keepAliveMs: 40, stalledMs: 40 },
+      {
+        firstRequestMs: idleMs,
+        keepAliveMs: idleMs - 10,
+        keepAliveMarginMs: 10,
+        stalledMs,
+      },
       handshakeDone,
     )
-    return { done, inner, socket }
+    /** A request, whole, and its response; `answered()` closes that. */
+    const ask = (): (() => void) => {
+      const res = part()
+      inner.emit('request', request(), res)
+      return () => void res.emit('close')
+    }
+    return { done, socket, outbound, tls, ask }
   }
 
   test('a whole request whose last bytes paused its tunnel: closed once it has not moved', async () => {
-    const { done, inner, socket } = tunnel(true)
-    inner.emit('request', request(), part())
+    const { done, socket, ask } = tunnel({ paused: true, stalledMs: 40 })
+    ask()
     await sleep(130)
     expect(done[0]).toBe('destroy')
     // And left alone from then on.
@@ -155,23 +181,21 @@ describe('with stand-ins', () => {
 
   test('a handshake under way is left to its own deadline', async () => {
     let shaken = false
-    const { done } = tunnel(false, () => shaken)
+    const { done } = tunnel({ handshakeDone: () => shaken })
     await sleep(100)
     expect(done).toEqual([])
     shaken = true
-    await sleep(60)
+    await sleep(40)
     expect(done).toEqual(['end'])
   })
 
   test('idle only once no response is owed', async () => {
-    const { done, inner } = tunnel()
-    const [first, second] = [part(), part()]
-    inner.emit('request', request(), first)
-    inner.emit('request', request(), second)
-    first.emit('close')
+    const { done, ask } = tunnel()
+    const [first, second] = [ask(), ask()]
+    first()
     await sleep(100)
     expect(done).toEqual([])
-    second.emit('close')
+    second()
     await sleep(60)
     expect(done).toEqual(['end'])
     // And no longer there as long again after.
@@ -179,14 +203,82 @@ describe('with stand-ins', () => {
     expect(done).toEqual(['end', 'destroy'])
   })
 
+  test.each(['tls', 'outbound', 'socket'] as const)(
+    'idle only a whole time after the last byte queued in %s has gone, and not destroyed before',
+    async layer => {
+      const t = tunnel()
+      const queue = (writableLength: number): void =>
+        void Object.assign(t[layer], { writableLength })
+      queue(1)
+      t.ask()()
+      await sleep(120)
+      expect(t.done).toEqual([])
+      queue(0)
+      await sleep(35)
+      expect(t.done).toEqual([])
+      await sleep(65)
+      expect(t.done[0]).toBe('end')
+      // The same once it is ended.
+      const ended = tunnel()
+      ended.ask()()
+      await sleep(60)
+      expect(ended.done).toEqual(['end'])
+      Object.assign(ended[layer], { writableLength: 24 })
+      await sleep(120)
+      expect(ended.done).toEqual(['end'])
+      Object.assign(ended[layer], { writableLength: 0 })
+      await sleep(100)
+      expect(ended.done).toEqual(['end', 'destroy'])
+    },
+  )
+
+  test('with bytes queued when the response ends, idle is counted from soon after the last has gone', async () => {
+    const t = tunnel({ idleMs: 500 })
+    Object.assign(t.outbound, { writableLength: 1 })
+    t.ask()()
+    await sleep(50)
+    Object.assign(t.outbound, { writableLength: 0 })
+    await sleep(450)
+    expect(t.done).toEqual([])
+    // Seen gone within a fifth of the time, so ended by 650 ms.
+    await sleep(300)
+    expect(t.done).toEqual(['end'])
+  })
+
+  test('bytes queued for a client that takes none: closed once nothing has moved; one that takes some is left alone', async () => {
+    const bounded = (): ReturnType<typeof tunnel> => tunnel({ stalledMs: 40 })
+    const [stuck, slow, fed] = [bounded(), bounded(), bounded()]
+    for (const t of [stuck, slow, fed]) {
+      t.ask()
+      Object.assign(t.outbound, { writableLength: 1_000 })
+    }
+    for (let i = 1; i <= 15; i++) {
+      await sleep(10)
+      // The queue shrinks; or stays as long, with as much written as taken.
+      Object.assign(slow.outbound, { writableLength: 1_000 - i })
+      Object.assign(fed.tls, { bytesWritten: i })
+    }
+    expect([stuck.done[0], slow.done, fed.done]).toEqual(['destroy', [], []])
+  })
+
+  test('a stalled tunnel is closed between one and one and a fifth times the time allowed', async () => {
+    const { done, tls, ask } = tunnel({ paused: true, stalledMs: 1_000 })
+    ask()
+    await sleep(20)
+    Object.assign(tls, { bytesRead: 8 })
+    await sleep(900)
+    expect(done).toEqual([])
+    await sleep(480)
+    expect(done[0]).toBe('destroy')
+  })
+
   test('a tunnel that has closed is not ended', async () => {
     const before = tunnel()
     before.socket.emit('close')
     const after = tunnel()
-    const res = part()
-    after.inner.emit('request', request(), res)
+    const answered = after.ask()
     Object.assign(after.socket, { destroyed: true }).emit('close')
-    res.emit('close')
+    answered()
     await sleep(100)
     expect([before.done, after.done]).toEqual([[], []])
   })
@@ -198,12 +290,24 @@ describe.each(RUNS.map((r, i) => ({ ...r, i })))(
     let outcome: Record<string, Outcome>
     beforeAll(async () => {
       outcome = await outcomeOf(i)
-    }, 60_000)
+    }, 120_000)
 
-    test('idle after a response: ended when the time it advertised is up', () => {
+    test('idle after a response: ended a margin later than the time it advertised', () => {
       const o = outcome['idle after a response']!
       expect(o).toMatchObject({ status: 200, advertised: 'timeout=1' })
-      expectClosed(o, 1_000)
+      expectClosed(o, 1_500)
+      expect(o.closeNotify).toBe(true)
+    })
+
+    test('asked again when the advertised time is up: served', () => {
+      expect(
+        outcome['asked again when the advertised time is up']!.status,
+      ).toBe(200)
+    })
+
+    test("ended by its own time alone, not the runtime's", () => {
+      const o = outcome['a margin longer than the runtime has']!
+      expectClosed(o, 2_000)
       expect(o.closeNotify).toBe(true)
     })
 
@@ -275,6 +379,27 @@ describe.each(RUNS.map((r, i) => ({ ...r, i })))(
     test('an upload answered early, whose client sends it all: the next request is served', () => {
       const o = outcome['answered early, the client sends on and asks again']!
       expect(o).toMatchObject({ status: 413, second: 200, heldBytes: 0 })
+    })
+
+    test('readers that take nothing for a while, then everything, lose nothing', () => {
+      expect(
+        outcome['readers that take nothing for a while, then everything']!
+          .missing,
+      ).toEqual([])
+    })
+
+    test('a reader that takes an answer in bursts loses nothing', () => {
+      expect(outcome['a reader that takes an answer in bursts']!.missing).toBe(
+        0,
+      )
+    })
+
+    test('a client that never reads its answer: closed once nothing has moved for the time allowed', () => {
+      const o = outcome['a client that never reads its answer']!
+      expect(o.slotFreeAfterMs).toBeNumber()
+      expect(o.slotFreeAfterMs as number).toBeGreaterThanOrEqual(500 - EARLY_MS)
+      expect(o.slotFreeAfterMs as number).toBeLessThan(1_000 + LATE_MS)
+      expect(o.upstream).toBe(0)
     })
 
     test('an upload the upstream stops taking: closed once it has not moved for the time allowed', () => {

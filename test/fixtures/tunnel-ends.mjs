@@ -38,6 +38,7 @@ const NEVER = 600_000
 const NO_TIMEOUTS = {
   firstRequestMs: NEVER,
   keepAliveMs: NEVER,
+  keepAliveMarginMs: 0,
   stalledMs: NEVER,
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -98,6 +99,20 @@ async function startUpstream({ onPost, onGet } = {}) {
       return open.size
     },
   }
+}
+
+/** An `onGet` that answers with `size` bytes (a multiple of 64 KiB), as fast as they are taken. */
+const longAnswer = size => s => {
+  s.write(`HTTP/1.1 200 X\r\nContent-Length: ${size}\r\n\r\n`)
+  const chunk = Buffer.alloc(64 << 10, 7)
+  let sent = 0
+  const pump = () => {
+    while (sent < size) {
+      sent += chunk.length
+      if (!s.write(chunk)) return void s.once('drain', pump)
+    }
+  }
+  pump()
 }
 
 /**
@@ -169,10 +184,19 @@ async function openTunnel({
   t.on('error', () => {})
   await new Promise(r => t.once('secureConnect', r))
   let text = ''
+  // The bytes of a long answer's body are counted, not kept, once its head
+  // is in.
+  let long = false
+  let body
   let lastByteAt = Date.now()
   t.on('data', d => {
-    text += d.toString('latin1')
     lastByteAt = Date.now()
+    if (body !== undefined) return void (body += d.length)
+    text += d.toString('latin1')
+    const head = text.indexOf('\r\n\r\n')
+    if (!long || head < 0) return
+    body = text.length - head - 4
+    text = ''
   })
 
   /** The next whole answer (status 0: none came). */
@@ -217,6 +241,23 @@ async function openTunnel({
         seen = raw.bytesWritten
       }
       return out
+    },
+    /** Ask for a long answer; `headers` go with the request. */
+    askForLong(headers = '') {
+      long = true
+      t.write(`GET / HTTP/1.1\r\nHost: ${target}\r\n${headers}\r\n`)
+    },
+    /** Take nothing more from the socket, or take it up again. */
+    stopReading: () => void raw.pause(),
+    readOn: () => void raw.resume(),
+    /** How much of the first `size` bytes of a long answer never came. */
+    async missingOf(size) {
+      const missing = () => Math.max(0, size - (body ?? 0))
+      const until = Date.now() + 20_000
+      while (missing() > 0 && !raw.destroyed && Date.now() < until) {
+        await sleep(5)
+      }
+      return missing()
     },
     leave: () => void t.end(),
     /** From now on the client sends nothing, not even its end. */
@@ -281,7 +322,7 @@ const light = {
     const up = await startUpstream()
     const c = await openTunnel({
       target: up.target,
-      timeouts: { ...NO_TIMEOUTS, keepAliveMs: 1_000 },
+      timeouts: { ...NO_TIMEOUTS, keepAliveMs: 1_000, keepAliveMarginMs: 500 },
     })
     const { status, head } = await c.get()
     const advertised = /keep-alive: ([^\r]*)/i.exec(head)?.[1]
@@ -291,6 +332,29 @@ const light = {
       ...(await c.end()),
       upstream: await up.stillOpen(),
     }
+  },
+
+  async 'asked again when the advertised time is up'() {
+    const up = await startUpstream()
+    const c = await openTunnel({
+      target: up.target,
+      timeouts: { ...NO_TIMEOUTS, keepAliveMs: 1_000, keepAliveMarginMs: 700 },
+    })
+    await c.get()
+    await sleep(1_100)
+    return { status: (await c.get()).status }
+  },
+
+  // Node's server has a keep-alive timeout of its own, 1 s past the time
+  // advertised.
+  async 'a margin longer than the runtime has'() {
+    const up = await startUpstream()
+    const c = await openTunnel({
+      target: up.target,
+      timeouts: { ...NO_TIMEOUTS, keepAliveMs: 200, keepAliveMarginMs: 1_800 },
+    })
+    await c.get()
+    return c.end()
   },
 
   async 'idle, and the client answers no end'() {
@@ -405,8 +469,33 @@ const light = {
   },
 }
 
-/** Uploads: run one at a time. */
+/** Much to carry: run one at a time. */
 const heavy = {
+  // What the kernel takes for a client that reads nothing differs, and only
+  // an answer up to a megabyte longer than that is all out, and yet queued.
+  async 'readers that take nothing for a while, then everything'() {
+    const cases = []
+    for (let size = MiB; size <= 6 * MiB; size += MiB / 2) {
+      cases.push([size, ''], [size, 'Connection: close\r\n'])
+    }
+    const ends = await Promise.all(
+      cases.map(async ([size, headers]) => {
+        const up = await startUpstream({ onGet: longAnswer(size) })
+        const c = await openTunnel({
+          target: up.target,
+          timeouts: { ...NO_TIMEOUTS, keepAliveMs: 200 },
+        })
+        c.stopReading()
+        c.askForLong(headers)
+        await sleep(1_000)
+        c.readOn()
+        return [await c.missingOf(size), (await c.end()).closedAfterMs]
+      }),
+    )
+    // All of it came, and then the tunnel was closed as any idle one is.
+    return { missing: ends.filter(([n, closed]) => n > 0 || closed === 'open') }
+  },
+
   'answered early, the client leaves': () => answeredEarly(leaves),
   'upstream port closed, the client leaves': () =>
     answeredEarly(leaves, { target: CLOSED }),
@@ -424,6 +513,38 @@ const heavy = {
       c.leave()
       return { second }
     }),
+
+  async 'a reader that takes an answer in bursts'() {
+    const up = await startUpstream({ onGet: longAnswer(UPLOAD) })
+    const c = await openTunnel({
+      target: up.target,
+      timeouts: { ...NO_TIMEOUTS, keepAliveMs: 200, stalledMs: 1_000 },
+    })
+    c.askForLong()
+    // 6 MiB, then nothing for 400 ms, and so on: longer in all than
+    // stalledMs, never that long at a time.
+    for (let next = 6 * MiB; next < UPLOAD; next += 6 * MiB) {
+      await c.missingOf(next)
+      c.stopReading()
+      await sleep(400)
+      c.readOn()
+    }
+    return { missing: await c.missingOf(UPLOAD) }
+  },
+
+  async 'a client that never reads its answer'() {
+    const up = await startUpstream({ onGet: longAnswer(UPLOAD) })
+    const c = await openTunnel({
+      target: up.target,
+      timeouts: { ...NO_TIMEOUTS, stalledMs: 500 },
+    })
+    c.stopReading()
+    c.askForLong()
+    return {
+      slotFreeAfterMs: await c.slotFree(),
+      upstream: await up.stillOpen(),
+    }
+  },
 
   async 'an upload the upstream stops taking'() {
     const up = await startUpstream({ onPost() {} })

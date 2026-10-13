@@ -270,17 +270,23 @@ const MAX_BUFFERED_REQUEST_BODY = 4 << 20
 export type TunnelTimeouts = {
   /** From the ClientHello to the first request's whole head. */
   firstRequestMs: number
-  /** From a response to the next request's whole head; `Keep-Alive: timeout` says it. */
+  /** What `Keep-Alive: timeout` says: from a response to the next request. */
   keepAliveMs: number
-  /** Between two looks at a request not all in, or held back for its upstream: has it moved? */
+  /** How much later than it says an idle tunnel is ended, for a client that takes it at its word. */
+  keepAliveMarginMs: number
+  /** With a request or a response under way that does not move. */
   stalledMs: number
 }
 
 export const TUNNEL_TIMEOUTS: TunnelTimeouts = {
   firstRequestMs: 10_000,
   keepAliveMs: 5_000,
+  keepAliveMarginMs: 1_000,
   stalledMs: 300_000,
 }
+
+/** A tunnel with something under way is looked at this many times in a timeout. */
+const LOOKS = 5
 
 export type TerminateTarget = {
   /**
@@ -523,7 +529,7 @@ export function terminateAndForward(
     // stays quiet where 'secure' is not said, so a deadline asks instead.
     const handshakeDone = (): boolean => established || isTlsHandshakeDone(tls)
     target.onHandshakeProbe?.(handshakeDone)
-    boundTunnel(inner, tls, socket, timeouts, handshakeDone)
+    boundTunnel(inner, tls, outbound, socket, timeouts, handshakeDone)
     tls.once('secure', () => {
       onEstablished()
       // Where the runtime reports the name its TLS layer took, it must be
@@ -584,12 +590,15 @@ export function terminateAndForward(
  * so of a server's connection timeouts the runtime applies keepAliveTimeout
  * alone (Node) or none (Bun).
  *
- * - No response owed (no request yet, between two, part of a head): ended
- *   with close_notify and a FIN, and destroyed if it is still there as long
- *   again.
- * - A request not all in, or the tunnel paused for an upstream that takes no
- *   more of one, so that not even its client's leaving is seen: destroyed
- *   once it has not moved from one `stalledMs` to the next.
+ * - Idle, that is no response owed (no request yet, between two, part of a
+ *   head) and nothing queued for the client: ended with close_notify and a
+ *   FIN, and destroyed if it is still there, and idle, as long again.
+ * - Under way, that is a request not all in, the tunnel paused for an
+ *   upstream that takes no more of one (so that not even its client's
+ *   leaving is seen), or bytes queued for a client: destroyed once nothing
+ *   has moved for `stalledMs`. A client that goes on reading loses nothing.
+ *   That it reads is seen when the kernel takes more, which it does once a
+ *   good part of its send buffer is free: up to a megabyte or two at a time.
  *
  * A whole request that waits for its response is left alone: the tunnel is
  * read meanwhile, so it closes when its client does.
@@ -599,43 +608,62 @@ export function terminateAndForward(
 export function boundTunnel(
   inner: Server,
   tls: TLSSocket,
+  outbound: Writable,
   socket: Duplex,
-  { firstRequestMs, keepAliveMs, stalledMs }: TunnelTimeouts,
+  { firstRequestMs, keepAliveMs, keepAliveMarginMs, stalledMs }: TunnelTimeouts,
   handshakeDone: () => boolean,
 ): void {
+  // What is on its way to the client and still in this process. No layer
+  // counts it all: a response is done, and Bun's TLS socket empty and
+  // finished, with a megabyte in the stream under it. (Under Node two of
+  // the three are one: all that is asked is whether it is zero, or changes.)
+  const queued = (): number =>
+    tls.writableLength + outbound.writableLength + socket.writableLength
+
   let owed = 0
   let idle: ReturnType<typeof setTimeout>
   const endWhenIdleFor = (ms: number): void => {
-    idle = setTimeout(() => {
-      // A handshake under way has a deadline of its own.
-      if (!handshakeDone()) return endWhenIdleFor(ms)
-      // Ended, and still here: not every client answers an end, and not
-      // every runtime closes the socket under a TLS socket it ends.
-      if (tls.writableEnded) return void socket.destroy()
-      logForDebugging(`[tls-terminate] tunnel idle for ${ms} ms; closed`)
-      tls.end()
-      endWhenIdleFor(ms)
-    }, ms)
+    const busy = queued() > 0
+    idle = setTimeout(
+      () => {
+        // Not idle for all of `ms`: a handshake under way has a deadline of
+        // its own, and what is queued is the client's to take.
+        if (!handshakeDone() || busy || queued() > 0) return endWhenIdleFor(ms)
+        // Ended, and still here: not every client answers an end, and not
+        // every runtime closes the socket under a TLS socket it ends.
+        if (tls.writableEnded) return void socket.destroy()
+        logForDebugging(`[tls-terminate] tunnel idle for ${ms} ms; closed`)
+        tls.end()
+        endWhenIdleFor(ms)
+      },
+      busy ? ms / LOOKS : ms,
+    )
     idle.unref?.()
   }
   endWhenIdleFor(firstRequestMs)
+  // Node's own keep-alive timeout destroys the socket, whatever is queued.
+  inner.on('timeout', () => {})
 
   let receiving: IncomingMessage | undefined
-  // A request moves when bytes are read, and when a paused tunnel is taken
-  // up again (what is read then, a runtime may have read ahead and counted).
+  // A tunnel moves when bytes are read, when it is taken up again after a
+  // pause (what is read then, a runtime may have read ahead and counted),
+  // and when bytes written to it leave the queue.
   let resumed = 0
   tls.on('resume', () => resumed++)
   let moved = 0
+  let still = 0
   const stalled = setInterval(() => {
     const before = moved
-    moved = tls.bytesRead + resumed
-    if (moved !== before) return
-    if (!tls.isPaused() && receiving?.complete !== false) return
+    moved = tls.bytesRead + resumed + tls.bytesWritten - queued()
+    const underWay =
+      tls.isPaused() || receiving?.complete === false || queued() > 0
+    still = underWay && moved === before ? still + 1 : 0
+    if (still < LOOKS) return
     logForDebugging(
-      `[tls-terminate] a request has not moved for ${stalledMs} ms; tunnel closed`,
+      `[tls-terminate] nothing has moved for ${stalledMs} ms; tunnel closed`,
     )
     socket.destroy()
-  }, stalledMs)
+  }, stalledMs / LOOKS)
   stalled.unref?.()
 
   inner.on('request', (req, res) => {
@@ -648,7 +676,9 @@ export function boundTunnel(
     // that the tunnel is read on: to the next request, or its client's end.
     res.once('finish', () => req.unpipe().resume())
     res.once('close', () => {
-      if (--owed === 0 && !socket.destroyed) endWhenIdleFor(keepAliveMs)
+      if (--owed === 0 && !socket.destroyed) {
+        endWhenIdleFor(keepAliveMs + keepAliveMarginMs)
+      }
     })
   })
   socket.once('close', () => {

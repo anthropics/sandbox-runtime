@@ -295,8 +295,8 @@ service only to itself.
 | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
 | TLS-terminated tunnels at once                                     | 256; past it, 503 before the 200                                                                            |
 | Time to finish a tunnel's TLS handshake                            | 10 s after the CONNECT; then the tunnel is closed and its slot freed                                        |
-| A tunnel with no request on it                                     | closed 10 s after its ClientHello, or 5 s after its last response (`Keep-Alive: timeout=5`)                 |
-| A request not all in, or held back for its upstream                | the tunnel is closed 300 to 600 s after it last moved. A whole request may wait for its response for ever   |
+| A tunnel with no request on it and nothing queued for its client   | closed 10 s after its ClientHello, or 6 s after its last response (`Keep-Alive: timeout=5`, and 1 s)        |
+| A request not all in or held back, a response its client leaves    | the tunnel is closed 300 to 360 s after anything last moved. A whole request may wait for its response      |
 | Request head                                                       | 2 MiB                                                                                                       |
 | Request body the decider sees (`need_body`)                        | `max`, at most 32 MiB                                                                                       |
 | Request bodies held for the decider at once                        | 64 MiB, counting each at its Content-Length or else at `max`; past it, 503 `decider_unavailable`            |

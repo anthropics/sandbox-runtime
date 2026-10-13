@@ -359,11 +359,13 @@ export interface HttpProxyServerOptions {
 
   /**
    * When a TLS-terminated tunnel is closed, and its slot freed, past its
-   * handshake: with no whole request head yet (default 10 s) or none since
-   * its last response (5 s, which `Keep-Alive: timeout` tells the client);
-   * and with a request that is not all in, or is held back for its upstream,
-   * and has not moved between two looks 300 s apart. A whole request that
-   * waits for its response is not timed out. Primarily a test seam.
+   * handshake. Idle, with nothing queued for its client: with no whole
+   * request head yet (default 10 s), or none since its last response (6 s:
+   * the 5 s that `Keep-Alive: timeout` tells the client, and a margin of
+   * 1 s). Under way, with a request that is not all in or is held back for
+   * its upstream, or bytes queued for its client: once nothing has moved for
+   * 300 s. A whole request that waits for its response is not timed out.
+   * Primarily a test seam.
    */
   tunnelTimeouts?: Partial<TunnelTimeouts>
 
@@ -734,7 +736,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             toldOfCap.add(auth.encodedCommand)
             const reason =
               `the sandbox's limit of ${maxTunnels} TLS-terminated tunnels at ` +
-              `once is reached; network.tlsTerminate.maxTunnels raises it`
+              `once is reached; the limit is network.tlsTerminate.maxTunnels ` +
+              `in the sandbox's configuration`
             logForDebugging(
               `[proxy] CONNECT ${hostname}:${port} refused: ${reason}`,
               { level: 'warn' },

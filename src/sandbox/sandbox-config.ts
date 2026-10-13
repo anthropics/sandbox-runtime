@@ -883,7 +883,7 @@ export const NetworkConfigSchema = z.object({
             'as a violation, once per command until half the slots are free ' +
             'again. A tunnel holds its slot from its CONNECT until it ' +
             'closes, so idle keep-alive tunnels count until they are closed ' +
-            '(5 s after a response); ' +
+            '(6 s after a response); ' +
             'one that turns out not to carry TLS frees it. The slot is taken ' +
             'before the first bytes are seen, so at the cap a non-TLS CONNECT ' +
             '(SSH, say) to a host that would be terminated is refused too. ' +

@@ -158,7 +158,8 @@ describe.skipIf(!SERVES_EMITTED_CONNECTIONS)(
       ).toEqual([
         "deny http-request CONNECT a.test:443 (the sandbox's limit of 1 " +
           'TLS-terminated tunnels at once is reached; ' +
-          'network.tlsTerminate.maxTunnels raises it)',
+          'the limit is network.tlsTerminate.maxTunnels in the ' +
+          "sandbox's configuration)",
       ])
     }, 20_000)
 
