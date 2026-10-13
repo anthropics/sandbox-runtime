@@ -1586,6 +1586,10 @@ describe.if(isLinux)('end-to-end file masking via SandboxManager', () => {
       '10',
       '--proxy',
       `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+      // An empty list overrides NO_PROXY, which would send curl around
+      // the proxy under test for 127.0.0.1.
+      '--noproxy',
+      '',
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]
@@ -1741,6 +1745,10 @@ describe.if(isLinux)(
         '10',
         '--proxy',
         `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+        // An empty list overrides NO_PROXY, which would send curl around
+        // the proxy under test for 127.0.0.1.
+        '--noproxy',
+        '',
         '-H',
         `Authorization: Bearer ${bearer}`,
       ]
@@ -1892,6 +1900,10 @@ describe.if(isLinux)('end-to-end JWT decode masking via SandboxManager', () => {
       '10',
       '--proxy',
       `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+      // An empty list overrides NO_PROXY, which would send curl around
+      // the proxy under test for 127.0.0.1.
+      '--noproxy',
+      '',
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]
@@ -2019,6 +2031,10 @@ describe.if(isLinux)('end-to-end maskClaims via SandboxManager', () => {
       '10',
       '--proxy',
       `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+      // An empty list overrides NO_PROXY, which would send curl around
+      // the proxy under test for 127.0.0.1.
+      '--noproxy',
+      '',
       '-H',
       `Authorization: Bearer ${bearer}`,
     ]

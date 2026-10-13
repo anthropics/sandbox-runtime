@@ -2,9 +2,9 @@
  * Seccomp BPF filter generator to block Unix domain socket creation
  *
  * This program generates a seccomp-bpf filter that blocks the socket() syscall
- * when called with AF_UNIX as the domain argument. This prevents creation of
- * Unix domain sockets while allowing all other socket types (AF_INET, AF_INET6, etc.)
- * and all other syscalls.
+ * when called with AF_UNIX or AF_VSOCK as the domain argument. This prevents creation
+ * of Unix domain sockets and VM sockets while allowing all other socket types
+ * (AF_INET, AF_INET6, etc.) and all other syscalls.
  *
  * The filter is exported in a format compatible with bubblewrap's --seccomp flag.
  *
@@ -55,8 +55,13 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-/* Not pulled from <sched.h>: that needs _GNU_SOURCE, and the value is ABI. */
+/* Not pulled from <sched.h>: that needs _GNU_SOURCE, and the values are ABI. */
 #define SRT_CLONE_NEWUSER 0x10000000UL
+#define SRT_CLONE_NEWNS 0x00020000UL
+/* unshare(2) alone, from Linux 7.1: a mount namespace with the root mount and
+ * none of those beneath it. To clone(2) the bit is CLONE_PARENT_SETTID, which
+ * threads are made with. */
+#define SRT_UNSHARE_EMPTY_MNTNS 0x00100000UL
 
 /*
  * The rules of the `namespaces` filter. None is ever left out: a call this
@@ -70,17 +75,21 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
     static const struct {
         const char *name;
         int err;
-        /* Refused only with CLONE_NEWUSER in arg0, the flags word of both
-         * calls on both architectures. Masked: other flags beside it too. */
-        int newuser_only;
+        /* Refused only with one of these in arg0, the flags word of both
+         * calls on both architectures; 0 for always. One rule a flag, each
+         * masked: other flags beside it too. */
+        unsigned long with_flags;
         /* For a call newer than the libseccomp some builders have
          * (mount_setattr is named from 2.5.2, open_tree_attr from 2.6.1): its
          * number, the same on every architecture since Linux 5.1. Taken by
          * libseccomp for the builder's own architecture only. */
         int nr_if_unnamed;
     } rules[] = {
-        { "unshare", EPERM, 1, 0 },
-        { "clone", EPERM, 1, 0 },
+        /* A mount namespace of its own too: a command started by uid 0 can
+         * make one with no new user namespace. */
+        { "unshare", EPERM,
+          SRT_CLONE_NEWUSER | SRT_CLONE_NEWNS | SRT_UNSHARE_EMPTY_MNTNS, 0 },
+        { "clone", EPERM, SRT_CLONE_NEWUSER | SRT_CLONE_NEWNS, 0 },
         /* clone3(2) passes its flags in a struct, which a filter cannot read.
          * ENOSYS, not EPERM: libc and the language runtimes take ENOSYS as
          * "this kernel has no clone3" and fall back to clone(2), which the
@@ -114,11 +123,15 @@ static int add_namespace_rules(scmp_filter_ctx ctx, int native,
                     rules[i].name, arch_name);
             return -1;
         }
-        int rc = rules[i].newuser_only
-            ? seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(rules[i].err), nr, 1,
-                                     SCMP_A0(SCMP_CMP_MASKED_EQ, SRT_CLONE_NEWUSER,
-                                             SRT_CLONE_NEWUSER))
+        int rc = rules[i].with_flags != 0
+            ? 0
             : seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(rules[i].err), nr, 0);
+        for (unsigned long left = rules[i].with_flags; rc == 0 && left != 0;
+             left &= left - 1) {
+            unsigned long flag = left & -left;
+            rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(rules[i].err), nr, 1,
+                                        SCMP_A0(SCMP_CMP_MASKED_EQ, flag, flag));
+        }
         if (rc < 0) {
             fprintf(stderr, "Error: Failed to add %s rule: %s\n", rules[i].name,
                     strerror(-rc));
@@ -204,9 +217,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Add rule to block socket(AF_VSOCK, ...) */
+    /* The network namespace does not fence VM sockets: on a machine with a
+     * vsock transport one connects straight out of the sandbox, past the
+     * proxies. No socketpair() rule is needed: the family has none. */
+    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
+                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_VSOCK));
+    if (rc < 0) {
+        fprintf(stderr, "Error: Failed to add AF_VSOCK rule: %s\n", strerror(-rc));
+        seccomp_release(ctx);
+        return 1;
+    }
+
     /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets
      * in kernel context without going through the socket() syscall, bypassing
-     * the rule above. seccomp cannot inspect io_uring SQEs (they live in a
+     * the rules above. seccomp cannot inspect io_uring SQEs (they live in a
      * shared-memory ring), so the only safe option is to deny ring creation
      * and use. Blocking all three syscalls also covers the case of an
      * inherited ring fd. */

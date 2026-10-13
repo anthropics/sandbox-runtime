@@ -10,7 +10,7 @@
 
 import forge from 'node-forge'
 import { sign as cryptoSign, X509Certificate } from 'node:crypto'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -60,6 +60,10 @@ export type MitmCA = {
   leafCerts: Map<string, LeafCert>
   /** Per-hostname cache of TLS SecureContexts wrapping the leaf certs. */
   secureContexts: Map<string, SecureContext>
+  /** How many host names the two caches above keep (default 256). */
+  cacheLimit?: number
+  /** The key pair every leaf minted against this CA uses (see mintLeafCert). */
+  leafKeyPair?: forge.pki.rsa.KeyPair
   /**
    * DER-encoded empty CRL signed by this CA. Schannel (Windows System32
    * curl, git's default backend, cargo) checks revocation on every leaf and
@@ -192,14 +196,11 @@ export function createMitmCA(opts: {
 
 /**
  * Remove the SRT-owned temp directories for this CA: the trust-bundle dir
- * always, and the cert/key dir too when SRT generated the CA (for an
- * ephemeral CA they are the same directory). User-supplied CA files are
- * left alone.
+ * always, and the cert/key dir, a directory of its own, too when SRT
+ * generated the CA. User-supplied CA files are left alone.
  */
 export async function disposeMitmCA(ca: MitmCA): Promise<void> {
-  const dirs = new Set([dirname(ca.trustBundlePath)])
-  if (ca.ephemeral) dirs.add(dirname(ca.certPath))
-  for (const dir of dirs) {
+  for (const dir of ownedDirs(ca)) {
     try {
       await rm(dir, { recursive: true, force: true })
     } catch (err) {
@@ -208,6 +209,29 @@ export async function disposeMitmCA(ca: MitmCA): Promise<void> {
       })
     }
   }
+}
+
+/**
+ * {@link disposeMitmCA} in one synchronous step, as a process 'exit' handler
+ * needs it: nothing awaited runs there. Harmless before, during or after the
+ * asynchronous one.
+ */
+export function disposeMitmCASync(ca: MitmCA): void {
+  for (const dir of ownedDirs(ca)) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch (err) {
+      logForDebugging(`[mitm-ca] cleanup failed: ${(err as Error).message}`, {
+        level: 'warn',
+      })
+    }
+  }
+}
+
+function ownedDirs(ca: MitmCA): Set<string> {
+  const dirs = new Set([dirname(ca.trustBundlePath)])
+  if (ca.ephemeral) dirs.add(dirname(ca.certPath))
+  return dirs
 }
 
 /**
@@ -606,10 +630,12 @@ function readPem(path: string, label: string, field: string): string {
 }
 
 export function randomSerial(): string {
-  // 16 random bytes, high bit cleared so the DER INTEGER stays positive.
-  const bytes = random.getBytesSync(16)
-  const hex = util.bytesToHex(bytes)
-  const firstNibble = parseInt(hex[0]!, 16) & 0x7
+  // 16 random bytes whose first two bits are 01. The high bit is clear so
+  // that the DER INTEGER is positive, and the next is set so that it has no
+  // leading zero byte: a parser refuses an INTEGER with more of them than the
+  // sign needs, and with it the whole certificate.
+  const hex = util.bytesToHex(random.getBytesSync(16))
+  const firstNibble = (parseInt(hex[0]!, 16) & 0x3) | 0x4
   return firstNibble.toString(16) + hex.slice(1)
 }
 

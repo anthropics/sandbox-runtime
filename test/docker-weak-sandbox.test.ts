@@ -139,6 +139,12 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     )
   })
 
+  it('seccomp blocks AF_VSOCK socket creation', () => {
+    const r = srt('python3 -c "import socket; socket.socket(socket.AF_VSOCK)"')
+    expect(r.status).not.toBe(0)
+    expect(r.stderr.toLowerCase()).toContain('operation not permitted')
+  })
+
   it('seccomp allows AF_INET socket creation', () => {
     const r = srt('python3 -c "import socket; socket.socket(socket.AF_INET)"')
     expect(r.status).toBe(0)
@@ -158,6 +164,31 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(r.status).not.toBe(0)
     expect(r.stdout).not.toContain('TOPSECRET')
     expect(existsSync(out)).toBe(false)
+  })
+
+  // The kernel would let it: the command holds the capability.
+  it('cannot make a mount namespace of its own (seccomp helper)', () => {
+    const probe = join(WORK, 'mount-namespace-probe.py')
+    writeFileSync(
+      probe,
+      [
+        'import ctypes, errno, os, platform',
+        'libc = ctypes.CDLL(None, use_errno=True)',
+        "CLONE = {'x86_64': 56, 'aarch64': 220}[platform.machine()]",
+        'NEWNS, SIGCHLD = 0x00020000, 17',
+        'def said(label, rc):',
+        "    print(label, 'ok' if rc >= 0 else errno.errorcode.get(ctypes.get_errno()))",
+        "said('unshare', libc.unshare(NEWNS))",
+        'pid = libc.syscall(CLONE, ctypes.c_ulong(NEWNS | SIGCHLD), None, None, None, None)',
+        'if pid == 0: os._exit(0)',
+        "said('clone', pid)",
+        '',
+      ].join('\n'),
+    )
+    const r = srt(`echo SANDBOX-RAN; python3 ${probe}`)
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    expect(r.stdout).toContain('unshare EPERM')
+    expect(r.stdout).toContain('clone EPERM')
   })
 
   // This job's /proc is masked, so the helper cannot mount a fresh one and

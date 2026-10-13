@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { testWithTls } from '../helpers/emitted-connections.js'
 import {
   createResolvedAddressGuard,
   isResolvedAddressDenied,
@@ -787,9 +788,12 @@ describe('resolved-address-guard: through the proxy servers', () => {
       proxyPort,
       `CONNECT rebind.example.com:${upstreamPort} HTTP/1.1\r\nHost: rebind.example.com:${upstreamPort}\r\n\r\n`,
     )
-    expect(resp.startsWith('HTTP/1.1 403')).toBe(true)
+    // The class is the status phrase too: few clients show the body.
+    expect(resp).toStartWith('HTTP/1.1 403 resolved to a loopback address\r\n')
     expect(resp).toContain('X-Proxy-Error: blocked-by-sandbox-runtime')
-    expect(resp).toContain('resolved to a loopback address')
+    expect(resp).toEndWith(
+      '\r\n\r\nConnection to rebind.example.com blocked: resolved to a loopback address',
+    )
     expect(resp).not.toContain('127.0.0.1')
     expect(denials.map(d => `${d.host}:${d.port}`)).toEqual([
       `rebind.example.com:${upstreamPort}`,
@@ -941,6 +945,8 @@ describe('resolved-address-guard: through the proxy servers', () => {
 // ---------------------------------------------------------------------------
 
 describe('resolved-address-guard: TLS-terminated upstream leg', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const it = testWithTls
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
   const UP_HOST = 'devbox.example.com'
   let upstream: ReturnType<typeof createHttpsServer>
@@ -1011,6 +1017,10 @@ describe('resolved-address-guard: TLS-terminated upstream leg', () => {
       '-sS',
       '--proxy',
       `http://127.0.0.1:${proxyPort}`,
+      // An empty list overrides NO_PROXY, which would send curl around
+      // the proxy under test for 127.0.0.1.
+      '--noproxy',
+      '',
       '--cacert',
       CA_CERT,
       '--max-time',

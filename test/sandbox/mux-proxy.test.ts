@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
-import { createServer as createHttpServer } from 'node:http'
+import { existsSync } from 'node:fs'
+import { createServer as createHttpServer, type Server } from 'node:http'
 import { connect, type Socket } from 'node:net'
 import {
   createMuxProxyServer,
@@ -15,12 +16,13 @@ import {
  */
 describe('mux-proxy first-byte dispatch', () => {
   let mux: MuxProxyServer
+  let httpStub: Server
   let port: number
   let socksHits: Buffer[]
 
   beforeEach(async () => {
     socksHits = []
-    const httpStub = createHttpServer((req, res) => {
+    httpStub = createHttpServer((req, res) => {
       res.writeHead(200, { connection: 'close' })
       res.end(`http-request:${req.method}:${req.url}\n`)
     })
@@ -126,5 +128,12 @@ describe('mux-proxy first-byte dispatch', () => {
       c.on('error', () => {})
     })
     expect(socksHits.length).toBe(0)
+  })
+
+  it('removeBackendSocketSync removes the backend socket file, and close() still works', () => {
+    const address = httpStub.address() // a path, or on Windows a port
+    if (typeof address === 'string') expect(existsSync(address)).toBe(true)
+    mux.removeBackendSocketSync()
+    if (typeof address === 'string') expect(existsSync(address)).toBe(false)
   })
 })

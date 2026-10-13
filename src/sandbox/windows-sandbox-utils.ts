@@ -13,7 +13,11 @@ import {
   normalizePathForSandbox,
   containsGlobCharsWin,
   expandGlobPattern,
+  isAtOrUnder,
   isUncPath,
+  markedLiteralPath,
+  normalizeCaseForComparison,
+  stripExtendedPathPrefix,
 } from './sandbox-utils.js'
 // Kept on this module's surface for out-of-tree importers; the
 // implementations live in sandbox-utils.ts.
@@ -24,8 +28,9 @@ export {
   isUncPath,
 } from './sandbox-utils.js'
 import { certThumbprint, generateCa, validateCaPair } from './mitm-ca.js'
+import { literalReadings } from './path-entries.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
-import type { SrtWinConfig } from './sandbox-config.js'
+import type { FilesystemPathEntry, SrtWinConfig } from './sandbox-config.js'
 
 /**
  * Windows sandbox backend.
@@ -1688,15 +1693,37 @@ export function uninstallWindowsSandbox(
  * `srt-win` soft-drops a missing UNC deny target rather than
  * materializing a placeholder chain on an SMB share. A UNC **glob**
  * still walks the share (user-trusted).
+ *
+ * `[` and `]` are characters of a name here, but the walk that expands a
+ * glob reads them as a character class. So a glob beneath a directory with
+ * brackets in its name is also expanded beneath that directory taken as the
+ * name it is (see path-entries.ts). A UNC glob is not: finding the directory
+ * would probe the share.
+ *
+ * An entry marked `{ path, literal: true }` is a literal whatever it holds.
+ * One that holds `*` or `?` is skipped: no Win32 name has them, and
+ * `srt-win` refuses the characters outright.
  */
 export function expandWindowsFsPaths(
-  patterns: readonly string[],
+  patterns: readonly FilesystemPathEntry[],
   opts?: { mode?: 'grant' | 'deny' },
 ): string[] {
   const out = new Set<string>()
-  for (const raw of patterns) {
-    const norm = normalizePathForSandbox(raw)
-    const isGlob = containsGlobCharsWin(norm)
+  for (const entry of patterns) {
+    const marked = typeof entry !== 'string'
+    const raw = marked ? markedLiteralPath(entry) : entry
+    const norm = normalizePathForSandbox(
+      raw,
+      marked ? { literal: true } : undefined,
+    )
+    if (marked && containsGlobCharsWin(norm)) {
+      logForDebugging(
+        `[Sandbox Windows] Skipping a literal path that no file can have: ${norm}`,
+        { level: 'warn' },
+      )
+      continue
+    }
+    const isGlob = !marked && containsGlobCharsWin(norm)
     // UNC literal: pass raw (no stat) — see {@link isUncPath}. A
     // UNC glob falls through to expandGlobPattern below.
     if (isUncPath(norm) && !isGlob) {
@@ -1704,7 +1731,19 @@ export function expandWindowsFsPaths(
       continue
     }
     const candidates = isGlob
-      ? expandGlobPattern(norm, { caseInsensitive: true })
+      ? [
+          ...expandGlobPattern(norm, { caseInsensitive: true }),
+          ...literalReadings(raw, opts?.mode === 'deny' ? 'deny' : 'allow', {
+            isPattern: containsGlobCharsWin,
+          }).flatMap(reading =>
+            reading.glob
+              ? expandGlobPattern(reading.path, {
+                  caseInsensitive: true,
+                  anchor: reading.anchor,
+                })
+              : [],
+          ),
+        ]
       : [norm]
     for (const c of candidates) {
       const st = fs.statSync(c, { throwIfNoEntry: false })
@@ -1721,6 +1760,130 @@ export function expandWindowsFsPaths(
     }
   }
   return [...out]
+}
+
+/**
+ * `p` for comparison with another path, as the object `srt-win` opens for it:
+ * links, junctions, 8.3 names and the case on disk are resolved by the same
+ * final-path lookup the helper makes. On top of that, lower case, `/`
+ * separators and none at the end. A path that cannot be opened is compared as
+ * spelled, and so is a UNC path, which is never probed (see
+ * {@link isUncPath}).
+ */
+function windowsPathKey(p: string): string {
+  let resolved = p
+  if (!isUncPath(p)) {
+    try {
+      // The final-path lookup itself, which also resolves 8.3 names and the
+      // case on disk.
+      // eslint-disable-next-line no-restricted-properties
+      resolved = fs.realpathSync.native(p)
+    } catch {
+      // Not there, so nothing lies beneath it either.
+    }
+  }
+  return normalizeCaseForComparison(
+    path.win32
+      .normalize(stripExtendedPathPrefix(resolved))
+      .replace(/\\/g, '/')
+      .replace(/\/+$/, ''),
+  )
+}
+
+/** The one of `dirs` that a path is, or lies beneath. */
+function coveringWindowsPath(
+  dirs: readonly string[],
+): (p: string) => string | undefined {
+  const keys = dirs.map(windowsPathKey)
+  return p => {
+    if (keys.length === 0) return undefined
+    const key = windowsPathKey(p)
+    const covering = keys.findIndex(dir => isAtOrUnder(key, dir))
+    return covering < 0 ? undefined : dirs[covering]
+  }
+}
+
+/** What `srt-win` is handed: see {@link rankWindowsFsAccess}. */
+export interface WindowsFsAccessSet {
+  grantRead: string[]
+  grantWrite: string[]
+  denyRead: string[]
+  denyWrite: string[]
+}
+
+/**
+ * Ranks the lists against each other, as on the other platforms, and returns
+ * the grants and stamps that say so. Takes concrete paths
+ * ({@link expandWindowsFsPaths}).
+ *
+ * The ACEs set on an object come before the ones it inherits, so beneath a
+ * DENY on a directory an ALLOW set further down is the one that counts. That
+ * is the rank of `allowRead` over `denyRead`. The other two ranks are the
+ * opposite one, so `srt-win` is handed no such ALLOW for them:
+ *
+ * - `denyWrite` over `allowWrite`: a write grant at or beneath a write deny
+ *   is a read grant.
+ * - `credentialDeny` (`credentials.files`) over `allowRead` and `allowWrite`:
+ *   a grant at or beneath a credential deny is left out. The caller adds the
+ *   grants for the library's own files to the result, so they are the only
+ *   exceptions.
+ *
+ * `held` are grants that are on disk already: the session's, when one command
+ * brings denies of its own. They cannot be taken back for one command, so
+ * each gets the deny at its own path, where `srt-win` puts DENY first.
+ */
+export function rankWindowsFsAccess(lists: {
+  allowRead: readonly string[]
+  allowWrite: readonly string[]
+  denyRead: readonly string[]
+  denyWrite: readonly string[]
+  credentialDeny: readonly string[]
+  held?: Pick<WindowsFsAccessSet, 'grantRead' | 'grantWrite'>
+}): WindowsFsAccessSet {
+  const credentialDenyOver = coveringWindowsPath(lists.credentialDeny)
+  const writeDenyOver = coveringWindowsPath(lists.denyWrite)
+  const grantRead = new Set<string>()
+  const grantWrite = new Set<string>()
+  const rank = (list: 'allowRead' | 'allowWrite', p: string): void => {
+    const credentialDeny = credentialDenyOver(p)
+    const writeDeny = list === 'allowWrite' ? writeDenyOver(p) : undefined
+    if (credentialDeny === undefined && writeDeny === undefined) {
+      const grants = list === 'allowRead' ? grantRead : grantWrite
+      grants.add(p)
+      return
+    }
+    if (credentialDeny === undefined) grantRead.add(p)
+    logForDebugging(
+      `[Sandbox Windows] ${list} ${p} is at or beneath ` +
+        (credentialDeny !== undefined
+          ? `the credential file entry ${credentialDeny}: not granted`
+          : `denyWrite ${writeDeny}: granted read only`),
+      { level: 'warn' },
+    )
+  }
+  for (const p of lists.allowRead) rank('allowRead', p)
+  for (const p of lists.allowWrite) rank('allowWrite', p)
+  const heldRead = lists.held?.grantRead ?? []
+  const heldWrite = lists.held?.grantWrite ?? []
+  return {
+    grantRead: [...grantRead],
+    grantWrite: [...grantWrite],
+    denyRead: [
+      ...new Set([
+        ...lists.denyRead,
+        ...lists.credentialDeny,
+        ...[...heldRead, ...heldWrite].filter(
+          p => credentialDenyOver(p) !== undefined,
+        ),
+      ]),
+    ],
+    denyWrite: [
+      ...new Set([
+        ...lists.denyWrite,
+        ...heldWrite.filter(p => writeDenyOver(p) !== undefined),
+      ]),
+    ],
+  }
 }
 
 /**

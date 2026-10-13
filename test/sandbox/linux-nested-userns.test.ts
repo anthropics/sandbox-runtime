@@ -442,6 +442,8 @@ describe.if(isLinux)(
           "said('unshare', libc.unshare(NEWUSER))",
           // High bits set beside the flag: the rule masks, it does not compare.
           "said('unshare-high-bits', libc.syscall(NR['unshare'], ctypes.c_ulong(NEWUSER | (1 << 40))))",
+          // A flag of unshare(2) alone, which a kernel without it calls EINVAL.
+          "said('unshare-empty-mntns', libc.unshare(0x00100000))",
           "said('clone', libc.syscall(NR['clone'], ctypes.c_ulong(NEWUSER | SIGCHLD), None, None, None, None))",
           "said('clone3', libc.syscall(NR['clone3'], None, 0))",
           "said('setns', libc.syscall(NR['setns'], -1, 0))",
@@ -466,6 +468,7 @@ describe.if(isLinux)(
         for (const call of [
           'unshare',
           'unshare-high-bits',
+          'unshare-empty-mntns',
           'clone',
           'setns',
           'open_tree',
