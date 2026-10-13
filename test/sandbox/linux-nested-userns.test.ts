@@ -266,6 +266,53 @@ describe.if(isLinux)(
       },
     )
 
+    it.if(APPLY_SECCOMP !== null)(
+      'a single wrap can be given the option, either way, and nothing but true lifts the limit',
+      async () => {
+        const configured = (
+          allowNestedUserNamespaces?: boolean,
+        ): SandboxRuntimeConfig => ({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: { denyRead: [], allowWrite: [PROJECT], denyWrite: [] },
+          allowNestedUserNamespaces,
+        })
+        const wrapGiven = (allowNestedUserNamespaces: unknown) =>
+          SandboxManager.wrapWithSandbox('true', undefined, {
+            allowNestedUserNamespaces,
+          } as Partial<SandboxRuntimeConfig>)
+        const before = SandboxManager.getConfig()
+        try {
+          for (const [session, given, said] of [
+            [false, true, 1],
+            [undefined, true, 1],
+            [true, false, 0],
+            [true, undefined, 1],
+            [false, undefined, 0],
+            [false, 'yes', 0],
+            [false, 1, 0],
+          ] as const) {
+            SandboxManager.updateConfig(configured(session))
+            expect([session, given, await wrapGiven(given)]).toEqual([
+              session,
+              given,
+              expect.stringContaining(
+                `SRT_ALLOW_NESTED_USERNS=${said} ${APPLY_SECCOMP}`,
+              ),
+            ])
+          }
+          // The one before it leaves nothing behind for the next.
+          SandboxManager.updateConfig(configured(false))
+          await wrapGiven(true)
+          expect(await SandboxManager.wrapWithSandbox('true')).toContain(
+            `SRT_ALLOW_NESTED_USERNS=0 ${APPLY_SECCOMP}`,
+          )
+        } finally {
+          // The configuration outlives a reset, and the next file's tests.
+          SandboxManager.updateConfig(before ?? configured())
+        }
+      },
+    )
+
     // ---- live ------------------------------------------------------------
 
     it.if(CAN_RUN_CHAIN && APPLY_SECCOMP !== null)(

@@ -1856,10 +1856,6 @@ function getEnableWeakerNestedSandbox(): boolean | undefined {
   return config?.enableWeakerNestedSandbox
 }
 
-function getAllowNestedUserNamespaces(): boolean | undefined {
-  return config?.allowNestedUserNamespaces
-}
-
 function getEnableWeakerNetworkIsolation(): boolean | undefined {
   return config?.enableWeakerNetworkIsolation
 }
@@ -2301,6 +2297,8 @@ async function wrapWithSandboxOnce(
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
+  const allowNestedUserNamespaces =
+    customConfig?.allowNestedUserNamespaces ?? config?.allowNestedUserNamespaces
 
   const gitSafeDirectories = getGitSafeDirectories(customConfig)
 
@@ -2364,7 +2362,7 @@ async function wrapWithSandboxOnce(
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowNestedUserNamespaces: getAllowNestedUserNamespaces(),
+        allowNestedUserNamespaces,
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
