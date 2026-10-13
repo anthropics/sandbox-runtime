@@ -1516,7 +1516,7 @@ export async function initializeLinuxNetworkBridge(
  * detached all at once; a directory opened beforehand then reaches the denied
  * names. So by default the helper refuses the calls with a seccomp filter and
  * sets user.max_user_namespaces to zero in the namespace it made. `1` lifts
- * both.
+ * both. A wrap with no helper gives bubblewrap --disable-userns instead.
  */
 const NESTED_USERNS_ENV = 'SRT_ALLOW_NESTED_USERNS'
 
@@ -1529,6 +1529,38 @@ const NESTED_USERNS_ENV = 'SRT_ALLOW_NESTED_USERNS'
 function helperEnvironmentPrefix(allowNestedUserNamespaces: boolean): string {
   return `${NESTED_USERNS_ENV}=${allowNestedUserNamespaces ? '1' : '0'} `
 }
+
+// Keyed by path, like the uid-0 probe. Only an answer is kept: a probe that
+// failed is made again the next time.
+const disableUsernsProbes = new Map<string, boolean>()
+
+/**
+ * Whether this bubblewrap lists --disable-userns (0.8.0 and later) and can
+ * honour it: a setuid bubblewrap refuses the option outright.
+ */
+export function bwrapCanDisableUserns(bwrap: string): boolean {
+  const cached = disableUsernsProbes.get(bwrap)
+  if (cached !== undefined) return cached
+  let can = false
+  try {
+    if ((fs.statSync(bwrap).mode & 0o4000) === 0) {
+      const help = spawnSync(bwrap, ['--help'], {
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        encoding: 'utf8',
+      })
+      const text = `${help.stdout ?? ''}${help.stderr ?? ''}`
+      if (help.error !== undefined || text.trim() === '') return false
+      can = text.includes('--disable-userns')
+    }
+  } catch {
+    return false
+  }
+  disableUsernsProbes.set(bwrap, can)
+  return can
+}
+
+let noUsernsLimitLogged = false
 
 /**
  * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
@@ -3618,6 +3650,30 @@ export async function wrapCommandWithSandboxLinux(
     // the variable is cleared after every other environment operation, which
     // bubblewrap applies in argument order, and helperEnvironmentPrefix sets it.
     bwrapArgs.push('--unsetenv', NESTED_USERNS_ENV)
+
+    // With no helper to refuse user namespaces, bubblewrap is asked to. Never
+    // beside the helper, which makes one of its own, and not under
+    // enableWeakerNestedSandbox: bubblewrap does it by writing a sysctl, and
+    // dies on the read-only /proc/sys of an unprivileged container.
+    if (
+      applySeccompPrefix === undefined &&
+      allowNestedUserNamespaces !== true
+    ) {
+      const bwrap = enableWeakerNestedSandbox
+        ? null
+        : (bwrapPath ?? whichSync('bwrap'))
+      if (bwrap !== null && bwrapCanDisableUserns(bwrap)) {
+        bwrapArgs.push('--disable-userns')
+      } else if (!noUsernsLimitLogged) {
+        noUsernsLimitLogged = true
+        logForDebugging(
+          '[Sandbox Linux] no seccomp helper in use, and bubblewrap cannot disable user namespaces ' +
+            '(needs 0.8.0 or later, not setuid, and no enableWeakerNestedSandbox) - ' +
+            'a sandboxed command that creates one can undo the write denies',
+          { level: 'warn' },
+        )
+      }
+    }
 
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
     // by creating a nested user namespace. This requires the host to permit
