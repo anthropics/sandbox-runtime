@@ -106,6 +106,44 @@ describe.if(!isWindows)('getDefaultWritePaths', () => {
     ).toEqual(getDefaultWritePaths())
   })
 
+  it('takes a pattern too large to compile as one that covers', () => {
+    expect(
+      getDefaultWritePaths({ denyRead: ['/x/' + 'a'.repeat(1 << 20) + '*'] }),
+    ).toEqual(SANDBOX_OWN)
+  })
+
+  // The engines differ in when they find a pattern too large.
+  it.each([
+    ['node', 'node'],
+    ['bun', process.execPath],
+  ])(
+    'getFsWriteConfig() answers for such a pattern, in %s',
+    (_, runtime) => {
+      const { stdout, stderr } = spawnSync(
+        runtime,
+        [
+          '-e',
+          `import('./dist/index.js').then(async ({ SandboxManager }) => {
+             await SandboxManager.initialize({
+               network: { allowedDomains: [], deniedDomains: [] },
+               filesystem: {
+                 denyRead: ['/x/' + 'a'.repeat(1 << 20) + '*'],
+                 allowWrite: [],
+                 denyWrite: [],
+               },
+             })
+             const { allowOnly } = SandboxManager.getFsWriteConfig()
+             await SandboxManager.reset()
+             process.stdout.write(JSON.stringify(allowOnly), () => process.exit(0))
+           })`,
+        ],
+        { cwd: REPO_ROOT, encoding: 'utf8', timeout: 30_000 },
+      )
+      expect([stderr, JSON.parse(stdout || 'null')]).toEqual(['', SANDBOX_OWN])
+    },
+    60_000,
+  )
+
   it.each([
     {
       name: 'an allowRead above the directory, beneath the deny',
@@ -217,6 +255,24 @@ describe.if(isLinux || isMacOS)(
       expect(grantsWrite(wrapped, join(fakeHome, CLAUDE_DEBUG))).toBe(false)
       // A per-call allowRead of the directory keeps its write allow.
       expect(grantsWrite(reopened, join(fakeHome, NPM_LOGS))).toBe(true)
+    })
+
+    it.if(isLinux)('is covered by a denyWrite entry above it', () => {
+      mkdirSync(join(fakeHome, NPM_LOGS), { recursive: true })
+      const wrapped = runWithHome(
+        fakeHome,
+        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+       console.log(JSON.stringify(await SandboxManager.wrapWithSandbox('true', undefined, {
+         filesystem: { denyRead: [], allowWrite: [], denyWrite: ['~/.npm'] },
+       })))`,
+      ) as string
+
+      const npm = join(fakeHome, '.npm')
+      expect(grantsWrite(wrapped, join(fakeHome, NPM_LOGS))).toBe(true)
+      expect(wrapped.indexOf(`--ro-bind ${npm} ${npm}`)).toBeGreaterThan(
+        wrapped.indexOf(`--bind ${npm}/_logs ${npm}/_logs`),
+      )
+      expect(wrapped).not.toContain(`--ro-bind ${fakeHome}/.claude`)
     })
   },
 )
