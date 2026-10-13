@@ -3,7 +3,13 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
@@ -76,21 +82,17 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
   })
 
   describe('with customConfig network overrides', () => {
-    it('blocks network when allowedDomains is empty', async () => {
+    it('keeps proxy routing when the custom allowlist is empty', async () => {
       const command = 'curl https://example.com'
       const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
-        network: {
-          allowedDomains: [], // Block all network
-          deniedDomains: [],
-        },
+        network: { allowedDomains: [], deniedDomains: [] },
       })
 
-      // Should wrap but without proxy env vars when allowedDomains is empty
       expect(wrapped).not.toBe(command)
-
-      // The wrapped command should not contain proxy port references
-      // when there are no allowed domains (no network access needed)
-      // Note: This is implementation-specific and may need adjustment
+      expect(wrapped).toContain('HTTP_PROXY')
+      expect(SandboxManager.getNetworkRestrictionConfig().allowedHosts).toEqual(
+        createTestConfig().network.allowedDomains,
+      )
     })
 
     it('uses main config network when customConfig.network is undefined', async () => {
@@ -109,13 +111,13 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
   })
 
   describe('readonly mode simulation', () => {
-    it('can create a fully restricted sandbox config', async () => {
+    it('can restrict writes without replacing session proxy policy', async () => {
       const command = 'ls -la'
 
       // This is what BashTool passes for readonly commands
       const readonlyConfig = {
         network: {
-          allowedDomains: [], // Block all network
+          allowedDomains: [], // Session proxy policy remains in force
           deniedDomains: [],
         },
         filesystem: {
@@ -153,10 +155,10 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
       expect(wrapped).not.toBe(command)
     })
 
-    it('only overrides specified network fields', async () => {
+    it('accepts custom network lists without changing session policy', async () => {
       const command = 'echo test'
 
-      // Only override allowedDomains
+      // Custom domains request routing but do not replace proxy policy.
       const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
         network: {
           allowedDomains: ['custom.example.com'],
@@ -168,6 +170,199 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
     })
   })
 })
+
+// Profile/command generation only. No proxies, native sandbox or Apple Events execution.
+describe.if(isMacOS || isLinux)(
+  'wrapWithSandbox command-policy overrides',
+  () => {
+    type Value = boolean | number | string[]
+    let directory: string
+    let previousCwd: string
+    let base: SandboxRuntimeConfig
+    const booleanFields = isMacOS
+      ? [
+          'network.allowAllUnixSockets',
+          'network.allowLocalBinding',
+          'filesystem.allowGitConfig',
+          'allowPty',
+          'enableWeakerNetworkIsolation',
+          'allowAppleEvents',
+        ]
+      : [
+          'network.allowAllUnixSockets',
+          'filesystem.allowGitConfig',
+          'enableWeakerNestedSandbox',
+        ]
+    const cases: { field: string; session: Value; overrides: Value[] }[] = [
+      ...booleanFields.flatMap(field => [
+        { field, session: false, overrides: [true] },
+        { field, session: true, overrides: [false] },
+      ]),
+      ...(isMacOS
+        ? [
+            {
+              field: 'network.allowMachLookup',
+              session: ['com.example.srt.session'],
+              overrides: [['com.example.srt.invocation'], []],
+            },
+            {
+              field: 'network.allowUnixSockets',
+              session: ['/tmp/srt-session.sock'],
+              overrides: [['/tmp/srt-invocation.sock'], []],
+            },
+          ]
+        : [
+            { field: 'mandatoryDenySearchDepth', session: 1, overrides: [3] },
+            { field: 'mandatoryDenySearchDepth', session: 3, overrides: [1] },
+          ]),
+    ]
+
+    beforeAll(() => {
+      previousCwd = process.cwd()
+      directory = realpathSync(mkdtempSync(join(tmpdir(), 'srt-policy-')))
+      for (const name of ['.git/hooks', 'reef/cave'])
+        mkdirSync(join(directory, name), { recursive: true })
+      for (const name of [
+        '.git/config',
+        'octopus.secret',
+        'starfish.lock',
+        'reef/cave/.bashrc',
+      ])
+        writeFileSync(join(directory, name), '')
+      process.chdir(directory)
+      base = {
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [join(directory, 'octopus.secret')],
+          allowWrite: [directory],
+          denyWrite: [join(directory, 'starfish.lock')],
+        },
+        // Deterministic, non-executed helper prefix. No native helper discovery.
+        seccomp: { applyPath: '/srt-profile-only', argv0: 'apply-seccomp' },
+      }
+    })
+
+    afterAll(async () => {
+      try {
+        await SandboxManager.reset()
+      } finally {
+        process.chdir(previousCwd)
+        rmSync(directory, { recursive: true, force: true })
+      }
+    })
+
+    it.each(cases)(
+      '$field with session $session',
+      async ({ field, session, overrides }) => {
+        const policy = withField(base, field, session)
+        SandboxManager.updateConfig(policy)
+        const original = await SandboxManager.wrapWithSandbox(
+          'true',
+          '/bin/bash',
+        )
+        const getters = () => [
+          SandboxManager.getAllowUnixSockets(),
+          SandboxManager.getAllowLocalBinding(),
+          SandboxManager.getAllowMachLookup(),
+          SandboxManager.getEnableWeakerNestedSandbox(),
+          SandboxManager.getFsWriteConfig(),
+        ]
+        const sessionGetters = structuredClone(getters())
+        const snapshot = structuredClone(SandboxManager.getConfig())
+        assertPolicy(original, field, session)
+        assertPolicy(
+          await SandboxManager.wrapWithSandbox('true', '/bin/bash', {}),
+          field,
+          session,
+        )
+        for (const value of overrides) {
+          const custom = withField(base, field, value)
+          const customSnapshot = structuredClone(custom)
+          const wrapped = await SandboxManager.wrapWithSandbox(
+            'true',
+            '/bin/bash',
+            custom,
+          )
+          assertPolicy(wrapped, field, value)
+          expect(wrapped).toContain(join(directory, '.git/hooks'))
+          expect(wrapped).toContain(join(directory, 'octopus.secret'))
+          expect(wrapped).toContain(join(directory, 'starfish.lock'))
+          if (isLinux) {
+            expect(wrapped).toContain('--unshare-pid')
+            expect(wrapped).toContain('--unshare-user')
+          } else {
+            expect(wrapped).toContain('(global-name "com.apple.system.logger")')
+            expect(wrapped).not.toContain('(allow network*)')
+          }
+          expect(SandboxManager.getConfig()).toEqual(snapshot)
+          expect(getters()).toEqual(sessionGetters)
+          expect(custom).toEqual(customSnapshot)
+          assertPolicy(
+            await SandboxManager.wrapWithSandbox('true', '/bin/bash'),
+            field,
+            session,
+          )
+        }
+      },
+    )
+
+    function assertPolicy(wrapped: string, field: string, value: Value): void {
+      if (Array.isArray(value)) {
+        const names =
+          field === 'network.allowMachLookup'
+            ? ['com.example.srt.session', 'com.example.srt.invocation']
+            : ['/tmp/srt-session.sock', '/tmp/srt-invocation.sock']
+        for (const name of names) {
+          const rules =
+            field === 'network.allowMachLookup'
+              ? [`(allow mach-lookup (global-name "${name}"))`]
+              : [
+                  `(allow network-bind (local unix-socket (subpath "${name}")))`,
+                  `(allow network-outbound (remote unix-socket (subpath "${name}")))`,
+                ]
+          for (const rule of rules) {
+            if (value.includes(name)) expect(wrapped).toContain(rule)
+            else expect(wrapped).not.toContain(rule)
+          }
+        }
+        return
+      }
+      const rules: Record<string, string> = {
+        'network.allowAllUnixSockets': isMacOS
+          ? '(path-regex #"^/")'
+          : 'ARGV0=apply-seccomp',
+        'network.allowLocalBinding': '(allow network-bind (local ip "*:*"))',
+        'filesystem.allowGitConfig': join(directory, '.git/config'),
+        allowPty: '(allow pseudo-tty)',
+        enableWeakerNetworkIsolation: '(global-name "com.apple.trustd.agent")',
+        allowAppleEvents: '(allow appleevent-send)',
+        enableWeakerNestedSandbox: '--bind /proc /proc',
+        mandatoryDenySearchDepth: join(directory, 'reef/cave/.bashrc'),
+      }
+      const enabled =
+        field === 'mandatoryDenySearchDepth' ? value === 3 : Boolean(value)
+      const inverse =
+        field === 'filesystem.allowGitConfig' ||
+        (field === 'network.allowAllUnixSockets' && isLinux)
+      expect(wrapped.includes(rules[field]!)).toBe(inverse ? !enabled : enabled)
+    }
+
+    // Set one field without replacing its enclosing network/filesystem block.
+    function withField(
+      policy: SandboxRuntimeConfig,
+      field: string,
+      value: Value,
+    ): SandboxRuntimeConfig {
+      const result = structuredClone(policy)
+      const [section, key] = field.split('.')
+      const target = (
+        key ? result[section as keyof SandboxRuntimeConfig] : result
+      ) as Record<string, unknown>
+      target[key ?? section!] = value
+      return result
+    }
+  },
+)
 
 /**
  * Tests for restriction pattern semantics
@@ -544,17 +739,9 @@ describe('restriction pattern semantics', () => {
   })
 })
 
-/**
- * Tests for the empty allowedDomains vulnerability fix
- *
- * These tests verify that when allowedDomains is explicitly set to an empty array [],
- * network access is blocked (as documented) rather than allowed (the bug).
- *
- * Documentation states: "Empty array = no network access"
- * Bug behavior: Empty array = full unrestricted network access
- * Fixed behavior: Empty array = network isolation enabled, all network blocked
- */
-describe('empty allowedDomains network blocking (CVE fix)', () => {
+// Empty custom lists still request isolation and proxy routing. They do not
+// replace the proxy's session allowlist or prove that traffic is denied.
+describe('empty custom allowedDomains network routing', () => {
   const command = 'curl https://example.com'
 
   describe('SandboxManager.wrapWithSandbox with empty allowedDomains', () => {
@@ -578,14 +765,14 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
     })
 
     it.if(isLinux)(
-      'empty allowedDomains in customConfig triggers network restriction on Linux',
+      'empty custom allowedDomains retains network isolation on Linux',
       async () => {
         const result = await SandboxManager.wrapWithSandbox(
           command,
           undefined,
           {
             network: {
-              allowedDomains: [], // Empty = block all network (documented behavior)
+              allowedDomains: [], // Session proxy policy remains in force
               deniedDomains: [],
             },
             filesystem: {
@@ -604,14 +791,14 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
     )
 
     it.if(isMacOS)(
-      'empty allowedDomains in customConfig triggers network restriction on macOS',
+      'empty custom allowedDomains retains network isolation on macOS',
       async () => {
         const result = await SandboxManager.wrapWithSandbox(
           command,
           undefined,
           {
             network: {
-              allowedDomains: [], // Empty = block all network (documented behavior)
+              allowedDomains: [], // Session proxy policy remains in force
               deniedDomains: [],
             },
             filesystem: {

@@ -299,6 +299,20 @@ child.on('exit', async code => {
 })
 ```
 
+**Per-command policy (`customConfig`).** The third argument to `wrapWithSandbox` / `wrapWithSandboxArgv` accepts the following command-local fields. Each omitted field falls back to session policy. Explicit `false` overrides `true`, and replacement lists accept `[]` to clear optional grants. Session configuration and zero-argument getters remain unchanged.
+
+| Fields                                                                                      | Platforms    |
+| ------------------------------------------------------------------------------------------- | ------------ |
+| `filesystem.denyRead`, `allowRead`, `allowWrite`, `denyWrite`, `disabled`, `allowGitConfig` | macOS, Linux |
+| `network.allowAllUnixSockets`                                                               | macOS, Linux |
+| `network.allowUnixSockets`, `allowLocalBinding`, `allowMachLookup`                          | macOS        |
+| `allowPty`, `enableWeakerNetworkIsolation`, `allowAppleEvents`                              | macOS        |
+| `enableWeakerNestedSandbox`, `mandatoryDenySearchDepth`                                     | Linux        |
+
+Filesystem lists keep mandatory/default protections. Supplying any `filesystem` override defaults its `disabled` to `false`, even if the session disabled filesystem restrictions. `allowGitConfig` does not unblock Git hooks or other mandatory denials. `git.safeDirectories` remains additive, not replacement.
+
+These are policy overrides, not a general config merge. Proxy and tooling settings remain session-scoped. Custom `network.allowedDomains` and `network.deniedDomains` do not replace the proxy's session lists: `allowedDomains: []` does not revoke session allowances. For per-command domain grants, use `registerCommandNetworkLists` below.
+
 **Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you _execute_ is not the command the invocation _represents_ (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`. A `commandId` you pass to `wrapWithSandbox` must be the same non-empty string you then pass to `annotateStderrWithSandboxFailures` / `getViolationsForCommand`; an empty one is treated as no `commandId` at all, so the key is the command.
 
 Only the key is cut to 100 characters. As of v0.0.76 the reported `command` — and the text `ignoreViolations` command patterns are matched against — is the whole command for an invocation wrapped without a `commandId`, not its first 100 characters; a pattern can therefore only suppress more than it did before, never less. An attribution key no invocation of this process registered (the carriers are writable from inside the sandbox) is reported sanitized and cut to that same key length.
