@@ -35,9 +35,8 @@ export function overrideEmittedConnectionProbe(
 
 /** The runtime, as the start-up error names it. */
 function runtimeName(): string {
-  const bun = (globalThis as { Bun?: { version?: unknown } }).Bun
-  if (bun !== undefined) return `Bun ${String(bun.version)}`
-  return `Node ${process.version}`
+  const bun = process.versions.bun
+  return bun !== undefined ? `Bun ${bun}` : `Node ${process.version}`
 }
 
 /**
@@ -61,6 +60,14 @@ export function assertTlsTerminationSupported(): void {
  * last batch, the request target among them, would be lost. Where the
  * parser on the socket has no onHeaders, collect the batches as Node's
  * server does and hand them to onHeadersComplete.
+ *
+ * The parser reports a chunked request's trailers through onHeaders too
+ * (with the request's own target again), after the body and before
+ * onMessageComplete. Those are not a batch of the next request's head:
+ * what is held when a message completes is dropped, as Node's server
+ * clears its own, so a request's trailers and target never become part of
+ * the request that follows it on the connection. Where the parser has no
+ * onMessageComplete to tell the two apart, nothing is installed.
  */
 export function keepFlushedHeaderBatches(sock: Socket): void {
   const parser: unknown = (sock as { parser?: unknown }).parser
@@ -69,17 +76,25 @@ export function keepFlushedHeaderBatches(sock: Socket): void {
   const statics = parser.constructor as {
     kOnHeaders?: unknown
     kOnHeadersComplete?: unknown
+    kOnMessageComplete?: unknown
   }
   if (
     typeof statics.kOnHeaders !== 'number' ||
-    typeof statics.kOnHeadersComplete !== 'number'
+    typeof statics.kOnHeadersComplete !== 'number' ||
+    typeof statics.kOnMessageComplete !== 'number'
   ) {
     return
   }
   const onHeaders = statics.kOnHeaders
   const onHeadersComplete = statics.kOnHeadersComplete
+  const onMessageComplete = statics.kOnMessageComplete
   const complete = slots[onHeadersComplete]
-  if (typeof slots[onHeaders] === 'function' || typeof complete !== 'function')
+  const messageComplete = slots[onMessageComplete]
+  if (
+    typeof slots[onHeaders] === 'function' ||
+    typeof complete !== 'function' ||
+    typeof messageComplete !== 'function'
+  )
     return
   let headers: string[] = []
   let url = ''
@@ -99,6 +114,29 @@ export function keepFlushedHeaderBatches(sock: Socket): void {
     }
     return (complete as (...a: unknown[]) => unknown).apply(this, args)
   }
+  slots[onMessageComplete] = function (
+    this: unknown,
+    ...args: unknown[]
+  ): unknown {
+    // Whatever came through onHeaders since the head was the message's
+    // trailers.
+    headers = []
+    url = ''
+    return (messageComplete as (...a: unknown[]) => unknown).apply(this, args)
+  }
+}
+
+/**
+ * A header string holds one char per byte, as the HTTP parser read it from
+ * the upstream, and Node's server names latin1 when it writes a response's
+ * head. Bun's server for an emitted connection names no encoding, so the
+ * socket's default applies: as UTF-8, every header byte from 0x80 up would
+ * reach the client as two. So latin1 is made the default of a socket about
+ * to be emitted. Anything else written to it with no encoding named has to
+ * be bytes or ASCII (see respondDenied).
+ */
+export function writeHeadsAsLatin1(sock: Socket): void {
+  if (runsOnBun()) sock.setDefaultEncoding('latin1')
 }
 
 /**

@@ -120,6 +120,31 @@ describe('proxy auth + network deny semantics', () => {
     )
   })
 
+  it('a deniedDomains entry spelled like a member of Object.prototype has the reason written for it, or the generic one', async () => {
+    const names = ['constructor', 'valueOf', '__proto__', 'hasOwnProperty']
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: names,
+        deniedDomainReasons: { valueOf: 'its own' },
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    for (const name of names) {
+      const reason = name === 'valueOf' ? 'its own' : 'host is on the deny list'
+      const { response } = await proxyRequest(port, name)
+      expect(response).toStartWith(`HTTP/1.1 403 ${reason}\r\n`)
+      expect(response).toContain('X-Proxy-Error: blocked-by-allowlist\r\n')
+      expect(store.getViolations().map(v => v.line)).toContain(
+        `deny network-outbound ${name}:443 (${reason})`,
+      )
+    }
+  })
+
   it('honors ignoreViolations for proxy-recorded network denials', async () => {
     await SandboxManager.initialize({
       network: {

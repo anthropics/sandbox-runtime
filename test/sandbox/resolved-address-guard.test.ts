@@ -788,9 +788,12 @@ describe('resolved-address-guard: through the proxy servers', () => {
       proxyPort,
       `CONNECT rebind.example.com:${upstreamPort} HTTP/1.1\r\nHost: rebind.example.com:${upstreamPort}\r\n\r\n`,
     )
-    expect(resp.startsWith('HTTP/1.1 403')).toBe(true)
+    // The class is the status phrase too: few clients show the body.
+    expect(resp).toStartWith('HTTP/1.1 403 resolved to a loopback address\r\n')
     expect(resp).toContain('X-Proxy-Error: blocked-by-sandbox-runtime')
-    expect(resp).toContain('resolved to a loopback address')
+    expect(resp).toEndWith(
+      '\r\n\r\nConnection to rebind.example.com blocked: resolved to a loopback address',
+    )
     expect(resp).not.toContain('127.0.0.1')
     expect(denials.map(d => `${d.host}:${d.port}`)).toEqual([
       `rebind.example.com:${upstreamPort}`,

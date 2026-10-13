@@ -156,7 +156,7 @@ const ParentProxyConfigSchema = z.object({
  * - `mask` — the sandboxed process sees a per-session sentinel value; the
  *   host proxy substitutes sentinel→real on egress to `injectHosts`.
  *   For files this is whole-file masking (Linux only; degrades to `deny`
- *   on macOS — see {@link CredentialFileConfigSchema}).
+ *   on macOS and Windows — see {@link CredentialFileConfigSchema}).
  */
 const credentialModeSchema = z.enum(['deny', 'mask'])
 
@@ -271,7 +271,7 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
  * `extract`/`decode`) currently degrades to `mode: "deny"` (the file is
- * unreadable inside the sandbox).
+ * unreadable inside the sandbox). Nor can an ACL, so on Windows it does too.
  */
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(
@@ -692,7 +692,7 @@ export const NetworkConfigSchema = z.object({
     .optional()
     .describe(
       'Optional model-facing reason keyed by the exact deniedDomains entry it explains (e.g., {"github.com:22": "SSH pushes to GitHub are blocked; use an https remote"}). ' +
-        'Reported in the <sandbox_violations> line when that entry denies a connection; entries without one use a generic reason. ' +
+        'Reported in the <sandbox_violations> line when that entry denies a connection, and to the sandboxed client as the status phrase of the 403 that answers its CONNECT; entries without one use a generic reason. ' +
         'Keys are matched by exact entry string, so a key with no matching deniedDomains entry never fires.',
     ),
   strictAllowlist: z
@@ -721,7 +721,7 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      'If true, allow all Unix sockets (disables blocking on both platforms).',
+      'If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK).',
     ),
   allowLocalBinding: z
     .boolean()
