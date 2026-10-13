@@ -352,6 +352,36 @@ describe('restriction pattern semantics', () => {
         rmSync(socksSock, { force: true })
       }
     })
+
+    it.if(isLinux)(
+      'quotes the socket addresses, so a space in the path cannot split them',
+      async () => {
+        const dir = join(tmpdir(), `srt test dir ${process.pid}`)
+        mkdirSync(dir, { recursive: true })
+        const httpSock = join(dir, 'srt-test-http.sock')
+        const socksSock = join(dir, 'srt-test-socks.sock')
+        writeFileSync(httpSock, '')
+        writeFileSync(socksSock, '')
+        try {
+          const result = await wrapCommandWithSandboxLinux({
+            command,
+            needsNetworkRestriction: true,
+            httpSocketPath: httpSock,
+            socksSocketPath: socksSock,
+            readConfig: { denyOnly: [] },
+            writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+          })
+
+          // Bare, the inner shell splits the address at the space, socat gets a
+          // third address, and the message goes to /dev/null.
+          expect(result).toContain(`'UNIX-CONNECT:${httpSock}'`)
+          expect(result).toContain(`'UNIX-CONNECT:${socksSock}'`)
+          expect(result).not.toContain(`reuseaddr UNIX-CONNECT:${httpSock} `)
+        } finally {
+          rmSync(dir, { recursive: true, force: true })
+        }
+      },
+    )
   })
 
   describe('write restrictions (allow-only pattern)', () => {
