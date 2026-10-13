@@ -135,7 +135,12 @@ describe('mux-proxy first-byte dispatch', () => {
   )
 
   it.each([
-    ['', 'HTTP/1.1 502 Bad Gateway\r\n'],
+    // Whether a backend that goes away shows here as an error at all is the
+    // platform's. On Linux a write fails first, and it does. On macOS and
+    // Windows this client is just closed, so the case would tell nothing.
+    ...(process.platform === 'linux'
+      ? [['', 'HTTP/1.1 502 Bad Gateway\r\n']]
+      : []),
     ['HTTP/1.1 200 Connection Established\r\n\r\n', ''],
   ])(
     'a backend that fails having answered %p: the mux adds %p',
