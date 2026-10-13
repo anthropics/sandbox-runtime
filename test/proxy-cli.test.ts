@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { connect, createServer, type Socket } from 'node:net'
 import type { Writable } from 'node:stream'
@@ -340,6 +340,95 @@ describe('srt-proxy entry', () => {
       20_000,
     )
   }
+})
+
+/**
+ * Runs the entry to completion with only stdin, stdout and stderr open, and
+ * returns what it wrote as bytes (one character per byte).
+ */
+function runToExit(
+  args: string[],
+  options?: { env?: NodeJS.ProcessEnv; cwd?: string },
+) {
+  const r = spawnSync(process.execPath, [ENTRY, ...args], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...options,
+  })
+  return {
+    status: r.status,
+    stdout: r.stdout.toString('latin1'),
+    stderr: r.stderr.toString('latin1'),
+  }
+}
+
+describe('srt-proxy --version', () => {
+  const manifest = JSON.parse(
+    readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+  ) as { version: string }
+  const LINE = `srt-proxy ${manifest.version}\n`
+
+  test('prints one line, the name and the package version, and exits 0', () => {
+    expect(manifest.version).toMatch(
+      /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/,
+    )
+    expect(runToExit(['--version'])).toEqual({
+      status: 0,
+      stdout: LINE,
+      stderr: '',
+    })
+  })
+
+  test('needs nothing from the environment or the working directory', () => {
+    expect(runToExit(['--version'], { env: {}, cwd: '/' })).toEqual({
+      status: 0,
+      stdout: LINE,
+      stderr: '',
+    })
+  })
+
+  // Descriptors 3 to 6 are closed in the child: starting on them fails, so
+  // the same answer shows that none of them was opened or read.
+  const CLOSED_FDS = [
+    '--listen-fd',
+    '3',
+    '--decider-fd',
+    '4',
+    '--lifeline-fd',
+    '5',
+    '--ca-fd',
+    '6',
+  ]
+
+  test('opens no descriptor another option names', () => {
+    expect(runToExit(CLOSED_FDS).status).not.toBe(0)
+    for (const args of [
+      [...CLOSED_FDS, '--version'],
+      ['--version', ...CLOSED_FDS],
+    ])
+      expect(runToExit(args)).toEqual({ status: 0, stdout: LINE, stderr: '' })
+  })
+
+  test.each([
+    ['after an option that does not exist', ['--no-such-option', '--version']],
+    ['before an option that does not exist', ['--version', '--no-such-option']],
+    ['where another option expects its value', ['--listen-fd', '--version']],
+    [
+      'after an address that would be refused',
+      ['--decider-fd', '3', '--listen', '0.0.0.0:0', '--version'],
+    ],
+    ['with --help', ['--help', '--version']],
+    ['given twice', ['--version', '--version']],
+  ])('wins over the rest of the command line: %s', (_name, args) => {
+    expect(runToExit(args)).toEqual({ status: 0, stdout: LINE, stderr: '' })
+  })
+
+  test('is listed by --help', () => {
+    const help = runToExit(['--help'])
+    expect(help.status).toBe(0)
+    expect(help.stderr).toBe('')
+    expect(help.stdout).toStartWith('Usage: srt-proxy [options]')
+    expect(help.stdout).toMatch(/^ {2}--version {2,}\S/m)
+  })
 })
 
 /** Whether this host can bind the IPv6 loopback address. */

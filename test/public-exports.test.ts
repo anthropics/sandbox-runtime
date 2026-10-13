@@ -53,6 +53,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'isUncPath',
   'parseWindowsBinShell',
   'parseWindowsSandboxError',
+  'realPathOf',
   'resolveSrtWin',
   'restoreWindowsAcl',
   'revokeWindowsAcl',

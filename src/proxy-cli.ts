@@ -1,9 +1,11 @@
 /**
  * `srt proxy` argument handling, shared by the `srt` CLI and the
  * standalone proxy entry (proxy-main.ts). Kept free of anything that needs
- * files next to the bundle (package.json, vendor/), so it compiles into a
- * single executable.
+ * files next to the bundle (vendor/, or package.json read at run time), so
+ * it compiles into a single executable. The package manifest is a static
+ * import, which a bundler embeds.
  */
+import pkg from '../package.json' with { type: 'json' }
 import { Command } from 'commander'
 import { isIPv4, isIPv6 } from 'node:net'
 import {
@@ -13,6 +15,13 @@ import {
 } from './sandbox/proxy-only.js'
 
 export async function runProxyCli(argv: string[]): Promise<void> {
+  // `--version` anywhere on the command line prints one line and does nothing
+  // else: no other option is parsed, so no descriptor is opened, nothing is
+  // read or bound, and the process ends once the line is written.
+  if (argv.includes('--version')) {
+    process.stdout.write(`srt-proxy ${pkg.version}\n`)
+    return
+  }
   const program = new Command('srt-proxy')
     .description(
       'Run only the HTTP proxy, deciding every request through an external decider on inherited fds.',
@@ -60,6 +69,10 @@ export async function runProxyCli(argv: string[]): Promise<void> {
       'let allow verdicts set headers on plain-HTTP requests (cleartext)',
     )
     .option('-d, --debug', 'enable debug logging')
+    .option(
+      '--version',
+      'print "srt-proxy <version>" and exit; every other option is ignored',
+    )
     .exitOverride(err => {
       process.exit(err.exitCode === 0 ? 0 : 2)
     })

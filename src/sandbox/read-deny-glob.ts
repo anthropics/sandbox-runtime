@@ -130,6 +130,10 @@ export function* expandReadDenyGlobLinuxSteps(
   }
 
   const locations = new Set<string>()
+  /** Links kept under their own spelling, which is not where they lead: a
+   *  directory denied above one hides the link and not that place, so they
+   *  take no part in the collapse. */
+  const spelledLinks: string[] = []
   /** Which spelling first put a location in the list, for the warning below. */
   const namedBy = new Map<string, string>()
   const addLocation = (location: string, candidate: string): void => {
@@ -153,7 +157,7 @@ export function* expandReadDenyGlobLinuxSteps(
         `[Sandbox Linux] denyRead glob "${globPattern}": ${candidate} leads somewhere that cannot be inspected; denying what holds it`,
         { level: 'warn' },
       )
-      addLocation(candidate, candidate)
+      spelledLinks.push(candidate)
       continue
     }
     const location = locationOf(candidate)
@@ -231,5 +235,5 @@ export function* expandReadDenyGlobLinuxSteps(
       { level: 'warn' },
     )
   }
-  return [...mounts].sort()
+  return [...mounts, ...spelledLinks].sort()
 }

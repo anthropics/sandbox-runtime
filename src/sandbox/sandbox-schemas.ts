@@ -28,6 +28,16 @@ export interface FsReadRestrictionConfig {
   literalDenyOnly?: string[]
   literalAllowWithinDeny?: string[]
   /**
+   * The `denyOnly` entries that come from `credentials.files`. Their only
+   * exceptions are the `ownAllowWithinDeny` paths. Absent when there are none.
+   */
+  credentialDenyOnly?: string[]
+  /**
+   * The `allowWithinDeny` entries the library adds for files of its own that
+   * a command is pointed at. Absent when there are none.
+   */
+  ownAllowWithinDeny?: string[]
+  /**
    * The `denyOnly` entries that stand for a directory a glob expansion could
    * not list. Nothing is bound back beneath one — neither an
    * `allowWithinDeny` path nor an allowed write path — because what the
@@ -72,7 +82,7 @@ export interface FsWriteRestrictionConfig {
  * - `maskedFileBinds`: (realPath → fakePath) pairs for whole-file masking;
  *   the platform layer binds fakePath over realPath read-only so the
  *   sandbox reads a sentinel instead of the real bytes (Linux only —
- *   macOS degrades these to denyReadPaths).
+ *   macOS and Windows degrade these to read denies).
  * - `maskedFileStoreDir`: host directory holding the fake files. The
  *   Linux layer ro-binds it over itself so the sandbox cannot tamper
  *   with the bind sources regardless of allowWrite.
@@ -132,9 +142,10 @@ export type NetworkHostPattern = {
  * Asked about a host that no configured rule and no per-command allow list
  * decided (never asked under `network.strictAllowlist`). Only `true` allows.
  * `{ allow: false, reason }` denies with that reason, which the violation
- * line reports. `false` and every other answer, truthy or not, deny with the
- * generic reason "user denied": a `reason` on an object that does not say
- * `allow: false` is not reported.
+ * line reports, and which the sandboxed client reads as the status phrase of
+ * the 403 that answers its CONNECT. `false` and every other answer, truthy
+ * or not, deny with the generic reason "user denied": a `reason` on an
+ * object that does not say `allow: false` is not reported.
  *
  * The reason is sanitized like the rest of a violation line (runs of control
  * or invisible characters become one space, `<` and `>` are removed, the
