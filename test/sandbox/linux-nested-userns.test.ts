@@ -254,6 +254,15 @@ describe.if(isLinux)(
             allowNestedUserNamespaces: true,
           }),
         ).not.toContain('--disable-userns')
+        // Nothing but true allows them, as with the helper.
+        for (const given of ['yes', 1]) {
+          expect(
+            await wrap('true', {
+              allowAllUnixSockets: true,
+              allowNestedUserNamespaces: given as unknown as boolean,
+            }),
+          ).toContain('--disable-userns')
+        }
         // Bubblewrap would die on an unprivileged container's /proc/sys.
         expect(
           await wrap('true', {

@@ -3655,7 +3655,10 @@ export async function wrapCommandWithSandboxLinux(
     // beside the helper, which makes one of its own, and not under
     // enableWeakerNestedSandbox: bubblewrap does it by writing a sysctl, and
     // dies on the read-only /proc/sys of an unprivileged container.
-    if (applySeccompPrefix === undefined && !allowNestedUserNamespaces) {
+    if (
+      applySeccompPrefix === undefined &&
+      allowNestedUserNamespaces !== true
+    ) {
       const bwrap = enableWeakerNestedSandbox
         ? null
         : (bwrapPath ?? whichSync('bwrap'))
