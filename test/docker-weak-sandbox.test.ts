@@ -166,6 +166,31 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(existsSync(out)).toBe(false)
   })
 
+  // The kernel would let it: the command holds the capability.
+  it('cannot make a mount namespace of its own (seccomp helper)', () => {
+    const probe = join(WORK, 'mount-namespace-probe.py')
+    writeFileSync(
+      probe,
+      [
+        'import ctypes, errno, os, platform',
+        'libc = ctypes.CDLL(None, use_errno=True)',
+        "CLONE = {'x86_64': 56, 'aarch64': 220}[platform.machine()]",
+        'NEWNS, SIGCHLD = 0x00020000, 17',
+        'def said(label, rc):',
+        "    print(label, 'ok' if rc >= 0 else errno.errorcode.get(ctypes.get_errno()))",
+        "said('unshare', libc.unshare(NEWNS))",
+        'pid = libc.syscall(CLONE, ctypes.c_ulong(NEWNS | SIGCHLD), None, None, None, None)',
+        'if pid == 0: os._exit(0)',
+        "said('clone', pid)",
+        '',
+      ].join('\n'),
+    )
+    const r = srt(`echo SANDBOX-RAN; python3 ${probe}`)
+    expect(r.stdout).toContain('SANDBOX-RAN')
+    expect(r.stdout).toContain('unshare EPERM')
+    expect(r.stdout).toContain('clone EPERM')
+  })
+
   // This job's /proc is masked, so the helper cannot mount a fresh one and
   // the command still sees the helper's outer process, which shares its user
   // namespace. The command holds a full capability set there; what keeps it
