@@ -120,15 +120,15 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     const upstream = backendSocketPath
       ? connect(backendSocketPath)
       : connect(backendTcpPort!, '127.0.0.1')
-    let dialed = false
-    upstream.once('connect', () => {
-      dialed = true
+    let answered = false
+    upstream.once('data', () => {
+      answered = true
     })
     upstream.on('error', err => {
-      // Past the dial the client may be in the middle of anything, a TLS
-      // tunnel included, where clear text is noise. The 'close' that follows
-      // ends it.
-      if (dialed) {
+      // The 502 is an answer, for a client that has had none. One that has
+      // may be in the middle of anything, a TLS tunnel included, where clear
+      // text is noise. The 'close' that follows ends it.
+      if (answered) {
         logForDebugging(`mux: HTTP backend error: ${(err as Error).message}`)
         return
       }
