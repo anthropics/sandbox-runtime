@@ -1481,6 +1481,24 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(asynFail).toEqual(syncFail)
   })
 
+  it('checkWindowsDependencies{,Async}: a partial WFP set is an install error', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const partial = JSON.stringify({
+      ...JSON.parse(RAW_WFP),
+      state: 'partial',
+      filters: 3,
+    })
+    stubSpawn(argv => ({
+      status: 0,
+      stdout: argv.includes('user') ? RAW_USER : partial,
+    }))
+    const sync = checkWindowsDependencies({ srtWin })
+    const asyn = await checkWindowsDependenciesAsync({ srtWin })
+    expect(sync.errors).toHaveLength(1)
+    expect(sync.errors[0]).toMatch(/WFP filter set incomplete \(3 present\)/)
+    expect(asyn).toEqual(sync)
+  })
+
   it('checkWindowsDependenciesAsync: probes run concurrently', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     let inFlight = 0
