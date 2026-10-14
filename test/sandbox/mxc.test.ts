@@ -643,6 +643,8 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
       // with the install-time trust-ca step. Discriminators: the
       // typed WindowsSandboxError family (trust-ca gates,
       // provisioning — thrown only by srt-win machinery), the
+      // dependency check naming the unprovisioned sandbox user (the
+      // first describe uninstalled what it installed), the
       // persistent-CA reconcile, and the explicit-path thumbprint
       // gate messages. Anything else — including any failure on an
       // mxc host, the suite's actual target — stays loud. Backend
@@ -651,7 +653,9 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
       const msg = e instanceof Error ? e.message : String(e)
       const srtWinFlavored =
         e instanceof WindowsSandboxError ||
-        /^ensurePersistentWindowsCa|^tlsTerminate on Windows/.test(msg)
+        /^ensurePersistentWindowsCa|^tlsTerminate on Windows|^Sandbox dependencies not available: Sandbox user is not provisioned/.test(
+          msg,
+        )
       if (!srtWinFlavored) throw e
       console.error(
         `[boundaries tls] srt-win tls init failed — G rows skipped: ${msg}`,
