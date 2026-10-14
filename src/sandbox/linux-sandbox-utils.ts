@@ -254,13 +254,11 @@ function resolveSymlinkedDenyPath(
 }
 
 /**
- * Check if any existing component in the path is a file (not a directory).
- * If so, the target path can never be created because you can't mkdir under a file.
- *
- * This handles the git worktree case: .git is a file, so .git/hooks can never
- * exist and there's nothing to deny.
+ * The first existing component of the path that is not a directory, if there
+ * is one. Nothing can be created below it for as long as it is there: a git
+ * worktree's `.git` is a file, so there is no `.git/hooks`.
  */
-function hasFileAncestor(targetPath: string): boolean {
+function fileOnTheWay(targetPath: string): string | undefined {
   const parts = targetPath.split(path.sep)
   let currentPath = ''
 
@@ -268,11 +266,7 @@ function hasFileAncestor(targetPath: string): boolean {
     if (!part) continue // Skip empty parts (leading /)
     const nextPath = currentPath + path.sep + part
     try {
-      const stat = fs.statSync(nextPath)
-      if (stat.isFile()) {
-        // This component exists as a file — nothing below it can be created
-        return true
-      }
+      if (!fs.statSync(nextPath).isDirectory()) return nextPath
     } catch {
       // Path doesn't exist — stop checking
       break
@@ -280,7 +274,7 @@ function hasFileAncestor(targetPath: string): boolean {
     currentPath = nextPath
   }
 
-  return false
+  return undefined
 }
 
 /**
@@ -401,7 +395,8 @@ function makeableMountPoint(
 /**
  * The part of the mandatory deny set that follows from the cwd alone: the
  * dangerous files and directories resolved against it, plus `.git/hooks` and
- * (unless the caller allows git config) `.git/config`.
+ * (unless the caller allows git config) `.git/config`, or a `.git` that is a
+ * file.
  * {@link linuxGetMandatoryDenyPaths} adds the nested matches its ripgrep scan
  * finds on top of these. Split out so a consumer that must not scan — the
  * violation monitor, which needs the same denies to judge a write bwrap
@@ -419,19 +414,23 @@ export function linuxGetCwdMandatoryDenyPaths(
     ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
   ]
 
-  // Git hooks and config are only denied when .git exists as a directory.
-  // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
-  // .git/hooks can never exist — denying it would cause bwrap to fail.
+  // Git hooks and config are denied where .git is a directory.
+  // In a git worktree or a submodule .git is a file ("gitdir: /path/..."),
+  // and there are no .git/hooks for as long as it is one. So the file is
+  // denied, which keeps it one.
   // When .git doesn't exist at all, mounting at .git would block its
   // creation and break git init.
   const dotGitPath = path.resolve(cwd, '.git')
-  let dotGitIsDirectory = false
+  let dotGitIsDirectory: boolean | undefined
   try {
     dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
   } catch {
     // .git doesn't exist
   }
 
+  if (dotGitIsDirectory === false) {
+    denyPaths.push(dotGitPath)
+  }
   if (dotGitIsDirectory) {
     // Git hooks always blocked for security
     denyPaths.push(path.resolve(cwd, '.git/hooks'))
@@ -538,6 +537,9 @@ async function linuxGetMandatoryDenyPaths(
   // Git hooks always blocked in nested repos. A repository is known by its
   // HEAD, so that its hooks are denied before there are any.
   iglobArgs.push('--iglob', '**/.git/hooks/**', '--iglob', '**/.git/HEAD')
+  // The .git of a nested worktree or submodule, which is a file. (ripgrep
+  // lists files: a directory of that name does not match.)
+  iglobArgs.push('--iglob', '.git')
 
   // Git config conditionally blocked in nested repos
   if (!allowGitConfig) {
@@ -2778,7 +2780,8 @@ async function generateFilesystemArgs(
      * The placeholder an absent deny path adds to the plan: where, which is
      * its first missing component, and the kind of mount point bubblewrap
      * makes for it on the host. `kind` is undefined where none can be made,
-     * and the whole answer where the path adds nothing.
+     * 'held' where what is there is bound onto itself, and the whole answer
+     * undefined where the path adds nothing.
      *
      * INVARIANT: a placeholder is left out only where the sandboxed command
      * cannot create the path either; each branch says why it cannot. On any
@@ -2787,7 +2790,9 @@ async function generateFilesystemArgs(
      */
     const mountPointFor = (
       absentPath: string,
-    ): { dest: string; kind: MountPointKind | undefined } | undefined => {
+    ):
+      | { dest: string; kind: MountPointKind | 'held' | undefined }
+      | undefined => {
       const none = (why: string): undefined => {
         logForDebugging(
           `[Sandbox Linux] No placeholder for non-existent deny path ${absentPath}: ${why}`,
@@ -2819,12 +2824,19 @@ async function generateFilesystemArgs(
       ) {
         return none('it is read-only there')
       }
-      // Nothing can be created under a file: a git worktree's .git is one.
+      // Nothing can be created under a file (a git worktree's .git is one),
+      // for as long as the file is there. So it is kept there: the command
+      // may write the directory that holds it. It is not tracked for removal:
+      // it is the caller's own, or another sandbox's mount point.
       // Asked of what lies above the path, not of the path: another sandbox's
       // bubblewrap may have made a mount point at it since it was found
       // absent, and a file there is no reason to leave it unbound.
-      if (hasFileAncestor(path.dirname(absentPath))) {
-        return none('a file lies above it')
+      const file = fileOnTheWay(path.dirname(absentPath))
+      if (file !== undefined) {
+        if (seenDenyWrite.has(file)) return none(`${file} is denied itself`)
+        seenDenyWrite.add(file)
+        decidedMountPoints.add(file)
+        return { dest: file, kind: 'held' }
       }
 
       // A component with a deny path beneath it is covered by an empty
@@ -2939,9 +2951,11 @@ async function generateFilesystemArgs(
           const { dest, kind } = placeholder
           denyWriteArgs.push(
             '--ro-bind',
-            kind === 'directory'
-              ? (emptySource ??= ensureEmptyMountSourceDir())
-              : '/dev/null',
+            kind === 'held'
+              ? dest
+              : kind === 'directory'
+                ? (emptySource ??= ensureEmptyMountSourceDir())
+                : '/dev/null',
             dest,
           )
           // The first of the denies that share the destination. The record is
@@ -2953,7 +2967,11 @@ async function generateFilesystemArgs(
             kind === undefined
               ? `[Sandbox Linux] No mount point at ${dest}, which neither bubblewrap nor the command can create, for ${normalizedPath}`
               : `[Sandbox Linux] Mounted ${
-                  kind === 'directory' ? 'empty dir' : '/dev/null'
+                  kind === 'held'
+                    ? 'itself'
+                    : kind === 'directory'
+                      ? 'empty dir'
+                      : '/dev/null'
                 } at ${dest} to block creation of ${normalizedPath}`,
           )
         }
