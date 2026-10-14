@@ -150,14 +150,17 @@ export function peekForClientHello(
  * Bun's TLS socket keeps reading the duplex under it while it is itself
  * paused, so once `consumer` (the TLS socket) is set, nothing more is read
  * from the client while that is paused: its uploads wait in the kernel.
+ *
+ * @internal Exported for its test.
  */
-function duplexOverSocket(
+export function duplexOverSocket(
   socket: Duplex,
   head: Buffer,
   onClosed: (how: string) => void,
-): { duplex: Duplex; setConsumer: (consumer: Readable) => void } {
+): { duplex: Duplex; setConsumer: (consumer: Duplex) => void } {
   let waiting = false
-  let consumer: Readable | undefined
+  let closing = false
+  let consumer: Duplex | undefined
   let waitingForConsumer = false
   const onConsumerResume = (): void => {
     waitingForConsumer = false
@@ -194,14 +197,30 @@ function duplexOverSocket(
     },
     final(cb) {
       socket.off('readable', onReadable)
+      closing = true
       closeAfterFlush(socket, onClosed)
       cb()
     },
     destroy(err, cb) {
-      socket.destroy()
+      // From `final` on the socket is closeAfterFlush's to close.
+      if (err || !closing) socket.destroy()
       cb(err)
     },
   })
+  // A TLS socket on this stream has finished once it has written here, long
+  // before the client has it all, and may then be destroyed: by a server's
+  // destroySoon(), or because its client has ended too. That would drop what
+  // is queued here. So it counts as an end (which, depending on the runtime,
+  // has or has not come first), and the client is given all of it.
+  const destroy = d.destroy.bind(d)
+  d.destroy = (err?: Error) => {
+    const done = d.writableEnded || consumer?.writableFinished
+    if (err || !done || d.writableFinished || socket.destroyed) {
+      return destroy(err)
+    }
+    if (!d.writableEnded) d.end()
+    return d
+  }
   if (head.length) d.push(head)
   socket.once('end', () => d.push(null))
   // The socket's own errors are handled where the tunnel starts; here they
@@ -224,8 +243,10 @@ function duplexOverSocket(
  * reads in that socket's own buffer too, which grows by the whole upload.
  * `outbound` is the stream whose write queue holds what is on its way to
  * the client.
+ *
+ * @internal Exported for its test.
  */
-function serverTlsOn(
+export function serverTlsOn(
   socket: Duplex,
   head: Buffer,
   options: TLSSocketOptions,
