@@ -343,6 +343,66 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(off.argv).not.toContain('--quiet')
   })
 
+  it('writeRestrictedToken off (unset or false): argv and env are exactly the no-option ones', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const base = {
+      command: 'git fetch',
+      httpProxyPort: 60080,
+      cwd: 'C:\\work\\repo',
+      caCertPath: 'C:/bundle.pem',
+      denyRead: ['C:\\secret'],
+      srtWin,
+    }
+    const unset = wrapCommandWithSandboxWindows(base)
+    const off = wrapCommandWithSandboxWindows({
+      ...base,
+      writeRestrictedToken: false,
+    })
+    expect(off.argv).toEqual(unset.argv)
+    expect(off.env).toEqual(unset.env)
+    expect(unset.argv).not.toContain('--write-restricted-token')
+    expect(unset.argv.join(' ')).not.toContain('http.sslBackend')
+  })
+
+  it('writeRestrictedToken on: --write-restricted-token reaches exec, before --, and nothing else in argv changes but the git backend entry', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const base = {
+      command: 'git fetch',
+      httpProxyPort: 60080,
+      cwd: 'C:\\work\\repo',
+      caCertPath: 'C:/bundle.pem',
+      srtWin,
+    }
+    const off = wrapCommandWithSandboxWindows(base)
+    const on = wrapCommandWithSandboxWindows({
+      ...base,
+      writeRestrictedToken: true,
+    })
+    // An srt-win option, so it must sit before `--`: after it the
+    // flag would be handed to the sandboxed command instead.
+    const flagAt = on.argv.indexOf('--write-restricted-token')
+    expect(flagAt).toBeGreaterThan(on.argv.indexOf('exec'))
+    expect(flagAt).toBeLessThan(on.argv.indexOf('--'))
+    expect(on.argv.filter(a => a === '--write-restricted-token')).toHaveLength(
+      1,
+    )
+    // The only differences from the option-off argv: the flag, one
+    // more git config entry, and the count that covers it.
+    const added = on.argv.filter(a => !off.argv.includes(a))
+    expect(added.sort()).toEqual(
+      [
+        '--write-restricted-token',
+        'GIT_CONFIG_COUNT=5',
+        'GIT_CONFIG_KEY_4=http.sslBackend',
+        'GIT_CONFIG_VALUE_4=openssl',
+      ].sort(),
+    )
+    const removed = off.argv.filter(a => !on.argv.includes(a))
+    expect(removed).toEqual(['GIT_CONFIG_COUNT=4'])
+    // The schannel knobs stay (harmless under the OpenSSL backend).
+    expect(on.argv).toContain('GIT_CONFIG_KEY_2=http.schannelUseSSLCAInfo')
+  })
+
   it('resolveSrtWin: explicit path → used verbatim, sentinel prepend', () => {
     const set = resolveSrtWin({ path: process.execPath })
     expect(set.exe).toBe(process.execPath)
@@ -496,6 +556,27 @@ describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
   })
 })
 
+describe('WindowsConfigSchema.writeRestrictedToken (pure, all platforms)', () => {
+  it('is an optional boolean, absent by default', () => {
+    const none = WindowsConfigSchema.parse({})
+    expect(none.writeRestrictedToken).toBeUndefined()
+    expect(
+      WindowsConfigSchema.parse({ writeRestrictedToken: true })
+        .writeRestrictedToken,
+    ).toBe(true)
+    expect(
+      WindowsConfigSchema.parse({ writeRestrictedToken: false })
+        .writeRestrictedToken,
+    ).toBe(false)
+    // A truthy non-boolean must not switch the token shape on.
+    for (const bad of ['true', 1, 'yes', null]) {
+      expect(
+        WindowsConfigSchema.safeParse({ writeRestrictedToken: bad }).success,
+      ).toBe(false)
+    }
+  })
+})
+
 describe('buildGitConfigEnv (pure, all platforms)', () => {
   it('emits safe.directory (dir + dir/*) + schannel knobs; forward slashes; deduped', () => {
     const env = buildGitConfigEnv({
@@ -541,6 +622,46 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
 
   it('returns {} when nothing to emit', () => {
     expect(buildGitConfigEnv({ safeDirs: [], schannelCa: false })).toEqual({})
+  })
+
+  it('http.sslBackend=openssl appears only with opensslBackend', () => {
+    const values = (env: Record<string, string>) =>
+      Object.entries(env)
+        .filter(([k]) => k.startsWith('GIT_CONFIG_KEY_'))
+        .map(([k, v]) => `${v}=${env[k.replace('KEY', 'VALUE')]}`)
+    const off = buildGitConfigEnv({ safeDirs: ['C:/r'], schannelCa: true })
+    expect(values(off)).not.toContain('http.sslBackend=openssl')
+    expect(
+      values(
+        buildGitConfigEnv({
+          safeDirs: ['C:/r'],
+          schannelCa: true,
+          opensslBackend: false,
+        }),
+      ),
+    ).toEqual(values(off))
+    const on = buildGitConfigEnv({
+      safeDirs: ['C:/r'],
+      schannelCa: true,
+      opensslBackend: true,
+    })
+    // Appended last, so every earlier entry keeps its index.
+    expect(values(on)).toEqual([...values(off), 'http.sslBackend=openssl'])
+    expect(on.GIT_CONFIG_COUNT).toBe(String(Number(off.GIT_CONFIG_COUNT) + 1))
+    // On its own (no safe dirs, no schannel knobs) it is still emitted.
+    expect(buildGitConfigEnv({ safeDirs: [], opensslBackend: true })).toEqual({
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'http.sslBackend',
+      GIT_CONFIG_VALUE_0: 'openssl',
+    })
+    // The caller's GIT_CONFIG_COUNT=0 opt-out still wins.
+    expect(
+      buildGitConfigEnv({
+        safeDirs: [],
+        opensslBackend: true,
+        baseEnv: { GIT_CONFIG_COUNT: '0' },
+      }),
+    ).toEqual({})
   })
 
   it('wrapCommandWithSandboxWindows: GIT_CONFIG_* rides the --env overlay', () => {
@@ -1230,6 +1351,60 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   afterEach(() => {
     spawnSpy?.mockRestore()
     spawnSyncSpy?.mockRestore()
+  })
+
+  it('verifyWindowsWfpEgress: default argv is unchanged; writeRestrictedToken adds --write-restricted-token', async () => {
+    const target = '127.0.0.1:49999'
+    stubSpawn(() => ({
+      status: 0,
+      stdout: JSON.stringify({ egress_probe: 'blocked', target }),
+    }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    await verifyWindowsWfpEgress({ target, srtWin })
+    await verifyWindowsWfpEgress({
+      target,
+      writeRestrictedToken: false,
+      srtWin,
+    })
+    await verifyWindowsWfpEgress({ target, writeRestrictedToken: true, srtWin })
+    const plain = [SRT_WIN_DISPATCH_ARG1, 'wfp', 'verify', '--target', target]
+    expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+      plain,
+      plain,
+      [...plain, '--write-restricted-token'],
+    ])
+  })
+
+  it('verifyWindowsWfpEgress with writeRestrictedToken rejects every outcome but blocked', async () => {
+    const target = '127.0.0.1:49999'
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    // 3 = the probe child connected (fence open for this token);
+    // 2 = unreachable; 1 = the probe child could not be created
+    // (e.g. the restricted token could not be built) → `error`.
+    for (const [status, probe, code] of [
+      [3, 'connected', 'wfp_fence_inactive'],
+      [2, 'unreachable', 'wfp_verify_inconclusive'],
+      [1, 'error', 'wfp_verify_inconclusive'],
+    ] as const) {
+      spawnSyncSpy?.mockRestore()
+      spawnSpy?.mockRestore()
+      stubSpawn(() => ({
+        status,
+        stdout: JSON.stringify({ egress_probe: probe, target }),
+      }))
+      let thrown: unknown
+      try {
+        await verifyWindowsWfpEgress({
+          target,
+          writeRestrictedToken: true,
+          srtWin,
+        })
+      } catch (e) {
+        thrown = e
+      }
+      expect(thrown).toBeInstanceOf(WindowsSandboxError)
+      expect((thrown as WindowsSandboxError).code).toBe(code)
+    }
   })
 
   it('getWindowsSandboxUserStatus{,Async}: identical argv + identical result', async () => {
@@ -2104,6 +2279,58 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     // call after a fresh user-provision creates the seclogon profile
     // (~8s on the CI runner), same budget as the verify test above.
   }, 60_000)
+
+  it('windows.writeRestrictedToken: initialize() verifies the fence with that token, exec carries the flag, a per-command override is refused', async () => {
+    installWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      proxyPortRange: PORT_RANGE,
+      srtWin: TEST_SRT_WIN,
+    })
+    const cfg = createTestConfig()
+    cfg.windows = { ...cfg.windows, writeRestrictedToken: true }
+    // Runs `wfp verify --write-restricted-token` for real: a lockdown
+    // child holding the restricted token must be refused by the fence,
+    // or this throws.
+    await SandboxManager.initialize(cfg)
+    try {
+      const { argv, env } =
+        await SandboxManager.wrapWithSandboxArgv('echo WR-TOKEN-OK')
+      expect(argv).toContain('--write-restricted-token')
+      expect(argv.indexOf('--write-restricted-token')).toBeLessThan(
+        argv.indexOf('--'),
+      )
+      const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+      const backendKey = envArgs.find(e => e.endsWith('=http.sslBackend'))
+      expect(backendKey).toMatch(/^GIT_CONFIG_KEY_\d+=http\.sslBackend$/)
+      expect(envArgs).toContain(
+        `${backendKey!.split('=')[0].replace('KEY', 'VALUE')}=openssl`,
+      )
+      const r = await spawnAsync(argv[0], argv.slice(1), {
+        timeout: 60_000,
+        env,
+      })
+      expectStatus('write-restricted echo', r, [0])
+      expect(r.stdout).toContain('WR-TOKEN-OK')
+      // The session's token shape is the one the fence was verified
+      // for; a command cannot switch to the other one.
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+      await expect(
+        SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
+          windows: { writeRestrictedToken: false },
+        }),
+      ).rejects.toThrow(/Per-command windows\.writeRestrictedToken/)
+    } finally {
+      await SandboxManager.reset()
+    }
+    // After reset the next session is back on the default token.
+    await SandboxManager.initialize(createTestConfig())
+    try {
+      const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(argv).not.toContain('--write-restricted-token')
+    } finally {
+      await SandboxManager.reset()
+    }
+  }, 120_000)
 })
 
 describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {

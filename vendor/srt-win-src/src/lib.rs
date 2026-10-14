@@ -38,4 +38,5 @@ pub mod user;
 
 pub mod cert_store;
 pub mod logon;
+pub mod probe;
 pub mod runner;

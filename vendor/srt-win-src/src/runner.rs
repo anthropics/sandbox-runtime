@@ -51,6 +51,13 @@ pub enum RunnerCmd {
     /// desk/grants/lockdown — the probe runs as the bare runner
     /// (same as [`InstallCa`](Self::InstallCa)); the WFP filter
     /// keys on the user SID, which the runner already carries.
+    ///
+    /// This is the probe for the **default** child token. With the
+    /// write-restricted token the child's token differs from the
+    /// runner's in a way the filter's access check can see, so `wfp
+    /// verify --write-restricted-token` does not use this command: it
+    /// sends an [`Exec`](Self::Exec) of `srt-win probe connect`, so
+    /// the connect is made by a process holding the child token.
     ProbeEgress { target: String },
 }
 
@@ -66,6 +73,11 @@ pub struct RunnerSpec {
     /// sandbox user's machine-only `PATH` while `USERPROFILE` /
     /// `TEMP` stay isolated. The proxy var set rides here too.
     pub env_overlay: Vec<(String, String)>,
+    /// Build the child token write-restricted (`srt-win exec
+    /// --write-restricted-token`; see [`crate::token`]). Off unless
+    /// the broker asks for it.
+    #[serde(default)]
+    pub write_restricted_token: bool,
 }
 
 /// Read a 4-byte little-endian length prefix followed by that many
@@ -120,7 +132,12 @@ pub fn run() -> Result<u32> {
                 );
             }
             let exe = std::path::PathBuf::from(&spec.argv[0]);
-            launch::run_lockdown(&exe, &spec.argv[1..], &spec.env_overlay)
+            launch::run_lockdown(
+                &exe,
+                &spec.argv[1..],
+                &spec.env_overlay,
+                spec.write_restricted_token,
+            )
         }
         RunnerCmd::InstallCa { der } => {
             let thumb = crate::cert_store::install_root_ca(&der)?;
@@ -130,50 +147,7 @@ pub fn run() -> Result<u32> {
             );
             Ok(0)
         }
-        RunnerCmd::ProbeEgress { target } => {
-            use std::net::{SocketAddr, TcpStream};
-            use std::time::Duration;
-            // WSAEACCES — what WFP returns from ALE_AUTH_CONNECT
-            // when the block-user filter denies the connect. Match
-            // on the raw code (not `ErrorKind::PermissionDenied`)
-            // so `ERROR_ACCESS_DENIED` (5) — which would mean
-            // something OTHER than the WFP fence — falls through
-            // to `unreachable`.
-            const WSAEACCES: i32 = 10013;
-            let addr: SocketAddr = target
-                .parse()
-                .with_context(|| format!("runner: ProbeEgress target '{target}'"))?;
-            // stderr (not stdout): `spawn_runner` pumps the
-            // runner's stdout straight to the broker's stdout, and
-            // the broker writes its own JSON there. The exit code
-            // is the contract; the line is diagnostic.
-            match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
-                Err(e) if e.raw_os_error() == Some(WSAEACCES) => {
-                    eprintln!(
-                        "srt-win: runner: egress probe {target}: \
-                         BLOCKED ({e})"
-                    );
-                    Ok(0)
-                }
-                Ok(_) => {
-                    eprintln!(
-                        "srt-win: runner: egress probe {target}: \
-                         CONNECTED — WFP block-user filter is NOT in \
-                         effect"
-                    );
-                    Ok(3)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "srt-win: runner: egress probe {target}: \
-                         UNREACHABLE: {e} (kind={:?}, os={:?})",
-                        e.kind(),
-                        e.raw_os_error(),
-                    );
-                    Ok(2)
-                }
-            }
-        }
+        RunnerCmd::ProbeEgress { target } => crate::probe::connect(&target),
     }
 }
 
@@ -186,6 +160,7 @@ mod tests {
         let s = RunnerCmd::Exec(RunnerSpec {
             argv: vec!["cmd.exe".into(), "/c".into(), "echo hi".into()],
             env_overlay: vec![("PATH".into(), r"C:\a;C:\b".into())],
+            write_restricted_token: true,
         });
         let bytes = encode_cmd(&s).unwrap();
         assert_eq!(
@@ -197,7 +172,14 @@ mod tests {
             RunnerCmd::Exec(r) => {
                 assert_eq!(r.argv, ["cmd.exe", "/c", "echo hi"]);
                 assert_eq!(r.env_overlay.len(), 1);
+                assert!(r.write_restricted_token);
             }
+            _ => panic!("wrong variant"),
+        }
+        // A spec without the field is the default token.
+        let legacy = br#"{"Exec":{"argv":["cmd.exe"],"env_overlay":[]}}"#;
+        match serde_json::from_slice::<RunnerCmd>(legacy).unwrap() {
+            RunnerCmd::Exec(r) => assert!(!r.write_restricted_token),
             _ => panic!("wrong variant"),
         }
         let ca = RunnerCmd::InstallCa {

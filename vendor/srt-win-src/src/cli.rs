@@ -227,6 +227,17 @@ enum Cmd {
         /// broker chatter.
         #[arg(long)]
         quiet: bool,
+        /// Build the child token with the `WRITE_RESTRICTED` flag and
+        /// the restricting SIDs `[<sandbox user>, Everyone,
+        /// RESTRICTED]`, so write access held by `BUILTIN\Users` /
+        /// `Authenticated Users` no longer reaches the child. Off by
+        /// default. Fails the exec if that token cannot be built —
+        /// there is no fallback to the ordinary token. Schannel-based
+        /// TLS clients (System32 `curl.exe`, schannel-backend git,
+        /// .NET / PowerShell web requests) fail under it. Pair with
+        /// `wfp verify --write-restricted-token`.
+        #[arg(long)]
+        write_restricted_token: bool,
         /// Target executable followed by its arguments. Use `--`
         /// to terminate srt-win's own option parsing.
         #[arg(
@@ -244,6 +255,38 @@ enum Cmd {
     /// be invoked directly.
     #[command(hide = true)]
     Runner,
+    /// Self-checks that report what the calling process's own token
+    /// can do. `wfp verify --write-restricted-token` runs `probe
+    /// connect` as the sandboxed child. Not intended to be invoked
+    /// directly.
+    #[command(hide = true)]
+    Probe {
+        #[command(subcommand)]
+        sub: ProbeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProbeCmd {
+    /// Attempt a direct TCP connect to `--target`. Exits **0** when
+    /// the WFP fence refused it (`WSAEACCES`), **3** when it
+    /// connected, **2** on any other error.
+    Connect {
+        #[arg(long)]
+        target: String,
+    },
+    /// Print this process's token restriction as JSON:
+    /// `{write_restricted, restricted_sids}`. CI smoke hook: only in
+    /// builds with the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    Token,
+    /// Try to open the parent process and each of its threads with
+    /// every write / code-execution / impersonation right, and print
+    /// which opens succeeded as JSON: `{parent_pid, threads, opened,
+    /// errors}`. CI smoke hook: only in builds with the `test-hooks`
+    /// feature.
+    #[cfg(feature = "test-hooks")]
+    ParentAccess,
 }
 
 #[derive(Subcommand)]
@@ -715,6 +758,16 @@ enum WfpCmd {
         /// on any external host.
         #[arg(long)]
         target: String,
+        /// Probe with the token `exec --write-restricted-token` gives
+        /// the child, instead of the default one. The connect is then
+        /// made by a lockdown child (`srt-win probe connect`) holding
+        /// that token, because the WFP block filter matches by an
+        /// access check of the connecting token and a restricted
+        /// token is checked differently from the runner's. A host
+        /// that runs commands with `--write-restricted-token` must
+        /// verify with this flag.
+        #[arg(long)]
+        write_restricted_token: bool,
     },
     /// Remove every srt-win-tagged WFP filter under the sublayer.
     /// Self-elevates via UAC if not already admin.
@@ -1075,7 +1128,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&st)?);
         }
         Cmd::Wfp {
-            sub: WfpCmd::Verify { target },
+            sub:
+                WfpCmd::Verify {
+                    target,
+                    write_restricted_token,
+                },
         } => {
             use srt_win::{install, logon, runner};
             // The WFP BLOCK fires at ALE_AUTH_CONNECT before any
@@ -1097,17 +1154,39 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            let code = logon::spawn_runner(
-                &cred.user,
-                &cred.pw,
-                &sb_sid,
-                None,
-                &runner::RunnerCmd::ProbeEgress {
+            // Default token: the bare runner connects. Its token and
+            // the default child token give the filter's access check
+            // the same answer. Write-restricted token: the runner
+            // launches this binary's `probe connect` as a lockdown
+            // child, so the connect is made under the exact token
+            // (and job, desktop, mitigations) a sandboxed command
+            // gets. A probe child that cannot be created exits the
+            // runner with 1, which is reported as `error` below —
+            // never as `blocked`.
+            let cmd = if write_restricted_token {
+                let exe = std::env::current_exe().context("current_exe")?;
+                let exe = exe
+                    .to_str()
+                    .ok_or_else(|| anyhow!("current_exe is not UTF-8"))?;
+                runner::RunnerCmd::Exec(runner::RunnerSpec {
+                    argv: vec![
+                        exe.to_owned(),
+                        SRT_WIN_DISPATCH_ARG1.to_owned(),
+                        "probe".to_owned(),
+                        "connect".to_owned(),
+                        "--target".to_owned(),
+                        target.clone(),
+                    ],
+                    env_overlay: Vec::new(),
+                    write_restricted_token: true,
+                })
+            } else {
+                runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
-                },
-                false,
-            )
-            .context("spawn runner for egress probe")?;
+                }
+            };
+            let code = logon::spawn_runner(&cred.user, &cred.pw, &sb_sid, None, &cmd, false)
+                .context("spawn runner for egress probe")?;
             let probe = match code {
                 0 => "blocked",
                 3 => "connected",
@@ -1118,14 +1197,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // valid probe outcome.
                 _ => "error",
             };
-            println!(
-                "{}",
-                json!({
-                    "egress_probe": probe,
-                    "target": target,
-                    "runner_exit": code,
-                })
-            );
+            let mut out = json!({
+                "egress_probe": probe,
+                "target": target,
+                "runner_exit": code,
+            });
+            if write_restricted_token {
+                out["write_restricted_token"] = json!(true);
+            }
+            println!("{out}");
             // `process::exit`'s rt::cleanup flushes stdout, but be
             // explicit — this is the only arm that prints to stdout
             // and then `process::exit`s instead of returning Ok(()).
@@ -1437,12 +1517,35 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             std::process::exit(code as i32);
         }
 
+        // ─── probe ─────────────────────────────────────────────────
+        Cmd::Probe {
+            sub: ProbeCmd::Connect { target },
+        } => {
+            let code = srt_win::probe::connect(&target)?;
+            std::process::exit(code as i32);
+        }
+        #[cfg(feature = "test-hooks")]
+        Cmd::Probe {
+            sub: ProbeCmd::Token,
+        } => {
+            let t = srt_win::token::own_token_restriction()?;
+            println!("{}", serde_json::to_string(&t)?);
+        }
+        #[cfg(feature = "test-hooks")]
+        Cmd::Probe {
+            sub: ProbeCmd::ParentAccess,
+        } => {
+            let r = srt_win::probe::parent_access()?;
+            println!("{}", serde_json::to_string(&r)?);
+        }
+
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
             deny_read,
             deny_write,
             env,
             quiet,
+            write_restricted_token,
             target,
         } => {
             use srt_win::install;
@@ -1597,6 +1700,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 &runner::RunnerCmd::Exec(runner::RunnerSpec {
                     argv: target,
                     env_overlay,
+                    write_restricted_token,
                 }),
                 quiet,
             ) {
@@ -1874,6 +1978,102 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    /// `--write-restricted-token` is off unless given, on `exec` and
+    /// on `wfp verify`, and the hidden `probe` subcommands the
+    /// write-restricted verify re-enters through parse — with the
+    /// dispatch sentinel stripped the way `run_from_args` strips it.
+    #[test]
+    fn write_restricted_token_flag_parses() {
+        let on = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--quiet",
+            "--write-restricted-token",
+            "--",
+            "cmd.exe",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            on.cmd,
+            Cmd::Exec {
+                write_restricted_token: true,
+                ..
+            }
+        ));
+        let off = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(
+            off.cmd,
+            Cmd::Exec {
+                write_restricted_token: false,
+                ..
+            }
+        ));
+        // After `--` the flag belongs to the target, not to srt-win.
+        let target_arg = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--",
+            "cmd.exe",
+            "--write-restricted-token",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            target_arg.cmd,
+            Cmd::Exec {
+                write_restricted_token: false,
+                ..
+            }
+        ));
+        let v_on = Cli::try_parse_from([
+            "srt-win",
+            "wfp",
+            "verify",
+            "--target",
+            "127.0.0.1:1",
+            "--write-restricted-token",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            v_on.cmd,
+            Cmd::Wfp {
+                sub: WfpCmd::Verify {
+                    write_restricted_token: true,
+                    ..
+                }
+            }
+        ));
+        let v_off = Cli::try_parse_from(["srt-win", "wfp", "verify", "--target", "127.0.0.1:1"])
+            .expect("parse");
+        assert!(matches!(
+            v_off.cmd,
+            Cmd::Wfp {
+                sub: WfpCmd::Verify {
+                    write_restricted_token: false,
+                    ..
+                }
+            }
+        ));
+        let probe = Cli::try_parse_from(["srt-win", "probe", "connect", "--target", "127.0.0.1:1"])
+            .expect("parse");
+        assert!(matches!(
+            probe.cmd,
+            Cmd::Probe {
+                sub: ProbeCmd::Connect { .. }
+            }
+        ));
+    }
+
+    /// `probe token` and `probe parent-access` are CI smoke hooks:
+    /// they parse only in a `test-hooks` build, so a default (shipped)
+    /// binary does not have them at all.
+    #[test]
+    fn probe_test_hooks_follow_the_feature() {
+        for sub in ["token", "parent-access"] {
+            let parsed = Cli::try_parse_from(["srt-win", "probe", sub]);
+            assert_eq!(parsed.is_ok(), cfg!(feature = "test-hooks"), "probe {sub}");
+        }
     }
 
     /// A path in `denyRead` and in `denyWrite` keeps the read deny,

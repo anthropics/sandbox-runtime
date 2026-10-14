@@ -22,24 +22,67 @@
 //!     to NT components.
 //!   - All privileges deleted except `SeChangeNotifyPrivilege`.
 //!   - Integrity Level = Medium (same as a normal user process).
-//!   - No `RestrictingSids` array — that breaks Schannel/LSA RPC.
+//!   - No `RestrictingSids` array by default — Schannel credential
+//!     acquisition fails under any token that carries one.
+//!
+//! ## Opt-in: write-restricted token
+//!
+//! With `write_restricted` set, [`make_sandbox_token`] adds the
+//! `WRITE_RESTRICTED` flag and the restricting-SID list
+//! [`restricting_sid_list`] = `[<sandbox user SID>, Everyone,
+//! RESTRICTED]`; everything above is unchanged. A restricted token is
+//! access-checked twice — once against its ordinary groups, once
+//! against the restricting list — and both must grant. With
+//! `WRITE_RESTRICTED` the second check applies to write-class access
+//! only, so reads behave as before, while a write must be granted to
+//! a SID in the list. The sandbox account is a member of
+//! `BUILTIN\Users` and `Authenticated Users`; neither is in the
+//! list, so write access those groups hold anywhere on the machine
+//! stops reaching the child.
+//!
+//! Why each SID is in the list:
+//!   - **The sandbox user SID** — every ACE the broker writes for
+//!     the sandbox (working-tree grants, deny stamps, the
+//!     window-station / desktop / `BaseNamedObjects` grants, the
+//!     default DACL below, the account's own profile) is keyed on
+//!     it, so those keep satisfying both checks with no change to
+//!     the ACL code. It is also what keeps the WFP egress BLOCK
+//!     matching — see [`crate::wfp::sddl_sandbox_user`]. **Removing
+//!     it from the list would silently disable the network fence.**
+//!   - **Everyone** and **RESTRICTED** — system objects a process
+//!     needs write-class access to in order to start and run
+//!     (named-object directories, ALPC ports, devices) grant one of
+//!     these; without them the CLR and most non-trivial programs do
+//!     not start.
+//!
+//! What stays writable under the option: anything that grants write
+//! to the sandbox user SID, to Everyone or to RESTRICTED, and
+//! objects the sandbox account owns (an owner is implicitly allowed
+//! to rewrite the DACL, and the owner is in the list).
+//!
+//! Cost: Schannel refuses to acquire credentials for a restricted
+//! token, so TLS clients built on it (System32 `curl.exe`, git's
+//! schannel backend, .NET / PowerShell web requests) fail inside the
+//! sandbox. OpenSSL-based clients are unaffected.
 
 use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::size_of;
 use windows::Win32::Foundation::{HANDLE, LUID};
 use windows::Win32::Security::{
-    ACL, ACL_REVISION, AddAccessAllowedAce, AllocateAndInitializeSid, CreateRestrictedToken,
-    DuplicateTokenEx, FreeSid, GetLengthSid, GetTokenInformation, InitializeAcl, LUA_TOKEN,
-    LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, PSID, SID_AND_ATTRIBUTES, SID_IDENTIFIER_AUTHORITY,
-    SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL, TOKEN_GROUPS,
-    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_USER, TokenDefaultDacl,
-    TokenGroups, TokenIntegrityLevel, TokenPrimary, TokenPrivileges, TokenUser,
+    ACL, ACL_REVISION, AddAccessAllowedAce, AllocateAndInitializeSid,
+    CREATE_RESTRICTED_TOKEN_FLAGS, CreateRestrictedToken, DuplicateTokenEx, FreeSid, GetLengthSid,
+    GetTokenInformation, InitializeAcl, LUA_TOKEN, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    PSID, SID_AND_ATTRIBUTES, SID_IDENTIFIER_AUTHORITY, SecurityImpersonation, SetTokenInformation,
+    TOKEN_ACCESS_INFORMATION, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_USER,
+    TokenAccessInformation, TokenDefaultDacl, TokenGroups, TokenIntegrityLevel, TokenPrimary,
+    TokenPrivileges, TokenRestrictedSids, TokenUser, WRITE_RESTRICTED,
 };
 use windows::Win32::System::SystemServices::SE_GROUP_LOGON_ID;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use crate::sid::LocalPsid;
+use crate::sid::{LocalPsid, psid_to_string};
 use crate::util::{pcwstr, wstr};
 
 /// Medium IL (`SECURITY_MANDATORY_MEDIUM_RID`). The sandbox child
@@ -50,6 +93,95 @@ pub const IL_MEDIUM: u32 = 0x2000;
 /// `BUILTIN\Administrators`. Always added to `SidsToDisable` so an
 /// elevated broker still produces a non-admin child.
 const SID_BUILTIN_ADMINS: &str = "S-1-5-32-544";
+
+/// `Everyone` (World). In the write-restricted list — see the module
+/// doc.
+pub const SID_EVERYONE: &str = "S-1-1-0";
+
+/// `NT AUTHORITY\RESTRICTED`. In the write-restricted list — see the
+/// module doc.
+pub const SID_RESTRICTED: &str = "S-1-5-12";
+
+/// `TOKEN_WRITE_RESTRICTED` (winnt.h) — the bit in
+/// `TOKEN_ACCESS_INFORMATION.Flags` that says the restricting SIDs
+/// gate write-class access only.
+const TOKEN_FLAG_WRITE_RESTRICTED: u32 = 0x0008;
+
+/// `CreateRestrictedToken` flags for the child token: `LUA_TOKEN`
+/// always, plus `WRITE_RESTRICTED` when the option is on.
+pub fn restricted_token_flags(write_restricted: bool) -> CREATE_RESTRICTED_TOKEN_FLAGS {
+    if write_restricted {
+        LUA_TOKEN | WRITE_RESTRICTED
+    } else {
+        LUA_TOKEN
+    }
+}
+
+/// The restricting-SID list of the write-restricted token, in the
+/// order it is passed to `CreateRestrictedToken`. `user_sid` is the
+/// sandbox account's own SID and **must** stay in the list: the WFP
+/// egress BLOCK and every sandbox ACE key on it (module doc).
+pub fn restricting_sid_list(user_sid: &str) -> [String; 3] {
+    [
+        user_sid.to_owned(),
+        SID_EVERYONE.to_owned(),
+        SID_RESTRICTED.to_owned(),
+    ]
+}
+
+/// What a token's restricting-SID state is, as the kernel reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "test-hooks", derive(serde::Serialize))]
+pub struct TokenRestriction {
+    /// `TOKEN_WRITE_RESTRICTED` is set in the token's flags.
+    pub write_restricted: bool,
+    /// The token's restricting SIDs (`TokenRestrictedSids`), as
+    /// strings, in token order. Empty for an unrestricted token.
+    pub restricted_sids: Vec<String>,
+}
+
+/// Read `tok`'s restricting SIDs and write-restricted flag. Needs
+/// `TOKEN_QUERY` on the handle.
+pub fn token_restriction(tok: HANDLE) -> Result<TokenRestriction> {
+    let groups = get_token_info(tok, TokenRestrictedSids)?;
+    let access = get_token_info(tok, TokenAccessInformation)?;
+    if groups.len() < size_of::<u32>() || access.len() < size_of::<TOKEN_ACCESS_INFORMATION>() {
+        return Err(anyhow!("GetTokenInformation returned a short buffer"));
+    }
+    unsafe {
+        let tg = &*(groups.as_ptr() as *const TOKEN_GROUPS);
+        let restricted_sids =
+            std::slice::from_raw_parts(tg.Groups.as_ptr(), tg.GroupCount as usize)
+                .iter()
+                .map(|g| psid_to_string(g.Sid))
+                .collect::<Result<Vec<_>>>()?;
+        let flags = (*(access.as_ptr() as *const TOKEN_ACCESS_INFORMATION)).Flags;
+        Ok(TokenRestriction {
+            write_restricted: flags & TOKEN_FLAG_WRITE_RESTRICTED != 0,
+            restricted_sids,
+        })
+    }
+}
+
+/// [`token_restriction`] of this process's own primary token. Used
+/// only by the `test-hooks` `probe token` subcommand.
+#[cfg(feature = "test-hooks")]
+pub fn own_token_restriction() -> Result<TokenRestriction> {
+    use windows::Win32::Security::TOKEN_QUERY;
+    let mut h = HANDLE::default();
+    unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut h)
+            .context("OpenProcessToken(TOKEN_QUERY)")?;
+    }
+    let h = crate::util::OwnedHandle(h);
+    token_restriction(h.raw())
+}
+
+/// `tok`'s user SID as a string.
+fn token_user_sid(tok: HANDLE) -> Result<String> {
+    let buf = get_token_info(tok, TokenUser)?;
+    psid_to_string(unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid })
+}
 
 /// `SE_GROUP_INTEGRITY` attribute (winnt.h). Required on the
 /// `TOKEN_MANDATORY_LABEL.Label.Attributes` field.
@@ -86,10 +218,15 @@ pub fn open_self_token() -> Result<HANDLE> {
     }
 }
 
-/// Build the restricted child token from `base`. Returns a
-/// non-primary token; the caller duplicates to primary via
-/// [`to_primary`].
-pub fn make_sandbox_token(base: HANDLE) -> Result<HANDLE> {
+/// Build the restricted child token from `base`. The caller
+/// duplicates the result to a primary token via [`to_primary`].
+///
+/// `write_restricted` adds the `WRITE_RESTRICTED` flag and the
+/// [`restricting_sid_list`] (module doc). It fails closed: if the
+/// token cannot be created with the list, or the created token does
+/// not report exactly that list and flag, this returns an error —
+/// there is no fallback to the ordinary token.
+pub fn make_sandbox_token(base: HANDLE, write_restricted: bool) -> Result<HANDLE> {
     // SIDs to disable: `BUILTIN\Administrators` + every
     // `SE_GROUP_LOGON_ID` group in `base` (see module doc — the
     // logon-SID strip is what stops the child reading same-session
@@ -110,27 +247,77 @@ pub fn make_sandbox_token(base: HANDLE) -> Result<HANDLE> {
     // SeChangeNotifyPrivilege.
     let to_delete = privileges_except(base, &["SeChangeNotifyPrivilege"])?;
 
+    // Restricting SIDs: none by default; the fixed three-SID list
+    // when `write_restricted`. `restrict_sids` owns the SID memory
+    // and must outlive `CreateRestrictedToken`.
+    let restrict_want: Vec<String> = if write_restricted {
+        restricting_sid_list(&token_user_sid(base)?).to_vec()
+    } else {
+        Vec::new()
+    };
+    let restrict_sids: Vec<LocalPsid> = restrict_want
+        .iter()
+        .map(|s| LocalPsid::from_string(s))
+        .collect::<Result<_>>()?;
+    let restrict: Vec<SID_AND_ATTRIBUTES> = restrict_sids
+        .iter()
+        .map(|s| SID_AND_ATTRIBUTES {
+            Sid: s.as_psid(),
+            Attributes: 0,
+        })
+        .collect();
+
     let mut out = HANDLE::default();
     unsafe {
         CreateRestrictedToken(
             base,
-            LUA_TOKEN,
+            restricted_token_flags(write_restricted),
             Some(&disable),
             if to_delete.is_empty() {
                 None
             } else {
                 Some(&to_delete)
             },
-            None, // RestrictingSids — intentionally empty
+            if restrict.is_empty() {
+                None
+            } else {
+                Some(&restrict)
+            },
             &mut out,
         )
-        .context("CreateRestrictedToken(disable=[Admins, logon-SIDs])")?;
+        .with_context(|| {
+            format!(
+                "CreateRestrictedToken(disable=[Admins, logon-SIDs], \
+                 write_restricted={write_restricted})"
+            )
+        })?;
     }
-    // `admins` + `logon_sids` (which back the disable-array PSIDs) drop here.
+    // `admins` + `logon_sids` (which back the disable-array PSIDs)
+    // and `restrict_sids` drop at the end of this function.
 
-    // RAII-own `out` so a `?` from set_il/set_default_dacl below
-    // closes it.
+    // RAII-own `out` so a `?` below closes it.
     let guard = crate::util::OwnedHandle(out);
+    if write_restricted {
+        // Fail closed on a token that is not the shape that was asked
+        // for: the caller is about to run a process whose write
+        // confinement depends on it.
+        let got = token_restriction(guard.raw()).context("read back restricting SIDs")?;
+        let same_sids = {
+            let (mut a, mut b) = (got.restricted_sids.clone(), restrict_want.clone());
+            a.sort();
+            b.sort();
+            a == b
+        };
+        if !got.write_restricted || !same_sids {
+            return Err(anyhow!(
+                "write-restricted token was not created as requested: \
+                 write_restricted={} restricted_sids={:?} (wanted {:?})",
+                got.write_restricted,
+                got.restricted_sids,
+                restrict_want,
+            ));
+        }
+    }
     set_il(guard.raw(), IL_MEDIUM)?;
     set_default_dacl(guard.raw(), base)?;
     Ok(guard.into_raw())
@@ -192,7 +379,10 @@ fn set_il(tok: HANDLE, rid: u32) -> Result<()> {
 ///
 /// Keyed on the user SID, not the logon SID: every logon SID in the
 /// child token is deny-only (see [`make_sandbox_token`]), so a
-/// logon-SID ALLOW ACE here would be ignored at access-check.
+/// logon-SID ALLOW ACE here would be ignored at access-check. The
+/// user SID is also in the write-restricted token's restricting list,
+/// so this DACL keeps granting the child write access to the objects
+/// it creates when that option is on.
 /// Siblings inside the sandbox (e.g. a parallel build's worker
 /// processes) share the `srt-sandbox` user SID, so the user-SID grant
 /// covers them — and the broker (different user, two hops away) never
@@ -291,12 +481,56 @@ mod tests {
     #[test]
     fn restricted_token_builds() {
         let base = open_self_token().expect("open_self_token");
-        let r = make_sandbox_token(base);
+        let r = make_sandbox_token(base, false);
         unsafe {
             let _ = CloseHandle(base);
         }
         let tok = r.expect("make_sandbox_token");
+        // The default token carries no restricting SIDs.
+        let shape = token_restriction(tok).expect("token_restriction");
+        assert!(!shape.write_restricted);
+        assert_eq!(shape.restricted_sids, Vec::<String>::new());
         let prim = to_primary(tok).expect("to_primary");
+        unsafe {
+            let _ = CloseHandle(tok);
+            let _ = CloseHandle(prim);
+        }
+    }
+
+    /// The exact flag and restricting list of the opt-in token. The
+    /// user SID is first and must stay: the WFP egress BLOCK matches
+    /// through it (see `wfp::sddl_sandbox_user`), so a list without
+    /// it would leave the child's network egress unfenced.
+    #[test]
+    fn write_restricted_shape_is_pinned() {
+        assert_eq!(restricted_token_flags(false), LUA_TOKEN);
+        assert_eq!(restricted_token_flags(false).0, 0x4);
+        assert_eq!(restricted_token_flags(true).0, 0x4 | 0x8);
+        assert_eq!(WRITE_RESTRICTED.0, 0x8);
+        assert_eq!(
+            restricting_sid_list("S-1-5-21-1-2-3-1005"),
+            ["S-1-5-21-1-2-3-1005", "S-1-1-0", "S-1-5-12"]
+        );
+    }
+
+    /// The kernel reports the token that was asked for: the three
+    /// SIDs, the write-restricted flag, and it survives the duplicate
+    /// to a primary token that `CreateProcessAsUserW` is given.
+    #[test]
+    fn write_restricted_token_reports_exact_list() {
+        let base = open_self_token().expect("open_self_token");
+        let user = token_user_sid(base).expect("token_user_sid");
+        let r = make_sandbox_token(base, true);
+        unsafe {
+            let _ = CloseHandle(base);
+        }
+        let tok = r.expect("make_sandbox_token(write_restricted)");
+        let prim = to_primary(tok).expect("to_primary");
+        for h in [tok, prim] {
+            let shape = token_restriction(h).expect("token_restriction");
+            assert!(shape.write_restricted, "TOKEN_WRITE_RESTRICTED not set");
+            assert_eq!(shape.restricted_sids, restricting_sid_list(&user));
+        }
         unsafe {
             let _ = CloseHandle(tok);
             let _ = CloseHandle(prim);

@@ -1009,6 +1009,10 @@ const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
  *     without `-c http.sslBackend=openssl`. Revocation is disabled
  *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
  *     be WFP-fenced.
+ *   - `http.sslBackend=openssl` when `opensslBackend` (Windows only)
+ *     — for a child whose token Schannel refuses (the write-restricted
+ *     token), so git's HTTPS transport keeps working. Emitted after
+ *     the schannel knobs, which the OpenSSL backend ignores.
  *
  * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
  * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the
@@ -1028,6 +1032,8 @@ export function buildGitConfigEnv(opts: {
   safeDirs: readonly string[]
   /** Windows-only schannel knobs; default false. */
   schannelCa?: boolean
+  /** Windows-only: select git's OpenSSL TLS backend; default false. */
+  opensslBackend?: boolean
   baseEnv?: Readonly<Record<string, string | undefined>>
 }): Record<string, string> {
   // An explicit `GIT_CONFIG_COUNT=0` in baseEnv is an opt-out ("no
@@ -1076,6 +1082,9 @@ export function buildGitConfigEnv(opts: {
   if (opts.schannelCa) {
     emit('http.schannelUseSSLCAInfo', 'true')
     emit('http.schannelCheckRevoke', 'false')
+  }
+  if (opts.opensslBackend) {
+    emit('http.sslBackend', 'openssl')
   }
   if (n === start) return {}
   out.GIT_CONFIG_COUNT = String(n)

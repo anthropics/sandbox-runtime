@@ -469,6 +469,18 @@ export interface WindowsSandboxParams {
    */
   srtWin?: SrtWinSpawn
   /**
+   * Run the child under the write-restricted token
+   * (`SandboxRuntimeConfig.windows.writeRestrictedToken`): adds
+   * `--write-restricted-token` to the `srt-win exec` argv and selects
+   * git's OpenSSL backend in the injected git config (Schannel
+   * refuses restricted tokens). Default `false`, which leaves argv
+   * and env exactly as they are without the option.
+   *
+   * The caller must have verified the egress fence for this token
+   * shape first — {@link verifyWindowsWfpEgress} with the same flag.
+   */
+  writeRestrictedToken?: boolean
+  /**
    * Inner shell. Defaults to `parseWindowsBinShell(undefined)`
    * (System32 cmd.exe). The child's post-`args` content is
    * **passthrough** — `&` chains, `"…"`/`'…'` quotes exactly as
@@ -943,12 +955,21 @@ export async function getWindowsWfpStatusAsync(
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
+ * @param opts.writeRestrictedToken probe with the write-restricted
+ *   child token instead of the default one (`srt-win wfp verify
+ *   --write-restricted-token`: the connect is made by a lockdown
+ *   child holding that token). The WFP block filter matches by an
+ *   access check of the connecting token, and a restricted token is
+ *   checked differently — a session that will run commands with the
+ *   option MUST verify with it, because a filter that stopped
+ *   matching would leave egress open, not closed.
  * @throws on any outcome other than `blocked` (exit 0).
  */
 export async function verifyWindowsWfpEgress(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
+    writeRestrictedToken?: boolean
     srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
@@ -984,7 +1005,11 @@ export async function verifyWindowsWfpEgress(
     // 30s: first call after install may create the sandbox user's
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
     // the runner allows itself 2s to connect (runner.rs).
-    const r = runSrtWin(['wfp', 'verify', '--target', target], {
+    const verifyArgs = ['wfp', 'verify', '--target', target]
+    if (opts.writeRestrictedToken === true) {
+      verifyArgs.push('--write-restricted-token')
+    }
+    const r = runSrtWin(verifyArgs, {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
     })
@@ -2402,11 +2427,17 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
       ...(p.gitSafeDirectories ?? []),
     ],
     schannelCa: p.caCertPath !== undefined,
+    // Schannel cannot acquire credentials under the write-restricted
+    // token, so git's default backend on Windows would fail every
+    // HTTPS operation; its OpenSSL backend is unaffected and reads the
+    // same GIT_SSL_CAINFO.
+    opensslBackend: p.writeRestrictedToken === true,
     baseEnv: p.setEnvVars,
   })
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
   if (p.quiet !== false) argv.push('--quiet')
+  if (p.writeRestrictedToken === true) argv.push('--write-restricted-token')
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env

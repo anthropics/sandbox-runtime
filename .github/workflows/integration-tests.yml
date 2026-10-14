@@ -96,6 +96,14 @@ jobs:
           cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
           cargo test   --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
           cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
+          # Second, test-only binary with the smoke hooks compiled in
+          # (`srt-win probe token` / `probe parent-access`), for the
+          # rows of smoke-write-restricted that need them. Its own
+          # target dir, so it can never replace the default-feature
+          # target\release\srt-win.exe every other step (and the TS
+          # suite) runs; release.yml never passes --features.
+          cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks
+          cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks --all-targets -- -D warnings
 
       - name: Smoke-test srt-win install lifecycle (Windows)
         if: matrix.os == 'windows'
@@ -144,6 +152,13 @@ jobs:
           # block that runs on no other leg, and config-validation covers the
           # schema on a real Windows host rather than under a platform spy.
           bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
+
+      # After the TS suite: this covers an opt-in, experimental token
+      # shape, so a failing row here must not skip the steps above.
+      - name: Smoke-test srt-win write-restricted token (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-write-restricted.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'

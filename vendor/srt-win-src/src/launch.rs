@@ -125,10 +125,21 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// passed through verbatim — so the broker's `PATH` + proxy vars
 /// ride here while the sandbox-user-profile `USERPROFILE`/`TEMP`
 /// stay isolated.
+///
+/// `write_restricted` builds the child token write-restricted (see
+/// [`crate::token`]). It is fail-closed throughout: token creation,
+/// the runner's process self-protect and its thread self-protect
+/// must all succeed or no child runs — there is no fallback to the
+/// ordinary token. Both self-protects matter more here than in the
+/// default mode, because the runner's own token is NOT
+/// write-restricted: a child that could open the runner, or one of
+/// its threads, could act with the runner's token and write wherever
+/// `BUILTIN\Users` can.
 pub fn run_lockdown(
     target_exe: &Path,
     target_args: &[String],
     env_overlay: &[(String, String)],
+    write_restricted: bool,
 ) -> Result<u32> {
     // 1) Self-protect: rewrite this process's DACL so the child can't
     //    `OpenProcess` us. The child shares the runner's user SID, so
@@ -140,16 +151,24 @@ pub fn run_lockdown(
     //    protection. First so the protection holds on every later
     //    error path. Best-effort — log on failure but don't abort,
     //    since a runner without self-protect is still strictly safer
-    //    than no sandbox.
+    //    than no sandbox. With `write_restricted` it is required
+    //    instead (see the fn doc).
     if let Err(e) = self_protect::install_broker_dacl(None) {
+        if write_restricted {
+            return Err(e.context("runner self-protect (required with --write-restricted-token)"));
+        }
         eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
     }
 
     // 2) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
     let self_tok = OwnedHandle(open_self_token()?);
-    let restricted =
-        OwnedHandle(token::make_sandbox_token(self_tok.raw()).context("make_sandbox_token")?);
+    //    `write_restricted` has no fallback: an error here ends the
+    //    launch.
+    let restricted = OwnedHandle(
+        token::make_sandbox_token(self_tok.raw(), write_restricted)
+            .context("make_sandbox_token")?,
+    );
     let primary = OwnedHandle(to_primary(restricted.raw()).context("to_primary")?);
 
     // 3) Job. `breakaway_ok = false` — this is the load-bearing
@@ -305,6 +324,17 @@ pub fn run_lockdown(
                 breakaway.0 != 0,
             )
         });
+    }
+    // Runner threads get the process's self-protect DACL before the
+    // child can run (it is still suspended). Here rather than at
+    // entry so it covers every thread the runner has started by the
+    // time the child first runs.
+    if write_restricted {
+        let n = self_protect::protect_own_threads()
+            .context("runner thread self-protect (required with --write-restricted-token)")?;
+        if dbg {
+            eprintln!("srt-win: run_lockdown: thread self-protect applied ({n} thread(s))");
+        }
     }
     let prev_suspend = unsafe { ResumeThread(child.thread()) };
     if prev_suspend == u32::MAX {

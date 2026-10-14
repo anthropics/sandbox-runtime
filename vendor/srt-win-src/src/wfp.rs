@@ -509,6 +509,36 @@ fn add_filter(
 /// a *user* SID means "is that user". The broker, services, and
 /// every other process carry a different user SID → no match → fall
 /// through to default-permit.
+///
+/// **Write-restricted child token** (`exec --write-restricted-token`,
+/// see [`crate::token`]). The filter matches only if the access check
+/// of the connecting token against this descriptor SUCCEEDS, so a
+/// check that fails means "no BLOCK" — the fence fails open, not
+/// closed. A token with restricting SIDs is checked twice, once
+/// against its ordinary SIDs and once against the restricting list,
+/// and (for the access the second check covers) both must grant:
+///
+///   - The only ACE here grants the match right (`CC` = 0x1,
+///     `FWP_ACTRL_MATCH_FILTER`) to the sandbox **user SID**.
+///   - First check: the child's user SID is that SID, enabled → grant
+///     (same as the default token).
+///   - Second check: the restricting list is `[<sandbox user SID>,
+///     Everyone, RESTRICTED]` ([`crate::token::restricting_sid_list`]).
+///     The user SID is in it, so the same ACE grants again. This
+///     holds whether or not WFP's generic mapping makes the match
+///     right a "write" access: if the second check is skipped the
+///     first alone decides, and if it runs it passes.
+///
+/// So this descriptor needs no change for that token, **as long as
+/// the user SID stays in the restricting list**. A list without it
+/// (e.g. `[Everyone, RESTRICTED]`) could fail the second check and
+/// silently un-fence the child; do not fix that by adding Everyone or
+/// RESTRICTED here — that would BLOCK every process on the machine.
+/// The owner (`O:LS`) plays no part: owner rights are `READ_CONTROL`
+/// / `WRITE_DAC`, not the match right. This is reasoning from the
+/// descriptor, not a measurement; the measurement is `wfp verify
+/// --write-restricted-token`, which the host runs at `initialize()`
+/// and which rejects the session unless the connect is refused.
 pub fn sddl_sandbox_user(sid: &str) -> String {
     format!("O:LSG:LSD:(A;;CC;;;{sid})")
 }

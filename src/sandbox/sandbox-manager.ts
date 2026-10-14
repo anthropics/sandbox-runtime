@@ -204,7 +204,18 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-let windowsWfpVerified = false
+// Tracked PER CHILD-TOKEN SHAPE: the WFP block filter matches by an
+// access check of the connecting token, so a pass for the default
+// token says nothing about the write-restricted one (or the reverse).
+// Turning `windows.writeRestrictedToken` on in a later initialize()
+// therefore probes again, with that token.
+const windowsWfpVerified = { defaultToken: false, writeRestrictedToken: false }
+// The child-token shape initialize() verified the fence for, captured
+// like `srtWinSpawn` so the wrap path uses it rather than `config`:
+// updateConfig() swaps `config` live without re-verifying, and a
+// swapped-in `windows.writeRestrictedToken` must not change the token
+// a command runs under until the next initialize().
+let windowsWriteRestrictedToken = false
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
 // and so reset()'s revoke/restore addresses the SAME binary the
@@ -1089,18 +1100,29 @@ async function initializeSteps(
     // After the user-status check so the not-provisioned message is
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
-    if (!windowsWfpVerified) {
+    // The probe runs under the token shape this session's commands
+    // will get. With `writeRestrictedToken` that is a lockdown child
+    // holding the write-restricted token; anything but a refused
+    // connect (including a probe child that could not be created)
+    // throws, so the session never starts with that token unfenced.
+    const wfpShape =
+      runtimeConfig.windows?.writeRestrictedToken === true
+        ? 'writeRestrictedToken'
+        : 'defaultToken'
+    if (!windowsWfpVerified[wfpShape]) {
       try {
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+          writeRestrictedToken: wfpShape === 'writeRestrictedToken',
           srtWin,
         })
       } catch (e) {
         config = undefined
         throw e
       }
-      windowsWfpVerified = true
+      windowsWfpVerified[wfpShape] = true
     }
+    windowsWriteRestrictedToken = wfpShape === 'writeRestrictedToken'
     // Persistent-CA branch (see the deferral comment above).
     // `ensurePersistentWindowsCa` reconciles the registry thumb
     // itself (so initialize() after uninstall→reinstall repairs
@@ -2610,6 +2632,23 @@ async function wrapWithSandboxArgv(
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
     // via `computeWindowsFsAccessSet`.
+    // The token shape is session-level: initialize() verified the
+    // egress fence for exactly one shape, so a per-command override
+    // would run a shape nobody probed. Refuse it instead of ignoring
+    // it (silently dropping a request to tighten) or honoring it
+    // (running unverified).
+    const writeRestrictedToken = windowsWriteRestrictedToken
+    const perCommandToken = customConfig?.windows?.writeRestrictedToken
+    if (
+      perCommandToken !== undefined &&
+      perCommandToken !== writeRestrictedToken
+    ) {
+      throw new Error(
+        `Per-command windows.writeRestrictedToken is not supported — ` +
+          `the egress fence is verified for the session's token shape ` +
+          `at initialize(). Set it at the session level.`,
+      )
+    }
     registerCommandText(command, options)
     return wrapCommandWithSandboxWindows({
       command,
@@ -2632,6 +2671,7 @@ async function wrapWithSandboxArgv(
       allowWrite: windowsFsStampedSet?.grantWrite,
       gitSafeDirectories: getGitSafeDirectories(customConfig),
       caCertPath: mitmCA?.trustBundlePath,
+      writeRestrictedToken,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
         ? resolveSrtWin(customConfig.windows.srtWin)
@@ -2696,6 +2736,20 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
         `(filesystem.* ∪ credentials.files) changed but the ACL ` +
         `stamp/grant is session-wide — call reset() then initialize() ` +
         `to apply. The previously-applied set stays in effect.`,
+      { level: 'warn' },
+    )
+  }
+  if (
+    getPlatform() === 'windows' &&
+    config &&
+    (newConfig.windows?.writeRestrictedToken === true) !==
+      windowsWriteRestrictedToken
+  ) {
+    logForDebugging(
+      `[Sandbox Windows] updateConfig: windows.writeRestrictedToken ` +
+        `changed but the child-token shape is fixed (and its egress ` +
+        `fence verified) at initialize() — call reset() then ` +
+        `initialize() to apply. The previous shape stays in effect.`,
       { level: 'warn' },
     )
   }
@@ -2866,6 +2920,7 @@ async function reset(): Promise<void> {
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
+  windowsWriteRestrictedToken = false
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
