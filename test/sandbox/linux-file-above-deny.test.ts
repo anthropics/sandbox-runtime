@@ -68,10 +68,11 @@ describe.if(isLinux)('A file above a write deny', () => {
       expect(wrapped).not.toContain(join(area, '.git', 'config'))
     })
 
-    it('so is one below the working directory', async () => {
+    // git rewrites and removes it: a checkout that recurses into submodules.
+    it('one below the working directory is left to git', async () => {
       mkdirSync(join(area, 'sub'))
       writeFileSync(join(area, 'sub', '.git'), POINTER)
-      expect(held(await wrap(), join(area, 'sub', '.git'))).toBe(1)
+      expect(await wrap()).not.toContain(join(area, 'sub'))
     })
 
     it('a .git that is a directory is denied as before', async () => {
@@ -150,21 +151,10 @@ describe.if(isLinux)('A file above a write deny', () => {
       `mkdir -p ${name}/hooks 2>/dev/null; echo mkdir=$?; echo x > ${name} 2>/dev/null; echo write=$?`
     const REFUSED = 'mv=1\nrm=1\nmkdir=1\nwrite=1'
 
-    it.each([
-      ['.git', '.'],
-      ['sub/.git', 'sub'],
-    ])('%s that is a file stays one', async (name, dir) => {
-      mkdirSync(join(area, dir), { recursive: true })
-      writeFileSync(join(area, name), POINTER)
-      expect(await run(REPLACE(name))).toBe(REFUSED)
-      expect(readFileSync(join(area, name), 'utf8')).toBe(POINTER)
-    })
-
-    it('the directory that holds it stays too', async () => {
-      mkdirSync(join(area, 'sub'))
-      writeFileSync(join(area, 'sub', '.git'), POINTER)
-      expect(await run('mv sub aside 2>/dev/null; echo mv=$?')).toBe('mv=1')
-      expect(readFileSync(join(area, 'sub', '.git'), 'utf8')).toBe(POINTER)
+    it('a .git that is a file stays one', async () => {
+      writeFileSync(join(area, '.git'), POINTER)
+      expect(await run(REPLACE('.git'))).toBe(REFUSED)
+      expect(readFileSync(join(area, '.git'), 'utf8')).toBe(POINTER)
     })
 
     it('a command beside it runs, and writes what it may', async () => {

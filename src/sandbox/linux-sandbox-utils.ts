@@ -417,7 +417,8 @@ export function linuxGetCwdMandatoryDenyPaths(
   // Git hooks and config are denied where .git is a directory.
   // In a git worktree or a submodule .git is a file ("gitdir: /path/..."),
   // and there are no .git/hooks for as long as it is one. So the file is
-  // denied, which keeps it one.
+  // denied, which keeps it one. Only here: one below the cwd is git's to
+  // rewrite and remove (a checkout that recurses into submodules does).
   // When .git doesn't exist at all, mounting at .git would block its
   // creation and break git init.
   const dotGitPath = path.resolve(cwd, '.git')
@@ -537,9 +538,6 @@ async function linuxGetMandatoryDenyPaths(
   // Git hooks always blocked in nested repos. A repository is known by its
   // HEAD, so that its hooks are denied before there are any.
   iglobArgs.push('--iglob', '**/.git/hooks/**', '--iglob', '**/.git/HEAD')
-  // The .git of a nested worktree or submodule, which is a file. (ripgrep
-  // lists files: a directory of that name does not match.)
-  iglobArgs.push('--iglob', '.git')
 
   // Git config conditionally blocked in nested repos
   if (!allowGitConfig) {

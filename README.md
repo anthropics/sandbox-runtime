@@ -941,7 +941,7 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 - IDE directories: `.vscode/`, `.idea/`
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
-- Git hooks and config: `.git/hooks/`, `.git/config`. In a worktree or a submodule `.git` is a file: on Linux that file is blocked, so it can be read but not changed, moved or removed.
+- Git hooks and config: `.git/hooks/`, `.git/config`. Where the working directory is a worktree or a submodule, its `.git` is a file: on Linux that file is blocked, so it can be read but not changed, moved or removed.
 
 These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 
@@ -961,7 +961,7 @@ With `allowWrite: ["/"]` the pins reach every ancestor, including any other allo
 
 A wrap that carries no write restrictions at all — `filesystem.disabled` with credential masks still in force, or a library caller passing no write config while a `denyRead` entry or a mask still seeds a pin — is the same shape: the whole tree is bound writable, so it gets the same pins and the same top-level covers, and the same `EXDEV` boundary applies there too.
 
-**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance: a dangerous file is found down to `a/b/.bashrc`, and a dangerous directory, or the hooks and config of a repository, one level higher up (`a/.vscode`, `a/.claude/commands`, `a/.git/hooks`). A `.git` that is a file counts as a dangerous file. Ignore files (`.gitignore`, `.ignore`) do not hide anything from it, and a directory of the user's own that it cannot read is denied whole. A dangerous directory other than a repository's hooks is only seen if it holds a file directly: below the working directory, one that is empty or does not exist yet can be filled. A repository that has no `hooks` directory has an empty file in its place while a command runs, which stops `git init` from being run again there and a hook from being installed. You can configure this with `mandatoryDenySearchDepth`:
+**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance: a dangerous file is found down to `a/b/.bashrc`, and a dangerous directory, or the hooks and config of a repository, one level higher up (`a/.vscode`, `a/.claude/commands`, `a/.git/hooks`). Ignore files (`.gitignore`, `.ignore`) do not hide anything from it, and a directory of the user's own that it cannot read is denied whole. A dangerous directory other than a repository's hooks is only seen if it holds a file directly: below the working directory, one that is empty or does not exist yet can be filled. A repository that has no `hooks` directory has an empty file in its place while a command runs, which stops `git init` from being run again there and a hook from being installed. You can configure this with `mandatoryDenySearchDepth`:
 
 ```json
 {
