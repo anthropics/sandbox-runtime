@@ -310,6 +310,17 @@ jobs:
           $env:SRT_WIN_TEST_HOOKS_EXE = (Resolve-Path 'vendor\srt-win-src\target\test-hooks\release\srt-win.exe').Path
           npm ci
           npm run build
+          # mxc.test.ts (the backend-agnostic boundary suite) runs in
+          # its OWN bun process, before the srt-win suites: it
+          # self-provisions srt-win and uninstalls what it installed,
+          # and the separate process keeps sandbox-manager's
+          # process-lifetime state (e.g. the once-per-process WFP
+          # verification) from leaking into winsrt's fail-closed
+          # guards. On these runners it exercises the srt-win path
+          # (the selection probe answers an AppContainer tier); on a
+          # BaseContainer-capable machine the same file verifies the
+          # mxc backend.
+          bun test test/sandbox/mxc.test.ts
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw
