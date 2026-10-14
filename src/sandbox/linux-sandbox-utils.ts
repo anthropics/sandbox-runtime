@@ -676,6 +676,61 @@ function ensureEmptyMountSourceDir(): string {
   return emptyMountSourceDir
 }
 
+// The source of the empty-file mount points: the file twin of the directory
+// above, kept the same way. One read-only empty file of our own, in a private
+// directory of its own, made on first use, reused while a sandbox is running,
+// and removed with the mount points. generateFilesystemArgs pins that
+// directory read-only inside every sandbox that uses it.
+//
+// /dev/null stood here before. bubblewrap gives every --ro-bind the nodev
+// flag, and opening a device node on a nodev mount fails with EACCES: a login
+// shell sourcing an absent ~/.bash_profile printed "Permission denied" and
+// skipped ~/.profile, and any tool reading a protected file it had yet to
+// create was refused the same way. An empty regular file reads as empty, and
+// the read-only bind still refuses the write the deny is there to refuse.
+type EmptyFileSource = { dir: string; file: string }
+let emptyFileSource: EmptyFileSource | undefined
+
+function ensureEmptyFileSource(): EmptyFileSource {
+  if (emptyFileSource !== undefined) {
+    // Revalidated, not trusted, for the directory's reason: a file swapped for
+    // a symlink, or written to, between two wraps would publish its target or
+    // its content at every file placeholder of the next.
+    try {
+      const dir = fs.lstatSync(emptyFileSource.dir)
+      const file = fs.lstatSync(emptyFileSource.file)
+      if (
+        dir.isDirectory() &&
+        dir.uid === process.getuid?.() &&
+        (dir.mode & 0o077) === 0 &&
+        fs.readdirSync(emptyFileSource.dir).length === 1 &&
+        file.isFile() &&
+        file.uid === process.getuid?.() &&
+        file.nlink === 1 &&
+        file.size === 0 &&
+        (file.mode & 0o077) === 0
+      ) {
+        return emptyFileSource
+      }
+    } catch {
+      // Gone, or no longer inspectable: make a new one below.
+    }
+    logForDebugging(
+      `[Sandbox Linux] Not reusing the empty-file mount source, it is gone or no longer our own empty file: ${emptyFileSource.file}`,
+    )
+  }
+  // The directory source's prefix, so that whatever tells a placeholder's
+  // source by its name sees one kind of thing.
+  const dir = fs.mkdtempSync(path.join(tmpdir(), 'claude-empty-'))
+  fs.chmodSync(dir, 0o700)
+  const file = path.join(dir, 'empty')
+  fs.closeSync(fs.openSync(file, 'wx', 0o400))
+  // As for the directory: the umask may have taken bits away.
+  fs.chmodSync(file, 0o400)
+  emptyFileSource = { dir, file }
+  return emptyFileSource
+}
+
 export const CAP_SETFCAP = 31
 
 // This process's bounding set unioned with its inheritable set, read once —
@@ -1202,6 +1257,33 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
       // decides whether it can be reused.
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         emptyMountSourceDir = undefined
+      }
+    }
+  }
+  if (emptyFileSource !== undefined) {
+    const { dir, file } = emptyFileSource
+    try {
+      // unlinkSync: it neither follows a symlink nor touches a directory.
+      fs.unlinkSync(file)
+    } catch {
+      // Already gone, or not ours to remove: rmdirSync below says which.
+    }
+    try {
+      fs.rmdirSync(dir)
+      logForDebugging(
+        `[Sandbox Linux] Cleaned up the empty-file mount source: ${file}`,
+      )
+      emptyFileSource = undefined
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      if (code === 'ENOTEMPTY') {
+        logForDebugging(
+          `[Sandbox Linux] Left the empty-file mount source behind, something has been put beside it: ${file}`,
+        )
+      }
+      // As for the directory source: forgotten only once nothing is left.
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        emptyFileSource = undefined
       }
     }
   }
@@ -2105,6 +2187,9 @@ async function generateFilesystemArgs(
   // tampered with in between) would leave the binds already emitted pointing
   // at a directory this same call has just judged not ours.
   let emptySource: string | undefined
+  // The empty file this call's file placeholders bind from, for the same
+  // reason resolved at most once per wrap.
+  let emptyFile: EmptyFileSource | undefined
   // Where a mount given `p` lands: `p` fully resolved, every symlink on the
   // way and not one hop. One resolution per path per wrap, so every predicate
   // below sees the same answer, and none before the mandatory-deny scan's
@@ -2829,8 +2914,9 @@ async function generateFilesystemArgs(
 
       // A component with a deny path beneath it is covered by an empty
       // read-only directory, which blocks creating it and everything below it
-      // exactly as /dev/null does and stays traversable; as a file it breaks
-      // tools that expect a directory there. Whatever the order of denyPaths.
+      // exactly as the empty file does and stays traversable; as a file it
+      // breaks tools that expect a directory there. Whatever the order of
+      // denyPaths.
       const dest = findFirstNonExistentComponent(absentPath)
       decidedMountPoints.add(dest)
       const kind = makeableMountPoint(
@@ -2927,9 +3013,10 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Handle non-existent paths by mounting /dev/null to block creation.
-      // Without this, a sandboxed process could mkdir+write a denied path that
-      // doesn't exist yet, bypassing the deny rule entirely.
+      // Handle non-existent paths by mounting an empty read-only file (or an
+      // empty read-only directory) over them to block creation. Without this,
+      // a sandboxed process could mkdir+write a denied path that doesn't
+      // exist yet, bypassing the deny rule entirely.
       if (
         decidedMountPointOver(normalizedPath) !== undefined ||
         !fs.existsSync(normalizedPath)
@@ -2941,7 +3028,11 @@ async function generateFilesystemArgs(
             '--ro-bind',
             kind === 'directory'
               ? (emptySource ??= ensureEmptyMountSourceDir())
-              : '/dev/null',
+              : kind === 'file'
+                ? (emptyFile ??= ensureEmptyFileSource()).file
+                : // Left out at emission (unmakeableDenyDests): no source is
+                  // made for a bind that is never emitted.
+                  '/dev/null',
             dest,
           )
           // The first of the denies that share the destination. The record is
@@ -2953,7 +3044,7 @@ async function generateFilesystemArgs(
             kind === undefined
               ? `[Sandbox Linux] No mount point at ${dest}, which neither bubblewrap nor the command can create, for ${normalizedPath}`
               : `[Sandbox Linux] Mounted ${
-                  kind === 'directory' ? 'empty dir' : '/dev/null'
+                  kind === 'directory' ? 'empty dir' : 'empty file'
                 } at ${dest} to block creation of ${normalizedPath}`,
           )
         }
@@ -3413,6 +3504,12 @@ async function generateFilesystemArgs(
   // like the store, to overlay any earlier --bind that covers it. A same-uid
   // process on the host can still swap the source between wrap and run, which
   // is outside what this library defends against.
+  // The empty file likewise, through the directory that holds it: read-only
+  // there, it can neither be written, replaced nor have its mode changed. The
+  // directory source's pin stays the last mount of all.
+  if (emptyFile !== undefined) {
+    args.push('--ro-bind', emptyFile.dir, emptyFile.dir)
+  }
   if (emptySource !== undefined) {
     args.push('--ro-bind', emptySource, emptySource)
   }

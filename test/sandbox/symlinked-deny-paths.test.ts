@@ -17,8 +17,21 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
-import { countMounts } from '../helpers/bwrap-argv.js'
+import { countMounts, mountsOf } from '../helpers/bwrap-argv.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
+
+/** Whether the empty-file placeholder that covers an absent write-denied
+ * file is bound at `dest`. */
+function fileStubbed(result: string, dest: string): boolean {
+  return mountsOf(result).some(mount => {
+    const [flag, from, at] = mount.split(' ')
+    return (
+      flag === '--ro-bind' &&
+      at === dest &&
+      /\/claude-empty-[A-Za-z0-9]+\/empty$/.test(from ?? '')
+    )
+  })
+}
 
 /**
  * The root's symlinks into /usr (/bin, /lib, /sbin on a usr-merged system),
@@ -124,10 +137,8 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
 
     // The creation-blocking mask must land at the resolved parent, not the
     // raw symlinked path.
-    expect(result).not.toContain(`/dev/null ${join(projLink, '.mcp.json')}`)
-    expect(result).toContain(
-      `--ro-bind /dev/null ${join(realProj, '.mcp.json')}`,
-    )
+    expect(fileStubbed(result, join(projLink, '.mcp.json'))).toBe(false)
+    expect(fileStubbed(result, join(realProj, '.mcp.json'))).toBe(true)
   })
 
   it('follows a dangling symlink so the deny lands where a write would create the file', async () => {
@@ -139,8 +150,8 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
 
     const result = await wrap([danglingLink])
 
-    expect(result).not.toContain(`/dev/null ${danglingLink}`)
-    expect(result).toContain(`--ro-bind /dev/null ${linkTarget}`)
+    expect(fileStubbed(result, danglingLink)).toBe(false)
+    expect(fileStubbed(result, linkTarget)).toBe(true)
   })
 
   it('lands beneath where a dangling symlink leads for a path beneath the link', async () => {
@@ -162,7 +173,9 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
         .filter(([, from, at]) => from !== at && at!.startsWith(`${PROJ}/`))
         .map(([, from, at]) => [
           at!.slice(PROJ.length + 1),
-          from === '/dev/null' ? 'file' : 'directory',
+          /\/claude-empty-[A-Za-z0-9]+\/empty$/.test(from!)
+            ? 'file'
+            : 'directory',
         ]),
     )
 

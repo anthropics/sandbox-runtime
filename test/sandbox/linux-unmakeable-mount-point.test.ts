@@ -151,6 +151,10 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     expect.stringMatching(
       new RegExp(`^--ro-bind \\S*claude-empty-\\S+ ${dest}$`),
     )
+  const emptyFileAt = (dest: string) =>
+    expect.stringMatching(
+      new RegExp(`^--ro-bind \\S*claude-empty-\\S+/empty ${dest}$`),
+    )
 
   describe('by what the parent directory answers', () => {
     // What access() says of the parent, whose it is, and whether the
@@ -177,7 +181,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
         const command = await wrap([leaf, nested])
 
         expect(mountsAt(command, leaf)).toEqual(
-          planned ? [`--ro-bind /dev/null ${leaf}`] : [],
+          planned ? [emptyFileAt(leaf)] : [],
         )
         expect(mountsAt(command, join(DIR, 'absent'))).toEqual(
           planned ? [emptyDirectoryAt(join(DIR, 'absent'))] : [],
@@ -247,7 +251,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     const planned = async (): Promise<void> => {
       const denied = join(DIR, 'policy.json')
       expect(mountsAt(await wrap([denied]), denied)).toEqual([
-        `--ro-bind /dev/null ${denied}`,
+        emptyFileAt(denied),
       ])
     }
 
@@ -428,7 +432,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
 
       const command = await wrap([leaf, nested])
 
-      expect(mountsAt(command, leaf)).toEqual([`--ro-bind /dev/null ${leaf}`])
+      expect(mountsAt(command, leaf)).toEqual([emptyFileAt(leaf)])
       expect(mountsAt(command, join(DIR, 'absent'))).toEqual([
         emptyDirectoryAt(join(DIR, 'absent')),
       ])
@@ -483,9 +487,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
 
       const command = await wrap([denied])
 
-      expect(mountsAt(command, denied)).toEqual([
-        `--ro-bind /dev/null ${denied}`,
-      ])
+      expect(mountsAt(command, denied)).toEqual([emptyFileAt(denied)])
       // The mode it has, so that nothing changes.
       expect(modes).toEqual([0o2750])
     })
@@ -669,7 +671,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
       const denied = join(DIR, 'policy.json')
 
       expect(mountsAt(await wrap([denied]), denied)).toEqual([
-        `--ro-bind /dev/null ${denied}`,
+        emptyFileAt(denied),
       ])
     })
 

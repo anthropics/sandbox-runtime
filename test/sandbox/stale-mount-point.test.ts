@@ -283,7 +283,13 @@ describe.if(isLinux)(
     }
 
     function emptySourceDirs(): string[] {
-      return readdirSync(tmpdir()).filter(n => n.startsWith('claude-empty-'))
+      // The file placeholders' source shares the prefix, and holds one
+      // file: only an empty directory is a directory source.
+      return readdirSync(tmpdir()).filter(
+        n =>
+          n.startsWith('claude-empty-') &&
+          readdirSync(join(tmpdir(), n)).length === 0,
+      )
     }
 
     it('binds one source for every empty-directory mount point, and takes it away with them', async () => {

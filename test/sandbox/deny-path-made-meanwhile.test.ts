@@ -15,7 +15,7 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
-import { countMounts } from '../helpers/bwrap-argv.js'
+import { lastMountAt } from '../helpers/bwrap-argv.js'
 
 /**
  * An absent deny path is blocked by a mount point bubblewrap makes on the
@@ -73,7 +73,9 @@ describe.if(isLinux)('A deny path made while the wrap is looking', () => {
     }
 
     expect(made).toBe(true)
-    expect(countMounts(wrapped, '--ro-bind', '/dev/null', denied)).toBe(1)
+    expect(lastMountAt(wrapped, denied)).toMatch(
+      /^--ro-bind \S*\/claude-empty-[A-Za-z0-9]+\/empty /,
+    )
   })
 
   it('still leaves alone a path beneath a file, which can never be created', async () => {

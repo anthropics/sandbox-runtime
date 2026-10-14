@@ -15,7 +15,7 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
-import { countMounts } from '../helpers/bwrap-argv.js'
+import { countMounts, lastMountAt } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 
 // Argument-level checks, plus one "(live bwrap)" arm per symlink shape: this
@@ -662,9 +662,9 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       expect(cwdPin).toBeGreaterThan(parentPin)
       expect(cover).toBeGreaterThan(cwdPin)
       // The deny binds still land on top of the cover.
-      expect(
-        wrapped.indexOf(`--ro-bind /dev/null ${join(cwd, '.bashrc')}`),
-      ).toBeGreaterThan(cover)
+      const stub = lastMountAt(wrapped, join(cwd, '.bashrc'))
+      expect(stub).toMatch(/^--ro-bind \S*\/claude-empty-[A-Za-z0-9]+\/empty /)
+      expect(wrapped.indexOf(stub!)).toBeGreaterThan(cover)
     } finally {
       process.chdir(savedCwd)
     }

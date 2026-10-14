@@ -24,6 +24,19 @@ import { countMounts, lastMountAt, mountsOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
+/** Binds of the empty-file placeholder at `dest`, the file twin of the
+ * claude-empty- directory sources: what covers an absent write-denied file. */
+function filePlaceholders(command: string, dest: string): number {
+  return mountsOf(command).filter(mount => {
+    const [flag, source, at] = mount.split(' ')
+    return (
+      flag === '--ro-bind' &&
+      at === dest &&
+      /\/claude-empty-[A-Za-z0-9]+\/empty$/.test(source ?? '')
+    )
+  }).length
+}
+
 /**
  * A deny path strictly beneath a directory that denyWithinAllow re-binds
  * read-only gets no --ro-bind of its own, under the same evidence and vetoes
@@ -1294,9 +1307,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
               under(allow),
             )
 
-            expect(countMounts(command, '--ro-bind', '/dev/null', absent)).toBe(
-              writable ? 1 : 0,
-            )
+            expect(filePlaceholders(command, absent)).toBe(writable ? 1 : 0)
             expect(decidingMount(command, absent)).toStartWith('--ro-bind ')
           },
         )
@@ -1342,9 +1353,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
               },
             },
           )
-          expect(countMounts(command, '--ro-bind', '/dev/null', absent)).toBe(
-            covered ? 0 : 1,
-          )
+          expect(filePlaceholders(command, absent)).toBe(covered ? 0 : 1)
           expect(run(command).stdout).toContain('BOOTED')
 
           // A mount point stays on the host until the clean-up, empty.
@@ -1602,7 +1611,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       expect(countMounts(command, '--ro-bind', bashrc, bashrc)).toBe(1)
       expect(countMounts(command, '--ro-bind', hooks, hooks)).toBe(1)
       // Absent: blocked from being created rather than bound read-only.
-      expect(countMounts(command, '--ro-bind', '/dev/null', mcp)).toBe(1)
+      expect(filePlaceholders(command, mcp)).toBe(1)
     })
 
     it('skips every per-path deny when "/" is denied whole, and keeps skipping them when "/" is vetoed', async () => {
@@ -1640,9 +1649,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       )
       expect(countMounts(rootDeniedWhole, '--ro-bind', bashrc, bashrc)).toBe(0)
       expect(countMounts(rootDeniedWhole, '--ro-bind', hooks, hooks)).toBe(0)
-      expect(countMounts(rootDeniedWhole, '--ro-bind', '/dev/null', mcp)).toBe(
-        0,
-      )
+      expect(filePlaceholders(rootDeniedWhole, mcp)).toBe(0)
       expect(rootDeniedWhole).not.toContain('claude-empty-')
 
       // A second allow entry vetoes '/' — it lies strictly beneath it — and
@@ -1654,13 +1661,13 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       // could not be derived — which readonly-deny-dir-stubs.test.ts covers.
       const secondAllow = await wrapRoot(['/', AREA], undefined)
       expect(countMounts(secondAllow, '--ro-bind', bashrc, bashrc)).toBe(0)
-      expect(countMounts(secondAllow, '--ro-bind', '/dev/null', mcp)).toBe(0)
+      expect(filePlaceholders(secondAllow, mcp)).toBe(0)
 
       const readDenied = join(BASE, 'ro')
       mkdirSync(readDenied)
       const oneReadDeny = await wrapRoot(['/'], { denyOnly: [readDenied] })
       expect(countMounts(oneReadDeny, '--ro-bind', bashrc, bashrc)).toBe(0)
-      expect(countMounts(oneReadDeny, '--ro-bind', '/dev/null', mcp)).toBe(0)
+      expect(filePlaceholders(oneReadDeny, mcp)).toBe(0)
     })
 
     it.skipIf(!BWRAP_CAN_NAMESPACE)(
