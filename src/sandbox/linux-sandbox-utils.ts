@@ -1774,10 +1774,18 @@ function buildSandboxCommand(
   // dropped, and tried again after 1 s, then 2 s, 4 s and so on: of a package
   // installer's burst, some wait for a minute. The kernel caps the number.
   const listen = 'fork,reuseaddr,backlog=4096'
+  // Which family a plain TCP-LISTEN takes is socat's choice, and differs by
+  // version. One that takes IPv6 exits at once on a kernel that has none, and
+  // nothing listens; one that takes IPv4 refuses a client to which `localhost`
+  // is ::1 and that tries no second address. So the family is named: IPv6 with
+  // IPv4 mapped in, which serves both, and IPv4 alone where that fails.
+  const relay = (port: number, socketPath: string): string =>
+    `{ ${socat} TCP6-LISTEN:${port},ipv6only=0,${listen} UNIX-CONNECT:${socketPath} || ` +
+    `exec ${socat} TCP4-LISTEN:${port},${listen} UNIX-CONNECT:${socketPath}; } >/dev/null 2>&1 &`
   const socatCommands = [
-    `${socat} TCP-LISTEN:3128,${listen} UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+    relay(3128, httpSocketPath),
     '_srt_http=$!',
-    `${socat} TCP-LISTEN:1080,${listen} UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+    relay(1080, socksSocketPath),
     '_srt_socks=$!',
     // The trap saves the status the script is exiting with and exits with
     // it. A bare `exit` inside an EXIT trap is not portable: bash and dash

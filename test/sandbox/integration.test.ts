@@ -1405,7 +1405,7 @@ describe.if(isLinux)('Exit status of a network-restricted wrap', () => {
     const wrapped = await SandboxManager.wrapWithSandbox(command, shell)
     // Only the script that bridges the network carries the trap.
     expect(wrapped).toContain('--unshare-net')
-    expect(wrapped).toContain('TCP-LISTEN:3128')
+    expect(wrapped).toContain('TCP6-LISTEN:3128')
     const result = await spawnAsync(wrapped, {
       shell: true,
       encoding: 'utf8',
