@@ -129,14 +129,23 @@ describe.if(isLinux)('A file above a write deny', () => {
         join(base, 'f'),
       )
     })
+
+    it('where it may write the file and not its directory, the file is not held', async () => {
+      const f = join(base, 'f')
+      writeFileSync(f, 'mine')
+      const wrapped = await wrap('true', [join(f, 'x')], [f])
+      expect(held(wrapped, f)).toBe(0)
+      expect(lastMountAt(wrapped, f)).toBe(`--bind ${f} ${f}`)
+    })
   })
 
   describe.if(bwrapCanNamespace())('in the sandbox', () => {
     const run = async (
       command: string,
       denies: string[] = [],
+      allowOnly?: string[],
     ): Promise<string> => {
-      const r = spawnSync(await wrap(command, denies), {
+      const r = spawnSync(await wrap(command, denies, allowOnly), {
         shell: true,
         encoding: 'utf8',
         timeout: 20_000,
@@ -168,6 +177,19 @@ describe.if(isLinux)('A file above a write deny', () => {
       writeFileSync(join(area, 'f'), 'mine')
       expect(await run(REPLACE('f'), [join(area, 'f', 'x')])).toBe(REFUSED)
       expect(readFileSync(join(area, 'f'), 'utf8')).toBe('mine')
+    })
+
+    it('a file that alone may be written is written, and stays one', async () => {
+      const f = join(base, 'f')
+      writeFileSync(f, 'mine')
+      expect(
+        await run(
+          `echo more >> ${f}; echo append=$?; cd ${base}; ${REPLACE('f')}`,
+          [join(f, 'x')],
+          [f],
+        ),
+      ).toBe('append=0\nmv=1\nrm=1\nmkdir=1\nwrite=0')
+      expect(readFileSync(f, 'utf8')).toBe('x\n')
     })
 
     it('a protected name that leads through a file: the file stays', async () => {
