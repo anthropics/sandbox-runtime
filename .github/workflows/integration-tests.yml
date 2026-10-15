@@ -197,7 +197,11 @@ jobs:
           # and on Windows that release tries only `::1` for `localhost`,
           # where the proxy listens on 127.0.0.1. The floor itself is run by
           # the package check in release.yml.
-          node-version: '22'
+          #
+          # Windows runs 24: @microsoft/mxc-sdk 0.9 declares Node >=24, and
+          # npm leaves an optional dependency out when its engines do not
+          # match, so on 22 the MXC runner is never installed.
+          node-version: ${{ matrix.os == 'windows' && '24' || '22' }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
