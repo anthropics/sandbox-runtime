@@ -83,6 +83,22 @@ describe.if(isLinux || isMacOS)('wrapWithSandbox: the ttys option', () => {
     expect(wrapped).toContain('(allow file-ioctl (literal "/dev/ttys012"))')
   })
 
+  it('refuses a malformed entry in wrapWithSandboxArgv too', async () => {
+    await init()
+    const outcome = await SandboxManager.wrapWithSandboxArgv(
+      'true',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { ttys: ['/dev/ttys012', 'ttys013'] },
+    ).then(
+      () => 'wrapped',
+      (err: unknown) => String(err),
+    )
+    expect(outcome).toMatch(/not a pty slave/)
+  })
+
   it('refuses a malformed entry on every platform', async () => {
     await init()
     const outcome = await SandboxManager.wrapWithSandbox(
