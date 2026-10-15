@@ -85,6 +85,8 @@ import {
   restoreWindowsAcl,
   grantWindowsAcl,
   grantWindowsAclPersistent,
+  windowsSetupVersionMismatch,
+  windowsWriteRestrictedTokenEnabled,
   forgetWindowsPersistentGrants,
   revokeWindowsAclChecked,
   windowsAclIncompleteRevoke,
@@ -206,19 +208,24 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// That holds for the DEFAULT child token only. The WFP block filter
-// matches by an access check of the connecting token, and the
+// That holds for the ORDINARY child token only (`defaultToken` below:
+// the token `srt-win exec` builds without a flag, which a session
+// gets with `windows.writeRestrictedToken: false`). The WFP block
+// filter matches by an access check of the connecting token, and the
 // write-restricted token's restricting SIDs include the capability
 // SIDs of the session's write roots — a different token per session.
-// So with `windows.writeRestrictedToken` every initialize() probes,
-// with that session's token, and nothing is remembered.
+// So under the write-restricted token (the default) every
+// initialize() probes, with that session's token, and nothing is
+// remembered.
 const windowsWfpVerified = { defaultToken: false }
 // The child-token shape initialize() verified the fence for, captured
 // like `srtWinSpawn` so the wrap path uses it rather than `config`:
 // updateConfig() swaps `config` live without re-verifying, and a
 // swapped-in `windows.writeRestrictedToken` must not change the token
-// a command runs under until the next initialize().
-let windowsWriteRestrictedToken = false
+// a command runs under until the next initialize(). Outside a session
+// it is the option's default, so a wrap made there never gets the
+// ordinary token.
+let windowsWriteRestrictedToken = true
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
 // and so reset()'s revoke/restore addresses the SAME binary the
@@ -1095,6 +1102,18 @@ async function initializeSteps(
           `provision it.`,
       )
     }
+    // An install made by a release with another setup version: srt-win
+    // would refuse to launch on it, and must not be asked to keep a
+    // grant on it. Checked before anything is granted.
+    const staleSetup = windowsSetupVersionMismatch(
+      u,
+      runtimeConfig.windows?.sublayerGuid ??
+        runtimeConfig.windows?.wfpSublayerGuid,
+    )
+    if (staleSetup) {
+      config = undefined
+      throw new WindowsSandboxError('reinstall_required', staleSetup)
+    }
     // Behavioral proof the WFP egress fence is active for the
     // sandbox user — BFE enumeration (`wfp status`) is admin-gated,
     // so this is the non-elevated readiness check. Fails closed: a
@@ -1104,16 +1123,19 @@ async function initializeSteps(
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
     // The probe runs under the token shape this session's commands
-    // will get. With `writeRestrictedToken` that token carries the
-    // capability SIDs of this session's write roots, which exist only
-    // once the roots are granted — so that probe runs below, after
-    // the grant, on every initialize().
-    const writeRestricted = runtimeConfig.windows?.writeRestrictedToken === true
+    // will get. By default that is the write-restricted token, which
+    // carries the capability SIDs of this session's write roots; they
+    // exist only once the roots are granted — so that probe runs
+    // below, after the grant, on every initialize().
+    const writeRestricted = windowsWriteRestrictedTokenEnabled(
+      runtimeConfig.windows,
+    )
     if (!writeRestricted) {
-      // Write grants kept by sessions that had the option on let the
-      // sandbox account write those trees under the ordinary token
-      // this session uses. Remove them before anything is granted or
-      // run; if that fails, no session.
+      // `windows.writeRestrictedToken: false`. Write grants kept by
+      // sessions that ran with the default let the sandbox account
+      // write those trees under the ordinary token this session uses.
+      // Remove them before anything is granted or run; if that fails,
+      // no session.
       if (u.persistentGrants) {
         try {
           forgetWindowsPersistentGrants({ srtWin })
@@ -1126,6 +1148,7 @@ async function initializeSteps(
         try {
           await verifyWindowsWfpEgress({
             proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+            writeRestrictedToken: false,
             srtWin,
           })
         } catch (e) {
@@ -2788,7 +2811,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   if (
     getPlatform() === 'windows' &&
     config &&
-    (newConfig.windows?.writeRestrictedToken === true) !==
+    windowsWriteRestrictedTokenEnabled(newConfig.windows) !==
       windowsWriteRestrictedToken
   ) {
     logForDebugging(
@@ -2949,9 +2972,9 @@ async function reset(): Promise<void> {
   // — log anomalies rather than throw, so teardown always
   // completes. ACEs still recorded for this process are released by
   // srt-win's crash recovery once it has exited.
-  // With `windows.writeRestrictedToken` the write roots and the
-  // denies under them were granted persistently and are not this
-  // process's to release: the same two calls take off only what was
+  // Under the write-restricted token (the default) the write roots
+  // and the denies under them were granted persistently and are not
+  // this process's to release: the same two calls take off only what was
   // per-session (read grants, denies outside every root).
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
@@ -2970,7 +2993,7 @@ async function reset(): Promise<void> {
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
-  windowsWriteRestrictedToken = false
+  windowsWriteRestrictedToken = true
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the

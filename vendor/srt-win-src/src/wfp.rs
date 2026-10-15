@@ -521,7 +521,7 @@ fn add_filter(
 ///   - The only ACE here grants the match right (`CC` = 0x1,
 ///     `FWP_ACTRL_MATCH_FILTER`) to the sandbox **user SID**.
 ///   - First check: the child's user SID is that SID, enabled → grant
-///     (same as the default token).
+///     (same as the ordinary token).
 ///   - Second check: the restricting list is `[<sandbox user SID>,
 ///     Everyone, RESTRICTED]` ([`crate::token::restricting_sid_list`]).
 ///     The user SID is in it, so the same ACE grants again. This

@@ -189,7 +189,9 @@ async function main(): Promise<void> {
     .command('windows-install')
     .description(
       'Windows: provision the `srt-sandbox` user account + install WFP ' +
-        'filters (one UAC prompt). No logout needed.',
+        'filters (one UAC prompt). No logout needed. Run it again after ' +
+        'upgrading sandbox-runtime when a command asks for it: it ' +
+        'upgrades the existing install in place.',
     )
     .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
     .option(

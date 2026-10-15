@@ -106,7 +106,7 @@ The sandbox uses OS-level primitives to enforce restrictions that apply to the e
 
 - **macOS**: Uses `sandbox-exec` with dynamically generated [Seatbelt profiles](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf)
 - **Linux**: Uses [bubblewrap](https://github.com/containers/bubblewrap) for containerization with network namespace isolation
-- **Windows**: Runs the sandboxed process under a dedicated `srt-sandbox` local user account, with a [Windows Filtering Platform](https://learn.microsoft.com/en-us/windows/win32/fwp/windows-filtering-platform-start-page) egress fence keyed on that account's SID and per-session explicit ACEs on the working tree
+- **Windows**: Runs the sandboxed process under a dedicated `srt-sandbox` local user account, with a [Windows Filtering Platform](https://learn.microsoft.com/en-us/windows/win32/fwp/windows-filtering-platform-start-page) egress fence keyed on that account's SID, a write-restricted token, and explicit ACEs on the working tree
 
 ![0d1c612947c798aef48e6ab4beb7e8544da9d41a-4096x2305](https://github.com/user-attachments/assets/76c838a9-19ef-4d0b-90bb-cbe1917b3551)
 
@@ -733,7 +733,7 @@ The package includes pre-generated seccomp BPF filters for x86-64 and arm archit
 
 ## Windows (alpha)
 
-Windows support is **alpha**. The sandboxed process runs under a dedicated `srt-sandbox` local user account, isolated from the calling user by native Windows security primitives — a Windows Filtering Platform (WFP) egress fence keyed on the sandbox account's SID, and per-session explicit ACEs that grant or deny that SID access to configured filesystem paths.
+Windows support is **alpha**. The sandboxed process runs under a dedicated `srt-sandbox` local user account, isolated from the calling user by native Windows security primitives — a Windows Filtering Platform (WFP) egress fence keyed on the sandbox account's SID, a write-restricted token, and explicit ACEs that grant or deny the sandbox access to configured filesystem paths.
 
 ### Setup
 
@@ -751,6 +751,10 @@ After install, `SandboxManager.initialize()` and the `srt` CLI work as on other 
 
 Programmatic install/uninstall are exported as `installWindowsSandbox()` / `uninstallWindowsSandbox()`.
 
+**Upgrading from an earlier release: run `windows-install` once more** (one UAC prompt). It upgrades the existing install in place; nothing has to be uninstalled first, and this is the only reinstall this release asks for. The install records a setup version, and this release raises it (2 → 3) because it keeps write grants on project directories between sessions (see [the child token and kept grants](#the-child-token-and-kept-write-grants)). Until the install is re-run, `initialize()` and `checkDependencies()` report that the sandbox was set up by a different release and say to re-run the install, and nothing is granted or run. Once it has been re-run, an older release on the same machine refuses to start its sandbox, instead of running commands under a token that the kept grants were not made for. Its message also says to re-run the install; with the older release that is a downgrade, so read the next paragraph first.
+
+**Going back to an earlier release:** run `windows-uninstall` with this release first (or `srt-win acl forget --all` as each user who ran sandboxed sessions), then install the older one. An older release's install does not know about the kept grants and does not remove them, and under its token they would let any sandboxed command write those directories. `srt-win user status` lists the directories that still carry one (`persistent_grants.roots`).
+
 ### Security model
 
 The sandboxed command runs **as the `srt-sandbox` account**, not as the calling user. The bundled `srt-win.exe` helper does a two-hop launch: the broker calls `CreateProcessWithLogonW` to start a runner as `srt-sandbox`, and the runner spawns the target under a restricted token inside a job object. The child inherits the sandbox account's isolated profile (`%USERPROFILE%`, `%TEMP%`, `HKCU`) and a fresh environment overlaid with only the broker's `PATH` and the generated proxy variables.
@@ -759,7 +763,7 @@ Running under a distinct user SID structurally closes the surrogate-spawn class 
 
 **Network isolation** is a two-filter WFP set at `FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6`: a PERMIT for loopback destinations inside the configured proxy port range (default `60080–60089`), and a BLOCK for any connect whose token carries the `srt-sandbox` SID. The sandboxed process reaches the internet only via the JS HTTP/SOCKS5 proxies listening in that range; a process that strips its proxy environment and connects directly is blocked at the kernel.
 
-**Filesystem isolation** is enforced by NTFS discretionary ACLs. The `srt-sandbox` account has no inherent rights on the calling user's files, so at `initialize()` the sandbox writes **additive, inheriting explicit ACEs for the `srt-sandbox` SID only** — it never rewrites or replaces a path's existing security descriptor:
+**Filesystem isolation** is enforced by NTFS discretionary ACLs. The `srt-sandbox` account has no inherent rights on the calling user's files, so at `initialize()` the sandbox writes **additive, inheriting explicit ACEs** — for the sandbox account, and for `allowWrite` roots for the sandbox group and an identifier of the root's own ([below](#the-child-token-and-kept-write-grants)) — and never rewrites or replaces a path's existing security descriptor:
 
 - `filesystem.allowWrite` → an inheriting `MODIFY` ALLOW ACE (`READ|WRITE|EXECUTE|DELETE`, with `FILE_DELETE_CHILD` withheld). The sandboxed process can create, modify, and delete files inside the working tree; withholding `FILE_DELETE_CHILD` from the grant is defense-in-depth for the deny stamps below, not a guard on the tree root.
 - `filesystem.allowRead` → an inheriting `READ|EXECUTE` ALLOW ACE
@@ -768,11 +772,39 @@ Running under a distinct user SID structurally closes the surrogate-spawn class 
 
 The lists rank as on the other platforms. The ACEs set on an object come before the ones it inherits, so an `allowRead` beneath a `denyRead` directory is readable. An `allowWrite` at or beneath a `denyWrite` path grants `READ|EXECUTE` only, and an `allowRead` or `allowWrite` at or beneath a `credentials.files` entry grants nothing. "Beneath" is decided on the paths as they resolve on disk: links, junctions, 8.3 names and letter case make no difference (a UNC path is compared as spelled, whatever its case). A deny that one command brings in its `customConfig` ranks the same way against the session's grants.
 
-`reset()` removes every ACE this session added (refcounted across this user's concurrent hosts via the per-user session DB; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit). Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered. A pattern is walked from the literal directory it starts with, a drive root or the root of a share included (`C:\Users*\.ssh\*`, `\\server\share\*.pem`); a `**` right below such a root lists the whole volume. In an entry without `*` or `?`, `[` and `]` are characters of the name. In a pattern they are read as a character class, as on the other platforms, and the pattern is also expanded beneath a folder that has them in its name.
+`reset()` removes the ACEs this session added, except the write grants on `allowWrite` roots and the denies beneath them, which are kept for the next session ([below](#the-child-token-and-kept-write-grants)). What is removed is refcounted across this user's concurrent hosts via the per-user session DB; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit. Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered. A pattern is walked from the literal directory it starts with, a drive root or the root of a share included (`C:\Users*\.ssh\*`, `\\server\share\*.pem`); a `**` right below such a root lists the whole volume. In an entry without `*` or `?`, `[` and `]` are characters of the name. In a pattern they are read as a character class, as on the other platforms, and the pattern is also expanded beneath a folder that has them in its name.
+
+### The child token and kept write grants
+
+The sandbox account is a member of `BUILTIN\Users`, so an ordinary token for it can write wherever `Users` / `Authenticated Users` hold write access, whatever `filesystem.allowWrite` says: directories created under `C:\`, trees on data drives, `PATH` directories outside `Program Files`. The sandboxed process therefore runs under a **write-restricted token**. Its restricting SIDs are the sandbox account, `Everyone`, `RESTRICTED`, and one identifier per `allowWrite` root of the session, so those group-held write rights do not apply: only the session's `allowWrite` roots, the sandbox account's own profile, and locations writable by `Everyone` are writable. Reads are unaffected by the token.
+
+**What does not work inside the sandbox: Schannel.** Windows does not hand TLS credentials to a restricted token, so a client that uses the operating system's TLS stack cannot complete an HTTPS handshake:
+
+- `System32\curl.exe`
+- PowerShell `Invoke-WebRequest` / `Invoke-RestMethod`
+- .NET `HttpClient`, and with it `dotnet restore` / NuGet
+- `winget`
+- any other tool built on WinHTTP, WinINet or Schannel, including git with `http.sslBackend=schannel` and cargo, whose bundled libcurl uses Schannel on Windows
+
+There is no per-tool workaround for these inside the sandbox; the way to run them is the opt-out below.
+
+**What keeps working:** clients that bring their own TLS stack — Node, Python, Java, Go programs, msys2 / Git for Windows `curl` built with OpenSSL, and Git for Windows itself, which the sandbox steers to its OpenSSL backend (`http.sslBackend=openssl` in the injected git config). They take their trust roots from the environment variables described under [TLS termination](#tls-termination-on-windows).
+
+**Write grants on `allowWrite` roots are kept between sessions.** Granting a directory means writing an access entry that Windows copies to every file below it, which takes time proportional to the tree — and as long again to take back. So a root is granted the first time it is used; afterwards `initialize()` reads one access list per root, and `reset()` leaves the grant in place.
+
+- A session can write only the roots in its own `allowWrite`. Each kept root is tied to an identifier of its own, which only a session given that root carries in its token, so a session in one project cannot write another project's kept root.
+- **Reads are not separated this way: any sandboxed session can read a kept root**, whether or not the root is in its lists, until the grant is removed.
+- `denyRead` / `denyWrite` entries beneath a kept root are kept with it, and are added to but not removed by later sessions.
+- Sandboxed programs cannot change the permissions of files they create under a kept root.
+- The kept grants are removed by `windows-uninstall`, by `srt-win acl forget <root>` or `srt-win acl forget --all`, and by opting out (next paragraph). `srt-win user status` lists them.
+
+**Opting out:** set `windows.writeRestrictedToken: false`. The sandboxed process then runs under the sandbox account's ordinary token, under which Schannel works, and what that costs is the two things above: it can write wherever `Users` / `Authenticated Users` can, and grants are per-session again — written at every `initialize()` and removed at every `reset()`, each a walk of the tree. The first `initialize()` after opting out removes the kept grants before anything is granted, walking each kept root once, and fails if one cannot be removed; while a kept grant exists, or its absence cannot be established, `srt-win` does not run a command under the ordinary token. Files the sandbox account itself created in a group-writable location while opted out may stay writable to it afterwards, because it owns them.
+
+The token is fixed per session. Every `initialize()` verifies the egress fence with that session's token and fails if the probe is not blocked; a per-command override in `customConfig` is rejected, and `updateConfig()` does not change it until the next `reset()` + `initialize()`. If the token cannot be created, or a command fails under it, the failure is reported: nothing retries under the ordinary token.
 
 ### TLS termination on Windows
 
-`network.tlsTerminate` requires the MITM CA to be present in the **sandbox user's** `CurrentUser\Root` certificate store (schannel — the TLS backend used by `System32\curl.exe`, PowerShell `Invoke-WebRequest`, .NET, and default-backend `git` — trusts only the OS store, not environment variables). This is an install-time step, separate from `windows-install`:
+`network.tlsTerminate` requires the MITM CA to be present in the **sandbox user's** `CurrentUser\Root` certificate store (schannel — the TLS backend used by `System32\curl.exe`, PowerShell `Invoke-WebRequest`, .NET, and default-backend `git` — trusts only the OS store, not environment variables; these clients run only with `windows.writeRestrictedToken: false`, see [above](#the-child-token-and-kept-write-grants)). This is an install-time step, separate from `windows-install`:
 
 ```typescript
 import { windowsTrustCa } from '@anthropic-ai/sandbox-runtime'
@@ -781,7 +813,7 @@ windowsTrustCa('/path/to/mitm-ca.crt') // or: srt-win user trust-ca <path>
 
 `initialize()` compares the session CA's thumbprint against the installed one and fails with an actionable message on mismatch, so a stale install-time CA cannot silently break TLS inside the sandbox.
 
-OpenSSL-backed clients (msys2 `curl`, `git -c http.sslBackend=openssl`, Node, Python, cargo) are covered by the env-var trust layer: the same trust bundle used on macOS/Linux is passed into the sandbox via `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, etc., and the bundle path is added to the session's `allowRead` grant so the sandbox account can open it.
+Clients with their own TLS stack (msys2 `curl`, git on its OpenSSL backend, Node, Python) are covered by the env-var trust layer, as is cargo where it runs (it reads `CARGO_HTTP_CAINFO`, but its transport is Schannel): the same trust bundle used on macOS/Linux is passed into the sandbox via `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, etc., and the bundle path is added to the session's `allowRead` grant so the sandbox account can open it.
 
 ### Windows-specific configuration
 
@@ -790,17 +822,12 @@ The cross-platform `filesystem` and `network` blocks apply as described above. W
 - `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range.
 - `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
 - `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
-- `windows.writeRestrictedToken` — **experimental**, boolean, default `false`. The sandbox account is a member of `BUILTIN\Users`, so by default a sandboxed process can write wherever `Users` / `Authenticated Users` already hold write access, whatever `filesystem.allowWrite` says: directories created under `C:\`, trees on data drives, `PATH` directories outside `Program Files`. With this option the process runs under a write-restricted token whose restricting SIDs are the sandbox account, `Everyone` and `RESTRICTED`, so those group-held write rights no longer apply; only `allowWrite` paths, the sandbox account's own profile, and locations writable by `Everyone` stay writable. Reads are unaffected. Costs and limits:
-  - **Schannel stops working inside the sandbox.** Windows refuses to hand TLS credentials to a restricted token, so `System32\curl.exe`, git with the schannel backend, and .NET / PowerShell web requests (`Invoke-WebRequest`, `HttpClient`) fail. OpenSSL-based clients (Node, Python, cargo, msys2 `curl`) are unaffected, and git is switched to its OpenSSL backend automatically (`http.sslBackend=openssl` in the injected git config). There is no workaround for `curl.exe` or .NET.
-  - It is session-level: every `initialize()` verifies the egress fence with this session's token and fails if the probe is not blocked; a per-command override is rejected, and `updateConfig()` does not change it until the next `reset()` + `initialize()`.
-  - If the token cannot be created the command fails — there is no fallback to the ordinary token.
-  - Files the sandbox account itself created in such a location while the option was off may stay writable to it, because it owns them.
-  - **Grants on `allowWrite` roots are kept between sessions.** Granting a directory means writing an access entry that Windows copies to every file below it, so it takes time proportional to the tree. With this option that is done the first time a root is used; afterwards `initialize()` reads one access list per root and `reset()` leaves the grant in place. A session can write only the roots in its own `allowWrite`: each root is tied to an identifier of its own that only a session given that root carries in its token, so a session in one project cannot write another project's kept root. **Reads are not separated this way: any sandboxed session can read a kept root.** `denyRead` / `denyWrite` entries under a kept root are kept with it, and are added to but not removed by later sessions. Sandboxed programs cannot change the permissions of files they create under a kept root.
-  - The kept grants are removed by `windows-uninstall`, by `srt-win acl forget --all` (or `srt-win acl forget <root>`), and automatically by the next `initialize()` that runs with the option off — which walks each kept root once and fails if a grant cannot be removed. While kept grants exist, commands are not run under the ordinary token.
+- `windows.writeRestrictedToken` — boolean, default `true`. Leave it unset for the write-restricted child token and the kept write grants described under [The child token and kept write grants](#the-child-token-and-kept-write-grants). Set it to `false` only to run Schannel-based clients inside the sandbox; that section says what opting out costs. It is session-level: it cannot be changed per command.
 
 ### Known limitations
 
-- **Certificate revocation under schannel.** CryptoAPI's CRL/OCSP fetch goes out via WinHTTP under the caller's token, ignoring the proxy environment, so it is blocked by the WFP egress fence. Tools that use schannel with revocation checking on by default fail with `CRYPT_E_REVOCATION_OFFLINE` (`0x80092013`) unless revocation is disabled per tool: `curl --ssl-no-revoke`, `git -c http.schannelCheckRevoke=false`, `CARGO_HTTP_CHECK_REVOKE=false`. `Invoke-WebRequest`, .NET `HttpClient`, and `gh` do not check revocation by default and are unaffected. A CRL distribution point served from the loopback proxy is planned to remove this workaround.
+- **Schannel-based clients do not work inside the sandbox by default** — see [The child token and kept write grants](#the-child-token-and-kept-write-grants) for the list and the opt-out.
+- **Certificate revocation under schannel** (with `windows.writeRestrictedToken: false`; by default Schannel clients do not get this far). CryptoAPI's CRL/OCSP fetch goes out via WinHTTP under the caller's token, ignoring the proxy environment, so it is blocked by the WFP egress fence. Tools that use schannel with revocation checking on by default fail with `CRYPT_E_REVOCATION_OFFLINE` (`0x80092013`) unless revocation is disabled per tool: `curl --ssl-no-revoke`, `git -c http.schannelCheckRevoke=false`, `CARGO_HTTP_CHECK_REVOKE=false`. `Invoke-WebRequest`, .NET `HttpClient`, and `gh` do not check revocation by default and are unaffected. A CRL distribution point served from the loopback proxy is planned to remove this workaround.
 - **Per-user tool installs are not reachable.** The sandboxed process runs as `srt-sandbox`, not as you, so tools installed under your profile (nvm/fnm-managed Node, per-user `winget`/Scoop packages, `pip install --user`, `%LOCALAPPDATA%\Programs\…`) resolve on the inherited `PATH` but cannot be opened by the sandbox account. Prefer machine-wide installs (`Program Files`, `choco`/`winget --scope machine`), or add the specific profile paths to `filesystem.allowRead`.
 - **Per-exec `filesystem.allowRead` / `filesystem.allowWrite` overrides are not supported.** Session-level `allowRead`/`allowWrite` (in the config passed to `initialize()`) work as described above; passing them per-command in `wrapWithSandbox`'s `customConfig` throws — grants are applied session-wide via `srt-win acl grant` at `initialize()`, and `srt-win exec` only exposes per-exec denies.
 - **`proxyAuthToken` is visible in the runner's command line.** The proxy environment (including `HTTP_PROXY=http://srt:<token>@127.0.0.1:…`) is passed to the two-hop runner as `--env` arguments on `srt-win exec`'s argv, so the token is readable by any local principal that can open the runner process for `PROCESS_QUERY_LIMITED_INFORMATION`. The token exists so the sandboxed process can authenticate to the loopback proxy, so it is not a secret from the sandbox itself; on a single-user development machine this is generally acceptable, but on a shared host treat the proxy allowlist as reachable by other same-session principals.
@@ -812,7 +839,7 @@ The cross-platform `filesystem` and `network` blocks apply as described above. W
 npx @anthropic-ai/sandbox-runtime windows-uninstall
 ```
 
-Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, the write grants kept by `windows.writeRestrictedToken` sessions of the user running it, and removes the `HKLM\SOFTWARE\sandbox-runtime` key (credential, marker, CA record) — one UAC prompt. `%ProgramData%\sandbox-runtime` (the CA key material) is left in place; delete it (and `%LOCALAPPDATA%\sandbox-runtime` per user) manually for a full sweep.
+Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, the write grants kept on `allowWrite` roots by sessions of the user running it, and removes the `HKLM\SOFTWARE\sandbox-runtime` key (credential, marker, CA record) — one UAC prompt. `%ProgramData%\sandbox-runtime` (the CA key material) is left in place; delete it (and `%LOCALAPPDATA%\sandbox-runtime` per user) manually for a full sweep.
 
 ## Development
 

@@ -234,7 +234,17 @@ fn db_roots_ro() -> Option<Vec<String>> {
 /// and then both a root it records and its absence refuse: "nothing
 /// recorded" is accepted only from a store that is there to be read.
 pub fn unrestricted_block_reason() -> Option<String> {
-    let m = match read_marker() {
+    block_reason_from(read_marker(), db_roots_ro)
+}
+
+/// [`unrestricted_block_reason`] on what was read: `marker` as
+/// [`read_marker`] returned it, `db_roots` as [`db_roots_ro`] does.
+/// Every "could not read" refuses.
+fn block_reason_from(
+    marker: Result<Marker>,
+    db_roots: impl FnOnce() -> Option<Vec<String>>,
+) -> Option<String> {
+    let m = match marker {
         Ok(m) => m,
         Err(e) => {
             return Some(format!(
@@ -252,7 +262,7 @@ pub fn unrestricted_block_reason() -> Option<String> {
     if !m.ever_enabled {
         return None;
     }
-    match db_roots_ro() {
+    match db_roots() {
         Some(v) if v.is_empty() => None,
         Some(v) => Some(format!(
             "the state database records {} persistent write grant(s) (e.g. '{}')",
@@ -882,7 +892,8 @@ pub fn forget_everything() -> Result<(usize, usize)> {
 /// the records may be gone while ACEs remain, look at each target's
 /// own DACL too: a persistent ALLOW written on the target itself is
 /// removed (one walk), one inherited from a directory above cannot be
-/// removed from here and refuses.
+/// removed from here and refuses. So does a target whose DACL cannot
+/// be read: "could not look" is not "no grant there".
 pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<()> {
     if let Some(why) = unrestricted_block_reason() {
         bail!(
@@ -891,29 +902,58 @@ pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<(
         );
     }
     let ids = Ids::load()?;
-    let t = ids.trustees();
     for canon in targets {
-        // A target whose DACL cannot be read is left to the grant
-        // itself, which reads it again and fails on it.
-        let Ok(aces) = acl::read_aces(canon) else {
-            continue;
-        };
-        let grant = |a: &&AceView| {
-            !a.deny && (t.group_sid == Some(a.sid.as_str()) || is_capability_sid(&a.sid))
-        };
-        if aces.iter().filter(grant).any(|a| a.inherited) {
-            bail!(
+        match unrecorded_grant_on(acl::read_aces(canon), ids.group_sid.as_deref()) {
+            Ok(UnrecordedGrant::None) => {}
+            Ok(UnrecordedGrant::Own) => {
+                eprintln!("srt-win: '{canon}' carries an unrecorded persistent grant; removing it");
+                forget_one(db.conn(), &ids, canon)
+                    .with_context(|| format!("remove the persistent grant on '{canon}'"))?;
+            }
+            Ok(UnrecordedGrant::Inherited) => bail!(
                 "'{canon}' inherits a persistent write grant from a directory above it that \
                  is no longer recorded; run `srt-win acl forget <that directory>`"
-            );
-        }
-        if aces.iter().any(|a| grant(&a)) {
-            eprintln!("srt-win: '{canon}' carries an unrecorded persistent grant; removing it");
-            forget_one(db.conn(), &ids, canon)
-                .with_context(|| format!("remove the persistent grant on '{canon}'"))?;
+            ),
+            Err(e) => bail!(
+                "the access list of '{canon}' cannot be read ({e:#}), so a persistent write \
+                 grant on it cannot be ruled out; grants for the ordinary token are refused"
+            ),
         }
     }
     Ok(())
+}
+
+/// A persistent ALLOW found on a path that no record lists.
+#[derive(Debug, PartialEq, Eq)]
+enum UnrecordedGrant {
+    None,
+    /// Written on the path itself: `forget_one` can remove it.
+    Own,
+    /// Inherited from a directory above: not removable from here.
+    Inherited,
+}
+
+/// What `aces` (a path's own DACL, as [`acl::read_aces`] returned it)
+/// says about a persistent ALLOW — one for the sandbox group or for a
+/// capability SID. A DACL that could not be read is an error, never
+/// [`UnrecordedGrant::None`].
+fn unrecorded_grant_on(
+    aces: Result<Vec<AceView>>,
+    group_sid: Option<&str>,
+) -> Result<UnrecordedGrant> {
+    let aces = aces?;
+    let mut grants = aces
+        .iter()
+        .filter(|a| !a.deny && (group_sid == Some(a.sid.as_str()) || is_capability_sid(&a.sid)))
+        .peekable();
+    if grants.peek().is_none() {
+        return Ok(UnrecordedGrant::None);
+    }
+    Ok(if grants.any(|a| a.inherited) {
+        UnrecordedGrant::Inherited
+    } else {
+        UnrecordedGrant::Own
+    })
 }
 
 #[cfg(test)]
@@ -1008,5 +1048,81 @@ mod tests {
         // A sibling whose name merely starts with a root's name.
         assert_eq!(c(r"\\?\C:\ab"), None);
         assert_eq!(c(r"\\?\C:\"), None);
+    }
+
+    fn marker_with(ever_enabled: bool, roots: &[&str]) -> Marker {
+        Marker {
+            ever_enabled,
+            roots: roots
+                .iter()
+                .map(|p| MarkerRoot {
+                    file_id: FileId::from_bytes(&[0u8; 24]).unwrap(),
+                    path: (*p).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The ordinary token is allowed only on a positive "nothing
+    /// kept": every store that could not be read refuses.
+    #[test]
+    fn ordinary_token_is_refused_on_any_read_failure() {
+        let no_db = || -> Option<Vec<String>> { panic!("database consulted") };
+        // Nothing was ever kept: allowed, without the database.
+        assert_eq!(block_reason_from(Ok(Marker::default()), no_db), None);
+        // The marker cannot be read.
+        let r = block_reason_from(Err(anyhow!("access denied")), no_db).unwrap();
+        assert!(r.contains("cannot be read"), "{r}");
+        // The marker lists a root.
+        let r = block_reason_from(Ok(marker_with(true, &[r"\\?\C:\a"])), no_db).unwrap();
+        assert!(r.contains("1 persistent write grant"), "{r}");
+        // Grants were made, no root is listed now: the database decides.
+        let ever = || Ok(marker_with(true, &[]));
+        assert_eq!(block_reason_from(ever(), || Some(Vec::new())), None);
+        let r = block_reason_from(ever(), || Some(vec![r"\\?\C:\b".to_owned()])).unwrap();
+        assert!(r.contains("state database records 1"), "{r}");
+        // … and a database that is missing or unreadable refuses.
+        let r = block_reason_from(ever(), || None).unwrap();
+        assert!(r.contains("missing or unreadable"), "{r}");
+    }
+
+    #[test]
+    fn unreadable_dacl_is_not_an_absent_grant() {
+        const GROUP: &str = "S-1-5-21-1-2-3-1001";
+        let cap = capability_sid_from([7; 16]);
+        let ace = |sid: &str, deny: bool, inherited: bool| AceView {
+            deny,
+            inherited,
+            flags: 0x3,
+            mask: 0x0013_01bf,
+            sid: sid.to_owned(),
+        };
+        let on = |aces: Vec<AceView>| unrecorded_grant_on(Ok(aces), Some(GROUP)).unwrap();
+        assert!(unrecorded_grant_on(Err(anyhow!("access denied")), Some(GROUP)).is_err());
+        assert_eq!(on(vec![]), UnrecordedGrant::None);
+        // Other trustees, and the group's DENY, are not grants.
+        assert_eq!(
+            on(vec![
+                ace("S-1-5-32-545", false, true),
+                ace(GROUP, true, false)
+            ]),
+            UnrecordedGrant::None
+        );
+        assert_eq!(on(vec![ace(GROUP, false, false)]), UnrecordedGrant::Own);
+        assert_eq!(on(vec![ace(&cap, false, false)]), UnrecordedGrant::Own);
+        assert_eq!(
+            on(vec![ace(GROUP, false, false), ace(&cap, false, true)]),
+            UnrecordedGrant::Inherited
+        );
+        // Without an install record the group cannot be told apart;
+        // a capability SID still can.
+        assert_eq!(
+            unrecorded_grant_on(Ok(vec![ace(GROUP, false, false)]), None).unwrap(),
+            UnrecordedGrant::None
+        );
+        assert_eq!(
+            unrecorded_grant_on(Ok(vec![ace(&cap, false, true)]), None).unwrap(),
+            UnrecordedGrant::Inherited
+        );
     }
 }

@@ -1,5 +1,6 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
 import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
+import { windowsWriteRestrictedTokenEnabled } from '../src/sandbox/windows-sandbox-utils.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
 
@@ -2318,6 +2319,44 @@ describe('Config Validation', () => {
           expect(parse({ handshakeTimeoutMs: v }).success).toBe(false)
         }
       })
+    })
+  })
+
+  describe('windows.writeRestrictedToken', () => {
+    const parse = (windows?: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        ...(windows !== undefined && { windows }),
+      })
+
+    test('defaults to on: no windows block, an empty one and true are the same; only false turns it off', () => {
+      const applied = (windows?: unknown): boolean => {
+        const r = parse(windows)
+        expect(r.success).toBe(true)
+        return windowsWriteRestrictedTokenEnabled(
+          r.success ? r.data.windows : undefined,
+        )
+      }
+      expect(applied()).toBe(true)
+      expect(applied({})).toBe(true)
+      expect(applied({ writeRestrictedToken: true })).toBe(true)
+      expect(applied({ writeRestrictedToken: false })).toBe(false)
+    })
+
+    test('the parsed config keeps what was written, so an explicit false stays distinguishable from unset', () => {
+      const unset = parse({})
+      const off = parse({ writeRestrictedToken: false })
+      expect(unset.success && unset.data.windows?.writeRestrictedToken).toBe(
+        undefined,
+      )
+      expect(off.success && off.data.windows?.writeRestrictedToken).toBe(false)
+    })
+
+    test('rejects a value that is not a boolean', () => {
+      for (const bad of ['false', 0, 'off', null]) {
+        expect(parse({ writeRestrictedToken: bad }).success).toBe(false)
+      }
     })
   })
 })

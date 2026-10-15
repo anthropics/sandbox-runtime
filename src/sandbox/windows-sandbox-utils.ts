@@ -121,6 +121,12 @@ export type WindowsSandboxErrorCode =
   /** Sandbox user account / credential not present — run install. */
   | 'not_provisioned'
   /**
+   * The sandbox is installed, by a release whose setup version is not
+   * the one this `srt-win` requires — re-run the install. Nothing is
+   * granted or run until then.
+   */
+  | 'reinstall_required'
+  /**
    * Working directory is on a mapped network drive; the sandbox
    * cannot start (per-user drive mappings don't exist under the
    * sandbox logon). `srt-win exec` exit **16**; parsed from its
@@ -225,6 +231,13 @@ export interface WindowsSandboxUserStatus {
   /** Setup marker schema version, when the marker row exists. */
   markerVersion?: number
   /**
+   * The setup version this `srt-win` requires. It launches nothing,
+   * and keeps no grant, while {@link markerVersion} differs — see
+   * {@link windowsSetupVersionMismatch}. Absent from an `srt-win`
+   * that does not report it.
+   */
+  setupVersion?: number
+  /**
    * The calling (real) user's SID — the broker's identity, surfaced
    * for diagnostics. The DENY-ACE trustee is `srt-sandbox`'s SID
    * ({@link sid}), not this. Always present.
@@ -238,11 +251,12 @@ export interface WindowsSandboxUserStatus {
   /** PEM-encoded install-time CA certificate, when present. */
   caCertPem?: string
   /**
-   * Set when write grants kept by `windows.writeRestrictedToken`
-   * sessions exist (`present`, with their roots) or cannot be ruled
-   * out (`unknown`). While it is set, `srt-win` refuses to run a
-   * command under the ordinary token; `initialize()` without the
-   * option removes the grants first.
+   * Set when write grants kept between sessions (the default; see
+   * `windows.writeRestrictedToken`) exist (`present`, with their
+   * roots) or cannot be ruled out (`unknown`). While it is set,
+   * `srt-win` refuses to run a command under the ordinary token;
+   * `initialize()` with the option set to `false` removes the grants
+   * first.
    */
   persistentGrants?: {
     state: 'present' | 'unknown'
@@ -487,19 +501,20 @@ export interface WindowsSandboxParams {
    * (`SandboxRuntimeConfig.windows.writeRestrictedToken`): adds
    * `--write-restricted-token` to the `srt-win exec` argv and selects
    * git's OpenSSL backend in the injected git config (Schannel
-   * refuses restricted tokens). Default `false`, which leaves argv
-   * and env exactly as they are without the option.
+   * refuses restricted tokens). Default `true`; unset and `true` are
+   * the same. Only an explicit `false` gives the ordinary token: no
+   * flag, no `--write-root`, no git backend entry.
    *
    * The caller must have verified the egress fence for this token
-   * shape first — {@link verifyWindowsWfpEgress} with the same flag.
+   * shape first — {@link verifyWindowsWfpEgress} with the same value.
    */
   writeRestrictedToken?: boolean
   /**
-   * With {@link writeRestrictedToken}: the session's write roots, as
-   * granted by {@link grantWindowsAclPersistent}. Each is passed as
+   * The session's write roots, as granted by
+   * {@link grantWindowsAclPersistent}. Each is passed as
    * `--write-root`, which puts the root's capability SID in the
    * child token — without it the child cannot write the root.
-   * Ignored without the token option.
+   * Ignored when {@link writeRestrictedToken} is `false`.
    */
   writeRoots?: readonly string[]
   /**
@@ -858,6 +873,7 @@ type RawUserStatus = {
   }
   cred_present: boolean
   marker_version?: number | null
+  setup_version?: number | null
   real_user_sid: string
   ca_cert_thumb?: string | null
   ca_cert_pem?: string | null
@@ -881,6 +897,9 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
     credPresent: raw.cred_present,
     ...(typeof raw.marker_version === 'number' && {
       markerVersion: raw.marker_version,
+    }),
+    ...(typeof raw.setup_version === 'number' && {
+      setupVersion: raw.setup_version,
     }),
     realUserSid: raw.real_user_sid,
     ...(raw.ca_cert_thumb && { caCertThumb: raw.ca_cert_thumb }),
@@ -996,17 +1015,17 @@ export async function getWindowsWfpStatusAsync(
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
- * @param opts.writeRoots with `writeRestrictedToken`: the session's
- *   write roots, so the probe child's token carries the same
- *   capability SIDs a command of the session gets.
- * @param opts.writeRestrictedToken probe with the write-restricted
- *   child token instead of the default one (`srt-win wfp verify
+ * @param opts.writeRoots the session's write roots, so the probe
+ *   child's token carries the same capability SIDs a command of the
+ *   session gets. Ignored when `writeRestrictedToken` is `false`.
+ * @param opts.writeRestrictedToken default `true`: probe with the
+ *   write-restricted child token (`srt-win wfp verify
  *   --write-restricted-token`: the connect is made by a lockdown
- *   child holding that token). The WFP block filter matches by an
- *   access check of the connecting token, and a restricted token is
- *   checked differently — a session that will run commands with the
- *   option MUST verify with it, because a filter that stopped
- *   matching would leave egress open, not closed.
+ *   child holding that token). `false` probes with the ordinary one.
+ *   The WFP block filter matches by an access check of the connecting
+ *   token, and a restricted token is checked differently — a session
+ *   MUST verify with the token its commands will run under, because a
+ *   filter that stopped matching would leave egress open, not closed.
  * @throws on any outcome other than `blocked` (exit 0).
  */
 export async function verifyWindowsWfpEgress(
@@ -1051,7 +1070,7 @@ export async function verifyWindowsWfpEgress(
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
     // the runner allows itself 2s to connect (runner.rs).
     const verifyArgs = ['wfp', 'verify', '--target', target]
-    if (opts.writeRestrictedToken === true) {
+    if (windowsWriteRestrictedTokenEnabled(opts)) {
       verifyArgs.push('--write-restricted-token')
       for (const r of opts.writeRoots ?? []) verifyArgs.push('--write-root', r)
     }
@@ -2281,8 +2300,9 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 }
 
 /**
- * Session start for `windows.writeRestrictedToken`: one `srt-win acl
- * grant --persistent` carrying the grants and the deny lists.
+ * Session start under the write-restricted token (the default; see
+ * `windows.writeRestrictedToken`): one `srt-win acl grant
+ * --persistent` carrying the grants and the deny lists.
  *
  * Each `write` path becomes a persistent root. It gets ACEs for the
  * sandbox group and for a capability SID of its own — none for the
@@ -2342,13 +2362,14 @@ export function grantWindowsAclPersistent(
 }
 
 /**
- * Remove every write grant kept by `windows.writeRestrictedToken`
- * sessions (`srt-win acl forget --all`): one walk per root.
+ * Remove every write grant kept between sessions (`srt-win acl forget
+ * --all`): one walk per root.
  *
- * A session WITHOUT the option must run this before it grants
- * anything, whenever {@link WindowsSandboxUserStatus.persistentGrants}
- * is set: a kept grant lets the sandbox account write its tree under
- * the ordinary token.
+ * A session with `windows.writeRestrictedToken: false` must run this
+ * before it grants anything, whenever
+ * {@link WindowsSandboxUserStatus.persistentGrants} is set: a kept
+ * grant lets the sandbox account write its tree under the ordinary
+ * token.
  *
  * @throws if any grant could not be removed.
  */
@@ -2366,8 +2387,8 @@ export function forgetWindowsPersistentGrants(
   if (r.status !== 0) {
     throw new WindowsSandboxError(
       'acl_forget_failed',
-      `Write grants kept from sessions with ` +
-        `windows.writeRestrictedToken could not be removed (srt-win ` +
+      `Write grants kept from earlier sessions could not be removed, ` +
+        `so windows.writeRestrictedToken: false cannot take effect (srt-win ` +
         `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}`,
     )
   }
@@ -2518,6 +2539,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   env: NodeJS.ProcessEnv
 } {
   const { exe, prependArgs } = p.srtWin ?? resolveSrtWin()
+  const writeRestricted = windowsWriteRestrictedTokenEnabled(p)
   // Generated proxy + CA-trust env. Single-sourced here so the
   // same object feeds (a) the spawn env merge below and (b) the
   // explicit `--env` overlay for the runner.
@@ -2570,13 +2592,13 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     // token, so git's default backend on Windows would fail every
     // HTTPS operation; its OpenSSL backend is unaffected and reads the
     // same GIT_SSL_CAINFO.
-    opensslBackend: p.writeRestrictedToken === true,
+    opensslBackend: writeRestricted,
     baseEnv: p.setEnvVars,
   })
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
   if (p.quiet !== false) argv.push('--quiet')
-  if (p.writeRestrictedToken === true) {
+  if (writeRestricted) {
     argv.push('--write-restricted-token')
     for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
   }
@@ -2654,6 +2676,49 @@ function envListToObject(list: string[]): NodeJS.ProcessEnv {
 // ────────────────────────────────────────────────────────────────────
 
 /**
+ * `windows.writeRestrictedToken` as it applies: on unless it is
+ * explicitly `false`. The one place the default is decided — every
+ * reader of the option (and of the parameters derived from it) goes
+ * through here, so unset and `true` cannot diverge.
+ */
+export function windowsWriteRestrictedTokenEnabled(
+  w: { writeRestrictedToken?: boolean } | undefined,
+): boolean {
+  return w?.writeRestrictedToken !== false
+}
+
+/**
+ * Why an existing install cannot be used by this `srt-win`, or
+ * `undefined` when it can: the install's setup marker was written by
+ * a release with a different setup version. `srt-win` then refuses to
+ * launch the sandbox account and to keep a write grant, and the
+ * repair is to re-run the install, which upgrades in place.
+ *
+ * Only meaningful for a provisioned install; an `srt-win` that does
+ * not report its setup version is not judged here (it enforces the
+ * same check itself at launch).
+ */
+export function windowsSetupVersionMismatch(
+  us: WindowsSandboxUserStatus,
+  sublayerGuid?: string,
+): string | undefined {
+  if (us.setupVersion === undefined || us.markerVersion === us.setupVersion) {
+    return undefined
+  }
+  const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
+  return (
+    `The Windows sandbox on this machine was set up by a different ` +
+    `release (setup version ${us.markerVersion ?? 'unknown'}; this ` +
+    `release needs ${us.setupVersion}). Re-run the install to upgrade ` +
+    `it in place (one UAC prompt):\n` +
+    `  npx sandbox-runtime windows-install\n` +
+    `  — or call installWindowsSandbox(), or run ` +
+    `\`srt-win.exe install${sl}\` directly.\n` +
+    `Nothing is granted or run until then.`
+  )
+}
+
+/**
  * Install instructions, surfaced verbatim in error messages.
  */
 export function windowsInstallInstructions(
@@ -2708,6 +2773,11 @@ function interpretDependencyProbes(
         `cred=${us.credPresent}). ` +
         windowsInstallInstructions(sublayerGuid),
     )
+  } else {
+    // Installed, by a release with another setup version: an upgrade,
+    // not a missing sandbox, so its own wording.
+    const stale = windowsSetupVersionMismatch(us, sublayerGuid)
+    if (stale) errors.push(stale)
   }
 
   // 3. WFP filters installed under the sublayer. BFE enumeration is

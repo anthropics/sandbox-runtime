@@ -22,10 +22,16 @@
 //!     to NT components.
 //!   - All privileges deleted except `SeChangeNotifyPrivilege`.
 //!   - Integrity Level = Medium (same as a normal user process).
-//!   - No `RestrictingSids` array by default — Schannel credential
-//!     acquisition fails under any token that carries one.
+//!   - No `RestrictingSids` array unless `write_restricted` (below) —
+//!     Schannel credential acquisition fails under any token that
+//!     carries one.
 //!
-//! ## Opt-in: write-restricted token
+//! ## Write-restricted token
+//!
+//! The token a sandboxed command gets from the library unless its
+//! `windows.writeRestrictedToken` option is `false`; `srt-win exec`
+//! builds it when given `--write-restricted-token`, and the token
+//! above (the ordinary one) otherwise.
 //!
 //! With `write_restricted` set, [`make_sandbox_token`] adds the
 //! `WRITE_RESTRICTED` flag and the restricting-SID list
@@ -528,7 +534,7 @@ mod tests {
             let _ = CloseHandle(base);
         }
         let tok = r.expect("make_sandbox_token");
-        // The default token carries no restricting SIDs.
+        // The ordinary token carries no restricting SIDs.
         let shape = token_restriction(tok).expect("token_restriction");
         assert!(!shape.write_restricted);
         assert_eq!(shape.restricted_sids, Vec::<String>::new());
@@ -539,7 +545,7 @@ mod tests {
         }
     }
 
-    /// The exact flag and restricting list of the opt-in token. The
+    /// The exact flag and restricting list of the write-restricted token. The
     /// user SID is first and must stay: the WFP egress BLOCK matches
     /// through it (see `wfp::sddl_sandbox_user`), so a list without
     /// it would leave the child's network egress unfenced.

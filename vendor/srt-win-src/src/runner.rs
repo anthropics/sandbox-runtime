@@ -186,7 +186,7 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
-        // A spec without the field is the default token.
+        // A spec without the field is the ordinary token.
         let legacy = br#"{"Exec":{"argv":["cmd.exe"],"env_overlay":[]}}"#;
         match serde_json::from_slice::<RunnerCmd>(legacy).unwrap() {
             RunnerCmd::Exec(r) => {

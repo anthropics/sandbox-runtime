@@ -1,10 +1,16 @@
 <#
-  Smoke test for the opt-in write-restricted child token
+  Smoke test for the write-restricted child token
   (`srt-win exec --write-restricted-token`, `token.rs`).
 
+  `srt-win exec` builds that token only when given the flag; the
+  library passes the flag unless its `windows.writeRestrictedToken`
+  option is `false`. Every row here names its token on the command
+  line: "option ON" is with the flag, "option OFF" / "ordinary token"
+  is without it.
+
   The sandbox account is a member of BUILTIN\Users and Authenticated
-  Users, so with the default token it can write wherever those groups
-  hold write access. The option adds WRITE_RESTRICTED and the
+  Users, so with the ordinary token it can write wherever those groups
+  hold write access. The flag adds WRITE_RESTRICTED and the
   restricting SIDs [<sandbox user>, Everyone, RESTRICTED] to the child
   token. Rows (option ON unless noted):
 
@@ -32,6 +38,11 @@
   Then the write grants that are kept between sessions (`acl grant
   --persistent`, `exec --write-root`, `persist.rs`), roots PA and PB:
 
+    P0  on an install whose setup marker is the previous version's —
+        one a broker of the previous release, which knows only the
+        ordinary token, would still launch on — `acl grant
+        --persistent` is refused and leaves nothing behind, and `exec`
+        does not run.
     P1  a session given only PA writes, creates and deletes in PA and
         can do none of them in PB, although PB carries the persistent
         sandbox-group ACE; it can read PB. With the test-hooks build:
@@ -193,7 +204,7 @@ function Wait-Sb { param($h, [int] $TimeoutSec = 180)
   $child = (($raw -split "`r?`n") | Where-Object { $_ -notmatch '^srt-win:' }) -join "`n"
   return [pscustomobject]@{ exit = $h.p.ExitCode; raw = $raw; out = $child }
 }
-# Sandboxed exec, default token.
+# Sandboxed exec, ordinary token (no flag).
 function SbOff { param([string[]] $tail, [int] $TimeoutSec = 180)
   Wait-Sb (Start-Sb (@('--') + $tail)) $TimeoutSec
 }
@@ -371,7 +382,7 @@ try {
     if ($r.exit -ne 0 -or -not $t) {
       Fail "G: could not read the child token with the option off (exit=$($r.exit)). raw: $($r.raw)"
     } elseif ($t.write_restricted -or @($t.restricted_sids).Count -ne 0) {
-      Fail 'G: default child token carries restricting SIDs (option off must be unchanged)'
+      Fail 'G: the ordinary child token carries restricting SIDs (option off must be unchanged)'
     } else { Ok 'G: default child token has no restricting SIDs' }
   }
   # For the log: the group view of the same token.
@@ -596,7 +607,7 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
       } else { Ok "E: no write/VM/impersonation open of the runner process or its $($a.threads) thread(s) succeeded" }
       if (@($a.errors).Count -gt 0) { Write-Host "E: note: non-access-denied results: $(@($a.errors) -join '; ')" }
     }
-    # For the record only: the same probe under the default token.
+    # For the record only: the same probe under the ordinary token.
     $r = SbOff @($HooksAbs, 'probe', 'parent-access')
     Write-Host "E-obs: option OFF (not asserted): $($r.out.Trim())"
   }
@@ -609,6 +620,28 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   $st = Persist-Status
   if ($st.state -eq 'none') { Ok 'P: no persistent grant recorded before the first one is made' }
   else { Fail "P: user status reports persistent_grants=$($st | ConvertTo-Json -Compress) before any was made" }
+
+  # ── P0: no kept grant on an install of the previous setup version ─
+  $reg = 'HKLM:\SOFTWARE\sandbox-runtime'
+  $curMarker = (Get-ItemProperty $reg).MarkerVersion
+  Set-ItemProperty $reg -Name MarkerVersion -Value ($curMarker - 1)
+  try {
+    $us0 = J @('user', 'status')
+    $g = Grant-P @($pa)
+    $r = SbOn @($cmd, '/c', 'echo P0-RAN')
+    $st = Persist-Status
+    if ($us0.marker_version -ne ($curMarker - 1) -or $us0.setup_version -ne $curMarker) {
+      Fail "P0: user status reports marker_version=$($us0.marker_version) setup_version=$($us0.setup_version) (marker set to $($curMarker - 1), build needs $curMarker)"
+    } elseif ($g.exit -ne 15 -or $g.raw -notmatch '(?i)marker version mismatch.*re-run') {
+      Fail "P0: acl grant --persistent on a previous-version install: exit=$($g.exit), expected 15 with the re-run-install message"
+    } elseif ((Has-Persistent $pa) -or $st.state -ne 'none' -or @($st.roots).Count -ne 0) {
+      Fail "P0: the refused grant left something behind: sddl=$(Sddl $pa) status=$($st | ConvertTo-Json -Compress)"
+    } elseif ($r.exit -ne 15 -or $r.out -match 'P0-RAN') {
+      Fail "P0: exec on a previous-version install: exit=$($r.exit) raw=$($r.raw)"
+    } else { Ok 'P0: a previous-version install gets no kept grant and no exec until it is re-installed' }
+  } finally {
+    Set-ItemProperty $reg -Name MarkerVersion -Value $curMarker
+  }
 
   # ── P1: two roots; a session writes only its own ─────────────────
   $ga = Grant-P @($pa)

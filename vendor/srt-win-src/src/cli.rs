@@ -200,8 +200,8 @@ enum Cmd {
     /// applied — proxy configuration is single-sourced by the caller
     /// (TS `generateProxyEnvVars`) and passed here via `--env`.
     ///
-    /// Requires `srt-win install` to have provisioned the user;
-    /// otherwise exits **15**.
+    /// Requires `srt-win install` to have provisioned the user, by a
+    /// build with this one's setup version; otherwise exits **15**.
     Exec {
         /// Per-exec read-deny: add an additive `(D;OICI;FA;;;<sb>)`
         /// ACE for the sandbox user on `<PATH>` (and a parent
@@ -234,8 +234,10 @@ enum Cmd {
         /// Build the child token with the `WRITE_RESTRICTED` flag and
         /// the restricting SIDs `[<sandbox user>, Everyone,
         /// RESTRICTED]`, so write access held by `BUILTIN\Users` /
-        /// `Authenticated Users` no longer reaches the child. Off by
-        /// default. Fails the exec if that token cannot be built —
+        /// `Authenticated Users` no longer reaches the child. Off
+        /// unless passed; the library passes it unless its
+        /// `windows.writeRestrictedToken` option is `false`. Fails the
+        /// exec if that token cannot be built —
         /// there is no fallback to the ordinary token. Schannel-based
         /// TLS clients (System32 `curl.exe`, schannel-backend git,
         /// .NET / PowerShell web requests) fail under it. Pair with
@@ -315,8 +317,11 @@ enum UserCmd {
     /// Print the sandbox user's provisioning state as JSON:
     /// `{user: {exists, sid?, group_exists, group_sid?,
     /// in_builtin_users, in_sandbox_group, hidden_from_logon},
-    /// cred_present, marker_version?, marker_user_sid?,
-    /// ca_cert_thumb?, ca_cert_pem?}`.
+    /// cred_present, marker_version?, setup_version,
+    /// marker_user_sid?, ca_cert_thumb?, ca_cert_pem?,
+    /// persistent_grants: {state, roots, reason?}}`. The install is
+    /// usable by this build only when `marker_version` equals
+    /// `setup_version`; otherwise re-run `srt-win install`.
     Status,
     /// Print the sandbox user's decrypted password (and only the
     /// password) to stdout. The broker uses this for
@@ -392,6 +397,11 @@ enum AclCmd {
         /// for the sandbox group and kept with it; the others, and
         /// the `read` paths, are per-session as without this flag.
         /// Pass each root to `exec` as `--write-root`.
+        ///
+        /// Exits **15** unless the install's setup marker is this
+        /// build's: no grant is kept on a machine where a build of
+        /// another setup version would still launch the sandbox
+        /// account.
         #[arg(long)]
         persistent: bool,
     },
@@ -694,6 +704,10 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // read as present from any user's session).
         "cred_present": setup.is_some() && install::cred_present(),
         "marker_version": setup.as_ref().map(|s| s.marker_version),
+        // The marker version this build requires. An install whose
+        // `marker_version` differs was made by another release and
+        // must be re-run before this build launches anything.
+        "setup_version": install::SETUP_VERSION,
         "marker_user_sid": setup.as_ref()
             .map(|s| s.sandbox_user_sid.as_str()),
         // The calling (real) user's SID — surfaced for diagnostics.
@@ -967,12 +981,21 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         }
                     }
                 }
-                eprintln!(
-                    "srt-win: partial install detected \
-                     (user_provisioned={}, marker_version={:?}) — \
-                     completing",
-                    us.exists, mv,
-                );
+                match mv {
+                    // An install by a build with another setup
+                    // version: the same steps bring it to this one.
+                    Some(v) if v != install::SETUP_VERSION => eprintln!(
+                        "srt-win: existing install has setup version {v}; \
+                         upgrading it to {}",
+                        install::SETUP_VERSION,
+                    ),
+                    _ => eprintln!(
+                        "srt-win: partial install detected \
+                         (user_provisioned={}, marker_version={:?}) — \
+                         completing",
+                        us.exists, mv,
+                    ),
+                }
                 // Fall through; the steps are idempotent.
             }
             // With --force and a changed name, do NOT delete the
@@ -1250,8 +1273,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            // Default token: the bare runner connects. Its token and
-            // the default child token give the filter's access check
+            // Ordinary token: the bare runner connects. Its token and
+            // the ordinary child token give the filter's access check
             // the same answer. Write-restricted token: the runner
             // launches this binary's `probe connect` as a lockdown
             // child, so the connect is made under the exact token
@@ -1415,6 +1438,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let holder = state_db::HolderPid(holder_pid);
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
+            // A grant that outlives the session is made only on an
+            // install of this build's setup version: a broker built
+            // for an earlier one runs the sandbox account under the
+            // ordinary token, and refuses to launch exactly when the
+            // marker is this build's. Checked before the session
+            // database is opened, so a refusal leaves no state.
+            if persistent && let Err(e) = srt_win::install::require_current_setup() {
+                eprintln!("srt-win: error: acl grant --persistent: {e:#}");
+                std::process::exit(15);
+            }
             let input: AclGrantInput =
                 serde_json::from_str(&buf).context("parse stdin JSON {read:[…], write:[…]}")?;
             let has_denies = !input.deny_read.is_empty() || !input.deny_write.is_empty();
@@ -1788,9 +1821,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
-                        "srt-win: error: sandbox user not \
-                         provisioned ({e:#}). Run `srt-win install` \
-                         (one UAC prompt)."
+                        "srt-win: error: the sandbox install cannot be \
+                         used ({e:#}). Run `srt-win install` (one UAC \
+                         prompt)."
                     );
                     std::process::exit(15);
                 }

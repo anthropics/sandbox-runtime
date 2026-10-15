@@ -20,12 +20,46 @@ use crate::state_db;
 use crate::{dpapi, logon, runner, user};
 
 /// Bumped on schema-incompatible changes to the `sandbox_user`
-/// row, or when `install` gains a step existing installs must pick
-/// up (v2: ambient write-deny stamps — `ambient.rs`). The broker
-/// compares this to the on-disk marker and refuses with a "re-run
-/// `srt-win install`" message on mismatch; `install` treats a stale
-/// marker as a partial install and completes the missing steps.
-pub const SETUP_VERSION: u32 = 2;
+/// row, when `install` gains a step existing installs must pick
+/// up (v2: ambient write-deny stamps — `ambient.rs`), or when a
+/// broker built with the previous value must stop launching on a
+/// machine this one has set up (v3: write grants kept between
+/// sessions — `persist.rs`; such a grant lets the sandbox group write
+/// its root, which is safe only under the write-restricted token a
+/// v2 broker does not build). The broker compares this to the
+/// on-disk marker and refuses with a "re-run `srt-win install`"
+/// message on mismatch ([`check_marker`]) — in both directions: an
+/// older broker refuses a newer install, and this one refuses an
+/// older install, so it makes no kept grant where an older broker can
+/// still launch. `install` treats a marker of another version as an
+/// install to complete, and rewrites it.
+pub const SETUP_VERSION: u32 = 3;
+
+/// `Err` unless `marker_version` is the one this build was made with.
+/// The message is what `read_cred` callers print; it names the repair.
+pub fn check_marker(marker_version: u32) -> Result<()> {
+    if marker_version != SETUP_VERSION {
+        return Err(anyhow!(
+            "setup marker version mismatch (have {marker_version}, expected \
+             {SETUP_VERSION}); re-run `srt-win install`",
+        ));
+    }
+    Ok(())
+}
+
+/// The install record, only if its marker is this build's
+/// ([`check_marker`]). What must hold before the sandbox account is
+/// launched or a grant is made that outlives the session.
+pub fn require_current_setup() -> Result<SetupInfo> {
+    let info = read_setup()?.ok_or_else(|| {
+        anyhow!(
+            "no sandbox-user setup record in the state store — run \
+             `srt-win install`"
+        )
+    })?;
+    check_marker(info.marker_version)?;
+    Ok(info)
+}
 
 #[derive(Debug, Clone)]
 pub struct SetupInfo {
@@ -363,20 +397,7 @@ impl Drop for SandboxCred {
 /// is DENY'd on it (and on the store directory) and so cannot call
 /// this to learn its own password.
 pub fn read_cred() -> Result<SandboxCred> {
-    let info = read_setup()?.ok_or_else(|| {
-        anyhow!(
-            "no sandbox-user setup record in the state store — run \
-             `srt-win install`"
-        )
-    })?;
-    if info.marker_version != SETUP_VERSION {
-        return Err(anyhow!(
-            "setup marker version mismatch (have {}, expected {}); \
-             re-run `srt-win install`",
-            info.marker_version,
-            SETUP_VERSION,
-        ));
-    }
+    let info = require_current_setup()?;
     let blob = read_cred_blob()?;
     let pw = String::from_utf8(dpapi::unprotect(&blob)?).context("password is not UTF-8")?;
     Ok(SandboxCred {
@@ -476,4 +497,19 @@ pub fn clear_setup() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_this_builds_marker_version_passes() {
+        assert!(check_marker(SETUP_VERSION).is_ok());
+        for other in [0, SETUP_VERSION - 1, SETUP_VERSION + 1, 99] {
+            let e = check_marker(other).unwrap_err().to_string();
+            assert!(e.contains("marker version mismatch"), "{e}");
+            assert!(e.contains("re-run `srt-win install`"), "{e}");
+        }
+    }
 }
