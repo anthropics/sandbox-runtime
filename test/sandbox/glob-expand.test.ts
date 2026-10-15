@@ -2511,6 +2511,15 @@ describe('globToRegex (shared)', () => {
     )
   })
 
+  it.each(['[', '[a', '[a]', '[z-a]'])(
+    'takes time that grows with the length: 100,000 characters of %p',
+    unit => {
+      const began = performance.now()
+      new RegExp(globToRegex(`/x/${unit.repeat(100_000 / unit.length)}`))
+      expect(performance.now() - began).toBeLessThan(2_000)
+    },
+  )
+
   it('matches the path a generated pattern spells, and not one a set would', () => {
     // A segment, a name it matches, and for brackets that spell no set a name
     // they would match as one.

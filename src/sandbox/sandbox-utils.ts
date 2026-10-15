@@ -697,19 +697,43 @@ function readRuleCovers(entry: FilesystemPathEntry): (p: string) => boolean {
   }
   const stripped = removeTrailingGlobSuffix(entry)
   if (containsGlobCharsForPlatform(stripped)) {
-    try {
-      const regex = new RegExp(denyGlobRegex(normalizePathForSandbox(stripped)))
-      // V8 finds a pattern too large only when it first runs it.
-      regex.test('')
-      return p => regex.test(p)
-    } catch {
-      // Too large to compile. What it covers cannot be told, so it covers.
-      return () => true
-    }
+    const regex = compiledDenyGlob(normalizePathForSandbox(stripped))
+    // Too large to compile. What it covers cannot be told, so it covers.
+    return regex === null ? () => true : p => regex.test(p)
   }
   const rule = normalizePathForSandbox(stripped, { literal: true })
   return p => isAtOrUnder(p, rule)
 }
+
+/**
+ * {@link denyGlobRegex} compiled, or null for a pattern too large to compile.
+ * Kept by the normalized pattern, which is all it depends on: these rules are
+ * read for a getter that callers ask once a path. What is asked of the disk
+ * on the way to the normalized pattern is asked every time.
+ */
+function compiledDenyGlob(normalizedGlob: string): RegExp | null {
+  let regex = compiledDenyGlobs.get(normalizedGlob)
+  if (regex === undefined) {
+    try {
+      regex = new RegExp(denyGlobRegex(normalizedGlob))
+      // V8 finds a pattern too large only when it first runs it.
+      regex.test('')
+    } catch {
+      regex = null
+    }
+    compiledDenyGlobChars += normalizedGlob.length
+    if (compiledDenyGlobChars > MAX_COMPILED_DENY_GLOB_CHARS) {
+      compiledDenyGlobs.clear()
+      compiledDenyGlobChars = normalizedGlob.length
+    }
+    compiledDenyGlobs.set(normalizedGlob, regex)
+  }
+  return regex
+}
+const compiledDenyGlobs = new Map<string, RegExp | null>()
+let compiledDenyGlobChars = 0
+/** Past this much pattern text all that is kept is let go, to begin again. */
+const MAX_COMPILED_DENY_GLOB_CHARS = 1 << 20
 
 /**
  * Generate proxy environment variables for sandboxed processes
@@ -1215,9 +1239,7 @@ export function encodedCommandFromProxyUser(
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
 export function globToRegex(globPattern: string): string {
-  // Every other part is a bracket expression, up to the first `]` as a regular
-  // expression reads one. The last part holds each `[` that is left open.
-  const sources = globPattern.split(/(\[[^\]]*\])/).map(part => {
+  const sources = splitAtBracketExpressions(globPattern).map(part => {
     const source = globPartToRegex(part)
     if (isRegex(source)) return source
     logForDebugging(
@@ -1230,6 +1252,27 @@ export function globToRegex(globPattern: string): string {
       .join('')
   })
   return `^${sources.join('')}$`
+}
+
+/**
+ * Every other part is a bracket expression, up to the first `]` as a regular
+ * expression reads one. The last part holds each `[` that is left open.
+ * What `split(/(\[[^\]]*\])/)` gives, which looks for a `]` from every `[`
+ * anew: the square of the length where none is closed.
+ */
+function splitAtBracketExpressions(globPattern: string): string[] {
+  const parts: string[] = []
+  let from = 0
+  for (;;) {
+    const open = globPattern.indexOf('[', from)
+    const close = open === -1 ? -1 : globPattern.indexOf(']', open + 1)
+    if (close === -1) return [...parts, globPattern.slice(from)]
+    parts.push(
+      globPattern.slice(from, open),
+      globPattern.slice(open, close + 1),
+    )
+    from = close + 1
+  }
 }
 
 function isRegex(source: string): boolean {
