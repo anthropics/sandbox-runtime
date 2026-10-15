@@ -2342,7 +2342,7 @@ async function wrapWithSandboxOnce(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        // true already grants every pty; false grants no terminal
+        // true already grants every pty; false opts out
         inheritedTtys:
           allowPty === undefined && options?.inheritsStdio
             ? resolveInheritedStdioTtys()

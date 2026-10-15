@@ -31,9 +31,7 @@ def main() -> int:
 
     def make_controlling() -> None:
         os.setsid()
-        # The slave fd explicitly, rather than fd 0. Relying on fd 0 assumes
-        # CPython has already run its dup2 before preexec_fn, which is true
-        # today but is not a documented guarantee.
+        # CPython runs preexec_fn before close_fds, so the slave is still open.
         fcntl.ioctl(slave, TIOCSCTTY, 0)
 
     proc = subprocess.Popen(
@@ -42,7 +40,6 @@ def main() -> int:
         stdout=slave,
         stderr=slave,
         preexec_fn=make_controlling,
-        pass_fds=(slave,),
         close_fds=True,
     )
     os.close(slave)

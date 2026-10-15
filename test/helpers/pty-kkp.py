@@ -48,7 +48,6 @@ def main() -> int:
         stdout=slave,
         stderr=slave,
         preexec_fn=make_controlling,
-        pass_fds=(slave,),
         close_fds=True,
     )
     os.close(slave)

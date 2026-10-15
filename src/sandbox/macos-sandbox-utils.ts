@@ -80,7 +80,7 @@ export interface MacOSSandboxParams {
    * Pseudo-terminal access. Unset grants `file-ioctl` on the terminals in
    * `inheritedTtys`, which is what a TUI needs to enter raw mode. `true`
    * grants every pty, for programs that allocate their own (tmux, script,
-   * node-pty). `false` grants no terminal.
+   * node-pty). `false` grants nothing beyond the base `/dev/tty` rule.
    */
   allowPty?: boolean
   /**
@@ -89,7 +89,7 @@ export interface MacOSSandboxParams {
    * function returns; see {@link resolveInheritedStdioTtys}. Entries that are
    * not pty slave devices are ignored.
    */
-  inheritedTtys?: string[]
+  inheritedTtys?: readonly string[]
   allowGitConfig?: boolean
   /**
    * Directories to emit as `safe.directory` via `GIT_CONFIG_*` env
@@ -1103,6 +1103,15 @@ export function resolveInheritedStdioTtys(
     return []
   }
 
+  const slaveByRdev = new Map<number, string>()
+  for (const name of slaves) {
+    try {
+      slaveByRdev.set(probes.rdevOfPath(`/dev/${name}`), name)
+    } catch {
+      // racing device teardown; keep scanning
+    }
+  }
+
   const found: string[] = []
   for (const fd of ttyFds) {
     let rdev: number
@@ -1112,13 +1121,7 @@ export function resolveInheritedStdioTtys(
       logForDebugging(`[Sandbox macOS] cannot fstat tty fd ${fd}: ${err}`)
       continue
     }
-    const match = slaves.find(name => {
-      try {
-        return probes.rdevOfPath(`/dev/${name}`) === rdev
-      } catch {
-        return false // racing device teardown; keep scanning
-      }
-    })
+    const match = slaveByRdev.get(rdev)
     if (match === undefined) {
       logForDebugging(
         `[Sandbox macOS] fd ${fd} is a tty but no /dev/ttys* matches its ` +
@@ -1165,7 +1168,7 @@ function generateSandboxProfile({
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
   allowPty?: boolean
-  inheritedTtys?: string[]
+  inheritedTtys?: readonly string[]
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean

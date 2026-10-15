@@ -1213,7 +1213,7 @@ export const SandboxRuntimeConfigSchema = z
           'on the inherited terminals so a TUI can enter raw mode, when the ' +
           'caller spawns with inherited stdio (the CLI does). true grants ' +
           'every pty, for programs that allocate their own (tmux, script, ' +
-          'node-pty). false grants no terminal.',
+          'node-pty). false grants nothing beyond the base /dev/tty rule.',
       ),
     seccomp: SeccompConfigSchema.optional().describe(
       'Custom seccomp binary paths (Linux only).',

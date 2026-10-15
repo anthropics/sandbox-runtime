@@ -107,8 +107,7 @@ describe.if(isMacOS)('macOS pty rules: inherited-stdio terminal grant', () => {
     expect(profile).not.toContain(`(allow file-ioctl (literal "${TTY_A}"))`)
   })
 
-  it('grants no terminal when allowPty is false, even with inherited ttys', () => {
-    // An explicit `false` opts out of every terminal rule.
+  it('emits no pty rules when allowPty is false, even with inherited ttys', () => {
     const profile = wrapCommandWithSandboxMacOS({
       ...baseParams,
       allowPty: false,
@@ -236,6 +235,7 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: resolver', () => {
     const res = runOnCtty('bun', '--eval', probe)
     const match = /RESOLVED:(\[.*\])/.exec(res.stdout ?? '')
 
+    expect(res.status).toBe(0)
     expect(match).not.toBeNull()
     const devices = JSON.parse(match![1]) as string[]
     expect(devices.length).toBeGreaterThan(0)
@@ -301,11 +301,12 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: resolver', () => {
     const res = runOnCtty('bun', '--eval', probe)
     const match = /GATE:(\{.*\})/.exec(res.stdout ?? '')
 
+    expect(res.status).toBe(0)
     expect(match).not.toBeNull()
     expect(JSON.parse(match![1])).toEqual({ without: false, with: true })
   })
 
-  it('allowPty:false grants no terminal even with inheritsStdio (manager gate)', () => {
+  it('allowPty:false emits no pty rule even with inheritsStdio (manager gate)', () => {
     // Pins the `=== undefined` gate: an explicit `allowPty: false` resolves no
     // terminal and emits no pty rule.
     const probe = `
@@ -326,6 +327,7 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: resolver', () => {
     const res = runOnCtty('bun', '--eval', probe)
     const match = /FALSEGATE:(\{.*\})/.exec(res.stdout ?? '')
 
+    expect(res.status).toBe(0)
     expect(match).not.toBeNull()
     expect(JSON.parse(match![1])).toEqual({
       hasInheritedDevice: false,
@@ -347,7 +349,9 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: end to end', () => {
 
   // The probe reports the errno so a refusal can be identified rather than
   // merely counted: EPERM (1) is Seatbelt, EACCES (13) is the kernel saying
-  // this is not the caller's controlling terminal.
+  // this is not the caller's controlling terminal. The EPERM holds even where
+  // the profile allows ioctl on the device, and which Seatbelt check raises it
+  // is unverified.
   //
   // Measured caveat: inside the sandbox Seatbelt refuses BEFORE the kernel's
   // controlling-terminal check, so a harness that lost the controlling
@@ -399,6 +403,7 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: end to end', () => {
 
   it('lets a sandboxed program enter raw mode with no allowPty key', () => {
     const res = runSandboxed('stty raw; echo "STTY-RC=$?"')
+    expect(res.status).toBe(0)
     expect(res.stdout).toContain('STTY-RC=0')
   })
 
@@ -436,6 +441,7 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: end to end', () => {
   it('proves the harness grants a controlling terminal: TIOCSTI works unsandboxed', () => {
     const res = runUnsandboxed('python3', '-c', TIOCSTI_PROBE)
 
+    expect(res.status).toBe(0)
     expect(res.stdout).toContain('TIOCSTI-ALLOWED')
     // The injected text is echoed back by the terminal, which is the injection
     // actually landing rather than merely being permitted.
@@ -445,6 +451,7 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: end to end', () => {
   it('refuses keystroke injection with EPERM in the default mode', () => {
     const res = runSandboxed(`python3 -c '${TIOCSTI_PROBE}'`)
 
+    expect(res.status).toBe(0)
     expect(res.stdout).toContain('TIOCSTI-DENIED errno=1')
     expect(res.stdout).not.toContain('TIOCSTI-ALLOWED')
   })
@@ -454,6 +461,7 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: end to end', () => {
     // injection primitive would appear first if the rules ever widened.
     const res = runSandboxed(`python3 -c '${TIOCSTI_PROBE}'`, SETTINGS_BROAD)
 
+    expect(res.status).toBe(0)
     expect(res.stdout).toContain('TIOCSTI-DENIED errno=1')
     expect(res.stdout).not.toContain('TIOCSTI-ALLOWED')
   })
