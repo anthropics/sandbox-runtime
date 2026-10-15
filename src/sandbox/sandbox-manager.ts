@@ -67,6 +67,7 @@ import {
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
 import {
+  assertPtySlavePaths,
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
@@ -1969,6 +1970,20 @@ export type WrapWithSandboxOptions = {
    * reported as the violation's `command`. Defaults to `command`.
    */
   commandText?: string
+  /**
+   * macOS: the pty slave devices (`/dev/ttysNNN`) you will spawn the command
+   * on, e.g. the `ptsName` of a pty you allocated yourself. Each gets a
+   * `file-ioctl` grant as a literal path, which is what a shell needs to
+   * turn off echo, set the foreground process group and run job control on
+   * its own terminal. Other terminals stay denied. Without this the only
+   * grant is `allowPty: true`, which covers every pty on the machine.
+   *
+   * Every entry must be `/dev/ttys` followed by three or more digits; any
+   * other value throws. Nothing more is granted where `allowPty: true`
+   * already applies. Ignored on Linux, where the profile has no path-based
+   * ioctl rule.
+   */
+  ttys?: readonly string[]
 }
 
 /** A wrap that has started over this many times walks without giving the
@@ -2075,6 +2090,9 @@ async function wrapWithSandboxOnce(
   options?: WrapWithSandboxOptions,
 ): Promise<string> {
   const platform = getPlatform()
+  // On every platform, so a value that macOS would refuse is not taken
+  // silently elsewhere.
+  assertPtySlavePaths(options?.ttys ?? [])
   const commandId = options?.commandId
   registerCommandText(command, options)
   const startedWith = config
@@ -2334,6 +2352,7 @@ async function wrapWithSandboxOnce(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
+        ttys: options?.ttys,
         allowGitConfig: getAllowGitConfig(),
         gitSafeDirectories,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
