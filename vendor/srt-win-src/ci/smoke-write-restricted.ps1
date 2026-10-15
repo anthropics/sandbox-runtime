@@ -29,6 +29,40 @@
     G  the child token itself: write-restricted, restricting SIDs
        exactly the three above.
 
+  Then the write grants that are kept between sessions (`acl grant
+  --persistent`, `exec --write-root`, `persist.rs`), roots PA and PB:
+
+    P1  a session given only PA writes, creates and deletes in PA and
+        can do none of them in PB, although PB carries the persistent
+        sandbox-group ACE; it can read PB. With the test-hooks build:
+        its token's restricting SIDs are the three plus one capability
+        SID.
+    P2  a session on PB creates a file and a directory there; a
+        session given only PA can then neither change their DACL
+        (icacls, and SetAccessControl on a handle) nor write the file
+        nor create inside the directory.
+    P3  a repeat session start on PA performs zero DACL writes.
+    P4  a deny target inside PA — one the real user owns and one the
+        sandbox user owns — stays denied during a session and after
+        it, and the owner cannot take the deny off.
+    P5  the real user can still change the ACL of a file of their own
+        under a persistent root.
+    P6  the fence probe reports blocked for a session's token; cmd,
+        Windows PowerShell, node and git-bash start under it and
+        git-bash forks.
+    P7  `acl forget <root>` removes a root's ACEs and its denies.
+    P8  while a persistent grant exists, `exec` without the token
+        flag is refused, also after the state database is deleted;
+        a restricted exec whose root has no capability SID recorded
+        does not run; a per-session `acl grant` is refused.
+    P9  turning the option off (`acl forget --all`) removes the
+        persistent ACEs and leaves each root's DACL as it was before
+        its grant; then the ordinary token runs again, and cannot
+        write a root that gives the sandbox account nothing itself.
+    P10 a per-session `acl grant` finds and removes a persistent grant
+        that neither the marker nor the database records.
+    P11 `uninstall` removes persistent grants.
+
   A failing row is recorded and the script keeps going, so one run
   reports every row; it throws at the end if any row failed.
 
@@ -167,6 +201,42 @@ function SbOff { param([string[]] $tail, [int] $TimeoutSec = 180)
 function SbOn { param([string[]] $tail, [int] $TimeoutSec = 180)
   Wait-Sb (Start-Sb (@('--write-restricted-token', '--') + $tail)) $TimeoutSec
 }
+# Sandboxed exec, write-restricted token, with the session's write
+# roots (`--write-root` each): the token of a session that was given
+# those roots.
+function SbRoots { param([string[]] $roots, [string[]] $tail, [int] $TimeoutSec = 180)
+  $pre = @('--write-restricted-token')
+  foreach ($r in $roots) { $pre += @('--write-root', $r) }
+  Wait-Sb (Start-Sb ($pre + @('--') + $tail)) $TimeoutSec
+}
+# Session start with the option on: `acl grant --persistent`. Returns
+# the exit code, the output, and how many DACLs it wrote (-1 if the
+# summary line is missing).
+function Grant-P { param([string[]] $write, [string[]] $denyWrite = @(), [string[]] $denyRead = @())
+  $json = @{ read = @(); write = @($write); denyRead = @($denyRead); denyWrite = @($denyWrite) } |
+    ConvertTo-Json -Compress
+  $raw = $json | & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid --persistent 2>&1 |
+    Out-String
+  $code = $LASTEXITCODE
+  Write-Host -NoNewline $raw
+  $writes = -1
+  if ($raw -match '(\d+) DACL write\(s\)') { $writes = [int]$Matches[1] }
+  return [pscustomobject]@{ exit = $code; raw = $raw; writes = $writes }
+}
+# What the session teardown runs: the per-session release. It must
+# leave persistent grants alone.
+function End-Session {
+  & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
+  & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
+}
+function Sddl { param([string] $p) (Get-Acl -LiteralPath $p).Sddl }
+# Whether a path's DACL names a capability SID or the sandbox group.
+$CapPrefix = 'S-1-0-1936880739-'
+function Has-Persistent { param([string] $p)
+  $sd = Sddl $p
+  return ($sd -match [regex]::Escape($CapPrefix)) -or ($sd -match [regex]::Escape($script:grpSid))
+}
+function Persist-Status { (J @('user', 'status')).persistent_grants }
 # First line of a result that parses as a JSON object, or $null.
 function JsonLine { param($r)
   $line = ($r.out -split "`r?`n") | Where-Object { $_.TrimStart().StartsWith('{') } |
@@ -179,18 +249,63 @@ try { Start-Service seclogon -ea Stop } catch {
   Write-Host "smoke-write-restricted: WARNING: Start-Service seclogon: $_"
 }
 
-# Scratch tree at the system-drive root, with inheritance cut on each
-# test directory so the ACEs below are the only ones that apply.
-# Administrators + SYSTEM keep full control so this script can seed
-# and clean up.
+# Scratch tree at the system-drive root. The root and every test
+# directory get a protected DACL that is written whole, so the ACEs
+# listed for a directory are the only ones that apply to it: nothing
+# is inherited from the drive root, where Authenticated Users hold
+# Modify and BUILTIN\Users read, and the sandbox account is a member
+# of both.
+#
+# Every test directory carries full control for Administrators and
+# SYSTEM, and what its row adds. This script and the broker run
+# elevated as a member of Administrators, which is what lets them
+# seed, grant and clean up; the sandbox account is in neither, so it
+# gains nothing from the two entries.
 $root = Join-Path "$env:SystemDrive\" "srt-wr-smoke-$([guid]::NewGuid().ToString('N'))"
-$adm  = @('*S-1-5-32-544:(OI)(CI)(F)', '*S-1-5-18:(OI)(CI)(F)')
-function New-AclDir { param([string] $name, [string[]] $extraGrants)
+$adm  = @('(A;OICI;FA;;;BA)', '(A;OICI;FA;;;SY)')
+# The root itself: the same two, and read for BUILTIN\Users on the
+# root only (no inheritance flags), so a sandboxed process can still
+# look a child up by name. No entry lets the sandbox account write.
+$rootAces = $adm + @('(A;;0x1200a9;;;BU)')
+# Modify, inherited by files and directories, as an ACE for `$who`
+# (an SDDL SID alias).
+function ModifyAce { param([string] $who) "(A;OICI;0x1301bf;;;$who)" }
+# The DACL of the SDDL string `$sd` in a form two of them can be
+# compared in: whether it is protected, then its ACEs, sorted so that
+# the comparison is of which ACEs are there and not of their order.
+function DaclOf { param([string] $sd)
+  $prot = if ($sd -match 'D:[A-Z]*P[A-Z]*\(') { 'protected' } else { 'inheriting' }
+  $aces = @([regex]::Matches($sd, '\([^)]*\)') | ForEach-Object Value | Sort-Object)
+  return "$prot $($aces -join '')"
+}
+function Dacl { param([string] $p) DaclOf (Sddl $p) }
+# Give directory `$d` a protected DACL holding exactly `$aces` (SDDL
+# ACE strings, spelled the way a DACL is reported back).
+#
+# The DACL is built here and written in one call. icacls is not used:
+# what `/inheritance:r` leaves of the inherited ACEs differs between
+# Windows versions (removed on one, kept as explicit ACEs on another),
+# and a directory that keeps them is writable to the sandbox account
+# whatever its row meant to grant. The DACL is then read back, and a
+# directory that does not carry exactly `$aces` is a failed row.
+function Set-OnlyAces { param([string] $d, [string[]] $aces)
+  $want = "D:PAI$($aces -join '')"
+  $sec = [System.Security.AccessControl.DirectorySecurity]::new()
+  $sec.SetSecurityDescriptorSddlForm(
+    $want, [System.Security.AccessControl.AccessControlSections]::Access)
+  # Protected, and nothing inherited kept.
+  $sec.SetAccessRuleProtection($true, $false)
+  [System.IO.FileSystemAclExtensions]::SetAccessControl(
+    [System.IO.DirectoryInfo]::new($d), $sec)
+  $got = Dacl $d
+  if ($got -ne (DaclOf $want)) {
+    Fail "setup: the DACL of $d is not the one set on it; rows that use it prove less. want: $(DaclOf $want)  got: $got  Sddl=$(Sddl $d)"
+  }
+}
+function New-AclDir { param([string] $name, [string[]] $extraAces)
   $d = Join-Path $root $name
   New-Item -ItemType Directory -Path $d -Force | Out-Null
-  $grants = $adm + $extraGrants
-  & icacls $d /inheritance:r /grant:r @grants | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "icacls $d exited $LASTEXITCODE" }
+  Set-OnlyAces $d ($adm + $extraAces)
   return $d
 }
 # Seed the three files an A-row acts on. Created AFTER the directory
@@ -217,13 +332,20 @@ function State { param([string] $d)
 }
 
 $sbSid = $null
+$script:grpSid = $null
 try {
   Run @('install', '--sublayer-guid', $Sublayer, '--proxy-port-range', $PortRange)
   $us = J @('user', 'status')
   $sbSid = $us.marker_user_sid
   if (-not $sbSid) { throw 'setup marker missing user_sid' }
-  Write-Host "sandbox user provisioned (sid=$sbSid)"
+  $script:grpSid = $us.user.group_sid
+  if (-not $script:grpSid) { throw 'user status missing group_sid' }
+  Write-Host "sandbox user provisioned (sid=$sbSid group=$($script:grpSid))"
+  # A persistent grant left by an earlier, interrupted run would make
+  # every option-off row below be refused.
+  & $Exe acl forget --all 2>&1 | Out-Null
   New-Item -ItemType Directory -Path $root -Force | Out-Null
+  Set-OnlyAces $root $rootAces
 
   # ── G: the token itself ──────────────────────────────────────────
   # First, so every later row is read knowing what token it ran under.
@@ -258,8 +380,8 @@ try {
 
   # ── A: ambient group-held write access ───────────────────────────
   foreach ($case in @(
-      @{ tag = 'Authenticated Users'; name = 'au';    ace = '*S-1-5-11:(OI)(CI)(M)' },
-      @{ tag = 'BUILTIN\Users';       name = 'users'; ace = '*S-1-5-32-545:(OI)(CI)(M)' })) {
+      @{ tag = 'Authenticated Users'; name = 'au';    ace = (ModifyAce 'AU') },
+      @{ tag = 'BUILTIN\Users';       name = 'users'; ace = (ModifyAce 'BU') })) {
     $d = New-AclDir $case.name @($case.ace)
     Seed-Dir $d
     # ON first: nothing in the directory is owned by the sandbox
@@ -294,7 +416,7 @@ try {
   # A (observations, never failed): what stays writable by design.
   # (1) A directory that grants Modify to Everyone — Everyone is in
   #     the restricting list.
-  $d = New-AclDir 'everyone' @('*S-1-1-0:(OI)(CI)(M)')
+  $d = New-AclDir 'everyone' @(ModifyAce 'WD')
   Seed-Dir $d
   $null = Mutate $d $true
   $s = State $d
@@ -478,8 +600,333 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
     $r = SbOff @($HooksAbs, 'probe', 'parent-access')
     Write-Host "E-obs: option OFF (not asserted): $($r.out.Trim())"
   }
+
+  # ══ Write grants kept between sessions ═══════════════════════════
+  $pa = New-AclDir 'pa' @()
+  $pb = New-AclDir 'pb' @()
+  # What `acl forget` has to leave behind (P9).
+  $pbBase = Dacl $pb
+  $st = Persist-Status
+  if ($st.state -eq 'none') { Ok 'P: no persistent grant recorded before the first one is made' }
+  else { Fail "P: user status reports persistent_grants=$($st | ConvertTo-Json -Compress) before any was made" }
+
+  # ── P1: two roots; a session writes only its own ─────────────────
+  $ga = Grant-P @($pa)
+  $gb = Grant-P @($pb)
+  if ($ga.exit -ne 0 -or $gb.exit -ne 0) {
+    Fail "P1: acl grant --persistent failed (PA exit=$($ga.exit), PB exit=$($gb.exit))"
+  } elseif ($ga.writes -lt 1 -or $gb.writes -lt 1) {
+    Fail "P1: a first grant reported no DACL write (PA=$($ga.writes), PB=$($gb.writes))"
+  } else { Ok 'P1: both roots granted; each first grant wrote its DACL' }
+  Write-Host "P1: PA Sddl=$(Sddl $pa)"
+  Write-Host "P1: PB Sddl=$(Sddl $pb)"
+  foreach ($d in @($pa, $pb)) {
+    $sd = Sddl $d
+    if ($sd -match [regex]::Escape(";;;$sbSid)")) { Fail "P1: $d carries an ACE for the sandbox USER SID: $sd" }
+    $caps = [regex]::Matches($sd, [regex]::Escape($CapPrefix) + '[0-9-]+') | ForEach-Object Value | Sort-Object -Unique
+    if (@($caps).Count -ne 1) { Fail "P1: $d carries $(@($caps).Count) capability SIDs, want 1: $sd" }
+    if ($sd -notmatch [regex]::Escape("(A;OICI;0x1301bf;;;$($script:grpSid))")) { Fail "P1: $d lacks the sandbox-group modify ACE: $sd" }
+    if ($sd -notmatch '\(A;OICI;RC;;;OW\)') { Fail "P1: $d lacks the OWNER RIGHTS read-control ACE: $sd" }
+  }
+  $st = Persist-Status
+  if ($st.state -eq 'present' -and @($st.roots).Count -eq 2) { Ok 'P1: user status lists both persistent roots' }
+  else { Fail "P1: user status persistent_grants=$($st | ConvertTo-Json -Compress), want present with 2 roots" }
+
+  function MutateRoots { param([string] $d, [string[]] $roots)
+    $line = "echo APPENDED>> `"$d\keep.txt`" & echo NEW> `"$d\new.txt`" & del /q `"$d\del.txt`""
+    SbRoots $roots @($cmd, '/d', '/s', '/c', $line)
+  }
+  Seed-Dir $pa
+  Seed-Dir $pb
+  $r = MutateRoots $pa @($pa)
+  $s = State $pa
+  if ($s.appended -and $s.created -and $s.deleted) { Ok 'P1: a session given PA writes, creates and deletes in PA' }
+  else { Fail "P1: a session given PA could not use it (appended=$($s.appended) created=$($s.created) deleted=$($s.deleted)). raw: $($r.raw)" }
+  $r = MutateRoots $pb @($pa)
+  $s = State $pb
+  if ($s.appended) { Fail 'P1: a session given only PA WROTE an existing file in PB' }
+  if ($s.created)  { Fail 'P1: a session given only PA CREATED a file in PB' }
+  if ($s.deleted)  { Fail 'P1: a session given only PA DELETED a file in PB' }
+  if (-not ($s.appended -or $s.created -or $s.deleted)) {
+    Ok 'P1: a session given only PA cannot write, create or delete in PB (which carries the group ACE)'
+  }
+  $r = SbRoots @($pa) @($cmd, '/c', "type `"$pb\keep.txt`"")
+  if ($r.out -match 'KEEP') { Ok 'P1: reads of another kept root are possible (as documented)' }
+  else { Fail "P1: read of PB from a session given PA failed. raw: $($r.raw)" }
+  # A write-restricted session that was given no root at all.
+  $r = SbOn @($cmd, '/d', '/s', '/c', "echo NOROOT> `"$pb\noroot.txt`"")
+  if (Test-Path "$pb\noroot.txt") { Fail 'P1: a write-restricted session with no write root wrote PB' }
+  else { Ok 'P1: a write-restricted session with no write root cannot write PB' }
+  if (-not $HooksAbs) { Skip 'P1 (restricting SIDs of a session with a write root)' } else {
+    $r = SbRoots @($pa) @($HooksAbs, 'probe', 'token')
+    $t = JsonLine $r
+    Write-Host "P1: child token with --write-root PA: $($r.out.Trim())"
+    $got = @($t.restricted_sids)
+    $capsInTok = @($got | Where-Object { $_.StartsWith($CapPrefix) })
+    $rest = @($got | Where-Object { -not $_.StartsWith($CapPrefix) } | Sort-Object)
+    $want = @($sbSid, 'S-1-1-0', 'S-1-5-12') | Sort-Object
+    if (-not $t -or -not $t.write_restricted) { Fail "P1: could not read a write-restricted child token. raw: $($r.raw)" }
+    elseif ($capsInTok.Count -ne 1 -or ($rest -join ',') -ne ($want -join ',')) {
+      Fail "P1: restricting SIDs are [$($got -join ', ')], want one capability SID plus [$($want -join ', ')]"
+    } elseif ((Sddl $pa) -notmatch [regex]::Escape($capsInTok[0])) {
+      Fail "P1: the token's capability SID $($capsInTok[0]) is not the one on PA"
+    } else { Ok 'P1: child token carries exactly PA''s capability SID plus the three fixed SIDs' }
+  }
+
+  # ── P6: fence and program start under a session's token ──────────
+  $outL = Bind-OutOfRange
+  $tgt = "127.0.0.1:$($outL.LocalEndpoint.Port)"
+  try {
+    $vout  = & $Exe wfp verify --target $tgt --write-restricted-token --write-root $pa
+    $vexit = $LASTEXITCODE
+    Write-Host "P6: wfp verify --write-restricted-token --write-root PA exit=$vexit stdout='$vout'"
+    $v = $null
+    try { $v = $vout | ConvertFrom-Json } catch { }
+    if ($vexit -eq 0 -and $v -and $v.egress_probe -eq 'blocked') { Ok 'P6: wfp verify with a write root reports blocked' }
+    else { Fail "P6: wfp verify with a write root expected exit 0 + blocked, got exit $vexit '$vout'" }
+    $r = SbRoots @($pa) @($ExeAbs, 'probe', 'connect', '--target', $tgt)
+    if ($r.exit -eq 0) { Ok 'P6: out-of-range connect from a session with a write root refused by the fence' }
+    else { Fail "P6: out-of-range connect from a session with a write root was NOT refused (probe exit=$($r.exit); 3 = connected). raw: $($r.raw)" }
+    # A root with no capability SID recorded: no probe, not `blocked`.
+    $vout  = & $Exe wfp verify --target $tgt --write-restricted-token --write-root $root 2>$null
+    if ($LASTEXITCODE -ne 0 -and "$vout" -notmatch 'blocked') { Ok 'P6: wfp verify with an ungranted write root fails without reporting blocked' }
+    else { Fail "P6: wfp verify with an ungranted write root: exit=$LASTEXITCODE '$vout'" }
+  } finally { $outL.Stop() }
+  $r = SbRoots @($pa) @($cmd, '/d', '/s', '/c', 'echo P6-CMD-OK')
+  if ($r.exit -eq 0 -and $r.out -match 'P6-CMD-OK') { Ok 'P6: cmd starts' }
+  else { Fail "P6: cmd did not start. exit=$($r.exit) raw: $($r.raw)" }
+  $r = SbRoots @($pa) @($pwsh, '-NoProfile', '-Command', 'Write-Output P6-PS-OK') 300
+  if ($r.out -match 'P6-PS-OK') { Ok 'P6: Windows PowerShell starts' }
+  else { Fail "P6: Windows PowerShell did not start. exit=$($r.exit) raw: $($r.raw)" }
+  if (-not $node) { Fail 'P6: node not found on PATH — row not run' } else {
+    $r = SbRoots @($pa) @($node, '-e', "require('fs').writeFileSync(String.raw``$pa\node.txt``,'x');console.log('P6-NODE-OK')")
+    if ($r.exit -eq 0 -and $r.out -match 'P6-NODE-OK' -and (Test-Path "$pa\node.txt")) { Ok 'P6: node starts and writes its root' }
+    else { Fail "P6: node did not start or could not write its root. exit=$($r.exit) raw: $($r.raw)" }
+  }
+  if (-not $bash) { Fail 'P6: git-bash not found under Program Files\Git — row not run' } else {
+    $r = SbRoots @($pa) @($bash, '-c', 'echo P6-BASH-$(echo FORK)-OK')
+    if ($r.exit -eq 0 -and $r.out -match 'P6-BASH-FORK-OK') { Ok 'P6: git-bash starts and forks' }
+    else { Fail "P6: git-bash did not start or could not fork. exit=$($r.exit) raw: $($r.raw)" }
+  }
+
+  # ── P2: objects the sandbox user owns in another root ────────────
+  $sbFile = Join-Path $pb 'sbfile.txt'
+  $sbDir  = Join-Path $pb 'sbdir'
+  $r = SbRoots @($pb) @($cmd, '/d', '/s', '/c', "echo OWN> `"$sbFile`" & mkdir `"$sbDir`"")
+  if (-not (Test-Path $sbFile) -or -not (Test-Path $sbDir)) {
+    Fail "P2: the session on PB could not create a file and a directory there. raw: $($r.raw)"
+  } else {
+    Write-Host "P2: owner of sbfile.txt=$((Get-Acl -LiteralPath $sbFile).Owner)  of sbdir=$((Get-Acl -LiteralPath $sbDir).Owner)"
+    $ownerSid = (Get-Acl -LiteralPath $sbFile).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if ($ownerSid -ne $sbSid) { Fail "P2: sbfile.txt is owned by $ownerSid, not the sandbox user — the row would prove nothing" }
+    $before = @((Sddl $sbFile), (Sddl $sbDir))
+    # (a) icacls, then the writes the new ACE would allow.
+    $line = "icacls `"$sbFile`" /grant *S-1-1-0:(F) & icacls `"$sbDir`" /grant *S-1-1-0:(OI)(CI)(F) & " +
+            "echo P2-HIT>> `"$sbFile`" & echo P2-NEW> `"$sbDir\in.txt`""
+    $r = SbRoots @($pa) @($cmd, '/d', '/s', '/c', $line)
+    Write-Host "P2: icacls from a session given only PA: $($r.out.Trim() -replace "`r?`n", ' | ')"
+    # (b) the DACL through a handle (SetSecurityInfo), no icacls.
+    $ps = "foreach (`$p in @('$sbFile','$sbDir')) { try { " +
+          "`$i = Get-Item -LiteralPath `$p; `$a = `$i.GetAccessControl('Access'); " +
+          "`$rule = New-Object System.Security.AccessControl.FileSystemAccessRule('Everyone','FullControl','Allow'); " +
+          "`$a.AddAccessRule(`$rule); `$i.SetAccessControl(`$a); Write-Output ('P2-SETACL-OK ' + `$p) } " +
+          "catch { Write-Output ('P2-SETACL-FAILED ' + `$p + ' ' + `$_.Exception.GetType().Name) } }"
+    $r2 = SbRoots @($pa) @($pwsh, '-NoProfile', '-Command', $ps) 300
+    Write-Host "P2: SetAccessControl from a session given only PA: $($r2.out.Trim() -replace "`r?`n", ' | ')"
+    $after = @((Sddl $sbFile), (Sddl $sbDir))
+    if ($r2.out -match 'P2-SETACL-OK') { Fail "P2: SetAccessControl on a sandbox-owned object in PB succeeded from a session given only PA. raw: $($r2.raw)" }
+    if ($r2.out -notmatch 'P2-SETACL-FAILED') { Fail "P2: the SetAccessControl attempt did not run. raw: $($r2.raw)" }
+    if ($before[0] -ne $after[0] -or $before[1] -ne $after[1]) {
+      Fail "P2: the DACL of a sandbox-owned object in PB was changed by a session given only PA. before=$($before -join ' / ') after=$($after -join ' / ')"
+    } else { Ok 'P2: a session given only PA cannot change the DACL of sandbox-owned objects in PB (icacls, SetAccessControl)' }
+    if ((Get-Content -Raw $sbFile) -match 'P2-HIT') { Fail 'P2: a session given only PA wrote a sandbox-owned file in PB' }
+    else { Ok 'P2: a session given only PA cannot write a sandbox-owned file in PB' }
+    if (Test-Path "$sbDir\in.txt") { Fail 'P2: a session given only PA created a file inside a sandbox-owned directory in PB' }
+    else { Ok 'P2: a session given only PA cannot create inside a sandbox-owned directory in PB' }
+    # The session on PB still uses what it created.
+    $r = SbRoots @($pb) @($cmd, '/d', '/s', '/c', "echo P2-OWN>> `"$sbFile`" & echo P2-OWN> `"$sbDir\in.txt`"")
+    if ((Get-Content -Raw $sbFile) -match 'P2-OWN' -and (Test-Path "$sbDir\in.txt")) { Ok 'P2: the session on PB writes the objects it created' }
+    else { Fail "P2: the session on PB cannot write the objects it created. raw: $($r.raw)" }
+  }
+
+  # ── P3: a repeat session start writes nothing ────────────────────
+  End-Session
+  if (-not (Has-Persistent $pa)) { Fail 'P3: the per-session release removed the persistent grant on PA' }
+  $g = Grant-P @($pa)
+  if ($g.exit -eq 0 -and $g.writes -eq 0 -and $g.raw -notmatch 'persistent DACL write') {
+    Ok 'P3: a repeat session start on PA performed zero DACL writes'
+  } else { Fail "P3: a repeat session start on PA: exit=$($g.exit), DACL writes=$($g.writes) (want 0). raw: $($g.raw)" }
+
+  # ── P4: denies live as long as the grant ─────────────────────────
+  $denyF   = Join-Path $pa 'deny.txt'
+  $sbOwned = Join-Path $pa 'sb-deny.txt'
+  'DENY' | Set-Content -Encoding ASCII $denyF
+  $r = SbRoots @($pa) @($cmd, '/d', '/s', '/c', "echo SBDENY> `"$sbOwned`"")
+  if (-not (Test-Path $sbOwned)) { Fail "P4: the session could not create the file to be denied. raw: $($r.raw)" }
+  $g = Grant-P @($pa) @($denyF, $sbOwned)
+  if ($g.exit -ne 0) { Fail "P4: session start with deny targets failed (exit=$($g.exit))" }
+  Write-Host "P4: deny.txt Sddl=$(Sddl $denyF)"
+  Write-Host "P4: sb-deny.txt Sddl=$(Sddl $sbOwned) owner=$((Get-Acl -LiteralPath $sbOwned).Owner)"
+  function Try-Denied { param([string] $tag)
+    $line = "echo $tag>> `"$denyF`" & echo $tag>> `"$sbOwned`" & " +
+            "icacls `"$sbOwned`" /remove:d *$($script:grpSid) & icacls `"$sbOwned`" /grant *${sbSid}:(F) & " +
+            "echo $tag-2>> `"$sbOwned`" & del /q `"$denyF`" `"$sbOwned`" & echo $tag-SIB> `"$pa\$tag.txt`""
+    $r = SbRoots @($pa) @($cmd, '/d', '/s', '/c', $line)
+    $bad = @()
+    foreach ($f in @($denyF, $sbOwned)) {
+      if (-not (Test-Path $f)) { $bad += "$f deleted" }
+      elseif ((Get-Content -Raw $f) -match $tag) { $bad += "$f written" }
+    }
+    if (-not (Test-Path "$pa\$tag.txt")) { $bad += 'sibling no longer writable' }
+    [pscustomobject]@{ bad = $bad; raw = $r.raw }
+  }
+  $t = Try-Denied 'P4-DURING'
+  if ($t.bad.Count -eq 0) { Ok 'P4: deny targets in PA (one real-user-owned, one sandbox-owned) hold during a session; the owner cannot take the deny off' }
+  else { Fail "P4: during the session: $($t.bad -join '; '). raw: $($t.raw)" }
+  # Between sessions: after the per-session release the ACEs are
+  # still on disk; the next start (which does not list them again)
+  # writes nothing and they still hold.
+  End-Session
+  $denyAce = '\(D;[^)]*;;;' + [regex]::Escape($script:grpSid) + '\)'
+  foreach ($f in @($denyF, $sbOwned)) {
+    if ((Sddl $f) -notmatch $denyAce) { Fail "P4: $f lost its sandbox-group deny ACE after the session ended: $(Sddl $f)" }
+  }
+  $g = Grant-P @($pa)
+  if ($g.exit -ne 0 -or $g.writes -ne 0) { Fail "P4: the next session start: exit=$($g.exit), DACL writes=$($g.writes) (want 0)" }
+  $t = Try-Denied 'P4-AFTER'
+  if ($t.bad.Count -eq 0) { Ok 'P4: the deny targets still hold in the next session, with zero DACL writes at its start' }
+  else { Fail "P4: in the next session: $($t.bad -join '; '). raw: $($t.raw)" }
+
+  # ── P5: the real user and their own file ─────────────────────────
+  # A root that gives the real user no full-control ACE: SYSTEM, and
+  # modify for Authenticated Users.
+  $pc = Join-Path $root 'pc'
+  New-Item -ItemType Directory -Path $pc -Force | Out-Null
+  Set-OnlyAces $pc @('(A;OICI;FA;;;SY)', (ModifyAce 'AU'))
+  $pcBase = Dacl $pc
+  $mine = Join-Path $pc 'mine.txt'
+  'MINE' | Set-Content -Encoding ASCII $mine
+  $g = Grant-P @($pc)
+  Write-Host "P5: PC Sddl=$(Sddl $pc)  mine.txt owner=$((Get-Acl -LiteralPath $mine).Owner)"
+  if ($g.exit -ne 0) { Fail "P5: acl grant --persistent on a root without a full-control ACE failed (exit=$($g.exit))" }
+  else {
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ((Sddl $pc) -notmatch [regex]::Escape("(A;OICI;RCWD;;;$me)") -and (Sddl $pc) -notmatch '\(A;OICI;RCWD;;;[A-Z]{2}\)') {
+      Fail "P5: PC lacks the real user's READ_CONTROL|WRITE_DAC ACE: $(Sddl $pc)"
+    }
+    $out = & icacls $mine /grant '*S-1-5-32-546:(R)' 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0 -and (Sddl $mine) -match ';;;BG\)') { Ok 'P5: the real user can still change the ACL of their own file under a persistent root' }
+    else { Fail "P5: the real user could not change the ACL of their own file under a persistent root (icacls exit=$LASTEXITCODE): $out" }
+  }
+
+  # ── P7: forget one root ──────────────────────────────────────────
+  $fo = & $Exe acl forget $pa --json 2>$null
+  $fexit = $LASTEXITCODE
+  Write-Host "P7: acl forget PA exit=$fexit stdout='$fo'"
+  $leftDeny = @($denyF, $sbOwned) | Where-Object { (Sddl $_) -match $denyAce }
+  if ($fexit -ne 0 -or "$fo" -notmatch '"removed"') { Fail "P7: acl forget PA: exit=$fexit '$fo'" }
+  elseif (Has-Persistent $pa) { Fail "P7: PA still carries persistent ACEs after forget: $(Sddl $pa)" }
+  elseif (Has-Persistent (Join-Path $pa 'keep.txt')) { Fail "P7: a file in PA still inherits persistent ACEs after forget: $(Sddl (Join-Path $pa 'keep.txt'))" }
+  elseif ($leftDeny) { Fail "P7: deny ACEs kept with PA survived its forget: $($leftDeny -join ', ')" }
+  else { Ok 'P7: acl forget removed PA''s ACEs, their inherited copies, and the denies kept with it' }
+  $r = SbRoots @($pa) @($cmd, '/d', '/s', '/c', "echo GONE> `"$pa\after-forget.txt`"")
+  if ($r.exit -ne 0 -and -not (Test-Path "$pa\after-forget.txt")) { Ok 'P7: an exec naming the forgotten root does not run' }
+  else { Fail "P7: an exec naming the forgotten root ran (exit=$($r.exit)). raw: $($r.raw)" }
+
+  # ── P8: no ordinary token while a persistent grant exists ────────
+  # PB and PC are still granted.
+  function Refused { param([string] $when)
+    $r = SbOff @($cmd, '/d', '/s', '/c', "echo P8-RAN> `"$root\p8-ran.txt`" & echo P8-RAN")
+    if ($r.exit -eq 20 -and $r.out -notmatch 'P8-RAN' -and $r.raw -match 'refusing to run' -and -not (Test-Path "$root\p8-ran.txt")) {
+      Ok "P8: exec without the token flag is refused $when"
+    } else { Fail "P8: exec without the token flag was NOT refused $when (exit=$($r.exit)). raw: $($r.raw)" }
+  }
+  Refused 'while a persistent grant exists'
+  $raw = "{`"write`":[`"$(JsonPath $pb)`"]}" |
+    & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0 -and (Sddl $pb) -notmatch [regex]::Escape(";;;$sbSid)")) { Ok 'P8: a per-session acl grant is refused while a persistent grant exists' }
+  else { Fail "P8: a per-session acl grant was not refused (exit=$LASTEXITCODE): $raw" }
+  $dbDir = Join-Path $env:LOCALAPPDATA 'sandbox-runtime'
+  Remove-Item (Join-Path $dbDir 'state.db*') -Force -ErrorAction SilentlyContinue
+  if (Test-Path (Join-Path $dbDir 'state.db')) { Fail 'P8: could not delete the state database — the next rows prove less' }
+  Refused 'after the state database is deleted'
+  $st = Persist-Status
+  if ($st.state -ne 'none') { Ok "P8: user status still reports persistent grants ($($st.state)) without the database" }
+  else { Fail 'P8: user status reports no persistent grants after the database was deleted' }
+  $r = SbRoots @($pb) @($cmd, '/d', '/s', '/c', "echo NOSID> `"$pb\nosid.txt`"")
+  if ($r.exit -ne 0 -and -not (Test-Path "$pb\nosid.txt")) { Ok 'P8: with no capability SID on record a restricted exec naming the root does not run' }
+  else { Fail "P8: a restricted exec ran for a root with no capability SID on record (exit=$($r.exit)). raw: $($r.raw)" }
+
+  # ── P9: option off — forget everything, then the ordinary token ──
+  $fo = & $Exe acl forget --all --json 2>$null
+  $fexit = $LASTEXITCODE
+  Write-Host "P9: acl forget --all exit=$fexit stdout='$fo'"
+  $still = @($pb, $pc, (Join-Path $pb 'keep.txt'), $mine) | Where-Object { Has-Persistent $_ }
+  if ($fexit -ne 0) { Fail "P9: acl forget --all exited $fexit" }
+  elseif ($still) { Fail "P9: persistent ACEs remain after forget --all (database deleted) on: $($still -join ', ')" }
+  elseif ((Sddl $pb) -match '\(A;OICI;RC;;;OW\)') { Fail "P9: PB still carries the OWNER RIGHTS ACE: $(Sddl $pb)" }
+  else { Ok 'P9: forget --all removed every persistent ACE, from the marker alone' }
+  # Nothing of a grant stays, and nothing else went with it: each
+  # root's own DACL is the one it had before its first grant.
+  Write-Host "P9: PB Sddl=$(Sddl $pb)"
+  Write-Host "P9: PC Sddl=$(Sddl $pc)"
+  foreach ($c in @(@{ n = 'PB'; p = $pb; base = $pbBase }, @{ n = 'PC'; p = $pc; base = $pcBase })) {
+    $now = Dacl $c.p
+    if ($now -eq $c.base) { Ok "P9: $($c.n)'s DACL is the one it had before its grant" }
+    else { Fail "P9: $($c.n)'s DACL after forget --all is not the one it had before its grant. before: $($c.base)  after: $now" }
+  }
+  $st = Persist-Status
+  if ($st.state -eq 'none' -and @($st.roots).Count -eq 0) { Ok 'P9: user status reports no persistent grants' }
+  else { Fail "P9: user status persistent_grants=$($st | ConvertTo-Json -Compress) after forget --all" }
+  $r = SbOff @($cmd, '/d', '/s', '/c', 'echo P9-RUNS')
+  if ($r.exit -eq 0 -and $r.out -match 'P9-RUNS') { Ok 'P9: the ordinary token runs again' }
+  else { Fail "P9: the ordinary token does not run after forget --all (exit=$($r.exit)). raw: $($r.raw)" }
+  # PB's own DACL names Administrators and SYSTEM only, so with the
+  # grant forgotten the sandbox account has no write access to it
+  # under any token. (A root whose own DACL lets Authenticated Users
+  # or BUILTIN\Users write stays writable to the ordinary token — rows
+  # A — and forgetting a grant does not change that.)
+  $p9 = Join-Path $pb 'p9.txt'
+  $r = SbOff @($cmd, '/d', '/s', '/c', "echo P9-W> `"$p9`"")
+  if (-not (Test-Path -LiteralPath $p9)) { Ok 'P9: the ordinary token cannot write a root whose grant was forgotten' }
+  else {
+    Fail ("P9: the ordinary token CREATED a file in PB after its grant was forgotten. " +
+          "exec exit=$($r.exit) raw: $($r.raw)  PB Sddl=$(Sddl $pb)  " +
+          "p9.txt Sddl=$(Sddl $p9) owner=$((Get-Acl -LiteralPath $p9).Owner)")
+  }
+
+  # ── P10: a grant neither store records ───────────────────────────
+  $g = Grant-P @($pb)
+  Remove-Item 'HKCU:\Software\sandbox-runtime\PersistentGrants' -Recurse -Force -ErrorAction SilentlyContinue
+  Remove-Item (Join-Path $dbDir 'state.db*') -Force -ErrorAction SilentlyContinue
+  if ($g.exit -ne 0 -or -not (Has-Persistent $pb)) { Fail 'P10: setup — PB is not carrying a persistent grant' }
+  else {
+    try {
+      $raw = "{`"write`":[`"$(JsonPath $pb)`"]}" |
+        & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-String
+      $gexit = $LASTEXITCODE
+      Write-Host -NoNewline $raw
+      if ($gexit -eq 0 -and -not (Has-Persistent $pb) -and (Sddl $pb) -match [regex]::Escape(";;;$sbSid)")) {
+        Ok 'P10: a per-session acl grant removed the unrecorded persistent grant before granting'
+      } else { Fail "P10: per-session acl grant on a root with an unrecorded persistent grant: exit=$gexit Sddl=$(Sddl $pb)" }
+    } finally { End-Session }
+  }
+
+  # ── P11: uninstall removes persistent grants ─────────────────────
+  $g = Grant-P @($pb)
+  if ($g.exit -ne 0 -or -not (Has-Persistent $pb)) { Fail 'P11: setup — PB is not carrying a persistent grant' }
+  else {
+    & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-String | Write-Host
+    $left = @((Get-ItemProperty 'HKCU:\Software\sandbox-runtime\PersistentGrants' -ErrorAction SilentlyContinue).Roots |
+      Where-Object { $_ })
+    if ((Sddl $pb) -match [regex]::Escape($CapPrefix) -or (Sddl $pb) -match [regex]::Escape($script:grpSid)) {
+      Fail "P11: PB still carries persistent ACEs after uninstall: $(Sddl $pb)"
+    } elseif ($left.Count -gt 0) { Fail "P11: the marker still lists roots after uninstall: $($left -join ', ')" }
+    else { Ok 'P11: uninstall removed the persistent grant and its record' }
+  }
 }
 finally {
+  & $Exe acl forget --all 2>&1 | Out-Null
   if ($sbSid) {
     & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
     & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
@@ -494,7 +941,7 @@ if ($script:Failures.Count -gt 0) {
   throw "smoke-write-restricted: $($script:Failures.Count) row(s) failed"
 }
 if ($script:Skipped.Count -gt 0) {
-  Write-Host "smoke-write-restricted: PASS (A, B, C, F-observed, D) — SKIPPED, no test-hooks binary: $($script:Skipped -join '; ')"
+  Write-Host "smoke-write-restricted: PASS (A, B, C, F-observed, D, P1-P11) — SKIPPED, no test-hooks binary: $($script:Skipped -join '; ')"
 } else {
-  Write-Host 'smoke-write-restricted: PASS (G, A, B, C, F-observed, D, E)'
+  Write-Host 'smoke-write-restricted: PASS (G, A, B, C, F-observed, D, E, P1-P11)'
 }

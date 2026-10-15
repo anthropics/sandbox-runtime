@@ -5,7 +5,8 @@
 //! TWO stores, split by scope and by writer:
 //!
 //! - SESSION store (`%LOCALAPPDATA%\sandbox-runtime\state.db`,
-//!   per-user): brokers / ace_holders / working_aces. These rows
+//!   per-user): brokers / ace_holders / working_aces, and the
+//!   holderless `persistent_*` tables of `crate::persist`. These rows
 //!   DRIVE ACL mutations on the owning user's files, so they are
 //!   only trustworthy while only that user (and admins) can write
 //!   them — the directory is stamped real-user-only on every open.
@@ -136,6 +137,36 @@ CREATE INDEX IF NOT EXISTS ace_holders_by_pid ON ace_holders (pid);
 -- depends on.
 CREATE TABLE IF NOT EXISTS placeholders (
   canonical_path TEXT PRIMARY KEY
+);
+-- Write roots whose grant is kept between sessions (`persist.rs`):
+-- the root's capability SID, keyed by canonical path, valid for the
+-- object with this file id. No holders: removed by `acl forget`.
+CREATE TABLE IF NOT EXISTS persistent_roots (
+  canonical_path TEXT PRIMARY KEY,
+  file_id        BLOB NOT NULL,
+  capability_sid TEXT NOT NULL
+);
+-- Sandbox-GROUP deny ACEs kept with a persistent root (same kinds
+-- and masks as `working_aces`, never 'grant'). No holders: added and
+-- widened by session starts, removed with `root` by `acl forget`.
+CREATE TABLE IF NOT EXISTS persistent_denies (
+  canonical_path TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  file_id        BLOB NOT NULL,
+  mask           TEXT NOT NULL,
+  root           TEXT NOT NULL,
+  PRIMARY KEY (canonical_path, kind)
+);
+-- One row per path whose persistent ACEs were written: `spec` is the
+-- ACE list the write was for, `done` is 0 from before the DACL write
+-- until it returned. A session start skips the write only on a row
+-- with `done = 1` for the same list and file id; crash recovery
+-- replays a row left at 0.
+CREATE TABLE IF NOT EXISTS persistent_writes (
+  canonical_path TEXT PRIMARY KEY,
+  file_id        BLOB NOT NULL,
+  spec           TEXT NOT NULL,
+  done           INTEGER NOT NULL
 );
 "#;
 
@@ -597,6 +628,11 @@ pub struct Locked {
 }
 
 impl Locked {
+    /// The session DB connection, for `persist.rs`'s own tables.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Record `self.holder_pid` in `brokers`. The row's
     /// `process_create_time` is the HOLDER's, so crash-recovery
     /// checks whether the holder — not this short-lived CLI — is
@@ -1237,7 +1273,11 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
     // session rows stay put for a later recovery).
     let sb = crate::install::read_setup()?.map(|s| s.sandbox_user_sid);
     let _ = force; // reserved for a future "force-recompose" mode
-    recover_with(conn, sb.as_deref(), &DISK)
+    let report = recover_with(conn, sb.as_deref(), &DISK)?;
+    // Persistent-grant DACL writes that were started and not seen to
+    // finish (they have no holder, so nothing above covers them).
+    crate::persist::replay_pending(conn);
+    Ok(report)
 }
 
 /// Release `(canon, kind)` for recovery; `false` when its rows are

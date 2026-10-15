@@ -127,7 +127,9 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// stay isolated.
 ///
 /// `write_restricted` builds the child token write-restricted (see
-/// [`crate::token`]). It is fail-closed throughout: token creation,
+/// [`crate::token`]), with `capability_sids` — the capability SIDs of
+/// the session's write roots — among its restricting SIDs. It is
+/// fail-closed throughout: token creation,
 /// the runner's process self-protect and its thread self-protect
 /// must all succeed or no child runs — there is no fallback to the
 /// ordinary token. Both self-protects matter more here than in the
@@ -140,6 +142,7 @@ pub fn run_lockdown(
     target_args: &[String],
     env_overlay: &[(String, String)],
     write_restricted: bool,
+    capability_sids: &[String],
 ) -> Result<u32> {
     // 1) Self-protect: rewrite this process's DACL so the child can't
     //    `OpenProcess` us. The child shares the runner's user SID, so
@@ -166,7 +169,7 @@ pub fn run_lockdown(
     //    `write_restricted` has no fallback: an error here ends the
     //    launch.
     let restricted = OwnedHandle(
-        token::make_sandbox_token(self_tok.raw(), write_restricted)
+        token::make_sandbox_token(self_tok.raw(), write_restricted, capability_sids)
             .context("make_sandbox_token")?,
     );
     let primary = OwnedHandle(to_primary(restricted.raw()).context("to_primary")?);

@@ -403,6 +403,48 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(on.argv).toContain('GIT_CONFIG_KEY_2=http.schannelUseSSLCAInfo')
   })
 
+  it('writeRoots: one --write-root per root, right after the token flag; ignored without the token option', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const base = {
+      command: 'git fetch',
+      httpProxyPort: 60080,
+      cwd: 'C:\\work\\repo',
+      denyWrite: ['C:\\work\\repo\\.git\\hooks'],
+      srtWin,
+    }
+    const roots = ['C:\\work\\repo', 'D:\\other tree']
+    const none = wrapCommandWithSandboxWindows({
+      ...base,
+      writeRestrictedToken: true,
+    })
+    const on = wrapCommandWithSandboxWindows({
+      ...base,
+      writeRestrictedToken: true,
+      writeRoots: roots,
+    })
+    const at = on.argv.indexOf('--write-restricted-token')
+    expect(on.argv.slice(at, at + 5)).toEqual([
+      '--write-restricted-token',
+      '--write-root',
+      roots[0],
+      '--write-root',
+      roots[1],
+    ])
+    // srt-win options: before `--`, and the per-exec denies are
+    // still there, unchanged.
+    expect(at + 5).toBeLessThanOrEqual(on.argv.indexOf('--deny-write'))
+    expect(on.argv.indexOf('--deny-write')).toBeLessThan(on.argv.indexOf('--'))
+    // Nothing else changes.
+    expect([...on.argv.slice(0, at + 1), ...on.argv.slice(at + 5)]).toEqual(
+      none.argv,
+    )
+    expect(on.env).toEqual(none.env)
+    // The ordinary token has no capability SIDs to carry.
+    const off = wrapCommandWithSandboxWindows({ ...base, writeRoots: roots })
+    expect(off.argv).toEqual(wrapCommandWithSandboxWindows(base).argv)
+    expect(off.argv).not.toContain('--write-root')
+  })
+
   it('resolveSrtWin: explicit path → used verbatim, sentinel prepend', () => {
     const set = resolveSrtWin({ path: process.execPath })
     expect(set.exe).toBe(process.execPath)
@@ -1375,6 +1417,135 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     ])
   })
 
+  it('verifyWindowsWfpEgress: writeRoots ride with the token flag only', async () => {
+    const target = '127.0.0.1:49999'
+    stubSpawn(() => ({
+      status: 0,
+      stdout: JSON.stringify({ egress_probe: 'blocked', target }),
+    }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const writeRoots = ['C:\\a', 'C:\\b']
+    await verifyWindowsWfpEgress({
+      target,
+      writeRestrictedToken: true,
+      writeRoots,
+      srtWin,
+    })
+    await verifyWindowsWfpEgress({ target, writeRoots, srtWin })
+    const plain = [SRT_WIN_DISPATCH_ARG1, 'wfp', 'verify', '--target', target]
+    expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+      [
+        ...plain,
+        '--write-restricted-token',
+        '--write-root',
+        'C:\\a',
+        '--write-root',
+        'C:\\b',
+      ],
+      plain,
+    ])
+  })
+
+  it('grantWindowsAclPersistent: one acl grant --persistent with grants and denies on stdin; any non-zero exit throws', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const opts = {
+      sandboxUserSid: 'S-1-5-21-1',
+      holderPid: 4242,
+      read: ['C:\\bundle'],
+      write: ['C:\\work\\repo'],
+      denyRead: ['C:\\work\\repo\\.env'],
+      denyWrite: ['C:\\work\\repo\\.git\\hooks'],
+      srtWin,
+    }
+    stubSpawn(() => ({ status: 0, stdout: '' }))
+    winUtils.grantWindowsAclPersistent(opts)
+    expect(spawnSyncSpy.mock.calls).toHaveLength(1)
+    const [, argv, spawnOpts] = spawnSyncSpy.mock.calls[0] as [
+      string,
+      string[],
+      { input: string },
+    ]
+    expect(argv).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'acl',
+      'grant',
+      '--holder-pid',
+      '4242',
+      '--sandbox-user-sid',
+      'S-1-5-21-1',
+      '--persistent',
+    ])
+    expect(JSON.parse(spawnOpts.input)).toEqual({
+      read: opts.read,
+      write: opts.write,
+      denyRead: opts.denyRead,
+      denyWrite: opts.denyWrite,
+    })
+    // 2 = an input was skipped; 1 = a capability SID, a DACL read or
+    // a DACL write failed. Neither is a session.
+    for (const status of [1, 2]) {
+      spawnSyncSpy.mockRestore()
+      spawnSpy.mockRestore()
+      stubSpawn(() => ({ status, stdout: '' }))
+      let thrown: unknown
+      try {
+        winUtils.grantWindowsAclPersistent(opts)
+      } catch (e) {
+        thrown = e
+      }
+      expect(thrown).toBeInstanceOf(WindowsSandboxError)
+      expect((thrown as WindowsSandboxError).code).toBe('acl_grant_failed')
+    }
+  })
+
+  it('forgetWindowsPersistentGrants: acl forget --all; a non-zero exit throws acl_forget_failed', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    stubSpawn(() => ({ status: 0, stdout: '' }))
+    winUtils.forgetWindowsPersistentGrants({ srtWin })
+    expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+      [SRT_WIN_DISPATCH_ARG1, 'acl', 'forget', '--all'],
+    ])
+    spawnSyncSpy.mockRestore()
+    spawnSpy.mockRestore()
+    stubSpawn(() => ({ status: 1, stdout: '' }))
+    let thrown: unknown
+    try {
+      winUtils.forgetWindowsPersistentGrants({ srtWin })
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeInstanceOf(WindowsSandboxError)
+    expect((thrown as WindowsSandboxError).code).toBe('acl_forget_failed')
+  })
+
+  it('user status: persistent_grants is surfaced unless it says "none"; an unknown state is not "none"', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const statusWith = (persistent_grants: unknown) => {
+      spawnSyncSpy?.mockRestore()
+      spawnSpy?.mockRestore()
+      stubSpawn(() => ({
+        status: 0,
+        stdout: JSON.stringify({ ...JSON.parse(RAW_USER), persistent_grants }),
+      }))
+      return getWindowsSandboxUserStatus({ srtWin }).persistentGrants
+    }
+    // An srt-win without the feature, and one with nothing kept.
+    expect(statusWith(undefined)).toBeUndefined()
+    expect(statusWith({ state: 'none', roots: [] })).toBeUndefined()
+    expect(
+      statusWith({ state: 'present', roots: ['C:\\a'], reason: 'r' }),
+    ).toEqual({ state: 'present', roots: ['C:\\a'], reason: 'r' })
+    expect(statusWith({ state: 'unknown', roots: [], reason: 'r' })).toEqual({
+      state: 'unknown',
+      roots: [],
+      reason: 'r',
+    })
+    expect(statusWith({ state: 'someLaterState' })).toEqual({
+      state: 'unknown',
+      roots: [],
+    })
+  })
+
   it('verifyWindowsWfpEgress with writeRestrictedToken rejects every outcome but blocked', async () => {
     const target = '127.0.0.1:49999'
     const srtWin = resolveSrtWin({ path: process.execPath })
@@ -1689,6 +1860,297 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
 // has happened, no later revoke in the process unlocks the restore.
 // These drive the real SandboxManager with the platform pinned to
 // Windows and both child_process entry points stubbed.
+
+describe('Windows writeRestrictedToken: write roots are granted once and kept (pure, all platforms)', () => {
+  const SID = 'S-1-5-21-1'
+  const RAW_USER = {
+    user: {
+      exists: true,
+      sid: SID,
+      group_exists: true,
+      group_sid: 'S-1-5-21-2',
+      in_builtin_users: true,
+      in_sandbox_group: true,
+      hidden_from_logon: true,
+    },
+    cred_present: true,
+    marker_version: 1,
+    real_user_sid: 'S-1-5-21-3',
+    ca_cert_thumb: null,
+    ca_cert_pem: null,
+  }
+  const RAW_WFP = {
+    state: 'installed',
+    filters: 4,
+    port_range: [60080, 60089],
+    user_sid: SID,
+  }
+  type SyncResult = { status: number; stdout: string; stderr: string }
+  const exit = (status: number, stdout = ''): SyncResult => ({
+    status,
+    stdout,
+    stderr: '',
+  })
+
+  /** What `user status` adds about kept grants; `undefined` = no field. */
+  let persistentGrants: unknown
+  const stdoutFor = (argv: readonly string[]): string => {
+    const user = {
+      ...RAW_USER,
+      ...(persistentGrants !== undefined && {
+        persistent_grants: persistentGrants,
+      }),
+    }
+    return argv.includes('user')
+      ? JSON.stringify(user)
+      : argv.includes('wfp')
+        ? JSON.stringify(RAW_WFP)
+        : argv.includes('status')
+          ? JSON.stringify({ user, wfp: RAW_WFP })
+          : ''
+  }
+  /** Every `acl` spawn: subcommand, flags after it, parsed stdin. */
+  let acl: { sub: string; argv: string[]; stdin: unknown }[]
+  /** spawnSync result per `acl` subcommand; default exit 0, `[]`. */
+  let aclResult: Record<string, SyncResult>
+  /** Arguments of every fence probe. */
+  let verifyCalls: Parameters<typeof winUtils.verifyWindowsWfpEgress>[0][]
+  let verifyResult: () => Promise<unknown>
+  let spies: { mockRestore(): void }[]
+  let dir: string
+
+  const subs = () => acl.map(c => c.sub)
+
+  beforeEach(() => {
+    persistentGrants = undefined
+    acl = []
+    aclResult = {}
+    verifyCalls = []
+    verifyResult = () => Promise.resolve({ outcome: 'blocked' })
+    winUtils.clearWindowsAclIncompleteRevokesForTesting()
+    dir = mkdtempSync(join(tmpdir(), 'srt-persist-'))
+    mkdirSync(join(dir, 'secret'))
+    spies = [
+      spyOn(platform, 'getPlatform').mockReturnValue('windows'),
+      spyOn(winUtils, 'verifyWindowsWfpEgress').mockImplementation(((
+        o: Parameters<typeof winUtils.verifyWindowsWfpEgress>[0],
+      ) => {
+        verifyCalls.push(o)
+        return verifyResult()
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      }) as any),
+      // Async spawns: `user status` / `status` at initialize().
+      spyOn(child_process, 'spawn').mockImplementation(((
+        _exe: string,
+        argv: readonly string[],
+      ) => {
+        const mkStream = () => {
+          const s = new EventEmitter() as EventEmitter & {
+            setEncoding(e: string): typeof s
+            end(d?: string): void
+          }
+          s.setEncoding = () => s
+          s.end = () => {}
+          return s
+        }
+        const child = Object.assign(new EventEmitter(), {
+          stdout: mkStream(),
+          stderr: mkStream(),
+          stdin: mkStream(),
+          kill: () => true,
+        })
+        setImmediate(() => {
+          child.stdout.emit('data', stdoutFor(argv))
+          child.emit('close', 0, null)
+        })
+        return child
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      }) as any),
+      // Sync spawns: every `acl` call.
+      spyOn(child_process, 'spawnSync').mockImplementation(((
+        _exe: string,
+        argv: readonly string[],
+        opts: { input?: string },
+      ) => {
+        if (!argv.includes('acl')) return exit(0, stdoutFor(argv))
+        const at = argv.indexOf('acl') + 1
+        acl.push({
+          sub: argv[at],
+          argv: argv.slice(at + 1),
+          stdin: opts.input === undefined ? undefined : JSON.parse(opts.input),
+        })
+        return aclResult[argv[at]] ?? exit(0, '[]')
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      }) as any),
+    ]
+  })
+
+  afterEach(async () => {
+    aclResult = {}
+    await SandboxManager.reset()
+    winUtils.clearWindowsAclIncompleteRevokesForTesting()
+    for (const s of spies) s.mockRestore()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  // Write root `dir`, deny on `dir/secret`; both proxy ports external
+  // so initialize() binds nothing.
+  const config = (writeRestrictedToken?: boolean): SandboxRuntimeConfig => ({
+    network: {
+      allowedDomains: [],
+      deniedDomains: [],
+      httpProxyPort: 1,
+      socksProxyPort: 2,
+    },
+    filesystem: {
+      denyRead: [join(dir, 'secret')],
+      allowRead: [],
+      allowWrite: [dir],
+      denyWrite: [],
+    },
+    windows: {
+      srtWin: { path: process.execPath },
+      ...(writeRestrictedToken !== undefined && { writeRestrictedToken }),
+    },
+  })
+  const rejection = async (
+    cfg: SandboxRuntimeConfig,
+  ): Promise<WindowsSandboxError> => {
+    try {
+      await SandboxManager.initialize(cfg)
+    } catch (e) {
+      return e as WindowsSandboxError
+    }
+    throw new Error('expected initialize() to reject')
+  }
+
+  it('option on: one acl grant --persistent carries roots and denies; no per-session grant or stamp; the probe gets the roots; exec gets --write-root', async () => {
+    await SandboxManager.initialize(config(true))
+    expect(subs()).toEqual(['grant'])
+    expect(acl[0].argv).toContain('--persistent')
+    const stdin = acl[0].stdin as Record<string, string[]>
+    expect(stdin.write).toHaveLength(1)
+    expect(stdin.denyRead).toHaveLength(1)
+    expect(stdin.read).toEqual([])
+    expect(stdin.denyWrite).toEqual([])
+    // The probe runs after the grant (the capability SIDs exist only
+    // then), under the token the commands get.
+    expect(verifyCalls).toHaveLength(1)
+    expect(verifyCalls[0]?.writeRestrictedToken).toBe(true)
+    expect(verifyCalls[0]?.writeRoots).toEqual(stdin.write)
+
+    const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
+    const at = argv.indexOf('--write-restricted-token')
+    expect(argv.slice(at, at + 3)).toEqual([
+      '--write-restricted-token',
+      '--write-root',
+      stdin.write[0],
+    ])
+    expect(at + 3).toBeLessThanOrEqual(argv.indexOf('--'))
+  })
+
+  it('option on: reset() releases only what was per-session; nothing forgets the roots', async () => {
+    await SandboxManager.initialize(config(true))
+    await SandboxManager.reset()
+    expect(subs()).toEqual(['grant', 'revoke', 'restore'])
+    expect(subs()).not.toContain('forget')
+  })
+
+  it("option on: every initialize() probes the fence again, with that session's roots", async () => {
+    await SandboxManager.initialize(config(true))
+    await SandboxManager.reset()
+    await SandboxManager.initialize(config(true))
+    expect(verifyCalls).toHaveLength(2)
+    for (const v of verifyCalls) {
+      expect(v?.writeRestrictedToken).toBe(true)
+      expect(v?.writeRoots).toHaveLength(1)
+    }
+  })
+
+  it('option on: a session with nothing to grant still probes, with no roots', async () => {
+    const cfg = config(true)
+    cfg.filesystem = {
+      denyRead: [],
+      allowRead: [],
+      allowWrite: [],
+      denyWrite: [],
+    }
+    await SandboxManager.initialize(cfg)
+    expect(subs()).toEqual([])
+    expect(verifyCalls).toHaveLength(1)
+    expect(verifyCalls[0]?.writeRoots).toEqual([])
+    const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
+    expect(argv).toContain('--write-restricted-token')
+    expect(argv).not.toContain('--write-root')
+  })
+
+  for (const status of [1, 2]) {
+    it(`option on: acl grant --persistent exits ${status} → initialize() rejects; no fallback to a per-session grant, no probe, no command`, async () => {
+      aclResult.grant = exit(status)
+      const e = await rejection(config(true))
+      expect(e.code).toBe('acl_grant_failed')
+      // One grant attempt, then only the release of whatever was
+      // per-session.
+      expect(subs().filter(s => s === 'grant')).toHaveLength(1)
+      expect(subs()).not.toContain('stamp')
+      expect(acl[0].argv).toContain('--persistent')
+      expect(verifyCalls).toHaveLength(0)
+      expect(SandboxManager.getConfig()).toBeUndefined()
+    })
+  }
+
+  it('option on: the probe is not blocked → initialize() rejects and no command can be wrapped', async () => {
+    verifyResult = () =>
+      Promise.reject(new WindowsSandboxError('wfp_fence_inactive', 'connected'))
+    const e = await rejection(config(true))
+    expect(e.code).toBe('wfp_fence_inactive')
+    expect(SandboxManager.getConfig()).toBeUndefined()
+    expect(subs()).toEqual(['grant', 'revoke', 'restore'])
+  })
+
+  it('option off, no kept grants reported: exactly the calls made before — no forget, no --persistent', async () => {
+    for (const reported of [undefined, { state: 'none', roots: [] }]) {
+      persistentGrants = reported
+      acl = []
+      await SandboxManager.initialize(config())
+      expect(subs()).toEqual(['grant', 'stamp'])
+      for (const c of acl) expect(c.argv).not.toContain('--persistent')
+      expect((acl[0].stdin as object) ?? {}).not.toHaveProperty('denyRead')
+      const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
+      expect(argv).not.toContain('--write-restricted-token')
+      expect(argv).not.toContain('--write-root')
+      await SandboxManager.reset()
+    }
+  })
+
+  for (const reported of [
+    { state: 'present', roots: ['C:\\kept'] },
+    // The marker or the database cannot be read: grants may exist.
+    { state: 'unknown', roots: [], reason: 'state database is missing' },
+  ]) {
+    it(`option off, kept grants ${reported.state}: they are forgotten before anything is granted`, async () => {
+      persistentGrants = reported
+      await SandboxManager.initialize(config(false))
+      expect(subs()).toEqual(['forget', 'grant', 'stamp'])
+      expect(acl[0].argv).toEqual(['--all'])
+    })
+
+    it(`option off, kept grants ${reported.state}: forget fails → initialize() rejects with nothing granted`, async () => {
+      persistentGrants = reported
+      aclResult.forget = exit(1)
+      const e = await rejection(config(false))
+      expect(e.code).toBe('acl_forget_failed')
+      expect(subs()).toEqual(['forget'])
+      expect(SandboxManager.getConfig()).toBeUndefined()
+    })
+  }
+
+  it('option on with kept grants reported: nothing is forgotten', async () => {
+    persistentGrants = { state: 'present', roots: [dir] }
+    await SandboxManager.initialize(config(true))
+    expect(subs()).toEqual(['grant'])
+  })
+})
 
 describe('Windows session ACLs: restore gated on a completed revoke (pure, all platforms)', () => {
   const SID = 'S-1-5-21-1'
@@ -2331,6 +2793,62 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       await SandboxManager.reset()
     }
   }, 120_000)
+
+  it('windows.writeRestrictedToken: a write root is writable to its own session only, is kept at reset(), and is removed when the option goes off', async () => {
+    installWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      proxyPortRange: PORT_RANGE,
+      srtWin: TEST_SRT_WIN,
+    })
+    // Long-form paths: the sandbox account cannot resolve an 8.3
+    // component of the runner's profile.
+    const rootA = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-a-')))
+    const rootB = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-b-')))
+    const withOption = (roots: string[]): SandboxRuntimeConfig => {
+      const cfg = createTestConfig()
+      cfg.filesystem.allowWrite = roots
+      cfg.windows = { ...cfg.windows, writeRestrictedToken: true }
+      return cfg
+    }
+    const write = async (file: string): Promise<boolean> => {
+      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+        `echo X> "${file}"`,
+      )
+      await spawnAsync(argv[0], argv.slice(1), { timeout: 60_000, env })
+      return existsSync(file)
+    }
+    const kept = () =>
+      getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN }).persistentGrants
+    try {
+      await SandboxManager.initialize(withOption([rootA]))
+      expect(await write(join(rootA, 'own.txt'))).toBe(true)
+      await SandboxManager.reset()
+      // The grant outlives the session.
+      expect(kept()?.state).toBe('present')
+      expect(kept()?.roots).toHaveLength(1)
+
+      // A session given only B: A still carries its grant, and this
+      // session cannot write there.
+      await SandboxManager.initialize(withOption([rootB]))
+      expect(await write(join(rootB, 'own.txt'))).toBe(true)
+      expect(await write(join(rootA, 'from-b.txt'))).toBe(false)
+      await SandboxManager.reset()
+      expect(kept()?.roots).toHaveLength(2)
+
+      // Option off: the kept grants are removed before anything is
+      // granted, and A works as a per-session root again.
+      const off = createTestConfig()
+      off.filesystem.allowWrite = [rootA]
+      await SandboxManager.initialize(off)
+      expect(kept()).toBeUndefined()
+      expect(await write(join(rootA, 'off.txt'))).toBe(true)
+      expect(await write(join(rootB, 'off.txt'))).toBe(false)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(rootA, { recursive: true, force: true })
+      rmSync(rootB, { recursive: true, force: true })
+    }
+  }, 240_000)
 })
 
 describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {

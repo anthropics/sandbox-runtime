@@ -29,8 +29,9 @@
 //!
 //! With `write_restricted` set, [`make_sandbox_token`] adds the
 //! `WRITE_RESTRICTED` flag and the restricting-SID list
-//! [`restricting_sid_list`] = `[<sandbox user SID>, Everyone,
-//! RESTRICTED]`; everything above is unchanged. A restricted token is
+//! [`restricting_sid_list`] = `[<capability SIDs of this session's
+//! write roots>, <sandbox user SID>, Everyone, RESTRICTED]`;
+//! everything above is unchanged. A restricted token is
 //! access-checked twice — once against its ordinary groups, once
 //! against the restricting list — and both must grant. With
 //! `WRITE_RESTRICTED` the second check applies to write-class access
@@ -41,8 +42,14 @@
 //! stops reaching the child.
 //!
 //! Why each SID is in the list:
-//!   - **The sandbox user SID** — every ACE the broker writes for
-//!     the sandbox (working-tree grants, deny stamps, the
+//!   - **The capability SIDs** — one per write root the session was
+//!     given (`crate::persist`). A root whose grant is kept between
+//!     sessions allows writing to its capability SID, not to the
+//!     sandbox user SID, so only a token that lists that SID passes
+//!     the second check there: a session of one project cannot write
+//!     another's root. The list may be empty.
+//!   - **The sandbox user SID** — every per-session ACE the broker
+//!     writes for the sandbox (read grants, deny stamps, the
 //!     window-station / desktop / `BaseNamedObjects` grants, the
 //!     default DACL below, the account's own profile) is keyed on
 //!     it, so those keep satisfying both checks with no change to
@@ -118,15 +125,24 @@ pub fn restricted_token_flags(write_restricted: bool) -> CREATE_RESTRICTED_TOKEN
 }
 
 /// The restricting-SID list of the write-restricted token, in the
-/// order it is passed to `CreateRestrictedToken`. `user_sid` is the
-/// sandbox account's own SID and **must** stay in the list: the WFP
-/// egress BLOCK and every sandbox ACE key on it (module doc).
-pub fn restricting_sid_list(user_sid: &str) -> [String; 3] {
-    [
+/// order it is passed to `CreateRestrictedToken`: the session's
+/// capability SIDs (duplicates dropped), then the three fixed SIDs.
+/// `user_sid` is the sandbox account's own SID and **must** stay in
+/// the list: the WFP egress BLOCK and every per-session sandbox ACE
+/// key on it (module doc).
+pub fn restricting_sid_list(user_sid: &str, capability_sids: &[String]) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(capability_sids.len() + 3);
+    for c in capability_sids {
+        if !v.contains(c) {
+            v.push(c.clone());
+        }
+    }
+    v.extend([
         user_sid.to_owned(),
         SID_EVERYONE.to_owned(),
         SID_RESTRICTED.to_owned(),
-    ]
+    ]);
+    v
 }
 
 /// What a token's restricting-SID state is, as the kernel reports it.
@@ -222,11 +238,32 @@ pub fn open_self_token() -> Result<HANDLE> {
 /// duplicates the result to a primary token via [`to_primary`].
 ///
 /// `write_restricted` adds the `WRITE_RESTRICTED` flag and the
-/// [`restricting_sid_list`] (module doc). It fails closed: if the
-/// token cannot be created with the list, or the created token does
-/// not report exactly that list and flag, this returns an error —
-/// there is no fallback to the ordinary token.
-pub fn make_sandbox_token(base: HANDLE, write_restricted: bool) -> Result<HANDLE> {
+/// [`restricting_sid_list`] (module doc) built from
+/// `capability_sids`. It fails closed: if the token cannot be created
+/// with the list, or the created token does not report exactly that
+/// list and flag, this returns an error — there is no fallback to the
+/// ordinary token, nor to a shorter list.
+///
+/// `capability_sids` must be empty without `write_restricted`, and
+/// each must be a capability SID (`crate::persist`): the list arrives
+/// in the launch spec, and nothing else is accepted from it as a
+/// restricting SID.
+pub fn make_sandbox_token(
+    base: HANDLE,
+    write_restricted: bool,
+    capability_sids: &[String],
+) -> Result<HANDLE> {
+    if !write_restricted && !capability_sids.is_empty() {
+        return Err(anyhow!(
+            "capability SIDs were given without the write-restricted token"
+        ));
+    }
+    if let Some(bad) = capability_sids
+        .iter()
+        .find(|s| !crate::persist::is_capability_sid(s))
+    {
+        return Err(anyhow!("'{bad}' is not a capability SID"));
+    }
     // SIDs to disable: `BUILTIN\Administrators` + every
     // `SE_GROUP_LOGON_ID` group in `base` (see module doc — the
     // logon-SID strip is what stops the child reading same-session
@@ -247,11 +284,11 @@ pub fn make_sandbox_token(base: HANDLE, write_restricted: bool) -> Result<HANDLE
     // SeChangeNotifyPrivilege.
     let to_delete = privileges_except(base, &["SeChangeNotifyPrivilege"])?;
 
-    // Restricting SIDs: none by default; the fixed three-SID list
-    // when `write_restricted`. `restrict_sids` owns the SID memory
-    // and must outlive `CreateRestrictedToken`.
+    // Restricting SIDs: none by default; the capability SIDs plus
+    // the fixed three when `write_restricted`. `restrict_sids` owns
+    // the SID memory and must outlive `CreateRestrictedToken`.
     let restrict_want: Vec<String> = if write_restricted {
-        restricting_sid_list(&token_user_sid(base)?).to_vec()
+        restricting_sid_list(&token_user_sid(base)?, capability_sids)
     } else {
         Vec::new()
     };
@@ -481,7 +518,12 @@ mod tests {
     #[test]
     fn restricted_token_builds() {
         let base = open_self_token().expect("open_self_token");
-        let r = make_sandbox_token(base, false);
+        let r = make_sandbox_token(base, false, &[]);
+        // Capability SIDs are refused without the flag, and so is
+        // anything that is not one with it.
+        let cap = crate::persist::new_capability_sid().unwrap();
+        assert!(make_sandbox_token(base, false, std::slice::from_ref(&cap)).is_err());
+        assert!(make_sandbox_token(base, true, &[SID_BUILTIN_ADMINS.to_owned()]).is_err());
         unsafe {
             let _ = CloseHandle(base);
         }
@@ -508,32 +550,55 @@ mod tests {
         assert_eq!(restricted_token_flags(true).0, 0x4 | 0x8);
         assert_eq!(WRITE_RESTRICTED.0, 0x8);
         assert_eq!(
-            restricting_sid_list("S-1-5-21-1-2-3-1005"),
+            restricting_sid_list("S-1-5-21-1-2-3-1005", &[]),
             ["S-1-5-21-1-2-3-1005", "S-1-1-0", "S-1-5-12"]
+        );
+        // Capability SIDs lead, once each, in the order given; the
+        // three fixed SIDs always follow.
+        let (a, b) = (
+            "S-1-0-1936880739-1-2-3-4".to_owned(),
+            "S-1-0-1936880739-5-6-7-8".to_owned(),
+        );
+        assert_eq!(
+            restricting_sid_list("S-1-5-21-1-2-3-1005", &[b.clone(), a.clone(), b.clone()]),
+            [
+                b.as_str(),
+                a.as_str(),
+                "S-1-5-21-1-2-3-1005",
+                "S-1-1-0",
+                "S-1-5-12"
+            ]
         );
     }
 
-    /// The kernel reports the token that was asked for: the three
-    /// SIDs, the write-restricted flag, and it survives the duplicate
-    /// to a primary token that `CreateProcessAsUserW` is given.
+    /// The kernel reports the token that was asked for: the
+    /// capability SIDs and the three fixed SIDs, the write-restricted
+    /// flag, and it survives the duplicate to a primary token that
+    /// `CreateProcessAsUserW` is given.
     #[test]
     fn write_restricted_token_reports_exact_list() {
-        let base = open_self_token().expect("open_self_token");
-        let user = token_user_sid(base).expect("token_user_sid");
-        let r = make_sandbox_token(base, true);
-        unsafe {
-            let _ = CloseHandle(base);
-        }
-        let tok = r.expect("make_sandbox_token(write_restricted)");
-        let prim = to_primary(tok).expect("to_primary");
-        for h in [tok, prim] {
-            let shape = token_restriction(h).expect("token_restriction");
-            assert!(shape.write_restricted, "TOKEN_WRITE_RESTRICTED not set");
-            assert_eq!(shape.restricted_sids, restricting_sid_list(&user));
-        }
-        unsafe {
-            let _ = CloseHandle(tok);
-            let _ = CloseHandle(prim);
+        let caps = [
+            crate::persist::new_capability_sid().unwrap(),
+            crate::persist::new_capability_sid().unwrap(),
+        ];
+        for caps in [&caps[..0], &caps[..]] {
+            let base = open_self_token().expect("open_self_token");
+            let user = token_user_sid(base).expect("token_user_sid");
+            let r = make_sandbox_token(base, true, caps);
+            unsafe {
+                let _ = CloseHandle(base);
+            }
+            let tok = r.expect("make_sandbox_token(write_restricted)");
+            let prim = to_primary(tok).expect("to_primary");
+            for h in [tok, prim] {
+                let shape = token_restriction(h).expect("token_restriction");
+                assert!(shape.write_restricted, "TOKEN_WRITE_RESTRICTED not set");
+                assert_eq!(shape.restricted_sids, restricting_sid_list(&user, caps));
+            }
+            unsafe {
+                let _ = CloseHandle(tok);
+                let _ = CloseHandle(prim);
+            }
         }
     }
 

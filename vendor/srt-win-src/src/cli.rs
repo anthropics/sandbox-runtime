@@ -16,8 +16,10 @@
 //!   status                             — combined `{user, wfp}` JSON
 //!   user   status | read-cred | trust-ca — inspect the sandbox user
 //!   wfp    status | verify | uninstall — inspect/probe/remove WFP filters
-//!   acl    stamp | grant | restore | revoke | recover
-//!                                       — additive sandbox-user ACEs
+//!   acl    stamp | grant | restore | revoke | recover | forget
+//!                                       — additive sandbox-user ACEs,
+//!                                         and write grants kept
+//!                                         between sessions
 //!   exec   -- <target> [args...]       — spawn under the two-hop
 //!                                         sandbox-user lockdown
 //!
@@ -138,7 +140,9 @@ enum Cmd {
     /// marker (unless `--keep-user`). Self-elevates via UAC if not
     /// already admin. Best-effort also removes the legacy
     /// `sandbox-runtime-net` discriminator group if a prior install
-    /// left it behind.
+    /// left it behind. Unless `--keep-user`, the calling user's
+    /// persistent write grants (`acl grant --persistent`) are removed
+    /// first, as by `acl forget --all`.
     Uninstall {
         #[arg(long)]
         sublayer_guid: Option<String>,
@@ -236,8 +240,25 @@ enum Cmd {
         /// TLS clients (System32 `curl.exe`, schannel-backend git,
         /// .NET / PowerShell web requests) fail under it. Pair with
         /// `wfp verify --write-restricted-token`.
+        ///
+        /// Without this flag the exec is refused (exit **20**) while
+        /// any persistent write grant exists (`acl grant
+        /// --persistent`): such a grant lets the sandbox account
+        /// write its tree under the ordinary token.
         #[arg(long)]
         write_restricted_token: bool,
+        /// A write root of this command's session, granted with `acl
+        /// grant --persistent`. Repeatable. The root's capability SID
+        /// is added to the child token's restricting SIDs, which is
+        /// what lets the child write there — and only there, among
+        /// the persistent roots. Fails the exec if no capability SID
+        /// is recorded for the path.
+        #[arg(
+            long = "write-root",
+            value_name = "PATH",
+            requires = "write_restricted_token"
+        )]
+        write_root: Vec<String>,
         /// Target executable followed by its arguments. Use `--`
         /// to terminate srt-win's own option parsing.
         #[arg(
@@ -349,6 +370,9 @@ enum AclCmd {
     /// existing DACL and inheritance are untouched. Refcounted per
     /// holder; `acl revoke` removes the ACE when the last holder
     /// releases.
+    ///
+    /// Refused while a persistent grant exists (see `--persistent`);
+    /// `acl forget --all` removes those.
     Grant {
         /// Holder PID (see `acl stamp`).
         #[arg(long)]
@@ -357,6 +381,19 @@ enum AclCmd {
         /// (`srt-win user status` → `marker_user_sid`).
         #[arg(long)]
         sandbox_user_sid: String,
+        /// Session start for `exec --write-restricted-token`. Each
+        /// `write` path becomes a persistent root: it gets a
+        /// capability SID of its own and ACEs for the sandbox GROUP
+        /// and that SID (none for the sandbox user), which are KEPT
+        /// when the session ends — `acl revoke` does not touch them,
+        /// `acl forget` removes them. A root already granted costs
+        /// one DACL read. stdin may also carry `denyRead` /
+        /// `denyWrite`: targets under a persistent root are stamped
+        /// for the sandbox group and kept with it; the others, and
+        /// the `read` paths, are per-session as without this flag.
+        /// Pass each root to `exec` as `--write-root`.
+        #[arg(long)]
+        persistent: bool,
     },
     /// Drop the holder's claim on every granted path; remove the
     /// sandbox-user ACE on any path whose refcount falls to zero.
@@ -396,6 +433,24 @@ enum AclCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Remove persistent write grants (`acl grant --persistent`):
+    /// the root's ACEs, the deny ACEs kept with it, its capability
+    /// SID and its record. One walk of the tree per root. Exits
+    /// non-zero if any root could not be completed; that root stays
+    /// recorded.
+    Forget {
+        /// Every root recorded for the calling user.
+        #[arg(long, conflicts_with = "roots")]
+        all: bool,
+        /// Emit a JSON array of per-root `{path, status}` objects on
+        /// stdout (`removed`, `absent`, `failed`), also when exiting
+        /// non-zero.
+        #[arg(long)]
+        json: bool,
+        /// The roots to forget.
+        #[arg(value_name = "PATH")]
+        roots: Vec<String>,
+    },
     /// Run crash-recovery only: release the holds of dead holders
     /// (grants first; a holder's deny ACEs are kept while one of its
     /// grants could not be released) and prune them. Exits non-zero
@@ -421,11 +476,17 @@ struct AclStampInput {
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct AclGrantInput {
     #[serde(default)]
     read: Vec<String>,
     #[serde(default)]
     write: Vec<String>,
+    /// `--persistent` only — see `acl grant`.
+    #[serde(default)]
+    deny_read: Vec<String>,
+    #[serde(default)]
+    deny_write: Vec<String>,
 }
 
 /// One per-path entry of `acl revoke --json` / `acl restore
@@ -639,6 +700,10 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         "real_user_sid": srt_win::sid::current_user_sid()?,
         "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
         "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
+        // Whether the ordinary token may be used: `state` is `none`
+        // unless persistent write grants exist or cannot be ruled
+        // out (`srt_win::persist`).
+        "persistent_grants": srt_win::persist::status_json(),
     }))
 }
 
@@ -768,6 +833,14 @@ enum WfpCmd {
         /// verify with this flag.
         #[arg(long)]
         write_restricted_token: bool,
+        /// The session's write roots, as given to `exec`: the probe
+        /// child's token then carries the same capability SIDs.
+        #[arg(
+            long = "write-root",
+            value_name = "PATH",
+            requires = "write_restricted_token"
+        )]
+        write_root: Vec<String>,
     },
     /// Remove every srt-win-tagged WFP filter under the sublayer.
     /// Self-elevates via UAC if not already admin.
@@ -1013,6 +1086,28 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sublayer_guid,
             keep_user,
         } => {
+            // Persistent write grants go with the account. Done here,
+            // before the elevation hop: the records are the CALLING
+            // user's (their registry hive, their session database),
+            // and the elevated process may be another user. They name
+            // the sandbox group, so this must also precede its
+            // removal. A root that cannot be completed stays recorded
+            // (`acl forget --all` retries) and does not stop the
+            // uninstall: once the group is gone its ACEs match no
+            // token.
+            if !keep_user {
+                match srt_win::persist::forget_everything() {
+                    Ok((0, _)) => {}
+                    Ok((n, 0)) => {
+                        eprintln!("srt-win: persistent write grants removed from {n} root(s)")
+                    }
+                    Ok((n, failed)) => eprintln!(
+                        "srt-win: warning: {failed} of {n} persistent write grant(s) could \
+                         not be removed and stay recorded"
+                    ),
+                    Err(e) => eprintln!("srt-win: warning: persistent write grant cleanup: {e:#}"),
+                }
+            }
             if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
@@ -1132,6 +1227,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 WfpCmd::Verify {
                     target,
                     write_restricted_token,
+                    write_root,
                 },
         } => {
             use srt_win::{install, logon, runner};
@@ -1164,6 +1260,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // runner with 1, which is reported as `error` below —
             // never as `blocked`.
             let cmd = if write_restricted_token {
+                // The probe child's restricting SIDs are the ones a
+                // command of this session gets. A root with no
+                // capability SID fails the verify (exit 1, nothing on
+                // stdout) — never a probe under a shorter list.
+                let capability_sids = srt_win::persist::capability_sids_for(&write_root)
+                    .context("wfp verify --write-root")?;
                 let exe = std::env::current_exe().context("current_exe")?;
                 let exe = exe
                     .to_str()
@@ -1179,6 +1281,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     ],
                     env_overlay: Vec::new(),
                     write_restricted_token: true,
+                    capability_sids,
                 })
             } else {
                 runner::RunnerCmd::ProbeEgress {
@@ -1305,17 +1408,25 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 AclCmd::Grant {
                     holder_pid,
                     sandbox_user_sid,
+                    persistent,
                 },
         } => {
-            use srt_win::{acl, state_db};
+            use srt_win::{acl, persist, state_db};
             let holder = state_db::HolderPid(holder_pid);
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
             let input: AclGrantInput =
                 serde_json::from_str(&buf).context("parse stdin JSON {read:[…], write:[…]}")?;
-            let ((at, witnesses, failed), report) =
+            let has_denies = !input.deny_read.is_empty() || !input.deny_write.is_empty();
+            if has_denies && !persistent {
+                return Err(anyhow!(
+                    "acl grant: denyRead/denyWrite are read only with --persistent; \
+                     use `acl stamp`"
+                ));
+            }
+            let ((at, witnesses, failed, kept), report) =
                 state_db::with_init_lock(holder, false, |db| {
-                    let at = canonicalize_ace_targets(
+                    let mut at = canonicalize_ace_targets(
                         db,
                         "grant",
                         &[
@@ -1323,17 +1434,76 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
                         ],
                     )?;
+                    if !persistent {
+                        // These grants are for the ordinary token.
+                        let paths: Vec<String> =
+                            at.targets.iter().map(|(p, _)| p.clone()).collect();
+                        persist::clear_for_unrestricted_grant(db, &paths)?;
+                        for (p, e) in &at.bad_inputs {
+                            eprintln!("srt-win: skipped: '{p}': {e}");
+                        }
+                        let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                        return Ok((at, w, f, None));
+                    }
+                    let ids = persist::Ids::load()?;
+                    if ids.sandbox_user_sid.as_deref() != Some(sandbox_user_sid.as_str()) {
+                        return Err(anyhow!(
+                            "--sandbox-user-sid {sandbox_user_sid} is not the installed \
+                             sandbox user"
+                        ));
+                    }
+                    let denies = canonicalize_ace_targets(
+                        db,
+                        "deny",
+                        &[
+                            (&input.deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
+                            (
+                                &input.deny_write,
+                                acl::SbAce::Deny(acl::DenyMask::WriteDeny),
+                            ),
+                        ],
+                    )?;
+                    at.bad_inputs.extend(denies.bad_inputs);
                     for (p, e) in &at.bad_inputs {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
-                    let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
-                    Ok((at, w, f))
+                    let modify = acl::SbAce::Grant(acl::GrantMask::Modify);
+                    let roots: Vec<String> = at
+                        .targets
+                        .iter()
+                        .filter(|(_, a)| *a == modify)
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    let (kept, per_session_denies) =
+                        persist::apply(db, &ids, &roots, &denies.targets)?;
+                    // Per session, for the sandbox user SID as without
+                    // the flag: the read grants, and the denies under
+                    // no persistent root.
+                    let mut rest: Vec<(String, acl::SbAce)> = at
+                        .targets
+                        .iter()
+                        .filter(|(_, a)| *a != modify)
+                        .cloned()
+                        .collect();
+                    rest.extend(per_session_denies);
+                    let (w, f) = db.apply_aces(&sandbox_user_sid, &rest)?;
+                    at.targets.extend(denies.targets);
+                    Ok((at, w, f, Some(kept)))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
+            if let Some(k) = kept {
+                // `DACL write(s)` is the number of tree walks this
+                // session start paid for: 0 once every root is granted.
+                eprintln!(
+                    "srt-win: acl grant (persistent) — {} root(s): {} DACL write(s), \
+                     {} path(s) unchanged",
+                    k.roots, k.writes, k.unchanged,
+                );
+            }
             eprintln!(
                 "srt-win: acl grant — {} path(s) ({} fresh, {} \
                  already held{}{}); recovery pruned {} dead \
@@ -1368,6 +1538,62 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     bad_inputs.len()
                 );
                 std::process::exit(2);
+            }
+        }
+        Cmd::Acl {
+            sub: AclCmd::Forget { all, json, roots },
+        } => {
+            use srt_win::{path_id, persist, state_db};
+            if !all && roots.is_empty() {
+                return Err(anyhow!(
+                    "acl forget: name the roots to forget, or pass --all"
+                ));
+            }
+            let ids = persist::Ids::load()?;
+            // No holder of its own: the PID is this process's.
+            let holder = state_db::HolderPid(std::process::id());
+            let (out, _report) = state_db::with_init_lock(holder, false, |db| {
+                // A root that no longer resolves is looked up as
+                // given: it may be recorded under that spelling.
+                let targets: Vec<String> = roots
+                    .iter()
+                    .map(|r| {
+                        path_id::canonicalize_path(r)
+                            .map(|(c, _)| c)
+                            .unwrap_or_else(|_| r.clone())
+                    })
+                    .collect();
+                persist::forget(db, &ids, &targets, all)
+            })?;
+            let failed = out
+                .iter()
+                .filter(|(_, r)| matches!(r, persist::Forgot::Failed(_)))
+                .count();
+            eprintln!(
+                "srt-win: acl forget — {} root(s){}",
+                out.len(),
+                if failed > 0 {
+                    format!(", {failed} FAILED (still recorded)")
+                } else {
+                    String::new()
+                },
+            );
+            if json {
+                let entries: Vec<AceReleaseEntry> = out
+                    .iter()
+                    .map(|(p, r)| AceReleaseEntry {
+                        path: p.clone(),
+                        status: r.as_str(),
+                    })
+                    .collect();
+                serde_json::to_writer(std::io::stdout(), &entries)
+                    .context("write --json forget result")?;
+                println!();
+            }
+            if failed > 0 {
+                return Err(anyhow!(
+                    "acl forget: {failed} persistent grant(s) could not be removed"
+                ));
             }
         }
         Cmd::Acl {
@@ -1546,6 +1772,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             env,
             quiet,
             write_restricted_token,
+            write_root,
             target,
         } => {
             use srt_win::install;
@@ -1567,6 +1794,25 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     );
                     std::process::exit(15);
                 }
+            };
+
+            // Token shape. With the flag: the capability SIDs of the
+            // session's write roots — every one of them, or no exec.
+            // Without it: nothing may run while a persistent grant
+            // exists, since its sandbox-group ACE is all the ordinary
+            // token needs to write that tree.
+            let capability_sids = if write_restricted_token {
+                srt_win::persist::capability_sids_for(&write_root).context("exec --write-root")?
+            } else if let Some(why) = srt_win::persist::unrestricted_block_reason() {
+                eprintln!(
+                    "srt-win: error: refusing to run without \
+                     --write-restricted-token: {why}. A persistent grant lets \
+                     the sandbox account write its tree under the ordinary \
+                     token. Run `srt-win acl forget --all` first."
+                );
+                std::process::exit(20);
+            } else {
+                Vec::new()
             };
 
             // Share-lock current_exe() so a sandboxed child can't
@@ -1701,6 +1947,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     argv: target,
                     env_overlay,
                     write_restricted_token,
+                    capability_sids,
                 }),
                 quiet,
             ) {
@@ -2055,6 +2302,57 @@ mod tests {
                 }
             }
         ));
+        // --write-root: repeatable, on exec and on wfp verify, and
+        // only with the token flag.
+        let roots = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--write-restricted-token",
+            "--write-root",
+            r"C:\a",
+            "--write-root",
+            r"C:\b",
+            "--",
+            "cmd.exe",
+        ])
+        .expect("parse");
+        match roots.cmd {
+            Cmd::Exec { write_root, .. } => assert_eq!(write_root, [r"C:\a", r"C:\b"]),
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(
+            Cli::try_parse_from(["srt-win", "exec", "--write-root", r"C:\a", "--", "cmd.exe"])
+                .is_err()
+        );
+        let v_roots = Cli::try_parse_from([
+            "srt-win",
+            "wfp",
+            "verify",
+            "--target",
+            "127.0.0.1:1",
+            "--write-restricted-token",
+            "--write-root",
+            r"C:\a",
+        ])
+        .expect("parse");
+        match v_roots.cmd {
+            Cmd::Wfp {
+                sub: WfpCmd::Verify { write_root, .. },
+            } => assert_eq!(write_root, [r"C:\a"]),
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "srt-win",
+                "wfp",
+                "verify",
+                "--target",
+                "127.0.0.1:1",
+                "--write-root",
+                r"C:\a",
+            ])
+            .is_err()
+        );
         let probe = Cli::try_parse_from(["srt-win", "probe", "connect", "--target", "127.0.0.1:1"])
             .expect("parse");
         assert!(matches!(
@@ -2068,6 +2366,70 @@ mod tests {
     /// `probe token` and `probe parent-access` are CI smoke hooks:
     /// they parse only in a `test-hooks` build, so a default (shipped)
     /// binary does not have them at all.
+    #[test]
+    fn persistent_grant_subcommands_parse() {
+        let grant = |extra: &[&str]| {
+            let mut argv = vec![
+                "srt-win",
+                "acl",
+                "grant",
+                "--holder-pid",
+                "7",
+                "--sandbox-user-sid",
+                "S-1-5-21-1",
+            ];
+            argv.extend(extra);
+            match Cli::try_parse_from(argv).expect("parse").cmd {
+                Cmd::Acl {
+                    sub: AclCmd::Grant { persistent, .. },
+                } => persistent,
+                _ => panic!("wrong subcommand"),
+            }
+        };
+        assert!(!grant(&[]));
+        assert!(grant(&["--persistent"]));
+
+        let forget = |argv: &[&str]| Cli::try_parse_from(argv).map(|c| c.cmd);
+        assert!(matches!(
+            forget(&["srt-win", "acl", "forget", "--all", "--json"]),
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget {
+                    all: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+        match forget(&["srt-win", "acl", "forget", r"C:\a", r"C:\b"]) {
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget { all, roots, .. },
+            }) => {
+                assert!(!all);
+                assert_eq!(roots, [r"C:\a", r"C:\b"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        // Either every root or the named ones.
+        assert!(forget(&["srt-win", "acl", "forget", "--all", r"C:\a"]).is_err());
+
+        // The deny lists ride in the same stdin document.
+        let input: AclGrantInput = serde_json::from_str(
+            r#"{"read":["r"],"write":["w"],"denyRead":["dr"],"denyWrite":["dw"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (input.read, input.write, input.deny_read, input.deny_write),
+            (
+                vec!["r".to_owned()],
+                vec!["w".to_owned()],
+                vec!["dr".to_owned()],
+                vec!["dw".to_owned()]
+            )
+        );
+        let plain: AclGrantInput = serde_json::from_str(r#"{"write":["w"]}"#).unwrap();
+        assert!(plain.deny_read.is_empty() && plain.deny_write.is_empty());
+    }
+
     #[test]
     fn probe_test_hooks_follow_the_feature() {
         for sub in ["token", "parent-access"] {

@@ -114,6 +114,8 @@ export type WindowsSandboxErrorCode =
   | 'acl_stamp_failed'
   /** `srt-win acl grant` exited non-zero. */
   | 'acl_grant_failed'
+  /** `srt-win acl forget` could not remove every persistent grant. */
+  | 'acl_forget_failed'
   /** `srt-win exec` argv would exceed CreateProcessW's 32 767-char limit. */
   | 'argv_too_long'
   /** Sandbox user account / credential not present — run install. */
@@ -235,6 +237,18 @@ export interface WindowsSandboxUserStatus {
   caCertThumb?: string
   /** PEM-encoded install-time CA certificate, when present. */
   caCertPem?: string
+  /**
+   * Set when write grants kept by `windows.writeRestrictedToken`
+   * sessions exist (`present`, with their roots) or cannot be ruled
+   * out (`unknown`). While it is set, `srt-win` refuses to run a
+   * command under the ordinary token; `initialize()` without the
+   * option removes the grants first.
+   */
+  persistentGrants?: {
+    state: 'present' | 'unknown'
+    roots: string[]
+    reason?: string
+  }
 }
 
 /**
@@ -480,6 +494,14 @@ export interface WindowsSandboxParams {
    * shape first — {@link verifyWindowsWfpEgress} with the same flag.
    */
   writeRestrictedToken?: boolean
+  /**
+   * With {@link writeRestrictedToken}: the session's write roots, as
+   * granted by {@link grantWindowsAclPersistent}. Each is passed as
+   * `--write-root`, which puts the root's capability SID in the
+   * child token — without it the child cannot write the root.
+   * Ignored without the token option.
+   */
+  writeRoots?: readonly string[]
   /**
    * Inner shell. Defaults to `parseWindowsBinShell(undefined)`
    * (System32 cmd.exe). The child's post-`args` content is
@@ -839,6 +861,12 @@ type RawUserStatus = {
   real_user_sid: string
   ca_cert_thumb?: string | null
   ca_cert_pem?: string | null
+  /** Absent from an `srt-win` that keeps no grants between sessions. */
+  persistent_grants?: {
+    state: string
+    roots?: string[]
+    reason?: string
+  } | null
 }
 
 function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
@@ -857,6 +885,19 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
     realUserSid: raw.real_user_sid,
     ...(raw.ca_cert_thumb && { caCertThumb: raw.ca_cert_thumb }),
     ...(raw.ca_cert_pem && { caCertPem: raw.ca_cert_pem }),
+    // Anything but an explicit "none" counts: a state this code does
+    // not know must not read as "no grants".
+    ...(raw.persistent_grants &&
+      raw.persistent_grants.state !== 'none' && {
+        persistentGrants: {
+          state:
+            raw.persistent_grants.state === 'present' ? 'present' : 'unknown',
+          roots: raw.persistent_grants.roots ?? [],
+          ...(raw.persistent_grants.reason && {
+            reason: raw.persistent_grants.reason,
+          }),
+        },
+      }),
   }
 }
 
@@ -955,6 +996,9 @@ export async function getWindowsWfpStatusAsync(
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
+ * @param opts.writeRoots with `writeRestrictedToken`: the session's
+ *   write roots, so the probe child's token carries the same
+ *   capability SIDs a command of the session gets.
  * @param opts.writeRestrictedToken probe with the write-restricted
  *   child token instead of the default one (`srt-win wfp verify
  *   --write-restricted-token`: the connect is made by a lockdown
@@ -970,6 +1014,7 @@ export async function verifyWindowsWfpEgress(
     target?: string
     proxyPortRange?: readonly [number, number]
     writeRestrictedToken?: boolean
+    writeRoots?: readonly string[]
     srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
@@ -1008,6 +1053,7 @@ export async function verifyWindowsWfpEgress(
     const verifyArgs = ['wfp', 'verify', '--target', target]
     if (opts.writeRestrictedToken === true) {
       verifyArgs.push('--write-restricted-token')
+      for (const r of opts.writeRoots ?? []) verifyArgs.push('--write-root', r)
     }
     const r = runSrtWin(verifyArgs, {
       timeoutMs: 30_000,
@@ -2235,6 +2281,99 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 }
 
 /**
+ * Session start for `windows.writeRestrictedToken`: one `srt-win acl
+ * grant --persistent` carrying the grants and the deny lists.
+ *
+ * Each `write` path becomes a persistent root. It gets ACEs for the
+ * sandbox group and for a capability SID of its own — none for the
+ * sandbox user — and they are KEPT when the session ends:
+ * {@link revokeWindowsAclChecked} does not remove them,
+ * {@link forgetWindowsPersistentGrants} does. A root that already
+ * carries them costs one DACL read here instead of a walk of its
+ * tree. Deny targets under a persistent root are stamped for the
+ * sandbox group and kept with it; `read` grants and deny targets
+ * elsewhere are per-session, as with {@link grantWindowsAcl} and
+ * {@link stampWindowsAcl}, and are released the same way.
+ *
+ * Pass `write` to {@link wrapCommandWithSandboxWindows} as
+ * `writeRoots`.
+ *
+ * @throws on exit ≠ 0, including exit 2 (an input was skipped).
+ *   Nothing falls back to a per-session grant.
+ */
+export function grantWindowsAclPersistent(
+  opts: WindowsAclGrantOptions & {
+    denyRead: readonly string[]
+    denyWrite: readonly string[]
+  },
+): void {
+  const holder = opts.holderPid ?? process.pid
+  const stdin = JSON.stringify({
+    read: opts.read,
+    write: opts.write,
+    denyRead: opts.denyRead,
+    denyWrite: opts.denyWrite,
+  })
+  const r = runSrtWin(
+    [
+      'acl',
+      'grant',
+      '--holder-pid',
+      `${holder}`,
+      '--sandbox-user-sid',
+      opts.sandboxUserSid,
+      '--persistent',
+    ],
+    // A root's first grant walks its whole tree.
+    { timeoutMs: 600_000, stdin, srtWin: opts.srtWin },
+  )
+  logForDebugging(
+    `[Sandbox Windows] acl grant --persistent exit=${r.status}: ` +
+      `${r.stderr || r.stdout}`,
+  )
+  if (r.status !== 0) {
+    throw new WindowsSandboxError(
+      'acl_grant_failed',
+      `srt-win acl grant --persistent exited ${r.status} ` +
+        (r.status === 2 ? '(partial — some inputs skipped)' : '(failed)') +
+        `: ${r.stderr || r.stdout}`,
+    )
+  }
+}
+
+/**
+ * Remove every write grant kept by `windows.writeRestrictedToken`
+ * sessions (`srt-win acl forget --all`): one walk per root.
+ *
+ * A session WITHOUT the option must run this before it grants
+ * anything, whenever {@link WindowsSandboxUserStatus.persistentGrants}
+ * is set: a kept grant lets the sandbox account write its tree under
+ * the ordinary token.
+ *
+ * @throws if any grant could not be removed.
+ */
+export function forgetWindowsPersistentGrants(
+  opts: { srtWin?: SrtWinSpawn } = {},
+): void {
+  const r = runSrtWin(['acl', 'forget', '--all'], {
+    timeoutMs: 600_000,
+    srtWin: opts.srtWin,
+  })
+  logForDebugging(
+    `[Sandbox Windows] acl forget --all exit=${r.status}: ` +
+      `${r.stderr || r.stdout}`,
+  )
+  if (r.status !== 0) {
+    throw new WindowsSandboxError(
+      'acl_forget_failed',
+      `Write grants kept from sessions with ` +
+        `windows.writeRestrictedToken could not be removed (srt-win ` +
+        `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}`,
+    )
+  }
+}
+
+/**
  * Outcome of a revoke as the session teardown needs it.
  */
 export interface WindowsAclRevokeResult {
@@ -2437,7 +2576,10 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
   if (p.quiet !== false) argv.push('--quiet')
-  if (p.writeRestrictedToken === true) argv.push('--write-restricted-token')
+  if (p.writeRestrictedToken === true) {
+    argv.push('--write-restricted-token')
+    for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
+  }
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env
