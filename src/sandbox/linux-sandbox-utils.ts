@@ -422,17 +422,17 @@ export function linuxGetCwdMandatoryDenyPaths(
   // When .git doesn't exist at all, mounting at .git would block its
   // creation and break git init.
   const dotGitPath = path.resolve(cwd, '.git')
-  let dotGitIsDirectory: boolean | undefined
+  let dotGit: 'directory' | 'file' | 'absent' = 'absent'
   try {
-    dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
+    dotGit = fs.statSync(dotGitPath).isDirectory() ? 'directory' : 'file'
   } catch {
     // .git doesn't exist
   }
 
-  if (dotGitIsDirectory === false) {
+  if (dotGit === 'file') {
     denyPaths.push(dotGitPath)
   }
-  if (dotGitIsDirectory) {
+  if (dotGit === 'directory') {
     // Git hooks always blocked for security
     denyPaths.push(path.resolve(cwd, '.git/hooks'))
 
