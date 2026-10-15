@@ -143,6 +143,16 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
+          # The JVM proxy agent jar, so the J rows in winsrt.test.ts can
+          # drive a real JVM through the proxy from inside the sandbox.
+          # Built only where the runner image carries a JDK; without the
+          # jar (or without a java the sandbox user can launch) those
+          # rows skip and the rest of the suite is unaffected.
+          if ($env:JAVA_HOME -or (Get-Command javac -ErrorAction SilentlyContinue)) {
+            npm run build:java-agent
+          } else {
+            Write-Host '::notice::no JDK on this runner; winsrt J4 (JVM through the proxy) will skip'
+          }
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw

@@ -8,6 +8,16 @@
   (real user, full visibility of its own processes) and from INSIDE
   the sandbox (Win32_Process sweep as srt-sandbox).
 
+  Also proves the other half of what a JVM in the sandbox needs:
+  JAVA_TOOL_OPTIONS=-javaagent:<jar> (the JVM proxy agent, which reads
+  the token-bearing HTTPS_PROXY above from its own environment) rides
+  the SAME stdin frame - the TS wrapper composes the host's own
+  JAVA_TOOL_OPTIONS into it, which can hold -D secrets - arrives
+  byte-for-byte, backslashes intact, and is on no command line. The
+  agent reaching a host through the filtering proxy needs that proxy,
+  which lives in the TS layer: see the J rows in
+  test/sandbox/winsrt.test.ts.
+
   Self-contained: provisions the `srt-sandbox` account + WFP filters
   under a fixed test-only sublayer GUID via `srt-win install`, and
   tears them down in `finally`. The fixed GUID is also listed in
@@ -85,6 +95,11 @@ $InnerProbe = Join-Path $ProbeDir 'inner.ps1'
 # go missing in the VM while single trailing lines (CHILD-DONE)
 # arrive, so stdout parsing is only the fallback oracle.
 $CenvFile   = Join-Path $ProbeDir 'cenv.txt'
+# What the TS wrapper puts in the frame for JVMs. The jar need not
+# exist - nothing in this chain is a JVM; the row is about the value
+# surviving frame -> broker -> runner -> child unchanged. No quotes
+# (the frame JSON below escapes backslashes only).
+$Jto        = '-javaagent:' + (Join-Path $ProbeDir 'srt-proxy-agent.jar')
 
 $decoy = $null
 try {
@@ -224,7 +239,9 @@ try {
   # runner::decode_env_frame (vendor/srt-win-src/src/runner.rs,
   # reader); keep all three in sync.
   $proxyUrl = "http://sb:$Token@localhost:$PortLo"
-  $frameJson = '[["HTTP_PROXY","' + $proxyUrl + '"],["HTTPS_PROXY","' + $proxyUrl + '"]]'
+  $jtoJson   = $Jto.Replace('\', '\\')
+  $frameJson = '[["HTTP_PROXY","' + $proxyUrl + '"],["HTTPS_PROXY","' + $proxyUrl + '"],' +
+               '["JAVA_TOOL_OPTIONS","' + $jtoJson + '"]]'
   $frameBody = [Text.Encoding]::UTF8.GetBytes($frameJson)
   $frameLen  = [BitConverter]::GetBytes([UInt32]$frameBody.Length)
 
@@ -280,6 +297,7 @@ try {
   # misdiagnosis.
   Start-Sleep -Seconds 3
   $hostHits = Find-CmdlinesContaining $Token
+  $jtoHits  = Find-CmdlinesContaining $Jto
   $brokerRows = Find-CmdlinesContaining '--env-stdin'
   # 120s matches the RExec rows in smoke-exec.ps1: a cold Windows
   # PowerShell start as the sandbox user can take 20-30s on some images.
@@ -301,28 +319,28 @@ try {
 
   # -- S2b/S2c: frame-delivery breadcrumbs, localizing any S4 fail --
   # exec (non-quiet) prints 'launching runner as ... (overlay=N
-  # var(s))': N must be 4 (PATH + PATHEXT + the 2 frame vars). N=2
+  # var(s))': N must be 5 (PATH + PATHEXT + the 3 frame vars). N=2
   # with exit 0 means clap never saw --env-stdin (exec cannot exit 0
   # with the flag parsed but the frame unread - the read errors or
   # times out), i.e. the Arguments string was mangled.
-  if ($raw -notmatch 'overlay=4 var\(s\)') {
+  if ($raw -notmatch 'overlay=5 var\(s\)') {
     $srtLines = ($raw -split "`r?`n") | Where-Object { $_ -match 'srt-win:' }
-    throw ("S2b FAIL: exec did not report overlay=4 - the stdin frame " +
+    throw ("S2b FAIL: exec did not report overlay=5 - the stdin frame " +
            "vars never joined the overlay (flag lost or frame unread). " +
            "srt-win lines:`n" + ($srtLines -join "`n"))
   }
-  Write-Host 'S2b ok: exec merged the frame (overlay=4)'
+  Write-Host 'S2b ok: exec merged the frame (overlay=5)'
   # Runner debug line ('spec read (argv=N env_overlay=M)'): only
   # printed when the RUNNER's env has SANDBOX_RUNTIME_WIN_DEBUG,
   # which the broker-side setting above does NOT provide (the runner
   # starts from the sandbox user's profile env - lpEnvironment=NULL
   # across seclogon). Assert when present, note when absent.
   if ($raw -match 'env_overlay=(\d+)') {
-    if ($Matches[1] -ne '4') {
+    if ($Matches[1] -ne '5') {
       throw ("S2c FAIL: runner reported env_overlay=$($Matches[1]), " +
-             "expected 4 - the spec pipe dropped entries")
+             "expected 5 - the spec pipe dropped entries")
     }
-    Write-Host 'S2c ok: runner received all 4 overlay entries'
+    Write-Host 'S2c ok: runner received all 5 overlay entries'
   } else {
     Write-Host ('S2c skipped: no runner spec-read line (debug env does ' +
                 'not cross the seclogon boundary)')
@@ -338,7 +356,11 @@ try {
            "--env-stdin during the sweep window - the sweep timing " +
            "missed the chain; consider a longer child sleep")
   }
-  Write-Host 'S3 ok: host-side sweep - token on no command line; exec chain was live'
+  if ($jtoHits.Count -ne 0) {
+    throw ("S3 FAIL: frame-delivered JAVA_TOOL_OPTIONS visible on a command " +
+           "line (host sweep):`n" + ($jtoHits -join "`n"))
+  }
+  Write-Host 'S3 ok: host-side sweep - token and JAVA_TOOL_OPTIONS on no command line; exec chain was live'
 
   # -- Child-dump oracle: prefer the FILE the child wrote; fall back
   # to stdout parsing. (Cycle 4: the child's bulk stdout dump went
@@ -378,6 +400,22 @@ try {
            "`nsrt-win lines:`n" + ($srtLines -join "`n"))
   }
   Write-Host "S4 ok: token present in the sandboxed child environment ($oracleSrc)"
+
+  # -- S4b: JAVA_TOOL_OPTIONS reached the child exactly as framed -------
+  # Literal comparison, not -match: the value is a Windows path, and a
+  # regex would read its backslashes as escapes. Exact equality also
+  # proves no hop rewrote the path or appended anything - in
+  # particular not the token, which must stay in HTTPS_PROXY.
+  $jtoWant = "JAVA_TOOL_OPTIONS=$Jto"
+  $jtoEnv = @($dump | Where-Object {
+    ($_ -eq "CENVD=$jtoWant") -or ($_ -eq "CENV=$jtoWant")
+  })
+  if ($jtoEnv.Count -lt 1) {
+    $jtoSeen = @($dump | Where-Object { $_ -match '^CENVD?=JAVA_TOOL_OPTIONS=' })
+    throw ("S4b FAIL: child env lacks '$jtoWant'. oracle=$oracleSrc; " +
+           "JAVA_TOOL_OPTIONS line(s) seen:`n" + ($jtoSeen -join "`n"))
+  }
+  Write-Host "S4b ok: JAVA_TOOL_OPTIONS=-javaagent:... present in the child environment ($oracleSrc)"
 
   # -- S5: child-side view - own + parent + visible cmdlines token-free -
   $selfLine = $dump | Where-Object { $_ -match '^SELFCMD=' }

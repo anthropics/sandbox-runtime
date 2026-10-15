@@ -14,6 +14,10 @@ import {
   getGlobalNpmPathsAsync,
 } from '../../src/sandbox/generate-seccomp-filter.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
+import {
+  resolveSrtWin,
+  wrapCommandWithSandboxWindows,
+} from '../../src/sandbox/windows-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
@@ -145,6 +149,143 @@ describe.if(isMacOS)('macOS wrapper', () => {
       writeConfig: undefined,
     })
     expect(wrapped).not.toContain('JAVA_TOOL_OPTIONS')
+  })
+})
+
+// Pure object test — the Windows wrapper only builds an argv, so this runs
+// on every platform (srtWin.path is the test runner's own executable so the
+// existence check passes). What the child's environment receives is the
+// `--env` overlay plus the `--env-stdin` frame; the returned `env` is the
+// broker's. JAVA_TOOL_OPTIONS can carry the broker's own value (-D secrets
+// included), so it must reach the child through the frame only.
+describe('Windows wrapper (pure, all platforms)', () => {
+  const JAR = 'C:\\srt\\java-agent-x\\srt-proxy-agent.jar'
+  const TOKEN = 'tok-secret-not-for-argv'
+
+  function wrap(
+    extra: Partial<Parameters<typeof wrapCommandWithSandboxWindows>[0]> = {},
+    inherited?: string,
+  ) {
+    const saved = process.env.JAVA_TOOL_OPTIONS
+    if (inherited === undefined) delete process.env.JAVA_TOOL_OPTIONS
+    else process.env.JAVA_TOOL_OPTIONS = inherited
+    try {
+      const r = wrapCommandWithSandboxWindows({
+        command: 'mvn -q verify',
+        httpProxyPort: 60080,
+        socksProxyPort: 60080,
+        proxyAuthToken: TOKEN,
+        srtWin: resolveSrtWin({ path: process.execPath }),
+        ...extra,
+      })
+      const envArgs = r.argv.filter((_, i) => r.argv[i - 1] === '--env')
+      const frame: [string, string][] = r.stdinPayload
+        ? JSON.parse(r.stdinPayload.subarray(4).toString('utf8'))
+        : []
+      // Never on argv, in any form: command lines are readable by
+      // same-user sibling processes.
+      expect(envArgs.some(e => /^JAVA_TOOL_OPTIONS=/i.test(e))).toBe(false)
+      for (const a of r.argv) {
+        expect(a).not.toContain('-javaagent:')
+        if (inherited) expect(a).not.toContain(inherited)
+      }
+      return {
+        ...r,
+        frame,
+        jto: frame
+          .filter(([k]) => k === 'JAVA_TOOL_OPTIONS')
+          .map(([k, v]) => `${k}=${v}`),
+      }
+    } finally {
+      if (saved === undefined) delete process.env.JAVA_TOOL_OPTIONS
+      else process.env.JAVA_TOOL_OPTIONS = saved
+    }
+  }
+
+  it('injects the agent through the stdin frame: native path, no IPv4 flag', () => {
+    // No -Djava.net.preferIPv4Stack=true: the WFP loopback PERMIT matches
+    // the IPv4 connect a dual-stack socket makes (see the wrapper).
+    expect(wrap({ javaAgentJarPath: JAR }).jto).toEqual([
+      `JAVA_TOOL_OPTIONS=-javaagent:${JAR}`,
+    ])
+  })
+
+  it('keeps the credential off JAVA_TOOL_OPTIONS and off argv: it rides the stdin frame', () => {
+    const { argv, env, frame, jto } = wrap(
+      { javaAgentJarPath: JAR },
+      '-Dbroker.secret=hunter2',
+    )
+    expect(jto[0]).not.toContain('@')
+    for (const a of argv) expect(a).not.toContain(TOKEN)
+    // The broker (srt-win) is not a JVM: the variable is dropped from its
+    // spawn env rather than left as one more same-user-readable copy.
+    expect(env.JAVA_TOOL_OPTIONS).toBeUndefined()
+    // What the agent reads at JVM start: the proxy endpoint in the
+    // loopback port range, with the per-session token as its password.
+    const https = frame.find(([k]) => k === 'HTTPS_PROXY')![1]
+    expect(https).toMatch(
+      new RegExp(`^http://[^:@]+:${TOKEN}@localhost:60080$`),
+    )
+    expect(frame.find(([k]) => k === 'HTTP_PROXY')![1]).toBe(https)
+  })
+
+  it('still uses the frame when there is no auth token (external proxy)', () => {
+    const { argv, stdinPayload, frame } = wrap({
+      javaAgentJarPath: JAR,
+      proxyAuthToken: undefined,
+    })
+    expect(argv).toContain('--env-stdin')
+    expect(stdinPayload).toBeDefined()
+    expect(frame).toEqual([['JAVA_TOOL_OPTIONS', `-javaagent:${JAR}`]])
+  })
+
+  it('composes with an existing JAVA_TOOL_OPTIONS, agent first', () => {
+    expect(
+      wrap({ javaAgentJarPath: JAR }, '-Dfile.encoding=UTF-8 -Xmx1g').jto,
+    ).toEqual([
+      `JAVA_TOOL_OPTIONS=-javaagent:${JAR} -Dfile.encoding=UTF-8 -Xmx1g`,
+    ])
+  })
+
+  it('drops the existing value when JAVA_TOOL_OPTIONS is a denied credential', () => {
+    expect(
+      wrap(
+        { javaAgentJarPath: JAR, unsetEnvVars: ['JAVA_TOOL_OPTIONS'] },
+        '-Dsecret=1',
+      ).jto,
+    ).toEqual([`JAVA_TOOL_OPTIONS=-javaagent:${JAR}`])
+  })
+
+  it('composes against a mask sentinel rather than the real value', () => {
+    const { argv, jto } = wrap(
+      {
+        javaAgentJarPath: JAR,
+        setEnvVars: { JAVA_TOOL_OPTIONS: '-Dkey=SENTINEL' },
+      },
+      '-Dkey=real-secret',
+    )
+    expect(jto).toEqual([`JAVA_TOOL_OPTIONS=-javaagent:${JAR} -Dkey=SENTINEL`])
+    for (const a of argv) expect(a).not.toContain('real-secret')
+    // The sentinel is overridden in the frame, not also left on --env:
+    // srt-win requires the two channels' keys to be disjoint.
+    for (const a of argv) expect(a).not.toContain('SENTINEL')
+  })
+
+  it('double-quotes a jar path containing whitespace', () => {
+    const spaced = 'C:\\Users\\A B\\Temp\\srt-java-agent-x\\srt-proxy-agent.jar'
+    expect(wrap({ javaAgentJarPath: spaced }).jto).toEqual([
+      `JAVA_TOOL_OPTIONS="-javaagent:${spaced}"`,
+    ])
+  })
+
+  it('omits JAVA_TOOL_OPTIONS when there is no jar, even if the broker has one', () => {
+    // Without the agent nothing of the broker's is forwarded: the child
+    // keeps whatever its own profile environment carries.
+    const off = wrap({}, '-Dbroker.only=1')
+    expect(off.jto).toEqual([])
+    // …and the broker's own env is not touched either.
+    expect(off.env.JAVA_TOOL_OPTIONS).toBe('-Dbroker.only=1')
+    expect(wrap({}).jto).toEqual([])
   })
 })
 
