@@ -392,6 +392,30 @@ function makeableMountPoint(
   }
 }
 
+/** What the `.git` of a directory is, and so what is denied there. */
+enum DotGitKind {
+  /** A repository: its hooks and config are denied. */
+  Directory,
+  /**
+   * The pointer of a worktree or a submodule ("gitdir: /path/..."). There are
+   * no .git/hooks for as long as it is a file, so the file is denied, which
+   * keeps it one.
+   */
+  File,
+  /** Nothing is denied: a mount at .git would keep `git init` from making it. */
+  Absent,
+}
+
+function dotGitKindAt(dotGitPath: string): DotGitKind {
+  try {
+    return fs.statSync(dotGitPath).isDirectory()
+      ? DotGitKind.Directory
+      : DotGitKind.File
+  } catch {
+    return DotGitKind.Absent
+  }
+}
+
 /**
  * The part of the mandatory deny set that follows from the cwd alone: the
  * dangerous files and directories resolved against it, plus `.git/hooks` and
@@ -414,25 +438,15 @@ export function linuxGetCwdMandatoryDenyPaths(
     ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
   ]
 
-  // Git hooks and config are denied where .git is a directory.
-  // In a git worktree or a submodule .git is a file ("gitdir: /path/..."),
-  // and there are no .git/hooks for as long as it is one. So the file is
-  // denied, which keeps it one. Only here: one below the cwd is git's to
-  // rewrite and remove (a checkout that recurses into submodules does).
-  // When .git doesn't exist at all, mounting at .git would block its
-  // creation and break git init.
+  // Only the cwd's own: a .git file below it is git's to rewrite and remove
+  // (a checkout that recurses into submodules does).
   const dotGitPath = path.resolve(cwd, '.git')
-  let dotGit: 'directory' | 'file' | 'absent' = 'absent'
-  try {
-    dotGit = fs.statSync(dotGitPath).isDirectory() ? 'directory' : 'file'
-  } catch {
-    // .git doesn't exist
-  }
+  const dotGit = dotGitKindAt(dotGitPath)
 
-  if (dotGit === 'file') {
+  if (dotGit === DotGitKind.File) {
     denyPaths.push(dotGitPath)
   }
-  if (dotGit === 'directory') {
+  if (dotGit === DotGitKind.Directory) {
     // Git hooks always blocked for security
     denyPaths.push(path.resolve(cwd, '.git/hooks'))
 
