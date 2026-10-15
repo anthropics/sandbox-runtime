@@ -107,24 +107,17 @@ describe.if(isMacOS)('macOS pty rules: inherited-stdio terminal grant', () => {
     expect(profile).not.toContain(`(allow file-ioctl (literal "${TTY_A}"))`)
   })
 
-  it('treats allowPty:false identically to unset (inherited ioctl, no wide grant)', () => {
-    // `false` collapses into the default rather than emitting nothing: an
-    // explicit `false` and an absent flag must produce the same profile, so
-    // `false` cannot silently reproduce the raw-mode bug. Only `true` widens.
-    const asFalse = wrapCommandWithSandboxMacOS({
+  it('grants no terminal when allowPty is false, even with inherited ttys', () => {
+    // An explicit `false` opts out of every terminal rule.
+    const profile = wrapCommandWithSandboxMacOS({
       ...baseParams,
       allowPty: false,
       inheritedTtys: [TTY_A],
     })
-    const asUnset = wrapCommandWithSandboxMacOS({
-      ...baseParams,
-      inheritedTtys: [TTY_A],
-    })
 
-    expect(asFalse).toContain(`(allow file-ioctl (literal "${TTY_A}"))`)
-    expect(asFalse).not.toContain(PSEUDO_TTY)
-    expect(asFalse).not.toContain(BROAD_REGEX)
-    expect(asFalse).toBe(asUnset)
+    expect(profile).not.toContain(PSEUDO_TTY)
+    expect(profile).not.toContain(BROAD_REGEX)
+    expect(profile).not.toContain('/dev/ttys')
   })
 })
 
@@ -312,9 +305,9 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: resolver', () => {
     expect(JSON.parse(match![1])).toEqual({ without: false, with: true })
   })
 
-  it('allowPty:false resolves inherited ttys like unset (manager gate)', () => {
-    // Pins the `!== true` gate: an explicit `allowPty: false` still resolves
-    // and grants the inherited terminals, with ioctl only and no `pseudo-tty`.
+  it('allowPty:false grants no terminal even with inheritsStdio (manager gate)', () => {
+    // Pins the `=== undefined` gate: an explicit `allowPty: false` resolves no
+    // terminal and emits no pty rule.
     const probe = `
       import { SandboxManager } from ${JSON.stringify(join(import.meta.dir, '../../src/index.ts'))}
       await SandboxManager.initialize({
@@ -335,7 +328,7 @@ describe.if(isMacOS && hasDeps)('macOS pty rules: resolver', () => {
 
     expect(match).not.toBeNull()
     expect(JSON.parse(match![1])).toEqual({
-      hasInheritedDevice: true,
+      hasInheritedDevice: false,
       hasPseudoTty: false,
     })
   })

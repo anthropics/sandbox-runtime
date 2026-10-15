@@ -77,14 +77,14 @@ export interface MacOSSandboxParams {
   degradeToDenyPaths?: readonly string[]
   ignoreViolations?: IgnoreViolationsConfig | undefined
   /**
-   * Pseudo-terminal access. Unset and `false` grant `file-ioctl` on the
-   * terminals in `inheritedTtys`, which is what a TUI needs to enter raw mode.
-   * `true` grants every pty, for programs that allocate their own (tmux,
-   * script, node-pty).
+   * Pseudo-terminal access. Unset grants `file-ioctl` on the terminals in
+   * `inheritedTtys`, which is what a TUI needs to enter raw mode. `true`
+   * grants every pty, for programs that allocate their own (tmux, script,
+   * node-pty). `false` grants no terminal.
    */
   allowPty?: boolean
   /**
-   * Terminals to grant `file-ioctl` on when `allowPty` is not `true`. The
+   * Terminals to grant `file-ioctl` on when `allowPty` is unset. The
    * caller supplies them because it picks the child's stdio after this
    * function returns; see {@link resolveInheritedStdioTtys}. Entries that are
    * not pty slave devices are ignored.
@@ -1491,7 +1491,7 @@ function generateSandboxProfile({
     profile.push('  (literal "/dev/ptmx")')
     profile.push('  (regex #"^/dev/ttys")')
     profile.push(')')
-  } else if (ttyGrants.length > 0) {
+  } else if (allowPty === undefined && ttyGrants.length > 0) {
     // Without an ioctl rule on the inherited pty, TIOCSETA returns EPERM and no
     // TUI can enter raw mode (#419, #391). ioctl is all raw mode needs.
     profile.push('')

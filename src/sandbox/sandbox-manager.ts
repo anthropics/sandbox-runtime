@@ -1974,7 +1974,7 @@ export type WrapWithSandboxOptions = {
    * Set only when you spawn the wrapped command with `stdio: 'inherit'`. On
    * macOS the profile then grants `file-ioctl` on this process's terminals,
    * which a TUI needs to enter raw mode. The caller has to say so because it
-   * picks the child's stdio after wrapping. Ignored when `allowPty` is `true`.
+   * picks the child's stdio after wrapping. Ignored when `allowPty` is set.
    */
   inheritsStdio?: boolean
 }
@@ -2342,9 +2342,9 @@ async function wrapWithSandboxOnce(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        // allowPty: true already grants every pty; false behaves like unset
+        // true already grants every pty; false grants no terminal
         inheritedTtys:
-          allowPty !== true && options?.inheritsStdio
+          allowPty === undefined && options?.inheritsStdio
             ? resolveInheritedStdioTtys()
             : undefined,
         allowGitConfig: getAllowGitConfig(),
