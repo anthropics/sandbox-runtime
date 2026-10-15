@@ -2454,6 +2454,8 @@ async function wrapWithSandboxArgv(
   cwd?: string,
   options?: WrapWithSandboxOptions,
 ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
+  // Before the Windows branch, which does not go through wrapWithSandbox.
+  assertPtySlavePaths(options?.ttys ?? [])
   const platform = getPlatform()
 
   if (platform === 'windows') {
