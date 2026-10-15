@@ -59,6 +59,7 @@ import {
   type DirectLookup,
   openConnectTunnel,
   proxyAuthHeader,
+  onUpstreamError,
   relayResponseHead,
   selectParentProxyUrl,
   shouldBypassParentProxy,
@@ -1339,7 +1340,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         )
       }
 
-      proxyReq.on('error', failUpstream)
+      onUpstreamError(proxyReq, failUpstream)
 
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())

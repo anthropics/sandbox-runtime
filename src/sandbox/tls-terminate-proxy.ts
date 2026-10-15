@@ -59,6 +59,7 @@ import {
   directRequestOptions,
   type DirectRequestOptions,
   formatAuthority,
+  onUpstreamError,
   relayResponseHead,
   stripHopByHop,
 } from './parent-proxy.js'
@@ -1312,7 +1313,7 @@ async function forwardUpstream(
     },
   )
 
-  upstream.on('error', err => failUpstream(err, upstream))
+  onUpstreamError(upstream, err => failUpstream(err, upstream))
 
   res.on('close', () => upstream.destroy())
   if (bufferedBody !== undefined) {
