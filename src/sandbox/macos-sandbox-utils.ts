@@ -78,6 +78,13 @@ export interface MacOSSandboxParams {
   degradeToDenyPaths?: readonly string[]
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
+  /**
+   * Pty slave devices (`/dev/ttysNNN`) the caller hands the child as its
+   * terminal. Each gets `file-ioctl` as a literal, so the child can set
+   * termios and its foreground process group on that terminal and on no
+   * other. See {@link assertPtySlavePaths} for what is accepted.
+   */
+  ttys?: readonly string[]
   allowGitConfig?: boolean
   /**
    * Directories to emit as `safe.directory` via `GIT_CONFIG_*` env
@@ -1056,6 +1063,7 @@ function generateSandboxProfile({
   allowLocalBinding,
   allowMachLookup,
   allowPty,
+  ttys = [],
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
   allowAppleEvents = false,
@@ -1073,6 +1081,7 @@ function generateSandboxProfile({
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
   allowPty?: boolean
+  ttys?: readonly string[]
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
@@ -1394,6 +1403,15 @@ function generateSandboxProfile({
     profile.push('  (literal "/dev/ptmx")')
     profile.push('  (regex #"^/dev/ttys")')
     profile.push(')')
+  } else if (ttys.length > 0) {
+    // The child's own terminal only. Without file-ioctl on it, TIOCSETA and
+    // TIOCSPGRP fail with EPERM: a shell cannot turn off echo or run job
+    // control. The /dev/tty rule above does not cover an inherited slave fd.
+    profile.push('')
+    profile.push('; Pseudo-terminal: only the terminals the caller named')
+    for (const device of ttys) {
+      profile.push(`(allow file-ioctl (literal ${escapePath(device)}))`)
+    }
   }
 
   return profile.join('\n')
@@ -1404,6 +1422,25 @@ function generateSandboxProfile({
  */
 function escapePath(pathStr: string): string {
   return JSON.stringify(pathStr)
+}
+
+const PTY_SLAVE_PATH = /^\/dev\/ttys[0-9]{3,}$/
+
+/**
+ * Throws unless every entry is a pty slave device path (`/dev/ttys` and three
+ * or more digits). A grant on a terminal is a grant on whatever session holds
+ * it, so anything else — a pattern, a relative name, a link, another device —
+ * is refused instead of being dropped or approximated.
+ */
+export function assertPtySlavePaths(ttys: readonly string[]): void {
+  for (const device of ttys) {
+    if (typeof device !== 'string' || !PTY_SLAVE_PATH.test(device)) {
+      throw new Error(
+        `ttys: ${JSON.stringify(device)} is not a pty slave device ` +
+          '(expected /dev/ttys followed by three or more digits)',
+      )
+    }
+  }
 }
 
 /**
@@ -1432,12 +1469,17 @@ export function wrapCommandWithSandboxMacOS(
     maskedFileBinds,
     degradeToDenyPaths,
     allowPty,
+    ttys = [],
     allowGitConfig = false,
     gitSafeDirectories,
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
   } = params
+
+  // Before any early return: a malformed entry is refused even when nothing
+  // else would make this command sandboxed.
+  assertPtySlavePaths(ttys)
 
   // SBPL cannot redirect a read to different bytes, so whole-file masking
   // degrades to read-deny on macOS: the sandboxed process gets EPERM
@@ -1502,6 +1544,7 @@ export function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     allowMachLookup,
     allowPty,
+    ttys,
     allowGitConfig,
     enableWeakerNetworkIsolation,
     allowAppleEvents,
