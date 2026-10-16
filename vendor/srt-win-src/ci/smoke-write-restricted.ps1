@@ -488,6 +488,16 @@ try {
       } elseif ($flag -and -not $v.write_restricted_token) {
         Fail 'C: wfp verify --write-restricted-token did not report the token shape it probed'
       } else { Ok "C: wfp verify (write-restricted=$flag) reports blocked" }
+      # Observation, never a failure: no filter is keyed on the
+      # anonymous token, so under either child token a connect made
+      # while impersonating it is expected to get through to an
+      # off-loopback address (`anonymous-egress`) unless the kernel
+      # refuses the token itself (`denied`).
+      if ($v) {
+        Write-Host ("C obs: write-restricted=$flag anonymous_probe=$($v.anonymous_probe) " +
+                    "(target=$($v.anonymous_target)) anonymous_loopback_probe=$($v.anonymous_loopback_probe) " +
+                    "deny_only_probe=$($v.deny_only_probe) residuals=[$($v.residuals -join ',')]")
+      }
     }
     # The same connect from an ordinary sandboxed command. `probe
     # connect` exits 0 = refused by the fence, 3 = connected.

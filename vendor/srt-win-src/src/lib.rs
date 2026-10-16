@@ -28,6 +28,8 @@ pub mod winsta;
 
 pub mod acl;
 pub mod ambient;
+#[cfg(feature = "test-hooks")]
+pub mod parent_access;
 pub mod path_id;
 pub mod persist;
 pub mod reg;

@@ -38,27 +38,34 @@ pub enum RunnerCmd {
     /// `srt-win uninstall` deletes the profile. Exit non-zero on
     /// failure.
     InstallCa { der: crate::cert_store::CertDer },
-    /// `wfp verify` probe: attempt a direct TCP connect to `target`
-    /// (`host:port`) **as the sandbox user**. The WFP block-user
-    /// filter fires at `ALE_AUTH_CONNECT` — before any packet
-    /// leaves — so an active fence yields WSAEACCES immediately;
-    /// a missing fence lets the connect through. Exit **0** =
-    /// WSAEACCES (fence active), **3** = connected (fence
-    /// MISSING), **2** = any other error (timeout/unreachable —
-    /// the broker treats it as failure). Exit 1 is reserved for
-    /// the runner's own anyhow `Err` path so a malformed target
-    /// or future runner bug isn't misread as `connected`. No
-    /// desk/grants/lockdown — the probe runs as the bare runner
-    /// (same as [`InstallCa`](Self::InstallCa)); the WFP filter
-    /// keys on the user SID, which the runner already carries.
+    /// `wfp verify` probe: attempt direct TCP connects **as the
+    /// sandbox user**, one per token shape a sandboxed process can
+    /// present to the filtering engine — see [`crate::probe`].
+    /// `target` (`host:port`) is the loopback probe target;
+    /// `anonymous_target` the off-loopback one for the attempt made
+    /// while impersonating the anonymous token (`None` skips it).
     ///
-    /// This is the probe for the **default** child token. With the
-    /// write-restricted token the child's token differs from the
-    /// runner's in a way the filter's access check can see, so `wfp
-    /// verify --write-restricted-token` does not use this command: it
-    /// sends an [`Exec`](Self::Exec) of `srt-win probe connect`, so
-    /// the connect is made by a process holding the child token.
-    ProbeEgress { target: String },
+    /// A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
+    /// leaves — so a fenced connect yields WSAEACCES immediately. The
+    /// runner exits with every result encoded
+    /// ([`crate::probe::Report::encode`]); exit 1 stays reserved for
+    /// the runner's own anyhow `Err` path, and never decodes as a
+    /// report. No desk/grants/lockdown — the probe runs as the bare
+    /// runner (same as [`InstallCa`](Self::InstallCa)); the filters
+    /// key on the token, which the runner already carries.
+    ///
+    /// This is the probe for the **ordinary** child token. The
+    /// write-restricted token differs from the runner's in a way a
+    /// filter's access check can see, so `wfp verify
+    /// --write-restricted-token` does not use this command: it sends
+    /// an [`Exec`](Self::Exec) of `srt-win probe fence`, which runs
+    /// the same attempts from a process holding the child token and
+    /// exits with the same encoded report.
+    ProbeEgress {
+        target: String,
+        #[serde(default)]
+        anonymous_target: Option<String>,
+    },
 }
 
 /// Inputs to a single [`RunnerCmd::Exec`].
@@ -155,7 +162,10 @@ pub fn run() -> Result<u32> {
             );
             Ok(0)
         }
-        RunnerCmd::ProbeEgress { target } => crate::probe::connect(&target),
+        RunnerCmd::ProbeEgress {
+            target,
+            anonymous_target,
+        } => Ok(crate::probe::run(&target, anonymous_target.as_deref())?.encode()),
     }
 }
 
@@ -205,11 +215,25 @@ mod tests {
         ));
         let probe = RunnerCmd::ProbeEgress {
             target: "127.0.0.1:49999".into(),
+            anonymous_target: Some("192.0.2.7:49999".into()),
         };
         let bytes = encode_cmd(&probe).unwrap();
         let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
-            back, RunnerCmd::ProbeEgress { target } if target == "127.0.0.1:49999"
+            back,
+            RunnerCmd::ProbeEgress { target, anonymous_target }
+                if target == "127.0.0.1:49999"
+                    && anonymous_target.as_deref() == Some("192.0.2.7:49999")
+        ));
+        // The off-loopback target is optional on the wire.
+        let back: RunnerCmd =
+            serde_json::from_str(r#"{"ProbeEgress":{"target":"127.0.0.1:1"}}"#).unwrap();
+        assert!(matches!(
+            back,
+            RunnerCmd::ProbeEgress {
+                anonymous_target: None,
+                ..
+            }
         ));
     }
 }

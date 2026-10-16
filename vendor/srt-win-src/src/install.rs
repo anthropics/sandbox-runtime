@@ -361,6 +361,79 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
     }))
 }
 
+/// Registry value holding the [`crate::wfp::FENCE_REVISION`] of the
+/// filter set the last completed `srt-win install` wrote, or
+/// [`crate::wfp::FENCE_REVISION_REMOVED`] after an uninstall removed
+/// the filters.
+const FENCE_REVISION_VALUE: &str = "FenceRevision";
+
+/// Record that the filter set at `rev` is installed. Called by the
+/// elevated install only AFTER the WFP transaction commits, so the
+/// value never claims filters that were not written.
+pub fn write_fence_revision(rev: u32) -> Result<()> {
+    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
+    base.set_dword(FENCE_REVISION_VALUE, rev)
+}
+
+/// Record that the filters are being removed: the value is reset to
+/// [`crate::wfp::FENCE_REVISION_REMOVED`]. No-op when the machine has
+/// no install record.
+///
+/// Every path that deletes filters calls this FIRST and deletes the
+/// filters only if it succeeded. The record and the filters are two
+/// stores with no common transaction, so they can disagree after a
+/// failure; this order (and install's opposite one — filters first,
+/// record second) makes the only possible disagreement "filters
+/// present, record says removed or older". That reads as `absent` or
+/// `outdated`, never as a current fence that is not there.
+///
+/// The record is machine-wide and filters live under a sublayer:
+/// removing the filters of one sublayer marks the fence removed even
+/// if another sublayer still holds a set. That errs the same safe
+/// way, and re-running `srt-win install` restores the record.
+pub fn mark_fence_removed() -> Result<()> {
+    match crate::reg::Key::open(crate::reg::BASE, true)? {
+        Some(base) => base.set_dword(FENCE_REVISION_VALUE, crate::wfp::FENCE_REVISION_REMOVED),
+        None => Ok(()),
+    }
+}
+
+/// Whether the record says an uninstall removed the filters. A read
+/// error is "no".
+pub fn fence_marked_removed() -> bool {
+    matches!(
+        read_fence_revision(),
+        Ok(Some(crate::wfp::FENCE_REVISION_REMOVED))
+    )
+}
+
+/// The recorded fence revision. `Ok(None)` when no install has run,
+/// or when the install that ran predates the record;
+/// [`crate::wfp::FENCE_REVISION_REMOVED`] once an uninstall has
+/// removed the filters and kept the account.
+///
+/// This is what the non-elevated broker has in place of filter
+/// enumeration (which is admin-only): it says which filter set the
+/// last install wrote, not that the filters are still there —
+/// `srt-win wfp verify` is what shows that.
+pub fn read_fence_revision() -> Result<Option<u32>> {
+    let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
+        return Ok(None);
+    };
+    base.get_dword(FENCE_REVISION_VALUE)
+}
+
+/// `Err` with the operator-facing explanation unless the recorded
+/// fence revision is the one this build requires.
+pub fn require_current_fence() -> std::result::Result<(), String> {
+    let have = read_fence_revision().map_err(|e| format!("read fence revision: {e:#}"))?;
+    if have == Some(crate::wfp::FENCE_REVISION) {
+        Ok(())
+    } else {
+        Err(crate::wfp::outdated_hint(have))
+    }
+}
+
 /// Read the recorded MITM CA (DER), if `srt-win user trust-ca`
 /// ever ran. `Ok(None)` when no install has run or no CA
 /// is recorded.
@@ -492,6 +565,7 @@ pub fn clear_setup() -> Result<()> {
             "SandboxGroupSid",
             "MarkerVersion",
             "CreatedAt",
+            FENCE_REVISION_VALUE,
         ] {
             crate::reg::delete_value(&base, v)?;
         }

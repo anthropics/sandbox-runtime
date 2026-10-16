@@ -99,6 +99,8 @@ export type {
   WindowsAclGrantOptions,
   WindowsAclAceOutcome,
   WindowsAclRevokeResult,
+  WindowsWfpProbeOutcome,
+  WindowsWfpResidual,
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,

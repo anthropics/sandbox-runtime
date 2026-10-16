@@ -202,6 +202,10 @@ enum Cmd {
     ///
     /// Requires `srt-win install` to have provisioned the user, by a
     /// build with this one's setup version; otherwise exits **15**.
+    /// Exits **19**, without launching anything, when the install
+    /// record says the WFP filter set was written by an earlier
+    /// build (and so lacks filters this one requires) or was removed
+    /// by an uninstall — re-run `srt-win install`.
     Exec {
         /// Per-exec read-deny: add an additive `(D;OICI;FA;;;<sb>)`
         /// ACE for the sandbox user on `<PATH>` (and a parent
@@ -280,7 +284,7 @@ enum Cmd {
     Runner,
     /// Self-checks that report what the calling process's own token
     /// can do. `wfp verify --write-restricted-token` runs `probe
-    /// connect` as the sandboxed child. Not intended to be invoked
+    /// fence` as the sandboxed child. Not intended to be invoked
     /// directly.
     #[command(hide = true)]
     Probe {
@@ -291,12 +295,28 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum ProbeCmd {
-    /// Attempt a direct TCP connect to `--target`. Exits **0** when
-    /// the WFP fence refused it (`WSAEACCES`), **3** when it
-    /// connected, **2** on any other error.
+    /// Attempt one direct TCP connect to `--target` under this
+    /// process's own token. Exits **0** when the WFP fence refused it
+    /// (`WSAEACCES`), **3** when it connected, **2** on any other
+    /// error.
     Connect {
         #[arg(long)]
         target: String,
+    },
+    /// Run the fence probe (`srt_win::probe::run`) from this process:
+    /// direct TCP connects under its own token and under each token
+    /// shape it can assume, to `--target` and `--anonymous-target`.
+    /// Exits with the encoded report (`probe::Report::encode`), or 1
+    /// when the probe could not run. One line per connect goes to
+    /// stderr; stdout is left alone.
+    Fence {
+        /// The loopback probe target (`host:port`).
+        #[arg(long)]
+        target: String,
+        /// The off-loopback target (`host:port`); the attempts aimed
+        /// at it are skipped without it.
+        #[arg(long)]
+        anonymous_target: Option<String>,
     },
     /// Print this process's token restriction as JSON:
     /// `{write_restricted, restricted_sids}`. CI smoke hook: only in
@@ -721,6 +741,22 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
     }))
 }
 
+/// `wfp::filter_status` with the install record's fence revision
+/// folded in — the `wfp` object both status commands print.
+fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::WfpStatus> {
+    use srt_win::{install, wfp};
+    // No install record → nothing to compare against. A record whose
+    // revision cannot be read is treated as carrying none.
+    let record = install::read_setup()
+        .ok()
+        .flatten()
+        .map(|_| install::read_fence_revision().ok().flatten());
+    Ok(wfp::apply_recorded_revision(
+        wfp::filter_status(sublayer)?,
+        record,
+    ))
+}
+
 /// Install-time ambient write-deny state: the recorded paths (HKLM
 /// `AmbientDenies` — admin-written, trustworthy) plus whether each
 /// deny ACE is on disk (an admin `icacls /reset` clears it;
@@ -810,25 +846,75 @@ enum WfpCmd {
     /// `FwpmFilterCreateEnumHandle0` is admin-gated, so a
     /// non-elevated caller gets `{state:"cannot-read", hint:…}`
     /// (exit 0). The non-elevated readiness check is `wfp verify`.
+    ///
+    /// `state:"outdated"` (with a `hint`) means the filter set was
+    /// written by an earlier build and lacks filters this build
+    /// requires — re-run `srt-win install`. An elevated caller reads
+    /// that off the filters; a non-elevated one off the install
+    /// record.
     Status {
         #[arg(long)]
         sublayer_guid: Option<String>,
     },
     /// Behavioral egress-block probe — the non-elevated readiness
     /// check for the WFP fence. Spawns the runner as `srt-sandbox`
-    /// (via `CreateProcessWithLogonW`) which attempts a direct TCP
-    /// connect to `target`.
+    /// (via `CreateProcessWithLogonW`), which attempts direct TCP
+    /// connects under each token shape a sandboxed process can
+    /// present (`srt_win::probe`).
     ///
-    /// Prints `{"egress_probe":"blocked"|"connected"|"unreachable",
-    /// "target":…}` and exits **0** (blocked = fence active),
-    /// **3** (connected = fence MISSING), **2** (unreachable =
-    /// timeout/no-route; treat as failure), or **15** when the
-    /// sandbox user is not provisioned. Any other code (including
-    /// 1, the runner's own anyhow `Err` path) maps to
-    /// `egress_probe:"error"`. Does not require elevation. This
-    /// is the non-elevated readiness check the host's
-    /// `initialize()` runs; `wfp status` is the elevated
-    /// ground-truth enum.
+    /// Prints one JSON line. Each `*_probe` is `blocked`,
+    /// `connected`, `refused`, `unreachable`, `skipped`, `error` or
+    /// `denied` (the kernel refused to let the probing process
+    /// impersonate that token, so no connect could be made under it):
+    ///
+    ///   - `egress_probe` — own token, to `target`.
+    ///   - `anonymous_probe` — impersonating the anonymous token, to
+    ///     `anonymous_target`.
+    ///   - `anonymous_loopback_probe` — impersonating the anonymous
+    ///     token, to `target`.
+    ///   - `deny_only_probe` — a copy of the own token with the user
+    ///     SID deny-only, to `target`.
+    ///   - `low_integrity_probe`, `low_integrity_loopback_probe` — a
+    ///     copy of the own token at low integrity, to
+    ///     `anonymous_target` and to `target`.
+    ///   - `untrusted_integrity_probe`,
+    ///     `untrusted_integrity_loopback_probe` — the same at
+    ///     untrusted integrity.
+    ///   - `residuals` — names of the gaps `anonymous_probe`,
+    ///     `anonymous_loopback_probe` and `deny_only_probe` found
+    ///     open (`anonymous-egress`, `anonymous-loopback`,
+    ///     `deny-only-user-sid`). The filters do not close these;
+    ///     they are reported, with a warning on stderr, and do not
+    ///     change the exit code. `anonymous-egress` is expected
+    ///     wherever the machine has an off-loopback address: no
+    ///     filter is keyed on the anonymous token.
+    ///
+    /// Every probe but `egress_probe` makes its connect twice: once
+    /// on a socket created before the token is assumed and once on a
+    /// socket created after, since the engine attributes a connect
+    /// to the token in effect when its socket was created. The JSON
+    /// carries the worse of the two results for the fence; stderr
+    /// carries one line per ordering, each naming it (`socket before
+    /// token`, `socket after token`).
+    ///
+    /// Every other probe must be blocked: `egress_probe` and the
+    /// four lowered-integrity ones, whose token still carries the
+    /// sandbox account's SID. Exits **0**
+    /// (all of them were blocked, or skipped for want of an
+    /// off-loopback address = fence active), **3** (one got past the
+    /// filters = fence MISSING), **2** (one was inconclusive — `error`
+    /// means no connect was made under the token: it could not be
+    /// assumed, or did not read back as assumed once the socket
+    /// existed, which is not a block; treat as failure; `denied`
+    /// counts the same unless `--write-restricted-token` is given,
+    /// where the probing process holds a command's own token and a
+    /// refused identity is closed), **19** when the
+    /// install record says the filter set predates this build, or
+    /// **15** when the sandbox user is not provisioned. A runner
+    /// exit that is not a probe report prints every probe as
+    /// `error` and exits 1. Does not require elevation. This is the
+    /// non-elevated readiness check the host's `initialize()` runs;
+    /// `wfp status` is the elevated ground-truth enum.
     Verify {
         /// Probe target (`host:port`). The host binds a local
         /// listener on an ephemeral loopback port OUTSIDE the WFP
@@ -838,9 +924,9 @@ enum WfpCmd {
         #[arg(long)]
         target: String,
         /// Probe with the token `exec --write-restricted-token` gives
-        /// the child, instead of the default one. The connect is then
-        /// made by a lockdown child (`srt-win probe connect`) holding
-        /// that token, because the WFP block filter matches by an
+        /// the child, instead of the default one. Every attempt is then
+        /// made by a lockdown child (`srt-win probe fence`) holding
+        /// that token, because a WFP block filter matches by an
         /// access check of the connecting token and a restricted
         /// token is checked differently from the runner's. A host
         /// that runs commands with `--write-restricted-token` must
@@ -855,6 +941,15 @@ enum WfpCmd {
             requires = "write_restricted_token"
         )]
         write_root: Vec<String>,
+        /// Off-loopback target (`host:port`) for the attempt made
+        /// while impersonating the anonymous token, and for the
+        /// lowered-integrity attempts' off-loopback half. Default: this
+        /// machine's own outbound address at `target`'s port —
+        /// nothing needs to listen there, since a refused connect
+        /// shows the filters let it through just as a completed one
+        /// does. With no such address the attempt is skipped.
+        #[arg(long)]
+        anonymous_target: Option<String>,
     },
     /// Remove every srt-win-tagged WFP filter under the sublayer.
     /// Self-elevates via UAC if not already admin.
@@ -910,9 +1005,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // stamping step below (env reads + a stat per entry).
             let ambient_targets = srt_win::ambient::ambient_deny_targets();
             let name_changed = existing.as_ref().is_some_and(|s| s.sandbox_user != name);
+            // An `outdated` set (written by an earlier build) takes
+            // the same conflict check but never the early-out: it
+            // falls through and is replaced.
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
-                && st.state == "installed"
+                && matches!(st.state, "installed" | "outdated")
             {
                 let want = [range.0, range.1];
                 if st.port_range != Some(want) || name_changed {
@@ -952,9 +1050,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // missing/undecryptable Cred\Blob with a healthy
                 // marker must fall through and be rewritten rather
                 // than early-outing on "already installed".
+                // So is the fence: the enumerated set and the
+                // install record must both be at this build's
+                // revision.
                 if us.exists
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
+                    && st.state == "installed"
+                    && install::require_current_fence().is_ok()
                     && install::cred_present()
                     && ambient_ok()
                 {
@@ -983,17 +1086,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 }
                 match mv {
                     // An install by a build with another setup
-                    // version: the same steps bring it to this one.
+                    // version: the same steps bring it to this one,
+                    // and rewrite the filter set at this build's
+                    // revision.
                     Some(v) if v != install::SETUP_VERSION => eprintln!(
                         "srt-win: existing install has setup version {v}; \
-                         upgrading it to {}",
+                         upgrading it to {} (fence={})",
                         install::SETUP_VERSION,
+                        st.state,
                     ),
                     _ => eprintln!(
-                        "srt-win: partial install detected \
-                         (user_provisioned={}, marker_version={:?}) — \
-                         completing",
-                        us.exists, mv,
+                        "srt-win: partial or out-of-date install detected \
+                         (user_provisioned={}, marker_version={:?}, \
+                         fence={}) — completing",
+                        us.exists, mv, st.state,
                     ),
                 }
                 // Fall through; the steps are idempotent.
@@ -1082,6 +1188,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
             }
+            // Only now that the filters are committed: record their
+            // revision for the non-elevated broker, which cannot
+            // enumerate them.
+            if let Err(e) = install::write_fence_revision(wfp::FENCE_REVISION) {
+                eprintln!("srt-win: error: record WFP fence revision: {e:#}");
+                std::process::exit(12);
+            }
             // Best-effort migration: a pre-v2-e install left the
             // legacy `sandbox-runtime-net` discriminator group.
             // Remove it now (idempotent on NERR_GroupNotFound).
@@ -1135,6 +1248,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
+            // Record first, filters second — see
+            // `install::mark_fence_removed` for why that order.
+            srt_win::install::mark_fence_removed().context("mark WFP fence removed")?;
             let n = wfp::uninstall_filters(&sl)?;
             // Read setup up front: the ambient cleanup and the
             // deprovision fallback both need the recorded name/SID
@@ -1200,7 +1316,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 "{}",
                 json!({
                     "user": user_status_json()?,
-                    "wfp": wfp::filter_status(&sl)?,
+                    "wfp": wfp_status(&sl)?,
                     "ambient": ambient_status_json()?,
                 })
             );
@@ -1242,7 +1358,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sub: WfpCmd::Status { sublayer_guid },
         } => {
             let sl = resolve_sublayer(&sublayer_guid)?;
-            let st = wfp::filter_status(&sl)?;
+            let st = wfp_status(&sl)?;
             println!("{}", serde_json::to_string(&st)?);
         }
         Cmd::Wfp {
@@ -1251,15 +1367,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     target,
                     write_restricted_token,
                     write_root,
+                    anonymous_target,
                 },
         } => {
-            use srt_win::{install, logon, runner};
-            // The WFP BLOCK fires at ALE_AUTH_CONNECT before any
-            // packet leaves, so an active fence gives WSAEACCES
-            // (~0ms, exit 0); a MISSING fence lets the connect
-            // succeed (exit 3). The host passes a local loopback
-            // listener bound outside the WFP permit range so
-            // fence-missing is distinguishable from fence-active
+            use srt_win::{install, logon, probe, runner};
+            // A BLOCK fires at ALE_AUTH_CONNECT before any packet
+            // leaves, so a fenced connect gives WSAEACCES (~0ms); a
+            // MISSING fence lets it through. The host passes a local
+            // loopback listener bound outside the WFP permit range
+            // so fence-missing is distinguishable from fence-active
             // without depending on any external host.
             let r = install::read_cred().and_then(|c| {
                 let s = install::read_setup()?
@@ -1273,15 +1389,58 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            // Ordinary token: the bare runner connects. Its token and
-            // the ordinary child token give the filter's access check
-            // the same answer. Write-restricted token: the runner
-            // launches this binary's `probe connect` as a lockdown
-            // child, so the connect is made under the exact token
-            // (and job, desktop, mitigations) a sandboxed command
-            // gets. A probe child that cannot be created exits the
-            // runner with 1, which is reported as `error` below —
-            // never as `blocked`.
+            // Every document this arm prints says which token the
+            // probe was for.
+            let finish = |mut doc: serde_json::Value, exit: i32| -> ! {
+                if write_restricted_token {
+                    doc["write_restricted_token"] = json!(true);
+                }
+                println!("{doc}");
+                // `process::exit`'s rt::cleanup flushes stdout, but
+                // be explicit — this arm prints to stdout and then
+                // `process::exit`s instead of returning Ok(()).
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                std::process::exit(exit)
+            };
+            // The install record is checked before probing: a filter
+            // set from an earlier build is refused by name, with the
+            // repair, instead of by whichever attempt happens to get
+            // through. A record that says the filters were REMOVED
+            // is not refused here: the probe then shows the missing
+            // fence itself (exit 3), which is the stronger answer.
+            if !install::fence_marked_removed()
+                && let Err(hint) = install::require_current_fence()
+            {
+                eprintln!("srt-win: error: wfp verify: {hint}");
+                finish(
+                    json!({
+                        "egress_probe": "not-run",
+                        "target": target,
+                        "outdated": true,
+                        "hint": hint,
+                    }),
+                    probe::EXIT_FENCE_OUTDATED,
+                );
+            }
+            let anonymous_target = anonymous_target.or_else(|| {
+                let port = target.parse::<std::net::SocketAddr>().ok()?.port();
+                probe::off_loopback_target(port).map(|a| a.to_string())
+            });
+            // The same attempts either way ([`probe::run`]); what
+            // differs is the process that makes them.
+            //
+            // Ordinary token: the bare runner. Its token and the
+            // ordinary child token give a filter's access check the
+            // same answer.
+            //
+            // Write-restricted token: the runner launches this
+            // binary's `probe fence` as a lockdown child, so every
+            // attempt starts from the exact token (and job, desktop,
+            // mitigations) a sandboxed command gets, and the child's
+            // exit code — the encoded report — becomes the runner's. A
+            // probe child that cannot be created exits the runner
+            // with 1, which does not decode and is reported as
+            // `error` below — never as `blocked`.
             let cmd = if write_restricted_token {
                 // The probe child's restricting SIDs are the ones a
                 // command of this session gets. A root with no
@@ -1293,15 +1452,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let exe = exe
                     .to_str()
                     .ok_or_else(|| anyhow!("current_exe is not UTF-8"))?;
+                let mut argv = vec![
+                    exe.to_owned(),
+                    SRT_WIN_DISPATCH_ARG1.to_owned(),
+                    "probe".to_owned(),
+                    "fence".to_owned(),
+                    "--target".to_owned(),
+                    target.clone(),
+                ];
+                if let Some(t) = &anonymous_target {
+                    argv.extend(["--anonymous-target".to_owned(), t.clone()]);
+                }
                 runner::RunnerCmd::Exec(runner::RunnerSpec {
-                    argv: vec![
-                        exe.to_owned(),
-                        SRT_WIN_DISPATCH_ARG1.to_owned(),
-                        "probe".to_owned(),
-                        "connect".to_owned(),
-                        "--target".to_owned(),
-                        target.clone(),
-                    ],
+                    argv,
                     env_overlay: Vec::new(),
                     write_restricted_token: true,
                     capability_sids,
@@ -1309,34 +1472,75 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             } else {
                 runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
+                    anonymous_target: anonymous_target.clone(),
                 }
             };
             let code = logon::spawn_runner(&cred.user, &cred.pw, &sb_sid, None, &cmd, false)
                 .context("spawn runner for egress probe")?;
-            let probe = match code {
-                0 => "blocked",
-                3 => "connected",
-                2 => "unreachable",
-                // 1 is the runner's own anyhow `Err` path
-                // (`main()` → `eprintln!` + `exit(1)`); anything
-                // else is an unmapped runner state. Neither is a
-                // valid probe outcome.
-                _ => "error",
+            let Some(report) = probe::Report::decode(code) else {
+                // 1 is the runner's own anyhow `Err` path (`main()`
+                // → `eprintln!` + `exit(1)`); anything else is an
+                // unmapped runner state. Neither is a probe result.
+                finish(
+                    json!({
+                        "egress_probe": "error",
+                        "anonymous_probe": "error",
+                        "anonymous_loopback_probe": "error",
+                        "deny_only_probe": "error",
+                        "low_integrity_probe": "error",
+                        "low_integrity_loopback_probe": "error",
+                        "untrusted_integrity_probe": "error",
+                        "untrusted_integrity_loopback_probe": "error",
+                        "target": target,
+                        "anonymous_target": anonymous_target,
+                        "residuals": [],
+                        "runner_exit": code,
+                    }),
+                    1,
+                );
             };
-            let mut out = json!({
-                "egress_probe": probe,
-                "target": target,
-                "runner_exit": code,
-            });
-            if write_restricted_token {
-                out["write_restricted_token"] = json!(true);
+            // Under the write-restricted token the report is the
+            // child's own, so an identity the kernel refused it is
+            // closed; see `probe::verdict`.
+            let verdict = probe::verdict(&report, write_restricted_token);
+            for residual in &verdict.residuals {
+                eprintln!(
+                    "srt-win: warning: wfp verify: residual '{residual}': {}",
+                    match *residual {
+                        probe::RESIDUAL_ANONYMOUS_EGRESS =>
+                            "a connect to an off-loopback destination made \
+                             while impersonating the anonymous token is not \
+                             blocked: no filter is keyed on that token \
+                             (see the per-ordering lines above)",
+                        probe::RESIDUAL_ANONYMOUS_LOOPBACK =>
+                            "a connect to a loopback destination made while \
+                             impersonating the anonymous token is not blocked \
+                             (see the per-ordering lines above)",
+                        _ =>
+                            "a connect made under a copy of the sandbox token \
+                             whose user SID is deny-only is not blocked \
+                             (see the per-ordering lines above)",
+                    },
+                );
             }
-            println!("{out}");
-            // `process::exit`'s rt::cleanup flushes stdout, but be
-            // explicit — this is the only arm that prints to stdout
-            // and then `process::exit`s instead of returning Ok(()).
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-            std::process::exit(code as i32);
+            finish(
+                json!({
+                    "egress_probe": report.plain.label(),
+                    "anonymous_probe": report.anonymous.label(),
+                    "anonymous_loopback_probe": report.anonymous_loopback.label(),
+                    "deny_only_probe": report.deny_only.label(),
+                    "low_integrity_probe": report.low_integrity.label(),
+                    "low_integrity_loopback_probe": report.low_integrity_loopback.label(),
+                    "untrusted_integrity_probe": report.untrusted_integrity.label(),
+                    "untrusted_integrity_loopback_probe":
+                        report.untrusted_integrity_loopback.label(),
+                    "target": target,
+                    "anonymous_target": anonymous_target,
+                    "residuals": verdict.residuals,
+                    "runner_exit": code,
+                }),
+                verdict.exit,
+            );
         }
         Cmd::Wfp {
             sub: WfpCmd::Uninstall { sublayer_guid },
@@ -1345,6 +1549,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
+            srt_win::install::mark_fence_removed().context("mark WFP fence removed")?;
             let n = wfp::uninstall_filters(&sl)?;
             eprintln!("srt-win: removed {n} WFP filter(s)");
         }
@@ -1780,8 +1985,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Probe {
             sub: ProbeCmd::Connect { target },
         } => {
-            let code = srt_win::probe::connect(&target)?;
+            let code = srt_win::probe::connect_once(&target)?;
             std::process::exit(code as i32);
+        }
+        Cmd::Probe {
+            sub:
+                ProbeCmd::Fence {
+                    target,
+                    anonymous_target,
+                },
+        } => {
+            let report = srt_win::probe::run(&target, anonymous_target.as_deref())?;
+            std::process::exit(report.encode() as i32);
         }
         #[cfg(feature = "test-hooks")]
         Cmd::Probe {
@@ -1794,7 +2009,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Probe {
             sub: ProbeCmd::ParentAccess,
         } => {
-            let r = srt_win::probe::parent_access()?;
+            let r = srt_win::parent_access::parent_access()?;
             println!("{}", serde_json::to_string(&r)?);
         }
 
@@ -1871,13 +2086,21 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 })
                 .ok();
 
-            // No WFP pre-flight here: BFE enumeration is
+            // No filter enumeration here: BFE enumeration is
             // admin-gated, so a non-elevated broker can't read it.
-            // The fence is verified BEHAVIORALLY by `srt-win wfp
-            // verify` at the host's `initialize()` (it spawns the
-            // runner as the sandbox user and expects WSAEACCES on a
-            // direct connect). Standalone `srt-win exec` callers
-            // should run `srt-win wfp verify` once per session.
+            // What the broker CAN read is the install record's fence
+            // revision, so a filter set written by an earlier build
+            // — one that lacks filters this build relies on — or
+            // removed by an uninstall is refused before anything is
+            // launched. That the filters a current record describes
+            // are still in place is verified BEHAVIORALLY by `srt-win
+            // wfp verify` at the host's `initialize()`. Standalone
+            // `srt-win exec` callers should run `srt-win wfp verify`
+            // once per session.
+            if let Err(hint) = install::require_current_fence() {
+                eprintln!("srt-win: error: {hint}");
+                std::process::exit(srt_win::probe::EXIT_FENCE_OUTDATED);
+            }
 
             // Per-exec file deny — `--deny-read`/`--deny-write`. The
             // session-level stamp (under `--holder-pid`) is applied
@@ -2394,6 +2617,18 @@ mod tests {
                 sub: ProbeCmd::Connect { .. }
             }
         ));
+        // What `wfp verify --write-restricted-token` sends the child.
+        for extra in [&[][..], &["--anonymous-target", "192.0.2.7:1"][..]] {
+            let mut argv = vec!["srt-win", "probe", "fence", "--target", "127.0.0.1:1"];
+            argv.extend_from_slice(extra);
+            let probe = Cli::try_parse_from(argv).expect("parse");
+            assert!(matches!(
+                probe.cmd,
+                Cmd::Probe {
+                    sub: ProbeCmd::Fence { .. }
+                }
+            ));
+        }
     }
 
     /// `probe token` and `probe parent-access` are CI smoke hooks:
