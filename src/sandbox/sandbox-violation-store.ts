@@ -14,21 +14,41 @@ export class SandboxViolationStore {
   private readonly maxSize = 100
   private listeners: Set<(violations: SandboxViolationEvent[]) => void> =
     new Set()
+  private eventListeners: Set<(violation: SandboxViolationEvent) => void> =
+    new Set()
 
   addViolation(violation: SandboxViolationEvent): void {
     // Every producer funnels through here (seatbelt log lines and seccomp
     // events embed raw paths, which may legally contain `<`, `>` or
     // newlines; proxy lines carry embedder-supplied reasons), so `line` is
     // reduced to one physical, tag-free line here rather than per producer.
-    this.violations.push({
+    const stored: SandboxViolationEvent = {
       ...violation,
       line: sanitizeViolationText(violation.line),
-    })
+    }
+    this.violations.push(stored)
     this.totalCount++
     if (this.violations.length > this.maxSize) {
       this.violations = this.violations.slice(-this.maxSize)
     }
     this.notifyListeners()
+    this.eventListeners.forEach(listener => listener(stored))
+  }
+
+  /**
+   * Observe each violation as it is recorded, after sanitization and after
+   * the producer's ignoreViolations check. Unlike `subscribe`, the listener
+   * sees every event exactly once rather than the capped tail, so it suits
+   * forwarding sinks (system log, metrics) that must not miss or repeat.
+   * Returns an unsubscribe function.
+   */
+  onViolation(
+    listener: (violation: SandboxViolationEvent) => void,
+  ): () => void {
+    this.eventListeners.add(listener)
+    return () => {
+      this.eventListeners.delete(listener)
+    }
   }
 
   getViolations(limit?: number): SandboxViolationEvent[] {
@@ -128,7 +148,7 @@ const DISPLAY_UNSAFE_CHARACTERS =
  * what is displayed. Shared by the store (for `line`) and by the
  * unregistered-key fallback, so the two carry the same guarantee.
  */
-function sanitizeViolationText(text: string): string {
+export function sanitizeViolationText(text: string): string {
   return text
     .replace(DISPLAY_UNSAFE_CHARACTERS, ' ')
     .replace(/[<>]/g, '')
