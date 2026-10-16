@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import * as which from '../../src/utils/which.js'
 import * as platform from '../../src/utils/platform.js'
+import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 
 // SandboxManager.checkDependencies() must only require ripgrep on Linux,
@@ -78,5 +79,47 @@ describe('SandboxManager.checkDependenciesAsync', () => {
     })
 
     expect(result.errors).toContain('ripgrep (custom-rg) not found')
+  })
+})
+
+describe('SandboxManager.checkDependencies with seccompConfig', () => {
+  const customApply = '/opt/custom/apply-seccomp'
+  const warning = 'seccomp not available - unix socket access not restricted'
+  let seccompSpy: ReturnType<typeof spyOn>
+  let seccompAsyncSpy: ReturnType<typeof spyOn>
+
+  beforeEach(() => {
+    platformSpy.mockReturnValue('linux')
+    whichSpy.mockImplementation((bin: string) => `/usr/bin/${bin}`)
+    // Only the caller's custom location has the helper.
+    const lookup = (p?: string) => (p === customApply ? p : null)
+    seccompSpy = spyOn(seccomp, 'getApplySeccompBinaryPath')
+    seccompSpy.mockImplementation(lookup)
+    seccompAsyncSpy = spyOn(seccomp, 'getApplySeccompBinaryPathAsync')
+    seccompAsyncSpy.mockImplementation(async (p?: string) => lookup(p))
+  })
+
+  afterEach(() => {
+    seccompSpy.mockRestore()
+    seccompAsyncSpy.mockRestore()
+  })
+
+  test('warns when the helper is only at a custom path and none is passed', () => {
+    expect(SandboxManager.checkDependencies().warnings).toContain(warning)
+  })
+
+  test('honours explicit seccompConfig.applyPath before initialize()', () => {
+    const result = SandboxManager.checkDependencies(undefined, {
+      applyPath: customApply,
+    })
+    expect(result.warnings).not.toContain(warning)
+  })
+
+  test('async: honours explicit seccompConfig.applyPath', async () => {
+    const result = await SandboxManager.checkDependenciesAsync(undefined, {
+      applyPath: customApply,
+    })
+    expect(result.warnings).not.toContain(warning)
+    expect(seccompAsyncSpy).toHaveBeenCalledWith(customApply)
   })
 })
