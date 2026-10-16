@@ -575,12 +575,17 @@ async function main(): Promise<void> {
             }
 
             if (signal) {
-              if (signal === 'SIGINT' || signal === 'SIGTERM') {
-                process.exit(0)
-              } else {
-                console.error(`Process killed by signal: ${signal}`)
-                process.exit(1)
+              if (process.platform !== 'win32') {
+                process.removeAllListeners(signal)
+                try {
+                  process.kill(process.pid, signal)
+                } catch {
+                  // Fall through to explicit exit code
+                }
               }
+              const signalNum =
+                (os.constants.signals as Record<string, number>)[signal] ?? 0
+              process.exit(128 + signalNum)
             }
             process.exit(code ?? 0)
           })
