@@ -342,6 +342,16 @@ await SandboxManager.initialize(config, async ({ host, port }) => {
 })
 ```
 
+**Which invocation asked (`context.attributionKey`).** The callback's second argument says which invocation opened the connection: `attributionKey` is the key its proxy username carries, decoded, which is the `commandId` passed to `wrapWithSandbox` (or the command text when none was passed), cut to 100 characters. It is the key the violation store records a proxy denial under and the key `registerCommandNetworkLists` is looked up by, and it is `undefined` when the connection named none. An embedder that runs several commands at once through the one proxy can use it to ask on behalf of the right command, or to answer differently for different kinds of process. The sandboxed process picks the username it presents, so the key is a label, not a credential: give each command a random `commandId` (at least 128 bits), look the key up among the ids you issued, and treat any other value as unattributed. A release before this argument existed calls the callback with one argument, so `context` is `undefined` there.
+
+```typescript
+await SandboxManager.initialize(config, async ({ host, port }, context) => {
+  const command = context && liveCommands.get(context.attributionKey ?? '')
+  if (!command) return false // unattributed: no prompt
+  return askAbout(command, host, port)
+})
+```
+
 **Per-command network allow lists (`registerCommandNetworkLists`).** One invocation can carry an allow list of its own, in addition to the configured one, for as long as it runs:
 
 ```typescript

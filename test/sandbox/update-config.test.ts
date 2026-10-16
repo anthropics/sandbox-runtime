@@ -3,12 +3,14 @@ import {
   SandboxManager,
   SandboxRuntimeConfigSchema,
   type SandboxAskCallback,
+  type SandboxAskContext,
   type SandboxRuntimeConfig,
 } from '../../src/index.js'
 import { connect, createServer, type AddressInfo, type Server } from 'net'
 import { randomBytes } from 'node:crypto'
 import { getPlatform } from '../../src/utils/platform.js'
 import {
+  decodeSandboxedCommand,
   encodeSandboxedCommand,
   proxyUsernameFor,
 } from '../../src/sandbox/sandbox-utils.js'
@@ -1309,6 +1311,116 @@ describe('ask callback answers', () => {
         process.env.SRT_DEBUG = before
       }
     }
+  })
+})
+
+describe('ask callback attribution', () => {
+  let loopback: { server: Server; target: string }
+  let asked: Array<{ target: string; context: SandboxAskContext | undefined }>
+
+  async function start(): Promise<number> {
+    await SandboxManager.initialize(
+      {
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: NO_FILESYSTEM_RULES,
+      },
+      async ({ host, port }, context) => {
+        asked.push({ target: `${host}:${port}`, context })
+        return false
+      },
+    )
+    SandboxManager.getSandboxViolationStore().clear()
+    return SandboxManager.getProxyPort()!
+  }
+
+  beforeEach(async () => {
+    await SandboxManager.reset()
+    loopback = await listenOnLoopback()
+    asked = []
+  })
+
+  afterEach(async () => {
+    await SandboxManager.reset()
+    loopback.server.close()
+  })
+
+  it('passes the commandId the proxy username names', async () => {
+    const port = await start()
+    const commandId = randomCommandId()
+    expect(await connectAs(port, loopback.target, usernameFor(commandId))).toBe(
+      403,
+    )
+    expect(asked).toEqual([
+      { target: loopback.target, context: { attributionKey: commandId } },
+    ])
+  })
+
+  it('passes it over SOCKS5 as over HTTP', async () => {
+    const port = await start()
+    const commandId = randomCommandId()
+    expect(
+      await socksConnectAs(port, loopback.target, usernameFor(commandId)),
+    ).toBe(2)
+    expect(asked).toEqual([
+      { target: loopback.target, context: { attributionKey: commandId } },
+    ])
+  })
+
+  it('passes undefined when the username names no key', async () => {
+    const port = await start()
+    expect(await connectAs(port, loopback.target, 'srt')).toBe(403)
+    expect(asked).toEqual([
+      { target: loopback.target, context: { attributionKey: undefined } },
+    ])
+  })
+
+  it('passes the key the violation store records the denial under', async () => {
+    const port = await start()
+    const commandId = randomCommandId()
+    await connectAs(port, loopback.target, usernameFor(commandId))
+    const [violation] =
+      SandboxManager.getSandboxViolationStore().getViolations()
+    expect(violation?.encodedCommand).toBeDefined()
+    expect(asked[0]?.context?.attributionKey).toBe(
+      decodeSandboxedCommand(violation!.encodedCommand!),
+    )
+  })
+
+  // The key is whatever the client presented: an embedder compares it with
+  // the ids it issued rather than trusting it.
+  it('passes a key no wrap registered, as the bytes it decodes to', async () => {
+    const port = await start()
+    const forged = 'not an id this process issued'
+    expect(
+      await connectAs(
+        port,
+        loopback.target,
+        `srt.${Buffer.from(forged).toString('base64')}`,
+      ),
+    ).toBe(403)
+    expect(asked[0]?.context).toEqual({ attributionKey: forged })
+  })
+
+  it('passes the key cut to 100 characters, as every carrier cuts it', async () => {
+    const port = await start()
+    const commandId = randomBytes(96).toString('base64url')
+    expect(commandId).toHaveLength(128)
+    await connectAs(port, loopback.target, usernameFor(commandId))
+    expect(asked[0]?.context).toEqual({
+      attributionKey: commandId.slice(0, 100),
+    })
+  })
+
+  it('is not asked when a per-command list already allowed the host', async () => {
+    const port = await start()
+    const commandId = randomCommandId()
+    SandboxManager.registerCommandNetworkLists(commandId, {
+      allowedDomains: [loopback.target],
+    })
+    expect(await connectAs(port, loopback.target, usernameFor(commandId))).toBe(
+      200,
+    )
+    expect(asked).toEqual([])
   })
 })
 
