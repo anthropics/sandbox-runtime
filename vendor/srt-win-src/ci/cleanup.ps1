@@ -25,7 +25,9 @@ param(
 
   [string]$AmbientSublayer = '9e4b2d7a-6c05-4f18-8a3d-2b9e7c1f5a0d',
   # Must match smoke-machine-store.ps1.
-  [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93'
+  [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93',
+  # Must match smoke-residual-egress.ps1.
+  [string]$ResidualSublayer = 'b7524f53-6892-434c-93d5-46e02c3f8cdc'
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -42,6 +44,7 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $TsSublayer
 & $Exe wfp uninstall --sublayer-guid $AmbientSublayer
 & $Exe wfp uninstall --sublayer-guid $MachineStoreSublayer
+& $Exe wfp uninstall --sublayer-guid $ResidualSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
 # sublayers; the test tears down via uninstallWindowsSandbox(). This
 # is belt-and-braces in case it crashed mid-row.
@@ -59,6 +62,10 @@ if (-not (Test-Path $Exe)) {
 # them, so this only matters if a smoke script threw mid-section.
 & $Exe uninstall --sublayer-guid $InstallSublayer
 Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
+# smoke-residual-egress.ps1 removes its share and account in its own
+# `finally`; this covers a run that was killed before reaching it.
+Get-SmbShare -Name 'srtresid*' | Remove-SmbShare -Force -Confirm:$false
+Get-LocalUser -Name 'srt-resid-*' | Remove-LocalUser
 Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue
 Remove-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' `
   -Name srt-sandbox -ea SilentlyContinue

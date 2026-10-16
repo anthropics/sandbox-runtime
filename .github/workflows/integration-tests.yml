@@ -127,6 +127,16 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-machine-store.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      # Measurements, not assertions: each row prints a `RESIDUAL <name>:`
+      # line with what it observed and the script ends with a table of them.
+      # What a row observes never fails this step. It fails only when the
+      # script could not do its own work (provisioning, a row's own code, or
+      # cleanup), and it still prints the table first.
+      - name: srt-win residual egress measurements (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-residual-egress.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
