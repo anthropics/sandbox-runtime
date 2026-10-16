@@ -726,7 +726,20 @@ export const NetworkConfigSchema = z.object({
   allowLocalBinding: z
     .boolean()
     .optional()
-    .describe('Whether to allow binding to local ports (default: false)'),
+    .describe(
+      'Whether sandboxed commands may use local ports directly (default: ' +
+        'false). macOS: allows binding and accepting on any local port ' +
+        'and connecting to localhost on any port. Windows: allows ' +
+        'connecting to loopback addresses (127.0.0.0/8, ::1) on any TCP ' +
+        'or UDP port except a fixed list of sensitive ones; it is part ' +
+        'of the machine-wide filter set, so it MUST match how `srt-win ' +
+        'install` was run (`--allow-loopback` or not) and a session that ' +
+        'differs from the install is refused. Linux: ignored — the ' +
+        'sandbox has its own network namespace, whose loopback is ' +
+        'always usable and is not the host one. Every service listening ' +
+        'on localhost becomes reachable, including any local proxy or ' +
+        'forwarder that would carry traffic off the machine.',
+    ),
   allowMachLookup: z
     .array(
       z.string().refine(
@@ -1102,6 +1115,38 @@ export const WindowsConfigSchema = z.object({
       'required to use the Windows sandbox — your own (multicall) binary, ' +
       'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
   ),
+  writeRestrictedToken: z
+    .boolean()
+    .optional()
+    .describe(
+      'Default true (unset means true). The sandboxed child runs under ' +
+        'a write-restricted token (restricting SIDs: the sandbox account, ' +
+        'Everyone, RESTRICTED, and one identifier per `allowWrite` root ' +
+        'of the session), so write access that `BUILTIN\\Users` / ' +
+        '`Authenticated Users` hold outside the allow-list (directories ' +
+        'created under `C:\\`, data-drive trees, PATH directories outside ' +
+        'Program Files) does not reach it, and the write grants on ' +
+        '`allowWrite` roots are kept between sessions instead of being ' +
+        'rewritten at every start. A kept grant also grants read: any ' +
+        'sandboxed session on the machine can read a kept root, whether ' +
+        'or not the root is in its own lists, until the grant is removed ' +
+        '(by uninstall, `srt-win acl forget`, or opting out). Hosts that ' +
+        "run sessions for parties that must not read each other's " +
+        'project roots should opt out. Cost: Schannel ' +
+        'refuses restricted tokens, so System32 `curl.exe`, git with the ' +
+        'schannel backend, and .NET / PowerShell web requests fail inside ' +
+        'the sandbox (git is switched to its OpenSSL backend ' +
+        'automatically); clients with their own TLS stack are unaffected. ' +
+        'If the token cannot be created the command fails; nothing falls ' +
+        'back to the ordinary token. Set `false` to opt out: the child ' +
+        'then runs under the ordinary token with per-session grants, and ' +
+        '`initialize()` first removes the kept grants (one walk of each ' +
+        'kept root). The read access to your user profile that the ' +
+        'install grants (see `grantWindowsProfileRead()`) exists only ' +
+        'with the write-restricted token: with `false`, `initialize()` ' +
+        'removes that grant as well, and sandboxed commands read nothing ' +
+        'in your profile beyond `allowRead`.',
+    ),
 })
 
 /**
@@ -1242,10 +1287,12 @@ export const SandboxRuntimeConfigSchema = z
     javaAgentJarPath: binaryPathSchema
       .optional()
       .describe(
-        'macOS/Linux: absolute path to srt-proxy-agent.jar, the JVM agent ' +
+        'Absolute path to srt-proxy-agent.jar, the JVM agent ' +
           'injected via JAVA_TOOL_OPTIONS so Java tools honor the proxy. ' +
           'When set, used instead of looking under vendor/java-proxy-agent/. ' +
-          'For consumers that bundle sandbox-runtime and ship the jar separately.',
+          'For consumers that bundle sandbox-runtime and ship the jar separately. ' +
+          'On Windows the jar is copied into a per-session directory that the ' +
+          'sandbox user is granted read access to; the original is not exposed.',
       ),
     windows: WindowsConfigSchema.optional().describe(
       'Windows-specific settings (WFP sublayer, proxy port range).',

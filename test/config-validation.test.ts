@@ -1,5 +1,10 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
-import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
+import {
+  NetworkConfigSchema,
+  SandboxRuntimeConfigSchema,
+} from '../src/sandbox/sandbox-config.js'
+import { windowsWriteRestrictedTokenEnabled } from '../src/sandbox/windows-sandbox-utils.js'
+import { WindowsConfigSchema } from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
 
@@ -2343,6 +2348,108 @@ describe('Config Validation', () => {
           expect(parse({ handshakeTimeoutMs: v }).success).toBe(false)
         }
       })
+    })
+  })
+
+  describe('windows.writeRestrictedToken', () => {
+    const parse = (windows?: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        ...(windows !== undefined && { windows }),
+      })
+
+    test('defaults to on: no windows block, an empty one and true are the same; only false turns it off', () => {
+      const applied = (windows?: unknown): boolean => {
+        const r = parse(windows)
+        expect(r.success).toBe(true)
+        return windowsWriteRestrictedTokenEnabled(
+          r.success ? r.data.windows : undefined,
+        )
+      }
+      expect(applied()).toBe(true)
+      expect(applied({})).toBe(true)
+      expect(applied({ writeRestrictedToken: true })).toBe(true)
+      expect(applied({ writeRestrictedToken: false })).toBe(false)
+    })
+
+    test('the parsed config keeps what was written, so an explicit false stays distinguishable from unset', () => {
+      const unset = parse({})
+      const off = parse({ writeRestrictedToken: false })
+      expect(unset.success && unset.data.windows?.writeRestrictedToken).toBe(
+        undefined,
+      )
+      expect(off.success && off.data.windows?.writeRestrictedToken).toBe(false)
+    })
+
+    test('rejects a value that is not a boolean', () => {
+      for (const bad of ['false', 0, 'off', null]) {
+        expect(parse({ writeRestrictedToken: bad }).success).toBe(false)
+      }
+    })
+  })
+
+  describe('reading the user profile on Windows is not a setting', () => {
+    const parse = (windows?: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        ...(windows !== undefined && { windows }),
+      })
+
+    test('the windows block has no key that turns it on, lists exclusions, or re-admits one', () => {
+      const keys = Object.keys(WindowsConfigSchema.shape)
+      for (const gone of [
+        'profileRead',
+        'profileReadExclude',
+        'profileReadInclude',
+        'dangerouslyAllowReadOfProfileExclusions',
+      ]) {
+        expect(keys).not.toContain(gone)
+      }
+      // A configuration written for the earlier flag still parses; the
+      // keys are dropped, not honoured.
+      const r = parse({ profileRead: false, profileReadExclude: ['.x'] })
+      expect(r.success).toBe(true)
+      expect(Object.keys((r.success && r.data.windows) || {})).toEqual([])
+    })
+
+    test('the token opt-out is the one switch, and stands alone', () => {
+      expect(parse({ writeRestrictedToken: false }).success).toBe(true)
+      expect(parse({ writeRestrictedToken: true }).success).toBe(true)
+      expect(parse({}).success).toBe(true)
+    })
+  })
+
+  describe('network.allowLocalBinding', () => {
+    const parse = (network: Record<string, unknown>) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [], ...network },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+
+    test('is unset by default and takes a boolean, nothing else', () => {
+      const none = parse({})
+      expect(none.success).toBe(true)
+      if (none.success) {
+        expect(none.data.network.allowLocalBinding).toBeUndefined()
+      }
+      for (const v of [true, false]) {
+        const r = parse({ allowLocalBinding: v })
+        expect(r.success).toBe(true)
+        if (r.success) expect(r.data.network.allowLocalBinding).toBe(v)
+      }
+      // No port list, range or mode word: it is a toggle.
+      for (const v of ['all', 1, [3000, 3099], null]) {
+        expect(parse({ allowLocalBinding: v }).success).toBe(false)
+      }
+    })
+
+    test('its description says what it does on each platform', () => {
+      const text = NetworkConfigSchema.shape.allowLocalBinding.description ?? ''
+      for (const platform of ['macOS', 'Windows', 'Linux']) {
+        expect(text).toContain(platform)
+      }
     })
   })
 })

@@ -506,20 +506,26 @@ fn is_logon_ui_hidden(user: &str) -> bool {
 /// `LOGON_WITH_PROFILE` logon performs and the sandbox launch
 /// depends on (the account holds it via `BUILTIN\Users`).
 ///
-/// - `SeDenyNetworkLogonRight`: the SMB redirector dials as SYSTEM
-///   from kernel mode, so the SID-keyed WFP fence never classifies
-///   its connects — red-teaming confirmed `net use \\127.0.0.1\IPC$`
-///   succeeded from inside the sandbox, and the same mechanism
-///   reaches remote shares (an exfil channel) and SMB-hosted RPC
-///   pipes. SMB *authenticates* as the sandbox account though, so
-///   denying it the network-logon right refuses the session at the
-///   server regardless of which process carried the bytes.
-///   CAVEAT (verified): LOOPBACK SMB stays reachable — NTLM
-///   loopback auth reuses the client's existing logon session, so
-///   no new network logon happens and the deny right never fires;
-///   `LogonUser(NETWORK)` (what any REMOTE server's LSA runs)
-///   returns 1385. Content behind loopback shares is still governed
-///   by the same NTFS ACLs the sandbox is stamped with.
+/// These are rights in THIS machine's LSA policy. They are consulted
+/// when a logon of that type is requested here for the account, so
+/// they govern logons TO this machine and nothing else.
+///
+/// - `SeDenyNetworkLogonRight`: this machine refuses a new network
+///   logon as the sandbox account (`LogonUser(NETWORK)` returns
+///   1385), which covers a session to this machine's own SMB server
+///   or RPC endpoints that authenticates afresh as the account.
+///   It does NOT limit what the sandboxed child can reach outbound:
+///   - The SMB redirector connects as SYSTEM from kernel mode, so
+///     the SID-keyed WFP fence never classifies those connects and
+///     a UNC path or `net use` leaves the machine unfenced.
+///   - A remote server decides the logon by its own policy and
+///     accounts, which this right is not part of, and the child can
+///     present other credentials (`net use … /user:`, a process
+///     started with network-only credentials).
+///   - Loopback SMB is not refused either: NTLM loopback
+///     authentication reuses the client's existing logon session,
+///     so no new network logon happens. Content behind a local
+///     share is still governed by the NTFS ACLs on it.
 /// - `SeDenyBatchLogonRight`: a sandboxed child can REGISTER a
 ///   scheduled task (the service's DACL allows it); the task then
 ///   needs a batch logon to RUN. Denying it turns registration into

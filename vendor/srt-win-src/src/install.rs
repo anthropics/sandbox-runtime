@@ -20,12 +20,46 @@ use crate::state_db;
 use crate::{dpapi, logon, runner, user};
 
 /// Bumped on schema-incompatible changes to the `sandbox_user`
-/// row, or when `install` gains a step existing installs must pick
-/// up (v2: ambient write-deny stamps — `ambient.rs`). The broker
-/// compares this to the on-disk marker and refuses with a "re-run
-/// `srt-win install`" message on mismatch; `install` treats a stale
-/// marker as a partial install and completes the missing steps.
-pub const SETUP_VERSION: u32 = 2;
+/// row, when `install` gains a step existing installs must pick
+/// up (v2: ambient write-deny stamps — `ambient.rs`), or when a
+/// broker built with the previous value must stop launching on a
+/// machine this one has set up (v3: write grants kept between
+/// sessions — `persist.rs`; such a grant lets the sandbox group write
+/// its root, which is safe only under the write-restricted token a
+/// v2 broker does not build). The broker compares this to the
+/// on-disk marker and refuses with a "re-run `srt-win install`"
+/// message on mismatch ([`check_marker`]) — in both directions: an
+/// older broker refuses a newer install, and this one refuses an
+/// older install, so it makes no kept grant where an older broker can
+/// still launch. `install` treats a marker of another version as an
+/// install to complete, and rewrites it.
+pub const SETUP_VERSION: u32 = 3;
+
+/// `Err` unless `marker_version` is the one this build was made with.
+/// The message is what `read_cred` callers print; it names the repair.
+pub fn check_marker(marker_version: u32) -> Result<()> {
+    if marker_version != SETUP_VERSION {
+        return Err(anyhow!(
+            "setup marker version mismatch (have {marker_version}, expected \
+             {SETUP_VERSION}); re-run `srt-win install`",
+        ));
+    }
+    Ok(())
+}
+
+/// The install record, only if its marker is this build's
+/// ([`check_marker`]). What must hold before the sandbox account is
+/// launched or a grant is made that outlives the session.
+pub fn require_current_setup() -> Result<SetupInfo> {
+    let info = read_setup()?.ok_or_else(|| {
+        anyhow!(
+            "no sandbox-user setup record in the state store — run \
+             `srt-win install`"
+        )
+    })?;
+    check_marker(info.marker_version)?;
+    Ok(info)
+}
 
 #[derive(Debug, Clone)]
 pub struct SetupInfo {
@@ -327,6 +361,141 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
     }))
 }
 
+/// Registry value holding the [`crate::wfp::FENCE_REVISION`] of the
+/// filter set the last completed `srt-win install` wrote, or
+/// [`crate::wfp::FENCE_REVISION_REMOVED`] after an uninstall removed
+/// the filters.
+const FENCE_REVISION_VALUE: &str = "FenceRevision";
+
+/// Registry value recording that the last completed `srt-win install`
+/// opened loopback (`--allow-loopback`): 1. Absent when the installed
+/// filter set leaves loopback closed.
+const ALLOW_LOOPBACK_VALUE: &str = "AllowLoopback";
+
+/// Record whether the filters just committed open loopback (`false`
+/// deletes the value). Called by the elevated install after the WFP
+/// transaction commits and BEFORE [`write_fence_revision`]: the
+/// revision is the commit point, so a record that reads as current
+/// always carries the mode of the filters it describes.
+pub fn write_allow_loopback(open: bool) -> Result<()> {
+    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
+    if open {
+        base.set_dword(ALLOW_LOOPBACK_VALUE, 1)
+    } else {
+        crate::reg::delete_value(&base, ALLOW_LOOPBACK_VALUE)
+    }
+}
+
+/// Whether the install record says loopback is open. `Ok(false)` when
+/// no install has run or the installed filter set leaves it closed. A
+/// value other than 1 is an error, never "closed": the broker must not
+/// guess what the filters open.
+pub fn read_allow_loopback() -> Result<bool> {
+    let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
+        return Ok(false);
+    };
+    match base.get_dword(ALLOW_LOOPBACK_VALUE)? {
+        None => Ok(false),
+        Some(1) => Ok(true),
+        Some(v) => Err(anyhow!(
+            "recorded loopback mode {v} is not one this build knows"
+        )),
+    }
+}
+
+/// `Err` with the operator-facing explanation unless the loopback mode
+/// this session is configured with is the one the install record says
+/// the filters have. A session that expects loopback open on a machine
+/// where it is closed would find its local servers unreachable; one
+/// that expects it closed on a machine where it is open would run with
+/// every local service reachable without having been told. Neither
+/// runs.
+pub fn require_allow_loopback(configured: bool) -> std::result::Result<(), String> {
+    let installed = read_allow_loopback().map_err(|e| format!("read loopback mode: {e:#}"))?;
+    if installed == configured {
+        Ok(())
+    } else {
+        Err(crate::wfp::loopback_mismatch_hint(installed, configured))
+    }
+}
+
+/// Record that the filter set at `rev` is installed. Called by the
+/// elevated install only AFTER the WFP transaction commits, so the
+/// value never claims filters that were not written.
+pub fn write_fence_revision(rev: u32) -> Result<()> {
+    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
+    base.set_dword(FENCE_REVISION_VALUE, rev)
+}
+
+/// Record that the filters are being removed: the value is reset to
+/// [`crate::wfp::FENCE_REVISION_REMOVED`], and the recorded loopback
+/// mode goes with it. No-op when the machine has no install record.
+///
+/// The elevated install also calls this before it replaces a filter
+/// set whose loopback mode is changing, so that no failure between
+/// the WFP commit and the record update can leave a record that reads
+/// as current beside filters with the other mode.
+///
+/// Every path that deletes filters calls this FIRST and deletes the
+/// filters only if it succeeded. The record and the filters are two
+/// stores with no common transaction, so they can disagree after a
+/// failure; this order (and install's opposite one — filters first,
+/// record second) makes the only possible disagreement "filters
+/// present, record says removed or older". That reads as `absent` or
+/// `outdated`, never as a current fence that is not there.
+///
+/// The record is machine-wide and filters live under a sublayer:
+/// removing the filters of one sublayer marks the fence removed even
+/// if another sublayer still holds a set. That errs the same safe
+/// way, and re-running `srt-win install` restores the record.
+pub fn mark_fence_removed() -> Result<()> {
+    match crate::reg::Key::open(crate::reg::BASE, true)? {
+        Some(base) => {
+            // Revision first: once it reads as removed, nothing
+            // consults the loopback mode.
+            base.set_dword(FENCE_REVISION_VALUE, crate::wfp::FENCE_REVISION_REMOVED)?;
+            crate::reg::delete_value(&base, ALLOW_LOOPBACK_VALUE)
+        }
+        None => Ok(()),
+    }
+}
+
+/// Whether the record says an uninstall removed the filters. A read
+/// error is "no".
+pub fn fence_marked_removed() -> bool {
+    matches!(
+        read_fence_revision(),
+        Ok(Some(crate::wfp::FENCE_REVISION_REMOVED))
+    )
+}
+
+/// The recorded fence revision. `Ok(None)` when no install has run,
+/// or when the install that ran predates the record;
+/// [`crate::wfp::FENCE_REVISION_REMOVED`] once an uninstall has
+/// removed the filters and kept the account.
+///
+/// This is what the non-elevated broker has in place of filter
+/// enumeration (which is admin-only): it says which filter set the
+/// last install wrote, not that the filters are still there —
+/// `srt-win wfp verify` is what shows that.
+pub fn read_fence_revision() -> Result<Option<u32>> {
+    let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
+        return Ok(None);
+    };
+    base.get_dword(FENCE_REVISION_VALUE)
+}
+
+/// `Err` with the operator-facing explanation unless the recorded
+/// fence revision is the one this build requires.
+pub fn require_current_fence() -> std::result::Result<(), String> {
+    let have = read_fence_revision().map_err(|e| format!("read fence revision: {e:#}"))?;
+    if have == Some(crate::wfp::FENCE_REVISION) {
+        Ok(())
+    } else {
+        Err(crate::wfp::outdated_hint(have))
+    }
+}
+
 /// Read the recorded MITM CA (DER), if `srt-win user trust-ca`
 /// ever ran. `Ok(None)` when no install has run or no CA
 /// is recorded.
@@ -363,20 +532,7 @@ impl Drop for SandboxCred {
 /// is DENY'd on it (and on the store directory) and so cannot call
 /// this to learn its own password.
 pub fn read_cred() -> Result<SandboxCred> {
-    let info = read_setup()?.ok_or_else(|| {
-        anyhow!(
-            "no sandbox-user setup record in the state store — run \
-             `srt-win install`"
-        )
-    })?;
-    if info.marker_version != SETUP_VERSION {
-        return Err(anyhow!(
-            "setup marker version mismatch (have {}, expected {}); \
-             re-run `srt-win install`",
-            info.marker_version,
-            SETUP_VERSION,
-        ));
-    }
+    let info = require_current_setup()?;
     let blob = read_cred_blob()?;
     let pw = String::from_utf8(dpapi::unprotect(&blob)?).context("password is not UTF-8")?;
     Ok(SandboxCred {
@@ -436,6 +592,7 @@ pub fn trust_ca(der: &crate::cert_store::CertDer, cred: &SandboxCred, sb_sid: &s
         None,
         &runner::RunnerCmd::InstallCa { der: der.clone() },
         false,
+        None,
     )
     .context("spawn runner for CA install")?;
     if code != 0 {
@@ -471,9 +628,26 @@ pub fn clear_setup() -> Result<()> {
             "SandboxGroupSid",
             "MarkerVersion",
             "CreatedAt",
+            FENCE_REVISION_VALUE,
+            ALLOW_LOOPBACK_VALUE,
         ] {
             crate::reg::delete_value(&base, v)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_this_builds_marker_version_passes() {
+        assert!(check_marker(SETUP_VERSION).is_ok());
+        for other in [0, SETUP_VERSION - 1, SETUP_VERSION + 1, 99] {
+            let e = check_marker(other).unwrap_err().to_string();
+            assert!(e.contains("marker version mismatch"), "{e}");
+            assert!(e.contains("re-run `srt-win install`"), "{e}");
+        }
+    }
 }

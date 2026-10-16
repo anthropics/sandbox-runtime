@@ -4,10 +4,20 @@
 //! Spawns `srt-win.exe runner` under the `srt-sandbox` account
 //! (via the Secondary Logon service — no
 //! `SeAssignPrimaryTokenPrivilege` needed on the broker), wires
-//! three anonymous pipes to its stdio, writes the
+//! three pipes to its stdio, writes the
 //! [`crate::runner::RunnerCmd`] over stdin, pumps stdout/stderr
 //! back to the broker's own stdio, waits, and returns the runner's
 //! exit code.
+//!
+//! **The sandbox side only ever holds pipe CLIENT ends.** A pipe's
+//! server end can `ImpersonateNamedPipeClient` whoever opened the
+//! other end, and here that is the real user — so the runner (and
+//! the child that inherits its stdio) must never be handed one.
+//! stdout/stderr are `CreatePipe` pairs whose write end, the one the
+//! runner gets, is the client end. The read end of a `CreatePipe`
+//! pair is the server end, so stdin is built the other way round by
+//! [`make_stdin_pipe`]: the broker keeps the server (write) end and
+//! opens the client (read) end itself.
 //!
 //! `lpEnvironment = NULL` + `LOGON_WITH_PROFILE` means the runner
 //! starts with the **sandbox user's** profile environment
@@ -22,25 +32,43 @@
 //! the **user SID** only.
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, HANDLE,
-    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, ERROR_SERVICE_DISABLED,
+    ERROR_SERVICE_DOES_NOT_EXIST, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
+    SetHandleInformation, WAIT_OBJECT_0,
 };
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
-use windows::Win32::Storage::FileSystem::{GetDriveTypeW, ReadFile, WriteFile};
-use windows::Win32::System::Pipes::CreatePipe;
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+    FILE_WRITE_ATTRIBUTES, GetDriveTypeW, OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, ReadFile,
+    SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT, WriteFile,
+};
+use windows::Win32::System::Pipes::{
+    CreateNamedPipeW, CreatePipe, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
+};
+use windows::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW,
+    QueryServiceStatus, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_DISABLED, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_TYPE, SERVICE_STATUS,
+    SERVICE_STATUS_CURRENT_STATE,
+};
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
     GetExitCodeProcess, INFINITE, LOGON_WITH_PROFILE, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
+    STARTF_USESTDHANDLES, STARTUPINFOW, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
+use crate::acl::{Allow, Mask, NO_INHERIT, build_allow_dacl};
 use crate::job::Job;
 use crate::launch::{SpawnedChild, quote_arg};
-use crate::util::{OwnedHandle, scrub_wstr, wstr};
+use crate::sid::current_user_sid;
+use crate::util::{OwnedHandle, pcwstr, scrub_wstr, wstr};
 use crate::winsta::{IsolatedDesk, grant_sandbox_on_session_bno, grant_sandbox_on_winsta};
 
 /// Typed error for [`spawn_runner`] with a mapped/network-drive
@@ -109,16 +137,172 @@ fn cwd_drive_root(cwd: &str) -> Option<String> {
     None
 }
 
-/// One anonymous pipe pair. The end the runner gets is created
-/// inheritable; the broker's end is flipped non-inheritable so the
-/// runner doesn't get a copy of it (which would keep the pipe open
-/// past the runner's exit and hang the pump).
+/// Readiness of the Secondary Logon service (`seclogon`) that every
+/// `CreateProcessWithLogonW` routes through, as reported in the
+/// `seclogon` field of `srt-win user status` / `srt-win status`.
+/// Hardened fleets set the service's start type to Disabled, which
+/// makes every sandboxed launch fail before the runner exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeclogonState {
+    /// Launchable: running, or stopped with a start type the SCM
+    /// will demand-start (`CreateProcessWithLogonW` starts a
+    /// Manual service itself).
+    Ok,
+    /// Start type is Disabled and the service is not running — the
+    /// SCM refuses the demand-start.
+    Disabled,
+    /// No `seclogon` service is registered on this machine.
+    Missing,
+    /// The SCM or the service could not be opened/queried (access
+    /// denied under a tightened service DACL, RPC failure). Not
+    /// proof of a problem: the launch itself is the ground truth.
+    CannotRead,
+}
+
+/// Pure half of [`seclogon_state`]: a service that is already
+/// running launches regardless of its start type (disabling a
+/// service does not stop it), so only "Disabled and not running" is
+/// [`SeclogonState::Disabled`].
+fn classify_seclogon(
+    start: SERVICE_START_TYPE,
+    current: Option<SERVICE_STATUS_CURRENT_STATE>,
+) -> SeclogonState {
+    if current == Some(SERVICE_RUNNING) {
+        SeclogonState::Ok
+    } else if start == SERVICE_DISABLED {
+        SeclogonState::Disabled
+    } else {
+        SeclogonState::Ok
+    }
+}
+
+/// `SC_HANDLE` closed on drop.
+struct ScHandle(SC_HANDLE);
+
+impl Drop for ScHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseServiceHandle(self.0);
+        }
+    }
+}
+
+/// Read-only probe of the Secondary Logon service. Opens the SCM
+/// with `SC_MANAGER_CONNECT` and the service with
+/// `SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS` — rights the stock
+/// service DACL grants every interactive user, so this works from
+/// the non-elevated broker. Never starts, stops, or reconfigures
+/// the service. Infallible: any failure to read is
+/// [`SeclogonState::CannotRead`].
+pub fn seclogon_state() -> SeclogonState {
+    let Ok(scm) = (unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) })
+    else {
+        return SeclogonState::CannotRead;
+    };
+    let scm = ScHandle(scm);
+    let svc = match unsafe {
+        OpenServiceW(
+            scm.0,
+            PCWSTR(wstr("seclogon").as_ptr()),
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    } {
+        Ok(h) => ScHandle(h),
+        Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => {
+            return SeclogonState::Missing;
+        }
+        Err(_) => return SeclogonState::CannotRead,
+    };
+    // `QUERY_SERVICE_CONFIGW` is variable-length (the strings trail
+    // the struct); the documented maximum is 8K bytes. `u64`
+    // elements keep the buffer aligned for the struct's pointers.
+    let mut buf = [0u64; 1024];
+    let mut needed = 0u32;
+    if unsafe {
+        QueryServiceConfigW(
+            svc.0,
+            Some(buf.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>()),
+            size_of_val(&buf) as u32,
+            &mut needed,
+        )
+    }
+    .is_err()
+    {
+        return SeclogonState::CannotRead;
+    }
+    let start = unsafe { (*buf.as_ptr().cast::<QUERY_SERVICE_CONFIGW>()).dwStartType };
+    // A failed status query leaves `current` unknown; the start
+    // type alone then decides.
+    let mut st = SERVICE_STATUS::default();
+    let current = unsafe { QueryServiceStatus(svc.0, &mut st) }
+        .ok()
+        .map(|()| st.dwCurrentState);
+    classify_seclogon(start, current)
+}
+
+/// Typed error for [`spawn_runner`] when the Secondary Logon
+/// service cannot be used: its start type is Disabled (`missing ==
+/// false`) or it is not registered at all (`missing == true`).
+/// `CreateProcessWithLogonW` then fails before the runner exists —
+/// an environment condition only an administrator can change, not
+/// a security block — typed so callers can present an actionable
+/// message instead of a bare HRESULT.
+#[derive(Debug)]
+pub struct SeclogonDisabled {
+    pub missing: bool,
+}
+
+impl SeclogonDisabled {
+    /// The [`SeclogonState`] this error corresponds to — the same
+    /// value `srt-win status` reports in its `seclogon` field.
+    pub fn state(&self) -> SeclogonState {
+        if self.missing {
+            SeclogonState::Missing
+        } else {
+            SeclogonState::Disabled
+        }
+    }
+}
+
+impl std::fmt::Display for SeclogonDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.missing {
+            write!(
+                f,
+                "the sandbox cannot start: the Windows Secondary Logon \
+                 service (seclogon) is not present on this machine, and \
+                 every sandboxed launch goes through it.",
+            )
+        } else {
+            write!(
+                f,
+                "the sandbox cannot start: the Windows Secondary Logon \
+                 service (seclogon) is disabled. An administrator must \
+                 set its startup type to Manual (`sc.exe config \
+                 seclogon start= demand`).",
+            )
+        }
+    }
+}
+
+impl std::error::Error for SeclogonDisabled {}
+
+/// One pipe pair. The end the runner gets is inheritable; the
+/// broker's end is not, so the runner doesn't get a copy of it
+/// (which would keep the pipe open past the runner's exit and hang
+/// the pump).
 struct PipePair {
     broker: OwnedHandle,
     runner: OwnedHandle,
 }
 
-fn make_pipe(runner_writes: bool) -> Result<PipePair> {
+/// An anonymous pipe the runner WRITES to (stdout / stderr). The
+/// write end of a `CreatePipe` pair is the pipe's client end, so the
+/// runner holds nothing it could impersonate through. Never use this
+/// shape for a pipe the runner reads: the read end is the server end
+/// (see [`make_stdin_pipe`]).
+fn make_output_pipe() -> Result<PipePair> {
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         bInheritHandle: true.into(),
@@ -130,15 +314,131 @@ fn make_pipe(runner_writes: bool) -> Result<PipePair> {
         CreatePipe(&mut read, &mut write, Some(&sa), 0).context("CreatePipe")?;
     }
     // Wrap immediately so the `?` below can't leak either end.
-    let (broker, runner) = if runner_writes {
-        (OwnedHandle(read), OwnedHandle(write))
-    } else {
-        (OwnedHandle(write), OwnedHandle(read))
-    };
+    let (broker, runner) = (OwnedHandle(read), OwnedHandle(write));
     // Broker end must NOT be inherited by the runner.
     unsafe {
         SetHandleInformation(broker.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
             .context("SetHandleInformation(broker end)")?;
+    }
+    Ok(PipePair { broker, runner })
+}
+
+/// `dwOpenMode` of the stdin pipe's server end: the server only
+/// writes, and the create fails unless this is the first pipe of
+/// that name (so the name cannot already belong to someone else).
+const STDIN_PIPE_OPEN_MODE: FILE_FLAGS_AND_ATTRIBUTES =
+    FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_OUTBOUND.0 | FILE_FLAG_FIRST_PIPE_INSTANCE.0);
+
+/// `dwPipeMode` of the stdin pipe: a blocking byte stream, local
+/// clients only.
+const STDIN_PIPE_MODE: NAMED_PIPE_MODE = NAMED_PIPE_MODE(
+    PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0,
+);
+
+/// One instance: once the broker's own client is connected, nobody
+/// else can connect to the name or create a second server for it.
+const STDIN_PIPE_MAX_INSTANCES: u32 = 1;
+
+/// Server-side buffer. A write larger than this just blocks until
+/// the runner reads, same as with an anonymous pipe.
+const STDIN_PIPE_OUT_BUFFER: u32 = 64 * 1024;
+
+/// Access the client (read) end is opened with: read, plus
+/// `FILE_WRITE_ATTRIBUTES` — the rights the read end of a
+/// `CreatePipe` pair carries, so a child that sets the read/wait
+/// mode on its stdin keeps working. No data-write access.
+const STDIN_CLIENT_ACCESS: u32 = GENERIC_READ.0 | FILE_WRITE_ATTRIBUTES.0;
+
+/// The client end is opened at the ANONYMOUS impersonation level, so
+/// even the pipe's server end (which stays in the broker) could not
+/// obtain a usable token for the broker's user through it.
+const STDIN_CLIENT_FLAGS: FILE_FLAGS_AND_ATTRIBUTES =
+    FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT.0 | SECURITY_ANONYMOUS.0);
+
+/// Name of the stdin pipe: the broker's pid plus 128 random bits.
+/// The name is not a secret the design leans on (the DACL and the
+/// single instance are what keep others out); it only has to be
+/// unique and not predictable enough to squat.
+fn stdin_pipe_name(pid: u32, rand: &[u8; 16]) -> String {
+    let hex: String = rand.iter().map(|b| format!("{b:02x}")).collect();
+    format!(r"\\.\pipe\srt-win-stdin-{pid}-{hex}")
+}
+
+/// The stdin pipe for the runner, built so the runner's end is the
+/// pipe's CLIENT end.
+///
+/// With `CreatePipe` the read end is the server end, and the write
+/// end is opened by this process — the real user. Handing that read
+/// end to the sandbox account would let it (and the child that
+/// inherits it) call `ImpersonateNamedPipeClient` and act as the
+/// real user. So the roles are swapped: the broker creates a named
+/// pipe, keeps the server end to write to, and opens the client end
+/// itself for the runner to read from. A client end cannot
+/// impersonate anyone.
+///
+/// The pipe is reachable only through these two handles: its DACL
+/// grants the broker's own user and nobody else (not the sandbox
+/// account, not Everyone), it rejects remote clients, and its single
+/// instance is taken by the client opened here.
+///
+/// There is no fallback: if any step fails the launch fails.
+fn make_stdin_pipe() -> Result<PipePair> {
+    let mut rand = [0u8; 16];
+    unsafe { BCryptGenRandom(None, &mut rand, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+        .ok()
+        .context("BCryptGenRandom (stdin pipe name)")?;
+    make_stdin_pipe_named(&stdin_pipe_name(std::process::id(), &rand))
+}
+
+fn make_stdin_pipe_named(name: &str) -> Result<PipePair> {
+    let name_w = wstr(name);
+    // Protected DACL with a single ACE for this process's user.
+    // `bInheritHandle` is false: the server end stays in the broker.
+    let me = current_user_sid().context("stdin pipe: current user SID")?;
+    let sa = build_allow_dacl(&[Allow(&me, Mask::FILE_ALL, NO_INHERIT)])?
+        .into_security_attributes()
+        .context("stdin pipe: security descriptor")?;
+    let server = unsafe {
+        CreateNamedPipeW(
+            pcwstr(&name_w),
+            STDIN_PIPE_OPEN_MODE,
+            STDIN_PIPE_MODE,
+            STDIN_PIPE_MAX_INSTANCES,
+            STDIN_PIPE_OUT_BUFFER,
+            0,
+            0,
+            Some(sa.as_ptr()),
+        )
+    };
+    if server.is_invalid() {
+        return Err(anyhow!(
+            "CreateNamedPipeW(runner stdin): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let broker = OwnedHandle(server);
+    // Not inheritable at open; only this one handle is flipped below.
+    let client = unsafe {
+        CreateFileW(
+            pcwstr(&name_w),
+            STDIN_CLIENT_ACCESS,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            STDIN_CLIENT_FLAGS,
+            None,
+        )
+    }
+    .context("CreateFileW(runner stdin client end)")?;
+    if client.is_invalid() {
+        return Err(anyhow!(
+            "CreateFileW(runner stdin client end): invalid handle"
+        ));
+    }
+    let runner = OwnedHandle(client);
+    unsafe {
+        SetHandleInformation(runner.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
+            .context("SetHandleInformation(runner stdin, inheritable)")?;
     }
     Ok(PipePair { broker, runner })
 }
@@ -174,6 +474,11 @@ fn pump(src: HANDLE, dst: HANDLE) {
 /// `WinSta0` station grant). `quiet` suppresses the informational
 /// stderr lines (the seclogon-job note); `SANDBOX_RUNTIME_WIN_DEBUG`
 /// checkpoints are gated separately on `dbg` and are unaffected.
+///
+/// `holder` is a waitable handle on the process whose session the
+/// command belongs to. The command does not outlive it: if that
+/// process ends first, the runner and everything it started are
+/// terminated and the call fails with [`HolderGone`].
 pub fn spawn_runner(
     username: &str,
     password: &str,
@@ -181,6 +486,7 @@ pub fn spawn_runner(
     cwd: Option<&str>,
     cmd: &crate::runner::RunnerCmd,
     quiet: bool,
+    holder: Option<HANDLE>,
 ) -> Result<u32> {
     // Mapped/network-drive cwd pre-check: `DRIVE_REMOTE` on the
     // cwd's root means CPWLW would fail inside seclogon with
@@ -194,9 +500,9 @@ pub fn spawn_runner(
     }
 
     let cmd_bytes = crate::runner::encode_cmd(cmd)?;
-    let stdin = make_pipe(false)?;
-    let stdout = make_pipe(true)?;
-    let stderr = make_pipe(true)?;
+    let stdin = make_stdin_pipe().context("runner stdin pipe")?;
+    let stdout = make_output_pipe()?;
+    let stderr = make_output_pipe()?;
 
     // Broker-side per-exec desktop on `WinSta0` with an explicit
     // `[broker, srt-sandbox, SY]:GA` DACL. The broker (interactive
@@ -300,6 +606,20 @@ pub fn spawn_runner(
                 .or_else(|| cwd.map(str::to_owned))
                 .unwrap_or_else(|| "<unknown>".into());
             return Err(MappedDriveCwd { drive }.into());
+        }
+        // `ERROR_SERVICE_DISABLED` = the SCM refused to demand-start
+        // seclogon. The read-only probe is consulted as well so the
+        // typed error does not hinge on which code a given Windows
+        // build surfaces for a disabled or absent service: a failed
+        // launch with seclogon unusable has that as its cause.
+        let state = seclogon_state();
+        if e.code() == ERROR_SERVICE_DISABLED.to_hresult()
+            || matches!(state, SeclogonState::Disabled | SeclogonState::Missing)
+        {
+            return Err(SeclogonDisabled {
+                missing: state == SeclogonState::Missing,
+            }
+            .into());
         }
         return Err(anyhow!(
             "CreateProcessWithLogonW({username}): {e} — ensure the \
@@ -419,9 +739,15 @@ pub fn spawn_runner(
         }
     });
 
-    let rc = unsafe { WaitForSingleObject(child.process(), INFINITE) };
-    if rc != WAIT_OBJECT_0 {
-        eprintln!("srt-win: WaitForSingleObject(runner) returned 0x{:x}", rc.0);
+    if wait_for_child_or_holder(child.process(), holder) == Ended::HolderGone {
+        // The whole tree, now: the runner (which takes its own job,
+        // and so the command, with it) and then this job. The output
+        // threads are not waited for — nothing the command or a
+        // process it left behind does with its end of a pipe delays
+        // this — and end with the process.
+        drop(child);
+        drop(job);
+        return Err(anyhow::Error::new(HolderGone));
     }
     let _ = t_out.join();
     let _ = t_err.join();
@@ -433,6 +759,50 @@ pub fn spawn_runner(
     // runner) then `job`. An explicit `drop(job)` here would close
     // the Job before the fallback terminate.
     Ok(code)
+}
+
+/// The process the command was started for ended while the command
+/// ran; the command was terminated.
+#[derive(Debug)]
+pub struct HolderGone;
+
+impl std::fmt::Display for HolderGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the session that started this command ended; the command and everything it \
+             started were terminated",
+        )
+    }
+}
+
+impl std::error::Error for HolderGone {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    Child,
+    HolderGone,
+}
+
+/// Wait until the runner has exited or the holder has gone, whichever
+/// is first. The runner is asked first: with both ended, the command
+/// ran to its end. Anything else the wait can say — the holder
+/// signalled, the wait failed, a handle that is no longer one —
+/// counts as the holder gone: a command is never left running on a
+/// holder that cannot be seen to be there.
+fn wait_for_child_or_holder(child: HANDLE, holder: Option<HANDLE>) -> Ended {
+    let Some(holder) = holder else {
+        let rc = unsafe { WaitForSingleObject(child, INFINITE) };
+        if rc != WAIT_OBJECT_0 {
+            eprintln!("srt-win: WaitForSingleObject(runner) returned 0x{:x}", rc.0);
+        }
+        return Ended::Child;
+    };
+    let rc = unsafe { WaitForMultipleObjects(&[child, holder], false, INFINITE) };
+    if rc == WAIT_OBJECT_0 {
+        Ended::Child
+    } else {
+        Ended::HolderGone
+    }
 }
 
 /// `std::io::Stdout`/`Stderr` → raw `HANDLE` for [`pump`].
@@ -452,7 +822,196 @@ impl AsRawHandle for std::io::Stderr {
 
 #[cfg(test)]
 mod tests {
-    use super::cwd_drive_root;
+    use super::*;
+    use windows::Win32::Foundation::ERROR_BROKEN_PIPE;
+    use windows::Win32::Security::RevertToSelf;
+    use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+
+    #[test]
+    fn stdin_pipe_name_shape() {
+        let n = stdin_pipe_name(1234, &[0xab; 16]);
+        assert_eq!(
+            n,
+            r"\\.\pipe\srt-win-stdin-1234-abababababababababababababababab"
+        );
+        // All 16 bytes land in the name, zero-padded.
+        let mut r = [0u8; 16];
+        r[15] = 0x0f;
+        assert!(stdin_pipe_name(1, &r).ends_with("-0000000000000000000000000000000f"));
+        assert_ne!(stdin_pipe_name(1, &[0; 16]), stdin_pipe_name(1, &r));
+    }
+
+    #[test]
+    fn stdin_pipe_flags() {
+        // Server end: outbound only (bit 0 = inbound access), first
+        // instance, synchronous.
+        assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x3, 0x2);
+        assert_ne!(STDIN_PIPE_OPEN_MODE.0 & 0x0008_0000, 0);
+        assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x4000_0000, 0);
+        // Byte stream, blocking, remote clients rejected.
+        assert_eq!(STDIN_PIPE_MODE.0, 0x8);
+        assert_eq!(STDIN_PIPE_MAX_INSTANCES, 1);
+        // Client end: GENERIC_READ + FILE_WRITE_ATTRIBUTES, nothing
+        // that writes data; SQOS present with level ANONYMOUS (the
+        // level lives in bits 16-17) and no context-tracking /
+        // effective-only bits.
+        assert_eq!(STDIN_CLIENT_ACCESS, 0x8000_0100);
+        assert_eq!(STDIN_CLIENT_FLAGS.0, 0x0010_0000);
+    }
+
+    /// The pair behaves like an anonymous pipe for a
+    /// reader — data, then `ERROR_BROKEN_PIPE` once the writer is
+    /// gone — and the reader's end can neither impersonate nor be
+    /// joined by a second client.
+    #[test]
+    fn stdin_pipe_runner_end_is_a_client_end() {
+        let mut rand = [0u8; 16];
+        unsafe { BCryptGenRandom(None, &mut rand, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+            .ok()
+            .unwrap();
+        let name = stdin_pipe_name(std::process::id(), &rand);
+        let pipe = make_stdin_pipe_named(&name).unwrap();
+
+        // A client end cannot impersonate.
+        let imp = unsafe { ImpersonateNamedPipeClient(pipe.runner.raw()) };
+        if imp.is_ok() {
+            unsafe { RevertToSelf().unwrap() };
+            panic!("ImpersonateNamedPipeClient succeeded on the runner's stdin end");
+        }
+
+        // The single instance is taken: no second client, and no
+        // second server under the same name.
+        let name_w = wstr(&name);
+        let again = unsafe {
+            CreateFileW(
+                pcwstr(&name_w),
+                STDIN_CLIENT_ACCESS,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                STDIN_CLIENT_FLAGS,
+                None,
+            )
+        };
+        assert!(
+            again.is_err(),
+            "a second client connected to the stdin pipe"
+        );
+        assert!(
+            make_stdin_pipe_named(&name).is_err(),
+            "a second server was created under the stdin pipe's name"
+        );
+
+        // Write, close the server end, then read: the bytes arrive,
+        // followed by ERROR_BROKEN_PIPE (what a reader treats as EOF).
+        let payload = b"spec-bytes";
+        let mut wrote = 0u32;
+        unsafe { WriteFile(pipe.broker.raw(), Some(payload), Some(&mut wrote), None) }.unwrap();
+        assert_eq!(wrote as usize, payload.len());
+        drop(pipe.broker);
+        let mut buf = [0u8; 64];
+        let mut read = 0u32;
+        unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) }.unwrap();
+        assert_eq!(&buf[..read as usize], payload);
+        let eof = unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) };
+        assert_eq!(
+            eof.unwrap_err().code(),
+            ERROR_BROKEN_PIPE.to_hresult(),
+            "reader must see ERROR_BROKEN_PIPE after the writer closes"
+        );
+    }
+
+    use windows::Win32::System::Services::{
+        SERVICE_AUTO_START, SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_RUNNING,
+        SERVICE_STOPPED,
+    };
+    #[test]
+    fn seclogon_disabled_only_when_not_running() {
+        use SeclogonState as S;
+        // Manual + stopped is the stock configuration: the launch
+        // demand-starts it.
+        let stopped = Some(SERVICE_STOPPED);
+        let running = Some(SERVICE_RUNNING);
+        assert_eq!(classify_seclogon(SERVICE_DEMAND_START, stopped), S::Ok);
+        assert_eq!(classify_seclogon(SERVICE_AUTO_START, running), S::Ok);
+        assert_eq!(classify_seclogon(SERVICE_DISABLED, stopped), S::Disabled);
+        // Status unreadable → the start type decides.
+        assert_eq!(classify_seclogon(SERVICE_DISABLED, None), S::Disabled);
+        assert_eq!(classify_seclogon(SERVICE_DEMAND_START, None), S::Ok);
+        // Disabled after it was started: still launches until the
+        // service stops.
+        assert_eq!(classify_seclogon(SERVICE_DISABLED, running), S::Ok);
+    }
+
+    #[test]
+    fn seclogon_state_json_values() {
+        let j = |s: SeclogonState| serde_json::to_value(s).unwrap();
+        assert_eq!(j(SeclogonState::Ok), "ok");
+        assert_eq!(j(SeclogonState::Disabled), "disabled");
+        assert_eq!(j(SeclogonState::Missing), "missing");
+        assert_eq!(j(SeclogonState::CannotRead), "cannot-read");
+    }
+
+    #[test]
+    fn seclogon_disabled_error_state_and_message() {
+        let d = SeclogonDisabled { missing: false };
+        assert_eq!(d.state(), SeclogonState::Disabled);
+        assert!(d.to_string().contains("startup type to Manual"));
+        let m = SeclogonDisabled { missing: true };
+        assert_eq!(m.state(), SeclogonState::Missing);
+        assert!(m.to_string().contains("not present"));
+    }
+    /// The command ends with its session: whichever of the two ends
+    /// first decides, the command when both have, and a holder that
+    /// cannot be waited on is a holder that is gone.
+    #[test]
+    fn the_wait_ends_with_the_child_or_with_the_holder() {
+        use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+        // Events stand in for the two processes: signalled is exited.
+        let event =
+            || crate::util::OwnedHandle(unsafe { CreateEventW(None, true, false, None) }.unwrap());
+        let (child, holder) = (event(), event());
+        unsafe { SetEvent(holder.raw()) }.unwrap();
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
+            super::Ended::HolderGone
+        );
+        // Both ended: the command ran to its end.
+        unsafe { SetEvent(child.raw()) }.unwrap();
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
+            super::Ended::Child
+        );
+        // The child alone, with a holder and without one.
+        let holder = event();
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
+            super::Ended::Child
+        );
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), None),
+            super::Ended::Child
+        );
+        // A holder handle that is not one fails the wait: gone.
+        let running = event();
+        let closed = windows::Win32::Foundation::HANDLE::default();
+        assert_eq!(
+            super::wait_for_child_or_holder(running.raw(), Some(closed)),
+            super::Ended::HolderGone
+        );
+        // The holder ending while the wait is under way wakes it.
+        let (child, holder) = (event(), event());
+        let signal = holder.raw().0 as isize;
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            unsafe { SetEvent(windows::Win32::Foundation::HANDLE(signal as *mut _)) }.unwrap();
+        });
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
+            super::Ended::HolderGone
+        );
+        t.join().unwrap();
+    }
 
     #[test]
     fn drive_letter_root() {

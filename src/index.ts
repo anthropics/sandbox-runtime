@@ -1,6 +1,10 @@
 // Library exports
 export { SandboxManager } from './sandbox/sandbox-manager.js'
-export type { WrapWithSandboxOptions } from './sandbox/sandbox-manager.js'
+export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
+export type {
+  WrapWithSandboxOptions,
+  SandboxInitializeOptions,
+} from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 
 // Configuration types and schemas
@@ -78,25 +82,53 @@ export {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
+  revokeWindowsAclChecked,
+  grantWindowsProfileRead,
+  forgetWindowsProfileRead,
+  forgetWindowsProfileReadAsync,
+  getWindowsProfileReadStatus,
+  windowsProfileReadEnv,
+  windowsProfileExclusionConflicts,
+  windowsProfileGrantSkipReason,
+  windowsProfileGrantNotice,
+  WINDOWS_PROFILE_READ_ENV_VARS,
   expandWindowsFsPaths,
   buildGitConfigEnv,
   parseWindowsBinShell,
   parseWindowsSandboxError,
   isUncPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  WINDOWS_ALLOW_LOOPBACK_EFFECT,
   SRT_WIN_DISPATCH_ARG1,
+  spawnWrappedCommandWindows,
+  writeStdinPayload,
+  encodeEnvStdinFrame,
+  ENV_STDIN_FRAME_CAP,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
   WindowsSandboxErrorCode,
   WindowsSandboxStatus,
   WindowsBinShell,
   MappedDriveCwdError,
+  SeclogonDisabledError,
+  WindowsSeclogonState,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,
   WindowsAclStampOptions,
   WindowsAclGrantOptions,
   WindowsAclAceOutcome,
+  WindowsAclRevokeResult,
+  WindowsProfileGrantState,
+  WindowsProfileGrantStatus,
+  WindowsProfileGrantPath,
+  WindowsProfileGrantOptions,
+  WindowsProfileGrantResult,
+  WindowsProfileGrantItem,
+  WindowsInstallProfileGrant,
+  WindowsProfileExclusionConflict,
+  WindowsWfpProbeOutcome,
+  WindowsWfpResidual,
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,

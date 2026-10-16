@@ -5,7 +5,8 @@
 //! TWO stores, split by scope and by writer:
 //!
 //! - SESSION store (`%LOCALAPPDATA%\sandbox-runtime\state.db`,
-//!   per-user): brokers / ace_holders / working_aces. These rows
+//!   per-user): brokers / ace_holders / working_aces, and the
+//!   holderless `persistent_*` tables of `crate::persist`. These rows
 //!   DRIVE ACL mutations on the owning user's files, so they are
 //!   only trustworthy while only that user (and admins) can write
 //!   them — the directory is stamped real-user-only on every open.
@@ -39,9 +40,25 @@
 //! There is deliberately NO single enclosing transaction. Each
 //! path's (FS mutation + row change) commits independently so a
 //! failure on path Y can't revert path X. The one ordering rule is
+//! that a row exists for every ACE that may be on disk. Adding is
 //! record-first: upsert, THEN `SetNamedSecurityInfoW`. A crash
 //! between leaves a row whose ACE hasn't been written; the next
-//! call re-derives and reapplies.
+//! call re-derives and reapplies. Releasing is the mirror image: the
+//! row changes of one path commit only after its converge succeeded
+//! (one short transaction per path — see [`release_hold`]), so a
+//! crash or a failed converge leaves the rows, and the next release
+//! or recovery retries.
+//!
+//! ## Release order: grants before denies
+//!
+//! A holder's DENY rows protect targets under trees its GRANT rows
+//! open up, and the sandbox account is shared between sessions. So a
+//! holder's deny rows are never released while one of its grants may
+//! still be on disk: a release that could not establish where the
+//! ACE is, or could not converge it, keeps its rows
+//! ([`AceRelease::Unreadable`] / [`AceRelease::Failed`]), and
+//! crash recovery releases a dead holder's grants first and keeps its
+//! deny rows for the next pass while any grant is still pending.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -121,6 +138,48 @@ CREATE INDEX IF NOT EXISTS ace_holders_by_pid ON ace_holders (pid);
 CREATE TABLE IF NOT EXISTS placeholders (
   canonical_path TEXT PRIMARY KEY
 );
+-- Write roots whose grant is kept between sessions (`persist.rs`):
+-- the root's capability SID, keyed by canonical path, valid for the
+-- object with this file id. No holders: removed by `acl forget`.
+CREATE TABLE IF NOT EXISTS persistent_roots (
+  canonical_path TEXT PRIMARY KEY,
+  file_id        BLOB NOT NULL,
+  capability_sid TEXT NOT NULL
+);
+-- Sandbox-GROUP deny ACEs kept with a persistent root (same kinds
+-- and masks as `working_aces`, never 'grant'). No holders: added and
+-- widened by session starts, removed with `root` by `acl forget`.
+CREATE TABLE IF NOT EXISTS persistent_denies (
+  canonical_path TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  file_id        BLOB NOT NULL,
+  mask           TEXT NOT NULL,
+  root           TEXT NOT NULL,
+  PRIMARY KEY (canonical_path, kind)
+);
+-- One row per path whose persistent ACEs were written: `spec` is the
+-- ACE list the write was for, `done` is 0 from before the DACL write
+-- until it returned. A session start skips the write only on a row
+-- with `done = 1` for the same list and file id; crash recovery
+-- replays a row left at 0.
+CREATE TABLE IF NOT EXISTS persistent_writes (
+  canonical_path TEXT PRIMARY KEY,
+  file_id        BLOB NOT NULL,
+  spec           TEXT NOT NULL,
+  done           INTEGER NOT NULL
+);
+-- Paths the profile read grant (`profile.rs`) wrote on, and what each
+-- carries: 'container', 'granted', 'file' or 'denied'. Valid for the
+-- object with this file id (empty until the object was opened).
+-- `created` is 1 for a directory the grant created empty. No holders:
+-- removed by `profile forget`. Added without a schema version change:
+-- the table is created by the first read-write open.
+CREATE TABLE IF NOT EXISTS profile_paths (
+  canonical_path TEXT PRIMARY KEY,
+  file_id        BLOB NOT NULL,
+  kind           TEXT NOT NULL,
+  created        INTEGER NOT NULL
+);
 "#;
 
 /// Outcome of a crash-recovery pass.
@@ -129,6 +188,10 @@ pub struct RecoveryReport {
     pub dead_brokers: u32,
     /// Orphaned `working_aces` rows whose ACE was revoked.
     pub aces_revoked: u32,
+    /// Grant paths of dead holders (or holderless rows) that could
+    /// not be released this pass. Their rows — and the same holder's
+    /// deny rows — are kept for the next recovery.
+    pub grants_pending: Vec<String>,
 }
 
 /// RAII guard for the init lock — an exclusive `LockFileEx` range
@@ -151,16 +214,163 @@ struct InitMutex {
 }
 impl Drop for InitMutex {
     fn drop(&mut self) {
+        use std::os::windows::fs::FileExt;
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Storage::FileSystem::UnlockFile;
+        let file = &self.file;
+        // The word goes before the lock does: a waiter never reads
+        // "a profile operation" of a holder that has let go.
+        if MARKED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            let _ = file.seek_write(&[b'\n'; LOCK_WORD_LEN], LOCK_WORD_AT);
+        }
         unsafe {
-            let _ = UnlockFile(HANDLE(self.file.as_raw_handle()), 0, 0, 1, 0);
+            let _ = UnlockFile(HANDLE(file.as_raw_handle()), 0, 0, 1, 0);
         }
     }
 }
 
+/// This process wrote the profile-operation word and clears it when
+/// its outermost guard goes.
+static MARKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Where in the lock file the holder says it is a profile operation,
+/// and how long that word is: `profile <pid>`, padded with newlines.
+const LOCK_WORD_AT: u64 = 8;
+const LOCK_WORD_LEN: usize = 24;
+
+fn lock_file_path() -> Result<PathBuf> {
+    Ok(session_store_dir()?.join(".acl-init.lock"))
+}
+
+/// Say that the lock this process holds is held for a profile
+/// operation that is GOING AHEAD — called after the quiet check, so a
+/// command that takes the lock only to refuse never says so. Cleared
+/// when the lock is released; a holder that dies without clearing it
+/// leaves the pid of a dead process, which no waiter believes.
+pub fn mark_profile_operation() -> Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut word = [b'\n'; LOCK_WORD_LEN];
+    let text = format!("profile {}", std::process::id());
+    word[..text.len()].copy_from_slice(text.as_bytes());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(lock_file_path()?)
+        .context("open the init lock to mark it")?;
+    file.seek_write(&word, LOCK_WORD_AT)
+        .context("mark the init lock")?;
+    MARKED.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+/// Whether the lock file's word names a profile operation of a
+/// process that is still running. Anything else — no word, a word of
+/// another shape (an older build writes none, or a bare one), the pid
+/// of a process that is gone — is not one, and the waiter waits as
+/// for any other holder.
+fn word_says_profile_operation(file: &std::fs::File) -> bool {
+    use std::os::windows::fs::FileExt;
+    let mut word = [0u8; LOCK_WORD_LEN];
+    if !file
+        .seek_read(&mut word, LOCK_WORD_AT)
+        .is_ok_and(|n| n == LOCK_WORD_LEN)
+    {
+        return false;
+    }
+    profile_word_pid(&word).is_some_and(pid_is_running)
+}
+
+/// The pid in a profile-operation word; `None` for anything else.
+fn profile_word_pid(word: &[u8]) -> Option<u32> {
+    std::str::from_utf8(word)
+        .ok()?
+        .trim_end_matches('\n')
+        .strip_prefix("profile ")?
+        .parse()
+        .ok()
+}
+
+fn pid_is_running(pid: u32) -> bool {
+    pid == std::process::id() || process_create_times().is_ok_and(|all| all.contains_key(&pid))
+}
+
+/// Whether a profile operation is running right now: the init lock is
+/// held, and held for one. For `profile status`, which takes no lock
+/// and would otherwise read a grant's half-written record as a run
+/// that was killed.
+pub fn profile_operation_running() -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Storage::FileSystem::{
+        LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFile,
+    };
+    use windows::Win32::System::IO::OVERLAPPED;
+    let Ok(file) = lock_file_path().and_then(|p| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(p)
+            .map_err(Into::into)
+    }) else {
+        return false;
+    };
+    let mut ov = OVERLAPPED::default();
+    let free = unsafe {
+        LockFileEx(
+            HANDLE(file.as_raw_handle()),
+            LOCK_FILE_FLAGS(LOCKFILE_EXCLUSIVE_LOCK.0 | LOCKFILE_FAIL_IMMEDIATELY.0),
+            None,
+            1,
+            0,
+            &mut ov,
+        )
+    }
+    .is_ok();
+    if free {
+        unsafe {
+            let _ = UnlockFile(HANDLE(file.as_raw_handle()), 0, 0, 1, 0);
+        }
+        return false;
+    }
+    word_says_profile_operation(&file)
+}
+
+/// The init lock is held for a profile grant or forget, which takes
+/// long: the caller was not made to wait it out. Exit code
+/// [`EXIT_PROFILE_BUSY`] at the top level.
+#[derive(Debug)]
+pub struct ProfileBusy;
+
+impl std::fmt::Display for ProfileBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the read grant on the user profile is being written or removed \
+             (`srt-win profile grant` / `profile forget`); nothing can start until it is done",
+        )
+    }
+}
+
+impl std::error::Error for ProfileBusy {}
+
+/// Exit code of any command that needed the init lock while a profile
+/// grant or forget held it.
+pub const EXIT_PROFILE_BUSY: i32 = 25;
+
+/// How long a caller waits for the init lock before it asks what the
+/// holder is doing: long enough for any session operation to finish,
+/// short enough that a session start during a profile grant fails at
+/// once, with the reason, instead of after a minute without one.
+const PROFILE_BUSY_AFTER_MS: u64 = 3_000;
+
 impl InitMutex {
     fn acquire() -> Result<Self> {
+        // Bounded, not infinite: crash-recovery under this lock is
+        // sub-second and real contention is a handful of concurrent
+        // acl ops for ONE user, so a minute means a wedged holder —
+        // fail the op loudly rather than hang.
+        Self::acquire_within(PROFILE_BUSY_AFTER_MS, 60_000)
+    }
+
+    fn acquire_within(ask_after_ms: u64, timeout_ms: u64) -> Result<Self> {
+        use std::os::windows::fs::FileExt;
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Storage::FileSystem::{
             LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
@@ -169,24 +379,20 @@ impl InitMutex {
         let dir = session_store_dir()?;
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create_dir_all {}", dir.display()))?;
-        let path = dir.join(".acl-init.lock");
+        let path = lock_file_path()?;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            // Never truncate: the file's only role is carrying the
-            // kernel byte-range lock; its content is irrelevant.
+            // Never truncate: the first byte carries the kernel
+            // byte-range lock, and the bytes at `LOCK_WORD_AT` say
+            // when the holder is a profile operation.
             .truncate(false)
             .open(&path)
             .with_context(|| format!("open init-lock file {}", path.display()))?;
-        // Bounded, not infinite: crash-recovery under this lock is
-        // sub-second and real contention is a handful of concurrent
-        // acl ops for ONE user, so a minute means a wedged holder —
-        // fail the op loudly rather than hang.
-        const ACQUIRE_TIMEOUT_MS: u64 = 60_000;
         const POLL_MS: u64 = 100;
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(ACQUIRE_TIMEOUT_MS);
+        let started = std::time::Instant::now();
+        let waited = || started.elapsed().as_millis() as u64;
         loop {
             let mut ov = OVERLAPPED::default();
             let r = unsafe {
@@ -200,11 +406,21 @@ impl InitMutex {
                 )
             };
             if r.is_ok() {
+                // A holder starts with no word: what a previous one
+                // left (it was killed before it could clear it) is
+                // not this one's.
+                file.seek_write(&[b'\n'; LOCK_WORD_LEN], LOCK_WORD_AT)
+                    .context("clear the init lock's word")?;
                 return Ok(Self { file });
             }
-            if std::time::Instant::now() >= deadline {
+            // Held. After the short wait: if it is held for the walk
+            // of a profile, say so now.
+            if waited() >= ask_after_ms && word_says_profile_operation(&file) {
+                return Err(anyhow::Error::new(ProfileBusy));
+            }
+            if waited() >= timeout_ms {
                 bail!(
-                    "init lock {} not acquired within {ACQUIRE_TIMEOUT_MS}ms — \
+                    "init lock {} not acquired within {timeout_ms}ms — \
                      another srt-win/broker is holding it (wedged?)",
                     path.display(),
                 );
@@ -219,6 +435,107 @@ impl InitMutex {
 /// acquire the session init lock without opening the session DB.
 pub fn acquire_session_lock() -> Result<impl Drop> {
     InitMutex::acquire()
+}
+
+use crate::profile::is_access_denied;
+
+/// Every live holder of anything: `(process, kind, path)` of each
+/// holder row whose process is alive, except those of `except`. Call
+/// under the init lock, after crash recovery has dropped the rows of
+/// holders that are gone.
+///
+/// This is what a profile grant, a profile forget and an uninstall
+/// look at before they change anything: they run only on a quiet
+/// machine, where no session and no sandboxed command exists.
+pub fn live_holders(db: &Locked, except: Option<u32>) -> Result<Vec<KeptHolder>> {
+    live_holders_with(db.conn(), except, alive_by_one_snapshot()?)
+}
+
+fn live_holders_with(
+    conn: &Connection,
+    except: Option<u32>,
+    alive: impl Fn(u32, i64) -> bool,
+) -> Result<Vec<KeptHolder>> {
+    let rows: Vec<(i64, i64, String, String)> = query_vec(
+        conn,
+        "SELECT h.pid, b.process_create_time, h.kind, h.canonical_path \
+         FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
+         ORDER BY h.pid, h.kind, h.canonical_path",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter(|&(pid, ct, _, _)| Some(pid as u32) != except && alive(pid as u32, ct))
+        .map(|(pid, _, kind, path)| KeptHolder {
+            pid: pid as u32,
+            kind,
+            path,
+        })
+        .collect())
+}
+
+/// The live process `pid`, if it is recorded as a session (a holder
+/// of the profile read grant: it registered at its start and has not
+/// released since) — as a handle that can be waited on, so that a
+/// command started for it ends with it.
+///
+/// `None` when it is not recorded, or is gone (its pid nobody's, or
+/// another process's now): the command then holds for itself, as one
+/// with no session behind it does. An error when it is recorded and
+/// alive and cannot be watched: nothing is started for a session
+/// whose end would go unnoticed.
+///
+/// Read from the database without the init lock: it decides only
+/// whether a command takes a hold of its own, and a wrong "no" costs
+/// one hold too many.
+pub fn watch_session(pid: u32) -> Result<Option<crate::util::OwnedHandle>> {
+    let Ok(Some(conn)) = open_db_ro() else {
+        return Ok(None);
+    };
+    let recorded = conn
+        .query_row(
+            "SELECT b.process_create_time FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
+             WHERE h.pid = ?1 AND h.kind = ?2",
+            params![pid as i64, KIND_KEPT_PROFILE],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let Some(recorded) = recorded else {
+        return Ok(None);
+    };
+    if !(DISK.alive)(pid, recorded) {
+        return Ok(None);
+    }
+    let opened = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION
+                | windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    };
+    let h = match opened {
+        Ok(h) if !h.is_invalid() => crate::util::OwnedHandle(h),
+        // Gone between the look and the open.
+        _ if !(DISK.alive)(pid, recorded) => return Ok(None),
+        Ok(_) => bail!("the session this command belongs to (process {pid}) cannot be watched"),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("the session this command belongs to (process {pid}) cannot be watched")
+            });
+        }
+    };
+    // The handle is the holder's, not that of a process that has its
+    // pid since: by the creation time read THROUGH it.
+    let created = process_create_time(h.raw())
+        .with_context(|| format!("the session's process {pid} cannot be identified"))?;
+    if created != recorded || unsafe { WaitForSingleObject(h.raw(), 0) } == WAIT_OBJECT_0 {
+        return Ok(None);
+    }
+    Ok(Some(h))
 }
 
 /// Open (creating if needed) the per-user SESSION DB. Stamps the
@@ -297,9 +614,70 @@ pub fn open_db() -> Result<Connection> {
 }
 
 /// Filter on `release_aces` for the deny-ACE lifecycle.
-pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete"];
+pub const KIND_DENY: &[&str] = &["deny", "deny_fdc", "deny_delete", KIND_DENY_SATISFIED];
+/// A read deny the holder asked for that could not be written because
+/// the object's access list may not be changed, on an object whose
+/// own access list gave the sandbox account no read at the time. No
+/// ACE stands behind the row and no `working_aces` row: it is there so
+/// the deny is not invisible — it shows among the holder's holds, is
+/// released with them, and names the path to look at again.
+pub const KIND_DENY_SATISFIED: &str = "deny_satisfied";
 /// Filter on `release_aces` for the grant lifecycle.
 pub const KIND_GRANT: &[&str] = &["grant"];
+/// Holder rows that record no ACE of the holder's own: that a session
+/// is RUNNING ON a grant kept between sessions — a kept write root
+/// (`kept_root`, by root path) or the profile read grant (`profile`,
+/// by profile directory). Nothing is written for them and they have
+/// no `working_aces` row. They exist so that removing a kept grant
+/// can first ask whether a live session depends on it
+/// ([`Locked::other_kept_holders`]); they go when the session
+/// releases its grants, or with its broker row when crash recovery
+/// finds the holder dead.
+pub const KIND_KEPT_ROOT: &str = "kept_root";
+pub const KIND_KEPT_PROFILE: &str = "profile";
+/// What a `profile` hold names. It is one resource — the calling
+/// user's profile read grant, whether or not one is recorded at the
+/// moment — and not a path. Every session, under either token, and
+/// every command with no session behind it holds it from its start:
+/// it is what says "a sandboxed process may exist", and the grant is
+/// made, refreshed or removed only while nobody holds it.
+pub const KEPT_PROFILE_PATH: &str = "(profile)";
+
+/// A live session, other than the caller's, running on a kept grant.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct KeptHolder {
+    pub pid: u32,
+    /// [`KIND_KEPT_ROOT`] or [`KIND_KEPT_PROFILE`].
+    pub kind: String,
+    pub path: String,
+}
+
+/// The kept-grant holds of every holder but `except` whose process is
+/// alive ([`Disk::alive`]: same PID, same creation time).
+fn kept_holders_with(
+    conn: &Connection,
+    except: i64,
+    alive: impl Fn(u32, i64) -> bool,
+) -> Result<Vec<KeptHolder>> {
+    let rows: Vec<(i64, i64, String, String)> = query_vec(
+        conn,
+        "SELECT h.pid, b.process_create_time, h.kind, h.canonical_path \
+         FROM ace_holders h JOIN brokers b ON b.pid = h.pid \
+         WHERE h.kind IN ('kept_root', 'profile') AND h.pid != ?1 \
+         ORDER BY h.pid, h.kind, h.canonical_path",
+        params![except],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    Ok(rows
+        .into_iter()
+        .filter(|&(pid, ct, _, _)| alive(pid as u32, ct))
+        .map(|(pid, _, kind, path)| KeptHolder {
+            pid: pid as u32,
+            kind,
+            path,
+        })
+        .collect())
+}
 
 /// `prepare → query_map → collect` with one error context. Shared
 /// by every "list of T from one query" site so error plumbing is
@@ -488,6 +866,18 @@ pub(crate) fn open_db_at(
     Ok(conn)
 }
 
+/// A fresh in-memory session database, for tests of the modules that
+/// keep their tables in it.
+#[cfg(test)]
+pub(crate) fn open_memory_db_for_tests() -> Connection {
+    open_db_at(
+        std::path::Path::new(":memory:"),
+        SESSION_SCHEMA_SQL,
+        SESSION_SCHEMA_VERSION,
+    )
+    .expect("in-memory session database")
+}
+
 /// The machine-wide store dir: `%ProgramData%\sandbox-runtime` —
 /// since the move of credential/marker/identity/CA-record/ambient
 /// state to `HKLM\SOFTWARE\sandbox-runtime` ([`crate::reg`]), this
@@ -550,6 +940,42 @@ pub fn with_init_lock<R>(
     Ok((out, report))
 }
 
+/// [`with_init_lock`] WITHOUT crash recovery, for a command that only
+/// records its own hold. Recovery releases what dead holders left;
+/// when that happens is the business of the session commands (`acl
+/// grant`, `stamp`, `revoke`, `restore`, `recover`), not of every
+/// sandboxed command that starts.
+pub fn with_init_lock_unrecovered<R>(
+    holder_pid: HolderPid,
+    f: impl FnOnce(&mut Locked) -> Result<R>,
+) -> Result<R> {
+    let _mutex = InitMutex::acquire()?;
+    let mut locked = Locked {
+        conn: open_db()?,
+        holder_pid,
+    };
+    f(&mut locked)
+}
+
+/// [`with_init_lock`] for a profile grant or forget: the same lock, held for the whole run. Once `f` has
+/// found the machine quiet it calls [`mark_profile_operation`], and
+/// from then a session start or a command that needs the lock is told
+/// at once what it is waiting for ([`ProfileBusy`]) instead of
+/// waiting it out.
+///
+/// The profile's entries change only inside this: no session start,
+/// no stamp and no strip runs beside it, and `f` is expected to refuse
+/// if [`live_holders`] finds anyone. A session's view of the profile
+/// grant is therefore fixed from its start to its end.
+pub fn with_profile_lock<R>(f: impl FnOnce(&mut Locked) -> Result<R>) -> Result<R> {
+    let (_mutex, conn, _report) = locked_recovered(false)?;
+    let mut locked = Locked {
+        conn,
+        holder_pid: HolderPid(std::process::id()),
+    };
+    f(&mut locked)
+}
+
 /// The shared critical-section preamble of [`with_init_lock`] and
 /// [`with_install_lock`]: acquire the init mutex, open the DB, run
 /// crash recovery. Keep the mutex guard alive for the whole
@@ -577,6 +1003,11 @@ pub struct Locked {
 }
 
 impl Locked {
+    /// The session DB connection, for `persist.rs`'s own tables.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Record `self.holder_pid` in `brokers`. The row's
     /// `process_create_time` is the HOLDER's, so crash-recovery
     /// checks whether the holder — not this short-lived CLI — is
@@ -605,6 +1036,89 @@ impl Locked {
             )
             .context("INSERT brokers")?;
         Ok(())
+    }
+
+    /// Record that the holder's session runs on these kept grants:
+    /// each kept write root, and the profile read grant if `profile`
+    /// names the profile it is recorded for. Idempotent.
+    pub fn hold_kept(&self, roots: &[String], profile: Option<&str>) -> Result<()> {
+        if roots.is_empty() && profile.is_none() {
+            return Ok(());
+        }
+        self.register_broker()?;
+        let pid = self.holder_pid.0 as i64;
+        let mut insert = self.conn.prepare_cached(
+            "INSERT OR IGNORE INTO ace_holders (canonical_path, kind, pid, want_mask) \
+             VALUES (?1, ?2, ?3, '')",
+        )?;
+        for root in roots {
+            insert
+                .execute(params![root, KIND_KEPT_ROOT, pid])
+                .context("INSERT kept-root hold")?;
+        }
+        if let Some(profile) = profile {
+            insert
+                .execute(params![profile, KIND_KEPT_PROFILE, pid])
+                .context("INSERT profile hold")?;
+        }
+        Ok(())
+    }
+
+    /// Record a read deny of the holder that the object's own access
+    /// list stands in for ([`KIND_DENY_SATISFIED`]).
+    ///
+    /// The attempt to write the deny recorded it first (a holder row
+    /// and a `working_aces` row, so that a crash between record and
+    /// write is recovered). Nothing of ours is on the object, so those
+    /// go: left behind, their release at session end would try the
+    /// same write, fail the same way, and keep the holder registered
+    /// for as long as it lives. What remains is this row alone, and
+    /// releasing it is a row delete.
+    fn note_satisfied_deny(&self, canon: &str) -> Result<()> {
+        delete_holder(&self.conn, Some(self.holder_pid.0 as i64), canon, "deny")?;
+        self.conn
+            .execute(
+                "DELETE FROM working_aces WHERE canonical_path = ?1 AND kind = ?2 \
+                 AND NOT EXISTS (SELECT 1 FROM ace_holders \
+                                 WHERE canonical_path = ?1 AND kind = ?2)",
+                params![canon, "deny"],
+            )
+            .context("DELETE unwritten deny")?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO ace_holders (canonical_path, kind, pid, want_mask) \
+                 VALUES (?1, ?2, ?3, 'denyRead')",
+                params![canon, KIND_DENY_SATISFIED, self.holder_pid.0 as i64],
+            )
+            .context("INSERT satisfied deny")?;
+        Ok(())
+    }
+
+    /// Drop the holder's kept-grant holds (its session, or its one
+    /// command, is ending). The broker row goes with the last hold of
+    /// any kind.
+    pub fn release_kept(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM ace_holders WHERE pid = ?1 AND kind IN ('kept_root', 'profile')",
+                params![self.holder_pid.0 as i64],
+            )
+            .context("DELETE kept holds")?;
+        if self.my_ace_holds(None)?.is_empty() {
+            self.unregister_broker()?;
+        }
+        Ok(())
+    }
+
+    /// The live sessions, other than the holder's own, that run on a
+    /// kept grant. Crash recovery has already run under this lock, so
+    /// a holder that died is not among them.
+    pub fn other_kept_holders(&self) -> Result<Vec<KeptHolder>> {
+        kept_holders_with(
+            &self.conn,
+            self.holder_pid.0 as i64,
+            alive_by_one_snapshot()?,
+        )
     }
 
     /// Remove the holder's `brokers` row. CASCADE drops its
@@ -671,6 +1185,23 @@ impl Locked {
         sandbox_sid: &str,
         targets: &[(String, SbAce)],
     ) -> Result<(Vec<AceWitness>, usize)> {
+        self.apply_aces_and(sandbox_sid, targets, &[])
+    }
+
+    /// [`Self::apply_aces`], plus a read deny on each of `also`: the
+    /// recorded paths of the profile read grant that a read deny among
+    /// `targets` has to be written on as well. They are held and
+    /// released like any other deny of the holder, and differ in two
+    /// ways: their parent gets no delete-child deny (nothing in the
+    /// profile is writable to begin with), and one that is no longer
+    /// there — removed since the grant recorded it — is passed over
+    /// instead of failing the batch.
+    pub fn apply_aces_and(
+        &self,
+        sandbox_sid: &str,
+        targets: &[(String, SbAce)],
+        also: &[String],
+    ) -> Result<(Vec<AceWitness>, usize)> {
         self.with_broker_registration(sandbox_sid, |db| {
             let mut witnesses = Vec::with_capacity(targets.len());
             let mut failed = 0usize;
@@ -679,6 +1210,30 @@ impl Locked {
                     Ok(w) => {
                         witnesses.push(w);
                         true
+                    }
+                    // A read deny that cannot be written on an object
+                    // whose own access list already gives the sandbox
+                    // account no read is what the deny asks for. One
+                    // that cannot be written where the account CAN
+                    // read fails the batch, as before.
+                    // Only where the access list may not be CHANGED
+                    // (access denied): every other refusal — a file
+                    // with other hard links, an object that is not the
+                    // recorded one — fails the batch as it always did.
+                    Err(e)
+                        if ace == SbAce::Deny(crate::acl::DenyMask::ReadDeny)
+                            && is_access_denied(&e)
+                            && crate::profile::closed_to_sandbox(canon) =>
+                    {
+                        eprintln!(
+                            "srt-win: '{canon}' cannot be given a read deny and is closed to \
+                             the sandbox account by its own access list"
+                        );
+                        if let Err(e) = db.note_satisfied_deny(canon) {
+                            eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
+                            failed += 1;
+                        }
+                        false
                     }
                     Err(e) => {
                         eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
@@ -699,6 +1254,26 @@ impl Locked {
                     && let Some(p) = path_id::canonical_parent_of(canon)
                 {
                     one(&p, SbAce::DenyFdc);
+                }
+            }
+            let read_deny = SbAce::Deny(crate::acl::DenyMask::ReadDeny);
+            for canon in also {
+                match db.ensure_ace(canon, read_deny, sandbox_sid) {
+                    Ok(w) => witnesses.push(w),
+                    Err(e) if path_id::is_not_found(&e) => {}
+                    // Cannot be written, and its own access list
+                    // already gives the sandbox account no read:
+                    // recorded as such, not passed over.
+                    Err(e) if is_access_denied(&e) && crate::profile::closed_to_sandbox(canon) => {
+                        if let Err(e) = db.note_satisfied_deny(canon) {
+                            eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
+                            failed += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
+                        failed += 1;
+                    }
                 }
             }
             Ok((witnesses, failed))
@@ -811,118 +1386,20 @@ impl Locked {
 
     /// `MAX(want_mask)` across live holders of `(canon, kind)`.
     fn effective_ace(&self, canon: &str, kind: &str) -> Result<Option<SbAce>> {
-        let masks: Vec<String> = query_vec(
-            &self.conn,
-            "SELECT want_mask FROM ace_holders \
-             WHERE canonical_path = ?1 AND kind = ?2",
-            params![canon, kind],
-            |r| r.get(0),
-        )?;
-        masks
-            .iter()
-            .map(|m| SbAce::parse(kind, m))
-            .reduce(|a, b| Ok(a?.max(b?)))
-            .transpose()
+        effective_ace(&self.conn, canon, kind)
     }
 
-    /// Release one `(canon, kind)` hold; recompute the effective ACE
-    /// from the remaining holders (downgrade if this holder was the
-    /// one that escalated it; revoke when zero remain).
-    /// Identity-validated: if the path now resolves to a different
-    /// `file_id`, the row is dropped and the ACE on the foreign
-    /// object is NOT touched — except for `Grant`, where we
-    /// best-effort `locate_by_file_id` and revoke at the moved path
-    /// so the sandbox user does not keep stale access.
+    /// Release this holder's `(canon, kind)` hold — see
+    /// [`release_hold`].
     fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
-        self.conn
-            .prepare_cached(
-                "DELETE FROM ace_holders WHERE canonical_path = ?1 \
-                 AND kind = ?2 AND pid = ?3",
-            )?
-            .execute(params![canon, kind, self.holder_pid.0 as i64])
-            .context("DELETE ace_holders (self)")?;
-        let row: Option<(Vec<u8>, String)> = self
-            .conn
-            .prepare_cached(
-                "SELECT file_id, mask FROM working_aces \
-                 WHERE canonical_path = ?1 AND kind = ?2",
-            )?
-            .query_row(params![canon, kind], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?;
-        let Some((fid, stored)) = row else {
-            return Ok(AceRelease::NoRow);
-        };
-        let new_eff = self.effective_ace(canon, kind)?;
-        // Row update first (record-first), then converge disk.
-        match new_eff {
-            Some(e) => self
-                .conn
-                .execute(
-                    "UPDATE working_aces SET mask = ?3 \
-                     WHERE canonical_path = ?1 AND kind = ?2",
-                    params![canon, kind, e.as_str()],
-                )
-                .context("UPDATE working_aces (downgrade)")?,
-            None => self
-                .conn
-                .execute(
-                    "DELETE FROM working_aces \
-                     WHERE canonical_path = ?1 AND kind = ?2",
-                    params![canon, kind],
-                )
-                .context("DELETE working_aces")?,
-        };
-        let want_id = FileId::from_bytes(&fid)?;
-        match identity_gate(canon, want_id) {
-            IdGate::Match => {
-                recompose_at(&self.conn, canon, sandbox_sid)?;
-                Ok(match new_eff {
-                    Some(e) if e.as_str() == stored => AceRelease::StillHeld,
-                    Some(_) => AceRelease::Downgraded,
-                    None => AceRelease::Revoked,
-                })
-            }
-            IdGate::Mismatch if kind == "grant" => {
-                // The granted object moved. The ALLOW ACE travels
-                // with the inode → the sandbox user still has
-                // access at the new path. Chase by file_id and
-                // revoke there (then re-converge if the new path
-                // happens to be tracked too). DENY/FDC are left in
-                // place on the moved inode (fail-closed).
-                Ok(match path_id::locate_by_file_id(&want_id) {
-                    Some(at) => {
-                        eprintln!(
-                            "srt-win: grant '{canon}': file_id moved \
-                             to '{at}'; revoking there"
-                        );
-                        recompose_at(&self.conn, &at, sandbox_sid)?;
-                        AceRelease::Relocated { moved_to: at }
-                    }
-                    None => {
-                        eprintln!(
-                            "srt-win: grant '{canon}': file_id not \
-                             found on volume; dropping row"
-                        );
-                        AceRelease::Missing
-                    }
-                })
-            }
-            IdGate::Mismatch => {
-                eprintln!(
-                    "srt-win: {kind} '{canon}': file_id mismatch — \
-                     path substituted; not touching ACE on the \
-                     foreign object (fail-closed)"
-                );
-                Ok(AceRelease::Mismatch)
-            }
-            IdGate::Unreadable => {
-                eprintln!(
-                    "srt-win: {kind} '{canon}': open failed; \
-                     dropping row"
-                );
-                Ok(AceRelease::Missing)
-            }
-        }
+        release_hold(
+            &self.conn,
+            Some(self.holder_pid.0 as i64),
+            canon,
+            kind,
+            sandbox_sid,
+            &DISK,
+        )
     }
 
     /// `(canon, kind)` rows held by this holder, optionally filtered
@@ -944,7 +1421,9 @@ impl Locked {
     /// Release every ACE hold of `self.holder_pid` for the given
     /// `kinds` ([`KIND_GRANT`] for `acl revoke`; [`KIND_DENY`] for
     /// `acl restore --sandbox-user-sid`) and unregister if no holds
-    /// of any kind remain. Per-path catch-and-continue.
+    /// of any kind remain. Per-path catch-and-continue: a path whose
+    /// release errored is reported as [`AceRelease::Failed`] (and
+    /// counted in the second tuple field); its rows are still held.
     pub fn release_aces(
         &self,
         sandbox_sid: &str,
@@ -959,8 +1438,9 @@ impl Locked {
                 Err(e) => {
                     eprintln!(
                         "srt-win: WARNING: release {kind} '{canon}': \
-                         {e:#}; ACE left in place"
+                         {e:#}; ACE left in place, rows kept for retry"
                     );
+                    out.push((canon.clone(), AceRelease::Failed));
                     failed += 1;
                 }
             }
@@ -1044,7 +1524,13 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
     if crate::install::ambient_deny_recorded(canon) {
         set.deny.get_or_insert(acl::DenyMask::WriteDeny);
     }
-    acl::apply_sandbox_aces(canon, sandbox_sid, set)
+    // The sandbox group, for the one place where a session's allow
+    // goes ahead of another entry of ours (`apply_sandbox_aces_over`).
+    let group = crate::install::read_setup()
+        .ok()
+        .flatten()
+        .map(|s| s.sandbox_group_sid);
+    acl::apply_sandbox_aces_over(canon, sandbox_sid, set, group.as_deref())
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
 }
 
@@ -1079,13 +1565,29 @@ pub enum AceRelease {
     /// `file_id` mismatch — row deleted, ACE on the foreign object
     /// not touched.
     Mismatch,
-    /// Path no longer opens — row deleted.
+    /// The object is positively gone — the path is not found AND,
+    /// for a grant, its volume reports no file with the recorded
+    /// `file_id`. Row deleted.
     Missing,
     /// Holder row removed but no `working_aces` row found.
     NoRow,
+    /// Where the ACE is now could not be established (the path could
+    /// not be opened for a reason other than not-found, or a moved
+    /// grant could not be located by `file_id`). Nothing was changed:
+    /// the holder row and the `working_aces` row are kept, and the
+    /// ACE may still be on disk.
+    Unreadable,
+    /// The release errored (row update or converge). Nothing was
+    /// changed: rows kept, ACE may still be on disk.
+    Failed,
 }
 
 impl AceRelease {
+    /// The rows are still there and the ACE may still be on disk.
+    pub fn is_pending(&self) -> bool {
+        matches!(self, AceRelease::Unreadable | AceRelease::Failed)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             AceRelease::Revoked => "revoked",
@@ -1095,18 +1597,283 @@ impl AceRelease {
             AceRelease::Mismatch => "mismatch",
             AceRelease::Missing => "missing",
             AceRelease::NoRow => "noRow",
+            AceRelease::Unreadable => "unreadable",
+            AceRelease::Failed => "failed",
         }
     }
 }
 
-/// Prune dead brokers and revoke any sandbox-user ACEs they orphaned.
+/// The filesystem and process probes a release or recovery performs.
+/// Injectable so the row bookkeeping can be unit-tested without real
+/// ACLs or processes.
+struct Disk {
+    gate: fn(&str, FileId) -> IdGate,
+    locate: fn(&FileId) -> path_id::Located,
+    converge: fn(&Connection, &str, &str) -> Result<()>,
+    alive: fn(u32, i64) -> bool,
+}
+
+const DISK: Disk = Disk {
+    gate: identity_gate,
+    locate: path_id::locate_by_file_id,
+    converge: recompose_at,
+    alive: is_process_alive,
+};
+
+/// `MAX(want_mask)` across the holders of `(canon, kind)`.
+fn effective_ace(conn: &Connection, canon: &str, kind: &str) -> Result<Option<SbAce>> {
+    let masks: Vec<String> = query_vec(
+        conn,
+        "SELECT want_mask FROM ace_holders \
+         WHERE canonical_path = ?1 AND kind = ?2",
+        params![canon, kind],
+        |r| r.get(0),
+    )?;
+    masks
+        .iter()
+        .map(|m| SbAce::parse(kind, m))
+        .reduce(|a, b| Ok(a?.max(b?)))
+        .transpose()
+}
+
+fn delete_holder(conn: &Connection, holder: Option<i64>, canon: &str, kind: &str) -> Result<()> {
+    if let Some(pid) = holder {
+        conn.prepare_cached(
+            "DELETE FROM ace_holders WHERE canonical_path = ?1 \
+             AND kind = ?2 AND pid = ?3",
+        )?
+        .execute(params![canon, kind, pid])
+        .context("DELETE ace_holders")?;
+    }
+    Ok(())
+}
+
+/// Release `holder`'s hold on `(canon, kind)` (`None`: a row that
+/// has no holder left); recompute the effective ACE from the
+/// remaining holders (downgrade if this holder was the one that
+/// escalated it; revoke when zero remain).
 ///
-/// Per-path commit: the dead-broker prune is one short tx (pure DB,
-/// CASCADE); then each orphan's (recompose FS mutation + row
-/// delete) is committed independently, so a failure on path Y
-/// leaves path X's recompose+delete durable. `force` is reserved
-/// for a future "force-recompose ignoring file-id mismatch" mode.
+/// Two rules keep a row for every ACE that may still be on disk:
+///
+/// 1. Where the ACE is now is established BEFORE any row changes.
+///    If the path now resolves to a different `file_id` (or is not
+///    found), the ACE on the foreign object is NOT touched — except
+///    for `grant`, where the ALLOW ACE travelled with the object, so
+///    it is chased by `file_id` and revoked at the moved path. A
+///    failed open is not evidence of absence — the sandboxed process
+///    can provoke one — so anything short of a positive answer
+///    returns [`AceRelease::Unreadable`] with nothing changed.
+/// 2. The row changes and the converge are one transaction,
+///    committed only after the converge succeeded. The converge reads
+///    `working_aces` through the same connection, so it sees the
+///    pending row changes; an error (or a crash) rolls them back and
+///    the rows are there for the next release or recovery. Deleting
+///    the rows first and converging afterwards would leave the ACE on
+///    disk with nothing recording it whenever the converge failed.
+fn release_hold(
+    conn: &Connection,
+    holder: Option<i64>,
+    canon: &str,
+    kind: &str,
+    sandbox_sid: &str,
+    disk: &Disk,
+) -> Result<AceRelease> {
+    let row: Option<(Vec<u8>, String)> = conn
+        .prepare_cached(
+            "SELECT file_id, mask FROM working_aces \
+             WHERE canonical_path = ?1 AND kind = ?2",
+        )?
+        .query_row(params![canon, kind], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((fid, stored)) = row else {
+        delete_holder(conn, holder, canon, kind)?;
+        return Ok(AceRelease::NoRow);
+    };
+    let want_id = FileId::from_bytes(&fid)?;
+
+    enum Site {
+        Here,
+        Moved(String),
+        Gone,
+        Foreign,
+    }
+    let site = match (disk.gate)(canon, want_id) {
+        IdGate::Match => Site::Here,
+        IdGate::Unreadable => {
+            eprintln!(
+                "srt-win: {kind} '{canon}': open failed; ACE left \
+                 in place, rows kept for retry"
+            );
+            return Ok(AceRelease::Unreadable);
+        }
+        // The granted object moved (or its path was swapped). The
+        // ALLOW ACE travels with the object → the sandbox user still
+        // has access at the new path. Chase by file_id and revoke
+        // there (then re-converge if the new path happens to be
+        // tracked too).
+        IdGate::Mismatch if kind == "grant" => match (disk.locate)(&want_id) {
+            path_id::Located::At(at) => Site::Moved(at),
+            path_id::Located::Gone => Site::Gone,
+            path_id::Located::Unknown | path_id::Located::VolumeAbsent => {
+                eprintln!(
+                    "srt-win: grant '{canon}': not at its path and \
+                     could not be located by file_id; ACE may \
+                     still be on disk, rows kept for retry"
+                );
+                return Ok(AceRelease::Unreadable);
+            }
+        },
+        // DENY/FDC are left in place on the moved object
+        // (fail-closed).
+        IdGate::Mismatch => Site::Foreign,
+    };
+
+    let tx = conn.unchecked_transaction().context("begin release tx")?;
+    delete_holder(&tx, holder, canon, kind)?;
+    let new_eff = effective_ace(&tx, canon, kind)?;
+    match new_eff {
+        Some(e) => tx
+            .execute(
+                "UPDATE working_aces SET mask = ?3 \
+                 WHERE canonical_path = ?1 AND kind = ?2",
+                params![canon, kind, e.as_str()],
+            )
+            .context("UPDATE working_aces (downgrade)")?,
+        None => tx
+            .execute(
+                "DELETE FROM working_aces \
+                 WHERE canonical_path = ?1 AND kind = ?2",
+                params![canon, kind],
+            )
+            .context("DELETE working_aces")?,
+    };
+    let out = match site {
+        Site::Here => {
+            (disk.converge)(&tx, canon, sandbox_sid)?;
+            match new_eff {
+                Some(e) if e.as_str() == stored => AceRelease::StillHeld,
+                Some(_) => AceRelease::Downgraded,
+                None => AceRelease::Revoked,
+            }
+        }
+        Site::Moved(at) => {
+            eprintln!(
+                "srt-win: grant '{canon}': file_id moved to '{at}'; \
+                 revoking there"
+            );
+            (disk.converge)(&tx, &at, sandbox_sid)?;
+            AceRelease::Relocated { moved_to: at }
+        }
+        Site::Gone => {
+            eprintln!(
+                "srt-win: grant '{canon}': path and file_id both \
+                 gone; dropping row"
+            );
+            AceRelease::Missing
+        }
+        Site::Foreign => {
+            eprintln!(
+                "srt-win: {kind} '{canon}': file_id mismatch — \
+                 path substituted; not touching ACE on the \
+                 foreign object (fail-closed)"
+            );
+            AceRelease::Mismatch
+        }
+    };
+    tx.commit().context("commit release")?;
+    Ok(out)
+}
+
+/// Release the holds of dead brokers, then prune them.
+///
+/// Per-path commit: each hold's (converge + row change) is its own
+/// transaction ([`release_hold`]), so a failure on path Y leaves path
+/// X's release durable. `force` is reserved for a future
+/// "force-recompose ignoring file-id mismatch" mode.
 fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
+    // Identity comes from the VALIDATED machine-store read (name↔SID
+    // + sandbox-group membership against SAM), never from raw rows:
+    // the session DB is user-writable, and this SID is about to be
+    // written into DACLs. No valid identity → no disk work (the
+    // session rows stay put for a later recovery).
+    let sb = crate::install::read_setup()?.map(|s| s.sandbox_user_sid);
+    let _ = force; // reserved for a future "force-recompose" mode
+    let report = recover_with(conn, sb.as_deref(), &DISK)?;
+    // Persistent-grant DACL writes that were started and not seen to
+    // finish (they have no holder, so nothing above covers them).
+    crate::persist::replay_pending(conn);
+    Ok(report)
+}
+
+/// Release `(canon, kind)` for recovery; `false` when its rows are
+/// still there (so the caller must not go on to dependent rows).
+fn recover_one(
+    conn: &Connection,
+    holder: Option<i64>,
+    canon: &str,
+    kind: &str,
+    sb: &str,
+    disk: &Disk,
+    report: &mut RecoveryReport,
+) -> bool {
+    let done = match release_hold(conn, holder, canon, kind, sb, disk) {
+        Ok(r) if r.is_pending() => false,
+        Ok(AceRelease::StillHeld | AceRelease::Downgraded | AceRelease::NoRow) => true,
+        Ok(_) => {
+            report.aces_revoked += 1;
+            true
+        }
+        Err(e) => {
+            eprintln!(
+                "srt-win: WARNING: recover {kind} '{canon}': {e:#}; \
+                 ACE left in place, rows kept for retry"
+            );
+            false
+        }
+    };
+    if !done && kind == "grant" {
+        report.grants_pending.push(canon.to_string());
+    }
+    done
+}
+
+/// Release `holds` grants-first. The non-grant rows are released
+/// only if every grant was — and not at all when `blocked`: a deny,
+/// deny-delete or parent delete-child ACE must outlive every grant it
+/// was stamped under.
+fn recover_holds(
+    conn: &Connection,
+    holder: Option<i64>,
+    holds: &[(String, String)],
+    blocked: bool,
+    sb: &str,
+    disk: &Disk,
+    report: &mut RecoveryReport,
+) {
+    let mut blocked = blocked;
+    for (canon, kind) in holds.iter().filter(|(_, k)| k == "grant") {
+        blocked |= !recover_one(conn, holder, canon, kind, sb, disk, report);
+    }
+    let denies = holds.iter().filter(|(_, k)| k != "grant");
+    if blocked {
+        let kept = denies.count();
+        if kept > 0 {
+            eprintln!(
+                "srt-win: WARNING: a grant{} could not be released; \
+                 keeping {kept} deny row(s) until it can",
+                holder
+                    .map(|p| format!(" of dead holder {p}"))
+                    .unwrap_or_default(),
+            );
+        }
+        return;
+    }
+    for (canon, kind) in denies {
+        recover_one(conn, holder, canon, kind, sb, disk, report);
+    }
+}
+
+fn recover_with(conn: &Connection, sb: Option<&str>, disk: &Disk) -> Result<RecoveryReport> {
     let mut report = RecoveryReport::default();
 
     // 1. Find dead brokers.
@@ -1117,80 +1884,63 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     )?
     .into_iter()
-    .filter(|&(pid, ct)| !is_process_alive(pid as u32, ct))
+    .filter(|&(pid, ct)| !(disk.alive)(pid as u32, ct))
     .map(|(pid, _)| pid)
     .collect();
-    // 2. Delete dead brokers in one short tx; CASCADE drops their
-    //    holder rows. (No-op if none — but still cheap.)
-    if !dead.is_empty() {
-        report.dead_brokers = dead.len() as u32;
-        let tx = conn
-            .unchecked_transaction()
-            .context("begin prune-dead tx")?;
-        for pid_i in &dead {
-            tx.execute("DELETE FROM brokers WHERE pid = ?1", params![pid_i])
-                .context("DELETE dead broker")?;
-        }
-        tx.commit().context("commit prune-dead")?;
-    }
-    // Even with no dead brokers there can be orphaned ACE rows
-    // (a broker that unregistered but crashed before releasing), so
-    // always run step 3.
 
-    // 3. Orphaned sandbox-user ACEs: any working_aces row with
-    //     zero ace_holders is one whose holder died (CASCADE
-    //     dropped the holder row above). Re-converge the path —
-    //     `recompose_at` reads the (possibly remaining) rows and
-    //     applies exactly that, so a path with one orphaned kind
-    //     and one still-held kind keeps the held one. Sandbox SID
-    //     comes from `read_setup_info` — when no sandbox user is
-    //     provisioned, there are no `working_aces` rows to orphan.
-    // Identity comes from the VALIDATED machine-store read (name↔SID
-    // + sandbox-group membership against SAM), never from raw rows:
-    // the machine DB is Users-writable, and this SID is about to be
-    // written into DACLs. No valid identity → skip disk work
-    // entirely (the session rows stay put for a later recovery).
-    if let Some(sb) = crate::install::read_setup()?.map(|s| s.sandbox_user_sid) {
-        let orphan_aces: Vec<(String, String, Vec<u8>)> = query_vec(
+    // 2. Release each dead broker's holds while its holder rows still
+    //    say whose they are (deleting the broker first would CASCADE
+    //    them away and leave no way to tell which deny rows belong
+    //    with which grants), then prune the broker once it holds
+    //    nothing. A broker with a hold that could not be released
+    //    stays, dead, and is retried by the next recovery.
+    for pid in dead {
+        let holds: Vec<(String, String)> = query_vec(
             conn,
-            "SELECT g.canonical_path, g.kind, g.file_id \
+            "SELECT canonical_path, kind FROM ace_holders \
+             WHERE pid = ?1 ORDER BY canonical_path, kind",
+            params![pid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if let Some(sb) = sb {
+            recover_holds(conn, Some(pid), &holds, false, sb, disk, &mut report);
+        }
+        let left: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM ace_holders WHERE pid = ?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .context("count holds of dead broker")?;
+        if left == 0 {
+            conn.execute("DELETE FROM brokers WHERE pid = ?1", params![pid])
+                .context("DELETE dead broker")?;
+            report.dead_brokers += 1;
+        }
+    }
+
+    // 3. `working_aces` rows with zero `ace_holders` (a holder row
+    //    lost without its release — e.g. rows written before step 2
+    //    kept them). Nothing says which holder a row was for, so
+    //    their deny rows are kept while ANY grant — theirs or a dead
+    //    holder's — is still pending. When no sandbox user is
+    //    provisioned there are no such rows.
+    if let Some(sb) = sb {
+        let orphans: Vec<(String, String)> = query_vec(
+            conn,
+            "SELECT g.canonical_path, g.kind \
              FROM working_aces g \
              LEFT JOIN ace_holders h \
                ON h.canonical_path = g.canonical_path \
               AND h.kind = g.kind \
-             WHERE h.canonical_path IS NULL",
+             WHERE h.canonical_path IS NULL \
+             ORDER BY g.canonical_path, g.kind",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        for (canon, kind, fid) in orphan_aces {
-            conn.execute(
-                "DELETE FROM working_aces \
-                 WHERE canonical_path = ?1 AND kind = ?2",
-                params![&canon, &kind],
-            )
-            .context("DELETE working_aces (orphan)")?;
-            let want = FileId::from_bytes(&fid)?;
-            match identity_gate(&canon, want) {
-                IdGate::Match => {
-                    if let Err(e) = recompose_at(conn, &canon, &sb) {
-                        eprintln!(
-                            "srt-win: orphaned {kind} '{canon}': \
-                             recompose failed ({e:#})"
-                        );
-                        continue;
-                    }
-                }
-                IdGate::Mismatch if kind == "grant" => {
-                    if let Some(at) = path_id::locate_by_file_id(&want) {
-                        let _ = recompose_at(conn, &at, &sb);
-                    }
-                }
-                _ => {} // gone/substituted — nothing on disk to do
-            }
-            report.aces_revoked += 1;
-        }
+        let blocked = !report.grants_pending.is_empty();
+        recover_holds(conn, None, &orphans, blocked, sb, disk, &mut report);
     }
-    let _ = force; // reserved for a future "force-recompose" mode
     Ok(report)
 }
 
@@ -1200,10 +1950,12 @@ enum IdGate {
     Unreadable,
 }
 
-/// `(path, file_id)` identity check. `path` gone
+/// `(path, file_id)` identity check. `path` not found
 /// (ERROR_FILE/PATH_NOT_FOUND) or different inode → `Mismatch`;
 /// any other open error → `Unreadable` (retryable, not a
-/// mismatch).
+/// mismatch). `Mismatch` says only that the recorded object is not
+/// at `path` — renaming an ancestor or swapping a component produces
+/// it while the object, and its ACE, live on elsewhere.
 fn identity_gate(path: &str, expect: FileId) -> IdGate {
     match path_id::capture_file_id(path) {
         Ok(cur) if cur == expect => IdGate::Match,
@@ -1212,10 +1964,7 @@ fn identity_gate(path: &str, expect: FileId) -> IdGate {
             if path_id::is_not_found(&e) {
                 IdGate::Mismatch
             } else {
-                eprintln!(
-                    "srt-win: '{path}': cannot read file_id ({e:#}); \
-                     leaving row (use `acl recover --force`)"
-                );
+                eprintln!("srt-win: '{path}': cannot read file_id ({e:#})");
                 IdGate::Unreadable
             }
         }
@@ -1230,6 +1979,127 @@ fn is_process_alive(pid: u32, expected_create_filetime: i64) -> bool {
         // somehow stale.
         return true;
     }
+    // Decided from the system's process list, which gives every
+    // process's creation time to any caller. Opening the process
+    // instead cannot tell a holder that died, whose pid now belongs to
+    // a process this user may not open, from a live one.
+    match process_create_times() {
+        Ok(all) => listed_alive(&all, pid, expected_create_filetime),
+        // No complete list: the process is asked directly, and
+        // whatever that cannot settle counts as alive — better a stale
+        // row than a live holder reaped and its files restored under
+        // it.
+        Err(_) => is_process_alive_by_opening(pid, expected_create_filetime),
+    }
+}
+
+/// The rule: a holder is DEAD only on positive evidence from a
+/// complete process list — its pid is not in it, or is in it with a
+/// creation time other than the one recorded. A holder recorded with
+/// no creation time (0) cannot be told from whoever has its pid now,
+/// and counts as alive while that pid exists.
+fn listed_alive(all: &std::collections::HashMap<u32, i64>, pid: u32, recorded: i64) -> bool {
+    match all.get(&pid) {
+        None => false,
+        Some(&created) => recorded == 0 || created == recorded,
+    }
+}
+
+/// [`is_process_alive`] over ONE reading of the process list, for a
+/// query that judges a holder per row: a session with hundreds of
+/// rows is one reading, not hundreds.
+///
+/// These queries decide whether something may be removed or changed
+/// beside other sessions. Without a complete list they do not guess:
+/// the query fails, and the operation with it, saying why — it neither
+/// goes ahead nor names a process it cannot identify as a session.
+fn alive_by_one_snapshot() -> Result<impl Fn(u32, i64) -> bool> {
+    let all = process_create_times().context(
+        "cannot tell which sandbox sessions are running (the system's process list could \
+         not be read); nothing was changed",
+    )?;
+    Ok(move |pid, created| pid == std::process::id() || listed_alive(&all, pid, created))
+}
+
+/// Every process on the machine: pid to creation time (a FILETIME as
+/// one integer, the form [`process_create_time`] gives).
+fn process_create_times() -> Result<std::collections::HashMap<u32, i64>> {
+    #[link(name = "ntdll", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn NtQuerySystemInformation(
+            class: u32,
+            info: *mut core::ffi::c_void,
+            len: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    // Of each entry: the offset of the next one (0 at the last), the
+    // creation time, the pid. The layout is the documented one and
+    // the same on every 64-bit Windows.
+    const NEXT_AT: usize = 0;
+    const CREATED_AT: usize = 32;
+    const PID_AT: usize = 80;
+    const ENTRY_MIN: usize = PID_AT + 8;
+
+    let mut buf: Vec<u64> = vec![0; 64 * 1024];
+    for _ in 0..8 {
+        let mut needed = 0u32;
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SYSTEM_PROCESS_INFORMATION,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 8) as u32,
+                &mut needed,
+            )
+        };
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            // More processes than fit, and more may start meanwhile.
+            buf = vec![0; (buf.len() * 2).max(needed as usize / 8 + 1024)];
+            continue;
+        }
+        if status < 0 {
+            bail!("NtQuerySystemInformation(processes): status {status:#x}");
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * 8) };
+        // Only what the system said it wrote.
+        let written = match needed as usize {
+            0 => bytes.len(),
+            n => n.min(bytes.len()),
+        };
+        return parse_process_list(&bytes[..written], NEXT_AT, CREATED_AT, PID_AT, ENTRY_MIN)
+            .context("the process list is incomplete");
+    }
+    bail!("the process list kept growing")
+}
+
+/// The list as pid → creation time, or `None` if it is not complete:
+/// an entry that does not fit in what was written, or a chain that
+/// does not end in a last entry. A list cut short would make every
+/// process after the cut look absent.
+fn parse_process_list(
+    bytes: &[u8],
+    next_at: usize,
+    created_at: usize,
+    pid_at: usize,
+    entry_min: usize,
+) -> Option<std::collections::HashMap<u32, i64>> {
+    let mut out = std::collections::HashMap::new();
+    let mut at = 0usize;
+    loop {
+        let entry = bytes.get(at..).filter(|e| e.len() >= entry_min)?;
+        let u32_at = |o: usize| u32::from_le_bytes(entry[o..o + 4].try_into().unwrap());
+        let i64_at = |o: usize| i64::from_le_bytes(entry[o..o + 8].try_into().unwrap());
+        out.insert(i64_at(pid_at) as u32, i64_at(created_at));
+        match u32_at(next_at) as usize {
+            0 => return Some(out),
+            next => at = at.checked_add(next)?,
+        }
+    }
+}
+
+fn is_process_alive_by_opening(pid: u32, expected_create_filetime: i64) -> bool {
     // SYNCHRONIZE so the WaitForSingleObject(0) signaled-check works.
     let h = match unsafe {
         OpenProcess(
@@ -1419,5 +2289,497 @@ mod tests {
     fn aliveness_bogus_pid_is_dead() {
         // PID 0x7FFF_FFFE is well above any plausible live PID.
         assert!(!is_process_alive(0x7FFF_FFFE, 0));
+    }
+
+    // ── Release / recovery bookkeeping, with the disk side faked ──
+
+    const TREE: &str = r"\\?\C:\tree";
+    const SECRET: &str = r"\\?\C:\tree\secret";
+    const SID: &str = "S-1-5-21-1";
+
+    /// Every probe answers "all good": the object is at its path,
+    /// the converge succeeds, every broker is dead.
+    const OK_DISK: Disk = Disk {
+        gate: |_, _| IdGate::Match,
+        locate: |_| path_id::Located::Gone,
+        converge: |_, _, _| Ok(()),
+        alive: |_, _| false,
+    };
+
+    /// One hold of `pid` on `(canon, kind)`, with its broker and
+    /// working row.
+    fn seed(conn: &Connection, pid: i64, canon: &str, kind: &str, mask: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO brokers (pid, process_create_time, started_at) \
+             VALUES (?1, 0, 0)",
+            params![pid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ace_holders (canonical_path, kind, pid, want_mask) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![canon, kind, pid, mask],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO working_aces (canonical_path, kind, file_id, mask) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![canon, kind, [0u8; 24].as_slice(), mask],
+        )
+        .unwrap();
+    }
+
+    /// `(brokers, ace_holders, working_aces)` row counts.
+    fn counts(conn: &Connection) -> (i64, i64, i64) {
+        let n = |t: &str| -> i64 {
+            conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        (n("brokers"), n("ace_holders"), n("working_aces"))
+    }
+
+    /// One lock for everything. A profile operation that is going
+    /// ahead says so, and a session start or a command gets
+    /// `ProfileBusy` after the short wait instead of waiting it out;
+    /// before it says so, after it has let go, and for a word that is
+    /// not a live profile operation's, it is an ordinary wait.
+    #[test]
+    fn a_profile_operation_going_ahead_is_named_to_those_it_keeps_out() {
+        use std::os::windows::fs::FileExt;
+        let busy = |r: Result<InitMutex>| r.err().is_some_and(|e| e.is::<ProfileBusy>());
+        let held = InitMutex::acquire_within(100, 400).unwrap();
+        // Holding it only — as a command that takes it to refuse does.
+        let r = InitMutex::acquire_within(100, 400);
+        assert!(r.is_err() && !busy(r));
+        assert!(!profile_operation_running());
+        // Going ahead.
+        mark_profile_operation().unwrap();
+        let started = std::time::Instant::now();
+        assert!(busy(InitMutex::acquire_within(200, 5_000)));
+        assert!(started.elapsed().as_millis() < 2_000, "told promptly");
+        assert!(profile_operation_running());
+        // A word of another shape, or of a process that is gone, is
+        // not believed: an older build writes a bare word, a killed
+        // run leaves its own.
+        let file = &held.file;
+        for stale in [&b"profile\n"[..], b"profile 2147483646", b"session\n"] {
+            let mut word = [b'\n'; LOCK_WORD_LEN];
+            word[..stale.len()].copy_from_slice(stale);
+            file.seek_write(&word, LOCK_WORD_AT).unwrap();
+            let r = InitMutex::acquire_within(100, 400);
+            assert!(r.is_err() && !busy(r), "{stale:?}");
+            assert!(!profile_operation_running());
+        }
+        // Released: the word goes with the lock.
+        mark_profile_operation().unwrap();
+        drop(held);
+        assert!(!profile_operation_running());
+        let next = InitMutex::acquire_within(100, 400).unwrap();
+        let mut word = [0u8; LOCK_WORD_LEN];
+        next.file.seek_read(&mut word, LOCK_WORD_AT).unwrap();
+        assert_eq!(profile_word_pid(&word), None);
+        drop(next);
+    }
+
+    /// A holder is alive if the process list has its pid with the
+    /// recorded creation time: a pid that is absent, or that now
+    /// belongs to another process, is dead — whether or not this user
+    /// may open that process.
+    #[test]
+    fn a_holder_is_judged_by_the_process_list() {
+        let all = process_create_times().unwrap();
+        let me = std::process::id();
+        assert_eq!(
+            all.get(&me).copied(),
+            Some(process_create_time(unsafe { GetCurrentProcess() }).unwrap())
+        );
+        // A system process this user may not open, under a creation
+        // time that is not its own: a recycled pid, dead.
+        let (&other, &created) = all.iter().find(|&(&pid, _)| pid != me && pid > 4).unwrap();
+        assert!(is_process_alive(other, created));
+        assert!(!is_process_alive(other, created + 1));
+        assert!(!is_process_alive(4, 1));
+        assert!(!is_process_alive(0x7FFF_FFFE, 0));
+        // Entries are walked by their own offsets.
+        let mut two = vec![0u8; 200];
+        two[0..4].copy_from_slice(&100u32.to_le_bytes());
+        two[32..40].copy_from_slice(&7i64.to_le_bytes());
+        two[80..88].copy_from_slice(&11u64.to_le_bytes());
+        two[132..140].copy_from_slice(&9i64.to_le_bytes());
+        two[180..188].copy_from_slice(&12u64.to_le_bytes());
+        let parsed = parse_process_list(&two, 0, 32, 80, 88).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!((parsed[&11], parsed[&12]), (7, 9));
+        // A list cut short is no list: the second entry is announced
+        // and not all there, or not there at all. Nothing is concluded
+        // from it — least of all that process 12 is gone.
+        assert!(parse_process_list(&two[..150], 0, 32, 80, 88).is_none());
+        assert!(parse_process_list(&two[..100], 0, 32, 80, 88).is_none());
+        assert!(parse_process_list(&two[..40], 0, 32, 80, 88).is_none());
+        assert!(parse_process_list(&[], 0, 32, 80, 88).is_none());
+        // Dead only on positive evidence.
+        assert!(listed_alive(&parsed, 11, 7));
+        assert!(!listed_alive(&parsed, 11, 8), "its pid is another's now");
+        assert!(!listed_alive(&parsed, 13, 7), "its pid is nobody's");
+        // Recorded without a creation time: not told apart from
+        // whoever has the pid, so not declared dead while it exists.
+        assert!(listed_alive(&parsed, 11, 0));
+        assert!(!listed_alive(&parsed, 13, 0));
+        // Every process this one can see directly is in the real list
+        // under the creation time it reports itself — the list and the
+        // recorded value are the same clock, to the tick.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 3 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        let recorded = pid_create_time(child.id()).unwrap();
+        assert!(is_process_alive(child.id(), recorded));
+        assert!(alive_by_one_snapshot().unwrap()(child.id(), recorded));
+        // Gone, it is dead by the same list. An exited process stays
+        // listed until its last handle is closed, and may for a moment
+        // after, so the handle is dropped and the answer is awaited.
+        let pid = child.id();
+        child.kill().ok();
+        child.wait().unwrap();
+        drop(child);
+        let gone = (0..50).any(|_| {
+            if !is_process_alive(pid, recorded) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            false
+        });
+        assert!(gone);
+    }
+
+    /// A read deny the object's own list stands in for leaves one row
+    /// — no deny holder, nothing to take off the object — and
+    /// releasing it leaves no holder at all.
+    #[test]
+    fn a_satisfied_deny_is_released_without_a_write() {
+        with_mem_db(|db| {
+            let canon = r"\\?\C:\Users\me\AppData\Local\Closed";
+            let pid = db.holder_pid.0 as i64;
+            // What the failed attempt to write the deny recorded.
+            seed(db.conn(), pid, canon, "deny", "denyRead");
+            db.note_satisfied_deny(canon).unwrap();
+            let kinds: Vec<String> = query_vec(
+                db.conn(),
+                "SELECT kind FROM ace_holders WHERE canonical_path = ?1",
+                params![canon],
+                |r| r.get(0),
+            )
+            .unwrap();
+            assert_eq!(kinds, [KIND_DENY_SATISFIED]);
+            let working: i64 = db
+                .conn()
+                .query_row("SELECT COUNT(*) FROM working_aces", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(working, 0);
+            assert_eq!(
+                live_holders_with(db.conn(), None, |_, _| true)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let (_, failed) = db.release_aces(SID, KIND_DENY).unwrap();
+            assert_eq!(failed, 0, "nothing was written, nothing fails");
+            assert_eq!(counts(db.conn()), (0, 0, 0));
+            assert!(
+                live_holders_with(db.conn(), None, |_, _| true)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    /// Who runs on a kept grant: live holders other than the caller,
+    /// and never one whose process is gone.
+    #[test]
+    fn kept_grant_holders_are_the_live_other_sessions() {
+        with_mem_db(|db| {
+            let me = db.holder_pid.0 as i64;
+            let (other, dead) = (me + 1, me + 2);
+            let root = r"\\?\C:\work".to_owned();
+            // This session: a root and the profile grant.
+            db.hold_kept(std::slice::from_ref(&root), Some(KEPT_PROFILE_PATH))
+                .unwrap();
+            // Twice is once.
+            db.hold_kept(std::slice::from_ref(&root), Some(KEPT_PROFILE_PATH))
+                .unwrap();
+            assert_eq!(counts(&db.conn), (1, 2, 0));
+            // Nothing held: no broker row is made for it.
+            let alone = Locked {
+                conn: open_memory_db_for_tests(),
+                holder_pid: HolderPid(db.holder_pid.0),
+            };
+            alone.hold_kept(&[], None).unwrap();
+            assert_eq!(counts(&alone.conn), (0, 0, 0));
+            // Another session, and one whose process has died, each
+            // with holds of their own; the other also has an ordinary
+            // session grant, which is not a kept-grant hold.
+            // A holder's liveness is its process's; here a creation
+            // time of 2 stands for a process that is gone.
+            fn alive(_pid: u32, create_time: i64) -> bool {
+                create_time != 2
+            }
+            for (pid, create_time) in [(other, 1), (dead, 2)] {
+                db.conn
+                    .execute(
+                        "INSERT INTO brokers (pid, process_create_time, started_at) \
+                         VALUES (?1, ?2, 0)",
+                        params![pid, create_time],
+                    )
+                    .unwrap();
+                for (kind, path) in [("kept_root", root.as_str()), ("profile", "p")] {
+                    db.conn
+                        .execute(
+                            "INSERT INTO ace_holders (canonical_path, kind, pid, want_mask) \
+                             VALUES (?1, ?2, ?3, '')",
+                            params![path, kind, pid],
+                        )
+                        .unwrap();
+                }
+            }
+            seed(&db.conn, other, TREE, "grant", "modify");
+            let held = kept_holders_with(&db.conn, me, alive).unwrap();
+            assert_eq!(
+                held,
+                [
+                    KeptHolder {
+                        pid: other as u32,
+                        kind: "kept_root".into(),
+                        path: root.clone()
+                    },
+                    KeptHolder {
+                        pid: other as u32,
+                        kind: "profile".into(),
+                        path: "p".into()
+                    },
+                ]
+            );
+            // Everything live counts for an operation that needs a
+            // quiet machine: kept holds and an ordinary session grant
+            // alike, of every live holder — or of every one but the
+            // asker.
+            let all = live_holders_with(&db.conn, None, alive).unwrap();
+            assert_eq!(all.len(), 5, "{all:?}");
+            assert!(all.iter().all(|h| i64::from(h.pid) != dead));
+            assert!(
+                all.iter()
+                    .any(|h| h.kind == "grant" && i64::from(h.pid) == other)
+            );
+            let but_me = live_holders_with(&db.conn, Some(me as u32), alive).unwrap();
+            assert_eq!(but_me.len(), 3);
+            // Asked by the other session, it is this one that holds.
+            let held = kept_holders_with(&db.conn, other, alive).unwrap();
+            assert!(held.iter().all(|h| i64::from(h.pid) == me) && held.len() == 2);
+
+            // Crash recovery reaps the dead holder's holds and its
+            // broker row; the live ones stay.
+            let disk = Disk { alive, ..OK_DISK };
+            let report = recover_with(&db.conn, Some(SID), &disk).unwrap();
+            assert_eq!(report.dead_brokers, 1);
+            let left: i64 = db
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM ace_holders WHERE pid = ?1",
+                    params![dead],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0);
+            assert_eq!(kept_holders_with(&db.conn, me, alive).unwrap().len(), 2);
+
+            // A session that ends drops its own holds and nobody
+            // else's.
+            db.release_kept().unwrap();
+            // With its last hold its broker row went too.
+            let mine: i64 = db
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM brokers WHERE pid = ?1",
+                    params![me],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(mine, 0);
+            assert!(
+                kept_holders_with(&db.conn, other, alive)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(kept_holders_with(&db.conn, me, alive).unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn unreadable_release_changes_nothing() {
+        with_mem_db(|db| {
+            let me = db.holder_pid.0 as i64;
+            seed(&db.conn, me, TREE, "grant", "modify");
+            let disk = Disk {
+                gate: |_, _| IdGate::Unreadable,
+                ..OK_DISK
+            };
+            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).unwrap();
+            assert_eq!(r, AceRelease::Unreadable);
+            assert_eq!(r.as_str(), "unreadable");
+            assert_eq!(counts(&db.conn), (1, 1, 1));
+            // Readable again → the same hold releases.
+            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &OK_DISK).unwrap();
+            assert_eq!(r, AceRelease::Revoked);
+            assert_eq!(counts(&db.conn), (1, 0, 0));
+        });
+    }
+
+    #[test]
+    fn failed_converge_rolls_the_rows_back() {
+        with_mem_db(|db| {
+            let me = db.holder_pid.0 as i64;
+            seed(&db.conn, me, TREE, "grant", "modify");
+            let disk = Disk {
+                converge: |_, _, _| bail!("SetNamedSecurityInfoW failed"),
+                ..OK_DISK
+            };
+            assert!(release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).is_err());
+            assert_eq!(counts(&db.conn), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn moved_grant_is_missing_only_when_positively_gone() {
+        with_mem_db(|db| {
+            let me = db.holder_pid.0 as i64;
+            seed(&db.conn, me, TREE, "grant", "modify");
+            // Not at its path, and the chase by file id could not
+            // answer: the ACE may be anywhere → keep the rows.
+            let disk = Disk {
+                gate: |_, _| IdGate::Mismatch,
+                locate: |_| path_id::Located::Unknown,
+                ..OK_DISK
+            };
+            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).unwrap();
+            assert_eq!(r, AceRelease::Unreadable);
+            assert_eq!(counts(&db.conn), (1, 1, 1));
+            // Found elsewhere but the revoke there fails → rows kept.
+            let disk = Disk {
+                gate: |_, _| IdGate::Mismatch,
+                locate: |_| path_id::Located::At(r"\\?\C:\moved".into()),
+                converge: |_, _, _| bail!("converge failed"),
+                ..OK_DISK
+            };
+            assert!(release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).is_err());
+            assert_eq!(counts(&db.conn), (1, 1, 1));
+            // The volume says no such file → gone, row dropped.
+            let disk = Disk {
+                gate: |_, _| IdGate::Mismatch,
+                ..OK_DISK
+            };
+            let r = release_hold(&db.conn, Some(me), TREE, "grant", SID, &disk).unwrap();
+            assert_eq!(r, AceRelease::Missing);
+            assert_eq!(counts(&db.conn), (1, 0, 0));
+        });
+    }
+
+    #[test]
+    fn recovery_keeps_a_holders_denies_while_its_grant_is_pending() {
+        with_mem_db(|db| {
+            let c = &db.conn;
+            // Dead holder 41: grant on TREE, deny stamps under it.
+            seed(c, 41, TREE, "grant", "modify");
+            seed(c, 41, SECRET, "deny", "denyWrite");
+            seed(c, 41, TREE, "deny_fdc", "fdc");
+            // Dead holder 42: its own grant and deny, both releasable.
+            seed(c, 42, r"\\?\C:\other", "grant", "read");
+            seed(c, 42, r"\\?\C:\other\x", "deny", "denyRead");
+
+            let disk = Disk {
+                gate: |p, _| {
+                    if p == TREE {
+                        IdGate::Unreadable
+                    } else {
+                        IdGate::Match
+                    }
+                },
+                ..OK_DISK
+            };
+            let rep = recover_with(c, Some(SID), &disk).unwrap();
+            assert_eq!(rep.grants_pending, vec![TREE.to_string()]);
+            // 42 fully released and pruned; 41 untouched, still
+            // registered so the next pass knows whose rows these are.
+            assert_eq!(rep.dead_brokers, 1);
+            assert_eq!(rep.aces_revoked, 2);
+            assert_eq!(counts(c), (1, 3, 3));
+
+            // Converge error on the grant: same outcome.
+            let disk = Disk {
+                converge: |_, p, _| {
+                    if p == TREE {
+                        bail!("converge failed")
+                    }
+                    Ok(())
+                },
+                ..OK_DISK
+            };
+            let rep = recover_with(c, Some(SID), &disk).unwrap();
+            assert_eq!(rep.grants_pending, vec![TREE.to_string()]);
+            assert_eq!(counts(c), (1, 3, 3));
+
+            // Releasable → grant first, then the denies, then prune.
+            let rep = recover_with(c, Some(SID), &OK_DISK).unwrap();
+            assert!(rep.grants_pending.is_empty());
+            assert_eq!((rep.dead_brokers, rep.aces_revoked), (1, 3));
+            assert_eq!(counts(c), (0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn recovery_keeps_holderless_denies_while_any_grant_is_pending() {
+        with_mem_db(|db| {
+            let c = &db.conn;
+            seed(c, 41, TREE, "grant", "modify");
+            seed(c, 41, SECRET, "deny", "denyWrite");
+            // Holder rows lost without a release.
+            c.execute("DELETE FROM brokers", []).unwrap();
+            assert_eq!(counts(c), (0, 0, 2));
+
+            let disk = Disk {
+                gate: |p, _| {
+                    if p == TREE {
+                        IdGate::Unreadable
+                    } else {
+                        IdGate::Match
+                    }
+                },
+                ..OK_DISK
+            };
+            let rep = recover_with(c, Some(SID), &disk).unwrap();
+            assert_eq!(rep.grants_pending, vec![TREE.to_string()]);
+            assert_eq!(counts(c), (0, 0, 2));
+
+            let rep = recover_with(c, Some(SID), &OK_DISK).unwrap();
+            assert!(rep.grants_pending.is_empty());
+            assert_eq!(counts(c), (0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn recovery_without_a_sandbox_identity_leaves_holds_in_place() {
+        with_mem_db(|db| {
+            let c = &db.conn;
+            seed(c, 41, TREE, "grant", "modify");
+            c.execute(
+                "INSERT INTO brokers (pid, process_create_time, started_at) \
+                 VALUES (43, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let rep = recover_with(c, None, &OK_DISK).unwrap();
+            // The hold-less dead broker is pruned; the one with a
+            // hold stays until its ACE can be released.
+            assert_eq!(rep.dead_brokers, 1);
+            assert_eq!(counts(c), (1, 1, 1));
+        });
     }
 }

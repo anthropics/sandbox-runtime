@@ -25,7 +25,15 @@ param(
 
   [string]$AmbientSublayer = '9e4b2d7a-6c05-4f18-8a3d-2b9e7c1f5a0d',
   # Must match smoke-machine-store.ps1.
-  [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93'
+  [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93',
+  # Must match smoke-write-restricted.ps1.
+  [string]$WriteRestrictedSublayer = 'c8f3a1d5-2e6b-4a97-b0c4-5d1e7f9a3b62',
+  # Must match smoke-profile-read.ps1.
+  [string]$ProfileReadSublayer = 'e1a47c93-5d28-4b6f-a3c1-7f0e9d2b4a58',
+  # Must match smoke-residual-egress.ps1.
+  [string]$ResidualSublayer = 'b7524f53-6892-434c-93d5-46e02c3f8cdc',
+  # Must match smoke-env-stdin.ps1.
+  [string]$EnvStdinSublayer = 'a7f3c9d1-5e28-4b06-8f4a-9c1d2e6b0a35'
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -42,6 +50,10 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $TsSublayer
 & $Exe wfp uninstall --sublayer-guid $AmbientSublayer
 & $Exe wfp uninstall --sublayer-guid $MachineStoreSublayer
+& $Exe wfp uninstall --sublayer-guid $WriteRestrictedSublayer
+& $Exe wfp uninstall --sublayer-guid $ProfileReadSublayer
+& $Exe wfp uninstall --sublayer-guid $ResidualSublayer
+& $Exe wfp uninstall --sublayer-guid $EnvStdinSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
 # sublayers; the test tears down via uninstallWindowsSandbox(). This
 # is belt-and-braces in case it crashed mid-row.
@@ -54,11 +66,36 @@ if (-not (Test-Path $Exe)) {
 # (smoke-exec) / A-row (smoke-aces) / H-row (winsrt.test.ts) threw
 # mid-section before its `finally` ran.
 & $Exe acl recover --force
+# Write grants kept between sessions (smoke-write-restricted.ps1, the
+# winsrt.test.ts writeRestrictedToken rows): while one is recorded,
+# `srt-win exec` without --write-restricted-token is refused. Before
+# the uninstall below, which removes the group the grants name.
+& $Exe acl forget --all
+# A profile read grant (smoke-profile-read.ps1, on its made-up profile
+# tree): the same refusal while one is recorded, and the same order.
+& $Exe profile forget
 # Sandbox user + credential/marker rows in state.db — `srt-win
 # install` provisions these; `uninstall` (no --keep-user) removes
 # them, so this only matters if a smoke script threw mid-section.
 & $Exe uninstall --sublayer-guid $InstallSublayer
+# smoke-write-restricted.ps1's scratch tree at the system-drive root.
+Get-ChildItem "$env:SystemDrive\" -Directory -Filter 'srt-wr-smoke-*' |
+  Remove-Item -Recurse -Force
+# smoke-profile-read.ps1's scratch tree. Its junctions are removed as
+# links first, so nothing is deleted through them.
+Get-ChildItem "$env:SystemDrive\" -Directory -Filter 'srt-pr-smoke-*' | ForEach-Object {
+  Get-ChildItem $_.FullName -Recurse -Force -Attributes ReparsePoint |
+    ForEach-Object { $_.Delete() }
+  Remove-Item $_.FullName -Recurse -Force
+}
+# The record of write grants kept between sessions, if `acl forget
+# --all` above could not clear it.
+Remove-Item 'HKCU:\Software\sandbox-runtime\PersistentGrants' -Recurse -Force
 Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
+# smoke-residual-egress.ps1 removes its share and account in its own
+# `finally`; this covers a run that was killed before reaching it.
+Get-SmbShare -Name 'srtresid*' | Remove-SmbShare -Force -Confirm:$false
+Get-LocalUser -Name 'srt-resid-*' | Remove-LocalUser
 Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue
 Remove-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' `
   -Name srt-sandbox -ea SilentlyContinue

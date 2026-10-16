@@ -116,7 +116,7 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// Called only from `srt-win runner` — this process is the
 /// `srt-sandbox` user (via `CreateProcessWithLogonW`), has NO
 /// console (broker spawned it `CREATE_NO_WINDOW`; stdio are
-/// anonymous pipes), and the child runs under a restricted token
+/// pipes), and the child runs under a restricted token
 /// with `BUILTIN\Administrators` flipped deny-only (LUA shape).
 ///
 /// `env_overlay` is `(KEY, VALUE)` pairs overlaid on the runner's
@@ -125,10 +125,25 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// passed through verbatim — so the broker's `PATH` + proxy vars
 /// ride here while the sandbox-user-profile `USERPROFILE`/`TEMP`
 /// stay isolated.
+///
+/// `write_restricted` builds the child token write-restricted (see
+/// [`crate::token`]), with `capability_sids` — the capability SIDs of
+/// the session's write roots — among its restricting SIDs. Token
+/// creation is fail-closed: there is no fallback to the ordinary
+/// token.
+///
+/// Under either token the runner's process self-protect and its
+/// thread self-protect must succeed or no child runs. They matter
+/// most with `write_restricted`, because the runner's own token is
+/// NOT write-restricted: a child that could open the runner, or one
+/// of its threads, could act with the runner's token and write
+/// wherever `BUILTIN\Users` can.
 pub fn run_lockdown(
     target_exe: &Path,
     target_args: &[String],
     env_overlay: &[(String, String)],
+    write_restricted: bool,
+    capability_sids: &[String],
 ) -> Result<u32> {
     // 1) Self-protect: rewrite this process's DACL so the child can't
     //    `OpenProcess` us. The child shares the runner's user SID, so
@@ -138,18 +153,28 @@ pub fn run_lockdown(
     //    `extra_allow = None` — we run as `srt-sandbox`; an
     //    `srt-sandbox:FA` ACE here would match the child and undo the
     //    protection. First so the protection holds on every later
-    //    error path. Best-effort — log on failure but don't abort,
-    //    since a runner without self-protect is still strictly safer
-    //    than no sandbox.
-    if let Err(e) = self_protect::install_broker_dacl(None) {
-        eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
-    }
+    //    error path. Required: a child that can open the runner is
+    //    not confined by the token built below, so a runner that
+    //    cannot protect itself launches nothing.
+    //
+    //    The runner's threads are separate objects with their own
+    //    DACLs and get the same treatment. This first sweep covers
+    //    the threads that exist now, against other sandboxed
+    //    processes of the same account that are already running; the
+    //    sweep that this launch's own child is held behind is in
+    //    step 10.
+    self_protect::install_broker_dacl(None).context("runner self-protect (process)")?;
+    self_protect::protect_own_threads().context("runner self-protect (threads)")?;
 
     // 2) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
     let self_tok = OwnedHandle(open_self_token()?);
-    let restricted =
-        OwnedHandle(token::make_sandbox_token(self_tok.raw()).context("make_sandbox_token")?);
+    //    `write_restricted` has no fallback: an error here ends the
+    //    launch.
+    let restricted = OwnedHandle(
+        token::make_sandbox_token(self_tok.raw(), write_restricted, capability_sids)
+            .context("make_sandbox_token")?,
+    );
     let primary = OwnedHandle(to_primary(restricted.raw()).context("to_primary")?);
 
     // 3) Job. `breakaway_ok = false` — this is the load-bearing
@@ -233,7 +258,7 @@ pub fn run_lockdown(
     // 8) STARTUPINFOEXW. `STARTF_USESTDHANDLES` + the caller's std
     //    handles is load-bearing: the runner has NO console (the
     //    broker spawned it with `CREATE_NO_WINDOW`; its stdio are the
-    //    broker's anonymous pipes), so without an explicit `hStd*`
+    //    broker's pipes), so without an explicit `hStd*`
     //    wiring the child would try to allocate a conhost on the
     //    non-interactive desktop — which under the restricted token
     //    hangs.
@@ -306,6 +331,27 @@ pub fn run_lockdown(
             )
         });
     }
+    // Runner threads get the process's self-protect DACL before the
+    // child can run (it is still suspended). Two parts, in this
+    // order: first the runner token's default DACL, so any thread
+    // created from here on starts out protected; then a sweep over
+    // every thread that exists, which covers the ones started since
+    // the sweep in step 1. The default DACL is changed only now
+    // because it would otherwise also land on the child's process,
+    // thread and token objects, which the child must be able to
+    // open; after this point the runner creates no object at all.
+    // Either failing ends the launch: the `child` guard terminates
+    // the suspended child.
+    self_protect::protect_future_threads()
+        .context("runner self-protect (default DACL for new threads)")?;
+    let protected_threads = self_protect::protect_own_threads()
+        .context("runner self-protect (threads, before resume)")?;
+    if dbg {
+        eprintln!(
+            "srt-win: run_lockdown: thread self-protect applied \
+             ({protected_threads} thread(s))"
+        );
+    }
     let prev_suspend = unsafe { ResumeThread(child.thread()) };
     if prev_suspend == u32::MAX {
         return Err(anyhow!("ResumeThread: {}", std::io::Error::last_os_error()));
@@ -354,7 +400,7 @@ pub fn run_lockdown(
 /// `srt-win exec` is a dumb passthrough for proxy configuration: it
 /// does NOT synthesize `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` and has
 /// no `--http-proxy` / `--socks-proxy` flags. The single source of
-/// proxy env is the TS `generateProxyEnvVars`, which the caller passes
+/// proxy env is the TS `generateProxyEnvEntries`, which the caller passes
 /// via `--env`; this function just forwards the runner's environment
 /// (= the sandbox user's `LOGON_WITH_PROFILE` defaults) with the
 /// overlay applied on top to the child. No proxy value is invented,
@@ -817,5 +863,26 @@ mod tests {
         assert!(matching("foo_proxyx").is_empty());
         assert_eq!(matching("PATH").len(), 1);
         assert!(matching("path").is_empty());
+    }
+
+    /// The final link of the `--env-stdin` delivery path: an overlay
+    /// entry (as `exec` sends it in the runner spec) must land in
+    /// the `CREATE_UNICODE_ENVIRONMENT` block verbatim, with its
+    /// lowercase proxy case-twin appended.
+    #[test]
+    fn build_env_block_carries_overlay_entry() {
+        let url = "http://sb:tokprobe0123@localhost:60080";
+        let block = build_env_block(&[("HTTPS_PROXY".to_string(), url.to_string())]);
+        // Decode `KEY=VALUE\0`…`\0\0` back into strings.
+        let s = String::from_utf16(&block).expect("utf16");
+        let entries: Vec<&str> = s.split('\0').filter(|e| !e.is_empty()).collect();
+        assert!(
+            entries.iter().any(|e| *e == format!("HTTPS_PROXY={url}")),
+            "overlay var missing from env block: {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|e| *e == format!("https_proxy={url}")),
+            "lowercase case-twin missing: {entries:?}"
+        );
     }
 }

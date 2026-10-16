@@ -84,7 +84,24 @@ import {
   stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
-  revokeWindowsAcl,
+  grantWindowsAclPersistent,
+  windowsSetupVersionMismatch,
+  windowsWriteRestrictedTokenEnabled,
+  forgetWindowsPersistentGrants,
+  forgetWindowsProfileReadAsync,
+  WINDOWS_SRT_WIN_CAPABILITIES,
+  windowsSrtWinOutdatedError,
+  missingWindowsSrtWinCapability,
+  windowsGrantsBeneathDenies,
+  type WindowsProfileGrantItem,
+  type WindowsProfileGrantStatus,
+  getWindowsProfileReadStatus,
+  windowsProfileExclusionConflicts,
+  revokeWindowsAclChecked,
+  windowsAclIncompleteRevoke,
+  type WindowsAclRevokeResult,
+  stageWindowsJavaAgentJar,
+  removeStagedWindowsJavaAgentJar,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
@@ -181,6 +198,13 @@ let mitmCA: MitmCA | undefined
  * shipped/found (JVMs then just aren't proxy-aware, as before).
  */
 let javaAgentJarPath: string | undefined
+/**
+ * Windows: this session's staged copy of the agent jar, in a directory of
+ * its own that the sandbox user is granted read on (the child runs as a
+ * different account and cannot read {@link javaAgentJarPath} where it
+ * sits). This is what the Windows wrap advertises.
+ */
+let windowsJavaAgentJarPath: string | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
@@ -193,6 +217,10 @@ let windowsFsStampedSet: WindowsFsAccessSet | undefined
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
 let windowsFsSbUserSid: string | undefined
+// Whether initialize() registered this process with srt-win as a
+// session: always under the write-restricted token; under the
+// ordinary one only with an srt-win that says it keeps such records.
+let windowsSessionRegistered = false
 // The RAW config inputs that produced `windowsFsStampedSet`.
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
@@ -202,7 +230,213 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-let windowsWfpVerified = false
+// That holds for the ORDINARY child token only (`defaultToken` below:
+// the token `srt-win exec` builds without a flag, which a session
+// gets with `windows.writeRestrictedToken: false`). The WFP block
+// filter matches by an access check of the connecting token, and the
+// write-restricted token's restricting SIDs include the capability
+// SIDs of the session's write roots — a different token per session.
+// So under the write-restricted token (the default) every
+// initialize() probes, with that session's token, and nothing is
+// remembered.
+// What IS config-scoped, under the ordinary token too, is the loopback
+// mode the probe was run with (`network.allowLocalBinding`):
+// `defaultToken` is that mode once verified, and a session configured
+// with the other verifies again.
+const windowsWfpVerified: { defaultToken: boolean | undefined } = {
+  defaultToken: undefined,
+}
+// The child-token shape initialize() verified the fence for, captured
+// like `srtWinSpawn` so the wrap path uses it rather than `config`:
+// updateConfig() swaps `config` live without re-verifying, and a
+// swapped-in `windows.writeRestrictedToken` must not change the token
+// a command runs under until the next initialize(). Outside a session
+// it is the option's default, so a wrap made there never gets the
+// ordinary token.
+let windowsWriteRestrictedToken = true
+// Windows: the `srt-win` builds this process has seen report every
+// capability the library relies on (see
+// missingWindowsSrtWinCapability), by identity — windowsSrtWinIdentity.
+// Only a positive result is remembered: one that lacked a capability,
+// or could not be asked, is asked again the next time.
+const windowsCapableSrtWin = new Set<string>()
+
+/**
+ * What tells one `srt-win` from another: the executable, the arguments
+ * put in front of every call, and — so that a file replaced in place
+ * is a different one — its size and modification time.
+ */
+function windowsSrtWinIdentity(srtWin: SrtWinSpawn): string {
+  let stat = ''
+  try {
+    const st = fs.statSync(srtWin.exe)
+    stat = `${st.size}:${st.mtimeMs}`
+  } catch {
+    // Not a path that can be looked at (resolved through PATH, say):
+    // the name and arguments are the identity.
+  }
+  return JSON.stringify([srtWin.exe, srtWin.prependArgs, stat])
+}
+
+const WINDOWS_CAPABILITIES_WHY =
+  `a session under the write-restricted token depends on (its read ` +
+  `denies are written on the profile read grant's paths by srt-win, ` +
+  `and kept grants are checked and removed there)`
+
+/**
+ * For a per-command read deny: make sure the `srt-win` this command
+ * will run through is one that has reported every capability the
+ * library relies on. initialize() records the session's own; one
+ * passed per command, or used with no session behind it, is asked
+ * here — once per identity, and again every time while the answer is
+ * not a yes.
+ */
+function assertWindowsSrtWinCapable(srtWin: SrtWinSpawn): void {
+  const id = windowsSrtWinIdentity(srtWin)
+  if (windowsCapableSrtWin.has(id)) return
+  const missing = missingWindowsSrtWinCapability(
+    getWindowsProfileReadStatus({ srtWin }).capabilities,
+  )
+  if (missing !== undefined) {
+    throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
+  }
+  windowsCapableSrtWin.add(id)
+}
+
+// Windows: whether this session's commands read the user's profile
+// through the profile read grant. 'absent': no grant is recorded (it
+// was skipped at install, or forgotten) or the session runs under the
+// ordinary token — the sandbox works, the profile is not readable.
+// `undefined` outside a Windows session.
+let windowsProfileRead: 'granted' | 'absent' | undefined
+// Windows: what the session has to tell its user about the profile
+// read grant it runs on (getWindowsProfileReadWarnings).
+let windowsProfileReadWarnings: WindowsProfileReadWarning[] = []
+
+/** Something about the profile read grant that the user should be shown. */
+export interface WindowsProfileReadWarning {
+  /** See {@link windowsProfileReadWarningsOf}. */
+  code:
+    | 'profile_exclusion_unprotected'
+    | 'profile_exclusion_unverifiable'
+    | 'profile_stale_allow'
+  message: string
+  paths: WindowsProfileGrantItem[]
+}
+
+/**
+ * What a session on this grant has to tell its user, from what
+ * `srt-win` found — each message says what was established about its
+ * paths and nothing more.
+ *
+ * - `profile_exclusion_unprotected`: exclusions that could not be
+ *   denied and are readable to sandboxed commands — by their own
+ *   access list, or, where that list could not be read, because YOU
+ *   can read them without being able to see why (what admits you
+ *   there is as a rule a group the sandbox account is in too).
+ * - `profile_exclusion_unverifiable`: exclusions that could not be
+ *   denied and could not be examined. No claim is made about them;
+ *   the message says what is known: that you cannot read them either,
+ *   or that the sandbox account's identity is not known, or that they
+ *   were not looked at.
+ * - `profile_stale_allow`: paths that are no longer to be readable and
+ *   still carry an allow of an earlier run that could not be removed.
+ */
+export function windowsProfileReadWarningsOf(
+  grant: Pick<
+    WindowsProfileGrantStatus,
+    'unprotected' | 'unverifiable' | 'staleAllow'
+  >,
+): WindowsProfileReadWarning[] {
+  const list = (items: readonly WindowsProfileGrantItem[]) =>
+    items.map(i => i.path).join(', ')
+  const out: WindowsProfileReadWarning[] = []
+  // Open through an entry this product wrote and could not take
+  // back: the strongest case, said first and as what it is.
+  const byOurs = grant.unprotected.filter(i => i.entry !== undefined)
+  const byList = grant.unprotected.filter(i => i.entry === undefined)
+  const callerReads = grant.unverifiable.filter(i => i.callerReads === true)
+  const rest = grant.unverifiable.filter(i => i.callerReads !== true)
+  if (byOurs.length + byList.length + callerReads.length > 0) {
+    const parts: string[] = []
+    if (byOurs.length > 0) {
+      parts.push(
+        `${byOurs.length} READABLE THROUGH AN ENTRY THIS PRODUCT WROTE and ` +
+          `could not remove — each path's reason gives the icacls command ` +
+          `that removes it, to be run as the object's owner or from an ` +
+          `elevated prompt, followed by the grant again (${list(byOurs)})`,
+      )
+    }
+    if (byList.length > 0) {
+      parts.push(
+        `${byList.length} by their own access lists, which you may not ` +
+          `change (${list(byList)})`,
+      )
+    }
+    if (callerReads.length > 0) {
+      parts.push(
+        `${callerReads.length} whose access lists could not be read but ` +
+          `which you can read all the same, so sandboxed commands may ` +
+          `too (${list(callerReads)})`,
+      )
+    }
+    out.push({
+      code: 'profile_exclusion_unprotected',
+      message:
+        `Paths on the exclusion list of the profile read grant could not ` +
+        `be denied and are, or may be, readable to sandboxed commands: ` +
+        parts.join('; ') +
+        `. Only their owner or an administrator can close them.`,
+      paths: [...byOurs, ...byList, ...callerReads],
+    })
+  }
+  if (rest.length > 0) {
+    const unreadable = rest.filter(i => i.callerReads === false)
+    const noAccount = rest.filter(i => i.cause === 'account_unknown')
+    const other = rest.filter(
+      i => i.callerReads !== false && i.cause !== 'account_unknown',
+    )
+    const parts: string[] = []
+    if (unreadable.length > 0) {
+      parts.push(
+        `${unreadable.length} whose access lists could not be read; you ` +
+          `cannot read their content either (${list(unreadable)})`,
+      )
+    }
+    if (noAccount.length > 0) {
+      parts.push(
+        `${noAccount.length} that could not be examined because the ` +
+          `sandbox account is not known (${list(noAccount)})`,
+      )
+    }
+    if (other.length > 0) {
+      parts.push(`${other.length} that were not examined (${list(other)})`)
+    }
+    out.push({
+      code: 'profile_exclusion_unverifiable',
+      message:
+        `Paths on the exclusion list of the profile read grant could not ` +
+        `be denied, and whether sandboxed commands can read them was not ` +
+        `established: ` +
+        parts.join('; ') +
+        `.`,
+      paths: rest,
+    })
+  }
+  if (grant.staleAllow.length > 0) {
+    out.push({
+      code: 'profile_stale_allow',
+      message:
+        `${grant.staleAllow.length} path(s) that have left the profile ` +
+        `read grant still carry an entry of it that could not be removed, ` +
+        `and are readable to sandboxed commands through it: ` +
+        `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
+        `path's reason gives the icacls command that removes the entry.`,
+      paths: grant.staleAllow,
+    })
+  }
+  return out
+}
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
 // and so reset()'s revoke/restore addresses the SAME binary the
@@ -257,6 +491,85 @@ function registerCleanup(): void {
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
   cleanupRegistered = true
+}
+
+// 'restored'/'alreadyOriginal' are the pre- same-user-removal
+// srt-win's success vocabulary; 'revoked'/'stillHeld' are the
+// post-. Either is non-anomalous.
+const WINDOWS_ACL_RELEASE_OK = new Set([
+  'revoked',
+  'stillHeld',
+  'restored',
+  'alreadyOriginal',
+])
+
+function logWindowsAclOutcomes(
+  kind: string,
+  outcomes: readonly { path: string; status: string }[] | undefined,
+): void {
+  for (const e of outcomes ?? []) {
+    if (!WINDOWS_ACL_RELEASE_OK.has(e.status)) {
+      logForDebugging(
+        `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
+          `ACE may be left in place; resolve and run ` +
+          `\`srt-win acl recover\` to clear`,
+        { level: 'warn' },
+      )
+    }
+  }
+}
+
+/**
+ * The release-ordering gate, shared by every release path: the deny
+ * restore runs only after a revoke that COMPLETED, and never again in
+ * this process once one did not. Returns whether it may run.
+ *
+ * Revoke takes the ALLOW grants off, restore takes the DENY stamps
+ * off. If the revoke failed, timed out, was only partial, or reported
+ * a path whose grant it could not release, an ALLOW grant may still
+ * be on disk — and the sandbox account is shared by every session, so
+ * with the stamps gone another session's sandboxed process could
+ * write this tree's deny targets (`.git/hooks`, settings files, …).
+ * So the stamps stay: they name only the sandbox account's SID and
+ * cost the real user nothing.
+ *
+ * The refusal lasts for the process: a later session's revoke that
+ * finds nothing left to release does not show the earlier grant is
+ * gone (an older srt-win forgets a path it could not open), so every
+ * later reset() keeps its stamps too.
+ *
+ * What clears them afterwards depends on the srt-win in use. A
+ * current one keeps the rows of a grant it could not release, held by
+ * this process; once this process has exited, any `srt-win acl`
+ * command retries those grants and takes this process's deny stamps
+ * off only when all of them are released. An older one has already
+ * dropped the row of such a grant: its crash recovery then removes
+ * the deny stamps once this process is gone, and the leftover ALLOW
+ * entry is recorded nowhere and has to be removed by hand.
+ */
+function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
+  logWindowsAclOutcomes('grant revoke', revoke.outcomes)
+  const earlier = windowsAclIncompleteRevoke()
+  if (revoke.complete && earlier === undefined) return true
+  const paths = [...new Set([...revoke.pending, ...(earlier ?? [])])]
+  logForDebugging(
+    `[Sandbox Windows] ` +
+      (revoke.complete
+        ? `an earlier grant revoke in this process did not complete`
+        : `grant revoke did not complete`) +
+      ` — NOT running the deny restore; deny ACEs stay in place ` +
+      `while a grant may still be on disk. Grants possibly left in ` +
+      `place: ${paths.length > 0 ? paths.map(p => `'${p}'`).join(', ') : '(none reported)'}` +
+      (revoke.detail ? `. srt-win: ${revoke.detail}` : '') +
+      `. After this process exits, \`srt-win acl recover\` retries ` +
+      `the grants still recorded for it and removes its deny ACEs ` +
+      `once they are released (it exits non-zero while one is not). ` +
+      `A listed path that still shows an ALLOW entry for the sandbox ` +
+      `account after that is no longer recorded; remove the entry by ` +
+      `hand.`,
+    { level: 'error' },
+  )
+  return false
 }
 
 /**
@@ -835,13 +1148,36 @@ async function startMuxProxyServer(
 // Public Module Functions (will be exported via namespace)
 // ============================================================================
 
+/**
+ * Options of {@link initialize} that are the embedding program's to
+ * set, not part of the configuration a user writes.
+ */
+export interface SandboxInitializeOptions {
+  /**
+   * Windows. `filesystem.allowRead` paths that may be granted although
+   * the read grant on the user's profile excludes them (a credential
+   * store, a browser profile, …): each entry admits the `allowRead`
+   * path that resolves to the same object, when that path is an
+   * excluded path or lies inside one. The store is then readable to
+   * the sandboxed commands of this session. An `allowRead` path that
+   * lies ABOVE an exclusion is refused whatever is listed here.
+   */
+  dangerouslyAllowReadOfProfileExclusions?: readonly string[]
+}
+
 async function initialize(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
+  options?: SandboxInitializeOptions,
 ): Promise<void> {
   try {
-    await initializeSteps(runtimeConfig, sandboxAskCallback, enableLogMonitor)
+    await initializeSteps(
+      runtimeConfig,
+      sandboxAskCallback,
+      enableLogMonitor,
+      options,
+    )
   } catch (error) {
     // Here, not at reset() or 'exit': a step can fail before the clean-up is
     // registered, and the next call makes a CA of its own.
@@ -855,6 +1191,7 @@ async function initializeSteps(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback: SandboxAskCallback | undefined,
   enableLogMonitor: boolean,
+  options: SandboxInitializeOptions | undefined,
 ): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
@@ -995,6 +1332,128 @@ async function initializeSteps(
           `provision it.`,
       )
     }
+    // An install made by a release with another setup version: srt-win
+    // would refuse to launch on it, and must not be asked to keep a
+    // grant on it. Checked before anything is granted.
+    const staleSetup = windowsSetupVersionMismatch(
+      u,
+      runtimeConfig.windows?.sublayerGuid ??
+        runtimeConfig.windows?.wfpSublayerGuid,
+    )
+    if (staleSetup) {
+      config = undefined
+      throw new WindowsSandboxError('reinstall_required', staleSetup)
+    }
+    // The read grant on the user's profile. It belongs to the
+    // write-restricted token (the default). The install applies it,
+    // grantWindowsProfileRead() refreshes it; this never writes or
+    // refreshes it. Whether one is recorded is the switch:
+    //  - none recorded (skipped at install, or forgotten): the session
+    //    runs as it would without the feature, and nothing in the
+    //    profile is readable;
+    //  - recorded and current: the session runs on it;
+    //  - recorded and not current (a run that did not finish, an older
+    //    exclusion list, a record that cannot be read or lacks its
+    //    lists): rejected — its allows are on disk, and what it must
+    //    keep excluded cannot be relied on.
+    // Under the ordinary token there is no grant: one that is found is
+    // removed before anything else is granted.
+    windowsProfileRead = 'absent'
+    windowsProfileReadWarnings = []
+    let profileExclusions: Parameters<
+      typeof windowsProfileExclusionConflicts
+    >[1] = { exclusions: [], ungrantedOnly: [] }
+    try {
+      if (!windowsWriteRestrictedTokenEnabled(runtimeConfig.windows)) {
+        // Not from under another live session that reads the profile
+        // through it, or writes through a kept grant: srt-win checks
+        // its holder records under its lock and removes nothing then
+        // (`kept_grants_in_use`). That check is srt-win's, so it is
+        // asked for by name: with grants to remove and an srt-win that
+        // keeps no holder records, nothing is removed.
+        //
+        // That is the only capability this path needs, and only then.
+        // The ordinary token uses none of the others — no profile
+        // read grant exists under it, no kept root — so with no kept
+        // grant of either kind reported, a session with
+        // `writeRestrictedToken: false` runs against an srt-win that
+        // lists nothing, as it did before capabilities existed.
+        if (
+          (u.profileGrant || u.persistentGrants) &&
+          !u.capabilities.includes(
+            WINDOWS_SRT_WIN_CAPABILITIES.keptGrantHolders,
+          )
+        ) {
+          throw windowsSrtWinOutdatedError(
+            WINDOWS_SRT_WIN_CAPABILITIES.keptGrantHolders,
+            `this library needs before it removes kept grants for ` +
+              `windows.writeRestrictedToken: false — another live session ` +
+              `may be running on them`,
+          )
+        }
+        if (u.profileGrant) {
+          await forgetWindowsProfileReadAsync({
+            srtWin,
+            unlessHeldByOthers: process.pid,
+          })
+        }
+      } else {
+        // The write-restricted token (the default). What this library
+        // hands srt-win on this path is only right if srt-win does its
+        // part, and the two are not always the same build: every
+        // capability the library relies on is required here, from the
+        // status already in hand, before anything is granted.
+        //
+        // Whether or not a grant is recorded. The capabilities belong
+        // to the build, not to the grant state: a grant can be made
+        // after this session started, and a status that shows none —
+        // because the field is missing, or was renamed — is not proof
+        // that none is on disk. A status with no `capabilities`, or
+        // one that is not a list, has none.
+        const missing = missingWindowsSrtWinCapability(u.capabilities)
+        if (missing !== undefined) {
+          throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
+        }
+        windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
+      }
+      if (
+        windowsWriteRestrictedTokenEnabled(runtimeConfig.windows) &&
+        u.profileGrant
+      ) {
+        const grant = getWindowsProfileReadStatus({ srtWin })
+        if (grant.state !== 'none' && grant.state !== 'current') {
+          throw new WindowsSandboxError(
+            'profile_grant_outdated',
+            `The recorded read grant on your user profile cannot be used ` +
+              `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''}). ` +
+              `Call grantWindowsProfileRead() (\`srt-win profile grant\`, ` +
+              `or \`npx sandbox-runtime windows-install\` again) as the ` +
+              `user who starts sessions to bring it up to date, or ` +
+              `forgetWindowsProfileRead() (\`srt-win profile forget\`) to ` +
+              `run without reading the profile. initialize() does neither ` +
+              `itself.`,
+          )
+        }
+        if (grant.state === 'current') {
+          profileExclusions = grant
+          windowsProfileRead = 'granted'
+          windowsProfileReadWarnings = windowsProfileReadWarningsOf(grant)
+          for (const w of windowsProfileReadWarnings) {
+            logForDebugging(`[Sandbox Windows] ${w.message}`, { level: 'warn' })
+          }
+        }
+      }
+      if (windowsProfileRead === 'absent') {
+        logForDebugging(
+          `[Sandbox Windows] no profile read grant: the user profile is ` +
+            `not readable to sandboxed commands in this session`,
+        )
+      }
+    } catch (e) {
+      windowsProfileRead = undefined
+      config = undefined
+      throw e
+    }
     // Behavioral proof the WFP egress fence is active for the
     // sandbox user — BFE enumeration (`wfp status`) is admin-gated,
     // so this is the non-elevated readiness check. Fails closed: a
@@ -1003,18 +1462,52 @@ async function initializeSteps(
     // After the user-status check so the not-provisioned message is
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
-    if (!windowsWfpVerified) {
-      try {
-        await verifyWindowsWfpEgress({
-          proxyPortRange: runtimeConfig.windows?.proxyPortRange,
-          srtWin,
-        })
-      } catch (e) {
-        config = undefined
-        throw e
+    // The probe runs under the token shape this session's commands
+    // will get. By default that is the write-restricted token, which
+    // carries the capability SIDs of this session's write roots; they
+    // exist only once the roots are granted — so that probe runs
+    // below, after the grant, on every initialize().
+    const writeRestricted = windowsWriteRestrictedTokenEnabled(
+      runtimeConfig.windows,
+    )
+    if (!writeRestricted) {
+      // `windows.writeRestrictedToken: false`. Write grants kept by
+      // sessions that ran with the default let the sandbox account
+      // write those trees under the ordinary token this session uses.
+      // Remove them before anything is granted or run; if that fails,
+      // no session. Nor if another live session is running on one:
+      // its working directory is not taken away from under it.
+      if (u.persistentGrants) {
+        try {
+          await forgetWindowsPersistentGrants({
+            srtWin,
+            unlessHeldByOthers: process.pid,
+          })
+        } catch (e) {
+          config = undefined
+          throw e
+        }
       }
-      windowsWfpVerified = true
+      // A session whose `network.allowLocalBinding` is not the
+      // loopback mode the install recorded is refused here too, with
+      // the install command that repairs it.
+      const allowLoopback = runtimeConfig.network?.allowLocalBinding === true
+      if (windowsWfpVerified.defaultToken !== allowLoopback) {
+        try {
+          await verifyWindowsWfpEgress({
+            proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+            allowLoopback,
+            writeRestrictedToken: false,
+            srtWin,
+          })
+        } catch (e) {
+          config = undefined
+          throw e
+        }
+        windowsWfpVerified.defaultToken = allowLoopback
+      }
     }
+    windowsWriteRestrictedToken = writeRestricted
     // Persistent-CA branch (see the deferral comment above).
     // `ensurePersistentWindowsCa` reconciles the registry thumb
     // itself (so initialize() after uninstall→reinstall repairs
@@ -1080,6 +1573,79 @@ async function initializeSteps(
         // onExtractNoMatch: "error" is thrown by every wrap, so nothing runs.
       }
       const acc = computeWindowsFsAccessSet(runtimeConfig, maskedFiles)
+      // No path the session grants, in any form, may reach what the
+      // profile read grant excludes. Checked on what each path resolves
+      // to, over everything initialize() hands to srt-win — the read
+      // grants, the write roots (a write root grants read too, and its
+      // grant is kept), and the library's own trust-bundle directory —
+      // before anything is granted. srt-win makes the same check on
+      // its side.
+      //
+      //                 protected path        ungranted-only directory
+      //   the path      refused (*)           refused
+      //   inside it     refused (*)           allowed
+      //   above it      refused               refused
+      //
+      // (*) A READ path only: the embedder's explicit override admits
+      // it — the store is then read on purpose, for this session. A
+      // write root is never admitted. Nothing above an exclusion is: a
+      // grant there inherits, so a store created again beneath it
+      // would carry it, and for a write root that grant is kept
+      // between sessions.
+      //
+      // With no grant recorded the lists are empty and nothing is
+      // checked: nothing in the profile is readable by default then.
+      const ownRead = mitmCA ? [dirname(mitmCA.trustBundlePath)] : []
+      const override = options?.dangerouslyAllowReadOfProfileExclusions ?? []
+      const refused = [
+        ...windowsProfileExclusionConflicts(acc.grantRead, profileExclusions, {
+          override,
+        }),
+        ...windowsProfileExclusionConflicts(ownRead, profileExclusions),
+        ...windowsProfileExclusionConflicts(acc.grantWrite, profileExclusions, {
+          write: true,
+        }),
+      ]
+      if (refused.length > 0) {
+        const describe = (c: (typeof refused)[number]): string => {
+          const list = c.access === 'write' ? 'allowWrite' : 'allowRead'
+          const what =
+            c.kind === 'ungranted-only'
+              ? (c.relation === 'equal' ? `is` : `contains`) +
+                ` ${c.exclusion}, which is not granted as a whole (grant ` +
+                `a directory inside it instead)`
+              : c.relation === 'equal'
+                ? `is the excluded ${c.exclusion}`
+                : c.relation === 'inside'
+                  ? `lies inside the excluded ${c.exclusion}`
+                  : c.unexamined !== undefined
+                    ? `may contain the excluded ${c.exclusion}: ` +
+                      `${c.unexamined}, and a path is granted only once ` +
+                      `it has been looked at`
+                    : `contains the excluded ${c.exclusion}`
+          return (
+            `${list} ${c.path} ${what}` +
+            (c.access === 'write' && c.relation === 'above'
+              ? `: a write grant on it is kept and inherited, so that ` +
+                `path would be writable and readable if it is ever ` +
+                `created again — choose a narrower working directory`
+              : '')
+          )
+        }
+        throw new WindowsSandboxError(
+          'profile_exclusion_read_grant',
+          `The session would grant a path that reaches one excluded from ` +
+            `reads of your user profile: ` +
+            refused.map(describe).join('; ') +
+            `. Nothing was granted. Remove the entry, or name a path that ` +
+            `neither is nor contains an excluded one.`,
+        )
+      }
+      // A read deny on or above a path the profile read grant made
+      // readable has to be on that path too, for the session: the
+      // path's own ALLOW would otherwise be met first. `srt-win` adds
+      // those from its record when it is handed the deny, so the deny
+      // is passed as it is, once, whatever it covers.
       // The trust bundle the CA-trust env vars point at
       // (NODE_EXTRA_CA_CERTS etc.) must be readable by the
       // srt-sandbox child. It's written into the broker's %TEMP%,
@@ -1093,7 +1659,58 @@ async function initializeSteps(
       // against the config's lists, nor one of the config's grants.
       const grantRead = mitmCA
         ? [...acc.grantRead, dirname(mitmCA.trustBundlePath)]
-        : acc.grantRead
+        : [...acc.grantRead]
+      // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
+      // It sits wherever the package was installed — unreadable to
+      // the sandbox user, and not a directory to grant wholesale —
+      // so a copy is staged in a directory of its own and that
+      // directory rides the read-set, exactly as the trust bundle's
+      // does. Read+execute only; released by the same revoke.
+      //
+      // The sandbox must never be able to WRITE there: every JVM it
+      // starts loads this jar, and the sandbox account is shared
+      // across sessions. A temp path does not guarantee that — an
+      // allowWrite root may cover it, or %TEMP% may be Users-writable
+      // — so the directory is also stamped with the session's write
+      // denies, as a protected path would be. The broker composes one
+      // DENY and one ALLOW per path, deny first, so the write-deny
+      // holds over any inherited modify grant while the read grant
+      // still works; reset()'s restore releases it with the other
+      // stamps. Like the grant, it is the library's own and not one
+      // of the config's, so it stays out of `acc`.
+      // Resolved here rather than with the proxies below (the lookup
+      // is cached, so that one is free) because the grant has to
+      // precede the first exec.
+      const denyWrite = [...acc.denyWrite]
+      const jar = await getJavaProxyAgentJarPathAsync(
+        runtimeConfig.javaAgentJarPath,
+      )
+      windowsJavaAgentJarPath = jar ? stageWindowsJavaAgentJar(jar) : undefined
+      // The staged directory is one more path the library grants on
+      // its own account, so it is held to the profile exclusions like
+      // the trust bundle's above. One that reaches an exclusion is not
+      // granted: the session then runs as if no jar was found.
+      if (
+        windowsJavaAgentJarPath &&
+        windowsProfileExclusionConflicts(
+          [dirname(windowsJavaAgentJarPath)],
+          profileExclusions,
+        ).length > 0
+      ) {
+        logForDebugging(
+          `[Sandbox Windows] the staged JVM proxy agent jar ` +
+            `'${windowsJavaAgentJarPath}' reaches a path excluded from ` +
+            `reads of the user profile; JVMs in the sandbox will not be ` +
+            `pointed at the proxy`,
+          { level: 'warn' },
+        )
+        removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
+        windowsJavaAgentJarPath = undefined
+      }
+      if (windowsJavaAgentJarPath) {
+        grantRead.push(dirname(windowsJavaAgentJarPath))
+        denyWrite.push(dirname(windowsJavaAgentJarPath))
+      }
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
       // status` here.
@@ -1108,43 +1725,100 @@ async function initializeSteps(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
-      // Grant FIRST so the sandbox user has working-tree access by
-      // the time the deny stamp runs. The two are independent
-      // refcounted state-DB sets keyed on the same holder PID.
-      if (grantRead.length > 0 || acc.grantWrite.length > 0) {
-        grantWindowsAcl({
-          sandboxUserSid: sb,
-          read: grantRead,
-          write: acc.grantWrite,
-          srtWin,
-        })
-      }
-      if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
-        stampWindowsAcl({
-          sandboxUserSid: sb,
-          denyRead: acc.denyRead,
-          denyWrite: acc.denyWrite,
-          srtWin,
-        })
-      }
-      // Only record when something was actually applied — gates
-      // running revoke/restore at reset(). Recorded AFTER success —
-      // the catch below clears `config`, and a non-undefined
-      // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed.
       const anyApplied =
         grantRead.length > 0 ||
         acc.grantWrite.length > 0 ||
         acc.denyRead.length > 0 ||
-        acc.denyWrite.length > 0
-      if (anyApplied) {
+        denyWrite.length > 0
+      const registersUnderOrdinaryToken =
+        !writeRestricted &&
+        u.capabilities.includes(WINDOWS_SRT_WIN_CAPABILITIES.execHolder)
+      if (writeRestricted) {
+        // One call: the write roots are granted persistently (kept at
+        // reset(); a root granted before costs one DACL read), the
+        // denies under them are converged with them, and the rest is
+        // per-session as below. A failure throws — there is no
+        // fallback to per-session grants.
+        //
+        // The same call records this process as a holder of its kept
+        // roots and of the profile read grant, so that another
+        // session switching the token off cannot remove them from
+        // under this one. That is why it is made always — with
+        // nothing to grant, and with no grant recorded: one made
+        // while this session runs is read through by its commands
+        // from then on, and must be held by then.
+        {
+          await grantWindowsAclPersistent({
+            sandboxUserSid: sb,
+            read: grantRead,
+            write: acc.grantWrite,
+            denyRead: acc.denyRead,
+            denyWrite: denyWrite,
+            allowProfileExclusions: override,
+            srtWin,
+          })
+        }
+        // The egress probe, under the token this session's commands
+        // get. Anything but a refused connect (including a probe
+        // child that could not be created) throws, so the session
+        // never starts with that token unfenced.
+        await verifyWindowsWfpEgress({
+          proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+          // A session whose `network.allowLocalBinding` is not the
+          // loopback mode the install recorded is refused here, with
+          // the install command that repairs it.
+          allowLoopback: runtimeConfig.network?.allowLocalBinding === true,
+          writeRestrictedToken: true,
+          writeRoots: acc.grantWrite,
+          srtWin,
+        })
+      } else {
+        // Grant FIRST so the sandbox user has working-tree access by
+        // the time the deny stamp runs. The two are independent
+        // refcounted state-DB sets keyed on the same holder PID.
+        //
+        // With an srt-win that records sessions it is made with
+        // nothing to grant too: the call is what records this process
+        // as one, and the profile read grant is not made or removed
+        // while one exists. An srt-win that does not say so is asked
+        // for nothing it was not asked for before: this token needs
+        // no capability of it.
+        if (
+          registersUnderOrdinaryToken ||
+          grantRead.length > 0 ||
+          acc.grantWrite.length > 0
+        ) {
+          grantWindowsAcl({
+            sandboxUserSid: sb,
+            read: grantRead,
+            write: acc.grantWrite,
+            srtWin,
+          })
+        }
+        if (acc.denyRead.length > 0 || denyWrite.length > 0) {
+          stampWindowsAcl({
+            sandboxUserSid: sb,
+            denyRead: acc.denyRead,
+            denyWrite: denyWrite,
+            srtWin,
+          })
+        }
+      }
+      // Gates running revoke/restore at reset(). Recorded AFTER
+      // success — the catch below clears `config`, and a non-undefined
+      // stampedSet would leave reset()/updateConfig() seeing state
+      // that never landed. Recorded whenever something was applied or
+      // the session registered itself with srt-win, which it releases
+      // the same way.
+      windowsSessionRegistered = writeRestricted || registersUnderOrdinaryToken
+      if (anyApplied || windowsSessionRegistered) {
         windowsFsStampedSet = acc
         logForDebugging(
           `[Sandbox Windows] fs applied: ` +
             `${acc.grantWrite.length} grantWrite, ` +
             `${grantRead.length} grantRead, ` +
             `${acc.denyRead.length} denyRead, ` +
-            `${acc.denyWrite.length} denyWrite`,
+            `${denyWrite.length} denyWrite`,
         )
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
@@ -1152,11 +1826,21 @@ async function initializeSteps(
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
+      // Restore only after a completed revoke — see
+      // windowsAclRestoreAllowed.
       if (windowsFsSbUserSid) {
-        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
-        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
+        const o = { sandboxUserSid: windowsFsSbUserSid, srtWin }
+        if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
+          logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
+        }
       }
       windowsFsSbUserSid = undefined
+      windowsSessionRegistered = false
+      windowsProfileRead = undefined
+      if (windowsJavaAgentJarPath) {
+        removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
+        windowsJavaAgentJarPath = undefined
+      }
       config = undefined
       throw e
     }
@@ -1273,11 +1957,15 @@ function isSandboxingEnabled(): boolean {
  * srt-win resolution failure) or the inputs for the Windows probe —
  * the only platform where the sync and async variants differ.
  */
-function checkDependenciesCommon(
-  ripgrepConfig?: RipgrepConfig,
-):
+function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
   | { done: SandboxDependencyCheck }
-  | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
+  | {
+      windows: {
+        sublayerGuid?: string
+        srtWin: SrtWinSpawn
+        allowLoopback?: boolean
+      }
+    } {
   if (!isSupportedPlatform()) {
     return { done: { errors: ['Unsupported platform'], warnings: [] } }
   }
@@ -1315,6 +2003,11 @@ function checkDependenciesCommon(
         sublayerGuid:
           config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
         srtWin,
+        // With a config to go by, an install whose loopback mode is
+        // not the configured one is an error.
+        ...(config && {
+          allowLoopback: config.network?.allowLocalBinding === true,
+        }),
       },
     }
   }
@@ -2403,17 +3096,23 @@ async function wrapWithSandboxOnce(
 
 /**
  * Wrap `command` for the sandbox and return a spawn descriptor:
- * `{ argv, env }`, suitable for
+ * `{ argv, env, stdinPayload? }`, suitable for
  * `spawn(argv[0], argv.slice(1), {shell: false, env})`.
  *
  * On Windows this is the ONLY supported wrap method (see
  * {@link wrapWithSandbox}); `env` is the broker process's spawn env
  * — the sandboxed child gets a fresh `srt-sandbox` profile env with
  * only the `--env` overlay baked into `argv` (see
- * {@link wrapCommandWithSandboxWindows}). On
+ * {@link wrapCommandWithSandboxWindows}). When `stdinPayload` is set
+ * (network config with proxy auth or a JVM proxy agent), the caller MUST spawn with
+ * stdin piped and write the payload immediately — it carries the
+ * proxy env entries embedding the per-session auth token, which
+ * must never appear on a command line (same-user siblings can
+ * enumerate those freely). On
  * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
- * (proxy env is baked into that command) and `env` is the unchanged
- * `process.env`, so callers can spawn uniformly across platforms.
+ * (proxy env is baked into that command), `env` is the unchanged
+ * `process.env`, and `stdinPayload` is never set, so callers can
+ * spawn uniformly across platforms.
  *
  * @param cwd the working directory the caller will spawn the result
  *   with. On Windows the child's cwd is whatever the caller passes
@@ -2429,7 +3128,11 @@ async function wrapWithSandboxArgv(
   abortSignal?: AbortSignal,
   cwd?: string,
   options?: WrapWithSandboxOptions,
-): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
+): Promise<{
+  argv: string[]
+  env: NodeJS.ProcessEnv
+  stdinPayload?: Buffer
+}> {
   const platform = getPlatform()
 
   if (platform === 'windows') {
@@ -2507,19 +3210,66 @@ async function wrapWithSandboxArgv(
         ],
         held: windowsFsStampedSet,
       })
-      perExecDenyRead = ranked.denyRead.filter(p => !sessRead.has(p))
+      // As at initialize(): a deny on or above a path of the profile
+      // read grant goes on that path too, for this command — added by
+      // `srt-win` from its record, not listed here, so the command
+      // line carries one `--deny-read` per deny however many recorded
+      // paths it covers.
+      const denyRead = ranked.denyRead
+      perExecDenyRead = denyRead.filter(p => !sessRead.has(p))
+      // That holds whatever the grant state was at initialize(): the
+      // deny always goes in this one form, srt-win expands it from
+      // the record as it is when the command runs — so a grant made
+      // since is covered — and the srt-win it goes to is known to do
+      // so: the session's own was required to at initialize(), and
+      // one passed for this command, or used with no session, is
+      // asked now.
       perExecDenyWrite = ranked.denyWrite.filter(
         p => !sessRead.has(p) && !sessWrite.has(p),
       )
     }
-    // Per-exec deny rides on argv (`acl stamp` reads stdin, but
-    // exec's stdin belongs to the child). The CreateProcessW
-    // length check lives in `wrapCommandWithSandboxWindows`
-    // where the full argv (incl. shell + user command) is known.
+    // Per-exec deny rides on argv (`acl stamp` reads stdin;
+    // exec's own stdin is reserved for the `--env-stdin` secret
+    // frame and is never forwarded to the sandboxed child). The
+    // CreateProcessW length check lives in
+    // `wrapCommandWithSandboxWindows` where the full argv (incl.
+    // shell + user command) is known.
     //
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
     // via `computeWindowsFsAccessSet`.
+    // The token shape is session-level: initialize() verified the
+    // egress fence for exactly one shape, so a per-command override
+    // would run a shape nobody probed. Refuse it instead of ignoring
+    // it (silently dropping a request to tighten) or honoring it
+    // (running unverified).
+    const writeRestrictedToken = windowsWriteRestrictedToken
+    const perCommandToken = customConfig?.windows?.writeRestrictedToken
+    if (
+      perCommandToken !== undefined &&
+      perCommandToken !== writeRestrictedToken
+    ) {
+      throw new Error(
+        `Per-command windows.writeRestrictedToken is not supported — ` +
+          `the egress fence is verified for the session's token shape ` +
+          `at initialize(). Set it at the session level.`,
+      )
+    }
+    // Under the write-restricted token every command relies on its
+    // srt-win for more than running it: the read denies above, and
+    // being held (`--held-by`, or srt-win holding for the command
+    // itself). The session's own srt-win was required to do all of it
+    // at initialize(); one passed for this command, or used with no
+    // session behind it, is asked now — once per srt-win, so an older
+    // one is refused as outdated instead of failing on a flag it does
+    // not know.
+    if (writeRestrictedToken) {
+      assertWindowsSrtWinCapable(
+        customConfig?.windows?.srtWin
+          ? resolveSrtWin(customConfig.windows.srtWin)
+          : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
+      )
+    }
     registerCommandText(command, options)
     return wrapCommandWithSandboxWindows({
       command,
@@ -2527,12 +3277,38 @@ async function wrapWithSandboxArgv(
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+      // `srt-win exec` launches nothing unless this is the loopback
+      // mode the install recorded, so one that differs — the session's
+      // or one command's — is refused, never silently ignored.
+      allowLoopback:
+        (customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()) ===
+        true,
       // mode:'deny' env vars are structurally absent (fresh
       // srt-sandbox profile env). mode:'mask' sentinels are
       // passed via the --env overlay so the sandboxed child sees
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
+      // Only when a proxy is advertised, as on macOS/Linux. The deny
+      // list rides along solely so a denied JAVA_TOOL_OPTIONS is not
+      // composed back in from the broker's env. The composed value
+      // travels in the --env-stdin frame, not on argv.
+      javaAgentJarPath: hasNetworkConfig ? windowsJavaAgentJarPath : undefined,
+      unsetEnvVars: credentialRestrictions.unsetEnvVars,
       denyRead: perExecDenyRead,
+      // The session's own grants beneath those denies keep their
+      // rank: srt-win leaves the recorded profile paths they cover
+      // out of what it denies for this command.
+      // (Under the ordinary token there is no profile grant and
+      // nothing to leave out; the flag is not sent.)
+      denyReadExcept: writeRestrictedToken
+        ? windowsGrantsBeneathDenies(
+            [
+              ...(windowsFsStampedSet?.grantRead ?? []),
+              ...(windowsFsStampedSet?.grantWrite ?? []),
+            ],
+            perExecDenyRead,
+          )
+        : undefined,
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
@@ -2542,6 +3318,24 @@ async function wrapWithSandboxArgv(
       allowWrite: windowsFsStampedSet?.grantWrite,
       gitSafeDirectories: getGitSafeDirectories(customConfig),
       caCertPath: mitmCA?.trustBundlePath,
+      writeRestrictedToken,
+      // The session that holds the kept grants for this command:
+      // this process, once initialize() has registered it. srt-win
+      // checks that it really holds — an embedder that revoked the
+      // session's grants in the middle of it no longer does — and
+      // otherwise, as for a command with no session behind it, holds
+      // for the command itself. Named only where the session did
+      // register: under the ordinary token an srt-win that keeps no
+      // such records does not know the flag.
+      heldBy:
+        windowsSessionRegistered && windowsFsSbUserSid !== undefined
+          ? process.pid
+          : undefined,
+      // The roots initialize() granted persistently; their capability
+      // SIDs are what let this command write them.
+      writeRoots: writeRestrictedToken
+        ? windowsFsStampedSet?.grantWrite
+        : undefined,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
         ? resolveSrtWin(customConfig.windows.srtWin)
@@ -2606,6 +3400,20 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
         `(filesystem.* ∪ credentials.files) changed but the ACL ` +
         `stamp/grant is session-wide — call reset() then initialize() ` +
         `to apply. The previously-applied set stays in effect.`,
+      { level: 'warn' },
+    )
+  }
+  if (
+    getPlatform() === 'windows' &&
+    config &&
+    windowsWriteRestrictedTokenEnabled(newConfig.windows) !==
+      windowsWriteRestrictedToken
+  ) {
+    logForDebugging(
+      `[Sandbox Windows] updateConfig: windows.writeRestrictedToken ` +
+        `changed but the child-token shape is fixed (and its egress ` +
+        `fence verified) at initialize() — call reset() then ` +
+        `initialize() to apply. The previous shape stays in effect.`,
       { level: 'warn' },
     )
   }
@@ -2757,38 +3565,40 @@ function forceCloseHttpServer(
 async function reset(): Promise<void> {
   // Windows: release this session's sandbox-user ACEs. Best-effort
   // — log anomalies rather than throw, so teardown always
-  // completes. Leftover ACEs are recoverable later via
-  // `srt-win acl recover` (which sweeps by trustee SID).
+  // completes. ACEs still recorded for this process are released by
+  // srt-win's crash recovery once it has exited.
+  // Under the write-restricted token (the default) the write roots
+  // and the denies under them were granted persistently and are not
+  // this process's to release: the same two calls take off only what was
+  // per-session (read grants, denies outside every root).
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
     const srtWin = srtWinSpawn
-    // 'restored'/'alreadyOriginal' are the pre- same-user-removal
-    // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
-    // post-. Either is non-anomalous.
-    const ok = new Set(['revoked', 'stillHeld', 'restored', 'alreadyOriginal'])
-    const log = (kind: string, e: { path: string; status: string }) => {
-      if (!ok.has(e.status)) {
-        logForDebugging(
-          `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
-            `ACE may be left in place; resolve and run ` +
-            `\`srt-win acl recover\` to clear`,
-          { level: 'warn' },
-        )
-      }
-    }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('grant revoke', e)
-    }
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('deny restore', e)
+    // Restore only after a completed revoke — see
+    // windowsAclRestoreAllowed. (The 'exit'/signal handler lands
+    // here too: this part of reset() runs synchronously.)
+    const o = { sandboxUserSid: sb, srtWin }
+    if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
+      logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
     }
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
+  windowsSessionRegistered = false
   windowsFsRawInputs = undefined
+  // After the revoke and restore above, so both ACEs are released
+  // while the path still resolves.
+  if (windowsJavaAgentJarPath) {
+    removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
+    windowsJavaAgentJarPath = undefined
+  }
   srtWinSpawn = undefined
+  windowsWriteRestrictedToken = true
+  windowsProfileRead = undefined
+  windowsProfileReadWarnings = []
+  windowsCapableSrtWin.clear()
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
@@ -2995,6 +3805,7 @@ export interface ISandboxManager {
     runtimeConfig: SandboxRuntimeConfig,
     sandboxAskCallback?: SandboxAskCallback,
     enableLogMonitor?: boolean,
+    options?: SandboxInitializeOptions,
   ): Promise<void>
   isSupportedPlatform(): boolean
   isSandboxingEnabled(): boolean
@@ -3034,7 +3845,11 @@ export interface ISandboxManager {
     abortSignal?: AbortSignal,
     cwd?: string,
     options?: WrapWithSandboxOptions,
-  ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
+  ): Promise<{
+    argv: string[]
+    env: NodeJS.ProcessEnv
+    stdinPayload?: Buffer
+  }>
   /**
    * Register the network allow list of one invocation, under the `commandId`
    * its wrap was given ({@link WrapWithSandboxOptions}). Entries are matched
@@ -3094,6 +3909,21 @@ export interface ISandboxManager {
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
+  /**
+   * Windows: whether the commands of the current session read the
+   * user's profile through the profile read grant. `'absent'` when no
+   * grant is recorded (skipped at install, or forgotten) or the
+   * session runs under the ordinary token: the sandbox works, the
+   * profile is not readable. `undefined` outside a Windows session.
+   */
+  getWindowsProfileRead(): 'granted' | 'absent' | undefined
+  /**
+   * Windows: what the current session has to tell its user about the
+   * profile read grant — at present, excluded paths that sandboxed
+   * commands can read all the same. Empty when there is nothing, and
+   * outside a session. An embedding program shows these.
+   */
+  getWindowsProfileReadWarnings(): WindowsProfileReadWarning[]
   getSentinelRegistry(): SentinelRegistry
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
@@ -3138,6 +3968,8 @@ export const SandboxManager: ISandboxManager = {
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,
+  getWindowsProfileRead: () => windowsProfileRead,
+  getWindowsProfileReadWarnings: () => [...windowsProfileReadWarnings],
   getSentinelRegistry: () => sentinelRegistry,
   getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,

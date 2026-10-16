@@ -25,14 +25,14 @@ $PortRange = '60080-60089'
 $PortLo    = 60080
 $PortHi    = 60089
 
-# Bind a TcpListener on the first free port from $candidates.
-# Throws if none bind.
+# Bind a TcpListener on the first free port from $candidates, on
+# 127.0.0.1 unless another address is given. Throws if none bind.
 function Bind-Listener {
-  param([int[]] $Candidates)
+  param([int[]] $Candidates,
+        [System.Net.IPAddress] $Address = [System.Net.IPAddress]::Loopback)
   foreach ($p in $Candidates) {
     try {
-      $l = [System.Net.Sockets.TcpListener]::new(
-        [System.Net.IPAddress]::Loopback, $p)
+      $l = [System.Net.Sockets.TcpListener]::new($Address, $p)
       $l.Start()
       return $l
     } catch {
@@ -100,14 +100,87 @@ $vout = & $Exe wfp verify --target $v1Tgt
 $vexit = $LASTEXITCODE
 $v1Lsn.Stop()
 Write-Host "V1: wfp verify --target $v1Tgt exit=$vexit stdout='$vout'"
-if ($vexit -ne 0) {
-  throw "V1: wfp verify expected exit 0 (blocked), got $vexit"
-}
 $v = $vout | ConvertFrom-Json
+
+# ── V1c: lowered-integrity copies of the sandbox token are blocked ──
+# Same run as V1, checked first so that a failure here is named for
+# what it is instead of surfacing as V1's exit code. The runner makes
+# four more connects under a copy of its own token whose integrity
+# level it has lowered: low and untrusted, each to the off-loopback
+# address and to the out-of-range loopback listener. The copy still
+# carries the sandbox account's SID, so block-user must refuse every
+# one. `error` means the runner could not assume the lowered token;
+# that is not a block and fails the row as such.
+$loweredFields = 'low_integrity_probe','low_integrity_loopback_probe',
+                 'untrusted_integrity_probe','untrusted_integrity_loopback_probe'
+foreach ($f in $loweredFields) {
+  if ($null -eq $v.PSObject.Properties[$f]) { throw "V1c: wfp verify output lacks '$f': $vout" }
+}
+$loweredRaw = ($loweredFields | ForEach-Object { "$_=$($v.$_)" }) -join ' '
+Write-Host "V1c raw: $loweredRaw (off-loopback target=$($v.anonymous_target))"
+$loweredOpen = @($loweredFields | Where-Object { $v.$_ -in 'connected','refused' })
+if ($loweredOpen.Count -gt 0) {
+  throw "V1c: BYPASS - a connect under a lowered-integrity copy of the sandbox token was NOT blocked " +
+        "($($loweredOpen -join ', ')); block-user does not match that token. $loweredRaw exit=$vexit"
+}
+foreach ($f in $loweredFields) {
+  $got = $v.$f
+  $offLoopback = $f -notlike '*_loopback_probe'
+  if ($got -eq 'error') {
+    throw "V1c: $f=error - the runner could not assume the lowered-integrity token (see its stderr line above); " +
+          "this is NOT a block. $loweredRaw"
+  }
+  if ($got -eq 'skipped' -and $offLoopback) {
+    Write-Host "V1c note: $f skipped (no off-loopback address on this runner)"
+  } elseif ($got -ne 'blocked') {
+    throw "V1c: $f expected blocked, got '$got'. $loweredRaw"
+  }
+}
+Write-Host "V1c ok: lowered-integrity connects blocked: $loweredRaw"
+
+if ($vexit -ne 0) {
+  throw "V1: wfp verify expected exit 0 (blocked), got $vexit. stdout: $vout"
+}
 if ($v.egress_probe -ne 'blocked') {
   throw "V1: wfp verify expected egress_probe=blocked, got '$($v.egress_probe)'"
 }
 Write-Host 'V1 ok: wfp verify reports egress_probe=blocked'
+
+# ── V1b: wfp verify reports each token shape separately ─────────
+# Same run as V1. Beside the plain connect the runner tries one
+# while impersonating the anonymous token, aimed at this machine's
+# own off-loopback address (srt-win picks it; `skipped` when there is
+# none), one under that token to the loopback listener, and one under
+# a deny-only copy of its own token. No filter covers these three
+# shapes; they must be REPORTED, and what they report is recorded
+# here, not asserted: a connect is the documented residual and is
+# named in `residuals`. The off-loopback anonymous connect is EXPECTED
+# to get through (`anonymous-egress`): no filter is keyed on the
+# anonymous token. None of the three changes the exit code, which V1
+# above required to be 0 on the plain connect being blocked.
+#
+# Every one of these is the worse of two connects - one on a socket
+# created before the token is assumed, one on a socket created after.
+# The runner's stderr lines above (`[<attempt>; socket before token]`,
+# `[<attempt>; socket after token]`) show each ordering's own result.
+foreach ($f in 'anonymous_probe','anonymous_loopback_probe','deny_only_probe','residuals') {
+  if ($null -eq $v.PSObject.Properties[$f]) { throw "V1b: wfp verify output lacks '$f': $vout" }
+}
+if ($v.anonymous_probe -eq 'skipped') {
+  Write-Host 'V1b note: anonymous attempt skipped (no off-loopback address on this runner)'
+}
+foreach ($pair in @(@('anonymous_probe','anonymous-egress'), @('anonymous_loopback_probe','anonymous-loopback'), @('deny_only_probe','deny-only-user-sid'))) {
+  $got = $v.($pair[0])
+  $open = $got -in 'connected','refused'
+  if ($open -ne ($v.residuals -contains $pair[1])) {
+    throw "V1b: $($pair[0])='$got' but residuals=[$($v.residuals -join ',')] - a connect must be named as '$($pair[1])', and only a connect"
+  }
+  Write-Host "V1b obs: $($pair[1]) $($pair[0])=$got named-in-residuals=$open"
+}
+# Kept for the in-sandbox rows below, which print the same shapes'
+# results beside these.
+$verify = $v
+Write-Host "V1b ok: anonymous_probe=$($v.anonymous_probe) target=$($v.anonymous_target); residuals=[$($v.residuals -join ',')]"
 
 # Exec helper. Same .exit/.raw/.out shape as before. The broker
 # forwards exactly what it is told via --env (it does NOT enumerate
@@ -125,7 +198,9 @@ function RExec {
   # 120s: a row that starts Windows PowerShell as the sandbox user can take
   # over 30s on some hosted runner images (powershell.exe is CPU-bound in
   # startup the whole time, then finishes). A limit only matters on a hang.
-  param([string[]] $tail, [int] $TimeoutSec = 120)
+  # -StdinText: give the broker a redirected stdin holding exactly this text,
+  # then close it. Without it the broker inherits this script's stdin.
+  param([string[]] $tail, [int] $TimeoutSec = 120, [string] $StdinText = $null)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
             '--env', "PATHEXT=$($env:PATHEXT)") + $tail
@@ -134,9 +209,14 @@ function RExec {
   $psi.UseShellExecute        = $false
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError  = $true
+  $feed = $PSBoundParameters.ContainsKey('StdinText')
+  if ($feed) { $psi.RedirectStandardInput = $true }
   $psi.Environment['SANDBOX_RUNTIME_WIN_DEBUG'] = '1'
   foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
   $p  = [System.Diagnostics.Process]::Start($psi)
+  if ($feed) {
+    try { $p.StandardInput.Write($StdinText); $p.StandardInput.Close() } catch { }
+  }
   # Drain both pipes concurrently so a full pipe buffer can't wedge
   # WaitForExit.
   $so = $p.StandardOutput.ReadToEndAsync()
@@ -322,6 +402,598 @@ if ($r.out -notmatch 'AccessDenied') {
 }
 Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
 
+# ── R5g-R5j: connects made under an assumed token ────────────────────
+# The filtering engine attributes a connect to the token that was in
+# effect when its SOCKET was created. A socket the process creates
+# under its own token and connects while impersonating is attributed
+# to the process, and block-user refuses it whatever the thread's
+# token is. So a probe that creates its socket first says nothing
+# about the assumed token. Each shape below is therefore tried in
+# both orderings, on one thread:
+#
+#   AFTER  - assume the token, create the socket, connect. The socket
+#            belongs to the assumed token; this is the ordering that
+#            matters.
+#   BEFORE - create the socket, assume the token, connect. Kept in
+#            case an engine attributes at connect time instead.
+#
+# One C# method does this through ws2_32 directly, reads the thread's
+# token back after the socket exists and before the connect, and
+# reverts. It prints one line per shape and ordering,
+# `<SHAPE>.<BEFORE|AFTER>=<result>`, where the result is:
+#
+#   CONNECTED              the connect completed
+#   WSA:<code>             10013 = refused by a filter; 10061 = refused
+#                          by the destination, i.e. past the filters
+#   TOKEN_FAILED:<step>:<code>   the token could not be assumed
+#   SOCKET_FAILED:<code>   no socket could be created under the token
+#   TOKEN_LOST:<what>      the thread's token did not read back as the
+#                          one assumed, so no connect was made
+#
+# Shapes: `anonymous` (ImpersonateAnonymousToken), `integrity:<sid>`
+# (a copy of the process token at that mandatory level), `denyonly`
+# (a restricted copy of the process token whose user SID is deny-only),
+# `denyall` (the user SID and every group deny-only), `narrow` and
+# `narrow-wr` (a restricted copy whose restricting SIDs were asked to
+# be Everyone alone - without and with the write-restricted flag).
+#
+# `-Observe` shapes are not connected in two orderings. Each gets one
+# line, `OBS.<LABEL>=<steps>`, that says how far the child got in
+# building and assuming the token and what a connect on a socket
+# created AFTER it was assumed did, to the off-loopback target
+# (`-OffIp`/`-OffPort`; SKIPPED without one) and to `$Ip:$Port`:
+#
+#   create=ok | create=FAILED:<step>:<win32 error>    (not for anonymous)
+#   impersonate=ok | impersonate=FAILED:<win32 error>
+#   level=<impersonation level the thread's token reads back at>
+#   user=<its user SID>  restricting=[<its restricting SIDs>]
+#   off-loopback=<result>  loopback=<result>
+#
+# with <result> as above. The line stops at the first step that
+# failed. `OBS.PROCESS=` describes the process token the copies are
+# made from.
+function TokenProbeScript {
+  param([string] $Ip, [int] $Port, [string[]] $Shapes,
+        [string[]] $Observe = @(), [string] $OffIp = '', [int] $OffPort = 0)
+  $calls = @(foreach ($entry in $Shapes) {
+    $label, $shape = $entry -split '=', 2
+    "'$label.BEFORE=' + [SrtTok]::Go('$Ip', $Port, '$shape', `$false)"
+    "'$label.AFTER=' + [SrtTok]::Go('$Ip', $Port, '$shape', `$true)"
+  })
+  if ($Observe.Count -gt 0) { $calls += "'OBS.PROCESS=' + [SrtTok]::Own()" }
+  foreach ($entry in $Observe) {
+    $label, $shape = $entry -split '=', 2
+    $calls += "'OBS.$label=' + [SrtTok]::Observe('$shape', '$OffIp', $OffPort, '$Ip', $Port)"
+  }
+  return @"
+`$src = @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+public static class SrtTok {
+  [StructLayout(LayoutKind.Sequential)] struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
+  [StructLayout(LayoutKind.Sequential)] struct TokenMandatoryLabel { public SidAndAttributes Label; }
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+  [DllImport("kernel32.dll")] static extern IntPtr GetCurrentThread();
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr p);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateAnonymousToken(IntPtr thread);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool OpenThreadToken(IntPtr thread, uint access, bool openAsSelf, out IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool DuplicateTokenEx(IntPtr token, uint access, IntPtr attrs, int level, int type, out IntPtr dup);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool CreateRestrictedToken(IntPtr token, uint flags, uint disableCount, ref SidAndAttributes disable, uint deleteCount, IntPtr delete, uint restrictCount, IntPtr restrict, out IntPtr newToken);
+  [DllImport("advapi32.dll", EntryPoint="CreateRestrictedToken", SetLastError=true)] static extern bool CreateRestrictedTokenLists(IntPtr token, uint flags, uint disableCount, IntPtr disable, uint deleteCount, IntPtr delete, uint restrictCount, IntPtr restrict, out IntPtr newToken);
+  [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool ConvertStringSidToSidW(string sid, out IntPtr psid);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool ConvertSidToStringSidW(IntPtr psid, out IntPtr str);
+  [DllImport("advapi32.dll")] static extern int GetLengthSid(IntPtr sid);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetTokenInformation(IntPtr token, int cls, ref TokenMandatoryLabel info, int len);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool GetTokenInformation(IntPtr token, int cls, IntPtr info, int len, out int ret);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetThreadToken(IntPtr thread, IntPtr token);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
+  [DllImport("ws2_32.dll", SetLastError=true)] static extern IntPtr socket(int af, int type, int protocol);
+  [DllImport("ws2_32.dll", SetLastError=true)] static extern int closesocket(IntPtr s);
+  [DllImport("ws2_32.dll", SetLastError=true)] static extern int connect(IntPtr s, byte[] name, int len);
+  const int TokenUser = 1, TokenGroups = 2, TokenImpersonationLevel = 9, TokenRestrictedSids = 11, TokenIntegrityLevel = 25;
+  static readonly IntPtr InvalidSocket = new IntPtr(-1);
+  static SrtTok() {
+    // Start Winsock under the process's own token, once.
+    new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp).Dispose();
+  }
+  static string Fail(string step) { return "TOKEN_FAILED:" + step + ":" + Marshal.GetLastWin32Error(); }
+  // The SID a TokenUser / TokenIntegrityLevel query starts with, as a
+  // string; null when it cannot be read.
+  static string TokenSid(IntPtr token, int cls) {
+    IntPtr buf = Marshal.AllocHGlobal(256), str = IntPtr.Zero;
+    try {
+      int ret;
+      if (!GetTokenInformation(token, cls, buf, 256, out ret)) return null;
+      if (!ConvertSidToStringSidW(Marshal.ReadIntPtr(buf), out str)) return null;
+      return Marshal.PtrToStringUni(str);
+    } finally {
+      if (str != IntPtr.Zero) LocalFree(str);
+      Marshal.FreeHGlobal(buf);
+    }
+  }
+  // Write one SID_AND_ATTRIBUTES, attributes 0, at index i of an array.
+  static void PutSid(IntPtr array, int i, IntPtr sid) {
+    int size = Marshal.SizeOf(typeof(SidAndAttributes));
+    Marshal.WriteIntPtr(array, i * size, sid);
+    Marshal.WriteInt32(array, i * size + IntPtr.Size, 0);
+  }
+  // Make the impersonation token for a shape other than "anonymous".
+  // Returns null on success, with the token in dup for the caller to
+  // close.
+  static string Build(string shape, out IntPtr dup) {
+    dup = IntPtr.Zero;
+    IntPtr own = IntPtr.Zero, restricted = IntPtr.Zero, psid = IntPtr.Zero;
+    IntPtr userBuf = IntPtr.Zero, groupBuf = IntPtr.Zero, list = IntPtr.Zero;
+    bool ok = false;
+    try {
+      // TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY
+      if (!OpenProcessToken(GetCurrentProcess(), 0x000B, out own)) return Fail("open");
+      IntPtr source = own;
+      int ret;
+      if (shape == "denyonly") {
+        // The user SID in the disable list becomes deny-only.
+        userBuf = Marshal.AllocHGlobal(256);
+        if (!GetTokenInformation(own, TokenUser, userBuf, 256, out ret)) return Fail("query-user");
+        SidAndAttributes disable = new SidAndAttributes();
+        disable.Sid = Marshal.ReadIntPtr(userBuf);
+        if (!CreateRestrictedToken(own, 0, 1, ref disable, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted)) return Fail("restrict");
+        source = restricted;
+      } else if (shape == "denyall") {
+        // The user SID and every group become deny-only.
+        userBuf = Marshal.AllocHGlobal(256);
+        if (!GetTokenInformation(own, TokenUser, userBuf, 256, out ret)) return Fail("query-user");
+        GetTokenInformation(own, TokenGroups, IntPtr.Zero, 0, out ret);
+        if (ret <= 0) return Fail("size-groups");
+        groupBuf = Marshal.AllocHGlobal(ret);
+        if (!GetTokenInformation(own, TokenGroups, groupBuf, ret, out ret)) return Fail("query-groups");
+        int n = Marshal.ReadInt32(groupBuf), size = Marshal.SizeOf(typeof(SidAndAttributes));
+        list = Marshal.AllocHGlobal(size * (n + 1));
+        PutSid(list, 0, Marshal.ReadIntPtr(userBuf));
+        int count = 1;
+        for (int i = 0; i < n; i++) {
+          IntPtr entry = IntPtr.Add(groupBuf, IntPtr.Size + i * size);
+          // The integrity label is listed with the groups; it is not one.
+          if ((Marshal.ReadInt32(entry, IntPtr.Size) & 0x20) != 0) continue;
+          PutSid(list, count++, Marshal.ReadIntPtr(entry));
+        }
+        if (!CreateRestrictedTokenLists(own, 0, (uint)count, list, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted)) return Fail("restrict");
+        source = restricted;
+      } else if (shape == "narrow" || shape == "narrow-wr") {
+        // Ask for Everyone as the only restricting SID. 0x8 =
+        // WRITE_RESTRICTED.
+        if (!ConvertStringSidToSidW("S-1-1-0", out psid)) return Fail("sid");
+        list = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SidAndAttributes)));
+        PutSid(list, 0, psid);
+        uint flags = shape == "narrow-wr" ? 8u : 0u;
+        if (!CreateRestrictedTokenLists(own, flags, 0, IntPtr.Zero, 0, IntPtr.Zero, 1, list, out restricted)) return Fail("restrict");
+        source = restricted;
+      }
+      // TOKEN_ALL_ACCESS, SecurityImpersonation, TokenImpersonation
+      if (!DuplicateTokenEx(source, 0xF01FF, IntPtr.Zero, 2, 2, out dup)) return Fail("duplicate");
+      if (shape.StartsWith("integrity:")) {
+        if (!ConvertStringSidToSidW(shape.Substring(10), out psid)) return Fail("sid");
+        TokenMandatoryLabel tml = new TokenMandatoryLabel();
+        tml.Label.Sid = psid;
+        tml.Label.Attributes = 0x20; // SE_GROUP_INTEGRITY
+        if (!SetTokenInformation(dup, TokenIntegrityLevel, ref tml, Marshal.SizeOf(tml) + GetLengthSid(psid))) return Fail("set-integrity");
+      }
+      ok = true;
+      return null;
+    } finally {
+      if (!ok && dup != IntPtr.Zero) { CloseHandle(dup); dup = IntPtr.Zero; }
+      if (list != IntPtr.Zero) Marshal.FreeHGlobal(list);
+      if (groupBuf != IntPtr.Zero) Marshal.FreeHGlobal(groupBuf);
+      if (userBuf != IntPtr.Zero) Marshal.FreeHGlobal(userBuf);
+      if (psid != IntPtr.Zero) LocalFree(psid);
+      if (restricted != IntPtr.Zero) CloseHandle(restricted);
+      if (own != IntPtr.Zero) CloseHandle(own);
+    }
+  }
+  // Put the token for a shape on this thread. Returns null on success.
+  static string Assume(string shape) {
+    if (shape == "anonymous")
+      return ImpersonateAnonymousToken(GetCurrentThread()) ? null : Fail("impersonate-anonymous");
+    IntPtr dup;
+    string failed = Build(shape, out dup);
+    if (failed != null) return failed;
+    try {
+      return SetThreadToken(IntPtr.Zero, dup) ? null : Fail("impersonate");
+    } finally {
+      CloseHandle(dup);
+    }
+  }
+  // Read the thread's token back. Returns null when it is the one the
+  // shape asks for, at impersonation level.
+  static string Lost(string shape) {
+    IntPtr cur = IntPtr.Zero, buf = Marshal.AllocHGlobal(8);
+    try {
+      // TOKEN_QUERY, opened as the process.
+      if (!OpenThreadToken(GetCurrentThread(), 0x0008, true, out cur)) return "TOKEN_LOST:no-thread-token:" + Marshal.GetLastWin32Error();
+      int ret;
+      if (!GetTokenInformation(cur, TokenImpersonationLevel, buf, 4, out ret)) return "TOKEN_LOST:query-level:" + Marshal.GetLastWin32Error();
+      int level = Marshal.ReadInt32(buf);
+      if (level < 2) return "TOKEN_LOST:level:" + level;
+      if (shape == "anonymous") {
+        string user = TokenSid(cur, TokenUser);
+        if (user != "S-1-5-7") return "TOKEN_LOST:user:" + user;
+      }
+      if (shape.StartsWith("integrity:")) {
+        string il = TokenSid(cur, TokenIntegrityLevel);
+        if (il != shape.Substring(10)) return "TOKEN_LOST:integrity:" + il;
+      }
+      return null;
+    } finally {
+      if (cur != IntPtr.Zero) CloseHandle(cur);
+      Marshal.FreeHGlobal(buf);
+    }
+  }
+  // A token's SIDs of one class (groups or restricting SIDs), as
+  // "[sid,sid]".
+  static string SidList(IntPtr token, int cls) {
+    int ret;
+    GetTokenInformation(token, cls, IntPtr.Zero, 0, out ret);
+    if (ret <= 0) return "unreadable:" + Marshal.GetLastWin32Error();
+    IntPtr buf = Marshal.AllocHGlobal(ret);
+    try {
+      if (!GetTokenInformation(token, cls, buf, ret, out ret)) return "unreadable:" + Marshal.GetLastWin32Error();
+      int n = Marshal.ReadInt32(buf), size = Marshal.SizeOf(typeof(SidAndAttributes));
+      string[] sids = new string[n];
+      for (int i = 0; i < n; i++) {
+        IntPtr str = IntPtr.Zero;
+        sids[i] = ConvertSidToStringSidW(Marshal.ReadIntPtr(buf, IntPtr.Size + i * size), out str) ? Marshal.PtrToStringUni(str) : "?";
+        if (str != IntPtr.Zero) LocalFree(str);
+      }
+      return "[" + string.Join(",", sids) + "]";
+    } finally {
+      Marshal.FreeHGlobal(buf);
+    }
+  }
+  // The process token: its user and its restricting SIDs.
+  public static string Own() {
+    IntPtr own = IntPtr.Zero;
+    try {
+      if (!OpenProcessToken(GetCurrentProcess(), 0x0008, out own)) return "unreadable:" + Marshal.GetLastWin32Error();
+      return "user=" + (TokenSid(own, TokenUser) ?? "unreadable") + " restricting=" + SidList(own, TokenRestrictedSids);
+    } catch (Exception e) {
+      return "EXCEPTION:" + e.GetType().Name + ":" + e.Message.Replace("\r", " ").Replace("\n", " ");
+    } finally {
+      if (own != IntPtr.Zero) CloseHandle(own);
+    }
+  }
+  // The token the thread carries now: the impersonation level it reads
+  // back at, its user and its restricting SIDs.
+  static string ThreadToken() {
+    IntPtr cur = IntPtr.Zero, buf = Marshal.AllocHGlobal(8);
+    try {
+      // TOKEN_QUERY, opened as the process.
+      if (!OpenThreadToken(GetCurrentThread(), 0x0008, true, out cur)) return "level=unreadable:" + Marshal.GetLastWin32Error();
+      int ret;
+      string level;
+      if (!GetTokenInformation(cur, TokenImpersonationLevel, buf, 4, out ret)) {
+        level = "unreadable:" + Marshal.GetLastWin32Error();
+      } else {
+        int l = Marshal.ReadInt32(buf);
+        level = l == 0 ? "anonymous" : l == 1 ? "identification" : l == 2 ? "impersonation" : l == 3 ? "delegation" : l.ToString();
+      }
+      return "level=" + level + " user=" + (TokenSid(cur, TokenUser) ?? "unreadable") + " restricting=" + SidList(cur, TokenRestrictedSids);
+    } finally {
+      if (cur != IntPtr.Zero) CloseHandle(cur);
+      Marshal.FreeHGlobal(buf);
+    }
+  }
+  static byte[] Sockaddr(string ip, int port) {
+    byte[] a = IPAddress.Parse(ip).GetAddressBytes();
+    byte[] sa = new byte[16];
+    sa[0] = 2; sa[2] = (byte)(port >> 8); sa[3] = (byte)(port & 0xff);
+    Array.Copy(a, 0, sa, 4, 4);
+    return sa;
+  }
+  // One connect on a socket created now, under whatever token the
+  // thread carries.
+  static string ConnectNew(string ip, int port) {
+    byte[] sa = Sockaddr(ip, port);
+    IntPtr s = socket(2, 1, 6);
+    if (s == InvalidSocket) return "SOCKET_FAILED:" + Marshal.GetLastWin32Error();
+    try {
+      int rc = connect(s, sa, sa.Length);
+      int err = Marshal.GetLastWin32Error();
+      return rc == 0 ? "CONNECTED" : "WSA:" + err;
+    } finally {
+      closesocket(s);
+    }
+  }
+  // Build and assume a shape, one step at a time, and say how far it
+  // got; then connect, on sockets created under it, to the off-loopback
+  // target (none when offIp is empty) and to the loopback one. Nothing
+  // here is judged: a level below impersonation is printed and the
+  // connects are still tried.
+  public static string Observe(string shape, string offIp, int offPort, string ip, int port) {
+    bool assumed = false;
+    string r;
+    try {
+      if (shape == "anonymous") {
+        if (!ImpersonateAnonymousToken(GetCurrentThread())) return "impersonate=FAILED:" + Marshal.GetLastWin32Error();
+        r = "impersonate=ok";
+      } else {
+        IntPtr dup;
+        string failed = Build(shape, out dup);
+        // "TOKEN_FAILED:<step>:<code>"
+        if (failed != null) return "create=FAILED:" + failed.Substring(13);
+        try {
+          if (!SetThreadToken(IntPtr.Zero, dup)) return "create=ok impersonate=FAILED:" + Marshal.GetLastWin32Error();
+        } finally {
+          CloseHandle(dup);
+        }
+        r = "create=ok impersonate=ok";
+      }
+      assumed = true;
+      r += " " + ThreadToken();
+      r += " off-loopback=" + (offIp == "" ? "SKIPPED" : ConnectNew(offIp, offPort));
+      r += " loopback=" + ConnectNew(ip, port);
+      return r;
+    } catch (Exception e) {
+      return "EXCEPTION:" + e.GetType().Name + ":" + e.Message.Replace("\r", " ").Replace("\n", " ");
+    } finally {
+      if (assumed) RevertToSelf();
+    }
+  }
+  // shape "plain" connects under the process's own token.
+  public static string Go(string ip, int port, string shape, bool socketAfter) {
+    byte[] sa = Sockaddr(ip, port);
+    bool assume = shape != "plain";
+    IntPtr s = InvalidSocket;
+    bool assumed = false;
+    try {
+      if (!socketAfter || !assume) {
+        s = socket(2, 1, 6);
+        if (s == InvalidSocket) return "SOCKET_FAILED:" + Marshal.GetLastWin32Error();
+      }
+      if (assume) {
+        string failed = Assume(shape);
+        if (failed != null) return failed;
+        assumed = true;
+        if (socketAfter) {
+          s = socket(2, 1, 6);
+          if (s == InvalidSocket) return "SOCKET_FAILED:" + Marshal.GetLastWin32Error();
+        }
+        string lost = Lost(shape);
+        if (lost != null) return lost;
+      }
+      int rc = connect(s, sa, sa.Length);
+      int err = Marshal.GetLastWin32Error();
+      return rc == 0 ? "CONNECTED" : "WSA:" + err;
+    } finally {
+      if (assumed) RevertToSelf();
+      if (s != InvalidSocket) closesocket(s);
+    }
+  }
+}
+'@
+Add-Type -TypeDefinition `$src
+'PLAIN=' + [SrtTok]::Go('$Ip', $Port, 'plain', `$false)
+$($calls -join "`n")
+"@
+}
+
+# One result of the probe above as the word `wfp verify` uses for it.
+function Probe-Word([string] $raw) {
+  switch -Regex ($raw) {
+    '^WSA:10013$' { return 'blocked' }
+    '^CONNECTED$' { return 'connected' }
+    '^WSA:10061$' { return 'refused' }
+    default       { return $raw }
+  }
+}
+
+# Both orderings' raw results for one shape label, from probe output.
+function Probe-Orderings([string] $out, [string] $label, [string] $row) {
+  $r = @{}
+  foreach ($order in 'BEFORE','AFTER') {
+    if ($out -notmatch "(?m)^$label\.$order=(\S+)") { throw "${row}: no $label.$order result. out: $out" }
+    $r[$order] = $Matches[1]
+  }
+  return $r
+}
+
+# Print what happened to a shape in each ordering, beside what
+# `wfp verify` reported for it. Never fails: for a shape no filter
+# covers.
+function Write-OrderingsObserved([string] $out, [string] $label, [string] $row, [string] $residual, [string] $verifyField) {
+  $o = Probe-Orderings $out $label $row
+  Write-Host ("$row obs: $residual " +
+              "socket-before=$(Probe-Word $o.BEFORE) socket-after=$(Probe-Word $o.AFTER) " +
+              "(raw before=$($o.BEFORE) after=$($o.AFTER)); " +
+              "wfp verify $verifyField=$($verify.$verifyField) " +
+              "residuals=[$($verify.residuals -join ',')]")
+}
+
+# Assert that a shape was blocked in both orderings. A token the child
+# could not assume, or could not create a socket under, is a route
+# that does not exist from inside exec: it is reported as NOT
+# EXERCISED, never as blocked. Anything else fails the row.
+function Assert-BothOrderingsBlocked([string] $out, [string] $label, [string] $row, [string] $what, [string] $raw) {
+  $res = Probe-Orderings $out $label $row
+  Write-Host "$row raw: $label socket-before=$($res.BEFORE) socket-after=$($res.AFTER)"
+  foreach ($order in 'BEFORE','AFTER') {
+    $got = $res[$order]
+    $name = "socket-$($order.ToLower())"
+    if ($got -in 'CONNECTED','WSA:10061') {
+      throw "${row}: BYPASS - $what was NOT blocked with the $name ordering ($label.$order=$got). raw: $raw"
+    } elseif ($got -like 'TOKEN_FAILED:*' -or $got -like 'SOCKET_FAILED:*') {
+      Write-Host "$row NOT EXERCISED ($name): $what - the child could not set it up ($got); see wfp verify (V1b/V1c)"
+    } elseif ($got -eq 'WSA:10013') {
+      Write-Host "$row ok ($name): $what blocked (WSA:10013)"
+    } else {
+      throw "${row}: expected $label.$order=WSA:10013, got '$got'. raw: $raw"
+    }
+  }
+}
+
+# R5g: anonymous, off-loopback - an OBSERVATION. The destination is
+# one of this runner's own addresses with a live listener, so "not
+# blocked" is an actual connect rather than a timeout. No filter is
+# keyed on the anonymous token, so the socket-after ordering is
+# expected to connect; this row prints what happened in each ordering
+# beside what `wfp verify` reported for the same shape. It fails only
+# if the PLAIN connect to that address gets through.
+$lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ea SilentlyContinue |
+  Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+  Select-Object -First 1).IPAddress
+if (-not $lanIp) {
+  Write-Host 'R5g SKIPPED: runner has no off-loopback IPv4 address'
+} else {
+  $lanLsn = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($lanIp), 0)
+  $lanLsn.Start()
+  $lanPort = $lanLsn.LocalEndpoint.Port
+  try {
+    # Sanity: the listener is live from the unsandboxed broker.
+    $bs = (Test-NetConnection $lanIp -Port $lanPort `
+           -WarningAction SilentlyContinue).TcpTestSucceeded
+    if (-not $bs) { throw "R5g: broker-side connect to ${lanIp}:$lanPort failed - test invalid" }
+    $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+                 (TokenProbeScript $lanIp $lanPort @('ANON=anonymous')))
+    Write-Host "R5g probe output (${lanIp}:$lanPort): $($r.out.Trim() -replace '\s+',' ')"
+    if ($r.out -notmatch 'PLAIN=WSA:10013') {
+      throw "R5g: plain connect to ${lanIp}:$lanPort expected WSA:10013 (block-user). raw: $($r.raw)"
+    }
+    Write-OrderingsObserved $r.out 'ANON' 'R5g' 'anonymous-egress' 'anonymous_probe'
+  } finally {
+    $lanLsn.Stop()
+  }
+}
+
+# R5h, R5i, R5j share one out-of-range LOOPBACK listener, live from
+# the broker, so "not blocked" is an actual connect.
+$tokLsn = Bind-Listener (50003, 50004, 50005, 49997)
+$tokPort = $tokLsn.LocalEndpoint.Port
+try {
+  $bs = (Test-NetConnection 127.0.0.1 -Port $tokPort `
+         -WarningAction SilentlyContinue).TcpTestSucceeded
+  if (-not $bs) { throw "R5h-j: broker-side connect to 127.0.0.1:$tokPort failed - test invalid" }
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+               (TokenProbeScript '127.0.0.1' $tokPort @(
+                  'ANON=anonymous', 'LOW=integrity:S-1-16-4096',
+                  'UNTRUSTED=integrity:S-1-16-0', 'DENYONLY=denyonly')))
+  Write-Host "R5h-j probe output (127.0.0.1:$tokPort): $($r.out.Trim() -replace '\s+',' ')"
+  if ($r.out -notmatch 'PLAIN=WSA:10013') {
+    throw "R5h-j: plain connect to out-of-range loopback expected WSA:10013 (block-user). raw: $($r.raw)"
+  }
+
+  # R5h: anonymous, out-of-range loopback - an OBSERVATION. No filter
+  # covers a loopback connect on a socket created while impersonating
+  # anonymous; this row prints what happened in each ordering beside
+  # what `wfp verify` reported for the same shape, and never fails.
+  Write-OrderingsObserved $r.out 'ANON' 'R5h' 'anonymous-loopback' 'anonymous_loopback_probe'
+
+  # R5i: a lowered-integrity copy of the child's own token - ASSERTED
+  # in both orderings. A process may lower the integrity level of a
+  # copy of its own token without any privilege; the copy still
+  # carries the sandbox account's SID, so block-user must refuse a
+  # connect on a socket created under it.
+  foreach ($shape in 'LOW','UNTRUSTED') {
+    Assert-BothOrderingsBlocked $r.out $shape 'R5i' `
+      "connect under a $shape-integrity copy of the sandboxed child's token" $r.raw
+  }
+
+  # R5j: a copy of the child's own token with the user SID deny-only -
+  # an OBSERVATION. A deny-only SID is matched by no allow entry, so
+  # no filter here can name that token; this row prints what happened
+  # in each ordering beside what `wfp verify` reported, and never
+  # fails.
+  Write-OrderingsObserved $r.out 'DENYONLY' 'R5j' 'deny-only-user-sid' 'deny_only_probe'
+} finally {
+  $tokLsn.Stop()
+}
+
+# ── R5k: what a child can do with its own token - OBSERVATIONS ────────
+# The filters name the sandbox account's SID. This row prints, for a
+# child launched WITH the write-restricted token and again for one
+# launched with the ordinary token, how far the child gets with each
+# token shape that could make a connect the filters do not attribute
+# to that SID, and what a connect on a socket created under the shape
+# does - to one of this machine's own off-loopback addresses and to an
+# out-of-range loopback port, both with a live listener. The shapes:
+#
+#   anonymous      ImpersonateAnonymousToken
+#   deny-only      a copy of the child's token, user SID deny-only
+#   deny-all       a copy with the user SID and every group deny-only
+#   low-integrity, untrusted-integrity
+#                  a copy at that mandatory level
+#   narrow         a copy whose restricting SIDs were asked to be
+#                  Everyone alone, so without the sandbox user's SID
+#   narrow-wr      the same, asked for with the write-restricted flag
+#
+# Every line starts `WRT obs:` and carries the child's own words (see
+# TokenProbeScript). Nothing here fails the script: a refusal by the
+# kernel is a result and is printed as one; a shape whose line the
+# child did not produce prints NOT EXERCISED with the reason.
+$wrtShapes = [ordered]@{
+  'anonymous'           = 'anonymous'
+  'deny-only'           = 'denyonly'
+  'deny-all'            = 'denyall'
+  'low-integrity'       = 'integrity:S-1-16-4096'
+  'untrusted-integrity' = 'integrity:S-1-16-0'
+  'narrow'              = 'narrow'
+  'narrow-wr'           = 'narrow-wr'
+}
+$wrtLoop = $null
+$wrtLan  = $null
+try {
+  $wrtLoop = Bind-Listener (50006, 50007, 50008, 49996)
+  $wrtPort = $wrtLoop.LocalEndpoint.Port
+  $wrtOffIp = ''
+  $wrtOffPort = 0
+  if ($lanIp) {
+    $wrtLan = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Parse($lanIp), 0)
+    $wrtLan.Start()
+    $wrtOffIp = $lanIp
+    $wrtOffPort = $wrtLan.LocalEndpoint.Port
+  }
+  Write-Host "WRT obs: targets off-loopback=$(if ($wrtOffIp) { "${wrtOffIp}:$wrtOffPort" } else { 'none' }) loopback=127.0.0.1:$wrtPort"
+  $wrtScript = TokenProbeScript '127.0.0.1' $wrtPort @() `
+    -Observe @($wrtShapes.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) `
+    -OffIp $wrtOffIp -OffPort $wrtOffPort
+  foreach ($mode in 'write-restricted', 'ordinary') {
+    $pre = "WRT obs: token=$mode"
+    $r = $null
+    $why = $null
+    try {
+      $tail = @()
+      if ($mode -eq 'write-restricted') { $tail += '--write-restricted-token' }
+      $tail += @('--', $pwsh, '-NoProfile', '-Command', $wrtScript)
+      $r = RExec $tail 300
+    } catch {
+      $why = "the child did not finish: $($_.Exception.Message)"
+    }
+    if ($r -and $r.out -notmatch '(?m)^PLAIN=') {
+      $why = "the probe did not run in the child (exec exit $($r.exit)): " +
+             "$(($r.raw.Trim() -replace '\s+', ' '))"
+    }
+    foreach ($name in @('process', 'plain') + @($wrtShapes.Keys)) {
+      $label = switch ($name) { 'process' { 'OBS.PROCESS' } 'plain' { 'PLAIN' } default { "OBS.$name" } }
+      if ($why) {
+        Write-Host "$pre shape=$name NOT EXERCISED: $why"
+      } elseif ($r.out -match "(?m)^$([regex]::Escape($label))=(.*?)\r?$") {
+        $got = $Matches[1]
+        if ($got -like 'EXCEPTION:*') { Write-Host "$pre shape=$name NOT EXERCISED: the probe threw ($got)" }
+        elseif ($name -eq 'plain')    { Write-Host "$pre shape=$name loopback=$got" }
+        else                          { Write-Host "$pre shape=$name $got" }
+      } else {
+        Write-Host "$pre shape=$name NOT EXERCISED: the child printed no $label line"
+      }
+    }
+  }
+} catch {
+  Write-Host "WRT obs: NOT EXERCISED: $($_.Exception.Message)"
+} finally {
+  if ($wrtLoop) { $wrtLoop.Stop() }
+  if ($wrtLan)  { $wrtLan.Stop() }
+}
+
 # ── R5f: non-interactive logon types refused for the sandbox account ─
 # The SMB redirector dials from kernel mode as SYSTEM, so the
 # SID-keyed WFP fence never sees its connects; the fix denies the
@@ -445,6 +1117,190 @@ if ($r.out -notmatch 'DENIED:runner') {
 }
 Write-Host 'R9b ok: child denied PROCESS_CREATE_PROCESS on the runner (self-protect holds)'
 
+# ── R9c: child cannot open any THREAD of the runner ──────────────
+# ── R9d: the same after a wait (a thread the runner started after
+#        the launch must be closed to the child too)
+# A thread object has its own DACL, separate from the process's. A
+# child that could open a runner thread for impersonation or
+# set-context would act with the runner's token, which carries none
+# of the child token's restrictions. The child lists the runner's
+# threads and tries every such right on each; one success fails the
+# row. CONTROL opens the child's OWN thread the same way, so a probe
+# that cannot open anything at all does not read as a pass.
+$threadRights = 11
+$probeR9c = @'
+$sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenThread(uint a,bool b,uint t);' +
+       '[DllImport("kernel32.dll")]public static extern bool CloseHandle(System.IntPtr h);' +
+       '[DllImport("kernel32.dll")]public static extern uint GetCurrentThreadId();'
+$k32 = Add-Type -MemberDefinition $sig -Name K32T -Namespace W -PassThru
+$rights = [ordered]@{
+  'terminate'            = 0x0001
+  'suspend-resume'       = 0x0002
+  'get-context'          = 0x0008
+  'set-context'          = 0x0010
+  'set-information'      = 0x0020
+  'query-information'    = 0x0040
+  'set-thread-token'     = 0x0080
+  'impersonate'          = 0x0100
+  'direct-impersonation' = 0x0200
+  'write-dac'            = 0x40000
+  'write-owner'          = 0x80000
+}
+$rp = 0
+$cur = $PID
+for ($i = 0; $i -lt 8; $i++) {
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ea SilentlyContinue
+  if (-not $p) { break }
+  if ($p.Name -eq 'srt-win.exe') { $rp = [int]$p.ProcessId; break }
+  if (-not $p.ParentProcessId) { break }
+  $cur = $p.ParentProcessId
+}
+function Sweep([string]$pass) {
+  $tids = @()
+  try { $tids = @((Get-Process -Id $rp -ErrorAction Stop).Threads | ForEach-Object { $_.Id }) } catch { }
+  if ($tids.Count -eq 0) {
+    $tids = @(Get-CimInstance Win32_Thread -Filter "ProcessHandle='$rp'" -ea SilentlyContinue |
+              ForEach-Object { [int]$_.Handle })
+  }
+  $denied = 0
+  foreach ($t in $tids) {
+    foreach ($name in $rights.Keys) {
+      $h = $k32::OpenThread([uint32]$rights[$name], $false, [uint32]$t)
+      $le = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+      if ($h -ne [System.IntPtr]::Zero) { [void]$k32::CloseHandle($h); "OPENED:$pass tid=$t right=$name" }
+      elseif ($le -eq 5)                { $denied++ }
+      else                              { "OTHER:$pass tid=$t right=$name le=$le" }
+    }
+  }
+  "SWEEP:$pass threads=$($tids.Count) denied=$denied"
+}
+if ($rp -eq 0) { 'NORUNNER' } else {
+  # 0x0012 = THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME
+  $h = $k32::OpenThread(0x0012, $false, $k32::GetCurrentThreadId())
+  if ($h -ne [System.IntPtr]::Zero) { 'CONTROL:ok' } else { 'CONTROL:failed' }
+  Sweep 'first'
+  Start-Sleep -Seconds 3
+  Sweep 'later'
+}
+'@
+$r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeR9c)
+Write-Host "R9c/R9d probe output: $($r.out.Trim())"
+if ($r.out -match 'NORUNNER') { throw "R9c: runner discovery failed. raw: $($r.raw)" }
+if ($r.out -notmatch 'CONTROL:ok') {
+  throw "R9c: the probe could not open its own thread — test invalid. raw: $($r.raw)"
+}
+foreach ($row in @(@{id='R9c'; pass='first'}, @{id='R9d'; pass='later'})) {
+  if ($r.out -match "OPENED:$($row.pass) ") {
+    throw "$($row.id): child opened a runner thread " +
+          "(runner thread self-protect ineffective — sandbox escape). raw: $($r.raw)"
+  }
+  # A thread that ended between the listing and the open reports 87;
+  # anything else is not a refusal the row can rely on.
+  $odd = $r.out -split "`r?`n" |
+    Where-Object { $_ -match "^OTHER:$($row.pass) " -and $_ -notmatch ' le=87$' }
+  if ($odd) { throw "$($row.id): unexpected OpenThread result: $($odd -join '; '). raw: $($r.raw)" }
+  if ($r.out -notmatch "SWEEP:$($row.pass) threads=(\d+) denied=(\d+)") {
+    throw "$($row.id): sweep did not complete. raw: $($r.raw)"
+  }
+  $nThreads = [int]$Matches[1]; $nDenied = [int]$Matches[2]
+  if ($nThreads -lt 1) { throw "$($row.id): no runner thread listed — test invalid. raw: $($r.raw)" }
+  if ($nDenied -lt $threadRights) {
+    throw "$($row.id): no runner thread refused every right ($nDenied refusals). raw: $($r.raw)"
+  }
+  Write-Host "$($row.id) ok: child refused every right on the runner's threads ($($row.pass): threads=$nThreads refusals=$nDenied)"
+}
+
+# ── T-rows: ordinary tools still start and behave ────────────────
+# The runner's self-protection changes security descriptors in the
+# runner. None of it may reach the child: these rows start the usual
+# tools and have a child open its own process and thread and a
+# grandchild's process, which a descriptor meant for the runner
+# landing on the child's objects would break.
+# ── T1: cmd ──
+$r = RExec @('--', $cmd, '/d', '/s', '/c', 'echo T1-CMD & ver')
+if ($r.exit -ne 0 -or $r.out -notmatch 'T1-CMD' -or $r.out -notmatch 'Windows') {
+  throw "T1: cmd did not run normally. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'T1 ok: cmd starts and runs a built-in'
+
+# ── T2: Windows PowerShell starts ────────────────────────────────
+# ── T3: a process opens its own process and thread by ID ─────────
+# ── T4: a parent opens, waits on and reads the exit code of a ────
+#        grandchild
+$probeT = @'
+$sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenProcess(uint a,bool b,uint p);' +
+       '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenThread(uint a,bool b,uint t);' +
+       '[DllImport("kernel32.dll")]public static extern uint GetCurrentThreadId();'
+$k32 = Add-Type -MemberDefinition $sig -Name K32S -Namespace W -PassThru
+"T2-PS=" + $PSVersionTable.PSVersion.Major
+function Res([string]$tag, [System.IntPtr]$h, [int]$le) {
+  if ($h -ne [System.IntPtr]::Zero) { "$tag=ok" } else { "$tag=FAILED le=$le" }
+}
+# 0x1FFFFF = PROCESS_ALL_ACCESS / THREAD_ALL_ACCESS
+$h = $k32::OpenProcess(0x1FFFFF, $false, $PID)
+Res 'SELF-PROC' $h ([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+$h = $k32::OpenThread(0x1FFFFF, $false, $k32::GetCurrentThreadId())
+Res 'SELF-THREAD' $h ([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $env:ComSpec
+# Waits on stdin, so it is still running when the parent opens it.
+$psi.Arguments = '/d /c "set /p x= & exit 7"'
+$psi.UseShellExecute = $false
+$psi.RedirectStandardInput = $true
+$psi.CreateNoWindow = $true
+$gc = [System.Diagnostics.Process]::Start($psi)
+$h = $k32::OpenProcess(0x1FFFFF, $false, $gc.Id)
+Res 'GC-OPEN' $h ([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+$gc.StandardInput.Close()
+if ($gc.WaitForExit(20000)) { "GC-EXIT=" + $gc.ExitCode } else { 'GC-EXIT=TIMEOUT'; $gc.Kill() }
+'@
+$r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeT)
+Write-Host "T2-T4 probe output: $($r.out.Trim())"
+if ($r.exit -ne 0 -or $r.out -notmatch 'T2-PS=\d') {
+  throw "T2: Windows PowerShell did not run normally. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'T2 ok: Windows PowerShell starts'
+if ($r.out -notmatch 'SELF-PROC=ok' -or $r.out -notmatch 'SELF-THREAD=ok') {
+  throw "T3: child could not open its own process or thread by ID. raw: $($r.raw)"
+}
+Write-Host 'T3 ok: child opens its own process and thread by ID'
+if ($r.out -notmatch 'GC-OPEN=ok' -or $r.out -notmatch 'GC-EXIT=7') {
+  throw "T4: parent could not open or wait on its grandchild. raw: $($r.raw)"
+}
+Write-Host 'T4 ok: parent opens a grandchild by ID, waits on it and reads its exit code'
+
+# ── T5: node (when installed) starts and runs a child process ────
+$node = (Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if ($node) {
+  $js = "const out = require('child_process').execFileSync(process.env.ComSpec, ['/d', '/c', 'echo kid']); " +
+        "process.stdout.write('T5-NODE ' + String(out).trim() + '\n')"
+  $r = RExec @('--', $node, '-e', $js)
+  if ($r.exit -ne 0 -or $r.out -notmatch 'T5-NODE kid') {
+    throw "T5: node did not run normally. exit=$($r.exit) raw: $($r.raw)"
+  }
+  Write-Host 'T5 ok: node starts and runs a child process'
+} else {
+  Write-Host 'T5 skipped: node.exe not on PATH'
+}
+
+# ── T6: git-bash (when installed) starts and forks ───────────────
+# An MSYS fork has the parent open and write into the new process,
+# and a pipeline and a subshell each fork.
+$bash = @("$env:ProgramFiles\Git\bin\bash.exe") +
+  @(Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {
+      Join-Path (Split-Path (Split-Path $_.Source)) 'bin\bash.exe' }) |
+  Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if ($bash) {
+  $r = RExec @('--', $bash, '-c', 'echo T6-PIPE | /usr/bin/cat; (echo T6-SUBSHELL); echo T6-$(echo SUBST)')
+  if ($r.exit -ne 0 -or $r.out -notmatch 'T6-PIPE' -or
+      $r.out -notmatch 'T6-SUBSHELL' -or $r.out -notmatch 'T6-SUBST') {
+    throw "T6: git-bash did not fork normally. exit=$($r.exit) raw: $($r.raw)"
+  }
+  Write-Host 'T6 ok: git-bash starts; pipeline, subshell and command substitution fork'
+} else {
+  Write-Host 'T6 skipped: git-bash not found'
+}
+
 # ── R11: child cannot OpenProcess(PROCESS_VM_READ) on a default-DACL ──
 #         real-user process (logon-SID strip).
 # seclogon stamps the broker's interactive logon SID into the
@@ -527,6 +1383,101 @@ if ($r.out -match 'CHILD_DESK=Default') {
   throw "R12: child on Default desktop. raw: $($r.raw)"
 }
 Write-Host 'R12 ok: child on broker-created srt-sb-* desktop (not Default)'
+
+# ── R13: the child's stdin cannot be used to impersonate ─────────
+# The egress BLOCK matches the sandbox account's SID, so a thread
+# running under any other identity would fall through to permit. A
+# pipe's SERVER end can ImpersonateNamedPipeClient whoever opened the
+# other end; the child's stdin is a pipe whose other end the real
+# user's broker holds, so it must be a CLIENT end. One compiled
+# method does the whole sequence on a single thread (impersonation is
+# per-thread): direct connect to an out-of-range listener, then
+# impersonate via the stdin handle, and — only if that worked — the
+# same connect on a NEW socket before reverting.
+$r13Lsn  = Bind-Listener (50003, 50004, 50005, 49997)
+$r13Port = $r13Lsn.LocalEndpoint.Port
+try {
+  $probeR13 = @"
+`$src = @'
+using System;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+public static class StdinProbe {
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GetStdHandle(int n);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern uint GetFileType(IntPtr h);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateNamedPipeClient(IntPtr h);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
+  static string Connect(int port) {
+    try { using (var c = new TcpClient()) { c.Connect("127.0.0.1", port); return "CONNECTED"; } }
+    catch (SocketException e) { return "blocked code=" + e.SocketErrorCode; }
+    catch (Exception e) { return "blocked ex=" + e.GetType().Name; }
+  }
+  public static string Run(int port) {
+    string o = "DIRECT=" + Connect(port) + "\n";
+    IntPtr h = GetStdHandle(-10);
+    o += "STDIN_TYPE=" + GetFileType(h) + "\n";
+    bool ok = ImpersonateNamedPipeClient(h);
+    int le = Marshal.GetLastWin32Error();
+    if (!ok) { return o + "IMPERSONATE=fail le=" + le + "\n"; }
+    string r = Connect(port);
+    if (!RevertToSelf()) { Environment.Exit(97); }
+    return o + "IMPERSONATE=ok\nIMPERSONATED_CONNECT=" + r + "\n";
+  }
+}
+'@
+Add-Type -TypeDefinition `$src
+[StdinProbe]::Run($r13Port)
+"@
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeR13)
+  Write-Host "R13 probe output: $($r.out.Trim())"
+  if ($r.out -match 'CONNECTED') {
+    throw "R13: a sandboxed connect to out-of-range port $r13Port succeeded. raw: $($r.raw)"
+  }
+  if ($r.out -notmatch 'DIRECT=blocked') {
+    throw "R13: probe did not report its direct connect. raw: $($r.raw)"
+  }
+  # 3 = FILE_TYPE_PIPE: the handle probed really is the stdin pipe, so a
+  # failed impersonation is the pipe refusing, not a missing handle.
+  if ($r.out -notmatch 'STDIN_TYPE=3') {
+    throw "R13: child stdin is not a pipe — impersonation probe is vacuous. raw: $($r.raw)"
+  }
+  if ($r.out -match 'IMPERSONATE=ok') {
+    throw "R13: child impersonated through its stdin handle (stdin is a pipe server end). raw: $($r.raw)"
+  }
+  if ($r.out -notmatch 'IMPERSONATE=fail') {
+    throw "R13: probe did not report an impersonation result. raw: $($r.raw)"
+  }
+  # Sanity: the listener was live, so "blocked" is the fence and not a
+  # closed port.
+  $hc = [System.Net.Sockets.TcpClient]::new()
+  try { $hc.Connect('127.0.0.1', $r13Port) } catch {
+    throw "R13: broker-side connect to its own listener on $r13Port failed — test invalid"
+  } finally { $hc.Dispose() }
+  Write-Host 'R13 ok: stdin handle cannot impersonate; out-of-range connect blocked'
+} finally {
+  $r13Lsn.Stop()
+}
+
+# ── R14: the child's stdin reads as end-of-file ──────────────────
+# The broker writes the launch spec to the runner's stdin and closes
+# it; it does not forward its own stdin. So a child that reads stdin
+# to the end must finish (a missing EOF is the RExec timeout) having
+# read nothing — in particular none of the spec. `sort` copies stdin
+# to stdout and exits at EOF; the marker after it proves it returned.
+# A payload is put on the BROKER's stdin so the row also shows what
+# reaches the child from there: either nothing, or exactly the
+# payload — never anything else.
+$r14Payload = 'R14-STDIN-PAYLOAD-7f3a'
+$r = RExec @('--', $cmd, '/c', 'sort & echo R14-EOF-MARK') `
+       -TimeoutSec 60 -StdinText "$r14Payload`r`n"
+if ($r.out -notmatch 'R14-EOF-MARK') {
+  throw "R14: child did not get past reading stdin. raw: $($r.raw)"
+}
+$r14Read = (($r.out -split 'R14-EOF-MARK')[0]).Trim()
+if ($r14Read -ne '' -and $r14Read -ne $r14Payload) {
+  throw "R14: child read unexpected bytes from stdin: '$r14Read'. raw: $($r.raw)"
+}
+Write-Host "R14 ok: child stdin reaches end-of-file (read: '$r14Read')"
 
 # ── G-rows: per-session FS access for the sandbox user ──────────
 # The sandbox child has NO inherent rights on real-user-owned
@@ -725,10 +1676,796 @@ try {
   Remove-Item -Recurse -Force $gRoot -ErrorAction SilentlyContinue
 }
 
+# ── U-rows: a fence written by an earlier build ─────────────────
+# An install from a build that predates the fence revision record has
+# no `FenceRevision` value. Removing the value reproduces what the
+# non-elevated broker can see of such an install — it cannot
+# enumerate filters, so the record is what it goes by.
+#
+# An earlier revision of the filter set also carried a BLOCK keyed on
+# the anonymous token (`block-anonymous`), which this build does not
+# install and must remove. U0b puts a filter with that revision's tag
+# and name under the sublayer, so that the reinstall in U4 and the
+# uninstall in the teardown have one to delete.
+
+# The filters under the test sublayer as the system's own dump of the
+# filtering engine lists them: how many there are, and which of them
+# name the anonymous token — by display name, or as `ANONYMOUS LOGON`
+# (`S-1-5-7`, `AN` in SDDL) in a condition's security descriptor.
+# Independent of srt-win's own enumeration. `$null` when the dump
+# could not be produced or read.
+function Get-SublayerFilterDump {
+  $file = Join-Path ([System.IO.Path]::GetTempPath()) "srt-wfp-$PID.xml"
+  try {
+    & netsh wfp show filters "file=$file" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $file)) { return $null }
+    $doc = [xml]::new()
+    $doc.Load($file)
+    $mine = @($doc.SelectNodes('//item[subLayerKey]') | Where-Object {
+      $_.subLayerKey.Trim('{}') -ieq $Sublayer
+    })
+    $anon = @($mine | Where-Object {
+      $_.OuterXml -match '(?i)block-anonymous|S-1-5-7(?![\d-])|;;;AN\)'
+    })
+    return @{ count = $mine.Count; anonymous = @($anon | ForEach-Object { $_.SelectSingleNode('displayData/name').InnerText }) }
+  } catch {
+    Write-Host "filter dump unreadable: $_"
+    return $null
+  } finally {
+    Remove-Item $file -Force -ea SilentlyContinue
+  }
+}
+
+# Assert on the dump that the sublayer holds `$want` filters naming
+# the anonymous token. The dump counts only when it lists exactly the
+# filters `wfp status` counted; otherwise the row says it was not
+# exercised and the status count stands alone.
+function Assert-AnonymousFiltersInDump([string] $row, [int] $statusCount, [int] $want) {
+  $d = Get-SublayerFilterDump
+  if ($null -eq $d -or $d.count -ne $statusCount) {
+    $saw = if ($null -eq $d) { 'no dump' } else { "$($d.count) filters" }
+    Write-Host "$row NOT EXERCISED (dump): expected $statusCount filters under the sublayer in the engine dump, saw $saw"
+    return
+  }
+  if ($d.anonymous.Count -ne $want) {
+    throw "${row}: expected $want filter(s) naming the anonymous token under the sublayer, the engine dump shows $($d.anonymous.Count): $($d.anonymous -join ', ')"
+  }
+  Write-Host "$row ok (dump): $($d.count) filters under the sublayer, $want naming the anonymous token"
+}
+
+# Add one filter under the test sublayer that carries the tag and the
+# display name the earlier revision gave its anonymous BLOCK. It is a
+# PERMIT with no conditions and no weight of its own, not persistent:
+# it changes no verdict (the BLOCK outweighs it for the sandbox
+# account, and everyone else is permitted already) and is gone at the
+# next restart whatever happens here. What matters is the tag: install
+# and uninstall find the filters to delete by it.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class SrtOldFilter {
+  [StructLayout(LayoutKind.Sequential)] struct Blob { public uint size; public IntPtr data; }
+  [StructLayout(LayoutKind.Sequential)] struct Value { public uint type; public ulong value; }
+  [StructLayout(LayoutKind.Sequential)] struct FilterAction { public uint type; public Guid filterType; }
+  [StructLayout(LayoutKind.Sequential)] struct Filter {
+    public Guid filterKey;
+    public IntPtr name;
+    public IntPtr description;
+    public uint flags;
+    public IntPtr providerKey;
+    public Blob providerData;
+    public Guid layerKey;
+    public Guid subLayerKey;
+    public Value weight;
+    public uint numFilterConditions;
+    public IntPtr filterCondition;
+    public FilterAction action;
+    public ulong context0;
+    public ulong context1;
+    public IntPtr reserved;
+    public ulong filterId;
+    public Value effectiveWeight;
+  }
+  [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineOpen0(IntPtr server, uint authn, IntPtr identity, IntPtr session, out IntPtr engine);
+  [DllImport("fwpuclnt.dll")] static extern uint FwpmEngineClose0(IntPtr engine);
+  [DllImport("fwpuclnt.dll")] static extern uint FwpmFilterAdd0(IntPtr engine, ref Filter filter, IntPtr sd, out ulong id);
+  // Returns 0, or the failing call's name and code.
+  public static string Add(string sublayer, string name, string tag) {
+    IntPtr engine;
+    uint rc = FwpmEngineOpen0(IntPtr.Zero, 0xFFFFFFFF, IntPtr.Zero, IntPtr.Zero, out engine);
+    if (rc != 0) return "FwpmEngineOpen0:0x" + rc.ToString("x8");
+    byte[] tagBytes = Encoding.UTF8.GetBytes(tag);
+    IntPtr tagPtr = Marshal.AllocHGlobal(tagBytes.Length);
+    IntPtr namePtr = Marshal.StringToHGlobalUni(name);
+    try {
+      Marshal.Copy(tagBytes, 0, tagPtr, tagBytes.Length);
+      Filter f = new Filter();
+      f.name = namePtr;
+      f.description = namePtr;
+      f.providerData.size = (uint)tagBytes.Length;
+      f.providerData.data = tagPtr;
+      // FWPM_LAYER_ALE_AUTH_CONNECT_V4
+      f.layerKey = new Guid("c38d57d1-05a7-4c33-904f-7fbceee60e82");
+      f.subLayerKey = new Guid(sublayer);
+      f.action.type = 0x1002; // FWP_ACTION_PERMIT
+      ulong id;
+      rc = FwpmFilterAdd0(engine, ref f, IntPtr.Zero, out id);
+      return rc == 0 ? "0" : "FwpmFilterAdd0:0x" + rc.ToString("x8");
+    } finally {
+      Marshal.FreeHGlobal(tagPtr);
+      Marshal.FreeHGlobal(namePtr);
+      FwpmEngineClose0(engine);
+    }
+  }
+}
+'@
+function Add-OldAnonymousFilter([string] $row) {
+  $tag = '{"tool":"srt-win","kind":"block-anonymous","user_sid":"' + $sbSid + '","rev":2}'
+  $rc = [SrtOldFilter]::Add($Sublayer, 'srt-win-v4-block-anonymous', $tag)
+  if ($rc -ne '0') { throw "${row}: could not add the earlier revision's filter under the sublayer: $rc" }
+}
+
+$regBase = 'HKLM:\SOFTWARE\sandbox-runtime'
+$rev = (Get-ItemProperty $regBase -ea Stop).FenceRevision
+if (-not $rev) { throw "U0: install did not record FenceRevision under $regBase" }
+$st0 = J @('wfp','status','--sublayer-guid',$Sublayer)
+# Exactly 4: `filters` counts every srt-win filter under the sublayer,
+# so a fifth would be one this build must not install.
+if ($st0.state -ne 'installed' -or $st0.filters -ne 4) {
+  throw "U0: fresh install expected installed/4 filters, got $($st0.state)/$($st0.filters)"
+}
+Assert-AnonymousFiltersInDump 'U0' $st0.filters 0
+Write-Host "U0 ok: fresh install records FenceRevision=$rev, $($st0.filters) filters, none for the anonymous token"
+
+# U0b: the earlier revision's anonymous filter, under the sublayer.
+Add-OldAnonymousFilter 'U0b'
+$st0b = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($st0b.filters -ne $st0.filters + 1) {
+  throw "U0b: expected $($st0.filters + 1) filters with the earlier revision's filter added, got $($st0b.filters)"
+}
+Assert-AnonymousFiltersInDump 'U0b' $st0b.filters 1
+Write-Host "U0b ok: sublayer holds $($st0b.filters) filters, one tagged block-anonymous at revision 2"
+Remove-ItemProperty $regBase -Name FenceRevision -ea Stop
+
+# U1: status (both forms) reports the fence as out of date, with the repair.
+$u1 = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($u1.state -ne 'outdated') { throw "U1: wfp status expected outdated, got '$($u1.state)'" }
+if ($u1.hint -notmatch '(?i)srt-win install') { throw "U1: hint lacks the reinstall instruction: $($u1.hint)" }
+$u1c = J @('status','--sublayer-guid',$Sublayer)
+if ($u1c.wfp.state -ne 'outdated') { throw "U1: status .wfp expected outdated, got '$($u1c.wfp.state)'" }
+Write-Host "U1 ok: status reports outdated ($($u1.hint))"
+
+# U2: exec refuses to launch, exit 19, naming the repair.
+$r = RExec @('--', $cmd, '/c', 'echo U2-RAN')
+if ($r.exit -ne 19) { throw "U2: exec expected exit 19 (fence out of date), got $($r.exit). raw: $($r.raw)" }
+if ($r.raw -match 'U2-RAN') { throw "U2: child RAN against an out-of-date fence. raw: $($r.raw)" }
+if ($r.raw -notmatch '(?i)out of date' -or $r.raw -notmatch '(?i)srt-win install') {
+  throw "U2: exec message lacks 'out of date' / reinstall hint. raw: $($r.raw)"
+}
+Write-Host 'U2 ok: exec exits 19 with the reinstall hint and does not launch'
+
+# U3: wfp verify refuses likewise, before probing.
+$u3Lsn = Bind-Listener (49980..49989)
+$u3out = & $Exe wfp verify --target "127.0.0.1:$($u3Lsn.LocalEndpoint.Port)"
+$u3exit = $LASTEXITCODE
+$u3Lsn.Stop()
+if ($u3exit -ne 19) { throw "U3: wfp verify expected exit 19, got $u3exit. out: $u3out" }
+if (-not ($u3out | ConvertFrom-Json).outdated) { throw "U3: wfp verify output lacks outdated=true: $u3out" }
+Write-Host 'U3 ok: wfp verify exits 19 (outdated)'
+
+# U4: re-running install (same config, no --force) repairs it — it
+# must not take the "already installed; no changes" early-out.
+Run @('install',
+      '--sublayer-guid',$Sublayer,
+      '--proxy-port-range',$PortRange)
+$u4 = J @('wfp','status','--sublayer-guid',$Sublayer)
+# Back to the fresh install's count: the reinstall deleted the earlier
+# revision's anonymous filter (U0b) along with the rest.
+if ($u4.state -ne 'installed' -or $u4.filters -ne $st0.filters) {
+  throw "U4: after reinstall expected installed/$($st0.filters) filters, got $($u4.state)/$($u4.filters)"
+}
+Assert-AnonymousFiltersInDump 'U4' $u4.filters 0
+if ((Get-ItemProperty $regBase -ea Stop).FenceRevision -ne $rev) {
+  throw 'U4: reinstall did not restore FenceRevision'
+}
+$r = RExec @('--', $cmd, '/c', 'echo U4-RAN')
+if ($r.exit -ne 0 -or $r.out -notmatch 'U4-RAN') {
+  throw "U4: exec after reinstall failed. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'U4 ok: reinstall restores the fence and removes the earlier revision''s anonymous filter; exec runs again'
+
+# ── L-rows: open loopback ────────────────────────────────────────
+# `install --allow-loopback` adds one PERMIT per layer: loopback
+# address AND any port but a short fixed list. The rows run the same
+# connects with loopback closed, as a default install leaves it (all
+# refused but the proxy port), then with it open (loopback reachable
+# on 127.0.0.1 and ::1 over TCP and UDP, the listed ports and
+# everything off loopback still refused), and show that a session
+# whose loopback mode differs from the installed one is not launched,
+# in either direction.
+#
+# The listeners sit clear of the proxy range, of every fixed port the
+# rows above listen on, and of the dynamic port range (49152 and up),
+# where Windows keeps its per-machine excluded ranges and hands out
+# ephemeral ports. Each listener takes the first port of its slice
+# that binds.
+$LbLo = 41000
+# Two of the ports that stay blocked with loopback open.
+$LbFloor = @(9229, 1080)
+
+# One raw TCP connect from inside the sandbox. Prints CONNECTED or
+# code=<SocketErrorCode> (AccessDenied = refused by a filter).
+# $ExecFlags are srt-win's own flags for this exec.
+function SbConnect {
+  param([string] $Address, [int] $Port, [string[]] $ExecFlags = @())
+  $new = if ($Address -match ':') {
+    'New-Object Net.Sockets.TcpClient([Net.Sockets.AddressFamily]::InterNetworkV6)'
+  } else {
+    'New-Object Net.Sockets.TcpClient'
+  }
+  return RExec ($ExecFlags + @('--', $pwsh, '-NoProfile', '-Command',
+    "try { `$c = $new; `$c.Connect('$Address', $Port); Write-Output CONNECTED } " +
+    "catch { Write-Output ('code=' + `$_.Exception.InnerException.SocketErrorCode) }"))
+}
+function Assert-SbRefused {
+  param([string] $Row, [string] $Address, [int] $Port, [string[]] $ExecFlags = @())
+  $r = SbConnect $Address $Port $ExecFlags
+  if ($r.out -match 'CONNECTED') {
+    throw "${Row}: sandboxed connect to ${Address}:$Port succeeded. raw: $($r.raw)"
+  }
+  if ($r.out -notmatch 'AccessDenied') {
+    throw "${Row}: expected AccessDenied (WFP block) for ${Address}:$Port, got: $($r.raw)"
+  }
+}
+function Assert-SbConnected {
+  param([string] $Row, [string] $Address, [int] $Port, [string[]] $ExecFlags = @())
+  $r = SbConnect $Address $Port $ExecFlags
+  if ($r.out -notmatch 'CONNECTED') {
+    throw "${Row}: sandboxed connect to ${Address}:$Port did not succeed. raw: $($r.raw)"
+  }
+}
+
+# Start a sandboxed command without waiting for it. Same argv shape
+# and environment as RExec; the caller reads .so/.se and waits on .p.
+function RExecStart {
+  param([string[]] $tail)
+  $argv = @('exec',
+            '--env', "PATH=$($env:PATH)",
+            '--env', "PATHEXT=$($env:PATHEXT)") + $tail
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName               = $Exe
+  $psi.UseShellExecute        = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError  = $true
+  $psi.Environment['SANDBOX_RUNTIME_WIN_DEBUG'] = '1'
+  foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
+  $p = [System.Diagnostics.Process]::Start($psi)
+  return [pscustomobject]@{
+    p  = $p
+    so = $p.StandardOutput.ReadToEndAsync()
+    se = $p.StandardError.ReadToEndAsync()
+  }
+}
+
+# A server started INSIDE the sandbox on 127.0.0.1:$Port, then one
+# connect to it from a second sandboxed command. The server prints
+# SERVED once a client is accepted, so a CONNECTED that reached
+# anything else does not pass. Returns the client's output and
+# whether the server accepted. Listening is not filtered, so the
+# server comes up with or without a range installed.
+function SbServerRoundTrip {
+  param([string] $Row, [int] $Port, [string[]] $ExecFlags = @())
+  $srv = RExecStart ($ExecFlags + @('--', $pwsh, '-NoProfile', '-Command',
+    "`$l = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port); `$l.Start(); " +
+    "`$t = `$l.AcceptTcpClientAsync(); " +
+    "if (`$t.Wait(240000)) { Write-Output SERVED } else { Write-Output NOCLIENT }; `$l.Stop()"))
+  try {
+    # Wait for the listener without connecting to it: a connect from
+    # here would be the one the server is waiting to accept.
+    $deadline = (Get-Date).AddSeconds(120)
+    while (-not (Get-NetTCPConnection -State Listen -LocalPort $Port -ea SilentlyContinue)) {
+      if ($srv.p.HasExited) {
+        throw "${Row}: sandboxed server exited before listening. out: $($srv.so.Result) err: $($srv.se.Result)"
+      }
+      if ((Get-Date) -gt $deadline) { throw "${Row}: sandboxed server did not listen on $Port within 120s" }
+      Start-Sleep -Milliseconds 250
+    }
+    $client = SbConnect '127.0.0.1' $Port $ExecFlags
+    # A refused client leaves the server waiting; do not sit out its
+    # timeout.
+    $served = $false
+    if ($client.out -match 'CONNECTED') {
+      if (-not $srv.p.WaitForExit(60000)) { throw "${Row}: sandboxed server did not exit after a client connected" }
+      $served = $srv.so.Result -match 'SERVED'
+    }
+    return [pscustomobject]@{ client = $client; served = $served }
+  } finally {
+    if (-not $srv.p.HasExited) { try { $srv.p.Kill($true) } catch { } }
+  }
+}
+
+# A port that binds on this runner right now, for a listener that
+# some other process is about to open.
+function Free-LbPort {
+  param([int[]] $Candidates)
+  $l = Bind-Listener $Candidates
+  $port = $l.LocalEndpoint.Port
+  $l.Stop()
+  return $port
+}
+
+# A UDP echo server on 127.0.0.1:$Port in a process of its own (this
+# account, not the sandbox): it answers one datagram and exits.
+# Returns once it is bound.
+function Start-UdpEcho {
+  param([string] $Row, [int] $Port)
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName               = $pwsh
+  $psi.UseShellExecute        = $false
+  $psi.RedirectStandardOutput = $true
+  $server =
+    "`$u = New-Object Net.Sockets.UdpClient(" +
+      "(New-Object Net.IPEndPoint([Net.IPAddress]::Loopback, $Port))); " +
+    "`$u.Client.ReceiveTimeout = 240000; " +
+    "`$ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0); " +
+    "Write-Output READY; " +
+    "`$d = `$u.Receive([ref]`$ep); [void]`$u.Send(`$d, `$d.Length, `$ep); Write-Output ECHOED"
+  foreach ($a in @('-NoProfile', '-Command', $server)) { $null = $psi.ArgumentList.Add($a) }
+  $p = [System.Diagnostics.Process]::Start($psi)
+  if ($p.StandardOutput.ReadLine() -ne 'READY') {
+    try { $p.Kill($true) } catch { }
+    throw "${Row}: UDP echo server did not come up on 127.0.0.1:$Port"
+  }
+  return $p
+}
+
+# One UDP datagram from inside the sandbox to 127.0.0.1:$Port, and the
+# wait for its echo. Prints ECHO=<payload>, or code=<SocketErrorCode>
+# (AccessDenied = refused by a filter; TimedOut = no answer).
+function SbUdpEcho {
+  param([int] $Port, [string[]] $ExecFlags = @())
+  $client =
+    "try { `$u = New-Object Net.Sockets.UdpClient; `$u.Client.ReceiveTimeout = 15000; " +
+    "`$u.Connect('127.0.0.1', $Port); " +
+    "`$b = [Text.Encoding]::ASCII.GetBytes('udp-ping'); [void]`$u.Send(`$b, `$b.Length); " +
+    "`$ep = New-Object Net.IPEndPoint([Net.IPAddress]::Any, 0); " +
+    "Write-Output ('ECHO=' + [Text.Encoding]::ASCII.GetString(`$u.Receive([ref]`$ep))) } " +
+    "catch { Write-Output ('code=' + `$_.Exception.InnerException.SocketErrorCode) }"
+  return RExec ($ExecFlags + @('--', $pwsh, '-NoProfile', '-Command', $client))
+}
+
+# L0: loopback closed (the default install). Live listeners on
+# 127.0.0.1 and ::1, and on a non-loopback address of this runner;
+# every sandboxed connect is refused by a filter, over UDP too. The
+# proxy port range is still reachable.
+$l0v4 = Bind-Listener ($LbLo..($LbLo + 7))
+$l0v6 = Bind-Listener (($LbLo + 8)..($LbLo + 15)) ([System.Net.IPAddress]::IPv6Loopback)
+try {
+  Assert-SbRefused 'L0' '127.0.0.1' $l0v4.LocalEndpoint.Port
+  Assert-SbRefused 'L0' '::1' $l0v6.LocalEndpoint.Port
+} finally {
+  $l0v4.Stop(); $l0v6.Stop()
+}
+if (-not $lanIp) {
+  Write-Host 'L0 note: no off-loopback IPv4 address on this runner; non-loopback half skipped'
+} else {
+  $l0lan = Bind-Listener (($LbLo + 16)..($LbLo + 23)) ([System.Net.IPAddress]::Parse($lanIp))
+  try { Assert-SbRefused 'L0' $lanIp $l0lan.LocalEndpoint.Port } finally { $l0lan.Stop() }
+}
+$rt = SbServerRoundTrip 'L0' (Free-LbPort (($LbLo + 24)..($LbLo + 31)))
+if ($rt.client.out -match 'CONNECTED' -or $rt.client.out -notmatch 'AccessDenied') {
+  throw "L0: connect to a sandbox-started server expected AccessDenied with loopback closed. raw: $($rt.client.raw)"
+}
+$l0udpPort = $LbLo + 32
+$l0udp = Start-UdpEcho 'L0' $l0udpPort
+try {
+  # No answer is the requirement; how the refusal surfaces to a
+  # datagram sender is logged, not asserted.
+  $r = SbUdpEcho $l0udpPort
+  if ($r.out -match 'ECHO=' -or $r.out -notmatch 'code=') {
+    throw "L0: UDP to 127.0.0.1:$l0udpPort expected no echo with loopback closed. raw: $($r.raw)"
+  }
+  Write-Host "L0: UDP to 127.0.0.1:$l0udpPort with loopback closed: $(($r.out -split "`n" | Select-String 'code=') -join ' ')"
+} finally {
+  try { $l0udp.Kill($true) } catch { }
+}
+$l0proxy = Bind-Listener ($PortHi..$PortLo)
+try { Assert-SbConnected 'L0' '127.0.0.1' $l0proxy.LocalEndpoint.Port } finally { $l0proxy.Stop() }
+Write-Host 'L0 ok: with loopback closed, loopback (v4, v6, UDP), non-loopback and sandbox-to-sandbox connects are all refused; the proxy port range is reachable'
+
+# L0b: a session that expects loopback open on an install that has it
+# closed is refused (exit 19) by exec and by wfp verify, naming the
+# reinstall.
+$r = RExec @('--allow-loopback', '--', $cmd, '/c', 'echo L0b-RAN')
+if ($r.exit -ne 19) { throw "L0b: exec expected exit 19 (loopback not open), got $($r.exit). raw: $($r.raw)" }
+if ($r.raw -match 'L0b-RAN') { throw "L0b: child RAN expecting open loopback on a closed install. raw: $($r.raw)" }
+if ($r.raw -notmatch '(?i)loopback mode' -or $r.raw -notmatch '(?i)srt-win install --allow-loopback') {
+  throw "L0b: exec message lacks the loopback mode / reinstall hint. raw: $($r.raw)"
+}
+$lvOut = & $Exe wfp verify --target "127.0.0.1:$($LbFloor[0])" --allow-loopback
+$lvExit = $LASTEXITCODE
+if ($lvExit -ne 19) { throw "L0b: wfp verify expected exit 19, got $lvExit. out: $lvOut" }
+$lvDoc = $lvOut | ConvertFrom-Json
+if (-not $lvDoc.outdated -or -not $lvDoc.allow_loopback_mismatch -or $lvDoc.hint -notmatch '(?i)srt-win install') {
+  throw "L0b: wfp verify output lacks outdated / allow_loopback_mismatch / the reinstall hint: $lvOut"
+}
+Write-Host 'L0b ok: a session expecting open loopback on a closed install is refused (exec 19, wfp verify 19)'
+
+# L1: opening loopback on an existing install is a config change:
+# refused (13) without --force, applied with it.
+& $Exe install --sublayer-guid $Sublayer --proxy-port-range $PortRange --allow-loopback 2>$null
+if ($LASTEXITCODE -ne 13) { throw "L1: install --allow-loopback without --force expected exit 13, got $LASTEXITCODE" }
+Run @('install',
+      '--sublayer-guid',$Sublayer,
+      '--proxy-port-range',$PortRange,
+      '--allow-loopback',
+      '--force')
+$l1 = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($l1.state -ne 'installed' -or $l1.filters -ne ($st0.filters + 2)) {
+  throw "L1: expected installed/$($st0.filters + 2) filters, got $($l1.state)/$($l1.filters)"
+}
+if ($l1.allow_loopback -ne $true -or $l1.loopback_notice -notmatch '(?i)loopback is open') {
+  throw "L1: wfp status expected allow_loopback=true with a loopback_notice, got $($l1 | ConvertTo-Json -Compress)"
+}
+if (($l1.port_range -join '-') -ne $PortRange) {
+  throw "L1: wfp status port_range changed: '$($l1.port_range -join '-')'"
+}
+$l1c = J @('status','--sublayer-guid',$Sublayer)
+if ($l1c.wfp.allow_loopback -ne $true -or $l1c.wfp.loopback_notice -notmatch '(?i)off the machine') {
+  throw "L1: status .wfp expected allow_loopback=true with a loopback_notice, got $($l1c.wfp | ConvertTo-Json -Compress)"
+}
+if ((Get-ItemProperty $regBase -ea Stop).AllowLoopback -ne 1) {
+  throw 'L1: install did not record AllowLoopback'
+}
+Write-Host "L1 ok: loopback opened: $($l1.filters) filters, reported by wfp status and status with the notice"
+
+$lb = @('--allow-loopback')
+
+# L2: wfp verify with loopback open. The plain target is one of the
+# ports that stay blocked; srt-win's own loopback listener on an
+# arbitrary port connects; that port on a non-loopback address is
+# blocked; the result says loopback is open.
+$l2Lsn = $null
+try { $l2Lsn = Bind-Listener $LbFloor } catch { Write-Host 'L2 note: no blocked port free to listen on; probing one without a listener' }
+$l2port = if ($l2Lsn) { $l2Lsn.LocalEndpoint.Port } else { $LbFloor[0] }
+$l2out = & $Exe wfp verify --target "127.0.0.1:$l2port" @lb
+$l2exit = $LASTEXITCODE
+if ($l2Lsn) { $l2Lsn.Stop() }
+Write-Host "L2: wfp verify exit=$l2exit stdout='$l2out'"
+if ($l2exit -ne 0) { throw "L2: wfp verify with loopback open expected exit 0, got $l2exit" }
+$l2 = $l2out | ConvertFrom-Json
+if ($l2.egress_probe -ne 'blocked') { throw "L2: loopback port $l2port expected blocked, got '$($l2.egress_probe)'" }
+if ($l2.open_loopback_probe -ne 'connected') {
+  throw "L2: loopback listener ($($l2.open_loopback_target)) expected connected, got '$($l2.open_loopback_probe)'"
+}
+if ($l2.open_off_loopback_probe -eq 'skipped') {
+  Write-Host 'L2 note: off-loopback attempt skipped (no off-loopback address on this runner)'
+} elseif ($l2.open_off_loopback_probe -ne 'blocked') {
+  throw "L2: open port on $($l2.open_off_loopback_target) expected blocked, got '$($l2.open_off_loopback_probe)'"
+}
+if ($l2.allow_loopback -ne $true -or $l2.loopback_notice -notmatch '(?i)loopback is open') {
+  throw "L2: wfp verify output does not say loopback is open: $l2out"
+}
+# With loopback open, the lowered-integrity attempts' off-loopback
+# half is aimed at the open port too, and all four are still blocked.
+if ($l2.open_off_loopback_target -and $l2.lowered_integrity_target -ne $l2.open_off_loopback_target) {
+  throw "L2: lowered_integrity_target expected $($l2.open_off_loopback_target), got '$($l2.lowered_integrity_target)'"
+}
+foreach ($f in $loweredFields) {
+  $got = $l2.$f
+  if ($got -eq 'skipped' -and $f -notlike '*_loopback_probe') {
+    Write-Host "L2 note: $f skipped (no off-loopback address on this runner)"
+  } elseif ($got -ne 'blocked') {
+    throw "L2: $f expected blocked with loopback open, got '$got'. out: $l2out"
+  }
+}
+# A must-be-blocked target that open loopback permits is refused as a
+# usage error, not probed.
+& $Exe wfp verify --target "127.0.0.1:$LbLo" @lb 2>$null | Out-Null
+if ($LASTEXITCODE -ne 1) { throw "L2: wfp verify with an open-loopback --target expected exit 1, got $LASTEXITCODE" }
+Write-Host 'L2 ok: wfp verify probes open loopback (listener connected, blocked port and off-loopback blocked), says it is open, and refuses an open target'
+
+# L3/L4: loopback listeners are reachable on 127.0.0.1 and ::1. The
+# 127.0.0.1 ports are taken from four stretches between the ports that
+# stay blocked, so more than one of the PERMIT's port conditions is
+# exercised.
+foreach ($slice in @((1100..1107), (8100..8107), ($LbLo..($LbLo + 7)), (48100..48107))) {
+  $l3 = Bind-Listener $slice
+  try {
+    Assert-SbConnected 'L3' '127.0.0.1' $l3.LocalEndpoint.Port $lb
+    Write-Host "L3 ok: loopback 127.0.0.1:$($l3.LocalEndpoint.Port) reachable"
+  } finally {
+    $l3.Stop()
+  }
+}
+$l4 = Bind-Listener (($LbLo + 8)..($LbLo + 15)) ([System.Net.IPAddress]::IPv6Loopback)
+try {
+  Assert-SbConnected 'L4' '::1' $l4.LocalEndpoint.Port $lb
+  Write-Host "L4 ok: loopback [::1]:$($l4.LocalEndpoint.Port) reachable"
+} finally {
+  $l4.Stop()
+}
+
+# L5: UDP on loopback works: a datagram reaches a local echo server
+# and its answer comes back.
+$l5port = $LbLo + 32
+$l5 = Start-UdpEcho 'L5' $l5port
+try {
+  $r = SbUdpEcho $l5port $lb
+  if ($r.out -notmatch 'ECHO=udp-ping') {
+    throw "L5: UDP echo through 127.0.0.1:$l5port did not come back. raw: $($r.raw)"
+  }
+} finally {
+  try { $l5.Kill($true) } catch { }
+}
+Write-Host "L5 ok: UDP echo on 127.0.0.1:$l5port works"
+
+# L6: the ports that stay blocked are still refused, listener or not
+# (the filter answers before the destination does).
+foreach ($port in $LbFloor) {
+  $l6 = $null
+  try { $l6 = Bind-Listener @($port) } catch { Write-Host "L6 note: port $port is taken on this runner; probing it as it is" }
+  try { Assert-SbRefused 'L6' '127.0.0.1' $port $lb } finally { if ($l6) { $l6.Stop() } }
+}
+Write-Host "L6 ok: loopback ports $($LbFloor -join ', ') still refused with loopback open"
+
+# L7: a port that is open on loopback is still refused on a
+# NON-loopback address of this machine — the PERMIT is for loopback
+# addresses only — and so is a connect off the machine.
+if (-not $lanIp) {
+  Write-Host 'L7 SKIPPED (non-loopback half): runner has no off-loopback IPv4 address'
+} else {
+  $l7 = Bind-Listener (($LbLo + 16)..($LbLo + 23)) ([System.Net.IPAddress]::Parse($lanIp))
+  $l7port = $l7.LocalEndpoint.Port
+  try {
+    # The same port, listening on loopback as well.
+    $l7lo = Bind-Listener @($l7port)
+    try { Assert-SbConnected 'L7' '127.0.0.1' $l7port $lb } finally { $l7lo.Stop() }
+    Assert-SbRefused 'L7' $lanIp $l7port $lb
+    Write-Host "L7 ok: port $l7port reachable on 127.0.0.1, refused on non-loopback $lanIp"
+  } finally {
+    $l7.Stop()
+  }
+}
+$r = RExec ($lb + @('--', $cmd, '/c', 'curl -sS -m 5 https://example.com'))
+if ($r.exit -eq 0) {
+  throw "L7: outbound curl succeeded under the sandbox with loopback open. out: $($r.out)"
+}
+Write-Host "L7 ok: off-machine egress still blocked with loopback open (curl exit=$($r.exit))"
+
+# L8: a server started by one sandboxed command is reachable from a
+# second sandboxed command.
+$rt = SbServerRoundTrip 'L8' (Free-LbPort (($LbLo + 24)..($LbLo + 31))) $lb
+if ($rt.client.out -notmatch 'CONNECTED' -or -not $rt.served) {
+  throw "L8: sandbox-started server not reached from a second sandboxed command (served=$($rt.served)). raw: $($rt.client.raw)"
+}
+Write-Host 'L8 ok: a sandbox-started server is reachable from a second sandboxed command'
+
+# L9: a session that expects loopback CLOSED on this install, which
+# has it open, is refused with the reinstall message and launches
+# nothing.
+$r = RExec @('--', $cmd, '/c', 'echo L9-RAN')
+if ($r.exit -ne 19) { throw "L9: exec expecting closed loopback expected exit 19, got $($r.exit). raw: $($r.raw)" }
+if ($r.raw -match 'L9-RAN') { throw "L9: child RAN expecting closed loopback on an open install. raw: $($r.raw)" }
+if ($r.raw -notmatch '(?i)loopback mode' -or $r.raw -notmatch '(?i)srt-win install') {
+  throw "L9: exec message lacks the loopback mode / reinstall hint. raw: $($r.raw)"
+}
+$l9Lsn = Bind-Listener (49950..49959)
+$l9out = & $Exe wfp verify --target "127.0.0.1:$($l9Lsn.LocalEndpoint.Port)"
+$l9exit = $LASTEXITCODE
+$l9Lsn.Stop()
+if ($l9exit -ne 19) { throw "L9: wfp verify expecting closed loopback expected exit 19, got $l9exit. out: $l9out" }
+$l9doc = $l9out | ConvertFrom-Json
+if (-not $l9doc.outdated -or -not $l9doc.allow_loopback_mismatch -or $l9doc.hint -notmatch '(?i)srt-win install') {
+  throw "L9: wfp verify output lacks outdated / allow_loopback_mismatch / the reinstall hint: $l9out"
+}
+Write-Host 'L9 ok: a session expecting closed loopback on an open install is refused (exec 19, wfp verify 19)'
+
+# L10: closing loopback is the install step again. The PERMIT goes
+# (the elevated status enumerates the sublayer's filters: the count is
+# back and none of them opens loopback), the record goes, and a
+# loopback listener is refused once more.
+Run @('install',
+      '--sublayer-guid',$Sublayer,
+      '--proxy-port-range',$PortRange,
+      '--force')
+$l10 = J @('wfp','status','--sublayer-guid',$Sublayer)
+if ($l10.state -ne 'installed' -or $l10.filters -ne $st0.filters -or $l10.allow_loopback -ne $false -or
+    $null -ne $l10.PSObject.Properties['loopback_notice']) {
+  throw "L10: after closing loopback expected installed/$($st0.filters) filters/allow_loopback=false, got $($l10 | ConvertTo-Json -Compress)"
+}
+if ($null -ne (Get-ItemProperty $regBase -ea Stop).PSObject.Properties['AllowLoopback']) {
+  throw 'L10: AllowLoopback still recorded after loopback was closed'
+}
+$l10Lsn = Bind-Listener ($LbLo..($LbLo + 7))
+try { Assert-SbRefused 'L10' '127.0.0.1' $l10Lsn.LocalEndpoint.Port } finally { $l10Lsn.Stop() }
+$r = RExec @('--', $cmd, '/c', 'echo L10-RAN')
+if ($r.exit -ne 0 -or $r.out -notmatch 'L10-RAN') {
+  throw "L10: exec after closing loopback failed. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'L10 ok: reinstalling without --allow-loopback closes it again and leaves no permit behind'
+
+# ── S-rows: Secondary Logon (seclogon) preflight + typed failure ─
+# Every launch is CreateProcessWithLogonW, which needs the seclogon
+# service. Hardened fleets set it to Disabled; `status` must say so
+# BEFORE a launch is attempted, and a launch must then fail with the
+# typed `seclogon_disabled` JSON line + exit 18 (never run the
+# command some other way). The invariant across all three states:
+# a `seclogon: ok` preflight means the launch works.
+#
+# This reconfigures a machine-wide service, so it runs last (only
+# the uninstall follows) and restores the original start type and
+# run state in `finally`; S4 then proves launches work again, so the
+# smoke scripts that follow are not poisoned.
+function Seclogon-State {
+  return (J @('status','--sublayer-guid',$Sublayer)).user.seclogon
+}
+function Seclogon-Err {
+  param([string] $text)
+  $line = ($text -split "`r?`n") |
+    Where-Object { $_ -match '^\s*\{.*"code"\s*:\s*"seclogon_disabled"' } |
+    Select-Object -First 1
+  if (-not $line) { return $null }
+  return $line | ConvertFrom-Json
+}
+# seclogon stops accepting SERVICE_CONTROL_STOP for a few milliseconds
+# after every launch it serviced: the broker has already returned (the
+# runner exited) while the service is still finishing that launch. A
+# Stop-Service issued straight after an exec fails with
+# ERROR_INVALID_SERVICE_CONTROL (1052) — "Cannot stop 'seclogon'
+# service". Wait until the service accepts STOP again, then stop it;
+# retry a stop that still loses the race.
+#
+# The service also stays unstoppable for as long as a process it
+# launched is alive. An earlier row that left one behind would keep it
+# that way, so after a few seconds any process still owned by the
+# sandbox account is listed and ended, and the wait goes on.
+function Stop-Seclogon {
+  param([int] $TimeoutSec = 60)
+  $start    = [DateTime]::UtcNow
+  $deadline = $start.AddSeconds($TimeoutSec)
+  $swept    = $false
+  $last     = ''
+  while ($true) {
+    $s = Get-Service seclogon
+    if ($s.Status -eq 'Stopped') { return }
+    # CanStop is not consulted: on some machines it stays false while
+    # a stop request is in fact accepted.
+    try { Stop-Service seclogon -Force -ErrorAction Stop; return } catch { $last = "$_" }
+    if (-not $swept -and ([DateTime]::UtcNow - $start).TotalSeconds -ge 5) {
+      $swept = $true
+      $left = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
+                Where-Object { $_.UserName -like '*\srt-sandbox' })
+      Write-Host "S: seclogon not stoppable after 5s; processes owned by the sandbox account: $(
+        if ($left) { ($left | ForEach-Object { "$($_.ProcessName)#$($_.Id)" }) -join ', ' } else { '(none)' })"
+      foreach ($p in $left) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    } elseif ([DateTime]::UtcNow -ge $deadline) {
+      $q = (& sc.exe queryex seclogon 2>&1 | Out-String) -replace '\s+', ' '
+      throw "seclogon: not accepting STOP after ${TimeoutSec}s (Status=$($s.Status)); last error: $last; sc queryex: $q"
+    }
+    Start-Sleep -Milliseconds 20
+  }
+}
+$slSvc        = Get-Service seclogon
+$slStartType  = [string]$slSvc.StartType
+$slWasRunning = $slSvc.Status -eq 'Running'
+Write-Host "S: seclogon before: StartType=$slStartType Status=$($slSvc.Status)"
+$slSkipped = $false
+try {
+  # ── S1: Manual + stopped → ok; the launch demand-starts it ─────
+  Set-Service seclogon -StartupType Manual
+  # A machine whose own session was started through this service
+  # keeps it unstoppable for as long as that session lives. The rows
+  # cannot run there; they are skipped by name, not passed. Only this
+  # first stop is excused — once it has succeeded, a later stop that
+  # fails is a failure.
+  try { Stop-Seclogon -TimeoutSec 20 } catch { throw "SECLOGON-UNSTOPPABLE: $_" }
+  $st = Seclogon-State
+  if ($st -ne 'ok') { throw "S1: Manual+stopped expected seclogon=ok, got '$st'" }
+  $r = RExec @('--', $cmd, '/c', 'echo S1-RAN')
+  if ($r.exit -ne 0 -or $r.out -notmatch 'S1-RAN') {
+    throw "S1: exec under Manual+stopped seclogon failed (exit $($r.exit)). raw: $($r.raw)"
+  }
+  Write-Host 'S1 ok: Manual+stopped reports ok and exec demand-starts the service'
+
+  # ── S2: Disabled but still running → ok (and it does launch) ───
+  # Disabling a service does not stop it. S1's exec left it running.
+  if ((Get-Service seclogon).Status -eq 'Running') {
+    Set-Service seclogon -StartupType Disabled
+    $st = Seclogon-State
+    if ($st -ne 'ok') { throw "S2: Disabled+running expected seclogon=ok, got '$st'" }
+    $r = RExec @('--', $cmd, '/c', 'echo S2-RAN')
+    if ($r.exit -ne 0 -or $r.out -notmatch 'S2-RAN') {
+      throw "S2: preflight said ok but exec failed under Disabled+running seclogon (exit $($r.exit)). raw: $($r.raw)"
+    }
+    Write-Host 'S2 ok: Disabled+running reports ok and exec still launches'
+  } else {
+    Write-Host 'S2 skipped: seclogon not running after S1'
+  }
+
+  # ── S3: Disabled + stopped → status disabled; typed exit 18 ────
+  # Stop-Service refuses a service whose start type is Disabled, so
+  # stop it under Manual first and disable it once it is down.
+  Set-Service seclogon -StartupType Manual
+  Stop-Seclogon
+  (Get-Service seclogon).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+  Set-Service seclogon -StartupType Disabled
+  $st = Seclogon-State
+  if ($st -ne 'disabled') { throw "S3: Disabled+stopped expected seclogon=disabled, got '$st'" }
+  $st = (J @('user','status')).seclogon
+  if ($st -ne 'disabled') { throw "S3: user status expected seclogon=disabled, got '$st'" }
+
+  $r = RExec @('--', $cmd, '/c', 'echo S3-RAN')
+  if ($r.exit -ne 18) {
+    throw "S3: exec expected exit 18 (seclogon_disabled), got $($r.exit). raw: $($r.raw)"
+  }
+  if ($r.raw -match 'S3-RAN') {
+    throw "S3: the command RAN with seclogon disabled (fail-open). raw: $($r.raw)"
+  }
+  $e = Seclogon-Err $r.raw
+  if (-not $e) { throw "S3: exec stderr has no seclogon_disabled JSON line. raw: $($r.raw)" }
+  if ($e.state -ne 'disabled') { throw "S3: exec error state '$($e.state)', expected disabled" }
+  if ($e.message -notmatch 'startup type to Manual') {
+    throw "S3: exec error message lacks the fix: $($e.message)"
+  }
+  Write-Host "S3 ok: exec exits 18 with seclogon_disabled ($($e.message))"
+
+  # ── S3b: wfp verify — same typed failure, no stdout verdict ────
+  # (the host's initialize() probe; previously exit 1 + empty stdout
+  # → "unparseable output"). The target is never dialled.
+  $vErrFile = Join-Path ([System.IO.Path]::GetTempPath()) "srt-smoke-s3b-$PID.err"
+  $vout  = & $Exe wfp verify --target '127.0.0.1:9' 2>$vErrFile
+  $vexit = $LASTEXITCODE
+  $verr  = Get-Content -Raw $vErrFile -ErrorAction SilentlyContinue
+  Remove-Item $vErrFile -ErrorAction SilentlyContinue
+  if ($vexit -ne 18) {
+    throw "S3b: wfp verify expected exit 18, got $vexit. stdout: '$vout' stderr: $verr"
+  }
+  if ($vout) {
+    throw "S3b: wfp verify printed a probe verdict without launching: '$vout'"
+  }
+  if (-not (Seclogon-Err $verr)) {
+    throw "S3b: wfp verify stderr has no seclogon_disabled JSON line. stderr: $verr"
+  }
+  Write-Host 'S3b ok: wfp verify exits 18 with seclogon_disabled'
+} catch {
+  if ("$_" -notlike 'SECLOGON-UNSTOPPABLE:*') { throw }
+  $slSkipped = $true
+  Write-Host "S1-S3 SKIPPED: the Secondary Logon service cannot be stopped on this machine. $_"
+} finally {
+  # Restore the original start type and run state. Warn rather than
+  # throw so an S-row failure above is not masked; S4 is the check.
+  try {
+    Set-Service seclogon -StartupType $slStartType
+    if ($slWasRunning) { Start-Service seclogon } else { Stop-Seclogon }
+  } catch {
+    Write-Host "S: WARNING: restoring seclogon (StartType=$slStartType running=$slWasRunning): $_"
+  }
+  $slNow = Get-Service seclogon
+  Write-Host "S: seclogon after:  StartType=$($slNow.StartType) Status=$($slNow.Status)"
+}
+
+# ── S4: restored — status ok and exec launches again ─────────────
+$st = Seclogon-State
+if ($st -ne 'ok') { throw "S4: after restore expected seclogon=ok, got '$st'" }
+$r = RExec @('--', $cmd, '/c', 'echo S4-RAN')
+if ($r.exit -ne 0 -or $r.out -notmatch 'S4-RAN') {
+  throw "S4: exec after restoring seclogon failed (exit $($r.exit)). raw: $($r.raw)"
+}
+Write-Host 'S4 ok: seclogon restored; exec launches again'
+
 # ── teardown ─────────────────────────────────────────────────────
+# With the earlier revision's anonymous filter under the sublayer
+# again: uninstall must delete it too (0 filters below).
+Add-OldAnonymousFilter 'teardown'
 Run @('uninstall','--sublayer-guid',$Sublayer)
 $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, G1-G6/G3b)'
+if ($post.filters -ne 0) {
+  throw "post-uninstall expected 0 filters, got $($post.filters)"
+}
+$slRows = if ($slSkipped) { 'S4; S1-S3 SKIPPED' } else { 'S1-S4' }
+Write-Host "smoke-exec: PASS (R0b, V1/V1b/V1c, R1-R7c, R5g-R5j, R5k-observed, R9/R9b/R9c/R9d, T1-T6, R11, R12, R13, R14, G1-G6/G3b, U0/U0b-U4, L0-L10, $slRows)"

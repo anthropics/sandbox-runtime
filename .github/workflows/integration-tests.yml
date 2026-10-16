@@ -96,6 +96,15 @@ jobs:
           cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
           cargo test   --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
           cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
+          # Second, test-only binary with the smoke hooks compiled in
+          # (`srt-win probe token` / `probe parent-access`), for the
+          # rows of smoke-write-restricted that need them. Its own
+          # target dir, so it can never replace the default-feature
+          # target\release\srt-win.exe the other smokes run;
+          # release.yml never passes --features. The TS suite runs
+          # this build too, for its made-up profile (see that step).
+          cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks
+          cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks --all-targets -- -D warnings
 
       - name: Smoke-test srt-win install lifecycle (Windows)
         if: matrix.os == 'windows'
@@ -127,6 +136,36 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-machine-store.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      # Before the TS suite, with the other smokes: this is the child
+      # token and the kept write grants the library uses by default.
+      - name: Smoke-test srt-win write-restricted token (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-write-restricted.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
+
+      # The opt-in profile read grant, on a made-up profile tree under a
+      # scratch root (never the runner's own profile): the test-hooks
+      # build is what can be pointed at it.
+      - name: Smoke-test srt-win profile read grant (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-profile-read.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
+
+      # Measurements, not assertions: each row prints a `RESIDUAL <name>:`
+      # line with what it observed and the script ends with a table of them.
+      # What a row observes never fails this step. It fails only when the
+      # script could not do its own work (provisioning, a row's own code, or
+      # cleanup), and it still prints the table first.
+      - name: srt-win residual egress measurements (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-residual-egress.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
+      - name: Smoke-test srt-win --env-stdin secret channel (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-env-stdin.ps1 vendor\srt-win-src\target\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -136,8 +175,27 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+          # A default session needs a read grant on the user's profile,
+          # and the suite must not grant the runner's own. It gets a
+          # made-up profile directory, which only the test-hooks build
+          # can be pointed at — so these rows run that build (the
+          # smokes above run the shipped one). Outside the system temp
+          # directory and the checkout, so no row's own paths contain it.
+          $env:SRT_WIN_TEST_PROFILE = Join-Path $env:RUNNER_TEMP 'srt-ts-profile'
+          New-Item -ItemType Directory -Force -Path $env:SRT_WIN_TEST_PROFILE | Out-Null
+          $env:SRT_WIN_TEST_HOOKS_EXE = (Resolve-Path 'vendor\srt-win-src\target\test-hooks\release\srt-win.exe').Path
           npm ci
           npm run build
+          # The JVM proxy agent jar, so the J rows in winsrt.test.ts can
+          # drive a real JVM through the proxy from inside the sandbox.
+          # Built only where the runner image carries a JDK; without the
+          # jar (or without a java the sandbox user can launch) those
+          # rows skip and the rest of the suite is unaffected.
+          if ($env:JAVA_HOME -or (Get-Command javac -ErrorAction SilentlyContinue)) {
+            npm run build:java-agent
+          } else {
+            Write-Host '::notice::no JDK on this runner; winsrt J4 (JVM through the proxy) will skip'
+          }
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw
