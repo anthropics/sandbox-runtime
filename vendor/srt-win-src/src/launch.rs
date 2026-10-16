@@ -138,12 +138,18 @@ pub fn run_lockdown(
     //    `extra_allow = None` — we run as `srt-sandbox`; an
     //    `srt-sandbox:FA` ACE here would match the child and undo the
     //    protection. First so the protection holds on every later
-    //    error path. Best-effort — log on failure but don't abort,
-    //    since a runner without self-protect is still strictly safer
-    //    than no sandbox.
-    if let Err(e) = self_protect::install_broker_dacl(None) {
-        eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
-    }
+    //    error path. Required: a child that can open the runner is
+    //    not confined by the token built below, so a runner that
+    //    cannot protect itself launches nothing.
+    //
+    //    The runner's threads are separate objects with their own
+    //    DACLs and get the same treatment. This first sweep covers
+    //    the threads that exist now, against other sandboxed
+    //    processes of the same account that are already running; the
+    //    sweep that this launch's own child is held behind is in
+    //    step 10.
+    self_protect::install_broker_dacl(None).context("runner self-protect (process)")?;
+    self_protect::protect_own_threads().context("runner self-protect (threads)")?;
 
     // 2) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
@@ -305,6 +311,27 @@ pub fn run_lockdown(
                 breakaway.0 != 0,
             )
         });
+    }
+    // Runner threads get the process's self-protect DACL before the
+    // child can run (it is still suspended). Two parts, in this
+    // order: first the runner token's default DACL, so any thread
+    // created from here on starts out protected; then a sweep over
+    // every thread that exists, which covers the ones started since
+    // the sweep in step 1. The default DACL is changed only now
+    // because it would otherwise also land on the child's process,
+    // thread and token objects, which the child must be able to
+    // open; after this point the runner creates no object at all.
+    // Either failing ends the launch: the `child` guard terminates
+    // the suspended child.
+    self_protect::protect_future_threads()
+        .context("runner self-protect (default DACL for new threads)")?;
+    let protected_threads = self_protect::protect_own_threads()
+        .context("runner self-protect (threads, before resume)")?;
+    if dbg {
+        eprintln!(
+            "srt-win: run_lockdown: thread self-protect applied \
+             ({protected_threads} thread(s))"
+        );
     }
     let prev_suspend = unsafe { ResumeThread(child.thread()) };
     if prev_suspend == u32::MAX {

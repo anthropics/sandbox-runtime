@@ -445,6 +445,190 @@ if ($r.out -notmatch 'DENIED:runner') {
 }
 Write-Host 'R9b ok: child denied PROCESS_CREATE_PROCESS on the runner (self-protect holds)'
 
+# ── R9c: child cannot open any THREAD of the runner ──────────────
+# ── R9d: the same after a wait (a thread the runner started after
+#        the launch must be closed to the child too)
+# A thread object has its own DACL, separate from the process's. A
+# child that could open a runner thread for impersonation or
+# set-context would act with the runner's token, which carries none
+# of the child token's restrictions. The child lists the runner's
+# threads and tries every such right on each; one success fails the
+# row. CONTROL opens the child's OWN thread the same way, so a probe
+# that cannot open anything at all does not read as a pass.
+$threadRights = 11
+$probeR9c = @'
+$sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenThread(uint a,bool b,uint t);' +
+       '[DllImport("kernel32.dll")]public static extern bool CloseHandle(System.IntPtr h);' +
+       '[DllImport("kernel32.dll")]public static extern uint GetCurrentThreadId();'
+$k32 = Add-Type -MemberDefinition $sig -Name K32T -Namespace W -PassThru
+$rights = [ordered]@{
+  'terminate'            = 0x0001
+  'suspend-resume'       = 0x0002
+  'get-context'          = 0x0008
+  'set-context'          = 0x0010
+  'set-information'      = 0x0020
+  'query-information'    = 0x0040
+  'set-thread-token'     = 0x0080
+  'impersonate'          = 0x0100
+  'direct-impersonation' = 0x0200
+  'write-dac'            = 0x40000
+  'write-owner'          = 0x80000
+}
+$rp = 0
+$cur = $PID
+for ($i = 0; $i -lt 8; $i++) {
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ea SilentlyContinue
+  if (-not $p) { break }
+  if ($p.Name -eq 'srt-win.exe') { $rp = [int]$p.ProcessId; break }
+  if (-not $p.ParentProcessId) { break }
+  $cur = $p.ParentProcessId
+}
+function Sweep([string]$pass) {
+  $tids = @()
+  try { $tids = @((Get-Process -Id $rp -ErrorAction Stop).Threads | ForEach-Object { $_.Id }) } catch { }
+  if ($tids.Count -eq 0) {
+    $tids = @(Get-CimInstance Win32_Thread -Filter "ProcessHandle='$rp'" -ea SilentlyContinue |
+              ForEach-Object { [int]$_.Handle })
+  }
+  $denied = 0
+  foreach ($t in $tids) {
+    foreach ($name in $rights.Keys) {
+      $h = $k32::OpenThread([uint32]$rights[$name], $false, [uint32]$t)
+      $le = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+      if ($h -ne [System.IntPtr]::Zero) { [void]$k32::CloseHandle($h); "OPENED:$pass tid=$t right=$name" }
+      elseif ($le -eq 5)                { $denied++ }
+      else                              { "OTHER:$pass tid=$t right=$name le=$le" }
+    }
+  }
+  "SWEEP:$pass threads=$($tids.Count) denied=$denied"
+}
+if ($rp -eq 0) { 'NORUNNER' } else {
+  # 0x0012 = THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME
+  $h = $k32::OpenThread(0x0012, $false, $k32::GetCurrentThreadId())
+  if ($h -ne [System.IntPtr]::Zero) { 'CONTROL:ok' } else { 'CONTROL:failed' }
+  Sweep 'first'
+  Start-Sleep -Seconds 3
+  Sweep 'later'
+}
+'@
+$r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeR9c)
+Write-Host "R9c/R9d probe output: $($r.out.Trim())"
+if ($r.out -match 'NORUNNER') { throw "R9c: runner discovery failed. raw: $($r.raw)" }
+if ($r.out -notmatch 'CONTROL:ok') {
+  throw "R9c: the probe could not open its own thread — test invalid. raw: $($r.raw)"
+}
+foreach ($row in @(@{id='R9c'; pass='first'}, @{id='R9d'; pass='later'})) {
+  if ($r.out -match "OPENED:$($row.pass) ") {
+    throw "$($row.id): child opened a runner thread " +
+          "(runner thread self-protect ineffective — sandbox escape). raw: $($r.raw)"
+  }
+  # A thread that ended between the listing and the open reports 87;
+  # anything else is not a refusal the row can rely on.
+  $odd = $r.out -split "`r?`n" |
+    Where-Object { $_ -match "^OTHER:$($row.pass) " -and $_ -notmatch ' le=87$' }
+  if ($odd) { throw "$($row.id): unexpected OpenThread result: $($odd -join '; '). raw: $($r.raw)" }
+  if ($r.out -notmatch "SWEEP:$($row.pass) threads=(\d+) denied=(\d+)") {
+    throw "$($row.id): sweep did not complete. raw: $($r.raw)"
+  }
+  $nThreads = [int]$Matches[1]; $nDenied = [int]$Matches[2]
+  if ($nThreads -lt 1) { throw "$($row.id): no runner thread listed — test invalid. raw: $($r.raw)" }
+  if ($nDenied -lt $threadRights) {
+    throw "$($row.id): no runner thread refused every right ($nDenied refusals). raw: $($r.raw)"
+  }
+  Write-Host "$($row.id) ok: child refused every right on the runner's threads ($($row.pass): threads=$nThreads refusals=$nDenied)"
+}
+
+# ── T-rows: ordinary tools still start and behave ────────────────
+# The runner's self-protection changes security descriptors in the
+# runner. None of it may reach the child: these rows start the usual
+# tools and have a child open its own process and thread and a
+# grandchild's process, which a descriptor meant for the runner
+# landing on the child's objects would break.
+# ── T1: cmd ──
+$r = RExec @('--', $cmd, '/d', '/s', '/c', 'echo T1-CMD & ver')
+if ($r.exit -ne 0 -or $r.out -notmatch 'T1-CMD' -or $r.out -notmatch 'Windows') {
+  throw "T1: cmd did not run normally. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'T1 ok: cmd starts and runs a built-in'
+
+# ── T2: Windows PowerShell starts ────────────────────────────────
+# ── T3: a process opens its own process and thread by ID ─────────
+# ── T4: a parent opens, waits on and reads the exit code of a ────
+#        grandchild
+$probeT = @'
+$sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenProcess(uint a,bool b,uint p);' +
+       '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenThread(uint a,bool b,uint t);' +
+       '[DllImport("kernel32.dll")]public static extern uint GetCurrentThreadId();'
+$k32 = Add-Type -MemberDefinition $sig -Name K32S -Namespace W -PassThru
+"T2-PS=" + $PSVersionTable.PSVersion.Major
+function Res([string]$tag, [System.IntPtr]$h, [int]$le) {
+  if ($h -ne [System.IntPtr]::Zero) { "$tag=ok" } else { "$tag=FAILED le=$le" }
+}
+# 0x1FFFFF = PROCESS_ALL_ACCESS / THREAD_ALL_ACCESS
+$h = $k32::OpenProcess(0x1FFFFF, $false, $PID)
+Res 'SELF-PROC' $h ([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+$h = $k32::OpenThread(0x1FFFFF, $false, $k32::GetCurrentThreadId())
+Res 'SELF-THREAD' $h ([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = $env:ComSpec
+# Waits on stdin, so it is still running when the parent opens it.
+$psi.Arguments = '/d /c "set /p x= & exit 7"'
+$psi.UseShellExecute = $false
+$psi.RedirectStandardInput = $true
+$psi.CreateNoWindow = $true
+$gc = [System.Diagnostics.Process]::Start($psi)
+$h = $k32::OpenProcess(0x1FFFFF, $false, $gc.Id)
+Res 'GC-OPEN' $h ([Runtime.InteropServices.Marshal]::GetLastWin32Error())
+$gc.StandardInput.Close()
+if ($gc.WaitForExit(20000)) { "GC-EXIT=" + $gc.ExitCode } else { 'GC-EXIT=TIMEOUT'; $gc.Kill() }
+'@
+$r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeT)
+Write-Host "T2-T4 probe output: $($r.out.Trim())"
+if ($r.exit -ne 0 -or $r.out -notmatch 'T2-PS=\d') {
+  throw "T2: Windows PowerShell did not run normally. exit=$($r.exit) raw: $($r.raw)"
+}
+Write-Host 'T2 ok: Windows PowerShell starts'
+if ($r.out -notmatch 'SELF-PROC=ok' -or $r.out -notmatch 'SELF-THREAD=ok') {
+  throw "T3: child could not open its own process or thread by ID. raw: $($r.raw)"
+}
+Write-Host 'T3 ok: child opens its own process and thread by ID'
+if ($r.out -notmatch 'GC-OPEN=ok' -or $r.out -notmatch 'GC-EXIT=7') {
+  throw "T4: parent could not open or wait on its grandchild. raw: $($r.raw)"
+}
+Write-Host 'T4 ok: parent opens a grandchild by ID, waits on it and reads its exit code'
+
+# ── T5: node (when installed) starts and runs a child process ────
+$node = (Get-Command node.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if ($node) {
+  $js = "const out = require('child_process').execFileSync(process.env.ComSpec, ['/d', '/c', 'echo kid']); " +
+        "process.stdout.write('T5-NODE ' + String(out).trim() + '\n')"
+  $r = RExec @('--', $node, '-e', $js)
+  if ($r.exit -ne 0 -or $r.out -notmatch 'T5-NODE kid') {
+    throw "T5: node did not run normally. exit=$($r.exit) raw: $($r.raw)"
+  }
+  Write-Host 'T5 ok: node starts and runs a child process'
+} else {
+  Write-Host 'T5 skipped: node.exe not on PATH'
+}
+
+# ── T6: git-bash (when installed) starts and forks ───────────────
+# An MSYS fork has the parent open and write into the new process,
+# and a pipeline and a subshell each fork.
+$bash = @("$env:ProgramFiles\Git\bin\bash.exe") +
+  @(Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object {
+      Join-Path (Split-Path (Split-Path $_.Source)) 'bin\bash.exe' }) |
+  Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if ($bash) {
+  $r = RExec @('--', $bash, '-c', 'echo T6-PIPE | /usr/bin/cat; (echo T6-SUBSHELL); echo T6-$(echo SUBST)')
+  if ($r.exit -ne 0 -or $r.out -notmatch 'T6-PIPE' -or
+      $r.out -notmatch 'T6-SUBSHELL' -or $r.out -notmatch 'T6-SUBST') {
+    throw "T6: git-bash did not fork normally. exit=$($r.exit) raw: $($r.raw)"
+  }
+  Write-Host 'T6 ok: git-bash starts; pipeline, subshell and command substitution fork'
+} else {
+  Write-Host 'T6 skipped: git-bash not found'
+}
+
 # ── R11: child cannot OpenProcess(PROCESS_VM_READ) on a default-DACL ──
 #         real-user process (logon-SID strip).
 # seclogon stamps the broker's interactive logon SID into the
@@ -731,4 +915,4 @@ $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, G1-G6/G3b)'
+Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b/R9c/R9d, T1-T6, R11, R12, G1-G6/G3b)'

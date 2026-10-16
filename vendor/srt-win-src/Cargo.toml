@@ -30,6 +30,7 @@ windows = { version = "0.62.2", features = [
   "Win32_System_JobObjects",
   "Win32_System_StationsAndDesktops",
   "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_IO",
   "Win32_System_Pipes",
   "Win32_Graphics_Gdi",
