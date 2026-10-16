@@ -166,8 +166,11 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     const command = await wrap()
 
-    expect(command).toContain(`--ro-bind /dev/null ${gitDir}/hooks`)
-    expect(command).toContain(`--ro-bind /dev/null ${gitDir}/config`)
+    for (const absent of [`${gitDir}/hooks`, `${gitDir}/config`]) {
+      expect(lastMountAt(command, absent)).toMatch(
+        /^--ro-bind \S*\/claude-empty-[A-Za-z0-9]+\/empty /,
+      )
+    }
     expect(command).toContain(`--ro-bind ${gitDir} ${gitDir}`)
   })
 
