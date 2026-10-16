@@ -23,6 +23,14 @@ describe('whichSync', () => {
     expect(result).toBeNull()
   })
 
+  it('should accept an executable absolute path without PATH lookup', () => {
+    expect(whichSync(process.execPath)).toBe(process.execPath)
+  })
+
+  it('should reject a missing executable absolute path', () => {
+    expect(whichSync('/path/that/does/not/exist')).toBeNull()
+  })
+
   it('should find common tools', () => {
     // These should exist in most environments
     const bash = whichSync('bash')
