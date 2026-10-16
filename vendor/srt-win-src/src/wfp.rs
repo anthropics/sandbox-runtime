@@ -639,11 +639,16 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
     })
 }
 
-/// Status of the WFP fence under `sublayer`. `installed` iff at
-/// least one `block-user` srt-win filter exists. (We don't insist
-/// on the exact count so enterprise tooling that adds extras under
-/// the same sublayer doesn't break detection.) `port_range` is read
-/// from the first `permit-loopback-user` tag.
+/// Status of the WFP fence under `sublayer`. `installed` iff every
+/// filter of the set is present: a `block-user` and a
+/// `permit-loopback-user` at BOTH the v4 and v6 connect layers.
+/// `partial` when some but not all of those are present (e.g. one
+/// address family's block was deleted: that family is open while a
+/// block on the other still exists), so `install`'s early-out falls
+/// through and re-adds the set. (We still don't insist on the exact
+/// count so enterprise tooling that adds extras under the same
+/// sublayer doesn't break detection.) `port_range` is read from the
+/// first `permit-loopback-user` tag.
 ///
 /// `cannot-read` is the graceful-degrade state when BFE
 /// enumeration is admin-gated ([`WfpAccessDenied`]). The
@@ -678,18 +683,17 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         Err(e) => return Err(e),
     };
     let mut filters = 0usize;
-    let mut have_block = false;
+    let mut seen = FenceParts::default();
     let mut port_range: Option<[u16; 2]> = None;
     let mut user_sid: Option<String> = None;
-    let enum_result = for_each_tagged_filter(&engine, sublayer, |_, _, tag| {
+    let enum_result = for_each_tagged_filter(&engine, sublayer, |layer, _, tag| {
         filters += 1;
         if user_sid.is_none() {
             user_sid.clone_from(&tag.user_sid);
         }
-        match tag.kind.as_str() {
-            "block-user" => have_block = true,
-            "permit-loopback-user" => port_range = tag.port_range,
-            _ => {}
+        seen.note(layer, &tag.kind);
+        if tag.kind == "permit-loopback-user" && port_range.is_none() {
+            port_range = tag.port_range;
         }
     });
     if let Err(e) = enum_result {
@@ -699,12 +703,46 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         return Err(e);
     }
     Ok(WfpStatus {
-        state: if have_block { "installed" } else { "absent" },
+        state: seen.state(),
         filters,
         port_range,
         user_sid,
         hint: None,
     })
+}
+
+/// Which parts of the [`FILTER_COUNT`] set [`filter_status`] saw:
+/// `[block, permit]` per connect layer, v4 then v6.
+#[derive(Debug, Default, Clone, Copy)]
+struct FenceParts([[bool; 2]; 2]);
+
+impl FenceParts {
+    fn note(&mut self, layer: &str, kind: &str) {
+        let l = if layer == ALE_LAYERS[0].1 {
+            0
+        } else if layer == ALE_LAYERS[1].1 {
+            1
+        } else {
+            return;
+        };
+        match kind {
+            "block-user" => self.0[l][0] = true,
+            "permit-loopback-user" => self.0[l][1] = true,
+            _ => {}
+        }
+    }
+
+    fn state(&self) -> &'static str {
+        let all = self.0.iter().flatten().all(|&b| b);
+        let any = self.0.iter().flatten().any(|&b| b);
+        if all {
+            "installed"
+        } else if any {
+            "partial"
+        } else {
+            "absent"
+        }
+    }
 }
 
 fn cannot_read(e: anyhow::Error) -> WfpStatus {
@@ -850,6 +888,33 @@ mod tests {
         let g2 = parse_guid("{2c5d0ad6-5f3b-4d4e-9b8f-1a3e7c9d0b21}").unwrap();
         assert_eq!(g1, g2);
         assert_eq!(g1, DEFAULT_SUBLAYER_GUID);
+    }
+
+    #[test]
+    fn fence_parts_state() {
+        const V4: &str = "ale_auth_connect_v4";
+        const V6: &str = "ale_auth_connect_v6";
+        let full = |skip: Option<(&str, &str)>| {
+            let mut p = FenceParts::default();
+            for l in [V4, V6] {
+                for k in ["block-user", "permit-loopback-user"] {
+                    if skip != Some((l, k)) {
+                        p.note(l, k);
+                    }
+                }
+            }
+            p.state()
+        };
+        assert_eq!(FenceParts::default().state(), "absent");
+        assert_eq!(full(None), "installed");
+        assert_eq!(full(Some((V4, "block-user"))), "partial");
+        assert_eq!(full(Some((V6, "block-user"))), "partial");
+        assert_eq!(full(Some((V6, "permit-loopback-user"))), "partial");
+        // Unknown kinds/layers neither complete nor start a set.
+        let mut p = FenceParts::default();
+        p.note(V4, "legacy-group");
+        p.note("other", "block-user");
+        assert_eq!(p.state(), "absent");
     }
 
     #[test]
