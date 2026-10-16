@@ -1,9 +1,33 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  spyOn,
+} from 'bun:test'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { lastMountAt } from '../helpers/bwrap-argv.js'
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import * as platformModule from '../../src/utils/platform.js'
+import {
+  createLinkedWorktreeFixture,
+  withWorktreeFixture,
+  type LinkedWorktreeFixture,
+} from '../helpers/git-fixtures.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
@@ -73,6 +97,53 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
 
       expect(wrapped).not.toBe(command)
     })
+  })
+
+  describe.if(isLinux || isMacOS)('linked worktree command overrides', () => {
+    for (const field of ['allowGitCommonDir', 'allowGitConfig'] as const) {
+      it(`honors per-command ${field}`, async () => {
+        const base = mkdtempSync(join(tmpdir(), 'srt-git-override-'))
+        try {
+          await withWorktreeFixture(
+            createLinkedWorktreeFixture(base, 'linked', 'ORIGINAL'),
+            async ({ commonDir }) => {
+              const target = join(
+                commonDir,
+                field === 'allowGitConfig' ? 'config' : 'refs/heads/main',
+              )
+              for (const enabled of [false, true]) {
+                const wrapped = await SandboxManager.wrapWithSandbox(
+                  `echo BOOTED; printf UPDATED > '${target}'`,
+                  undefined,
+                  {
+                    filesystem: {
+                      denyRead: [],
+                      allowWrite: ['.'],
+                      denyWrite: [],
+                      allowGitCommonDir: true,
+                      [field]: enabled,
+                    },
+                  },
+                )
+                const result = spawnSync(wrapped, {
+                  shell: true,
+                  encoding: 'utf8',
+                  timeout: 10000,
+                })
+                SandboxManager.cleanupAfterCommand()
+                expect(result.stdout).toContain('BOOTED')
+                expect(result.status === 0).toBe(enabled)
+                expect(readFileSync(target, 'utf8')).toBe(
+                  enabled ? 'UPDATED' : 'ORIGINAL',
+                )
+              }
+            },
+          )
+        } finally {
+          rmSync(base, { recursive: true, force: true })
+        }
+      })
+    }
   })
 
   describe('with customConfig network overrides', () => {
@@ -166,6 +237,154 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
 
       expect(wrapped).not.toBe(command)
     })
+  })
+})
+
+/** Public-manager policy generation without initialization, proxies or native execution. */
+describe.if(isLinux || isMacOS)('Git policy profiles', () => {
+  let root: string
+  let fixture: LinkedWorktreeFixture
+  let platform: ReturnType<typeof spyOn<typeof platformModule, 'getPlatform'>>
+  const cwd = process.cwd()
+  const config = (
+    common: boolean,
+    gitConfig: boolean,
+  ): SandboxRuntimeConfig => ({
+    network: { allowedDomains: [], deniedDomains: [] },
+    filesystem: {
+      denyRead: [],
+      allowWrite: ['.'],
+      denyWrite: [],
+      allowGitCommonDir: common,
+      allowGitConfig: gitConfig,
+    },
+  })
+
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), 'srt-git-policy-')))
+    fixture = createLinkedWorktreeFixture(root, '[moon]?', 'ORIGINAL')
+    process.chdir(fixture.worktreeDir)
+    platform = spyOn(platformModule, 'getPlatform').mockReturnValue('macos')
+  })
+
+  afterEach(async () => {
+    await SandboxManager.reset()
+    platform.mockRestore()
+    process.chdir(cwd)
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  for (const session of [false, true]) {
+    for (const override of [undefined, false, true]) {
+      it(`resolves Git toggles independently: session=${session}, override=${override}`, async () => {
+        const initial = config(session, session)
+        SandboxManager.updateConfig(initial)
+        const getter = SandboxManager.getFsWriteConfig()
+        expect(
+          getter.literalAllowOnly?.includes(fixture.commonDir) ?? false,
+        ).toBe(session)
+        for (const field of ['allowGitCommonDir', 'allowGitConfig'] as const) {
+          const custom = {
+            filesystem: {
+              denyRead: [],
+              allowWrite: ['.'],
+              denyWrite: [],
+              [field]: override,
+            },
+          }
+          const wrapped = await SandboxManager.wrapWithSandbox(
+            'true',
+            undefined,
+            custom,
+          )
+          const write = wrapped.slice(wrapped.indexOf('; File write'))
+          const deny = write.indexOf('(deny file-write*')
+          const grant =
+            field === 'allowGitCommonDir' ? (override ?? session) : session
+          const allowConfig =
+            field === 'allowGitConfig' ? (override ?? session) : session
+          expect(
+            write
+              .slice(0, deny)
+              .includes(`(subpath ${JSON.stringify(fixture.commonDir)})`),
+          ).toBe(grant)
+          for (const target of [
+            join(fixture.commonDir, 'config'),
+            join(fixture.commonDir, 'config.worktree'),
+            join(fixture.worktreeGitDir, 'config.worktree'),
+          ]) {
+            expect(
+              write.slice(deny).includes(`(subpath ${JSON.stringify(target)})`),
+            ).toBe(!allowConfig)
+          }
+          expect(write.slice(deny)).toContain(
+            `(subpath ${JSON.stringify(join(fixture.commonDir, 'hooks'))})`,
+          )
+          expect(SandboxManager.getConfig()).toEqual(initial)
+        }
+      })
+    }
+  }
+
+  it('includes the common write root before Linux read-deny glob collapse', async () => {
+    platform.mockReturnValue('linux')
+    const plain = createLinkedWorktreeFixture(root, 'plain', 'ORIGINAL')
+    process.chdir(plain.worktreeDir)
+    const secret = join(plain.commonDir, 'refs', 'secret')
+    writeFileSync(secret, 'MOON')
+    const policy = config(true, false)
+    policy.network.allowAllUnixSockets = true
+    policy.bwrapPath = '/not-executed/bwrap'
+    policy.filesystem.denyRead = ['../main-repo/.git/**/secret']
+    SandboxManager.updateConfig(policy)
+    const wrapped = await SandboxManager.wrapWithSandbox('true')
+    expect(lastMountAt(wrapped, secret)).toBe(`--ro-bind /dev/null ${secret}`)
+    expect(lastMountAt(wrapped, join(plain.commonDir, 'config'))).toBe(
+      `--ro-bind ${join(plain.commonDir, 'config')} ${join(plain.commonDir, 'config')}`,
+    )
+  })
+
+  it('does not discover a second grant after read-policy expansion', async () => {
+    const other = createLinkedWorktreeFixture(root, 'other', 'ORIGINAL')
+    SandboxManager.updateConfig(config(true, false))
+    const pending = SandboxManager.wrapWithSandbox('true')
+    queueMicrotask(() => {
+      writeFileSync(
+        join(fixture.worktreeDir, '.git'),
+        `gitdir: ${other.worktreeGitDir}`,
+      )
+      writeFileSync(
+        join(other.worktreeGitDir, 'gitdir'),
+        join(fixture.worktreeDir, '.git'),
+      )
+    })
+    const wrapped = await pending
+    const write = wrapped.slice(wrapped.indexOf('; File write'))
+    const deny = write.indexOf('(deny file-write*')
+    expect(write.slice(0, deny)).toContain(
+      `(subpath ${JSON.stringify(fixture.commonDir)})`,
+    )
+    expect(write.slice(0, deny)).not.toContain(
+      `(subpath ${JSON.stringify(other.commonDir)})`,
+    )
+    expect(write.slice(deny)).toContain(
+      `(subpath ${JSON.stringify(join(fixture.commonDir, 'config'))})`,
+    )
+  })
+
+  it('restarts with current Git policy after a configuration change during a wrap', async () => {
+    SandboxManager.updateConfig(config(true, true))
+    const pending = SandboxManager.wrapWithSandbox('true')
+    queueMicrotask(() => SandboxManager.updateConfig(config(false, false)))
+    const wrapped = await pending
+    const write = wrapped.slice(wrapped.indexOf('; File write'))
+    const deny = write.indexOf('(deny file-write*')
+    expect(write.slice(0, deny)).not.toContain(
+      `(subpath ${JSON.stringify(fixture.commonDir)})`,
+    )
+    expect(write.slice(deny)).toContain(
+      `(subpath ${JSON.stringify(join(fixture.commonDir, 'config'))})`,
+    )
   })
 })
 

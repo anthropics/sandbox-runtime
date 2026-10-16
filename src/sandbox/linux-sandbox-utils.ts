@@ -26,6 +26,9 @@ import {
   properAncestors,
   nameLocation,
   getDangerousDirectories,
+  getGitDirs,
+  getGitCommonDirDenyPaths,
+  resolveGitCommonDirWriteAccess,
   workingDirectory,
 } from './sandbox-utils.js'
 import type {
@@ -86,6 +89,8 @@ export interface LinuxSandboxParams {
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
   allowGitConfig?: boolean
+  /** Linked worktrees only: allow writes to the verified Git common directory. */
+  allowGitCommonDir?: boolean
   /**
    * Directories to emit as `safe.directory` via `GIT_CONFIG_*` env
    * vars (see {@link buildPosixGitSafeDirEnv}). Under `--unshare-user`
@@ -468,6 +473,7 @@ export function linuxGetCwdMandatoryDenyPaths(
     }
   }
 
+  denyPaths.push(...getGitCommonDirDenyPaths(getGitDirs(), allowGitConfig))
   return denyPaths
 }
 
@@ -3547,6 +3553,7 @@ export async function wrapCommandWithSandboxLinux(
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     allowGitConfig = false,
+    allowGitCommonDir = false,
     gitSafeDirectories,
     seccompConfig,
     bwrapPath,
@@ -3559,7 +3566,11 @@ export async function wrapCommandWithSandboxLinux(
   // below can read a list and miss them; a pattern in `allowOnly` that is no
   // name is dropped by the fold (see writeNamesOf).
   const readConfig = readNamesOf(params.readConfig)
-  const writeConfig = writeNamesOf(params.writeConfig)
+  const writeConfig = writeNamesOf(
+    allowGitCommonDir
+      ? resolveGitCommonDirWriteAccess(params.writeConfig, true, allowGitConfig)
+      : params.writeConfig,
+  )
 
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions

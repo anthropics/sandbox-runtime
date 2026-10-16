@@ -13,6 +13,7 @@ import {
   type GlobToken,
 } from './glob-pattern.js'
 import type { FilesystemPathEntry } from './sandbox-config.js'
+import type { FsWriteRestrictionConfig } from './sandbox-schemas.js'
 
 /**
  * Dangerous files that should be protected from writes.
@@ -47,6 +48,238 @@ export function getDangerousDirectories(): string[] {
     '.claude/commands',
     '.claude/agents',
   ]
+}
+
+export interface GitDirs {
+  gitDir: string
+  commonDir: string
+}
+
+/**
+ * Resolve the nearest checkout without executing Git or consulting its config.
+ * A common directory is extra write scope only when the canonical layout is
+ * <common>/worktrees/<name> and its gitdir backlink names this checkout's .git.
+ * A main checkout (directory .git) never follows commondir.
+ */
+export function getGitDirs(
+  startDir: string = process.cwd(),
+): GitDirs | undefined {
+  let current = resolveGitDirectory(startDir)
+  if (!current) return undefined
+  for (;;) {
+    const dotGit = path.join(current, '.git')
+    const stats = gitMetadataStat(dotGit)
+    if (stats) {
+      if (stats.isDirectory()) return { gitDir: dotGit, commonDir: dotGit }
+      // A symlink .git must not impersonate another worktree's backlink.
+      if (!stats.isFile()) return undefined
+      const text = readGitMetadata(dotGit)
+      if (!text?.startsWith('gitdir:')) return undefined
+      const target = text.slice('gitdir:'.length).trim()
+      if (!target) return undefined
+      const gitDir = resolveGitDirectory(gitMetadataPath(current, target))
+      if (!gitDir) return undefined
+      const single = { gitDir, commonDir: gitDir }
+      const common = readGitMetadata(path.join(gitDir, 'commondir'))
+      if (!common) return single
+      const commonDir = resolveGitDirectory(gitMetadataPath(gitDir, common))
+      if (!commonDir) return single
+      const worktrees = path.join(commonDir, 'worktrees')
+      // Compare against the canonical common dir WITHOUT resolving worktrees:
+      // a symlink there must not turn an unrelated directory into a registry.
+      if (
+        !gitMetadataStat(worktrees)?.isDirectory() ||
+        path.dirname(gitDir) !== worktrees
+      )
+        return single
+      const backlink = readGitMetadata(path.join(gitDir, 'gitdir'))
+      if (
+        !backlink ||
+        resolveGitPath(gitMetadataPath(gitDir, backlink)) !== dotGit
+      ) {
+        return undefined
+      }
+      return { gitDir, commonDir }
+    }
+    const parent = path.dirname(current)
+    if (parent === current) return undefined
+    current = parent
+  }
+}
+
+export function getLinkedGitCommonDir(
+  gitDirs: GitDirs | undefined,
+): string | undefined {
+  return gitDirs && gitDirs.gitDir !== gitDirs.commonDir
+    ? gitDirs.commonDir
+    : undefined
+}
+
+/** Literal denies, even when a caller's broader allow already covers the repo. */
+export function getGitCommonDirDenyPaths(
+  gitDirs: GitDirs | undefined,
+  allowGitConfig = false,
+): string[] {
+  const commonDir = getLinkedGitCommonDir(gitDirs)
+  if (!commonDir) return []
+  const denies = [path.join(commonDir, 'hooks')]
+  if (!allowGitConfig) {
+    denies.push(
+      path.join(commonDir, 'config'),
+      path.join(commonDir, 'config.worktree'),
+    )
+    const registry = path.join(commonDir, 'worktrees')
+    // Include absent config.worktree files, not just the files present today.
+    // Symlink entries are included too: denying a name never grants its target.
+    for (const entry of fs.readdirSync(registry, { withFileTypes: true })) {
+      if (entry.isDirectory() || entry.isSymbolicLink()) {
+        denies.push(path.join(registry, entry.name, 'config.worktree'))
+      }
+    }
+  }
+  return [...new Set(denies.flatMap(p => gitDenyPathSpellings(commonDir, p)))]
+}
+
+/**
+ * Add only verified, literal Git scope. Resolve before read-deny expansion so
+ * Linux's collapsed read masks account for the additional write root. Keep
+ * the denies with that root across awaits. Backends may add fresh denies, but
+ * must not rediscover another grant after the manager has expanded read rules.
+ * Undefined retains the existing "filesystem disabled" meaning.
+ */
+export function resolveGitCommonDirWriteAccess(
+  config: FsWriteRestrictionConfig,
+  allowGitCommonDir?: boolean,
+  allowGitConfig?: boolean,
+): FsWriteRestrictionConfig
+export function resolveGitCommonDirWriteAccess(
+  config: FsWriteRestrictionConfig | undefined,
+  allowGitCommonDir?: boolean,
+  allowGitConfig?: boolean,
+): FsWriteRestrictionConfig | undefined
+export function resolveGitCommonDirWriteAccess(
+  config: FsWriteRestrictionConfig | undefined,
+  allowGitCommonDir = false,
+  allowGitConfig = false,
+): FsWriteRestrictionConfig | undefined {
+  if (!config || getPlatform() === 'windows') return config
+  const dirs = getGitDirs()
+  // Invalid markers forbid new scope, not denies beneath an explicit allow.
+  const commonDir =
+    allowGitCommonDir &&
+    dirs &&
+    dirs.gitDir !== dirs.commonDir &&
+    hasGitRepositoryMarkers(dirs.gitDir, dirs.commonDir)
+      ? dirs.commonDir
+      : undefined
+  const denies = getGitCommonDirDenyPaths(dirs, allowGitConfig)
+  if (!commonDir && denies.length === 0) return config
+  return {
+    ...config,
+    ...(commonDir && {
+      literalAllowOnly: [
+        ...new Set([...(config.literalAllowOnly ?? []), commonDir]),
+      ],
+    }),
+    literalDenyWithinAllow: [
+      ...new Set([...(config.literalDenyWithinAllow ?? []), ...denies]),
+    ],
+  }
+}
+
+/**
+ * Recognition markers, not a config or object parser: a regular HEAD naming
+ * a ref (including unborn branches) or a SHA-1/SHA-256 detached head, plus
+ * common object/ref storage. Layout and backlinks alone can describe nonrepos.
+ */
+function hasGitRepositoryMarkers(gitDir: string, commonDir: string): boolean {
+  const head = readGitMetadata(path.join(gitDir, 'HEAD'))
+  return (
+    head !== undefined &&
+    /^(?:ref: refs\/[^\s\0]+|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(head) &&
+    resolveGitDirectory(path.join(commonDir, 'objects')) !== undefined &&
+    resolveGitDirectory(path.join(commonDir, 'refs')) !== undefined
+  )
+}
+
+/**
+ * Deny both the metadata name and where it leads, even when its target does
+ * not exist yet. realpath alone misses dangling hooks/config links and absent
+ * config.worktree files beneath a symlinked registry entry. Resolve links one
+ * component at a time so a link followed by .. keeps its kernel meaning.
+ */
+function gitDenyPathSpellings(commonDir: string, p: string): string[] {
+  // commonDir was already resolved and verified. Only walk the tail beneath it.
+  let resolved = commonDir
+  const pending = path.relative(commonDir, p).split(path.sep)
+  let links = 0
+  while (pending.length > 0) {
+    const component = pending.shift()!
+    if (!component || component === '.') continue
+    if (component === '..') {
+      resolved = path.dirname(resolved)
+      continue
+    }
+    const next = path.join(resolved, component)
+    if (gitMetadataStat(next)?.isSymbolicLink()) {
+      if (++links > 40) throw new Error(`Cannot resolve Git deny path: ${p}`)
+      const target = fs.readlinkSync(next)
+      if (path.isAbsolute(target)) resolved = path.parse(target).root
+      pending.unshift(...target.split(path.sep))
+    } else {
+      resolved = next
+    }
+  }
+  return resolved === p ? [p] : [p, resolved]
+}
+
+// Preserve .. until realpath: folding link/.. lexically would verify a path
+// different from the one Git and the kernel actually follow.
+function gitMetadataPath(base: string, target: string): string {
+  return path.isAbsolute(target) ? target : `${base}/${target}`
+}
+
+function gitMetadataStat(p: string): fs.Stats | undefined {
+  try {
+    return fs.lstatSync(p)
+  } catch (error) {
+    if (isAbsenceErrno(error)) return undefined
+    throw error
+  }
+}
+
+/** Reject links and special files rather than reading an attacker-chosen pipe. */
+function readGitMetadata(p: string): string | undefined {
+  if (!gitMetadataStat(p)?.isFile()) return undefined
+  try {
+    return fs.readFileSync(p, 'utf8').trim()
+  } catch (error) {
+    if (isAbsenceErrno(error)) return undefined
+    throw error
+  }
+}
+
+function resolveGitPath(p: string): string | undefined {
+  try {
+    const resolved = fs.realpathSync(p)
+    // Some runtimes fold link/.. lexically in realpath. Extra scope must
+    // name the inode the kernel actually reaches, not that lexical guess.
+    const original = fs.statSync(p, { bigint: true })
+    const canonical = fs.statSync(resolved, { bigint: true })
+    return original.dev === canonical.dev && original.ino === canonical.ino
+      ? resolved
+      : undefined
+  } catch (error) {
+    if (isAbsenceErrno(error)) return undefined
+    throw error
+  }
+}
+
+function resolveGitDirectory(p: string): string | undefined {
+  const resolved = resolveGitPath(p)
+  return resolved && gitMetadataStat(resolved)?.isDirectory()
+    ? resolved
+    : undefined
 }
 
 /**

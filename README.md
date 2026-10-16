@@ -535,6 +535,10 @@ Uses two different patterns:
 
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
+- `filesystem.allowGitConfig` - Allow writes to `.git/config` and linked-worktree `config.worktree` files while keeping hooks protected (default: false, macOS/Linux)
+- `filesystem.allowGitCommonDir` - Allow writes to the verified Git common directory of the linked worktree containing the command's working directory (default: false, macOS/Linux)
+
+`allowGitCommonDir` has no effect in the main worktree. Explicit denies still win. Common hooks remain blocked, and common config and existing linked worktrees' `config.worktree` paths remain blocked unless `allowGitConfig` is enabled. Both Git options can be overridden per command.
 
 A few paths are writable without being listed: the child's stdio and `/tmp/claude`, and as a convenience `~/.npm/_logs` and `~/.claude/debug`. Those two home directories are dropped when a `denyRead` entry covers them (and kept when an `allowRead` entry beneath that deny re-opens them), so list them in `allowWrite` if you want them writable under a home read-deny.
 
