@@ -42,12 +42,11 @@ import {
   writeRootsOf,
 } from '../../src/sandbox/path-entries.js'
 import type { FilesystemPathEntry } from '../../src/sandbox/sandbox-config.js'
+import { denyGlobRegex, globToRegex } from '../../src/sandbox/glob-pattern.js'
 import {
   containsGlobCharsWin,
-  denyGlobRegex,
   expandGlobPattern,
   getDefaultWritePaths,
-  globToRegex,
   normalizePathForSandbox,
 } from '../../src/sandbox/sandbox-utils.js'
 import {
@@ -530,6 +529,9 @@ describe.if(!isWindows)('literalReadings', () => {
         for (const file of ['a]x', 'deep/a]x', 'deep/er/b]x', 'deep/.env']) {
           writeFileSync(join(base, file), '')
         }
+        for (const file of ['*x', 'deep/ax']) {
+          writeFileSync(join(base, file), '')
+        }
       }
     })
 
@@ -556,14 +558,12 @@ describe.if(!isWindows)('literalReadings', () => {
     )
 
     it.each([
-      ['/**/[a*]x', ['/a]x', '/deep/a]x']],
-      ['/[a*]x', ['/a]x']],
-      ['/deep/[a*]x', ['/deep/a]x']],
+      ['/**/[a*]x', ['/*x', '/deep/ax']],
+      ['/[a*]x', ['/*x']],
+      ['/deep/[a*]x', ['/deep/ax']],
     ])(
-      'matches %p, which cannot be split, by its spelling from the anchor on',
+      'matches %p, with a wildcard in a set, from the anchor on',
       (tail, expected) => {
-        // A wildcard inside a bracket expression: the walk matches such a
-        // pattern against whole paths, which beneath an anchor start at it.
         expect(
           expandGlobPattern(ordinary + tail)
             .map(match => match.slice(ordinary.length))
