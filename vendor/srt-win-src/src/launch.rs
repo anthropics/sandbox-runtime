@@ -116,7 +116,7 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// Called only from `srt-win runner` — this process is the
 /// `srt-sandbox` user (via `CreateProcessWithLogonW`), has NO
 /// console (broker spawned it `CREATE_NO_WINDOW`; stdio are
-/// anonymous pipes), and the child runs under a restricted token
+/// pipes), and the child runs under a restricted token
 /// with `BUILTIN\Administrators` flipped deny-only (LUA shape).
 ///
 /// `env_overlay` is `(KEY, VALUE)` pairs overlaid on the runner's
@@ -233,7 +233,7 @@ pub fn run_lockdown(
     // 8) STARTUPINFOEXW. `STARTF_USESTDHANDLES` + the caller's std
     //    handles is load-bearing: the runner has NO console (the
     //    broker spawned it with `CREATE_NO_WINDOW`; its stdio are the
-    //    broker's anonymous pipes), so without an explicit `hStd*`
+    //    broker's pipes), so without an explicit `hStd*`
     //    wiring the child would try to allocate a conhost on the
     //    non-interactive desktop — which under the restricted token
     //    hangs.

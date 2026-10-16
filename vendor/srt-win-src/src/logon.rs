@@ -4,10 +4,20 @@
 //! Spawns `srt-win.exe runner` under the `srt-sandbox` account
 //! (via the Secondary Logon service — no
 //! `SeAssignPrimaryTokenPrivilege` needed on the broker), wires
-//! three anonymous pipes to its stdio, writes the
+//! three pipes to its stdio, writes the
 //! [`crate::runner::RunnerCmd`] over stdin, pumps stdout/stderr
 //! back to the broker's own stdio, waits, and returns the runner's
 //! exit code.
+//!
+//! **The sandbox side only ever holds pipe CLIENT ends.** A pipe's
+//! server end can `ImpersonateNamedPipeClient` whoever opened the
+//! other end, and here that is the real user — so the runner (and
+//! the child that inherits its stdio) must never be handed one.
+//! stdout/stderr are `CreatePipe` pairs whose write end, the one the
+//! runner gets, is the client end. The read end of a `CreatePipe`
+//! pair is the server end, so stdin is built the other way round by
+//! [`make_stdin_pipe`]: the broker keeps the server (write) end and
+//! opens the client (read) end itself.
 //!
 //! `lpEnvironment = NULL` + `LOGON_WITH_PROFILE` means the runner
 //! starts with the **sandbox user's** profile environment
@@ -25,12 +35,20 @@ use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, HANDLE,
+    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, GENERIC_READ, HANDLE,
     HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
 };
+use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
-use windows::Win32::Storage::FileSystem::{GetDriveTypeW, ReadFile, WriteFile};
-use windows::Win32::System::Pipes::CreatePipe;
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE,
+    FILE_WRITE_ATTRIBUTES, GetDriveTypeW, OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, ReadFile,
+    SECURITY_ANONYMOUS, SECURITY_SQOS_PRESENT, WriteFile,
+};
+use windows::Win32::System::Pipes::{
+    CreateNamedPipeW, CreatePipe, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
     GetExitCodeProcess, INFINITE, LOGON_WITH_PROFILE, PROCESS_INFORMATION, ResumeThread,
@@ -38,9 +56,11 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{PCWSTR, PWSTR};
 
+use crate::acl::{Allow, Mask, NO_INHERIT, build_allow_dacl};
 use crate::job::Job;
 use crate::launch::{SpawnedChild, quote_arg};
-use crate::util::{OwnedHandle, scrub_wstr, wstr};
+use crate::sid::current_user_sid;
+use crate::util::{OwnedHandle, pcwstr, scrub_wstr, wstr};
 use crate::winsta::{IsolatedDesk, grant_sandbox_on_session_bno, grant_sandbox_on_winsta};
 
 /// Typed error for [`spawn_runner`] with a mapped/network-drive
@@ -109,16 +129,21 @@ fn cwd_drive_root(cwd: &str) -> Option<String> {
     None
 }
 
-/// One anonymous pipe pair. The end the runner gets is created
-/// inheritable; the broker's end is flipped non-inheritable so the
-/// runner doesn't get a copy of it (which would keep the pipe open
-/// past the runner's exit and hang the pump).
+/// One pipe pair. The end the runner gets is inheritable; the
+/// broker's end is not, so the runner doesn't get a copy of it
+/// (which would keep the pipe open past the runner's exit and hang
+/// the pump).
 struct PipePair {
     broker: OwnedHandle,
     runner: OwnedHandle,
 }
 
-fn make_pipe(runner_writes: bool) -> Result<PipePair> {
+/// An anonymous pipe the runner WRITES to (stdout / stderr). The
+/// write end of a `CreatePipe` pair is the pipe's client end, so the
+/// runner holds nothing it could impersonate through. Never use this
+/// shape for a pipe the runner reads: the read end is the server end
+/// (see [`make_stdin_pipe`]).
+fn make_output_pipe() -> Result<PipePair> {
     let sa = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         bInheritHandle: true.into(),
@@ -130,15 +155,131 @@ fn make_pipe(runner_writes: bool) -> Result<PipePair> {
         CreatePipe(&mut read, &mut write, Some(&sa), 0).context("CreatePipe")?;
     }
     // Wrap immediately so the `?` below can't leak either end.
-    let (broker, runner) = if runner_writes {
-        (OwnedHandle(read), OwnedHandle(write))
-    } else {
-        (OwnedHandle(write), OwnedHandle(read))
-    };
+    let (broker, runner) = (OwnedHandle(read), OwnedHandle(write));
     // Broker end must NOT be inherited by the runner.
     unsafe {
         SetHandleInformation(broker.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
             .context("SetHandleInformation(broker end)")?;
+    }
+    Ok(PipePair { broker, runner })
+}
+
+/// `dwOpenMode` of the stdin pipe's server end: the server only
+/// writes, and the create fails unless this is the first pipe of
+/// that name (so the name cannot already belong to someone else).
+const STDIN_PIPE_OPEN_MODE: FILE_FLAGS_AND_ATTRIBUTES =
+    FILE_FLAGS_AND_ATTRIBUTES(PIPE_ACCESS_OUTBOUND.0 | FILE_FLAG_FIRST_PIPE_INSTANCE.0);
+
+/// `dwPipeMode` of the stdin pipe: a blocking byte stream, local
+/// clients only.
+const STDIN_PIPE_MODE: NAMED_PIPE_MODE = NAMED_PIPE_MODE(
+    PIPE_TYPE_BYTE.0 | PIPE_READMODE_BYTE.0 | PIPE_WAIT.0 | PIPE_REJECT_REMOTE_CLIENTS.0,
+);
+
+/// One instance: once the broker's own client is connected, nobody
+/// else can connect to the name or create a second server for it.
+const STDIN_PIPE_MAX_INSTANCES: u32 = 1;
+
+/// Server-side buffer. A write larger than this just blocks until
+/// the runner reads, same as with an anonymous pipe.
+const STDIN_PIPE_OUT_BUFFER: u32 = 64 * 1024;
+
+/// Access the client (read) end is opened with: read, plus
+/// `FILE_WRITE_ATTRIBUTES` — the rights the read end of a
+/// `CreatePipe` pair carries, so a child that sets the read/wait
+/// mode on its stdin keeps working. No data-write access.
+const STDIN_CLIENT_ACCESS: u32 = GENERIC_READ.0 | FILE_WRITE_ATTRIBUTES.0;
+
+/// The client end is opened at the ANONYMOUS impersonation level, so
+/// even the pipe's server end (which stays in the broker) could not
+/// obtain a usable token for the broker's user through it.
+const STDIN_CLIENT_FLAGS: FILE_FLAGS_AND_ATTRIBUTES =
+    FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT.0 | SECURITY_ANONYMOUS.0);
+
+/// Name of the stdin pipe: the broker's pid plus 128 random bits.
+/// The name is not a secret the design leans on (the DACL and the
+/// single instance are what keep others out); it only has to be
+/// unique and not predictable enough to squat.
+fn stdin_pipe_name(pid: u32, rand: &[u8; 16]) -> String {
+    let hex: String = rand.iter().map(|b| format!("{b:02x}")).collect();
+    format!(r"\\.\pipe\srt-win-stdin-{pid}-{hex}")
+}
+
+/// The stdin pipe for the runner, built so the runner's end is the
+/// pipe's CLIENT end.
+///
+/// With `CreatePipe` the read end is the server end, and the write
+/// end is opened by this process — the real user. Handing that read
+/// end to the sandbox account would let it (and the child that
+/// inherits it) call `ImpersonateNamedPipeClient` and act as the
+/// real user. So the roles are swapped: the broker creates a named
+/// pipe, keeps the server end to write to, and opens the client end
+/// itself for the runner to read from. A client end cannot
+/// impersonate anyone.
+///
+/// The pipe is reachable only through these two handles: its DACL
+/// grants the broker's own user and nobody else (not the sandbox
+/// account, not Everyone), it rejects remote clients, and its single
+/// instance is taken by the client opened here.
+///
+/// There is no fallback: if any step fails the launch fails.
+fn make_stdin_pipe() -> Result<PipePair> {
+    let mut rand = [0u8; 16];
+    unsafe { BCryptGenRandom(None, &mut rand, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+        .ok()
+        .context("BCryptGenRandom (stdin pipe name)")?;
+    make_stdin_pipe_named(&stdin_pipe_name(std::process::id(), &rand))
+}
+
+fn make_stdin_pipe_named(name: &str) -> Result<PipePair> {
+    let name_w = wstr(name);
+    // Protected DACL with a single ACE for this process's user.
+    // `bInheritHandle` is false: the server end stays in the broker.
+    let me = current_user_sid().context("stdin pipe: current user SID")?;
+    let sa = build_allow_dacl(&[Allow(&me, Mask::FILE_ALL, NO_INHERIT)])?
+        .into_security_attributes()
+        .context("stdin pipe: security descriptor")?;
+    let server = unsafe {
+        CreateNamedPipeW(
+            pcwstr(&name_w),
+            STDIN_PIPE_OPEN_MODE,
+            STDIN_PIPE_MODE,
+            STDIN_PIPE_MAX_INSTANCES,
+            STDIN_PIPE_OUT_BUFFER,
+            0,
+            0,
+            Some(sa.as_ptr()),
+        )
+    };
+    if server.is_invalid() {
+        return Err(anyhow!(
+            "CreateNamedPipeW(runner stdin): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let broker = OwnedHandle(server);
+    // Not inheritable at open; only this one handle is flipped below.
+    let client = unsafe {
+        CreateFileW(
+            pcwstr(&name_w),
+            STDIN_CLIENT_ACCESS,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            STDIN_CLIENT_FLAGS,
+            None,
+        )
+    }
+    .context("CreateFileW(runner stdin client end)")?;
+    if client.is_invalid() {
+        return Err(anyhow!(
+            "CreateFileW(runner stdin client end): invalid handle"
+        ));
+    }
+    let runner = OwnedHandle(client);
+    unsafe {
+        SetHandleInformation(runner.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT)
+            .context("SetHandleInformation(runner stdin, inheritable)")?;
     }
     Ok(PipePair { broker, runner })
 }
@@ -194,9 +335,9 @@ pub fn spawn_runner(
     }
 
     let cmd_bytes = crate::runner::encode_cmd(cmd)?;
-    let stdin = make_pipe(false)?;
-    let stdout = make_pipe(true)?;
-    let stderr = make_pipe(true)?;
+    let stdin = make_stdin_pipe().context("runner stdin pipe")?;
+    let stdout = make_output_pipe()?;
+    let stderr = make_output_pipe()?;
 
     // Broker-side per-exec desktop on `WinSta0` with an explicit
     // `[broker, srt-sandbox, SY]:GA` DACL. The broker (interactive
@@ -452,7 +593,104 @@ impl AsRawHandle for std::io::Stderr {
 
 #[cfg(test)]
 mod tests {
-    use super::cwd_drive_root;
+    use super::*;
+    use windows::Win32::Foundation::ERROR_BROKEN_PIPE;
+    use windows::Win32::Security::RevertToSelf;
+    use windows::Win32::System::Pipes::ImpersonateNamedPipeClient;
+
+    #[test]
+    fn stdin_pipe_name_shape() {
+        let n = stdin_pipe_name(1234, &[0xab; 16]);
+        assert_eq!(
+            n,
+            r"\\.\pipe\srt-win-stdin-1234-abababababababababababababababab"
+        );
+        // All 16 bytes land in the name, zero-padded.
+        let mut r = [0u8; 16];
+        r[15] = 0x0f;
+        assert!(stdin_pipe_name(1, &r).ends_with("-0000000000000000000000000000000f"));
+        assert_ne!(stdin_pipe_name(1, &[0; 16]), stdin_pipe_name(1, &r));
+    }
+
+    #[test]
+    fn stdin_pipe_flags() {
+        // Server end: outbound only (bit 0 = inbound access), first
+        // instance, synchronous.
+        assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x3, 0x2);
+        assert_ne!(STDIN_PIPE_OPEN_MODE.0 & 0x0008_0000, 0);
+        assert_eq!(STDIN_PIPE_OPEN_MODE.0 & 0x4000_0000, 0);
+        // Byte stream, blocking, remote clients rejected.
+        assert_eq!(STDIN_PIPE_MODE.0, 0x8);
+        assert_eq!(STDIN_PIPE_MAX_INSTANCES, 1);
+        // Client end: GENERIC_READ + FILE_WRITE_ATTRIBUTES, nothing
+        // that writes data; SQOS present with level ANONYMOUS (the
+        // level lives in bits 16-17) and no context-tracking /
+        // effective-only bits.
+        assert_eq!(STDIN_CLIENT_ACCESS, 0x8000_0100);
+        assert_eq!(STDIN_CLIENT_FLAGS.0, 0x0010_0000);
+    }
+
+    /// The pair behaves like an anonymous pipe for a
+    /// reader — data, then `ERROR_BROKEN_PIPE` once the writer is
+    /// gone — and the reader's end can neither impersonate nor be
+    /// joined by a second client.
+    #[test]
+    fn stdin_pipe_runner_end_is_a_client_end() {
+        let mut rand = [0u8; 16];
+        unsafe { BCryptGenRandom(None, &mut rand, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }
+            .ok()
+            .unwrap();
+        let name = stdin_pipe_name(std::process::id(), &rand);
+        let pipe = make_stdin_pipe_named(&name).unwrap();
+
+        // A client end cannot impersonate.
+        let imp = unsafe { ImpersonateNamedPipeClient(pipe.runner.raw()) };
+        if imp.is_ok() {
+            unsafe { RevertToSelf().unwrap() };
+            panic!("ImpersonateNamedPipeClient succeeded on the runner's stdin end");
+        }
+
+        // The single instance is taken: no second client, and no
+        // second server under the same name.
+        let name_w = wstr(&name);
+        let again = unsafe {
+            CreateFileW(
+                pcwstr(&name_w),
+                STDIN_CLIENT_ACCESS,
+                FILE_SHARE_MODE(0),
+                None,
+                OPEN_EXISTING,
+                STDIN_CLIENT_FLAGS,
+                None,
+            )
+        };
+        assert!(
+            again.is_err(),
+            "a second client connected to the stdin pipe"
+        );
+        assert!(
+            make_stdin_pipe_named(&name).is_err(),
+            "a second server was created under the stdin pipe's name"
+        );
+
+        // Write, close the server end, then read: the bytes arrive,
+        // followed by ERROR_BROKEN_PIPE (what a reader treats as EOF).
+        let payload = b"spec-bytes";
+        let mut wrote = 0u32;
+        unsafe { WriteFile(pipe.broker.raw(), Some(payload), Some(&mut wrote), None) }.unwrap();
+        assert_eq!(wrote as usize, payload.len());
+        drop(pipe.broker);
+        let mut buf = [0u8; 64];
+        let mut read = 0u32;
+        unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) }.unwrap();
+        assert_eq!(&buf[..read as usize], payload);
+        let eof = unsafe { ReadFile(pipe.runner.raw(), Some(&mut buf), Some(&mut read), None) };
+        assert_eq!(
+            eof.unwrap_err().code(),
+            ERROR_BROKEN_PIPE.to_hresult(),
+            "reader must see ERROR_BROKEN_PIPE after the writer closes"
+        );
+    }
 
     #[test]
     fn drive_letter_root() {
