@@ -57,6 +57,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'resolveSrtWin',
   'restoreWindowsAcl',
   'revokeWindowsAcl',
+  'revokeWindowsAclChecked',
   'stampWindowsAcl',
   'uninstallWindowsSandbox',
   'validateCaPair',

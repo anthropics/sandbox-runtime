@@ -317,11 +317,20 @@ enum AclCmd {
     },
     /// Drop the holder's claim on every granted path; remove the
     /// sandbox-user ACE on any path whose refcount falls to zero.
+    ///
+    /// Exits non-zero when any grant could not be released (status
+    /// `unreadable` or `failed`: the ACE may still be on disk and its
+    /// rows are kept for a retry). A caller that goes on to
+    /// `acl restore` must not do so in that case.
     Revoke {
         #[arg(long)]
         holder_pid: u32,
         #[arg(long)]
         sandbox_user_sid: String,
+        /// Emit a single JSON array of per-path `{path, status}`
+        /// objects on stdout. The array is complete — it includes
+        /// the paths that could not be released — and is written
+        /// before a non-zero exit.
         #[arg(long)]
         json: bool,
     },
@@ -344,8 +353,10 @@ enum AclCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Run crash-recovery only: prune dead holders, drop any
-    /// orphaned sandbox-user ACEs.
+    /// Run crash-recovery only: release the holds of dead holders
+    /// (grants first; a holder's deny ACEs are kept while one of its
+    /// grants could not be released) and prune them. Exits non-zero
+    /// when a grant is still pending.
     Recover {
         #[arg(long)]
         force: bool,
@@ -1292,14 +1303,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
                 db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
             })?;
+            // Grants whose ACE may still be on disk (rows kept).
+            let pending: Vec<&str> = entries
+                .iter()
+                .filter(|(_, r)| r.is_pending())
+                .map(|(p, _)| p.as_str())
+                .collect();
             eprintln!(
                 "srt-win: acl revoke — {} path(s){}; recovery \
                  revoked {} orphan grant(s)",
                 entries.len(),
-                if failed > 0 {
-                    format!(", {failed} FAILED (ACE left in place)")
-                } else {
+                if pending.is_empty() {
                     String::new()
+                } else {
+                    format!(", {} NOT RELEASED (ACE left in place)", pending.len())
                 },
                 report.aces_revoked,
             );
@@ -1315,8 +1332,17 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .context("write --json revoke result")?;
                 println!();
             }
-            if failed > 0 {
-                return Err(anyhow!("acl revoke: {failed} path(s) could not be revoked"));
+            if failed > 0 || !pending.is_empty() {
+                return Err(anyhow!(
+                    "acl revoke: {} grant(s) could not be released \
+                     and may still be on disk (rows kept for retry): {}",
+                    pending.len(),
+                    pending
+                        .iter()
+                        .map(|p| format!("'{p}'"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
             }
         }
         Cmd::Acl {
@@ -1385,8 +1411,23 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     json!({
                         "deadBrokers": report.dead_brokers,
                         "acesRevoked": report.aces_revoked,
+                        "grantsPending": report.grants_pending,
                     })
                 );
+            }
+            if !report.grants_pending.is_empty() {
+                return Err(anyhow!(
+                    "acl recover: {} grant(s) could not be released \
+                     and may still be on disk (rows, and their \
+                     holders' deny ACEs, kept for retry): {}",
+                    report.grants_pending.len(),
+                    report
+                        .grants_pending
+                        .iter()
+                        .map(|p| format!("'{p}'"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
             }
         }
 
