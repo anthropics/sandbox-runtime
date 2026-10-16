@@ -125,7 +125,7 @@ function RExec {
   # 120s: a row that starts Windows PowerShell as the sandbox user can take
   # over 30s on some hosted runner images (powershell.exe is CPU-bound in
   # startup the whole time, then finishes). A limit only matters on a hang.
-  param([string[]] $tail, [int] $TimeoutSec = 120)
+  param([string[]] $tail, [int] $TimeoutSec = 120, $Stdin = $null)
   $argv = @('exec',
             '--env', "PATH=$($env:PATH)",
             '--env', "PATHEXT=$($env:PATHEXT)") + $tail
@@ -134,6 +134,7 @@ function RExec {
   $psi.UseShellExecute        = $false
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError  = $true
+  $psi.RedirectStandardInput  = $null -ne $Stdin
   $psi.Environment['SANDBOX_RUNTIME_WIN_DEBUG'] = '1'
   foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
   $p  = [System.Diagnostics.Process]::Start($psi)
@@ -141,6 +142,10 @@ function RExec {
   # WaitForExit.
   $so = $p.StandardOutput.ReadToEndAsync()
   $se = $p.StandardError.ReadToEndAsync()
+  if ($null -ne $Stdin) {
+    $p.StandardInput.Write($Stdin)
+    $p.StandardInput.Close()
+  }
   if (-not $p.WaitForExit($TimeoutSec * 1000)) {
     # Report through the host, not the exception: the error view truncates a
     # long message, and the child's output and the processes it got as far as
@@ -186,6 +191,17 @@ if ($r.raw -notmatch 'R2-STDERR-MARK') {
   throw "R2: stderr marker missing. raw: $($r.raw)"
 }
 Write-Host 'R2 ok: stdout+stderr piped through runner to broker'
+
+# ── R2b: stdin relayed broker → runner → child, through EOF ─────
+# Written before the runner reads its spec and larger than a read
+# buffer, so a runner that over-reads its stdin would drop lines.
+$lines = 1..2000 | ForEach-Object { 'R2B-{0:d4}' -f $_ }
+$r = RExec @('--', $cmd, '/c', 'sort') -Stdin (($lines -join "`r`n") + "`r`n")
+$got = @($r.out -split "`r?`n" | Where-Object { $_ -match '^R2B-\d{4}$' })
+if ($r.exit -ne 0 -or $got.Count -ne $lines.Count -or $got[0] -ne 'R2B-0001') {
+  throw "R2b: expected $($lines.Count) sorted lines back, got $($got.Count) (exit $($r.exit)). raw head: $($r.raw.Substring(0, [Math]::Min(400, $r.raw.Length)))"
+}
+Write-Host 'R2b ok: stdin piped through runner to child, EOF delivered'
 
 # ── R3: exit code propagates broker ← runner ← child ────────────
 $r = RExec @('--', $cmd, '/c', 'exit 23')
