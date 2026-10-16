@@ -1,6 +1,12 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf, wayTo } from '../utils/real-path.js'
+import {
+  bytesOf,
+  realPathOf,
+  spelledBy,
+  wayTo,
+  type PathBytes,
+} from '../utils/real-path.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
@@ -153,6 +159,32 @@ function findSymlinkInPath(
 /** As many missing names as one way is followed up from again. */
 const MAX_MISSING_NAMES_PASSED = 40
 
+/** Where a write deny goes. */
+type DenyLanding = {
+  path: string
+  /** `path` is denied in place of what lies beneath it (see spellableLanding). */
+  standsIn: boolean
+}
+
+/**
+ * `landing`, a path that crosses no link, as far as a mount can be given it.
+ * bubblewrap is handed its arguments as text, so what holds the first name
+ * that is no text stands in for the rest. Denied whole, that keeps everything
+ * beneath it as it is, what is not there yet included.
+ *
+ * INVARIANT: the command can write at `landing` only where it can write at
+ * the stand-in. An allowed write path is text, so one that holds `landing`
+ * ends at or above the stand-in, and none lies beneath the name that is not.
+ */
+function spellableLanding(landing: PathBytes): DenyLanding {
+  const names = landing.split('/').map(spelledBy)
+  const cut = names.indexOf(undefined)
+  return {
+    path: (cut === -1 ? names : names.slice(0, cut)).join('/') || '/',
+    standsIn: cut !== -1,
+  }
+}
+
 /**
  * Canonicalize a deny path through symlinks before any mask or bind is
  * computed (resolve-before-mask). Deny paths regularly contain symlinked
@@ -178,8 +210,11 @@ const MAX_MISSING_NAMES_PASSED = 40
  * A directory on the way that cannot be searched is the answer itself: what
  * lies in it cannot be told, and denied whole it keeps its place and its mode.
  *
- * Returns null when the path cannot be canonicalized (a symlink cycle, a name
- * that is no text). Callers fail closed on it.
+ * A name that is no text is followed like any other, but no mount can be
+ * given it: see spellableLanding.
+ *
+ * Returns null when the path cannot be canonicalized (a symlink cycle).
+ * Callers fail closed on it.
  *
  * Unlike normalizePathForSandbox, this intentionally applies no
  * isSymlinkOutsideBoundary check: that check exists so allow paths can't
@@ -190,9 +225,9 @@ const MAX_MISSING_NAMES_PASSED = 40
 function resolveSymlinkedDenyPath(
   targetPath: string,
   alsoDenied?: string[],
-): string | null {
+): DenyLanding | null {
   try {
-    return realPathOf(targetPath)
+    return { path: realPathOf(targetPath), standsIn: false }
   } catch {
     // Some component is missing or dangling — canonicalize manually below.
   }
@@ -223,21 +258,26 @@ function resolveSymlinkedDenyPath(
   try {
     fs.readlinkSync(path.join(resolvedAncestor, remainder[0]))
   } catch {
-    return rejoined // Not a symlink — nothing left to resolve.
+    // Not a symlink — nothing left to resolve.
+    return { path: rejoined, standsIn: false }
   }
   let why: unknown = 'it goes up from too many names that are not there'
   try {
-    let onward = rejoined
+    let onward = bytesOf(rejoined)
     for (let i = 0; i < MAX_MISSING_NAMES_PASSED; i++) {
       const { real, rest, notThere } = wayTo(onward)
       if ((notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES') {
-        return real || '/'
+        return spellableLanding(real)
       }
       const names = rest.filter(name => name !== '' && name !== '.')
       if (names[1] !== '..') {
-        return [real, ...names.slice(0, 2)].join('/') || '/'
+        return spellableLanding([real, ...names.slice(0, 2)].join('/'))
       }
-      alsoDenied?.push(`${real}/${names[0]}`)
+      // Nothing is put at a missing name that is stood in for, so there the
+      // way does not go on.
+      const missing = spellableLanding(`${real}/${names[0]}`)
+      if (missing.standsIn) return missing
+      alsoDenied?.push(missing.path)
       onward = [real, ...names.slice(2)].join('/')
     }
   } catch (err) {
@@ -2641,8 +2681,12 @@ async function generateFilesystemArgs(
       if (rawPath.startsWith('/dev/')) {
         continue
       }
-      const resolvedPath = resolveSymlinkedDenyPath(rawPath, denyPaths)
-      if (resolvedPath === null || resolvedPath.startsWith('/dev/')) {
+      const landing = resolveSymlinkedDenyPath(rawPath, denyPaths)
+      if (landing === null || landing.path.startsWith('/dev/')) {
+        continue
+      }
+      const resolvedPath = landing.path
+      if (landing.standsIn && !isWithinAnyAllowedWritePath(resolvedPath)) {
         continue
       }
       for (const above of properAncestors(resolvedPath)) {
@@ -2933,8 +2977,8 @@ async function generateFilesystemArgs(
       // symlink) or lands on the target inode anyway (file symlink). Writes
       // through the original symlinked path resolve to the same denied
       // target inside the mount namespace.
-      const normalizedPath = resolveSymlinkedDenyPath(rawPath)
-      if (normalizedPath === null) {
+      const landing = resolveSymlinkedDenyPath(rawPath)
+      if (landing === null) {
         // Unresolvable: a symlink cycle, or a chain past the ELOOP bound.
         // Fail closed. Dropping the deny here would sandbox the command with
         // the path unprotected, so instead mask the symlink component and let
@@ -2955,6 +2999,7 @@ async function generateFilesystemArgs(
         )
         continue
       }
+      const normalizedPath = landing.path
       if (normalizedPath !== rawPath) {
         logForDebugging(
           `[Sandbox Linux] Resolved symlinked deny path: ${rawPath} -> ${normalizedPath}`,
@@ -2966,6 +3011,22 @@ async function generateFilesystemArgs(
       // a bind would either miss or fight the new devtmpfs.
       if (normalizedPath.startsWith('/dev/')) {
         continue
+      }
+
+      // A stand-in is asked whether the command can write there, not whether
+      // it holds a write path as well: those beside what it stands in for are
+      // none of this deny's (see spellableLanding).
+      if (landing.standsIn) {
+        if (!isWithinAnyAllowedWritePath(normalizedPath)) {
+          logForDebugging(
+            `[Sandbox Linux] Skipping deny path not within allowed paths: ${rawPath}, which leads beneath ${normalizedPath}`,
+          )
+          continue
+        }
+        logForDebugging(
+          `[Sandbox Linux] A write to ${rawPath} would land at a name that is no text, which no mount can be given. All of ${normalizedPath}, which holds it, is denied in its place.`,
+          { level: 'warn' },
+        )
       }
 
       // Dedup post-resolution: distinct spellings (tilde vs absolute, via
