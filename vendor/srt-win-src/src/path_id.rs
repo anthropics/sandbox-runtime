@@ -548,6 +548,84 @@ pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
     None
 }
 
+/// Canonical spellings of every REPARSE POINT the LEXICAL spelling
+/// of `path` traverses — including `path` itself when it is one.
+/// Object-attached ACLs mean a deny stamped on the resolved target
+/// covers every route to that object, but not the reparse links the
+/// spelling rode through: re-pointing (or deleting + recreating) a
+/// link makes the spelling resolve to an unstamped object. The
+/// stamp flow locks each returned object with
+/// [`crate::acl::SbAce::DenyReparseLock`].
+///
+/// Walks each absolute-path prefix with a NO-FOLLOW open
+/// (`FILE_FLAG_OPEN_REPARSE_POINT`) and collects the handle-derived
+/// canonical path of every prefix whose attributes carry
+/// `FILE_ATTRIBUTE_REPARSE_POINT`. UNC paths return empty (the
+/// local ACL model does not cover SMB); unresolvable prefixes stop
+/// the walk (the leaf's own canonicalization decides hard errors).
+pub fn reparse_components(path: &str) -> Vec<String> {
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, GetFileAttributesW,
+        INVALID_FILE_ATTRIBUTES,
+    };
+    if is_unc_path(path) {
+        return Vec::new();
+    }
+    let abs = match std::path::absolute(strip_extended_prefix(path)) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let mut prefix = std::path::PathBuf::new();
+    for comp in abs.components() {
+        prefix.push(comp);
+        let Some(pstr) = prefix.to_str() else {
+            return out;
+        };
+        // Drive roots (`C:\`) cannot be reparse points; skip the
+        // syscall noise.
+        if matches!(
+            comp,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        ) {
+            continue;
+        }
+        let w = wstr(pstr);
+        let attrs = unsafe { GetFileAttributesW(pcwstr(&w)) };
+        if attrs == INVALID_FILE_ATTRIBUTES {
+            return out; // prefix unresolvable — leaf canon decides
+        }
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            // Canonical spelling of the LINK OBJECT itself: open
+            // no-follow and derive from the handle, so ancestor
+            // case/8.3 forms normalize identically to every other
+            // stamp target.
+            let h = unsafe {
+                CreateFileW(
+                    pcwstr(&w),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    None,
+                )
+            };
+            let Ok(h) = h else { return out };
+            if h == INVALID_HANDLE_VALUE {
+                return out;
+            }
+            let h = OwnedHandle(h);
+            if let Ok(buf) = final_path_from_handle(h.0)
+                && let Ok(s) = String::from_utf16(&buf)
+            {
+                out.push(strip_extended_prefix(&s).to_string());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
