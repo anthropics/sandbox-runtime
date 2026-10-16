@@ -68,6 +68,33 @@ pub struct RunnerSpec {
     pub env_overlay: Vec<(String, String)>,
 }
 
+/// Sanity cap shared by every length-prefixed stdin frame (the
+/// runner spec, `exec`'s `--env-stdin` overlay). The payloads are a
+/// few KB; anything in the MB range means the two sides of the pipe
+/// are out of sync.
+const FRAME_CAP: usize = 4 * 1024 * 1024;
+
+/// Read one `<u32 LE length><payload>` frame from `r`. The length
+/// prefix lets the reader know where the frame ends without the
+/// writer closing its end. Bytes after the frame stay available to
+/// further reads from the SAME reader — but a buffered reader (e.g.
+/// `Stdin`) may have pulled them into its userland buffer, so they
+/// are not guaranteed to still be in the underlying pipe for a
+/// different handle holder.
+fn read_frame(r: &mut impl Read, what: &str) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)
+        .with_context(|| format!("{what}: read length prefix"))?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > FRAME_CAP {
+        return Err(anyhow!("{what}: length {len} exceeds 4 MiB sanity cap"));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)
+        .with_context(|| format!("{what}: read body"))?;
+    Ok(buf)
+}
+
 /// Read a 4-byte little-endian length prefix followed by that many
 /// bytes of JSON from stdin. The length prefix lets the runner know
 /// when the spec ends without the broker closing the write end
@@ -75,33 +102,71 @@ pub struct RunnerSpec {
 /// future stdin-after-spec use).
 fn read_cmd_from_stdin() -> Result<RunnerCmd> {
     let mut stdin = std::io::stdin().lock();
-    let mut len_buf = [0u8; 4];
-    stdin
-        .read_exact(&mut len_buf)
-        .context("runner: read spec length prefix from stdin")?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    // Sanity cap — the spec is a few KB; anything in the MB range
-    // means the broker/runner are out of sync.
-    if len > 4 * 1024 * 1024 {
+    let buf = read_frame(&mut stdin, "runner: spec")?;
+    serde_json::from_slice(&buf).context("runner: parse spec JSON")
+}
+
+/// Decode the caller→`exec` env-overlay frame (`--env-stdin`):
+/// `<u32 LE length><JSON [[KEY,VALUE],…]>` read from `srt-win
+/// exec`'s **own** stdin. Carries overlay entries whose values embed
+/// the per-session proxy auth token, so the token never appears on
+/// any command line (command lines are freely readable by same-user
+/// sibling processes). Same framing as [`RunnerCmd`]; the writer is
+/// the host's `wrapCommandWithSandboxWindows`.
+pub fn decode_env_frame(r: &mut impl Read) -> Result<Vec<(String, String)>> {
+    let buf = read_frame(r, "exec: --env-stdin overlay")?;
+    serde_json::from_slice(&buf).context("exec: parse --env-stdin overlay JSON")
+}
+
+/// Append a decoded `--env-stdin` frame to the `--env` overlay. The
+/// writer-side invariant is that each key rides EXACTLY ONE channel
+/// (the TS wrapper partitions by key), so a case-insensitive overlap
+/// means the two sides disagree about the contract — fail loudly
+/// instead of silently picking a winner.
+pub fn merge_env_overlay(
+    mut base: Vec<(String, String)>,
+    extra: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>> {
+    let base_keys: std::collections::HashSet<String> =
+        base.iter().map(|(k, _)| k.to_ascii_uppercase()).collect();
+    if let Some((k, _)) = extra
+        .iter()
+        .find(|(k, _)| base_keys.contains(&k.to_ascii_uppercase()))
+    {
         return Err(anyhow!(
-            "runner: spec length {len} exceeds 4 MiB sanity cap"
+            "exec: --env-stdin frame key '{k}' duplicates an --env \
+             argument (case-insensitive) — the caller must put each \
+             key on exactly one channel"
         ));
     }
-    let mut buf = vec![0u8; len];
-    stdin
-        .read_exact(&mut buf)
-        .context("runner: read spec body from stdin")?;
-    serde_json::from_slice(&buf).context("runner: parse spec JSON")
+    base.extend(extra);
+    Ok(base)
+}
+
+/// Frame `json` as `<u32 LE length><payload>` — the single writer-side
+/// definition of the wire format [`read_frame`] consumes.
+fn encode_frame(json: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + json.len());
+    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    out.extend(json);
+    out
+}
+
+/// Serialize env-overlay entries as `<u32 LE length><JSON>` — the
+/// inverse of [`decode_env_frame`]. Test-only: the production writer
+/// is the TS host (`encodeEnvStdinFrame`); this exists so the Rust
+/// tests exercise the same wire shape.
+#[cfg(test)]
+fn encode_env_frame(entries: &[(String, String)]) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec(entries).context("encode env frame")?;
+    Ok(encode_frame(json))
 }
 
 /// Serialize `cmd` as `<u32 LE length><JSON>`. Broker-side helper —
 /// lives here so the wire format has one definition.
 pub fn encode_cmd(cmd: &RunnerCmd) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(cmd).context("runner: encode cmd")?;
-    let mut out = Vec::with_capacity(4 + json.len());
-    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    out.extend_from_slice(&json);
-    Ok(out)
+    Ok(encode_frame(json))
 }
 
 /// Entry point for `srt-win runner`. Reads the command from stdin,
@@ -216,5 +281,92 @@ mod tests {
         assert!(matches!(
             back, RunnerCmd::ProbeEgress { target } if target == "127.0.0.1:49999"
         ));
+    }
+
+    #[test]
+    fn env_frame_roundtrip() {
+        let entries = vec![
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://u:tok-secret@localhost:60080".to_string(),
+            ),
+            (
+                "http_proxy".to_string(),
+                "http://u:tok-secret@localhost:60080".to_string(),
+            ),
+        ];
+        let bytes = encode_env_frame(&entries).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize,
+            bytes.len() - 4
+        );
+        let back = decode_env_frame(&mut &bytes[..]).unwrap();
+        assert_eq!(back, entries);
+    }
+
+    #[test]
+    fn env_frame_leaves_trailing_bytes_unread() {
+        // The frame is self-delimiting: the decoder reads exactly
+        // the prefix + body and leaves later bytes on the reader.
+        let entries = vec![("K".to_string(), "V".to_string())];
+        let mut bytes = encode_env_frame(&entries).unwrap();
+        bytes.extend_from_slice(b"user input after the frame");
+        let mut r = &bytes[..];
+        let back = decode_env_frame(&mut r).unwrap();
+        assert_eq!(back, entries);
+        assert_eq!(r, b"user input after the frame");
+    }
+
+    #[test]
+    fn merge_env_overlay_appends_disjoint_and_rejects_overlap() {
+        let base = vec![("PATH".to_string(), "C:\\bin".to_string())];
+        let extra = vec![(
+            "HTTPS_PROXY".to_string(),
+            "http://u:tok@localhost:60080".to_string(),
+        )];
+        let merged = merge_env_overlay(base.clone(), extra.clone()).unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                ("PATH".to_string(), "C:\\bin".to_string()),
+                (
+                    "HTTPS_PROXY".to_string(),
+                    "http://u:tok@localhost:60080".to_string()
+                ),
+            ]
+        );
+
+        // Case-insensitive overlap = writer-side contract violation.
+        let overlapping_base = vec![
+            ("PATH".to_string(), "C:\\bin".to_string()),
+            (
+                "https_proxy".to_string(),
+                "http://localhost:60080".to_string(),
+            ),
+        ];
+        let e = merge_env_overlay(overlapping_base, extra).unwrap_err();
+        assert!(format!("{e:#}").contains("exactly one channel"), "{e:#}");
+    }
+
+    #[test]
+    fn env_frame_rejects_oversize_and_truncated() {
+        // Length over the 4 MiB cap → rejected before allocation.
+        let mut oversize = Vec::new();
+        oversize.extend_from_slice(&(5u32 * 1024 * 1024).to_le_bytes());
+        let e = decode_env_frame(&mut &oversize[..]).unwrap_err();
+        assert!(format!("{e:#}").contains("sanity cap"), "{e:#}");
+
+        // Truncated body → read error, not a hang or partial parse.
+        let entries = vec![("K".to_string(), "V".to_string())];
+        let bytes = encode_env_frame(&entries).unwrap();
+        let e = decode_env_frame(&mut &bytes[..bytes.len() - 1]).unwrap_err();
+        assert!(format!("{e:#}").contains("read body"), "{e:#}");
+
+        // Valid frame, garbage JSON → parse error.
+        let mut garbage = Vec::new();
+        garbage.extend_from_slice(&3u32.to_le_bytes());
+        garbage.extend_from_slice(b"nop");
+        let e = decode_env_frame(&mut &garbage[..]).unwrap_err();
+        assert!(format!("{e:#}").contains("parse"), "{e:#}");
     }
 }
