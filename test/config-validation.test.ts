@@ -918,6 +918,75 @@ describe('Config Validation', () => {
       }
     })
 
+    describe('injectInto', () => {
+      const withEnv = (entry: Record<string, unknown>) =>
+        SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['api.github.com'],
+            deniedDomains: [],
+            tlsTerminate: {},
+          },
+          credentials: {
+            envVars: [{ name: 'GH_TOKEN', mode: 'mask', ...entry }],
+          },
+        })
+
+      test('accepts headers, body and named headers', () => {
+        expect(withEnv({ injectInto: ['header:authorization'] }).success).toBe(
+          true,
+        )
+        expect(withEnv({ injectInto: ['header:X-Api-Key'] }).success).toBe(true)
+        expect(withEnv({ injectInto: ['headers', 'body'] }).success).toBe(true)
+      })
+
+      test('accepts it on a masked file', () => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: {
+            allowedDomains: ['api.github.com'],
+            deniedDomains: [],
+            tlsTerminate: {},
+          },
+          credentials: {
+            files: [
+              {
+                path: '~/.config/gh/token',
+                mode: 'mask',
+                injectInto: ['header:authorization'],
+              },
+            ],
+          },
+        })
+        expect(result.success).toBe(true)
+      })
+
+      test('rejects what is not a place in a request', () => {
+        for (const bad of [
+          'header:',
+          'header:a b',
+          'cookie',
+          'url',
+          'Headers',
+        ]) {
+          expect(withEnv({ injectInto: [bad] }).success).toBe(false)
+        }
+      })
+
+      test('rejects an explicitly empty list', () => {
+        const result = withEnv({ injectInto: [] })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          const messages = result.error.issues.map(i => i.message).join('\n')
+          expect(messages).toContain('injectInto is explicitly empty')
+        }
+      })
+
+      test('is ignored, empty or not, on a deny entry', () => {
+        expect(withEnv({ mode: 'deny', injectInto: [] }).success).toBe(true)
+      })
+    })
+
     test('rejects per-entry file injectHosts not reachable via allowedDomains', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
