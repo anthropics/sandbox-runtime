@@ -152,7 +152,8 @@ enum Cmd {
     },
     /// Print `{user: <user-status>, wfp: <wfp-status>}` as one line
     /// of JSON — the same objects `user status` and `wfp status`
-    /// emit, in a single spawn. The host's readiness check calls
+    /// emit (so Secondary Logon readiness is `user.seclogon`), in a
+    /// single spawn. The host's readiness check calls
     /// this instead of two separate subprocesses. Exit 0.
     Status {
         #[arg(long)]
@@ -197,7 +198,11 @@ enum Cmd {
     /// (TS `generateProxyEnvVars`) and passed here via `--env`.
     ///
     /// Requires `srt-win install` to have provisioned the user;
-    /// otherwise exits **15**.
+    /// otherwise exits **15**. Typed launch failures print one line
+    /// of JSON `{"code":…,"message":…}` to stderr and exit with a
+    /// dedicated code: **16** `mapped_drive_cwd`, **18**
+    /// `seclogon_disabled` (the Secondary Logon service is disabled
+    /// or absent).
     Exec {
         /// Per-exec read-deny: add an additive `(D;OICI;FA;;;<sb>)`
         /// ACE for the sandbox user on `<PATH>` (and a parent
@@ -252,7 +257,10 @@ enum UserCmd {
     /// `{user: {exists, sid?, group_exists, group_sid?,
     /// in_builtin_users, in_sandbox_group, hidden_from_logon},
     /// cred_present, marker_version?, marker_user_sid?,
-    /// ca_cert_thumb?, ca_cert_pem?}`.
+    /// ca_cert_thumb?, ca_cert_pem?, seclogon}`. `seclogon` is the
+    /// Secondary Logon service every launch depends on:
+    /// `"ok"|"disabled"|"missing"|"cannot-read"` (read-only SCM
+    /// query — see `logon::seclogon_state`).
     Status,
     /// Print the sandbox user's decrypted password (and only the
     /// password) to stdout. The broker uses this for
@@ -266,7 +274,9 @@ enum UserCmd {
     /// has a separate lifecycle from `srt-win install` — install
     /// provisions the account/filters and never touches the CA;
     /// this is the only command that sets it. Does NOT require
-    /// elevation. Persistent until `srt-win uninstall`.
+    /// elevation. Persistent until `srt-win uninstall`. Exits
+    /// **18** (with the `seclogon_disabled` JSON line on stderr)
+    /// when the Secondary Logon service is disabled or absent.
     TrustCa {
         /// PEM- or DER-encoded CA certificate file.
         #[arg(value_name = "PATH")]
@@ -585,7 +595,40 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         "real_user_sid": srt_win::sid::current_user_sid()?,
         "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
         "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
+        // Secondary Logon readiness: the launch needs the service
+        // as much as it needs the account and credential above.
+        "seclogon": srt_win::logon::seclogon_state(),
     }))
+}
+
+/// Exit code for a launch that failed because the Secondary Logon
+/// service is disabled or absent ([`srt_win::logon::SeclogonDisabled`])
+/// — shared by `exec`, `wfp verify` and `user trust-ca`, the three
+/// commands that spawn the runner.
+const EXIT_SECLOGON_DISABLED: i32 = 18;
+
+/// The one-line stderr JSON for a `logon::spawn_runner` failure
+/// caused by [`srt_win::logon::SeclogonDisabled`], or `None` for
+/// any other error. Sees through `.context(…)` layers, so callers
+/// can pass the error as they received it.
+fn seclogon_error_json(e: &anyhow::Error) -> Option<serde_json::Value> {
+    let s = e.downcast_ref::<srt_win::logon::SeclogonDisabled>()?;
+    Some(serde_json::json!({
+        "code": "seclogon_disabled",
+        "state": s.state(),
+        "message": s.to_string(),
+    }))
+}
+
+/// Emit the [`seclogon_error_json`] line and exit
+/// [`EXIT_SECLOGON_DISABLED`] when `e` is that typed failure;
+/// otherwise hand `e` back unchanged for the caller's own handling.
+fn exit_if_seclogon_disabled(e: anyhow::Error) -> anyhow::Error {
+    if let Some(j) = seclogon_error_json(&e) {
+        eprintln!("{j}");
+        std::process::exit(EXIT_SECLOGON_DISABLED);
+    }
+    e
 }
 
 /// Install-time ambient write-deny state: the recorded paths (HKLM
@@ -689,8 +732,10 @@ enum WfpCmd {
     /// Prints `{"egress_probe":"blocked"|"connected"|"unreachable",
     /// "target":…}` and exits **0** (blocked = fence active),
     /// **3** (connected = fence MISSING), **2** (unreachable =
-    /// timeout/no-route; treat as failure), or **15** when the
-    /// sandbox user is not provisioned. Any other code (including
+    /// timeout/no-route; treat as failure), **15** when the
+    /// sandbox user is not provisioned, or **18** (no stdout; the
+    /// `seclogon_disabled` JSON line on stderr) when the Secondary
+    /// Logon service is disabled or absent. Any other code (including
     /// 1, the runner's own anyhow `Err` path) maps to
     /// `egress_probe:"error"`. Does not require elevation. This
     /// is the non-elevated readiness check the host's
@@ -1047,7 +1092,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let sb_sid = install::read_setup()?
                 .ok_or_else(|| anyhow!("sandbox user not provisioned"))?
                 .sandbox_user_sid;
-            install::trust_ca(&der, &cred, &sb_sid)?;
+            install::trust_ca(&der, &cred, &sb_sid).map_err(exit_if_seclogon_disabled)?;
             eprintln!(
                 "srt-win: CA installed into sandbox-user Root \
                  (thumb={})",
@@ -1096,6 +1141,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 },
                 false,
             )
+            .map_err(exit_if_seclogon_disabled)
             .context("spawn runner for egress probe")?;
             let probe = match code {
                 0 => "blocked",
@@ -1561,6 +1607,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             ) {
                 Ok(c) => c,
                 Err(e) => {
+                    // Secondary Logon disabled/absent (see
+                    // `logon::SeclogonDisabled`): same one-line
+                    // JSON shape as below, exit 18. The per-exec
+                    // restore runs first — `process::exit` skips
+                    // destructors.
+                    if let Some(j) = seclogon_error_json(&e) {
+                        eprintln!("{j}");
+                        drop(per_exec_guard);
+                        std::process::exit(EXIT_SECLOGON_DISABLED);
+                    }
                     // Mapped/network-drive cwd (see
                     // `logon::MappedDriveCwd`): emit a one-line
                     // JSON error the TS caller can parse and exit
@@ -1797,6 +1853,32 @@ mod tests {
         assert!(
             Cli::try_parse_from(["srt-win.exe", SRT_WIN_DISPATCH_ARG1, "user", "status",]).is_err()
         );
+    }
+
+    /// A `SeclogonDisabled` from `logon::spawn_runner` maps to the
+    /// typed stderr JSON whether or not a caller wrapped it in
+    /// `.context(…)` (`wfp verify` and `install::trust_ca` do);
+    /// any other error is left for the generic exit-1 path.
+    #[test]
+    fn seclogon_error_json_shape() {
+        use srt_win::logon::SeclogonDisabled;
+        let bare = anyhow::Error::from(SeclogonDisabled { missing: false });
+        assert_eq!(
+            seclogon_error_json(&bare).expect("typed"),
+            serde_json::json!({
+                "code": "seclogon_disabled",
+                "state": "disabled",
+                "message": SeclogonDisabled { missing: false }.to_string(),
+            }),
+        );
+        let wrapped = anyhow::Error::from(SeclogonDisabled { missing: true })
+            .context("spawn runner for CA install");
+        assert_eq!(
+            seclogon_error_json(&wrapped).expect("typed through context")["state"],
+            "missing",
+        );
+        assert!(seclogon_error_json(&anyhow::anyhow!("CreateProcessWithLogonW: other")).is_none());
+        assert_eq!(EXIT_SECLOGON_DISABLED, 18);
     }
 
     /// Top-level `status` parses with and without `--sublayer-guid`.
