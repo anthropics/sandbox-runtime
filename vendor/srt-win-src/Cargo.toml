@@ -13,6 +13,15 @@ path = "src/lib.rs"
 name = "srt-win"
 path = "src/main.rs"
 
+[features]
+# Test-only fault injection for the CI smokes (the write-intent
+# journal's kill-before-DACL-write hook in `state_db.rs`). OFF by
+# default and never enabled for a shipped binary: `vendor/srt-win/
+# build.ts` (release) and the default CI build use plain
+# `cargo build --release`; only the smoke's second, hooks-only
+# binary is built with `--features test-hooks`.
+test-hooks = []
+
 [target.'cfg(windows)'.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

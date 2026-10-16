@@ -81,10 +81,14 @@ import {
   parseWindowsBinShell,
   expandWindowsFsPaths,
   rankWindowsFsAccess,
-  stampWindowsAcl,
+  stampWindowsAclAsync,
   restoreWindowsAcl,
-  grantWindowsAcl,
-  revokeWindowsAcl,
+  restoreWindowsAclAsync,
+  grantWindowsAclAsync,
+  revokeWindowsAclChecked,
+  revokeWindowsAclCheckedAsync,
+  windowsAclIncompleteRevoke,
+  type WindowsAclRevokeResult,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
@@ -208,6 +212,46 @@ let windowsWfpVerified = false
 // and so reset()'s revoke/restore addresses the SAME binary the
 // grants/stamps were applied with even if `config` mutated between.
 let srtWinSpawn: SrtWinSpawn | undefined
+// `windows.aclTimeoutMs` captured at initialize() — reset() uses the
+// budget the session was applied with.
+let windowsAclTimeoutMs: number | undefined
+// Per-call bound for the SYNCHRONOUS revoke/restore the exit/signal
+// handler runs (`releaseWindowsAclSync`). Deliberately not
+// `windows.aclTimeoutMs` and not the 10-minute default: that budget
+// is for calls the host awaits, while this one blocks process exit,
+// which must stay bounded.
+//
+// What a release killed at this bound leaves behind (srt-win's
+// `state_db.rs`): holds on paths it had not reached yet keep their
+// rows, and the next `srt-win acl` call of any session reaps them
+// once it sees this holder dead (`crash_recovery`). The path it was
+// walking is NOT covered: `release_row` deletes the row before the
+// on-disk converge, so recovery has no row left to find, and
+// descendants the walk had not reached keep their inherited
+// sandbox-user ACEs until a later grant/stamp + release of that same
+// path runs to completion. That residue is accepted here in exchange
+// for a bounded exit; it is not self-healing.
+const WINDOWS_ACL_EXIT_TIMEOUT_MS = 60_000
+// Set while an async `srt-win acl` sequence (initialize()'s
+// grant→stamp, or a revoke→restore) is running. It carries what a
+// process-exit handler needs to stop the in-flight child and release
+// synchronously — see `releaseWindowsAclSync`.
+let windowsAclInFlight:
+  | {
+      sandboxUserSid: string
+      srtWin: SrtWinSpawn | undefined
+      abort: AbortController
+    }
+  | undefined
+// initialize()'s grant→stamp. wrapWithSandboxArgv awaits it so no
+// command is wrapped before both have resolved (and rejects with the
+// same error if they failed).
+let windowsAclApply: Promise<void> | undefined
+// The latest revoke→restore. initialize() awaits it before granting:
+// both key on this process's holder PID, so a late revoke/restore
+// would silently strip the ACEs (deny stamps included) of the session
+// that started after it.
+let windowsAclTeardown: Promise<void> | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
@@ -228,12 +272,18 @@ function registerCleanup(): void {
   if (cleanupRegistered) {
     return
   }
-  const cleanupHandler = () =>
-    reset().catch(e => {
+  const cleanupHandler = () => {
+    // 'exit' cannot await, and a host commonly calls process.exit()
+    // straight after SIGINT/SIGTERM — so the Windows ACEs are
+    // released synchronously here, before reset()'s async teardown
+    // (which then finds nothing left to release).
+    releaseWindowsAclSync()
+    return reset().catch(e => {
       logForDebugging(`Cleanup failed in registerCleanup ${e}`, {
         level: 'error',
       })
     })
+  }
   process.once('exit', () => {
     void cleanupHandler()
     // On 'exit' reset() gets as far as its first await, so what it takes out
@@ -257,6 +307,161 @@ function registerCleanup(): void {
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
   cleanupRegistered = true
+}
+
+// 'restored'/'alreadyOriginal' are the pre- same-user-removal
+// srt-win's success vocabulary; 'revoked'/'stillHeld' are the
+// post-. Either is non-anomalous.
+const WINDOWS_ACL_RELEASE_OK = new Set([
+  'revoked',
+  'stillHeld',
+  'restored',
+  'alreadyOriginal',
+])
+
+function logWindowsAclOutcomes(
+  kind: string,
+  outcomes: readonly { path: string; status: string }[] | undefined,
+): void {
+  for (const e of outcomes ?? []) {
+    if (!WINDOWS_ACL_RELEASE_OK.has(e.status)) {
+      logForDebugging(
+        `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
+          `ACE may be left in place; resolve and run ` +
+          `\`srt-win acl recover\` to clear`,
+        { level: 'warn' },
+      )
+    }
+  }
+}
+
+/**
+ * The release-ordering gate, shared by every release path: the deny
+ * restore runs only after a revoke that COMPLETED, and never again in
+ * this process once one did not. Returns whether it may run.
+ *
+ * Revoke takes the ALLOW grants off, restore takes the DENY stamps
+ * off. If the revoke failed, timed out, was only partial, or reported
+ * a path whose grant it could not release, an ALLOW grant may still
+ * be on disk — and the sandbox account is shared by every session, so
+ * with the stamps gone another session's sandboxed process could
+ * write this tree's deny targets (`.git/hooks`, settings files, …).
+ * So the stamps stay: they name only the sandbox account's SID and
+ * cost the real user nothing.
+ *
+ * The refusal lasts for the process: a later session's revoke that
+ * finds nothing left to release does not show the earlier grant is
+ * gone (an older srt-win forgets a path it could not open), so every
+ * later reset() keeps its stamps too.
+ *
+ * What clears them afterwards depends on the srt-win in use. A
+ * current one keeps the rows of a grant it could not release, held by
+ * this process; once this process has exited, any `srt-win acl`
+ * command retries those grants and takes this process's deny stamps
+ * off only when all of them are released. An older one has already
+ * dropped the row of such a grant: its crash recovery then removes
+ * the deny stamps once this process is gone, and the leftover ALLOW
+ * entry is recorded nowhere and has to be removed by hand.
+ */
+function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
+  logWindowsAclOutcomes('grant revoke', revoke.outcomes)
+  const earlier = windowsAclIncompleteRevoke()
+  if (revoke.complete && earlier === undefined) return true
+  const paths = [...new Set([...revoke.pending, ...(earlier ?? [])])]
+  logForDebugging(
+    `[Sandbox Windows] ` +
+      (revoke.complete
+        ? `an earlier grant revoke in this process did not complete`
+        : `grant revoke did not complete`) +
+      ` — NOT running the deny restore; deny ACEs stay in place ` +
+      `while a grant may still be on disk. Grants possibly left in ` +
+      `place: ${paths.length > 0 ? paths.map(p => `'${p}'`).join(', ') : '(none reported)'}` +
+      (revoke.detail ? `. srt-win: ${revoke.detail}` : '') +
+      `. After this process exits, \`srt-win acl recover\` retries ` +
+      `the grants still recorded for it and removes its deny ACEs ` +
+      `once they are released (it exits non-zero while one is not). ` +
+      `A listed path that still shows an ALLOW entry for the sandbox ` +
+      `account after that is no longer recorded; remove the entry by ` +
+      `hand.`,
+    { level: 'error' },
+  )
+  return false
+}
+
+/**
+ * Run `fn` (an async `srt-win acl` sequence) with
+ * {@link windowsAclInFlight} set, so an exit during it is released
+ * synchronously by {@link releaseWindowsAclSync}.
+ */
+async function withWindowsAclInFlight<T>(
+  sandboxUserSid: string,
+  srtWin: SrtWinSpawn | undefined,
+  fn: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const mine = { sandboxUserSid, srtWin, abort: new AbortController() }
+  windowsAclInFlight = mine
+  try {
+    return await fn(mine.abort.signal)
+  } finally {
+    if (windowsAclInFlight === mine) windowsAclInFlight = undefined
+  }
+}
+
+/**
+ * Async release of one session's sandbox-user ACEs: revoke, then —
+ * only if that completed, see {@link windowsAclRestoreAllowed} —
+ * restore. Never rejects (both helpers are best-effort); anomalies
+ * are logged.
+ */
+function releaseWindowsAclAsync(
+  sandboxUserSid: string,
+  srtWin: SrtWinSpawn | undefined,
+  timeoutMs: number | undefined,
+): Promise<void> {
+  return withWindowsAclInFlight(sandboxUserSid, srtWin, async signal => {
+    const o = { sandboxUserSid, srtWin, timeoutMs, signal }
+    const revoked = windowsAclRestoreAllowed(
+      await revokeWindowsAclCheckedAsync(o),
+    )
+    // An abort means the exit-time sync release has taken over.
+    if (signal.aborted || !revoked) return
+    logWindowsAclOutcomes('deny restore', await restoreWindowsAclAsync(o))
+  })
+}
+
+/**
+ * Synchronous release for contexts that cannot await: the process
+ * 'exit' handler (and SIGINT/SIGTERM, which hosts usually follow with
+ * process.exit()). `spawnSync`-blocks, each call bounded by
+ * {@link WINDOWS_ACL_EXIT_TIMEOUT_MS} (see there for what a release
+ * cut off at that bound leaves behind). Covers both a fully applied
+ * session and an async ACL sequence that is still running: that
+ * child is killed first (it would die with the process anyway), then
+ * revoke and — only if it completed — restore run here. That fully undoes a killed grant/stamp
+ * (their rows are recorded before the walk). A killed revoke/restore
+ * is not redone for the path it was walking — its row is already
+ * gone — so the same residue as a timed-out release applies.
+ */
+function releaseWindowsAclSync(): void {
+  const inFlight = windowsAclInFlight
+  const target =
+    inFlight ??
+    (windowsFsStampedSet && windowsFsSbUserSid
+      ? { sandboxUserSid: windowsFsSbUserSid, srtWin: srtWinSpawn }
+      : undefined)
+  if (!target) return
+  inFlight?.abort.abort()
+  windowsAclInFlight = undefined
+  // Cleared so the async reset() that follows releases nothing twice.
+  windowsFsStampedSet = undefined
+  windowsFsSbUserSid = undefined
+  const o = {
+    sandboxUserSid: target.sandboxUserSid,
+    srtWin: target.srtWin,
+    timeoutMs: WINDOWS_ACL_EXIT_TIMEOUT_MS,
+  }
+  if (!windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) return
+  logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
 }
 
 /**
@@ -1066,8 +1271,23 @@ async function initializeSteps(
         )
       }
     }
-    // Filesystem grants/denies — additive sandbox-user ACEs.
-    try {
+    // Filesystem grants/denies — additive sandbox-user ACEs. Async
+    // spawns: granting a large tree is linear in its file count, and a
+    // blocking spawn here froze the host's event loop for the whole
+    // walk. `windowsAclApply` is what keeps wrapWithSandboxArgv from
+    // handing out a command before grant AND stamp have resolved.
+    const aclTimeoutMs = runtimeConfig.windows?.aclTimeoutMs
+    // What the failure path below must release. Held locally: a
+    // reset() racing this clears the module-level SID.
+    let appliedSid: string | undefined
+    // The exit-time sync release killed the in-flight call and has
+    // already run revoke/restore itself.
+    let releasedAtExit = false
+    const apply = (async () => {
+      // A previous session's revoke/restore may still be walking the
+      // tree (e.g. the un-awaited reset() of a failed initialize()).
+      // It addresses the same holder PID, so let it finish first.
+      await windowsAclTeardown
       let maskedFiles: string[] = []
       try {
         maskedFiles = windowsMaskedFileDenies(
@@ -1107,26 +1327,40 @@ async function initializeSteps(
       // Record module-level state BEFORE the first acl call so the
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
-      windowsFsSbUserSid = sb
-      // Grant FIRST so the sandbox user has working-tree access by
-      // the time the deny stamp runs. The two are independent
-      // refcounted state-DB sets keyed on the same holder PID.
-      if (grantRead.length > 0 || acc.grantWrite.length > 0) {
-        grantWindowsAcl({
-          sandboxUserSid: sb,
-          read: grantRead,
-          write: acc.grantWrite,
-          srtWin,
-        })
-      }
-      if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
-        stampWindowsAcl({
-          sandboxUserSid: sb,
-          denyRead: acc.denyRead,
-          denyWrite: acc.denyWrite,
-          srtWin,
-        })
-      }
+      windowsFsSbUserSid = appliedSid = sb
+      windowsAclTimeoutMs = aclTimeoutMs
+      await withWindowsAclInFlight(sb, srtWin, async signal => {
+        signal.addEventListener('abort', () => (releasedAtExit = true))
+        // Grant FIRST so the sandbox user has working-tree access by
+        // the time the deny stamp runs. The two are independent
+        // refcounted state-DB sets keyed on the same holder PID.
+        if (grantRead.length > 0 || acc.grantWrite.length > 0) {
+          // initialize() has no progress callback, so the debug log
+          // is the only channel for "this may take a while".
+          logForDebugging(
+            `[Sandbox Windows] applying filesystem permissions to ` +
+              `${[...acc.grantWrite, ...grantRead].join(', ')}…`,
+          )
+          await grantWindowsAclAsync({
+            sandboxUserSid: sb,
+            read: grantRead,
+            write: acc.grantWrite,
+            srtWin,
+            timeoutMs: aclTimeoutMs,
+            signal,
+          })
+        }
+        if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
+          await stampWindowsAclAsync({
+            sandboxUserSid: sb,
+            denyRead: acc.denyRead,
+            denyWrite: acc.denyWrite,
+            srtWin,
+            timeoutMs: aclTimeoutMs,
+            signal,
+          })
+        }
+      })
       // Only record when something was actually applied — gates
       // running revoke/restore at reset(). Recorded AFTER success —
       // the catch below clears `config`, and a non-undefined
@@ -1148,17 +1382,24 @@ async function initializeSteps(
         )
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
-    } catch (e) {
+    })().catch(async e => {
       // Best-effort release of whatever WAS applied before the
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
-      if (windowsFsSbUserSid) {
-        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
-        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
+      // Awaited, so initialize() rejects only once the cleanup has
+      // run.
+      if (appliedSid && !releasedAtExit) {
+        await releaseWindowsAclAsync(appliedSid, srtWin, aclTimeoutMs)
       }
       windowsFsSbUserSid = undefined
       config = undefined
       throw e
+    })
+    windowsAclApply = apply
+    try {
+      await apply
+    } finally {
+      if (windowsAclApply === apply) windowsAclApply = undefined
     }
   }
 
@@ -2433,6 +2674,11 @@ async function wrapWithSandboxArgv(
   const platform = getPlatform()
 
   if (platform === 'windows') {
+    // initialize() still applying the session ACLs: wait for grant
+    // and stamp to resolve; rethrows the init error if they failed.
+    if (windowsAclApply) {
+      await windowsAclApply
+    }
     const hasNetworkConfig =
       customConfig?.network?.allowedDomains !== undefined ||
       config?.network?.allowedDomains !== undefined
@@ -2757,37 +3003,32 @@ function forceCloseHttpServer(
 async function reset(): Promise<void> {
   // Windows: release this session's sandbox-user ACEs. Best-effort
   // — log anomalies rather than throw, so teardown always
-  // completes. Leftover ACEs are recoverable later via
-  // `srt-win acl recover` (which sweeps by trustee SID).
+  // completes. ACEs still recorded for this process are released by
+  // srt-win's crash recovery once it has exited.
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
-    // Captured at initialize() — the SAME binary the grants/stamps
-    // were applied with, immune to `config` mutation between.
+    // Captured at initialize() — the SAME binary (and timeout) the
+    // grants/stamps were applied with, immune to `config` mutation
+    // between.
     const srtWin = srtWinSpawn
-    // 'restored'/'alreadyOriginal' are the pre- same-user-removal
-    // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
-    // post-. Either is non-anomalous.
-    const ok = new Set(['revoked', 'stillHeld', 'restored', 'alreadyOriginal'])
-    const log = (kind: string, e: { path: string; status: string }) => {
-      if (!ok.has(e.status)) {
-        logForDebugging(
-          `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
-            `ACE may be left in place; resolve and run ` +
-            `\`srt-win acl recover\` to clear`,
-          { level: 'warn' },
-        )
-      }
-    }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('grant revoke', e)
-    }
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('deny restore', e)
-    }
+    const timeoutMs = windowsAclTimeoutMs
+    // Async spawns (the walk is as long as the grant's was), chained
+    // so two releases never overlap. Started here and awaited at the
+    // very end: the rest of this teardown, and the module state it
+    // clears, keep the timing they had when the release was a
+    // blocking call. initialize() waits on `windowsAclTeardown`
+    // before it grants again.
+    const teardown: Promise<void> = (windowsAclTeardown ?? Promise.resolve())
+      .then(() => releaseWindowsAclAsync(sb, srtWin, timeoutMs))
+      .finally(() => {
+        if (windowsAclTeardown === teardown) windowsAclTeardown = undefined
+      })
+    windowsAclTeardown = teardown
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  windowsAclTimeoutMs = undefined
   srtWinSpawn = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
@@ -2892,6 +3133,9 @@ async function reset(): Promise<void> {
   commandTextsByKey.clear()
   commandNetworkListsByKey.clear()
   maskedFileStore.dispose()
+
+  // Windows: reset() resolves only once revoke and restore have run.
+  await windowsAclTeardown
 }
 
 function getSandboxViolationStore() {

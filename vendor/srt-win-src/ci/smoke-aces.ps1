@@ -11,7 +11,13 @@
 #>
 param(
   [Parameter(Mandatory = $true, Position = 0)]
-  [string] $Exe
+  [string] $Exe,
+  # A second srt-win.exe built with `--features test-hooks` (fault
+  # injection compiled in). Used ONLY for A33's killed revoke; every
+  # other invocation, A33's recovery included, runs the default
+  # build in $Exe. Omitted → A33 is skipped.
+  [Parameter(Position = 1)]
+  [string] $HooksExe
 )
 
 $ErrorActionPreference = 'Stop'
@@ -360,7 +366,7 @@ try {
   # canonical paths, but `ace_holders` is PATH-keyed. A Deny on
   # one alias is invisible to a holder of another — releasing it
   # would write the SHARED DACL back without the deny while the
-  # other holder's child is still running. `ensure_ace` refuses
+  # other holder's child is still running. `record_ace` refuses
   # `links > 1` for ALL Deny callers (per-exec and session-level
   # `acl stamp` alike — no `refuse_escalation` distinction under
   # the additive-ACE model).
@@ -384,7 +390,7 @@ try {
   }
   # (b) session-level `acl stamp` on the original → ALSO refused.
   #     (Same chokepoint; under the additive-ACE model session
-  #     stamps go through ensure_ace too.)
+  #     stamps go through record_ace too.)
   $b30 = (ConvertTo-Json -Compress @{ denyWrite = @($f30) }) `
          | & $Exe acl stamp --holder-pid $PID `
                   --sandbox-user-sid $sbSid 2>&1 | Out-String
@@ -489,6 +495,255 @@ try {
   }
   $a.RemoveAccessRule($rule) | Out-Null; Set-Acl $unw $a
   Write-Host 'A31(e) ok: broker-unwritable deny target soft-drops'
+
+  # ── A34: one DACL write per path per batch; no write when converged ─
+  # The session-init shape on a tree big enough for propagation to
+  # show: grant the root, then stamp a root-level deny plus two
+  # denies under a MISSING `.claude` (placeholder dir). Writing a
+  # directory DACL re-propagates to every descendant, so the root
+  # must be written ONCE by the grant and ONCE by the stamp (which
+  # adds its parent-FDC deny) — not once per deny/placeholder entry —
+  # and a repeat of the identical grant + stamp must write neither
+  # directory at all. Asserted on the `dacl write|unchanged` debug
+  # lines (SANDBOX_RUNTIME_WIN_DEBUG), not on wall-clock; the timings
+  # are printed for the log.
+  $big = Join-Path $Root 'a34'
+  foreach ($d in 0..59) {
+    $dd = Join-Path $big ('d{0:d2}' -f $d)
+    New-Item -ItemType Directory -Path $dd | Out-Null
+    foreach ($f in 0..49) {
+      [System.IO.File]::WriteAllText((Join-Path $dd ('f{0:d2}.txt' -f $f)), 'x')
+    }
+  }
+  $deep34   = Join-Path $big 'd59\f49.txt'
+  $mcp34    = Join-Path $big '.mcp.json'
+  $claude34 = Join-Path $big '.claude'
+  'A34-DEEP' | Set-Content -Encoding ASCII $deep34
+  '{}' | Set-Content -Encoding ASCII $mcp34
+  $deny34 = @($mcp34, (Join-Path $claude34 'settings.json'),
+              (Join-Path $claude34 'settings.local.json'))
+  if (Test-Path $claude34) { throw 'A34 pre: .claude already exists' }
+
+  # Run an stdin-fed acl op; return its combined output + elapsed ms.
+  function Timed34 { param([string] $op, [hashtable] $body, [int] $HolderPid)
+    $j  = ConvertTo-Json -Compress -Depth 4 $body
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $raw = $j | & $Exe acl $op --holder-pid $HolderPid `
+                     --sandbox-user-sid $sbSid 2>&1 | Out-String
+    $sw.Stop()
+    Write-Host -NoNewline $raw
+    if ($LASTEXITCODE -ne 0) { throw "A34: acl $op exited ${LASTEXITCODE}: $raw" }
+    return [pscustomobject]@{ raw = $raw; ms = $sw.ElapsedMilliseconds }
+  }
+  # How many `dacl write|unchanged` debug lines name exactly $path. Matched
+  # on the scratch-relative tail so the `\\?\` canonical prefix
+  # and drive-letter case don't matter; the closing quote keeps
+  # `…\a34` from matching `…\a34\.claude`.
+  $rootLeaf34 = Split-Path $Root -Leaf
+  function Dacl34 { param([string] $raw, [string] $what, [string] $path)
+    $tail = $rootLeaf34 + $path.Substring($Root.Length)
+    $pat  = "srt-win: debug: dacl $what '[^']*" + [regex]::Escape($tail) + "'"
+    return [regex]::Matches($raw, $pat, 'IgnoreCase').Count
+  }
+  # The sandbox user's ACEs on $path, in DACL order, as
+  # `Deny|Allow:<hex mask>:<inheritance flags>`.
+  function SbAces34 { param([string] $path, [bool] $Inherited, [switch] $NoFlags)
+    (Get-Acl $path).Access | Where-Object {
+      $_.IsInherited -eq $Inherited -and
+      $_.IdentityReference.Translate(
+        [System.Security.Principal.SecurityIdentifier]) -eq $sbAcct
+    } | ForEach-Object {
+      $s = '{0}:{1:x}' -f $_.AccessControlType, [int]$_.FileSystemRights
+      if (-not $NoFlags) { $s += ':{0}' -f [int]$_.InheritanceFlags }
+      $s
+    }
+  }
+  function Snapshot34 {
+    ($big, $claude34, $deep34, $mcp34 | ForEach-Object {
+      (& icacls $_ | Out-String) + (Get-Acl $_).Sddl
+    }) -join "`n"
+  }
+
+  $h34 = Start-Process -FilePath $pwsh -PassThru -WindowStyle Hidden `
+    -ArgumentList @('-NoProfile','-Command','Start-Sleep 600')
+  try {
+    # (a) first grant + stamp: each directory written exactly once
+    #     per batch, however many entries target it.
+    $g1 = Timed34 'grant' @{ write = @($big) } $h34.Id
+    if ((Dacl34 $g1.raw 'write' $big) -ne 1) {
+      throw "A34(a): first grant did not write the root DACL exactly once. raw: $($g1.raw)"
+    }
+    $s1 = Timed34 'stamp' @{ denyWrite = $deny34 } $h34.Id
+    foreach ($dir in $big, $claude34) {
+      $n = Dacl34 $s1.raw 'write' $dir
+      if ($n -ne 1) {
+        throw ("A34(a): stamp wrote '$dir' $n time(s) — expected exactly 1 " +
+               "(one converge per path per batch). raw: $($s1.raw)")
+      }
+    }
+
+    # (b) the ACEs on disk are the ones the unbatched converge
+    #     produced: root = parent-FDC deny then the grant, both
+    #     (OI)(CI); placeholder dir = object-only deny-DELETE then
+    #     parent-FDC deny; the deny target carries the denyWrite
+    #     mask; a deep file inherits the root's pair.
+    $want = @{
+      root   = 'Deny:40:3|Allow:1301bf:3'
+      claude = 'Deny:10000:0|Deny:40:3'
+      mcp    = 'Deny:10116'
+    }
+    $got = @{
+      root   = (SbAces34 $big      $false) -join '|'
+      claude = (SbAces34 $claude34 $false) -join '|'
+      mcp    = (SbAces34 $mcp34    $false -NoFlags) -join '|'
+    }
+    foreach ($k in $want.Keys) {
+      if ($got[$k] -ne $want[$k]) {
+        throw "A34(b): explicit sandbox ACEs on $k = '$($got[$k])', expected '$($want[$k])'"
+      }
+    }
+    $inh = @(SbAces34 $deep34 $true -NoFlags)
+    if ($inh -notcontains 'Deny:40' -or $inh -notcontains 'Allow:1301bf') {
+      throw "A34(b): deep file did not inherit the root's ACEs: $($inh -join '|')"
+    }
+    $r = RExec @('--', $cmd, '/c', "type `"$deep34`" && echo nope> `"$mcp34`"")
+    if ($r.out -notmatch 'A34-DEEP' -or (Get-Content -Raw $mcp34).Trim() -ne '{}') {
+      throw "A34(b): grant/deny not effective on the tree. raw: $($r.raw)"
+    }
+
+    # (c) identical repeat: every per-row step re-runs, but both
+    #     directory DACLs are already converged → zero writes, and
+    #     the ACLs are bit-for-bit what they were.
+    $before = Snapshot34
+    $g2 = Timed34 'grant' @{ write = @($big) } $h34.Id
+    $s2 = Timed34 'stamp' @{ denyWrite = $deny34 } $h34.Id
+    Write-Host ("A34: grant first={0}ms repeat={1}ms; stamp first={2}ms repeat={3}ms" -f `
+                $g1.ms, $g2.ms, $s1.ms, $s2.ms)
+    foreach ($run in $g2, $s2) {
+      foreach ($dir in $big, $claude34) {
+        if ((Dacl34 $run.raw 'write' $dir) -ne 0) {
+          throw "A34(c): repeat re-wrote the converged DACL of '$dir'. raw: $($run.raw)"
+        }
+      }
+      if ((Dacl34 $run.raw 'unchanged' $big) -ne 1) {
+        throw "A34(c): repeat did not converge the root exactly once. raw: $($run.raw)"
+      }
+    }
+    if ((Snapshot34) -ne $before) {
+      throw "A34(c): ACLs changed across an identical repeat.`nbefore:`n$before`nafter:`n$(Snapshot34)"
+    }
+
+    # (d) release coalesces too: `.claude` holds deny_delete AND
+    #     deny_fdc, the root holds deny_fdc — one write each — and
+    #     the revoke leaves no sandbox ACE behind.
+    $rs = RunCapture @('acl','restore','--holder-pid',$h34.Id,'--sandbox-user-sid',$sbSid)
+    foreach ($dir in $big, $claude34) {
+      $n = Dacl34 $rs.raw 'write' $dir
+      if ($rs.exit -ne 0 -or $n -ne 1) {
+        throw "A34(d): restore wrote '$dir' $n time(s) (exit $($rs.exit)). raw: $($rs.raw)"
+      }
+    }
+    if ((SbAces34 $big $false) -join '|' -ne 'Allow:1301bf:3') {
+      throw "A34(d): root after restore: $((SbAces34 $big $false) -join '|')"
+    }
+    $rv = RunCapture @('acl','revoke','--holder-pid',$h34.Id,'--sandbox-user-sid',$sbSid)
+    if ($rv.exit -ne 0 -or (Dacl34 $rv.raw 'write' $big) -ne 1) {
+      throw "A34(d): revoke did not write the root exactly once. raw: $($rv.raw)"
+    }
+    if (@(SbAces34 $big $false).Count -ne 0 -or @(SbAces34 $claude34 $false).Count -ne 0) {
+      throw 'A34(d): explicit sandbox ACEs left after restore + revoke'
+    }
+    Write-Host ('A34 ok: one DACL write per path per batch; identical ' +
+                'repeat writes nothing and leaves the ACLs unchanged')
+  } finally {
+    & $Exe acl restore --holder-pid $h34.Id --sandbox-user-sid $sbSid 2>&1 | Out-Null
+    & $Exe acl revoke  --holder-pid $h34.Id --sandbox-user-sid $sbSid 2>&1 | Out-Null
+    Stop-Process -Id $h34.Id -Force -ea SilentlyContinue
+  }
+
+  # ── A33: release killed at the start of its propagation → recover ──
+  # A release drops its row FIRST and walks the tree second, so a
+  # broker killed mid-walk leaves sandbox ACEs on the tree with no
+  # row for recovery to find. The write-intent journal is the
+  # breadcrumb: `acl recover` (and the recovery pass of any acl op)
+  # re-runs the converge from the rows that exist now. The kill is
+  # the test hook (SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE),
+  # which exists only in the `--features test-hooks` build
+  # ($HooksExe): that binary exits right AFTER committing the intent
+  # row and BEFORE the DACL write — deterministic, and the worst case
+  # (nothing was stripped yet). Grant, recovery and every assertion
+  # use the default build. The tree sits OUTSIDE the granted $Root so
+  # "no sandbox ACE left" is exact, inherited ones included.
+  if (-not $HooksExe) {
+    Write-Host 'A33 SKIPPED: no test-hooks binary given (2nd argument)'
+  } else {
+  # The hook must exist in the test-hooks build only: the default
+  # (shipped-shape) binary carries no trace of its variable name.
+  $hookVar33 = 'KILL_BEFORE_DACL_WRITE'
+  function HasHook33 { param([string] $path)
+    [System.Text.Encoding]::ASCII.GetString(
+      [System.IO.File]::ReadAllBytes((Resolve-Path $path).Path)).Contains($hookVar33)
+  }
+  if (HasHook33 $Exe) { throw "A33 pre: default build $Exe contains the test hook" }
+  if (-not (HasHook33 $HooksExe)) { throw "A33 pre: $HooksExe was not built with test-hooks" }
+  $tree33 = "$Root-a33"
+  foreach ($d in 0..39) {
+    $dd = Join-Path $tree33 ('d{0:d2}' -f $d)
+    New-Item -ItemType Directory -Path $dd | Out-Null
+    foreach ($f in 0..49) {
+      [System.IO.File]::WriteAllText((Join-Path $dd ('f{0:d2}.txt' -f $f)), 'x')
+    }
+  }
+  $deep33 = Join-Path $tree33 'd39\f49.txt'
+  $h33 = Start-Process -FilePath $pwsh -PassThru -WindowStyle Hidden `
+    -ArgumentList @('-NoProfile','-Command','Start-Sleep 600')
+  try {
+    $null = Timed34 'grant' @{ write = @($tree33) } $h33.Id
+    if ((SbAces34 $tree33 $false) -join '|' -ne 'Allow:1301bf:3' -or
+        @(SbAces34 $deep33 $true -NoFlags) -notcontains 'Allow:1301bf') {
+      throw 'A33 setup: grant did not land on the tree'
+    }
+    # (a) revoke by the test-hooks build, killed between the intent
+    #     row and the write. The variable STAYS set through (b): the
+    #     default build has no hook to honor it, and the hook itself
+    #     never fires on the recovery replay.
+    $env:SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE = Split-Path $tree33 -Leaf
+    $raw33 = & $HooksExe acl revoke --holder-pid $h33.Id `
+                 --sandbox-user-sid $sbSid 2>&1 | Out-String
+    $rk = [pscustomobject]@{ exit = $LASTEXITCODE; raw = $raw33 }
+    if ($rk.exit -ne 86 -or $rk.raw -notmatch 'killed before dacl write') {
+      throw "A33(a): kill hook did not fire (exit $($rk.exit)). raw: $($rk.raw)"
+    }
+    if ((SbAces34 $tree33 $false) -join '|' -ne 'Allow:1301bf:3') {
+      throw 'A33(a): grant ACE gone although the write never ran'
+    }
+    # (b) the row is gone (a second revoke finds nothing to release)
+    #     yet recovery — here the explicit `acl recover` — finishes
+    #     the write from the journal and leaves the journal empty.
+    $rec = J @('acl','recover','--json')
+    if ($rec.writesResumed -ne 1 -or $rec.writesPending -ne 0) {
+      throw "A33(b): recover did not finish the interrupted write: $($rec | ConvertTo-Json -Compress)"
+    }
+    if (@(SbAces34 $tree33 $false).Count -ne 0 -or @(SbAces34 $tree33 $true).Count -ne 0) {
+      throw "A33(b): sandbox ACE left on the root: $((Get-Acl $tree33).Sddl)"
+    }
+    if (@(SbAces34 $deep33 $false).Count -ne 0 -or @(SbAces34 $deep33 $true).Count -ne 0) {
+      throw "A33(b): sandbox ACE left on a deep file: $((Get-Acl $deep33).Sddl)"
+    }
+    # (c) idempotent: nothing left to resume.
+    $rec = J @('acl','recover','--json')
+    if ($rec.writesResumed -ne 0 -or $rec.writesPending -ne 0) {
+      throw "A33(c): second recover not a no-op: $($rec | ConvertTo-Json -Compress)"
+    }
+    Write-Host ('A33 ok: release killed before its DACL write → ' +
+                'recover finished it from the write-intent journal')
+  } finally {
+    Remove-Item Env:SANDBOX_RUNTIME_WIN_DEBUG_KILL_BEFORE_DACL_WRITE -ea SilentlyContinue
+    & $Exe acl revoke --holder-pid $h33.Id --sandbox-user-sid $sbSid 2>&1 | Out-Null
+    Stop-Process -Id $h33.Id -Force -ea SilentlyContinue
+    Remove-Item -Recurse -Force $tree33 -ea SilentlyContinue
+  }
+  }
 }
 finally {
   & $Exe acl revoke  --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
@@ -498,4 +753,4 @@ finally {
   & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-Null
 }
 
-Write-Host 'smoke-aces: PASS (A2/A2(reg)/A4/A5/A13/A28/A29/A30/A31)'
+Write-Host 'smoke-aces: PASS (A2/A2(reg)/A4/A5/A13/A28/A29/A30/A31/A32/A33/A34)'

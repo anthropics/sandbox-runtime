@@ -20,6 +20,16 @@
 //! path keeps its severed inheritance). The single chokepoint is
 //! [`apply_sandbox_aces`] ([`SbAceSet`]): converge the path to
 //! exactly the wanted ALLOW + DENY for `<sb-SID>`, idempotently.
+//! Given a [`WriteLedger`] ([`converge_sandbox_aces`] — the state
+//! DB's converges), its final `SetNamedSecurityInfoW` is skipped
+//! when the DACL just read from disk already IS the composed target
+//! ([`aces_converged`]) AND the ledger shows our last write of that
+//! exact DACL ran to completion: the call re-propagates to every
+//! unprotected descendant, so an unchanged directory DACL would
+//! otherwise cost a full tree walk for nothing. Any doubt — a
+//! differing ACE, an unreadable ACL, no completion record (a write
+//! killed mid-propagation leaves the object itself looking
+//! converged) — falls through to the write.
 //!
 //! The PROTECTED allow-lists in [`set_path_dacl_from_sddl`]'s
 //! callers are the ONE remaining `PROTECTED` consumer — they
@@ -451,6 +461,122 @@ pub(crate) fn ace_sid_is(body: &[u8], sid_bytes: &[u8]) -> bool {
     body.get(ACE_FIXED..ACE_FIXED + sid_bytes.len()) == Some(sid_bytes)
 }
 
+/// Every ACE of `acl` as its own byte string (`AceSize` bytes:
+/// header — type, flags, size — then mask and SID), in ACL order.
+/// The owned copy is what [`aces_converged`] compares, so the
+/// comparison never depends on either ACL's buffer layout
+/// (`AclSize`, trailing slack) — only on the ACEs themselves.
+fn ace_bytes(acl: *const ACL) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    filter_aces(acl, |_, body| {
+        out.push(body.to_vec());
+        false
+    })?;
+    Ok(out)
+}
+
+/// Whether writing the composed ACE list `want` over an object whose
+/// DACL currently holds `on_disk` would change nothing — the
+/// [`converge_sandbox_aces`] write-skip predicate, on plain bytes (see
+/// [`ace_bytes`]) so it is unit-testable.
+///
+/// `want` is what the converge would hand `SetNamedSecurityInfoW`:
+/// explicit ACEs only. The write stores exactly those, in that
+/// order, then (unprotected DACL) appends the ACEs it re-derives
+/// from the parent. So the disk already matches iff:
+///
+/// - its leading `want.len()` ACEs equal `want` byte for byte, in
+///   order — same type, flags, mask and SID, none of them inherited;
+/// - everything after that is an `INHERITED_ACE` — the kernel-derived
+///   tail the write would re-derive, never an extra explicit ACE;
+/// - on a `protected` DACL there is no tail at all: nothing is
+///   re-derived there, and the converge drops a stray
+///   inherited-flagged entry, so its presence means a write is due.
+///
+/// Anything else — including an ACE too short to carry a header —
+/// is "not converged": the caller writes.
+fn aces_converged(on_disk: &[Vec<u8>], want: &[Vec<u8>], protected: bool) -> bool {
+    let inherited = |ace: &Vec<u8>| ace.get(1).map(|flags| flags & INHERITED_ACE != 0);
+    if want.iter().any(|a| inherited(a) != Some(false)) {
+        return false;
+    }
+    let Some((head, tail)) = on_disk.split_at_checked(want.len()) else {
+        return false;
+    };
+    head == want
+        && tail.iter().all(|a| inherited(a) == Some(true))
+        && (tail.is_empty() || !protected)
+}
+
+/// [`aces_converged`] over the two live ACLs, plus the ACL revision
+/// (a differing revision is a differing DACL). A NULL on-disk DACL
+/// ("everyone, everything") is never converged, and a walk error on
+/// either side reads as "not converged" — every uncertain answer
+/// here must fall toward the unconditional write, never toward
+/// trusting that the disk is already right.
+fn dacl_converged(on_disk: *const ACL, want: &BuiltAcl, protected: bool) -> bool {
+    if on_disk.is_null() {
+        return false;
+    }
+    let same_rev = unsafe { (*on_disk).AclRevision == (*want.as_ptr()).AclRevision };
+    match (ace_bytes(on_disk), ace_bytes(want.as_ptr())) {
+        (Ok(cur), Ok(new)) => same_rev && aces_converged(&cur, &new, protected),
+        _ => false,
+    }
+}
+
+/// What [`WriteLedger`] records for a composed DACL: its protection
+/// state and revision, then every ACE's bytes in order (each ACE
+/// carries its own size, so the concatenation is unambiguous).
+/// `None` when the ACL cannot be walked — no fingerprint, no skip.
+fn dacl_fingerprint(want: &BuiltAcl, protected: bool) -> Option<Vec<u8>> {
+    let aces = ace_bytes(want.as_ptr()).ok()?;
+    let rev = unsafe { (*want.as_ptr()).AclRevision };
+    let mut print = vec![u8::from(protected), rev];
+    aces.iter().for_each(|a| print.extend(a));
+    Some(print)
+}
+
+/// Completion record for one path's DACL writes — the second half of
+/// the [`converge_sandbox_aces`] write-skip, held by the caller (the
+/// state DB) because it must outlive this process.
+///
+/// Comparing the on-disk DACL to the composed one proves only that
+/// the OBJECT is converged. `SetNamedSecurityInfoW` on a directory
+/// then walks the whole subtree, and a broker killed mid-walk (the
+/// caller's spawn timeout on a large tree) leaves the directory
+/// converged over descendants that never received the inherited
+/// ACE — for a deny, files the sandbox can still reach. Rewriting
+/// heals that; skipping would make it permanent. So a write is
+/// skipped only against positive evidence that the last write of
+/// this exact DACL RETURNED: [`Self::begin`] drops the record before
+/// every write, [`Self::complete`] stores it after, and anything in
+/// between (crash, kill, error, lost DB) reads as "not completed".
+pub(crate) trait WriteLedger {
+    /// Whether the last completed write on this path wrote exactly
+    /// `dacl` (a [`dacl_fingerprint`]). Any doubt → `false`.
+    fn completed(&self, dacl: &[u8]) -> bool;
+    /// A write is about to start: forget the completion record. An
+    /// error aborts the converge — writing under a record that
+    /// could not be withdrawn would let an interrupted write pass
+    /// for a completed one.
+    fn begin(&self) -> Result<()>;
+    /// The write returned success: record `dacl` as completed.
+    /// Best-effort — a lost record only costs the next skip.
+    fn complete(&self, dacl: &[u8]);
+}
+
+/// `SANDBOX_RUNTIME_WIN_DEBUG` trace of [`converge_sandbox_aces`]'s
+/// write decision: `dacl write '<path>'` when the DACL was rewritten
+/// (and, on a directory, re-propagated), `dacl unchanged '<path>'`
+/// when the write was skipped. One line per converge, so the smokes
+/// can count DACL writes per path instead of timing them.
+fn debug_dacl(event: &str, canonical_path: &str) {
+    if std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some() {
+        eprintln!("srt-win: debug: dacl {event} '{canonical_path}'");
+    }
+}
+
 /// Apply the broker-only DACL to a directory with `(OI)(CI)`
 /// inheritance, optionally **prefixed** by a `(D;OICI;FA;;;
 /// <deny_sid>)` ACE. Used by `state_db.rs` and `install.rs` to
@@ -766,6 +892,12 @@ pub struct SbAceSet {
 }
 
 impl SbAceSet {
+    /// No sandbox ACE at all — converging to this strips the SID
+    /// from the path.
+    pub fn is_empty(&self) -> bool {
+        self.grant.is_none() && self.deny.is_none() && !self.deny_fdc && !self.deny_delete
+    }
+
     /// The set's entries as [`NewAce`]s for `sid`, in canonical
     /// deny → deny-fdc → allow order. `Deny`/`DenyFdc`/`Grant` carry
     /// [`OICI`]; `DenyDelete` is object-only ([`NO_INHERIT`]) — see
@@ -804,6 +936,10 @@ impl SbAceSet {
 /// root's `Authenticated Users:(M)`) would durably re-open a path its
 /// admin had locked down.
 ///
+/// This form ALWAYS writes (and so always re-propagates a directory
+/// DACL); the state DB's converges go through
+/// [`converge_sandbox_aces`], which can skip a redundant write.
+///
 /// `SetEntriesInAclW(REVOKE_ACCESS)` is NOT used: per MSDN it
 /// removes `ACCESS_ALLOWED_ACE`/`SYSTEM_AUDIT_ACE` for the trustee,
 /// not `ACCESS_DENIED_ACE` — so a prior `Deny`/`DenyFdc` ACE would
@@ -814,12 +950,35 @@ impl SbAceSet {
 /// Both grant and deny carry `(OI)(CI)` so directory targets cover
 /// the subtree; on a file the inheritance flags are inert.
 pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<()> {
+    converge_sandbox_aces(canonical_path, sandbox_sid, set, None)
+}
+
+/// [`apply_sandbox_aces`] with an optional [`WriteLedger`]. With one,
+/// the final write is skipped when BOTH hold: the DACL read in step
+/// 1 already equals the composed one ([`dacl_converged`]), and the
+/// ledger shows the last write of that exact DACL completed. The
+/// read, the filter and the compose always run; only a provably
+/// redundant `SetNamedSecurityInfoW` (and the subtree re-propagation
+/// it triggers on a directory) is elided. Without a ledger — or on
+/// any mismatch or doubt — the write is unconditional, as before.
+///
+/// The skip also forgoes that re-propagation's side effect of
+/// re-syncing descendants whose inherited ACEs went stale behind our
+/// back (a file MOVED into the tree keeps its old ones); those are
+/// refreshed by the next converge that actually changes this DACL,
+/// exactly as for a path nobody re-stamps.
+pub(crate) fn converge_sandbox_aces(
+    canonical_path: &str,
+    sandbox_sid: &str,
+    set: SbAceSet,
+    ledger: Option<&dyn WriteLedger>,
+) -> Result<()> {
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
     let sid_bytes = sid.as_bytes();
     // 1. Read the current DACL and its protection state. `sd` owns
     //    the buffer `old`/`keep` point into; it's freed after step
-    //    4's write.
+    //    5's write.
     let (sd, old) =
         read_file_dacl(canonical_path).with_context(|| format!("recompose '{canonical_path}'"))?;
     let protected =
@@ -832,17 +991,41 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     // 3. Build fresh ACL: set's entries (deny-first canonical order)
     //    then surviving explicit ACEs.
     let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[])?;
-    // 4. Write back, preserving the DACL's protection state:
+    // 4. Already converged AND last written to completion →
+    //    nothing to write (see doc comment). `protected` is the
+    //    state the write would preserve, so an equal ACE list means
+    //    an equal DACL.
+    let print = ledger.and_then(|_| dacl_fingerprint(&new, protected));
+    if let (Some(ledger), Some(print)) = (ledger, &print)
+        && dacl_converged(old, &new, protected)
+        && ledger.completed(print)
+    {
+        debug_dacl("unchanged", canonical_path);
+        return Ok(());
+    }
+    // 5. Write back, preserving the DACL's protection state:
     //    UNPROTECTED so the kernel re-derives inherited ACEs from the
     //    parent, PROTECTED when inheritance was severed before we
-    //    touched the path (see doc comment).
+    //    touched the path (see doc comment). The completion record
+    //    is withdrawn first and restored only once the write has
+    //    returned.
     let prot = if protected {
         Protection::Protected
     } else {
         Protection::Unprotected
     };
+    if let Some(ledger) = ledger {
+        ledger
+            .begin()
+            .with_context(|| format!("recompose '{canonical_path}'"))?;
+    }
+    debug_dacl("write", canonical_path);
     write_file_dacl(canonical_path, new.as_ptr(), prot)
-        .with_context(|| format!("recompose '{canonical_path}'"))
+        .with_context(|| format!("recompose '{canonical_path}'"))?;
+    if let (Some(ledger), Some(print)) = (ledger, &print) {
+        ledger.complete(print);
+    }
+    Ok(())
 }
 
 /// Whether `canonical_path` carries an EXPLICIT `(OI)(CI)` deny ACE
@@ -981,6 +1164,212 @@ mod tests {
             "inherited ACEs re-derived on the unprotected dir"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A raw ACE: header (type, flags, LE size) + mask + a stand-in
+    /// SID — the byte shape [`ace_bytes`] yields.
+    fn raw_ace(ty: u8, flags: u8, mask: u32, sid: &[u8]) -> Vec<u8> {
+        let mut a = vec![ty, flags];
+        a.extend(((ACE_FIXED + sid.len()) as u16).to_le_bytes());
+        a.extend(mask.to_le_bytes());
+        a.extend(sid);
+        a
+    }
+
+    /// The write-skip predicate compares ACE content in order — not
+    /// counts, not lengths — and tolerates ONLY a kernel-derived
+    /// inherited tail on an unprotected DACL.
+    #[test]
+    fn aces_converged_is_exact_and_ordered() {
+        const ALLOW: u8 = 0;
+        const DENY: u8 = 1;
+        let oici = OICI.0 as u8;
+        let (sb, user) = ([1u8, 1, 0, 0, 0, 0, 0, 5, 9], [1u8, 1, 0, 0, 0, 0, 0, 5, 7]);
+        let deny = raw_ace(DENY, oici, Mask::FILE_DELETE_CHILD.bits(), &sb);
+        let grant = raw_ace(ALLOW, oici, Mask::MODIFY_NO_FDC.bits(), &sb);
+        let other = raw_ace(ALLOW, 0, Mask::FILE_ALL.bits(), &user);
+        let inh = raw_ace(ALLOW, oici | INHERITED_ACE, Mask::FILE_ALL.bits(), &user);
+        let want = vec![deny.clone(), grant.clone(), other.clone()];
+
+        // Identical explicit list, with and without an inherited tail.
+        assert!(aces_converged(&want, &want, false));
+        assert!(aces_converged(&want, &want, true));
+        let with_tail = [want.clone(), vec![inh.clone(), inh.clone()]].concat();
+        assert!(aces_converged(&with_tail, &want, false));
+        // …but a PROTECTED DACL has no re-derived tail: a stray
+        // inherited-flagged entry there means the write is due.
+        assert!(!aces_converged(&with_tail, &want, true));
+        // Empty target (revoke) on a path with only inherited ACEs.
+        assert!(aces_converged(std::slice::from_ref(&inh), &[], false));
+        assert!(aces_converged(&[], &[], true));
+
+        // Same ACEs, different order.
+        let swapped = vec![grant.clone(), deny.clone(), other.clone()];
+        assert!(!aces_converged(&swapped, &want, false));
+        // Same count and same byte length, one field different:
+        // mask, flags, type, SID.
+        let variants = [
+            raw_ace(ALLOW, oici, Mask::FILE_READ_EXEC.bits(), &sb),
+            raw_ace(ALLOW, 0, Mask::MODIFY_NO_FDC.bits(), &sb),
+            raw_ace(DENY, oici, Mask::MODIFY_NO_FDC.bits(), &sb),
+            raw_ace(ALLOW, oici, Mask::MODIFY_NO_FDC.bits(), &user),
+        ];
+        for v in variants {
+            assert_eq!(v.len(), grant.len());
+            let disk = vec![deny.clone(), v, other.clone()];
+            assert!(!aces_converged(&disk, &want, false));
+        }
+        // Missing ACE; extra EXPLICIT ACE (leading, trailing, or
+        // wedged before the inherited tail).
+        assert!(!aces_converged(&want[..2], &want, false));
+        assert!(!aces_converged(&[], &want, false));
+        let extra_tail = [want.clone(), vec![other.clone()]].concat();
+        assert!(!aces_converged(&extra_tail, &want, false));
+        let extra_head = [vec![grant.clone()], want.clone()].concat();
+        assert!(!aces_converged(&extra_head, &want, false));
+        let wedged = [want.clone(), vec![inh.clone(), other.clone()]].concat();
+        assert!(!aces_converged(&wedged, &want, false));
+        // An on-disk sandbox ACE that is merely INHERITED does not
+        // stand in for the explicit one the converge wants.
+        let inh_grant = raw_ace(ALLOW, oici | INHERITED_ACE, Mask::MODIFY_NO_FDC.bits(), &sb);
+        assert!(!aces_converged(
+            std::slice::from_ref(&inh_grant),
+            std::slice::from_ref(&grant),
+            false
+        ));
+        // Malformed input never reads as converged.
+        assert!(!aces_converged(&[vec![0u8]], &[vec![0u8]], false));
+        let inh_only = std::slice::from_ref(&inh_grant);
+        assert!(!aces_converged(inh_only, inh_only, false));
+    }
+
+    /// End-to-end over real ACLs: a second identical converge finds
+    /// the DACL converged (and must leave it byte-identical); any
+    /// change to the wanted set does not.
+    #[test]
+    fn dacl_converged_tracks_on_disk_state() {
+        const FAKE_SB_SID: &str = "S-1-5-32-546";
+        let dir = std::env::temp_dir().join(format!("srtwin-conv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+        let sid = LocalPsid::from_string(FAKE_SB_SID).unwrap();
+        // What `apply_sandbox_aces` would compose for `set` right now.
+        let compose = |set: SbAceSet| {
+            let (sd, old) = read_file_dacl(path).unwrap();
+            let kept = filter_aces(old, |hdr, body| {
+                hdr.AceFlags & INHERITED_ACE == 0 && !ace_sid_is(body, sid.as_bytes())
+            })
+            .unwrap();
+            let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[]).unwrap();
+            let protected = sd_dacl_protected(&sd).unwrap();
+            (
+                dacl_converged(old, &new, protected),
+                ace_bytes(old).unwrap(),
+            )
+        };
+        let grant = SbAceSet {
+            grant: Some(GrantMask::Modify),
+            ..Default::default()
+        };
+        let grant_fdc = SbAceSet {
+            deny_fdc: true,
+            ..grant
+        };
+
+        assert!(!compose(grant).0, "fresh dir: grant not yet on disk");
+        apply_sandbox_aces(path, FAKE_SB_SID, grant).unwrap();
+        let (converged, before) = compose(grant);
+        assert!(converged, "after the write the same set is converged");
+        apply_sandbox_aces(path, FAKE_SB_SID, grant).unwrap();
+        assert_eq!(compose(grant).1, before, "repeat converge changed the DACL");
+
+        assert!(!compose(grant_fdc).0, "an added deny is a change");
+        assert!(!compose(SbAceSet::default()).0, "a revoke is a change");
+        let read_only = SbAceSet {
+            grant: Some(GrantMask::ReadOnly),
+            ..Default::default()
+        };
+        assert!(!compose(read_only).0, "a narrower mask is a change");
+        assert!(!dacl_converged(
+            std::ptr::null(),
+            &build_allow_dacl(&[]).unwrap(),
+            false
+        ));
+
+        apply_sandbox_aces(path, FAKE_SB_SID, SbAceSet::default()).unwrap();
+        assert!(compose(SbAceSet::default()).0, "revoked and converged");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// In-memory [`WriteLedger`]: the record plus a count of writes
+    /// begun.
+    #[derive(Default)]
+    struct MemLedger {
+        record: std::cell::RefCell<Option<Vec<u8>>>,
+        writes: std::cell::Cell<u32>,
+    }
+    impl WriteLedger for MemLedger {
+        fn completed(&self, dacl: &[u8]) -> bool {
+            self.record.borrow().as_deref() == Some(dacl)
+        }
+        fn begin(&self) -> Result<()> {
+            self.writes.set(self.writes.get() + 1);
+            self.record.replace(None);
+            Ok(())
+        }
+        fn complete(&self, dacl: &[u8]) {
+            self.record.replace(Some(dacl.to_vec()));
+        }
+    }
+
+    /// The write is skipped only when the disk is converged AND the
+    /// ledger holds a completion record for that exact DACL: an
+    /// interrupted write (record withdrawn, never restored), a
+    /// foreign record, or no ledger at all each force the rewrite.
+    #[test]
+    fn converge_skips_only_a_completed_identical_write() {
+        const FAKE_SB_SID: &str = "S-1-5-32-546";
+        let dir = std::env::temp_dir().join(format!("srtwin-ledger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+        let grant = SbAceSet {
+            grant: Some(GrantMask::Modify),
+            ..Default::default()
+        };
+        let grant_fdc = SbAceSet {
+            deny_fdc: true,
+            ..grant
+        };
+        let ledger = MemLedger::default();
+        let converge = |set| converge_sandbox_aces(path, FAKE_SB_SID, set, Some(&ledger)).unwrap();
+
+        converge(grant);
+        assert_eq!(ledger.writes.get(), 1, "first converge writes");
+        converge(grant);
+        converge(grant);
+        assert_eq!(ledger.writes.get(), 1, "identical repeats are skipped");
+
+        // Disk converged by a ledger-less writer, no record: the
+        // object looks right but nothing vouches for its subtree.
+        apply_sandbox_aces(path, FAKE_SB_SID, grant_fdc).unwrap();
+        converge(grant_fdc);
+        assert_eq!(ledger.writes.get(), 2, "stale record → rewrite");
+        converge(grant_fdc);
+        assert_eq!(ledger.writes.get(), 2);
+
+        // A write killed mid-propagation: record withdrawn by
+        // `begin`, `complete` never reached, object already converged.
+        ledger.record.replace(None);
+        converge(grant_fdc);
+        assert_eq!(ledger.writes.get(), 3, "no completion record → rewrite");
+
+        // A real change always writes, and is then skippable itself.
+        converge(grant);
+        converge(grant);
+        assert_eq!(ledger.writes.get(), 4);
+
+        apply_sandbox_aces(path, FAKE_SB_SID, SbAceSet::default()).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

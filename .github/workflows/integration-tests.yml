@@ -96,6 +96,13 @@ jobs:
           cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
           cargo test   --release --locked --manifest-path vendor/srt-win-src/Cargo.toml
           cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
+          # Second, test-only binary with the fault-injection hooks
+          # compiled in, for smoke-aces row A33 alone. Its own target
+          # dir, so it can never replace the default-feature
+          # target\release\srt-win.exe every other step (and the TS
+          # suite) runs; release.yml never passes --features.
+          cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks
+          cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks --all-targets -- -D warnings
 
       - name: Smoke-test srt-win install lifecycle (Windows)
         if: matrix.os == 'windows'
@@ -110,7 +117,7 @@ jobs:
       - name: Smoke-test srt-win additive-ACE lifecycle (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
-        run: pwsh vendor/srt-win-src/ci/smoke-aces.ps1 vendor\srt-win-src\target\release\srt-win.exe
+        run: pwsh vendor/srt-win-src/ci/smoke-aces.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
 
       - name: Smoke-test srt-win kill-chain invariant (Windows)
         if: matrix.os == 'windows'

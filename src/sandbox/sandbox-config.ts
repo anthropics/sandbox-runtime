@@ -1097,6 +1097,21 @@ export const WindowsConfigSchema = z.object({
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
     ),
+  aclTimeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      'Timeout in milliseconds for each `srt-win acl` grant / stamp / ' +
+        'revoke / restore call made at initialize() and reset(). Their ' +
+        'cost is linear in the number of files under the granted roots. ' +
+        'Default: 600000 (10 minutes) — deliberately generous, because a ' +
+        'call killed mid-propagation leaves a half-applied tree that the ' +
+        'cleanup then has to walk in full again. Does not apply to the ' +
+        'synchronous release run from the process exit / SIGINT / SIGTERM ' +
+        'handler, which is fixed at 60000 per call so exit stays bounded.',
+    ),
   srtWin: SrtWinConfigSchema.optional().describe(
     'How to locate/invoke the srt-win helper binary. `srtWin.path` is ' +
       'required to use the Windows sandbox — your own (multicall) binary, ' +

@@ -317,11 +317,20 @@ enum AclCmd {
     },
     /// Drop the holder's claim on every granted path; remove the
     /// sandbox-user ACE on any path whose refcount falls to zero.
+    ///
+    /// Exits non-zero when any grant could not be released (status
+    /// `unreadable` or `failed`: the ACE may still be on disk and its
+    /// rows are kept for a retry). A caller that goes on to
+    /// `acl restore` must not do so in that case.
     Revoke {
         #[arg(long)]
         holder_pid: u32,
         #[arg(long)]
         sandbox_user_sid: String,
+        /// Emit a single JSON array of per-path `{path, status}`
+        /// objects on stdout. The array is complete — it includes
+        /// the paths that could not be released — and is written
+        /// before a non-zero exit.
         #[arg(long)]
         json: bool,
     },
@@ -344,12 +353,15 @@ enum AclCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Run crash-recovery only: prune dead holders, drop any
-    /// orphaned sandbox-user ACEs.
+    /// Run crash-recovery only: release the holds of dead holders
+    /// (grants first; a holder's deny ACEs are kept while one of its
+    /// grants could not be released) and prune them. Exits non-zero
+    /// when a grant is still pending.
     Recover {
         #[arg(long)]
         force: bool,
-        /// Emit `{"deadBrokers": N, "acesRevoked": N}` on stdout.
+        /// Emit `{"deadBrokers": N, "acesRevoked": N,
+        /// "writesResumed": N, "writesPending": N}` on stdout.
         /// (Not the per-path array — recover sweeps by trustee SID
         /// and does not enumerate paths.)
         #[arg(long)]
@@ -1292,14 +1304,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
                 db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
             })?;
+            // Grants whose ACE may still be on disk (rows kept).
+            let pending: Vec<&str> = entries
+                .iter()
+                .filter(|(_, r)| r.is_pending())
+                .map(|(p, _)| p.as_str())
+                .collect();
             eprintln!(
                 "srt-win: acl revoke — {} path(s){}; recovery \
                  revoked {} orphan grant(s)",
                 entries.len(),
-                if failed > 0 {
-                    format!(", {failed} FAILED (ACE left in place)")
-                } else {
+                if pending.is_empty() {
                     String::new()
+                } else {
+                    format!(", {} NOT RELEASED (ACE left in place)", pending.len())
                 },
                 report.aces_revoked,
             );
@@ -1315,8 +1333,17 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .context("write --json revoke result")?;
                 println!();
             }
-            if failed > 0 {
-                return Err(anyhow!("acl revoke: {failed} path(s) could not be revoked"));
+            if failed > 0 || !pending.is_empty() {
+                return Err(anyhow!(
+                    "acl revoke: {} grant(s) could not be released \
+                     and may still be on disk (rows kept for retry): {}",
+                    pending.len(),
+                    pending
+                        .iter()
+                        .map(|p| format!("'{p}'"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
             }
         }
         Cmd::Acl {
@@ -1376,8 +1403,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 })?;
             eprintln!(
                 "srt-win: acl recover — pruned {} dead broker(s), \
-                 revoked {} orphan ACE(s)",
-                report.dead_brokers, report.aces_revoked,
+                 revoked {} orphan ACE(s), finished {} interrupted \
+                 DACL write(s) ({} pending)",
+                report.dead_brokers,
+                report.aces_revoked,
+                report.writes_resumed,
+                report.writes_pending,
             );
             if json {
                 println!(
@@ -1385,8 +1416,25 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     json!({
                         "deadBrokers": report.dead_brokers,
                         "acesRevoked": report.aces_revoked,
+                        "writesResumed": report.writes_resumed,
+                        "writesPending": report.writes_pending,
+                        "grantsPending": report.grants_pending,
                     })
                 );
+            }
+            if !report.grants_pending.is_empty() {
+                return Err(anyhow!(
+                    "acl recover: {} grant(s) could not be released \
+                     and may still be on disk (rows, and their \
+                     holders' deny ACEs, kept for retry): {}",
+                    report.grants_pending.len(),
+                    report
+                        .grants_pending
+                        .iter()
+                        .map(|p| format!("'{p}'"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
             }
         }
 
@@ -1751,6 +1799,38 @@ fn maybe_self_elevate(args: &[OsString]) -> anyhow::Result<Option<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two deny targets under one placeholder directory (and a
+    /// nested chain) list each ancestor once, first occurrence kept,
+    /// order otherwise untouched.
+    #[test]
+    fn placeholder_ancestors_listed_once_per_call() {
+        use srt_win::acl::{DenyMask, SbAce};
+        let deny = SbAce::Deny(DenyMask::ReadDeny);
+        let s = |p: &str| p.to_string();
+        let (claude, hooks) = (r"\\?\C:\p\.claude", r"\\?\C:\p\.claude\hooks");
+        let anc = |p: &str| (s(p), SbAce::DenyDelete);
+        let targets = merge_ace_targets(vec![
+            (s(r"\\?\C:\p\.claude\hooks\pre"), deny),
+            anc(claude),
+            anc(hooks),
+            (s(r"\\?\C:\p\.claude\settings.json"), deny),
+            anc(claude),
+            (s(r"\\?\C:\p\.claude\hooks\post"), deny),
+            anc(hooks),
+            anc(claude),
+        ]);
+        assert_eq!(
+            targets,
+            [
+                (s(r"\\?\C:\p\.claude\hooks\pre"), deny),
+                (s(claude), SbAce::DenyDelete),
+                (s(hooks), SbAce::DenyDelete),
+                (s(r"\\?\C:\p\.claude\settings.json"), deny),
+                (s(r"\\?\C:\p\.claude\hooks\post"), deny),
+            ],
+        );
+    }
 
     /// `run_from_args` strips the `argv[1]` sentinel before clap so
     /// the same argv shape works whether the embedder's dispatcher
