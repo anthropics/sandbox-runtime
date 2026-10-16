@@ -575,12 +575,11 @@ async function main(): Promise<void> {
             }
 
             if (signal) {
-              if (signal === 'SIGINT' || signal === 'SIGTERM') {
-                process.exit(0)
-              } else {
-                console.error(`Process killed by signal: ${signal}`)
-                process.exit(1)
-              }
+              const signum =
+                os.constants.signals[
+                  signal as keyof typeof os.constants.signals
+                ]
+              process.exit(signum !== undefined ? 128 + signum : 1)
             }
             process.exit(code ?? 0)
           })
