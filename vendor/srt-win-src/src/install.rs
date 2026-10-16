@@ -333,6 +333,58 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
 /// the filters.
 const FENCE_REVISION_VALUE: &str = "FenceRevision";
 
+/// Registry value recording that the last completed `srt-win install`
+/// opened loopback (`--allow-loopback`): 1. Absent when the installed
+/// filter set leaves loopback closed.
+const ALLOW_LOOPBACK_VALUE: &str = "AllowLoopback";
+
+/// Record whether the filters just committed open loopback (`false`
+/// deletes the value). Called by the elevated install after the WFP
+/// transaction commits and BEFORE [`write_fence_revision`]: the
+/// revision is the commit point, so a record that reads as current
+/// always carries the mode of the filters it describes.
+pub fn write_allow_loopback(open: bool) -> Result<()> {
+    let (base, _) = crate::reg::Key::create(crate::reg::BASE, None)?;
+    if open {
+        base.set_dword(ALLOW_LOOPBACK_VALUE, 1)
+    } else {
+        crate::reg::delete_value(&base, ALLOW_LOOPBACK_VALUE)
+    }
+}
+
+/// Whether the install record says loopback is open. `Ok(false)` when
+/// no install has run or the installed filter set leaves it closed. A
+/// value other than 1 is an error, never "closed": the broker must not
+/// guess what the filters open.
+pub fn read_allow_loopback() -> Result<bool> {
+    let Some(base) = crate::reg::Key::open(crate::reg::BASE, false)? else {
+        return Ok(false);
+    };
+    match base.get_dword(ALLOW_LOOPBACK_VALUE)? {
+        None => Ok(false),
+        Some(1) => Ok(true),
+        Some(v) => Err(anyhow!(
+            "recorded loopback mode {v} is not one this build knows"
+        )),
+    }
+}
+
+/// `Err` with the operator-facing explanation unless the loopback mode
+/// this session is configured with is the one the install record says
+/// the filters have. A session that expects loopback open on a machine
+/// where it is closed would find its local servers unreachable; one
+/// that expects it closed on a machine where it is open would run with
+/// every local service reachable without having been told. Neither
+/// runs.
+pub fn require_allow_loopback(configured: bool) -> std::result::Result<(), String> {
+    let installed = read_allow_loopback().map_err(|e| format!("read loopback mode: {e:#}"))?;
+    if installed == configured {
+        Ok(())
+    } else {
+        Err(crate::wfp::loopback_mismatch_hint(installed, configured))
+    }
+}
+
 /// Record that the filter set at `rev` is installed. Called by the
 /// elevated install only AFTER the WFP transaction commits, so the
 /// value never claims filters that were not written.
@@ -342,8 +394,13 @@ pub fn write_fence_revision(rev: u32) -> Result<()> {
 }
 
 /// Record that the filters are being removed: the value is reset to
-/// [`crate::wfp::FENCE_REVISION_REMOVED`]. No-op when the machine has
-/// no install record.
+/// [`crate::wfp::FENCE_REVISION_REMOVED`], and the recorded loopback
+/// mode goes with it. No-op when the machine has no install record.
+///
+/// The elevated install also calls this before it replaces a filter
+/// set whose loopback mode is changing, so that no failure between
+/// the WFP commit and the record update can leave a record that reads
+/// as current beside filters with the other mode.
 ///
 /// Every path that deletes filters calls this FIRST and deletes the
 /// filters only if it succeeded. The record and the filters are two
@@ -359,7 +416,12 @@ pub fn write_fence_revision(rev: u32) -> Result<()> {
 /// way, and re-running `srt-win install` restores the record.
 pub fn mark_fence_removed() -> Result<()> {
     match crate::reg::Key::open(crate::reg::BASE, true)? {
-        Some(base) => base.set_dword(FENCE_REVISION_VALUE, crate::wfp::FENCE_REVISION_REMOVED),
+        Some(base) => {
+            // Revision first: once it reads as removed, nothing
+            // consults the loopback mode.
+            base.set_dword(FENCE_REVISION_VALUE, crate::wfp::FENCE_REVISION_REMOVED)?;
+            crate::reg::delete_value(&base, ALLOW_LOOPBACK_VALUE)
+        }
         None => Ok(()),
     }
 }
@@ -545,6 +607,7 @@ pub fn clear_setup() -> Result<()> {
             "MarkerVersion",
             "CreatedAt",
             FENCE_REVISION_VALUE,
+            ALLOW_LOOPBACK_VALUE,
         ] {
             crate::reg::delete_value(&base, v)?;
         }

@@ -91,11 +91,15 @@ export type WindowsSandboxErrorCode =
   /** `srt-win wfp verify` was neither `blocked` nor `connected`. */
   | 'wfp_verify_inconclusive'
   /**
-   * The installed filter set was written by an earlier `srt-win` and
-   * lacks filters this one requires (`srt-win wfp verify` exit 19) —
-   * re-run the install.
+   * The installed filter set is not the one this session requires
+   * (`srt-win wfp verify` exit 19): it was written by an earlier
+   * `srt-win` and lacks filters this one requires, or its loopback
+   * mode (open or closed) is not what `network.allowLocalBinding`
+   * asks for — re-run the install.
    */
   | 'wfp_fence_outdated'
+  /** `srt-win` predates `--allow-loopback`; `network.allowLocalBinding` needs a newer one. */
+  | 'srt_win_too_old'
   /** `srt-win user trust-ca` exited non-zero. */
   | 'trust_ca_failed'
   /** `tlsTerminate` requested but no CA is installed for the sandbox user. */
@@ -169,6 +173,33 @@ export const DEFAULT_WINDOWS_PROXY_PORT_RANGE: readonly [number, number] = [
 ]
 
 /**
+ * Loopback ports that stay blocked for sandboxed commands even with
+ * `network.allowLocalBinding`: local services that hand whoever
+ * connects to them control of the machine, of another account or of
+ * another process, or that forward traffic off the machine. `srt-win`
+ * owns the list (`LOOPBACK_FLOOR_PORTS` in
+ * `vendor/srt-win-src/src/wfp.rs`); this copy is for describing it
+ * and for aiming the fence probe.
+ */
+export const WINDOWS_LOOPBACK_FLOOR_PORTS: readonly number[] = [
+  53, 1080, 2375, 2376, 3389, 5985, 5986, 9222, 9229, 47001,
+]
+
+/**
+ * What `network.allowLocalBinding` opens on Windows, in plain words.
+ * Shown wherever the open-loopback install is offered, confirmed or
+ * found in place.
+ */
+export const WINDOWS_ALLOW_LOOPBACK_EFFECT =
+  `Loopback is open: sandboxed commands can connect to every TCP and ` +
+  `UDP port on localhost (127.0.0.0/8 and ::1) except ` +
+  `${WINDOWS_LOOPBACK_FLOOR_PORTS.join(', ')}. Every service listening ` +
+  `on localhost is reachable from them, and any local forwarder (a DNS ` +
+  `stub, a SOCKS or HTTP proxy, a VPN or security agent, a tunnel) ` +
+  `reachable there gives them a way off the machine that the network ` +
+  `restrictions do not cover.`
+
+/**
  * `cannot-read` is the graceful-degrade state when BFE enumeration
  * is access-denied (it is admin-gated). The non-elevated readiness
  * check is {@link verifyWindowsWfpEgress}, not this enum.
@@ -176,7 +207,9 @@ export const DEFAULT_WINDOWS_PROXY_PORT_RANGE: readonly [number, number] = [
  * `outdated` means a filter set is installed but was written by an
  * earlier `srt-win` and is not the set the current one installs; the
  * sandbox refuses to run until the install is re-run. It is reported
- * to elevated and non-elevated callers alike.
+ * to elevated and non-elevated callers alike. An elevated caller also
+ * gets it when the loopback mode of the filters is not the one the
+ * install recorded.
  */
 export type WindowsWfpStatus =
   | 'absent'
@@ -190,6 +223,13 @@ export interface WindowsWfpStatusResult {
   filters: number
   /** `[low, high]` for the loopback PERMIT, when known. */
   portRange?: [number, number]
+  /**
+   * Whether the installed filter set opens loopback to sandboxed
+   * commands (`srt-win install --allow-loopback`; see
+   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}). Read off the filters by an
+   * elevated caller and off the install record by a non-elevated one.
+   */
+  allowLoopback: boolean
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
   /**
@@ -243,8 +283,10 @@ export type WindowsWfpResidual =
  * Result of `srt-win wfp verify` on success (exit 0) — see
  * {@link verifyWindowsWfpEgress}. Any other outcome throws, so on the
  * return path `probes.plain` and the two lowered-integrity loopback
- * attempts are always `blocked`, and the two lowered-integrity
- * off-loopback attempts are `blocked` or `skipped`. The remaining
+ * attempts are always `blocked`, the two lowered-integrity
+ * off-loopback attempts are `blocked` or `skipped`, and — with
+ * loopback open — `probes.openOffLoopback` is `blocked` or `skipped`
+ * and `probes.openLoopback` is `connected` or `skipped`. The remaining
  * three (`anonymous`, `anonymousLoopback`, `denyOnly`) can be anything:
  * the filters do not cover them, and one that got through is named in
  * `residuals`.
@@ -271,6 +313,16 @@ export interface WindowsWfpVerifyResult {
     untrustedIntegrity: WindowsWfpProbeOutcome
     /** The sandbox token at untrusted integrity, to the loopback target. */
     untrustedIntegrityLoopback: WindowsWfpProbeOutcome
+    /**
+     * Own token, to a NON-loopback address of this machine at the
+     * port of `openLoopback`'s listener. Only with loopback open.
+     */
+    openOffLoopback?: WindowsWfpProbeOutcome
+    /**
+     * Own token, to a loopback listener `srt-win` binds on an
+     * arbitrary port for the probe. Only with loopback open.
+     */
+    openLoopback?: WindowsWfpProbeOutcome
   }
   /**
    * Gaps the probe found open. NOT a clean pass when non-empty: the
@@ -279,9 +331,10 @@ export interface WindowsWfpVerifyResult {
    */
   residuals: WindowsWfpResidual[]
   /**
-   * Human-readable warnings: one per residual, plus one per attempt
-   * that was skipped (no off-loopback address to aim
-   * at). `initialize()` logs them.
+   * Human-readable warnings: one per residual, one per attempt that
+   * was skipped (no off-loopback address to aim at, or no loopback
+   * port to listen on), and — with loopback open —
+   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}. `initialize()` logs them.
    */
   warnings: string[]
 }
@@ -467,6 +520,14 @@ export interface WindowsSandboxParams {
   socksProxyPort?: number
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
+  /**
+   * The session's `network.allowLocalBinding`. Passed to `srt-win
+   * exec`, which launches nothing (exit 19) unless the install
+   * recorded the same loopback mode. When set, with a proxy, the
+   * child's `NO_PROXY` names the loopback hosts — see
+   * {@link WINDOWS_LOOPBACK_NO_PROXY}.
+   */
+  allowLoopback?: boolean
   /**
    * `mode: 'mask'` credential env vars — sentinel values the
    * sandboxed child should see in place of the real credentials.
@@ -881,6 +942,7 @@ type RawWfpStatus = {
   state: WindowsWfpStatus
   filters: number
   port_range?: [number, number]
+  allow_loopback?: boolean
   user_sid?: string
   hint?: string
 }
@@ -896,6 +958,7 @@ function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
     state: raw.state,
     filters: raw.filters,
     ...(raw.port_range && { portRange: raw.port_range }),
+    allowLoopback: raw.allow_loopback === true,
     ...(raw.user_sid && { userSid: raw.user_sid }),
     ...(raw.hint && { hint: raw.hint }),
   }
@@ -1025,9 +1088,47 @@ type RawWfpVerify = {
   low_integrity_loopback_probe?: string
   untrusted_integrity_probe?: string
   untrusted_integrity_loopback_probe?: string
+  lowered_integrity_target?: string | null
+  allow_loopback?: boolean
+  open_off_loopback_probe?: string
+  open_off_loopback_target?: string | null
+  open_loopback_probe?: string
+  open_loopback_target?: string | null
   residuals?: string[]
   outdated?: boolean
+  allow_loopback_mismatch?: boolean
   hint?: string
+}
+
+/**
+ * The install command that gives the machine's filter set the
+ * loopback mode `allowLoopback` asks for. `--force`: a different mode
+ * is a configuration change, which the install refuses to make
+ * silently.
+ */
+function windowsInstallCommandForLoopback(allowLoopback: boolean): string {
+  return (
+    `npx sandbox-runtime windows-install` +
+    (allowLoopback ? ` --allow-loopback` : '') +
+    ` --force`
+  )
+}
+
+/**
+ * Whether a failed `srt-win` run is an `srt-win` that predates
+ * `--allow-loopback` rejecting the argument.
+ */
+function rejectsAllowLoopback(r: { stderr: string }): boolean {
+  return /unexpected argument '--allow-loopback'/.test(r.stderr)
+}
+
+function srtWinTooOld(stderr: string): WindowsSandboxError {
+  return new WindowsSandboxError(
+    'srt_win_too_old',
+    `srt-win is too old for network.allowLocalBinding: it does not know ` +
+      `\`--allow-loopback\`. Update srt-win (and re-run the install with ` +
+      `it), or unset network.allowLocalBinding. (${stderr.trim()})`,
+  )
 }
 
 const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
@@ -1054,12 +1155,17 @@ function isWfpResidual(s: string): s is WindowsWfpResidual {
  * Pure — the spawn and the listener live in
  * {@link verifyWindowsWfpEgress}.
  *
- * - exit 19 → `wfp_fence_outdated` (the install predates this build).
+ * - an `srt-win` that does not know `--allow-loopback` →
+ *   `srt_win_too_old`.
+ * - exit 19 → `wfp_fence_outdated` (the install predates this build,
+ *   or its loopback mode is not the one the session is configured
+ *   with).
  * - exit 3, or any attempt the fence must refuse reported as having
  *   got past the filters → `wfp_fence_inactive`. Those attempts are
- *   the plain one and the four made under a copy of the sandbox
- *   token with its integrity level lowered. The attempts made while
- *   impersonating the anonymous token are not among them.
+ *   the plain one, the four made under a copy of the sandbox token
+ *   with its integrity level lowered, and — with loopback open — the
+ *   off-loopback one at the port of a loopback listener. The attempts
+ *   made while impersonating the anonymous token are not among them.
  * - any other non-zero exit → `wfp_verify_inconclusive`.
  * - exit 0 → the result, with any residuals and their warnings. A
  *   residual never throws: the filters do not close it, so refusing
@@ -1075,6 +1181,7 @@ export function interpretWindowsWfpVerify(r: {
   try {
     raw = JSON.parse(r.stdout) as RawWfpVerify
   } catch {
+    if (rejectsAllowLoopback(r)) throw srtWinTooOld(r.stderr)
     // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before
     // this parse; status=null here means an external signal.
     // Include signal + stderr so the CI log self-explains instead
@@ -1099,18 +1206,45 @@ export function interpretWindowsWfpVerify(r: {
     lowIntegrityLoopback: outcome(raw.low_integrity_loopback_probe),
     untrustedIntegrity: outcome(raw.untrusted_integrity_probe),
     untrustedIntegrityLoopback: outcome(raw.untrusted_integrity_loopback_probe),
+    // The two attempts open loopback adds.
+    ...(raw.allow_loopback && {
+      openOffLoopback: outcome(raw.open_off_loopback_probe),
+      openLoopback: outcome(raw.open_loopback_probe),
+    }),
   }
   const offLoopback = raw.anonymous_target ?? 'no target'
+  // With loopback open the lowered-integrity attempts' off-loopback
+  // half is aimed at a port that is open on loopback; `srt-win` says
+  // where.
+  const loweredTarget = raw.lowered_integrity_target ?? raw.anonymous_target
+  const loweredOffLoopback = loweredTarget ?? 'no target'
   const summary =
     `plain=${probes.plain} (${raw.target}), ` +
     `anonymous=${probes.anonymous} (${offLoopback}), ` +
     `anonymous-loopback=${probes.anonymousLoopback}, ` +
     `deny-only=${probes.denyOnly}, ` +
-    `low-integrity=${probes.lowIntegrity} (${offLoopback}), ` +
+    `low-integrity=${probes.lowIntegrity} (${loweredOffLoopback}), ` +
     `low-integrity-loopback=${probes.lowIntegrityLoopback}, ` +
-    `untrusted-integrity=${probes.untrustedIntegrity} (${offLoopback}), ` +
-    `untrusted-integrity-loopback=${probes.untrustedIntegrityLoopback}`
+    `untrusted-integrity=${probes.untrustedIntegrity} (${loweredOffLoopback}), ` +
+    `untrusted-integrity-loopback=${probes.untrustedIntegrityLoopback}` +
+    (raw.allow_loopback
+      ? `, open-off-loopback=${probes.openOffLoopback} ` +
+        `(${raw.open_off_loopback_target ?? 'no target'}), ` +
+        `open-loopback=${probes.openLoopback} ` +
+        `(${raw.open_loopback_target ?? 'no listener'})`
+      : '')
   if (r.status === 19 || raw.outdated) {
+    if (raw.allow_loopback_mismatch) {
+      throw new WindowsSandboxError(
+        'wfp_fence_outdated',
+        `WFP egress fence does not match network.allowLocalBinding — ` +
+          (raw.hint ??
+            'the installed filter set has a different loopback mode') +
+          `. Through this package: \`` +
+          windowsInstallCommandForLoopback(raw.allow_loopback === true) +
+          `\`, keeping your other install options.`,
+      )
+    }
     throw new WindowsSandboxError(
       'wfp_fence_outdated',
       `WFP egress fence is out of date — ` +
@@ -1127,10 +1261,15 @@ export function interpretWindowsWfpVerify(r: {
   const which = (
     [
       [probes.plain, 'the sandbox user', raw.target],
-      [probes.lowIntegrity, lowIl, raw.anonymous_target],
+      [probes.lowIntegrity, lowIl, loweredTarget],
       [probes.lowIntegrityLoopback, lowIl, raw.target],
-      [probes.untrustedIntegrity, untrustedIl, raw.anonymous_target],
+      [probes.untrustedIntegrity, untrustedIl, loweredTarget],
       [probes.untrustedIntegrityLoopback, untrustedIl, raw.target],
+      [
+        probes.openOffLoopback,
+        'the sandbox user (a port open on loopback, on a non-loopback address)',
+        raw.open_off_loopback_target,
+      ],
     ] as const
   )
     .filter(([o]) => o === 'connected' || o === 'refused')
@@ -1167,6 +1306,24 @@ export function interpretWindowsWfpVerify(r: {
         `srt-win that does not make them)`,
     )
   }
+  if (probes.openOffLoopback === 'skipped') {
+    warnings.push(
+      `WFP egress fence: the off-loopback attempt at a port open on ` +
+        `loopback was skipped (no off-loopback address on this machine to ` +
+        `aim it at, or no listener), so that the port is closed off ` +
+        `loopback is unverified this run`,
+    )
+  }
+  if (probes.openLoopback === 'skipped') {
+    warnings.push(
+      `WFP egress fence: the open-loopback reachability attempt was ` +
+        `skipped (no loopback port to listen on), so that loopback is ` +
+        `open is unverified this run`,
+    )
+  }
+  // A pass says direct egress is blocked. With loopback open that is
+  // not the whole story, so the result says the rest.
+  if (raw.allow_loopback) warnings.push(WINDOWS_ALLOW_LOOPBACK_EFFECT)
   return { target: raw.target, stderr: r.stderr, probes, residuals, warnings }
 }
 
@@ -1204,10 +1361,26 @@ export function interpretWindowsWfpVerify(r: {
  * required, so the synchronous `runSrtWin` is safe). Does not require
  * elevation and does not depend on any external host.
  *
- * Attempts 1 and 5 are what the fence must refuse: either getting
- * through throws. Attempts 2, 3 and 4 are shapes the filter set does
- * not refuse — attempt 2 is expected to get through; when they do,
- * the result names them in `residuals` (with `warnings`) rather than
+ * With `opts.allowLoopback` (the session's `network.allowLocalBinding`)
+ * loopback is open, so the listener is bound on one of
+ * {@link WINDOWS_LOOPBACK_FLOOR_PORTS} — the loopback ports that stay
+ * blocked — and the probe makes two more attempts, both under its own
+ * token, aiming the off-loopback half of attempt 5 where attempt 6
+ * goes:
+ *
+ * 6. to this machine's own off-loopback address at the port of
+ *    attempt 7's listener (nothing listens there) — loopback is open
+ *    for loopback addresses only;
+ * 7. to a loopback listener `srt-win` itself binds on an arbitrary
+ *    port for the probe — loopback must actually be open.
+ *
+ * Attempts 1, 5 and 6 are what the fence must refuse: any of them
+ * getting through throws. So does attempt 7 being blocked, and a
+ * loopback mode that is not the one the install recorded
+ * (`wfp_fence_outdated`, before anything is probed). Attempts 2, 3 and
+ * 4 are shapes the filter set does not refuse — attempt 2 is expected
+ * to get through; when they do, the
+ * result names them in `residuals` (with `warnings`) rather than
  * passing silently — see {@link WindowsWfpResidual}.
  *
  * `initialize()` calls this once per session, so a stale install
@@ -1220,6 +1393,8 @@ export function interpretWindowsWfpVerify(r: {
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
+ * @param opts.allowLoopback the session's `network.allowLocalBinding`.
+ *   `srt-win` compares it with the installed loopback mode.
  * @throws on any outcome other than exit 0 — see
  *   {@link interpretWindowsWfpVerify}.
  */
@@ -1227,11 +1402,37 @@ export async function verifyWindowsWfpEgress(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
+    allowLoopback?: boolean
     srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
   let target = opts.target
   let server: net.Server | undefined
+  if (!target && opts.allowLoopback) {
+    // Loopback is open, so the listener goes on a port that stays
+    // blocked: the first of the floor that is free.
+    for (const p of WINDOWS_LOOPBACK_FLOOR_PORTS) {
+      const s = net.createServer()
+      try {
+        s.listen(p, '127.0.0.1')
+        await once(s, 'listening')
+      } catch {
+        s.close()
+        continue
+      }
+      server = s
+      target = `127.0.0.1:${p}`
+      break
+    }
+    if (!target) {
+      throw new WindowsSandboxError(
+        'wfp_verify_bind_failed',
+        `verifyWindowsWfpEgress: could not bind a loopback listener on ` +
+          `any of the ports that stay blocked with loopback open ` +
+          `(${WINDOWS_LOOPBACK_FLOOR_PORTS.join(', ')})`,
+      )
+    }
+  }
   if (!target) {
     // Bind ephemeral; retry if it lands inside the WFP
     // loopback-permit range (a port in-range would be PERMITted
@@ -1258,11 +1459,13 @@ export async function verifyWindowsWfpEgress(
       )
     }
   }
+  const args = ['wfp', 'verify', '--target', target]
+  if (opts.allowLoopback) args.push('--allow-loopback')
   try {
     // 30s: first call after install may create the sandbox user's
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
     // the runner bounds each of its connects (probe.rs).
-    const r = runSrtWin(['wfp', 'verify', '--target', target], {
+    const r = runSrtWin(args, {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
     })
@@ -1674,14 +1877,24 @@ export interface WindowsInstallOptions {
    */
   proxyPortRange?: readonly [number, number]
   /**
+   * Open loopback to sandboxed commands — see
+   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}. Must match what
+   * `SandboxRuntimeConfig.network.allowLocalBinding` will be set to.
+   * Default: false. Take it only from a source the machine's user or
+   * administrator controls, never from a project's own files.
+   * Changing it on an existing install is a configuration change and
+   * needs {@link force}.
+   */
+  allowLoopback?: boolean
+  /**
    * Name for the sandbox user account (created if absent, adopted
    * if it already exists as a local user). Default `srt-sandbox`.
    */
   sandboxUser?: string
   /**
    * Replace an existing install whose configuration differs
-   * (different port range or sandbox-user name under the same
-   * sublayer). Without this, install refuses with "already
+   * (different port range, loopback mode or sandbox-user name
+   * under the same sublayer). Without this, install refuses with "already
    * installed with different config" rather than silently
    * overwriting.
    */
@@ -1731,6 +1944,7 @@ function installArgs(opts: WindowsInstallOptions): string[] {
       `${opts.proxyPortRange[0]}-${opts.proxyPortRange[1]}`,
     )
   }
+  if (opts.allowLoopback) args.push('--allow-loopback')
   if (opts.sandboxUser) args.push('--sandbox-user', opts.sandboxUser)
   if (opts.force) args.push('--force')
   return args
@@ -1766,6 +1980,7 @@ function throwOnInstallFailure(r: RunResult): void {
     `[Sandbox Windows] install exit=${r.status}: ${r.stderr || r.stdout}`,
   )
   if (r.status === 0 || r.status === 10) return
+  if (rejectsAllowLoopback(r)) throw srtWinTooOld(r.stderr)
   const out = r.stderr || r.stdout
   switch (r.status) {
     case 12:
@@ -1782,7 +1997,8 @@ function throwOnInstallFailure(r: RunResult): void {
       throw new WindowsSandboxError(
         'install_config_conflict',
         `srt-win install: filters already exist under this sublayer with ` +
-          `a different port range or sandbox-user name. Pass ` +
+          `a different port range, loopback mode or sandbox-user ` +
+          `name. Pass ` +
           `{force: true} to replace, or pick a different sublayerGuid. ` +
           `Output: ${out}`,
       )
@@ -1820,9 +2036,10 @@ function throwOnInstallFailure(r: RunResult): void {
  * `spawnSync`-blocks the event loop for the full UAC-prompt wait
  * (up to `timeoutMs`).
  *
- * @throws on user/WFP creation failure, or if filters already exist
- *   under `sublayerGuid` with a different port range and `force` is
- *   not set.
+ * @throws on user/WFP creation failure, if filters already exist
+ *   under `sublayerGuid` with a different port range or loopback mode
+ *   and `force` is not set, or (`srt_win_too_old`) if `allowLoopback`
+ *   is set and `srt-win` predates it.
  */
 export function installWindowsSandbox(
   opts: WindowsInstallOptions = {},
@@ -2428,6 +2645,14 @@ export function revokeWindowsAcl(opts: {
  * what we pass as `--env` — built here from the broker's `PATH` plus
  * the generated proxy set.
  */
+/**
+ * `NO_PROXY` for a sandboxed child when `network.allowLocalBinding`
+ * is set: the loopback hosts, so proxy-aware clients connect to local
+ * servers directly. Without it `NO_PROXY` is not set at all and
+ * localhost requests go through the proxy.
+ */
+export const WINDOWS_LOOPBACK_NO_PROXY = 'localhost,127.0.0.1,::1'
+
 export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   argv: string[]
   env: NodeJS.ProcessEnv
@@ -2470,6 +2695,18 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // SID, and is not fenced).
   delete generated.NO_PROXY
   delete generated.no_proxy
+  // With loopback open the fence does permit direct connects to
+  // loopback, and that is the only way to a local server that the
+  // proxy would not reach or allow. So the loopback hosts — and
+  // nothing else of the POSIX list: the private-network entries are
+  // still fenced — go back into NO_PROXY. A proxy-aware client then
+  // connects directly to every localhost port, the filtering proxy is
+  // not consulted for them, and one of the few ports that stay blocked
+  // is refused by the fence instead of being sent through the proxy.
+  if (p.allowLoopback && (p.httpProxyPort || p.socksProxyPort)) {
+    generated.NO_PROXY = WINDOWS_LOOPBACK_NO_PROXY
+    generated.no_proxy = WINDOWS_LOOPBACK_NO_PROXY
+  }
 
   // GIT_CONFIG_* set — safe.directory (dubious-ownership) + the
   // schannel CA knobs. Composed against setEnvVars so a caller
@@ -2486,6 +2723,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
   if (p.quiet !== false) argv.push('--quiet')
+  if (p.allowLoopback) argv.push('--allow-loopback')
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env
@@ -2606,6 +2844,7 @@ function interpretDependencyProbes(
   sublayerGuid: string | undefined,
   user: PromiseSettledResult<WindowsSandboxUserStatus>,
   getWfp: () => PromiseSettledResult<WindowsWfpStatusResult>,
+  allowLoopback?: boolean,
 ): SandboxDependencyCheck {
   const errors: string[] = []
   const warnings: string[] = []
@@ -2660,8 +2899,38 @@ function interpretDependencyProbes(
   } else if (ws.portRange) {
     logForDebugging(
       `[Sandbox Windows] WFP installed: ${ws.filters} filters, ` +
-        `proxy port range ${ws.portRange[0]}-${ws.portRange[1]}`,
+        `proxy port range ${ws.portRange[0]}-${ws.portRange[1]}, ` +
+        `loopback ${ws.allowLoopback ? 'open' : 'closed'}`,
     )
+  }
+
+  // 4. The installed loopback mode is the configured one, in either
+  // direction. `undefined` = the caller did not say what is
+  // configured (nothing to compare). Both an elevated status
+  // (`installed`, read off the filters) and a non-elevated one
+  // (`cannot-read`, read off the install record) report the mode.
+  const mode = (open: boolean): string => (open ? 'open' : 'closed')
+  const fenced =
+    us.provisioned &&
+    us.credPresent &&
+    (ws.state === 'installed' || ws.state === 'cannot-read')
+  if (
+    fenced &&
+    allowLoopback !== undefined &&
+    ws.allowLoopback !== allowLoopback
+  ) {
+    errors.push(
+      `WFP filters under sublayer ${sublayerGuid ?? '(default)'} do not ` +
+        `match network.allowLocalBinding (installed: loopback ` +
+        `${mode(ws.allowLoopback)}; configured: ` +
+        `${mode(allowLoopback)}). Re-run the install for this ` +
+        `configuration, keeping your other install options ` +
+        `(one UAC prompt):\n  ` +
+        windowsInstallCommandForLoopback(allowLoopback),
+    )
+  } else if (fenced && ws.allowLoopback) {
+    // Not an error, and not to be read past: say what is open.
+    warnings.push(WINDOWS_ALLOW_LOOPBACK_EFFECT)
   }
 
   return { errors, warnings }
@@ -2674,9 +2943,18 @@ function interpretDependencyProbes(
  * Prefer {@link checkWindowsDependenciesAsync}; this variant
  * `spawnSync`-blocks the event loop on two `srt-win.exe` spawns
  * (Windows Defender cold-scan can add seconds).
+ *
+ * @param opts.allowLoopback the configuration's
+ *   `network.allowLocalBinding` (`false` when unset): an install with
+ *   the other loopback mode is then an error. Omit to skip the
+ *   comparison.
  */
 export function checkWindowsDependencies(
-  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
+  opts: {
+    sublayerGuid?: string
+    srtWin?: SrtWinSpawn
+    allowLoopback?: boolean
+  } = {},
 ): SandboxDependencyCheck {
   // 1. Binary present. The argless `resolveSrtWin()` throws (no
   // implicit vendor fallback) — surfaced as a dependency error
@@ -2696,6 +2974,7 @@ export function checkWindowsDependencies(
       settle(() =>
         getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid, srtWin }),
       ),
+    opts.allowLoopback,
   )
 }
 
@@ -2705,7 +2984,11 @@ export function checkWindowsDependencies(
  * and never blocks the event loop.
  */
 export async function checkWindowsDependenciesAsync(
-  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
+  opts: {
+    sublayerGuid?: string
+    srtWin?: SrtWinSpawn
+    allowLoopback?: boolean
+  } = {},
 ): Promise<SandboxDependencyCheck> {
   let srtWin: SrtWinSpawn
   try {
@@ -2718,5 +3001,10 @@ export async function checkWindowsDependenciesAsync(
     getWindowsSandboxUserStatusAsync({ srtWin }),
     getWindowsWfpStatusAsync({ sublayerGuid: opts.sublayerGuid, srtWin }),
   ])
-  return interpretDependencyProbes(opts.sublayerGuid, user, () => wfp)
+  return interpretDependencyProbes(
+    opts.sublayerGuid,
+    user,
+    () => wfp,
+    opts.allowLoopback,
+  )
 }

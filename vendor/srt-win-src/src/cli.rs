@@ -111,8 +111,8 @@ enum Cmd {
     ///   10 — UAC prompt cancelled by the user
     ///   12 — WFP filter install failed
     ///   13 — already installed under this sublayer with a
-    ///        DIFFERENT port-range or sandbox-user name; pass
-    ///        `--force` to replace
+    ///        DIFFERENT port-range, loopback mode or
+    ///        sandbox-user name; pass `--force` to replace
     ///   14 — sandbox user provisioning failed
     ///   1  — other error (parse, elevation check, etc.)
     Install {
@@ -122,14 +122,25 @@ enum Cmd {
         /// Loopback port range (`LOW-HIGH`, default 60080-60089).
         #[arg(long, value_name = "LOW-HIGH")]
         proxy_port_range: Option<String>,
+        /// Open loopback: the sandbox account may connect to
+        /// 127.0.0.0/8 and ::1 on every TCP and UDP port except those
+        /// in `wfp::LOOPBACK_FLOOR_PORTS`. Default: closed (only the
+        /// proxy port range is reachable). Every listener on
+        /// localhost — whoever owns it — becomes reachable from the
+        /// sandbox, including any local forwarder that carries
+        /// traffic off the machine. Changing the mode means running
+        /// `install` again (with `--force`); a session configured
+        /// with the other mode than the installed one is refused.
+        #[arg(long)]
+        allow_loopback: bool,
         /// Name for the sandbox user account. Default:
         /// `srt-sandbox`. srt-win only manages an account it
         /// created — a name that already resolves to a principal
         /// srt-win didn't provision is refused (exit 14).
         #[arg(long)]
         sandbox_user: Option<String>,
-        /// Replace an existing install whose port-range or
-        /// sandbox-user name differs (otherwise exits 13).
+        /// Replace an existing install whose port-range, loopback
+        /// mode or sandbox-user name differs (otherwise exits 13).
         #[arg(long)]
         force: bool,
     },
@@ -200,9 +211,16 @@ enum Cmd {
     /// otherwise exits **15**. Exits **19**, without launching
     /// anything, when the install record says the WFP filter set
     /// was written by an earlier build (and so lacks filters this
-    /// one requires) or was removed by an uninstall — re-run
-    /// `srt-win install`.
+    /// one requires) or was removed by an uninstall, or that its
+    /// loopback mode is not the one `--allow-loopback` (or its
+    /// absence) names — re-run `srt-win install`.
     Exec {
+        /// This session expects loopback open. Must be given exactly
+        /// when `srt-win install --allow-loopback` installed it:
+        /// on a difference in either direction nothing is launched
+        /// and the exit code is 19.
+        #[arg(long)]
+        allow_loopback: bool,
         /// Per-exec read-deny: add an additive `(D;OICI;FA;;;<sb>)`
         /// ACE for the sandbox user on `<PATH>` (and a parent
         /// `FILE_DELETE_CHILD` DENY) for the lifetime of this exec
@@ -602,10 +620,15 @@ fn wfp_status(sublayer: &windows::core::GUID) -> anyhow::Result<srt_win::wfp::Wf
         .ok()
         .flatten()
         .map(|_| install::read_fence_revision().ok().flatten());
-    Ok(wfp::apply_recorded_revision(
-        wfp::filter_status(sublayer)?,
-        record,
-    ))
+    let st = wfp::apply_recorded_revision(wfp::filter_status(sublayer)?, record);
+    // A recorded loopback mode that cannot be read is treated as no
+    // record: the non-elevated caller then reports closed, and `wfp
+    // verify` / `exec` — which do fail on it — say why.
+    let recorded_loopback = match record {
+        Some(_) => install::read_allow_loopback().ok(),
+        None => None,
+    };
+    Ok(wfp::apply_recorded_loopback(st, recorded_loopback))
 }
 
 /// Install-time ambient write-deny state: the recorded paths (HKLM
@@ -693,7 +716,12 @@ impl Drop for PerExecRestore {
 #[derive(Subcommand)]
 enum WfpCmd {
     /// Print WFP fence state as JSON: `{state, filters,
-    /// port_range?, user_sid?, hint?}`. BFE's
+    /// port_range?, allow_loopback, loopback_notice?, user_sid?,
+    /// hint?}`. `allow_loopback` is whether the installed set opens
+    /// loopback (read off the filters when elevated, off the install
+    /// record otherwise); when it does, `loopback_notice` says in
+    /// plain words what that exposes.
+    /// BFE's
     /// `FwpmFilterCreateEnumHandle0` is admin-gated, so a
     /// non-elevated caller gets `{state:"cannot-read", hint:…}`
     /// (exit 0). The non-elevated readiness check is `wfp verify`.
@@ -702,7 +730,8 @@ enum WfpCmd {
     /// written by an earlier build and lacks filters this build
     /// requires — re-run `srt-win install`. An elevated caller reads
     /// that off the filters; a non-elevated one off the install
-    /// record.
+    /// record. An elevated caller also gets it when the loopback
+    /// mode of the filters is not the recorded one.
     Status {
         #[arg(long)]
         sublayer_guid: Option<String>,
@@ -725,10 +754,21 @@ enum WfpCmd {
     ///     SID deny-only, to `target`.
     ///   - `low_integrity_probe`, `low_integrity_loopback_probe` — a
     ///     copy of the own token at low integrity, to
-    ///     `anonymous_target` and to `target`.
+    ///     `lowered_integrity_target` and to `target`.
+    ///     `lowered_integrity_target` is `anonymous_target`, or with
+    ///     `--allow-loopback` the same address at a port that is open
+    ///     on loopback (`open_off_loopback_target`).
     ///   - `untrusted_integrity_probe`,
     ///     `untrusted_integrity_loopback_probe` — the same at
     ///     untrusted integrity.
+    ///   - `open_loopback_probe` — own token, to
+    ///     `open_loopback_target`: a loopback listener this command
+    ///     binds on an arbitrary port for the probe. `skipped`
+    ///     without `--allow-loopback`, or when none could be bound.
+    ///   - `open_off_loopback_probe` — own token, to
+    ///     `open_off_loopback_target`: a non-loopback address of this
+    ///     machine at that listener's port. `skipped` without
+    ///     `--allow-loopback`.
     ///   - `residuals` — names of the gaps `anonymous_probe`,
     ///     `anonymous_loopback_probe` and `deny_only_probe` found
     ///     open (`anonymous-egress`, `anonymous-loopback`,
@@ -738,37 +778,58 @@ enum WfpCmd {
     ///     wherever the machine has an off-loopback address: no
     ///     filter is keyed on the anonymous token.
     ///
-    /// Every probe but `egress_probe` makes its connect twice: once
-    /// on a socket created before the token is assumed and once on a
-    /// socket created after, since the engine attributes a connect
-    /// to the token in effect when its socket was created. The JSON
-    /// carries the worse of the two results for the fence; stderr
-    /// carries one line per ordering, each naming it (`socket before
-    /// token`, `socket after token`).
+    /// Every probe but `egress_probe` and the two `open_*` ones
+    /// (all three run under the runner's own token) makes its connect
+    /// twice: once on a socket created before the token is assumed
+    /// and once on a socket created after, since the engine
+    /// attributes a connect to the token in effect when its socket
+    /// was created. The JSON carries the worse of the two results for
+    /// the fence; stderr carries one line per ordering, each naming
+    /// it (`socket before token`, `socket after token`).
     ///
-    /// Every other probe must be blocked: `egress_probe` and the
-    /// four lowered-integrity ones, whose token still carries the
-    /// sandbox account's SID. Exits **0**
-    /// (all of them were blocked, or skipped for want of an
-    /// off-loopback address = fence active), **3** (one got past the
-    /// filters = fence MISSING), **2** (one was inconclusive — `error`
-    /// means no connect was made under the token: it could not be
-    /// assumed, or did not read back as assumed once the socket
-    /// existed, which is not a block; treat as failure), **19** when the
-    /// install record says the filter set predates this build, or
+    /// Every other probe but `open_loopback_probe` must be blocked:
+    /// `egress_probe`, the four lowered-integrity
+    /// ones, whose token still carries the sandbox account's SID, and
+    /// `open_off_loopback_probe`. Exits **0** (all of them were
+    /// blocked, or skipped for want of an off-loopback address or
+    /// with loopback closed, and `open_loopback_probe` connected or
+    /// was skipped = fence active), **3** (one got past the filters = fence
+    /// MISSING), **2** (one was inconclusive — `error` means no
+    /// connect was made under the token: it could not be assumed, or
+    /// did not read back as assumed once the socket existed, which is
+    /// not a block; treat as failure), **19** when the install record
+    /// says the filter set predates this build or has the other
+    /// loopback mode than `--allow-loopback` (or its absence) names,
+    /// or when the open-loopback listener was blocked (`outdated:
+    /// true`, with a `hint`; the two loopback cases also carry
+    /// `allow_loopback_mismatch: true`), or
     /// **15** when the sandbox user is not provisioned. A runner
     /// exit that is not a probe report prints every probe as
     /// `error` and exits 1. Does not require elevation. This is the
     /// non-elevated readiness check the host's `initialize()` runs;
     /// `wfp status` is the elevated ground-truth enum.
+    ///
+    /// With `--allow-loopback` the JSON carries `allow_loopback: true`
+    /// and a `loopback_notice` (also printed to stderr): loopback is
+    /// open, so a pass means direct connections off the machine are
+    /// blocked, not that nothing on localhost forwards traffic off
+    /// it.
     Verify {
         /// Probe target (`host:port`). The host binds a local
-        /// listener on an ephemeral loopback port OUTSIDE the WFP
-        /// loopback-permit range and passes it here, so the
-        /// fence-inactive case is deterministic without depending
-        /// on any external host.
+        /// listener on a loopback port no PERMIT covers and passes
+        /// it here, so the fence-inactive case is deterministic
+        /// without depending on any external host: an ephemeral port
+        /// outside the proxy port range, or with `--allow-loopback`
+        /// one of `wfp::LOOPBACK_FLOOR_PORTS`. With
+        /// `--allow-loopback` any other loopback target is refused
+        /// (exit 1): an intact fence permits it.
         #[arg(long)]
         target: String,
+        /// This session expects loopback open. Compared with the
+        /// installed mode (exit 19 on a difference in either
+        /// direction) and, when given, probed.
+        #[arg(long)]
+        allow_loopback: bool,
         /// Off-loopback target (`host:port`) for the attempt made
         /// while impersonating the anonymous token, and for the
         /// lowered-integrity attempts' off-loopback half. Default: this
@@ -804,22 +865,26 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Install {
             sublayer_guid,
             proxy_port_range,
+            allow_loopback,
             sandbox_user,
             force,
         } => {
             use srt_win::{install, user};
-            if let Some(code) = maybe_self_elevate(args)? {
-                std::process::exit(code);
-            }
-            let sl = resolve_sublayer(&sublayer_guid)?;
+            // The range is validated before the elevation prompt: one
+            // that will be refused should not cost a prompt.
             let range = match &proxy_port_range {
                 Some(s) => wfp::parse_port_range(s)
                     .with_context(|| format!("invalid --proxy-port-range '{s}'"))?,
                 None => wfp::DEFAULT_PROXY_PORT_RANGE,
             };
+            if let Some(code) = maybe_self_elevate(args)? {
+                std::process::exit(code);
+            }
+            let sl = resolve_sublayer(&sublayer_guid)?;
             let name = sandbox_user.as_deref().unwrap_or(user::SANDBOX_USER);
             // Idempotency / conflict pre-check. With a DIFFERENT
-            // port-range or sandbox-user name and no --force, refuse
+            // port-range, loopback mode or sandbox-user name
+            // and no --force, refuse
             // (exit 13) so an unintended config drift surfaces
             // instead of silently overwriting. With the SAME config,
             // only return early when the install is COMPLETE — i.e.
@@ -841,7 +906,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 && matches!(st.state, "installed" | "outdated")
             {
                 let want = [range.0, range.1];
-                if st.port_range != Some(want) || name_changed {
+                if st.port_range != Some(want)
+                    || st.allow_loopback != allow_loopback
+                    || name_changed
+                {
                     let have_range = st
                         .port_range
                         .map(|[l, h]| format!("{l}-{h}"))
@@ -853,11 +921,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     eprintln!(
                         "srt-win: error: already installed under \
                          sublayer {sl:?} with port_range={have_range}, \
+                         loopback={}, \
                          sandbox_user='{have_name}'; requested \
-                         port_range={}-{}, sandbox_user='{name}'. \
+                         port_range={}-{}, loopback={}, \
+                         sandbox_user='{name}'. \
                          Pass --force to replace, or run `srt-win \
                          uninstall` first.",
-                        range.0, range.1,
+                        wfp::fmt_loopback(st.allow_loopback),
+                        range.0,
+                        range.1,
+                        wfp::fmt_loopback(allow_loopback),
                     );
                     std::process::exit(13);
                 }
@@ -880,12 +953,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // than early-outing on "already installed".
                 // So is the fence: the enumerated set and the
                 // install record must both be at this build's
-                // revision.
+                // revision, and the record must carry the loopback
+                // mode the enumerated set has.
                 if us.exists
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
                     && st.state == "installed"
                     && install::require_current_fence().is_ok()
+                    && install::require_allow_loopback(allow_loopback).is_ok()
                     && install::cred_present()
                     && ambient_ok()
                 {
@@ -1000,13 +1075,30 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(17);
                 }
             }
-            if let Err(e) = wfp::install_filters(&sl, &pu.sid, range) {
+            // A changing loopback mode: mark the fence removed in the
+            // record BEFORE replacing the filters, so that a failure
+            // anywhere between here and the revision write below
+            // leaves a record `exec` refuses on, never a
+            // current-looking one beside filters with the other mode.
+            // An unreadable recorded mode counts as changing.
+            if install::read_allow_loopback().ok() != Some(allow_loopback)
+                && let Err(e) = install::mark_fence_removed()
+            {
+                eprintln!("srt-win: error: mark WFP fence removed: {e:#}");
+                std::process::exit(12);
+            }
+            if let Err(e) = wfp::install_filters(&sl, &pu.sid, range, allow_loopback) {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
             }
-            // Only now that the filters are committed: record their
-            // revision for the non-elevated broker, which cannot
-            // enumerate them.
+            // Only now that the filters are committed: record what
+            // they open and their revision for the non-elevated
+            // broker, which cannot enumerate them. The revision is
+            // written last — it is what makes the record current.
+            if let Err(e) = install::write_allow_loopback(allow_loopback) {
+                eprintln!("srt-win: error: record loopback mode: {e:#}");
+                std::process::exit(12);
+            }
             if let Err(e) = install::write_fence_revision(wfp::FENCE_REVISION) {
                 eprintln!("srt-win: error: record WFP fence revision: {e:#}");
                 std::process::exit(12);
@@ -1020,11 +1112,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let _ = srt_win::sam::delete_local_group("sandbox-runtime-net");
             eprintln!(
                 "srt-win: installed (sublayer={sl:?}, \
-                 proxy_port_range={}-{}, filters={})",
+                 proxy_port_range={}-{}, loopback={}, \
+                 filters={})",
                 range.0,
                 range.1,
-                wfp::FILTER_COUNT,
+                wfp::fmt_loopback(allow_loopback),
+                wfp::filter_count(allow_loopback),
             );
+            if allow_loopback {
+                eprintln!("srt-win: warning: {}", wfp::open_loopback_notice());
+            }
             eprintln!(
                 "srt-win: sandbox user '{}' provisioned (sid={}, \
                  group={} sid={})",
@@ -1159,14 +1256,27 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sub:
                 WfpCmd::Verify {
                     target,
+                    allow_loopback,
                     anonymous_target,
                 },
         } => {
             use srt_win::{install, logon, probe, runner};
+            // With loopback open, the must-be-blocked loopback target
+            // can only be one of the ports that stay blocked.
+            if allow_loopback
+                && let Ok(addr) = target.parse::<std::net::SocketAddr>()
+                && probe::target_is_open_loopback(&addr)
+            {
+                return Err(anyhow!(
+                    "wfp verify: --target {target} is a loopback port that \
+                     --allow-loopback opens, which the fence permits; pass one \
+                     of the ports that stay blocked"
+                ));
+            }
             // A BLOCK fires at ALE_AUTH_CONNECT before any packet
             // leaves, so a fenced connect gives WSAEACCES (~0ms); a
             // MISSING fence lets it through. The host passes a local
-            // loopback listener bound outside the WFP permit range
+            // loopback listener bound on a port no PERMIT covers
             // so fence-missing is distinguishable from fence-active
             // without depending on any external host.
             let r = install::read_cred().and_then(|c| {
@@ -1192,27 +1302,58 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // The install record is checked before probing: a filter
             // set from an earlier build is refused by name, with the
             // repair, instead of by whichever attempt happens to get
-            // through. A record that says the filters were REMOVED
-            // is not refused here: the probe then shows the missing
-            // fence itself (exit 3), which is the stronger answer.
-            if !install::fence_marked_removed()
-                && let Err(hint) = install::require_current_fence()
-            {
-                eprintln!("srt-win: error: wfp verify: {hint}");
-                finish(
-                    json!({
-                        "egress_probe": "not-run",
-                        "target": target,
-                        "outdated": true,
-                        "hint": hint,
-                    }),
-                    probe::EXIT_FENCE_OUTDATED,
-                );
+            // through. So is a filter set whose loopback mode is not
+            // the one this session is configured with. A record that
+            // says the filters were REMOVED is not refused here: the
+            // probe then shows the missing fence itself (exit 3),
+            // which is the stronger answer.
+            let notice = allow_loopback.then(wfp::open_loopback_notice);
+            if !install::fence_marked_removed() {
+                if let Err(hint) = install::require_current_fence() {
+                    eprintln!("srt-win: error: wfp verify: {hint}");
+                    finish(
+                        json!({
+                            "egress_probe": "not-run",
+                            "target": target,
+                            "outdated": true,
+                            "hint": hint,
+                        }),
+                        probe::EXIT_FENCE_OUTDATED,
+                    );
+                }
+                // `allow_loopback_mismatch` tells the host that the
+                // repair is an install with THIS session's loopback
+                // mode (`allow_loopback`).
+                if let Err(hint) = install::require_allow_loopback(allow_loopback) {
+                    eprintln!("srt-win: error: wfp verify: {hint}");
+                    finish(
+                        json!({
+                            "egress_probe": "not-run",
+                            "target": target,
+                            "outdated": true,
+                            "allow_loopback_mismatch": true,
+                            "allow_loopback": allow_loopback,
+                            "hint": hint,
+                        }),
+                        probe::EXIT_FENCE_OUTDATED,
+                    );
+                }
             }
             let anonymous_target = anonymous_target.or_else(|| {
                 let port = target.parse::<std::net::SocketAddr>().ok()?.port();
                 probe::off_loopback_target(port).map(|a| a.to_string())
             });
+            // The two attempts open loopback adds: a loopback
+            // listener bound here, on an arbitrary port, for as long
+            // as the runner takes, and this machine's own off-loopback
+            // address at that port (nothing listens there). Neither
+            // depends on a listener some other process owns.
+            let open_listener = allow_loopback.then(probe::bind_open_loopback).flatten();
+            let open_loopback_addr = open_listener.as_ref().and_then(|l| l.local_addr().ok());
+            let open_loopback_target = open_loopback_addr.map(|a| a.to_string());
+            let open_off_loopback_target = open_loopback_addr
+                .and_then(|a| probe::off_loopback_target(a.port()))
+                .map(|a| a.to_string());
             let code = logon::spawn_runner(
                 &cred.user,
                 &cred.pw,
@@ -1221,10 +1362,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 &runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
                     anonymous_target: anonymous_target.clone(),
+                    open_off_loopback_target: open_off_loopback_target.clone(),
+                    open_loopback_target: open_loopback_target.clone(),
                 },
                 false,
             )
             .context("spawn runner for egress probe")?;
+            drop(open_listener);
+            // Where the runner aimed the lowered-integrity attempts'
+            // off-loopback half.
+            let lowered_integrity_target = probe::lowered_off_loopback(
+                open_off_loopback_target.clone(),
+                anonymous_target.clone(),
+            );
             let Some(report) = probe::Report::decode(code) else {
                 // 1 is the runner's own anyhow `Err` path (`main()`
                 // → `eprintln!` + `exit(1)`); anything else is an
@@ -1239,8 +1389,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         "low_integrity_loopback_probe": "error",
                         "untrusted_integrity_probe": "error",
                         "untrusted_integrity_loopback_probe": "error",
+                        "open_off_loopback_probe": "error",
+                        "open_loopback_probe": "error",
+                        "lowered_integrity_target": lowered_integrity_target,
                         "target": target,
                         "anonymous_target": anonymous_target,
+                        "allow_loopback": allow_loopback,
+                        "open_off_loopback_target": open_off_loopback_target,
+                        "open_loopback_target": open_loopback_target,
                         "residuals": [],
                         "runner_exit": code,
                     }),
@@ -1268,24 +1424,46 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     },
                 );
             }
-            finish(
-                json!({
-                    "egress_probe": report.plain.label(),
-                    "anonymous_probe": report.anonymous.label(),
-                    "anonymous_loopback_probe": report.anonymous_loopback.label(),
-                    "deny_only_probe": report.deny_only.label(),
-                    "low_integrity_probe": report.low_integrity.label(),
-                    "low_integrity_loopback_probe": report.low_integrity_loopback.label(),
-                    "untrusted_integrity_probe": report.untrusted_integrity.label(),
-                    "untrusted_integrity_loopback_probe":
-                        report.untrusted_integrity_loopback.label(),
-                    "target": target,
-                    "anonymous_target": anonymous_target,
-                    "residuals": verdict.residuals,
-                    "runner_exit": code,
-                }),
-                verdict.exit,
-            );
+            let mut doc = json!({
+                "egress_probe": report.plain.label(),
+                "anonymous_probe": report.anonymous.label(),
+                "anonymous_loopback_probe": report.anonymous_loopback.label(),
+                "deny_only_probe": report.deny_only.label(),
+                "low_integrity_probe": report.low_integrity.label(),
+                "low_integrity_loopback_probe": report.low_integrity_loopback.label(),
+                "untrusted_integrity_probe": report.untrusted_integrity.label(),
+                "untrusted_integrity_loopback_probe":
+                    report.untrusted_integrity_loopback.label(),
+                "lowered_integrity_target": lowered_integrity_target,
+                "open_off_loopback_probe": report.open_off_loopback.label(),
+                "open_loopback_probe": report.open_loopback.label(),
+                "target": target,
+                "anonymous_target": anonymous_target,
+                "allow_loopback": allow_loopback,
+                "open_off_loopback_target": open_off_loopback_target,
+                "open_loopback_target": open_loopback_target,
+                "residuals": verdict.residuals,
+                "runner_exit": code,
+            });
+            // Loopback is open: whatever the probes say about direct
+            // egress, say what else is reachable.
+            if let Some(notice) = notice {
+                eprintln!("srt-win: warning: wfp verify: {notice}");
+                doc["loopback_notice"] = json!(notice);
+            }
+            // The record and the session agree that loopback is open,
+            // and the broker's own loopback listener was still
+            // blocked: the filters in place are not the recorded
+            // ones. Reported like any other fence the install must
+            // replace.
+            if verdict.exit == probe::EXIT_FENCE_OUTDATED {
+                let hint = wfp::loopback_closed_hint();
+                eprintln!("srt-win: error: wfp verify: {hint}");
+                doc["outdated"] = json!(true);
+                doc["allow_loopback_mismatch"] = json!(true);
+                doc["hint"] = json!(hint);
+            }
+            finish(doc, verdict.exit);
         }
         Cmd::Wfp {
             sub: WfpCmd::Uninstall { sublayer_guid },
@@ -1565,6 +1743,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
 
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
+            allow_loopback,
             deny_read,
             deny_write,
             env,
@@ -1626,7 +1805,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // wfp verify` at the host's `initialize()`. Standalone
             // `srt-win exec` callers should run `srt-win wfp verify`
             // once per session.
-            if let Err(hint) = install::require_current_fence() {
+            //
+            // The same record says whether the filters open loopback.
+            // A session configured the other way — in either
+            // direction — is refused here too: it would otherwise run
+            // behind a fence it was not told about.
+            if let Err(hint) = install::require_current_fence()
+                .and_then(|()| install::require_allow_loopback(allow_loopback))
+            {
                 eprintln!("srt-win: error: {hint}");
                 std::process::exit(srt_win::probe::EXIT_FENCE_OUTDATED);
             }
@@ -2008,6 +2194,91 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    /// `--allow-loopback` parses on the three commands that take it
+    /// and is off by default. Placement before `--` on `exec` (where
+    /// the TS wrapper puts it) is accepted.
+    #[test]
+    fn allow_loopback_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--allow-loopback",
+            "--quiet",
+            "--",
+            "cmd.exe",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Exec {
+                allow_loopback: true,
+                quiet: true,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Exec {
+                allow_loopback: false,
+                ..
+            }
+        ));
+        // After `--` it belongs to the target, not to srt-win.
+        let cli = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe", "--allow-loopback"])
+            .expect("parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Exec { allow_loopback: false, ref target, .. } if target.len() == 2
+        ));
+        let cli = Cli::try_parse_from(["srt-win", "install", "--allow-loopback"]).expect("parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Install {
+                allow_loopback: true,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["srt-win", "install"]).expect("parse");
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Install {
+                allow_loopback: false,
+                ..
+            }
+        ));
+        for (argv, want) in [
+            (
+                &[
+                    "srt-win",
+                    "wfp",
+                    "verify",
+                    "--target",
+                    "127.0.0.1:9229",
+                    "--allow-loopback",
+                ][..],
+                true,
+            ),
+            (
+                &["srt-win", "wfp", "verify", "--target", "127.0.0.1:49999"][..],
+                false,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("parse");
+            assert!(matches!(
+                cli.cmd,
+                Cmd::Wfp {
+                    sub: WfpCmd::Verify { allow_loopback, .. }
+                } if allow_loopback == want
+            ));
+        }
+        // The retired range argument is not accepted anywhere.
+        assert!(
+            Cli::try_parse_from(["srt-win", "install", "--loopback-port-range", "3000-3099"])
+                .is_err()
+        );
     }
 
     /// A path in `denyRead` and in `denyWrite` keeps the read deny,

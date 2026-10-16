@@ -5,8 +5,11 @@
 //! filtering engine, and reports one result per shape and
 //! destination:
 //!
-//!   - **plain** — its own token, to the loopback probe target. The
-//!     sandbox-user BLOCK must refuse it.
+//!   - **plain** — its own token, to the loopback probe target: a
+//!     loopback port outside the proxy port range and, when loopback
+//!     is open, one of the ports that stay blocked
+//!     ([`crate::wfp::LOOPBACK_FLOOR_PORTS`]). The sandbox-user BLOCK
+//!     must refuse it.
 //!   - **anonymous** — while impersonating the anonymous token, to an
 //!     off-loopback target. No filter covers a socket created under
 //!     that token (see the `wfp` module doc), so a connect here is
@@ -29,6 +32,35 @@
 //!     deny-only SID is matched by no ALLOW ACE, so the filters
 //!     cannot be made to refuse it; a connect here is reported as the
 //!     [`crate::wfp::RESIDUAL_DENY_ONLY`] residual.
+//!
+//! With loopback open (`wfp verify --allow-loopback`) it makes two
+//! more, both under its own token, which show that the open-loopback
+//! PERMIT opens what it says and no more:
+//!
+//!   - **open, off-loopback** — to a NON-loopback address of this
+//!     machine, on the port of the listener below. The PERMIT is for
+//!     loopback addresses only, so the sandbox-user BLOCK must refuse
+//!     it.
+//!   - **open, loopback** — to a loopback listener the broker itself
+//!     bound on an arbitrary port for the duration of the probe. It
+//!     must connect; a block here means the filters in place do not
+//!     open loopback.
+//!
+//! It also moves the off-loopback half of the lowered-integrity
+//! attempts onto that port ([`lowered_off_loopback`]): the address is
+//! the same, so nothing is lost, and the attempts then also show that
+//! the PERMIT stays closed off loopback for a lowered token, in both
+//! socket orderings described below. (The report is the runner's exit
+//! code, and ten three-bit results fill it; aiming the existing
+//! attempts at the stricter destination adds the check without another
+//! result.) The two open-loopback attempts themselves run under the
+//! runner's own token, where there is no ordering to vary: one connect
+//! each.
+//!
+//! A pass with loopback open says that DIRECT connections off the
+//! machine are blocked. It does not say that nothing on localhost
+//! forwards traffic off it: `wfp verify` prints
+//! [`crate::wfp::open_loopback_notice`] with every such result.
 //!
 //! ## Two orderings per assumed identity
 //!
@@ -193,7 +225,8 @@ impl Outcome {
     }
 }
 
-/// Every attempt's result.
+/// Every attempt's result. The two `open_*` attempts are
+/// [`Outcome::Skipped`] when loopback is closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
     pub plain: Outcome,
@@ -208,16 +241,25 @@ pub struct Report {
     pub untrusted_integrity: Outcome,
     /// Untrusted integrity, to the loopback target.
     pub untrusted_integrity_loopback: Outcome,
+    /// Own token, to a non-loopback address on a port that is open on
+    /// loopback.
+    pub open_off_loopback: Outcome,
+    /// Own token, to the broker's loopback listener on an arbitrary
+    /// port.
+    pub open_loopback: Outcome,
 }
 
 const BITS: u32 = 3;
 const MASK: u32 = (1 << BITS) - 1;
 /// Number of [`Outcome`] fields in a [`Report`].
-const FIELDS: u32 = 8;
+const FIELDS: u32 = 10;
 /// Marks a runner exit code as an encoded [`Report`]: the bit just
 /// above the fields. Above every code the runner exits with for
 /// another reason (0, and 1 for its own error path), so an unrelated
-/// exit never decodes.
+/// exit never decodes. With ten three-bit fields this is bit 30 of
+/// the 32 an exit code has; a decoded code also has bit 31 clear, so
+/// the `0xC000_0000` failure codes a killed process exits with never
+/// decode. There is room for no further field at this width.
 const REPORT_BASE: u32 = 1 << (FIELDS * BITS);
 
 impl Report {
@@ -231,6 +273,8 @@ impl Report {
             self.low_integrity_loopback,
             self.untrusted_integrity,
             self.untrusted_integrity_loopback,
+            self.open_off_loopback,
+            self.open_loopback,
         ]
     }
 
@@ -257,19 +301,23 @@ impl Report {
             low_integrity_loopback: field(5)?,
             untrusted_integrity: field(6)?,
             untrusted_integrity_loopback: field(7)?,
+            open_off_loopback: field(8)?,
+            open_loopback: field(9)?,
         })
     }
 
     /// The attempts the filters are built to refuse, each with
     /// whether it may have been skipped (the ones aimed at the
-    /// off-loopback target, which a machine can lack).
-    fn must_be_blocked(&self) -> [(Outcome, bool); 5] {
+    /// off-loopback target, which a machine can lack, and the one
+    /// made only with loopback open).
+    fn must_be_blocked(&self) -> [(Outcome, bool); 6] {
         [
             (self.plain, false),
             (self.low_integrity, true),
             (self.low_integrity_loopback, false),
             (self.untrusted_integrity, true),
             (self.untrusted_integrity_loopback, false),
+            (self.open_off_loopback, true),
         ]
     }
 }
@@ -282,9 +330,13 @@ pub const EXIT_INCONCLUSIVE: i32 = 2;
 /// `wfp verify` exit code: a connect the fence must refuse got past
 /// it.
 pub const EXIT_NOT_FENCED: i32 = 3;
-/// `wfp verify` / `exec` exit code: the install record says the
-/// filter set is not the one this build requires (written by an
-/// earlier build, or — for `exec` — removed by an uninstall).
+/// `wfp verify` / `exec` exit code: the installed filter set is not
+/// the one this session requires — the install record says it was
+/// written by an earlier build, or (for `exec`) removed by an
+/// uninstall, or has a different loopback mode than the one the
+/// session is configured with; or the probe found loopback closed
+/// where it is recorded open. The repair is always to re-run the
+/// install.
 pub const EXIT_FENCE_OUTDATED: i32 = 19;
 
 /// What `wfp verify` concludes from a [`Report`].
@@ -298,16 +350,25 @@ pub struct Verdict {
 }
 
 /// The plain and the four lowered-integrity attempts — the ones made
-/// under a token that still carries the sandbox account's SID —
-/// decide the exit code: any one getting
-/// past the filters is a missing fence, and any one that neither got
-/// past nor was blocked — the token could not be assumed, the connect
-/// timed out — leaves the probe inconclusive. An attempt at the
-/// off-loopback target that was skipped (the machine has no such
-/// address to aim at) does not fail the probe. The three remaining
-/// attempts — both anonymous ones and the deny-only one — never fail
-/// it, whatever their outcome: the filters do not refuse them. One
-/// that got through is reported as a residual instead of passing
+/// under a token that still carries the sandbox account's SID — and
+/// the off-loopback one at a port open on loopback
+/// decide whether the fence is there: any one getting
+/// past the filters is a missing fence ([`EXIT_NOT_FENCED`]), and any
+/// one that neither got past nor was blocked — the token could not be
+/// assumed, the connect timed out — leaves the probe inconclusive. An
+/// attempt at an off-loopback target that was skipped (the machine
+/// has no such address to aim at, or loopback is closed) does not
+/// fail the probe.
+///
+/// With those settled, the attempt at the broker's own loopback
+/// listener must connect. Blocked means the filters do not open
+/// loopback ([`EXIT_FENCE_OUTDATED`]); skipped (loopback is closed, or
+/// no listener could be bound) does not fail the probe.
+///
+/// The three remaining attempts — both anonymous ones and the
+/// deny-only one — never fail it, whatever their outcome: the filters
+/// do not refuse them. One that got through is reported as a residual
+/// instead of passing
 /// silently.
 pub fn verdict(r: &Report) -> Verdict {
     let must = r.must_be_blocked();
@@ -319,7 +380,11 @@ pub fn verdict(r: &Report) -> Verdict {
     {
         EXIT_INCONCLUSIVE
     } else {
-        EXIT_FENCED
+        match r.open_loopback {
+            Outcome::Connected | Outcome::Skipped => EXIT_FENCED,
+            Outcome::Blocked => EXIT_FENCE_OUTDATED,
+            _ => EXIT_INCONCLUSIVE,
+        }
     };
     let mut residuals = Vec::new();
     if exit == EXIT_FENCED {
@@ -337,8 +402,9 @@ pub fn verdict(r: &Report) -> Verdict {
 }
 
 /// An off-loopback destination on this machine for the anonymous
-/// and the lowered-integrity attempts: the address the machine would
-/// use as the source of an outbound connection, at `port`. Nothing needs to listen there —
+/// attempt, the lowered-integrity attempts and the off-loopback
+/// open-port attempt: the address the machine would use as the source of an
+/// outbound connection, at `port`. Nothing needs to listen there —
 /// refused is as good an answer as connected.
 ///
 /// Found by connecting a UDP socket to a documentation address, which
@@ -361,6 +427,33 @@ pub fn off_loopback_target(port: u16) -> Option<SocketAddr> {
         }
     }
     None
+}
+
+/// A loopback listener on a port the open-loopback PERMIT covers, for
+/// the reachability attempt: whatever port the system hands out, tried
+/// again (with the earlier ones held) if that is one of the floor.
+/// Held by the caller (the broker) until the runner has reported, then
+/// dropped. A pending connection completes against the listen backlog,
+/// so nothing needs to accept. `None` when none could be bound: the
+/// probe never aims that attempt at a listener it does not own.
+pub fn bind_open_loopback() -> Option<std::net::TcpListener> {
+    let mut on_floor = Vec::new();
+    for _ in 0..4 {
+        let l = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+        if !crate::wfp::is_loopback_floor_port(l.local_addr().ok()?.port()) {
+            return Some(l);
+        }
+        on_floor.push(l);
+    }
+    None
+}
+
+/// Whether `target` cannot serve as the probe's must-be-blocked
+/// loopback target with loopback open: a loopback port outside the
+/// floor is PERMITted by an intact fence, so a connect there would
+/// read as a missing one.
+pub fn target_is_open_loopback(target: &SocketAddr) -> bool {
+    target.ip().is_loopback() && !crate::wfp::is_loopback_floor_port(target.port())
 }
 
 // ────────────────────── the attempts ──────────────────────
@@ -843,22 +936,53 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Outcome {
     worst
 }
 
-/// Run every attempt. `target` is the loopback probe target;
-/// `anonymous_target` the off-loopback one (`None` skips the attempts
-/// aimed at it).
-pub fn run(target: &str, anonymous_target: Option<&str>) -> Result<Report> {
+/// The off-loopback target of the lowered-integrity attempts: the
+/// one at a port open on loopback when there is one, else the
+/// anonymous attempt's. Both are the same address; the open port is
+/// the stricter destination, since it is one a PERMIT names. Shared by the runner, which aims the attempts, and
+/// the broker, which reports where they went.
+pub fn lowered_off_loopback<T>(open_off_loopback: Option<T>, anonymous: Option<T>) -> Option<T> {
+    open_off_loopback.or(anonymous)
+}
+
+/// Where each attempt is aimed. `None` skips that attempt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Targets<'a> {
+    /// The loopback probe target: a port no PERMIT covers.
+    pub target: &'a str,
+    /// Off-loopback, for the attempt made while impersonating the
+    /// anonymous token — and for the lowered-integrity attempts when
+    /// `open_off_loopback` is `None`.
+    pub anonymous: Option<&'a str>,
+    /// Off-loopback, at a port that is open on loopback. Also where
+    /// the lowered-integrity attempts' off-loopback half goes
+    /// ([`lowered_off_loopback`]).
+    pub open_off_loopback: Option<&'a str>,
+    /// The broker's loopback listener on an arbitrary port.
+    pub open_loopback: Option<&'a str>,
+}
+
+/// Run every attempt.
+pub fn run(targets: Targets<'_>) -> Result<Report> {
     let parse = |s: &str| -> Result<SocketAddr> {
         s.parse()
             .with_context(|| format!("runner: ProbeEgress target '{s}'"))
     };
-    let target = parse(target)?;
-    let anonymous_target = anonymous_target.map(parse).transpose()?;
+    let target = parse(targets.target)?;
+    let anonymous_target = targets.anonymous.map(parse).transpose()?;
+    let open_off_loopback = targets.open_off_loopback.map(parse).transpose()?;
+    let open_loopback = targets.open_loopback.map(parse).transpose()?;
+    let optional = |name: &str, t: &Option<SocketAddr>| match t {
+        Some(t) => attempt(name, Identity::Own, t),
+        None => Outcome::Skipped,
+    };
     let mut wsa = WSADATA::default();
     let rc = unsafe { WSAStartup(0x0202, &mut wsa) };
     if rc != 0 {
         return Err(anyhow!("WSAStartup: {rc}"));
     }
-    let off_loopback = |name: &str, id: Identity| match &anonymous_target {
+    let lowered_target = lowered_off_loopback(open_off_loopback, anonymous_target);
+    let off_loopback_at = |name: &str, id: Identity, t: &Option<SocketAddr>| match t {
         Some(t) => attempt(name, id, t),
         None => {
             eprintln!(
@@ -872,13 +996,15 @@ pub fn run(target: &str, anonymous_target: Option<&str>) -> Result<Report> {
     let untrusted = Identity::LoweredIntegrity(IL_UNTRUSTED);
     Ok(Report {
         plain: attempt("plain", Identity::Own, &target),
-        anonymous: off_loopback("anonymous", Identity::Anonymous),
+        anonymous: off_loopback_at("anonymous", Identity::Anonymous, &anonymous_target),
         anonymous_loopback: attempt("anonymous, loopback", Identity::Anonymous, &target),
         deny_only: attempt("deny-only user SID", Identity::DenyOnlyUser, &target),
-        low_integrity: off_loopback("low integrity", low),
+        low_integrity: off_loopback_at("low integrity", low, &lowered_target),
         low_integrity_loopback: attempt("low integrity, loopback", low, &target),
-        untrusted_integrity: off_loopback("untrusted integrity", untrusted),
+        untrusted_integrity: off_loopback_at("untrusted integrity", untrusted, &lowered_target),
         untrusted_integrity_loopback: attempt("untrusted integrity, loopback", untrusted, &target),
+        open_off_loopback: optional("open loopback, off-loopback", &open_off_loopback),
+        open_loopback: optional("open loopback, loopback", &open_loopback),
     })
 }
 
@@ -886,8 +1012,9 @@ pub fn run(target: &str, anonymous_target: Option<&str>) -> Result<Report> {
 mod tests {
     use super::*;
 
-    /// The four lowered-integrity attempts blocked, the rest as
-    /// given.
+    /// A report with loopback closed: the four lowered-integrity
+    /// attempts blocked, the two open-loopback attempts skipped, the
+    /// rest as given.
     fn report(p: Outcome, a: Outcome, al: Outcome, d: Outcome) -> Report {
         lowered(
             Report {
@@ -899,6 +1026,8 @@ mod tests {
                 low_integrity_loopback: Outcome::Blocked,
                 untrusted_integrity: Outcome::Blocked,
                 untrusted_integrity_loopback: Outcome::Blocked,
+                open_off_loopback: Outcome::Skipped,
+                open_loopback: Outcome::Skipped,
             },
             [Outcome::Blocked; 4],
         )
@@ -916,17 +1045,42 @@ mod tests {
         }
     }
 
+    /// An otherwise clean report with the two open-loopback attempts
+    /// set.
+    fn opened(off_loopback: Outcome, loopback: Outcome) -> Report {
+        Report {
+            open_off_loopback: off_loopback,
+            open_loopback: loopback,
+            ..report(
+                Outcome::Blocked,
+                Outcome::Blocked,
+                Outcome::Blocked,
+                Outcome::Blocked,
+            )
+        }
+    }
+
     #[test]
     fn report_round_trips_every_combination() {
         for p in Outcome::ALL {
             for a in Outcome::ALL {
                 for al in Outcome::ALL {
                     for d in Outcome::ALL {
-                        // The other four fields take the same values
-                        // in a different order, so every field sees
-                        // every outcome beside differing neighbours.
-                        let r = lowered(report(p, a, al, d), [d, al, a, p]);
-                        assert_eq!(Report::decode(r.encode()), Some(r));
+                        // The four lowered-integrity fields take the
+                        // same values in a different order, so every
+                        // field sees every outcome beside differing
+                        // neighbours; the two open-loopback fields take
+                        // every pair.
+                        for ro in Outcome::ALL {
+                            for rl in Outcome::ALL {
+                                let r = Report {
+                                    open_off_loopback: ro,
+                                    open_loopback: rl,
+                                    ..lowered(report(p, a, al, d), [d, al, a, p])
+                                };
+                                assert_eq!(Report::decode(r.encode()), Some(r));
+                            }
+                        }
                     }
                 }
             }
@@ -934,9 +1088,101 @@ mod tests {
     }
 
     #[test]
+    fn verdict_with_loopback_open() {
+        // Loopback is open and nothing else is.
+        let v = verdict(&opened(Blocked, Connected));
+        assert_eq!(v.exit, EXIT_FENCED);
+        assert!(v.residuals.is_empty());
+        // No off-loopback address to aim at, or no listener: neither
+        // fails the probe.
+        assert_eq!(verdict(&opened(Skipped, Connected)).exit, EXIT_FENCED);
+        assert_eq!(verdict(&opened(Blocked, Skipped)).exit, EXIT_FENCED);
+        // A port that is open on loopback reached off loopback is a
+        // missing fence, whatever the listener attempt says.
+        for through in [Connected, Refused] {
+            for listener in [Connected, Blocked, Skipped, Unreachable] {
+                assert_eq!(verdict(&opened(through, listener)).exit, EXIT_NOT_FENCED);
+            }
+        }
+        // The broker's own loopback listener blocked: the filters do
+        // not open loopback.
+        assert_eq!(verdict(&opened(Blocked, Blocked)).exit, EXIT_FENCE_OUTDATED);
+        // A must-be-blocked attempt getting out outranks that.
+        let mut r = opened(Blocked, Blocked);
+        r.plain = Connected;
+        assert_eq!(verdict(&r).exit, EXIT_NOT_FENCED);
+        // Anything else says nothing either way.
+        for odd in [Unreachable, Error] {
+            assert_eq!(verdict(&opened(odd, Connected)).exit, EXIT_INCONCLUSIVE);
+        }
+        for odd in [Refused, Unreachable, Error] {
+            assert_eq!(verdict(&opened(Blocked, odd)).exit, EXIT_INCONCLUSIVE);
+        }
+        // Residuals qualify a pass with loopback open as with it
+        // closed.
+        let mut r = opened(Blocked, Connected);
+        r.deny_only = Connected;
+        assert_eq!(verdict(&r).residuals, [crate::wfp::RESIDUAL_DENY_ONLY]);
+    }
+
+    #[test]
+    fn lowered_attempts_go_to_the_open_port_when_there_is_one() {
+        assert_eq!(
+            lowered_off_loopback(Some("10.0.0.5:3000"), Some("10.0.0.5:49999")),
+            Some("10.0.0.5:3000")
+        );
+        assert_eq!(
+            lowered_off_loopback(None, Some("10.0.0.5:49999")),
+            Some("10.0.0.5:49999")
+        );
+        assert_eq!(lowered_off_loopback::<&str>(None, None), None);
+    }
+
+    #[test]
+    fn every_field_fits_below_the_marker_in_an_exit_code() {
+        const { assert!(FIELDS * BITS < 31) };
+        assert_eq!(REPORT_BASE, 0x4000_0000);
+        // The widest report still has bit 31 clear.
+        let all_error = Report {
+            open_off_loopback: Error,
+            open_loopback: Error,
+            ..lowered(report(Error, Error, Error, Error), [Error; 4])
+        };
+        assert_eq!(all_error.encode() >> 31, 0);
+        assert_eq!(Report::decode(all_error.encode()), Some(all_error));
+    }
+
+    #[test]
+    fn only_a_floor_port_is_a_blocked_loopback_target_with_loopback_open() {
+        let t = |s: &str| s.parse::<SocketAddr>().unwrap();
+        for open in [
+            "127.0.0.1:3000",
+            "127.0.0.1:49152",
+            "127.9.9.9:8080",
+            "[::1]:3050",
+            "127.0.0.1:1",
+            "127.0.0.1:65535",
+        ] {
+            assert!(target_is_open_loopback(&t(open)), "{open}");
+        }
+        for (port, _) in crate::wfp::LOOPBACK_FLOOR_PORTS {
+            for host in ["127.0.0.1", "[::1]"] {
+                let floor = format!("{host}:{port}");
+                assert!(!target_is_open_loopback(&t(&floor)), "{floor}");
+            }
+        }
+        // The PERMIT is for loopback addresses: any port elsewhere is
+        // still a must-be-blocked destination.
+        assert!(!target_is_open_loopback(&t("192.0.2.7:3050")));
+        assert!(!target_is_open_loopback(&t("[fe80::1]:3050")));
+        assert!(!target_is_open_loopback(&t("[::ffff:192.0.2.7]:3050")));
+    }
+
+    #[test]
     fn unrelated_exit_codes_do_not_decode() {
         // 0 and 1 are the runner's ordinary exits; 2 and 3 were the
-        // whole contract of an earlier single-attempt probe.
+        // whole contract of an earlier single-attempt probe, and
+        // 0x1000.. that of the four-attempt one.
         for code in [
             0,
             1,

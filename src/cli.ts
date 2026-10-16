@@ -197,6 +197,11 @@ async function main(): Promise<void> {
       'loopback PERMIT port range (e.g. 60080-60089)',
     )
     .option(
+      '--allow-loopback',
+      'let sandboxed commands connect to any localhost port except a few ' +
+        'sensitive ones (default: off); must match network.allowLocalBinding',
+    )
+    .option(
       '--sandbox-user <name>',
       'name for the sandbox user account (default: srt-sandbox)',
     )
@@ -207,6 +212,7 @@ async function main(): Promise<void> {
         resolveSrtWin,
         VENDORED_SRT_WIN_EXE,
         WINDOWS_INSTALL_NETWORK_EFFECT,
+        WINDOWS_ALLOW_LOOPBACK_EFFECT,
       } = await import('./sandbox/windows-sandbox-utils.js')
       const range =
         typeof o.proxyPortRange === 'string'
@@ -216,6 +222,7 @@ async function main(): Promise<void> {
         const r = installWindowsSandbox({
           sublayerGuid: o.sublayerGuid as string | undefined,
           proxyPortRange: range,
+          allowLoopback: Boolean(o.allowLoopback),
           sandboxUser: o.sandboxUser as string | undefined,
           force: Boolean(o.force),
           // Our own CLI opts into the packaged exe explicitly —
@@ -235,8 +242,10 @@ async function main(): Promise<void> {
             (r.wfp.portRange
               ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
               : '') +
+            `, loopback ${r.wfp.allowLoopback ? 'open' : 'closed'}` +
             `\n\n` +
-            `No logout needed. ${WINDOWS_INSTALL_NETWORK_EFFECT}`,
+            `No logout needed. ${WINDOWS_INSTALL_NETWORK_EFFECT}` +
+            (r.wfp.allowLoopback ? `\n\n${WINDOWS_ALLOW_LOOPBACK_EFFECT}` : ''),
         )
       } catch (e) {
         console.error(`Error: ${(e as Error).message}`)

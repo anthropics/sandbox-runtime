@@ -202,7 +202,10 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-let windowsWfpVerified = false
+// What IS config-scoped is the loopback mode the probe was run with
+// (`network.allowLocalBinding`): the value is that mode, and a session
+// configured with the other verifies again.
+let windowsWfpVerifiedFor: boolean | undefined
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
 // and so reset()'s revoke/restore addresses the SAME binary the
@@ -1008,17 +1011,22 @@ async function initializeSteps(
     // After the user-status check so the not-provisioned message is
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
-    if (!windowsWfpVerified) {
+    // A session whose `network.allowLocalBinding` is not the loopback
+    // mode the install recorded is refused here too, with the install
+    // command that repairs it.
+    const allowLoopback = runtimeConfig.network?.allowLocalBinding === true
+    if (windowsWfpVerifiedFor !== allowLoopback) {
       try {
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+          allowLoopback,
           srtWin,
         })
       } catch (e) {
         config = undefined
         throw e
       }
-      windowsWfpVerified = true
+      windowsWfpVerifiedFor = allowLoopback
     }
     // Persistent-CA branch (see the deferral comment above).
     // `ensurePersistentWindowsCa` reconciles the registry thumb
@@ -1278,11 +1286,15 @@ function isSandboxingEnabled(): boolean {
  * srt-win resolution failure) or the inputs for the Windows probe —
  * the only platform where the sync and async variants differ.
  */
-function checkDependenciesCommon(
-  ripgrepConfig?: RipgrepConfig,
-):
+function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
   | { done: SandboxDependencyCheck }
-  | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
+  | {
+      windows: {
+        sublayerGuid?: string
+        srtWin: SrtWinSpawn
+        allowLoopback?: boolean
+      }
+    } {
   if (!isSupportedPlatform()) {
     return { done: { errors: ['Unsupported platform'], warnings: [] } }
   }
@@ -1320,6 +1332,11 @@ function checkDependenciesCommon(
         sublayerGuid:
           config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
         srtWin,
+        // With a config to go by, an install whose loopback mode is
+        // not the configured one is an error.
+        ...(config && {
+          allowLoopback: config.network?.allowLocalBinding === true,
+        }),
       },
     }
   }
@@ -2532,6 +2549,12 @@ async function wrapWithSandboxArgv(
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+      // `srt-win exec` launches nothing unless this is the loopback
+      // mode the install recorded, so one that differs — the session's
+      // or one command's — is refused, never silently ignored.
+      allowLoopback:
+        (customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()) ===
+        true,
       // mode:'deny' env vars are structurally absent (fresh
       // srt-sandbox profile env). mode:'mask' sentinels are
       // passed via the --env overlay so the sandboxed child sees
@@ -2794,7 +2817,7 @@ async function reset(): Promise<void> {
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
-  // windowsWfpVerified is NOT cleared — per-process, not per-session.
+  // windowsWfpVerifiedFor is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
   // active-sandbox counter — reset() means the session is over.
