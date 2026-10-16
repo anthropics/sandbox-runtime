@@ -984,6 +984,180 @@ describe.if(isMacOS)('macOS Seatbelt Process Enumeration', () => {
   })
 })
 
+describe.if(isMacOS)('macOS Seatbelt netsrc kernel control', () => {
+  const TEST_BASE_DIR = join(tmpdir(), 'seatbelt-netsrc-test-' + Date.now())
+  const PROBE_PATH = join(TEST_BASE_DIR, 'netsrc_probe.py')
+  const NETSRC_CONTROL = 'com.apple.netsrc'
+  const NETSRC_RULE =
+    '(allow network-outbound (control-name "com.apple.netsrc"))'
+
+  // Kernel controls the rule must not admit. Membership here is a candidate
+  // list, not evidence: com.apple.flow-divert, for one, refuses an
+  // unprivileged connect() with EPERM on a bare macOS 27 with no sandbox in
+  // play at all, so a CONNECT_DENIED under Seatbelt would say nothing about
+  // the profile. The baseline below keeps only the controls this kernel
+  // really does let an unsandboxed process reach.
+  const OTHER_CONTROLS = [
+    'com.apple.network.statistics',
+    'com.apple.flow-divert',
+  ]
+
+  // Connect an AF_SYSTEM/SYSPROTO_CONTROL socket to a named kernel control,
+  // the way libsystem_info's getaddrinfo() result sorting does. Python has no
+  // binding for sockaddr_ctl, so connect() goes through ctypes.
+  //
+  // Exactly one token on stdout and always exit 0, so a non-zero exit means
+  // the probe itself broke and each outcome names itself. In particular an
+  // unregistered control (CTLIOCGINFO fails with ENOENT — true today of
+  // com.apple.nke.utun, com.apple.necp and com.apple.nehelper) reports
+  // CONTROL_ABSENT instead of dying in a traceback that a maintainer would
+  // read as a sandbox denial.
+  const PROBE_SOURCE = [
+    'import ctypes, ctypes.util, fcntl, socket, struct, sys',
+    'AF_SYSTEM = 32',
+    'SYSPROTO_CONTROL = 2',
+    'AF_SYS_CONTROL = 2',
+    "# CTLIOCGINFO = _IOWR('N', 3, struct ctl_info), ctl_info is 100 bytes",
+    'CTLIOCGINFO = 0xC0644E03',
+    'name = sys.argv[1].encode()',
+    's = socket.socket(AF_SYSTEM, socket.SOCK_DGRAM, SYSPROTO_CONTROL)',
+    'try:',
+    "    info = fcntl.ioctl(s.fileno(), CTLIOCGINFO, struct.pack('I96s', 0, name))",
+    'except OSError:',
+    "    print('CONTROL_ABSENT')",
+    '    sys.exit(0)',
+    "ctl_id = struct.unpack('I96s', info)[0]",
+    "libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)",
+    "addr = struct.pack('BBHII', 32, AF_SYSTEM, AF_SYS_CONTROL, ctl_id, 0) + b'\\0' * 20",
+    'rc = libc.connect(s.fileno(), ctypes.c_char_p(addr), 32)',
+    "print('CONNECT_OK' if rc == 0 else 'CONNECT_DENIED')",
+  ].join('\n')
+
+  const probeCommand = (controlName: string) =>
+    `python3 ${PROBE_PATH} ${controlName}`
+
+  const runUnsandboxed = (controlName: string) =>
+    spawnSync(probeCommand(controlName), {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+
+  const runProbe = (controlName: string) => {
+    const writeConfig: FsWriteRestrictionConfig = {
+      allowOnly: [TEST_BASE_DIR],
+      denyWithinAllow: [],
+    }
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: probeCommand(controlName),
+      needsNetworkRestriction: true,
+      readConfig: undefined,
+      writeConfig,
+    })
+    return spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+  }
+
+  // What each control does with no sandbox at all, measured once.
+  const baseline = new Map<string, string>()
+
+  beforeAll(() => {
+    mkdirSync(TEST_BASE_DIR, { recursive: true })
+    writeFileSync(PROBE_PATH, PROBE_SOURCE)
+
+    for (const controlName of [NETSRC_CONTROL, ...OTHER_CONTROLS]) {
+      baseline.set(controlName, runUnsandboxed(controlName).stdout.trim())
+    }
+  })
+
+  afterAll(() => {
+    if (existsSync(TEST_BASE_DIR)) {
+      rmSync(TEST_BASE_DIR, { recursive: true, force: true })
+    }
+  })
+
+  it('should emit the netsrc rule when network access is restricted', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain(NETSRC_RULE)
+  })
+
+  it('should not emit the netsrc rule when network access is unrestricted', () => {
+    const writeConfig: FsWriteRestrictionConfig = {
+      allowOnly: [tmpdir()],
+      denyWithinAllow: [],
+    }
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig,
+    })
+
+    // (allow network*) already covers it, so the narrower rule is redundant.
+    expect(wrappedCommand).toContain('(allow network*)')
+    expect(wrappedCommand).not.toContain(NETSRC_RULE)
+  })
+
+  it('should let a restricted process connect to the com.apple.netsrc control', () => {
+    // Otherwise a CONNECT_DENIED below is the kernel's doing rather than the
+    // profile's, and this test would name the wrong culprit.
+    expect(baseline.get(NETSRC_CONTROL)).toBe('CONNECT_OK')
+
+    const result = runProbe(NETSRC_CONTROL)
+
+    expect(result.status).toBe(0)
+    expect(result.stdout.trim()).toBe('CONNECT_OK')
+  })
+
+  it('should still deny every other kernel control', () => {
+    const deniable = OTHER_CONTROLS.filter(
+      controlName => baseline.get(controlName) === 'CONNECT_OK',
+    )
+
+    // With an empty list the loop below asserts nothing, and the scope of the
+    // rule would go unchecked behind a green test.
+    expect(deniable.length).toBeGreaterThan(0)
+
+    for (const controlName of deniable) {
+      const result = runProbe(controlName)
+
+      expect(result.status).toBe(0)
+      expect(result.stdout.trim()).toBe('CONNECT_DENIED')
+    }
+  })
+
+  it('should not admit IP egress', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      // Seatbelt check, not reachability: the deny path is an immediate EPERM
+      // at connect(), and settimeout bounds the success path. A widened
+      // profile exits 0, and a host that is merely unreachable raises
+      // socket.timeout — neither prints "Operation not permitted".
+      command: `python3 -c "import socket; s = socket.socket(); s.settimeout(3); s.connect(('1.1.1.1', 443)); print('CONNECTED')"`,
+      needsNetworkRestriction: true,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('Operation not permitted')
+  })
+})
+
 describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
   it('should emit global-name and global-name-prefix rules for configured services', () => {
     const wrappedCommand = wrapCommandWithSandboxMacOS({
