@@ -21,7 +21,40 @@
 //!     = [`sddl_sandbox_user`]. Matches only tokens whose user SID is
 //!     `<srt-sandbox SID>`. Everyone else (the broker, services,
 //!     SYSTEM, the real user) carries a different user SID → no match
-//!     → falls through to default-permit.
+//!     → falls through to default-permit. The SD also carries ALLOW
+//!     ACEs for the two all-packages SIDs so an AppContainer token
+//!     derived from the sandbox account still matches (see
+//!     [`sddl_sandbox_user`]).
+//!
+//! ## What the filters do not cover
+//!
+//! The identity WFP checks for a connect is the token that was in
+//! effect when the SOCKET was created. Both gaps below are a sandboxed
+//! thread putting a token the sandbox-user BLOCK does not match on
+//! itself and then creating its socket. (A socket the process created
+//! under its own token stays attributed to the sandbox account, and to
+//! the BLOCK, even when the connect is made while impersonating.)
+//!
+//!   - The **anonymous token** (`ANONYMOUS LOGON`) is not the sandbox
+//!     account, so the BLOCK does not match a socket created while
+//!     impersonating it — to any destination, off the machine or on
+//!     loopback. The only filter that could refuse it is one keyed on
+//!     the anonymous SID itself, which would apply to every process on
+//!     the machine that uses that token, sandboxed or not; this set
+//!     carries none. `srt-win wfp verify` probes both destinations and
+//!     reports a connect as the
+//!     [`crate::probe::RESIDUAL_ANONYMOUS_EGRESS`] and
+//!     [`crate::probe::RESIDUAL_ANONYMOUS_LOOPBACK`] residuals.
+//!   - A token whose user SID has been made **deny-only**
+//!     (`CreateRestrictedToken`) is matched by no ALLOW ACE, so the
+//!     sandbox-user BLOCK does not match a socket created under it.
+//!     No descriptor can fix that: the filter set blocks what it can
+//!     name and permits the rest. `srt-win wfp verify` probes this
+//!     shape and reports a connect as the [`RESIDUAL_DENY_ONLY`]
+//!     residual.
+//!
+//! The probe makes each of these connects with the socket created
+//! after the token is assumed as well as before; see [`crate::probe`].
 //!
 //! WFP's `ALE_USER_ID` condition with `FWP_MATCH_EQUAL` evaluates the
 //! supplied security descriptor via `AccessCheck` against the
@@ -33,8 +66,10 @@
 //! still matches the BLOCK.
 //!
 //! Filters carry a small JSON tag in `providerData` (`{tool, kind,
-//! port_range?, user_sid}`) so install/uninstall/status can locate
-//! them by enumeration. BFE enumeration is admin-gated (see
+//! port_range?, user_sid, rev}`) so install/uninstall/status can
+//! locate them by enumeration. `rev` is [`FENCE_REVISION`]; a set
+//! written by an earlier build lacks it or carries another and reads
+//! as `outdated`. BFE enumeration is admin-gated (see
 //! [`WfpAccessDenied`]) — `wfp status` returns `cannot-read` for a
 //! non-elevated caller; the non-elevated readiness check is `srt-win
 //! wfp verify` (a behavioral connect probe).
@@ -256,7 +291,7 @@ fn fwp_uint16(v: u16) -> FWP_VALUE0 {
     }
 }
 
-fn cond_port_range(field_key: GUID, range: &mut FWP_RANGE0) -> FWPM_FILTER_CONDITION0 {
+fn cond_range(field_key: GUID, range: &mut FWP_RANGE0) -> FWPM_FILTER_CONDITION0 {
     FWPM_FILTER_CONDITION0 {
         fieldKey: field_key,
         matchType: FWP_MATCH_RANGE,
@@ -294,6 +329,10 @@ pub struct FilterTag {
     /// the user-SID-keyed design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_sid: Option<String>,
+    /// [`FENCE_REVISION`] of the build that wrote the filter. `None`
+    /// on filters written before the revision was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u32>,
 }
 
 impl FilterTag {
@@ -303,6 +342,7 @@ impl FilterTag {
             kind: kind.into(),
             port_range: range.map(|(l, h)| [l, h]),
             user_sid: Some(sid.into()),
+            rev: Some(FENCE_REVISION),
         }
     }
     fn to_blob_bytes(&self) -> Vec<u8> {
@@ -310,8 +350,43 @@ impl FilterTag {
     }
 }
 
-/// Number of filters in the user-SID-keyed set (2 per layer × v4/v6).
+/// Number of filters in the set (2 per layer × v4/v6).
 pub const FILTER_COUNT: usize = 4;
+
+/// Revision of the filter set this build installs and requires.
+/// Bumped whenever the set changes in a way an existing install must
+/// pick up by re-running `srt-win install`:
+///
+///   1. loopback PERMIT + sandbox-user BLOCK (unrecorded — filters of
+///      this revision carry no `rev`).
+///   2. adds a BLOCK keyed on the anonymous SID, for off-loopback
+///      destinations, and the all-packages ACEs on the sandbox-user
+///      descriptor.
+///   3. drops the anonymous BLOCK, which applied to every process on
+///      the machine; keeps the all-packages ACEs. Installing over a
+///      revision-2 set deletes its anonymous BLOCK filters along with
+///      the rest ([`install_filters`] removes every tagged filter
+///      before adding its own).
+///
+/// Recorded twice: in every filter's tag (what an elevated `wfp
+/// status` reads) and in the install record (what the non-elevated
+/// broker reads — it cannot enumerate filters).
+pub const FENCE_REVISION: u32 = 3;
+
+/// What the install record holds in place of a revision once an
+/// uninstall has removed the filters but kept the account. Never a
+/// revision a filter set carries.
+pub const FENCE_REVISION_REMOVED: u32 = 0;
+
+/// Filter kinds that must be present, at [`FENCE_REVISION`], on each
+/// ALE connect layer for the fence to be current.
+const REQUIRED_BLOCK_KINDS: [&str; 1] = ["block-user"];
+
+/// Name of the residual `srt-win wfp verify` reports when a connect
+/// made under a copy of the sandbox token whose user SID is deny-only
+/// is not blocked, in either socket ordering the probe tries. See the
+/// module doc.
+pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 
 // Filter weights — kept below 2^60 so they stay in WFP's
 // "manual weight" class (top 4 bits are auto-classifier). The
@@ -504,22 +579,44 @@ fn add_filter(
 // with no `G:`. The group's value is irrelevant to DACL
 // evaluation; LS is just a stable, always-present principal.
 
-/// SDDL for the BLOCK filter — ALLOW `<sandbox_user_sid>`. Matches
-/// iff the connecting token carries that SID **enabled**, which for
-/// a *user* SID means "is that user". The broker, services, and
-/// every other process carry a different user SID → no match → fall
-/// through to default-permit.
+/// SDDL for the sandbox-user BLOCK filter — ALLOW `<sandbox_user_sid>`
+/// plus ALLOW for ALL APPLICATION PACKAGES (`S-1-15-2-1`) and ALL
+/// RESTRICTED APPLICATION PACKAGES (`S-1-15-2-2`).
+///
+/// The user ACE matches iff the connecting token carries that SID
+/// **enabled**, which for a *user* SID means "is that user". The
+/// broker, services, and every other process carry a different user
+/// SID → no match → fall through to default-permit.
+///
+/// The two package ACEs exist for AppContainer tokens. The access
+/// check of such a token has two halves that must BOTH grant: the
+/// ordinary one over the user and group SIDs, and one over the
+/// package and capability SIDs. With the user ACE alone, an
+/// AppContainer process started under the sandbox account passes the
+/// first half and fails the second, so the BLOCK would not match it.
+/// The package ACEs supply the second half. They grant nothing by
+/// themselves: a token outside an AppContainer does not carry either
+/// SID, and an AppContainer token of any OTHER user still fails the
+/// first half.
+///
+/// The descriptor carries no mandatory label: a process of the
+/// sandbox account runs at medium integrity, the level an unlabelled
+/// descriptor is given. A copy of its token
+/// with the integrity level lowered is below that level; whether the
+/// BLOCK still matches it is measured by the fence probe
+/// ([`crate::probe`]), which requires it to.
 pub fn sddl_sandbox_user(sid: &str) -> String {
-    format!("O:LSG:LSD:(A;;CC;;;{sid})")
+    format!("O:LSG:LSD:(A;;CC;;;{sid})(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)")
 }
 
-/// Install (or refresh) the user-SID-keyed filter set under
+/// Install (or refresh) the filter set under
 /// `sublayer`. Two filters at each of the v4/v6 ALE-connect layers
 /// ([`FILTER_COUNT`] total) — see the module doc for the design.
 ///
 /// Idempotent: any existing srt-win-tagged filters under `sublayer`
 /// — including legacy discriminator-group-keyed filters from a
-/// pre-separate-user install — are deleted first, then a fresh set
+/// pre-separate-user install and the anonymous BLOCK filters of a
+/// revision-2 install — are deleted first, then a fresh set
 /// is added, all inside one WFP transaction.
 pub fn install_filters(
     sublayer: &GUID,
@@ -555,10 +652,10 @@ pub fn install_filters(
         }
 
         // Idempotency + migration: drop EVERY stale srt-win filter
-        // (both this version's user-keyed shape and any legacy
-        // group-keyed filters from a prior install) before
-        // re-adding. Inside the transaction so a crash leaves the
-        // previous state intact.
+        // (this version's user-keyed shape, the anonymous BLOCK of
+        // an earlier revision, and any legacy group-keyed filters
+        // from a prior install) before re-adding. Inside the
+        // transaction so a crash leaves the previous state intact.
         delete_tagged_filters(engine, sublayer)?;
 
         let mut sd_user_blob = sd_byte_blob(&sd_user);
@@ -592,7 +689,7 @@ pub fn install_filters(
             };
             let mut c_lb = [
                 addr_cond,
-                cond_port_range(FWPM_CONDITION_IP_REMOTE_PORT, &mut port_range_slot),
+                cond_range(FWPM_CONDITION_IP_REMOTE_PORT, &mut port_range_slot),
             ];
             add_filter(
                 engine.h(),
@@ -639,11 +736,9 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
     })
 }
 
-/// Status of the WFP fence under `sublayer`. `installed` iff at
-/// least one `block-user` srt-win filter exists. (We don't insist
-/// on the exact count so enterprise tooling that adds extras under
-/// the same sublayer doesn't break detection.) `port_range` is read
-/// from the first `permit-loopback-user` tag.
+/// Status of the WFP fence under `sublayer` — see
+/// [`classify_fence`] for `absent` / `installed` / `outdated`.
+/// `port_range` is read from the first `permit-loopback-user` tag.
 ///
 /// `cannot-read` is the graceful-degrade state when BFE
 /// enumeration is admin-gated ([`WfpAccessDenied`]). The
@@ -659,9 +754,83 @@ pub struct WfpStatus {
     /// Sandbox-user SID read from the first user-keyed tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_sid: Option<String>,
-    /// Populated only on `cannot-read`.
+    /// Populated on `cannot-read` and on `outdated`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+/// What to tell the operator when the fence is not at
+/// [`FENCE_REVISION`]. One wording for `wfp status`, `wfp verify`
+/// and `exec`.
+pub fn outdated_hint(have: Option<u32>) -> String {
+    if have == Some(FENCE_REVISION_REMOVED) {
+        return "the network fence on this machine is not installed (its \
+                filters were removed by an uninstall) — re-run `srt-win \
+                install` (one UAC prompt)"
+            .to_string();
+    }
+    let have = match have {
+        Some(r) => format!("revision {r}"),
+        None => "an unrecorded earlier revision".to_string(),
+    };
+    format!(
+        "the network fence on this machine is out of date ({have}; \
+         this build requires revision {FENCE_REVISION}) — re-run \
+         `srt-win install` (one UAC prompt)"
+    )
+}
+
+/// Classify an enumerated filter set, given `(layer, tag)` for every
+/// srt-win filter under the sublayer.
+///
+///   - `absent` — no `block-user` filter at all.
+///   - `installed` — every [`REQUIRED_BLOCK_KINDS`] filter is present
+///     at [`FENCE_REVISION`] on BOTH ALE connect layers.
+///   - `outdated` — anything in between: a set written by an earlier
+///     build (no `rev`, or another one), or one missing a layer.
+///
+/// Extra filters are ignored, so enterprise tooling that adds its own
+/// under the same sublayer does not break detection.
+pub(crate) fn classify_fence(tags: &[(&str, FilterTag)]) -> &'static str {
+    if !tags.iter().any(|(_, t)| t.kind == "block-user") {
+        return "absent";
+    }
+    let current = ALE_LAYERS.iter().all(|(_, layer)| {
+        REQUIRED_BLOCK_KINDS.iter().all(|kind| {
+            tags.iter()
+                .any(|(l, t)| l == layer && t.kind == *kind && t.rev == Some(FENCE_REVISION))
+        })
+    });
+    if current { "installed" } else { "outdated" }
+}
+
+/// Fold the install record's fence revision into an enumerated
+/// status. `record` is `None` when the machine has no install record
+/// at all, `Some(rev)` when it has one (`rev` itself is `None` for a
+/// record written before the revision was kept).
+///
+/// A non-elevated caller cannot enumerate filters (`cannot-read`), so
+/// the record is its only way to learn that the install predates this
+/// build (`outdated`) or that an uninstall removed the filters
+/// (`absent`); and an elevated caller that enumerated a
+/// current-looking set under one sublayer still must not report
+/// `installed` while the record says otherwise (`outdated`). Only a
+/// record at [`FENCE_REVISION`] leaves `installed` or `cannot-read`
+/// standing.
+pub fn apply_recorded_revision(mut st: WfpStatus, record: Option<Option<u32>>) -> WfpStatus {
+    if let Some(rev) = record
+        && rev != Some(FENCE_REVISION)
+        && matches!(st.state, "installed" | "cannot-read")
+    {
+        let removed = rev == Some(FENCE_REVISION_REMOVED);
+        st.state = if removed && st.state == "cannot-read" {
+            "absent"
+        } else {
+            "outdated"
+        };
+        st.hint = Some(outdated_hint(rev));
+    }
+    st
 }
 
 /// Live BFE enumeration. Admin-gated — a non-elevated caller gets
@@ -677,20 +846,17 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         }
         Err(e) => return Err(e),
     };
-    let mut filters = 0usize;
-    let mut have_block = false;
+    let mut tags: Vec<(&'static str, FilterTag)> = Vec::new();
     let mut port_range: Option<[u16; 2]> = None;
     let mut user_sid: Option<String> = None;
-    let enum_result = for_each_tagged_filter(&engine, sublayer, |_, _, tag| {
-        filters += 1;
+    let enum_result = for_each_tagged_filter(&engine, sublayer, |layer, _, tag| {
         if user_sid.is_none() {
             user_sid.clone_from(&tag.user_sid);
         }
-        match tag.kind.as_str() {
-            "block-user" => have_block = true,
-            "permit-loopback-user" => port_range = tag.port_range,
-            _ => {}
+        if tag.kind == "permit-loopback-user" {
+            port_range = tag.port_range;
         }
+        tags.push((layer, tag.clone()));
     });
     if let Err(e) = enum_result {
         if e.downcast_ref::<WfpAccessDenied>().is_some() {
@@ -698,12 +864,16 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         }
         return Err(e);
     }
+    let state = classify_fence(&tags);
     Ok(WfpStatus {
-        state: if have_block { "installed" } else { "absent" },
-        filters,
+        state,
+        filters: tags.len(),
         port_range,
         user_sid,
-        hint: None,
+        hint: (state == "outdated").then(|| {
+            // The oldest revision present is the one worth naming.
+            outdated_hint(tags.iter().map(|(_, t)| t.rev).min().flatten())
+        }),
     })
 }
 
@@ -788,6 +958,136 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_user_sddl_carries_both_package_aces() {
+        let s = sddl_sandbox_user("S-1-5-21-1-2-3-1005");
+        assert!(s.contains("(A;;CC;;;S-1-5-21-1-2-3-1005)"));
+        assert!(s.contains("(A;;CC;;;S-1-15-2-1)"));
+        assert!(s.contains("(A;;CC;;;S-1-15-2-2)"));
+        // ALLOW only: a DENY ACE in a match descriptor would invert
+        // which tokens the filter applies to.
+        assert!(!s.contains("(D;"));
+    }
+
+    fn tag(kind: &str, rev: Option<u32>) -> FilterTag {
+        FilterTag {
+            rev,
+            ..FilterTag::user(kind, "S-1-5-21-1-2-3-1005", None)
+        }
+    }
+
+    fn full_set(rev: Option<u32>, kinds: &[&str]) -> Vec<(&'static str, FilterTag)> {
+        ALE_LAYERS
+            .iter()
+            .flat_map(|(_, layer)| kinds.iter().map(move |k| (*layer, tag(k, rev))))
+            .collect()
+    }
+
+    const ALL_KINDS: [&str; 2] = ["permit-loopback-user", "block-user"];
+    /// The set revision 2 wrote: a BLOCK keyed on the anonymous SID
+    /// beside the two this build writes.
+    const REV2_KINDS: [&str; 3] = ["permit-loopback-user", "block-user", "block-anonymous"];
+
+    #[test]
+    fn classify_fence_states() {
+        assert_eq!(classify_fence(&[]), "absent");
+        // Only a PERMIT left behind: nothing is fenced.
+        assert_eq!(
+            classify_fence(&full_set(Some(FENCE_REVISION), &["permit-loopback-user"])),
+            "absent"
+        );
+        let current = full_set(Some(FENCE_REVISION), &ALL_KINDS);
+        assert_eq!(current.len(), FILTER_COUNT);
+        assert_eq!(classify_fence(&current), "installed");
+        // No kind this build writes names the anonymous token.
+        assert!(current.iter().all(|(_, t)| !t.kind.contains("anonymous")));
+        // The set the first build wrote: no rev.
+        assert_eq!(classify_fence(&full_set(None, &ALL_KINDS)), "outdated");
+        // The same kinds but written at an earlier revision.
+        assert_eq!(classify_fence(&full_set(Some(1), &ALL_KINDS)), "outdated");
+        // A revision-2 set, with its anonymous BLOCK: replaced by the
+        // next install.
+        assert_eq!(classify_fence(&full_set(Some(2), &REV2_KINDS)), "outdated");
+        // One layer missing its BLOCK.
+        let mut half = current.clone();
+        let v6 = ALE_LAYERS[1].1;
+        half.retain(|(l, t)| !(*l == v6 && t.kind == "block-user"));
+        assert_eq!(classify_fence(&half), "outdated");
+        // Foreign extras under the sublayer do not disturb a current set.
+        let mut extra = current;
+        extra.push((v6, tag("something-else", None)));
+        assert_eq!(classify_fence(&extra), "installed");
+    }
+
+    #[test]
+    fn revision_follows_the_anonymous_block_removal() {
+        const { assert!(FENCE_REVISION == 3) };
+        assert!(outdated_hint(Some(2)).contains("revision 2"));
+        assert!(outdated_hint(Some(2)).contains("requires revision 3"));
+    }
+
+    fn status(state: &'static str) -> WfpStatus {
+        WfpStatus {
+            state,
+            filters: 0,
+            port_range: None,
+            user_sid: None,
+            hint: None,
+        }
+    }
+
+    #[test]
+    fn recorded_revision_overrides_installed_and_cannot_read() {
+        let cur = Some(Some(FENCE_REVISION));
+        for s in ["installed", "cannot-read", "absent", "outdated"] {
+            assert_eq!(apply_recorded_revision(status(s), cur).state, s);
+            // No install record at all: nothing to compare against.
+            assert_eq!(apply_recorded_revision(status(s), None).state, s);
+        }
+        for old in [Some(None), Some(Some(FENCE_REVISION - 1))] {
+            for s in ["installed", "cannot-read"] {
+                let st = apply_recorded_revision(status(s), old);
+                assert_eq!(st.state, "outdated");
+                assert!(st.hint.unwrap().contains("srt-win install"));
+            }
+            assert_eq!(
+                apply_recorded_revision(status("absent"), old).state,
+                "absent"
+            );
+        }
+    }
+
+    /// After an uninstall that keeps the account, the record is
+    /// `FENCE_REVISION_REMOVED`. A caller that cannot enumerate must
+    /// then read `absent`; one that still enumerates a set (the reset
+    /// landed and the filter removal did not, or another sublayer
+    /// holds one) must read `outdated`. Neither may read `installed`.
+    #[test]
+    fn removed_record_never_reads_as_installed() {
+        let removed = Some(Some(FENCE_REVISION_REMOVED));
+        let st = apply_recorded_revision(status("cannot-read"), removed);
+        assert_eq!(st.state, "absent");
+        let hint = st.hint.unwrap();
+        assert!(hint.contains("not installed") && hint.contains("srt-win install"));
+        assert_eq!(
+            apply_recorded_revision(status("installed"), removed).state,
+            "outdated"
+        );
+        assert_eq!(
+            apply_recorded_revision(status("absent"), removed).state,
+            "absent"
+        );
+        // Whatever else the record holds, only FENCE_REVISION lets
+        // `installed` or `cannot-read` through unchanged.
+        for rev in [None, Some(0), Some(1), Some(FENCE_REVISION + 1)] {
+            for s in ["installed", "cannot-read"] {
+                let got = apply_recorded_revision(status(s), Some(rev)).state;
+                assert!(matches!(got, "absent" | "outdated"), "{rev:?}/{s} -> {got}");
+            }
+        }
+        const { assert!(FENCE_REVISION_REMOVED != FENCE_REVISION) };
+    }
+
+    #[test]
     fn sddl_rejects_garbage() {
         assert!(OwnedSd::from_sddl("O:LSG:LSD:(A;;CC;;;NOT-A-SID)").is_err());
     }
@@ -798,6 +1098,7 @@ mod tests {
         let bk = FilterTag::user("block-user", sid, None);
         assert_eq!(bk.user_sid.as_deref(), Some(sid));
         assert_eq!(bk.port_range, None);
+        assert_eq!(bk.rev, Some(FENCE_REVISION));
         let lb = FilterTag::user("permit-loopback-user", sid, Some((60080, 60089)));
         assert_eq!(lb.port_range, Some([60080, 60089]));
         // Round-trips through JSON.
@@ -815,6 +1116,17 @@ mod tests {
         assert_eq!(t.kind, "permit-loopback");
         assert_eq!(t.port_range, None);
         assert_eq!(t.user_sid, None);
+        assert_eq!(t.rev, None);
+        // The tag the 4-filter set wrote: a user SID but no rev.
+        let prev = br#"{"tool":"srt-win","kind":"block-user","user_sid":"S-1-5-21-1"}"#;
+        let t: FilterTag = serde_json::from_slice(prev).unwrap();
+        assert_eq!(t.rev, None);
+        // A kind this build no longer writes still parses as one of
+        // ours, so install and uninstall delete it.
+        let anon =
+            br#"{"tool":"srt-win","kind":"block-anonymous","user_sid":"S-1-5-21-1","rev":2}"#;
+        let t: FilterTag = serde_json::from_slice(anon).unwrap();
+        assert_eq!((t.tool.as_str(), t.rev), ("srt-win", Some(2)));
     }
 
     /// const-assert the weight invariant directly so a reshuffle in

@@ -202,8 +202,12 @@ async function main(): Promise<void> {
     )
     .option('--force', 'replace an existing install with different config')
     .action(async (o: Record<string, string | boolean | undefined>) => {
-      const { installWindowsSandbox, resolveSrtWin, VENDORED_SRT_WIN_EXE } =
-        await import('./sandbox/windows-sandbox-utils.js')
+      const {
+        installWindowsSandbox,
+        resolveSrtWin,
+        VENDORED_SRT_WIN_EXE,
+        WINDOWS_INSTALL_NETWORK_EFFECT,
+      } = await import('./sandbox/windows-sandbox-utils.js')
       const range =
         typeof o.proxyPortRange === 'string'
           ? (o.proxyPortRange.split('-').map(Number) as [number, number])
@@ -232,8 +236,7 @@ async function main(): Promise<void> {
               ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
               : '') +
             `\n\n` +
-            `No logout needed — the WFP filter keys on the dedicated ` +
-            `\`srt-sandbox\` user's SID, so your network is unaffected.`,
+            `No logout needed. ${WINDOWS_INSTALL_NETWORK_EFFECT}`,
         )
       } catch (e) {
         console.error(`Error: ${(e as Error).message}`)

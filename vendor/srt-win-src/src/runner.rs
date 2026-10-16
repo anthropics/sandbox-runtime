@@ -38,20 +38,26 @@ pub enum RunnerCmd {
     /// `srt-win uninstall` deletes the profile. Exit non-zero on
     /// failure.
     InstallCa { der: crate::cert_store::CertDer },
-    /// `wfp verify` probe: attempt a direct TCP connect to `target`
-    /// (`host:port`) **as the sandbox user**. The WFP block-user
-    /// filter fires at `ALE_AUTH_CONNECT` — before any packet
-    /// leaves — so an active fence yields WSAEACCES immediately;
-    /// a missing fence lets the connect through. Exit **0** =
-    /// WSAEACCES (fence active), **3** = connected (fence
-    /// MISSING), **2** = any other error (timeout/unreachable —
-    /// the broker treats it as failure). Exit 1 is reserved for
-    /// the runner's own anyhow `Err` path so a malformed target
-    /// or future runner bug isn't misread as `connected`. No
-    /// desk/grants/lockdown — the probe runs as the bare runner
-    /// (same as [`InstallCa`](Self::InstallCa)); the WFP filter
-    /// keys on the user SID, which the runner already carries.
-    ProbeEgress { target: String },
+    /// `wfp verify` probe: attempt direct TCP connects **as the
+    /// sandbox user**, one per token shape a sandboxed process can
+    /// present to the filtering engine — see [`crate::probe`].
+    /// `target` (`host:port`) is the loopback probe target;
+    /// `anonymous_target` the off-loopback one for the attempt made
+    /// while impersonating the anonymous token (`None` skips it).
+    ///
+    /// A BLOCK filter fires at `ALE_AUTH_CONNECT` — before any packet
+    /// leaves — so a fenced connect yields WSAEACCES immediately. The
+    /// runner exits with the four results encoded
+    /// ([`crate::probe::Report::encode`]); exit 1 stays reserved for
+    /// the runner's own anyhow `Err` path, and never decodes as a
+    /// report. No desk/grants/lockdown — the probe runs as the bare
+    /// runner (same as [`InstallCa`](Self::InstallCa)); the filters
+    /// key on the token, which the runner already carries.
+    ProbeEgress {
+        target: String,
+        #[serde(default)]
+        anonymous_target: Option<String>,
+    },
 }
 
 /// Inputs to a single [`RunnerCmd::Exec`].
@@ -130,50 +136,10 @@ pub fn run() -> Result<u32> {
             );
             Ok(0)
         }
-        RunnerCmd::ProbeEgress { target } => {
-            use std::net::{SocketAddr, TcpStream};
-            use std::time::Duration;
-            // WSAEACCES — what WFP returns from ALE_AUTH_CONNECT
-            // when the block-user filter denies the connect. Match
-            // on the raw code (not `ErrorKind::PermissionDenied`)
-            // so `ERROR_ACCESS_DENIED` (5) — which would mean
-            // something OTHER than the WFP fence — falls through
-            // to `unreachable`.
-            const WSAEACCES: i32 = 10013;
-            let addr: SocketAddr = target
-                .parse()
-                .with_context(|| format!("runner: ProbeEgress target '{target}'"))?;
-            // stderr (not stdout): `spawn_runner` pumps the
-            // runner's stdout straight to the broker's stdout, and
-            // the broker writes its own JSON there. The exit code
-            // is the contract; the line is diagnostic.
-            match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
-                Err(e) if e.raw_os_error() == Some(WSAEACCES) => {
-                    eprintln!(
-                        "srt-win: runner: egress probe {target}: \
-                         BLOCKED ({e})"
-                    );
-                    Ok(0)
-                }
-                Ok(_) => {
-                    eprintln!(
-                        "srt-win: runner: egress probe {target}: \
-                         CONNECTED — WFP block-user filter is NOT in \
-                         effect"
-                    );
-                    Ok(3)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "srt-win: runner: egress probe {target}: \
-                         UNREACHABLE: {e} (kind={:?}, os={:?})",
-                        e.kind(),
-                        e.raw_os_error(),
-                    );
-                    Ok(2)
-                }
-            }
-        }
+        RunnerCmd::ProbeEgress {
+            target,
+            anonymous_target,
+        } => Ok(crate::probe::run(&target, anonymous_target.as_deref())?.encode()),
     }
 }
 
@@ -210,11 +176,25 @@ mod tests {
         ));
         let probe = RunnerCmd::ProbeEgress {
             target: "127.0.0.1:49999".into(),
+            anonymous_target: Some("192.0.2.7:49999".into()),
         };
         let bytes = encode_cmd(&probe).unwrap();
         let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
-            back, RunnerCmd::ProbeEgress { target } if target == "127.0.0.1:49999"
+            back,
+            RunnerCmd::ProbeEgress { target, anonymous_target }
+                if target == "127.0.0.1:49999"
+                    && anonymous_target.as_deref() == Some("192.0.2.7:49999")
+        ));
+        // The off-loopback target is optional on the wire.
+        let back: RunnerCmd =
+            serde_json::from_str(r#"{"ProbeEgress":{"target":"127.0.0.1:1"}}"#).unwrap();
+        assert!(matches!(
+            back,
+            RunnerCmd::ProbeEgress {
+                anonymous_target: None,
+                ..
+            }
         ));
     }
 }

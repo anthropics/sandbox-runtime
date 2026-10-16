@@ -97,6 +97,8 @@ export type {
   WindowsAclStampOptions,
   WindowsAclGrantOptions,
   WindowsAclAceOutcome,
+  WindowsWfpProbeOutcome,
+  WindowsWfpResidual,
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
