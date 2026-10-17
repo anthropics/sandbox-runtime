@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import {
   existsSync,
   mkdirSync,
+  mkdtempSync,
   rmSync,
   writeFileSync,
   readFileSync,
@@ -1021,5 +1022,78 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     })
 
     expect(result.status).toBe(0)
+  })
+})
+
+describe.if(isMacOS)('macOS Seatbelt denyMachLookup', () => {
+  it('should deny configured services after every allow', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      denyMachLookup: ['com.apple.SecurityServer', 'com.example.prefix.*'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const allow = wrappedCommand.indexOf(
+      '(allow mach-lookup (global-name "com.apple.SecurityServer"))',
+    )
+    const deny = wrappedCommand.indexOf(
+      '(deny mach-lookup (global-name "com.apple.SecurityServer"))',
+    )
+    expect(allow).toBeGreaterThan(-1)
+    expect(deny).toBeGreaterThan(allow)
+    expect(wrappedCommand).toContain(
+      '(deny mach-lookup (global-name-prefix "com.example.prefix."))',
+    )
+  })
+
+  describe('with a keychain item', () => {
+    let dir: string
+    let keychain: string
+
+    beforeAll(() => {
+      dir = mkdtempSync(join(tmpdir(), 'srt-deny-mach-'))
+      keychain = join(dir, 'test.keychain')
+      spawnSync('/usr/bin/security', ['create-keychain', '-p', 'pw', keychain])
+      spawnSync('/usr/bin/security', [
+        'add-generic-password',
+        '-s',
+        'srt-deny-mach',
+        '-a',
+        'test',
+        '-w',
+        'canary',
+        keychain,
+      ])
+    })
+
+    afterAll(() => {
+      spawnSync('/usr/bin/security', ['delete-keychain', keychain])
+      rmSync(dir, { recursive: true, force: true })
+    })
+
+    const readItem = (denyMachLookup?: string[]) =>
+      spawnSync(
+        wrapCommandWithSandboxMacOS({
+          command: `/usr/bin/security find-generic-password -s srt-deny-mach -w ${keychain}`,
+          // With nothing restricted the command is not wrapped at all.
+          needsNetworkRestriction: true,
+          denyMachLookup,
+          readConfig: undefined,
+          writeConfig: undefined,
+        }),
+        { shell: true, encoding: 'utf8', timeout: 10000 },
+      )
+
+    it('should read the item when no lookup is denied', () => {
+      expect(readItem().stdout.trim()).toBe('canary')
+    })
+
+    it('should not read the item with com.apple.SecurityServer denied', () => {
+      const result = readItem(['com.apple.SecurityServer'])
+      expect(result.status).not.toBe(0)
+      expect(result.stdout).not.toContain('canary')
+    })
   })
 })
