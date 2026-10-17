@@ -2220,6 +2220,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // `curl --noproxy ""`. Drop NO_PROXY here so localhost goes through
   // the proxy (which connects on the child's behalf, from the broker's
   // SID, and is not fenced).
+  // NODE_USE_ENV_PROXY stays: with no bypass list, Node's built-in
+  // clients send every request, loopback included, to the proxy.
   delete generated.NO_PROXY
   delete generated.no_proxy
 
