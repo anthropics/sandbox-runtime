@@ -2250,13 +2250,17 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // same precedence as the macOS/Linux `env -u … VAR=…
   // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
   // (which composes against setEnvVars) wins.
-  const overlay: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    PATHEXT: process.env.PATHEXT,
-    ...(p.setEnvVars ?? {}),
-    ...generated,
-    ...gitCfg,
-  }
+  //
+  // Merged ignoring case, as Windows reads names: `generated` names
+  // each proxy variable in both cases for Unix tools, and a caller's
+  // `Https_Proxy` is the same variable as ours. One name each goes to
+  // the runner (see mergeWindowsEnv).
+  const overlay = mergeWindowsEnv(
+    { PATH: process.env.PATH, PATHEXT: process.env.PATHEXT },
+    p.setEnvVars ?? {},
+    generated,
+    gitCfg,
+  )
   for (const [k, v] of Object.entries(overlay)) {
     if (v !== undefined) argv.push('--env', `${k}=${v}`)
   }
@@ -2290,6 +2294,53 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy).
   const env: NodeJS.ProcessEnv = { ...process.env, ...generated }
   return { argv, env }
+}
+
+/**
+ * The one spelling each of these proxy variables has in a sandboxed
+ * command's environment. Mirrors `PROXY_NAME_SPELLING` in
+ * `vendor/srt-win-src/src/launch.rs`, which has the reasoning: native
+ * Windows programs look names up ignoring case, so the spelling is the
+ * one the case-sensitive Cygwin/MSYS2 tools read (wget and curl want
+ * `http_proxy` in lower case, rsync wants `RSYNC_PROXY` in upper).
+ */
+const WINDOWS_PROXY_NAME_SPELLING: readonly string[] = [
+  'http_proxy',
+  'https_proxy',
+  'ftp_proxy',
+  'all_proxy',
+  'no_proxy',
+  'grpc_proxy',
+  'RSYNC_PROXY',
+]
+
+/**
+ * Merge environment layers the way Windows reads names: ignoring case.
+ * A later layer's entry replaces an earlier one, name and value, so the
+ * result never holds two names that differ only by case. Two such names
+ * in one environment block make .NET's `Process.Start` throw ("Item has
+ * already been added"), which breaks MSBuild, `Start-Process` with
+ * redirection and anything else that starts a process that way. The
+ * names in {@link WINDOWS_PROXY_NAME_SPELLING} are spelled as listed;
+ * every other name keeps the spelling it was last given.
+ *
+ * `srt-win exec` enforces the same rule on what it is handed; doing it
+ * here keeps the command line to one `--env` per variable.
+ */
+export function mergeWindowsEnv(
+  ...layers: Readonly<Record<string, string | undefined>>[]
+): Record<string, string | undefined> {
+  const byName = new Map<string, [name: string, value: string | undefined]>()
+  for (const layer of layers) {
+    for (const [name, value] of Object.entries(layer)) {
+      const folded = name.toUpperCase()
+      const spelling =
+        WINDOWS_PROXY_NAME_SPELLING.find(n => n.toUpperCase() === folded) ??
+        name
+      byName.set(folded, [spelling, value])
+    }
+  }
+  return Object.fromEntries(byName.values())
 }
 
 /**

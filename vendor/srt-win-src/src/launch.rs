@@ -349,87 +349,34 @@ pub fn run_lockdown(
 // ─── Environment block ──────────────────────────────────────────────
 
 /// Build a `CREATE_UNICODE_ENVIRONMENT` block from the runner's own
-/// environment, **verbatim**.
+/// environment with `overlay` applied on top.
 ///
 /// `srt-win exec` is a dumb passthrough for proxy configuration: it
 /// does NOT synthesize `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` and has
 /// no `--http-proxy` / `--socks-proxy` flags. The single source of
 /// proxy env is the TS `generateProxyEnvVars`, which the caller passes
-/// via `--env`; this function just forwards the runner's environment
+/// via `--env`; this function forwards the runner's environment
 /// (= the sandbox user's `LOGON_WITH_PROFILE` defaults) with the
 /// overlay applied on top to the child. No proxy value is invented,
-/// no inherited var is stripped or blanked.
+/// no inherited var is blanked. See [`merge_env`] for the one rule
+/// the block does enforce: no two names equal ignoring case.
 ///
-/// Entries are sorted case-insensitively by name for block ordering —
-/// not the strict case-insensitive Unicode collation the
-/// `CreateProcess` docs describe, but in practice the loader and
-/// `GetEnvironmentVariableW` don't enforce ordering; `cmd /c set` and
-/// every consumer we've tested work regardless. Names are NOT folded
-/// or deduplicated, so if both `HTTP_PROXY` and `http_proxy` are
-/// present both survive into the child.
-///
-/// Two adjustments on top of the verbatim copy: (a) restoring the
-/// missing-case variants of `*_PROXY` variables (see
-/// [`add_proxy_case_twins`]) — casing repair of caller-provided
-/// values, not proxy synthesis; (b) applying `overlay` on top, where
-/// each `(KEY, VALUE)` REPLACES any base entry whose name matches
-/// case-insensitively (so the runner's broker-supplied `PATH`
-/// supersedes the sandbox-user default `PATH` while everything else
-/// passes through). Nothing else is added: consumers that need the
-/// broker's identity (e.g. the self-protect probe) discover it by
-/// walking the parent-process chain rather than via an environment
-/// variable.
+/// Nothing else is added: consumers that need the broker's identity
+/// (e.g. the self-protect probe) discover it by walking the
+/// parent-process chain rather than via an environment variable.
 fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-
     // Lossless base set — `env::vars()` PANICS on any entry whose
     // key or value is not valid UTF-8 (e.g. a PATH segment with an
     // unpaired surrogate from a profile path). Build from
     // `vars_os()` and encode each via `encode_wide` so nothing is
     // dropped and nothing panics.
-    let overlay_upper: std::collections::HashSet<String> = overlay
-        .iter()
-        .map(|(k, _)| k.to_ascii_uppercase())
-        .collect();
-    let mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
-        .filter(|(k, _)| {
-            // Drop base entries the overlay replaces. The
-            // overlay keys are ASCII (PATH, *_PROXY, …); a base
-            // key that doesn't round-trip as UTF-8 cannot match
-            // one and is kept.
-            k.to_str()
-                .map(|s| !overlay_upper.contains(&s.to_ascii_uppercase()))
-                .unwrap_or(true)
-        })
-        .collect();
-    for (k, v) in overlay {
-        entries.push((k.into(), v.into()));
-    }
+    encode_env_block(merge_env(std::env::vars_os().collect(), overlay))
+}
 
-    // Proxy case-twin repair operates on the UTF-8-decodable
-    // subset: proxy variable NAMES are ASCII by convention so
-    // filtering to entries whose key round-trips as UTF-8 misses
-    // nothing relevant; values are passed through lossily (the
-    // helper only inspects names, never values). Built from the
-    // post-overlay `entries` so an overlay-supplied `HTTP_PROXY`
-    // gets its lowercase twin too.
-    let mut twin_view: Vec<(String, String)> = entries
-        .iter()
-        .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_string_lossy().into_owned())))
-        .collect();
-    let before = twin_view.len();
-    add_proxy_case_twins(&mut twin_view);
-    for (k, v) in twin_view.into_iter().skip(before) {
-        entries.push((k.into(), v.into()));
-    }
+/// Encode `KEY=VALUE\0`… `\0`.
+fn encode_env_block(entries: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
 
-    // Order the block case-insensitively by name; values pass
-    // through verbatim. No dedup — case-variant duplicates are
-    // preserved. The sort key uses `to_string_lossy` only for
-    // ordering; the encoded bytes use `encode_wide` losslessly.
-    entries.sort_by_cached_key(|(k, _)| k.to_string_lossy().to_ascii_uppercase());
-
-    // Encode: `KEY=VALUE\0`… `\0`.
     let mut out: Vec<u16> = Vec::new();
     for (k, v) in entries {
         out.extend(k.encode_wide());
@@ -441,30 +388,134 @@ fn build_env_block(overlay: &[(String, String)]) -> Vec<u16> {
     out
 }
 
-/// Re-add the missing-case variants of `*_PROXY` variables (the host
-/// spawn layer collapses case-duplicate keys) so that Cygwin/MSYS2
-/// programs — which see a case-sensitive environment — still find
-/// them. For every entry whose name ends with `_PROXY`
-/// (case-insensitively), the all-uppercase and all-lowercase forms of
-/// that name are appended where missing, with the same value. Existing
-/// keys are never overwritten and nothing is added for names that are
-/// not `*_PROXY`.
-fn add_proxy_case_twins(entries: &mut Vec<(String, String)>) {
-    let mut names: std::collections::HashSet<String> =
-        entries.iter().map(|(k, _)| k.clone()).collect();
-    let mut twins: Vec<(String, String)> = Vec::new();
-    for (k, v) in entries.iter() {
-        if !k.to_ascii_uppercase().ends_with("_PROXY") {
-            continue;
+/// The entries of the child's environment: `inherited` with `overlay`
+/// applied on top, holding **no two names that are equal ignoring
+/// case**.
+///
+/// Windows environment names are case-insensitive, and a block that
+/// spells one name two ways breaks programs that load it into a
+/// case-insensitive table: .NET throws `ArgumentException: Item has
+/// already been added` from `Process.Start`, which takes down MSBuild
+/// tasks, `Start-Process -RedirectStandardOutput` in Windows
+/// PowerShell, `dotnet watch`, and so on. A second spelling also
+/// survives `set "NAME="`, which removes only the first match. This
+/// is the last point before the block is built, so the rule holds
+/// here whatever the overlay or the runner's environment contains:
+///
+/// - Among inherited entries that differ only by case, the first in
+///   the block is kept — the one `GetEnvironmentVariableW` returns.
+/// - An overlay entry replaces, name and value, whatever entry
+///   matches its name ignoring case (so the broker-supplied `PATH`
+///   supersedes the sandbox-user default `Path`), including an
+///   earlier overlay entry: the last `--env` wins.
+/// - The proxy variables in [`PROXY_NAME_SPELLING`] are then spelled
+///   as that table says, wherever they came from. Every other name
+///   keeps the spelling it arrived with.
+///
+/// Entries are sorted case-insensitively by name for block ordering —
+/// not the strict collation the `CreateProcess` docs describe, but in
+/// practice the loader and `GetEnvironmentVariableW` don't enforce
+/// ordering; `cmd /c set` and every consumer we've tested work
+/// regardless.
+fn merge_env(
+    inherited: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    overlay: &[(String, String)],
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use std::collections::hash_map::{Entry, HashMap};
+    use std::ffi::OsString;
+
+    let mut merged: Vec<(OsString, OsString)> = Vec::new();
+    let mut index: HashMap<Vec<u16>, usize> = HashMap::new();
+    for (k, v) in inherited {
+        if let Entry::Vacant(slot) = index.entry(fold_env_name(&k)) {
+            slot.insert(merged.len());
+            merged.push((k, v));
         }
-        for form in [k.to_ascii_uppercase(), k.to_ascii_lowercase()] {
-            if !names.contains(&form) {
-                names.insert(form.clone());
-                twins.push((form, v.clone()));
+    }
+    for (k, v) in overlay {
+        let entry: (OsString, OsString) = (k.into(), v.into());
+        match index.entry(fold_env_name(&entry.0)) {
+            Entry::Occupied(slot) => merged[*slot.get()] = entry,
+            Entry::Vacant(slot) => {
+                slot.insert(merged.len());
+                merged.push(entry);
             }
         }
     }
-    entries.extend(twins);
+    for (k, _) in &mut merged {
+        if let Some(spelling) = k.to_str().and_then(proxy_name_spelling) {
+            *k = spelling.into();
+        }
+    }
+    merged.sort_by_cached_key(|(k, _)| fold_env_name(k));
+    merged
+}
+
+/// An environment name as Windows compares it: UTF-16 units, each
+/// upper-cased on its own. A unit with no single-unit upper-case form
+/// (a surrogate half, `ß`) stays as it is, so names that are not
+/// valid Unicode fold too and none is dropped.
+fn fold_env_name(name: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    name.encode_wide()
+        .map(|unit| {
+            let Some(c) = char::from_u32(u32::from(unit)) else {
+                return unit;
+            };
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(u), None) => u16::try_from(u32::from(u)).unwrap_or(unit),
+                _ => unit,
+            }
+        })
+        .collect()
+}
+
+/// The one spelling each proxy variable has in the child's
+/// environment.
+///
+/// A native Windows program (C runtime `getenv`, .NET, PowerShell,
+/// cmd) looks names up ignoring case, so any one spelling serves it.
+/// A program on the Cygwin/MSYS2 runtime (Git Bash and its `/usr/bin`
+/// tools) sees names case-sensitively, so the spelling is chosen for
+/// those:
+///
+/// - `http_proxy`, `https_proxy`, `ftp_proxy`, `no_proxy`: wget reads
+///   only the lower-case names, and curl reads `http_proxy` in lower
+///   case only. curl reads the others, and `all_proxy`, in either
+///   case, lower case first.
+/// - `grpc_proxy`: gRPC reads the lower-case name.
+/// - `RSYNC_PROXY`: rsync reads only the upper-case name.
+///
+/// Both spellings cannot be handed to such a program: when it starts
+/// a native child it rebuilds a Windows block from its case-sensitive
+/// environment, and the duplicate reaches everything it starts. What
+/// one spelling costs: on that runtime, a shell script that expands
+/// `$HTTP_PROXY`, `$HTTPS_PROXY`, `$ALL_PROXY`, `$FTP_PROXY`,
+/// `$NO_PROXY` or `$GRPC_PROXY` in upper case, or a program that
+/// reads only those, finds them unset. Native programs it starts are
+/// unaffected.
+///
+/// A name that is not listed is not a proxy address this table knows
+/// a reader for (`NODE_USE_ENV_PROXY` is a switch, `DOCKER_HTTP_PROXY`
+/// has upper-case readers only) and keeps the spelling it was given.
+const PROXY_NAME_SPELLING: &[&str] = &[
+    "http_proxy",
+    "https_proxy",
+    "ftp_proxy",
+    "all_proxy",
+    "no_proxy",
+    "grpc_proxy",
+    "RSYNC_PROXY",
+];
+
+/// The spelling [`PROXY_NAME_SPELLING`] gives `name`, if it lists it.
+fn proxy_name_spelling(name: &str) -> Option<&'static str> {
+    PROXY_NAME_SPELLING
+        .iter()
+        .copied()
+        .find(|spelling| spelling.eq_ignore_ascii_case(name))
 }
 
 // ─── Command-line quoting ───────────────────────────────────────────
@@ -780,42 +831,200 @@ mod tests {
         assert!(line.ends_with(r#""a \"b""#), "got: {line}");
     }
 
+    fn os(pairs: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        pairs.iter().map(|(k, v)| (k.into(), v.into())).collect()
+    }
+
+    fn overlay(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The merged entries as `(name, value)` strings, having checked
+    /// that no two names are equal ignoring case.
+    fn merged(inherited: &[(&str, &str)], over: &[(&str, &str)]) -> Vec<(String, String)> {
+        let entries: Vec<(String, String)> = merge_env(os(inherited), &overlay(over))
+            .into_iter()
+            .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        for (k, _) in &entries {
+            assert!(
+                seen.insert(k.to_uppercase()),
+                "{k} is in the block twice ignoring case: {entries:?}"
+            );
+        }
+        entries
+    }
+
+    fn value_of<'a>(entries: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        entries
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     #[test]
-    fn proxy_case_twins_suffix_rule_covers_any_proxy_var() {
-        let mut entries = vec![
-            // Any *_PROXY name is twinned, not just the standard trio.
-            (
-                "GRPC_PROXY".to_string(),
-                "socks5h://localhost:60081".to_string(),
-            ),
-            // Mixed-case input → BOTH canonical forms appended.
-            (
-                "Http_Proxy".to_string(),
-                "http://localhost:60080".to_string(),
-            ),
-            // Names that merely contain or extend the suffix are not.
-            ("FOO_PROXYX".to_string(), "x".to_string()),
-            ("PATH".to_string(), r"C:\Windows".to_string()),
+    fn env_overlay_with_both_spellings_yields_one_name() {
+        // What a caller that names each proxy variable in both cases
+        // sends.
+        let entries = merged(
+            &[("SystemRoot", r"C:\Windows")],
+            &[
+                ("HTTP_PROXY", "http://localhost:60080"),
+                ("HTTPS_PROXY", "http://localhost:60080"),
+                ("http_proxy", "http://localhost:60080"),
+                ("https_proxy", "http://localhost:60080"),
+                ("ALL_PROXY", "http://localhost:60080"),
+                ("all_proxy", "http://localhost:60080"),
+                ("GRPC_PROXY", "http://localhost:60080"),
+                ("grpc_proxy", "http://localhost:60080"),
+                ("FTP_PROXY", "socks5h://localhost:60081"),
+                ("ftp_proxy", "socks5h://localhost:60081"),
+                ("RSYNC_PROXY", "localhost:60081"),
+            ],
+        );
+        assert_eq!(entries.len(), 7, "{entries:?}");
+        for name in ["http_proxy", "https_proxy", "all_proxy", "grpc_proxy"] {
+            assert_eq!(value_of(&entries, name), Some("http://localhost:60080"));
+        }
+        assert_eq!(
+            value_of(&entries, "ftp_proxy"),
+            Some("socks5h://localhost:60081")
+        );
+        assert_eq!(value_of(&entries, "RSYNC_PROXY"), Some("localhost:60081"));
+    }
+
+    #[test]
+    fn env_proxy_names_have_one_spelling_whatever_was_given() {
+        for (given, spelled) in [
+            ("HTTP_PROXY", "http_proxy"),
+            ("Http_Proxy", "http_proxy"),
+            ("http_proxy", "http_proxy"),
+            ("HTTPS_PROXY", "https_proxy"),
+            ("FTP_PROXY", "ftp_proxy"),
+            ("ALL_PROXY", "all_proxy"),
+            ("NO_PROXY", "no_proxy"),
+            ("GRPC_PROXY", "grpc_proxy"),
+            ("rsync_proxy", "RSYNC_PROXY"),
+            ("RSYNC_PROXY", "RSYNC_PROXY"),
+        ] {
+            // From the overlay, and from the runner's own environment.
+            let entries = merged(&[], &[(given, "v")]);
+            assert_eq!(entries, vec![(spelled.to_string(), "v".to_string())]);
+            let entries = merged(&[(given, "v")], &[]);
+            assert_eq!(entries, vec![(spelled.to_string(), "v".to_string())]);
+        }
+    }
+
+    #[test]
+    fn env_other_names_keep_their_spelling_and_get_no_second_one() {
+        // Names that end in `_PROXY` but are not in the table, a name
+        // that merely extends the suffix, and an ordinary one.
+        let over = [
+            ("NODE_USE_ENV_PROXY", "1"),
+            ("DOCKER_HTTP_PROXY", "http://localhost:60080"),
+            ("Foo_Proxy", "x"),
+            ("HTTP_PROXYX", "x"),
+            ("PATH", r"C:\Windows"),
         ];
-        add_proxy_case_twins(&mut entries);
-        let matching = |name: &str| {
-            entries
-                .iter()
-                .filter(|(k, _)| k == name)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(matching("grpc_proxy").len(), 1);
-        assert_eq!(matching("grpc_proxy")[0].1, "socks5h://localhost:60081");
-        assert_eq!(matching("GRPC_PROXY").len(), 1);
-        // Mixed-case original is preserved AND both canonical forms added.
-        assert_eq!(matching("Http_Proxy").len(), 1);
-        assert_eq!(matching("HTTP_PROXY").len(), 1);
-        assert_eq!(matching("http_proxy").len(), 1);
-        assert_eq!(matching("http_proxy")[0].1, "http://localhost:60080");
-        // Non-matching names untouched, nothing appended for them.
-        assert_eq!(matching("FOO_PROXYX").len(), 1);
-        assert!(matching("foo_proxyx").is_empty());
-        assert_eq!(matching("PATH").len(), 1);
-        assert!(matching("path").is_empty());
+        let entries = merged(&[], &over);
+        assert_eq!(entries.len(), over.len(), "{entries:?}");
+        for (name, value) in over {
+            assert_eq!(value_of(&entries, name), Some(value));
+        }
+    }
+
+    #[test]
+    fn env_overlay_replaces_an_inherited_name_in_any_case() {
+        let entries = merged(
+            &[
+                ("Path", r"C:\Users\sandbox\bin"),
+                ("HTTPS_PROXY", "http://inherited:1"),
+                ("node_use_env_proxy", "1"),
+                ("TEMP", r"C:\Users\sandbox\Temp"),
+            ],
+            &[
+                ("PATH", r"C:\Windows"),
+                ("https_proxy", "http://localhost:60080"),
+                ("NODE_USE_ENV_PROXY", "0"),
+            ],
+        );
+        assert_eq!(entries.len(), 4, "{entries:?}");
+        // The overlay's value, under the overlay's spelling.
+        assert_eq!(value_of(&entries, "PATH"), Some(r"C:\Windows"));
+        assert_eq!(
+            value_of(&entries, "https_proxy"),
+            Some("http://localhost:60080")
+        );
+        assert_eq!(value_of(&entries, "NODE_USE_ENV_PROXY"), Some("0"));
+        assert_eq!(value_of(&entries, "TEMP"), Some(r"C:\Users\sandbox\Temp"));
+    }
+
+    #[test]
+    fn env_inherited_names_that_differ_by_case_yield_the_first() {
+        // A runner started with a block that already spells a name
+        // twice: the first is the one a lookup by name returns.
+        let entries = merged(
+            &[
+                ("HTTP_PROXY", "http://first:1"),
+                ("http_proxy", "http://second:2"),
+                ("Foo", "first"),
+                ("FOO", "second"),
+            ],
+            &[],
+        );
+        assert_eq!(
+            entries,
+            vec![
+                ("Foo".to_string(), "first".to_string()),
+                ("http_proxy".to_string(), "http://first:1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_last_overlay_entry_for_a_name_wins() {
+        let entries = merged(
+            &[],
+            &[
+                ("NODE_USE_ENV_PROXY", "1"),
+                ("node_use_env_proxy", ""),
+                ("HTTPS_PROXY", "http://masked"),
+                ("https_proxy", "http://localhost:60080"),
+            ],
+        );
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "https_proxy".to_string(),
+                    "http://localhost:60080".to_string()
+                ),
+                ("node_use_env_proxy".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_names_fold_beyond_ascii_and_block_is_sorted() {
+        let entries = merged(&[("é", "1"), ("b", "2"), ("A", "3")], &[("É", "4")]);
+        assert_eq!(
+            entries,
+            vec![
+                ("A".to_string(), "3".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("É".to_string(), "4".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_block_is_name_value_pairs_with_a_final_nul() {
+        let block = encode_env_block(os(&[("A", "1"), ("b", "x=y")]));
+        let expected: Vec<u16> = "A=1\0b=x=y\0\0".encode_utf16().collect();
+        assert_eq!(block, expected);
     }
 }

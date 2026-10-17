@@ -207,22 +207,128 @@ if ($r.out -notmatch '(?i)PATH=.*System32') {
 }
 Write-Host 'R4 ok: USERPROFILE isolated, broker PATH overlaid'
 
-# ── R4b: --env overlay restores the *_PROXY case-twin ───────────
-# The host spawn layer keeps only ONE casing of an env key, but
-# Cygwin/MSYS2 children read the lowercase names — so the runner
-# appends the missing twin. Passing HTTP_PROXY via --env and
-# finding BOTH casings in the child proves the repair.
+# Names in `set` output that appear more than once ignoring case.
+function Get-RepeatedEnvNames {
+  param([string] $SetOutput)
+  $SetOutput -split "`r?`n" |
+    Where-Object { $_ -match '^[^=]+=' } |
+    ForEach-Object { ($_ -split '=', 2)[0].ToUpperInvariant() } |
+    Group-Object | Where-Object { $_.Count -gt 1 } |
+    ForEach-Object { $_.Name }
+}
+
+# ── R4b: a proxy variable given in upper case reaches the child ──
+# in lower case, once. Cygwin/MSYS2 programs see names
+# case-sensitively and wget and curl read the lower-case http_proxy;
+# native programs find it under either spelling. Two spellings in one
+# block break .NET (R4d, R4e), so there is exactly one.
 $r = RExec @('--env', "HTTP_PROXY=http://127.0.0.1:$PortLo",
              '--', $cmd, '/c', 'set http')
 if ($r.exit -ne 0) { throw "R4b: 'set http' exited $($r.exit). out: $($r.out)" }
 $lines = $r.out -split "`r?`n"
 if (-not ($lines | Where-Object { $_ -clike 'http_proxy=*' })) {
-  throw "R4b: lowercase http_proxy twin missing in child. out: $($r.out)"
+  throw "R4b: lowercase http_proxy missing in child. out: $($r.out)"
 }
-if (-not ($lines | Where-Object { $_ -clike 'HTTP_PROXY=*' })) {
-  throw "R4b: uppercase HTTP_PROXY missing in child. out: $($r.out)"
+$n = @($lines | Where-Object { $_ -like 'http_proxy=*' }).Count
+if ($n -ne 1) {
+  throw "R4b: http_proxy is in the child's environment $n times ignoring case. out: $($r.out)"
 }
-Write-Host 'R4b ok: runner restores the lowercase twin of overlay-proxy vars'
+Write-Host 'R4b ok: an overlay proxy var reaches the child in lower case, once'
+
+# An overlay that spells names both ways, as a caller that serves
+# case-sensitive Unix tools would, plus a `*_PROXY` name that is a
+# switch and not an address.
+$bothCases = @(
+  '--env', "HTTP_PROXY=http://127.0.0.1:$PortLo",
+  '--env', "HTTPS_PROXY=http://127.0.0.1:$PortLo",
+  '--env', "http_proxy=http://127.0.0.1:$PortLo",
+  '--env', "https_proxy=http://127.0.0.1:$PortLo",
+  '--env', "ALL_PROXY=http://127.0.0.1:$PortLo",
+  '--env', "all_proxy=http://127.0.0.1:$PortLo",
+  '--env', "GRPC_PROXY=http://127.0.0.1:$PortLo",
+  '--env', "grpc_proxy=http://127.0.0.1:$PortLo",
+  '--env', "FTP_PROXY=socks5h://127.0.0.1:$PortLo",
+  '--env', "ftp_proxy=socks5h://127.0.0.1:$PortLo",
+  '--env', "RSYNC_PROXY=127.0.0.1:$PortLo",
+  '--env', "rsync_proxy=127.0.0.1:$PortLo",
+  '--env', 'NODE_USE_ENV_PROXY=1')
+
+# ── R4c: no name is in the child's environment twice ─────────────
+$r = RExec ($bothCases + @('--', $cmd, '/c', 'set'))
+if ($r.exit -ne 0) { throw "R4c: 'set' exited $($r.exit). out: $($r.out)" }
+$repeated = @(Get-RepeatedEnvNames $r.out)
+if ($repeated.Count -ne 0) {
+  throw "R4c: names in the child's environment twice ignoring case: $($repeated -join ', '). out: $($r.out)"
+}
+$lines = $r.out -split "`r?`n"
+foreach ($name in 'http_proxy', 'https_proxy', 'all_proxy', 'grpc_proxy',
+                  'ftp_proxy', 'RSYNC_PROXY', 'NODE_USE_ENV_PROXY') {
+  if (-not ($lines | Where-Object { $_ -clike "$name=*" })) {
+    throw "R4c: $name missing in child under that spelling. out: $($r.out)"
+  }
+}
+# With one name, clearing it clears it.
+$r = RExec ($bothCases + @('--', $cmd, '/c',
+  'set "NODE_USE_ENV_PROXY=" & set NODE_USE_ENV & echo R4C-DONE'))
+if ($r.out -notmatch 'R4C-DONE' -or $r.out -match '(?im)^NODE_USE_ENV_PROXY=') {
+  throw "R4c: NODE_USE_ENV_PROXY survived being cleared. raw: $($r.raw)"
+}
+Write-Host 'R4c ok: each name once ignoring case; a cleared variable is gone'
+
+# ── R4d: .NET can load the child's environment ───────────────────
+# ProcessStartInfo copies the block into a case-insensitive table and
+# throws "Item has already been added" on a name spelled two ways.
+$r = RExec ($bothCases + @('--', $pwsh, '-NoProfile', '-Command',
+  "try { 'R4D-COUNT=' + (New-Object System.Diagnostics.ProcessStartInfo).EnvironmentVariables.Count } " +
+  "catch { 'R4D-ERR: ' + `$_ }"))
+if ($r.out -notmatch 'R4D-COUNT=\d+') {
+  throw "R4d: .NET could not load the environment. raw: $($r.raw)"
+}
+Write-Host 'R4d ok: ProcessStartInfo.EnvironmentVariables loads'
+
+# ── R4e: Windows PowerShell Start-Process with redirection ───────
+# The same table is built before anything is started, so with a
+# repeated name nothing starts: MSBuild tasks, `dotnet watch` and
+# scripts that start a server this way all fail alike.
+$r = RExec ($bothCases + @('--', $pwsh, '-NoProfile', '-Command',
+  "`$o = Join-Path `$env:TEMP 'srt-r4e-out.txt'; " +
+  "try { Start-Process cmd -ArgumentList '/c','echo R4E-OK' -RedirectStandardOutput `$o -Wait -NoNewWindow; Get-Content `$o } " +
+  "catch { 'R4E-ERR: ' + `$_ } finally { Remove-Item `$o -ErrorAction SilentlyContinue }"))
+if ($r.out -notmatch 'R4E-OK') {
+  throw "R4e: Start-Process -RedirectStandardOutput did not run its command. raw: $($r.raw)"
+}
+Write-Host 'R4e ok: Start-Process -RedirectStandardOutput starts its command'
+
+# ── R4f: an MSYS2 shell sees one name, and so does what it starts ─
+# The shell hands its case-sensitive environment on to a native child
+# as a Windows block, so a second spelling would reach R4d's failure
+# through it.
+$gitBash = 'C:\Program Files\Git\usr\bin\bash.exe'
+if (Test-Path $gitBash) {
+  # Two counts: the names that are http_proxy ignoring case, then the
+  # ones spelled in lower case. The script is one argument to `-c`: in
+  # an array literal `,` binds tighter than `+`, so a string joined
+  # there would be split in two, and bash would run only the first.
+  $script = "/usr/bin/env | /usr/bin/grep -i '^http_proxy=' | /usr/bin/wc -l; " +
+            "/usr/bin/env | /usr/bin/grep -c '^http_proxy='"
+  $r = RExec ($bothCases + @('--', $gitBash, '-c', $script))
+  $counts = @($r.out -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  if ($r.exit -ne 0 -or $counts.Count -ne 2 -or $counts[0] -ne '1' -or $counts[1] -ne '1') {
+    throw "R4f: expected one http_proxy, in lower case, in the shell's environment; counts: $($counts -join ' / '). exit: $($r.exit). raw: $($r.raw)"
+  }
+  # Only the proxy names are counted here: what else the shell's own
+  # startup adds to its environment is not this row's subject.
+  $r = RExec ($bothCases + @('--', $gitBash, '-c', 'cmd.exe //c set'))
+  $proxyLines = @($r.out -split "`r?`n" | Where-Object { $_ -match '(?i)^[^=]*_proxy=' })
+  $repeated = @(Get-RepeatedEnvNames ($proxyLines -join "`n"))
+  if ($r.exit -ne 0 -or $repeated.Count -ne 0 -or
+      -not ($proxyLines | Where-Object { $_ -clike 'http_proxy=*' })) {
+    throw "R4f: a native child of the shell has repeated names ($($repeated -join ', ')) or no http_proxy. raw: $($r.raw)"
+  }
+  Write-Host 'R4f ok: one http_proxy in an MSYS2 shell and in its native child'
+} else {
+  Write-Host 'R4f skipped: no Git Bash on this runner'
+}
 
 # ── R5: outbound blocked by block-user filter ───────────────────
 # The user-SID WFP filter blocks all srt-sandbox egress except
