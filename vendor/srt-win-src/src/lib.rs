@@ -30,6 +30,8 @@ pub mod acl;
 pub mod ambient;
 pub mod path_id;
 pub mod persist;
+pub mod profile;
+pub mod profile_plan;
 pub mod reg;
 pub mod state_db;
 

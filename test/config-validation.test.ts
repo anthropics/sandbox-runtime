@@ -1,6 +1,7 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
 import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
 import { windowsWriteRestrictedTokenEnabled } from '../src/sandbox/windows-sandbox-utils.js'
+import { WindowsConfigSchema } from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
 
@@ -2357,6 +2358,38 @@ describe('Config Validation', () => {
       for (const bad of ['false', 0, 'off', null]) {
         expect(parse({ writeRestrictedToken: bad }).success).toBe(false)
       }
+    })
+  })
+
+  describe('reading the user profile on Windows is not a setting', () => {
+    const parse = (windows?: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        ...(windows !== undefined && { windows }),
+      })
+
+    test('the windows block has no key that turns it on, lists exclusions, or re-admits one', () => {
+      const keys = Object.keys(WindowsConfigSchema.shape)
+      for (const gone of [
+        'profileRead',
+        'profileReadExclude',
+        'profileReadInclude',
+        'dangerouslyAllowReadOfProfileExclusions',
+      ]) {
+        expect(keys).not.toContain(gone)
+      }
+      // A configuration written for the earlier flag still parses; the
+      // keys are dropped, not honoured.
+      const r = parse({ profileRead: false, profileReadExclude: ['.x'] })
+      expect(r.success).toBe(true)
+      expect(Object.keys((r.success && r.data.windows) || {})).toEqual([])
+    })
+
+    test('the token opt-out is the one switch, and stands alone', () => {
+      expect(parse({ writeRestrictedToken: false }).success).toBe(true)
+      expect(parse({ writeRestrictedToken: true }).success).toBe(true)
+      expect(parse({}).success).toBe(true)
     })
   })
 })

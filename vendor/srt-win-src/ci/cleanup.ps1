@@ -27,7 +27,9 @@ param(
   # Must match smoke-machine-store.ps1.
   [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93',
   # Must match smoke-write-restricted.ps1.
-  [string]$WriteRestrictedSublayer = 'c8f3a1d5-2e6b-4a97-b0c4-5d1e7f9a3b62'
+  [string]$WriteRestrictedSublayer = 'c8f3a1d5-2e6b-4a97-b0c4-5d1e7f9a3b62',
+  # Must match smoke-profile-read.ps1.
+  [string]$ProfileReadSublayer = 'e1a47c93-5d28-4b6f-a3c1-7f0e9d2b4a58'
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -45,6 +47,7 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $AmbientSublayer
 & $Exe wfp uninstall --sublayer-guid $MachineStoreSublayer
 & $Exe wfp uninstall --sublayer-guid $WriteRestrictedSublayer
+& $Exe wfp uninstall --sublayer-guid $ProfileReadSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
 # sublayers; the test tears down via uninstallWindowsSandbox(). This
 # is belt-and-braces in case it crashed mid-row.
@@ -62,6 +65,9 @@ if (-not (Test-Path $Exe)) {
 # `srt-win exec` without --write-restricted-token is refused. Before
 # the uninstall below, which removes the group the grants name.
 & $Exe acl forget --all
+# A profile read grant (smoke-profile-read.ps1, on its made-up profile
+# tree): the same refusal while one is recorded, and the same order.
+& $Exe profile forget
 # Sandbox user + credential/marker rows in state.db — `srt-win
 # install` provisions these; `uninstall` (no --keep-user) removes
 # them, so this only matters if a smoke script threw mid-section.
@@ -69,6 +75,13 @@ if (-not (Test-Path $Exe)) {
 # smoke-write-restricted.ps1's scratch tree at the system-drive root.
 Get-ChildItem "$env:SystemDrive\" -Directory -Filter 'srt-wr-smoke-*' |
   Remove-Item -Recurse -Force
+# smoke-profile-read.ps1's scratch tree. Its junctions are removed as
+# links first, so nothing is deleted through them.
+Get-ChildItem "$env:SystemDrive\" -Directory -Filter 'srt-pr-smoke-*' | ForEach-Object {
+  Get-ChildItem $_.FullName -Recurse -Force -Attributes ReparsePoint |
+    ForEach-Object { $_.Delete() }
+  Remove-Item $_.FullName -Recurse -Force
+}
 # The record of write grants kept between sessions, if `acl forget
 # --all` above could not clear it.
 Remove-Item 'HKCU:\Software\sandbox-runtime\PersistentGrants' -Recurse -Force

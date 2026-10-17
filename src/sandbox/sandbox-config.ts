@@ -1113,7 +1113,11 @@ export const WindowsConfigSchema = z.object({
         'back to the ordinary token. Set `false` to opt out: the child ' +
         'then runs under the ordinary token with per-session grants, and ' +
         '`initialize()` first removes the kept grants (one walk of each ' +
-        'kept root).',
+        'kept root). The read access to your user profile that the ' +
+        'install grants (see `grantWindowsProfileRead()`) exists only ' +
+        'with the write-restricted token: with `false`, `initialize()` ' +
+        'removes that grant as well, and sandboxed commands read nothing ' +
+        'in your profile beyond `allowRead`.',
     ),
 })
 

@@ -100,8 +100,9 @@ jobs:
           # (`srt-win probe token` / `probe parent-access`), for the
           # rows of smoke-write-restricted that need them. Its own
           # target dir, so it can never replace the default-feature
-          # target\release\srt-win.exe every other step (and the TS
-          # suite) runs; release.yml never passes --features.
+          # target\release\srt-win.exe the other smokes run;
+          # release.yml never passes --features. The TS suite runs
+          # this build too, for its made-up profile (see that step).
           cargo build  --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks
           cargo clippy --release --locked --manifest-path vendor/srt-win-src/Cargo.toml --features test-hooks --target-dir vendor/srt-win-src/target/test-hooks --all-targets -- -D warnings
 
@@ -142,6 +143,14 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-write-restricted.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
 
+      # The opt-in profile read grant, on a made-up profile tree under a
+      # scratch root (never the runner's own profile): the test-hooks
+      # build is what can be pointed at it.
+      - name: Smoke-test srt-win profile read grant (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-profile-read.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -151,6 +160,15 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+          # A default session needs a read grant on the user's profile,
+          # and the suite must not grant the runner's own. It gets a
+          # made-up profile directory, which only the test-hooks build
+          # can be pointed at — so these rows run that build (the
+          # smokes above run the shipped one). Outside the system temp
+          # directory and the checkout, so no row's own paths contain it.
+          $env:SRT_WIN_TEST_PROFILE = Join-Path $env:RUNNER_TEMP 'srt-ts-profile'
+          New-Item -ItemType Directory -Force -Path $env:SRT_WIN_TEST_PROFILE | Out-Null
+          $env:SRT_WIN_TEST_HOOKS_EXE = (Resolve-Path 'vendor\srt-win-src\target\test-hooks\release\srt-win.exe').Path
           npm ci
           npm run build
           # These are listed explicitly because the non-Windows legs run the
