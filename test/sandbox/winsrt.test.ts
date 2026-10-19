@@ -3133,6 +3133,8 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
         /Re-run the install/,
       )
       await SandboxManager.reset()
+      // Roots other rows kept are not this row's business.
+      const keptBefore = status().persistentGrants?.roots ?? []
       const grant = spawnSync(
         TEST_SRT_WIN!.exe,
         [
@@ -3158,7 +3160,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       )
       expect(grant.status).toBe(15)
       expect(grant.stderr).toMatch(/re-run `srt-win install`/)
-      expect(status().persistentGrants).toBeUndefined()
+      expect(status().persistentGrants?.roots ?? []).toEqual(keptBefore)
       {
         const { argv, env } = wrapCommandWithSandboxWindows({
           command: 'echo V2-RAN',
