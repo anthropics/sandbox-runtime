@@ -110,9 +110,9 @@ enum Cmd {
     ///        port-range; no changes)
     ///   10 — UAC prompt cancelled by the user
     ///   12 — WFP filter install failed
-    ///   13 — already installed under this sublayer with a
-    ///        DIFFERENT port-range or sandbox-user name; pass
-    ///        `--force` to replace
+    ///   13 — a filter set (complete or partial) exists under
+    ///        this sublayer with a DIFFERENT port-range or
+    ///        sandbox-user name; pass `--force` to replace
     ///   14 — sandbox user provisioning failed
     ///   1  — other error (parse, elevation check, etc.)
     Install {
@@ -747,13 +747,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Idempotency / conflict pre-check. With a DIFFERENT
             // port-range or sandbox-user name and no --force, refuse
             // (exit 13) so an unintended config drift surfaces
-            // instead of silently overwriting. With the SAME config,
-            // only return early when the install is COMPLETE — i.e.
-            // the sandbox user is provisioned and the marker is
-            // current. A partial install falls through and the
-            // (idempotent) steps below complete it. A pre-existing
-            // install whose tags lack a port_range (legacy) is
-            // treated as "different" and requires --force.
+            // instead of silently overwriting; this holds for a
+            // complete and for a partial filter set. With the SAME
+            // config, only return early when the install is
+            // COMPLETE — i.e. the filter set is whole, the sandbox
+            // user is provisioned and the marker is current. A
+            // partial install falls through and the (idempotent)
+            // steps below complete it. A complete set whose tags
+            // lack a port_range (legacy) is treated as "different"
+            // and requires --force; a partial set without one has
+            // no range to compare and is re-added.
             let existing = install::read_setup().ok().flatten();
             // Shared by the early-out completeness check and the
             // stamping step below (env reads + a stat per entry).
@@ -761,10 +764,17 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let name_changed = existing.as_ref().is_some_and(|s| s.sandbox_user != name);
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
-                && st.state == "installed"
+                && (st.state == "installed" || st.state == "partial")
             {
                 let want = [range.0, range.1];
-                if st.port_range != Some(want) || name_changed {
+                // A partial set with no permit left has no range to
+                // compare; a complete set without one is legacy and
+                // counts as different.
+                let range_differs = match st.port_range {
+                    Some(have) => have != want,
+                    None => st.state == "installed",
+                };
+                if range_differs || name_changed {
                     let have_range = st
                         .port_range
                         .map(|[l, h]| format!("{l}-{h}"))
@@ -774,13 +784,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .map(|s| s.sandbox_user.as_str())
                         .unwrap_or("<none>");
                     eprintln!(
-                        "srt-win: error: already installed under \
+                        "srt-win: error: existing filter set is {} under \
                          sublayer {sl:?} with port_range={have_range}, \
                          sandbox_user='{have_name}'; requested \
                          port_range={}-{}, sandbox_user='{name}'. \
                          Pass --force to replace, or run `srt-win \
                          uninstall` first.",
-                        range.0, range.1,
+                        st.state, range.0, range.1,
                     );
                     std::process::exit(13);
                 }
@@ -801,7 +811,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // missing/undecryptable Cred\Blob with a healthy
                 // marker must fall through and be rewritten rather
                 // than early-outing on "already installed".
-                if us.exists
+                if st.state == "installed"
+                    && us.exists
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
                     && install::cred_present()
@@ -832,9 +843,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 }
                 eprintln!(
                     "srt-win: partial install detected \
-                     (user_provisioned={}, marker_version={:?}) — \
-                     completing",
-                    us.exists, mv,
+                     (wfp={}, user_provisioned={}, \
+                     marker_version={:?}) — completing",
+                    st.state, us.exists, mv,
                 );
                 // Fall through; the steps are idempotent.
             }

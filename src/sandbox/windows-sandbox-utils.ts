@@ -167,7 +167,11 @@ export const DEFAULT_WINDOWS_PROXY_PORT_RANGE: readonly [number, number] = [
  * is access-denied (it is admin-gated). The non-elevated readiness
  * check is {@link verifyWindowsWfpEgress}, not this enum.
  */
-export type WindowsWfpStatus = 'absent' | 'installed' | 'cannot-read'
+export type WindowsWfpStatus =
+  | 'absent'
+  | 'partial'
+  | 'installed'
+  | 'cannot-read'
 
 export interface WindowsWfpStatusResult {
   state: WindowsWfpStatus
@@ -1508,7 +1512,7 @@ function remapInstallTimeout(e: unknown): never {
 //   0  ok
 //   10 user cancelled UAC elevation
 //   12 WFP install failed
-//   13 already installed with different config (use --force)
+//   13 a filter set exists with a different config (use --force)
 //   14 sandbox-user provisioning failed
 //   17 ambient write-deny stamping failed
 //   1  other error (stderr has detail)
@@ -2391,11 +2395,15 @@ function interpretDependencyProbes(
       `[Sandbox Windows] wfp status cannot-read (non-elevated): ${ws.hint}`,
     )
   } else if (ws.state !== 'installed') {
-    // 'absent'. If the user is also not-provisioned, the user-state
-    // error above already gave the right instruction; don't repeat.
+    // 'absent' or 'partial' (some of the set is missing, so one address
+    // family may be open). If the user is also not-provisioned, the
+    // user-state error above already gave the right instruction; don't
+    // repeat.
     if (us.provisioned && us.credPresent) {
       errors.push(
-        `WFP filters not installed under sublayer ` +
+        (ws.state === 'partial'
+          ? `WFP filter set incomplete (${ws.filters} present) under sublayer `
+          : `WFP filters not installed under sublayer `) +
           `${sublayerGuid ?? '(default)'}. ` +
           windowsInstallInstructions(sublayerGuid),
       )
