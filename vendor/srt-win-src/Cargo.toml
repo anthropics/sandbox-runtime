@@ -13,6 +13,11 @@ path = "src/lib.rs"
 name = "srt-win"
 path = "src/main.rs"
 
+[features]
+# Test-only fault injection for the CI smokes. OFF by default and never
+# enabled for a shipped binary.
+test-hooks = []
+
 [target.'cfg(windows)'.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

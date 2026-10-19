@@ -487,15 +487,28 @@ pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)>
     Ok((id, std_info.NumberOfLinks, std_info.Directory))
 }
 
-/// Best-effort: locate the CURRENT path of a file by its captured
+/// Where a recorded `(volume_serial, file_id)` is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+    /// The object exists; this is its current path.
+    At(String),
+    /// Positively gone: its volume was found and the volume reported
+    /// that no file has this id.
+    Gone,
+    /// Could not be established either way (volume not mounted, or the
+    /// lookup failed for another reason). The object may still exist.
+    Unknown,
+}
+
+/// Locate the CURRENT path of a file by its captured
 /// `(volume_serial, file_id)`. Opens the volume root (`\\?\X:\`),
 /// `OpenFileById` with an `ExtendedFileId` descriptor, then
-/// `GetFinalPathNameByHandleW`. Returns `None` if the file was
-/// deleted or the open fails for any reason. Used ONLY for
-/// reporting `movedTo` — restore is path-anchored and never
-/// relocates by inode (chasing the file by ID to remove its stamp
-/// would re-expose a relocated secret).
-pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
+/// `GetFinalPathNameByHandleW`.
+///
+/// Returns [`Located::Gone`] only when the volume itself answered that the id
+/// names no file; every other failure is [`Located::Unknown`].
+pub fn locate_by_file_id(file_id: &FileId) -> Located {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER};
     use windows::Win32::Storage::FileSystem::{
         ExtendedFileIdType, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, OpenFileById,
     };
@@ -539,13 +552,26 @@ pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
             )
         } {
             Ok(h) => OwnedHandle(h),
-            Err(_) => return None,
+            Err(e)
+                if e.code() == ERROR_FILE_NOT_FOUND.into()
+                    || e.code() == ERROR_INVALID_PARAMETER.into() =>
+            {
+                return Located::Gone;
+            }
+            Err(_) => return Located::Unknown,
         };
-        let buf = final_path_from_handle(fh.raw()).ok()?;
+        let Ok(buf) = final_path_from_handle(fh.raw()) else {
+            return Located::Unknown;
+        };
         let s = String::from_utf16_lossy(&buf);
-        return utf16_roundtrips(&buf, &s).then_some(s);
+        return if utf16_roundtrips(&buf, &s) {
+            Located::At(s)
+        } else {
+            Located::Unknown
+        };
     }
-    None
+    // No mounted volume carries this serial.
+    Located::Unknown
 }
 
 #[cfg(test)]
