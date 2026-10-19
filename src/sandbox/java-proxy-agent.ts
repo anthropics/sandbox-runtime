@@ -105,7 +105,7 @@ function findGlobalJar(globalBases: string[]): string | null {
 export function buildJavaToolOptions(opts: {
   agentJarPath?: string
   flags?: string[]
-  unsetEnvVars?: string[]
+  unsetEnvVars?: readonly string[]
   inherited?: string
 }): string | undefined {
   const denied = (opts.unsetEnvVars ?? []).includes('JAVA_TOOL_OPTIONS')

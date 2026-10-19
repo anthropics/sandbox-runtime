@@ -85,6 +85,8 @@ import {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
+  stageWindowsJavaAgentJar,
+  removeStagedWindowsJavaAgentJar,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
@@ -181,6 +183,11 @@ let mitmCA: MitmCA | undefined
  * shipped/found (JVMs then just aren't proxy-aware, as before).
  */
 let javaAgentJarPath: string | undefined
+/**
+ * Windows: this session's staged copy of the agent jar, in a directory of
+ * its own that the sandbox user is granted read on.
+ */
+let windowsJavaAgentJarPath: string | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
@@ -1098,7 +1105,18 @@ async function initializeSteps(
       // against the config's lists, nor one of the config's grants.
       const grantRead = mitmCA
         ? [...acc.grantRead, dirname(mitmCA.trustBundlePath)]
-        : acc.grantRead
+        : [...acc.grantRead]
+      // Every JVM loads the staged agent jar as code, so its directory is
+      // write-denied as well as read-granted; both stay out of `acc`.
+      const denyWrite = [...acc.denyWrite]
+      const jar = await getJavaProxyAgentJarPathAsync(
+        runtimeConfig.javaAgentJarPath,
+      )
+      windowsJavaAgentJarPath = jar ? stageWindowsJavaAgentJar(jar) : undefined
+      if (windowsJavaAgentJarPath) {
+        grantRead.push(dirname(windowsJavaAgentJarPath))
+        denyWrite.push(dirname(windowsJavaAgentJarPath))
+      }
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
       // status` here.
@@ -1124,11 +1142,11 @@ async function initializeSteps(
           srtWin,
         })
       }
-      if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
+      if (acc.denyRead.length > 0 || denyWrite.length > 0) {
         stampWindowsAcl({
           sandboxUserSid: sb,
           denyRead: acc.denyRead,
-          denyWrite: acc.denyWrite,
+          denyWrite,
           srtWin,
         })
       }
@@ -1141,7 +1159,7 @@ async function initializeSteps(
         grantRead.length > 0 ||
         acc.grantWrite.length > 0 ||
         acc.denyRead.length > 0 ||
-        acc.denyWrite.length > 0
+        denyWrite.length > 0
       if (anyApplied) {
         windowsFsStampedSet = acc
         logForDebugging(
@@ -1149,7 +1167,7 @@ async function initializeSteps(
             `${acc.grantWrite.length} grantWrite, ` +
             `${grantRead.length} grantRead, ` +
             `${acc.denyRead.length} denyRead, ` +
-            `${acc.denyWrite.length} denyWrite`,
+            `${denyWrite.length} denyWrite`,
         )
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
@@ -1162,6 +1180,10 @@ async function initializeSteps(
         restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
       }
       windowsFsSbUserSid = undefined
+      if (windowsJavaAgentJarPath) {
+        removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
+        windowsJavaAgentJarPath = undefined
+      }
       config = undefined
       throw e
     }
@@ -2416,8 +2438,8 @@ async function wrapWithSandboxOnce(
  * — the sandboxed child gets a fresh `srt-sandbox` profile env with
  * only the `--env` overlay baked into `argv` (see
  * {@link wrapCommandWithSandboxWindows}). When `stdinPayload` is set
- * (network config with proxy auth), the caller MUST spawn with
- * stdin piped and write the payload immediately — it carries the
+ * (network config with proxy auth or a JVM proxy agent), the caller
+ * MUST spawn with stdin piped and write the payload immediately — it carries the
  * proxy env entries embedding the per-session auth token, which
  * must never appear on a command line (same-user siblings can
  * enumerate those freely). On
@@ -2549,6 +2571,10 @@ async function wrapWithSandboxArgv(
       // passed via the --env overlay so the sandboxed child sees
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
+      // Only when a proxy is advertised. The deny list rides along so a denied
+      // JAVA_TOOL_OPTIONS is not composed back in from the broker's env.
+      javaAgentJarPath: hasNetworkConfig ? windowsJavaAgentJarPath : undefined,
+      unsetEnvVars: credentialRestrictions.unsetEnvVars,
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
@@ -2805,6 +2831,12 @@ async function reset(): Promise<void> {
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  // After the revoke and restore above, so both ACEs are released
+  // while the path still resolves.
+  if (windowsJavaAgentJarPath) {
+    removeStagedWindowsJavaAgentJar(windowsJavaAgentJarPath)
+    windowsJavaAgentJarPath = undefined
+  }
   srtWinSpawn = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 

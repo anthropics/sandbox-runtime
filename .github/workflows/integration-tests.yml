@@ -143,6 +143,13 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
+          # The JVM proxy agent jar, for the J rows in winsrt.test.ts; without
+          # it those rows skip.
+          if ($env:JAVA_HOME -or (Get-Command javac -ErrorAction SilentlyContinue)) {
+            npm run build:java-agent
+          } else {
+            Write-Host '::notice::no JDK on this runner; winsrt J4 (JVM through the proxy) will skip'
+          }
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw

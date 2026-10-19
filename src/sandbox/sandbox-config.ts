@@ -1227,10 +1227,12 @@ export const SandboxRuntimeConfigSchema = z
     javaAgentJarPath: binaryPathSchema
       .optional()
       .describe(
-        'macOS/Linux: absolute path to srt-proxy-agent.jar, the JVM agent ' +
+        'Absolute path to srt-proxy-agent.jar, the JVM agent ' +
           'injected via JAVA_TOOL_OPTIONS so Java tools honor the proxy. ' +
           'When set, used instead of looking under vendor/java-proxy-agent/. ' +
-          'For consumers that bundle sandbox-runtime and ship the jar separately.',
+          'For consumers that bundle sandbox-runtime and ship the jar separately. ' +
+          'On Windows the jar is copied into a per-session directory that the ' +
+          'sandbox user is granted read access to; the original is not exposed.',
       ),
     windows: WindowsConfigSchema.optional().describe(
       'Windows-specific settings (WFP sublayer, proxy port range).',
