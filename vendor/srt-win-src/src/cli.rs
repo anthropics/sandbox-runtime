@@ -124,7 +124,8 @@ enum Cmd {
         proxy_port_range: Option<String>,
         /// Open loopback: the sandbox account may connect to
         /// 127.0.0.0/8 and ::1 on every TCP and UDP port, as
-        /// `network.allowLocalBinding` allows on macOS. Default: closed (only the
+        /// `network.allowLocalBinding` allows on macOS (port 1 alone
+        /// stays blocked, for the fence check). Default: closed (only the
         /// proxy port range is reachable). Every listener on
         /// localhost — whoever owns it — becomes reachable from the
         /// sandbox, including any local forwarder that carries
@@ -767,13 +768,14 @@ enum WfpCmd {
     ///     lowered-integrity probe is `error`: that token shape could
     ///     not be set up, so no connect under it was observed.
     ///
-    /// With `--allow-loopback` nothing aimed at loopback is refused,
-    /// so `egress_probe` and `deny_only_probe` go to `anonymous_target`
-    /// instead (`egress_target` says where `egress_probe` went), and
-    /// the other probes aimed at `target` are `skipped`. A machine
-    /// with no off-loopback address then has nothing the filters must
-    /// refuse to aim at: `egress_probe` is `skipped`, the exit code is
-    /// still 0, and `residuals` names `egress-unprobed`.
+    /// With `--allow-loopback` one loopback port stays blocked for
+    /// the sandbox account (`wfp::LOOPBACK_PROBE_PORT`), and nothing
+    /// listens on it. `egress_probe` and the lowered-integrity
+    /// loopback probes go there (`egress_target`) and pass only on
+    /// the filter's refusal: for `egress_probe`, a refusal by the
+    /// stack, a connect or no answer in time all mean the block did
+    /// not fire (exit 3). `anonymous_loopback_probe` and
+    /// `deny_only_probe` are `skipped`.
     ///
     /// Every probe but `egress_probe` and `open_loopback_probe`
     /// (both run under the runner's own token) makes its connect
@@ -788,7 +790,8 @@ enum WfpCmd {
     /// `egress_probe` and the four lowered-integrity ones, whose
     /// token still carries the sandbox account's SID. Exits **0**
     /// (`egress_probe` was blocked; each lowered-integrity one was
-    /// blocked, skipped, or `error`; and with `--allow-loopback`
+    /// blocked, skipped for want of an off-loopback address, or
+    /// `error`; and with `--allow-loopback`
     /// `open_loopback_probe` connected = fence active), **3** (one
     /// got past the filters = fence MISSING), **2** (`egress_probe`
     /// was not blocked, or a connect that was made got no answer;
@@ -876,6 +879,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .with_context(|| format!("invalid --proxy-port-range '{s}'"))?,
                 None => wfp::DEFAULT_PROXY_PORT_RANGE,
             };
+            // The proxy PERMIT would open the port the fence check needs blocked.
+            if allow_loopback && range.0 <= wfp::LOOPBACK_PROBE_PORT {
+                return Err(anyhow!(
+                    "invalid --proxy-port-range {}-{} with --allow-loopback: port {} \
+                     stays blocked for the fence check",
+                    range.0,
+                    range.1,
+                    wfp::LOOPBACK_PROBE_PORT,
+                ));
+            }
             if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
@@ -1297,11 +1310,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let port = target.parse::<std::net::SocketAddr>().ok()?.port();
                 probe::off_loopback_target(port).map(|a| a.to_string())
             });
-            // Where the plain attempt goes: off loopback when loopback is open.
+            // Where the plain attempt goes: the reserved port when loopback is open.
             let egress_target = if allow_loopback {
-                anonymous_target.clone()
+                probe::blocked_loopback_target().to_string()
             } else {
-                Some(target.clone())
+                target.clone()
             };
             let code = logon::spawn_runner(
                 &cred.user,
@@ -1341,7 +1354,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     1,
                 );
             };
-            let verdict = probe::verdict(&report);
+            let verdict = probe::verdict(&report, allow_loopback);
             for residual in &verdict.residuals {
                 eprintln!(
                     "srt-win: warning: wfp verify: residual '{residual}': {}",
@@ -1359,10 +1372,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             "a lowered-integrity copy of the sandbox token \
                              could not be set up, so no connect under it was \
                              observed (see the per-ordering lines above)",
-                        probe::RESIDUAL_EGRESS_UNPROBED =>
-                            "loopback is open and this machine has no \
-                             off-loopback address, so no connect the filters \
-                             must refuse could be made: direct egress was not tested",
                         _ =>
                             "a connect made under a copy of the sandbox token \
                              whose user SID is deny-only is not blocked \

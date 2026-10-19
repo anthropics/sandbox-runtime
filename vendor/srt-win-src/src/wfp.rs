@@ -20,8 +20,8 @@
 //!
 //!   - **PERMIT loopback, open** (weight [`W_LOOPBACK`], only with
 //!     `install --allow-loopback`) — the same address condition, and
-//!     every port. It opens EVERY loopback listener, local forwarders
-//!     off the machine included.
+//!     every port but [`LOOPBACK_PROBE_PORT`]. It opens EVERY loopback
+//!     listener, local forwarders off the machine included.
 //!
 //!   - **BLOCK sandbox user** (weight [`W_BLOCK`]) — `ALE_USER_ID` SD
 //!     = [`sddl_sandbox_user`]. Matches only tokens whose user SID is
@@ -98,10 +98,15 @@ pub const DEFAULT_PROXY_PORT_RANGE: (u16, u16) = (60080, 60089);
 /// that.
 pub const MAX_PROXY_PORT_RANGE_WIDTH: u16 = 64;
 
-/// The remote ports of the open-loopback PERMIT: every one but 0. For
-/// ICMP the engine presents the message code as the remote port, and
-/// an echo request (code 0) must not match.
-pub(crate) const OPEN_LOOPBACK_PORTS: (u16, u16) = (1, u16::MAX);
+/// The one loopback port that stays blocked for the sandbox account with
+/// loopback open, so the fence check has a connect that must be refused.
+/// Nothing listens on it; the library mirrors it (`WINDOWS_LOOPBACK_PROBE_PORT`).
+pub const LOOPBACK_PROBE_PORT: u16 = 1;
+
+/// The remote ports of the open-loopback PERMIT: all above
+/// [`LOOPBACK_PROBE_PORT`]. Port 0 is out too: for ICMP the engine presents
+/// the message code as the remote port, and an echo request must not match.
+pub(crate) const OPEN_LOOPBACK_PORTS: (u16, u16) = (LOOPBACK_PROBE_PORT + 1, u16::MAX);
 
 // WFP error codes we treat as benign idempotency outcomes.
 const FWP_E_ALREADY_EXISTS: u32 = 0x80320009;
@@ -695,7 +700,7 @@ pub fn install_filters(
                             &mut tag,
                         )?;
                     }
-                    // PERMIT loopback ∩ every port (no user condition).
+                    // PERMIT loopback ∩ every port but the probe's (no user condition).
                     FilterShape::PermitLoopbackOpen => {
                         let mut ports = [FWP_RANGE0 {
                             valueLow: fwp_uint16(OPEN_LOOPBACK_PORTS.0),
@@ -791,13 +796,15 @@ pub fn fmt_loopback(open: bool) -> &'static str {
 /// What to say wherever loopback is found open, so that "egress
 /// blocked" is not read as the whole story.
 pub fn open_loopback_notice() -> String {
-    "loopback is open: the sandbox account can connect to every TCP \
-     and UDP port on 127.0.0.0/8 and ::1. Every service listening on \
-     localhost is reachable from sandboxed commands, and any local \
-     forwarder (a DNS stub, a SOCKS or HTTP proxy, a VPN agent) \
-     reachable there gives them a way off the machine; the egress \
-     block covers direct connections only"
-        .to_string()
+    format!(
+        "loopback is open: the sandbox account can connect to every TCP \
+         and UDP port on 127.0.0.0/8 and ::1 (port {LOOPBACK_PROBE_PORT} \
+         alone stays blocked, for the fence check). Every service \
+         listening on localhost is reachable from sandboxed commands, \
+         and any local forwarder (a DNS stub, a SOCKS or HTTP proxy, a \
+         VPN agent) reachable there gives them a way off the machine; \
+         the egress block covers direct connections only"
+    )
 }
 
 /// What to tell the operator when the session's loopback mode is not
@@ -1051,6 +1058,19 @@ mod tests {
     }
 
     #[test]
+    fn the_open_permit_leaves_out_only_the_probe_port_and_port_zero() {
+        const { assert!(LOOPBACK_PROBE_PORT == 1) };
+        let (lo, hi) = OPEN_LOOPBACK_PORTS;
+        let open = |p: u16| (lo..=hi).contains(&p);
+        assert!(!open(0) && !open(LOOPBACK_PROBE_PORT));
+        assert!((0..=u16::MAX).filter(|p| !open(*p)).count() == 2);
+        assert!(open(LOOPBACK_PROBE_PORT + 1) && open(u16::MAX));
+        // The proxy PERMIT must not open it either: see `install`.
+        let (proxy_lo, proxy_hi) = DEFAULT_PROXY_PORT_RANGE;
+        assert!(!(proxy_lo..=proxy_hi).contains(&LOOPBACK_PROBE_PORT));
+    }
+
+    #[test]
     fn loopback_is_open_only_with_the_permit_on_every_layer() {
         let (v4, v6) = (ALE_LAYERS[0].1, ALE_LAYERS[1].1);
         assert!(!tags_open_loopback(&enumerated(&[])));
@@ -1111,7 +1131,8 @@ mod tests {
     fn open_loopback_notice_is_plain() {
         let n = open_loopback_notice();
         assert!(n.starts_with("loopback is open"));
-        assert!(n.contains("every TCP and UDP port") && !n.contains("except"));
+        assert!(n.contains("every TCP and UDP port"));
+        assert!(n.contains(&format!("port {LOOPBACK_PROBE_PORT} alone stays blocked")));
         assert!(n.contains("forwarder") && n.contains("off the machine"));
     }
 

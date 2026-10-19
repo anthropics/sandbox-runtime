@@ -47,10 +47,6 @@ pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 /// under that shape was observed.
 pub const RESIDUAL_LOWERED_INTEGRITY_UNPROBED: &str = "lowered-integrity-unprobed";
 
-/// Residual: loopback is open and this machine has no off-loopback
-/// address, so no attempt the filters must refuse could be made.
-pub const RESIDUAL_EGRESS_UNPROBED: &str = "egress-unprobed";
-
 const ANONYMOUS_SID: &str = "S-1-5-7";
 
 const IL_LOW: u32 = 0x1000;
@@ -246,23 +242,26 @@ pub struct Verdict {
 /// The plain attempt must be blocked and no lowered-integrity one may pass;
 /// one not set up (`Error`) is a residual, as the rest are when they connect.
 /// With loopback open, `open_loopback` must connect ([`EXIT_LOOPBACK_MISMATCH`]).
-pub fn verdict(r: &Report) -> Verdict {
+pub fn verdict(r: &Report, allow_loopback: bool) -> Verdict {
     let lowered = r.lowered();
-    // With loopback open every attempt the filters must refuse goes off
-    // loopback, and a machine with no such address skips them all.
-    let open = r.open_loopback != Outcome::Skipped;
-    let exit = if r.plain.passed_fence() || lowered.iter().any(|(o, _)| o.passed_fence()) {
+    // With loopback open nothing listens at the plain attempt's target:
+    // only the filter's refusal passes, and no answer is no block either.
+    let plain_passed =
+        r.plain.passed_fence() || (allow_loopback && r.plain == Outcome::Unreachable);
+    let exit = if plain_passed || lowered.iter().any(|(o, _)| o.passed_fence()) {
         EXIT_NOT_FENCED
-    } else if !(r.plain == Outcome::Blocked || (open && r.plain == Outcome::Skipped))
+    } else if r.plain != Outcome::Blocked
         || lowered.iter().any(|(o, may_skip)| {
             !(matches!(o, Outcome::Blocked | Outcome::Error)
-                || ((*may_skip || open) && *o == Outcome::Skipped))
+                || (*may_skip && *o == Outcome::Skipped))
         })
     {
         EXIT_INCONCLUSIVE
+    } else if !allow_loopback {
+        EXIT_FENCED
     } else {
         match r.open_loopback {
-            Outcome::Connected | Outcome::Skipped => EXIT_FENCED,
+            Outcome::Connected => EXIT_FENCED,
             Outcome::Blocked => EXIT_LOOPBACK_MISMATCH,
             _ => EXIT_INCONCLUSIVE,
         }
@@ -280,9 +279,6 @@ pub fn verdict(r: &Report) -> Verdict {
         }
         if lowered.iter().any(|(o, _)| *o == Outcome::Error) {
             residuals.push(RESIDUAL_LOWERED_INTEGRITY_UNPROBED);
-        }
-        if open && r.plain == Outcome::Skipped {
-            residuals.push(RESIDUAL_EGRESS_UNPROBED);
         }
     }
     Verdict { exit, residuals }
@@ -779,9 +775,11 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Result<Outcome> {
 /// skip. The anonymous off-loopback one, which no filter refuses and
 /// which can wait on its destination, runs only with `anonymous_egress`.
 ///
-/// With `allow_loopback` nothing aimed at loopback is refused, so the
-/// plain and deny-only attempts go to `anonymous_target` instead, the
-/// other loopback ones skip, and `open_loopback` connects to `target`.
+/// With `allow_loopback` the attempts the filters must refuse on
+/// loopback go to [`crate::wfp::LOOPBACK_PROBE_PORT`], where nothing
+/// listens, and `open_loopback` connects to `target`. The two
+/// residual-only loopback attempts would each wait out a closed port
+/// there, so they skip.
 pub fn run(
     target: &str,
     anonymous_target: Option<&str>,
@@ -807,17 +805,19 @@ pub fn run(
         Some(t) => attempt(name, id, t),
         None => skipped(name, "no off-loopback target"),
     };
-    // An attempt the filters refuse at the loopback target while loopback
-    // is closed; `elsewhere` is where it goes instead while it is open.
-    let refused_on_loopback = |name: &str, id: Identity, elsewhere: bool| match allow_loopback {
+    let blocked_target = if allow_loopback {
+        blocked_loopback_target()
+    } else {
+        target
+    };
+    let residual_only = |name: &str, id: Identity| match allow_loopback {
         false => attempt(name, id, &target),
-        true if elsewhere => off_loopback(name, id),
         true => skipped(name, "loopback is open"),
     };
     let low = Identity::LoweredIntegrity(IL_LOW);
     let untrusted = Identity::LoweredIntegrity(IL_UNTRUSTED);
-    let plain = refused_on_loopback("plain", Identity::Own, true)?;
-    if plain.passed_fence() {
+    let plain = attempt("plain", Identity::Own, &blocked_target)?;
+    if plain.passed_fence() || (allow_loopback && plain == Outcome::Unreachable) {
         eprintln!("srt-win: runner: egress probe: the plain connect was not blocked; stopping");
         return Ok(Report::unfenced_at_plain(plain));
     }
@@ -831,18 +831,26 @@ pub fn run(
     Ok(Report {
         plain,
         anonymous,
-        anonymous_loopback: refused_on_loopback("anonymous, loopback", Identity::Anonymous, false)?,
-        deny_only: refused_on_loopback("deny-only user SID", Identity::DenyOnlyUser, true)?,
+        anonymous_loopback: residual_only("anonymous, loopback", Identity::Anonymous)?,
+        deny_only: residual_only("deny-only user SID", Identity::DenyOnlyUser)?,
         low_integrity: off_loopback("low integrity", low)?,
-        low_integrity_loopback: refused_on_loopback(loopback_il, low, false)?,
+        low_integrity_loopback: attempt(loopback_il, low, &blocked_target)?,
         untrusted_integrity: off_loopback("untrusted integrity", untrusted)?,
-        untrusted_integrity_loopback: refused_on_loopback(loopback_untrusted, untrusted, false)?,
+        untrusted_integrity_loopback: attempt(loopback_untrusted, untrusted, &blocked_target)?,
         open_loopback: if allow_loopback {
             attempt("open loopback", Identity::Own, &target)?
         } else {
             Outcome::Skipped
         },
     })
+}
+
+/// Where the attempts the filters must refuse go with loopback open.
+pub fn blocked_loopback_target() -> SocketAddr {
+    SocketAddr::from((
+        std::net::Ipv4Addr::LOCALHOST,
+        crate::wfp::LOOPBACK_PROBE_PORT,
+    ))
 }
 
 #[cfg(test)]
@@ -864,55 +872,70 @@ mod tests {
         }
     }
 
-    /// Loopback open on a machine with an off-loopback address: the
-    /// loopback attempts skipped, `plain` and `open_loopback` as given.
+    /// The verdict with loopback closed.
+    fn closed(r: &Report) -> Verdict {
+        verdict(r, false)
+    }
+
+    /// Loopback open: the residual-only loopback attempts skipped,
+    /// `plain` and `open_loopback` as given, the rest blocked.
     fn opened(plain: Outcome, open_loopback: Outcome) -> Report {
         Report {
-            anonymous_loopback: Outcome::Skipped,
-            low_integrity_loopback: Outcome::Skipped,
-            untrusted_integrity_loopback: Outcome::Skipped,
             open_loopback,
-            ..report(plain, Outcome::Skipped, Outcome::Blocked, Outcome::Blocked)
+            ..report(plain, Outcome::Skipped, Outcome::Skipped, Outcome::Skipped)
         }
     }
 
     #[test]
     fn verdict_with_loopback_open() {
-        let v = verdict(&opened(Blocked, Connected));
+        let v = verdict(&opened(Blocked, Connected), true);
         assert_eq!((v.exit, v.residuals.is_empty()), (EXIT_FENCED, true));
-        // The direct connect off loopback is what must still be refused.
-        for out in [Connected, Refused] {
-            assert_eq!(verdict(&opened(out, Connected)).exit, EXIT_NOT_FENCED);
+        // Nothing listens at the reserved port: only the filter's refusal
+        // passes. Refused by the stack, connected, or no answer in time
+        // all mean the block did not fire.
+        for out in [Connected, Refused, Unreachable] {
+            assert_eq!(
+                verdict(&opened(out, Connected), true).exit,
+                EXIT_NOT_FENCED,
+                "{out:?}"
+            );
+            let stopped = Report::unfenced_at_plain(out);
+            assert_eq!(verdict(&stopped, true).exit, EXIT_NOT_FENCED, "{out:?}");
         }
-        for unknown in [Unreachable, Error] {
-            assert_eq!(verdict(&opened(unknown, Connected)).exit, EXIT_INCONCLUSIVE);
+        // No connect was made at all: unknown, and still not a pass.
+        for unknown in [Error, Skipped] {
+            assert_eq!(
+                verdict(&opened(unknown, Connected), true).exit,
+                EXIT_INCONCLUSIVE
+            );
         }
         // Loopback recorded open, but the connect to our own listener was refused.
         assert_eq!(
-            verdict(&opened(Blocked, Blocked)).exit,
+            verdict(&opened(Blocked, Blocked), true).exit,
             EXIT_LOOPBACK_MISMATCH
         );
-        for unknown in [Refused, Unreachable, Error] {
-            assert_eq!(verdict(&opened(Blocked, unknown)).exit, EXIT_INCONCLUSIVE);
+        for unknown in [Refused, Unreachable, Error, Skipped] {
+            assert_eq!(
+                verdict(&opened(Blocked, unknown), true).exit,
+                EXIT_INCONCLUSIVE
+            );
         }
-        // A lowered-integrity copy getting out off loopback still fails it.
+        // A lowered-integrity copy reaching the reserved port fails it.
         let mut leak = opened(Blocked, Connected);
-        leak.untrusted_integrity = Refused;
-        assert_eq!(verdict(&leak).exit, EXIT_NOT_FENCED);
+        leak.untrusted_integrity_loopback = Refused;
+        assert_eq!(verdict(&leak, true).exit, EXIT_NOT_FENCED);
+        // With loopback closed the target has a listener: no answer is unknown.
+        assert_eq!(
+            closed(&report(Unreachable, Blocked, Blocked, Blocked)).exit,
+            EXIT_INCONCLUSIVE
+        );
     }
 
     #[test]
-    fn verdict_with_loopback_open_and_no_off_loopback_address() {
-        // Nothing the filters must refuse could be aimed anywhere: named, not failed.
-        let mut r = opened(Skipped, Connected);
-        (r.deny_only, r.low_integrity, r.untrusted_integrity) = (Skipped, Skipped, Skipped);
-        let v = verdict(&r);
-        assert_eq!(v.exit, EXIT_FENCED);
-        assert_eq!(v.residuals, [RESIDUAL_EGRESS_UNPROBED]);
-        // With loopback closed a skipped plain attempt is never a pass.
-        let closed = report(Skipped, Blocked, Blocked, Blocked);
-        assert_eq!(verdict(&closed).exit, EXIT_INCONCLUSIVE);
-        assert!(verdict(&closed).residuals.is_empty());
+    fn the_blocked_loopback_target_is_the_reserved_port() {
+        let t = blocked_loopback_target();
+        assert!(t.ip().is_loopback());
+        assert_eq!(t.port(), crate::wfp::LOOPBACK_PROBE_PORT);
     }
 
     /// `r` with the lowered-integrity attempts replaced, in field order.
@@ -1012,20 +1035,20 @@ mod tests {
 
     #[test]
     fn verdict_fenced_without_residuals() {
-        let v = verdict(&report(Blocked, Blocked, Blocked, Blocked));
+        let v = closed(&report(Blocked, Blocked, Blocked, Blocked));
         assert_eq!(v.exit, EXIT_FENCED);
         assert!(v.residuals.is_empty());
     }
 
     #[test]
     fn verdict_names_each_residual() {
-        let v = verdict(&report(Blocked, Blocked, Connected, Connected));
+        let v = closed(&report(Blocked, Blocked, Connected, Connected));
         assert_eq!(v.exit, EXIT_FENCED);
         assert_eq!(
             v.residuals,
             [RESIDUAL_ANONYMOUS_LOOPBACK, RESIDUAL_DENY_ONLY]
         );
-        let v = verdict(&report(Blocked, Connected, Connected, Connected));
+        let v = closed(&report(Blocked, Connected, Connected, Connected));
         assert_eq!(v.exit, EXIT_FENCED);
         assert_eq!(
             v.residuals,
@@ -1035,10 +1058,10 @@ mod tests {
                 RESIDUAL_DENY_ONLY
             ]
         );
-        let v = verdict(&report(Blocked, Blocked, Blocked, Refused));
+        let v = closed(&report(Blocked, Blocked, Blocked, Refused));
         assert_eq!(v.residuals, [RESIDUAL_DENY_ONLY]);
         // An attempt that could not be made is not a residual.
-        let v = verdict(&report(Blocked, Blocked, Error, Unreachable));
+        let v = closed(&report(Blocked, Blocked, Error, Unreachable));
         assert_eq!(v.exit, EXIT_FENCED);
         assert!(v.residuals.is_empty());
     }
@@ -1046,10 +1069,10 @@ mod tests {
     #[test]
     fn verdict_plain_getting_out_is_not_fenced() {
         for through in [Connected, Refused] {
-            let v = verdict(&report(through, Blocked, Blocked, Blocked));
+            let v = closed(&report(through, Blocked, Blocked, Blocked));
             assert_eq!(v.exit, EXIT_NOT_FENCED);
             // Residuals qualify a pass; a failure reports none.
-            let v = verdict(&report(through, Connected, Connected, Connected));
+            let v = closed(&report(through, Connected, Connected, Connected));
             assert_eq!(v.exit, EXIT_NOT_FENCED);
             assert!(v.residuals.is_empty());
         }
@@ -1058,12 +1081,12 @@ mod tests {
     #[test]
     fn verdict_anonymous_egress_is_a_residual_never_a_failure() {
         for through in [Connected, Refused] {
-            let v = verdict(&report(Blocked, through, Blocked, Blocked));
+            let v = closed(&report(Blocked, through, Blocked, Blocked));
             assert_eq!(v.exit, EXIT_FENCED);
             assert_eq!(v.residuals, [RESIDUAL_ANONYMOUS_EGRESS]);
         }
         for other in [Blocked, Unreachable, Error, Skipped] {
-            let v = verdict(&report(Blocked, other, Blocked, Blocked));
+            let v = closed(&report(Blocked, other, Blocked, Blocked));
             assert_eq!(v.exit, EXIT_FENCED, "{other:?}");
             assert!(v.residuals.is_empty(), "{other:?}");
         }
@@ -1076,7 +1099,7 @@ mod tests {
             for through in [Connected, Refused] {
                 let mut l = [Blocked; 4];
                 l[field] = through;
-                let v = verdict(&lowered(all_blocked, l));
+                let v = closed(&lowered(all_blocked, l));
                 assert_eq!(v.exit, EXIT_NOT_FENCED, "field {field} {through:?}");
                 assert!(v.residuals.is_empty());
             }
@@ -1090,35 +1113,35 @@ mod tests {
             // A token that could not be assumed is not a block: it is named.
             let mut l = [Blocked; 4];
             l[field] = Error;
-            let v = verdict(&lowered(all_blocked, l));
+            let v = closed(&lowered(all_blocked, l));
             assert_eq!(v.exit, EXIT_FENCED, "field {field}");
             assert_eq!(v.residuals, [RESIDUAL_LOWERED_INTEGRITY_UNPROBED]);
             // A connect that was made and did not answer is still unknown.
             l[field] = Unreachable;
-            let v = verdict(&lowered(all_blocked, l));
+            let v = closed(&lowered(all_blocked, l));
             assert_eq!(v.exit, EXIT_INCONCLUSIVE, "field {field}");
             assert!(v.residuals.is_empty());
         }
         // It does not excuse the plain attempt, nor a leak beside it.
         for plain in [Error, Unreachable, Skipped] {
             let r = lowered(report(plain, Blocked, Blocked, Blocked), [Error; 4]);
-            assert_eq!(verdict(&r).exit, EXIT_INCONCLUSIVE, "{plain:?}");
+            assert_eq!(closed(&r).exit, EXIT_INCONCLUSIVE, "{plain:?}");
         }
         let leak = lowered(all_blocked, [Error, Connected, Error, Error]);
-        assert_eq!(verdict(&leak).exit, EXIT_NOT_FENCED);
+        assert_eq!(closed(&leak).exit, EXIT_NOT_FENCED);
         // It is named after the residuals that connected.
         let r = lowered(report(Blocked, Blocked, Blocked, Connected), [Error; 4]);
         assert_eq!(
-            verdict(&r).residuals,
+            closed(&r).residuals,
             [RESIDUAL_DENY_ONLY, RESIDUAL_LOWERED_INTEGRITY_UNPROBED]
         );
         // Only the attempts at the off-loopback target can be skipped.
-        let v = verdict(&lowered(all_blocked, [Skipped, Blocked, Skipped, Blocked]));
+        let v = closed(&lowered(all_blocked, [Skipped, Blocked, Skipped, Blocked]));
         assert_eq!(v.exit, EXIT_FENCED);
         for loopback in [1, 3] {
             let mut l = [Blocked; 4];
             l[loopback] = Skipped;
-            assert_eq!(verdict(&lowered(all_blocked, l)).exit, EXIT_INCONCLUSIVE);
+            assert_eq!(closed(&lowered(all_blocked, l)).exit, EXIT_INCONCLUSIVE);
         }
     }
 
@@ -1126,12 +1149,12 @@ mod tests {
     fn verdict_no_token_copy_can_be_assumed_is_fenced_with_each_reported() {
         // A restricted token: every impersonation of a copy is refused.
         let r = lowered(report(Blocked, Blocked, Blocked, Blocked), [Error; 4]);
-        let v = verdict(&r);
+        let v = closed(&r);
         assert_eq!(v.exit, EXIT_FENCED);
         assert_eq!(v.residuals, [RESIDUAL_LOWERED_INTEGRITY_UNPROBED]);
         // The anonymous and deny-only copies refused as well.
         let r = lowered(report(Blocked, Error, Error, Error), [Error; 4]);
-        let v = verdict(&r);
+        let v = closed(&r);
         assert_eq!(v.exit, EXIT_FENCED);
         assert_eq!(v.residuals, [RESIDUAL_LOWERED_INTEGRITY_UNPROBED]);
         // Each reaches the broker as `error`, not as a block.
@@ -1163,7 +1186,7 @@ mod tests {
             let r = Report::unfenced_at_plain(through);
             assert_eq!(r.plain, through);
             assert!(r.fields()[1..].iter().all(|o| *o == Skipped));
-            let v = verdict(&r);
+            let v = closed(&r);
             assert_eq!(v.exit, EXIT_NOT_FENCED);
             assert!(v.residuals.is_empty());
             assert_eq!(Report::decode(r.encode()), Some(r));
@@ -1174,7 +1197,7 @@ mod tests {
     fn verdict_inconclusive_and_skipped() {
         for odd in [Unreachable, Error, Skipped] {
             assert_eq!(
-                verdict(&report(odd, Blocked, Blocked, Blocked)).exit,
+                closed(&report(odd, Blocked, Blocked, Blocked)).exit,
                 EXIT_INCONCLUSIVE
             );
         }

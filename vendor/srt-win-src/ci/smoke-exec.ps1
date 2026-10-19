@@ -1068,6 +1068,8 @@ try {
 # The listeners sit clear of the proxy range, the fixed ports used above
 # and the dynamic range (49152+), where Windows keeps its excluded ranges.
 $LbLo = 41000
+# The one loopback port that stays blocked with loopback open (wfp.rs).
+$LbProbePort = 1
 $regBase = 'HKLM:\SOFTWARE\sandbox-runtime'
 $st0 = J @('wfp','status','--sublayer-guid',$Sublayer)
 
@@ -1332,22 +1334,16 @@ if ($l2.open_loopback_probe -ne 'connected') {
 if ($l2.allow_loopback -ne $true -or $l2.loopback_notice -notmatch '(?i)loopback is open') {
   throw "L2: wfp verify output does not say loopback is open: $l2out"
 }
-# What must still be refused is a direct connect off loopback.
-if ($l2.egress_target) {
-  if ($l2.egress_target -like '127.*' -or $l2.egress_probe -ne 'blocked') {
-    throw "L2: direct connect to off-loopback $($l2.egress_target) expected blocked, got '$($l2.egress_probe)'"
-  }
-  if ($l2.residuals -contains 'egress-unprobed') { throw "L2: egress-unprobed named although egress was probed: $l2out" }
-} elseif ($l2.egress_probe -ne 'skipped' -or $l2.residuals -notcontains 'egress-unprobed') {
-  throw "L2: with no off-loopback address expected egress_probe=skipped and the egress-unprobed residual: $l2out"
-} else {
-  Write-Host 'L2 note: no off-loopback address on this runner; direct egress reported as not tested'
+# What must still be refused is the reserved loopback port, where nothing listens.
+if ($l2.egress_target -ne "127.0.0.1:$LbProbePort" -or $l2.egress_probe -ne 'blocked') {
+  throw "L2: connect to the reserved port 127.0.0.1:$LbProbePort expected blocked, got '$($l2.egress_probe)' at '$($l2.egress_target)'"
+}
+foreach ($f in 'anonymous_loopback_probe', 'deny_only_probe') {
+  if ($l2.$f -ne 'skipped') { throw "L2: $f expected skipped with loopback open, got '$($l2.$f)'. out: $l2out" }
 }
 foreach ($f in $loweredFields) {
   $got = $l2.$f
-  if ($f -like '*_loopback_probe') {
-    if ($got -ne 'skipped') { throw "L2: $f expected skipped with loopback open, got '$got'. out: $l2out" }
-  } elseif ($got -eq 'skipped' -and -not $l2.egress_target) {
+  if ($got -eq 'skipped' -and $f -notlike '*_loopback_probe') {
     Write-Host "L2 note: $f skipped (no off-loopback address on this runner)"
   } elseif ($got -ne 'blocked') {
     throw "L2: $f expected blocked with loopback open, got '$got'. out: $l2out"
@@ -1356,7 +1352,7 @@ foreach ($f in $loweredFields) {
 # With loopback open the target is the loopback listener: another is a usage error.
 & $Exe wfp verify --target '192.0.2.1:9' @lb 2>$null | Out-Null
 if ($LASTEXITCODE -ne 1) { throw "L2: wfp verify with an off-loopback --target expected exit 1, got $LASTEXITCODE" }
-Write-Host 'L2 ok: wfp verify with loopback open reaches its listener, still finds direct egress blocked, and says loopback is open'
+Write-Host 'L2 ok: wfp verify with loopback open reaches its listener, finds the reserved port blocked, and says loopback is open'
 
 # L3/L4: loopback listeners are reachable on 127.0.0.1 and ::1, low
 # ports and high alike: one PERMIT covers every port.
@@ -1389,6 +1385,16 @@ try {
   try { $l5.Kill($true) } catch { }
 }
 Write-Host "L5 ok: UDP echo on 127.0.0.1:$l5port works"
+
+# L6: the reserved port is refused for the sandbox account, listener or
+# not; its neighbour is reachable.
+$l6 = $null
+try { $l6 = Bind-Listener @($LbProbePort) } catch { Write-Host "L6 note: port $LbProbePort is taken on this runner; probing it as it is" }
+try { Assert-SbRefused 'L6' '127.0.0.1' $LbProbePort $lb } finally { if ($l6) { $l6.Stop() } }
+$l6n = Bind-Listener (($LbProbePort + 1)..($LbProbePort + 8))
+$l6nPort = $l6n.LocalEndpoint.Port
+try { Assert-SbConnected 'L6' '127.0.0.1' $l6nPort $lb } finally { $l6n.Stop() }
+Write-Host "L6 ok: with loopback open, port $LbProbePort is still refused and port $l6nPort is reachable"
 
 # L7: a port open on loopback is still refused off loopback, on and off this machine.
 if (-not $lanIp) {
@@ -1467,4 +1473,4 @@ if ($post.state -ne 'absent') {
 if ($null -ne (Get-LoopbackMode $Sublayer)) {
   throw "post-uninstall: the sublayer's loopback mode is still recorded: '$(Get-LoopbackMode $Sublayer)'"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c/V1d, R1-R7c, R5g-R5j, R9/R9b, R11, R12, G1-G6/G3b, L0-L5, L7-L10)'
+Write-Host 'smoke-exec: PASS (R0b, V1/V1b/V1c/V1d, R1-R7c, R5g-R5j, R9/R9b, R11, R12, G1-G6/G3b, L0-L10)'

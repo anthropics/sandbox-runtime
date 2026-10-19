@@ -70,6 +70,7 @@ import {
   VENDORED_SRT_WIN_EXE,
   WINDOWS_ALLOW_LOOPBACK_EFFECT,
   WINDOWS_LOOPBACK_NO_PROXY,
+  WINDOWS_LOOPBACK_PROBE_PORT,
   type WindowsWfpVerifyResult,
   type WindowsAclGrantOptions,
   type WindowsAclStampOptions,
@@ -595,10 +596,29 @@ describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
 })
 
 describe('network.allowLocalBinding on Windows (pure, all platforms)', () => {
-  it('the effect text says loopback is open, with no exception, and names the way off the machine', () => {
+  it('the one port that stays blocked is the one srt-win leaves out of the permit', () => {
+    // `LOOPBACK_PROBE_PORT` in the Rust source, parsed as text: the two
+    // constants are kept by hand and must not drift.
+    const rust = readFileSync(
+      join(import.meta.dir, '../../vendor/srt-win-src/src/wfp.rs'),
+      'utf8',
+    )
+    const m = /pub const LOOPBACK_PROBE_PORT: u16 = (\d+);/.exec(rust)
+    expect(m).not.toBeNull()
+    expect(Number(m![1])).toBe(WINDOWS_LOOPBACK_PROBE_PORT)
+    expect(WINDOWS_LOOPBACK_PROBE_PORT).toBe(1)
+    // One constant, not a list.
+    expect(rust.match(/pub const LOOPBACK_\w*PORTS?\b/g)).toEqual([
+      'pub const LOOPBACK_PROBE_PORT',
+    ])
+  })
+
+  it('the effect text says loopback is open, names the one blocked port and the way off the machine', () => {
     expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toMatch(/^Loopback is open/)
     expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toMatch(/every TCP and UDP port/)
-    expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).not.toMatch(/except|\d{4}/)
+    expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toContain(
+      `port ${WINDOWS_LOOPBACK_PROBE_PORT} alone stays blocked`,
+    )
     expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toMatch(/forwarder/)
     expect(WINDOWS_ALLOW_LOOPBACK_EFFECT).toMatch(/off the machine/)
   })
@@ -2194,12 +2214,11 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   const openOut = (over: Record<string, unknown> = {}): string =>
     verifyOut({
       target: '127.0.0.1:50123',
-      egress_target: '10.0.0.5:50123',
+      egress_target: `127.0.0.1:${WINDOWS_LOOPBACK_PROBE_PORT}`,
       anonymous_target: '10.0.0.5:50123',
       allow_loopback: true,
       anonymous_loopback_probe: 'skipped',
-      low_integrity_loopback_probe: 'skipped',
-      untrusted_integrity_loopback_probe: 'skipped',
+      deny_only_probe: 'skipped',
       open_loopback_probe: 'connected',
       loopback_notice: 'loopback is open',
       ...over,
@@ -2227,11 +2246,11 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       plain: 'blocked',
       anonymous: 'blocked',
       anonymousLoopback: 'skipped',
-      denyOnly: 'blocked',
+      denyOnly: 'skipped',
       lowIntegrity: 'blocked',
-      lowIntegrityLoopback: 'skipped',
+      lowIntegrityLoopback: 'blocked',
       untrustedIntegrity: 'blocked',
-      untrustedIntegrityLoopback: 'skipped',
+      untrustedIntegrityLoopback: 'blocked',
       openLoopback: 'connected',
     })
     expect(r.warnings).toEqual([WINDOWS_ALLOW_LOOPBACK_EFFECT])
@@ -2264,50 +2283,57 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
-    // The plain attempt goes off loopback, and is named there; it
-    // rejects whatever the exit code says.
-    for (const through of ['connected', 'refused']) {
-      const quiet = await runOpenVerify(
-        0,
-        openOut({ egress_probe: through }),
+  })
+
+  it('verifyWindowsWfpEgress: with loopback open, only the filter refusing the reserved port passes', async () => {
+    const reserved = `127\\.0\\.0\\.1:${WINDOWS_LOOPBACK_PROBE_PORT}`
+    // Refused by the stack (slowly or not), connected, or no answer in
+    // time: the block did not fire, whatever the exit code says.
+    for (const [status, plain] of [
+      [3, 'refused'],
+      [3, 'connected'],
+      [3, 'unreachable'],
+      [0, 'refused'],
+      [0, 'unreachable'],
+      [2, 'unreachable'],
+    ] as const) {
+      const err = await runOpenVerify(
+        status,
+        openOut({ egress_probe: plain }),
       ).catch(e => e as WindowsSandboxError)
-      expect((quiet as WindowsSandboxError).code).toBe('wfp_fence_inactive')
-      expect((quiet as WindowsSandboxError).message).toMatch(
-        /from the sandbox user to 10\.0\.0\.5:50123/,
+      expect(err).toBeInstanceOf(WindowsSandboxError)
+      expect((err as WindowsSandboxError).code).toBe('wfp_fence_inactive')
+      expect((err as WindowsSandboxError).message).toMatch(
+        new RegExp(`from the sandbox user to ${reserved}`),
       )
       spawnSpy.mockRestore()
       spawnSyncSpy.mockRestore()
     }
-  })
-
-  it('verifyWindowsWfpEgress: with loopback open and no off-loopback address, the run passes and says direct egress was not tested', async () => {
-    const nowhere = {
-      egress_probe: 'skipped',
-      egress_target: null,
-      anonymous_target: null,
-      deny_only_probe: 'skipped',
-      low_integrity_probe: 'skipped',
-      untrusted_integrity_probe: 'skipped',
-    }
-    const r = await runOpenVerify(
-      0,
-      openOut({ ...nowhere, residuals: ['egress-unprobed'] }),
-    )
-    expect(r.probes.plain).toBe('skipped')
-    expect(r.residuals).toEqual(['egress-unprobed'])
-    expect(r.warnings[0]).toMatch(/direct egress is blocked was not tested/)
-    spawnSpy.mockRestore()
-    spawnSyncSpy.mockRestore()
-    // A skipped plain attempt without that residual, or with loopback
-    // closed, is not a pass.
-    for (const out of [
-      openOut(nowhere),
-      verifyOut({ egress_probe: 'skipped', residuals: ['egress-unprobed'] }),
-    ]) {
-      expect(await verifyCode(0, out)).toBe('wfp_verify_inconclusive')
+    // No connect was made at all: not a pass either.
+    for (const plain of ['error', 'skipped']) {
+      expect(
+        await runOpenVerify(0, openOut({ egress_probe: plain })).then(
+          () => 'resolved',
+          e => (e as WindowsSandboxError).code,
+        ),
+      ).toBe('wfp_verify_inconclusive')
       spawnSpy.mockRestore()
       spawnSyncSpy.mockRestore()
     }
+    // A lowered-integrity copy reaching the reserved port is named there.
+    const leak = await runOpenVerify(
+      3,
+      openOut({ low_integrity_loopback_probe: 'refused' }),
+    ).catch(e => e as WindowsSandboxError)
+    expect((leak as WindowsSandboxError).message).toMatch(
+      new RegExp(`low-integrity copy of its token to ${reserved}`),
+    )
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    // With loopback closed, no answer from the listener stays inconclusive.
+    expect(
+      await verifyCode(2, verifyOut({ egress_probe: 'unreachable' })),
+    ).toBe('wfp_verify_inconclusive')
   })
 
   /**

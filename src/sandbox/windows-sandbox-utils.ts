@@ -169,10 +169,19 @@ export const DEFAULT_WINDOWS_PROXY_PORT_RANGE: readonly [number, number] = [
   60080, 60089,
 ]
 
+/**
+ * The one loopback port that stays blocked for the sandbox account with
+ * `network.allowLocalBinding`, so the fence check has a connect that must
+ * be refused. `srt-win` owns it (`LOOPBACK_PROBE_PORT` in `wfp.rs`).
+ */
+export const WINDOWS_LOOPBACK_PROBE_PORT = 1
+
 /** What `network.allowLocalBinding` opens on Windows, in plain words. */
 export const WINDOWS_ALLOW_LOOPBACK_EFFECT =
   `Loopback is open: sandboxed commands can connect to every TCP and ` +
-  `UDP port on localhost (127.0.0.0/8 and ::1). Every service listening ` +
+  `UDP port on localhost (127.0.0.0/8 and ::1; port ` +
+  `${WINDOWS_LOOPBACK_PROBE_PORT} alone stays blocked, so the sandbox ` +
+  `can check its own fence). Every service listening ` +
   `on localhost is reachable from them, and any local forwarder (a DNS ` +
   `stub, a SOCKS or HTTP proxy, a VPN or security agent, a tunnel) ` +
   `reachable there gives them a way off the machine that the network ` +
@@ -236,12 +245,11 @@ export type WindowsWfpResidual =
   | 'anonymous-loopback'
   | 'deny-only-user-sid'
   | 'lowered-integrity-unprobed'
-  | 'egress-unprobed'
 
 /**
  * Result of `srt-win wfp verify` on success (exit 0); anything else
- * throws. `plain` is `blocked` (or, with loopback open on a machine
- * with no off-loopback address, `skipped`: see `residuals`).
+ * throws. `plain` is `blocked`. A lowered-integrity attempt may be
+ * `error` (not set up), and the rest anything: see `residuals`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
@@ -249,8 +257,8 @@ export interface WindowsWfpVerifyResult {
   stderr: string
   /**
    * One per attempt. `anonymous`, `lowIntegrity` and `untrustedIntegrity`
-   * go to an off-loopback target, the rest to the loopback one. With
-   * loopback open `plain` and `denyOnly` go off loopback too.
+   * go to an off-loopback target, the rest to the loopback one: the
+   * listener, or with loopback open {@link WINDOWS_LOOPBACK_PROBE_PORT}.
    */
   probes: {
     plain: WindowsWfpProbeOutcome
@@ -1017,7 +1025,7 @@ type RawWfpVerify = {
   low_integrity_loopback_probe?: string
   untrusted_integrity_probe?: string
   untrusted_integrity_loopback_probe?: string
-  egress_target?: string | null
+  egress_target?: string
   allow_loopback?: boolean
   open_loopback_probe?: string
   residuals?: string[]
@@ -1098,10 +1106,6 @@ const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
   'lowered-integrity-unprobed':
     'a lowered-integrity copy of the sandbox token could not be set up on ' +
     'this machine, so no connect under it was observed',
-  'egress-unprobed':
-    'loopback is open and this machine has no off-loopback address, so no ' +
-    'connect the filters must refuse could be made: that direct egress is ' +
-    'blocked was not tested this run',
 }
 
 function isWfpResidual(s: string): s is WindowsWfpResidual {
@@ -1154,11 +1158,11 @@ export function interpretWindowsWfpVerify(
     }),
   }
   const offLoopback = raw.anonymous_target ?? 'no target'
-  // Where the plain attempt went: off loopback when loopback is open.
-  const plainTarget =
-    raw.egress_target === undefined ? raw.target : raw.egress_target
+  // Where the attempts the fence must refuse on loopback went: the
+  // reserved port when loopback is open, else the listener.
+  const blockedTarget = raw.egress_target ?? raw.target
   const summary =
-    `plain=${probes.plain} (${plainTarget ?? 'no target'}), ` +
+    `plain=${probes.plain} (${blockedTarget}), ` +
     `anonymous=${probes.anonymous} (${offLoopback}), ` +
     `anonymous-loopback=${probes.anonymousLoopback}, ` +
     `deny-only=${probes.denyOnly}, ` +
@@ -1192,15 +1196,23 @@ export function interpretWindowsWfpVerify(
     'the sandbox user under an untrusted-integrity copy of its token'
   const which = (
     [
-      [probes.plain, 'the sandbox user', plainTarget],
+      [probes.plain, 'the sandbox user', blockedTarget],
       [probes.lowIntegrity, lowIl, raw.anonymous_target],
-      [probes.lowIntegrityLoopback, lowIl, raw.target],
+      [probes.lowIntegrityLoopback, lowIl, blockedTarget],
       [probes.untrustedIntegrity, untrustedIl, raw.anonymous_target],
-      [probes.untrustedIntegrityLoopback, untrustedIl, raw.target],
+      [probes.untrustedIntegrityLoopback, untrustedIl, blockedTarget],
     ] as const
   )
     .filter(([o]) => o === 'connected' || o === 'refused')
     .map(([, who, tgt]) => `direct outbound from ${who} to ${tgt}`)
+  // With loopback open nothing listens at the plain attempt's port: no
+  // answer in time is no refusal by the filter either.
+  if (raw.allow_loopback && probes.plain === 'unreachable') {
+    which.push(
+      `direct outbound from the sandbox user to ${blockedTarget} (no ` +
+        `answer where the filter must refuse at once)`,
+    )
+  }
   if (r.status === 3 || which.length > 0) {
     throw new WindowsSandboxError(
       'wfp_fence_inactive',
@@ -1215,18 +1227,13 @@ export function interpretWindowsWfpVerify(
     throw new WindowsSandboxError(
       'wfp_verify_inconclusive',
       `WFP egress fence could not be verified — probe to ` +
-        `${plainTarget ?? raw.target} was '${raw.egress_probe}' (exit ` +
+        `${blockedTarget} was '${raw.egress_probe}' (exit ` +
         `${r.status}) [${summary}]. The fence may be absent. Re-run ` +
         `\`srt-win install\`. (${r.stderr})`,
     )
   }
   // Exit 0 alone is not a pass: the plain attempt must say `blocked`.
-  // With loopback open and no off-loopback address it could not be made.
-  const unprobed =
-    raw.allow_loopback === true &&
-    raw.egress_probe === 'skipped' &&
-    raw.residuals?.includes('egress-unprobed') === true
-  if (raw.egress_probe !== 'blocked' && !unprobed) {
+  if (raw.egress_probe !== 'blocked') {
     throw new WindowsSandboxError(
       'wfp_verify_inconclusive',
       `WFP egress fence could not be verified — \`srt-win wfp verify\` ` +
@@ -1268,11 +1275,10 @@ export function interpretWindowsWfpVerify(
  * the synchronous `runSrtWin` is safe). Does not require elevation
  * and does not depend on any external host.
  *
- * With `opts.allowLoopback` nothing on loopback is refused, so the
- * connects that must be blocked go to an off-loopback address of this
- * machine, and the listener is what `srt-win` must be able to reach.
- * A machine with no such address passes with the `egress-unprobed`
- * residual: that direct egress is blocked was not tested.
+ * With `opts.allowLoopback` the connects that must be blocked go to
+ * {@link WINDOWS_LOOPBACK_PROBE_PORT}, where nothing listens and only
+ * the filter's refusal passes, and the listener is what `srt-win` must
+ * be able to reach.
  *
  * `initialize()` calls this once per session, so a stale install
  * (sandbox user provisioned but filters since removed) fails closed
