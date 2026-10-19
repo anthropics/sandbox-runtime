@@ -8,7 +8,7 @@
     E  the child cannot open the runner or its threads
     F  observation only: Schannel handshake under the option
     G  the child token's restricting SIDs
-    P1-P11  write grants kept between sessions (`acl grant --persistent`)
+    P0-P11  write grants kept between sessions (`acl grant --persistent`)
   `$HooksExe` is a `--features test-hooks` build that rows G and E run
   as the sandboxed command; without it they are skipped.
 #>
@@ -263,7 +263,7 @@ try {
     if ($r.exit -ne 0 -or -not $t) {
       Fail "G: could not read the child token with the option off (exit=$($r.exit)). raw: $($r.raw)"
     } elseif ($t.write_restricted -or @($t.restricted_sids).Count -ne 0) {
-      Fail 'G: default child token carries restricting SIDs (option off must be unchanged)'
+      Fail 'G: the ordinary child token carries restricting SIDs (option off must be unchanged)'
     } else { Ok 'G: default child token has no restricting SIDs' }
   }
   $r = SbOn @($cmd, '/c', 'whoami /user /groups /fo csv /nh')
@@ -477,6 +477,28 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   if ($st.state -eq 'none') { Ok 'P: no persistent grant recorded before the first one is made' }
   else { Fail "P: user status reports persistent_grants=$($st | ConvertTo-Json -Compress) before any was made" }
 
+  # ── P0: no kept grant on an install of the previous setup version ─
+  $reg = 'HKLM:\SOFTWARE\sandbox-runtime'
+  $curMarker = (Get-ItemProperty $reg).MarkerVersion
+  Set-ItemProperty $reg -Name MarkerVersion -Value ($curMarker - 1)
+  try {
+    $us0 = J @('user', 'status')
+    $g = Grant-P @($pa)
+    $r = SbOn @($cmd, '/c', 'echo P0-RAN')
+    $st = Persist-Status
+    if ($us0.marker_version -ne ($curMarker - 1) -or $us0.setup_version -ne $curMarker) {
+      Fail "P0: user status reports marker_version=$($us0.marker_version) setup_version=$($us0.setup_version) (marker set to $($curMarker - 1), build needs $curMarker)"
+    } elseif ($g.exit -ne 15 -or $g.raw -notmatch '(?i)marker version mismatch.*re-run') {
+      Fail "P0: acl grant --persistent on a previous-version install: exit=$($g.exit), expected 15 with the re-run-install message"
+    } elseif ((Has-Persistent $pa) -or $st.state -ne 'none' -or @($st.roots).Count -ne 0) {
+      Fail "P0: the refused grant left something behind: sddl=$(Sddl $pa) status=$($st | ConvertTo-Json -Compress)"
+    } elseif ($r.exit -ne 15 -or $r.out -match 'P0-RAN') {
+      Fail "P0: exec on a previous-version install: exit=$($r.exit) raw=$($r.raw)"
+    } else { Ok 'P0: a previous-version install gets no kept grant and no exec until it is re-installed' }
+  } finally {
+    Set-ItemProperty $reg -Name MarkerVersion -Value $curMarker
+  }
+
   # ── P1: two roots; a session writes only its own ─────────────────
   $ga = Grant-P @($pa)
   $gb = Grant-P @($pb)
@@ -623,6 +645,47 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   if ($g.exit -eq 0 -and $g.writes -eq 0 -and $g.raw -notmatch 'persistent DACL write') {
     Ok 'P3: a repeat session start on PA performed zero DACL writes'
   } else { Fail "P3: a repeat session start on PA: exit=$($g.exit), DACL writes=$($g.writes) (want 0). raw: $($g.raw)" }
+
+  # ── PF: someone else's deny for the sandbox group on a kept root ──
+  End-Session
+  $pf = New-AclDir 'pf' @()
+  foreach ($i in 0..39) {
+    $d = Join-Path $pf "d$i"
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    foreach ($j in 0..49) { [System.IO.File]::WriteAllText((Join-Path $d "f$j.txt"), 'x') }
+  }
+  $pfDeep = Join-Path $pf 'd0\deep\f.txt'
+  New-Item -ItemType Directory -Path (Split-Path $pfDeep) -Force | Out-Null
+  'DEEP' | Set-Content -Encoding ASCII $pfDeep
+  & icacls $pf /deny "*$($script:grpSid):(DE,WDAC,WO,DC)" | Out-Null
+  $fence = [regex]::Match((Sddl $pf), '\(D;;[^;)]*;;;' + [regex]::Escape($script:grpSid) + '\)').Value
+  if (-not $fence) { Fail "PF: setup — the fence is not on the root: $(Sddl $pf)" }
+  else {
+    $groupAllow = '\(A;[^)]*;;;' + [regex]::Escape($script:grpSid) + '\)'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $g1 = Grant-P @($pf); $sw.Stop(); $t1 = $sw.ElapsedMilliseconds
+    End-Session
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $g2 = Grant-P @($pf); $sw.Stop(); $t2 = $sw.ElapsedMilliseconds
+    Write-Host ("PF: TIMING: kept root with 2000 files and a foreign deny: first grant {0} ms ({1} tree walk(s)), second grant {2} ms ({3} tree walk(s))" -f $t1, $g1.writes, $t2, $g2.writes)
+    if ($g1.exit -eq 0 -and $g1.writes -ge 1 -and (Sddl $pfDeep) -match $groupAllow) { Ok 'PF: the first grant walks the tree: a deep file inherits the grant' }
+    else { Fail "PF: first grant: exit=$($g1.exit) walks=$($g1.writes) deep=$(Sddl $pfDeep)" }
+    if ($g2.exit -eq 0 -and $g2.writes -eq 0 -and $g2.raw -notmatch 'persistent DACL write') { Ok 'PF: a later session start on that root performs zero DACL writes although it carries a deny for the group this product did not write' }
+    else { Fail "PF: second grant: exit=$($g2.exit) walks=$($g2.writes) (want 0). raw: $($g2.raw)" }
+    if ((Sddl $pf).Contains($fence)) { Ok 'PF: the foreign deny is still on the root' }
+    else { Fail "PF: the foreign deny is gone: want $fence in $(Sddl $pf)" }
+    $r = SbRoots @($pf) @($cmd, '/d', '/s', '/c', "echo PF-W> `"$pf\w.txt`"")
+    if (Test-Path "$pf\w.txt") { Ok 'PF: a sandboxed command still writes in the root' }
+    else { Fail "PF: a sandboxed write in the root failed. raw: $($r.raw)" }
+    End-Session
+    $fo = & $Exe acl forget $pf --json 2>&1 | Out-String
+    $fexit = $LASTEXITCODE
+    $sd = Sddl $pf
+    if ($fexit -eq 0 -and $sd -notmatch $groupAllow -and $sd -notmatch [regex]::Escape($CapPrefix) -and
+        (Sddl $pfDeep) -notmatch [regex]::Escape($script:grpSid)) { Ok 'PF: forgetting the root removes everything this product wrote, on it and below' }
+    else { Fail "PF: after forget: exit=$fexit root=$sd deep=$(Sddl $pfDeep)" }
+    if ($sd.Contains($fence) -and $fo -match 'left in place') { Ok 'PF: the foreign deny is left on the forgotten root, and the forget says so' }
+    else { Fail "PF: the foreign deny after forget: on root=$($sd.Contains($fence)) output: $fo" }
+    & icacls $pf /remove:d "*$($script:grpSid)" | Out-Null
+  }
 
   # ── P4: denies live as long as the grant ─────────────────────────
   $denyF   = Join-Path $pa 'deny.txt'
@@ -773,6 +836,7 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   $g = Grant-P @($pb)
   if ($g.exit -ne 0 -or -not (Has-Persistent $pb)) { Fail 'P11: setup — PB is not carrying a persistent grant' }
   else {
+    End-Session
     & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-String | Write-Host
     $left = @((Get-ItemProperty 'HKCU:\Software\sandbox-runtime\PersistentGrants' -ErrorAction SilentlyContinue).Roots |
       Where-Object { $_ })

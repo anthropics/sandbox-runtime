@@ -22,10 +22,14 @@
 //!     to NT components.
 //!   - All privileges deleted except `SeChangeNotifyPrivilege`.
 //!   - Integrity Level = Medium (same as a normal user process).
-//!   - No `RestrictingSids` array by default — Schannel credential
-//!     acquisition fails under any token that carries one.
+//!   - No `RestrictingSids` array unless `write_restricted` (below) —
+//!     Schannel credential acquisition fails under any token that
+//!     carries one.
 //!
-//! ## Opt-in: write-restricted token
+//! ## Write-restricted token
+//!
+//! What the library always uses; `srt-win exec` builds it only with
+//! `--write-restricted-token`.
 //!
 //! `write_restricted` adds the `WRITE_RESTRICTED` flag and the
 //! restricting SIDs [`restricting_sid_list`]: a write must then also

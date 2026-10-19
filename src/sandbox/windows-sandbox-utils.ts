@@ -1,4 +1,5 @@
 import * as fs from 'node:fs'
+import * as os from 'node:os'
 import * as net from 'node:net'
 import * as path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -114,12 +115,40 @@ export type WindowsSandboxErrorCode =
   | 'acl_stamp_failed'
   /** `srt-win acl grant` exited non-zero. */
   | 'acl_grant_failed'
-  /** `srt-win acl forget` could not remove every persistent grant. */
-  | 'acl_forget_failed'
+  /**
+   * A profile read grant is recorded and cannot be relied on (unfinished,
+   * older exclusion list, another profile, unreadable record). An ABSENT
+   * grant is not an error.
+   */
+  | 'profile_grant_outdated'
+  /**
+   * `srt-win profile grant` did not complete. From an install: the
+   * account and the filters are installed, the grant is not.
+   */
+  | 'profile_grant_failed'
+  /** `srt-win profile forget` could not remove the whole grant. */
+  | 'profile_forget_failed'
+  | 'kept_grants_in_use'
+  | 'srt_win_outdated'
+  | 'profile_grant_blocked_by_session'
+  | 'profile_operation_in_progress'
+  | 'session_ended'
+  /**
+   * A path the session would grant — `filesystem.allowRead`, or a
+   * write root (`allowWrite`) — is, contains, or lies inside a path
+   * the profile read grant excludes. Nothing is granted.
+   */
+  | 'profile_exclusion_read_grant'
   /** `srt-win exec` argv would exceed CreateProcessW's 32 767-char limit. */
   | 'argv_too_long'
   /** Sandbox user account / credential not present — run install. */
   | 'not_provisioned'
+  /**
+   * The sandbox is installed, by a release whose setup version is not
+   * the one this `srt-win` requires — re-run the install. Nothing is
+   * granted or run until then.
+   */
+  | 'reinstall_required'
   /**
    * Working directory is on a mapped network drive; the sandbox
    * cannot start (per-user drive mappings don't exist under the
@@ -225,6 +254,12 @@ export interface WindowsSandboxUserStatus {
   /** Setup marker schema version, when the marker row exists. */
   markerVersion?: number
   /**
+   * The setup version this `srt-win` requires; it launches nothing
+   * while {@link markerVersion} differs. Absent from an `srt-win` that
+   * does not report it.
+   */
+  setupVersion?: number
+  /**
    * The calling (real) user's SID — the broker's identity, surfaced
    * for diagnostics. The DENY-ACE trustee is `srt-sandbox`'s SID
    * ({@link sid}), not this. Always present.
@@ -247,6 +282,26 @@ export interface WindowsSandboxUserStatus {
     roots: string[]
     reason?: string
   }
+  /**
+   * Set when a profile read grant is recorded (`present`) or cannot
+   * be ruled out (`unknown`). Whether it is current is {@link
+   * getWindowsProfileReadStatus}'s to say.
+   */
+  profileGrant?: {
+    state: 'present' | 'unknown'
+    reason?: string
+  }
+  /**
+   * What `srt-win` says it does, by name (see
+   * {@link WINDOWS_SRT_WIN_CAPABILITIES}); empty from one that does
+   * not say.
+   */
+  capabilities: string[]
+  /**
+   * SID of the user who owns the interactive session this process
+   * runs in, when `srt-win` can tell.
+   */
+  sessionUserSid?: string
 }
 
 /**
@@ -416,6 +471,17 @@ export interface WindowsSandboxParams {
    * a caller bug.
    */
   denyRead?: readonly string[]
+  /**
+   * Paths the session is granted (read or write) that lie beneath a
+   * {@link denyRead} path — see {@link windowsGrantsBeneathDenies}.
+   */
+  denyReadExcept?: readonly string[]
+  /**
+   * The process whose session this command belongs to, as `srt-win`
+   * recorded it. Without it `srt-win exec` records itself until the command
+   * has exited (one more acquisition of its lock).
+   */
+  heldBy?: number
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
@@ -481,15 +547,9 @@ export interface WindowsSandboxParams {
    */
   srtWin?: SrtWinSpawn
   /**
-   * Run the child under the write-restricted token. The caller must
-   * have verified the egress fence for this token shape first
-   * ({@link verifyWindowsWfpEgress} with the same flag).
-   */
-  writeRestrictedToken?: boolean
-  /**
-   * With {@link writeRestrictedToken}: the session's write roots. Each
-   * is passed as `--write-root`, which puts the root's capability SID
-   * in the child token; without it the child cannot write the root.
+   * The session's write roots. Each is passed as `--write-root`, which
+   * puts the root's capability SID in the child token; without it the
+   * child cannot write the root.
    */
   writeRoots?: readonly string[]
   /**
@@ -681,12 +741,115 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
       args[0],
     )
   }
+  throwIfRefusedBesideOthers(args, r.status, r.stdout ?? '')
   return {
     status: r.status,
     signal: r.signal,
     stdout: (r.stdout ?? '').trim(),
     stderr: (r.stderr ?? '').trim(),
   }
+}
+
+/**
+ * `srt-win`'s exit code when its lock is held by a `profile grant` or
+ * `profile forget`: the caller is told after about three seconds.
+ */
+export const SRT_WIN_EXIT_PROFILE_BUSY = 25
+/**
+ * `srt-win exec`'s exit code when the session a command was started
+ * for (`heldBy`) ended while the command ran: the command and
+ * everything it started were terminated.
+ */
+export const SRT_WIN_EXIT_SESSION_ENDED = 26
+/** `srt-win`'s exit code for "nothing was removed: sandbox sessions or commands are running". */
+export const SRT_WIN_EXIT_HELD_BY_OTHERS = 22
+/** `srt-win profile grant`'s exit code for "nothing was changed: sandbox sessions or commands are running". */
+export const SRT_WIN_EXIT_GRANT_BLOCKED = 24
+
+/** One row of `srt-win`'s `{"held_by": […]}`, said as what it is. */
+function describeWindowsHolder(h: {
+  pid?: unknown
+  kind?: unknown
+  path?: unknown
+}): string {
+  const who = `process ${String(h.pid)}`
+  const at = String(h.path)
+  switch (h.kind) {
+    case 'profile':
+      return `${who} is a sandbox session or command`
+    case 'kept_root':
+      return `${who} runs on the kept write grant on ${at}`
+    case 'grant':
+      return `${who} holds a session grant on ${at}`
+    case 'deny':
+    case 'deny_fdc':
+    case 'deny_delete':
+    case 'deny_satisfied':
+      return `${who} holds a session deny on ${at}`
+    default:
+      return `${who} holds ${String(h.kind)} on ${at}`
+  }
+}
+
+function describeWindowsHolders(stdout: string): string {
+  let held: { pid?: unknown; kind?: unknown; path?: unknown }[] = []
+  try {
+    const parsed = JSON.parse(stdout) as { held_by?: unknown }
+    if (Array.isArray(parsed.held_by)) held = parsed.held_by as typeof held
+  } catch {
+    // The exit code says it; the list is for the message only.
+  }
+  const said = held.slice(0, 8).map(describeWindowsHolder)
+  if (held.length > said.length) {
+    said.push(`${held.length - said.length} more`)
+  }
+  return said.join('; ')
+}
+
+/**
+ * The one mapping of `srt-win`'s refusals beside other sandbox activity:
+ * 25 (a profile operation runs), 22 (nothing removed), 24 (grant unchanged).
+ */
+function throwIfRefusedBesideOthers(
+  args: readonly string[],
+  status: number | null,
+  stdout: string,
+): void {
+  if (status === SRT_WIN_EXIT_PROFILE_BUSY) {
+    throw new WindowsSandboxError(
+      'profile_operation_in_progress',
+      `The read grant on your user profile is being written or removed ` +
+        `right now (srt-win profile grant / profile forget). Nothing in the ` +
+        `sandbox can start until that is done; try again when it has ` +
+        `finished.`,
+      args[0],
+    )
+  }
+  if (
+    status !== SRT_WIN_EXIT_HELD_BY_OTHERS &&
+    status !== SRT_WIN_EXIT_GRANT_BLOCKED
+  ) {
+    return
+  }
+  const what = describeWindowsHolders(stdout)
+  const who = what ? ` (${what})` : ''
+  if (status === SRT_WIN_EXIT_GRANT_BLOCKED) {
+    throw new WindowsSandboxError(
+      'profile_grant_blocked_by_session',
+      `The read grant on your user profile was not changed: sandbox ` +
+        `sessions or commands are running${who}, and the grant is written ` +
+        `only while none is, so that no session sees it change. What was ` +
+        `granted before is as it was. End them and run it again.`,
+      args[0],
+    )
+  }
+  throw new WindowsSandboxError(
+    'kept_grants_in_use',
+    `srt-win ${args.slice(0, 2).join(' ')} removed nothing: sandbox ` +
+      `sessions or commands are running${who}, and what they run on is ` +
+      `not taken from under them. End them and run it again.`,
+    args[0],
+  )
 }
 
 /**
@@ -743,6 +906,12 @@ function runSrtWinAsync(
             args[0],
           ),
         )
+        return
+      }
+      try {
+        throwIfRefusedBesideOthers(args, status, stdout)
+      } catch (e) {
+        reject(e as Error)
         return
       }
       resolve({ status, signal, stdout: stdout.trim(), stderr: stderr.trim() })
@@ -848,6 +1017,7 @@ type RawUserStatus = {
   }
   cred_present: boolean
   marker_version?: number | null
+  setup_version?: number | null
   real_user_sid: string
   ca_cert_thumb?: string | null
   ca_cert_pem?: string | null
@@ -857,6 +1027,81 @@ type RawUserStatus = {
     roots?: string[]
     reason?: string
   } | null
+  /** Absent from an `srt-win` without the profile read grant. */
+  profile_grant?: { state: string; reason?: string } | null
+  session_user_sid?: string | null
+  /** Absent from an `srt-win` that does not name what it does. */
+  capabilities?: unknown
+}
+
+/**
+ * Behaviours of `srt-win` this library relies on and asks for by
+ * name. `srt-win` lists what it does as `capabilities` in `user
+ * status` and `profile status`.
+ */
+export const WINDOWS_SRT_WIN_CAPABILITIES = {
+  /**
+   * A read deny handed to `srt-win` is also written on every recorded
+   * path of the profile read grant beneath it that carries an allow
+   * of its own.
+   */
+  profileDenyExpansion: 'profile-deny-expansion',
+  /**
+   * Sessions are recorded as holders of the kept grants they run on,
+   * and `acl forget` / `profile forget` take
+   * `--unless-held-by-others`.
+   */
+  keptGrantHolders: 'kept-grant-holders',
+  /**
+   * `acl grant` itself refuses a path that reaches an exclusion
+   * recorded with the profile read grant.
+   */
+  profileSessionGrantCheck: 'profile-session-grant-check',
+  /**
+   * That expansion leaves out the recorded paths the session allows
+   * more specifically: the grants of the same `acl grant` call, and
+   * the ones a command names with `--deny-read-except`.
+   */
+  readDenyExcept: 'read-deny-except',
+  /**
+   * A session under the write-restricted token is recorded as a
+   * holder of the profile read grant from its start, and `exec` is
+   * told which session holds for it (`--held-by`) or holds for itself.
+   */
+  execHolder: 'exec-holder',
+} as const
+
+/**
+ * The first capability this library needs that `capabilities` (as
+ * `srt-win` reported them) does not list.
+ */
+export function missingWindowsSrtWinCapability(
+  capabilities: readonly string[],
+): string | undefined {
+  return Object.values(WINDOWS_SRT_WIN_CAPABILITIES).find(
+    c => !capabilities.includes(c),
+  )
+}
+
+function capabilityList(v: unknown): string[] {
+  return Array.isArray(v)
+    ? v.filter((x): x is string => typeof x === 'string')
+    : []
+}
+
+/** The typed error for an `srt-win` that lacks a behaviour by name. */
+export function windowsSrtWinOutdatedError(
+  capability: string,
+  why: string,
+): WindowsSandboxError {
+  return new WindowsSandboxError(
+    'srt_win_outdated',
+    `The srt-win in use is older than this library: it does not report ` +
+      `the capability '${capability}', which ${why}. Update srt-win (the ` +
+      `one shipped with the program embedding this library, or the ` +
+      `package's own) to a build that matches the library. Nothing was ` +
+      `granted.`,
+  )
 }
 
 function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
@@ -872,6 +1117,9 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
     ...(typeof raw.marker_version === 'number' && {
       markerVersion: raw.marker_version,
     }),
+    ...(typeof raw.setup_version === 'number' && {
+      setupVersion: raw.setup_version,
+    }),
     realUserSid: raw.real_user_sid,
     ...(raw.ca_cert_thumb && { caCertThumb: raw.ca_cert_thumb }),
     ...(raw.ca_cert_pem && { caCertPem: raw.ca_cert_pem }),
@@ -885,6 +1133,21 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
           roots: raw.persistent_grants.roots ?? [],
           ...(raw.persistent_grants.reason && {
             reason: raw.persistent_grants.reason,
+          }),
+        },
+      }),
+    ...(typeof raw.session_user_sid === 'string' &&
+      raw.session_user_sid !== '' && {
+        sessionUserSid: raw.session_user_sid,
+      }),
+    capabilities: capabilityList(raw.capabilities),
+    // As above: only an explicit "none" is no grant.
+    ...(raw.profile_grant &&
+      raw.profile_grant.state !== 'none' && {
+        profileGrant: {
+          state: raw.profile_grant.state === 'present' ? 'present' : 'unknown',
+          ...(raw.profile_grant.reason && {
+            reason: raw.profile_grant.reason,
           }),
         },
       }),
@@ -986,19 +1249,14 @@ export async function getWindowsWfpStatusAsync(
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
- * @param opts.writeRoots with `writeRestrictedToken`: the session's
- *   write roots, so the probe child's token carries the same
- *   capability SIDs a command of the session gets.
- * @param opts.writeRestrictedToken probe with the write-restricted
- *   child token; a session that runs commands with the option MUST
- *   verify with it (the filter matches by a token access check).
+ * @param opts.writeRoots the session's write roots: the probe runs
+ *   under the write-restricted token a command of the session gets.
  * @throws on any outcome other than `blocked` (exit 0).
  */
 export async function verifyWindowsWfpEgress(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
-    writeRestrictedToken?: boolean
     writeRoots?: readonly string[]
     srtWin?: SrtWinSpawn
   } = {},
@@ -1035,11 +1293,14 @@ export async function verifyWindowsWfpEgress(
     // 30s: first call after install may create the sandbox user's
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
     // the runner allows itself 2s to connect (runner.rs).
-    const verifyArgs = ['wfp', 'verify', '--target', target]
-    if (opts.writeRestrictedToken === true) {
-      verifyArgs.push('--write-restricted-token')
-      for (const r of opts.writeRoots ?? []) verifyArgs.push('--write-root', r)
-    }
+    const verifyArgs = [
+      'wfp',
+      'verify',
+      '--target',
+      target,
+      '--write-restricted-token',
+    ]
+    for (const r of opts.writeRoots ?? []) verifyArgs.push('--write-root', r)
     const r = runSrtWin(verifyArgs, {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
@@ -1499,15 +1760,62 @@ export interface WindowsInstallOptions {
    * Defaults to {@link INSTALL_TIMEOUT_MS}.
    */
   timeoutMs?: number
+  /**
+   * Leave the profile read grant unapplied.
+   */
+  skipProfileGrant?: boolean
+  /**
+   * Paths inside the profile to keep unreadable in addition to the
+   * built-in exclusions — {@link WindowsProfileGrantOptions.exclude}.
+   */
+  profileExclude?: readonly string[]
+  /**
+   * How long the profile read grant may take. Default 30 minutes; the
+   * first grant touches every file under the granted directories.
+   */
+  profileGrantTimeoutMs?: number
+  /**
+   * Called with each progress line of the profile read grant (a count
+   * of top-level items done). The synchronous install delivers the
+   * lines only when the grant has finished.
+   */
+  onProfileGrantProgress?: (line: string) => void
+  /**
+   * Called once, right before the profile read grant is applied (not
+   * when it is skipped), with {@link windowsProfileGrantNotice} for
+   * the profile about to be granted: one line to show the user.
+   */
+  onProfileGrantStart?: (notice: string) => void
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
   srtWin?: SrtWinSpawn
 }
+
+/**
+ * What an install did about the profile read grant.
+ */
+export type WindowsInstallProfileGrant =
+  | {
+      applied: true
+      /** SID of the user whose profile was granted. */
+      userSid: string
+      result: WindowsProfileGrantResult
+    }
+  | {
+      applied: false
+      /**
+       * Why not. Sessions still run; they read nothing in the profile
+       * until the grant is applied.
+       */
+      reason: string
+    }
 
 export interface WindowsInstallResult {
   /** Post-install WFP state. */
   wfp: WindowsWfpStatusResult
   /** Post-install sandbox-user state. */
   user: WindowsSandboxUserStatus
+  /** The profile read grant; absent when the install was cancelled. */
+  profileGrant?: WindowsInstallProfileGrant
   /**
    * `true` if the user dismissed the UAC prompt. Not an error —
    * the install simply didn't happen. Re-run when the user is
@@ -1650,7 +1958,21 @@ export function installWindowsSandbox(
     sublayerGuid: opts.sublayerGuid,
     srtWin,
   })
-  return r.status === 10 ? { ...state, cancelled: true } : state
+  if (r.status === 10) return { ...state, cancelled: true }
+  const skip = installProfileGrantSkip(opts, state.user)
+  if (skip) return { ...state, profileGrant: skip }
+  opts.onProfileGrantStart?.(windowsProfileGrantNotice(os.homedir()))
+  try {
+    const result = grantWindowsProfileReadSync(
+      installProfileGrantOptions(opts, srtWin),
+    )
+    return {
+      ...state,
+      profileGrant: { applied: true, userSid: state.user.realUserSid, result },
+    }
+  } catch (e) {
+    throwInstallProfileGrantFailure(e)
+  }
 }
 
 /**
@@ -1677,7 +1999,134 @@ export async function installWindowsSandboxAsync(
     sublayerGuid: opts.sublayerGuid,
     srtWin,
   })
-  return r.status === 10 ? { ...state, cancelled: true } : state
+  if (r.status === 10) return { ...state, cancelled: true }
+  const skip = installProfileGrantSkip(opts, state.user)
+  if (skip) return { ...state, profileGrant: skip }
+  opts.onProfileGrantStart?.(windowsProfileGrantNotice(os.homedir()))
+  try {
+    const result = await grantWindowsProfileRead(
+      installProfileGrantOptions(opts, srtWin),
+    )
+    return {
+      ...state,
+      profileGrant: { applied: true, userSid: state.user.realUserSid, result },
+    }
+  } catch (e) {
+    throwInstallProfileGrantFailure(e)
+  }
+}
+
+/** LocalSystem, LocalService, NetworkService: accounts no one runs sessions as. */
+const WINDOWS_SERVICE_ACCOUNT_SIDS: ReadonlySet<string> = new Set([
+  'S-1-5-18',
+  'S-1-5-19',
+  'S-1-5-20',
+])
+
+/**
+ * Why an install leaves the profile read grant unapplied (`undefined`: it
+ * applies it): asked to skip, a service account, or not running as the
+ * owner of the interactive session, whose profile it would open instead.
+ */
+export function windowsProfileGrantSkipReason(
+  user: Pick<WindowsSandboxUserStatus, 'realUserSid' | 'sessionUserSid'>,
+  opts: { skipProfileGrant?: boolean } = {},
+): string | undefined {
+  if (opts.skipProfileGrant) return 'skipProfileGrant was set'
+  const how =
+    `run the install, or grantWindowsProfileRead() (\`srt-win profile ` +
+    `grant\`), as the user whose sessions are to read their profile`
+  if (WINDOWS_SERVICE_ACCOUNT_SIDS.has(user.realUserSid)) {
+    return (
+      `the install ran as the service account ${user.realUserSid}, which ` +
+      `runs no sessions; ${how}`
+    )
+  }
+  if (user.sessionUserSid === undefined) {
+    return (
+      `the owner of the session this install ran in could not be ` +
+      `determined, so it is not known whose profile ${user.realUserSid} ` +
+      `is; ${how}`
+    )
+  }
+  if (user.sessionUserSid.toUpperCase() !== user.realUserSid.toUpperCase()) {
+    return (
+      `the install ran as ${user.realUserSid} in a session that belongs ` +
+      `to ${user.sessionUserSid}; granting would open the installing ` +
+      `account's profile, not the session owner's; ${how}`
+    )
+  }
+  return undefined
+}
+
+function installProfileGrantSkip(
+  opts: WindowsInstallOptions,
+  user: WindowsSandboxUserStatus,
+): WindowsInstallProfileGrant | undefined {
+  const reason = windowsProfileGrantSkipReason(user, opts)
+  return reason === undefined ? undefined : { applied: false, reason }
+}
+
+/**
+ * What the profile read grant is about to do, in one line, for the person
+ * at the keyboard.
+ */
+export function windowsProfileGrantNotice(profileDir: string): string {
+  return (
+    `Making ${profileDir} readable to sandboxed commands on this machine, ` +
+    `except the excluded credential stores (SSH and GPG keys, cloud and ` +
+    `browser sign-ins, password managers, registry hives). Readable ` +
+    `files include package-manager configuration that can hold feed ` +
+    `tokens: .npmrc, pip.ini, NuGet.Config, Maven settings.xml, ` +
+    `gradle.properties, .gitconfig. Skip with --skip-profile-grant ` +
+    `(skipProfileGrant); undo with \`srt-win profile forget\` ` +
+    `(forgetWindowsProfileRead()).`
+  )
+}
+
+function installProfileGrantOptions(
+  opts: WindowsInstallOptions,
+  srtWin: SrtWinSpawn,
+): WindowsProfileGrantOptions {
+  return {
+    exclude: opts.profileExclude,
+    timeoutMs: opts.profileGrantTimeoutMs,
+    onProgress: opts.onProfileGrantProgress,
+    srtWin,
+  }
+}
+
+/**
+ * The account and the filters are installed and the profile read grant
+ * is not: its own error, so the caller does not take the whole install
+ * for failed.
+ */
+function throwInstallProfileGrantFailure(e: unknown): never {
+  const cause = e as Error
+  // Refused beside other sandbox activity: nothing was written, and a
+  // grant made before is still the current one.
+  if (
+    cause instanceof WindowsSandboxError &&
+    (cause.code === 'profile_grant_blocked_by_session' ||
+      cause.code === 'profile_operation_in_progress')
+  ) {
+    throw new WindowsSandboxError(
+      cause.code,
+      `The Windows sandbox is installed. ${cause.message}`,
+      'profile',
+    )
+  }
+  const timedOut =
+    cause instanceof WindowsSandboxError && cause.code === 'srt_win_timeout'
+  throw new WindowsSandboxError(
+    'profile_grant_failed',
+    `The Windows sandbox is installed, but the read grant on your user ` +
+      `profile ${timedOut ? 'did not finish in time' : 'could not be applied'}` +
+      `: ${cause.message}\nNo session starts until it is complete. Run the ` +
+      `install again, or grantWindowsProfileRead(), to finish it; ` +
+      `forgetWindowsProfileRead() removes what was written.`,
+    'profile',
+  )
 }
 
 /**
@@ -1692,8 +2141,9 @@ export function uninstallWindowsSandbox(
     sublayerGuid?: string
     keepUser?: boolean
     /**
-     * How long to wait for the self-elevating uninstall subprocess.
-     * Defaults to {@link INSTALL_TIMEOUT_MS}.
+     * How long to wait for the uninstall: the elevation prompt, and
+     * then the removal of the grants kept for this user, which walks
+     * the profile. Defaults to the install's and the grant's together.
      */
     timeoutMs?: number
     srtWin?: SrtWinSpawn
@@ -1705,7 +2155,11 @@ export function uninstallWindowsSandbox(
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   if (opts.keepUser) args.push('--keep-user')
   const r = runSrtWin(args, {
-    timeoutMs: installTimeoutMs(opts),
+    timeoutMs:
+      opts.timeoutMs ??
+      (opts.keepUser
+        ? INSTALL_TIMEOUT_MS
+        : INSTALL_TIMEOUT_MS + PROFILE_GRANT_TIMEOUT_MS),
     srtWin: opts.srtWin,
   })
   logForDebugging(
@@ -1819,28 +2273,67 @@ export function expandWindowsFsPaths(
 }
 
 /**
- * `p` for comparison with another path, as the object `srt-win` opens for it:
- * links, junctions, 8.3 names and the case on disk are resolved by the same
- * final-path lookup the helper makes. On top of that, lower case, `/`
- * separators and none at the end. A path that cannot be opened is compared as
- * spelled, and so is a UNC path, which is never probed (see
- * {@link isUncPath}).
+ * A path that names a network share (`\\\\server\\share\\…`, `\\\\?\\UNC\\…`)
+ * or anything in the device namespace other than a drive (`\\\\.\\pipe\\…`,
+ * `\\\\?\\GLOBALROOT\\…`).
+ */
+function isUnprobedWindowsPath(p: string): boolean {
+  return isUncPath(p) || /^[\\/]{2}[?.][\\/](?![a-z]:)/i.test(p)
+}
+
+/** What the one look at a path on disk found. */
+type ResolvedWindowsPath =
+  /** The object it names, with links, 8.3 names and case resolved. */
+  | { state: 'resolved'; path: string }
+  /** Nothing is there (or a parent is not a directory). */
+  | { state: 'absent' }
+  /** Not looked at: see {@link isUnprobedWindowsPath}. */
+  | { state: 'unprobed' }
+  /** Looking failed for another reason: access denied, an I/O error. */
+  | { state: 'error'; code: string }
+
+/** "Does not exist" as opposed to "could not look". */
+function isAbsentError(e: unknown): boolean {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
+}
+
+/**
+ * The single place a path of a session's configuration is resolved on
+ * disk for comparison: the same final-path lookup `srt-win` makes.
+ */
+function resolveWindowsPath(p: string): ResolvedWindowsPath {
+  if (isUnprobedWindowsPath(p)) return { state: 'unprobed' }
+  try {
+    // eslint-disable-next-line no-restricted-properties
+    return { state: 'resolved', path: fs.realpathSync.native(p) }
+  } catch (e) {
+    return isAbsentError(e)
+      ? { state: 'absent' }
+      : {
+          state: 'error',
+          code: (e as NodeJS.ErrnoException | undefined)?.code ?? 'unknown',
+        }
+  }
+}
+
+/**
+ * `p` for comparison with another path: links, junctions, 8.3 names and
+ * the case on disk are resolved, as `srt-win` resolves a path it is given.
  */
 function windowsPathKey(p: string): string {
-  let resolved = p
-  if (!isUncPath(p)) {
-    try {
-      // The final-path lookup itself, which also resolves 8.3 names and the
-      // case on disk.
-      // eslint-disable-next-line no-restricted-properties
-      resolved = fs.realpathSync.native(p)
-    } catch {
-      // Not there, so nothing lies beneath it either.
-    }
-  }
+  return windowsPathKeyOf(p, resolveWindowsPath(p))
+}
+
+/** {@link windowsPathKey} from a look at the path already taken. */
+function windowsPathKeyOf(p: string, resolved: ResolvedWindowsPath): string {
   return normalizeCaseForComparison(
     path.win32
-      .normalize(stripExtendedPathPrefix(resolved))
+      .normalize(
+        stripExtendedPathPrefix(
+          resolved.state === 'resolved' ? resolved.path : p,
+        ),
+      )
       .replace(/\\/g, '/')
       .replace(/\/+$/, ''),
   )
@@ -1857,6 +2350,32 @@ function coveringWindowsPath(
     const covering = keys.findIndex(dir => isAtOrUnder(key, dir))
     return covering < 0 ? undefined : dirs[covering]
   }
+}
+
+/**
+ * The ones of `grants` that lie strictly beneath one of `denies`: the
+ * grants that rank above those denies, an allow set further down
+ * being the one that counts.
+ */
+export function windowsGrantsBeneathDenies(
+  grants: readonly string[],
+  denies: readonly string[],
+): string[] {
+  if (grants.length === 0 || denies.length === 0) return []
+  const denyKeys = denies.map(windowsPathKey)
+  const keyed = grants.map(g => ({ path: g, key: windowsPathKey(g) }))
+  // Per deny, the topmost grants strictly beneath THAT deny.
+  const out = new Map<string, string>()
+  for (const d of denyKeys) {
+    const beneath = keyed.filter(g => g.key !== d && isAtOrUnder(g.key, d))
+    for (const g of beneath) {
+      const covered = beneath.some(
+        other => other.key !== g.key && isAtOrUnder(g.key, other.key),
+      )
+      if (!covered && !out.has(g.key)) out.set(g.key, g.path)
+    }
+  }
+  return [...out.values()]
 }
 
 /** What `srt-win` is handed: see {@link rankWindowsFsAccess}. */
@@ -1969,7 +2488,10 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
  */
 export function parseWindowsSandboxError(
   stderr: string,
-): MappedDriveCwdError | undefined {
+):
+  | MappedDriveCwdError
+  | (WindowsSandboxError & { drive?: undefined })
+  | undefined {
   for (const line of stderr.split(/\r?\n/)) {
     const t = line.trim()
     if (!t.startsWith('{') || !t.includes('"code"')) continue
@@ -1978,6 +2500,25 @@ export function parseWindowsSandboxError(
         code?: string
         message?: string
         drive?: string
+      }
+      // Exit 25: the command needed the lock a profile grant or forget
+      // is holding.
+      if (j.code === 'profile_operation_in_progress') {
+        return new WindowsSandboxError(
+          'profile_operation_in_progress',
+          j.message ?? 'a profile grant or forget is in progress',
+          'exec',
+        )
+      }
+      // Exit 26: the process named with `heldBy` ended while the
+      // command ran, and the command was terminated with it.
+      if (j.code === 'session_ended') {
+        return new WindowsSandboxError(
+          'session_ended',
+          j.message ??
+            'the session that started this command ended; the command was terminated',
+          'exec',
+        )
       }
       if (j.code === 'mapped_drive_cwd') {
         // The canonical class carries `code`/`subcommand`; `drive`
@@ -2166,8 +2707,20 @@ export interface WindowsAclGrantOptions {
   sandboxUserSid: string
   /** Long-lived host PID the holds are tied to. Default: this process. */
   holderPid?: number
+  /**
+   * `read` paths that may be granted although the profile read grant
+   * excludes them (`srt-win acl grant --allow-profile-exclusion`).
+   */
+  allowProfileExclusions?: readonly string[]
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
   srtWin?: SrtWinSpawn
+}
+
+function allowProfileExclusionArgs(opts: WindowsAclGrantOptions): string[] {
+  return (opts.allowProfileExclusions ?? []).flatMap(p => [
+    '--allow-profile-exclusion',
+    p,
+  ])
 }
 
 /**
@@ -2192,6 +2745,7 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
       `${holder}`,
       '--sandbox-user-sid',
       opts.sandboxUserSid,
+      ...allowProfileExclusionArgs(opts),
     ],
     { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
   )
@@ -2207,16 +2761,16 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 }
 
 /**
- * Session start for `windows.writeRestrictedToken`: one `srt-win acl
+ * Session start under the write-restricted token: one `srt-win acl
  * grant --persistent`. Grants on the `write` roots are KEPT at session
- * end; {@link forgetWindowsPersistentGrants} removes them.
+ * end; `srt-win acl forget` removes them.
  */
-export function grantWindowsAclPersistent(
+export async function grantWindowsAclPersistent(
   opts: WindowsAclGrantOptions & {
     denyRead: readonly string[]
     denyWrite: readonly string[]
   },
-): void {
+): Promise<void> {
   const holder = opts.holderPid ?? process.pid
   const stdin = JSON.stringify({
     read: opts.read,
@@ -2224,7 +2778,7 @@ export function grantWindowsAclPersistent(
     denyRead: opts.denyRead,
     denyWrite: opts.denyWrite,
   })
-  const r = runSrtWin(
+  const r = await runSrtWinAsync(
     [
       'acl',
       'grant',
@@ -2233,6 +2787,7 @@ export function grantWindowsAclPersistent(
       '--sandbox-user-sid',
       opts.sandboxUserSid,
       '--persistent',
+      ...allowProfileExclusionArgs(opts),
     ],
     // A root's first grant walks its whole tree.
     { timeoutMs: 600_000, stdin, srtWin: opts.srtWin },
@@ -2247,32 +2802,6 @@ export function grantWindowsAclPersistent(
       `srt-win acl grant --persistent exited ${r.status} ` +
         (r.status === 2 ? '(partial — some inputs skipped)' : '(failed)') +
         `: ${r.stderr || r.stdout}`,
-    )
-  }
-}
-
-/**
- * Remove every write grant kept between sessions (`srt-win acl forget
- * --all`). A session without `windows.writeRestrictedToken` must run
- * this first: a kept grant is writable under the ordinary token.
- */
-export function forgetWindowsPersistentGrants(
-  opts: { srtWin?: SrtWinSpawn } = {},
-): void {
-  const r = runSrtWin(['acl', 'forget', '--all'], {
-    timeoutMs: 600_000,
-    srtWin: opts.srtWin,
-  })
-  logForDebugging(
-    `[Sandbox Windows] acl forget --all exit=${r.status}: ` +
-      `${r.stderr || r.stdout}`,
-  )
-  if (r.status !== 0) {
-    throw new WindowsSandboxError(
-      'acl_forget_failed',
-      `Write grants kept from sessions with ` +
-        `windows.writeRestrictedToken could not be removed (srt-win ` +
-        `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}`,
     )
   }
 }
@@ -2366,6 +2895,781 @@ export function revokeWindowsAcl(opts: {
   return revokeWindowsAclChecked(opts).outcomes
 }
 
+/**
+ * What `srt-win profile status` reports. Only `current` is a grant a
+ * session may rely on: complete, made with this `srt-win`'s exclusion
+ * list, for the profile directory that is there now.
+ */
+export type WindowsProfileGrantState =
+  | 'none'
+  | 'current'
+  | 'outdated'
+  | 'incomplete'
+  | 'unknown'
+
+/** One path the grant wrote on, as `srt-win` recorded it. */
+export interface WindowsProfileGrantPath {
+  /** Canonical (`\\?\`-prefixed) path. */
+  path: string
+  /**
+   * `container`: listable, children granted one by one. `granted`: a
+   * directory readable with everything below it. `file`: a single
+   * readable file. `denied`: an exclusion.
+   */
+  kind: 'container' | 'granted' | 'file' | 'denied'
+}
+
+export interface WindowsProfileGrantStatus {
+  state: WindowsProfileGrantState
+  /** Why the state is not `current`, when `srt-win` says. */
+  reason?: string
+  /** The profile directory the grant was made for. */
+  profile?: string
+  /**
+   * What `srt-win` says it does, by name (see
+   * {@link WINDOWS_SRT_WIN_CAPABILITIES}); empty from one that does
+   * not say.
+   */
+  capabilities: string[]
+  /**
+   * What the last run of the grant left as it found it, as {@link
+   * WindowsProfileGrantResult} reports it: objects in the profile
+   * this user may not change.
+   */
+  notGranted: WindowsProfileGrantItem[]
+  selfClosed: WindowsProfileGrantItem[]
+  unverifiable: WindowsProfileGrantItem[]
+  unprotected: WindowsProfileGrantItem[]
+  staleAllow: WindowsProfileGrantItem[]
+  /**
+   * Configuration files granted by name that were replaced since (a save
+   * by write-and-rename): unreadable to sandboxed commands, and their
+   * variables are not in `env`, until the grant runs again.
+   */
+  replacedFiles: string[]
+  /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
+  extraExclusions: string[]
+  /**
+   * Every PROTECTED path the grant keeps unreadable, absolute, existing or
+   * not; `*` stands for one name, a trailing `*` for a prefix. A session may
+   * not grant a path that is one, lies inside one, or lies above one.
+   */
+  exclusions: string[]
+  /**
+   * The UNGRANTED-ONLY directories, in the same form (the user's
+   * temporary directory): not readable through the grant, and not
+   * denied.
+   */
+  ungrantedOnly: string[]
+  counts: { containers: number; granted: number; files: number; denied: number }
+  /**
+   * Configuration-file variables for a sandboxed command — see
+   * {@link windowsProfileReadEnv}. Empty unless `current`.
+   */
+  env: Record<string, string>
+  /** Every recorded path; only when asked for. */
+  paths?: WindowsProfileGrantPath[]
+}
+
+type RawProfileStatus = {
+  record_version?: unknown
+  capabilities?: unknown
+  not_granted?: unknown
+  self_closed?: unknown
+  unverifiable?: unknown
+  unprotected?: unknown
+  stale_allow?: unknown
+  replaced_files?: unknown
+  state?: string
+  reason?: string
+  profile?: string | null
+  extra_exclusions?: string[]
+  exclusions?: unknown
+  ungranted_only?: unknown
+  containers?: number
+  granted?: number
+  files?: number
+  denied?: number
+  env?: Record<string, unknown>
+  paths?: { path?: unknown; kind?: unknown }[]
+}
+
+const PROFILE_GRANT_STATES: ReadonlySet<string> = new Set([
+  'none',
+  'current',
+  'outdated',
+  'incomplete',
+  'unknown',
+])
+const PROFILE_PATH_KINDS: ReadonlySet<string> = new Set([
+  'container',
+  'granted',
+  'file',
+  'denied',
+])
+
+/**
+ * The variables {@link windowsProfileReadEnv} can return; any other name
+ * `srt-win` reports is dropped. `RUSTUP_HOME` and `CARGO_HOME` name
+ * directories, which stay read-only to the sandboxed command.
+ */
+export const WINDOWS_PROFILE_READ_ENV_VARS: readonly string[] = [
+  'NPM_CONFIG_USERCONFIG',
+  'GIT_CONFIG_GLOBAL',
+  'PIP_CONFIG_FILE',
+  'MAVEN_ARGS',
+  'RUSTUP_HOME',
+  'CARGO_HOME',
+]
+
+/**
+ * The version of `srt-win profile status`'s record format this library
+ * reads. Any other version is not read: its lists decide what may be granted.
+ */
+const WINDOWS_PROFILE_RECORD_VERSION = 1
+
+function stringList(v: unknown): string[] | undefined {
+  return Array.isArray(v) && v.every(x => typeof x === 'string' && x !== '')
+    ? (v as string[])
+    : undefined
+}
+
+/**
+ * Why a status that says `current` cannot be relied on, if so.
+ */
+function profileStatusProblem(raw: RawProfileStatus): string | undefined {
+  if (raw.record_version !== WINDOWS_PROFILE_RECORD_VERSION) {
+    return (
+      `srt-win reports record format ${JSON.stringify(raw.record_version)}; ` +
+      `this library reads format ${WINDOWS_PROFILE_RECORD_VERSION}`
+    )
+  }
+  const exclusions = stringList(raw.exclusions)
+  if (!exclusions || exclusions.length === 0) {
+    return 'the recorded grant carries no list of excluded paths'
+  }
+  if (!stringList(raw.ungranted_only)) {
+    return 'the recorded grant carries no list of ungranted directories'
+  }
+  return undefined
+}
+
+function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
+  // A state this code does not know is not a usable grant.
+  let state = (
+    PROFILE_GRANT_STATES.has(raw.state ?? '') ? raw.state : 'unknown'
+  ) as WindowsProfileGrantState
+  let reason = raw.reason
+  const problem = state === 'current' ? profileStatusProblem(raw) : undefined
+  if (problem) {
+    state = 'outdated'
+    reason = problem
+  }
+  const env: Record<string, string> = {}
+  if (state === 'current') {
+    for (const name of WINDOWS_PROFILE_READ_ENV_VARS) {
+      const v = raw.env?.[name]
+      if (typeof v === 'string' && v !== '') env[name] = v
+    }
+  }
+  return {
+    state,
+    ...(reason && { reason }),
+    ...(raw.profile && { profile: raw.profile }),
+    capabilities: capabilityList(raw.capabilities),
+    notGranted: grantItems(raw.not_granted),
+    selfClosed: grantItems(raw.self_closed),
+    unverifiable: grantItems(raw.unverifiable),
+    unprotected: grantItems(raw.unprotected),
+    staleAllow: grantItems(raw.stale_allow),
+    replacedFiles: stringList(raw.replaced_files) ?? [],
+    extraExclusions: raw.extra_exclusions ?? [],
+    exclusions: stringList(raw.exclusions) ?? [],
+    ungrantedOnly: stringList(raw.ungranted_only) ?? [],
+    counts: {
+      containers: raw.containers ?? 0,
+      granted: raw.granted ?? 0,
+      files: raw.files ?? 0,
+      denied: raw.denied ?? 0,
+    },
+    env,
+    ...(raw.paths && {
+      paths: raw.paths.filter(
+        (p): p is WindowsProfileGrantPath =>
+          typeof p.path === 'string' &&
+          typeof p.kind === 'string' &&
+          PROFILE_PATH_KINDS.has(p.kind),
+      ),
+    }),
+  }
+}
+
+/**
+ * The recorded profile read grant (`srt-win profile status`): whether one
+ * exists and is current, and with `paths` every path it wrote on. Throws
+ * `profile_operation_in_progress` while a grant or forget is running.
+ */
+export function getWindowsProfileReadStatus(
+  opts: { paths?: boolean; srtWin?: SrtWinSpawn } = {},
+): WindowsProfileGrantStatus {
+  const args = ['profile', 'status']
+  if (opts.paths) args.push('--paths')
+  const raw = runSrtWinJson<RawProfileStatus>(args, {
+    timeoutMs: 30_000,
+    srtWin: opts.srtWin,
+  })
+  // Asked while a grant or forget is running: the record is being
+  // rewritten, and is not a run that was cut short.
+  if (raw.state === 'in_progress') {
+    throwIfRefusedBesideOthers(args, SRT_WIN_EXIT_PROFILE_BUSY, '')
+  }
+  return mapProfileStatus(raw)
+}
+
+export interface WindowsProfileGrantOptions {
+  /**
+   * Paths inside the profile to keep unreadable in addition to the
+   * built-in list (absolute, or relative to the profile): for example
+   * the embedding program's own configuration directory.
+   */
+  exclude?: readonly string[]
+  /**
+   * Make `exclude` the whole added list, dropping the entries earlier
+   * runs recorded. Without it a run only ever adds.
+   */
+  replaceExclusions?: boolean
+  /**
+   * Kill `srt-win` after this long. Default 30 minutes: the first run
+   * touches every file under the granted directories.
+   */
+  timeoutMs?: number
+  /** Called with each progress line `srt-win` writes (a count of top-level items done). */
+  onProgress?: (line: string) => void
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
+}
+
+/** One path `srt-win profile grant` skipped or could not write. */
+export interface WindowsProfileGrantItem {
+  path: string
+  reason: string
+  /**
+   * On an `unverifiable` item: whether YOU can open the object for reading
+   * (`'unknown'`: not tried). One you can read without seeing its access
+   * list is to be taken as readable to sandboxed commands as well.
+   */
+  callerReads?: boolean | 'unknown'
+  /**
+   * On an `unverifiable` item: why it could not be examined —
+   * `acl_unreadable`, `account_unknown` (the sandbox account's
+   * identity is not known), `not_local`, `probe_failed`.
+   */
+  cause?: string
+  /**
+   * Set where an entry THIS PRODUCT wrote makes the path readable and could
+   * not be removed: `true` if the path is on the exclusion list now (among
+   * `unprotected`), `false` if it merely left the grant (`staleAllow`).
+   */
+  protectedExclusion?: boolean
+  /**
+   * With `protectedExclusion`: `explicit` — the entry is on the
+   * object, which you may not change; `inherited` — a copy handed down
+   * from a directory above, which could not be taken off the object.
+   */
+  entry?: 'explicit' | 'inherited'
+}
+
+export interface WindowsProfileGrantResult {
+  profile: string
+  containers: number
+  granted: number
+  files: number
+  denied: number
+  /** Excluded directories that did not exist and were created empty. */
+  placeholders: number
+  /** DACLs written by this run; 0 on a refresh that found nothing new. */
+  writes: number
+  unchanged: number
+  /** Recorded paths that left the grant and had their entry removed. */
+  removed: number
+  /** Junctions, symbolic links, cloud placeholders: nothing is written on or through them. */
+  skipped: WindowsProfileGrantItem[]
+  /**
+   * Paths that were to be granted and whose access list this user may not
+   * change. They stay unreadable to sandboxed commands.
+   */
+  notGranted: WindowsProfileGrantItem[]
+  /**
+   * Excluded paths whose deny could not be written, and whose own
+   * access list gives the sandbox account no read.
+   */
+  selfClosed: WindowsProfileGrantItem[]
+  /**
+   * Excluded paths whose deny could not be written and whose access
+   * list this user may not even read (and so cannot use either).
+   */
+  unverifiable: WindowsProfileGrantItem[]
+  /**
+   * Excluded paths whose deny could not be written and whose own
+   * access list lets the sandbox account read them — as it did before
+   * the grant, which neither opened them nor can close them.
+   */
+  unprotected: WindowsProfileGrantItem[]
+  /**
+   * Paths that have left the grant and still carry the allow of an
+   * earlier run, which could not be removed: readable through the
+   * grant's own entry.
+   */
+  staleAllow: WindowsProfileGrantItem[]
+  /**
+   * Write roots kept from earlier sessions whose grant this run removed
+   * because it reached an exclusion (the root is one, lies inside one,
+   * or lies above one). A session that asks for such a root is refused.
+   */
+  forgottenRoots: WindowsProfileGrantItem[]
+  elapsedMs: number
+}
+
+const PROFILE_GRANT_TIMEOUT_MS = 30 * 60_000
+
+/** A `[{path, reason}]` list as `srt-win` reports it; anything else is none. */
+function grantItems(v: unknown): WindowsProfileGrantItem[] {
+  return Array.isArray(v)
+    ? v.flatMap(i => {
+        const { path: p, reason } = (i ?? {}) as {
+          path?: unknown
+          reason?: unknown
+        }
+        if (typeof p !== 'string') return []
+        const {
+          caller_reads: reads,
+          cause,
+          protected_exclusion: protectedExclusion,
+          entry,
+        } = i as {
+          caller_reads?: unknown
+          cause?: unknown
+          protected_exclusion?: unknown
+          entry?: unknown
+        }
+        return [
+          {
+            path: p,
+            reason: typeof reason === 'string' ? reason : '',
+            ...((typeof reads === 'boolean' || reads === 'unknown') && {
+              callerReads: reads,
+            }),
+            ...(typeof cause === 'string' && { cause }),
+            ...(typeof protectedExclusion === 'boolean' && {
+              protectedExclusion,
+            }),
+            ...((entry === 'explicit' || entry === 'inherited') && { entry }),
+          },
+        ]
+      })
+    : []
+}
+
+/**
+ * Write or refresh the profile read grant (`srt-win profile grant`), as
+ * the user of this process, unelevated. Runs only while no sandbox session
+ * or command is running (`profile_grant_blocked_by_session`).
+ */
+export async function grantWindowsProfileRead(
+  opts: WindowsProfileGrantOptions = {},
+): Promise<WindowsProfileGrantResult> {
+  const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
+  const args = profileGrantArgs(opts)
+  const timeoutMs = opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS
+  const r = await new Promise<RunResult>((resolve, reject) => {
+    const child = spawn(exe, [...prependArgs, ...args], { windowsHide: true })
+    let timedOut = false
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true
+            child.kill()
+          }, timeoutMs)
+        : undefined
+    let stdout = ''
+    let stderr = ''
+    let pending = ''
+    child.stdout?.setEncoding('utf8').on('data', d => (stdout += d))
+    child.stderr?.setEncoding('utf8').on('data', (d: string) => {
+      stderr += d
+      pending += d
+      const lines = pending.split(/\r?\n/)
+      pending = lines.pop() ?? ''
+      for (const line of lines) {
+        if (line.trim() !== '') opts.onProgress?.(line)
+      }
+    })
+    child.stdin?.on('error', () => {}).end()
+    child.once('error', e => {
+      clearTimeout(timer)
+      reject(
+        new WindowsSandboxError(
+          'spawn_failed',
+          `srt-win profile: spawn failed: ${e.message}`,
+          'profile',
+        ),
+      )
+    })
+    child.once('close', (status, signal) => {
+      clearTimeout(timer)
+      if (pending.trim() !== '') opts.onProgress?.(pending)
+      if (timedOut) {
+        reject(
+          new WindowsSandboxError(
+            'srt_win_timeout',
+            `srt-win profile grant timed out after ${timeoutMs}ms; the ` +
+              `grant is recorded as incomplete — run it again, or remove ` +
+              `it with forgetWindowsProfileRead()`,
+            'profile',
+          ),
+        )
+        return
+      }
+      try {
+        throwIfRefusedBesideOthers(args, status, stdout)
+      } catch (e) {
+        reject(e as Error)
+        return
+      }
+      resolve({ status, signal, stdout: stdout.trim(), stderr: stderr.trim() })
+    })
+  })
+  return profileGrantResult(args, r)
+}
+
+function profileGrantArgs(opts: WindowsProfileGrantOptions): string[] {
+  const args = ['profile', 'grant', '--json']
+  for (const e of opts.exclude ?? []) args.push('--exclude', e)
+  if (opts.replaceExclusions) args.push('--replace-excludes')
+  return args
+}
+
+function profileGrantResult(
+  args: string[],
+  r: RunResult,
+): WindowsProfileGrantResult {
+  logForDebugging(
+    `[Sandbox Windows] profile grant exit=${r.status}: ${r.stderr.slice(-2000)}`,
+  )
+  if (r.status !== 0) {
+    throw new WindowsSandboxError(
+      'profile_grant_failed',
+      `srt-win profile grant exited ${r.status}: ` +
+        `${r.stderr.slice(-2000) || r.stdout}`,
+      'profile',
+    )
+  }
+  // stdout carries one JSON object; `--json` puts nothing else there.
+  const raw = parseSrtWinJson<{
+    profile: string
+    containers: number
+    granted: number
+    files: number
+    denied: number
+    placeholders: number
+    writes: number
+    unchanged: number
+    removed: number
+    skipped?: WindowsProfileGrantItem[]
+    not_granted?: unknown
+    self_closed?: unknown
+    unverifiable?: unknown
+    unprotected?: unknown
+    stale_allow?: unknown
+    forgotten_roots?: unknown
+    failed?: WindowsProfileGrantItem[]
+    elapsed_ms: number
+  }>(args, r)
+  return {
+    profile: raw.profile,
+    containers: raw.containers,
+    granted: raw.granted,
+    files: raw.files,
+    denied: raw.denied,
+    placeholders: raw.placeholders,
+    writes: raw.writes,
+    unchanged: raw.unchanged,
+    removed: raw.removed,
+    skipped: raw.skipped ?? [],
+    notGranted: grantItems(raw.not_granted),
+    selfClosed: grantItems(raw.self_closed),
+    unverifiable: grantItems(raw.unverifiable),
+    unprotected: grantItems(raw.unprotected),
+    staleAllow: grantItems(raw.stale_allow),
+    forgottenRoots: grantItems(raw.forgotten_roots),
+    elapsedMs: raw.elapsed_ms,
+  }
+}
+
+/**
+ * {@link grantWindowsProfileRead} for the synchronous install: blocks
+ * until `srt-win` exits, and hands `onProgress` its lines only then.
+ */
+function grantWindowsProfileReadSync(
+  opts: WindowsProfileGrantOptions,
+): WindowsProfileGrantResult {
+  const args = profileGrantArgs(opts)
+  const r = runSrtWin(args, {
+    timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
+    srtWin: opts.srtWin,
+  })
+  for (const line of r.stderr.split(/\r?\n/)) {
+    if (line.trim() !== '') opts.onProgress?.(line)
+  }
+  return profileGrantResult(args, r)
+}
+
+/**
+ * Remove the profile read grant (`srt-win profile forget`). Synchronous:
+ * blocks for as long as the removal takes; with an event loop use
+ * {@link forgetWindowsProfileReadAsync}. Throws `profile_forget_failed`.
+ */
+export function forgetWindowsProfileRead(
+  opts: { timeoutMs?: number; srtWin?: SrtWinSpawn } = {},
+): void {
+  const r = runSrtWin(['profile', 'forget', '--json'], {
+    timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
+    srtWin: opts.srtWin,
+  })
+  profileForgetResult(r)
+}
+
+/** {@link forgetWindowsProfileRead} without blocking the event loop. */
+export async function forgetWindowsProfileReadAsync(
+  opts: {
+    timeoutMs?: number
+    srtWin?: SrtWinSpawn
+  } = {},
+): Promise<void> {
+  const r = await runSrtWinAsync(['profile', 'forget', '--json'], {
+    timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
+    srtWin: opts.srtWin,
+  })
+  profileForgetResult(r)
+}
+
+function profileForgetResult(r: RunResult): void {
+  logForDebugging(
+    `[Sandbox Windows] profile forget exit=${r.status}: ` +
+      `${r.stderr || r.stdout}`,
+  )
+  if (r.status !== 0) {
+    throw new WindowsSandboxError(
+      'profile_forget_failed',
+      `The profile read grant could not be removed (srt-win profile ` +
+        `forget exited ${r.status}): ${r.stderr || r.stdout}`,
+      'profile',
+    )
+  }
+}
+
+/** `p` for a comparison of profile paths: no `\\?\` prefix, `/`, lower case, no separator at the end. */
+function profilePathKey(p: string): string {
+  return stripExtendedPathPrefix(p)
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase()
+}
+
+/** How a path a session wants to grant stands to a profile exclusion. */
+export interface WindowsProfileExclusionConflict {
+  /** The path as the session configuration resolved it. */
+  path: string
+  /** The exclusion, as the grant recorded it. */
+  exclusion: string
+  /** Which list the exclusion is on. */
+  kind: 'protected' | 'ungranted-only'
+  /** What the session would have granted on the path. */
+  access: 'read' | 'write'
+  /**
+   * `equal`: the path is the excluded one. `inside`: it lies beneath
+   * an excluded directory (protected only). `above`: an excluded path
+   * lies beneath it.
+   */
+  relation: 'equal' | 'inside' | 'above'
+  /**
+   * Set on an `above` conflict with a wildcard exclusion when the path
+   * could not be examined for what the exclusion covers beneath it —
+   * access denied, an I/O error, a path on a share — with the reason.
+   */
+  unexamined?: string
+}
+
+/** One component of a recorded exclusion against one of a path; both lower case. */
+function exclusionComponentMatches(pattern: string, name: string): boolean {
+  if (pattern === '*') return true
+  if (pattern.endsWith('*')) return name.startsWith(pattern.slice(0, -1))
+  return pattern === name
+}
+
+/**
+ * Whether something that exists beneath the directory `dir` matches
+ * `rest`, the components of an exclusion that `dir` lies above.
+ */
+function exclusionMatchedBeneath(
+  dir: string,
+  rest: readonly string[],
+  top = true,
+): 'none' | 'match' | { unexamined: string } {
+  if (rest.length === 0) return 'match'
+  let entries: fs.Dirent[]
+  try {
+    const st = fs.lstatSync(dir)
+    if (st.isSymbolicLink()) {
+      // Beneath `dir`, a link is simply not followed. `dir` itself was
+      // resolved a moment ago and should not be one.
+      return top ? { unexamined: `'${dir}' is a link` } : 'none'
+    }
+    if (!st.isDirectory()) return 'none'
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch (e) {
+    if (isAbsentError(e)) return 'none'
+    const code = (e as NodeJS.ErrnoException | undefined)?.code ?? 'error'
+    return { unexamined: `'${dir}' could not be listed (${code})` }
+  }
+  let unexamined: { unexamined: string } | undefined
+  for (const e of entries) {
+    if (
+      !exclusionComponentMatches(rest[0]!, normalizeCaseForComparison(e.name))
+    ) {
+      continue
+    }
+    const found = exclusionMatchedBeneath(
+      path.join(dir, e.name),
+      rest.slice(1),
+      false,
+    )
+    if (found === 'match') return 'match'
+    if (found !== 'none') unexamined ??= found
+  }
+  return unexamined ?? 'none'
+}
+
+/**
+ * The paths among `paths` a session must not grant while the profile read
+ * grant exists, with the exclusion each collides with. Paths are resolved
+ * first; fails closed on a path that exists and cannot be listed.
+ */
+export function windowsProfileExclusionConflicts(
+  paths: readonly string[],
+  grant: Pick<WindowsProfileGrantStatus, 'exclusions' | 'ungrantedOnly'>,
+  opts: { override?: readonly string[]; write?: boolean } = {},
+): WindowsProfileExclusionConflict[] {
+  if (paths.length === 0) return []
+  const access = opts.write ? 'write' : 'read'
+  const rulesOf = (
+    list: readonly string[],
+    kind: WindowsProfileExclusionConflict['kind'],
+  ) =>
+    list.map(e => ({
+      exclusion: e,
+      kind,
+      parts: normalizeCaseForComparison(profilePathKey(e)).split('/'),
+    }))
+  // The ungranted-only directory itself is looked for first, so it is
+  // reported as what it is and not as "above" something inside it.
+  const ungranted = rulesOf(grant.ungrantedOnly, 'ungranted-only')
+  const rules = [
+    ...ungranted.map(r => ({ ...r, onlyEqual: true })),
+    ...rulesOf(grant.exclusions, 'protected').map(r => ({
+      ...r,
+      onlyEqual: false,
+    })),
+    ...ungranted.map(r => ({ ...r, onlyEqual: false })),
+  ]
+  if (rules.length === 0) return []
+  const admitted = new Set(
+    opts.write ? [] : (opts.override ?? []).map(windowsPathKey),
+  )
+  const out: WindowsProfileExclusionConflict[] = []
+  for (const p of paths) {
+    // One guarded look at the path: the comparison key and the
+    // lookups beneath it use the same result.
+    const onDisk = resolveWindowsPath(p)
+    const key = windowsPathKeyOf(p, onDisk)
+    const parts = key.split('/')
+    for (const r of rules) {
+      const shared = Math.min(parts.length, r.parts.length)
+      let related = true
+      for (let i = 0; related && i < shared; i++) {
+        related = exclusionComponentMatches(r.parts[i]!, parts[i]!)
+      }
+      if (!related) continue
+      const relation =
+        parts.length === r.parts.length
+          ? 'equal'
+          : parts.length > r.parts.length
+            ? 'inside'
+            : 'above'
+      if (r.onlyEqual && relation !== 'equal') continue
+      let unexamined: string | undefined
+      if (relation === 'above' && r.exclusion.includes('*')) {
+        if (onDisk.state === 'absent') continue
+        if (onDisk.state === 'resolved') {
+          const found = exclusionMatchedBeneath(
+            onDisk.path,
+            r.parts.slice(parts.length),
+          )
+          if (found === 'none') continue
+          if (found !== 'match') unexamined = found.unexamined
+        } else {
+          // Never opened (a share, the device namespace) or not
+          // openable: nothing was looked at, so nothing is admitted.
+          unexamined =
+            onDisk.state === 'unprobed'
+              ? `'${p}' is not on a local drive and is not examined`
+              : `'${p}' could not be resolved (${onDisk.code})`
+        }
+      }
+      if (r.kind === 'ungranted-only') {
+        if (relation === 'inside') continue
+      } else if (relation !== 'above' && admitted.has(key)) {
+        // An admitted path is still checked against the other
+        // exclusions: it may lie above one of them.
+        continue
+      }
+      out.push({
+        path: p,
+        exclusion: r.exclusion,
+        kind: r.kind,
+        access,
+        relation,
+        ...(unexamined === undefined ? {} : { unexamined }),
+      })
+      break
+    }
+  }
+  return out
+}
+
+/**
+ * Variables an embedder may set so a tool reads the real user's files in
+ * place. Empty unless the grant is current; never one `env` already holds.
+ * The library sets none of them itself.
+ */
+export function windowsProfileReadEnv(
+  status: WindowsProfileGrantStatus,
+  env: Readonly<Record<string, string | undefined>> = {},
+): Record<string, string> {
+  if (status.state !== 'current') return {}
+  const supplied = new Set(
+    Object.entries(env)
+      .filter(([, v]) => v !== undefined)
+      .map(([k]) => k.toUpperCase()),
+  )
+  const out: Record<string, string> = {}
+  for (const name of WINDOWS_PROFILE_READ_ENV_VARS) {
+    const v = status.env[name]
+    if (v !== undefined && !supplied.has(name)) out[name] = v
+  }
+  return out
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Wrap
 // ────────────────────────────────────────────────────────────────────
@@ -2443,17 +3747,17 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     schannelCa: p.caCertPath !== undefined,
     // Schannel cannot acquire credentials under the write-restricted
     // token; git's OpenSSL backend reads the same GIT_SSL_CAINFO.
-    opensslBackend: p.writeRestrictedToken === true,
+    opensslBackend: true,
     baseEnv: p.setEnvVars,
   })
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
   if (p.quiet !== false) argv.push('--quiet')
-  if (p.writeRestrictedToken === true) {
-    argv.push('--write-restricted-token')
-    for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
-  }
+  if (p.heldBy !== undefined) argv.push('--held-by', `${p.heldBy}`)
+  argv.push('--write-restricted-token')
+  for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
+  for (const a of p.denyReadExcept ?? []) argv.push('--deny-read-except', a)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env
   // (USERPROFILE/TEMP isolated) and overlays exactly what we pass as
@@ -2493,7 +3797,12 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     throw new WindowsSandboxError(
       'argv_too_long',
       `Windows sandbox argv is ~${cmdlineEstimate} chars ` +
-        `(CreateProcessW limit is 32 767).`,
+        `(CreateProcessW limit is 32 767). Besides the command itself it ` +
+        `carries ${p.denyRead?.length ?? 0} per-command read denies, ` +
+        `${p.denyReadExcept?.length ?? 0} session grants beneath them, ` +
+        `${p.denyWrite?.length ?? 0} write denies and ` +
+        `${p.writeRoots?.length ?? 0} write roots; the command was not ` +
+        `run with fewer.`,
     )
   }
 
@@ -2527,17 +3836,55 @@ function envListToObject(list: string[]): NodeJS.ProcessEnv {
 // ────────────────────────────────────────────────────────────────────
 
 /**
+ * Why an existing install cannot be used by this `srt-win` (its setup
+ * marker is another release's; re-run the install), or `undefined`.
+ * An `srt-win` that does not report its setup version is not judged.
+ */
+export function windowsSetupVersionMismatch(
+  us: WindowsSandboxUserStatus,
+  sublayerGuid?: string,
+): string | undefined {
+  if (us.setupVersion === undefined || us.markerVersion === us.setupVersion) {
+    return undefined
+  }
+  if (us.markerVersion !== undefined && us.markerVersion > us.setupVersion) {
+    const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
+    return (
+      `The Windows sandbox on this machine was set up by a newer ` +
+      `release (setup version ${us.markerVersion}; this release needs ` +
+      `${us.setupVersion}). Use that release, or replace its install ` +
+      `with this one: \`srt-win.exe install --force${sl}\`.\n` +
+      `Nothing is granted or run until then.`
+    )
+  }
+  return (
+    `The Windows sandbox on this machine was set up by a different ` +
+    `release (setup version ${us.markerVersion ?? 'unknown'}; this ` +
+    `release needs ${us.setupVersion}). Re-run the install to upgrade ` +
+    `it in place (one UAC prompt):\n` +
+    windowsInstallCommandLines(sublayerGuid) +
+    `Nothing is granted or run until then.`
+  )
+}
+
+function windowsInstallCommandLines(sublayerGuid: string | undefined): string {
+  const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
+  return (
+    `  npx sandbox-runtime windows-install\n` +
+    `  — or call installWindowsSandbox(), or run ` +
+    `\`srt-win.exe install${sl}\` directly.\n`
+  )
+}
+
+/**
  * Install instructions, surfaced verbatim in error messages.
  */
 export function windowsInstallInstructions(
   sublayerGuid: string | undefined,
 ): string {
-  const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
   return (
     `Windows sandbox needs a one-time install (one UAC prompt):\n` +
-    `  npx sandbox-runtime windows-install\n` +
-    `  — or call installWindowsSandbox(), or run ` +
-    `\`srt-win.exe install${sl}\` directly.\n` +
+    windowsInstallCommandLines(sublayerGuid) +
     `No logout is needed: the WFP filter keys on the dedicated ` +
     `\`srt-sandbox\` user's SID, so your network is unaffected.`
   )
@@ -2568,6 +3915,12 @@ function interpretDependencyProbes(
 ): SandboxDependencyCheck {
   const errors: string[] = []
   const warnings: string[] = []
+  let reinstallRequired: string | undefined
+  const result = (): SandboxDependencyCheck => ({
+    errors,
+    warnings,
+    ...(reinstallRequired && { reinstallRequired }),
+  })
 
   // 2. Sandbox user provisioned + credential readable.
   if (user.status === 'rejected') {
@@ -2581,6 +3934,11 @@ function interpretDependencyProbes(
         `cred=${us.credPresent}). ` +
         windowsInstallInstructions(sublayerGuid),
     )
+  } else {
+    // Installed, by a release with another setup version: an upgrade,
+    // not a missing sandbox, so its own wording.
+    reinstallRequired = windowsSetupVersionMismatch(us, sublayerGuid)
+    if (reinstallRequired) errors.push(reinstallRequired)
   }
 
   // 3. WFP filters installed under the sublayer. BFE enumeration is
@@ -2590,7 +3948,7 @@ function interpretDependencyProbes(
   const wfp = getWfp()
   if (wfp.status === 'rejected') {
     errors.push(`srt-win wfp status failed: ${(wfp.reason as Error).message}`)
-    return { errors, warnings }
+    return result()
   }
   const ws = wfp.value
   if (ws.state === 'cannot-read') {
@@ -2614,7 +3972,7 @@ function interpretDependencyProbes(
     )
   }
 
-  return { errors, warnings }
+  return result()
 }
 
 /**

@@ -19,13 +19,47 @@ use anyhow::{Context, Result, anyhow};
 use crate::state_db;
 use crate::{dpapi, logon, runner, user};
 
-/// Bumped on schema-incompatible changes to the `sandbox_user`
-/// row, or when `install` gains a step existing installs must pick
-/// up (v2: ambient write-deny stamps — `ambient.rs`). The broker
-/// compares this to the on-disk marker and refuses with a "re-run
-/// `srt-win install`" message on mismatch; `install` treats a stale
-/// marker as a partial install and completes the missing steps.
-pub const SETUP_VERSION: u32 = 2;
+/// Bumped when the `sandbox_user` row changes, when `install` gains a
+/// step (v2: ambient stamps), or when an older broker must stop
+/// launching here (v3: kept write grants). See [`check_marker`].
+pub const SETUP_VERSION: u32 = 3;
+
+/// `Err` unless `marker_version` is the one this build was made with.
+/// The message is what `read_cred` callers print; it names the repair.
+pub fn check_marker(marker_version: u32) -> Result<()> {
+    if marker_version != SETUP_VERSION {
+        return Err(anyhow!(
+            "setup marker version mismatch (have {marker_version}, expected \
+             {SETUP_VERSION}); re-run `srt-win install`",
+        ));
+    }
+    Ok(())
+}
+
+/// Why a plain `install` must not replace an install with this marker
+/// version (a newer build made it); `None` when it may proceed.
+pub fn newer_setup_refusal(marker_version: u32) -> Option<String> {
+    (marker_version > SETUP_VERSION).then(|| {
+        format!(
+            "existing install has setup version {marker_version}, newer than this \
+             build's {SETUP_VERSION}; not replacing it. Use the release that made it, \
+             or pass --force to replace it with this one."
+        )
+    })
+}
+
+/// The install record, only if its marker is this build's
+/// ([`check_marker`]): required before launching or keeping a grant.
+pub fn require_current_setup() -> Result<SetupInfo> {
+    let info = read_setup()?.ok_or_else(|| {
+        anyhow!(
+            "no sandbox-user setup record in the state store — run \
+             `srt-win install`"
+        )
+    })?;
+    check_marker(info.marker_version)?;
+    Ok(info)
+}
 
 #[derive(Debug, Clone)]
 pub struct SetupInfo {
@@ -363,20 +397,7 @@ impl Drop for SandboxCred {
 /// is DENY'd on it (and on the store directory) and so cannot call
 /// this to learn its own password.
 pub fn read_cred() -> Result<SandboxCred> {
-    let info = read_setup()?.ok_or_else(|| {
-        anyhow!(
-            "no sandbox-user setup record in the state store — run \
-             `srt-win install`"
-        )
-    })?;
-    if info.marker_version != SETUP_VERSION {
-        return Err(anyhow!(
-            "setup marker version mismatch (have {}, expected {}); \
-             re-run `srt-win install`",
-            info.marker_version,
-            SETUP_VERSION,
-        ));
-    }
+    let info = require_current_setup()?;
     let blob = read_cred_blob()?;
     let pw = String::from_utf8(dpapi::unprotect(&blob)?).context("password is not UTF-8")?;
     Ok(SandboxCred {
@@ -436,6 +457,7 @@ pub fn trust_ca(der: &crate::cert_store::CertDer, cred: &SandboxCred, sb_sid: &s
         None,
         &runner::RunnerCmd::InstallCa { der: der.clone() },
         false,
+        None,
     )
     .context("spawn runner for CA install")?;
     if code != 0 {
@@ -476,4 +498,24 @@ pub fn clear_setup() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_this_builds_marker_version_passes() {
+        assert!(check_marker(SETUP_VERSION).is_ok());
+        // Only a newer install is refused; an older one is upgraded.
+        assert!(newer_setup_refusal(SETUP_VERSION).is_none());
+        assert!(newer_setup_refusal(SETUP_VERSION - 1).is_none());
+        let why = newer_setup_refusal(SETUP_VERSION + 1).unwrap();
+        assert!(why.contains("newer than this build's"), "{why}");
+        for other in [0, SETUP_VERSION - 1, SETUP_VERSION + 1, 99] {
+            let e = check_marker(other).unwrap_err().to_string();
+            assert!(e.contains("marker version mismatch"), "{e}");
+            assert!(e.contains("re-run `srt-win install`"), "{e}");
+        }
+    }
 }

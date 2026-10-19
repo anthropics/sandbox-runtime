@@ -1087,22 +1087,6 @@ export const WindowsConfigSchema = z.object({
       'required to use the Windows sandbox — your own (multicall) binary, ' +
       'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
   ),
-  writeRestrictedToken: z
-    .boolean()
-    .optional()
-    .describe(
-      'Experimental, default false. Run the sandboxed child under a ' +
-        'write-restricted token (restricting SIDs: the sandbox account, ' +
-        'Everyone, RESTRICTED), so write access that `BUILTIN\\Users` / ' +
-        '`Authenticated Users` hold outside the allow-list (directories ' +
-        'created under `C:\\`, data-drive trees, PATH directories outside ' +
-        'Program Files) no longer reaches it. Reads are unaffected. Cost: ' +
-        'Schannel refuses restricted tokens, so System32 `curl.exe`, git ' +
-        'with the schannel backend, and .NET / PowerShell web requests ' +
-        'fail inside the sandbox (git is switched to its OpenSSL backend ' +
-        'automatically). If the token cannot be created the command ' +
-        'fails; there is no fallback to the ordinary token.',
-    ),
 })
 
 /**
