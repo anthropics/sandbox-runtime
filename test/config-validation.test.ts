@@ -226,6 +226,31 @@ describe('Config Validation', () => {
     }
   })
 
+  test('network.ambiguousRequestTarget takes its three values and no other', () => {
+    const parse = (ambiguousRequestTarget: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          ambiguousRequestTarget,
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+    for (const value of [
+      undefined,
+      'refuse',
+      'asSpelled',
+      'normalize',
+    ] as const) {
+      const result = parse(value)
+      expect(result.success).toBe(true)
+      expect(result.data?.network.ambiguousRequestTarget).toBe(value)
+    }
+    for (const value of ['', 'normalized', 'asspelled', true, null]) {
+      expect(parse(value).success).toBe(false)
+    }
+  })
+
   test('should validate config with enableWeakerNetworkIsolation', () => {
     const config = {
       network: {

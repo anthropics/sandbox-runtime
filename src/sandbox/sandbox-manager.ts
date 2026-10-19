@@ -434,25 +434,19 @@ const directLookup: DirectLookup =
     )
 
 /**
- * The request URL as it should appear in a model-visible violation line:
- * origin + path, with any query string reduced to a `?…` marker (origin
- * carries no userinfo, so an embedded `name:pass@` is dropped too). Query
- * strings routinely carry credentials (api_key=, access_token=, signed
- * URLs) that the sandboxed client interpolated at runtime and that were
- * never in the model's context, so they must not enter the transcript via
- * the <sandbox_violations> block. The full URL still reaches the embedder's
+ * The request URL as it should appear in a model-visible violation line: as
+ * spelled (parsed, a refused `/a/../b` would read `/b`), with a query string
+ * or fragment reduced to a `?…` or `#…` marker. (The proxy rebuilds the
+ * authority, so an embedded `name:pass@` is gone already.) Query strings
+ * routinely carry credentials (api_key=, access_token=, signed URLs) that
+ * the sandboxed client interpolated at runtime and that were never in the
+ * model's context, so they must not enter the transcript via the
+ * <sandbox_violations> block. The full URL still reaches the embedder's
  * filterRequest callback and its own debug logging.
  */
 function redactUrlForViolation(url: string): string {
-  try {
-    const u = new URL(url)
-    return `${u.origin}${u.pathname}${u.search ? '?…' : ''}`
-  } catch {
-    // Not an absolute URL (shouldn't happen for proxy requests) — drop
-    // anything after '?' rather than risk leaking it.
-    const q = url.indexOf('?')
-    return q === -1 ? url : `${url.slice(0, q)}?…`
-  }
+  const cut = url.search(/[?#]/)
+  return cut === -1 ? url : `${url.slice(0, cut + 1)}…`
 }
 
 /** Whether an ask-callback answer is one of the two documented denials. */
@@ -744,6 +738,7 @@ async function startMuxProxyServer(
     stripResponseHeaders: config?.network.stripResponseHeaders,
     refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
     requireHostMatch: config?.network.requireHostMatch,
+    ambiguousRequestTarget: config?.network.ambiguousRequestTarget,
     // Read at each CONNECT, so that updateConfig changes them.
     get maxTerminatedTunnels() {
       return config?.network.tlsTerminate?.maxTunnels

@@ -149,7 +149,9 @@ ids start at 1 and strictly increase.
 - `path` and `query` are the request target **as the client spelled it**:
   dot segments and percent escapes are not resolved. A decider that matches
   paths exactly therefore refuses an unusual spelling of an allowed path.
-  `query` is left out when there is none.
+  One that matches by prefix has to refuse dot segments (`..`, `%2e%2e`)
+  itself: `/public/../admin` begins with `/public/`, and the upstream may
+  resolve it. `query` is left out when there is none.
 - `headers` maps each lower-case header name to its values, in order, with
   `Host` apart.
 

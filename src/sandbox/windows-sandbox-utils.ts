@@ -2250,13 +2250,20 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // same precedence as the macOS/Linux `env -u … VAR=…
   // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
   // (which composes against setEnvVars) wins.
-  const overlay: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    PATHEXT: process.env.PATHEXT,
-    ...(p.setEnvVars ?? {}),
-    ...generated,
-    ...gitCfg,
-  }
+  // Merged ignoring case, as Windows reads names: a caller's
+  // `Https_Proxy` is the same variable as ours. Node's built-in clients
+  // read the proxy variables only with NODE_USE_ENV_PROXY set; it sits in
+  // the first layer, so a caller's value, in any case, wins.
+  const overlay = mergeWindowsEnv(
+    {
+      PATH: process.env.PATH,
+      PATHEXT: process.env.PATHEXT,
+      ...(p.httpProxyPort ? { NODE_USE_ENV_PROXY: '1' } : {}),
+    },
+    p.setEnvVars ?? {},
+    generated,
+    gitCfg,
+  )
   for (const [k, v] of Object.entries(overlay)) {
     if (v !== undefined) argv.push('--env', `${k}=${v}`)
   }
@@ -2290,6 +2297,43 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy).
   const env: NodeJS.ProcessEnv = { ...process.env, ...generated }
   return { argv, env }
+}
+
+/**
+ * The one spelling each proxy variable has in a sandboxed command's
+ * environment. Must match `PROXY_NAME_SPELLING` in launch.rs.
+ */
+const WINDOWS_PROXY_NAME_SPELLING: readonly string[] = [
+  'http_proxy',
+  'https_proxy',
+  'ftp_proxy',
+  'all_proxy',
+  'no_proxy',
+  'grpc_proxy',
+  'RSYNC_PROXY',
+]
+
+/**
+ * Merge environment layers ignoring case, as Windows reads names: a later
+ * layer's entry replaces an earlier one, name and value; an `undefined`
+ * value sets nothing. Two names that differ only by case in one block make
+ * .NET's `Process.Start` throw.
+ */
+export function mergeWindowsEnv(
+  ...layers: Readonly<Record<string, string | undefined>>[]
+): Record<string, string | undefined> {
+  const byName = new Map<string, [name: string, value: string | undefined]>()
+  for (const layer of layers) {
+    for (const [name, value] of Object.entries(layer)) {
+      if (value === undefined) continue
+      const folded = name.toUpperCase()
+      const spelling =
+        WINDOWS_PROXY_NAME_SPELLING.find(n => n.toUpperCase() === folded) ??
+        name
+      byName.set(folded, [spelling, value])
+    }
+  }
+  return Object.fromEntries(byName.values())
 }
 
 /**
