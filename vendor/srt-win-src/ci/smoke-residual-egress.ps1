@@ -1,28 +1,14 @@
 <#
-  Measurement rows for traffic the egress fence does not attribute to
-  the sandbox account, because a system component carries it:
+  Measurement rows for traffic the egress fence does not attribute to the
+  sandbox account, because a system component carries it (SMB redirector,
+  WSL).
 
-    SMB  - the kernel redirector connects for a UNC path, and the
-           child can present credentials other than its own.
-    WSL  - the WSL service runs a distribution whose traffic is
-           forwarded by the virtual switch or a host component.
+  Nothing here is an assertion: each row prints `RESIDUAL <name>: <observed>`
+  and the script exits non-zero only when it could not do its own work
+  (provisioning, a row's own code throwing, cleanup).
 
-  Nothing here is an assertion. Each row prints one line
-
-      RESIDUAL <name>: <observed>
-
-  and the script ends with a table of all of them. An observation,
-  whatever it is, never fails the script. The script exits non-zero
-  only when it could not do its own work: provisioning, a row's own
-  code throwing, or cleanup. Even then every remaining row still runs
-  and the table is still printed, and the failure is raised last.
-
-  The runner has no second machine, so the "remote" server is this
-  machine's own SMB server reached through a non-loopback address.
-
-  Self-contained: installs under a fixed test-only sublayer GUID
-  (distinct from the other smoke scripts, listed in cleanup.ps1) and
-  removes everything it created in `finally`.
+  The "remote" server is this machine's own SMB server reached through a
+  non-loopback address.
 #>
 param(
   [Parameter(Mandatory = $true, Position = 0)]
@@ -58,8 +44,7 @@ function Stdin { param([string[]] $argv, [string] $json)
   }
 }
 
-# Collapse to one line. wsl.exe writes UTF-16, which arrives here as
-# text with a NUL after every character, so NULs are dropped first.
+# wsl.exe writes UTF-16, which arrives with a NUL after every character.
 function OneLine { param([string] $s, [int] $Max = 500)
   $t = (("$s" -replace "`0", '') -replace '\s+', ' ').Trim()
   if ($t.Length -gt $Max) { $t = $t.Substring(0, $Max) + ' ...' }
@@ -77,10 +62,7 @@ function Record { param([string] $Name, [string] $Observed)
   Write-Host "RESIDUAL ${Name}: $o"
   $rows.Add([pscustomobject]@{ Row = $Name; Observed = $o })
 }
-# One row. The body returns the observation as a string. A body that
-# throws is this script failing, not an observation: it is recorded
-# in the row, the remaining rows still run, and the script fails at
-# the end.
+# A body that throws is this script failing, not an observation.
 function Row { param([string] $Name, [scriptblock] $Body)
   try {
     Record $Name ((& $Body | Out-String))
@@ -93,10 +75,7 @@ function Cleanup { param([string] $What, [scriptblock] $Body)
   try { & $Body } catch { $errors.Add("cleanup ($What): $_") }
 }
 
-# Run a command as the sandbox account through `srt-win exec`. The
-# broker forwards only what --env names, so PATH/PATHEXT are passed
-# as the other smoke scripts do. A timeout is returned, not thrown:
-# here a command that hangs is something to record.
+# A timeout is returned, not thrown: a command that hangs is something to record.
 function SbExec {
   param([string[]] $tail, [int] $TimeoutSec = 120, [string[]] $ExtraEnv = @())
   $argv = @('exec', '--quiet',
@@ -121,8 +100,7 @@ function SbExec {
     try { $p.Kill($true) } catch { }
     $null = $p.WaitForExit(10000)
   }
-  # Bounded: a process that outlives the broker and still holds the
-  # pipe must not hang the script.
+  # Bounded: a process that outlives the broker and holds the pipe must not hang this.
   $out = if ($so.Wait(10000)) { $so.Result } else { '' }
   $err = if ($se.Wait(10000)) { $se.Result } else { '' }
   $raw = $out + $err
@@ -142,13 +120,10 @@ function Detail { param($r)
   if ($r.timedOut) { return "timeout after $($r.timeout)s" }
   return "exit=$($r.exit); text: $(OneLine $r.out 300)"
 }
-# A read is allowed when the canary's content came back.
 function ReadVerdict { param($r)
   if ("$($r.out)" -match [regex]::Escape($CanaryToken)) { return 'allowed' }
   return 'denied'
 }
-# A write is allowed when the file is in the shared directory, seen
-# from this side, holding the nonce.
 function WriteVerdict { param([string] $File, [string] $Nonce)
   $p = Join-Path $shareDir $File
   if ((Test-Path -LiteralPath $p) -and
@@ -180,17 +155,14 @@ public static extern bool SetKernelObjectSecurity(
 function Win32Text { param([int] $Code)
   return "error $Code ($(([System.ComponentModel.Win32Exception]::new($Code)).Message))"
 }
-# The sandbox account opens by the path it is given, and cannot list
-# the runner's profile to resolve an 8.3 component of %TEMP%.
+# The sandbox account cannot resolve an 8.3 component of %TEMP% itself.
 function LongPath { param([string] $p)
   $sb = [System.Text.StringBuilder]::new(1024)
   if ([SrtResid.Native]::GetLongPathName($p, $sb, 1024) -gt 0) { return $sb.ToString() }
   return $p
 }
 
-# \Device\Mup, opened through the Win32 alias for the object
-# manager's root. Only security rights are requested, so no I/O is
-# done on the device.
+# \Device\Mup via the Win32 alias for the object manager's root; security rights only.
 $MupWin32Path = '\\.\GLOBALROOT\Device\Mup'
 $DACL_INFO    = 0x4
 function OpenMup { param([uint32] $Access)
@@ -210,8 +182,7 @@ function ReadMupDacl { param($h)
     $le = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
   }
   if (-not $ok) { throw (Win32Text $le) }
-  # Keep the bytes exactly as the system returned them: they are what
-  # the restore writes back.
+  # Kept byte for byte: this is what the restore writes back.
   $len = if ($needed -gt 0 -and $needed -le $buf.Length) { [int] $needed } else { $buf.Length }
   $out = [byte[]]::new($len)
   [Array]::Copy($buf, $out, $len)
@@ -225,8 +196,6 @@ function WriteMupDacl { param($h, [byte[]] $sd)
 function SddlOf { param([byte[]] $sd)
   return [System.Security.AccessControl.RawSecurityDescriptor]::new($sd, 0).GetSddlForm('Access')
 }
-# Put the descriptor read before the experiment back, and confirm the
-# device then reads back byte for byte the same.
 function RestoreMup {
   if (-not $script:mupOriginal) { return 'nothing to restore' }
   $h = OpenMup 0x00060000
@@ -269,9 +238,7 @@ try {
   if (-not $sbSid) { throw 'setup marker missing user_sid' }
   Write-Host "setup: sandbox account provisioned (sid=$sbSid)"
 
-  # The workspace: the one directory the sandbox account is granted.
-  # Probe scripts and their output live here. The shared directory is
-  # a sibling and is not part of the grant.
+  # The one directory the sandbox account is granted; the share is a sibling outside it.
   $ws = Join-Path $env:TEMP "srt-resid-ws-$([guid]::NewGuid().ToString('N'))"
   New-Item -ItemType Directory -Path $ws -Force | Out-Null
   $ws = LongPath $ws
@@ -289,8 +256,7 @@ try {
     New-Item -ItemType Directory -Path $shareDir -Force | Out-Null
     $shareDir = LongPath $shareDir
     $CanaryToken | Set-Content -Encoding ASCII (Join-Path $shareDir 'canary.txt')
-    # Everyone may modify, on the directory and on the share, so that
-    # neither the file ACL nor the share ACL is what decides a row.
+    # Everyone may modify, so neither the file ACL nor the share ACL decides a row.
     & icacls $shareDir /grant '*S-1-1-0:(OI)(CI)M' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "icacls on the shared directory exited $LASTEXITCODE" }
     $everyone = ([System.Security.Principal.SecurityIdentifier] 'S-1-1-0').Translate(
@@ -317,7 +283,6 @@ try {
     Write-Host "setup: SMB setup FAILED: $_"
   }
 
-  # Without these the rows cannot run; each still gets its line.
   $noRemote = if (-not $smbReady) { "not attempted: SMB setup failed: $smbWhy" }
               elseif (-not $addr) { 'not attempted: no non-loopback local IPv4 address found' }
               else { $null }
@@ -325,9 +290,7 @@ try {
   $unc      = "\\$addr\$shareName"
   $uncLoop  = "\\127.0.0.1\$shareName"
 
-  # Controls. If the administrator cannot read the share through the
-  # address, or the sandbox account can read the directory by its
-  # local path, the rows below mean something different.
+  # Controls: if either fails, the rows below mean something different.
   Row 'smb-control-admin-unc-read' {
     if ($noRemote) { return $noRemote }
     try {
@@ -359,9 +322,7 @@ try {
   }
 
   # ── (c) net use with the temporary account, then read and write ──
-  # One exec: a mapping belongs to the logon session that made it,
-  # and every exec is a new logon session. The mapping is deleted by
-  # the same command.
+  # One exec: a mapping belongs to its logon session, and every exec is a new one.
   Row 'smb-c-net-use-explicit-credentials' {
     if ($noRemote) { return $noRemote }
     $n = NewNonce
@@ -382,11 +343,7 @@ echo NETUSE_DELETE_EXIT=%errorlevel%
   }
 
   # ── (d) a process started with network-only credentials ─────────
-  # The child calls CreateProcessWithLogonW with
-  # LOGON_NETCREDENTIALS_ONLY (2): the new process keeps the caller's
-  # local identity and presents the temporary account to servers. It
-  # is started by the Secondary Logon service, so its output is
-  # collected through a file in the workspace.
+  # LOGON_NETCREDENTIALS_ONLY: started by seclogon, so output comes back through a file.
   Row 'smb-d-network-only-credentials' {
     if ($noRemote) { return $noRemote }
     $n = NewNonce
@@ -470,17 +427,12 @@ public static extern bool CloseHandle(IntPtr h);
     "$(ReadVerdict $r); $(Detail $r)"
   }
 
-  # ── EXPERIMENT: a deny entry for the sandbox account on ──────────
-  #    \Device\Mup. Not a mechanism the product uses. It changes a
-  #    machine-wide object, so the original descriptor is put back in
-  #    this row's own finally, and again in the outer finally if that
-  #    did not happen.
+  # ── EXPERIMENT: a deny entry for the sandbox account on \Device\Mup ──
+  # Changes a machine-wide object: restored in this row's finally and the outer one.
   Row 'smb-EXPERIMENT-mup-deny-ace' {
     $api = 'CreateFileW(\\.\GLOBALROOT\Device\Mup) + GetKernelObjectSecurity/SetKernelObjectSecurity(DACL)'
     $h = $null
     try { $h = OpenMup 0x00060000 } catch {
-      # Not openable for READ_CONTROL|WRITE_DAC. Record whether it can
-      # at least be read.
       $openErr = "$_"
       try {
         $hr = OpenMup 0x00020000
@@ -535,8 +487,7 @@ public static extern bool CloseHandle(IntPtr h);
   }
 
   # ── WSL ──────────────────────────────────────────────────────────
-  # Read-only. Nothing is imported, and no registry value or COM
-  # permission is changed. WSL_UTF8 asks wsl.exe for UTF-8 output.
+  # Read-only. WSL_UTF8 asks wsl.exe for UTF-8 output.
   Row 'wsl-exe-as-sandbox' {
     $r = SbExec @('--', $cmd, '/c',
       "where wsl.exe & if exist `"$wsl`" (echo SYSTEM32_WSL=present) else (echo SYSTEM32_WSL=absent)")
@@ -556,9 +507,7 @@ public static extern bool CloseHandle(IntPtr h);
     }
     $parts -join '; '
   }
-  # As Administrator: AppID entries that name WSL, and whether each
-  # carries its own launch or access permission value. Presence only;
-  # the keys are opened read-only and no value's bytes are printed.
+  # Presence only: the keys are opened read-only and no value's bytes are printed.
   Row 'wsl-com-appid-permissions' {
     $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
       [Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
@@ -603,13 +552,10 @@ catch {
   Write-Host "smoke-residual-egress: ERROR: $_"
 }
 finally {
-  # Everything below runs whatever happened above, and each step runs
-  # whether or not the one before it worked.
   Cleanup 'restore the \Device\Mup descriptor' {
     if ($script:mupOriginal) { Write-Host "cleanup: \Device\Mup: $(RestoreMup)" }
   }
-  # A mapping made by a child went with the child's logon session;
-  # this removes one in the script's own session, should there be one.
+  # A child's mapping went with its logon session; this removes one of the script's own.
   Cleanup 'remove net use mappings' {
     foreach ($a in @($addr, '127.0.0.1')) {
       if ($a) { & net.exe use "\\$a\$shareName" /delete /y 2>&1 | Out-Null }

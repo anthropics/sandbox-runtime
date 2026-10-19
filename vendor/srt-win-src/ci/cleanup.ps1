@@ -62,8 +62,7 @@ if (-not (Test-Path $Exe)) {
 # them, so this only matters if a smoke script threw mid-section.
 & $Exe uninstall --sublayer-guid $InstallSublayer
 Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
-# smoke-residual-egress.ps1 removes its share and account in its own
-# `finally`; this covers a run that was killed before reaching it.
+# Covers a smoke-residual-egress.ps1 run killed before its own `finally`.
 Get-SmbShare -Name 'srtresid*' | Remove-SmbShare -Force -Confirm:$false
 Get-LocalUser -Name 'srt-resid-*' | Remove-LocalUser
 Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue
