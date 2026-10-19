@@ -465,7 +465,7 @@ export interface WindowsSandboxParams {
   /**
    * The session's `network.allowLocalBinding`. `srt-win exec` launches
    * nothing (exit 19) unless the install recorded the same mode. When
-   * true, with a proxy, `NO_PROXY` names the loopback hosts.
+   * true, with a proxy, `no_proxy` names the loopback hosts.
    */
   allowLoopback?: boolean
   /**
@@ -2524,9 +2524,9 @@ export function revokeWindowsAcl(opts: {
 // ────────────────────────────────────────────────────────────────────
 
 /**
- * `NO_PROXY` for a sandboxed child with `network.allowLocalBinding`:
+ * `no_proxy` for a sandboxed child with `network.allowLocalBinding`:
  * the loopback hosts, so proxy-aware clients connect to local servers
- * directly. Otherwise `NO_PROXY` is not set at all.
+ * directly. Otherwise `no_proxy` is not set at all.
  */
 export const WINDOWS_LOOPBACK_NO_PROXY = 'localhost,127.0.0.1,::1'
 
@@ -2593,7 +2593,6 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // With loopback open the fence permits direct loopback connects, so the
   // loopback hosts (only: private networks are still fenced) skip the proxy.
   if (p.allowLoopback && (p.httpProxyPort || p.socksProxyPort)) {
-    generated.NO_PROXY = WINDOWS_LOOPBACK_NO_PROXY
     generated.no_proxy = WINDOWS_LOOPBACK_NO_PROXY
   }
 
@@ -2625,21 +2624,20 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // same precedence as the macOS/Linux `env -u … VAR=…
   // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
   // (which composes against setEnvVars) wins.
-  // Node's built-in clients read the proxy variables only when this is
-  // set. It is no security variable: a caller's value, in any case, wins.
-  const callerSetsNodeProxy = Object.keys(p.setEnvVars ?? {}).some(
-    k => k.toUpperCase() === 'NODE_USE_ENV_PROXY',
+  // Merged ignoring case, as Windows reads names: a caller's
+  // `Https_Proxy` is the same variable as ours. Node's built-in clients
+  // read the proxy variables only with NODE_USE_ENV_PROXY set; it sits in
+  // the first layer, so a caller's value, in any case, wins.
+  const overlay = mergeWindowsEnv(
+    {
+      PATH: process.env.PATH,
+      PATHEXT: process.env.PATHEXT,
+      ...(p.httpProxyPort ? { NODE_USE_ENV_PROXY: '1' } : {}),
+    },
+    p.setEnvVars ?? {},
+    generated,
+    gitCfg,
   )
-  const overlay: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    PATHEXT: process.env.PATHEXT,
-    ...(p.httpProxyPort && !callerSetsNodeProxy
-      ? { NODE_USE_ENV_PROXY: '1' }
-      : {}),
-    ...(p.setEnvVars ?? {}),
-    ...generated,
-    ...gitCfg,
-  }
   for (const [k, v] of Object.entries(overlay)) {
     if (v !== undefined) argv.push('--env', `${k}=${v}`)
   }
@@ -2673,6 +2671,43 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy).
   const env: NodeJS.ProcessEnv = { ...process.env, ...generated }
   return { argv, env }
+}
+
+/**
+ * The one spelling each proxy variable has in a sandboxed command's
+ * environment. Must match `PROXY_NAME_SPELLING` in launch.rs.
+ */
+const WINDOWS_PROXY_NAME_SPELLING: readonly string[] = [
+  'http_proxy',
+  'https_proxy',
+  'ftp_proxy',
+  'all_proxy',
+  'no_proxy',
+  'grpc_proxy',
+  'RSYNC_PROXY',
+]
+
+/**
+ * Merge environment layers ignoring case, as Windows reads names: a later
+ * layer's entry replaces an earlier one, name and value; an `undefined`
+ * value sets nothing. Two names that differ only by case in one block make
+ * .NET's `Process.Start` throw.
+ */
+export function mergeWindowsEnv(
+  ...layers: Readonly<Record<string, string | undefined>>[]
+): Record<string, string | undefined> {
+  const byName = new Map<string, [name: string, value: string | undefined]>()
+  for (const layer of layers) {
+    for (const [name, value] of Object.entries(layer)) {
+      if (value === undefined) continue
+      const folded = name.toUpperCase()
+      const spelling =
+        WINDOWS_PROXY_NAME_SPELLING.find(n => n.toUpperCase() === folded) ??
+        name
+      byName.set(folded, [spelling, value])
+    }
+  }
+  return Object.fromEntries(byName.values())
 }
 
 /**
