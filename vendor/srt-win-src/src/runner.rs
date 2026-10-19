@@ -72,6 +72,11 @@ pub struct RunnerSpec {
     /// Build the child token write-restricted (see [`crate::token`]).
     #[serde(default)]
     pub write_restricted_token: bool,
+    /// Capability SIDs of the session's write roots (`crate::persist`),
+    /// added to the child token's restricting SIDs. Only with
+    /// `write_restricted_token`.
+    #[serde(default)]
+    pub capability_sids: Vec<String>,
 }
 
 /// Read a 4-byte little-endian length prefix followed by that many
@@ -131,6 +136,7 @@ pub fn run() -> Result<u32> {
                 &spec.argv[1..],
                 &spec.env_overlay,
                 spec.write_restricted_token,
+                &spec.capability_sids,
             )
         }
         RunnerCmd::InstallCa { der } => {
@@ -155,6 +161,7 @@ mod tests {
             argv: vec!["cmd.exe".into(), "/c".into(), "echo hi".into()],
             env_overlay: vec![("PATH".into(), r"C:\a;C:\b".into())],
             write_restricted_token: true,
+            capability_sids: vec!["S-1-0-1936880739-1-2-3-4".into()],
         });
         let bytes = encode_cmd(&s).unwrap();
         assert_eq!(
@@ -167,13 +174,17 @@ mod tests {
                 assert_eq!(r.argv, ["cmd.exe", "/c", "echo hi"]);
                 assert_eq!(r.env_overlay.len(), 1);
                 assert!(r.write_restricted_token);
+                assert_eq!(r.capability_sids, ["S-1-0-1936880739-1-2-3-4"]);
             }
             _ => panic!("wrong variant"),
         }
-        // A spec without the field is the default token.
+        // A spec without the field is the ordinary token.
         let legacy = br#"{"Exec":{"argv":["cmd.exe"],"env_overlay":[]}}"#;
         match serde_json::from_slice::<RunnerCmd>(legacy).unwrap() {
-            RunnerCmd::Exec(r) => assert!(!r.write_restricted_token),
+            RunnerCmd::Exec(r) => {
+                assert!(!r.write_restricted_token);
+                assert!(r.capability_sids.is_empty());
+            }
             _ => panic!("wrong variant"),
         }
         let ca = RunnerCmd::InstallCa {

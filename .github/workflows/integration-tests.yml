@@ -131,6 +131,20 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-machine-store.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
+      # Before the TS suite, with the other smokes: this is the child
+      # token and the kept write grants the library uses by default.
+      - name: Smoke-test srt-win write-restricted token (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-write-restricted.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
+
+      # On a made-up profile tree, never the runner's own: only the
+      # test-hooks build can be pointed at one.
+      - name: Smoke-test srt-win profile read grant (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win-src/ci/smoke-profile-read.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
+
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -140,6 +154,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
+          # A made-up profile for the suite (test-hooks build only),
+          # outside the temp directory and the checkout.
+          $env:SRT_WIN_TEST_PROFILE = Join-Path $env:RUNNER_TEMP 'srt-ts-profile'
+          New-Item -ItemType Directory -Force -Path $env:SRT_WIN_TEST_PROFILE | Out-Null
+          $env:SRT_WIN_TEST_HOOKS_EXE = (Resolve-Path 'vendor\srt-win-src\target\test-hooks\release\srt-win.exe').Path
           npm ci
           npm run build
           # These are listed explicitly because the non-Windows legs run the
@@ -148,12 +167,6 @@ jobs:
           # block that runs on no other leg, and config-validation covers the
           # schema on a real Windows host rather than under a platform spy.
           bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
-
-      # After the TS suite, so a failing row here does not skip the steps above.
-      - name: Smoke-test srt-win write-restricted token (Windows)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        run: pwsh vendor/srt-win-src/ci/smoke-write-restricted.ps1 vendor\srt-win-src\target\release\srt-win.exe vendor\srt-win-src\target\test-hooks\release\srt-win.exe
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'

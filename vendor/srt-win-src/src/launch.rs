@@ -134,6 +134,7 @@ pub fn run_lockdown(
     target_args: &[String],
     env_overlay: &[(String, String)],
     write_restricted: bool,
+    capability_sids: &[String],
 ) -> Result<u32> {
     // 1) Self-protect: rewrite this process's DACL so the child can't
     //    `OpenProcess` us. The child shares the runner's user SID, so
@@ -158,7 +159,7 @@ pub fn run_lockdown(
     //    below closes whatever was already opened.
     let self_tok = OwnedHandle(open_self_token()?);
     let restricted = OwnedHandle(
-        token::make_sandbox_token(self_tok.raw(), write_restricted)
+        token::make_sandbox_token(self_tok.raw(), write_restricted, capability_sids)
             .context("make_sandbox_token")?,
     );
     let primary = OwnedHandle(to_primary(restricted.raw()).context("to_primary")?);
