@@ -898,10 +898,149 @@ try {
   Remove-Item -Recurse -Force $gRoot -ErrorAction SilentlyContinue
 }
 
+# ── S-rows: Secondary Logon (seclogon) preflight + typed failure ─
+# Reconfigures a machine-wide service: runs last and restores it in `finally`.
+function Seclogon-State {
+  return (J @('status','--sublayer-guid',$Sublayer)).user.seclogon
+}
+function Seclogon-Err {
+  param([string] $text)
+  $line = ($text -split "`r?`n") |
+    Where-Object { $_ -match '^\s*\{.*"code"\s*:\s*"seclogon_disabled"' } |
+    Select-Object -First 1
+  if (-not $line) { return $null }
+  return $line | ConvertFrom-Json
+}
+# seclogon refuses STOP briefly after each launch (1052) and while a process it launched lives.
+function Stop-Seclogon {
+  param([int] $TimeoutSec = 60)
+  $start    = [DateTime]::UtcNow
+  $deadline = $start.AddSeconds($TimeoutSec)
+  $swept    = $false
+  $last     = ''
+  while ($true) {
+    $s = Get-Service seclogon
+    if ($s.Status -eq 'Stopped') { return }
+    # CanStop is not consulted: it can stay false while a stop is accepted.
+    try { Stop-Service seclogon -Force -ErrorAction Stop; return } catch { $last = "$_" }
+    if (-not $swept -and ([DateTime]::UtcNow - $start).TotalSeconds -ge 5) {
+      $swept = $true
+      $left = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue |
+                Where-Object { $_.UserName -like '*\srt-sandbox' })
+      Write-Host "S: seclogon not stoppable after 5s; processes owned by the sandbox account: $(
+        if ($left) { ($left | ForEach-Object { "$($_.ProcessName)#$($_.Id)" }) -join ', ' } else { '(none)' })"
+      foreach ($p in $left) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    } elseif ([DateTime]::UtcNow -ge $deadline) {
+      $q = (& sc.exe queryex seclogon 2>&1 | Out-String) -replace '\s+', ' '
+      throw "seclogon: not accepting STOP after ${TimeoutSec}s (Status=$($s.Status)); last error: $last; sc queryex: $q"
+    }
+    Start-Sleep -Milliseconds 20
+  }
+}
+$slSvc        = Get-Service seclogon
+$slStartType  = [string]$slSvc.StartType
+$slWasRunning = $slSvc.Status -eq 'Running'
+Write-Host "S: seclogon before: StartType=$slStartType Status=$($slSvc.Status)"
+$slSkipped = $false
+try {
+  # ── S1: Manual + stopped → ok; the launch demand-starts it ─────
+  Set-Service seclogon -StartupType Manual
+  # Unstoppable where this session itself came through seclogon: rows skipped by name.
+  try { Stop-Seclogon -TimeoutSec 20 } catch { throw "SECLOGON-UNSTOPPABLE: $_" }
+  $st = Seclogon-State
+  if ($st -ne 'ok') { throw "S1: Manual+stopped expected seclogon=ok, got '$st'" }
+  $r = RExec @('--', $cmd, '/c', 'echo S1-RAN')
+  if ($r.exit -ne 0 -or $r.out -notmatch 'S1-RAN') {
+    throw "S1: exec under Manual+stopped seclogon failed (exit $($r.exit)). raw: $($r.raw)"
+  }
+  Write-Host 'S1 ok: Manual+stopped reports ok and exec demand-starts the service'
+
+  # ── S2: Disabled but still running → ok (and it does launch) ───
+  if ((Get-Service seclogon).Status -eq 'Running') {
+    Set-Service seclogon -StartupType Disabled
+    $st = Seclogon-State
+    if ($st -ne 'ok') { throw "S2: Disabled+running expected seclogon=ok, got '$st'" }
+    $r = RExec @('--', $cmd, '/c', 'echo S2-RAN')
+    if ($r.exit -ne 0 -or $r.out -notmatch 'S2-RAN') {
+      throw "S2: preflight said ok but exec failed under Disabled+running seclogon (exit $($r.exit)). raw: $($r.raw)"
+    }
+    Write-Host 'S2 ok: Disabled+running reports ok and exec still launches'
+  } else {
+    Write-Host 'S2 skipped: seclogon not running after S1'
+  }
+
+  # ── S3: Disabled + stopped → status disabled; typed exit 18 ────
+  # Stop-Service refuses a Disabled service: stop under Manual, then disable.
+  Set-Service seclogon -StartupType Manual
+  Stop-Seclogon
+  (Get-Service seclogon).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+  Set-Service seclogon -StartupType Disabled
+  $st = Seclogon-State
+  if ($st -ne 'disabled') { throw "S3: Disabled+stopped expected seclogon=disabled, got '$st'" }
+  $st = (J @('user','status')).seclogon
+  if ($st -ne 'disabled') { throw "S3: user status expected seclogon=disabled, got '$st'" }
+
+  $r = RExec @('--', $cmd, '/c', 'echo S3-RAN')
+  if ($r.exit -ne 18) {
+    throw "S3: exec expected exit 18 (seclogon_disabled), got $($r.exit). raw: $($r.raw)"
+  }
+  if ($r.raw -match 'S3-RAN') {
+    throw "S3: the command RAN with seclogon disabled (fail-open). raw: $($r.raw)"
+  }
+  $e = Seclogon-Err $r.raw
+  if (-not $e) { throw "S3: exec stderr has no seclogon_disabled JSON line. raw: $($r.raw)" }
+  if ($e.state -ne 'disabled') { throw "S3: exec error state '$($e.state)', expected disabled" }
+  if ($e.message -notmatch 'startup type to Manual') {
+    throw "S3: exec error message lacks the fix: $($e.message)"
+  }
+  Write-Host "S3 ok: exec exits 18 with seclogon_disabled ($($e.message))"
+
+  # ── S3b: wfp verify — same typed failure, no stdout verdict ────
+  $vErrFile = Join-Path ([System.IO.Path]::GetTempPath()) "srt-smoke-s3b-$PID.err"
+  $vout  = & $Exe wfp verify --target '127.0.0.1:9' 2>$vErrFile
+  $vexit = $LASTEXITCODE
+  $verr  = Get-Content -Raw $vErrFile -ErrorAction SilentlyContinue
+  Remove-Item $vErrFile -ErrorAction SilentlyContinue
+  if ($vexit -ne 18) {
+    throw "S3b: wfp verify expected exit 18, got $vexit. stdout: '$vout' stderr: $verr"
+  }
+  if ($vout) {
+    throw "S3b: wfp verify printed a probe verdict without launching: '$vout'"
+  }
+  if (-not (Seclogon-Err $verr)) {
+    throw "S3b: wfp verify stderr has no seclogon_disabled JSON line. stderr: $verr"
+  }
+  Write-Host 'S3b ok: wfp verify exits 18 with seclogon_disabled'
+} catch {
+  if ("$_" -notlike 'SECLOGON-UNSTOPPABLE:*') { throw }
+  $slSkipped = $true
+  Write-Host "S1-S3 SKIPPED: the Secondary Logon service cannot be stopped on this machine. $_"
+} finally {
+  # Warn rather than throw so an S-row failure above is not masked; S4 is the check.
+  try {
+    Set-Service seclogon -StartupType $slStartType
+    if ($slWasRunning) { Start-Service seclogon } else { Stop-Seclogon }
+  } catch {
+    Write-Host "S: WARNING: restoring seclogon (StartType=$slStartType running=$slWasRunning): $_"
+  }
+  $slNow = Get-Service seclogon
+  Write-Host "S: seclogon after:  StartType=$($slNow.StartType) Status=$($slNow.Status)"
+}
+
+# ── S4: restored — status ok and exec launches again ─────────────
+$st = Seclogon-State
+if ($st -ne 'ok') { throw "S4: after restore expected seclogon=ok, got '$st'" }
+$r = RExec @('--', $cmd, '/c', 'echo S4-RAN')
+if ($r.exit -ne 0 -or $r.out -notmatch 'S4-RAN') {
+  throw "S4: exec after restoring seclogon failed (exit $($r.exit)). raw: $($r.raw)"
+}
+Write-Host 'S4 ok: seclogon restored; exec launches again'
+
 # ── teardown ─────────────────────────────────────────────────────
 Run @('uninstall','--sublayer-guid',$Sublayer)
 $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, R13, R14, G1-G6/G3b)'
+$slRows = if ($slSkipped) { 'S4; S1-S3 SKIPPED' } else { 'S1-S4' }
+Write-Host "smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, R13, R14, G1-G6/G3b, $slRows)"

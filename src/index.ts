@@ -106,6 +106,8 @@ export type {
   WindowsSandboxStatus,
   WindowsBinShell,
   MappedDriveCwdError,
+  SeclogonDisabledError,
+  WindowsSeclogonState,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,

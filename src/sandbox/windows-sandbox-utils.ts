@@ -157,6 +157,11 @@ export type WindowsSandboxErrorCode =
    * the failing root on `.drive` ({@link MappedDriveCwdError}).
    */
   | 'mapped_drive_cwd'
+  /**
+   * The Secondary Logon service (`seclogon`) is disabled or absent; `srt-win`
+   * launch subcommands exit **18** ({@link SeclogonDisabledError}).
+   */
+  | 'seclogon_disabled'
 
 /**
  * Error thrown by the Windows sandbox backend. Carries a stable
@@ -228,6 +233,13 @@ export interface WindowsWfpVerifyResult {
 }
 
 /**
+ * Readiness of the Secondary Logon service every launch goes through. `ok`
+ * covers a stopped Manual service (the launch demand-starts it);
+ * `cannot-read` is not proof of a problem.
+ */
+export type WindowsSeclogonState = 'ok' | 'disabled' | 'missing' | 'cannot-read'
+
+/**
  * State of the `srt-sandbox` local account that `srt-win install`
  * provisions. The sandboxed child runs **as** this account.
  */
@@ -272,6 +284,8 @@ export interface WindowsSandboxUserStatus {
   caCertThumb?: string
   /** PEM-encoded install-time CA certificate, when present. */
   caCertPem?: string
+  /** Secondary Logon readiness. Absent when `srt-win` predates the field. */
+  seclogon?: WindowsSeclogonState
   /**
    * Set when write grants kept between sessions exist (`present`) or
    * cannot be ruled out (`unknown`); `srt-win` then refuses to run a
@@ -1021,6 +1035,8 @@ type RawUserStatus = {
   real_user_sid: string
   ca_cert_thumb?: string | null
   ca_cert_pem?: string | null
+  /** Absent from an `srt-win` that predates the field. */
+  seclogon?: string
   /** Absent from an `srt-win` that keeps no grants between sessions. */
   persistent_grants?: {
     state: string
@@ -1104,6 +1120,13 @@ export function windowsSrtWinOutdatedError(
   )
 }
 
+const SECLOGON_STATES: readonly string[] = [
+  'ok',
+  'disabled',
+  'missing',
+  'cannot-read',
+] satisfies WindowsSeclogonState[]
+
 function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
   return {
     provisioned: raw.user.exists,
@@ -1123,6 +1146,10 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
     realUserSid: raw.real_user_sid,
     ...(raw.ca_cert_thumb && { caCertThumb: raw.ca_cert_thumb }),
     ...(raw.ca_cert_pem && { caCertPem: raw.ca_cert_pem }),
+    ...(raw.seclogon !== undefined &&
+      SECLOGON_STATES.includes(raw.seclogon) && {
+        seclogon: raw.seclogon as WindowsSeclogonState,
+      }),
     // Anything but an explicit "none" counts: a state this code does
     // not know must not read as "no grants".
     ...(raw.persistent_grants &&
@@ -1152,6 +1179,35 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
         },
       }),
   }
+}
+
+/** User-facing text for a disabled/absent Secondary Logon service. */
+function seclogonDisabledMessage(state: 'disabled' | 'missing'): string {
+  return state === 'missing'
+    ? `The Windows Secondary Logon service (seclogon) is not present ` +
+        `on this machine; the sandbox cannot start without it.`
+    : `The Windows Secondary Logon service (seclogon) is disabled; an ` +
+        `administrator must set its startup type to Manual (\`sc.exe ` +
+        `config seclogon start= demand\`). The sandbox cannot start ` +
+        `without it.`
+}
+
+/** `srt-win` exit code for a `seclogon_disabled` launch failure. */
+const SRT_WIN_EXIT_SECLOGON_DISABLED = 18
+
+/**
+ * The typed `seclogon_disabled` error for an `srt-win` launch result, if it
+ * is one. Gated on the exit code first: the child's own stderr could match.
+ */
+function seclogonDisabledFrom(
+  r: { status: number | null; stderr: string },
+  subcommand: string,
+): SeclogonDisabledError | undefined {
+  if (r.status !== SRT_WIN_EXIT_SECLOGON_DISABLED) return undefined
+  const e = parseSrtWinLaunchError(r.stderr, subcommand)
+  return e?.code === 'seclogon_disabled'
+    ? (e as SeclogonDisabledError)
+    : undefined
 }
 
 /** Combined result of `srt-win status` — see {@link checkWindowsSandboxStatus}. */
@@ -1308,6 +1364,10 @@ export async function verifyWindowsWfpEgress(
     logForDebugging(
       `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
     )
+    // Exit 18 comes with empty stdout: report the typed failure, not
+    // the unparseable-output fallthrough below.
+    const seclogon = seclogonDisabledFrom(r, 'wfp')
+    if (seclogon) throw seclogon
     let raw: { egress_probe: string; target: string }
     try {
       raw = JSON.parse(r.stdout)
@@ -1446,6 +1506,8 @@ function checkTrustCaResult(caCertPath: string, r: RunResult): void {
   logForDebugging(
     `[Sandbox Windows] user trust-ca exit=${r.status}: ${r.stderr || r.stdout}`,
   )
+  const seclogon = seclogonDisabledFrom(r, 'user')
+  if (seclogon) throw seclogon
   if (r.status !== 0) {
     throw new WindowsSandboxError(
       'trust_ca_failed',
@@ -2471,11 +2533,18 @@ export interface MappedDriveCwdError extends WindowsSandboxError {
   readonly drive?: string
 }
 
+/** {@link WindowsSandboxError} narrowed to `seclogon_disabled`. */
+export interface SeclogonDisabledError extends WindowsSandboxError {
+  readonly code: 'seclogon_disabled'
+  readonly state: 'disabled' | 'missing'
+}
+
 /**
  * Parse a structured `srt-win exec` error from its stderr. `exec`
  * emits typed launch failures as a single JSON line
  * `{"code":…,"message":…}` alongside a distinct exit code —
- * `mapped_drive_cwd` is exit **16**. Embedders that spawn the
+ * `mapped_drive_cwd` is exit **16**, `seclogon_disabled` is exit
+ * **18**. Embedders that spawn the
  * `{argv, env}` from {@link wrapCommandWithSandboxWindows} call
  * this on non-zero exit to surface an actionable
  * {@link WindowsSandboxError} instead of a bare status.
@@ -2490,6 +2559,19 @@ export function parseWindowsSandboxError(
   stderr: string,
 ):
   | MappedDriveCwdError
+  | SeclogonDisabledError
+  | (WindowsSandboxError & { drive?: undefined })
+  | undefined {
+  return parseSrtWinLaunchError(stderr, 'exec')
+}
+
+/** {@link parseWindowsSandboxError} for any runner-launching subcommand. */
+function parseSrtWinLaunchError(
+  stderr: string,
+  subcommand: string,
+):
+  | MappedDriveCwdError
+  | SeclogonDisabledError
   | (WindowsSandboxError & { drive?: undefined })
   | undefined {
   for (const line of stderr.split(/\r?\n/)) {
@@ -2500,6 +2582,7 @@ export function parseWindowsSandboxError(
         code?: string
         message?: string
         drive?: string
+        state?: string
       }
       // Exit 25: the command needed the lock a profile grant or forget
       // is holding.
@@ -2528,10 +2611,21 @@ export function parseWindowsSandboxError(
           new WindowsSandboxError(
             'mapped_drive_cwd',
             j.message ?? 'mapped/network-drive working directory',
-            'exec',
+            subcommand,
           ),
           { drive: j.drive },
         ) as MappedDriveCwdError
+      }
+      if (j.code === 'seclogon_disabled') {
+        const state = j.state === 'missing' ? 'missing' : 'disabled'
+        return Object.assign(
+          new WindowsSandboxError(
+            'seclogon_disabled',
+            j.message ?? seclogonDisabledMessage(state),
+            subcommand,
+          ),
+          { state },
+        ) as SeclogonDisabledError
       }
     } catch {
       // not our line
@@ -3999,6 +4093,17 @@ function interpretDependencyProbes(
     // not a missing sandbox, so its own wording.
     reinstallRequired = windowsSetupVersionMismatch(us, sublayerGuid)
     if (reinstallRequired) errors.push(reinstallRequired)
+  }
+
+  // 2b. Secondary Logon service usable: every launch goes through it.
+  // Field absent (older srt-win) → no opinion.
+  if (us.seclogon === 'disabled' || us.seclogon === 'missing') {
+    errors.push(seclogonDisabledMessage(us.seclogon))
+  } else if (us.seclogon === 'cannot-read') {
+    logForDebugging(
+      `[Sandbox Windows] Secondary Logon (seclogon) state cannot-read; ` +
+        `a launch will show whether it is usable`,
+    )
   }
 
   // 3. WFP filters installed under the sublayer. BFE enumeration is
