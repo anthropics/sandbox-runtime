@@ -62,6 +62,7 @@ import {
   ensurePersistentWindowsCa,
   windowsStateDir,
   wrapCommandWithSandboxWindows,
+  mergeWindowsEnv,
   parseWindowsBinShell,
   rankWindowsFsAccess,
   resolveSrtWin,
@@ -324,6 +325,26 @@ async function runSandboxed(
 
 type RunResult = { stdout: string; stderr: string; status: number | null }
 
+/** The names that are in `names` more than once ignoring case. */
+function repeatedIgnoringCase(names: string[]): string[] {
+  const seen = new Set<string>()
+  const repeated = new Set<string>()
+  for (const name of names) {
+    const folded = name.toUpperCase()
+    if (seen.has(folded)) repeated.add(folded)
+    seen.add(folded)
+  }
+  return [...repeated]
+}
+
+/** The variable names in the output of cmd's `set`. */
+function namesInSetOutput(out: string): string[] {
+  return out
+    .split(/\r?\n/)
+    .filter(line => /^[^=]+=/.test(line))
+    .map(line => line.slice(0, line.indexOf('=')))
+}
+
 /**
  * Run a sandboxed command up to `attempts` times until `ok` holds.
  * For ALLOW rows only (they hit live hosts; a registry/network blip
@@ -523,7 +544,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     // proxy set. Values follow each --env as KEY=VALUE.
     const envArgs = on.argv.filter((_, i) => on.argv[i - 1] === '--env')
     expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
-    expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
+    expect(envArgs).toContain('http_proxy=http://localhost:60080')
     // No caCertPath passed → CA-bundle vars absent from the overlay.
     // (G1 below covers the caCertPath-set case.)
     expect(envArgs.some(e => e.startsWith('NODE_EXTRA_CA_CERTS='))).toBe(false)
@@ -665,7 +686,61 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(envArgs.some(e => e.startsWith('NO_PROXY='))).toBe(false)
     expect(envArgs.some(e => e.startsWith('no_proxy='))).toBe(false)
     // The proxy vars themselves survive — only the bypass list is dropped.
-    expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
+    expect(envArgs.some(e => e.startsWith('https_proxy='))).toBe(true)
+  })
+
+  it('the --env overlay names each variable once ignoring case', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      httpProxyPort: 60080,
+      socksProxyPort: 60081,
+      caCertPath: 'C:\\ca\\bundle.pem',
+      setEnvVars: {
+        Https_Proxy: 'http://caller.invalid',
+        Path: 'C:\\caller',
+        NODE_USE_ENV_PROXY: '1',
+      },
+      srtWin,
+    })
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    const names = envArgs.map(e => e.slice(0, e.indexOf('=')))
+    expect(repeatedIgnoringCase(names)).toEqual([])
+    expect(envArgs).toContain('http_proxy=http://localhost:60080')
+    expect(envArgs).toContain('all_proxy=http://localhost:60080')
+    expect(envArgs).toContain('grpc_proxy=http://localhost:60080')
+    expect(envArgs).toContain('ftp_proxy=socks5h://localhost:60081')
+    expect(envArgs).toContain('RSYNC_PROXY=localhost:60081')
+    expect(envArgs).toContain('https_proxy=http://localhost:60080')
+    expect(envArgs).toContain('NODE_USE_ENV_PROXY=1')
+    expect(envArgs).toContain('Path=C:\\caller')
+    expect(names).toContain('DOCKER_HTTP_PROXY')
+  })
+
+  it('mergeWindowsEnv: a later layer replaces a name in any case', () => {
+    expect(
+      mergeWindowsEnv(
+        { PATH: 'a', HTTP_PROXY: 'one', NODE_USE_ENV_PROXY: '1', Gone: 'x' },
+        { Path: 'b', http_proxy: 'two', rsync_proxy: 'h:1', GONE: undefined },
+        { Http_Proxy: 'three', node_use_env_proxy: '0', NO_PROXY: '' },
+      ),
+    ).toEqual({
+      Path: 'b',
+      http_proxy: 'three',
+      node_use_env_proxy: '0',
+      Gone: 'x',
+      RSYNC_PROXY: 'h:1',
+      no_proxy: '',
+    })
+  })
+
+  it('mergeWindowsEnv: an undefined value in a later layer erases nothing', () => {
+    const merged = mergeWindowsEnv(
+      { PATH: 'C:\\Windows', Kept: 'x' },
+      { Path: undefined, KEPT: undefined, Absent: undefined },
+    )
+    expect(merged).toEqual({ PATH: 'C:\\Windows', Kept: 'x' })
+    expect(Object.keys(merged)).toEqual(['PATH', 'Kept'])
   })
 
   it('NODE_USE_ENV_PROXY=1 rides the --env overlay with the HTTP proxy, unless the caller names it', () => {
@@ -3300,10 +3375,13 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     expect(argv).toContain('exec')
     // Proxy ports ride as --env KEY=VALUE pairs to the runner.
     const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
-    const httpProxy = envArgs.find(e => e.startsWith('HTTP_PROXY='))
-    const allProxy = envArgs.find(e => e.startsWith('ALL_PROXY='))
-    expect(httpProxy).toMatch(/^HTTP_PROXY=http:\/\/.+:\d+$/)
-    expect(allProxy).toMatch(/^ALL_PROXY=http:\/\/.+:\d+$/)
+    const httpProxy = envArgs.find(e => e.startsWith('http_proxy='))
+    const allProxy = envArgs.find(e => e.startsWith('all_proxy='))
+    expect(httpProxy).toMatch(/^http_proxy=http:\/\/.+:\d+$/)
+    expect(allProxy).toMatch(/^all_proxy=http:\/\/.+:\d+$/)
+    expect(
+      repeatedIgnoringCase(envArgs.map(e => e.slice(0, e.indexOf('=')))),
+    ).toEqual([])
     const httpPort = Number(httpProxy!.split(':').pop())
     expect(httpPort).toBeGreaterThanOrEqual(PORT_RANGE[0])
     expect(httpPort).toBeLessThanOrEqual(PORT_RANGE[1])
@@ -3343,6 +3421,57 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     expectStatus('H3', r, [0])
     expect(r.stdout.toLowerCase()).toContain('srt-sandbox')
   }, 60_000)
+
+  // ════════════════════════════════════════════════════════════════
+  // Group N — one name per variable in the child's environment
+  // ════════════════════════════════════════════════════════════════
+
+  it('N1: no name is in the child environment twice ignoring case', async () => {
+    const r = await runSandboxed('set')
+    expectStatus('N1', r, [0])
+    const names = namesInSetOutput(r.stdout)
+    expect(repeatedIgnoringCase(names)).toEqual([])
+    for (const name of [
+      'http_proxy',
+      'https_proxy',
+      'all_proxy',
+      'grpc_proxy',
+      'ftp_proxy',
+      'RSYNC_PROXY',
+    ]) {
+      expect(names).toContain(name)
+    }
+  }, 60_000)
+
+  it('N2: clearing a proxy variable clears it', async () => {
+    const r = await runSandboxed(
+      'set "HTTPS_PROXY=" & set https_proxy & echo N2-DONE',
+    )
+    expect(r.stdout).toContain('N2-DONE')
+    expect(r.stdout).not.toMatch(/^https_proxy=/im)
+  }, 60_000)
+
+  it('N3: .NET can load the child environment', async () => {
+    const r = await runSandboxed(
+      'powershell -NoProfile -Command "(New-Object System.Diagnostics.ProcessStartInfo).EnvironmentVariables.Count"',
+      120_000,
+    )
+    expectStatus('N3', r, [0])
+    expect(r.stdout.trim()).toMatch(/^\d+$/)
+  }, 150_000)
+
+  it('N4: Start-Process -RedirectStandardOutput starts its command', async () => {
+    const r = await runSandboxed(
+      `powershell -NoProfile -Command "$o = Join-Path $env:TEMP 'srt-n4-out.txt'; Start-Process cmd -ArgumentList '/c','echo N4-OK' -RedirectStandardOutput $o -Wait -NoNewWindow; Get-Content $o; Remove-Item $o"`,
+      120_000,
+    )
+    if (!r.stdout.includes('N4-OK')) {
+      throw new Error(
+        `N4: redirected output not found · status=${r.status} · ` +
+          `stdout=${JSON.stringify(r.stdout)} · stderr=${JSON.stringify(r.stderr.slice(-2000))}`,
+      )
+    }
+  }, 150_000)
 
   // ════════════════════════════════════════════════════════════════
   // Group B — egress via real tools (allowed → reaches host via proxy)
@@ -3663,6 +3792,31 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       expect(r.stdout.trim()).toBe('one TWO')
     },
     90_000,
+  )
+
+  it.skipIf(!existsSync(GIT_BASH))(
+    'E6: git-bash sees one http_proxy, in lower case',
+    async () => {
+      const r = await runSandboxed(
+        `"${GIT_BASH}" -c "/usr/bin/env | /usr/bin/grep -i '^http_proxy=' | /usr/bin/wc -l; /usr/bin/env | /usr/bin/grep -c '^http_proxy='"`,
+      )
+      expectStatus('E6', r, [0])
+      expect(r.stdout.split(/\r?\n/).map(l => l.trim())).toEqual(['1', '1', ''])
+    },
+    90_000,
+  )
+
+  it.skipIf(!existsSync(GIT_BASH))(
+    'E7: .NET started from git-bash can load its environment',
+    async () => {
+      const r = await runSandboxed(
+        `"${GIT_BASH}" -c "powershell.exe -NoProfile -Command '(New-Object System.Diagnostics.ProcessStartInfo).EnvironmentVariables.Count'"`,
+        120_000,
+      )
+      expectStatus('E7', r, [0])
+      expect(r.stdout.trim()).toMatch(/^\d+$/)
+    },
+    150_000,
   )
 
   // `-O -`: an MSYS program handed `NUL` creates a FILE of that name instead.
