@@ -637,7 +637,7 @@ enum AclCmd {
         /// any kept write root. (Not offered for named roots: a hold
         /// is recorded by path, a root is forgotten by the object it
         /// is, and the two would have to be matched.)
-        #[arg(long, value_name = "PID", requires = "all")]
+        #[arg(long, value_name = "PID", requires = "all", conflicts_with = "roots")]
         unless_held_by_others: Option<u32>,
         /// Stop waiting for the volume of a grant that `forget`
         /// reported as pending, and drop its record: for a volume that
