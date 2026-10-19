@@ -1325,7 +1325,9 @@ export async function verifyWindowsWfpEgress(
     // even with the fence active → false `connected`).
     const [lo, hi] = opts.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
     for (let i = 0; i < 5; i++) {
-      const s = net.createServer()
+      // A connect that gets through is accepted while `srt-win` runs:
+      // drop it, and keep its errors from being uncaught.
+      const s = net.createServer(c => c.on('error', () => {}).destroy())
       s.listen(0, '127.0.0.1')
       await once(s, 'listening')
       const p = (s.address() as net.AddressInfo).port
@@ -1372,7 +1374,7 @@ export async function verifyWindowsWfpEgress(
     try {
       raw = JSON.parse(r.stdout)
     } catch {
-      // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before
+      // Timeout is thrown as `srt_win_timeout` by `runSrtWinAsync` before
       // this parse; status=null here means an external signal.
       // Include signal + stderr so the CI log self-explains instead
       // of just `exited null with unparseable output ""`.
@@ -3202,6 +3204,7 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
  * The recorded profile read grant (`srt-win profile status`): whether one
  * exists and is current, and with `paths` every path it wrote on. Throws
  * `profile_operation_in_progress` while a grant or forget is running.
+ * Blocks the event loop: prefer {@link getWindowsProfileReadStatusAsync}.
  */
 export function getWindowsProfileReadStatus(
   opts: { paths?: boolean; srtWin?: SrtWinSpawn } = {},

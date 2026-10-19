@@ -1894,6 +1894,27 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(spawnSpy.mock.calls[0][2]).toMatchObject({ windowsHide: true })
   })
 
+  it('getWindowsProfileReadStatus{,Async}: identical argv + identical result', async () => {
+    stubSpawn(() => ({
+      status: 0,
+      stdout: JSON.stringify({ state: 'none', record_version: 1 }),
+    }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sync = winUtils.getWindowsProfileReadStatus({ paths: true, srtWin })
+    const asyn = await winUtils.getWindowsProfileReadStatusAsync({
+      paths: true,
+      srtWin,
+    })
+    expect(asyn).toEqual(sync)
+    expect(spawnSpy.mock.calls[0][1]).toEqual(spawnSyncSpy.mock.calls[0][1])
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'profile',
+      'status',
+      '--paths',
+    ])
+  })
+
   it('getWindowsWfpStatus{,Async}: identical argv + identical result', async () => {
     stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
     const srtWin = resolveSrtWin({ path: process.execPath })
@@ -5678,8 +5699,12 @@ describe('Windows profile read grant (pure, all platforms)', () => {
 
   describe('a default session: initialize() checks the record and never writes the grant', () => {
     it('a current grant: one `profile status`, without the path list, then the session as usual', async () => {
+      // The status is read without blocking the event loop.
+      const blocking = spyOn(winUtils, 'getWindowsProfileReadStatus')
+      spies.push(blocking)
       await SandboxManager.initialize(config())
       expect(names()).toEqual(['profile status', 'acl grant'])
+      expect(blocking).not.toHaveBeenCalled()
       expect(calls[0].argv).toEqual([])
       expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
       expect(names()).not.toContain('profile grant')
