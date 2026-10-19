@@ -528,6 +528,100 @@ if ($r.out -match 'CHILD_DESK=Default') {
 }
 Write-Host 'R12 ok: child on broker-created srt-sb-* desktop (not Default)'
 
+# ── R13: the child's stdio handles are pipe CLIENT ends ──────────
+$r13Lsn  = Bind-Listener (50003, 50004, 50005, 49997)
+$r13Port = $r13Lsn.LocalEndpoint.Port
+try {
+  $probeR13 = @"
+`$src = @'
+using System;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+public static class StdinProbe {
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GetStdHandle(int n);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern uint GetFileType(IntPtr h);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateNamedPipeClient(IntPtr h);
+  [DllImport("advapi32.dll", SetLastError=true)] static extern bool RevertToSelf();
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetNamedPipeInfo(IntPtr h, out uint flags, IntPtr o, IntPtr i, IntPtr m);
+  static string End(IntPtr h) {
+    if (GetFileType(h) != 3) { return "notpipe"; }
+    uint flags;
+    if (!GetNamedPipeInfo(h, out flags, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero)) { return "unknown le=" + Marshal.GetLastWin32Error(); }
+    return (flags & 1) != 0 ? "server" : "client";
+  }
+  static string Connect(int port) {
+    try { using (var c = new TcpClient()) { c.Connect("127.0.0.1", port); return "CONNECTED"; } }
+    catch (SocketException e) { return "blocked code=" + e.SocketErrorCode; }
+    catch (Exception e) { return "blocked ex=" + e.GetType().Name; }
+  }
+  public static string Run(int port) {
+    string o = "DIRECT=" + Connect(port) + "\n";
+    int[] ids = { -10, -11, -12 };
+    string[] names = { "STDIN", "STDOUT", "STDERR" };
+    for (int i = 0; i < 3; i++) { o += "END_" + names[i] + "=" + End(GetStdHandle(ids[i])) + "\n"; }
+    for (int i = 0; i < 3; i++) {
+      bool ok = ImpersonateNamedPipeClient(GetStdHandle(ids[i]));
+      int le = Marshal.GetLastWin32Error();
+      if (ok) {
+        string r = Connect(port);
+        if (!RevertToSelf()) { Environment.Exit(97); }
+        return o + "IMPERSONATE=ok via " + names[i] + "\nIMPERSONATED_CONNECT=" + r + "\n";
+      }
+      o += "IMPERSONATE_" + names[i] + "=fail le=" + le + "\n";
+    }
+    return o + "IMPERSONATE=fail\n";
+  }
+}
+'@
+Add-Type -TypeDefinition `$src
+[StdinProbe]::Run($r13Port)
+"@
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeR13)
+  Write-Host "R13 probe output: $($r.out.Trim())"
+  if ($r.out -match 'CONNECTED') {
+    throw "R13: a sandboxed connect to out-of-range port $r13Port succeeded. raw: $($r.raw)"
+  }
+  if ($r.out -notmatch 'DIRECT=blocked') {
+    throw "R13: probe did not report its direct connect. raw: $($r.raw)"
+  }
+  # GetNamedPipeInfo names the end; a refused impersonation alone does not
+  # (a server end is refused too until data has been read through it).
+  if ($r.out -notmatch '(?m)^END_STDIN=client\s*$') {
+    throw "R13: child stdin is not a pipe CLIENT end. raw: $($r.raw)"
+  }
+  foreach ($n in 'STDOUT', 'STDERR') {
+    if ($r.out -notmatch "(?m)^END_$n=(client|unknown)") {
+      throw "R13: child $n is not a pipe client end. raw: $($r.raw)"
+    }
+  }
+  if ($r.out -match 'IMPERSONATE=ok') {
+    throw "R13: child impersonated through a stdio handle (a pipe server end). raw: $($r.raw)"
+  }
+  if ($r.out -notmatch 'IMPERSONATE=fail') {
+    throw "R13: probe did not report an impersonation result. raw: $($r.raw)"
+  }
+  # The listener was live, so "blocked" is the fence and not a closed port.
+  $hc = [System.Net.Sockets.TcpClient]::new()
+  try { $hc.Connect('127.0.0.1', $r13Port) } catch {
+    throw "R13: broker-side connect to its own listener on $r13Port failed — test invalid"
+  } finally { $hc.Dispose() }
+  Write-Host 'R13 ok: stdio handles are pipe client ends and cannot impersonate; out-of-range connect blocked'
+} finally {
+  $r13Lsn.Stop()
+}
+
+# ── R14: the child's stdin reads as end-of-file ──────────────────
+# `&&`: the marker is printed only if `sort` read its input to the end.
+$r = RExec @('--', $cmd, '/c', 'sort && echo R14-EOF-MARK') -TimeoutSec 60
+if ($r.exit -ne 0 -or $r.out -notmatch 'R14-EOF-MARK') {
+  throw "R14: child could not read its stdin to the end (exit $($r.exit)). raw: $($r.raw)"
+}
+$r14Read = (($r.out -split 'R14-EOF-MARK')[0]).Trim()
+if ($r14Read -ne '') {
+  throw "R14: child stdin was not empty, or the read wrote to stderr: '$r14Read'. raw: $($r.raw)"
+}
+Write-Host 'R14 ok: child stdin is readable and at end-of-file'
+
 # ── G-rows: per-session FS access for the sandbox user ──────────
 # The sandbox child has NO inherent rights on real-user-owned
 # files. `acl grant` adds an inheritable MODIFY_NO_FDC ALLOW ACE
@@ -731,4 +825,4 @@ $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, G1-G6/G3b)'
+Write-Host 'smoke-exec: PASS (R0b, V1, R1-R7c, R9/R9b, R11, R12, R13, R14, G1-G6/G3b)'

@@ -36,8 +36,11 @@ import {
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
-  normalizeRequestTarget,
+  readRequestTarget,
+  refuseUnparsedRequest,
   requestTargetAsSpelled,
+  respondRefusedTarget,
+  type AmbiguousRequestTarget,
   type DenyMark,
   applyHeaderEdits,
   notifyResponse,
@@ -59,6 +62,7 @@ import {
   directRequestOptions,
   type DirectRequestOptions,
   formatAuthority,
+  onUpstreamError,
   relayResponseHead,
   stripHopByHop,
 } from './parent-proxy.js'
@@ -224,8 +228,10 @@ function duplexOverSocket(
  * reads in that socket's own buffer too, which grows by the whole upload.
  * `outbound` is the stream whose write queue holds what is on its way to
  * the client.
+ *
+ * @internal Exported for its test.
  */
-function serverTlsOn(
+export function serverTlsOn(
   socket: Duplex,
   head: Buffer,
   options: TLSSocketOptions,
@@ -242,6 +248,12 @@ function serverTlsOn(
     isServer: true,
   })
   setConsumer(tls)
+  // destroySoon() is to destroy a socket once all it was given is out. This
+  // one has finished as soon as it has written to the stream under it, long
+  // before the client has the bytes, and destroyed then it drops them. (A
+  // runtime's http server may call it after an HTTP/1.0 response.) Ended, it
+  // closes the tunnel too, after the flush. destroy() still cuts at once.
+  tls.destroySoon = () => void tls.end()
   return { tls, outbound: duplex }
 }
 
@@ -325,6 +337,8 @@ export type TerminateTarget = {
   denyHeader?: string
   /** Forward the request-target as spelled (see HttpProxyServerOptions.requestTargetAsSpelled). */
   requestTargetAsSpelled?: boolean
+  /** What becomes of an ambiguous request-target (see HttpProxyServerOptions.ambiguousRequestTarget). */
+  ambiguousRequestTarget?: AmbiguousRequestTarget
   /** The TLS server name the client sent (set by terminateAndForward). */
   clientServerName?: string
   /** The ClientHello carries a server name that could not be read (see serverNameFromClientHello). */
@@ -430,6 +444,12 @@ export function terminateAndForward(
       maxSigv4BodyBytes,
     )
   })
+  // Responses under way on the tunnel's connection.
+  let answering = 0
+  inner.on('request', (_req, res) => {
+    answering++
+    res.once('close', () => answering--)
+  })
   inner.on('clientError', (err, sock) => {
     // Parse errors and resets on the tunnel would otherwise escalate to an
     // uncaughtException, same class as the request-stream errors handled
@@ -438,26 +458,22 @@ export function terminateAndForward(
       `[tls-terminate] client connection error for ${target.hostname}: ${err.message}`,
       { level: 'error' },
     )
-    if (
-      target.maxHeaderSize !== undefined &&
-      (err as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW' &&
-      sock.writable
-    ) {
-      // A head past the caller's own limit is a request past its limits:
-      // 400, flushed before the socket goes.
-      sock.on('error', () => {})
-      const mark =
-        target.denyHeader !== undefined
-          ? `${target.denyHeader}: bad_request\r\n`
-          : ''
-      sock.end(
-        `HTTP/1.1 400 Bad Request\r\n${mark}Content-Length: 0\r\nConnection: close\r\n\r\n`,
-        () => sock.destroy(),
-      )
-      setTimeout(() => sock.destroy(), 1000).unref?.()
-      return
-    }
-    sock.destroy()
+    // A request the parser refuses is refused like any other: answered, and
+    // reported under the tunnel's own target.
+    const refused = refuseUnparsedRequest(
+      err,
+      sock,
+      answering === 0,
+      target.denyHeader !== undefined
+        ? { name: target.denyHeader, value: 'bad_request' }
+        : undefined,
+    )
+    if (refused === undefined) return
+    target.onFilterRequestDeny?.(
+      refused.method,
+      `https://${formatAuthority(target.hostname, target.port, 443)}${refused.target}`,
+      refused.reason,
+    )
   })
   inner.on('upgrade', (_req, sock) => {
     // WebSocket / non-HTTP over TLS — out of scope for now.
@@ -1003,25 +1019,45 @@ async function forwardUpstream(
   // yields a well-formed URL, and discard any client-supplied authority so
   // the CONNECT-verified target stays authoritative (same rationale as the
   // Host-header note below).
-  // With filterRequest, the request target is normalized before the hook
-  // sees it and that normalized target is what is forwarded: some runtimes'
-  // HTTP clients normalize it again on the way out, and the hook must judge
-  // exactly what is sent. A target of any other shape could make the judged
-  // URL name another host, so it is refused. Without filterRequest nothing
-  // judges the path, so the target is forwarded unchanged (and a masked AWS
-  // credential is re-signed over those same bytes). requestTargetAsSpelled
-  // comes first: it forwards the target as the client spelled it.
+  // With filterRequest, the hook gets the target as spelled and normalized,
+  // and the spelling is what is forwarded: rewriting it would break a
+  // signature over the path, or have a masked AWS credential re-signed for
+  // a resource the client did not name. Where the two forms can name
+  // different resources the hook may have judged another one than the
+  // upstream acts on, so the request is refused unless
+  // ambiguousRequestTarget says which form to send. A target of any other
+  // shape could make the judged URL name another host, so it is refused.
+  // Without filterRequest nothing judges the path, so the target is
+  // forwarded unchanged. requestTargetAsSpelled comes first: it forwards the
+  // target as the client spelled it.
   const markFor = (code: string): DenyMark | undefined =>
     target.denyHeader !== undefined
       ? { name: target.denyHeader, value: code }
       : undefined
+  // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
+  const authority = formatAuthority(target.hostname, target.port, 443)
+  const read =
+    filterRequest && !target.requestTargetAsSpelled
+      ? readRequestTarget(
+          req.url ?? '/',
+          req.method,
+          target.ambiguousRequestTarget,
+        )
+      : undefined
   const path = target.requestTargetAsSpelled
     ? requestTargetAsSpelled(req.url ?? '/')
-    : filterRequest
-      ? normalizeRequestTarget(req.url ?? '/', req.method)
+    : read
+      ? read.forwarded
       : originFormPath(req.url)
   if (path === undefined) {
-    respondDenied(res, 'malformed request-target', markFor('bad_request'), 400)
+    const why = respondRefusedTarget(res, read?.refusal, markFor('bad_request'))
+    target.onFilterRequestDeny?.(
+      req.method ?? 'GET',
+      `https://${authority}${read?.spelled ?? ''}`,
+      why,
+    )
+    // Like a denial: a body still to come must not keep the tunnel.
+    destroyAfterDenial(req, res)
     return
   }
   // RFC 9112 3.2: an HTTP/1.1 request without Host is answered 400. Not
@@ -1039,18 +1075,15 @@ async function forwardUpstream(
     )
     return
   }
-  // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
-  const authority = formatAuthority(target.hostname, target.port, 443)
+  // RFC 9112 3.3: the target URI of the asterisk form (`OPTIONS *`) has an
+  // empty path. Put behind the authority, the `*` would be read into the host.
+  const url = `https://${authority}${path === '*' ? '' : path}`
   let body: Readable = req
   let decision: RequestDecision | undefined
   const sni = target.clientServerName ?? serverNameOf(req)
   if (target.requireHostMatch && target.clientServerNameUnreadable) {
     const why = 'TLS server name could not be read'
-    target.onFilterRequestDeny?.(
-      req.method ?? 'GET',
-      `https://${authority}${path}`,
-      why,
-    )
+    target.onFilterRequestDeny?.(req.method ?? 'GET', url, why)
     respondDenied(res, why, markFor('misdirected'), 421)
     return
   }
@@ -1062,11 +1095,7 @@ async function forwardUpstream(
       absoluteFormAuthority(req.url),
     )
     if (why !== undefined) {
-      target.onFilterRequestDeny?.(
-        req.method ?? 'GET',
-        `https://${authority}${path}`,
-        why,
-      )
+      target.onFilterRequestDeny?.(req.method ?? 'GET', url, why)
       respondDenied(res, why, markFor('misdirected'), 421)
       return
     }
@@ -1093,13 +1122,15 @@ async function forwardUpstream(
       filterRequest,
       req,
       res,
-      `https://${authority}${path}`,
+      url,
       ac.signal,
       target.onFilterRequestDeny,
       {
         sni,
         target: { host: target.hostname, port: target.port },
-        requestTarget: path,
+        requestTarget: read?.spelled ?? path,
+        normalizedRequestTarget: read?.normalized,
+        requestTargetIsAmbiguous: read?.ambiguous,
         rawHeaders: [...req.rawHeaders],
         scheme: 'https',
       },
@@ -1312,7 +1343,7 @@ async function forwardUpstream(
     },
   )
 
-  upstream.on('error', err => failUpstream(err, upstream))
+  onUpstreamError(upstream, err => failUpstream(err, upstream))
 
   res.on('close', () => upstream.destroy())
   if (bufferedBody !== undefined) {

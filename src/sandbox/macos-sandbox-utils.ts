@@ -12,8 +12,6 @@ import {
   encodeSandboxedCommand,
   decodeSandboxedCommand,
   containsGlobChars,
-  globToRegex,
-  denyGlobRegex,
   isAtOrUnder,
   isStrictlyUnder as isPathStrictlyUnder,
   nameLocation,
@@ -21,6 +19,11 @@ import {
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
+import {
+  denyGlobRegex,
+  escapeRegexLiteral,
+  globToRegex,
+} from './glob-pattern.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 import { literalReadings, type PathListKind } from './path-entries.js'
 
@@ -661,11 +664,6 @@ const SBPL_STRING_MAX_BYTES = 900
  * it would replace.
  */
 const MIN_DENY_GROUP_SIZE = 4
-
-/** Escape a literal path component for use inside a regex. */
-function escapeRegexLiteral(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
 
 /**
  * Literal deny paths of the shape `<dir>/<name>/<leaf>` that share `dir` and

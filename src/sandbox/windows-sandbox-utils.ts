@@ -3769,9 +3769,17 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // same precedence as the macOS/Linux `env -u … VAR=…
   // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
   // (which composes against setEnvVars) wins.
+  // Node's built-in clients read the proxy variables only when this is
+  // set. It is no security variable: a caller's value, in any case, wins.
+  const callerSetsNodeProxy = Object.keys(p.setEnvVars ?? {}).some(
+    k => k.toUpperCase() === 'NODE_USE_ENV_PROXY',
+  )
   const overlay: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
     PATHEXT: process.env.PATHEXT,
+    ...(p.httpProxyPort && !callerSetsNodeProxy
+      ? { NODE_USE_ENV_PROXY: '1' }
+      : {}),
     ...(p.setEnvVars ?? {}),
     ...generated,
     ...gitCfg,
