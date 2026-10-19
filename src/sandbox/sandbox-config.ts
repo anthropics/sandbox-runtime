@@ -1087,34 +1087,6 @@ export const WindowsConfigSchema = z.object({
       'required to use the Windows sandbox — your own (multicall) binary, ' +
       'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
   ),
-  writeRestrictedToken: z
-    .boolean()
-    .optional()
-    .describe(
-      'Default true (unset means true). The sandboxed child runs under ' +
-        'a write-restricted token (restricting SIDs: the sandbox account, ' +
-        'Everyone, RESTRICTED, and one identifier per `allowWrite` root ' +
-        'of the session), so write access that `BUILTIN\\Users` / ' +
-        '`Authenticated Users` hold outside the allow-list (directories ' +
-        'created under `C:\\`, data-drive trees, PATH directories outside ' +
-        'Program Files) does not reach it, and the write grants on ' +
-        '`allowWrite` roots are kept between sessions instead of being ' +
-        'rewritten at every start. A kept grant also grants read: any ' +
-        'sandboxed session on the machine can read a kept root, whether ' +
-        'or not the root is in its own lists, until the grant is removed ' +
-        '(by uninstall, `srt-win acl forget`, or opting out). Hosts that ' +
-        "run sessions for parties that must not read each other's " +
-        'project roots should opt out. Cost: Schannel ' +
-        'refuses restricted tokens, so System32 `curl.exe`, git with the ' +
-        'schannel backend, and .NET / PowerShell web requests fail inside ' +
-        'the sandbox (git is switched to its OpenSSL backend ' +
-        'automatically); clients with their own TLS stack are unaffected. ' +
-        'If the token cannot be created the command fails; nothing falls ' +
-        'back to the ordinary token. Set `false` to opt out: the child ' +
-        'then runs under the ordinary token with per-session grants, and ' +
-        '`initialize()` first removes the kept grants (one walk of each ' +
-        'kept root).',
-    ),
 })
 
 /**

@@ -235,8 +235,7 @@ enum Cmd {
         /// the restricting SIDs `[<sandbox user>, Everyone,
         /// RESTRICTED]`, so write access held by `BUILTIN\Users` /
         /// `Authenticated Users` no longer reaches the child. Off
-        /// unless passed; the library passes it unless its
-        /// `windows.writeRestrictedToken` option is `false`. Fails the
+        /// unless passed; the library always passes it. Fails the
         /// exec if that token cannot be built —
         /// there is no fallback to the ordinary token. Schannel-based
         /// TLS clients (System32 `curl.exe`, schannel-backend git,

@@ -28,8 +28,8 @@
 //!
 //! ## Write-restricted token
 //!
-//! What the library uses unless `windows.writeRestrictedToken` is
-//! `false`; `srt-win exec` builds it only with `--write-restricted-token`.
+//! What the library always uses; `srt-win exec` builds it only with
+//! `--write-restricted-token`.
 //!
 //! `write_restricted` adds the `WRITE_RESTRICTED` flag and the
 //! restricting SIDs [`restricting_sid_list`]: a write must then also

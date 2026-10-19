@@ -159,7 +159,6 @@ function sandboxReachable(name: string): string | undefined {
 const GIT = sandboxReachable('git')
 const NODE = sandboxReachable('node')
 const PYTHON = sandboxReachable('python')
-const CARGO = sandboxReachable('cargo')
 
 /** Whether Git Bash's `curl` is OpenSSL (on ARM64 it is Schannel only). */
 const GIT_BASH_CURL_HAS_OPENSSL =
@@ -206,11 +205,6 @@ function ownTlsGet(host: string): string {
 }
 const got200 = (r: { stdout: string }): boolean =>
   /(?:^|STATUS:)200$/.test(r.stdout.trim())
-
-/** `cfg` with `windows.writeRestrictedToken: false` (the ordinary token). */
-function onOrdinaryToken(cfg: SandboxRuntimeConfig): SandboxRuntimeConfig {
-  return { ...cfg, windows: { ...cfg.windows, writeRestrictedToken: false } }
-}
 
 // Direct helper calls (and SandboxManager configs) must thread an
 // explicit srt-win path — there is no ambient vendor fallback.
@@ -442,30 +436,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(off.argv).not.toContain('--quiet')
   })
 
-  it('writeRestrictedToken unset is true: argv and env are identical, and carry the token flag and the git backend entry', () => {
-    const srtWin = resolveSrtWin({ path: process.execPath })
-    const base = {
-      command: 'git fetch',
-      httpProxyPort: 60080,
-      cwd: 'C:\\work\\repo',
-      caCertPath: 'C:/bundle.pem',
-      denyRead: ['C:\\secret'],
-      writeRoots: ['C:\\work\\repo'],
-      srtWin,
-    }
-    const unset = wrapCommandWithSandboxWindows(base)
-    const on = wrapCommandWithSandboxWindows({
-      ...base,
-      writeRestrictedToken: true,
-    })
-    expect(unset.argv).toEqual(on.argv)
-    expect(unset.env).toEqual(on.env)
-    expect(unset.argv).toContain('--write-restricted-token')
-    expect(unset.argv).toContain('--write-root')
-    expect(unset.argv).toContain('GIT_CONFIG_VALUE_4=openssl')
-  })
-
-  it('writeRestrictedToken false: the ordinary-token argv, exactly', () => {
+  it('the exec argv: the token flag, one --write-root per root, the denies, then the command', () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const { argv } = wrapCommandWithSandboxWindows({
       command: 'git fetch',
@@ -473,23 +444,25 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
       caCertPath: 'C:/bundle.pem',
       denyRead: ['C:\\secret'],
       denyWrite: ['C:\\work\\repo\\.git\\hooks'],
-      writeRoots: ['C:\\work\\repo'],
+      writeRoots: ['C:\\work\\repo', 'D:\\other tree'],
       setEnvVars: {},
       binShell: { exe: 'C:\\sh.exe', args: ['-c'] },
-      writeRestrictedToken: false,
       srtWin,
     })
-    // The --env values are reduced to their names.
     const dashes = argv.indexOf('--')
     const flags = argv
       .slice(0, dashes)
-      .map((a, i) => (argv[i - 1] === '--env' ? a.split('=')[0] : a))
       .filter((a, i, all) => !(a === '--env' || all[i - 1] === '--env'))
     expect(flags).toEqual([
       process.execPath,
       SRT_WIN_DISPATCH_ARG1,
       'exec',
       '--quiet',
+      '--write-restricted-token',
+      '--write-root',
+      'C:\\work\\repo',
+      '--write-root',
+      'D:\\other tree',
       '--deny-read',
       'C:\\secret',
       '--deny-write',
@@ -497,81 +470,25 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     ])
     expect(argv.slice(dashes)).toEqual(['--', 'C:\\sh.exe', '-c', 'git fetch'])
     const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
-    expect(envArgs).toContain('GIT_CONFIG_COUNT=4')
-    expect(envArgs.join(' ')).not.toContain('http.sslBackend')
-    expect(argv).not.toContain('--write-restricted-token')
-    expect(argv).not.toContain('--write-root')
-  })
-
-  it('writeRestrictedToken: --write-restricted-token reaches exec, before --, and nothing else differs from the false argv but the git backend entry', () => {
-    const srtWin = resolveSrtWin({ path: process.execPath })
-    const base = {
-      command: 'git fetch',
-      httpProxyPort: 60080,
-      cwd: 'C:\\work\\repo',
-      caCertPath: 'C:/bundle.pem',
-      srtWin,
-    }
-    const off = wrapCommandWithSandboxWindows({
-      ...base,
-      writeRestrictedToken: false,
-    })
-    const on = wrapCommandWithSandboxWindows(base)
-    // Before `--`: after it the flag goes to the sandboxed command.
-    const flagAt = on.argv.indexOf('--write-restricted-token')
-    expect(flagAt).toBeGreaterThan(on.argv.indexOf('exec'))
-    expect(flagAt).toBeLessThan(on.argv.indexOf('--'))
-    expect(on.argv.filter(a => a === '--write-restricted-token')).toHaveLength(
-      1,
-    )
-    const added = on.argv.filter(a => !off.argv.includes(a))
-    expect(added.sort()).toEqual(
-      [
-        '--write-restricted-token',
-        'GIT_CONFIG_COUNT=5',
-        'GIT_CONFIG_KEY_4=http.sslBackend',
-        'GIT_CONFIG_VALUE_4=openssl',
-      ].sort(),
-    )
-    const removed = off.argv.filter(a => !on.argv.includes(a))
-    expect(removed).toEqual(['GIT_CONFIG_COUNT=4'])
+    expect(envArgs).toContain('GIT_CONFIG_COUNT=5')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_4=http.sslBackend')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_4=openssl')
     // The schannel knobs stay (harmless under the OpenSSL backend).
-    expect(on.argv).toContain('GIT_CONFIG_KEY_2=http.schannelUseSSLCAInfo')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_2=http.schannelUseSSLCAInfo')
   })
 
-  it('writeRoots: one --write-root per root, right after the token flag; ignored under the ordinary token', () => {
+  it('no write roots: the token flag alone, once, before --', () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
-    const base = {
+    const { argv } = wrapCommandWithSandboxWindows({
       command: 'git fetch',
-      httpProxyPort: 60080,
       cwd: 'C:\\work\\repo',
-      denyWrite: ['C:\\work\\repo\\.git\\hooks'],
       srtWin,
-    }
-    const roots = ['C:\\work\\repo', 'D:\\other tree']
-    const none = wrapCommandWithSandboxWindows(base)
-    const on = wrapCommandWithSandboxWindows({ ...base, writeRoots: roots })
-    const at = on.argv.indexOf('--write-restricted-token')
-    expect(on.argv.slice(at, at + 5)).toEqual([
-      '--write-restricted-token',
-      '--write-root',
-      roots[0],
-      '--write-root',
-      roots[1],
-    ])
-    // srt-win options sit before `--`; the per-exec denies are unchanged.
-    expect(at + 5).toBeLessThanOrEqual(on.argv.indexOf('--deny-write'))
-    expect(on.argv.indexOf('--deny-write')).toBeLessThan(on.argv.indexOf('--'))
-    // Nothing else changes.
-    expect([...on.argv.slice(0, at + 1), ...on.argv.slice(at + 5)]).toEqual(
-      none.argv,
+    })
+    expect(argv.filter(a => a === '--write-restricted-token')).toHaveLength(1)
+    expect(argv).not.toContain('--write-root')
+    expect(argv.indexOf('--write-restricted-token')).toBeLessThan(
+      argv.indexOf('--'),
     )
-    expect(on.env).toEqual(none.env)
-    // The ordinary token has no capability SIDs to carry.
-    const plain = { ...base, writeRestrictedToken: false }
-    const off = wrapCommandWithSandboxWindows({ ...plain, writeRoots: roots })
-    expect(off.argv).toEqual(wrapCommandWithSandboxWindows(plain).argv)
-    expect(off.argv).not.toContain('--write-root')
   })
 
   it('resolveSrtWin: explicit path → used verbatim, sentinel prepend', () => {
@@ -727,33 +644,12 @@ describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
   })
 })
 
-describe('WindowsConfigSchema.writeRestrictedToken (pure, all platforms)', () => {
-  it('is an optional boolean; unset means on, only false turns it off', () => {
-    // Left unset by the schema: the default is applied where it is read.
-    const none = WindowsConfigSchema.parse({})
-    expect(none.writeRestrictedToken).toBeUndefined()
-    const enabled = winUtils.windowsWriteRestrictedTokenEnabled
-    expect(enabled(undefined)).toBe(true)
-    expect(enabled(none)).toBe(true)
-    expect(enabled({ writeRestrictedToken: true })).toBe(true)
-    expect(enabled({ writeRestrictedToken: false })).toBe(false)
-    expect(WindowsConfigSchema.shape.writeRestrictedToken.description).toMatch(
-      /^Default true/,
-    )
+describe('WindowsConfigSchema (pure, all platforms)', () => {
+  it('has no writeRestrictedToken option: a config that still sets it parses without it', () => {
+    expect('writeRestrictedToken' in WindowsConfigSchema.shape).toBe(false)
     expect(
-      WindowsConfigSchema.parse({ writeRestrictedToken: true })
-        .writeRestrictedToken,
-    ).toBe(true)
-    expect(
-      WindowsConfigSchema.parse({ writeRestrictedToken: false })
-        .writeRestrictedToken,
-    ).toBe(false)
-    // A truthy non-boolean must not switch the token shape on.
-    for (const bad of ['true', 1, 'yes', null]) {
-      expect(
-        WindowsConfigSchema.safeParse({ writeRestrictedToken: bad }).success,
-      ).toBe(false)
-    }
+      WindowsConfigSchema.parse({ writeRestrictedToken: false }),
+    ).not.toHaveProperty('writeRestrictedToken')
   })
 })
 
@@ -1169,7 +1065,7 @@ describe('rankWindowsFsAccess (pure, all platforms)', () => {
 })
 
 // Run once per child-token mode; not on Windows, where the L-rows make the calls.
-function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
+describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
   const spies: Array<ReturnType<typeof spyOn>> = []
   let granted: Pick<WindowsAclGrantOptions, 'read' | 'write'> | undefined
   let stamped:
@@ -1194,10 +1090,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
     },
     filesystem: { denyRead: [], allowWrite: [], denyWrite: [], ...filesystem },
     credentials: { files },
-    windows: {
-      srtWin: { path: process.execPath },
-      ...(writeRestrictedToken === false && { writeRestrictedToken }),
-    },
+    windows: { srtWin: { path: process.execPath } },
   })
 
   /** The values of `flag` in what one command is wrapped to. */
@@ -1245,17 +1138,8 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
         target: '',
         stderr: '',
       }),
-      spyOn(winUtils, 'grantWindowsAcl').mockImplementation(o => {
-        expect(writeRestrictedToken).toBe(false)
-        granted = o
-      }),
-      spyOn(winUtils, 'stampWindowsAcl').mockImplementation(o => {
-        expect(writeRestrictedToken).toBe(false)
-        stamped = o
-      }),
       // One call with all four lists, recorded as the grant and stamp it stands for.
       spyOn(winUtils, 'grantWindowsAclPersistent').mockImplementation(o => {
-        expect(writeRestrictedToken).toBeUndefined()
         if (o.read.length > 0 || o.write.length > 0) {
           granted = { read: o.read, write: o.write }
         }
@@ -1414,28 +1298,20 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
     expect(await flagged('--deny-read', { credentials })).toEqual([sub])
   })
 
-  it('a CA missing from the sandbox user store is required only under the ordinary token', async () => {
+  it("tlsTerminate does not require the CA in the sandbox user's store", async () => {
     spies.push(spyOn(winUtils, 'getWindowsSandboxCaCert').mockReturnValue(null))
     const base = configOf({})
-    // The check under test comes after the runtime's own TLS check.
+    // Past the runtime's own TLS check, which this is not about.
     overrideEmittedConnectionProbe(() => true)
     try {
-      const started = SandboxManager.initialize({
+      await SandboxManager.initialize({
         ...base,
         network: {
           ...base.network,
           tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
         },
       })
-      if (writeRestrictedToken === false) {
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects as void; the await is required at runtime
-        await expect(started).rejects.toMatchObject({
-          code: 'trust_ca_not_installed',
-        })
-      } else {
-        await started
-        expect(SandboxManager.getMitmCA()).toBeDefined()
-      }
+      expect(SandboxManager.getMitmCA()).toBeDefined()
     } finally {
       overrideEmittedConnectionProbe(undefined)
     }
@@ -1459,14 +1335,7 @@ function whatSrtWinIsHanded(writeRestrictedToken: false | undefined): void {
       }),
     ).not.toContain(own)
   })
-}
-describe.if(!isWindows)('what srt-win is handed (platform spy)', () =>
-  whatSrtWinIsHanded(undefined),
-)
-describe.if(!isWindows)(
-  'what srt-win is handed, writeRestrictedToken: false (platform spy)',
-  () => whatSrtWinIsHanded(false),
-)
+})
 
 describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   const RAW_USER = JSON.stringify({
@@ -1581,7 +1450,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     spawnSyncSpy?.mockRestore()
   })
 
-  it('verifyWindowsWfpEgress: --write-restricted-token unless writeRestrictedToken is false', async () => {
+  it('verifyWindowsWfpEgress always probes with --write-restricted-token', async () => {
     const target = '127.0.0.1:49999'
     stubSpawn(() => ({
       status: 0,
@@ -1589,54 +1458,43 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }))
     const srtWin = resolveSrtWin({ path: process.execPath })
     await verifyWindowsWfpEgress({ target, srtWin })
-    await verifyWindowsWfpEgress({
-      target,
-      writeRestrictedToken: false,
-      srtWin,
-    })
-    await verifyWindowsWfpEgress({ target, writeRestrictedToken: true, srtWin })
-    const plain = [SRT_WIN_DISPATCH_ARG1, 'wfp', 'verify', '--target', target]
     expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
-      [...plain, '--write-restricted-token'],
-      plain,
-      [...plain, '--write-restricted-token'],
+      [
+        SRT_WIN_DISPATCH_ARG1,
+        'wfp',
+        'verify',
+        '--target',
+        target,
+        '--write-restricted-token',
+      ],
     ])
   })
 
-  it('verifyWindowsWfpEgress: writeRoots ride with the token flag, unset or true, and never without it', async () => {
+  it('verifyWindowsWfpEgress: one --write-root per root, after the token flag', async () => {
     const target = '127.0.0.1:49999'
     stubSpawn(() => ({
       status: 0,
       stdout: JSON.stringify({ egress_probe: 'blocked', target }),
     }))
     const srtWin = resolveSrtWin({ path: process.execPath })
-    const writeRoots = ['C:\\a', 'C:\\b']
     await verifyWindowsWfpEgress({
       target,
-      writeRestrictedToken: true,
-      writeRoots,
+      writeRoots: ['C:\\a', 'C:\\b'],
       srtWin,
     })
-    await verifyWindowsWfpEgress({ target, writeRoots, srtWin })
-    await verifyWindowsWfpEgress({
-      target,
-      writeRestrictedToken: false,
-      writeRoots,
-      srtWin,
-    })
-    const plain = [SRT_WIN_DISPATCH_ARG1, 'wfp', 'verify', '--target', target]
-    const withRoots = [
-      ...plain,
-      '--write-restricted-token',
-      '--write-root',
-      'C:\\a',
-      '--write-root',
-      'C:\\b',
-    ]
     expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
-      withRoots,
-      withRoots,
-      plain,
+      [
+        SRT_WIN_DISPATCH_ARG1,
+        'wfp',
+        'verify',
+        '--target',
+        target,
+        '--write-restricted-token',
+        '--write-root',
+        'C:\\a',
+        '--write-root',
+        'C:\\b',
+      ],
     ])
   })
 
@@ -1691,26 +1549,6 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }
   })
 
-  it('forgetWindowsPersistentGrants: acl forget --all; a non-zero exit throws acl_forget_failed', () => {
-    const srtWin = resolveSrtWin({ path: process.execPath })
-    stubSpawn(() => ({ status: 0, stdout: '' }))
-    winUtils.forgetWindowsPersistentGrants({ srtWin })
-    expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
-      [SRT_WIN_DISPATCH_ARG1, 'acl', 'forget', '--all'],
-    ])
-    spawnSyncSpy.mockRestore()
-    spawnSpy.mockRestore()
-    stubSpawn(() => ({ status: 1, stdout: '' }))
-    let thrown: unknown
-    try {
-      winUtils.forgetWindowsPersistentGrants({ srtWin })
-    } catch (e) {
-      thrown = e
-    }
-    expect(thrown).toBeInstanceOf(WindowsSandboxError)
-    expect((thrown as WindowsSandboxError).code).toBe('acl_forget_failed')
-  })
-
   it('user status: persistent_grants is surfaced unless it says "none"; an unknown state is not "none"', () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const statusWith = (persistent_grants: unknown) => {
@@ -1739,7 +1577,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     })
   })
 
-  it('verifyWindowsWfpEgress with writeRestrictedToken rejects every outcome but blocked', async () => {
+  it('verifyWindowsWfpEgress rejects every outcome but blocked', async () => {
     const target = '127.0.0.1:49999'
     const srtWin = resolveSrtWin({ path: process.execPath })
     // 3 = connected, 2 = unreachable, 1 = no probe child was created.
@@ -1756,11 +1594,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       }))
       let thrown: unknown
       try {
-        await verifyWindowsWfpEgress({
-          target,
-          writeRestrictedToken: true,
-          srtWin,
-        })
+        await verifyWindowsWfpEgress({ target, srtWin })
       } catch (e) {
         thrown = e
       }
@@ -2095,7 +1929,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   })
 })
 
-describe('Windows write-restricted token, the default: write roots are granted once and kept (pure, all platforms)', () => {
+describe('Windows write roots are granted once and kept (pure, all platforms)', () => {
   const SID = 'S-1-5-21-1'
   const RAW_USER = {
     user: {
@@ -2234,7 +2068,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
     rmSync(dir, { recursive: true, force: true })
   })
 
-  const config = (writeRestrictedToken?: boolean): SandboxRuntimeConfig => ({
+  const config = (): SandboxRuntimeConfig => ({
     network: {
       allowedDomains: [],
       deniedDomains: [],
@@ -2247,10 +2081,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
       allowWrite: [dir],
       denyWrite: [],
     },
-    windows: {
-      srtWin: { path: process.execPath },
-      ...(writeRestrictedToken !== undefined && { writeRestrictedToken }),
-    },
+    windows: { srtWin: { path: process.execPath } },
   })
   const rejection = async (
     cfg: SandboxRuntimeConfig,
@@ -2263,15 +2094,9 @@ describe('Windows write-restricted token, the default: write roots are granted o
     throw new Error('expected initialize() to reject')
   }
 
-  // Unset and `true` are the same session, call for call.
-  const ON: [string, true | undefined][] = [
-    ['default (option unset)', undefined],
-    ['option true', true],
-  ]
-
-  for (const [mode, opt] of ON) {
-    it(`${mode}: one acl grant --persistent carries roots and denies; no per-session grant or stamp; the probe gets the roots; exec gets --write-root`, async () => {
-      await SandboxManager.initialize(config(opt))
+  describe('session start', () => {
+    it('one acl grant --persistent carries roots and denies; no per-session grant or stamp; the probe gets the roots; exec gets --write-root', async () => {
+      await SandboxManager.initialize(config())
       expect(subs()).toEqual(['grant'])
       expect(acl[0].argv).toContain('--persistent')
       const stdin = acl[0].stdin as Record<string, string[]>
@@ -2281,7 +2106,6 @@ describe('Windows write-restricted token, the default: write roots are granted o
       expect(stdin.denyWrite).toEqual([])
       // The probe runs after the grant: the capability SIDs exist only then.
       expect(verifyCalls).toHaveLength(1)
-      expect(verifyCalls[0]?.writeRestrictedToken).toBe(true)
       expect(verifyCalls[0]?.writeRoots).toEqual(stdin.write)
 
       const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
@@ -2299,40 +2123,39 @@ describe('Windows write-restricted token, the default: write roots are granted o
       )
     })
 
-    it(`${mode}: reset() releases only what was per-session; nothing forgets the roots`, async () => {
-      await SandboxManager.initialize(config(opt))
+    it('reset() releases only what was per-session; nothing forgets the roots', async () => {
+      await SandboxManager.initialize(config())
       await SandboxManager.reset()
       expect(subs()).toEqual(['grant', 'revoke', 'restore'])
       expect(subs()).not.toContain('forget')
     })
 
-    it(`${mode}: the fence is probed once per sandbox account, not on every initialize()`, async () => {
-      await SandboxManager.initialize(config(opt))
+    it('the fence is probed once per sandbox account, not on every initialize()', async () => {
+      await SandboxManager.initialize(config())
       await SandboxManager.reset()
-      await SandboxManager.initialize(config(opt))
+      await SandboxManager.initialize(config())
       expect(verifyCalls).toHaveLength(1)
-      expect(verifyCalls[0]?.writeRestrictedToken).toBe(true)
       expect(verifyCalls[0]?.writeRoots).toHaveLength(1)
       // Another account (a reinstall) is probed again.
       await SandboxManager.reset()
       sid = `${SID}-other-${accounts}`
-      await SandboxManager.initialize(config(opt))
+      await SandboxManager.initialize(config())
       expect(verifyCalls).toHaveLength(2)
     })
 
-    it(`${mode}: a probe that is not blocked is not remembered`, async () => {
+    it('a probe that is not blocked is not remembered', async () => {
       verifyResult = () =>
         Promise.reject(
           new WindowsSandboxError('wfp_fence_inactive', 'connected'),
         )
-      await rejection(config(opt))
+      await rejection(config())
       verifyResult = () => Promise.resolve({ outcome: 'blocked' })
-      await SandboxManager.initialize(config(opt))
+      await SandboxManager.initialize(config())
       expect(verifyCalls).toHaveLength(2)
     })
 
-    it(`${mode}: a session with nothing to grant still probes, with no roots`, async () => {
-      const cfg = config(opt)
+    it('a session with nothing to grant still probes, with no roots', async () => {
+      const cfg = config()
       cfg.filesystem = {
         denyRead: [],
         allowRead: [],
@@ -2349,9 +2172,9 @@ describe('Windows write-restricted token, the default: write roots are granted o
     })
 
     for (const status of [1, 2]) {
-      it(`${mode}: acl grant --persistent exits ${status} → initialize() rejects; no fallback to a per-session grant, no probe, no command`, async () => {
+      it('acl grant --persistent exits ${status} → initialize() rejects; no fallback to a per-session grant, no probe, no command', async () => {
         aclResult.grant = exit(status)
-        const e = await rejection(config(opt))
+        const e = await rejection(config())
         expect(e.code).toBe('acl_grant_failed')
         expect(subs().filter(s => s === 'grant')).toHaveLength(1)
         expect(subs()).not.toContain('stamp')
@@ -2361,59 +2184,24 @@ describe('Windows write-restricted token, the default: write roots are granted o
       })
     }
 
-    it(`${mode}: the probe is not blocked → initialize() rejects, and nothing probes or grants again for the ordinary token`, async () => {
+    it('the probe is not blocked → initialize() rejects and releases what it granted', async () => {
       verifyResult = () =>
         Promise.reject(
           new WindowsSandboxError('wfp_fence_inactive', 'connected'),
         )
-      const e = await rejection(config(opt))
+      const e = await rejection(config())
       expect(e.code).toBe('wfp_fence_inactive')
       expect(SandboxManager.getConfig()).toBeUndefined()
       expect(subs()).toEqual(['grant', 'revoke', 'restore'])
       expect(acl[0].argv).toContain('--persistent')
       expect(verifyCalls).toHaveLength(1)
-      expect(verifyCalls[0]?.writeRestrictedToken).toBe(true)
     })
 
-    it(`${mode} with kept grants reported: nothing is forgotten`, async () => {
+    it('with kept grants reported: nothing is forgotten', async () => {
       persistentGrants = { state: 'present', roots: [dir] }
-      await SandboxManager.initialize(config(opt))
+      await SandboxManager.initialize(config())
       expect(subs()).toEqual(['grant'])
     })
-  }
-
-  it('unset and true: the same acl calls, the same probe, the same wrapped argv', async () => {
-    const session = async (opt: true | undefined) => {
-      acl = []
-      verifyCalls = []
-      // An account of its own, so that each session probes.
-      sid = `${SID}-${++accounts}`
-      await SandboxManager.initialize(config(opt))
-      const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
-      await SandboxManager.reset()
-      return {
-        acl: JSON.parse(JSON.stringify(acl).split(sid).join('SID')) as unknown,
-        probes: verifyCalls.map(v => ({
-          writeRestrictedToken: v?.writeRestrictedToken,
-          writeRoots: v?.writeRoots,
-        })),
-        argv,
-      }
-    }
-    const unset = await session(undefined)
-    expect(await session(true)).toEqual(unset)
-    expect(unset.argv).toContain('--write-restricted-token')
-  })
-
-  it('an initialize() that fails under the ordinary token leaves the default behind', async () => {
-    aclResult.grant = exit(1)
-    await rejection(config(false))
-    const { argv } = await SandboxManager.wrapWithSandboxArgv(
-      'echo x',
-      undefined,
-      { windows: { srtWin: { path: process.execPath } } },
-    )
-    expect(argv).toContain('--write-restricted-token')
   })
 
   it('a wrap outside a session gets the write-restricted token, with no roots', async () => {
@@ -2426,94 +2214,8 @@ describe('Windows write-restricted token, the default: write roots are granted o
     expect(argv).not.toContain('--write-root')
   })
 
-  it('a per-command option that differs from the session is refused, in either direction', async () => {
-    const wrap = (writeRestrictedToken: boolean) =>
-      SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
-        windows: { srtWin: { path: process.execPath }, writeRestrictedToken },
-      })
-    await SandboxManager.initialize(config())
-    expect((await wrap(true)).argv).toContain('--write-restricted-token')
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-    await expect(wrap(false)).rejects.toThrow(/Per-command/)
-    await SandboxManager.reset()
-    await SandboxManager.initialize(config(false))
-    expect((await wrap(false)).argv).not.toContain('--write-restricted-token')
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-    await expect(wrap(true)).rejects.toThrow(/Per-command/)
-  })
-
-  it('option false, no kept grants reported: the per-session calls and the ordinary-token argv, exactly — no forget, no --persistent, no token flag', async () => {
-    for (const reported of [undefined, { state: 'none', roots: [] }]) {
-      persistentGrants = reported
-      acl = []
-      await SandboxManager.initialize(config(false))
-      expect(acl.map(c => [c.sub, ...c.argv])).toEqual([
-        ['grant', '--holder-pid', `${process.pid}`, '--sandbox-user-sid', sid],
-        ['stamp', '--holder-pid', `${process.pid}`, '--sandbox-user-sid', sid],
-      ])
-      const granted = acl[0].stdin as Record<string, string[]>
-      expect(Object.keys(granted).sort()).toEqual(['read', 'write'])
-      expect(granted.write).toHaveLength(1)
-      for (const v of verifyCalls) {
-        expect(v?.writeRestrictedToken).toBe(false)
-        expect(v?.writeRoots).toBeUndefined()
-      }
-      const { argv } = await SandboxManager.wrapWithSandboxArgv(
-        'echo x',
-        { exe: 'C:\\sh.exe', args: ['-c'] },
-        undefined,
-        undefined,
-        dir,
-      )
-      // Head and tail in full; between them only --env pairs.
-      expect(argv.slice(0, 4)).toEqual([
-        process.execPath,
-        SRT_WIN_DISPATCH_ARG1,
-        'exec',
-        '--quiet',
-      ])
-      const dashes = argv.indexOf('--')
-      expect(argv.slice(dashes)).toEqual(['--', 'C:\\sh.exe', '-c', 'echo x'])
-      const between = argv.slice(4, dashes)
-      const flagSlots = between.filter((_, i) => i % 2 === 0)
-      expect(flagSlots).toEqual(flagSlots.map(() => '--env'))
-      expect(argv.join(' ')).not.toContain('http.sslBackend')
-      expect(argv).not.toContain('--write-restricted-token')
-      expect(argv).not.toContain('--write-root')
-      await SandboxManager.reset()
-    }
-  })
-
-  for (const reported of [
-    { state: 'present', roots: ['C:\\kept'] },
-    // The marker or the database cannot be read: grants may exist.
-    { state: 'unknown', roots: [], reason: 'state database is missing' },
-    // A state this code does not know is not "none".
-    { state: 'someLaterState' },
-  ]) {
-    it(`option false, kept grants ${reported.state}: they are forgotten before anything is granted`, async () => {
-      persistentGrants = reported
-      await SandboxManager.initialize(config(false))
-      expect(subs()).toEqual(['forget', 'grant', 'stamp'])
-      expect(acl[0].argv).toEqual(['--all'])
-    })
-
-    it(`option false, kept grants ${reported.state}: forget fails → initialize() rejects with nothing granted, and does not fall back to the write-restricted token`, async () => {
-      persistentGrants = reported
-      aclResult.forget = exit(1)
-      const e = await rejection(config(false))
-      expect(e.code).toBe('acl_forget_failed')
-      expect(subs()).toEqual(['forget'])
-      expect(verifyCalls).toHaveLength(0)
-      expect(SandboxManager.getConfig()).toBeUndefined()
-    })
-  }
-
-  for (const [mode, opt] of [...ON, ['option false', false]] as [
-    string,
-    boolean | undefined,
-  ][]) {
-    it(`${mode}: an install of another setup version → initialize() asks for a re-install and makes no acl call`, async () => {
+  describe('setup version', () => {
+    it('an install of another setup version → initialize() asks for a re-install and makes no acl call', async () => {
       setupVersions = { marker_version: 2, setup_version: 3 }
       persistentGrants = { state: 'present', roots: ['C:\\kept'] }
       const stale = (e: Error) => {
@@ -2525,7 +2227,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
         expect(verifyCalls).toHaveLength(0)
       }
       // The dependency check reports it first, as the typed error.
-      const first = await rejection(config(opt))
+      const first = await rejection(config())
       expect(first).toBeInstanceOf(WindowsSandboxError)
       expect(first.code).toBe('reinstall_required')
       stale(first)
@@ -2535,7 +2237,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
         'checkWindowsDependenciesAsync',
       ).mockResolvedValue({ errors: [], warnings: [] })
       try {
-        const e = await rejection(config(opt))
+        const e = await rejection(config())
         expect(e).toBeInstanceOf(WindowsSandboxError)
         expect(e.code).toBe('reinstall_required')
         stale(e)
@@ -2544,7 +2246,7 @@ describe('Windows write-restricted token, the default: write roots are granted o
         deps.mockRestore()
       }
     })
-  }
+  })
 
   it('the install is of this setup version, or srt-win reports none: initialize() proceeds', async () => {
     for (const v of [{ marker_version: 3, setup_version: 3 }, {}]) {
@@ -2557,16 +2259,11 @@ describe('Windows write-restricted token, the default: write roots are granted o
   })
 })
 
-// Run once per child-token mode: the release is the same in both.
-function restoreGatedOnACompletedRevoke(
-  writeRestrictedToken: false | undefined,
-): void {
-  const perSession = writeRestrictedToken === false
-  /** The `acl` calls a session start makes. */
-  const START = perSession ? ['grant', 'stamp'] : ['grant']
-  /** The last of them, and what initialize() rejects with when it fails. */
-  const LAST_START_CALL = perSession ? 'stamp' : 'grant'
-  const START_FAILED = perSession ? 'acl_stamp_failed' : 'acl_grant_failed'
+describe('Windows session ACLs: restore gated on a completed revoke (pure, all platforms)', () => {
+  /** The `acl` call a session start makes. */
+  const START = ['grant']
+  /** What initialize() rejects with when it fails. */
+  const START_FAILED = 'acl_grant_failed'
   const SID = 'S-1-5-21-1'
   // spawnSync is stubbed, so any existing file does.
   const STUB_SRT_WIN = resolveSrtWin({ path: process.execPath })
@@ -2740,15 +2437,12 @@ function restoreGatedOnACompletedRevoke(
       allowWrite: [dir],
       denyWrite: [],
     },
-    windows: {
-      srtWin: { path: process.execPath },
-      ...(perSession && { writeRestrictedToken: false }),
-    },
+    windows: { srtWin: { path: process.execPath } },
   })
 
-  /** initialize() whose last `acl` call fails, so its failure cleanup runs. */
+  /** initialize() whose `acl grant` fails, so its failure cleanup runs. */
   const failingInitialize = async (): Promise<WindowsSandboxError> => {
-    aclResult[LAST_START_CALL] = exit(2, '')
+    aclResult.grant = exit(2, '')
     try {
       await SandboxManager.initialize(config())
     } catch (e) {
@@ -2871,31 +2565,13 @@ function restoreGatedOnACompletedRevoke(
     expect(r.pending).toEqual(['C:\\tree'])
   })
 
-  it.if(perSession)(
-    'windows.writeRestrictedToken turned on by updateConfig(): the wrap throws',
-    async () => {
-      await SandboxManager.initialize(config())
-      const next = config()
-      next.windows = { ...next.windows, writeRestrictedToken: true }
-      SandboxManager.updateConfig(next)
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-      await expect(
-        SandboxManager.wrapWithSandboxArgv('echo x'),
-      ).rejects.toThrow(/turned on after initialize\(\)/)
-    },
-  )
-
   it('reset(): a restore that fails after a completed revoke stays best-effort', async () => {
     await SandboxManager.initialize(config())
     aclResult.restore = exit(1, 'boom')
     await SandboxManager.reset()
     expect(aclCalls).toEqual(WITH_RESTORE)
   })
-}
-describe('Windows session ACLs: restore gated on a completed revoke (pure, all platforms)', () =>
-  restoreGatedOnACompletedRevoke(undefined))
-describe('Windows session ACLs, writeRestrictedToken: false: restore gated on a completed revoke (pure, all platforms)', () =>
-  restoreGatedOnACompletedRevoke(false))
+})
 
 describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('getSrtWinPath resolves to an existing binary', () => {
@@ -2964,16 +2640,11 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       // ALE_AUTH_CONNECT before any packet leaves → WSAEACCES. The
       // probe binds a local out-of-range loopback listener; no
       // external host involved.
-      // Probed under both child tokens: the default (write-restricted)
-      // one, by a lockdown child holding it, and the ordinary one.
-      for (const writeRestrictedToken of [undefined, false]) {
-        const v = await verifyWindowsWfpEgress({
-          proxyPortRange: PORT_RANGE,
-          writeRestrictedToken,
-          srtWin: TEST_SRT_WIN,
-        })
-        expect(v.target).toMatch(/^127\.0\.0\.1:\d+$/)
-      }
+      const v = await verifyWindowsWfpEgress({
+        proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
+      })
+      expect(v.target).toMatch(/^127\.0\.0\.1:\d+$/)
       // Filters removed, sandbox user kept → fence inactive →
       // throws. This is the throw initialize() relays when a stale
       // install (user provisioned, filters since removed) would
@@ -2986,16 +2657,13 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
         keepUser: true,
         srtWin: TEST_SRT_WIN,
       })
-      for (const writeRestrictedToken of [undefined, false]) {
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-        await expect(
-          verifyWindowsWfpEgress({
-            proxyPortRange: PORT_RANGE,
-            writeRestrictedToken,
-            srtWin: TEST_SRT_WIN,
-          }),
-        ).rejects.toThrow(/WFP egress fence/i)
-      }
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+      await expect(
+        verifyWindowsWfpEgress({
+          proxyPortRange: PORT_RANGE,
+          srtWin: TEST_SRT_WIN,
+        }),
+      ).rejects.toThrow(/WFP egress fence/i)
     } finally {
       uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
     }
@@ -3131,7 +2799,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     // (~8s on the CI runner), same budget as the verify test above.
   }, 60_000)
 
-  it('default token: initialize() verifies the fence with it, exec carries the flag, a per-command override is refused; writeRestrictedToken: false gives the ordinary token back', async () => {
+  it('initialize() verifies the fence under the write-restricted token and exec carries the flag', async () => {
     installWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
@@ -3157,39 +2825,12 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       })
       expectStatus('write-restricted echo', r, [0])
       expect(r.stdout).toContain('WR-TOKEN-OK')
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-      await expect(
-        SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
-          windows: { writeRestrictedToken: false },
-        }),
-      ).rejects.toThrow(/Per-command windows\.writeRestrictedToken/)
     } finally {
       await SandboxManager.reset()
     }
-    await SandboxManager.initialize(onOrdinaryToken(createTestConfig()))
-    try {
-      const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
-      expect(argv).not.toContain('--write-restricted-token')
-      expect(argv).not.toContain('--write-root')
-      expect(argv.join(' ')).not.toContain('http.sslBackend')
-      const r = await runSandboxedUntil(
-        `"${SYSTEM32_CURL}" -sS -m 15 -o NUL -w "%{http_code}" https://example.com/`,
-        got200,
-      )
-      expectStatus('ordinary-token System32 curl', r, [0])
-      expect(r.stdout.trim()).toBe('200')
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-      await expect(
-        SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
-          windows: { writeRestrictedToken: true },
-        }),
-      ).rejects.toThrow(/Per-command windows\.writeRestrictedToken/)
-    } finally {
-      await SandboxManager.reset()
-    }
-  }, 180_000)
+  }, 120_000)
 
-  it('default token: a write root is writable to its own session only and readable from any, is kept at reset(), and is removed by a session with writeRestrictedToken: false', async () => {
+  it('a write root is writable to its own session only and readable from any, is kept at reset(), and is removed by acl forget --all', async () => {
     installWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
@@ -3198,7 +2839,6 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     // Long-form paths: the sandbox account cannot resolve an 8.3 component.
     const rootA = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-a-')))
     const rootB = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-wr-b-')))
-    // No option set: the default.
     const withRoots = (roots: string[]): SandboxRuntimeConfig => {
       const cfg = createTestConfig()
       cfg.filesystem.allowWrite = roots
@@ -3233,13 +2873,17 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       await SandboxManager.reset()
       expect(kept()?.roots).toHaveLength(2)
 
-      // Opted out: the kept grants are removed first.
-      await SandboxManager.initialize(onOrdinaryToken(withRoots([rootA])))
+      const forget = spawnSync(
+        TEST_SRT_WIN!.exe,
+        [...TEST_SRT_WIN!.prependArgs, 'acl', 'forget', '--all'],
+        { encoding: 'utf8', timeout: 120_000 },
+      )
+      expect(forget.status).toBe(0)
       expect(kept()).toBeUndefined()
-      expect(await write(join(rootA, 'off.txt'))).toBe(true)
-      expect(await write(join(rootB, 'off.txt'))).toBe(false)
-      expect(await read(join(rootA, 'seed.txt'))).toContain('SEED-IN-A')
-      expect(await read(join(rootB, 'seed.txt'))).not.toContain('SEED-IN-B')
+      // With the grants gone, no session's token writes or reads A.
+      await SandboxManager.initialize(withRoots([rootB]))
+      expect(await write(join(rootA, 'after.txt'))).toBe(false)
+      expect(await read(join(rootA, 'seed.txt'))).not.toContain('SEED-IN-A')
     } finally {
       await SandboxManager.reset()
       rmSync(rootA, { recursive: true, force: true })
@@ -3288,13 +2932,11 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(deps.errors).toHaveLength(1)
       expect(deps.errors[0]).toMatch(/Re-run the install/)
       expect(deps.errors[0]).not.toMatch(/not provisioned/i)
-      for (const c of [cfg, onOrdinaryToken(cfg)]) {
-        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-        await expect(SandboxManager.initialize(c)).rejects.toThrow(
-          /Re-run the install/,
-        )
-        await SandboxManager.reset()
-      }
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+      await expect(SandboxManager.initialize(cfg)).rejects.toThrow(
+        /Re-run the install/,
+      )
+      await SandboxManager.reset()
       const grant = spawnSync(
         TEST_SRT_WIN!.exe,
         [
@@ -3321,20 +2963,22 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(grant.status).toBe(15)
       expect(grant.stderr).toMatch(/re-run `srt-win install`/)
       expect(status().persistentGrants).toBeUndefined()
-      for (const writeRestrictedToken of [undefined, false]) {
+      {
         const { argv, env } = wrapCommandWithSandboxWindows({
           command: 'echo V2-RAN',
-          writeRestrictedToken,
           quiet: false,
           srtWin: TEST_SRT_WIN,
         })
-        const r = await spawnAsync(argv[0], argv.slice(1), {
-          timeout: 60_000,
-          env,
-        })
-        expect(r.status).toBe(15)
-        expect(r.stdout).not.toContain('V2-RAN')
-        expect(r.stderr).toMatch(/re-run `srt-win install`/)
+        // The broker holds the same line with and without the token flag.
+        for (const a of [
+          argv,
+          argv.filter(x => x !== '--write-restricted-token'),
+        ]) {
+          const r = await spawnAsync(a[0], a.slice(1), { timeout: 60_000, env })
+          expect(r.status).toBe(15)
+          expect(r.stdout).not.toContain('V2-RAN')
+          expect(r.stderr).toMatch(/re-run `srt-win install`/)
+        }
       }
 
       // The repair: the same install command, which upgrades in place.
@@ -4080,541 +3724,518 @@ describe.if(isWindows)(
       }
     }, 90_000)
 
-    for (const ordinaryToken of [false, true]) {
-      describe(
-        ordinaryToken
-          ? 'files, writeRestrictedToken: false'
-          : 'files, default token',
-        () => {
-          // ── H5-H8: FS parity via SandboxManager (grant + deny ACEs) ──
-          let hScratch: string
-          let hSecret: string
-          let hSibling: string
+    describe('files', () => {
+      // ── H5-H8: FS parity via SandboxManager (grant + deny ACEs) ──
+      let hScratch: string
+      let hSecret: string
+      let hSibling: string
 
-          type FsOverrides = Partial<SandboxRuntimeConfig['filesystem']>
-          function createFsTestConfig(fs: FsOverrides): SandboxRuntimeConfig {
-            const base = ordinaryToken
-              ? onOrdinaryToken(createTestConfig())
-              : createTestConfig()
-            return { ...base, filesystem: { ...base.filesystem, ...fs } }
-          }
+      type FsOverrides = Partial<SandboxRuntimeConfig['filesystem']>
+      function createFsTestConfig(fs: FsOverrides): SandboxRuntimeConfig {
+        const base = createTestConfig()
+        return { ...base, filesystem: { ...base.filesystem, ...fs } }
+      }
 
-          async function rexecSandboxed(cmd: string, fs: FsOverrides) {
-            await SandboxManager.initialize(createFsTestConfig(fs))
-            try {
-              const wrapped = await SandboxManager.wrapWithSandboxArgv(cmd)
-              return await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
-                env: wrapped.env,
-                timeout: 60_000,
-              })
-            } finally {
-              await SandboxManager.reset()
-            }
-          }
-
-          it('H5: allowWrite grants the working tree — child reads sibling', async () => {
-            hScratch = mkdtempSync(join(tmpdir(), 'srt-h-'))
-            hSecret = join(hScratch, 'secret.txt')
-            hSibling = join(hScratch, 'sibling.txt')
-            writeFileSync(hSecret, 'SECRET')
-            writeFileSync(hSibling, 'SIBLING')
-            const r = await rexecSandboxed(`type "${hSibling}"`, {
-              allowWrite: [hScratch],
-            })
-            if (r.status !== 0 || !r.stdout.includes('SIBLING')) {
-              throw new Error(
-                `H5: child read sibling under allowWrite tree failed — ` +
-                  `exit=${r.status} stderr=${JSON.stringify(r.stderr)} ` +
-                  `stdout=${JSON.stringify(r.stdout)}`,
-              )
-            }
-          }, 90_000)
-
-          it('H6: allowWrite + denyRead — secret denied, sibling readable', async () => {
-            const r = await rexecSandboxed(
-              `type "${hSecret}" & echo --SEP-- & type "${hSibling}"`,
-              { allowWrite: [hScratch], denyRead: [hSecret] },
-            )
-            if (r.stdout.includes('SECRET')) {
-              throw new Error(
-                `H6: child read the denyRead target — ` +
-                  `stdout=${JSON.stringify(r.stdout)}`,
-              )
-            }
-            if (!r.stdout.includes('SIBLING')) {
-              throw new Error(
-                `H6: sibling unreadable post-stamp — ` +
-                  `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
-              )
-            }
-          }, 90_000)
-
-          it('H-denyWrite: child cannot write the denyWrite target', async () => {
-            // denyWrite blocks writes and leaves reads open (acl.rs
-            // DenyMask::WriteDeny strips SYNCHRONIZE); this asserts the
-            // write half, smoke-aces A2 the read half.
-            const hCfg = join(hScratch, 'cfg.txt')
-            writeFileSync(hCfg, 'CONFIG-V1')
-            const w = await rexecSandboxed(`echo POISONED>"${hCfg}"`, {
-              allowWrite: [hScratch],
-              denyWrite: [hCfg],
-            })
-            const after = readFileSync(hCfg, 'utf8')
-            if (after !== 'CONFIG-V1') {
-              throw new Error(
-                `H-denyWrite: target was modified — ` +
-                  `content=${JSON.stringify(after)} exit=${w.status} ` +
-                  `stderr=${JSON.stringify(w.stderr)}`,
-              )
-            }
-          }, 90_000)
-
-          it('H7: no allowWrite — child has no rights on real-user file', async () => {
-            // H5's root keeps its grant, and a kept root is readable.
-            const never = mkdtempSync(join(tmpdir(), 'srt-h7-'))
-            const file = join(never, 'mine.txt')
-            writeFileSync(file, 'NEVER-GRANTED')
-            try {
-              const r = await rexecSandboxed(`type "${file}"`, {})
-              if (r.status === 0 || r.stdout.includes('NEVER-GRANTED')) {
-                throw new Error(
-                  `H7: child read a real-user file with no grant — ` +
-                    `exit=${r.status} stdout=${JSON.stringify(r.stdout)}`,
-                )
-              }
-            } finally {
-              rmSync(never, { recursive: true, force: true })
-            }
-          }, 90_000)
-
-          it('H-glob: per-exec denyRead glob — expanded TS-side, both denied, restored', async () => {
-            // Per-exec denyRead globs must go through expandWindowsFsPaths,
-            // the same chokepoint as session-level: srt-win's
-            // canonicalize_path rejects a raw glob.
-            const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
-            const a = join(dir, 'glob-a.secret')
-            const b = join(dir, 'glob-b.secret')
-            writeFileSync(a, 'GLOB-A')
-            writeFileSync(b, 'GLOB-B')
-            await SandboxManager.initialize(
-              createFsTestConfig({ allowWrite: [dir] }),
-            )
-            try {
-              const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-                `type "${a}" & echo --SEP-- & type "${b}"`,
-                undefined,
-                {
-                  filesystem: {
-                    denyRead: [join(dir, 'glob-*.secret')],
-                    allowWrite: [],
-                    denyWrite: [],
-                  },
-                },
-              )
-              // Glob expanded TS-side: exactly two --deny-read flags;
-              // no glob char survives onto the argv (Rust would
-              // hard-fail otherwise).
-              const denyIdx = argv.flatMap((x, i) =>
-                x === '--deny-read' ? [i] : [],
-              )
-              if (denyIdx.length !== 2) {
-                throw new Error(
-                  `H-glob: expected 2 --deny-read flags after glob expand; ` +
-                    `got ${denyIdx.length}: ${JSON.stringify(argv)}`,
-                )
-              }
-              for (const i of denyIdx) {
-                if (argv[i + 1].includes('*') || argv[i + 1].includes('?')) {
-                  throw new Error(
-                    `H-glob: glob char survived into --deny-read value ` +
-                      `'${argv[i + 1]}' — per-exec expand not applied`,
-                  )
-                }
-              }
-              const r = await spawnAsync(argv[0], argv.slice(1), {
-                env,
-                timeout: 60_000,
-              })
-              if (r.stdout.includes('GLOB-A') || r.stdout.includes('GLOB-B')) {
-                throw new Error(
-                  `H-glob: child read a glob-expanded deny target — ` +
-                    `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
-                )
-              }
-              // Per-exec restore: a fresh child (no customConfig) under
-              // the same session can read both — proves the per-exec
-              // stamp was lifted on child exit, not leaked onto disk.
-              const wf = await SandboxManager.wrapWithSandboxArgv(
-                `type "${a}" & type "${b}"`,
-              )
-              const rR = await spawnAsync(wf.argv[0], wf.argv.slice(1), {
-                env: wf.env,
-                timeout: 60_000,
-              })
-              if (
-                !rR.stdout.includes('GLOB-A') ||
-                !rR.stdout.includes('GLOB-B')
-              ) {
-                throw new Error(
-                  `H-glob: per-exec stamp NOT restored — fresh child still ` +
-                    `denied. stdout=${JSON.stringify(rR.stdout)} ` +
-                    `stderr=${JSON.stringify(rR.stderr)}`,
-                )
-              }
-            } finally {
-              await SandboxManager.reset()
-              rmSync(dir, { recursive: true, force: true })
-            }
-          }, 120_000)
-
-          it(
-            ordinaryToken
-              ? 'H8: reset() revokes the grant — sandbox-user ACE gone'
-              : 'H8: reset() keeps the write root granted — to no sandbox-user ACE',
-            async () => {
-              // After H5/H6/H7's reset() calls, the root's DACL must NOT
-              // carry an explicit ACE for the sandbox user.
-              const out = spawnSync('icacls', [hScratch], {
-                encoding: 'utf8',
-                timeout: 5_000,
-              })
-              if (
-                out.stdout.includes(sbSid) ||
-                out.stdout.includes('srt-sandbox')
-              ) {
-                throw new Error(
-                  `H8: srt-sandbox ACE still on '${hScratch}' after reset(): ` +
-                    out.stdout,
-                )
-              }
-              // A kept grant carries the root's own `S-1-0-1936880739-…` SID.
-              expect(out.stdout.includes('S-1-0-1936880739-')).toBe(
-                !ordinaryToken,
-              )
-              rmSync(hScratch, { recursive: true, force: true })
-            },
-            30_000,
-          )
-
-          // ── L-rows: how the lists rank against each other ──
-          // A tree per row: d\own.txt, d\sub\in.txt, beside\b.txt, and to-d, a
-          // junction to d. Each row logs what it ran, so a job log tells a row
-          // that ran from one that was skipped.
-          describe('L-rows: how the lists rank', () => {
-            let spelled: string
-            let root: string
-            const at = (rel: string): string => join(root, rel)
-            const CONTENT: Record<string, string> = {
-              'd/own.txt': 'IN-D',
-              'd/sub/in.txt': 'IN-SUB',
-              'beside/b.txt': 'IN-BESIDE',
-            }
-
-            beforeEach(() => {
-              spelled = mkdtempSync(join(tmpdir(), 'srt-l-'))
-              root = realpathSync.native(spelled)
-              for (const [rel, content] of Object.entries(CONTENT)) {
-                mkdirSync(dirname(at(rel)), { recursive: true })
-                writeFileSync(at(rel), content)
-              }
-              symlinkSync(at('d'), at('to-d'), 'junction')
-            })
-
-            afterEach(() => {
-              try {
-                rmSync(root, { recursive: true, force: true })
-              } catch {
-                // Not every runtime removes a junction.
-              }
-            })
-
-            type Expected = {
-              /** A file of CONTENT, and whether the command reads it. */
-              reads?: Record<string, boolean>
-              /** A file, there or not, and whether the command writes it. */
-              writes?: Record<string, boolean>
-            }
-
-            /** One command that tries all of `expected`, held against it. */
-            async function tryAll(
-              id: string,
-              expected: Expected,
-              customConfig?: Partial<SandboxRuntimeConfig>,
-            ): Promise<void> {
-              const reads = Object.entries(expected.reads ?? {})
-              const writes = Object.entries(expected.writes ?? {})
-              const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-                [
-                  'echo RAN',
-                  // `type` lists the folder first; `<` opens the file alone.
-                  ...reads.map(
-                    ([rel]) => `type "${at(rel)}" & more < "${at(rel)}"`,
-                  ),
-                  ...writes.map(([rel]) => `echo WROTE>"${at(rel)}"`),
-                ].join(' & '),
-                undefined,
-                customConfig,
-              )
-              const r = await spawnAsync(argv[0], argv.slice(1), {
-                env,
-                timeout: 60_000,
-              })
-              const found = {
-                reads: Object.fromEntries(
-                  reads.map(([rel]) => [rel, r.stdout.includes(CONTENT[rel])]),
-                ),
-                writes: Object.fromEntries(
-                  writes.map(([rel]) => [
-                    rel,
-                    existsSync(at(rel)) &&
-                      readFileSync(at(rel), 'utf8').includes('WROTE'),
-                  ]),
-                ),
-              }
-              console.error(
-                `[winsrt ${id}] ran: exit=${r.status} found=${JSON.stringify(found)} ` +
-                  `stderr=${JSON.stringify(r.stderr)}`,
-              )
-              expect(r.stdout).toContain('RAN')
-              expect(found).toEqual({
-                reads: expected.reads ?? {},
-                writes: expected.writes ?? {},
-              })
-            }
-
-            /** `run` in a session of these lists. */
-            async function inSession(
-              fs: FsOverrides,
-              files: CredentialFileConfig[],
-              run: () => Promise<void>,
-            ): Promise<void> {
-              await SandboxManager.initialize({
-                ...createFsTestConfig(fs),
-                credentials: { files },
-              })
-              try {
-                await run()
-              } finally {
-                await SandboxManager.reset()
-              }
-              for (const rel of ['.', 'beside', 'd', 'd/own.txt', 'd/sub']) {
-                const acl = spawnSync('icacls', [at(rel)], {
-                  encoding: 'utf8',
-                  timeout: 5_000,
-                }).stdout
-                expect(acl).toContain(root)
-                expect(acl).not.toContain(sbSid)
-                expect(acl).not.toContain('srt-sandbox')
-              }
-            }
-
-            type Lists = Partial<
-              Record<
-                'allowRead' | 'allowWrite' | 'denyRead' | 'denyWrite',
-                string[]
-              >
-            >
-            it.each<[string, string, Lists, CredentialFileConfig[], Expected]>([
-              [
-                'L1',
-                'a denyWrite inside an allowWrite: written around, read within',
-                { allowWrite: ['.'], denyWrite: ['d'] },
-                [],
-                {
-                  reads: { 'd/own.txt': true, 'd/sub/in.txt': true },
-                  writes: {
-                    'new.txt': true,
-                    'd/new.txt': false,
-                    'd/sub/new.txt': false,
-                  },
-                },
-              ],
-              [
-                'L2',
-                'an allowWrite beneath a denyWrite: read, not written; beside it: written',
-                { allowWrite: ['d/sub', 'beside'], denyWrite: ['d'] },
-                [],
-                {
-                  reads: { 'd/sub/in.txt': true, 'beside/b.txt': true },
-                  writes: {
-                    'd/sub/new.txt': false,
-                    'd/sub/in.txt': false,
-                    'beside/new.txt': true,
-                  },
-                },
-              ],
-              [
-                'L3',
-                'an allowWrite around and beneath a denyWrite: written around alone',
-                { allowWrite: ['.', 'd/sub'], denyWrite: ['d'] },
-                [],
-                {
-                  reads: { 'd/sub/in.txt': true },
-                  writes: { 'new.txt': true, 'd/sub/new.txt': false },
-                },
-              ],
-              [
-                'L4',
-                'an allowWrite beneath a denyWrite, named through a junction',
-                { allowWrite: ['to-d/sub'], denyWrite: ['d'] },
-                [],
-                {
-                  reads: { 'd/sub/in.txt': true },
-                  writes: { 'd/sub/new.txt': false },
-                },
-              ],
-              [
-                'L5',
-                'an allowRead beneath a denyRead: read',
-                { allowRead: ['d/sub', 'beside'], denyRead: ['d'] },
-                [],
-                {
-                  reads: {
-                    'd/sub/in.txt': true,
-                    'd/own.txt': false,
-                    'beside/b.txt': true,
-                  },
-                },
-              ],
-              [
-                'L6',
-                'a credential deny inside an allowWrite: neither read nor written',
-                { allowWrite: ['.'] },
-                [{ path: 'd', mode: 'deny' }],
-                {
-                  reads: {
-                    'd/own.txt': false,
-                    'd/sub/in.txt': false,
-                    'beside/b.txt': true,
-                  },
-                  writes: { 'd/new.txt': false, 'new.txt': true },
-                },
-              ],
-              [
-                'L7',
-                'an allowRead beneath a credential deny: not read',
-                { allowRead: ['d/sub', 'beside'] },
-                [{ path: 'd', mode: 'deny' }],
-                { reads: { 'd/sub/in.txt': false, 'beside/b.txt': true } },
-              ],
-              [
-                'L8',
-                'an allowWrite beneath a credential deny: neither read nor written',
-                { allowWrite: ['d/sub', 'beside'] },
-                [{ path: 'd', mode: 'deny' }],
-                {
-                  reads: { 'd/sub/in.txt': false, 'beside/b.txt': true },
-                  writes: { 'd/sub/new.txt': false, 'beside/new.txt': true },
-                },
-              ],
-              [
-                'L9',
-                'a masked file inside an allowWrite: neither read nor written',
-                { allowWrite: ['.'] },
-                [{ path: 'd/own.txt', mode: 'mask' }],
-                {
-                  reads: { 'd/own.txt': false, 'd/sub/in.txt': true },
-                  writes: { 'd/own.txt': false, 'd/new.txt': true },
-                },
-              ],
-              [
-                'L10',
-                'a masked file that is an allowRead too: not read',
-                { allowRead: ['d/own.txt', 'beside'] },
-                [{ path: 'd/own.txt', mode: 'mask' }],
-                { reads: { 'd/own.txt': false, 'beside/b.txt': true } },
-              ],
-              [
-                'L11',
-                'a masked file with no match, to be denied: not read',
-                { allowWrite: ['.'] },
-                [
-                  {
-                    path: 'd/own.txt',
-                    mode: 'mask',
-                    extract: 'absent-(text)',
-                    onExtractNoMatch: 'deny',
-                  },
-                ],
-                { reads: { 'd/own.txt': false, 'd/sub/in.txt': true } },
-              ],
-            ])(
-              '%s: %s',
-              async (id, _name, lists, files, expected) => {
-                await inSession(
-                  Object.fromEntries(
-                    Object.entries(lists).map(([list, rels]) => [
-                      list,
-                      rels.map(at),
-                    ]),
-                  ),
-                  files.map(f => ({ ...f, path: at(f.path) })),
-                  () => tryAll(id, expected),
-                )
-              },
-              90_000,
-            )
-
-            it('L12: an allowWrite beneath a denyWrite, each spelled its own way', async () => {
-              console.error(`[winsrt L12] spelled=${spelled} resolved=${root}`)
-              await inSession(
-                {
-                  allowWrite: [at('d/sub').toUpperCase()],
-                  denyWrite: [join(spelled, 'd')],
-                },
-                [],
-                () =>
-                  tryAll('L12', {
-                    reads: { 'd/sub/in.txt': true },
-                    writes: { 'd/sub/new.txt': false },
-                  }),
-              )
-            }, 90_000)
-
-            it("L13: one command's denyWrite over the session's allowWrite, for that command", async () => {
-              await inSession({ allowWrite: [at('d/sub')] }, [], async () => {
-                await tryAll(
-                  'L13 with',
-                  {
-                    reads: { 'd/sub/in.txt': true },
-                    writes: { 'd/sub/new.txt': false },
-                  },
-                  {
-                    filesystem: {
-                      denyRead: [],
-                      allowWrite: [],
-                      denyWrite: [at('d')],
-                    },
-                  },
-                )
-                await tryAll('L13 without', {
-                  writes: { 'd/sub/new.txt': true },
-                })
-              })
-            }, 120_000)
-
-            it("L14: one command's credential deny over the session's grants, for that command", async () => {
-              await inSession(
-                { allowRead: [at('d/sub')], allowWrite: [at('beside')] },
-                [],
-                async () => {
-                  await tryAll(
-                    'L14 with',
-                    { reads: { 'd/sub/in.txt': false, 'beside/b.txt': true } },
-                    {
-                      credentials: { files: [{ path: at('d'), mode: 'deny' }] },
-                    },
-                  )
-                  await tryAll('L14 without', {
-                    reads: { 'd/sub/in.txt': true },
-                  })
-                },
-              )
-            }, 120_000)
+      async function rexecSandboxed(cmd: string, fs: FsOverrides) {
+        await SandboxManager.initialize(createFsTestConfig(fs))
+        try {
+          const wrapped = await SandboxManager.wrapWithSandboxArgv(cmd)
+          return await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
+            env: wrapped.env,
+            timeout: 60_000,
           })
-        },
-      )
-    }
+        } finally {
+          await SandboxManager.reset()
+        }
+      }
+
+      it('H5: allowWrite grants the working tree — child reads sibling', async () => {
+        hScratch = mkdtempSync(join(tmpdir(), 'srt-h-'))
+        hSecret = join(hScratch, 'secret.txt')
+        hSibling = join(hScratch, 'sibling.txt')
+        writeFileSync(hSecret, 'SECRET')
+        writeFileSync(hSibling, 'SIBLING')
+        const r = await rexecSandboxed(`type "${hSibling}"`, {
+          allowWrite: [hScratch],
+        })
+        if (r.status !== 0 || !r.stdout.includes('SIBLING')) {
+          throw new Error(
+            `H5: child read sibling under allowWrite tree failed — ` +
+              `exit=${r.status} stderr=${JSON.stringify(r.stderr)} ` +
+              `stdout=${JSON.stringify(r.stdout)}`,
+          )
+        }
+      }, 90_000)
+
+      it('H6: allowWrite + denyRead — secret denied, sibling readable', async () => {
+        const r = await rexecSandboxed(
+          `type "${hSecret}" & echo --SEP-- & type "${hSibling}"`,
+          { allowWrite: [hScratch], denyRead: [hSecret] },
+        )
+        if (r.stdout.includes('SECRET')) {
+          throw new Error(
+            `H6: child read the denyRead target — ` +
+              `stdout=${JSON.stringify(r.stdout)}`,
+          )
+        }
+        if (!r.stdout.includes('SIBLING')) {
+          throw new Error(
+            `H6: sibling unreadable post-stamp — ` +
+              `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+          )
+        }
+      }, 90_000)
+
+      it('H-denyWrite: child cannot write the denyWrite target', async () => {
+        // denyWrite blocks writes and leaves reads open (acl.rs
+        // DenyMask::WriteDeny strips SYNCHRONIZE); this asserts the
+        // write half, smoke-aces A2 the read half.
+        const hCfg = join(hScratch, 'cfg.txt')
+        writeFileSync(hCfg, 'CONFIG-V1')
+        const w = await rexecSandboxed(`echo POISONED>"${hCfg}"`, {
+          allowWrite: [hScratch],
+          denyWrite: [hCfg],
+        })
+        const after = readFileSync(hCfg, 'utf8')
+        if (after !== 'CONFIG-V1') {
+          throw new Error(
+            `H-denyWrite: target was modified — ` +
+              `content=${JSON.stringify(after)} exit=${w.status} ` +
+              `stderr=${JSON.stringify(w.stderr)}`,
+          )
+        }
+      }, 90_000)
+
+      it('H7: no allowWrite — child has no rights on real-user file', async () => {
+        // H5's root keeps its grant, and a kept root is readable.
+        const never = mkdtempSync(join(tmpdir(), 'srt-h7-'))
+        const file = join(never, 'mine.txt')
+        writeFileSync(file, 'NEVER-GRANTED')
+        try {
+          const r = await rexecSandboxed(`type "${file}"`, {})
+          if (r.status === 0 || r.stdout.includes('NEVER-GRANTED')) {
+            throw new Error(
+              `H7: child read a real-user file with no grant — ` +
+                `exit=${r.status} stdout=${JSON.stringify(r.stdout)}`,
+            )
+          }
+        } finally {
+          rmSync(never, { recursive: true, force: true })
+        }
+      }, 90_000)
+
+      it('H-glob: per-exec denyRead glob — expanded TS-side, both denied, restored', async () => {
+        // Per-exec denyRead globs must go through expandWindowsFsPaths,
+        // the same chokepoint as session-level: srt-win's
+        // canonicalize_path rejects a raw glob.
+        const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
+        const a = join(dir, 'glob-a.secret')
+        const b = join(dir, 'glob-b.secret')
+        writeFileSync(a, 'GLOB-A')
+        writeFileSync(b, 'GLOB-B')
+        await SandboxManager.initialize(
+          createFsTestConfig({ allowWrite: [dir] }),
+        )
+        try {
+          const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+            `type "${a}" & echo --SEP-- & type "${b}"`,
+            undefined,
+            {
+              filesystem: {
+                denyRead: [join(dir, 'glob-*.secret')],
+                allowWrite: [],
+                denyWrite: [],
+              },
+            },
+          )
+          // Glob expanded TS-side: exactly two --deny-read flags;
+          // no glob char survives onto the argv (Rust would
+          // hard-fail otherwise).
+          const denyIdx = argv.flatMap((x, i) =>
+            x === '--deny-read' ? [i] : [],
+          )
+          if (denyIdx.length !== 2) {
+            throw new Error(
+              `H-glob: expected 2 --deny-read flags after glob expand; ` +
+                `got ${denyIdx.length}: ${JSON.stringify(argv)}`,
+            )
+          }
+          for (const i of denyIdx) {
+            if (argv[i + 1].includes('*') || argv[i + 1].includes('?')) {
+              throw new Error(
+                `H-glob: glob char survived into --deny-read value ` +
+                  `'${argv[i + 1]}' — per-exec expand not applied`,
+              )
+            }
+          }
+          const r = await spawnAsync(argv[0], argv.slice(1), {
+            env,
+            timeout: 60_000,
+          })
+          if (r.stdout.includes('GLOB-A') || r.stdout.includes('GLOB-B')) {
+            throw new Error(
+              `H-glob: child read a glob-expanded deny target — ` +
+                `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+            )
+          }
+          // Per-exec restore: a fresh child (no customConfig) under
+          // the same session can read both — proves the per-exec
+          // stamp was lifted on child exit, not leaked onto disk.
+          const wf = await SandboxManager.wrapWithSandboxArgv(
+            `type "${a}" & type "${b}"`,
+          )
+          const rR = await spawnAsync(wf.argv[0], wf.argv.slice(1), {
+            env: wf.env,
+            timeout: 60_000,
+          })
+          if (!rR.stdout.includes('GLOB-A') || !rR.stdout.includes('GLOB-B')) {
+            throw new Error(
+              `H-glob: per-exec stamp NOT restored — fresh child still ` +
+                `denied. stdout=${JSON.stringify(rR.stdout)} ` +
+                `stderr=${JSON.stringify(rR.stderr)}`,
+            )
+          }
+        } finally {
+          await SandboxManager.reset()
+          rmSync(dir, { recursive: true, force: true })
+        }
+      }, 120_000)
+
+      it('H8: reset() keeps the write root granted — to no sandbox-user ACE', async () => {
+        // After H5/H6/H7's reset() calls, the root's DACL must NOT
+        // carry an explicit ACE for the sandbox user.
+        const out = spawnSync('icacls', [hScratch], {
+          encoding: 'utf8',
+          timeout: 5_000,
+        })
+        if (out.stdout.includes(sbSid) || out.stdout.includes('srt-sandbox')) {
+          throw new Error(
+            `H8: srt-sandbox ACE still on '${hScratch}' after reset(): ` +
+              out.stdout,
+          )
+        }
+        // A kept grant carries the root's own `S-1-0-1936880739-…` SID.
+        expect(out.stdout.includes('S-1-0-1936880739-')).toBe(true)
+        rmSync(hScratch, { recursive: true, force: true })
+      }, 30_000)
+
+      // ── L-rows: how the lists rank against each other ──
+      // A tree per row: d\own.txt, d\sub\in.txt, beside\b.txt, and to-d, a
+      // junction to d. Each row logs what it ran, so a job log tells a row
+      // that ran from one that was skipped.
+      describe('L-rows: how the lists rank', () => {
+        let spelled: string
+        let root: string
+        const at = (rel: string): string => join(root, rel)
+        const CONTENT: Record<string, string> = {
+          'd/own.txt': 'IN-D',
+          'd/sub/in.txt': 'IN-SUB',
+          'beside/b.txt': 'IN-BESIDE',
+        }
+
+        beforeEach(() => {
+          spelled = mkdtempSync(join(tmpdir(), 'srt-l-'))
+          root = realpathSync.native(spelled)
+          for (const [rel, content] of Object.entries(CONTENT)) {
+            mkdirSync(dirname(at(rel)), { recursive: true })
+            writeFileSync(at(rel), content)
+          }
+          symlinkSync(at('d'), at('to-d'), 'junction')
+        })
+
+        afterEach(() => {
+          try {
+            rmSync(root, { recursive: true, force: true })
+          } catch {
+            // Not every runtime removes a junction.
+          }
+        })
+
+        type Expected = {
+          /** A file of CONTENT, and whether the command reads it. */
+          reads?: Record<string, boolean>
+          /** A file, there or not, and whether the command writes it. */
+          writes?: Record<string, boolean>
+        }
+
+        /** One command that tries all of `expected`, held against it. */
+        async function tryAll(
+          id: string,
+          expected: Expected,
+          customConfig?: Partial<SandboxRuntimeConfig>,
+        ): Promise<void> {
+          const reads = Object.entries(expected.reads ?? {})
+          const writes = Object.entries(expected.writes ?? {})
+          const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+            [
+              'echo RAN',
+              // `type` lists the folder first; `<` opens the file alone.
+              ...reads.map(
+                ([rel]) => `type "${at(rel)}" & more < "${at(rel)}"`,
+              ),
+              ...writes.map(([rel]) => `echo WROTE>"${at(rel)}"`),
+            ].join(' & '),
+            undefined,
+            customConfig,
+          )
+          const r = await spawnAsync(argv[0], argv.slice(1), {
+            env,
+            timeout: 60_000,
+          })
+          const found = {
+            reads: Object.fromEntries(
+              reads.map(([rel]) => [rel, r.stdout.includes(CONTENT[rel])]),
+            ),
+            writes: Object.fromEntries(
+              writes.map(([rel]) => [
+                rel,
+                existsSync(at(rel)) &&
+                  readFileSync(at(rel), 'utf8').includes('WROTE'),
+              ]),
+            ),
+          }
+          console.error(
+            `[winsrt ${id}] ran: exit=${r.status} found=${JSON.stringify(found)} ` +
+              `stderr=${JSON.stringify(r.stderr)}`,
+          )
+          expect(r.stdout).toContain('RAN')
+          expect(found).toEqual({
+            reads: expected.reads ?? {},
+            writes: expected.writes ?? {},
+          })
+        }
+
+        /** `run` in a session of these lists. */
+        async function inSession(
+          fs: FsOverrides,
+          files: CredentialFileConfig[],
+          run: () => Promise<void>,
+        ): Promise<void> {
+          await SandboxManager.initialize({
+            ...createFsTestConfig(fs),
+            credentials: { files },
+          })
+          try {
+            await run()
+          } finally {
+            await SandboxManager.reset()
+          }
+          for (const rel of ['.', 'beside', 'd', 'd/own.txt', 'd/sub']) {
+            const acl = spawnSync('icacls', [at(rel)], {
+              encoding: 'utf8',
+              timeout: 5_000,
+            }).stdout
+            expect(acl).toContain(root)
+            expect(acl).not.toContain(sbSid)
+            expect(acl).not.toContain('srt-sandbox')
+          }
+        }
+
+        type Lists = Partial<
+          Record<
+            'allowRead' | 'allowWrite' | 'denyRead' | 'denyWrite',
+            string[]
+          >
+        >
+        it.each<[string, string, Lists, CredentialFileConfig[], Expected]>([
+          [
+            'L1',
+            'a denyWrite inside an allowWrite: written around, read within',
+            { allowWrite: ['.'], denyWrite: ['d'] },
+            [],
+            {
+              reads: { 'd/own.txt': true, 'd/sub/in.txt': true },
+              writes: {
+                'new.txt': true,
+                'd/new.txt': false,
+                'd/sub/new.txt': false,
+              },
+            },
+          ],
+          [
+            'L2',
+            'an allowWrite beneath a denyWrite: read, not written; beside it: written',
+            { allowWrite: ['d/sub', 'beside'], denyWrite: ['d'] },
+            [],
+            {
+              reads: { 'd/sub/in.txt': true, 'beside/b.txt': true },
+              writes: {
+                'd/sub/new.txt': false,
+                'd/sub/in.txt': false,
+                'beside/new.txt': true,
+              },
+            },
+          ],
+          [
+            'L3',
+            'an allowWrite around and beneath a denyWrite: written around alone',
+            { allowWrite: ['.', 'd/sub'], denyWrite: ['d'] },
+            [],
+            {
+              reads: { 'd/sub/in.txt': true },
+              writes: { 'new.txt': true, 'd/sub/new.txt': false },
+            },
+          ],
+          [
+            'L4',
+            'an allowWrite beneath a denyWrite, named through a junction',
+            { allowWrite: ['to-d/sub'], denyWrite: ['d'] },
+            [],
+            {
+              reads: { 'd/sub/in.txt': true },
+              writes: { 'd/sub/new.txt': false },
+            },
+          ],
+          [
+            'L5',
+            'an allowRead beneath a denyRead: read',
+            { allowRead: ['d/sub', 'beside'], denyRead: ['d'] },
+            [],
+            {
+              reads: {
+                'd/sub/in.txt': true,
+                'd/own.txt': false,
+                'beside/b.txt': true,
+              },
+            },
+          ],
+          [
+            'L6',
+            'a credential deny inside an allowWrite: neither read nor written',
+            { allowWrite: ['.'] },
+            [{ path: 'd', mode: 'deny' }],
+            {
+              reads: {
+                'd/own.txt': false,
+                'd/sub/in.txt': false,
+                'beside/b.txt': true,
+              },
+              writes: { 'd/new.txt': false, 'new.txt': true },
+            },
+          ],
+          [
+            'L7',
+            'an allowRead beneath a credential deny: not read',
+            { allowRead: ['d/sub', 'beside'] },
+            [{ path: 'd', mode: 'deny' }],
+            { reads: { 'd/sub/in.txt': false, 'beside/b.txt': true } },
+          ],
+          [
+            'L8',
+            'an allowWrite beneath a credential deny: neither read nor written',
+            { allowWrite: ['d/sub', 'beside'] },
+            [{ path: 'd', mode: 'deny' }],
+            {
+              reads: { 'd/sub/in.txt': false, 'beside/b.txt': true },
+              writes: { 'd/sub/new.txt': false, 'beside/new.txt': true },
+            },
+          ],
+          [
+            'L9',
+            'a masked file inside an allowWrite: neither read nor written',
+            { allowWrite: ['.'] },
+            [{ path: 'd/own.txt', mode: 'mask' }],
+            {
+              reads: { 'd/own.txt': false, 'd/sub/in.txt': true },
+              writes: { 'd/own.txt': false, 'd/new.txt': true },
+            },
+          ],
+          [
+            'L10',
+            'a masked file that is an allowRead too: not read',
+            { allowRead: ['d/own.txt', 'beside'] },
+            [{ path: 'd/own.txt', mode: 'mask' }],
+            { reads: { 'd/own.txt': false, 'beside/b.txt': true } },
+          ],
+          [
+            'L11',
+            'a masked file with no match, to be denied: not read',
+            { allowWrite: ['.'] },
+            [
+              {
+                path: 'd/own.txt',
+                mode: 'mask',
+                extract: 'absent-(text)',
+                onExtractNoMatch: 'deny',
+              },
+            ],
+            { reads: { 'd/own.txt': false, 'd/sub/in.txt': true } },
+          ],
+        ])(
+          '%s: %s',
+          async (id, _name, lists, files, expected) => {
+            await inSession(
+              Object.fromEntries(
+                Object.entries(lists).map(([list, rels]) => [
+                  list,
+                  rels.map(at),
+                ]),
+              ),
+              files.map(f => ({ ...f, path: at(f.path) })),
+              () => tryAll(id, expected),
+            )
+          },
+          90_000,
+        )
+
+        it('L12: an allowWrite beneath a denyWrite, each spelled its own way', async () => {
+          console.error(`[winsrt L12] spelled=${spelled} resolved=${root}`)
+          await inSession(
+            {
+              allowWrite: [at('d/sub').toUpperCase()],
+              denyWrite: [join(spelled, 'd')],
+            },
+            [],
+            () =>
+              tryAll('L12', {
+                reads: { 'd/sub/in.txt': true },
+                writes: { 'd/sub/new.txt': false },
+              }),
+          )
+        }, 90_000)
+
+        it("L13: one command's denyWrite over the session's allowWrite, for that command", async () => {
+          await inSession({ allowWrite: [at('d/sub')] }, [], async () => {
+            await tryAll(
+              'L13 with',
+              {
+                reads: { 'd/sub/in.txt': true },
+                writes: { 'd/sub/new.txt': false },
+              },
+              {
+                filesystem: {
+                  denyRead: [],
+                  allowWrite: [],
+                  denyWrite: [at('d')],
+                },
+              },
+            )
+            await tryAll('L13 without', {
+              writes: { 'd/sub/new.txt': true },
+            })
+          })
+        }, 120_000)
+
+        it("L14: one command's credential deny over the session's grants, for that command", async () => {
+          await inSession(
+            { allowRead: [at('d/sub')], allowWrite: [at('beside')] },
+            [],
+            async () => {
+              await tryAll(
+                'L14 with',
+                { reads: { 'd/sub/in.txt': false, 'beside/b.txt': true } },
+                {
+                  credentials: { files: [{ path: at('d'), mode: 'deny' }] },
+                },
+              )
+              await tryAll('L14 without', {
+                reads: { 'd/sub/in.txt': true },
+              })
+            },
+          )
+        }, 120_000)
+      })
+    })
   },
 )
 
@@ -4626,22 +4247,16 @@ describe.if(isWindows)(
 // tls-terminate-proxy.test.ts); these rows prove the sandboxed
 // CHILD trusts the proxy-minted certs
 // via the env vars `generateProxyEnvVars` emits when `caCertPath` is
-// set. Schannel-level trust (System32 curl, IWR, .NET) comes from
-// the install-time `srt-win user trust-ca` write into the sandbox
-// user's `CurrentUser\Root`; the env-var layer here covers the
-// OpenSSL-backed tools.
+// set. Schannel clients (System32 curl, IWR, .NET) get no credentials
+// under the sandbox's token, so only tools with their own TLS stack
+// are covered.
 //
 // Tool/row selection follows per-tool ground-truth probes run on
 // win-x64 and win-arm64. In particular: Schannel `curl.exe`
 // (System32, and the ARM64 git-bundled clangarm64 build) ignores
 // `CURL_CA_BUNDLE`, so the curl row gates on an OpenSSL build being
 // present; git defaults to the schannel backend (which ignores
-// `GIT_SSL_CAINFO`), so the git row forces `http.sslBackend=openssl`;
-// cargo's vendored Schannel libcurl honors `CARGO_HTTP_CAINFO`.
-// Schannel's revocation check on the leaf is satisfied by the CDP →
-// empty CRL the proxy serves at `/srt.crl` — no per-tool
-// `--ssl-no-revoke` / `schannelCheckRevoke=false` /
-// `CARGO_HTTP_CHECK_REVOKE=false` needed.
+// `GIT_SSL_CAINFO`), so the git row forces `http.sslBackend=openssl`.
 
 // Committed test-only CA — see test/fixtures/tls-terminate/README.md.
 const TLS_FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
@@ -4938,126 +4553,6 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
   }, 120_000)
 })
 
-// Group G's Schannel clients, in a session with `writeRestrictedToken: false`.
-describe.if(isWindows)(
-  'Windows sandbox: tlsTerminate, Schannel clients under the ordinary token (G8)',
-  () => {
-    beforeAll(async () => {
-      console.error('[winsrt G8 beforeAll] start')
-      // G's afterAll uninstalled: re-provision and trust the fixture CA again.
-      installWindowsSandbox({
-        sublayerGuid: TEST_SUBLAYER,
-        proxyPortRange: PORT_RANGE,
-        srtWin: TEST_SRT_WIN,
-      })
-      windowsTrustCa(CA_CERT, { srtWin: TEST_SRT_WIN })
-      await SandboxManager.initialize(
-        onOrdinaryToken(
-          createTlsTestConfig(['example.com', 'github.com', 'crates.io']),
-        ),
-      )
-      const { argv } = await SandboxManager.wrapWithSandboxArgv('echo x')
-      expect(argv).not.toContain('--write-restricted-token')
-      console.error('[winsrt G8 beforeAll] done')
-    }, 120_000)
-
-    afterAll(async () => {
-      await SandboxManager.reset()
-      uninstallWindowsSandbox({
-        sublayerGuid: TEST_SUBLAYER,
-        srtWin: TEST_SRT_WIN,
-      })
-    }, 60_000)
-
-    it('G8: System32 curl (Schannel) trusts via the sandbox-user Root install, NOT CURL_CA_BUNDLE', async () => {
-      // Schannel curl ignores CURL_CA_BUNDLE/SSL_CERT_FILE by design
-      // — trust comes from the sandbox user's `CurrentUser\Root`,
-      // which `windowsTrustCa` populated in beforeAll. Revocation is
-      // checked on the LEAF: minted leaves carry a CDP pointing at the
-      // proxy's `/srt.crl` (empty CRL), so no `--ssl-no-revoke` needed.
-      SandboxManager.updateConfig(
-        onOrdinaryToken(createTlsTestConfig(['example.com'])),
-      )
-      const r = await runSandboxedUntil(
-        `"${SYSTEM32_CURL}" -sS -o NUL -w "%{http_code}" https://example.com/`,
-        x => x.status === 0,
-      )
-      expectStatus('G8', r, [0])
-      expect(r.stdout).toContain('200')
-    }, 60_000)
-
-    it.skipIf(GIT === undefined)(
-      'G8b: git schannel backend passes revocation via the served CRL (no schannelCheckRevoke=false)',
-      async () => {
-        // Trust: `-c http.schannelUseSSLCAInfo=true` makes git-schannel
-        // honor `GIT_SSL_CAINFO` (the trust bundle #346 emits). Without
-        // it, git-for-windows' patched http.c clears sslCAInfo so
-        // schannel reads the Windows store — but on the CI runner that
-        // path hits SEC_E_UNTRUSTED_ROOT (system-gitconfig drift; the
-        // store-trust path is proven by G8's curl row).
-        // Revocation: what this row TESTS — the leaf's CDP → empty CRL
-        // on the proxy port means NO `http.schannelCheckRevoke=false`
-        // is needed. `-c http.sslBackend=schannel` is explicit so the
-        // row is hermetic against the runner's default backend.
-        // git-via-proxy is heavier than curl (smart-HTTP), so
-        // 45s/attempt + 120s overall.
-        SandboxManager.updateConfig(
-          onOrdinaryToken(createTlsTestConfig(['example.com', 'github.com'])),
-        )
-        const r = await runSandboxedUntil(
-          `"${GIT}" -c http.sslBackend=schannel -c http.schannelUseSSLCAInfo=true ` +
-            `ls-remote https://github.com/git/git.git HEAD`,
-          x => x.status === 0 && /HEAD/.test(x.stdout),
-          2,
-          45_000,
-        )
-        if (r.status !== 0) {
-          // Diagnostic: dump the effective git http.* config so a
-          // failure names the runner's system-gitconfig state.
-          const cfg = await runSandboxed(
-            `"${GIT}" config --list --show-origin 2>&1 | findstr /i "ssl schannel backend"`,
-          )
-          r.stderr += `\n[G8b diag: git http config]\n${cfg.stdout}${cfg.stderr}`
-        }
-        expectStatus('G8b', r, [0])
-        expect(r.stdout).toMatch(/HEAD/)
-      },
-      120_000,
-    )
-
-    it.skipIf(CARGO === undefined)(
-      'G9: cargo trusts the MITM CA via CARGO_HTTP_CAINFO',
-      async () => {
-        // cargo's vendored libcurl is Schannel but honors `CAINFO`
-        // (replace semantics). Revocation is satisfied by the leaf's
-        // CDP → empty CRL served on the proxy port, so no
-        // `CARGO_HTTP_CHECK_REVOKE=false` needed. Skips when cargo
-        // lives under the broker's profile (`~/.cargo/bin` on GHA
-        // runners) — srt-sandbox cannot read it; see
-        // `sandboxReachable`.
-        SandboxManager.updateConfig(
-          onOrdinaryToken(
-            createTlsTestConfig([
-              'crates.io',
-              'static.crates.io',
-              'index.crates.io',
-            ]),
-          ),
-        )
-        const r = await runSandboxedUntil(
-          `"${CARGO}" search serde --limit 1`,
-          x => x.status === 0 && /serde/.test(x.stdout),
-          2,
-          30_000,
-        )
-        expectStatus('G9', r, [0])
-        expect(r.stdout).toMatch(/serde/)
-      },
-      120_000,
-    )
-  },
-)
-
 // ────────────────────────────────────────────────────────────────────
 // Group P — persistent CA (`ensurePersistentWindowsCa` +
 // `initialize()` auto-load with `tlsTerminate: {}`).
@@ -5158,9 +4653,7 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
     // calls ensurePersistentWindowsCa(), then createMitmCA on its
     // paths. First run generates; the returned MitmCA's certPath
     // must be under the state-dir `ca/` (not a mkdtemp `srt-ca-`).
-    // Under the ordinary token: P3, which shares this session, proves
-    // the trust with a Schannel client.
-    const cfg = onOrdinaryToken(createTestConfig(['example.com']))
+    const cfg = createTestConfig(['example.com'])
     await SandboxManager.initialize({
       ...cfg,
       network: { ...cfg.network, tlsTerminate: {} },
@@ -5180,20 +4673,15 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
     expect(u.caCertThumb).toBeTruthy()
   }, 60_000)
 
-  it('P3: schannel trusts the persistent CA end-to-end (System32 curl)', async () => {
-    // Mirrors G8 but with the persistent (not fixture) CA — the
-    // load-bearing proof that an embedder passing `tlsTerminate:{}`
-    // gets working schannel-level trust with zero orchestration.
-    expect(
-      (await SandboxManager.wrapWithSandboxArgv('echo x')).argv,
-    ).not.toContain('--write-restricted-token')
-    const r = await runSandboxedUntil(
-      `"${SYSTEM32_CURL}" -sS -o NUL -w "%{http_code}" https://example.com/`,
-      x => x.status === 0,
-    )
-    expectStatus('P3', r, [0])
-    expect(r.stdout).toContain('200')
-  }, 60_000)
+  it.skipIf(!HAS_OWN_TLS_CLIENT)(
+    'P3: a client with its own TLS stack trusts the persistent CA end-to-end',
+    async () => {
+      const r = await runSandboxedUntil(ownTlsGet('example.com'), got200)
+      expectStatus('P3', r, [0])
+      expect(got200(r)).toBe(true)
+    },
+    90_000,
+  )
 
   it('P4: ca.json (key custody) is unreadable from inside the sandbox', async () => {
     // The `ca/` dir inherits the state-dir's `(OI)(CI)` real-user
