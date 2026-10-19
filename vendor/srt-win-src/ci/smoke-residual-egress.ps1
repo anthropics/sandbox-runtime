@@ -159,6 +159,11 @@ function WriteVerdict { param([string] $File, [string] $Nonce)
   return 'denied'
 }
 function NewNonce { return "nonce-$([guid]::NewGuid().ToString('N'))-end" }
+function WslFirstLines { param([string] $CommandLine)
+  $r = SbExec @('--', $cmd, '/c', $CommandLine) -TimeoutSec 90 -ExtraEnv @('WSL_UTF8=1')
+  if ($r.timedOut) { return "timeout after $($r.timeout)s; first lines: $(FirstLines $r.out)" }
+  return "exit=$($r.exit); first lines: $(FirstLines $r.out)"
+}
 
 Add-Type -Namespace SrtResid -Name Native -MemberDefinition @'
 [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
@@ -540,16 +545,8 @@ public static extern bool CloseHandle(IntPtr h);
       "where wsl.exe & if exist `"$wsl`" (echo SYSTEM32_WSL=present) else (echo SYSTEM32_WSL=absent)")
     Detail $r
   }
-  Row 'wsl-status-as-sandbox' {
-    $r = SbExec @('--', $cmd, '/c', 'wsl.exe --status < nul') -TimeoutSec 90 -ExtraEnv @('WSL_UTF8=1')
-    if ($r.timedOut) { return "timeout after $($r.timeout)s; first lines: $(FirstLines $r.out)" }
-    "exit=$($r.exit); first lines: $(FirstLines $r.out)"
-  }
-  Row 'wsl-list-verbose-as-sandbox' {
-    $r = SbExec @('--', $cmd, '/c', 'wsl.exe --list --verbose < nul') -TimeoutSec 90 -ExtraEnv @('WSL_UTF8=1')
-    if ($r.timedOut) { return "timeout after $($r.timeout)s; first lines: $(FirstLines $r.out)" }
-    "exit=$($r.exit); first lines: $(FirstLines $r.out)"
-  }
+  Row 'wsl-status-as-sandbox' { WslFirstLines 'wsl.exe --status < nul' }
+  Row 'wsl-list-verbose-as-sandbox' { WslFirstLines 'wsl.exe --list --verbose < nul' }
   Row 'wsl-service-as-sandbox' {
     $parts = foreach ($svc in @('WslService', 'LxssManager')) {
       $r = SbExec @('--', $sc, 'query', $svc)
