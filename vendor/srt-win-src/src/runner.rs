@@ -48,6 +48,9 @@ pub enum RunnerCmd {
         /// Also make the anonymous off-loopback attempt.
         #[serde(default)]
         anonymous_egress: bool,
+        /// Loopback is open: see [`crate::probe::run`].
+        #[serde(default)]
+        allow_loopback: bool,
     },
 }
 
@@ -131,9 +134,14 @@ pub fn run() -> Result<u32> {
             target,
             anonymous_target,
             anonymous_egress,
-        } => {
-            Ok(crate::probe::run(&target, anonymous_target.as_deref(), anonymous_egress)?.encode())
-        }
+            allow_loopback,
+        } => Ok(crate::probe::run(
+            &target,
+            anonymous_target.as_deref(),
+            anonymous_egress,
+            allow_loopback,
+        )?
+        .encode()),
     }
 }
 
@@ -172,17 +180,22 @@ mod tests {
             target: "127.0.0.1:49999".into(),
             anonymous_target: Some("192.0.2.7:49999".into()),
             anonymous_egress: true,
+            allow_loopback: true,
         };
         let bytes = encode_cmd(&probe).unwrap();
         let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
             back,
-            RunnerCmd::ProbeEgress { target, anonymous_target, anonymous_egress: true }
-                if target == "127.0.0.1:49999"
+            RunnerCmd::ProbeEgress {
+                target,
+                anonymous_target,
+                anonymous_egress: true,
+                allow_loopback: true,
+            } if target == "127.0.0.1:49999"
                     && anonymous_target.as_deref() == Some("192.0.2.7:49999")
         ));
-        // The off-loopback target and the anonymous-egress switch are
-        // optional on the wire; the switch defaults to off.
+        // The off-loopback target and the two switches are optional on
+        // the wire; the switches default to off.
         let back: RunnerCmd =
             serde_json::from_str(r#"{"ProbeEgress":{"target":"127.0.0.1:1"}}"#).unwrap();
         assert!(matches!(
@@ -190,6 +203,7 @@ mod tests {
             RunnerCmd::ProbeEgress {
                 anonymous_target: None,
                 anonymous_egress: false,
+                allow_loopback: false,
                 ..
             }
         ));

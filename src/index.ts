@@ -84,6 +84,8 @@ export {
   parseWindowsSandboxError,
   isUncPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  WINDOWS_ALLOW_LOOPBACK_EFFECT,
+  WINDOWS_LOOPBACK_PROBE_PORT,
   SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
@@ -91,6 +93,7 @@ export type {
   WindowsSandboxStatus,
   WindowsBinShell,
   MappedDriveCwdError,
+  LoopbackMismatchError,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,
