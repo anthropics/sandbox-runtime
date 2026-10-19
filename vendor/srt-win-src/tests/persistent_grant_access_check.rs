@@ -18,7 +18,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::BOOL;
 
-use srt_win::acl::{AceView, DenyMask, PersistentWant, persistent_aces};
+use srt_win::acl::{AceView, DenyMask, PersistentWant, ProfileAce, persistent_aces};
 use srt_win::persist::new_capability_sid;
 use srt_win::token::{make_sandbox_token, open_self_token};
 use srt_win::util::wstr;
@@ -109,6 +109,7 @@ fn persistent_root_access_matrix() {
         deny: None,
         deny_fdc: false,
         deny_delete: false,
+        profile: None,
     };
     // A file in root B that the sandbox user created and owns.
     let in_b = persistent_aces(&root_b);
@@ -184,5 +185,105 @@ fn persistent_root_access_matrix() {
         for t in [session_a, session_b, no_roots, ordinary] {
             let _ = CloseHandle(t);
         }
+    }
+}
+
+/// What the profile grant's entries give a sandboxed process: read, execute
+/// and listing, never a write. A session's read deny inherited from above
+/// a granted directory loses to that directory's own allow.
+#[test]
+fn profile_grant_access_matrix() {
+    const FILE_APPEND_DATA: u32 = 0x4;
+    const FILE_EXECUTE: u32 = 0x20;
+    const FILE_DELETE_CHILD: u32 = 0x40;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const DELETE: u32 = 0x0001_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    let me = srt_win::sid::current_user_sid().unwrap();
+    let list = |profile: Option<ProfileAce>, deny: Option<DenyMask>| {
+        persistent_aces(&PersistentWant {
+            group_sid: AUTHENTICATED_USERS,
+            real_user_sid: SOMEONE_ELSE,
+            capability_sid: None,
+            deny,
+            deny_fdc: false,
+            deny_delete: false,
+            profile,
+        })
+    };
+    let granted_dir = list(Some(ProfileAce::Granted), None);
+    let container = list(Some(ProfileAce::Container), None);
+    let file = list(Some(ProfileAce::File), None);
+    let excluded = list(None, Some(DenyMask::ReadDeny));
+
+    let restricted = child_token(true, &[]);
+    let with_a_root = child_token(true, &[new_capability_sid().unwrap()]);
+    let ordinary = child_token(false, &[]);
+    let every_write = [
+        ("write data / add file", FILE_WRITE_DATA),
+        ("append / add directory", FILE_APPEND_DATA),
+        ("delete child", FILE_DELETE_CHILD),
+        ("write attributes", FILE_WRITE_ATTRIBUTES),
+        ("delete (and so rename)", DELETE),
+        ("change permissions", WRITE_DAC),
+        ("take ownership", WRITE_OWNER),
+        ("generic write", FILE_GENERIC_WRITE.0),
+    ];
+    for (name, tok) in [
+        ("write-restricted", restricted),
+        ("write-restricted with a root", with_a_root),
+        ("ordinary", ordinary),
+    ] {
+        let can = |aces: &[AceView], access: u32| granted(tok, SOMEONE_ELSE, aces, access);
+        for (what, aces) in [("granted directory", &granted_dir), ("granted file", &file)] {
+            assert!(can(aces, FILE_GENERIC_READ.0), "{name}: read {what}");
+            assert!(can(aces, FILE_EXECUTE), "{name}: execute {what}");
+            for (right, access) in every_write {
+                assert!(!can(aces, access), "{name}: {right} on a {what}");
+            }
+        }
+        assert!(can(&container, FILE_READ_DATA), "{name}: list a container");
+        assert!(
+            can(&container, FILE_EXECUTE),
+            "{name}: traverse a container"
+        );
+        assert!(can(&container, FILE_READ_ATTRIBUTES));
+        // What a generic-read open of the directory asks for.
+        assert!(
+            can(&container, FILE_GENERIC_READ.0),
+            "{name}: open a container"
+        );
+        for (right, access) in every_write {
+            assert!(!can(&container, access), "{name}: {right} on a container");
+        }
+        let mut excluded_with_allow = excluded.clone();
+        excluded_with_allow.extend(granted_dir.iter().cloned());
+        for aces in [&excluded, &excluded_with_allow] {
+            assert!(!can(aces, FILE_READ_DATA), "{name}: read an excluded path");
+            assert!(!can(aces, FILE_EXECUTE));
+            assert!(!can(aces, FILE_READ_ATTRIBUTES));
+        }
+        assert!(!can(&[], FILE_READ_DATA), "{name}: read with no entry");
+
+        let session_deny = AceView {
+            deny: true,
+            inherited: false,
+            flags: 0x3,
+            mask: FILE_ALL_ACCESS.0,
+            sid: me.clone(),
+        };
+        let mut beneath = vec![session_deny.clone()];
+        beneath.extend(granted_dir.iter().cloned());
+        assert!(
+            !can(&beneath, FILE_READ_DATA),
+            "{name}: a deny beneath a granted directory lost"
+        );
+        let mut inherited_from_above = granted_dir.clone();
+        inherited_from_above.push(session_deny);
+        assert!(
+            can(&inherited_from_above, FILE_READ_DATA),
+            "{name}: the order of an explicit allow and an inherited deny changed"
+        );
     }
 }

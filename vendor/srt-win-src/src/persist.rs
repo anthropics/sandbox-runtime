@@ -1,21 +1,19 @@
 //! Write grants kept between sessions, for the write-restricted token.
-//!
 //! Each write root gets its own capability SID,
 //! `S-1-0-1936880739-<a>-<b>-<c>-<d>` (128 random bits; no account can
 //! hold it), and its ACEs ([`crate::acl::persistent_aces`]) allow
 //! writing only to a token with that SID among its restricting SIDs.
-//!
-//! A marker under `HKCU\Software\sandbox-runtime\PersistentGrants`
-//! lists every root that may carry a grant: added before the first ACE
-//! is written, removed only after the ACEs are. While it or the session
-//! database lists a root, nothing may run the sandbox account under
-//! the ordinary token ([`unrestricted_block_reason`]).
+//! A marker under `HKCU\Software\sandbox-runtime\PersistentGrants` lists
+//! every root that may carry a grant. While it or the session database
+//! lists a root, nothing may run the sandbox account under the ordinary
+//! token ([`unrestricted_block_reason`]). A root whose volume is away
+//! becomes a [`PendingStrip`] there.
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 
-use crate::acl::{self, AceView, PersistentTrustees, PersistentWant, SbAce};
+use crate::acl::{self, AceView, DaclTarget, PersistentTrustees, PersistentWant, SbAce};
 use crate::path_id::{self, FileId, Located};
 use crate::reg;
 use crate::state_db::Locked;
@@ -62,9 +60,57 @@ pub fn is_capability_sid(sid: &str) -> bool {
 
 // ─── Marker ─────────────────────────────────────────────────────────
 
-const MARKER_KEY: &str = r"Software\sandbox-runtime\PersistentGrants";
+pub(crate) const MARKER_KEY: &str = r"Software\sandbox-runtime\PersistentGrants";
 const MARKER_ROOTS: &str = "Roots";
 const MARKER_EVER: &str = "EverEnabled";
+const MARKER_PENDING: &str = "Pending";
+const MARKER_GROUP: &str = "GroupSid";
+const MARKER_PREVIOUS_GROUPS: &str = "PreviousGroupSids";
+
+/// Record the sandbox group's SID beside the grants that name it, so they
+/// can be removed after the install record is gone. A different SID
+/// recorded earlier is kept as a previous group, still ours to remove.
+pub(crate) fn marker_set_group_sid(group_sid: &str) -> Result<()> {
+    let key = reg::Key::create_hkcu(MARKER_KEY)?;
+    if let Some(old) = key.get_sz(MARKER_GROUP)?.filter(|s| !s.is_empty())
+        && old != group_sid
+    {
+        let mut previous = key
+            .get_multi_sz(MARKER_PREVIOUS_GROUPS)?
+            .unwrap_or_default();
+        if !previous.contains(&old) {
+            previous.push(old);
+            key.set_multi_sz(MARKER_PREVIOUS_GROUPS, &previous)?;
+        }
+    }
+    key.set_sz(MARKER_GROUP, group_sid)
+}
+
+/// Set the marker's `EverEnabled`: from now on "nothing is recorded"
+/// is believed only from a state database that can be read.
+pub(crate) fn marker_set_ever() -> Result<()> {
+    reg::Key::create_hkcu(MARKER_KEY)?.set_dword(MARKER_EVER, 1)
+}
+
+/// Clear `EverEnabled` once nothing is recorded any more: no root in
+/// the marker or the database, and no profile read grant.
+pub(crate) fn marker_clear_ever_if_unused(conn: &Connection) -> Result<()> {
+    let m = read_marker()?;
+    if m.roots.is_empty()
+        && m.pending.is_empty()
+        && all_root_paths(conn)?.is_empty()
+        && !crate::profile::recorded(conn)?
+        && let Some(key) = reg::Key::open_hkcu(MARKER_KEY, true)?
+    {
+        reg::delete_value(&key, MARKER_EVER)?;
+        // With nothing recorded, no entry of an earlier group is left
+        // to recognise either.
+        if key.get_multi_sz(MARKER_PREVIOUS_GROUPS)?.is_some() {
+            reg::delete_value(&key, MARKER_PREVIOUS_GROUPS)?;
+        }
+    }
+    Ok(())
+}
 
 /// One root in the marker: where it was granted and which object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +147,45 @@ impl MarkerRoot {
     }
 }
 
+/// A kept grant whose removal is waiting for its volume: the object,
+/// the sandbox group its ACEs name, and the path it was last known
+/// at (for messages; the file id is what finds it again).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingStrip {
+    pub file_id: FileId,
+    pub group_sid: String,
+    pub path: String,
+}
+
+impl PendingStrip {
+    /// `<48 hex digits of the file id>|<group SID>|<path>`.
+    pub fn encode(&self) -> String {
+        let hex: String = self
+            .file_id
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("{hex}|{}|{}", self.group_sid, self.path)
+    }
+
+    pub fn decode(s: &str) -> Result<Self> {
+        let bad = || anyhow!("malformed pending-strip marker entry '{s}'");
+        let mut it = s.splitn(3, '|');
+        let (hex, group, path) = (
+            it.next().ok_or_else(bad)?,
+            it.next().ok_or_else(bad)?,
+            it.next().ok_or_else(bad)?,
+        );
+        let root = MarkerRoot::decode(&format!("{hex}|{path}")).map_err(|_| bad())?;
+        Ok(Self {
+            file_id: root.file_id,
+            group_sid: group.to_owned(),
+            path: root.path,
+        })
+    }
+}
+
 /// The marker as read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Marker {
@@ -108,6 +193,19 @@ pub struct Marker {
     /// --all` has not completed since.
     pub ever_enabled: bool,
     pub roots: Vec<MarkerRoot>,
+    /// Kept grants waiting for their volume to be removed.
+    pub pending: Vec<PendingStrip>,
+    /// The sandbox group the recorded grants name.
+    pub group_sid: Option<String>,
+    /// Groups of earlier installs that recorded grants may still name.
+    pub previous_group_sids: Vec<String>,
+}
+
+impl Marker {
+    /// No root, no pending strip, and no grant was ever made.
+    fn nothing_recorded(&self) -> bool {
+        !self.ever_enabled && self.roots.is_empty() && self.pending.is_empty()
+    }
 }
 
 /// Read the marker. An absent key is the empty marker; anything that
@@ -123,9 +221,20 @@ pub fn read_marker() -> Result<Marker> {
         .iter()
         .map(|s| MarkerRoot::decode(s))
         .collect::<Result<_>>()?;
+    let pending = key
+        .get_multi_sz(MARKER_PENDING)?
+        .unwrap_or_default()
+        .iter()
+        .map(|s| PendingStrip::decode(s))
+        .collect::<Result<_>>()?;
     Ok(Marker {
         ever_enabled: key.get_dword(MARKER_EVER)?.unwrap_or(0) != 0,
         roots,
+        pending,
+        group_sid: key.get_sz(MARKER_GROUP)?.filter(|s| !s.is_empty()),
+        previous_group_sids: key
+            .get_multi_sz(MARKER_PREVIOUS_GROUPS)?
+            .unwrap_or_default(),
     })
 }
 
@@ -139,7 +248,7 @@ fn write_marker_roots(roots: &[MarkerRoot]) -> Result<()> {
 /// for the same path. `EverEnabled` is set first.
 fn marker_add(path: &str, file_id: FileId) -> Result<()> {
     let mut m = read_marker()?;
-    reg::Key::create_hkcu(MARKER_KEY)?.set_dword(MARKER_EVER, 1)?;
+    marker_set_ever()?;
     let entry = MarkerRoot {
         file_id,
         path: path.to_owned(),
@@ -150,6 +259,27 @@ fn marker_add(path: &str, file_id: FileId) -> Result<()> {
     m.roots.retain(|r| r.path != path);
     m.roots.push(entry);
     write_marker_roots(&m.roots)
+}
+
+fn write_pending(pending: &[PendingStrip]) -> Result<()> {
+    let key = reg::Key::create_hkcu(MARKER_KEY)?;
+    let encoded: Vec<String> = pending.iter().map(PendingStrip::encode).collect();
+    key.set_multi_sz(MARKER_PENDING, &encoded)
+}
+
+/// Add pending strips to the marker (an object already listed is not
+/// listed twice).
+pub(crate) fn marker_add_pending(new: &[PendingStrip]) -> Result<()> {
+    if new.is_empty() {
+        return Ok(());
+    }
+    let mut pending = read_marker()?.pending;
+    for p in new {
+        if !pending.iter().any(|q| q.file_id == p.file_id) {
+            pending.push(p.clone());
+        }
+    }
+    write_pending(&pending)
 }
 
 fn marker_remove(path: &str) -> Result<()> {
@@ -174,7 +304,14 @@ fn db_roots_ro() -> Option<Vec<String>> {
 /// write-restricted token now; `None` when it may. "Nothing recorded"
 /// is accepted only from a store that is there to be read.
 pub fn unrestricted_block_reason() -> Option<String> {
-    block_reason_from(read_marker(), db_roots_ro)
+    write_grant_block_reason().or_else(crate::profile::block_reason)
+}
+
+/// [`unrestricted_block_reason`] for the write grants alone. A
+/// profile read grant refuses the ordinary token under the same rule
+/// ([`crate::profile::block_reason`]) and has its own removal.
+pub fn write_grant_block_reason() -> Option<String> {
+    block_reason_from(read_marker(), db_roots_ro, path_id::volume_mounted)
 }
 
 /// [`unrestricted_block_reason`] on what was read: `marker` as
@@ -183,6 +320,7 @@ pub fn unrestricted_block_reason() -> Option<String> {
 fn block_reason_from(
     marker: Result<Marker>,
     db_roots: impl FnOnce() -> Option<Vec<String>>,
+    mounted: impl Fn(u64) -> bool,
 ) -> Option<String> {
     let m = match marker {
         Ok(m) => m,
@@ -197,6 +335,13 @@ fn block_reason_from(
             "{} persistent write grant(s) exist (e.g. '{}')",
             m.roots.len(),
             r.path
+        ));
+    }
+    if let Some(p) = m.pending.iter().find(|p| mounted(p.file_id.volume_serial)) {
+        return Some(format!(
+            "the persistent write grant on '{}' is still on disk: its volume was absent \
+             when it was forgotten and is mounted again",
+            p.path
         ));
     }
     if !m.ever_enabled {
@@ -221,14 +366,17 @@ fn block_reason_from(
 /// the ordinary token may be used, `present` when the marker lists
 /// roots, `unknown` otherwise.
 pub fn status_json() -> serde_json::Value {
-    let roots: Vec<String> = read_marker()
-        .map(|m| m.roots.into_iter().map(|r| r.path).collect())
-        .unwrap_or_default();
-    match unrestricted_block_reason() {
-        None => serde_json::json!({ "state": "none", "roots": roots }),
+    let m = read_marker().unwrap_or_default();
+    let roots: Vec<String> = m.roots.into_iter().map(|r| r.path).collect();
+    // Grants waiting for an absent volume: listed, and no reason to
+    // refuse the ordinary token until the volume is back.
+    let pending: Vec<String> = m.pending.into_iter().map(|p| p.path).collect();
+    match write_grant_block_reason() {
+        None => serde_json::json!({ "state": "none", "roots": roots, "pending": pending }),
         Some(reason) => serde_json::json!({
             "state": if roots.is_empty() { "unknown" } else { "present" },
             "roots": roots,
+            "pending": pending,
             "reason": reason,
         }),
     }
@@ -245,27 +393,71 @@ pub struct Ids {
     pub group_sid: Option<String>,
     pub sandbox_user_sid: Option<String>,
     pub real_user_sid: String,
+    /// Sandbox groups other than `group_sid` that grants recorded for
+    /// this user were made for: the marker's, when the install record
+    /// names another group now or none.
+    pub previous_group_sids: Vec<String>,
 }
 
 impl Ids {
     pub fn load() -> Result<Self> {
         let setup = crate::install::read_setup()?;
+        // With the install record gone, the group the recorded grants name
+        // is still known from the marker.
+        let marker = read_marker().unwrap_or_default();
+        let group_sid = setup
+            .as_ref()
+            .map(|s| s.sandbox_group_sid.clone())
+            .or_else(|| marker.group_sid.clone());
+        // Every other group the marker knows of (earlier installs).
+        let mut previous_group_sids: Vec<String> = marker
+            .group_sid
+            .into_iter()
+            .chain(marker.previous_group_sids)
+            .filter(|g| Some(g) != group_sid.as_ref())
+            .collect();
+        previous_group_sids.dedup();
         Ok(Self {
-            group_sid: setup.as_ref().map(|s| s.sandbox_group_sid.clone()),
+            group_sid,
             sandbox_user_sid: setup.map(|s| s.sandbox_user_sid),
             real_user_sid: crate::sid::current_user_sid()?,
+            previous_group_sids,
         })
     }
 
-    fn trustees(&self) -> PersistentTrustees<'_> {
+    pub(crate) fn trustees(&self) -> PersistentTrustees<'_> {
         PersistentTrustees {
             group_sid: self.group_sid.as_deref(),
             real_user_sid: &self.real_user_sid,
+            previous_group_sids: &self.previous_group_sids,
+            sandbox_user_sid: self.sandbox_user_sid.as_deref(),
+            recorded_denies: None,
+        }
+    }
+
+    /// [`Ids::trustees`] for a path with a record: `recorded` are the
+    /// denies the record lists for it ([`recorded_denies`]).
+    fn trustees_for<'a>(&'a self, recorded: Option<&'a [AceView]>) -> PersistentTrustees<'a> {
+        PersistentTrustees {
+            recorded_denies: recorded,
+            ..self.trustees()
         }
     }
 }
 
 // ─── Rows ───────────────────────────────────────────────────────────
+
+/// Every root that may carry a kept write grant: the marker's and the
+/// database's.
+pub(crate) fn kept_roots(conn: &Connection) -> Result<Vec<String>> {
+    let mut roots: Vec<String> = read_marker()?.roots.into_iter().map(|r| r.path).collect();
+    for r in all_root_paths(conn)? {
+        if !roots.contains(&r) {
+            roots.push(r);
+        }
+    }
+    Ok(roots)
+}
 
 fn all_root_paths(conn: &Connection) -> Result<Vec<String>> {
     let mut s = conn.prepare("SELECT canonical_path FROM persistent_roots")?;
@@ -330,7 +522,17 @@ fn wanted(conn: &Connection, ids: &Ids, canon: &str, cur: FileId) -> Result<Vec<
             SbAce::Grant(_) => bail!("persistent_denies holds a grant row for '{canon}'"),
         }
     }
-    if cap.is_none() && deny.is_none() && !deny_fdc && !deny_delete {
+    // What the profile read grant recorded for this object: an
+    // excluded path is a read deny, any other kind one allow.
+    let mut profile = None;
+    match crate::profile::recorded_kind(conn, canon, cur)? {
+        Some(crate::profile_plan::Kind::Denied) => deny = Some(acl::DenyMask::ReadDeny),
+        Some(crate::profile_plan::Kind::Container) => profile = Some(acl::ProfileAce::Container),
+        Some(crate::profile_plan::Kind::Granted) => profile = Some(acl::ProfileAce::Granted),
+        Some(crate::profile_plan::Kind::File) => profile = Some(acl::ProfileAce::File),
+        Some(crate::profile_plan::Kind::Skipped | crate::profile_plan::Kind::Ungranted) | None => {}
+    }
+    if cap.is_none() && deny.is_none() && !deny_fdc && !deny_delete && profile.is_none() {
         return Ok(Vec::new());
     }
     let group_sid = ids.group_sid.as_deref().ok_or_else(|| {
@@ -343,6 +545,7 @@ fn wanted(conn: &Connection, ids: &Ids, canon: &str, cur: FileId) -> Result<Vec<
         deny,
         deny_fdc,
         deny_delete,
+        profile,
     }))
 }
 
@@ -351,15 +554,75 @@ fn spec_of(want: &[AceView]) -> String {
     want.iter().map(AceView::sddl).collect()
 }
 
+/// The DENY entries of a write record's text ([`spec_of`]): trustee
+/// and mask of each `(D;…)`. An entry that does not read as one is
+/// left out.
+fn denies_of_spec(spec: &str) -> Vec<AceView> {
+    spec.split(')')
+        .filter_map(|ace| {
+            let mut f = ace.trim_start_matches('(').split(';');
+            let (ty, _flags, mask) = (f.next()?, f.next()?, f.next()?);
+            let sid = f.nth(2)?;
+            let mask = u32::from_str_radix(mask.strip_prefix("0x")?, 16).ok()?;
+            (ty == "D").then(|| AceView {
+                deny: true,
+                inherited: false,
+                flags: 0,
+                mask,
+                sid: sid.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The denies the record lists for a path: those wanted now and those
+/// of its last write (`last_spec`; they may be on the object still).
+fn recorded_denies(want: &[AceView], last_spec: Option<&str>) -> Option<Vec<AceView>> {
+    let last = last_spec?;
+    let mut v: Vec<AceView> = want.iter().filter(|a| a.deny).cloned().collect();
+    v.extend(denies_of_spec(last));
+    Some(v)
+}
+
 // ─── Converge ───────────────────────────────────────────────────────
 
 /// Bring `canon`'s persistent ACEs to what the rows say; returns
 /// whether it wrote. The write is skipped only when the ACEs on disk
 /// match AND the write record says that exact write completed.
 fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
-    let (cur, _links, is_dir) = path_id::capture_id_and_links(canon)?;
+    converge_on(conn, ids, canon, None)
+}
+
+/// An object that is already open, for [`converge_on`]: the handle
+/// (with `READ_CONTROL | WRITE_DAC`), and the identity read from it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OpenObject {
+    pub handle: windows::Win32::Foundation::HANDLE,
+    pub id: FileId,
+    pub is_dir: bool,
+}
+
+/// [`converge`], reading and writing through `on` when given instead
+/// of opening `canon` by name.
+pub(crate) fn converge_on(
+    conn: &Connection,
+    ids: &Ids,
+    canon: &str,
+    on: Option<&OpenObject>,
+) -> Result<bool> {
+    let (cur, is_dir) = match on {
+        Some(o) => (o.id, o.is_dir),
+        None => {
+            let (cur, _links, is_dir) = path_id::capture_id_and_links(canon)?;
+            (cur, is_dir)
+        }
+    };
+    let target = match on {
+        Some(o) => DaclTarget::Handle(o.handle, canon),
+        None => DaclTarget::Path(canon),
+    };
     let want = wanted(conn, ids, canon, cur)?;
-    let aces = acl::read_aces(canon).with_context(|| format!("read the DACL of '{canon}'"))?;
+    let aces = acl::read_aces_at(target).with_context(|| format!("read the DACL of '{canon}'"))?;
     let is_root = want.iter().any(|a| is_capability_sid(&a.sid));
     if is_root {
         // An ALLOW for the sandbox user SID would pass both access
@@ -380,7 +643,6 @@ fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
             );
         }
     }
-    let t = ids.trustees();
     let spec = spec_of(&want);
     let record: Option<(Vec<u8>, String, i64)> = conn
         .query_row(
@@ -390,15 +652,15 @@ fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
         )
         .optional()
         .context("SELECT persistent_writes")?;
-    let same = acl::persistent_on_disk(&aces, &t, is_dir) == acl::comparable(&want, is_dir);
+    // A group deny the record does not list is not ours: it stays.
+    let listed = recorded_denies(&want, record.as_ref().map(|r| r.1.as_str()));
+    let t = ids.trustees_for(listed.as_deref());
+    // The same entries, with no explicit deny behind one of our allows.
+    let same = acl::persistent_on_disk(&aces, &t, is_dir) == acl::comparable(&want, is_dir)
+        && acl::persistent_layout_ok(&aces, &t);
     // Settled: no write is outstanding for this path, and (with ACEs
     // wanted) a write of exactly this list completed on this object.
-    let settled = match &record {
-        None => want.is_empty(),
-        Some((id, s, done)) => {
-            *done == 1 && (want.is_empty() || (*s == spec && id.as_slice() == cur.as_bytes()))
-        }
-    };
+    let settled = is_settled(record.as_ref(), want.is_empty(), &spec, &cur.as_bytes());
     if same && settled {
         if want.is_empty() {
             conn.execute(
@@ -416,7 +678,19 @@ fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
         params![canon, cur.as_bytes().as_slice(), spec],
     )
     .context("record persistent write intent")?;
-    acl::write_persistent_aces(canon, &t, &want)?;
+    // The walk is spared only where nothing handed down changes, and
+    // never where the record cannot vouch that an earlier write finished.
+    let unfinished = matches!(&record, Some((_, _, 0)));
+    let written = acl::write_persistent_aces_at(target, &t, &want, unfinished || same)?;
+    if want.is_empty() {
+        for left in acl::foreign_group_denies(&aces, &t) {
+            eprintln!(
+                "srt-win: '{canon}' carries a deny for the sandbox group that this product \
+                 did not write, {}: left in place",
+                left.sddl()
+            );
+        }
+    }
     if want.is_empty() {
         conn.execute(
             "DELETE FROM persistent_writes WHERE canonical_path = ?1",
@@ -431,9 +705,74 @@ fn converge(conn: &Connection, ids: &Ids, canon: &str) -> Result<bool> {
     .context("record persistent write completion")?;
     if std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some() {
         eprintln!(
-            "srt-win: persistent DACL write '{canon}' ({} ACE(s))",
+            "srt-win: persistent DACL write '{canon}' ({} ACE(s), {written:?})",
             want.len()
         );
+    }
+    Ok(true)
+}
+
+/// Whether the write record vouches for a path: no write is outstanding
+/// and, with ACEs wanted, a write of exactly `spec` completed on `cur`.
+fn is_settled(
+    record: Option<&(Vec<u8>, String, i64)>,
+    want_empty: bool,
+    spec: &str,
+    cur: &[u8],
+) -> bool {
+    match record {
+        None => want_empty,
+        Some((id, s, done)) => *done == 1 && (want_empty || (s == spec && id.as_slice() == cur)),
+    }
+}
+
+/// Put on record, outside any transaction, that the strip of `root` and
+/// of the deny targets kept with it has begun. A strip that is killed
+/// mid-walk then reads as unfinished and is walked again.
+fn mark_strip_begun(conn: &Connection, root: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE persistent_writes SET done = 0 WHERE canonical_path = ?1 \
+         OR canonical_path IN (SELECT canonical_path FROM persistent_denies WHERE root = ?1)",
+        params![root],
+    )
+    .context("record the strip as begun")?;
+    Ok(())
+}
+
+/// After a [`converge_on`] that failed: whether the object itself
+/// carries exactly the wanted ACEs all the same.
+pub(crate) fn settled_on_object(
+    conn: &Connection,
+    ids: &Ids,
+    canon: &str,
+    on: &OpenObject,
+) -> Result<bool> {
+    let want = wanted(conn, ids, canon, on.id)?;
+    let aces = acl::read_aces_at(DaclTarget::Handle(on.handle, canon))?;
+    let last: Option<String> = conn
+        .query_row(
+            "SELECT spec FROM persistent_writes WHERE canonical_path = ?1",
+            params![canon],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let listed = recorded_denies(&want, last.as_deref());
+    let t = ids.trustees_for(listed.as_deref());
+    if acl::persistent_on_disk(&aces, &t, on.is_dir) != acl::comparable(&want, on.is_dir)
+        || !acl::persistent_layout_ok(&aces, &t)
+    {
+        return Ok(false);
+    }
+    if want.is_empty() {
+        conn.execute(
+            "DELETE FROM persistent_writes WHERE canonical_path = ?1",
+            params![canon],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE persistent_writes SET done = 1 WHERE canonical_path = ?1",
+            params![canon],
+        )?;
     }
     Ok(true)
 }
@@ -492,8 +831,11 @@ pub(crate) fn replay_pending(conn: &Connection) {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Applied {
     pub roots: usize,
-    /// Paths whose DACL was written.
+    /// DACL writes that walked a tree: the system brought the
+    /// inherited entries of everything below the path up to date.
     pub writes: usize,
+    /// DACL writes on an object alone ([`acl::Written::Local`]).
+    pub local_writes: usize,
     /// Paths found as wanted and left alone.
     pub unchanged: usize,
 }
@@ -524,6 +866,9 @@ fn record_root(conn: &Connection, ids: &Ids, canon: &str) -> Result<()> {
         }
     }
     // Before any ACE is written — see the module doc.
+    if let Some(g) = &ids.group_sid {
+        marker_set_group_sid(g)?;
+    }
     marker_add(canon, cur).with_context(|| format!("list '{canon}' in the persistent-grant marker"))
 }
 
@@ -589,6 +934,9 @@ pub fn apply(
     if ids.group_sid.is_none() {
         bail!("no install record: run `srt-win install`");
     }
+    // A kept grant whose volume was absent when it was forgotten: if
+    // the volume is back, its ACEs come off now.
+    retry_pending(conn, ids, false)?;
     let mut touched: Vec<String> = Vec::new();
     let mut touch = |p: &str| {
         if !touched.iter().any(|t| t == p) {
@@ -619,13 +967,15 @@ pub fn apply(
         roots: roots.len(),
         ..Default::default()
     };
+    let before = acl::write_counts();
     for p in &touched {
-        if converge(conn, ids, p).with_context(|| format!("persistent grant '{p}'"))? {
-            out.writes += 1;
-        } else {
+        if !converge(conn, ids, p).with_context(|| format!("persistent grant '{p}'"))? {
             out.unchanged += 1;
         }
     }
+    let after = acl::write_counts();
+    out.writes = after.0 - before.0;
+    out.local_writes = after.1 - before.1;
     Ok((out, per_session))
 }
 
@@ -667,6 +1017,10 @@ pub enum Forgot {
     Removed,
     /// Nothing was on disk; the records are gone.
     Absent,
+    /// The object is on a volume that is not mounted. Its records are
+    /// gone and it is listed as a pending strip, to be removed when
+    /// the volume is back.
+    Pending,
     /// Could not be completed; the root stays recorded.
     Failed(String),
     /// `--force` only: the object could not be located; its record is
@@ -679,9 +1033,80 @@ impl Forgot {
         match self {
             Forgot::Removed => "removed",
             Forgot::Absent => "absent",
+            Forgot::Pending => "pending",
             Forgot::Failed(_) => "failed",
             Forgot::Dropped => "dropped",
         }
+    }
+}
+
+/// What opening a recorded path found, as far as it decides what
+/// becomes of the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtPath {
+    /// The recorded object.
+    Recorded,
+    /// Something, but not the recorded object.
+    Another,
+    /// Nothing has that name ([`path_id::OpenFailure::NotFound`]).
+    Nothing,
+    /// The volume cannot be reached right now
+    /// ([`path_id::OpenFailure::VolumeUnavailable`]).
+    Unavailable,
+}
+
+/// What removing a record's ACEs takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Disposition {
+    /// Remove them at the recorded path.
+    StripHere,
+    /// The object is at another path now — renamed, moved, or the
+    /// volume is mounted elsewhere: remove them there.
+    StripAt(String),
+    /// The object no longer exists: there is nothing to remove.
+    Drop,
+    /// The object is on a volume that cannot be reached now: a
+    /// pending strip.
+    Pending,
+    /// It could not be established where the object is while its
+    /// volume is there: an error; the record stays.
+    Fail,
+}
+
+/// What becomes of a record, by where its path leads now and where the
+/// object was found by file id (asked only when the path does not lead
+/// to it). On a share (`network`) a volume cannot be looked for.
+fn disposition(at_path: AtPath, located: impl FnOnce() -> Located, network: bool) -> Disposition {
+    if at_path == AtPath::Recorded {
+        return Disposition::StripHere;
+    }
+    match (located(), at_path) {
+        (Located::At(p), _) => Disposition::StripAt(p),
+        (Located::Gone, _) => Disposition::Drop,
+        (Located::VolumeAbsent | Located::Unknown, AtPath::Unavailable) => Disposition::Pending,
+        (Located::VolumeAbsent, _) if !network => Disposition::Pending,
+        _ => Disposition::Fail,
+    }
+}
+
+/// Whether `canon` is somewhere volumes cannot be enumerated: a share,
+/// or a drive letter mapped to one.
+fn on_network(canon: &str) -> bool {
+    !path_id::is_drive_path(canon) || path_id::on_network_drive(canon)
+}
+
+/// What is at `path` now, against the recorded object `id`: the open
+/// error classified ([`path_id::open_failure`]). An error that is
+/// neither "nothing there" nor "volume unavailable" is returned.
+fn at_path(path: &str, id: &FileId) -> Result<AtPath> {
+    match path_id::capture_file_id(path) {
+        Ok(now) if now == *id => Ok(AtPath::Recorded),
+        Ok(_) => Ok(AtPath::Another),
+        Err(e) => match path_id::open_failure(&e) {
+            path_id::OpenFailure::NotFound => Ok(AtPath::Nothing),
+            path_id::OpenFailure::VolumeUnavailable => Ok(AtPath::Unavailable),
+            path_id::OpenFailure::Other => Err(e.context(format!("open '{path}'"))),
+        },
     }
 }
 
@@ -702,15 +1127,20 @@ fn unlocatable(canon: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove `canon`'s persistent grant. The rows are deleted only after
-/// every DACL write succeeded, and an object that cannot be located
-/// fails the call unless `force` ([`unlocatable`]).
-fn forget_one(conn: &Connection, ids: &Ids, canon: &str, force: bool) -> Result<Forgot> {
-    let here = match path_id::capture_file_id(canon) {
-        Ok(id) => Some(id),
-        Err(e) if path_id::is_not_found(&e) => None,
-        Err(e) => return Err(e.context(format!("open '{canon}'"))),
-    };
+/// Remove `canon`'s persistent grant. Rows are deleted only after every
+/// DACL write succeeded; an object whose volume is away becomes pending,
+/// and one that cannot be located fails the call unless `force`.
+pub(crate) fn forget_one(conn: &Connection, ids: &Ids, canon: &str, force: bool) -> Result<Forgot> {
+    forget_one_with(conn, ids, canon, force, path_id::locate_by_file_id)
+}
+
+fn forget_one_with(
+    conn: &Connection,
+    ids: &Ids,
+    canon: &str,
+    force: bool,
+    locate: impl Fn(&FileId) -> Located,
+) -> Result<Forgot> {
     // Every object the grant may have been written on.
     let mut granted: Vec<FileId> = Vec::new();
     granted.extend(root_row(conn, canon)?.map(|(id, _)| id));
@@ -719,11 +1149,15 @@ fn forget_one(conn: &Connection, ids: &Ids, canon: &str, force: bool) -> Result<
             granted.push(r.file_id);
         }
     }
+    // Durable before the walk: the transaction below takes its own
+    // writes back if the process is killed, the object's DACL stays.
+    mark_strip_begun(conn, canon)?;
     let tx = conn.unchecked_transaction().context("begin forget tx")?;
-    let denies: Vec<String> = {
-        let mut s =
-            tx.prepare("SELECT DISTINCT canonical_path FROM persistent_denies WHERE root = ?1")?;
-        let rows = s.query_map(params![canon], |r| r.get(0))?;
+    let denies: Vec<(String, Vec<u8>)> = {
+        let mut s = tx.prepare(
+            "SELECT DISTINCT canonical_path, file_id FROM persistent_denies WHERE root = ?1",
+        )?;
+        let rows = s.query_map(params![canon], |r| Ok((r.get(0)?, r.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     tx.execute(
@@ -738,33 +1172,212 @@ fn forget_one(conn: &Connection, ids: &Ids, canon: &str, force: bool) -> Result<
     // what another root still records for it).
     let mut removed = false;
     let mut dropped = false;
-    if here.is_some() {
-        removed |= converge(&tx, ids, canon)?;
-    }
-    for id in granted.iter().filter(|id| Some(**id) != here) {
-        match path_id::locate_by_file_id(id) {
-            Located::At(moved) => removed |= converge(&tx, ids, &moved)?,
-            Located::Gone => {}
-            Located::Unknown => {
-                unlocatable(canon, force)?;
+    let mut pending: Vec<PendingStrip> = Vec::new();
+    let mut recorded: Vec<(String, FileId)> =
+        granted.iter().map(|id| (canon.to_owned(), *id)).collect();
+    recorded.extend(
+        denies
+            .iter()
+            .filter_map(|(d, id)| Some((d.clone(), FileId::from_bytes(id).ok()?))),
+    );
+    // Whatever is at a recorded path now carries nothing of ours any
+    // more, whichever object it is.
+    let mut stripped_here: Vec<&str> = Vec::new();
+    for (path, id) in &recorded {
+        let at = at_path(path, id)?;
+        if matches!(at, AtPath::Recorded | AtPath::Another)
+            && !stripped_here.contains(&path.as_str())
+        {
+            removed |= converge(&tx, ids, path)?;
+            stripped_here.push(path);
+        }
+        match disposition(at, || locate(id), on_network(path)) {
+            Disposition::StripHere | Disposition::Drop => {}
+            Disposition::StripAt(now) => removed |= converge(&tx, ids, &now)?,
+            Disposition::Pending => pending.push(PendingStrip {
+                file_id: *id,
+                group_sid: ids.group_sid.clone().unwrap_or_default(),
+                path: path.clone(),
+            }),
+            Disposition::Fail => {
+                unlocatable(path, force)?;
                 dropped = true;
             }
         }
     }
-    for d in &denies {
-        match path_id::capture_file_id(d) {
-            Ok(_) => removed |= converge(&tx, ids, d)?,
-            Err(e) if path_id::is_not_found(&e) => {}
-            Err(e) => return Err(e.context(format!("open '{d}'"))),
-        }
+    // A root with no record of the object it was granted on (nothing
+    // in the database or the marker): the path is all there is.
+    if granted.is_empty() && path_id::capture_file_id(canon).is_ok() {
+        removed |= converge(&tx, ids, canon)?;
     }
+    // Before the rows go: a crash in between leaves the object listed
+    // twice, never not at all.
+    marker_add_pending(&pending)?;
     tx.commit().context("commit forget")?;
     marker_remove(canon)?;
-    Ok(match (dropped, removed) {
-        (true, _) => Forgot::Dropped,
-        (false, true) => Forgot::Removed,
-        (false, false) => Forgot::Absent,
+    Ok(if dropped {
+        Forgot::Dropped
+    } else if !pending.is_empty() {
+        Forgot::Pending
+    } else if removed {
+        Forgot::Removed
+    } else {
+        Forgot::Absent
     })
+}
+
+/// Look at every pending strip again; an entry goes only once its ACEs are
+/// off or its volume says the object is gone. A share is contacted only
+/// with `probe_network`. Returns what is still pending.
+pub(crate) fn retry_pending(
+    conn: &Connection,
+    ids: &Ids,
+    probe_network: bool,
+) -> Result<Vec<PendingStrip>> {
+    retry_pending_with(
+        read_marker()?.pending,
+        |p| {
+            if !on_network(&p.path) {
+                return path_id::locate_by_file_id_local(&p.file_id);
+            }
+            if !probe_network {
+                return Located::VolumeAbsent;
+            }
+            // Not at its recorded path: looked for by id on that share. If the
+            // share cannot say where it is or that it is gone, the entry stays.
+            let elsewhere = || match path_id::locate_on_share(&p.path, &p.file_id) {
+                Located::Gone => {
+                    eprintln!(
+                        "srt-win: the object the kept grant on '{}' was made on no longer \
+                         exists on its share; its record is dropped",
+                        p.path
+                    );
+                    Located::Gone
+                }
+                Located::At(at) => Located::At(at),
+                other => {
+                    eprintln!(
+                        "srt-win: the object the kept grant on '{}' was made on is not at \
+                         that path, and the share could not say where it is or that it is \
+                         gone; if it was renamed it still carries the grant. The record \
+                         stays (`srt-win acl forget --drop-pending` gives it up).",
+                        p.path
+                    );
+                    other
+                }
+            };
+            match path_id::capture_file_id(&p.path) {
+                Ok(now) if now == p.file_id => Located::At(p.path.clone()),
+                Ok(_) => elsewhere(),
+                Err(e) if path_id::is_not_found(&e) => elsewhere(),
+                Err(_) => Located::VolumeAbsent,
+            }
+        },
+        |p, at| {
+            // The ACEs name the group that was installed when the grant
+            // was made, which may not be the one installed now.
+            let then = Ids {
+                group_sid: Some(p.group_sid.clone()).filter(|g| !g.is_empty()),
+                ..ids.clone()
+            };
+            converge(conn, &then, at).map(|_| ())
+        },
+    )
+    .and_then(|(left, changed)| {
+        if changed {
+            write_pending(&left)?;
+        }
+        Ok(left)
+    })
+}
+
+/// [`retry_pending`] on what was read, with the lookups passed in:
+/// what stays pending, and whether the list changed.
+fn retry_pending_with(
+    pending: Vec<PendingStrip>,
+    locate: impl Fn(&PendingStrip) -> Located,
+    strip: impl Fn(&PendingStrip, &str) -> Result<()>,
+) -> Result<(Vec<PendingStrip>, bool)> {
+    let before = pending.len();
+    let mut left = Vec::new();
+    for p in pending {
+        match locate(&p) {
+            Located::At(at) => {
+                if let Err(e) = strip(&p, &at) {
+                    eprintln!(
+                        "srt-win: WARNING: the kept grant on '{at}' (forgotten while its \
+                         volume was absent) could not be removed: {e:#}"
+                    );
+                    left.push(p);
+                }
+            }
+            Located::Gone => {}
+            Located::VolumeAbsent | Located::Unknown => left.push(p),
+        }
+    }
+    let changed = left.len() != before;
+    Ok((left, changed))
+}
+
+/// Give up the pending strips recorded for `paths` (a volume that will not
+/// return). Refuses an entry whose volume is present; writes nothing but
+/// the list.
+pub fn drop_pending(conn: &Connection, ids: &Ids, paths: &[String]) -> Result<Vec<PendingStrip>> {
+    let pending = retry_pending(conn, ids, true)?;
+    let names = |p: &PendingStrip, want: &str| {
+        let want = want.trim_end_matches('\\');
+        let have = p.path.trim_end_matches('\\');
+        have.eq_ignore_ascii_case(want)
+            || have
+                .strip_prefix(r"\\?\")
+                .is_some_and(|h| h.eq_ignore_ascii_case(want))
+    };
+    let named = |p: &PendingStrip| paths.iter().any(|want| names(p, want));
+    for want in paths {
+        if !pending.iter().any(|p| names(p, want)) {
+            bail!(
+                "no kept grant is waiting for a volume at '{want}' (what could be removed \
+                 has been)"
+            );
+        }
+    }
+    for p in pending.iter().filter(|p| named(p)) {
+        // What is still pending on a share is unreachable or could not be
+        // found by its id.
+        let reachable = !on_network(&p.path) && path_id::volume_mounted(p.file_id.volume_serial);
+        if reachable {
+            bail!(
+                "the volume of '{}' is present, and its entries could not be removed just \
+                 now; they are live and are not given up. Run `srt-win acl forget --all` \
+                 for the reason",
+                p.path
+            );
+        }
+    }
+    let (dropped, left): (Vec<_>, Vec<_>) = pending.into_iter().partition(named);
+    for p in dropped.iter().filter(|p| on_network(&p.path)) {
+        // Not at its path and not found by id: which is not the share
+        // saying it is gone.
+        eprintln!(
+            "srt-win: giving up the kept grant recorded at '{}': the object is not at that \
+             path and its share could not be asked where it is. If it still exists under \
+             another name it keeps the entries of {}; `icacls <its path> /remove:g \"*{}\" \
+             /T` removes them.",
+            p.path,
+            if p.group_sid.is_empty() {
+                "the sandbox group"
+            } else {
+                "group"
+            },
+            if p.group_sid.is_empty() {
+                "<sandbox group SID>"
+            } else {
+                &p.group_sid
+            },
+        );
+    }
+    write_pending(&left)?;
+    Ok(dropped)
 }
 
 /// `acl forget`: remove the persistent grants of `roots`, or with
@@ -778,6 +1391,9 @@ pub fn forget(
     force: bool,
 ) -> Result<Vec<(String, Forgot)>> {
     let conn = db.conn();
+    // First the grants forgotten earlier whose volume was absent.
+    // An explicit request: one on a share is tried at its path too.
+    let still_pending = retry_pending(conn, ids, true)?;
     let mut targets: Vec<String> = roots.to_vec();
     if all {
         targets.extend(read_marker()?.roots.into_iter().map(|r| r.path));
@@ -796,12 +1412,14 @@ pub fn forget(
         };
         out.push((t, r));
     }
-    if all
-        && read_marker()?.roots.is_empty()
-        && all_root_paths(conn)?.is_empty()
-        && let Some(key) = reg::Key::open_hkcu(MARKER_KEY, true)?
-    {
-        reg::delete_value(&key, MARKER_EVER)?;
+    // … which are part of the answer for as long as they wait.
+    for p in still_pending {
+        if !out.iter().any(|(t, _)| *t == p.path) {
+            out.push((p.path, Forgot::Pending));
+        }
+    }
+    if all {
+        marker_clear_ever_if_unused(conn)?;
     }
     Ok(out)
 }
@@ -809,29 +1427,94 @@ pub fn forget(
 /// `srt-win uninstall`: forget every persistent grant of the calling
 /// user. Does nothing — and creates no state — when none was ever
 /// made. Returns how many roots were processed and how many failed.
-pub fn forget_everything() -> Result<(usize, usize)> {
-    if read_marker().is_ok_and(|m| m == Marker::default()) {
-        return Ok((0, 0));
+pub fn forget_everything() -> Result<Forgotten> {
+    forget_everything_as(None)
+}
+
+/// What the half of `srt-win uninstall` that runs as the calling user
+/// does once the elevated half has returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterElevation {
+    /// The install is gone: forget the caller's grants. `step_failed`
+    /// is the elevated step's exit code if it was not 0 — it removed
+    /// the account and then failed at something else.
+    ForgetGrants { step_failed: Option<i32> },
+    /// The install is still there: change nothing of the caller's,
+    /// exit with this code.
+    LeaveEverything(i32),
+}
+
+pub fn after_elevation(elevated_exit: i32, install_record_present: bool) -> AfterElevation {
+    if install_record_present {
+        // Not removed. An exit of 0 with the record still there is not
+        // a clean removal either.
+        AfterElevation::LeaveEverything(if elevated_exit == 0 { 1 } else { elevated_exit })
+    } else {
+        AfterElevation::ForgetGrants {
+            step_failed: (elevated_exit != 0).then_some(elevated_exit),
+        }
     }
-    let ids = Ids::load()?;
+}
+
+/// What [`forget_everything`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Forgotten {
+    /// Roots processed.
+    pub roots: usize,
+    /// Roots that could not be completed; they stay recorded.
+    pub failed: usize,
+    /// Paths on volumes that are not mounted, still to be stripped.
+    pub pending: Vec<String>,
+}
+
+/// [`forget_everything`] with the identities read earlier: after the
+/// install record is gone, `ids` taken before it went still name the
+/// group the grants were written for.
+pub fn forget_everything_as(ids: Option<&Ids>) -> Result<Forgotten> {
+    if read_marker().is_ok_and(|m| m.nothing_recorded()) {
+        return Ok(Forgotten::default());
+    }
+    let loaded;
+    let ids = match ids {
+        Some(ids) => ids,
+        None => {
+            loaded = Ids::load()?;
+            &loaded
+        }
+    };
     let holder = crate::state_db::HolderPid(std::process::id());
     let (out, _) =
-        crate::state_db::with_init_lock(holder, false, |db| forget(db, &ids, &[], true, false))?;
-    let failed = out
-        .iter()
-        .filter(|(_, r)| matches!(r, Forgot::Failed(_)))
-        .count();
-    Ok((out.len(), failed))
+        crate::state_db::with_init_lock(holder, false, |db| forget(db, ids, &[], true, false))?;
+    Ok(Forgotten {
+        roots: out.len(),
+        failed: out
+            .iter()
+            .filter(|(_, r)| matches!(r, Forgot::Failed(_)))
+            .count(),
+        pending: out
+            .into_iter()
+            .filter(|(_, r)| *r == Forgot::Pending)
+            .map(|(p, _)| p)
+            .collect(),
+    })
 }
 
 /// For `acl grant` without `--persistent`: refuse while a persistent
 /// grant is recorded or a target's DACL cannot be read, and remove a
 /// persistent ALLOW found on a target's own DACL (inherited: refuse).
 pub fn clear_for_unrestricted_grant(db: &Locked, targets: &[String]) -> Result<()> {
-    if let Some(why) = unrestricted_block_reason() {
+    // A grant forgotten while its volume was absent, and back now.
+    retry_pending(db.conn(), &Ids::load()?, false)?;
+    if let Some(why) = write_grant_block_reason() {
         bail!(
             "{why}; grants for the ordinary token are refused until `srt-win acl forget \
              --all` has removed them"
+        );
+    }
+    if let Some(why) = crate::profile::block_reason() {
+        bail!(
+            "{why}; grants for the ordinary token are refused until `srt-win profile \
+             forget` has removed it"
         );
     }
     let ids = Ids::load()?;
@@ -891,6 +1574,109 @@ fn unrecorded_grant_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A strip that was begun stays on record when its transaction is
+    /// rolled back, and such a record does not vouch for the tree.
+    #[test]
+    fn a_strip_that_was_begun_is_unfinished_until_it_completes() {
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (root, target, other) = (r"\\?\C:\w", r"\\?\C:\w\deny.txt", r"\\?\C:\other");
+        let id = [7u8; 24];
+        for p in [root, target, other] {
+            conn.execute(
+                "INSERT INTO persistent_writes (canonical_path, file_id, spec, done) \
+                 VALUES (?1, ?2, 'spec', 1)",
+                params![p, id.as_slice()],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO persistent_denies (canonical_path, root, kind, mask, file_id) \
+             VALUES (?1, ?2, 'deny', 'denyWrite', ?3)",
+            params![target, root, id.as_slice()],
+        )
+        .unwrap();
+        let done = |p: &str| -> i64 {
+            conn.query_row(
+                "SELECT done FROM persistent_writes WHERE canonical_path = ?1",
+                params![p],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        mark_strip_begun(&conn, root).unwrap();
+        // What the forget does next is undone when the process dies.
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute("DELETE FROM persistent_denies", []).unwrap();
+        tx.execute("UPDATE persistent_writes SET done = 1", [])
+            .unwrap();
+        drop(tx);
+        assert_eq!((done(root), done(target), done(other)), (0, 0, 1));
+        // Nothing wanted and nothing of ours on the object any more is
+        // settled only if no strip is outstanding.
+        let rec = |d: i64| (id.to_vec(), "spec".to_owned(), d);
+        assert!(!is_settled(Some(&rec(0)), true, "", &id));
+        assert!(is_settled(Some(&rec(1)), true, "", &id));
+        assert!(is_settled(None, true, "", &id));
+        // With ACEs wanted: a completed write of that list on that object.
+        assert!(is_settled(Some(&rec(1)), false, "spec", &id));
+        assert!(!is_settled(Some(&rec(1)), false, "other", &id));
+        assert!(!is_settled(Some(&rec(1)), false, "spec", &[8u8; 24]));
+        assert!(!is_settled(None, false, "spec", &id));
+    }
+
+    /// The denies a write record lists are read back from its text:
+    /// what tells a deny of ours from someone else's on the same
+    /// path.
+    #[test]
+    fn the_denies_of_a_write_record_are_read_back() {
+        const GROUP: &str = "S-1-5-21-1-2-3-1002";
+        const CAP: &str = "S-1-0-1936880739-1-2-3-4";
+        let want = acl::persistent_aces(&PersistentWant {
+            group_sid: GROUP,
+            real_user_sid: "S-1-5-21-1-2-3-1000",
+            capability_sid: Some(CAP),
+            deny: Some(acl::DenyMask::WriteDeny),
+            deny_fdc: true,
+            deny_delete: true,
+            profile: None,
+        });
+        let spec = spec_of(&want);
+        let key = |v: &[AceView]| -> Vec<(String, u32)> {
+            v.iter().map(|a| (a.sid.clone(), a.mask)).collect()
+        };
+        let wanted_denies: Vec<AceView> = want.iter().filter(|a| a.deny).cloned().collect();
+        assert_eq!(wanted_denies.len(), 3);
+        assert_eq!(key(&denies_of_spec(&spec)), key(&wanted_denies));
+        assert!(denies_of_spec("").is_empty());
+        assert!(denies_of_spec("(A;OICI;0x1301bf;;;S-1-1-0)(nonsense").is_empty());
+        assert!(recorded_denies(&want, None).is_none());
+        let now: Vec<AceView> = want.iter().filter(|a| !a.deny).cloned().collect();
+        let listed = recorded_denies(&now, Some(&spec)).unwrap();
+        assert_eq!(key(&listed), key(&wanted_denies));
+        let t = PersistentTrustees {
+            group_sid: Some(GROUP),
+            real_user_sid: "S-1-5-21-1-2-3-1000",
+            previous_group_sids: &[],
+            sandbox_user_sid: None,
+            recorded_denies: Some(&listed),
+        };
+        for d in &wanted_denies {
+            assert!(acl::is_persistent_ace(d, &t), "{}", d.sddl());
+        }
+        let fence = AceView {
+            deny: true,
+            inherited: false,
+            flags: 0,
+            mask: 0x000d_0040,
+            sid: GROUP.to_owned(),
+        };
+        assert!(!acl::is_persistent_ace(&fence, &t));
+        assert_eq!(
+            acl::foreign_group_denies(std::slice::from_ref(&fence), &t).len(),
+            1
+        );
+    }
 
     #[test]
     fn an_unlocatable_root_is_skipped_only_with_force() {
@@ -966,6 +1752,155 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_forgets_grants_only_after_the_elevated_removal_succeeded() {
+        assert_eq!(
+            after_elevation(0, false),
+            AfterElevation::ForgetGrants { step_failed: None }
+        );
+        for code in [1, 2, 23, -1, 259] {
+            assert_eq!(
+                after_elevation(code, false),
+                AfterElevation::ForgetGrants {
+                    step_failed: Some(code)
+                }
+            );
+        }
+        for code in [10, 1, 2, -1, 259] {
+            assert_eq!(
+                after_elevation(code, true),
+                AfterElevation::LeaveEverything(code)
+            );
+        }
+        assert_eq!(after_elevation(0, true), AfterElevation::LeaveEverything(1));
+    }
+
+    #[test]
+    fn a_pending_strip_round_trips_and_blocks_only_while_its_volume_is_mounted() {
+        let id = |serial: u64| {
+            let mut b = [0u8; 24];
+            b[..8].copy_from_slice(&serial.to_le_bytes());
+            b[8] = 7;
+            FileId::from_bytes(&b).unwrap()
+        };
+        let p = PendingStrip {
+            file_id: id(0xAB),
+            group_sid: "S-1-5-21-1-2-3-1001".to_owned(),
+            path: r"\\?\E:\work|odd".to_owned(),
+        };
+        assert_eq!(PendingStrip::decode(&p.encode()).unwrap(), p);
+        assert!(PendingStrip::decode("nonsense").is_err());
+        assert!(PendingStrip::decode("zz|S-1-1-0|x").is_err());
+
+        let marker = || {
+            Ok(Marker {
+                pending: vec![p.clone()],
+                ..Default::default()
+            })
+        };
+        let no_db = || -> Option<Vec<String>> { panic!("the database is not consulted") };
+        assert_eq!(block_reason_from(marker(), no_db, |_| false), None);
+        let serial = p.file_id.volume_serial;
+        assert_eq!(
+            block_reason_from(marker(), no_db, |s| s == serial + 1),
+            None
+        );
+        let why = block_reason_from(marker(), no_db, |s| s == serial).unwrap();
+        assert!(why.contains(r"E:\work"), "{why}");
+        assert!(!marker().unwrap().nothing_recorded());
+        assert!(Marker::default().nothing_recorded());
+    }
+
+    /// The re-check of pending strips: what stays listed.
+    #[test]
+    fn pending_strips_are_retried_until_the_strip_succeeds() {
+        use std::cell::RefCell;
+        let id = |n: u8| FileId::from_bytes(&[n; 24]).unwrap();
+        let entry = |n: u8| PendingStrip {
+            file_id: id(n),
+            group_sid: "S-1-5-21-1-2-3-1001".to_owned(),
+            path: format!(r"\\?\E:\root{n}"),
+        };
+        let all = || vec![entry(1), entry(2), entry(3), entry(4)];
+        let stripped = RefCell::new(Vec::<String>::new());
+        let locate = |p: &PendingStrip| match p.file_id.as_bytes()[0] {
+            1 => Located::VolumeAbsent,
+            2 => Located::At(r"\\?\F:\moved".to_owned()),
+            3 => Located::Gone,
+            _ => Located::Unknown,
+        };
+        let (left, changed) = retry_pending_with(all(), locate, |p, at| {
+            stripped.borrow_mut().push(format!("{}@{at}", p.path));
+            Ok(())
+        })
+        .unwrap();
+        assert!(changed);
+        assert_eq!(left, vec![entry(1), entry(4)]);
+        assert_eq!(*stripped.borrow(), [r"\\?\E:\root2@\\?\F:\moved"]);
+
+        let (left, changed) =
+            retry_pending_with(all(), locate, |_, _| Err(anyhow!("access denied"))).unwrap();
+        assert_eq!(left, vec![entry(1), entry(2), entry(4)]);
+        assert!(changed, "the gone one was dropped");
+
+        let (left, changed) =
+            retry_pending_with(vec![entry(1)], locate, |_, _| unreachable!()).unwrap();
+        assert_eq!((left, changed), (vec![entry(1)], false));
+
+        use AtPath::{Another, Nothing, Recorded, Unavailable};
+        let at = || Located::At("p".into());
+        let cases: [(AtPath, Located, bool, Disposition); 16] = [
+            (Recorded, Located::Unknown, false, Disposition::StripHere),
+            (
+                Recorded,
+                Located::VolumeAbsent,
+                true,
+                Disposition::StripHere,
+            ),
+            (Nothing, at(), false, Disposition::StripAt("p".into())),
+            (Another, at(), false, Disposition::StripAt("p".into())),
+            (Nothing, Located::Gone, false, Disposition::Drop),
+            (Another, Located::Gone, true, Disposition::Drop),
+            (Nothing, Located::Unknown, false, Disposition::Fail),
+            (Another, Located::Unknown, false, Disposition::Fail),
+            (Nothing, Located::VolumeAbsent, false, Disposition::Pending),
+            (Another, Located::VolumeAbsent, false, Disposition::Pending),
+            (
+                Unavailable,
+                Located::VolumeAbsent,
+                false,
+                Disposition::Pending,
+            ),
+            (Unavailable, Located::Unknown, false, Disposition::Pending),
+            (
+                Unavailable,
+                Located::VolumeAbsent,
+                true,
+                Disposition::Pending,
+            ),
+            (Unavailable, at(), false, Disposition::StripAt("p".into())),
+            (Nothing, Located::VolumeAbsent, true, Disposition::Fail),
+            (Another, Located::VolumeAbsent, true, Disposition::Fail),
+        ];
+        for (at_path, located, network, want) in cases {
+            let asked = std::cell::Cell::new(false);
+            let got = disposition(
+                at_path,
+                || {
+                    asked.set(true);
+                    located.clone()
+                },
+                network,
+            );
+            assert_eq!(got, want, "{at_path:?} / {located:?} / network={network}");
+            assert_eq!(
+                asked.get(),
+                at_path != Recorded,
+                "{at_path:?}: looked up by id"
+            );
+        }
+    }
+
+    #[test]
     fn marker_entry_round_trips() {
         let r = MarkerRoot {
             file_id: FileId {
@@ -1009,6 +1944,7 @@ mod tests {
                     path: (*p).to_owned(),
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -1016,16 +1952,23 @@ mod tests {
     #[test]
     fn ordinary_token_is_refused_on_any_read_failure() {
         let no_db = || -> Option<Vec<String>> { panic!("database consulted") };
-        assert_eq!(block_reason_from(Ok(Marker::default()), no_db), None);
-        let r = block_reason_from(Err(anyhow!("access denied")), no_db).unwrap();
+        assert_eq!(
+            block_reason_from(Ok(Marker::default()), no_db, |_| false),
+            None
+        );
+        let r = block_reason_from(Err(anyhow!("access denied")), no_db, |_| false).unwrap();
         assert!(r.contains("cannot be read"), "{r}");
-        let r = block_reason_from(Ok(marker_with(true, &[r"\\?\C:\a"])), no_db).unwrap();
+        let r = block_reason_from(Ok(marker_with(true, &[r"\\?\C:\a"])), no_db, |_| false).unwrap();
         assert!(r.contains("1 persistent write grant"), "{r}");
         let ever = || Ok(marker_with(true, &[]));
-        assert_eq!(block_reason_from(ever(), || Some(Vec::new())), None);
-        let r = block_reason_from(ever(), || Some(vec![r"\\?\C:\b".to_owned()])).unwrap();
+        assert_eq!(
+            block_reason_from(ever(), || Some(Vec::new()), |_| false),
+            None
+        );
+        let r =
+            block_reason_from(ever(), || Some(vec![r"\\?\C:\b".to_owned()]), |_| false).unwrap();
         assert!(r.contains("state database records 1"), "{r}");
-        let r = block_reason_from(ever(), || None).unwrap();
+        let r = block_reason_from(ever(), || None, |_| false).unwrap();
         assert!(r.contains("missing or unreadable"), "{r}");
     }
 

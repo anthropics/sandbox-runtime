@@ -646,6 +646,47 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
     Ok 'P3: a repeat session start on PA performed zero DACL writes'
   } else { Fail "P3: a repeat session start on PA: exit=$($g.exit), DACL writes=$($g.writes) (want 0). raw: $($g.raw)" }
 
+  # ── PF: someone else's deny for the sandbox group on a kept root ──
+  End-Session
+  $pf = New-AclDir 'pf' @()
+  foreach ($i in 0..39) {
+    $d = Join-Path $pf "d$i"
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    foreach ($j in 0..49) { [System.IO.File]::WriteAllText((Join-Path $d "f$j.txt"), 'x') }
+  }
+  $pfDeep = Join-Path $pf 'd0\deep\f.txt'
+  New-Item -ItemType Directory -Path (Split-Path $pfDeep) -Force | Out-Null
+  'DEEP' | Set-Content -Encoding ASCII $pfDeep
+  & icacls $pf /deny "*$($script:grpSid):(DE,WDAC,WO,DC)" | Out-Null
+  $fence = [regex]::Match((Sddl $pf), '\(D;;[^;)]*;;;' + [regex]::Escape($script:grpSid) + '\)').Value
+  if (-not $fence) { Fail "PF: setup — the fence is not on the root: $(Sddl $pf)" }
+  else {
+    $groupAllow = '\(A;[^)]*;;;' + [regex]::Escape($script:grpSid) + '\)'
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $g1 = Grant-P @($pf); $sw.Stop(); $t1 = $sw.ElapsedMilliseconds
+    End-Session
+    $sw = [System.Diagnostics.Stopwatch]::StartNew(); $g2 = Grant-P @($pf); $sw.Stop(); $t2 = $sw.ElapsedMilliseconds
+    Write-Host ("PF: TIMING: kept root with 2000 files and a foreign deny: first grant {0} ms ({1} tree walk(s)), second grant {2} ms ({3} tree walk(s))" -f $t1, $g1.writes, $t2, $g2.writes)
+    if ($g1.exit -eq 0 -and $g1.writes -ge 1 -and (Sddl $pfDeep) -match $groupAllow) { Ok 'PF: the first grant walks the tree: a deep file inherits the grant' }
+    else { Fail "PF: first grant: exit=$($g1.exit) walks=$($g1.writes) deep=$(Sddl $pfDeep)" }
+    if ($g2.exit -eq 0 -and $g2.writes -eq 0 -and $g2.raw -notmatch 'persistent DACL write') { Ok 'PF: a later session start on that root performs zero DACL writes although it carries a deny for the group this product did not write' }
+    else { Fail "PF: second grant: exit=$($g2.exit) walks=$($g2.writes) (want 0). raw: $($g2.raw)" }
+    if ((Sddl $pf).Contains($fence)) { Ok 'PF: the foreign deny is still on the root' }
+    else { Fail "PF: the foreign deny is gone: want $fence in $(Sddl $pf)" }
+    $r = SbRoots @($pf) @($cmd, '/d', '/s', '/c', "echo PF-W> `"$pf\w.txt`"")
+    if (Test-Path "$pf\w.txt") { Ok 'PF: a sandboxed command still writes in the root' }
+    else { Fail "PF: a sandboxed write in the root failed. raw: $($r.raw)" }
+    End-Session
+    $fo = & $Exe acl forget $pf --json 2>&1 | Out-String
+    $fexit = $LASTEXITCODE
+    $sd = Sddl $pf
+    if ($fexit -eq 0 -and $sd -notmatch $groupAllow -and $sd -notmatch [regex]::Escape($CapPrefix) -and
+        (Sddl $pfDeep) -notmatch [regex]::Escape($script:grpSid)) { Ok 'PF: forgetting the root removes everything this product wrote, on it and below' }
+    else { Fail "PF: after forget: exit=$fexit root=$sd deep=$(Sddl $pfDeep)" }
+    if ($sd.Contains($fence) -and $fo -match 'left in place') { Ok 'PF: the foreign deny is left on the forgotten root, and the forget says so' }
+    else { Fail "PF: the foreign deny after forget: on root=$($sd.Contains($fence)) output: $fo" }
+    & icacls $pf /remove:d "*$($script:grpSid)" | Out-Null
+  }
+
   # ── P4: denies live as long as the grant ─────────────────────────
   $denyF   = Join-Path $pa 'deny.txt'
   $sbOwned = Join-Path $pa 'sb-deny.txt'
@@ -795,6 +836,7 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   $g = Grant-P @($pb)
   if ($g.exit -ne 0 -or -not (Has-Persistent $pb)) { Fail 'P11: setup — PB is not carrying a persistent grant' }
   else {
+    End-Session
     & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-String | Write-Host
     $left = @((Get-ItemProperty 'HKCU:\Software\sandbox-runtime\PersistentGrants' -ErrorAction SilentlyContinue).Roots |
       Where-Object { $_ })
