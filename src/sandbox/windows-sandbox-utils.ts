@@ -2763,7 +2763,7 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
 /**
  * Session start under the write-restricted token: one `srt-win acl
  * grant --persistent`. Grants on the `write` roots are KEPT at session
- * end; {@link forgetWindowsPersistentGrants} removes them.
+ * end; `srt-win acl forget` removes them.
  */
 export async function grantWindowsAclPersistent(
   opts: WindowsAclGrantOptions & {
