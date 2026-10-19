@@ -2251,9 +2251,15 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
   // (which composes against setEnvVars) wins.
   // Merged ignoring case, as Windows reads names: a caller's
-  // `Https_Proxy` is the same variable as ours.
+  // `Https_Proxy` is the same variable as ours. Node's built-in clients
+  // read the proxy variables only with NODE_USE_ENV_PROXY set; it sits in
+  // the first layer, so a caller's value, in any case, wins.
   const overlay = mergeWindowsEnv(
-    { PATH: process.env.PATH, PATHEXT: process.env.PATHEXT },
+    {
+      PATH: process.env.PATH,
+      PATHEXT: process.env.PATHEXT,
+      ...(p.httpProxyPort ? { NODE_USE_ENV_PROXY: '1' } : {}),
+    },
     p.setEnvVars ?? {},
     generated,
     gitCfg,
