@@ -7,8 +7,9 @@
   and the script exits non-zero only when it could not do its own work
   (provisioning, a row's own code throwing, cleanup).
 
-  The "remote" server is this machine's own SMB server reached through a
-  non-loopback address.
+  Limits: the "remote" server is this machine's own SMB server reached
+  through a non-loopback address, which Windows may still treat as local,
+  and no row starts a WSL distribution.
 #>
 param(
   [Parameter(Mandatory = $true, Position = 0)]
@@ -25,6 +26,10 @@ $cmd  = Join-Path $env:SystemRoot 'System32\cmd.exe'
 $wps  = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $sc   = Join-Path $env:SystemRoot 'System32\sc.exe'
 $wsl  = Join-Path $env:SystemRoot 'System32\wsl.exe'
+
+# Every probe command prints this first; a result without it never ran.
+$RanMark = 'SRT-RESID-RAN'
+$Ran     = "echo $RanMark & "
 
 $rows   = [System.Collections.Generic.List[object]]::new()
 $errors = [System.Collections.Generic.List[string]]::new()
@@ -101,41 +106,50 @@ function SbExec {
     $null = $p.WaitForExit(10000)
   }
   # Bounded: a process that outlives the broker and holds the pipe must not hang this.
-  $out = if ($so.Wait(10000)) { $so.Result } else { '' }
-  $err = if ($se.Wait(10000)) { $se.Result } else { '' }
+  $outRead = $so.Wait(10000)
+  $errRead = $se.Wait(10000)
+  $out = if ($outRead) { $so.Result } else { '' }
+  $err = if ($errRead) { $se.Result } else { '' }
   $raw = $out + $err
   $child = (($raw -split "`r?`n") |
-            Where-Object { $_ -notmatch '^srt-win:' }) -join "`n"
+            Where-Object { $_ -notmatch '^srt-win:' -and $_.Trim() -ne $RanMark }) -join "`n"
   $exit = if ($timedOut) { -1 } else { $p.ExitCode }
+  $unmeasured = if ($timedOut) { "timeout after ${TimeoutSec}s" }
+                elseif (-not ($outRead -and $errRead)) { 'its output was not read within 10s' }
+                elseif ($raw -notmatch $RanMark) { "the command did not start (exit=$exit)" }
+                else { $null }
   Write-Host "  [exec exit=$exit timedOut=$timedOut] $($tail -join ' ')"
   foreach ($line in (("$raw" -replace "`0", '') -split "`r?`n")) {
     if ($line.Trim()) { Write-Host "    | $line" }
   }
   return [pscustomobject]@{
     exit = $exit; raw = $raw; out = $child
-    timedOut = $timedOut; timeout = $TimeoutSec
+    timedOut = $timedOut; timeout = $TimeoutSec; unmeasured = $unmeasured
   }
 }
 function Detail { param($r)
-  if ($r.timedOut) { return "timeout after $($r.timeout)s" }
+  if ($r.unmeasured) { return "not measured: $($r.unmeasured)" }
   return "exit=$($r.exit); text: $(OneLine $r.out 300)"
 }
+# `denied` is recorded only for a command that ran and returned its output.
 function ReadVerdict { param($r)
   if ("$($r.out)" -match [regex]::Escape($CanaryToken)) { return 'allowed' }
+  if ($r.unmeasured) { return 'not measured' }
   return 'denied'
 }
-function WriteVerdict { param([string] $File, [string] $Nonce)
+function WriteVerdict { param($r, [string] $File, [string] $Nonce)
   $p = Join-Path $shareDir $File
   if ((Test-Path -LiteralPath $p) -and
       ("$(Get-Content -Raw -LiteralPath $p)" -match [regex]::Escape($Nonce))) {
     return 'allowed'
   }
+  if ($r.unmeasured) { return 'not measured' }
   return 'denied'
 }
 function NewNonce { return "nonce-$([guid]::NewGuid().ToString('N'))-end" }
 function WslFirstLines { param([string] $CommandLine)
-  $r = SbExec @('--', $cmd, '/c', $CommandLine) -TimeoutSec 90 -ExtraEnv @('WSL_UTF8=1')
-  if ($r.timedOut) { return "timeout after $($r.timeout)s; first lines: $(FirstLines $r.out)" }
+  $r = SbExec @('--', $cmd, '/c', "$Ran$CommandLine") -TimeoutSec 90 -ExtraEnv @('WSL_UTF8=1')
+  if ($r.unmeasured) { return "not measured: $($r.unmeasured); first lines: $(FirstLines $r.out)" }
   return "exit=$($r.exit); first lines: $(FirstLines $r.out)"
 }
 
@@ -196,6 +210,9 @@ function WriteMupDacl { param($h, [byte[]] $sd)
 function SddlOf { param([byte[]] $sd)
   return [System.Security.AccessControl.RawSecurityDescriptor]::new($sd, 0).GetSddlForm('Access')
 }
+# Holds the original descriptor while the experiment's is in place; cleanup.ps1
+# restores from it if this script is killed first.
+$MupBackup = Join-Path ([IO.Path]::GetTempPath()) 'srt-resid-mup-dacl.b64'
 function RestoreMup {
   if (-not $script:mupOriginal) { return 'nothing to restore' }
   $h = OpenMup 0x00060000
@@ -207,6 +224,7 @@ function RestoreMup {
     throw "descriptor after restore differs from the original: now $(SddlOf $now)"
   }
   $script:mupOriginal = $null
+  Remove-Item -LiteralPath $MupBackup -Force -ErrorAction SilentlyContinue
   return 'restored, reads back identical to the original'
 }
 
@@ -245,8 +263,16 @@ try {
   Stdin @('acl', 'grant', '--holder-pid', $PID, '--sandbox-user-sid', $sbSid) `
         (@{ write = @($ws) } | ConvertTo-Json -Compress)
 
-  $r = SbExec @('--', $cmd, '/c', 'whoami /user /FO CSV /NH')
+  $r = SbExec @('--', $cmd, '/c', "${Ran}whoami /user /FO CSV /NH")
   Record 'setup-child-identity' (Detail $r)
+
+  # A command that cannot start must read as `not measured`, never `denied`.
+  Row 'selfcheck-unstarted-command' {
+    $r = SbExec @('--', (Join-Path $ws 'no-such-program.exe'))
+    $v = ReadVerdict $r
+    if ($v -ne 'not measured') { throw "a command that never started was recorded as '$v'" }
+    "$v; $(Detail $r)"
+  }
 
   # ── SMB setup ────────────────────────────────────────────────────
   $smbReady = $false
@@ -290,25 +316,39 @@ try {
   $unc      = "\\$addr\$shareName"
   $uncLoop  = "\\127.0.0.1\$shareName"
 
-  # Controls: if either fails, the rows below mean something different.
+  # Controls: the rows below are measured only if the share answers the
+  # administrator and a sandboxed command can be launched and read back.
+  $script:ctlAdmin = $null
+  $script:ctlLocal = $null
   Row 'smb-control-admin-unc-read' {
     if ($noRemote) { return $noRemote }
     try {
       $t = "$(Get-Content -Raw -LiteralPath "$unc\canary.txt" -ErrorAction Stop)"
-      if ($t -match [regex]::Escape($CanaryToken)) { 'allowed' } else { "unexpected content: $(OneLine $t 80)" }
+      if ($t -match [regex]::Escape($CanaryToken)) { $script:ctlAdmin = 'allowed'; 'allowed' }
+      else { "unexpected content: $(OneLine $t 80)" }
     } catch { "denied; text: $_" }
   }
   Row 'smb-control-sandbox-local-path-read' {
     if ($noLocal) { return $noLocal }
-    $r = SbExec @('--', $cmd, '/c', "type `"$shareDir\canary.txt`"")
-    "$(ReadVerdict $r); $(Detail $r)"
+    $r = SbExec @('--', $cmd, '/c', "${Ran}type `"$shareDir\canary.txt`"")
+    $script:ctlLocal = ReadVerdict $r
+    "$($script:ctlLocal); $(Detail $r)"
+  }
+  $noLaunch = if ($script:ctlLocal -eq 'not measured') {
+    'not measured: the control command as the sandbox account was itself not measured'
+  } else { $null }
+  if (-not $noLocal) { $noLocal = $noLaunch }
+  if (-not $noRemote) {
+    $noRemote = if ($script:ctlAdmin -ne 'allowed') {
+      'not measured: the administrator could not read the share through the address'
+    } else { $noLaunch }
   }
 
   # ── (a) read through the address, default identity ──────────────
   $script:aVerdict = $null
   Row 'smb-a-default-identity-read' {
     if ($noRemote) { return $noRemote }
-    $r = SbExec @('--', $cmd, '/c', "type `"$unc\canary.txt`"")
+    $r = SbExec @('--', $cmd, '/c', "${Ran}type `"$unc\canary.txt`"")
     $script:aVerdict = ReadVerdict $r
     "$($script:aVerdict); $(Detail $r)"
   }
@@ -317,8 +357,8 @@ try {
   Row 'smb-b-default-identity-write' {
     if ($noRemote) { return $noRemote }
     $n = NewNonce
-    $r = SbExec @('--', $cmd, '/c', "echo $n> `"$unc\b-write.txt`"")
-    "$(WriteVerdict 'b-write.txt' $n); $(Detail $r)"
+    $r = SbExec @('--', $cmd, '/c', "${Ran}echo $n> `"$unc\b-write.txt`"")
+    "$(WriteVerdict $r 'b-write.txt' $n); $(Detail $r)"
   }
 
   # ── (c) net use with the temporary account, then read and write ──
@@ -328,6 +368,7 @@ try {
     $n = NewNonce
     @"
 @echo off
+echo $RanMark
 net use "$unc" "$acctPw" /user:$($env:COMPUTERNAME)\$acct /persistent:no < nul
 echo NETUSE_EXIT=%errorlevel%
 type "$unc\canary.txt"
@@ -339,7 +380,7 @@ echo NETUSE_DELETE_EXIT=%errorlevel%
 "@ | Set-Content -Encoding ASCII (Join-Path $ws 'probe-c.cmd')
     $r = SbExec @('--', $cmd, '/c', "`"$ws\probe-c.cmd`"")
     $nu = if ("$($r.out)" -match 'NETUSE_EXIT=(-?\d+)') { $Matches[1] } else { 'not reached' }
-    "net use exit=$nu; read: $(ReadVerdict $r); write: $(WriteVerdict 'c-write.txt' $n); $(Detail $r)"
+    "net use exit=$nu; read: $(ReadVerdict $r); write: $(WriteVerdict $r 'c-write.txt' $n); $(Detail $r)"
   }
 
   # ── (d) a process started with network-only credentials ─────────
@@ -356,6 +397,7 @@ echo WRITE_EXIT=%errorlevel%
 "@ | Set-Content -Encoding ASCII (Join-Path $ws 'probe-d-inner.cmd')
     $probeD = @'
 $ErrorActionPreference = 'Stop'
+'SRT-RESID-RAN'
 try {
   Add-Type -Namespace Resid -Name Native -MemberDefinition @"
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -417,19 +459,23 @@ public static extern bool CloseHandle(IntPtr h);
     $r = SbExec @('--', $wps, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
                   '-File', (Join-Path $ws 'probe-d.ps1')) -TimeoutSec 180
     $start = if ("$($r.out)" -match '(CPWLW_RESULT=[^\r\n]*|PROBE_ERROR=[^\r\n]*)') { $Matches[1] } else { 'no result line' }
-    "start: $start; read: $(ReadVerdict $r); write: $(WriteVerdict 'd-write.txt' $n); $(Detail $r)"
+    "start: $start; read: $(ReadVerdict $r); write: $(WriteVerdict $r 'd-write.txt' $n); $(Detail $r)"
   }
 
   # ── (e) control: the same read through the loopback address ─────
   Row 'smb-e-loopback-read-control' {
     if ($noLocal) { return $noLocal }
-    $r = SbExec @('--', $cmd, '/c', "type `"$uncLoop\canary.txt`"")
+    $r = SbExec @('--', $cmd, '/c', "${Ran}type `"$uncLoop\canary.txt`"")
     "$(ReadVerdict $r); $(Detail $r)"
   }
 
   # ── EXPERIMENT: a deny entry for the sandbox account on \Device\Mup ──
   # Changes a machine-wide object: restored in this row's finally and the outer one.
   Row 'smb-EXPERIMENT-mup-deny-ace' {
+    if ($noRemote) { return $noRemote }
+    if ($script:aVerdict -ne 'allowed') {
+      return "not attempted: row (a) was '$($script:aVerdict)', so a deny entry has nothing to change"
+    }
     $api = 'CreateFileW(\\.\GLOBALROOT\Device\Mup) + GetKernelObjectSecurity/SetKernelObjectSecurity(DACL)'
     $h = $null
     try { $h = OpenMup 0x00060000 } catch {
@@ -459,21 +505,19 @@ public static extern bool CloseHandle(IntPtr h);
       $new = [byte[]]::new($sd.BinaryLength)
       $sd.GetBinaryForm($new, 0)
 
+      [IO.File]::WriteAllText($MupBackup, [Convert]::ToBase64String($orig))
       $script:mupOriginal = $orig
       try { WriteMupDacl $h $new } catch {
         $script:mupOriginal = $null
+        Remove-Item -LiteralPath $MupBackup -Force -ErrorAction SilentlyContinue
         return $out + "not settable: SetKernelObjectSecurity failed: $_"
       }
       $after = SddlOf (ReadMupDacl $h)
       $present = $after -match [regex]::Escape($sbSid)
       $out += "set returned success; deny entry present on re-read: $present; "
-      if ($noRemote) {
-        $out += "re-run of (a) $noRemote; "
-      } else {
-        $r = SbExec @('--', $cmd, '/c', "type `"$unc\canary.txt`"")
-        $v = ReadVerdict $r
-        $out += "(a) before: $($script:aVerdict); (a) with the deny entry: $v ($(Detail $r)); changed: $($v -ne $script:aVerdict); "
-      }
+      $r = SbExec @('--', $cmd, '/c', "${Ran}type `"$unc\canary.txt`"")
+      $v = ReadVerdict $r
+      $out += "(a) before: $($script:aVerdict); (a) with the deny entry: $v ($(Detail $r)); changed: $($v -ne $script:aVerdict); "
     } finally {
       $h.Dispose()
       if ($script:mupOriginal) {
@@ -490,16 +534,16 @@ public static extern bool CloseHandle(IntPtr h);
   # Read-only. WSL_UTF8 asks wsl.exe for UTF-8 output.
   Row 'wsl-exe-as-sandbox' {
     $r = SbExec @('--', $cmd, '/c',
-      "where wsl.exe & if exist `"$wsl`" (echo SYSTEM32_WSL=present) else (echo SYSTEM32_WSL=absent)")
+      "${Ran}where wsl.exe & if exist `"$wsl`" (echo SYSTEM32_WSL=present) else (echo SYSTEM32_WSL=absent)")
     Detail $r
   }
   Row 'wsl-status-as-sandbox' { WslFirstLines 'wsl.exe --status < nul' }
   Row 'wsl-list-verbose-as-sandbox' { WslFirstLines 'wsl.exe --list --verbose < nul' }
   Row 'wsl-service-as-sandbox' {
     $parts = foreach ($svc in @('WslService', 'LxssManager')) {
-      $r = SbExec @('--', $sc, 'query', $svc)
+      $r = SbExec @('--', $cmd, '/c', "$Ran`"$sc`" query $svc")
       $state = if ("$($r.out)" -match 'STATE\s*:\s*\d+\s+(\w+)') { $Matches[1] }
-               elseif ($r.timedOut) { "timeout after $($r.timeout)s" }
+               elseif ($r.unmeasured) { "not measured: $($r.unmeasured)" }
                else { OneLine $r.out 120 }
       $admin = Get-Service -Name $svc -ErrorAction SilentlyContinue
       $adminView = if ($admin) { "$($admin.Status)/$($admin.StartType)" } else { 'absent' }
