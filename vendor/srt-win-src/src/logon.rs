@@ -377,8 +377,8 @@ pub fn spawn_runner(
     drop(stdout.runner);
     drop(stderr.runner);
 
-    // Write the spec, then close stdin so the runner's
-    // `read_exact` doesn't block waiting for more.
+    // Write the spec first; the runner reads exactly the
+    // length-prefixed spec, so anything after it is the child's.
     {
         let mut wrote = 0u32;
         unsafe {
@@ -393,19 +393,38 @@ pub fn spawn_runner(
             ));
         }
     }
-    drop(stdin.broker);
 
-    // Pump stdout/stderr on dedicated threads. `HANDLE` wraps a
+    // Pump stdio on dedicated threads. `HANDLE` wraps a
     // `*mut c_void` which is `!Send`; the value is just an opaque
     // index into the process's handle table, so cast to `isize` for
     // the move and reconstruct inside the thread. Broker stdio
     // handles are not OwnedHandle — they're owned by the process,
     // not us.
+    let h = |v: isize| HANDLE(v as *mut c_void);
+
+    // Exec: relay the caller's stdin to the child (which inherits the
+    // runner's stdin), closing the pipe on the caller's EOF so the
+    // child sees it too. Not joined: it can block on a caller that
+    // never closes stdin, and `exec` exits once the runner does.
+    // One-shot runner commands keep the close-after-spec so they
+    // never consume the broker's own stdin.
+    if matches!(cmd, crate::runner::RunnerCmd::Exec(_)) {
+        let bin = std::io::stdin().as_raw().0 as isize;
+        let si = stdin.broker.into_raw().0 as isize;
+        std::thread::spawn(move || {
+            pump(h(bin), h(si));
+            unsafe {
+                let _ = CloseHandle(h(si));
+            }
+        });
+    } else {
+        drop(stdin.broker);
+    }
+
     let bout = std::io::stdout().as_raw().0 as isize;
     let berr = std::io::stderr().as_raw().0 as isize;
     let so = stdout.broker.into_raw().0 as isize;
     let se = stderr.broker.into_raw().0 as isize;
-    let h = |v: isize| HANDLE(v as *mut c_void);
     let t_out = std::thread::spawn(move || {
         pump(h(so), h(bout));
         unsafe {
@@ -435,9 +454,14 @@ pub fn spawn_runner(
     Ok(code)
 }
 
-/// `std::io::Stdout`/`Stderr` → raw `HANDLE` for [`pump`].
+/// `std::io::Stdin`/`Stdout`/`Stderr` → raw `HANDLE` for [`pump`].
 trait AsRawHandle {
     fn as_raw(&self) -> HANDLE;
+}
+impl AsRawHandle for std::io::Stdin {
+    fn as_raw(&self) -> HANDLE {
+        HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(self))
+    }
 }
 impl AsRawHandle for std::io::Stdout {
     fn as_raw(&self) -> HANDLE {
