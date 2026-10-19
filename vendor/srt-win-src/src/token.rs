@@ -157,7 +157,7 @@ pub fn to_primary(token: HANDLE) -> Result<HANDLE> {
 /// Set the token's integrity level via a mandatory-label SID built
 /// with `AllocateAndInitializeSid` (so [`FreeSid`] is the correct
 /// release fn — the one place in this crate where it is).
-fn set_il(tok: HANDLE, rid: u32) -> Result<()> {
+pub(crate) fn set_il(tok: HANDLE, rid: u32) -> Result<()> {
     unsafe {
         let ml_auth = SID_IDENTIFIER_AUTHORITY {
             Value: [0, 0, 0, 0, 0, 16],

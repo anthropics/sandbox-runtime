@@ -683,19 +683,60 @@ enum WfpCmd {
     },
     /// Behavioral egress-block probe — the non-elevated readiness
     /// check for the WFP fence. Spawns the runner as `srt-sandbox`
-    /// (via `CreateProcessWithLogonW`) which attempts a direct TCP
-    /// connect to `target`.
+    /// (via `CreateProcessWithLogonW`), which attempts direct TCP
+    /// connects under each token shape a sandboxed process can
+    /// present (`srt_win::probe`).
     ///
-    /// Prints `{"egress_probe":"blocked"|"connected"|"unreachable",
-    /// "target":…}` and exits **0** (blocked = fence active),
-    /// **3** (connected = fence MISSING), **2** (unreachable =
-    /// timeout/no-route; treat as failure), or **15** when the
-    /// sandbox user is not provisioned. Any other code (including
-    /// 1, the runner's own anyhow `Err` path) maps to
-    /// `egress_probe:"error"`. Does not require elevation. This
-    /// is the non-elevated readiness check the host's
-    /// `initialize()` runs; `wfp status` is the elevated
-    /// ground-truth enum.
+    /// Prints one JSON line. Each `*_probe` is `blocked`,
+    /// `connected`, `refused`, `unreachable`, `skipped` or `error`:
+    ///
+    ///   - `egress_probe` — own token, to `target`.
+    ///   - `anonymous_probe` — impersonating the anonymous token, to
+    ///     `anonymous_target`.
+    ///   - `anonymous_loopback_probe` — impersonating the anonymous
+    ///     token, to `target`.
+    ///   - `deny_only_probe` — a copy of the own token with the user
+    ///     SID deny-only, to `target`.
+    ///   - `low_integrity_probe`, `low_integrity_loopback_probe` — a
+    ///     copy of the own token at low integrity, to
+    ///     `anonymous_target` and to `target`.
+    ///   - `untrusted_integrity_probe`,
+    ///     `untrusted_integrity_loopback_probe` — the same at
+    ///     untrusted integrity.
+    ///   - `residuals` — names of the gaps `anonymous_probe`,
+    ///     `anonymous_loopback_probe` and `deny_only_probe` found
+    ///     open (`anonymous-egress`, `anonymous-loopback`,
+    ///     `deny-only-user-sid`). The filters do not close these;
+    ///     they are reported, with a warning on stderr, and do not
+    ///     change the exit code. `anonymous-egress` is expected
+    ///     wherever the machine has an off-loopback address: no
+    ///     filter is keyed on the anonymous token.
+    ///     `lowered-integrity-unprobed` is named when a
+    ///     lowered-integrity probe is `error`: that token shape could
+    ///     not be set up, so no connect under it was observed.
+    ///
+    /// Every probe but `egress_probe` makes its connect twice: once
+    /// on a socket created before the token is assumed and once on a
+    /// socket created after, since the engine attributes a connect
+    /// to the token in effect when its socket was created. The JSON
+    /// carries the worse of the two results for the fence; stderr
+    /// carries one line per ordering, each naming it (`socket before
+    /// token`, `socket after token`).
+    ///
+    /// Every other probe must be blocked: `egress_probe` and the
+    /// four lowered-integrity ones, whose token still carries the
+    /// sandbox account's SID. Exits **0**
+    /// (`egress_probe` was blocked and each lowered-integrity one was
+    /// blocked, skipped for want of an off-loopback address, or
+    /// `error` = fence active), **3** (one got past the filters =
+    /// fence MISSING), **2** (`egress_probe` was not blocked, or a
+    /// lowered-integrity connect was made and got no answer; treat
+    /// as failure), or **15** when the sandbox user is not
+    /// provisioned. A runner
+    /// exit that is not a probe report prints every probe as
+    /// `error` and exits 1. Does not require elevation. This is the
+    /// non-elevated readiness check the host's `initialize()` runs;
+    /// `wfp status` is the elevated ground-truth enum.
     Verify {
         /// Probe target (`host:port`). The host binds a local
         /// listener on an ephemeral loopback port OUTSIDE the WFP
@@ -704,6 +745,22 @@ enum WfpCmd {
         /// on any external host.
         #[arg(long)]
         target: String,
+        /// Off-loopback target (`host:port`) for the attempt made
+        /// while impersonating the anonymous token, and for the
+        /// lowered-integrity attempts' off-loopback half. Default: this
+        /// machine's own outbound address at `target`'s port —
+        /// nothing needs to listen there, since a refused connect
+        /// shows the filters let it through just as a completed one
+        /// does. With no such address the attempt is skipped.
+        #[arg(long)]
+        anonymous_target: Option<String>,
+        /// Also make the off-loopback attempt under the anonymous
+        /// token (`anonymous_probe`, residual `anonymous-egress`).
+        /// No filter refuses it, so it never changes the exit code,
+        /// and it can wait on its destination; without this flag it
+        /// is `skipped`.
+        #[arg(long)]
+        anonymous_egress: bool,
     },
     /// Remove every srt-win-tagged WFP filter under the sublayer.
     /// Self-elevates via UAC if not already admin.
@@ -1064,16 +1121,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&st)?);
         }
         Cmd::Wfp {
-            sub: WfpCmd::Verify { target },
+            sub:
+                WfpCmd::Verify {
+                    target,
+                    anonymous_target,
+                    anonymous_egress,
+                },
         } => {
-            use srt_win::{install, logon, runner};
-            // The WFP BLOCK fires at ALE_AUTH_CONNECT before any
-            // packet leaves, so an active fence gives WSAEACCES
-            // (~0ms, exit 0); a MISSING fence lets the connect
-            // succeed (exit 3). The host passes a local loopback
-            // listener bound outside the WFP permit range so
-            // fence-missing is distinguishable from fence-active
-            // without depending on any external host.
+            use srt_win::{install, logon, probe, runner};
+            // The host passes a loopback listener outside the permit range, so
+            // a MISSING fence connects where an active one gives WSAEACCES.
             let r = install::read_cred().and_then(|c| {
                 let s = install::read_setup()?
                     .ok_or_else(|| anyhow!("sandbox user not provisioned"))?;
@@ -1086,6 +1143,17 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
+            fn finish(doc: serde_json::Value, exit: i32) -> ! {
+                println!("{doc}");
+                // Explicit flush: this arm prints to stdout and then
+                // `process::exit`s instead of returning Ok(()).
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                std::process::exit(exit)
+            }
+            let anonymous_target = anonymous_target.or_else(|| {
+                let port = target.parse::<std::net::SocketAddr>().ok()?.port();
+                probe::off_loopback_target(port).map(|a| a.to_string())
+            });
             let code = logon::spawn_runner(
                 &cred.user,
                 &cred.pw,
@@ -1093,33 +1161,76 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 None,
                 &runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
+                    anonymous_target: anonymous_target.clone(),
+                    anonymous_egress,
                 },
                 false,
             )
             .context("spawn runner for egress probe")?;
-            let probe = match code {
-                0 => "blocked",
-                3 => "connected",
-                2 => "unreachable",
-                // 1 is the runner's own anyhow `Err` path
-                // (`main()` → `eprintln!` + `exit(1)`); anything
-                // else is an unmapped runner state. Neither is a
-                // valid probe outcome.
-                _ => "error",
+            let Some(report) = probe::Report::decode(code) else {
+                // Not a report: exit 1 is the runner's own `Err` path, and
+                // anything else is an unmapped runner state.
+                finish(
+                    json!({
+                        "egress_probe": "error",
+                        "anonymous_probe": "error",
+                        "anonymous_loopback_probe": "error",
+                        "deny_only_probe": "error",
+                        "low_integrity_probe": "error",
+                        "low_integrity_loopback_probe": "error",
+                        "untrusted_integrity_probe": "error",
+                        "untrusted_integrity_loopback_probe": "error",
+                        "target": target,
+                        "anonymous_target": anonymous_target,
+                        "residuals": [],
+                        "runner_exit": code,
+                    }),
+                    1,
+                );
             };
-            println!(
-                "{}",
+            let verdict = probe::verdict(&report);
+            for residual in &verdict.residuals {
+                eprintln!(
+                    "srt-win: warning: wfp verify: residual '{residual}': {}",
+                    match *residual {
+                        probe::RESIDUAL_ANONYMOUS_EGRESS =>
+                            "a connect to an off-loopback destination made \
+                             while impersonating the anonymous token is not \
+                             blocked: no filter is keyed on that token \
+                             (see the per-ordering lines above)",
+                        probe::RESIDUAL_ANONYMOUS_LOOPBACK =>
+                            "a connect to a loopback destination made while \
+                             impersonating the anonymous token is not blocked \
+                             (see the per-ordering lines above)",
+                        probe::RESIDUAL_LOWERED_INTEGRITY_UNPROBED =>
+                            "a lowered-integrity copy of the sandbox token \
+                             could not be set up, so no connect under it was \
+                             observed (see the per-ordering lines above)",
+                        _ =>
+                            "a connect made under a copy of the sandbox token \
+                             whose user SID is deny-only is not blocked \
+                             (see the per-ordering lines above)",
+                    },
+                );
+            }
+            finish(
                 json!({
-                    "egress_probe": probe,
+                    "egress_probe": report.plain.label(),
+                    "anonymous_probe": report.anonymous.label(),
+                    "anonymous_loopback_probe": report.anonymous_loopback.label(),
+                    "deny_only_probe": report.deny_only.label(),
+                    "low_integrity_probe": report.low_integrity.label(),
+                    "low_integrity_loopback_probe": report.low_integrity_loopback.label(),
+                    "untrusted_integrity_probe": report.untrusted_integrity.label(),
+                    "untrusted_integrity_loopback_probe":
+                        report.untrusted_integrity_loopback.label(),
                     "target": target,
+                    "anonymous_target": anonymous_target,
+                    "residuals": verdict.residuals,
                     "runner_exit": code,
-                })
+                }),
+                verdict.exit,
             );
-            // `process::exit`'s rt::cleanup flushes stdout, but be
-            // explicit — this is the only arm that prints to stdout
-            // and then `process::exit`s instead of returning Ok(()).
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-            std::process::exit(code as i32);
         }
         Cmd::Wfp {
             sub: WfpCmd::Uninstall { sublayer_guid },

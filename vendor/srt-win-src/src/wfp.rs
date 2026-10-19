@@ -23,6 +23,12 @@
 //!     SYSTEM, the real user) carries a different user SID → no match
 //!     → falls through to default-permit.
 //!
+//! WFP attributes a connect to the token in effect when its SOCKET
+//! was created. A thread that assumes the anonymous token, or a copy
+//! of its own token with the user SID deny-only, before creating a
+//! socket is NOT matched by the BLOCK; `srt-win wfp verify` reports
+//! either as a residual ([`crate::probe`]).
+//!
 //! WFP's `ALE_USER_ID` condition with `FWP_MATCH_EQUAL` evaluates the
 //! supplied security descriptor via `AccessCheck` against the
 //! connecting token: the filter *matches* iff the check grants

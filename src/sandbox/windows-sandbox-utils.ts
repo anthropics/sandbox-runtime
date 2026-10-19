@@ -186,14 +186,56 @@ export interface WindowsWfpStatusResult {
 }
 
 /**
- * Result of `srt-win wfp verify` on success (exit 0, `blocked`) —
- * see {@link verifyWindowsWfpEgress}. Any other outcome throws, so
- * the tri-state is unobservable on the return path.
+ * Result of one connect attempt by `srt-win wfp verify`. `connected`
+ * and `refused` both mean the connect got past the filters;
+ * `unreachable` and `error` say nothing about the fence.
+ */
+export type WindowsWfpProbeOutcome =
+  | 'blocked'
+  | 'connected'
+  | 'refused'
+  | 'unreachable'
+  | 'skipped'
+  | 'error'
+
+/**
+ * A gap {@link verifyWindowsWfpEgress} observed that the filter set
+ * does not close. `anonymous-egress` is expected on every machine with
+ * an off-loopback address: no filter is keyed on the anonymous token.
+ */
+export type WindowsWfpResidual =
+  | 'anonymous-egress'
+  | 'anonymous-loopback'
+  | 'deny-only-user-sid'
+  | 'lowered-integrity-unprobed'
+
+/**
+ * Result of `srt-win wfp verify` on success (exit 0); anything else
+ * throws. `plain` is `blocked`. A lowered-integrity attempt may be
+ * `error` (not set up), and the rest anything: see `residuals`.
  */
 export interface WindowsWfpVerifyResult {
   target: string
-  /** Runner's stderr (carries the `BLOCKED (…)` diagnostic line). */
+  /** Runner's stderr (carries one diagnostic line per attempt). */
   stderr: string
+  /**
+   * One per attempt. `anonymous`, `lowIntegrity` and `untrustedIntegrity`
+   * go to an off-loopback target, the rest to the loopback one.
+   */
+  probes: {
+    plain: WindowsWfpProbeOutcome
+    anonymous: WindowsWfpProbeOutcome
+    anonymousLoopback: WindowsWfpProbeOutcome
+    denyOnly: WindowsWfpProbeOutcome
+    lowIntegrity: WindowsWfpProbeOutcome
+    lowIntegrityLoopback: WindowsWfpProbeOutcome
+    untrustedIntegrity: WindowsWfpProbeOutcome
+    untrustedIntegrityLoopback: WindowsWfpProbeOutcome
+  }
+  /** Gaps the probe found open: NOT a clean pass when non-empty. */
+  residuals: WindowsWfpResidual[]
+  /** Warnings for residuals and skipped attempts; `initialize()` logs them. */
+  warnings: string[]
 }
 
 /**
@@ -921,12 +963,157 @@ export async function getWindowsWfpStatusAsync(
   )
 }
 
+type RawWfpVerify = {
+  egress_probe: string
+  target: string
+  anonymous_probe?: string
+  anonymous_target?: string | null
+  anonymous_loopback_probe?: string
+  deny_only_probe?: string
+  low_integrity_probe?: string
+  low_integrity_loopback_probe?: string
+  untrusted_integrity_probe?: string
+  untrusted_integrity_loopback_probe?: string
+  residuals?: string[]
+}
+
+const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
+  'anonymous-egress':
+    'a connect to an off-loopback destination made while impersonating ' +
+    'the anonymous token is not blocked (no filter is keyed on that ' +
+    'token; a sandboxed process that puts it on a thread before ' +
+    'creating a socket is not fenced)',
+  'anonymous-loopback':
+    'a connect to a loopback destination made while impersonating the ' +
+    'anonymous token is not blocked (local listeners outside the proxy ' +
+    'port range are reachable that way)',
+  'deny-only-user-sid':
+    'a connect made under a copy of the sandbox token whose user SID is ' +
+    'deny-only is not blocked (the filters cannot match that token)',
+  'lowered-integrity-unprobed':
+    'a lowered-integrity copy of the sandbox token could not be set up on ' +
+    'this machine, so no connect under it was observed',
+}
+
+function isWfpResidual(s: string): s is WindowsWfpResidual {
+  return Object.prototype.hasOwnProperty.call(WFP_RESIDUAL_TEXT, s)
+}
+
+/**
+ * Turn one `srt-win wfp verify` run into a result or a typed error
+ * (pure). An attempt the fence must refuse that got through rejects
+ * whatever the exit code says; a residual never throws.
+ */
+export function interpretWindowsWfpVerify(r: {
+  status: number | null
+  signal?: NodeJS.Signals | null
+  stdout: string
+  stderr: string
+}): WindowsWfpVerifyResult {
+  let raw: RawWfpVerify
+  try {
+    raw = JSON.parse(r.stdout) as RawWfpVerify
+  } catch {
+    // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before this
+    // parse; status=null here means an external signal.
+    throw new WindowsSandboxError(
+      'wfp_verify_unparseable',
+      `WFP egress fence could not be verified — \`srt-win wfp ` +
+        `verify\` exited ${r.status}` +
+        (r.signal ? ` (signal ${r.signal})` : '') +
+        ` with unparseable output ${JSON.stringify(r.stdout)} ` +
+        `(stderr: ${JSON.stringify(r.stderr)})`,
+    )
+  }
+  const outcome = (v: string | undefined): WindowsWfpProbeOutcome =>
+    (v ?? 'skipped') as WindowsWfpProbeOutcome
+  const probes = {
+    plain: outcome(raw.egress_probe),
+    anonymous: outcome(raw.anonymous_probe),
+    anonymousLoopback: outcome(raw.anonymous_loopback_probe),
+    denyOnly: outcome(raw.deny_only_probe),
+    lowIntegrity: outcome(raw.low_integrity_probe),
+    lowIntegrityLoopback: outcome(raw.low_integrity_loopback_probe),
+    untrustedIntegrity: outcome(raw.untrusted_integrity_probe),
+    untrustedIntegrityLoopback: outcome(raw.untrusted_integrity_loopback_probe),
+  }
+  const offLoopback = raw.anonymous_target ?? 'no target'
+  const summary =
+    `plain=${probes.plain} (${raw.target}), ` +
+    `anonymous=${probes.anonymous} (${offLoopback}), ` +
+    `anonymous-loopback=${probes.anonymousLoopback}, ` +
+    `deny-only=${probes.denyOnly}, ` +
+    `low-integrity=${probes.lowIntegrity} (${offLoopback}), ` +
+    `low-integrity-loopback=${probes.lowIntegrityLoopback}, ` +
+    `untrusted-integrity=${probes.untrustedIntegrity} (${offLoopback}), ` +
+    `untrusted-integrity-loopback=${probes.untrustedIntegrityLoopback}`
+  // The attempts the fence must refuse. One getting through rejects
+  // whatever the exit code says.
+  const lowIl = 'the sandbox user under a low-integrity copy of its token'
+  const untrustedIl =
+    'the sandbox user under an untrusted-integrity copy of its token'
+  const which = (
+    [
+      [probes.plain, 'the sandbox user', raw.target],
+      [probes.lowIntegrity, lowIl, raw.anonymous_target],
+      [probes.lowIntegrityLoopback, lowIl, raw.target],
+      [probes.untrustedIntegrity, untrustedIl, raw.anonymous_target],
+      [probes.untrustedIntegrityLoopback, untrustedIl, raw.target],
+    ] as const
+  )
+    .filter(([o]) => o === 'connected' || o === 'refused')
+    .map(([, who, tgt]) => `direct outbound from ${who} to ${tgt}`)
+  if (r.status === 3 || which.length > 0) {
+    throw new WindowsSandboxError(
+      'wfp_fence_inactive',
+      `WFP egress fence is not active — ` +
+        `${which.join(' and ') || 'a direct outbound connect'} was not ` +
+        `blocked [${summary}]. Re-run \`srt-win install\` (one UAC ` +
+        `prompt). (${r.stderr})`,
+    )
+  }
+  if (r.status !== 0) {
+    throw new WindowsSandboxError(
+      'wfp_verify_inconclusive',
+      `WFP egress fence could not be verified — probe to ` +
+        `${raw.target} was '${raw.egress_probe}' (exit ` +
+        `${r.status}) [${summary}]. The fence may be absent. Re-run ` +
+        `\`srt-win install\`. (${r.stderr})`,
+    )
+  }
+  // Exit 0 alone is not a pass: the plain attempt must say `blocked`.
+  if (raw.egress_probe !== 'blocked') {
+    throw new WindowsSandboxError(
+      'wfp_verify_inconclusive',
+      `WFP egress fence could not be verified — \`srt-win wfp verify\` ` +
+        `exited 0 but reported the plain attempt as ` +
+        `'${raw.egress_probe ?? 'missing'}' [${summary}]. (${r.stderr})`,
+    )
+  }
+  const residuals = (raw.residuals ?? []).filter(isWfpResidual)
+  const warnings = residuals.map(
+    x => `WFP egress fence residual '${x}': ${WFP_RESIDUAL_TEXT[x]}`,
+  )
+  if (
+    probes.lowIntegrity === 'skipped' ||
+    probes.untrustedIntegrity === 'skipped'
+  ) {
+    warnings.push(
+      `WFP egress fence: the off-loopback lowered-integrity attempts ` +
+        `were skipped (no off-loopback address on this machine, or an ` +
+        `srt-win that does not make them)`,
+    )
+  }
+  return { target: raw.target, stderr: r.stderr, probes, residuals, warnings }
+}
+
 /**
  * Behavioral proof that the WFP egress fence is active for the
  * sandbox user. Binds a local listener on an ephemeral loopback port
  * outside the WFP loopback-permit range, then spawns `srt-win
  * runner` as the sandbox user (via `CreateProcessWithLogonW`) to
- * attempt a direct TCP connect to it. The WFP block-user filter
+ * attempt direct TCP connects, one per token shape a sandboxed
+ * process can present. The WFP block-user filter
  * fires at `ALE_AUTH_CONNECT` — before any packet leaves — so an
  * active fence yields WSAEACCES immediately and a missing fence lets
  * the connect through (the kernel completes the handshake against
@@ -943,12 +1130,16 @@ export async function getWindowsWfpStatusAsync(
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
- * @throws on any outcome other than `blocked` (exit 0).
+ * @param opts.anonymousEgress also make the off-loopback attempt under
+ *   the anonymous token. It cannot change the result and can take
+ *   seconds, so `initialize()` leaves it out; for diagnostics only.
+ * @throws on any outcome other than exit 0.
  */
 export async function verifyWindowsWfpEgress(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
+    anonymousEgress?: boolean
     srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
@@ -980,52 +1171,24 @@ export async function verifyWindowsWfpEgress(
       )
     }
   }
+  const args = ['wfp', 'verify', '--target', target]
+  if (opts.anonymousEgress) args.push('--anonymous-egress')
   try {
     // 30s: first call after install may create the sandbox user's
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
-    // the runner allows itself 2s to connect (runner.rs).
-    const r = runSrtWin(['wfp', 'verify', '--target', target], {
+    // the runner bounds each of its connects (probe.rs).
+    const r = runSrtWin(args, {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
     })
     logForDebugging(
       `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
     )
-    let raw: { egress_probe: string; target: string }
-    try {
-      raw = JSON.parse(r.stdout)
-    } catch {
-      // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before
-      // this parse; status=null here means an external signal.
-      // Include signal + stderr so the CI log self-explains instead
-      // of just `exited null with unparseable output ""`.
-      throw new WindowsSandboxError(
-        'wfp_verify_unparseable',
-        `WFP egress fence could not be verified — \`srt-win wfp ` +
-          `verify\` exited ${r.status}` +
-          (r.signal ? ` (signal ${r.signal})` : '') +
-          ` with unparseable output ${JSON.stringify(r.stdout)} ` +
-          `(stderr: ${JSON.stringify(r.stderr)})`,
-      )
+    const result = interpretWindowsWfpVerify(r)
+    for (const w of result.warnings) {
+      logForDebugging(`[Sandbox Windows] ${w}`, { level: 'warn' })
     }
-    if (r.status === 3) {
-      throw new WindowsSandboxError(
-        'wfp_fence_inactive',
-        `WFP egress fence is not active — direct outbound from the ` +
-          `sandbox user to ${raw.target} succeeded. Re-run ` +
-          `\`srt-win install\` (one UAC prompt). (${r.stderr})`,
-      )
-    }
-    if (r.status !== 0) {
-      throw new WindowsSandboxError(
-        'wfp_verify_inconclusive',
-        `WFP egress fence could not be verified — probe to ` +
-          `${raw.target} was '${raw.egress_probe}' (exit ` +
-          `${r.status}). The fence may be absent. Re-run \`srt-win ` +
-          `install\`. (${r.stderr})`,
-      )
-    }
-    return { target: raw.target, stderr: r.stderr }
+    return result
   } finally {
     server?.close()
   }
