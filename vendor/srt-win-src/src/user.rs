@@ -508,8 +508,7 @@ fn is_logon_ui_hidden(user: &str) -> bool {
 ///
 /// - `SeDenyNetworkLogonRight`: THIS machine refuses a new network logon as
 ///   the account. It governs logons to this machine only and is no limit on
-///   outbound SMB; `ci/smoke-residual-egress.ps1` measures that, against this
-///   machine's own server only.
+///   outbound SMB: a share on this machine's own server stays reachable.
 /// - `SeDenyBatchLogonRight`: a sandboxed child can REGISTER a
 ///   scheduled task (the service's DACL allows it); the task then
 ///   needs a batch logon to RUN. Denying it turns registration into

@@ -25,9 +25,7 @@ param(
 
   [string]$AmbientSublayer = '9e4b2d7a-6c05-4f18-8a3d-2b9e7c1f5a0d',
   # Must match smoke-machine-store.ps1.
-  [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93',
-  # Must match smoke-residual-egress.ps1.
-  [string]$ResidualSublayer = 'b7524f53-6892-434c-93d5-46e02c3f8cdc'
+  [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93'
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -44,7 +42,6 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $TsSublayer
 & $Exe wfp uninstall --sublayer-guid $AmbientSublayer
 & $Exe wfp uninstall --sublayer-guid $MachineStoreSublayer
-& $Exe wfp uninstall --sublayer-guid $ResidualSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
 # sublayers; the test tears down via uninstallWindowsSandbox(). This
 # is belt-and-braces in case it crashed mid-row.
@@ -62,37 +59,6 @@ if (-not (Test-Path $Exe)) {
 # them, so this only matters if a smoke script threw mid-section.
 & $Exe uninstall --sublayer-guid $InstallSublayer
 Remove-LocalUser -Name srt-sandbox -ea SilentlyContinue
-# Covers a smoke-residual-egress.ps1 run killed before its own `finally`.
-Get-SmbShare -Name 'srtresid*' | Remove-SmbShare -Force -Confirm:$false
-Get-LocalUser -Name 'srt-resid-*' | Remove-LocalUser
-# The file exists only while \Device\Mup carries that script's experimental
-# DACL: put the saved descriptor back.
-$mupBackup = Join-Path ([IO.Path]::GetTempPath()) 'srt-resid-mup-dacl.b64'
-if (Test-Path -LiteralPath $mupBackup) {
-  try {
-    $mupSd = [Convert]::FromBase64String((Get-Content -Raw -LiteralPath $mupBackup -ea Stop).Trim())
-    $mupApi = Add-Type -Namespace SrtCleanup -Name Mup -PassThru -ea Stop -MemberDefinition @'
-[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(
-  string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
-[DllImport("advapi32.dll", SetLastError = true)]
-public static extern bool SetKernelObjectSecurity(
-  Microsoft.Win32.SafeHandles.SafeFileHandle h, uint info, byte[] sd);
-'@
-    # 0x00060000 = READ_CONTROL | WRITE_DAC, 3 = OPEN_EXISTING, 0x4 = DACL_SECURITY_INFORMATION
-    $mupH = $mupApi::CreateFileW('\\.\GLOBALROOT\Device\Mup', 0x00060000, 7, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
-    try {
-      if ($mupH.IsInvalid) { throw 'the device could not be opened for WRITE_DAC' }
-      if (-not $mupApi::SetKernelObjectSecurity($mupH, 0x4, $mupSd)) {
-        throw "SetKernelObjectSecurity failed: error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-      }
-    } finally { $mupH.Dispose() }
-    Remove-Item -LiteralPath $mupBackup -Force
-    Write-Host 'cleanup: \Device\Mup descriptor restored'
-  } catch {
-    Write-Host "cleanup: WARNING: \Device\Mup descriptor NOT restored: $_"
-  }
-}
 Remove-LocalGroup -Name sandbox-runtime-users -ea SilentlyContinue
 Remove-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' `
   -Name srt-sandbox -ea SilentlyContinue
