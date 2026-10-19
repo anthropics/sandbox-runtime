@@ -509,6 +509,10 @@ fn add_filter(
 /// a *user* SID means "is that user". The broker, services, and
 /// every other process carry a different user SID → no match → fall
 /// through to default-permit.
+///
+/// Under the write-restricted token the check must also pass against
+/// the restricting list, so the sandbox user SID must stay in it
+/// ([`crate::token::restricting_sid_list`]); a failed check means no BLOCK.
 pub fn sddl_sandbox_user(sid: &str) -> String {
     format!("O:LSG:LSD:(A;;CC;;;{sid})")
 }

@@ -1,6 +1,10 @@
 // Library exports
 export { SandboxManager } from './sandbox/sandbox-manager.js'
-export type { WrapWithSandboxOptions } from './sandbox/sandbox-manager.js'
+export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
+export type {
+  WrapWithSandboxOptions,
+  SandboxInitializeOptions,
+} from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 
 // Configuration types and schemas
@@ -79,6 +83,15 @@ export {
   grantWindowsAcl,
   revokeWindowsAcl,
   revokeWindowsAclChecked,
+  grantWindowsProfileRead,
+  forgetWindowsProfileRead,
+  forgetWindowsProfileReadAsync,
+  getWindowsProfileReadStatus,
+  windowsProfileReadEnv,
+  windowsProfileExclusionConflicts,
+  windowsProfileGrantSkipReason,
+  windowsProfileGrantNotice,
+  WINDOWS_PROFILE_READ_ENV_VARS,
   expandWindowsFsPaths,
   buildGitConfigEnv,
   parseWindowsBinShell,
@@ -99,6 +112,14 @@ export type {
   WindowsAclGrantOptions,
   WindowsAclAceOutcome,
   WindowsAclRevokeResult,
+  WindowsProfileGrantState,
+  WindowsProfileGrantStatus,
+  WindowsProfileGrantPath,
+  WindowsProfileGrantOptions,
+  WindowsProfileGrantResult,
+  WindowsProfileGrantItem,
+  WindowsInstallProfileGrant,
+  WindowsProfileExclusionConflict,
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
