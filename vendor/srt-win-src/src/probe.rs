@@ -47,6 +47,10 @@ pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 /// under that shape was observed.
 pub const RESIDUAL_LOWERED_INTEGRITY_UNPROBED: &str = "lowered-integrity-unprobed";
 
+/// Residual: loopback is open and this machine has no off-loopback
+/// address, so no attempt the filters must refuse could be made.
+pub const RESIDUAL_EGRESS_UNPROBED: &str = "egress-unprobed";
+
 const ANONYMOUS_SID: &str = "S-1-5-7";
 
 const IL_LOW: u32 = 0x1000;
@@ -130,7 +134,7 @@ impl Outcome {
 
 /// One result per attempt. `anonymous`, `low_integrity` and
 /// `untrusted_integrity` are aimed at the off-loopback target, the
-/// rest at the loopback one.
+/// rest at the loopback one; [`run`] says what changes with loopback open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
     pub plain: Outcome,
@@ -141,11 +145,14 @@ pub struct Report {
     pub low_integrity_loopback: Outcome,
     pub untrusted_integrity: Outcome,
     pub untrusted_integrity_loopback: Outcome,
+    /// Own token, to the loopback target. Attempted exactly when
+    /// loopback is open, where it must connect; else `Skipped`.
+    pub open_loopback: Outcome,
 }
 
 const BITS: u32 = 3;
 const MASK: u32 = (1 << BITS) - 1;
-const FIELDS: u32 = 8;
+const FIELDS: u32 = 9;
 /// Marks a runner exit code as an encoded [`Report`]: the bit just
 /// above the fields, so the runner's other exits (0, and 1 for its own
 /// error path) never decode.
@@ -162,6 +169,7 @@ impl Report {
             self.low_integrity_loopback,
             self.untrusted_integrity,
             self.untrusted_integrity_loopback,
+            self.open_loopback,
         ]
     }
 
@@ -188,6 +196,7 @@ impl Report {
             low_integrity_loopback: field(5)?,
             untrusted_integrity: field(6)?,
             untrusted_integrity_loopback: field(7)?,
+            open_loopback: field(8)?,
         })
     }
 
@@ -203,6 +212,7 @@ impl Report {
             low_integrity_loopback: Outcome::Skipped,
             untrusted_integrity: Outcome::Skipped,
             untrusted_integrity_loopback: Outcome::Skipped,
+            open_loopback: Outcome::Skipped,
         }
     }
 
@@ -222,6 +232,9 @@ impl Report {
 pub const EXIT_FENCED: i32 = 0;
 pub const EXIT_INCONCLUSIVE: i32 = 2;
 pub const EXIT_NOT_FENCED: i32 = 3;
+/// `wfp verify` / `exec` exit code: the installed loopback mode is not
+/// the one this session asks for.
+pub const EXIT_LOOPBACK_MISMATCH: i32 = 19;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Verdict {
@@ -230,22 +243,29 @@ pub struct Verdict {
     pub residuals: Vec<&'static str>,
 }
 
-/// The plain attempt must be blocked and no lowered-integrity one may
-/// pass the filters. A lowered-integrity attempt that could not be set
-/// up (`Error`) is reported as a residual, as the rest are when they connect.
+/// The plain attempt must be blocked and no lowered-integrity one may pass;
+/// one not set up (`Error`) is a residual, as the rest are when they connect.
+/// With loopback open, `open_loopback` must connect ([`EXIT_LOOPBACK_MISMATCH`]).
 pub fn verdict(r: &Report) -> Verdict {
     let lowered = r.lowered();
+    // With loopback open every attempt the filters must refuse goes off
+    // loopback, and a machine with no such address skips them all.
+    let open = r.open_loopback != Outcome::Skipped;
     let exit = if r.plain.passed_fence() || lowered.iter().any(|(o, _)| o.passed_fence()) {
         EXIT_NOT_FENCED
-    } else if r.plain != Outcome::Blocked
+    } else if !(r.plain == Outcome::Blocked || (open && r.plain == Outcome::Skipped))
         || lowered.iter().any(|(o, may_skip)| {
             !(matches!(o, Outcome::Blocked | Outcome::Error)
-                || (*may_skip && *o == Outcome::Skipped))
+                || ((*may_skip || open) && *o == Outcome::Skipped))
         })
     {
         EXIT_INCONCLUSIVE
     } else {
-        EXIT_FENCED
+        match r.open_loopback {
+            Outcome::Connected | Outcome::Skipped => EXIT_FENCED,
+            Outcome::Blocked => EXIT_LOOPBACK_MISMATCH,
+            _ => EXIT_INCONCLUSIVE,
+        }
     };
     let mut residuals = Vec::new();
     if exit == EXIT_FENCED {
@@ -260,6 +280,9 @@ pub fn verdict(r: &Report) -> Verdict {
         }
         if lowered.iter().any(|(o, _)| *o == Outcome::Error) {
             residuals.push(RESIDUAL_LOWERED_INTEGRITY_UNPROBED);
+        }
+        if open && r.plain == Outcome::Skipped {
+            residuals.push(RESIDUAL_EGRESS_UNPROBED);
         }
     }
     Verdict { exit, residuals }
@@ -755,7 +778,16 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Result<Outcome> {
 /// Run the attempts; with no `anonymous_target` the off-loopback ones
 /// skip. The anonymous off-loopback one, which no filter refuses and
 /// which can wait on its destination, runs only with `anonymous_egress`.
-pub fn run(target: &str, anonymous_target: Option<&str>, anonymous_egress: bool) -> Result<Report> {
+///
+/// With `allow_loopback` nothing aimed at loopback is refused, so the
+/// plain and deny-only attempts go to `anonymous_target` instead, the
+/// other loopback ones skip, and `open_loopback` connects to `target`.
+pub fn run(
+    target: &str,
+    anonymous_target: Option<&str>,
+    anonymous_egress: bool,
+    allow_loopback: bool,
+) -> Result<Report> {
     let parse = |s: &str| -> Result<SocketAddr> {
         s.parse()
             .with_context(|| format!("runner: ProbeEgress target '{s}'"))
@@ -767,19 +799,24 @@ pub fn run(target: &str, anonymous_target: Option<&str>, anonymous_egress: bool)
     if rc != 0 {
         return Err(anyhow!("WSAStartup: {rc}"));
     }
+    let skipped = |name: &str, why: &str| {
+        eprintln!("srt-win: runner: egress probe [{name}]: SKIPPED ({why})");
+        Ok(Outcome::Skipped)
+    };
     let off_loopback = |name: &str, id: Identity| match &anonymous_target {
         Some(t) => attempt(name, id, t),
-        None => {
-            eprintln!(
-                "srt-win: runner: egress probe [{name}]: SKIPPED \
-                 (no off-loopback target)"
-            );
-            Ok(Outcome::Skipped)
-        }
+        None => skipped(name, "no off-loopback target"),
+    };
+    // An attempt the filters refuse at the loopback target while loopback
+    // is closed; `elsewhere` is where it goes instead while it is open.
+    let refused_on_loopback = |name: &str, id: Identity, elsewhere: bool| match allow_loopback {
+        false => attempt(name, id, &target),
+        true if elsewhere => off_loopback(name, id),
+        true => skipped(name, "loopback is open"),
     };
     let low = Identity::LoweredIntegrity(IL_LOW);
     let untrusted = Identity::LoweredIntegrity(IL_UNTRUSTED);
-    let plain = attempt("plain", Identity::Own, &target)?;
+    let plain = refused_on_loopback("plain", Identity::Own, true)?;
     if plain.passed_fence() {
         eprintln!("srt-win: runner: egress probe: the plain connect was not blocked; stopping");
         return Ok(Report::unfenced_at_plain(plain));
@@ -787,18 +824,24 @@ pub fn run(target: &str, anonymous_target: Option<&str>, anonymous_egress: bool)
     let anonymous = if anonymous_egress {
         off_loopback("anonymous", Identity::Anonymous)?
     } else {
-        eprintln!("srt-win: runner: egress probe [anonymous]: SKIPPED (not requested)");
-        Outcome::Skipped
+        skipped("anonymous", "not requested")?
     };
+    let loopback_il = "low integrity, loopback";
+    let loopback_untrusted = "untrusted integrity, loopback";
     Ok(Report {
         plain,
         anonymous,
-        anonymous_loopback: attempt("anonymous, loopback", Identity::Anonymous, &target)?,
-        deny_only: attempt("deny-only user SID", Identity::DenyOnlyUser, &target)?,
+        anonymous_loopback: refused_on_loopback("anonymous, loopback", Identity::Anonymous, false)?,
+        deny_only: refused_on_loopback("deny-only user SID", Identity::DenyOnlyUser, true)?,
         low_integrity: off_loopback("low integrity", low)?,
-        low_integrity_loopback: attempt("low integrity, loopback", low, &target)?,
+        low_integrity_loopback: refused_on_loopback(loopback_il, low, false)?,
         untrusted_integrity: off_loopback("untrusted integrity", untrusted)?,
-        untrusted_integrity_loopback: attempt("untrusted integrity, loopback", untrusted, &target)?,
+        untrusted_integrity_loopback: refused_on_loopback(loopback_untrusted, untrusted, false)?,
+        open_loopback: if allow_loopback {
+            attempt("open loopback", Identity::Own, &target)?
+        } else {
+            Outcome::Skipped
+        },
     })
 }
 
@@ -817,7 +860,59 @@ mod tests {
             low_integrity_loopback: Outcome::Blocked,
             untrusted_integrity: Outcome::Blocked,
             untrusted_integrity_loopback: Outcome::Blocked,
+            open_loopback: Outcome::Skipped,
         }
+    }
+
+    /// Loopback open on a machine with an off-loopback address: the
+    /// loopback attempts skipped, `plain` and `open_loopback` as given.
+    fn opened(plain: Outcome, open_loopback: Outcome) -> Report {
+        Report {
+            anonymous_loopback: Outcome::Skipped,
+            low_integrity_loopback: Outcome::Skipped,
+            untrusted_integrity_loopback: Outcome::Skipped,
+            open_loopback,
+            ..report(plain, Outcome::Skipped, Outcome::Blocked, Outcome::Blocked)
+        }
+    }
+
+    #[test]
+    fn verdict_with_loopback_open() {
+        let v = verdict(&opened(Blocked, Connected));
+        assert_eq!((v.exit, v.residuals.is_empty()), (EXIT_FENCED, true));
+        // The direct connect off loopback is what must still be refused.
+        for out in [Connected, Refused] {
+            assert_eq!(verdict(&opened(out, Connected)).exit, EXIT_NOT_FENCED);
+        }
+        for unknown in [Unreachable, Error] {
+            assert_eq!(verdict(&opened(unknown, Connected)).exit, EXIT_INCONCLUSIVE);
+        }
+        // Loopback recorded open, but the connect to our own listener was refused.
+        assert_eq!(
+            verdict(&opened(Blocked, Blocked)).exit,
+            EXIT_LOOPBACK_MISMATCH
+        );
+        for unknown in [Refused, Unreachable, Error] {
+            assert_eq!(verdict(&opened(Blocked, unknown)).exit, EXIT_INCONCLUSIVE);
+        }
+        // A lowered-integrity copy getting out off loopback still fails it.
+        let mut leak = opened(Blocked, Connected);
+        leak.untrusted_integrity = Refused;
+        assert_eq!(verdict(&leak).exit, EXIT_NOT_FENCED);
+    }
+
+    #[test]
+    fn verdict_with_loopback_open_and_no_off_loopback_address() {
+        // Nothing the filters must refuse could be aimed anywhere: named, not failed.
+        let mut r = opened(Skipped, Connected);
+        (r.deny_only, r.low_integrity, r.untrusted_integrity) = (Skipped, Skipped, Skipped);
+        let v = verdict(&r);
+        assert_eq!(v.exit, EXIT_FENCED);
+        assert_eq!(v.residuals, [RESIDUAL_EGRESS_UNPROBED]);
+        // With loopback closed a skipped plain attempt is never a pass.
+        let closed = report(Skipped, Blocked, Blocked, Blocked);
+        assert_eq!(verdict(&closed).exit, EXIT_INCONCLUSIVE);
+        assert!(verdict(&closed).residuals.is_empty());
     }
 
     /// `r` with the lowered-integrity attempts replaced, in field order.
