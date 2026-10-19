@@ -507,9 +507,9 @@ fn is_logon_ui_hidden(user: &str) -> bool {
 /// depends on (the account holds it via `BUILTIN\Users`).
 ///
 /// - `SeDenyNetworkLogonRight`: THIS machine refuses a new network logon as
-///   the account. It does NOT limit outbound SMB: the redirector connects as
-///   SYSTEM (unfenced), a remote server applies its own policy, and loopback
-///   NTLM reuses the client's existing logon session.
+///   the account. It governs logons to this machine only and is no limit on
+///   outbound SMB; `ci/smoke-residual-egress.ps1` measures that, against this
+///   machine's own server only.
 /// - `SeDenyBatchLogonRight`: a sandboxed child can REGISTER a
 ///   scheduled task (the service's DACL allows it); the task then
 ///   needs a batch logon to RUN. Denying it turns registration into
