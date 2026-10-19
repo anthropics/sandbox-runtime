@@ -459,7 +459,7 @@ enum AclCmd {
         /// With `--all`: a root whose object can no longer be located
         /// (its drive is gone, say) is reported and its record dropped
         /// instead of failing the command. Its ACEs may still be on disk.
-        #[arg(long, requires = "all")]
+        #[arg(long, requires = "all", conflicts_with = "roots")]
         force: bool,
         /// The roots to forget.
         #[arg(value_name = "PATH")]
