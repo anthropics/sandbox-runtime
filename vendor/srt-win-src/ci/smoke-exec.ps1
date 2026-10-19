@@ -408,14 +408,8 @@ if ($r.out -notmatch 'AccessDenied') {
 Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
 
 # ── R5f: non-interactive logon types refused for the sandbox account ─
-# The SMB redirector dials from kernel mode as SYSTEM, so the
-# SID-keyed WFP fence never sees its connects; the fix denies the
-# sandbox group every logon type except interactive. LOOPBACK SMB is
-# exempt by NTLM loopback-session reuse (no new logon occurs), so the
-# CI-provable check is LogonUser itself: type NETWORK/BATCH/SERVICE
-# must refuse with 1385 (what any remote server's LSA runs at SMB
-# session setup), INTERACTIVE must stay granted (the
-# CreateProcessWithLogonW launch depends on it).
+# These rights govern logons TO this machine; they are no limit on outbound
+# SMB. INTERACTIVE must stay granted: the launch depends on it.
 $pwPlain = (& $Exe user read-cred).Trim()
 if ($LASTEXITCODE -ne 0 -or -not $pwPlain) { throw 'R5f: read-cred failed' }
 $lsig = '[DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool LogonUserW(string u, string d, string p, uint type, uint prov, out IntPtr tok);'

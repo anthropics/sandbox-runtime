@@ -1252,6 +1252,8 @@ export type LinuxDependencyStatus = {
 export type SandboxDependencyCheck = {
   warnings: string[]
   errors: string[]
+  /** Windows: the error in `errors` that asks for the install to be re-run. */
+  reinstallRequired?: string
 }
 
 /**

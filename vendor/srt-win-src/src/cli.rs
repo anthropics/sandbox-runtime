@@ -16,8 +16,12 @@
 //!   status                             — combined `{user, wfp}` JSON
 //!   user   status | read-cred | trust-ca — inspect the sandbox user
 //!   wfp    status | verify | uninstall — inspect/probe/remove WFP filters
-//!   acl    stamp | grant | restore | revoke | recover
-//!                                       — additive sandbox-user ACEs
+//!   acl    stamp | grant | restore | revoke | recover | forget
+//!                                       — additive sandbox-user ACEs,
+//!                                         and write grants kept
+//!                                         between sessions
+//!   profile grant | forget | status    — the opt-in read grant on
+//!                                         the real user's profile
 //!   exec   -- <target> [args...]       — spawn under the two-hop
 //!                                         sandbox-user lockdown
 //!
@@ -81,6 +85,19 @@ where
     }
     match run(Cli::parse_from(&args), &args) {
         Ok(()) => 0,
+        // Kept out by a profile grant or forget in progress: its own
+        // exit code and one line of JSON, so the caller can say so.
+        Err(e) if e.is::<srt_win::state_db::ProfileBusy>() => {
+            eprintln!("srt-win: error: {e:#}");
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "code": "profile_operation_in_progress",
+                    "message": e.to_string(),
+                })
+            );
+            srt_win::state_db::EXIT_PROFILE_BUSY
+        }
         Err(e) => {
             eprintln!("srt-win: error: {e:#}");
             1
@@ -138,7 +155,10 @@ enum Cmd {
     /// marker (unless `--keep-user`). Self-elevates via UAC if not
     /// already admin. Best-effort also removes the legacy
     /// `sandbox-runtime-net` discriminator group if a prior install
-    /// left it behind.
+    /// left it behind. Unless `--keep-user`, the calling user's
+    /// persistent write grants (`acl grant --persistent`) are removed
+    /// first, as by `acl forget --all`, and so is their profile read
+    /// grant, as by `profile forget`.
     Uninstall {
         #[arg(long)]
         sublayer_guid: Option<String>,
@@ -149,6 +169,12 @@ enum Cmd {
         /// unit).
         #[arg(long)]
         keep_user: bool,
+        /// Set by `uninstall` itself on the elevated process it
+        /// starts: do the machine-wide removal only. The grants kept
+        /// for the calling user are that user's to forget, in the
+        /// process that asked.
+        #[arg(long, hide = true)]
+        elevated_step: bool,
     },
     /// Print `{user: <user-status>, wfp: <wfp-status>}` as one line
     /// of JSON — the same objects `user status` and `wfp status`
@@ -180,6 +206,14 @@ enum Cmd {
         #[command(subcommand)]
         sub: AclCmd,
     },
+    /// The profile read grant: make the calling user's profile
+    /// readable to the sandbox group, except for credential stores.
+    /// Opt-in; nothing else in `srt-win` writes it. Runs as the user
+    /// whose profile it is, without elevation.
+    Profile {
+        #[command(subcommand)]
+        sub: ProfileCmd,
+    },
     /// Spawn a process inside the sandbox.
     ///
     /// Two-hop launch: this process (the broker, real user) reads
@@ -197,12 +231,12 @@ enum Cmd {
     /// applied — proxy configuration is single-sourced by the caller
     /// (TS `generateProxyEnvVars`) and passed here via `--env`.
     ///
-    /// Requires `srt-win install` to have provisioned the user;
-    /// otherwise exits **15**. Typed launch failures print one line
-    /// of JSON `{"code":…,"message":…}` to stderr and exit with a
-    /// dedicated code: **16** `mapped_drive_cwd`, **18**
-    /// `seclogon_disabled` (the Secondary Logon service is disabled
-    /// or absent).
+    /// Requires `srt-win install` to have provisioned the user, by a
+    /// build with this one's setup version; otherwise exits **15**.
+    /// Typed launch failures print one line of JSON
+    /// `{"code":…,"message":…}` to stderr and exit with a dedicated
+    /// code: **16** `mapped_drive_cwd`, **18** `seclogon_disabled`
+    /// (the Secondary Logon service is disabled or absent).
     Exec {
         /// Per-exec read-deny: add an additive `(D;OICI;FA;;;<sb>)`
         /// ACE for the sandbox user on `<PATH>` (and a parent
@@ -214,6 +248,31 @@ enum Cmd {
         /// caller error, not a skip).
         #[arg(long = "deny-read")]
         deny_read: Vec<String>,
+        /// A path the caller's session is granted (read or write)
+        /// that lies beneath a `--deny-read` path. While a profile
+        /// read grant is recorded, a read deny is also written on the
+        /// recorded paths beneath it; one at or beneath a path given
+        /// here is left out, as the session's own allow there ranks
+        /// above a deny set further up. Repeatable. A path that
+        /// cannot be resolved spares nothing.
+        #[arg(long = "deny-read-except", value_name = "PATH")]
+        deny_read_except: Vec<String>,
+        /// The process whose session this command belongs to and
+        /// which is recorded as one (`acl grant --holder-pid`, with
+        /// or without `--persistent`). Checked: if that process is not
+        /// alive or is not recorded — or without the flag — this
+        /// process records itself, under either token, as a session
+        /// and as the holder of each `--write-root`: the profile read
+        /// grant is not made or removed beside the command, and no
+        /// root is removed from under it.
+        ///
+        /// A command started for a recorded session ends with it: if
+        /// that process exits while the command runs, the command and
+        /// everything it started are terminated and this exits **26**.
+        /// A recorded, live session that cannot be watched fails the
+        /// command before anything is started.
+        #[arg(long = "held-by", value_name = "PID")]
+        held_by: Option<u32>,
         /// Per-exec write-deny — see `--deny-read`.
         #[arg(long = "deny-write")]
         deny_write: Vec<String>,
@@ -232,6 +291,39 @@ enum Cmd {
         /// broker chatter.
         #[arg(long)]
         quiet: bool,
+        /// Build the child token with the `WRITE_RESTRICTED` flag and
+        /// the restricting SIDs `[<sandbox user>, Everyone,
+        /// RESTRICTED]`, so write access held by `BUILTIN\Users` /
+        /// `Authenticated Users` no longer reaches the child. Off
+        /// unless passed; the library always passes it. Fails the
+        /// exec if that token cannot be built —
+        /// there is no fallback to the ordinary token. Schannel-based
+        /// TLS clients (System32 `curl.exe`, schannel-backend git,
+        /// .NET / PowerShell web requests) fail under it. Pair with
+        /// `wfp verify --write-restricted-token`.
+        ///
+        /// Without this flag the exec is refused (exit **20**) while
+        /// any persistent write grant exists (`acl grant
+        /// --persistent`): such a grant lets the sandbox account
+        /// write its tree under the ordinary token. It is refused the
+        /// same way while a profile read grant exists (`profile
+        /// grant`), or while either record cannot be read: grants that
+        /// outlive a session are made for the write-restricted token
+        /// only.
+        #[arg(long)]
+        write_restricted_token: bool,
+        /// A write root of this command's session, granted with `acl
+        /// grant --persistent`. Repeatable. The root's capability SID
+        /// is added to the child token's restricting SIDs, which is
+        /// what lets the child write there — and only there, among
+        /// the persistent roots. Fails the exec if no capability SID
+        /// is recorded for the path.
+        #[arg(
+            long = "write-root",
+            value_name = "PATH",
+            requires = "write_restricted_token"
+        )]
+        write_root: Vec<String>,
         /// Target executable followed by its arguments. Use `--`
         /// to terminate srt-win's own option parsing.
         #[arg(
@@ -249,6 +341,143 @@ enum Cmd {
     /// be invoked directly.
     #[command(hide = true)]
     Runner,
+    /// Self-checks that report what the calling process's own token
+    /// can do. `wfp verify --write-restricted-token` runs `probe
+    /// connect` as the sandboxed child. Not intended to be invoked
+    /// directly.
+    #[command(hide = true)]
+    Probe {
+        #[command(subcommand)]
+        sub: ProbeCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProbeCmd {
+    /// Attempt a direct TCP connect to `--target`. Exits **0** when
+    /// the WFP fence refused it (`WSAEACCES`), **3** when it
+    /// connected, **2** on any other error.
+    Connect {
+        #[arg(long)]
+        target: String,
+    },
+    /// Print this process's token restriction as JSON:
+    /// `{write_restricted, restricted_sids}`. CI smoke hook: only in
+    /// builds with the `test-hooks` feature.
+    #[cfg(feature = "test-hooks")]
+    Token,
+    /// Try to open the parent process and each of its threads with
+    /// every write / code-execution / impersonation right, and print
+    /// which opens succeeded as JSON: `{parent_pid, threads, opened,
+    /// errors}`. CI smoke hook: only in builds with the `test-hooks`
+    /// feature.
+    #[cfg(feature = "test-hooks")]
+    ParentAccess,
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// Write, or bring up to date, the read grant on the calling
+    /// user's profile for the sandbox group.
+    ///
+    /// The profile directory and every directory that could hold an
+    /// excluded path get an entry that lets the sandbox list them and
+    /// pass through; their other children are granted read + execute
+    /// one by one (a directory with one inheriting entry, a file with
+    /// its own). Protected paths — key and credential stores, browser
+    /// and password-manager data, the registry hives, and what
+    /// `--exclude` adds — are never granted and get a read deny,
+    /// written before the first allow; a protected directory that
+    /// does not exist is created empty to carry it. The temporary
+    /// directory is left as it is: nothing in it is granted, and it
+    /// is not denied, so a session can still grant a directory of its
+    /// own inside it.
+    /// Junctions, symbolic links and cloud placeholders are skipped.
+    /// No entry grants a write, delete or change-permissions right.
+    ///
+    /// The first run touches every file under the granted
+    /// directories and can take minutes on a large profile; progress
+    /// goes to stderr. A later run writes only what changed: a new
+    /// child of the profile directory (or of another directory whose
+    /// children are granted one by one) is not readable until then.
+    /// Other `srt-win acl` commands of the same user wait while a run
+    /// is in progress.
+    ///
+    /// Exits **15** unless the install's setup marker is this
+    /// build's, **21** when run as a service account (LocalSystem,
+    /// LocalService, NetworkService), **24** — nothing changed — while
+    /// a sandbox session or command is running, and **25** while
+    /// another profile operation is. A path that cannot be written is
+    /// reported by what that leaves and does not fail the run.
+    Grant {
+        /// A path inside the profile to exclude in addition to the
+        /// built-in list (absolute, or relative to the profile).
+        /// Repeatable. The exclusions added by earlier runs stay in
+        /// force as well. Nothing removes a built-in exclusion.
+        #[arg(long = "exclude", value_name = "PATH")]
+        exclude: Vec<String>,
+        /// Make the `--exclude` paths of this run the whole added
+        /// list, dropping the ones earlier runs recorded (with no
+        /// `--exclude`: drop them all).
+        #[arg(long)]
+        replace_excludes: bool,
+        /// Print the result as one JSON object on stdout:
+        /// `{profile, list_version, complete, containers, granted,
+        /// files, denied, placeholders, writes, unchanged, removed,
+        /// skipped, failed, elapsed_ms}`.
+        #[arg(long)]
+        json: bool,
+        /// No progress lines on stderr.
+        #[arg(long)]
+        quiet: bool,
+        /// Treat this directory as the profile, with its `AppData`
+        /// folders beneath it; the `SRT_WIN_TEST_PROFILE` environment
+        /// variable does the same when the flag is absent. CI hook:
+        /// only in builds with the `test-hooks` feature — a default
+        /// build has neither the flag nor the variable.
+        #[cfg(feature = "test-hooks")]
+        #[arg(long, value_name = "DIR")]
+        test_profile: Option<String>,
+    },
+    /// Remove the grant: the sandbox group's entry from every
+    /// recorded path (each DACL is left as it was before the grant),
+    /// the empty directories the grant created, and the record. Exits
+    /// non-zero if a path could not be completed; it stays recorded.
+    Forget {
+        /// Print `{removed, absent, placeholders_removed, failed}` on
+        /// stdout, also when exiting non-zero.
+        #[arg(long)]
+        json: bool,
+        /// Remove nothing, print `{"held_by": [{pid, kind, path}]}`
+        /// on stdout and exit 22, if a live session other than the
+        /// one of this process id is running on a kept grant.
+        #[arg(long, value_name = "PID")]
+        unless_held_by_others: Option<u32>,
+    },
+    /// Print the recorded grant as JSON: `{state, reason?, profile,
+    /// list_version, recorded_list_version, extra_exclusions,
+    /// exclusions, ungranted_only, containers, granted, files, denied,
+    /// env?, paths?}`.
+    /// `exclusions` is every protected path the grant was made to
+    /// keep unreadable (wildcards as written), existing or not;
+    /// `ungranted_only` the directories it leaves ungranted without
+    /// denying them. `state` is
+    /// `none`, `current`, `outdated`, `incomplete` or `unknown`; only
+    /// `current` is a grant a session may rely on. Asked while a
+    /// grant or forget is running it is `in_progress`, with nothing
+    /// else but `capabilities`. `env` lists the
+    /// configuration-file variables an embedder may set for a
+    /// sandboxed command. Reads the registry and opens the profile
+    /// directory; nothing below it. Exit 0.
+    Status {
+        /// Include every recorded path with its kind.
+        #[arg(long)]
+        paths: bool,
+        /// See `profile grant --test-profile`.
+        #[cfg(feature = "test-hooks")]
+        #[arg(long, value_name = "DIR")]
+        test_profile: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -256,10 +485,14 @@ enum UserCmd {
     /// Print the sandbox user's provisioning state as JSON:
     /// `{user: {exists, sid?, group_exists, group_sid?,
     /// in_builtin_users, in_sandbox_group, hidden_from_logon},
-    /// cred_present, marker_version?, marker_user_sid?,
-    /// ca_cert_thumb?, ca_cert_pem?, seclogon}`. `seclogon` is the
-    /// Secondary Logon service every launch depends on:
-    /// `"ok"|"disabled"|"missing"|"cannot-read"` (read-only SCM
+    /// cred_present, marker_version?, setup_version,
+    /// marker_user_sid?, ca_cert_thumb?, ca_cert_pem?,
+    /// persistent_grants: {state, roots, reason?}, profile_grant:
+    /// {state, reason?}, session_user_sid?, seclogon}`. The install is
+    /// usable by this build only when `marker_version` equals
+    /// `setup_version`; otherwise re-run `srt-win install`.
+    /// `seclogon` is the Secondary Logon service every launch depends
+    /// on: `"ok"|"disabled"|"missing"|"cannot-read"` (read-only SCM
     /// query — see `logon::seclogon_state`).
     Status,
     /// Print the sandbox user's decrypted password (and only the
@@ -316,6 +549,9 @@ enum AclCmd {
     /// existing DACL and inheritance are untouched. Refcounted per
     /// holder; `acl revoke` removes the ACE when the last holder
     /// releases.
+    ///
+    /// Refused while a persistent grant exists (see `--persistent`);
+    /// `acl forget --all` removes those.
     Grant {
         /// Holder PID (see `acl stamp`).
         #[arg(long)]
@@ -324,14 +560,51 @@ enum AclCmd {
         /// (`srt-win user status` → `marker_user_sid`).
         #[arg(long)]
         sandbox_user_sid: String,
+        /// Session start for `exec --write-restricted-token`. Each
+        /// `write` path becomes a persistent root: it gets a
+        /// capability SID of its own and ACEs for the sandbox GROUP
+        /// and that SID (none for the sandbox user), which are KEPT
+        /// when the session ends — `acl revoke` does not touch them,
+        /// `acl forget` removes them. A root already granted costs
+        /// one DACL read. stdin may also carry `denyRead` /
+        /// `denyWrite`: targets under a persistent root are stamped
+        /// for the sandbox group and kept with it; the others, and
+        /// the `read` paths, are per-session as without this flag.
+        /// Pass each root to `exec` as `--write-root`.
+        ///
+        /// Exits **15** unless the install's setup marker is this
+        /// build's: no grant is kept on a machine where a build of
+        /// another setup version would still launch the sandbox
+        /// account.
+        #[arg(long)]
+        persistent: bool,
+        /// While a profile read grant is recorded, no path is granted
+        /// here that is a protected exclusion of it, lies inside one,
+        /// or lies above one, nor one that is or lies above a
+        /// directory it leaves ungranted as a whole (the temporary
+        /// directory): the command fails and grants nothing. This
+        /// flag names a `read` path that may be granted although it is
+        /// a protected exclusion or lies inside one. Repeatable. It
+        /// admits no `write` path, and no path above an exclusion.
+        #[arg(long = "allow-profile-exclusion", value_name = "PATH")]
+        allow_profile_exclusion: Vec<String>,
     },
     /// Drop the holder's claim on every granted path; remove the
     /// sandbox-user ACE on any path whose refcount falls to zero.
+    ///
+    /// Exits non-zero when any grant could not be released (status
+    /// `unreadable` or `failed`: the ACE may still be on disk and its
+    /// rows are kept for a retry). A caller that goes on to
+    /// `acl restore` must not do so in that case.
     Revoke {
         #[arg(long)]
         holder_pid: u32,
         #[arg(long)]
         sandbox_user_sid: String,
+        /// Emit a single JSON array of per-path `{path, status}`
+        /// objects on stdout. The array is complete — it includes
+        /// the paths that could not be released — and is written
+        /// before a non-zero exit.
         #[arg(long)]
         json: bool,
     },
@@ -354,9 +627,55 @@ enum AclCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Run crash-recovery only: prune dead holders, drop any
-    /// orphaned sandbox-user ACEs.
+    /// Remove persistent write grants (`acl grant --persistent`):
+    /// the root's ACEs, the deny ACEs kept with it, its capability
+    /// SID and its record. One walk of the tree per root. Exits
+    /// non-zero if any root could not be completed; that root stays
+    /// recorded.
+    Forget {
+        /// Every root recorded for the calling user.
+        #[arg(long, conflicts_with = "roots")]
+        all: bool,
+        /// Emit a JSON array of per-root `{path, status}` objects on
+        /// stdout (`removed`, `absent`, `failed`, `dropped`), also when
+        /// exiting non-zero.
+        #[arg(long)]
+        json: bool,
+        /// With `--all` only: remove nothing, print `{"held_by":
+        /// [{pid, kind, path}]}` on stdout and exit 22, if a live
+        /// session other than the one of this process id is running on
+        /// any kept write root. (Not offered for named roots: a hold
+        /// is recorded by path, a root is forgotten by the object it
+        /// is, and the two would have to be matched.)
+        #[arg(long, value_name = "PID", requires = "all", conflicts_with = "roots")]
+        unless_held_by_others: Option<u32>,
+        /// Stop waiting for the volume of a grant that `forget`
+        /// reported as pending, and drop its record: for a volume that
+        /// will not come back (reformatted, discarded). The entries on
+        /// that object are NOT removed — it cannot be reached — and
+        /// nothing will remove them later; the command says so, with
+        /// the group they name. Nothing else ever drops a pending
+        /// record. Repeatable; an unknown path is an error.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["all", "roots"])]
+        drop_pending: Vec<String>,
+        /// With `--all`: a root whose object can no longer be located
+        /// (its drive is gone, say) is reported and its record dropped
+        /// instead of failing the command. Its ACEs may still be on disk.
+        #[arg(long, requires = "all", conflicts_with = "roots")]
+        force: bool,
+        /// The roots to forget.
+        #[arg(value_name = "PATH")]
+        roots: Vec<String>,
+    },
+    /// Run crash-recovery only: release the holds of dead holders
+    /// (grants first; a holder's deny ACEs are kept while one of its
+    /// grants could not be released) and prune them. Exits non-zero
+    /// when a grant is still pending.
     Recover {
+        /// Drop the record of a dead holder's grant that can no longer
+        /// be located (its path is gone and its file id cannot be
+        /// looked up), then release that holder's deny ACEs. Each
+        /// dropped path is printed; its ACE may still be on disk.
         #[arg(long)]
         force: bool,
         /// Emit `{"deadBrokers": N, "acesRevoked": N}` on stdout.
@@ -377,11 +696,17 @@ struct AclStampInput {
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct AclGrantInput {
     #[serde(default)]
     read: Vec<String>,
     #[serde(default)]
     write: Vec<String>,
+    /// `--persistent` only — see `acl grant`.
+    #[serde(default)]
+    deny_read: Vec<String>,
+    #[serde(default)]
+    deny_write: Vec<String>,
 }
 
 /// One per-path entry of `acl revoke --json` / `acl restore
@@ -398,6 +723,12 @@ struct AceTargets {
     targets: Vec<(String, srt_win::acl::SbAce)>,
     /// Inputs that could not be canonicalized (soft-skip → exit 2).
     bad_inputs: Vec<(String, String)>,
+    /// Recorded paths of the profile read grant that a read deny among
+    /// `targets` is written on as well — for
+    /// `Locked::apply_aces_and`. They exist only because of the
+    /// expansion: they are denied for the holder's session, and are
+    /// never handed to `persist::apply` to be kept with a write root.
+    also_read_deny: Vec<String>,
 }
 
 /// Canonicalize `(paths, ace)` pairs for `acl grant`/`acl stamp`
@@ -431,10 +762,16 @@ struct AceTargets {
 /// [`create_placeholder_chain`]: srt_win::path_id::create_placeholder_chain
 /// [`placeholder_ancestors_of`]: srt_win::state_db::Locked::placeholder_ancestors_of
 /// [`SbAce::DenyDelete`]: srt_win::acl::SbAce::DenyDelete
+///
+/// `allows` are the canonical paths the same session is granted (read
+/// or write): a read deny is not carried onto a recorded profile path
+/// that such a grant allows more specifically
+/// (`RecordedAllows::covered`).
 fn canonicalize_ace_targets(
     db: &srt_win::state_db::Locked,
     label: &str,
     inputs: &[(&[String], srt_win::acl::SbAce)],
+    allows: &[String],
 ) -> anyhow::Result<AceTargets> {
     use anyhow::anyhow;
     use srt_win::acl::SbAce;
@@ -444,6 +781,10 @@ fn canonicalize_ace_targets(
     use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
+    let mut also_read_deny: Vec<String> = Vec::new();
+    // The profile read grant's record, read at the first read deny
+    // and once for all of them.
+    let mut recorded: Option<srt_win::profile_plan::RecordedAllows> = None;
     // Deepest-first so overlapping non-existent denies (`['y',
     // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
     // `y` FILE (which would then fail `y\secret` with "ancestor is
@@ -526,6 +867,19 @@ fn canonicalize_ace_targets(
             }
         };
         targets.push((canon.clone(), ace));
+        // A read deny holds against the profile read grant only if it is
+        // also on each recorded path beneath it that carries its own allow.
+        if matches!(ace, SbAce::Deny(srt_win::acl::DenyMask::ReadDeny)) {
+            let recorded = match &recorded {
+                Some(r) => r,
+                None => recorded.insert(srt_win::profile::recorded_allows()?),
+            };
+            for also in recorded.covered(&canon, allows) {
+                if !also_read_deny.iter().any(|p| p == also) {
+                    also_read_deny.push(also.to_owned());
+                }
+            }
+        }
         // Full-chain hold (see doc). Duplicates are merged below.
         if matches!(ace, SbAce::Deny(_)) {
             for anc in db.placeholder_ancestors_of(&canon)? {
@@ -533,9 +887,17 @@ fn canonicalize_ace_targets(
             }
         }
     }
+    let targets = merge_ace_targets(targets);
+    // A path named outright is not also an expansion.
+    also_read_deny.retain(|p| {
+        !targets
+            .iter()
+            .any(|(t, a)| t == p && matches!(a, SbAce::Deny(srt_win::acl::DenyMask::ReadDeny)))
+    });
     Ok(AceTargets {
-        targets: merge_ace_targets(targets),
+        targets,
         bad_inputs,
+        also_read_deny,
     })
 }
 
@@ -589,12 +951,23 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
         // read as present from any user's session).
         "cred_present": setup.is_some() && install::cred_present(),
         "marker_version": setup.as_ref().map(|s| s.marker_version),
+        // An install whose `marker_version` differs must be re-run.
+        "setup_version": install::SETUP_VERSION,
         "marker_user_sid": setup.as_ref()
             .map(|s| s.sandbox_user_sid.as_str()),
         // The calling (real) user's SID — surfaced for diagnostics.
         "real_user_sid": srt_win::sid::current_user_sid()?,
         "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
         "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
+        // `none` unless persistent write grants exist or cannot be ruled out.
+        "persistent_grants": srt_win::persist::status_json(),
+        // Whether a profile read grant is recorded (`none`, `present`
+        // or `unknown`); `profile status` says whether it is current.
+        "profile_grant": srt_win::profile::brief_status_json(),
+        "capabilities": srt_win::profile::CAPABILITIES,
+        // The owner of the interactive session (`null` if unknown): an
+        // install applies the profile grant only when run as that user.
+        "session_user_sid": session_user_sid_for_status(),
         "seclogon": srt_win::logon::seclogon_state(),
     }))
 }
@@ -646,6 +1019,14 @@ fn ambient_status_json() -> anyhow::Result<serde_json::Value> {
         paths.push(json!({ "path": p, "present": present }));
     }
     Ok(json!({ "paths": paths }))
+}
+
+fn quoted_list<S: AsRef<str>>(paths: &[S]) -> String {
+    paths
+        .iter()
+        .map(|p| format!("'{}'", p.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Read `path` and decode it as a single DER-encoded X.509
@@ -742,6 +1123,24 @@ enum WfpCmd {
         /// on any external host.
         #[arg(long)]
         target: String,
+        /// Probe with the token `exec --write-restricted-token` gives
+        /// the child, instead of the default one. The connect is then
+        /// made by a lockdown child (`srt-win probe connect`) holding
+        /// that token, because the WFP block filter matches by an
+        /// access check of the connecting token and a restricted
+        /// token is checked differently from the runner's. A host
+        /// that runs commands with `--write-restricted-token` must
+        /// verify with this flag.
+        #[arg(long)]
+        write_restricted_token: bool,
+        /// The session's write roots, as given to `exec`: the probe
+        /// child's token then carries the same capability SIDs.
+        #[arg(
+            long = "write-root",
+            value_name = "PATH",
+            requires = "write_restricted_token"
+        )]
+        write_root: Vec<String>,
     },
     /// Remove every srt-win-tagged WFP filter under the sublayer.
     /// Self-elevates via UAC if not already admin.
@@ -797,6 +1196,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // stamping step below (env reads + a stat per entry).
             let ambient_targets = srt_win::ambient::ambient_deny_targets();
             let name_changed = existing.as_ref().is_some_and(|s| s.sandbox_user != name);
+            if !force
+                && let Some(why) = existing
+                    .as_ref()
+                    .and_then(|s| install::newer_setup_refusal(s.marker_version))
+            {
+                eprintln!("srt-win: {why}");
+                std::process::exit(13);
+            }
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
                 && st.state == "installed"
@@ -868,12 +1275,21 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         }
                     }
                 }
-                eprintln!(
-                    "srt-win: partial install detected \
-                     (user_provisioned={}, marker_version={:?}) — \
-                     completing",
-                    us.exists, mv,
-                );
+                match mv {
+                    // An install by a build with another setup
+                    // version: the same steps bring it to this one.
+                    Some(v) if v != install::SETUP_VERSION => eprintln!(
+                        "srt-win: existing install has setup version {v}; \
+                         upgrading it to {}",
+                        install::SETUP_VERSION,
+                    ),
+                    _ => eprintln!(
+                        "srt-win: partial install detected \
+                         (user_provisioned={}, marker_version={:?}) — \
+                         completing",
+                        us.exists, mv,
+                    ),
+                }
                 // Fall through; the steps are idempotent.
             }
             // With --force and a changed name, do NOT delete the
@@ -986,9 +1402,55 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         Cmd::Uninstall {
             sublayer_guid,
             keep_user,
+            elevated_step,
         } => {
-            if let Some(code) = maybe_self_elevate(args)? {
-                std::process::exit(code);
+            // The group's SID is read while the install record is there:
+            // this process forgets the grants after the removal.
+            let ids = if keep_user || elevated_step {
+                None
+            } else {
+                srt_win::persist::Ids::load().ok()
+            };
+            // Not from under a live session. Checked once: a session
+            // that starts before the elevated step is not kept out.
+            if !keep_user && !elevated_step {
+                let holder = srt_win::state_db::HolderPid(std::process::id());
+                srt_win::state_db::with_init_lock(holder, false, |db| {
+                    exit_unless_quiet(db, None, EXIT_HELD_BY_OTHERS, "uninstall")
+                })?;
+            }
+            let mut for_step: Vec<OsString> = args.to_vec();
+            for_step.push("--elevated-step".into());
+            if !elevated_step && let Some(code) = maybe_self_elevate(&for_step)? {
+                use srt_win::persist::{AfterElevation, after_elevation};
+                if keep_user {
+                    // Nothing of the caller's goes with --keep-user.
+                    std::process::exit(code);
+                }
+                // By what is true now, not by the step's word alone.
+                let install_present = srt_win::install::read_setup()
+                    .map(|s| s.is_some())
+                    .unwrap_or(true);
+                match after_elevation(code, install_present) {
+                    AfterElevation::LeaveEverything(code) => {
+                        eprintln!(
+                            "srt-win: the elevated step did not remove the sandbox account \
+                             (exit {code}). The grants kept for this user are unchanged."
+                        );
+                        std::process::exit(code);
+                    }
+                    AfterElevation::ForgetGrants { step_failed } => {
+                        if let Some(code) = step_failed {
+                            eprintln!(
+                                "srt-win: the elevated step removed the sandbox account and \
+                                 then reported a failure (exit {code}); the grants kept for \
+                                 this user are removed all the same."
+                            );
+                        }
+                        let forgot = forget_grants_after_removal(ids.as_ref(), keep_user);
+                        std::process::exit(step_failed.unwrap_or(forgot));
+                    }
+                }
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
             let n = wfp::uninstall_filters(&sl)?;
@@ -1047,6 +1509,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // Idempotent on already-absent.
             let _ = srt_win::sam::delete_local_group("sandbox-runtime-net");
             eprintln!("srt-win: uninstalled ({n} filter(s) removed). {user_note}");
+            // Started elevated by the user, so no hop: this process is
+            // also the calling user's half.
+            if !elevated_step {
+                let code = forget_grants_after_removal(ids.as_ref(), keep_user);
+                if code != 0 {
+                    std::process::exit(code);
+                }
+            }
         }
 
         // ─── status (combined) ─────────────────────────────────────
@@ -1102,7 +1572,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&st)?);
         }
         Cmd::Wfp {
-            sub: WfpCmd::Verify { target },
+            sub:
+                WfpCmd::Verify {
+                    target,
+                    write_restricted_token,
+                    write_root,
+                },
         } => {
             use srt_win::{install, logon, runner};
             // The WFP BLOCK fires at ALE_AUTH_CONNECT before any
@@ -1124,18 +1599,38 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
-            let code = logon::spawn_runner(
-                &cred.user,
-                &cred.pw,
-                &sb_sid,
-                None,
-                &runner::RunnerCmd::ProbeEgress {
+            // Write-restricted: the runner launches `probe connect` as a
+            // lockdown child, so the connect is made under the child token.
+            let cmd = if write_restricted_token {
+                // A root with no capability SID fails the verify — never
+                // a probe under a shorter list.
+                let capability_sids = srt_win::persist::capability_sids_for(&write_root)
+                    .context("wfp verify --write-root")?;
+                let exe = std::env::current_exe().context("current_exe")?;
+                let exe = exe
+                    .to_str()
+                    .ok_or_else(|| anyhow!("current_exe is not UTF-8"))?;
+                runner::RunnerCmd::Exec(runner::RunnerSpec {
+                    argv: vec![
+                        exe.to_owned(),
+                        SRT_WIN_DISPATCH_ARG1.to_owned(),
+                        "probe".to_owned(),
+                        "connect".to_owned(),
+                        "--target".to_owned(),
+                        target.clone(),
+                    ],
+                    env_overlay: Vec::new(),
+                    write_restricted_token: true,
+                    capability_sids,
+                })
+            } else {
+                runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
-                },
-                false,
-            )
-            .map_err(exit_if_seclogon_disabled)
-            .context("spawn runner for egress probe")?;
+                }
+            };
+            let code = logon::spawn_runner(&cred.user, &cred.pw, &sb_sid, None, &cmd, false, None)
+                .map_err(exit_if_seclogon_disabled)
+                .context("spawn runner for egress probe")?;
             let probe = match code {
                 0 => "blocked",
                 3 => "connected",
@@ -1146,14 +1641,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // valid probe outcome.
                 _ => "error",
             };
-            println!(
-                "{}",
-                json!({
-                    "egress_probe": probe,
-                    "target": target,
-                    "runner_exit": code,
-                })
-            );
+            let mut out = json!({
+                "egress_probe": probe,
+                "target": target,
+                "runner_exit": code,
+            });
+            if write_restricted_token {
+                out["write_restricted_token"] = json!(true);
+            }
+            println!("{out}");
             // `process::exit`'s rt::cleanup flushes stdout, but be
             // explicit — this is the only arm that prints to stdout
             // and then `process::exit`s instead of returning Ok(()).
@@ -1200,16 +1696,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                                 acl::SbAce::Deny(acl::DenyMask::WriteDeny),
                             ),
                         ],
+                        &[],
                     )?;
                     for (p, e) in &at.bad_inputs {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
-                    let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                    let (w, f) =
+                        db.apply_aces_and(&sandbox_user_sid, &at.targets, &at.also_read_deny)?;
                     Ok((at, w, f))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
+                ..
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
@@ -1253,35 +1752,134 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 AclCmd::Grant {
                     holder_pid,
                     sandbox_user_sid,
+                    persistent,
+                    allow_profile_exclusion,
                 },
         } => {
-            use srt_win::{acl, state_db};
+            use srt_win::{acl, persist, state_db};
             let holder = state_db::HolderPid(holder_pid);
             let mut buf = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
+            // Kept grants are made only on an install of this build's setup
+            // version; checked before the session database is opened.
+            if persistent && let Err(e) = srt_win::install::require_current_setup() {
+                eprintln!("srt-win: error: acl grant --persistent: {e:#}");
+                std::process::exit(15);
+            }
             let input: AclGrantInput =
                 serde_json::from_str(&buf).context("parse stdin JSON {read:[…], write:[…]}")?;
-            let ((at, witnesses, failed), report) =
+            let has_denies = !input.deny_read.is_empty() || !input.deny_write.is_empty();
+            if has_denies && !persistent {
+                return Err(anyhow!(
+                    "acl grant: denyRead/denyWrite are read only with --persistent; \
+                     use `acl stamp`"
+                ));
+            }
+            let ((at, witnesses, failed, kept), report) =
                 state_db::with_init_lock(holder, false, |db| {
-                    let at = canonicalize_ace_targets(
+                    let mut at = canonicalize_ace_targets(
                         db,
                         "grant",
                         &[
                             (&input.read, acl::SbAce::Grant(acl::GrantMask::ReadOnly)),
                             (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
                         ],
+                        &[],
                     )?;
+                    // At every session start, for every path, kept roots included:
+                    // no grant may reach what the profile read grant excludes.
+                    let grants: Vec<(String, bool)> = at
+                        .targets
+                        .iter()
+                        .filter_map(|(p, a)| match a {
+                            acl::SbAce::Grant(m) => Some((p.clone(), *m == acl::GrantMask::Modify)),
+                            _ => None,
+                        })
+                        .collect();
+                    srt_win::profile::check_session_grants(&grants, &allow_profile_exclusion)?;
+                    if !persistent {
+                        // These grants are for the ordinary token.
+                        let paths: Vec<String> =
+                            at.targets.iter().map(|(p, _)| p.clone()).collect();
+                        persist::clear_for_unrestricted_grant(db, &paths)?;
+                        for (p, e) in &at.bad_inputs {
+                            eprintln!("srt-win: skipped: '{p}': {e}");
+                        }
+                        let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                        // A session exists from here: recorded, so that the profile
+                        // grant is not made or removed beside it.
+                        db.hold_kept(&[], Some(state_db::KEPT_PROFILE_PATH))?;
+                        return Ok((at, w, f, None));
+                    }
+                    let ids = persist::Ids::load()?;
+                    if ids.sandbox_user_sid.as_deref() != Some(sandbox_user_sid.as_str()) {
+                        return Err(anyhow!(
+                            "--sandbox-user-sid {sandbox_user_sid} is not the installed \
+                             sandbox user"
+                        ));
+                    }
+                    // A read deny is not carried onto a recorded profile path
+                    // that this same call allows more specifically.
+                    let allowed: Vec<String> = grants.iter().map(|(p, _)| p.clone()).collect();
+                    let denies = canonicalize_ace_targets(
+                        db,
+                        "deny",
+                        &[
+                            (&input.deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
+                            (
+                                &input.deny_write,
+                                acl::SbAce::Deny(acl::DenyMask::WriteDeny),
+                            ),
+                        ],
+                        &allowed,
+                    )?;
+                    at.bad_inputs.extend(denies.bad_inputs);
                     for (p, e) in &at.bad_inputs {
                         eprintln!("srt-win: skipped: '{p}': {e}");
                     }
-                    let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
-                    Ok((at, w, f))
+                    let modify = acl::SbAce::Grant(acl::GrantMask::Modify);
+                    let roots: Vec<String> = at
+                        .targets
+                        .iter()
+                        .filter(|(_, a)| *a == modify)
+                        .map(|(p, _)| p.clone())
+                        .collect();
+                    let (kept, per_session_denies) =
+                        persist::apply(db, &ids, &roots, &denies.targets)?;
+                    // The session row is taken whether or not a profile
+                    // grant is recorded: none is made or changed beside it.
+                    db.hold_kept(&roots, Some(state_db::KEPT_PROFILE_PATH))?;
+                    // Per session, for the sandbox user SID: the read
+                    // grants, and the denies under no persistent root.
+                    let mut rest: Vec<(String, acl::SbAce)> = at
+                        .targets
+                        .iter()
+                        .filter(|(_, a)| *a != modify)
+                        .cloned()
+                        .collect();
+                    rest.extend(per_session_denies);
+                    // Plus, for this session only, a read deny on each recorded
+                    // profile path those denies cover; never kept with a root.
+                    let (w, f) =
+                        db.apply_aces_and(&sandbox_user_sid, &rest, &denies.also_read_deny)?;
+                    at.targets.extend(denies.targets);
+                    Ok((at, w, f, Some(kept)))
                 })?;
             let AceTargets {
                 targets,
                 bad_inputs,
+                ..
             } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
+            if let Some(k) = kept {
+                // `DACL write(s)` counts tree walks: 0 once every root is
+                // granted. Object-only writes are counted apart.
+                eprintln!(
+                    "srt-win: acl grant (persistent) — {} root(s): {} DACL write(s), \
+                     {} path(s) unchanged, {} written without a walk of the tree",
+                    k.roots, k.writes, k.unchanged, k.local_writes,
+                );
+            }
             eprintln!(
                 "srt-win: acl grant — {} path(s) ({} fresh, {} \
                  already held{}{}); recovery pruned {} dead \
@@ -1320,6 +1918,127 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         }
         Cmd::Acl {
             sub:
+                AclCmd::Forget {
+                    all,
+                    json,
+                    unless_held_by_others,
+                    drop_pending,
+                    force,
+                    roots,
+                },
+        } => {
+            use srt_win::{path_id, persist, state_db};
+            if !drop_pending.is_empty() {
+                let holder = state_db::HolderPid(std::process::id());
+                let ids = persist::Ids::load()?;
+                let (dropped, _) = state_db::with_init_lock(holder, false, |db| {
+                    persist::drop_pending(db.conn(), &ids, &drop_pending)
+                })?;
+                for p in &dropped {
+                    eprintln!(
+                        "srt-win: no longer waiting for the volume of '{}'. The entries the \
+                         kept grant wrote on that object (for the group {}) were NOT removed \
+                         and will not be: if the volume is ever attached again, they are \
+                         still on it.",
+                        p.path,
+                        if p.group_sid.is_empty() {
+                            "that was installed then"
+                        } else {
+                            p.group_sid.as_str()
+                        },
+                    );
+                }
+                if json {
+                    let entries: Vec<AceReleaseEntry> = dropped
+                        .iter()
+                        .map(|p| AceReleaseEntry {
+                            path: p.path.clone(),
+                            status: "abandoned",
+                        })
+                        .collect();
+                    serde_json::to_writer(std::io::stdout(), &entries)
+                        .context("write --json forget result")?;
+                    println!();
+                }
+                return Ok(());
+            }
+            if !all && roots.is_empty() {
+                return Err(anyhow!(
+                    "acl forget: name the roots to forget, or pass --all"
+                ));
+            }
+            let ids = persist::Ids::load()?;
+            // No holder of its own: the PID is this process's, unless
+            // the caller says whose session is asking.
+            let holder =
+                state_db::HolderPid(unless_held_by_others.unwrap_or_else(std::process::id));
+            let (out, _report) = state_db::with_init_lock(holder, false, |db| {
+                // A root that no longer resolves is looked up as
+                // given: it may be recorded under that spelling.
+                let targets: Vec<String> = roots
+                    .iter()
+                    .map(|r| {
+                        path_id::canonicalize_path(r)
+                            .map(|(c, _)| c)
+                            .unwrap_or_else(|_| r.clone())
+                    })
+                    .collect();
+                if unless_held_by_others.is_some() {
+                    exit_if_roots_held_by_others(db)?;
+                }
+                persist::forget(db, &ids, &targets, all, force)
+            })?;
+            let failed = out
+                .iter()
+                .filter(|(_, r)| matches!(r, persist::Forgot::Failed(_)))
+                .count();
+            let pending = out
+                .iter()
+                .filter(|(_, r)| *r == persist::Forgot::Pending)
+                .count();
+            let dropped = out
+                .iter()
+                .filter(|(_, r)| *r == persist::Forgot::Dropped)
+                .count();
+            eprintln!(
+                "srt-win: acl forget — {} root(s){}{}{}",
+                out.len(),
+                if failed > 0 {
+                    format!(", {failed} FAILED (still recorded)")
+                } else {
+                    String::new()
+                },
+                if pending > 0 {
+                    format!(", {pending} on a volume that is not mounted (removed when it is back)")
+                } else {
+                    String::new()
+                },
+                if dropped > 0 {
+                    format!(", {dropped} DROPPED (not located; ACEs may remain)")
+                } else {
+                    String::new()
+                },
+            );
+            if json {
+                let entries: Vec<AceReleaseEntry> = out
+                    .iter()
+                    .map(|(p, r)| AceReleaseEntry {
+                        path: p.clone(),
+                        status: r.as_str(),
+                    })
+                    .collect();
+                serde_json::to_writer(std::io::stdout(), &entries)
+                    .context("write --json forget result")?;
+                println!();
+            }
+            if failed > 0 {
+                return Err(anyhow!(
+                    "acl forget: {failed} persistent grant(s) could not be removed"
+                ));
+            }
+        }
+        Cmd::Acl {
+            sub:
                 AclCmd::Revoke {
                     holder_pid,
                     sandbox_user_sid,
@@ -1329,16 +2048,25 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             use srt_win::state_db;
             let holder = state_db::HolderPid(holder_pid);
             let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
+                // The session is ending: it no longer runs on the
+                // kept grants either.
+                db.release_kept()?;
                 db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
             })?;
+            // Grants whose ACE may still be on disk (rows kept).
+            let pending: Vec<&str> = entries
+                .iter()
+                .filter(|(_, r)| r.is_pending())
+                .map(|(p, _)| p.as_str())
+                .collect();
             eprintln!(
                 "srt-win: acl revoke — {} path(s){}; recovery \
                  revoked {} orphan grant(s)",
                 entries.len(),
-                if failed > 0 {
-                    format!(", {failed} FAILED (ACE left in place)")
-                } else {
+                if pending.is_empty() {
                     String::new()
+                } else {
+                    format!(", {} NOT RELEASED (ACE left in place)", pending.len())
                 },
                 report.aces_revoked,
             );
@@ -1354,8 +2082,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .context("write --json revoke result")?;
                 println!();
             }
-            if failed > 0 {
-                return Err(anyhow!("acl revoke: {failed} path(s) could not be revoked"));
+            if failed > 0 || !pending.is_empty() {
+                return Err(anyhow!(
+                    "acl revoke: {} grant(s) could not be released \
+                     and may still be on disk (rows kept for retry): {}",
+                    pending.len(),
+                    quoted_list(&pending),
+                ));
             }
         }
         Cmd::Acl {
@@ -1373,12 +2106,17 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
                 db.release_aces(&sandbox_user_sid, state_db::KIND_DENY)
             })?;
+            // Denies whose ACE is still on disk (rows kept).
+            let kept = entries.iter().filter(|(_, r)| r.is_pending()).count();
+            let grant_pending = entries
+                .iter()
+                .any(|(_, r)| *r == state_db::AceRelease::GrantPending);
             eprintln!(
                 "srt-win: acl restore (deny-ace) — {} ACE(s){}; \
                  recovery revoked {} orphan ACE(s)",
                 entries.len(),
-                if failed > 0 {
-                    format!(", {failed} FAILED (ACE left in place)")
+                if kept > 0 {
+                    format!(", {kept} NOT RELEASED (ACE left in place)")
                 } else {
                     String::new()
                 },
@@ -1396,9 +2134,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     .context("write --json restore result")?;
                 println!();
             }
-            if failed > 0 {
+            if grant_pending {
                 return Err(anyhow!(
-                    "acl restore: {failed} path(s) could not be \
+                    "acl restore: refused — the holder still has a grant \
+                     recorded; run `acl revoke` first (deny ACEs kept)"
+                ));
+            }
+            if failed > 0 || kept > 0 {
+                return Err(anyhow!(
+                    "acl restore: {kept} path(s) could not be \
                      restored (ACE left, fail-closed)"
                 ));
             }
@@ -1415,8 +2159,19 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 })?;
             eprintln!(
                 "srt-win: acl recover — pruned {} dead broker(s), \
-                 revoked {} orphan ACE(s)",
-                report.dead_brokers, report.aces_revoked,
+                 revoked {} orphan ACE(s){}",
+                report.dead_brokers,
+                report.aces_revoked,
+                if report.grants_dropped.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; dropped the record of {} grant(s) that could not \
+                         be located: {}",
+                        report.grants_dropped.len(),
+                        quoted_list(&report.grants_dropped),
+                    )
+                },
             );
             if json {
                 println!(
@@ -1424,9 +2179,199 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     json!({
                         "deadBrokers": report.dead_brokers,
                         "acesRevoked": report.aces_revoked,
+                        "grantsPending": report.grants_pending,
+                        "grantsDropped": report.grants_dropped,
                     })
                 );
             }
+            if !report.grants_pending.is_empty() {
+                return Err(anyhow!(
+                    "acl recover: {} grant(s) could not be released \
+                     and may still be on disk (rows, and their \
+                     holders' deny ACEs, kept for retry): {}",
+                    report.grants_pending.len(),
+                    quoted_list(&report.grants_pending),
+                ));
+            }
+        }
+
+        // ─── profile ───────────────────────────────────────────────
+        Cmd::Profile {
+            sub:
+                ProfileCmd::Grant {
+                    exclude,
+                    replace_excludes,
+                    json,
+                    quiet,
+                    #[cfg(feature = "test-hooks")]
+                    test_profile,
+                },
+        } => {
+            use srt_win::{persist, profile, state_db};
+            #[cfg(not(feature = "test-hooks"))]
+            let test_profile: Option<String> = None;
+            #[cfg(feature = "test-hooks")]
+            let test_profile = test_profile.or_else(test_profile_from_env);
+            // A service account runs no sessions: its profile gets no grant.
+            let me = srt_win::sid::current_user_sid()?;
+            if test_profile.is_none() && is_service_account(&me) {
+                eprintln!(
+                    "srt-win: error: profile grant: running as the service account {me}; \
+                     run it as the user whose sessions are to read their profile"
+                );
+                std::process::exit(21);
+            }
+            // As for a kept write grant: only on an install of this
+            // build's setup version, checked before any state exists.
+            if let Err(e) = srt_win::install::require_current_setup() {
+                eprintln!("srt-win: error: profile grant: {e:#}");
+                std::process::exit(15);
+            }
+            let ids = persist::Ids::load()?;
+            let layout = profile::Layout::resolve(test_profile.as_deref())?;
+            // Exclusive: under the one lock for the whole run, and only
+            // while no live session or command holds anything.
+            let report = state_db::with_profile_lock(|db| {
+                exit_unless_quiet(db, None, EXIT_GRANT_BLOCKED_BY_SESSION, "profile grant")?;
+                state_db::mark_profile_operation()?;
+                profile::grant(
+                    &profile::Store::of(db.conn()),
+                    &ids,
+                    &layout,
+                    &exclude,
+                    replace_excludes,
+                    !quiet,
+                )
+            })?;
+            for s in &report.skipped {
+                eprintln!("srt-win: profile grant: skipped '{}': {}", s.path, s.reason);
+            }
+            for r in &report.forgotten_roots {
+                eprintln!(
+                    "srt-win: profile grant: the write grant kept on '{}' was removed: {}",
+                    r.path, r.reason
+                );
+            }
+            for v in &report.env_ignored {
+                eprintln!(
+                    "srt-win: profile grant: {v} is a relative path and names no store to \
+                     protect; ignored"
+                );
+            }
+            for (what, items) in [
+                ("not granted", &report.not_granted),
+                (
+                    "excluded, closed by its own access list",
+                    &report.self_closed,
+                ),
+                ("excluded, could not be examined", &report.unverifiable),
+                ("EXCLUDED BUT READABLE", &report.unprotected),
+                (
+                    "STILL READABLE THROUGH AN EARLIER ENTRY",
+                    &report.stale_allow,
+                ),
+            ] {
+                for i in items {
+                    eprintln!("srt-win: profile grant: {what}: '{}': {}", i.path, i.reason);
+                }
+            }
+            eprintln!(
+                "srt-win: profile grant — '{}': {} container(s), {} directory(ies) and {} \
+                 file(s) granted, {} excluded ({} created), {} skipped, {} not granted, {} \
+                 exclusion(s) without a deny ({} of them readable to the sandbox account); \
+                 {} DACL write(s), {} written without a walk of the tree, {} unchanged, \
+                 {} stale removed; {} ms",
+                report.profile,
+                report.containers,
+                report.granted,
+                report.files,
+                report.denied,
+                report.placeholders,
+                report.skipped.len(),
+                report.not_granted.len(),
+                report.self_closed.len() + report.unverifiable.len() + report.unprotected.len(),
+                report.unprotected.len(),
+                report.tree_walks,
+                report.local_writes,
+                report.unchanged,
+                report.removed,
+                report.elapsed_ms,
+            );
+            if json {
+                println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Cmd::Profile {
+            sub:
+                ProfileCmd::Forget {
+                    json,
+                    unless_held_by_others,
+                },
+        } => {
+            use srt_win::{persist, profile, state_db};
+            let ids = persist::Ids::load()?;
+            // As the grant, except that the session that asks is not counted.
+            let out = state_db::with_profile_lock(|db| {
+                exit_unless_quiet(
+                    db,
+                    unless_held_by_others,
+                    EXIT_HELD_BY_OTHERS,
+                    "profile forget",
+                )?;
+                state_db::mark_profile_operation()?;
+                profile::forget(&profile::Store::of(db.conn()), &ids)
+            })?;
+            eprintln!(
+                "srt-win: profile forget — {} path(s) cleared, {} carried nothing, {} empty \
+                 directory(ies) removed{}",
+                out.removed,
+                out.absent,
+                out.placeholders_removed,
+                if out.failed.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} FAILED (still recorded)", out.failed.len())
+                },
+            );
+            if json {
+                println!("{}", serde_json::to_string(&out)?);
+            }
+            if !out.failed.is_empty() {
+                return Err(anyhow!(
+                    "profile forget: {} path(s) could not be completed",
+                    out.failed.len()
+                ));
+            }
+        }
+        Cmd::Profile {
+            sub:
+                ProfileCmd::Status {
+                    paths,
+                    #[cfg(feature = "test-hooks")]
+                    test_profile,
+                },
+        } => {
+            use srt_win::{persist, profile};
+            #[cfg(not(feature = "test-hooks"))]
+            let test_profile: Option<String> = None;
+            #[cfg(feature = "test-hooks")]
+            let test_profile = test_profile.or_else(test_profile_from_env);
+            // While a grant or forget runs the record is half-written by
+            // design: not to be read as a run that was killed.
+            let mut status = if srt_win::state_db::profile_operation_running() {
+                json!({ "state": "in_progress" })
+            } else {
+                profile::status_json(
+                    persist::MARKER_KEY,
+                    profile::Layout::resolve(test_profile.as_deref()),
+                    paths,
+                )
+            };
+            // Whatever the state: what this build does, by name.
+            if let Some(o) = status.as_object_mut() {
+                o.insert("capabilities".to_owned(), json!(profile::CAPABILITIES));
+            }
+            println!("{status}");
         }
 
         // ─── runner ────────────────────────────────────────────────
@@ -1435,12 +2380,38 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             std::process::exit(code as i32);
         }
 
+        // ─── probe ─────────────────────────────────────────────────
+        Cmd::Probe {
+            sub: ProbeCmd::Connect { target },
+        } => {
+            let code = srt_win::probe::connect(&target)?;
+            std::process::exit(code as i32);
+        }
+        #[cfg(feature = "test-hooks")]
+        Cmd::Probe {
+            sub: ProbeCmd::Token,
+        } => {
+            let t = srt_win::token::own_token_restriction()?;
+            println!("{}", serde_json::to_string(&t)?);
+        }
+        #[cfg(feature = "test-hooks")]
+        Cmd::Probe {
+            sub: ProbeCmd::ParentAccess,
+        } => {
+            let r = srt_win::probe::parent_access()?;
+            println!("{}", serde_json::to_string(&r)?);
+        }
+
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
             deny_read,
+            deny_read_except,
+            held_by,
             deny_write,
             env,
             quiet,
+            write_restricted_token,
+            write_root,
             target,
         } => {
             use srt_win::install;
@@ -1456,12 +2427,44 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!(
-                        "srt-win: error: sandbox user not \
-                         provisioned ({e:#}). Run `srt-win install` \
-                         (one UAC prompt)."
+                        "srt-win: error: the sandbox install cannot be \
+                         used ({e:#}). Run `srt-win install` (one UAC \
+                         prompt)."
                     );
                     std::process::exit(15);
                 }
+            };
+
+            // A Secondary Logon service that cannot launch is reported
+            // here, before anything is stamped or granted for the command.
+            {
+                use srt_win::logon::{SeclogonDisabled, SeclogonState, seclogon_state};
+                let state = seclogon_state();
+                if matches!(state, SeclogonState::Disabled | SeclogonState::Missing) {
+                    let missing = state == SeclogonState::Missing;
+                    return Err(exit_if_seclogon_disabled(
+                        SeclogonDisabled { missing }.into(),
+                    ));
+                }
+            }
+
+            // Without the flag nothing may run while a persistent grant
+            // exists: its sandbox-group ACE is all the ordinary token needs.
+            let capability_sids = if write_restricted_token {
+                srt_win::persist::capability_sids_for(&write_root).context("exec --write-root")?
+            } else if let Some(why) = srt_win::persist::unrestricted_block_reason() {
+                eprintln!(
+                    "srt-win: error: refusing to run without \
+                     --write-restricted-token: {why}. Grants kept between \
+                     sessions are made for that token only: a kept write \
+                     grant lets the sandbox account write its tree under the \
+                     ordinary one. Remove them first: `srt-win acl forget \
+                     --all` (write grants), `srt-win profile forget` (profile \
+                     read grant)."
+                );
+                std::process::exit(20);
+            } else {
+                Vec::new()
             };
 
             // Share-lock current_exe() so a sandboxed child can't
@@ -1495,22 +2498,45 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // direct connect). Standalone `srt-win exec` callers
             // should run `srt-win wfp verify` once per session.
 
-            // Per-exec file deny — `--deny-read`/`--deny-write`. The
-            // session-level stamp (under `--holder-pid`) is applied
-            // once at the host's `initialize()`; these flags add
-            // PER-EXEC paths via the same additive DENY-ACE path as
-            // session `acl stamp`, under THIS exec process's own
-            // PID as a DISTINCT holder. Release downgrades the mask
-            // from the remaining holders' MAX(want_mask). Any stamp
-            // error (glob, canon-fail, apply-fail) FAILS the exec
-            // rather than running the child with an incomplete deny
-            // set.
+            // A named session is verified and WATCHED. Not recorded, or gone,
+            // this process holds for itself: it lives as long as the command.
+            let session = match held_by {
+                Some(pid) => srt_win::state_db::watch_session(pid)?,
+                None => None,
+            };
+            let self_hold: Option<Vec<String>> = session.is_none().then(|| {
+                write_root
+                    .iter()
+                    .filter_map(|r| srt_win::path_id::canonicalize_path(r).ok())
+                    .map(|(canon, _)| canon)
+                    .collect()
+            });
+            let hold_for_self = |db: &srt_win::state_db::Locked| -> anyhow::Result<()> {
+                match &self_hold {
+                    Some(roots) => db.hold_kept(roots, Some(srt_win::state_db::KEPT_PROFILE_PATH)),
+                    None => Ok(()),
+                }
+            };
             let per_exec_guard = if deny_read.is_empty() && deny_write.is_empty() {
+                if self_hold.is_some() {
+                    let own = srt_win::state_db::HolderPid(std::process::id());
+                    // No crash recovery here: starting a command must not release
+                    // what a holder that is gone left behind.
+                    srt_win::state_db::with_init_lock_unrecovered(own, |db| hold_for_self(db))
+                        .context("hold the kept grants for this command")?;
+                }
                 None
             } else {
                 use srt_win::{acl, state_db};
                 let own = state_db::HolderPid(std::process::id());
+                let deny_read_except: Vec<String> = deny_read_except
+                    .iter()
+                    .filter_map(|p| srt_win::path_id::canonicalize_path(p).ok())
+                    .map(|(canon, _)| canon)
+                    .collect();
                 let ((at, _w, failed), _r) = state_db::with_init_lock(own, false, |db| {
+                    // The same acquisition takes the hold.
+                    hold_for_self(db)?;
                     let at = canonicalize_ace_targets(
                         db,
                         "deny",
@@ -1518,11 +2544,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             (&deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
                             (&deny_write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
                         ],
+                        &deny_read_except,
                     )?;
                     if let Some((p, e)) = at.bad_inputs.first() {
                         return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
                     }
-                    let (w, f) = db.apply_aces(&sb_sid, &at.targets)?;
+                    let (w, f) = db.apply_aces_and(&sb_sid, &at.targets, &at.also_read_deny)?;
                     Ok((at, w, f))
                 })
                 .context("per-exec deny-ace")?;
@@ -1595,10 +2622,24 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 &runner::RunnerCmd::Exec(runner::RunnerSpec {
                     argv: target,
                     env_overlay,
+                    write_restricted_token,
+                    capability_sids,
                 }),
                 quiet,
+                session.as_ref().map(|h| h.raw()),
             ) {
                 Ok(c) => c,
+                // The session ended first: the tree is gone. What this
+                // command held is released, and the caller is told.
+                Err(e) if e.is::<logon::HolderGone>() => {
+                    drop(per_exec_guard);
+                    eprintln!("srt-win: error: {e}");
+                    eprintln!(
+                        "{}",
+                        json!({ "code": "session_ended", "message": e.to_string() })
+                    );
+                    std::process::exit(EXIT_SESSION_ENDED);
+                }
                 Err(e) => {
                     // Same one-line JSON shape as below, exit 18. The per-exec
                     // restore runs first: `process::exit` skips destructors.
@@ -1635,6 +2676,31 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `SRT_WIN_TEST_PROFILE`, for a `test-hooks` build whose caller
+/// cannot pass `--test-profile` (the library, driven by a test suite).
+#[cfg(feature = "test-hooks")]
+fn test_profile_from_env() -> Option<String> {
+    std::env::var("SRT_WIN_TEST_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// `session_user_sid` of `user status`. A `test-hooks` build that was
+/// given a made-up profile has no session owner to compare it with,
+/// and reports the caller.
+fn session_user_sid_for_status() -> Option<String> {
+    #[cfg(feature = "test-hooks")]
+    if test_profile_from_env().is_some() {
+        return srt_win::sid::current_user_sid().ok();
+    }
+    srt_win::profile::session_user_sid()
+}
+
+/// LocalSystem, LocalService or NetworkService.
+fn is_service_account(sid: &str) -> bool {
+    matches!(sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20")
 }
 
 fn is_elevated() -> anyhow::Result<bool> {
@@ -1678,6 +2744,166 @@ fn require_elevated() -> anyhow::Result<()> {
             "this command requires elevation — run from an \
              administrator prompt"
         ))
+    }
+}
+
+/// Exit code of `profile grant` when any live session or command
+/// holds anything: nothing was written. The grant changes the
+/// profile's entries only on a quiet machine.
+const EXIT_GRANT_BLOCKED_BY_SESSION: i32 = 24;
+
+/// Exit code of `exec` when the session named with `--held-by` ended
+/// while the command ran: the command and everything it started were
+/// terminated. (25 is `state_db::EXIT_PROFILE_BUSY`.)
+const EXIT_SESSION_ENDED: i32 = 26;
+
+/// Exit code of `acl forget` / `profile forget` with
+/// `--unless-held-by-others` when another live session runs on a kept
+/// grant: nothing was removed.
+const EXIT_HELD_BY_OTHERS: i32 = 22;
+
+/// For an operation that needs a quiet machine: if any live session or
+/// command other than `except` holds anything, print `{"held_by": […]}`
+/// on stdout and exit `code` with nothing changed. Call under the lock.
+fn exit_unless_quiet(
+    db: &srt_win::state_db::Locked,
+    except: Option<u32>,
+    code: i32,
+    what: &str,
+) -> anyhow::Result<()> {
+    let held = srt_win::state_db::live_holders(db, except)?;
+    if held.is_empty() {
+        return Ok(());
+    }
+    let mut pids: Vec<u32> = held.iter().map(|h| h.pid).collect();
+    pids.dedup();
+    eprintln!(
+        "srt-win: error: {what}: {} sandbox session(s) or command(s) are running (process {}). \
+         Nothing was changed; end them and run it again.",
+        pids.len(),
+        pids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    println!("{}", serde_json::json!({ "held_by": held }));
+    std::process::exit(code);
+}
+
+/// Under the init lock: if a live session other than the lock's holder
+/// runs on a kept write root, print `{"held_by": […]}` and exit
+/// [`EXIT_HELD_BY_OTHERS`] before anything is removed.
+fn exit_if_roots_held_by_others(db: &srt_win::state_db::Locked) -> anyhow::Result<()> {
+    use srt_win::state_db::KIND_KEPT_ROOT;
+    // Only holds on what is about to be removed count.
+    let held: Vec<_> = db
+        .other_kept_holders()?
+        .into_iter()
+        .filter(|h| h.kind == KIND_KEPT_ROOT)
+        .collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    for h in &held {
+        eprintln!(
+            "srt-win: a live session (pid {}) is running on the kept write grant on '{}'",
+            h.pid, h.path
+        );
+    }
+    eprintln!("srt-win: nothing was removed");
+    println!("{}", serde_json::json!({ "held_by": held }));
+    std::process::exit(EXIT_HELD_BY_OTHERS);
+}
+
+/// Exit code of `uninstall` when the machine-wide removal succeeded
+/// and the calling user's grants could not all be forgotten: they stay
+/// recorded, and `acl forget --all` / `profile forget` finish the job.
+const EXIT_GRANTS_NOT_FORGOTTEN: i32 = 23;
+
+/// The calling user's half of `uninstall`, after the machine-wide removal:
+/// forget their profile read grant and kept write grants. Returns 0, or
+/// [`EXIT_GRANTS_NOT_FORGOTTEN`] when something stays recorded.
+fn forget_grants_after_removal(ids: Option<&srt_win::persist::Ids>, keep_user: bool) -> i32 {
+    if keep_user {
+        return 0;
+    }
+    let mut incomplete = false;
+    match srt_win::profile::forget_everything_as(ids) {
+        Ok(None) => {}
+        Ok(Some(f)) if f.failed.is_empty() => eprintln!(
+            "srt-win: profile read grant removed ({} path(s))",
+            f.removed + f.absent
+        ),
+        Ok(Some(f)) => {
+            incomplete = true;
+            eprintln!(
+                "srt-win: WARNING: the profile read grant could not be removed from {} \
+                 path(s), which stay recorded; run `srt-win profile forget`",
+                f.failed.len()
+            );
+        }
+        Err(e) => {
+            incomplete = true;
+            eprintln!("srt-win: WARNING: profile read grant not removed: {e:#}");
+        }
+    }
+    match srt_win::persist::forget_everything_as(ids) {
+        Ok(f) => {
+            if f.roots > 0 && f.failed == 0 {
+                eprintln!(
+                    "srt-win: persistent write grants removed from {} root(s)",
+                    f.roots - f.pending.len()
+                );
+            }
+            if f.failed > 0 {
+                incomplete = true;
+                eprintln!(
+                    "srt-win: WARNING: {} of {} persistent write grant(s) could not be \
+                     removed and stay recorded; run `srt-win acl forget --all`",
+                    f.failed, f.roots
+                );
+            }
+            if !f.pending.is_empty() {
+                eprintln!(
+                    "srt-win: NOTE: {} grant(s) are on volumes that are not mounted and are \
+                     still on disk there. They stay recorded and are removed by `srt-win acl \
+                     forget --all` once the volume is back:",
+                    f.pending.len()
+                );
+                for p in &f.pending {
+                    eprintln!("srt-win:   {p}");
+                }
+            }
+        }
+        Err(e) => {
+            incomplete = true;
+            eprintln!("srt-win: WARNING: persistent write grants not removed: {e:#}");
+        }
+    }
+    // Nothing kept a session from starting after the quiet check. One
+    // that did has lost its account: named, so the user can end it.
+    let holder = srt_win::state_db::HolderPid(std::process::id());
+    if let Ok((held, _)) = srt_win::state_db::with_init_lock(holder, false, |db| {
+        srt_win::state_db::live_holders(db, None)
+    }) && !held.is_empty()
+    {
+        let mut pids: Vec<String> = held.iter().map(|h| h.pid.to_string()).collect();
+        pids.dedup();
+        eprintln!(
+            "srt-win: NOTE: a sandbox session started while the uninstall ran (process {}). \
+             The sandbox account is gone: its commands will fail. End it.",
+            pids.join(", ")
+        );
+    }
+    if incomplete {
+        eprintln!(
+            "srt-win: the sandbox account and filters are removed, but not every grant kept \
+             for this user was (see above). What is left stays recorded; once nothing else \
+             is running, `srt-win profile forget` and `srt-win acl forget --all` remove it."
+        );
+        EXIT_GRANTS_NOT_FORGOTTEN
+    } else {
+        0
     }
 }
 
@@ -1758,7 +2984,7 @@ fn maybe_self_elevate(args: &[OsString]) -> anyhow::Result<Option<i32>> {
     if ok.is_err() {
         let err = unsafe { GetLastError() };
         if err == ERROR_CANCELLED {
-            eprintln!("srt-win: UAC prompt cancelled by user");
+            eprintln!("srt-win: UAC prompt cancelled by user; nothing was changed");
             std::process::exit(10);
         }
         return Err(anyhow::anyhow!(
@@ -1902,6 +3128,377 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    /// The flag is off unless given, and the hidden `probe` subcommands parse.
+    #[test]
+    fn write_restricted_token_flag_parses() {
+        let on = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--quiet",
+            "--write-restricted-token",
+            "--",
+            "cmd.exe",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            on.cmd,
+            Cmd::Exec {
+                write_restricted_token: true,
+                ..
+            }
+        ));
+        let off = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
+        assert!(matches!(
+            off.cmd,
+            Cmd::Exec {
+                write_restricted_token: false,
+                ..
+            }
+        ));
+        // After `--` the flag belongs to the target, not to srt-win.
+        let target_arg = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--",
+            "cmd.exe",
+            "--write-restricted-token",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            target_arg.cmd,
+            Cmd::Exec {
+                write_restricted_token: false,
+                ..
+            }
+        ));
+        let v_on = Cli::try_parse_from([
+            "srt-win",
+            "wfp",
+            "verify",
+            "--target",
+            "127.0.0.1:1",
+            "--write-restricted-token",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            v_on.cmd,
+            Cmd::Wfp {
+                sub: WfpCmd::Verify {
+                    write_restricted_token: true,
+                    ..
+                }
+            }
+        ));
+        let v_off = Cli::try_parse_from(["srt-win", "wfp", "verify", "--target", "127.0.0.1:1"])
+            .expect("parse");
+        assert!(matches!(
+            v_off.cmd,
+            Cmd::Wfp {
+                sub: WfpCmd::Verify {
+                    write_restricted_token: false,
+                    ..
+                }
+            }
+        ));
+        let roots = Cli::try_parse_from([
+            "srt-win",
+            "exec",
+            "--write-restricted-token",
+            "--write-root",
+            r"C:\a",
+            "--write-root",
+            r"C:\b",
+            "--",
+            "cmd.exe",
+        ])
+        .expect("parse");
+        match roots.cmd {
+            Cmd::Exec { write_root, .. } => assert_eq!(write_root, [r"C:\a", r"C:\b"]),
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(
+            Cli::try_parse_from(["srt-win", "exec", "--write-root", r"C:\a", "--", "cmd.exe"])
+                .is_err()
+        );
+        let v_roots = Cli::try_parse_from([
+            "srt-win",
+            "wfp",
+            "verify",
+            "--target",
+            "127.0.0.1:1",
+            "--write-restricted-token",
+            "--write-root",
+            r"C:\a",
+        ])
+        .expect("parse");
+        match v_roots.cmd {
+            Cmd::Wfp {
+                sub: WfpCmd::Verify { write_root, .. },
+            } => assert_eq!(write_root, [r"C:\a"]),
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "srt-win",
+                "wfp",
+                "verify",
+                "--target",
+                "127.0.0.1:1",
+                "--write-root",
+                r"C:\a",
+            ])
+            .is_err()
+        );
+        let probe = Cli::try_parse_from(["srt-win", "probe", "connect", "--target", "127.0.0.1:1"])
+            .expect("parse");
+        assert!(matches!(
+            probe.cmd,
+            Cmd::Probe {
+                sub: ProbeCmd::Connect { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn persistent_grant_subcommands_parse() {
+        let grant = |extra: &[&str]| {
+            let mut argv = vec![
+                "srt-win",
+                "acl",
+                "grant",
+                "--holder-pid",
+                "7",
+                "--sandbox-user-sid",
+                "S-1-5-21-1",
+            ];
+            argv.extend(extra);
+            match Cli::try_parse_from(argv).expect("parse").cmd {
+                Cmd::Acl {
+                    sub: AclCmd::Grant { persistent, .. },
+                } => persistent,
+                _ => panic!("wrong subcommand"),
+            }
+        };
+        assert!(!grant(&[]));
+        assert!(grant(&["--persistent"]));
+
+        let forget = |argv: &[&str]| Cli::try_parse_from(argv).map(|c| c.cmd);
+        assert!(matches!(
+            forget(&["srt-win", "acl", "forget", "--all", "--json"]),
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget {
+                    all: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+        match forget(&["srt-win", "acl", "forget", r"C:\a", r"C:\b"]) {
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget { all, roots, .. },
+            }) => {
+                assert!(!all);
+                assert_eq!(roots, [r"C:\a", r"C:\b"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        // Either every root or the named ones.
+        assert!(forget(&["srt-win", "acl", "forget", "--all", r"C:\a"]).is_err());
+        match forget(&["srt-win", "acl", "forget", "--drop-pending", r"E:\w"]) {
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget {
+                    drop_pending, all, ..
+                },
+            }) => {
+                assert!(!all);
+                assert_eq!(drop_pending, [r"E:\w"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        for mixed in [
+            &[
+                "srt-win",
+                "acl",
+                "forget",
+                "--all",
+                "--drop-pending",
+                r"E:\w",
+            ][..],
+            &[
+                "srt-win",
+                "acl",
+                "forget",
+                r"C:\a",
+                "--drop-pending",
+                r"E:\w",
+            ][..],
+            &["srt-win", "acl", "forget", "--drop-pending"][..],
+        ] {
+            assert!(forget(mixed).is_err(), "{mixed:?}");
+        }
+        // --force is for --all only.
+        assert!(matches!(
+            forget(&["srt-win", "acl", "forget", "--all", "--force"]),
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget { force: true, .. }
+            })
+        ));
+        assert!(forget(&["srt-win", "acl", "forget", "--force", r"C:\a"]).is_err());
+
+        // The deny lists ride in the same stdin document.
+        let input: AclGrantInput = serde_json::from_str(
+            r#"{"read":["r"],"write":["w"],"denyRead":["dr"],"denyWrite":["dw"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (input.read, input.write, input.deny_read, input.deny_write),
+            (
+                vec!["r".to_owned()],
+                vec!["w".to_owned()],
+                vec!["dr".to_owned()],
+                vec!["dw".to_owned()]
+            )
+        );
+        let plain: AclGrantInput = serde_json::from_str(r#"{"write":["w"]}"#).unwrap();
+        assert!(plain.deny_read.is_empty() && plain.deny_write.is_empty());
+    }
+
+    /// `probe token` / `probe parent-access` parse only in a `test-hooks` build.
+    #[test]
+    fn profile_subcommands_parse() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).map(|c| c.cmd);
+        match parse(&[
+            "srt-win",
+            "profile",
+            "grant",
+            "--exclude",
+            r"C:\Users\me\.myapp",
+            "--exclude",
+            ".other",
+            "--json",
+        ]) {
+            Ok(Cmd::Profile {
+                sub:
+                    ProfileCmd::Grant {
+                        exclude,
+                        json,
+                        quiet,
+                        ..
+                    },
+            }) => {
+                assert_eq!(exclude, [r"C:\Users\me\.myapp", ".other"]);
+                assert!(json && !quiet);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(matches!(
+            parse(&["srt-win", "profile", "grant", "--quiet"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Grant {
+                    quiet: true,
+                    replace_excludes: false,
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            parse(&["srt-win", "profile", "grant", "--replace-excludes"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Grant {
+                    replace_excludes: true,
+                    ..
+                }
+            })
+        ));
+        match parse(&[
+            "srt-win",
+            "acl",
+            "grant",
+            "--holder-pid",
+            "7",
+            "--sandbox-user-sid",
+            "S-1-5-21-1",
+            "--persistent",
+            "--allow-profile-exclusion",
+            r"C:\Users\me\.ssh",
+        ]) {
+            Ok(Cmd::Acl {
+                sub:
+                    AclCmd::Grant {
+                        allow_profile_exclusion,
+                        ..
+                    },
+            }) => assert_eq!(allow_profile_exclusion, [r"C:\Users\me\.ssh"]),
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(is_service_account("S-1-5-18"));
+        assert!(!is_service_account("S-1-5-21-1-2-3-1001"));
+        assert!(matches!(
+            parse(&["srt-win", "profile", "forget", "--json"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Forget {
+                    json: true,
+                    unless_held_by_others: None,
+                }
+            })
+        ));
+        assert!(matches!(
+            parse(&[
+                "srt-win",
+                "profile",
+                "forget",
+                "--unless-held-by-others",
+                "41"
+            ]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Forget {
+                    unless_held_by_others: Some(41),
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            parse(&[
+                "srt-win",
+                "acl",
+                "forget",
+                "--all",
+                "--unless-held-by-others",
+                "41"
+            ]),
+            Ok(Cmd::Acl {
+                sub: AclCmd::Forget {
+                    all: true,
+                    unless_held_by_others: Some(41),
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            parse(&["srt-win", "profile", "status", "--paths"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Status { paths: true, .. }
+            })
+        ));
+        for sub in ["grant", "status"] {
+            let parsed = parse(&["srt-win", "profile", sub, "--test-profile", r"C:\x"]);
+            assert_eq!(
+                parsed.is_ok(),
+                cfg!(feature = "test-hooks"),
+                "profile {sub} --test-profile"
+            );
+        }
+        assert!(parse(&["srt-win", "profile", "grant", "--include", ".ssh"]).is_err());
+    }
+
+    #[test]
+    fn probe_test_hooks_follow_the_feature() {
+        for sub in ["token", "parent-access"] {
+            let parsed = Cli::try_parse_from(["srt-win", "probe", sub]);
+            assert_eq!(parsed.is_ok(), cfg!(feature = "test-hooks"), "probe {sub}");
+        }
     }
 
     /// A path in `denyRead` and in `denyWrite` keeps the read deny,

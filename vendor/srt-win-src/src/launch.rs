@@ -125,10 +125,16 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// passed through under one name each — so the broker's `PATH` + proxy vars
 /// ride here while the sandbox-user-profile `USERPROFILE`/`TEMP`
 /// stay isolated.
+///
+/// `write_restricted` is fail-closed: token creation and the runner's
+/// process and thread self-protect must all succeed, because the
+/// runner's own token is not write-restricted.
 pub fn run_lockdown(
     target_exe: &Path,
     target_args: &[String],
     env_overlay: &[(String, String)],
+    write_restricted: bool,
+    capability_sids: &[String],
 ) -> Result<u32> {
     // 1) Self-protect: rewrite this process's DACL so the child can't
     //    `OpenProcess` us. The child shares the runner's user SID, so
@@ -140,16 +146,22 @@ pub fn run_lockdown(
     //    protection. First so the protection holds on every later
     //    error path. Best-effort — log on failure but don't abort,
     //    since a runner without self-protect is still strictly safer
-    //    than no sandbox.
+    //    than no sandbox. With `write_restricted` it is required
+    //    instead (see the fn doc).
     if let Err(e) = self_protect::install_broker_dacl(None) {
+        if write_restricted {
+            return Err(e.context("runner self-protect (required with --write-restricted-token)"));
+        }
         eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
     }
 
     // 2) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
     let self_tok = OwnedHandle(open_self_token()?);
-    let restricted =
-        OwnedHandle(token::make_sandbox_token(self_tok.raw()).context("make_sandbox_token")?);
+    let restricted = OwnedHandle(
+        token::make_sandbox_token(self_tok.raw(), write_restricted, capability_sids)
+            .context("make_sandbox_token")?,
+    );
     let primary = OwnedHandle(to_primary(restricted.raw()).context("to_primary")?);
 
     // 3) Job. `breakaway_ok = false` — this is the load-bearing
@@ -305,6 +317,15 @@ pub fn run_lockdown(
                 breakaway.0 != 0,
             )
         });
+    }
+    // Here rather than at entry, so it covers every thread the runner
+    // has started by the time the (still suspended) child first runs.
+    if write_restricted {
+        let n = self_protect::protect_own_threads()
+            .context("runner thread self-protect (required with --write-restricted-token)")?;
+        if dbg {
+            eprintln!("srt-win: run_lockdown: thread self-protect applied ({n} thread(s))");
+        }
     }
     let prev_suspend = unsafe { ResumeThread(child.thread()) };
     if prev_suspend == u32::MAX {
