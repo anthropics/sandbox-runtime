@@ -29,7 +29,6 @@ import {
   type PlanSigv4,
 } from './credential-aws-pairs.js'
 import {
-  certThumbprint,
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
@@ -81,15 +80,9 @@ import {
   parseWindowsBinShell,
   expandWindowsFsPaths,
   rankWindowsFsAccess,
-  stampWindowsAcl,
   restoreWindowsAcl,
-  grantWindowsAcl,
   grantWindowsAclPersistent,
   windowsSetupVersionMismatch,
-  windowsWriteRestrictedTokenEnabled,
-  forgetWindowsPersistentGrants,
-  forgetWindowsProfileReadAsync,
-  WINDOWS_SRT_WIN_CAPABILITIES,
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
   windowsGrantsBeneathDenies,
@@ -100,7 +93,6 @@ import {
   revokeWindowsAclChecked,
   type WindowsAclRevokeResult,
   getWindowsSandboxUserStatusAsync,
-  getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
   verifyWindowsWfpEgress,
   resolveSrtWin,
@@ -207,9 +199,6 @@ let windowsFsStampedSet: WindowsFsAccessSet | undefined
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
 let windowsFsSbUserSid: string | undefined
-// Whether initialize() registered this process with srt-win as a session
-// (under the ordinary token only if srt-win advertises `exec-holder`).
-let windowsSessionRegistered = false
 // The RAW config inputs that produced `windowsFsStampedSet`.
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
@@ -219,13 +208,9 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-// Remembered per child-token shape, as the sandbox account the check
-// passed for: a different account (a reinstall) is checked again.
-const windowsWfpVerifiedFor: { ordinary?: string; writeRestricted?: string } =
-  {}
-// The child-token shape initialize() verified the fence for (the wrap
-// path uses it, not `config`); outside a session, the option's default.
-let windowsWriteRestrictedToken = true
+// Remembered as the sandbox account the check passed for: a different
+// account (a reinstall) is checked again.
+let windowsWfpVerifiedFor: string | undefined
 // The `srt-win` builds, by identity, that reported every capability the
 // library relies on. Only a yes is remembered.
 const windowsCapableSrtWin = new Set<string>()
@@ -248,7 +233,7 @@ function windowsSrtWinIdentity(srtWin: SrtWinSpawn): string {
 }
 
 const WINDOWS_CAPABILITIES_WHY =
-  `a session under the write-restricted token depends on (its read ` +
+  `a session depends on (its read ` +
   `denies are written on the profile read grant's paths by srt-win, ` +
   `and kept grants are checked and removed there)`
 
@@ -1130,8 +1115,6 @@ async function initialize(
     // registered, and the next call makes a CA of its own.
     if (mitmCA) disposeMitmCASync(mitmCA)
     mitmCA = undefined
-    // No session came of it: back to the option's default.
-    if (config === undefined) windowsWriteRestrictedToken = true
     throw error
   }
 }
@@ -1298,48 +1281,20 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
-    // The profile read grant exists only under the write-restricted
-    // token. initialize() never writes or refreshes it.
+    // initialize() never writes or refreshes the profile read grant.
     windowsProfileRead = 'absent'
     windowsProfileReadWarnings = []
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
     >[1] = { exclusions: [], ungrantedOnly: [] }
     try {
-      if (!windowsWriteRestrictedTokenEnabled(runtimeConfig.windows)) {
-        // Removing kept grants needs srt-win's holder check, so that capability
-        // is required here, and only when there is something to remove.
-        if (
-          (u.profileGrant || u.persistentGrants) &&
-          !u.capabilities.includes(
-            WINDOWS_SRT_WIN_CAPABILITIES.keptGrantHolders,
-          )
-        ) {
-          throw windowsSrtWinOutdatedError(
-            WINDOWS_SRT_WIN_CAPABILITIES.keptGrantHolders,
-            `this library needs before it removes kept grants for ` +
-              `windows.writeRestrictedToken: false — another live session ` +
-              `may be running on them`,
-          )
-        }
-        if (u.profileGrant) {
-          await forgetWindowsProfileReadAsync({
-            srtWin,
-            unlessHeldByOthers: process.pid,
-          })
-        }
-      } else {
-        // Required whether or not a profile grant is recorded.
-        const missing = missingWindowsSrtWinCapability(u.capabilities)
-        if (missing !== undefined) {
-          throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
-        }
-        windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
+      // Required whether or not a profile grant is recorded.
+      const missing = missingWindowsSrtWinCapability(u.capabilities)
+      if (missing !== undefined) {
+        throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
       }
-      if (
-        windowsWriteRestrictedTokenEnabled(runtimeConfig.windows) &&
-        u.profileGrant
-      ) {
+      windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
+      if (u.profileGrant) {
         const grant = getWindowsProfileReadStatus({ srtWin })
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
@@ -1382,40 +1337,8 @@ async function initializeSteps(
     // After the user-status check so the not-provisioned message is
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
-    // With `writeRestrictedToken` the probe runs below, after the
-    // grant: the capability SIDs exist only once the roots are granted.
-    const writeRestricted = windowsWriteRestrictedTokenEnabled(
-      runtimeConfig.windows,
-    )
-    if (!writeRestricted) {
-      // Kept write grants let the sandbox account write those trees
-      // under the ordinary token: remove them first, or no session.
-      if (u.persistentGrants) {
-        try {
-          await forgetWindowsPersistentGrants({
-            srtWin,
-            unlessHeldByOthers: process.pid,
-          })
-        } catch (e) {
-          config = undefined
-          throw e
-        }
-      }
-      if (u.sid === undefined || windowsWfpVerifiedFor.ordinary !== u.sid) {
-        try {
-          await verifyWindowsWfpEgress({
-            proxyPortRange: runtimeConfig.windows?.proxyPortRange,
-            writeRestrictedToken: false,
-            srtWin,
-          })
-        } catch (e) {
-          config = undefined
-          throw e
-        }
-        windowsWfpVerifiedFor.ordinary = u.sid
-      }
-    }
-    windowsWriteRestrictedToken = writeRestricted
+    // The probe runs below, after the grant: the capability SIDs of
+    // the write roots exist only once the roots are granted.
     // Persistent-CA branch (see the deferral comment above).
     // `ensurePersistentWindowsCa` reconciles the registry thumb
     // itself (so initialize() after uninstall→reinstall repairs
@@ -1434,39 +1357,6 @@ async function initializeSteps(
       } catch (e) {
         config = undefined
         throw e
-      }
-    }
-    // Explicit-path branch: schannel clients (System32 curl, IWR,
-    // .NET, default-backend git) only trust what's in the sandbox
-    // user's `CurrentUser\Root` — which `srt-win exec` does not (and
-    // must not) write. Compare thumbprints so a stale install-time
-    // CA doesn't pass the gate while schannel rejects the session's
-    // proxy-minted leaves.
-    // Only the ordinary token: under the write-restricted one Schannel
-    // gets no credentials, so nothing that runs reads that store.
-    if (tlsTerminate && mitmCA && !useWindowsPersistentCa && !writeRestricted) {
-      const installed = getWindowsSandboxCaCert(u)
-      const sessionThumb = certThumbprint(mitmCA.certPem)
-      if (!installed) {
-        config = undefined
-        throw new WindowsSandboxError(
-          'trust_ca_not_installed',
-          `tlsTerminate on Windows requires the sandbox to be ` +
-            `installed with this CA (thumb=${sessionThumb}): run ` +
-            `\`srt-win user trust-ca ${mitmCA.certPath}\`. Per-exec ` +
-            `installs into the sandbox user's Root store are not ` +
-            `supported.`,
-        )
-      }
-      if (installed.thumb !== sessionThumb) {
-        config = undefined
-        throw new WindowsSandboxError(
-          'trust_ca_thumbprint_mismatch',
-          `tlsTerminate on Windows: the sandbox's installed CA ` +
-            `(thumb=${installed.thumb}) doesn't match this ` +
-            `session's CA (thumb=${sessionThumb}). Run \`srt-win ` +
-            `user trust-ca ${mitmCA.certPath}\` to update it.`,
-        )
       }
     }
     // Filesystem grants/denies — additive sandbox-user ACEs.
@@ -1550,66 +1440,30 @@ async function initializeSteps(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
-      const anyApplied =
-        grantRead.length > 0 ||
-        acc.grantWrite.length > 0 ||
-        acc.denyRead.length > 0 ||
-        acc.denyWrite.length > 0
-      const registersUnderOrdinaryToken =
-        !writeRestricted &&
-        u.capabilities.includes(WINDOWS_SRT_WIN_CAPABILITIES.execHolder)
-      if (writeRestricted) {
-        // One call, always made: it also records this process as a
-        // session. Write roots are kept at reset(); a failure throws.
-        {
-          await grantWindowsAclPersistent({
-            sandboxUserSid: sb,
-            read: grantRead,
-            write: acc.grantWrite,
-            denyRead: acc.denyRead,
-            denyWrite: acc.denyWrite,
-            allowProfileExclusions: override,
-            srtWin,
-          })
-        }
-        // The egress probe, under the token this session's commands
-        // get; anything but a refused connect throws.
-        if (windowsWfpVerifiedFor.writeRestricted !== sb) {
-          await verifyWindowsWfpEgress({
-            proxyPortRange: runtimeConfig.windows?.proxyPortRange,
-            writeRestrictedToken: true,
-            writeRoots: acc.grantWrite,
-            srtWin,
-          })
-          windowsWfpVerifiedFor.writeRestricted = sb
-        }
-      } else {
-        // Grant FIRST so the sandbox user has working-tree access by
-        // the time the deny stamp runs.
-        if (
-          registersUnderOrdinaryToken ||
-          grantRead.length > 0 ||
-          acc.grantWrite.length > 0
-        ) {
-          grantWindowsAcl({
-            sandboxUserSid: sb,
-            read: grantRead,
-            write: acc.grantWrite,
-            srtWin,
-          })
-        }
-        if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
-          stampWindowsAcl({
-            sandboxUserSid: sb,
-            denyRead: acc.denyRead,
-            denyWrite: acc.denyWrite,
-            srtWin,
-          })
-        }
+      // One call, always made: it also records this process as a
+      // session. Write roots are kept at reset(); a failure throws.
+      await grantWindowsAclPersistent({
+        sandboxUserSid: sb,
+        read: grantRead,
+        write: acc.grantWrite,
+        denyRead: acc.denyRead,
+        denyWrite: acc.denyWrite,
+        allowProfileExclusions: override,
+        srtWin,
+      })
+      // The egress probe, under the token this session's commands
+      // get; anything but a refused connect throws.
+      if (windowsWfpVerifiedFor !== sb) {
+        await verifyWindowsWfpEgress({
+          proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+          writeRoots: acc.grantWrite,
+          srtWin,
+        })
+        windowsWfpVerifiedFor = sb
       }
-      // Gates running revoke/restore at reset().
-      windowsSessionRegistered = writeRestricted || registersUnderOrdinaryToken
-      if (anyApplied || windowsSessionRegistered) {
+      // Gates running revoke/restore at reset(): every session is
+      // recorded with srt-win, whatever it was given.
+      {
         windowsFsStampedSet = acc
         logForDebugging(
           `[Sandbox Windows] fs applied: ` +
@@ -1628,7 +1482,6 @@ async function initializeSteps(
         releaseWindowsSessionAcls(windowsFsSbUserSid, srtWin)
       }
       windowsFsSbUserSid = undefined
-      windowsSessionRegistered = false
       windowsProfileRead = undefined
       config = undefined
       throw e
@@ -2996,41 +2849,13 @@ async function wrapWithSandboxArgv(
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
     // via `computeWindowsFsAccessSet`.
-    // initialize() verified the egress fence for one token shape, so a
-    // per-command override that differs is refused.
-    const writeRestrictedToken = windowsWriteRestrictedToken
-    const perCommandToken = customConfig?.windows?.writeRestrictedToken
-    if (
-      perCommandToken !== undefined &&
-      perCommandToken !== writeRestrictedToken
-    ) {
-      throw new Error(
-        `Per-command windows.writeRestrictedToken is not supported — ` +
-          `the egress fence is verified for the session's token shape ` +
-          `at initialize(). Set it at the session level.`,
-      )
-    }
-    // A config that asks for the restricted token must not run a
-    // command under the ordinary one.
-    if (
-      windowsWriteRestrictedTokenEnabled(config?.windows) &&
-      !writeRestrictedToken
-    ) {
-      throw new Error(
-        `windows.writeRestrictedToken was turned on after initialize() — ` +
-          `call reset() then initialize() to apply it. Refusing to run ` +
-          `the command under the ordinary token.`,
-      )
-    }
     // Asked once per srt-win, so an older one is refused as outdated
     // instead of failing on a flag it does not know.
-    if (writeRestrictedToken) {
-      assertWindowsSrtWinCapable(
-        customConfig?.windows?.srtWin
-          ? resolveSrtWin(customConfig.windows.srtWin)
-          : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
-      )
-    }
+    assertWindowsSrtWinCapable(
+      customConfig?.windows?.srtWin
+        ? resolveSrtWin(customConfig.windows.srtWin)
+        : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
+    )
     registerCommandText(command, options)
     return wrapCommandWithSandboxWindows({
       command,
@@ -3045,16 +2870,13 @@ async function wrapWithSandboxArgv(
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
       // The session's own grants beneath those denies keep their rank.
-      // Not sent under the ordinary token: there is no profile grant.
-      denyReadExcept: writeRestrictedToken
-        ? windowsGrantsBeneathDenies(
-            [
-              ...(windowsFsStampedSet?.grantRead ?? []),
-              ...(windowsFsStampedSet?.grantWrite ?? []),
-            ],
-            perExecDenyRead,
-          )
-        : undefined,
+      denyReadExcept: windowsGrantsBeneathDenies(
+        [
+          ...(windowsFsStampedSet?.grantRead ?? []),
+          ...(windowsFsStampedSet?.grantWrite ?? []),
+        ],
+        perExecDenyRead,
+      ),
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
@@ -3064,18 +2886,12 @@ async function wrapWithSandboxArgv(
       allowWrite: windowsFsStampedSet?.grantWrite,
       gitSafeDirectories: getGitSafeDirectories(customConfig),
       caCertPath: mitmCA?.trustBundlePath,
-      writeRestrictedToken,
       // srt-win verifies the holder and otherwise holds for the command
-      // itself. Named only where the session did register.
-      heldBy:
-        windowsSessionRegistered && windowsFsSbUserSid !== undefined
-          ? process.pid
-          : undefined,
+      // itself.
+      heldBy: windowsFsSbUserSid !== undefined ? process.pid : undefined,
       // The roots initialize() granted persistently; their capability
       // SIDs are what let this command write them.
-      writeRoots: writeRestrictedToken
-        ? windowsFsStampedSet?.grantWrite
-        : undefined,
+      writeRoots: windowsFsStampedSet?.grantWrite,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
         ? resolveSrtWin(customConfig.windows.srtWin)
@@ -3140,20 +2956,6 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
         `(filesystem.* ∪ credentials.files) changed but the ACL ` +
         `stamp/grant is session-wide — call reset() then initialize() ` +
         `to apply. The previously-applied set stays in effect.`,
-      { level: 'warn' },
-    )
-  }
-  if (
-    getPlatform() === 'windows' &&
-    config &&
-    windowsWriteRestrictedTokenEnabled(newConfig.windows) !==
-      windowsWriteRestrictedToken
-  ) {
-    logForDebugging(
-      `[Sandbox Windows] updateConfig: windows.writeRestrictedToken ` +
-        `changed but the child-token shape is fixed (and its egress ` +
-        `fence verified) at initialize() — call reset() then ` +
-        `initialize() to apply. The previous shape stays in effect.`,
       { level: 'warn' },
     )
   }
@@ -3317,10 +3119,8 @@ async function reset(): Promise<void> {
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
-  windowsSessionRegistered = false
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
-  windowsWriteRestrictedToken = true
   windowsProfileRead = undefined
   windowsProfileReadWarnings = []
   windowsCapableSrtWin.clear()

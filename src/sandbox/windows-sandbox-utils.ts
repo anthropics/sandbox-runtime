@@ -115,8 +115,6 @@ export type WindowsSandboxErrorCode =
   | 'acl_stamp_failed'
   /** `srt-win acl grant` exited non-zero. */
   | 'acl_grant_failed'
-  /** `srt-win acl forget` could not remove every persistent grant. */
-  | 'acl_forget_failed'
   /**
    * A profile read grant is recorded and cannot be relied on (unfinished,
    * older exclusion list, another profile, unreadable record). An ABSENT
@@ -549,15 +547,9 @@ export interface WindowsSandboxParams {
    */
   srtWin?: SrtWinSpawn
   /**
-   * Run the child under the write-restricted token. Default `true`;
-   * only an explicit `false` gives the ordinary token. The caller must
-   * have verified the egress fence for this token shape first.
-   */
-  writeRestrictedToken?: boolean
-  /**
    * The session's write roots. Each is passed as `--write-root`, which
    * puts the root's capability SID in the child token; without it the
-   * child cannot write the root. Ignored with the ordinary token.
+   * child cannot write the root.
    */
   writeRoots?: readonly string[]
   /**
@@ -1080,8 +1072,8 @@ export const WINDOWS_SRT_WIN_CAPABILITIES = {
 } as const
 
 /**
- * The first capability this library needs under the write-restricted
- * token that `capabilities` (as `srt-win` reported them) does not list.
+ * The first capability this library needs that `capabilities` (as
+ * `srt-win` reported them) does not list.
  */
 export function missingWindowsSrtWinCapability(
   capabilities: readonly string[],
@@ -1257,18 +1249,14 @@ export async function getWindowsWfpStatusAsync(
  * @param opts.proxyPortRange the WFP loopback-permit range the
  *   listener must avoid. Default
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
- * @param opts.writeRoots the session's write roots; ignored when
- *   `writeRestrictedToken` is `false`.
- * @param opts.writeRestrictedToken default `true`: probe with the
- *   write-restricted child token; a session MUST verify with the
- *   token its commands will run under.
+ * @param opts.writeRoots the session's write roots: the probe runs
+ *   under the write-restricted token a command of the session gets.
  * @throws on any outcome other than `blocked` (exit 0).
  */
 export async function verifyWindowsWfpEgress(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
-    writeRestrictedToken?: boolean
     writeRoots?: readonly string[]
     srtWin?: SrtWinSpawn
   } = {},
@@ -1305,11 +1293,14 @@ export async function verifyWindowsWfpEgress(
     // 30s: first call after install may create the sandbox user's
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW, and
     // the runner allows itself 2s to connect (runner.rs).
-    const verifyArgs = ['wfp', 'verify', '--target', target]
-    if (windowsWriteRestrictedTokenEnabled(opts)) {
-      verifyArgs.push('--write-restricted-token')
-      for (const r of opts.writeRoots ?? []) verifyArgs.push('--write-root', r)
-    }
+    const verifyArgs = [
+      'wfp',
+      'verify',
+      '--target',
+      target,
+      '--write-restricted-token',
+    ]
+    for (const r of opts.writeRoots ?? []) verifyArgs.push('--write-root', r)
     const r = runSrtWin(verifyArgs, {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
@@ -2815,40 +2806,6 @@ export async function grantWindowsAclPersistent(
   }
 }
 
-/**
- * Remove every write grant kept between sessions (`srt-win acl forget
- * --all`). A session with `windows.writeRestrictedToken: false` must
- * run this first: a kept grant is writable under the ordinary token.
- */
-export async function forgetWindowsPersistentGrants(
-  opts: { unlessHeldByOthers?: number; srtWin?: SrtWinSpawn } = {},
-): Promise<void> {
-  const r = await runSrtWinAsync(
-    ['acl', 'forget', '--all', ...unlessHeldArgs(opts.unlessHeldByOthers)],
-    { timeoutMs: 600_000, srtWin: opts.srtWin },
-  )
-  logForDebugging(
-    `[Sandbox Windows] acl forget --all exit=${r.status}: ` +
-      `${r.stderr || r.stdout}`,
-  )
-  if (r.status !== 0) {
-    throw new WindowsSandboxError(
-      'acl_forget_failed',
-      `Write grants kept from earlier sessions could not be removed, ` +
-        `so windows.writeRestrictedToken: false cannot take effect (srt-win ` +
-        `acl forget --all exited ${r.status}): ${r.stderr || r.stdout}. ` +
-        `For a root that can no longer be located (a removed drive), ` +
-        `\`srt-win acl forget --all --force\` drops its record.`,
-    )
-  }
-}
-
-function unlessHeldArgs(holderPid: number | undefined): string[] {
-  return holderPid === undefined
-    ? []
-    : ['--unless-held-by-others', `${holderPid}`]
-}
-
 export interface WindowsAclRevokeResult {
   /**
    * True only when `srt-win acl revoke` exited 0, its output parsed,
@@ -3482,25 +3439,17 @@ export function forgetWindowsProfileRead(
   profileForgetResult(r)
 }
 
-/**
- * {@link forgetWindowsProfileRead} without blocking the event loop.
- * `unlessHeldByOthers` (the calling session's process id) makes it
- * remove nothing if another live session is running on a kept grant.
- */
+/** {@link forgetWindowsProfileRead} without blocking the event loop. */
 export async function forgetWindowsProfileReadAsync(
   opts: {
     timeoutMs?: number
-    unlessHeldByOthers?: number
     srtWin?: SrtWinSpawn
   } = {},
 ): Promise<void> {
-  const r = await runSrtWinAsync(
-    ['profile', 'forget', '--json', ...unlessHeldArgs(opts.unlessHeldByOthers)],
-    {
-      timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
-      srtWin: opts.srtWin,
-    },
-  )
+  const r = await runSrtWinAsync(['profile', 'forget', '--json'], {
+    timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
+    srtWin: opts.srtWin,
+  })
   profileForgetResult(r)
 }
 
@@ -3748,7 +3697,6 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   env: NodeJS.ProcessEnv
 } {
   const { exe, prependArgs } = p.srtWin ?? resolveSrtWin()
-  const writeRestricted = windowsWriteRestrictedTokenEnabled(p)
   // Generated proxy + CA-trust env. Single-sourced here so the
   // same object feeds (a) the spawn env merge below and (b) the
   // explicit `--env` overlay for the runner.
@@ -3799,17 +3747,15 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
     schannelCa: p.caCertPath !== undefined,
     // Schannel cannot acquire credentials under the write-restricted
     // token; git's OpenSSL backend reads the same GIT_SSL_CAINFO.
-    opensslBackend: writeRestricted,
+    opensslBackend: true,
     baseEnv: p.setEnvVars,
   })
 
   const argv: string[] = [exe, ...prependArgs, 'exec']
   if (p.quiet !== false) argv.push('--quiet')
   if (p.heldBy !== undefined) argv.push('--held-by', `${p.heldBy}`)
-  if (writeRestricted) {
-    argv.push('--write-restricted-token')
-    for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
-  }
+  argv.push('--write-restricted-token')
+  for (const r of p.writeRoots ?? []) argv.push('--write-root', r)
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const a of p.denyReadExcept ?? []) argv.push('--deny-read-except', a)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
@@ -3888,17 +3834,6 @@ function envListToObject(list: string[]): NodeJS.ProcessEnv {
 // ────────────────────────────────────────────────────────────────────
 // Dependency / readiness check
 // ────────────────────────────────────────────────────────────────────
-
-/**
- * `windows.writeRestrictedToken` as it applies: on unless it is
- * explicitly `false`. Every reader of the option goes through here,
- * so unset and `true` cannot diverge.
- */
-export function windowsWriteRestrictedTokenEnabled(
-  w: { writeRestrictedToken?: boolean } | undefined,
-): boolean {
-  return w?.writeRestrictedToken !== false
-}
 
 /**
  * Why an existing install cannot be used by this `srt-win` (its setup

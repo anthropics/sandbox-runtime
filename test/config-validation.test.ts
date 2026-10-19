@@ -1,6 +1,5 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
 import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
-import { windowsWriteRestrictedTokenEnabled } from '../src/sandbox/windows-sandbox-utils.js'
 import { WindowsConfigSchema } from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
@@ -2323,44 +2322,6 @@ describe('Config Validation', () => {
     })
   })
 
-  describe('windows.writeRestrictedToken', () => {
-    const parse = (windows?: unknown) =>
-      SandboxRuntimeConfigSchema.safeParse({
-        network: { allowedDomains: [], deniedDomains: [] },
-        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-        ...(windows !== undefined && { windows }),
-      })
-
-    test('defaults to on: no windows block, an empty one and true are the same; only false turns it off', () => {
-      const applied = (windows?: unknown): boolean => {
-        const r = parse(windows)
-        expect(r.success).toBe(true)
-        return windowsWriteRestrictedTokenEnabled(
-          r.success ? r.data.windows : undefined,
-        )
-      }
-      expect(applied()).toBe(true)
-      expect(applied({})).toBe(true)
-      expect(applied({ writeRestrictedToken: true })).toBe(true)
-      expect(applied({ writeRestrictedToken: false })).toBe(false)
-    })
-
-    test('the parsed config keeps what was written, so an explicit false stays distinguishable from unset', () => {
-      const unset = parse({})
-      const off = parse({ writeRestrictedToken: false })
-      expect(unset.success && unset.data.windows?.writeRestrictedToken).toBe(
-        undefined,
-      )
-      expect(off.success && off.data.windows?.writeRestrictedToken).toBe(false)
-    })
-
-    test('rejects a value that is not a boolean', () => {
-      for (const bad of ['false', 0, 'off', null]) {
-        expect(parse({ writeRestrictedToken: bad }).success).toBe(false)
-      }
-    })
-  })
-
   describe('reading the user profile on Windows is not a setting', () => {
     const parse = (windows?: unknown) =>
       SandboxRuntimeConfigSchema.safeParse({
@@ -2382,12 +2343,6 @@ describe('Config Validation', () => {
       const r = parse({ profileRead: false, profileReadExclude: ['.x'] })
       expect(r.success).toBe(true)
       expect(Object.keys((r.success && r.data.windows) || {})).toEqual([])
-    })
-
-    test('the token opt-out is the one switch, and stands alone', () => {
-      expect(parse({ writeRestrictedToken: false }).success).toBe(true)
-      expect(parse({ writeRestrictedToken: true }).success).toBe(true)
-      expect(parse({}).success).toBe(true)
     })
   })
 })
