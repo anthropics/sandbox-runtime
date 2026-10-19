@@ -606,6 +606,10 @@ fn add_filter(
 /// SDDL for the sandbox-user BLOCK filter: ALLOW `<sandbox_user_sid>`
 /// (matches iff the token IS that user), plus ALLOW for the two
 /// all-packages SIDs, which an AppContainer token's check also needs.
+///
+/// Under the write-restricted token the check must also pass against
+/// the restricting list, so the sandbox user SID must stay in it
+/// ([`crate::token::restricting_sid_list`]); a failed check means no BLOCK.
 pub fn sddl_sandbox_user(sid: &str) -> String {
     format!("O:LSG:LSD:(A;;CC;;;{sid})(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)")
 }

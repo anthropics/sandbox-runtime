@@ -41,6 +41,9 @@ pub enum RunnerCmd {
     /// `wfp verify` probe ([`crate::probe`]), run as the bare runner:
     /// no desk/grants/lockdown. Exits with the results encoded; exit 1
     /// stays the runner's own error path and never decodes as a report.
+    ///
+    /// Probes the runner's own token only; the write-restricted verify
+    /// sends an [`Exec`](Self::Exec) of `srt-win probe egress`.
     ProbeEgress {
         target: String,
         #[serde(default)]
@@ -66,6 +69,14 @@ pub struct RunnerSpec {
     /// sandbox user's machine-only `PATH` while `USERPROFILE` /
     /// `TEMP` stay isolated. The proxy var set rides here too.
     pub env_overlay: Vec<(String, String)>,
+    /// Build the child token write-restricted (see [`crate::token`]).
+    #[serde(default)]
+    pub write_restricted_token: bool,
+    /// Capability SIDs of the session's write roots (`crate::persist`),
+    /// added to the child token's restricting SIDs. Only with
+    /// `write_restricted_token`.
+    #[serde(default)]
+    pub capability_sids: Vec<String>,
 }
 
 /// Read a 4-byte little-endian length prefix followed by that many
@@ -120,7 +131,13 @@ pub fn run() -> Result<u32> {
                 );
             }
             let exe = std::path::PathBuf::from(&spec.argv[0]);
-            launch::run_lockdown(&exe, &spec.argv[1..], &spec.env_overlay)
+            launch::run_lockdown(
+                &exe,
+                &spec.argv[1..],
+                &spec.env_overlay,
+                spec.write_restricted_token,
+                &spec.capability_sids,
+            )
         }
         RunnerCmd::InstallCa { der } => {
             let thumb = crate::cert_store::install_root_ca(&der)?;
@@ -154,6 +171,8 @@ mod tests {
         let s = RunnerCmd::Exec(RunnerSpec {
             argv: vec!["cmd.exe".into(), "/c".into(), "echo hi".into()],
             env_overlay: vec![("PATH".into(), r"C:\a;C:\b".into())],
+            write_restricted_token: true,
+            capability_sids: vec!["S-1-0-1936880739-1-2-3-4".into()],
         });
         let bytes = encode_cmd(&s).unwrap();
         assert_eq!(
@@ -165,6 +184,17 @@ mod tests {
             RunnerCmd::Exec(r) => {
                 assert_eq!(r.argv, ["cmd.exe", "/c", "echo hi"]);
                 assert_eq!(r.env_overlay.len(), 1);
+                assert!(r.write_restricted_token);
+                assert_eq!(r.capability_sids, ["S-1-0-1936880739-1-2-3-4"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // A spec without the field is the ordinary token.
+        let legacy = br#"{"Exec":{"argv":["cmd.exe"],"env_overlay":[]}}"#;
+        match serde_json::from_slice::<RunnerCmd>(legacy).unwrap() {
+            RunnerCmd::Exec(r) => {
+                assert!(!r.write_restricted_token);
+                assert!(r.capability_sids.is_empty());
             }
             _ => panic!("wrong variant"),
         }

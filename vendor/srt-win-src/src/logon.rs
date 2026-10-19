@@ -47,7 +47,7 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
     GetExitCodeProcess, INFINITE, LOGON_WITH_PROFILE, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
+    STARTF_USESTDHANDLES, STARTUPINFOW, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -293,13 +293,9 @@ fn pump(src: HANDLE, dst: HANDLE) {
     }
 }
 
-/// Spawn `srt-win runner` as `username`, send `cmd` over stdin, and
-/// return its exit code. `cwd` is set as the runner's working
-/// directory; `None` inherits the broker's. `sb_sid` is the
-/// `srt-sandbox` user-SID string (for the desktop DACL and the
-/// `WinSta0` station grant). `quiet` suppresses the informational
-/// stderr lines (the seclogon-job note); `SANDBOX_RUNTIME_WIN_DEBUG`
-/// checkpoints are gated separately on `dbg` and are unaffected.
+/// Spawn `srt-win runner` as `username`, send `cmd` over stdin, return its
+/// exit code. If `holder` (a waitable process handle) ends first, the runner
+/// and everything it started are terminated: [`HolderGone`].
 pub fn spawn_runner(
     username: &str,
     password: &str,
@@ -307,6 +303,7 @@ pub fn spawn_runner(
     cwd: Option<&str>,
     cmd: &crate::runner::RunnerCmd,
     quiet: bool,
+    holder: Option<HANDLE>,
 ) -> Result<u32> {
     // Mapped/network-drive cwd pre-check: `DRIVE_REMOTE` on the
     // cwd's root means CPWLW would fail inside seclogon with
@@ -545,9 +542,12 @@ pub fn spawn_runner(
         }
     });
 
-    let rc = unsafe { WaitForSingleObject(child.process(), INFINITE) };
-    if rc != WAIT_OBJECT_0 {
-        eprintln!("srt-win: WaitForSingleObject(runner) returned 0x{:x}", rc.0);
+    if wait_for_child_or_holder(child.process(), holder) == Ended::HolderGone {
+        // The whole tree, now: the runner (which takes its own job,
+        // and so the command, with it) and then this job.
+        drop(child);
+        drop(job);
+        return Err(anyhow::Error::new(HolderGone));
     }
     let _ = t_out.join();
     let _ = t_err.join();
@@ -559,6 +559,47 @@ pub fn spawn_runner(
     // runner) then `job`. An explicit `drop(job)` here would close
     // the Job before the fallback terminate.
     Ok(code)
+}
+
+/// The process the command was started for ended while the command
+/// ran; the command was terminated.
+#[derive(Debug)]
+pub struct HolderGone;
+
+impl std::fmt::Display for HolderGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the session that started this command ended; the command and everything it \
+             started were terminated",
+        )
+    }
+}
+
+impl std::error::Error for HolderGone {}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Ended {
+    Child,
+    HolderGone,
+}
+
+/// Wait for the runner or the holder, whichever ends first; the runner is
+/// asked first. Anything else the wait can say (signalled holder, failed
+/// wait, bad handle) counts as the holder gone.
+fn wait_for_child_or_holder(child: HANDLE, holder: Option<HANDLE>) -> Ended {
+    let Some(holder) = holder else {
+        let rc = unsafe { WaitForSingleObject(child, INFINITE) };
+        if rc != WAIT_OBJECT_0 {
+            eprintln!("srt-win: WaitForSingleObject(runner) returned 0x{:x}", rc.0);
+        }
+        return Ended::Child;
+    };
+    let rc = unsafe { WaitForMultipleObjects(&[child, holder], false, INFINITE) };
+    if rc == WAIT_OBJECT_0 {
+        Ended::Child
+    } else {
+        Ended::HolderGone
+    }
 }
 
 /// `std::io::Stdout`/`Stderr` → raw `HANDLE` for [`pump`].
@@ -584,6 +625,53 @@ mod tests {
     use windows::Win32::System::Pipes::{
         GetNamedPipeInfo, ImpersonateNamedPipeClient, PIPE_SERVER_END,
     };
+
+    /// The command ends with its session: whichever of the two ends
+    /// first decides, the command when both have, and a holder that
+    /// cannot be waited on is a holder that is gone.
+    #[test]
+    fn the_wait_ends_with_the_child_or_with_the_holder() {
+        use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+        let event =
+            || crate::util::OwnedHandle(unsafe { CreateEventW(None, true, false, None) }.unwrap());
+        let (child, holder) = (event(), event());
+        unsafe { SetEvent(holder.raw()) }.unwrap();
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
+            super::Ended::HolderGone
+        );
+        unsafe { SetEvent(child.raw()) }.unwrap();
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
+            super::Ended::Child
+        );
+        let holder = event();
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
+            super::Ended::Child
+        );
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), None),
+            super::Ended::Child
+        );
+        let running = event();
+        let closed = windows::Win32::Foundation::HANDLE::default();
+        assert_eq!(
+            super::wait_for_child_or_holder(running.raw(), Some(closed)),
+            super::Ended::HolderGone
+        );
+        let (child, holder) = (event(), event());
+        let signal = holder.raw().0 as isize;
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            unsafe { SetEvent(windows::Win32::Foundation::HANDLE(signal as *mut _)) }.unwrap();
+        });
+        assert_eq!(
+            super::wait_for_child_or_holder(child.raw(), Some(holder.raw())),
+            super::Ended::HolderGone
+        );
+        t.join().unwrap();
+    }
 
     #[test]
     fn stdin_pipe_name_shape() {

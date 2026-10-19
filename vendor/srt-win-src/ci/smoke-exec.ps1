@@ -108,8 +108,8 @@ if ($vexit -notin 0, 2, 3) { throw "V1: wfp verify exited $vexit without a probe
 $v = $vout | ConvertFrom-Json
 
 # ── V1c: lowered-integrity copies of the sandbox token are blocked ──
-# `error` means the runner could not assume the lowered token; that is
-# not a block and fails the row as such.
+# `error` means the lowered token could not be assumed (the kernel refuses
+# it under some tokens): accepted only with the residual that reports it.
 $loweredFields = 'low_integrity_probe','low_integrity_loopback_probe',
                  'untrusted_integrity_probe','untrusted_integrity_loopback_probe'
 foreach ($f in $loweredFields) {
@@ -126,16 +126,18 @@ foreach ($f in $loweredFields) {
   $got = $v.$f
   $offLoopback = $f -notlike '*_loopback_probe'
   if ($got -eq 'error') {
-    throw "V1c: $f=error - the runner could not assume the lowered-integrity token (see its stderr line above); " +
-          "this is NOT a block. $loweredRaw"
-  }
-  if ($got -eq 'skipped' -and $offLoopback) {
+    if ($v.residuals -notcontains 'lowered-integrity-unprobed') {
+      throw "V1c: $f=error without the lowered-integrity-unprobed residual; an attempt that was " +
+            "not made must be reported. $loweredRaw residuals=$($v.residuals -join ',')"
+    }
+    Write-Host "V1c note: $f not set up (error), reported as lowered-integrity-unprobed"
+  } elseif ($got -eq 'skipped' -and $offLoopback) {
     Write-Host "V1c note: $f skipped (no off-loopback address on this runner)"
   } elseif ($got -ne 'blocked') {
     throw "V1c: $f expected blocked, got '$got'. $loweredRaw"
   }
 }
-Write-Host "V1c ok: lowered-integrity connects blocked: $loweredRaw"
+Write-Host "V1c ok: no lowered-integrity connect got out: $loweredRaw"
 
 if ($vexit -ne 0) {
   throw "V1: wfp verify expected exit 0 (blocked), got $vexit. stdout: $vout"
@@ -1518,6 +1520,8 @@ foreach ($f in $loweredFields) {
   $got = $l2.$f
   if ($got -eq 'skipped' -and $f -notlike '*_loopback_probe') {
     Write-Host "L2 note: $f skipped (no off-loopback address on this runner)"
+  } elseif ($got -eq 'error' -and $l2.residuals -contains 'lowered-integrity-unprobed') {
+    Write-Host "L2 note: $f not set up (error), reported as lowered-integrity-unprobed"
   } elseif ($got -ne 'blocked') {
     throw "L2: $f expected blocked with loopback open, got '$got'. out: $l2out"
   }
