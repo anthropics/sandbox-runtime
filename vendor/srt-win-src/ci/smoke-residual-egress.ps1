@@ -43,7 +43,6 @@ $wsl  = Join-Path $env:SystemRoot 'System32\wsl.exe'
 $rows   = [System.Collections.Generic.List[object]]::new()
 $errors = [System.Collections.Generic.List[string]]::new()
 
-# ── helpers ────────────────────────────────────────────────────────
 function Run { param([string[]] $argv)
   & $Exe @argv
   if ($LASTEXITCODE -ne 0) {
@@ -242,7 +241,6 @@ function RestoreMup {
   return 'restored, reads back identical to the original'
 }
 
-# ── state the finally block needs ──────────────────────────────────
 $installed    = $false
 $sbSid        = $null
 $ws           = $null
@@ -264,7 +262,6 @@ try { Start-Service seclogon -ea Stop } catch {
 }
 
 try {
-  # ── provisioning ─────────────────────────────────────────────────
   Run @('install', '--sublayer-guid', $Sublayer, '--proxy-port-range', $PortRange)
   $installed = $true
   $us = J @('user', 'status')
@@ -644,7 +641,6 @@ finally {
   }
 }
 
-# ── summary ────────────────────────────────────────────────────────
 Write-Host ''
 Write-Host 'smoke-residual-egress: summary (observations, not assertions)'
 $width = 0
