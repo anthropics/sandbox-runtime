@@ -54,6 +54,10 @@ import {
   parseWindowsSandboxError,
   WindowsSandboxError,
 } from '../../src/sandbox/windows-sandbox-utils.js'
+import type {
+  MappedDriveCwdError,
+  SeclogonDisabledError,
+} from '../../src/sandbox/windows-sandbox-utils.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 import { spawnSync } from 'node:child_process'
@@ -2309,8 +2313,29 @@ describe('parseWindowsSandboxError', () => {
     expect(err).toBeInstanceOf(WindowsSandboxError)
     expect(err?.code).toBe('mapped_drive_cwd')
     expect(err?.subcommand).toBe('exec')
-    expect(err?.drive).toBe('Z:\\')
+    expect((err as MappedDriveCwdError).drive).toBe('Z:\\')
     expect(err?.message).toContain('DRIVE_REMOTE')
+  })
+
+  it('parses seclogon_disabled JSON line (srt-win exec exit 18)', () => {
+    const line = (state: string) =>
+      `{"code":"seclogon_disabled","state":"${state}","message":"the sandbox cannot start: seclogon is ${state}"}`
+    const err = parseWindowsSandboxError(
+      ['srt-win: launching runner', line('disabled'), ''].join('\r\n'),
+    )
+    expect(err).toBeInstanceOf(WindowsSandboxError)
+    expect(err?.code).toBe('seclogon_disabled')
+    expect(err?.subcommand).toBe('exec')
+    expect((err as SeclogonDisabledError).state).toBe('disabled')
+    expect(err?.message).toContain('seclogon is disabled')
+    expect(
+      (parseWindowsSandboxError(line('missing')) as SeclogonDisabledError)
+        .state,
+    ).toBe('missing')
+    // No message from srt-win → the actionable default.
+    expect(
+      parseWindowsSandboxError('{"code":"seclogon_disabled"}')?.message,
+    ).toMatch(/administrator must set its startup type to Manual/)
   })
 
   it('returns undefined when no typed-error line present', () => {

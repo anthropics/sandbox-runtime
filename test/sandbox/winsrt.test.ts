@@ -63,6 +63,7 @@ import {
   WindowsSandboxError,
   verifyWindowsWfpEgress,
   windowsTrustCa,
+  windowsTrustCaAsync,
   ensurePersistentWindowsCa,
   windowsStateDir,
   wrapCommandWithSandboxWindows,
@@ -82,6 +83,7 @@ import {
   type WindowsAclStampOptions,
   type WindowsFsAccessSet,
 } from '../../src/sandbox/windows-sandbox-utils.js'
+import type { SeclogonDisabledError } from '../../src/sandbox/windows-sandbox-utils.js'
 
 /**
  * Windows network-sandbox integration tests.
@@ -2419,6 +2421,133 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     const asynFail = await checkWindowsDependenciesAsync({ srtWin })
     expect(syncFail.errors[0]).toMatch(/user status failed/)
     expect(asynFail).toEqual(syncFail)
+  })
+
+  it('checkWindowsDependencies{,Async}: seclogon state → error / silent', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const withSeclogon = (seclogon: string | undefined) =>
+      JSON.stringify({ ...JSON.parse(RAW_USER), seclogon })
+    const run = async (seclogon: string | undefined) => {
+      stubSpawn(argv => ({
+        status: 0,
+        stdout: argv.includes('user') ? withSeclogon(seclogon) : RAW_WFP,
+      }))
+      const sync = checkWindowsDependencies({ srtWin })
+      const asyn = await checkWindowsDependenciesAsync({ srtWin })
+      expect(asyn).toEqual(sync)
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+      return sync
+    }
+
+    const disabled = await run('disabled')
+    expect(disabled.errors.length).toBe(1)
+    expect(disabled.errors[0]).toMatch(/Secondary Logon service.*is disabled/)
+    expect(disabled.errors[0]).toMatch(
+      /administrator must set its startup type to Manual/,
+    )
+    expect(disabled.warnings).toEqual([])
+
+    const missing = await run('missing')
+    expect(missing.errors.length).toBe(1)
+    expect(missing.errors[0]).toMatch(/Secondary Logon service.*not present/)
+
+    // Unreadable proves nothing: the launch itself is the ground truth.
+    expect(await run('cannot-read')).toEqual({ errors: [], warnings: [] })
+
+    expect(await run('ok')).toEqual({ errors: [], warnings: [] })
+    // Field absent: an srt-win built before the probe existed.
+    expect(await run(undefined)).toEqual({ errors: [], warnings: [] })
+    // A value this build does not know is not an opinion either.
+    expect(await run('starting')).toEqual({ errors: [], warnings: [] })
+  })
+
+  it('getWindowsSandboxUserStatus: seclogon passes through; absent stays absent', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    stubSpawn(() => ({
+      status: 0,
+      stdout: JSON.stringify({ ...JSON.parse(RAW_USER), seclogon: 'disabled' }),
+    }))
+    expect(getWindowsSandboxUserStatus({ srtWin }).seclogon).toBe('disabled')
+    spawnSyncSpy.mockRestore()
+    spawnSpy.mockRestore()
+    stubSpawn(() => ({ status: 0, stdout: RAW_USER }))
+    expect('seclogon' in getWindowsSandboxUserStatus({ srtWin })).toBe(false)
+  })
+
+  // `stubSpawn` has no stderr, so these stub spawnSync / spawn directly.
+  const SECLOGON_STDERR =
+    'srt-win: launching runner\n' +
+    '{"code":"seclogon_disabled","state":"disabled","message":"the sandbox cannot start: the Windows Secondary Logon service (seclogon) is disabled."}'
+  const stubSpawnResult = (status: number, stderr: string) => {
+    spawnSyncSpy = spyOn(child_process, 'spawnSync').mockImplementation(
+      (() => ({
+        status,
+        stdout: '',
+        stderr,
+        error: null,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      })) as any,
+    )
+    spawnSpy = spyOn(child_process, 'spawn').mockImplementation((() => {
+      // Close on a timer so the stderr chunk lands first.
+      const child = mkFakeChild('', status, 5)
+      setImmediate(() => child.stderr.emit('data', stderr))
+      return child
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any)
+  }
+  const thrownBy = async (fn: () => unknown): Promise<WindowsSandboxError> => {
+    try {
+      await fn()
+    } catch (e) {
+      return e as WindowsSandboxError
+    }
+    throw new Error('expected a throw')
+  }
+
+  it('verifyWindowsWfpEgress: exit 18 + typed stderr → seclogon_disabled, not wfp_verify_unparseable', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const verify = () =>
+      verifyWindowsWfpEgress({ target: '127.0.0.1:9', srtWin })
+    stubSpawnResult(18, SECLOGON_STDERR)
+    const e = await thrownBy(verify)
+    expect(e).toBeInstanceOf(WindowsSandboxError)
+    expect(e.code).toBe('seclogon_disabled')
+    expect(e.subcommand).toBe('wfp')
+    expect((e as SeclogonDisabledError).state).toBe('disabled')
+    expect(e.message).toMatch(
+      /Secondary Logon service \(seclogon\) is disabled/,
+    )
+    spawnSyncSpy.mockRestore()
+    spawnSpy.mockRestore()
+
+    // The exit code gates the parse; every shape still throws.
+    stubSpawnResult(1, SECLOGON_STDERR)
+    expect((await thrownBy(verify)).code).toBe('wfp_verify_unparseable')
+    spawnSyncSpy.mockRestore()
+    spawnSpy.mockRestore()
+    stubSpawnResult(18, 'srt-win: error: something else')
+    expect((await thrownBy(verify)).code).toBe('wfp_verify_unparseable')
+  })
+
+  it('windowsTrustCa{,Async}: exit 18 + typed stderr → seclogon_disabled', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    stubSpawnResult(18, SECLOGON_STDERR)
+    const sync = await thrownBy(() => windowsTrustCa('C:\\ca.pem', { srtWin }))
+    const asyn = await thrownBy(() =>
+      windowsTrustCaAsync('C:\\ca.pem', { srtWin }),
+    )
+    expect(sync.code).toBe('seclogon_disabled')
+    expect(sync.subcommand).toBe('user')
+    expect(asyn.code).toBe(sync.code)
+    expect(asyn.message).toBe(sync.message)
+    spawnSyncSpy.mockRestore()
+    spawnSpy.mockRestore()
+    stubSpawnResult(1, 'srt-win: error: CA install runner exited 1')
+    expect(
+      (await thrownBy(() => windowsTrustCa('C:\\ca.pem', { srtWin }))).code,
+    ).toBe('trust_ca_failed')
   })
 
   it('checkWindowsDependencies: an install of a newer setup version is not offered an upgrade', () => {

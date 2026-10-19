@@ -27,11 +27,13 @@
 //! the **user SID** only.
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, ERROR_PIPE_BUSY,
-    GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
+    ERROR_SERVICE_DISABLED, ERROR_SERVICE_DOES_NOT_EXIST, GENERIC_READ, HANDLE,
+    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
@@ -43,6 +45,12 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Pipes::{
     CreateNamedPipeW, CreatePipe, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_WAIT,
+};
+use windows::Win32::System::Services::{
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW,
+    QueryServiceStatus, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_DISABLED, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_TYPE, SERVICE_STATUS,
+    SERVICE_STATUS_CURRENT_STATE,
 };
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
@@ -123,6 +131,146 @@ fn cwd_drive_root(cwd: &str) -> Option<String> {
     }
     None
 }
+
+/// Readiness of the Secondary Logon service (`seclogon`) that every
+/// `CreateProcessWithLogonW` routes through, as `srt-win status` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SeclogonState {
+    /// Running, or stopped with a start type the SCM will demand-start.
+    Ok,
+    /// Start type is Disabled and the service is not running.
+    Disabled,
+    /// No `seclogon` service is registered on this machine.
+    Missing,
+    /// The SCM or the service could not be queried. Not proof of a problem:
+    /// the launch itself is the ground truth.
+    CannotRead,
+}
+
+/// A running service launches regardless of its start type (disabling does
+/// not stop it), so only "Disabled and known not to run" is `Disabled`; with
+/// the status unreadable, a Disabled start type is `CannotRead`.
+fn classify_seclogon(
+    start: SERVICE_START_TYPE,
+    current: Option<SERVICE_STATUS_CURRENT_STATE>,
+) -> SeclogonState {
+    match (start == SERVICE_DISABLED, current) {
+        (true, Some(SERVICE_RUNNING)) | (false, _) => SeclogonState::Ok,
+        (true, Some(_)) => SeclogonState::Disabled,
+        (true, None) => SeclogonState::CannotRead,
+    }
+}
+
+/// Whether a failed logon call is the Secondary Logon service being unusable:
+/// the probe says so, or the call failed with `ERROR_SERVICE_DISABLED` (which
+/// any service on the logon path can cause) and the probe did not read it `Ok`.
+fn logon_failure_is_seclogon(service_disabled_error: bool, state: SeclogonState) -> bool {
+    match state {
+        SeclogonState::Disabled | SeclogonState::Missing => true,
+        SeclogonState::Ok => false,
+        SeclogonState::CannotRead => service_disabled_error,
+    }
+}
+
+/// `SC_HANDLE` closed on drop.
+struct ScHandle(SC_HANDLE);
+
+impl Drop for ScHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseServiceHandle(self.0);
+        }
+    }
+}
+
+/// Read-only probe of the Secondary Logon service, using rights the stock
+/// service DACL grants every interactive user. Any failure to read is
+/// [`SeclogonState::CannotRead`].
+pub fn seclogon_state() -> SeclogonState {
+    let Ok(scm) = (unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) })
+    else {
+        return SeclogonState::CannotRead;
+    };
+    let scm = ScHandle(scm);
+    let svc = match unsafe {
+        OpenServiceW(
+            scm.0,
+            PCWSTR(wstr("seclogon").as_ptr()),
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS,
+        )
+    } {
+        Ok(h) => ScHandle(h),
+        Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => {
+            return SeclogonState::Missing;
+        }
+        Err(_) => return SeclogonState::CannotRead,
+    };
+    // Variable-length struct, documented maximum 8K bytes. `u64` elements
+    // keep the buffer aligned for the struct's pointers.
+    let mut buf = [0u64; 1024];
+    let mut needed = 0u32;
+    if unsafe {
+        QueryServiceConfigW(
+            svc.0,
+            Some(buf.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>()),
+            size_of_val(&buf) as u32,
+            &mut needed,
+        )
+    }
+    .is_err()
+    {
+        return SeclogonState::CannotRead;
+    }
+    let start = unsafe { (*buf.as_ptr().cast::<QUERY_SERVICE_CONFIGW>()).dwStartType };
+    // A failed status query leaves the start type alone to decide.
+    let mut st = SERVICE_STATUS::default();
+    let current = unsafe { QueryServiceStatus(svc.0, &mut st) }
+        .ok()
+        .map(|()| st.dwCurrentState);
+    classify_seclogon(start, current)
+}
+
+/// Typed error for [`spawn_runner`]: the Secondary Logon service is Disabled
+/// (`missing == false`) or not registered (`missing == true`).
+#[derive(Debug)]
+pub struct SeclogonDisabled {
+    pub missing: bool,
+}
+
+impl SeclogonDisabled {
+    /// The [`SeclogonState`] this error corresponds to.
+    pub fn state(&self) -> SeclogonState {
+        if self.missing {
+            SeclogonState::Missing
+        } else {
+            SeclogonState::Disabled
+        }
+    }
+}
+
+impl std::fmt::Display for SeclogonDisabled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.missing {
+            write!(
+                f,
+                "the sandbox cannot start: the Windows Secondary Logon \
+                 service (seclogon) is not present on this machine, and \
+                 every sandboxed launch goes through it.",
+            )
+        } else {
+            write!(
+                f,
+                "the sandbox cannot start: the Windows Secondary Logon \
+                 service (seclogon) is disabled. An administrator must \
+                 set its startup type to Manual (`sc.exe config \
+                 seclogon start= demand`).",
+            )
+        }
+    }
+}
+
+impl std::error::Error for SeclogonDisabled {}
 
 /// One pipe pair. The runner's end is inheritable; the broker's is not, or
 /// the runner's copy would keep the pipe open past its exit and hang the pump.
@@ -424,6 +572,13 @@ pub fn spawn_runner(
                 .unwrap_or_else(|| "<unknown>".into());
             return Err(MappedDriveCwd { drive }.into());
         }
+        let state = seclogon_state();
+        if logon_failure_is_seclogon(e.code() == ERROR_SERVICE_DISABLED.to_hresult(), state) {
+            return Err(SeclogonDisabled {
+                missing: state == SeclogonState::Missing,
+            }
+            .into());
+        }
         return Err(anyhow!(
             "CreateProcessWithLogonW({username}): {e} — ensure the \
              Secondary Logon service (seclogon) is running."
@@ -625,6 +780,60 @@ mod tests {
     use windows::Win32::System::Pipes::{
         GetNamedPipeInfo, ImpersonateNamedPipeClient, PIPE_SERVER_END,
     };
+    use windows::Win32::System::Services::{
+        SERVICE_AUTO_START, SERVICE_DEMAND_START, SERVICE_STOPPED,
+    };
+
+    #[test]
+    fn seclogon_disabled_only_when_not_running() {
+        use SeclogonState as S;
+        let stopped = Some(SERVICE_STOPPED);
+        let running = Some(SERVICE_RUNNING);
+        assert_eq!(classify_seclogon(SERVICE_DEMAND_START, stopped), S::Ok);
+        assert_eq!(classify_seclogon(SERVICE_AUTO_START, running), S::Ok);
+        assert_eq!(classify_seclogon(SERVICE_DISABLED, stopped), S::Disabled);
+        assert_eq!(classify_seclogon(SERVICE_DISABLED, None), S::CannotRead);
+        assert_eq!(classify_seclogon(SERVICE_DEMAND_START, None), S::Ok);
+        // Disabled after it was started: still launches until the service stops.
+        assert_eq!(classify_seclogon(SERVICE_DISABLED, running), S::Ok);
+    }
+
+    #[test]
+    fn logon_failure_is_seclogon_only_when_the_probe_agrees() {
+        use SeclogonState as S;
+        for service_disabled_error in [true, false] {
+            assert!(logon_failure_is_seclogon(
+                service_disabled_error,
+                S::Disabled
+            ));
+            assert!(logon_failure_is_seclogon(
+                service_disabled_error,
+                S::Missing
+            ));
+            assert!(!logon_failure_is_seclogon(service_disabled_error, S::Ok));
+        }
+        assert!(logon_failure_is_seclogon(true, S::CannotRead));
+        assert!(!logon_failure_is_seclogon(false, S::CannotRead));
+    }
+
+    #[test]
+    fn seclogon_state_json_values() {
+        let j = |s: SeclogonState| serde_json::to_value(s).unwrap();
+        assert_eq!(j(SeclogonState::Ok), "ok");
+        assert_eq!(j(SeclogonState::Disabled), "disabled");
+        assert_eq!(j(SeclogonState::Missing), "missing");
+        assert_eq!(j(SeclogonState::CannotRead), "cannot-read");
+    }
+
+    #[test]
+    fn seclogon_disabled_error_state_and_message() {
+        let d = SeclogonDisabled { missing: false };
+        assert_eq!(d.state(), SeclogonState::Disabled);
+        assert!(d.to_string().contains("startup type to Manual"));
+        let m = SeclogonDisabled { missing: true };
+        assert_eq!(m.state(), SeclogonState::Missing);
+        assert!(m.to_string().contains("not present"));
+    }
 
     /// The command ends with its session: whichever of the two ends
     /// first decides, the command when both have, and a holder that
