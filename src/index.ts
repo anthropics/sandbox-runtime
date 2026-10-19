@@ -87,6 +87,7 @@ export {
   forgetWindowsProfileRead,
   forgetWindowsProfileReadAsync,
   getWindowsProfileReadStatus,
+  getWindowsProfileReadStatusAsync,
   windowsProfileReadEnv,
   windowsProfileExclusionConflicts,
   windowsProfileGrantSkipReason,

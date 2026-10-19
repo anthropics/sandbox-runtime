@@ -45,6 +45,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'getDefaultWritePaths',
   'getSrtWinPath',
   'getWindowsProfileReadStatus',
+  'getWindowsProfileReadStatusAsync',
   'getWindowsSandboxCaCert',
   'getWindowsSandboxUserStatus',
   'getWindowsSandboxUserStatusAsync',

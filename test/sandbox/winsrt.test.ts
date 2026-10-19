@@ -473,17 +473,17 @@ async function bindOutOfRange(): Promise<BoundListener> {
 // pointed at the test runner's own executable so binary resolution
 // passes its existence check on non-Windows hosts.
 /**
- * Whether `argv` is one of the `srt-win` calls that can walk a tree,
- * which the library makes without blocking: `acl grant --persistent`,
- * `acl forget`, `profile forget`.
+ * Whether `argv` is one of the `srt-win` calls a session makes without
+ * blocking: `acl grant --persistent`, `acl forget`, `profile forget`,
+ * `profile status`.
  */
-function walksATree(argv: readonly string[]): boolean {
+function madeWithoutBlocking(argv: readonly string[]): boolean {
   const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
   return (
     (own[0] === 'acl' &&
       (own[1] === 'forget' ||
         (own[1] === 'grant' && own.includes('--persistent')))) ||
-    (own[0] === 'profile' && own[1] === 'forget')
+    (own[0] === 'profile' && (own[1] === 'forget' || own[1] === 'status'))
   )
 }
 
@@ -1377,6 +1377,22 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         env: {},
         paths: [],
       }),
+      spyOn(winUtils, 'getWindowsProfileReadStatusAsync').mockResolvedValue({
+        state: 'current',
+        capabilities: SRT_WIN_CAPABILITIES,
+        notGranted: [],
+        selfClosed: [],
+        unverifiable: [],
+        unprotected: [],
+        staleAllow: [],
+        replacedFiles: [],
+        extraExclusions: [],
+        exclusions: [],
+        ungrantedOnly: [],
+        counts: { containers: 0, granted: 0, files: 0, denied: 0 },
+        env: {},
+        paths: [],
+      }),
       // One call with all four lists, recorded as the grant and stamp it stands for.
       spyOn(winUtils, 'grantWindowsAclPersistent').mockImplementation(
         async o => {
@@ -1703,7 +1719,9 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     }))
     const srtWin = resolveSrtWin({ path: process.execPath })
     await verifyWindowsWfpEgress({ target, srtWin })
-    expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+    // Through the async spawn: a session start must not block the event loop.
+    expect(spawnSyncSpy.mock.calls).toHaveLength(0)
+    expect(spawnSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
       [
         SRT_WIN_DISPATCH_ARG1,
         'wfp',
@@ -1727,7 +1745,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       writeRoots: ['C:\\a', 'C:\\b'],
       srtWin,
     })
-    expect(spawnSyncSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
+    expect(spawnSpy.mock.calls.map((c: unknown[]) => c[1])).toEqual([
       [
         SRT_WIN_DISPATCH_ARG1,
         'wfp',
@@ -2297,7 +2315,8 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
         _exe: string,
         argv: readonly string[],
       ) => {
-        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
+        if (madeWithoutBlocking(argv))
+          return asyncChildAnsweredBySync(_exe, argv)
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -2672,7 +2691,8 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         _exe: string,
         argv: readonly string[],
       ) => {
-        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
+        if (madeWithoutBlocking(argv))
+          return asyncChildAnsweredBySync(_exe, argv)
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -5408,7 +5428,8 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         _exe: string,
         argv: readonly string[],
       ) => {
-        if (walksATree(argv)) return asyncChildAnsweredBySync(_exe, argv)
+        if (madeWithoutBlocking(argv))
+          return asyncChildAnsweredBySync(_exe, argv)
         const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
         asyncCalls.push([...own])
         const mkStream = () => {

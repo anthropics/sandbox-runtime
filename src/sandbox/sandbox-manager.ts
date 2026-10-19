@@ -89,6 +89,7 @@ import {
   type WindowsProfileGrantItem,
   type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
+  getWindowsProfileReadStatusAsync,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
   type WindowsAclRevokeResult,
@@ -1290,7 +1291,7 @@ async function initializeSteps(
       }
       windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
       if (u.profileGrant) {
-        const grant = getWindowsProfileReadStatus({ srtWin })
+        const grant = await getWindowsProfileReadStatusAsync({ srtWin })
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
             'profile_grant_outdated',

@@ -1236,9 +1236,9 @@ export async function getWindowsWfpStatusAsync(
  * fires at `ALE_AUTH_CONNECT` — before any packet leaves — so an
  * active fence yields WSAEACCES immediately and a missing fence lets
  * the connect through (the kernel completes the handshake against
- * the listening socket's backlog; no event-loop tick required, so
- * the synchronous `runSrtWin` is safe). Does not require elevation
- * and does not depend on any external host.
+ * the listening socket's backlog). The event loop stays live while
+ * `srt-win` runs. Does not require elevation and does not depend on
+ * any external host.
  *
  * `initialize()` calls this once per session, so a stale install
  * (sandbox user provisioned but filters since removed) fails closed
@@ -1301,7 +1301,7 @@ export async function verifyWindowsWfpEgress(
       '--write-restricted-token',
     ]
     for (const r of opts.writeRoots ?? []) verifyArgs.push('--write-root', r)
-    const r = runSrtWin(verifyArgs, {
+    const r = await runSrtWinAsync(verifyArgs, {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
     })
@@ -3120,6 +3120,22 @@ export function getWindowsProfileReadStatus(
   })
   // Asked while a grant or forget is running: the record is being
   // rewritten, and is not a run that was cut short.
+  if (raw.state === 'in_progress') {
+    throwIfRefusedBesideOthers(args, SRT_WIN_EXIT_PROFILE_BUSY, '')
+  }
+  return mapProfileStatus(raw)
+}
+
+/** Async twin of {@link getWindowsProfileReadStatus}: the event loop stays live. */
+export async function getWindowsProfileReadStatusAsync(
+  opts: { paths?: boolean; srtWin?: SrtWinSpawn } = {},
+): Promise<WindowsProfileGrantStatus> {
+  const args = ['profile', 'status']
+  if (opts.paths) args.push('--paths')
+  const raw = await runSrtWinJsonAsync<RawProfileStatus>(args, {
+    timeoutMs: 30_000,
+    srtWin: opts.srtWin,
+  })
   if (raw.state === 'in_progress') {
     throwIfRefusedBesideOthers(args, SRT_WIN_EXIT_PROFILE_BUSY, '')
   }
