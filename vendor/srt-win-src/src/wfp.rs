@@ -504,13 +504,11 @@ fn add_filter(
 // with no `G:`. The group's value is irrelevant to DACL
 // evaluation; LS is just a stable, always-present principal.
 
-/// SDDL for the BLOCK filter — ALLOW `<sandbox_user_sid>`. Matches
-/// iff the connecting token carries that SID **enabled**, which for
-/// a *user* SID means "is that user". The broker, services, and
-/// every other process carry a different user SID → no match → fall
-/// through to default-permit.
+/// SDDL for the sandbox-user BLOCK filter: ALLOW `<sandbox_user_sid>`
+/// (matches iff the token IS that user), plus ALLOW for the two
+/// all-packages SIDs, which an AppContainer token's check also needs.
 pub fn sddl_sandbox_user(sid: &str) -> String {
-    format!("O:LSG:LSD:(A;;CC;;;{sid})")
+    format!("O:LSG:LSD:(A;;CC;;;{sid})(A;;CC;;;S-1-15-2-1)(A;;CC;;;S-1-15-2-2)")
 }
 
 /// Install (or refresh) the user-SID-keyed filter set under
@@ -785,6 +783,17 @@ mod tests {
         let sd = OwnedSd::from_sddl(&sddl_sandbox_user("S-1-5-32-545")).expect("sddl");
         assert!(!sd.ptr.0.is_null());
         assert!(sd.len > 0);
+    }
+
+    #[test]
+    fn sandbox_user_sddl_carries_both_package_aces() {
+        let s = sddl_sandbox_user("S-1-5-21-1-2-3-1005");
+        assert!(s.contains("(A;;CC;;;S-1-5-21-1-2-3-1005)"));
+        assert!(s.contains("(A;;CC;;;S-1-15-2-1)"));
+        assert!(s.contains("(A;;CC;;;S-1-15-2-2)"));
+        // ALLOW only: a DENY ACE in a match descriptor would invert
+        // which tokens the filter applies to.
+        assert!(!s.contains("(D;"));
     }
 
     #[test]
