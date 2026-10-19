@@ -120,6 +120,63 @@ describe('mux-proxy first-byte dispatch', () => {
     expect([errors, hadError]).toEqual([[], false])
   })
 
+  it.skipIf(process.platform === 'win32')(
+    'answers 502, with the reason, where the backend cannot be dialled',
+    async () => {
+      mux.removeBackendSocketSync()
+      const reply = await send(
+        Buffer.from('CONNECT x:443 HTTP/1.1\r\nHost: x:443\r\n\r\n'),
+      )
+      expect(reply.toString()).toBe(
+        'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n' +
+          'mux backend dial failed (ENOENT)\n',
+      )
+    },
+  )
+
+  it.each([
+    // Whether a backend that goes away shows here as an error at all is the
+    // platform's. On Linux a write fails first, and it does. On macOS and
+    // Windows this client is just closed, so the case would tell nothing.
+    ...(process.platform === 'linux'
+      ? [['', 'HTTP/1.1 502 Bad Gateway\r\n']]
+      : []),
+    ['HTTP/1.1 200 Connection Established\r\n\r\n', ''],
+  ])(
+    'a backend that fails having answered %p: the mux adds %p',
+    async (answer, added) => {
+      httpStub.removeAllListeners('connect')
+      httpStub.on('connect', (_req, sock) => {
+        sock.on('error', () => {})
+        sock.resume()
+        if (answer !== '') sock.write(answer)
+        setTimeout(() => sock.destroy(), 50)
+      })
+      for (let n = 0; n < 5; n++) {
+        const reply = await new Promise<string>(resolve => {
+          let text = ''
+          // Still sending when the backend goes: the write that fails then
+          // is the error.
+          const chunk = Buffer.alloc(64 << 10)
+          const pump = (): void => {
+            while (!c.destroyed && c.writable && c.write(chunk));
+          }
+          const c = connect(port, '127.0.0.1', () => {
+            c.write('CONNECT x:443 HTTP/1.1\r\nHost: x:443\r\n\r\n')
+            pump()
+          })
+          c.on('drain', pump)
+          c.on('error', () => {})
+          c.on('data', d => (text += d.toString('latin1')))
+          c.on('close', () => resolve(text))
+        })
+        expect(reply.slice(0, answer.length)).toBe(answer)
+        expect(reply.slice(answer.length).slice(0, added.length)).toBe(added)
+        if (added === '') expect(reply).toBe(answer)
+      }
+    },
+  )
+
   it('routes a TLS ClientHello first byte (0x16) to HTTP, not SOCKS', async () => {
     // Not a valid HTTP request — the backend will 400 it — but the point
     // is it must NOT be treated as SOCKS.

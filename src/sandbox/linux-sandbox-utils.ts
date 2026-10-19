@@ -254,13 +254,11 @@ function resolveSymlinkedDenyPath(
 }
 
 /**
- * Check if any existing component in the path is a file (not a directory).
- * If so, the target path can never be created because you can't mkdir under a file.
- *
- * This handles the git worktree case: .git is a file, so .git/hooks can never
- * exist and there's nothing to deny.
+ * The first existing component of the path that is not a directory, if there
+ * is one. Nothing can be created below it for as long as it is there: a git
+ * worktree's `.git` is a file, so there is no `.git/hooks`.
  */
-function hasFileAncestor(targetPath: string): boolean {
+function fileOnTheWay(targetPath: string): string | undefined {
   const parts = targetPath.split(path.sep)
   let currentPath = ''
 
@@ -268,11 +266,7 @@ function hasFileAncestor(targetPath: string): boolean {
     if (!part) continue // Skip empty parts (leading /)
     const nextPath = currentPath + path.sep + part
     try {
-      const stat = fs.statSync(nextPath)
-      if (stat.isFile()) {
-        // This component exists as a file — nothing below it can be created
-        return true
-      }
+      if (!fs.statSync(nextPath).isDirectory()) return nextPath
     } catch {
       // Path doesn't exist — stop checking
       break
@@ -280,7 +274,7 @@ function hasFileAncestor(targetPath: string): boolean {
     currentPath = nextPath
   }
 
-  return false
+  return undefined
 }
 
 /**
@@ -307,8 +301,19 @@ function findFirstNonExistentComponent(targetPath: string): string {
   return targetPath // Shouldn't reach here if called correctly
 }
 
-/** What bubblewrap makes on the host to mount a placeholder on. */
-type MountPointKind = 'file' | 'directory'
+/** What the placeholder for an absent deny path is mounted on. */
+enum MountPointKind {
+  /** A file made on the host for it, which /dev/null goes on. */
+  File = 'file',
+  /** A directory made on the host for it, which an empty one goes on. */
+  Directory = 'directory',
+  /** The file above the path, which goes on itself. Nothing is made. */
+  Held = 'held',
+  /** None can be made. Nothing is mounted; what lies above is still pinned. */
+  Unmakeable = 'unmakeable',
+}
+/** The kinds that are made on the host. */
+type MadeMountPointKind = MountPointKind.File | MountPointKind.Directory
 
 /** open(2)'s O_PATH on x86-64 and arm64; node:fs does not name it. Where the
  * bit means something else the open is an ordinary one or fails, and a failure
@@ -320,16 +325,17 @@ const V9FS_MAGIC = 0x01021997
 /**
  * The kind of mount point that can be made at `dest`, an absent path whose
  * parent is there: `wanted`, a directory where only a file is refused, or
- * none. bubblewrap makes it on the host as this user, before the command runs,
- * and exits if it cannot.
+ * unmakeable. bubblewrap makes it on the host as this user, before the command
+ * runs, and exits if it cannot.
  *
- * None only where the refusal is not this user's to lift, so that the command
- * cannot create `dest` either; `wanted` on any doubt (see mountPointFor).
+ * Unmakeable only where the refusal is not this user's to lift, so that the
+ * command cannot create `dest` either; `wanted` on any doubt (see
+ * mountPointFor).
  */
 function makeableMountPoint(
   dest: string,
-  wanted: MountPointKind,
-): MountPointKind | undefined {
+  wanted: MadeMountPointKind,
+): MadeMountPointKind | MountPointKind.Unmakeable {
   /** The errno `attempt` is refused with. Any other failure is a doubt. */
   const refusalOf = (attempt: () => void): string | undefined => {
     try {
@@ -366,7 +372,7 @@ function makeableMountPoint(
       return refusal === undefined ||
         (refusal === 'EACCES' && uid === process.geteuid?.())
         ? wanted
-        : undefined
+        : MountPointKind.Unmakeable
     }
 
     // On a Windows drive the Windows ACL decides, and nothing on this side
@@ -376,21 +382,21 @@ function makeableMountPoint(
     if (refusal === undefined) {
       const entry = `${parent}/${path.basename(dest)}`
       if (
-        wanted === 'file' &&
+        wanted === MountPointKind.File &&
         refusalOf(() => fs.closeSync(fs.openSync(entry, 'wx', 0o444))) ===
           undefined
       ) {
-        return 'file'
+        return MountPointKind.File
       }
       if (refusalOf(() => fs.mkdirSync(entry)) === undefined) {
-        return 'directory'
+        return MountPointKind.Directory
       }
     }
     // The name may be refused for a reason that passes. The folder is beyond
     // this user when it may not even be given the mode it has.
     return refusalOf(() => fs.chmodSync(parent, mode & 0o7777)) === undefined
       ? wanted
-      : undefined
+      : MountPointKind.Unmakeable
   } catch {
     return wanted
   } finally {
@@ -398,10 +404,35 @@ function makeableMountPoint(
   }
 }
 
+/** What the `.git` of a directory is, and so what is denied there. */
+enum DotGitKind {
+  /** A repository: its hooks and config are denied. */
+  Directory = 'directory',
+  /**
+   * The pointer of a worktree or a submodule ("gitdir: /path/..."). There are
+   * no .git/hooks for as long as it is a file, so the file is denied, which
+   * keeps it one.
+   */
+  File = 'file',
+  /** Nothing is denied: a mount at .git would keep `git init` from making it. */
+  Absent = 'absent',
+}
+
+function dotGitKindAt(dotGitPath: string): DotGitKind {
+  try {
+    return fs.statSync(dotGitPath).isDirectory()
+      ? DotGitKind.Directory
+      : DotGitKind.File
+  } catch {
+    return DotGitKind.Absent
+  }
+}
+
 /**
  * The part of the mandatory deny set that follows from the cwd alone: the
  * dangerous files and directories resolved against it, plus `.git/hooks` and
- * (unless the caller allows git config) `.git/config`.
+ * (unless the caller allows git config) `.git/config`, or a `.git` that is a
+ * file.
  * {@link linuxGetMandatoryDenyPaths} adds the nested matches its ripgrep scan
  * finds on top of these. Split out so a consumer that must not scan — the
  * violation monitor, which needs the same denies to judge a write bwrap
@@ -419,20 +450,15 @@ export function linuxGetCwdMandatoryDenyPaths(
     ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
   ]
 
-  // Git hooks and config are only denied when .git exists as a directory.
-  // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
-  // .git/hooks can never exist — denying it would cause bwrap to fail.
-  // When .git doesn't exist at all, mounting at .git would block its
-  // creation and break git init.
+  // Only the cwd's own: a .git file below it is git's to rewrite and remove
+  // (a checkout that recurses into submodules does).
   const dotGitPath = path.resolve(cwd, '.git')
-  let dotGitIsDirectory = false
-  try {
-    dotGitIsDirectory = fs.statSync(dotGitPath).isDirectory()
-  } catch {
-    // .git doesn't exist
-  }
+  const dotGit = dotGitKindAt(dotGitPath)
 
-  if (dotGitIsDirectory) {
+  if (dotGit === DotGitKind.File) {
+    denyPaths.push(dotGitPath)
+  }
+  if (dotGit === DotGitKind.Directory) {
     // Git hooks always blocked for security
     denyPaths.push(path.resolve(cwd, '.git/hooks'))
 
@@ -1774,10 +1800,18 @@ function buildSandboxCommand(
   // dropped, and tried again after 1 s, then 2 s, 4 s and so on: of a package
   // installer's burst, some wait for a minute. The kernel caps the number.
   const listen = 'fork,reuseaddr,backlog=4096'
+  // Which family a plain TCP-LISTEN takes is socat's choice, and differs by
+  // version. One that takes IPv6 exits at once on a kernel that has none, and
+  // nothing listens; one that takes IPv4 refuses a client to which `localhost`
+  // is ::1 and that tries no second address. So the family is named: IPv6 with
+  // IPv4 mapped in, which serves both, and IPv4 alone where that fails.
+  const relay = (port: number, socketPath: string): string =>
+    `{ ${socat} TCP6-LISTEN:${port},ipv6only=0,${listen} UNIX-CONNECT:${socketPath} || ` +
+    `exec ${socat} TCP4-LISTEN:${port},${listen} UNIX-CONNECT:${socketPath}; } >/dev/null 2>&1 &`
   const socatCommands = [
-    `${socat} TCP-LISTEN:3128,${listen} UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+    relay(3128, httpSocketPath),
     '_srt_http=$!',
-    `${socat} TCP-LISTEN:1080,${listen} UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+    relay(1080, socksSocketPath),
     '_srt_socks=$!',
     // The trap saves the status the script is exiting with and exits with
     // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
@@ -2774,20 +2808,18 @@ async function generateFilesystemArgs(
     const decidedMountPoints = new Set<string>()
     const decidedMountPointOver = (p: string): string | undefined =>
       [p, ...properAncestors(p)].find(at => decidedMountPoints.has(at))
+    type Placeholder = { dest: string; kind: MountPointKind }
     /**
      * The placeholder an absent deny path adds to the plan: where, which is
-     * its first missing component, and the kind of mount point bubblewrap
-     * makes for it on the host. `kind` is undefined where none can be made,
-     * and the whole answer where the path adds nothing.
+     * its first missing component or the file above it, and on what kind of
+     * mount point. Undefined where the path adds nothing.
      *
      * INVARIANT: a placeholder is left out only where the sandboxed command
      * cannot create the path either; each branch says why it cannot. On any
      * doubt the placeholder stays: at worst bubblewrap cannot make its mount
      * point and nothing starts, which loses no deny.
      */
-    const mountPointFor = (
-      absentPath: string,
-    ): { dest: string; kind: MountPointKind | undefined } | undefined => {
+    const mountPointFor = (absentPath: string): Placeholder | undefined => {
       const none = (why: string): undefined => {
         logForDebugging(
           `[Sandbox Linux] No placeholder for non-existent deny path ${absentPath}: ${why}`,
@@ -2819,12 +2851,27 @@ async function generateFilesystemArgs(
       ) {
         return none('it is read-only there')
       }
-      // Nothing can be created under a file: a git worktree's .git is one.
+      // Nothing can be created under a file (a git worktree's .git is one),
+      // for as long as the file is there. So it is kept there, where the
+      // command may write the directory that holds it. Where it may write the
+      // file alone, that stays where it is and writable. It is not tracked
+      // for removal: it is the caller's own, or another sandbox's mount point.
       // Asked of what lies above the path, not of the path: another sandbox's
       // bubblewrap may have made a mount point at it since it was found
       // absent, and a file there is no reason to leave it unbound.
-      if (hasFileAncestor(path.dirname(absentPath))) {
-        return none('a file lies above it')
+      const file = fileOnTheWay(path.dirname(absentPath))
+      if (file !== undefined) {
+        if (seenDenyWrite.has(file)) return none(`${file} is denied itself`)
+        if (
+          !uncoveredWritePaths.some(allowedPath =>
+            isAtOrUnder(path.dirname(file), allowedPath),
+          )
+        ) {
+          return none(`${file} is a file, in a directory that is read-only`)
+        }
+        seenDenyWrite.add(file)
+        decidedMountPoints.add(file)
+        return { dest: file, kind: MountPointKind.Held }
       }
 
       // A component with a deny path beneath it is covered by an empty
@@ -2835,9 +2882,11 @@ async function generateFilesystemArgs(
       decidedMountPoints.add(dest)
       const kind = makeableMountPoint(
         dest,
-        denyPathAncestors.has(dest) ? 'directory' : 'file',
+        denyPathAncestors.has(dest)
+          ? MountPointKind.Directory
+          : MountPointKind.File,
       )
-      if (kind === undefined) {
+      if (kind === MountPointKind.Unmakeable) {
         // The directories above it are pinned all the same: a command that
         // may write one of THEM could otherwise move the refusing one aside.
         unmakeableDenyDests.add(dest)
@@ -2850,6 +2899,20 @@ async function generateFilesystemArgs(
         registerExitCleanupHandler()
       }
       return { dest, kind }
+    }
+    /** What goes on it. The empty directory is made when first asked for. */
+    const mountSourceFor = ({ dest, kind }: Placeholder): string => {
+      switch (kind) {
+        case MountPointKind.Held:
+          return dest
+        case MountPointKind.Directory:
+          return (emptySource ??= ensureEmptyMountSourceDir())
+        case MountPointKind.File:
+          return '/dev/null'
+        case MountPointKind.Unmakeable:
+          // Never mounted: unmakeableDenyDests keeps it out of what is emitted.
+          return '/dev/null'
+      }
     }
     for (const [index, pathPattern] of denyPaths.entries()) {
       if (index === configuredDenyPaths.length) {
@@ -2937,24 +3000,17 @@ async function generateFilesystemArgs(
         const placeholder = mountPointFor(normalizedPath)
         if (placeholder !== undefined) {
           const { dest, kind } = placeholder
-          denyWriteArgs.push(
-            '--ro-bind',
-            kind === 'directory'
-              ? (emptySource ??= ensureEmptyMountSourceDir())
-              : '/dev/null',
-            dest,
-          )
+          const source = mountSourceFor(placeholder)
+          denyWriteArgs.push('--ro-bind', source, dest)
           // The first of the denies that share the destination. The record is
           // purely additive: it only gives the tmpfs and mask comparisons
           // below a second spelling to test, and `dest` itself is always
           // tested.
           denyWriteRawDests.set(dest, rawPath)
           logForDebugging(
-            kind === undefined
+            kind === MountPointKind.Unmakeable
               ? `[Sandbox Linux] No mount point at ${dest}, which neither bubblewrap nor the command can create, for ${normalizedPath}`
-              : `[Sandbox Linux] Mounted ${
-                  kind === 'directory' ? 'empty dir' : '/dev/null'
-                } at ${dest} to block creation of ${normalizedPath}`,
+              : `[Sandbox Linux] Mounted ${source} at ${dest} to block creation of ${normalizedPath}`,
           )
         }
         continue

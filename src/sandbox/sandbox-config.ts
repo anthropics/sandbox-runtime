@@ -779,7 +779,7 @@ export const NetworkConfigSchema = z.object({
         'request is denied. Applies to plain HTTP through the proxy and, ' +
         'when tlsTerminate is configured, to terminated HTTPS. SRT does not ' +
         'provide a policy language; library consumers own matching. This and ' +
-        'the four options after it are read when the proxy starts; ' +
+        'the five options after it are read when the proxy starts; ' +
         'updateConfig does not change them.',
     ),
   allowPlaintextHeaderSet: z
@@ -818,6 +818,21 @@ export const NetworkConfigSchema = z.object({
         'absolute-form authority does not name the host and port it is sent ' +
         'to, before filterRequest is asked. Refusals are recorded as ' +
         'violations.',
+    ),
+  ambiguousRequestTarget: z
+    .enum(['refuse', 'asSpelled', 'normalize'])
+    .optional()
+    .describe(
+      'While filterRequest is set: what becomes of a request whose target ' +
+        'names another path once normalized than as the client spelled it ' +
+        '(a dot segment, "%2e" included, leading slashes or "\\"), so that ' +
+        'the upstream may act on another resource than the callback judged. ' +
+        '"refuse" (default): 400 before filterRequest is asked, recorded as ' +
+        'a violation. "asSpelled": forwarded as spelled; the callback has to ' +
+        'hold for every reading of it, and gets requestTarget, ' +
+        'normalizedRequestTarget and requestTargetIsAmbiguous. "normalize": ' +
+        'forwarded normalized, which breaks a signature over the path and ' +
+        'names another resource to an upstream that takes the path literally.',
     ),
   tlsTerminate: z
     .object({
