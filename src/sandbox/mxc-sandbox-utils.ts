@@ -63,26 +63,33 @@
  *     (BaseContainer has no write-only deny primitive, so reads on
  *     those paths are lost as well). Fail-closed direction; refine
  *     after hardware verification.
- *   - network: egress blocked, `proxy: {localhost: <mux port>}` as
- *     the sole escape; srt's proxy does the domain filtering exactly
- *     as on macOS/Linux. OPEN (manual test #1): MXC's GA model scopes
- *     the loopback exemption to a proxy CONTAINER's SID
- *     (`allowedPeers`) — whether the OS-applied policy lets the child
- *     reach our plain host-process listener is unverified.
+ *   - network: `egress.default: 'deny'`; with a proxy configured,
+ *     `ingress.default: 'allow'` + `ingress.hostLoopback: 'allow'`
+ *     and `runtimeConfig.networkProxy` naming the mux port as the
+ *     sole escape — MXC 1.0's identity-less host-proxy posture (no
+ *     `processContainer.network.allowedProxyPeer`). hostLoopback is
+ *     resolved on its own in 1.0 (it no longer inherits from
+ *     `ingress.default`), so every branch sets it explicitly. srt's
+ *     proxy does the domain filtering exactly as on macOS/Linux.
+ *     OPEN (manual test #1): whether the OS-applied policy lets the
+ *     child reach our plain host-process listener is unverified.
  *
  * ── Spawn contract ──────────────────────────────────────────────────
  *
  * Same as srt-win: {@link wrapCommandWithSandboxMxc} returns
  * `{argv, env}` for the CALLER to spawn with `shell: false`. The argv
- * is `wxc-exec.exe --config-base64 <base64(ContainerConfig JSON)>` —
- * the SDK is used only as the policy→config compiler
- * (`buildSandboxPayload`) and the vehicle that ships the signed
- * runner. MXC takes ONE `process.commandLine` string that wxc-exec
+ * is `wxc-exec.exe --config-base64 <base64(OneShotRequest JSON)>` —
+ * srt compiles the exact MXC 1.0.0 one-shot request itself
+ * ({@link buildMxcContainerConfig}); the SDK package is only the
+ * vehicle that ships the signed runner (its 1.x Node API builds and
+ * runs requests in-process and has no compile-only entry point).
+ * MXC takes ONE `process.commandLine` string that wxc-exec
  * re-parses MSVCRT-style, so {@link joinWindowsCommandLine} re-encodes
  * srt's discrete argv with the standard CreateProcess quoting
  * algorithm.
  */
 
+import { randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import * as path from 'node:path'
 import { existsSync } from 'node:fs'
@@ -97,90 +104,63 @@ import type { WindowsBinShell } from './windows-sandbox-utils.js'
 import type { MxcConfig } from './sandbox-config.js'
 
 // ────────────────────────────────────────────────────────────────────────
-// Structural subset of @microsoft/mxc-sdk@0.9 that srt actually uses.
+// Exact MXC 1.0.0 one-shot request — the subset srt emits.
 //
-// The SDK is an optionalDependency (Windows-only, ~40 MB with
-// the bundled runners) loaded via dynamic import, so its types cannot
-// be `import type`d unconditionally on macOS/Linux dev machines. These
-// interfaces mirror sdk/node/src/types.ts for policy version
-// 0.9.0-alpha; keep them in step with the pinned SDK minor.
+// `@microsoft/mxc-sdk` 1.x has no compile-only `buildSandboxPayload`:
+// its `@microsoft/mxc-sdk/v1` API builds the request and runs it
+// in-process. srt spawns `wxc-exec.exe` itself (the child env must be
+// sealed, see `buildChildEnv`), so it emits the wire request directly.
+// These interfaces mirror the SDK's generated
+// `sdk/node/src/generated/v1_0_0/wire.ts` (`OneShotRequest`) and the
+// shape its `prepareOneShotRequest` sends for `containment: 'process'`;
+// keep them in step with the pinned SDK major.
 // ────────────────────────────────────────────────────────────────────────
 
 /** MXC config schema version srt targets. See SDK Compatibility table. */
-export const MXC_POLICY_VERSION = '0.9.0-alpha'
+export const MXC_POLICY_VERSION = '1.0.0'
 
-/** Mirrors @microsoft/mxc-sdk `SandboxPolicy` (fields srt sets). */
-export interface MxcSandboxPolicy {
+/** Directional network policy (MXC 1.0: both axes deny when omitted). */
+export interface MxcNetworkPolicy {
+  egress?: { default?: 'allow' | 'deny' }
+  ingress?: {
+    default?: 'allow' | 'deny'
+    /** Resolved independently of `default` in 1.0 — always set it. */
+    hostLoopback?: 'allow' | 'deny'
+  }
+}
+
+/**
+ * Mirrors the slice of the MXC 1.0.0 `OneShotRequest` srt emits. The
+ * wire contract carries more (processContainer, wslc, telemetry, …)
+ * that srt never sets.
+ */
+export interface MxcContainerConfig {
   version: string
+  containerId?: string
+  containment?: 'process'
+  lifecycle?: { destroyOnExit?: boolean; preservePolicy?: boolean }
+  process: {
+    commandLine: string
+    cwd?: string
+    env?: string[]
+    /** Milliseconds; 0 = no timeout. */
+    timeout?: number
+  }
   filesystem?: {
     readwritePaths?: string[]
     readonlyPaths?: string[]
     deniedPaths?: string[]
   }
-  network?: {
-    egress?: { default?: 'allow' | 'deny' }
-    ingress?: {
-      default?: 'allow' | 'deny'
-      hostLoopback?: 'allow' | 'deny'
-    }
-  }
+  network?: MxcNetworkPolicy
   runtimeConfig?: { networkProxy?: string }
-  ui?: { allowWindows?: boolean }
-  timeoutMs?: number
-}
-
-/**
- * Mirrors the slice of @microsoft/mxc-sdk `ContainerConfig` we touch.
- * `process` is required because `createConfigFromPolicy` always builds
- * it; the SDK's own type marks it optional only for hand-written
- * configs. The runtime object carries more fields (processContainer,
- * network, ui, …) that pass through JSON.stringify untyped.
- */
-export interface MxcContainerConfig {
-  version: string
-  containment?: string
-  process: { commandLine: string; cwd?: string; env?: string[] }
-  network?: {
-    egress?: { default?: 'allow' | 'deny' }
-    ingress?: {
-      default?: 'allow' | 'deny'
-      hostLoopback?: 'allow' | 'deny'
-    }
+  ui?: {
+    disable?: boolean
+    clipboard?: 'none' | 'read' | 'write' | 'all'
+    injection?: boolean
   }
-  runtimeConfig?: { networkProxy?: string }
-}
-
-/** The SDK entry point srt calls. */
-export interface MxcSdk {
-  buildSandboxPayload(
-    script: string,
-    policy: MxcSandboxPolicy,
-    workingDirectory?: string,
-    containerName?: string,
-    containment?: string,
-  ): MxcContainerConfig
 }
 
 const MXC_PKG = '@microsoft/mxc-sdk'
-
-let mxcSdkPromise: Promise<MxcSdk> | undefined
-
-/**
- * Lazily load the optional `@microsoft/mxc-sdk`. Cached for the
- * process. Absence is NOT an error at the selection layer (it just
- * means srt-win); callers that reach this after selection picked mxc
- * get the raw import error.
- */
-export function loadMxcSdk(): Promise<MxcSdk> {
-  mxcSdkPromise ??= import(MXC_PKG).then(
-    m => m as unknown as MxcSdk,
-    (e: unknown) => {
-      mxcSdkPromise = undefined
-      throw e
-    },
-  )
-  return mxcSdkPromise
-}
 
 // ────────────────────────────────────────────────────────────────────────
 // Binary resolution
@@ -438,18 +418,16 @@ export interface MxcSandboxParams {
 }
 
 /**
- * Compile srt semantics into an MXC ContainerConfig via the SDK.
- * Separated from the wrap so `initialize()` can compile the session
- * policy once for the `--probe` selection call. `proxyEnv` lets the
- * wrap share one `generateProxyEnvVars` result between the child env
- * and the broker spawn env; omitted (probe path) it is computed here.
+ * Compile srt semantics into an MXC 1.0.0 one-shot request. Separated
+ * from the wrap so `initialize()` can compile the session policy once
+ * for the `--probe` selection call. `proxyEnv` lets the wrap share one
+ * `generateProxyEnvVars` result between the child env and the broker
+ * spawn env; omitted (probe path) it is computed here.
  */
-export async function buildMxcContainerConfig(
+export function buildMxcContainerConfig(
   p: MxcSandboxParams,
   proxyEnv?: readonly string[],
-): Promise<MxcContainerConfig> {
-  const sdk = await loadMxcSdk()
-
+): MxcContainerConfig {
   const systemDrive = `${process.env.SystemDrive ?? 'C:'}\\`
   const workingDirectory = p.cwd ?? process.cwd()
   const readonlyPaths = [systemDrive, workingDirectory, ...(p.allowRead ?? [])]
@@ -460,56 +438,65 @@ export async function buildMxcContainerConfig(
   ]
   const deniedPaths = [...(p.denyRead ?? []), ...(p.denyWrite ?? [])]
 
-  const policy: MxcSandboxPolicy = {
+  const sh = p.binShell ?? parseWindowsBinShell(undefined)
+  const commandLine = buildShellCommandLine(sh, p.command)
+  const hasProxy = p.httpProxyPort !== undefined
+
+  return {
     version: MXC_POLICY_VERSION,
+    // What the SDK's own adapter sends: a random id the runtime names
+    // the container after, and the one-shot lifecycle.
+    containerId: randomBytes(16).toString('hex'),
+    // 'process' is the ABSTRACT intent — wxc-exec resolves it per host
+    // (BaseContainer on the hosts selection admits).
+    containment: 'process',
+    lifecycle: { destroyOnExit: true, preservePolicy: false },
+    process: {
+      commandLine,
+      cwd: workingDirectory,
+      env: buildChildEnv(
+        p,
+        proxyEnv ??
+          generateProxyEnvVars(
+            p.httpProxyPort,
+            p.socksProxyPort,
+            p.caCertPath?.replace(/\\/g, '/'),
+            p.proxyAuthToken,
+          ),
+      ),
+      timeout: p.timeoutMs ?? 0,
+    },
     filesystem: { readonlyPaths, readwritePaths, deniedPaths },
     network: {
       egress: { default: 'deny' },
-      ingress:
-        p.httpProxyPort !== undefined
-          ? { default: 'allow', hostLoopback: 'allow' }
-          : { default: 'deny', hostLoopback: 'deny' },
+      // MXC 1.0 resolves hostLoopback on its own (no inheritance from
+      // ingress.default), and admits a host proxy that carries no
+      // allowedProxyPeer identity only with hostLoopback 'allow' plus
+      // ingress 'allow' for a ProcessContainer. Without a proxy both
+      // axes deny — stated, not left to the omitted-means-deny rule.
+      ingress: hasProxy
+        ? { default: 'allow', hostLoopback: 'allow' }
+        : { default: 'deny', hostLoopback: 'deny' },
     },
-    runtimeConfig:
-      p.httpProxyPort !== undefined
-        ? {
+    ...(hasProxy
+      ? {
+          runtimeConfig: {
             networkProxy: `http://${
               p.proxyAuthToken ? `srt:${p.proxyAuthToken}@` : ''
             }127.0.0.1:${p.httpProxyPort}`,
-          }
-        : undefined,
+          },
+        }
+      : {}),
     // Shells need UI: upstream documents that PowerShell (5.1 and 7)
-    // fails at startup under `ui.allowWindows: false` because of
-    // win32k calls. cmd.exe is fine either way.
-    ui: { allowWindows: isPowerShell(p.binShell) },
-    timeoutMs: p.timeoutMs,
+    // fails at startup with UI disabled because of win32k calls.
+    // cmd.exe is fine either way. Clipboard and input injection stay
+    // denied, as the SDK adapter defaults them.
+    ui: {
+      disable: !isPowerShell(p.binShell),
+      clipboard: 'none',
+      injection: false,
+    },
   }
-
-  const sh = p.binShell ?? parseWindowsBinShell(undefined)
-  const commandLine = buildShellCommandLine(sh, p.command)
-
-  // 'process' is the ABSTRACT intent — the only spelling the SDK's
-  // config compiler accepts (it resolves per-platform itself; the
-  // concrete 'processcontainer' name is understood by wxc-exec's
-  // parser but throws in createConfigFromPolicy).
-  const cfg = sdk.buildSandboxPayload(
-    commandLine,
-    policy,
-    workingDirectory,
-    undefined,
-    'process',
-  )
-  cfg.process.env = buildChildEnv(
-    p,
-    proxyEnv ??
-      generateProxyEnvVars(
-        p.httpProxyPort,
-        p.socksProxyPort,
-        p.caCertPath?.replace(/\\/g, '/'),
-        p.proxyAuthToken,
-      ),
-  )
-  return cfg
 }
 
 /**
@@ -588,7 +575,7 @@ function buildChildEnv(
   return Object.entries(merged).map(([k, v]) => `${k}=${v}`)
 }
 
-/** Serialize a ContainerConfig for `--config-base64`. */
+/** Serialize the one-shot request for `--config-base64`. */
 export function encodeMxcConfig(cfg: MxcContainerConfig): string {
   return Buffer.from(JSON.stringify(cfg), 'utf-8').toString('base64')
 }
@@ -600,19 +587,19 @@ export function encodeMxcConfig(cfg: MxcContainerConfig): string {
 /**
  * Produce the `{argv, env}` to spawn under MXC BaseContainer. Same
  * contract as `wrapCommandWithSandboxWindows`: caller spawns `argv`
- * with `shell:false`. Async because the SDK is a lazily-imported
- * optional dependency.
+ * with `shell:false`.
  */
-export async function wrapCommandWithSandboxMxc(
-  p: MxcSandboxParams,
-): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
+export function wrapCommandWithSandboxMxc(p: MxcSandboxParams): {
+  argv: string[]
+  env: NodeJS.ProcessEnv
+} {
   const proxyEnv = generateProxyEnvVars(
     p.httpProxyPort,
     p.socksProxyPort,
     p.caCertPath?.replace(/\\/g, '/'),
     p.proxyAuthToken,
   )
-  const cfg = await buildMxcContainerConfig(p, proxyEnv)
+  const cfg = buildMxcContainerConfig(p, proxyEnv)
   const argv = [p.mxc.exe]
   if (process.env.SRT_DEBUG) {
     argv.push('--debug')
