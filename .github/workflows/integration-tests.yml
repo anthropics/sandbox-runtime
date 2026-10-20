@@ -291,6 +291,7 @@ jobs:
             test/sandbox/mount-point-manifests.test.ts \
             test/sandbox/mount-point-liveness.test.ts \
             test/sandbox/mount-point-passes.test.ts \
+            test/sandbox/mount-point-hosts.test.ts \
             test/sandbox/stale-mount-point.test.ts \
             test/sandbox/linux-bwrap-args-file.test.ts
 

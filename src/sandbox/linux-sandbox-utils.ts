@@ -11,11 +11,13 @@ import path, { join } from 'node:path'
 import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import {
   collectMountPoints,
-  discardMountPointManifest,
+  discardMountPointManifests,
   holdsMountPointManifest,
   keepTrackOfMountPoint,
   keepTrackOfMountSource,
   kindOfMountPoint,
+  lookAfreshAt,
+  otherHostsReach,
   mountPointManifestDirectories,
   namedMountPoints,
   passesToEnd,
@@ -999,8 +1001,9 @@ export type LinuxSandboxProfileErrorCode =
   /**
    * The mount point manifests cannot be read, so a path cannot be told from a
    * mount point a running sandbox relies on; or one of their directories cannot
-   * be looked at, so it cannot be kept out of the command's reach. It ends by
-   * itself: when this process has descriptors again, when the file system
+   * be looked at, or whether the home is a network home cannot be told, so they
+   * cannot all be kept out of the command's reach. It ends by itself: when this
+   * process has descriptors again, when the file system or the user database
    * answers again, when what sits among them and is no manifest is an hour old,
    * when the process on a record with no manifest has ended. `.cause` is the
    * reason, with the file where there is one, which the message holds too.
@@ -1114,8 +1117,8 @@ export class WorkingDirectoryChanged extends Error {
  * command among them, stays on the line. The result stays a simple command,
  * so a prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
  *
- * With `started`, the record of a wrap that named mount points, the string is
- * a shell that appends its own /proc/self/stat line to that record and then
+ * With `started`, the records of a wrap that named mount points, the string is
+ * a shell that appends its own /proc/self/stat line to each of them and then
  * execs bwrap in its place: the pid on record is bwrap's, written before bwrap
  * has made a mount. Read by the shell itself, a redirection on a builtin: a
  * child's line would be that of a process gone at once. Not /proc/$$: under an
@@ -1131,19 +1134,14 @@ function renderBwrapInvocation(
   bwrapBinary: string,
   bwrapArgs: string[],
   mounts: { start: number; end: number; mandatoryDenyArgs: number },
-  started?: string,
+  started: readonly string[] = [],
 ): string {
   /** What the string's own shell does, to the file it is given as "$1". */
   type Step = { run: string; file: string }
-  const record: Step[] =
-    started === undefined
-      ? []
-      : [
-          {
-            run: 'srt_record() { local s && read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"; } && srt_record "$1"',
-            file: started,
-          },
-        ]
+  const record: Step[] = started.map(file => ({
+    run: 'srt_record() { local s && read -r s </proc/self/stat && printf "%s\\n" "$s" >>"$1"; } && srt_record "$1"',
+    file,
+  }))
   /** `words`, run by a shell named `name` once it has taken `steps`. */
   const afterSteps = (steps: Step[], name: string, words: string[]): string =>
     steps.length === 0
@@ -2243,9 +2241,9 @@ async function generateFilesystemArgs(
       args: string[]
       /** How many of them, from the first, have to stay on the command line. */
       onTheLine: number
-      manifest: MountPointManifest | undefined
-      /** Where the manifest's started record is, as the binds spell its directory. */
-      started: string | undefined
+      manifests: MountPointManifest[]
+      /** Where their started records are, as the binds spell their directories. */
+      started: string[]
       /** How many of them are the mandatory denies'. */
       mandatoryDenyArgs: number
     }
@@ -2262,7 +2260,9 @@ async function generateFilesystemArgs(
   let manifestDirs: string[] = []
   const makeManifestDirs = (recording: boolean): void => {
     try {
-      manifestDirs = mountPointManifestDirectories(recording)
+      manifestDirs = mountPointManifestDirectories(recording, dir =>
+        isWithinAnyAllowedWritePath(nameLocationOf(dir)),
+      )
     } catch (err) {
       throw new LinuxSandboxProfileError(
         'mount_points_unreadable',
@@ -2273,8 +2273,10 @@ async function generateFilesystemArgs(
   }
   // What the manifests name, as of the last time it was asked.
   let named: NamedMountPoints | undefined
-  const whatIsNamedNow = (ownManifest?: string): ReadonlySet<string> => {
-    const now = namedMountPoints(named, ownManifest)
+  const whatIsNamedNow = (
+    ownManifests: readonly string[] = [],
+  ): ReadonlySet<string> => {
+    const now = namedMountPoints(named, ownManifests)
     if ('inDoubt' in now) {
       if (now.keptChanging) {
         throw new MountPlanFailed(now.inDoubt)
@@ -3732,9 +3734,11 @@ async function generateFilesystemArgs(
   // another sandbox's mount points, which go when no live manifest names them.
   // A file among them was made again after the deny loop took it for the
   // caller's own.
-  const mountPointsReliedOn = (ownManifest?: string): string[] => {
+  const mountPointsReliedOn = (
+    ownManifests: readonly string[] = [],
+  ): string[] => {
     const found = new Set<string>()
-    const namedNow = boundFrom.size > 0 ? whatIsNamedNow(ownManifest) : found
+    const namedNow = boundFrom.size > 0 ? whatIsNamedNow(ownManifests) : found
     for (const relied of namedNow.size > 0 ? [...madeIn, ...boundFrom] : []) {
       for (let dir = relied; dir !== '/'; dir = path.dirname(dir)) {
         if (namedNow.has(dir)) found.add(dir)
@@ -3751,13 +3755,47 @@ async function generateFilesystemArgs(
   // a reading taken after the last look at the host above. A directory it left
   // out (the one a placeholder is nested in, a pin) goes with its maker, and the
   // command is then refused its start or, once the pin is mounted, loses it.
+  //
+  // INVARIANT, as in the deny loop: only a path found absent is named as this
+  // wrap's own to remove. Of a directory that other hosts reach, absent may be
+  // what this host remembers, and the user may have put an empty file there
+  // from another host since. So the server is asked, before anything of this
+  // wrap's names the path: what is there now and no manifest names is the
+  // caller's own, and the next plan finds it. (What the plan has made itself, on
+  // a 9p drive, counts as named from the moment it is made.)
+  let othersMayHaveMadeOne: boolean
+  try {
+    othersMayHaveMadeOne = otherHostsReach(mountPoints)
+  } catch (err) {
+    throw new LinuxSandboxProfileError(
+      'mount_points_unreadable',
+      `Whether other hosts reach the mount points cannot be told (${errorText(err)})`,
+      errorText(err),
+    )
+  }
+  if (othersMayHaveMadeOne) {
+    lookAfreshAt(mountPoints)
+    const thereNow = mountPoints.filter(made => {
+      try {
+        fs.lstatSync(made)
+        return true
+      } catch {
+        // As the plan found it, or not to be looked at: bubblewrap says which.
+        return false
+      }
+    })
+    if (thereNow.length > 0) {
+      const namedNow = whatIsNamedNow()
+      if (thereNow.some(made => !namedNow.has(made))) return undefined
+    }
+  }
   const names = [...mountPoints, ...mountPointsReliedOn()]
-  const manifest = publishMountPointManifest(
+  const manifests = publishMountPointManifest(
     names,
     emptySource === undefined ? [] : [emptySource],
     commandKey,
   )
-  if (manifest === 'too-large') {
+  if (manifests === 'too-large') {
     throw new LinuxSandboxProfileError(
       'too_many_mount_points',
       `Sandbox profile relies on ${names.length} mount points, more than one manifest holds; reduce the write denies on paths that do not exist`,
@@ -3784,13 +3822,17 @@ async function generateFilesystemArgs(
     // is waited for, and the look at the host comes after. Asked without giving
     // the thread back first, which is all there is to it but for a moment now
     // and then.
-    if (manifest !== undefined) {
+    if (manifests.length > 0) {
       let heldUp: string | undefined
       try {
-        const underWay = passesUnderWay()
+        const ofOtherHosts = otherHostsReach([
+          ...names,
+          ...(emptySource === undefined ? [] : [emptySource]),
+        ])
+        const underWay = passesUnderWay(ofOtherHosts)
         heldUp =
           underWay.length > 0
-            ? await passesToEnd(underWay, abortSignal)
+            ? await passesToEnd(underWay, abortSignal, undefined, ofOtherHosts)
             : undefined
       } catch (err) {
         if (abortSignal?.aborted) throw err
@@ -3810,18 +3852,25 @@ async function generateFilesystemArgs(
       // One plan, one working directory, on both sides of this await too.
       if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
     }
+    // What another host has removed is to be found gone, by the look below and
+    // by bubblewrap: meanwhile, or before the plan was made, which may have
+    // taken for the caller's own a mount point this host only remembers. Its
+    // manifest is dropped after it, so no reading names it any more.
+    lookAfreshAt([...names, ...madeIn, ...boundFrom])
     holds =
       // Else let go of during the wait, by a forced clean-up: no command starts
       // under it any more.
-      (manifest === undefined || holdsMountPointManifest(manifest.file)) &&
+      manifests.every(({ file }) => holdsMountPointManifest(file)) &&
       [...boundFrom].every(relied => isThere(relied, false)) &&
       [...madeIn].every(relied => isThere(relied, true)) &&
-      mountPointsReliedOn(manifest?.file).every(dir => names.includes(dir)) &&
+      mountPointsReliedOn(manifests.map(({ file }) => file)).every(dir =>
+        names.includes(dir),
+      ) &&
       // Else settled on since the pins were made: nothing is pinned above it.
-      (manifest === undefined || manifestDirs.includes(manifest.dir))
+      manifests.every(({ dir }) => manifestDirs.includes(dir))
   } finally {
-    if (!holds && manifest !== undefined) {
-      discardMountPointManifest(manifest.file)
+    if (!holds && manifests.length > 0) {
+      discardMountPointManifests(manifests.map(({ file }) => file))
     }
   }
   if (!holds) {
@@ -3838,12 +3887,12 @@ async function generateFilesystemArgs(
   // their sandboxes.
   const isInReach = (dir: string): boolean =>
     !isHiddenByTmpfs(dir, 'writes and reads')
-  let started: string | undefined
+  const started: string[] = []
   let onTheLine = 0
-  if (manifest !== undefined) {
+  for (const manifest of manifests) {
     const dir = canonicalForm(manifest.dir)
     const file = path.join(dir, path.basename(manifest.file))
-    started = path.join(dir, path.basename(manifest.started))
+    started.push(path.join(dir, path.basename(manifest.started)))
     // INVARIANT: the manifest is the first thing bound after the root, and its
     // bind is on the command line, not in an --args file. bubblewrap looks up
     // every bind source before it makes anything, so a command started once a
@@ -3853,10 +3902,11 @@ async function generateFilesystemArgs(
     // and bound any later it would by then have made mount points on the host
     // that nothing names or removes. On the line, because the --args file is
     // opened by a descriptor number that another wrap's file may have by then.
-    args.splice(afterRootBind, 0, '--ro-bind', file, file)
-    onTheLine = afterRootBind + 3
+    args.splice(afterRootBind + onTheLine, 0, '--ro-bind', file, file)
+    onTheLine += 3
     if (isInReach(dir)) args.push('--ro-bind', dir, dir)
   }
+  if (onTheLine > 0) onTheLine += afterRootBind
   if (names.length > 0 || emptySource !== undefined) {
     registerExitCleanupHandler()
   }
@@ -3866,7 +3916,7 @@ async function generateFilesystemArgs(
     // replaced - is not an error.
     // Each where it really is, once: two of the names may lead to one place.
     const others = new Set(manifestDirs.map(canonicalForm))
-    if (manifest !== undefined) others.delete(canonicalForm(manifest.dir))
+    for (const { dir } of manifests) others.delete(canonicalForm(dir))
     for (const dir of others) {
       if (isInReach(dir)) args.push('--ro-bind-try', dir, dir)
     }
@@ -3899,7 +3949,7 @@ async function generateFilesystemArgs(
     args.push('--ro-bind', dir, dir)
   }
 
-  return { args, onTheLine, manifest, started, mandatoryDenyArgs }
+  return { args, onTheLine, manifests, started, mandatoryDenyArgs }
 }
 
 /**
@@ -4026,9 +4076,9 @@ export async function wrapCommandWithSandboxLinux(
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let applySeccompPrefix: string | undefined
-  // The manifest naming the mount points this wrap relies on, dropped again if
+  // The manifests naming the mount points this wrap relies on, dropped again if
   // no command comes of it.
-  let manifest: MountPointManifest | undefined
+  let manifests: MountPointManifest[] = []
 
   try {
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
@@ -4225,7 +4275,7 @@ export async function wrapCommandWithSandboxLinux(
     }
     // Held for the catch below: a wrap that produces no command has to let go
     // of the mount points it named.
-    manifest = filesystem.manifest
+    manifests = filesystem.manifests
     const mounts = {
       start: bwrapArgs.length + filesystem.onTheLine,
       end: bwrapArgs.length + filesystem.args.length,
@@ -4363,9 +4413,9 @@ export async function wrapCommandWithSandboxLinux(
     if (forcedCleanups !== countedAfter) activeSandboxCount++
     return wrappedCommand
   } catch (error) {
-    // No command came of this wrap, so no sandbox starts under its manifest.
-    if (manifest !== undefined) {
-      discardMountPointManifest(manifest.file)
+    // No command came of this wrap, so no sandbox starts under its manifests.
+    if (manifests.length > 0) {
+      discardMountPointManifests(manifests.map(({ file }) => file))
     }
     // Its place in the count goes back through the clean-up: a command that
     // ended meanwhile left to this wrap what goes when none is outstanding.

@@ -9,6 +9,7 @@ import {
   readdirSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -57,12 +58,21 @@ function endSandboxesOnRecord(dir: string): void {
 
 /**
  * Makes `/var/tmp`, `/run/user/UID` and `/tmp` under `root`, as a system has
- * them. Returns the places the manifests are kept in there, in the order they
- * are tried, none of them made: for `setMountPointManifestPlacesForTesting`, or
- * {@link inPrivateNamespace}.
+ * them, and an `/etc/passwd` that gives the user `home` (one under `root`, not
+ * made, unless given). Returns the places the manifests are kept in there, in
+ * the order they are tried, none of them made: for
+ * `setMountPointManifestPlacesForTesting`, or {@link inPrivateNamespace}.
  */
-export function makePlaces(root: string): [string, string, string] {
+export function makePlaces(
+  root: string,
+  home = join(root, 'home/user'),
+): [string, string, string] {
   const uid = process.getuid?.() ?? 0
+  mkdirSync(join(root, 'etc'), { recursive: true })
+  writeFileSync(
+    join(root, 'etc/passwd'),
+    `user:x:${uid}:${uid}::${home}:/bin/sh\n`,
+  )
   const places = [
     join(root, 'var/tmp', `srt-mount-points-${uid}`),
     join(root, 'run/user', String(uid), 'srt-mount-points'),
@@ -79,9 +89,10 @@ export function makePlaces(root: string): [string, string, string] {
  * The start of a command line that runs what follows it in a mount namespace of
  * its own, where what {@link makePlaces} made under `root` stands at its real
  * name: for a child process that is to work the places out for itself, with
- * nothing put in its way, and not reach the user's own. `keep`, this repository
- * and the runtime are bound back where they are: they may lie under one of the
- * three. No PID namespace. Needs `bwrapCanNamespace`.
+ * nothing put in its way, and not reach the user's own, the one in a network
+ * home included. `keep`, this repository and the runtime are bound back where
+ * they are: they may lie under one of the three. No PID namespace. Needs
+ * `bwrapCanNamespace`.
  */
 export function inPrivateNamespace(root: string, keep: string[]): string[] {
   return [
@@ -94,6 +105,9 @@ export function inPrivateNamespace(root: string, keep: string[]): string[] {
     ...['/var/tmp', '/run/user', '/tmp']
       .filter(dir => existsSync(dir))
       .flatMap(dir => ['--bind', join(root, dir), dir]),
+    '--ro-bind',
+    join(root, 'etc/passwd'),
+    '/etc/passwd',
     ...[
       join(import.meta.dir, '../..'),
       dirname(process.execPath),

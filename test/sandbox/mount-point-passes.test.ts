@@ -273,7 +273,7 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
       }) as never),
     ]
     try {
-      expect(publishMountPointManifest([LOCK], [])).toBeUndefined()
+      expect(publishMountPointManifest([LOCK], [])).toEqual([])
       leftover(LOCK)
       expect(collectMountPoints('all')).toEqual([LOCK])
     } finally {
@@ -854,8 +854,8 @@ describe.if(isLinux)('A clean-up of mount points, on record', () => {
 
   /** The manifest this process publishes for a wrap that names `paths`. */
   function publish(paths: string[], commandKey?: string): string {
-    const manifest = publishMountPointManifest(paths, [], commandKey)
-    if (manifest === undefined || manifest === 'too-large') {
+    const [manifest] = publishMountPointManifest(paths, [], commandKey)
+    if (manifest === undefined || typeof manifest === 'string') {
       throw new Error(`not published: ${manifest}`)
     }
     return manifest.file

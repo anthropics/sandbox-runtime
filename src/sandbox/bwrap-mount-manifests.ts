@@ -33,11 +33,20 @@
  * mountPointManifestDirectories}). Not covered: a sandbox this library did not
  * start; a name, or one above it, that is a link inside a write root; a parent
  * that is not there, where the command may make it.
+ *
+ * A mount point on a file system that other hosts mount too (a network home) is
+ * there for all of them, and a directory of this host's tells them nothing. So
+ * a wrap names those in a manifest of their own in the home directory, where
+ * that is on such a file system (see {@link networkManifestDirectoryName}). No
+ * host can ask after another's processes, so there a manifest is live by its
+ * age, and the process that wrote it keeps it young (see {@link
+ * keepOwnManifestsYoung}).
  */
 
+import { spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'node:fs'
-import { tmpdir } from 'node:os'
+import { tmpdir, userInfo } from 'node:os'
 import path from 'node:path'
 import { z } from 'zod/v3'
 import { logForDebugging } from '../utils/debug.js'
@@ -98,6 +107,23 @@ const UNREADABLE_MANIFEST_MAX_AGE_MS = 60 * 60 * 1000
 const OTHER_NAMESPACE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 
 /**
+ * A manifest whose processes cannot be asked after, and whose writer keeps it
+ * young, counts as live until it and its record are this old. Far more than
+ * {@link KEPT_YOUNG_EVERY_MS}, for what lies between two hosts: their clocks, a
+ * minute of cached attributes, a timer that is late.
+ */
+const OTHER_KERNEL_MAX_AGE_MS = 10 * 60 * 1000
+
+/** How often a process sets the time of its manifests that other kernels read. */
+const KEPT_YOUNG_EVERY_MS = 60 * 1000
+
+/**
+ * For how long one listing is good in a pass over a directory that other
+ * kernels reach, where a listing is a round trip to a server.
+ */
+const NETWORK_LISTING_GOOD_FOR_MS = 20
+
+/**
  * A pass removes nothing more this long after it set out to go on record, and
  * leaves the rest to the next: an ordinary one takes milliseconds.
  */
@@ -114,8 +140,9 @@ const bothClocks = (): readonly [number, number] => [
 ]
 
 /**
- * A pass that cannot be asked after (another PID namespace's) counts as under
- * way until its record is this old: well past {@link PASS_GOOD_FOR_MS}.
+ * A pass that cannot be asked after (another PID namespace's, another host's)
+ * counts as under way until its record is this old: well past {@link
+ * PASS_GOOD_FOR_MS}.
  */
 const PASS_MAX_AGE_MS = 60 * 1000
 
@@ -159,11 +186,17 @@ const ManifestSchema = z.object({
    */
   ns: z.string().optional(),
   /**
-   * The boot it was written in. Absent where that could not be read. As read,
-   * both are absent where nothing follows from them (see {@link
-   * ONE_KERNEL_FILE_SYSTEMS}).
+   * The boot it was written in. Absent where that could not be read. All that
+   * tells this kernel's from another's where more than one reaches the directory
+   * (see {@link ONE_KERNEL_FILE_SYSTEMS}).
    */
   boot: z.string().optional(),
+  /**
+   * Its writer sets its time every {@link KEPT_YOUNG_EVERY_MS} for as long as it
+   * holds on to it. Said by the writer, who alone knows: the same directory can
+   * be on one kind of file system to the writer and on another to a reader.
+   */
+  keptYoung: z.boolean().optional(),
   /** When the manifest was written, for {@link MANIFEST_GRACE_MS}. */
   created: z.number(),
   /** The mount points bwrap makes on the host for that wrap's deny paths. */
@@ -184,6 +217,16 @@ type Manifest = z.infer<typeof ManifestSchema> & {
   finished: boolean
   /** Its started record, `<id>.started`. */
   record: string
+  /**
+   * In a directory that other kernels reach, and not of this kernel and PID
+   * namespace for all that can be told: nothing here can ask after it.
+   */
+  elsewhere: boolean
+  /**
+   * Another host's, and it names what this host does not reach (which, of one in
+   * the home, is left out of its lists).
+   */
+  namesMore: boolean
   /** This process wrote it and the caller says its command is over. */
   released: boolean
 }
@@ -196,7 +239,12 @@ type Manifest = z.infer<typeof ManifestSchema> & {
  */
 const ownManifests = new Map<
   string,
-  { commandKey: string | undefined; over: boolean }
+  {
+    commandKey: string | undefined
+    over: boolean
+    /** Other kernels read it, and have its age to go by. */
+    byItsAge: boolean
+  }
 >()
 
 /**
@@ -360,12 +408,12 @@ function ownBootId(): string | undefined {
  * `statfs`'s type. On any other (NFS, 9p, virtiofs, FUSE) a manifest may be
  * another running kernel's, and only the boot id tells: two hosts each in their
  * initial PID namespace name that alike. So there a manifest is this kernel's
- * only when its boot id and ours can both be read and are equal. Of any other,
- * neither its boot nor its namespace says anything: it records none, and is
- * live for {@link OTHER_NAMESPACE_MAX_AGE_MS}.
+ * only when its boot id and ours can both be read and are equal. Any other, and
+ * one of another PID namespace of this kernel, is live by its age (see {@link
+ * OTHER_KERNEL_MAX_AGE_MS}).
  *
  * INVARIANT: a list of what is let in, not of what is kept out. On a local kind
- * that is missing, what an earlier boot left waits those seven days instead of
+ * that is missing, what an earlier boot left waits those minutes instead of
  * going at once. A kind wrongly let in, as the next network file system would be
  * by a list of the known ones, has a live sandbox judged finished and its mount
  * points removed.
@@ -380,24 +428,78 @@ const ONE_KERNEL_FILE_SYSTEMS = new Set([
   0xf2f52010, // f2fs
 ])
 
-/** Whether `dir` is on one of those. Not where that cannot be asked. */
-function isReachedByOneKernel(dir: string): boolean {
+/**
+ * The directories found on none of those, and until when that is believed, by
+ * `performance.now()`: on a network file system the question is a round trip
+ * each time. For a minute, because a share can be unmounted, and what another
+ * host names there is then not this host's to judge or collect any more. Never
+ * the other answer: a share can be mounted, and that has to be seen at once.
+ */
+const foundWithinOthersReach = new Map<string, number>()
+const FOUND_WITHIN_OTHERS_REACH_FOR_MS = 60 * 1000
+
+/**
+ * Whether `dir` is on one of those, or on a kind that other kernels reach too;
+ * `absent` where it is not there. What else cannot be asked is thrown with
+ * `orThrow`, and else counts as within their reach.
+ */
+function reachOf(
+  dir: string,
+  orThrow = false,
+): 'one kernel' | 'others too' | 'absent' {
+  if (performance.now() < (foundWithinOthersReach.get(dir) ?? -Infinity)) {
+    return 'others too'
+  }
+  let type: number
   try {
-    return ONE_KERNEL_FILE_SYSTEMS.has(Number(fs.statfsSync(dir).type))
-  } catch {
-    return false
+    type = Number(fs.statfsSync(dir).type)
+  } catch (e) {
+    if (isAbsenceErrno(e)) return 'absent'
+    if (orThrow) throw e
+    return 'others too'
+  }
+  if (ONE_KERNEL_FILE_SYSTEMS.has(type)) {
+    return 'one kernel'
+  }
+  if (foundWithinOthersReach.size >= 1024) foundWithinOthersReach.clear()
+  foundWithinOthersReach.set(
+    dir,
+    performance.now() + FOUND_WITHIN_OTHERS_REACH_FOR_MS,
+  )
+  return 'others too'
+}
+
+/** Whether `dir` is on one of those. Not where that cannot be asked. */
+const isReachedByOneKernel = (dir: string): boolean =>
+  reachOf(dir) === 'one kernel'
+
+/**
+ * Whether other kernels reach what is in `dir`, going by the nearest directory
+ * at or above it that is there: on a host that does not have `/scratch`,
+ * `/scratch/x` is a name on its own root and no share.
+ */
+function othersReachInto(dir: string): boolean {
+  for (;;) {
+    const reach = reachOf(dir)
+    if (reach !== 'absent' || dir === path.dirname(dir)) {
+      return reach !== 'one kernel'
+    }
+    dir = path.dirname(dir)
   }
 }
 
+/** Whether other kernels reach the path `p`. */
+const othersReach = (p: string): boolean => othersReachInto(path.dirname(p))
+
 /**
- * Whether `file` was last written over `ms` ago. One that cannot be looked at
- * was not; one that is not there counts as `absent` says.
+ * Whether `file` was last written over `ms` ago. One that cannot be looked at,
+ * or is not there, was not.
  */
-function olderThan(file: string, ms: number, absent = false): boolean {
+function olderThan(file: string, ms: number): boolean {
   try {
     return Date.now() - fs.lstatSync(file).mtimeMs > ms
-  } catch (e) {
-    return absent && isAbsenceErrno(e)
+  } catch {
+    return false
   }
 }
 
@@ -445,6 +547,11 @@ function isOurPrivateDirectory(
  * planted at the name is refused, not followed.
  */
 function makeOurPrivateDirectory(dir: string): boolean {
+  // As it mostly is, and all that follows comes to this question in the end: in
+  // a network home each step of it is a round trip.
+  if (!isReachedByOneKernel(dir) && isOurPrivateDirectory(dir)) {
+    return true
+  }
   try {
     fs.mkdirSync(dir, { mode: 0o700 })
   } catch {
@@ -485,7 +592,8 @@ function isBuriedBySandboxMounts(dir: string): boolean {
   )
 }
 
-// Test seam: what stands in for `/` in the names that follow from the user id.
+// Test seam: what stands in for `/` in the names that follow from the user id,
+// and in /etc/passwd.
 let root = '/'
 
 /**
@@ -498,12 +606,6 @@ let root = '/'
  * else as well. Not to be read under: where it is a write root the command can
  * chmod it, and must not make other processes read less by that. Reading more
  * does no harm, a manifest being only a claim about a path.
- *
- * Not the home directory. A network home caches listings, and the claim by
- * rename, the reading after it and the listing before a removal all need the
- * next readdir in another process to show a rename; a home is often inside a
- * write root; nothing ages what is left there; and in a shared one another boot
- * id may be another live host's.
  */
 function fixedManifestDirectoryNames(
   orThrow = false,
@@ -522,6 +624,324 @@ function fixedManifestDirectoryNames(
       : []),
     path.join(root, 'tmp', `srt-mount-points-${uid}`),
   ]
+}
+
+/** What the directory in a network home is called. */
+const NETWORK_DIRECTORY = '.srt-mount-points'
+
+/** For how long "no such user" is taken for an answer. */
+const NO_HOME_GOOD_FOR_MS = 60 * 1000
+
+/**
+ * For how long no answer at all is not asked for again. Each asking holds the
+ * thread for as long as `getent` is given, and a wrap that is refused asks more
+ * than once.
+ */
+const NO_ANSWER_GOOD_FOR_MS = 10 * 1000
+
+let home: { dir: string | undefined; asked: number } | undefined
+let noAnswer: { error: Error; asked: number } | undefined
+
+/**
+ * The user's home as the user database has it, not as the environment does, or
+ * `undefined`. Asked once: the database may be a directory service.
+ *
+ * Node asks the C library. Bun answers `os.userInfo()` with `$HOME`, so there it
+ * is /etc/passwd and then `getent`, at its usual places and never looked up on
+ * `PATH`, for a user only a directory service knows.
+ *
+ * INVARIANT: no answer but a home is kept for good. A process that took an
+ * outage for "no home" would neither read what the others keep there nor keep
+ * its own sandboxes out of it, for as long as it runs. So it throws where it gets
+ * no answer; and "no such user", which is also all that a directory service that
+ * is down has the C library say, is asked again after {@link
+ * NO_HOME_GOOD_FOR_MS}.
+ */
+function homeDirectory(): string | undefined {
+  if (
+    home !== undefined &&
+    (home.dir !== undefined ||
+      performance.now() - home.asked < NO_HOME_GOOD_FOR_MS)
+  ) {
+    return home.dir
+  }
+  if (
+    noAnswer !== undefined &&
+    performance.now() - noAnswer.asked < NO_ANSWER_GOOD_FOR_MS
+  ) {
+    throw noAnswer.error
+  }
+  const uid = String(process.getuid?.() ?? 0)
+  const inPasswdLines = (text: string): string | undefined =>
+    text
+      .split('\n')
+      .map(line => line.split(':'))
+      .find(fields => fields[2] === uid)?.[5]
+  let dir: string | undefined
+  if (root === '/' && process.versions['bun'] === undefined) {
+    try {
+      dir = userInfo().homedir
+    } catch {
+      // No such user, for all it says.
+    }
+  } else {
+    try {
+      dir = inPasswdLines(
+        fs.readFileSync(path.join(root, 'etc/passwd'), 'utf8'),
+      )
+    } catch (e) {
+      if (!isAbsenceErrno(e)) throw e
+    }
+    const getent =
+      dir === undefined
+        ? ['usr/bin/getent', 'bin/getent', 'run/current-system/sw/bin/getent']
+            .map(file => path.join(root, file))
+            .find(file => fs.existsSync(file))
+        : undefined
+    if (getent !== undefined) {
+      const asked = spawnSync(getent, ['passwd', uid], {
+        encoding: 'utf8',
+        env: {},
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 5000,
+      })
+      // 2 is its word for "no such key".
+      if (asked.status !== 0 && asked.status !== 2) {
+        noAnswer = {
+          error: new Error(
+            `${getent} passwd ${uid} gave no answer (${asked.error?.message ?? `status ${asked.status}`})`,
+          ),
+          asked: performance.now(),
+        }
+        throw noAnswer.error
+      }
+      dir = inPasswdLines(asked.stdout)
+    }
+  }
+  home = {
+    dir: dir !== undefined && path.isAbsolute(dir) ? dir : undefined,
+    asked: performance.now(),
+  }
+  return home.dir
+}
+
+/**
+ * What {@link networkManifestDirectoryName} has found, once it has found one.
+ * For what follows from the directories a wrap or a pass has already worked out:
+ * it asks nothing, so it does not throw half way through either.
+ */
+let network: string | undefined
+
+/**
+ * Where the manifests go that name what other hosts reach too: in the user's
+ * home directory, where that is itself on a file system more than one kernel
+ * reaches, and `undefined` where it is not. Hosts that share a home work it out
+ * alike, and on a host with a home of its own nothing is read or written there
+ * (it is kept out of reach there too: see {@link
+ * mountPointManifestDirectories}).
+ *
+ * Read, bound read-only and pinned like the places that follow from the user id,
+ * and written only for what other hosts reach: it is no place for what they do
+ * not, and does not stand in for one.
+ *
+ * INVARIANT: only on the file system's own word. A home that is not there, or
+ * that this user may not enter, is no network home: no wrap could make or bind
+ * the directory in it, and a sandboxed command that then made both would be
+ * believed. Throws where it cannot tell (an error of the moment, twice, on a
+ * home that may hold the directory): a wrap that went on would leave it unbound.
+ * And only that there is one is remembered: a home on this host's own disk may
+ * be what shows until the share is mounted over it.
+ *
+ * What speaks against a home directory, and what is done about it:
+ *
+ * - A network file system caches listings, and all of this rests on one process
+ *   seeing what another has put into the directory. A client asks the server
+ *   again for a directory it opens, and for one it has itself just changed.
+ *   Where it matters each side has: a pass goes on record before the reading it
+ *   decides on, and a wrap publishes before it lists the passes and reads the
+ *   manifests again.
+ * - It caches what is in the directories the mount points are in as well: see
+ *   {@link lookAfreshAt}.
+ * - Another boot id may be another live host's: see {@link
+ *   ONE_KERNEL_FILE_SYSTEMS}.
+ * - Nothing ages what is left there: see {@link OTHER_KERNEL_MAX_AGE_MS}.
+ * - It is often inside a write root: it is bound read-only and what lies above
+ *   it is pinned, like the others.
+ */
+function networkManifestDirectoryName(): string | undefined {
+  if (network !== undefined) {
+    return network
+  }
+  const dir = homeDirectory()
+  if (dir === undefined || isBuriedBySandboxMounts(dir)) {
+    return undefined
+  }
+  for (const last of [false, true]) {
+    try {
+      if (reachOf(dir, true) === 'others too') {
+        network = path.join(dir, NETWORK_DIRECTORY)
+      }
+      break
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'EACCES') break
+      if (last) throw e
+    }
+  }
+  return network
+}
+
+/**
+ * Whether other hosts that keep their manifests where this one does reach one of
+ * `paths`: what they do is then this wrap's business, and the other way round.
+ */
+export function otherHostsReach(paths: readonly string[]): boolean {
+  // Nothing is asked for a wrap that names nothing: it may restrict no write.
+  return (
+    paths.length > 0 &&
+    networkManifestDirectoryName() !== undefined &&
+    paths.some(othersReach)
+  )
+}
+
+/**
+ * Has a network file system compare what it remembers of `p` with the server's,
+ * which it does for what is opened (close-to-open consistency).
+ */
+function openAndClose(p: string, flags: number): void {
+  try {
+    fs.closeSync(fs.openSync(p, flags))
+  } catch {
+    // Not there, or not to be opened: the look that follows says so.
+  }
+}
+
+/**
+ * Has this host ask again what is in the directories that hold `paths`, those
+ * of them that other hosts reach. A network file system answers a look-up from
+ * what it remembers, for seconds to a minute, so a mount point another host has
+ * just removed would be found there still, by the wrap and by bubblewrap, which
+ * would mount on what the server no longer has: the mount goes when the client
+ * finds out. Opening a directory has the client compare it with the server's,
+ * and look up again what is in one that has changed.
+ *
+ * Only where there is a network home: without the manifests in it no host knows
+ * what another is about, and there is nothing to find out in time.
+ */
+export function lookAfreshAt(paths: Iterable<string>): void {
+  if (network === undefined) {
+    return
+  }
+  for (const dir of new Set([...paths].map(p => path.dirname(p)))) {
+    if (othersReachInto(dir)) {
+      openAndClose(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY)
+    }
+  }
+}
+
+let keptYoung: ReturnType<typeof setInterval> | undefined
+
+/** Sets the time of `file` to now, by this host's clock, if it can be set. */
+function touch(file: string): void {
+  const now = new Date()
+  try {
+    fs.utimesSync(file, now, now)
+  } catch {
+    // It has the server's.
+  }
+}
+
+/**
+ * Puts a file that holds `text` at `file`, in a directory other kernels read.
+ * They go by its age, by this host's clock and not the server's, so it comes to
+ * its name whole and with its time set. Throws, with nothing left there, where
+ * it cannot be.
+ */
+function putWhereOtherKernelsRead(file: string, text: string): void {
+  const temporary = `${file}${TEMPORARY_SUFFIX}`
+  try {
+    const fd = fs.openSync(temporary, 'wx', 0o600)
+    try {
+      if (text !== '') {
+        // A network file system takes the bytes, and says only as they are
+        // flushed that it has no room for them. Bun passes on neither what
+        // closing the file says nor what the `flush` option finds.
+        fs.writeFileSync(fd, text)
+        fs.fsyncSync(fd)
+      }
+    } finally {
+      fs.closeSync(fd)
+    }
+    touch(temporary)
+    fs.renameSync(temporary, file)
+  } catch (e) {
+    drop(temporary)
+    throw e
+  }
+}
+
+/**
+ * Has the time of every manifest of this process that other kernels read set
+ * every {@link KEPT_YOUNG_EVERY_MS}, for as long as this process knows of one:
+ * its age is all they have to go by. By this host's clock and not the server's,
+ * so that what has to agree is the clocks of the hosts.
+ *
+ * On a timer, so a process that does not come back to its event loop for {@link
+ * OTHER_KERNEL_MAX_AGE_MS} (stopped with its sandbox, or waiting for its command
+ * in a call that blocks) is taken for gone by the other hosts. The timer does
+ * not keep the process alive, and an error does not end it: the next tick may do.
+ */
+function keepOwnManifestsYoung(): void {
+  const some = [...ownManifests.values()].some(own => own.byItsAge)
+  if (some && keptYoung === undefined) {
+    keptYoung = setInterval(setTheTimesOfOwnManifests, KEPT_YOUNG_EVERY_MS)
+    keptYoung.unref()
+  } else if (!some && keptYoung !== undefined) {
+    clearInterval(keptYoung)
+    keptYoung = undefined
+  }
+}
+
+let settingTimes = false
+
+/**
+ * One tick of that. Not with the calls that wait: nobody has asked for anything
+ * when it runs, and a server that does not answer would hold up the one thread
+ * of whatever program this is part of. One request at a time, and no tick while
+ * the last is at it, so that such a server ties up one thread of the pool those
+ * requests run on and not all of them.
+ */
+function setTheTimesOfOwnManifests(): void {
+  // Those a pass has collected since the last tick are forgotten by now.
+  keepOwnManifestsYoung()
+  if (settingTimes) {
+    return
+  }
+  settingTimes = true
+  const left = [...ownManifests].filter(([, own]) => own.byItsAge)
+  const next = (): void => {
+    const [file, own] = left.shift() ?? []
+    if (file === undefined || own === undefined) {
+      settingTimes = false
+      return
+    }
+    const now = new Date()
+    const done = (e: NodeJS.ErrnoException | null): void => {
+      if (e !== null && !(isAbsenceErrno(e) && own.over)) {
+        logForDebugging(
+          `[Sandbox Linux] The time of the manifest ${file} could not be set (${String(e)}) - other hosts take its mount points for left behind once it is old`,
+          { level: 'warn' },
+        )
+      }
+      next()
+    }
+    fs.utimes(file, now, now, e =>
+      // A pass of this host has it, and gives it back if a sandbox runs.
+      e !== null && isAbsenceErrno(e)
+        ? fs.utimes(`${idOf(file)}${CLAIMED_SUFFIX}`, now, now, done)
+        : done(e),
+    )
+  }
+  next()
 }
 
 /**
@@ -552,8 +972,9 @@ function sharedManifestDirectoryNames(
  * claims and collects in those it can write. The names that follow from the
  * user id; the ones the environment gives only where none of those can be
  * written, because only processes with that environment keep them out of a
- * sandbox's reach; and the one it has settled on. Each only while it is a
- * directory of ours alone. Makes nothing. Throws where it cannot tell.
+ * sandbox's reach; {@link networkManifestDirectoryName}; and the one it has
+ * settled on. Each only while it is a directory of ours alone. Makes nothing.
+ * Throws where it cannot tell.
  *
  * Each directory once, whatever it is called: where /var/tmp is a link to /tmp,
  * or a bind mount of it, two of the names are one directory. Every manifest in
@@ -565,6 +986,8 @@ function believedManifestDirectories(): string[] {
   )
     ? fixedManifestDirectoryNames(true)
     : sharedManifestDirectoryNames(true)
+  const inTheHome = networkManifestDirectoryName()
+  if (inTheHome !== undefined) names.push(inTheHome)
   if (manifestDirectory !== undefined) names.push(manifestDirectory)
   const byIdentity = new Map<string, string>()
   for (const dir of names) {
@@ -650,7 +1073,8 @@ function ensureManifestDirectory(): string | undefined {
 /**
  * Every directory a wrap must bind read-only because some process of this user
  * keeps manifests in it and a collect believes what it finds there: every
- * shared name, whichever this process writes to, plus the one it settled on.
+ * shared name, whichever this process writes to, the one in a network home, and
+ * the one it settled on.
  *
  * Each is made if it can be, so a sandboxed command cannot make and fill it
  * first. One that can be neither made nor bound is not believed, and the
@@ -662,11 +1086,20 @@ function ensureManifestDirectory(): string | undefined {
  * - another user has the name, in a sticky directory: only that user or root
  *   can remove or rename it.
  *
+ * INVARIANT: the one in the home is kept out of reach on a host that does not
+ * believe it as well. A home that is this host's own disk may be a network home
+ * to others (it is to the clients of the server that exports it), who believe
+ * what they find there. So it is bound wherever it is there, and where it is
+ * not, but the command could make it (`commandMayMake`), it is made first.
+ *
  * With `recording`, the directory this wrap's manifest will go to is settled
  * first, so the wrap can pin what lies above it before it publishes. Throws
  * where it cannot tell whether one of them is there.
  */
-export function mountPointManifestDirectories(recording = false): string[] {
+export function mountPointManifestDirectories(
+  recording = false,
+  commandMayMake: (dir: string) => boolean = () => false,
+): string[] {
   if (!onLinux()) {
     return []
   }
@@ -680,6 +1113,21 @@ export function mountPointManifestDirectories(recording = false): string[] {
     makeOurPrivateDirectory(candidate)
     if (isToBeBound(candidate)) {
       dirs.add(candidate)
+    }
+  }
+  const believed = networkManifestDirectoryName()
+  const home = homeDirectory()
+  const inTheHome =
+    believed ??
+    (home === undefined || isBuriedBySandboxMounts(home)
+      ? undefined
+      : path.join(home, NETWORK_DIRECTORY))
+  if (inTheHome !== undefined) {
+    if (believed !== undefined || commandMayMake(inTheHome)) {
+      makeOurPrivateDirectory(inTheHome)
+    }
+    if (isToBeBound(inTheHome)) {
+      dirs.add(inTheHome)
     }
   }
   if (recording) {
@@ -770,32 +1218,93 @@ function readOwnFile(file: string, max: number): string | undefined {
 const idOf = (file: string): string => file.slice(0, file.lastIndexOf('.'))
 
 /**
+ * What the manifests hold that have been read in a directory other kernels
+ * reach, by `<directory>/<id>`, for as long as they are listed. There each read
+ * is several round trips to a server, every wrap reads every manifest, and a
+ * manifest is never rewritten: its name is all that changes.
+ */
+const remembered = new Map<
+  string,
+  {
+    fields: z.infer<typeof ManifestSchema>
+    /**
+     * Until when, by `performance.now()`, it is young whatever happens: its time
+     * is only ever set forward. A look at it is a round trip as well, and every
+     * pass judges every manifest of every host.
+     */
+    youngUntil: number
+  }
+>()
+
+/**
  * The manifest at `file`, which is its own name or a claim's, or `undefined`
  * where nothing is there. Throws like {@link readOwnFile}, and {@link NotOurs}
- * for what does not hold a manifest's fields.
+ * for what does not hold a manifest's fields. One that is {@link remembered} is
+ * taken to be where the caller has just found it listed. `othersReadIt` says
+ * whether its directory is one that other kernels reach.
  */
-function readManifest(file: string): Manifest | undefined {
-  const text = readOwnFile(file, MANIFEST_MAX_BYTES)
-  if (text === undefined) {
-    return undefined
-  }
-  let json: unknown
-  try {
-    json = JSON.parse(text)
-  } catch {
-    throw new NotJson(`${file} is not JSON`)
-  }
-  const parsed = ManifestSchema.safeParse(json)
-  if (!parsed.success) {
-    throw new NotOurs(`${file} is not a manifest this version can read`)
-  }
+function readManifest(
+  file: string,
+  othersReadIt: boolean,
+  reached: (p: string) => boolean = othersReach,
+): Manifest | undefined {
   const id = idOf(file)
+  let fields = othersReadIt ? remembered.get(id)?.fields : undefined
+  if (fields === undefined) {
+    let text: string | undefined
+    try {
+      text = readOwnFile(file, MANIFEST_MAX_BYTES)
+    } catch (e) {
+      // A network file system's word for a file another host has removed since
+      // this one looked it up or opened it. Of a manifest, whose reader then
+      // starts over; a record that cannot be read vouches, whatever the error.
+      if ((e as NodeJS.ErrnoException).code !== 'ESTALE') throw e
+    }
+    if (text === undefined) {
+      return undefined
+    }
+    let json: unknown
+    try {
+      json = JSON.parse(text)
+    } catch {
+      throw new NotJson(`${file} is not JSON`)
+    }
+    const parsed = ManifestSchema.safeParse(json)
+    if (!parsed.success) {
+      throw new NotOurs(`${file} is not a manifest this version can read`)
+    }
+    fields = parsed.data
+    if (othersReadIt) remembered.set(id, { fields, youngUntil: -Infinity })
+  }
+  const ofThisBoot = fields.boot !== undefined && fields.boot === ownBootId()
+  const elsewhere =
+    othersReadIt &&
+    // Its own it knows, where it cannot read what would say so.
+    !ownManifests.has(`${id}${MANIFEST_SUFFIX}`) &&
+    !(ofThisBoot && fields.ns !== undefined && fields.ns === ownPidNamespace())
+  // INVARIANT: of what another host has put into the home only what that host
+  // and this one both reach counts. `/data/x` there may be another file than
+  // here, and here it may be the user's own. Asked at every reading: a share may
+  // have been mounted since the last.
+  const inTheHome = path.dirname(file) === network
+  const counts = elsewhere && inTheHome ? reached : (): boolean => true
   return {
-    ...parsed.data,
+    ...fields,
+    paths: fields.paths.filter(counts),
+    sources: fields.sources.filter(counts),
     file,
     claimed: !file.endsWith(MANIFEST_SUFFIX),
     finished: file.endsWith(FINISHED_SUFFIX),
     record: `${id}${STARTED_SUFFIX}`,
+    elsewhere,
+    // In any other directory that both hosts read (a /var/tmp that diskless
+    // nodes share) a manifest names all its wrap relies on, and all of it
+    // counts, as before there was one in the home. It is as little for this
+    // host to collect.
+    namesMore:
+      elsewhere &&
+      (inTheHome || !ofThisBoot) &&
+      ![...fields.paths, ...fields.sources].every(reached),
     released: ownManifests.get(`${id}${MANIFEST_SUFFIX}`)?.over === true,
   }
 }
@@ -848,39 +1357,82 @@ const isOfAnotherBoot = (manifest: Manifest): boolean =>
   manifest.boot !== (ownBootId() ?? manifest.boot)
 
 /**
- * Whether this process can tell if the processes behind a manifest run: none of
- * another boot does, and of this one it can ask after those of its own PID
- * namespace. What {@link isLive} says of any other goes by its age alone.
+ * Whether this process can tell if the processes behind a manifest run: of this
+ * kernel's, none of another boot does, and of this one it can ask after those of
+ * its own PID namespace. What {@link isLive} says of any other goes by its age
+ * alone.
  */
 function canBeAskedAfter(manifest: Manifest): boolean {
   const here = ownPidNamespace()
   return (
-    isOfAnotherBoot(manifest) || (here !== undefined && manifest.ns === here)
+    !manifest.elsewhere &&
+    (isOfAnotherBoot(manifest) || (here !== undefined && manifest.ns === here))
   )
 }
 
 /**
+ * A manifest is no longer at the name a listing showed it at: renamed, or
+ * dropped. What was made of that listing is out of date.
+ */
+class Moved extends Error {}
+
+/**
+ * {@link isLive} for a manifest whose processes cannot be asked after: until it
+ * and its record are old, by what its writer says it does about that. What
+ * cannot be looked at is live.
+ *
+ * Throws {@link Moved} for one that is gone from its name. Not "live": whoever
+ * dropped it may have kept a path for a manifest of the caller's, and a caller
+ * that kept the path for this one in turn would leave it to nobody. And not
+ * "finished": it may only have been claimed, and be given back.
+ */
+function isLiveByItsAge(manifest: Manifest): boolean {
+  const maxAge = manifest.keptYoung
+    ? OTHER_KERNEL_MAX_AGE_MS
+    : OTHER_NAMESPACE_MAX_AGE_MS
+  const known = remembered.get(idOf(manifest.file))
+  if (known !== undefined && performance.now() < known.youngUntil) {
+    return true
+  }
+  let age: number
+  try {
+    age = Date.now() - fs.lstatSync(manifest.file).mtimeMs
+  } catch (e) {
+    if (isAbsenceErrno(e)) throw new Moved(manifest.file)
+    return true
+  }
+  try {
+    age = Math.min(age, Date.now() - fs.lstatSync(manifest.record).mtimeMs)
+  } catch (e) {
+    if (!isAbsenceErrno(e)) return true
+  }
+  if (known !== undefined) {
+    known.youngUntil = performance.now() + (maxAge - age)
+  }
+  return age <= maxAge
+}
+
+/**
  * Whether a sandbox that named this manifest may be running, or may yet start.
- * None of another boot is, whatever else the manifest says. Only a process in
- * the PID namespace that wrote it can tell; to any other it is live until {@link
- * OTHER_NAMESPACE_MAX_AGE_MS}. A process on its started record that runs keeps
+ * Where other kernels reach its directory, one that is not of this kernel and
+ * PID namespace goes by its age, which its writer keeps low for as long as it
+ * holds on to it. Where only this kernel does, none of another boot is, whatever
+ * else the manifest says, and only a process in the PID namespace that wrote it
+ * can tell; to any other it is live until {@link OTHER_NAMESPACE_MAX_AGE_MS}. A process on its started record that runs keeps
  * it live, whatever else. With none, no sandbox is past a claim, and one at its
  * own name that the caller has not released is live while its writer runs (its
  * command line may be run yet, for the first time or again), or while it is
  * young and has no record.
  */
 function isLive(manifest: Manifest): boolean {
+  if (manifest.elsewhere) {
+    return isLiveByItsAge(manifest)
+  }
   if (isOfAnotherBoot(manifest)) {
     return false
   }
   if (!canBeAskedAfter(manifest)) {
-    return (
-      ownPidNamespace() === undefined ||
-      !(
-        olderThan(manifest.file, OTHER_NAMESPACE_MAX_AGE_MS) &&
-        olderThan(manifest.record, OTHER_NAMESPACE_MAX_AGE_MS, true)
-      )
-    )
+    return ownPidNamespace() === undefined || isLiveByItsAge(manifest)
   }
   const vouched = recordVouches(manifest.record)
   if (vouched === true) {
@@ -894,6 +1446,18 @@ function isLive(manifest: Manifest): boolean {
       isRunning(manifest.pid, manifest.start))
   )
 }
+
+/**
+ * Whether `manifest` names what this host does not reach, and is not so old that
+ * no host that does will come for it any more. Collected from here, the rest of
+ * what it names would have nothing left to name it; and held on to from here,
+ * with what this host reaches removed, it would go on naming that.
+ */
+const isForAnotherHostToCollect = (manifest: Manifest): boolean =>
+  manifest.namesMore &&
+  (performance.now() <
+    (remembered.get(idOf(manifest.file))?.youngUntil ?? -Infinity) ||
+    !olderThan(manifest.file, OTHER_NAMESPACE_MAX_AGE_MS))
 
 /**
  * What became of a path a pass set out to remove: `left` when it is gone or no
@@ -1023,87 +1587,142 @@ export type MountPointManifest = {
 
 /**
  * Record the mount points this wrap relies on, and the empty directories they
- * bind from, before the sandbox can start.
+ * bind from, before the sandbox can start. Returns what was written.
  *
- * `undefined` when there is nothing to record or no manifest could be written.
- * What could not be recorded is kept in memory and removed at this process's
+ * All of it goes into a manifest in a place of this host's, as on a host with a
+ * home of its own: a process of this host that does not see the home (a service
+ * kept out of it, a container with another) reads it there. What other hosts
+ * reach too goes into a second one as well, where they read it (see {@link
+ * networkManifestDirectoryName}), and nothing else does: whoever reads a manifest
+ * can then collect it whole. Where that one cannot be written (a home over its
+ * quota) the first is all there is.
+ *
+ * What could be recorded nowhere is kept in memory and removed at this process's
  * own clean-up, since no other process will know of it. `too-large`, with
- * nothing written or added to that, for one its own reader would refuse: every pass of
- * every process would turn back at it.
+ * nothing written or added to that, for more than one manifest holds: its own
+ * reader would refuse it, and every pass of every process would turn back at it.
  */
 export function publishMountPointManifest(
   mountPoints: readonly string[],
   sources: readonly string[],
   commandKey?: string,
-): MountPointManifest | 'too-large' | undefined {
+): MountPointManifest[] | 'too-large' {
   if (!onLinux() || (mountPoints.length === 0 && sources.length === 0)) {
-    return undefined
+    return []
   }
-  const dir = ensureManifestDirectory()
-  if (dir !== undefined) {
+  type Named = { paths: string[]; sources: string[] }
+  const writer = {
+    version: MANIFEST_VERSION,
+    ...ownProcess(),
+    ns: ownPidNamespace(),
+    boot: ownBootId(),
+    created: Date.now(),
+  }
+  const textOf = (named: Named, keptYoung: boolean): string => {
+    const body: z.infer<typeof ManifestSchema> = {
+      ...writer,
+      ...(keptYoung ? { keptYoung } : {}),
+      ...named,
+    }
+    return JSON.stringify(body)
+  }
+  const all = {
+    paths: [...new Set(mountPoints)],
+    sources: [...new Set(sources)],
+  }
+  if (Buffer.byteLength(textOf(all, true)) > MANIFEST_MAX_BYTES) {
+    return 'too-large'
+  }
+  const written = (
+    dir: string | undefined,
+    named: Named,
+  ): MountPointManifest | undefined => {
+    if (dir === undefined) {
+      return undefined
+    }
     const id = path.join(
       dir,
       `${process.pid}-${randomBytes(8).toString('hex')}`,
     )
     const file = `${id}${MANIFEST_SUFFIX}`
     const temporary = `${file}${TEMPORARY_SUFFIX}`
-    const body: z.infer<typeof ManifestSchema> = {
-      version: MANIFEST_VERSION,
-      ...ownProcess(),
-      ns: ownPidNamespace(),
-      boot: ownBootId(),
-      created: Date.now(),
-      paths: [...new Set(mountPoints)],
-      sources: [...new Set(sources)],
-    }
-    const text = JSON.stringify(body)
-    if (Buffer.byteLength(text) > MANIFEST_MAX_BYTES) {
-      return 'too-large'
-    }
-    // Written beside the manifest and renamed onto it, so that it is read whole
-    // or not at all.
+    const byItsAge = !isReachedByOneKernel(dir)
     try {
-      fs.writeFileSync(temporary, text, { mode: 0o600 })
-      fs.renameSync(temporary, file)
-      ownManifests.set(file, { commandKey, over: false })
-      // Not what an earlier wrap could record nowhere and this one names too:
-      // that wrap's sandbox may outlast this manifest.
-      for (const named of [...mountPoints, ...sources]) {
-        if (unrecorded.madeByAPlan.delete(named)) {
-          unrecorded.paths.delete(named)
-          unrecorded.sources.delete(named)
-        }
+      if (byItsAge) {
+        putWhereOtherKernelsRead(file, textOf(named, true))
+      } else {
+        // Written beside the manifest and renamed onto it, so that it is read
+        // whole or not at all.
+        fs.writeFileSync(temporary, textOf(named, false), { mode: 0o600 })
+        fs.renameSync(temporary, file)
       }
+      ownManifests.set(file, { commandKey, over: false, byItsAge })
+      keepOwnManifestsYoung()
       return { dir, file, started: `${id}${STARTED_SUFFIX}` }
     } catch (e) {
-      try {
-        fs.unlinkSync(temporary)
-      } catch {
-        // Never made.
-      }
+      if (!byItsAge) drop(temporary)
       logForDebugging(
-        `[Sandbox Linux] Could not record the mount points this command relies on (${String(e)}) - they are kept in memory and removed at this process's own clean-up`,
+        `[Sandbox Linux] Could not record the mount points this command relies on in ${dir} (${String(e)})`,
         { level: 'warn' },
       )
+      return undefined
     }
   }
-  for (const mountPoint of mountPoints) unrecorded.paths.add(mountPoint)
-  for (const source of sources) unrecorded.sources.add(source)
-  for (const named of [...mountPoints, ...sources]) {
-    unrecorded.madeByAPlan.delete(named)
+  let inTheHome: string | undefined
+  try {
+    inTheHome = networkManifestDirectoryName()
+  } catch {
+    // The wrap has asked before this, and is refused by what asks after it.
   }
-  return undefined
+  const theirsToo =
+    inTheHome === undefined
+      ? { paths: [], sources: [] }
+      : {
+          paths: all.paths.filter(othersReach),
+          sources: all.sources.filter(othersReach),
+        }
+  const inTheirSight =
+    inTheHome !== undefined &&
+    theirsToo.paths.length + theirsToo.sources.length > 0 &&
+    makeOurPrivateDirectory(inTheHome)
+      ? written(inTheHome, theirsToo)
+      : undefined
+  const here = written(ensureManifestDirectory(), all)
+  if (here === undefined) {
+    // Not what the other hosts' sight of it covers: that is for them.
+    logForDebugging(
+      "[Sandbox Linux] Mount points that could not be recorded on this host are kept in memory and removed at this process's own clean-up",
+      { level: 'warn' },
+    )
+    for (const mountPoint of all.paths) unrecorded.paths.add(mountPoint)
+    for (const source of all.sources) unrecorded.sources.add(source)
+    for (const named of [...all.paths, ...all.sources]) {
+      unrecorded.madeByAPlan.delete(named)
+    }
+  } else {
+    // Not what an earlier wrap could record nowhere and this one names too:
+    // that wrap's sandbox may outlast this manifest.
+    for (const named of [...all.paths, ...all.sources]) {
+      if (unrecorded.madeByAPlan.delete(named)) {
+        unrecorded.paths.delete(named)
+        unrecorded.sources.delete(named)
+      }
+    }
+  }
+  return [inTheirSight, here].filter(manifest => manifest !== undefined)
 }
 
 /**
- * Let go of the manifest of a wrap that produced no command: released, and
+ * Let go of the manifests of a wrap that produced no command: released, and
  * collected by a pass like any other. Not unlinked: a pass elsewhere may have
  * spared a path on its word and dropped the manifest that named the path till
  * then, and what nothing names any more stays on the host for good.
  */
-export function discardMountPointManifest(file: string): void {
-  const own = ownManifests.get(file)
-  if (own !== undefined) own.over = true
+export function discardMountPointManifests(files: readonly string[]): void {
+  for (const file of files) {
+    const own = ownManifests.get(file)
+    if (own !== undefined) own.over = true
+  }
   collectMountPoints('none')
 }
 
@@ -1143,17 +1762,18 @@ type Reading = {
  * one directory is doubt.
  *
  * A pass renames a manifest to claim it, to give it back and to say that it is
- * finished, which can hide it
- * from a listing under way and from the open that follows one, and one published
- * while the directory is listed can be missed with its record shown. A record is
- * never renamed. So the reading starts over for a listed manifest that is gone
- * when opened, and for a record with no manifest listed beside it whose manifest
- * is there when asked for by name.
+ * finished, which can hide it from a listing under way, or show it twice, and
+ * hide it from the open that follows one; and one published while the directory
+ * is listed can be missed with its record shown. A record is never renamed. So
+ * the reading starts over for a manifest that is listed at two names, for one
+ * that is gone when opened, and for a record with no manifest listed beside it
+ * whose manifest is there when asked for by name. One that is {@link remembered}
+ * is not opened, and is where the listing showed it, as of the listing.
  *
- * A record with no manifest at any of its names puts the reading in doubt only while
- * a process on it runs (see {@link recordVouches}) and is spent otherwise, one
- * with no whole line past {@link MANIFEST_GRACE_MS} (its shell may be about to
- * write to it).
+ * A record with no manifest at any of its names puts the reading in doubt only
+ * while a process on it runs (see {@link recordVouches}) and is spent otherwise,
+ * one with no whole line past {@link MANIFEST_GRACE_MS} (its shell may be about
+ * to write to it).
  *
  * Whatever is at a manifest's name and cannot be read puts the reading in doubt
  * too: always where that is an error of the moment (a sandboxed command can use
@@ -1164,6 +1784,17 @@ type Reading = {
  */
 function readManifests(dirs: readonly string[]): Reading {
   const oneKernel = dirs.filter(isReachedByOneKernel)
+  // Each directory is asked after once in a reading, whatever the answer.
+  const reachedInto = new Map<string, boolean>()
+  const reached = (p: string): boolean => {
+    const dir = path.dirname(p)
+    let answer = reachedInto.get(dir)
+    if (answer === undefined) {
+      answer = othersReachInto(dir)
+      reachedInto.set(dir, answer)
+    }
+    return answer
+  }
   // What cannot be asked after counts as there.
   const isThere = (file: string): boolean => {
     try {
@@ -1183,23 +1814,25 @@ function readManifests(dirs: readonly string[]): Reading {
     const reading: Reading = { files, manifests: [], spent: [] }
     const listed = new Set<string>()
     let moved = false
+    let twice = false
     for (const file of files) {
       if (!MANIFEST_SUFFIXES.some(suffix => file.endsWith(suffix))) {
         continue
       }
+      // Listed at two of its names: renamed while the directory was listed.
+      if (listed.has(idOf(file))) {
+        twice = true
+      }
       listed.add(idOf(file))
       try {
-        const manifest = readManifest(file)
+        const manifest = readManifest(
+          file,
+          !oneKernel.includes(path.dirname(file)),
+          reached,
+        )
         if (manifest === undefined) {
           moved = true
           continue
-        }
-        if (
-          !oneKernel.includes(path.dirname(file)) &&
-          (manifest.boot === undefined || manifest.boot !== ownBootId())
-        ) {
-          delete manifest.boot
-          delete manifest.ns
         }
         reading.manifests.push(manifest)
       } catch (e) {
@@ -1219,6 +1852,9 @@ function readManifests(dirs: readonly string[]): Reading {
           reading.inDoubt ??= why.includes(file) ? why : `${file}: ${why}`
         }
       }
+    }
+    for (const id of remembered.keys()) {
+      if (!listed.has(id)) remembered.delete(id)
     }
     for (const file of files) {
       if (file.endsWith(TEMPORARY_SUFFIX)) {
@@ -1255,7 +1891,9 @@ function readManifests(dirs: readonly string[]): Reading {
         }
       }
     }
-    if (moved && attempt < LISTING_ATTEMPTS) {
+    // One that is at two names for good (a copy, a restored snapshot) is read
+    // at both in the end, and judged at each like any other.
+    if ((moved || twice) && attempt < LISTING_ATTEMPTS) {
       continue
     }
     if (moved) {
@@ -1285,11 +1923,11 @@ export type NamedMountPoints = {
  *
  * `earlier` is a reading this call may answer with. A manifest is never
  * rewritten, so it still holds when the directories list nothing it did not,
- * `own` (a manifest the caller has published since) apart.
+ * `own` (the manifests the caller has published since) apart.
  */
 export function namedMountPoints(
   earlier?: NamedMountPoints,
-  own?: string,
+  own: readonly string[] = [],
 ): NamedMountPoints | { inDoubt: string; keptChanging?: boolean } {
   try {
     const dirs = onLinux() ? believedManifestDirectories() : []
@@ -1297,7 +1935,9 @@ export function namedMountPoints(
       earlier !== undefined &&
       // What a plan has made itself since then is named from that moment.
       [...unrecorded.paths].every(kept => earlier.paths.has(kept)) &&
-      filesIn(dirs).every(file => earlier.listed.has(file) || file === own)
+      filesIn(dirs).every(
+        file => earlier.listed.has(file) || own.includes(file),
+      )
     ) {
       return earlier
     }
@@ -1353,18 +1993,27 @@ export function liveMountPoints(): ReadonlySet<string> | undefined {
   if (!onLinux()) {
     return spared
   }
-  const named = new Set(unrecorded.paths)
+  const named = new Set<string>()
   try {
-    const reading = readManifests(believedManifestDirectories())
-    if (reading.inDoubt !== undefined) {
-      throw new Error(reading.inDoubt)
-    }
-    for (const manifest of reading.manifests) {
-      if (
-        isLive(manifest) &&
-        !(manifest.finished && !canBeAskedAfter(manifest))
-      ) {
-        for (const mountPoint of manifest.paths) named.add(mountPoint)
+    for (let attempt = 1; ; attempt++) {
+      const reading = readManifests(believedManifestDirectories())
+      if (reading.inDoubt !== undefined) {
+        throw new Error(reading.inDoubt)
+      }
+      named.clear()
+      for (const mountPoint of unrecorded.paths) named.add(mountPoint)
+      try {
+        for (const manifest of reading.manifests) {
+          if (
+            !(manifest.finished && !canBeAskedAfter(manifest)) &&
+            isLive(manifest)
+          ) {
+            for (const mountPoint of manifest.paths) named.add(mountPoint)
+          }
+        }
+        break
+      } catch (e) {
+        if (!(e instanceof Moved) || attempt === LISTING_ATTEMPTS) throw e
       }
     }
   } catch (e) {
@@ -1396,30 +2045,43 @@ const inAPassName = {
 
 /**
  * Puts a pass of this process on record in each of `dirs`, until {@link
- * takePassOffRecord}. `false`, with nothing left there, where it could not be
- * in one of them: nothing may then be removed on a manifest's word.
+ * takePassOffRecord}, and returns those it is on record in. None, with nothing
+ * left there, where it could not be in one of this host's own: nothing may then
+ * be removed on a manifest's word. All but the one in the home where that takes
+ * no record (a home over its quota), which need only stop what other hosts reach
+ * from being removed.
  *
  * The name says whose it is: the pid, its start time, its PID namespace and the
  * boot, each left empty where it cannot be read. In the name, so that a pass is
  * on record whole or not at all and a listing is all it takes to judge one.
  */
-function putPassOnRecord(dirs: readonly string[]): boolean {
+function putPassOnRecord(dirs: readonly string[]): string[] {
   const { pid, start } = ownProcess()
   const name = `${pid}-${start}-${inAPassName.ns()}-${inAPassName.boot()}-${ownPassMark}${randomBytes(4).toString('hex')}${PASS_SUFFIX}`
   ownPassOnRecord = dirs.map(dir => path.join(dir, name))
-  try {
-    for (const file of ownPassOnRecord) {
-      fs.closeSync(fs.openSync(file, 'wx', 0o600))
+  const onRecordIn: string[] = []
+  for (const dir of dirs) {
+    const file = path.join(dir, name)
+    try {
+      if (isReachedByOneKernel(dir)) {
+        fs.closeSync(fs.openSync(file, 'wx', 0o600))
+      } else {
+        putWhereOtherKernelsRead(file, '')
+      }
+      onRecordIn.push(dir)
+    } catch (e) {
+      const inTheHome = dir === network
+      logForDebugging(
+        `[Sandbox Linux] The clean-up of mount points could not be put on record in ${dir} (${String(e)}) - leaving what ${inTheHome ? 'other hosts reach' : 'the manifests name'} where it is`,
+        { level: 'warn' },
+      )
+      if (!inTheHome) {
+        takePassOffRecord()
+        return []
+      }
     }
-    return true
-  } catch (e) {
-    takePassOffRecord()
-    logForDebugging(
-      `[Sandbox Linux] The clean-up of mount points could not be put on record (${String(e)}) - leaving what the manifests name where it is`,
-      { level: 'warn' },
-    )
-    return false
   }
+  return onRecordIn
 }
 
 /** One that stays behind is dropped by the next pass, of any process. */
@@ -1447,7 +2109,9 @@ function stateOfPass(
 ): 'under way' | 'over' | 'overdue' {
   const byItsAge = (): 'under way' | 'over' | 'overdue' => {
     try {
-      return Date.now() - fs.lstatSync(file).mtimeMs > PASS_MAX_AGE_MS
+      // Either way: one stamped by a clock that is hours ahead would else hold
+      // up every wrap for those hours.
+      return Math.abs(Date.now() - fs.lstatSync(file).mtimeMs) > PASS_MAX_AGE_MS
         ? 'overdue'
         : 'under way'
     } catch (e) {
@@ -1477,12 +2141,18 @@ function stateOfPass(
 /**
  * The passes on record that may be under way. Throws where the directories
  * cannot be told or listed.
+ *
+ * Without `ofOtherHosts`, for a wrap that names nothing they reach, not those in
+ * the home: a pass of another host removes nothing else, and one of this host
+ * that may is on record in a place of this host's as well.
  */
-export function passesUnderWay(): string[] {
+export function passesUnderWay(ofOtherHosts = true): string[] {
   if (!onLinux()) {
     return []
   }
-  const dirs = believedManifestDirectories()
+  const dirs = believedManifestDirectories().filter(
+    dir => ofOtherHosts || dir !== network,
+  )
   const oneKernel = dirs.filter(isReachedByOneKernel)
   return filesIn(dirs).filter(
     file =>
@@ -1506,10 +2176,14 @@ export async function passesToEnd(
   passes: readonly string[],
   signal?: AbortSignal,
   waitMs = WAITS_FOR_PASSES_MS,
+  ofOtherHosts = true,
 ): Promise<string | undefined> {
   const deadline = performance.now() + waitMs
   let left = passes
-  for (let pause = 1; ; pause = Math.min(pause * 2, 50)) {
+  // Each look at the home is some round trips, from every host that waits.
+  const longest = (): number =>
+    left.some(pass => path.dirname(pass) === network) ? 250 : 50
+  for (let pause = 1; ; pause = Math.min(pause * 2, longest())) {
     if (left.length === 0 || performance.now() >= deadline) {
       return left[0]
     }
@@ -1517,7 +2191,9 @@ export async function passesToEnd(
     signal?.throwIfAborted()
     // By its own name, which no other has: a directory that has two may be
     // listed by the other one this time.
-    const underWay = new Set(passesUnderWay().map(pass => path.basename(pass)))
+    const underWay = new Set(
+      passesUnderWay(ofOtherHosts).map(pass => path.basename(pass)),
+    )
     left = left.filter(pass => underWay.has(path.basename(pass)))
   }
 }
@@ -1554,6 +2230,20 @@ export function collectMountPoints(release: OwnManifestRelease): string[] {
   ensureManifestDirectory()
   let dirs: string[]
   try {
+    // The one in the home, where it is there, is set right as a wrap sets it. A
+    // `chmod -R g+rX ~` opens it up, and passed over for that, what the other
+    // hosts keep in it would go unread while what they reach is removed.
+    const inTheHome = networkManifestDirectoryName()
+    if (
+      inTheHome !== undefined &&
+      isOurPrivateDirectory(inTheHome, {
+        orThrow: true,
+        toWrite: false,
+        alone: false,
+      })
+    ) {
+      makeOurPrivateDirectory(inTheHome)
+    }
     dirs = believedManifestDirectories()
   } catch (e) {
     logForDebugging(
@@ -1607,17 +2297,19 @@ const childrenFirst = (paths: Iterable<string>): string[] =>
  * behind, before that reading; and a pass that cannot ask keeps nothing on the
  * word of a manifest at that name. A path that is kept is dropped from the
  * manifests of this pass and left to the one it is kept for. To a pass that
- * cannot ask (one in another PID namespace) a claim is live like any other, so
- * without the name each of two such passes would leave the path to the other's
- * manifest. With it, whichever reads second finds the other's finished, and of
- * all the manifests that name a path the pass over the last to be finished
- * keeps it for none. What such a manifest names alone is still its own
- * namespace's to remove, or anybody's once it is old. A pass that goes by the
- * age of a manifest does not give it the name: whoever can ask goes on asking.
+ * cannot ask (one in another PID namespace, or on another host) a claim is live
+ * like any other, so without the name each of two such passes would leave the
+ * path to the other's manifest. With it, whichever reads second finds the
+ * other's finished, and of all the manifests that name a path the pass over the
+ * last to be finished keeps it for none. What such a manifest names alone is
+ * still for those to remove who can ask, or for anybody once it is old. A pass
+ * that goes by the age of a manifest does not give it the name: whoever can ask
+ * goes on asking.
  *
  * INVARIANT: the pass is on record in every directory it can write from before
  * that reading until after its last removal, and removes nothing where it could
- * not be put there. A wrap lists the passes once it has published, and hands no
+ * not be put there (in the home, only a pass that may remove what other hosts
+ * reach, and that alone stays where the home takes no record). A wrap lists the passes once it has published, and hands no
  * command out while one is under way (see {@link passesToEnd}). So the wrap of
  * a manifest that the reading missed finds the pass on record, and no sandbox
  * starts under that manifest until the pass is over, for however long the pass
@@ -1625,8 +2317,9 @@ const childrenFirst = (paths: Iterable<string>): string[] =>
  *
  * INVARIANT: the directories, worked out afresh, are listed again before every
  * removal (in a pass of over {@link LISTS_BEFORE_EACH_REMOVAL_UP_TO}
- * candidates, whenever the listing is {@link LISTING_GOOD_FOR_MS} old), and
- * what has come to its name keeps what it names. The record above does not make
+ * candidates, whenever the listing is {@link LISTING_GOOD_FOR_MS} old; those
+ * that other kernels reach, whenever it is {@link NETWORK_LISTING_GOOD_FOR_MS}
+ * old), and what has come to its name keeps what it names. The record above does not make
  * this redundant. A wrap sees no record of a pass that could go on none, or only
  * in a directory the wrap does not list (one inside another sandbox, which reads
  * the shared places and cannot write them); and a pass is on no record in a
@@ -1643,6 +2336,11 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
   before.spent.forEach(drop)
   const own = new Set<string>()
   let claims = false
+  // Whether other hosts reach any of what this pass may come to remove.
+  let othersReachSome =
+    unrecordedToo &&
+    network !== undefined &&
+    [...unrecorded.paths, ...unrecorded.sources].some(othersReach)
   if (before.inDoubt === undefined) {
     // Forget own manifests that something else has removed.
     const there = new Set(before.files.map(idOf))
@@ -1651,12 +2349,22 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
         ownManifests.delete(file)
       }
     }
+    // Another pass is at one that has moved: it is that one's.
+    const isLiveOrHasMoved = (manifest: Manifest): boolean => {
+      try {
+        return isLive(manifest)
+      } catch (e) {
+        if (e instanceof Moved) return true
+        throw e
+      }
+    }
     for (const manifest of before.manifests) {
+      if (isForAnotherHostToCollect(manifest)) continue
       const claim = manifest.claimed
         ? manifest.file
         : `${idOf(manifest.file)}${CLAIMED_SUFFIX}`
       if (!manifest.claimed) {
-        if (isLive(manifest)) continue
+        if (isLiveOrHasMoved(manifest)) continue
         try {
           fs.renameSync(manifest.file, claim)
           own.add(claim)
@@ -1666,8 +2374,18 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
         }
       }
       // Asked again, now that no sandbox can start under it.
-      const over = !isLive({ ...manifest, file: claim, claimed: true })
+      const over = !isLiveOrHasMoved({
+        ...manifest,
+        file: claim,
+        claimed: true,
+      })
       claims ||= over || own.has(claim)
+      // What is in the home is collected on record there, whatever it names.
+      othersReachSome ||=
+        over &&
+        network !== undefined &&
+        (path.dirname(claim) === network ||
+          [...manifest.paths, ...manifest.sources].some(othersReach))
       // Not of one that is only old: those who can ask go on asking.
       if (over && !manifest.finished && canBeAskedAfter(manifest)) {
         try {
@@ -1695,18 +2413,31 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
     return []
   }
   const writable = dirs.filter(dir => isOurPrivateDirectory(dir))
-  // From before its record is made, whose age others go by.
+  // From before its record has its time: to whoever goes by the age of that,
+  // what a server takes to put it at its name is time the pass has had.
   const since = bothClocks()
   try {
     // Off the record it removes nothing on a manifest's word. What is left to
     // remove is what this process could record nowhere, which no wrap elsewhere
     // knows for a mount point or waits for.
+    //
+    // Not on record in the home for what no other host reaches: every wrap on
+    // every host that names what they do reach would wait for it.
+    const onRecordIn = putPassOnRecord(
+      writable.filter(dir => dir !== network || othersReachSome),
+    )
     return removeWhatIsFinished(
       dirs,
-      putPassOnRecord(writable) ? writable : [],
+      onRecordIn,
       own,
       unrecordedToo,
       since,
+      // Where the home cannot be written from here at all (mounted read-only,
+      // bound so by an outer sandbox) no pass of this host is ever seen there.
+      // It goes by the manifests it reads, as it would with no home to read.
+      network !== undefined &&
+        writable.includes(network) &&
+        !onRecordIn.includes(network),
     )
   } finally {
     takePassOffRecord()
@@ -1716,7 +2447,9 @@ function collect(dirs: readonly string[], unrecordedToo: boolean): string[] {
 /**
  * The rest of {@link collect}, for as long as the pass is on record, which it
  * has been `since`: `own` are the claims it has made, `writable` the directories
- * it can claim in.
+ * it can claim in and is on record in. With `unseenByOtherHosts` it is not on
+ * record where they look, though it could be, and nothing that they reach may
+ * go.
  */
 function removeWhatIsFinished(
   dirs: readonly string[],
@@ -1724,16 +2457,8 @@ function removeWhatIsFinished(
   own: ReadonlySet<string>,
   unrecordedToo: boolean,
   since: readonly [number, number],
+  unseenByOtherHosts: boolean,
 ): string[] {
-  const reading = readManifests(dirs)
-  if (reading.inDoubt !== undefined) {
-    logForDebugging(
-      `[Sandbox Linux] A sandbox may be running on mount points that cannot be listed - leaving every mount point where it is (${reading.inDoubt})`,
-      { level: 'warn' },
-    )
-    return []
-  }
-
   const kept = new Set<string>()
   const keep = (
     manifest: Record<'paths' | 'sources', Iterable<string>>,
@@ -1742,32 +2467,64 @@ function removeWhatIsFinished(
       kept.add(named)
     }
   }
-  // A wrap of this process is outstanding, and may be the one that relies on it.
-  if (!unrecordedToo) keep(unrecorded)
   const finished: Manifest[] = []
-  for (const manifest of reading.manifests) {
-    const asked = canBeAskedAfter(manifest)
-    if (
-      manifest.claimed &&
-      !isLive(manifest) &&
-      // Else its last process has ended, or the renaming has failed, since the
-      // claims: it is the next pass's, which says so before it reads.
-      (manifest.finished || !asked) &&
-      writable.includes(path.dirname(manifest.file))
-    ) {
-      finished.push(manifest)
-      continue
+  let reading: Reading
+  for (let attempt = 1; ; attempt++) {
+    reading = readManifests(dirs)
+    if (reading.inDoubt !== undefined) {
+      logForDebugging(
+        `[Sandbox Linux] A sandbox may be running on mount points that cannot be listed - leaving every mount point where it is (${reading.inDoubt})`,
+        { level: 'warn' },
+      )
+      return []
     }
-    // Not for this pass to remove, and nothing to keep anything for.
-    if (manifest.finished && !asked) {
-      continue
-    }
-    keep(manifest)
-    if (own.has(manifest.file)) {
-      try {
-        fs.renameSync(manifest.file, `${idOf(manifest.file)}${MANIFEST_SUFFIX}`)
-      } catch {
-        // Stays claimed, and kept while a process on its record runs.
+    kept.clear()
+    finished.length = 0
+    // A wrap of this process is outstanding, and may be the one that relies on it.
+    if (!unrecordedToo) keep(unrecorded)
+    try {
+      for (const manifest of reading.manifests) {
+        if (isForAnotherHostToCollect(manifest)) {
+          if (!manifest.finished && isLive(manifest)) keep(manifest)
+          continue
+        }
+        const asked = canBeAskedAfter(manifest)
+        if (
+          manifest.claimed &&
+          !isLive(manifest) &&
+          // Else its last process has ended, or the renaming has failed, since
+          // the claims: it is the next pass's, which says so before it reads.
+          (manifest.finished || !asked) &&
+          writable.includes(path.dirname(manifest.file))
+        ) {
+          finished.push(manifest)
+          continue
+        }
+        // Not for this pass to remove, and nothing to keep anything for.
+        if (manifest.finished && !asked) {
+          continue
+        }
+        keep(manifest)
+        if (own.has(manifest.file)) {
+          try {
+            fs.renameSync(
+              manifest.file,
+              `${idOf(manifest.file)}${MANIFEST_SUFFIX}`,
+            )
+          } catch {
+            // Stays claimed, and kept while a process on its record runs.
+          }
+        }
+      }
+      break
+    } catch (e) {
+      if (!(e instanceof Moved)) throw e
+      if (attempt === LISTING_ATTEMPTS) {
+        logForDebugging(
+          `[Sandbox Linux] The mount point manifests kept changing (${e.message}) - leaving every mount point where it is`,
+          { level: 'warn' },
+        )
+        return []
       }
     }
   }
@@ -1785,18 +2542,40 @@ function removeWhatIsFinished(
     }
   }
   const known = new Set(reading.files)
-  const goodFor =
-    candidates.size <= LISTS_BEFORE_EACH_REMOVAL_UP_TO ? 0 : LISTING_GOOD_FOR_MS
-  let listedAt = -Infinity
+  // This host's own directories as ever. Those that other kernels reach, where
+  // a listing is a round trip, by a time of their own.
+  const listed = [
+    {
+      oneKernel: true,
+      at: -Infinity,
+      goodFor:
+        candidates.size <= LISTS_BEFORE_EACH_REMOVAL_UP_TO
+          ? 0
+          : LISTING_GOOD_FOR_MS,
+    },
+    { oneKernel: false, at: -Infinity, goodFor: NETWORK_LISTING_GOOD_FOR_MS },
+  ]
   const newcomersKeepWhatTheyName = (): boolean => {
+    const due = listed.filter(
+      ({ at, goodFor }) => performance.now() - at >= goodFor,
+    )
+    if (due.length === 0) return true
     try {
       // The first place last: most is published there, so that listing is the
       // one to be a few microseconds old.
-      for (const file of filesIn(believedManifestDirectories().reverse())) {
+      const again = believedManifestDirectories()
+        .reverse()
+        .filter(dir =>
+          due.some(({ oneKernel }) => oneKernel === isReachedByOneKernel(dir)),
+        )
+      for (const file of filesIn(again)) {
         if (known.has(file) || !file.endsWith(MANIFEST_SUFFIX)) continue
         // Published, or given back, since the reading. One that is gone again
         // is looked for the next time: it may be given back once more.
-        const arrived = readManifest(file)
+        const arrived = readManifest(
+          file,
+          !isReachedByOneKernel(path.dirname(file)),
+        )
         if (arrived === undefined) continue
         keep(arrived)
         known.add(file)
@@ -1808,24 +2587,42 @@ function removeWhatIsFinished(
       )
       return false
     }
-    listedAt = performance.now()
+    for (const listing of due) listing.at = performance.now()
     return true
   }
 
   const removed: string[] = []
   const notRemoved = new Set<string>()
+  const lookedAfreshAt = new Set<string>()
   for (const candidate of childrenFirst(candidates.keys())) {
-    if (
-      performance.now() - listedAt >= goodFor &&
-      !newcomersKeepWhatTheyName()
-    ) {
+    if (!newcomersKeepWhatTheyName()) {
       return removed
     }
     if (kept.has(candidate)) {
       continue
     }
+    if (unseenByOtherHosts && othersReach(candidate)) {
+      notRemoved.add(candidate)
+      continue
+    }
+    // What is removed is looked at first, and removed by its name: another host
+    // may have put a file of the user's there since this one last asked.
+    if (!lookedAfreshAt.has(path.dirname(candidate))) {
+      lookedAfreshAt.add(path.dirname(candidate))
+      lookAfreshAt([candidate])
+    }
+    // Or have written into the very file (old bubblewrap makes it 0644), which
+    // leaves the directory as it was.
+    if (network !== undefined && othersReach(candidate)) {
+      openAndClose(
+        candidate,
+        fs.constants.O_RDONLY |
+          fs.constants.O_NOFOLLOW |
+          fs.constants.O_NONBLOCK,
+      )
+    }
     // To a process that cannot ask after this one the pass is over by its age.
-    // The last thing before a removal, after all that may have taken time.
+    // Asked last, after all that may have waited for a server.
     if (bothClocks().some((now, i) => now - since[i]! > PASS_GOOD_FOR_MS)) {
       logForDebugging(
         '[Sandbox Linux] The clean-up of mount points has taken too long - leaving the rest to the next',
@@ -1869,9 +2666,9 @@ function removeWhatIsFinished(
 }
 
 /**
- * Look for the places that follow from the user id under `under` instead of
- * `/`. Test seam, and nothing else may call it: no environment keeps a test out
- * of the ones the user's own processes keep.
+ * Look for the places that follow from the user id, for /etc/passwd and for
+ * `getent` under `under` instead of `/`. Test seam, and nothing else may call it: no
+ * environment keeps a test out of the ones the user's own processes keep.
  */
 export function setMountPointManifestPlacesForTesting(under: string): void {
   root = under
@@ -1887,7 +2684,17 @@ export function setMountPointManifestPlacesForTesting(under: string): void {
 export function forgetMountPointManifestDirectory(): void {
   pidNamespace = null
   bootId = undefined
+  home = undefined
+  noAnswer = undefined
+  network = undefined
+  foundWithinOthersReach.clear()
+  remembered.clear()
   manifestDirectory = undefined
   manifestDirectoryIsPrivate = false
   manifestDirectoryUnavailable = false
+  if (keptYoung !== undefined) {
+    clearInterval(keptYoung)
+    keptYoung = undefined
+  }
+  settingTimes = false
 }

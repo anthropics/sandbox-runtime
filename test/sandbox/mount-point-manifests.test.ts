@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import {
   collectMountPoints,
-  discardMountPointManifest,
+  discardMountPointManifests,
   forgetMountPointManifestDirectory,
   keepTrackOfMountPoint,
   keepTrackOfMountSource,
@@ -114,8 +114,8 @@ describe.if(isLinux)('The mount point manifests', () => {
 
   /** The manifest this process publishes for a wrap that names `paths`. */
   function publish(paths: string[], sources: string[] = []): string {
-    const manifest = publishMountPointManifest(paths, sources)
-    if (manifest === undefined || manifest === 'too-large') {
+    const [manifest] = publishMountPointManifest(paths, sources)
+    if (manifest === undefined || typeof manifest === 'string') {
       throw new Error(`not published: ${manifest}`)
     }
     return manifest.file
@@ -191,7 +191,7 @@ describe.if(isLinux)('The mount point manifests', () => {
   }
 
   const COLLECT = `m.collectMountPoints('all')`
-  const PUBLISH = `console.log(JSON.stringify(m.publishMountPointManifest(['/nonexistent/x'], []) ?? null))`
+  const PUBLISH = `console.log(JSON.stringify(m.publishMountPointManifest(['/nonexistent/x'], [])[0] ?? null))`
 
   it.if(BWRAP_CAN_NAMESPACE && NOT_ROOT)(
     'collects nothing on the word of a directory that is read-only from here',
@@ -259,7 +259,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     let published: { status: number | null; stdout: string } | undefined
     const pass = duringTheNextPass(() => {
       published = inAChild(
-        `console.log(JSON.stringify(m.publishMountPointManifest([${JSON.stringify(X)}], []) ?? null))`,
+        `console.log(JSON.stringify(m.publishMountPointManifest([${JSON.stringify(X)}], [])[0] ?? null))`,
       )
     })
     let removed: string[]
@@ -292,7 +292,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     expect(readdirSync(DIR)).toEqual([basename(newcomer!)])
 
     const live = started(manifestOfADeadProcess([Y]), thisProcess())
-    discardMountPointManifest(newcomer!)
+    discardMountPointManifests([newcomer!])
     expect(existsSync(X)).toBe(false)
     // What another manifest names as well is that one's to keep.
     expect(existsSync(Y)).toBe(true)
@@ -1162,7 +1162,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       return (write as (...args: unknown[]) => void)(file, ...rest)
     }) as never)
     try {
-      expect(publishMountPointManifest(paths, sources)).toBeUndefined()
+      expect(publishMountPointManifest(paths, sources)).toEqual([])
     } finally {
       spy.mockRestore()
     }
@@ -1696,7 +1696,13 @@ describe.if(isLinux)('The mount point manifests', () => {
       if (type instanceof Error) throw type
       return { type }
     }) as never)
-    return { restore: () => spy.mockRestore() }
+    // With what the library remembers of the answers.
+    return {
+      restore: () => {
+        spy.mockRestore()
+        forgetMountPointManifestDirectory()
+      },
+    }
   }
 
   it('is finished when written in another boot, whatever runs on its record and whichever PID namespace wrote it', () => {
@@ -1773,6 +1779,8 @@ describe.if(isLinux)('The mount point manifests', () => {
       const bothAged = (manifest: string, minutes: number): void => {
         aged(manifest, minutes)
         aged(recordOf(manifest), minutes)
+        // A time is only ever set forward, and the library counts on that.
+        forgetMountPointManifestDirectory()
       }
       forgetMountPointManifestDirectory()
       const spies = [onAFileSystemOf(0x6969)]
@@ -1860,7 +1868,7 @@ describe.if(isLinux)('The mount point manifests', () => {
       // at with a /dev/shm of the child's own, not the one every process has.
       const SHM = '/dev/shm'
       const launcher = ['bwrap', '--dev-bind', '/', '/', '--tmpfs', SHM, '--']
-      const publishAndList = `const { readdirSync } = await import('node:fs')\nconsole.log(JSON.stringify({ manifest: m.publishMountPointManifest(['/nonexistent/x'], []) ?? null, made: readdirSync(${JSON.stringify(SHM)}) }))`
+      const publishAndList = `const { readdirSync } = await import('node:fs')\nconsole.log(JSON.stringify({ manifest: m.publishMountPointManifest(['/nonexistent/x'], [])[0] ?? null, made: readdirSync(${JSON.stringify(SHM)}) }))`
       const fellBack = inAChild(publishAndList, {
         launcher,
         env: { XDG_RUNTIME_DIR: SHM },
@@ -2537,7 +2545,7 @@ describe.if(isLinux)('The mount point manifests', () => {
             `m.setMountPointManifestPlacesForTesting(${JSON.stringify(join(BASE, 'root'))})`,
             `const named = [...m.namedMountPoints().paths].sort()`,
             `const removed = m.collectMountPoints('all')`,
-            `console.log(JSON.stringify({ named, removed, file: m.publishMountPointManifest(['/nonexistent/x'], []).file }))`,
+            `console.log(JSON.stringify({ named, removed, file: m.publishMountPointManifest(['/nonexistent/x'], [])[0].file }))`,
           ].join('\n'),
           {
             launcher: [
@@ -2578,7 +2586,7 @@ describe.if(isLinux)('The mount point manifests', () => {
           `const at = ${JSON.stringify({ X, directory, source })}`,
           `const { existsSync } = await import('node:fs')`,
           `const there = () => [at.X, at.directory, at.source].map(p => existsSync(p))`,
-          `const published = m.publishMountPointManifest([at.X, at.directory], [at.source]) ?? null`,
+          `const published = m.publishMountPointManifest([at.X, at.directory], [at.source])[0] ?? null`,
           `const named = [...m.namedMountPoints().paths].sort()`,
           `const held = [...m.liveMountPoints()].sort()`,
           `const some = { removed: m.collectMountPoints('none'), there: there() }`,
@@ -3007,12 +3015,12 @@ describe.if(isLinux)('The mount point manifests', () => {
     }
     // The caller knows what it has published itself.
     const own = publish([Y])
-    expect(namedMountPoints(first, own)).toBe(first)
+    expect(namedMountPoints(first, [own])).toBe(first)
     expect([...reads(namedMountPoints(first)).paths].sort()).toEqual(
       [X, Y].sort(),
     )
     manifestOfADeadProcess([Z])
-    expect([...reads(namedMountPoints(first, own)).paths].sort()).toEqual(
+    expect([...reads(namedMountPoints(first, [own])).paths].sort()).toEqual(
       [X, Y, Z].sort(),
     )
   })
@@ -3110,7 +3118,7 @@ describe.if(isLinux)('The mount point manifests', () => {
     const elsewhere = inAChild(
       [
         `const u = await import(${LIBRARY})`,
-        `const published = m.publishMountPointManifest([${JSON.stringify(X)}], []) ?? null`,
+        `const published = m.publishMountPointManifest([${JSON.stringify(X)}], [])[0] ?? null`,
         `const live = [...m.liveMountPoints()]`,
         `const directories = m.mountPointManifestDirectories()`,
         `const collected = m.collectMountPoints('all')`,
