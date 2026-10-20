@@ -1,5 +1,9 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
-import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
+import {
+  NetworkConfigSchema,
+  SandboxRuntimeConfigSchema,
+  WindowsConfigSchema,
+} from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
 
@@ -108,11 +112,30 @@ describe('Config Validation', () => {
         'git push': ['/usr/bin/nc'],
       },
       enableWeakerNestedSandbox: true,
+      allowNestedUserNamespaces: true,
       enableWeakerNetworkIsolation: false,
     }
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
     expect(result.success).toBe(true)
+    expect(result.data?.allowNestedUserNamespaces).toBe(true)
+  })
+
+  test('allowNestedUserNamespaces is a boolean, and absent unless given', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+    expect(
+      SandboxRuntimeConfigSchema.safeParse(base).data
+        ?.allowNestedUserNamespaces,
+    ).toBeUndefined()
+    expect(
+      SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        allowNestedUserNamespaces: 'yes',
+      }).success,
+    ).toBe(false)
   })
 
   test('should reject missing required fields', () => {
@@ -204,6 +227,31 @@ describe('Config Validation', () => {
         filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
       })
       expect(result.success).toBe(false)
+    }
+  })
+
+  test('network.ambiguousRequestTarget takes its three values and no other', () => {
+    const parse = (ambiguousRequestTarget: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          ambiguousRequestTarget,
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+    for (const value of [
+      undefined,
+      'refuse',
+      'asSpelled',
+      'normalize',
+    ] as const) {
+      const result = parse(value)
+      expect(result.success).toBe(true)
+      expect(result.data?.network.ambiguousRequestTarget).toBe(value)
+    }
+    for (const value of ['', 'normalized', 'asspelled', true, null]) {
+      expect(parse(value).success).toBe(false)
     }
   })
 
@@ -2299,6 +2347,62 @@ describe('Config Validation', () => {
           expect(parse({ handshakeTimeoutMs: v }).success).toBe(false)
         }
       })
+    })
+  })
+
+  describe('network.allowLocalBinding', () => {
+    const parse = (network: Record<string, unknown>) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [], ...network },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+
+    test('is unset by default and takes a boolean, nothing else', () => {
+      const none = parse({})
+      expect(none.success).toBe(true)
+      if (none.success) {
+        expect(none.data.network.allowLocalBinding).toBeUndefined()
+      }
+      for (const v of [true, false]) {
+        const r = parse({ allowLocalBinding: v })
+        expect(r.success).toBe(true)
+        if (r.success) expect(r.data.network.allowLocalBinding).toBe(v)
+      }
+      // No port list, range or mode word: it is a toggle.
+      for (const v of ['all', 1, [3000, 3099], null]) {
+        expect(parse({ allowLocalBinding: v }).success).toBe(false)
+      }
+    })
+
+    test('its description says what it does on each platform', () => {
+      const text = NetworkConfigSchema.shape.allowLocalBinding.description ?? ''
+      for (const platform of ['macOS', 'Windows', 'Linux']) {
+        expect(text).toContain(platform)
+      }
+    })
+  })
+
+  describe('reading the user profile on Windows is not a setting', () => {
+    const parse = (windows?: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        ...(windows !== undefined && { windows }),
+      })
+
+    test('the windows block has no key that turns it on, lists exclusions, or re-admits one', () => {
+      const keys = Object.keys(WindowsConfigSchema.shape)
+      for (const gone of [
+        'profileRead',
+        'profileReadExclude',
+        'profileReadInclude',
+        'dangerouslyAllowReadOfProfileExclusions',
+      ]) {
+        expect(keys).not.toContain(gone)
+      }
+      const r = parse({ profileRead: false, profileReadExclude: ['.x'] })
+      expect(r.success).toBe(true)
+      expect(Object.keys((r.success && r.data.windows) || {})).toEqual([])
     })
   })
 })

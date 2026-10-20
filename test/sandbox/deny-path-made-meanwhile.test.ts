@@ -76,12 +76,15 @@ describe.if(isLinux)('A deny path made while the wrap is looking', () => {
     expect(countMounts(wrapped, '--ro-bind', '/dev/null', denied)).toBe(1)
   })
 
-  it('still leaves alone a path beneath a file, which can never be created', async () => {
+  it('still lays nothing at a path beneath a file, and keeps the file', async () => {
     writeFileSync(join(area, '.git'), 'gitdir: elsewhere\n')
     const denied = join(area, '.git', 'hooks')
 
     const wrapped = await wrap(denied)
 
     expect(wrapped).not.toContain(denied)
+    expect(
+      countMounts(wrapped, '--ro-bind', join(area, '.git'), join(area, '.git')),
+    ).toBe(1)
   })
 })

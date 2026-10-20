@@ -28,6 +28,12 @@ const CA_PEM = readFileSync(CA_CERT, 'utf8')
 
 const TLS_UPSTREAM_NAME = 'badstatus.test'
 
+/** By path: the body an upstream declares, which `EXCESS` then follows. */
+const DECLARED: Record<string, string> = {
+  '/more-than-declared': 'whole',
+  '/more-in-one-write': 'whole',
+}
+
 /**
  * Fake upstream speaking raw bytes, so it can send response heads a real
  * HTTP server would refuse to produce. The reply depends on the request path.
@@ -44,6 +50,20 @@ function answer(socket: Socket): void {
       socket.write('HTTP/1.1 099 x\r\nX-Up: 1\r\nContent-Length: 4\r\n\r\nleak')
     } else if (path === '/status-000') {
       socket.write('HTTP/1.1 000 x\r\nX-Up: 1\r\nContent-Length: 4\r\n\r\nleak')
+    } else if (path in DECLARED) {
+      const body = DECLARED[path]!
+      const head = `HTTP/1.1 200 OK\r\nContent-Length: ${body.length}\r\n\r\n`
+      if (path === '/more-in-one-write') socket.write(`${head}${body}EXCESS`)
+      else socket.write(head, () => socket.write(`${body}EXCESS`))
+    } else if (path === '/bad-chunk') {
+      socket.write(
+        'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n',
+        () => socket.write('5\r\nwhole\r\nnot a size\r\n'),
+      )
+    } else if (path === '/less-than-declared') {
+      socket.write('HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n', () =>
+        socket.end('whole'),
+      )
     } else {
       socket.write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok')
     }
@@ -167,6 +187,31 @@ describe('invalid upstream status line', () => {
         expect(good.raw.endsWith('ok')).toBe(true)
       })
     }
+
+    const bodyOf = (raw: string): string =>
+      raw.slice(raw.indexOf('\r\n\r\n') + 4)
+
+    // As from an upstream that counts characters for bytes. A client that asks
+    // it directly takes what was declared.
+    for (const path of Object.keys(DECLARED)) {
+      test(`${name}: ${path} arrives as declared, and no more`, async () => {
+        const got = await get(path)
+        expect(got.status).toBe(200)
+        expect(bodyOf(got.raw) === DECLARED[path]).toBe(true)
+      })
+    }
+
+    test(`${name}: /less-than-declared stays short of it`, async () => {
+      const got = await get('/less-than-declared')
+      expect(got.raw).toMatch(/\r\ncontent-length: 9\r\n/i)
+      expect(bodyOf(got.raw)).toBe('whole')
+    })
+
+    test(`${name}: /bad-chunk is not ended as a whole answer is`, async () => {
+      const got = await get('/bad-chunk')
+      expect(got.raw).not.toMatch(/\r\ncontent-length:/i)
+      expect(got.raw.endsWith('0\r\n\r\n')).toBe(false)
+    })
   }
 })
 

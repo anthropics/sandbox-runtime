@@ -10,21 +10,18 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import {
-  globToRegex,
-  walkGlobPattern,
-} from '../../src/sandbox/sandbox-utils.js'
+import { globToRegex } from '../../src/sandbox/glob-pattern.js'
+import { walkGlobPattern } from '../../src/sandbox/sandbox-utils.js'
 import { isWindows } from '../helpers/platform.js'
 
 /**
- * The walk reads a pattern one path component at a time; globToRegex reads
- * the same pattern as one regular expression over a whole path, and nothing
- * else in the tree holds the two together.
+ * The walk takes a pattern's tokens one path component at a time; globToRegex
+ * makes of them one regular expression over a whole path, and nothing else in
+ * the tree holds the two together.
  *
  * Over trees with no symlinks, where every path below the base is reached by
  * exactly one name, the two must agree exactly: what the walk returns is what
- * the regular expression matches beneath the pattern's base. A pattern the
- * walk cannot split is in the sample too.
+ * the regular expression matches beneath the pattern's base.
  *
  * Seeded, so a failure is reproducible, and bounded, so the suite stays fast.
  * Not run on Windows, where a path is spelled with the other separator.
@@ -32,8 +29,8 @@ import { isWindows } from '../helpers/platform.js'
 
 /** Names that put the interesting readings next to each other: a bracket set
  *  that can match a separator (`[+-9]` spans `/`), a `**` written against
- *  text, a name that is a prefix of another, and brackets that spell no set
- *  (`b-a` runs backwards). */
+ *  text, a name that is a prefix of another, a wildcard that is a member of a
+ *  set, and brackets that spell no set (`b-a` runs backwards). */
 const NAME = fc.constantFrom(
   'a',
   'b',
@@ -44,6 +41,7 @@ const NAME = fc.constantFrom(
   'y.pem',
   'a9',
   's',
+  '*',
   '[b-a]',
 )
 

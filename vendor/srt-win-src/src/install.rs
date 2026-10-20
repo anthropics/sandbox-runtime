@@ -15,17 +15,52 @@
 //! ([`provision_machine_store`]).
 
 use anyhow::{Context, Result, anyhow};
+use windows::core::GUID;
 
 use crate::state_db;
 use crate::{dpapi, logon, runner, user};
 
-/// Bumped on schema-incompatible changes to the `sandbox_user`
-/// row, or when `install` gains a step existing installs must pick
-/// up (v2: ambient write-deny stamps — `ambient.rs`). The broker
-/// compares this to the on-disk marker and refuses with a "re-run
-/// `srt-win install`" message on mismatch; `install` treats a stale
-/// marker as a partial install and completes the missing steps.
-pub const SETUP_VERSION: u32 = 2;
+/// Bumped when the `sandbox_user` row changes, when `install` gains a
+/// step (v2: ambient stamps), or when an older broker must stop
+/// launching here (v3: kept write grants). See [`check_marker`].
+pub const SETUP_VERSION: u32 = 3;
+
+/// `Err` unless `marker_version` is the one this build was made with.
+/// The message is what `read_cred` callers print; it names the repair.
+pub fn check_marker(marker_version: u32) -> Result<()> {
+    if marker_version != SETUP_VERSION {
+        return Err(anyhow!(
+            "setup marker version mismatch (have {marker_version}, expected \
+             {SETUP_VERSION}); re-run `srt-win install`",
+        ));
+    }
+    Ok(())
+}
+
+/// Why a plain `install` must not replace an install with this marker
+/// version (a newer build made it); `None` when it may proceed.
+pub fn newer_setup_refusal(marker_version: u32) -> Option<String> {
+    (marker_version > SETUP_VERSION).then(|| {
+        format!(
+            "existing install has setup version {marker_version}, newer than this \
+             build's {SETUP_VERSION}; not replacing it. Use the release that made it, \
+             or pass --force to replace it with this one."
+        )
+    })
+}
+
+/// The install record, only if its marker is this build's
+/// ([`check_marker`]): required before launching or keeping a grant.
+pub fn require_current_setup() -> Result<SetupInfo> {
+    let info = read_setup()?.ok_or_else(|| {
+        anyhow!(
+            "no sandbox-user setup record in the state store — run \
+             `srt-win install`"
+        )
+    })?;
+    check_marker(info.marker_version)?;
+    Ok(info)
+}
 
 #[derive(Debug, Clone)]
 pub struct SetupInfo {
@@ -327,6 +362,143 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
     }))
 }
 
+/// Registry value (MULTI_SZ): one `<sublayer guid>=<mode>` line per
+/// sublayer whose filters an install wrote; an uninstall removes the line.
+const LOOPBACK_MODES_VALUE: &str = "LoopbackModes";
+
+const MODE_OPEN: &str = "open";
+const MODE_CLOSED: &str = "closed";
+/// The mode while an install replaces a set with the other mode: it
+/// reads as an error, so nothing is launched until the install is done.
+const MODE_CHANGING: &str = "changing";
+
+fn sublayer_key(sublayer: &GUID) -> String {
+    let d = sublayer.data4;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        sublayer.data1,
+        sublayer.data2,
+        sublayer.data3,
+        d[0],
+        d[1],
+        d[2],
+        d[3],
+        d[4],
+        d[5],
+        d[6],
+        d[7]
+    )
+}
+
+/// Parse the record lines; a line without `=` is dropped.
+fn parse_loopback_modes(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            Some((k.to_ascii_lowercase(), v.to_string()))
+        })
+        .collect()
+}
+
+/// `modes` with `key` set to `mode` (`None` removes it), as lines to store.
+fn loopback_modes_with(
+    mut modes: Vec<(String, String)>,
+    key: &str,
+    mode: Option<&str>,
+) -> Vec<String> {
+    modes.retain(|(k, _)| k != key);
+    if let Some(mode) = mode {
+        modes.push((key.to_string(), mode.to_string()));
+    }
+    modes.iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+/// The loopback mode sandboxed commands run under, over every recorded
+/// sublayer: open only if each is open (one closed set's BLOCK applies
+/// to all), closed with no record. Any other word is an error, never "closed".
+fn effective_loopback(modes: &[(String, String)]) -> Result<bool> {
+    if let Some((k, v)) = modes
+        .iter()
+        .find(|(_, v)| v != MODE_OPEN && v != MODE_CLOSED)
+    {
+        return Err(anyhow!(
+            "recorded loopback mode '{v}' (sublayer {k}) is not one this build knows"
+        ));
+    }
+    Ok(!modes.is_empty() && modes.iter().all(|(_, v)| v == MODE_OPEN))
+}
+
+fn set_loopback_mode(sublayer: &GUID, mode: Option<&str>) -> Result<()> {
+    let base = match mode {
+        Some(_) => crate::reg::Key::create(crate::reg::BASE, None)?.0,
+        None => match crate::reg::Key::open(crate::reg::BASE, true)? {
+            Some(base) => base,
+            None => return Ok(()),
+        },
+    };
+    let modes = parse_loopback_modes(&base.get_multi_sz(LOOPBACK_MODES_VALUE)?.unwrap_or_default());
+    let lines = loopback_modes_with(modes, &sublayer_key(sublayer), mode);
+    base.set_multi_sz(LOOPBACK_MODES_VALUE, &lines)
+}
+
+/// Record the loopback mode of the filters committed under `sublayer`.
+/// Call only AFTER the WFP transaction commits.
+pub fn write_loopback_mode(sublayer: &GUID, open: bool) -> Result<()> {
+    set_loopback_mode(sublayer, Some(if open { MODE_OPEN } else { MODE_CLOSED }))
+}
+
+/// Mark `sublayer`'s mode as changing, BEFORE its filters are replaced
+/// with the other mode's.
+pub fn mark_loopback_mode_changing(sublayer: &GUID) -> Result<()> {
+    set_loopback_mode(sublayer, Some(MODE_CHANGING))
+}
+
+/// Drop `sublayer`'s recorded mode; every path that deletes its filters calls this.
+pub fn clear_loopback_mode(sublayer: &GUID) -> Result<()> {
+    set_loopback_mode(sublayer, None)
+}
+
+fn read_loopback_modes() -> Result<Vec<(String, String)>> {
+    Ok(match crate::reg::Key::open(crate::reg::BASE, false)? {
+        Some(base) => {
+            parse_loopback_modes(&base.get_multi_sz(LOOPBACK_MODES_VALUE)?.unwrap_or_default())
+        }
+        None => Vec::new(),
+    })
+}
+
+/// The mode recorded for `sublayer` alone; `Ok(None)` with no line.
+pub fn read_loopback_mode(sublayer: &GUID) -> Result<Option<bool>> {
+    let key = sublayer_key(sublayer);
+    let own: Vec<_> = read_loopback_modes()?
+        .into_iter()
+        .filter(|(k, _)| *k == key)
+        .collect();
+    Ok(if own.is_empty() {
+        None
+    } else {
+        Some(effective_loopback(&own)?)
+    })
+}
+
+/// Whether the install record says loopback is open for sandboxed
+/// commands ([`effective_loopback`]); `Ok(false)` with no install.
+pub fn read_allow_loopback() -> Result<bool> {
+    effective_loopback(&read_loopback_modes()?)
+}
+
+/// `Err` (operator-facing text) unless the session's loopback mode is
+/// the one the install record has; a difference either way is refused.
+pub fn require_allow_loopback(configured: bool) -> std::result::Result<(), String> {
+    let installed = read_allow_loopback().map_err(|e| format!("read loopback mode: {e:#}"))?;
+    if installed == configured {
+        Ok(())
+    } else {
+        Err(crate::wfp::loopback_mismatch_hint(installed, configured))
+    }
+}
+
 /// Read the recorded MITM CA (DER), if `srt-win user trust-ca`
 /// ever ran. `Ok(None)` when no install has run or no CA
 /// is recorded.
@@ -363,20 +535,7 @@ impl Drop for SandboxCred {
 /// is DENY'd on it (and on the store directory) and so cannot call
 /// this to learn its own password.
 pub fn read_cred() -> Result<SandboxCred> {
-    let info = read_setup()?.ok_or_else(|| {
-        anyhow!(
-            "no sandbox-user setup record in the state store — run \
-             `srt-win install`"
-        )
-    })?;
-    if info.marker_version != SETUP_VERSION {
-        return Err(anyhow!(
-            "setup marker version mismatch (have {}, expected {}); \
-             re-run `srt-win install`",
-            info.marker_version,
-            SETUP_VERSION,
-        ));
-    }
+    let info = require_current_setup()?;
     let blob = read_cred_blob()?;
     let pw = String::from_utf8(dpapi::unprotect(&blob)?).context("password is not UTF-8")?;
     Ok(SandboxCred {
@@ -436,6 +595,7 @@ pub fn trust_ca(der: &crate::cert_store::CertDer, cred: &SandboxCred, sb_sid: &s
         None,
         &runner::RunnerCmd::InstallCa { der: der.clone() },
         false,
+        None,
     )
     .context("spawn runner for CA install")?;
     if code != 0 {
@@ -471,9 +631,75 @@ pub fn clear_setup() -> Result<()> {
             "SandboxGroupSid",
             "MarkerVersion",
             "CreatedAt",
+            LOOPBACK_MODES_VALUE,
         ] {
             crate::reg::delete_value(&base, v)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wfp::DEFAULT_SUBLAYER_GUID;
+
+    const A: &str = "2c5d0ad6-5f3b-4d4e-9b8f-1a3e7c9d0b21";
+    const B: &str = "7d3c1a52-6e0b-4f8a-b1d4-2a9c5e7f3b60";
+
+    fn modes(v: &[&str]) -> Vec<(String, String)> {
+        parse_loopback_modes(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn sublayer_key_is_the_lowercase_guid() {
+        assert_eq!(sublayer_key(&DEFAULT_SUBLAYER_GUID), A);
+    }
+
+    #[test]
+    fn one_sublayer_changes_only_its_own_line() {
+        let both = [format!("{A}=closed"), format!("{B}=open")];
+        let got = loopback_modes_with(modes(&[&both[0], &both[1]]), A, Some(MODE_OPEN));
+        assert_eq!(got, [format!("{B}=open"), format!("{A}=open")]);
+        // An uninstall removes the line and leaves the other.
+        let got = loopback_modes_with(modes(&[&both[0], &both[1]]), A, None);
+        assert_eq!(got, [format!("{B}=open")]);
+        // A key is matched whatever its case; a line without `=` is dropped.
+        let upper = format!("{}=open", A.to_uppercase());
+        assert_eq!(modes(&[&upper, "junk"]), modes(&[&format!("{A}=open")]));
+    }
+
+    #[test]
+    fn loopback_is_open_only_when_every_recorded_set_is() {
+        // No record: nothing installed, or a set from before the record.
+        assert!(!effective_loopback(&[]).unwrap());
+        assert!(effective_loopback(&modes(&[&format!("{A}=open")])).unwrap());
+        assert!(!effective_loopback(&modes(&[&format!("{A}=closed")])).unwrap());
+        // One closed set's BLOCK applies to every sandboxed connect.
+        let mixed = modes(&[&format!("{A}=open"), &format!("{B}=closed")]);
+        assert!(!effective_loopback(&mixed).unwrap());
+    }
+
+    #[test]
+    fn a_mode_that_is_changing_or_unknown_is_an_error_not_closed() {
+        for word in [MODE_CHANGING, "1", ""] {
+            let m = modes(&[&format!("{A}=open"), &format!("{B}={word}")]);
+            assert!(effective_loopback(&m).is_err(), "{word:?}");
+        }
+    }
+
+    #[test]
+    fn only_this_builds_marker_version_passes() {
+        assert!(check_marker(SETUP_VERSION).is_ok());
+        // Only a newer install is refused; an older one is upgraded.
+        assert!(newer_setup_refusal(SETUP_VERSION).is_none());
+        assert!(newer_setup_refusal(SETUP_VERSION - 1).is_none());
+        let why = newer_setup_refusal(SETUP_VERSION + 1).unwrap();
+        assert!(why.contains("newer than this build's"), "{why}");
+        for other in [0, SETUP_VERSION - 1, SETUP_VERSION + 1, 99] {
+            let e = check_marker(other).unwrap_err().to_string();
+            assert!(e.contains("marker version mismatch"), "{e}");
+            assert!(e.contains("re-run `srt-win install`"), "{e}");
+        }
+    }
 }

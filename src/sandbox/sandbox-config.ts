@@ -726,7 +726,20 @@ export const NetworkConfigSchema = z.object({
   allowLocalBinding: z
     .boolean()
     .optional()
-    .describe('Whether to allow binding to local ports (default: false)'),
+    .describe(
+      'Whether sandboxed commands may use local ports directly (default: ' +
+        'false). macOS: allows binding and accepting on any local port ' +
+        'and connecting to localhost on any port. Windows: allows ' +
+        'connecting to loopback addresses (127.0.0.0/8, ::1) on any TCP ' +
+        'or UDP port; it is part ' +
+        'of the machine-wide filter set, so it MUST match how `srt-win ' +
+        'install` was run (`--allow-loopback` or not) and a session that ' +
+        'differs from the install is refused. Linux: ignored — the ' +
+        'sandbox has its own network namespace, whose loopback is ' +
+        'always usable and is not the host one. Every service listening ' +
+        'on localhost becomes reachable, including any local proxy or ' +
+        'forwarder that would carry traffic off the machine.',
+    ),
   allowMachLookup: z
     .array(
       z.string().refine(
@@ -779,7 +792,7 @@ export const NetworkConfigSchema = z.object({
         'request is denied. Applies to plain HTTP through the proxy and, ' +
         'when tlsTerminate is configured, to terminated HTTPS. SRT does not ' +
         'provide a policy language; library consumers own matching. This and ' +
-        'the four options after it are read when the proxy starts; ' +
+        'the five options after it are read when the proxy starts; ' +
         'updateConfig does not change them.',
     ),
   allowPlaintextHeaderSet: z
@@ -818,6 +831,21 @@ export const NetworkConfigSchema = z.object({
         'absolute-form authority does not name the host and port it is sent ' +
         'to, before filterRequest is asked. Refusals are recorded as ' +
         'violations.',
+    ),
+  ambiguousRequestTarget: z
+    .enum(['refuse', 'asSpelled', 'normalize'])
+    .optional()
+    .describe(
+      'While filterRequest is set: what becomes of a request whose target ' +
+        'names another path once normalized than as the client spelled it ' +
+        '(a dot segment, "%2e" included, leading slashes or "\\"), so that ' +
+        'the upstream may act on another resource than the callback judged. ' +
+        '"refuse" (default): 400 before filterRequest is asked, recorded as ' +
+        'a violation. "asSpelled": forwarded as spelled; the callback has to ' +
+        'hold for every reading of it, and gets requestTarget, ' +
+        'normalizedRequestTarget and requestTargetIsAmbiguous. "normalize": ' +
+        'forwarded normalized, which breaks a signature over the path and ' +
+        'names another resource to an upstream that takes the path literally.',
     ),
   tlsTerminate: z
     .object({
@@ -879,13 +907,16 @@ export const NetworkConfigSchema = z.object({
         .describe(
           'At most this many CONNECT tunnels are TLS-terminated at once ' +
             '(default 256); past it a CONNECT is answered 503 with ' +
-            '"X-Proxy-Error: too-many-tunnels". A tunnel holds its slot from ' +
-            'its CONNECT until it closes, so idle keep-alive tunnels count; ' +
+            '"X-Proxy-Error: too-many-tunnels", and the refusal is recorded ' +
+            'as a violation, once per command until half the slots are free ' +
+            'again. A tunnel holds its slot from its CONNECT until it ' +
+            'closes, so idle keep-alive tunnels count until they are closed ' +
+            '(6 s after a response); ' +
             'one that turns out not to carry TLS frees it. The slot is taken ' +
             'before the first bytes are seen, so at the cap a non-TLS CONNECT ' +
             '(SSH, say) to a host that would be terminated is refused too. ' +
-            'Hosts in excludeDomains do not count. Read when the proxy ' +
-            'starts; updateConfig does not change it.',
+            'Hosts in excludeDomains do not count. Read at each CONNECT, so ' +
+            'updateConfig changes it for the tunnels that follow.',
         ),
       handshakeTimeoutMs: z
         .number()
@@ -897,8 +928,8 @@ export const NetworkConfigSchema = z.object({
           'A tunnel to be TLS-terminated must finish its TLS handshake ' +
             'within this many milliseconds of its CONNECT (default 10000), ' +
             'or it is closed and its slot freed. A tunnel past its handshake ' +
-            'is never timed out by it. Read when the proxy starts; ' +
-            'updateConfig does not change it.',
+            'is never timed out by it. Read at each CONNECT, so ' +
+            'updateConfig changes it for the tunnels that follow.',
         ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {
@@ -1158,6 +1189,15 @@ export const SandboxRuntimeConfigSchema = z
       .boolean()
       .optional()
       .describe('Enable weaker nested sandbox mode (for Docker environments)'),
+    allowNestedUserNamespaces: z
+      .boolean()
+      .optional()
+      .describe(
+        'Let the sandboxed command create user namespaces of its own (Linux only), as a browser ' +
+          'sandbox, rootless podman or a nested bubblewrap does. This gives up the write denies against ' +
+          'a hostile command, which can then take the read-only binds that enforce denyWrite and the ' +
+          'mandatory denies out of its own view. Default: false.',
+      ),
     enableWeakerNetworkIsolation: z
       .boolean()
       .optional()

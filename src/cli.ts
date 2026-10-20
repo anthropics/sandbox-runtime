@@ -189,7 +189,12 @@ async function main(): Promise<void> {
     .command('windows-install')
     .description(
       'Windows: provision the `srt-sandbox` user account + install WFP ' +
-        'filters (one UAC prompt). No logout needed.',
+        'filters (one UAC prompt), then make your user profile readable ' +
+        'to sandboxed commands, except for credential stores (no ' +
+        'elevation; minutes on a large profile the first time). No ' +
+        'logout needed. Run it again after upgrading sandbox-runtime ' +
+        'when a command asks for it, or to bring the profile read grant ' +
+        'up to date: it upgrades the existing install in place.',
     )
     .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
     .option(
@@ -197,49 +202,93 @@ async function main(): Promise<void> {
       'loopback PERMIT port range (e.g. 60080-60089)',
     )
     .option(
+      '--allow-loopback',
+      'let sandboxed commands connect to any localhost port (default: ' +
+        'off); must match network.allowLocalBinding',
+    )
+    .option(
       '--sandbox-user <name>',
       'name for the sandbox user account (default: srt-sandbox)',
     )
     .option('--force', 'replace an existing install with different config')
-    .action(async (o: Record<string, string | boolean | undefined>) => {
-      const { installWindowsSandbox, resolveSrtWin, VENDORED_SRT_WIN_EXE } =
-        await import('./sandbox/windows-sandbox-utils.js')
-      const range =
-        typeof o.proxyPortRange === 'string'
-          ? (o.proxyPortRange.split('-').map(Number) as [number, number])
-          : undefined
-      try {
-        const r = installWindowsSandbox({
-          sublayerGuid: o.sublayerGuid as string | undefined,
-          proxyPortRange: range,
-          sandboxUser: o.sandboxUser as string | undefined,
-          force: Boolean(o.force),
-          // Our own CLI opts into the packaged exe explicitly —
-          // there is no ambient vendor fallback.
-          srtWin: resolveSrtWin({ path: VENDORED_SRT_WIN_EXE }),
-        })
-        if (r.cancelled) {
-          console.error('Install cancelled at the UAC prompt. Nothing changed.')
-          process.exit(2)
+    .option(
+      '--profile-exclude <path>',
+      'a path inside your profile to keep unreadable in addition to the ' +
+        'built-in exclusions (repeatable)',
+      (v: string, acc: string[]) => [...acc, v],
+      [] as string[],
+    )
+    .option(
+      '--skip-profile-grant',
+      'install the account and the filters only; sandboxed commands ' +
+        'then read nothing in your profile (use this on a computer other ' +
+        'people have accounts on)',
+    )
+    .action(
+      async (o: Record<string, string | boolean | string[] | undefined>) => {
+        const {
+          installWindowsSandboxAsync,
+          resolveSrtWin,
+          VENDORED_SRT_WIN_EXE,
+          WINDOWS_ALLOW_LOOPBACK_EFFECT,
+        } = await import('./sandbox/windows-sandbox-utils.js')
+        const range =
+          typeof o.proxyPortRange === 'string'
+            ? (o.proxyPortRange.split('-').map(Number) as [number, number])
+            : undefined
+        try {
+          const r = await installWindowsSandboxAsync({
+            sublayerGuid: o.sublayerGuid as string | undefined,
+            proxyPortRange: range,
+            allowLoopback: Boolean(o.allowLoopback),
+            sandboxUser: o.sandboxUser as string | undefined,
+            force: Boolean(o.force),
+            skipProfileGrant: Boolean(o.skipProfileGrant),
+            profileExclude: o.profileExclude as string[],
+            // One line on what is about to become readable, and how to
+            // skip or undo it, before the grant is applied.
+            onProfileGrantStart: notice => console.error(notice),
+            onProfileGrantProgress: line => console.error(line),
+            // Our own CLI opts into the packaged exe explicitly —
+            // there is no ambient vendor fallback.
+            srtWin: resolveSrtWin({ path: VENDORED_SRT_WIN_EXE }),
+          })
+          if (r.cancelled) {
+            console.error(
+              'Install cancelled at the UAC prompt. Nothing changed.',
+            )
+            process.exit(2)
+          }
+          console.log(
+            `Installed.\n` +
+              `  sandbox user: ${r.user.provisioned ? 'provisioned' : 'MISSING'}` +
+              (r.user.sid ? ` (${r.user.sid})` : '') +
+              `\n` +
+              `  WFP:   ${r.wfp.state}, ${r.wfp.filters} filters` +
+              (r.wfp.portRange
+                ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
+                : '') +
+              `\n` +
+              `  profile read grant: ` +
+              (r.profileGrant?.applied
+                ? `applied to ${r.profileGrant.result.profile} ` +
+                  `(${r.profileGrant.result.granted} directories, ` +
+                  `${r.profileGrant.result.denied} excluded, ` +
+                  `${r.profileGrant.result.skipped.length} skipped)`
+                : `NOT applied — ${r.profileGrant?.reason ?? 'unknown'}`) +
+              `\n\n` +
+              `No logout needed — the WFP filter keys on the dedicated ` +
+              `\`srt-sandbox\` user's SID, so your network is unaffected.` +
+              (r.wfp.allowLoopback
+                ? `\n\n${WINDOWS_ALLOW_LOOPBACK_EFFECT}`
+                : ''),
+          )
+        } catch (e) {
+          console.error(`Error: ${(e as Error).message}`)
+          process.exit(1)
         }
-        console.log(
-          `Installed.\n` +
-            `  sandbox user: ${r.user.provisioned ? 'provisioned' : 'MISSING'}` +
-            (r.user.sid ? ` (${r.user.sid})` : '') +
-            `\n` +
-            `  WFP:   ${r.wfp.state}, ${r.wfp.filters} filters` +
-            (r.wfp.portRange
-              ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
-              : '') +
-            `\n\n` +
-            `No logout needed — the WFP filter keys on the dedicated ` +
-            `\`srt-sandbox\` user's SID, so your network is unaffected.`,
-        )
-      } catch (e) {
-        console.error(`Error: ${(e as Error).message}`)
-        process.exit(1)
-      }
-    })
+      },
+    )
 
   program
     .command('windows-uninstall')

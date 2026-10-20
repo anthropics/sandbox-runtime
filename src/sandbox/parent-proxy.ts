@@ -17,6 +17,7 @@
 
 import type { LookupFunction, Socket } from 'node:net'
 import type {
+  ClientRequest,
   IncomingHttpHeaders,
   IncomingMessage,
   ServerResponse,
@@ -410,6 +411,34 @@ export function relayResponseHead(
     res.end('Bad Gateway')
     return false
   }
+}
+
+/**
+ * Calls `fail` for an error of a forwarded request, unless its answer has
+ * arrived whole by then. An upstream that sends more than the Content-Length
+ * it declared (one that counts characters for bytes) has those bytes taken for
+ * the start of a next answer, which is an error of the request: it comes after
+ * the answer is complete and before that has been read. The answer is good,
+ * and a client that asks the upstream itself takes it. The runtime has closed
+ * the connection, so nothing that follows on it is read.
+ */
+export function onUpstreamError(
+  upstream: ClientRequest,
+  fail: (err: Error) => void,
+): void {
+  let answer: IncomingMessage | undefined
+  upstream.once('response', res => {
+    answer = res
+  })
+  upstream.on('error', err => {
+    if (answer?.complete) {
+      logForDebugging(
+        `Upstream connection failed after a whole answer: ${err.message}`,
+      )
+      return
+    }
+    fail(err)
+  })
 }
 
 /**

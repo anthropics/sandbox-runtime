@@ -163,8 +163,8 @@ export function uriEncode(s: string): string {
  * awslabs/aws-sigv4-proxy, which disables path escaping for s3 only.
  *
  * rawPath is the target the proxy forwards, so the signature covers the
- * path on the wire: the client's bytes unchanged when no filterRequest is
- * configured, the normalized target when one is.
+ * path on the wire: the client's bytes unchanged, or the normalized target
+ * under ambiguousRequestTarget 'normalize'.
  */
 export function canonicalUri(rawPath: string, service: string): string {
   if (rawPath === '') return '/'
