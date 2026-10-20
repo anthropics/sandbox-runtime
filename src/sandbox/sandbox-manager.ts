@@ -593,7 +593,7 @@ async function initialize(
         acc.grantRead.push(dirname(mitmCA.trustBundlePath))
       }
       try {
-        const probeCfg = await buildMxcContainerConfig({
+        const probeCfg = buildMxcContainerConfig({
           command: 'exit 0',
           // Representative proxy port: the real mux port is bound
           // later in initialize (inside this same range on Windows),
@@ -614,10 +614,10 @@ async function initialize(
           encodeMxcConfig(probeCfg),
         )
       } catch (e) {
-        // Runner exists but the SDK import/compile failed.
+        // Runner exists but the policy compile failed.
         windowsSelection = {
           backend: 'srt-win',
-          reason: `mxc sdk error: ${(e as Error).message}`,
+          reason: `mxc policy compile error: ${(e as Error).message}`,
         }
       }
       if (windowsSelection.backend === 'mxc') {
