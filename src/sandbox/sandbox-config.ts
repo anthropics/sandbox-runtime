@@ -3,7 +3,6 @@
  * This is the main configuration interface that consumers pass to SandboxManager.initialize()
  */
 
-import { isIP } from 'node:net'
 import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
@@ -13,61 +12,18 @@ import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
 // schemas the v4 API they are not written against.
 import { z } from 'zod/v3'
 import {
+  ALLOWED_DOMAIN_ENTRY_MESSAGE,
+  DOMAIN_PATTERN_MESSAGE,
+  hasValidIpv6Bracketing,
   isInjectHostCoveredByAllowedDomains,
+  isValidAllowedDomainEntry,
+  isValidDomainPattern,
   splitDomainPatternPort,
   stripDomainPatternPort,
 } from './domain-pattern.js'
 import { parseAddressRange } from './address.js'
 import { containsGlobCharsForPlatform } from './sandbox-utils.js'
 import { getPlatform } from '../utils/platform.js'
-
-/**
- * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
- * protocols, paths, ports, and overly broad wildcards.
- */
-function isValidDomainPattern(val: string): boolean {
-  // A bare IPv6 literal as produced by splitDomainPatternPort for a
-  // bracketed entry (`[::1]`, `[2001:db8::1]:443` → `::1`, `2001:db8::1`).
-  // Whether the *raw* entry was bracketed is enforced separately
-  // (hasValidIpv6Bracketing) before the split.
-  if (isIP(val) === 6) return true
-
-  // Reject protocols, paths, ports, etc.
-  if (val.includes('://') || val.includes('/') || val.includes(':')) {
-    return false
-  }
-
-  // Allow localhost
-  if (val === 'localhost') return true
-
-  // Allow wildcard domains like *.example.com
-  if (val.startsWith('*.')) {
-    const domain = val.slice(2)
-    // After the *. there must be a valid domain with at least one more dot
-    // e.g., *.example.com is valid, *.com is not (too broad)
-    if (
-      !domain.includes('.') ||
-      domain.startsWith('.') ||
-      domain.endsWith('.')
-    ) {
-      return false
-    }
-    // Count dots - must have at least 2 parts after the wildcard (e.g., example.com)
-    const parts = domain.split('.')
-    return parts.length >= 2 && parts.every(p => p.length > 0)
-  }
-
-  // Reject any other use of wildcards (e.g., *, *., etc.)
-  if (val.includes('*')) {
-    return false
-  }
-
-  // Regular domains must have at least one dot and only valid characters
-  return val.includes('.') && !val.startsWith('.') && !val.endsWith('.')
-}
-
-const DOMAIN_PATTERN_MESSAGE =
-  'Invalid domain pattern. Must be a valid domain (e.g., "example.com"), a wildcard (e.g., "*.example.com"), or a bracketed IPv6 literal (e.g., "[::1]", "[2001:db8::1]:443"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -81,32 +37,11 @@ const domainPatternSchema = z
  * Domain pattern with an optional `:port` suffix (e.g., "example.com:443",
  * "*.npmjs.org:8443"). Used for allowedDomains / deniedDomains, where the
  * proxy knows the destination port; an entry without a port matches any port.
+ * The check and its message live in domain-pattern.ts, which says why.
  */
-/**
- * Raw-entry rule applied before the port split: an entry with two or more
- * colons is an IPv6 literal and must use RFC 3986 brackets (`[::1]`,
- * `[::1]:443`). Unbracketed it is ambiguous — `2001:db8::1:443` is itself a
- * valid 8-hextet address — so reject it and make the user say which they
- * mean, rather than accept an entry that can silently match the wrong thing.
- */
-function hasValidIpv6Bracketing(val: string): boolean {
-  const first = val.indexOf(':')
-  const multiColon = first !== -1 && val.indexOf(':', first + 1) !== -1
-  return !multiColon || val.startsWith('[')
-}
-
 const domainPortPatternSchema = z
   .string()
-  .refine(
-    val =>
-      hasValidIpv6Bracketing(val) &&
-      isValidDomainPattern(splitDomainPatternPort(val).hostPattern),
-    {
-      message:
-        DOMAIN_PATTERN_MESSAGE +
-        ' An optional ":port" suffix (1-65535) restricts the entry to that port.',
-    },
-  )
+  .refine(isValidAllowedDomainEntry, { message: ALLOWED_DOMAIN_ENTRY_MESSAGE })
 
 /**
  * deniedDomains entry: a domainPortPattern, or a bare "*" / "*:port"
@@ -137,6 +72,28 @@ const addressRangeSchema = z
  * Schema for filesystem paths
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
+
+/**
+ * An entry of `denyRead`, `allowRead`, `allowWrite` or `denyWrite`: a
+ * spelling, which is a pattern when it reads as one, or a path marked
+ * `literal: true`, which never is. An object without the mark, or with a
+ * key this does not know, is refused rather than read either way.
+ */
+const filesystemPathEntrySchema = z.union(
+  [
+    filesystemPathSchema,
+    z.object({ path: filesystemPathSchema, literal: z.literal(true) }).strict(),
+  ],
+  {
+    errorMap: (issue, ctx) =>
+      issue.code === z.ZodIssueCode.invalid_union
+        ? {
+            message:
+              'Expected a path, or { "path": "<path>", "literal": true }',
+          }
+        : { message: ctx.defaultError },
+  },
+)
 
 /**
  * Schema for an absolute path to an external binary.
@@ -199,7 +156,7 @@ const ParentProxyConfigSchema = z.object({
  * - `mask` — the sandboxed process sees a per-session sentinel value; the
  *   host proxy substitutes sentinel→real on egress to `injectHosts`.
  *   For files this is whole-file masking (Linux only; degrades to `deny`
- *   on macOS — see {@link CredentialFileConfigSchema}).
+ *   on macOS and Windows — see {@link CredentialFileConfigSchema}).
  */
 const credentialModeSchema = z.enum(['deny', 'mask'])
 
@@ -314,12 +271,12 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
  * `extract`/`decode`) currently degrades to `mode: "deny"` (the file is
- * unreadable inside the sandbox).
+ * unreadable inside the sandbox). Nor can an ACL, so on Windows it does too.
  */
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(
     'Path to a credential file or directory. Supports the same path forms as ' +
-      'filesystem.denyRead (absolute paths and ~ expansion).',
+      'a string in filesystem.denyRead (absolute paths and ~ expansion).',
   ),
   mode: credentialModeSchema.describe('Access mode for this path'),
   extract: extractPatternSchema
@@ -735,14 +692,14 @@ export const NetworkConfigSchema = z.object({
     .optional()
     .describe(
       'Optional model-facing reason keyed by the exact deniedDomains entry it explains (e.g., {"github.com:22": "SSH pushes to GitHub are blocked; use an https remote"}). ' +
-        'Reported in the <sandbox_violations> line when that entry denies a connection; entries without one use a generic reason. ' +
+        'Reported in the <sandbox_violations> line when that entry denies a connection, and to the sandboxed client as the status phrase of the 403 that answers its CONNECT; entries without one use a generic reason. ' +
         'Keys are matched by exact entry string, so a key with no matching deniedDomains entry never fires.',
     ),
   strictAllowlist: z
     .boolean()
     .optional()
     .describe(
-      'If true, hosts not in allowedDomains are denied without consulting the ask callback. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
+      'If true, hosts not in allowedDomains are denied without consulting the ask callback, and a per-command allow list (registerCommandNetworkLists) is ignored. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
     ),
   deniedResolvedAddresses: z
     .array(addressRangeSchema)
@@ -764,12 +721,25 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      'If true, allow all Unix sockets (disables blocking on both platforms).',
+      'If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK).',
     ),
   allowLocalBinding: z
     .boolean()
     .optional()
-    .describe('Whether to allow binding to local ports (default: false)'),
+    .describe(
+      'Whether sandboxed commands may use local ports directly (default: ' +
+        'false). macOS: allows binding and accepting on any local port ' +
+        'and connecting to localhost on any port. Windows: allows ' +
+        'connecting to loopback addresses (127.0.0.0/8, ::1) on any TCP ' +
+        'or UDP port; it is part ' +
+        'of the machine-wide filter set, so it MUST match how `srt-win ' +
+        'install` was run (`--allow-loopback` or not) and a session that ' +
+        'differs from the install is refused. Linux: ignored — the ' +
+        'sandbox has its own network namespace, whose loopback is ' +
+        'always usable and is not the host one. Every service listening ' +
+        'on localhost becomes reachable, including any local proxy or ' +
+        'forwarder that would carry traffic off the machine.',
+    ),
   allowMachLookup: z
     .array(
       z.string().refine(
@@ -815,11 +785,67 @@ export const NetworkConfigSchema = z.object({
     .optional()
     .describe(
       'Per-request filter callback. Receives the parsed HTTP request ' +
-        '(web-standard Request) and returns {action, reason?}. Denied ' +
-        'requests get a 403 with the reason. If the callback throws, the ' +
+        '(web-standard Request) and request details, and returns {action, ' +
+        'reason?, status?} or, for an allow, header edits (removeHeaders, ' +
+        'setHeaders) and an onResponse observer. Denied requests get the ' +
+        'status (403 by default) with the reason. If the callback throws, the ' +
         'request is denied. Applies to plain HTTP through the proxy and, ' +
         'when tlsTerminate is configured, to terminated HTTPS. SRT does not ' +
-        'provide a policy language; library consumers own matching.',
+        'provide a policy language; library consumers own matching. This and ' +
+        'the five options after it are read when the proxy starts; ' +
+        'updateConfig does not change them.',
+    ),
+  allowPlaintextHeaderSet: z
+    .boolean()
+    .optional()
+    .describe(
+      'Let a filterRequest allow set headers on plain-HTTP requests. Off by ' +
+        'default: a header set there travels in cleartext, so while it is off ' +
+        'an allow that carries setHeaders is refused with 403 for every ' +
+        'request the proxy receives in cleartext, an absolute https:// URI ' +
+        'included. An allow without setHeaders is unaffected and removals ' +
+        'always apply.',
+    ),
+  stripResponseHeaders: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'Response headers never passed back to the sandboxed client, matched ' +
+        'case-insensitively with "-", "_" and "." folded (e.g. ["set-cookie"]).',
+    ),
+  refuseOpaqueTunnels: z
+    .boolean()
+    .optional()
+    .describe(
+      'Refuse every tunnel filterRequest cannot see into: an HTTP CONNECT ' +
+        'that would not be TLS-terminated or carries no TLS, and every SOCKS ' +
+        'CONNECT (refused at the handshake). Requires tlsTerminate to serve ' +
+        'HTTPS at all, and stops CONNECT-carried SSH such as GIT_SSH_COMMAND ' +
+        'through the proxy. Refusals are recorded as violations.',
+    ),
+  requireHostMatch: z
+    .boolean()
+    .optional()
+    .describe(
+      'Answer 421 to a request whose Host header, TLS server name or ' +
+        'absolute-form authority does not name the host and port it is sent ' +
+        'to, before filterRequest is asked. Refusals are recorded as ' +
+        'violations.',
+    ),
+  ambiguousRequestTarget: z
+    .enum(['refuse', 'asSpelled', 'normalize'])
+    .optional()
+    .describe(
+      'While filterRequest is set: what becomes of a request whose target ' +
+        'names another path once normalized than as the client spelled it ' +
+        '(a dot segment, "%2e" included, leading slashes or "\\"), so that ' +
+        'the upstream may act on another resource than the callback judged. ' +
+        '"refuse" (default): 400 before filterRequest is asked, recorded as ' +
+        'a violation. "asSpelled": forwarded as spelled; the callback has to ' +
+        'hold for every reading of it, and gets requestTarget, ' +
+        'normalizedRequestTarget and requestTargetIsAmbiguous. "normalize": ' +
+        'forwarded normalized, which breaks a signature over the path and ' +
+        'names another resource to an upstream that takes the path literally.',
     ),
   tlsTerminate: z
     .object({
@@ -872,6 +898,39 @@ export const NetworkConfigSchema = z.object({
             'or contain no PEM CERTIFICATE block are skipped (with a debug ' +
             'log), so paths that exist on only some hosts are safe to list.',
         ),
+      maxTunnels: z
+        .number()
+        .int()
+        .min(1)
+        .max(65536)
+        .optional()
+        .describe(
+          'At most this many CONNECT tunnels are TLS-terminated at once ' +
+            '(default 256); past it a CONNECT is answered 503 with ' +
+            '"X-Proxy-Error: too-many-tunnels", and the refusal is recorded ' +
+            'as a violation, once per command until half the slots are free ' +
+            'again. A tunnel holds its slot from its CONNECT until it ' +
+            'closes, so idle keep-alive tunnels count until they are closed ' +
+            '(6 s after a response); ' +
+            'one that turns out not to carry TLS frees it. The slot is taken ' +
+            'before the first bytes are seen, so at the cap a non-TLS CONNECT ' +
+            '(SSH, say) to a host that would be terminated is refused too. ' +
+            'Hosts in excludeDomains do not count. Read at each CONNECT, so ' +
+            'updateConfig changes it for the tunnels that follow.',
+        ),
+      handshakeTimeoutMs: z
+        .number()
+        .int()
+        .min(100)
+        .max(600_000)
+        .optional()
+        .describe(
+          'A tunnel to be TLS-terminated must finish its TLS handshake ' +
+            'within this many milliseconds of its CONNECT (default 10000), ' +
+            'or it is closed and its slot freed. A tunnel past its handshake ' +
+            'is never timed out by it. Read at each CONNECT, so ' +
+            'updateConfig changes it for the tunnels that follow.',
+        ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {
       message: 'caCertPath and caKeyPath must be provided together',
@@ -880,7 +939,9 @@ export const NetworkConfigSchema = z.object({
     .describe(
       '[EXPERIMENTAL] Enable in-process TLS termination so HTTPS ' +
         'request/response bodies are visible to SRT. Provide a CA cert+key, ' +
-        'or omit both to have SRT generate an ephemeral one.',
+        'or omit both to have SRT generate an ephemeral one. Needs Node, or ' +
+        'Bun 1.4 or later: SandboxManager.initialize throws on an older ' +
+        'runtime.',
     ),
   parentProxy: ParentProxyConfigSchema.optional().describe(
     "Upstream HTTP proxy for outbound connections. When set, SRT's proxy " +
@@ -905,19 +966,21 @@ export const FilesystemConfigSchema = z.object({
         'is trusted with full host filesystem access. Network and credential-env restrictions ' +
         'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',
     ),
-  denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
+  denyRead: z
+    .array(filesystemPathEntrySchema)
+    .describe('Paths denied for reading'),
   allowRead: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .optional()
     .describe(
       'Paths to re-allow reading within denied regions (takes precedence over denyRead). ' +
         'Use with denyRead to deny a broad region then allow back specific subdirectories.',
     ),
   allowWrite: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .describe('Paths allowed for writing'),
   denyWrite: z
-    .array(filesystemPathSchema)
+    .array(filesystemPathEntrySchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
   allowGitConfig: z
     .boolean()
@@ -1075,7 +1138,9 @@ export const SeccompConfigSchema = z.object({
 /**
  * An inert deny is fail-open, so a deny glob whose trailing separator leaves
  * it matching nothing is rejected; the same glob as an allow fails closed,
- * so the allow lists keep the plain path schema.
+ * so the allow lists keep the plain path schema. Such an entry may also be
+ * the name of a path (`/w/[WIP]/keep/`), but only the disk can say so and
+ * validation does not ask it: the message gives the spelling read both ways.
  */
 function addInertSlashedDenyGlobIssue(
   value: string,
@@ -1097,9 +1162,10 @@ function addInertSlashedDenyGlobIssue(
     code: z.ZodIssueCode.custom,
     path,
     message:
-      `Deny glob "${value}" ends in a separator, so the pattern can match ` +
-      `no path. Write "${value.replace(trailingSeparator, '')}", or add a ` +
-      `"**" segment to match at any depth.`,
+      `Deny glob "${value}" ends in a separator, so as a pattern it can ` +
+      `match no path. Write "${value.replace(trailingSeparator, '')}", ` +
+      `which is also read as the path of that name where it exists, or add ` +
+      `a "**" segment to match at any depth.`,
   })
 }
 
@@ -1123,6 +1189,15 @@ export const SandboxRuntimeConfigSchema = z
       .boolean()
       .optional()
       .describe('Enable weaker nested sandbox mode (for Docker environments)'),
+    allowNestedUserNamespaces: z
+      .boolean()
+      .optional()
+      .describe(
+        'Let the sandboxed command create user namespaces of its own (Linux only), as a browser ' +
+          'sandbox, rootless podman or a nested bubblewrap does. This gives up the write denies against ' +
+          'a hostile command, which can then take the read-only binds that enforce denyWrite and the ' +
+          'mandatory denies out of its own view. Default: false.',
+      ),
     enableWeakerNetworkIsolation: z
       .boolean()
       .optional()
@@ -1153,7 +1228,9 @@ export const SandboxRuntimeConfigSchema = z
       .max(10)
       .optional()
       .describe(
-        'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
+        'How deep below the working directory dangerous names are looked for on Linux (default: 3): ' +
+          'a dangerous file down to this depth, and a dangerous directory, or the hooks and ' +
+          'config of a repository, one level higher up. ' +
           'Higher values provide more protection but slower performance.',
       ),
     allowPty: z
@@ -1199,10 +1276,14 @@ export const SandboxRuntimeConfigSchema = z
     // under it is not a hole.
     const fsEnforced = !cfg.filesystem.disabled
     if (fsEnforced) {
+      // A marked entry is never a glob, so a separator at its end is the
+      // end of a name.
       for (const [idx, p] of cfg.filesystem.denyRead.entries()) {
+        if (typeof p !== 'string') continue
         addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyRead', idx], ctx)
       }
       for (const [idx, p] of cfg.filesystem.denyWrite.entries()) {
+        if (typeof p !== 'string') continue
         addInertSlashedDenyGlobIssue(p, ['filesystem', 'denyWrite', idx], ctx)
       }
     }
@@ -1463,6 +1544,7 @@ export type MitmProxyConfig = z.infer<typeof MitmProxyConfigSchema>
 export type ParentProxyConfig = z.infer<typeof ParentProxyConfigSchema>
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
 export type FilesystemConfig = z.infer<typeof FilesystemConfigSchema>
+export type FilesystemPathEntry = z.infer<typeof filesystemPathEntrySchema>
 export type CredentialMode = z.infer<typeof credentialModeSchema>
 export type CredentialFileConfig = z.infer<typeof CredentialFileConfigSchema>
 export type CredentialEnvVarConfig = z.infer<

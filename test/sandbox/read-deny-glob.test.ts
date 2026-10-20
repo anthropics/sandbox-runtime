@@ -173,6 +173,49 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (collapse)', () => {
   })
 })
 
+describe.if(!isWindows)('expandReadDenyGlobLinux (beneath an anchor)', () => {
+  let ROOT: string
+  let PROJECT: string
+
+  beforeAll(() => {
+    ROOT = realpathSync(mkdtempSync(join(tmpdir(), 'deny-glob-anchor-')))
+    // A directory a pattern reads as a character class, and `W project`,
+    // which is what that class matches.
+    PROJECT = join(ROOT, '[WIP] project')
+    for (const base of [PROJECT, join(ROOT, 'W project')]) {
+      mkdirSync(join(base, 'pkg', 'build', 'sub'), { recursive: true })
+      writeFileSync(join(base, 'pkg', 'build', 'sub', '1.out'), '')
+      writeFileSync(join(base, 'pkg', '.env'), '')
+    }
+    mkdirSync(join(ROOT, 'elsewhere'))
+    writeFileSync(join(ROOT, 'elsewhere', '.env'), '')
+    symlinkSync(join(ROOT, 'elsewhere'), join(PROJECT, 'link'))
+  })
+
+  afterAll(() => {
+    rmSync(ROOT, { recursive: true, force: true })
+  })
+
+  it('walks the pattern beneath the directory of that name and no other', () => {
+    expect(expandReadDenyGlobLinux(`${PROJECT}/**/build/**`, [])).toEqual([
+      join(ROOT, 'W project', 'pkg', 'build'),
+    ])
+    expect(
+      expandReadDenyGlobLinux(`${PROJECT}/**/build/**`, [], undefined, {
+        anchor: PROJECT,
+      }),
+    ).toEqual([join(PROJECT, 'pkg', 'build')])
+  })
+
+  it('lists a match found through a link beneath the anchor where it really lives', () => {
+    expect(
+      expandReadDenyGlobLinux(`${PROJECT}/**/.env`, [], undefined, {
+        anchor: PROJECT,
+      }),
+    ).toEqual([join(PROJECT, 'pkg', '.env'), join(ROOT, 'elsewhere', '.env')])
+  })
+})
+
 describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
   let ROOT: string
   let OUTSIDE: string
@@ -317,6 +360,299 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     expect(mounts).toEqual([join(many, '.env')])
     expect([...unlistable]).toEqual([])
   })
+
+  it('denies through a link out of the tree what a pattern with a wildcard in a set matches', () => {
+    const root = caseRoot('wildcard-in-a-set')
+    mkdirSync(join(root, 'proj', 'vendor', 'sdk'), { recursive: true })
+    mkdirSync(join(root, 'outside'))
+    writeFileSync(join(root, 'outside', 'id*.pem'), '')
+    writeFileSync(join(root, 'outside', 'idx.pem'), '')
+    symlinkSync(
+      join(root, 'outside'),
+      join(root, 'proj', 'vendor', 'sdk', 'conf'),
+    )
+
+    const unlistable = new Set<string>()
+    const mounts = expandReadDenyGlobLinux(
+      join(root, 'proj', '**', 'id[*].pem'),
+      [],
+      unlistable,
+    )
+
+    expect(mounts).toEqual([join(root, 'outside', 'id*.pem')])
+    expect([...unlistable]).toEqual([])
+  })
+
+  describe('a directory with two names that does not list', () => {
+    /** The mounts of two patterns handed the same listings, with the first
+     *  `failures` listings of pkg/certs failing with `code`. A link leads to
+     *  it as well, by no shorter a name, so its real path is all that is
+     *  ever asked. */
+    function expandWith(
+      code: string,
+      failures: number,
+    ): {
+      certs: string
+      mounts: string[][]
+      unlistable: string[]
+      tries: number
+    } {
+      const root = caseRoot('two-names')
+      const certs = join(root, 'pkg', 'certs')
+      mkdirSync(certs, { recursive: true })
+      writeFileSync(join(certs, 'id.pem'), '')
+      symlinkSync(join('pkg', 'certs'), join(root, 'link-to-certs'))
+      let tries = 0
+      const readdirSync = fs.readdirSync
+      const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+        ...args: Parameters<typeof fs.readdirSync>
+      ) => {
+        if (String(args[0]) === certs && ++tries <= failures) {
+          throw Object.assign(new Error(code), { code })
+        }
+        return readdirSync(...args)
+      }) as typeof fs.readdirSync)
+      try {
+        const listings = new Map()
+        const unlistable = new Set<string>()
+        const mounts = ['*.pem', '*.key'].map(name =>
+          expandReadDenyGlobLinux(join(root, '**', name), [], unlistable, {
+            listings,
+          }),
+        )
+        return { certs, mounts, unlistable: [...unlistable], tries }
+      } finally {
+        spy.mockRestore()
+      }
+    }
+
+    it('lets a failure kept in shared listings answer for the second name, the directory being denied whole', () => {
+      // A walk by itself tries a directory under each name that leads to it
+      // (glob-expand: "does not let one name that fails to list answer for
+      // the others"). Between the patterns of one configuration a failure is
+      // kept, and the directory is denied whole for each of them.
+      const { certs, mounts, unlistable, tries } = expandWith('EMFILE', 1)
+
+      expect(tries).toBe(1)
+      expect(mounts).toEqual([[certs], [certs]])
+      expect(unlistable).toEqual([certs])
+    })
+
+    it('denies nothing for one that answers that it is not there', () => {
+      const { mounts, unlistable } = expandWith('ENOENT', Infinity)
+
+      expect(mounts).toEqual([[], []])
+      expect(unlistable).toEqual([])
+    })
+
+    it('asks under the second name when it was not there under the first', () => {
+      const { certs, mounts, unlistable } = expandWith('ENOENT', 1)
+
+      expect(mounts).toEqual([[join(certs, 'id.pem')], []])
+      expect(unlistable).toEqual([])
+    })
+  })
+
+  describe('a link that matches and is read by its short name alone', () => {
+    // proj/vendor is shorter than what it leads to, so what lies in there is
+    // spelled by its real path and has a short name besides. Its real path
+    // failing, a link stays in the list as spelled, beneath a directory the
+    // pattern denies as well: where it leads is not in there.
+    const V = 'out/of/the/tree/vendor'
+    const CLEAN = [
+      'far.txt',
+      'far2.txt',
+      `${V}/root`,
+      `${V}/secrets`,
+      'proj',
+      'store/dir',
+      'store/key.txt',
+      'store/sub',
+    ]
+    let root: string
+
+    beforeAll(() => {
+      root = caseRoot('short-name-link')
+      for (const dir of [
+        `${V}/secrets`,
+        `${V}/alt`,
+        `${V}/file`,
+        `${V}/up`,
+        `${V}/root`,
+        'store/dir',
+        'store/sub',
+        'decoy',
+        'proj',
+      ]) {
+        mkdirSync(join(root, dir), { recursive: true })
+      }
+      for (const file of [
+        `${V}/secrets/token.txt`,
+        'store/key.txt',
+        'store/dir/f',
+        'store/sub/g',
+        'far.txt',
+        'far2.txt',
+        'decoy.txt',
+      ]) {
+        writeFileSync(join(root, file), '')
+      }
+      symlinkSync(join(root, V), join(root, 'proj/vendor'))
+      // In a denied directory; of the directory form; behind that one.
+      symlinkSync(join(root, 'store/key.txt'), join(root, V, 'secrets/key.pem'))
+      symlinkSync(join(root, 'store/dir'), join(root, V, 'alt/secrets'))
+      symlinkSync(join(root, 'far.txt'), join(root, 'store/dir/more'))
+      // Of the directory form by its name, and no directory: denies nothing.
+      symlinkSync(join(root, 'decoy.txt'), join(root, V, 'file/secrets'))
+      // A match that is a directory, and what lies behind it.
+      symlinkSync(join(root, 'store/sub'), join(root, V, 'secrets/sub'))
+      symlinkSync(join(root, 'far2.txt'), join(root, 'store/sub/more'))
+      // Of the directory form, to the base and to the root: not listed through.
+      symlinkSync(join(root, 'proj'), join(root, V, 'up/secrets'))
+      symlinkSync('/', join(root, V, 'root/secrets'))
+    })
+
+    /** What `proj/**\/secrets/**` denies while `answers` holds: by call and
+     *  name, the errno it fails with or, after `=`, the path that answers. */
+    function expandWhile(
+      answers: Record<string, string>,
+      tail = '**/secrets/**',
+    ): string[] {
+      const spies = (['statSync', 'realpathSync'] as const).map(fn => {
+        // The real path is asked of the `native` form.
+        const [holder, name] = (
+          fn === 'realpathSync' ? [fs.realpathSync, 'native'] : [fs, fn]
+        ) as [Record<string, unknown>, string]
+        const call = holder[name] as (...args: unknown[]) => unknown
+        return spyOn(holder, name).mockImplementation(((
+          p: unknown,
+          ...rest: unknown[]
+        ) => {
+          const answer = answers[`${fn} ${String(p).slice(root.length + 1)}`]
+          if (answer === undefined) return call(p, ...rest)
+          if (answer[0] === '=')
+            return call(join(root, answer.slice(1)), ...rest)
+          throw Object.assign(new Error(answer), { code: answer })
+        }) as never)
+      })
+      try {
+        return expandReadDenyGlobLinux(join(root, 'proj', tail), []).map(p =>
+          p.slice(root.length + 1),
+        )
+      } finally {
+        for (const spy of spies) spy.mockRestore()
+      }
+    }
+
+    it.each(
+      ['statSync', 'realpathSync'].flatMap(call =>
+        ['EACCES', 'EMFILE'].map(code => [call, code] as const),
+      ),
+    )('denies where it leads besides (%s, %s)', (call, code) => {
+      expect(expandWhile({})).toEqual(CLEAN)
+      for (const link of [
+        'secrets/key.pem',
+        'secrets/sub',
+        'alt/secrets',
+        'file/secrets',
+        'up/secrets',
+        'root/secrets',
+      ]) {
+        expect([link, expandWhile({ [`${call} ${V}/${link}`]: code })]).toEqual(
+          [link, [...CLEAN, `${V}/${link}`].sort()],
+        )
+      }
+      // A match with nothing of the pattern left beneath it.
+      expect(
+        expandWhile(
+          { [`${call} ${V}/secrets/sub`]: code },
+          'vendor/secrets/s*',
+        ),
+      ).toEqual(['proj/vendor/secrets/sub', 'store/sub'])
+    })
+
+    it('denies a decoy besides, and nothing less for it', () => {
+      expect(
+        expandWhile({
+          [`statSync ${V}/secrets/key.pem`]: 'EACCES',
+          'statSync proj/vendor/secrets/key.pem': '=decoy.txt',
+          'realpathSync proj/vendor/secrets/key.pem': '=decoy.txt',
+          [`statSync ${V}/alt/secrets`]: 'EACCES',
+          'statSync proj/vendor/alt/secrets': '=decoy',
+          'realpathSync proj/vendor/alt/secrets': '=decoy',
+        }),
+      ).toEqual(
+        [
+          ...CLEAN.filter(
+            p => !['store/dir', 'store/key.txt', 'far.txt'].includes(p),
+          ),
+          'decoy',
+          'decoy.txt',
+          `${V}/alt/secrets`,
+          `${V}/secrets/key.pem`,
+        ].sort(),
+      )
+    })
+
+    it('keeps it as spelled beneath whatever the short name says it leads to', () => {
+      expect(
+        expandWhile({
+          [`statSync ${V}/secrets/key.pem`]: 'EACCES',
+          'statSync proj/vendor/secrets/key.pem': `=${V}`,
+          'realpathSync proj/vendor/secrets/key.pem': `=${V}`,
+        }),
+      ).toEqual(
+        [
+          ...CLEAN.filter(p => !p.startsWith(V) && p !== 'store/key.txt'),
+          V,
+          `${V}/secrets/key.pem`,
+        ].sort(),
+      )
+    })
+
+    it('keeps one that cannot be inspected under either name as spelled', () => {
+      expect(
+        expandWhile({
+          [`statSync ${V}/secrets/key.pem`]: 'EACCES',
+          'statSync proj/vendor/secrets/key.pem': 'EACCES',
+        }),
+      ).toEqual(
+        [
+          ...CLEAN.filter(p => p !== 'store/key.txt'),
+          `${V}/secrets/key.pem`,
+        ].sort(),
+      )
+    })
+  })
+
+  it.if(isLinux && process.getuid?.() !== 0)(
+    'keeps a link as spelled, with where its short name leads, when no real path answers',
+    () => {
+      // Nothing is made to fail. The working directory lies behind one that
+      // cannot be searched, so what is in it answers by /proc/self/cwd alone,
+      // which this runtime resolves.
+      const root = caseRoot('no-real-path')
+      const work = join(root, 'gate/work')
+      const secrets = join(work, 'deep/er/dir/secrets')
+      mkdirSync(secrets, { recursive: true })
+      writeFileSync(join(secrets, 'token.txt'), '')
+      writeFileSync(join(root, 'key.txt'), '')
+      symlinkSync(join(root, 'key.txt'), join(secrets, 'key.pem'))
+      symlinkSync('deep/er/dir', join(work, 'l'))
+      const cwd = process.cwd()
+      process.chdir(work)
+      chmodSync(join(root, 'gate'), 0o000)
+      try {
+        expect(realpathSync('/proc/self/cwd')).toBe(work)
+        expect(
+          expandReadDenyGlobLinux('/proc/self/cwd/*/secrets/**', []),
+        ).toEqual([work, join(secrets, 'key.pem'), join(root, 'key.txt')])
+      } finally {
+        chmodSync(join(root, 'gate'), 0o755)
+        process.chdir(cwd)
+      }
+    },
+  )
 
   it('lists every match where it really is when the base is a symlink', () => {
     // alias -> ROOT, sideways: normalizePathForSandbox keeps the link
@@ -1454,7 +1790,7 @@ describe.if(isLinux)(
         })
       }
       const realStat = fs.statSync
-      const realRealpath = fs.realpathSync
+      const realRealpath = fs.realpathSync.native
       const spies = [
         spyOn(fs, 'statSync').mockImplementation(((
           p: fs.PathLike,
@@ -1466,7 +1802,7 @@ describe.if(isLinux)(
                 p,
                 ...rest,
               )) as typeof fs.statSync),
-        spyOn(fs, 'realpathSync').mockImplementation(((
+        spyOn(fs.realpathSync, 'native').mockImplementation(((
           p: fs.PathLike,
           ...rest: unknown[]
         ) =>
@@ -1475,7 +1811,7 @@ describe.if(isLinux)(
             : (realRealpath as (...a: unknown[]) => unknown)(
                 p,
                 ...rest,
-              )) as typeof fs.realpathSync),
+              )) as typeof fs.realpathSync.native),
       ]
       try {
         const wrapped = await wrapCommandWithSandboxLinux({
@@ -1988,6 +2324,38 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
       expect(wrapped).toContain(`--ro-bind /dev/null ${literalFile}`)
     } finally {
       await SandboxManager.reset()
+    }
+  })
+
+  it('mounts nothing for a pattern whose base is not there, beneath a write root', async () => {
+    // Denied, a base made between the walk and the mounts, as here, would be
+    // an empty tmpfs over a part of the write root, and what the command
+    // writes there would be lost.
+    const absent = join(ROOT, 'absent')
+    const wrap = (denyRead: string[]): Promise<string> =>
+      SandboxManager.wrapWithSandbox('echo hello', undefined, {
+        filesystem: { denyRead, allowWrite: [ROOT], denyWrite: [] },
+      })
+    const readdirSync = fs.readdirSync
+    const spy = spyOn(fs, 'readdirSync').mockImplementation(((
+      ...args: Parameters<typeof fs.readdirSync>
+    ) => {
+      try {
+        return readdirSync(...args)
+      } finally {
+        if (String(args[0]) === absent) mkdirSync(absent)
+      }
+    }) as typeof fs.readdirSync)
+    try {
+      const wrapped = await wrap([join(absent, '**/*.out')])
+      spy.mockRestore()
+
+      expect(existsSync(absent)).toBe(true)
+      expect(wrapped).toBe(await wrap([]))
+    } finally {
+      spy.mockRestore()
+      await SandboxManager.reset()
+      rmSync(absent, { recursive: true, force: true })
     }
   })
 })

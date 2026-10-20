@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import pkg from '../package.json' with { type: 'json' }
 import { quote } from './utils/shell-quote.js'
 import { Command, InvalidArgumentError } from 'commander'
 import { SandboxManager } from './index.js'
@@ -11,7 +12,6 @@ import * as fs from 'fs'
 import * as net from 'net'
 import * as path from 'path'
 import * as os from 'os'
-import { createRequire } from 'module'
 
 /**
  * Get default config path
@@ -21,17 +21,15 @@ function getDefaultConfigPath(): string {
 }
 
 /**
- * The version `--version` reports, read from the package's own manifest, which
- * sits one directory above both src/cli.ts and dist/cli.js. There is no
- * fallback: a manifest that cannot be read is a broken install, and a
- * plausible-looking wrong version is worse than the throw, because the README
- * pins behaviour to specific releases.
+ * The version `--version` reports, from the package's own manifest, which
+ * sits one directory above both src/cli.ts and dist/cli.js. A static import
+ * rather than a runtime require, so a single-file build (`bun build
+ * --compile`) embeds it instead of looking for a package.json beside the
+ * binary. There is still no fallback: a plausible-looking wrong version is
+ * worse than failing, because the README pins behaviour to specific releases.
  */
 function getPackageVersion(): string {
-  const manifest: { version: string } = createRequire(import.meta.url)(
-    '../package.json',
-  )
-  return manifest.version
+  return pkg.version
 }
 
 /**
@@ -191,7 +189,12 @@ async function main(): Promise<void> {
     .command('windows-install')
     .description(
       'Windows: provision the `srt-sandbox` user account + install WFP ' +
-        'filters (one UAC prompt). No logout needed.',
+        'filters (one UAC prompt), then make your user profile readable ' +
+        'to sandboxed commands, except for credential stores (no ' +
+        'elevation; minutes on a large profile the first time). No ' +
+        'logout needed. Run it again after upgrading sandbox-runtime ' +
+        'when a command asks for it, or to bring the profile read grant ' +
+        'up to date: it upgrades the existing install in place.',
     )
     .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
     .option(
@@ -199,49 +202,93 @@ async function main(): Promise<void> {
       'loopback PERMIT port range (e.g. 60080-60089)',
     )
     .option(
+      '--allow-loopback',
+      'let sandboxed commands connect to any localhost port (default: ' +
+        'off); must match network.allowLocalBinding',
+    )
+    .option(
       '--sandbox-user <name>',
       'name for the sandbox user account (default: srt-sandbox)',
     )
     .option('--force', 'replace an existing install with different config')
-    .action(async (o: Record<string, string | boolean | undefined>) => {
-      const { installWindowsSandbox, resolveSrtWin, VENDORED_SRT_WIN_EXE } =
-        await import('./sandbox/windows-sandbox-utils.js')
-      const range =
-        typeof o.proxyPortRange === 'string'
-          ? (o.proxyPortRange.split('-').map(Number) as [number, number])
-          : undefined
-      try {
-        const r = installWindowsSandbox({
-          sublayerGuid: o.sublayerGuid as string | undefined,
-          proxyPortRange: range,
-          sandboxUser: o.sandboxUser as string | undefined,
-          force: Boolean(o.force),
-          // Our own CLI opts into the packaged exe explicitly —
-          // there is no ambient vendor fallback.
-          srtWin: resolveSrtWin({ path: VENDORED_SRT_WIN_EXE }),
-        })
-        if (r.cancelled) {
-          console.error('Install cancelled at the UAC prompt. Nothing changed.')
-          process.exit(2)
+    .option(
+      '--profile-exclude <path>',
+      'a path inside your profile to keep unreadable in addition to the ' +
+        'built-in exclusions (repeatable)',
+      (v: string, acc: string[]) => [...acc, v],
+      [] as string[],
+    )
+    .option(
+      '--skip-profile-grant',
+      'install the account and the filters only; sandboxed commands ' +
+        'then read nothing in your profile (use this on a computer other ' +
+        'people have accounts on)',
+    )
+    .action(
+      async (o: Record<string, string | boolean | string[] | undefined>) => {
+        const {
+          installWindowsSandboxAsync,
+          resolveSrtWin,
+          VENDORED_SRT_WIN_EXE,
+          WINDOWS_ALLOW_LOOPBACK_EFFECT,
+        } = await import('./sandbox/windows-sandbox-utils.js')
+        const range =
+          typeof o.proxyPortRange === 'string'
+            ? (o.proxyPortRange.split('-').map(Number) as [number, number])
+            : undefined
+        try {
+          const r = await installWindowsSandboxAsync({
+            sublayerGuid: o.sublayerGuid as string | undefined,
+            proxyPortRange: range,
+            allowLoopback: Boolean(o.allowLoopback),
+            sandboxUser: o.sandboxUser as string | undefined,
+            force: Boolean(o.force),
+            skipProfileGrant: Boolean(o.skipProfileGrant),
+            profileExclude: o.profileExclude as string[],
+            // One line on what is about to become readable, and how to
+            // skip or undo it, before the grant is applied.
+            onProfileGrantStart: notice => console.error(notice),
+            onProfileGrantProgress: line => console.error(line),
+            // Our own CLI opts into the packaged exe explicitly —
+            // there is no ambient vendor fallback.
+            srtWin: resolveSrtWin({ path: VENDORED_SRT_WIN_EXE }),
+          })
+          if (r.cancelled) {
+            console.error(
+              'Install cancelled at the UAC prompt. Nothing changed.',
+            )
+            process.exit(2)
+          }
+          console.log(
+            `Installed.\n` +
+              `  sandbox user: ${r.user.provisioned ? 'provisioned' : 'MISSING'}` +
+              (r.user.sid ? ` (${r.user.sid})` : '') +
+              `\n` +
+              `  WFP:   ${r.wfp.state}, ${r.wfp.filters} filters` +
+              (r.wfp.portRange
+                ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
+                : '') +
+              `\n` +
+              `  profile read grant: ` +
+              (r.profileGrant?.applied
+                ? `applied to ${r.profileGrant.result.profile} ` +
+                  `(${r.profileGrant.result.granted} directories, ` +
+                  `${r.profileGrant.result.denied} excluded, ` +
+                  `${r.profileGrant.result.skipped.length} skipped)`
+                : `NOT applied — ${r.profileGrant?.reason ?? 'unknown'}`) +
+              `\n\n` +
+              `No logout needed — the WFP filter keys on the dedicated ` +
+              `\`srt-sandbox\` user's SID, so your network is unaffected.` +
+              (r.wfp.allowLoopback
+                ? `\n\n${WINDOWS_ALLOW_LOOPBACK_EFFECT}`
+                : ''),
+          )
+        } catch (e) {
+          console.error(`Error: ${(e as Error).message}`)
+          process.exit(1)
         }
-        console.log(
-          `Installed.\n` +
-            `  sandbox user: ${r.user.provisioned ? 'provisioned' : 'MISSING'}` +
-            (r.user.sid ? ` (${r.user.sid})` : '') +
-            `\n` +
-            `  WFP:   ${r.wfp.state}, ${r.wfp.filters} filters` +
-            (r.wfp.portRange
-              ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
-              : '') +
-            `\n\n` +
-            `No logout needed — the WFP filter keys on the dedicated ` +
-            `\`srt-sandbox\` user's SID, so your network is unaffected.`,
-        )
-      } catch (e) {
-        console.error(`Error: ${(e as Error).message}`)
-        process.exit(1)
-      }
-    })
+      },
+    )
 
   program
     .command('windows-uninstall')
@@ -266,6 +313,19 @@ async function main(): Promise<void> {
         console.error(`Error: ${(e as Error).message}`)
         process.exit(1)
       }
+    })
+
+  program
+    .command('proxy')
+    .description(
+      'Run only the HTTP proxy, deciding every request through an external decider on inherited fds.',
+    )
+    .allowUnknownOption()
+    .helpOption(false)
+    .argument('[args...]')
+    .action(async (args: string[]) => {
+      const { runProxyCli } = await import('./proxy-cli.js')
+      await runProxyCli(args)
     })
 
   // Default command - run command in sandbox
@@ -426,6 +486,20 @@ async function main(): Promise<void> {
             controlStream.on('error', onControlError)
           }
 
+          // Until there is a child to pass an interrupt on to, it stops the
+          // run. The library's own handlers, which initialize() installs, only
+          // clean up: left to them the command would be run all the same.
+          const interrupted = new AbortController()
+          const interrupt = (signal: NodeJS.Signals): void =>
+            interrupted.abort(new Error(`interrupted by ${signal}`))
+          process.once('SIGINT', interrupt)
+          process.once('SIGTERM', interrupt)
+          const aboutToSpawn = (): void => {
+            interrupted.signal.throwIfAborted()
+            process.off('SIGINT', interrupt)
+            process.off('SIGTERM', interrupt)
+          }
+
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')
           await SandboxManager.initialize(runtimeConfig)
@@ -515,14 +589,21 @@ async function main(): Promise<void> {
             // entries to the child as CRT descriptors, so the control fd
             // is not among them (an inheritable HANDLE still reaches the
             // child, but unnamed — nothing there can find it).
+            aboutToSpawn()
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
               stdio: 'inherit',
               env,
             })
           } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
+            // The wrap can take seconds over a large tree.
+            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+              command,
+              undefined,
+              undefined,
+              interrupted.signal,
+            )
+            aboutToSpawn()
             child = spawn(sandboxedCommand, {
               shell: true,
               stdio: sandboxedStdio(controlFd),

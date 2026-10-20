@@ -1,5 +1,9 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
-import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
+import {
+  NetworkConfigSchema,
+  SandboxRuntimeConfigSchema,
+  WindowsConfigSchema,
+} from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
 
@@ -108,11 +112,30 @@ describe('Config Validation', () => {
         'git push': ['/usr/bin/nc'],
       },
       enableWeakerNestedSandbox: true,
+      allowNestedUserNamespaces: true,
       enableWeakerNetworkIsolation: false,
     }
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
     expect(result.success).toBe(true)
+    expect(result.data?.allowNestedUserNamespaces).toBe(true)
+  })
+
+  test('allowNestedUserNamespaces is a boolean, and absent unless given', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+    expect(
+      SandboxRuntimeConfigSchema.safeParse(base).data
+        ?.allowNestedUserNamespaces,
+    ).toBeUndefined()
+    expect(
+      SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        allowNestedUserNamespaces: 'yes',
+      }).success,
+    ).toBe(false)
   })
 
   test('should reject missing required fields', () => {
@@ -204,6 +227,31 @@ describe('Config Validation', () => {
         filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
       })
       expect(result.success).toBe(false)
+    }
+  })
+
+  test('network.ambiguousRequestTarget takes its three values and no other', () => {
+    const parse = (ambiguousRequestTarget: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          ambiguousRequestTarget,
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+    for (const value of [
+      undefined,
+      'refuse',
+      'asSpelled',
+      'normalize',
+    ] as const) {
+      const result = parse(value)
+      expect(result.success).toBe(true)
+      expect(result.data?.network.ambiguousRequestTarget).toBe(value)
+    }
+    for (const value of ['', 'normalized', 'asspelled', true, null]) {
+      expect(parse(value).success).toBe(false)
     }
   })
 
@@ -433,6 +481,27 @@ describe('Config Validation', () => {
       }
     })
 
+    test.if(!isWindows)(
+      'points a deny inside a folder named like a pattern at the spelling read both ways',
+      () => {
+        // Whether the folder exists is for the disk to say, which validation
+        // does not ask, so the separator is refused here as in any pattern.
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          filesystem: {
+            ...base.filesystem,
+            denyWrite: ['/work/[WIP] project/keep/'],
+          },
+        })
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.message).toContain(
+            'Write "/work/[WIP] project/keep", which is also read as the path of that name',
+          )
+        }
+      },
+    )
+
     test('accepts the slash-free glob spellings it points at', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
@@ -520,6 +589,121 @@ describe('Config Validation', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
         filesystem: { ...base.filesystem, denyRead: ['/data/[ab]/'] },
+      })
+      expect(result.success).toBe(false)
+    })
+  })
+
+  describe('path entries marked literal', () => {
+    type List = 'denyRead' | 'allowRead' | 'allowWrite' | 'denyWrite'
+    const lists: List[] = ['denyRead', 'allowRead', 'allowWrite', 'denyWrite']
+
+    function parse(list: List, entry: unknown) {
+      return SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [],
+          denyWrite: [],
+          [list]: [entry],
+        },
+      })
+    }
+
+    test.each(lists)('%s takes a path marked literal beside a string', list => {
+      const marked = { path: '/work/*.env', literal: true as const }
+      const result = parse(list, marked)
+      expect(result.success).toBe(true)
+      expect(result.success && result.data.filesystem[list]).toEqual([marked])
+      const plain = parse(list, '/work/keep')
+      expect(plain.success && plain.data.filesystem[list]).toEqual([
+        '/work/keep',
+      ])
+    })
+
+    test.each(lists)(
+      '%s takes ~ and relative spellings marked literal',
+      list => {
+        for (const path of ['~/notes (draft?)', './build*', '[WIP] project']) {
+          expect(parse(list, { path, literal: true }).success).toBe(true)
+        }
+      },
+    )
+
+    test.each([
+      ['no mark', { path: '/work/x' }],
+      ['a mark that is false', { path: '/work/x', literal: false }],
+      ['a mark that is a string', { path: '/work/x', literal: 'true' }],
+      ['a mark that is a number', { path: '/work/x', literal: 1 }],
+      ['no path', { literal: true }],
+      ['a path that is not a string', { path: ['/work/x'], literal: true }],
+      ['a number', 42],
+      ['null', null],
+      ['a list', ['/work/x']],
+    ])('refuses an entry with %s', (_what, entry) => {
+      for (const list of lists) {
+        const result = parse(list, entry)
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.path.slice(0, 3)).toEqual([
+            'filesystem',
+            list,
+            0,
+          ])
+        }
+      }
+    })
+
+    test('says what an entry may be when it is neither', () => {
+      const result = parse('denyRead', { path: '/work/x', literal: false })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toBe(
+          'Expected a path, or { "path": "<path>", "literal": true }',
+        )
+      }
+    })
+
+    test('refuses a key it does not know, rather than ignore it', () => {
+      const result = parse('denyRead', {
+        path: '/work/x',
+        literal: true,
+        recursive: true,
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.code).toBe('unrecognized_keys')
+      }
+    })
+
+    test('refuses an empty path, marked or not, with the same message', () => {
+      for (const entry of ['', { path: '', literal: true }]) {
+        const result = parse('allowWrite', entry)
+        expect(result.success).toBe(false)
+        if (!result.success) {
+          expect(result.error.issues[0]?.message).toBe('Path cannot be empty')
+        }
+      }
+    })
+
+    test('takes a separator at the end of a marked deny, which is no glob', () => {
+      // The same spelling as a string is a pattern that can match no path,
+      // and is refused; marked, it is a name and the separator ends it.
+      for (const list of ['denyRead', 'denyWrite'] as const) {
+        expect(parse(list, '/data/*/').success).toBe(false)
+        expect(parse(list, { path: '/data/*/', literal: true }).success).toBe(
+          true,
+        )
+      }
+    })
+
+    test('does not take the mark on a credential file', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        credentials: {
+          files: [{ path: { path: '~/.netrc', literal: true }, mode: 'deny' }],
+        },
       })
       expect(result.success).toBe(false)
     })
@@ -2118,6 +2302,107 @@ describe('Config Validation', () => {
         })
         expect(result.success).toBe(false)
       })
+    })
+
+    describe('maxTunnels and handshakeTimeoutMs', () => {
+      const parse = (tlsTerminate: Record<string, unknown>) =>
+        SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          network: { ...base.network, tlsTerminate },
+        })
+
+      test('are optional and round-trip when given', () => {
+        const none = parse({})
+        expect(none.success).toBe(true)
+        if (none.success) {
+          expect(none.data.network.tlsTerminate?.maxTunnels).toBeUndefined()
+          expect(
+            none.data.network.tlsTerminate?.handshakeTimeoutMs,
+          ).toBeUndefined()
+        }
+        const given = parse({ maxTunnels: 1024, handshakeTimeoutMs: 30_000 })
+        expect(given.success).toBe(true)
+        if (given.success) {
+          expect(given.data.network.tlsTerminate?.maxTunnels).toBe(1024)
+          expect(given.data.network.tlsTerminate?.handshakeTimeoutMs).toBe(
+            30_000,
+          )
+        }
+      })
+
+      test('accept their bounds', () => {
+        for (const v of [1, 65536]) {
+          expect(parse({ maxTunnels: v }).success).toBe(true)
+        }
+        for (const v of [100, 600_000]) {
+          expect(parse({ handshakeTimeoutMs: v }).success).toBe(true)
+        }
+      })
+
+      test('reject a value that is not a positive integer in range', () => {
+        for (const v of [0, -1, 1.5, 65537, '256', null]) {
+          expect(parse({ maxTunnels: v }).success).toBe(false)
+        }
+        for (const v of [0, 99, 1500.5, 600_001, '10000', null]) {
+          expect(parse({ handshakeTimeoutMs: v }).success).toBe(false)
+        }
+      })
+    })
+  })
+
+  describe('network.allowLocalBinding', () => {
+    const parse = (network: Record<string, unknown>) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [], ...network },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+
+    test('is unset by default and takes a boolean, nothing else', () => {
+      const none = parse({})
+      expect(none.success).toBe(true)
+      if (none.success) {
+        expect(none.data.network.allowLocalBinding).toBeUndefined()
+      }
+      for (const v of [true, false]) {
+        const r = parse({ allowLocalBinding: v })
+        expect(r.success).toBe(true)
+        if (r.success) expect(r.data.network.allowLocalBinding).toBe(v)
+      }
+      // No port list, range or mode word: it is a toggle.
+      for (const v of ['all', 1, [3000, 3099], null]) {
+        expect(parse({ allowLocalBinding: v }).success).toBe(false)
+      }
+    })
+
+    test('its description says what it does on each platform', () => {
+      const text = NetworkConfigSchema.shape.allowLocalBinding.description ?? ''
+      for (const platform of ['macOS', 'Windows', 'Linux']) {
+        expect(text).toContain(platform)
+      }
+    })
+  })
+
+  describe('reading the user profile on Windows is not a setting', () => {
+    const parse = (windows?: unknown) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        ...(windows !== undefined && { windows }),
+      })
+
+    test('the windows block has no key that turns it on, lists exclusions, or re-admits one', () => {
+      const keys = Object.keys(WindowsConfigSchema.shape)
+      for (const gone of [
+        'profileRead',
+        'profileReadExclude',
+        'profileReadInclude',
+        'dangerouslyAllowReadOfProfileExclusions',
+      ]) {
+        expect(keys).not.toContain(gone)
+      }
+      const r = parse({ profileRead: false, profileReadExclude: ['.x'] })
+      expect(r.success).toBe(true)
+      expect(Object.keys((r.success && r.data.windows) || {})).toEqual([])
     })
   })
 })

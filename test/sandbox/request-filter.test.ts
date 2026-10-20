@@ -1,4 +1,7 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { test, expect, beforeAll, afterAll } from 'bun:test'
+// Every case here runs a proxy configured to terminate TLS, so each is
+// skipped where this runtime cannot terminate it in-process.
+import { describeWithTls as describe } from '../helpers/emitted-connections.js'
 import { createServer as createHttpsServer } from 'node:https'
 import type { Server, AddressInfo } from 'node:net'
 import { spawn } from 'node:child_process'
@@ -353,6 +356,10 @@ async function curl(
     '-sS',
     '--proxy',
     `http://127.0.0.1:${proxyPort}`,
+    // An empty list overrides NO_PROXY, which would send curl around
+    // the proxy under test for 127.0.0.1.
+    '--noproxy',
+    '',
     '--cacert',
     CA_CERT,
     '--max-time',
