@@ -726,7 +726,20 @@ export const NetworkConfigSchema = z.object({
   allowLocalBinding: z
     .boolean()
     .optional()
-    .describe('Whether to allow binding to local ports (default: false)'),
+    .describe(
+      'Whether sandboxed commands may use local ports directly (default: ' +
+        'false). macOS: allows binding and accepting on any local port ' +
+        'and connecting to localhost on any port. Windows: allows ' +
+        'connecting to loopback addresses (127.0.0.0/8, ::1) on any TCP ' +
+        'or UDP port; it is part ' +
+        'of the machine-wide filter set, so it MUST match how `srt-win ' +
+        'install` was run (`--allow-loopback` or not) and a session that ' +
+        'differs from the install is refused. Linux: ignored — the ' +
+        'sandbox has its own network namespace, whose loopback is ' +
+        'always usable and is not the host one. Every service listening ' +
+        'on localhost becomes reachable, including any local proxy or ' +
+        'forwarder that would carry traffic off the machine.',
+    ),
   allowMachLookup: z
     .array(
       z.string().refine(

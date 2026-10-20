@@ -15,6 +15,7 @@
 //! ([`provision_machine_store`]).
 
 use anyhow::{Context, Result, anyhow};
+use windows::core::GUID;
 
 use crate::state_db;
 use crate::{dpapi, logon, runner, user};
@@ -361,6 +362,143 @@ pub fn read_setup() -> Result<Option<SetupInfo>> {
     }))
 }
 
+/// Registry value (MULTI_SZ): one `<sublayer guid>=<mode>` line per
+/// sublayer whose filters an install wrote; an uninstall removes the line.
+const LOOPBACK_MODES_VALUE: &str = "LoopbackModes";
+
+const MODE_OPEN: &str = "open";
+const MODE_CLOSED: &str = "closed";
+/// The mode while an install replaces a set with the other mode: it
+/// reads as an error, so nothing is launched until the install is done.
+const MODE_CHANGING: &str = "changing";
+
+fn sublayer_key(sublayer: &GUID) -> String {
+    let d = sublayer.data4;
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        sublayer.data1,
+        sublayer.data2,
+        sublayer.data3,
+        d[0],
+        d[1],
+        d[2],
+        d[3],
+        d[4],
+        d[5],
+        d[6],
+        d[7]
+    )
+}
+
+/// Parse the record lines; a line without `=` is dropped.
+fn parse_loopback_modes(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            Some((k.to_ascii_lowercase(), v.to_string()))
+        })
+        .collect()
+}
+
+/// `modes` with `key` set to `mode` (`None` removes it), as lines to store.
+fn loopback_modes_with(
+    mut modes: Vec<(String, String)>,
+    key: &str,
+    mode: Option<&str>,
+) -> Vec<String> {
+    modes.retain(|(k, _)| k != key);
+    if let Some(mode) = mode {
+        modes.push((key.to_string(), mode.to_string()));
+    }
+    modes.iter().map(|(k, v)| format!("{k}={v}")).collect()
+}
+
+/// The loopback mode sandboxed commands run under, over every recorded
+/// sublayer: open only if each is open (one closed set's BLOCK applies
+/// to all), closed with no record. Any other word is an error, never "closed".
+fn effective_loopback(modes: &[(String, String)]) -> Result<bool> {
+    if let Some((k, v)) = modes
+        .iter()
+        .find(|(_, v)| v != MODE_OPEN && v != MODE_CLOSED)
+    {
+        return Err(anyhow!(
+            "recorded loopback mode '{v}' (sublayer {k}) is not one this build knows"
+        ));
+    }
+    Ok(!modes.is_empty() && modes.iter().all(|(_, v)| v == MODE_OPEN))
+}
+
+fn set_loopback_mode(sublayer: &GUID, mode: Option<&str>) -> Result<()> {
+    let base = match mode {
+        Some(_) => crate::reg::Key::create(crate::reg::BASE, None)?.0,
+        None => match crate::reg::Key::open(crate::reg::BASE, true)? {
+            Some(base) => base,
+            None => return Ok(()),
+        },
+    };
+    let modes = parse_loopback_modes(&base.get_multi_sz(LOOPBACK_MODES_VALUE)?.unwrap_or_default());
+    let lines = loopback_modes_with(modes, &sublayer_key(sublayer), mode);
+    base.set_multi_sz(LOOPBACK_MODES_VALUE, &lines)
+}
+
+/// Record the loopback mode of the filters committed under `sublayer`.
+/// Call only AFTER the WFP transaction commits.
+pub fn write_loopback_mode(sublayer: &GUID, open: bool) -> Result<()> {
+    set_loopback_mode(sublayer, Some(if open { MODE_OPEN } else { MODE_CLOSED }))
+}
+
+/// Mark `sublayer`'s mode as changing, BEFORE its filters are replaced
+/// with the other mode's.
+pub fn mark_loopback_mode_changing(sublayer: &GUID) -> Result<()> {
+    set_loopback_mode(sublayer, Some(MODE_CHANGING))
+}
+
+/// Drop `sublayer`'s recorded mode; every path that deletes its filters calls this.
+pub fn clear_loopback_mode(sublayer: &GUID) -> Result<()> {
+    set_loopback_mode(sublayer, None)
+}
+
+fn read_loopback_modes() -> Result<Vec<(String, String)>> {
+    Ok(match crate::reg::Key::open(crate::reg::BASE, false)? {
+        Some(base) => {
+            parse_loopback_modes(&base.get_multi_sz(LOOPBACK_MODES_VALUE)?.unwrap_or_default())
+        }
+        None => Vec::new(),
+    })
+}
+
+/// The mode recorded for `sublayer` alone; `Ok(None)` with no line.
+pub fn read_loopback_mode(sublayer: &GUID) -> Result<Option<bool>> {
+    let key = sublayer_key(sublayer);
+    let own: Vec<_> = read_loopback_modes()?
+        .into_iter()
+        .filter(|(k, _)| *k == key)
+        .collect();
+    Ok(if own.is_empty() {
+        None
+    } else {
+        Some(effective_loopback(&own)?)
+    })
+}
+
+/// Whether the install record says loopback is open for sandboxed
+/// commands ([`effective_loopback`]); `Ok(false)` with no install.
+pub fn read_allow_loopback() -> Result<bool> {
+    effective_loopback(&read_loopback_modes()?)
+}
+
+/// `Err` (operator-facing text) unless the session's loopback mode is
+/// the one the install record has; a difference either way is refused.
+pub fn require_allow_loopback(configured: bool) -> std::result::Result<(), String> {
+    let installed = read_allow_loopback().map_err(|e| format!("read loopback mode: {e:#}"))?;
+    if installed == configured {
+        Ok(())
+    } else {
+        Err(crate::wfp::loopback_mismatch_hint(installed, configured))
+    }
+}
+
 /// Read the recorded MITM CA (DER), if `srt-win user trust-ca`
 /// ever ran. `Ok(None)` when no install has run or no CA
 /// is recorded.
@@ -493,6 +631,7 @@ pub fn clear_setup() -> Result<()> {
             "SandboxGroupSid",
             "MarkerVersion",
             "CreatedAt",
+            LOOPBACK_MODES_VALUE,
         ] {
             crate::reg::delete_value(&base, v)?;
         }
@@ -503,6 +642,51 @@ pub fn clear_setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wfp::DEFAULT_SUBLAYER_GUID;
+
+    const A: &str = "2c5d0ad6-5f3b-4d4e-9b8f-1a3e7c9d0b21";
+    const B: &str = "7d3c1a52-6e0b-4f8a-b1d4-2a9c5e7f3b60";
+
+    fn modes(v: &[&str]) -> Vec<(String, String)> {
+        parse_loopback_modes(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn sublayer_key_is_the_lowercase_guid() {
+        assert_eq!(sublayer_key(&DEFAULT_SUBLAYER_GUID), A);
+    }
+
+    #[test]
+    fn one_sublayer_changes_only_its_own_line() {
+        let both = [format!("{A}=closed"), format!("{B}=open")];
+        let got = loopback_modes_with(modes(&[&both[0], &both[1]]), A, Some(MODE_OPEN));
+        assert_eq!(got, [format!("{B}=open"), format!("{A}=open")]);
+        // An uninstall removes the line and leaves the other.
+        let got = loopback_modes_with(modes(&[&both[0], &both[1]]), A, None);
+        assert_eq!(got, [format!("{B}=open")]);
+        // A key is matched whatever its case; a line without `=` is dropped.
+        let upper = format!("{}=open", A.to_uppercase());
+        assert_eq!(modes(&[&upper, "junk"]), modes(&[&format!("{A}=open")]));
+    }
+
+    #[test]
+    fn loopback_is_open_only_when_every_recorded_set_is() {
+        // No record: nothing installed, or a set from before the record.
+        assert!(!effective_loopback(&[]).unwrap());
+        assert!(effective_loopback(&modes(&[&format!("{A}=open")])).unwrap());
+        assert!(!effective_loopback(&modes(&[&format!("{A}=closed")])).unwrap());
+        // One closed set's BLOCK applies to every sandboxed connect.
+        let mixed = modes(&[&format!("{A}=open"), &format!("{B}=closed")]);
+        assert!(!effective_loopback(&mixed).unwrap());
+    }
+
+    #[test]
+    fn a_mode_that_is_changing_or_unknown_is_an_error_not_closed() {
+        for word in [MODE_CHANGING, "1", ""] {
+            let m = modes(&[&format!("{A}=open"), &format!("{B}={word}")]);
+            assert!(effective_loopback(&m).is_err(), "{word:?}");
+        }
+    }
 
     #[test]
     fn only_this_builds_marker_version_passes() {

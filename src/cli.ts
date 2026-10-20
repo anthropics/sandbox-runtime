@@ -202,6 +202,11 @@ async function main(): Promise<void> {
       'loopback PERMIT port range (e.g. 60080-60089)',
     )
     .option(
+      '--allow-loopback',
+      'let sandboxed commands connect to any localhost port (default: ' +
+        'off); must match network.allowLocalBinding',
+    )
+    .option(
       '--sandbox-user <name>',
       'name for the sandbox user account (default: srt-sandbox)',
     )
@@ -225,6 +230,7 @@ async function main(): Promise<void> {
           installWindowsSandboxAsync,
           resolveSrtWin,
           VENDORED_SRT_WIN_EXE,
+          WINDOWS_ALLOW_LOOPBACK_EFFECT,
         } = await import('./sandbox/windows-sandbox-utils.js')
         const range =
           typeof o.proxyPortRange === 'string'
@@ -234,6 +240,7 @@ async function main(): Promise<void> {
           const r = await installWindowsSandboxAsync({
             sublayerGuid: o.sublayerGuid as string | undefined,
             proxyPortRange: range,
+            allowLoopback: Boolean(o.allowLoopback),
             sandboxUser: o.sandboxUser as string | undefined,
             force: Boolean(o.force),
             skipProfileGrant: Boolean(o.skipProfileGrant),
@@ -271,7 +278,10 @@ async function main(): Promise<void> {
                 : `NOT applied — ${r.profileGrant?.reason ?? 'unknown'}`) +
               `\n\n` +
               `No logout needed — the WFP filter keys on the dedicated ` +
-              `\`srt-sandbox\` user's SID, so your network is unaffected.`,
+              `\`srt-sandbox\` user's SID, so your network is unaffected.` +
+              (r.wfp.allowLoopback
+                ? `\n\n${WINDOWS_ALLOW_LOOPBACK_EFFECT}`
+                : ''),
           )
         } catch (e) {
           console.error(`Error: ${(e as Error).message}`)

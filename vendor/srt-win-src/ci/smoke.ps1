@@ -294,12 +294,15 @@ function WfpVerify([string]$tgt) {
   $out = & $Exe wfp verify --target $tgt
   $ec = $LASTEXITCODE
   Write-Host "wfp verify --target ${tgt}: exit=$ec stdout='$out'"
+  # The exit code first: only 0, 2 and 3 come with a probe report to parse.
+  if ($ec -notin 0, 2, 3) { throw "wfp verify --target ${tgt} exited $ec without a probe report. stdout: $out" }
   return [pscustomobject]@{ exit = $ec; json = $out | ConvertFrom-Json }
 }
 $v = WfpVerify $probeTgt
 if ($v.exit -ne 0 -or $v.json.egress_probe -ne 'blocked') {
   throw ("wfp verify (fence-active): expected exit 0 + blocked, " +
-         "got exit=$($v.exit) probe='$($v.json.egress_probe)'")
+         "got exit=$($v.exit) probe='$($v.json.egress_probe)'. " +
+         "Every attempt: $($v.json | ConvertTo-Json -Compress)")
 }
 if ($v.json.target -ne $probeTgt) {
   throw "wfp verify: --target not honoured; got '$($v.json.target)'"
@@ -398,6 +401,10 @@ if ($v.exit -ne 3 -or $v.json.egress_probe -ne 'connected') {
          "fence-active from fence-missing")
 }
 Write-Host 'wfp verify ok: fence-inactive → exit 3 + connected'
+# The plain connect settles it: nothing else is attempted.
+if ($v.json.low_integrity_loopback_probe -ne 'skipped' -or $v.json.anonymous_loopback_probe -ne 'skipped') {
+  throw "wfp verify (fence-inactive): expected the remaining attempts skipped: $($v.json | ConvertTo-Json -Compress)"
+}
 $probeLsn.Stop()
 
 # Re-install to set up for the full uninstall below.

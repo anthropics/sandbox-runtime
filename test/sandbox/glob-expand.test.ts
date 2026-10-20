@@ -2344,6 +2344,20 @@ describe('parseWindowsSandboxError', () => {
     )
     expect(parseWindowsSandboxError('')).toBe(undefined)
   })
+
+  it('parses the wfp_loopback_mismatch line exec prints when it launches nothing', () => {
+    const message =
+      "the network fence on this machine does not match this session's " +
+      'loopback mode (installed: closed; configured: open) — re-run ' +
+      '`srt-win install --allow-loopback --force` (one UAC prompt)'
+    const err = parseWindowsSandboxError(
+      JSON.stringify({ code: 'wfp_loopback_mismatch', message }) + '\n',
+    )
+    expect(err).toBeInstanceOf(WindowsSandboxError)
+    expect(err?.code).toBe('wfp_loopback_mismatch')
+    expect(err?.message).toBe(message)
+    expect(err?.subcommand).toBe('exec')
+  })
 })
 
 // ============================================================================

@@ -1254,6 +1254,11 @@ export type SandboxDependencyCheck = {
   errors: string[]
   /** Windows: the error in `errors` that asks for the install to be re-run. */
   reinstallRequired?: string
+  /**
+   * Windows: the error in `errors` that says the installed loopback mode
+   * is not the configured `network.allowLocalBinding`.
+   */
+  loopbackMismatch?: string
 }
 
 /**

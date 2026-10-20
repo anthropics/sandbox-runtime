@@ -1,6 +1,9 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
-import { SandboxRuntimeConfigSchema } from '../src/sandbox/sandbox-config.js'
-import { WindowsConfigSchema } from '../src/sandbox/sandbox-config.js'
+import {
+  NetworkConfigSchema,
+  SandboxRuntimeConfigSchema,
+  WindowsConfigSchema,
+} from '../src/sandbox/sandbox-config.js'
 import * as platform from '../src/utils/platform.js'
 import { isWindows } from './helpers/platform.js'
 
@@ -2344,6 +2347,38 @@ describe('Config Validation', () => {
           expect(parse({ handshakeTimeoutMs: v }).success).toBe(false)
         }
       })
+    })
+  })
+
+  describe('network.allowLocalBinding', () => {
+    const parse = (network: Record<string, unknown>) =>
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [], ...network },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+
+    test('is unset by default and takes a boolean, nothing else', () => {
+      const none = parse({})
+      expect(none.success).toBe(true)
+      if (none.success) {
+        expect(none.data.network.allowLocalBinding).toBeUndefined()
+      }
+      for (const v of [true, false]) {
+        const r = parse({ allowLocalBinding: v })
+        expect(r.success).toBe(true)
+        if (r.success) expect(r.data.network.allowLocalBinding).toBe(v)
+      }
+      // No port list, range or mode word: it is a toggle.
+      for (const v of ['all', 1, [3000, 3099], null]) {
+        expect(parse({ allowLocalBinding: v }).success).toBe(false)
+      }
+    })
+
+    test('its description says what it does on each platform', () => {
+      const text = NetworkConfigSchema.shape.allowLocalBinding.description ?? ''
+      for (const platform of ['macOS', 'Windows', 'Linux']) {
+        expect(text).toContain(platform)
+      }
     })
   })
 

@@ -361,6 +361,21 @@ try {
       } elseif ($flag -and -not $v.write_restricted_token) {
         Fail 'C: wfp verify --write-restricted-token did not report the token shape it probed'
       } else { Ok "C: wfp verify (write-restricted=$flag) reports blocked" }
+      # Under either token no lowered-integrity copy may get out; one that
+      # could not be assumed is `error`, and is named in the residuals.
+      if ($v) {
+        $low = 'low_integrity_probe','low_integrity_loopback_probe',
+               'untrusted_integrity_probe','untrusted_integrity_loopback_probe'
+        $out = @($low | Where-Object { $v.$_ -in 'connected','refused' })
+        $unset = @($low | Where-Object { $v.$_ -eq 'error' })
+        if ($out.Count -gt 0) {
+          Fail "C: a lowered-integrity connect got out (write-restricted=$flag): $($out -join ', ')"
+        } elseif ($unset.Count -gt 0 -and $v.residuals -notcontains 'lowered-integrity-unprobed') {
+          Fail "C: $($unset -join ', ') = error without the lowered-integrity-unprobed residual (write-restricted=$flag)"
+        } else {
+          Ok "C: lowered-integrity attempts (write-restricted=$flag): $(($low | ForEach-Object { "$_=$($v.$_)" }) -join ' ')"
+        }
+      }
     }
     # `probe connect` exits 0 = refused by the fence, 3 = connected.
     $r = SbOn @($ExeAbs, 'probe', 'connect', '--target', $tgt)
