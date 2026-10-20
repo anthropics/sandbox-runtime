@@ -14,6 +14,9 @@ import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
  * them runs backwards (`[user-id]`: `r-i`). A route folder is named so. The
  * brackets are the text they are, in every list and on every platform, and
  * the rest of the entry is the pattern it was.
+ *
+ * So are brackets with nothing in them and a bracket without its partner. A
+ * wildcard in a set is a member of it.
  */
 
 const ROOT = join(
@@ -30,6 +33,12 @@ const FILES = {
   // What a set of the letters between the brackets would match.
   U: 'u/a.env',
   P: 'plain',
+  L: 'list[].ts',
+  C: 'x]y',
+  O: 'o[p[q1',
+  W: 'a*c',
+  // What a wildcard there would match.
+  B: 'abc',
 }
 const ALL = Object.keys(FILES).join('')
 const without = (letters: string): string =>
@@ -41,6 +50,11 @@ const ENTRIES: Array<[string, string, string]> = [
   ['[user-id]', 'SE', '\\[user-id\\]'],
   ['[user-id]/secret', 'S', '\\[user-id\\]/secret'],
   ['**/[user-id]/*.env', 'ED', '(.*/)?\\[user-id\\]/[^/]*\\.env'],
+  // After a `**/`, so that none is also read as the name of the file.
+  ['**/list[].ts', 'L', '(.*/)?list\\[\\]\\.ts'],
+  ['**/x]y', 'C', '(.*/)?x\\]y'],
+  ['**/o[p[q*', 'O', '(.*/)?o\\[p\\[q[^/]*'],
+  ['**/a[*]c', 'W', '(.*/)?a[*]c'],
 ]
 
 type Policy = Pick<SandboxRuntimeConfig, 'filesystem' | 'credentials'>

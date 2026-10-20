@@ -5,6 +5,10 @@ import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, generateCa } from '../../src/sandbox/mitm-ca.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import {
+  encodeSandboxedCommand,
+  proxyUsernameFor,
+} from '../../src/sandbox/sandbox-utils.js'
 import { SERVES_EMITTED_CONNECTIONS } from '../helpers/emitted-connections.js'
 
 // TLS termination runs in this process and needs an http.Server that
@@ -86,10 +90,13 @@ describe('a runtime that cannot terminate TLS in-process fails at start-up', () 
   )
 })
 
-/** A CONNECT to a.test:443 through the manager's proxy: the reply head and the socket. */
-function connectThroughManager(): Promise<{ head: string; sock: Socket }> {
+/** A CONNECT to a.test:443 through the manager's proxy, as `command` if given: the reply head and the socket. */
+function connectThroughManager(
+  command?: string,
+): Promise<{ head: string; sock: Socket }> {
   const port = SandboxManager.getProxyPort()!
-  const auth = Buffer.from(`srt:${SandboxManager.getProxyAuthToken()!}`)
+  const user = proxyUsernameFor(command && encodeSandboxedCommand(command))
+  const auth = Buffer.from(`${user}:${SandboxManager.getProxyAuthToken()!}`)
   return new Promise(resolve => {
     const sock = connect(port, '127.0.0.1', () =>
       sock.write(
@@ -134,6 +141,45 @@ describe.skipIf(!SERVES_EMITTED_CONNECTIONS)(
       await new Promise(r => setTimeout(r, 50))
       const third = await connectThroughManager()
       expect(third.head).toStartWith('HTTP/1.1 200')
+    }, 20_000)
+
+    test("the cap's 503 is recorded as a violation of the command it refused", async () => {
+      cleanup.push(() => SandboxManager.reset())
+      await SandboxManager.initialize(
+        baseConfig({ tlsTerminate: { maxTunnels: 1 } }),
+      )
+      await connectThroughManager('holds the slot')
+      const refused = await connectThroughManager('curl https://a.test/')
+      expect(refused.head).toStartWith('HTTP/1.1 503')
+      expect(
+        SandboxManager.getSandboxViolationStore()
+          .getViolationsForCommand('curl https://a.test/')
+          .map(v => v.line),
+      ).toEqual([
+        "deny http-request CONNECT a.test:443 (the sandbox's limit of 1 " +
+          'TLS-terminated tunnels at once is reached; ' +
+          'the limit is network.tlsTerminate.maxTunnels in the ' +
+          "sandbox's configuration)",
+      ])
+    }, 20_000)
+
+    test('updateConfig changes both for the CONNECTs that follow', async () => {
+      cleanup.push(() => SandboxManager.reset())
+      await SandboxManager.initialize(
+        baseConfig({ tlsTerminate: { maxTunnels: 1 } }),
+      )
+      await connectThroughManager()
+      expect((await connectThroughManager()).head).toStartWith('HTTP/1.1 503')
+      SandboxManager.updateConfig(
+        baseConfig({
+          tlsTerminate: { maxTunnels: 2, handshakeTimeoutMs: 300 },
+        }),
+      )
+      const second = await connectThroughManager()
+      expect(second.head).toStartWith('HTTP/1.1 200')
+      const openedAt = Date.now()
+      await new Promise(r => second.sock.once('close', r))
+      expect(Date.now() - openedAt).toBeLessThan(5_000)
     }, 20_000)
   },
 )

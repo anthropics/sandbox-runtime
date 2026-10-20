@@ -1,7 +1,9 @@
 import { expect, test } from 'bun:test'
+import { EventEmitter } from 'node:events'
 import {
   adjustByteBudget,
   createByteBudget,
+  gateSocketOnBufferedBody,
 } from '../../src/sandbox/emitted-connection.js'
 
 test('a drop in a byte budget wakes each waiter once and empties the set', () => {
@@ -57,3 +59,24 @@ test('many add and release cycles leave a byte budget empty', () => {
   expect(budget.used).toBe(0)
   expect(budget.waiters.size).toBe(0)
 })
+
+test.each(['end', 'close'])(
+  "what a gated request holds is given back at its %s, or its socket's close, and the socket is let go of",
+  event => {
+    for (const from of ['req', 'socket'] as const) {
+      const budget = createByteBudget(1000)
+      const socket = Object.assign(new EventEmitter(), { pause() {} })
+      const req = Object.assign(new EventEmitter(), {
+        socket,
+        readableLength: 10,
+      })
+      gateSocketOnBufferedBody(req as never, 100, budget)
+      socket.emit('data')
+      expect(budget.used).toBe(10)
+      if (from === 'req') req.emit(event)
+      else socket.emit('close')
+      expect(budget.used).toBe(0)
+      expect(socket.eventNames()).toEqual([])
+    }
+  },
+)

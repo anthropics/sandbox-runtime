@@ -361,29 +361,25 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
     expect([...unlistable]).toEqual([])
   })
 
-  it('denies nothing for a link out of the tree when the pattern cannot be read a name at a time', () => {
-    // `id[*].pem` cannot be followed one path component at a time, so no
-    // directory is listed through a symlink, and what such a pattern would
-    // match through one goes undenied: a known gap. Denying whole what every
-    // link out of the tree leads to is no cure: with vendor/sdk/conf -> /usr
-    // that masks /usr, and no command starts.
-    const unsplit = caseRoot('unsplit')
-    mkdirSync(join(unsplit, 'proj', 'vendor', 'sdk'), { recursive: true })
-    mkdirSync(join(unsplit, 'outside'))
-    writeFileSync(join(unsplit, 'outside', 'x'), '')
+  it('denies through a link out of the tree what a pattern with a wildcard in a set matches', () => {
+    const root = caseRoot('wildcard-in-a-set')
+    mkdirSync(join(root, 'proj', 'vendor', 'sdk'), { recursive: true })
+    mkdirSync(join(root, 'outside'))
+    writeFileSync(join(root, 'outside', 'id*.pem'), '')
+    writeFileSync(join(root, 'outside', 'idx.pem'), '')
     symlinkSync(
-      join(unsplit, 'outside'),
-      join(unsplit, 'proj', 'vendor', 'sdk', 'conf'),
+      join(root, 'outside'),
+      join(root, 'proj', 'vendor', 'sdk', 'conf'),
     )
 
     const unlistable = new Set<string>()
     const mounts = expandReadDenyGlobLinux(
-      join(unsplit, 'proj', 'id[*].pem'),
+      join(root, 'proj', '**', 'id[*].pem'),
       [],
       unlistable,
     )
 
-    expect(mounts).toEqual([])
+    expect(mounts).toEqual([join(root, 'outside', 'id*.pem')])
     expect([...unlistable]).toEqual([])
   })
 
@@ -523,8 +519,12 @@ describe.if(!isWindows)('expandReadDenyGlobLinux (symlinks)', () => {
       tail = '**/secrets/**',
     ): string[] {
       const spies = (['statSync', 'realpathSync'] as const).map(fn => {
-        const call = fs[fn] as (...args: unknown[]) => unknown
-        return spyOn(fs, fn).mockImplementation(((
+        // The real path is asked of the `native` form.
+        const [holder, name] = (
+          fn === 'realpathSync' ? [fs.realpathSync, 'native'] : [fs, fn]
+        ) as [Record<string, unknown>, string]
+        const call = holder[name] as (...args: unknown[]) => unknown
+        return spyOn(holder, name).mockImplementation(((
           p: unknown,
           ...rest: unknown[]
         ) => {
@@ -1790,7 +1790,7 @@ describe.if(isLinux)(
         })
       }
       const realStat = fs.statSync
-      const realRealpath = fs.realpathSync
+      const realRealpath = fs.realpathSync.native
       const spies = [
         spyOn(fs, 'statSync').mockImplementation(((
           p: fs.PathLike,
@@ -1802,7 +1802,7 @@ describe.if(isLinux)(
                 p,
                 ...rest,
               )) as typeof fs.statSync),
-        spyOn(fs, 'realpathSync').mockImplementation(((
+        spyOn(fs.realpathSync, 'native').mockImplementation(((
           p: fs.PathLike,
           ...rest: unknown[]
         ) =>
@@ -1811,7 +1811,7 @@ describe.if(isLinux)(
             : (realRealpath as (...a: unknown[]) => unknown)(
                 p,
                 ...rest,
-              )) as typeof fs.realpathSync),
+              )) as typeof fs.realpathSync.native),
       ]
       try {
         const wrapped = await wrapCommandWithSandboxLinux({

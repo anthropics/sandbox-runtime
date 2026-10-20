@@ -346,7 +346,7 @@ describe('restriction pattern semantics', () => {
         })
 
         expect(result).toContain('/opt/sc/socat')
-        expect(result).toContain('TCP-LISTEN:3128')
+        expect(result).toContain('TCP6-LISTEN:3128')
       } finally {
         rmSync(httpSock, { force: true })
         rmSync(socksSock, { force: true })

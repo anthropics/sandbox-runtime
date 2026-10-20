@@ -197,12 +197,15 @@ export function gateSocketOnBufferedBody(
   }
   const release = (): void => {
     socket.off('data', check)
+    socket.off('close', release)
     if (budget) adjustByteBudget(budget, -counted)
     counted = 0
   }
   socket.on('data', check)
   req.once('end', release)
   req.once('close', release)
+  // Not every runtime closes the request of a socket that closes.
+  socket.once('close', release)
 }
 
 const endsGracefully = new WeakSet<object>()

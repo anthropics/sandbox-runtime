@@ -334,3 +334,114 @@ describe.if(isLinux)('getFsWriteConfig() stays a plain getter', () => {
     )
   })
 })
+
+/**
+ * The getter is asked once a path, from permission checks, so what its read
+ * rules compile to is kept. Only that: what it asks of the configuration and
+ * of the disk it asks every time.
+ */
+describe.if(isLinux || isMacOS)(
+  'getFsWriteConfig() is asked once a path',
+  () => {
+    let base: string
+
+    beforeAll(() => {
+      base = mkdtempSync(join(tmpdir(), 'srt-home-'))
+    })
+
+    afterAll(async () => {
+      await SandboxManager.reset()
+      rmSync(base, { recursive: true, force: true })
+    })
+
+    /** Runs `body`, which fills `out`, under a new HOME named `name`. */
+    const run = (name: string, body: string): unknown => {
+      const home = join(base, name)
+      mkdirSync(join(home, NPM_LOGS), { recursive: true })
+      return runWithHome(
+        home,
+        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+       const fs = await import('node:fs')
+       const home = process.env.HOME
+       const logs = home + '/${NPM_LOGS}'
+       const logsWritable = () =>
+         SandboxManager.getFsWriteConfig().allowOnly.includes(logs)
+       const start = async filesystem => {
+         const config = {
+           network: { allowedDomains: [], deniedDomains: [] },
+           filesystem: { allowWrite: [], denyWrite: [], ...filesystem },
+         }
+         await SandboxManager.initialize(config)
+         return config
+       }
+       const out = []
+       ${body}
+       await SandboxManager.reset()
+       process.stdout.write(JSON.stringify(out) + '\\n', () => process.exit(0))`,
+      )
+    }
+
+    it('follows a configuration that is changed in place', () => {
+      expect(
+        run(
+          'in-place',
+          `const config = await start({ denyRead: [] })
+         out.push(logsWritable())
+         config.filesystem.denyRead.push('~/.np[m]')
+         out.push(logsWritable())`,
+        ),
+      ).toEqual([true, false])
+    })
+
+    // In a home whose name holds brackets the allowRead is a name only for as
+    // long as nothing on its way is a link.
+    it('follows what is on disk', () => {
+      expect(
+        run(
+          '[h]ome',
+          `await start({ denyRead: [home + '/.npm'], allowRead: [logs] })
+         out.push(logsWritable())
+         fs.rmSync(logs, { recursive: true })
+         fs.symlinkSync(home, logs)
+         out.push(logsWritable())`,
+        ),
+      ).toEqual([true, false])
+    })
+
+    it('reads more pattern text than it keeps', () => {
+      expect(
+        run(
+          'much',
+          `const much = Array.from({ length: 300 }, (_, i) => '/x' + i + '/' + 'a'.repeat(4_000) + '*')
+         await start({ denyRead: much })
+         out.push(logsWritable(), logsWritable())
+         await SandboxManager.reset()
+         await start({ denyRead: [...much, '~/.np[m]', ...much.map(p => p + 'b')] })
+         out.push(logsWritable(), logsWritable())`,
+        ),
+      ).toEqual([true, true, false, false])
+    })
+
+    it.each(['[', '[z-a]'])(
+      'does not compile 96 KB of %p for every path',
+      async unit => {
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            denyRead: Array.from(
+              { length: 24 },
+              (_, i) => `/x${i}/${unit.repeat(4_000 / unit.length)}`,
+            ),
+            allowWrite: [],
+            denyWrite: [],
+          },
+        })
+        const began = performance.now()
+        for (let i = 0; i < 60; i++) SandboxManager.getFsWriteConfig()
+        // Some 3 ms each. Compiled each time, 40 ms and more.
+        expect(performance.now() - began).toBeLessThan(1_500)
+      },
+    )
+  },
+)

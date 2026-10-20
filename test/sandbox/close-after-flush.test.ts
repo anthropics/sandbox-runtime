@@ -54,4 +54,25 @@ describe('closeAfterFlush', () => {
     expect(read).toBe(size)
     expect(await how).toBe('the client ending after the flush')
   }, 60_000)
+
+  test('a client that takes nothing is cut after the time allowed, not before', async () => {
+    const began = Date.now()
+    const how = await new Promise<string>(closedBy => {
+      const server = createServer((s: Socket) => {
+        s.on('error', () => {})
+        // More than the kernel takes for a client that reads nothing.
+        s.write(Buffer.alloc(32 << 20, 0x61))
+        closeAfterFlush(s, closedBy, 400)
+      })
+      cleanup.push(() => server.close())
+      server.listen(0, '127.0.0.1', () => {
+        const c = connect((server.address() as AddressInfo).port, '127.0.0.1')
+        c.on('error', () => {})
+        c.pause()
+        cleanup.push(() => c.destroy())
+      })
+    })
+    expect(how).toBe('not flushed in 400 ms')
+    expect(Date.now() - began).toBeGreaterThanOrEqual(400)
+  }, 5_000)
 })

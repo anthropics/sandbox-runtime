@@ -11,7 +11,12 @@
 
 import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
 import { createServer as createHttpServer } from 'node:http'
-import type { ClientRequest, IncomingMessage, ServerResponse } from 'node:http'
+import type {
+  ClientRequest,
+  IncomingMessage,
+  Server,
+  ServerResponse,
+} from 'node:http'
 import type { LookupFunction, Socket } from 'node:net'
 import { checkServerIdentity, TLSSocket } from 'node:tls'
 import type { TLSSocketOptions } from 'node:tls'
@@ -31,8 +36,11 @@ import {
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
-  normalizeRequestTarget,
+  readRequestTarget,
+  refuseUnparsedRequest,
   requestTargetAsSpelled,
+  respondRefusedTarget,
+  type AmbiguousRequestTarget,
   type DenyMark,
   applyHeaderEdits,
   notifyResponse,
@@ -54,6 +62,7 @@ import {
   directRequestOptions,
   type DirectRequestOptions,
   formatAuthority,
+  onUpstreamError,
   relayResponseHead,
   stripHopByHop,
 } from './parent-proxy.js'
@@ -219,8 +228,10 @@ function duplexOverSocket(
  * reads in that socket's own buffer too, which grows by the whole upload.
  * `outbound` is the stream whose write queue holds what is on its way to
  * the client.
+ *
+ * @internal Exported for its test.
  */
-function serverTlsOn(
+export function serverTlsOn(
   socket: Duplex,
   head: Buffer,
   options: TLSSocketOptions,
@@ -237,6 +248,12 @@ function serverTlsOn(
     isServer: true,
   })
   setConsumer(tls)
+  // destroySoon() is to destroy a socket once all it was given is out. This
+  // one has finished as soon as it has written to the stream under it, long
+  // before the client has the bytes, and destroyed then it drops them. (A
+  // runtime's http server may call it after an HTTP/1.0 response.) Ended, it
+  // closes the tunnel too, after the flush. destroy() still cuts at once.
+  tls.destroySoon = () => void tls.end()
   return { tls, outbound: duplex }
 }
 
@@ -260,6 +277,28 @@ const MAX_QUEUED_FOR_CLIENT = 1 << 20
  * paused instead (gateSocketOnBufferedBody).
  */
 const MAX_BUFFERED_REQUEST_BODY = 4 << 20
+
+/** How long a tunnel may stay as it is before boundTunnel closes it. */
+export type TunnelTimeouts = {
+  /** From the ClientHello to the first request's whole head. */
+  firstRequestMs: number
+  /** What `Keep-Alive: timeout` says: from a response to the next request. */
+  keepAliveMs: number
+  /** How much later than it says an idle tunnel is ended, for a client that takes it at its word. */
+  keepAliveMarginMs: number
+  /** With a request or a response under way that does not move. */
+  stalledMs: number
+}
+
+export const TUNNEL_TIMEOUTS: TunnelTimeouts = {
+  firstRequestMs: 10_000,
+  keepAliveMs: 5_000,
+  keepAliveMarginMs: 1_000,
+  stalledMs: 300_000,
+}
+
+/** A tunnel with something under way is looked at this many times in a timeout. */
+const LOOKS = 5
 
 export type TerminateTarget = {
   /**
@@ -298,6 +337,8 @@ export type TerminateTarget = {
   denyHeader?: string
   /** Forward the request-target as spelled (see HttpProxyServerOptions.requestTargetAsSpelled). */
   requestTargetAsSpelled?: boolean
+  /** What becomes of an ambiguous request-target (see HttpProxyServerOptions.ambiguousRequestTarget). */
+  ambiguousRequestTarget?: AmbiguousRequestTarget
   /** The TLS server name the client sent (set by terminateAndForward). */
   clientServerName?: string
   /** The ClientHello carries a server name that could not be read (see serverNameFromClientHello). */
@@ -308,6 +349,8 @@ export type TerminateTarget = {
   onHandshakeProbe?: (isDone: () => boolean) => void
   /** Shared across a proxy's tunnels: bytes they may hold for slow parties (see ByteBudget). */
   byteBudget?: ByteBudget
+  /** In place of TUNNEL_TIMEOUTS (see HttpProxyServerOptions.tunnelTimeouts). */
+  timeouts?: Partial<TunnelTimeouts>
 }
 
 /**
@@ -340,12 +383,14 @@ export function terminateAndForward(
   // The tunnel's one connection is its client's, so the server name in its
   // ClientHello is the tunnel's (read below, before the handshake).
   let serverName: ServerName = { kind: 'absent' }
+  const timeouts = { ...TUNNEL_TIMEOUTS, ...target.timeouts }
   // Never listens: the TLS socket below is handed to it.
-  const inner = createHttpServer(
-    target.maxHeaderSize !== undefined
+  const inner = createHttpServer({
+    keepAliveTimeout: timeouts.keepAliveMs,
+    ...(target.maxHeaderSize !== undefined
       ? { maxHeaderSize: target.maxHeaderSize }
-      : {},
-  )
+      : {}),
+  })
 
   // Needs an http.Server that serves a connection handed to it (Node, Bun
   // 1.4 and later: such a server has a 'connection' listener of its own).
@@ -399,6 +444,12 @@ export function terminateAndForward(
       maxSigv4BodyBytes,
     )
   })
+  // Responses under way on the tunnel's connection.
+  let answering = 0
+  inner.on('request', (_req, res) => {
+    answering++
+    res.once('close', () => answering--)
+  })
   inner.on('clientError', (err, sock) => {
     // Parse errors and resets on the tunnel would otherwise escalate to an
     // uncaughtException, same class as the request-stream errors handled
@@ -407,26 +458,22 @@ export function terminateAndForward(
       `[tls-terminate] client connection error for ${target.hostname}: ${err.message}`,
       { level: 'error' },
     )
-    if (
-      target.maxHeaderSize !== undefined &&
-      (err as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW' &&
-      sock.writable
-    ) {
-      // A head past the caller's own limit is a request past its limits:
-      // 400, flushed before the socket goes.
-      sock.on('error', () => {})
-      const mark =
-        target.denyHeader !== undefined
-          ? `${target.denyHeader}: bad_request\r\n`
-          : ''
-      sock.end(
-        `HTTP/1.1 400 Bad Request\r\n${mark}Content-Length: 0\r\nConnection: close\r\n\r\n`,
-        () => sock.destroy(),
-      )
-      setTimeout(() => sock.destroy(), 1000).unref?.()
-      return
-    }
-    sock.destroy()
+    // A request the parser refuses is refused like any other: answered, and
+    // reported under the tunnel's own target.
+    const refused = refuseUnparsedRequest(
+      err,
+      sock,
+      answering === 0,
+      target.denyHeader !== undefined
+        ? { name: target.denyHeader, value: 'bad_request' }
+        : undefined,
+    )
+    if (refused === undefined) return
+    target.onFilterRequestDeny?.(
+      refused.method,
+      `https://${formatAuthority(target.hostname, target.port, 443)}${refused.target}`,
+      refused.reason,
+    )
   })
   inner.on('upgrade', (_req, sock) => {
     // WebSocket / non-HTTP over TLS — out of scope for now.
@@ -496,7 +543,9 @@ export function terminateAndForward(
     tls.once('data', onEstablished)
     // Neither event comes for a client that finishes the handshake and then
     // stays quiet where 'secure' is not said, so a deadline asks instead.
-    target.onHandshakeProbe?.(() => established || isTlsHandshakeDone(tls))
+    const handshakeDone = (): boolean => established || isTlsHandshakeDone(tls)
+    target.onHandshakeProbe?.(handshakeDone)
+    boundTunnel(inner, tls, outbound, socket, timeouts, handshakeDone)
     tls.once('secure', () => {
       onEstablished()
       // Where the runtime reports the name its TLS layer took, it must be
@@ -549,6 +598,109 @@ export function terminateAndForward(
     inner.emit('connection', tls)
     keepFlushedHeaderBatches(tls)
   }
+}
+
+/**
+ * Close a tunnel that would otherwise stay open, and hold its slot, for as
+ * long as its client or its upstream leaves it so. Its server never listens,
+ * so of a server's connection timeouts the runtime applies keepAliveTimeout
+ * alone (Node) or none (Bun).
+ *
+ * - Idle, that is no response owed (no request yet, between two, part of a
+ *   head) and nothing queued for the client: ended with close_notify and a
+ *   FIN, and destroyed if it is still there, and idle, as long again.
+ * - Under way, that is a request not all in, the tunnel paused for an
+ *   upstream that takes no more of one (so that not even its client's
+ *   leaving is seen), or bytes queued for a client: destroyed once nothing
+ *   has moved for `stalledMs`. A client that goes on reading loses nothing.
+ *   That it reads is seen when the kernel takes more, which it does once a
+ *   good part of its send buffer is free: up to a megabyte or two at a time.
+ *
+ * A whole request that waits for its response is left alone: the tunnel is
+ * read meanwhile, so it closes when its client does.
+ *
+ * @internal Exported for its test.
+ */
+export function boundTunnel(
+  inner: Server,
+  tls: TLSSocket,
+  outbound: Writable,
+  socket: Duplex,
+  { firstRequestMs, keepAliveMs, keepAliveMarginMs, stalledMs }: TunnelTimeouts,
+  handshakeDone: () => boolean,
+): void {
+  // What is on its way to the client and still in this process. No layer
+  // counts it all: a response is done, and Bun's TLS socket empty and
+  // finished, with a megabyte in the stream under it. (Under Node two of
+  // the three are one: all that is asked is whether it is zero, or changes.)
+  const queued = (): number =>
+    tls.writableLength + outbound.writableLength + socket.writableLength
+
+  let owed = 0
+  let idle: ReturnType<typeof setTimeout>
+  const endWhenIdleFor = (ms: number): void => {
+    const busy = queued() > 0
+    idle = setTimeout(
+      () => {
+        // Not idle for all of `ms`: a handshake under way has a deadline of
+        // its own, and what is queued is the client's to take.
+        if (!handshakeDone() || busy || queued() > 0) return endWhenIdleFor(ms)
+        // Ended, and still here: not every client answers an end, and not
+        // every runtime closes the socket under a TLS socket it ends.
+        if (tls.writableEnded) return void socket.destroy()
+        logForDebugging(`[tls-terminate] tunnel idle for ${ms} ms; closed`)
+        tls.end()
+        endWhenIdleFor(ms)
+      },
+      busy ? ms / LOOKS : ms,
+    )
+    idle.unref?.()
+  }
+  endWhenIdleFor(firstRequestMs)
+  // Node's own keep-alive timeout destroys the socket, whatever is queued.
+  inner.on('timeout', () => {})
+
+  let receiving: IncomingMessage | undefined
+  // A tunnel moves when bytes are read, when it is taken up again after a
+  // pause (what is read then, a runtime may have read ahead and counted),
+  // and when bytes written to it leave the queue.
+  let resumed = 0
+  tls.on('resume', () => resumed++)
+  let moved = 0
+  let still = 0
+  const stalled = setInterval(() => {
+    const before = moved
+    moved = tls.bytesRead + resumed + tls.bytesWritten - queued()
+    const underWay =
+      tls.isPaused() || receiving?.complete === false || queued() > 0
+    still = underWay && moved === before ? still + 1 : 0
+    if (still < LOOKS) return
+    logForDebugging(
+      `[tls-terminate] nothing has moved for ${stalledMs} ms; tunnel closed`,
+    )
+    socket.destroy()
+  }, stalledMs / LOOKS)
+  stalled.unref?.()
+
+  inner.on('request', (req, res) => {
+    owed++
+    clearTimeout(idle)
+    receiving = req
+    // Once the answer is out nothing reads the request on (an upstream that
+    // answered or failed early took part of it), and a runtime's server
+    // leaves alone a request that was being read. The rest is dropped, so
+    // that the tunnel is read on: to the next request, or its client's end.
+    res.once('finish', () => req.unpipe().resume())
+    res.once('close', () => {
+      if (--owed === 0 && !socket.destroyed) {
+        endWhenIdleFor(keepAliveMs + keepAliveMarginMs)
+      }
+    })
+  })
+  socket.once('close', () => {
+    clearTimeout(idle)
+    clearInterval(stalled)
+  })
 }
 
 /**
@@ -672,11 +824,14 @@ function hostNameEntry(body: Buffer): ServerName {
  * the client ends its side, or after a grace period. Until then what the
  * client sends is read and dropped, since unread input when the socket
  * closes turns the close into a reset, and a reset discards what the
- * client has not read yet. A backstop covers a client that stops reading.
+ * client has not read yet. A client that has not taken it all in
+ * `stalledMs` is cut: what is queued leaves the queue all at once, so one
+ * that reads slowly cannot be told from one that has stopped.
  */
 export function closeAfterFlush(
   socket: Duplex,
   done: (how: string) => void,
+  stalledMs = TUNNEL_TIMEOUTS.stalledMs,
 ): void {
   if (socket.destroyed) {
     done('the client, earlier')
@@ -688,13 +843,16 @@ export function closeAfterFlush(
   const close = (how: string): void => {
     if (settled) return
     settled = true
-    clearTimeout(backstop)
+    clearTimeout(stalled)
     clearTimeout(grace)
     if (!socket.destroyed) socket.destroy()
     done(how)
   }
-  const backstop = setTimeout(() => close('the 30 s backstop'), 30_000)
-  backstop.unref?.()
+  const stalled = setTimeout(
+    () => close(`not flushed in ${stalledMs} ms`),
+    stalledMs,
+  )
+  stalled.unref?.()
   let grace: ReturnType<typeof setTimeout> | undefined
   const onFinish = (): void => {
     finished = true
@@ -861,25 +1019,45 @@ async function forwardUpstream(
   // yields a well-formed URL, and discard any client-supplied authority so
   // the CONNECT-verified target stays authoritative (same rationale as the
   // Host-header note below).
-  // With filterRequest, the request target is normalized before the hook
-  // sees it and that normalized target is what is forwarded: some runtimes'
-  // HTTP clients normalize it again on the way out, and the hook must judge
-  // exactly what is sent. A target of any other shape could make the judged
-  // URL name another host, so it is refused. Without filterRequest nothing
-  // judges the path, so the target is forwarded unchanged (and a masked AWS
-  // credential is re-signed over those same bytes). requestTargetAsSpelled
-  // comes first: it forwards the target as the client spelled it.
+  // With filterRequest, the hook gets the target as spelled and normalized,
+  // and the spelling is what is forwarded: rewriting it would break a
+  // signature over the path, or have a masked AWS credential re-signed for
+  // a resource the client did not name. Where the two forms can name
+  // different resources the hook may have judged another one than the
+  // upstream acts on, so the request is refused unless
+  // ambiguousRequestTarget says which form to send. A target of any other
+  // shape could make the judged URL name another host, so it is refused.
+  // Without filterRequest nothing judges the path, so the target is
+  // forwarded unchanged. requestTargetAsSpelled comes first: it forwards the
+  // target as the client spelled it.
   const markFor = (code: string): DenyMark | undefined =>
     target.denyHeader !== undefined
       ? { name: target.denyHeader, value: code }
       : undefined
+  // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
+  const authority = formatAuthority(target.hostname, target.port, 443)
+  const read =
+    filterRequest && !target.requestTargetAsSpelled
+      ? readRequestTarget(
+          req.url ?? '/',
+          req.method,
+          target.ambiguousRequestTarget,
+        )
+      : undefined
   const path = target.requestTargetAsSpelled
     ? requestTargetAsSpelled(req.url ?? '/')
-    : filterRequest
-      ? normalizeRequestTarget(req.url ?? '/', req.method)
+    : read
+      ? read.forwarded
       : originFormPath(req.url)
   if (path === undefined) {
-    respondDenied(res, 'malformed request-target', markFor('bad_request'), 400)
+    const why = respondRefusedTarget(res, read?.refusal, markFor('bad_request'))
+    target.onFilterRequestDeny?.(
+      req.method ?? 'GET',
+      `https://${authority}${read?.spelled ?? ''}`,
+      why,
+    )
+    // Like a denial: a body still to come must not keep the tunnel.
+    destroyAfterDenial(req, res)
     return
   }
   // RFC 9112 3.2: an HTTP/1.1 request without Host is answered 400. Not
@@ -897,18 +1075,15 @@ async function forwardUpstream(
     )
     return
   }
-  // The tunnel target as it goes on the wire: filterRequest URL, Host, SigV4.
-  const authority = formatAuthority(target.hostname, target.port, 443)
+  // RFC 9112 3.3: the target URI of the asterisk form (`OPTIONS *`) has an
+  // empty path. Put behind the authority, the `*` would be read into the host.
+  const url = `https://${authority}${path === '*' ? '' : path}`
   let body: Readable = req
   let decision: RequestDecision | undefined
   const sni = target.clientServerName ?? serverNameOf(req)
   if (target.requireHostMatch && target.clientServerNameUnreadable) {
     const why = 'TLS server name could not be read'
-    target.onFilterRequestDeny?.(
-      req.method ?? 'GET',
-      `https://${authority}${path}`,
-      why,
-    )
+    target.onFilterRequestDeny?.(req.method ?? 'GET', url, why)
     respondDenied(res, why, markFor('misdirected'), 421)
     return
   }
@@ -920,11 +1095,7 @@ async function forwardUpstream(
       absoluteFormAuthority(req.url),
     )
     if (why !== undefined) {
-      target.onFilterRequestDeny?.(
-        req.method ?? 'GET',
-        `https://${authority}${path}`,
-        why,
-      )
+      target.onFilterRequestDeny?.(req.method ?? 'GET', url, why)
       respondDenied(res, why, markFor('misdirected'), 421)
       return
     }
@@ -951,13 +1122,15 @@ async function forwardUpstream(
       filterRequest,
       req,
       res,
-      `https://${authority}${path}`,
+      url,
       ac.signal,
       target.onFilterRequestDeny,
       {
         sni,
         target: { host: target.hostname, port: target.port },
-        requestTarget: path,
+        requestTarget: read?.spelled ?? path,
+        normalizedRequestTarget: read?.normalized,
+        requestTargetIsAmbiguous: read?.ambiguous,
         rawHeaders: [...req.rawHeaders],
         scheme: 'https',
       },
@@ -1170,7 +1343,7 @@ async function forwardUpstream(
     },
   )
 
-  upstream.on('error', err => failUpstream(err, upstream))
+  onUpstreamError(upstream, err => failUpstream(err, upstream))
 
   res.on('close', () => upstream.destroy())
   if (bufferedBody !== undefined) {

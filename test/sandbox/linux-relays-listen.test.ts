@@ -115,6 +115,32 @@ describe.if(isLinux && bwrapCanNamespaceNetwork() && has('socat'))(
       })
     }
 
+    // Which family a plain TCP-LISTEN takes is socat's choice, and differs by
+    // version. These two stand-ins make it, so that the socat here does not.
+    it('listens on IPv4 where socat cannot on IPv6, and would', async () => {
+      const noIPv6 =
+        'case "$1" in TCP-LISTEN:* | TCP6-LISTEN:*) exit 1 ;; esac\nexec socat "$@"'
+      expect((await run(noIPv6)).lines).toEqual(['3128 up', '1080 up'])
+    })
+
+    it.if(existsSync('/proc/net/if_inet6'))(
+      'serves ::1 as well as 127.0.0.1, whatever socat would take',
+      async () => {
+        const { lines } = await run('exec socat -4 "$@"', {
+          command:
+            'for at in 127.0.0.1/3128 127.0.0.1/1080 ::1/3128 ::1/1080; do\n' +
+            '  (exec 3<>/dev/tcp/$at) 2>/dev/null && echo "$at up" || echo "$at refused"\n' +
+            'done',
+        })
+        expect(lines).toEqual([
+          '127.0.0.1/3128 up',
+          '127.0.0.1/1080 up',
+          '::1/3128 up',
+          '::1/1080 up',
+        ])
+      },
+    )
+
     // There, and never listening.
     const stopped = 'kill -STOP $$'
 
