@@ -120,6 +120,7 @@ export interface MacOSSandboxParams {
 export function macGetMandatoryDenyEntries(
   allowGitConfig = false,
   allowWritePaths: readonly string[] = [],
+  hasWritePatterns = false,
 ): PathEntry[] {
   const cwd = normalizePathForSandbox(process.cwd(), { literal: true })
   const entries: PathEntry[] = []
@@ -195,14 +196,14 @@ export function macGetMandatoryDenyEntries(
   // file. Nested pointer files are matched by vnode type instead
   // (gitPointerFilter), which cannot follow them.
   const pointer = gitFileDenies(dotGit, allowGitConfig, deadline)
-  const visited = new Set<string>()
   // Only where the command may write some of it: else there is nothing to deny,
-  // and a walk that refuses over a sibling worktree would protect nothing.
+  // and a walk that refuses over a sibling worktree would protect nothing. What
+  // a write root that is a pattern reaches is not worked out.
   const trees = pointer.gitDirs
-    .filter(gitDir => meetsWriteRoots(gitDir, allowWritePaths))
-    .map(gitDir =>
-      gitDirTreeDenies(gitDir, allowGitConfig, { deadline, visited }),
+    .filter(
+      gitDir => hasWritePatterns || meetsWriteRoots(gitDir, allowWritePaths),
     )
+    .map(gitDir => gitDirTreeDenies(gitDir, allowGitConfig, { deadline }))
   return withOnDisk(
     [...own, ...pointer.denyPaths, ...trees.flatMap(gitDirTreeDenyPaths)],
     [...pointer.chainHops, ...trees.flatMap(tree => tree.chainHops)],
@@ -1179,6 +1180,7 @@ function generateWriteRules(
       // The write roots that are names, a path marked literal among them. A
       // pattern names no directory that a deny could take whole.
       writeRoots.flatMap(root => (root.glob ? [] : [root.path])),
+      writeRoots.some(root => root.glob),
     ),
   ]
   denyEntries.push(...alsoReadAs(config.denyWithinAllow, 'deny'))

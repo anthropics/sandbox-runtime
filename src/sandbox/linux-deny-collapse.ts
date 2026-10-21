@@ -201,9 +201,12 @@ export function collapseFurther(
       // Each git directory under it is one bind by now, and the one bind of
       // `modules` replaces the lot.
       at =>
-        (plan.repositories[at]?.gitDirs ?? []).filter(kept =>
-          takesAMount(kept.gitDir),
-        ).length - 1,
+        Math.max(
+          (plan.repositories[at]?.gitDirs ?? []).filter(kept =>
+            takesAMount(kept.gitDir),
+          ).length - 1,
+          0,
+        ),
     )
     return { ...level, wholeModulesDirs: level.wholeModulesDirs + taken }
   }

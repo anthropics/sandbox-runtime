@@ -309,6 +309,22 @@ describe.if(isLinux)('Passes over a profile that does not fit', () => {
         denyPath.startsWith(join(dir, 'repo')),
       ),
     ).toEqual({ wholeGitDirs: 72, wholeModulesDirs: 0 })
+
+    // And so for the directories that hold them: the one that takes no mount
+    // gives nothing back, and takes nothing from what the next one gives, nine
+    // binds of its ten. The first is left as it is.
+    const further = [
+      repository(join(dir, 'repo', 'first', '.git', 'modules'), 10),
+      ...repositories,
+    ]
+    expect(
+      collapseFurther(
+        { ...plan, repositories: further },
+        { wholeGitDirs: 90, wholeModulesDirs: 0 },
+        9,
+        denyPath => denyPath.startsWith(join(dir, 'repo')),
+      ),
+    ).toEqual({ wholeGitDirs: 90, wholeModulesDirs: 2 })
   })
 
   it('resolves each path once to say what was degraded', () => {
@@ -340,6 +356,25 @@ describe.if(isLinux)('Passes over a profile that does not fit', () => {
     } finally {
       resolve.mockRestore()
     }
+  })
+
+  it('degrades once a git directory that two repositories lead to', async () => {
+    // A nested submodule's is reached from the repository that keeps it and
+    // through the `.git` file of the checkout it is nested in.
+    const { checkout, subs } = makeSuperproject(join(dir, 'repo'), 2)
+    makeGitDir(join(subs[0]!, 'modules', 'nested'))
+    mkdirSync(join(checkout, 'sub'))
+    writeFileSync(join(checkout, 'sub', '.git'), `gitdir: ${subs[0]!}\n`)
+    process.chdir(checkout)
+
+    const { warnings } = await wrapCountingPasses(checkout, 8_900)
+
+    const modules = join(checkout, '.git', 'modules')
+    const told = warnings.join('\n')
+    expect(told).toContain(
+      `3 of the 3 submodule git directories under ${modules} are`,
+    )
+    expect(told).toContain(`; ${modules} is denied whole`)
   })
 
   it('still stops at the first level that fits where stepping does give words back', async () => {

@@ -795,7 +795,7 @@ function cwdMandatoryDenyPlan(
   allowGitConfig: boolean,
   deadline: number | undefined,
   allowWritePaths: readonly string[],
-  visited = new Set<string>(),
+  visited = new Map<string, boolean>(),
 ): SubmoduleDenyPlan {
   const cwd = process.cwd()
   const plan: SubmoduleDenyPlan = {
@@ -1219,7 +1219,7 @@ async function linuxGetMandatoryDenyPaths(
 
   // The working directory's own repository is the first the collapse works
   // back through, so it is the last to lose its precise denies.
-  const visited = new Set<string>()
+  const visited = new Map<string, boolean>()
   const plan = asProfileRefusal(() =>
     cwdMandatoryDenyPlan(allowGitConfig, deadline, allowWritePaths, visited),
   )
