@@ -332,6 +332,37 @@ jobs:
           # schema on a real Windows host rather than under a platform spy.
           bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
 
+      # Diagnostic only: why the MXC BaseContainer tier is or isn't available
+      # on this runner. Never fails the job.
+      - name: MXC host diagnostics (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          HUSKY: '0'
+        run: |
+          $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          "OS: $($cv.ProductName) $($cv.EditionID) $($cv.InstallationType) $($cv.DisplayVersion) build $($cv.CurrentBuild).$($cv.UBR)"
+          $dll = Get-Item "$env:SystemRoot\System32\processmodel.dll" -ErrorAction SilentlyContinue
+          "processmodel.dll: $(if ($dll) { $dll.VersionInfo.FileVersion } else { 'absent' })"
+          foreach ($id in 61389575, 61155944) {
+            foreach ($priority in 4, 8) {
+              $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FeatureManagement\Overrides\$priority\$id"
+              $state = (Get-ItemProperty $key -ErrorAction SilentlyContinue).EnabledState
+              "feature $id override $priority EnabledState: $(if ($null -eq $state) { 'unset' } else { $state })"
+            }
+          }
+          if (-not (Test-Path node_modules)) { npm ci }
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $wxc = "node_modules\@microsoft\mxc-sdk\bin\$arch\wxc-exec.exe"
+          if (Test-Path $wxc) {
+            "wxc-exec --probe:"
+            & $wxc --probe
+            "exit code: $LASTEXITCODE"
+          } else {
+            "wxc-exec not found at $wxc"
+          }
+
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
         shell: pwsh
