@@ -320,10 +320,10 @@ jobs:
           # and the separate process keeps sandbox-manager's
           # process-lifetime state (e.g. the once-per-process WFP
           # verification) from leaking into winsrt's fail-closed
-          # guards. On these runners it exercises the srt-win path
-          # (the selection probe answers an AppContainer tier); on a
-          # BaseContainer-capable machine the same file verifies the
-          # mxc backend.
+          # guards. It names its backend, so a runner that can't run
+          # that backend fails: only the arm64 image is
+          # BaseContainer-capable.
+          $env:SRT_BOUNDARY_BACKEND = if ('${{ matrix.arch }}' -eq 'arm64') { 'mxc' } else { 'srt-win' }
           bun test test/sandbox/mxc.test.ts
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over

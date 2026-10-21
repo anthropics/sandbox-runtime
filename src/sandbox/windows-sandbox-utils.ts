@@ -169,6 +169,11 @@ export type WindowsSandboxErrorCode =
    * launch subcommands exit **18** ({@link SeclogonDisabledError}).
    */
   | 'seclogon_disabled'
+  /**
+   * The named `windows.backend` cannot run this configuration on this
+   * host. Nothing falls back; the caller decides what to try next.
+   */
+  | 'backend_unsupported'
 
 /**
  * Error thrown by the Windows sandbox backend. Carries a stable

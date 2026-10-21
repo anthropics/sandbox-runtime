@@ -1063,12 +1063,8 @@ export const SrtWinConfigSchema = z.object({
 /**
  * MXC runner location (Windows only). Locates the `wxc-exec.exe`
  * native runner that `@microsoft/mxc-sdk` ships prebuilt under
- * `bin/<arch>/`. Parallel to {@link SrtWinConfigSchema} — a
- * deployment knob, NOT a policy choice: srt selects between MXC
- * BaseContainer and srt-win automatically at initialize() based on
- * what the host's Windows build supports (`wxc-exec --probe`), and
- * falls back to srt-win on any ambiguity. See
- * `mxc-sandbox-utils.ts` `selectWindowsBackend`.
+ * `bin/<arch>/`. Parallel to {@link SrtWinConfigSchema}. Which backend
+ * runs is the caller's choice: `windows.backend`.
  */
 export const MxcConfigSchema = z.object({
   path: z
@@ -1094,6 +1090,17 @@ export const MxcConfigSchema = z.object({
  * `.extend()`/`.shape` it.
  */
 export const WindowsConfigSchema = z.object({
+  // TODO(next breaking release): make this required, so callers must
+  // choose a backend. Not `.default()`: that makes the inferred type
+  // required, which is the breaking change.
+  backend: z
+    .enum(['mxc', 'srt-win'])
+    .optional()
+    .describe(
+      'The Windows enforcement backend. Defaults to srt-win. initialize() ' +
+        'refuses a configuration the named backend cannot enforce; there ' +
+        'is no fallback between backends.',
+    ),
   sandboxUser: z
     .string()
     .min(1)
@@ -1139,9 +1146,7 @@ export const WindowsConfigSchema = z.object({
       'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
   ),
   mxc: MxcConfigSchema.optional().describe(
-    'Where to find the MXC wxc-exec.exe runner (backend selection ' +
-      'itself is automatic — BaseContainer-capable hosts use MXC, ' +
-      'all others use srt-win).',
+    'Where to find the MXC wxc-exec.exe runner, for backend: "mxc".',
   ),
 })
 

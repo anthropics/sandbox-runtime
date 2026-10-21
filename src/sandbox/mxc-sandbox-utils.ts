@@ -1,38 +1,31 @@
 /**
- * MXC BaseContainer backend for Windows — automatic, not user-chosen.
+ * MXC BaseContainer backend for Windows, chosen by the caller with
+ * `windows.backend: 'mxc'`.
  *
- * srt selects its Windows enforcement backend at `initialize()`:
+ * On hosts whose Windows build supports MXC's **BaseContainer** tier,
+ * sandboxed execs run through Microsoft's `wxc-exec.exe`: the OS
+ * applies filesystem and network policy in its own elevated context,
+ * with no install step, no UAC, no ACL stamping, and policy lifetime
+ * bound to the container. MXC's AppContainer tiers are deliberately
+ * never used: srt-win's WFP fence is mandatory and fail-closed, where
+ * MXC's AppContainer network enforcement is cooperative (WinHTTP-stack
+ * proxying, env-var steering) and proceeds unfenced when firewall-rule
+ * writes fail without admin.
  *
- *   - Hosts whose Windows build supports MXC's **BaseContainer** tier
- *     (`Experimental_CreateProcessInSandbox` in processmodel.dll,
- *     25H2+ with the OS feature enabled) run sandboxed execs through
- *     Microsoft's `wxc-exec.exe` — the OS applies filesystem and
- *     network policy in its own elevated context: no install step, no
- *     UAC, no ACL stamping, policy lifetime bound to the container.
- *   - Every other host (23H2/24H2/25H2 today, where MXC would fall
- *     back to its AppContainer tiers) uses srt-win, unchanged. MXC's
- *     AppContainer tiers are deliberately never used: srt-win's WFP
- *     fence is mandatory and fail-closed, where MXC's AppContainer
- *     network enforcement is cooperative (WinHTTP-stack proxying,
- *     env-var steering) and proceeds unfenced when firewall-rule
- *     writes fail without admin.
+ * `network.tlsTerminate` is not supported here: Schannel clients in a
+ * BaseContainer do not trust the MITM CA.
  *
- * There is no user-facing backend choice. The only config surface is
- * `windows.mxc.path` (where to find `wxc-exec.exe`), parallel to
- * `windows.srtWin.path`.
- *
- * ── Selection (see {@link selectWindowsBackend}) ────────────────────
+ * ── Verification (see {@link verifyMxcBackend}) ─────────────────────
  *
  * `wxc-exec --probe --config-base64 <b64>` runs MXC's own fallback
  * detector against OUR actual policy and reports the tier it would
- * dispatch (`"base-container"` / `"appcontainer-dacl"` / …). Selecting
- * on that answer is skew-free: the same code that will pick the tier
- * at exec time picks it at selection time, with denies, WRITE_DAC,
- * and the deny-capability bit all accounted for. Anything other than
- * a clean `"base-container"` answer — SDK not installed, binary
- * missing, probe error, any other tier — selects srt-win. srt-win
- * enforces everything srt promises, so failing toward it is always
- * safe; MXC is an upgrade, never a requirement.
+ * dispatch (`"base-container"` / `"appcontainer-dacl"` / …). Checking
+ * that answer is skew-free: the same code that will pick the tier at
+ * exec time picks it here, with denies, WRITE_DAC, and the
+ * deny-capability bit all accounted for. Anything other than a clean
+ * `"base-container"` answer — SDK not installed, binary missing, probe
+ * error, any other tier — is an error. Nothing falls back to srt-win;
+ * the caller decides what to try next.
  *
  * Residual risk: tier selection re-runs inside `wxc-exec` at exec
  * time, and if the machine state changed since the probe (feature
@@ -99,6 +92,7 @@ import { generateProxyEnvVars, buildGitConfigEnv } from './sandbox-utils.js'
 import {
   parseWindowsBinShell,
   envListToObject,
+  WindowsSandboxError,
 } from './windows-sandbox-utils.js'
 import type { WindowsBinShell } from './windows-sandbox-utils.js'
 import type { MxcConfig } from './sandbox-config.js'
@@ -263,16 +257,15 @@ export function probeMxc(
 }
 
 export type WindowsBackendSelection =
-  | Readonly<{ backend: 'srt-win'; reason: string }>
+  | Readonly<{ backend: 'srt-win' }>
   | Readonly<{
       backend: 'mxc'
-      reason: string
       mxc: MxcSpawn
       /** `SANDBOX_CAP_FS_DENY` bit at selection — gates per-exec denies. */
       denyPathsSupported: boolean
     }>
 
-/** The reason string for the (common) no-runner srt-win selection. */
+/** Why `windows.backend: 'mxc'` has no runner to use. */
 export function mxcUnavailableReason(cfg: MxcConfig | undefined): string {
   return cfg?.path
     ? `windows.mxc.path does not exist: ${cfg.path}`
@@ -280,34 +273,34 @@ export function mxcUnavailableReason(cfg: MxcConfig | undefined): string {
 }
 
 /**
- * Decide which Windows enforcement backend this session uses, given a
- * resolved runner and the session policy compiled to a ContainerConfig
- * (see {@link buildMxcContainerConfig} + {@link encodeMxcConfig} —
- * compiling it is the caller's job so the same expansion feeds both
- * the probe and wrap-time). Called once from
- * `SandboxManager.initialize()`; the answer is held for the session.
- * EVERY failure or ambiguity selects srt-win — the packaged,
- * always-correct fallback.
+ * Check that the host can run this session on MXC BaseContainer, given
+ * the resolved runner and the session policy compiled to a Container
+ * config (see {@link buildMxcContainerConfig} + {@link encodeMxcConfig}).
+ * Called once from `SandboxManager.initialize()`; the answer is held
+ * for the session.
+ *
+ * @throws {WindowsSandboxError} `backend_unsupported` on every failure
+ * or ambiguity.
  */
-export function selectWindowsBackend(
+export function verifyMxcBackend(
   spawn: MxcSpawn,
   probeConfigBase64: string,
-): WindowsBackendSelection {
-  const srtWin = (reason: string): WindowsBackendSelection => ({
-    backend: 'srt-win',
-    reason,
-  })
+): Extract<WindowsBackendSelection, { backend: 'mxc' }> {
+  const unsupported = (reason: string): WindowsSandboxError =>
+    new WindowsSandboxError(
+      'backend_unsupported',
+      `windows.backend is 'mxc' but ${reason}`,
+    )
   const probe = probeMxc(spawn, probeConfigBase64)
-  if (!probe) return srtWin('wxc-exec --probe failed or emitted no JSON')
-  if (probe.error) return srtWin(`probe error: ${probe.error}`)
+  if (!probe) throw unsupported('wxc-exec --probe failed or emitted no JSON')
+  if (probe.error) throw unsupported(`the probe failed: ${probe.error}`)
   if (probe.tier !== 'base-container') {
-    return srtWin(
-      `host supports mxc tier '${probe.tier}' only; BaseContainer required`,
+    throw unsupported(
+      `this host supports mxc tier '${probe.tier}' only; BaseContainer is required`,
     )
   }
   return {
     backend: 'mxc',
-    reason: 'host supports BaseContainer for this policy',
     mxc: spawn,
     denyPathsSupported: probe.probes?.baseContainerSupportsDenyPaths === true,
   }
@@ -404,13 +397,6 @@ export interface MxcSandboxParams {
   allowWrite?: readonly string[]
   cwd?: string
   gitSafeDirectories?: readonly string[]
-  /**
-   * TLS-termination trust bundle. Env-var layer only
-   * (NODE_EXTRA_CA_CERTS/CURL_CA_BUNDLE/…) — whether schannel clients
-   * inside a BaseContainer see the invoking user's Root store is
-   * manual test #4.
-   */
-  caCertPath?: string
   binShell?: WindowsBinShell
   /** Resolved runner from selection. */
   mxc: MxcSpawn
@@ -460,7 +446,7 @@ export function buildMxcContainerConfig(
           generateProxyEnvVars(
             p.httpProxyPort,
             p.socksProxyPort,
-            p.caCertPath?.replace(/\\/g, '/'),
+            undefined,
             p.proxyAuthToken,
           ),
       ),
@@ -554,7 +540,7 @@ function buildChildEnv(
       ...(p.allowWrite ?? []),
       ...(p.gitSafeDirectories ?? []),
     ],
-    schannelCa: p.caCertPath !== undefined,
+    schannelCa: false,
     baseEnv: p.setEnvVars,
   })
   const merged: Record<string, string> = {}
@@ -596,7 +582,7 @@ export function wrapCommandWithSandboxMxc(p: MxcSandboxParams): {
   const proxyEnv = generateProxyEnvVars(
     p.httpProxyPort,
     p.socksProxyPort,
-    p.caCertPath?.replace(/\\/g, '/'),
+    undefined,
     p.proxyAuthToken,
   )
   const cfg = buildMxcContainerConfig(p, proxyEnv)

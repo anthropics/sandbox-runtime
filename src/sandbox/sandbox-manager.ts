@@ -105,7 +105,7 @@ import {
 } from './windows-sandbox-utils.js'
 import {
   resolveMxc,
-  selectWindowsBackend,
+  verifyMxcBackend,
   mxcUnavailableReason,
   buildMxcContainerConfig,
   encodeMxcConfig,
@@ -408,11 +408,9 @@ export function windowsProfileReadWarningsOf(
 // and so reset()'s revoke/restore addresses the SAME binary the
 // grants/stamps were applied with even if `config` mutated between.
 let srtWinSpawn: SrtWinSpawn | undefined
-// Windows backend selection, decided ONCE at initialize() by running
-// `wxc-exec --probe` against the session policy (see
-// `selectWindowsBackend`): BaseContainer-capable hosts get MXC, every
-// other host gets srt-win. Not user-configurable. undefined until
-// initialize(); wrap treats undefined as srt-win.
+// The Windows backend from `windows.backend` (default srt-win), set
+// once at initialize(). undefined until then; wrap treats undefined as
+// srt-win.
 let windowsSelection: WindowsBackendSelection | undefined
 // Set iff selection landed on mxc: the resolved runner, the probe's
 // deny-capability bit, and the session fs sets — the SAME expansion
@@ -1180,6 +1178,25 @@ async function initializeSteps(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
+  // An mxc session it cannot run is refused before any CA, proxy or
+  // sandbox is set up; what to try next is the caller's decision.
+  let mxcSpawn: MxcSpawn | undefined
+  if (getPlatform() === 'windows' && runtimeConfig.windows?.backend === 'mxc') {
+    if (runtimeConfig.network.tlsTerminate) {
+      throw new WindowsSandboxError(
+        'backend_unsupported',
+        'network.tlsTerminate is not supported on the mxc backend',
+      )
+    }
+    const mxcCfg = runtimeConfig.windows.mxc
+    mxcSpawn = resolveMxc(mxcCfg)
+    if (!mxcSpawn) {
+      throw new WindowsSandboxError(
+        'backend_unsupported',
+        `windows.backend is 'mxc' but ${mxcUnavailableReason(mxcCfg)}`,
+      )
+    }
+  }
   // Before any CA, proxy or sandbox is set up: a runtime that cannot
   // terminate TLS in-process fails here, not on each tunnel.
   if (runtimeConfig.network.tlsTerminate) assertTlsTerminationSupported()
@@ -1291,25 +1308,12 @@ async function initializeSteps(
   // wrap-time) means the host gets a single actionable error before
   // any per-exec work happens, instead of exit-15 on every command.
   if (getPlatform() === 'windows') {
-    // Pick the enforcement backend for this session: MXC iff
-    // `wxc-exec --probe` — MXC's own fallback detector, run against
-    // OUR compiled policy — answers 'base-container'. Any other
-    // answer (SDK absent, runner missing, probe failure, an
-    // AppContainer tier) selects srt-win; MXC's AppContainer tiers
-    // are never used (see the mxc-sandbox-utils.ts header for why).
-    const mxcCfg = runtimeConfig.windows?.mxc
-    const mxcSpawn = resolveMxc(mxcCfg)
-    if (!mxcSpawn) {
-      windowsSelection = {
-        backend: 'srt-win',
-        reason: mxcUnavailableReason(mxcCfg),
-      }
-    } else {
+    if (mxcSpawn) {
       // Compile the session policy ONCE: the probe validates the
       // same expanded fs sets (tier selection keys on denies +
       // SANDBOX_CAP_FS_DENY) and the same policy SHAPE — including
-      // the proxy stanza and the trust-bundle read grant — that
-      // every wrap-time config will carry, and the mxc branch below
+      // the proxy stanza — that every wrap-time config will carry,
+      // and the mxc branch below
       // reuses the expansion for wrap-time. A probe fed a slimmer
       // policy could answer 'base-container' for a policy the exec
       // then widens, letting wxc-exec silently fall through to an
@@ -1329,17 +1333,7 @@ async function initializeSteps(
         // onExtractNoMatch: "error" is thrown by every wrap, so nothing runs.
       }
       const acc = computeWindowsFsAccessSet(runtimeConfig, maskedFiles)
-      if (mitmCA) {
-        // Trust bundle read grant — same dirname-level grant as the
-        // srt-win path pushes below.
-        //
-        // tlsTerminate caveat (manual test #4): only the env-var CA
-        // layer (OpenSSL-backed clients) is known to work under mxc.
-        // Whether schannel clients inside a BaseContainer see the
-        // invoking user's Root store is unverified — srt-win's
-        // install-time sandbox-user store write has no MXC analogue.
-        acc.grantRead.push(dirname(mitmCA.trustBundlePath))
-      }
+      let probeConfigBase64: string
       try {
         const probeCfg = buildMxcContainerConfig({
           command: 'exit 0',
@@ -1357,49 +1351,27 @@ async function initializeSteps(
           allowWrite: acc.grantWrite,
           mxc: mxcSpawn,
         })
-        windowsSelection = selectWindowsBackend(
-          mxcSpawn,
-          encodeMxcConfig(probeCfg),
-        )
+        probeConfigBase64 = encodeMxcConfig(probeCfg)
       } catch (e) {
-        // Runner exists but the policy compile failed.
-        windowsSelection = {
-          backend: 'srt-win',
-          reason: `mxc policy compile error: ${(e as Error).message}`,
-        }
+        throw new WindowsSandboxError(
+          'backend_unsupported',
+          `windows.backend is 'mxc' but the policy did not compile: ${(e as Error).message}`,
+        )
       }
-      if (windowsSelection.backend === 'mxc') {
-        // MXC BaseContainer: the OS applies filesystem + network
-        // policy per exec, in its own elevated context — no sandbox
-        // user, no WFP install, no session ACL stamping, nothing to
-        // verify or restore.
-        //
-        // tlsTerminate with default (unset) CA paths: the Windows
-        // persistent-CA flow is srt-win machinery — it persists into
-        // the SANDBOX USER's CurrentUser\Root via srt-win, and mxc
-        // has no sandbox user. Mint a session CA the same way
-        // macOS/Linux do; the env-var CA layer covers OpenSSL-backed
-        // clients, and schannel trust under BaseContainer is manual
-        // test #4. Created here (after selection, before capturing
-        // the fs sets) so the trust bundle's read grant lands in
-        // every wrap-time config; the probe config predates it by
-        // one readonly path, which cannot flip the tier answer
-        // (tier selection keys on denies).
-        if (useWindowsPersistentCa && tlsTerminate) {
-          mitmCA = createMitmCA(tlsTerminate)
-          acc.grantRead.push(dirname(mitmCA.trustBundlePath))
-        }
-        windowsMxcState = {
-          mxc: windowsSelection.mxc,
-          denyPathsSupported: windowsSelection.denyPathsSupported,
-          fsSet: acc,
-        }
+      const selection = verifyMxcBackend(mxcSpawn, probeConfigBase64)
+      windowsSelection = selection
+      // MXC BaseContainer: the OS applies filesystem + network policy
+      // per exec, in its own elevated context — no sandbox user, no WFP
+      // install, no session ACL stamping, nothing to verify or restore.
+      windowsMxcState = {
+        mxc: selection.mxc,
+        denyPathsSupported: selection.denyPathsSupported,
+        fsSet: acc,
       }
+    } else {
+      windowsSelection = { backend: 'srt-win' }
     }
-    logForDebugging(
-      `[Sandbox Windows] using ${windowsSelection.backend} ` +
-        `(${windowsSelection.reason})`,
-    )
+    logForDebugging(`[Sandbox Windows] using ${windowsSelection.backend}`)
   }
   if (getPlatform() === 'windows' && !windowsMxcState) {
     // Resolve once (stats disk); captured module-level for wrap/reset.
@@ -1801,7 +1773,7 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
     } catch (e) {
       errors.push((e as Error).message)
       return {
-        done: downgradeSrtWinProblemsIfMxcPresent({ errors, warnings }),
+        done: windowsBackendDependencies({ errors, warnings }),
       }
     }
     return {
@@ -1834,30 +1806,19 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
 }
 
 /**
- * Backend selection is decided at initialize() (async probe). When an
- * MXC runner is present it may take over entirely — a BaseContainer
- * host needs neither srt-win.exe nor the WFP/user install — so
- * srt-win problems downgrade to warnings, labelled so the report is
- * honest about the remaining risk: runner PRESENCE is not selection
- * (a 24H2 host with the SDK installed still probes to srt-win), and
- * on such a host initialize() hard-fails with these same messages.
- * Hosts that need a true preflight for the mxc path can run
- * `selectWindowsBackend` themselves.
+ * The srt-win dependency report, unless the session named the mxc
+ * backend: that needs neither srt-win.exe nor the WFP/user install,
+ * only a runner. Whether the host can run it is settled by
+ * initialize()'s probe, or `verifyMxcBackend`.
  */
-function downgradeSrtWinProblemsIfMxcPresent(
-  deps: SandboxDependencyCheck,
+function windowsBackendDependencies(
+  srtWinDeps: SandboxDependencyCheck,
 ): SandboxDependencyCheck {
-  if (resolveMxc(config?.windows?.mxc) === undefined) return deps
+  if (config?.windows?.backend !== 'mxc') return srtWinDeps
+  const mxcCfg = config.windows.mxc
   return {
-    errors: [],
-    warnings: [
-      ...deps.errors.map(
-        m =>
-          `srt-win (required unless initialize() selects the MXC ` +
-          `BaseContainer backend): ${m}`,
-      ),
-      ...deps.warnings,
-    ],
+    errors: resolveMxc(mxcCfg) ? [] : [mxcUnavailableReason(mxcCfg)],
+    warnings: [],
   }
 }
 
@@ -1871,9 +1832,7 @@ function checkDependencies(
 ): SandboxDependencyCheck {
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
-  return downgradeSrtWinProblemsIfMxcPresent(
-    checkWindowsDependencies(common.windows),
-  )
+  return windowsBackendDependencies(checkWindowsDependencies(common.windows))
 }
 
 /**
@@ -1894,7 +1853,7 @@ async function checkDependenciesAsync(
   }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
-  return downgradeSrtWinProblemsIfMxcPresent(
+  return windowsBackendDependencies(
     await checkWindowsDependenciesAsync(common.windows),
   )
 }
@@ -3042,7 +3001,6 @@ async function wrapWithSandboxArgv(
         allowWrite: [...st.fsSet.grantWrite, ...perExecAllowWrite],
         cwd,
         gitSafeDirectories: getGitSafeDirectories(customConfig),
-        caCertPath: mitmCA?.trustBundlePath,
         binShell: parseWindowsBinShell(binShell),
         mxc: st.mxc,
       })

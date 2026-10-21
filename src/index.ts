@@ -134,17 +134,12 @@ export type {
   SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
 
-// Windows MXC BaseContainer backend — selected automatically at
-// initialize() on hosts whose Windows build supports it; srt-win
-// everywhere else. Only the diagnostic/preflight surface is public
-// (parallel to the srt-win status APIs above); the policy compiler
-// and wire-format helpers are internal. See mxc-sandbox-utils.ts for
-// the selection and policy-mapping design.
+// Windows MXC BaseContainer backend, named by `windows.backend`.
 export {
   getWxcExecPath,
   resolveMxc,
   probeMxc,
-  selectWindowsBackend,
+  verifyMxcBackend,
 } from './sandbox/mxc-sandbox-utils.js'
 export type {
   MxcSpawn,

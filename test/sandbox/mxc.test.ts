@@ -16,7 +16,6 @@ import { isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import {
-  WindowsSandboxError,
   getSrtWinPath,
   resolveSrtWin,
   installWindowsSandbox,
@@ -29,14 +28,13 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
  *
  * Backend-agnostic: every test drives the public SandboxManager
  * surface (`wrapWithSandboxArgv` + spawn `shell:false`) and asserts
- * the boundary srt promises, not the mechanism that enforces it. The
- * suite prints which backend `initialize()` selected; run it on a
- * BaseContainer-capable machine (Windows 11 25H2+ with the OS feature
- * enabled, `@microsoft/mxc-sdk` installed) to verify the MXC path, or
- * on any other Windows machine (after `npx sandbox-runtime
- * windows-install`) to verify srt-win. Overlap with winsrt.test.ts is
- * deliberate — this file is the checklist for manual verification of
- * a new backend, so it must stand alone.
+ * the boundary srt promises, not the mechanism that enforces it.
+ * `SRT_BOUNDARY_BACKEND` names the backend under test (`mxc`, else
+ * srt-win); mxc needs a BaseContainer-capable machine (Windows 11
+ * 25H2+, `@microsoft/mxc-sdk` installed), srt-win any Windows machine
+ * (after `npx sandbox-runtime windows-install`). Overlap with
+ * winsrt.test.ts is deliberate — this file is the checklist for manual
+ * verification of a new backend, so it must stand alone.
  *
  * The matrix:
  *
@@ -75,14 +73,23 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
  *     F2 stdout/stderr separation
  *     F3 kill chain: broker killed → sandboxed tree dies
  *     F4 PowerShell starts (UI policy)
- *   G — tlsTerminate (MXC only here; srt-win's flow needs the
- *        install-time trust-ca step and is covered in winsrt.test.ts)
- *     G1 OpenSSL-backed client trusts via the env CA layer
- *     G2 schannel client (System32 curl.exe) trusts — answers whether
- *        a BaseContainer child sees the user's CurrentUser\Root store
  */
 
 const FIXTURE_SECRET = 'BOUNDARY-SECRET-4d1f'
+
+/** The backend under test: initialize() fails if the host can't run it. */
+const BOUNDARY_BACKEND =
+  process.env.SRT_BOUNDARY_BACKEND === 'mxc' ? 'mxc' : 'srt-win'
+
+/**
+ * Schannel clients do not run under srt-win, where System32 curl fails
+ * whatever the proxy decides: B1 would fail and B2 pass for the wrong
+ * reason. git-for-windows' x64 curl has its own TLS stack.
+ */
+const CURL =
+  BOUNDARY_BACKEND === 'srt-win'
+    ? '"C:\\Program Files\\Git\\mingw64\\bin\\curl.exe"'
+    : 'curl.exe'
 
 let root: string // read-granted fixture tree (inside %TEMP%)
 let allowWriteDir: string // write-granted
@@ -150,7 +157,10 @@ function createBoundaryConfig(): SandboxRuntimeConfig {
       allowedDomains: ['example.com'],
       deniedDomains: [],
     },
-    windows: SRT_WIN_PATH ? { srtWin: { path: SRT_WIN_PATH } } : undefined,
+    windows: {
+      backend: BOUNDARY_BACKEND,
+      ...(SRT_WIN_PATH && { srtWin: { path: SRT_WIN_PATH } }),
+    },
     filesystem: {
       allowRead: [root],
       allowWrite: [allowWriteDir],
@@ -270,8 +280,7 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
       installedHere = true
       await SandboxManager.initialize(createBoundaryConfig())
     }
-    const backend = SandboxManager.getWindowsBackend?.()
-    console.error(`[boundaries] using ${backend?.backend} (${backend?.reason})`)
+    expect(SandboxManager.getWindowsBackend?.()?.backend).toBe(BOUNDARY_BACKEND)
     // Install + double initialize + wxc-exec --probe exceed bun's 5s
     // default hook timeout (same class as winsrt's beforeAll).
   }, 180_000)
@@ -294,14 +303,14 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
 
   it('B1: allowed domain reachable through the proxy', async () => {
     const r = await runSandboxedUntil(
-      'curl.exe -fsS -o NUL https://example.com',
+      `${CURL} -fsS -o NUL https://example.com`,
       x => x.status === 0,
     )
     expectStatus('B1', r, [0])
   }, 90_000)
 
   it('B2: non-allowed domain blocked at the proxy', async () => {
-    const r = await runSandboxed('curl.exe -fsS -o NUL https://api.github.com')
+    const r = await runSandboxed(`${CURL} -fsS -o NUL https://api.github.com`)
     expectBlocked('B2', r)
   }, 90_000)
 
@@ -596,123 +605,5 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
     })
     expectStatus('F4', r, [0])
     expect(r.stdout).toContain('PS-MARK')
-  }, 90_000)
-})
-
-// ── G: tlsTerminate ─────────────────────────────────────────────────
-//
-// Separate describe: needs its own initialize() cycle. Runs only when
-// the mxc backend is selected — srt-win's tlsTerminate needs the
-// install-time `srt-win user trust-ca` step and is covered by
-// winsrt.test.ts. G2 is the open manual question: does a BaseContainer
-// child see the invoking user's CurrentUser\Root store?
-
-describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
-  let mxcSelected = false
-
-  beforeAll(async () => {
-    await SandboxManager.reset()
-    // The first describe's afterAll rmSync()'s the whole fixture tree, but
-    // createBoundaryConfig() still lists deny-read/cred/deny-write (and their
-    // parent dirs) in deniedPaths/filesystem. A denied path whose parent
-    // directory no longer exists is rejected by the OS at container creation
-    // (ERROR_PATH_NOT_FOUND), failing every G exec at launch. Recreate the
-    // fixture so the boundary config the tls describe reuses is valid.
-    mkdirSync(allowWriteDir, { recursive: true })
-    writeFileSync(denyReadFile, FIXTURE_SECRET)
-    writeFileSync(denyWriteFile, 'original-content')
-    writeFileSync(credFile, FIXTURE_SECRET)
-    try {
-      await SandboxManager.initialize({
-        ...createBoundaryConfig(),
-        network: {
-          allowedDomains: ['example.com'],
-          deniedDomains: [],
-          tlsTerminate: {},
-        },
-      })
-      const backend = SandboxManager.getWindowsBackend?.()?.backend
-      mxcSelected = backend === 'mxc'
-      console.error(
-        `[boundaries tls] using ${backend}` +
-          (mxcSelected ? '' : ' — G rows skipped (covered by winsrt.test.ts)'),
-      )
-    } catch (e) {
-      // Only srt-win-flavored initialize failures are an expected
-      // miss here — that path's tls flow lives in winsrt.test.ts
-      // with the install-time trust-ca step. Discriminators: the
-      // typed WindowsSandboxError family (trust-ca gates,
-      // provisioning — thrown only by srt-win machinery), the
-      // dependency check naming the unprovisioned sandbox user (the
-      // first describe uninstalled what it installed), the
-      // persistent-CA reconcile, and the explicit-path thumbprint
-      // gate messages. Anything else — including any failure on an
-      // mxc host, the suite's actual target — stays loud. Backend
-      // state can't discriminate here: network-phase failures reset
-      // the manager, clearing the selection, before this catch runs.
-      const msg = e instanceof Error ? e.message : String(e)
-      const srtWinFlavored =
-        e instanceof WindowsSandboxError ||
-        /^ensurePersistentWindowsCa|^tlsTerminate on Windows|^Sandbox dependencies not available: Sandbox user is not provisioned/.test(
-          msg,
-        )
-      if (!srtWinFlavored) throw e
-      console.error(
-        `[boundaries tls] srt-win tls init failed — G rows skipped: ${msg}`,
-      )
-    }
-  }, 120_000)
-
-  afterAll(async () => {
-    await SandboxManager.reset()
-  }, 60_000)
-
-  it.skipIf(!hasTool('node'))(
-    'G1: OpenSSL-backed client trusts the MITM leaf via env CA',
-    async () => {
-      if (!mxcSelected) {
-        console.error(
-          '[boundaries tls] SKIPPED (not mxc) — this pass proves nothing',
-        )
-        return
-      }
-      const js =
-        `const c=require('child_process');const u=new URL(process.env.HTTPS_PROXY);` +
-        `const r=c.spawnSync('openssl',['s_client','-proxy',u.hostname+':'+u.port,` +
-        `'-proxy_user',decodeURIComponent(u.username),'-proxy_pass',` +
-        `'pass:'+decodeURIComponent(u.password),'-connect','example.com:443',` +
-        `'-servername','example.com','-CAfile',process.env.SSL_CERT_FILE,` +
-        `'-verify_return_error','-brief'],{input:'Q\\n',encoding:'utf8'});` +
-        `process.stdout.write(r.stdout||'');process.stderr.write(r.stderr||'');` +
-        `process.exitCode=r.status??1`
-      const r = await runSandboxed(`node -e "${js}"`, {
-        binShell: 'powershell',
-        timeoutMs: 60_000,
-      })
-      expectStatus('G1', r, [0])
-    },
-    90_000,
-  )
-
-  it('G2: schannel client (System32 curl.exe) trusts the MITM leaf', async () => {
-    if (!mxcSelected) {
-      console.error(
-        '[boundaries tls] SKIPPED (not mxc) — this pass proves nothing',
-      )
-      return
-    }
-    // --ssl-no-revoke isolates the trust question from the known
-    // CRL-fetch-through-the-fence issue (see README). A TLS trust
-    // failure here means BaseContainer children do NOT see the
-    // user's Root store — tlsTerminate then needs an MXC-era trust
-    // story before schannel/.NET tools work.
-    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-      'curl.exe -fsS --ssl-no-revoke -o NUL https://example.com',
-    )
-    const r = await spawnAsync(argv[0], argv.slice(1), {
-      timeout: 60_000,
-      env,
-    })
-    expectStatus('G2', r, [0])
   }, 90_000)
 })

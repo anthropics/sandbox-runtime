@@ -2404,5 +2404,11 @@ describe('Config Validation', () => {
       expect(r.success).toBe(true)
       expect(Object.keys((r.success && r.data.windows) || {})).toEqual([])
     })
+
+    test('windows.backend is optional and limited to the known backends', () => {
+      expect(parse({}).success).toBe(true)
+      expect(parse({ backend: 'mxc' }).success).toBe(true)
+      expect(parse({ backend: 'auto' }).success).toBe(false)
+    })
   })
 })

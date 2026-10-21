@@ -967,10 +967,13 @@ A kept write grant on a volume that cannot be reached — a disk that is not att
 
 Clients with their own TLS stack (msys2 `curl`, git on its OpenSSL backend, Node, Python) are covered by the env-var trust layer: the same trust bundle used on macOS/Linux is passed into the sandbox via `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, etc., and the bundle path is added to the session's `allowRead` grant so the sandbox account can open it.
 
+The MXC backend does not support `network.tlsTerminate`: `initialize()` refuses that combination.
+
 ### Windows-specific configuration
 
 The cross-platform `filesystem` and `network` blocks apply as described above. Windows-only settings live under `windows`:
 
+- `windows.backend` — `'mxc'` or `'srt-win'`. Defaults to `'srt-win'`; a future breaking release will require it. `initialize()` throws a `WindowsSandboxError` with code `backend_unsupported` when `'mxc'` cannot run the configuration on this host. Nothing falls back from one backend to the other, so the caller decides what to try next.
 - `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range.
 - `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
 - `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
