@@ -232,27 +232,13 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
       }
     })
 
-    it('is listed once more at most where it is taken for what git keeps', () => {
-      const store = join(modules, 'store')
-      mkdirSync(store, { recursive: true })
-      for (const name of ['a', 'b', 'y', 'z']) {
-        const gitDir = join(modules, name)
-        mkdirSync(gitDir)
-        writeFileSync(join(gitDir, 'HEAD'), '')
-        symlinkSync('../store', join(gitDir, 'objects'))
-      }
-      const list = spyOn(fs, 'readdirSync')
-      try {
-        submoduleGitDirs(modules)
+    it('has each link to it held that has a name git keeps for itself', () => {
+      // `refs` is listed before it is followed, and followed for what it holds.
+      const store = makeGitDir(join(dir, 'store'))
+      const gitDirs = ['a', 'b'].map(name => makeGitDir(join(modules, name)))
+      for (const gitDir of gitDirs) symlinkSync(store, join(gitDir, 'refs'))
 
-        expect(
-          list.mock.calls.filter(
-            call => realpathSync(String(call[0])) === realpathSync(store),
-          ).length,
-        ).toBeLessThanOrEqual(2)
-      } finally {
-        list.mockRestore()
-      }
+      expect(submoduleGitDirs(modules).linkedEntryDirs).toEqual(gitDirs)
     })
 
     it.if(process.getuid?.() !== 0)(
@@ -391,6 +377,47 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
           linkedEntryDirs: [],
           chainHops: [],
         })
+      },
+    )
+
+    it('takes what lies below a file for nothing', () => {
+      mkdirSync(modules)
+      writeFileSync(join(dir, 'file'), '')
+      symlinkSync(
+        Buffer.concat([Buffer.from('../file/'), NO_TEXT]),
+        join(modules, 'x'),
+      )
+
+      expect(submoduleGitDirs(modules).unreadableDirs).toEqual([modules])
+    })
+
+    it.if(isLinux)('takes a loop for nothing', () => {
+      mkdirSync(modules)
+      symlinkSync(
+        Buffer.concat([Buffer.from('../'), NO_TEXT]),
+        join(modules, 'x'),
+      )
+      symlinkSync('modules/x', Buffer.concat([Buffer.from(`${dir}/`), NO_TEXT]))
+
+      expect(submoduleGitDirs(modules).unreadableDirs).toEqual([modules])
+    })
+
+    it.if(process.getuid?.() !== 0)(
+      'refuses where what is behind the link cannot be looked at',
+      () => {
+        const locked = join(dir, 'locked')
+        mkdirSync(locked)
+        mkdirSync(modules)
+        symlinkSync(
+          Buffer.concat([Buffer.from('../locked/'), NO_TEXT]),
+          join(modules, 'x'),
+        )
+        chmodSync(locked, 0o000)
+        try {
+          expect(() => submoduleGitDirs(modules)).toThrow(GitMetadataError)
+        } finally {
+          chmodSync(locked, 0o755)
+        }
       },
     )
 

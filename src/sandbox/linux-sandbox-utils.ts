@@ -891,7 +891,7 @@ function wholeDirDenyLanding(dir: string): string {
 }
 
 /**
- * `denyPaths` without the ones naming an intermediate hop of a chain. A bind
+ * `denyPaths` without the ones naming a hop of a chain. A bind
  * there lands on whatever the link leads to — for a symlinked directory
  * component a whole directory nothing asked to deny, and for a `.git/modules`
  * entry the git directory it reaches — while holding the link itself, which
@@ -987,11 +987,12 @@ function guardedDenyPlan(
   const denied = new Set(plan.denyPaths)
   const added = held.filter(dir => !denied.has(dir))
   if (added.length > 0) {
+    const isAdded = new Set(added)
     // A holder is a directory nothing asked to deny: say which link put it
     // there, so a subtree that turns read-only can be traced to its cause.
     const why = new Set(
       plan.chainHops
-        .filter(hop => hop.holder !== undefined && added.includes(hop.holder))
+        .filter(hop => hop.holder !== undefined && isAdded.has(hop.holder))
         .map(
           hop =>
             `${hop.holder} holds ${hop.link}, which ${hop.source} is reached through`,
@@ -1019,9 +1020,10 @@ function guardedDenyPlan(
  * working directory or a write root leaves nothing in the project writable from
  * the next wrap on, with nothing inside the sandbox able to undo it.
  *
- * - A directory this process CAN list was denied whole to hold something inside
- *   it, both ends of which keep their own deny paths: dropped, with a warning.
- * - One it cannot list stands in for a tree nothing else covers: the command is
+ * - A directory this process CAN list and search was denied whole to hold
+ *   something inside it, both ends of which keep their own deny paths: dropped,
+ *   with a warning.
+ * - One it cannot stands in for a tree nothing else covers: the command is
  *   REFUSED, naming it.
  *
  * Each is judged by where it LANDS, not by how it is spelled: `hooks -> ../..`
@@ -1051,6 +1053,7 @@ function withoutWorkTreeDenies(
     }
     try {
       fs.readdirSync(landing)
+      fs.accessSync(landing, fs.constants.X_OK)
     } catch (err) {
       // A file holds no tree. It is a write root itself, /dev/null among the
       // default ones, that an entry was linked to: the deny stands.
@@ -1059,7 +1062,7 @@ function withoutWorkTreeDenies(
         continue
       }
       const message =
-        `[Sandbox Linux] ${denyPath} could not be listed (${errorText(err)}), ` +
+        `[Sandbox Linux] ${denyPath} could not be looked into (${errorText(err)}), ` +
         `and it holds the working directory or a path this command may ` +
         `write: denying it whole is the only thing that stands in for a tree ` +
         `that cannot be read, and that would leave every command after this ` +

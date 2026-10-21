@@ -156,9 +156,9 @@ interface ResolvedChain {
 }
 
 /**
- * A symlink a git directory is reached THROUGH: a further hop of a symlinked
- * entry, a symlinked directory on the way, or a component of the path a
- * `gitdir:` or a `commondir` names. The denies at the two ends of the chain
+ * A symlink a git directory is reached THROUGH: an entry of a `modules` or a
+ * `worktrees`, a further hop of a symlinked entry, a symlinked directory on the
+ * way, or a component of the path a `gitdir:` or a `commondir` names. The denies at the two ends of the chain
  * cover neither it nor the directory it sits in, and a command that retargets
  * it moves where the chain leads, for the host's git to follow.
  */
@@ -212,7 +212,7 @@ export interface SubmoduleScan {
    * Sorted, no duplicates.
    */
   linkedEntryDirs: string[]
-  /** The hops between such an entry and what it lands on. */
+  /** Such an entry, and the hops between it and what it lands on. */
   chainHops: GitChainHop[]
 }
 
@@ -922,8 +922,8 @@ function keptWorktrees(gitDir: string, walk: TreeWalk): KeptGitDir[] {
     // Where a link leads to nothing is denied as a git directory that is not
     // there yet, as the `.git/modules` walk denies one.
     const worktree = found.kind === 'dangling' ? found.landing : child
+    if (isCutShort('worktree', worktree, walk)) continue
     if (found.kind === 'directory') {
-      if (isCutShort('worktree', worktree, walk)) continue
       // git opens what is in there by name, which takes leave to search it and
       // none to list it. Without that leave git, the same user's, reads no
       // `commondir` either: denied whole, and nothing to refuse the command
@@ -1010,7 +1010,7 @@ export function submoduleGitDirs(
  * see, so the deadline is what bounds the walk.
  */
 function walkModules(modulesDir: string, walk: TreeWalk): string[] {
-  if (isCutShort('names', modulesDir, walk)) return []
+  if (isCutShort('root', modulesDir, walk)) return []
   const gitDirs = new Set<string>()
   // Where the walk still has to look. A directory that was listed carries its
   // entries, and `gitDir` says it was recorded as a git directory, so that some
@@ -1049,7 +1049,6 @@ function walkModules(modulesDir: string, walk: TreeWalk): string[] {
           GIT_OWN_DIRECTORIES.has(entry.name) &&
           (entry.isDirectory() || entry.isSymbolicLink())
         ) {
-          if (isCutShort('own', child, walk)) continue
           childEntries = listDirectory(child, walk)
           if (
             childEntries?.some(e => GIT_PROTECTED_ENTRIES.has(e.name)) !== true
@@ -1128,7 +1127,8 @@ interface TreeWalk {
 /**
  * Whether a walk stops short of `dir`, which it would read `as` an `entry` of a
  * walked directory (a git directory or a segment of a name, by what it holds),
- * as git's `own`, as the `names` of submodules, as a `worktrees` or as one
+ * as the `root` of a walk, as the `names` in the `modules` of a git directory
+ * (which may be one itself, and a root is not), as a `worktrees` or as one
  * linked `worktree`: a walk has read it so before, by where `dir` really is.
  * That is what ends a link that leads back up, and what keeps many links to one
  * directory, or many `.git` files into one repository, from costing as many
@@ -1142,7 +1142,7 @@ interface TreeWalk {
  * walked from it all the same.
  */
 function isCutShort(
-  as: 'entry' | 'own' | 'names' | 'worktrees' | 'worktree',
+  as: 'entry' | 'root' | 'names' | 'worktrees' | 'worktree',
   dir: string,
   walk: TreeWalk,
 ): boolean {
@@ -1229,14 +1229,13 @@ function walkEntry(
     if (!(err instanceof GitMetadataError)) throw err
     // Where it leads cannot be named, so a directory there cannot be denied,
     // nor what cannot be looked at.
-    let behind: fs.Stats | undefined
     try {
-      behind = fs.statSync(entryPath, { throwIfNoEntry: false })
-    } catch {
-      throw err
+      if (fs.statSync(entryPath).isDirectory()) throw err
+      return { kind: 'skip' }
+    } catch (statErr) {
+      const code = (statErr as NodeJS.ErrnoException).code
+      if (!isAbsenceError(statErr) && code !== 'ELOOP') throw err
     }
-    if (behind?.isDirectory() === true) throw err
-    if (behind !== undefined) return { kind: 'skip' }
     // Nothing is there. A command can make such a link here, so it costs what
     // any link here does and not every command after it.
     walk.unreadableDirs.add(realPathOrSelf(holder))
@@ -1324,7 +1323,9 @@ function gitDirTargetDenies(
     case 'absent':
       return gitDirDenies(target, allowGitConfig, deadline)
     case 'unreadable': {
-      const denied = deepestReachableAncestor(target) ?? target
+      // Where it really is: a value can end in a link, whose name is what holds
+      // the link and no deny of what it leads to ({@link GitChainHop.link}).
+      const denied = realPathOrSelf(deepestReachableAncestor(target) ?? target)
       logForDebugging(
         `[Sandbox] Could not read ${target} named by ${source}, denying ${denied} whole`,
         { level: 'warn' },
@@ -1357,8 +1358,6 @@ function gitDirKind(dir: string): GitDirKind {
   let entries: fs.Dirent[]
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true })
-    // git opens what is in there by name, which takes leave to search it.
-    fs.accessSync(dir, fs.constants.X_OK)
   } catch (err) {
     if (isUnusablePathError(err)) return 'unusable'
     return isAbsenceError(err) ? 'absent' : 'unreadable'
@@ -1646,8 +1645,9 @@ export function physicalDenyPath(
  * The deepest ancestor of `target`, itself included, that this process can stat
  * as a directory. Denying it fails closed where what lies below cannot be
  * inspected. Symlinks are followed, so a link to an unlistable directory is
- * answered with the link's own path, which the Linux deny loop binds at its
- * target, not with the directory holding it.
+ * answered with the link's own path, not with the directory holding it. That
+ * path may be a {@link GitChainHop.link}, which is no deny of what it leads to:
+ * a caller denies where it really is.
  */
 function deepestReachableAncestor(target: string): string | undefined {
   for (let dir = target; ; dir = path.dirname(dir)) {

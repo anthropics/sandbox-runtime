@@ -4432,15 +4432,15 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
       // Refusing every command in the checkout would be a brick one chmod
       // plants; the directory is denied whole instead, and nothing under it
       // stays writable. The repository that keeps it is as writable as it was,
-      // and its `commondir` cannot be read to name it (0o000, 0o444), or was not
-      // since the directory could not be listed (0o311, through which git still
-      // opens it): where the directory is names it.
+      // and its `commondir` cannot be read to name it (0o000), or was not since
+      // the directory could not be listed (0o311, through which git still opens
+      // it): where the directory is names it.
       const main = makeGitDir(join(dir, 'main.git'))
       const worktreeGitDir = makeGitDir(join(main, 'worktrees', 'wt'))
       writeFileSync(join(worktreeGitDir, 'commondir'), '../..\n')
       const pointer = makePointer('wt-checkout', worktreeGitDir)
       try {
-        for (const mode of [0o000, 0o311, 0o444]) {
+        for (const mode of [0o000, 0o311]) {
           chmodSync(worktreeGitDir, mode)
           expect(gitFileDenies(pointer, false)).toMatchObject({
             denyPaths: [
@@ -4453,6 +4453,18 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
         }
       } finally {
         chmodSync(worktreeGitDir, 0o755)
+      }
+      // By where it really is, where the value ends in a link: the name of a
+      // link holds the link, and on Linux is no deny at all.
+      const behind = makeGitDir(join(dir, 'repos', 'behind'))
+      mkdirSync(join(dir, 'links'))
+      symlinkSync(behind, join(dir, 'links', 'gd'))
+      const linked = makePointer('linked-checkout', join(dir, 'links', 'gd'))
+      chmodSync(behind, 0o311)
+      try {
+        expect(gitFileDenies(linked, false).denyPaths).toContain(behind)
+      } finally {
+        chmodSync(behind, 0o755)
       }
       // Nowhere else does git keep what belongs to the directory two up.
       const elsewhere = makeGitDir(join(main, 'kept', 'wt'))

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -179,6 +180,34 @@ describe.if(isLinux)('a git entry that is a link to the work tree', () => {
     expect(binds).not.toContain(dir)
     expect(binds).not.toContain(checkout)
   })
+
+  it.if(process.getuid?.() !== 0).each([0o311, 0o600, 0o000])(
+    'refuses where a write root that cannot be looked into is a git directory (%o)',
+    async mode => {
+      // THREAT: a bare repository that a session in its linked worktree may
+      // write, and one `chmod` by a command. Nothing in it can be named any
+      // more, so it would be denied whole, which is dropped for a write root
+      // that holds something: the next command puts the mode back and writes
+      // the hooks.
+      const main = join(dir, 'main.git')
+      const worktreeGitDir = join(main, 'worktrees', 'wt')
+      mkdirSync(join(main, 'hooks'), { recursive: true })
+      mkdirSync(worktreeGitDir, { recursive: true })
+      writeFileSync(join(main, 'HEAD'), 'ref: refs/heads/main\n')
+      writeFileSync(join(worktreeGitDir, 'commondir'), '../..\n')
+      const checkout = join(dir, 'wt')
+      mkdirSync(checkout)
+      writeFileSync(join(checkout, '.git'), `gitdir: ${worktreeGitDir}\n`)
+      chmodSync(main, mode)
+      try {
+        expect(
+          await wrapIn(checkout, 'true', [checkout, main]).catch(String),
+        ).toContain(`${main} could not be looked into`)
+      } finally {
+        chmodSync(main, 0o755)
+      }
+    },
+  )
 
   it('still binds an ordinary directory an entry is linked at', async () => {
     const checkout = makeCheckout('repo')

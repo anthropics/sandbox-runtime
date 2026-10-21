@@ -1053,10 +1053,53 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
             worktrees: [],
           })
         }
-        // Not so much as listed: how much is there is a command's to choose.
-        expect(list.mock.calls).toEqual([])
+        // Not so much as listed: how much is there is a command's to choose. But
+        // for the `modules` a walk starts from, which the first walk read as one
+        // that may be a git directory itself.
+        expect(list.mock.calls.map(call => String(call[0]))).toEqual([
+          join(submodule, 'modules'),
+        ])
       } finally {
         list.mockRestore()
+      }
+    })
+
+    it('records the modules of a git directory that a walk started from earlier', () => {
+      // `sub/modules` is a submodule's name too. A walk that starts from it
+      // takes it for no git directory, and a command can have one start there: a
+      // `.git` file that names `sub`, under a name that sorts first.
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const sub = makeGitDir(join(mainGitDir, 'modules', 'sub'))
+      const named = makeGitDir(join(sub, 'modules'))
+      const visited = new Map<string, boolean>()
+      gitDirTreeDenies(sub, false, { visited })
+
+      expect(
+        gitDirTreeDenyPaths(gitDirTreeDenies(mainGitDir, false, { visited })),
+      ).toEqual(expect.arrayContaining(gitDirDenyPaths(named, false)))
+    })
+
+    it('reads once what many links that lead nowhere fold to', () => {
+      // `nope/../w` is nothing to the kernel, and on paper the directory beside
+      // the link.
+      const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+      const worktree = join(mainGitDir, 'worktrees', 'w')
+      mkdirSync(worktree, { recursive: true })
+      writeFileSync(join(worktree, 'commondir'), '../..\n')
+      for (const name of ['a', 'b', 'x', 'y']) {
+        symlinkSync('nope/../w', join(mainGitDir, 'worktrees', name))
+      }
+      const open = spyOn(fs, 'openSync')
+      try {
+        gitDirTreeDenies(mainGitDir, false)
+
+        expect(
+          open.mock.calls.filter(call =>
+            String(call[0]).endsWith('/w/commondir'),
+          ).length,
+        ).toBeLessThanOrEqual(2)
+      } finally {
+        open.mockRestore()
       }
     })
 
