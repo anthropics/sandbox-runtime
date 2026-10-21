@@ -1119,24 +1119,56 @@ describe.if(!isWindows)('Linked worktree git directories', () => {
       )
     })
 
-    it('denies a linked worktree under each name that leads to it', () => {
-      // On macOS it is what is denied beneath a link that holds the link.
+    it('holds by its own name each link that leads to a linked worktree', () => {
+      // Which is what holds it on macOS. What it leads to is read once.
       const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
       const { worktreeGitDir } = makeLinkedWorktree(
         mainGitDir,
         'w',
         join(dir, 'w'),
       )
-      const alias = join(mainGitDir, 'worktrees', 'alias')
-      symlinkSync('w', alias)
-
-      expect(gitDirTreeDenyPaths(gitDirTreeDenies(mainGitDir, false))).toEqual(
-        expect.arrayContaining([
-          ...heldFiles(worktreeGitDir),
-          ...heldFiles(alias),
-        ]),
+      const links = ['a', 'b', 'x', 'y'].map(name =>
+        join(mainGitDir, 'worktrees', name),
       )
+      for (const link of links) symlinkSync('w', link)
+
+      const denyPaths = gitDirTreeDenyPaths(gitDirTreeDenies(mainGitDir, false))
+
+      expect(denyPaths).toEqual(
+        expect.arrayContaining([...heldFiles(worktreeGitDir), ...links]),
+      )
+      expect(
+        denyPaths.filter(denyPath => denyPath.endsWith('/commondir')).length,
+      ).toBeLessThanOrEqual(3)
     })
+
+    it.if(NOT_ROOT)(
+      'goes by whether a linked worktree can be searched, as git does',
+      () => {
+        // git opens `commondir` by name. Without leave to list the directory it
+        // still does, so what that names stays denied. Without leave to search
+        // it git opens nothing: denied whole, and no command is refused.
+        const mainGitDir = makeGitDir(join(dir, 'main', '.git'))
+        const other = makeGitDir(join(dir, 'other', '.git'))
+        const worktree = join(mainGitDir, 'worktrees', 'w')
+        mkdirSync(worktree, { recursive: true })
+        writeFileSync(join(worktree, 'commondir'), `${other}\n`)
+        try {
+          chmodSync(worktree, 0o311)
+          expect(
+            gitDirTreeDenyPaths(gitDirTreeDenies(mainGitDir, false)),
+          ).toEqual(expect.arrayContaining(gitDirDenyPaths(other, false)))
+          for (const mode of [0o444, 0o000]) {
+            chmodSync(worktree, mode)
+            expect(gitDirTreeDenies(mainGitDir, false).unreadableDirs).toEqual([
+              worktree,
+            ])
+          }
+        } finally {
+          chmodSync(worktree, 0o755)
+        }
+      },
+    )
 
     // The macOS file systems take no such name.
     it.if(isLinux)(

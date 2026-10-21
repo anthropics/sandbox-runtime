@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import * as fs from 'fs'
 import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
@@ -207,16 +208,71 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
       }
     }
 
-    it('is a git directory by each name', () => {
+    it('is listed once more at most, and each link held by its own name', () => {
+      // How many links and how much they lead to are a command's to choose.
       const lib = makeGitDir(join(modules, 'lib'))
       linkFromBothSides('../lib')
+      const list = spyOn(fs, 'readdirSync')
+      try {
+        const scan = submoduleGitDirs(modules)
 
-      expect(submoduleGitDirs(modules).gitDirs).toEqual([
-        join(modules, 'a', 'link'),
-        lib,
-        join(modules, 'z', 'link'),
-      ])
+        expect(scan.gitDirs).toContain(lib)
+        expect(scan.gitDirs.length).toBeLessThanOrEqual(2)
+        expect(scan.chainHops.map(hop => hop.link).sort()).toEqual([
+          join(modules, 'a', 'link'),
+          join(modules, 'z', 'link'),
+        ])
+        expect(
+          list.mock.calls.filter(
+            call => realpathSync(String(call[0])) === realpathSync(lib),
+          ).length,
+        ).toBeLessThanOrEqual(2)
+      } finally {
+        list.mockRestore()
+      }
     })
+
+    it('is listed once more at most where it is taken for what git keeps', () => {
+      const store = join(modules, 'store')
+      mkdirSync(store, { recursive: true })
+      for (const name of ['a', 'b', 'y', 'z']) {
+        const gitDir = join(modules, name)
+        mkdirSync(gitDir)
+        writeFileSync(join(gitDir, 'HEAD'), '')
+        symlinkSync('../store', join(gitDir, 'objects'))
+      }
+      const list = spyOn(fs, 'readdirSync')
+      try {
+        submoduleGitDirs(modules)
+
+        expect(
+          list.mock.calls.filter(
+            call => realpathSync(String(call[0])) === realpathSync(store),
+          ).length,
+        ).toBeLessThanOrEqual(2)
+      } finally {
+        list.mockRestore()
+      }
+    })
+
+    it.if(process.getuid?.() !== 0)(
+      'is denied whole where it is, where it cannot be listed',
+      () => {
+        // The name of the link holds the link, and on Linux is no deny at all.
+        const locked = join(dir, 'locked')
+        mkdirSync(locked)
+        mkdirSync(modules)
+        symlinkSync(locked, join(modules, 'link'))
+        chmodSync(locked, 0o311)
+        try {
+          expect(submoduleGitDirs(modules).unreadableDirs).toEqual([
+            realpathSync(locked),
+          ])
+        } finally {
+          chmodSync(locked, 0o755)
+        }
+      },
+    )
 
     it('is walked from where it is', () => {
       const lib = makeGitDir(join(modules, 'vendor', 'deep', 'lib'))
@@ -262,6 +318,20 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
     expect(submoduleGitDirs(modules).gitDirs).toEqual([lib, ...nested])
   })
 
+  it.if(!isWindows)('nor one that is kept behind a link', () => {
+    const lib = makeGitDir(join(modules, 'lib'))
+    mkdirSync(join(lib, 'modules'))
+    symlinkSync(
+      makeGitDir(join(dir, 'store', 'hooks.git')),
+      join(lib, 'modules', 'hooks'),
+    )
+
+    expect(submoduleGitDirs(modules).gitDirs).toEqual([
+      lib,
+      join(lib, 'modules', 'hooks'),
+    ])
+  })
+
   describe.if(!isWindows)('what cannot be named', () => {
     const NO_TEXT = Buffer.from([0x63, 0x61, 0x66, 0xe9])
 
@@ -280,14 +350,49 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
       })
     })
 
+    it('has that directory denied where it really is', () => {
+      // The name of a link holds the link, and on Linux is no deny at all.
+      const store = join(dir, 'store')
+      mkdirSync(store)
+      mkdirSync(modules)
+      symlinkSync(NO_TEXT, join(store, 'x'))
+      symlinkSync(store, join(modules, 'link'))
+
+      expect(submoduleGitDirs(modules).unreadableDirs).toEqual([store])
+    })
+
     // The macOS file systems take no such name.
     it.if(isLinux)('has the directory holding it denied whole', () => {
-      const named = join(modules, 'named')
-      mkdirSync(named, { recursive: true })
-      mkdirSync(Buffer.concat([Buffer.from(`${named}/`), NO_TEXT]))
+      // Where it really is as well.
+      const named = [join(modules, 'named'), join(dir, 'store')]
+      for (const holder of named) {
+        mkdirSync(holder, { recursive: true })
+        mkdirSync(Buffer.concat([Buffer.from(`${holder}/`), NO_TEXT]))
+      }
+      symlinkSync(join(dir, 'store'), join(modules, 'link'))
 
-      expect(submoduleGitDirs(modules).unreadableDirs).toEqual([named])
+      expect(submoduleGitDirs(modules).unreadableDirs).toEqual(named)
     })
+
+    it.if(isLinux)(
+      'passes over a link that leads to a file of such a name',
+      () => {
+        // As over any link to a file: git opens no git directory there.
+        mkdirSync(modules)
+        writeFileSync(Buffer.concat([Buffer.from(`${dir}/`), NO_TEXT]), '')
+        symlinkSync(
+          Buffer.concat([Buffer.from('../'), NO_TEXT]),
+          join(modules, 'x'),
+        )
+
+        expect(submoduleGitDirs(modules)).toEqual({
+          gitDirs: [],
+          unreadableDirs: [],
+          linkedEntryDirs: [],
+          chainHops: [],
+        })
+      },
+    )
 
     it.if(isLinux)('refuses where a link leads to it', () => {
       // What is there cannot be denied, and the host's git follows the link.
