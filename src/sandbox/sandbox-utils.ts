@@ -3,7 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf } from '../utils/real-path.js'
+import { realPathOf, realPathOrSelf } from '../utils/real-path.js'
 import {
   denyGlobRegex,
   globToRegex,
@@ -92,6 +92,20 @@ export function coversWriteTree(
     isAtOrUnder(cwd, dir) ||
     allowWritePaths.some(allowed => isAtOrUnder(allowed, dir))
   )
+}
+
+/**
+ * Whether a command may write anything at or under `dir`: it lies in a path the
+ * caller allows writes to, or holds one. Both as they really are.
+ */
+export function meetsWriteRoots(
+  dir: string,
+  allowWritePaths: readonly string[],
+): boolean {
+  const real = realPathOrSelf(dir)
+  return allowWritePaths
+    .map(realPathOrSelf)
+    .some(allowed => isAtOrUnder(real, allowed) || isAtOrUnder(allowed, real))
 }
 
 /** `p` lies strictly beneath `dir` (isAtOrUnder, excluding `dir` itself). */

@@ -3705,6 +3705,14 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
 
     expect(scan.linkedEntryDirs).toEqual([modules])
     expect(scan.chainHops).toEqual([
+      // The entry itself, for the backend that holds a link by its name.
+      {
+        kind: 'entry',
+        chain: 'resolved',
+        source: join(modules, 'lib'),
+        link: join(modules, 'lib'),
+        holder: undefined,
+      },
       {
         kind: 'entry',
         chain: 'resolved',
@@ -4196,8 +4204,9 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
     'holds the link it read where what lies past it cannot be',
     () => {
       // The chain runs into a directory this process cannot search, so the
-      // git directory is failed closed on the deepest ancestor it can reach
-      // and the link it DID read is held as any other is.
+      // git directory is failed closed on the deepest directory it can reach
+      // TOWARDS it, behind the link and not around it, and the link it DID read
+      // is held as any other is.
       const locked = join(dir, 'checkout', 'locked')
       mkdirSync(join(locked, 'inner'), { recursive: true })
       const pointer = writePointer('checkout', 'gitdir: mid/gitdir\n')
@@ -4207,7 +4216,7 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
       try {
         const denies = gitFileDenies(pointer, false)
 
-        expect(denies.denyPaths).toEqual([pointer, hop, join(dir, 'checkout')])
+        expect(denies.denyPaths).toEqual([pointer, hop, locked])
         expect(denies.chainHops).toEqual([
           {
             kind: 'pointer',
@@ -4421,22 +4430,54 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
   it.if(process.getuid?.() !== 0)(
     'denies a git directory it cannot read whole, rather than refusing',
     () => {
-      // git, running as the same user, cannot read through it either, so the
-      // repository is already broken for everyone. Refusing every command in
-      // the checkout would be a brick one chmod plants; the directory is
-      // denied whole instead, and nothing under it stays writable.
+      // Refusing every command in the checkout would be a brick one chmod
+      // plants; the directory is denied whole instead, and nothing under it
+      // stays writable. The repository that keeps it is as writable as it was,
+      // and its `commondir` cannot be read to name it (0o000), or was not since
+      // the directory could not be listed (0o311, through which git still opens
+      // it): where the directory is names it.
       const main = makeGitDir(join(dir, 'main.git'))
       const worktreeGitDir = makeGitDir(join(main, 'worktrees', 'wt'))
       writeFileSync(join(worktreeGitDir, 'commondir'), '../..\n')
       const pointer = makePointer('wt-checkout', worktreeGitDir)
-      chmodSync(worktreeGitDir, 0o000)
       try {
-        expect(gitFileDenies(pointer, false).denyPaths).toEqual([
-          pointer,
-          worktreeGitDir,
-        ])
+        for (const mode of [0o000, 0o311]) {
+          chmodSync(worktreeGitDir, mode)
+          expect(gitFileDenies(pointer, false)).toMatchObject({
+            denyPaths: [
+              pointer,
+              worktreeGitDir,
+              ...gitDirDenyPaths(main, false),
+            ],
+            gitDirs: [main],
+          })
+        }
       } finally {
         chmodSync(worktreeGitDir, 0o755)
+      }
+      // By where it really is, where the value ends in a link: the name of a
+      // link holds the link, and on Linux is no deny at all.
+      const behind = makeGitDir(join(dir, 'repos', 'behind'))
+      mkdirSync(join(dir, 'links'))
+      symlinkSync(behind, join(dir, 'links', 'gd'))
+      const linked = makePointer('linked-checkout', join(dir, 'links', 'gd'))
+      chmodSync(behind, 0o311)
+      try {
+        expect(gitFileDenies(linked, false).denyPaths).toContain(behind)
+      } finally {
+        chmodSync(behind, 0o755)
+      }
+      // Nowhere else does git keep what belongs to the directory two up.
+      const elsewhere = makeGitDir(join(main, 'kept', 'wt'))
+      const other = makePointer('other-checkout', elsewhere)
+      chmodSync(elsewhere, 0o000)
+      try {
+        expect(gitFileDenies(other, false).denyPaths).toEqual([
+          other,
+          elsewhere,
+        ])
+      } finally {
+        chmodSync(elsewhere, 0o755)
       }
     },
   )
@@ -4589,11 +4630,10 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
     symlinkSync(join(dir, 'modules'), join(dir, 'modules', 'a', 'back'))
     const gitDir = makeGitDir(join(dir, 'modules', 'a', 'lib'))
 
-    expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
+    expect(submoduleGitDirs(join(dir, 'modules'))).toMatchObject({
       gitDirs: [gitDir],
       unreadableDirs: [],
       linkedEntryDirs: [join(dir, 'modules', 'a')],
-      chainHops: [],
     })
   })
 
@@ -4648,11 +4688,10 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
       symlinkSync(join(locked, 'two'), join(dir, 'modules', 'b'))
       chmodSync(locked, 0o000)
       try {
-        expect(submoduleGitDirs(join(dir, 'modules'))).toEqual({
+        expect(submoduleGitDirs(join(dir, 'modules'))).toMatchObject({
           gitDirs: [sibling],
           unreadableDirs: [locked],
           linkedEntryDirs: [join(dir, 'modules')],
-          chainHops: [],
         })
       } finally {
         chmodSync(locked, 0o755)

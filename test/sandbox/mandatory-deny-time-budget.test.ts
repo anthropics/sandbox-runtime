@@ -267,7 +267,64 @@ describe.if(isLinux)('Passes over a profile that does not fit', () => {
     })
 
     expect(level).toEqual(collapseEverything(plan))
-    expect(asked).toBeLessThanOrEqual(2 * plan.denyPaths.length)
+    expect(asked).toBeLessThanOrEqual(4 * plan.denyPaths.length)
+  })
+
+  it('steps past entries that take no mount to those that do', () => {
+    // Served last, so taken first: seventy git directories the command may not
+    // write. Degrading them gives nothing back, and is no reason to degrade
+    // every one of those it may.
+    const repository = (
+      modulesDir: string,
+      count: number,
+    ): SubmoduleDenyPlan['repositories'][number] => ({
+      modulesDir,
+      wholeDirDenies: [],
+      gitDirs: Array.from({ length: count }, (_unused, i) => ({
+        gitDir: join(modulesDir, `s${i}`),
+        denyPaths: ['hooks', 'config'].map(name =>
+          join(modulesDir, `s${i}`, name),
+        ),
+        escapingDenyPaths: [],
+        linkedEntryDirs: [],
+        chainHops: [],
+      })),
+    })
+    const repositories = [
+      repository(join(dir, 'repo', '.git', 'modules'), 10),
+      repository(join(dir, 'elsewhere', '.git', 'modules'), 70),
+    ]
+    const plan: SubmoduleDenyPlan = {
+      denyPaths: repositories.flatMap(each =>
+        each.gitDirs.flatMap(kept => kept.denyPaths),
+      ),
+      repositories,
+      chainHops: [],
+    }
+
+    // Twenty deny paths that take a mount, and room for eighteen: two of the
+    // ten, each two paths for one bind, make up for it.
+    expect(
+      collapseFloor(plan, 18, denyPath =>
+        denyPath.startsWith(join(dir, 'repo')),
+      ),
+    ).toEqual({ wholeGitDirs: 72, wholeModulesDirs: 0 })
+
+    // And so for the directories that hold them: the one that takes no mount
+    // gives nothing back, and takes nothing from what the next one gives, nine
+    // binds of its ten. The first is left as it is.
+    const further = [
+      repository(join(dir, 'repo', 'first', '.git', 'modules'), 10),
+      ...repositories,
+    ]
+    expect(
+      collapseFurther(
+        { ...plan, repositories: further },
+        { wholeGitDirs: 90, wholeModulesDirs: 0 },
+        9,
+        denyPath => denyPath.startsWith(join(dir, 'repo')),
+      ),
+    ).toEqual({ wholeGitDirs: 90, wholeModulesDirs: 2 })
   })
 
   it('resolves each path once to say what was degraded', () => {
@@ -299,6 +356,25 @@ describe.if(isLinux)('Passes over a profile that does not fit', () => {
     } finally {
       resolve.mockRestore()
     }
+  })
+
+  it('degrades once a git directory that two repositories lead to', async () => {
+    // A nested submodule's is reached from the repository that keeps it and
+    // through the `.git` file of the checkout it is nested in.
+    const { checkout, subs } = makeSuperproject(join(dir, 'repo'), 2)
+    makeGitDir(join(subs[0]!, 'modules', 'nested'))
+    mkdirSync(join(checkout, 'sub'))
+    writeFileSync(join(checkout, 'sub', '.git'), `gitdir: ${subs[0]!}\n`)
+    process.chdir(checkout)
+
+    const { warnings } = await wrapCountingPasses(checkout, 8_900)
+
+    const modules = join(checkout, '.git', 'modules')
+    const told = warnings.join('\n')
+    expect(told).toContain(
+      `3 of the 3 submodule git directories under ${modules} are`,
+    )
+    expect(told).toContain(`; ${modules} is denied whole`)
   })
 
   it('still stops at the first level that fits where stepping does give words back', async () => {

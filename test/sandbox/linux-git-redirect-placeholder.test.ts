@@ -30,7 +30,6 @@ import {
 } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
 import {
-  aDeadProcess,
   type Process,
   processAt,
   refusal,
@@ -244,32 +243,75 @@ describe.if(isLinux)('The mount point of a file git reads back', () => {
     if (isSomebodys) expect(readFileSync(dest, 'utf8')).toBe(before.contents)
   })
 
-  it.each([
-    { whose: 'a killed wrap', maker: aDeadProcess, stays: false },
-    { whose: 'a wrap of a running process', maker: initProcess, stays: true },
-  ])(
-    'denies the git directory whole where $whose left an empty commondir',
-    async ({ maker, stays }) => {
-      // What bubblewrap's own ensure_file() makes where the file has gone from
-      // under a command that then starts. It is no use to git and is not
-      // written over, so it takes no bind of its own. It goes as any mount
-      // point does, once no manifest of a running process names it.
-      const checkout = makeCheckout('repo')
-      const gitDir = join(checkout, '.git')
-      const commondir = join(gitDir, 'commondir')
-      writeFileSync(commondir, '', { mode: 0o444 })
-      writeManifest(runtime.manifestDir(), [commondir], maker())
+  // What bubblewrap's own ensure_file() makes where the file has gone from under
+  // a command that then starts. It is no use to git, and is never written over.
+  it('makes anew the empty commondir a killed wrap left', async () => {
+    // It goes as any mount point does once no running process's manifest names
+    // it, which is when the plan that found it lets go of its own.
+    const checkout = makeCheckout('repo')
+    const commondir = join(checkout, '.git', 'commondir')
+    writeFileSync(commondir, '', { mode: 0o444 })
+    writeManifest(runtime.manifestDir(), [commondir])
 
-      const command = await wrapIn(checkout)
+    const command = await wrapIn(checkout)
 
-      expect(isDeniedWhole(command, checkout, gitDir)).toBe(true)
-      expect(lastMountAt(command, commondir)).toBeUndefined()
-      cleanupBwrapMountPoints({ force: true })
-      expect(existsSync(commondir)).toBe(stays)
-      if (stays) expect(readFileSync(commondir, 'utf8')).toBe('')
-      expect(existsSync(join(gitDir, 'config.worktree'))).toBe(false)
-    },
-  )
+    expect(lastMountAt(command, commondir)).toBe(
+      `--ro-bind ${commondir} ${commondir}`,
+    )
+    expect(readFileSync(commondir, 'utf8')).toBe('.\n')
+    cleanupBwrapMountPoints({ force: true })
+    expect(existsSync(commondir)).toBe(false)
+  })
+
+  it('denies the git directory whole where the empty commondir stays', async () => {
+    const checkout = makeCheckout('repo')
+    const gitDir = join(checkout, '.git')
+    const commondir = join(gitDir, 'commondir')
+    writeFileSync(commondir, '', { mode: 0o444 })
+    writeManifest(runtime.manifestDir(), [commondir], initProcess())
+
+    const command = await wrapIn(checkout)
+
+    expect(isDeniedWhole(command, checkout, gitDir)).toBe(true)
+    expect(lastMountAt(command, commondir)).toBeUndefined()
+    cleanupBwrapMountPoints({ force: true })
+    expect(readFileSync(commondir, 'utf8')).toBe('')
+    expect(existsSync(join(gitDir, 'config.worktree'))).toBe(false)
+  })
+
+  it('takes a commondir another wrap is about to write for no leftover', async () => {
+    // Made and written are two steps. Found between them, it is empty.
+    const checkout = makeCheckout('repo')
+    const gitDir = join(checkout, '.git')
+    const commondir = join(gitDir, 'commondir')
+    let manifest: string | undefined
+
+    const { command } = await wrapSwappingBefore(
+      'writeFileSync',
+      checkout,
+      gitDir,
+      () => {
+        manifest = writeManifest(
+          runtime.manifestDir(),
+          [commondir],
+          initProcess(),
+        )
+        writeFileSync(commondir, '', { mode: 0o444 })
+        // By the time this wrap has planned again the other has written it.
+        setImmediate(() => {
+          chmodSync(commondir, 0o644)
+          writeFileSync(commondir, '.\n')
+          chmodSync(commondir, 0o444)
+        })
+      },
+    )
+
+    expect(manifest).toBeDefined()
+    expect(isDeniedWhole(command, checkout, gitDir)).toBe(false)
+    expect(lastMountAt(command, commondir)).toBe(
+      `--ro-bind ${commondir} ${commondir}`,
+    )
+  })
 
   it('goes by the file, not by the spelling of the deny entry', async () => {
     // A caller's own deny for the same file comes first and wins the dedup. Its

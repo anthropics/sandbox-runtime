@@ -170,12 +170,15 @@ export function collapsedDenyPaths(
  * where nothing is left to degrade, which is where the profile is refused with
  * `too_many_arguments`. What a step really gives back is the caller's to
  * measure. The arithmetic decides how many entries one step takes, so that a
- * repository with thousands of submodules is not rebuilt once for each.
+ * repository with thousands of submodules is not rebuilt once for each. An entry
+ * none of whose deny paths `takesAMount` (all outside the write allowlist) gives
+ * nothing back, and the step goes on past it.
  */
 export function collapseFurther(
   plan: SubmoduleDenyPlan,
   level: CollapseLevel,
   mountsOver: number,
+  takesAMount: (denyPath: string) => boolean = () => true,
 ): CollapseLevel | undefined {
   const order = collapsibleGitDirs(plan)
   if (level.wholeGitDirs < order.length) {
@@ -183,9 +186,10 @@ export function collapseFurther(
       order.length - level.wholeGitDirs,
       mountsOver,
       at => {
-        const submodule = order[at]
-        if (submodule === undefined) return 0
-        return submodule.denyPaths.length - submodule.escapingDenyPaths.length
+        const escaping = new Set(order[at]?.escapingDenyPaths)
+        return (order[at]?.denyPaths ?? []).filter(
+          denyPath => !escaping.has(denyPath) && takesAMount(denyPath),
+        ).length
       },
     )
     return { ...level, wholeGitDirs: level.wholeGitDirs + taken }
@@ -194,9 +198,15 @@ export function collapseFurther(
     const taken = stepBack(
       plan.repositories.length - level.wholeModulesDirs,
       mountsOver,
-      // Each submodule under it is one bind by now, and the one bind of
+      // Each git directory under it is one bind by now, and the one bind of
       // `modules` replaces the lot.
-      at => (plan.repositories[at]?.gitDirs.length ?? 1) - 1,
+      at =>
+        Math.max(
+          (plan.repositories[at]?.gitDirs ?? []).filter(kept =>
+            takesAMount(kept.gitDir),
+          ).length - 1,
+          0,
+        ),
     )
     return { ...level, wholeModulesDirs: level.wholeModulesDirs + taken }
   }
@@ -241,7 +251,7 @@ export function collapseFloor(
     // many more of those lie ahead is a command's to choose.
     if (denies >= deniesBefore) return collapseEverything(plan)
     deniesBefore = denies
-    const degraded = collapseFurther(plan, level, denies - mounts)
+    const degraded = collapseFurther(plan, level, denies - mounts, takesAMount)
     if (degraded === undefined) return level
     level = degraded
   }
