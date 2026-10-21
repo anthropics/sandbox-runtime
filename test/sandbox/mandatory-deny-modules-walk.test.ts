@@ -251,9 +251,7 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
         symlinkSync(locked, join(modules, 'link'))
         chmodSync(locked, 0o311)
         try {
-          expect(submoduleGitDirs(modules).unreadableDirs).toEqual([
-            realpathSync(locked),
-          ])
+          expect(submoduleGitDirs(modules).unreadableDirs).toEqual([locked])
         } finally {
           chmodSync(locked, 0o755)
         }
