@@ -1025,6 +1025,7 @@ async function startMuxProxyServer(
   socksProxyServer = createSocksProxyServer({
     filter: (port, host, encodedCommand) =>
       filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
+    getMitmSocketPath,
     parentProxy,
     lookupFor: directLookup,
     proxyAuthToken,
