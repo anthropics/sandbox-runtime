@@ -1194,7 +1194,8 @@ function listDirectory(dir: string, walk: TreeWalk): fs.Dirent[] | undefined {
 }
 
 function denyUnreadable(dir: string, err: unknown, walk: TreeWalk): void {
-  const denied = realPathOrSelf(deepestReachableAncestor(dir) ?? dir)
+  const denied =
+    deepestReachableAncestor(physicalDenyPath(dir, walk.deadline)) ?? dir
   walk.unreadableDirs.add(denied)
   logForDebugging(
     `[Sandbox] Could not look into ${dir}, denying ${denied} whole: ${err}`,
@@ -1229,20 +1230,21 @@ function walkEntry(
     if (!(err instanceof GitMetadataError)) throw err
     // Where it leads cannot be named, so a directory there cannot be denied,
     // nor what cannot be looked at.
+    let behind: fs.Stats
     try {
-      if (fs.statSync(entryPath).isDirectory()) throw err
-      return { kind: 'skip' }
+      behind = fs.statSync(entryPath)
     } catch (statErr) {
-      const code = (statErr as NodeJS.ErrnoException).code
-      if (!isAbsenceError(statErr) && code !== 'ELOOP') throw err
+      if (!isAbsenceErrno(statErr)) throw err
+      // Nothing is there. A command can make such a link here, so it costs what
+      // any link here does and not every command after it.
+      walk.unreadableDirs.add(realPathOrSelf(holder))
+      logForDebugging(
+        `[Sandbox] ${entryPath} leads through a symlink whose target is not valid UTF-8, to nothing; denying ${holder} whole`,
+        { level: 'warn' },
+      )
+      return { kind: 'skip' }
     }
-    // Nothing is there. A command can make such a link here, so it costs what
-    // any link here does and not every command after it.
-    walk.unreadableDirs.add(realPathOrSelf(holder))
-    logForDebugging(
-      `[Sandbox] ${entryPath} leads through a symlink whose target is not valid UTF-8, to nothing; denying ${holder} whole`,
-      { level: 'warn' },
-    )
+    if (behind.isDirectory()) throw err
     return { kind: 'skip' }
   }
   // The first hop is the entry, whose holder joins `linkedEntryDirs` below. The
@@ -1323,9 +1325,11 @@ function gitDirTargetDenies(
     case 'absent':
       return gitDirDenies(target, allowGitConfig, deadline)
     case 'unreadable': {
-      // Where it really is: a value can end in a link, whose name is what holds
-      // the link and no deny of what it leads to ({@link GitChainHop.link}).
-      const denied = realPathOrSelf(deepestReachableAncestor(target) ?? target)
+      // Towards where it really is. A value can go through a link, whose name
+      // holds the link and is no deny of what it leads to ({@link
+      // GitChainHop.link}), and what cannot be looked into may lie behind it.
+      const denied =
+        deepestReachableAncestor(physicalDenyPath(target, deadline)) ?? target
       logForDebugging(
         `[Sandbox] Could not read ${target} named by ${source}, denying ${denied} whole`,
         { level: 'warn' },

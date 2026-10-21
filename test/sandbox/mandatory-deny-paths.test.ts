@@ -4204,8 +4204,9 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
     'holds the link it read where what lies past it cannot be',
     () => {
       // The chain runs into a directory this process cannot search, so the
-      // git directory is failed closed on the deepest ancestor it can reach
-      // and the link it DID read is held as any other is.
+      // git directory is failed closed on the deepest directory it can reach
+      // TOWARDS it, behind the link and not around it, and the link it DID read
+      // is held as any other is.
       const locked = join(dir, 'checkout', 'locked')
       mkdirSync(join(locked, 'inner'), { recursive: true })
       const pointer = writePointer('checkout', 'gitdir: mid/gitdir\n')
@@ -4215,7 +4216,7 @@ describe.if(!isWindows)('Git metadata deny paths - Unit Tests', () => {
       try {
         const denies = gitFileDenies(pointer, false)
 
-        expect(denies.denyPaths).toEqual([pointer, hop, join(dir, 'checkout')])
+        expect(denies.denyPaths).toEqual([pointer, hop, locked])
         expect(denies.chainHops).toEqual([
           {
             kind: 'pointer',

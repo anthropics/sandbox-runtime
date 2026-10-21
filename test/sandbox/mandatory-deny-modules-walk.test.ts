@@ -260,6 +260,21 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
       },
     )
 
+    it.if(process.getuid?.() !== 0)(
+      'has what shuts it off denied whole, behind the link and not around it',
+      () => {
+        const locked = join(dir, 'locked')
+        mkdirSync(join(locked, 'deep'), { recursive: true })
+        symlinkSync(join(locked, 'deep'), modules)
+        chmodSync(locked, 0o000)
+        try {
+          expect(submoduleGitDirs(modules).unreadableDirs).toEqual([locked])
+        } finally {
+          chmodSync(locked, 0o755)
+        }
+      },
+    )
+
     it('is walked from where it is', () => {
       const lib = makeGitDir(join(modules, 'vendor', 'deep', 'lib'))
       linkFromBothSides('../vendor/deep')
@@ -380,11 +395,14 @@ describe('The .git/modules walk beneath what looks like a git directory', () => 
       },
     )
 
-    it('takes what lies below a file for nothing', () => {
+    it.each([
+      { what: 'what lies below a file', before: '../file/', after: '' },
+      { what: 'a name no file can have', before: '', after: 'x'.repeat(300) },
+    ])('takes $what for nothing', ({ before, after }) => {
       mkdirSync(modules)
       writeFileSync(join(dir, 'file'), '')
       symlinkSync(
-        Buffer.concat([Buffer.from('../file/'), NO_TEXT]),
+        Buffer.concat([Buffer.from(before), NO_TEXT, Buffer.from(after)]),
         join(modules, 'x'),
       )
 
