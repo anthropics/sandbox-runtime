@@ -2170,6 +2170,11 @@ export interface WindowsInstallOptions {
    */
   profileExclude?: readonly string[]
   /**
+   * Directories (or files) inside the profile to make readable in
+   * addition to the built-in list — {@link WindowsProfileGrantOptions.include}.
+   */
+  profileInclude?: readonly string[]
+  /**
    * How long the profile read grant may take. Default 30 minutes; the
    * first grant touches every file under the granted directories.
    */
@@ -2476,12 +2481,15 @@ function installProfileGrantSkip(
  */
 export function windowsProfileGrantNotice(profileDir: string): string {
   return (
-    `Making ${profileDir} readable to sandboxed commands on this machine, ` +
-    `except the excluded credential stores (SSH and GPG keys, cloud and ` +
-    `browser sign-ins, password managers, registry hives). Readable ` +
-    `files include package-manager configuration that can hold feed ` +
-    `tokens: .npmrc, pip.ini, NuGet.Config, Maven settings.xml, ` +
-    `gradle.properties, .gitconfig. Skip with --skip-profile-grant ` +
+    `Making the tool directories of ${profileDir} readable to sandboxed ` +
+    `commands on this machine: where per-user tools install themselves ` +
+    `(AppData\\Local\\Programs, AppData\\Roaming\\npm, scoop, .nuget, ` +
+    `.cargo and the like) and package-manager configuration that can ` +
+    `hold feed tokens (.npmrc, pip.ini, NuGet.Config, Maven settings.xml, ` +
+    `gradle.properties, .gitconfig). Documents, Desktop, Downloads and ` +
+    `the rest of the profile are not readable unless added; credential ` +
+    `stores (SSH and GPG keys, cloud and browser sign-ins, password ` +
+    `managers, registry hives) are denied. Skip with --skip-profile-grant ` +
     `(skipProfileGrant); undo with \`srt-win profile forget\` ` +
     `(forgetWindowsProfileRead()).`
   )
@@ -2493,6 +2501,7 @@ function installProfileGrantOptions(
 ): WindowsProfileGrantOptions {
   return {
     exclude: opts.profileExclude,
+    include: opts.profileInclude,
     timeoutMs: opts.profileGrantTimeoutMs,
     onProgress: opts.onProfileGrantProgress,
     srtWin,
@@ -3394,6 +3403,12 @@ export interface WindowsProfileGrantStatus {
   /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
   /**
+   * Inclusions added to the built-in list when the grant was made,
+   * relative to the profile: directories (or files) readable besides
+   * the per-user tool directories the library lists.
+   */
+  extraInclusions: string[]
+  /**
    * Every PROTECTED path the grant keeps unreadable, absolute, existing or
    * not; `*` stands for one name, a trailing `*` for a prefix. A session may
    * not grant a path that is one, lies inside one, or lies above one.
@@ -3405,6 +3420,13 @@ export interface WindowsProfileGrantStatus {
    * denied.
    */
   ungrantedOnly: string[]
+  /**
+   * Every inclusion the grant was made with, absolute: the built-in
+   * list of per-user tool directories and what was added, each readable
+   * but for the exclusions inside it. Empty from an srt-win that does
+   * not report them.
+   */
+  inclusions: string[]
   counts: { containers: number; granted: number; files: number; denied: number }
   /**
    * Configuration-file variables for a sandboxed command — see
@@ -3428,8 +3450,10 @@ type RawProfileStatus = {
   reason?: string
   profile?: string | null
   extra_exclusions?: string[]
+  extra_inclusions?: unknown
   exclusions?: unknown
   ungranted_only?: unknown
+  inclusions?: unknown
   containers?: number
   granted?: number
   files?: number
@@ -3528,8 +3552,12 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     staleAllow: grantItems(raw.stale_allow),
     replacedFiles: stringList(raw.replaced_files) ?? [],
     extraExclusions: raw.extra_exclusions ?? [],
+    // Absent from what an srt-win without `--include` reports: read
+    // as none added. Nothing a session checks depends on it.
+    extraInclusions: stringList(raw.extra_inclusions) ?? [],
     exclusions: stringList(raw.exclusions) ?? [],
     ungrantedOnly: stringList(raw.ungranted_only) ?? [],
+    inclusions: stringList(raw.inclusions) ?? [],
     counts: {
       containers: raw.containers ?? 0,
       granted: raw.granted ?? 0,
@@ -3599,6 +3627,24 @@ export interface WindowsProfileGrantOptions {
    * runs recorded. Without it a run only ever adds.
    */
   replaceExclusions?: boolean
+  /**
+   * Directories (or files) inside the profile to make readable in
+   * addition to the built-in list of per-user tool directories
+   * (absolute, or relative to the profile): a toolchain kept somewhere
+   * the list does not name, say. A protected path, anything inside
+   * one, and the temporary directory or anything in it are refused
+   * (`profile_grant_failed`); a directory above a protected path is
+   * granted child by child. An inclusion recorded by an earlier run is
+   * checked again on every run, since the built-in exclusions may have
+   * grown: one that conflicts fails the run the same way until a run
+   * with `replaceInclusions: true` drops it.
+   */
+  include?: readonly string[]
+  /**
+   * Make `include` the whole added list, dropping the entries earlier
+   * runs recorded. Without it a run only ever adds.
+   */
+  replaceInclusions?: boolean
   /**
    * Kill `srt-win` after this long. Default 30 minutes: the first run
    * touches every file under the granted directories.
@@ -3807,6 +3853,8 @@ function profileGrantArgs(opts: WindowsProfileGrantOptions): string[] {
   const args = ['profile', 'grant', '--json']
   for (const e of opts.exclude ?? []) args.push('--exclude', e)
   if (opts.replaceExclusions) args.push('--replace-excludes')
+  for (const i of opts.include ?? []) args.push('--include', i)
+  if (opts.replaceInclusions) args.push('--replace-includes')
   return args
 }
 

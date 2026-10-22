@@ -415,15 +415,23 @@ enum ProfileCmd {
     /// Write, or bring up to date, the read grant on the calling
     /// user's profile for the sandbox group.
     ///
-    /// The profile directory and every directory that could hold an
-    /// excluded path get an entry that lets the sandbox list them and
-    /// pass through; their other children are granted read + execute
-    /// one by one (a directory with one inheriting entry, a file with
-    /// its own). Protected paths — key and credential stores, browser
-    /// and password-manager data, the registry hives, and what
-    /// `--exclude` adds — are never granted and get a read deny,
-    /// written before the first allow; a protected directory that
-    /// does not exist is created empty to carry it. The temporary
+    /// Only the listed directories are readable: where per-user tools
+    /// install themselves and what they need to run
+    /// (`AppData\Local\Programs`, `AppData\Roaming\npm`, `scoop`,
+    /// `.nuget`, `.cargo`, …), and what `--include` adds. A listed
+    /// directory is granted read + execute with one inheriting entry,
+    /// or — where a protected path could lie beneath it — child by
+    /// child. The
+    /// profile directory and every directory on the way to a listed
+    /// or a protected path get an entry that lets the sandbox list
+    /// them and pass through; any other directory gets no entry at
+    /// all, and a session may still open it with a read grant of its
+    /// own. In the profile directory itself only `.npmrc` and
+    /// `.gitconfig` are readable. Protected paths — key and credential
+    /// stores, browser and password-manager data, the registry hives,
+    /// and what `--exclude` adds — are never granted and get a read
+    /// deny, written before the first allow; a protected directory
+    /// that does not exist is created empty to carry it. The temporary
     /// directory is left as it is: nothing in it is granted, and it
     /// is not denied, so a session can still grant a directory of its
     /// own inside it.
@@ -433,10 +441,9 @@ enum ProfileCmd {
     /// The first run touches every file under the granted
     /// directories and can take minutes on a large profile; progress
     /// goes to stderr. A later run writes only what changed: a new
-    /// child of the profile directory (or of another directory whose
-    /// children are granted one by one) is not readable until then.
-    /// Other `srt-win acl` commands of the same user wait while a run
-    /// is in progress.
+    /// child of a directory whose children are granted one by one is
+    /// not readable until then. Other `srt-win acl` commands of the
+    /// same user wait while a run is in progress.
     ///
     /// Exits **15** unless the install's setup marker is this
     /// build's, **21** when run as a service account (LocalSystem,
@@ -456,6 +463,20 @@ enum ProfileCmd {
         /// `--exclude`: drop them all).
         #[arg(long)]
         replace_excludes: bool,
+        /// A directory (or file) inside the profile to make readable
+        /// in addition to the built-in list (absolute, or relative to
+        /// the profile). Repeatable. The inclusions added by earlier
+        /// runs stay in force as well. A protected path, anything
+        /// inside one, and the temporary directory or anything in it
+        /// are refused; a directory above a protected path is granted
+        /// child by child.
+        #[arg(long = "include", value_name = "PATH")]
+        include: Vec<String>,
+        /// Make the `--include` paths of this run the whole added
+        /// list, dropping the ones earlier runs recorded (with no
+        /// `--include`: drop them all).
+        #[arg(long)]
+        replace_includes: bool,
         /// Print the result as one JSON object on stdout:
         /// `{profile, list_version, complete, containers, granted,
         /// files, denied, placeholders, writes, unchanged, removed,
@@ -491,8 +512,8 @@ enum ProfileCmd {
     },
     /// Print the recorded grant as JSON: `{state, reason?, profile,
     /// list_version, recorded_list_version, extra_exclusions,
-    /// exclusions, ungranted_only, containers, granted, files, denied,
-    /// env?, paths?}`.
+    /// extra_inclusions, exclusions, ungranted_only, containers,
+    /// granted, files, denied, env?, paths?}`.
     /// `exclusions` is every protected path the grant was made to
     /// keep unreadable (wildcards as written), existing or not;
     /// `ungranted_only` the directories it leaves ungranted without
@@ -2517,6 +2538,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 ProfileCmd::Grant {
                     exclude,
                     replace_excludes,
+                    include,
+                    replace_includes,
                     json,
                     quiet,
                     #[cfg(feature = "test-hooks")]
@@ -2554,8 +2577,12 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     &profile::Store::of(db.conn()),
                     &ids,
                     &layout,
-                    &exclude,
-                    replace_excludes,
+                    profile::Added {
+                        exclude: &exclude,
+                        replace_excludes,
+                        include: &include,
+                        replace_includes,
+                    },
                     !quiet,
                 )
             })?;
@@ -3856,6 +3883,43 @@ mod tests {
         ));
         match parse(&[
             "srt-win",
+            "profile",
+            "grant",
+            "--include",
+            r"C:\Users\me\tools",
+            "--include",
+            "Documents",
+            "--exclude",
+            r"Documents\secret",
+        ]) {
+            Ok(Cmd::Profile {
+                sub:
+                    ProfileCmd::Grant {
+                        include,
+                        exclude,
+                        replace_includes,
+                        ..
+                    },
+            }) => {
+                assert_eq!(include, [r"C:\Users\me\tools", "Documents"]);
+                assert_eq!(exclude, [r"Documents\secret"]);
+                assert!(!replace_includes);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(matches!(
+            parse(&["srt-win", "profile", "grant", "--replace-includes"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Grant {
+                    replace_includes: true,
+                    replace_excludes: false,
+                    ..
+                }
+            })
+        ));
+        assert!(parse(&["srt-win", "profile", "grant", "--include"]).is_err());
+        match parse(&[
+            "srt-win",
             "acl",
             "grant",
             "--holder-pid",
@@ -3932,7 +3996,7 @@ mod tests {
                 "profile {sub} --test-profile"
             );
         }
-        assert!(parse(&["srt-win", "profile", "grant", "--include", ".ssh"]).is_err());
+        assert!(parse(&["srt-win", "profile", "grant", "--allow", ".ssh"]).is_err());
     }
 
     #[test]
