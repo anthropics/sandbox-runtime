@@ -1,18 +1,23 @@
 //! The pure half of the profile read grant ([`crate::profile`]): what is
-//! never readable, and which directory gets which entry. No Windows call
-//! is made here.
-//! The walk goes down from the profile root. A directory is a container
-//! (a non-inheriting list entry; children looked at one by one) exactly
-//! when some exclusion could lie beneath it, existing or not; otherwise it
-//! is granted whole. So no excluded path ever has an ancestor that carries
-//! an inheriting allow. A protected exclusion is read-denied; an
+//! readable, what is never readable, and which directory gets which
+//! entry. No Windows call is made here.
+//! The walk goes down from the profile root. Nothing is granted unless
+//! it lies beneath an inclusion ([`INCLUDED`], plus what configuration
+//! adds): a directory there is granted whole unless some exclusion
+//! could lie beneath it, existing or not, in which case it is a
+//! container (a non-inheriting list entry; children looked at one by
+//! one). A directory an inclusion or an exclusion could lie beneath is
+//! a container as well, so the way down to both stays open; any other
+//! directory gets no entry at all. So no excluded path ever has an
+//! ancestor that carries an inheriting allow, and nothing outside the
+//! inclusions is readable. A protected exclusion is read-denied; an
 //! ungranted-only one (the temporary directory) gets nothing at all. A
 //! link at or above a rule's path is resolved, and the rule is applied
 //! beneath its target as well ([`plan_resolved`]).
 
-/// Version of the exclusion list and of the walk rule. A recorded
-/// grant made with another version is reported as outdated.
-pub const LIST_VERSION: u32 = 3;
+/// Version of the inclusion and exclusion lists and of the walk rule. A
+/// recorded grant made with another version is reported as outdated.
+pub const LIST_VERSION: u32 = 4;
 
 /// What a built-in exclusion's path is relative to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +254,96 @@ pub const BUILT_IN: &[Excl] = &[
 /// of a private package feed or a git host.
 pub const READABLE_ROOT_FILES: &[&str] = &[".npmrc", ".gitconfig"];
 
+/// One built-in inclusion: a directory beneath which everything is
+/// granted, but for the exclusions. `path` is written like an
+/// exclusion's, wildcards included.
+#[derive(Debug, Clone, Copy)]
+pub struct Incl {
+    pub base: Base,
+    pub path: &'static str,
+}
+
+const fn inc(base: Base, path: &'static str) -> Incl {
+    Incl { base, path }
+}
+
+/// Every directory of the profile that is readable: where per-user
+/// tools install themselves, and what they need to run. A directory
+/// beneath none of these is left alone — not granted, and not denied,
+/// so a session can still open it with a read grant of its own.
+/// Configuration can add to this list ([`Rules::new`]'s `include`, the
+/// `--include` of `profile grant`); nothing removes an entry.
+pub const INCLUDED: &[Incl] = &[
+    // ─── Per-user program installs, found through PATH ───
+    // python.org's Python, Git for Windows, VS Code, Node.
+    inc(Local, "Programs"),
+    // winget packages, and the Links to their executables.
+    inc(Local, r"Microsoft\WinGet"),
+    // npm global installs and their shims.
+    inc(Roaming, "npm"),
+    // nvm-windows: the Node versions.
+    inc(Roaming, "nvm"),
+    // fnm: the Node versions, and the per-shell links to them.
+    inc(Roaming, "fnm"),
+    inc(Local, "fnm_multishells"),
+    // Volta: tools and shims.
+    inc(Local, "Volta"),
+    // pnpm: its home and store.
+    inc(Local, "pnpm"),
+    // scoop: shims and apps.
+    inc(Profile, "scoop"),
+    // Go: installed binaries and the module cache.
+    inc(Profile, "go"),
+    // .NET global tools and workloads, and a per-user SDK (dotnet-install).
+    inc(Profile, ".dotnet"),
+    inc(Local, r"Microsoft\dotnet"),
+    // Bun and Deno: their binaries and caches.
+    inc(Profile, ".bun"),
+    inc(Profile, ".deno"),
+    // JDKs installed by the JetBrains IDEs.
+    inc(Profile, ".jdks"),
+    // `.local\bin`: the launchers of uv, pipx and others.
+    inc(Profile, ".local"),
+    // pipx: its environments.
+    inc(Profile, "pipx"),
+    // conda.
+    inc(Profile, "miniconda3"),
+    inc(Profile, "anaconda3"),
+    // NuGet: the packages a restore fetched.
+    inc(Profile, ".nuget"),
+    // uv: the Pythons and tools it manages.
+    inc(Roaming, "uv"),
+    // ─── Toolchain homes and configuration ───
+    // Their binaries are found through PATH (`.cargo\bin`, pyenv's
+    // shims, the Python user scripts); the configuration and caches in
+    // them are read only when the embedder points the tool at them
+    // (`RUSTUP_HOME`, `CARGO_HOME`, `PIP_CONFIG_FILE`, `MAVEN_ARGS`,
+    // `GIT_CONFIG_GLOBAL`: [`env_pointers`]; NuGet and Gradle have no
+    // such variable), since a sandboxed command keeps the sandbox
+    // account's own profile.
+    // rustup: the toolchains.
+    inc(Profile, ".rustup"),
+    // cargo: shims, registry and config (its credential files stay denied).
+    inc(Profile, ".cargo"),
+    // Maven: settings and the local repository.
+    inc(Profile, ".m2"),
+    // pip: pip.ini, at its current place and its older one.
+    inc(Roaming, "pip"),
+    inc(Profile, "pip"),
+    // XDG-style configuration (its stores stay denied).
+    inc(Profile, ".config"),
+    // pyenv-win: the Python versions.
+    inc(Profile, ".pyenv"),
+    // Gradle: gradle.properties and caches (its key files stay denied).
+    inc(Profile, ".gradle"),
+    // NuGet: NuGet.Config.
+    inc(Roaming, "NuGet"),
+    // Python: the user site-packages and their scripts.
+    inc(Roaming, "Python"),
+    // uv: its cache.
+    inc(Local, "uv"),
+];
+
 /// The configuration files that are readable by design although they
 /// can hold a feed sign-in, with what reads them.
 pub const READABLE_CONFIG: &[(Base, &str, &str)] = &[
@@ -390,12 +485,21 @@ struct Rule {
     placeholder: bool,
 }
 
-/// The exclusions in force for one profile: the built-in list placed
-/// at the profile's known-folder locations, plus what configuration
-/// added.
+/// One inclusion: a directory beneath the profile that is granted.
+#[derive(Debug, Clone)]
+struct Inc {
+    pats: Vec<Pat>,
+    /// The components as spelled.
+    spelled: Vec<String>,
+}
+
+/// The exclusions and inclusions in force for one profile: the
+/// built-in lists placed at the profile's known-folder locations, plus
+/// what configuration added.
 #[derive(Debug, Clone)]
 pub struct Rules {
     rules: Vec<Rule>,
+    includes: Vec<Inc>,
 }
 
 /// Where the application-data folders are when nothing redirects
@@ -406,17 +510,22 @@ const CONVENTIONAL_LOCAL: [&str; 2] = ["AppData", "Local"];
 impl Rules {
     /// `roaming` and `local` are the known-folder locations as
     /// components beneath the profile, `None` when a folder is not
-    /// inside the profile.
+    /// inside the profile. `extra` are the exclusions configuration
+    /// adds, `include` its inclusions, both as components beneath the
+    /// profile.
     pub fn new(
         roaming: Option<&[String]>,
         local: Option<&[String]>,
         extra: &[Vec<String>],
+        include: &[Vec<String>],
     ) -> Rules {
-        let mut rules = Vec::new();
         let conventional = |c: &[&str]| c.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        for e in BUILT_IN {
+        // Where an entry of a built-in list is placed: at the
+        // conventional location of its base and, for a known folder
+        // redirected elsewhere inside the profile, there as well.
+        let placed = |base: Base, path: &str| -> Vec<Vec<String>> {
             let mut bases: Vec<Vec<String>> = Vec::new();
-            match e.base {
+            match base {
                 Base::Profile => bases.push(Vec::new()),
                 Base::Roaming => {
                     bases.push(conventional(&CONVENTIONAL_ROAMING));
@@ -433,9 +542,17 @@ impl Rules {
                         .zip(b.iter())
                         .all(|(x, y)| norm_component(x) == norm_component(y))
             });
-            for base in bases {
-                let mut spelled = base;
-                spelled.extend(e.path.split('\\').map(str::to_owned));
+            bases
+                .into_iter()
+                .map(|mut spelled| {
+                    spelled.extend(path.split('\\').map(str::to_owned));
+                    spelled
+                })
+                .collect()
+        };
+        let mut rules = Vec::new();
+        for e in BUILT_IN {
+            for spelled in placed(e.base, e.path) {
                 let pats: Vec<Pat> = spelled.iter().map(|c| Pat::parse(c)).collect();
                 let wild = pats.iter().any(|p| !matches!(p, Pat::Lit(_)));
                 rules.push(Rule {
@@ -456,7 +573,22 @@ impl Rules {
                 placeholder: false,
             });
         }
-        Rules { rules }
+        let mut includes = Vec::new();
+        for i in INCLUDED {
+            for spelled in placed(i.base, i.path) {
+                includes.push(Inc {
+                    pats: spelled.iter().map(|c| Pat::parse(c)).collect(),
+                    spelled,
+                });
+            }
+        }
+        for x in include.iter().filter(|x| !x.is_empty()) {
+            includes.push(Inc {
+                pats: x.iter().map(|c| Pat::Lit(norm_component(c))).collect(),
+                spelled: x.clone(),
+            });
+        }
+        Rules { rules, includes }
     }
 
     /// The exclusions of one kind, as written: components beneath the
@@ -510,8 +642,41 @@ impl Rules {
         })
     }
 
+    /// The inclusions, built-in and added, as written: components
+    /// beneath the profile joined by `\\`, wildcards included.
+    pub fn spelled_included(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for i in &self.includes {
+            let s = i.spelled.join("\\");
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// Whether `rel` is an inclusion or lies beneath one: readable,
+    /// but for the exclusions.
+    pub fn included(&self, rel: &[Name]) -> bool {
+        self.includes.iter().any(|i| {
+            i.pats.len() <= rel.len() && i.pats.iter().zip(rel).all(|(p, n)| n.matched_by(p))
+        })
+    }
+
+    /// Whether an inclusion could lie strictly beneath the directory
+    /// `rel`, whatever is on disk.
+    pub fn could_include_beneath(&self, rel: &[Name]) -> bool {
+        self.includes.iter().any(|i| {
+            i.pats.len() > rel.len() && i.pats.iter().zip(rel).all(|(p, n)| n.matched_by(p))
+        })
+    }
+
     fn all(&self) -> Vec<usize> {
         (0..self.rules.len()).collect()
+    }
+
+    fn all_included(&self) -> Vec<usize> {
+        (0..self.includes.len()).collect()
     }
 }
 
@@ -674,6 +839,51 @@ pub fn session_grant_refusal(
                 "a {what} grant on '{path}' would cover everything in '{u}', which is not \
                  granted as a whole; choose a narrower directory"
             ));
+        }
+    }
+    None
+}
+
+/// Why `path` cannot be an added inclusion of a grant with these
+/// exclusions (`None`: it can): it is a protected path or lies inside
+/// one — the deny wins, and the inclusion would grant nothing — or it is
+/// the ungranted-only directory or lies inside it, where nothing is
+/// granted. A path above an exclusion is admitted: the walk grants it
+/// child by child, and the exclusion beneath keeps its deny. All
+/// absolute; `protected` and `ungranted` may hold the wildcards of the
+/// built-in list.
+pub fn include_refusal(path: &str, protected: &[String], ungranted: &[String]) -> Option<String> {
+    for r in protected {
+        match relation(path, r) {
+            Some(Relation::Equal) => {
+                return Some(format!(
+                    "'{path}' is excluded from reads of the profile; an exclusion is not \
+                     undone by including it"
+                ));
+            }
+            Some(Relation::Inside) => {
+                return Some(format!(
+                    "'{path}' lies inside '{r}', which is excluded from reads of the profile"
+                ));
+            }
+            Some(Relation::Above) | None => {}
+        }
+    }
+    for u in ungranted {
+        match relation(path, u) {
+            Some(Relation::Equal) => {
+                return Some(format!(
+                    "'{path}' is the temporary directory, in which nothing is granted; a \
+                     session can grant a directory inside it with its own read grant"
+                ));
+            }
+            Some(Relation::Inside) => {
+                return Some(format!(
+                    "'{path}' lies inside '{u}', in which nothing is granted; a session can \
+                     grant a directory there with its own read grant"
+                ));
+            }
+            Some(Relation::Above) | None => {}
         }
     }
     None
@@ -918,11 +1128,13 @@ pub struct Node {
     pub note: Option<String>,
 }
 
-/// A link the walk met where a rule points: its path, and the rules
-/// that matched down to and including its name.
+/// A link the walk met where a rule points: its path, and the
+/// exclusion rules and inclusions that matched down to and including
+/// its name.
 struct LinkHit {
     rel: Vec<String>,
     rules: Vec<usize>,
+    includes: Vec<usize>,
 }
 
 /// What a walk produces.
@@ -959,7 +1171,14 @@ pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, R
             hits: Vec::new(),
         };
         let all = rules.all();
-        walk(tree, &rules, &[], entries, &all, false, &mut found);
+        let all_included = rules.all_included();
+        let ctx = WalkCtx {
+            alive: &all,
+            included: &all_included,
+            inside: false,
+            bare: false,
+        };
+        walk(tree, &rules, &[], entries, ctx, &mut found);
         let Found { nodes: out, hits } = found;
         let mut grew = false;
         for hit in hits {
@@ -967,6 +1186,12 @@ pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, R
                 continue;
             };
             if target.is_empty() {
+                if hit.rules.is_empty() {
+                    // A link at an inclusion's path that leads to the
+                    // profile itself grants nothing: the link is skipped,
+                    // and the profile is never granted whole.
+                    continue;
+                }
                 return Err(format!(
                     "'{}' is a link to the profile directory itself and stands where an \
                      exclusion applies; the profile cannot be granted around it",
@@ -974,6 +1199,19 @@ pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, R
                 ));
             }
             let depth = hit.rel.len();
+            for i in hit.includes {
+                let from = rules.includes[i].clone();
+                let mut pats: Vec<Pat> =
+                    target.iter().map(|c| Pat::Lit(norm_component(c))).collect();
+                pats.extend(from.pats[depth..].iter().cloned());
+                let mut spelled = target.clone();
+                spelled.extend(from.spelled[depth..].iter().cloned());
+                if !rules.includes.iter().any(|i| i.pats == pats) {
+                    // The inclusion, at the place the link leads to.
+                    rules.includes.push(Inc { pats, spelled });
+                    grew = true;
+                }
+            }
             for i in hit.rules {
                 let from = rules.rules[i].clone();
                 let mut pats: Vec<Pat> =
@@ -1005,17 +1243,38 @@ pub fn plan_resolved(tree: &mut dyn Tree, rules: &Rules) -> Result<(Vec<Node>, R
     ))
 }
 
-/// Walk one container. `alive` are the rules whose first `rel.len()`
-/// components matched the path so far.
+/// What the walk knows about the directory it is in.
+#[derive(Clone, Copy)]
+struct WalkCtx<'a> {
+    /// The exclusion rules whose first `rel.len()` components matched
+    /// the path so far.
+    alive: &'a [usize],
+    /// The inclusions whose first `rel.len()` components matched the
+    /// path so far, and that reach further down.
+    included: &'a [usize],
+    /// The directory lies inside an inclusion: its children are
+    /// readable, but for the exclusions.
+    inside: bool,
+    /// The directory is, or lies inside, an ungranted-only exclusion:
+    /// nothing in it is granted.
+    bare: bool,
+}
+
+/// Walk one container.
 fn walk(
     tree: &mut dyn Tree,
     rules: &Rules,
     rel: &[String],
     entries: Vec<Entry>,
-    alive: &[usize],
-    bare: bool,
+    ctx: WalkCtx<'_>,
     found: &mut Found,
 ) {
+    let WalkCtx {
+        alive,
+        included,
+        inside,
+        bare,
+    } = ctx;
     let depth = rel.len();
     let node = |name: &str, is_dir: bool, kind: Kind| Node {
         rel: rel.iter().cloned().chain([name.to_owned()]).collect(),
@@ -1032,6 +1291,11 @@ fn walk(
             .copied()
             .filter(|&i| e.name.matched_by(&rules.rules[i].pats[depth]))
             .collect();
+        let inc_next: Vec<usize> = included
+            .iter()
+            .copied()
+            .filter(|&i| e.name.matched_by(&rules.includes[i].pats[depth]))
+            .collect();
         if let Some(why) = &e.skip {
             found.nodes.push(Node {
                 note: Some(why.clone()),
@@ -1039,10 +1303,11 @@ fn walk(
             });
             // Nothing is written on it. If rules point at or through
             // it and it leads somewhere, they follow it there.
-            if e.link && !next.is_empty() {
+            if e.link && (!next.is_empty() || !inc_next.is_empty()) {
                 found.hits.push(LinkHit {
                     rel: rel.iter().cloned().chain([name.to_owned()]).collect(),
                     rules: next,
+                    includes: inc_next,
                 });
             }
             continue;
@@ -1077,7 +1342,15 @@ fn walk(
                 match tree.list(&child) {
                     Ok(children) => {
                         found.nodes.push(node(name, true, Kind::Ungranted));
-                        walk(tree, rules, &child, children, &deeper, true, found);
+                        // An inclusion reaching into it grants nothing
+                        // there: only the exclusions are looked for.
+                        let below = WalkCtx {
+                            alive: &deeper,
+                            included: &[],
+                            inside: false,
+                            bare: true,
+                        };
+                        walk(tree, rules, &child, children, below, found);
                     }
                     Err(why) => found.nodes.push(Node {
                         note: Some(why),
@@ -1089,27 +1362,54 @@ fn walk(
             }
             continue;
         }
+        // Inside an inclusion from here on if one ends at this entry;
+        // the inclusions that reach further go on down.
+        let inside = inside
+            || inc_next
+                .iter()
+                .any(|&i| rules.includes[i].pats.len() == depth + 1);
         if !e.is_dir {
-            let readable = if depth == 0 {
+            // A file is readable inside an inclusion, or as an inclusion
+            // itself; in the profile root, by name as well.
+            let by_name = depth == 0 && {
                 let n = norm_component(name);
                 READABLE_ROOT_FILES.iter().any(|f| norm_component(f) == n)
-            } else {
-                true
             };
-            if readable {
+            if inside || by_name {
                 found.nodes.push(node(name, false, Kind::File));
             }
             continue;
         }
+        let inc_deeper: Vec<usize> = inc_next
+            .iter()
+            .copied()
+            .filter(|&i| rules.includes[i].pats.len() > depth + 1)
+            .collect();
         if next.is_empty() {
-            found.nodes.push(node(name, true, Kind::Granted));
-            continue;
+            // No exclusion can lie beneath it: granted whole where it is
+            // readable; a container where an inclusion lies deeper;
+            // otherwise left alone, with no entry at all.
+            if inside {
+                found.nodes.push(node(name, true, Kind::Granted));
+                continue;
+            }
+            if inc_deeper.is_empty() {
+                continue;
+            }
         }
+        // An exclusion or an inclusion could lie beneath it: a container,
+        // whose children are looked at one by one.
         let child: Vec<String> = rel.iter().cloned().chain([name.to_owned()]).collect();
         match tree.list(&child) {
             Ok(children) => {
                 found.nodes.push(node(name, true, Kind::Container));
-                walk(tree, rules, &child, children, &next, false, found);
+                let down = WalkCtx {
+                    alive: &next,
+                    included: &inc_deeper,
+                    inside,
+                    bare: false,
+                };
+                walk(tree, rules, &child, children, down, found);
             }
             Err(why) => found.nodes.push(Node {
                 note: Some(why),
@@ -1582,19 +1882,32 @@ mod tests {
 
         /// `path` with every link on the way resolved, as the final
         /// path of a real open is; `None` for outside the profile or
-        /// a cycle.
+        /// a cycle. Names are matched as the file system matches
+        /// them: whatever their case, trailing dots and spaces dropped.
         fn real(&self, path: &str) -> Option<String> {
+            let same = |a: &str, b: &str| {
+                let (a, b) = (split_path(a), split_path(b));
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(&b)
+                        .all(|(x, y)| norm_component(x) == norm_component(y))
+            };
             let mut cur = path.to_owned();
             for _ in 0..32 {
                 let comps = split_path(&cur);
                 let hit = (1..=comps.len())
                     .map(|n| comps[..n].join("\\"))
-                    .find(|prefix| self.links.contains_key(prefix));
-                let Some(prefix) = hit else {
+                    .find_map(|prefix| {
+                        self.links
+                            .keys()
+                            .find(|k| same(k, &prefix))
+                            .map(|k| (prefix.len(), k.clone()))
+                    });
+                let Some((cut, prefix)) = hit else {
                     return Some(cur);
                 };
                 let target = self.links[&prefix].clone()?;
-                let rest = &cur[prefix.len()..];
+                let rest = &cur[cut..];
                 cur = format!("{target}{rest}")
                     .trim_start_matches('\\')
                     .to_owned();
@@ -1627,7 +1940,7 @@ mod tests {
     }
 
     fn rules() -> Rules {
-        Rules::new(None, None, &[])
+        Rules::new(None, None, &[], &[])
     }
 
     fn kinds(nodes: &[Node]) -> BTreeMap<String, (Kind, bool)> {
@@ -1654,6 +1967,8 @@ mod tests {
         let mut t = Mem::default();
         t.add(r"Documents\notes.txt")
             .add(r"source\repo\a.rs")
+            .add(r"scoop\shims\rg.exe")
+            .add(r".local\bin\uv.exe")
             .add(".npmrc")
             .add(".gitconfig")
             .add(".netrc")
@@ -1684,10 +1999,15 @@ mod tests {
         };
         let absent = |p: &str| assert!(!k.contains_key(p), "{p} is in the plan");
         is("", Kind::Container);
-        is("Documents", Kind::Granted);
-        is("source", Kind::Granted);
-        is(".m2", Kind::Granted);
+        // Unlisted: no entry, and nothing beneath.
+        absent("Documents");
         absent(r"Documents\notes.txt");
+        absent("source");
+        // Listed, with no exclusion beneath: granted whole.
+        is("scoop", Kind::Granted);
+        absent(r"scoop\shims");
+        is(".local", Kind::Granted);
+        is(".m2", Kind::Granted);
         is(".npmrc", Kind::File);
         is(".gitconfig", Kind::File);
         absent("stray.txt");
@@ -1711,16 +2031,21 @@ mod tests {
         is(r"AppData\Roaming\npm", Kind::Granted);
         is(r"AppData\Roaming\Microsoft", Kind::Container);
         is(r"AppData\Roaming\Microsoft\Credentials", Kind::Denied);
-        is(r"AppData\Roaming\Microsoft\Windows", Kind::Granted);
+        // Beside the excluded store, unlisted: nothing.
+        absent(r"AppData\Roaming\Microsoft\Windows");
         is(r"AppData\Local", Kind::Container);
         is(r"AppData\Local\Temp", Kind::Ungranted);
         absent(r"AppData\Local\Temp\t.tmp");
+        // Listed, but an embedded browser profile could lie beneath:
+        // a container whose children are granted one by one.
         is(r"AppData\Local\Programs", Kind::Container);
         is(r"AppData\Local\Programs\Python", Kind::Granted);
+        // Unlisted, with the same wildcard beneath: a container for
+        // the deny, and its files are not granted.
         is(r"AppData\Local\SomeApp", Kind::Container);
         is(r"AppData\Local\SomeApp\EBWebView", Kind::Denied);
-        is(r"AppData\Local\SomeApp\data.bin", Kind::File);
-        is(r"AppData\LocalLow", Kind::Granted);
+        absent(r"AppData\Local\SomeApp\data.bin");
+        absent(r"AppData\LocalLow");
         assert_eq!(k.get(".aws"), Some(&(Kind::Denied, true)));
         assert_eq!(k.get(".config\\gcloud"), Some(&(Kind::Denied, true)));
         assert_eq!(
@@ -1764,7 +2089,7 @@ mod tests {
     #[test]
     fn an_ungranted_only_directory_is_left_bare_but_for_protected_paths_inside() {
         let extra = vec![split_path(r"AppData\Local\Temp\app\keys")];
-        let rules = Rules::new(None, None, &extra);
+        let rules = Rules::new(None, None, &extra, &[]);
         let mut t = Mem::default();
         t.add(r"AppData\Local\Temp\loose.txt")
             .add(r"AppData\Local\Temp\session-1\work\f.txt")
@@ -1810,6 +2135,7 @@ mod tests {
         let (nodes, rules) = plan_resolved(&mut t, &rules()).unwrap();
         let k = kinds(&nodes);
         let is = |p: &str, kind: Kind| assert_eq!(k.get(p).map(|v| v.0), Some(kind), "{p}");
+        let absent = |p: &str| assert!(!k.contains_key(p), "{p} is in the plan");
         is(".ssh", Kind::Skipped);
         is(".config", Kind::Skipped);
         is("dotfiles", Kind::Container);
@@ -1818,11 +2144,21 @@ mod tests {
         is(r"dotfiles\.config\gh", Kind::Denied);
         is(r"dotfiles\.config\git", Kind::Container);
         is(r"dotfiles\.config\git\credentials", Kind::Denied);
+        // `.config` is an inclusion: it follows the link too, so the
+        // configuration behind it is readable, and only that.
         is(r"dotfiles\.config\git\config", Kind::File);
         is(r"dotfiles\.config\nvim", Kind::Granted);
-        is(r"dotfiles\README", Kind::File);
-        is("Documents", Kind::Granted);
+        absent(r"dotfiles\README");
+        absent("Documents");
         assert!(!k.contains_key(r"dotfiles\.ssh\id_ed25519"));
+        assert!(rules.included(&names(&split_path(r"dotfiles\.config\nvim\init.lua"))));
+        assert!(!rules.included(&names(&split_path(r"dotfiles\README"))));
+        assert!(
+            rules
+                .spelled_included()
+                .iter()
+                .any(|s| s == r"dotfiles\.config")
+        );
         let spelled = rules.spelled();
         for want in [
             r"dotfiles\.ssh",
@@ -1841,7 +2177,7 @@ mod tests {
             .add(r"dotfiles\.ssh\id_ed25519")
             .add(r"dotfiles\README");
         let k = kinds(&plan(&mut plain, &super::tests::rules()).unwrap());
-        assert_eq!(k.get("dotfiles").map(|v| v.0), Some(Kind::Granted));
+        assert!(!k.contains_key("dotfiles"));
     }
 
     /// A link's destination is worked out from the link's own data,
@@ -1947,7 +2283,7 @@ mod tests {
         let k = kinds(&nodes);
         assert_eq!(k.get("dotfiles").map(|v| v.0), Some(Kind::Container));
         assert_eq!(k.get(r"dotfiles\.ssh"), Some(&(Kind::Denied, true)));
-        assert_eq!(k.get(r"dotfiles\README").map(|v| v.0), Some(Kind::File));
+        assert!(!k.contains_key(r"dotfiles\README"));
         assert!(rules.excludes(&names(&split_path(r"dotfiles\.ssh\id_new"))));
         let mut t = Mem::default();
         t.add(r"Documents\a.txt");
@@ -1970,7 +2306,7 @@ mod tests {
         let k = kinds(&plan(&mut t, &super::tests::rules()).unwrap());
         assert_eq!(k.get(".ssh").map(|v| v.0), Some(Kind::Skipped));
         assert_eq!(k.get("").map(|v| v.0), Some(Kind::Container));
-        assert_eq!(k.get("Documents").map(|v| v.0), Some(Kind::Granted));
+        assert!(!k.contains_key("Documents"));
     }
 
     /// A rule carried over to a link's target keeps the source rule's
@@ -1990,6 +2326,11 @@ mod tests {
         assert!(!state.stamp, "the state directory is left to its owner");
         let creds = by(&nodes, r"data\Local\Microsoft\Credentials");
         assert!(creds.kind == Kind::Denied && creds.stamp);
+        // The inclusions of the local application data follow the
+        // link as well: a per-user install behind it is readable.
+        assert_eq!(by(&nodes, r"data\Local\Programs").kind, Kind::Container);
+        assert_eq!(by(&nodes, r"data\Local\Programs\tool.exe").kind, Kind::File);
+        assert!(rules.included(&names(&split_path(r"data\Local\Programs\x"))));
         assert!(rules.ungranted(&names(&split_path(r"data\Local\Temp"))));
         assert!(!rules.excludes(&names(&split_path(r"data\Local\Temp"))));
         assert!(rules.rules.len() > original.rules.len());
@@ -2019,8 +2360,9 @@ mod tests {
         let k = kinds(&nodes);
         assert_eq!(k.get(r"b\gh").map(|v| v.0), Some(Kind::Denied));
         assert_eq!(k.get("b").map(|v| v.0), Some(Kind::Container));
-        assert_eq!(k.get(r"b\keep.txt").map(|v| v.0), Some(Kind::File));
+        assert!(!k.contains_key(r"b\keep.txt"));
         assert_eq!(k.get(r"a\cfg").map(|v| v.0), Some(Kind::Container));
+        assert_eq!(k.get(r"a\cfg\other").map(|v| v.0), Some(Kind::Granted));
         assert_eq!(k.get(r"a\cfg\gh").map(|v| v.0), Some(Kind::Skipped));
         assert!(rules.spelled().iter().any(|s| s == r"b\gh"));
 
@@ -2037,7 +2379,7 @@ mod tests {
         let (nodes, rules) = plan_resolved(&mut t, &super::tests::rules()).unwrap();
         let k = kinds(&nodes);
         assert_eq!(k.get(".ssh").map(|v| v.0), Some(Kind::Skipped));
-        assert_eq!(k.get("Documents").map(|v| v.0), Some(Kind::Granted));
+        assert!(!k.contains_key("Documents"));
         assert_eq!(rules.spelled(), super::tests::rules().spelled());
 
         let mut t = Mem::default();
@@ -2047,11 +2389,29 @@ mod tests {
         assert_eq!(k.get(".aws").map(|v| v.0), Some(Kind::Skipped));
 
         let mut t = Mem::default();
-        t.add(r"work\x");
-        t.link("shortcut", Some("work"));
+        t.add(r"work\x").add(r"tools\x");
+        t.link("shortcut", Some("work")).link("go", Some("tools"));
         let (nodes, rules) = plan_resolved(&mut t, &super::tests::rules()).unwrap();
-        assert_eq!(kinds(&nodes).get("work").map(|v| v.0), Some(Kind::Granted));
+        let k = kinds(&nodes);
+        assert!(!k.contains_key("work"));
+        assert_eq!(k.get("go").map(|v| v.0), Some(Kind::Skipped));
+        assert_eq!(k.get("tools").map(|v| v.0), Some(Kind::Granted));
         assert_eq!(rules.spelled(), super::tests::rules().spelled());
+        assert!(rules.spelled_included().iter().any(|s| s == "tools"));
+
+        // An inclusion that is a link to the profile itself grants
+        // nothing, and is no error.
+        let mut t = Mem::default();
+        t.add(r"Documents\a.txt");
+        t.link("go", Some(""));
+        let (nodes, rules) = plan_resolved(&mut t, &super::tests::rules()).unwrap();
+        let k = kinds(&nodes);
+        assert_eq!(k.get("go").map(|v| v.0), Some(Kind::Skipped));
+        assert!(!k.contains_key("Documents"));
+        assert_eq!(
+            rules.spelled_included(),
+            super::tests::rules().spelled_included()
+        );
 
         let mut t = Mem::default();
         t.link(".ssh", Some(""));
@@ -2072,7 +2432,7 @@ mod tests {
             }
             t
         };
-        let with_long = Rules::new(None, None, std::slice::from_ref(&long));
+        let with_long = Rules::new(None, None, std::slice::from_ref(&long), &[]);
         assert!(plan(&mut chain(hops), &with_long).is_err());
         let (nodes, rules) = plan_resolved(&mut chain(3), &with_long).unwrap();
         assert_eq!(kinds(&nodes).get("h3").map(|v| v.0), Some(Kind::Container));
@@ -2174,6 +2534,7 @@ mod tests {
                 vec!["MYSECR~1".to_owned()],
                 vec!["Long Secret Dir".to_owned()],
             ],
+            &[],
         );
         assert!(r.excludes(&[short("My Secrets", "MYSECR~1")]));
         assert!(r.excludes(&[short("Long Secret Dir", "LONGSE~1")]));
@@ -2208,7 +2569,7 @@ mod tests {
         ] {
             assert!(rel_components(profile, bad).is_err(), "{bad}");
         }
-        let r = Rules::new(None, None, &[vec![".myapp".to_owned()], vec![]]);
+        let r = Rules::new(None, None, &[vec![".myapp".to_owned()], vec![]], &[]);
         assert!(r.excludes(&names(&split_path(r".MyApp\token"))));
         assert!(!r.excludes(&names(&split_path("Documents"))));
         assert!(r.excludes(&names(&split_path(".ssh"))));
@@ -2237,13 +2598,22 @@ mod tests {
     #[test]
     fn application_data_entries_follow_the_known_folders() {
         let moved = ["Data".to_owned(), "Roam".to_owned()];
-        let r = Rules::new(Some(&moved), None, &[]);
+        let r = Rules::new(Some(&moved), None, &[], &[]);
         let ex = |p: &str| r.excludes(&names(&split_path(p)));
         assert!(ex(r"Data\Roam\Microsoft\Credentials"));
         assert!(ex(r"Data\Roam\gcloud"));
         assert!(ex(r"AppData\Roaming\Microsoft\Credentials"));
         assert!(r.ungranted(&names(&split_path(r"AppData\Local\Temp"))));
         assert!(!ex(r"Data\Roam\npm"));
+        // The inclusions are placed the same way.
+        let inc = |p: &str| r.included(&names(&split_path(p)));
+        assert!(inc(r"Data\Roam\npm\tool.cmd"));
+        assert!(inc(r"AppData\Roaming\npm"));
+        assert!(!inc(r"Data\Roam\Anthropic"));
+        assert!(!inc(r"Data\Roam"));
+        assert!(r.could_include_beneath(&names(&split_path(r"Data\Roam"))));
+        assert!(r.could_include_beneath(&names(&split_path("Data"))));
+        assert!(!r.could_include_beneath(&names(&split_path("Documents"))));
         let r = rules();
         for (base, path) in [
             (Roaming, "gcloud"),
@@ -2297,6 +2667,11 @@ mod tests {
             && !e.path.starts_with('\\')
             && !e.path.contains('/')
             && !e.path.contains(':')));
+        assert!(INCLUDED.iter().all(|i| !i.path.is_empty()
+            && !i.path.starts_with('\\')
+            && !i.path.contains('/')
+            && !i.path.contains(':')
+            && !i.path.contains('*')));
         for tool in [
             r".pulumi\bin\pulumi.exe",
             r".fly\bin\flyctl.exe",
@@ -2367,6 +2742,12 @@ mod tests {
         ".myapp",
         "tokens",
         "keys",
+        "bin",
+        "tools",
+        "Programs",
+        "scoop",
+        ".local",
+        "npm",
     ];
 
     fn random_tree(rng: &mut Rng) -> Mem {
@@ -2418,7 +2799,8 @@ mod tests {
 
     /// The invariant, over generated trees: no excluded path — on
     /// disk now or created later — has an ancestor carrying an
-    /// inheriting allow, and nothing excluded is granted itself.
+    /// inheriting allow, nothing excluded is granted itself, and
+    /// nothing is granted outside the inclusions.
     #[test]
     fn no_exclusion_ever_lies_beneath_an_inheriting_allow() {
         let extra = vec![
@@ -2426,12 +2808,20 @@ mod tests {
             vec!["Documents".to_owned(), "a".to_owned()],
             split_path(r"AppData\Local\Temp\keys"),
         ];
-        let rules = Rules::new(None, None, &extra);
+        // Added inclusions above an added exclusion, beside one, and
+        // deep under an unlisted name.
+        let include = vec![
+            vec!["Documents".to_owned()],
+            vec![".myapp".to_owned(), "bin".to_owned()],
+            split_path(r"src\tools\bin"),
+        ];
+        let rules = Rules::new(None, None, &extra, &include);
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let original = rules;
         for round in 0..600 {
             let mut t = random_tree(&mut rng);
-            let (nodes, rules) = plan_resolved(&mut t, &original).unwrap();
+            let (nodes, rules) = plan_resolved(&mut t, &original)
+                .unwrap_or_else(|e| panic!("round {round}: {e}; links {:?}", t.links));
             for (n, d) in rules.rules.iter().enumerate().skip(original.rules.len()) {
                 assert!(
                     rules.rules[..n].iter().any(|r| {
@@ -2457,13 +2847,33 @@ mod tests {
                             !rules.could_exclude_beneath(&rel),
                             "round {round}: an exclusion can lie beneath granted {path}"
                         );
+                        assert!(
+                            rules.included(&rel),
+                            "round {round}: {path} is granted outside the inclusions"
+                        );
                     }
-                    Kind::File => assert!(!rules.excludes(&rel), "round {round}: {path}"),
+                    Kind::File => {
+                        assert!(!rules.excludes(&rel), "round {round}: {path}");
+                        let by_name = n.rel.len() == 1
+                            && READABLE_ROOT_FILES
+                                .iter()
+                                .any(|f| norm_component(f) == norm_component(&n.rel[0]));
+                        assert!(
+                            by_name || rules.included(&rel),
+                            "round {round}: {path} is granted outside the inclusions"
+                        );
+                    }
                     Kind::Denied => assert!(rules.excludes(&rel), "round {round}: {path}"),
                     Kind::Ungranted => {
                         assert!(rules.ungranted(&rel), "round {round}: {path}");
                         assert!(!rules.excludes(&rel), "round {round}: {path}");
                     }
+                    // A container is on the way to an exclusion or an
+                    // inclusion.
+                    Kind::Container if !n.rel.is_empty() => assert!(
+                        rules.could_exclude_beneath(&rel) || rules.could_include_beneath(&rel),
+                        "round {round}: {path} is a container with nothing beneath it to reach"
+                    ),
                     Kind::Container | Kind::Skipped => {}
                 }
                 if rules.ungranted(&rel) {
@@ -2544,13 +2954,44 @@ mod tests {
                 for e in entries {
                     let mut rel = parent.clone();
                     rel.push(e.name.long.clone());
+                    let path = rel.join("\\");
                     if rules.excludes(&names(&rel)) {
-                        let k = by_rel[&rel.join("\\")].kind;
+                        let k = by_rel[&path].kind;
                         assert!(
                             matches!(k, Kind::Denied | Kind::Skipped),
-                            "round {round}: excluded {} planned as {k:?}",
-                            rel.join("\\")
+                            "round {round}: excluded {path} planned as {k:?}"
                         );
+                        continue;
+                    }
+                    if rules.ungranted(&names(&rel)) {
+                        continue;
+                    }
+                    // Everything included is in the plan, and nothing
+                    // that is neither included nor on the way to a rule.
+                    let included = rules.included(&names(&rel));
+                    let on_the_way = e.is_dir
+                        && (rules.could_include_beneath(&names(&rel))
+                            || rules.could_exclude_beneath(&names(&rel)));
+                    let by_name = rel.len() == 1
+                        && !e.is_dir
+                        && READABLE_ROOT_FILES
+                            .iter()
+                            .any(|f| norm_component(f) == norm_component(&rel[0]));
+                    match by_rel.get(&path).map(|n| n.kind) {
+                        Some(Kind::Skipped) => {}
+                        Some(Kind::Granted | Kind::File) => assert!(
+                            included || by_name,
+                            "round {round}: {path} is readable though not included"
+                        ),
+                        Some(Kind::Container) => assert!(
+                            on_the_way,
+                            "round {round}: {path} is a container with nothing to reach"
+                        ),
+                        Some(k) => panic!("round {round}: {path} planned as {k:?}"),
+                        None => assert!(
+                            !included && !on_the_way && !by_name,
+                            "round {round}: included {path} is not in the plan"
+                        ),
                     }
                 }
             }
@@ -2774,6 +3215,297 @@ mod tests {
         assert_eq!(kind(r".cargo\registry"), Some(Kind::Granted));
         assert_eq!(kind(r".cargo\config.toml"), Some(Kind::File));
         assert_eq!(kind(r".cargo\credentials.toml"), Some(Kind::Denied));
+        // The same for Gradle and the XDG-style configuration.
+        let mut t = Mem::default();
+        t.add(r".gradle\enterprise\keys.properties")
+            .add(r".gradle\gradle.properties")
+            .add(r".gradle\caches\x")
+            .add(r".config\gh\hosts.yml")
+            .add(r".config\nvim\init.lua")
+            .add(r".config\starship.toml");
+        let k = kinds(&plan(&mut t, &rules()).unwrap());
+        let kind = |p: &str| k.get(p).map(|v| v.0);
+        assert_eq!(kind(".gradle"), Some(Kind::Container));
+        assert_eq!(kind(r".gradle\enterprise"), Some(Kind::Container));
+        assert_eq!(
+            kind(r".gradle\enterprise\keys.properties"),
+            Some(Kind::Denied)
+        );
+        assert_eq!(kind(r".gradle\gradle.properties"), Some(Kind::File));
+        assert_eq!(kind(r".gradle\caches"), Some(Kind::Granted));
+        assert_eq!(kind(".config"), Some(Kind::Container));
+        assert_eq!(kind(r".config\gh"), Some(Kind::Denied));
+        assert_eq!(kind(r".config\nvim"), Some(Kind::Granted));
+        assert_eq!(kind(r".config\starship.toml"), Some(Kind::File));
+    }
+
+    /// What a typical profile looks like under the inclusions: the
+    /// per-user tools are readable, whole; the user's documents, the
+    /// data of applications the list does not name, and files beside
+    /// an excluded store get no entry at all.
+    #[test]
+    fn nothing_is_granted_outside_the_inclusions() {
+        let mut t = Mem::default();
+        t.add(r"Documents\notes.txt")
+            .add(r"Documents\proj\src\main.rs")
+            .add(r"Desktop\a.lnk")
+            .add(r"Downloads\setup.exe")
+            .add(r"source\repos\app\app.csproj")
+            .add(r"OneDrive\f.docx")
+            .add(r"stray.txt")
+            .add(".npmrc")
+            .add(r"AppData\Roaming\Anthropic\creds.json")
+            .add(r"AppData\Roaming\Code\User\settings.json")
+            .add(r"AppData\Roaming\Microsoft\Windows\Start Menu\a.lnk")
+            .add(r"AppData\Roaming\npm\tool.cmd")
+            .add(r"AppData\Roaming\uv\python\cpython-3.13\python.exe")
+            .add(r"AppData\Local\SomeApp\data.bin")
+            .add(r"AppData\Local\Programs\Python\Python313\python.exe")
+            .add(r"AppData\Local\Microsoft\WinGet\Links\rg.exe")
+            .add(r"AppData\Local\Microsoft\Edge\User Data\Default\Cookies")
+            .add(r"AppData\Local\Microsoft\Windows\Explorer\thumbcache.db")
+            .add(r"AppData\Local\Temp\t.tmp")
+            .add(r"AppData\LocalLow\x")
+            .add(r"scoop\shims\x.exe")
+            .add(r".local\bin\uv.exe")
+            .add(r".nuget\packages\a\1.0\a.dll")
+            .add(r".vscode\extensions\e\x");
+        let nodes = plan(&mut t, &rules()).unwrap();
+        let k = kinds(&nodes);
+        let is = |p: &str, kind: Kind| {
+            assert_eq!(k.get(p).map(|v| v.0), Some(kind), "{p}");
+        };
+        let absent = |p: &str| assert!(!k.contains_key(p), "{p} is in the plan");
+        is("", Kind::Container);
+        is(".npmrc", Kind::File);
+        for unlisted in [
+            "Documents",
+            "Desktop",
+            "Downloads",
+            "source",
+            "OneDrive",
+            "stray.txt",
+            ".vscode",
+            r"AppData\Roaming\Anthropic",
+            r"AppData\Roaming\Code",
+            r"AppData\Roaming\Microsoft\Windows",
+            r"AppData\Local\SomeApp\data.bin",
+            r"AppData\Local\Microsoft\Windows\Explorer",
+            r"AppData\LocalLow",
+        ] {
+            absent(unlisted);
+        }
+        assert!(!k.keys().any(|p| p.starts_with("Documents")));
+        // On the way to the inclusions and the exclusions: containers.
+        for container in [
+            "AppData",
+            r"AppData\Roaming",
+            r"AppData\Roaming\Microsoft",
+            r"AppData\Local",
+            r"AppData\Local\Microsoft",
+            r"AppData\Local\Microsoft\Windows",
+            r"AppData\Local\Programs",
+            r"AppData\Local\Microsoft\WinGet",
+            r"AppData\Local\SomeApp",
+        ] {
+            is(container, Kind::Container);
+        }
+        is(r"AppData\Local\Microsoft\Edge\User Data", Kind::Denied);
+        is(r"AppData\Local\Temp", Kind::Ungranted);
+        // The inclusions, whole.
+        for granted in [
+            "scoop",
+            ".local",
+            ".nuget",
+            r"AppData\Roaming\npm",
+            r"AppData\Roaming\uv",
+            r"AppData\Local\Programs\Python",
+            r"AppData\Local\Microsoft\WinGet\Links",
+        ] {
+            is(granted, Kind::Granted);
+        }
+        absent(r"scoop\shims");
+        absent(r"AppData\Local\Programs\Python\Python313");
+        // A session may still grant itself an unlisted directory: the
+        // record it is measured against holds only the exclusions.
+        let p = |rel: &str| format!(r"\\?\C:\Users\me\{rel}");
+        let r = rules();
+        let protected: Vec<String> = r.spelled().iter().map(|s| p(s)).collect();
+        let ungranted: Vec<String> = r.spelled_ungranted().iter().map(|s| p(s)).collect();
+        let empty = |_: &str| Listing::Nothing;
+        for rel in [
+            "Documents",
+            r"Documents\proj",
+            r"AppData\Roaming\Code",
+            "source",
+        ] {
+            assert_eq!(
+                session_grant_refusal(&p(rel), false, &protected, &ungranted, &[], &empty),
+                None,
+                "{rel}"
+            );
+            assert_eq!(
+                session_grant_refusal(&p(rel), true, &protected, &ungranted, &[], &empty),
+                None,
+                "{rel}"
+            );
+        }
+    }
+
+    /// An inclusion added by configuration opens a directory, whole,
+    /// or one file; and is matched as an exclusion is.
+    #[test]
+    fn an_added_inclusion_opens_a_directory_or_a_file() {
+        let include = vec![
+            split_path("Documents"),
+            split_path(r"AppData\Roaming\tool\settings.json"),
+            vec!["LONGTO~1".to_owned()],
+            vec!["Tools. ".to_owned()],
+            vec![],
+        ];
+        let r = Rules::new(None, None, &[], &include);
+        let mut t = Mem::default();
+        t.add(r"Documents\notes.txt")
+            .add(r"Documents\sub\x")
+            .add(r"AppData\Roaming\tool\settings.json")
+            .add(r"AppData\Roaming\tool\other.txt")
+            .add(r"AppData\Roaming\tool\cache\x")
+            .add(r"Long Tool Dir\x")
+            .add(r"tools\x")
+            .add(r"Desktop\a");
+        t.entry_mut("Long Tool Dir").name.short = Some("LONGTO~1".into());
+        let k = kinds(&plan(&mut t, &r).unwrap());
+        let kind = |p: &str| k.get(p).map(|v| v.0);
+        assert_eq!(kind("Documents"), Some(Kind::Granted));
+        assert!(!k.contains_key(r"Documents\sub"));
+        assert_eq!(kind(r"AppData\Roaming\tool"), Some(Kind::Container));
+        assert_eq!(
+            kind(r"AppData\Roaming\tool\settings.json"),
+            Some(Kind::File)
+        );
+        assert!(!k.contains_key(r"AppData\Roaming\tool\other.txt"));
+        assert!(!k.contains_key(r"AppData\Roaming\tool\cache"));
+        assert_eq!(kind("Long Tool Dir"), Some(Kind::Granted));
+        assert_eq!(kind("tools"), Some(Kind::Granted));
+        assert!(!k.contains_key("Desktop"));
+        let spelled = r.spelled_included();
+        assert!(spelled.iter().any(|s| s == "Documents"));
+        assert!(
+            spelled
+                .iter()
+                .any(|s| s == r"AppData\Roaming\tool\settings.json")
+        );
+        assert!(
+            spelled.iter().any(|s| s == "scoop"),
+            "the built-in list stays"
+        );
+        assert!(!spelled.iter().any(|s| s.is_empty()));
+        let inc = |p: &str| r.included(&names(&split_path(p)));
+        assert!(inc(r"DOCUMENTS\x"));
+        assert!(inc(r"tools\y"));
+        assert!(!inc("Desktop"));
+        assert!(!inc(r"AppData\Roaming\tool"));
+        assert!(inc(r"AppData\Roaming\tool\SETTINGS.JSON"));
+        // An exclusion beneath an added inclusion keeps its deny, and the
+        // inclusion is a container then.
+        let r = Rules::new(
+            None,
+            None,
+            &[split_path(r"Documents\secret")],
+            &[split_path("Documents")],
+        );
+        let mut t = Mem::default();
+        t.add(r"Documents\notes.txt")
+            .add(r"Documents\secret\k")
+            .add(r"Documents\sub\x");
+        let k = kinds(&plan(&mut t, &r).unwrap());
+        let kind = |p: &str| k.get(p).map(|v| v.0);
+        assert_eq!(kind("Documents"), Some(Kind::Container));
+        assert_eq!(kind(r"Documents\notes.txt"), Some(Kind::File));
+        assert_eq!(kind(r"Documents\secret"), Some(Kind::Denied));
+        assert_eq!(kind(r"Documents\sub"), Some(Kind::Granted));
+    }
+
+    /// Which paths may be added as inclusions: not an exclusion or
+    /// anything inside one, not the temporary directory or anything
+    /// inside it; a directory above an exclusion may, and is granted
+    /// child by child.
+    #[test]
+    fn an_added_inclusion_is_measured_against_the_exclusions() {
+        let p = |rel: &str| format!(r"\\?\C:\Users\me\{rel}");
+        let protected = vec![
+            p(".ssh"),
+            p(r"AppData\Local\*\EBWebView"),
+            p("NTUSER.DAT*"),
+            p(r".cargo\credentials.toml"),
+            p(r"AppData\Local\Temp\keys"),
+        ];
+        let ungranted = vec![p(r"AppData\Local\Temp")];
+        let refusal = |rel: &str| include_refusal(&p(rel), &protected, &ungranted);
+        for refused in [
+            ".ssh",
+            r".SSH.\keys",
+            r".ssh\sub\deeper",
+            r"AppData\Local\App\EBWebView",
+            r"AppData\Local\App\EBWebView\Default",
+            "ntuser.dat.LOG1",
+            r".cargo\credentials.toml",
+            r"AppData\Local\Temp",
+            r"AppData\Local\Temp\session",
+            r"AppData\Local\Temp\keys",
+        ] {
+            let why = refusal(refused).unwrap_or_else(|| panic!("{refused} was admitted"));
+            assert!(why.contains(&p(refused)), "{why}");
+        }
+        for admitted in [
+            ".cargo",
+            ".sshx",
+            "Documents",
+            r"AppData\Local\App",
+            r"AppData\Local",
+            "AppData",
+            r"Documents\.ssh",
+        ] {
+            assert_eq!(refusal(admitted), None, "{admitted}");
+        }
+    }
+
+    /// No built-in inclusion is, or lies inside, a built-in exclusion
+    /// or the temporary directory, at either placement of the
+    /// application-data folders; and the configuration files that are
+    /// readable by design are reached through the inclusions.
+    #[test]
+    fn the_built_in_inclusions_stand_clear_of_the_exclusions() {
+        let moved_r = ["Data".to_owned(), "Roam".to_owned()];
+        let moved_l = ["Data".to_owned(), "Loc".to_owned()];
+        for r in [
+            rules(),
+            Rules::new(Some(&moved_r), Some(&moved_l), &[], &[]),
+        ] {
+            for s in r.spelled_included() {
+                let rel = names(&split_path(&s));
+                assert!(!r.excludes(&rel), "{s} is excluded");
+                assert!(!r.ungranted(&rel), "{s} is ungranted");
+            }
+        }
+        let r = rules();
+        for (base, path, _) in READABLE_CONFIG {
+            let prefix = match base {
+                Roaming => r"AppData\Roaming\",
+                Local => r"AppData\Local\",
+                Profile => "",
+            };
+            let full = format!("{prefix}{path}");
+            let rel = split_path(&full);
+            let by_name = rel.len() == 1
+                && READABLE_ROOT_FILES
+                    .iter()
+                    .any(|f| norm_component(f) == norm_component(&rel[0]));
+            assert!(
+                by_name || r.included(&names(&rel)),
+                "{full} is not reached by the inclusions"
+            );
+        }
     }
 
     #[test]
