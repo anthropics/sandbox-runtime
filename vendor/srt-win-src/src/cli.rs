@@ -477,11 +477,6 @@ enum ProfileCmd {
         /// `--include`: drop them all).
         #[arg(long)]
         replace_includes: bool,
-        /// An entry that could not be revoked leaves the grant
-        /// incomplete, so that no session starts on it. Without this
-        /// it is reported and the grant completes.
-        #[arg(long)]
-        refresh: bool,
         /// Print the result as one JSON object on stdout:
         /// `{profile, list_version, complete, containers, granted,
         /// files, denied, placeholders, placeholders_removed, writes,
@@ -499,6 +494,13 @@ enum ProfileCmd {
         #[cfg(feature = "test-hooks")]
         #[arg(long, value_name = "DIR")]
         test_profile: Option<String>,
+    },
+    /// Try again to revoke what the last run could not, on the paths
+    /// it noted alone. What still cannot be done stays noted.
+    RetryStale {
+        /// Print `{cleared, stale_allow}` on stdout.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove the grant: the sandbox group's entry from every
     /// recorded path (each DACL is left as it was before the grant),
@@ -2545,7 +2547,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     replace_excludes,
                     include,
                     replace_includes,
-                    refresh,
                     json,
                     quiet,
                     #[cfg(feature = "test-hooks")]
@@ -2588,7 +2589,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         replace_excludes,
                         include: &include,
                         replace_includes,
-                        refresh,
                     },
                     !quiet,
                 )
@@ -2649,6 +2649,34 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             );
             if json {
                 println!("{}", serde_json::to_string(&report)?);
+            }
+        }
+        Cmd::Profile {
+            sub: ProfileCmd::RetryStale { json },
+        } => {
+            use srt_win::{persist, profile, state_db};
+            if let Err(e) = srt_win::install::require_current_setup() {
+                eprintln!("srt-win: error: profile retry-stale: {e:#}");
+                std::process::exit(15);
+            }
+            let ids = persist::Ids::load()?;
+            let out = state_db::with_profile_lock(|db| {
+                exit_unless_quiet(
+                    db,
+                    None,
+                    EXIT_GRANT_BLOCKED_BY_SESSION,
+                    "profile retry-stale",
+                )?;
+                state_db::mark_profile_operation()?;
+                profile::retry_stale(&profile::Store::of(db.conn()), &ids)
+            })?;
+            eprintln!(
+                "srt-win: profile retry-stale — {} cleared, {} still stale",
+                out.cleared,
+                out.stale_allow.len()
+            );
+            if json {
+                println!("{}", serde_json::to_string(&out)?);
             }
         }
         Cmd::Profile {
@@ -3926,9 +3954,9 @@ mod tests {
         ));
         assert!(parse(&["srt-win", "profile", "grant", "--include"]).is_err());
         assert!(matches!(
-            parse(&["srt-win", "profile", "grant", "--refresh"]),
+            parse(&["srt-win", "profile", "retry-stale", "--json"]),
             Ok(Cmd::Profile {
-                sub: ProfileCmd::Grant { refresh: true, .. }
+                sub: ProfileCmd::RetryStale { json: true }
             })
         ));
         match parse(&[
