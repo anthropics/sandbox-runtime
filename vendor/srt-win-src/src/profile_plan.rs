@@ -290,8 +290,6 @@ pub const INCLUDED: &[Incl] = &[
     inc(Local, "Volta"),
     // pnpm: its home and store.
     inc(Local, "pnpm"),
-    // scoop: shims and apps.
-    inc(Profile, "scoop"),
     // Go: installed binaries and the module cache.
     inc(Profile, "go"),
     // .NET global tools and workloads, and a per-user SDK (dotnet-install).
@@ -302,8 +300,6 @@ pub const INCLUDED: &[Incl] = &[
     inc(Profile, ".deno"),
     // JDKs installed by the JetBrains IDEs.
     inc(Profile, ".jdks"),
-    // `.local\bin`: the launchers of uv, pipx and others.
-    inc(Profile, ".local"),
     // pipx: its environments.
     inc(Profile, "pipx"),
     // conda.
@@ -311,8 +307,6 @@ pub const INCLUDED: &[Incl] = &[
     inc(Profile, "anaconda3"),
     // NuGet: the packages a restore fetched.
     inc(Profile, ".nuget"),
-    // uv: the Pythons and tools it manages.
-    inc(Roaming, "uv"),
     // ─── Toolchain homes and configuration ───
     // Their binaries are found through PATH (`.cargo\bin`, pyenv's
     // shims, the Python user scripts); the configuration and caches in
@@ -340,8 +334,6 @@ pub const INCLUDED: &[Incl] = &[
     inc(Roaming, "NuGet"),
     // Python: the user site-packages and their scripts.
     inc(Roaming, "Python"),
-    // uv: its cache.
-    inc(Local, "uv"),
 ];
 
 /// The configuration files that are readable by design although they
@@ -1874,8 +1866,129 @@ pub fn revoke_action(
     }
 }
 
+/// What writing a planned path came to.
+#[derive(Debug)]
+pub enum Stamped {
+    Wrote,
+    Unchanged,
+    /// Left alone, for this reason: nothing on it was looked at or changed.
+    Skipped(&'static str),
+}
+
+impl Stamped {
+    /// Whether the object itself was brought to the plan.
+    pub fn reached_object(&self) -> bool {
+        !matches!(self, Stamped::Skipped(_))
+    }
+}
+
+/// Whether the recorded entry handed reading down, so that taking it off
+/// counts only once what it handed down is gone too. `Ungranted` is such
+/// a removal an earlier run could not finish.
+pub fn hands_reading_down(kind: Kind) -> bool {
+    matches!(kind, Kind::Granted | Kind::Ungranted)
+}
+
+/// Whether a recorded path may still carry an allow of ours that a
+/// sandboxed command can read through. `Ungranted`: its removal did not
+/// finish, so a copy of the entry may be left beneath it.
+pub fn may_carry_allow(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Container | Kind::Granted | Kind::File | Kind::Ungranted
+    )
+}
+
+/// Whether `profile forget` reports a path instead of failing on it: its
+/// volume cannot be reached and no file id says what to look for when it
+/// returns, so waiting would hold the forget open for good.
+pub fn forget_defers(volume_unreachable: bool, file_id_known: bool) -> bool {
+    volume_unreachable && !file_id_known
+}
+
+/// How long a bounded retry of stale entries leaves the last one to
+/// stand: nothing cheap says whether a stuck object has changed.
+pub const STALE_RETRY_INTERVAL_SECS: u64 = 6 * 60 * 60;
+
+/// Whether a bounded retry of stale entries is due. A clock that went
+/// backwards makes it due.
+pub fn stale_retry_due(last: Option<u64>, now: u64) -> bool {
+    last.is_none_or(|l| l > now || now - l >= STALE_RETRY_INTERVAL_SECS)
+}
+
+/// Whether a retry of stale entries looks at this one. A bounded retry
+/// runs while a session starts: it never waits on a network path, and
+/// starts nothing new once its budget is spent.
+pub fn stale_retry_attempts(bounded: bool, on_network: bool, past_budget: bool) -> bool {
+    !bounded || !(on_network || past_budget)
+}
+
+/// Whether a retry of stale entries names the lock as a profile
+/// operation, which fails a starting session at once. A bounded retry is
+/// short, so a session that meets it waits for the lock instead.
+pub fn stale_retry_marks_operation(bounded: bool) -> bool {
+    !bounded
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_revoke_is_checked_beneath_whenever_the_entry_handed_reading_down() {
+        use super::{Kind, hands_reading_down as down};
+        assert!(down(Kind::Granted));
+        assert!(down(Kind::Ungranted));
+        for k in [Kind::Container, Kind::File, Kind::Denied] {
+            assert!(!down(k), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn an_unfinished_revoke_still_counts_as_a_possible_allow() {
+        use super::{Kind, may_carry_allow as allow};
+        for k in [Kind::Container, Kind::Granted, Kind::File, Kind::Ungranted] {
+            assert!(allow(k), "{k:?}");
+        }
+        assert!(!allow(Kind::Denied));
+    }
+
+    #[test]
+    fn a_skipped_object_was_not_reached() {
+        use super::Stamped;
+        assert!(Stamped::Wrote.reached_object());
+        assert!(Stamped::Unchanged.reached_object());
+        assert!(!Stamped::Skipped("a reparse point").reached_object());
+    }
+
+    #[test]
+    fn forget_defers_only_what_it_could_never_look_for() {
+        use super::forget_defers as defers;
+        assert!(defers(true, false));
+        // With a file id it waits for the volume; otherwise it is a failure.
+        assert!(!defers(true, true));
+        assert!(!defers(false, false));
+        assert!(!defers(false, true));
+    }
+
+    #[test]
+    fn a_bounded_retry_is_rare_short_and_stays_off_the_network() {
+        use super::{
+            STALE_RETRY_INTERVAL_SECS as I, stale_retry_attempts as attempts,
+            stale_retry_due as due, stale_retry_marks_operation as marks,
+        };
+        assert!(due(None, 1000));
+        assert!(!due(Some(1000), 1000));
+        assert!(!due(Some(1000), 1000 + I - 1));
+        assert!(due(Some(1000), 1000 + I));
+        assert!(due(Some(1000), 999));
+        assert!(attempts(true, false, false));
+        assert!(!attempts(true, true, false));
+        assert!(!attempts(true, false, true));
+        // Asked for by hand: everything, however long it takes.
+        assert!(attempts(false, true, true));
+        assert!(!marks(true));
+        assert!(marks(false));
+    }
+
     #[test]
     fn revoking_drops_a_record_only_for_an_object_that_is_definitely_gone() {
         use super::{FoundById as F, RecordedAt as A, RevokeAction as R, revoke_action as act};
@@ -2088,6 +2201,7 @@ mod tests {
             .add(r"source\repo\a.rs")
             .add(r"scoop\shims\rg.exe")
             .add(r".local\bin\uv.exe")
+            .add(r"go\bin\gopls.exe")
             .add(".npmrc")
             .add(".gitconfig")
             .add(".netrc")
@@ -2123,9 +2237,12 @@ mod tests {
         absent(r"Documents\notes.txt");
         absent("source");
         // Listed, with no exclusion beneath: granted whole.
-        is("scoop", Kind::Granted);
+        is("go", Kind::Granted);
+        absent(r"go\bin");
+        absent("scoop");
         absent(r"scoop\shims");
-        is(".local", Kind::Granted);
+        absent(".local");
+        absent(r".local\bin");
         is(".m2", Kind::Granted);
         is(".npmrc", Kind::File);
         is(".gitconfig", Kind::File);
@@ -3387,6 +3504,7 @@ mod tests {
             .add(r"AppData\LocalLow\x")
             .add(r"scoop\shims\x.exe")
             .add(r".local\bin\uv.exe")
+            .add(r"go\bin\x.exe")
             .add(r".nuget\packages\a\1.0\a.dll")
             .add(r".vscode\extensions\e\x");
         let nodes = plan(&mut t, &rules()).unwrap();
@@ -3433,17 +3551,19 @@ mod tests {
         is(r"AppData\Local\Temp", Kind::Ungranted);
         // The inclusions, whole.
         for granted in [
-            "scoop",
-            ".local",
+            "go",
             ".nuget",
             r"AppData\Roaming\npm",
-            r"AppData\Roaming\uv",
             r"AppData\Local\Programs\Python",
             r"AppData\Local\Microsoft\WinGet\Links",
         ] {
             is(granted, Kind::Granted);
         }
-        absent(r"scoop\shims");
+        absent(r"go\bin");
+        // Not listed, whatever they hold.
+        for unlisted in ["scoop", ".local", r"AppData\Roaming\uv"] {
+            absent(unlisted);
+        }
         absent(r"AppData\Local\Programs\Python\Python313");
         // A session may still grant itself an unlisted directory: the
         // record it is measured against holds only the exclusions.
@@ -3514,10 +3634,7 @@ mod tests {
                 .iter()
                 .any(|s| s == r"AppData\Roaming\tool\settings.json")
         );
-        assert!(
-            spelled.iter().any(|s| s == "scoop"),
-            "the built-in list stays"
-        );
+        assert!(spelled.iter().any(|s| s == "go"), "the built-in list stays");
         assert!(!spelled.iter().any(|s| s.is_empty()));
         let inc = |p: &str| r.included(&names(&split_path(p)));
         assert!(inc(r"DOCUMENTS\x"));

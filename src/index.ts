@@ -123,6 +123,7 @@ export type {
   WindowsProfileGrantStatus,
   WindowsProfileGrantPath,
   WindowsProfileGrantOptions,
+  WindowsProfileForgetResult,
   WindowsProfileGrantResult,
   WindowsProfileGrantItem,
   WindowsInstallProfileGrant,

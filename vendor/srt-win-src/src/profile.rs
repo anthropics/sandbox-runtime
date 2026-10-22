@@ -18,7 +18,9 @@ use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use crate::acl;
 use crate::path_id::{self, FileId, Located};
 use crate::persist::{self, Ids, OpenObject};
-use crate::profile_plan::{self as plan, Entry, Kind, LinkTarget, Name, Node, Rules, Tree};
+use crate::profile_plan::{
+    self as plan, Entry, Kind, LinkTarget, Name, Node, Rules, Stamped, Tree,
+};
 use crate::reg;
 use crate::util::{OwnedHandle, pcwstr, wstr};
 
@@ -596,6 +598,8 @@ const VAL_INCLUSIONS: &str = "ProfileInclusions";
 const VAL_UNGRANTED: &str = "ProfileUngranted";
 const VAL_NOTES: &str = "ProfileNotes";
 const VAL_OPERATION: &str = "ProfileOp";
+/// Seconds since the epoch of the last bounded retry of stale entries.
+const VAL_STALE_RETRIED: &str = "ProfileStaleRetried";
 
 /// What a run of the grant left as it found it, and why — the objects
 /// in a real profile that its user may not change, or not even open.
@@ -978,6 +982,7 @@ fn clear_marker(key: &str) -> Result<()> {
             VAL_PATHS,
             VAL_NOTES,
             VAL_OPERATION,
+            VAL_STALE_RETRIED,
         ] {
             reg::delete_value(&k, v)?;
         }
@@ -1779,12 +1784,6 @@ fn volume_reachable(path: &str) -> bool {
     root.is_some_and(|r| std::fs::metadata(r).is_ok())
 }
 
-enum Stamped {
-    Wrote,
-    Unchanged,
-    Skipped(&'static str),
-}
-
 /// Open the node without following a link, check it is still what
 /// the plan saw, record it, and converge its ACEs through the handle.
 ///
@@ -1851,6 +1850,22 @@ fn stamp(
     }
 }
 
+/// Take the entry off `o`, which handed reading down, and say whether
+/// anything was written. An object that already carries nothing may be
+/// one a run was killed walking: its write record rolled back with it,
+/// so only what is on disk tells. `Ok(false)`: nothing is left beneath.
+fn converge_revoke(conn: &Connection, ids: &Ids, path: &str, o: &Opened) -> Result<bool> {
+    let obj = o.object();
+    if persist::converge_on(conn, ids, path, Some(&obj))? {
+        return Ok(true);
+    }
+    if copies_beneath(path, ids).is_empty() {
+        return Ok(false);
+    }
+    persist::mark_write_unfinished(conn, path, o.id)?;
+    persist::converge_on(conn, ids, path, Some(&obj))
+}
+
 /// Take a recorded path out of the grant: remove its row, and the
 /// group's ACE from the recorded object — at its path, or wherever
 /// its file id is now ([`plan::revoke_action`]).
@@ -1903,7 +1918,9 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
         Located::VolumeAbsent => FoundById::VolumeAbsent,
         Located::Unknown => FoundById::Unknown,
     });
-    let reachable = by_id.is_some() || volume_reachable(&r.path);
+    // The one case the answer decides; a stat of a share can block.
+    let reachable =
+        matches!(at, RecordedAt::Nothing) && by_id.is_none() && volume_reachable(&r.path);
     let mut targets: Vec<(String, Opened)> = Vec::new();
     let mut deferred = false;
     match plan::revoke_action(at, by_id, network, reachable) {
@@ -1941,9 +1958,8 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
         }
     }
     // A directory's entry handed reading down: taking it off counts only
-    // once what it handed down is gone too. `Ungranted` is such a removal
-    // an earlier run could not finish.
-    let hands_down = matches!(r.kind, Kind::Granted | Kind::Ungranted);
+    // once what it handed down is gone too.
+    let hands_down = plan::hands_reading_down(r.kind);
     let tx = store
         .conn
         .unchecked_transaction()
@@ -1956,10 +1972,15 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
     let mut unfinished: Option<(&str, FileId, UnfinishedRevoke)> = None;
     for (p, o) in &targets {
         let obj = o.object();
-        let cause = match persist::converge_on(&tx, ids, p, Some(&obj)) {
+        let converged = if hands_down {
+            converge_revoke(&tx, ids, p, o)
+        } else {
+            persist::converge_on(&tx, ids, p, Some(&obj))
+        };
+        let cause = match converged {
             Ok(w) => {
                 removed |= w;
-                if !hands_down || !(w || r.kind == Kind::Ungranted) {
+                if !w || !hands_down {
                     continue;
                 }
                 None
@@ -2021,16 +2042,17 @@ fn resolve_added(profile: &str, flag: &str, raw: &[String]) -> Result<Vec<Vec<St
     Ok(out)
 }
 
+/// Whether two paths beneath the profile are the same, by component.
+fn same_components(a: &[String], b: &[String]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(p, q)| plan::norm_component(p) == plan::norm_component(q))
+}
+
 /// The paths an earlier run recorded as added (`recorded`), unless
-/// they are to be replaced, with this run's (`raw`, resolved) added
-/// once each.
-fn added_paths(
-    profile: &str,
-    flag: &str,
-    recorded: &[String],
-    raw: &[String],
-    replace: bool,
-) -> Result<Vec<Vec<String>>> {
+/// they are to be replaced, with this run's (`given`) added once each.
+fn added_paths(recorded: &[String], given: &[Vec<String>], replace: bool) -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = if replace {
         Vec::new()
     } else {
@@ -2040,18 +2062,12 @@ fn added_paths(
             .filter(|x| !x.is_empty())
             .collect()
     };
-    for x in resolve_added(profile, flag, raw)? {
-        let same = |a: &Vec<String>| {
-            a.len() == x.len()
-                && a.iter()
-                    .zip(&x)
-                    .all(|(p, q)| plan::norm_component(p) == plan::norm_component(q))
-        };
-        if !out.iter().any(same) {
-            out.push(x);
+    for x in given {
+        if !out.iter().any(|a| same_components(a, x)) {
+            out.push(x.clone());
         }
     }
-    Ok(out)
+    out
 }
 
 /// What a run of `profile grant` adds to the built-in lists.
@@ -2094,20 +2110,10 @@ pub fn grant(
     drop(root);
 
     let old = read_marker_at(store.key)?;
-    let extra = added_paths(
-        profile,
-        "--exclude",
-        &old.extra,
-        added.exclude,
-        added.replace_excludes,
-    )?;
-    let include = added_paths(
-        profile,
-        "--include",
-        &old.include,
-        added.include,
-        added.replace_includes,
-    )?;
+    let given_excludes = resolve_added(profile, "--exclude", added.exclude)?;
+    let given_includes = resolve_added(profile, "--include", added.include)?;
+    let extra = added_paths(&old.extra, &given_excludes, added.replace_excludes);
+    let include = added_paths(&old.include, &given_includes, added.replace_includes);
     // Stores the caller's environment moves inside the profile, added
     // to those an earlier run recorded; no run drops them.
     let mut env_extra: Vec<Vec<String>> = old
@@ -2135,27 +2141,20 @@ pub fn grant(
     // and one in the temporary directory the same: refused. One an
     // earlier run recorded is looked at again, as the built-in
     // exclusions may have grown since; `--replace-includes` drops it.
+    let absolute = |rel: Vec<String>| -> Vec<String> {
+        rel.iter()
+            .map(|rel| format!("{}\\{rel}", profile.trim_end_matches('\\')))
+            .collect()
+    };
     {
-        let absolute = |rel: Vec<String>| -> Vec<String> {
-            rel.iter()
-                .map(|rel| format!("{}\\{rel}", profile.trim_end_matches('\\')))
-                .collect()
-        };
         let protected = absolute(rules.spelled());
         let ungranted = absolute(rules.spelled_ungranted());
-        let given = resolve_added(profile, "--include", added.include)?;
-        let same = |a: &[String], b: &[String]| {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b)
-                    .all(|(p, q)| plan::norm_component(p) == plan::norm_component(q))
-        };
         for x in &include {
             let path = join(profile, x);
             let Some(why) = plan::include_refusal(&path, &protected, &ungranted) else {
                 continue;
             };
-            if given.iter().any(|g| same(g, x)) {
+            if given_includes.iter().any(|g| same_components(g, x)) {
                 bail!("--include: {why}");
             }
             bail!(
@@ -2210,11 +2209,6 @@ pub fn grant(
     }
     let extra_strings: Vec<String> = extra.iter().map(|x| x.join("\\")).collect();
     let include_strings: Vec<String> = include.iter().map(|x| x.join("\\")).collect();
-    let absolute = |rel: Vec<String>| -> Vec<String> {
-        rel.iter()
-            .map(|rel| format!("{}\\{rel}", profile.trim_end_matches('\\')))
-            .collect()
-    };
     let exclusions = absolute(rules.spelled());
     let ungranted_only = absolute(rules.spelled_ungranted());
     let inclusions = absolute(rules.spelled_included());
@@ -2319,7 +2313,10 @@ pub fn grant(
         if unfinished.is_none() {
             upsert_row(store.conn, &r.path, r.file_id, r.kind, r.created)?;
         }
-        match (is_allow(r.kind), wanted.map(|n| is_allow(n.kind))) {
+        match (
+            plan::may_carry_allow(r.kind),
+            wanted.map(|n| is_allow(n.kind)),
+        ) {
             // An allow of ours stays on a path that is no longer to be readable:
             // on the exclusion list now it is `OurAllow`, otherwise `StaleAllow`.
             (true, Some(false)) | (true, None) => {
@@ -2361,7 +2358,8 @@ pub fn grant(
             // Granted WHOLE earlier and now to be a container: the entry
             // that hands reading down to everything beneath is still there.
             (true, Some(true))
-                if r.kind == Kind::Granted && wanted.is_some_and(|n| n.kind == Kind::Container) =>
+                if plan::hands_reading_down(r.kind)
+                    && wanted.is_some_and(|n| n.kind == Kind::Container) =>
             {
                 let excludes_beneath = plan::rel_components(profile, path).is_ok_and(|rel| {
                     let names: Vec<Name> = rel.iter().map(|c| Name::long(c)).collect();
@@ -2654,15 +2652,39 @@ pub struct Retried {
 /// Try again to revoke what the last run could not, on the noted paths
 /// alone: no plan of the profile, and no walk beyond those paths. What
 /// cannot be done stays noted, and is no failure of this run.
-pub fn retry_stale(store: &Store<'_>, ids: &Ids) -> Result<Retried> {
+///
+/// `budget`: run while a session starts. Only when one is due
+/// ([`plan::stale_retry_due`]), recorded before any work so that a run
+/// that is killed does not repeat at every start; no network path is
+/// looked at, and nothing new starts once the budget is spent.
+pub fn retry_stale(
+    store: &Store<'_>,
+    ids: &Ids,
+    budget: Option<std::time::Duration>,
+) -> Result<Retried> {
+    let started = std::time::Instant::now();
+    let bounded = budget.is_some();
     let marker = read_marker_at(store.key)?;
     let mut out = Retried::default();
     if !marker.header.as_ref().is_some_and(|h| h.complete) {
         return Ok(out);
     }
+    if bounded {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let k = reg::Key::create_hkcu(store.key)?;
+        let last = k
+            .get_sz(VAL_STALE_RETRIED)?
+            .and_then(|s| s.parse::<u64>().ok());
+        if !plan::stale_retry_due(last, now) {
+            return Ok(out);
+        }
+        k.set_sz(VAL_STALE_RETRIED, &now.to_string())?;
+    }
     let rows = all_recorded(store, &marker)?;
     let pending: Vec<persist::PendingStrip> = if store.key == persist::MARKER_KEY {
-        persist::retry_pending(store.conn, ids, true)?
+        persist::retry_pending(store.conn, ids, !bounded)?
     } else {
         Vec::new()
     };
@@ -2675,6 +2697,18 @@ pub fn retry_stale(store: &Store<'_>, ids: &Ids) -> Result<Retried> {
                 | NoteClass::StaleInPlan
                 | NoteClass::Unreachable
         ) {
+            notes.push(n.clone());
+            continue;
+        }
+        let on_network = !path_id::is_drive_path(&n.path) || path_id::on_network_drive(&n.path);
+        let past_budget = budget.is_some_and(|b| started.elapsed() >= b);
+        if !plan::stale_retry_attempts(bounded, on_network, past_budget) {
+            out.stale_allow.push(Item {
+                path: n.path.clone(),
+                reason: n.reason.clone(),
+                protected_exclusion: Some(false),
+                ..Default::default()
+            });
             notes.push(n.clone());
             continue;
         }
@@ -2695,7 +2729,14 @@ pub fn retry_stale(store: &Store<'_>, ids: &Ids) -> Result<Retried> {
                     note: None,
                 };
                 stamp(store, ids, &r.path, &node, false, true)
-                    .map(|_| ())
+                    .and_then(|s| {
+                        // Not looked at: its entry may still be there.
+                        if s.reached_object() {
+                            Ok(())
+                        } else {
+                            Err(anyhow!("it could not be looked at again: {s:?}"))
+                        }
+                    })
                     .inspect_err(|e| {
                         if !e.is::<UnfinishedRevoke>() {
                             let _ = upsert_row(store.conn, &r.path, r.file_id, r.kind, r.created);
@@ -2760,6 +2801,10 @@ pub struct Forgotten {
     pub placeholders_removed: usize,
     /// Paths that could not be completed; they stay recorded.
     pub failed: Vec<Item>,
+    /// Paths on a volume that cannot be reached, with no file id to find
+    /// them by when it returns: no longer recorded, and NOT known to carry
+    /// nothing. If the volume comes back they may still hold the entry.
+    pub deferred: Vec<Item>,
 }
 
 /// Mark the record incomplete, and a forget's, before the first entry
@@ -2827,6 +2872,28 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
         match strip(store, ids, r) {
             Ok(Stripped::Removed) => out.removed += 1,
             Ok(Stripped::Absent | Stripped::Deferred) => out.absent += 1,
+            Err(e) if plan::forget_defers(e.is::<VolumeUnreachable>(), r.file_id.is_some()) => {
+                eprintln!(
+                    "srt-win: WARNING: profile forget '{}': its volume cannot be reached and \
+                     nothing recorded can find it later; if the volume returns it may still \
+                     carry the entry",
+                    r.path
+                );
+                store.conn.execute(
+                    "DELETE FROM profile_paths WHERE canonical_path = ?1",
+                    params![r.path],
+                )?;
+                store.conn.execute(
+                    "DELETE FROM persistent_writes WHERE canonical_path = ?1",
+                    params![r.path],
+                )?;
+                failed_paths.insert(&r.path);
+                out.deferred.push(Item {
+                    path: r.path.clone(),
+                    reason: format!("{e:#}"),
+                    ..Default::default()
+                });
+            }
             Err(e) => {
                 eprintln!("srt-win: profile forget '{}': {e:#}", r.path);
                 failed_paths.insert(&r.path);
@@ -2866,7 +2933,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
                 inclusions: marker.inclusions,
                 paths: all
                     .iter()
-                    .filter(|r| failed_paths.contains(r.path.as_str()))
+                    .filter(|r| out.failed.iter().any(|f| f.path == r.path))
                     .cloned()
                     .collect(),
             },
@@ -4274,7 +4341,7 @@ mod tests {
         let outside = base.join("outside");
         for f in [
             r"Documents\a.txt",
-            r"scoop\shims\x.exe",
+            r"go\bin\x.exe",
             r".ssh\id_ed25519",
             ".npmrc",
             "stray.txt",
@@ -4300,7 +4367,7 @@ mod tests {
         let touched = [
             "",
             "Documents",
-            "scoop",
+            "go",
             ".ssh",
             ".npmrc",
             ".netrc",
@@ -4347,7 +4414,7 @@ mod tests {
             assert_eq!(group_aces(&prof.join(c)), allow(0, LIST), "container '{c}'");
         }
         for g in [
-            "scoop",
+            "go",
             r".cargo\bin",
             r"AppData\Roaming\npm",
             r"AppData\Local\Programs\Tool",
@@ -4355,7 +4422,7 @@ mod tests {
             assert_eq!(group_aces(&prof.join(g)), allow(0x3, RX), "granted '{g}'");
         }
         assert_eq!(
-            group_aces(&prof.join(r"scoop\shims\x.exe")),
+            group_aces(&prof.join(r"go\bin\x.exe")),
             [(false, false, 0, RX)]
         );
         // Not on the list: no entry, and nothing beneath.
@@ -4561,7 +4628,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_lowercase())
             .collect();
-        for want in [r"\scoop", r"\appdata\local\programs", r"\.cargo"] {
+        for want in [r"\go", r"\appdata\local\programs", r"\.cargo"] {
             assert!(included.contains(&at(want)), "{want} not in {included:?}");
         }
         assert!(!included.iter().any(|i| i.ends_with(r"\documents")));
@@ -4743,6 +4810,51 @@ mod tests {
     }
 
     #[test]
+    fn forget_reports_a_path_on_a_lost_volume_it_could_never_find_again() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestLostVolume";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (_prof, _layout) = granted_documents("lost-volume", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let letter = ('D'..='Z')
+            .rev()
+            .find(|c| std::fs::metadata(format!("{c}:\\")).is_err())
+            .expect("a drive letter nothing is on");
+        let lost = format!(r"\\?\{letter}:\gone\dir");
+        upsert_row(&conn, &lost, None, Kind::Granted, false).unwrap();
+        let out = forget(&store, &ids()).unwrap();
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert_eq!(
+            out.deferred.iter().map(|i| &i.path).collect::<Vec<_>>(),
+            [&lost]
+        );
+        assert!(read_marker_at(KEY).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_retry_on_a_budget_is_not_repeated_until_one_is_due() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestRetryDue";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, layout) = granted_documents("retry-due", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        grant(&store, &ids(), &layout, dropping_inclusions(), false).unwrap();
+        let budget = Some(std::time::Duration::from_secs(3));
+        retry_stale(&store, &ids(), budget).unwrap();
+        let k = reg::Key::open_hkcu(KEY, false).unwrap().unwrap();
+        let first = k.get_sz(VAL_STALE_RETRIED).unwrap().unwrap();
+        retry_stale(&store, &ids(), budget).unwrap();
+        assert_eq!(k.get_sz(VAL_STALE_RETRIED).unwrap().unwrap(), first);
+        forget(&store, &ids()).unwrap();
+        assert!(k.get_sz(VAL_STALE_RETRIED).unwrap().is_none());
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    #[test]
     fn copies_left_beneath_stand_in_status_though_the_directory_is_clean() {
         const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestBeneath";
         let conn = crate::state_db::open_memory_db_for_tests();
@@ -4918,7 +5030,7 @@ mod tests {
             key: KEY,
         };
         let rows_before = db_rows(&conn).unwrap().len();
-        let r = retry_stale(&store, &ids()).unwrap();
+        let r = retry_stale(&store, &ids(), None).unwrap();
         assert_eq!(r.cleared, 1, "{r:?}");
         assert!(r.stale_allow.is_empty(), "{r:?}");
         assert!(group_aces(&prof.join("Documents")).is_empty());
@@ -4943,7 +5055,7 @@ mod tests {
             key: KEY,
         };
         let before = read_marker_at(KEY).unwrap();
-        let r = retry_stale(&store, &ids()).unwrap();
+        let r = retry_stale(&store, &ids(), None).unwrap();
         assert_eq!(r.cleared, 0);
         assert_eq!(read_marker_at(KEY).unwrap().paths.len(), before.paths.len());
         assert!(!group_aces(&prof.join("Documents")).is_empty());
@@ -4957,7 +5069,7 @@ mod tests {
         }];
         write_marker(KEY, &m).unwrap();
         mark_forget_begun(KEY, &m).unwrap();
-        assert_eq!(retry_stale(&store, &ids()).unwrap().cleared, 0);
+        assert_eq!(retry_stale(&store, &ids(), None).unwrap().cleared, 0);
         assert!(!group_aces(&prof.join("Documents")).is_empty());
         forget(&store, &ids()).unwrap();
         std::fs::remove_dir_all(prof.parent().unwrap()).ok();
@@ -4975,7 +5087,7 @@ mod tests {
         let mut m = read_marker_at(KEY).unwrap();
         m.notes[0].class = NoteClass::StaleInPlan;
         write_marker(KEY, &m).unwrap();
-        let r = retry_stale(&store, &ids()).unwrap();
+        let r = retry_stale(&store, &ids(), None).unwrap();
         assert_eq!(r.cleared, 1, "{r:?}");
         let aces = group_aces(&prof.join("Documents"));
         assert_eq!(aces.len(), 1, "{aces:?}");

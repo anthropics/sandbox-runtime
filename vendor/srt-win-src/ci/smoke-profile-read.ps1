@@ -28,7 +28,7 @@
         for the made-up profile and outdated for the real one; `user
         status` reports a grant.
     R1  a sandboxed command reads a file under a listed directory
-        (`.local`), and under a bulk tree inside another (`go`).
+        (`.bun`), and under a bulk tree inside another (`go`).
     R2  it runs an .exe from a per-user tool directory on PATH.
     R3  it reads `.npmrc` in the profile root.
     R4  it lists a container, and cannot read a file in the root that
@@ -69,6 +69,10 @@
         rewrite is reported in `stale_allow` and the grant completes;
         `profile retry-stale` keeps it reported while the child is
         stuck, and clears it once it can be rewritten.
+    W   a revoke killed part-way through its walk: the next run finds
+        the copies left beneath a directory that already looks clean,
+        takes them off, and reports nothing stale. SKIPPED if the walk
+        finished before it could be killed.
     A   `acl grant` (a session's grants) refuses, and grants nothing,
         when a write root is a protected exclusion, lies inside one,
         or lies above one (the profile directory), and when it is the
@@ -302,12 +306,12 @@ try {
   New-Item -ItemType Directory -Path $prof, $outside -Force | Out-Null
 
   # ── The made-up profile ──────────────────────────────────────────
-  # `.local` stands for a listed directory (a per-user tool root);
+  # `.bun` stands for a listed directory (a per-user tool root);
   # `Documents` for one the list does not name.
-  $note     = Seed '.local\note.txt'                            'NOTE-CONTENT'
-  $subFile  = Seed '.local\sub\deep.txt'                        'DEEP-CONTENT'
-  $null     = Seed '.local\del.txt'                             'DEL'
-  $null     = Seed '.local\ren.txt'                             'REN'
+  $note     = Seed '.bun\note.txt'                            'NOTE-CONTENT'
+  $subFile  = Seed '.bun\sub\deep.txt'                        'DEEP-CONTENT'
+  $null     = Seed '.bun\del.txt'                             'DEL'
+  $null     = Seed '.bun\ren.txt'                             'REN'
   $docNote  = Seed 'Documents\note.txt'                         'DOC-CONTENT'
   $npmrc    = Seed '.npmrc'                                     'NPMRC-CONTENT'
   $stray    = Seed 'stray.txt'                                  'STRAY-CONTENT'
@@ -333,12 +337,12 @@ try {
   $secret = Join-Path $outside 'secret.txt'
   'OUTSIDE-CONTENT' | Set-Content -Encoding ASCII -LiteralPath $secret
   $jTop     = Join-Path $prof 'link'
-  $jOutside = Join-Path $prof '.local\to-outside'
-  $jSsh     = Join-Path $prof '.local\to-ssh'
+  $jOutside = Join-Path $prof '.bun\to-outside'
+  $jSsh     = Join-Path $prof '.bun\to-ssh'
   New-Item -ItemType Junction -Path $jTop     -Target $outside               | Out-Null
   New-Item -ItemType Junction -Path $jOutside -Target $outside               | Out-Null
   New-Item -ItemType Junction -Path $jSsh     -Target (Join-Path $prof '.ssh') | Out-Null
-  $symFile = Join-Path $prof '.local\sym.txt'
+  $symFile = Join-Path $prof '.bun\sym.txt'
   $haveSym = $false
   try {
     New-Item -ItemType SymbolicLink -Path $symFile -Target $secret -ea Stop | Out-Null
@@ -346,7 +350,7 @@ try {
   } catch { Write-Host "J: no file symbolic link on this runner ($_); that part of J is not run" }
 
   $touched = @(
-    $prof, (Join-Path $prof '.local'), $note, (Join-Path $prof 'Documents'), $docNote, $npmrc, (Join-Path $prof '.cargo'), $cargoCfg,
+    $prof, (Join-Path $prof '.bun'), $note, (Join-Path $prof 'Documents'), $docNote, $npmrc, (Join-Path $prof '.cargo'), $cargoCfg,
     (Join-Path $prof 'AppData'), (Join-Path $prof 'AppData\Roaming'),
     (Join-Path $prof 'AppData\Roaming\Microsoft'), (Join-Path $prof 'AppData\Roaming\Microsoft\Credentials'),
     $credBlob, (Join-Path $prof 'AppData\Roaming\npm'), $npmTool, (Join-Path $prof 'AppData\Local'),
@@ -515,8 +519,8 @@ try {
   Expect-Read 'R1' $note 'NOTE-CONTENT'
   Expect-Read 'R1' $subFile 'DEEP-CONTENT'
   Expect-Read 'R1' $bulkSample 'BULK-CONTENT'
-  if ((Has-GroupAllow (Join-Path $prof '.local')) -and -not (Has-ExplicitGroup $note)) { Ok 'R1: a listed directory is granted whole: one entry on it, inherited by what is in it' }
-  else { Fail "R1: .local=$(Sddl (Join-Path $prof '.local')) note=$(Sddl $note)" }
+  if ((Has-GroupAllow (Join-Path $prof '.bun')) -and -not (Has-ExplicitGroup $note)) { Ok 'R1: a listed directory is granted whole: one entry on it, inherited by what is in it' }
+  else { Fail "R1: .local=$(Sddl (Join-Path $prof '.bun')) note=$(Sddl $note)" }
   $r = Sb @($cmd, '/d', '/s', '/c', 'srtsmoketool.exe /d /c echo TOOL-RAN') $toolDir
   if ($r.exit -eq 0 -and $r.out -match 'TOOL-RAN') { Ok 'R2: an .exe in a per-user tool directory on PATH runs' }
   else { Fail "R2: srtsmoketool.exe from $toolDir on PATH: exit=$($r.exit) raw: $($r.raw)" }
@@ -718,6 +722,14 @@ try {
     $st = Status
     if ($st.state -eq 'current' -and @($st.stale_allow).Count -ge 1) { Ok 'V: the record says so, though the directory itself is clean' }
     else { Fail "V: status over a stuck child: $($st | ConvertTo-Json -Compress -Depth 2)" }
+    # Failing again, on a row already recorded as unfinished, stays reported.
+    $gv = Grant @('--replace-includes')
+    $named = @($gv.json.stale_allow | Where-Object { $_.path -match '\\Documents$' }).Count -eq 1
+    if ($gv.exit -eq 0 -and $named) { Ok 'V: a second run that cannot finish still reports it' }
+    else { Fail "V: second run over a stuck child exit=$($gv.exit) raw: $($gv.raw)" }
+    $rq = Invoke-Srt $Exe @('profile', 'retry-stale', '--json', '--budget-ms', '3000')
+    if ($rq.exit -eq 0 -and @((Status).stale_allow).Count -ge 1) { Ok 'V: a bounded retry is no failure, and keeps it reported' }
+    else { Fail "V: bounded retry exit=$($rq.exit) raw: $($rq.raw)" }
     $rv = Invoke-Srt $Exe @('profile', 'retry-stale', '--json')
     if ($rv.exit -eq 0) { Ok 'V: a retry over a stuck child is no failure' }
     else { Fail "V: retry-stale exit=$($rv.exit) raw: $($rv.raw)" }
@@ -729,6 +741,38 @@ try {
   else { Fail "V: after unsticking: stuck=$(Sddl $vStuck) raw: $($gv.raw)" }
   & icacls $docs /remove:g "*$vOther" | Out-Null
   Remove-Item -Recurse -Force (Join-Path $docs 'revoke')
+
+  # ── W: a revoke killed part-way through its walk ─────────────────
+  $wRoot = Join-Path $docs 'killed'
+  $wSample = @()
+  foreach ($i in 1..40) {
+    $wDir = Join-Path $wRoot "d$i"
+    New-Item -ItemType Directory -Force -Path $wDir | Out-Null
+    foreach ($j in 1..100) { [IO.File]::WriteAllText((Join-Path $wDir "f$j.txt"), 'KILLED-CONTENT') }
+    $wSample += (Join-Path $wDir 'f100.txt')
+  }
+  $gv = Grant @('--include', 'Documents')
+  if ($gv.exit -ne 0) { Fail "W: grant --include exit=$($gv.exit) raw: $($gv.raw)" }
+  $wRun = Start-Process -FilePath $HooksAbs -PassThru -WindowStyle Hidden `
+    -ArgumentList @('profile', 'grant', '--test-profile', "`"$prof`"", '--replace-includes')
+  $wClock = [Diagnostics.Stopwatch]::StartNew()
+  while (-not $wRun.HasExited -and (Has-GroupAllow $docs) -and $wClock.Elapsed.TotalSeconds -lt 60) { Start-Sleep -Milliseconds 5 }
+  if (-not $wRun.HasExited) { Stop-Process -Id $wRun.Id -Force; $wRun.WaitForExit() }
+  $wLeft = @($wSample | Where-Object { Has-GroupAllow $_ }).Count
+  if ($wLeft -eq 0 -or (Has-GroupAllow $docs)) {
+    Write-Host "W: SKIPPED: the kill did not land between the directory and its children (left=$wLeft)"
+  } else {
+    Ok "W: killed with the directory clean and $wLeft sampled children still carrying the entry"
+    $gv = Grant @('--replace-includes')
+    if ($gv.exit -eq 0 -and $gv.json.complete -and @($gv.json.stale_allow).Count -eq 0) { Ok 'W: the next run completes with nothing stale' }
+    else { Fail "W: run after the kill exit=$($gv.exit) raw: $($gv.raw)" }
+    $wLeft = @($wSample | Where-Object { Has-Group $_ }).Count
+    if ($wLeft -eq 0) { Ok 'W: no sampled child carries anything of the group' }
+    else { Fail "W: $wLeft sampled children still carry the entry" }
+  }
+  $gv = Grant @('--replace-includes')
+  if ($gv.exit -ne 0) { Fail "W: closing grant exit=$($gv.exit) raw: $($gv.raw)" }
+  Remove-Item -Recurse -Force $wRoot
 
   # ── A: a session's grants against the exclusions ─────────────────
   function Session-Grant { param([string[]] $read = @(), [string[]] $write = @(), [string[]] $flags = @())
@@ -818,7 +862,7 @@ try {
 
   # ── W: nothing is writable ───────────────────────────────────────
   foreach ($case in @(
-      @{ tag = 'a listed directory'; dir = (Join-Path $prof '.local'); keep = 'note.txt'; text = 'NOTE-CONTENT' },
+      @{ tag = 'a listed directory'; dir = (Join-Path $prof '.bun'); keep = 'note.txt'; text = 'NOTE-CONTENT' },
       @{ tag = 'a container';     dir = (Join-Path $prof '.cargo');    keep = 'config.toml'; text = 'CARGO-CONFIG-CONTENT' },
       @{ tag = 'the profile directory'; dir = $prof;                   keep = '.npmrc'; text = 'NPMRC-CONTENT' })) {
     $d = $case.dir
@@ -905,7 +949,7 @@ try {
   End-Session
   & $Exe acl forget $ownRoot 2>&1 | Out-Null
   Remove-Item -Force -LiteralPath (Join-Path $ownRoot 'd-own.txt') -ErrorAction SilentlyContinue
-  $local = Join-Path $prof '.local'
+  $local = Join-Path $prof '.bun'
   if ((Session-Deny @($local)) -ne 0) { Fail 'D: the session stamp for a deny on a listed directory could not be written' }
   else {
     Expect-NoRead 'D (deny on a listed directory)' $note 'NOTE-CONTENT'
@@ -980,14 +1024,14 @@ try {
   if ($fl.exit -ne 0) { Fail "L: profile forget exit=$($fl.exit) raw: $($fl.raw)" }
 
   # ── C: a deny the owner put there stays in front ──────────────────
-  $ownerDenied = Join-Path $prof '.local\OwnerDenied'
-  $odFile = Seed '.local\OwnerDenied\f.txt' 'OWNER-DENIED-CONTENT'
+  $ownerDenied = Join-Path $prof '.bun\OwnerDenied'
+  $odFile = Seed '.bun\OwnerDenied\f.txt' 'OWNER-DENIED-CONTENT'
   & icacls $ownerDenied /deny '*S-1-5-32-545:(OI)(CI)(RD)' | Out-Null
   $g = Grant
   if ($g.exit -ne 0) { Fail "C: profile grant exit=$($g.exit) raw: $($g.raw)" }
   else {
-    if ((Has-GroupAllow (Join-Path $prof '.local')) -and (Has-Group $ownerDenied) -and -not (Has-ExplicitGroup $ownerDenied)) { Ok 'C: the directory inherits the allow of its listed parent, like any other child' }
-    else { Fail "C: OwnerDenied/.local: $(Sddl $ownerDenied) / $(Sddl (Join-Path $prof '.local'))" }
+    if ((Has-GroupAllow (Join-Path $prof '.bun')) -and (Has-Group $ownerDenied) -and -not (Has-ExplicitGroup $ownerDenied)) { Ok 'C: the directory inherits the allow of its listed parent, like any other child' }
+    else { Fail "C: OwnerDenied/.local: $(Sddl $ownerDenied) / $(Sddl (Join-Path $prof '.bun'))" }
     Expect-NoRead "C (a profile directory with the owner's deny for Users)" $odFile 'OWNER-DENIED-CONTENT'
     if (Denies-First $ownerDenied) { Ok 'C: every explicit deny precedes the first allow on it' }
     else { Fail "C: the DACL of OwnerDenied is not in canonical order: $((Explicit-Aces $ownerDenied) -join '')" }
