@@ -417,7 +417,7 @@ enum ProfileCmd {
     ///
     /// Only the listed directories are readable: where per-user tools
     /// install themselves and what they need to run
-    /// (`AppData\Local\Programs`, `AppData\Roaming\npm`, `scoop`,
+    /// (`AppData\Local\Programs`, `AppData\Roaming\npm`, `go`,
     /// `.nuget`, `.cargo`, …), and what `--include` adds. A listed
     /// directory is granted read + execute with one inheriting entry,
     /// or — where a protected path could lie beneath it — child by
@@ -501,6 +501,11 @@ enum ProfileCmd {
         /// Print `{cleared, stale_allow}` on stdout.
         #[arg(long)]
         json: bool,
+        /// Run while a session starts: only if a retry is due, on local
+        /// paths alone, starting nothing new after this many milliseconds,
+        /// and without keeping a starting session out.
+        #[arg(long)]
+        budget_ms: Option<u64>,
     },
     /// Remove the grant: the sandbox group's entry from every
     /// recorded path (each DACL is left as it was before the grant),
@@ -2652,7 +2657,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
         }
         Cmd::Profile {
-            sub: ProfileCmd::RetryStale { json },
+            sub: ProfileCmd::RetryStale { json, budget_ms },
         } => {
             use srt_win::{persist, profile, state_db};
             if let Err(e) = srt_win::install::require_current_setup() {
@@ -2667,8 +2672,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     EXIT_GRANT_BLOCKED_BY_SESSION,
                     "profile retry-stale",
                 )?;
-                state_db::mark_profile_operation()?;
-                profile::retry_stale(&profile::Store::of(db.conn()), &ids)
+                let budget = budget_ms.map(std::time::Duration::from_millis);
+                if srt_win::profile_plan::stale_retry_marks_operation(budget.is_some()) {
+                    state_db::mark_profile_operation()?;
+                }
+                profile::retry_stale(&profile::Store::of(db.conn()), &ids, budget)
             })?;
             eprintln!(
                 "srt-win: profile retry-stale — {} cleared, {} still stale",
@@ -2709,6 +2717,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     String::new()
                 } else {
                     format!(", {} FAILED (still recorded)", out.failed.len())
+                } + &if out.deferred.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} on a volume that cannot be reached (not cleared)",
+                        out.deferred.len()
+                    )
                 },
             );
             if json {
@@ -3956,7 +3971,19 @@ mod tests {
         assert!(matches!(
             parse(&["srt-win", "profile", "retry-stale", "--json"]),
             Ok(Cmd::Profile {
-                sub: ProfileCmd::RetryStale { json: true }
+                sub: ProfileCmd::RetryStale {
+                    json: true,
+                    budget_ms: None
+                }
+            })
+        ));
+        assert!(matches!(
+            parse(&["srt-win", "profile", "retry-stale", "--budget-ms", "3000"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::RetryStale {
+                    json: false,
+                    budget_ms: Some(3000)
+                }
             })
         ));
         match parse(&[

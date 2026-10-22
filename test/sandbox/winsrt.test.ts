@@ -1889,6 +1889,33 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
   })
 })
 
+describe('forgetWindowsProfileRead (pure, all platforms)', () => {
+  const srtWin = { exe: process.execPath, prependArgs: [] }
+  const forgetAnswering = (stdout: string) => {
+    const spy = spyOn(child_process, 'spawnSync').mockReturnValue({
+      status: 0,
+      stdout,
+      stderr: '',
+    } as never)
+    try {
+      return winUtils.forgetWindowsProfileRead({ srtWin })
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
+  it('reports what it could not reach', () => {
+    const out = forgetAnswering(
+      JSON.stringify({ deferred: [{ path: 'Q:\\x', reason: 'gone' }] }),
+    )
+    expect(out.deferred.map(d => d.path)).toEqual(['Q:\\x'])
+  })
+
+  it('no report: nothing deferred', () => {
+    expect(forgetAnswering('').deferred).toEqual([])
+  })
+})
+
 describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   const RAW_USER = JSON.stringify({
     user: {
@@ -6567,7 +6594,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     extra_inclusions: ['tools'],
     exclusions: exclusions(),
     ungranted_only: ungrantedOnly(),
-    inclusions: [join(home, 'scoop'), join(home, 'tools')],
+    inclusions: [join(home, 'go'), join(home, 'tools')],
     containers: 2,
     granted: 1,
     files: 2,
@@ -6949,6 +6976,31 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         })
       }
 
+      it('hands progress to the caller, and bounds the run', async () => {
+        profileStatus = until(refreshable())
+        grantRun = { stderr: ['12 of 40 done'], stdout: grantJson(), code: 0 }
+        const lines: string[] = []
+        const grantSpy = spyOn(winUtils, 'grantWindowsProfileRead')
+        spies.push(grantSpy)
+        await SandboxManager.initialize(config(), undefined, false, {
+          onWindowsProfileGrantProgress: line => lines.push(line),
+        })
+        expect(lines).toEqual(['12 of 40 done'])
+        expect(grantSpy.mock.calls[0]?.[0]?.timeoutMs).toBe(300_000)
+      })
+
+      it('a run that times out: a typed error, and no session', async () => {
+        profileStatus = refreshable()
+        spies.push(
+          spyOn(winUtils, 'grantWindowsProfileRead').mockRejectedValue(
+            new winUtils.WindowsSandboxError('srt_win_timeout', 'timed out'),
+          ),
+        )
+        const e = await rejection(config())
+        expect(e.code).toBe('srt_win_timeout')
+        expect(names()).not.toContain('acl grant')
+      })
+
       it('exit 0 with a stale allow: the session starts, and the path is warned about', async () => {
         profileStatus = {
           toJSON: () =>
@@ -6993,6 +7045,21 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           ])
           expect(asyncCalls.some(a => a[1] === 'grant')).toBe(false)
           expect(SandboxManager.getWindowsProfileReadWarnings()).toEqual([])
+        })
+
+        it('is bounded: a budget, and a short limit', async () => {
+          profileStatus = stale()
+          syncResult['profile retry-stale'] = exit(0, '{"cleared":0}')
+          await SandboxManager.initialize(config())
+          const argv = calls.find(c => c.sub === 'retry-stale')?.argv ?? []
+          expect(argv[argv.indexOf('--budget-ms') + 1]).toBe('3000')
+        })
+
+        it('none cleared: the status is not read again', async () => {
+          profileStatus = stale()
+          syncResult['profile retry-stale'] = exit(0, '{"cleared":0}')
+          await SandboxManager.initialize(config())
+          expect(names().filter(n => n === 'profile status')).toHaveLength(1)
         })
 
         it('one still stuck: the session starts, and it is warned about', async () => {
@@ -8836,7 +8903,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(st.extraInclusions).toEqual(['tools'])
       expect(st.exclusions).toEqual(exclusions())
       expect(st.ungrantedOnly).toEqual(ungrantedOnly())
-      expect(st.inclusions).toEqual([join(home, 'scoop'), join(home, 'tools')])
+      expect(st.inclusions).toEqual([join(home, 'go'), join(home, 'tools')])
       expect(st.counts).toEqual({
         containers: 2,
         granted: 1,

@@ -92,6 +92,7 @@ import {
   getWindowsProfileReadStatus,
   getWindowsProfileReadStatusAsync,
   grantWindowsProfileRead,
+  PROFILE_GRANT_REFRESH_TIMEOUT_MS,
   retryWindowsProfileStale,
   windowsProfileGrantRefreshable,
   windowsProfileExclusionConflicts,
@@ -1101,6 +1102,12 @@ export interface SandboxInitializeOptions {
    * Never applies to a write root or to a path above an exclusion.
    */
   dangerouslyAllowReadOfProfileExclusions?: readonly string[]
+  /**
+   * Windows: called with each progress line while initialize() narrows
+   * an older profile read grant, which can take minutes. Show the user
+   * why the session has not started yet.
+   */
+  onWindowsProfileGrantProgress?: (line: string) => void
 }
 
 async function initialize(
@@ -1323,14 +1330,21 @@ async function initializeSteps(
           )
           windowsProfileReadRefresh = await grantWindowsProfileRead({
             srtWin,
-            onProgress: line => logForDebugging(`[Sandbox Windows] ${line}`),
+            timeoutMs: PROFILE_GRANT_REFRESH_TIMEOUT_MS,
+            onProgress: line => {
+              logForDebugging(`[Sandbox Windows] ${line}`)
+              options?.onWindowsProfileGrantProgress?.(line)
+            },
           })
           grant = await getWindowsProfileReadStatusAsync({ srtWin })
         } else if (grant.state === 'current' && grant.staleAllow.length > 0) {
-          // On the noted paths alone, and never a reason not to start.
+          // Bounded, on the noted paths alone, and never a reason not to
+          // start.
           try {
-            await retryWindowsProfileStale({ srtWin })
-            grant = await getWindowsProfileReadStatusAsync({ srtWin })
+            const { cleared } = await retryWindowsProfileStale({ srtWin })
+            if (cleared > 0) {
+              grant = await getWindowsProfileReadStatusAsync({ srtWin })
+            }
           } catch (e) {
             logForDebugging(
               `[Sandbox Windows] retrying stale profile entries: ${e}`,

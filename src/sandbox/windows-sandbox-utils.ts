@@ -2489,7 +2489,7 @@ export function windowsProfileGrantNotice(profileDir: string): string {
   return (
     `Making the tool directories of ${profileDir} readable to sandboxed ` +
     `commands on this machine: where per-user tools install themselves ` +
-    `(AppData\\Local\\Programs, AppData\\Roaming\\npm, scoop, .nuget, ` +
+    `(AppData\\Local\\Programs, AppData\\Roaming\\npm, go, .nuget, ` +
     `.cargo and the like) and package-manager configuration that can ` +
     `hold feed tokens (.npmrc, pip.ini, NuGet.Config, Maven settings.xml, ` +
     `gradle.properties, .gitconfig). Documents, Desktop, Downloads and ` +
@@ -3796,6 +3796,15 @@ export interface WindowsProfileGrantResult {
 }
 
 const PROFILE_GRANT_TIMEOUT_MS = 30 * 60_000
+/**
+ * A refresh inside `initialize()`: a first command waits on it. One that
+ * runs out stays incomplete, and the next start carries on from there.
+ */
+export const PROFILE_GRANT_REFRESH_TIMEOUT_MS = 5 * 60_000
+/** How long a retry of stale entries may start new work during a start. */
+const PROFILE_STALE_RETRY_BUDGET_MS = 3_000
+/** And when it is killed, in case a single tree walk outruns the budget. */
+const PROFILE_STALE_RETRY_TIMEOUT_MS = 10_000
 
 /** A `[{path, reason}]` list as `srt-win` reports it; anything else is none. */
 function grantItems(v: unknown): WindowsProfileGrantItem[] {
@@ -3977,15 +3986,23 @@ function profileGrantResult(
 
 /**
  * Try again to revoke what the last run of the grant could not, on the
- * paths it noted alone (`srt-win profile retry-stale`). Returns how many
- * cleared; what is left stays recorded and reported by the status.
+ * paths it noted alone (`srt-win profile retry-stale`). Bounded, as a
+ * session is starting: only if a retry is due, on local paths, and
+ * keeping no starting session out. Returns how many cleared; what is
+ * left stays recorded and reported by the status.
  */
 export async function retryWindowsProfileStale(opts: {
   srtWin: SrtWinSpawn
 }): Promise<{ cleared: number }> {
-  const args = ['profile', 'retry-stale', '--json']
+  const args = [
+    'profile',
+    'retry-stale',
+    '--json',
+    '--budget-ms',
+    String(PROFILE_STALE_RETRY_BUDGET_MS),
+  ]
   const r = await runSrtWinAsync(args, {
-    timeoutMs: 60_000,
+    timeoutMs: PROFILE_STALE_RETRY_TIMEOUT_MS,
     srtWin: opts.srtWin,
   })
   throwIfRefusedBesideOthers(args, r.status, r.stdout)
@@ -4025,12 +4042,12 @@ function grantWindowsProfileReadSync(
  */
 export function forgetWindowsProfileRead(
   opts: { timeoutMs?: number; srtWin?: SrtWinSpawn } = {},
-): void {
+): WindowsProfileForgetResult {
   const r = runSrtWin(['profile', 'forget', '--json'], {
     timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
     srtWin: opts.srtWin,
   })
-  profileForgetResult(r)
+  return profileForgetResult(r)
 }
 
 /** {@link forgetWindowsProfileRead} without blocking the event loop. */
@@ -4039,15 +4056,25 @@ export async function forgetWindowsProfileReadAsync(
     timeoutMs?: number
     srtWin?: SrtWinSpawn
   } = {},
-): Promise<void> {
+): Promise<WindowsProfileForgetResult> {
   const r = await runSrtWinAsync(['profile', 'forget', '--json'], {
     timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
     srtWin: opts.srtWin,
   })
-  profileForgetResult(r)
+  return profileForgetResult(r)
 }
 
-function profileForgetResult(r: RunResult): void {
+/** What `srt-win profile forget` could not establish. */
+export interface WindowsProfileForgetResult {
+  /**
+   * Paths on a volume that cannot be reached, with nothing recorded that
+   * could find them when it returns. No longer recorded, and NOT known
+   * to be clear: if the volume comes back they may still hold the entry.
+   */
+  deferred: WindowsProfileGrantItem[]
+}
+
+function profileForgetResult(r: RunResult): WindowsProfileForgetResult {
   logForDebugging(
     `[Sandbox Windows] profile forget exit=${r.status}: ` +
       `${r.stderr || r.stdout}`,
@@ -4060,6 +4087,21 @@ function profileForgetResult(r: RunResult): void {
       'profile',
     )
   }
+  let raw: { deferred?: unknown } = {}
+  try {
+    raw = JSON.parse(r.stdout) as typeof raw
+  } catch {
+    // No report on stdout: nothing was deferred that can be named.
+  }
+  const deferred = grantItems(raw.deferred)
+  for (const d of deferred) {
+    logForDebugging(
+      `[Sandbox Windows] profile forget could not reach ${d.path}: ` +
+        `it may still carry the entry if its volume returns`,
+      { level: 'warn' },
+    )
+  }
+  return { deferred }
 }
 
 /** `p` for a comparison of profile paths: no `\\?\` prefix, `/`, lower case, no separator at the end. */
