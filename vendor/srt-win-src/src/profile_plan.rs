@@ -1751,41 +1751,88 @@ pub fn cargo_home_protected(exclusions: &[String], dir: &str) -> bool {
 
 // ─── Configuration pointers ─────────────────────────────────────────
 
+/// What [`env_pointers`] found: the variables to set, and the ones that
+/// would be set but cannot be, each with why (`env_withheld` in
+/// `profile status`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EnvPointers {
+    pub env: Vec<(&'static str, String)>,
+    pub withheld: Vec<(&'static str, String)>,
+}
+
+/// Whether the launchers that expand `MAVEN_ARGS` pass `path` through
+/// whole and as it is. `mvn` expands `${MAVEN_ARGS}` unquoted: a space
+/// splits the value into words, a quote reaches Maven as part of the
+/// path, and `*`, `?` and `[` are wildcards; `mvn.cmd` expands
+/// `%MAVEN_ARGS%` into its command line, where `&`, `|`, `<`, `>` and
+/// `^` are operators.
+fn plain_for_launchers(path: &str) -> bool {
+    !path
+        .chars()
+        .any(|c| c.is_whitespace() || "\"&|<>^*?[".contains(c))
+}
+
 /// Variables an embedder may set so a tool reads the real user's files in
 /// place, each only when its file or directory is there and covered by the
-/// grant. `RUSTUP_HOME` and `CARGO_HOME` name directories.
+/// grant. `RUSTUP_HOME` and `CARGO_HOME` name directories. `short_path`
+/// gives a path by its 8.3 names (`None` when it cannot), for a value a
+/// launcher takes unquoted.
 pub fn env_pointers(
     profile: &str,
     roaming: Option<&str>,
     readable: &dyn Fn(&str) -> bool,
     dir_readable: &dyn Fn(&str) -> bool,
+    short_path: &dyn Fn(&str) -> Option<String>,
     own_env: &dyn Fn(&str) -> Option<String>,
-) -> Vec<(&'static str, String)> {
+) -> EnvPointers {
     let at = |base: &str, rel: &str| format!("{}\\{rel}", base.trim_end_matches('\\'));
     let first = |candidates: &[String]| candidates.iter().find(|p| readable(p)).cloned();
-    let mut out = Vec::new();
+    let mut out = EnvPointers::default();
     if let Some(p) = first(&[at(profile, ".npmrc")]) {
-        out.push(("NPM_CONFIG_USERCONFIG", p));
+        out.env.push(("NPM_CONFIG_USERCONFIG", p));
     }
     if let Some(p) = first(&[
         at(profile, ".gitconfig"),
         at(profile, r".config\git\config"),
     ]) {
-        out.push(("GIT_CONFIG_GLOBAL", p));
+        out.env.push(("GIT_CONFIG_GLOBAL", p));
     }
     let mut pip = Vec::new();
     pip.extend(roaming.map(|r| at(r, r"pip\pip.ini")));
     pip.push(at(profile, r"pip\pip.ini"));
     pip.push(at(profile, r".config\pip\pip.conf"));
     if let Some(p) = first(&pip) {
-        out.push(("PIP_CONFIG_FILE", p));
+        out.env.push(("PIP_CONFIG_FILE", p));
     }
     if let Some(settings) = first(&[at(profile, r".m2\settings.xml")]) {
-        let mut v = format!("-s \"{settings}\"");
-        if let Some(sec) = first(&[at(profile, r".m2\settings-security.xml")]) {
-            v.push_str(&format!(" \"-Dsettings.security={sec}\""));
+        // No quotes: the launchers pass the value on as it is (see
+        // `plain_for_launchers`). A path they would take apart is given
+        // by its 8.3 names, and where the volume keeps none the variable
+        // is withheld rather than set to something Maven would misread.
+        let arg = |p: &str| -> Result<String, String> {
+            if plain_for_launchers(p) {
+                return Ok(p.to_owned());
+            }
+            match short_path(p) {
+                Some(s) if plain_for_launchers(&s) => Ok(s),
+                _ => Err(format!(
+                    "'{p}' holds whitespace or a character the mvn launchers do not pass on \
+                     unquoted, and no 8.3 name free of them was found for it: give the file \
+                     to Maven on the command line, quoted."
+                )),
+            }
+        };
+        let value = arg(&settings).and_then(|s| {
+            let mut v = format!("-s {s}");
+            if let Some(sec) = first(&[at(profile, r".m2\settings-security.xml")]) {
+                v.push_str(&format!(" -Dsettings.security={}", arg(&sec)?));
+            }
+            Ok(v)
+        });
+        match value {
+            Ok(v) => out.env.push(("MAVEN_ARGS", v)),
+            Err(why) => out.withheld.push(("MAVEN_ARGS", why)),
         }
-        out.push(("MAVEN_ARGS", v));
     }
     for (var, rel) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
         let dir = own_env(var)
@@ -1793,7 +1840,7 @@ pub fn env_pointers(
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| at(profile, rel));
         if dir_readable(&dir) {
-            out.push((var, dir));
+            out.env.push((var, dir));
         }
     }
     out
@@ -3291,9 +3338,9 @@ mod tests {
         let all = |_: &str| true;
         let none = |_: &str| false;
         let unset = |_: &str| None;
-        let got = env_pointers(profile, Some(roaming), &all, &none, &unset);
+        let got = env_pointers(profile, Some(roaming), &all, &none, &unset, &unset);
         assert_eq!(
-            got,
+            got.env,
             vec![
                 ("NPM_CONFIG_USERCONFIG", r"C:\Users\me\.npmrc".to_owned()),
                 ("GIT_CONFIG_GLOBAL", r"C:\Users\me\.gitconfig".to_owned()),
@@ -3303,13 +3350,19 @@ mod tests {
                 ),
                 (
                     "MAVEN_ARGS",
-                    "-s \"C:\\Users\\me\\.m2\\settings.xml\" \
-                     \"-Dsettings.security=C:\\Users\\me\\.m2\\settings-security.xml\""
-                        .to_owned()
+                    concat!(
+                        r"-s C:\Users\me\.m2\settings.xml",
+                        r" -Dsettings.security=C:\Users\me\.m2\settings-security.xml"
+                    )
+                    .to_owned()
                 ),
             ]
         );
-        assert!(env_pointers(profile, Some(roaming), &none, &none, &unset).is_empty());
+        assert!(got.withheld.is_empty());
+        assert_eq!(
+            env_pointers(profile, Some(roaming), &none, &none, &unset, &unset),
+            EnvPointers::default()
+        );
         let only =
             |want: &'static [&'static str]| move |p: &str| want.iter().any(|w| p.ends_with(w));
         let got = env_pointers(
@@ -3318,30 +3371,28 @@ mod tests {
             &only(&[r".config\git\config", r"me\pip\pip.ini", "settings.xml"]),
             &none,
             &unset,
+            &unset,
         );
         assert_eq!(
-            got,
+            got.env,
             vec![
                 (
                     "GIT_CONFIG_GLOBAL",
                     r"C:\Users\me\.config\git\config".to_owned()
                 ),
                 ("PIP_CONFIG_FILE", r"C:\Users\me\pip\pip.ini".to_owned()),
-                (
-                    "MAVEN_ARGS",
-                    "-s \"C:\\Users\\me\\.m2\\settings.xml\"".to_owned()
-                ),
+                ("MAVEN_ARGS", r"-s C:\Users\me\.m2\settings.xml".to_owned()),
             ]
         );
-        let got = env_pointers(profile, None, &only(&["pip.conf"]), &none, &unset);
+        let got = env_pointers(profile, None, &only(&["pip.conf"]), &none, &unset, &unset);
         assert_eq!(
-            got,
+            got.env,
             vec![(
                 "PIP_CONFIG_FILE",
                 r"C:\Users\me\.config\pip\pip.conf".to_owned()
             )]
         );
-        for (var, _) in env_pointers(profile, Some(roaming), &all, &all, &unset) {
+        for (var, _) in env_pointers(profile, Some(roaming), &all, &all, &unset, &unset).env {
             assert!(
                 ![
                     "USERPROFILE",
@@ -3357,6 +3408,107 @@ mod tests {
         }
     }
 
+    /// The Maven pointer carries no quotes, since `mvn` expands it
+    /// unquoted; a path the launchers would take apart is given by its
+    /// 8.3 names, or the variable is withheld with the reason.
+    #[test]
+    fn the_maven_pointer_is_a_path_the_launchers_pass_on_whole() {
+        let none = |_: &str| false;
+        let unset = |_: &str| None;
+        let maven = |profile: &str,
+                     readable: &dyn Fn(&str) -> bool,
+                     short: &dyn Fn(&str) -> Option<String>| {
+            let got = env_pointers(profile, None, readable, &none, short, &unset);
+            let env = got
+                .env
+                .into_iter()
+                .find(|(v, _)| *v == "MAVEN_ARGS")
+                .map(|(_, v)| v);
+            let withheld = got
+                .withheld
+                .into_iter()
+                .find(|(v, _)| *v == "MAVEN_ARGS")
+                .map(|(_, v)| v);
+            (env, withheld)
+        };
+        let all = |_: &str| true;
+        let settings_only = |p: &str| p.ends_with(r"\settings.xml");
+        // A plain path is given as it is; the short name is not asked for.
+        let not_asked = |p: &str| panic!("short name asked for {p}");
+        assert_eq!(
+            maven(r"C:\Users\me", &settings_only, &not_asked),
+            (Some(r"-s C:\Users\me\.m2\settings.xml".to_owned()), None)
+        );
+        // Whitespace, and the characters the launchers treat specially: the
+        // 8.3 path, each file looked up on its own.
+        let short = |p: &str| {
+            Some(
+                p.replace(r"C:\Users\Mary Ann", r"C:\Users\MARYAN~1")
+                    .replace("settings-security.xml", "SETTIN~2.XML"),
+            )
+        };
+        assert_eq!(
+            maven(r"C:\Users\Mary Ann", &all, &short),
+            (
+                Some(
+                    concat!(
+                        r"-s C:\Users\MARYAN~1\.m2\settings.xml",
+                        r" -Dsettings.security=C:\Users\MARYAN~1\.m2\SETTIN~2.XML"
+                    )
+                    .to_owned()
+                ),
+                None
+            )
+        );
+        for odd in [
+            "a\tb",
+            "Tom&Jerry",
+            "a|b",
+            "a<b",
+            "a>b",
+            "a^b",
+            "a*b",
+            "a?b",
+            "a[b]",
+            "a\"b",
+        ] {
+            let profile = format!(r"C:\Users\{odd}");
+            let short = |p: &str| Some(p.replace(&profile, r"C:\Users\ODD~1"));
+            assert_eq!(
+                maven(&profile, &settings_only, &short),
+                (Some(r"-s C:\Users\ODD~1\.m2\settings.xml".to_owned()), None),
+                "{odd}"
+            );
+        }
+        // No short name (a volume that keeps none, or the lookup fails): withheld, and said.
+        let (env, withheld) = maven(r"C:\Users\Mary Ann", &settings_only, &unset);
+        assert_eq!(env, None);
+        let why = withheld.expect("withheld");
+        assert!(
+            why.contains(r"'C:\Users\Mary Ann\.m2\settings.xml'"),
+            "{why}"
+        );
+        assert!(why.contains("8.3"), "{why}");
+        let still_long = |p: &str| Some(p.to_owned());
+        assert_eq!(
+            maven(r"C:\Users\Mary Ann", &settings_only, &still_long).0,
+            None
+        );
+        // The security file alone failing withholds the whole variable:
+        // a settings file without its key file would not decrypt.
+        let security_stays = |p: &str| {
+            (!p.ends_with("settings-security.xml")).then(|| p.replace("Mary Ann", "MARYAN~1"))
+        };
+        let (env, withheld) = maven(r"C:\Users\Mary Ann", &all, &security_stays);
+        assert_eq!(env, None);
+        assert!(withheld.is_some_and(|w| w.contains("settings-security.xml")));
+        // Unrelated characters are left alone.
+        assert_eq!(
+            maven(r"C:\Users\o'brien$%!", &settings_only, &not_asked).0,
+            Some(r"-s C:\Users\o'brien$%!\.m2\settings.xml".to_owned())
+        );
+    }
+
     /// `RUSTUP_HOME` and `CARGO_HOME` are named where the grant reaches them, at
     /// the place the real user's environment says, else the default one.
     #[test]
@@ -3365,7 +3517,7 @@ mod tests {
         let none = |_: &str| false;
         let unset = |_: &str| None;
         let rust = |dirs: &dyn Fn(&str) -> bool, env: &dyn Fn(&str) -> Option<String>| {
-            env_pointers(profile, None, &none, dirs, env)
+            env_pointers(profile, None, &none, dirs, &unset, env).env
         };
         assert_eq!(
             rust(&|_| true, &unset),

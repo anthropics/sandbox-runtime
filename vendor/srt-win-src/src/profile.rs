@@ -3045,6 +3045,29 @@ fn covered(paths: &[Recorded], path: &str) -> bool {
     })
 }
 
+/// `path` with each of its names replaced by the 8.3 name the volume
+/// keeps for it (`GetShortPathNameW`), for a value a launcher takes
+/// unquoted. A name the volume keeps no short form of stays as it is;
+/// `None` when the lookup fails.
+fn short_path(path: &str) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+    let wide = wstr(path);
+    let mut buf = vec![0u16; wide.len() + 16];
+    loop {
+        // SAFETY: `wide` is NUL-terminated and outlives the call; `buf`
+        // is the buffer the call writes into, bounded by its length.
+        let n = unsafe { GetShortPathNameW(pcwstr(&wide), Some(&mut buf)) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            return String::from_utf16(&buf[..n]).ok();
+        }
+        // Too small: `n` is the size needed, terminator included.
+        buf = vec![0u16; n];
+    }
+}
+
 /// `profile status`: what is recorded, and whether it is a complete
 /// grant of the current list for the profile that is there now.
 pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde_json::Value {
@@ -3274,32 +3297,39 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
                     )
                 })
         };
-        let mut withheld = serde_json::Map::new();
-        let env: serde_json::Map<String, serde_json::Value> = plan::env_pointers(
+        let pointers = plan::env_pointers(
             &shown(&l.profile),
             l.roaming.as_deref().map(shown).as_deref(),
             &readable,
             &dir_readable,
+            &short_path,
             &|var| l.own(var),
-        )
-        .into_iter()
-        // `CARGO_HOME` only where its credential files are on record as
-        // protected: a grant made before it pointed there has not excluded them.
-        .filter(|(var, dir)| {
-            let ok = *var != "CARGO_HOME" || plan::cargo_home_protected(&m.exclusions, dir);
-            if !ok {
-                withheld.insert(
-                    (*var).to_owned(),
-                    json!(format!(
-                        "'{dir}' was not the cargo home when the grant was made: its \
+        );
+        let mut withheld: serde_json::Map<String, serde_json::Value> = pointers
+            .withheld
+            .into_iter()
+            .map(|(var, why)| (var.to_owned(), json!(why)))
+            .collect();
+        let env: serde_json::Map<String, serde_json::Value> = pointers
+            .env
+            .into_iter()
+            // `CARGO_HOME` only where its credential files are on record as
+            // protected: a grant made before it pointed there has not excluded them.
+            .filter(|(var, dir)| {
+                let ok = *var != "CARGO_HOME" || plan::cargo_home_protected(&m.exclusions, dir);
+                if !ok {
+                    withheld.insert(
+                        (*var).to_owned(),
+                        json!(format!(
+                            "'{dir}' was not the cargo home when the grant was made: its \
                          credential files are not excluded. Run `srt-win profile grant` again."
-                    )),
-                );
-            }
-            ok
-        })
-        .map(|(k, v)| (k.to_owned(), json!(v)))
-        .collect();
+                        )),
+                    );
+                }
+                ok
+            })
+            .map(|(k, v)| (k.to_owned(), json!(v)))
+            .collect();
         out["env"] = serde_json::Value::Object(env);
         if !withheld.is_empty() {
             out["env_withheld"] = serde_json::Value::Object(withheld);
