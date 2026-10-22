@@ -588,9 +588,11 @@ impl Tree for DiskTree<'_> {
 
 const VAL_HEADER: &str = "Profile";
 const VAL_EXTRA: &str = "ProfileExtra";
+const VAL_INCLUDE: &str = "ProfileInclude";
 const VAL_ENV_EXTRA: &str = "ProfileEnvExclusions";
 const VAL_PATHS: &str = "ProfilePaths";
 const VAL_EXCLUSIONS: &str = "ProfileExclusions";
+const VAL_INCLUSIONS: &str = "ProfileInclusions";
 const VAL_UNGRANTED: &str = "ProfileUngranted";
 const VAL_NOTES: &str = "ProfileNotes";
 
@@ -810,6 +812,9 @@ pub struct Marker {
     /// as paths beneath the profile. A later run keeps them unless it
     /// is told to replace them.
     pub extra: Vec<String>,
+    /// Inclusions added to the built-in list, in the same form and
+    /// kept the same way.
+    pub include: Vec<String>,
     /// Exclusions from the calling user's environment ([`plan::ENV_STORES`]).
     /// No run drops them, not even one told to replace the added exclusions:
     /// what was protected once stays protected until the grant is forgotten.
@@ -821,6 +826,10 @@ pub struct Marker {
     /// The UNGRANTED-ONLY exclusions, in the same form: directories
     /// the grant leaves unreadable without denying them.
     pub ungranted_only: Vec<String>,
+    /// Every inclusion the grant was made with, in the same form,
+    /// built-in and added, those carried to the targets of links
+    /// included: what is readable, but for the exclusions.
+    pub inclusions: Vec<String>,
     pub paths: Vec<Recorded>,
     /// What the last run left as it found it ([`NoteClass`]).
     pub notes: Vec<Note>,
@@ -863,9 +872,11 @@ pub fn read_marker_at(key: &str) -> Result<Marker> {
             .map(|s| Header::decode(&s))
             .transpose()?,
         extra: k.get_multi_sz(VAL_EXTRA)?.unwrap_or_default(),
+        include: k.get_multi_sz(VAL_INCLUDE)?.unwrap_or_default(),
         env_extra: k.get_multi_sz(VAL_ENV_EXTRA)?.unwrap_or_default(),
         exclusions: k.get_multi_sz(VAL_EXCLUSIONS)?.unwrap_or_default(),
         ungranted_only: k.get_multi_sz(VAL_UNGRANTED)?.unwrap_or_default(),
+        inclusions: k.get_multi_sz(VAL_INCLUSIONS)?.unwrap_or_default(),
         paths: k
             .get_multi_sz(VAL_PATHS)?
             .unwrap_or_default()
@@ -890,9 +901,11 @@ fn write_marker(key: &str, m: &Marker) -> Result<()> {
     let paths: Vec<String> = m.paths.iter().map(Recorded::encode).collect();
     k.set_multi_sz(VAL_PATHS, &paths)?;
     k.set_multi_sz(VAL_EXTRA, &m.extra)?;
+    k.set_multi_sz(VAL_INCLUDE, &m.include)?;
     k.set_multi_sz(VAL_ENV_EXTRA, &m.env_extra)?;
     k.set_multi_sz(VAL_EXCLUSIONS, &m.exclusions)?;
     k.set_multi_sz(VAL_UNGRANTED, &m.ungranted_only)?;
+    k.set_multi_sz(VAL_INCLUSIONS, &m.inclusions)?;
     let notes: Vec<String> = m.notes.iter().map(Note::encode).collect();
     k.set_multi_sz(VAL_NOTES, &notes)?;
     match &m.header {
@@ -906,8 +919,10 @@ fn clear_marker(key: &str) -> Result<()> {
         for v in [
             VAL_HEADER,
             VAL_EXTRA,
+            VAL_INCLUDE,
             VAL_ENV_EXTRA,
             VAL_EXCLUSIONS,
+            VAL_INCLUSIONS,
             VAL_UNGRANTED,
             VAL_PATHS,
             VAL_NOTES,
@@ -1703,29 +1718,75 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<bool> {
     Ok(removed)
 }
 
-/// Exclusions added by the caller, as components beneath the profile,
-/// resolved where they exist. One outside the profile is an error.
-fn resolve_extra(profile: &str, raw: &[String]) -> Result<Vec<Vec<String>>> {
+/// Paths added by the caller (`flag` names the option, for the error),
+/// as components beneath the profile, resolved where they exist. One
+/// outside the profile is an error.
+fn resolve_added(profile: &str, flag: &str, raw: &[String]) -> Result<Vec<Vec<String>>> {
     let mut out: Vec<Vec<String>> = Vec::new();
     for r in raw {
         let absolute = match plan::rel_components(profile, r) {
             Ok(rel) => join(profile, &rel),
-            Err(e) => bail!("--exclude: {e}"),
+            Err(e) => bail!("{flag}: {e}"),
         };
         let resolved = match path_id::canonicalize_path(&absolute) {
             Ok((c, _)) => c,
             Err(_) => absolute,
         };
-        let rel =
-            plan::rel_components(profile, &resolved).map_err(|e| anyhow!("--exclude: {e}"))?;
+        let rel = plan::rel_components(profile, &resolved).map_err(|e| anyhow!("{flag}: {e}"))?;
         if rel.is_empty() {
-            bail!("--exclude '{r}' is the profile itself");
+            bail!("{flag} '{r}' is the profile itself");
         }
         if !out.contains(&rel) {
             out.push(rel);
         }
     }
     Ok(out)
+}
+
+/// The paths an earlier run recorded as added (`recorded`), unless
+/// they are to be replaced, with this run's (`raw`, resolved) added
+/// once each.
+fn added_paths(
+    profile: &str,
+    flag: &str,
+    recorded: &[String],
+    raw: &[String],
+    replace: bool,
+) -> Result<Vec<Vec<String>>> {
+    let mut out: Vec<Vec<String>> = if replace {
+        Vec::new()
+    } else {
+        recorded
+            .iter()
+            .map(|x| plan::split_path(x))
+            .filter(|x| !x.is_empty())
+            .collect()
+    };
+    for x in resolve_added(profile, flag, raw)? {
+        let same = |a: &Vec<String>| {
+            a.len() == x.len()
+                && a.iter()
+                    .zip(&x)
+                    .all(|(p, q)| plan::norm_component(p) == plan::norm_component(q))
+        };
+        if !out.iter().any(same) {
+            out.push(x);
+        }
+    }
+    Ok(out)
+}
+
+/// What a run of `profile grant` adds to the built-in lists.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Added<'a> {
+    /// `--exclude`: paths to keep unreadable.
+    pub exclude: &'a [String],
+    /// `--replace-excludes`: drop the exclusions earlier runs added.
+    pub replace_excludes: bool,
+    /// `--include`: paths to make readable.
+    pub include: &'a [String],
+    /// `--replace-includes`: drop the inclusions earlier runs added.
+    pub replace_includes: bool,
 }
 
 /// `profile grant`: bring the profile to the plan. Order: the record
@@ -1735,8 +1796,7 @@ pub fn grant(
     store: &Store<'_>,
     ids: &Ids,
     layout: &Layout,
-    extra_raw: &[String],
-    replace_extra: bool,
+    added: Added<'_>,
     progress: bool,
 ) -> Result<Report> {
     let started = std::time::Instant::now();
@@ -1756,26 +1816,20 @@ pub fn grant(
     drop(root);
 
     let old = read_marker_at(store.key)?;
-    let mut extra: Vec<Vec<String>> = if replace_extra {
-        Vec::new()
-    } else {
-        old.extra
-            .iter()
-            .map(|x| plan::split_path(x))
-            .filter(|x| !x.is_empty())
-            .collect()
-    };
-    for x in resolve_extra(profile, extra_raw)? {
-        let same = |a: &Vec<String>| {
-            a.len() == x.len()
-                && a.iter()
-                    .zip(&x)
-                    .all(|(p, q)| plan::norm_component(p) == plan::norm_component(q))
-        };
-        if !extra.iter().any(same) {
-            extra.push(x);
-        }
-    }
+    let extra = added_paths(
+        profile,
+        "--exclude",
+        &old.extra,
+        added.exclude,
+        added.replace_excludes,
+    )?;
+    let include = added_paths(
+        profile,
+        "--include",
+        &old.include,
+        added.include,
+        added.replace_includes,
+    )?;
     // Stores the caller's environment moves inside the profile, added
     // to those an earlier run recorded; no run drops them.
     let mut env_extra: Vec<Vec<String>> = old
@@ -1786,7 +1840,7 @@ pub fn grant(
         .collect();
     let (named_by_env, env_ignored) = plan::env_exclusions(&|var| layout.own(var));
     for named in named_by_env {
-        for x in resolve_extra(profile, &[named]).unwrap_or_default() {
+        for x in resolve_added(profile, "", &[named]).unwrap_or_default() {
             if !env_extra.contains(&x) {
                 env_extra.push(x);
             }
@@ -1797,7 +1851,42 @@ pub fn grant(
         layout.rel(&layout.roaming).as_deref(),
         layout.rel(&layout.local).as_deref(),
         &[extra.clone(), env_extra].concat(),
+        &include,
     );
+    // An added inclusion that an exclusion covers would grant nothing,
+    // and one in the temporary directory the same: refused. One an
+    // earlier run recorded is looked at again, as the built-in
+    // exclusions may have grown since; `--replace-includes` drops it.
+    {
+        let absolute = |rel: Vec<String>| -> Vec<String> {
+            rel.iter()
+                .map(|rel| format!("{}\\{rel}", profile.trim_end_matches('\\')))
+                .collect()
+        };
+        let protected = absolute(rules.spelled());
+        let ungranted = absolute(rules.spelled_ungranted());
+        let given = resolve_added(profile, "--include", added.include)?;
+        let same = |a: &[String], b: &[String]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(p, q)| plan::norm_component(p) == plan::norm_component(q))
+        };
+        for x in &include {
+            let path = join(profile, x);
+            let Some(why) = plan::include_refusal(&path, &protected, &ungranted) else {
+                continue;
+            };
+            if given.iter().any(|g| same(g, x)) {
+                bail!("--include: {why}");
+            }
+            bail!(
+                "the inclusion '{}' recorded by an earlier run: {why}; run with \
+                 `--replace-includes` and the inclusions you do want",
+                x.join("\\")
+            );
+        }
+    }
     // The rules the plan ends with include those carried over to the
     // targets of links; they are what is recorded.
     let (nodes, rules) = plan::plan_resolved(&mut DiskTree { profile }, &rules)
@@ -1842,6 +1931,7 @@ pub fn grant(
         }
     }
     let extra_strings: Vec<String> = extra.iter().map(|x| x.join("\\")).collect();
+    let include_strings: Vec<String> = include.iter().map(|x| x.join("\\")).collect();
     let absolute = |rel: Vec<String>| -> Vec<String> {
         rel.iter()
             .map(|rel| format!("{}\\{rel}", profile.trim_end_matches('\\')))
@@ -1849,6 +1939,7 @@ pub fn grant(
     };
     let exclusions = absolute(rules.spelled());
     let ungranted_only = absolute(rules.spelled_ungranted());
+    let inclusions = absolute(rules.spelled_included());
     let mut header = Header {
         list_version: plan::LIST_VERSION,
         complete: false,
@@ -1872,9 +1963,11 @@ pub fn grant(
         &Marker {
             header: Some(header.clone()),
             extra: extra_strings.clone(),
+            include: include_strings.clone(),
             env_extra: env_strings.clone(),
             exclusions: exclusions.clone(),
             ungranted_only: ungranted_only.clone(),
+            inclusions: inclusions.clone(),
             paths: pre,
             notes: old.notes.clone(),
         },
@@ -2203,9 +2296,11 @@ pub fn grant(
         &Marker {
             header: Some(header),
             extra: extra_strings,
+            include: include_strings,
             env_extra: env_strings,
             exclusions,
             ungranted_only,
+            inclusions,
             paths,
             notes,
         },
@@ -2318,9 +2413,11 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
                     ..h
                 }),
                 extra: marker.extra,
+                include: marker.include,
                 env_extra: marker.env_extra,
                 exclusions: marker.exclusions,
                 ungranted_only: marker.ungranted_only,
+                inclusions: marker.inclusions,
                 paths: all
                     .iter()
                     .filter(|r| failed_paths.contains(r.path.as_str()))
@@ -2439,9 +2536,11 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         "recorded_list_version": m.header.as_ref().map(|h| h.list_version),
         "profile": m.header.as_ref().map(|h| h.profile.as_str()),
         "extra_exclusions": m.extra,
+        "extra_inclusions": m.include,
         "env_exclusions": m.env_extra,
         "exclusions": m.exclusions,
         "ungranted_only": m.ungranted_only,
+        "inclusions": m.inclusions,
         "containers": count(Kind::Container),
         "granted": count(Kind::Granted),
         "files": count(Kind::File),
@@ -2608,10 +2707,19 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
             }
             !gone
         };
-        // A directory: a real one (not a link to somewhere else),
-        // which the grant made traversable.
+        // A directory: a real one (not a link to somewhere else), which
+        // the grant made traversable and whose contents it grants — one
+        // that is, or lies inside, an inclusion. A container on the way
+        // to an excluded store is traversable and holds nothing readable.
         let dir_readable = |p: &str| {
-            std::fs::symlink_metadata(p).is_ok_and(|md| md.is_dir()) && traversable(&m.paths, p)
+            std::fs::symlink_metadata(p).is_ok_and(|md| md.is_dir())
+                && traversable(&m.paths, p)
+                && m.inclusions.iter().any(|i| {
+                    matches!(
+                        plan::relation(p, i),
+                        Some(plan::Relation::Equal | plan::Relation::Inside)
+                    )
+                })
         };
         let mut withheld = serde_json::Map::new();
         let env: serde_json::Map<String, serde_json::Value> = plan::env_pointers(
@@ -2654,6 +2762,29 @@ mod tests {
     use crate::acl::{self, AceView};
 
     const TEST_KEY: &str = r"Software\sandbox-runtime\ProfileGrantTest";
+    /// A run that drops the exclusions earlier runs added.
+    const REPLACE_EXCLUDES: Added<'static> = Added {
+        exclude: &[],
+        replace_excludes: true,
+        include: &[],
+        replace_includes: false,
+    };
+
+    /// A run that adds `paths` to the exclusions.
+    fn excluding(paths: &[String]) -> Added<'_> {
+        Added {
+            exclude: paths,
+            ..Default::default()
+        }
+    }
+
+    /// A run that adds `paths` to the inclusions.
+    fn including(paths: &[String]) -> Added<'_> {
+        Added {
+            include: paths,
+            ..Default::default()
+        }
+    }
     /// Guests stands in for the sandbox group: resolvable, and never
     /// the identity the tests run as.
     const GROUP: &str = "S-1-5-32-546";
@@ -2804,9 +2935,11 @@ mod tests {
         let recorded = || Marker {
             header: Some(header.clone()),
             extra: Vec::new(),
+            include: Vec::new(),
             env_extra: Vec::new(),
             exclusions: vec![p(".ssh"), p("NTUSER.DAT*")],
             ungranted_only: vec![p(r"AppData\Local\Temp")],
+            inclusions: vec![p(".cargo")],
             paths: Vec::new(),
             notes: Vec::new(),
         };
@@ -3005,7 +3138,7 @@ mod tests {
         clear_marker(&key).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
-        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        let report = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert!(report.complete, "{report:?}");
         let deny_dir = vec![(true, true, 0x3u8, ALL)];
         assert_eq!(group_aces(&prof.join(r"dotfiles\.ssh")), deny_dir);
@@ -3020,10 +3153,10 @@ mod tests {
             group_aces(&prof.join(r"dotfiles\.config")),
             [(true, false, 0, LIST)]
         );
-        assert_eq!(
-            group_aces(&prof.join(r"dotfiles\README")),
-            [(true, false, 0, RX)]
-        );
+        // `dotfiles` is not an inclusion, so its own file gets nothing;
+        // `.config` is one and follows its link, so what is behind it
+        // and not excluded is granted.
+        assert!(group_aces(&prof.join(r"dotfiles\README")).is_empty());
         assert_eq!(
             group_aces(&prof.join(r"dotfiles\.config\nvim")),
             [(true, false, 0x3, RX)]
@@ -3106,8 +3239,9 @@ mod tests {
         clear_marker(&key).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
+        let docs = ["Documents".to_owned()];
         for run in ["first", "refresh"] {
-            let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+            let report = grant(&store, &ids, &layout, including(&docs), false).unwrap();
             assert!(report.complete, "{run}: {report:?}");
             assert!(report.unprotected.is_empty(), "{run}");
             assert!(report.unverifiable.is_empty(), "{run}: {report:?}");
@@ -3192,19 +3326,33 @@ mod tests {
             )
         };
 
-        let report = grant(&store, &ids, &unset, &[], false, false).unwrap();
+        let report = grant(&store, &ids, &unset, Added::default(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(denied(r".cargo\credentials.toml"));
         assert!(!denied(r"tools\cargo\credentials.toml"));
         let default_home =
             path_id::strip_extended_prefix(&canon(&prof.join(".cargo"))).to_lowercase();
-        assert_eq!(cargo_home(&unset), (Some(default_home), false));
-        assert_eq!(cargo_home(&moved), (None, true));
+        assert_eq!(cargo_home(&unset), (Some(default_home.clone()), false));
+        // The moved home lies under a directory the list does not name:
+        // nothing there is readable, and it is not offered.
+        assert!(group_aces(&prof.join("tools")).is_empty());
+        assert_eq!(cargo_home(&moved), (None, false));
 
-        let report = grant(&store, &ids, &moved, &[], false, false).unwrap();
+        // Protected where the variable points, but still not readable
+        // inside (its credential files make it a container, which holds
+        // nothing of its own): offered only once it is included.
+        let report = grant(&store, &ids, &moved, Added::default(), false).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(denied(r"tools\cargo\credentials.toml"));
+        assert!(group_aces(&prof.join(r"tools\cargo\config.toml")).is_empty());
+        assert!(group_aces(&prof.join(r"tools\other.txt")).is_empty());
+        assert_eq!(cargo_home(&moved), (None, false));
+        let tools = ["tools".to_owned()];
+        let report = grant(&store, &ids, &moved, including(&tools), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(denied(r"tools\cargo\credentials.toml"));
         assert!(!denied(r"tools\cargo\config.toml"));
+        assert!(!group_aces(&prof.join(r"tools\cargo\config.toml")).is_empty());
         assert!(!group_aces(&prof.join(r"tools\other.txt")).is_empty());
         let m = read_marker_at(KEY).unwrap();
         assert_eq!(
@@ -3212,19 +3360,30 @@ mod tests {
             [r"tools\cargo\credentials", r"tools\cargo\credentials.toml"]
         );
         assert!(plan::cargo_home_protected(&m.exclusions, &moved_to));
+        assert!(
+            m.inclusions
+                .iter()
+                .any(|i| i.to_lowercase().ends_with(r"\tools")),
+            "{:?}",
+            m.inclusions
+        );
         assert_eq!(cargo_home(&moved), (Some(moved_to.to_lowercase()), false));
+        assert_eq!(cargo_home(&unset), (Some(default_home), false));
         assert!(denied(r".cargo\credentials.toml"));
 
-        let report = grant(&store, &ids, &unset, &[], true, false).unwrap();
+        let report = grant(&store, &ids, &unset, REPLACE_EXCLUDES, false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(denied(r"tools\cargo\credentials.toml"));
-        assert_eq!(read_marker_at(KEY).unwrap().env_extra.len(), 2);
+        let m = read_marker_at(KEY).unwrap();
+        assert_eq!(m.env_extra.len(), 2);
+        assert_eq!(m.include, ["tools"], "the added inclusion stays");
+        assert_eq!(cargo_home(&moved), (Some(moved_to.to_lowercase()), false));
 
         let outside = Layout {
             own_env: vec![("CARGO_HOME".to_owned(), base.to_str().unwrap().to_owned())],
             ..unset.clone()
         };
-        let report = grant(&store, &ids, &outside, &[], false, false).unwrap();
+        let report = grant(&store, &ids, &outside, Added::default(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert_eq!(read_marker_at(KEY).unwrap().env_extra.len(), 2);
         assert_eq!(cargo_home(&outside), (None, false));
@@ -3313,8 +3472,16 @@ mod tests {
         clear_marker(&key).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
+        // The objects are under directories the built-in list does not
+        // name: the first run includes them, and the later runs keep
+        // that (`AppData\Roaming\Microsoft` lies above excluded stores,
+        // so it is granted child by child).
+        let mine = [
+            r"AppData\Roaming\Microsoft".to_owned(),
+            "Documents".to_owned(),
+        ];
         for run in ["first", "refresh"] {
-            let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+            let report = grant(&store, &ids, &layout, including(&mine), false).unwrap();
             let paths = |items: &[Item]| items.iter().map(|i| i.path.clone()).collect::<Vec<_>>();
             assert!(report.complete, "{run}: {report:?}");
             assert_eq!(
@@ -3399,7 +3566,7 @@ mod tests {
             &format!("(A;OICI;0x1200a9;;;{GROUP})(A;OICI;0x1200a9;;;BU)(A;OICI;FA;;;SY)"),
         ));
         disowned.push(docs.clone());
-        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        let report = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(report.stale_allow.is_empty(), "{report:?}");
         assert!(
@@ -3426,12 +3593,17 @@ mod tests {
                 .find(|i| i.path == path)
                 .map(|i| (i.protected_exclusion, i.entry, i.reason.clone()))
         };
+        // An exclusion beneath the included directory: it is to be
+        // granted child by child now, and cannot be rewritten.
+        let secret = [r"Documents\secret".to_owned()];
         let report = grant(
             &store,
             &ids,
             &layout,
-            &[r"Documents\secret".to_owned()],
-            true,
+            Added {
+                exclude: &secret,
+                ..REPLACE_EXCLUDES
+            },
             false,
         )
         .unwrap();
@@ -3442,12 +3614,34 @@ mod tests {
         let (protected, entry, reason) = ours(&report, &at("Documents")).unwrap();
         assert_eq!((protected, entry), (Some(true), Some("explicit")));
         assert!(reason.contains("an exclusion lies beneath it"), "{reason}");
+        // The directory itself excluded: its recorded inclusion would be
+        // refused, so the inclusions are replaced along with it.
+        let docs_excluded = ["Documents".to_owned()];
+        let e = grant(
+            &store,
+            &ids,
+            &layout,
+            Added {
+                exclude: &docs_excluded,
+                ..REPLACE_EXCLUDES
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("recorded by an earlier run"),
+            "{e:#}"
+        );
         let report = grant(
             &store,
             &ids,
             &layout,
-            &["Documents".to_owned()],
-            true,
+            Added {
+                exclude: &docs_excluded,
+                replace_excludes: true,
+                include: &[],
+                replace_includes: true,
+            },
             false,
         )
         .unwrap();
@@ -3476,7 +3670,20 @@ mod tests {
             status_json(&key, Ok(layout.clone()), false)["state"],
             "current"
         );
-        let report = grant(&store, &ids, &layout, &[], true, false).unwrap();
+        // Included again, and no longer excluded: the entry of the
+        // earlier run is the one wanted, and is left alone.
+        let docs_included = ["Documents".to_owned()];
+        let report = grant(
+            &store,
+            &ids,
+            &layout,
+            Added {
+                include: &docs_included,
+                ..REPLACE_EXCLUDES
+            },
+            false,
+        )
+        .unwrap();
         assert!(
             report.complete && report.stale_allow.is_empty(),
             "{report:?}"
@@ -3489,7 +3696,20 @@ mod tests {
         std::fs::write(&note, b"x").unwrap();
         let note = note.to_str().unwrap().to_owned();
         let by_child = [r"Shelf\box\secret".to_owned()];
-        let report = grant(&store, &ids, &layout, &by_child, true, false).unwrap();
+        let shelf_included = ["Shelf".to_owned()];
+        let report = grant(
+            &store,
+            &ids,
+            &layout,
+            Added {
+                exclude: &by_child,
+                replace_excludes: true,
+                include: &shelf_included,
+                replace_includes: false,
+            },
+            false,
+        )
+        .unwrap();
         assert!(report.complete, "{report:?}");
         assert_eq!(group_aces(std::path::Path::new(&note)).len(), 1);
         assert!(disown(
@@ -3497,7 +3717,7 @@ mod tests {
             &format!("(A;;0x1200a9;;;{GROUP})(A;;0x1200a9;;;BU)(A;;FA;;;SY)"),
         ));
         disowned.push(note.clone());
-        let report = grant(&store, &ids, &layout, &[], true, false).unwrap();
+        let report = grant(&store, &ids, &layout, REPLACE_EXCLUDES, false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(ours(&report, &at(r"Shelf\box\note.txt")).is_none());
         let stale: Vec<_> = report
@@ -3514,7 +3734,7 @@ mod tests {
             &note,
             &format!("(A;;0x1200a9;;;{GROUP})(A;;FA;;;{me})")
         ));
-        let report = grant(&store, &ids, &layout, &[], true, false).unwrap();
+        let report = grant(&store, &ids, &layout, REPLACE_EXCLUDES, false).unwrap();
         assert!(
             report.complete && report.stale_allow.is_empty(),
             "{report:?}"
@@ -3561,17 +3781,14 @@ mod tests {
         clear_marker(&key).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
-        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        let report = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert_eq!(group_aces(&prof.join("dotfiles")), [(true, false, 0, LIST)]);
         assert_eq!(
             group_aces(&prof.join(r"dotfiles\.ssh")),
             [(true, true, 0x3u8, ALL)]
         );
-        assert_eq!(
-            group_aces(&prof.join(r"dotfiles\README")),
-            [(true, false, 0, RX)]
-        );
+        assert!(group_aces(&prof.join(r"dotfiles\README")).is_empty());
         let f = forget(&store, &ids).unwrap();
         assert!(f.failed.is_empty(), "{f:?}");
         assert!(!prof.join(r"dotfiles\.ssh").exists());
@@ -3588,6 +3805,7 @@ mod tests {
         let outside = base.join("outside");
         for f in [
             r"Documents\a.txt",
+            r"scoop\shims\x.exe",
             r".ssh\id_ed25519",
             ".npmrc",
             "stray.txt",
@@ -3596,6 +3814,7 @@ mod tests {
             r".cargo\config.toml",
             r".cargo\bin\tool.exe",
             r"AppData\Roaming\npm\x.cmd",
+            r"AppData\Local\Programs\Tool\t.exe",
             r"AppData\Roaming\Microsoft\Credentials\c",
             r"AppData\Local\Temp\t.tmp",
             r"AppData\Local\Temp\session\s.txt",
@@ -3612,6 +3831,7 @@ mod tests {
         let touched = [
             "",
             "Documents",
+            "scoop",
             ".ssh",
             ".npmrc",
             ".netrc",
@@ -3625,6 +3845,7 @@ mod tests {
             r"AppData\Roaming\Microsoft",
             r"AppData\Roaming\Microsoft\Credentials",
             r"AppData\Local",
+            r"AppData\Local\Programs",
             r"AppData\Local\Temp",
         ];
         let snapshot =
@@ -3639,7 +3860,7 @@ mod tests {
         clear_marker(TEST_KEY).unwrap();
         let ids = ids();
         let layout = Layout::resolve(Some(prof.to_str().unwrap())).unwrap();
-        let report = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        let report = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(report.complete, "{report:?}");
 
@@ -3652,16 +3873,25 @@ mod tests {
             r"AppData\Roaming",
             r"AppData\Roaming\Microsoft",
             r"AppData\Local",
+            r"AppData\Local\Programs",
         ] {
             assert_eq!(group_aces(&prof.join(c)), allow(0, LIST), "container '{c}'");
         }
-        for g in ["Documents", r".cargo\bin", r"AppData\Roaming\npm"] {
+        for g in [
+            "scoop",
+            r".cargo\bin",
+            r"AppData\Roaming\npm",
+            r"AppData\Local\Programs\Tool",
+        ] {
             assert_eq!(group_aces(&prof.join(g)), allow(0x3, RX), "granted '{g}'");
         }
         assert_eq!(
-            group_aces(&prof.join(r"Documents\a.txt")),
+            group_aces(&prof.join(r"scoop\shims\x.exe")),
             [(false, false, 0, RX)]
         );
+        // Not on the list: no entry, and nothing beneath.
+        assert!(group_aces(&prof.join("Documents")).is_empty());
+        assert!(group_aces(&prof.join(r"Documents\a.txt")).is_empty());
         for f in [".npmrc", r".cargo\config.toml"] {
             assert_eq!(group_aces(&prof.join(f)), allow(0, RX), "file '{f}'");
         }
@@ -3750,15 +3980,20 @@ mod tests {
             );
         }
 
+        // A new child of a container is readable after a refresh; a new
+        // top-level directory the list does not name never is.
+        write(&prof, r"AppData\Local\Programs\NewTool\n.txt");
         write(&prof, r"NewTop\n.txt");
-        assert!(group_aces(&prof.join("NewTop")).is_empty());
-        let again = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        let new_tool = prof.join(r"AppData\Local\Programs\NewTool");
+        assert!(group_aces(&new_tool).is_empty());
+        let again = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert!(again.complete, "{again:?}");
-        assert_eq!(group_aces(&prof.join("NewTop")), allow(0x3, RX));
+        assert_eq!(group_aces(&new_tool), allow(0x3, RX));
+        assert!(group_aces(&prof.join("NewTop")).is_empty());
         assert_eq!(group_aces(&prof.join(".ssh")), deny_dir);
         assert!(group_aces(&prof.join(".netrc")).iter().all(|a| a.1));
         assert_eq!(again.writes, 4, "{again:?}");
-        let third = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        let third = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert_eq!(third.writes, 0, "{third:?}");
         assert_eq!(explicit(&outside), outside_before);
 
@@ -3797,37 +4032,37 @@ mod tests {
             named,
             [path_id::strip_extended_prefix(&canon(&npmrc)).to_lowercase()]
         );
-        let again = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        let again = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert_eq!(again.writes, 1, "{again:?}");
         let st = status_json(TEST_KEY, Ok(layout.clone()), false);
         assert!(st["env"]["NPM_CONFIG_USERCONFIG"].is_string(), "{st}");
         assert_eq!(st["replaced_files"], serde_json::json!([]));
 
-        let with_extra = grant(
-            &store,
-            &ids,
-            &layout,
-            &["NewTop".to_owned(), r"AppData\Local\Temp\keys".to_owned()],
-            false,
-            false,
-        )
-        .unwrap();
+        let extra = [
+            r"AppData\Local\Programs\NewTool".to_owned(),
+            r"AppData\Local\Temp\keys".to_owned(),
+        ];
+        let with_extra = grant(&store, &ids, &layout, excluding(&extra), false).unwrap();
         assert!(with_extra.complete, "{with_extra:?}");
-        assert_eq!(group_aces(&prof.join("NewTop")), deny_dir);
+        assert_eq!(group_aces(&new_tool), deny_dir);
         assert_eq!(group_aces(&prof.join(r"AppData\Local\Temp\keys")), deny_dir);
         assert!(group_aces(&prof.join(r"AppData\Local\Temp")).is_empty());
         assert!(group_aces(&prof.join(r"AppData\Local\Temp\session")).is_empty());
-        assert!(group_aces(&prof.join(r"NewTop\n.txt")).iter().all(|a| a.1));
+        assert!(group_aces(&new_tool.join("n.txt")).iter().all(|a| a.1));
 
-        let kept = grant(&store, &ids, &layout, &[], false, false).unwrap();
+        let kept = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert!(kept.complete, "{kept:?}");
         assert_eq!(kept.writes, 0, "{kept:?}");
-        assert_eq!(group_aces(&prof.join("NewTop")), deny_dir);
+        assert_eq!(group_aces(&new_tool), deny_dir);
         let st = status_json(TEST_KEY, Ok(layout.clone()), false);
         assert_eq!(
             st["extra_exclusions"],
-            serde_json::json!(["NewTop", r"AppData\Local\Temp\keys"])
+            serde_json::json!([
+                r"AppData\Local\Programs\NewTool",
+                r"AppData\Local\Temp\keys"
+            ])
         );
+        assert_eq!(st["extra_inclusions"], serde_json::json!([]));
         let listed: Vec<String> = st["exclusions"]
             .as_array()
             .unwrap()
@@ -3836,7 +4071,7 @@ mod tests {
             .collect();
         let at = |rel: &str| format!("{}{rel}", layout.profile.to_lowercase());
         for want in [
-            r"\newtop",
+            r"\appdata\local\programs\newtool",
             r"\.ssh",
             r"\appdata\local\temp\keys",
             r"\ntuser.dat*",
@@ -3851,17 +4086,83 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_lowercase())
             .collect();
         assert_eq!(ungranted, [at(r"\appdata\local\temp")]);
-        let same = grant(&store, &ids, &layout, &["newtop".to_owned()], false, false).unwrap();
+        let included: Vec<String> = st["inclusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_lowercase())
+            .collect();
+        for want in [r"\scoop", r"\appdata\local\programs", r"\.cargo"] {
+            assert!(included.contains(&at(want)), "{want} not in {included:?}");
+        }
+        assert!(!included.iter().any(|i| i.ends_with(r"\documents")));
+        let respelled = [r"appdata\local\programs\newtool".to_owned()];
+        let same = grant(&store, &ids, &layout, excluding(&respelled), false).unwrap();
         assert_eq!(same.writes, 0, "{same:?}");
-        let replaced = grant(&store, &ids, &layout, &[], true, false).unwrap();
+        let replaced = grant(&store, &ids, &layout, REPLACE_EXCLUDES, false).unwrap();
         assert!(replaced.complete, "{replaced:?}");
-        assert_eq!(group_aces(&prof.join("NewTop")), allow(0x3, RX));
+        assert_eq!(group_aces(&new_tool), allow(0x3, RX));
         assert!(group_aces(&prof.join(r"AppData\Local\Temp\keys")).is_empty());
         assert_eq!(
             status_json(TEST_KEY, Ok(layout.clone()), false)["extra_exclusions"],
             serde_json::json!([])
         );
         assert_eq!(group_aces(&prof.join(".ssh")), deny_dir);
+
+        // An added inclusion opens an unlisted directory, whole; a
+        // refresh keeps it; replacing the added inclusions closes it
+        // again. One that is excluded, or in the temporary directory,
+        // is refused.
+        let docs = ["Documents".to_owned()];
+        let opened = grant(&store, &ids, &layout, including(&docs), false).unwrap();
+        assert!(opened.complete, "{opened:?}");
+        assert_eq!(group_aces(&prof.join("Documents")), allow(0x3, RX));
+        assert_eq!(
+            group_aces(&prof.join(r"Documents\a.txt")),
+            [(false, false, 0, RX)]
+        );
+        assert_eq!(
+            status_json(TEST_KEY, Ok(layout.clone()), false)["extra_inclusions"],
+            serde_json::json!(["Documents"])
+        );
+        let kept = grant(&store, &ids, &layout, Added::default(), false).unwrap();
+        assert_eq!(kept.writes, 0, "{kept:?}");
+        assert_eq!(group_aces(&prof.join("Documents")), allow(0x3, RX));
+        for (refused, word) in [
+            (".ssh", "excluded"),
+            (r".ssh\keys", "excluded"),
+            (r"AppData\Local\Temp\session", "nothing is granted"),
+        ] {
+            let e = grant(
+                &store,
+                &ids,
+                &layout,
+                including(&[refused.to_owned()]),
+                false,
+            )
+            .unwrap_err();
+            assert!(format!("{e:#}").contains(word), "{refused}: {e:#}");
+        }
+        assert_eq!(group_aces(&prof.join("Documents")), allow(0x3, RX));
+        let closed = grant(
+            &store,
+            &ids,
+            &layout,
+            Added {
+                replace_includes: true,
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        assert!(closed.complete, "{closed:?}");
+        assert!(closed.removed >= 1, "{closed:?}");
+        assert!(group_aces(&prof.join("Documents")).is_empty());
+        assert!(group_aces(&prof.join(r"Documents\a.txt")).is_empty());
+        assert_eq!(
+            status_json(TEST_KEY, Ok(layout.clone()), false)["extra_inclusions"],
+            serde_json::json!([])
+        );
 
         let f = forget(&store, &ids).unwrap();
         assert!(f.failed.is_empty(), "{f:?}");
@@ -3875,7 +4176,7 @@ mod tests {
             }
         }
         assert!(group_aces(&prof.join(r"Documents\a.txt")).is_empty());
-        assert!(group_aces(&prof.join("NewTop")).is_empty());
+        assert!(group_aces(&new_tool).is_empty());
         assert!(read_marker_at(TEST_KEY).unwrap().is_empty());
         assert!(!db_has_rows(&conn).unwrap());
         assert_eq!(status_json(TEST_KEY, Ok(layout), false)["state"], "none");

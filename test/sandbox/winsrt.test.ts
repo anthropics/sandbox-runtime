@@ -1538,6 +1538,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         staleAllow: [],
         replacedFiles: [],
         extraExclusions: [],
+        extraInclusions: [],
         exclusions: [],
         ungrantedOnly: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
@@ -1554,6 +1555,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         staleAllow: [],
         replacedFiles: [],
         extraExclusions: [],
+        extraInclusions: [],
         exclusions: [],
         ungrantedOnly: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
@@ -6852,6 +6854,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     list_version: 1,
     recorded_list_version: 1,
     extra_exclusions: extra,
+    extra_inclusions: ['tools'],
     exclusions: exclusions(),
     ungranted_only: ungrantedOnly(),
     containers: 2,
@@ -8231,6 +8234,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       const r = await winUtils.installWindowsSandboxAsync({
         srtWin,
         profileExclude: ['.myapp'],
+        profileInclude: ['tools'],
         onProfileGrantProgress: l => progress.push(l),
       })
       expect(asyncCalls.map(a => a.slice(0, 2).join(' '))).toEqual([
@@ -8244,6 +8248,8 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         '--json',
         '--exclude',
         '.myapp',
+        '--include',
+        'tools',
       ])
       expect(progress).toHaveLength(2)
       expect(r.profileGrant).toEqual({
@@ -8876,12 +8882,14 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(winUtils.windowsGrantsBeneathDenies([home], [home])).toEqual([])
     })
 
-    it('grantWindowsProfileRead: a refresh names no exclusion and drops none; replacing them is explicit', async () => {
+    it('grantWindowsProfileRead: a refresh names no exclusion or inclusion and drops none; replacing them is explicit', async () => {
       await winUtils.grantWindowsProfileRead({ srtWin })
       await winUtils.grantWindowsProfileRead({
         srtWin,
         exclude: ['.only'],
         replaceExclusions: true,
+        include: [join(home, 'tools'), 'Documents'],
+        replaceInclusions: true,
       })
       expect(asyncCalls).toEqual([
         ['profile', 'grant', '--json'],
@@ -8892,6 +8900,11 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           '--exclude',
           '.only',
           '--replace-excludes',
+          '--include',
+          join(home, 'tools'),
+          '--include',
+          'Documents',
+          '--replace-includes',
         ],
       ])
     })
@@ -8946,6 +8959,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(st.state).toBe('current')
       expect(st.profile).toBe(home)
       expect(st.extraExclusions).toEqual(['.myapp'])
+      expect(st.extraInclusions).toEqual(['tools'])
       expect(st.exclusions).toEqual(exclusions())
       expect(st.ungrantedOnly).toEqual(ungrantedOnly())
       expect(st.counts).toEqual({
@@ -8968,6 +8982,12 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(odd.state).toBe('unknown')
       expect(odd.exclusions).toEqual([])
       expect(odd.ungrantedOnly).toEqual([])
+      // A status that says nothing of added inclusions (an srt-win
+      // without `--include`): still a usable grant, with none added.
+      profileStatus = { ...current(), extra_inclusions: undefined }
+      const older = winUtils.getWindowsProfileReadStatus({ srtWin })
+      expect(older.state).toBe('current')
+      expect(older.extraInclusions).toEqual([])
     })
 
     it('windowsProfileExclusionConflicts: equal, inside, above, wildcards, and what is unrelated', () =>
@@ -9044,6 +9064,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         staleAllow: [],
         replacedFiles: [],
         extraExclusions: [],
+        extraInclusions: [],
         exclusions: [],
         ungrantedOnly: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
