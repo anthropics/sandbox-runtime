@@ -90,6 +90,8 @@ import {
   type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
   getWindowsProfileReadStatusAsync,
+  refreshWindowsProfileRead,
+  windowsProfileGrantRefreshable,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
   type WindowsAclRevokeResult,
@@ -271,6 +273,7 @@ export interface WindowsProfileReadWarning {
     | 'profile_exclusion_unprotected'
     | 'profile_exclusion_unverifiable'
     | 'profile_stale_allow'
+    | 'profile_volume_unreachable'
     | 'profile_file_replaced'
   message: string
   paths: WindowsProfileGrantItem[]
@@ -286,7 +289,7 @@ export function windowsProfileReadWarningsOf(
     WindowsProfileGrantStatus,
     'unprotected' | 'unverifiable' | 'staleAllow'
   > &
-    Partial<Pick<WindowsProfileGrantStatus, 'replacedFiles'>>,
+    Partial<Pick<WindowsProfileGrantStatus, 'replacedFiles' | 'unreachable'>>,
 ): WindowsProfileReadWarning[] {
   const list = (items: readonly WindowsProfileGrantItem[]) =>
     items.map(i => i.path).join(', ')
@@ -373,6 +376,18 @@ export function windowsProfileReadWarningsOf(
         `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
         `path's reason gives the icacls command that removes the entry.`,
       paths: grant.staleAllow,
+    })
+  }
+  const unreachable = grant.unreachable ?? []
+  if (unreachable.length > 0) {
+    out.push({
+      code: 'profile_volume_unreachable',
+      message:
+        `${unreachable.length} path(s) that have left the profile read ` +
+        `grant are on a volume that cannot be reached now, and may still ` +
+        `carry an entry of it: ${list(unreachable)}. It is removed when ` +
+        `the volume is back.`,
+      paths: unreachable,
     })
   }
   const replaced = grant.replacedFiles ?? []
@@ -1288,7 +1303,8 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
-    // initialize() never writes or refreshes the profile read grant.
+    // initialize() writes the profile read grant only to narrow one
+    // already there (windowsProfileGrantRefreshable).
     windowsProfileReadWarnings = []
     let profileRead: 'granted' | 'absent' = 'absent'
     let profileExclusions: Parameters<
@@ -1302,7 +1318,19 @@ async function initializeSteps(
       }
       windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
       if (u.profileGrant) {
-        const grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        let grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        // Before this session is a holder of anything: the grant is
+        // written only while no session or command holds it.
+        if (windowsProfileGrantRefreshable(grant)) {
+          logForDebugging(
+            `[Sandbox Windows] refreshing the profile read grant ` +
+              `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''})`,
+          )
+          grant = await refreshWindowsProfileRead({
+            srtWin,
+            onProgress: line => logForDebugging(`[Sandbox Windows] ${line}`),
+          })
+        }
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
             'profile_grant_outdated',
@@ -1313,7 +1341,7 @@ async function initializeSteps(
               `user who starts sessions to bring it up to date, or ` +
               `forgetWindowsProfileRead() (\`srt-win profile forget\`) to ` +
               `run without reading the profile. initialize() does neither ` +
-              `itself.`,
+              `itself for a grant in this state.`,
           )
         }
         if (grant.state === 'current') {

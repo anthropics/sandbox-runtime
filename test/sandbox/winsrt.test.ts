@@ -228,6 +228,7 @@ const SRT_WIN_CAPABILITIES = [
   'kept-grant-holders',
   'read-deny-except',
   'exec-holder',
+  'profile-refresh',
 ]
 const CURRENT_PROFILE_GRANT = JSON.stringify({
   record_version: 1,
@@ -1483,12 +1484,14 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       }),
       spyOn(winUtils, 'getWindowsProfileReadStatus').mockReturnValue({
         state: 'current',
+        sameProfile: true,
         capabilities: SRT_WIN_CAPABILITIES,
         notGranted: [],
         selfClosed: [],
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
+        unreachable: [],
         replacedFiles: [],
         extraExclusions: [],
         extraInclusions: [],
@@ -1501,12 +1504,14 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       }),
       spyOn(winUtils, 'getWindowsProfileReadStatusAsync').mockResolvedValue({
         state: 'current',
+        sameProfile: true,
         capabilities: SRT_WIN_CAPABILITIES,
         notGranted: [],
         selfClosed: [],
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
+        unreachable: [],
         replacedFiles: [],
         extraExclusions: [],
         extraInclusions: [],
@@ -6780,7 +6785,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     )
   }
 
-  describe('a default session: initialize() checks the record and never writes the grant', () => {
+  describe('a default session: initialize() checks the record and never creates the grant', () => {
     it('a current grant: one `profile status`, without the path list, then the session as usual', async () => {
       // The status is read without blocking the event loop.
       const blocking = spyOn(winUtils, 'getWindowsProfileReadStatus')
@@ -6869,6 +6874,142 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(SandboxManager.getConfig()).toBeUndefined()
       })
     }
+
+    describe('an outdated grant it may narrow by itself', () => {
+      const refreshable = (patch: Record<string, unknown> = {}) => ({
+        ...current(),
+        state: 'outdated',
+        reason: 'made with list version 3; this build has 4',
+        list_version: 4,
+        recorded_list_version: 3,
+        same_profile: true,
+        last_operation: 'grant',
+        ...patch,
+      })
+      const granted = () => asyncCalls.some(a => a[1] === 'grant')
+      /** What `profile status` says before the grant runs, and after. */
+      const until = (before: Record<string, unknown>) => ({
+        toJSON: () => (granted() ? current() : before),
+      })
+      const report = (patch: Record<string, unknown>) =>
+        JSON.stringify({ ...JSON.parse(grantJson()), ...patch })
+      const staleItem = { path: 'C:\\p\\Documents', reason: 'copies beneath' }
+
+      for (const [what, patch] of [
+        ['an older list on the same profile', {}],
+        [
+          'a grant cut short',
+          { state: 'incomplete', recorded_list_version: 4 },
+        ],
+      ] as const) {
+        it(`${what}: refreshed before the session starts, and the session runs on it`, async () => {
+          profileStatus = until(refreshable(patch))
+          await SandboxManager.initialize(config())
+          expect(asyncCalls.filter(a => a[0] === 'profile')).toEqual([
+            ['profile', 'grant', '--json', '--refresh'],
+          ])
+          expect(names()).toEqual([
+            'profile status',
+            'profile status',
+            'acl grant',
+          ])
+          expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
+        })
+      }
+
+      for (const [what, patch] of [
+        [
+          'a forget cut short',
+          { state: 'incomplete', last_operation: 'forget' },
+        ],
+        [
+          'a run that does not say what it was',
+          { state: 'incomplete', last_operation: undefined },
+        ],
+        ['another profile', { same_profile: false }],
+        ['a status that does not say whose it is', { same_profile: undefined }],
+        ['a record newer than this build', { recorded_list_version: 5 }],
+        [
+          'a run cut short on a record newer than this build',
+          { state: 'incomplete', recorded_list_version: 5 },
+        ],
+        [
+          'a record older than the narrowing range',
+          { recorded_list_version: 2 },
+        ],
+        ['a list beyond the narrowing range', { list_version: 5 }],
+        ['the same list', { recorded_list_version: 4 }],
+        ['a status without versions', { list_version: undefined }],
+      ] as const) {
+        it(`${what}: profile_grant_outdated, and the grant is not run`, async () => {
+          profileStatus = refreshable(patch)
+          const e = await rejection(config())
+          expect(e.code).toBe('profile_grant_outdated')
+          expect(asyncCalls.some(a => a[0] === 'profile')).toBe(false)
+          expect(names()).toEqual(['profile status'])
+        })
+      }
+
+      for (const [what, patch] of [
+        ['exit 0 with a stale allow', { stale_allow: [staleItem] }],
+        [
+          'exit 0 with an excluded path still open through our entry',
+          { unprotected: [{ ...staleItem, entry: 'explicit' }] },
+        ],
+        ['exit 0 and not complete', { complete: false }],
+      ] as const) {
+        it(`${what}: profile_grant_refresh_failed, and no session starts`, async () => {
+          profileStatus = until(refreshable())
+          grantRun = { stderr: [], stdout: report(patch), code: 0 }
+          const e = await rejection(config())
+          expect(e).toBeInstanceOf(WindowsSandboxError)
+          expect(e.code).toBe('profile_grant_refresh_failed')
+          expect(names()).not.toContain('acl grant')
+          expect(SandboxManager.getConfig()).toBeUndefined()
+        })
+      }
+
+      it('names what it could not revoke', async () => {
+        profileStatus = until(refreshable())
+        grantRun = {
+          stderr: [],
+          stdout: report({ stale_allow: [staleItem] }),
+          code: 0,
+        }
+        const e = await rejection(config())
+        expect(e.message).toContain(staleItem.path)
+        expect(e.message).toContain('copies beneath')
+      })
+
+      it('an unreachable volume is reported and holds nothing back', async () => {
+        const unreachable = [{ path: 'Q:\\gone', reason: 'volume' }]
+        profileStatus = {
+          toJSON: () =>
+            granted() ? { ...current(), unreachable } : refreshable(),
+        }
+        grantRun = { stderr: [], stdout: report({ unreachable }), code: 0 }
+        await SandboxManager.initialize(config())
+        expect(names()).toContain('acl grant')
+        expect(
+          SandboxManager.getWindowsProfileReadWarnings().map(w => w.code),
+        ).toEqual(['profile_volume_unreachable'])
+      })
+
+      for (const [code, want] of [
+        [24, 'profile_grant_blocked_by_session'],
+        [25, 'profile_operation_in_progress'],
+        [1, 'profile_grant_failed'],
+      ] as const) {
+        it(`srt-win exits ${code}: ${want}, and no session starts`, async () => {
+          profileStatus = until(refreshable())
+          grantRun = { stderr: [], stdout: '', code }
+          const e = await rejection(config())
+          expect(e.code).toBe(want)
+          expect(names()).not.toContain('acl grant')
+          expect(SandboxManager.getConfig()).toBeUndefined()
+        })
+      }
+    })
 
     for (const [what, patch] of [
       ['no exclusion list', { exclusions: undefined }],
@@ -8182,6 +8323,8 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       ])
       expect(r).toEqual({
         profile: home,
+        complete: true,
+        placeholdersRemoved: 0,
         containers: 4,
         granted: 30,
         files: 6,
@@ -8196,6 +8339,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
+        unreachable: [],
         forgottenRoots: [],
         elapsedMs: 1234,
       })
@@ -8758,12 +8902,14 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         state: winUtils.WindowsProfileGrantState,
       ): winUtils.WindowsProfileGrantStatus => ({
         state,
+        sameProfile: true,
         capabilities: [],
         notGranted: [],
         selfClosed: [],
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
+        unreachable: [],
         replacedFiles: [],
         extraExclusions: [],
         extraInclusions: [],
