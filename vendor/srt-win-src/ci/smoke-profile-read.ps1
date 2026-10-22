@@ -2,8 +2,9 @@
   Smoke test for the profile read grant
   (`srt-win profile grant | forget | status`, `profile.rs`).
 
-  The grant makes the real user's profile readable to the sandbox
-  group, except for the excluded credential stores. This script never
+  The grant makes the listed tool directories of the real user's
+  profile readable to the sandbox group, minus the excluded credential
+  stores, and leaves the rest of the profile alone. This script never
   touches the runner's own profile: it builds a made-up profile tree
   under a scratch root and hands it to `profile grant` through
   `--test-profile`, which exists only in the test-hooks build.
@@ -26,11 +27,15 @@
         time it took is printed. `profile status` reports it current
         for the made-up profile and outdated for the real one; `user
         status` reports a grant.
-    R1  a sandboxed command reads a file under a granted child.
+    R1  a sandboxed command reads a file under a listed directory
+        (`.local`), and under a bulk tree inside another (`go`).
     R2  it runs an .exe from a per-user tool directory on PATH.
     R3  it reads `.npmrc` in the profile root.
     R4  it lists a container, and cannot read a file in the root that
         is not granted by name.
+    R5  an unlisted directory (Documents) is not readable, carries no
+        entry, and is not denied: a session grants it to itself with
+        `acl grant`, and it is readable for that session only.
     X   it cannot read a key directory, a credential file in the
         root, or a store under AppData\Roaming.
     TMP the temporary directory is left ungranted, not denied: a file
@@ -44,12 +49,19 @@
     X2  an exclusion deleted and created again is still unreadable,
         and so is a credential file replaced by write-then-rename
         (in the root and in a container).
-    N   a new top-level child is unreadable until `profile grant` is
-        run again, and readable after.
+    N   a new child of a listed container (AppData\Local\Programs) is
+        unreadable until `profile grant` is run again, and readable
+        after; a new unlisted top-level directory stays unreadable.
     E   a path added with `--exclude` becomes unreadable; a refresh
         that does not name it keeps it excluded, and the record lists
         it beside the built-in exclusions; only `--replace-excludes`
         re-admits it, and no built-in exclusion goes with it.
+    I   a directory added with `--include` (Documents) becomes
+        readable, whole; a refresh that does not name it keeps it, and
+        the record lists it; `--replace-includes` drops it, and it is
+        unreadable again. An `--include` of an excluded path, of a path
+        inside one, or of a path in the temporary directory is refused
+        and records nothing.
     A   `acl grant` (a session's grants) refuses, and grants nothing,
         when a write root is a protected exclusion, lies inside one,
         or lies above one (the profile directory), and when it is the
@@ -59,7 +71,7 @@
         admits no write root. A write root inside the temporary
         directory is granted as usual.
     W   it cannot write, create, delete, rename or mkdir under a
-        granted child, a container, or the profile root.
+        listed directory, a container, or the profile root.
     J   a junction inside a granted directory pointing at an excluded
         store, and one pointing outside the profile, cannot be read
         through; the targets' DACLs are unchanged after the grant and
@@ -67,10 +79,9 @@
         reported. (A file symbolic link too, where one can be made.)
     D   a session read deny on the profile directory — stamped on
         every path the grant made readable, as the library does —
-        and one on a granted child, deny for that session and are
-        gone after it; a deny beneath a granted child needs no more
-        than its own path. OBSERVATION: what a deny stamped on the
-        profile directory alone leaves readable.
+        and one on a listed directory, deny for that session and are
+        gone after it; a deny beneath a listed directory needs no more
+        than its own path.
     O   an exec under the ordinary token is refused (exit 20) while
         the grant exists.
     F   `profile forget` (what a session under the ordinary token
@@ -240,6 +251,11 @@ function Explicit-Aces { param([string] $p)
   @([regex]::Matches($dacl, '\(([^;)]*);([^;)]*);[^)]*\)') | Where-Object { $_.Groups[2].Value -notmatch 'ID' } |
     ForEach-Object Value)
 }
+# Whether a path's DACL names the sandbox group in an ACE of its own
+# (not one inherited from a directory above).
+function Has-ExplicitGroup { param([string] $p)
+  @(Explicit-Aces $p | Where-Object { $_ -match [regex]::Escape($script:grpSid) }).Count -gt 0
+}
 function Denies-First { param([string] $p)
   $seenAllow = $false
   foreach ($a in (Explicit-Aces $p)) {
@@ -279,10 +295,13 @@ try {
   New-Item -ItemType Directory -Path $prof, $outside -Force | Out-Null
 
   # ── The made-up profile ──────────────────────────────────────────
-  $note     = Seed 'Documents\note.txt'                         'NOTE-CONTENT'
-  $subFile  = Seed 'Documents\sub\deep.txt'                     'DEEP-CONTENT'
-  $null     = Seed 'Documents\del.txt'                          'DEL'
-  $null     = Seed 'Documents\ren.txt'                          'REN'
+  # `.local` stands for a listed directory (a per-user tool root);
+  # `Documents` for one the list does not name.
+  $note     = Seed '.local\note.txt'                            'NOTE-CONTENT'
+  $subFile  = Seed '.local\sub\deep.txt'                        'DEEP-CONTENT'
+  $null     = Seed '.local\del.txt'                             'DEL'
+  $null     = Seed '.local\ren.txt'                             'REN'
+  $docNote  = Seed 'Documents\note.txt'                         'DOC-CONTENT'
   $npmrc    = Seed '.npmrc'                                     'NPMRC-CONTENT'
   $stray    = Seed 'stray.txt'                                  'STRAY-CONTENT'
   $netrc    = Seed '.netrc'                                     'NETRC-CONTENT'
@@ -299,20 +318,20 @@ try {
   Copy-Item $cmd (Join-Path $toolDir 'srtsmoketool.exe')
   $bulkDirs = 20; $bulkFiles = 150
   foreach ($i in 0..($bulkDirs - 1)) {
-    $d = Join-Path $prof ("bulk\d{0:d3}" -f $i)
+    $d = Join-Path $prof ("go\pkg\d{0:d3}" -f $i)
     New-Item -ItemType Directory -Path $d -Force | Out-Null
     foreach ($k in 0..($bulkFiles - 1)) { [System.IO.File]::WriteAllText((Join-Path $d ("f{0:d3}.txt" -f $k)), 'BULK-CONTENT') }
   }
-  $bulkSample = Join-Path $prof 'bulk\d019\f149.txt'
+  $bulkSample = Join-Path $prof 'go\pkg\d019\f149.txt'
   $secret = Join-Path $outside 'secret.txt'
   'OUTSIDE-CONTENT' | Set-Content -Encoding ASCII -LiteralPath $secret
   $jTop     = Join-Path $prof 'link'
-  $jOutside = Join-Path $prof 'Documents\to-outside'
-  $jSsh     = Join-Path $prof 'Documents\to-ssh'
+  $jOutside = Join-Path $prof '.local\to-outside'
+  $jSsh     = Join-Path $prof '.local\to-ssh'
   New-Item -ItemType Junction -Path $jTop     -Target $outside               | Out-Null
   New-Item -ItemType Junction -Path $jOutside -Target $outside               | Out-Null
   New-Item -ItemType Junction -Path $jSsh     -Target (Join-Path $prof '.ssh') | Out-Null
-  $symFile = Join-Path $prof 'Documents\sym.txt'
+  $symFile = Join-Path $prof '.local\sym.txt'
   $haveSym = $false
   try {
     New-Item -ItemType SymbolicLink -Path $symFile -Target $secret -ea Stop | Out-Null
@@ -320,13 +339,13 @@ try {
   } catch { Write-Host "J: no file symbolic link on this runner ($_); that part of J is not run" }
 
   $touched = @(
-    $prof, (Join-Path $prof 'Documents'), $note, $npmrc, (Join-Path $prof '.cargo'), $cargoCfg,
+    $prof, (Join-Path $prof '.local'), $note, (Join-Path $prof 'Documents'), $docNote, $npmrc, (Join-Path $prof '.cargo'), $cargoCfg,
     (Join-Path $prof 'AppData'), (Join-Path $prof 'AppData\Roaming'),
     (Join-Path $prof 'AppData\Roaming\Microsoft'), (Join-Path $prof 'AppData\Roaming\Microsoft\Credentials'),
     $credBlob, (Join-Path $prof 'AppData\Roaming\npm'), $npmTool, (Join-Path $prof 'AppData\Local'),
     (Join-Path $prof 'AppData\Local\Temp'), $tempFile, (Join-Path $prof 'AppData\Local\Temp\session'),
     $sessFile, (Join-Path $prof 'AppData\Local\Programs'),
-    $toolDir, (Join-Path $prof 'bulk'), $bulkSample, $stray)
+    $toolDir, (Join-Path $prof 'go'), $bulkSample, $stray)
   $replaced = @((Join-Path $prof '.ssh'), $sshKey, $netrc, $cargoCr)
   $pre = @{}
   foreach ($p in $touched) { $pre[$p] = Dacl $p }
@@ -368,8 +387,10 @@ try {
   $lockedDir  = Join-Path $prof '.azure'
   $lockedFile = Seed '.azure\tok.txt' 'LOCKED-CONTENT'
   & icacls $lockedDir /deny '*S-1-1-0:(OI)(CI)(RX)' '*S-1-5-11:(OI)(CI)(RX)' '*S-1-5-32-545:(OI)(CI)(RX)' | Out-Null
-  $instDir  = Join-Path $prof 'AppData\Roaming\Microsoft\Installer'
-  $instFile = Seed 'AppData\Roaming\Microsoft\Installer\x.txt' 'INSTALLER-CONTENT'
+  # A child of a listed container (AppData\Local\Programs) that the
+  # caller may not change: the grant wants it and cannot write it.
+  $instDir  = Join-Path $prof 'AppData\Local\Programs\Installer'
+  $instFile = Seed 'AppData\Local\Programs\Installer\x.txt' 'INSTALLER-CONTENT'
   $openDir  = Join-Path $prof '.docker'
   $openFile = Seed '.docker\config.json' 'DOCKER-CONTENT'
   foreach ($d in @($instDir, $openDir)) {
@@ -403,7 +424,7 @@ try {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $g = Grant
   $sw.Stop()
-  Write-Host ("G: TIMING: profile grant on a tree with {0} files in {1} directories under one granted child: {2} ms wall, {3} ms reported; {4} DACL write(s), {5} with a walk of the tree, {6} without" -f `
+  Write-Host ("G: TIMING: profile grant on a tree with {0} files in {1} directories under one listed directory: {2} ms wall, {3} ms reported; {4} DACL write(s), {5} with a walk of the tree, {6} without" -f `
     $files, $bulkDirs, $sw.ElapsedMilliseconds, $g.json.elapsed_ms, $g.json.writes, $g.json.tree_walks, $g.json.local_writes)
   $sdAfter = @($untouched | ForEach-Object { Sddl $_ })
   if (($sdBefore -join '|') -eq ($sdAfter -join '|')) { Ok 'G: a child and a grandchild of a container keep their security descriptors, auto-inherited mark included' }
@@ -487,6 +508,8 @@ try {
   Expect-Read 'R1' $note 'NOTE-CONTENT'
   Expect-Read 'R1' $subFile 'DEEP-CONTENT'
   Expect-Read 'R1' $bulkSample 'BULK-CONTENT'
+  if ((Has-GroupAllow (Join-Path $prof '.local')) -and -not (Has-ExplicitGroup $note)) { Ok 'R1: a listed directory is granted whole: one entry on it, inherited by what is in it' }
+  else { Fail "R1: .local=$(Sddl (Join-Path $prof '.local')) note=$(Sddl $note)" }
   $r = Sb @($cmd, '/d', '/s', '/c', 'srtsmoketool.exe /d /c echo TOOL-RAN') $toolDir
   if ($r.exit -eq 0 -and $r.out -match 'TOOL-RAN') { Ok 'R2: an .exe in a per-user tool directory on PATH runs' }
   else { Fail "R2: srtsmoketool.exe from $toolDir on PATH: exit=$($r.exit) raw: $($r.raw)" }
@@ -496,6 +519,22 @@ try {
   if ($r.exit -eq 0 -and $r.out -match 'Documents' -and $r.out -match 'stray\.txt') { Ok 'R4: the profile directory (a container) can be listed' }
   else { Fail "R4: dir of the profile directory: exit=$($r.exit) raw: $($r.raw)" }
   Expect-NoRead 'R4 (a root file not granted by name)' $stray 'STRAY-CONTENT'
+
+  # ── R5: an unlisted directory ────────────────────────────────────
+  $docs = Join-Path $prof 'Documents'
+  Expect-NoRead 'R5 (a file under an unlisted directory)' $docNote 'DOC-CONTENT'
+  if (-not (Has-Group $docs) -and -not (Has-Group $docNote)) { Ok 'R5: an unlisted directory carries no entry for the sandbox group, neither allow nor deny' }
+  else { Fail "R5: Documents names the group: $(Sddl $docs) / $(Sddl $docNote)" }
+  $st = Status
+  if (@($st.paths | Where-Object { $_.path -match '\\Documents' }).Count -eq 0 -and
+      @($st.exclusions | Where-Object { $_ -match '\\Documents' }).Count -eq 0) { Ok 'R5: it is neither recorded as granted nor listed as excluded' }
+  else { Fail "R5: Documents in the record: paths=$(@($st.paths | Where-Object { $_.path -match '\\Documents' }) | ConvertTo-Json -Compress) exclusions=$($st.exclusions -join ' | ')" }
+  $json = @{ read = @($docs); write = @(); denyRead = @(); denyWrite = @() } | ConvertTo-Json -Compress
+  $raw = $json | & $Exe acl grant --holder-pid $PID --sandbox-user-sid $sbSid --persistent 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) { Fail "R5: a session read grant on an unlisted directory was refused: $raw" }
+  else { Expect-Read 'R5 (granted to the session)' $docNote 'DOC-CONTENT' }
+  End-Session
+  Expect-NoRead 'R5 (after the session)' $docNote 'DOC-CONTENT'
 
   # A container's entry covers a generic-read open of the directory,
   # which asks for READ_CONTROL as well: reading its access list does.
@@ -553,13 +592,17 @@ try {
   if (@($allowed).Count -eq 0) { Ok 'X2: none of the replaced objects carries an allow for the sandbox group, inherited or its own' }
   else { Fail "X2: an allow for the group on: $($allowed | ForEach-Object { "$_ $(Sddl $_)" })" }
 
-  # ── N: a new top-level child, and the refresh ────────────────────
-  $newFile = Seed 'NewTop\n.txt' 'NEWTOP-CONTENT'
+  # ── N: a new child of a listed container, and the refresh ────────
+  $newFile = Seed 'AppData\Local\Programs\NewTool\n.txt' 'NEWTOP-CONTENT'
+  $newTop  = Seed 'NewTop\n.txt' 'NEWTOP-UNLISTED'
   Expect-NoRead 'N (before the refresh)' $newFile 'NEWTOP-CONTENT'
   $g2 = Grant
   if ($g2.exit -eq 0 -and $g2.json.complete) { Ok "N: refresh complete ($($g2.json.writes) DACL write(s), $($g2.json.unchanged) unchanged, $($g2.json.elapsed_ms) ms)" }
   else { Fail "N: refresh exit=$($g2.exit) raw: $($g2.raw)" }
   Expect-Read 'N (after the refresh)' $newFile 'NEWTOP-CONTENT'
+  Expect-NoRead 'N (a new unlisted top-level directory, after the refresh)' $newTop 'NEWTOP-UNLISTED'
+  if (-not (Has-Group (Join-Path $prof 'NewTop'))) { Ok 'N: the new unlisted directory carries no entry' }
+  else { Fail "N: NewTop names the group: $(Sddl (Join-Path $prof 'NewTop'))" }
   Expect-NoRead 'N (the replaced exclusions after the refresh)' $sshKey 'SSH2-CONTENT'
   Expect-NoRead 'N (the replaced exclusions after the refresh)' $netrc 'REPLACED-CONTENT'
   $g3 = Grant
@@ -568,7 +611,8 @@ try {
   Outside-Unchanged 'after the refresh'
 
   # ── E: added exclusions ──────────────────────────────────────────
-  $ge = Grant @('--exclude', (Join-Path $prof 'NewTop'))
+  $newDir = Join-Path $prof 'AppData\Local\Programs\NewTool'
+  $ge = Grant @('--exclude', $newDir)
   if ($ge.exit -ne 0) { Fail "E: grant --exclude exit=$($ge.exit) raw: $($ge.raw)" }
   Expect-NoRead 'E (an added exclusion)' $newFile 'NEWTOP-CONTENT'
   $ge = Grant
@@ -576,8 +620,8 @@ try {
   Expect-NoRead 'E (kept by a refresh that does not name it)' $newFile 'NEWTOP-CONTENT'
   $st = Status
   $listed = @($st.exclusions)
-  if (@($st.extra_exclusions) -contains 'NewTop' -and
-      @($listed | Where-Object { $_ -match '\\NewTop$' }).Count -eq 1 -and
+  if (@($st.extra_exclusions) -contains 'AppData\Local\Programs\NewTool' -and
+      @($listed | Where-Object { $_ -match '\\NewTool$' }).Count -eq 1 -and
       @($listed | Where-Object { $_ -match '\\\.ssh$' }).Count -eq 1 -and
       @($listed | Where-Object { $_ -match '\\AppData\\Local\\Temp$' }).Count -eq 0) {
     Ok "E: the record lists the added exclusion with the built-in ones ($($listed.Count) in all)"
@@ -586,6 +630,37 @@ try {
   if ($ge.exit -ne 0) { Fail "E: grant --replace-excludes exit=$($ge.exit) raw: $($ge.raw)" }
   Expect-Read 'E (re-admitted by replacing the added list)' $newFile 'NEWTOP-CONTENT'
   Expect-NoRead 'E (a built-in exclusion is not replaceable)' $sshKey 'SSH2-CONTENT'
+
+  # ── I: added inclusions ──────────────────────────────────────────
+  $gi = Grant @('--include', $docs)
+  if ($gi.exit -ne 0) { Fail "I: grant --include exit=$($gi.exit) raw: $($gi.raw)" }
+  Expect-Read 'I (an added inclusion)' $docNote 'DOC-CONTENT'
+  if ((Has-GroupAllow $docs) -and -not (Has-ExplicitGroup $docNote)) { Ok 'I: the added directory is granted whole' }
+  else { Fail "I: Documents=$(Sddl $docs) note=$(Sddl $docNote)" }
+  $gi = Grant
+  if ($gi.exit -ne 0) { Fail "I: refresh exit=$($gi.exit) raw: $($gi.raw)" }
+  Expect-Read 'I (kept by a refresh that does not name it)' $docNote 'DOC-CONTENT'
+  $st = Status
+  if (@($st.extra_inclusions) -contains 'Documents' -and @($st.paths | Where-Object { $_.path -match '\\Documents$' -and $_.kind -eq 'granted' }).Count -eq 1) {
+    Ok 'I: the record lists the added inclusion, and the directory as granted'
+  } else { Fail "I: extra_inclusions=$($st.extra_inclusions -join ',') paths=$(@($st.paths | Where-Object { $_.path -match 'Documents' }) | ConvertTo-Json -Compress)" }
+  foreach ($bad in @(
+      @{ what = 'an excluded path';                  path = (Join-Path $prof '.ssh') },
+      @{ what = 'a path inside an excluded one';     path = (Join-Path $prof '.ssh\sub') },
+      @{ what = 'a path in the temporary directory'; path = $sessDir })) {
+    $before = (Status).extra_inclusions
+    $gb = Grant @('--include', $bad.path)
+    $after = (Status).extra_inclusions
+    if ($gb.exit -ne 0 -and (($before -join '|') -eq ($after -join '|'))) { Ok "I: --include of $($bad.what) is refused and records nothing" }
+    else { Fail "I: --include $($bad.path): exit=$($gb.exit) before=[$($before -join ',')] after=[$($after -join ',')] raw: $($gb.raw)" }
+  }
+  Expect-NoRead 'I (the refused paths stay unreadable)' $sshKey 'SSH2-CONTENT'
+  $gi = Grant @('--replace-includes')
+  if ($gi.exit -ne 0) { Fail "I: grant --replace-includes exit=$($gi.exit) raw: $($gi.raw)" }
+  Expect-NoRead 'I (dropped by replacing the added list)' $docNote 'DOC-CONTENT'
+  if (-not (Has-Group $docs) -and @((Status).extra_inclusions).Count -eq 0) { Ok 'I: the dropped directory carries no entry, and the record lists no added inclusion' }
+  else { Fail "I: after --replace-includes: Documents=$(Sddl $docs) extra_inclusions=$((Status).extra_inclusions -join ',')" }
+  Expect-Read 'I (a built-in entry is not replaceable)' $note 'NOTE-CONTENT'
 
   # ── A: a session's grants against the exclusions ─────────────────
   function Session-Grant { param([string[]] $read = @(), [string[]] $write = @(), [string[]] $flags = @())
@@ -651,7 +726,8 @@ try {
   Refused 'a root that was granted before, once a store has appeared beneath it' $noWeb -write @($noWeb)
   Remove-Item -Recurse -Force -LiteralPath (Join-Path $noWeb 'EBWebView')
 
-  # ── P: a write root with a read-denied file inside it ────────────
+  # ── P: a write root with a read-denied file inside it, under an
+  #      unlisted directory ─────────────────────────────────────────
   $proj    = Join-Path $prof 'Documents\proj'
   $envFile = Seed 'Documents\proj\.env'    'ENV-CONTENT'
   $srcFile = Seed 'Documents\proj\src.txt' 'SRC-CONTENT'
@@ -662,7 +738,7 @@ try {
     $r = Sb @($cmd, '/d', '/s', '/c', "type `"$srcFile`" & echo NEW> `"$proj\p-new.txt`" & type `"$envFile`"") -WriteRoots @($proj)
     $made = Test-Path -LiteralPath (Join-Path $proj 'p-new.txt')
     if ($r.out -match 'SRC-CONTENT' -and $made -and $r.out -notmatch 'ENV-CONTENT') {
-      Ok 'P: the root is readable and writable, the denied file inside it is not readable'
+      Ok 'P: the root under an unlisted directory is readable and writable, the denied file inside it is not readable'
     } else { Fail "P: read=$($r.out -match 'SRC-CONTENT') created=$made env-read=$($r.out -match 'ENV-CONTENT') raw: $($r.raw)" }
     $before = (Status).exclusions
     if (@($before | Where-Object { $_ -match 'proj' }).Count -eq 0) { Ok "P: the session's deny is not among the recorded exclusions" }
@@ -674,7 +750,7 @@ try {
 
   # ── W: nothing is writable ───────────────────────────────────────
   foreach ($case in @(
-      @{ tag = 'a granted child'; dir = (Join-Path $prof 'Documents'); keep = 'note.txt'; text = 'NOTE-CONTENT' },
+      @{ tag = 'a listed directory'; dir = (Join-Path $prof '.local'); keep = 'note.txt'; text = 'NOTE-CONTENT' },
       @{ tag = 'a container';     dir = (Join-Path $prof '.cargo');    keep = 'config.toml'; text = 'CARGO-CONFIG-CONTENT' },
       @{ tag = 'the profile directory'; dir = $prof;                   keep = '.npmrc'; text = 'NPMRC-CONTENT' })) {
     $d = $case.dir
@@ -710,8 +786,8 @@ try {
   else { Fail "D: capabilities: user status [$($capsUser -join ', ')] profile status [$($capsProf -join ', ')]" }
   if ((Session-Deny @($prof)) -ne 0) { Fail 'D: the session stamps for a deny on the profile directory could not be written' }
   else {
-    Expect-NoRead 'D (deny on the profile: granted child)' $note 'NOTE-CONTENT'
-    Expect-NoRead 'D (deny on the profile: file under a granted child)' $subFile 'DEEP-CONTENT'
+    Expect-NoRead 'D (deny on the profile: listed directory)' $note 'NOTE-CONTENT'
+    Expect-NoRead 'D (deny on the profile: file under a listed directory)' $subFile 'DEEP-CONTENT'
     Expect-NoRead 'D (deny on the profile: root file)' $npmrc 'NPMRC-CONTENT'
     Expect-NoRead 'D (deny on the profile: file of a container)' $cargoCfg 'CARGO-CONFIG-CONTENT'
     Expect-NoRead 'D (deny on the profile: file under a nested container)' $npmTool 'NPM-TOOL'
@@ -761,20 +837,20 @@ try {
   End-Session
   & $Exe acl forget $ownRoot 2>&1 | Out-Null
   Remove-Item -Force -LiteralPath (Join-Path $ownRoot 'd-own.txt') -ErrorAction SilentlyContinue
-  $docs = Join-Path $prof 'Documents'
-  if ((Session-Deny @($docs)) -ne 0) { Fail 'D: the session stamp for a deny on a granted child could not be written' }
+  $local = Join-Path $prof '.local'
+  if ((Session-Deny @($local)) -ne 0) { Fail 'D: the session stamp for a deny on a listed directory could not be written' }
   else {
-    Expect-NoRead 'D (deny on a granted child)' $note 'NOTE-CONTENT'
-    Expect-NoRead 'D (deny on a granted child, deeper)' $subFile 'DEEP-CONTENT'
-    Expect-Read 'D (deny on a granted child leaves the rest)' $npmrc 'NPMRC-CONTENT'
+    Expect-NoRead 'D (deny on a listed directory)' $note 'NOTE-CONTENT'
+    Expect-NoRead 'D (deny on a listed directory, deeper)' $subFile 'DEEP-CONTENT'
+    Expect-Read 'D (deny on a listed directory leaves the rest)' $npmrc 'NPMRC-CONTENT'
   }
   End-Session
   Expect-Read 'D (after the session)' $note 'NOTE-CONTENT'
-  $sub = Join-Path $docs 'sub'
-  if ((Session-Deny @($sub)) -ne 0) { Fail 'D: the session stamp for a deny beneath a granted child could not be written' }
+  $sub = Join-Path $local 'sub'
+  if ((Session-Deny @($sub)) -ne 0) { Fail 'D: the session stamp for a deny beneath a listed directory could not be written' }
   else {
-    Expect-NoRead 'D (deny beneath a granted child)' $subFile 'DEEP-CONTENT'
-    Expect-Read 'D (deny beneath a granted child leaves its siblings)' $note 'NOTE-CONTENT'
+    Expect-NoRead 'D (deny beneath a listed directory)' $subFile 'DEEP-CONTENT'
+    Expect-Read 'D (deny beneath a listed directory leaves its siblings)' $note 'NOTE-CONTENT'
   }
   End-Session
   Expect-Read 'D (after the session)' $subFile 'DEEP-CONTENT'
@@ -812,8 +888,8 @@ try {
   $gl = Invoke-Srt $HooksAbs @('profile', 'grant', '--test-profile', $prof2, '--json')
   if ($gl.exit -ne 0) { Fail "L: profile grant on the profile with links: exit=$($gl.exit) raw: $($gl.raw)" }
   else {
-    Expect-Read   'L (beside the linked stores)'                 $lReadme 'LREADME-CONTENT'
-    Expect-Read   'L (configuration no rule names, behind the link)' $lNvim 'LNVIM-CONTENT'
+    Expect-NoRead 'L (beside the linked stores, in an unlisted directory)' $lReadme 'LREADME-CONTENT'
+    Expect-Read   'L (configuration no rule names, behind the link of a listed directory)' $lNvim 'LNVIM-CONTENT'
     Expect-NoRead 'L (the keys, where they really are)'          $lKey   'LKEY-CONTENT'
     Expect-NoRead 'L (the keys, through the link)'               (Join-Path $lSsh 'id_test') 'LKEY-CONTENT'
     Expect-NoRead 'L (the sign-in, where it really is)'          $lHosts 'LHOSTS-CONTENT'
@@ -836,14 +912,14 @@ try {
   if ($fl.exit -ne 0) { Fail "L: profile forget exit=$($fl.exit) raw: $($fl.raw)" }
 
   # ── C: a deny the owner put there stays in front ──────────────────
-  $ownerDenied = Join-Path $prof 'OwnerDenied'
-  $odFile = Seed 'OwnerDenied\f.txt' 'OWNER-DENIED-CONTENT'
+  $ownerDenied = Join-Path $prof '.local\OwnerDenied'
+  $odFile = Seed '.local\OwnerDenied\f.txt' 'OWNER-DENIED-CONTENT'
   & icacls $ownerDenied /deny '*S-1-5-32-545:(OI)(CI)(RD)' | Out-Null
   $g = Grant
   if ($g.exit -ne 0) { Fail "C: profile grant exit=$($g.exit) raw: $($g.raw)" }
   else {
-    if (Has-GroupAllow $ownerDenied) { Ok 'C: the directory is granted like any other child' }
-    else { Fail "C: OwnerDenied carries no allow for the group: $(Sddl $ownerDenied)" }
+    if ((Has-GroupAllow (Join-Path $prof '.local')) -and (Has-Group $ownerDenied) -and -not (Has-ExplicitGroup $ownerDenied)) { Ok 'C: the directory inherits the allow of its listed parent, like any other child' }
+    else { Fail "C: OwnerDenied/.local: $(Sddl $ownerDenied) / $(Sddl (Join-Path $prof '.local'))" }
     Expect-NoRead "C (a profile directory with the owner's deny for Users)" $odFile 'OWNER-DENIED-CONTENT'
     if (Denies-First $ownerDenied) { Ok 'C: every explicit deny precedes the first allow on it' }
     else { Fail "C: the DACL of OwnerDenied is not in canonical order: $((Explicit-Aces $ownerDenied) -join '')" }
@@ -984,4 +1060,4 @@ if ($script:Failures.Count -gt 0) {
   $script:Failures | ForEach-Object { Write-Host "  - $_" }
   throw "smoke-profile-read: $($script:Failures.Count) row(s) failed"
 }
-Write-Host 'smoke-profile-read: PASS (T, B, G, R1-R4, X, TMP, X2, N, E, A, P, W, J, D, O, F, L, C, H, S, U)'
+Write-Host 'smoke-profile-read: PASS (T, B, G, R1-R5, X, TMP, X2, N, E, I, A, P, W, J, D, O, F, L, C, H, S, U)'
