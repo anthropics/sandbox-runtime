@@ -1531,6 +1531,18 @@ fn own_access(
     }))
 }
 
+/// Whether the object itself carries an entry of the sandbox group, if
+/// its access list can be read.
+fn holds_entry(path: &str, ids: &Ids) -> Option<bool> {
+    let h = open_bare(path, READ_CONTROL).ok()?;
+    let aces = acl::read_aces_at(acl::DaclTarget::Handle(h.raw(), path)).ok()?;
+    Some(aces.iter().any(|a| {
+        !a.inherited
+            && (ids.group_sid.as_deref() == Some(a.sid.as_str())
+                || ids.previous_group_sids.contains(&a.sid))
+    }))
+}
+
 /// What an object's own access list says about the sandbox account.
 struct Access {
     reads: bool,
@@ -2308,6 +2320,12 @@ pub fn grant(
             return Ok(true);
         }
         let unfinished = why.downcast_ref::<UnfinishedRevoke>();
+        if wanted.is_some()
+            && unfinished.is_none()
+            && plan::record_without_entry(r.kind, holds_entry(path, ids))
+        {
+            return Ok(false);
+        }
         // The stamp may have got as far as recording the new kind. Not
         // an unfinished revoke: its record says what is to happen next.
         if unfinished.is_none() {

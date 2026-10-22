@@ -1899,6 +1899,14 @@ pub fn may_carry_allow(kind: Kind) -> bool {
     )
 }
 
+/// Whether a recorded path that cannot be written now is a row only: a
+/// killed run records every planned path before writing any, so a row
+/// says nothing of the object until its access list agrees. `Ungranted`
+/// is about what lies beneath, and a list that cannot be read proves nothing.
+pub fn record_without_entry(kind: Kind, holds_entry: Option<bool>) -> bool {
+    !matches!(kind, Kind::Ungranted | Kind::Skipped) && holds_entry == Some(false)
+}
+
 /// Whether `profile forget` reports a path instead of failing on it: its
 /// volume cannot be reached and no file id says what to look for when it
 /// returns, so waiting would hold the forget open for good.
@@ -1940,6 +1948,18 @@ mod tests {
         for k in [Kind::Container, Kind::File, Kind::Denied] {
             assert!(!down(k), "{k:?}");
         }
+    }
+
+    #[test]
+    fn a_row_with_no_entry_on_its_object_is_not_an_earlier_grant() {
+        use super::{Kind, record_without_entry as row_only};
+        for kind in [Kind::Container, Kind::Granted, Kind::File, Kind::Denied] {
+            assert!(row_only(kind, Some(false)));
+            assert!(!row_only(kind, Some(true)));
+            assert!(!row_only(kind, None));
+        }
+        assert!(!row_only(Kind::Ungranted, Some(false)));
+        assert!(!row_only(Kind::Skipped, Some(false)));
     }
 
     #[test]

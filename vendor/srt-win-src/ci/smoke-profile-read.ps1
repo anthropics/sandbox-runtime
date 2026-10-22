@@ -772,6 +772,39 @@ try {
   }
   $gv = Grant @('--replace-includes')
   if ($gv.exit -ne 0) { Fail "W: closing grant exit=$($gv.exit) raw: $($gv.raw)" }
+  # A killed run records every planned path first: one it never wrote and
+  # cannot write is not an earlier grant.
+  if ((& $paths $gv.json.not_granted) -contains $instDir) {
+    Ok 'W: a path the killed run recorded but never wrote is reported as not granted'
+  } else { Fail "W: after the kill, not_granted lacks $instDir raw: $($gv.raw)" }
+
+  # The state a kill between a directory and its children leaves, made
+  # directly: SetFileSecurity writes one object and hands nothing down.
+  Add-Type -Namespace SrtSmoke -Name Raw -MemberDefinition @'
+[DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern bool SetFileSecurityW(string path, uint info, byte[] sd);
+'@
+  $gv = Grant @('--include', 'Documents')
+  if ($gv.exit -ne 0) { Fail "W: grant --include exit=$($gv.exit) raw: $($gv.raw)" }
+  $wSd = [System.Security.AccessControl.RawSecurityDescriptor]::new((Sddl $docs))
+  foreach ($i in ($wSd.DiscretionaryAcl.Count - 1)..0) {
+    if ($wSd.DiscretionaryAcl[$i].SecurityIdentifier.Value -eq $script:grpSid) { $wSd.DiscretionaryAcl.RemoveAce($i) }
+  }
+  $wBytes = [byte[]]::new($wSd.BinaryLength)
+  $wSd.GetBinaryForm($wBytes, 0)
+  if (-not [SrtSmoke.Raw]::SetFileSecurityW($docs, 4, $wBytes)) { Fail 'W: SetFileSecurity on the directory failed' }
+  $wLeft = @($wSample | Where-Object { Has-GroupAllow $_ }).Count
+  if ((Has-Group $docs) -or $wLeft -eq 0) {
+    Fail "W: setup: directory=$(Sddl $docs) children left=$wLeft"
+  } else {
+    Ok "W: the directory is clean and $wLeft sampled children still carry the entry"
+    $gv = Grant @('--replace-includes')
+    if ($gv.exit -eq 0 -and $gv.json.complete) { Ok 'W: the run after it completes' }
+    else { Fail "W: run after it exit=$($gv.exit) raw: $($gv.raw)" }
+    $wLeft = @($wSample | Where-Object { Has-Group $_ }).Count
+    if ($wLeft -eq 0) { Ok 'W: no sampled child is left carrying the entry' }
+    else { Fail "W: $wLeft sampled children still carry the entry, stale_allow=$(@($gv.json.stale_allow).Count)" }
+  }
   Remove-Item -Recurse -Force $wRoot
 
   # ── A: a session's grants against the exclusions ─────────────────
