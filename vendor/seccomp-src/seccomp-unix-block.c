@@ -4,7 +4,8 @@
  * This program generates a seccomp-bpf filter that blocks the socket() syscall
  * when called with AF_UNIX or AF_VSOCK as the domain argument. This prevents creation
  * of Unix domain sockets and VM sockets while allowing all other socket types
- * (AF_INET, AF_INET6, etc.) and all other syscalls.
+ * (AF_INET, AF_INET6, etc.) and all other syscalls, apart from io_uring and the
+ * kernel keyring calls.
  *
  * The filter is exported in a format compatible with bubblewrap's --seccomp flag.
  *
@@ -62,6 +63,10 @@
  * none of those beneath it. To clone(2) the bit is CLONE_PARENT_SETTID, which
  * threads are made with. */
 #define SRT_UNSHARE_EMPTY_MNTNS 0x00100000UL
+
+/* Given by value: older headers lack them. */
+#define SRT_SOL_ALG 279
+#define SRT_ALG_SET_KEY_BY_KEY_SERIAL 7
 
 /*
  * The rules of the `namespaces` filter. None is ever left out: a call this
@@ -235,18 +240,33 @@ int main(int argc, char *argv[]) {
      * shared-memory ring), so the only safe option is to deny ring creation
      * and use. Blocking all three syscalls also covers the case of an
      * inherited ring fd. */
-    int io_uring_calls[] = {
+    int refused_calls[] = {
         SCMP_SYS(io_uring_setup),
         SCMP_SYS(io_uring_enter),
         SCMP_SYS(io_uring_register),
+        /* The sandbox's namespaces do not contain the kernel's keyrings. */
+        SCMP_SYS(add_key),
+        SCMP_SYS(request_key),
+        SCMP_SYS(keyctl),
     };
-    for (size_t i = 0; i < sizeof(io_uring_calls) / sizeof(io_uring_calls[0]); i++) {
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), io_uring_calls[i], 0);
+    for (size_t i = 0; i < sizeof(refused_calls) / sizeof(refused_calls[0]); i++) {
+        rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), refused_calls[i], 0);
         if (rc < 0) {
-            fprintf(stderr, "Error: Failed to add io_uring rule: %s\n", strerror(-rc));
+            fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
             seccomp_release(ctx);
             return 1;
         }
+    }
+
+    /* The same keys reach the kernel's crypto API by serial number. */
+    rc = seccomp_rule_add_exact(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(setsockopt), 2,
+                                SCMP_A1(SCMP_CMP_MASKED_EQ, 0xffffffff, SRT_SOL_ALG),
+                                SCMP_A2(SCMP_CMP_MASKED_EQ, 0xffffffff,
+                                        SRT_ALG_SET_KEY_BY_KEY_SERIAL));
+    if (rc < 0) {
+        fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
+        seccomp_release(ctx);
+        return 1;
     }
 
     return export_filter(ctx, output_file);

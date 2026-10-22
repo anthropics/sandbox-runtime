@@ -110,7 +110,7 @@ describe('checkLinuxDependencies', () => {
     const result = checkLinuxDependencies()
 
     expect(result.warnings).toContain(
-      'seccomp not available - unix socket access not restricted',
+      'seccomp not available - unix sockets and kernel keyrings not restricted',
     )
   })
 

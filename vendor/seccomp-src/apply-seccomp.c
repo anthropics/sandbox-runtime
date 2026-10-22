@@ -329,8 +329,8 @@ static int recv_fd(int sock) {
  *   sendmsg, close, close, prctl(PR_SET_SECCOMP) once per filter, execve
  * None are in the observe match set (write-intent fs), none are in the
  * namespaces set (user-namespace creation, setns, mount calls) and none are
- * in the unix-block set (socket(AF_UNIX)/io_uring), so the worker cannot
- * trap on itself, or be refused, before exec. perror()/snprintf() are
+ * in the unix-block set (socket(AF_UNIX)/io_uring/keyrings), so the worker
+ * cannot trap on itself, or be refused, before exec. perror()/snprintf() are
  * deliberately avoided post-filter to keep this set closed. */
 static void install_observe_filter(int sp_fd) {
     if (sp_fd < 0) return;

@@ -721,7 +721,7 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      'If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK).',
+      'If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK) and the kernel keyring calls.',
     ),
   allowLocalBinding: z
     .boolean()

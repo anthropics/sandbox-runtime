@@ -1330,7 +1330,9 @@ export function checkLinuxDependencies(
     !seccompConfig?.argv0 &&
     getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
   ) {
-    warnings.push('seccomp not available - unix socket access not restricted')
+    warnings.push(
+      'seccomp not available - unix sockets and kernel keyrings not restricted',
+    )
   }
 
   const uid0Error = uid0SandboxError({
@@ -3510,7 +3512,7 @@ async function generateFilesystemArgs(
  *
  * The filter allows:
  * - All TCP/UDP sockets (AF_INET, AF_INET6) for normal network operations
- * - All other syscalls
+ * - All other syscalls, apart from io_uring and the kernel keyring calls
  *
  * PLATFORM NOTE:
  * The allowUnixSockets configuration is not path-based on Linux (unlike macOS)
