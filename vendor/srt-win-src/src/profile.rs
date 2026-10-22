@@ -622,9 +622,12 @@ pub enum NoteClass {
     /// itself, with copies of it left on objects beneath. The directory's
     /// own access list cannot show that, so it stands until the next run.
     StaleBeneath,
+    /// A [`NoteClass::StaleAllow`] on a path still in the grant, granted
+    /// whole earlier and child by child now: its new entry is wanted, so
+    /// retrying it writes that rather than taking the entry off.
+    StaleInPlan,
     /// An entry to revoke on a volume that cannot be reached now. It may
-    /// still be there, on a disk no sandboxed command can read while it
-    /// is away; it is retried, and does not hold a refresh back.
+    /// still be there; it is retried, and reported as `stale_allow`.
     Unreachable,
     /// An allow of an earlier run that could not be removed, on a path that IS
     /// on the exclusion list now. Reported with the unprotected ones.
@@ -636,13 +639,12 @@ pub enum NoteClass {
 }
 
 impl NoteClass {
-    pub const ALL: [NoteClass; 6] = [
+    pub const ALL: [NoteClass; 5] = [
         NoteClass::NotGranted,
         NoteClass::SelfClosed,
         NoteClass::Unverifiable,
         NoteClass::Unprotected,
         NoteClass::StaleAllow,
-        NoteClass::Unreachable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -653,6 +655,7 @@ impl NoteClass {
             NoteClass::Unprotected => "unprotected",
             NoteClass::StaleAllow => "stale_allow",
             NoteClass::StaleBeneath => "stale_beneath",
+            NoteClass::StaleInPlan => "stale_in_plan",
             NoteClass::Unreachable => "unreachable",
             NoteClass::OurAllow => "our_allow",
             NoteClass::OurAllowAbove => "our_allow_above",
@@ -660,14 +663,15 @@ impl NoteClass {
     }
 
     /// Every class a record can carry: those reported, the two that
-    /// are reported as `unprotected`, and the one reported as `stale_allow`.
-    const RECORDED: [NoteClass; 9] = [
+    /// are reported as `unprotected`, and the three reported as `stale_allow`.
+    const RECORDED: [NoteClass; 10] = [
         NoteClass::NotGranted,
         NoteClass::SelfClosed,
         NoteClass::Unverifiable,
         NoteClass::Unprotected,
         NoteClass::StaleAllow,
         NoteClass::StaleBeneath,
+        NoteClass::StaleInPlan,
         NoteClass::Unreachable,
         NoteClass::OurAllow,
         NoteClass::OurAllowAbove,
@@ -1147,7 +1151,7 @@ pub const CAPABILITIES: &[&str] = &[
     "kept-grant-holders",
     "read-deny-except",
     "exec-holder",
-    "profile-refresh",
+    "profile-retry-stale",
 ];
 
 /// The recorded paths that carry an allow of their own, for working
@@ -1285,6 +1289,9 @@ pub struct Item {
     /// left on objects beneath it.
     #[serde(skip)]
     beneath: bool,
+    /// On a volume that cannot be reached now.
+    #[serde(skip)]
+    volume: bool,
 }
 
 /// What an exclusion without a deny of ours is, with what was found
@@ -1334,6 +1341,7 @@ impl Probe {
             entry: self.entry,
             above: false,
             beneath: false,
+            volume: false,
         }
     }
 }
@@ -1382,12 +1390,10 @@ pub struct Report {
     pub self_closed: Vec<Item>,
     pub unverifiable: Vec<Item>,
     pub unprotected: Vec<Item>,
-    /// Paths that have left the grant and still carry the allow of an
-    /// earlier run, which could not be removed: readable through an
-    /// entry of ours on an object that cannot be written.
+    /// Paths that have left the grant and may still carry the allow of
+    /// an earlier run, which could not be removed: readable through an
+    /// entry of ours until it is. Retried ([`retry_stale`]).
     pub stale_allow: Vec<Item>,
-    /// Entries to revoke on a volume that cannot be reached now; retried.
-    pub unreachable: Vec<Item>,
     pub elapsed_ms: u64,
 }
 
@@ -1411,14 +1417,15 @@ impl Report {
             NoteClass::Unprotected | NoteClass::OurAllow | NoteClass::OurAllowAbove => {
                 self.unprotected.push(item)
             }
-            NoteClass::StaleAllow | NoteClass::StaleBeneath => self.stale_allow.push(item),
-            NoteClass::Unreachable => self.unreachable.push(item),
+            NoteClass::StaleAllow | NoteClass::StaleBeneath | NoteClass::StaleInPlan => {
+                self.stale_allow.push(item)
+            }
+            NoteClass::Unreachable => self.stale_allow.push(Item {
+                volume: true,
+                protected_exclusion: Some(false),
+                ..item
+            }),
         }
-    }
-
-    /// Something an earlier entry of ours made readable still is.
-    fn revoke_failed(&self) -> bool {
-        !self.stale_allow.is_empty() || self.unprotected.iter().any(|i| i.entry.is_some())
     }
 
     fn notes(&self) -> Vec<Note> {
@@ -1431,6 +1438,8 @@ impl Report {
                     class: match (class, i.entry, i.above) {
                         (NoteClass::Unprotected, Some(_), false) => NoteClass::OurAllow,
                         (NoteClass::Unprotected, Some(_), true) => NoteClass::OurAllowAbove,
+                        (NoteClass::StaleAllow, _, true) => NoteClass::StaleInPlan,
+                        (NoteClass::StaleAllow, _, _) if i.volume => NoteClass::Unreachable,
                         (NoteClass::StaleAllow, _, _) if i.beneath => NoteClass::StaleBeneath,
                         _ => class,
                     },
@@ -1445,7 +1454,6 @@ impl Report {
             of(NoteClass::Unverifiable, &self.unverifiable),
             of(NoteClass::Unprotected, &self.unprotected),
             of(NoteClass::StaleAllow, &self.stale_allow),
-            of(NoteClass::Unreachable, &self.unreachable),
         ]
         .concat()
     }
@@ -2057,9 +2065,6 @@ pub struct Added<'a> {
     pub include: &'a [String],
     /// `--replace-includes`: drop the inclusions earlier runs added.
     pub replace_includes: bool,
-    /// `--refresh`: an entry that could not be revoked leaves the grant
-    /// incomplete, so that no session starts on it.
-    pub refresh: bool,
 }
 
 /// `profile grant`: bring the profile to the plan. Order: the record
@@ -2340,7 +2345,7 @@ pub fn grant(
                     } else {
                         "explicit"
                     }),
-                    above: unfinished.is_some(),
+                    above: excluded_now && unfinished.is_some(),
                     beneath: unfinished.is_some(),
                     ..Default::default()
                 };
@@ -2426,8 +2431,10 @@ pub fn grant(
             && n.kind != Kind::Granted
             && (earlier(path).is_some_and(|r| matches!(r.kind, Kind::Granted | Kind::Ungranted))
                 || old.notes.iter().any(|x| {
-                    matches!(x.class, NoteClass::StaleBeneath | NoteClass::OurAllowAbove)
-                        && x.path.eq_ignore_ascii_case(path)
+                    matches!(
+                        x.class,
+                        NoteClass::StaleBeneath | NoteClass::StaleInPlan | NoteClass::OurAllowAbove
+                    ) && x.path.eq_ignore_ascii_case(path)
                 }))
     };
 
@@ -2605,10 +2612,9 @@ pub fn grant(
         );
     }
 
-    // The record as it now is: every row, and nothing else. A refresh
-    // is not finished while something it was to revoke is still readable.
-    header.complete = !(added.refresh && report.revoke_failed());
-    report.complete = header.complete;
+    // The record as it now is: every row, and nothing else.
+    header.complete = true;
+    report.complete = true;
     let paths = db_rows(store.conn)?;
     let notes = report.notes();
     write_marker(
@@ -2631,6 +2637,115 @@ pub fn grant(
     report.tree_walks = writes_after.0 - writes_before.0;
     report.local_writes = writes_after.1 - writes_before.1;
     Ok(report)
+}
+
+// ─── Retry ──────────────────────────────────────────────────────────
+
+/// Outcome of [`retry_stale`], and the `--json` output of `profile
+/// retry-stale`.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct Retried {
+    /// Noted paths whose earlier entry is gone now.
+    pub cleared: usize,
+    /// Those that are not; each stays noted and recorded.
+    pub stale_allow: Vec<Item>,
+}
+
+/// Try again to revoke what the last run could not, on the noted paths
+/// alone: no plan of the profile, and no walk beyond those paths. What
+/// cannot be done stays noted, and is no failure of this run.
+pub fn retry_stale(store: &Store<'_>, ids: &Ids) -> Result<Retried> {
+    let marker = read_marker_at(store.key)?;
+    let mut out = Retried::default();
+    if !marker.header.as_ref().is_some_and(|h| h.complete) {
+        return Ok(out);
+    }
+    let rows = all_recorded(store, &marker)?;
+    let pending: Vec<persist::PendingStrip> = if store.key == persist::MARKER_KEY {
+        persist::retry_pending(store.conn, ids, true)?
+    } else {
+        Vec::new()
+    };
+    let mut notes = Vec::new();
+    for n in &marker.notes {
+        if !matches!(
+            n.class,
+            NoteClass::StaleAllow
+                | NoteClass::StaleBeneath
+                | NoteClass::StaleInPlan
+                | NoteClass::Unreachable
+        ) {
+            notes.push(n.clone());
+            continue;
+        }
+        let row = rows.iter().find(|r| r.path.eq_ignore_ascii_case(&n.path));
+        let result = match row {
+            // Handed to the strips retried with its volume, just above.
+            None if pending.iter().any(|p| p.path.eq_ignore_ascii_case(&n.path)) => {
+                Err(VolumeUnreachable.into())
+            }
+            None => Ok(()),
+            Some(r) if n.class == NoteClass::StaleInPlan => {
+                let node = Node {
+                    rel: Vec::new(),
+                    is_dir: true,
+                    kind: Kind::Container,
+                    missing: false,
+                    stamp: true,
+                    note: None,
+                };
+                stamp(store, ids, &r.path, &node, false, true)
+                    .map(|_| ())
+                    .inspect_err(|e| {
+                        if !e.is::<UnfinishedRevoke>() {
+                            let _ = upsert_row(store.conn, &r.path, r.file_id, r.kind, r.created);
+                        }
+                    })
+            }
+            Some(r) => match strip(store, ids, r) {
+                Ok(Stripped::Deferred) => Err(VolumeUnreachable.into()),
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
+        };
+        let why = match result {
+            Ok(()) => {
+                out.cleared += 1;
+                continue;
+            }
+            Err(e) => e,
+        };
+        let class = match () {
+            _ if why.is::<VolumeUnreachable>() => NoteClass::Unreachable,
+            _ if n.class == NoteClass::StaleInPlan => n.class,
+            _ if why.is::<UnfinishedRevoke>() => NoteClass::StaleBeneath,
+            _ => NoteClass::StaleAllow,
+        };
+        let reason = why.downcast_ref::<UnfinishedRevoke>().map_or_else(
+            || format!("{why:#}"),
+            |u| format!("it is no longer part of the grant, and {}", u.line()),
+        );
+        out.stale_allow.push(Item {
+            path: n.path.clone(),
+            reason: reason.clone(),
+            protected_exclusion: Some(false),
+            ..Default::default()
+        });
+        notes.push(Note {
+            class,
+            path: n.path.clone(),
+            reason,
+        });
+    }
+    write_marker(
+        store.key,
+        &Marker {
+            paths: db_rows(store.conn)?,
+            notes,
+            ..marker
+        },
+    )?;
+    Ok(out)
 }
 
 // ─── Forget ─────────────────────────────────────────────────────────
@@ -2912,24 +3027,16 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
                     },
                 ),
             },
-            // Copies beneath it: its own access list cannot show them, so
-            // as the run found it, until the next run.
-            (NoteClass::StaleBeneath, _) => (
+            // Copies beneath it, a new entry that is wanted, or a volume not
+            // there to look at: its own access list cannot settle it, so as
+            // the run found it, until the next run.
+            (NoteClass::StaleBeneath | NoteClass::StaleInPlan | NoteClass::Unreachable, _) => (
                 NoteClass::StaleAllow,
                 Item {
                     path: n.path.clone(),
                     reason: n.reason.clone(),
                     protected_exclusion: Some(false),
                     entry: Some("inherited"),
-                    ..Default::default()
-                },
-            ),
-            // As the run found it: looking again would wait on the volume.
-            (NoteClass::Unreachable, _) => (
-                n.class,
-                Item {
-                    path: n.path.clone(),
-                    reason: n.reason.clone(),
                     ..Default::default()
                 },
             ),
@@ -3129,7 +3236,6 @@ mod tests {
         replace_excludes: true,
         include: &[],
         replace_includes: false,
-        refresh: false,
     };
 
     /// A run that adds `paths` to the exclusions.
@@ -4004,7 +4110,6 @@ mod tests {
                 replace_excludes: true,
                 include: &[],
                 replace_includes: true,
-                refresh: false,
             },
             false,
         )
@@ -4070,7 +4175,6 @@ mod tests {
                 replace_excludes: true,
                 include: &shelf_included,
                 replace_includes: false,
-                refresh: false,
             },
             false,
         )
@@ -4675,29 +4779,6 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_is_not_finished_while_something_it_was_to_revoke_stays_readable() {
-        let item = |entry| Item {
-            entry,
-            ..Default::default()
-        };
-        assert!(!Report::default().revoke_failed());
-        let failed = |r: Report| r.revoke_failed();
-        assert!(failed(Report {
-            stale_allow: vec![item(Some("explicit"))],
-            ..Default::default()
-        }));
-        assert!(failed(Report {
-            unprotected: vec![item(Some("explicit"))],
-            ..Default::default()
-        }));
-        // Readable by its own access list: no entry of ours to revoke.
-        assert!(!failed(Report {
-            unprotected: vec![item(None)],
-            ..Default::default()
-        }));
-    }
-
-    #[test]
     fn a_placeholder_that_left_the_grant_goes_if_empty() {
         const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestPlaceholder";
         let conn = crate::state_db::open_memory_db_for_tests();
@@ -4771,14 +4852,9 @@ mod tests {
         };
         let docs = canon(&prof.join("Documents"));
         std::fs::remove_dir_all(prof.join("Documents")).unwrap();
-        let added = Added {
-            refresh: true,
-            ..dropping_inclusions()
-        };
-        let report = grant(&store, &ids(), &layout, added, false).unwrap();
+        let report = grant(&store, &ids(), &layout, dropping_inclusions(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(report.stale_allow.is_empty(), "{report:?}");
-        assert!(report.unreachable.is_empty(), "{report:?}");
         assert!(!db_rows(&conn).unwrap().iter().any(|r| r.path == docs));
         forget(&store, &ids()).unwrap();
         std::fs::remove_dir_all(prof.parent().unwrap()).ok();
@@ -4795,11 +4871,7 @@ mod tests {
         };
         std::fs::rename(prof.join("Documents"), prof.join("Renamed")).unwrap();
         assert!(!group_aces(&prof.join("Renamed")).is_empty());
-        let added = Added {
-            refresh: true,
-            ..dropping_inclusions()
-        };
-        let report = grant(&store, &ids(), &layout, added, false).unwrap();
+        let report = grant(&store, &ids(), &layout, dropping_inclusions(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(group_aces(&prof.join("Renamed")).is_empty());
         assert!(group_aces(&prof.join(r"Renamed\deep\er\x.txt")).is_empty());
@@ -4808,14 +4880,114 @@ mod tests {
     }
 
     #[test]
-    fn an_unreachable_volume_is_reported_and_does_not_count_as_a_failed_revoke() {
-        let report = Report {
-            unreachable: vec![Item::default()],
-            ..Default::default()
-        };
-        assert!(!report.revoke_failed());
+    fn an_unreachable_volume_is_reported_as_stale_and_recorded_as_unreachable() {
+        let mut report = Report::default();
+        report.note(NoteClass::Unreachable, "Q:\\x", "away".to_owned());
+        assert_eq!(report.stale_allow.len(), 1);
         assert_eq!(report.notes()[0].class, NoteClass::Unreachable);
         assert!(!volume_reachable(r"\\?\Q:\no\such\drive"));
         assert!(volume_reachable(&canon(&std::env::temp_dir())));
+    }
+
+    /// Documents as a stale path: left the grant, its row kept, its entry
+    /// still on it.
+    fn stale_documents(
+        tag: &str,
+        key: &'static str,
+        conn: &Connection,
+    ) -> (std::path::PathBuf, Layout, String) {
+        let (prof, layout) = granted_documents(tag, key, conn);
+        let docs = canon(&prof.join("Documents"));
+        let mut m = read_marker_at(key).unwrap();
+        m.notes = vec![Note {
+            class: NoteClass::StaleAllow,
+            path: docs.clone(),
+            reason: "could not be removed".to_owned(),
+        }];
+        write_marker(key, &m).unwrap();
+        (prof, layout, docs)
+    }
+
+    #[test]
+    fn a_retry_revokes_a_noted_path_and_touches_nothing_else() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestRetry";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, layout, docs) = stale_documents("retry", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let rows_before = db_rows(&conn).unwrap().len();
+        let r = retry_stale(&store, &ids()).unwrap();
+        assert_eq!(r.cleared, 1, "{r:?}");
+        assert!(r.stale_allow.is_empty(), "{r:?}");
+        assert!(group_aces(&prof.join("Documents")).is_empty());
+        assert!(group_aces(&prof.join(r"Documents\deep\er\x.txt")).is_empty());
+        assert!(!db_rows(&conn).unwrap().iter().any(|x| x.path == docs));
+        assert_eq!(db_rows(&conn).unwrap().len(), rows_before - 1);
+        let st = status_json(KEY, Ok(layout), false);
+        assert_eq!(st["state"], "current", "{st}");
+        assert_eq!(st["stale_allow"], serde_json::json!([]));
+        assert!(read_marker_at(KEY).unwrap().notes.is_empty());
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_retry_with_nothing_noted_changes_nothing_and_an_unfinished_run_is_left_alone() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestRetryNone";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, _layout) = granted_documents("retrynone", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let before = read_marker_at(KEY).unwrap();
+        let r = retry_stale(&store, &ids()).unwrap();
+        assert_eq!(r.cleared, 0);
+        assert_eq!(read_marker_at(KEY).unwrap().paths.len(), before.paths.len());
+        assert!(!group_aces(&prof.join("Documents")).is_empty());
+        // A forget cut short is not finished from here.
+        let docs = canon(&prof.join("Documents"));
+        let mut m = read_marker_at(KEY).unwrap();
+        m.notes = vec![Note {
+            class: NoteClass::StaleAllow,
+            path: docs,
+            reason: String::new(),
+        }];
+        write_marker(KEY, &m).unwrap();
+        mark_forget_begun(KEY, &m).unwrap();
+        assert_eq!(retry_stale(&store, &ids()).unwrap().cleared, 0);
+        assert!(!group_aces(&prof.join("Documents")).is_empty());
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_retry_of_a_path_still_in_the_grant_leaves_its_new_entry_on_it() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestRetryPlan";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, _layout, docs) = stale_documents("retryplan", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let mut m = read_marker_at(KEY).unwrap();
+        m.notes[0].class = NoteClass::StaleInPlan;
+        write_marker(KEY, &m).unwrap();
+        let r = retry_stale(&store, &ids()).unwrap();
+        assert_eq!(r.cleared, 1, "{r:?}");
+        let aces = group_aces(&prof.join("Documents"));
+        assert_eq!(aces.len(), 1, "{aces:?}");
+        assert_eq!(aces[0].2 & 0x3, 0, "not inheriting: {aces:?}");
+        assert!(group_aces(&prof.join(r"Documents\deep\er\x.txt")).is_empty());
+        assert!(
+            db_rows(&conn)
+                .unwrap()
+                .iter()
+                .any(|x| x.path == docs && x.kind == Kind::Container)
+        );
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
     }
 }

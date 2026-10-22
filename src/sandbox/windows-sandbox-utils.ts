@@ -133,13 +133,6 @@ export type WindowsSandboxErrorCode =
    * account and the filters are installed, the grant is not.
    */
   | 'profile_grant_failed'
-  /**
-   * `initialize()` refreshed an outdated grant and something it was to
-   * revoke is still readable to sandboxed commands. No session starts
-   * until a later run revokes it; `grantWindowsProfileRead()` reports
-   * what is left, and completes the grant with it reported.
-   */
-  | 'profile_grant_refresh_failed'
   /** `srt-win profile forget` could not remove the whole grant. */
   | 'profile_forget_failed'
   | 'kept_grants_in_use'
@@ -1186,11 +1179,11 @@ export const WINDOWS_SRT_WIN_CAPABILITIES = {
    */
   execHolder: 'exec-holder',
   /**
-   * `profile grant --refresh` leaves the grant incomplete when an entry
-   * could not be revoked, and `profile status` says which operation
-   * wrote the record and whether it is this profile's.
+   * `profile retry-stale` tries again to revoke what the last run could
+   * not, and `profile status` says which operation wrote the record and
+   * whether it is this profile's.
    */
-  profileRefresh: 'profile-refresh',
+  profileRetryStale: 'profile-retry-stale',
 } as const
 
 /**
@@ -3414,7 +3407,6 @@ export interface WindowsProfileGrantStatus {
   unverifiable: WindowsProfileGrantItem[]
   unprotected: WindowsProfileGrantItem[]
   staleAllow: WindowsProfileGrantItem[]
-  unreachable: WindowsProfileGrantItem[]
   /**
    * Configuration files granted by name that were replaced since (a save
    * by write-and-rename): unreadable to sandboxed commands, and their
@@ -3470,7 +3462,6 @@ type RawProfileStatus = {
   unverifiable?: unknown
   unprotected?: unknown
   stale_allow?: unknown
-  unreachable?: unknown
   replaced_files?: unknown
   state?: string
   reason?: string
@@ -3614,7 +3605,6 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     unverifiable: grantItems(raw.unverifiable),
     unprotected: grantItems(raw.unprotected),
     staleAllow: grantItems(raw.stale_allow),
-    unreachable: grantItems(raw.unreachable),
     replacedFiles: stringList(raw.replaced_files) ?? [],
     extraExclusions: raw.extra_exclusions ?? [],
     // Absent from what an srt-win without `--include` reports: read
@@ -3711,12 +3701,6 @@ export interface WindowsProfileGrantOptions {
    */
   replaceInclusions?: boolean
   /**
-   * An entry that could not be revoked leaves the grant incomplete, so
-   * that no session starts on it. Without this it is reported in
-   * `staleAllow` and the grant completes.
-   */
-  refresh?: boolean
-  /**
    * Kill `srt-win` after this long. Default 30 minutes: the first run
    * touches every file under the granted directories.
    */
@@ -3759,8 +3743,6 @@ export interface WindowsProfileGrantItem {
 
 export interface WindowsProfileGrantResult {
   profile: string
-  /** `false`: a `refresh` run left something it was to revoke readable. */
-  complete: boolean
   containers: number
   granted: number
   files: number
@@ -3798,16 +3780,12 @@ export interface WindowsProfileGrantResult {
    */
   unprotected: WindowsProfileGrantItem[]
   /**
-   * Paths that have left the grant and still carry the allow of an
+   * Paths that have left the grant and may still carry the allow of an
    * earlier run, which could not be removed: readable through the
-   * grant's own entry.
+   * grant's own entry until it is. Includes those on a volume that
+   * cannot be reached now. They stay recorded and are retried.
    */
   staleAllow: WindowsProfileGrantItem[]
-  /**
-   * Entries to revoke on a volume that cannot be reached now. They may
-   * still be on it; they are retried, and hold nothing back.
-   */
-  unreachable: WindowsProfileGrantItem[]
   /**
    * Write roots kept from earlier sessions whose grant this run removed
    * because it reached an exclusion (the root is one, lies inside one,
@@ -3935,7 +3913,6 @@ function profileGrantArgs(opts: WindowsProfileGrantOptions): string[] {
   if (opts.replaceExclusions) args.push('--replace-excludes')
   for (const i of opts.include ?? []) args.push('--include', i)
   if (opts.replaceInclusions) args.push('--replace-includes')
-  if (opts.refresh) args.push('--refresh')
   return args
 }
 
@@ -3957,7 +3934,6 @@ function profileGrantResult(
   // stdout carries one JSON object; `--json` puts nothing else there.
   const raw = parseSrtWinJson<{
     profile: string
-    complete?: boolean
     containers: number
     granted: number
     files: number
@@ -3973,14 +3949,12 @@ function profileGrantResult(
     unverifiable?: unknown
     unprotected?: unknown
     stale_allow?: unknown
-    unreachable?: unknown
     forgotten_roots?: unknown
     failed?: WindowsProfileGrantItem[]
     elapsed_ms: number
   }>(args, r)
   return {
     profile: raw.profile,
-    complete: raw.complete !== false,
     containers: raw.containers,
     granted: raw.granted,
     files: raw.files,
@@ -3996,40 +3970,34 @@ function profileGrantResult(
     unverifiable: grantItems(raw.unverifiable),
     unprotected: grantItems(raw.unprotected),
     staleAllow: grantItems(raw.stale_allow),
-    unreachable: grantItems(raw.unreachable),
     forgottenRoots: grantItems(raw.forgotten_roots),
     elapsedMs: raw.elapsed_ms,
   }
 }
 
 /**
- * Bring a grant {@link windowsProfileGrantRefreshable} says may be
- * brought up to date, and return its status. Throws
- * `profile_grant_refresh_failed` if anything it was to revoke is still
- * readable, whatever `srt-win` exited with.
+ * Try again to revoke what the last run of the grant could not, on the
+ * paths it noted alone (`srt-win profile retry-stale`). Returns how many
+ * cleared; what is left stays recorded and reported by the status.
  */
-export async function refreshWindowsProfileRead(opts: {
+export async function retryWindowsProfileStale(opts: {
   srtWin: SrtWinSpawn
-  onProgress?: (line: string) => void
-}): Promise<WindowsProfileGrantStatus> {
-  const r = await grantWindowsProfileRead({ ...opts, refresh: true })
-  const left = [
-    ...r.staleAllow,
-    ...r.unprotected.filter(i => i.entry !== undefined),
-  ]
-  if (!r.complete || left.length > 0) {
+}): Promise<{ cleared: number }> {
+  const args = ['profile', 'retry-stale', '--json']
+  const r = await runSrtWinAsync(args, {
+    timeoutMs: 60_000,
+    srtWin: opts.srtWin,
+  })
+  throwIfRefusedBesideOthers(args, r.status, r.stdout)
+  if (r.status !== 0) {
     throw new WindowsSandboxError(
-      'profile_grant_refresh_failed',
-      `The read grant on your user profile could not be narrowed: ` +
-        `${left.map(i => `'${i.path}': ${i.reason}`).join('; ') || 'the run did not complete'}. ` +
-        `No session starts until it is. Fix what is named and start again, ` +
-        `or run grantWindowsProfileRead() (\`srt-win profile grant\`) to ` +
-        `complete the grant with it reported, or forgetWindowsProfileRead() ` +
-        `(\`srt-win profile forget\`) to run without reading the profile.`,
+      'profile_grant_failed',
+      `srt-win profile retry-stale exited ${r.status}: ${r.stderr.slice(-2000)}`,
       'profile',
     )
   }
-  return getWindowsProfileReadStatusAsync({ srtWin: opts.srtWin })
+  const { cleared } = parseSrtWinJson<{ cleared?: number }>(args, r)
+  return { cleared: cleared ?? 0 }
 }
 
 /**

@@ -228,7 +228,7 @@ const SRT_WIN_CAPABILITIES = [
   'kept-grant-holders',
   'read-deny-except',
   'exec-holder',
-  'profile-refresh',
+  'profile-retry-stale',
 ]
 const CURRENT_PROFILE_GRANT = JSON.stringify({
   record_version: 1,
@@ -494,7 +494,8 @@ function madeWithoutBlocking(argv: readonly string[]): boolean {
     (own[0] === 'acl' &&
       (own[1] === 'forget' ||
         (own[1] === 'grant' && own.includes('--persistent')))) ||
-    (own[0] === 'profile' && (own[1] === 'forget' || own[1] === 'status'))
+    (own[0] === 'profile' &&
+      (own[1] === 'forget' || own[1] === 'status' || own[1] === 'retry-stale'))
   )
 }
 
@@ -1491,7 +1492,6 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
-        unreachable: [],
         replacedFiles: [],
         extraExclusions: [],
         extraInclusions: [],
@@ -1511,7 +1511,6 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
-        unreachable: [],
         replacedFiles: [],
         extraExclusions: [],
         extraInclusions: [],
@@ -6906,7 +6905,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           profileStatus = until(refreshable(patch))
           await SandboxManager.initialize(config())
           expect(asyncCalls.filter(a => a[0] === 'profile')).toEqual([
-            ['profile', 'grant', '--json', '--refresh'],
+            ['profile', 'grant', '--json'],
           ])
           expect(names()).toEqual([
             'profile status',
@@ -6950,49 +6949,81 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         })
       }
 
-      for (const [what, patch] of [
-        ['exit 0 with a stale allow', { stale_allow: [staleItem] }],
-        [
-          'exit 0 with an excluded path still open through our entry',
-          { unprotected: [{ ...staleItem, entry: 'explicit' }] },
-        ],
-        ['exit 0 and not complete', { complete: false }],
-      ] as const) {
-        it(`${what}: profile_grant_refresh_failed, and no session starts`, async () => {
-          profileStatus = until(refreshable())
-          grantRun = { stderr: [], stdout: report(patch), code: 0 }
-          const e = await rejection(config())
-          expect(e).toBeInstanceOf(WindowsSandboxError)
-          expect(e.code).toBe('profile_grant_refresh_failed')
-          expect(names()).not.toContain('acl grant')
-          expect(SandboxManager.getConfig()).toBeUndefined()
-        })
-      }
-
-      it('names what it could not revoke', async () => {
-        profileStatus = until(refreshable())
+      it('exit 0 with a stale allow: the session starts, and the path is warned about', async () => {
+        profileStatus = {
+          toJSON: () =>
+            granted()
+              ? { ...current(), stale_allow: [staleItem] }
+              : refreshable(),
+        }
         grantRun = {
           stderr: [],
           stdout: report({ stale_allow: [staleItem] }),
           code: 0,
         }
-        const e = await rejection(config())
-        expect(e.message).toContain(staleItem.path)
-        expect(e.message).toContain('copies beneath')
-      })
-
-      it('an unreachable volume is reported and holds nothing back', async () => {
-        const unreachable = [{ path: 'Q:\\gone', reason: 'volume' }]
-        profileStatus = {
-          toJSON: () =>
-            granted() ? { ...current(), unreachable } : refreshable(),
-        }
-        grantRun = { stderr: [], stdout: report({ unreachable }), code: 0 }
         await SandboxManager.initialize(config())
         expect(names()).toContain('acl grant')
+        expect(names()).not.toContain('profile retry-stale')
+        const [w] = SandboxManager.getWindowsProfileReadWarnings()
+        expect(w!.code).toBe('profile_stale_allow')
+        expect(w!.paths.map(i => i.path)).toEqual([staleItem.path])
+        expect(w!.message).toContain('may still carry')
         expect(
-          SandboxManager.getWindowsProfileReadWarnings().map(w => w.code),
-        ).toEqual(['profile_volume_unreachable'])
+          SandboxManager.getWindowsProfileReadRefresh()?.staleAllow.map(
+            i => i.path,
+          ),
+        ).toEqual([staleItem.path])
+      })
+
+      describe('a current grant with stale allows', () => {
+        const stale = () => ({ ...current(), stale_allow: [staleItem] })
+        const retried = () => names().includes('profile retry-stale')
+
+        it('is retried on those paths, and a cleared one is not warned about', async () => {
+          profileStatus = {
+            toJSON: () => (retried() ? current() : stale()),
+          }
+          syncResult['profile retry-stale'] = exit(0, '{"cleared":1}')
+          await SandboxManager.initialize(config())
+          expect(names()).toEqual([
+            'profile status',
+            'profile retry-stale',
+            'profile status',
+            'acl grant',
+          ])
+          expect(asyncCalls.some(a => a[1] === 'grant')).toBe(false)
+          expect(SandboxManager.getWindowsProfileReadWarnings()).toEqual([])
+        })
+
+        it('one still stuck: the session starts, and it is warned about', async () => {
+          profileStatus = stale()
+          syncResult['profile retry-stale'] = exit(0, '{"cleared":0}')
+          await SandboxManager.initialize(config())
+          expect(names()).toContain('acl grant')
+          expect(
+            SandboxManager.getWindowsProfileReadWarnings().map(w => w.code),
+          ).toEqual(['profile_stale_allow'])
+        })
+
+        for (const [what, code] of [
+          ['another session running', 24],
+          ['a failure of its own', 1],
+        ] as const) {
+          it(`${what}: not a failure, and it is warned about`, async () => {
+            profileStatus = stale()
+            syncResult['profile retry-stale'] = exit(code, '')
+            await SandboxManager.initialize(config())
+            expect(names()).toContain('acl grant')
+            expect(
+              SandboxManager.getWindowsProfileReadWarnings().map(w => w.code),
+            ).toEqual(['profile_stale_allow'])
+          })
+        }
+
+        it('a current grant with none is not retried', async () => {
+          await SandboxManager.initialize(config())
+          expect(retried()).toBe(false)
+        })
       })
 
       for (const [code, want] of [
@@ -8323,7 +8354,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       ])
       expect(r).toEqual({
         profile: home,
-        complete: true,
         placeholdersRemoved: 0,
         containers: 4,
         granted: 30,
@@ -8339,7 +8369,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
-        unreachable: [],
         forgottenRoots: [],
         elapsedMs: 1234,
       })
@@ -8909,7 +8938,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         unverifiable: [],
         unprotected: [],
         staleAllow: [],
-        unreachable: [],
         replacedFiles: [],
         extraExclusions: [],
         extraInclusions: [],

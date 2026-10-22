@@ -66,9 +66,9 @@
         finds) revokes what left the grant: the directory and a deep
         child carry nothing of the group, another party's entry stays,
         a key directory stays unreadable. A child the walk cannot
-        rewrite is reported: `--refresh` leaves the grant incomplete,
-        a plain run completes it with the path in `stale_allow`, and
-        the run after it is made writable clears it.
+        rewrite is reported in `stale_allow` and the grant completes;
+        `profile retry-stale` keeps it reported while the child is
+        stuck, and clears it once it can be rewritten.
     A   `acl grant` (a session's grants) refuses, and grants nothing,
         when a write root is a protected exclusion, lies inside one,
         or lies above one (the profile directory), and when it is the
@@ -689,7 +689,7 @@ try {
   if ($st.state -eq 'outdated' -and $st.recorded_list_version -eq 3 -and $st.same_profile -eq $true -and $st.last_operation -eq 'grant') {
     Ok 'V: the older record reads outdated, on the same profile, written by a grant'
   } else { Fail "V: status of the older record: $($st | ConvertTo-Json -Compress -Depth 2)" }
-  $gv = Grant @('--replace-includes', '--refresh')
+  $gv = Grant @('--replace-includes')
   if ($gv.exit -eq 0 -and $gv.json.complete -and @($gv.json.stale_allow).Count -eq 0) { Ok 'V: the refresh completes' }
   else { Fail "V: refresh exit=$($gv.exit) raw: $($gv.raw)" }
   if (-not (Has-Group $docs) -and -not (Has-Group $vDeep)) { Ok 'V: neither the directory nor a deep child carries anything of the group' }
@@ -707,19 +707,20 @@ try {
   if ($gv.exit -ne 0) { Fail "V: second grant exit=$($gv.exit) raw: $($gv.raw)" }
   & icacls $vStuck /deny '*S-1-1-0:(WDAC)' | Out-Null
   & icacls $vStuck /setowner '*S-1-5-18' | Out-Null
-  $gv = Grant @('--replace-includes', '--refresh')
-  if (-not (Has-GroupAllow $vStuck)) {
+  $gv = Grant @('--replace-includes')
+  $vWalked = -not (Has-GroupAllow $vStuck)
+  if ($vWalked) {
     Write-Host 'V: SKIPPED the failed walk: this account rewrote the child all the same'
   } else {
     $named = @($gv.json.stale_allow | Where-Object { $_.path -match '\\Documents$' }).Count -eq 1
-    if ($gv.exit -eq 0 -and -not $gv.json.complete -and $named) { Ok 'V: a walk that did not finish is reported, and a refresh is left incomplete' }
-    else { Fail "V: refresh over a stuck child exit=$($gv.exit) raw: $($gv.raw)" }
+    if ($gv.exit -eq 0 -and $gv.json.complete -and $named) { Ok 'V: a walk that did not finish is reported, and the grant completes' }
+    else { Fail "V: run over a stuck child exit=$($gv.exit) raw: $($gv.raw)" }
     $st = Status
-    if ($st.state -eq 'incomplete' -and $st.last_operation -eq 'grant' -and @($st.stale_allow).Count -ge 1) { Ok 'V: the record says so, though the directory itself is clean' }
+    if ($st.state -eq 'current' -and @($st.stale_allow).Count -ge 1) { Ok 'V: the record says so, though the directory itself is clean' }
     else { Fail "V: status over a stuck child: $($st | ConvertTo-Json -Compress -Depth 2)" }
-    $gv = Grant
-    if ($gv.json.complete -and @($gv.json.stale_allow).Count -ge 1) { Ok 'V: a run the user asked for completes the grant, with the path reported' }
-    else { Fail "V: plain run over a stuck child: raw: $($gv.raw)" }
+    $rv = Invoke-Srt $Exe @('profile', 'retry-stale', '--json')
+    if ($rv.exit -eq 0) { Ok 'V: a retry over a stuck child is no failure' }
+    else { Fail "V: retry-stale exit=$($rv.exit) raw: $($rv.raw)" }
   }
   & icacls $vStuck /setowner "*$(([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value)" | Out-Null
   & icacls $vStuck /remove:d '*S-1-1-0' | Out-Null

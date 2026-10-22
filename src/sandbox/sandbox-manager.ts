@@ -87,10 +87,12 @@ import {
   missingWindowsSrtWinCapability,
   windowsGrantsBeneathDenies,
   type WindowsProfileGrantItem,
+  type WindowsProfileGrantResult,
   type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
   getWindowsProfileReadStatusAsync,
-  refreshWindowsProfileRead,
+  grantWindowsProfileRead,
+  retryWindowsProfileStale,
   windowsProfileGrantRefreshable,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
@@ -265,6 +267,8 @@ let windowsProfileRead: 'granted' | 'absent' | undefined
 // Windows: what the session has to tell its user about the profile
 // read grant it runs on (getWindowsProfileReadWarnings).
 let windowsProfileReadWarnings: WindowsProfileReadWarning[] = []
+// Windows: what this initialize() found when it refreshed the grant.
+let windowsProfileReadRefresh: WindowsProfileGrantResult | undefined
 
 /** Something about the profile read grant that the user should be shown. */
 export interface WindowsProfileReadWarning {
@@ -273,7 +277,6 @@ export interface WindowsProfileReadWarning {
     | 'profile_exclusion_unprotected'
     | 'profile_exclusion_unverifiable'
     | 'profile_stale_allow'
-    | 'profile_volume_unreachable'
     | 'profile_file_replaced'
   message: string
   paths: WindowsProfileGrantItem[]
@@ -289,7 +292,7 @@ export function windowsProfileReadWarningsOf(
     WindowsProfileGrantStatus,
     'unprotected' | 'unverifiable' | 'staleAllow'
   > &
-    Partial<Pick<WindowsProfileGrantStatus, 'replacedFiles' | 'unreachable'>>,
+    Partial<Pick<WindowsProfileGrantStatus, 'replacedFiles'>>,
 ): WindowsProfileReadWarning[] {
   const list = (items: readonly WindowsProfileGrantItem[]) =>
     items.map(i => i.path).join(', ')
@@ -371,23 +374,12 @@ export function windowsProfileReadWarningsOf(
       code: 'profile_stale_allow',
       message:
         `${grant.staleAllow.length} path(s) that have left the profile ` +
-        `read grant still carry an entry of it that could not be removed, ` +
-        `and are readable to sandboxed commands through it: ` +
+        `read grant may still carry an entry of it that could not be ` +
+        `removed, and stay readable to sandboxed commands until it is: ` +
         `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
-        `path's reason gives the icacls command that removes the entry.`,
+        `path's reason says what stopped it; it is tried again at each ` +
+        `session start.`,
       paths: grant.staleAllow,
-    })
-  }
-  const unreachable = grant.unreachable ?? []
-  if (unreachable.length > 0) {
-    out.push({
-      code: 'profile_volume_unreachable',
-      message:
-        `${unreachable.length} path(s) that have left the profile read ` +
-        `grant are on a volume that cannot be reached now, and may still ` +
-        `carry an entry of it: ${list(unreachable)}. It is removed when ` +
-        `the volume is back.`,
-      paths: unreachable,
     })
   }
   const replaced = grant.replacedFiles ?? []
@@ -1306,6 +1298,7 @@ async function initializeSteps(
     // initialize() writes the profile read grant only to narrow one
     // already there (windowsProfileGrantRefreshable).
     windowsProfileReadWarnings = []
+    windowsProfileReadRefresh = undefined
     let profileRead: 'granted' | 'absent' = 'absent'
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
@@ -1320,16 +1313,30 @@ async function initializeSteps(
       if (u.profileGrant) {
         let grant = await getWindowsProfileReadStatusAsync({ srtWin })
         // Before this session is a holder of anything: the grant is
-        // written only while no session or command holds it.
+        // written only while no session or command holds it. A run that
+        // does not finish throws; one that finishes with paths it could
+        // not revoke starts the session, and they are warned about.
         if (windowsProfileGrantRefreshable(grant)) {
           logForDebugging(
             `[Sandbox Windows] refreshing the profile read grant ` +
               `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''})`,
           )
-          grant = await refreshWindowsProfileRead({
+          windowsProfileReadRefresh = await grantWindowsProfileRead({
             srtWin,
             onProgress: line => logForDebugging(`[Sandbox Windows] ${line}`),
           })
+          grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        } else if (grant.state === 'current' && grant.staleAllow.length > 0) {
+          // On the noted paths alone, and never a reason not to start.
+          try {
+            await retryWindowsProfileStale({ srtWin })
+            grant = await getWindowsProfileReadStatusAsync({ srtWin })
+          } catch (e) {
+            logForDebugging(
+              `[Sandbox Windows] retrying stale profile entries: ${e}`,
+              { level: 'warn' },
+            )
+          }
         }
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
@@ -3232,6 +3239,7 @@ async function reset(): Promise<void> {
   srtWinSpawn = undefined
   windowsProfileRead = undefined
   windowsProfileReadWarnings = []
+  windowsProfileReadRefresh = undefined
   windowsCapableSrtWin.clear()
   // windowsWfpVerifiedFor is NOT cleared — per-process, not per-session.
 
@@ -3550,6 +3558,8 @@ export interface ISandboxManager {
    * entries that could not be removed. None of them is a rejection.
    */
   getWindowsProfileReadWarnings(): WindowsProfileReadWarning[]
+  /** What this `initialize()` found if it refreshed the profile read grant. */
+  getWindowsProfileReadRefresh(): WindowsProfileGrantResult | undefined
   getSentinelRegistry(): SentinelRegistry
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
@@ -3596,6 +3606,7 @@ export const SandboxManager: ISandboxManager = {
   getMitmCA: () => mitmCA,
   getWindowsProfileRead: () => windowsProfileRead,
   getWindowsProfileReadWarnings: () => [...windowsProfileReadWarnings],
+  getWindowsProfileReadRefresh: () => windowsProfileReadRefresh,
   getSentinelRegistry: () => sentinelRegistry,
   getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,
