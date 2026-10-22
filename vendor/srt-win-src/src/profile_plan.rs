@@ -1807,8 +1807,127 @@ pub fn env_pointers(
     out
 }
 
+/// What is at a recorded path now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedAt {
+    /// The recorded object, or an object where none was identified.
+    ThisObject,
+    /// An object that is not the recorded one.
+    AnotherObject,
+    /// Nothing has that name.
+    Nothing,
+    /// The volume cannot be reached right now.
+    VolumeUnavailable,
+    /// It could not be opened for another reason, access denied among them.
+    Refused,
+}
+
+/// Where the recorded file id leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoundById {
+    Elsewhere,
+    /// The volume answered that no file has this id.
+    Gone,
+    VolumeAbsent,
+    Unknown,
+}
+
+/// What to do about a recorded entry that is to be revoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeAction {
+    /// Take the entry off the object at the recorded path.
+    AtPath,
+    /// Take it off the object where its file id leads.
+    ByFileId,
+    /// The object no longer exists: only the record goes.
+    Drop,
+    /// Hand it to the strips retried when its volume returns.
+    Defer,
+    /// Keep the record and try again at the next run.
+    Unreachable,
+    Fail,
+}
+
+/// Decide what revoking a recorded entry takes. An object is gone only on
+/// a definite not-found from a volume that answers: `by_id` is `None`
+/// when no file id is recorded, and then `volume_reachable` says whether
+/// the path's own volume is there.
+pub fn revoke_action(
+    at: RecordedAt,
+    by_id: Option<FoundById>,
+    network: bool,
+    volume_reachable: bool,
+) -> RevokeAction {
+    use {FoundById as F, RecordedAt as A, RevokeAction as R};
+    match (at, by_id) {
+        (A::ThisObject, _) => R::AtPath,
+        (A::Refused, _) => R::Fail,
+        (_, Some(F::Elsewhere)) => R::ByFileId,
+        (_, Some(F::Gone)) => R::Drop,
+        (A::VolumeUnavailable, Some(_)) => R::Defer,
+        (_, Some(F::VolumeAbsent)) if network => R::Unreachable,
+        (_, Some(F::VolumeAbsent)) => R::Defer,
+        (_, Some(F::Unknown)) => R::Fail,
+        (A::Nothing, None) if volume_reachable => R::Drop,
+        (A::Nothing | A::VolumeUnavailable, None) => R::Unreachable,
+        (A::AnotherObject, None) => R::Fail,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn revoking_drops_a_record_only_for_an_object_that_is_definitely_gone() {
+        use super::{FoundById as F, RecordedAt as A, RevokeAction as R, revoke_action as act};
+        // Gone: not found at the path, and the volume says so too.
+        assert_eq!(act(A::Nothing, Some(F::Gone), false, true), R::Drop);
+        assert_eq!(act(A::Nothing, None, false, true), R::Drop);
+        // A new object at the path: the recorded one is gone, this is not ours.
+        assert_eq!(act(A::AnotherObject, Some(F::Gone), false, true), R::Drop);
+        // Moved: it still exists, and still carries the entry.
+        assert_eq!(
+            act(A::Nothing, Some(F::Elsewhere), false, true),
+            R::ByFileId
+        );
+        assert_eq!(
+            act(A::AnotherObject, Some(F::Elsewhere), false, true),
+            R::ByFileId
+        );
+        // Unreachable: neither dropped nor a failure.
+        for by_id in [F::VolumeAbsent, F::Unknown] {
+            assert_eq!(
+                act(A::VolumeUnavailable, Some(by_id), true, false),
+                R::Defer
+            );
+        }
+        assert_eq!(
+            act(A::Nothing, Some(F::VolumeAbsent), false, false),
+            R::Defer
+        );
+        assert_eq!(
+            act(A::Nothing, Some(F::VolumeAbsent), true, false),
+            R::Unreachable
+        );
+        assert_eq!(
+            act(A::VolumeUnavailable, None, false, false),
+            R::Unreachable
+        );
+        // A drive letter that names nothing also reads as not found.
+        assert_eq!(act(A::Nothing, None, false, false), R::Unreachable);
+        // Access denied and the like stay failures, whatever else is known.
+        for by_id in [
+            None,
+            Some(F::Gone),
+            Some(F::Elsewhere),
+            Some(F::VolumeAbsent),
+        ] {
+            assert_eq!(act(A::Refused, by_id, false, true), R::Fail);
+        }
+        assert_eq!(act(A::Nothing, Some(F::Unknown), false, true), R::Fail);
+        // The recorded object is there: the ordinary case.
+        assert_eq!(act(A::ThisObject, None, false, true), R::AtPath);
+    }
+
     use super::*;
     use std::collections::BTreeMap;
 

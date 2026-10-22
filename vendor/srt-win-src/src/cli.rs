@@ -477,10 +477,15 @@ enum ProfileCmd {
         /// `--include`: drop them all).
         #[arg(long)]
         replace_includes: bool,
+        /// An entry that could not be revoked leaves the grant
+        /// incomplete, so that no session starts on it. Without this
+        /// it is reported and the grant completes.
+        #[arg(long)]
+        refresh: bool,
         /// Print the result as one JSON object on stdout:
         /// `{profile, list_version, complete, containers, granted,
-        /// files, denied, placeholders, writes, unchanged, removed,
-        /// skipped, failed, elapsed_ms}`.
+        /// files, denied, placeholders, placeholders_removed, writes,
+        /// unchanged, removed, skipped, failed, elapsed_ms}`.
         #[arg(long)]
         json: bool,
         /// No progress lines on stderr.
@@ -2540,6 +2545,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     replace_excludes,
                     include,
                     replace_includes,
+                    refresh,
                     json,
                     quiet,
                     #[cfg(feature = "test-hooks")]
@@ -2582,6 +2588,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         replace_excludes,
                         include: &include,
                         replace_includes,
+                        refresh,
                     },
                     !quiet,
                 )
@@ -3918,6 +3925,12 @@ mod tests {
             })
         ));
         assert!(parse(&["srt-win", "profile", "grant", "--include"]).is_err());
+        assert!(matches!(
+            parse(&["srt-win", "profile", "grant", "--refresh"]),
+            Ok(Cmd::Profile {
+                sub: ProfileCmd::Grant { refresh: true, .. }
+            })
+        ));
         match parse(&[
             "srt-win",
             "acl",

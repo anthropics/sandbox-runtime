@@ -62,6 +62,13 @@
         unreadable again. An `--include` of an excluded path, of a path
         inside one, or of a path in the temporary directory is refused
         and records nothing.
+    V   a refresh from a record of an older list (what an upgrade
+        finds) revokes what left the grant: the directory and a deep
+        child carry nothing of the group, another party's entry stays,
+        a key directory stays unreadable. A child the walk cannot
+        rewrite is reported: `--refresh` leaves the grant incomplete,
+        a plain run completes it with the path in `stale_allow`, and
+        the run after it is made writable clears it.
     A   `acl grant` (a session's grants) refuses, and grants nothing,
         when a write root is a protected exclusion, lies inside one,
         or lies above one (the profile directory), and when it is the
@@ -661,6 +668,66 @@ try {
   if (-not (Has-Group $docs) -and @((Status).extra_inclusions).Count -eq 0) { Ok 'I: the dropped directory carries no entry, and the record lists no added inclusion' }
   else { Fail "I: after --replace-includes: Documents=$(Sddl $docs) extra_inclusions=$((Status).extra_inclusions -join ',')" }
   Expect-Read 'I (a built-in entry is not replaceable)' $note 'NOTE-CONTENT'
+
+  # ── V: revoking what left the grant ──────────────────────────────
+  $vDeep  = Join-Path $docs 'revoke\a\b\deep.txt'
+  $vStuck = Join-Path $docs 'revoke\stuck.txt'
+  New-Item -ItemType Directory -Force -Path (Split-Path $vDeep) | Out-Null
+  Set-Content -Path $vDeep -Value 'DEEP-CONTENT' -NoNewline
+  Set-Content -Path $vStuck -Value 'STUCK-CONTENT' -NoNewline
+  $vOther = 'S-1-5-19'
+  & icacls $docs /grant "*${vOther}:(R)" | Out-Null
+  $gv = Grant @('--include', 'Documents')
+  if ($gv.exit -ne 0) { Fail "V: grant --include exit=$($gv.exit) raw: $($gv.raw)" }
+  if (Has-GroupAllow $vDeep) { Ok 'V: a deep child carries a copy of the entry' }
+  else { Fail "V: deep child before the refresh: $(Sddl $vDeep)" }
+  # The record an earlier release leaves: the same rows, an older list.
+  $vKey = 'HKCU:\Software\sandbox-runtime\PersistentGrants'
+  $vHeader = (Get-ItemProperty $vKey).Profile
+  Set-ItemProperty $vKey -Name Profile -Value ($vHeader -replace '^1\|\d+\|', '1|3|')
+  $st = Status
+  if ($st.state -eq 'outdated' -and $st.recorded_list_version -eq 3 -and $st.same_profile -eq $true -and $st.last_operation -eq 'grant') {
+    Ok 'V: the older record reads outdated, on the same profile, written by a grant'
+  } else { Fail "V: status of the older record: $($st | ConvertTo-Json -Compress -Depth 2)" }
+  $gv = Grant @('--replace-includes', '--refresh')
+  if ($gv.exit -eq 0 -and $gv.json.complete -and @($gv.json.stale_allow).Count -eq 0) { Ok 'V: the refresh completes' }
+  else { Fail "V: refresh exit=$($gv.exit) raw: $($gv.raw)" }
+  if (-not (Has-Group $docs) -and -not (Has-Group $vDeep)) { Ok 'V: neither the directory nor a deep child carries anything of the group' }
+  else { Fail "V: after the refresh: Documents=$(Sddl $docs) deep=$(Sddl $vDeep)" }
+  if ((Sddl $docs) -match '\(A;[^)]*;;;LS\)') { Ok "V: another party's entry stays" }
+  else { Fail "V: another party's entry is gone: $(Sddl $docs)" }
+  Expect-NoRead 'V (revoked deep child)' $vDeep 'DEEP-CONTENT'
+  if ((Status).state -eq 'current') { Ok 'V: the refreshed grant is current' }
+  else { Fail "V: state after the refresh: $((Status).state)" }
+  if ((Sddl (Join-Path $prof '.ssh')) -match ('\(D;[^)]*' + [regex]::Escape($script:grpSid))) { Ok 'V: a key directory keeps its deny' }
+  else { Fail "V: .ssh after the refresh: $(Sddl (Join-Path $prof '.ssh'))" }
+
+  # A child the walk cannot rewrite: owned by SYSTEM, WRITE_DAC denied.
+  $gv = Grant @('--include', 'Documents')
+  if ($gv.exit -ne 0) { Fail "V: second grant exit=$($gv.exit) raw: $($gv.raw)" }
+  & icacls $vStuck /deny '*S-1-1-0:(WDAC)' | Out-Null
+  & icacls $vStuck /setowner '*S-1-5-18' | Out-Null
+  $gv = Grant @('--replace-includes', '--refresh')
+  if (-not (Has-GroupAllow $vStuck)) {
+    Write-Host 'V: SKIPPED the failed walk: this account rewrote the child all the same'
+  } else {
+    $named = @($gv.json.stale_allow | Where-Object { $_.path -match '\\Documents$' }).Count -eq 1
+    if ($gv.exit -eq 0 -and -not $gv.json.complete -and $named) { Ok 'V: a walk that did not finish is reported, and a refresh is left incomplete' }
+    else { Fail "V: refresh over a stuck child exit=$($gv.exit) raw: $($gv.raw)" }
+    $st = Status
+    if ($st.state -eq 'incomplete' -and $st.last_operation -eq 'grant' -and @($st.stale_allow).Count -ge 1) { Ok 'V: the record says so, though the directory itself is clean' }
+    else { Fail "V: status over a stuck child: $($st | ConvertTo-Json -Compress -Depth 2)" }
+    $gv = Grant
+    if ($gv.json.complete -and @($gv.json.stale_allow).Count -ge 1) { Ok 'V: a run the user asked for completes the grant, with the path reported' }
+    else { Fail "V: plain run over a stuck child: raw: $($gv.raw)" }
+  }
+  & icacls $vStuck /setowner "*$(([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value)" | Out-Null
+  & icacls $vStuck /remove:d '*S-1-1-0' | Out-Null
+  $gv = Grant
+  if ($gv.json.complete -and @($gv.json.stale_allow).Count -eq 0 -and -not (Has-Group $vStuck)) { Ok 'V: once it can be rewritten the next run clears it' }
+  else { Fail "V: after unsticking: stuck=$(Sddl $vStuck) raw: $($gv.raw)" }
+  & icacls $docs /remove:g "*$vOther" | Out-Null
+  Remove-Item -Recurse -Force (Join-Path $docs 'revoke')
 
   # ── A: a session's grants against the exclusions ─────────────────
   function Session-Grant { param([string[]] $read = @(), [string[]] $write = @(), [string[]] $flags = @())
