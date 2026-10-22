@@ -1494,6 +1494,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         extraInclusions: [],
         exclusions: [],
         ungrantedOnly: [],
+        inclusions: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
         env: {},
         paths: [],
@@ -1511,6 +1512,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         extraInclusions: [],
         exclusions: [],
         ungrantedOnly: [],
+        inclusions: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
         env: {},
         paths: [],
@@ -6561,6 +6563,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     extra_inclusions: ['tools'],
     exclusions: exclusions(),
     ungranted_only: ungrantedOnly(),
+    inclusions: [join(home, 'scoop'), join(home, 'tools')],
     containers: 2,
     granted: 1,
     files: 2,
@@ -8046,7 +8049,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       for (const said of [
         homedir(),
         'readable to sandboxed commands',
-        'except',
+        'AppData\\Local\\Programs',
+        'not readable unless added',
+        'denied',
         '.npmrc',
         'pip.ini',
         'NuGet.Config',
@@ -8658,6 +8663,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       expect(st.extraInclusions).toEqual(['tools'])
       expect(st.exclusions).toEqual(exclusions())
       expect(st.ungrantedOnly).toEqual(ungrantedOnly())
+      expect(st.inclusions).toEqual([join(home, 'scoop'), join(home, 'tools')])
       expect(st.counts).toEqual({
         containers: 2,
         granted: 1,
@@ -8763,6 +8769,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         extraInclusions: [],
         exclusions: [],
         ungrantedOnly: [],
+        inclusions: [],
         counts: { containers: 0, granted: 0, files: 0, denied: 0 },
         env: {
           NPM_CONFIG_USERCONFIG: 'n',
