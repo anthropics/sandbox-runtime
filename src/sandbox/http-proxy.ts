@@ -499,8 +499,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     }
   }
 
-  // Handle CONNECT requests for HTTPS traffic
-  server.on('connect', async (req, socket, head) => {
+  // Handle CONNECT requests for HTTPS traffic. `head` is widened from the
+  // listener's NonSharedBuffer: it is reassigned below from socket reads.
+  server.on('connect', async (req, socket, head: Buffer) => {
     // Attach error handler immediately to prevent unhandled errors
     socket.on('error', err => {
       logForDebugging(`Client socket error: ${err.message}`, { level: 'error' })
