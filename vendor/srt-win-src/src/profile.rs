@@ -2436,8 +2436,11 @@ pub fn grant(
             .context("begin recording revokes")?;
         for r in &before {
             let w = wanted(&r.path);
-            if is_pending(&r.path) || plan::revoke_begins(r.kind, w) {
+            if plan::revoke_begins(r.kind, w) {
                 pend_revoke(&tx, r, w)?;
+            } else if is_pending(&r.path) {
+                // Wanted again as it was: there is nothing to take back.
+                finish_revoke(&tx, &r.path)?;
             }
         }
         tx.commit().context("commit recording revokes")?;
@@ -4705,15 +4708,11 @@ mod tests {
             r"AppData\Roaming\Microsoft",
             r"AppData\Local",
             r"AppData\Local\Programs",
+            r"AppData\Local\Programs\Tool",
         ] {
             assert_eq!(group_aces(&prof.join(c)), allow(0, LIST), "container '{c}'");
         }
-        for g in [
-            "go",
-            r".cargo\bin",
-            r"AppData\Roaming\npm",
-            r"AppData\Local\Programs\Tool",
-        ] {
+        for g in ["go", r".cargo\bin", r"AppData\Roaming\npm"] {
             assert_eq!(group_aces(&prof.join(g)), allow(0x3, RX), "granted '{g}'");
         }
         assert_eq!(
