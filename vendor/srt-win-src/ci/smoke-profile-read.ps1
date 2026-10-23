@@ -69,6 +69,8 @@
         rewrite is reported in `stale_allow` and the grant completes;
         `profile retry-stale` keeps it reported while the child is
         stuck, and clears it once it can be rewritten.
+    V2  the same on a directory narrowed to child by child: still
+        reported on the second run, and cleared by a retry.
     W   a revoke killed part-way through its walk: the next run finds
         the copies left beneath a directory that already looks clean,
         takes them off, and reports nothing stale. SKIPPED if the walk
@@ -741,6 +743,33 @@ try {
   else { Fail "V: after unsticking: stuck=$(Sddl $vStuck) raw: $($gv.raw)" }
   & icacls $docs /remove:g "*$vOther" | Out-Null
   Remove-Item -Recurse -Force (Join-Path $docs 'revoke')
+
+  # Granted whole, then child by child, over a child the walk cannot
+  # rewrite: its row already says container on the second run.
+  $v2Stuck = Join-Path $docs 'stuck2.txt'
+  Set-Content -Path $v2Stuck -Value 'STUCK2-CONTENT' -NoNewline
+  $gv = Grant @('--include', 'Documents')
+  if ($gv.exit -ne 0) { Fail "V2: grant --include exit=$($gv.exit) raw: $($gv.raw)" }
+  & icacls $v2Stuck /deny '*S-1-1-0:(WDAC)' | Out-Null
+  & icacls $v2Stuck /setowner '*S-1-5-18' | Out-Null
+  function V2-Named { param($o) @(@($o.stale_allow) + @($o.unprotected) | Where-Object { $_.path -match '\\Documents$' }).Count -ge 1 }
+  $v2Exclude = Join-Path $docs 'v2\secret'
+  $gv = Grant @('--include', 'Documents', '--exclude', $v2Exclude)
+  if ($gv.exit -eq 0 -and (Has-GroupAllow $v2Stuck) -and (V2-Named $gv.json)) { Ok 'V2: a directory that could not be narrowed is reported' }
+  else { Fail "V2: first run exit=$($gv.exit) stuck=$(Sddl $v2Stuck) raw: $($gv.raw)" }
+  $gv = Grant @('--include', 'Documents', '--exclude', $v2Exclude)
+  if ($gv.exit -eq 0 -and (V2-Named $gv.json)) { Ok 'V2: the second run, on a row that already says container, still reports it' }
+  else { Fail "V2: second run exit=$($gv.exit) raw: $($gv.raw)" }
+  if (V2-Named (Status)) { Ok 'V2: the status reports it' }
+  else { Fail "V2: status: $(Status | ConvertTo-Json -Compress -Depth 2)" }
+  & icacls $v2Stuck /setowner "*$(([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value)" | Out-Null
+  & icacls $v2Stuck /remove:d '*S-1-1-0' | Out-Null
+  $rv = Invoke-Srt $Exe @('profile', 'retry-stale', '--json')
+  if ($rv.exit -eq 0 -and -not (V2-Named (Status))) { Ok 'V2: a retry clears it once it can be rewritten' }
+  else { Fail "V2: retry exit=$($rv.exit) raw: $($rv.raw) status: $(Status | ConvertTo-Json -Compress -Depth 2)" }
+  $gv = Grant @('--replace-includes', '--replace-excludes')
+  if ($gv.exit -ne 0) { Fail "V2: closing grant exit=$($gv.exit) raw: $($gv.raw)" }
+  Remove-Item -Force $v2Stuck
 
   # ── W: a revoke killed part-way through its walk ─────────────────
   $wRoot = Join-Path $docs 'killed'

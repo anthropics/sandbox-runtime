@@ -423,10 +423,10 @@ enum ProfileCmd {
     /// or — where a protected path could lie beneath it — child by
     /// child. The
     /// profile directory and every directory on the way to a listed
-    /// or a protected path get an entry that lets the sandbox list
-    /// them and pass through; any other directory gets no entry at
-    /// all, and a session may still open it with a read grant of its
-    /// own. In the profile directory itself only `.npmrc` and
+    /// or a protected path, listed or not, get an entry that lets the
+    /// sandbox list them and pass through; any other directory gets no
+    /// entry at all, and a session may still open it with a read grant
+    /// of its own. In the profile directory itself only `.npmrc` and
     /// `.gitconfig` are readable. Protected paths — key and credential
     /// stores, browser and password-manager data, the registry hives,
     /// and what `--exclude` adds — are never granted and get a read

@@ -7,10 +7,10 @@
 //! could lie beneath it, existing or not, in which case it is a
 //! container (a non-inheriting list entry; children looked at one by
 //! one). A directory an inclusion or an exclusion could lie beneath is
-//! a container as well, so the way down to both stays open; any other
-//! directory gets no entry at all. So no excluded path ever has an
-//! ancestor that carries an inheriting allow, and nothing outside the
-//! inclusions is readable. A protected exclusion is read-denied; an
+//! a container as well, so the way down to both stays open, and its
+//! names can be listed; any other directory gets no entry at all. So no
+//! excluded path ever has an ancestor that carries an inheriting allow,
+//! and no file outside the inclusions is readable. A protected exclusion is read-denied; an
 //! ungranted-only one (the temporary directory) gets nothing at all. A
 //! link at or above a rule's path is resolved, and the rule is applied
 //! beneath its target as well ([`plan_resolved`]).
@@ -209,6 +209,12 @@ pub const BUILT_IN: &[Excl] = &[
     // Embedded browser profiles of desktop applications.
     dir(Local, r"*\EBWebView"),
     dir(Local, r"Microsoft\*\EBWebView"),
+    // The same beside a per-user install: WebView2's default is a folder
+    // named after the executable, next to it.
+    dir(Local, r"Programs\*\EBWebView"),
+    dir(Local, r"Programs\*\*.WebView2\EBWebView"),
+    dir(Local, r"Microsoft\WinGet\Packages\*\EBWebView"),
+    dir(Local, r"Microsoft\WinGet\Packages\*\*.WebView2\EBWebView"),
     // Password managers.
     dir(Roaming, "1Password"),
     dir(Local, "1Password"),
@@ -367,6 +373,7 @@ pub fn norm_component(name: &str) -> String {
 enum Pat {
     Lit(String),
     Prefix(String),
+    Suffix(String),
     Any,
 }
 
@@ -376,6 +383,8 @@ impl Pat {
             Pat::Any
         } else if let Some(prefix) = component.strip_suffix('*') {
             Pat::Prefix(norm_component(prefix))
+        } else if let Some(suffix) = component.strip_prefix('*') {
+            Pat::Suffix(norm_component(suffix))
         } else {
             Pat::Lit(norm_component(component))
         }
@@ -390,6 +399,7 @@ impl Pat {
         match self {
             Pat::Lit(l) => l == norm,
             Pat::Prefix(p) => norm.starts_with(p.as_str()),
+            Pat::Suffix(p) => norm.ends_with(p.as_str()),
             Pat::Any => true,
         }
     }
@@ -1924,28 +1934,61 @@ impl Stamped {
 }
 
 /// Whether the recorded entry handed reading down, so that taking it off
-/// counts only once what it handed down is gone too. `Ungranted` is such
-/// a removal an earlier run could not finish.
+/// counts only once what it handed down is gone too.
 pub fn hands_reading_down(kind: Kind) -> bool {
-    matches!(kind, Kind::Granted | Kind::Ungranted)
+    kind == Kind::Granted
 }
 
-/// Whether a recorded path may still carry an allow of ours that a
-/// sandboxed command can read through. `Ungranted`: its removal did not
-/// finish, so a copy of the entry may be left beneath it.
-pub fn may_carry_allow(kind: Kind) -> bool {
-    matches!(
-        kind,
-        Kind::Container | Kind::Granted | Kind::File | Kind::Ungranted
-    )
+/// Whether the entry of this kind lets a sandboxed command in.
+pub fn grants_reading(kind: Kind) -> bool {
+    matches!(kind, Kind::Container | Kind::Granted | Kind::File)
+}
+
+/// Whether a run taking a path from `kind` to `wanted` (`None`: out of
+/// the grant) takes reading back, so the path is a pending revoke until
+/// that is seen to be done.
+pub fn revoke_begins(kind: Kind, wanted: Option<Kind>) -> bool {
+    match wanted {
+        None => grants_reading(kind),
+        Some(Kind::Denied) => grants_reading(kind),
+        Some(w) => hands_reading_down(kind) && !hands_reading_down(w),
+    }
+}
+
+/// Whether a path only the registry lists is done with: a grant that was
+/// cut short deleted its row as it finished it, and left the registry as
+/// the run began. Not when the database has no rows at all (it may be the
+/// database that is gone), nor while a revoke of the path is pending.
+pub fn row_finished_by_cut_short_grant(
+    cut_short_grant: bool,
+    database_has_rows: bool,
+    in_database: bool,
+    revoke_pending: bool,
+) -> bool {
+    cut_short_grant && database_has_rows && !in_database && !revoke_pending
+}
+
+/// The list version of the last grant that ran to its end, as a new run
+/// begins: the record's own if it was complete (a build that kept no
+/// separate value says so that way), else what was kept.
+pub fn completed_list_at_start(complete_record: Option<u32>, kept: Option<u32>) -> Option<u32> {
+    complete_record.or(kept)
 }
 
 /// Whether a recorded path that cannot be written now is a row only: a
 /// killed run records every planned path before writing any, so a row
-/// says nothing of the object until its access list agrees. `Ungranted`
-/// is about what lies beneath, and a list that cannot be read proves nothing.
-pub fn record_without_entry(kind: Kind, holds_entry: Option<bool>) -> bool {
-    !matches!(kind, Kind::Ungranted | Kind::Skipped) && holds_entry == Some(false)
+/// says nothing of the object until its access list agrees. A pending
+/// revoke is about what lies beneath as well, and a list that cannot be
+/// read proves nothing.
+pub fn record_without_entry(kind: Kind, revoke_pending: bool, holds_entry: Option<bool>) -> bool {
+    kind != Kind::Skipped && !revoke_pending && holds_entry == Some(false)
+}
+
+/// Whether the check for copies of a revoked entry goes into an entry: a
+/// directory, not a link or placeholder (its access list is read, but what
+/// it leads to is another matter), with no entry of the group of its own.
+pub fn descends_for_copies(is_dir: bool, skipped: bool, own_entry: bool) -> bool {
+    is_dir && !skipped && !own_entry
 }
 
 /// Whether `profile forget` reports a path instead of failing on it: its
@@ -1985,8 +2028,7 @@ mod tests {
     fn a_revoke_is_checked_beneath_whenever_the_entry_handed_reading_down() {
         use super::{Kind, hands_reading_down as down};
         assert!(down(Kind::Granted));
-        assert!(down(Kind::Ungranted));
-        for k in [Kind::Container, Kind::File, Kind::Denied] {
+        for k in [Kind::Container, Kind::File, Kind::Denied, Kind::Ungranted] {
             assert!(!down(k), "{k:?}");
         }
     }
@@ -1995,21 +2037,74 @@ mod tests {
     fn a_row_with_no_entry_on_its_object_is_not_an_earlier_grant() {
         use super::{Kind, record_without_entry as row_only};
         for kind in [Kind::Container, Kind::Granted, Kind::File, Kind::Denied] {
-            assert!(row_only(kind, Some(false)));
-            assert!(!row_only(kind, Some(true)));
-            assert!(!row_only(kind, None));
+            assert!(row_only(kind, false, Some(false)));
+            assert!(!row_only(kind, false, Some(true)));
+            assert!(!row_only(kind, false, None));
+            assert!(!row_only(kind, true, Some(false)), "a pending revoke");
         }
-        assert!(!row_only(Kind::Ungranted, Some(false)));
-        assert!(!row_only(Kind::Skipped, Some(false)));
+        assert!(!row_only(Kind::Skipped, false, Some(false)));
     }
 
     #[test]
-    fn an_unfinished_revoke_still_counts_as_a_possible_allow() {
-        use super::{Kind, may_carry_allow as allow};
-        for k in [Kind::Container, Kind::Granted, Kind::File, Kind::Ungranted] {
-            assert!(allow(k), "{k:?}");
+    fn the_check_for_copies_reads_a_link_but_does_not_go_into_it() {
+        use super::descends_for_copies as goes;
+        assert!(goes(true, false, false));
+        assert!(!goes(true, true, false), "a link or placeholder");
+        assert!(!goes(true, false, true), "its own entry");
+        assert!(!goes(false, false, false), "a file");
+    }
+
+    #[test]
+    fn a_revoke_begins_when_reading_is_taken_back() {
+        use super::{Kind, revoke_begins as begins};
+        for k in [Kind::Container, Kind::Granted, Kind::File] {
+            assert!(begins(k, None), "{k:?} leaving the grant");
+            assert!(begins(k, Some(Kind::Denied)), "{k:?} excluded now");
         }
-        assert!(!allow(Kind::Denied));
+        assert!(begins(Kind::Granted, Some(Kind::Container)));
+        assert!(begins(Kind::Granted, Some(Kind::File)));
+        assert!(!begins(Kind::Granted, Some(Kind::Granted)));
+        assert!(!begins(Kind::Container, Some(Kind::Container)));
+        assert!(!begins(Kind::Container, Some(Kind::Granted)));
+        assert!(!begins(Kind::File, Some(Kind::File)));
+        assert!(!begins(Kind::Denied, None), "a deny is not reading");
+        assert!(!begins(Kind::Denied, Some(Kind::Container)));
+    }
+
+    #[test]
+    fn a_first_grant_cut_short_never_counts_as_completed() {
+        use super::completed_list_at_start as at_start;
+        assert_eq!(at_start(None, None), None, "the first run");
+        assert_eq!(at_start(Some(3), None), Some(3), "a complete older record");
+        assert_eq!(at_start(None, Some(3)), Some(3), "a run cut short keeps it");
+        assert_eq!(at_start(Some(4), Some(3)), Some(4));
+    }
+
+    #[test]
+    fn only_a_row_a_cut_short_grant_deleted_is_finished() {
+        use super::row_finished_by_cut_short_grant as finished;
+        assert!(finished(true, true, false, false));
+        assert!(!finished(false, true, false, false), "not cut short");
+        assert!(!finished(true, false, false, false), "the database is gone");
+        assert!(!finished(true, true, true, false), "still in the database");
+        assert!(!finished(true, true, false, true), "its revoke is pending");
+    }
+
+    #[test]
+    fn a_webview2_folder_beside_a_per_user_install_is_excluded() {
+        let r = rules();
+        let names = |p: &str| -> Vec<Name> { p.split('\\').map(Name::long).collect() };
+        for p in [
+            r"AppData\Local\Programs\App\EBWebView",
+            r"AppData\Local\Programs\App\app.exe.WebView2\EBWebView",
+            r"AppData\Local\Programs\App\APP.EXE.WEBVIEW2\EBWebView\Default",
+            r"AppData\Local\Microsoft\WinGet\Packages\Pkg\tool.exe.WebView2\EBWebView",
+        ] {
+            assert!(r.excludes(&names(p)), "{p}");
+        }
+        assert!(!r.excludes(&names(r"AppData\Local\Programs\App\lib\x.dll")));
+        assert!(!r.could_exclude_beneath(&names(r"AppData\Local\Programs\App\lib")));
+        assert!(r.could_exclude_beneath(&names(r"AppData\Local\Programs\App\a.exe.WebView2")));
     }
 
     #[test]
@@ -2351,7 +2446,9 @@ mod tests {
         // Listed, but an embedded browser profile could lie beneath:
         // a container whose children are granted one by one.
         is(r"AppData\Local\Programs", Kind::Container);
-        is(r"AppData\Local\Programs\Python", Kind::Granted);
+        // A WebView2 folder could lie beside what is installed in it.
+        is(r"AppData\Local\Programs\Python", Kind::Container);
+        is(r"AppData\Local\Programs\Python\python.exe", Kind::File);
         // Unlisted, with the same wildcard beneath: a container for
         // the deny, and its files are not granted.
         is(r"AppData\Local\SomeApp", Kind::Container);
@@ -3709,7 +3806,7 @@ mod tests {
             "go",
             ".nuget",
             r"AppData\Roaming\npm",
-            r"AppData\Local\Programs\Python",
+            r"AppData\Local\Programs\Python\Python313",
             r"AppData\Local\Microsoft\WinGet\Links",
         ] {
             is(granted, Kind::Granted);
@@ -3719,7 +3816,7 @@ mod tests {
         for unlisted in ["scoop", ".local", r"AppData\Roaming\uv"] {
             absent(unlisted);
         }
-        absent(r"AppData\Local\Programs\Python\Python313");
+        absent(r"AppData\Local\Programs\Python\Python313\python.exe");
         // A session may still grant itself an unlisted directory: the
         // record it is measured against holds only the exclusions.
         let p = |rel: &str| format!(r"\\?\C:\Users\me\{rel}");
