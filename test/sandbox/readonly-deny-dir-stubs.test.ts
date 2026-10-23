@@ -18,7 +18,11 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
-import { countMounts, lastIndexOfMount } from '../helpers/bwrap-argv.js'
+import {
+  countMounts,
+  lastIndexOfMount,
+  withoutManifestName,
+} from '../helpers/bwrap-argv.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 /**
@@ -350,6 +354,55 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
     expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
     expect(command).not.toContain(`--ro-bind /dev/null ${absentDeny}`)
+  })
+
+  it('emits the same deny mounts whichever order the deny paths are listed in', async () => {
+    // The pre-pass and the deny loop walk the same list and must reach the
+    // same verdict about each entry: a directory one records and the other
+    // does not re-bind read-only would suppress a stub the sandbox needs,
+    // and only under some orderings. Which mounts come out is what the
+    // pre-pass makes order-independent, so the two orderings must agree.
+    //
+    // `kept` is named by two spellings, one through a link, beneath a
+    // directory that is denied too: which of the two the loop meets first is
+    // the caller's ordering.
+    const kept = join(AREA, 'real', 'kept')
+    mkdirSync(kept, { recursive: true })
+    symlinkSync(join(AREA, 'real'), join(AREA, 'link'))
+    mkdirSync(join(PROJ, 'sub'), { recursive: true })
+    const denies = [
+      PROJ,
+      join(PROJ, '.gitconfig'),
+      join(PROJ, 'sub'),
+      join(PROJ, 'sub', 'absent'),
+      join(AREA, 'real'),
+      kept,
+      join(AREA, 'link', 'kept'),
+      join(AREA, 'other', 'absent'),
+      '/dev/null',
+    ]
+    // Each wrap names a manifest of its own.
+    const mountsOf = (command: string) =>
+      [...withoutManifestName(command).matchAll(/--(?:ro-)?bind (\S+) (\S+)/g)]
+        .map(mount => `${mount[1]} ${mount[2]}`)
+        .sort()
+
+    const forward = mountsOf(await wrap(denies))
+    const backward = mountsOf(await wrap([...denies].reverse()))
+
+    expect(backward).toEqual(forward)
+    // Not vacuous, and the skip is specific rather than global: the
+    // covering directory is bound read-only, the absent entries beneath it
+    // are left unstubbed, and the absent entry outside it still gets its
+    // empty-directory placeholder.
+    expect(forward).toContain(`${PROJ} ${PROJ}`)
+    expect(forward).toContain(`${kept} ${kept}`)
+    expect(
+      forward.filter(mount => mount.startsWith(`/dev/null ${PROJ}/`)),
+    ).toEqual([])
+    expect(
+      forward.some(mount => mount.endsWith(` ${join(AREA, 'other')}`)),
+    ).toBe(true)
   })
 
   it('skips the stub when a denyRead directory sits under the covering deny dir with no allowed write path beneath it', async () => {

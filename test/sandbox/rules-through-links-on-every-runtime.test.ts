@@ -26,7 +26,7 @@ import { isLinux, isMacOS } from '../helpers/platform.js'
  * hold bytes that are no text, which no rule and no mount can spell.
  */
 
-const CLI_PATH = join(process.cwd(), 'dist', 'cli.js')
+const CLI_PATH = join(process.cwd(), 'test/helpers/isolated/dist-cli.mjs')
 const RUNTIMES = [
   ['node', ['node', '--max-old-space-size=256']],
   ['bun', [process.execPath]],
