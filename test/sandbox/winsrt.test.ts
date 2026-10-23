@@ -884,6 +884,34 @@ describe('parseWindowsBinShell (pure, all platforms)', () => {
   })
 })
 
+describe('WINDOWS_INSTALL_COMMAND (pure, all platforms)', () => {
+  const repoRoot = join(import.meta.dir, '../..')
+
+  it('runs this package', () => {
+    const pkg = JSON.parse(
+      readFileSync(join(repoRoot, 'package.json'), 'utf8'),
+    ) as { name: string; bin: Record<string, string> }
+    expect(winUtils.WINDOWS_INSTALL_COMMAND).toBe(
+      `npx ${pkg.name} windows-install`,
+    )
+    // npx picks the bin itself only while they all point at one file.
+    expect(new Set(Object.values(pkg.bin)).size).toBe(1)
+  })
+
+  it('is the only spelling in src/ and the README', () => {
+    const otherSpelling =
+      /npx\s+(-\S+\s+)*sandbox-runtime|(?<!@anthropic-ai\/)sandbox-runtime\s+windows-/
+    const sources = fs
+      .readdirSync(join(repoRoot, 'src'), { recursive: true, encoding: 'utf8' })
+      .filter(file => file.endsWith('.ts'))
+      .map(file => join('src', file))
+    const offenders = ['README.md', ...sources].filter(file =>
+      otherSpelling.test(readFileSync(join(repoRoot, file), 'utf8')),
+    )
+    expect(offenders).toEqual([])
+  })
+})
+
 describe('WindowsSandboxError (pure, all platforms)', () => {
   it('carries a stable .code and is instanceof Error', () => {
     const e = new WindowsSandboxError('install_config_conflict', 'x')
@@ -2628,7 +2656,9 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(sync.errors).toHaveLength(1)
     expect(sync.errors[0]).toMatch(/setup version 2; this release needs 3/)
     expect(sync.errors[0]).toMatch(/Re-run the install to upgrade it in place/)
-    expect(sync.errors[0]).toContain('npx sandbox-runtime windows-install')
+    expect(sync.errors[0]).toContain(
+      'npx @anthropic-ai/sandbox-runtime windows-install',
+    )
     expect(sync.errors[0]).not.toMatch(/not provisioned|one-time install/i)
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
@@ -3324,7 +3354,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     )
     expect((err as WindowsSandboxError).message).toContain(hint)
     expect((err as WindowsSandboxError).message).toContain(
-      'npx sandbox-runtime windows-install --allow-loopback --force',
+      'npx @anthropic-ai/sandbox-runtime windows-install --allow-loopback --force',
     )
     spawnSpy.mockRestore()
     spawnSyncSpy.mockRestore()
@@ -3341,7 +3371,7 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     ).catch(e => e as WindowsSandboxError)
     expect((closed as WindowsSandboxError).code).toBe('wfp_loopback_mismatch')
     expect((closed as WindowsSandboxError).message).toContain(
-      '`npx sandbox-runtime windows-install --force`',
+      '`npx @anthropic-ai/sandbox-runtime windows-install --force`',
     )
   })
 
@@ -3754,7 +3784,9 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
       const stale = (e: Error) => {
         expect(e.message).toMatch(/setup version 2; this release needs 3/)
         expect(e.message).toMatch(/Re-run the install/)
-        expect(e.message).toContain('npx sandbox-runtime windows-install')
+        expect(e.message).toContain(
+          'npx @anthropic-ai/sandbox-runtime windows-install',
+        )
         expect(e.message).not.toMatch(/not provisioned|one-time install/i)
         expect(subs()).toEqual([])
         expect(verifyCalls).toHaveLength(0)

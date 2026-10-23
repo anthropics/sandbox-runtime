@@ -82,6 +82,7 @@ import {
   rankWindowsFsAccess,
   restoreWindowsAcl,
   grantWindowsAclPersistent,
+  WINDOWS_INSTALL_COMMAND,
   windowsSetupVersionMismatch,
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
@@ -1273,8 +1274,8 @@ async function initializeSteps(
       throw new WindowsSandboxError(
         'not_provisioned',
         `Windows sandbox user is not provisioned (user=` +
-          `${u.provisioned}, cred=${u.credPresent}). Run \`npx ` +
-          `sandbox-runtime windows-install\` (one UAC prompt) to ` +
+          `${u.provisioned}, cred=${u.credPresent}). Run ` +
+          `\`${WINDOWS_INSTALL_COMMAND}\` (one UAC prompt) to ` +
           `provision it.`,
       )
     }
@@ -1310,7 +1311,7 @@ async function initializeSteps(
             `The recorded read grant on your user profile cannot be used ` +
               `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''}). ` +
               `Call grantWindowsProfileRead() (\`srt-win profile grant\`, ` +
-              `or \`npx sandbox-runtime windows-install\` again) as the ` +
+              `or \`${WINDOWS_INSTALL_COMMAND}\` again) as the ` +
               `user who starts sessions to bring it up to date, or ` +
               `forgetWindowsProfileRead() (\`srt-win profile forget\`) to ` +
               `run without reading the profile. initialize() does neither ` +
