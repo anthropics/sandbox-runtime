@@ -108,6 +108,36 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
     })
   })
 
+  it.if(isMacOS)('prefers customConfig macOS permissions', async () => {
+    const globalConfig = createTestConfig()
+    globalConfig.network.allowLocalBinding = true
+    globalConfig.network.allowUnixSockets = ['/global/socket']
+    globalConfig.allowAppleEvents = true
+    globalConfig.enableWeakerNetworkIsolation = true
+    SandboxManager.updateConfig(globalConfig)
+
+    const customConfig = createTestConfig()
+    customConfig.network.allowLocalBinding = false
+    customConfig.network.allowUnixSockets = []
+    customConfig.allowAppleEvents = false
+    customConfig.enableWeakerNetworkIsolation = false
+
+    try {
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        'echo test',
+        undefined,
+        customConfig,
+      )
+
+      expect(wrapped).not.toContain('(allow network-bind (local ip "*:*"))')
+      expect(wrapped).not.toContain('/global/socket')
+      expect(wrapped).not.toContain('(allow lsopen)')
+      expect(wrapped).not.toContain('com.apple.trustd.agent')
+    } finally {
+      SandboxManager.updateConfig(createTestConfig())
+    }
+  })
+
   describe('readonly mode simulation', () => {
     it('can create a fully restricted sandbox config', async () => {
       const command = 'ls -la'
