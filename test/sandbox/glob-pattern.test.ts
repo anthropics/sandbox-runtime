@@ -11,7 +11,14 @@ const text = (t: string): GlobToken => ({ kind: Kind.Text, text: t })
 const set = (members: string, matchesSeparator = false): GlobToken => ({
   kind: Kind.Set,
   members,
+  negated: false,
   matchesSeparator,
+})
+const allBut = (members: string): GlobToken => ({
+  kind: Kind.Set,
+  members,
+  negated: true,
+  matchesSeparator: false,
 })
 const SEPARATOR: GlobToken = { kind: Kind.Separator }
 const ANY_CHAR: GlobToken = { kind: Kind.AnyChar }
@@ -73,8 +80,8 @@ describe('parseGlob', () => {
     ['[-a]', [set('-a')]],
     ['[a-]', [set('a-')]],
     ['[a-a]', [set('a-a')]],
-    ['[^a]', [set('^a')]],
-    ['[!a]', [set('!a')]],
+    ['[a^]', [set('a^')]],
+    ['[a!]', [set('a!')]],
     ['[a[b]', [set('a[b')]],
     ['[a]]', [set('a'), text(']')]],
     ['[s/]', [set('s/', true)]],
@@ -88,10 +95,34 @@ describe('parseGlob', () => {
   })
 
   it.each<[string, GlobToken[]]>([
+    ['[^a]', [allBut('a')]],
+    ['[!a]', [allBut('a')]],
+    ['x[!a-z]y', [text('x'), allBut('a-z'), text('y')]],
+    // Only the first of them negates.
+    ['[!!]', [allBut('!')]],
+    ['[^^]', [allBut('^')]],
+    ['[!^]', [allBut('^')]],
+    ['[^!a]', [allBut('!a')]],
+    ['[!-a]', [allBut('-a')]],
+    ['[!*]', [allBut('*')]],
+    // Never the separator, be it a member or not.
+    ['[!s/]', [allBut('s/')]],
+    ['[!+-9]', [allBut('+-9')]],
+    ['[!a]]', [allBut('a'), text(']')]],
+  ])('reads %p as a negated set', (pattern, tokens) => {
+    expect(parseGlob(pattern)).toEqual(tokens)
+  })
+
+  it.each<[string, GlobToken[]]>([
     ['[z-a]', [text('[z-a]')]],
     ['[user-id]', [text('[user-id]')]],
     ['[]', [text('[]')]],
     ['[]a]', [text('[]a]')]],
+    ['[!]', [text('[!]')]],
+    ['[^]', [text('[^]')]],
+    ['[!]a]', [text('[!]a]')]],
+    ['[!z-a]', [text('[!z-a]')]],
+    ['[^user-id]', [text('[^user-id]')]],
     ['a]b', [text('a]b')]],
     ['a[b', [text('a[b')]],
     ['a[b[c', [text('a[b[c')]],
@@ -106,6 +137,7 @@ describe('parseGlob', () => {
 
   it.each<[string, GlobToken[]]>([
     ['[z-a*]', [text('[z-a'), STAR, text(']')]],
+    ['[!z-a*]', [text('[!z-a'), STAR, text(']')]],
     ['[z-a/?]', [text('[z-a'), SEPARATOR, ANY_CHAR, text(']')]],
     ['a[b[c*', [text('a[b[c'), STAR]],
     ['[**/', [text('['), GLOBSTAR_SLASH]],
@@ -173,8 +205,18 @@ function referenceGlobMatch(pattern: string, pathText: string): boolean {
     if (head === '?') return pathText[s] !== '/' && rest(p + 1, s + 1)
     if (head === '[' && p >= bracketsAreTextUntil) {
       const close = pattern.indexOf(']', p + 1)
-      const has = close === -1 ? undefined : setOf(pattern.slice(p + 1, close))
-      if (has !== undefined) return has(pathText[s]!) && rest(close + 1, s + 1)
+      const negated = pattern[p + 1] === '!' || pattern[p + 1] === '^'
+      const has =
+        close === -1
+          ? undefined
+          : setOf(pattern.slice(p + (negated ? 2 : 1), close))
+      if (has !== undefined) {
+        const char = pathText[s]!
+        return (
+          (negated ? !has(char) && char !== '/' : has(char)) &&
+          rest(close + 1, s + 1)
+        )
+      }
       bracketsAreTextUntil = close === -1 ? pattern.length : close + 1
     }
     return pathText[s] === head && from(p + 1, s + 1, bracketsAreTextUntil)
@@ -219,17 +261,24 @@ describe('globToRegex', () => {
 
   it('agrees with a reference matcher over generated patterns and paths', () => {
     const piece = fc.constantFrom(
-      ...'[[]]--**??//az09+.^!\\',
+      ...'[[]]--**??//az09+,.^!\\',
       '**/',
       '[a-z]',
       '[z-a]',
       '[+-9]',
       '[*]',
       '[]',
+      '[!a-z]',
+      '[^09]',
+      '[!z-a]',
+      '[!-a]',
+      '[!]',
+      '[+--]',
+      '[--0]',
     )
     const pattern = fc.array(piece, { maxLength: 8 }).map(p => p.join(''))
     // A path like the pattern, so that a match is not rare, or any at all.
-    const char = fc.constantFrom(...'[]-*?/az09+.^!\\')
+    const char = fc.constantFrom(...'[]-*?/az09+,.^!\\')
     const pathFor = (p: string): fc.Arbitrary<string> =>
       fc.oneof(
         fc.array(char, { maxLength: 6 }).map(chars => chars.join('')),

@@ -1005,6 +1005,14 @@ describe.if(!isWindows)('walkGlobPattern', () => {
         join(root, 'outside', 'cert', 'x.pem'),
         join(root, 'outside', 'cert9x.pem'),
       ])
+      // A negated set is one character of a name, whatever it leaves out.
+      expect(found('*/cert[!s/]x.pem')).toEqual([
+        join(root, 'outside', 'cert9x.pem'),
+      ])
+      expect(found('*/cert[^0-8]x.pem')).toEqual([
+        join(root, 'outside', 'cert9x.pem'),
+        join(root, 'outside', 'certsx.pem'),
+      ])
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -2410,19 +2418,20 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(letters).test('/tmp/test/1bc.txt')).toBe(false)
   })
 
-  it('never negates a bracket set: ^ and ! are members of it', () => {
+  it('negates a bracket set written with ^ or !', () => {
     // Both spellings used for negation elsewhere (regex `^`, gitignore `!`)
-    // land in the set as ordinary characters, so such a pattern matches
-    // fewer names than its author meant, not more.
+    // negate the set rather than joining it as ordinary characters.
     const caret = globToRegex('/tmp/test/file[^0-9].txt')
-    expect(new RegExp(caret).test('/tmp/test/file^.txt')).toBe(true)
-    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(true)
-    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(caret).test('/tmp/test/fileA.txt')).toBe(true)
+    expect(new RegExp(caret).test('/tmp/test/file3.txt')).toBe(false)
 
     const bang = globToRegex('/tmp/test/file[!0-9].txt')
-    expect(new RegExp(bang).test('/tmp/test/file!.txt')).toBe(true)
-    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(true)
-    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(false)
+    expect(new RegExp(bang).test('/tmp/test/fileA.txt')).toBe(true)
+    expect(new RegExp(bang).test('/tmp/test/file3.txt')).toBe(false)
+
+    // The character that negates the set is not also a member of it.
+    expect(new RegExp(globToRegex('/tmp/[^^]')).test('/tmp/^')).toBe(false)
+    expect(new RegExp(globToRegex('/tmp/[!!]')).test('/tmp/!')).toBe(false)
   })
 
   it('treats a bracket that opens no set as a literal character', () => {
