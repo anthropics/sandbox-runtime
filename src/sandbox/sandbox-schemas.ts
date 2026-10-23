@@ -157,4 +157,27 @@ export type NetworkHostPattern = {
  */
 export type SandboxAskCallback = (
   params: NetworkHostPattern,
+  context?: SandboxAskContext,
 ) => Promise<boolean | { allow: false; reason: string }>
+
+/**
+ * Which invocation opened the connection a SandboxAskCallback is asked about.
+ * The library always passes it; the parameter is optional only so a callback
+ * invoked directly by existing code still type-checks.
+ *
+ * `attributionKey` is the key the proxy username carries, decoded: the
+ * `commandId` given to `wrapWithSandbox` (or the command text when none was
+ * given), cut to its first 100 characters, the same key a proxy denial is
+ * recorded under in the violation store and that
+ * `registerCommandNetworkLists` is looked up by. It is `undefined` when the
+ * connection named no key (the bare `srt` username).
+ *
+ * The sandboxed process chooses which username it presents, so the key is a
+ * label, not a credential. Compare it with ids you minted at random (at least
+ * 128 bits, as `registerCommandNetworkLists` requires) and treat any other
+ * value as unattributed. It is passed whether or not this process wrapped a
+ * command under it.
+ */
+export type SandboxAskContext = {
+  attributionKey: string | undefined
+}
