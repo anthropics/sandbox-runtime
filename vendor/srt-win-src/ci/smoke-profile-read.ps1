@@ -771,6 +771,41 @@ try {
   if ($gv.exit -ne 0) { Fail "V2: closing grant exit=$($gv.exit) raw: $($gv.raw)" }
   Remove-Item -Force $v2Stuck
 
+  # A check that cannot look is not a clean result: a child whose access
+  # list cannot be read keeps the revoke pending. One that can be read
+  # and holds no copy does not, even if nothing could write it.
+  $meSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+  $v3Dark = Join-Path $docs 'v3\dark.txt'
+  $v3Bare = Join-Path $docs 'v3b\bare.txt'
+  New-Item -ItemType Directory -Force -Path (Split-Path $v3Dark), (Split-Path $v3Bare) | Out-Null
+  Set-Content -Path $v3Dark -Value 'V3-CONTENT' -NoNewline
+  Set-Content -Path $v3Bare -Value 'V3B-CONTENT' -NoNewline
+  $gv = Grant @('--include', 'Documents')
+  if ($gv.exit -ne 0) { Fail "V3: grant --include exit=$($gv.exit) raw: $($gv.raw)" }
+  & icacls $v3Bare /inheritance:r /grant:r "*${meSid}:(F)" '*S-1-1-0:(R)' | Out-Null
+  & icacls $v3Bare /setowner '*S-1-5-18' | Out-Null
+  & icacls $v3Bare /remove:g "*$meSid" | Out-Null
+  if (Has-Group $v3Bare) { Fail "V3: setup: the bare child still names the group: $(Sddl $v3Bare)" }
+  $gv = Grant @('--replace-includes')
+  if ($gv.exit -eq 0 -and @($gv.json.stale_allow).Count -eq 0 -and -not (Has-Group $docs)) { Ok 'V3: a child with no copy that nothing can write does not hold the revoke open' }
+  else { Fail "V3: over a bare child exit=$($gv.exit) raw: $($gv.raw)" }
+  $gv = Grant @('--include', 'Documents')
+  if ($gv.exit -ne 0) { Fail "V3: second grant exit=$($gv.exit) raw: $($gv.raw)" }
+  & icacls $v3Dark /deny '*S-1-1-0:(RC)' | Out-Null
+  & icacls $v3Dark /setowner '*S-1-5-18' | Out-Null
+  $gv = Grant @('--replace-includes')
+  $named = @($gv.json.stale_allow | Where-Object { $_.path -match '\\Documents$' }).Count -eq 1
+  if ($gv.exit -eq 0 -and $gv.json.complete -and $named) { Ok 'V3: a child whose access list cannot be read keeps the revoke reported' }
+  else { Fail "V3: over an unreadable child exit=$($gv.exit) raw: $($gv.raw)" }
+  & icacls $v3Dark /setowner "*$meSid" | Out-Null
+  & icacls $v3Dark /remove:d '*S-1-1-0' | Out-Null
+  & icacls $v3Bare /setowner "*$meSid" | Out-Null
+  & icacls $v3Bare /grant "*${meSid}:(F)" | Out-Null
+  $gv = Grant @('--replace-includes')
+  if ($gv.json.complete -and @($gv.json.stale_allow).Count -eq 0 -and -not (Has-Group $v3Dark)) { Ok 'V3: once it can be read the next run clears it' }
+  else { Fail "V3: after unsticking: dark=$(Sddl $v3Dark) raw: $($gv.raw)" }
+  Remove-Item -Recurse -Force (Split-Path $v3Dark), (Split-Path $v3Bare)
+
   # ── W: a revoke killed part-way through its walk ─────────────────
   $wRoot = Join-Path $docs 'killed'
   $wSample = @()
@@ -1050,10 +1085,11 @@ public static extern bool SetFileSecurityW(string path, uint info, byte[] sd);
   # ── L: excluded names that are links ─────────────────────────────
   $prof2 = Join-Path $root 'profile2'
   $dot   = Join-Path $prof2 'dotfiles'
-  New-Item -ItemType Directory -Path (Join-Path $dot '.ssh'), (Join-Path $dot '.config\gh'), (Join-Path $dot '.config\nvim') -Force | Out-Null
+  New-Item -ItemType Directory -Path (Join-Path $dot '.ssh'), (Join-Path $dot '.config\gh'), (Join-Path $dot '.config\nvim'), (Join-Path $dot '.config\git') -Force | Out-Null
   $lKey    = Join-Path $dot '.ssh\id_test';          'LKEY-CONTENT'   | Set-Content -Encoding ASCII -LiteralPath $lKey
   $lHosts  = Join-Path $dot '.config\gh\hosts.yml';  'LHOSTS-CONTENT' | Set-Content -Encoding ASCII -LiteralPath $lHosts
   $lNvim   = Join-Path $dot '.config\nvim\init.lua'; 'LNVIM-CONTENT'  | Set-Content -Encoding ASCII -LiteralPath $lNvim
+  $lGit    = Join-Path $dot '.config\git\config';  'LGIT-CONTENT'   | Set-Content -Encoding ASCII -LiteralPath $lGit
   $lReadme = Join-Path $dot 'README';                 'LREADME-CONTENT' | Set-Content -Encoding ASCII -LiteralPath $lReadme
   $lSsh = Join-Path $prof2 '.ssh'
   $lCfg = Join-Path $prof2 '.config'
@@ -1063,7 +1099,8 @@ public static extern bool SetFileSecurityW(string path, uint info, byte[] sd);
   if ($gl.exit -ne 0) { Fail "L: profile grant on the profile with links: exit=$($gl.exit) raw: $($gl.raw)" }
   else {
     Expect-NoRead 'L (beside the linked stores, in an unlisted directory)' $lReadme 'LREADME-CONTENT'
-    Expect-Read   'L (configuration no rule names, behind the link of a listed directory)' $lNvim 'LNVIM-CONTENT'
+    Expect-Read   'L (configuration of a listed directory, behind a link)' $lGit 'LGIT-CONTENT'
+    Expect-NoRead 'L (configuration of an unlisted directory, behind the same link)' $lNvim 'LNVIM-CONTENT'
     Expect-NoRead 'L (the keys, where they really are)'          $lKey   'LKEY-CONTENT'
     Expect-NoRead 'L (the keys, through the link)'               (Join-Path $lSsh 'id_test') 'LKEY-CONTENT'
     Expect-NoRead 'L (the sign-in, where it really is)'          $lHosts 'LHOSTS-CONTENT'
