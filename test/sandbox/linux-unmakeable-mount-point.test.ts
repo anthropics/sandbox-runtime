@@ -7,6 +7,7 @@ import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import { whichSync } from '../../src/utils/which.js'
 import { isLinux } from '../helpers/platform.js'
 import { countMounts, mountsOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
@@ -130,6 +131,13 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
       value: { ...real.statfsSync(p as string), type: V9FS_MAGIC },
     }))
 
+  // The wrap is told which helpers to run: one case allows writes to /usr, and
+  // a copy on PATH that lies inside a write path is passed over.
+  const HELPERS = {
+    bwrapPath: whichSync('bwrap') ?? undefined,
+    binShell: whichSync('bash') ?? undefined,
+    ripgrepConfig: { command: whichSync('rg') ?? 'rg' },
+  }
   const wrap = (
     denyWithinAllow: string[],
     command = 'true',
@@ -139,6 +147,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
       command,
       needsNetworkRestriction: false,
       writeConfig: { allowOnly, denyWithinAllow },
+      ...HELPERS,
     })
 
   const run = (command: string) =>
