@@ -1968,13 +1968,6 @@ pub fn row_finished_by_cut_short_grant(
     cut_short_grant && database_has_rows && !in_database && !revoke_pending
 }
 
-/// The list version of the last grant that ran to its end, as a new run
-/// begins: the record's own if it was complete (a build that kept no
-/// separate value says so that way), else what was kept.
-pub fn completed_list_at_start(complete_record: Option<u32>, kept: Option<u32>) -> Option<u32> {
-    complete_record.or(kept)
-}
-
 /// Whether a recorded path that cannot be written now is a row only: a
 /// killed run records every planned path before writing any, so a row
 /// says nothing of the object until its access list agrees. A pending
@@ -2069,15 +2062,6 @@ mod tests {
         assert!(!begins(Kind::File, Some(Kind::File)));
         assert!(!begins(Kind::Denied, None), "a deny is not reading");
         assert!(!begins(Kind::Denied, Some(Kind::Container)));
-    }
-
-    #[test]
-    fn a_first_grant_cut_short_never_counts_as_completed() {
-        use super::completed_list_at_start as at_start;
-        assert_eq!(at_start(None, None), None, "the first run");
-        assert_eq!(at_start(Some(3), None), Some(3), "a complete older record");
-        assert_eq!(at_start(None, Some(3)), Some(3), "a run cut short keeps it");
-        assert_eq!(at_start(Some(4), Some(3)), Some(4));
     }
 
     #[test]
