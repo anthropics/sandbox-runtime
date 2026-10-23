@@ -175,6 +175,8 @@ pub const BUILT_IN: &[Excl] = &[
     file(Profile, r".cargo\credentials.toml"),
     file(Profile, r".gradle\enterprise\keys.properties"),
     file(Profile, r".gradle\develocity\keys.properties"),
+    // Maven's master password: it unlocks what settings.xml stores encrypted.
+    file(Profile, r".m2\settings-security.xml"),
     // The user's registry hives and their logs.
     file(Profile, "NTUSER.DAT*"),
     file(Profile, "ntuser.ini"),
@@ -347,7 +349,6 @@ pub const READABLE_CONFIG: &[(Base, &str, &str)] = &[
     (Profile, r".config\pip\pip.conf", "pip"),
     (Roaming, r"NuGet\NuGet.Config", "NuGet"),
     (Profile, r".m2\settings.xml", "Maven"),
-    (Profile, r".m2\settings-security.xml", "Maven"),
     (Profile, r".gradle\gradle.properties", "Gradle"),
 ];
 
@@ -1822,15 +1823,8 @@ pub fn env_pointers(
                 )),
             }
         };
-        let value = arg(&settings).and_then(|s| {
-            let mut v = format!("-s {s}");
-            if let Some(sec) = first(&[at(profile, r".m2\settings-security.xml")]) {
-                v.push_str(&format!(" -Dsettings.security={}", arg(&sec)?));
-            }
-            Ok(v)
-        });
-        match value {
-            Ok(v) => out.env.push(("MAVEN_ARGS", v)),
+        match arg(&settings) {
+            Ok(s) => out.env.push(("MAVEN_ARGS", format!("-s {s}"))),
             Err(why) => out.withheld.push(("MAVEN_ARGS", why)),
         }
     }
@@ -2262,6 +2256,21 @@ mod tests {
     }
 
     #[test]
+    fn maven_master_password_is_denied_beside_a_readable_settings_file() {
+        let mut t = Mem::default();
+        t.add(r".m2\settings.xml")
+            .add(r".m2\settings-security.xml")
+            .add(r".m2\repository\a.jar");
+        let k = kinds(&plan(&mut t, &rules()).unwrap());
+        assert_eq!(
+            k.get(r".m2\settings-security.xml").map(|v| v.0),
+            Some(Kind::Denied)
+        );
+        assert_eq!(k.get(r".m2\settings.xml").map(|v| v.0), Some(Kind::File));
+        assert_eq!(k.get(".m2").map(|v| v.0), Some(Kind::Container));
+    }
+
+    #[test]
     fn a_profile_is_planned_by_the_walk_rule() {
         let mut t = Mem::default();
         t.add(r"Documents\notes.txt")
@@ -2310,7 +2319,7 @@ mod tests {
         absent(r"scoop\shims");
         absent(".local");
         absent(r".local\bin");
-        is(".m2", Kind::Granted);
+        is(".m2", Kind::Container);
         is(".npmrc", Kind::File);
         is(".gitconfig", Kind::File);
         absent("stray.txt");
@@ -3348,14 +3357,7 @@ mod tests {
                     "PIP_CONFIG_FILE",
                     r"C:\Users\me\AppData\Roaming\pip\pip.ini".to_owned()
                 ),
-                (
-                    "MAVEN_ARGS",
-                    concat!(
-                        r"-s C:\Users\me\.m2\settings.xml",
-                        r" -Dsettings.security=C:\Users\me\.m2\settings-security.xml"
-                    )
-                    .to_owned()
-                ),
+                ("MAVEN_ARGS", r"-s C:\Users\me\.m2\settings.xml".to_owned()),
             ]
         );
         assert!(got.withheld.is_empty());
@@ -3440,23 +3442,12 @@ mod tests {
             (Some(r"-s C:\Users\me\.m2\settings.xml".to_owned()), None)
         );
         // Whitespace, and the characters the launchers treat specially: the
-        // 8.3 path, each file looked up on its own.
-        let short = |p: &str| {
-            Some(
-                p.replace(r"C:\Users\Mary Ann", r"C:\Users\MARYAN~1")
-                    .replace("settings-security.xml", "SETTIN~2.XML"),
-            )
-        };
+        // 8.3 path. The master password file is never pointed at.
+        let short = |p: &str| Some(p.replace(r"C:\Users\Mary Ann", r"C:\Users\MARYAN~1"));
         assert_eq!(
             maven(r"C:\Users\Mary Ann", &all, &short),
             (
-                Some(
-                    concat!(
-                        r"-s C:\Users\MARYAN~1\.m2\settings.xml",
-                        r" -Dsettings.security=C:\Users\MARYAN~1\.m2\SETTIN~2.XML"
-                    )
-                    .to_owned()
-                ),
+                Some(r"-s C:\Users\MARYAN~1\.m2\settings.xml".to_owned()),
                 None
             )
         );
@@ -3494,14 +3485,6 @@ mod tests {
             maven(r"C:\Users\Mary Ann", &settings_only, &still_long).0,
             None
         );
-        // The security file alone failing withholds the whole variable:
-        // a settings file without its key file would not decrypt.
-        let security_stays = |p: &str| {
-            (!p.ends_with("settings-security.xml")).then(|| p.replace("Mary Ann", "MARYAN~1"))
-        };
-        let (env, withheld) = maven(r"C:\Users\Mary Ann", &all, &security_stays);
-        assert_eq!(env, None);
-        assert!(withheld.is_some_and(|w| w.contains("settings-security.xml")));
         // Unrelated characters are left alone.
         assert_eq!(
             maven(r"C:\Users\o'brien$%!", &settings_only, &not_asked).0,
