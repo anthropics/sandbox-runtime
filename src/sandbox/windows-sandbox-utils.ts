@@ -3797,11 +3797,6 @@ export interface WindowsProfileGrantResult {
 }
 
 const PROFILE_GRANT_TIMEOUT_MS = 30 * 60_000
-/**
- * A refresh inside `initialize()`: a first command waits on it. One that
- * runs out stays incomplete, and the next start carries on from there.
- */
-export const PROFILE_GRANT_REFRESH_TIMEOUT_MS = 5 * 60_000
 /** How long a retry of stale entries may start new work during a start. */
 const PROFILE_STALE_RETRY_BUDGET_MS = 3_000
 /** And when it is killed, in case a single tree walk outruns the budget. */

@@ -332,8 +332,9 @@ pub const INCLUDED: &[Incl] = &[
     // pip: pip.ini, at its current place and its older one.
     inc(Roaming, "pip"),
     inc(Profile, "pip"),
-    // XDG-style configuration (its stores stay denied).
-    inc(Profile, ".config"),
+    // XDG-style configuration: only what the pointers read.
+    inc(Profile, r".config\git"),
+    inc(Profile, r".config\pip"),
     // pyenv-win: the Python versions.
     inc(Profile, ".pyenv"),
     // Gradle: gradle.properties and caches (its key files stay denied).
@@ -1933,6 +1934,25 @@ impl Stamped {
     }
 }
 
+/// What reading a left path's access list back found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBack {
+    /// Nothing is there, on a volume that answers.
+    Gone,
+    /// It was read, and holds no allow of the sandbox group.
+    Clean,
+    /// It was read, and still holds one.
+    Carries,
+    /// It could not be read, or its volume does not answer.
+    Unread,
+}
+
+/// Whether a path that left the plan is known to be closed. Anything but
+/// a read that shows it stays a pending revoke, whatever the record says.
+pub fn read_back_closed(found: ReadBack) -> bool {
+    matches!(found, ReadBack::Gone | ReadBack::Clean)
+}
+
 /// Whether the recorded entry handed reading down, so that taking it off
 /// counts only once what it handed down is gone too.
 pub fn hands_reading_down(kind: Kind) -> bool {
@@ -2045,6 +2065,15 @@ mod tests {
         assert!(!goes(true, true, false), "a link or placeholder");
         assert!(!goes(true, false, true), "its own entry");
         assert!(!goes(false, false, false), "a file");
+    }
+
+    #[test]
+    fn a_left_path_is_closed_only_when_a_read_shows_it() {
+        use super::{ReadBack as B, read_back_closed as closed};
+        assert!(closed(B::Gone));
+        assert!(closed(B::Clean));
+        assert!(!closed(B::Carries));
+        assert!(!closed(B::Unread));
     }
 
     #[test]
@@ -2537,20 +2566,21 @@ mod tests {
         is(r"dotfiles\.config\gh", Kind::Denied);
         is(r"dotfiles\.config\git", Kind::Container);
         is(r"dotfiles\.config\git\credentials", Kind::Denied);
-        // `.config` is an inclusion: it follows the link too, so the
+        // `.config\git` is an inclusion: it follows the link too, so the
         // configuration behind it is readable, and only that.
         is(r"dotfiles\.config\git\config", Kind::File);
-        is(r"dotfiles\.config\nvim", Kind::Granted);
+        absent(r"dotfiles\.config\nvim");
         absent(r"dotfiles\README");
         absent("Documents");
         assert!(!k.contains_key(r"dotfiles\.ssh\id_ed25519"));
-        assert!(rules.included(&names(&split_path(r"dotfiles\.config\nvim\init.lua"))));
+        assert!(rules.included(&names(&split_path(r"dotfiles\.config\git\config"))));
+        assert!(!rules.included(&names(&split_path(r"dotfiles\.config\nvim\init.lua"))));
         assert!(!rules.included(&names(&split_path(r"dotfiles\README"))));
         assert!(
             rules
                 .spelled_included()
                 .iter()
-                .any(|s| s == r"dotfiles\.config")
+                .any(|s| s == r"dotfiles\.config\git")
         );
         let spelled = rules.spelled();
         for want in [
@@ -2755,7 +2785,7 @@ mod tests {
         assert_eq!(k.get("b").map(|v| v.0), Some(Kind::Container));
         assert!(!k.contains_key(r"b\keep.txt"));
         assert_eq!(k.get(r"a\cfg").map(|v| v.0), Some(Kind::Container));
-        assert_eq!(k.get(r"a\cfg\other").map(|v| v.0), Some(Kind::Granted));
+        assert_eq!(k.get(r"a\cfg\other").map(|v| v.0), None);
         assert_eq!(k.get(r"a\cfg\gh").map(|v| v.0), Some(Kind::Skipped));
         assert!(rules.spelled().iter().any(|s| s == r"b\gh"));
 
@@ -3707,8 +3737,25 @@ mod tests {
         assert_eq!(kind(r".gradle\caches"), Some(Kind::Granted));
         assert_eq!(kind(".config"), Some(Kind::Container));
         assert_eq!(kind(r".config\gh"), Some(Kind::Denied));
-        assert_eq!(kind(r".config\nvim"), Some(Kind::Granted));
-        assert_eq!(kind(r".config\starship.toml"), Some(Kind::File));
+        assert_eq!(kind(r".config\nvim"), None);
+        assert_eq!(kind(r".config\starship.toml"), None);
+    }
+
+    #[test]
+    fn only_the_configuration_the_pointers_read_is_readable_under_dot_config() {
+        let mut t = Mem::default();
+        t.add(r".config\rclone\rclone.conf")
+            .add(r".config\git\config")
+            .add(r".config\git\credentials")
+            .add(r".config\pip\pip.conf");
+        let k = kinds(&plan(&mut t, &rules()).unwrap());
+        let kind = |p: &str| k.get(p).map(|v| v.0);
+        assert_eq!(kind(".config"), Some(Kind::Container));
+        assert_eq!(kind(r".config\rclone"), None);
+        assert_eq!(kind(r".config\rclone\rclone.conf"), None);
+        assert_eq!(kind(r".config\git\config"), Some(Kind::File));
+        assert_eq!(kind(r".config\git\credentials"), Some(Kind::Denied));
+        assert_eq!(kind(r".config\pip"), Some(Kind::Granted));
     }
 
     /// What a typical profile looks like under the inclusions: the

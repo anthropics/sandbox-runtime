@@ -92,7 +92,6 @@ import {
   getWindowsProfileReadStatus,
   getWindowsProfileReadStatusAsync,
   grantWindowsProfileRead,
-  PROFILE_GRANT_REFRESH_TIMEOUT_MS,
   retryWindowsProfileStale,
   windowsProfileGrantRefreshable,
   windowsProfileExclusionConflicts,
@@ -179,6 +178,13 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+// The initialize() in flight, from its first step: a profile grant refresh
+// can hold it for minutes before initializationPromise exists. reset()
+// moves the generation on, which cancels it.
+let pendingInitialize:
+  | { promise: Promise<void>; generation: number }
+  | undefined
+let initializeGeneration = 0
 let cleanupRegistered = false
 let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
@@ -378,8 +384,9 @@ export function windowsProfileReadWarningsOf(
         `read grant may still carry an entry of it that could not be ` +
         `removed, and stay readable to sandboxed commands until it is: ` +
         `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
-        `path's reason says what stopped it; it is tried again at each ` +
-        `session start.`,
+        `path's reason says what stopped it. A session start tries local ` +
+        `paths again, at most every six hours; with every sandbox session ` +
+        `closed, \`srt-win profile retry-stale\` tries them all now.`,
       paths: grant.staleAllow,
     })
   }
@@ -1116,6 +1123,41 @@ async function initialize(
   enableLogMonitor = false,
   options?: SandboxInitializeOptions,
 ): Promise<void> {
+  if (pendingInitialize) {
+    const { promise, generation } = pendingInitialize
+    if (generation === initializeGeneration) return promise
+    // A reset() cancelled that run: this one starts once it has stopped.
+    await promise.catch(() => {})
+    return initialize(
+      runtimeConfig,
+      sandboxAskCallback,
+      enableLogMonitor,
+      options,
+    )
+  }
+  const entry = {
+    promise: initializeOnce(
+      runtimeConfig,
+      sandboxAskCallback,
+      enableLogMonitor,
+      options,
+    ),
+    generation: initializeGeneration,
+  }
+  pendingInitialize = entry
+  try {
+    await entry.promise
+  } finally {
+    if (pendingInitialize === entry) pendingInitialize = undefined
+  }
+}
+
+async function initializeOnce(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  enableLogMonitor: boolean,
+  options: SandboxInitializeOptions | undefined,
+): Promise<void> {
   try {
     await initializeSteps(
       runtimeConfig,
@@ -1143,6 +1185,7 @@ async function initializeSteps(
     await initializationPromise
     return
   }
+  const generation = initializeGeneration
 
   // Store config for use by other functions
   config = runtimeConfig
@@ -1319,6 +1362,7 @@ async function initializeSteps(
       windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
       if (u.profileGrant) {
         let grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        let refreshed: WindowsProfileGrantResult | undefined
         // Before this session is a holder of anything: the grant is
         // written only while no session or command holds it. A run that
         // does not finish throws; one that finishes with paths it could
@@ -1328,9 +1372,8 @@ async function initializeSteps(
             `[Sandbox Windows] refreshing the profile read grant ` +
               `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''})`,
           )
-          windowsProfileReadRefresh = await grantWindowsProfileRead({
+          refreshed = await grantWindowsProfileRead({
             srtWin,
-            timeoutMs: PROFILE_GRANT_REFRESH_TIMEOUT_MS,
             onProgress: line => {
               logForDebugging(`[Sandbox Windows] ${line}`)
               options?.onWindowsProfileGrantProgress?.(line)
@@ -1356,6 +1399,11 @@ async function initializeSteps(
             )
           }
         }
+        // reset() during those awaits: no session starts after it.
+        if (generation !== initializeGeneration) {
+          throw new Error('initialize() was cancelled by reset()')
+        }
+        windowsProfileReadRefresh = refreshed
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
             'profile_grant_outdated',
@@ -3239,6 +3287,7 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  initializeGeneration++
   // Windows: release this session's sandbox-user ACEs. Best-effort:
   // log anomalies rather than throw, so teardown always completes.
   // Persistent write roots and the denies under them are not released.

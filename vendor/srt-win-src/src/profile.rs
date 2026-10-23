@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 
 use crate::acl;
@@ -598,7 +598,6 @@ const VAL_INCLUSIONS: &str = "ProfileInclusions";
 const VAL_UNGRANTED: &str = "ProfileUngranted";
 const VAL_NOTES: &str = "ProfileNotes";
 const VAL_OPERATION: &str = "ProfileOp";
-/// The list version of the last grant that ran to its end.
 /// Seconds since the epoch of the last bounded retry of stale entries.
 const VAL_STALE_RETRIED: &str = "ProfileStaleRetried";
 
@@ -1653,6 +1652,30 @@ fn holds_entry(path: &str, ids: &Ids) -> Option<bool> {
     }))
 }
 
+/// Read back a path that left the plan, from the object itself: what
+/// the record says of it is not looked at.
+fn read_back(path: &str, ids: &Ids) -> plan::ReadBack {
+    use plan::ReadBack;
+    let aces = open_bare(path, READ_CONTROL)
+        .and_then(|h| acl::read_aces_at(acl::DaclTarget::Handle(h.raw(), path)));
+    match aces {
+        Ok(aces) => {
+            if aces.iter().any(|a| {
+                !a.inherited
+                    && !a.deny
+                    && (ids.group_sid.as_deref() == Some(a.sid.as_str())
+                        || ids.previous_group_sids.contains(&a.sid))
+            }) {
+                ReadBack::Carries
+            } else {
+                ReadBack::Clean
+            }
+        }
+        Err(e) if path_id::is_not_found(&e) && volume_reachable(path) => ReadBack::Gone,
+        Err(_) => ReadBack::Unread,
+    }
+}
+
 /// What an object's own access list says about the sandbox account.
 struct Access {
     reads: bool,
@@ -1783,7 +1806,7 @@ const COPIES_NAMED: usize = 8;
 
 /// The objects beneath the directory `dir` that still carry a copy of
 /// an allow of the sandbox group, up to [`COPIES_NAMED`]; one that
-/// cannot be examined counts. A link, a placeholder or an entry with an
+/// cannot be examined counts, so empty means all of it was seen. A link, a placeholder or an entry with an
 /// unusable name has its own access list read and is not gone into, and a
 /// directory with an entry of the group's own is that entry's business.
 fn copies_beneath(dir: &str, ids: &Ids) -> Vec<String> {
@@ -1911,6 +1934,31 @@ fn volume_reachable(path: &str) -> bool {
     root.is_some_and(|r| std::fs::metadata(r).is_ok())
 }
 
+/// Whether the object recorded by `r` is gone for good, by the rule
+/// [`strip`] goes by: a definite not-found from a volume that answers.
+fn recorded_object_gone(r: &Recorded) -> bool {
+    use plan::{FoundById, RecordedAt, RevokeAction};
+    let e = match open_for_stamp(&r.path, None) {
+        Ok(_) => return false,
+        Err(e) => e,
+    };
+    let at = match path_id::open_failure(&e) {
+        path_id::OpenFailure::NotFound => RecordedAt::Nothing,
+        path_id::OpenFailure::VolumeUnavailable => RecordedAt::VolumeUnavailable,
+        path_id::OpenFailure::Other => return false,
+    };
+    let by_id = r.file_id.map(|id| match path_id::locate_by_file_id(&id) {
+        Located::At(_) => FoundById::Elsewhere,
+        Located::Gone => FoundById::Gone,
+        Located::VolumeAbsent => FoundById::VolumeAbsent,
+        Located::Unknown => FoundById::Unknown,
+    });
+    let network = !path_id::is_drive_path(&r.path) || path_id::on_network_drive(&r.path);
+    let reachable =
+        matches!(at, RecordedAt::Nothing) && by_id.is_none() && volume_reachable(&r.path);
+    plan::revoke_action(at, by_id, network, reachable) == RevokeAction::Drop
+}
+
 /// Open the node without following a link, check it is still what
 /// the plan saw, record it, and converge its ACEs through the handle.
 ///
@@ -1962,7 +2010,15 @@ fn stamp(
             if revoking
                 && persist::carries_wanted(store.conn, ids, path, &obj).unwrap_or(false) =>
         {
-            unfinished(Some(format!("{e:#}")), copies_beneath(path, ids))
+            // A check that could not look names what it could not: only
+            // a check that saw everything comes back empty.
+            let remaining = copies_beneath(path, ids);
+            if !remaining.is_empty() {
+                return unfinished(Some(format!("{e:#}")), remaining);
+            }
+            persist::settled_on_object(store.conn, ids, path, &obj)?;
+            finish_revoke(store.conn, path)?;
+            Ok(Stamped::Wrote)
         }
         Err(e) => {
             if persist::settled_on_object(store.conn, ids, path, &obj).unwrap_or(false) {
@@ -2140,9 +2196,14 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
                 return Err(e);
             }
         };
+        // A check that could not look names what it could not: only a
+        // check that saw everything comes back empty.
         let remaining = copies_beneath(p, ids);
-        if cause.is_some() || !remaining.is_empty() {
+        if !remaining.is_empty() {
             unfinished = Some((p, o.id, UnfinishedRevoke { cause, remaining }));
+        } else if cause.is_some() {
+            persist::settled_on_object(&tx, ids, p, &obj)?;
+            removed = true;
         }
     }
     if let Some((p, id, why)) = unfinished {
@@ -2345,35 +2406,36 @@ pub fn grant(
     let planned_keys: HashSet<String> = planned.iter().map(|(p, _)| p.to_lowercase()).collect();
 
     // What an earlier run recorded.
-    let pending_at_start = revokes(store.conn)?;
-    let is_pending = |path: &str| {
-        pending_at_start
-            .iter()
-            .any(|p| p.row.path.eq_ignore_ascii_case(path))
-    };
-    let db_kinds: Vec<(String, Kind)> = db_rows(store.conn)?
+    let pending_at_start: HashSet<String> = revokes(store.conn)?
+        .into_iter()
+        .map(|p| p.row.path.to_lowercase())
+        .collect();
+    let is_pending = |path: &str| pending_at_start.contains(&path.to_lowercase());
+    let db_kinds: HashMap<String, Kind> = db_rows(store.conn)?
         .into_iter()
         .map(|r| (r.path.to_lowercase(), r.kind))
         .collect();
-    let in_db = |path: &str| {
-        let lower = path.to_lowercase();
-        db_kinds.iter().find(|(p, _)| *p == lower).map(|(_, k)| *k)
-    };
+    let in_db = |path: &str| db_kinds.get(&path.to_lowercase()).copied();
     // Resuming a run that was cut short: what it finished is not redone.
     let cut_short_grant =
         old.operation == Some(Operation::Grant) && old.header.as_ref().is_some_and(|h| !h.complete);
     let database_has_rows = !db_kinds.is_empty();
-    let mut before = all_recorded(store, &old)?;
-    before.retain(|r| {
-        !plan::row_finished_by_cut_short_grant(
-            cut_short_grant,
-            database_has_rows,
-            in_db(&r.path).is_some(),
-            is_pending(&r.path),
-        )
-    });
+    let recorded_at_start = all_recorded(store, &old)?;
+    let mut before = recorded_at_start.clone();
+    if cut_short_grant {
+        before.retain(|r| {
+            !plan::row_finished_by_cut_short_grant(
+                cut_short_grant,
+                database_has_rows,
+                in_db(&r.path).is_some(),
+                is_pending(&r.path),
+            )
+        });
+    }
     let is_allow = plan::grants_reading;
-    let earlier = |path: &str| before.iter().find(|r| r.path.eq_ignore_ascii_case(path));
+    let before_by_path: HashMap<String, &Recorded> =
+        before.iter().map(|r| (r.path.to_lowercase(), r)).collect();
+    let earlier = |path: &str| before_by_path.get(&path.to_lowercase()).copied();
 
     // The record goes first, marked incomplete, so that a run that is
     // KILLED leaves nothing on disk that `profile forget` does not know.
@@ -2424,12 +2486,11 @@ pub fn grant(
 
     // Every revoke of this run, before anything is walked or changed.
     {
-        let wanted = |path: &str| {
-            planned
-                .iter()
-                .find(|(p, _)| p.eq_ignore_ascii_case(path))
-                .map(|(_, n)| n.kind)
-        };
+        let planned_kinds: HashMap<String, Kind> = planned
+            .iter()
+            .map(|(p, n)| (p.to_lowercase(), n.kind))
+            .collect();
+        let wanted = |path: &str| planned_kinds.get(&path.to_lowercase()).copied();
         let tx = store
             .conn
             .unchecked_transaction()
@@ -2812,6 +2873,37 @@ pub fn grant(
         );
     }
 
+    // Before this reads as current: what left the plan, from the objects
+    // themselves. Whatever the bookkeeping says, a path a read does not
+    // show closed stays a pending revoke.
+    let still_pending: HashSet<String> = revokes(store.conn)?
+        .into_iter()
+        .map(|p| p.row.path.to_lowercase())
+        .collect();
+    for r in recorded_at_start.iter().filter(|r| {
+        plan::grants_reading(r.kind)
+            && !planned_keys.contains(&r.path.to_lowercase())
+            && !still_pending.contains(&r.path.to_lowercase())
+    }) {
+        let found = read_back(&r.path, ids);
+        if !plan::read_back_closed(found) {
+            pend_revoke(store.conn, r, None)?;
+            report.note(
+                NoteClass::StaleAllow,
+                &r.path,
+                format!(
+                    "it left the grant, and reading it back found {}; it may stay readable \
+                     to sandboxed commands until its entry is gone",
+                    if found == plan::ReadBack::Carries {
+                        "its entry still there"
+                    } else {
+                        "nothing that shows its entry is gone"
+                    }
+                ),
+            );
+        }
+    }
+
     // The record as it now is: every row, and nothing else.
     header.complete = true;
     report.complete = true;
@@ -2935,6 +3027,10 @@ pub fn retry_stale(
         })
         .cloned()
         .collect();
+    let row_kinds: HashMap<String, Kind> = db_rows(store.conn)?
+        .into_iter()
+        .map(|x| (x.path.to_lowercase(), x.kind))
+        .collect();
     let mut cleared: Vec<&Recorded> = Vec::new();
     for rv in &pending_revokes {
         let r = &rv.row;
@@ -2960,11 +3056,18 @@ pub fn retry_stale(
             left(rv.class, rv.reason.clone());
             continue;
         }
-        let row_kind = db_rows(store.conn)?
-            .into_iter()
-            .find(|x| x.path.eq_ignore_ascii_case(&r.path))
-            .map(|x| x.kind);
+        let row_kind = row_kinds.get(&r.path.to_lowercase()).copied();
         let result = match rv.wanted {
+            // Still in the plan, but the object is gone for good.
+            Some(_) if recorded_object_gone(r) => (|| {
+                store.conn.execute(
+                    "DELETE FROM profile_paths WHERE canonical_path = ?1",
+                    params![r.path],
+                )?;
+                finish_revoke(store.conn, &r.path)?;
+                cleared.push(r);
+                Ok(())
+            })(),
             // Still in the grant: what is wanted on it is written, and
             // that takes off what it carried.
             Some(kind) => {
@@ -3956,6 +4059,7 @@ mod tests {
             r"dotfiles\.ssh\id_ed25519",
             r"dotfiles\.config\gh\hosts.yml",
             r"dotfiles\.config\nvim\init.lua",
+            r"dotfiles\.config\git\config",
             r"dotfiles\README",
             r"Documents\a.txt",
         ] {
@@ -3988,12 +4092,13 @@ mod tests {
             [(true, false, 0, LIST)]
         );
         // `dotfiles` is not an inclusion, so its own file gets nothing;
-        // `.config` is one and follows its link, so what is behind it
-        // and not excluded is granted.
+        // `.config\git` is one and follows the link, so what is behind it
+        // and not excluded is granted; the rest of `.config` is not.
         assert!(group_aces(&prof.join(r"dotfiles\README")).is_empty());
+        assert!(group_aces(&prof.join(r"dotfiles\.config\nvim")).is_empty());
         assert_eq!(
-            group_aces(&prof.join(r"dotfiles\.config\nvim")),
-            [(true, false, 0x3, RX)]
+            group_aces(&prof.join(r"dotfiles\.config\git\config")),
+            [(true, false, 0, RX)]
         );
         for link in [r"\.ssh", r"\.config"] {
             assert!(
@@ -5379,8 +5484,8 @@ mod tests {
         };
         let docs = canon(&prof.join("Documents"));
         // As a killed run leaves a finished row: gone from the database,
-        // still in the registry. Its entry is left on disk to show nothing
-        // goes back to look at it.
+        // still in the registry. Its entry is left on disk: it is not
+        // walked again, but reading it back keeps it warned about.
         conn.execute(
             "DELETE FROM profile_paths WHERE canonical_path = ?1",
             params![docs],
@@ -5393,6 +5498,84 @@ mod tests {
         let report = grant(&store, &ids(), &layout, dropping_inclusions(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(!group_aces(&prof.join("Documents")).is_empty());
+        assert!(
+            report.stale_allow.iter().any(|i| i.path == docs),
+            "{report:?}"
+        );
+        assert_eq!(revokes(&conn).unwrap().len(), 1);
+        let r = retry_stale(&store, &ids(), None).unwrap();
+        assert_eq!(r.cleared, 1, "{r:?}");
+        assert!(group_aces(&prof.join("Documents")).is_empty());
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_read_back_of_what_left_the_plan_finds_only_what_is_there() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestReadBack";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, _layout) = granted_documents("readback", KEY, &conn);
+        let docs = canon(&prof.join("Documents"));
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        assert_eq!(read_back(&docs, &ids()), plan::ReadBack::Carries);
+        let plain = canon(&prof.join(r"Documents\deep"));
+        assert_eq!(read_back(&plain, &ids()), plan::ReadBack::Clean);
+        let gone = format!(r"{docs}\no-such-thing");
+        assert_eq!(read_back(&gone, &ids()), plan::ReadBack::Gone);
+        let letter = ('D'..='Z')
+            .rev()
+            .find(|c| std::fs::metadata(format!("{c}:\\")).is_err())
+            .expect("a drive letter nothing is on");
+        let away = format!(r"\\?\{letter}:\gone");
+        assert_eq!(read_back(&away, &ids()), plan::ReadBack::Unread);
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_retry_drops_a_narrowed_path_only_when_it_is_gone_for_good() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestRetryGone";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, _layout) = granted_documents("retrygone", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let vanished = prof.join("vanished");
+        std::fs::create_dir(&vanished).unwrap();
+        let gone = Recorded {
+            path: canon(&vanished),
+            kind: Kind::Granted,
+            created: false,
+            file_id: None,
+        };
+        std::fs::remove_dir(&vanished).unwrap();
+        let letter = ('D'..='Z')
+            .rev()
+            .find(|c| std::fs::metadata(format!("{c}:\\")).is_err())
+            .expect("a drive letter nothing is on");
+        let away = Recorded {
+            path: format!(r"\\?\{letter}:\away"),
+            kind: Kind::Granted,
+            created: false,
+            file_id: None,
+        };
+        pend_revoke(&conn, &gone, Some(Kind::Container)).unwrap();
+        pend_revoke(&conn, &away, Some(Kind::Container)).unwrap();
+        assert!(recorded_object_gone(&gone));
+        assert!(!recorded_object_gone(&away));
+        let r = retry_stale(&store, &ids(), None).unwrap();
+        assert_eq!(r.cleared, 1, "{r:?}");
+        assert_eq!(
+            r.stale_allow.iter().map(|i| &i.path).collect::<Vec<_>>(),
+            [&away.path]
+        );
+        let left = revokes(&conn).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].row.path, away.path);
         forget(&store, &ids()).unwrap();
         std::fs::remove_dir_all(prof.parent().unwrap()).ok();
     }

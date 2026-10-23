@@ -7001,7 +7001,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         })
       }
 
-      it('hands progress to the caller, and bounds the run', async () => {
+      it('hands progress to the caller, under the default grant timeout', async () => {
         profileStatus = until(refreshable())
         grantRun = { stderr: ['12 of 40 done'], stdout: grantJson(), code: 0 }
         const lines: string[] = []
@@ -7011,7 +7011,68 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           onWindowsProfileGrantProgress: line => lines.push(line),
         })
         expect(lines).toEqual(['12 of 40 done'])
-        expect(grantSpy.mock.calls[0]?.[0]?.timeoutMs).toBe(300_000)
+        expect(grantSpy.mock.calls[0]?.[0]?.timeoutMs).toBeUndefined()
+      })
+
+      describe('while a refresh is running', () => {
+        let finishGrant: () => void
+        let grantSpy: ReturnType<typeof spyOn>
+        const started = async (): Promise<void> => {
+          while (grantSpy.mock.calls.length === 0) {
+            await new Promise(r => setImmediate(r))
+          }
+        }
+        beforeEach(() => {
+          let finished = false
+          profileStatus = {
+            toJSON: () => (finished ? current() : refreshable()),
+          }
+          grantSpy = spyOn(winUtils, 'grantWindowsProfileRead')
+          grantSpy.mockImplementation(
+            (() =>
+              new Promise(resolve => {
+                finishGrant = () => {
+                  finished = true
+                  resolve(JSON.parse(grantJson()))
+                }
+              })) as never,
+          )
+          spies.push(grantSpy)
+        })
+
+        it('a second initialize() shares it, and it runs once', async () => {
+          const first = SandboxManager.initialize(config())
+          await started()
+          const second = SandboxManager.initialize(config())
+          finishGrant()
+          await Promise.all([first, second])
+          expect(grantSpy).toHaveBeenCalledTimes(1)
+          expect(SandboxManager.getConfig()).toBeDefined()
+          expect(names()).toContain('acl grant')
+        })
+
+        it('reset() cancels it: no session starts afterwards', async () => {
+          const first = SandboxManager.initialize(config())
+          await started()
+          await SandboxManager.reset()
+          finishGrant()
+          // eslint-disable-next-line @typescript-eslint/await-thenable
+          await expect(first).rejects.toThrow('cancelled by reset()')
+          expect(names()).not.toContain('acl grant')
+          expect(SandboxManager.getConfig()).toBeUndefined()
+        })
+
+        it('initialize() after that reset() waits, then starts its own session', async () => {
+          const first = SandboxManager.initialize(config())
+          first.catch(() => {})
+          await started()
+          await SandboxManager.reset()
+          const second = SandboxManager.initialize(config())
+          finishGrant()
+          await second
+          expect(grantSpy).toHaveBeenCalledTimes(1)
+          expect(SandboxManager.getConfig()).toBeDefined()
+        })
       })
 
       it('a run that times out: a typed error, and no session', async () => {
