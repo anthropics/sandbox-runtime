@@ -4818,11 +4818,12 @@ mod tests {
         assert!(group_aces(&new_tool).is_empty());
         let again = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert!(again.complete, "{again:?}");
-        assert_eq!(group_aces(&new_tool), allow(0x3, RX));
+        assert_eq!(group_aces(&new_tool), allow(0, LIST));
+        assert_eq!(group_aces(&new_tool.join("n.txt")), allow(0, RX));
         assert!(group_aces(&prof.join("NewTop")).is_empty());
         assert_eq!(group_aces(&prof.join(".ssh")), deny_dir);
         assert!(group_aces(&prof.join(".netrc")).iter().all(|a| a.1));
-        assert_eq!(again.writes, 4, "{again:?}");
+        assert_eq!(again.writes, 5, "{again:?}");
         let third = grant(&store, &ids, &layout, Added::default(), false).unwrap();
         assert_eq!(third.writes, 0, "{third:?}");
         assert_eq!(explicit(&outside), outside_before);
