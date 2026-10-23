@@ -326,7 +326,36 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat ripgrep apparmor-profiles zsh
+          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat apparmor-profiles zsh
+
+      # The library reads both the output and the exit status of ripgrep, and
+      # those differ between releases: for an unreadable directory exactly at
+      # --max-depth, 14.1.1 prints "Permission denied" and exits 2, where
+      # 15.2.0 passes over it and exits 0. 14.1.1 is what most installations
+      # have, so every later step finds it first on PATH; the second full run
+      # below puts 15.2.0 ahead of it. Both are upstream's archives, by the
+      # checksums upstream publishes. macOS runs whatever Homebrew serves.
+      - name: Install ripgrep 14.1.1 and 15.2.0 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          install_ripgrep() {
+            case "${{ matrix.arch }}" in
+              x86-64) asset=ripgrep-$1-x86_64-unknown-linux-musl.tar.gz sha256=$2 ;;
+              arm64) asset=ripgrep-$1-aarch64-unknown-linux-gnu.tar.gz sha256=$3 ;;
+            esac
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" "https://github.com/BurntSushi/ripgrep/releases/download/$1/$asset"
+            echo "$sha256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
+            mkdir "$RUNNER_TEMP/ripgrep-$1"
+            tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/ripgrep-$1" --strip-components=1
+            "$RUNNER_TEMP/ripgrep-$1/rg" --version
+          }
+          install_ripgrep 14.1.1 \
+            4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e \
+            c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f
+          install_ripgrep 15.2.0 \
+            33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c \
+            a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d
+          echo "$RUNNER_TEMP/ripgrep-14.1.1" >> "$GITHUB_PATH"
 
       - name: Enable unprivileged user namespaces (Linux)
         if: matrix.os == 'linux'
@@ -352,7 +381,7 @@ jobs:
 
       - name: Install Node dependencies
         if: matrix.os != 'windows'
-        run: npm install
+        run: npm ci
 
       - name: Lint (ESLint)
         if: matrix.os == 'linux' && matrix.arch == 'x86-64'
@@ -398,9 +427,9 @@ jobs:
           ninja -C _build install
           "$RUNNER_TEMP/bwrap-0.12/bin/bwrap" --version
 
-      - name: Run tests against bubblewrap 0.12.0 (Linux)
+      - name: Run tests against bubblewrap 0.12.0 and ripgrep 15.2.0 (Linux)
         if: matrix.os == 'linux'
-        run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
+        run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$RUNNER_TEMP/ripgrep-15.2.0:$PATH" npm test
 
       # RHEL 8 and 9 ship bubblewrap 0.4.0 and 0.4.1, the oldest versions in
       # current distribution use, and both refuse to start on a plan that
@@ -442,6 +471,18 @@ jobs:
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
+
+      # Everything above ran with Node 22 on PATH. What runs the library under
+      # Node repeats on 24, in a step so that the matrix stays as it is.
+      - name: Setup Node.js 24
+        if: matrix.os != 'windows'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Run the tests that use Node (Node 24)
+        if: matrix.os != 'windows'
+        run: npm run test:node
 
       - name: Upload test results
         if: always()
