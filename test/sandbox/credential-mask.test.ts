@@ -202,6 +202,76 @@ describe('SentinelRegistry', () => {
     expect(headers.authorization).toBe('Bearer gh-secret')
     expect(headers['x-npm-token']).toBe(npm)
   })
+
+  test('injectInto ["header:authorization"]: only that header swaps, and no body pair', () => {
+    const reg = new SentinelRegistry()
+    const s = reg.register(
+      'GH_TOKEN',
+      REAL_TOKEN,
+      ['api.github.com'],
+      ['header:Authorization'],
+    )
+    const headers: IncomingHttpHeaders = {
+      authorization: `Bearer ${s}`,
+      'x-api-key': s,
+    }
+    reg.substituteInHeaders(headers, 'api.github.com', eq)
+    // The header name matches case-insensitively.
+    expect(headers.authorization).toBe(`Bearer ${REAL_TOKEN}`)
+    expect(headers['x-api-key']).toBe(s)
+    expect(reg.sentinelsForHost('api.github.com', eq)).toEqual([])
+  })
+
+  test('injectInto ["headers"]: any header swaps, the body does not', () => {
+    const reg = new SentinelRegistry()
+    const s = reg.register(
+      'GH_TOKEN',
+      REAL_TOKEN,
+      ['api.github.com'],
+      ['headers'],
+    )
+    const headers: IncomingHttpHeaders = { 'x-api-key': s }
+    reg.substituteInHeaders(headers, 'api.github.com', eq)
+    expect(headers['x-api-key']).toBe(REAL_TOKEN)
+    expect(reg.sentinelsForHost('api.github.com', eq)).toEqual([])
+  })
+
+  test('injectInto ["body"]: the body swaps, headers do not', () => {
+    const reg = new SentinelRegistry()
+    const s = reg.register('GH_TOKEN', REAL_TOKEN, ['api.github.com'], ['body'])
+    const headers: IncomingHttpHeaders = { authorization: `Bearer ${s}` }
+    reg.substituteInHeaders(headers, 'api.github.com', eq)
+    expect(headers.authorization).toBe(`Bearer ${s}`)
+    const pairs = reg.sentinelsForHost('api.github.com', eq)
+    expect(pairs.map(p => p.realValue.toString())).toEqual([REAL_TOKEN])
+  })
+
+  test('injectInto narrows per credential: a body-scoped one and a header-scoped one at the same host', () => {
+    const reg = new SentinelRegistry()
+    reg.register(
+      'GH_TOKEN',
+      'gh-secret',
+      ['api.github.com'],
+      ['header:authorization'],
+    )
+    reg.register('FORM_KEY', 'form-secret', ['api.github.com'])
+    const pairs = reg.sentinelsForHost('api.github.com', eq)
+    expect(pairs.map(p => p.realValue.toString())).toEqual(['form-secret'])
+  })
+
+  test('re-registering a name updates injectInto but keeps the sentinel', () => {
+    const reg = new SentinelRegistry()
+    const s1 = reg.register('GH_TOKEN', REAL_TOKEN, ['api.github.com'])
+    expect(reg.sentinelsForHost('api.github.com', eq)).toHaveLength(1)
+    const s2 = reg.register(
+      'GH_TOKEN',
+      REAL_TOKEN,
+      ['api.github.com'],
+      ['header:authorization'],
+    )
+    expect(s2).toBe(s1)
+    expect(reg.sentinelsForHost('api.github.com', eq)).toEqual([])
+  })
 })
 
 describe('macOS env preamble for masked credentials', () => {

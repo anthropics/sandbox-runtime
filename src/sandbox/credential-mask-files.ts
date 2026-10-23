@@ -226,12 +226,13 @@ export function buildMaskedFileBinds(
     }
 
     const injectHosts = f.injectHosts ?? allowedDomains
+    const injectInto = f.injectInto
     const key = FILE_KEY_PREFIX + realPath
 
     let fakeContent: string
     if (f.extract === undefined && f.decode === undefined) {
       // Whole-file: one sentinel for the entire content.
-      fakeContent = registry.register(key, content, injectHosts)
+      fakeContent = registry.register(key, content, injectHosts, injectInto)
     } else {
       // An explicit extract pattern wins; decode without one falls back to
       // the built-in JWT pattern so authors don't hand-write it.
@@ -252,7 +253,12 @@ export function buildMaskedFileBinds(
             // the whole real token, so both the bearer path (token sent
             // verbatim) and the extracted-claim path substitute on egress.
             const masked = maskJwtClaims(cap, f.maskClaims, (claim, real) =>
-              registry.register(`${key}#jwt${i}.${claim}`, real, injectHosts),
+              registry.register(
+                `${key}#jwt${i}.${claim}`,
+                real,
+                injectHosts,
+                injectInto,
+              ),
             )
             if (masked === null) {
               // A verified JWT none of whose named claims are present as
@@ -281,6 +287,7 @@ export function buildMaskedFileBinds(
               masked.fakeToken,
               cap,
               injectHosts,
+              injectInto,
             )
           }
           maskedCount++
@@ -293,8 +300,9 @@ export function buildMaskedFileBinds(
                 mintFakeJwt(randomUUID()),
                 cap,
                 injectHosts,
+                injectInto,
               )
-            : registry.register(name, cap, injectHosts)
+            : registry.register(name, cap, injectHosts, injectInto)
         },
         { maskDuplicates: f.maskDuplicates ?? false },
       )
