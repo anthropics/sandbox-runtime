@@ -2227,6 +2227,10 @@ function getAllowMachLookup(): string[] | undefined {
   return config?.network?.allowMachLookup
 }
 
+function getDenyMachLookup(): string[] | undefined {
+  return config?.network?.denyMachLookup
+}
+
 function getIgnoreViolations(): Record<string, string[]> | undefined {
   return config?.ignoreViolations
 }
@@ -2704,6 +2708,7 @@ async function wrapWithSandboxOnce(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         allowMachLookup: getAllowMachLookup(),
+        denyMachLookup: getDenyMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
@@ -3430,6 +3435,7 @@ export interface ISandboxManager {
   getAllowUnixSockets(): string[] | undefined
   getAllowLocalBinding(): boolean | undefined
   getAllowMachLookup(): string[] | undefined
+  getDenyMachLookup(): string[] | undefined
   getIgnoreViolations(): Record<string, string[]> | undefined
   getEnableWeakerNestedSandbox(): boolean | undefined
   getProxyPort(): number | undefined
@@ -3551,6 +3557,7 @@ export const SandboxManager: ISandboxManager = {
   getAllowUnixSockets,
   getAllowLocalBinding,
   getAllowMachLookup,
+  getDenyMachLookup,
   getIgnoreViolations,
   getEnableWeakerNestedSandbox,
   getProxyPort,
