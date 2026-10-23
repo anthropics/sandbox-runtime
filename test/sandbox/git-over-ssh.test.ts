@@ -83,6 +83,184 @@ const basicOf = (token: string): string =>
 const PROMPT_MS = 15_000
 const TEST_MS = 90_000
 
+async function retryMacosProxyConnect<T extends RunResult>(
+  run: () => Promise<T>,
+  retryable: (r: T) => boolean,
+  onMacOS = isMacOS,
+): Promise<T & { ms: number }> {
+  const started = Date.now()
+  for (let attempt = 1; ; attempt++) {
+    const r = await run()
+    const ms = Date.now() - started
+    if (!onMacOS || attempt === 3 || ms >= PROMPT_MS || !retryable(r)) {
+      return { ...r, ms }
+    }
+    console.warn(`[macOS proxy connect retry ${attempt}/3] ${r.stderr}`)
+  }
+}
+
+// Without nc -v, "no answer" cannot distinguish EPERM from ECONNREFUSED or
+// a proxy closing before a status, including after it read CONNECT. This test
+// policy can absorb two such failures per command before a later reply; every
+// absorbed failure is logged. A third failure still reaches the assertions.
+function unansweredProxy(
+  r: RunResult,
+  asked: boolean,
+  denied: boolean,
+): boolean {
+  return (
+    r.status === 128 &&
+    r.stdout === '' &&
+    !asked &&
+    !denied &&
+    /^sandbox proxy: 127\.0\.0\.1:\d+: no answer\r?$/m.test(r.stderr)
+  )
+}
+
+describe('macOS sandbox proxy retry limits', () => {
+  const noAnswer = {
+    status: 128,
+    signal: null,
+    stdout: '',
+    stderr: 'sandbox proxy: 127.0.0.1:12345: no answer\n',
+  }
+  const success = { ...noAnswer, status: 0, stdout: 'refs', stderr: '' }
+
+  it('preserves a failure after the last attempt, and a later success', async () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      for (const final of [noAnswer, success]) {
+        let calls = 0
+        const result = await retryMacosProxyConnect(
+          async () => (++calls === 3 ? final : noAnswer),
+          r => unansweredProxy(r, false, false),
+          true,
+        )
+        expect(calls).toBe(3)
+        expect(result).toMatchObject(final)
+      }
+      expect(warn).toHaveBeenCalledTimes(4)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('preserves answered requests, recorded denials and other errors without retrying', async () => {
+    for (const [r, asked, denied] of [
+      [noAnswer, true, false],
+      [noAnswer, false, true],
+      [{ ...noAnswer, stderr: '403 refused' }, false, false],
+      [{ ...noAnswer, stdout: 'partial response' }, false, false],
+      [{ ...noAnswer, status: 1 }, false, false],
+    ] as const) {
+      let calls = 0
+      expect(
+        await retryMacosProxyConnect(
+          async () => {
+            calls++
+            return r
+          },
+          result => unansweredProxy(result, asked, denied),
+          true,
+        ),
+      ).toMatchObject(r)
+      expect(calls).toBe(1)
+    }
+  })
+
+  it('does not retry on Linux', async () => {
+    let calls = 0
+    await retryMacosProxyConnect(
+      async () => {
+        calls++
+        return noAnswer
+      },
+      r => unansweredProxy(r, false, false),
+      false,
+    )
+    expect(calls).toBe(1)
+  })
+
+  it('preserves a slow failure without spending another attempt', async () => {
+    const now = spyOn(Date, 'now')
+      .mockReturnValueOnce(0)
+      .mockReturnValue(PROMPT_MS)
+    let calls = 0
+    try {
+      expect(
+        await retryMacosProxyConnect(
+          async () => {
+            calls++
+            return noAnswer
+          },
+          r => unansweredProxy(r, false, false),
+          true,
+        ),
+      ).toMatchObject(noAnswer)
+      expect(calls).toBe(1)
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('times the whole retrying command', async () => {
+    const now = spyOn(Date, 'now')
+      .mockReturnValueOnce(0)
+      .mockReturnValueOnce(4)
+      .mockReturnValueOnce(9)
+      .mockReturnValueOnce(13)
+    const warn = spyOn(console, 'warn').mockImplementation(() => {})
+    let calls = 0
+    try {
+      const r = await retryMacosProxyConnect(
+        async () => (++calls === 3 ? success : noAnswer),
+        result => unansweredProxy(result, false, false),
+        true,
+      )
+      expect(r.ms).toBe(13)
+      expect(calls).toBe(3)
+    } finally {
+      now.mockRestore()
+      warn.mockRestore()
+    }
+  })
+
+  // The recorded failure shape has a normalized port. These controlled inputs
+  // exercise the policy, while ordinary file trials leave this case skipped.
+  it.if(process.env.SRT_SSH_RETRY_CONTROL !== undefined)(
+    'recorded macOS no-answer input reaches the expected proxy refusal',
+    async () => {
+      const mode = process.env.SRT_SSH_RETRY_CONTROL
+      if (mode !== 'recovered' && mode !== 'unabsorbed') {
+        throw new Error('Unknown SSH retry control input')
+      }
+      let calls = 0
+      const refusal = {
+        ...noAnswer,
+        stderr: 'sandbox proxy: 127.0.0.1:12345: 403 asked, and refused\n',
+      }
+      const r = await retryMacosProxyConnect(
+        async () => {
+          calls++
+          return mode === 'recovered' && calls === 3 ? refusal : noAnswer
+        },
+        result => unansweredProxy(result, false, false),
+        true,
+      )
+      console.log(
+        JSON.stringify({
+          control: 'ssh-no-answer',
+          mode,
+          calls,
+          stderr: r.stderr,
+        }),
+      )
+      expect(r.stderr).toContain('403 asked, and refused')
+      expect(calls).toBe(3)
+    },
+  )
+})
+
 function listen(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once('error', reject)
@@ -918,6 +1096,7 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
     const DENY_REASON = 'ssh to this port is blocked; use an https:// remote'
     const ASK_REASON = 'asked, and refused'
     let deniedPort: number
+    let asked = 0
 
     beforeAll(async () => {
       deniedPort = await freePort()
@@ -935,6 +1114,7 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
         },
         // A refusal that comes late, when ssh has long sent its first bytes.
         async () => {
+          asked++
           await new Promise(resolve => setTimeout(resolve, 500))
           return { allow: false, reason: ASK_REASON }
         },
@@ -970,12 +1150,30 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
       ...args: string[]
     ): Promise<RunResult & { ms: number; command: string }> {
       const command = `${vars} git ${quote(args)}`
-      const started = Date.now()
-      const r = await spawnAsync(
-        await SandboxManager.wrapWithSandbox(command),
-        { timeout: TEST_MS / 2 },
+      let askedBefore = asked
+      // macOS 14 sometimes refuses the connect to the allowed proxy port.
+      // A request already answered or recorded by the proxy is never retried.
+      // "No answer" also covers a refused port or a proxy dropping CONNECT.
+      // At most two such transient defects per command can be absorbed. A
+      // persistent third failure and every observed ask/denial stay visible.
+      return retryMacosProxyConnect(
+        async () => {
+          askedBefore = asked
+          const r = await spawnAsync(
+            await SandboxManager.wrapWithSandbox(command),
+            { timeout: TEST_MS / 2 },
+          )
+          return { ...r, command }
+        },
+        r =>
+          unansweredProxy(
+            r,
+            asked !== askedBefore,
+            SandboxManager.getSandboxViolationStore().getViolationsForCommand(
+              command,
+            ).length > 0,
+          ),
       )
-      return { ...r, ms: Date.now() - started, command }
     }
 
     // On its own, so that a profile that does not let the script's nc out is
@@ -984,12 +1182,21 @@ describe.skipIf(NO_SSH !== '')(`git over ssh${NO_SSH}`, () => {
       'nc reaches the proxy on 127.0.0.1',
       async () => {
         const port = isLinux ? 3128 : SandboxManager.getProxyPort()!
-        const r = await spawnAsync(
-          await SandboxManager.wrapWithSandbox(
-            // The sleep holds nc's stdin open, as ssh does, until the answer.
-            `{ printf 'GET http://x.invalid/ HTTP/1.1\\r\\nHost: x.invalid\\r\\nConnection: close\\r\\n\\r\\n'; sleep 2; } | ${NC} -v 127.0.0.1 ${port}`,
-          ),
-          { timeout: TEST_MS / 2 },
+        const r = await retryMacosProxyConnect(
+          async () =>
+            spawnAsync(
+              await SandboxManager.wrapWithSandbox(
+                // The sleep holds nc's stdin open, as ssh does, until the answer.
+                `{ printf 'GET http://x.invalid/ HTTP/1.1\\r\\nHost: x.invalid\\r\\nConnection: close\\r\\n\\r\\n'; sleep 2; } | ${NC} -v 127.0.0.1 ${port}`,
+              ),
+              { timeout: TEST_MS / 2 },
+            ),
+          r =>
+            r.status === 1 &&
+            r.stdout === '' &&
+            r.stderr.includes(
+              `nc: connectx to 127.0.0.1 port ${port} (tcp) failed: Operation not permitted`,
+            ),
         )
         expect(explain('nc', r)).toStartWith('nc: status 0,')
         expect(r.stdout).toStartWith('HTTP/1.1 407 ')
