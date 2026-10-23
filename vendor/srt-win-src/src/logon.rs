@@ -602,6 +602,10 @@ pub fn spawn_runner(
     // denial is non-elevated-only). Declared after `job` so it
     // drops first: terminate before job-close.
     let child = SpawnedChild::new(pi);
+    // Before the runner runs a single instruction: no other process of the
+    // sandbox account may find it under the default DACL.
+    crate::self_protect::protect_suspended_runner(child.process(), child.thread())
+        .context("protect the suspended runner")?;
 
     // Grant `srt-sandbox` on the broker's `WinSta0` (with a non-NULL
     // `lpDesktop`, seclogon skips its station auto-grant for the new
