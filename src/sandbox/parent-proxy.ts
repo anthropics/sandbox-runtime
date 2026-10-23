@@ -391,7 +391,10 @@ export function relayResponseHead(
   headers: IncomingHttpHeaders = stripHopByHop(upstreamRes.headers),
 ): boolean {
   try {
-    res.writeHead(upstreamRes.statusCode ?? 502, headers)
+    res.writeHead(
+      upstreamRes.statusCode ?? 502,
+      sanitizeResponseHeaders(headers),
+    )
     return true
   } catch (err) {
     logForDebugging(
@@ -467,6 +470,36 @@ export function stripHopByHop(
   for (const [k, v] of Object.entries(h)) {
     const nk = norm(k)
     if (!HOP_BY_HOP.has(nk) && !extra.has(nk)) out[k] = v
+  }
+  return out
+}
+
+/**
+ * Replace characters outside Latin-1 (> 0xFF) with '?' in a header value.
+ * Node's ServerResponse.writeHead validates header values and throws
+ * TypeError [ERR_INVALID_CHAR] on any character code > 0xFF (#490).
+ */
+export function sanitizeHeaderValue(v: string): string {
+  // eslint-disable-next-line no-control-regex -- matching Latin-1 range
+  return v.replace(/[^\x00-\xFF]/g, '?')
+}
+
+/**
+ * Sanitize response headers before forwarding to a ServerResponse via `writeHead`.
+ * Prevents ERR_INVALID_CHAR exceptions when an upstream server returns non-Latin1
+ * headers (e.g. raw UTF-8 in Content-Disposition).
+ */
+export function sanitizeResponseHeaders(
+  headers: IncomingHttpHeaders,
+): IncomingHttpHeaders {
+  const out: IncomingHttpHeaders = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) continue
+    if (Array.isArray(value)) {
+      out[key] = value.map(sanitizeHeaderValue)
+    } else {
+      out[key] = sanitizeHeaderValue(value)
+    }
   }
   return out
 }
