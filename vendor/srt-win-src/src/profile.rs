@@ -4932,7 +4932,7 @@ mod tests {
         assert_eq!(same.writes, 0, "{same:?}");
         let replaced = grant(&store, &ids, &layout, REPLACE_EXCLUDES, false).unwrap();
         assert!(replaced.complete, "{replaced:?}");
-        assert_eq!(group_aces(&new_tool), allow(0x3, RX));
+        assert_eq!(group_aces(&new_tool), allow(0, LIST));
         assert!(group_aces(&prof.join(r"AppData\Local\Temp\keys")).is_empty());
         assert_eq!(
             status_json(TEST_KEY, Ok(layout.clone()), false)["extra_exclusions"],
