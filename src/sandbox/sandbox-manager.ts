@@ -86,6 +86,7 @@ import {
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
   windowsGrantsBeneathDenies,
+  windowsMandatoryDenyPaths,
   type WindowsProfileGrantItem,
   type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
@@ -108,6 +109,7 @@ import {
   containsGlobChars,
   globBaseDirIsRoot,
   globPatternBaseDir,
+  isUncPath,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
   walkGlobPatternSteps,
@@ -196,6 +198,9 @@ let proxyAuthToken: string | undefined
 // at initialize(). `undefined` means no stamp/grant was applied
 // (gates running `acl restore`/`acl revoke` at reset()).
 let windowsFsStampedSet: WindowsFsAccessSet | undefined
+// The objects this session has put a write deny on, each by its path and
+// file index: see `windowsMandatoryDeniesDue`.
+let windowsWriteDenied = new Map<string, bigint | undefined>()
 // The sandbox user SID captured at initialize(). reset() uses this
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
@@ -1450,6 +1455,12 @@ async function initializeSteps(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
+      // A share is not looked at (see isUncPath). No mandatory deny is on one.
+      const writeDenied = new Map(
+        acc.denyWrite
+          .filter(p => !isUncPath(p))
+          .map(p => [p, windowsFileIndexOf(p)]),
+      )
       // One call, always made: it also records this process as a
       // session. Write roots are kept at reset(); a failure throws.
       await grantWindowsAclPersistent({
@@ -1465,6 +1476,7 @@ async function initializeSteps(
       // recorded with srt-win, whatever it was given. Set before the
       // probe, so that a reset() during it releases what was granted.
       windowsFsStampedSet = acc
+      windowsWriteDenied = writeDenied
       logForDebugging(
         `[Sandbox Windows] fs applied: ` +
           `${acc.grantWrite.length} grantWrite, ` +
@@ -2095,20 +2107,62 @@ function computeWindowsFsAccessSet(
     }
   }
   const expand = expandWindowsFsPaths
+  const allowWrite = expand(fs?.allowWrite ?? [], { mode: 'grant' })
   // `mode: 'deny'` — non-existent literals reach srt-win, which
   // creates a placeholder chain and stamps it (deny lands on the
   // exact target path). `mode: 'grant'` drops them (a grant on
   // nothing is meaningless).
   return rankWindowsFsAccess({
     allowRead: expand(fs?.allowRead ?? [], { mode: 'grant' }),
-    allowWrite: expand(fs?.allowWrite ?? [], { mode: 'grant' }),
+    allowWrite,
     denyRead: expand(fs?.denyRead ?? [], { mode: 'deny' }),
-    denyWrite: expand(fs?.denyWrite ?? [], { mode: 'deny' }),
+    denyWrite: [
+      ...expand(fs?.denyWrite ?? [], { mode: 'deny' }),
+      ...windowsMandatoryDenyPaths(process.cwd(), allowWrite, {
+        maxDepth: c.mandatoryDenySearchDepth ?? 3,
+        allowGitConfig: fs?.allowGitConfig ?? false,
+      }),
+    ],
     credentialDeny: [
       ...expand(getCredentialDenyReadPaths(c.credentials), { mode: 'deny' }),
       ...maskedFiles,
     ],
   })
+}
+
+/** Which object is at `p`: undefined where that cannot be told. */
+function windowsFileIndexOf(p: string): bigint | undefined {
+  try {
+    return fs.lstatSync(p, { bigint: true }).ino
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The mandatory write denies for a command run in `cwd` that are not on disk
+ * yet: a name that is new since `initialize()`, and one that is another object
+ * than the one denied. A deny on a file goes with the object, and git and most
+ * editors write a file by putting a new one in its place.
+ */
+function windowsMandatoryDeniesDue(
+  cwd: string,
+): Map<string, bigint | undefined> {
+  const due = new Map<string, bigint | undefined>()
+  for (const p of windowsMandatoryDenyPaths(
+    cwd,
+    windowsFsStampedSet?.grantWrite ?? [],
+    {
+      maxDepth: getMandatoryDenySearchDepth(),
+      allowGitConfig: getAllowGitConfig(),
+    },
+  )) {
+    const index = windowsFileIndexOf(p)
+    if (!windowsWriteDenied.has(p) || windowsWriteDenied.get(p) !== index) {
+      due.set(p, index)
+    }
+  }
+  return due
 }
 
 /**
@@ -2135,7 +2189,8 @@ function windowsMaskedFileDenies(
 function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   // Keyed exactly on what {@link computeWindowsFsAccessSet} reads of
   // the config. The masked files are not session-wide: each wrap
-  // denies the ones the session has not stamped.
+  // denies the ones the session has not stamped. So with the mandatory
+  // denies, whose two settings each wrap reads anew.
   // `network.allowedDomains` does NOT feed file-deny (only mask
   // injectHosts), so a network-only updateConfig hits the cache.
   return {
@@ -2891,6 +2946,29 @@ async function wrapWithSandboxArgv(
       perExecDenyWrite = ranked.denyWrite.filter(
         p => !sessRead.has(p) && !sessWrite.has(p),
       )
+    }
+    // Kept with the write root like the session's own, so each is written
+    // once and no command after this one pays for it.
+    const due = windowsMandatoryDeniesDue(cwd ?? process.cwd())
+    if (!fsCfg?.disabled && due.size > 0 && windowsFsSbUserSid !== undefined) {
+      await grantWindowsAclPersistent({
+        sandboxUserSid: windowsFsSbUserSid,
+        read: [],
+        write: [],
+        denyRead: [],
+        // With the session's write grants beneath them, which they outrank.
+        denyWrite: rankWindowsFsAccess({
+          allowRead: [],
+          allowWrite: [],
+          denyRead: [],
+          denyWrite: [...due.keys()],
+          credentialDeny: [],
+          held: windowsFsStampedSet,
+        }).denyWrite,
+        srtWin: srtWinSpawn,
+      })
+      // As looked at before the write: one replaced since is due again.
+      for (const [p, index] of due) windowsWriteDenied.set(p, index)
     }
     // Per-exec deny rides on argv (`acl stamp` reads stdin, but
     // exec's stdin belongs to the child). The CreateProcessW

@@ -1153,9 +1153,9 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 - IDE directories: `.vscode/`, `.idea/`
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
-- Git hooks and config: `.git/hooks/`, `.git/config`. Where the working directory is a worktree or a submodule, its `.git` is a file: on Linux that file is blocked, so it can be read but not changed, moved or removed.
+- Git hooks and config: `.git/hooks/`, `.git/config`. Where the working directory is a worktree or a submodule, its `.git` is a file: on Linux and Windows that file is blocked, so it can be read but not changed, moved or removed.
 
-These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
+These paths are blocked automatically, on every platform - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 
 ```bash
 $ srt 'echo "malicious" >> .bashrc'
@@ -1166,6 +1166,15 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 ```
 
 **Note (Linux):** A mandatory deny path that does not exist yet is blocked as well. bubblewrap covers it with a read-only `/dev/null`, or mounts an empty read-only directory at the first missing intermediate component, and those host mount points are removed by `cleanupAfterCommand()` — see "Write denies on paths that do not exist yet (Linux)" above. macOS uses glob patterns, which cover existing and new files alike.
+
+**Note (Windows):** Only what is there is blocked: a name that does not exist yet can be created, and is blocked from the next command on.
+
+- The names are looked for at `initialize()` in the working directory of the process, and at every command in the `cwd` given to `wrapWithSandboxArgv()`: each name down to `mandatoryDenySearchDepth` levels below it (`a\b\.bashrc`, `a\b\.git` at the default of 3), `node_modules` apart. Those under an `allowWrite` root are denied. A command writes an access list only for a name that is new, or that is another file than the one denied (git and most editors write a file by putting a new one in its place); until that command, such a file is writable.
+- A symbolic link or junction is passed over, at one of these names and on the way to one: it is neither followed nor denied.
+- Where `.git` is a file, `hooks` and `config` are also blocked in the directories it leads to, as far as they lie under an `allowWrite` root: the git directory of a linked worktree and the repository it belongs to, or `.git\modules\<name>` for a submodule.
+- They are denies beneath a kept root like any other (see "Write grants on `allowWrite` roots are kept between sessions"): kept with it, and not removed by a later session. So `.git\config`, once blocked, stays blocked for a later session with `filesystem.allowGitConfig` until `srt-win acl forget <root>`.
+- Every directory between a path the session denies (`denyRead`, `denyWrite`, these names) and the kept root above it can be neither renamed nor removed from inside the sandbox, so that the name cannot be moved aside and made anew. Of kept roots one inside another the outermost counts, whether or not this session holds it, and each is forgotten for itself. What is in those directories is as writable as before. The first deny in a tree has Windows rewrite the access list of everything beneath the root, once, as the root's own grant did.
+- A file with a second hard link cannot be denied: `initialize()`, or the wrap, fails with `acl_grant_failed` and names it. A sandboxed command can bring that about with a file it makes itself (`.mcp.json` and a hard link to it), and no command runs there until one of the two names is removed from outside the sandbox. With a `.git` file of its own making it can likewise have `hooks` and `config` denied in any directory under the root.
 
 **Pinned directories (Linux):** Every existing ancestor of a protected path (a write-denied path, a read-denied file or directory, a masked credential file) up to the allowed write root covering it is made a mountpoint — "pinned" — and cannot be renamed or removed from inside the sandbox: `mv` or `rmdir` of such a directory (for example a nested repository's parent) fails with `EBUSY` ("Device or resource busy"), and `rm -rf` of a nested repository leaves the pinned directories and the protected files behind (as with `.git/hooks`). A pin is buried under the mounts above it, so it never appears on a lookup path: reads, writes, creation, renames and hard links inside or across a pinned directory are unaffected.
 
