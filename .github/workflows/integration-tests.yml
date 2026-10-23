@@ -197,7 +197,11 @@ jobs:
           # and on Windows that release tries only `::1` for `localhost`,
           # where the proxy listens on 127.0.0.1. The floor itself is run by
           # the package check in release.yml.
-          node-version: '22'
+          #
+          # Windows runs 24: @microsoft/mxc-sdk 0.9 declares Node >=24, and
+          # npm leaves an optional dependency out when its engines do not
+          # match, so on 22 the MXC runner is never installed.
+          node-version: ${{ matrix.os == 'windows' && '24' || '22' }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -310,12 +314,54 @@ jobs:
           $env:SRT_WIN_TEST_HOOKS_EXE = (Resolve-Path 'vendor\srt-win-src\target\test-hooks\release\srt-win.exe').Path
           npm ci
           npm run build
+          # mxc.test.ts (the backend-agnostic boundary suite) runs in
+          # its OWN bun process, before the srt-win suites: it
+          # self-provisions srt-win and uninstalls what it installed,
+          # and the separate process keeps sandbox-manager's
+          # process-lifetime state (e.g. the once-per-process WFP
+          # verification) from leaking into winsrt's fail-closed
+          # guards. It names its backend, so a runner that can't run
+          # that backend fails: only the arm64 image is
+          # BaseContainer-capable.
+          $env:SRT_BOUNDARY_BACKEND = if ('${{ matrix.arch }}' -eq 'arm64') { 'mxc' } else { 'srt-win' }
+          bun test test/sandbox/mxc.test.ts
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw
           # block that runs on no other leg, and config-validation covers the
           # schema on a real Windows host rather than under a platform spy.
           bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
+
+      # Diagnostic only: why the MXC BaseContainer tier is or isn't available
+      # on this runner. Never fails the job.
+      - name: MXC host diagnostics (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          HUSKY: '0'
+        run: |
+          $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          "OS: $($cv.ProductName) $($cv.EditionID) $($cv.InstallationType) $($cv.DisplayVersion) build $($cv.CurrentBuild).$($cv.UBR)"
+          $dll = Get-Item "$env:SystemRoot\System32\processmodel.dll" -ErrorAction SilentlyContinue
+          "processmodel.dll: $(if ($dll) { $dll.VersionInfo.FileVersion } else { 'absent' })"
+          foreach ($id in 61389575, 61155944) {
+            foreach ($priority in 4, 8) {
+              $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FeatureManagement\Overrides\$priority\$id"
+              $state = (Get-ItemProperty $key -ErrorAction SilentlyContinue).EnabledState
+              "feature $id override $priority EnabledState: $(if ($null -eq $state) { 'unset' } else { $state })"
+            }
+          }
+          if (-not (Test-Path node_modules)) { npm ci }
+          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $wxc = "node_modules\@microsoft\mxc-sdk\bin\$arch\wxc-exec.exe"
+          if (Test-Path $wxc) {
+            "wxc-exec --probe:"
+            & $wxc --probe
+            "exit code: $LASTEXITCODE"
+          } else {
+            "wxc-exec not found at $wxc"
+          }
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'

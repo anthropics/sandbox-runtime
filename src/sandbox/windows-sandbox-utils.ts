@@ -169,6 +169,11 @@ export type WindowsSandboxErrorCode =
    * launch subcommands exit **18** ({@link SeclogonDisabledError}).
    */
   | 'seclogon_disabled'
+  /**
+   * The named `windows.backend` cannot run this configuration on this
+   * host. Nothing falls back; the caller decides what to try next.
+   */
+  | 'backend_unsupported'
 
 /**
  * Error thrown by the Windows sandbox backend. Carries a stable
@@ -4337,9 +4342,10 @@ export function mergeWindowsEnv(
 /**
  * Parse a list of `KEY=VALUE` strings (as produced by
  * {@link generateProxyEnvVars}) into an object. Splits on the FIRST
- * `=` only, so values containing `=` survive intact.
+ * `=` only, so values containing `=` survive intact. Shared with the
+ * MXC backend's broker-env assembly.
  */
-function envListToObject(list: string[]): NodeJS.ProcessEnv {
+export function envListToObject(list: readonly string[]): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}
   for (const entry of list) {
     const eq = entry.indexOf('=')

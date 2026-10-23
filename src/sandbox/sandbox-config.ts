@@ -1061,6 +1061,25 @@ export const SrtWinConfigSchema = z.object({
 })
 
 /**
+ * MXC runner location (Windows only). Locates the `wxc-exec.exe`
+ * native runner that `@microsoft/mxc-sdk` ships prebuilt under
+ * `bin/<arch>/`. Parallel to {@link SrtWinConfigSchema}. Which backend
+ * runs is the caller's choice: `windows.backend`.
+ */
+export const MxcConfigSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Path to the wxc-exec.exe runner. When unset, resolved from ' +
+        'the installed @microsoft/mxc-sdk package ' +
+        '(bin/<arch>/wxc-exec.exe) or the MXC_BIN_DIR env var, ' +
+        "mirroring the SDK's own lookup order.",
+    ),
+})
+
+/**
  * Windows-specific configuration schema. See
  * `windows-sandbox-utils.ts` for the install flow these settings
  * must agree with.
@@ -1071,6 +1090,17 @@ export const SrtWinConfigSchema = z.object({
  * `.extend()`/`.shape` it.
  */
 export const WindowsConfigSchema = z.object({
+  // TODO(next breaking release): make this required, so callers must
+  // choose a backend. Not `.default()`: that makes the inferred type
+  // required, which is the breaking change.
+  backend: z
+    .enum(['mxc', 'srt-win'])
+    .optional()
+    .describe(
+      'The Windows enforcement backend. Defaults to srt-win. initialize() ' +
+        'refuses a configuration the named backend cannot enforce; there ' +
+        'is no fallback between backends.',
+    ),
   sandboxUser: z
     .string()
     .min(1)
@@ -1114,6 +1144,9 @@ export const WindowsConfigSchema = z.object({
     'How to locate/invoke the srt-win helper binary. `srtWin.path` is ' +
       'required to use the Windows sandbox — your own (multicall) binary, ' +
       'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
+  ),
+  mxc: MxcConfigSchema.optional().describe(
+    'Where to find the MXC wxc-exec.exe runner, for backend: "mxc".',
   ),
 })
 
@@ -1560,5 +1593,6 @@ export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type GitConfig = z.infer<typeof GitConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
 export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
+export type MxcConfig = z.infer<typeof MxcConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>
