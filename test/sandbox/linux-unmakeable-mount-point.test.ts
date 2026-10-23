@@ -10,6 +10,8 @@ import {
 import { isLinux } from '../helpers/platform.js'
 import { countMounts, mountsOf } from '../helpers/bwrap-argv.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { refusal } from '../helpers/mount-point-fixtures.js'
+import { usePrivateManifestDirectory } from '../helpers/private-manifest-directory.js'
 
 const REPO_ROOT = join(import.meta.dir, '../..')
 const V9FS_MAGIC = 0x01021997
@@ -55,6 +57,9 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
   let DIR: string // a directory in it, holding the absent deny paths
   const savedCwd = process.cwd()
   const spies: Array<{ mockRestore(): void }> = []
+  // Empty at the start of each case: a plan reads what is in it before it looks
+  // at the parent, with the calls that are stood in for here.
+  const runtime = usePrivateManifestDirectory()
 
   const CAN_RUN = bwrapCanNamespace()
   // Directories of another's that this user cannot write: not root's view.
@@ -182,8 +187,13 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
         expect(mountsAt(command, join(DIR, 'absent'))).toEqual(
           planned ? [emptyDirectoryAt(join(DIR, 'absent'))] : [],
         )
-        // The parent is pinned either way, beneath the allow bind.
-        expect(mountsOf(command).indexOf(`--ro-bind ${DIR} ${DIR}`)).toBe(1)
+        // The parent is pinned either way, beneath the allow bind. The
+        // manifest of a wrap that names mount points is bound before both.
+        expect(
+          mountsOf(command)
+            .filter(mount => !mount.includes('srt-mount-points'))
+            .indexOf(`--ro-bind ${DIR} ${DIR}`),
+        ).toBe(1)
         // And the question is asked without a trace.
         expect(fs.readdirSync(DIR)).toEqual([])
       },
@@ -349,7 +359,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     it('plans it when the parent is swapped once it is open', async () => {
       swapOnce(
         'fstatSync',
-        () => true,
+        fd => real.readlinkSync(`/proc/self/fd/${String(fd)}`) === DIR,
         () => {
           fs.renameSync(DIR, join(ROOT, 'aside'))
           fs.symlinkSync('/usr', DIR)
@@ -397,7 +407,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
       }
       if (drive) onWindowsDrive()
       stub('closeSync', () => {
-        opened.push([])
+        if (opened.length === 1) opened.push([])
         return undefined
       })
 
@@ -421,6 +431,8 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     beforeEach(onWindowsDrive)
 
     const listing = () => fs.readdirSync(DIR).sort()
+    /** What is no manifest: every reading is in doubt while it is there. */
+    const junk = () => join(runtime.manifestDir(), '1-junk.json')
 
     it('makes the mount point itself, and the clean-up removes it', async () => {
       const leaf = join(DIR, 'policy.json')
@@ -437,6 +449,94 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
       expect(fs.statSync(leaf).mode & 0o777).toBe(0o444)
       expect(fs.readdirSync(join(DIR, 'absent'))).toEqual([])
       cleanupBwrapMountPoints()
+      expect(listing()).toEqual([])
+    })
+
+    it('has what it made removed as the process ends, when all it did was a wrap that came to nothing', () => {
+      // No plan held, which is what used to have the clean-up at exit set up.
+      const absent = join(DIR, 'policy.json')
+      const own = join(DIR, 'own.empty')
+      fs.writeFileSync(own, '')
+      const manifests = join(BASE, 'run', 'srt-mount-points')
+      fs.mkdirSync(manifests, { recursive: true, mode: 0o700 })
+      fs.chmodSync(join(BASE, 'run'), 0o700)
+      const junk = join(manifests, '1-junk.json')
+      const child = spawnSync(
+        process.execPath,
+        [
+          '-e',
+          `const fs = require('node:fs')
+           const statfs = fs.statfsSync
+           fs.statfsSync = (...args) => ({ ...statfs(...args), type: ${V9FS_MAGIC} })
+           const open = fs.openSync
+           fs.openSync = (p, ...rest) => {
+             if (String(p).endsWith('/policy.json')) fs.writeFileSync(${JSON.stringify(junk)}, '{}')
+             return open(p, ...rest)
+           }
+           const { wrapCommandWithSandboxLinux } = await import('./test/helpers/isolated/library.ts')
+           const refused = await wrapCommandWithSandboxLinux({
+             command: 'true',
+             needsNetworkRestriction: false,
+             writeConfig: { allowOnly: [${JSON.stringify(ROOT)}], denyWithinAllow: ${JSON.stringify([absent, own])} },
+           }).then(() => undefined, error => error)
+           console.log(refused?.code, fs.existsSync(${JSON.stringify(absent)}))
+           fs.rmSync(${JSON.stringify(junk)})`,
+        ],
+        {
+          cwd: REPO_ROOT,
+          encoding: 'utf8',
+          env: { ...process.env, XDG_RUNTIME_DIR: join(BASE, 'run') },
+        },
+      )
+      expect(child.stdout).toBe('mount_points_unreadable true\n')
+      expect(listing()).toEqual(['own.empty'])
+    })
+
+    describe.each([
+      ['file', 'policy.json', 'policy.json', 'openSync'],
+      ['directory', 'absent/policy.json', 'absent', 'mkdirSync'],
+    ] as const)(
+      'when the plan comes to nothing, the %s it made',
+      (_kind, denied, made, makes) => {
+        it.each(['a forced clean-up', 'the next wrap and its clean-up'])(
+          'is removed by %s',
+          async by => {
+            const absent = join(DIR, denied)
+            const own = join(DIR, 'own.empty')
+            fs.writeFileSync(own, '')
+            // In doubt from the moment the mount point is made: the plan has
+            // read the manifests by then.
+            stub(makes, p => {
+              if (names(p, join(DIR, made))) fs.writeFileSync(junk(), '{}')
+              return undefined
+            })
+            expect(await refusal(wrap([absent, own]))).toBe(
+              'mount_points_unreadable',
+            )
+            fs.rmSync(junk())
+            expect(listing()).toEqual([made, 'own.empty'].sort())
+            if (by === 'a forced clean-up') {
+              cleanupBwrapMountPoints({ force: true })
+            } else {
+              expect(mountsAt(await wrap([absent, own]), absent)).toEqual([
+                `--ro-bind /dev/null ${absent}`,
+              ])
+              cleanupBwrapMountPoints()
+            }
+            expect(listing()).toEqual(['own.empty'])
+          },
+        )
+      },
+    )
+
+    it('makes nothing while the manifests cannot be read, when no clean-up would remove it either', async () => {
+      fs.mkdirSync(runtime.manifestDir(), { recursive: true, mode: 0o700 })
+      fs.writeFileSync(junk(), '{}')
+      expect(
+        await refusal(
+          wrap([join(DIR, 'policy.json'), join(DIR, 'absent', 'policy.json')]),
+        ),
+      ).toBe('mount_points_unreadable')
       expect(listing()).toEqual([])
     })
 
@@ -596,7 +696,8 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
   it('asks nothing of the host for a path that needs no placeholder', async () => {
     const opened: unknown[] = []
     stub('openSync', p => {
-      opened.push(p)
+      // Every wrap looks after the manifest directories, whatever it denies.
+      if (!String(p).includes('srt-mount-points')) opened.push(p)
       return undefined
     })
     fs.writeFileSync(join(ROOT, 'file'), '')
@@ -617,7 +718,8 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
   it('asks once for deny paths that share a missing directory', async () => {
     const opened: unknown[] = []
     stub('openSync', p => {
-      opened.push(p)
+      // Every wrap looks after the manifest directories, whatever it denies.
+      if (!String(p).includes('srt-mount-points')) opened.push(p)
       return undefined
     })
 
@@ -699,7 +801,7 @@ describe.if(isLinux)('A placeholder where no mount point can be made', () => {
     () => {
       const denied = join(DIR, 'policy.json')
       const script = `
-        const { wrapCommandWithSandboxLinux } = await import('./src/sandbox/linux-sandbox-utils.ts')
+        const { wrapCommandWithSandboxLinux } = await import('./test/helpers/isolated/library.ts')
         const { spawnSync } = await import('node:child_process')
         const command = await wrapCommandWithSandboxLinux({
           command: 'echo BOOTED; echo x > ${denied}; echo x > ${join(ROOT, 'new')}',

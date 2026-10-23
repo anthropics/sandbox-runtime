@@ -15,7 +15,7 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
-import { mountsOf } from '../helpers/bwrap-argv.js'
+import { mountsOf, withoutManifestName } from '../helpers/bwrap-argv.js'
 
 /** The empty directory mounted over an absent deny path's first missing
  * component is made fresh per wrap, so its name says nothing about the plan. */
@@ -23,7 +23,7 @@ const EMPTY_MOUNT_SOURCE = /\S*claude-empty-[A-Za-z0-9]+/g
 
 /** A profile's mounts as a multiset, for the reason mountsOf gives. */
 function mountMultiset(command: string): string[] {
-  return mountsOf(command)
+  return mountsOf(withoutManifestName(command))
     .map(mount => mount.replace(EMPTY_MOUNT_SOURCE, '<empty mount source>'))
     .sort()
 }

@@ -23,6 +23,7 @@ export default [
             'eslint.config.js',
             'test/fixtures/tunnel-ends.mjs',
             'test/utils/which-node-test.mjs',
+            'test/helpers/isolated/dist-cli.mjs',
             'vendor/build-common.ts',
             'vendor/seccomp/build.ts',
             'vendor/srt-win/build.ts',
