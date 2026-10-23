@@ -123,13 +123,17 @@ describe('mux-proxy first-byte dispatch', () => {
   it.skipIf(process.platform === 'win32')(
     'answers 502, with the reason, where the backend cannot be dialled',
     async () => {
-      mux.removeBackendSocketSync()
+      if (process.platform === 'linux') {
+        await new Promise<void>(resolve => httpStub.close(() => resolve()))
+      } else {
+        mux.removeBackendSocketSync()
+      }
       const reply = await send(
         Buffer.from('CONNECT x:443 HTTP/1.1\r\nHost: x:443\r\n\r\n'),
       )
       expect(reply.toString()).toBe(
         'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n' +
-          'mux backend dial failed (ENOENT)\n',
+          `mux backend dial failed (${process.platform === 'linux' ? 'ECONNREFUSED' : 'ENOENT'})\n`,
       )
     },
   )
@@ -207,9 +211,16 @@ describe('mux-proxy first-byte dispatch', () => {
     expect(socksHits.length).toBe(0)
   })
 
-  it('removeBackendSocketSync removes the backend socket file, and close() still works', () => {
+  it('close tolerates synchronous removal of filesystem backend sockets', () => {
     const address = httpStub.address() // a path, or on Windows a port
-    if (typeof address === 'string') expect(existsSync(address)).toBe(true)
+    if (typeof address === 'string') {
+      if (process.platform === 'linux') {
+        expect(address.startsWith('\0')).toBe(true)
+        expect(existsSync(address)).toBe(false)
+      } else {
+        expect(existsSync(address)).toBe(true)
+      }
+    }
     mux.removeBackendSocketSync()
     if (typeof address === 'string') expect(existsSync(address)).toBe(false)
   })
