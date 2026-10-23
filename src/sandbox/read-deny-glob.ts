@@ -1,6 +1,6 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
-  type GlobWalkListings,
+  type GlobWalkOptions,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
@@ -59,6 +59,11 @@ function collapseReadDenyLocations({
   return kept
 }
 
+type ReadDenyGlobOptions = Pick<
+  GlobWalkOptions,
+  'anchor' | 'budget' | 'listings'
+> & { matchedLinks?: Set<string> }
+
 /**
  * Expand a read-deny glob into the paths bwrap should mount over, collapsed
  * against `reExposedPaths` (the caller's allowRead and allowWrite entries).
@@ -74,13 +79,16 @@ function collapseReadDenyLocations({
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
  * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
+ * @param opts.budget - as in `GlobWalkOptions.budget`.
  * @param opts.listings - one map for all the patterns of a configuration.
+ * @param opts.matchedLinks - receives the matches that are symbolic links, by
+ * name: what is returned for one is where it leads.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: { anchor?: string; listings?: GlobWalkListings } = {},
+  opts: ReadDenyGlobOptions = {},
 ): string[] {
   return finish(
     expandReadDenyGlobLinuxSteps(
@@ -97,13 +105,12 @@ export function* expandReadDenyGlobLinuxSteps(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
-  opts: { anchor?: string; listings?: GlobWalkListings } = {},
+  opts: ReadDenyGlobOptions = {},
 ): Steps<string[]> {
   const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
-    anchor: opts.anchor,
-    listings: opts.listings,
+    ...opts,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.
@@ -141,6 +148,7 @@ export function* expandReadDenyGlobLinuxSteps(
     if (!namedBy.has(location)) namedBy.set(location, candidate)
   }
   for (const candidate of candidates) {
+    if (walk.symlinks.has(candidate)) opts.matchedLinks?.add(candidate)
     if (walk.symlinks.has(candidate) && !walk.realOf.has(candidate)) {
       if (!walk.uninspectableLinks.has(candidate)) {
         // A link that resolves to nothing denies nothing, and bwrap cannot
