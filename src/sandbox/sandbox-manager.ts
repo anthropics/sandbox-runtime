@@ -1337,7 +1337,11 @@ async function initializeSteps(
             },
           })
           grant = await getWindowsProfileReadStatusAsync({ srtWin })
-        } else if (grant.state === 'current' && grant.staleAllow.length > 0) {
+        } else if (
+          grant.state === 'current' &&
+          (grant.staleAllow.length > 0 ||
+            grant.unprotected.some(u => u.entry !== undefined))
+        ) {
           // Bounded, on the noted paths alone, and never a reason not to
           // start.
           try {

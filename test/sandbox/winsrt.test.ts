@@ -1916,6 +1916,22 @@ describe('forgetWindowsProfileRead (pure, all platforms)', () => {
   })
 })
 
+describe('windowsProfileExclusionConflicts: a leading wildcard', () => {
+  const grant = {
+    exclusions: ['C:\\Users\\me\\Programs\\*\\*.WebView2\\EBWebView'],
+    ungrantedOnly: [],
+  }
+  const conflicts = (p: string) =>
+    winUtils.windowsProfileExclusionConflicts([p], grant).length
+
+  it('matches the end of a name, and only that', () => {
+    expect(
+      conflicts('C:\\Users\\me\\Programs\\App\\a.exe.WebView2\\EBWebView'),
+    ).toBe(1)
+    expect(conflicts('C:\\Users\\me\\Programs\\App\\lib\\EBWebView')).toBe(0)
+  })
+})
+
 describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   const RAW_USER = JSON.stringify({
     user: {
@@ -6924,8 +6940,12 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       for (const [what, patch] of [
         ['an older list on the same profile', {}],
         [
-          'a grant cut short',
-          { state: 'incomplete', recorded_list_version: 4 },
+          'a grant cut short after an earlier one completed',
+          {
+            state: 'incomplete',
+            recorded_list_version: 4,
+            completed_list_version: 3,
+          },
         ],
       ] as const) {
         it(`${what}: refreshed before the session starts, and the session runs on it`, async () => {
@@ -6945,19 +6965,35 @@ describe('Windows profile read grant (pure, all platforms)', () => {
 
       for (const [what, patch] of [
         [
+          'a first grant cut short: none ever completed',
+          { state: 'incomplete', recorded_list_version: 4 },
+        ],
+        [
           'a forget cut short',
-          { state: 'incomplete', last_operation: 'forget' },
+          {
+            state: 'incomplete',
+            last_operation: 'forget',
+            completed_list_version: 3,
+          },
         ],
         [
           'a run that does not say what it was',
-          { state: 'incomplete', last_operation: undefined },
+          {
+            state: 'incomplete',
+            last_operation: undefined,
+            completed_list_version: 3,
+          },
         ],
         ['another profile', { same_profile: false }],
         ['a status that does not say whose it is', { same_profile: undefined }],
         ['a record newer than this build', { recorded_list_version: 5 }],
         [
           'a run cut short on a record newer than this build',
-          { state: 'incomplete', recorded_list_version: 5 },
+          {
+            state: 'incomplete',
+            recorded_list_version: 5,
+            completed_list_version: 3,
+          },
         ],
         [
           'a record older than the narrowing range',
@@ -7030,6 +7066,24 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       describe('a current grant with stale allows', () => {
         const stale = () => ({ ...current(), stale_allow: [staleItem] })
         const retried = () => names().includes('profile retry-stale')
+
+        it('is retried too for an entry of ours on an exclusion', async () => {
+          profileStatus = {
+            toJSON: () => ({
+              ...current(),
+              unprotected: [{ ...staleItem, entry: 'explicit' }],
+            }),
+          }
+          syncResult['profile retry-stale'] = exit(0, '{"cleared":0}')
+          await SandboxManager.initialize(config())
+          expect(retried()).toBe(true)
+        })
+
+        it('is not retried for an exclusion open by its own access list', async () => {
+          profileStatus = { ...current(), unprotected: [{ ...staleItem }] }
+          await SandboxManager.initialize(config())
+          expect(retried()).toBe(false)
+        })
 
         it('is retried on those paths, and a cleared one is not warned about', async () => {
           profileStatus = {

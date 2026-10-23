@@ -598,6 +598,8 @@ const VAL_INCLUSIONS: &str = "ProfileInclusions";
 const VAL_UNGRANTED: &str = "ProfileUngranted";
 const VAL_NOTES: &str = "ProfileNotes";
 const VAL_OPERATION: &str = "ProfileOp";
+/// The list version of the last grant that ran to its end.
+const VAL_COMPLETED: &str = "ProfileCompleted";
 /// Seconds since the epoch of the last bounded retry of stale entries.
 const VAL_STALE_RETRIED: &str = "ProfileStaleRetried";
 
@@ -622,14 +624,10 @@ pub enum NoteClass {
     /// be readable, and the allow could not be removed. Not on the
     /// exclusion list: it has merely left the grant.
     StaleAllow,
-    /// A [`NoteClass::StaleAllow`] whose entry is gone from the directory
-    /// itself, with copies of it left on objects beneath. The directory's
-    /// own access list cannot show that, so it stands until the next run.
+    /// A [`NoteClass::StaleAllow`] its own access list cannot settle: copies
+    /// of the entry left on objects beneath it, or a new entry wanted on it.
+    /// It stands until the revoke is seen to be done.
     StaleBeneath,
-    /// A [`NoteClass::StaleAllow`] on a path still in the grant, granted
-    /// whole earlier and child by child now: its new entry is wanted, so
-    /// retrying it writes that rather than taking the entry off.
-    StaleInPlan,
     /// An entry to revoke on a volume that cannot be reached now. It may
     /// still be there; it is retried, and reported as `stale_allow`.
     Unreachable,
@@ -659,7 +657,6 @@ impl NoteClass {
             NoteClass::Unprotected => "unprotected",
             NoteClass::StaleAllow => "stale_allow",
             NoteClass::StaleBeneath => "stale_beneath",
-            NoteClass::StaleInPlan => "stale_in_plan",
             NoteClass::Unreachable => "unreachable",
             NoteClass::OurAllow => "our_allow",
             NoteClass::OurAllowAbove => "our_allow_above",
@@ -668,18 +665,33 @@ impl NoteClass {
 
     /// Every class a record can carry: those reported, the two that
     /// are reported as `unprotected`, and the three reported as `stale_allow`.
-    const RECORDED: [NoteClass; 10] = [
+    const RECORDED: [NoteClass; 9] = [
         NoteClass::NotGranted,
         NoteClass::SelfClosed,
         NoteClass::Unverifiable,
         NoteClass::Unprotected,
         NoteClass::StaleAllow,
         NoteClass::StaleBeneath,
-        NoteClass::StaleInPlan,
         NoteClass::Unreachable,
         NoteClass::OurAllow,
         NoteClass::OurAllowAbove,
     ];
+
+    /// Whether a note of this class reports a revoke not yet done.
+    fn is_revoke(self) -> bool {
+        matches!(
+            self,
+            NoteClass::StaleAllow
+                | NoteClass::StaleBeneath
+                | NoteClass::Unreachable
+                | NoteClass::OurAllow
+                | NoteClass::OurAllowAbove
+        )
+    }
+
+    fn parse(s: &str) -> Option<NoteClass> {
+        NoteClass::RECORDED.into_iter().find(|c| c.as_str() == s)
+    }
 }
 
 /// Which run wrote the record: a run cut short is finished by running
@@ -725,9 +737,7 @@ impl Note {
         let mut it = s.splitn(3, '|');
         let class = it.next()?;
         Some(Note {
-            class: NoteClass::RECORDED
-                .into_iter()
-                .find(|c| c.as_str() == class)?,
+            class: NoteClass::parse(class)?,
             path: it.next()?.to_owned(),
             reason: it.next().unwrap_or_default().to_owned(),
         })
@@ -883,6 +893,9 @@ pub struct Marker {
     /// The operation that last wrote the record. `None` on a record from
     /// a build that did not say.
     pub operation: Option<Operation>,
+    /// The list version of the last grant that ran to its end. `None`: no
+    /// run has, so a run cut short was the first, and nothing was agreed to.
+    pub completed_list: Option<u32>,
 }
 
 impl Marker {
@@ -942,6 +955,7 @@ pub fn read_marker_at(key: &str) -> Result<Marker> {
             .filter_map(|s| Note::decode(s))
             .collect(),
         operation: k.get_sz(VAL_OPERATION)?.and_then(|s| Operation::parse(&s)),
+        completed_list: k.get_sz(VAL_COMPLETED)?.and_then(|s| s.parse().ok()),
     })
 }
 
@@ -963,6 +977,10 @@ fn write_marker(key: &str, m: &Marker) -> Result<()> {
         Some(op) => k.set_sz(VAL_OPERATION, op.as_str())?,
         None => reg::delete_value(&k, VAL_OPERATION)?,
     }
+    match m.completed_list {
+        Some(v) => k.set_sz(VAL_COMPLETED, &v.to_string())?,
+        None => reg::delete_value(&k, VAL_COMPLETED)?,
+    }
     match &m.header {
         Some(h) => k.set_sz(VAL_HEADER, &h.encode()),
         None => reg::delete_value(&k, VAL_HEADER),
@@ -982,6 +1000,7 @@ fn clear_marker(key: &str) -> Result<()> {
             VAL_PATHS,
             VAL_NOTES,
             VAL_OPERATION,
+            VAL_COMPLETED,
             VAL_STALE_RETRIED,
         ] {
             reg::delete_value(&k, v)?;
@@ -1066,12 +1085,114 @@ fn upsert_row(
     Ok(())
 }
 
-/// The recorded paths of both stores, the database's entry first
-/// where both have one (it is the newer).
+/// An entry of the grant being taken back. The row is written before the
+/// first walk or change of kind and deleted only once the whole tree has
+/// been checked, so that what a run reports cannot lose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Revoke {
+    /// The path as it was, with what it carried as its kind.
+    row: Recorded,
+    /// What it is to carry instead; `None`: nothing.
+    wanted: Option<Kind>,
+    /// Why it is not done yet, for the warning.
+    class: NoteClass,
+    reason: String,
+}
+
+fn revokes(conn: &Connection) -> Result<Vec<Revoke>> {
+    let mut s = conn.prepare(
+        "SELECT canonical_path, file_id, kind, created, wanted, class, reason \
+         FROM profile_revokes",
+    )?;
+    let rows = s.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Vec<u8>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, String>(5)?,
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, id, kind, created, wanted, class, reason) = row?;
+        out.push(Revoke {
+            row: Recorded {
+                kind: Kind::parse(&kind)
+                    .ok_or_else(|| anyhow!("profile_revokes holds kind '{kind}' for '{path}'"))?,
+                created: created != 0,
+                file_id: FileId::from_bytes(&id).ok(),
+                path,
+            },
+            wanted: wanted.as_deref().and_then(Kind::parse),
+            class: NoteClass::parse(&class).unwrap_or(NoteClass::StaleAllow),
+            reason,
+        });
+    }
+    Ok(out)
+}
+
+/// Record that `r` is being taken back. What it carried stays as first
+/// recorded: a later run's row may already say what it is to become.
+fn pend_revoke(conn: &Connection, r: &Recorded, wanted: Option<Kind>) -> Result<()> {
+    let id = r.file_id.map(|i| i.as_bytes().to_vec()).unwrap_or_default();
+    conn.execute(
+        "INSERT INTO profile_revokes \
+           (canonical_path, file_id, kind, created, wanted, class, reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(canonical_path) DO UPDATE SET wanted = excluded.wanted",
+        params![
+            r.path,
+            id,
+            r.kind.as_str(),
+            i64::from(r.created),
+            wanted.map(Kind::as_str),
+            NoteClass::StaleAllow.as_str(),
+            "taking its entry back has not finished, so it may still be readable to \
+             sandboxed commands; it is tried again",
+        ],
+    )
+    .context("record a pending revoke")?;
+    Ok(())
+}
+
+fn finish_revoke(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM profile_revokes WHERE canonical_path = ?1",
+        params![path],
+    )
+    .context("clear a pending revoke")?;
+    Ok(())
+}
+
+fn note_revoke(conn: &Connection, path: &str, class: NoteClass, reason: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE profile_revokes SET class = ?2, reason = ?3 WHERE canonical_path = ?1",
+        params![path, class.as_str(), reason],
+    )
+    .context("note why a revoke is pending")?;
+    Ok(())
+}
+
+/// The recorded paths of both stores, the database's entry first where
+/// both have one (it is the newer). A path being taken back is listed
+/// with what it carried, whatever its row says it is to become, and even
+/// if its row has gone.
 fn all_recorded(store: &Store<'_>, marker: &Marker) -> Result<Vec<Recorded>> {
+    let pending = revokes(store.conn)?;
     let mut out = db_rows(store.conn)?;
+    for r in &mut out {
+        if let Some(p) = pending
+            .iter()
+            .find(|p| p.row.path.eq_ignore_ascii_case(&r.path))
+        {
+            r.kind = p.row.kind;
+        }
+    }
     let mut seen: HashSet<String> = out.iter().map(|r| r.path.to_lowercase()).collect();
-    for r in &marker.paths {
+    for r in pending.iter().map(|p| &p.row).chain(&marker.paths) {
         if seen.insert(r.path.to_lowercase()) {
             out.push(r.clone());
         }
@@ -1422,9 +1543,7 @@ impl Report {
             NoteClass::Unprotected | NoteClass::OurAllow | NoteClass::OurAllowAbove => {
                 self.unprotected.push(item)
             }
-            NoteClass::StaleAllow | NoteClass::StaleBeneath | NoteClass::StaleInPlan => {
-                self.stale_allow.push(item)
-            }
+            NoteClass::StaleAllow | NoteClass::StaleBeneath => self.stale_allow.push(item),
             NoteClass::Unreachable => self.stale_allow.push(Item {
                 volume: true,
                 protected_exclusion: Some(false),
@@ -1443,9 +1562,10 @@ impl Report {
                     class: match (class, i.entry, i.above) {
                         (NoteClass::Unprotected, Some(_), false) => NoteClass::OurAllow,
                         (NoteClass::Unprotected, Some(_), true) => NoteClass::OurAllowAbove,
-                        (NoteClass::StaleAllow, _, true) => NoteClass::StaleInPlan,
                         (NoteClass::StaleAllow, _, _) if i.volume => NoteClass::Unreachable,
-                        (NoteClass::StaleAllow, _, _) if i.beneath => NoteClass::StaleBeneath,
+                        (NoteClass::StaleAllow, _, _) if i.beneath || i.above => {
+                            NoteClass::StaleBeneath
+                        }
                         _ => class,
                     },
                     path: i.path.clone(),
@@ -1673,7 +1793,8 @@ const COPIES_NAMED: usize = 8;
 
 /// The objects beneath the directory `dir` that still carry a copy of
 /// an allow of the sandbox group, up to [`COPIES_NAMED`]; one that
-/// cannot be examined counts. Nothing is followed through a link, and a
+/// cannot be examined counts. A link, a placeholder or an entry with an
+/// unusable name has its own access list read and is not gone into, and a
 /// directory with an entry of the group's own is that entry's business.
 fn copies_beneath(dir: &str, ids: &Ids) -> Vec<String> {
     let group = |sid: &str| {
@@ -1693,13 +1814,17 @@ fn copies_beneath(dir: &str, ids: &Ids) -> Vec<String> {
                 continue;
             }
         };
-        for e in entries.iter().filter(|e| e.skip.is_none()) {
+        for e in &entries {
             let p = format!("{d}\\{}", e.name.long);
             let aces = open_bare(&p, READ_CONTROL)
                 .and_then(|h| acl::read_aces_at(acl::DaclTarget::Handle(h.raw(), &p)));
             let keep = match aces {
                 Ok(aces) => {
-                    if e.is_dir && !aces.iter().any(|a| group(&a.sid) && !a.inherited) {
+                    if plan::descends_for_copies(
+                        e.is_dir,
+                        e.skip.is_some(),
+                        aces.iter().any(|a| group(&a.sid) && !a.inherited),
+                    ) {
                         pending.push(p.clone());
                     }
                     aces.iter().any(|a| group(&a.sid) && a.inherited && !a.deny)
@@ -1836,6 +1961,7 @@ fn stamp(
             if !remaining.is_empty() {
                 return unfinished(None, remaining);
             }
+            finish_revoke(store.conn, path)?;
             Ok(if wrote {
                 Stamped::Wrote
             } else {
@@ -1854,6 +1980,7 @@ fn stamp(
                     "srt-win: profile grant: '{path}' carries its entry; not every object \
                      below it could be updated ({e:#})"
                 );
+                finish_revoke(store.conn, path)?;
                 Ok(Stamped::Wrote)
             } else {
                 Err(e)
@@ -1880,9 +2007,16 @@ fn converge_revoke(conn: &Connection, ids: &Ids, path: &str, o: &Opened) -> Resu
 
 /// Take a recorded path out of the grant: remove its row, and the
 /// group's ACE from the recorded object — at its path, or wherever
-/// its file id is now ([`plan::revoke_action`]).
+/// its file id is now ([`plan::revoke_action`]). Its pending revoke goes
+/// with the row, and only then: anything else leaves it to be retried.
 fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
     use plan::{FoundById, RecordedAt, RevokeAction};
+    if plan::grants_reading(r.kind) {
+        pend_revoke(store.conn, r, None)?;
+    }
+    // A directory's entry handed reading down: taking it off counts only
+    // once what it handed down is gone too.
+    let hands_down = plan::hands_reading_down(r.kind);
     let is_dir = match r.kind {
         Kind::Container | Kind::Granted => Some(true),
         Kind::File => Some(false),
@@ -1907,10 +2041,21 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
             path_id::OpenFailure::Other
                 if is_access_denied(&e) && nothing_of_ours_on(&r.path, ids) =>
             {
+                if hands_down {
+                    let remaining = copies_beneath(&r.path, ids);
+                    if !remaining.is_empty() {
+                        return Err(UnfinishedRevoke {
+                            cause: Some(format!("{e:#}")),
+                            remaining,
+                        }
+                        .into());
+                    }
+                }
                 store.conn.execute(
                     "DELETE FROM profile_paths WHERE canonical_path = ?1",
                     params![r.path],
                 )?;
+                finish_revoke(store.conn, &r.path)?;
                 return Ok(Stripped::Absent);
             }
             path_id::OpenFailure::Other => {
@@ -1969,9 +2114,6 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
             }));
         }
     }
-    // A directory's entry handed reading down: taking it off counts only
-    // once what it handed down is gone too.
-    let hands_down = plan::hands_reading_down(r.kind);
     let tx = store
         .conn
         .unchecked_transaction()
@@ -2014,12 +2156,18 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
         }
     }
     if let Some((p, id, why)) = unfinished {
-        // Recorded as carrying nothing, so that nothing writes the old
-        // entry back, and as unfinished, so that the walk is made again.
+        // No row, so that nothing writes the old entry back; the walk is
+        // owed, and the pending revoke says what to retry.
         drop(tx);
-        upsert_row(store.conn, &r.path, r.file_id, Kind::Ungranted, r.created)?;
+        store.conn.execute(
+            "DELETE FROM profile_paths WHERE canonical_path = ?1",
+            params![r.path],
+        )?;
         persist::mark_write_unfinished(store.conn, p, id)?;
         return Err(why.into());
+    }
+    if !deferred {
+        finish_revoke(&tx, &r.path)?;
     }
     tx.commit().context("commit profile strip")?;
     Ok(match (deferred, removed) {
@@ -2207,8 +2355,34 @@ pub fn grant(
     let planned_keys: HashSet<String> = planned.iter().map(|(p, _)| p.to_lowercase()).collect();
 
     // What an earlier run recorded.
-    let before = all_recorded(store, &old)?;
-    let is_allow = |k: Kind| matches!(k, Kind::Container | Kind::Granted | Kind::File);
+    let pending_at_start = revokes(store.conn)?;
+    let is_pending = |path: &str| {
+        pending_at_start
+            .iter()
+            .any(|p| p.row.path.eq_ignore_ascii_case(path))
+    };
+    let db_kinds: Vec<(String, Kind)> = db_rows(store.conn)?
+        .into_iter()
+        .map(|r| (r.path.to_lowercase(), r.kind))
+        .collect();
+    let in_db = |path: &str| {
+        let lower = path.to_lowercase();
+        db_kinds.iter().find(|(p, _)| *p == lower).map(|(_, k)| *k)
+    };
+    // Resuming a run that was cut short: what it finished is not redone.
+    let cut_short_grant =
+        old.operation == Some(Operation::Grant) && old.header.as_ref().is_some_and(|h| !h.complete);
+    let database_has_rows = !db_kinds.is_empty();
+    let mut before = all_recorded(store, &old)?;
+    before.retain(|r| {
+        !plan::row_finished_by_cut_short_grant(
+            cut_short_grant,
+            database_has_rows,
+            in_db(&r.path).is_some(),
+            is_pending(&r.path),
+        )
+    });
+    let is_allow = plan::grants_reading;
     let earlier = |path: &str| before.iter().find(|r| r.path.eq_ignore_ascii_case(path));
 
     // The record goes first, marked incomplete, so that a run that is
@@ -2230,6 +2404,14 @@ pub fn grant(
         file_id: root_id,
         profile: profile.to_owned(),
     };
+    // A run from before this was recorded says so by being complete.
+    let completed_list = plan::completed_list_at_start(
+        old.header
+            .as_ref()
+            .filter(|h| h.complete)
+            .map(|h| h.list_version),
+        old.completed_list,
+    );
     let mut pre = before.clone();
     let known: HashSet<String> = pre.iter().map(|r| r.path.to_lowercase()).collect();
     for (path, n) in &planned {
@@ -2255,8 +2437,30 @@ pub fn grant(
             paths: pre,
             notes: old.notes.clone(),
             operation: Some(Operation::Grant),
+            completed_list,
         },
     )?;
+
+    // Every revoke of this run, before anything is walked or changed.
+    {
+        let wanted = |path: &str| {
+            planned
+                .iter()
+                .find(|(p, _)| p.eq_ignore_ascii_case(path))
+                .map(|(_, n)| n.kind)
+        };
+        let tx = store
+            .conn
+            .unchecked_transaction()
+            .context("begin recording revokes")?;
+        for r in &before {
+            let w = wanted(&r.path);
+            if is_pending(&r.path) || plan::revoke_begins(r.kind, w) {
+                pend_revoke(&tx, r, w)?;
+            }
+        }
+        tx.commit().context("commit recording revokes")?;
+    }
 
     // Excluded directories that are not there yet.
     let mut created_now: HashSet<&str> = HashSet::new();
@@ -2322,19 +2526,19 @@ pub fn grant(
         let unfinished = why.downcast_ref::<UnfinishedRevoke>();
         if wanted.is_some()
             && unfinished.is_none()
-            && plan::record_without_entry(r.kind, holds_entry(path, ids))
+            && plan::record_without_entry(r.kind, is_pending(path), holds_entry(path, ids))
         {
             return Ok(false);
         }
-        // The stamp may have got as far as recording the new kind. Not
-        // an unfinished revoke: its record says what is to happen next.
-        if unfinished.is_none() {
-            upsert_row(store.conn, &r.path, r.file_id, r.kind, r.created)?;
+        // The stamp may have got as far as recording the new kind: put back
+        // what the row said when this run began. Not an unfinished revoke:
+        // its entry is off, and the row must not ask for it again.
+        if unfinished.is_none()
+            && let Some(kind) = in_db(path)
+        {
+            upsert_row(store.conn, &r.path, r.file_id, kind, r.created)?;
         }
-        match (
-            plan::may_carry_allow(r.kind),
-            wanted.map(|n| is_allow(n.kind)),
-        ) {
+        match (is_allow(r.kind), wanted.map(|n| is_allow(n.kind))) {
             // An allow of ours stays on a path that is no longer to be readable:
             // on the exclusion list now it is `OurAllow`, otherwise `StaleAllow`.
             (true, Some(false)) | (true, None) => {
@@ -2440,18 +2644,13 @@ pub fn grant(
         Ok(true)
     };
 
-    // The earlier entry handed reading down, or an earlier run could not
-    // finish taking that back; the new one hands nothing down.
+    // A revoke of something that handed reading down, and the new entry
+    // hands nothing down. Read from the record, not from the row: a run cut
+    // short may already have written the new kind.
     let revoking = |path: &str, n: &Node| {
         n.is_dir
-            && n.kind != Kind::Granted
-            && (earlier(path).is_some_and(|r| matches!(r.kind, Kind::Granted | Kind::Ungranted))
-                || old.notes.iter().any(|x| {
-                    matches!(
-                        x.class,
-                        NoteClass::StaleBeneath | NoteClass::StaleInPlan | NoteClass::OurAllowAbove
-                    ) && x.path.eq_ignore_ascii_case(path)
-                }))
+            && !plan::hands_reading_down(n.kind)
+            && earlier(path).is_some_and(|r| plan::hands_reading_down(r.kind))
     };
 
     // 0. A write root kept from an earlier session that no session could
@@ -2586,6 +2785,7 @@ pub fn grant(
                 // by its identity and cleared, if it can be.
                 match earlier(path) {
                     Some(r) => {
+                        // `strip` keeps the revoke pending if it cannot finish.
                         if let Err(e) = strip(store, ids, r) {
                             keeps_earlier(&mut report, path, None, &e)?;
                         }
@@ -2632,6 +2832,7 @@ pub fn grant(
     header.complete = true;
     report.complete = true;
     let paths = db_rows(store.conn)?;
+    settle_revokes(store.conn, &mut report)?;
     let notes = report.notes();
     write_marker(
         store.key,
@@ -2646,6 +2847,7 @@ pub fn grant(
             paths,
             notes,
             operation: Some(Operation::Grant),
+            completed_list: Some(plan::LIST_VERSION),
         },
     )?;
     report.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -2653,6 +2855,38 @@ pub fn grant(
     report.tree_walks = writes_after.0 - writes_before.0;
     report.local_writes = writes_after.1 - writes_before.1;
     Ok(report)
+}
+
+/// Bring the pending revokes and the report into line: what this run
+/// found is kept as why each is pending, and one this run said nothing
+/// about is reported as it stood. No pending revoke goes unreported.
+fn settle_revokes(conn: &Connection, report: &mut Report) -> Result<()> {
+    let noted = report.notes();
+    for r in revokes(conn)? {
+        let path = &r.row.path;
+        match noted
+            .iter()
+            .find(|n| n.class.is_revoke() && n.path.eq_ignore_ascii_case(path))
+        {
+            Some(n) => note_revoke(conn, path, n.class, &n.reason)?,
+            None => report.note_item(r.class, revoke_item(&r)),
+        }
+    }
+    Ok(())
+}
+
+/// A pending revoke as an item of the class it is noted with.
+fn revoke_item(r: &Revoke) -> Item {
+    let ours = matches!(r.class, NoteClass::OurAllow | NoteClass::OurAllowAbove);
+    Item {
+        path: r.row.path.clone(),
+        reason: r.reason.clone(),
+        protected_exclusion: Some(ours),
+        entry: ours.then_some("explicit"),
+        above: r.class == NoteClass::OurAllowAbove,
+        beneath: r.class == NoteClass::StaleBeneath,
+        ..Default::default()
+    }
 }
 
 // ─── Retry ──────────────────────────────────────────────────────────
@@ -2667,9 +2901,9 @@ pub struct Retried {
     pub stale_allow: Vec<Item>,
 }
 
-/// Try again to revoke what the last run could not, on the noted paths
-/// alone: no plan of the profile, and no walk beyond those paths. What
-/// cannot be done stays noted, and is no failure of this run.
+/// Try again to revoke what the last run could not: every pending revoke,
+/// and no plan of the profile or walk beyond those paths. What cannot be
+/// done stays pending and noted, and is no failure of this run.
 ///
 /// `budget`: run while a session starts. Only when one is due
 /// ([`plan::stale_retry_due`]), recorded before any work so that a run
@@ -2700,70 +2934,98 @@ pub fn retry_stale(
         }
         k.set_sz(VAL_STALE_RETRIED, &now.to_string())?;
     }
-    let rows = all_recorded(store, &marker)?;
     let pending: Vec<persist::PendingStrip> = if store.key == persist::MARKER_KEY {
         persist::retry_pending(store.conn, ids, !bounded)?
     } else {
         Vec::new()
     };
-    let mut notes = Vec::new();
-    for n in &marker.notes {
-        if !matches!(
-            n.class,
-            NoteClass::StaleAllow
-                | NoteClass::StaleBeneath
-                | NoteClass::StaleInPlan
-                | NoteClass::Unreachable
-        ) {
-            notes.push(n.clone());
-            continue;
-        }
-        let on_network = !path_id::is_drive_path(&n.path) || path_id::on_network_drive(&n.path);
+    let pending_revokes = revokes(store.conn)?;
+    // A revoke note with no record is from an earlier build: it stays.
+    let mut notes: Vec<Note> = marker
+        .notes
+        .iter()
+        .filter(|n| {
+            !n.class.is_revoke()
+                || !pending_revokes
+                    .iter()
+                    .any(|r| r.row.path.eq_ignore_ascii_case(&n.path))
+        })
+        .cloned()
+        .collect();
+    let mut cleared: Vec<&Recorded> = Vec::new();
+    for rv in &pending_revokes {
+        let r = &rv.row;
+        let on_network = !path_id::is_drive_path(&r.path) || path_id::on_network_drive(&r.path);
         let past_budget = budget.is_some_and(|b| started.elapsed() >= b);
-        if !plan::stale_retry_attempts(bounded, on_network, past_budget) {
+        let mut left = |class: NoteClass, reason: String| {
             out.stale_allow.push(Item {
-                path: n.path.clone(),
-                reason: n.reason.clone(),
-                protected_exclusion: Some(false),
+                path: r.path.clone(),
+                reason: reason.clone(),
+                protected_exclusion: Some(matches!(
+                    class,
+                    NoteClass::OurAllow | NoteClass::OurAllowAbove
+                )),
                 ..Default::default()
             });
-            notes.push(n.clone());
+            notes.push(Note {
+                class,
+                path: r.path.clone(),
+                reason,
+            });
+        };
+        if !plan::stale_retry_attempts(bounded, on_network, past_budget) {
+            left(rv.class, rv.reason.clone());
             continue;
         }
-        let row = rows.iter().find(|r| r.path.eq_ignore_ascii_case(&n.path));
-        let result = match row {
-            // Handed to the strips retried with its volume, just above.
-            None if pending.iter().any(|p| p.path.eq_ignore_ascii_case(&n.path)) => {
-                Err(VolumeUnreachable.into())
-            }
-            None => Ok(()),
-            Some(r) if n.class == NoteClass::StaleInPlan => {
+        let row_kind = db_rows(store.conn)?
+            .into_iter()
+            .find(|x| x.path.eq_ignore_ascii_case(&r.path))
+            .map(|x| x.kind);
+        let result = match rv.wanted {
+            // Still in the grant: what is wanted on it is written, and
+            // that takes off what it carried.
+            Some(kind) => {
                 let node = Node {
                     rel: Vec::new(),
-                    is_dir: true,
-                    kind: Kind::Container,
+                    is_dir: r.kind != Kind::File,
+                    kind,
                     missing: false,
                     stamp: true,
                     note: None,
                 };
-                stamp(store, ids, &r.path, &node, false, true)
-                    .and_then(|s| {
-                        // Not looked at: its entry may still be there.
-                        if s.reached_object() {
-                            Ok(())
-                        } else {
-                            Err(anyhow!("it could not be looked at again: {s:?}"))
-                        }
-                    })
-                    .inspect_err(|e| {
-                        if !e.is::<UnfinishedRevoke>() {
-                            let _ = upsert_row(store.conn, &r.path, r.file_id, r.kind, r.created);
-                        }
-                    })
+                stamp(
+                    store,
+                    ids,
+                    &r.path,
+                    &node,
+                    false,
+                    plan::hands_reading_down(r.kind) && !plan::hands_reading_down(kind),
+                )
+                .and_then(|s| {
+                    // Not looked at: its entry may still be there.
+                    if s.reached_object() {
+                        Ok(())
+                    } else {
+                        Err(anyhow!("it could not be looked at again: {s:?}"))
+                    }
+                })
+                .inspect_err(|e| {
+                    if !e.is::<UnfinishedRevoke>()
+                        && let Some(k) = row_kind
+                    {
+                        let _ = upsert_row(store.conn, &r.path, r.file_id, k, r.created);
+                    }
+                })
             }
-            Some(r) => match strip(store, ids, r) {
+            None if pending.iter().any(|p| p.path.eq_ignore_ascii_case(&r.path)) => {
+                Err(VolumeUnreachable.into())
+            }
+            None => match strip(store, ids, r) {
                 Ok(Stripped::Deferred) => Err(VolumeUnreachable.into()),
-                Ok(_) => Ok(()),
+                Ok(_) => {
+                    cleared.push(r);
+                    Ok(())
+                }
                 Err(e) => Err(e),
             },
         };
@@ -2774,28 +3036,19 @@ pub fn retry_stale(
             }
             Err(e) => e,
         };
-        let class = match () {
-            _ if why.is::<VolumeUnreachable>() => NoteClass::Unreachable,
-            _ if n.class == NoteClass::StaleInPlan => n.class,
-            _ if why.is::<UnfinishedRevoke>() => NoteClass::StaleBeneath,
-            _ => NoteClass::StaleAllow,
-        };
+        let class = retry_class(
+            rv.class,
+            why.is::<VolumeUnreachable>(),
+            why.is::<UnfinishedRevoke>(),
+        );
         let reason = why.downcast_ref::<UnfinishedRevoke>().map_or_else(
             || format!("{why:#}"),
             |u| format!("it is no longer part of the grant, and {}", u.line()),
         );
-        out.stale_allow.push(Item {
-            path: n.path.clone(),
-            reason: reason.clone(),
-            protected_exclusion: Some(false),
-            ..Default::default()
-        });
-        notes.push(Note {
-            class,
-            path: n.path.clone(),
-            reason,
-        });
+        note_revoke(store.conn, &r.path, class, &reason)?;
+        left(class, reason);
     }
+    remove_placeholders(cleared);
     write_marker(
         store.key,
         &Marker {
@@ -2805,6 +3058,18 @@ pub fn retry_stale(
         },
     )?;
     Ok(out)
+}
+
+/// The class a revoke keeps after a retry that failed: one that reaches
+/// an exclusion stays that, however it failed this time.
+fn retry_class(was: NoteClass, volume: bool, unfinished: bool) -> NoteClass {
+    match was {
+        NoteClass::OurAllow | NoteClass::OurAllowAbove => was,
+        _ if volume => NoteClass::Unreachable,
+        _ if unfinished => NoteClass::StaleBeneath,
+        NoteClass::StaleBeneath => was,
+        _ => NoteClass::StaleAllow,
+    }
 }
 
 // ─── Forget ─────────────────────────────────────────────────────────
@@ -2905,6 +3170,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
                     "DELETE FROM persistent_writes WHERE canonical_path = ?1",
                     params![r.path],
                 )?;
+                finish_revoke(store.conn, &r.path)?;
                 failed_paths.insert(&r.path);
                 out.deferred.push(Item {
                     path: r.path.clone(),
@@ -2929,6 +3195,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
             .collect(),
     );
     if out.failed.is_empty() {
+        store.conn.execute("DELETE FROM profile_revokes", [])?;
         clear_marker(store.key)?;
         if store.key == persist::MARKER_KEY {
             persist::marker_clear_ever_if_unused(store.conn)?;
@@ -2939,6 +3206,7 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
             &Marker {
                 notes: Vec::new(),
                 operation: Some(Operation::Forget),
+                completed_list: marker.completed_list,
                 header: marker.header.map(|h| Header {
                     complete: false,
                     ..h
@@ -3089,6 +3357,7 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         "list_version": plan::LIST_VERSION,
         "recorded_list_version": m.header.as_ref().map(|h| h.list_version),
         "last_operation": m.operation.map(Operation::as_str),
+        "completed_list_version": m.completed_list,
         "profile": m.header.as_ref().map(|h| h.profile.as_str()),
         "extra_exclusions": m.extra,
         "extra_inclusions": m.include,
@@ -3138,7 +3407,7 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
             // Copies beneath it, a new entry that is wanted, or a volume not
             // there to look at: its own access list cannot settle it, so as
             // the run found it, until the next run.
-            (NoteClass::StaleBeneath | NoteClass::StaleInPlan | NoteClass::Unreachable, _) => (
+            (NoteClass::StaleBeneath | NoteClass::Unreachable, _) => (
                 NoteClass::StaleAllow,
                 Item {
                     path: n.path.clone(),
@@ -3526,6 +3795,7 @@ mod tests {
             paths: Vec::new(),
             notes: Vec::new(),
             operation: None,
+            completed_list: None,
         };
         let check = |m: Result<Marker>, g: &[(String, bool)], admitted: &[String]| {
             check_grants_against(m, g, admitted, &|_| plan::Listing::Nothing)
@@ -4840,19 +5110,27 @@ mod tests {
         };
         let docs = canon(&prof.join("Documents"));
         let id = path_id::capture_file_id(&docs).unwrap();
-        // As `strip` leaves it: nothing wanted, the walk owed.
-        upsert_row(&conn, &docs, Some(id), Kind::Ungranted, false).unwrap();
+        // As `strip` leaves it: no row, the walk owed, the revoke pending.
+        let row = db_rows(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.path == docs)
+            .unwrap();
+        pend_revoke(&conn, &row, None).unwrap();
+        conn.execute(
+            "DELETE FROM profile_paths WHERE canonical_path = ?1",
+            params![docs],
+        )
+        .unwrap();
         persist::mark_write_unfinished(&conn, &docs, id).unwrap();
-        assert_eq!(
-            recorded_kind(&conn, &docs, id).unwrap(),
-            Some(Kind::Ungranted)
-        );
+        assert_eq!(recorded_kind(&conn, &docs, id).unwrap(), None);
         let report = grant(&store, &ids(), &layout, dropping_inclusions(), false).unwrap();
         assert!(report.stale_allow.is_empty(), "{report:?}");
         assert!(report.removed >= 1, "{report:?}");
         assert!(group_aces(&prof.join("Documents")).is_empty());
         assert!(group_aces(&prof.join(r"Documents\deep\er\x.txt")).is_empty());
         assert_eq!(recorded_kind(&conn, &docs, id).unwrap(), None);
+        assert!(revokes(&conn).unwrap().is_empty());
         forget(&store, &ids()).unwrap();
         std::fs::remove_dir_all(prof.parent().unwrap()).ok();
     }
@@ -5049,6 +5327,159 @@ mod tests {
         assert!(volume_reachable(&canon(&std::env::temp_dir())));
     }
 
+    #[test]
+    fn a_pending_revoke_a_run_says_nothing_about_is_still_reported() {
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let row = Recorded {
+            path: r"\\?\C:\gone\x".to_owned(),
+            kind: Kind::Granted,
+            created: false,
+            file_id: None,
+        };
+        pend_revoke(&conn, &row, None).unwrap();
+        let mut report = Report::default();
+        settle_revokes(&conn, &mut report).unwrap();
+        assert_eq!(report.stale_allow.len(), 1, "{report:?}");
+        // What a run found is kept as why it is pending, and reported as that.
+        note_revoke(&conn, &row.path, NoteClass::OurAllowAbove, "above").unwrap();
+        let mut report = Report::default();
+        settle_revokes(&conn, &mut report).unwrap();
+        assert_eq!(report.notes()[0].class, NoteClass::OurAllowAbove);
+        // Later kinds do not overwrite what it carried; the wanted one does.
+        let later = Recorded {
+            kind: Kind::Container,
+            ..row.clone()
+        };
+        pend_revoke(&conn, &later, Some(Kind::Container)).unwrap();
+        let got = revokes(&conn).unwrap().remove(0);
+        assert_eq!(got.row.kind, Kind::Granted);
+        assert_eq!(got.wanted, Some(Kind::Container));
+        finish_revoke(&conn, &row.path).unwrap();
+        assert!(revokes(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_retry_class_keeps_what_reaches_an_exclusion() {
+        use NoteClass::*;
+        assert_eq!(retry_class(OurAllowAbove, true, true), OurAllowAbove);
+        assert_eq!(retry_class(OurAllow, false, false), OurAllow);
+        assert_eq!(retry_class(StaleAllow, true, false), Unreachable);
+        assert_eq!(retry_class(StaleAllow, false, true), StaleBeneath);
+        assert_eq!(retry_class(StaleBeneath, false, false), StaleBeneath);
+        assert_eq!(retry_class(Unreachable, false, false), StaleAllow);
+    }
+
+    #[test]
+    fn copies_beneath_reads_a_link_and_does_not_go_into_it() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestCopiesLink";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, _layout) = granted_documents("copieslink", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let target = prof.parent().unwrap().join("target");
+        write(&target, "beyond.txt");
+        // Made after the grant, so it takes a copy of the entry from its parent.
+        std::fs::remove_dir_all(prof.join(r"Documents\deep")).unwrap();
+        junction(&prof.join(r"Documents\link"), &target);
+        let left = copies_beneath(&canon(&prof.join("Documents")), &ids());
+        assert!(left.iter().any(|p| p.ends_with("link")), "{left:?}");
+        assert!(!left.iter().any(|p| p.contains("beyond")), "{left:?}");
+        std::fs::remove_dir(prof.join(r"Documents\link")).unwrap();
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_run_resuming_a_cut_short_grant_does_not_redo_what_it_finished() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestResume";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, layout) = granted_documents("resume", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let docs = canon(&prof.join("Documents"));
+        // As a killed run leaves a finished row: gone from the database,
+        // still in the registry. Its entry is left on disk to show nothing
+        // goes back to look at it.
+        conn.execute(
+            "DELETE FROM profile_paths WHERE canonical_path = ?1",
+            params![docs],
+        )
+        .unwrap();
+        let mut m = read_marker_at(KEY).unwrap();
+        m.header.as_mut().unwrap().complete = false;
+        m.operation = Some(Operation::Grant);
+        write_marker(KEY, &m).unwrap();
+        let report = grant(&store, &ids(), &layout, dropping_inclusions(), false).unwrap();
+        assert!(report.complete, "{report:?}");
+        assert!(!group_aces(&prof.join("Documents")).is_empty());
+        assert_eq!(
+            read_marker_at(KEY).unwrap().completed_list,
+            Some(plan::LIST_VERSION)
+        );
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_revoke_waiting_for_its_volume_stays_reported_across_grants() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestWaiting";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, layout) = granted_documents("waiting", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let away = Recorded {
+            path: r"\\?\Q:\no\such\drive".to_owned(),
+            kind: Kind::Granted,
+            created: false,
+            file_id: None,
+        };
+        pend_revoke(&conn, &away, None).unwrap();
+        for _ in 0..2 {
+            let report = grant(&store, &ids(), &layout, Added::default(), false).unwrap();
+            assert!(
+                report.stale_allow.iter().any(|i| i.path == away.path),
+                "{report:?}"
+            );
+            assert_eq!(revokes(&conn).unwrap().len(), 1);
+        }
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn a_retry_covers_a_revoke_that_reaches_an_exclusion_and_removes_its_placeholder() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestRetryOurs";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, _layout, docs) = stale_documents("retryours", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        note_revoke(&conn, &docs, NoteClass::OurAllow, "excluded now").unwrap();
+        let empty = prof.join("made-empty");
+        std::fs::create_dir(&empty).unwrap();
+        let placeholder = Recorded {
+            path: canon(&empty),
+            kind: Kind::File,
+            created: true,
+            file_id: None,
+        };
+        pend_revoke(&conn, &placeholder, None).unwrap();
+        let r = retry_stale(&store, &ids(), None).unwrap();
+        assert_eq!(r.cleared, 2, "{r:?}");
+        assert!(group_aces(&prof.join("Documents")).is_empty());
+        assert!(!empty.exists(), "the placeholder went with its row");
+        assert!(revokes(&conn).unwrap().is_empty());
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
     /// Documents as a stale path: left the grant, its row kept, its entry
     /// still on it.
     fn stale_documents(
@@ -5058,6 +5489,12 @@ mod tests {
     ) -> (std::path::PathBuf, Layout, String) {
         let (prof, layout) = granted_documents(tag, key, conn);
         let docs = canon(&prof.join("Documents"));
+        let row = db_rows(conn)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.path == docs)
+            .unwrap();
+        pend_revoke(conn, &row, None).unwrap();
         let mut m = read_marker_at(key).unwrap();
         m.notes = vec![Note {
             class: NoteClass::StaleAllow,
@@ -5132,9 +5569,8 @@ mod tests {
             conn: &conn,
             key: KEY,
         };
-        let mut m = read_marker_at(KEY).unwrap();
-        m.notes[0].class = NoteClass::StaleInPlan;
-        write_marker(KEY, &m).unwrap();
+        let row = revokes(&conn).unwrap().remove(0).row;
+        pend_revoke(&conn, &row, Some(Kind::Container)).unwrap();
         let r = retry_stale(&store, &ids(), None).unwrap();
         assert_eq!(r.cleared, 1, "{r:?}");
         let aces = group_aces(&prof.join("Documents"));
