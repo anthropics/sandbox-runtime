@@ -54,6 +54,7 @@ export {
   LinuxSandboxProfileError,
   type LinuxSandboxProfileErrorCode,
 } from './sandbox/linux-sandbox-utils.js'
+export type { GlobWalkBudgetError } from './sandbox/sandbox-utils.js'
 
 // Windows install/status API
 export {
