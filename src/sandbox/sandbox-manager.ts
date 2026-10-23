@@ -68,6 +68,7 @@ import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
+  resolveInheritedStdioTtys,
 } from './macos-sandbox-utils.js'
 import {
   startLinuxSandboxViolationMonitor,
@@ -2341,6 +2342,13 @@ export type WrapWithSandboxOptions = {
    * reported as the violation's `command`. Defaults to `command`.
    */
   commandText?: string
+  /**
+   * Set only when you spawn the wrapped command with `stdio: 'inherit'`. On
+   * macOS the profile then grants `file-ioctl` on this process's terminals,
+   * which a TUI needs to enter raw mode. The caller has to say so because it
+   * picks the child's stdio after wrapping. Ignored when `allowPty` is set.
+   */
+  inheritsStdio?: boolean
 }
 
 /** A wrap that has started over this many times walks without giving the
@@ -2706,6 +2714,11 @@ async function wrapWithSandboxOnce(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
+        // true already grants every pty; false opts out
+        inheritedTtys:
+          allowPty === undefined && options?.inheritsStdio
+            ? resolveInheritedStdioTtys()
+            : undefined,
         allowGitConfig: getAllowGitConfig(),
         gitSafeDirectories,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),

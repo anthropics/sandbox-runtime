@@ -1236,7 +1236,13 @@ export const SandboxRuntimeConfigSchema = z
     allowPty: z
       .boolean()
       .optional()
-      .describe('Allow pseudo-terminal (pty) operations (macOS only)'),
+      .describe(
+        'Pseudo-terminal (pty) access (macOS only). Unset grants file-ioctl ' +
+          'on the inherited terminals so a TUI can enter raw mode, when the ' +
+          'caller spawns with inherited stdio (the CLI does). true grants ' +
+          'every pty, for programs that allocate their own (tmux, script, ' +
+          'node-pty). false grants nothing beyond the base /dev/tty rule.',
+      ),
     seccomp: SeccompConfigSchema.optional().describe(
       'Custom seccomp binary paths (Linux only).',
     ),
