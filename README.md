@@ -887,7 +887,7 @@ These configuration files are readable by sandboxed commands. That is deliberate
 | `%USERPROFILE%\.npmrc` | npm |
 | `%APPDATA%\pip\pip.ini`, `%USERPROFILE%\pip\pip.ini`, `%USERPROFILE%\.config\pip\pip.conf` | pip |
 | `%APPDATA%\NuGet\NuGet.Config` | NuGet |
-| `%USERPROFILE%\.m2\settings.xml`, `settings-security.xml` | Maven |
+| `%USERPROFILE%\.m2\settings.xml` | Maven |
 | `%USERPROFILE%\.gradle\gradle.properties` | Gradle |
 | `%USERPROFILE%\.gitconfig`, `%USERPROFILE%\.config\git\config` | git |
 
@@ -900,7 +900,7 @@ The sandboxed process has its own profile, so a tool does not look in yours by i
 | `NPM_CONFIG_USERCONFIG` | npm | |
 | `GIT_CONFIG_GLOBAL` | git 2.32+ | replaces both global files; left out when you set it yourself |
 | `PIP_CONFIG_FILE` | pip | read in addition to pip's other files |
-| `MAVEN_ARGS` (`-s <settings.xml> -Dsettings.security=<settings-security.xml>`) | Maven 3.9+ | no quotes, since `mvn` expands the variable unquoted; a path holding whitespace or a character the launchers treat specially is given by its 8.3 names, or, where no such name is free of them, the variable is withheld and `srt-win profile status` says why under `env_withheld`; older Maven needs `-s` on the command line |
+| `MAVEN_ARGS` (`-s <settings.xml>`) | Maven 3.9+ | no quotes, since `mvn` expands the variable unquoted; a path holding whitespace or a character the launchers treat specially is given by its 8.3 names, or, where no such name is free of them, the variable is withheld and `srt-win profile status` says why under `env_withheld`; older Maven needs `-s` on the command line |
 | `RUSTUP_HOME` | rustup (`cargo`, `rustc`) | a directory: your `RUSTUP_HOME` if you set one, else `%USERPROFILE%\.rustup`; without it rustup's shims find no toolchain |
 | `CARGO_HOME` | cargo | a directory: your `CARGO_HOME` if you set one, else `%USERPROFILE%\.cargo`; read-only — see below |
 | — | NuGet | no variable names the user file: pass `--configfile`, or keep a `NuGet.Config` in or above the project |
