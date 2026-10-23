@@ -599,7 +599,6 @@ const VAL_UNGRANTED: &str = "ProfileUngranted";
 const VAL_NOTES: &str = "ProfileNotes";
 const VAL_OPERATION: &str = "ProfileOp";
 /// The list version of the last grant that ran to its end.
-const VAL_COMPLETED: &str = "ProfileCompleted";
 /// Seconds since the epoch of the last bounded retry of stale entries.
 const VAL_STALE_RETRIED: &str = "ProfileStaleRetried";
 
@@ -893,9 +892,6 @@ pub struct Marker {
     /// The operation that last wrote the record. `None` on a record from
     /// a build that did not say.
     pub operation: Option<Operation>,
-    /// The list version of the last grant that ran to its end. `None`: no
-    /// run has, so a run cut short was the first, and nothing was agreed to.
-    pub completed_list: Option<u32>,
 }
 
 impl Marker {
@@ -955,7 +951,6 @@ pub fn read_marker_at(key: &str) -> Result<Marker> {
             .filter_map(|s| Note::decode(s))
             .collect(),
         operation: k.get_sz(VAL_OPERATION)?.and_then(|s| Operation::parse(&s)),
-        completed_list: k.get_sz(VAL_COMPLETED)?.and_then(|s| s.parse().ok()),
     })
 }
 
@@ -977,10 +972,6 @@ fn write_marker(key: &str, m: &Marker) -> Result<()> {
         Some(op) => k.set_sz(VAL_OPERATION, op.as_str())?,
         None => reg::delete_value(&k, VAL_OPERATION)?,
     }
-    match m.completed_list {
-        Some(v) => k.set_sz(VAL_COMPLETED, &v.to_string())?,
-        None => reg::delete_value(&k, VAL_COMPLETED)?,
-    }
     match &m.header {
         Some(h) => k.set_sz(VAL_HEADER, &h.encode()),
         None => reg::delete_value(&k, VAL_HEADER),
@@ -1000,7 +991,6 @@ fn clear_marker(key: &str) -> Result<()> {
             VAL_PATHS,
             VAL_NOTES,
             VAL_OPERATION,
-            VAL_COMPLETED,
             VAL_STALE_RETRIED,
         ] {
             reg::delete_value(&k, v)?;
@@ -2404,14 +2394,6 @@ pub fn grant(
         file_id: root_id,
         profile: profile.to_owned(),
     };
-    // A run from before this was recorded says so by being complete.
-    let completed_list = plan::completed_list_at_start(
-        old.header
-            .as_ref()
-            .filter(|h| h.complete)
-            .map(|h| h.list_version),
-        old.completed_list,
-    );
     let mut pre = before.clone();
     let known: HashSet<String> = pre.iter().map(|r| r.path.to_lowercase()).collect();
     for (path, n) in &planned {
@@ -2437,7 +2419,6 @@ pub fn grant(
             paths: pre,
             notes: old.notes.clone(),
             operation: Some(Operation::Grant),
-            completed_list,
         },
     )?;
 
@@ -2847,7 +2828,6 @@ pub fn grant(
             paths,
             notes,
             operation: Some(Operation::Grant),
-            completed_list: Some(plan::LIST_VERSION),
         },
     )?;
     report.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -3206,7 +3186,6 @@ pub fn forget(store: &Store<'_>, ids: &Ids) -> Result<Forgotten> {
             &Marker {
                 notes: Vec::new(),
                 operation: Some(Operation::Forget),
-                completed_list: marker.completed_list,
                 header: marker.header.map(|h| Header {
                     complete: false,
                     ..h
@@ -3357,7 +3336,6 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         "list_version": plan::LIST_VERSION,
         "recorded_list_version": m.header.as_ref().map(|h| h.list_version),
         "last_operation": m.operation.map(Operation::as_str),
-        "completed_list_version": m.completed_list,
         "profile": m.header.as_ref().map(|h| h.profile.as_str()),
         "extra_exclusions": m.extra,
         "extra_inclusions": m.include,
@@ -3795,7 +3773,6 @@ mod tests {
             paths: Vec::new(),
             notes: Vec::new(),
             operation: None,
-            completed_list: None,
         };
         let check = |m: Result<Marker>, g: &[(String, bool)], admitted: &[String]| {
             check_grants_against(m, g, admitted, &|_| plan::Listing::Nothing)
@@ -5416,10 +5393,6 @@ mod tests {
         let report = grant(&store, &ids(), &layout, dropping_inclusions(), false).unwrap();
         assert!(report.complete, "{report:?}");
         assert!(!group_aces(&prof.join("Documents")).is_empty());
-        assert_eq!(
-            read_marker_at(KEY).unwrap().completed_list,
-            Some(plan::LIST_VERSION)
-        );
         forget(&store, &ids()).unwrap();
         std::fs::remove_dir_all(prof.parent().unwrap()).ok();
     }

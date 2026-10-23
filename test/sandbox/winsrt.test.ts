@@ -6940,12 +6940,8 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       for (const [what, patch] of [
         ['an older list on the same profile', {}],
         [
-          'a grant cut short after an earlier one completed',
-          {
-            state: 'incomplete',
-            recorded_list_version: 4,
-            completed_list_version: 3,
-          },
+          'a grant cut short',
+          { state: 'incomplete', recorded_list_version: 4 },
         ],
       ] as const) {
         it(`${what}: refreshed before the session starts, and the session runs on it`, async () => {
@@ -6965,15 +6961,10 @@ describe('Windows profile read grant (pure, all platforms)', () => {
 
       for (const [what, patch] of [
         [
-          'a first grant cut short: none ever completed',
-          { state: 'incomplete', recorded_list_version: 4 },
-        ],
-        [
           'a forget cut short',
           {
             state: 'incomplete',
             last_operation: 'forget',
-            completed_list_version: 3,
           },
         ],
         [
@@ -6981,7 +6972,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           {
             state: 'incomplete',
             last_operation: undefined,
-            completed_list_version: 3,
           },
         ],
         ['another profile', { same_profile: false }],
@@ -6992,7 +6982,6 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           {
             state: 'incomplete',
             recorded_list_version: 5,
-            completed_list_version: 3,
           },
         ],
         [

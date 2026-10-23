@@ -3388,8 +3388,6 @@ export interface WindowsProfileGrantStatus {
   /** The list version of this `srt-win`, and the one the grant was made with. */
   listVersion?: number
   recordedListVersion?: number
-  /** The list version of the last grant that ran to its end, if any did. */
-  completedListVersion?: number
   /** Which operation last wrote the record, when `srt-win` says. */
   lastOperation?: 'grant' | 'forget'
   /** The record was made for the profile directory that is there now. */
@@ -3458,7 +3456,6 @@ type RawProfileStatus = {
   list_version?: unknown
   recorded_list_version?: unknown
   last_operation?: unknown
-  completed_list_version?: unknown
   same_profile?: unknown
   capabilities?: unknown
   not_granted?: unknown
@@ -3528,10 +3525,9 @@ export const WINDOWS_PROFILE_NARROWING_LIST_VERSIONS = { from: 3, to: 4 }
 
 /**
  * Whether `initialize()` brings this grant up to date by itself: an
- * older list on the same profile, or a grant cut short after an earlier
- * one completed. Not a first grant that was cut short (nothing was ever
- * agreed to), a forget that was cut short, another profile, or a record
- * newer than this `srt-win`.
+ * older list on the same profile, or a grant that was cut short, which
+ * finishes what its caller started. Not a forget that was cut short,
+ * another profile, or a record newer than this `srt-win`.
  */
 export function windowsProfileGrantRefreshable(
   status: WindowsProfileGrantStatus,
@@ -3543,11 +3539,7 @@ export function windowsProfileGrantRefreshable(
   }
   if (recorded < from || recorded > list || list > to) return false
   if (status.state === 'outdated') return recorded < list
-  return (
-    status.state === 'incomplete' &&
-    status.lastOperation === 'grant' &&
-    status.completedListVersion !== undefined
-  )
+  return status.state === 'incomplete' && status.lastOperation === 'grant'
 }
 
 function stringList(v: unknown): string[] | undefined {
@@ -3603,9 +3595,6 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     }),
     ...(typeof raw.recorded_list_version === 'number' && {
       recordedListVersion: raw.recorded_list_version,
-    }),
-    ...(typeof raw.completed_list_version === 'number' && {
-      completedListVersion: raw.completed_list_version,
     }),
     ...((raw.last_operation === 'grant' || raw.last_operation === 'forget') && {
       lastOperation: raw.last_operation,
