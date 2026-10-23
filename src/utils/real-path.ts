@@ -104,6 +104,16 @@ export function wayTo(folded: string): {
       )
     }
     const target = textOf(fs.readlinkSync, next)
+    // Kernels differ on a trailing slash after a followed link. A successful
+    // probe settles that requirement; the target still needs its links walked.
+    if (rest.length > 0 && rest.every(name => name === '')) {
+      try {
+        fs.statSync(`${next}/`)
+        rest.length = 0
+      } catch {
+        // An unresolved probe must not override the walk's error or partial path.
+      }
+    }
     if (target.startsWith('/')) real = ''
     rest.unshift(...target.split('/'))
   }

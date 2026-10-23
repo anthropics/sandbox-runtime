@@ -108,6 +108,15 @@ describe.if(!isWindows)('realPathOf', () => {
       ['a\\b/up-from-a-file', 'file/..'],
       ['a\\b/in-a-file', 'file/.'],
       ['a\\b/file-as-a-directory', 'file/'],
+      ['a\\b/file-link', 'file'],
+      ['a\\b/absolute-file-link', at('a\\b/file')],
+      ['a\\b/directory-link', 'in'],
+      ['a\\b/slash-after-file-link', 'file-link/'],
+      ['a\\b/slashes-after-file-link', 'file-link///'],
+      ['a\\b/slash-after-absolute-file-link', 'absolute-file-link/'],
+      ['a\\b/slash-after-directory-link', 'directory-link/'],
+      ['a\\b/through-file', 'file/sub'],
+      ['a\\b/slash-after-through-file', 'through-file/'],
       ['a\\b/up-from-shut', '../shut\\/..'],
       ['a\\b/1', 'file'],
       ['plain/out', '../a/b'],
@@ -117,6 +126,7 @@ describe.if(!isWindows)('realPathOf', () => {
       fs.symlinkSync(target!, at(link!))
     }
     for (let i = 2; i <= 41; i++) fs.symlinkSync(`${i - 1}`, at(`a\\b/${i}`))
+    fs.symlinkSync('40/', at('a\\b/slash-after-40-links'))
     fs.chmodSync(at('shut\\'), 0o600)
   })
 
@@ -191,6 +201,68 @@ describe.if(!isWindows)('realPathOf', () => {
       ...FAILS.map(([, code]) => code),
     ])
   }, 30_000)
+
+  it("keeps the kernel's trailing-slash rule after following a link", () => {
+    const paths = [
+      'a\\b/slash-after-file-link',
+      'a\\b/slashes-after-file-link',
+      'a\\b/slash-after-absolute-file-link',
+      'a\\b/slash-after-directory-link',
+    ].map(at)
+    const answers = inNode(paths)
+    paths.forEach((p, i) => {
+      const real = answer(() => realPathOf(p))
+      const there = answers[i]![0]!
+      const kernel = fileAt(p)
+      console.log(`${p}: kernel ${kernel}; here ${real}; Node ${there}`)
+      expect([
+        p,
+        real.startsWith('/') ? fileAt(real) : real,
+        there.startsWith('/') ? fileAt(there) : there,
+      ]).toEqual([p, kernel, kernel])
+    })
+  }, 30_000)
+
+  it("uses the kernel's successful trailing-slash probe", () => {
+    const stat = spyOn(fs, 'statSync').mockReturnValue(
+      fs.statSync(at('a\\b/file')),
+    )
+    try {
+      expect(realPathOf(at('a\\b/slash-after-file-link'))).toBe(at('a\\b/file'))
+    } finally {
+      stat.mockRestore()
+    }
+  })
+
+  it('preserves ELOOP when a trailing-slash probe has not counted earlier links', () => {
+    const p = at('a\\b/slash-after-40-links')
+    expect(fileAt(p)).toBe('ELOOP')
+    expect(answer(() => realPathOf(p))).toBe('ELOOP')
+  })
+
+  it('returns the partial way through a file behind a trailing slash', () => {
+    const { real, rest, notThere } = wayTo(at('a\\b/slash-after-through-file'))
+    expect({
+      real,
+      rest,
+      code: (notThere as NodeJS.ErrnoException).code,
+    }).toEqual({
+      real: at('a\\b/file'),
+      rest: ['sub', ''],
+      code: 'ENOTDIR',
+    })
+  })
+
+  it.if(isLinux)('preserves EILSEQ behind a trailing slash', () => {
+    const bytes = Buffer.from([0xff])
+    fs.writeFileSync(Buffer.concat([Buffer.from(at('a\\b/')), bytes]), '')
+    fs.symlinkSync(bytes, at('a\\b/non-text-target'))
+    fs.symlinkSync('non-text-target', at('a\\b/to-non-text-target'))
+    fs.symlinkSync('to-non-text-target/', at('a\\b/slash-before-non-text'))
+    expect(answer(() => realPathOf(at('a\\b/slash-before-non-text')))).toBe(
+      'EILSEQ',
+    )
+  })
 
   // macOS lets no such name be made.
   it.if(isLinux)(
@@ -487,7 +559,12 @@ describe.if(!isWindows)('property: realPathOf', () => {
           }
         },
       ),
-      { numRuns: 60 },
+      {
+        numRuns: 60,
+        includeErrorInReport: true,
+        interruptAfterTimeLimit: 90_000,
+        markInterruptAsFailure: true,
+      },
     )
   }, 120_000)
 })
