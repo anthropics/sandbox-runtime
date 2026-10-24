@@ -797,10 +797,16 @@ try {
   $named = @($gv.json.stale_allow | Where-Object { $_.path -match '\\Documents$' }).Count -eq 1
   if ($gv.exit -eq 0 -and $gv.json.complete -and $named) { Ok 'V3: a child whose access list cannot be read keeps the revoke reported' }
   else { Fail "V3: over an unreadable child exit=$($gv.exit) raw: $($gv.raw)" }
-  & icacls $v3Dark /setowner "*$meSid" | Out-Null
+  # takeown, not /setowner: neither file can be opened to read its access
+  # list until it is ours again, and an owner may always read and rewrite it.
+  foreach ($f in @($v3Dark, $v3Bare)) {
+    & takeown /f $f | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail "V3: setup: could not take back $f" }
+  }
   & icacls $v3Dark /remove:d '*S-1-1-0' | Out-Null
-  & icacls $v3Bare /setowner "*$meSid" | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail "V3: setup: could not remove the deny on $v3Dark" }
   & icacls $v3Bare /grant "*${meSid}:(F)" | Out-Null
+  if ($LASTEXITCODE -ne 0) { Fail "V3: setup: could not grant $v3Bare back" }
   $gv = Grant @('--replace-includes')
   if ($gv.json.complete -and @($gv.json.stale_allow).Count -eq 0 -and -not (Has-Group $v3Dark)) { Ok 'V3: once it can be read the next run clears it' }
   else { Fail "V3: after unsticking: dark=$(Sddl $v3Dark) raw: $($gv.raw)" }
