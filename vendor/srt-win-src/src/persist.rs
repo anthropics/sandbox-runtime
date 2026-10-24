@@ -739,9 +739,9 @@ fn mark_strip_begun(conn: &Connection, root: &str) -> Result<()> {
     Ok(())
 }
 
-/// After a [`converge_on`] that failed: whether the object itself
-/// carries exactly the wanted ACEs all the same.
-pub(crate) fn settled_on_object(
+/// Whether the object itself carries exactly the wanted ACEs. Says
+/// nothing of what it handed down.
+pub(crate) fn carries_wanted(
     conn: &Connection,
     ids: &Ids,
     canon: &str,
@@ -758,12 +758,39 @@ pub(crate) fn settled_on_object(
         .optional()?;
     let listed = recorded_denies(&want, last.as_deref());
     let t = ids.trustees_for(listed.as_deref());
-    if acl::persistent_on_disk(&aces, &t, on.is_dir) != acl::comparable(&want, on.is_dir)
-        || !acl::persistent_layout_ok(&aces, &t)
-    {
+    Ok(
+        acl::persistent_on_disk(&aces, &t, on.is_dir) == acl::comparable(&want, on.is_dir)
+            && acl::persistent_layout_ok(&aces, &t),
+    )
+}
+
+/// Put on record that the write on `canon` did not reach everything
+/// beneath it: the next converge walks the tree again, whatever the
+/// object itself carries.
+pub(crate) fn mark_write_unfinished(conn: &Connection, canon: &str, id: FileId) -> Result<()> {
+    conn.execute(
+        "INSERT INTO persistent_writes (canonical_path, file_id, spec, done) \
+         VALUES (?1, ?2, '', 0) \
+         ON CONFLICT(canonical_path) DO UPDATE SET file_id = excluded.file_id, done = 0",
+        params![canon, id.as_bytes().as_slice()],
+    )
+    .context("record the write as unfinished")?;
+    Ok(())
+}
+
+/// After a [`converge_on`] that failed: whether the object itself
+/// carries exactly the wanted ACEs all the same, recording it as done
+/// if so.
+pub(crate) fn settled_on_object(
+    conn: &Connection,
+    ids: &Ids,
+    canon: &str,
+    on: &OpenObject,
+) -> Result<bool> {
+    if !carries_wanted(conn, ids, canon, on)? {
         return Ok(false);
     }
-    if want.is_empty() {
+    if wanted(conn, ids, canon, on.id)?.is_empty() {
         conn.execute(
             "DELETE FROM persistent_writes WHERE canonical_path = ?1",
             params![canon],
