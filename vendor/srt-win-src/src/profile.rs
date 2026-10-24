@@ -1171,13 +1171,14 @@ fn note_revoke(conn: &Connection, path: &str, class: NoteClass, reason: &str) ->
 /// if its row has gone.
 fn all_recorded(store: &Store<'_>, marker: &Marker) -> Result<Vec<Recorded>> {
     let pending = revokes(store.conn)?;
+    let carried: HashMap<String, Kind> = pending
+        .iter()
+        .map(|p| (p.row.path.to_lowercase(), p.row.kind))
+        .collect();
     let mut out = db_rows(store.conn)?;
     for r in &mut out {
-        if let Some(p) = pending
-            .iter()
-            .find(|p| p.row.path.eq_ignore_ascii_case(&r.path))
-        {
-            r.kind = p.row.kind;
+        if let Some(kind) = carried.get(&r.path.to_lowercase()) {
+            r.kind = *kind;
         }
     }
     let mut seen: HashSet<String> = out.iter().map(|r| r.path.to_lowercase()).collect();
@@ -1640,16 +1641,36 @@ fn own_access(
     }))
 }
 
+/// Whether `sid` is the sandbox group, now or as an earlier install made it.
+fn is_group_sid(ids: &Ids, sid: &str) -> bool {
+    ids.group_sid.as_deref() == Some(sid) || ids.previous_group_sids.iter().any(|g| g == sid)
+}
+
+/// What a lookup by file id says of a recorded object, for
+/// [`plan::revoke_action`].
+fn found_by_id(located: &Located) -> plan::FoundById {
+    use plan::FoundById;
+    match located {
+        Located::At(_) => FoundById::Elsewhere,
+        Located::Gone => FoundById::Gone,
+        Located::VolumeAbsent => FoundById::VolumeAbsent,
+        Located::Unknown => FoundById::Unknown,
+    }
+}
+
+fn on_network(path: &str) -> bool {
+    !path_id::is_drive_path(path) || path_id::on_network_drive(path)
+}
+
 /// Whether the object itself carries an entry of the sandbox group, if
 /// its access list can be read.
 fn holds_entry(path: &str, ids: &Ids) -> Option<bool> {
     let h = open_bare(path, READ_CONTROL).ok()?;
     let aces = acl::read_aces_at(acl::DaclTarget::Handle(h.raw(), path)).ok()?;
-    Some(aces.iter().any(|a| {
-        !a.inherited
-            && (ids.group_sid.as_deref() == Some(a.sid.as_str())
-                || ids.previous_group_sids.contains(&a.sid))
-    }))
+    Some(
+        aces.iter()
+            .any(|a| !a.inherited && is_group_sid(ids, &a.sid)),
+    )
 }
 
 /// Read back a path that left the plan, from the object itself: what
@@ -1660,12 +1681,10 @@ fn read_back(path: &str, ids: &Ids) -> plan::ReadBack {
         .and_then(|h| acl::read_aces_at(acl::DaclTarget::Handle(h.raw(), path)));
     match aces {
         Ok(aces) => {
-            if aces.iter().any(|a| {
-                !a.inherited
-                    && !a.deny
-                    && (ids.group_sid.as_deref() == Some(a.sid.as_str())
-                        || ids.previous_group_sids.contains(&a.sid))
-            }) {
+            if aces
+                .iter()
+                .any(|a| !a.inherited && !a.deny && is_group_sid(ids, &a.sid))
+            {
                 ReadBack::Carries
             } else {
                 ReadBack::Clean
@@ -1810,9 +1829,7 @@ const COPIES_NAMED: usize = 8;
 /// unusable name has its own access list read and is not gone into, and a
 /// directory with an entry of the group's own is that entry's business.
 fn copies_beneath(dir: &str, ids: &Ids) -> Vec<String> {
-    let group = |sid: &str| {
-        ids.group_sid.as_deref() == Some(sid) || ids.previous_group_sids.iter().any(|g| g == sid)
-    };
+    let group = |sid: &str| is_group_sid(ids, sid);
     let mut found = Vec::new();
     let mut pending = vec![dir.to_owned()];
     while let Some(d) = pending.pop() {
@@ -1937,7 +1954,7 @@ fn volume_reachable(path: &str) -> bool {
 /// Whether the object recorded by `r` is gone for good, by the rule
 /// [`strip`] goes by: a definite not-found from a volume that answers.
 fn recorded_object_gone(r: &Recorded) -> bool {
-    use plan::{FoundById, RecordedAt, RevokeAction};
+    use plan::{RecordedAt, RevokeAction};
     let e = match open_for_stamp(&r.path, None) {
         Ok(_) => return false,
         Err(e) => e,
@@ -1947,13 +1964,10 @@ fn recorded_object_gone(r: &Recorded) -> bool {
         path_id::OpenFailure::VolumeUnavailable => RecordedAt::VolumeUnavailable,
         path_id::OpenFailure::Other => return false,
     };
-    let by_id = r.file_id.map(|id| match path_id::locate_by_file_id(&id) {
-        Located::At(_) => FoundById::Elsewhere,
-        Located::Gone => FoundById::Gone,
-        Located::VolumeAbsent => FoundById::VolumeAbsent,
-        Located::Unknown => FoundById::Unknown,
-    });
-    let network = !path_id::is_drive_path(&r.path) || path_id::on_network_drive(&r.path);
+    let by_id = r
+        .file_id
+        .map(|id| found_by_id(&path_id::locate_by_file_id(&id)));
+    let network = on_network(&r.path);
     let reachable =
         matches!(at, RecordedAt::Nothing) && by_id.is_none() && volume_reachable(&r.path);
     plan::revoke_action(at, by_id, network, reachable) == RevokeAction::Drop
@@ -2056,7 +2070,7 @@ fn converge_revoke(conn: &Connection, ids: &Ids, path: &str, o: &Opened) -> Resu
 /// its file id is now ([`plan::revoke_action`]). Its pending revoke goes
 /// with the row, and only then: anything else leaves it to be retried.
 fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
-    use plan::{FoundById, RecordedAt, RevokeAction};
+    use plan::{RecordedAt, RevokeAction};
     if plan::grants_reading(r.kind) {
         pend_revoke(store.conn, r, None)?;
     }
@@ -2110,17 +2124,12 @@ fn strip(store: &Store<'_>, ids: &Ids, r: &Recorded) -> Result<Stripped> {
             }
         },
     };
-    let network = !path_id::is_drive_path(&r.path) || path_id::on_network_drive(&r.path);
+    let network = on_network(&r.path);
     let located = match at {
         RecordedAt::ThisObject | RecordedAt::Refused => None,
         _ => r.file_id.map(|id| path_id::locate_by_file_id(&id)),
     };
-    let by_id = located.as_ref().map(|l| match l {
-        Located::At(_) => FoundById::Elsewhere,
-        Located::Gone => FoundById::Gone,
-        Located::VolumeAbsent => FoundById::VolumeAbsent,
-        Located::Unknown => FoundById::Unknown,
-    });
+    let by_id = located.as_ref().map(found_by_id);
     // The one case the answer decides; a stat of a share can block.
     let reachable =
         matches!(at, RecordedAt::Nothing) && by_id.is_none() && volume_reachable(&r.path);
@@ -2576,10 +2585,11 @@ pub fn grant(
             return Ok(false);
         }
         // The stamp may have got as far as recording the new kind: put back
-        // what the row said when this run began. Not an unfinished revoke:
-        // its entry is off, and the row must not ask for it again.
+        // what the row said when this run began, or what only the registry
+        // held, so that a later forget can find it. Not an unfinished
+        // revoke: its entry is off, and the row must not ask for it again.
         if unfinished.is_none()
-            && let Some(kind) = in_db(path)
+            && let Some(kind) = plan::row_to_restore(in_db(path), r.kind, is_pending(path))
         {
             upsert_row(store.conn, &r.path, r.file_id, kind, r.created)?;
         }
@@ -2936,13 +2946,16 @@ pub fn grant(
 /// found is kept as why each is pending, and one this run said nothing
 /// about is reported as it stood. No pending revoke goes unreported.
 fn settle_revokes(conn: &Connection, report: &mut Report) -> Result<()> {
-    let noted = report.notes();
+    let notes = report.notes();
+    let noted: HashMap<String, &Note> = notes
+        .iter()
+        .filter(|n| n.class.is_revoke())
+        .rev()
+        .map(|n| (n.path.to_lowercase(), n))
+        .collect();
     for r in revokes(conn)? {
         let path = &r.row.path;
-        match noted
-            .iter()
-            .find(|n| n.class.is_revoke() && n.path.eq_ignore_ascii_case(path))
-        {
+        match noted.get(&path.to_lowercase()) {
             Some(n) => note_revoke(conn, path, n.class, &n.reason)?,
             None => report.note_item(r.class, revoke_item(&r)),
         }
@@ -3034,7 +3047,7 @@ pub fn retry_stale(
     let mut cleared: Vec<&Recorded> = Vec::new();
     for rv in &pending_revokes {
         let r = &rv.row;
-        let on_network = !path_id::is_drive_path(&r.path) || path_id::on_network_drive(&r.path);
+        let network = on_network(&r.path);
         let past_budget = budget.is_some_and(|b| started.elapsed() >= b);
         let mut left = |class: NoteClass, reason: String| {
             out.stale_allow.push(Item {
@@ -3052,7 +3065,7 @@ pub fn retry_stale(
                 reason,
             });
         };
-        if !plan::stale_retry_attempts(bounded, on_network, past_budget) {
+        if !plan::stale_retry_attempts(bounded, network, past_budget) {
             left(rv.class, rv.reason.clone());
             continue;
         }
@@ -3424,6 +3437,28 @@ fn short_path(path: &str) -> Option<String> {
 /// `profile status`: what is recorded, and whether it is a complete
 /// grant of the current list for the profile that is there now.
 pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde_json::Value {
+    status_with_revokes(key, layout, with_paths, pending_revokes_read(key))
+}
+
+/// The pending revokes for `profile status`; `None` when they cannot be
+/// read. Only the real record has them in the state database.
+fn pending_revokes_read(key: &str) -> Option<Vec<Revoke>> {
+    if key != persist::MARKER_KEY {
+        return Some(Vec::new());
+    }
+    match crate::state_db::open_db_ro() {
+        Ok(None) => Some(Vec::new()),
+        Ok(Some(conn)) => revokes(&conn).ok(),
+        Err(_) => None,
+    }
+}
+
+fn status_with_revokes(
+    key: &str,
+    layout: Result<Layout>,
+    with_paths: bool,
+    pending: Option<Vec<Revoke>>,
+) -> serde_json::Value {
     use serde_json::json;
     let m = match read_marker_at(key) {
         Ok(m) => m,
@@ -3461,6 +3496,11 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
         .into_iter()
         .map(|c| (c.as_str(), Vec::new()))
         .collect();
+    let pending_kinds: Option<HashMap<String, Kind>> = pending.as_ref().map(|p| {
+        p.iter()
+            .map(|r| (r.row.path.to_lowercase(), r.row.kind))
+            .collect()
+    });
     for n in &m.notes {
         let (class, item) = match (n.class, &ids) {
             (NoteClass::NotGranted, _) => (
@@ -3471,9 +3511,19 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
                     ..Default::default()
                 },
             ),
-            // Looked at again: no longer reported once the entry is gone.
+            // Looked at again: no longer reported once the entry is gone,
+            // unless a pending revoke says copies may be left beneath it.
             (NoteClass::StaleAllow, Some(ids)) => match own_access(&n.path, ids) {
-                Ok(Some(Access { ours: None, .. })) | Ok(None) => continue,
+                Ok(None) => continue,
+                Ok(Some(Access { ours: None, .. }))
+                    if !plan::stale_note_outlives_entry(
+                        pending_kinds
+                            .as_ref()
+                            .map(|k| k.get(&n.path.to_lowercase()).copied()),
+                    ) =>
+                {
+                    continue;
+                }
                 found => (
                     n.class,
                     Item {
@@ -3481,7 +3531,7 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
                         reason: n.reason.clone(),
                         protected_exclusion: Some(false),
                         entry: match found {
-                            Ok(Some(Access { ours, .. })) => ours,
+                            Ok(Some(Access { ours, .. })) => ours.or(Some("inherited")),
                             _ => None,
                         },
                         ..Default::default()
@@ -3561,6 +3611,28 @@ pub fn status_json(key: &str, layout: Result<Layout>, with_paths: bool) -> serde
             }
         };
         by_class.entry(class.as_str()).or_default().push(item);
+    }
+    // A pending revoke no note speaks for: a complete record warns of it
+    // all the same.
+    if m.header.as_ref().is_some_and(|h| h.complete) {
+        let noted: HashSet<String> = m
+            .notes
+            .iter()
+            .filter(|n| n.class.is_revoke())
+            .map(|n| n.path.to_lowercase())
+            .collect();
+        for r in pending.iter().flatten() {
+            if !noted.contains(&r.row.path.to_lowercase()) {
+                let class = match r.class {
+                    NoteClass::OurAllow | NoteClass::OurAllowAbove => NoteClass::Unprotected,
+                    _ => NoteClass::StaleAllow,
+                };
+                by_class
+                    .entry(class.as_str())
+                    .or_default()
+                    .push(revoke_item(r));
+            }
+        }
     }
     for (class, items) in by_class {
         out[class] = json!(items);
@@ -5152,6 +5224,119 @@ mod tests {
             replace_includes: true,
             ..Default::default()
         }
+    }
+
+    /// A retry killed part-way: the directory's own entry has gone, the
+    /// note still says `StaleAllow`, and copies may be left beneath it.
+    #[test]
+    fn a_pending_revoke_keeps_its_warning_once_the_entry_itself_is_gone() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestKilledRetry";
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let (prof, layout) = granted_documents("killed-retry", KEY, &conn);
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        grant(&store, &ids(), &layout, dropping_inclusions(), false).unwrap();
+        let path = canon(&prof.join("Documents"));
+        assert!(group_aces(&prof.join("Documents")).is_empty());
+        let pending = |kind| {
+            Some(vec![Revoke {
+                row: Recorded {
+                    path: path.clone(),
+                    kind,
+                    created: false,
+                    file_id: None,
+                },
+                wanted: None,
+                class: NoteClass::StaleAllow,
+                reason: "pending".to_owned(),
+            }])
+        };
+        let warned = |revokes: Option<Vec<Revoke>>| {
+            status_with_revokes(KEY, Ok(layout.clone()), false, revokes)["stale_allow"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        // No note at all: the record alone is enough.
+        assert_eq!(warned(pending(Kind::Granted)), 1);
+        let mut m = read_marker_at(KEY).unwrap();
+        m.notes = vec![Note {
+            class: NoteClass::StaleAllow,
+            path: path.clone(),
+            reason: "stale".to_owned(),
+        }];
+        write_marker(KEY, &m).unwrap();
+        assert_eq!(warned(pending(Kind::Granted)), 1, "copies may remain");
+        assert_eq!(warned(None), 1, "the record could not be read");
+        assert_eq!(warned(Some(Vec::new())), 0, "nothing is pending");
+        assert_eq!(warned(pending(Kind::File)), 0, "a file hands nothing down");
+        m.notes.clear();
+        write_marker(KEY, &m).unwrap();
+        forget(&store, &ids()).unwrap();
+        std::fs::remove_dir_all(prof.parent().unwrap()).ok();
+    }
+
+    /// The database is gone and the registry alone holds a path that cannot
+    /// be written now: the kept path goes back on the record, so that a
+    /// later forget still takes its entry off.
+    #[test]
+    fn a_kept_path_only_the_registry_held_stays_on_the_record() {
+        const KEY: &str = r"Software\sandbox-runtime\ProfileGrantTestRegistryOnly";
+        let base = scratch("registry-only");
+        let prof = base.join("profile");
+        write(&prof, ".npmrc");
+        write(&prof, r"go\x.exe");
+        clear_marker(KEY).unwrap();
+        let layout = Layout {
+            own_env: Vec::new(),
+            ..Layout::resolve(Some(prof.to_str().unwrap())).unwrap()
+        };
+        let conn = crate::state_db::open_memory_db_for_tests();
+        let store = Store {
+            conn: &conn,
+            key: KEY,
+        };
+        let ids = ids();
+        grant(&store, &ids, &layout, Added::default(), false).unwrap();
+        conn.execute("DELETE FROM profile_paths", []).unwrap();
+        let file = prof.join(".npmrc");
+        let p = file.to_str().unwrap().to_owned();
+        let me = crate::sid::current_user_sid().unwrap();
+        let mine = format!("(A;;FA;;;{me})(A;;{RX:#x};;;{GROUP})");
+        let disowned = acl::set_path_dacl_from_sddl(&p, &format!("D:P{mine}"), "test").is_ok()
+            && std::process::Command::new("icacls")
+                .args([p.as_str(), "/setowner", "*S-1-5-18"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+            && acl::set_path_dacl_from_sddl(
+                &p,
+                &format!("D:P(A;;{RX:#x};;;{GROUP})(A;;{RX:#x};;;WD)(A;;FA;;;SY)"),
+                "test",
+            )
+            .is_ok();
+        if !disowned {
+            eprintln!("skipped: needs an elevated run to change an object's owner");
+            forget(&store, &ids).ok();
+            std::fs::remove_dir_all(&base).ok();
+            return;
+        }
+        let report = grant(&store, &ids, &layout, Added::default(), false).unwrap();
+        assert!(report.complete, "{report:?}");
+        let path = canon(&file);
+        let held = |rows: &[Recorded]| rows.iter().any(|r| r.path.eq_ignore_ascii_case(&path));
+        assert!(held(&db_rows(&conn).unwrap()), "{report:?}");
+        assert!(held(&read_marker_at(KEY).unwrap().paths));
+        let took = std::process::Command::new("takeown")
+            .args(["/F", p.as_str()])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(took);
+        acl::set_path_dacl_from_sddl(&p, &format!("D:P{mine}"), "test").unwrap();
+        forget(&store, &ids).unwrap();
+        assert!(group_aces(&file).is_empty());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
