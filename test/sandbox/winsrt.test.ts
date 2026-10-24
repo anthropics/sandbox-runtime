@@ -30,6 +30,7 @@ import type { AddressInfo } from 'node:net'
 import { isMacOS, isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import {
+  SandboxInitializeConflictError,
   SandboxManager,
   windowsProfileReadWarningsOf,
 } from '../../src/sandbox/sandbox-manager.js'
@@ -1869,6 +1870,33 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     }
   })
 
+  it('reset() during a step with no grant: no session, and the next initialize() runs', async () => {
+    const status = await winUtils.getWindowsSandboxUserStatusAsync({})
+    let release = (): void => {}
+    const gate = new Promise<void>(r => {
+      release = r
+    })
+    const spy = spyOn(winUtils, 'getWindowsSandboxUserStatusAsync')
+    const before = spy.mock.calls.length
+    spy.mockImplementationOnce(async () => {
+      await gate
+      return status
+    })
+    const first = SandboxManager.initialize(configOf({}))
+    first.catch(() => {})
+    while (spy.mock.calls.length === before) {
+      await new Promise(r => setImmediate(r))
+    }
+    await SandboxManager.reset()
+    const own = configOf({})
+    const second = SandboxManager.initialize(own)
+    release()
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(first).rejects.toThrow('cancelled by reset()')
+    await second
+    expect(SandboxManager.getConfig()).toBe(own)
+  })
+
   it("the library's trust bundle is granted beneath a credential deny", async () => {
     const above = { path: tmpdir(), mode: 'deny' as const }
     const base = configOf({ allowRead: [sub] }, [above])
@@ -1933,6 +1961,20 @@ describe('windowsProfileExclusionConflicts: a leading wildcard', () => {
 })
 
 describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
+  it('grantWindowsProfileRead: an aborted signal kills the run', async () => {
+    const abort = new AbortController()
+    const run = winUtils.grantWindowsProfileRead({
+      srtWin: {
+        exe: process.execPath,
+        prependArgs: ['-e', 'setTimeout(() => {}, 60000)'],
+      },
+      signal: abort.signal,
+    })
+    abort.abort()
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(run).rejects.toMatchObject({ code: 'srt_win_cancelled' })
+  })
+
   const RAW_USER = JSON.stringify({
     user: {
       exists: true,
@@ -7014,6 +7056,17 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         expect(grantSpy.mock.calls[0]?.[0]?.timeoutMs).toBeUndefined()
       })
 
+      it('a progress callback that throws does not disturb the refresh', async () => {
+        profileStatus = until(refreshable())
+        grantRun = { stderr: ['12 of 40 done'], stdout: grantJson(), code: 0 }
+        await SandboxManager.initialize(config(), undefined, false, {
+          onWindowsProfileGrantProgress: () => {
+            throw new Error('renderer gone')
+          },
+        })
+        expect(SandboxManager.getWindowsProfileRead()).toBe('granted')
+      })
+
       describe('while a refresh is running', () => {
         let finishGrant: () => void
         let grantSpy: ReturnType<typeof spyOn>
@@ -7029,12 +7082,20 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           }
           grantSpy = spyOn(winUtils, 'grantWindowsProfileRead')
           grantSpy.mockImplementation(
-            (() =>
-              new Promise(resolve => {
+            ((opts?: winUtils.WindowsProfileGrantOptions) =>
+              new Promise((resolve, reject) => {
                 finishGrant = () => {
                   finished = true
                   resolve(JSON.parse(grantJson()))
                 }
+                opts?.signal?.addEventListener('abort', () =>
+                  reject(
+                    new winUtils.WindowsSandboxError(
+                      'srt_win_cancelled',
+                      'killed',
+                    ),
+                  ),
+                )
               })) as never,
           )
           spies.push(grantSpy)
@@ -7047,6 +7108,49 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           finishGrant()
           await Promise.all([first, second])
           expect(grantSpy).toHaveBeenCalledTimes(1)
+          expect(SandboxManager.getConfig()).toBeDefined()
+          expect(names()).toContain('acl grant')
+        })
+
+        it('a second initialize() asking for something else is refused', async () => {
+          const first = SandboxManager.initialize(config())
+          await started()
+          const base = config()
+          const others = await Promise.allSettled([
+            SandboxManager.initialize({
+              ...base,
+              windows: { ...base.windows, sandboxUser: 'other' },
+            }),
+            SandboxManager.initialize(config(), async () => true),
+            SandboxManager.initialize(config(), undefined, false, {
+              onWindowsProfileGrantProgress: () => {},
+            }),
+          ])
+          for (const other of others) {
+            expect(other.status).toBe('rejected')
+            expect((other as PromiseRejectedResult).reason).toBeInstanceOf(
+              SandboxInitializeConflictError,
+            )
+          }
+          finishGrant()
+          await first
+          expect(grantSpy).toHaveBeenCalledTimes(1)
+        })
+
+        it('reset() kills the run, and the next initialize() does not wait for it', async () => {
+          const first = SandboxManager.initialize(config())
+          first.catch(() => {})
+          await started()
+          await SandboxManager.reset()
+          expect(grantSpy.mock.calls[0]?.[0]?.signal?.aborted).toBe(true)
+          // eslint-disable-next-line @typescript-eslint/await-thenable
+          await expect(first).rejects.toThrow('cancelled by reset()')
+          const second = SandboxManager.initialize(config())
+          while (grantSpy.mock.calls.length < 2) {
+            await new Promise(r => setImmediate(r))
+          }
+          finishGrant()
+          await second
           expect(SandboxManager.getConfig()).toBeDefined()
           expect(names()).toContain('acl grant')
         })

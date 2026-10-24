@@ -77,6 +77,8 @@ export type WindowsSandboxErrorCode =
   | 'spawn_failed'
   /** `srt-win` was killed by the spawn timeout (generic; see `install_timeout`). */
   | 'srt_win_timeout'
+  /** The caller aborted a run of `srt-win` (see `signal`). */
+  | 'srt_win_cancelled'
   /** A JSON-emitting `srt-win` subcommand exited non-zero. */
   | 'srt_win_nonzero'
   /** `srt-win` stdout was not valid JSON. */
@@ -3673,6 +3675,11 @@ export async function getWindowsProfileReadStatusAsync(
 
 export interface WindowsProfileGrantOptions {
   /**
+   * Abort the run: the child is killed and the promise rejects with
+   * `srt_win_cancelled`. The grant stays recorded as incomplete.
+   */
+  signal?: AbortSignal
+  /**
    * Paths inside the profile to keep unreadable in addition to the
    * built-in list (absolute, or relative to the profile): for example
    * the embedding program's own configuration directory.
@@ -3861,6 +3868,11 @@ export async function grantWindowsProfileRead(
             child.kill()
           }, timeoutMs)
         : undefined
+    const abort = (): void => {
+      child.kill()
+    }
+    if (opts.signal?.aborted) abort()
+    opts.signal?.addEventListener('abort', abort, { once: true })
     let stdout = ''
     let stderr = ''
     let pending = ''
@@ -3877,6 +3889,7 @@ export async function grantWindowsProfileRead(
     child.stdin?.on('error', () => {}).end()
     child.once('error', e => {
       clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', abort)
       reject(
         new WindowsSandboxError(
           'spawn_failed',
@@ -3887,7 +3900,20 @@ export async function grantWindowsProfileRead(
     })
     child.once('close', (status, signal) => {
       clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', abort)
       if (pending.trim() !== '') opts.onProgress?.(pending)
+      if (opts.signal?.aborted) {
+        reject(
+          new WindowsSandboxError(
+            'srt_win_cancelled',
+            `srt-win profile grant was cancelled; the grant is recorded ` +
+              `as incomplete — run it again, or remove it with ` +
+              `forgetWindowsProfileRead()`,
+            'profile',
+          ),
+        )
+        return
+      }
       if (timedOut) {
         reject(
           new WindowsSandboxError(

@@ -175,8 +175,6 @@ pub const BUILT_IN: &[Excl] = &[
     file(Profile, r".cargo\credentials.toml"),
     file(Profile, r".gradle\enterprise\keys.properties"),
     file(Profile, r".gradle\develocity\keys.properties"),
-    // Maven's master password: it unlocks what settings.xml stores encrypted.
-    file(Profile, r".m2\settings-security.xml"),
     // The user's registry hives and their logs.
     file(Profile, "NTUSER.DAT*"),
     file(Profile, "ntuser.ini"),
@@ -327,7 +325,7 @@ pub const INCLUDED: &[Incl] = &[
     inc(Profile, ".rustup"),
     // cargo: shims, registry and config (its credential files stay denied).
     inc(Profile, ".cargo"),
-    // Maven: settings and the local repository.
+    // Maven: settings, its master password files and the local repository.
     inc(Profile, ".m2"),
     // pip: pip.ini, at its current place and its older one.
     inc(Roaming, "pip"),
@@ -356,6 +354,8 @@ pub const READABLE_CONFIG: &[(Base, &str, &str)] = &[
     (Profile, r".config\pip\pip.conf", "pip"),
     (Roaming, r"NuGet\NuGet.Config", "NuGet"),
     (Profile, r".m2\settings.xml", "Maven"),
+    (Profile, r".m2\settings-security.xml", "Maven"),
+    (Profile, r".m2\settings-security4.xml", "Maven"),
     (Profile, r".gradle\gradle.properties", "Gradle"),
 ];
 
@@ -1834,8 +1834,15 @@ pub fn env_pointers(
                 )),
             }
         };
-        match arg(&settings) {
-            Ok(s) => out.env.push(("MAVEN_ARGS", format!("-s {s}"))),
+        let value = arg(&settings).and_then(|s| {
+            let mut v = format!("-s {s}");
+            if let Some(sec) = first(&[at(profile, r".m2\settings-security.xml")]) {
+                v.push_str(&format!(" -Dsettings.security={}", arg(&sec)?));
+            }
+            Ok(v)
+        });
+        match value {
+            Ok(v) => out.env.push(("MAVEN_ARGS", v)),
             Err(why) => out.withheld.push(("MAVEN_ARGS", why)),
         }
     }
@@ -1975,6 +1982,21 @@ pub fn revoke_begins(kind: Kind, wanted: Option<Kind>) -> bool {
     }
 }
 
+/// Whether a `StaleAllow` note stands once the object's own list has no
+/// entry: copies may be left beneath a directory whose revoke is still
+/// pending. `pending`: its revoke's kind, `None` inside when there is none;
+/// `None` outside when the record could not be read, which proves nothing.
+pub fn stale_note_outlives_entry(pending: Option<Option<Kind>>) -> bool {
+    pending.is_none_or(|kind| kind.is_some_and(hands_reading_down))
+}
+
+/// What to put back on the record for a path a run kept: what the database
+/// said as the run began, else what only the registry held. A pending
+/// revoke needs no row: its own record speaks for it.
+pub fn row_to_restore(in_db: Option<Kind>, earlier: Kind, pending: bool) -> Option<Kind> {
+    in_db.or((!pending).then_some(earlier))
+}
+
 /// Whether a path only the registry lists is done with: a grant that was
 /// cut short deleted its row as it finished it, and left the registry as
 /// the run began. Not when the database has no rows at all (it may be the
@@ -2091,6 +2113,26 @@ mod tests {
         assert!(!begins(Kind::File, Some(Kind::File)));
         assert!(!begins(Kind::Denied, None), "a deny is not reading");
         assert!(!begins(Kind::Denied, Some(Kind::Container)));
+    }
+
+    #[test]
+    fn a_stale_note_outlives_its_entry_only_for_what_may_be_left_beneath() {
+        use super::{Kind, stale_note_outlives_entry as stands};
+        assert!(stands(Some(Some(Kind::Granted))));
+        assert!(stands(None), "the record could not be read");
+        assert!(!stands(Some(None)), "nothing pending");
+        assert!(!stands(Some(Some(Kind::File))));
+        assert!(!stands(Some(Some(Kind::Container))));
+    }
+
+    #[test]
+    fn a_kept_row_goes_back_as_it_was_recorded() {
+        use super::{Kind, row_to_restore as restore};
+        let (g, f) = (Kind::Granted, Kind::File);
+        assert_eq!(restore(Some(g), f, false), Some(g), "the database first");
+        assert_eq!(restore(Some(g), f, true), Some(g));
+        assert_eq!(restore(None, f, false), Some(f), "only the registry");
+        assert_eq!(restore(None, f, true), None, "its revoke speaks for it");
     }
 
     #[test]
@@ -2364,18 +2406,16 @@ mod tests {
     }
 
     #[test]
-    fn maven_master_password_is_denied_beside_a_readable_settings_file() {
+    fn maven_is_readable_whole_with_its_master_password_files() {
         let mut t = Mem::default();
         t.add(r".m2\settings.xml")
             .add(r".m2\settings-security.xml")
+            .add(r".m2\settings-security4.xml")
             .add(r".m2\repository\a.jar");
         let k = kinds(&plan(&mut t, &rules()).unwrap());
-        assert_eq!(
-            k.get(r".m2\settings-security.xml").map(|v| v.0),
-            Some(Kind::Denied)
-        );
-        assert_eq!(k.get(r".m2\settings.xml").map(|v| v.0), Some(Kind::File));
-        assert_eq!(k.get(".m2").map(|v| v.0), Some(Kind::Container));
+        assert_eq!(k.get(".m2").map(|v| v.0), Some(Kind::Granted));
+        assert!(!k.contains_key(r".m2\settings-security.xml"), "no deny");
+        assert!(!k.contains_key(r".m2\settings-security4.xml"), "no deny");
     }
 
     #[test]
@@ -2427,7 +2467,7 @@ mod tests {
         absent(r"scoop\shims");
         absent(".local");
         absent(r".local\bin");
-        is(".m2", Kind::Container);
+        is(".m2", Kind::Granted);
         is(".npmrc", Kind::File);
         is(".gitconfig", Kind::File);
         absent("stray.txt");
@@ -3468,7 +3508,14 @@ mod tests {
                     "PIP_CONFIG_FILE",
                     r"C:\Users\me\AppData\Roaming\pip\pip.ini".to_owned()
                 ),
-                ("MAVEN_ARGS", r"-s C:\Users\me\.m2\settings.xml".to_owned()),
+                (
+                    "MAVEN_ARGS",
+                    concat!(
+                        r"-s C:\Users\me\.m2\settings.xml",
+                        r" -Dsettings.security=C:\Users\me\.m2\settings-security.xml"
+                    )
+                    .to_owned()
+                ),
             ]
         );
         assert!(got.withheld.is_empty());
@@ -3553,12 +3600,23 @@ mod tests {
             (Some(r"-s C:\Users\me\.m2\settings.xml".to_owned()), None)
         );
         // Whitespace, and the characters the launchers treat specially: the
-        // 8.3 path. The master password file is never pointed at.
-        let short = |p: &str| Some(p.replace(r"C:\Users\Mary Ann", r"C:\Users\MARYAN~1"));
+        // 8.3 path, each file looked up on its own.
+        let short = |p: &str| {
+            Some(
+                p.replace(r"C:\Users\Mary Ann", r"C:\Users\MARYAN~1")
+                    .replace("settings-security.xml", "SETTIN~2.XML"),
+            )
+        };
         assert_eq!(
             maven(r"C:\Users\Mary Ann", &all, &short),
             (
-                Some(r"-s C:\Users\MARYAN~1\.m2\settings.xml".to_owned()),
+                Some(
+                    concat!(
+                        r"-s C:\Users\MARYAN~1\.m2\settings.xml",
+                        r" -Dsettings.security=C:\Users\MARYAN~1\.m2\SETTIN~2.XML"
+                    )
+                    .to_owned()
+                ),
                 None
             )
         );
@@ -3596,6 +3654,14 @@ mod tests {
             maven(r"C:\Users\Mary Ann", &settings_only, &still_long).0,
             None
         );
+        // The security file alone failing withholds the whole variable:
+        // a settings file without its key file would not decrypt.
+        let security_stays = |p: &str| {
+            (!p.ends_with("settings-security.xml")).then(|| p.replace("Mary Ann", "MARYAN~1"))
+        };
+        let (env, withheld) = maven(r"C:\Users\Mary Ann", &all, &security_stays);
+        assert_eq!(env, None);
+        assert!(withheld.is_some_and(|w| w.contains("settings-security.xml")));
         // Unrelated characters are left alone.
         assert_eq!(
             maven(r"C:\Users\o'brien$%!", &settings_only, &not_asked).0,

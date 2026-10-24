@@ -24,6 +24,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'NetworkConfigSchema',
   'RipgrepConfigSchema',
   'SRT_WIN_DISPATCH_ARG1',
+  'SandboxInitializeConflictError',
   'SandboxManager',
   'SandboxRuntimeConfigSchema',
   'SandboxViolationStore',

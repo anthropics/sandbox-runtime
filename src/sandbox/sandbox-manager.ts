@@ -155,6 +155,7 @@ import {
 } from './resolved-address-guard.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { getJavaProxyAgentJarPathAsync } from './java-proxy-agent.js'
 import { getApplySeccompBinaryPathAsync } from './generate-seccomp-filter.js'
 
@@ -182,9 +183,11 @@ let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 // can hold it for minutes before initializationPromise exists. reset()
 // moves the generation on, which cancels it.
 let pendingInitialize:
-  | { promise: Promise<void>; generation: number }
+  | { promise: Promise<void>; generation: number; args: unknown[] }
   | undefined
 let initializeGeneration = 0
+// Kills the profile grant a refresh is running, at reset().
+let windowsProfileGrantAbort: AbortController | undefined
 let cleanupRegistered = false
 let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
@@ -1100,6 +1103,21 @@ async function startMuxProxyServer(
 // ============================================================================
 
 /**
+ * A second {@link initialize} while one is in flight asked for something
+ * else: its configuration or callbacks would not have been applied.
+ */
+export class SandboxInitializeConflictError extends Error {
+  readonly code = 'initialize_conflict'
+  constructor() {
+    super(
+      'initialize() is already running with a different configuration or ' +
+        'different callbacks: wait for it, or reset() first',
+    )
+    this.name = 'SandboxInitializeConflictError'
+  }
+}
+
+/**
  * Options of {@link initialize} that are the embedding program's to
  * set, not part of the configuration a user writes.
  */
@@ -1123,9 +1141,16 @@ async function initialize(
   enableLogMonitor = false,
   options?: SandboxInitializeOptions,
 ): Promise<void> {
+  const args = [runtimeConfig, sandboxAskCallback, enableLogMonitor, options]
   if (pendingInitialize) {
-    const { promise, generation } = pendingInitialize
-    if (generation === initializeGeneration) return promise
+    const { promise, generation, args: running } = pendingInitialize
+    if (generation === initializeGeneration) {
+      // Functions compare by identity, the rest by value.
+      if (!isDeepStrictEqual(args, running)) {
+        throw new SandboxInitializeConflictError()
+      }
+      return promise
+    }
     // A reset() cancelled that run: this one starts once it has stopped.
     await promise.catch(() => {})
     return initialize(
@@ -1143,6 +1168,7 @@ async function initialize(
       options,
     ),
     generation: initializeGeneration,
+    args,
   }
   pendingInitialize = entry
   try {
@@ -1186,6 +1212,13 @@ async function initializeSteps(
     return
   }
   const generation = initializeGeneration
+  // After every await below: a reset() meanwhile means no session starts.
+  const stopIfReset = (): void => {
+    if (generation !== initializeGeneration) {
+      config = undefined
+      throw new Error('initialize() was cancelled by reset()')
+    }
+  }
 
   // Store config for use by other functions
   config = runtimeConfig
@@ -1231,6 +1264,7 @@ async function initializeSteps(
 
   // Check dependencies
   const deps = await checkDependenciesAsync()
+  stopIfReset()
   if (deps.errors.length > 0) {
     if (deps.reinstallRequired) {
       throw new WindowsSandboxError(
@@ -1324,6 +1358,7 @@ async function initializeSteps(
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
     const u = await getWindowsSandboxUserStatusAsync({ srtWin })
+    stopIfReset()
     if (!u.provisioned || !u.credPresent) {
       config = undefined
       throw new WindowsSandboxError(
@@ -1362,6 +1397,7 @@ async function initializeSteps(
       windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
       if (u.profileGrant) {
         let grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        stopIfReset()
         let refreshed: WindowsProfileGrantResult | undefined
         // Before this session is a holder of anything: the grant is
         // written only while no session or command holds it. A run that
@@ -1372,13 +1408,31 @@ async function initializeSteps(
             `[Sandbox Windows] refreshing the profile read grant ` +
               `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''})`,
           )
-          refreshed = await grantWindowsProfileRead({
-            srtWin,
-            onProgress: line => {
-              logForDebugging(`[Sandbox Windows] ${line}`)
-              options?.onWindowsProfileGrantProgress?.(line)
-            },
-          })
+          windowsProfileGrantAbort = new AbortController()
+          try {
+            refreshed = await grantWindowsProfileRead({
+              srtWin,
+              signal: windowsProfileGrantAbort.signal,
+              onProgress: line => {
+                logForDebugging(`[Sandbox Windows] ${line}`)
+                // The host's code, called from a stream handler.
+                try {
+                  options?.onWindowsProfileGrantProgress?.(line)
+                } catch (e) {
+                  logForDebugging(
+                    `[Sandbox Windows] progress callback threw: ${e}`,
+                    { level: 'warn' },
+                  )
+                }
+              },
+            })
+          } catch (e) {
+            stopIfReset()
+            throw e
+          } finally {
+            windowsProfileGrantAbort = undefined
+          }
+          stopIfReset()
           grant = await getWindowsProfileReadStatusAsync({ srtWin })
         } else if (
           grant.state === 'current' &&
@@ -1399,10 +1453,7 @@ async function initializeSteps(
             )
           }
         }
-        // reset() during those awaits: no session starts after it.
-        if (generation !== initializeGeneration) {
-          throw new Error('initialize() was cancelled by reset()')
-        }
+        stopIfReset()
         windowsProfileReadRefresh = refreshed
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
@@ -1457,6 +1508,7 @@ async function initializeSteps(
     if (useWindowsPersistentCa && tlsTerminate) {
       try {
         const p = await ensurePersistentWindowsCa({ status: u, srtWin })
+        stopIfReset()
         mitmCA = createMitmCA({
           caCertPem: p.certPem,
           caKeyPem: p.keyPem,
@@ -1561,6 +1613,7 @@ async function initializeSteps(
         allowProfileExclusions: override,
         srtWin,
       })
+      stopIfReset()
       // Gates running revoke/restore at reset(): every session is
       // recorded with srt-win, whatever it was given. Set before the
       // probe, so that a reset() during it releases what was granted.
@@ -1591,6 +1644,7 @@ async function initializeSteps(
           sandboxUser: runtimeConfig.windows?.sandboxUser,
           srtWin,
         })
+        stopIfReset()
         windowsWfpVerifiedFor = sb
         windowsWfpVerifiedLoopback = allowLoopback
       }
@@ -1640,6 +1694,7 @@ async function initializeSteps(
       const muxPort = needLocalProxy
         ? await startMuxProxyServer(sandboxAskCallback, portRange)
         : undefined
+      stopIfReset()
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
       // JVMs read neither HTTPS_PROXY nor its credential; the agent bridges
@@ -1648,6 +1703,7 @@ async function initializeSteps(
       javaAgentJarPath =
         (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
         undefined
+      stopIfReset()
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1675,6 +1731,7 @@ async function initializeSteps(
           socksProxyPort,
           config.socatPath,
         )
+        stopIfReset()
       }
 
       const context: HostNetworkManagerContext = {
@@ -1689,7 +1746,9 @@ async function initializeSteps(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
-      reset().catch(e => {
+      // Awaited: an initialize() queued behind this one must not start
+      // until this clean-up has finished clearing what it shares.
+      await reset().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
         })
@@ -3288,6 +3347,7 @@ function forceCloseHttpServer(
 
 async function reset(): Promise<void> {
   initializeGeneration++
+  windowsProfileGrantAbort?.abort()
   // Windows: release this session's sandbox-user ACEs. Best-effort:
   // log anomalies rather than throw, so teardown always completes.
   // Persistent write roots and the denies under them are not released.

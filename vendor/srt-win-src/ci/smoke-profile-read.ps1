@@ -326,6 +326,8 @@ try {
   $npmTool  = Seed 'AppData\Roaming\npm\tool.cmd'               '@echo NPM-TOOL'
   $tempFile = Seed 'AppData\Local\Temp\t.txt'                   'TEMP-CONTENT'
   $sessFile = Seed 'AppData\Local\Temp\session\s.txt'          'SESSION-CONTENT'
+  $m2Settings = Seed '.m2\settings.xml'                        'M2-SETTINGS'
+  $m2Master   = Seed '.m2\settings-security.xml'               'M2-MASTER'
   $toolDir  = Join-Path $prof 'AppData\Local\Programs\MyTool'
   New-Item -ItemType Directory -Path $toolDir -Force | Out-Null
   Copy-Item $cmd (Join-Path $toolDir 'srtsmoketool.exe')
@@ -536,6 +538,8 @@ try {
   # ── R5: an unlisted directory ────────────────────────────────────
   $docs = Join-Path $prof 'Documents'
   Expect-NoRead 'R5 (a file under an unlisted directory)' $docNote 'DOC-CONTENT'
+  Expect-Read 'R1 (Maven is listed whole)' $m2Settings 'M2-SETTINGS'
+  Expect-Read 'R1 (its master password file, by design)' $m2Master 'M2-MASTER'
   if (-not (Has-Group $docs) -and -not (Has-Group $docNote)) { Ok 'R5: an unlisted directory carries no entry for the sandbox group, neither allow nor deny' }
   else { Fail "R5: Documents names the group: $(Sddl $docs) / $(Sddl $docNote)" }
   $st = Status
