@@ -31,7 +31,7 @@
     "@pondwader/socks5-server": "^1.0.10",
     "commander": "^12.1.0",
     "node-forge": "^1.4.0",
-    "zod": "^3.25.0"
+    "zod": "^3.25.0 || ^4.6.6"
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",
