@@ -1,5 +1,8 @@
 // Library exports
-export { SandboxManager } from './sandbox/sandbox-manager.js'
+export {
+  SandboxManager,
+  SandboxInitializeConflictError,
+} from './sandbox/sandbox-manager.js'
 export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
 export type {
   WrapWithSandboxOptions,
@@ -123,6 +126,7 @@ export type {
   WindowsProfileGrantStatus,
   WindowsProfileGrantPath,
   WindowsProfileGrantOptions,
+  WindowsProfileForgetResult,
   WindowsProfileGrantResult,
   WindowsProfileGrantItem,
   WindowsInstallProfileGrant,
