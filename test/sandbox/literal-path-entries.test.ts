@@ -1831,10 +1831,22 @@ const EXPECTED_MACOS_FILE_RULES = String.raw`; File read
   (regex "^/(.*/)?\\.claude/commands/.*(/.*)?$")
   (subpath "/.claude/agents")
   (regex "^/(.*/)?\\.claude/agents/.*(/.*)?$")
-  (subpath "/.git/hooks")
-  (regex "^/(.*/)?\\.git/hooks/.*(/.*)?$")
-  (subpath "/.git/config")
+  (regex "^/(.*/)?\\.git/hooks(/.*)?$")
+  (regex "^/(.*/)?\\.git/commondir(/.*)?$")
   (regex "^/(.*/)?\\.git/config(/.*)?$")
+  (regex "^/(.*/)?\\.git/config\\.worktree(/.*)?$")
+  (regex "^/(.*/)?\\.git/modules/[^/]*/hooks(/.*)?$")
+  (regex "^/(.*/)?\\.git/modules/[^/]*/commondir(/.*)?$")
+  (regex "^/(.*/)?\\.git/modules/[^/]*/config(/.*)?$")
+  (regex "^/(.*/)?\\.git/modules/[^/]*/config\\.worktree(/.*)?$")
+  (subpath "/.git/hooks")
+  (subpath "/.git/commondir")
+  (subpath "/.git/config")
+  (subpath "/.git/config.worktree")
+  (require-all (vnode-type REGULAR-FILE) (regex "^/(.*/)?\\.git$"))
+  (with message "<tag>"))
+(allow file-write-create
+  (require-all (require-all (vnode-type REGULAR-FILE) (regex "^/(.*/)?\\.git$")) (require-any (subpath "/srt-literal-path-entries/proj") (regex "^/srt-literal-path-entries/out/.*$") (regex "^/srt-literal-path-entries/build/[^/]*$") (regex "^/srt-literal-path-entries/cache/[0-9]$")))
   (with message "<tag>"))
 (deny file-write-unlink file-write-create
   (subpath "/srt-literal-path-entries/proj/.git")
@@ -1871,11 +1883,22 @@ const EXPECTED_MACOS_FILE_RULES = String.raw`; File read
   (regex "^/(.*/)?\\.claude/commands/.*(/.*)?$")
   (subpath "/.claude/agents")
   (regex "^/(.*/)?\\.claude/agents/.*(/.*)?$")
+  (regex "^/(.*/)?\\.git/hooks(/.*)?$")
+  (regex "^/(.*/)?\\.git/commondir(/.*)?$")
+  (regex "^/(.*/)?\\.git/config(/.*)?$")
+  (regex "^/(.*/)?\\.git/config\\.worktree(/.*)?$")
+  (regex "^/(.*/)?\\.git/modules/[^/]*/hooks(/.*)?$")
+  (regex "^/(.*/)?\\.git/modules/[^/]*/commondir(/.*)?$")
+  (regex "^/(.*/)?\\.git/modules/[^/]*/config(/.*)?$")
+  (regex "^/(.*/)?\\.git/modules/[^/]*/config\\.worktree(/.*)?$")
   (subpath "/.git/hooks")
   (literal "/.git")
-  (regex "^/(.*/)?\\.git/hooks/.*(/.*)?$")
+  (subpath "/.git/commondir")
   (subpath "/.git/config")
-  (regex "^/(.*/)?\\.git/config(/.*)?$")
+  (subpath "/.git/config.worktree")
+  (with message "<tag>"))
+(deny file-write-unlink
+  (require-all (vnode-type REGULAR-FILE) (regex "^/(.*/)?\\.git$"))
   (with message "<tag>"))
 
 ; File read: keep read-denied paths inside write roots in place
@@ -2354,7 +2377,7 @@ describe.if(!isWindows)(
       join(import.meta.dir, '../../src/sandbox/sandbox-utils.ts'),
     )})
     const { SandboxManager } = await import(${JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/sandbox-manager.ts'),
+      join(import.meta.dir, '../helpers/isolated/manager.ts'),
     )})
     const kept = paths => paths.filter(p => p.endsWith('/debug') || p.endsWith('/_logs')).map(p => p.split('/').slice(-2).join('/'))
     ${body}`
