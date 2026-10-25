@@ -224,34 +224,47 @@ describe.if(isLinux && canRun).each(RUNTIMES)(
       )
     }, 60_000)
 
-    it('denyWrite of a link to what is not there yet keeps it from being made', () => {
+    it('denyWrite of a link to what is not there yet holds the directory it would be made in', () => {
       symlinkSync(
         Buffer.concat([Buffer.from('../elsewhere/'), Buffer.of(0xff)]),
         join(root, 'here/new'),
       )
 
-      // Whether a mount can be put on the link itself is bubblewrap's to say.
       expect(
-        reach(
-          argv,
-          denyWrite(join(root, 'here/new')),
-          'append',
-          ['here/new'],
-          'or not',
-        ),
-      ).toEqual([])
+        reach(argv, denyWrite(join(root, 'here/new')), 'append', [
+          'here/new',
+          'elsewhere/file',
+          'here/file',
+        ]),
+      ).toEqual(['here/file'])
     }, 60_000)
 
     it.each(['file', 'not-there'])(
-      'denyWrite of %s there lets nothing run that could write it',
+      'denyWrite of %s there holds the directory that name is in',
       name => {
         const file = `here/to-bytes/${name}`
         expect(
-          reach(argv, denyWrite(join(root, file)), 'append', [file], false),
+          reach(argv, denyWrite(join(root, file)), 'append', [
+            file,
+            'here/file',
+          ]),
         ).toEqual([])
       },
       60_000,
     )
+
+    it('starts where a built-in deny is a link to what is not there yet', () => {
+      symlinkSync(
+        Buffer.concat([Buffer.from('gone'), Buffer.of(0xff)]),
+        join(root, '.mcp.json'),
+      )
+
+      expect(
+        reach(argv, denyWrite(join(root, 'not-there')), 'append', [
+          '.mcp.json',
+        ]),
+      ).toEqual([])
+    }, 60_000)
   },
 )
 
@@ -350,7 +363,7 @@ describe.if(isLinux && canRun).each(RUNTIMES)(
       ).toEqual(['here/file'])
     }, 60_000)
 
-    it('lets nothing run that could write it where a hop leads to a name that is no text', () => {
+    it('holds where a hop leads to a name that is no text', () => {
       symlinkSync(
         Buffer.concat([Buffer.from('n'), Buffer.of(0xff), Buffer.from('/in')]),
         join(root, 'hop'),
@@ -363,7 +376,7 @@ describe.if(isLinux && canRun).each(RUNTIMES)(
           denyWrite(join(root, 'name')),
           'append',
           ['name'],
-          false,
+          true,
           `mkdir -p ${bytes}/in`,
         ),
       ).toEqual([])
