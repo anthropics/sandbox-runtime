@@ -510,7 +510,14 @@ async function main(): Promise<void> {
 
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
+          try {
+            await SandboxManager.initialize(runtimeConfig)
+          } catch (err) {
+            // The library's own handler resets on the same signal, which
+            // cancels initialize(): the interrupt is the reason to report.
+            interrupted.signal.throwIfAborted()
+            throw err
+          }
 
           // Read config updates only now. The stream has been waiting
           // unread, so nothing the caller wrote meanwhile is lost, and an
