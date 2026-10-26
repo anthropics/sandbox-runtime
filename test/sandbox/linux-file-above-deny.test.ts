@@ -68,11 +68,12 @@ describe.if(isLinux)('A file above a write deny', () => {
       expect(wrapped).not.toContain(join(area, '.git', 'config'))
     })
 
-    // git rewrites and removes it: a checkout that recurses into submodules.
-    it('one below the working directory is left to git', async () => {
+    // Rewritten, it sends the host's git to a git directory of the command's
+    // own. A checkout that recurses into submodules is refused with it.
+    it('one below the working directory is bound onto itself as well', async () => {
       mkdirSync(join(area, 'sub'))
       writeFileSync(join(area, 'sub', '.git'), POINTER)
-      expect(await wrap()).not.toContain(join(area, 'sub'))
+      expect(held(await wrap(), join(area, 'sub', '.git'))).toBe(1)
     })
 
     it('a .git that is a directory is denied as before', async () => {
@@ -92,7 +93,10 @@ describe.if(isLinux)('A file above a write deny', () => {
     // Read without the scan too, which would find the file as well.
     it.each([
       ['a file', ['.git']],
-      ['a directory', ['.git/hooks', '.git/config']],
+      [
+        'a directory',
+        ['.git/hooks', '.git/commondir', '.git/config', '.git/config.worktree'],
+      ],
       ['not there', []],
     ])('what follows from the cwd alone, .git being %s', (what, denied) => {
       if (what === 'a file') writeFileSync(join(area, '.git'), POINTER)

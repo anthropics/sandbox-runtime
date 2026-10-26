@@ -58,6 +58,7 @@ import type {
   MappedDriveCwdError,
   SeclogonDisabledError,
 } from '../../src/sandbox/windows-sandbox-utils.js'
+import { withoutManifestName } from '../helpers/bwrap-argv.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 import { spawnSync } from 'node:child_process'
@@ -2787,7 +2788,9 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
       readdirSpy.mockRestore()
 
       expect(listed).toBeGreaterThan(2)
-      expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+      expect(withoutManifestName(disturbed)).toBe(
+        withoutManifestName(await SandboxManager.wrapWithSandbox('true')),
+      )
       expect(disturbed).toContain(join(root, 'second'))
       expect(disturbed).not.toContain(join(root, 'first'))
     } finally {
@@ -2851,7 +2854,9 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
 
           expect(listed[0]).toBe(root)
           expect(disturbed).toContain(join(root, 'key.pem'))
-          expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+          expect(withoutManifestName(disturbed)).toBe(
+            withoutManifestName(await SandboxManager.wrapWithSandbox('true')),
+          )
           // The first attempt is left at once; the second lists all seven.
           expect(listed.length).toBe(at + 7)
         } finally {
@@ -2907,7 +2912,9 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
         const disturbed = await SandboxManager.wrapWithSandbox('true')
         readdirSpy.mockRestore()
 
-        expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+        expect(withoutManifestName(disturbed)).toBe(
+          withoutManifestName(await SandboxManager.wrapWithSandbox('true')),
+        )
         expect(disturbed).toContain(join(root, 'to'))
         expect(disturbed).not.toContain(join(root, 'from'))
         expect(listed.length).toBe(at + 7)
@@ -2948,7 +2955,9 @@ describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
       const disturbed = await SandboxManager.wrapWithSandbox('true')
 
       expect(fs.readFileSync(scans, 'utf8')).toBe('ran\nran\n')
-      expect(disturbed).toBe(await SandboxManager.wrapWithSandbox('true'))
+      expect(withoutManifestName(disturbed)).toBe(
+        withoutManifestName(await SandboxManager.wrapWithSandbox('true')),
+      )
       expect(disturbed).toContain(join(root, 'to'))
       expect(disturbed).not.toContain(join(root, 'from'))
     } finally {
@@ -3308,7 +3317,9 @@ describe.if(isLinux)('wrapWithSandbox while another wrap walks', () => {
     expect(listed).toBe('aabbbaaa')
     expect(waited).toContain(join(root, holds))
     expect(waited).not.toContain(join(root, lacks))
-    expect(waited).toBe(await SandboxManager.wrapWithSandbox('true'))
+    expect(withoutManifestName(waited)).toBe(
+      withoutManifestName(await SandboxManager.wrapWithSandbox('true')),
+    )
   })
 
   it('keeps the order through a reset()', async () => {

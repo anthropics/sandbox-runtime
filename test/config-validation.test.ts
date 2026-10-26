@@ -1,6 +1,7 @@
 import { describe, test, expect, afterEach, spyOn } from 'bun:test'
 import {
   NetworkConfigSchema,
+  RipgrepConfigSchema,
   SandboxRuntimeConfigSchema,
   WindowsConfigSchema,
 } from '../src/sandbox/sandbox-config.js'
@@ -318,6 +319,14 @@ describe('Config Validation', () => {
     if (result.success) {
       expect(result.data.ripgrep?.command).toBe('/usr/local/bin/rg')
     }
+  })
+
+  test('should take no ripgrep timeout that a timer cannot', () => {
+    const withTimeout = (timeoutMs: number) =>
+      RipgrepConfigSchema.safeParse({ command: 'rg', timeoutMs }).success
+
+    expect(withTimeout(2 ** 31 - 1)).toBe(true)
+    expect(withTimeout(2 ** 31)).toBe(false)
   })
 
   test('should validate config with custom ripgrep command and args', () => {
