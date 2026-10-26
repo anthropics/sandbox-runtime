@@ -50,6 +50,19 @@ export function getDangerousDirectories(): string[] {
 }
 
 /**
+ * The configuration file ripgrep reads, as `RIPGREP_CONFIG_PATH` names it in
+ * this process's environment, or undefined when it names none. ripgrep looks
+ * for no file of its own, so it reads the `.ripgreprc` in
+ * {@link DANGEROUS_FILES} only when the variable names it; and a
+ * configuration file can add any flag, `--pre` among them, which runs a
+ * program. Callers resolve a relative name against the cwd, so it is denied
+ * there only: ripgrep resolves it against whatever directory it runs in.
+ */
+export function getRipgrepConfigFile(): string | undefined {
+  return process.env.RIPGREP_CONFIG_PATH || undefined
+}
+
+/**
  * Normalizes a path for case-insensitive comparison.
  * This prevents bypassing security checks using mixed-case paths on case-insensitive
  * filesystems (macOS/Windows) like `.cLauDe/Settings.locaL.json`.

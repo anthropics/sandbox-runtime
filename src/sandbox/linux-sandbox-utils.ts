@@ -26,6 +26,7 @@ import {
   properAncestors,
   nameLocation,
   getDangerousDirectories,
+  getRipgrepConfigFile,
   workingDirectory,
 } from './sandbox-utils.js'
 import type {
@@ -429,10 +430,11 @@ function dotGitKindAt(dotGitPath: string): DotGitKind {
 }
 
 /**
- * The part of the mandatory deny set that follows from the cwd alone: the
- * dangerous files and directories resolved against it, plus `.git/hooks` and
+ * The part of the mandatory deny set that needs no scan: the dangerous
+ * files and directories resolved against the cwd, plus `.git/hooks` and
  * (unless the caller allows git config) `.git/config`, or a `.git` that is a
- * file.
+ * file; and ripgrep's configuration file ({@link getRipgrepConfigFile}),
+ * wherever the environment puts it.
  * {@link linuxGetMandatoryDenyPaths} adds the nested matches its ripgrep scan
  * finds on top of these. Split out so a consumer that must not scan — the
  * violation monitor, which needs the same denies to judge a write bwrap
@@ -449,6 +451,14 @@ export function linuxGetCwdMandatoryDenyPaths(
     // Dangerous directories in CWD
     ...getDangerousDirectories().map(d => path.resolve(cwd, d)),
   ]
+  const ripgrepConfigFile = getRipgrepConfigFile()
+  if (ripgrepConfigFile !== undefined) {
+    // Not one in /dev (`/dev/null` turns the configuration off): the wrapper
+    // skips those, as --dev /dev replaces that tree, and the violation
+    // monitor must not judge by a deny the wrapper does not apply.
+    const configPath = path.resolve(cwd, ripgrepConfigFile)
+    if (!isAtOrUnder(configPath, '/dev')) denyPaths.push(configPath)
+  }
 
   // Only the cwd's own: a .git file below it is git's to rewrite and remove
   // (a checkout that recurses into submodules does).
