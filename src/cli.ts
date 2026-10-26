@@ -604,7 +604,13 @@ async function main(): Promise<void> {
               interrupted.signal,
             )
             aboutToSpawn()
-            child = spawn(sandboxedCommand, {
+            // bwrap must watch the CLI as its parent, and forwarded signals
+            // must reach bwrap rather than a shell waiting for it.
+            const spawnCommand =
+              process.platform === 'linux'
+                ? `exec ${sandboxedCommand}`
+                : sandboxedCommand
+            child = spawn(spawnCommand, {
               shell: true,
               stdio: sandboxedStdio(controlFd),
             })

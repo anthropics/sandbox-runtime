@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { rmSync } from 'node:fs'
 import { unlink } from 'node:fs/promises'
+import { randomBytes } from 'node:crypto'
 import { logForDebugging } from '../utils/debug.js'
 import { getPlatform } from '../utils/platform.js'
 import { listenInRange } from './listen-in-range.js'
@@ -64,7 +65,7 @@ export interface MuxProxyServer {
   close(): Promise<void>
   /**
    * The part of close() left to a process 'exit' handler, where nothing
-   * awaited runs: remove the backend's unix socket file (Windows has none).
+   * awaited runs: remove a filesystem backend socket, where one exists.
    */
   removeBackendSocketSync(): void
   /** unref() both listeners so they don't keep the event loop alive. */
@@ -75,6 +76,9 @@ const DEFAULT_FIRST_BYTE_TIMEOUT_MS = 10_000
 
 let backendSeq = 0
 function unixSocketPath(): string {
+  if (getPlatform() === 'linux') {
+    return `\0srt-mux-${randomBytes(16).toString('hex')}`
+  }
   // Keep it short — macOS sun_path is 104 bytes.
   return join(
     tmpdir(),
@@ -196,9 +200,8 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     async listenHttpBackend(): Promise<number | undefined> {
       if (!isWindows) {
         const path = unixSocketPath()
-        // A prior process with the same PID may have crashed without
-        // unlinking; clear any stale file so listen() doesn't EADDRINUSE.
-        await unlink(path).catch(() => {})
+        // Filesystem sockets can survive a crashed process with the same PID.
+        if (!path.startsWith('\0')) await unlink(path).catch(() => {})
         await new Promise<void>((resolve, reject) => {
           opts.httpServer.once('error', reject)
           opts.httpServer.listen(path, () => {
@@ -236,15 +239,17 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
       // sandbox-manager.reset() additionally calls forceCloseHttpServer()
       // for closeAllConnections() semantics; double-close is a no-op.
       await new Promise<void>(resolve => opts.httpServer.close(() => resolve()))
-      if (backendSocketPath) {
+      if (backendSocketPath && !backendSocketPath.startsWith('\0')) {
         await unlink(backendSocketPath).catch(() => {})
-        backendSocketPath = undefined
       }
+      backendSocketPath = undefined
       backendTcpPort = undefined
     },
     removeBackendSocketSync(): void {
       try {
-        if (backendSocketPath) rmSync(backendSocketPath, { force: true })
+        if (backendSocketPath && !backendSocketPath.startsWith('\0')) {
+          rmSync(backendSocketPath, { force: true })
+        }
       } catch {
         // Best effort, as in close().
       }
