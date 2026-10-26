@@ -1,0 +1,12 @@
+# Link the C runtime statically into vendor/srt-win-src. With the
+# default dynamic CRT, srt-win.exe imports VCRUNTIME140.dll, which comes
+# with the VC++ Redistributable, not with Windows: where it is missing,
+# srt-win.exe fails to load (0xC0000135) before it can print anything.
+# cargo reads this file from the working directory upwards, and the
+# build scripts and CI run cargo from the repository root with
+# --manifest-path. A RUSTFLAGS environment variable replaces these flags.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
