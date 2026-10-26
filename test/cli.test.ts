@@ -12,10 +12,11 @@ import { join } from 'node:path'
 import { isLinux } from './helpers/platform.js'
 
 /**
- * Get the path to the CLI entry point
+ * Get the path to the CLI entry point, kept out of the user's own mount point
+ * manifests
  */
 function getCliPath(): string {
-  return join(process.cwd(), 'src', 'cli.ts')
+  return join(process.cwd(), 'test', 'helpers', 'isolated', 'cli.ts')
 }
 
 /**

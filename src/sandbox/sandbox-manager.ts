@@ -2332,6 +2332,15 @@ export type WrapWithSandboxOptions = {
    *
    * An id that a network allow list is registered under must also be
    * unguessable: see `registerCommandNetworkLists`.
+   *
+   * On Linux it is also the name under which the wrap records the mount
+   * points its command relies on: pass the same value to
+   * `cleanupAfterCommand({ commandId })` to let go of them at once when the
+   * command will never be started, whatever other commands are still in
+   * flight (a command that ran is let go of by any such call once it has
+   * ended). It has to be unique among the wraps in flight. Only a value passed
+   * here counts for that; the `command` default does not, since two wraps in
+   * flight may share their text.
    */
   commandId?: string
   /**
@@ -2755,7 +2764,8 @@ async function wrapWithSandboxOnce(
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
       }).catch((err: unknown) => {
-        // It awaits once more, for its scan: see the invariant above.
+        // It awaits again, for its scan and for a clean-up under way: see the
+        // invariant above.
         if (err instanceof WorkingDirectoryChanged) return startOver()
         throw err
       })
@@ -3068,11 +3078,20 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
  * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
  * These persist after bwrap exits. This function removes them.
  *
- * Safe to call on any platform — it's a no-op on macOS.
+ * Call it once for each wrapped command, when that command is over. Every
+ * call removes what commands that ran and have ended relied on: this
+ * process's, and those of processes that are gone. A command that was wrapped
+ * and has not started is let go of only once it has been called for every wrap
+ * handed out, because a call cannot tell which command it is for; pass the
+ * `commandId` the wrap was given (`WrapWithSandboxOptions.commandId`) to let
+ * go of that one at once. A wrapped string that has been let go of refuses to
+ * start; until then it may be run again.
+ *
+ * Safe to call on any platform: it does nothing except on Linux.
  * Also called automatically by reset() and on process exit as safety nets.
  */
-function cleanupAfterCommand(): void {
-  cleanupBwrapMountPoints()
+function cleanupAfterCommand(options?: { commandId?: string }): void {
+  cleanupBwrapMountPoints({ commandId: options?.commandId })
 }
 
 /**
@@ -3528,7 +3547,7 @@ export interface ISandboxManager {
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
   updateConfig(newConfig: SandboxRuntimeConfig): void
-  cleanupAfterCommand(): void
+  cleanupAfterCommand(options?: { commandId?: string }): void
   reset(): Promise<void>
 }
 
