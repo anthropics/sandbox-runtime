@@ -49,15 +49,27 @@ pub fn thread_ids_of(pid: u32) -> anyhow::Result<Vec<u32>> {
             dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
             ..Default::default()
         };
-        let mut more = Thread32First(snap.raw(), &mut te).is_ok();
-        while more {
+        let mut step = Thread32First(snap.raw(), &mut te);
+        while snapshot_has_entry(step)? {
             if te.th32OwnerProcessID == pid {
                 out.push(te.th32ThreadID);
             }
-            more = Thread32Next(snap.raw(), &mut te).is_ok();
+            step = Thread32Next(snap.raw(), &mut te);
         }
     }
     Ok(out)
+}
+
+/// Whether a Toolhelp `…First`/`…Next` call produced an entry. Only
+/// `ERROR_NO_MORE_FILES` ends the list; any other failure is an error, so a
+/// caller never acts on a list that was cut short.
+fn snapshot_has_entry(step: windows::core::Result<()>) -> anyhow::Result<bool> {
+    use windows::Win32::Foundation::ERROR_NO_MORE_FILES;
+    match step {
+        Ok(()) => Ok(true),
+        Err(e) if e.code() == ERROR_NO_MORE_FILES.to_hresult() => Ok(false),
+        Err(e) => Err(anyhow::anyhow!("thread snapshot enumeration: {e}")),
+    }
 }
 
 /// The parent process ID recorded for `pid`; `None` when not in the snapshot.
@@ -312,4 +324,23 @@ pub fn enable_privilege(name: &str) -> anyhow::Result<bool> {
     }
     adjusted?;
     Ok(assigned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NO_MORE_FILES};
+
+    #[test]
+    fn only_no_more_files_ends_a_snapshot_walk() {
+        assert!(snapshot_has_entry(Ok(())).unwrap());
+        assert!(!snapshot_has_entry(Err(ERROR_NO_MORE_FILES.into())).unwrap());
+        assert!(snapshot_has_entry(Err(ERROR_ACCESS_DENIED.into())).is_err());
+    }
+
+    #[test]
+    fn thread_ids_of_lists_this_thread() {
+        let me = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        assert!(thread_ids_of(std::process::id()).unwrap().contains(&me));
+    }
 }

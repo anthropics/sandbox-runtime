@@ -126,9 +126,9 @@ const MITIGATION_IMAGE_LOAD_NO_LOW_LABEL: u64 = 1u64 << 56;
 /// ride here while the sandbox-user-profile `USERPROFILE`/`TEMP`
 /// stay isolated.
 ///
-/// `write_restricted` is fail-closed: token creation and the runner's
-/// process and thread self-protect must all succeed, because the
-/// runner's own token is not write-restricted.
+/// `write_restricted` selects the child's token. The runner's process and
+/// thread self-protect must succeed either way, because the runner's own
+/// token is never the child's restricted one.
 pub fn run_lockdown(
     target_exe: &Path,
     target_args: &[String],
@@ -144,16 +144,10 @@ pub fn run_lockdown(
     //    `extra_allow = None` — we run as `srt-sandbox`; an
     //    `srt-sandbox:FA` ACE here would match the child and undo the
     //    protection. First so the protection holds on every later
-    //    error path. Best-effort — log on failure but don't abort,
-    //    since a runner without self-protect is still strictly safer
-    //    than no sandbox. With `write_restricted` it is required
-    //    instead (see the fn doc).
-    if let Err(e) = self_protect::install_broker_dacl(None) {
-        if write_restricted {
-            return Err(e.context("runner self-protect (required with --write-restricted-token)"));
-        }
-        eprintln!("srt-win: WARNING: install_broker_dacl: {e:#}");
-    }
+    //    error path. Required: a runner that cannot protect itself launches
+    //    nothing. Its threads get the same treatment, here and in step 10.
+    self_protect::install_broker_dacl(None).context("runner self-protect (process)")?;
+    self_protect::protect_own_threads().context("runner self-protect (threads)")?;
 
     // 2) Restricted token. Each handle is RAII-owned so any `?`
     //    below closes whatever was already opened.
@@ -318,14 +312,17 @@ pub fn run_lockdown(
             )
         });
     }
-    // Here rather than at entry, so it covers every thread the runner
-    // has started by the time the (still suspended) child first runs.
-    if write_restricted {
-        let n = self_protect::protect_own_threads()
-            .context("runner thread self-protect (required with --write-restricted-token)")?;
-        if dbg {
-            eprintln!("srt-win: run_lockdown: thread self-protect applied ({n} thread(s))");
-        }
+    // Order matters: the default DACL first, so new threads start protected, then
+    // the sweep. Not before the child exists: it would land on the child's objects.
+    self_protect::protect_future_threads()
+        .context("runner self-protect (default DACL for new threads)")?;
+    let protected_threads = self_protect::protect_own_threads()
+        .context("runner self-protect (threads, before resume)")?;
+    if dbg {
+        eprintln!(
+            "srt-win: run_lockdown: thread self-protect applied \
+             ({protected_threads} thread(s))"
+        );
     }
     let prev_suspend = unsafe { ResumeThread(child.thread()) };
     if prev_suspend == u32::MAX {
