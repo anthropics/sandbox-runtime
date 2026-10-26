@@ -258,6 +258,28 @@ How srt reads the channel, and what it refuses:
 
 `srt proxy` (or the single-file `srt-proxy` executable built by `bun run build:srt-proxy`) runs only SRT's HTTP proxy, with no sandboxed child, for a host that runs the workload elsewhere. It accepts on a listening socket the host hands in, terminates every CONNECT in-process, and forwards a request only when a separate decider process, reached over another inherited descriptor, allows it. See [docs/srt-proxy.md](docs/srt-proxy.md) for the command line, the decider protocol and the security model.
 
+#### Reading what was refused: `--violations`
+
+`--violations <path>` appends each violation srt records to a file, one JSON
+object per line, while the command runs:
+
+```bash
+srt --settings ./srt-settings.json --violations ./violations.jsonl -- npm test
+```
+
+```json
+{"timestamp":"…","line":"deny network-outbound github.com:443 (host is not on the allow list)","command":"npm test"}
+```
+
+- It also turns on the kernel monitors, which are off by default on the CLI.
+  Without them only proxy denies are recorded; with them, on macOS, refused
+  filesystem operations are too.
+- A command refused on its last line exits before the monitor has delivered
+  that deny, so with the flag srt waits a moment (250 ms) after the command
+  exits. Without the flag nothing changes.
+- The file is created on the first violation, not before: no file means
+  nothing was refused.
+
 ### As a library
 
 ```typescript
