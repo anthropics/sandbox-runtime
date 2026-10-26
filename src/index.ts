@@ -53,6 +53,8 @@ export {
   type SandboxDependencyCheck,
   LinuxSandboxProfileError,
   type LinuxSandboxProfileErrorCode,
+  type LinuxUnheldLink,
+  type LinuxUnheldLinkReason,
 } from './sandbox/linux-sandbox-utils.js'
 
 // Windows install/status API

@@ -1,6 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf, wayTo } from '../utils/real-path.js'
+import { realPathOf, wayPastMissingNames } from '../utils/real-path.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
@@ -20,6 +20,7 @@ import {
   encodeSandboxedCommand,
   attributionKeyFor,
   DANGEROUS_FILES,
+  followLinks,
   isAbsenceErrno,
   isAtOrUnder,
   isStrictlyUnder,
@@ -150,9 +151,6 @@ function findSymlinkInPath(
   return null
 }
 
-/** As many missing names as one way is followed up from again. */
-const MAX_MISSING_NAMES_PASSED = 40
-
 /**
  * Canonicalize a deny path through symlinks before any mask or bind is
  * computed (resolve-before-mask). Deny paths regularly contain symlinked
@@ -225,21 +223,11 @@ function resolveSymlinkedDenyPath(
   } catch {
     return rejoined // Not a symlink — nothing left to resolve.
   }
-  let why: unknown = 'it goes up from too many names that are not there'
+  let why: unknown
   try {
-    let onward = rejoined
-    for (let i = 0; i < MAX_MISSING_NAMES_PASSED; i++) {
-      const { real, rest, notThere } = wayTo(onward)
-      if ((notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES') {
-        return real || '/'
-      }
-      const names = rest.filter(name => name !== '' && name !== '.')
-      if (names[1] !== '..') {
-        return [real, ...names.slice(0, 2)].join('/') || '/'
-      }
-      alsoDenied?.push(`${real}/${names[0]}`)
-      onward = [real, ...names.slice(2)].join('/')
-    }
+    const { real, rest, shut, passed } = wayPastMissingNames(rejoined)
+    alsoDenied?.push(...passed)
+    return [real, ...(shut ? [] : rest.slice(0, 2))].join('/') || '/'
   } catch (err) {
     why = err
   }
@@ -1035,7 +1023,13 @@ export class WorkingDirectoryChanged extends Error {
 function renderBwrapInvocation(
   bwrapBinary: string,
   bwrapArgs: string[],
-  mounts: { start: number; end: number; mandatoryDenyArgs: number },
+  mounts: {
+    start: number
+    end: number
+    mandatoryDenyArgs: number
+    /** How much of the command word is the seccomp helper's `--hold-link`s. */
+    holdWordsBytes: number
+  },
 ): string {
   // Whose the arguments are and what lowers each share: the mandatory denies
   // follow from what the working directory holds, not from the configuration.
@@ -1100,7 +1094,11 @@ function renderBwrapInvocation(
     closeBwrapArgsProfile(argsFd)
     throw new LinuxSandboxProfileError(
       'command_too_long',
-      `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})`,
+      `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})${
+        mounts.holdWordsBytes > 0
+          ? `. At least ${mounts.holdWordsBytes} of them are not the caller's: they name the symbolic links on the way to denied paths, for the seccomp helper to hold, and stay on the line (seccomp.holdsLinks: false leaves them unheld)`
+          : ''
+      }`,
     )
   }
   logForDebugging(
@@ -1663,6 +1661,60 @@ export async function initializeLinuxNetworkBridge(
   }
 }
 
+/** Why a symbolic link that should be held in place is not; see README.md. */
+export type LinuxUnheldLinkReason =
+  | 'no_helper'
+  | 'told_no'
+  | 'not_told'
+  | 'older_helper'
+  | 'no_answer'
+
+/**
+ * Why the seccomp helper is not handed the links to hold, or undefined where
+ * it is. One built from older sources takes `--hold-link` for the command to
+ * run, so the words go to no helper that is not known to take them.
+ */
+function whyLinksAreNotHeld(
+  helperInUse: boolean,
+  config: SeccompConfig | undefined,
+): LinuxUnheldLinkReason | undefined {
+  if (!helperInUse) return 'no_helper'
+  if (config?.holdsLinks !== undefined) {
+    return config.holdsLinks ? undefined : 'told_no'
+  }
+  // A path the caller gave need name the helper only inside the sandbox.
+  const helper = config?.argv0
+    ? null
+    : getApplySeccompBinaryPath(config?.applyPath)
+  if (helper === null || helper === config?.applyPath) return 'not_told'
+  // THREAT: read, never run. This is outside any sandbox, and where the
+  // library lies in a path the command may write (a checkout, a project's own
+  // node_modules) the file is whatever an earlier command left there.
+  try {
+    return fs.readFileSync(helper).includes('--holds-links')
+      ? undefined
+      : 'older_helper'
+  } catch {
+    return 'no_answer'
+  }
+}
+
+/** A symbolic link where it lies, and why nothing holds it there. */
+export type LinuxUnheldLink = { path: string; reason: LinuxUnheldLinkReason }
+
+// By link: what the latest wrap that met it came to.
+const unheldLinks = new Map<string, LinuxUnheldLinkReason>()
+
+/** `SandboxManager.getLinuxUnheldLinks()`. */
+export function getLinuxUnheldLinks(): LinuxUnheldLink[] {
+  return [...unheldLinks].map(([path, reason]) => ({ path, reason }))
+}
+
+/** For `reset()` and `updateConfig()`: the list is of one configuration. */
+export function forgetLinuxUnheldLinks(): void {
+  unheldLinks.clear()
+}
+
 /**
  * Read by the seccomp helper, never by this process. The write denies are
  * read-only binds, and a bind protects a path only in the mount namespace it
@@ -2101,7 +2153,14 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
-): Promise<{ args: string[]; mandatoryDenyArgs: number }> {
+  /** Whether the caller has `linksToHold` held. */
+  linksAreHeld = false,
+): Promise<{
+  args: string[]
+  mandatoryDenyArgs: number
+  /** The links the command could replace, each with what it said. */
+  linksToHold: Array<[link: string, target: string]>
+}> {
   const args: string[] = []
   const startedIn = workingDirectory()
   // fs already imported
@@ -2114,6 +2173,19 @@ async function generateFilesystemArgs(
   const denyWriteArgs: string[] = []
   // Where the mandatory denies' binds begin in it: after the configuration's.
   let mandatoryDenyArgsStart = Infinity
+  // What the ways to the denied paths depend on; see followLinks.
+  const linksToDenies = new Map<string, string>()
+  const leftOnTheWay = new Set<string>()
+  /**
+   * Returns what stands in for `name` where the walk to it could not look in
+   * a directory: that directory, and the missing names it went up from before.
+   */
+  const noteLinksTo = (name: string): string[] | undefined => {
+    const { links, left, passed, unsearched } = followLinks(name)
+    for (const [link, target] of links) linksToDenies.set(link, target)
+    for (const dir of left) leftOnTheWay.add(dir)
+    return unsearched === undefined ? undefined : [unsearched, ...passed]
+  }
   // Directories that a deny entry re-binds read-only inside the sandbox
   // (--ro-bind <dir> <dir>), keyed by resolved dest, with every raw
   // (pre-resolution) spelling each was reached through. A non-existent deny
@@ -2619,6 +2691,21 @@ async function generateFilesystemArgs(
     // against it on both sides of the await above, the only one here.
     if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
 
+    // Each deny path as both loops below take it. A directory the walk could
+    // not look in stands in for the path: bound read-only, it keeps its mode.
+    const rawDenyPaths = denyPaths.flatMap(pathPattern => {
+      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
+      // Both loops skip it.
+      if (rawPath.startsWith('/dev/')) return rawPath
+      const instead = noteLinksTo(rawPath)
+      if (instead === undefined) return rawPath
+      logForDebugging(
+        `[Sandbox Linux] Write deny path ${rawPath} cannot be looked at; denying ${instead[0]} whole instead`,
+        { level: 'warn' },
+      )
+      return instead
+    })
+
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
     // bwrap's ensure_file() falls through to creat() on a read-only mount.
@@ -2643,12 +2730,11 @@ async function generateFilesystemArgs(
     // where the loop masks that component and emits no bind for the
     // directory (the re-check below); an emitted one missing from the record
     // only costs a spurious abort.
-    for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
+    for (const rawPath of rawDenyPaths) {
       if (rawPath.startsWith('/dev/')) {
         continue
       }
-      const resolvedPath = resolveSymlinkedDenyPath(rawPath, denyPaths)
+      const resolvedPath = resolveSymlinkedDenyPath(rawPath, rawDenyPaths)
       if (resolvedPath === null || resolvedPath.startsWith('/dev/')) {
         continue
       }
@@ -2921,11 +3007,10 @@ async function generateFilesystemArgs(
           return '/dev/null'
       }
     }
-    for (const [index, pathPattern] of denyPaths.entries()) {
+    for (const [index, rawPath] of rawDenyPaths.entries()) {
       if (index === configuredDenyPaths.length) {
         mandatoryDenyArgsStart = denyWriteArgs.length
       }
-      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (rawPath.startsWith('/dev/')) {
@@ -3299,9 +3384,39 @@ async function generateFilesystemArgs(
   // each: a symlink spelling would pin the chain of the link, not of where
   // the mount sits. Deny binds, tmpfs units and masks are emitted later and
   // land on top of both pins and covers.
+  //
+  // The read side's names count like the write denies': the next wrap finds
+  // what to hide by the name again. A path that cannot be looked at has its
+  // stand-in already (readDenyTargetOf), and one that is where it resolves to
+  // has no link on the way.
+  for (const name of [
+    ...readDenyPlan().map(entry => entry.normalizedPath),
+    ...(maskedFileBinds ?? []).map(bind => bind.realPath),
+  ]) {
+    const { canonical, resolved } = canonicalLocationOf(name)
+    if (!resolved || canonical !== name) noteLinksTo(name)
+  }
+  readConfig?.matchedLinks?.forEach(noteLinksTo)
+  // A link is held where the command could replace it: in a directory it can
+  // write to, and sees as it is on the host.
+  const linksToHold = [...linksToDenies].filter(
+    ([link]) =>
+      isWithinAnyAllowedWritePath(path.dirname(link)) &&
+      !KERNEL_TOP_LEVEL_DIRS.some(dir => isAtOrUnder(link, dir)) &&
+      !isHiddenByTmpfs(path.dirname(link), 'writes and reads'),
+  )
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
+      // The directories above a held link are pinned like those above a
+      // mount, and so is each the way goes up from, itself included. Where
+      // nothing holds the links, pins would keep nothing from being led away.
+      ...(linksAreHeld || linksToHold.length === 0
+        ? [
+            ...linksToHold.map(([link]) => link),
+            ...[...leftOnTheWay].map(dir => `${dir}/.`),
+          ]
+        : []),
       ...fileMasks.map(mask => mask.landing),
       ...readDenyTmpfsUnits.map(unit => unit.landing),
     ],
@@ -3480,7 +3595,7 @@ async function generateFilesystemArgs(
     args.push('--ro-bind', emptySource, emptySource)
   }
 
-  return { args, mandatoryDenyArgs }
+  return { args, mandatoryDenyArgs, linksToHold }
 }
 
 /**
@@ -3779,7 +3894,15 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
-    const { args: fsArgs, mandatoryDenyArgs } = await generateFilesystemArgs(
+    const whyNotHeld = whyLinksAreNotHeld(
+      applySeccompPrefix !== undefined,
+      seccompConfig,
+    )
+    const {
+      args: fsArgs,
+      mandatoryDenyArgs,
+      linksToHold,
+    } = await generateFilesystemArgs(
       readConfig,
       writeConfig,
       maskedFileBinds,
@@ -3788,13 +3911,20 @@ export async function wrapCommandWithSandboxLinux(
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      whyNotHeld === undefined,
     )
+    const holdWords =
+      whyNotHeld === undefined
+        ? quote(linksToHold.flatMap(pair => ['--hold-link', ...pair]))
+        : ''
+    if (holdWords !== '') applySeccompPrefix += `${holdWords} `
     const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)
     const mounts = {
       start: mountsStart,
       end: bwrapArgs.length,
       mandatoryDenyArgs,
+      holdWordsBytes: Buffer.byteLength(holdWords, 'utf8'),
     }
 
     // Always bind /dev
@@ -3920,6 +4050,18 @@ export async function wrapCommandWithSandboxLinux(
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
     )
+
+    for (const [link] of linksToHold) {
+      if (whyNotHeld === undefined) {
+        unheldLinks.delete(link)
+        continue
+      }
+      unheldLinks.set(link, whyNotHeld)
+      logForDebugging(
+        `[Sandbox Linux] A denied path leads through the symbolic link ${link}, which the command can replace: nothing holds it (${whyNotHeld})`,
+        { level: 'warn' },
+      )
+    }
 
     // INVARIANT: a wrap that hands out a command is in the count when it does,
     // whatever a forced cleanup did meanwhile: its caller gives one back.

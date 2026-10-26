@@ -269,6 +269,10 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       const shut = join(PROJ, 'shut')
       expect(countMounts(result, '--ro-bind', shut, shut)).toBe(1)
       expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
+      // Made a link, the missing name would lead to another `shut`.
+      expect(
+        countMounts(result, '--ro-bind', '/dev/null', join(PROJ, 'gone')),
+      ).toBe(target.startsWith('gone') ? 1 : 0)
     },
   )
 
@@ -281,7 +285,8 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
 
       const result = await wrap([join(PROJ, 'name')])
 
-      expect(result).not.toContain(shut)
+      // Among the mounts: the helper is told what the link it holds says.
+      expect(result.split(' -- ')[0]).not.toContain(shut)
       expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
     },
   )
