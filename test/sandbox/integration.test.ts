@@ -13,6 +13,11 @@ import { join } from 'node:path'
 import { isLinux } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { bwrapCanNamespaceNetwork } from '../helpers/bwrap-namespace.js'
+import {
+  runNetworkProbe,
+  withHttpTarget,
+  withDnsTarget,
+} from '../helpers/network-probe.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
@@ -166,28 +171,25 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         expect(output).toContain('blocked by network allowlist')
       })
 
-      it('should block HTTP requests to anthropic.com (not in allowlist)', async () => {
-        // Use --max-time to timeout quickly, and --show-error to see proxy errors
-        const command = await SandboxManager.wrapWithSandbox(
-          'curl -s --show-error --max-time 2 https://www.anthropic.com',
-        )
+      it('should block HTTPS requests to a non-allowlisted server', async () => {
+        await withHttpTarget(async target => {
+          const control = await runNetworkProbe(
+            `curl -sS --max-time 2 --noproxy "" ${target.url}`,
+            false,
+          )
+          expect(control.status).toBe(0)
+          expect(control.stdout).toContain(target.body)
+          const connections = target.connections()
+          expect(connections).toBeGreaterThan(0)
 
-        const result = await spawnAsync(command, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
+          const result = await runNetworkProbe(
+            `curl -sS --max-time 2 --connect-timeout 2 --noproxy "" ${target.httpsUrl}`,
+            true,
+          )
+          expect(result.status).toBe(56)
+          expect(result.stderr).toContain('403')
+          expect(target.connections()).toBe(connections)
         })
-
-        // The proxy blocks the connection, causing curl to timeout or fail
-        // Check that the request did not succeed
-        const output = (result.stderr || result.stdout || '').toLowerCase()
-        const didFail = result.status !== 0 || result.status === null
-        expect(didFail).toBe(true)
-
-        // The output should either contain an error or be empty (timeout)
-        // It should NOT contain successful HTML response
-        expect(output).not.toContain('<!doctype html')
-        expect(output).not.toContain('<html')
       })
 
       it('should allow HTTP requests to allowlisted domains', async () => {
@@ -1008,116 +1010,70 @@ describe.if(isLinux)(
       })
 
       it('should block all HTTP requests when allowedDomains is empty', async () => {
-        // Try to access example.com - should be blocked
-        const command = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 --connect-timeout 2 http://example.com 2>&1 || echo "network_failed"',
-        )
+        await withHttpTarget(async target => {
+          const command = `curl -sS --fail --max-time 2 --connect-timeout 2 --noproxy "" ${target.url}`
+          const control = await runNetworkProbe(command, false)
+          expect(control.status).toBe(0)
+          expect(control.stdout).toContain(target.body)
+          const connections = target.connections()
+          expect(connections).toBeGreaterThan(0)
 
-        const result = await spawnAsync(command, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 5000,
+          const result = await runNetworkProbe(command, true)
+          expect([7, 22, 28]).toContain(result.status)
+          expect(result.stdout).not.toContain(target.body)
+          expect(target.connections()).toBe(connections)
         })
-
-        // With empty allowedDomains, network should be completely blocked
-        // curl should fail with network-related error
-        const output = (result.stdout + result.stderr).toLowerCase()
-
-        // Network should fail - either connection error, timeout, proxy rejection, or "network_failed" echo
-        const networkBlocked =
-          output.includes('network_failed') ||
-          output.includes("couldn't connect") ||
-          output.includes('connection refused') ||
-          output.includes('network is unreachable') ||
-          output.includes('name or service not known') ||
-          output.includes('timed out') ||
-          output.includes('connection timed out') ||
-          output.includes('blocked by') ||
-          result.status !== 0
-
-        expect(networkBlocked).toBe(true)
-
-        // Should NOT contain successful HTML response
-        expect(output).not.toContain('example domain')
-        expect(output).not.toContain('<!doctype')
       })
 
       it('should block all HTTPS requests when allowedDomains is empty', async () => {
-        const command = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 --connect-timeout 2 https://example.com 2>&1 || echo "network_failed"',
-        )
+        await withHttpTarget(async target => {
+          const control = await runNetworkProbe(
+            `curl -sS --max-time 2 --noproxy "" ${target.url}`,
+            false,
+          )
+          expect(control.status).toBe(0)
+          expect(control.stdout).toContain(target.body)
+          const connections = target.connections()
+          expect(connections).toBeGreaterThan(0)
 
-        const result = await spawnAsync(command, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 5000,
+          const result = await runNetworkProbe(
+            `curl -sS --max-time 2 --connect-timeout 2 --noproxy "" ${target.httpsUrl}`,
+            true,
+          )
+          expect([7, 28, 56]).toContain(result.status)
+          expect(target.connections()).toBe(connections)
         })
-
-        const output = (result.stdout + result.stderr).toLowerCase()
-
-        // Network should fail
-        const networkBlocked =
-          output.includes('network_failed') ||
-          output.includes("couldn't connect") ||
-          output.includes('connection refused') ||
-          output.includes('network is unreachable') ||
-          output.includes('name or service not known') ||
-          output.includes('timed out') ||
-          output.includes('blocked by') ||
-          result.status !== 0
-
-        expect(networkBlocked).toBe(true)
       })
 
       it('should block DNS lookups when allowedDomains is empty', async () => {
-        // Try DNS lookup - should fail with no network
-        const command = await SandboxManager.wrapWithSandbox(
-          'host example.com 2>&1 || nslookup example.com 2>&1 || echo "dns_failed"',
-        )
+        await withDnsTarget(async target => {
+          const control = await runNetworkProbe(target.command, false)
+          expect(control.status).toBe(0)
+          expect(control.stdout).toContain('DNS_CODE:EREFUSED')
+          const queries = target.queries()
+          expect(queries).toBeGreaterThan(0)
 
-        const result = await spawnAsync(command, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 5000,
+          const result = await runNetworkProbe(target.command, true)
+          expect(result.status).toBe(1)
+          expect(result.stdout).toMatch(/DNS_CODE:(ECONNREFUSED|ETIMEOUT)/)
+          expect(target.queries()).toBe(queries)
         })
-
-        const output = (result.stdout + result.stderr).toLowerCase()
-
-        // DNS should fail when network is blocked
-        const dnsBlocked =
-          output.includes('dns_failed') ||
-          output.includes('connection timed out') ||
-          output.includes('no servers could be reached') ||
-          output.includes('network is unreachable') ||
-          output.includes('name or service not known') ||
-          output.includes('temporary failure') ||
-          result.status !== 0
-
-        expect(dnsBlocked).toBe(true)
       })
 
       it('should block wget when allowedDomains is empty', async () => {
-        const command = await SandboxManager.wrapWithSandbox(
-          'wget -q --timeout=2 -O - http://example.com 2>&1 || echo "wget_failed"',
-        )
+        await withHttpTarget(async target => {
+          const command = `wget -q --tries=1 --timeout=2 -O - ${target.url}`
+          const control = await runNetworkProbe(command, false)
+          expect(control.status).toBe(0)
+          expect(control.stdout).toContain(target.body)
+          const connections = target.connections()
+          expect(connections).toBeGreaterThan(0)
 
-        const result = await spawnAsync(command, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 5000,
+          const result = await runNetworkProbe(command, true)
+          expect([4, 8]).toContain(result.status)
+          expect(result.stdout).not.toContain(target.body)
+          expect(target.connections()).toBe(connections)
         })
-
-        const output = (result.stdout + result.stderr).toLowerCase()
-
-        // wget should fail
-        const wgetBlocked =
-          output.includes('wget_failed') ||
-          output.includes('failed') ||
-          output.includes('network is unreachable') ||
-          output.includes('unable to resolve') ||
-          result.status !== 0
-
-        expect(wgetBlocked).toBe(true)
       })
 
       it('should allow local filesystem operations when network is blocked', async () => {
