@@ -375,7 +375,7 @@ pub fn run_lockdown(
 /// `srt-win exec` is a dumb passthrough for proxy configuration: it
 /// does NOT synthesize `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` and has
 /// no `--http-proxy` / `--socks-proxy` flags. The single source of
-/// proxy env is the TS `generateProxyEnvVars`, which the caller passes
+/// proxy env is the TS `generateProxyEnvEntries`, which the caller passes
 /// via `--env`; this function forwards the runner's environment
 /// (= the sandbox user's `LOGON_WITH_PROFILE` defaults) with the
 /// overlay applied on top to the child. No proxy value is invented,
@@ -445,7 +445,7 @@ fn merge_env(
 /// An environment name as Windows compares it: UTF-16 units, each
 /// upper-cased on its own. A unit with no single-unit upper-case form
 /// stays as it is, so names that are not valid Unicode fold too.
-fn fold_env_name(name: &std::ffi::OsStr) -> Vec<u16> {
+pub(crate) fn fold_env_name(name: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
     name.encode_wide()
@@ -982,5 +982,22 @@ mod tests {
         let block = encode_env_block(os(&[("A", "1"), ("b", "x=y")]));
         let expected: Vec<u16> = "A=1\0b=x=y\0\0".encode_utf16().collect();
         assert_eq!(block, expected);
+    }
+
+    /// The final link of the `--env-stdin` delivery path: an overlay entry
+    /// (as `exec` sends it in the runner spec) lands in the environment
+    /// block once, under the variable's one spelling.
+    #[test]
+    fn build_env_block_carries_overlay_entry() {
+        let url = "http://sb:tokprobe0123@localhost:60080";
+        for given in ["https_proxy", "HTTPS_PROXY"] {
+            let block = build_env_block(&[(given.to_string(), url.to_string())]);
+            let s = String::from_utf16(&block).expect("utf16");
+            let named: Vec<&str> = s
+                .split('\0')
+                .filter(|e| e.to_ascii_lowercase().starts_with("https_proxy="))
+                .collect();
+            assert_eq!(named, [format!("https_proxy={url}")], "given {given}");
+        }
     }
 }

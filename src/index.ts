@@ -102,6 +102,10 @@ export {
   WINDOWS_ALLOW_LOOPBACK_EFFECT,
   WINDOWS_LOOPBACK_PROBE_PORT,
   SRT_WIN_DISPATCH_ARG1,
+  spawnWrappedCommandWindows,
+  writeStdinPayload,
+  encodeEnvStdinFrame,
+  ENV_STDIN_FRAME_CAP,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
   WindowsSandboxErrorCode,
