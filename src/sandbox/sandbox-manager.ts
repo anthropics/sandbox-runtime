@@ -36,7 +36,6 @@ import {
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
-import { whichSync } from '../utils/which.js'
 import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
@@ -65,6 +64,13 @@ import {
   linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
+import {
+  describeUnavailableHostHelper,
+  findHostHelper,
+  writableNamedHelperWarning,
+  writablePlaces,
+  type WritablePlaces,
+} from './host-helpers.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -1547,8 +1553,10 @@ async function initializeSteps(
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
       // Async: the global-npm fallback spawns `npm root -g`.
       javaAgentJarPath =
-        (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
-        undefined
+        (await getJavaProxyAgentJarPathAsync(
+          config.javaAgentJarPath,
+          hostWritablePlaces(),
+        )) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1575,6 +1583,7 @@ async function initializeSteps(
           httpProxyPort,
           socksProxyPort,
           config.socatPath,
+          hostWritablePlaces(),
         )
       }
 
@@ -1617,6 +1626,21 @@ function isSandboxingEnabled(): boolean {
 }
 
 /**
+ * Where a wrap under the installed configuration lets the sandboxed command
+ * write (see `writablePlaces`), for what is looked up outside a wrap. A
+ * configuration that cannot be read counts as none: whoever enforces it says
+ * what is wrong with it. POSIX only, like the search.
+ */
+function hostWritablePlaces(): WritablePlaces {
+  if (getPlatform() === 'windows') return writablePlaces('anywhere')
+  try {
+    return writablePlaces(config && writeRootsOf(getFsWriteConfig()))
+  } catch {
+    return writablePlaces(undefined)
+  }
+}
+
+/**
  * Platform-independent part of the dependency check. Returns either
  * a finished result (POSIX, unsupported platform, or a Windows
  * srt-win resolution failure) or the inputs for the Windows probe —
@@ -1646,14 +1670,31 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
     // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
     // profiles take regex patterns directly, so rg is never invoked there.
     const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
-    if (whichSync(rgToCheck.command) === null) {
-      errors.push(`ripgrep (${rgToCheck.command}) not found`)
+    const writable = hostWritablePlaces()
+    // Looked for the way the wrap will look for it.
+    const search = findHostHelper(rgToCheck.command, writable)
+    if (search.path === null) {
+      errors.push(
+        describeUnavailableHostHelper(
+          rgToCheck.command,
+          'ripgrep.command',
+          search,
+          `ripgrep (${rgToCheck.command}) not found`,
+        ),
+      )
     }
+    const warning = writableNamedHelperWarning(
+      'ripgrep.command',
+      rgToCheck.command,
+      writable,
+    )
+    if (warning !== undefined) warnings.push(warning)
 
     const linuxDeps = checkLinuxDependencies({
       seccompConfig: config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
+      writable,
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
@@ -1721,7 +1762,10 @@ async function checkDependenciesAsync(
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
   if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+    await getApplySeccompBinaryPathAsync(
+      config?.seccomp?.applyPath,
+      hostWritablePlaces(),
+    )
   }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
@@ -2752,6 +2796,7 @@ async function wrapWithSandboxOnce(
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        alsoWritable: hostWritablePlaces(),
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
       }).catch((err: unknown) => {

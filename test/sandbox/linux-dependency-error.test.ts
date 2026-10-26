@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import * as childProcess from 'node:child_process'
 import * as which from '../../src/utils/which.js'
 import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
+import * as hostHelpers from '../../src/sandbox/host-helpers.js'
 import {
   CAP_SETFCAP,
   CAP_SETFCAP_MISSING_MESSAGE,
@@ -22,6 +23,7 @@ const lacksSetfcap = !processHasBoundingCapability(CAP_SETFCAP)
 // just the piece it's exercising. spyOn patches the export binding, so
 // linux-sandbox-utils' own imports see the replacement.
 let whichSpy: ReturnType<typeof spyOn>
+let hostHelperSpy: ReturnType<typeof spyOn>
 let applySpy: ReturnType<typeof spyOn>
 let euidSpy: ReturnType<typeof spyOn> | undefined
 let spawnSyncSpy: ReturnType<typeof spyOn>
@@ -30,17 +32,21 @@ let spawnSyncSpy: ReturnType<typeof spyOn>
 const bwrapExiting = (status: number, stderr = '') =>
   ({ status, signal: null, pid: 1, output: [], stdout: '', stderr }) as never
 
-// The spawns that are not the `bwrap --version` probe every caller runs:
-// the ones that ask about capabilities.
+// The spawns that are not the bare `bwrap --version` every caller runs: the
+// ones that ask about capabilities, which run `--version` inside a sandbox.
 const capabilityProbes = (): unknown[] =>
   spawnSyncSpy.mock.calls.filter(
     (call: unknown[]) =>
-      !(Array.isArray(call[1]) && call[1].includes('--version')),
+      !(Array.isArray(call[1]) && call[1].join(' ') === '--version'),
   )
 
 beforeEach(() => {
   whichSpy = spyOn(which, 'whichSync').mockImplementation(
     (bin: string) => `/usr/bin/${bin}`,
+  )
+  // What is passed over is host-helpers.test.ts's.
+  hostHelperSpy = spyOn(hostHelpers, 'findHostHelper').mockImplementation(
+    (name: string) => ({ path: which.whichSync(name), skipped: [] }),
   )
   applySpy = spyOn(seccomp, 'getApplySeccompBinaryPath').mockReturnValue(
     '/path/to/apply-seccomp',
@@ -57,6 +63,7 @@ beforeEach(() => {
 
 afterEach(() => {
   whichSpy.mockRestore()
+  hostHelperSpy.mockRestore()
   applySpy.mockRestore()
   euidSpy?.mockRestore()
   spawnSyncSpy.mockRestore()
@@ -147,7 +154,7 @@ describe('checkLinuxDependencies', () => {
   test('passes custom applyPath through to the resolver', () => {
     checkLinuxDependencies({ seccompConfig: { applyPath: '/custom/apply' } })
 
-    expect(applySpy).toHaveBeenCalledWith('/custom/apply')
+    expect(applySpy).toHaveBeenCalledWith('/custom/apply', expect.anything())
   })
 
   test('argv0 mode: no seccomp warning even when binary lookup would fail', () => {
@@ -206,12 +213,15 @@ describe('uid0SandboxError', () => {
         bwrap: '/usr/bin/bwrap-refuses',
       }),
     ).toBe(`${CAP_SETFCAP_MISSING_MESSAGE} (bubblewrap: ${REFUSAL})`)
+    // The command inside is the same bubblewrap by its path, never a bare name.
+    expect(spawnSyncSpy.mock.calls[0]?.[0]).toBe('/usr/bin/bwrap-refuses')
     expect(spawnSyncSpy.mock.calls[0]?.[1]).toEqual([
       '--unshare-user',
       '--dev-bind',
       '/',
       '/',
-      'true',
+      '/usr/bin/bwrap-refuses',
+      '--version',
     ])
   })
 

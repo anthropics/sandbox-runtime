@@ -49,6 +49,7 @@ export type {
 
 // Platform-specific utilities
 export type { SandboxViolationEvent } from './sandbox/macos-sandbox-utils.js'
+export type { SkippedHostHelper } from './sandbox/host-helpers.js'
 export {
   type SandboxDependencyCheck,
   LinuxSandboxProfileError,
