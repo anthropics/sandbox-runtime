@@ -126,13 +126,17 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
 
   it('blocks write outside allowWrite', () => {
     const out = join(DENIED, 'out')
-    const r = srt(`echo bad > ${out}`)
+    const r = srt(`echo SANDBOX-RAN; echo bad > ${out}`)
+    expect(r.stdout).toContain('SANDBOX-RAN')
     expect(r.status).not.toBe(0)
     expect(existsSync(out)).toBe(false)
   })
 
   it('seccomp blocks AF_UNIX socket creation', () => {
-    const r = srt('python3 -c "import socket; socket.socket(socket.AF_UNIX)"')
+    const r = srt(
+      'echo SANDBOX-RAN; python3 -c "import socket; socket.socket(socket.AF_UNIX)"',
+    )
+    expect(r.stdout).toContain('SANDBOX-RAN')
     expect(r.status).not.toBe(0)
     expect(r.stderr.toLowerCase()).toMatch(
       /permission denied|operation not permitted/,
