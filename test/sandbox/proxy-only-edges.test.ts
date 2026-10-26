@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { closeSync, openSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import { connect, type AddressInfo, type Socket } from 'node:net'
 import { connect as tlsConnect, type TLSSocket } from 'node:tls'
 import { createMitmCA, generateCa } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
-import { startProxyOnly } from '../../src/sandbox/proxy-only.js'
+import { openFdStreams, startProxyOnly } from '../../src/sandbox/proxy-only.js'
 import {
   SERVES_EMITTED_CONNECTIONS,
   testWithTls,
 } from '../helpers/emitted-connections.js'
 import { fakeDecider, type Frame } from '../helpers/fake-decider.js'
+import { isLinux } from '../helpers/platform.js'
 
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => {
@@ -321,6 +323,24 @@ describe('TRACE inside a terminated tunnel', () => {
       expect(await readAll(second)).toMatch(/^HTTP\/1\.1 200 /)
       expect(requests()).toEqual([...before, 'GET'])
       expect(reached).toEqual(['GET'])
+    },
+  )
+})
+
+describe('a write to an inherited fd that fails', () => {
+  // /dev/full refuses every write. Bun buffers the small chunk, so flush()
+  // reports it, and hands the large one straight to write().
+  test.skipIf(!isLinux).each([1, 1 << 20])(
+    'reaches the callback: %d byte(s)',
+    async size => {
+      const fd = openSync('/dev/full', 'w')
+      cleanup.push(() => closeSync(fd))
+      const { output } = openFdStreams(fd)
+      output.on('error', () => {})
+      const failure = await new Promise<Error | null | undefined>(resolve =>
+        output.write(Buffer.alloc(size), resolve),
+      )
+      expect(failure).toMatchObject({ code: 'ENOSPC' })
     },
   )
 })

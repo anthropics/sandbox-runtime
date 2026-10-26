@@ -310,14 +310,15 @@ export function openFdStreams(fd: number): {
       input: Readable.fromWeb(file.stream()),
       output: new Writable({
         write(chunk: Buffer, _encoding, callback) {
-          try {
+          // A failed write shows in one of three ways: write() rejects (a
+          // chunk too large to buffer), flush() throws, or flush() rejects.
+          // Inside an async function all three reach the callback.
+          const send = async (): Promise<void> => {
             sink ??= file.writer()
-            sink.write(chunk)
-            // On a broken pipe flush() throws rather than rejects.
-            Promise.resolve(sink.flush()).then(() => callback(), callback)
-          } catch (err) {
-            callback(err as Error)
+            await sink.write(chunk)
+            await sink.flush()
           }
+          send().then(() => callback(), callback)
         },
         final(callback) {
           Promise.resolve(sink?.end()).then(() => callback(), callback)
