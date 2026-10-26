@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import * as which from '../../src/utils/which.js'
 import * as platform from '../../src/utils/platform.js'
+import * as hostHelpers from '../../src/sandbox/host-helpers.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 
 // SandboxManager.checkDependencies() must only require ripgrep on Linux,
@@ -9,15 +10,23 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 
 let whichSpy: ReturnType<typeof spyOn>
 let platformSpy: ReturnType<typeof spyOn>
+let hostHelperSpy: ReturnType<typeof spyOn>
 
 beforeEach(() => {
   whichSpy = spyOn(which, 'whichSync')
   platformSpy = spyOn(platform, 'getPlatform')
+  // The manager keeps the configuration of whichever suite ran before, and
+  // findHostHelper judges by it: pin the lookup to the unrestricted case,
+  // which is the whichSync mocked here.
+  hostHelperSpy = spyOn(hostHelpers, 'findHostHelper').mockImplementation(
+    (name: string) => ({ path: which.whichSync(name), skipped: [] }),
+  )
 })
 
 afterEach(() => {
   whichSpy.mockRestore()
   platformSpy.mockRestore()
+  hostHelperSpy.mockRestore()
 })
 
 describe('SandboxManager.checkDependencies: ripgrep', () => {

@@ -36,7 +36,6 @@ import {
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
-import { whichSync } from '../utils/which.js'
 import type { RipgrepConfig } from '../utils/ripgrep.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
@@ -47,6 +46,7 @@ import type {
   SandboxRuntimeConfig,
   SeccompConfig,
 } from './sandbox-config.js'
+import { FilesystemConfigSchema } from './sandbox-config.js'
 import type {
   SandboxAskCallback,
   CredentialRestrictionConfig,
@@ -62,9 +62,20 @@ import {
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
+  forgetLinuxUnheldLinks,
+  getLinuxUnheldLinks,
+  type LinuxUnheldLink,
   linuxGetCwdMandatoryDenyPaths,
+  LinuxSandboxProfileError,
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
+import {
+  describeUnavailableHostHelper,
+  findHostHelper,
+  writableNamedHelperWarning,
+  writablePlaces,
+  type WritablePlaces,
+} from './host-helpers.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -87,6 +98,7 @@ import {
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
   windowsGrantsBeneathDenies,
+  windowsMandatoryDenyPaths,
   type WindowsProfileGrantItem,
   type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
@@ -109,11 +121,15 @@ import {
   containsGlobChars,
   globBaseDirIsRoot,
   globPatternBaseDir,
+  isUncPath,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
+  GlobWalkBudgetError,
   walkGlobPatternSteps,
   workingDirectory,
+  type GlobWalkBudget,
   type GlobWalkListings,
+  newGlobWalkBudget,
   type Steps,
   finish,
   finishInTurns,
@@ -197,6 +213,9 @@ let proxyAuthToken: string | undefined
 // at initialize(). `undefined` means no stamp/grant was applied
 // (gates running `acl restore`/`acl revoke` at reset()).
 let windowsFsStampedSet: WindowsFsAccessSet | undefined
+// The objects this session has put a write deny on, each by its path and
+// file index: see `windowsMandatoryDeniesDue`.
+let windowsWriteDenied = new Map<string, bigint | undefined>()
 // The sandbox user SID captured at initialize(). reset() uses this
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
@@ -1451,6 +1470,12 @@ async function initializeSteps(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
+      // A share is not looked at (see isUncPath). No mandatory deny is on one.
+      const writeDenied = new Map(
+        acc.denyWrite
+          .filter(p => !isUncPath(p))
+          .map(p => [p, windowsFileIndexOf(p)]),
+      )
       // One call, always made: it also records this process as a
       // session. Write roots are kept at reset(); a failure throws.
       await grantWindowsAclPersistent({
@@ -1466,6 +1491,7 @@ async function initializeSteps(
       // recorded with srt-win, whatever it was given. Set before the
       // probe, so that a reset() during it releases what was granted.
       windowsFsStampedSet = acc
+      windowsWriteDenied = writeDenied
       logForDebugging(
         `[Sandbox Windows] fs applied: ` +
           `${acc.grantWrite.length} grantWrite, ` +
@@ -1547,8 +1573,10 @@ async function initializeSteps(
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
       // Async: the global-npm fallback spawns `npm root -g`.
       javaAgentJarPath =
-        (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
-        undefined
+        (await getJavaProxyAgentJarPathAsync(
+          config.javaAgentJarPath,
+          hostWritablePlaces(),
+        )) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1575,6 +1603,7 @@ async function initializeSteps(
           httpProxyPort,
           socksProxyPort,
           config.socatPath,
+          hostWritablePlaces(),
         )
       }
 
@@ -1617,6 +1646,21 @@ function isSandboxingEnabled(): boolean {
 }
 
 /**
+ * Where a wrap under the installed configuration lets the sandboxed command
+ * write (see `writablePlaces`), for what is looked up outside a wrap. A
+ * configuration that cannot be read counts as none: whoever enforces it says
+ * what is wrong with it. POSIX only, like the search.
+ */
+function hostWritablePlaces(): WritablePlaces {
+  if (getPlatform() === 'windows') return writablePlaces('anywhere')
+  try {
+    return writablePlaces(config && writeRootsOf(getFsWriteConfig()))
+  } catch {
+    return writablePlaces(undefined)
+  }
+}
+
+/**
  * Platform-independent part of the dependency check. Returns either
  * a finished result (POSIX, unsupported platform, or a Windows
  * srt-win resolution failure) or the inputs for the Windows probe —
@@ -1646,14 +1690,31 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
     // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
     // profiles take regex patterns directly, so rg is never invoked there.
     const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
-    if (whichSync(rgToCheck.command) === null) {
-      errors.push(`ripgrep (${rgToCheck.command}) not found`)
+    const writable = hostWritablePlaces()
+    // Looked for the way the wrap will look for it.
+    const search = findHostHelper(rgToCheck.command, writable)
+    if (search.path === null) {
+      errors.push(
+        describeUnavailableHostHelper(
+          rgToCheck.command,
+          'ripgrep.command',
+          search,
+          `ripgrep (${rgToCheck.command}) not found`,
+        ),
+      )
     }
+    const warning = writableNamedHelperWarning(
+      'ripgrep.command',
+      rgToCheck.command,
+      writable,
+    )
+    if (warning !== undefined) warnings.push(warning)
 
     const linuxDeps = checkLinuxDependencies({
       seccompConfig: config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
+      writable,
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
@@ -1721,7 +1782,10 @@ async function checkDependenciesAsync(
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
   if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+    await getApplySeccompBinaryPathAsync(
+      config?.seccomp?.applyPath,
+      hostWritablePlaces(),
+    )
   }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
@@ -1915,11 +1979,8 @@ function* resolveReadPathEntries(
       !literal.has(p) &&
       containsGlobChars(stripped)
     ) {
-      for (const found of yield* withOtherReadings(
-        p,
-        stripped,
-        kind,
-        expandGlob,
+      for (const found of yield* withinBudget(
+        withOtherReadings(p, stripped, kind, expandGlob),
       )) {
         resolved.add(found)
       }
@@ -1956,11 +2017,49 @@ function stripWriteGlobs(
     })
 }
 
+/**
+ * What the glob walks of one read configuration may spend between them, on
+ * Linux, its clock starting now: `filesystem.denyReadGlobBudget`, a wrap's own
+ * limits over the session's one by one. Checked here, because only the CLI
+ * runs the schema and a limit that is no number would never be reached.
+ */
+function readGlobBudget(
+  ...limits: Array<SandboxRuntimeConfig['filesystem']['denyReadGlobBudget']>
+): GlobWalkBudget {
+  const [session, own] = limits.map(given =>
+    FilesystemConfigSchema.shape.denyReadGlobBudget.parse(given, {
+      path: ['filesystem', 'denyReadGlobBudget'],
+    }),
+  )
+  return newGlobWalkBudget({
+    maxEntries: own?.maxEntries ?? session?.maxEntries,
+    timeoutMs: own?.timeoutMs ?? session?.timeoutMs,
+  })
+}
+
+/** `walk`, with a budget that runs out in it told as
+ *  {@link LinuxSandboxProfileError} `deny_glob_too_large`. */
+function* withinBudget<T>(walk: Steps<T>): Steps<T> {
+  try {
+    return yield* walk
+  } catch (error) {
+    if (!(error instanceof GlobWalkBudgetError)) throw error
+    throw new LinuxSandboxProfileError(
+      'deny_glob_too_large',
+      `${error.message}; the allowRead, denyRead and credentials.files patterns of one configuration share the budget: ` +
+        `narrow the pattern, remove or move what it walks into, or raise filesystem.denyReadGlobBudget`,
+      error,
+    )
+  }
+}
+
 function* expandAllowReadGlob(
+  budget: GlobWalkBudget,
   pattern: string,
   anchor?: string,
 ): Steps<string[]> {
-  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor })).matches
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor, budget }))
+    .matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -1988,11 +2087,12 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   )
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.
+  const budget = readGlobBudget(config.filesystem.denyReadGlobBudget)
   const allowPaths = finish(
     resolveReadPathEntries(
       'allow',
       config.filesystem.allowRead ?? [],
-      expandAllowReadGlob,
+      (pattern, anchor) => expandAllowReadGlob(budget, pattern, anchor),
     ),
   )
   const reExposedPaths = reExposedBy(
@@ -2001,6 +2101,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     getFsWriteConfig(),
   )
   const unlistableDenyDirs = new Set<string>()
+  const matchedLinks = new Set<string>()
   const listings: GlobWalkListings = new Map()
   const denyPaths = finish(
     resolveReadDenies(
@@ -2011,7 +2112,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
           pattern,
           reExposedPaths,
           unlistableDenyDirs,
-          { anchor, listings },
+          { anchor, budget, listings, matchedLinks },
         ),
     ),
   )
@@ -2020,6 +2121,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     ...denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
+    ...(matchedLinks.size > 0 && { matchedLinks: [...matchedLinks] }),
     ...literalReadLists(
       config.filesystem.denyRead,
       config.filesystem.allowRead,
@@ -2096,20 +2198,62 @@ function computeWindowsFsAccessSet(
     }
   }
   const expand = expandWindowsFsPaths
+  const allowWrite = expand(fs?.allowWrite ?? [], { mode: 'grant' })
   // `mode: 'deny'` — non-existent literals reach srt-win, which
   // creates a placeholder chain and stamps it (deny lands on the
   // exact target path). `mode: 'grant'` drops them (a grant on
   // nothing is meaningless).
   return rankWindowsFsAccess({
     allowRead: expand(fs?.allowRead ?? [], { mode: 'grant' }),
-    allowWrite: expand(fs?.allowWrite ?? [], { mode: 'grant' }),
+    allowWrite,
     denyRead: expand(fs?.denyRead ?? [], { mode: 'deny' }),
-    denyWrite: expand(fs?.denyWrite ?? [], { mode: 'deny' }),
+    denyWrite: [
+      ...expand(fs?.denyWrite ?? [], { mode: 'deny' }),
+      ...windowsMandatoryDenyPaths(process.cwd(), allowWrite, {
+        maxDepth: c.mandatoryDenySearchDepth ?? 3,
+        allowGitConfig: fs?.allowGitConfig ?? false,
+      }),
+    ],
     credentialDeny: [
       ...expand(getCredentialDenyReadPaths(c.credentials), { mode: 'deny' }),
       ...maskedFiles,
     ],
   })
+}
+
+/** Which object is at `p`: undefined where that cannot be told. */
+function windowsFileIndexOf(p: string): bigint | undefined {
+  try {
+    return fs.lstatSync(p, { bigint: true }).ino
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The mandatory write denies for a command run in `cwd` that are not on disk
+ * yet: a name that is new since `initialize()`, and one that is another object
+ * than the one denied. A deny on a file goes with the object, and git and most
+ * editors write a file by putting a new one in its place.
+ */
+function windowsMandatoryDeniesDue(
+  cwd: string,
+): Map<string, bigint | undefined> {
+  const due = new Map<string, bigint | undefined>()
+  for (const p of windowsMandatoryDenyPaths(
+    cwd,
+    windowsFsStampedSet?.grantWrite ?? [],
+    {
+      maxDepth: getMandatoryDenySearchDepth(),
+      allowGitConfig: getAllowGitConfig(),
+    },
+  )) {
+    const index = windowsFileIndexOf(p)
+    if (!windowsWriteDenied.has(p) || windowsWriteDenied.get(p) !== index) {
+      due.set(p, index)
+    }
+  }
+  return due
 }
 
 /**
@@ -2136,7 +2280,8 @@ function windowsMaskedFileDenies(
 function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   // Keyed exactly on what {@link computeWindowsFsAccessSet} reads of
   // the config. The masked files are not session-wide: each wrap
-  // denies the ones the session has not stamped.
+  // denies the ones the session has not stamped. So with the mandatory
+  // denies, whose two settings each wrap reads anew.
   // `network.allowedDomains` does NOT feed file-deny (only mask
   // injectHosts), so a network-only updateConfig hits the cache.
   return {
@@ -2565,13 +2710,17 @@ async function wrapWithSandboxOnce(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
+    const budget = readGlobBudget(
+      config?.filesystem.denyReadGlobBudget,
+      customConfig?.filesystem?.denyReadGlobBudget,
+    )
     const expandedAllowRead = await walked(
       resolveReadPathEntries(
         'allow',
         customConfig?.filesystem?.allowRead ??
           config?.filesystem.allowRead ??
           [],
-        expandAllowReadGlob,
+        (pattern, anchor) => expandAllowReadGlob(budget, pattern, anchor),
       ),
     )
     if (expandedAllowRead === REPLACED) return startOver()
@@ -2593,6 +2742,7 @@ async function wrapWithSandboxOnce(
       writeConfig,
     )
     const unlistableDenyDirs = new Set<string>()
+    const matchedLinks = new Set<string>()
     const listings: GlobWalkListings = new Map()
     const expandedDenyRead = await walked(
       resolveReadDenies(
@@ -2603,7 +2753,7 @@ async function wrapWithSandboxOnce(
             pattern,
             reExposedPaths,
             unlistableDenyDirs,
-            { anchor, listings },
+            { anchor, budget, listings, matchedLinks },
           ),
       ),
     )
@@ -2616,6 +2766,7 @@ async function wrapWithSandboxOnce(
       allowWithinDeny: expandedAllowRead,
       ...(ownAllowWithinDeny.length > 0 && { ownAllowWithinDeny }),
       unlistableDenyDirs: [...unlistableDenyDirs],
+      matchedLinks: [...matchedLinks],
       ...literalReadLists(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
         customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
@@ -2752,6 +2903,7 @@ async function wrapWithSandboxOnce(
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        alsoWritable: hostWritablePlaces(),
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
       }).catch((err: unknown) => {
@@ -2892,6 +3044,29 @@ async function wrapWithSandboxArgv(
       perExecDenyWrite = ranked.denyWrite.filter(
         p => !sessRead.has(p) && !sessWrite.has(p),
       )
+    }
+    // Kept with the write root like the session's own, so each is written
+    // once and no command after this one pays for it.
+    const due = windowsMandatoryDeniesDue(cwd ?? process.cwd())
+    if (!fsCfg?.disabled && due.size > 0 && windowsFsSbUserSid !== undefined) {
+      await grantWindowsAclPersistent({
+        sandboxUserSid: windowsFsSbUserSid,
+        read: [],
+        write: [],
+        denyRead: [],
+        // With the session's write grants beneath them, which they outrank.
+        denyWrite: rankWindowsFsAccess({
+          allowRead: [],
+          allowWrite: [],
+          denyRead: [],
+          denyWrite: [...due.keys()],
+          credentialDeny: [],
+          held: windowsFsStampedSet,
+        }).denyWrite,
+        srtWin: srtWinSpawn,
+      })
+      // As looked at before the write: one replaced since is due again.
+      for (const [p, index] of due) windowsWriteDenied.set(p, index)
     }
     // Per-exec deny rides on argv (`acl stamp` reads stdin, but
     // exec's stdin belongs to the child). The CreateProcessW
@@ -3052,6 +3227,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
   configInstalls++
+  forgetLinuxUnheldLinks()
   resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
@@ -3212,6 +3388,7 @@ async function reset(): Promise<void> {
   // Clean up any leftover bwrap mount points. Force past the
   // active-sandbox counter — reset() means the session is over.
   cleanupBwrapMountPoints({ force: true })
+  forgetLinuxUnheldLinks()
 
   // Stop log monitor
   if (logMonitorShutdown) {
@@ -3425,6 +3602,8 @@ export interface ISandboxManager {
     command: string
     args?: string[]
   }): Promise<SandboxDependencyCheck>
+  /** On Linux it expands the `denyRead` globs, and throws
+   *  {@link LinuxSandboxProfileError} `deny_glob_too_large` as the wrap does. */
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
@@ -3511,6 +3690,12 @@ export interface ISandboxManager {
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
+  /**
+   * Linux: the symbolic links on the way to a denied path that a command
+   * could replace, each with the reason nothing holds it. Each is listed by
+   * the latest wrap that met it; `reset()` and `updateConfig()` empty the list.
+   */
+  getLinuxUnheldLinks(): LinuxUnheldLink[]
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
   /**
@@ -3576,6 +3761,7 @@ export const SandboxManager: ISandboxManager = {
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
+  getLinuxUnheldLinks,
   getConfig,
   updateConfig,
 } as const

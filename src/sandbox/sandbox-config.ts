@@ -976,6 +976,18 @@ export const FilesystemConfigSchema = z.object({
       'Paths to re-allow reading within denied regions (takes precedence over denyRead). ' +
         'Use with denyRead to deny a broad region then allow back specific subdirectories.',
     ),
+  denyReadGlobBudget: z
+    .object({
+      maxEntries: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional(),
+    })
+    .strict()
+    .optional()
+    .describe(
+      'Linux: what expanding the globs of one read configuration may spend, all of them together, ' +
+        'before the wrap is refused: directory entries read (default 20,000,000) and ' +
+        'milliseconds (default 60,000).',
+    ),
   allowWrite: z
     .array(filesystemPathEntrySchema)
     .describe('Paths allowed for writing'),
@@ -1004,7 +1016,13 @@ export const IgnoreViolationsConfigSchema = z
  * Ripgrep configuration schema
  */
 export const RipgrepConfigSchema = z.object({
-  command: z.string().describe('The ripgrep command to execute'),
+  command: z
+    .string()
+    .describe(
+      'The ripgrep command to execute. A bare name (the default "rg") is ' +
+        'looked up on PATH, passing over any copy inside an allowed write ' +
+        'path; a path is run as given.',
+    ),
   args: z
     .array(z.string())
     .optional()
@@ -1133,6 +1151,15 @@ export const SeccompConfigSchema = z.object({
         'applyPath resolves inside the bwrap namespace and that the target ' +
         'binary implements the apply-seccomp interface when ARGV0 matches.',
     ),
+  holdsLinks: z
+    .boolean()
+    .optional()
+    .describe(
+      'Whether the helper takes --hold-link, which keeps the symbolic links ' +
+        'on the way to denied paths in place. Taken at its word. Not set, a ' +
+        'helper the library found for itself is read for the option, and ' +
+        'one named by applyPath is handed no link. false turns holding off.',
+    ),
 })
 
 /**
@@ -1228,8 +1255,8 @@ export const SandboxRuntimeConfigSchema = z
       .max(10)
       .optional()
       .describe(
-        'How deep below the working directory dangerous names are looked for on Linux (default: 3): ' +
-          'a dangerous file down to this depth, and a dangerous directory, or the hooks and ' +
+        'How deep below the working directory dangerous names are looked for on Linux and Windows (default: 3): ' +
+          'a dangerous file down to this depth, and on Linux a dangerous directory, or the hooks and ' +
           'config of a repository, one level higher up. ' +
           'Higher values provide more protection but slower performance.',
       ),
@@ -1244,13 +1271,15 @@ export const SandboxRuntimeConfigSchema = z
       .optional()
       .describe(
         'Linux only: absolute path to the bwrap (bubblewrap) binary. ' +
-          'When set, this path is used directly instead of resolving "bwrap" via PATH.',
+          'When set, this path is used directly instead of resolving "bwrap" via PATH ' +
+          '(where a copy inside an allowed write path is passed over).',
       ),
     socatPath: binaryPathSchema
       .optional()
       .describe(
         'Linux only: absolute path to the socat binary. ' +
-          'When set, this path is used directly instead of resolving "socat" via PATH.',
+          'When set, this path is used directly instead of resolving "socat" via PATH ' +
+          '(where a copy inside an allowed write path is passed over).',
       ),
     javaAgentJarPath: binaryPathSchema
       .optional()

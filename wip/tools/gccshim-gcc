@@ -1,0 +1,10 @@
+#!/bin/bash
+# For vendor/seccomp/build.ts on a machine without libseccomp-dev or a static libc in the default paths.
+args=("$@")
+if printf '%s\n' "${args[@]}" | grep -qx -- '-lseccomp'; then
+  out=()
+  for a in "${args[@]}"; do [ "$a" = "-static" ] || out+=("$a"); done
+  L=/nix/store/lxxk4dxshw0v4lwjzs3ywy3knx37gxgb-libseccomp-2.6.1-lib/lib
+  exec /usr/bin/gcc -I/opt/srt-stubs/build/seccomp-inc "${out[@]}" -L$L -Wl,-rpath,$L
+fi
+exec /usr/bin/gcc "${args[@]}" -L/nix/store/dr8sxxby6x9k0kg0s054cmcxqzpiy2yy-glibc-2.42-84-static/lib

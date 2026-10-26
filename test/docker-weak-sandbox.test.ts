@@ -19,8 +19,10 @@ import { spawnSync } from 'node:child_process'
 import {
   mkdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
   readFileSync,
+  readlinkSync,
   existsSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -33,11 +35,14 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
   const ALLOWED = join(WORK, 'allowed')
   const DENIED = join(WORK, 'denied')
   const SECRET = join(WORK, 'secret')
+  const LINK = join(ALLOWED, 'link')
   const CONFIG = join(WORK, 'srt.json')
   // Same policy without the seccomp helper: the command then runs in bwrap's
   // own namespaces, where --cap-drop ALL is the only thing between it and the
   // deny mounts.
   const CONFIG_NO_SECCOMP = join(WORK, 'srt-no-seccomp.json')
+  // Same policy with the helper's namespaces filter lifted.
+  const CONFIG_NAMESPACES = join(WORK, 'srt-namespaces.json')
   // umount(8) reports through /proc/self/mountinfo, which under the helper
   // belongs to another pid namespace; call the syscall so the kernel's own
   // errno is what the test reads.
@@ -71,6 +76,7 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     mkdirSync(DENIED, { recursive: true })
     mkdirSync(SECRET, { recursive: true })
     writeFileSync(join(SECRET, 'key'), 'TOPSECRET')
+    symlinkSync('leads-to', LINK)
     writeFileSync(
       UMOUNT_PROBE,
       [
@@ -78,7 +84,8 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
         "libc = ctypes.CDLL('libc.so.6', use_errno=True)",
         'for target in sys.argv[1:]:',
         '    ctypes.set_errno(0)',
-        '    rc = libc.umount2(target.encode(), 0)',
+        // UMOUNT_NOFOLLOW, which also reaches a mount on a symbolic link.
+        '    rc = libc.umount2(target.encode(), 8)',
         '    e = ctypes.get_errno()',
         "    print('umount2 %s rc=%d errno=%s (%s)' % (",
         '        target, rc, errno.errorcode.get(e, str(e)), os.strerror(e)))',
@@ -89,7 +96,7 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
       filesystem: {
         denyRead: [SECRET],
         allowWrite: [ALLOWED],
-        denyWrite: [],
+        denyWrite: [LINK],
       },
       enableWeakerNestedSandbox: true,
     }
@@ -98,6 +105,14 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
       JSON.stringify({
         ...policy,
         network: { allowedDomains: [], deniedDomains: [] },
+      }),
+    )
+    writeFileSync(
+      CONFIG_NAMESPACES,
+      JSON.stringify({
+        ...policy,
+        network: { allowedDomains: [], deniedDomains: [] },
+        allowNestedUserNamespaces: true,
       }),
     )
     writeFileSync(
@@ -165,6 +180,26 @@ describe.if(inDocker)('srt end-to-end as uid 0 in a container', () => {
     expect(r.stdout).not.toContain('TOPSECRET')
     expect(existsSync(out)).toBe(false)
   })
+
+  // The filter refuses the unmount; where it is lifted, the lock does.
+  it.each([
+    ['', CONFIG, 'EPERM'],
+    [' from a command allowed namespaces', CONFIG_NAMESPACES, 'EINVAL'],
+  ])(
+    'keeps a write-denied symbolic link in place%s',
+    (_from, config, errno) => {
+      const r = srt(
+        `echo SANDBOX-RAN; python3 ${UMOUNT_PROBE} ${LINK}; rm ${LINK} 2>&1`,
+        config,
+      )
+
+      expect(r.stdout).toContain('SANDBOX-RAN')
+      expect(r.stdout).toContain(`umount2 ${LINK} rc=-1 errno=${errno}`)
+      // EBUSY, as glibc words it ("Device or resource busy") or musl.
+      expect(r.stdout).toMatch(/resource busy/i)
+      expect(readlinkSync(LINK)).toBe('leads-to')
+    },
+  )
 
   // The kernel would let it: the command holds the capability.
   it('cannot make a mount namespace of its own (seccomp helper)', () => {

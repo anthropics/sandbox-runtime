@@ -10,7 +10,7 @@ on:
 # certificate and of its public key.
 jobs:
   integration-tests:
-    name: Tests (${{ matrix.os }} / ${{ matrix.arch }})
+    name: Tests (${{ matrix.os }} / ${{ matrix.label || matrix.arch }})
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -28,6 +28,13 @@ jobs:
             os: macos
           - arch: arm64
             runner: macos-14
+            os: macos
+          # The newest macOS as well: the sandbox profile's own regex engine
+          # and what Seatbelt refuses have both moved between releases, and
+          # the two legs above stay on the images they name.
+          - arch: arm64
+            label: arm64-macos26
+            runner: macos-26
             os: macos
           # Windows legs build srt-win, run the Rust smoke scripts,
           # then the TS integration suite (test/sandbox/winsrt.test.ts).
@@ -326,7 +333,36 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat ripgrep apparmor-profiles zsh
+          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat apparmor-profiles zsh
+
+      # The library reads both the output and the exit status of ripgrep, and
+      # those differ between releases: for an unreadable directory exactly at
+      # --max-depth, 14.1.1 prints "Permission denied" and exits 2, where
+      # 15.2.0 passes over it and exits 0. 14.1.1 is what most installations
+      # have, so every later step finds it first on PATH; the second full run
+      # below puts 15.2.0 ahead of it. Both are upstream's archives, by the
+      # checksums upstream publishes. macOS runs whatever Homebrew serves.
+      - name: Install ripgrep 14.1.1 and 15.2.0 (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          install_ripgrep() {
+            case "${{ matrix.arch }}" in
+              x86-64) asset=ripgrep-$1-x86_64-unknown-linux-musl.tar.gz sha256=$2 ;;
+              arm64) asset=ripgrep-$1-aarch64-unknown-linux-gnu.tar.gz sha256=$3 ;;
+            esac
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" "https://github.com/BurntSushi/ripgrep/releases/download/$1/$asset"
+            echo "$sha256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
+            mkdir "$RUNNER_TEMP/ripgrep-$1"
+            tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/ripgrep-$1" --strip-components=1
+            "$RUNNER_TEMP/ripgrep-$1/rg" --version
+          }
+          install_ripgrep 14.1.1 \
+            4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e \
+            c827481c4ff4ea10c9dc7a4022c8de5db34a5737cb74484d62eb94a95841ab2f
+          install_ripgrep 15.2.0 \
+            33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c \
+            a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d
+          echo "$RUNNER_TEMP/ripgrep-14.1.1" >> "$GITHUB_PATH"
 
       - name: Enable unprivileged user namespaces (Linux)
         if: matrix.os == 'linux'
@@ -352,17 +388,19 @@ jobs:
 
       - name: Install Node dependencies
         if: matrix.os != 'windows'
-        run: npm install
-
-      - name: Lint (ESLint)
-        if: matrix.os == 'linux' && matrix.arch == 'x86-64'
-        run: npx eslint .
+        run: npm ci
 
       # `npm run build` compiles src only. This is the one step that checks
       # the types of test/, which bun strips at runtime.
       - name: Typecheck
         if: matrix.os != 'windows'
         run: npm run typecheck
+
+      # After the type check, which builds dist/: test/smoke imports it, and
+      # without it the rules that read types see `any` there and say nothing.
+      - name: Lint (ESLint)
+        if: matrix.os == 'linux' && matrix.arch == 'x86-64'
+        run: npx eslint .
 
       - name: Build seccomp binaries (Linux)
         if: matrix.os == 'linux'
@@ -398,9 +436,9 @@ jobs:
           ninja -C _build install
           "$RUNNER_TEMP/bwrap-0.12/bin/bwrap" --version
 
-      - name: Run tests against bubblewrap 0.12.0 (Linux)
+      - name: Run tests against bubblewrap 0.12.0 and ripgrep 15.2.0 (Linux)
         if: matrix.os == 'linux'
-        run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$PATH" npm test
+        run: PATH="$RUNNER_TEMP/bwrap-0.12/bin:$RUNNER_TEMP/ripgrep-15.2.0:$PATH" npm test
 
       # RHEL 8 and 9 ship bubblewrap 0.4.0 and 0.4.1, the oldest versions in
       # current distribution use, and both refuse to start on a plan that
@@ -443,11 +481,23 @@ jobs:
         if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
 
+      # Everything above ran with Node 22 on PATH. What runs the library under
+      # Node repeats on 24, in a step so that the matrix stays as it is.
+      - name: Setup Node.js 24
+        if: matrix.os != 'windows'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Run the tests that use Node (Node 24)
+        if: matrix.os != 'windows'
+        run: npm run test:node
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: test-results-${{ matrix.os }}-${{ matrix.arch }}
+          name: test-results-${{ matrix.os }}-${{ matrix.label || matrix.arch }}
           path: |
             test-results/
             *.log
@@ -593,6 +643,11 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+
       - name: Enable unprivileged user namespaces on host
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
@@ -611,27 +666,59 @@ jobs:
             --security-opt apparmor=unconfined \
             -v "${{ github.workspace }}:/work" \
             -v "$(dirname "$(dirname "$(command -v node)")")":/opt/node:ro \
+            -v "$(command -v bun)":/usr/local/bin/bun:ro \
             -w /work \
             -e SRT_E2E_DOCKER=1 \
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              # node and npm are those of the runner, bound in: no second
-              # piped installer, and not those of the image, which has Node
-              # 18, below what engines in package.json allows. bun is pinned
-              # to the version the rest of the matrix runs (oven-sh/setup-bun
-              # above). The tree carries a dozen bun-version-specific
+              # node, npm and bun are those of the runner, bound in: no piped
+              # installer, not the Node 18 of the image, which is below what
+              # engines in package.json allows, and the bun the rest of the
+              # matrix runs. The tree carries a dozen bun-version-specific
               # workarounds, so "whatever bun shipped this morning" is not
               # the runtime under test.
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev libcap2-bin
-              curl -fsSL https://bun.sh/install | bash -s bun-v1.4.2
-              export PATH="/opt/node/bin:$HOME/.bun/bin:$PATH"
+              apt-get install -y -qq bubblewrap socat ripgrep python3 ca-certificates gcc libseccomp-dev libcap2-bin
+              export PATH="/opt/node/bin:$PATH"
               node --version
+              bun --version
               npm ci
               npm run build:seccomp
               npm run build
               echo "== as uid 0 with CAP_SYS_ADMIN"
               bun test test/docker-weak-sandbox.test.ts
+              echo "== as uid 0 without CAP_SYS_ADMIN"
+              capsh --drop=cap_sys_admin -- -c "bun test test/docker-weak-sandbox.test.ts"
+            '
+
+      # The same two runs on musl, and the package as an embedder ships it.
+      # bubblewrap, socat, ripgrep and node are Alpine's own builds, and bun is
+      # its musl build, from the release archive by checksum. The rest is what
+      # the step above left in the workspace: node_modules and dist, which are
+      # JavaScript, and the seccomp helper, static against glibc, because that
+      # is the file the npm package brings to a musl host.
+      - name: Run srt end-to-end as uid 0 in an Alpine container
+        run: |
+          docker run --rm \
+            --cap-add SYS_ADMIN \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            -e SRT_E2E_DOCKER=1 \
+            alpine:3.22 \
+            sh -euc '
+              apk add --no-cache bash bubblewrap socat ripgrep python3 curl ca-certificates unzip libcap-utils libstdc++ libgcc nodejs
+              case "$(uname -m)" in
+                x86_64) bun=bun-linux-x64-musl sha256=4835eca59d6da70f4674f5642f6e459dcadab773695b2ed9922d131057989742 ;;
+                aarch64) bun=bun-linux-aarch64-musl sha256=71760b6c8ea30623b81a4907cb815d48e2ea266f2e73e751534a44a0607950df ;;
+              esac
+              curl -fsSL --retry 3 -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v1.4.2/$bun.zip"
+              echo "$sha256  /tmp/bun.zip" | sha256sum -c -
+              unzip -q /tmp/bun.zip -d /tmp
+              install -m 0755 "/tmp/$bun/bun" /usr/local/bin/bun
+              echo "== as uid 0 with CAP_SYS_ADMIN"
+              bun test test/docker-weak-sandbox.test.ts test/smoke/bundled.test.ts
               echo "== as uid 0 without CAP_SYS_ADMIN"
               capsh --drop=cap_sys_admin -- -c "bun test test/docker-weak-sandbox.test.ts"
             '
