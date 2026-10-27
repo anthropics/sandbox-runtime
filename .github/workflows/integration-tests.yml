@@ -396,7 +396,10 @@ jobs:
           import path from 'node:path'
           const w = path.join(process.cwd(), 'w')
           export const cmd = 'C:\\Windows\\System32\\cmd.exe /d /c '
-          export const script = (name, file) => `${cmd}${path.join(w, name)} ${path.join(w, file)}`
+          const hb = file => `for /l %i in (1,1,40) do @(echo x>>${path.join(w, file)} & ping -n 2 127.0.0.1 >nul)`
+          export const script = (name, file) => name === 'bg.cmd'
+            ? `${cmd}"start /b cmd /d /c "${hb(file)}""`
+            : `${cmd}"start /b cmd /d /c "${hb(file)}" & ping -n 60 127.0.0.1 >nul"`
           export const request = {
             filesystem: { readonlyPaths: [process.cwd()], readwritePaths: [w] },
             network: { egress: { default: 'deny' } },
@@ -429,20 +432,26 @@ jobs:
           const timed = async fn => { const t = Date.now(); const r = await fn(); return { ...r, ms: Date.now() - t } }
           mark('runtime', process.version)
           mark('tier', (await sdk.getPlatformSupport()).isolationTier)
-          const show = async (name, command) => step(name, async () => {
-            const p = await sdk.spawn({ ...request, timeoutMs: 8000, command })
+          const show = async (name, command, extra = {}) => step(name, async () => {
+            const p = await sdk.spawn({ ...request, timeoutMs: 8000, ...extra, command })
             const out = collect(p.standardOutput)
             const err = collect(p.standardError)
             const result = await p.wait()
-            return { command, result, out: out().slice(0, 400), err: err().slice(0, 400) }
+            return { result, out: out().slice(0, 200), err: err().slice(0, 200) }
           })
-          await show('diag-dir', `${cmd}dir ${w}`)
-          await show('diag-type', `${cmd}type ${w}\\parent.cmd`)
-          await show('diag-write', `${cmd}"echo x>>${w}\\diag.txt"`)
-          mark('diag-write-size', size('diag.txt'))
-          await show('diag-parent', script('parent.cmd', 'diag2.txt'))
-          await show('diag-hb-direct', script('hb.cmd', 'diag3.txt'))
-          mark('diag-hb-size', size('diag3.txt'))
+          const rwOnly = { filesystem: { readwritePaths: [w] } }
+          const roOnly = { filesystem: { readonlyPaths: [w] } }
+          const runIt = `${cmd}${w}\\ok.cmd`
+          fs.writeFileSync(path.join(w, 'ok.cmd'), '@echo ran\r\n')
+          await show('perm-overlap-dir', `${cmd}dir /b ${w}`)
+          await show('perm-overlap-run', runIt)
+          await show('perm-rw-dir', `${cmd}dir /b ${w}`, rwOnly)
+          await show('perm-rw-run', runIt, rwOnly)
+          await show('perm-ro-dir', `${cmd}dir /b ${w}`, roOnly)
+          await show('perm-ro-run', runIt, roOnly)
+          await show('diag-inline', script('bg.cmd', 'diag.txt'))
+          await sleep(4000)
+          mark('diag-inline-size', size('diag.txt'))
           await step('tree-kill', async () => {
             const p = await sdk.spawn({ ...request, command: script('parent.cmd', 'a.txt') })
             await sleep(3000)
