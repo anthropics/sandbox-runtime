@@ -364,71 +364,151 @@ jobs:
           }
 
       # Throwaway: does @microsoft/mxc-sdk work under Bun? Never fails the job.
-      - name: MXC SDK under Bun (Windows)
+      - name: MXC SDK spawn behaviour (Windows)
         if: ${{ !cancelled() && matrix.os == 'windows' }}
         continue-on-error: true
+        timeout-minutes: 10
         shell: pwsh
         run: |
-          $d = Join-Path $env:RUNNER_TEMP 'mxc-bun'
-          New-Item -ItemType Directory -Force -Path $d | Out-Null
+          $d = Join-Path $env:RUNNER_TEMP 'mxc-probe'
+          New-Item -ItemType Directory -Force -Path (Join-Path $d 'w') | Out-Null
           Set-Location $d
-          '{"name":"mxc-bun","private":true,"type":"module"}' | Set-Content package.json
+          '{"name":"mxc-probe","private":true,"type":"module"}' | Set-Content package.json
+          npm install '@microsoft/mxc-sdk@1.0.1' --ignore-scripts --no-audit --no-fund 2>&1 | Select-Object -Last 3
           @'
+          @echo off
+          for /l %%i in (1,1,40) do (
+            echo x>>"%~1"
+            ping -n 2 127.0.0.1 >nul
+          )
+          '@ | Set-Content -Encoding ascii w\hb.cmd
+          @'
+          @echo off
+          start "" /b cmd /d /c "%~dp0hb.cmd" "%~1"
+          ping -n 60 127.0.0.1 >nul
+          '@ | Set-Content -Encoding ascii w\parent.cmd
+          @'
+          @echo off
+          start "" /b cmd /d /c "%~dp0hb.cmd" "%~1"
+          '@ | Set-Content -Encoding ascii w\bg.cmd
+          @'
+          import * as sdk from '@microsoft/mxc-sdk/v1'
+          import path from 'node:path'
+          const w = path.join(process.cwd(), 'w')
+          export const cmd = 'C:\\Windows\\System32\\cmd.exe /d /c '
+          export const script = (name, file) => `${cmd}"${path.join(w, name)}" "${path.join(w, file)}"`
+          export const request = {
+            filesystem: { readonlyPaths: [process.cwd()], readwritePaths: [w] },
+            network: { egress: { default: 'deny' } },
+            workingDirectory: w,
+            timeoutMs: 120000,
+          }
+          export { sdk, w }
+          '@ | Set-Content common.mjs
+          @'
+          import { sdk, request, script } from './common.mjs'
+          const p = await sdk.spawn({ ...request, command: script('parent.cmd', process.argv[2]) })
+          console.log('HOST child id', p.id)
+          setTimeout(() => process.exit(0), 3000)
+          setInterval(() => {}, 1000)
+          '@ | Set-Content host.mjs
+          @'
+          import { sdk, request, cmd, script, w } from './common.mjs'
+          import fs from 'node:fs'
+          import path from 'node:path'
+          import { execFileSync, spawn as nodeSpawn } from 'node:child_process'
           const mark = (name, value) => console.log(`RESULT ${name}: ${value}`)
           const step = async (name, fn) => {
             try { mark(name, `ok ${JSON.stringify(await fn())}`) }
-            catch (e) { mark(name, `FAILED ${e?.code ?? ''} ${e?.message ?? e} @ ${e?.stack?.split('\n').slice(1, 5).join(' | ')}`) }
+            catch (e) { mark(name, `FAILED ${e?.code ?? ''} ${e?.message ?? e}`) }
           }
-          const runtime = typeof Bun === 'undefined' ? `node ${process.version}` : `bun ${Bun.version} ${Bun.revision} node ${process.versions.node}`
-          mark('runtime', runtime)
-          const sdk = await import('@microsoft/mxc-sdk/v1')
-          mark('import', 'ok')
-          const request = {
-            filesystem: { readonlyPaths: [process.cwd()] },
-            network: { egress: { default: 'deny' } },
-            timeoutMs: 30000,
-          }
-          const cmd = 'C:\\Windows\\System32\\cmd.exe /d /c '
-          await step('getPlatformSupport', () => sdk.getPlatformSupport())
-          await step('run', async () => {
-            const r = await sdk.run({ ...request, command: cmd + 'echo hello' })
-            return { stdout: r.stdout, exitCode: r.exitCode, warnings: r.warnings }
+          const sleep = ms => new Promise(r => setTimeout(r, ms))
+          const size = f => { try { return fs.statSync(path.join(w, f)).size } catch { return -1 } }
+          const growing = async f => { const a = size(f); await sleep(5000); const b = size(f); return { from: a, to: b, growing: b > a } }
+          const collect = s => { let t = ''; s?.on('data', c => { t += c }); return () => t }
+          const timed = async fn => { const t = Date.now(); const r = await fn(); return { ...r, ms: Date.now() - t } }
+          mark('runtime', process.version)
+          mark('tier', (await sdk.getPlatformSupport()).isolationTier)
+          await step('tree-kill', async () => {
+            const p = await sdk.spawn({ ...request, command: script('parent.cmd', 'a.txt') })
+            await sleep(3000)
+            const before = await growing('a.txt')
+            p.kill()
+            const result = await p.wait()
+            await sleep(1000)
+            return { id: p.id, before, result, after: await growing('a.txt') }
           })
-          await step('run-exit-code', async () => (await sdk.run({ ...request, command: cmd + 'exit 7' })).exitCode)
-          await step('spawn', async () => {
-            const p = await sdk.spawn({ ...request, command: cmd + 'echo streamed' })
-            let out = ''
-            p.standardOutput?.on('data', c => { out += c })
-            const w = await p.wait()
-            return { out, wait: w }
+          await step('host-taskkill-tree', async () => {
+            const p = await sdk.spawn({ ...request, command: script('parent.cmd', 'b.txt') })
+            await sleep(3000)
+            const before = await growing('b.txt')
+            let taskkill
+            try { taskkill = execFileSync('taskkill', ['/t', '/f', '/pid', String(p.id)], { encoding: 'utf8' }).trim() }
+            catch (e) { taskkill = `FAILED ${e.status} ${e.stderr}` }
+            const result = await Promise.race([p.wait(), sleep(15000).then(() => 'wait timed out')])
+            const after = await growing('b.txt')
+            try { p.kill() } catch {}
+            return { id: p.id, before, taskkill, result, after }
           })
-          await step('spawn-kill', async () => {
-            const p = await sdk.spawn({ ...request, command: 'C:\\Windows\\System32\\ping.exe -n 30 127.0.0.1' })
-            setTimeout(() => p.kill(), 1000)
-            return await p.wait()
+          await step('background-after-exit', async () => {
+            const p = await sdk.spawn({ ...request, command: script('bg.cmd', 'c.txt') })
+            const result = await timed(() => p.wait())
+            await sleep(1000)
+            return { result, after: await growing('c.txt') }
           })
-          await step('spawnWithPty', async () => {
-            const p = await sdk.spawnWithPty({ ...request, command: cmd + 'echo pty' })
-            return await p.wait()
+          await step('host-exit', async () => {
+            const out = execFileSync(process.execPath, ['host.mjs', 'd.txt'], { cwd: path.dirname(w), encoding: 'utf8' }).trim()
+            await sleep(1000)
+            return { out, after: await growing('d.txt') }
           })
+          await step('host-hard-kill', async () => {
+            const h = nodeSpawn(process.execPath, ['host.mjs', 'e.txt'], { cwd: path.dirname(w), stdio: 'ignore' })
+            await sleep(2000)
+            execFileSync('taskkill', ['/f', '/pid', String(h.pid)])
+            await sleep(1000)
+            return { after: await growing('e.txt') }
+          })
+          await step('stdin', async () => {
+            const p = await sdk.spawn({ ...request, command: 'C:\\Windows\\System32\\sort.exe' })
+            const out = collect(p.standardOutput)
+            p.standardInput.end('b\r\na\r\n')
+            return { result: await p.wait(), out: out() }
+          })
+          await step('large-output-to-file', async () => {
+            const p = await sdk.spawn({ ...request, command: `${cmd}"for /l %i in (1,1,30000) do @echo line%i & @echo err%i 1>&2"` })
+            const f = path.join(w, 'out.log')
+            const file = fs.createWriteStream(f)
+            p.standardOutput.pipe(file, { end: false })
+            p.standardError.pipe(file, { end: false })
+            const result = await timed(() => p.wait())
+            await new Promise(r => file.end(r))
+            const lines = fs.readFileSync(f, 'utf8').split('\n').filter(Boolean)
+            return { result, lines: lines.length, last: lines.at(-1) }
+          })
+          const env = async (name, extra) => step(name, async () => {
+            process.env.PROBE_HOST_ONLY = 'host'
+            const p = await sdk.spawn({ ...request, ...extra, command: `${cmd}set` })
+            const out = collect(p.standardOutput)
+            const err = collect(p.standardError)
+            const result = await p.wait()
+            const keys = out().split(/\r?\n/).map(l => l.split('=')[0]).filter(Boolean)
+            const value = k => out().split(/\r?\n/).find(l => l.toUpperCase().startsWith(`${k}=`))
+            return { result, count: keys.length, keys: keys.join(','), probe: value('PROBE_SET'), path: value('PATH')?.slice(0, 60), err: err().slice(0, 200) }
+          })
+          await env('env-omitted', {})
+          await env('env-verbatim', { environment: { PROBE_SET: 'x', SystemRoot: 'C:\\Windows' } })
+          await env('env-inherit', { environment: { PROBE_SET: 'x', PATH: 'C:\\probe-path' }, inheritDefaultEnvironment: true })
+          await step('exit-code', async () => (await (await sdk.spawn({ ...request, command: `${cmd}exit 7` })).wait()))
+          await step('timeout', async () => timed(async () => (await sdk.spawn({ ...request, timeoutMs: 2000, command: script('parent.cmd', 'f.txt') })).wait()))
+          await step('concurrent', async () => (await Promise.all([1, 2, 3, 4, 5].map(async i => {
+            const p = await sdk.spawn({ ...request, command: `${cmd}echo ${i}` })
+            const out = collect(p.standardOutput)
+            const result = await p.wait()
+            return `${out().trim()}:${result.exitCode}`
+          }))).join(' '))
           process.exit(0)
-          '@ -replace '(?m)^          ', '' | Set-Content probe.mjs
-          # A private copy, so the steps after this one keep the pinned Bun.
-          New-Item -ItemType Directory -Force -Path canary | Out-Null
-          $bun = Join-Path $d 'canary\bun.exe'
-          Copy-Item (Get-Command bun).Source $bun
-          "--- bun upgrade"; & $bun upgrade --canary 2>&1 | Select-Object -Last 5; "upgrade exit: $LASTEXITCODE"; & $bun --revision
-          "--- bun add"; & $bun add '@microsoft/mxc-sdk@1.0.1' 2>&1 | Select-Object -Last 15; "bun add exit: $LASTEXITCODE"
-          "--- installed"; Get-ChildItem node_modules\@microsoft\mxc-sdk\bin\* -ErrorAction SilentlyContinue | Select-Object -First 12 -ExpandProperty FullName
-          Get-ChildItem node_modules\koffi\build -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty Name
-          "--- under bun"; & $bun probe.mjs 2>&1; "bun exit: $LASTEXITCODE"
+          '@ | Set-Content probe.mjs
           "--- under node"; node probe.mjs 2>&1; "node exit: $LASTEXITCODE"
-          "--- compiled"; & $bun build --compile probe.mjs --outfile probe.exe 2>&1 | Select-Object -Last 8; "compile exit: $LASTEXITCODE"
-          if (Test-Path probe.exe) {
-            New-Item -ItemType Directory -Force -Path moved | Out-Null
-            Copy-Item probe.exe moved\probe.exe
-            Push-Location moved; .\probe.exe 2>&1; "compiled exit: $LASTEXITCODE"; Pop-Location
-          }
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
