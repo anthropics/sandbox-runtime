@@ -396,12 +396,13 @@ jobs:
           import path from 'node:path'
           const w = path.join(process.cwd(), 'w')
           export const cmd = 'C:\\Windows\\System32\\cmd.exe /d /c '
-          const hb = file => `for /l %i in (1,1,40) do @(echo x>>${path.join(w, file)} & ping -n 2 127.0.0.1 >nul)`
+          const ping = 'C:\\Windows\\System32\\PING.EXE'
+          const hb = file => `for /l %i in (1,1,40) do @(echo x>>${path.join(w, file)} & ${ping} -n 2 127.0.0.1 >nul)`
           export const script = (name, file) => name === 'bg.cmd'
             ? `${cmd}"start /b cmd /d /c "${hb(file)}""`
-            : `${cmd}"start /b cmd /d /c "${hb(file)}" & ping -n 60 127.0.0.1 >nul"`
+            : `${cmd}"start /b cmd /d /c "${hb(file)}" & ${ping} -n 60 127.0.0.1 >nul"`
           export const request = {
-            filesystem: { readonlyPaths: [process.cwd()], readwritePaths: [w] },
+            filesystem: { readonlyPaths: [`${process.env.SystemDrive ?? 'C:'}\\`, process.cwd()], readwritePaths: [w] },
             network: { egress: { default: 'deny' } },
             workingDirectory: w,
             timeoutMs: 120000,
@@ -439,8 +440,8 @@ jobs:
             const result = await p.wait()
             return { result, out: out().slice(0, 200), err: err().slice(0, 200) }
           })
-          const rwOnly = { filesystem: { readwritePaths: [w] } }
-          const roOnly = { filesystem: { readonlyPaths: [w] } }
+          const rwOnly = { filesystem: { readonlyPaths: [`${process.env.SystemDrive ?? 'C:'}\\`], readwritePaths: [w] } }
+          const roOnly = { filesystem: { readonlyPaths: [`${process.env.SystemDrive ?? 'C:'}\\`, w] } }
           const runIt = `${cmd}${w}\\ok.cmd`
           fs.writeFileSync(path.join(w, 'ok.cmd'), '@echo ran\r\n')
           await show('perm-overlap-dir', `${cmd}dir /b ${w}`)
