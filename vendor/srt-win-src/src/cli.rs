@@ -1149,16 +1149,23 @@ enum WfpCmd {
     /// port_range?, allow_loopback, loopback_notice?, user_sid?,
     /// hint?}`. `allow_loopback` is whether the installed set opens
     /// loopback (read off the filters when elevated, off the install
-    /// record otherwise); when it does, `loopback_notice` says in
-    /// plain words what that exposes.
+    /// record otherwise, and off the record for a `partial` set when
+    /// there is one); when it does, `loopback_notice` says in plain
+    /// words what that exposes.
     /// BFE's
     /// `FwpmFilterCreateEnumHandle0` is admin-gated, so a
     /// non-elevated caller gets `{state:"cannot-read", hint:…}`
     /// (exit 0). The non-elevated readiness check is `wfp verify`.
     ///
+    /// `state:"partial"`: some but not all of the filters the install
+    /// adds for its loopback mode are present, or the proxy PERMITs
+    /// carry different port ranges; a plain `install` of the recorded
+    /// mode re-adds the set. With a `hint` when the filters show
+    /// loopback closed but the install record says open.
+    ///
     /// `state:"loopback-mismatch"` (with a `hint`): the loopback mode
     /// of the filters is not the one the install recorded. Only an
-    /// elevated caller can see it.
+    /// elevated caller can see either.
     Status {
         #[arg(long)]
         sublayer_guid: Option<String>,
@@ -1357,8 +1364,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // partial install falls through and the (idempotent)
             // steps below complete it. A complete set whose tags
             // lack a port_range (legacy) is treated as "different"
-            // and requires --force; a partial set without one has
-            // no range to compare and is re-added.
+            // and requires --force; a partial set without one (no
+            // proxy PERMIT left, or a legacy tag) has no range to
+            // compare and is re-added.
             let existing = install::read_setup().ok().flatten();
             // Shared by the early-out completeness check and the
             // stamping step below (env reads + a stat per entry).

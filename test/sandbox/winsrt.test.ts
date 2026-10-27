@@ -2504,8 +2504,48 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     const sync = checkWindowsDependencies({ srtWin })
     const asyn = await checkWindowsDependenciesAsync({ srtWin })
     expect(sync.errors).toHaveLength(1)
-    expect(sync.errors[0]).toMatch(/WFP filter set incomplete \(3 present\)/)
+    expect(sync.errors[0]).toMatch(
+      /WFP filter set incomplete \(3 srt-win filters found\)/,
+    )
+    expect(sync.errors[0]).not.toMatch(/--force/)
     expect(asyn).toEqual(sync)
+  })
+
+  it('checkWindowsDependencies{,Async}: a partial WFP set of the other loopback mode names the install with --force, in either direction', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    for (const recorded of [true, false]) {
+      const partial = JSON.stringify({
+        ...JSON.parse(RAW_WFP),
+        state: 'partial',
+        filters: 5,
+        allow_loopback: recorded,
+      })
+      for (const configured of [recorded, !recorded]) {
+        stubSpawn(argv => ({
+          status: 0,
+          stdout: argv.includes('user') ? RAW_USER : partial,
+        }))
+        const opts = { srtWin, allowLoopback: configured }
+        const sync = checkWindowsDependencies(opts)
+        expect(await checkWindowsDependenciesAsync(opts)).toEqual(sync)
+        spawnSpy.mockRestore()
+        spawnSyncSpy.mockRestore()
+        expect(sync.errors).toHaveLength(1)
+        const msg = sync.errors[0]
+        expect(msg).toMatch(/WFP filter set incomplete/)
+        const flag = configured ? ' --allow-loopback' : ''
+        if (configured === recorded) {
+          expect(msg).toContain(`windows-install${flag}\n`)
+          expect(msg).not.toMatch(/--force|Its install recorded/)
+        } else {
+          expect(msg).toContain(`windows-install${flag} --force`)
+          expect(msg).toContain(
+            `Its install recorded loopback ${recorded ? 'open' : 'closed'}; ` +
+              `configured: ${configured ? 'open' : 'closed'}.`,
+          )
+        }
+      }
+    }
   })
 
   it('checkWindowsDependencies{,Async}: seclogon state → error / silent', async () => {

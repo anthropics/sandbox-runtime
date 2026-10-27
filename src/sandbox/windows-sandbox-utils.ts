@@ -4512,14 +4512,24 @@ function interpretDependencyProbes(
     // 'absent' or 'partial' (some of the set is missing, so one address
     // family may be open). If the user is also not-provisioned, the
     // user-state error above already gave the right instruction; don't
-    // repeat.
+    // repeat. A partial set's `allowLoopback` is the recorded mode: an
+    // install of the other mode replaces it, so needs --force.
     if (us.provisioned && us.credPresent) {
+      const otherMode =
+        ws.state === 'partial' &&
+        allowLoopback !== undefined &&
+        ws.allowLoopback !== allowLoopback
       errors.push(
         (ws.state === 'partial'
-          ? `WFP filter set incomplete (${ws.filters} present) under sublayer `
+          ? `WFP filter set incomplete (${ws.filters} srt-win filters ` +
+            `found) under sublayer `
           : `WFP filters not installed under sublayer `) +
           `${sublayerGuid ?? '(default)'}. ` +
-          windowsInstallInstructions(install),
+          (otherMode
+            ? `Its install recorded loopback ${mode(ws.allowLoopback)}; ` +
+              `configured: ${mode(!ws.allowLoopback)}. `
+            : '') +
+          windowsInstallInstructions(install, otherMode),
       )
     }
   } else if (ws.portRange) {
