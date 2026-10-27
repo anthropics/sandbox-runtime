@@ -228,11 +228,15 @@ export const WINDOWS_ALLOW_LOOPBACK_EFFECT =
  * is access-denied (it is admin-gated). The non-elevated readiness
  * check is {@link verifyWindowsWfpEgress}, not this enum.
  *
+ * `partial` (elevated callers only): some but not all of the filters
+ * the recorded install adds are present; a plain install re-adds them.
+ *
  * `loopback-mismatch` (elevated callers only): the filters' loopback
  * mode is not the one the install recorded; re-install.
  */
 export type WindowsWfpStatus =
   | 'absent'
+  | 'partial'
   | 'installed'
   | 'loopback-mismatch'
   | 'cannot-read'
@@ -241,19 +245,29 @@ export interface WindowsWfpStatusResult {
   state: WindowsWfpStatus
   /** Live filter count from BFE enum; `0` on `cannot-read`. */
   filters: number
-  /** `[low, high]` for the loopback PERMIT, when known. */
+  /**
+   * `[low, high]` of the proxy-range loopback PERMIT: the first one
+   * enumerated. Absent when no such PERMIT is left or its tag carries
+   * no range. PERMITs of different ranges make the set `partial`.
+   */
   portRange?: [number, number]
   /**
    * Whether the installed filter set opens loopback — see
-   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}.
+   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}. On `cannot-read`, the mode
+   * the install recorded. On `partial`, the recorded mode when there
+   * is a record (the mode a plain install restores; the filters left
+   * may not show it), else whether any open-loopback PERMIT is left.
    */
   allowLoopback: boolean
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
   /**
-   * Populated only on `cannot-read` (BFE enumeration is admin-gated;
-   * a non-elevated caller can't read it). The non-elevated readiness
-   * check is {@link verifyWindowsWfpEgress}, not this enum.
+   * Populated on `cannot-read` (BFE enumeration is admin-gated; a
+   * non-elevated caller can't read it; the non-elevated readiness
+   * check is {@link verifyWindowsWfpEgress}, not this enum), on
+   * `loopback-mismatch`, and on `partial` when the filters show
+   * loopback closed but the install record says open. It names the
+   * repair.
    */
   hint?: string
 }
@@ -329,6 +343,12 @@ export type WindowsSeclogonState = 'ok' | 'disabled' | 'missing' | 'cannot-read'
  * provisions. The sandboxed child runs **as** this account.
  */
 export interface WindowsSandboxUserStatus {
+  /**
+   * The sandbox account's name: the one the install recorded, or
+   * `srt-sandbox` when none is recorded. Absent from an `srt-win`
+   * that does not report it.
+   */
+  name?: string
   /** The `srt-sandbox` local account exists. */
   provisioned: boolean
   /** `S-1-5-21-…` of `srt-sandbox`, when provisioned. */
@@ -1114,6 +1134,7 @@ function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
 /** Shape of `srt-win user status` (and `srt-win status .user`) stdout. */
 type RawUserStatus = {
   user: {
+    name?: string
     exists: boolean
     sid?: string
     group_exists: boolean
@@ -1222,6 +1243,7 @@ const SECLOGON_STATES: readonly string[] = [
 
 function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
   return {
+    ...(typeof raw.user.name === 'string' && { name: raw.user.name }),
     provisioned: raw.user.exists,
     ...(raw.user.sid && { sid: raw.user.sid }),
     groupExists: raw.user.group_exists,
@@ -2277,7 +2299,7 @@ function remapInstallTimeout(e: unknown): never {
 //   0  ok
 //   10 user cancelled UAC elevation
 //   12 WFP install failed
-//   13 already installed with different config (use --force)
+//   13 a filter set exists with a different config (use --force)
 //   14 sandbox-user provisioning failed
 //   17 ambient write-deny stamping failed
 //   1  other error (stderr has detail)
@@ -4432,6 +4454,65 @@ function settle<T>(fn: () => T): PromiseSettledResult<T> {
  * `user status` already failed); the async caller has already run
  * both probes concurrently and its thunk returns the settled result.
  */
+/**
+ * How the filter set in place differs from the one `install` requests
+ * (omitted options: their defaults, loopback closed), as `srt-win
+ * install`'s pre-check compares them before it refuses, without
+ * `--force` (exit 13), to replace an `installed` or `partial` set
+ * (`loopback-mismatch` reads `installed` there): the loopback mode (a
+ * partial set's `allowLoopback` is the recorded one), the port range
+ * (unknown on a complete set counts as different; a partial set
+ * without one has none to compare), and the recorded sandbox user
+ * (only when an install is recorded). Empty for a set it does not
+ * compare (`absent`, `cannot-read`).
+ */
+function windowsInstallReplaces(
+  install: WindowsInstallContext,
+  us: WindowsSandboxUserStatus,
+  ws: WindowsWfpStatusResult,
+): string[] {
+  if (
+    ws.state !== 'installed' &&
+    ws.state !== 'partial' &&
+    ws.state !== 'loopback-mismatch'
+  ) {
+    return []
+  }
+  const mode = (open: boolean): string => (open ? 'open' : 'closed')
+  const differs: string[] = []
+  const open = install.allowLoopback ?? false
+  if (ws.allowLoopback !== open) {
+    differs.push(
+      `loopback ${mode(ws.allowLoopback)} (requested: ${mode(open)})`,
+    )
+  }
+  const [lo, hi] = install.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
+  const range = ws.portRange
+  if (range ? range[0] !== lo || range[1] !== hi : ws.state !== 'partial') {
+    differs.push(
+      `port range ${range ? `${range[0]}-${range[1]}` : 'unknown'} ` +
+        `(requested: ${lo}-${hi})`,
+    )
+  }
+  const user = install.sandboxUser ?? 'srt-sandbox'
+  if (
+    us.markerVersion !== undefined &&
+    us.name !== undefined &&
+    us.name !== user
+  ) {
+    differs.push(`sandbox user '${us.name}' (requested: '${user}')`)
+  }
+  return differs
+}
+
+/** The sentence naming what {@link windowsInstallReplaces} found. */
+function windowsInstallReplacesText(differs: string[]): string {
+  return (
+    `The filter set in place differs from the install below, which ` +
+    `replaces it: ${differs.join('; ')}. `
+  )
+}
+
 function interpretDependencyProbes(
   install: WindowsInstallContext,
   user: PromiseSettledResult<WindowsSandboxUserStatus>,
@@ -4456,12 +4537,16 @@ function interpretDependencyProbes(
     return { errors, warnings }
   }
   const us = user.value
+  // Where the not-provisioned error stands, to name a set in place the
+  // install it suggests would replace (step 3).
+  let unprovisionedAt: number | undefined
+  const unprovisioned = (differs: string[]): string =>
+    `Sandbox user is not provisioned (user=${us.provisioned}, ` +
+    `cred=${us.credPresent}). ` +
+    (differs.length > 0 ? windowsInstallReplacesText(differs) : '') +
+    windowsInstallInstructions(install, differs.length > 0)
   if (!us.provisioned || !us.credPresent) {
-    errors.push(
-      `Sandbox user is not provisioned (user=${us.provisioned}, ` +
-        `cred=${us.credPresent}). ` +
-        windowsInstallInstructions(install),
-    )
+    unprovisionedAt = errors.push(unprovisioned([])) - 1
   } else {
     // Installed, by a release with another setup version: an upgrade,
     // not a missing sandbox, so its own wording.
@@ -4490,6 +4575,12 @@ function interpretDependencyProbes(
     return result()
   }
   const ws = wfp.value
+  if (unprovisionedAt !== undefined) {
+    // srt-win's pre-check does not depend on the user's state.
+    errors[unprovisionedAt] = unprovisioned(
+      windowsInstallReplaces(install, us, ws),
+    )
+  }
   if (ws.state === 'cannot-read') {
     logForDebugging(
       `[Sandbox Windows] wfp status cannot-read (non-elevated): ${ws.hint}`,
@@ -4505,13 +4596,21 @@ function interpretDependencyProbes(
         windowsInstallCommand(install, true),
     )
   } else if (ws.state !== 'installed') {
-    // 'absent'. If the user is also not-provisioned, the user-state
-    // error above already gave the right instruction; don't repeat.
+    // 'absent' or 'partial' (some of the set is missing, so one address
+    // family may be open). If the user is also not-provisioned, the
+    // user-state error above already gave the right instruction; don't
+    // repeat. A plain install re-adds a partial set; one that differs
+    // from the suggested install it refuses without --force (exit 13).
     if (us.provisioned && us.credPresent) {
+      const differs = windowsInstallReplaces(install, us, ws)
       errors.push(
-        `WFP filters not installed under sublayer ` +
+        (ws.state === 'partial'
+          ? `WFP filter set incomplete (${ws.filters} srt-win filters ` +
+            `found) under sublayer `
+          : `WFP filters not installed under sublayer `) +
           `${sublayerGuid ?? '(default)'}. ` +
-          windowsInstallInstructions(install),
+          (differs.length > 0 ? windowsInstallReplacesText(differs) : '') +
+          windowsInstallInstructions(install, differs.length > 0),
       )
     }
   } else if (ws.portRange) {
@@ -4558,10 +4657,14 @@ function interpretDependencyProbes(
  * (Windows Defender cold-scan can add seconds).
  *
  * @param opts.allowLoopback the configured `network.allowLocalBinding`:
- *   an install with the other loopback mode is an error. Omit it to
- *   skip the comparison.
+ *   a complete install with the other loopback mode is an error. Omit
+ *   it to skip that comparison; an install an error suggests then
+ *   requests loopback closed.
  * @param opts.proxyPortRange, opts.sandboxUser the configured install
- *   options, named in the install command an error suggests.
+ *   options, named in the install command an error suggests. That
+ *   command carries `--force` when the filter set in place differs
+ *   from it in loopback mode, port range or sandbox user, as
+ *   `srt-win install` refuses to replace such a set otherwise.
  */
 export function checkWindowsDependencies(
   opts: WindowsInstallContext & { srtWin?: SrtWinSpawn } = {},
