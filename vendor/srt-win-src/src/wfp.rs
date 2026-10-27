@@ -976,7 +976,10 @@ pub(crate) fn status_from_tags(tags: &[(&str, FilterTag)]) -> WfpStatus {
 /// closed set here; [`apply_recorded_loopback`] makes it `partial` when
 /// the install record says open. Every proxy PERMIT must also carry the
 /// same range, as one install writes them: one that opens other ports
-/// than the rest makes the set `partial`. Other kinds are ignored.
+/// than the rest makes the set `partial`. So does a filter of the set
+/// keyed to another user SID than the rest: a block for another account
+/// leaves the sandbox account unfenced on that family. Other kinds are
+/// ignored.
 pub(crate) fn tags_fence_state(tags: &[(&str, FilterTag)]) -> &'static str {
     let open = tags.iter().any(|(_, t)| t.kind == KIND_PERMIT_OPEN);
     let specs = filter_specs(DEFAULT_PROXY_PORT_RANGE, open);
@@ -994,7 +997,14 @@ pub(crate) fn tags_fence_state(tags: &[(&str, FilterTag)]) -> &'static str {
         .filter(|(_, t)| t.kind == KIND_PERMIT_PROXY)
         .map(|(_, t)| t.port_range);
     let first = ranges.next();
-    if all && ranges.all(|r| Some(r) == first) {
+    let one_range = ranges.all(|r| Some(r) == first);
+    let mut sids = tags
+        .iter()
+        .filter(|(_, t)| specs.iter().any(|s| s.kind == t.kind))
+        .map(|(_, t)| &t.user_sid);
+    let first_sid = sids.next();
+    let one_sid = sids.all(|s| Some(s) == first_sid);
+    if all && one_range && one_sid {
         "installed"
     } else if any {
         "partial"
@@ -1406,7 +1416,7 @@ mod tests {
                 assert!(differs_from_request(&st, other, open));
             }
         }
-        // Legacy tags (no range on either) still agree.
+        // Legacy tags (no range on any) still agree.
         let legacy: Vec<_> = installed_set(false)
             .into_iter()
             .map(|(l, mut t)| {
@@ -1415,6 +1425,45 @@ mod tests {
             })
             .collect();
         assert_eq!(tags_fence_state(&legacy), "installed");
+    }
+
+    #[test]
+    fn a_filter_keyed_to_another_user_is_not_a_complete_set() {
+        let (v4, v6) = (ALE_LAYERS[0].1, ALE_LAYERS[1].1);
+        let range = DEFAULT_PROXY_PORT_RANGE;
+        let rekey = |set: Vec<(&'static str, FilterTag)>, layer: &str, kind: &str| {
+            set.into_iter()
+                .map(|(l, mut t)| {
+                    if l == layer && t.kind == kind {
+                        t.user_sid = Some("S-1-5-21-9-9-9-1001".into());
+                    }
+                    (l, t)
+                })
+                .collect::<Vec<_>>()
+        };
+        for open in [false, true] {
+            assert_eq!(tags_fence_state(&installed_set(open)), "installed");
+            for layer in [v4, v6] {
+                for kind in [KIND_BLOCK_USER, KIND_PERMIT_PROXY] {
+                    let ctx = format!("{} {layer} {kind}", fmt_loopback(open));
+                    let set = rekey(installed_set(open), layer, kind);
+                    let st = apply_recorded_loopback(status_from_tags(&set), Some(open));
+                    assert_eq!(st.state, "partial", "{ctx}");
+                    // A plain install of the recorded mode re-adds the set.
+                    let st = apply_recorded_parts(status_from_tags(&set), Some(open));
+                    assert!(!differs_from_request(&st, range, open), "{ctx}");
+                }
+            }
+        }
+        let set = rekey(installed_set(true), v6, KIND_PERMIT_OPEN);
+        assert_eq!(tags_fence_state(&set), "partial");
+        // A tag of another kind is not part of the set.
+        let mut set = installed_set(false);
+        set.push((
+            v4,
+            FilterTag::user("legacy-group", "S-1-5-21-9-9-9-1001", None),
+        ));
+        assert_eq!(tags_fence_state(&set), "installed");
     }
 
     /// The set [`install_filters`] adds, tagged as it tags them.

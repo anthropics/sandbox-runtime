@@ -1159,7 +1159,8 @@ enum WfpCmd {
     ///
     /// `state:"partial"`: some but not all of the filters the install
     /// adds for its loopback mode are present, or the proxy PERMITs
-    /// carry different port ranges; a plain `install` of the recorded
+    /// carry different port ranges, or the filters are keyed to
+    /// different user SIDs; a plain `install` of the recorded
     /// mode re-adds the set. With a `hint` when the filters show
     /// loopback closed but the install record says open.
     ///
