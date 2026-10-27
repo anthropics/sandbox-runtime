@@ -1372,28 +1372,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!("srt-win: {why}");
                 std::process::exit(13);
             }
-            // An unreadable record is treated as none here: the
-            // filters' own verdict stands, and the main path below
-            // marks the mode as changing before replacing them.
+            // A partial set's loopback mode is the recorded one
+            // (`apply_recorded_parts`). An unreadable record is
+            // treated as none here: the filters' own verdict stands,
+            // and the main path below marks the mode as changing
+            // before replacing them.
             let recorded = install::read_loopback_mode(&sl).ok().flatten();
             if !force
                 && let Ok(st) =
                     wfp::filter_status(&sl).map(|st| wfp::apply_recorded_parts(st, recorded))
                 && (st.state == "installed" || st.state == "partial")
             {
-                let want = [range.0, range.1];
-                // A partial set with no permit left has no range to
-                // compare; a complete set without one is legacy and
-                // counts as different.
-                let range_differs = match st.port_range {
-                    Some(have) => have != want,
-                    None => st.state == "installed",
-                };
-                // The set's mode is open when its filters or the
-                // record say so: a partial open set may have lost
-                // every open-loopback PERMIT.
-                let have_open = st.allow_loopback || recorded == Some(true);
-                if range_differs || have_open != allow_loopback || name_changed {
+                if wfp::differs_from_request(&st, range, allow_loopback) || name_changed {
                     let have_range = st
                         .port_range
                         .map(|[l, h]| format!("{l}-{h}"))
@@ -1412,7 +1402,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                          Pass --force to replace, or run `srt-win \
                          uninstall` first.",
                         st.state,
-                        wfp::fmt_loopback(have_open),
+                        wfp::fmt_loopback(st.allow_loopback),
                         range.0,
                         range.1,
                         wfp::fmt_loopback(allow_loopback),
