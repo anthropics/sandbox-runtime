@@ -424,11 +424,25 @@ jobs:
           }
           const sleep = ms => new Promise(r => setTimeout(r, ms))
           const size = f => { try { return fs.statSync(path.join(w, f)).size } catch { return -1 } }
-          const growing = async f => { const a = size(f); await sleep(5000); const b = size(f); return { from: a, to: b, growing: b > a } }
+          const growing = async f => { const a = size(f); await sleep(5000); const b = size(f); return { from: a, to: b, growing: b > a, verdict: a < 0 ? 'INCONCLUSIVE' : 'measured' } }
           const collect = s => { let t = ''; s?.on('data', c => { t += c }); return () => t }
           const timed = async fn => { const t = Date.now(); const r = await fn(); return { ...r, ms: Date.now() - t } }
           mark('runtime', process.version)
           mark('tier', (await sdk.getPlatformSupport()).isolationTier)
+          const show = async (name, command) => step(name, async () => {
+            const p = await sdk.spawn({ ...request, timeoutMs: 8000, command })
+            const out = collect(p.standardOutput)
+            const err = collect(p.standardError)
+            const result = await p.wait()
+            return { command, result, out: out().slice(0, 400), err: err().slice(0, 400) }
+          })
+          await show('diag-dir', `${cmd}dir ${w}`)
+          await show('diag-type', `${cmd}type ${w}\\parent.cmd`)
+          await show('diag-write', `${cmd}"echo x>>${w}\\diag.txt"`)
+          mark('diag-write-size', size('diag.txt'))
+          await show('diag-parent', script('parent.cmd', 'diag2.txt'))
+          await show('diag-hb-direct', script('hb.cmd', 'diag3.txt'))
+          mark('diag-hb-size', size('diag3.txt'))
           await step('tree-kill', async () => {
             const p = await sdk.spawn({ ...request, command: script('parent.cmd', 'a.txt') })
             await sleep(3000)
