@@ -1428,11 +1428,15 @@ function windowsInstallFlags(
   )
 }
 
+/** The install command, as error messages print it. */
+export const WINDOWS_INSTALL_COMMAND =
+  'npx @anthropic-ai/sandbox-runtime windows-install'
+
 function windowsInstallCommand(
   ctx: WindowsInstallContext,
   force: boolean,
 ): string {
-  return `npx sandbox-runtime windows-install` + windowsInstallFlags(ctx, force)
+  return WINDOWS_INSTALL_COMMAND + windowsInstallFlags(ctx, force)
 }
 
 /**
@@ -1971,14 +1975,14 @@ export async function ensurePersistentWindowsCa(
     throw new Error(
       `ensurePersistentWindowsCa: sandbox user is not provisioned ` +
         `(user=${status.provisioned}, cred=${status.credPresent}). ` +
-        `Run \`npx sandbox-runtime windows-install\` first.`,
+        `Run \`${WINDOWS_INSTALL_COMMAND}\` first.`,
     )
   }
   const stateDir = opts.dir ? undefined : windowsStateDir()
   if (stateDir && !fs.existsSync(stateDir)) {
     throw new Error(
       `ensurePersistentWindowsCa: state directory ${stateDir} does not ` +
-        `exist. Run \`npx sandbox-runtime windows-install\` first.`,
+        `exist. Run \`${WINDOWS_INSTALL_COMMAND}\` first.`,
     )
   }
   const dir = opts.dir ?? path.win32.join(stateDir!, 'ca')
@@ -4388,7 +4392,7 @@ export function windowsSetupVersionMismatch(
 /** The two ways to run the install, with `flags` (see `windowsInstallFlags`). */
 function windowsInstallCommandLines(flags: string): string {
   return (
-    `  npx sandbox-runtime windows-install${flags}\n` +
+    `  ${WINDOWS_INSTALL_COMMAND}${flags}\n` +
     `  — or call installWindowsSandbox(), or run ` +
     `\`srt-win.exe install${flags}\` directly.\n`
   )
