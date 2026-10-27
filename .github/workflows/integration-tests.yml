@@ -363,6 +363,68 @@ jobs:
             "wxc-exec not found at $wxc"
           }
 
+      # Throwaway: does @microsoft/mxc-sdk work under Bun? Never fails the job.
+      - name: MXC SDK under Bun (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP 'mxc-bun'
+          New-Item -ItemType Directory -Force -Path $d | Out-Null
+          Set-Location $d
+          '{"name":"mxc-bun","private":true,"type":"module"}' | Set-Content package.json
+          @'
+          const mark = (name, value) => console.log(`RESULT ${name}: ${value}`)
+          const step = async (name, fn) => {
+            try { mark(name, `ok ${JSON.stringify(await fn())}`) }
+            catch (e) { mark(name, `FAILED ${e?.code ?? ''} ${e?.message ?? e}`) }
+          }
+          const runtime = typeof Bun === 'undefined' ? `node ${process.version}` : `bun ${Bun.version}`
+          mark('runtime', runtime)
+          const sdk = await import('@microsoft/mxc-sdk/v1')
+          mark('import', 'ok')
+          const request = {
+            filesystem: { readonlyPaths: [process.cwd()] },
+            network: { egress: { default: 'deny' } },
+            timeoutMs: 30000,
+          }
+          const cmd = 'C:\\Windows\\System32\\cmd.exe /d /c '
+          await step('getPlatformSupport', () => sdk.getPlatformSupport())
+          await step('run', async () => {
+            const r = await sdk.run({ ...request, command: cmd + 'echo hello' })
+            return { stdout: r.stdout, exitCode: r.exitCode, warnings: r.warnings }
+          })
+          await step('run-exit-code', async () => (await sdk.run({ ...request, command: cmd + 'exit 7' })).exitCode)
+          await step('spawn', async () => {
+            const p = await sdk.spawn({ ...request, command: cmd + 'echo streamed' })
+            let out = ''
+            p.standardOutput?.on('data', c => { out += c })
+            const w = await p.wait()
+            return { out, wait: w }
+          })
+          await step('spawn-kill', async () => {
+            const p = await sdk.spawn({ ...request, command: 'C:\\Windows\\System32\\ping.exe -n 30 127.0.0.1' })
+            setTimeout(() => p.kill(), 1000)
+            return await p.wait()
+          })
+          await step('spawnWithPty', async () => {
+            const p = await sdk.spawnWithPty({ ...request, command: cmd + 'echo pty' })
+            return await p.wait()
+          })
+          process.exit(0)
+          '@ -replace '(?m)^          ', '' | Set-Content probe.mjs
+          "--- bun add"; bun add '@microsoft/mxc-sdk@1.0.1' 2>&1 | Select-Object -Last 15; "bun add exit: $LASTEXITCODE"
+          "--- installed"; Get-ChildItem node_modules\@microsoft\mxc-sdk\bin\* -ErrorAction SilentlyContinue | Select-Object -First 12 -ExpandProperty FullName
+          Get-ChildItem node_modules\koffi\build -ErrorAction SilentlyContinue | Select-Object -First 3 -ExpandProperty Name
+          "--- under bun"; bun probe.mjs 2>&1; "bun exit: $LASTEXITCODE"
+          "--- under node"; node probe.mjs 2>&1; "node exit: $LASTEXITCODE"
+          "--- compiled"; bun build --compile probe.mjs --outfile probe.exe 2>&1 | Select-Object -Last 8; "compile exit: $LASTEXITCODE"
+          if (Test-Path probe.exe) {
+            New-Item -ItemType Directory -Force -Path moved | Out-Null
+            Copy-Item probe.exe moved\probe.exe
+            Push-Location moved; .\probe.exe 2>&1; "compiled exit: $LASTEXITCODE"; Pop-Location
+          }
+
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
         shell: pwsh
