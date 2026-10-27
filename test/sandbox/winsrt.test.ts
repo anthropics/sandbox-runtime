@@ -2606,10 +2606,12 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
       { cred_present: false },
     ]
     for (const user of states) {
-      for (const state of ['partial', 'installed']) {
+      // `loopback-mismatch` is an installed set to srt-win's pre-check;
+      // its own error (with --force) follows the user's.
+      for (const state of ['partial', 'installed', 'loopback-mismatch']) {
         // Same configuration: a plain install.
         let errors = await run({ state }, user, {})
-        expect(errors).toHaveLength(1)
+        expect(errors).toHaveLength(state === 'loopback-mismatch' ? 2 : 1)
         expect(errors[0]).toMatch(/Sandbox user is not provisioned/)
         expect(errors[0]).not.toMatch(/--force/)
         expect(errors[0]).not.toMatch(replaces)
@@ -2635,13 +2637,13 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
         )
       }
       // A complete set without a range is a legacy one: it differs.
-      const errors = await run(
-        { state: 'installed', port_range: undefined },
-        user,
-        {},
-      )
-      expect(errors[0]).toContain('port range unknown (requested: 60080-60089)')
-      expect(errors[0]).toContain('windows-install --force\n')
+      for (const state of ['installed', 'loopback-mismatch']) {
+        const errors = await run({ state, port_range: undefined }, user, {})
+        expect(errors[0]).toContain(
+          'port range unknown (requested: 60080-60089)',
+        )
+        expect(errors[0]).toContain('windows-install --force\n')
+      }
     }
     // No install recorded (no setup marker): srt-win has no name to
     // compare, so neither does the suggestion.
