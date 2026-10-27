@@ -384,19 +384,19 @@ jobs:
           '@ | Set-Content -Encoding ascii w\hb.cmd
           @'
           @echo off
-          start "" /b cmd /d /c "%~dp0hb.cmd" "%~1"
+          start "" /b cmd /d /c %~dp0hb.cmd %~1
           ping -n 60 127.0.0.1 >nul
           '@ | Set-Content -Encoding ascii w\parent.cmd
           @'
           @echo off
-          start "" /b cmd /d /c "%~dp0hb.cmd" "%~1"
+          start "" /b cmd /d /c %~dp0hb.cmd %~1
           '@ | Set-Content -Encoding ascii w\bg.cmd
           @'
           import * as sdk from '@microsoft/mxc-sdk/v1'
           import path from 'node:path'
           const w = path.join(process.cwd(), 'w')
           export const cmd = 'C:\\Windows\\System32\\cmd.exe /d /c '
-          export const script = (name, file) => `${cmd}"${path.join(w, name)}" "${path.join(w, file)}"`
+          export const script = (name, file) => `${cmd}${path.join(w, name)} ${path.join(w, file)}`
           export const request = {
             filesystem: { readonlyPaths: [process.cwd()], readwritePaths: [w] },
             network: { egress: { default: 'deny' } },
