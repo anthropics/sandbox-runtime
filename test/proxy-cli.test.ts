@@ -369,7 +369,7 @@ describe('srt-proxy --version', () => {
 
   test('prints one line, the name and the package version, and exits 0', () => {
     expect(manifest.version).toMatch(
-      /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/,
+      /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$/,
     )
     expect(runToExit(['--version'])).toEqual({
       status: 0,

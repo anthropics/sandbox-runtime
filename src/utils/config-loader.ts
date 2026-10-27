@@ -1,5 +1,5 @@
 import * as fs from 'fs'
-import { z } from 'zod'
+import { z } from 'zod/v3'
 import {
   SandboxRuntimeConfigSchema,
   type SandboxRuntimeConfig,
