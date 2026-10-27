@@ -17,8 +17,10 @@ import {
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
-  normalizeRequestTarget,
+  readRequestTarget,
   requestTargetAsSpelled,
+  respondRefusedTarget,
+  type AmbiguousRequestTarget,
   type DenyMark,
   applyHeaderEdits,
   notifyResponse,
@@ -59,6 +61,7 @@ import {
   type DirectLookup,
   openConnectTunnel,
   proxyAuthHeader,
+  onUpstreamError,
   relayResponseHead,
   selectParentProxyUrl,
   shouldBypassParentProxy,
@@ -304,6 +307,17 @@ export interface HttpProxyServerOptions {
    * absolute form inside a TLS-terminated tunnel.
    */
   requestTargetAsSpelled?: boolean
+
+  /**
+   * What becomes of a request filterRequest would judge whose target is
+   * ambiguous (see readRequestTarget), on both paths. `'refuse'`, the
+   * default: 400 before filterRequest is asked, reported through
+   * onFilterRequestDenied. `'asSpelled'`: forwarded as the client spelled
+   * it; filterRequest has to hold for every reading. `'normalize'`: forwarded
+   * normalized, which breaks a signature over the path and names another
+   * resource to an upstream that takes the path literally.
+   */
+  ambiguousRequestTarget?: AmbiguousRequestTarget
 
   /**
    * Refuse, with 400 and before the allowlist is consulted, a request
@@ -815,6 +829,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               foldHopByHop: options.foldHopByHop,
               denyHeader: options.denyHeader,
               requestTargetAsSpelled: options.requestTargetAsSpelled,
+              ambiguousRequestTarget: options.ambiguousRequestTarget,
               byteBudget,
               timeouts: options.tunnelTimeouts,
               onEstablished: () => clearTimeout(deadline),
@@ -1075,23 +1090,38 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // forwarding the client's raw req.url. This ensures the upstream proxy
       // sees exactly the host we allowlist-checked, closing URL-parser
       // differential bypasses.
-      // With filterRequest, the request target is normalized before the
-      // hook sees it and that normalized target is what is forwarded;
-      // without it, the parsed path and query are forwarded unchanged.
-      // requestTargetAsSpelled comes first: it forwards the target as the
-      // client spelled it, hook or no hook.
+      // With filterRequest, the hook gets the target as spelled and
+      // normalized, the spelling is what is forwarded, and a target whose
+      // two forms can name different resources is refused unless
+      // ambiguousRequestTarget says which to send (see forwardUpstream in
+      // tls-terminate-proxy.ts); without it, the parsed path and query are
+      // forwarded unchanged. requestTargetAsSpelled comes first: it forwards
+      // the target as the client spelled it, hook or no hook.
+      const read =
+        options.filterRequest && !options.requestTargetAsSpelled
+          ? readRequestTarget(
+              req.url!,
+              req.method,
+              options.ambiguousRequestTarget,
+            )
+          : undefined
       const requestTarget = options.requestTargetAsSpelled
         ? requestTargetAsSpelled(req.url!, { absolute: true })
-        : options.filterRequest
-          ? normalizeRequestTarget(req.url!, req.method)
+        : read
+          ? read.forwarded
           : `${url.pathname}${url.search}`
       if (requestTarget === undefined) {
-        respondDenied(
+        const reason = respondRefusedTarget(
           res,
-          'malformed request-target',
+          read?.refusal,
           markFor('bad_request'),
-          400,
         )
+        options.onFilterRequestDenied?.({
+          method: req.method ?? 'GET',
+          url: `${url.protocol}//${authority}${read?.spelled ?? ''}`,
+          reason,
+          encodedCommand: auth.encodedCommand,
+        })
         return
       }
       const absUrl = `${url.protocol}//${authority}${requestTarget}`
@@ -1160,7 +1190,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             : undefined,
           {
             target: { host: hostname, port },
-            requestTarget,
+            requestTarget: read?.spelled ?? requestTarget,
+            normalizedRequestTarget: read?.normalized,
+            requestTargetIsAmbiguous: read?.ambiguous,
             rawHeaders: [...req.rawHeaders],
             scheme: 'http',
           },
@@ -1339,7 +1371,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         )
       }
 
-      proxyReq.on('error', failUpstream)
+      onUpstreamError(proxyReq, failUpstream)
 
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())

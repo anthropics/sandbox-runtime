@@ -739,9 +739,10 @@ describe('normalizeRequestTarget', () => {
   })
 })
 
-describe('the request-target the callback sees is the one forwarded', () => {
+describe("'normalize': the normalized request-target the callback sees is the one forwarded", () => {
   // Every case runs a TLS-terminating proxy: skipped where none can run.
   const test = testWithTls
+  const normalize = { ambiguousRequestTarget: 'normalize' } as const
   // Each spelling would pass a naive "/public/" prefix rule, or dodge a
   // "/admin" deny rule, if the callback saw it raw while the proxy (or the
   // runtime's HTTP client) forwarded a normalized form.
@@ -759,7 +760,7 @@ describe('the request-target the callback sees is the one forwarded', () => {
   const recordTarget =
     (sink: { got?: string }): FilterRequestCallback =>
     async (_req, info) => {
-      sink.got = info?.requestTarget
+      sink.got = info?.normalizedRequestTarget
       return { action: 'allow' }
     }
   for (const [label, send] of [
@@ -770,7 +771,7 @@ describe('the request-target the callback sees is the one forwarded', () => {
       test(`${label}: ${spelling}`, async () => {
         const sink: { got?: string } = {}
         const before = seen.length
-        await withProxy(recordTarget(sink), {}, async port => {
+        await withProxy(recordTarget(sink), normalize, async port => {
           expect((await send(port, spelling)).status).toBe(200)
         })
         expect(seen.length).toBe(before + 1)
@@ -779,7 +780,7 @@ describe('the request-target the callback sees is the one forwarded', () => {
     }
     test(`${label}: dot segments and leading slashes are normalized before the callback sees them`, async () => {
       const sink: { got?: string } = {}
-      await withProxy(recordTarget(sink), {}, async port => {
+      await withProxy(recordTarget(sink), normalize, async port => {
         await send(port, '/public/%2e%2e/admin')
         expect(sink.got).toBe('/admin')
         expect(lastSeen().url).toBe('/admin')
@@ -1410,6 +1411,7 @@ describe('network config', () => {
       stripResponseHeaders: ['set-cookie'],
       refuseOpaqueTunnels: true,
       requireHostMatch: true,
+      ambiguousRequestTarget: 'asSpelled',
     })
     expect(ok.success).toBe(true)
     expect(

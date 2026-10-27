@@ -120,7 +120,18 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     const upstream = backendSocketPath
       ? connect(backendSocketPath)
       : connect(backendTcpPort!, '127.0.0.1')
+    let answered = false
+    upstream.once('data', () => {
+      answered = true
+    })
     upstream.on('error', err => {
+      // The 502 is an answer, for a client that has had none. One that has
+      // may be in the middle of anything, a TLS tunnel included, where clear
+      // text is noise. The 'close' that follows ends it.
+      if (answered) {
+        logForDebugging(`mux: HTTP backend error: ${(err as Error).message}`)
+        return
+      }
       // Surface a 502 with the errno code so callers (and CI logs) can tell
       // *why* the backend was unreachable instead of an opaque empty-reply.
       // Full error (including path) goes to debug logging only — the client
