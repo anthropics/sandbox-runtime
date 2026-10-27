@@ -245,19 +245,29 @@ export interface WindowsWfpStatusResult {
   state: WindowsWfpStatus
   /** Live filter count from BFE enum; `0` on `cannot-read`. */
   filters: number
-  /** `[low, high]` for the loopback PERMIT, when known. */
+  /**
+   * `[low, high]` of the proxy-range loopback PERMIT: the first one
+   * enumerated. Absent when no such PERMIT is left or its tag carries
+   * no range. PERMITs of different ranges make the set `partial`.
+   */
   portRange?: [number, number]
   /**
    * Whether the installed filter set opens loopback — see
-   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}.
+   * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}. On `cannot-read`, the mode
+   * the install recorded. On `partial`, the recorded mode when there
+   * is a record (the mode a plain install restores; the filters left
+   * may not show it), else whether any open-loopback PERMIT is left.
    */
   allowLoopback: boolean
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
   /**
-   * Populated only on `cannot-read` (BFE enumeration is admin-gated;
-   * a non-elevated caller can't read it). The non-elevated readiness
-   * check is {@link verifyWindowsWfpEgress}, not this enum.
+   * Populated on `cannot-read` (BFE enumeration is admin-gated; a
+   * non-elevated caller can't read it; the non-elevated readiness
+   * check is {@link verifyWindowsWfpEgress}, not this enum), on
+   * `loopback-mismatch`, and on `partial` when the filters show
+   * loopback closed but the install record says open. It names the
+   * repair.
    */
   hint?: string
 }
@@ -333,6 +343,12 @@ export type WindowsSeclogonState = 'ok' | 'disabled' | 'missing' | 'cannot-read'
  * provisions. The sandboxed child runs **as** this account.
  */
 export interface WindowsSandboxUserStatus {
+  /**
+   * The sandbox account's name: the one the install recorded, or
+   * `srt-sandbox` when none is recorded. Absent from an `srt-win`
+   * that does not report it.
+   */
+  name?: string
   /** The `srt-sandbox` local account exists. */
   provisioned: boolean
   /** `S-1-5-21-…` of `srt-sandbox`, when provisioned. */
@@ -1118,6 +1134,7 @@ function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
 /** Shape of `srt-win user status` (and `srt-win status .user`) stdout. */
 type RawUserStatus = {
   user: {
+    name?: string
     exists: boolean
     sid?: string
     group_exists: boolean
@@ -1226,6 +1243,7 @@ const SECLOGON_STATES: readonly string[] = [
 
 function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
   return {
+    ...(typeof raw.user.name === 'string' && { name: raw.user.name }),
     provisioned: raw.user.exists,
     ...(raw.user.sid && { sid: raw.user.sid }),
     groupExists: raw.user.group_exists,
@@ -4512,24 +4530,48 @@ function interpretDependencyProbes(
     // 'absent' or 'partial' (some of the set is missing, so one address
     // family may be open). If the user is also not-provisioned, the
     // user-state error above already gave the right instruction; don't
-    // repeat. A partial set's `allowLoopback` is the recorded mode: an
-    // install of the other mode replaces it, so needs --force.
+    // repeat. A plain install re-adds a partial set; one of another
+    // configuration than the suggested command's it refuses without
+    // --force (exit 13), as srt-win's `differs_from_request` and its
+    // sandbox-user check decide: the loopback mode (a partial set's
+    // `allowLoopback` is the recorded one), the range while a proxy
+    // PERMIT carries one, and the recorded sandbox user.
     if (us.provisioned && us.credPresent) {
-      const otherMode =
-        ws.state === 'partial' &&
-        allowLoopback !== undefined &&
-        ws.allowLoopback !== allowLoopback
+      const differs: string[] = []
+      if (ws.state === 'partial') {
+        const open = allowLoopback ?? false
+        if (ws.allowLoopback !== open) {
+          differs.push(
+            `loopback ${mode(ws.allowLoopback)} (configured: ${mode(open)})`,
+          )
+        }
+        const [lo, hi] =
+          install.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE
+        if (
+          ws.portRange &&
+          (ws.portRange[0] !== lo || ws.portRange[1] !== hi)
+        ) {
+          differs.push(
+            `port range ${ws.portRange[0]}-${ws.portRange[1]} ` +
+              `(configured: ${lo}-${hi})`,
+          )
+        }
+        const user = install.sandboxUser ?? 'srt-sandbox'
+        if (us.name !== undefined && us.name !== user) {
+          differs.push(`sandbox user '${us.name}' (configured: '${user}')`)
+        }
+      }
       errors.push(
         (ws.state === 'partial'
           ? `WFP filter set incomplete (${ws.filters} srt-win filters ` +
             `found) under sublayer `
           : `WFP filters not installed under sublayer `) +
           `${sublayerGuid ?? '(default)'}. ` +
-          (otherMode
-            ? `Its install recorded loopback ${mode(ws.allowLoopback)}; ` +
-              `configured: ${mode(!ws.allowLoopback)}. `
+          (differs.length > 0
+            ? `Its install differs from this configuration: ` +
+              `${differs.join('; ')}. `
             : '') +
-          windowsInstallInstructions(install, otherMode),
+          windowsInstallInstructions(install, differs.length > 0),
       )
     }
   } else if (ws.portRange) {

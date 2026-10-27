@@ -977,8 +977,9 @@ pub(crate) fn status_from_tags(tags: &[(&str, FilterTag)]) -> WfpStatus {
 /// the install record says open. Every proxy PERMIT must also carry the
 /// same range, as one install writes them: one that opens other ports
 /// than the rest makes the set `partial`. So does a filter of the set
-/// keyed to another user SID than the rest: a block for another account
-/// leaves the sandbox account unfenced on that family. Other kinds are
+/// whose user SID tag differs from the others': a block keyed to another
+/// account fences that account only. (The tags are compared with each
+/// other, not with the provisioned sandbox account.) Other kinds are
 /// ignored.
 pub(crate) fn tags_fence_state(tags: &[(&str, FilterTag)]) -> &'static str {
     let open = tags.iter().any(|(_, t)| t.kind == KIND_PERMIT_OPEN);
@@ -1428,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn a_filter_keyed_to_another_user_is_not_a_complete_set() {
+    fn filters_keyed_to_different_users_are_not_a_complete_set() {
         let (v4, v6) = (ALE_LAYERS[0].1, ALE_LAYERS[1].1);
         let range = DEFAULT_PROXY_PORT_RANGE;
         let rekey = |set: Vec<(&'static str, FilterTag)>, layer: &str, kind: &str| {
