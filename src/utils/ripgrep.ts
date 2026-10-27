@@ -15,7 +15,7 @@ export interface RipgrepConfig {
  * @param abortSignal AbortSignal to cancel the operation
  * @param config Ripgrep configuration (command and optional args)
  * @returns Array of matching lines (one per line of output)
- * @throws Error if ripgrep exits with non-zero status (except exit code 1 which means no matches)
+ * @throws RipgrepError if ripgrep exits with non-zero status (except exit code 1 which means no matches)
  */
 export async function ripGrep(
   args: string[],
@@ -48,5 +48,24 @@ export async function ripGrep(
     // Exit code 1 means "no matches found" - this is normal
     return []
   }
-  throw new Error(`ripgrep failed with exit code ${code}: ${stderr}`)
+  // Whole lines only: killed, it can leave half of one.
+  throw new RipgrepError(
+    `ripgrep failed with exit code ${code}: ${stderr}`,
+    stdout.split('\n').slice(0, -1).filter(Boolean),
+    stderr,
+  )
+}
+
+/** ripgrep ended otherwise than by finding something or nothing. */
+export class RipgrepError extends Error {
+  constructor(
+    message: string,
+    /** What it had listed by then. */
+    readonly listed: string[],
+    /** What it said went wrong. The paths in it are the tree's own text. */
+    readonly stderr: string,
+  ) {
+    super(message)
+    this.name = 'RipgrepError'
+  }
 }

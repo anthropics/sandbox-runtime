@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'bun:test'
+import { SERVES_EMITTED_CONNECTIONS } from '../helpers/emitted-connections.js'
 import { once } from 'node:events'
 import { unlinkSync } from 'node:fs'
 import {
@@ -197,6 +198,67 @@ function rawGet(
     req.on('error', reject)
     req.end()
   })
+}
+
+/**
+ * SOCKS5 CONNECT to a DOMAINNAME destination through the proxy, with
+ * username/password auth when a token is given. Resolves with the reply's
+ * REP byte (0 = granted), the socket (the tunnel, when granted), and
+ * `received()`, the bytes that have come through the tunnel so far.
+ */
+async function socksConnect(
+  proxyPort: number,
+  host: string,
+  port: number,
+  authToken?: string,
+): Promise<{ rep: number; sock: Socket; received(): string }> {
+  const sock = connect(proxyPort, '127.0.0.1')
+  sock.on('error', () => {})
+  await once(sock, 'connect')
+  // Replies can arrive split or joined, so read them by length.
+  let buf = Buffer.alloc(0)
+  let wake: (() => void) | undefined
+  sock.on('data', d => {
+    buf = Buffer.concat([buf, d])
+    wake?.()
+  })
+  sock.once('close', () => wake?.())
+  const read = async (n: number): Promise<Buffer> => {
+    while (buf.length < n) {
+      if (sock.destroyed) throw new Error('SOCKS proxy closed mid-handshake')
+      await new Promise<void>(r => (wake = r))
+    }
+    const out = buf.subarray(0, n)
+    buf = buf.subarray(n)
+    return out
+  }
+
+  sock.write(Buffer.from([0x05, 0x01, authToken ? 0x02 : 0x00]))
+  expect([...(await read(2))]).toEqual([0x05, authToken ? 0x02 : 0x00])
+  if (authToken) {
+    const token = Buffer.from(authToken)
+    sock.write(
+      Buffer.concat([
+        Buffer.from([0x01, 3]),
+        Buffer.from('srt'),
+        Buffer.from([token.length]),
+        token,
+      ]),
+    )
+    expect([...(await read(2))]).toEqual([0x01, 0x00])
+  }
+  const name = Buffer.from(host)
+  sock.write(
+    Buffer.concat([
+      Buffer.from([0x05, 0x01, 0x00, 0x03, name.length]),
+      name,
+      Buffer.from([(port >> 8) & 0xff, port & 0xff]),
+    ]),
+  )
+  // VER REP RSV ATYP=IPv4 0.0.0.0:0. Every CONNECT reply this proxy sends is
+  // 10 bytes.
+  const reply = await read(10)
+  return { rep: reply[1]!, sock, received: () => buf.toString('latin1') }
 }
 
 function listen(server: Server): Promise<number> {
@@ -404,31 +466,34 @@ describe.if(!isWindows)(
       expect(parent.connects).toEqual(['upstream.invalid:80'])
     })
 
-    it('CONNECT: the tlsTerminate exemption hook is consulted with the canonical host', async () => {
-      const ca = createMitmCA({})
-      const exemptionSaw: string[] = []
-      try {
-        proxy = createHttpProxyServer({
-          filter: () => true,
-          mitmCA: ca,
-          shouldTerminateTLS: host => {
-            exemptionSaw.push(host)
-            return false
-          },
-          // Exempted → opaque tunnel → normal routing, which we point at the
-          // recorder so the test needs no real upstream.
-          getMitmSocketPath: () => mitm.socketPath,
-        })
-        const port = await listen(proxy)
-        expect(await rawConnect(port, 'Pinned.invalid.:443')).toMatch(
-          /^HTTP\/1\.1 200 /,
-        )
-        expect(exemptionSaw).toEqual(['pinned.invalid'])
-        expect(mitm.connects).toEqual(['pinned.invalid:443'])
-      } finally {
-        await disposeMitmCA(ca)
-      }
-    })
+    it.skipIf(!SERVES_EMITTED_CONNECTIONS)(
+      'CONNECT: the tlsTerminate exemption hook is consulted with the canonical host',
+      async () => {
+        const ca = createMitmCA({})
+        const exemptionSaw: string[] = []
+        try {
+          proxy = createHttpProxyServer({
+            filter: () => true,
+            mitmCA: ca,
+            shouldTerminateTLS: host => {
+              exemptionSaw.push(host)
+              return false
+            },
+            // Exempted → opaque tunnel → normal routing, which we point at the
+            // recorder so the test needs no real upstream.
+            getMitmSocketPath: () => mitm.socketPath,
+          })
+          const port = await listen(proxy)
+          expect(await rawConnect(port, 'Pinned.invalid.:443')).toMatch(
+            /^HTTP\/1\.1 200 /,
+          )
+          expect(exemptionSaw).toEqual(['pinned.invalid'])
+          expect(mitm.connects).toEqual(['pinned.invalid:443'])
+        } finally {
+          await disposeMitmCA(ca)
+        }
+      },
+    )
   },
 )
 
@@ -436,13 +501,24 @@ describe.if(!isWindows)('socks-proxy: dials the canonical host', () => {
   let tcp: ReturnType<typeof createTcpServer> | undefined
   let wrapper: ReturnType<typeof createSocksProxyServer> | undefined
   let parent: RecordingParent | undefined
+  let mitm: RecordingMitm | undefined
 
   afterEach(async () => {
     await wrapper?.close()
     tcp?.close()
     await parent?.close()
-    wrapper = tcp = parent = undefined
+    await mitm?.close()
+    wrapper = tcp = parent = mitm = undefined
   })
+
+  /** Serve `wrapper` on a loopback port, as the mux front-end would. */
+  async function listenSocks(): Promise<number> {
+    const w = wrapper!
+    tcp = createTcpServer(s => w.handleConnection(s))
+    tcp.listen(0, '127.0.0.1')
+    await once(tcp, 'listening')
+    return (tcp.address() as AddressInfo).port
+  }
 
   it('filter sees the raw spelling; the parent proxy is asked for the canonical authority', async () => {
     parent = await startRecordingParent()
@@ -488,6 +564,60 @@ describe.if(!isWindows)('socks-proxy: dials the canonical host', () => {
     expect(filterSaw).toEqual(['Upstream.invalid.'])
     expect(parent.connects).toEqual(['upstream.invalid:80'])
   })
+
+  it('filter sees the raw spelling; the MITM lookup and the authority sent into the MITM socket are canonical, and the parent proxy is not used', async () => {
+    const m = (mitm = await startRecordingMitm())
+    parent = await startRecordingParent()
+    const filterSaw: string[] = []
+    const mitmLookups: string[] = []
+    wrapper = createSocksProxyServer({
+      filter: (_port, host) => {
+        filterSaw.push(host)
+        return true
+      },
+      getMitmSocketPath: host => {
+        mitmLookups.push(host)
+        return host === 'api.mitm.invalid' ? m.socketPath : undefined
+      },
+      parentProxy: resolveParentProxy({
+        http: `http://127.0.0.1:${parent.port}`,
+        noProxy: '',
+      }),
+    })
+    const socksPort = await listenSocks()
+
+    const { rep, sock } = await socksConnect(
+      socksPort,
+      'Api.MITM.invalid.',
+      443,
+    )
+    sock.destroy()
+    expect(rep).toBe(0x00)
+    expect(filterSaw).toEqual(['Api.MITM.invalid.'])
+    expect(mitmLookups).toEqual(['api.mitm.invalid'])
+    expect(m.connects).toEqual(['api.mitm.invalid:443'])
+    expect(parent.connects).toEqual([])
+  })
+
+  it('refuseOpaqueTunnels refuses a MITM host like any other, without asking for its socket', async () => {
+    const m = (mitm = await startRecordingMitm())
+    const mitmLookups: string[] = []
+    wrapper = createSocksProxyServer({
+      filter: () => true,
+      getMitmSocketPath: host => {
+        mitmLookups.push(host)
+        return m.socketPath
+      },
+      refuseOpaqueTunnels: true,
+    })
+    const socksPort = await listenSocks()
+
+    const { rep, sock } = await socksConnect(socksPort, 'api.mitm.invalid', 443)
+    sock.destroy()
+    expect(rep).toBe(0x01) // general SOCKS server failure
+    expect(mitmLookups).toEqual([])
+    expect(m.connects).toEqual([])
+  })
 })
 
 describe.if(!isWindows)(
@@ -497,11 +627,14 @@ describe.if(!isWindows)(
     let parent: RecordingParent
     let origin: Server
     let originPort: number
+    let originConnections = 0
+    let originProbes = 0
 
     beforeAll(async () => {
       mitm = await startRecordingMitm()
       parent = await startRecordingParent()
       origin = createHttpServer((_req, res) => res.end('origin'))
+      origin.on('connection', () => originConnections++)
       originPort = await listen(origin)
     })
     afterAll(async () => {
@@ -516,12 +649,33 @@ describe.if(!isWindows)(
       mitm.requests.length = 0
       parent.connects.length = 0
       parent.requests.length = 0
+      originConnections = originProbes = 0
     })
+
+    /**
+     * Connections the origin has accepted, not counting the ones this opens.
+     * The origin accepts in arrival order, so once it has answered this
+     * request it has already counted every connection made before it.
+     */
+    async function originConnectionCount(): Promise<number> {
+      originProbes++
+      const probe = connect(originPort, '127.0.0.1')
+      probe.on('error', () => {})
+      probe.write('GET / HTTP/1.1\r\nHost: origin\r\n\r\n')
+      let answer = ''
+      while (!answer.endsWith('origin')) {
+        const [chunk] = (await once(probe, 'data')) as [Buffer]
+        answer += chunk.toString('latin1')
+      }
+      probe.destroy()
+      return originConnections - originProbes
+    }
 
     async function start(network: {
       allowedDomains: string[]
       deniedDomains?: string[]
       mitmDomains: string[]
+      mitmSocketPath?: string
       viaParent?: boolean
     }): Promise<{ port: number; token: string }> {
       await SandboxManager.initialize({
@@ -529,7 +683,7 @@ describe.if(!isWindows)(
           allowedDomains: network.allowedDomains,
           deniedDomains: network.deniedDomains ?? [],
           mitmProxy: {
-            socketPath: mitm.socketPath,
+            socketPath: network.mitmSocketPath ?? mitm.socketPath,
             domains: network.mitmDomains,
           },
           ...(network.viaParent
@@ -723,6 +877,123 @@ describe.if(!isWindows)(
         /^HTTP\/1\.1 200 /,
       )
       expect(mitm.connects).toEqual(['ok.mitm.invalid:443'])
+    })
+
+    // The proxy port speaks SOCKS5 as well as HTTP. A SOCKS CONNECT to a MITM
+    // host must take the same route as an HTTP CONNECT to it: dialed directly
+    // or through the parent proxy, it would skip the MITM proxy.
+
+    it.each([
+      ['exact pattern', 'api.mitm.invalid'],
+      ['wildcard pattern', '*.mitm.invalid'],
+    ])(
+      'SOCKS: every spelling of a MITM host is routed to the MITM socket (%s)',
+      async (_label, pattern) => {
+        const { port, token } = await start({
+          allowedDomains: [pattern],
+          mitmDomains: [pattern],
+        })
+        for (const spelling of [
+          'api.mitm.invalid',
+          'api.mitm.invalid.',
+          'API.Mitm.Invalid',
+        ]) {
+          const { rep, sock } = await socksConnect(port, spelling, 443, token)
+          sock.destroy()
+          expect(rep).toBe(0x00)
+        }
+        expect(mitm.connects).toEqual(
+          Array(3).fill('api.mitm.invalid:443') as string[],
+        )
+      },
+    )
+
+    it('SOCKS: a MITM-pinned IP is routed to the MITM socket and the address itself is never dialed', async () => {
+      const { port, token } = await start({
+        allowedDomains: ['127.0.0.1'],
+        mitmDomains: ['127.0.0.1'],
+      })
+      for (const spelling of ['127.0.0.1', '127.1', '127.0.0.1.']) {
+        const { rep, sock } = await socksConnect(
+          port,
+          spelling,
+          originPort,
+          token,
+        )
+        sock.destroy()
+        expect(rep).toBe(0x00)
+      }
+      expect(mitm.connects).toEqual(
+        Array(3).fill(`127.0.0.1:${originPort}`) as string[],
+      )
+      expect(await originConnectionCount()).toBe(0)
+    })
+
+    it('SOCKS via a parent proxy: MITM domains still win, and the parent gets the canonical authority otherwise', async () => {
+      const { port, token } = await start({
+        allowedDomains: ['api.mitm.invalid', 'other.example.invalid'],
+        mitmDomains: ['api.mitm.invalid'],
+        viaParent: true,
+      })
+      for (const host of ['api.mitm.invalid.', 'Other.Example.invalid.']) {
+        const { rep, sock } = await socksConnect(port, host, 443, token)
+        sock.destroy()
+        expect(rep).toBe(0x00)
+      }
+      expect(mitm.connects).toEqual(['api.mitm.invalid:443'])
+      expect(parent.connects).toEqual(['other.example.invalid:443'])
+    })
+
+    it('SOCKS: an allowed host outside the MITM domains still dials directly', async () => {
+      const { port, token } = await start({
+        allowedDomains: ['api.mitm.invalid', '127.0.0.1'],
+        mitmDomains: ['api.mitm.invalid'],
+      })
+      const { rep, sock, received } = await socksConnect(
+        port,
+        '127.0.0.1',
+        originPort,
+        token,
+      )
+      expect(rep).toBe(0x00)
+      sock.write('GET / HTTP/1.1\r\nHost: origin\r\nConnection: close\r\n\r\n')
+      await once(sock, 'close')
+      expect(received()).toMatch(/\r\n\r\norigin$/)
+      expect(mitm.connects).toEqual([])
+    })
+
+    it('SOCKS: when the MITM socket cannot be reached the client gets a failure, and neither the parent proxy nor the host is dialed instead', async () => {
+      const { port, token } = await start({
+        allowedDomains: ['api.mitm.invalid', '127.0.0.1'],
+        mitmDomains: ['api.mitm.invalid', '127.0.0.1'],
+        mitmSocketPath: shortSocketPath(), // nothing listens here
+        viaParent: true,
+      })
+      // A fallback would send the first of these to the parent proxy and the
+      // second, since loopback bypasses a parent, straight to the origin.
+      for (const [host, destPort] of [
+        ['api.mitm.invalid', 443],
+        ['127.0.0.1', originPort],
+      ] as const) {
+        const { rep, sock } = await socksConnect(port, host, destPort, token)
+        sock.destroy()
+        expect(rep).toBe(0x04) // host unreachable
+      }
+      expect(parent.connects).toEqual([])
+      expect(await originConnectionCount()).toBe(0)
+    })
+
+    it('SOCKS: a host outside the allowlist is refused even when it is a MITM domain, and never reaches the MITM', async () => {
+      const { port, token } = await start({
+        allowedDomains: ['api.mitm.invalid'],
+        mitmDomains: ['*.mitm.invalid'],
+      })
+      for (const host of ['other.mitm.invalid', 'OTHER.mitm.invalid.']) {
+        const { rep, sock } = await socksConnect(port, host, 443, token)
+        sock.destroy()
+        expect(rep).toBe(0x02) // connection not allowed by ruleset
+      }
+      expect(mitm.connects).toEqual([])
     })
   },
 )

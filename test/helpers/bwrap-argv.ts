@@ -8,6 +8,16 @@ const ARGS_FILE_ARGV0 = 'srt-args'
 /** The mount flags this generator emits with a source and a destination. */
 const MOUNT_FLAGS = ['--bind', '--ro-bind']
 
+/** How many words follow each mount flag this generator emits. */
+const MOUNT_ARITY: Record<string, number> = {
+  '--bind': 2,
+  '--ro-bind': 2,
+  '--dev-bind': 2,
+  '--tmpfs': 1,
+  '--dev': 1,
+  '--proc': 1,
+}
+
 /**
  * A whole mount, in the two shapes bwrap is given here: a destination-only
  * `--tmpfs`, or a flag with a source and a destination. Spelling them out is
@@ -75,6 +85,25 @@ export function countMounts(command: string, ...words: MountWords): number {
  */
 export function indexOfMount(command: string, ...words: MountWords): number {
   return runIndices(command, words)[0] ?? -1
+}
+
+/**
+ * Every mount the command carries, in emission order, each as the words
+ * bwrap is given for it. Compare as a MULTISET: the mandatory-deny scan
+ * takes ripgrep's hits in thread order, so that order varies run to run.
+ */
+export function mountsOf(command: string): string[] {
+  const argv = argvOf(command)
+  const mounts: string[] = []
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i]
+    if (flag === undefined) continue
+    const arity = MOUNT_ARITY[flag]
+    if (arity === undefined) continue
+    const words = argv.slice(i, i + 1 + arity)
+    if (words.length === 1 + arity) mounts.push(words.join(' '))
+  }
+  return mounts
 }
 
 /** Argv index of the last occurrence of that whole mount, or -1. */

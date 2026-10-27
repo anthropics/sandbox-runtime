@@ -1,4 +1,4 @@
-import type { Socket } from 'net'
+import { connect, type Socket } from 'net'
 import { createServer } from '@pondwader/socks5-server'
 import { logForDebugging } from '../utils/debug.js'
 import type { DirectLookup, ResolvedParentProxy } from './parent-proxy.js'
@@ -8,6 +8,7 @@ import {
   connectViaParentProxy,
   dialDirect,
   isValidHost,
+  openConnectTunnel,
   selectParentProxyUrl,
   shouldBypassParentProxy,
 } from './parent-proxy.js'
@@ -29,13 +30,25 @@ export interface SocksProxyServerOptions {
   ): Promise<boolean> | boolean
 
   /**
-   * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests are
-   * tunnelled through the parent's HTTP CONNECT instead of dialing directly.
-   * NO_PROXY-matched hosts still connect directly.
+   * Unix socket path of the MITM proxy that carries connections to this host,
+   * or undefined for a host it does not cover. Called with the canonical host,
+   * after `filter` has allowed it. A returned path is the only route tried: an
+   * HTTP CONNECT into that socket, never parentProxy or a direct dial.
+   */
+  getMitmSocketPath?(host: string): string | undefined
+
+  /**
+   * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests (those
+   * not routed via mitmProxy) are tunnelled through the parent's HTTP CONNECT
+   * instead of dialing directly. NO_PROXY-matched hosts still connect directly.
    */
   parentProxy?: ResolvedParentProxy
 
-  /** Direct-dial name resolution (see HttpProxyServerOptions.lookupFor); a refusal is answered "not allowed by ruleset". */
+  /**
+   * Direct-dial name resolution (see HttpProxyServerOptions.lookupFor); a
+   * refusal is answered "not allowed by ruleset". Not consulted for the
+   * mitmProxy or parentProxy routes.
+   */
   lookupFor?: DirectLookup
 
   /**
@@ -64,7 +77,22 @@ export interface SocksProxyServerOptions {
     port: number,
     host: string,
   ): Promise<{ deniedReason?: string }>
+
+  /**
+   * When true, every SOCKS CONNECT is refused at the handshake with
+   * "general SOCKS server failure", before the allowlist is consulted and
+   * before anything is dialled. A SOCKS tunnel is opaque, so nothing sent
+   * through it could pass the HTTP proxy's filterRequest. Set it together
+   * with HttpProxyServerOptions.refuseOpaqueTunnels.
+   */
+  refuseOpaqueTunnels?: boolean
+
+  /** Called for each CONNECT refused under refuseOpaqueTunnels. */
+  onTunnelRefused?(port: number, host: string, encodedCommand?: string): void
 }
+
+// VER, REP=0x01 (general SOCKS server failure), RSV, ATYP=IPv4, 0.0.0.0:0.
+const SOCKS_REPLY_GENERAL_FAILURE = Buffer.from([5, 1, 0, 1, 0, 0, 0, 0, 0, 0])
 
 export interface SocksProxyWrapper {
   /**
@@ -100,7 +128,27 @@ export function createSocksProxyServer(
     })
   }
 
-  socksServer.setRulesetValidator(async conn => {
+  socksServer.setRulesetValidator(conn => {
+    if (options.refuseOpaqueTunnels) {
+      logForDebugging(
+        `SOCKS CONNECT to ${JSON.stringify(conn.destAddress)}:${conn.destPort} refused (refuseOpaqueTunnels)`,
+      )
+      options.onTunnelRefused?.(
+        conn.destPort,
+        conn.destAddress,
+        encodedCommandFromProxyUser(conn.username),
+      )
+      // Answered here rather than through the library's deny, whose reply
+      // claims a ruleset refusal of this destination.
+      conn.socket.end(SOCKS_REPLY_GENERAL_FAILURE, () => conn.socket.destroy())
+      return undefined
+    }
+    return validateDestination(conn)
+  })
+
+  async function validateDestination(
+    conn: Parameters<NonNullable<typeof socksServer.rulesetValidator>>[0],
+  ): Promise<boolean> {
     try {
       const hostname = conn.destAddress
       const port = conn.destPort
@@ -140,15 +188,15 @@ export function createSocksProxyServer(
       })
       return false
     }
-  })
+  }
 
   // Override the default connection handler so we can route through a parent
-  // HTTP proxy when one is configured. The default handler does a straight
-  // net.connect() which fails when direct egress is blocked.
+  // HTTP proxy, or into the MITM proxy's socket, when one is configured. The
+  // default handler does a straight net.connect(), which uses neither.
   socksServer.setConnectionHandler((conn, sendStatus) => {
     // The ruleset validator above allowed this destination on its
-    // canonical spelling; dial (and make the parent-proxy decision on)
-    // that same spelling, as the HTTP proxy does, rather than the client's.
+    // canonical spelling; dial (and make the MITM and parent-proxy decisions
+    // on) that same spelling, as the HTTP proxy does, rather than the client's.
     const host = canonicalizeHost(conn.destAddress) ?? conn.destAddress
     const port = conn.destPort
 
@@ -161,20 +209,39 @@ export function createSocksProxyServer(
     })
     conn.socket.on('error', () => upstreamRef?.destroy())
 
-    // SOCKS is an opaque TCP tunnel — semantically identical to HTTP
-    // CONNECT — so always prefer HTTPS_PROXY if set, regardless of dest port.
+    // A host with a MITM socket must never reach the network any other way:
+    // if that tunnel fails the client gets a failure reply, not the next route.
+    const mitmSocketPath = options.getMitmSocketPath?.(host)
+
+    // SOCKS is an opaque TCP tunnel — semantically identical to HTTP CONNECT —
+    // so a non-MITM host prefers HTTPS_PROXY if set, regardless of dest port.
     const parentUrl =
-      options.parentProxy && !shouldBypassParentProxy(options.parentProxy, host)
+      !mitmSocketPath &&
+      options.parentProxy &&
+      !shouldBypassParentProxy(options.parentProxy, host)
         ? selectParentProxyUrl(options.parentProxy, { isHttps: true })
         : undefined
 
-    const open = parentUrl
-      ? connectViaParentProxy(parentUrl, host, port)
-      : dialDirect(
-          host,
-          port,
-          options.lookupFor?.(port, encodedCommandFromProxyUser(conn.username)),
-        )
+    let open: Promise<Socket>
+    if (mitmSocketPath) {
+      logForDebugging(
+        `Routing SOCKS CONNECT ${host}:${port} through MITM proxy at ${mitmSocketPath}`,
+      )
+      open = openConnectTunnel({
+        dial: () => connect({ path: mitmSocketPath }),
+        readyEvent: 'connect',
+        destHost: host,
+        destPort: port,
+      })
+    } else if (parentUrl) {
+      open = connectViaParentProxy(parentUrl, host, port)
+    } else {
+      open = dialDirect(
+        host,
+        port,
+        options.lookupFor?.(port, encodedCommandFromProxyUser(conn.username)),
+      )
+    }
 
     open
       .then(upstream => {

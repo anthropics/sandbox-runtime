@@ -1,4 +1,17 @@
+import {
+  hasNameReading,
+  literalReadLists,
+  literalWriteLists,
+  reExposedBy,
+  readRulesOf,
+  samePathEntries,
+  spelledOf,
+  withOtherReadings,
+  writeRootsOf,
+  type PathListKind,
+} from './path-entries.js'
 import { createHttpProxyServer } from './http-proxy.js'
+import { assertTlsTerminationSupported } from './emitted-connection.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { createMuxProxyServer, type MuxProxyServer } from './mux-proxy.js'
@@ -16,10 +29,10 @@ import {
   type PlanSigv4,
 } from './credential-aws-pairs.js'
 import {
-  certThumbprint,
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
+  disposeMitmCASync,
   type MitmCA,
 } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
@@ -30,6 +43,7 @@ import * as fs from 'fs'
 import { randomBytes } from 'node:crypto'
 import type {
   CredentialsConfig,
+  FilesystemPathEntry,
   SandboxRuntimeConfig,
   SeccompConfig,
 } from './sandbox-config.js'
@@ -41,6 +55,7 @@ import type {
   NetworkRestrictionConfig,
 } from './sandbox-schemas.js'
 import {
+  WorkingDirectoryChanged,
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
@@ -49,7 +64,7 @@ import {
   cleanupBwrapMountPoints,
   linuxGetCwdMandatoryDenyPaths,
 } from './linux-sandbox-utils.js'
-import { expandReadDenyGlobLinux } from './read-deny-glob.js'
+import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -64,33 +79,52 @@ import {
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   expandWindowsFsPaths,
-  stampWindowsAcl,
+  rankWindowsFsAccess,
   restoreWindowsAcl,
-  grantWindowsAcl,
-  revokeWindowsAcl,
+  grantWindowsAclPersistent,
+  WINDOWS_INSTALL_COMMAND,
+  windowsSetupVersionMismatch,
+  windowsSrtWinOutdatedError,
+  missingWindowsSrtWinCapability,
+  windowsGrantsBeneathDenies,
+  type WindowsProfileGrantItem,
+  type WindowsProfileGrantStatus,
+  getWindowsProfileReadStatus,
+  getWindowsProfileReadStatusAsync,
+  windowsProfileExclusionConflicts,
+  revokeWindowsAclChecked,
+  type WindowsAclRevokeResult,
   getWindowsSandboxUserStatusAsync,
-  getWindowsSandboxCaCert,
   ensurePersistentWindowsCa,
   verifyWindowsWfpEgress,
   resolveSrtWin,
   WindowsSandboxError,
   type SrtWinSpawn,
   type WindowsBinShell,
+  type WindowsFsAccessSet,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './windows-sandbox-utils.js'
 import {
   getDefaultWritePaths,
   containsGlobChars,
+  globBaseDirIsRoot,
   globPatternBaseDir,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
-  expandGlobPattern,
+  walkGlobPatternSteps,
+  workingDirectory,
+  type GlobWalkListings,
+  type Steps,
+  finish,
+  finishInTurns,
   attributionKeyFor,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
+import { ownInstallWarning } from './own-files.js'
 import {
   SandboxViolationStore,
+  sanitizeDenialReason,
   sanitizeUnregisteredCommandKey,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
@@ -103,6 +137,8 @@ import {
   resolveParentProxy,
 } from './parent-proxy.js'
 import {
+  ALLOWED_DOMAIN_ENTRY_MESSAGE,
+  isValidAllowedDomainEntry,
   matchesDomainPattern,
   matchesDomainPatternWithPort,
   stripDomainPatternPort,
@@ -132,12 +168,17 @@ interface HostNetworkManagerContext {
 // ============================================================================
 
 let config: SandboxRuntimeConfig | undefined
+/** How many times a configuration has been installed. A wrap tells by this
+ *  as well as by the object: initialize() keeps the caller's own, which can
+ *  be handed to it again. */
+let configInstalls = 0
 let httpProxyServer: ReturnType<typeof createHttpProxyServer> | undefined
 let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
+let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
@@ -154,12 +195,10 @@ let javaAgentJarPath: string | undefined
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
 let proxyAuthToken: string | undefined
-// Windows: the resolved access set that was actually applied at
-// initialize(). `undefined` means no stamp/grant was applied
+// Windows: the config's resolved access set that was actually applied
+// at initialize(). `undefined` means no stamp/grant was applied
 // (gates running `acl restore`/`acl revoke` at reset()).
-let windowsFsStampedSet:
-  | ReturnType<typeof computeWindowsFsAccessSet>
-  | undefined
+let windowsFsStampedSet: WindowsFsAccessSet | undefined
 // The sandbox user SID captured at initialize(). reset() uses this
 // so a config change between init and reset can't strand ACEs
 // under a different SID.
@@ -173,7 +212,190 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // user's profile). The WFP fence is install-scoped, not config- or
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
-let windowsWfpVerified = false
+// Remembered as the sandbox account the check passed for: a different
+// account (a reinstall) is checked again.
+let windowsWfpVerifiedFor: string | undefined
+// And the loopback mode (`network.allowLocalBinding`) it was run with: a
+// session configured with the other is checked, and refused, again.
+let windowsWfpVerifiedLoopback: boolean | undefined
+// The `srt-win` builds, by identity, that reported every capability the
+// library relies on. Only a yes is remembered.
+const windowsCapableSrtWin = new Set<string>()
+
+/**
+ * What tells one `srt-win` from another: the executable, the arguments
+ * put in front of every call, and — so that a file replaced in place
+ * is a different one — its size and modification time.
+ */
+function windowsSrtWinIdentity(srtWin: SrtWinSpawn): string {
+  let stat = ''
+  try {
+    const st = fs.statSync(srtWin.exe)
+    stat = `${st.size}:${st.mtimeMs}`
+  } catch {
+    // Not a path that can be looked at (resolved through PATH, say):
+    // the name and arguments are the identity.
+  }
+  return JSON.stringify([srtWin.exe, srtWin.prependArgs, stat])
+}
+
+const WINDOWS_CAPABILITIES_WHY =
+  `a session depends on (its read ` +
+  `denies are written on the profile read grant's paths by srt-win, ` +
+  `and kept grants are checked and removed there)`
+
+/**
+ * Make sure the `srt-win` this command runs through has reported every
+ * capability the library relies on; asked once per identity.
+ */
+function assertWindowsSrtWinCapable(srtWin: SrtWinSpawn): void {
+  const id = windowsSrtWinIdentity(srtWin)
+  if (windowsCapableSrtWin.has(id)) return
+  const missing = missingWindowsSrtWinCapability(
+    getWindowsProfileReadStatus({ srtWin }).capabilities,
+  )
+  if (missing !== undefined) {
+    throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
+  }
+  windowsCapableSrtWin.add(id)
+}
+
+// Windows: whether this session's commands read the user's profile
+// through the profile read grant.
+let windowsProfileRead: 'granted' | 'absent' | undefined
+// Windows: what the session has to tell its user about the profile
+// read grant it runs on (getWindowsProfileReadWarnings).
+let windowsProfileReadWarnings: WindowsProfileReadWarning[] = []
+
+/** Something about the profile read grant that the user should be shown. */
+export interface WindowsProfileReadWarning {
+  /** See {@link windowsProfileReadWarningsOf}. */
+  code:
+    | 'profile_exclusion_unprotected'
+    | 'profile_exclusion_unverifiable'
+    | 'profile_stale_allow'
+    | 'profile_file_replaced'
+  message: string
+  paths: WindowsProfileGrantItem[]
+}
+
+/**
+ * What a session on this grant has to tell its user, from what
+ * `srt-win` found — each message says what was established about its
+ * paths and nothing more.
+ */
+export function windowsProfileReadWarningsOf(
+  grant: Pick<
+    WindowsProfileGrantStatus,
+    'unprotected' | 'unverifiable' | 'staleAllow'
+  > &
+    Partial<Pick<WindowsProfileGrantStatus, 'replacedFiles'>>,
+): WindowsProfileReadWarning[] {
+  const list = (items: readonly WindowsProfileGrantItem[]) =>
+    items.map(i => i.path).join(', ')
+  const out: WindowsProfileReadWarning[] = []
+  // Open through an entry this product wrote and could not take
+  // back: the strongest case, said first and as what it is.
+  const byOurs = grant.unprotected.filter(i => i.entry !== undefined)
+  const byList = grant.unprotected.filter(i => i.entry === undefined)
+  const callerReads = grant.unverifiable.filter(i => i.callerReads === true)
+  const rest = grant.unverifiable.filter(i => i.callerReads !== true)
+  if (byOurs.length + byList.length + callerReads.length > 0) {
+    const parts: string[] = []
+    if (byOurs.length > 0) {
+      parts.push(
+        `${byOurs.length} READABLE THROUGH AN ENTRY THIS PRODUCT WROTE and ` +
+          `could not remove — each path's reason gives the icacls command ` +
+          `that removes it, to be run as the object's owner or from an ` +
+          `elevated prompt, followed by the grant again (${list(byOurs)})`,
+      )
+    }
+    if (byList.length > 0) {
+      parts.push(
+        `${byList.length} by their own access lists, which you may not ` +
+          `change (${list(byList)})`,
+      )
+    }
+    if (callerReads.length > 0) {
+      parts.push(
+        `${callerReads.length} whose access lists could not be read but ` +
+          `which you can read all the same, so sandboxed commands may ` +
+          `too (${list(callerReads)})`,
+      )
+    }
+    out.push({
+      code: 'profile_exclusion_unprotected',
+      message:
+        `Paths on the exclusion list of the profile read grant could not ` +
+        `be denied and are, or may be, readable to sandboxed commands: ` +
+        parts.join('; ') +
+        `. Only their owner or an administrator can close them.`,
+      paths: [...byOurs, ...byList, ...callerReads],
+    })
+  }
+  if (rest.length > 0) {
+    const unreadable = rest.filter(i => i.callerReads === false)
+    const noAccount = rest.filter(i => i.cause === 'account_unknown')
+    const other = rest.filter(
+      i => i.callerReads !== false && i.cause !== 'account_unknown',
+    )
+    const parts: string[] = []
+    if (unreadable.length > 0) {
+      parts.push(
+        `${unreadable.length} whose access lists could not be read; you ` +
+          `cannot read their content either (${list(unreadable)})`,
+      )
+    }
+    if (noAccount.length > 0) {
+      parts.push(
+        `${noAccount.length} that could not be examined because the ` +
+          `sandbox account is not known (${list(noAccount)})`,
+      )
+    }
+    if (other.length > 0) {
+      parts.push(`${other.length} that were not examined (${list(other)})`)
+    }
+    out.push({
+      code: 'profile_exclusion_unverifiable',
+      message:
+        `Paths on the exclusion list of the profile read grant could not ` +
+        `be denied, and whether sandboxed commands can read them was not ` +
+        `established: ` +
+        parts.join('; ') +
+        `.`,
+      paths: rest,
+    })
+  }
+  if (grant.staleAllow.length > 0) {
+    out.push({
+      code: 'profile_stale_allow',
+      message:
+        `${grant.staleAllow.length} path(s) that have left the profile ` +
+        `read grant still carry an entry of it that could not be removed, ` +
+        `and are readable to sandboxed commands through it: ` +
+        `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
+        `path's reason gives the icacls command that removes the entry.`,
+      paths: grant.staleAllow,
+    })
+  }
+  const replaced = grant.replacedFiles ?? []
+  if (replaced.length > 0) {
+    out.push({
+      code: 'profile_file_replaced',
+      message:
+        `${replaced.length} configuration file(s) were replaced since the ` +
+        `profile read grant was made and are not readable to sandboxed ` +
+        `commands; the variables that point at them are not returned: ` +
+        `${replaced.join(', ')}. Run grantWindowsProfileRead() ` +
+        `(\`srt-win profile grant\`) again.`,
+      paths: replaced.map(path => ({
+        path,
+        reason: 'replaced since the grant was made',
+      })),
+    })
+  }
+  return out
+}
 // Resolved once at initialize() (`resolveSrtWin` stats the disk).
 // Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
 // and so reset()'s revoke/restore addresses the SAME binary the
@@ -205,10 +427,88 @@ function registerCleanup(): void {
         level: 'error',
       })
     })
-  process.once('exit', cleanupHandler)
+  process.once('exit', () => {
+    void cleanupHandler()
+    // On 'exit' reset() gets as far as its first await, so what it takes out
+    // of the temp directory later than that goes here. After it, because on
+    // Windows it starts by revoking a grant on the trust-bundle directory.
+    // Only paths this process made and still holds: never a listing of the
+    // temp directory, never a path out of the configuration.
+    if (mitmCA) disposeMitmCASync(mitmCA)
+    muxProxyServer?.removeBackendSocketSync()
+    maskedFileStore.dispose()
+    // A bridge told to end removes its own socket, but not every time.
+    const bridge = managerContext?.linuxBridge
+    for (const path of [bridge?.httpSocketPath, bridge?.socksSocketPath]) {
+      try {
+        if (path) fs.rmSync(path, { force: true })
+      } catch {
+        // Best effort: an 'exit' handler must not throw.
+      }
+    }
+  })
   process.once('SIGINT', cleanupHandler)
   process.once('SIGTERM', cleanupHandler)
   cleanupRegistered = true
+}
+
+// An older srt-win reports 'restored'/'alreadyOriginal' where a
+// current one reports 'revoked'/'stillHeld'.
+const WINDOWS_ACL_RELEASE_OK = new Set([
+  'revoked',
+  'stillHeld',
+  'restored',
+  'alreadyOriginal',
+])
+
+function logWindowsAclOutcomes(
+  kind: string,
+  outcomes: readonly { path: string; status: string }[] | undefined,
+): void {
+  for (const e of outcomes ?? []) {
+    if (!WINDOWS_ACL_RELEASE_OK.has(e.status)) {
+      logForDebugging(
+        `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
+          `ACE may be left in place; resolve and run ` +
+          `\`srt-win acl recover\` to clear`,
+        { level: 'warn' },
+      )
+    }
+  }
+}
+
+/**
+ * Whether the deny restore may run: only after a revoke that
+ * completed — otherwise a grant may still be on disk, and the sandbox
+ * account is shared. srt-win enforces the same rule from its records.
+ */
+function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
+  logWindowsAclOutcomes('grant revoke', revoke.outcomes)
+  if (revoke.complete) return true
+  const paths = revoke.pending
+  logForDebugging(
+    `[Sandbox Windows] grant revoke did not complete` +
+      ` — NOT running the deny restore; deny ACEs stay in place ` +
+      `while a grant may still be on disk. Grants possibly left in ` +
+      `place: ${paths.length > 0 ? paths.map(p => `'${p}'`).join(', ') : '(none reported)'}` +
+      (revoke.detail ? `. srt-win: ${revoke.detail}` : '') +
+      `. The next revoke retries them; after this process exits, ` +
+      `\`srt-win acl recover\` does, and removes its deny ACEs once ` +
+      `they are released (\`--force\` drops the record of a grant ` +
+      `that can no longer be located).`,
+    { level: 'error' },
+  )
+  return false
+}
+
+function releaseWindowsSessionAcls(
+  sandboxUserSid: string,
+  srtWin: SrtWinSpawn | undefined,
+): void {
+  const o = { sandboxUserSid, srtWin }
+  if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
+    logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
+  }
 }
 
 /**
@@ -250,6 +550,82 @@ export function resolveCommandText(decodedKey: string): string {
   return (
     commandTextsByKey.get(decodedKey) ??
     sanitizeUnregisteredCommandKey(decodedKey)
+  )
+}
+
+/**
+ * The shortest commandId a per-command allow list may be registered under:
+ * 16 random bytes (128 bits) as unpadded base64url. The floor only turns away
+ * what is too short to hold 128 bits: it cannot tell a random id from a
+ * predictable one of the same length.
+ */
+const MIN_NETWORK_LISTS_COMMAND_ID_LENGTH = 22
+
+/**
+ * Attribution key to the network allow list registered for one invocation
+ * (registerCommandNetworkLists), keyed the way commandTextsByKey is because
+ * the proxy username delivers both. The embedder removes an entry when its
+ * command is gone. Not bounded the way commandTextsByKey is: dropping the
+ * oldest entry would silently take a list away from a running command.
+ */
+const commandNetworkListsByKey = new Map<string, { allowedDomains: string[] }>()
+
+function registerCommandNetworkLists(
+  commandId: string,
+  lists: { allowedDomains?: string[] },
+): void {
+  // The floor is measured on the key the map holds, not on the raw id, and
+  // less U+FFFD: every unpaired surrogate becomes one, so it carries nothing.
+  const key =
+    typeof commandId === 'string'
+      ? decodeSandboxedCommand(encodeSandboxedCommand(commandId))
+      : ''
+  // The id is not echoed in either message: it is what stands between a
+  // sandboxed process and this list, and error text ends up in logs.
+  if (key.replace(/\ufffd/g, '').length < MIN_NETWORK_LISTS_COMMAND_ID_LENGTH) {
+    throw new Error(
+      `registerCommandNetworkLists: commandId must be a string of at least ` +
+        `${MIN_NETWORK_LISTS_COMMAND_ID_LENGTH} characters, unpaired ` +
+        `surrogates not counted. The id is the ` +
+        `only thing that binds a proxy connection to this allow list, and ` +
+        `the sandboxed process chooses which id it presents, so it must be ` +
+        `random (at least 128 bits, e.g. 16 random bytes as base64url) and ` +
+        `never derived from the command text, a counter or the time.`,
+    )
+  }
+  const allowedDomains = lists?.allowedDomains ?? []
+  if (!Array.isArray(allowedDomains)) {
+    throw new Error(
+      'registerCommandNetworkLists: allowedDomains must be an array of strings.',
+    )
+  }
+  for (const entry of allowedDomains) {
+    if (typeof entry !== 'string' || !isValidAllowedDomainEntry(entry)) {
+      throw new Error(
+        `registerCommandNetworkLists: invalid allowedDomains entry ` +
+          `${JSON.stringify(entry)}. ${ALLOWED_DOMAIN_ENTRY_MESSAGE}`,
+      )
+    }
+  }
+  commandNetworkListsByKey.set(
+    key,
+    // Copied, so the caller cannot change what was validated.
+    { allowedDomains: [...allowedDomains] },
+  )
+  // An external HTTP proxy is handed no username, so no connection names an id.
+  if (config?.network.httpProxyPort !== undefined) {
+    logForDebugging(
+      'registerCommandNetworkLists: network.httpProxyPort is set (an ' +
+        'external proxy), so this list will never apply',
+      { level: 'warn' },
+    )
+  }
+}
+
+function unregisterCommandNetworkLists(commandId: string): void {
+  if (typeof commandId !== 'string') return
+  commandNetworkListsByKey.delete(
+    decodeSandboxedCommand(encodeSandboxedCommand(commandId)),
   )
 }
 
@@ -310,25 +686,49 @@ const directLookup: DirectLookup =
     )
 
 /**
- * The request URL as it should appear in a model-visible violation line:
- * origin + path, with any query string reduced to a `?…` marker (origin
- * carries no userinfo, so an embedded `name:pass@` is dropped too). Query
- * strings routinely carry credentials (api_key=, access_token=, signed
- * URLs) that the sandboxed client interpolated at runtime and that were
- * never in the model's context, so they must not enter the transcript via
- * the <sandbox_violations> block. The full URL still reaches the embedder's
+ * The request URL as it should appear in a model-visible violation line: as
+ * spelled (parsed, a refused `/a/../b` would read `/b`), with a query string
+ * or fragment reduced to a `?…` or `#…` marker. (The proxy rebuilds the
+ * authority, so an embedded `name:pass@` is gone already.) Query strings
+ * routinely carry credentials (api_key=, access_token=, signed URLs) that
+ * the sandboxed client interpolated at runtime and that were never in the
+ * model's context, so they must not enter the transcript via the
+ * <sandbox_violations> block. The full URL still reaches the embedder's
  * filterRequest callback and its own debug logging.
  */
 function redactUrlForViolation(url: string): string {
-  try {
-    const u = new URL(url)
-    return `${u.origin}${u.pathname}${u.search ? '?…' : ''}`
-  } catch {
-    // Not an absolute URL (shouldn't happen for proxy requests) — drop
-    // anything after '?' rather than risk leaking it.
-    const q = url.indexOf('?')
-    return q === -1 ? url : `${url.slice(0, q)}?…`
-  }
+  const cut = url.search(/[?#]/)
+  return cut === -1 ? url : `${url.slice(0, cut + 1)}…`
+}
+
+/** Whether an ask-callback answer is one of the two documented denials. */
+function isDeclaredDenial(answer: unknown): boolean {
+  return (
+    answer === false ||
+    (typeof answer === 'object' &&
+      answer !== null &&
+      (answer as { allow?: unknown }).allow === false)
+  )
+}
+
+/**
+ * The reason an ask-callback answer gives for denying, sanitized, or
+ * undefined when it gives none that can be shown. Only
+ * `{ allow: false, reason }` supplies one: a reason on any other object was
+ * not written as the explanation of a denial.
+ */
+function denialReasonOf(answer: unknown): string | undefined {
+  if (typeof answer !== 'object' || answer === null) return undefined
+  const { allow, reason } = answer as { allow?: unknown; reason?: unknown }
+  if (allow !== false || typeof reason !== 'string') return undefined
+  return sanitizeDenialReason(reason) || undefined
+}
+
+/** Own keys only: an entry can be spelled `constructor`. */
+function deniedDomainReason(entry: string): string {
+  const reasons = config?.network.deniedDomainReasons ?? {}
+  const own = Object.prototype.hasOwnProperty.call(reasons, entry)
+  return (own ? reasons[entry] : undefined) ?? 'host is on the deny list'
 }
 
 async function filterNetworkRequest(
@@ -336,9 +736,11 @@ async function filterNetworkRequest(
   host: string,
   sandboxAskCallback: SandboxAskCallback | undefined,
   encodedCommand?: string,
+  explain?: (reason: string) => void,
 ): Promise<boolean> {
   const denied = (reason: string): false => {
     recordOutboundDeny(host, port, reason, encodedCommand)
+    explain?.(reason)
     return false
   }
 
@@ -372,10 +774,7 @@ async function filterNetworkRequest(
       // The matched entry's own reason when the caller supplied one, so the
       // model reads why this destination is off-limits (and the sanctioned
       // alternative) instead of a generic deny; keyed by the exact entry.
-      return denied(
-        config.network.deniedDomainReasons?.[deniedDomain] ??
-          'host is on the deny list',
-      )
+      return denied(deniedDomainReason(deniedDomain))
     }
   }
 
@@ -401,22 +800,51 @@ async function filterNetworkRequest(
     }
   }
 
-  // No matching rules - ask user or deny. strictAllowlist makes the
-  // allowlist deterministic enforcement: never fall through to the callback.
-  if (!sandboxAskCallback || config.network.strictAllowlist) {
+  // strictAllowlist makes the configured allowlist deterministic enforcement:
+  // neither a per-command allow list nor the callback below can widen it.
+  if (config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
     return denied('host is not on the allow list')
   }
 
-  logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
+  // The allow list registered for the invocation the proxy username names.
+  // Coming after both configured lists, it lifts the default deny for that
+  // one command and never a configured deniedDomains entry. The username is
+  // presented by the sandboxed client: see registerCommandNetworkLists.
+  const perCommand = encodedCommand
+    ? commandNetworkListsByKey.get(decodeSandboxedCommand(encodedCommand))
+    : undefined
+  for (const allowedDomain of perCommand?.allowedDomains ?? []) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {
+      logForDebugging(`Allowed by per-command rule: ${host}:${port}`)
+      return true
+    }
+  }
+
+  if (!sandboxAskCallback) {
+    logForDebugging(`No matching rule, denying: ${host}:${port}`)
+    return denied('host is not on the allow list')
+  }
+
+  logForDebugging(`No matching rule, asking user: ${host}:${port}`)
   try {
-    const userAllowed = await sandboxAskCallback({ host, port })
-    if (userAllowed) {
+    // Held as unknown: a JavaScript caller is not bound by the declared type.
+    const answer: unknown = await sandboxAskCallback({ host, port })
+    // Only `true` allows: an object is how a callback denies with a reason,
+    // and a truthiness test here would read every such denial as an allow.
+    if (answer === true) {
       logForDebugging(`User allowed: ${host}:${port}`)
       return true
     }
+    if (!isDeclaredDenial(answer)) {
+      logForDebugging(
+        `Ask callback answered neither a boolean nor { allow: false, reason }; treating it as a denial: ${host}:${port}`,
+        { level: 'warn' },
+      )
+    }
     logForDebugging(`User denied: ${host}:${port}`)
-    return denied('user denied')
+    // The callback's own reason, when it gave one, says what to do instead.
+    return denied(denialReasonOf(answer) ?? 'user denied')
   } catch (error) {
     logForDebugging(`Error in permission callback: ${error}`, {
       level: 'error',
@@ -560,15 +988,35 @@ async function startMuxProxyServer(
   const injectCredentials = buildCredentialInjector()
   const injectBodyCredentials = buildBodyCredentialInjector()
   httpProxyServer = createHttpProxyServer({
-    filter: (port, host, _socket, encodedCommand) =>
-      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
+    filter: (port, host, _socket, encodedCommand, explain) =>
+      filterNetworkRequest(
+        port,
+        host,
+        sandboxAskCallback,
+        encodedCommand,
+        explain,
+      ),
     getMitmSocketPath,
     mitmCA,
     shouldTerminateTLS: shouldTerminateTLSForHost,
     filterRequest: config?.network.filterRequest,
+    plaintextHeaderSet: config?.network.allowPlaintextHeaderSet,
+    stripResponseHeaders: config?.network.stripResponseHeaders,
+    refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
+    requireHostMatch: config?.network.requireHostMatch,
+    ambiguousRequestTarget: config?.network.ambiguousRequestTarget,
+    // Read at each CONNECT, so that updateConfig changes them.
+    get maxTerminatedTunnels() {
+      return config?.network.tlsTerminate?.maxTunnels
+    },
+    get tlsHandshakeTimeoutMs() {
+      return config?.network.tlsTerminate?.handshakeTimeoutMs
+    },
     onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
+      // A refused CONNECT comes with its authority (`host:port`), not a URL.
+      const target = method === 'CONNECT' ? url : redactUrlForViolation(url)
       recordProxyViolation(
-        `deny http-request ${method} ${redactUrlForViolation(url)} (${reason})`,
+        `deny http-request ${method} ${target} (${reason})`,
         encodedCommand,
       )
     },
@@ -594,9 +1042,19 @@ async function startMuxProxyServer(
   socksProxyServer = createSocksProxyServer({
     filter: (port, host, encodedCommand) =>
       filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
+    getMitmSocketPath,
     parentProxy,
     lookupFor: directLookup,
     proxyAuthToken,
+    // A SOCKS tunnel is opaque, so the option that keeps opaque CONNECT
+    // tunnels off the HTTP side must close this side of the port too.
+    refuseOpaqueTunnels: config?.network.refuseOpaqueTunnels,
+    onTunnelRefused: (port, host, encodedCommand) => {
+      recordProxyViolation(
+        `deny socks-tunnel ${host}:${port} (refuseOpaqueTunnels)`,
+        encodedCommand,
+      )
+    },
     probeUnauthenticated: async (port, host) => {
       // Explicit deny rules only: an unauthenticated peer must never reach
       // the ask callback, and a merely off-list host gets the generic
@@ -605,9 +1063,7 @@ async function startMuxProxyServer(
       const canonical = canonicalizeHost(host) ?? host
       for (const entry of config.network.deniedDomains) {
         if (matchesDomainPatternWithPort(canonical, port, entry)) {
-          const reason =
-            config.network.deniedDomainReasons?.[entry] ??
-            'host is on the deny list'
+          const reason = deniedDomainReason(entry)
           recordOutboundDeny(host, port, reason)
           return { deniedReason: reason }
         }
@@ -646,10 +1102,45 @@ async function startMuxProxyServer(
 // Public Module Functions (will be exported via namespace)
 // ============================================================================
 
+/**
+ * Options of {@link initialize} that are the embedding program's to
+ * set, not part of the configuration a user writes.
+ */
+export interface SandboxInitializeOptions {
+  /**
+   * Windows: profile exclusions this session may still be granted READ on.
+   * Never applies to a write root or to a path above an exclusion.
+   */
+  dangerouslyAllowReadOfProfileExclusions?: readonly string[]
+}
+
 async function initialize(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
+  options?: SandboxInitializeOptions,
+): Promise<void> {
+  try {
+    await initializeSteps(
+      runtimeConfig,
+      sandboxAskCallback,
+      enableLogMonitor,
+      options,
+    )
+  } catch (error) {
+    // Here, not at reset() or 'exit': a step can fail before the clean-up is
+    // registered, and the next call makes a CA of its own.
+    if (mitmCA) disposeMitmCASync(mitmCA)
+    mitmCA = undefined
+    throw error
+  }
+}
+
+async function initializeSteps(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  enableLogMonitor: boolean,
+  options: SandboxInitializeOptions | undefined,
 ): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
@@ -659,6 +1150,7 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+  configInstalls++
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
@@ -678,6 +1170,9 @@ async function initialize(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
+  // Before any CA, proxy or sandbox is set up: a runtime that cannot
+  // terminate TLS in-process fails here, not on each tunnel.
+  if (runtimeConfig.network.tlsTerminate) assertTlsTerminationSupported()
   // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
   // defer CA creation until the Windows block below has resolved
   // srt-win and fetched user status — the persistent CA is
@@ -698,6 +1193,20 @@ async function initialize(
   // Check dependencies
   const deps = await checkDependenciesAsync()
   if (deps.errors.length > 0) {
+    if (deps.reinstallRequired) {
+      throw new WindowsSandboxError(
+        'reinstall_required',
+        deps.reinstallRequired,
+      )
+    }
+    // The session asks for the other loopback mode than the installed
+    // one: refused here, before anything is granted or launched.
+    if (deps.loopbackMismatch) {
+      throw new WindowsSandboxError(
+        'wfp_loopback_mismatch',
+        deps.loopbackMismatch,
+      )
+    }
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
     )
@@ -715,14 +1224,16 @@ async function initialize(
   if (enableLogMonitor && getPlatform() === 'linux') {
     // The monitor compares paths the kernel reported, so its lists are
     // expanded the way the wrapper expands them (getFsWriteConfig folds in
-    // the default write paths and drops the globs bwrap cannot take;
+    // the default write paths and drops the patterns, so only names are left;
     // normalizePathForSandbox resolves `~`, relative spellings and symlinks),
     // plus the built-in write denies the wrapper always applies.
     // It does not reproduce the wrapper's existence and boundary-symlink
     // filters, nor the ripgrep scan for nested dangerous paths; and it still
     // reports writes bwrap permits through `--dev`, `--proc` and the tmpfs
     // over each read-denied directory. Started once, so both lists are fixed
-    // at the cwd and configuration of this call.
+    // at the cwd and configuration of this call, and at the disk as it is
+    // now: an entry with glob characters that becomes the name of a path
+    // later is applied by the next wrap and stays unknown here.
     const monitoredWrites = getFsWriteConfig()
     linuxMonitor = startLinuxSandboxViolationMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
@@ -735,12 +1246,15 @@ async function initialize(
         // out because it is read-denied sits under that deny's writable
         // tmpfs, so a write there is permitted and is not a violation.
         allowWritePaths: [
-          ...monitoredWrites.allowOnly,
+          ...writeRootsOf(monitoredWrites),
           ...(config.filesystem.disabled ? [] : getDefaultWritePaths()),
-        ].map(p => normalizePathForSandbox(p)),
+        ].map(p => normalizePathForSandbox(p, { literal: true })),
         denyWritePaths: [
           ...monitoredWrites.denyWithinAllow.map(p =>
-            normalizePathForSandbox(p),
+            normalizePathForSandbox(p, { literal: true }),
+          ),
+          ...(monitoredWrites.literalDenyWithinAllow ?? []).map(p =>
+            normalizePathForSandbox(p, { literal: true }),
           ),
           // filesystem.disabled reaches the wrapper as `writeConfig ===
           // undefined`, which skips every bind and the built-in denies with
@@ -776,10 +1290,71 @@ async function initialize(
       throw new WindowsSandboxError(
         'not_provisioned',
         `Windows sandbox user is not provisioned (user=` +
-          `${u.provisioned}, cred=${u.credPresent}). Run \`npx ` +
-          `sandbox-runtime windows-install\` (one UAC prompt) to ` +
+          `${u.provisioned}, cred=${u.credPresent}). Run ` +
+          `\`${WINDOWS_INSTALL_COMMAND}\` (one UAC prompt) to ` +
           `provision it.`,
       )
+    }
+    // srt-win refuses to launch on an install of another setup
+    // version; checked before anything is granted.
+    const staleSetup = windowsSetupVersionMismatch(
+      u,
+      runtimeConfig.windows?.sublayerGuid ??
+        runtimeConfig.windows?.wfpSublayerGuid,
+    )
+    if (staleSetup) {
+      config = undefined
+      throw new WindowsSandboxError('reinstall_required', staleSetup)
+    }
+    // initialize() never writes or refreshes the profile read grant.
+    windowsProfileReadWarnings = []
+    let profileRead: 'granted' | 'absent' = 'absent'
+    let profileExclusions: Parameters<
+      typeof windowsProfileExclusionConflicts
+    >[1] = { exclusions: [], ungrantedOnly: [] }
+    try {
+      // Required whether or not a profile grant is recorded.
+      const missing = missingWindowsSrtWinCapability(u.capabilities)
+      if (missing !== undefined) {
+        throw windowsSrtWinOutdatedError(missing, WINDOWS_CAPABILITIES_WHY)
+      }
+      windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
+      if (u.profileGrant) {
+        const grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        if (grant.state !== 'none' && grant.state !== 'current') {
+          throw new WindowsSandboxError(
+            'profile_grant_outdated',
+            `The recorded read grant on your user profile cannot be used ` +
+              `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''}). ` +
+              `Call grantWindowsProfileRead() (\`srt-win profile grant\`, ` +
+              `or \`${WINDOWS_INSTALL_COMMAND}\` again) as the ` +
+              `user who starts sessions to bring it up to date, or ` +
+              `forgetWindowsProfileRead() (\`srt-win profile forget\`) to ` +
+              `run without reading the profile. initialize() does neither ` +
+              `itself.`,
+          )
+        }
+        if (grant.state === 'current') {
+          profileExclusions = grant
+          profileRead = 'granted'
+          windowsProfileReadWarnings = windowsProfileReadWarningsOf(grant)
+          for (const w of windowsProfileReadWarnings) {
+            logForDebugging(`[Sandbox Windows] ${w.message}`, { level: 'warn' })
+          }
+        }
+      }
+      // Stored once known: `absent` is never reported for a granted session.
+      windowsProfileRead = profileRead
+      if (profileRead === 'absent') {
+        logForDebugging(
+          `[Sandbox Windows] no profile read grant: the user profile is ` +
+            `not readable to sandboxed commands in this session`,
+        )
+      }
+    } catch (e) {
+      windowsProfileRead = undefined
+      config = undefined
+      throw e
     }
     // Behavioral proof the WFP egress fence is active for the
     // sandbox user — BFE enumeration (`wfp status`) is admin-gated,
@@ -789,18 +1364,8 @@ async function initialize(
     // After the user-status check so the not-provisioned message is
     // the actionable one. Once per process — the fence is install-
     // scoped, not session-scoped.
-    if (!windowsWfpVerified) {
-      try {
-        await verifyWindowsWfpEgress({
-          proxyPortRange: runtimeConfig.windows?.proxyPortRange,
-          srtWin,
-        })
-      } catch (e) {
-        config = undefined
-        throw e
-      }
-      windowsWfpVerified = true
-    }
+    // The probe runs below, after the grant: the capability SIDs of
+    // the write roots exist only once the roots are granted.
     // Persistent-CA branch (see the deferral comment above).
     // `ensurePersistentWindowsCa` reconciles the registry thumb
     // itself (so initialize() after uninstall→reinstall repairs
@@ -821,53 +1386,73 @@ async function initialize(
         throw e
       }
     }
-    // Explicit-path branch: schannel clients (System32 curl, IWR,
-    // .NET, default-backend git) only trust what's in the sandbox
-    // user's `CurrentUser\Root` — which `srt-win exec` does not (and
-    // must not) write. Compare thumbprints so a stale install-time
-    // CA doesn't pass the gate while schannel rejects the session's
-    // proxy-minted leaves.
-    if (tlsTerminate && mitmCA && !useWindowsPersistentCa) {
-      const installed = getWindowsSandboxCaCert(u)
-      const sessionThumb = certThumbprint(mitmCA.certPem)
-      if (!installed) {
-        config = undefined
-        throw new WindowsSandboxError(
-          'trust_ca_not_installed',
-          `tlsTerminate on Windows requires the sandbox to be ` +
-            `installed with this CA (thumb=${sessionThumb}): run ` +
-            `\`srt-win user trust-ca ${mitmCA.certPath}\`. Per-exec ` +
-            `installs into the sandbox user's Root store are not ` +
-            `supported.`,
-        )
-      }
-      if (installed.thumb !== sessionThumb) {
-        config = undefined
-        throw new WindowsSandboxError(
-          'trust_ca_thumbprint_mismatch',
-          `tlsTerminate on Windows: the sandbox's installed CA ` +
-            `(thumb=${installed.thumb}) doesn't match this ` +
-            `session's CA (thumb=${sessionThumb}). Run \`srt-win ` +
-            `user trust-ca ${mitmCA.certPath}\` to update it.`,
-        )
-      }
-    }
     // Filesystem grants/denies — additive sandbox-user ACEs.
     try {
-      const acc = computeWindowsFsAccessSet(runtimeConfig)
-      // The trust bundle the CA-trust env vars point at
-      // (NODE_EXTRA_CA_CERTS etc.) must be readable by the
-      // srt-sandbox child. It's written into the broker's %TEMP%,
-      // which the sandbox user has no inherent rights on, so it
-      // rides the same session-level `acl grant` read-set as the
-      // working tree. Granted on the mkdtemp DIR (not the file)
-      // so the (OI)(CI) ACE covers both the file open AND the
-      // parent-directory list that cmd's `type`/`FindFirstFile`
-      // does before opening. Mirrors the mac/linux
-      // `expandedAllowRead` push in wrapWithSandbox.
-      if (mitmCA) {
-        acc.grantRead.push(dirname(mitmCA.trustBundlePath))
+      let maskedFiles: string[] = []
+      try {
+        maskedFiles = windowsMaskedFileDenies(
+          getCredentialRestrictions(
+            runtimeConfig.credentials,
+            runtimeConfig.network.allowedDomains,
+          ),
+        )
+      } catch {
+        // onExtractNoMatch: "error" is thrown by every wrap, so nothing runs.
       }
+      const acc = computeWindowsFsAccessSet(runtimeConfig, maskedFiles)
+      // No path the session grants, in any form, may reach what the
+      // profile read grant excludes.
+      const ownRead = mitmCA ? [dirname(mitmCA.trustBundlePath)] : []
+      const override = options?.dangerouslyAllowReadOfProfileExclusions ?? []
+      const refused = [
+        ...windowsProfileExclusionConflicts(acc.grantRead, profileExclusions, {
+          override,
+        }),
+        ...windowsProfileExclusionConflicts(ownRead, profileExclusions),
+        ...windowsProfileExclusionConflicts(acc.grantWrite, profileExclusions, {
+          write: true,
+        }),
+      ]
+      if (refused.length > 0) {
+        const describe = (c: (typeof refused)[number]): string => {
+          const list = c.access === 'write' ? 'allowWrite' : 'allowRead'
+          const what =
+            c.kind === 'ungranted-only'
+              ? (c.relation === 'equal' ? `is` : `contains`) +
+                ` ${c.exclusion}, which is not granted as a whole (grant ` +
+                `a directory inside it instead)`
+              : c.relation === 'equal'
+                ? `is the excluded ${c.exclusion}`
+                : c.relation === 'inside'
+                  ? `lies inside the excluded ${c.exclusion}`
+                  : c.unexamined !== undefined
+                    ? `may contain the excluded ${c.exclusion}: ` +
+                      `${c.unexamined}, and a path is granted only once ` +
+                      `it has been looked at`
+                    : `contains the excluded ${c.exclusion}`
+          return (
+            `${list} ${c.path} ${what}` +
+            (c.access === 'write' && c.relation === 'above'
+              ? `: a write grant on it is kept and inherited, so that ` +
+                `path would be writable and readable if it is ever ` +
+                `created again — choose a narrower working directory`
+              : '')
+          )
+        }
+        throw new WindowsSandboxError(
+          'profile_exclusion_read_grant',
+          `The session would grant a path that reaches one excluded from ` +
+            `reads of your user profile: ` +
+            refused.map(describe).join('; ') +
+            `. Nothing was granted. Remove the entry, or name a path that ` +
+            `neither is nor contains an excluded one.`,
+        )
+      }
+      // A read deny is passed once: `srt-win` adds the recorded profile paths it
+      // covers. The CA trust bundle's directory rides the session's read grants.
+      const grantRead = mitmCA
+        ? [...acc.grantRead, dirname(mitmCA.trustBundlePath)]
+        : acc.grantRead
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
       // status` here.
@@ -882,44 +1467,49 @@ async function initialize(
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
       windowsFsSbUserSid = sb
-      // Grant FIRST so the sandbox user has working-tree access by
-      // the time the deny stamp runs. The two are independent
-      // refcounted state-DB sets keyed on the same holder PID.
-      if (acc.grantRead.length > 0 || acc.grantWrite.length > 0) {
-        grantWindowsAcl({
-          sandboxUserSid: sb,
-          read: acc.grantRead,
-          write: acc.grantWrite,
+      // One call, always made: it also records this process as a
+      // session. Write roots are kept at reset(); a failure throws.
+      await grantWindowsAclPersistent({
+        sandboxUserSid: sb,
+        read: grantRead,
+        write: acc.grantWrite,
+        denyRead: acc.denyRead,
+        denyWrite: acc.denyWrite,
+        allowProfileExclusions: override,
+        srtWin,
+      })
+      // Gates running revoke/restore at reset(): every session is
+      // recorded with srt-win, whatever it was given. Set before the
+      // probe, so that a reset() during it releases what was granted.
+      windowsFsStampedSet = acc
+      logForDebugging(
+        `[Sandbox Windows] fs applied: ` +
+          `${acc.grantWrite.length} grantWrite, ` +
+          `${grantRead.length} grantRead, ` +
+          `${acc.denyRead.length} denyRead, ` +
+          `${acc.denyWrite.length} denyWrite`,
+      )
+      // The egress probe, under the token this session's commands
+      // get; anything but a refused connect throws, and so does an
+      // install whose loopback mode is not this session's. Remembered
+      // per account and loopback mode.
+      const allowLoopback = runtimeConfig.network?.allowLocalBinding === true
+      if (
+        windowsWfpVerifiedFor !== sb ||
+        windowsWfpVerifiedLoopback !== allowLoopback
+      ) {
+        await verifyWindowsWfpEgress({
+          proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+          writeRoots: acc.grantWrite,
+          allowLoopback,
+          sublayerGuid:
+            runtimeConfig.windows?.sublayerGuid ??
+            runtimeConfig.windows?.wfpSublayerGuid,
+          sandboxUser: runtimeConfig.windows?.sandboxUser,
           srtWin,
         })
-      }
-      if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
-        stampWindowsAcl({
-          sandboxUserSid: sb,
-          denyRead: acc.denyRead,
-          denyWrite: acc.denyWrite,
-          srtWin,
-        })
-      }
-      // Only record when something was actually applied — gates
-      // running revoke/restore at reset(). Recorded AFTER success —
-      // the catch below clears `config`, and a non-undefined
-      // stampedSet would leave reset()/updateConfig() seeing state
-      // that never landed.
-      const anyApplied =
-        acc.grantRead.length > 0 ||
-        acc.grantWrite.length > 0 ||
-        acc.denyRead.length > 0 ||
-        acc.denyWrite.length > 0
-      if (anyApplied) {
-        windowsFsStampedSet = acc
-        logForDebugging(
-          `[Sandbox Windows] fs applied: ` +
-            `${acc.grantWrite.length} grantWrite, ` +
-            `${acc.grantRead.length} grantRead, ` +
-            `${acc.denyRead.length} denyRead, ` +
-            `${acc.denyWrite.length} denyWrite`,
-        )
+        windowsWfpVerifiedFor = sb
+        windowsWfpVerifiedLoopback = allowLoopback
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
     } catch (e) {
@@ -927,10 +1517,11 @@ async function initialize(
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
       if (windowsFsSbUserSid) {
-        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
-        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
+        releaseWindowsSessionAcls(windowsFsSbUserSid, srtWin)
       }
       windowsFsSbUserSid = undefined
+      windowsFsStampedSet = undefined
+      windowsProfileRead = undefined
       config = undefined
       throw e
     }
@@ -1047,11 +1638,17 @@ function isSandboxingEnabled(): boolean {
  * srt-win resolution failure) or the inputs for the Windows probe —
  * the only platform where the sync and async variants differ.
  */
-function checkDependenciesCommon(
-  ripgrepConfig?: RipgrepConfig,
-):
+function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
   | { done: SandboxDependencyCheck }
-  | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
+  | {
+      windows: {
+        sublayerGuid?: string
+        proxyPortRange?: readonly [number, number]
+        sandboxUser?: string
+        srtWin: SrtWinSpawn
+        allowLoopback?: boolean
+      }
+    } {
   if (!isSupportedPlatform()) {
     return { done: { errors: ['Unsupported platform'], warnings: [] } }
   }
@@ -1088,8 +1685,25 @@ function checkDependenciesCommon(
       windows: {
         sublayerGuid:
           config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
+        proxyPortRange: config?.windows?.proxyPortRange,
+        sandboxUser: config?.windows?.sandboxUser,
         srtWin,
+        // With a config to go by, an install whose loopback mode is
+        // not the configured one is an error.
+        ...(config && {
+          allowLoopback: config.network?.allowLocalBinding === true,
+        }),
       },
+    }
+  }
+
+  // The library itself writable from inside the sandbox: see own-files.ts.
+  if (!config?.filesystem.disabled) {
+    try {
+      const ownInstall = ownInstallWarning(writeRootsOf(getFsWriteConfig()))
+      if (ownInstall !== undefined) warnings.push(ownInstall)
+    } catch {
+      // It only advises: whoever enforces a config says what is wrong with it.
     }
   }
 
@@ -1239,73 +1853,118 @@ function getCredentialDenyReadPaths(
  * expansion and no credential masking, because getFsWriteConfig() is a
  * getter callers reach from permission checks and render paths. A mask entry
  * that degrades to a deny is a file and cannot cover a directory, so
- * leaving those out changes nothing.
+ * leaving those out changes nothing. An entry with glob characters that is
+ * also the name of a path counts as that name too. The credential denies are
+ * judged apart, with no `allowRead`: they have no exceptions.
  */
 function defaultWritePathsUnder({
   denyRead,
   allowRead,
   credentials,
 }: {
-  denyRead: readonly string[]
-  allowRead: readonly string[] | undefined
+  denyRead: readonly FilesystemPathEntry[]
+  allowRead: readonly FilesystemPathEntry[] | undefined
   credentials: CredentialsConfig | undefined
 }): string[] {
-  return getDefaultWritePaths({
-    denyRead: [...denyRead, ...getCredentialDenyReadPaths(credentials)],
-    allowRead,
-  })
+  const underCredentialDenies = getDefaultWritePaths(
+    readRulesOf([], undefined, getCredentialDenyReadPaths(credentials)),
+  )
+  return getDefaultWritePaths(readRulesOf(denyRead, allowRead, [])).filter(p =>
+    underCredentialDenies.includes(p),
+  )
 }
 
 /**
- * Union the explicit `filesystem.denyRead` with credential-derived
- * deny paths. The single source of "what files does this config
- * want read-denied" — all platforms route through here so a new
- * credential kind that contributes deny paths reaches every
- * backend.
+ * The explicit `filesystem.denyRead` and the credential-derived deny paths,
+ * each through {@link resolveReadPathEntries}. The single source of "what
+ * files does this config want read-denied" on macOS and Linux, so a new
+ * credential kind that contributes deny paths reaches both. The credential
+ * ones are also returned apart, for the precedence the backends give them.
  */
-function unionDenyReadPaths(
-  denyRead: readonly string[],
+function* resolveReadDenies(
+  denyRead: readonly FilesystemPathEntry[] = [],
   credentialRestrictions: CredentialRestrictionConfig,
-): string[] {
-  return [...new Set([...denyRead, ...credentialRestrictions.denyReadPaths])]
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
+): Steps<Pick<FsReadRestrictionConfig, 'denyOnly' | 'credentialDenyOnly'>> {
+  const listed = yield* resolveReadPathEntries('deny', denyRead, expandGlob)
+  const credentialDenyOnly = yield* resolveReadPathEntries(
+    'deny',
+    credentialRestrictions.denyReadPaths,
+    expandGlob,
+    credentialRestrictions.degradeToDenyPaths,
+  )
+  return {
+    denyOnly: [...new Set([...listed, ...credentialDenyOnly])],
+    ...(credentialDenyOnly.length > 0 && { credentialDenyOnly }),
+  }
 }
 
 /**
  * Strip a trailing `/**` from each read-path entry and, on Linux, replace
  * any remaining glob with what `expandGlob` returns for it (bubblewrap takes
  * concrete paths only). Other platforms match globs natively.
+ * On Linux the entry's other readings are added (see `withOtherReadings`);
+ * elsewhere the backend decides them. Entries the caller marked literal are
+ * not in the result: they travel in the `literal…` lists.
  *
  * `literalPaths` are the ones the library resolved itself (a masked
  * credential file that degraded to deny) — each names one file on disk, so
  * it is passed through whatever characters it contains. Expanded as a
  * pattern, a name holding `[` matches nothing and the deny is lost.
+ *
+ * Each path once, where it first came up: every `**` pattern over one base
+ * returns the directories it could not list, and the Linux wrapper looks at
+ * every entry it is given.
  */
-function resolveReadPathEntries(
-  paths: readonly string[],
-  expandGlob: (pattern: string) => string[],
+function* resolveReadPathEntries(
+  kind: PathListKind,
+  paths: readonly FilesystemPathEntry[],
+  expandGlob: (pattern: string, anchor?: string) => Steps<string[]>,
   literalPaths: readonly string[] = [],
-): string[] {
+): Steps<string[]> {
   const literal = new Set(literalPaths)
-  return paths.flatMap(p => {
+  const resolved = new Set<string>()
+  for (const p of spelledOf(paths)) {
     const stripped = removeTrailingGlobSuffix(p)
-    return getPlatform() === 'linux' &&
+    if (
+      getPlatform() === 'linux' &&
       !literal.has(p) &&
       containsGlobChars(stripped)
-      ? expandGlob(p)
-      : [stripped]
-  })
+    ) {
+      for (const found of yield* withOtherReadings(
+        p,
+        stripped,
+        kind,
+        expandGlob,
+      )) {
+        resolved.add(found)
+      }
+    } else {
+      resolved.add(stripped)
+    }
+  }
+  return [...resolved]
 }
 
 /**
  * Strip a trailing `/**` and drop what is still a glob on Linux: bwrap needs
  * real paths. macOS subpath matching is recursive, so the strip is harmless
  * there and the filter never fires.
+ * A glob that is also the name of a path that exists is kept, as that name.
+ * Marked entries are not in the result, as in {@link resolveReadPathEntries}.
  */
-function stripWriteGlobs(paths: readonly string[]): string[] {
-  return paths
+function stripWriteGlobs(
+  kind: PathListKind,
+  paths: readonly FilesystemPathEntry[],
+): string[] {
+  return spelledOf(paths)
     .map(p => removeTrailingGlobSuffix(p))
     .filter(p => {
-      if (getPlatform() === 'linux' && containsGlobChars(p)) {
+      if (
+        getPlatform() === 'linux' &&
+        containsGlobChars(p) &&
+        !hasNameReading(p, kind)
+      ) {
         logForDebugging(`[Sandbox] Skipping glob write pattern on Linux: ${p}`)
         return false
       }
@@ -1313,8 +1972,11 @@ function stripWriteGlobs(paths: readonly string[]): string[] {
     })
 }
 
-function expandAllowReadGlob(pattern: string): string[] {
-  const expanded = expandGlobPattern(pattern)
+function* expandAllowReadGlob(
+  pattern: string,
+  anchor?: string,
+): Steps<string[]> {
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor })).matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -1324,9 +1986,10 @@ function expandAllowReadGlob(pattern: string): string[] {
 /**
  * The read policy of the initialized config, for inspection and display.
  * On Linux, denyRead globs are collapsed to covering directory mounts against
- * this config's allowRead and {@link getFsWriteConfig}'s allowOnly, so
+ * this config's allowRead and {@link getFsWriteConfig}'s write roots, so
  * `denyOnly` is only sound alongside that write config and must not be handed
- * to wrapCommandWithSandboxLinux with a different one.
+ * to wrapCommandWithSandboxLinux with a different one. Marked entries are
+ * in the `literal…` lists, as spelled: pass the object on whole.
  */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
@@ -1341,23 +2004,42 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   )
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.
-  const allowPaths = resolveReadPathEntries(
-    config.filesystem.allowRead ?? [],
-    expandAllowReadGlob,
+  const allowPaths = finish(
+    resolveReadPathEntries(
+      'allow',
+      config.filesystem.allowRead ?? [],
+      expandAllowReadGlob,
+    ),
   )
-  const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
+  const reExposedPaths = reExposedBy(
+    allowPaths,
+    config.filesystem.allowRead,
+    getFsWriteConfig(),
+  )
   const unlistableDenyDirs = new Set<string>()
-  const denyPaths = resolveReadPathEntries(
-    unionDenyReadPaths(config.filesystem.denyRead, credentialRestrictions),
-    pattern =>
-      expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
-    credentialRestrictions.degradeToDenyPaths,
+  const listings: GlobWalkListings = new Map()
+  const denyPaths = finish(
+    resolveReadDenies(
+      config.filesystem.denyRead,
+      credentialRestrictions,
+      (pattern, anchor) =>
+        expandReadDenyGlobLinuxSteps(
+          pattern,
+          reExposedPaths,
+          unlistableDenyDirs,
+          { anchor, listings },
+        ),
+    ),
   )
 
   return {
-    denyOnly: denyPaths,
+    ...denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
+    ...literalReadLists(
+      config.filesystem.denyRead,
+      config.filesystem.allowRead,
+    ),
   }
 }
 
@@ -1370,8 +2052,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: ['/'], denyWithinAllow: [] }
   }
 
-  const allowPaths = stripWriteGlobs(config.filesystem.allowWrite)
-  const denyPaths = stripWriteGlobs(config.filesystem.denyWrite)
+  const allowPaths = stripWriteGlobs('allow', config.filesystem.allowWrite)
+  const denyPaths = stripWriteGlobs('deny', config.filesystem.denyWrite)
 
   const allowOnly = [
     ...defaultWritePathsUnder({
@@ -1385,6 +2067,10 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
   return {
     allowOnly,
     denyWithinAllow: denyPaths,
+    ...literalWriteLists(
+      config.filesystem.allowWrite,
+      config.filesystem.denyWrite,
+    ),
   }
 }
 
@@ -1401,49 +2087,60 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
  * `READ|EXECUTE` ALLOW ACE, and `denyRead`/`denyWrite` become an
  * explicit DENY ACE for `<sb-SID>` on the target plus a
  * `(OI)(CI) FILE_DELETE_CHILD` DENY on its parent.
+ * {@link rankWindowsFsAccess} ranks the lists against each other.
+ *
+ * `maskedFiles`: see {@link windowsMaskedFileDenies}.
  */
-function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
-  grantRead: string[]
-  grantWrite: string[]
-  denyRead: string[]
-  denyWrite: string[]
-} {
+function computeWindowsFsAccessSet(
+  c: SandboxRuntimeConfig,
+  maskedFiles: readonly string[],
+): WindowsFsAccessSet {
   const fs = c.filesystem
   // filesystem.disabled bypasses ALL filesystem rule generation —
   // same as the macOS/Linux wrapWithSandbox path (readConfig /
-  // writeConfig left undefined). On Windows this means no ACL
-  // stamp/grant; credential FILE denies are dropped along with the
-  // rest (credential ENV: mode:'deny' is structural under the
-  // fresh srt-sandbox env; mode:'mask' sentinels are passed via
-  // the --env overlay).
+  // writeConfig left undefined). On Windows this means no grant, and
+  // no stamp but a masked file's; credential FILE denies are dropped
+  // along with the rest (credential ENV: mode:'deny' is structural
+  // under the fresh srt-sandbox env; mode:'mask' sentinels are passed
+  // via the --env overlay).
   if (fs?.disabled) {
-    return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
+    return {
+      grantRead: [],
+      grantWrite: [],
+      denyRead: [...maskedFiles],
+      denyWrite: [],
+    }
   }
   const expand = expandWindowsFsPaths
   // `mode: 'deny'` — non-existent literals reach srt-win, which
   // creates a placeholder chain and stamps it (deny lands on the
   // exact target path). `mode: 'grant'` drops them (a grant on
   // nothing is meaningless).
-  const denyRead = expand(
-    [
-      ...new Set([
-        ...(fs?.denyRead ?? []),
-        ...getCredentialDenyReadPaths(c.credentials),
-      ]),
+  return rankWindowsFsAccess({
+    allowRead: expand(fs?.allowRead ?? [], { mode: 'grant' }),
+    allowWrite: expand(fs?.allowWrite ?? [], { mode: 'grant' }),
+    denyRead: expand(fs?.denyRead ?? [], { mode: 'deny' }),
+    denyWrite: expand(fs?.denyWrite ?? [], { mode: 'deny' }),
+    credentialDeny: [
+      ...expand(getCredentialDenyReadPaths(c.credentials), { mode: 'deny' }),
+      ...maskedFiles,
     ],
-    { mode: 'deny' },
-  )
-  const denyWrite = expand(fs?.denyWrite ?? [], { mode: 'deny' })
-  return {
-    // `allowRead` also serves as `allowWithinDeny`: a file under a
-    // denied dir gets an explicit ALLOW ACE for the sandbox user,
-    // and explicit DENY on the parent doesn't override it because
-    // the recompose chokepoint orders deny-before-allow per-path.
-    grantRead: expand(fs?.allowRead ?? [], { mode: 'grant' }),
-    grantWrite: expand(fs?.allowWrite ?? [], { mode: 'grant' }),
-    denyRead,
-    denyWrite,
-  }
+  })
+}
+
+/**
+ * The `mode: "mask"` files, as credential denies: an ACL cannot redirect a
+ * read, so on Windows, as on macOS, a masked file is unreadable. Each is a
+ * file the library opened, so none is expanded, and `filesystem.disabled`
+ * leaves them in force, as it leaves the masks on the other platforms.
+ */
+function windowsMaskedFileDenies(
+  credentialRestrictions: CredentialRestrictionConfig,
+): string[] {
+  return [
+    ...credentialRestrictions.maskedFileBinds.map(b => b.realPath),
+    ...credentialRestrictions.degradeToDenyPaths,
+  ]
 }
 
 /**
@@ -1453,7 +2150,9 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
  * expansion) when nothing relevant changed.
  */
 function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
-  // Keyed exactly on what {@link computeWindowsFsAccessSet} reads.
+  // Keyed exactly on what {@link computeWindowsFsAccessSet} reads of
+  // the config. The masked files are not session-wide: each wrap
+  // denies the ones the session has not stamped.
   // `network.allowedDomains` does NOT feed file-deny (only mask
   // injectHosts), so a network-only updateConfig hits the cache.
   return {
@@ -1466,23 +2165,17 @@ function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   }
 }
 
-function setEq(a: readonly string[], b: readonly string[]): boolean {
-  if (a.length !== b.length) return false
-  const s = new Set(a)
-  return b.every(x => s.has(x))
-}
-
 function sameRawWindowsFsInputs(
   a: ReturnType<typeof rawWindowsFsInputs>,
   b: ReturnType<typeof rawWindowsFsInputs>,
 ): boolean {
   return (
     a.disabled === b.disabled &&
-    setEq(a.denyRead, b.denyRead) &&
-    setEq(a.denyWrite, b.denyWrite) &&
-    setEq(a.allowRead, b.allowRead) &&
-    setEq(a.allowWrite, b.allowWrite) &&
-    setEq(a.credFiles, b.credFiles)
+    samePathEntries(a.denyRead, b.denyRead) &&
+    samePathEntries(a.denyWrite, b.denyWrite) &&
+    samePathEntries(a.allowRead, b.allowRead) &&
+    samePathEntries(a.allowWrite, b.allowWrite) &&
+    samePathEntries(a.credFiles, b.credFiles)
   )
 }
 
@@ -1496,6 +2189,22 @@ function sameWindowsStampSet(newConfig: SandboxRuntimeConfig): boolean {
   return (
     windowsFsRawInputs !== undefined &&
     sameRawWindowsFsInputs(windowsFsRawInputs, rawWindowsFsInputs(newConfig))
+  )
+}
+
+/** Why a loopback mode other than the session's verified one is refused. */
+function windowsLoopbackModeChanged(
+  wanted: boolean,
+  verified: boolean,
+): string {
+  const mode = (open: boolean) => (open ? 'open' : 'closed')
+  return (
+    `network.allowLocalBinding asks for loopback ${mode(wanted)}, but this ` +
+    `session verified the network fence with loopback ${mode(verified)}. ` +
+    `On Windows the loopback mode is fixed by the install and checked at ` +
+    `initialize(): it cannot change for one command or through ` +
+    `updateConfig(). Call reset() then initialize() with the new value; ` +
+    `the installed mode must match it.`
   )
 }
 
@@ -1636,6 +2345,9 @@ export type WrapWithSandboxOptions = {
    * command text: keys are compared on their first 100 characters, so two
    * long commands sharing a prefix would otherwise cross-attribute, and a
    * rerun of the same text would inherit the earlier run's events.
+   *
+   * An id that a network allow list is registered under must also be
+   * unguessable: see `registerCommandNetworkLists`.
    */
   commandId?: string
   /**
@@ -1648,7 +2360,103 @@ export type WrapWithSandboxOptions = {
   commandText?: string
 }
 
+/** A wrap that has started over this many times walks without giving the
+ *  thread back. */
+const RESTARTS_IN_TURNS = 2
+
+/** In place of what a walk finds: the configuration was replaced under it. */
+const REPLACED = Symbol('replaced')
+
+/** Whether a wrap is walking, and the ones waiting to, first come first. */
+let walking = false
+const waitingToWalk: (() => void)[] = []
+
+/**
+ * Resolves once no other wrap is walking, with what says that this one's walk
+ * has ended; only the first call of it counts. Walks that take turns on one
+ * thread end no sooner for it, while each keeps all it has listed until it
+ * ends and has its turn before the event loop gets one: the memory and the
+ * thread held would both grow with the wraps in flight.
+ * Rejects with `signal`'s reason as soon as that is aborted during the wait.
+ * Nothing else takes a wrap out of the line, reset() included.
+ */
+async function waitToWalk(signal?: AbortSignal): Promise<() => void> {
+  if (walking) {
+    signal?.throwIfAborted()
+    await new Promise<void>((resolve, reject) => {
+      const go = (): void => {
+        signal?.removeEventListener('abort', leave)
+        resolve()
+      }
+      const leave = (): void => {
+        waitingToWalk.splice(waitingToWalk.indexOf(go), 1)
+        reject(signal?.reason)
+      }
+      waitingToWalk.push(go)
+      signal?.addEventListener('abort', leave, { once: true })
+    })
+  }
+  walking = true
+  let ended = false
+  return () => {
+    if (ended) return
+    ended = true
+    // Handed on while `walking` stays set, so that no newcomer gets in first.
+    const next = waitingToWalk.shift()
+    if (next) next()
+    else walking = false
+  }
+}
+
 async function wrapWithSandbox(
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
+  return wrapWithSandboxAgain(
+    0,
+    command,
+    binShell,
+    customConfig,
+    abortSignal,
+    options,
+  )
+}
+
+/** {@link wrapWithSandbox}, having started over `restarts` times. */
+async function wrapWithSandboxAgain(
+  restarts: number,
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
+  // INVARIANT: an attempt waits before it reads anything, so that it goes by
+  // the configuration, the working directory and the disk it finds afterwards.
+  const walkEnded = await waitToWalk(abortSignal)
+  try {
+    return await wrapWithSandboxOnce(
+      walkEnded,
+      restarts,
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
+  } finally {
+    walkEnded()
+  }
+}
+
+/** One attempt of {@link wrapWithSandboxAgain}, which calls `walkEnded` once
+ *  it walks no more. */
+async function wrapWithSandboxOnce(
+  walkEnded: () => void,
+  restarts: number,
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
@@ -1658,6 +2466,44 @@ async function wrapWithSandbox(
   const platform = getPlatform()
   const commandId = options?.commandId
   registerCommandText(command, options)
+  const startedWith = config
+  const startedAt = configInstalls
+  const startedIn = workingDirectory()
+  const movedOn = (): boolean =>
+    config !== startedWith ||
+    configInstalls !== startedAt ||
+    workingDirectory() !== startedIn
+  const startOver = (): Promise<string> => {
+    // The next attempt waits like any other wrap, behind the ones there are.
+    walkEnded()
+    return wrapWithSandboxAgain(
+      restarts + 1,
+      command,
+      binShell,
+      customConfig,
+      abortSignal,
+      options,
+    )
+  }
+  /** `steps`, left as soon as the host is seen to have moved on: what they
+   *  would go on to find is for a wrap that starts over anyway. */
+  function* whileCurrent<T>(steps: Steps<T>): Steps<T | typeof REPLACED> {
+    for (;;) {
+      if (movedOn()) return REPLACED
+      const step = steps.next()
+      if (step.done) return step.value
+      yield
+    }
+  }
+  const walked = <T>(
+    steps: Steps<T>,
+  ): T | typeof REPLACED | Promise<T | typeof REPLACED> => {
+    if (restarts < RESTARTS_IN_TURNS) {
+      return finishInTurns(whileCurrent(steps), abortSignal)
+    }
+    abortSignal?.throwIfAborted()
+    return finish(steps)
+  }
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -1688,6 +2534,7 @@ async function wrapWithSandbox(
   let readConfig: FsReadRestrictionConfig | undefined
   if (!fsDisabled) {
     const userAllowWrite = stripWriteGlobs(
+      'allow',
       customConfig?.filesystem?.allowWrite ??
         config?.filesystem.allowWrite ??
         [],
@@ -1706,10 +2553,27 @@ async function wrapWithSandbox(
         ...userAllowWrite,
       ],
       denyWithinAllow: stripWriteGlobs(
+        'deny',
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
           [],
       ),
+      ...literalWriteLists(
+        customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite,
+        customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite,
+      ),
+    }
+    // For a caller that never reads checkDependencies(), the CLI among them.
+    if (!ownInstallLogged) {
+      ownInstallLogged = true
+      try {
+        const ownInstall = ownInstallWarning(writeRootsOf(writeConfig))
+        if (ownInstall !== undefined) {
+          logForDebugging(ownInstall, { level: 'warn' })
+        }
+      } catch {
+        // It only advises, as in checkDependenciesCommon().
+      }
     }
 
     // Credential deny paths are unioned with the caller's denyRead — never
@@ -1717,37 +2581,65 @@ async function wrapWithSandbox(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
-    const expandedAllowRead = resolveReadPathEntries(
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
-      expandAllowReadGlob,
+    const expandedAllowRead = await walked(
+      resolveReadPathEntries(
+        'allow',
+        customConfig?.filesystem?.allowRead ??
+          config?.filesystem.allowRead ??
+          [],
+        expandAllowReadGlob,
+      ),
     )
+    if (expandedAllowRead === REPLACED) return startOver()
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
-    // paths fall under a user-configured denyRead.
+    // paths fall under a user-configured denyRead or credential entry.
+    const ownAllowWithinDeny: string[] = []
     if (mitmCA) {
-      expandedAllowRead.push(mitmCA.certPath, mitmCA.trustBundlePath)
+      ownAllowWithinDeny.push(mitmCA.certPath, mitmCA.trustBundlePath)
     }
     // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
     if (javaAgentJarPath) {
-      expandedAllowRead.push(javaAgentJarPath)
+      ownAllowWithinDeny.push(javaAgentJarPath)
     }
-    const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
-    const unlistableDenyDirs = new Set<string>()
-    const expandedDenyRead = resolveReadPathEntries(
-      unionDenyReadPaths(
-        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-        credentialRestrictions,
-      ),
-      pattern =>
-        expandReadDenyGlobLinux(pattern, reExposedPaths, unlistableDenyDirs),
-      credentialRestrictions.degradeToDenyPaths,
+    expandedAllowRead.push(...ownAllowWithinDeny)
+    const reExposedPaths = reExposedBy(
+      expandedAllowRead,
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+      writeConfig,
     )
+    const unlistableDenyDirs = new Set<string>()
+    const listings: GlobWalkListings = new Map()
+    const expandedDenyRead = await walked(
+      resolveReadDenies(
+        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+        credentialRestrictions,
+        (pattern, anchor) =>
+          expandReadDenyGlobLinuxSteps(
+            pattern,
+            reExposedPaths,
+            unlistableDenyDirs,
+            { anchor, listings },
+          ),
+      ),
+    )
+    // Emptied by hand: a runtime may keep what this function has named for as
+    // long as it is suspended, which is until the scan below has ended.
+    listings.clear()
+    if (expandedDenyRead === REPLACED) return startOver()
     readConfig = {
-      denyOnly: expandedDenyRead,
+      ...expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
+      ...(ownAllowWithinDeny.length > 0 && { ownAllowWithinDeny }),
       unlistableDenyDirs: [...unlistableDenyDirs],
+      ...literalReadLists(
+        customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
+        customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
+      ),
     }
   }
+  // Nothing below walks, and what it waits for is not this thread.
+  walkEnded()
 
   // Check if network config is specified - this determines if we need network restrictions
   // Network restriction is needed when:
@@ -1773,8 +2665,36 @@ async function wrapWithSandbox(
     await waitForNetworkInitialization()
   }
 
+  // INVARIANT: one wrap, one configuration. updateConfig() can run in any of
+  // the turns above, and what was read before it must not be put together
+  // with what is read after it: the write list of one configuration with the
+  // allowGitConfig of another is a policy nobody chose. So the wrap starts
+  // over. Nothing from here to the platform's wrapper awaits.
+  //
+  // And one working directory, which a relative entry is resolved against
+  // wherever it is read: a `.` bound back from where the host has gone to,
+  // over denies walked from where it was, uncovers what they matched.
+  //
+  // INVARIANT: what a wrap hands out was read from the disk after its
+  // configuration was installed. A host that writes a file and then installs
+  // a rule that denies it finds it denied by every wrap that goes by that
+  // rule. So a wrap that starts over keeps nothing of what it has listed or
+  // walked, the same rules included. A configuration installed after this
+  // check is the next wrap's.
+  //
+  // An embedder can replace the configuration many times during one walk.
+  // After RESTARTS_IN_TURNS the wrap walks without a turn of the event loop,
+  // so no timer or I/O callback replaces it meanwhile. That holds the thread
+  // for one walk, as every wrap did before the walk took turns. It is not a
+  // proof that the wrap ends: a promise continuation, or anything at all
+  // while the network is still being initialized, can replace it between the
+  // walk and this check, and the wrap then starts over once more.
+  if (movedOn()) return startOver()
+
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
+  const allowNestedUserNamespaces =
+    customConfig?.allowNestedUserNamespaces ?? config?.allowNestedUserNamespaces
 
   const gitSafeDirectories = getGitSafeDirectories(customConfig)
 
@@ -1838,6 +2758,7 @@ async function wrapWithSandbox(
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
+        allowNestedUserNamespaces,
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
@@ -1849,6 +2770,10 @@ async function wrapWithSandbox(
         socatPath: config?.socatPath,
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
+      }).catch((err: unknown) => {
+        // It awaits once more, for its scan: see the invariant above.
+        if (err instanceof WorkingDirectoryChanged) return startOver()
+        throw err
       })
 
     case 'windows':
@@ -1931,12 +2856,15 @@ async function wrapWithSandboxArgv(
     // as session-level `computeWindowsFsAccessSet` (credential
     // ENV: mode:'deny' is structural under the fresh srt-sandbox
     // env; mode:'mask' sentinels are passed via the --env
-    // overlay).
+    // overlay). The masked files stay denied, as of this wrap: the
+    // session has stamped the ones it found at initialize().
     // Per-exec allowRead/allowWrite throw — `srt-win exec` only
     // exposes `--deny-*`; per-exec grants are not implemented.
     const fsCfg = customConfig?.filesystem
-    let perExecDenyRead: string[] = []
-    let perExecDenyWrite: string[] = []
+    const maskedFiles = windowsMaskedFileDenies(credentialRestrictions)
+    let rawRead: readonly FilesystemPathEntry[] = []
+    let rawWrite: readonly FilesystemPathEntry[] = []
+    let rawCredential: readonly string[] = []
     if (!fsCfg?.disabled) {
       if (fsCfg?.allowRead?.length || fsCfg?.allowWrite?.length) {
         throw new Error(
@@ -1945,24 +2873,41 @@ async function wrapWithSandboxArgv(
             `denies. Set them at the session level (initialize()).`,
         )
       }
-      const rawRead = [
-        ...(fsCfg?.denyRead ?? []),
-        ...getCredentialDenyReadPaths(customConfig?.credentials),
-      ]
-      const rawWrite = fsCfg?.denyWrite ?? []
-      // Skip on the dominant path (no per-exec fs or
-      // credential-file deny).
-      if (rawRead.length > 0 || rawWrite.length > 0) {
-        const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
-        const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
-        const expand = expandWindowsFsPaths
-        perExecDenyRead = expand(rawRead, { mode: 'deny' }).filter(
-          p => !sessRead.has(p),
-        )
-        perExecDenyWrite = expand(rawWrite, { mode: 'deny' }).filter(
-          p => !sessRead.has(p) && !sessWrite.has(p),
-        )
-      }
+      rawRead = fsCfg?.denyRead ?? []
+      rawWrite = fsCfg?.denyWrite ?? []
+      rawCredential = getCredentialDenyReadPaths(customConfig?.credentials)
+    }
+    let perExecDenyRead: string[] = []
+    let perExecDenyWrite: string[] = []
+    // Skip on the dominant path (no per-exec fs deny, no credential
+    // file).
+    if (
+      rawRead.length > 0 ||
+      rawWrite.length > 0 ||
+      rawCredential.length > 0 ||
+      maskedFiles.length > 0
+    ) {
+      const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
+      const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
+      const expand = expandWindowsFsPaths
+      const ranked = rankWindowsFsAccess({
+        allowRead: [],
+        allowWrite: [],
+        denyRead: expand(rawRead, { mode: 'deny' }),
+        denyWrite: expand(rawWrite, { mode: 'deny' }),
+        credentialDeny: [
+          ...expand(rawCredential, { mode: 'deny' }),
+          ...maskedFiles,
+        ],
+        held: windowsFsStampedSet,
+      })
+      const denyRead = ranked.denyRead
+      perExecDenyRead = denyRead.filter(p => !sessRead.has(p))
+      // srt-win expands the deny from the record as it is when the command
+      // runs, so a grant made since initialize() is covered.
+      perExecDenyWrite = ranked.denyWrite.filter(
+        p => !sessRead.has(p) && !sessWrite.has(p),
+      )
     }
     // Per-exec deny rides on argv (`acl stamp` reads stdin, but
     // exec's stdin belongs to the child). The CreateProcessW
@@ -1972,6 +2917,27 @@ async function wrapWithSandboxArgv(
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
     // via `computeWindowsFsAccessSet`.
+    // Asked once per srt-win, so an older one is refused as outdated
+    // instead of failing on a flag it does not know.
+    assertWindowsSrtWinCapable(
+      customConfig?.windows?.srtWin
+        ? resolveSrtWin(customConfig.windows.srtWin)
+        : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
+    )
+    // The loopback mode is the one initialize() probed the fence with.
+    // A command or an updateConfig() asking for the other is refused here.
+    const wantsLoopback =
+      (customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding()) ===
+      true
+    if (
+      windowsWfpVerifiedLoopback !== undefined &&
+      wantsLoopback !== windowsWfpVerifiedLoopback
+    ) {
+      throw new WindowsSandboxError(
+        'wfp_loopback_mismatch',
+        windowsLoopbackModeChanged(wantsLoopback, windowsWfpVerifiedLoopback),
+      )
+    }
     registerCommandText(command, options)
     return wrapCommandWithSandboxWindows({
       command,
@@ -1979,12 +2945,23 @@ async function wrapWithSandboxArgv(
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+      // `srt-win exec` launches nothing unless this is the loopback mode
+      // the install recorded: a difference is refused, never ignored.
+      allowLoopback: wantsLoopback,
       // mode:'deny' env vars are structurally absent (fresh
       // srt-sandbox profile env). mode:'mask' sentinels are
       // passed via the --env overlay so the sandboxed child sees
       // the sentinel value, same as macOS/Linux.
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
+      // The session's own grants beneath those denies keep their rank.
+      denyReadExcept: windowsGrantsBeneathDenies(
+        [
+          ...(windowsFsStampedSet?.grantRead ?? []),
+          ...(windowsFsStampedSet?.grantWrite ?? []),
+        ],
+        perExecDenyRead,
+      ),
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
       // grants + explicit git.safeDirectories — the working-tree
@@ -1994,6 +2971,12 @@ async function wrapWithSandboxArgv(
       allowWrite: windowsFsStampedSet?.grantWrite,
       gitSafeDirectories: getGitSafeDirectories(customConfig),
       caCertPath: mitmCA?.trustBundlePath,
+      // srt-win verifies the holder and otherwise holds for the command
+      // itself.
+      heldBy: windowsFsSbUserSid !== undefined ? process.pid : undefined,
+      // The roots initialize() granted persistently; their capability
+      // SIDs are what let this command write them.
+      writeRoots: windowsFsStampedSet?.grantWrite,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
         ? resolveSrtWin(customConfig.windows.srtWin)
@@ -2061,6 +3044,20 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
       { level: 'warn' },
     )
   }
+  const nextLoopback = newConfig.network?.allowLocalBinding === true
+  if (
+    getPlatform() === 'windows' &&
+    config &&
+    windowsWfpVerifiedLoopback !== undefined &&
+    nextLoopback !== windowsWfpVerifiedLoopback
+  ) {
+    logForDebugging(
+      `[Sandbox Windows] updateConfig: ` +
+        windowsLoopbackModeChanged(nextLoopback, windowsWfpVerifiedLoopback) +
+        ` Commands are refused until then.`,
+      { level: 'warn' },
+    )
+  }
   // Built before anything is swapped, so a malformed range leaves the
   // previous config fully in effect.
   const nextGuard = createResolvedAddressGuard(newConfig.network)
@@ -2070,6 +3067,7 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   const { filterRequest, ...rest } = newConfig.network
   config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
+  configInstalls++
   resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
@@ -2206,41 +3204,26 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
-  // Windows: release this session's sandbox-user ACEs. Best-effort
-  // — log anomalies rather than throw, so teardown always
-  // completes. Leftover ACEs are recoverable later via
-  // `srt-win acl recover` (which sweeps by trustee SID).
+  // Windows: release this session's sandbox-user ACEs. Best-effort:
+  // log anomalies rather than throw, so teardown always completes.
+  // Persistent write roots and the denies under them are not released.
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
     // were applied with, immune to `config` mutation between.
     const srtWin = srtWinSpawn
-    // 'restored'/'alreadyOriginal' are the pre- same-user-removal
-    // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
-    // post-. Either is non-anomalous.
-    const ok = new Set(['revoked', 'stillHeld', 'restored', 'alreadyOriginal'])
-    const log = (kind: string, e: { path: string; status: string }) => {
-      if (!ok.has(e.status)) {
-        logForDebugging(
-          `[Sandbox Windows] ${kind}: '${e.path}' ${e.status} — ` +
-            `ACE may be left in place; resolve and run ` +
-            `\`srt-win acl recover\` to clear`,
-          { level: 'warn' },
-        )
-      }
-    }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('grant revoke', e)
-    }
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
-      log('deny restore', e)
-    }
+    // The 'exit'/signal handler lands here too: this part of
+    // reset() runs synchronously.
+    releaseWindowsSessionAcls(sb, srtWin)
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
   srtWinSpawn = undefined
-  // windowsWfpVerified is NOT cleared — per-process, not per-session.
+  windowsProfileRead = undefined
+  windowsProfileReadWarnings = []
+  windowsCapableSrtWin.clear()
+  // windowsWfpVerifiedFor is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
   // active-sandbox counter — reset() means the session is over.
@@ -2341,6 +3324,7 @@ async function reset(): Promise<void> {
   sentinelRegistry.clear()
   awsPairRegistry.clear()
   commandTextsByKey.clear()
+  commandNetworkListsByKey.clear()
   maskedFileStore.dispose()
 }
 
@@ -2377,6 +3361,9 @@ function annotateStderrWithSandboxFailures(
  * sandboxing is disabled.
  *
  * Patterns ending with /** are excluded since they work as subpaths.
+ * So are entries marked literal. An entry that is also the name of a path
+ * that exists is still returned: what is returned must not depend on what
+ * is on the disk, which a sandboxed command can change.
  */
 function getLinuxGlobPatternWarnings(): string[] {
   // Only warn on Linux/WSL (bubblewrap doesn't support globs)
@@ -2395,6 +3382,7 @@ function getLinuxGlobPatternWarnings(): string[] {
   ]
 
   for (const path of allPaths) {
+    if (typeof path !== 'string') continue
     // Strip trailing /** since that's just a subpath (directory and everything under it)
     const pathWithoutTrailingStar = removeTrailingGlobSuffix(path)
 
@@ -2405,17 +3393,22 @@ function getLinuxGlobPatternWarnings(): string[] {
   }
 
   // Read paths are expanded, so a glob there is supported — unless the
-  // pattern has no literal directory for the walk to start from (a wildcard
-  // in its first path component, `/**/*.pem`), which expands to nothing and
-  // leaves the entry unenforced.
+  // pattern has no literal directory below the root for the walk to start
+  // from (a wildcard in its first path component, `/**/*.pem`), which
+  // expands to nothing and leaves the entry unenforced.
   for (const path of [
-    ...config.filesystem.denyRead,
+    ...new Set([
+      ...config.filesystem.denyRead,
+      // Joins the read denies, and is skipped like one of them.
+      ...getCredentialDenyReadPaths(config.credentials),
+    ]),
     ...(config.filesystem.allowRead ?? []),
   ]) {
+    if (typeof path !== 'string') continue
     const baseDir = globPatternBaseDir(normalizePathForSandbox(path))
     if (
       containsGlobChars(removeTrailingGlobSuffix(path)) &&
-      (baseDir === '' || baseDir === '/')
+      globBaseDirIsRoot(baseDir)
     ) {
       globPatterns.push(path)
     }
@@ -2436,6 +3429,7 @@ export interface ISandboxManager {
     runtimeConfig: SandboxRuntimeConfig,
     sandboxAskCallback?: SandboxAskCallback,
     enableLogMonitor?: boolean,
+    options?: SandboxInitializeOptions,
   ): Promise<void>
   isSupportedPlatform(): boolean
   isSandboxingEnabled(): boolean
@@ -2476,11 +3470,76 @@ export interface ISandboxManager {
     cwd?: string,
     options?: WrapWithSandboxOptions,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
+  /**
+   * Register the network allow list of one invocation, under the `commandId`
+   * its wrap was given ({@link WrapWithSandboxOptions}). Entries are matched
+   * and validated as `network.allowedDomains` entries are; an invalid one
+   * throws. Registering an id again replaces its list.
+   *
+   * Order of evaluation for a connection: a configured `deniedDomains` match
+   * denies; a configured `allowedDomains` match allows;
+   * `network.strictAllowlist` denies; a match in the list registered for the
+   * id the connection presents allows; then the ask callback decides if
+   * there is one, and otherwise the connection is denied. So a per-command
+   * entry never overrides a configured `deniedDomains` entry and is ignored
+   * entirely under `strictAllowlist`. It also never enters `network.*`, so
+   * the default `injectHosts` scope of a masked credential does not grow.
+   *
+   * The proxy reads the id from the proxy username, which the sandboxed
+   * client presents, so the id is the ONLY thing binding a connection to an
+   * allow list. It MUST be unguessable: at least 128 bits of randomness (16
+   * random bytes as base64url, 22 characters; a shorter id throws), never a
+   * counter, a timestamp or anything derived from the command. Presenting
+   * another live invocation's id gets that invocation's allows: this is
+   * attribution, not a boundary between concurrent commands of one session.
+   *
+   * Register just before spawning the wrapped command, and unregister when
+   * the child exits or never started: a registration that outlives its
+   * command widens the window in which its id is worth presenting.
+   *
+   * As with every attribution key, only the first 100 characters of an id
+   * take part, and a list under an id whose encoded form does not fit in the
+   * proxy username (possible only with non-ASCII ids) never applies. An
+   * unpaired surrogate does not count towards the 22 characters.
+   *
+   * No list applies while `network.httpProxyPort` names an external proxy:
+   * the wrap gives that proxy no username, so no connection carries an id.
+   * Registering still succeeds, and every connection is decided as if no list
+   * existed.
+   */
+  registerCommandNetworkLists(
+    commandId: string,
+    lists: { allowedDomains?: string[] },
+  ): void
+  /**
+   * Remove the list registered for `commandId`. A no-op for an id that has
+   * none. `reset()` removes them all.
+   */
+  unregisterCommandNetworkLists(commandId: string): void
+  /**
+   * True when the network filter understands an ask callback's
+   * `{ allow: false, reason }` answer (see {@link SandboxAskCallback}). Read
+   * it before returning that object: releases up to v0.0.77 allow on any
+   * truthy answer, so there the object would be read as an allow. Where this
+   * is absent, deny with a plain `false`.
+   */
+  readonly askCallbackDenyReason: true
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
+  /**
+   * Windows: whether the commands of the current session read the
+   * user's profile through the profile read grant.
+   */
+  getWindowsProfileRead(): 'granted' | 'absent' | undefined
+  /**
+   * Windows: warnings about the profile read grant for the current session:
+   * excluded paths that are, or may be, readable to sandboxed commands, and
+   * entries that could not be removed. None of them is a rejection.
+   */
+  getWindowsProfileReadWarnings(): WindowsProfileReadWarning[]
   getSentinelRegistry(): SentinelRegistry
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
@@ -2519,9 +3578,14 @@ export const SandboxManager: ISandboxManager = {
   waitForNetworkInitialization,
   wrapWithSandbox,
   wrapWithSandboxArgv,
+  registerCommandNetworkLists,
+  unregisterCommandNetworkLists,
+  askCallbackDenyReason: true,
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,
+  getWindowsProfileRead: () => windowsProfileRead,
+  getWindowsProfileReadWarnings: () => [...windowsProfileReadWarnings],
   getSentinelRegistry: () => sentinelRegistry,
   getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,

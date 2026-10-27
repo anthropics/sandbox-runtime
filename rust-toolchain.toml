@@ -1,0 +1,7 @@
+# Toolchain for vendor/srt-win-src. rustup looks for this file from the
+# working directory upwards, and the build scripts and CI run cargo from
+# the repository root with --manifest-path.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

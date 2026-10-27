@@ -1,4 +1,7 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { test, expect, beforeAll, afterAll } from 'bun:test'
+// Every case here runs a proxy configured to terminate TLS, so each is
+// skipped where this runtime cannot terminate it in-process.
+import { describeWithTls as describe } from '../helpers/emitted-connections.js'
 import { createServer as createHttpsServer } from 'node:https'
 import type { Server, AddressInfo } from 'node:net'
 import type { TLSSocket } from 'node:tls'
@@ -8,7 +11,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import forge from 'node-forge'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
-import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
+import {
+  createMitmCA,
+  disposeMitmCA,
+  randomSerial,
+} from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 
 // Committed test-only CA — see test/fixtures/tls-terminate/README.md.
@@ -572,13 +579,11 @@ function mintClientCert(
   ca: ReturnType<typeof createMitmCA>,
   cn: string,
 ): { certPem: string; keyPem: string } {
-  const { pki, md, random, util } = forge
+  const { pki, md } = forge
   const keys = pki.rsa.generateKeyPair(2048)
   const cert = pki.createCertificate()
   cert.publicKey = keys.publicKey
-  // 16 random bytes, high bit cleared so the DER INTEGER stays positive.
-  const hex = util.bytesToHex(random.getBytesSync(16))
-  cert.serialNumber = (parseInt(hex[0]!, 16) & 0x7).toString(16) + hex.slice(1)
+  cert.serialNumber = randomSerial()
   const notBefore = new Date()
   notBefore.setDate(notBefore.getDate() - 1)
   const notAfter = new Date()
@@ -626,6 +631,10 @@ async function curlViaProxy(
     '-v', // TLS issuer line goes to stderr
     '--proxy',
     `http://127.0.0.1:${proxyPort}`,
+    // An empty list overrides NO_PROXY, which would send curl around
+    // the proxy under test for 127.0.0.1.
+    '--noproxy',
+    '',
     '--cacert',
     opts.cacert ?? CA_CERT,
     '--max-time',
