@@ -21,6 +21,7 @@ export default [
         projectService: {
           allowDefaultProject: [
             'eslint.config.js',
+            'test/fixtures/tunnel-ends.mjs',
             'test/utils/which-node-test.mjs',
             'vendor/build-common.ts',
             'vendor/seccomp/build.ts',
@@ -150,6 +151,20 @@ export default [
           message:
             'Every path here is a name: pass { literal: true }, so that glob characters in it are not read as a pattern.',
         },
+      ],
+    },
+  },
+  {
+    // Runtimes differ in what realpathSync does with a backslash in a name.
+    files: ['src/**/*.ts'],
+    ignores: ['src/utils/real-path.ts'],
+    rules: {
+      'no-restricted-properties': [
+        'error',
+        ...['realpathSync', 'realpath'].map(property => ({
+          property,
+          message: 'Ask realPathOf (src/utils/real-path.ts) instead.',
+        })),
       ],
     },
   },

@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -421,16 +422,32 @@ describe.if(isLinux)('Reporting an older bubblewrap', () => {
     ).toBe(false)
   })
 
-  it('asks again after a probe that got no answer', () => {
-    const path = join(BASE, 'late')
-    writeFileSync(path, '#!/bin/sh\nexit 3\n', { mode: 0o755 })
-    const warnsOfOlder = (): boolean =>
-      checkLinuxDependencies({ bwrapPath: path }).warnings.some(warning =>
-        warning.includes(OLDEST_FULLY_SUPPORTED_BWRAP_VERSION),
+  it.each([
+    ['failing', 'exit 3'],
+    ['wordless', 'echo bubblewrap'],
+    ['killed', 'kill -KILL $$'],
+    ['hung', 'exec sleep 20'],
+  ])(
+    'does not ask again after a probe that got no answer: %s',
+    (name, onVersion) => {
+      const path = join(BASE, name)
+      const asked = join(BASE, `${name}.asked`)
+      writeFileSync(
+        path,
+        `#!/bin/sh\n[ "$1" = --version ] || exit 0\necho >> '${asked}'\n${onVersion}\n`,
+        { mode: 0o755 },
       )
-    expect(warnsOfOlder()).toBe(false)
-    // The same path now answers: the silence before was not remembered.
-    stubBwrap('late', '0.4.1')
-    expect(warnsOfOlder()).toBe(true)
-  })
+      for (let ask = 0; ask < 3; ask++) {
+        const { warnings } = checkLinuxDependencies({ bwrapPath: path })
+        expect(
+          warnings.some(warning =>
+            warning.includes(OLDEST_FULLY_SUPPORTED_BWRAP_VERSION),
+          ),
+        ).toBe(false)
+      }
+      expect(readFileSync(asked, 'utf8')).toBe('\n')
+    },
+    // The hung one blocks for the probe's whole timeout.
+    20_000,
+  )
 })

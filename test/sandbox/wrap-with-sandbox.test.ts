@@ -346,7 +346,7 @@ describe('restriction pattern semantics', () => {
         })
 
         expect(result).toContain('/opt/sc/socat')
-        expect(result).toContain('TCP-LISTEN:3128')
+        expect(result).toContain('TCP6-LISTEN:3128')
       } finally {
         rmSync(httpSock, { force: true })
         rmSync(socksSock, { force: true })
@@ -376,7 +376,8 @@ describe('restriction pattern semantics', () => {
           // third address, and the message goes to /dev/null.
           expect(result).toContain(`'UNIX-CONNECT:${httpSock}'`)
           expect(result).toContain(`'UNIX-CONNECT:${socksSock}'`)
-          expect(result).not.toContain(`reuseaddr UNIX-CONNECT:${httpSock} `)
+          expect(result).not.toContain(` UNIX-CONNECT:${httpSock}`)
+          expect(result).not.toContain(` UNIX-CONNECT:${socksSock}`)
         } finally {
           rmSync(dir, { recursive: true, force: true })
         }
