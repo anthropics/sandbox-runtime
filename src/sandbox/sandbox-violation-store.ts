@@ -35,6 +35,10 @@ export class SandboxViolationStore {
     if (limit === undefined) {
       return [...this.violations]
     }
+    // slice(-0) means slice(0), which would reveal the entire retained tail.
+    if (!(limit > 0)) {
+      return []
+    }
     return this.violations.slice(-limit)
   }
 
