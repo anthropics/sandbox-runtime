@@ -202,9 +202,7 @@ describe.if(!isWindows)(
         const profile = wrapCommandWithSandboxMacOS({
           command: 'true',
           needsNetworkRestriction: false,
-          readConfig: {
-            denyOnly: [linkMcp],
-          },
+          readConfig: undefined,
           writeConfig: {
             allowOnly: [base],
             denyWithinAllow: [linkMcp],
@@ -222,6 +220,7 @@ describe.if(!isWindows)(
     it.each([
       ['/work/pub/x*', '^/work/pub/x[^/]*(/.*)?$'],
       ['/work/pub/[u-z]*', '^/work/pub/[u-z][^/]*(/.*)?$'],
+      ['/work/pub/[a-zA-Z]*', '^/work/pub/[a-zA-Z][^/]*(/.*)?$'],
       ['/work/pub/?', '^/work/pub/[^/](/.*)?$'],
     ])(
       'does not carve out a broader allowWithinDeny glob from a narrower denyOnly glob (%s)',
@@ -247,5 +246,21 @@ describe.if(!isWindows)(
         expect(narrowDenyIdx).toBeGreaterThan(allowIdx)
       },
     )
+
+    it('carves out an allowWithinDeny glob covered by a wider character-class denyOnly glob', () => {
+      const profile = wrapCommandWithSandboxMacOS({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: ['/work/pub/[a-z]*'],
+          allowWithinDeny: ['/work/pub/[a-z]safe*'],
+        },
+        writeConfig: undefined,
+      })
+
+      expect(profile).toContain(
+        `(require-all (regex "^/work/pub/[a-z][^/]*(/.*)?$") (require-not (regex "^/work/pub/[a-z]safe[^/]*$")))`,
+      )
+    })
   },
 )

@@ -23,6 +23,8 @@ import {
   denyGlobRegex,
   escapeRegexLiteral,
   globToRegex,
+  GlobTokenKind,
+  parseGlob,
 } from './glob-pattern.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 import { literalReadings, type PathListKind } from './path-entries.js'
@@ -216,25 +218,114 @@ function denyPathFilter(entry: PathEntry): string {
 }
 
 /**
- * A concrete path shaped like the ones `entry` matches, substituting `*`/`**`
- * with `starFill` and `?`/`[...]` with `charFill`. Probing both `('x', 'x')`
- * and `('Q7_', '9')` in {@link denyGlobCovers} ensures a narrower deny glob
- * that happens to match `'x'` (such as `/dir/x*`, `/dir/[u-z]*`, or `/dir/?`)
- * is not mistaken for universal coverage of an allow/writeRoot region.
+ * A concrete path shaped like the ones `entry` matches (every glob segment
+ * replaced by a literal `x`), used by {@link isStrictlyUnder} to test whether
+ * `entry`'s region lies strictly beneath a literal directory.
  */
-function entrySamplePath(
-  entry: PathEntry,
-  starFill = 'x',
-  charFill = 'x',
-): string {
+function entrySamplePath(entry: PathEntry): string {
   if (!entry.glob) return entry.path
   const anchor = entry.anchor ?? ''
   return (
-    anchor +
-    entry.path
-      .slice(anchor.length)
-      .replace(/\[[^\]]*\]|\*+|\?/g, m => (m[0] === '*' ? starFill : charFill))
+    anchor + entry.path.slice(anchor.length).replace(/\[[^\]]*\]|[*?]+/g, 'x')
   )
+}
+
+type GlobAtom =
+  | { kind: 'sep' }
+  | {
+      kind: 'char'
+      ranges: readonly [number, number][]
+      matchesSeparator: boolean
+    }
+  | { kind: 'star' | 'globstar' | 'globstarSlash' }
+
+const ANY_NON_SLASH_RANGES: readonly [number, number][] = [
+  [0, 46],
+  [48, 0xffff],
+]
+
+function charRangesOfSet(members: string): [number, number][] {
+  const ranges: [number, number][] = []
+  for (let i = 0; i < members.length; i++) {
+    const isRange = members[i + 1] === '-' && i + 2 < members.length
+    const from = members.charCodeAt(i)
+    if (isRange) i += 2
+    const to = members.charCodeAt(i)
+    ranges.push([from, to])
+  }
+  return ranges
+}
+
+function rangesCover(
+  covering: readonly [number, number][],
+  covered: readonly [number, number][],
+): boolean {
+  const sorted = [...covering].sort((a, b) => a[0] - b[0])
+  for (const [fromA, toA] of covered) {
+    let cursor = fromA
+    for (const [fromD, toD] of sorted) {
+      if (toD < cursor) continue
+      if (fromD > cursor) break
+      cursor = toD + 1
+      if (cursor > toA) break
+    }
+    if (cursor <= toA) return false
+  }
+  return true
+}
+
+function globEntryAtoms(entry: GlobPathEntry): GlobAtom[] {
+  const atoms: GlobAtom[] = []
+  const pushLiteralChar = (ch: string): void => {
+    if (ch === '/') {
+      atoms.push({ kind: 'sep' })
+    } else {
+      const code = ch.charCodeAt(0)
+      atoms.push({
+        kind: 'char',
+        ranges: [[code, code]],
+        matchesSeparator: false,
+      })
+    }
+  }
+  const anchor = entry.anchor ?? ''
+  for (let i = 0; i < anchor.length; i++) pushLiteralChar(anchor[i]!)
+  for (const token of parseGlob(entry.path.slice(anchor.length))) {
+    switch (token.kind) {
+      case GlobTokenKind.Text:
+        for (let i = 0; i < token.text.length; i++) {
+          pushLiteralChar(token.text[i]!)
+        }
+        break
+      case GlobTokenKind.Separator:
+        atoms.push({ kind: 'sep' })
+        break
+      case GlobTokenKind.AnyChar:
+        atoms.push({
+          kind: 'char',
+          ranges: ANY_NON_SLASH_RANGES,
+          matchesSeparator: false,
+        })
+        break
+      case GlobTokenKind.Set:
+        atoms.push({
+          kind: 'char',
+          ranges: charRangesOfSet(token.members),
+          matchesSeparator: token.matchesSeparator,
+        })
+        break
+      case GlobTokenKind.Star:
+        atoms.push({ kind: 'star' })
+        break
+      case GlobTokenKind.Globstar:
+        atoms.push({ kind: 'globstar' })
+        break
+      case GlobTokenKind.GlobstarSlash:
+        atoms.push({ kind: 'globstarSlash' })
+        break
+    }
+  }
+  return atoms
 }
 
 /**
@@ -339,12 +430,107 @@ function callerEntries(
   ]
 }
 
-/** Does a subtree-extended deny glob regex cover `entry`'s region? */
-function denyGlobCovers(denyRegex: RegExp, entry: PathEntry): boolean {
-  return (
-    denyRegex.test(entrySamplePath(entry, 'x', 'x')) &&
-    denyRegex.test(entrySamplePath(entry, 'Q7_', '9'))
-  )
+/**
+ * Does a subtree-extended deny glob cover `entry`'s region?
+ *
+ * For a literal `entry`, testing `denyRegex` on `entry.path` suffices because
+ * `denyRegex` ends with `(/.*)?$`. For a glob `entry`, checks sound structural
+ * containment over the parsed glob tokens so that narrower character classes or
+ * prefixes (e.g., `/dir/x*` or `/dir/[a-zA-Z]*` vs `/dir/*`) never carve out a
+ * broader allow, while covered character-class allows (e.g., `/dir/[a-z]safe*`
+ * under `/dir/[a-z]*`) are recognized.
+ */
+function denyGlobCovers(
+  deny: GlobPathEntry,
+  denyRegex: RegExp,
+  entry: PathEntry,
+): boolean {
+  if (!entry.glob) return denyRegex.test(entry.path)
+  const D = globEntryAtoms(deny)
+  const A = globEntryAtoms(entry)
+  const memo = new Map<number, boolean>()
+
+  const covers = (dIdx: number, aIdx: number): boolean => {
+    const key = dIdx * (A.length + 1) + aIdx
+    const cached = memo.get(key)
+    if (cached !== undefined) return cached
+
+    let result = false
+    if (dIdx === D.length) {
+      // Subtree-extended deny `(/.*)?$` covers exact end or any `/` subtree tail.
+      result = aIdx === A.length || A[aIdx]?.kind === 'sep'
+    } else {
+      const d = D[dIdx]!
+      switch (d.kind) {
+        case 'globstar':
+          result =
+            dIdx === D.length - 1 ||
+            covers(dIdx + 1, aIdx) ||
+            (aIdx < A.length && covers(dIdx, aIdx + 1))
+          break
+        case 'globstarSlash':
+          if (covers(dIdx + 1, aIdx)) {
+            result = true
+            break
+          }
+          if (aIdx < A.length && A[aIdx]!.kind === 'globstarSlash') {
+            if (covers(dIdx + 1, aIdx + 1) || covers(dIdx, aIdx + 1)) {
+              result = true
+              break
+            }
+          }
+          for (let k = aIdx; k < A.length; k++) {
+            if (
+              A[k]!.kind === 'sep' &&
+              (covers(dIdx + 1, k + 1) || covers(dIdx, k + 1))
+            ) {
+              result = true
+              break
+            }
+          }
+          break
+        case 'star':
+          if (covers(dIdx + 1, aIdx)) {
+            result = true
+            break
+          }
+          if (aIdx < A.length) {
+            const a = A[aIdx]!
+            if (
+              a.kind === 'star' ||
+              (a.kind === 'char' && !a.matchesSeparator)
+            ) {
+              result = covers(dIdx, aIdx + 1)
+            }
+          }
+          break
+        case 'sep':
+          result =
+            aIdx < A.length &&
+            A[aIdx]!.kind === 'sep' &&
+            covers(dIdx + 1, aIdx + 1)
+          break
+        case 'char':
+          if (aIdx < A.length) {
+            const a = A[aIdx]!
+            if (a.kind === 'sep') {
+              result =
+                d.matchesSeparator &&
+                rangesCover(d.ranges, [[47, 47]]) &&
+                covers(dIdx + 1, aIdx + 1)
+            } else if (a.kind === 'char') {
+              result =
+                rangesCover(d.ranges, a.ranges) && covers(dIdx + 1, aIdx + 1)
+            }
+          }
+          break
+      }
+    }
+    memo.set(key, result)
+    return result
+  }
+
+  return covers(0, 0)
 }
 
 /** Is `entry`'s region strictly inside the literal directory `dir`? */
@@ -496,7 +682,7 @@ function lateReadDenyFilters(resolved: ResolvedReadConfig): {
     const denyRegex = new RegExp(denyGlobEntryRegex(deny))
     if (denyRegex.test('/')) coversRoot = true
     const carveOuts = (isCredential ? resolved.ownAllows : resolved.allows)
-      .filter(a => denyGlobCovers(denyRegex, a))
+      .filter(a => denyGlobCovers(deny, denyRegex, a))
       .map(a => pathFilter(a))
     filters.push(carveFilter(denyPathFilter(deny), carveOuts))
   }
@@ -602,7 +788,7 @@ function generateReadDenyUnlinkRules(
       if (!intersectsWriteRoot) continue
       const denyRegex = new RegExp(denyGlobEntryRegex(deny))
       const carveOuts = exceptions
-        .filter(e => denyGlobCovers(denyRegex, e))
+        .filter(e => denyGlobCovers(deny, denyRegex, e))
         .map(e => pathFilter(e))
       filters.add(carveFilter(denyPathFilter(deny), carveOuts))
       if (baseDir !== '/') {
