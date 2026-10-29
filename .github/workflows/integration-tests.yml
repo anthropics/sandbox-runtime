@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: ['**']
 
+permissions:
+  contents: read
+
 # LISTED, in the steps that take it: on each line, the SHA-256 of a
 # certificate and of its public key.
 jobs:
@@ -325,9 +328,11 @@ jobs:
           # BaseContainer-capable.
           $env:SRT_BOUNDARY_BACKEND = if ('${{ matrix.arch }}' -eq 'arm64') { 'mxc' } else { 'srt-win' }
           if ($env:SRT_BOUNDARY_BACKEND -eq 'mxc') {
-            # The MXC SDK's spawn() needs fs streams that accept
-            # `windowsHandle`, which no Bun release has yet; the canary
-            # build does. Temporary: drop this once a release has it.
+            # TEMPORARY, until a tagged Bun release has the windowsHandle
+            # fix (oven-sh/bun#47087): the MXC SDK's spawn() needs fs
+            # streams that accept `windowsHandle`. Bun's canary is one
+            # rolling release whose assets are replaced on every build,
+            # so it cannot be pinned; the revision is printed instead.
             $canary = Join-Path $env:RUNNER_TEMP 'bun-canary'
             Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/canary/bun-windows-aarch64.zip' -OutFile "$canary.zip"
             Expand-Archive "$canary.zip" -DestinationPath $canary -Force
