@@ -3199,30 +3199,50 @@ async function spawnSandboxed(
   // allowWrite are expressible here (srt-win's grants are session ACL
   // state and refuse them). Per-command paths go through the same
   // `expandWindowsFsPaths` as the session's.
+  // `mode: 'mask'` files are denied, as on the srt-win path: nothing
+  // can show the child a masked copy. Like there, they stay in force
+  // under `filesystem.disabled`.
   const fsCfg = customConfig?.filesystem
+  const maskedFiles = windowsMaskedFileDenies(credentialRestrictions)
   let perExecDenyRead: string[] = []
   let perExecDenyWrite: string[] = []
   let perExecAllowRead: string[] = []
   let perExecAllowWrite: string[] = []
   if (!fsCfg?.disabled) {
-    perExecAllowRead = expandWindowsFsPaths(fsCfg?.allowRead ?? [])
-    perExecAllowWrite = expandWindowsFsPaths(fsCfg?.allowWrite ?? [])
-    perExecDenyRead = expandWindowsFsPaths([
-      ...(fsCfg?.denyRead ?? []),
-      ...getCredentialDenyReadPaths(customConfig?.credentials),
-    ])
-    perExecDenyWrite = expandWindowsFsPaths(fsCfg?.denyWrite ?? [])
+    perExecAllowRead = expandWindowsFsPaths(fsCfg?.allowRead ?? [], {
+      mode: 'grant',
+    })
+    perExecAllowWrite = expandWindowsFsPaths(fsCfg?.allowWrite ?? [], {
+      mode: 'grant',
+    })
+    // Deny mode keeps a missing literal path, so a file created after
+    // this point is still denied.
+    perExecDenyRead = expandWindowsFsPaths(
+      [
+        ...(fsCfg?.denyRead ?? []),
+        ...getCredentialDenyReadPaths(customConfig?.credentials),
+      ],
+      { mode: 'deny' },
+    )
+    perExecDenyWrite = expandWindowsFsPaths(fsCfg?.denyWrite ?? [], {
+      mode: 'deny',
+    })
   }
+  const unique = (paths: string[]): string[] => [...new Set(paths)]
   const request = buildMxcRequest({
     command,
     httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
     socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
     proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
     setEnvVars: credentialRestrictions.setEnvVars,
-    denyRead: [...st.fsSet.denyRead, ...perExecDenyRead],
-    denyWrite: [...st.fsSet.denyWrite, ...perExecDenyWrite],
-    allowRead: [...st.fsSet.grantRead, ...perExecAllowRead],
-    allowWrite: [...st.fsSet.grantWrite, ...perExecAllowWrite],
+    denyRead: unique([
+      ...st.fsSet.denyRead,
+      ...perExecDenyRead,
+      ...maskedFiles,
+    ]),
+    denyWrite: unique([...st.fsSet.denyWrite, ...perExecDenyWrite]),
+    allowRead: unique([...st.fsSet.grantRead, ...perExecAllowRead]),
+    allowWrite: unique([...st.fsSet.grantWrite, ...perExecAllowWrite]),
     cwd,
     gitSafeDirectories: getGitSafeDirectories(customConfig),
     binShell: parseWindowsBinShell(options.binShell),

@@ -47,6 +47,11 @@ import { certThumbprint } from '../../src/sandbox/mitm-ca.js'
 import * as platform from '../../src/utils/platform.js'
 import { overrideEmittedConnectionProbe } from '../../src/sandbox/emitted-connection.js'
 import * as winUtils from '../../src/sandbox/windows-sandbox-utils.js'
+import * as mxcUtils from '../../src/sandbox/mxc-sandbox-utils.js'
+import type {
+  MxcProcessHandle,
+  MxcRequest,
+} from '../../src/sandbox/mxc-sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
@@ -1927,6 +1932,66 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       message: expect.stringContaining("windows.backend is 'mxc'"),
     })
     expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
+  })
+
+  it('mxc: a masked credential file is denied in the spawned request', async () => {
+    const spawned: MxcRequest[] = []
+    const probe = (): mxcUtils.MxcProbeOutput => ({
+      tier: 'base-container',
+      needsDaclAugmentation: false,
+      warnings: [],
+      probes: {
+        baseContainerSupportsDenyPaths: true,
+        baseContainerSupportsIngressHostLoopbackAllow: true,
+        baseContainerSupportsIdentitylessLoopbackProxy: true,
+        uiCapabilities: {
+          canBlockClipboardRead: true,
+          canBlockClipboardWrite: true,
+          canBlockInputInjection: true,
+        },
+      },
+    })
+    spies.push(
+      spyOn(mxcUtils, 'isMxcSdkInstalled').mockReturnValue(true),
+      spyOn(mxcUtils, 'loadMxcSdk').mockResolvedValue({
+        probe,
+        spawn: request => {
+          spawned.push(request)
+          return Promise.resolve({} as MxcProcessHandle)
+        },
+      }),
+    )
+    const base = configOf({ allowWrite: [root] })
+    await SandboxManager.initialize({
+      ...base,
+      windows: { ...base.windows, backend: 'mxc' },
+    })
+    expect(SandboxManager.getWindowsBackend?.()?.backend).toBe('mxc')
+    const credentials = { files: [{ path: token, mode: 'mask' as const }] }
+    const missing = join(d, 'not-yet-created')
+    await SandboxManager.spawnSandboxed!('rem', {
+      customConfig: {
+        credentials,
+        filesystem: { denyRead: [missing], allowWrite: [], denyWrite: [] },
+      },
+    })
+    // filesystem.disabled leaves the mask in force, as under srt-win.
+    await SandboxManager.spawnSandboxed!('rem', {
+      customConfig: {
+        credentials,
+        filesystem: {
+          disabled: true,
+          denyRead: [],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      },
+    })
+    expect(spawned).toHaveLength(2)
+    expect(spawned[0].filesystem.deniedPaths).toContain(token)
+    // A missing literal deny is kept, not dropped.
+    expect(spawned[0].filesystem.deniedPaths).toContain(missing)
+    expect(spawned[1].filesystem.deniedPaths).toContain(token)
   })
 
   it('wrapWithSandboxArgv and spawnSandboxed name the other entry point', async () => {
