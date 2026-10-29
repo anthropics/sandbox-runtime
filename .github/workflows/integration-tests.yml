@@ -198,9 +198,9 @@ jobs:
           # where the proxy listens on 127.0.0.1. The floor itself is run by
           # the package check in release.yml.
           #
-          # Windows runs 24: @microsoft/mxc-sdk 0.9 declares Node >=24, and
+          # Windows runs 24: @microsoft/mxc-sdk declares Node >=24, and
           # npm leaves an optional dependency out when its engines do not
-          # match, so on 22 the MXC runner is never installed.
+          # match, so on 22 the MXC SDK is never installed.
           node-version: ${{ matrix.os == 'windows' && '24' || '22' }}
 
       - name: Setup Bun
@@ -324,7 +324,20 @@ jobs:
           # that backend fails: only the arm64 image is
           # BaseContainer-capable.
           $env:SRT_BOUNDARY_BACKEND = if ('${{ matrix.arch }}' -eq 'arm64') { 'mxc' } else { 'srt-win' }
-          bun test test/sandbox/mxc.test.ts
+          if ($env:SRT_BOUNDARY_BACKEND -eq 'mxc') {
+            # The MXC SDK's spawn() needs fs streams that accept
+            # `windowsHandle`, which no Bun release has yet; the canary
+            # build does. Temporary: drop this once a release has it.
+            $canary = Join-Path $env:RUNNER_TEMP 'bun-canary'
+            Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/canary/bun-windows-aarch64.zip' -OutFile "$canary.zip"
+            Expand-Archive "$canary.zip" -DestinationPath $canary -Force
+            $bun = (Get-ChildItem $canary -Recurse -Filter bun.exe | Select-Object -First 1).FullName
+            & $bun --revision
+            & $bun test test/sandbox/mxc.test.ts
+          } else {
+            bun test test/sandbox/mxc.test.ts
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw
@@ -353,186 +366,8 @@ jobs:
             }
           }
           if (-not (Test-Path node_modules)) { npm ci }
-          $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
-          $wxc = "node_modules\@microsoft\mxc-sdk\bin\$arch\wxc-exec.exe"
-          if (Test-Path $wxc) {
-            "wxc-exec --probe:"
-            & $wxc --probe
-            "exit code: $LASTEXITCODE"
-          } else {
-            "wxc-exec not found at $wxc"
-          }
-
-      # Throwaway: does @microsoft/mxc-sdk work under Bun? Never fails the job.
-      - name: MXC SDK spawn behaviour (Windows)
-        if: ${{ !cancelled() && matrix.os == 'windows' }}
-        continue-on-error: true
-        timeout-minutes: 10
-        shell: pwsh
-        run: |
-          $d = Join-Path $env:RUNNER_TEMP 'mxc-probe'
-          New-Item -ItemType Directory -Force -Path (Join-Path $d 'w') | Out-Null
-          Set-Location $d
-          '{"name":"mxc-probe","private":true,"type":"module"}' | Set-Content package.json
-          npm install '@microsoft/mxc-sdk@1.0.1' --ignore-scripts --no-audit --no-fund 2>&1 | Select-Object -Last 3
-          @'
-          @echo off
-          for /l %%i in (1,1,40) do (
-            echo x>>"%~1"
-            ping -n 2 127.0.0.1 >nul
-          )
-          '@ | Set-Content -Encoding ascii w\hb.cmd
-          @'
-          @echo off
-          start "" /b cmd /d /c %~dp0hb.cmd %~1
-          ping -n 60 127.0.0.1 >nul
-          '@ | Set-Content -Encoding ascii w\parent.cmd
-          @'
-          @echo off
-          start "" /b cmd /d /c %~dp0hb.cmd %~1
-          '@ | Set-Content -Encoding ascii w\bg.cmd
-          @'
-          import * as sdk from '@microsoft/mxc-sdk/v1'
-          import path from 'node:path'
-          const w = path.join(process.cwd(), 'w')
-          export const cmd = 'C:\\Windows\\System32\\cmd.exe /d /c '
-          const ping = 'C:\\Windows\\System32\\PING.EXE'
-          const hb = file => `for /l %i in (1,1,40) do @(echo x>>${path.join(w, file)} & ${ping} -n 2 127.0.0.1 >nul)`
-          export const script = (name, file) => name === 'bg.cmd'
-            ? `${cmd}"start /b cmd /d /c "${hb(file)}""`
-            : `${cmd}"start /b cmd /d /c "${hb(file)}" & ${ping} -n 60 127.0.0.1 >nul"`
-          export const request = {
-            filesystem: { readonlyPaths: [`${process.env.SystemDrive ?? 'C:'}\\`, process.cwd()], readwritePaths: [w] },
-            network: { egress: { default: 'deny' } },
-            workingDirectory: w,
-            timeoutMs: 120000,
-          }
-          export { sdk, w }
-          '@ | Set-Content common.mjs
-          @'
-          import { sdk, request, script } from './common.mjs'
-          const p = await sdk.spawn({ ...request, command: script('parent.cmd', process.argv[2]) })
-          console.log('HOST child id', p.id)
-          setTimeout(() => process.exit(0), 3000)
-          setInterval(() => {}, 1000)
-          '@ | Set-Content host.mjs
-          @'
-          import { sdk, request, cmd, script, w } from './common.mjs'
-          import fs from 'node:fs'
-          import path from 'node:path'
-          import { execFileSync, spawn as nodeSpawn } from 'node:child_process'
-          const mark = (name, value) => console.log(`RESULT ${name}: ${value}`)
-          const step = async (name, fn) => {
-            try { mark(name, `ok ${JSON.stringify(await fn())}`) }
-            catch (e) { mark(name, `FAILED ${e?.code ?? ''} ${e?.message ?? e}`) }
-          }
-          const sleep = ms => new Promise(r => setTimeout(r, ms))
-          const size = f => { try { return fs.statSync(path.join(w, f)).size } catch { return -1 } }
-          const growing = async f => { const a = size(f); await sleep(5000); const b = size(f); return { from: a, to: b, growing: b > a, verdict: a < 0 ? 'INCONCLUSIVE' : 'measured' } }
-          const collect = s => { let t = ''; s?.on('data', c => { t += c }); return () => t }
-          const timed = async fn => { const t = Date.now(); const r = await fn(); return { ...r, ms: Date.now() - t } }
-          mark('runtime', process.version)
-          mark('tier', (await sdk.getPlatformSupport()).isolationTier)
-          const show = async (name, command, extra = {}) => step(name, async () => {
-            const p = await sdk.spawn({ ...request, timeoutMs: 8000, ...extra, command })
-            const out = collect(p.standardOutput)
-            const err = collect(p.standardError)
-            const result = await p.wait()
-            return { result, out: out().slice(0, 200), err: err().slice(0, 200) }
-          })
-          const rwOnly = { filesystem: { readonlyPaths: [`${process.env.SystemDrive ?? 'C:'}\\`], readwritePaths: [w] } }
-          const roOnly = { filesystem: { readonlyPaths: [`${process.env.SystemDrive ?? 'C:'}\\`, w] } }
-          const runIt = `${cmd}${w}\\ok.cmd`
-          fs.writeFileSync(path.join(w, 'ok.cmd'), '@echo ran\r\n')
-          await show('perm-overlap-dir', `${cmd}dir /b ${w}`)
-          await show('perm-overlap-run', runIt)
-          await show('perm-rw-dir', `${cmd}dir /b ${w}`, rwOnly)
-          await show('perm-rw-run', runIt, rwOnly)
-          await show('perm-ro-dir', `${cmd}dir /b ${w}`, roOnly)
-          await show('perm-ro-run', runIt, roOnly)
-          await show('diag-inline', script('bg.cmd', 'diag.txt'))
-          await sleep(4000)
-          mark('diag-inline-size', size('diag.txt'))
-          await step('tree-kill', async () => {
-            const p = await sdk.spawn({ ...request, command: script('parent.cmd', 'a.txt') })
-            await sleep(3000)
-            const before = await growing('a.txt')
-            p.kill()
-            const result = await p.wait()
-            await sleep(1000)
-            return { id: p.id, before, result, after: await growing('a.txt') }
-          })
-          await step('host-taskkill-tree', async () => {
-            const p = await sdk.spawn({ ...request, command: script('parent.cmd', 'b.txt') })
-            await sleep(3000)
-            const before = await growing('b.txt')
-            let taskkill
-            try { taskkill = execFileSync('taskkill', ['/t', '/f', '/pid', String(p.id)], { encoding: 'utf8' }).trim() }
-            catch (e) { taskkill = `FAILED ${e.status} ${e.stderr}` }
-            const result = await Promise.race([p.wait(), sleep(15000).then(() => 'wait timed out')])
-            const after = await growing('b.txt')
-            try { p.kill() } catch {}
-            return { id: p.id, before, taskkill, result, after }
-          })
-          await step('background-after-exit', async () => {
-            const p = await sdk.spawn({ ...request, command: script('bg.cmd', 'c.txt') })
-            const result = await timed(() => p.wait())
-            await sleep(1000)
-            return { result, after: await growing('c.txt') }
-          })
-          await step('host-exit', async () => {
-            const out = execFileSync(process.execPath, ['host.mjs', 'd.txt'], { cwd: path.dirname(w), encoding: 'utf8' }).trim()
-            await sleep(1000)
-            return { out, after: await growing('d.txt') }
-          })
-          await step('host-hard-kill', async () => {
-            const h = nodeSpawn(process.execPath, ['host.mjs', 'e.txt'], { cwd: path.dirname(w), stdio: 'ignore' })
-            await sleep(2000)
-            execFileSync('taskkill', ['/f', '/pid', String(h.pid)])
-            await sleep(1000)
-            return { after: await growing('e.txt') }
-          })
-          await step('stdin', async () => {
-            const p = await sdk.spawn({ ...request, command: 'C:\\Windows\\System32\\sort.exe' })
-            const out = collect(p.standardOutput)
-            p.standardInput.end('b\r\na\r\n')
-            return { result: await p.wait(), out: out() }
-          })
-          await step('large-output-to-file', async () => {
-            const p = await sdk.spawn({ ...request, command: `${cmd}"for /l %i in (1,1,30000) do @echo line%i & @echo err%i 1>&2"` })
-            const f = path.join(w, 'out.log')
-            const file = fs.createWriteStream(f)
-            p.standardOutput.pipe(file, { end: false })
-            p.standardError.pipe(file, { end: false })
-            const result = await timed(() => p.wait())
-            await new Promise(r => file.end(r))
-            const lines = fs.readFileSync(f, 'utf8').split('\n').filter(Boolean)
-            return { result, lines: lines.length, last: lines.at(-1) }
-          })
-          const env = async (name, extra) => step(name, async () => {
-            process.env.PROBE_HOST_ONLY = 'host'
-            const p = await sdk.spawn({ ...request, ...extra, command: `${cmd}set` })
-            const out = collect(p.standardOutput)
-            const err = collect(p.standardError)
-            const result = await p.wait()
-            const keys = out().split(/\r?\n/).map(l => l.split('=')[0]).filter(Boolean)
-            const value = k => out().split(/\r?\n/).find(l => l.toUpperCase().startsWith(`${k}=`))
-            return { result, count: keys.length, keys: keys.join(','), probe: value('PROBE_SET'), path: value('PATH')?.slice(0, 60), err: err().slice(0, 200) }
-          })
-          await env('env-omitted', {})
-          await env('env-verbatim', { environment: { PROBE_SET: 'x', SystemRoot: 'C:\\Windows' } })
-          await env('env-inherit', { environment: { PROBE_SET: 'x', PATH: 'C:\\probe-path' }, inheritDefaultEnvironment: true })
-          await step('exit-code', async () => (await (await sdk.spawn({ ...request, command: `${cmd}exit 7` })).wait()))
-          await step('timeout', async () => timed(async () => (await sdk.spawn({ ...request, timeoutMs: 2000, command: script('parent.cmd', 'f.txt') })).wait()))
-          await step('concurrent', async () => (await Promise.all([1, 2, 3, 4, 5].map(async i => {
-            const p = await sdk.spawn({ ...request, command: `${cmd}echo ${i}` })
-            const out = collect(p.standardOutput)
-            const result = await p.wait()
-            return `${out().trim()}:${result.exitCode}`
-          }))).join(' '))
-          process.exit(0)
-          '@ | Set-Content probe.mjs
-          "--- under node"; node probe.mjs 2>&1; "node exit: $LASTEXITCODE"
+          "MXC SDK probe:"
+          node -e "import('@microsoft/mxc-sdk/v1').then(s => console.log(JSON.stringify(s.probe(), null, 1)), e => console.log('not available: ' + e.message))"
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
