@@ -323,26 +323,13 @@ jobs:
           # and the separate process keeps sandbox-manager's
           # process-lifetime state (e.g. the once-per-process WFP
           # verification) from leaking into winsrt's fail-closed
-          # guards. It names its backend, so a runner that can't run
-          # that backend fails: only the arm64 image is
-          # BaseContainer-capable.
-          $env:SRT_BOUNDARY_BACKEND = if ('${{ matrix.arch }}' -eq 'arm64') { 'mxc' } else { 'srt-win' }
-          if ($env:SRT_BOUNDARY_BACKEND -eq 'mxc') {
-            # TEMPORARY, until a tagged Bun release has the windowsHandle
-            # fix (oven-sh/bun#47087): the MXC SDK's spawn() needs fs
-            # streams that accept `windowsHandle`. Bun's canary is one
-            # rolling release whose assets are replaced on every build,
-            # so it cannot be pinned; the revision is printed instead.
-            $canary = Join-Path $env:RUNNER_TEMP 'bun-canary'
-            Invoke-WebRequest 'https://github.com/oven-sh/bun/releases/download/canary/bun-windows-aarch64.zip' -OutFile "$canary.zip"
-            Expand-Archive "$canary.zip" -DestinationPath $canary -Force
-            $bun = (Get-ChildItem $canary -Recurse -Filter bun.exe | Select-Object -First 1).FullName
-            & $bun --revision
-            & $bun test test/sandbox/mxc.test.ts
-          } else {
-            bun test test/sandbox/mxc.test.ts
-          }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # guards. It runs on srt-win for now: the mxc backend needs
+          # fs streams that accept `windowsHandle`, which no Bun
+          # release has yet. Set SRT_BOUNDARY_BACKEND to 'mxc' on the
+          # arm64 leg (the only BaseContainer-capable image) once the
+          # pinned Bun has it.
+          $env:SRT_BOUNDARY_BACKEND = 'srt-win'
+          bun test test/sandbox/mxc.test.ts
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw
