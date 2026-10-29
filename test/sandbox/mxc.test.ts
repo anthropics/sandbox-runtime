@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { finished } from 'node:stream/promises'
+import type { Readable } from 'node:stream'
 import {
   existsSync,
   mkdirSync,
@@ -27,11 +29,12 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
  * Windows sandbox BOUNDARY verification matrix.
  *
  * Backend-agnostic: every test drives the public SandboxManager
- * surface (`wrapWithSandboxArgv` + spawn `shell:false`) and asserts
- * the boundary srt promises, not the mechanism that enforces it.
- * `SRT_BOUNDARY_BACKEND` names the backend under test (`mxc`, else
- * srt-win); mxc needs a BaseContainer-capable machine (Windows 11
- * 25H2+, `@microsoft/mxc-sdk` installed), srt-win any Windows machine
+ * surface (`spawnSandboxed` under mxc, `wrapWithSandboxArgv` + spawn
+ * `shell:false` under srt-win) and asserts the boundary srt promises,
+ * not the mechanism that enforces it. `SRT_BOUNDARY_BACKEND` names the
+ * backend under test (`mxc`, else srt-win); mxc needs a
+ * BaseContainer-capable machine (Windows 11 25H2+,
+ * `@microsoft/mxc-sdk` installed), srt-win any Windows machine
  * (after `npx sandbox-runtime windows-install`). Overlap with
  * winsrt.test.ts is deliberate — this file is the checklist for manual
  * verification of a new backend, so it must stand alone.
@@ -71,8 +74,13 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
  *   F — process lifecycle
  *     F1 exit code propagation
  *     F2 stdout/stderr separation
- *     F3 kill chain: broker killed → sandboxed tree dies
+ *     F3 kill chain: killing the command kills its whole tree
  *     F4 PowerShell starts (UI policy)
+ *   G — everyday tools start inside the sandbox
+ *     G1 cmd.exe, G2 whoami, G3 git, G4 node
+ *     G5 Git Bash: a KNOWN FAILURE under mxc (bash.exe crashes with
+ *        0xC0000005 in a BaseContainer). Marked failing, so the row
+ *        turns red the day it starts working.
  */
 
 const FIXTURE_SECRET = 'BOUNDARY-SECRET-4d1f'
@@ -84,12 +92,26 @@ const BOUNDARY_BACKEND =
 /**
  * Schannel clients do not run under srt-win, where System32 curl fails
  * whatever the proxy decides: B1 would fail and B2 pass for the wrong
- * reason. git-for-windows' x64 curl has its own TLS stack.
+ * reason. There, use a curl with its own TLS stack (git-for-windows'
+ * x64 build), found by its `--version`, and skip B1/B2 without one.
  */
-const CURL =
-  BOUNDARY_BACKEND === 'srt-win'
-    ? '"C:\\Program Files\\Git\\mingw64\\bin\\curl.exe"'
-    : 'curl.exe'
+function findOpenSslCurl(): string | undefined {
+  if (!isWindows) return undefined
+  for (const c of [
+    'C:\\Program Files\\Git\\mingw64\\bin\\curl.exe',
+    'C:\\Program Files\\Git\\clangarm64\\bin\\curl.exe',
+    'C:\\msys64\\mingw64\\bin\\curl.exe',
+  ]) {
+    if (!existsSync(c)) continue
+    const r = spawnSync(c, ['--version'], { encoding: 'utf8', timeout: 5_000 })
+    if (r.status === 0 && /OpenSSL/i.test(r.stdout)) return `"${c}"`
+  }
+  return undefined
+}
+const CURL = BOUNDARY_BACKEND === 'srt-win' ? findOpenSslCurl() : 'curl.exe'
+
+/** Git Bash, where git-for-windows puts it on every runner image. */
+const GIT_BASH = 'C:\\Program Files\\Git\\bin\\bash.exe'
 
 let root: string // read-granted fixture tree (inside %TEMP%)
 let allowWriteDir: string // write-granted
@@ -179,16 +201,68 @@ function createBoundaryConfig(): SandboxRuntimeConfig {
 
 type RunResult = { stdout: string; stderr: string; status: number | null }
 
+type RunOptions = {
+  timeoutMs?: number
+  customConfig?: Partial<SandboxRuntimeConfig>
+  cwd?: string
+  /** Set in the host process only; must never reach the child. */
+  extraBrokerEnv?: Record<string, string>
+  binShell?: string
+}
+
+function collect(stream: Readable | null): () => Promise<string> {
+  if (!stream) return () => Promise.resolve('')
+  let text = ''
+  stream.setEncoding('utf8')
+  stream.on('data', (chunk: string) => {
+    text += chunk
+  })
+  return () =>
+    finished(stream).then(
+      () => text,
+      () => text,
+    )
+}
+
+/** Run through the MXC SDK, which starts the process itself. */
+async function runMxc(command: string, opts: RunOptions): Promise<RunResult> {
+  const saved: Record<string, string | undefined> = {}
+  for (const [k, v] of Object.entries(opts.extraBrokerEnv ?? {})) {
+    saved[k] = process.env[k]
+    process.env[k] = v
+  }
+  try {
+    const p = await SandboxManager.spawnSandboxed!(command, {
+      binShell: opts.binShell,
+      customConfig: opts.customConfig,
+      cwd: opts.cwd,
+      timeoutMs: opts.timeoutMs ?? 60_000,
+    })
+    try {
+      const stdout = collect(p.stdout)
+      const stderr = collect(p.stderr)
+      const { exitCode } = await p.wait()
+      return {
+        stdout: await stdout(),
+        stderr: await stderr(),
+        status: exitCode,
+      }
+    } finally {
+      p.dispose()
+    }
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+}
+
 async function runSandboxed(
   command: string,
-  opts: {
-    timeoutMs?: number
-    customConfig?: Partial<SandboxRuntimeConfig>
-    cwd?: string
-    extraBrokerEnv?: Record<string, string>
-    binShell?: string
-  } = {},
+  opts: RunOptions = {},
 ): Promise<RunResult> {
+  if (BOUNDARY_BACKEND === 'mxc') return runMxc(command, opts)
   const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
     command,
     opts.binShell,
@@ -281,8 +355,8 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
       await SandboxManager.initialize(createBoundaryConfig())
     }
     expect(SandboxManager.getWindowsBackend?.()?.backend).toBe(BOUNDARY_BACKEND)
-    // Install + double initialize + wxc-exec --probe exceed bun's 5s
-    // default hook timeout (same class as winsrt's beforeAll).
+    // Install + double initialize exceed bun's 5s default hook
+    // timeout (same class as winsrt's beforeAll).
   }, 180_000)
 
   afterAll(async () => {
@@ -301,18 +375,29 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
 
   // ── B: network egress ────────────────────────────────────────────
 
-  it('B1: allowed domain reachable through the proxy', async () => {
-    const r = await runSandboxedUntil(
-      `${CURL} -fsS -o NUL https://example.com`,
-      x => x.status === 0,
-    )
-    expectStatus('B1', r, [0])
-  }, 90_000)
+  it.skipIf(CURL === undefined)(
+    'B1: allowed domain reachable through the proxy',
+    async () => {
+      const r = await runSandboxedUntil(
+        `${CURL} -fsS -o NUL https://example.com`,
+        x => x.status === 0,
+      )
+      expectStatus('B1', r, [0])
+    },
+    90_000,
+  )
 
-  it('B2: non-allowed domain blocked at the proxy', async () => {
-    const r = await runSandboxed(`${CURL} -fsS -o NUL https://api.github.com`)
-    expectBlocked('B2', r)
-  }, 90_000)
+  it.skipIf(CURL === undefined)(
+    'B2: non-allowed domain blocked at the proxy',
+    async () => {
+      const r = await runSandboxed(`${CURL} -fsS -o NUL https://api.github.com`)
+      // curl's 22/35/56 etc. all mean "no answer from the origin"; a
+      // missing binary would also be non-zero, so check it ran.
+      expect(r.stderr).not.toMatch(/cannot find|not recognized/i)
+      expectBlocked('B2', r)
+    },
+    90_000,
+  )
 
   it.skipIf(!hasTool('node'))(
     'B3: raw TCP to an external IP is blocked (proxy-env bypass)',
@@ -321,8 +406,6 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
       // means the egress fence does not bind raw sockets — the
       // cooperative-proxy failure mode.
       const r = await runSandboxed(connectProbeCmd('1.1.1.1', 443), {
-        // Node requires Win32k during startup. Selecting PowerShell enables
-        // ui.allowWindows for this probe without weakening the session policy.
         binShell: 'powershell',
       })
       // A missing PROBE-START means the child never ran (spawn/env
@@ -567,17 +650,24 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
     expect(r.stderr).toContain('ERR-MARK')
   }, 60_000)
 
-  it('F3: kill chain — broker killed, sandboxed tree dies', async () => {
+  it('F3: kill chain — killing the command kills its whole tree', async () => {
     // `waitfor` parks until its signal or /T expires; it exists on
-    // every Windows SKU. Kill the broker mid-wait, then confirm no
-    // waitfor.exe survives (racy against unrelated waitfors, hence
-    // the retry loop and the generous poll budget).
-    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-      'waitfor SrtBoundarySig /t 90',
-    )
-    const broker = spawn(argv[0], argv.slice(1), { env, stdio: 'ignore' })
-    await new Promise(res => setTimeout(res, 5_000))
-    broker.kill()
+    // every Windows SKU. Kill the command mid-wait (under srt-win, its
+    // broker), then confirm no waitfor.exe survives (racy against
+    // unrelated waitfors, hence the retry loop and the poll budget).
+    const command = 'waitfor SrtBoundarySig /t 90'
+    if (BOUNDARY_BACKEND === 'mxc') {
+      const p = await SandboxManager.spawnSandboxed!(command)
+      await new Promise(res => setTimeout(res, 5_000))
+      p.kill()
+      await p.wait()
+      p.dispose()
+    } else {
+      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(command)
+      const broker = spawn(argv[0], argv.slice(1), { env, stdio: 'ignore' })
+      await new Promise(res => setTimeout(res, 5_000))
+      broker.kill()
+    }
     let alive = true
     for (let i = 0; i < 15 && alive; i++) {
       await new Promise(res => setTimeout(res, 1_000))
@@ -595,15 +685,68 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
   }, 60_000)
 
   it('F4: PowerShell starts (UI policy)', async () => {
-    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-      'Write-Output PS-MARK',
-      'powershell',
-    )
-    const r = await spawnAsync(argv[0], argv.slice(1), {
-      timeout: 60_000,
-      env,
+    const r = await runSandboxed('Write-Output PS-MARK', {
+      binShell: 'powershell',
     })
     expectStatus('F4', r, [0])
     expect(r.stdout).toContain('PS-MARK')
   }, 90_000)
+
+  // ── G: everyday tools ────────────────────────────────────────────
+
+  it('G1: cmd.exe runs', async () => {
+    const r = await runSandboxed('ver')
+    expectStatus('G1', r, [0])
+    expect(r.stdout).toMatch(/Windows/)
+  }, 60_000)
+
+  it('G2: whoami runs', async () => {
+    const r = await runSandboxed('whoami')
+    expectStatus('G2', r, [0])
+    expect(r.stdout.trim().length).toBeGreaterThan(0)
+  }, 60_000)
+
+  it.skipIf(!hasTool('git'))(
+    'G3: git runs',
+    async () => {
+      const r = await runSandboxed('git --version')
+      expectStatus('G3', r, [0])
+      expect(r.stdout).toContain('git version')
+    },
+    60_000,
+  )
+
+  it.skipIf(!hasTool('node'))(
+    'G4: node runs',
+    async () => {
+      const r = await runSandboxed('node -e "console.log(1+1)"')
+      expectStatus('G4', r, [0])
+      expect(r.stdout.trim()).toBe('2')
+    },
+    60_000,
+  )
+
+  // Known failure under mxc: bash.exe dies with 0xC0000005 inside a
+  // BaseContainer. `it.failing` passes while it still fails, and
+  // fails as soon as Git Bash works, so the row gets removed then.
+  // srt-win's Git Bash coverage lives in winsrt.test.ts.
+  const knownMxcFailure =
+    BOUNDARY_BACKEND === 'mxc' && isWindows && existsSync(GIT_BASH)
+      ? it.failing
+      : it.skip
+  knownMxcFailure(
+    'G5: Git Bash runs (known failure under mxc: 0xC0000005)',
+    async () => {
+      const r = await runSandboxed('echo BASH-MARK', {
+        binShell: GIT_BASH,
+      })
+      console.log(
+        `G5 Git Bash under mxc: exit ${r.status} ` +
+          `(0x${((r.status ?? 0) >>> 0).toString(16)}) stderr=${JSON.stringify(r.stderr.slice(0, 200))}`,
+      )
+      expectStatus('G5', r, [0])
+      expect(r.stdout).toContain('BASH-MARK')
+    },
+    60_000,
+  )
 })
