@@ -252,34 +252,32 @@ describe('MXC probe gate (fail closed)', () => {
     expect(mxcProbeRefusals(buildMxcRequest({ command: 'x' }), p)).toEqual([])
   })
 
-  it('refuses a grant beneath a denied path, before probing', async () => {
-    let probed = false
-    const { sdk, spawned } = fakeSdk(() => {
-      probed = true
-      return fullSupport()
-    })
+  it('sends a grant beneath a deny in both lists, unrefused', async () => {
+    // MXC resolves by path specificity, so the nested grant wins for
+    // its own subtree, matching srt's ranking.
+    const { sdk, spawned } = fakeSdk(fullSupport)
     const req = buildMxcRequest({
       command: 'x',
-      cwd: 'C:\\elsewhere',
+      cwd: 'C:\\Users\\me\\project',
       denyRead: ['C:\\Users\\me'],
+      allowRead: ['C:\\Users\\me\\docs'],
       allowWrite: ['C:\\Users\\me\\project'],
     })
-    // eslint-disable-next-line @typescript-eslint/await-thenable
-    await expect(spawnMxcRequest(sdk, req)).rejects.toMatchObject({
-      code: 'backend_unsupported',
-      message: expect.stringContaining('C:\\Users\\me\\project'),
-    })
-    expect(probed).toBe(false)
-    expect(spawned).toHaveLength(0)
-    // A deny beneath a grant is fine: that is the deny-list model.
-    const ok = buildMxcRequest({
+    expect(req.filesystem.deniedPaths).toEqual(['C:\\Users\\me'])
+    expect(req.filesystem.readonlyPaths).toContain('C:\\Users\\me\\docs')
+    expect(req.filesystem.readwritePaths).toContain('C:\\Users\\me\\project')
+    await spawnMxcRequest(sdk, req)
+    expect(spawned).toEqual([req])
+  })
+
+  it('sends a deny beneath a grant as a denied path', () => {
+    const req = buildMxcRequest({
       command: 'x',
-      cwd: 'C:\\elsewhere',
-      allowWrite: ['C:\\Users\\me\\project'],
-      denyWrite: ['C:\\Users\\me\\project\\.git'],
+      allowWrite: ['C:\\work'],
+      denyWrite: ['C:\\work\\.git'],
     })
-    await spawnMxcRequest(sdk, ok)
-    expect(spawned).toHaveLength(1)
+    expect(req.filesystem.readwritePaths).toContain('C:\\work')
+    expect(req.filesystem.deniedPaths).toEqual(['C:\\work\\.git'])
   })
 
   it('verifyMxcBackend refuses like spawn', () => {

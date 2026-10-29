@@ -46,6 +46,10 @@
  *   - writes: `readwritePaths: [...allowWrite, %TEMP%]`. %TEMP% is
  *     granted for parity with macOS/Linux (TMPDIR is always writable).
  *     cwd is NOT auto-granted, as on every other platform.
+ *   - MXC resolves overlapping entries by path specificity, whatever
+ *     the list order: a grant beneath a denied path is accessible and
+ *     the rest of the deny stays denied, which is srt's ranking (a
+ *     grant beneath a deny outranks it). So the lists go as they are.
  *   - denyWrite: mapped into `deniedPaths` too, which over-denies
  *     (BaseContainer has no write-only deny, so reads on those paths
  *     are lost as well).
@@ -72,7 +76,6 @@ import {
 import {
   envListToObject,
   parseWindowsBinShell,
-  windowsGrantsBeneathDenies,
   WindowsSandboxError,
 } from './windows-sandbox-utils.js'
 import type { WindowsBinShell } from './windows-sandbox-utils.js'
@@ -249,27 +252,7 @@ export function mxcProbeRefusals(
 }
 
 /**
- * Policy srt cannot hand MXC without changing its meaning, whatever the
- * host. srt ranks a grant beneath a deny above the deny (srt-win carries
- * it as an exception to the deny); MXC documents no such rule, so the
- * request is refused rather than sent with the deny winning.
- */
-export function mxcPolicyRefusals(request: MxcRequest): string[] {
-  const beneath = windowsGrantsBeneathDenies(
-    [...request.filesystem.readonlyPaths, ...request.filesystem.readwritePaths],
-    request.filesystem.deniedPaths,
-  )
-  return beneath.length > 0
-    ? [
-        `MXC cannot grant a path beneath a denied one (${beneath.join(', ')}); ` +
-          'move the grant out from under the deny, or narrow the deny',
-      ]
-    : []
-}
-
-/**
- * Probe `request`, refusing anything {@link mxcPolicyRefusals} or
- * {@link mxcProbeRefusals} reports.
+ * Probe `request`, refusing anything {@link mxcProbeRefusals} reports.
  *
  * @throws {WindowsSandboxError} `backend_unsupported`.
  */
@@ -277,13 +260,6 @@ export function assertMxcCanEnforce(
   sdk: MxcSdk,
   request: MxcRequest,
 ): MxcProbeOutput {
-  const policyRefusals = mxcPolicyRefusals(request)
-  if (policyRefusals.length > 0) {
-    throw new WindowsSandboxError(
-      'backend_unsupported',
-      `windows.backend is 'mxc' but ${policyRefusals.join('; ')}`,
-    )
-  }
   let probe: MxcProbeOutput
   try {
     probe = sdk.probe(request)
@@ -460,10 +436,12 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
     },
     network: {
       egress: { default: 'deny' },
-      // MXC 1.0 resolves hostLoopback on its own (it does not inherit
-      // ingress.default), and admits a host proxy without a peer
-      // identity only with hostLoopback 'allow' plus ingress 'allow'.
-      // Without a proxy both are denied explicitly.
+      // MXC 1.0 refuses a host proxy unless ingress.default is 'allow',
+      // and one without a peer identity also needs hostLoopback 'allow'
+      // (resolved on its own, not inherited). On Windows 11 25H2 (build
+      // 26200.9711) this still admitted nothing inbound, from loopback
+      // or the LAN, and blocked outbound to other loopback ports; MXC
+      // documents no guarantee of that. Without a proxy both are denied.
       ...(hasProxy
         ? {
             ingress: { default: 'allow', hostLoopback: 'allow' },

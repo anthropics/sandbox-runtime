@@ -1003,9 +1003,8 @@ Known limitations:
 - **Settings refused under mxc**, with `backend_unsupported`, because MXC cannot express them with the meaning they have elsewhere:
   - `network.tlsTerminate`, so credential masking of request headers is unavailable.
   - `filesystem.disabled` at the session level: MXC is allow-list in both directions, and the nearest request would restrict rather than lift restrictions. (Per command it keeps the session's policy, as on srt-win.)
-  - `network.allowLocalBinding: true`, at the session level or per command.
-  - An `allowRead`, `allowWrite`, the working directory or `%TEMP%` beneath a denied path: srt ranks such a grant above the deny, and MXC documents no way to do that.
-- **Loopback with a proxy is not guaranteed closed.** MXC admits a host proxy that has no app identity only with host loopback allowed, and documents that this opens host loopback in both directions without limiting it to the proxy. In CI an outbound connection to another loopback port was still blocked, but MXC does not promise it.
+  - `network.allowLocalBinding: true`, at the session level or per command: nothing outside the container can connect in.
+- **Loopback with a proxy is closed by measurement, not by promise.** MXC 1.0 refuses a host proxy unless `ingress.default` is `allow`, and one without an app identity also needs host loopback allowed. On Windows 11 25H2 (build 26200.9711) that request still admitted no inbound connection, from loopback or the LAN, and blocked outbound connections to loopback ports other than the proxy's. MXC documents no guarantee of either.
 - **The child's environment is sealed**: it gets a fixed set of Windows variables, the proxy settings and srt's own, never the user's profile environment.
 - **Host file I/O can stall** for several seconds while several sandboxed commands run at once.
 - **Bun** needs a build whose `fs` streams accept `windowsHandle`; Node 24 works.
