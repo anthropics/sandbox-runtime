@@ -31,8 +31,14 @@ import { isMacOS, isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import {
   SandboxManager,
+  resolveCommandText,
   windowsProfileReadWarningsOf,
 } from '../../src/sandbox/sandbox-manager.js'
+import {
+  attributionKeyFor,
+  decodeSandboxedCommand,
+  encodeSandboxedCommand,
+} from '../../src/sandbox/sandbox-utils.js'
 import type {
   CredentialFileConfig,
   SandboxRuntimeConfig,
@@ -1992,6 +1998,73 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     // A missing literal deny is kept, not dropped.
     expect(spawned[0].filesystem.deniedPaths).toContain(missing)
     expect(spawned[1].filesystem.deniedPaths).toContain(token)
+    // The command text is registered under the command id's key, as
+    // on srt-win (the proxy username carries the same key; see
+    // mxc-config.test.ts).
+    await SandboxManager.spawnSandboxed!('curl x', {
+      commandId: 'tool-7',
+      commandText: 'curl shown',
+    })
+    expect(
+      resolveCommandText(
+        decodeSandboxedCommand(
+          encodeSandboxedCommand(attributionKeyFor('curl x', 'tool-7')),
+        ),
+      ),
+    ).toBe('curl shown')
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.spawnSandboxed!('rem', {
+        customConfig: {
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+            allowLocalBinding: true,
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'backend_unsupported' })
+    expect(spawned).toHaveLength(3)
+  })
+
+  it('mxc: refuses settings it cannot honour, before loading the SDK', async () => {
+    const load = spyOn(mxcUtils, 'loadMxcSdk')
+    spies.push(load)
+    const base = configOf({ allowWrite: [root] })
+    const mxc = { ...base.windows, backend: 'mxc' as const }
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.initialize({
+        ...base,
+        filesystem: { ...base.filesystem, disabled: true },
+        windows: mxc,
+      }),
+    ).rejects.toMatchObject({
+      code: 'backend_unsupported',
+      message: expect.stringContaining('filesystem.disabled'),
+    })
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.initialize({
+        ...base,
+        network: { ...base.network, allowLocalBinding: true },
+        windows: mxc,
+      }),
+    ).rejects.toMatchObject({
+      code: 'backend_unsupported',
+      message: expect.stringContaining('network.allowLocalBinding'),
+    })
+    expect(load).not.toHaveBeenCalled()
+  })
+
+  it('checkDependencies checks the backend it is told, before initialize()', () => {
+    spies.push(spyOn(mxcUtils, 'isMxcSdkInstalled').mockReturnValue(false))
+    expect(
+      SandboxManager.checkDependencies(undefined, { windowsBackend: 'mxc' }),
+    ).toEqual({
+      errors: [mxcUtils.MXC_SDK_MISSING],
+      warnings: [],
+    })
   })
 
   it('wrapWithSandboxArgv and spawnSandboxed name the other entry point', async () => {

@@ -410,19 +410,15 @@ export function windowsProfileReadWarningsOf(
 // and so reset()'s revoke/restore addresses the SAME binary the
 // grants/stamps were applied with even if `config` mutated between.
 let srtWinSpawn: SrtWinSpawn | undefined
-// The Windows backend from `windows.backend` (default srt-win), set
-// once at initialize(). undefined until then; wrap treats undefined as
-// srt-win.
-let windowsSelection: WindowsBackendSelection | undefined
-// Set iff selection landed on mxc: the loaded SDK, the probe's
-// deny-capability bit, and the session fs sets — the SAME expansion
-// (`computeWindowsFsAccessSet`) the probe validated, applied per spawn
-// inside the MXC request instead of via session ACLs. Its presence IS
-// the "mxc selected" signal spawnSandboxed and wrap dispatch on.
+// Set iff initialize() selected mxc: the loaded SDK and the session
+// fs sets — the SAME expansion (`computeWindowsFsAccessSet`) the probe
+// validated, applied per spawn inside the MXC request instead of via
+// session ACLs. Its presence IS the "mxc selected" signal
+// spawnSandboxed, wrap and getWindowsBackend dispatch on; srt-win's is
+// `srtWinSpawn`.
 let windowsMxcState:
   | Readonly<{
       sdk: MxcSdk
-      denyPathsSupported: boolean
       fsSet: ReturnType<typeof computeWindowsFsAccessSet>
     }>
   | undefined
@@ -1190,6 +1186,7 @@ async function initializeSteps(
         'network.tlsTerminate is not supported on the mxc backend',
       )
     }
+    assertMxcSessionConfig(runtimeConfig)
     mxcSdk = await loadMxcSdk()
   }
   // Before any CA, proxy or sandbox is set up: a runtime that cannot
@@ -1347,20 +1344,13 @@ async function initializeSteps(
           `windows.backend is 'mxc' but the policy did not compile: ${(e as Error).message}`,
         )
       }
-      const selection = verifyMxcBackend(mxcSdk, probeRequest)
-      windowsSelection = selection
+      verifyMxcBackend(mxcSdk, probeRequest)
       // MXC BaseContainer: the OS applies filesystem + network policy
       // per spawn, in its own elevated context — no sandbox user, no
       // WFP install, no session ACL stamping, nothing to restore.
-      windowsMxcState = {
-        sdk: mxcSdk,
-        denyPathsSupported: selection.denyPathsSupported,
-        fsSet: acc,
-      }
-    } else {
-      windowsSelection = { backend: 'srt-win' }
+      windowsMxcState = { sdk: mxcSdk, fsSet: acc }
     }
-    logForDebugging(`[Sandbox Windows] using ${windowsSelection.backend}`)
+    logForDebugging(`[Sandbox Windows] using ${mxcSdk ? 'mxc' : 'srt-win'}`)
   }
   if (getPlatform() === 'windows' && !windowsMxcState) {
     // Resolve once (stats disk); captured module-level for wrap/reset.
@@ -1761,9 +1751,7 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
       srtWin = resolveSrtWin(config?.windows?.srtWin)
     } catch (e) {
       errors.push((e as Error).message)
-      return {
-        done: windowsBackendDependencies({ errors, warnings }),
-      }
+      return { done: { errors, warnings } }
     }
     return {
       windows: {
@@ -1794,16 +1782,26 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
   return { done: { errors, warnings } }
 }
 
+/** Options for {@link checkDependencies}. */
+export interface CheckDependenciesOptions {
+  /**
+   * The Windows backend to check for. Defaults to the initialized
+   * config's `windows.backend`, else srt-win; pass it when checking
+   * before initialize().
+   */
+  windowsBackend?: 'mxc' | 'srt-win'
+}
+
 /**
- * The srt-win dependency report, unless the session named the mxc
- * backend: that needs neither srt-win.exe nor the WFP/user install,
+ * The mxc backend needs neither srt-win.exe nor the WFP/user install,
  * only the SDK package. Whether the host can run it is settled by
- * initialize()'s probe.
+ * initialize()'s probe. undefined when the srt-win check applies.
  */
-function windowsBackendDependencies(
-  srtWinDeps: SandboxDependencyCheck,
-): SandboxDependencyCheck {
-  if (config?.windows?.backend !== 'mxc') return srtWinDeps
+function mxcDependencies(
+  options: CheckDependenciesOptions | undefined,
+): SandboxDependencyCheck | undefined {
+  const backend = options?.windowsBackend ?? config?.windows?.backend
+  if (backend !== 'mxc' || getPlatform() !== 'windows') return undefined
   return {
     errors: isMxcSdkInstalled() ? [] : [MXC_SDK_MISSING],
     warnings: [],
@@ -1817,10 +1815,13 @@ function windowsBackendDependencies(
  */
 function checkDependencies(
   ripgrepConfig?: RipgrepConfig,
+  options?: CheckDependenciesOptions,
 ): SandboxDependencyCheck {
+  const mxc = mxcDependencies(options)
+  if (mxc) return mxc
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
-  return windowsBackendDependencies(checkWindowsDependencies(common.windows))
+  return checkWindowsDependencies(common.windows)
 }
 
 /**
@@ -1832,7 +1833,10 @@ function checkDependencies(
  */
 async function checkDependenciesAsync(
   ripgrepConfig?: RipgrepConfig,
+  options?: CheckDependenciesOptions,
 ): Promise<SandboxDependencyCheck> {
+  const mxc = mxcDependencies(options)
+  if (mxc) return mxc
   // Linux: resolve apply-seccomp first so its global-npm fallback
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
@@ -1841,9 +1845,7 @@ async function checkDependenciesAsync(
   }
   const common = checkDependenciesCommon(ripgrepConfig)
   if ('done' in common) return common.done
-  return windowsBackendDependencies(
-    await checkWindowsDependenciesAsync(common.windows),
-  )
+  return checkWindowsDependenciesAsync(common.windows)
 }
 
 /**
@@ -3113,6 +3115,30 @@ async function wrapWithSandboxArgv(
   return { argv: [shell, '-c', wrapped], env: process.env }
 }
 
+/**
+ * Settings the mxc backend cannot honour, refused rather than run with
+ * a different meaning than on the other backends.
+ *
+ * @throws {WindowsSandboxError} `backend_unsupported`.
+ */
+function assertMxcSessionConfig(c: Partial<SandboxRuntimeConfig>): void {
+  const refuse = (what: string): never => {
+    throw new WindowsSandboxError(
+      'backend_unsupported',
+      `${what} is not supported on the mxc backend`,
+    )
+  }
+  // MXC is allow-list in both directions: "no filesystem restrictions"
+  // has no faithful mapping, and the nearest request would restrict.
+  if (c.filesystem?.disabled) refuse('filesystem.disabled')
+  // A host proxy without a peer identity needs host loopback open, and
+  // MXC promises nothing about other loopback ports either way, so
+  // opening loopback on request is not something srt can guarantee.
+  if (c.network?.allowLocalBinding === true) {
+    refuse('network.allowLocalBinding')
+  }
+}
+
 /** Options for {@link spawnSandboxed}. */
 export interface SpawnSandboxedOptions {
   /** Inner shell, as for `wrapWithSandboxArgv`. Defaults to cmd.exe. */
@@ -3123,6 +3149,10 @@ export interface SpawnSandboxedOptions {
   cwd?: string
   /** Kill the command after this many milliseconds. */
   timeoutMs?: number
+  /** As for `wrapWithSandboxArgv`: see {@link WrapWithSandboxOptions}. */
+  commandId?: string
+  /** As for `wrapWithSandboxArgv`: see {@link WrapWithSandboxOptions}. */
+  commandText?: string
 }
 
 /**
@@ -3185,6 +3215,9 @@ async function spawnSandboxed(
     )
   }
   const { customConfig, cwd } = options
+  if (customConfig?.network?.allowLocalBinding === true) {
+    assertMxcSessionConfig({ network: customConfig.network })
+  }
   const hasNetworkConfig =
     customConfig?.network?.allowedDomains !== undefined ||
     config?.network?.allowedDomains !== undefined
@@ -3229,8 +3262,13 @@ async function spawnSandboxed(
     })
   }
   const unique = (paths: string[]): string[] => [...new Set(paths)]
+  registerCommandText(command, {
+    commandId: options.commandId,
+    commandText: options.commandText,
+  })
   const request = buildMxcRequest({
     command,
+    commandId: options.commandId,
     httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
     socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
     proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
@@ -3473,10 +3511,9 @@ async function reset(): Promise<void> {
   windowsProfileRead = undefined
   windowsProfileReadWarnings = []
   windowsCapableSrtWin.clear()
-  // MXC's one-shot model applies policy per exec inside wxc-exec and
-  // leaves nothing behind, so there is no ACL/user state to unwind —
-  // only the session's selection and cached fs sets.
-  windowsSelection = undefined
+  // MXC applies policy per spawn and leaves no host state behind, so
+  // there is no ACL/user state to unwind: only the loaded SDK and the
+  // cached fs sets. Processes a caller started stay theirs to dispose.
   windowsMxcState = undefined
   // windowsWfpVerifiedFor is NOT cleared — per-process, not per-session.
 
@@ -3590,7 +3627,9 @@ async function reset(): Promise<void> {
  * visible at a glance.
  */
 function getWindowsBackend(): WindowsBackendSelection | undefined {
-  return windowsSelection
+  if (windowsMxcState) return { backend: 'mxc' }
+  if (srtWinSpawn) return { backend: 'srt-win' }
+  return undefined
 }
 
 function getSandboxViolationStore() {
@@ -3698,14 +3737,20 @@ export interface ISandboxManager {
   ): Promise<void>
   isSupportedPlatform(): boolean
   isSandboxingEnabled(): boolean
-  checkDependencies(ripgrepConfig?: {
-    command: string
-    args?: string[]
-  }): SandboxDependencyCheck
-  checkDependenciesAsync(ripgrepConfig?: {
-    command: string
-    args?: string[]
-  }): Promise<SandboxDependencyCheck>
+  checkDependencies(
+    ripgrepConfig?: {
+      command: string
+      args?: string[]
+    },
+    options?: CheckDependenciesOptions,
+  ): SandboxDependencyCheck
+  checkDependenciesAsync(
+    ripgrepConfig?: {
+      command: string
+      args?: string[]
+    },
+    options?: CheckDependenciesOptions,
+  ): Promise<SandboxDependencyCheck>
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig

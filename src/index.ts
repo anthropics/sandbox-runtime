@@ -138,6 +138,7 @@ export type {
 // commands start through SandboxManager.spawnSandboxed().
 export type { WindowsBackendSelection } from './sandbox/mxc-sandbox-utils.js'
 export type {
+  CheckDependenciesOptions,
   SandboxedProcess,
   SpawnSandboxedOptions,
 } from './sandbox/sandbox-manager.js'

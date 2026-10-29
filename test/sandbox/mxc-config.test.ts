@@ -9,6 +9,12 @@ import {
   type MxcRequest,
   type MxcSdk,
 } from '../../src/sandbox/mxc-sandbox-utils.js'
+import {
+  attributionKeyFor,
+  decodeSandboxedCommand,
+  encodeSandboxedCommand,
+  proxyUsernameFor,
+} from '../../src/sandbox/sandbox-utils.js'
 
 /**
  * The request srt hands the MXC SDK, and the probe gate in front of
@@ -81,16 +87,41 @@ describe('MXC SDK request', () => {
   it('routes egress through the host proxy when there is one', () => {
     const req = buildMxcRequest({
       command: 'exit 0',
+      commandId: 'tool-1',
       httpProxyPort: 48123,
       proxyAuthToken: 'tok',
     })
+    const user = encodeURIComponent(
+      proxyUsernameFor(
+        encodeSandboxedCommand(attributionKeyFor('exit 0', 'tool-1')),
+      ),
+    )
     expect(req.network).toEqual({
       egress: { default: 'deny' },
       ingress: { default: 'allow', hostLoopback: 'allow' },
-      runtimeConfig: { networkProxy: 'http://srt:tok@127.0.0.1:48123' },
+      runtimeConfig: {
+        networkProxy: `http://${user}:tok@127.0.0.1:48123`,
+      },
     })
-    expect(req.environment.HTTPS_PROXY).toBe('http://srt:tok@localhost:48123')
+    expect(req.environment.HTTPS_PROXY).toBe(
+      `http://${user}:tok@localhost:48123`,
+    )
     expect(req.environment).not.toHaveProperty('NO_PROXY')
+  })
+
+  it('carries the command id in the proxy username, as srt-win does', () => {
+    const req = buildMxcRequest({
+      command: 'curl x',
+      commandId: 'tool-42',
+      httpProxyPort: 1,
+      proxyAuthToken: 'tok',
+    })
+    const userinfo = new URL(req.network.runtimeConfig!.networkProxy).username
+    const user = decodeURIComponent(userinfo)
+    expect(user.startsWith('srt.')).toBe(true)
+    expect(decodeSandboxedCommand(user.slice('srt.'.length))).toBe(
+      attributionKeyFor('curl x', 'tool-42'),
+    )
   })
 
   it('keeps UI on for every shell, with clipboard and injection blocked', () => {
@@ -221,14 +252,40 @@ describe('MXC probe gate (fail closed)', () => {
     expect(mxcProbeRefusals(buildMxcRequest({ command: 'x' }), p)).toEqual([])
   })
 
-  it('verifyMxcBackend reports the deny capability and refuses like spawn', () => {
-    const p = fullSupport()
-    p.probes.baseContainerSupportsDenyPaths = false
-    const req = buildMxcRequest({ command: 'x' })
-    expect(verifyMxcBackend(fakeSdk(() => p).sdk, req)).toEqual({
-      backend: 'mxc',
-      denyPathsSupported: false,
+  it('refuses a grant beneath a denied path, before probing', async () => {
+    let probed = false
+    const { sdk, spawned } = fakeSdk(() => {
+      probed = true
+      return fullSupport()
     })
+    const req = buildMxcRequest({
+      command: 'x',
+      cwd: 'C:\\elsewhere',
+      denyRead: ['C:\\Users\\me'],
+      allowWrite: ['C:\\Users\\me\\project'],
+    })
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(spawnMxcRequest(sdk, req)).rejects.toMatchObject({
+      code: 'backend_unsupported',
+      message: expect.stringContaining('C:\\Users\\me\\project'),
+    })
+    expect(probed).toBe(false)
+    expect(spawned).toHaveLength(0)
+    // A deny beneath a grant is fine: that is the deny-list model.
+    const ok = buildMxcRequest({
+      command: 'x',
+      cwd: 'C:\\elsewhere',
+      allowWrite: ['C:\\Users\\me\\project'],
+      denyWrite: ['C:\\Users\\me\\project\\.git'],
+    })
+    await spawnMxcRequest(sdk, ok)
+    expect(spawned).toHaveLength(1)
+  })
+
+  it('verifyMxcBackend refuses like spawn', () => {
+    const p = fullSupport()
+    const req = buildMxcRequest({ command: 'x' })
+    expect(() => verifyMxcBackend(fakeSdk(() => p).sdk, req)).not.toThrow()
     p.tier = 'appcontainer-bfs'
     expect(() => verifyMxcBackend(fakeSdk(() => p).sdk, req)).toThrow(
       /BaseContainer is required/,

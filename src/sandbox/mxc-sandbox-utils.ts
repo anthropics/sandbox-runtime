@@ -62,9 +62,17 @@ import { createRequire } from 'node:module'
 import * as path from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
-import { generateProxyEnvVars, buildGitConfigEnv } from './sandbox-utils.js'
 import {
+  attributionKeyFor,
+  buildGitConfigEnv,
+  encodeSandboxedCommand,
+  generateProxyEnvVars,
+  proxyUsernameFor,
+} from './sandbox-utils.js'
+import {
+  envListToObject,
   parseWindowsBinShell,
+  windowsGrantsBeneathDenies,
   WindowsSandboxError,
 } from './windows-sandbox-utils.js'
 import type { WindowsBinShell } from './windows-sandbox-utils.js'
@@ -195,13 +203,7 @@ export async function loadMxcSdk(): Promise<MxcSdk> {
 // Probe & spawn
 // ────────────────────────────────────────────────────────────────────────
 
-export type WindowsBackendSelection =
-  | Readonly<{ backend: 'srt-win' }>
-  | Readonly<{
-      backend: 'mxc'
-      /** Whether the host can enforce per-command denied paths. */
-      denyPathsSupported: boolean
-    }>
+export type WindowsBackendSelection = Readonly<{ backend: 'srt-win' | 'mxc' }>
 
 /**
  * Every reason the probe's answer cannot enforce `request` exactly.
@@ -247,7 +249,27 @@ export function mxcProbeRefusals(
 }
 
 /**
- * Probe `request`, refusing anything {@link mxcProbeRefusals} reports.
+ * Policy srt cannot hand MXC without changing its meaning, whatever the
+ * host. srt ranks a grant beneath a deny above the deny (srt-win carries
+ * it as an exception to the deny); MXC documents no such rule, so the
+ * request is refused rather than sent with the deny winning.
+ */
+export function mxcPolicyRefusals(request: MxcRequest): string[] {
+  const beneath = windowsGrantsBeneathDenies(
+    [...request.filesystem.readonlyPaths, ...request.filesystem.readwritePaths],
+    request.filesystem.deniedPaths,
+  )
+  return beneath.length > 0
+    ? [
+        `MXC cannot grant a path beneath a denied one (${beneath.join(', ')}); ` +
+          'move the grant out from under the deny, or narrow the deny',
+      ]
+    : []
+}
+
+/**
+ * Probe `request`, refusing anything {@link mxcPolicyRefusals} or
+ * {@link mxcProbeRefusals} reports.
  *
  * @throws {WindowsSandboxError} `backend_unsupported`.
  */
@@ -255,6 +277,13 @@ export function assertMxcCanEnforce(
   sdk: MxcSdk,
   request: MxcRequest,
 ): MxcProbeOutput {
+  const policyRefusals = mxcPolicyRefusals(request)
+  if (policyRefusals.length > 0) {
+    throw new WindowsSandboxError(
+      'backend_unsupported',
+      `windows.backend is 'mxc' but ${policyRefusals.join('; ')}`,
+    )
+  }
   let probe: MxcProbeOutput
   try {
     probe = sdk.probe(request)
@@ -284,15 +313,8 @@ export function assertMxcCanEnforce(
  *
  * @throws {WindowsSandboxError} `backend_unsupported`.
  */
-export function verifyMxcBackend(
-  sdk: MxcSdk,
-  request: MxcRequest,
-): Extract<WindowsBackendSelection, { backend: 'mxc' }> {
-  const probe = assertMxcCanEnforce(sdk, request)
-  return {
-    backend: 'mxc',
-    denyPathsSupported: probe.probes.baseContainerSupportsDenyPaths,
-  }
+export function verifyMxcBackend(sdk: MxcSdk, request: MxcRequest): void {
+  assertMxcCanEnforce(sdk, request)
 }
 
 /**
@@ -382,6 +404,8 @@ function quoteWindowsArg(arg: string): string {
  */
 export interface MxcSandboxParams {
   command: string
+  /** Attribution key for the proxy and violation store; see WrapWithSandboxOptions. */
+  commandId?: string
   /** Proxy port: the ONE loopback listener the child may reach. */
   httpProxyPort?: number
   socksProxyPort?: number
@@ -409,11 +433,19 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
   const temp = process.env.TEMP ?? process.env.TMP
   const sh = p.binShell ?? parseWindowsBinShell(undefined)
   const hasProxy = p.httpProxyPort !== undefined
+  // The proxy username carries the command's attribution key, as on
+  // srt-win, so per-command network lists and violations reach it.
+  const encodedCommand = encodeSandboxedCommand(
+    attributionKeyFor(p.command, p.commandId),
+  )
+  const proxyUser = proxyUsernameFor(encodedCommand)
   const proxyEnv = generateProxyEnvVars(
     p.httpProxyPort,
     p.socksProxyPort,
     undefined,
     p.proxyAuthToken,
+    undefined,
+    encodedCommand,
   )
 
   return {
@@ -437,7 +469,9 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
             ingress: { default: 'allow', hostLoopback: 'allow' },
             runtimeConfig: {
               networkProxy: `http://${
-                p.proxyAuthToken ? `srt:${p.proxyAuthToken}@` : ''
+                p.proxyAuthToken
+                  ? `${encodeURIComponent(proxyUser)}:${p.proxyAuthToken}@`
+                  : ''
               }127.0.0.1:${p.httpProxyPort}`,
             },
           }
@@ -535,15 +569,11 @@ function buildChildEnv(
     const v = process.env[k]
     if (v !== undefined) merged[k] = v
   }
-  for (const [k, v] of Object.entries(p.setEnvVars ?? {})) {
-    merged[k] = v
-  }
-  for (const e of envList) {
-    const eq = e.indexOf('=')
-    if (eq > 0) merged[e.slice(0, eq)] = e.slice(eq + 1)
-  }
-  for (const [k, v] of Object.entries(gitCfg)) {
-    merged[k] = v
+  const layers = [p.setEnvVars ?? {}, envListToObject(envList), gitCfg]
+  for (const layer of layers) {
+    for (const [k, v] of Object.entries(layer)) {
+      if (v !== undefined) merged[k] = v
+    }
   }
   return merged
 }
