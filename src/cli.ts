@@ -11,6 +11,7 @@ import * as readline from 'readline'
 import * as fs from 'fs'
 import * as net from 'net'
 import * as path from 'path'
+import { finished } from 'stream/promises'
 import * as os from 'os'
 
 /**
@@ -636,15 +637,32 @@ async function main(): Promise<void> {
               stdin.on('error', () => {})
               process.stdin.pipe(stdin)
             }
-            proc.wait().then(
-              ({ exitCode }) => onCommandExit(exitCode, killedBy),
-              (error: unknown) => {
+            // Exit only once the command's output has been read to the
+            // end and written out: a pipe on Windows is asynchronous,
+            // and process.exit() would drop what is still queued.
+            const drained = Promise.all(
+              [proc.stdout, proc.stderr].map(s =>
+                s ? finished(s).catch(() => {}) : Promise.resolve(),
+              ),
+            )
+            const flushed = (out: NodeJS.WriteStream): Promise<void> =>
+              new Promise(resolve => out.write('', () => resolve()))
+            proc
+              .wait()
+              .then(async ({ exitCode }) => {
+                await drained
+                await Promise.all([
+                  flushed(process.stdout),
+                  flushed(process.stderr),
+                ])
+                onCommandExit(exitCode, killedBy)
+              })
+              .catch((error: unknown) => {
                 console.error(
                   `Failed to execute command: ${error instanceof Error ? error.message : String(error)}`,
                 )
                 process.exit(1)
-              },
-            )
+              })
           } else if (process.platform === 'win32') {
             // env carries the proxy vars the sandboxed child must inherit.
             const { argv, env } =
