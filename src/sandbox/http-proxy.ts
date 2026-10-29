@@ -1277,7 +1277,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
 
       const failUpstream = (err: Error) => {
-        logForDebugging(`Proxy request failed: ${err.message}`, {
+        logForDebugging(`Proxy request failed: ${describeError(err)}`, {
           level: 'error',
         })
         respondUpstreamError(res, err, options.denyHeader)
@@ -1303,9 +1303,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
             const outHeaders = stripHopByHop(proxyRes.headers)
@@ -1338,9 +1341,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
             const outHeaders = stripHopByHop(proxyRes.headers)
@@ -1383,9 +1389,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
             const outHeaders = stripHopByHop(proxyRes.headers)
