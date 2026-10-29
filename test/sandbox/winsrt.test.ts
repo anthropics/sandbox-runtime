@@ -1903,7 +1903,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
           ...base.network,
           tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
         },
-        windows: { ...base.windows, backend: 'mxc', mxc: { path: token } },
+        windows: { ...base.windows, backend: 'mxc' },
       }),
     ).rejects.toMatchObject({
       code: 'backend_unsupported',
@@ -1911,46 +1911,30 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     })
   })
 
-  it('refuses the mxc backend without a runner, with no fallback', async () => {
+  it('refuses the mxc backend off a BaseContainer host, with no fallback', async () => {
+    // Here the SDK is either not installed (it needs Node 24) or its
+    // probe refuses a non-Windows host: both must refuse, not fall
+    // back to srt-win.
     const base = configOf({})
     // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(
       SandboxManager.initialize({
         ...base,
-        windows: {
-          ...base.windows,
-          backend: 'mxc',
-          mxc: { path: join(d, 'no-such-runner.exe') },
-        },
+        windows: { ...base.windows, backend: 'mxc' },
       }),
     ).rejects.toMatchObject({
       code: 'backend_unsupported',
-      message: expect.stringContaining('does not exist'),
+      message: expect.stringContaining("windows.backend is 'mxc'"),
     })
     expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
   })
 
-  it('refuses the mxc backend when the probe does not answer', async () => {
-    const base = configOf({})
+  it('wrapWithSandboxArgv and spawnSandboxed name the other entry point', async () => {
+    await SandboxManager.initialize(configOf({}))
     // eslint-disable-next-line @typescript-eslint/await-thenable
-    await expect(
-      SandboxManager.initialize({
-        ...base,
-        windows: { ...base.windows, backend: 'mxc', mxc: { path: token } },
-      }),
-    ).rejects.toMatchObject({
-      code: 'backend_unsupported',
-      message: expect.stringContaining('--probe failed'),
-    })
-  })
-
-  it('srt-win ignores a configured mxc runner', async () => {
-    const base = configOf({})
-    await SandboxManager.initialize({
-      ...base,
-      windows: { ...base.windows, mxc: { path: token } },
-    })
-    expect(SandboxManager.getWindowsBackend?.()).toEqual({ backend: 'srt-win' })
+    await expect(SandboxManager.spawnSandboxed?.('echo x')).rejects.toThrow(
+      /wrapWithSandboxArgv/,
+    )
   })
 })
 

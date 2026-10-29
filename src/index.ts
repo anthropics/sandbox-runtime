@@ -134,18 +134,13 @@ export type {
   SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
 
-// Windows MXC BaseContainer backend, named by `windows.backend`.
-export {
-  getWxcExecPath,
-  resolveMxc,
-  probeMxc,
-  verifyMxcBackend,
-} from './sandbox/mxc-sandbox-utils.js'
+// Windows MXC BaseContainer backend, named by `windows.backend`:
+// commands start through SandboxManager.spawnSandboxed().
+export type { WindowsBackendSelection } from './sandbox/mxc-sandbox-utils.js'
 export type {
-  MxcSpawn,
-  MxcProbeResult,
-  WindowsBackendSelection,
-} from './sandbox/mxc-sandbox-utils.js'
+  SandboxedProcess,
+  SpawnSandboxedOptions,
+} from './sandbox/sandbox-manager.js'
 
 // TLS-termination CA generation/validation (mitm-ca.ts). Embedders that
 // manage CA persistence themselves (rather than relying on the Windows
@@ -159,13 +154,11 @@ export type { GeneratedCa, CaPairValidation } from './sandbox/mitm-ca.js'
 export type {
   WindowsConfig,
   SrtWinConfig,
-  MxcConfig,
   GitConfig,
 } from './sandbox/sandbox-config.js'
 export {
   WindowsConfigSchema,
   SrtWinConfigSchema,
-  MxcConfigSchema,
   GitConfigSchema,
 } from './sandbox/sandbox-config.js'
 

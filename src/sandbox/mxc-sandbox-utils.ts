@@ -3,307 +3,313 @@
  * `windows.backend: 'mxc'`.
  *
  * On hosts whose Windows build supports MXC's **BaseContainer** tier,
- * sandboxed execs run through Microsoft's `wxc-exec.exe`: the OS
- * applies filesystem and network policy in its own elevated context,
- * with no install step, no UAC, no ACL stamping, and policy lifetime
- * bound to the container. MXC's AppContainer tiers are deliberately
- * never used: srt-win's WFP fence is mandatory and fail-closed, where
- * MXC's AppContainer network enforcement is cooperative (WinHTTP-stack
- * proxying, env-var steering) and proceeds unfenced when firewall-rule
- * writes fail without admin.
+ * sandboxed commands start through the `@microsoft/mxc-sdk` Node API,
+ * in this process: the OS applies filesystem and network policy in its
+ * own elevated context, with no install step, no UAC, no ACL stamping,
+ * and policy lifetime bound to the container. MXC's AppContainer tiers
+ * are never used: srt-win's WFP fence is mandatory and fail-closed,
+ * where MXC's AppContainer network enforcement is cooperative.
+ *
+ * The SDK starts the process itself, so this backend has no argv form:
+ * callers use `SandboxManager.spawnSandboxed()`, and
+ * `wrapWithSandboxArgv()` refuses.
  *
  * `network.tlsTerminate` is not supported here: Schannel clients in a
  * BaseContainer do not trust the MITM CA.
  *
- * ── Verification (see {@link verifyMxcBackend}) ─────────────────────
+ * ── Fail closed ──────────────────────────────────────────────────────
  *
- * `wxc-exec --probe --config-base64 <b64>` runs MXC's own fallback
- * detector against OUR actual policy and reports the tier it would
- * dispatch (`"base-container"` / `"appcontainer-dacl"` / …). Checking
- * that answer is skew-free: the same code that will pick the tier at
- * exec time picks it here, with denies, WRITE_DAC, and the
- * deny-capability bit all accounted for. Anything other than a clean
- * `"base-container"` answer — SDK not installed, binary missing, probe
- * error, any other tier — is an error. Nothing falls back to srt-win;
- * the caller decides what to try next.
+ * Every spawn first runs the SDK's request-aware `probe()` on the exact
+ * request it is about to start. The probe runs MXC's own tier detector,
+ * the same code that picks the tier at spawn time. Anything other than
+ * a clean `base-container` answer that supports every restriction in
+ * the request (denied paths, the host proxy, clipboard and input
+ * injection blocking) refuses the spawn. Nothing retries with a weaker
+ * request and nothing falls back to srt-win.
  *
- * Residual risk: tier selection re-runs inside `wxc-exec` at exec
- * time, and if the machine state changed since the probe (feature
- * disabled, deny-cap lost) MXC silently falls back to ITS AppContainer
- * tier rather than failing. Their §2.1 "never silently downgrade"
- * contract suggests a fail-loud flag may come; until then the probe
- * and exec are seconds apart in practice.
+ * Residual risk: tier selection runs again inside `spawn()`. If the
+ * machine changed between the two calls, MXC could pick an AppContainer
+ * tier rather than fail. The calls are milliseconds apart.
  *
- * ── Policy mapping (same config, same semantics) ────────────────────
+ * ── Policy mapping ───────────────────────────────────────────────────
  *
  * srt's cross-platform contract: writes are an ALLOW-list
  * (`filesystem.allowWrite`), reads are a DENY-list
  * (`filesystem.denyRead`, readable everywhere else). BaseContainer is
  * default-deny in both directions, so:
  *
- *   - reads:  `readonlyPaths: [<system drive root>, ...allowRead]`
+ *   - reads:  `readonlyPaths: [<system drive root>, cwd, ...allowRead]`
  *     restores read-everywhere, then `deniedPaths: denyRead ∪
- *     credential-file denies` carves the deny-list out (requires the
- *     `SANDBOX_CAP_FS_DENY` bit — the probe accounts for it).
- *     MULTI-DRIVE CAVEAT: only the system drive is granted; secondary
- *     fixed drives are unreadable under this mapping until verified
- *     on hardware.
+ *     credential-file denies` carves the deny-list out.
+ *     Only the system drive is granted: other fixed drives are
+ *     unreadable unless listed in allowRead.
  *   - writes: `readwritePaths: [...allowWrite, %TEMP%]`. %TEMP% is
- *     granted for parity with macOS/Linux (TMPDIR is always writable)
- *     and with srt-win (the sandbox user's own profile temp).
- *     cwd is NOT auto-granted — same as every other platform.
- *   - denyWrite: mapped into `deniedPaths` too, which OVER-denies
- *     (BaseContainer has no write-only deny primitive, so reads on
- *     those paths are lost as well). Fail-closed direction; refine
- *     after hardware verification.
+ *     granted for parity with macOS/Linux (TMPDIR is always writable).
+ *     cwd is NOT auto-granted, as on every other platform.
+ *   - denyWrite: mapped into `deniedPaths` too, which over-denies
+ *     (BaseContainer has no write-only deny, so reads on those paths
+ *     are lost as well).
  *   - network: `egress.default: 'deny'`; with a proxy configured,
- *     `ingress.default: 'allow'` + `ingress.hostLoopback: 'allow'`
- *     and `runtimeConfig.networkProxy` naming the mux port as the
- *     sole escape — MXC 1.0's identity-less host-proxy posture (no
- *     `processContainer.network.allowedProxyPeer`). hostLoopback is
- *     resolved on its own in 1.0 (it no longer inherits from
- *     `ingress.default`), so every branch sets it explicitly. srt's
+ *     `ingress.default: 'allow'` + `ingress.hostLoopback: 'allow'` and
+ *     `runtimeConfig.networkProxy` naming the proxy port as the only
+ *     way out (MXC 1.0's host proxy without a peer identity). srt's
  *     proxy does the domain filtering exactly as on macOS/Linux.
- *     OPEN (manual test #1): whether the OS-applied policy lets the
- *     child reach our plain host-process listener is unverified.
- *
- * ── Spawn contract ──────────────────────────────────────────────────
- *
- * Same as srt-win: {@link wrapCommandWithSandboxMxc} returns
- * `{argv, env}` for the CALLER to spawn with `shell: false`. The argv
- * is `wxc-exec.exe --config-base64 <base64(OneShotRequest JSON)>` —
- * srt compiles the exact MXC 1.0.0 one-shot request itself
- * ({@link buildMxcContainerConfig}); the SDK package is only the
- * vehicle that ships the signed runner (its 1.x Node API builds and
- * runs requests in-process and has no compile-only entry point).
- * MXC takes ONE `process.commandLine` string that wxc-exec
- * re-parses MSVCRT-style, so {@link joinWindowsCommandLine} re-encodes
- * srt's discrete argv with the standard CreateProcess quoting
- * algorithm.
+ *   - UI: on for every command (see {@link buildMxcRequest}), with
+ *     clipboard and input injection blocked.
  */
 
-import { randomBytes } from 'node:crypto'
 import { createRequire } from 'node:module'
 import * as path from 'node:path'
-import { existsSync } from 'node:fs'
-import { spawnSync } from 'node:child_process'
+import type { Readable, Writable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 import { generateProxyEnvVars, buildGitConfigEnv } from './sandbox-utils.js'
 import {
   parseWindowsBinShell,
-  envListToObject,
   WindowsSandboxError,
 } from './windows-sandbox-utils.js'
 import type { WindowsBinShell } from './windows-sandbox-utils.js'
-import type { MxcConfig } from './sandbox-config.js'
-
-// ────────────────────────────────────────────────────────────────────────
-// Exact MXC 1.0.0 one-shot request — the subset srt emits.
-//
-// `@microsoft/mxc-sdk` 1.x has no compile-only `buildSandboxPayload`:
-// its `@microsoft/mxc-sdk/v1` API builds the request and runs it
-// in-process. srt spawns `wxc-exec.exe` itself (the child env must be
-// sealed, see `buildChildEnv`), so it emits the wire request directly.
-// These interfaces mirror the SDK's generated
-// `sdk/node/src/generated/v1_0_0/wire.ts` (`OneShotRequest`) and the
-// shape its `prepareOneShotRequest` sends for `containment: 'process'`;
-// keep them in step with the pinned SDK major.
-// ────────────────────────────────────────────────────────────────────────
-
-/** MXC config schema version srt targets. See SDK Compatibility table. */
-export const MXC_POLICY_VERSION = '1.0.0'
-
-/** Directional network policy (MXC 1.0: both axes deny when omitted). */
-export interface MxcNetworkPolicy {
-  egress?: { default?: 'allow' | 'deny' }
-  ingress?: {
-    default?: 'allow' | 'deny'
-    /** Resolved independently of `default` in 1.0 — always set it. */
-    hostLoopback?: 'allow' | 'deny'
-  }
-}
-
-/**
- * Mirrors the slice of the MXC 1.0.0 `OneShotRequest` srt emits. The
- * wire contract carries more (processContainer, wslc, telemetry, …)
- * that srt never sets.
- */
-export interface MxcContainerConfig {
-  version: string
-  containerId?: string
-  containment?: 'process'
-  lifecycle?: { destroyOnExit?: boolean; preservePolicy?: boolean }
-  process: {
-    commandLine: string
-    cwd?: string
-    env?: string[]
-    /** Milliseconds; 0 = no timeout. */
-    timeout?: number
-  }
-  filesystem?: {
-    readwritePaths?: string[]
-    readonlyPaths?: string[]
-    deniedPaths?: string[]
-  }
-  network?: MxcNetworkPolicy
-  runtimeConfig?: { networkProxy?: string }
-  ui?: {
-    disable?: boolean
-    clipboard?: 'none' | 'read' | 'write' | 'all'
-    injection?: boolean
-  }
-}
 
 const MXC_PKG = '@microsoft/mxc-sdk'
+const MXC_V1 = `${MXC_PKG}/v1`
 
 // ────────────────────────────────────────────────────────────────────────
-// Binary resolution
+// The SDK surface srt uses. `@microsoft/mxc-sdk` is an optional
+// dependency that only installs on Node 24+, so srt cannot compile
+// against its types; these mirror the subset of `@microsoft/mxc-sdk/v1`
+// (`ContainerRequest`, `ProbeOutput`, `MxcProcess`) srt reads and
+// writes. Keep them in step with the pinned SDK major.
 // ────────────────────────────────────────────────────────────────────────
 
-/** Resolved `wxc-exec.exe` spawn descriptor (parallel to `SrtWinSpawn`). */
-export type MxcSpawn = Readonly<{ exe: string }>
-
-/**
- * SDK bin-directory arch tag. Mirrors the SDK's `getSdkArch()`
- * (`x64` | `arm64`), which keys the `bin/<arch>/` layout the package
- * publishes for both architectures.
- */
-function mxcArch(): 'x64' | 'arm64' {
-  return process.arch === 'arm64' ? 'arm64' : 'x64'
+/** Mirrors the subset of the SDK's v1 `ContainerRequest` srt sends. */
+export interface MxcRequest {
+  /** One command line, handed to the OS verbatim. */
+  command: string
+  filesystem: {
+    readwritePaths: string[]
+    readonlyPaths: string[]
+    deniedPaths: string[]
+  }
+  network: {
+    egress: { default: 'deny' }
+    ingress: { default: 'allow' | 'deny'; hostLoopback: 'allow' | 'deny' }
+    runtimeConfig?: { networkProxy: string }
+  }
+  ui: {
+    disable: boolean
+    clipboard: 'none'
+    allowInputInjection: false
+  }
+  /** Milliseconds; omitted = no timeout. */
+  timeoutMs?: number
+  workingDirectory: string
+  environment: Record<string, string>
+  /** Always false: the child gets exactly `environment`. */
+  inheritDefaultEnvironment: false
 }
 
-/**
- * Locate the packaged `wxc-exec.exe`, in the SDK's own precedence
- * order so behaviour matches its `findWxcExecutable()`:
- *   1. `MXC_BIN_DIR/<arch>/wxc-exec.exe` (env override)
- *   2. `<@microsoft/mxc-sdk root>/bin/<arch>/wxc-exec.exe`
- *
- * Returns undefined when neither resolves — for the selection layer,
- * "no runner" simply means srt-win. The package root is resolved via
- * its exported `./package.json` subpath (the only non-`.` entry in
- * the SDK's exports map), so this survives node_modules hoisting and
- * npm/bun layout differences.
- */
-export function getWxcExecPath(): string | undefined {
-  const candidates: string[] = []
-  if (process.env.MXC_BIN_DIR) {
-    candidates.push(
-      path.join(process.env.MXC_BIN_DIR, mxcArch(), 'wxc-exec.exe'),
-    )
-  }
-  try {
-    const require = createRequire(import.meta.url)
-    const pkgJson = require.resolve(`${MXC_PKG}/package.json`)
-    candidates.push(
-      path.join(path.dirname(pkgJson), 'bin', mxcArch(), 'wxc-exec.exe'),
-    )
-  } catch {
-    // Package not installed — selection falls back to srt-win.
-  }
-  return candidates.find(p => existsSync(p))
+/** Mirrors the SDK's `UiCapabilitySupport` fields srt checks. */
+export interface MxcUiCapabilities {
+  canBlockClipboardRead: boolean
+  canBlockClipboardWrite: boolean
+  canBlockInputInjection: boolean
 }
 
-/**
- * Resolve the MXC runner from config. Returns undefined (→ srt-win)
- * when nothing resolves; an explicitly configured `windows.mxc.path`
- * that does not exist is undefined too — selection logs the reason.
- */
-export function resolveMxc(cfg?: MxcConfig): MxcSpawn | undefined {
-  if (cfg?.path) {
-    return existsSync(cfg.path) ? { exe: cfg.path } : undefined
-  }
-  const exe = getWxcExecPath()
-  return exe ? { exe } : undefined
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// Probe & selection
-// ────────────────────────────────────────────────────────────────────────
-
-/** Parsed subset of `wxc-exec --probe` JSON output (probe.rs). */
-export interface MxcProbeResult {
-  /** Tier the detector would dispatch: 'base-container' | 'appcontainer-bfs' | 'appcontainer-dacl'. */
+/** Mirrors the SDK's `ProbeOutput` fields srt checks. */
+export interface MxcProbeOutput {
   tier?: string
-  /** Detector error (tier absent when set). */
+  needsDaclAugmentation?: boolean
+  warnings: readonly string[]
   error?: string
-  /** Raw machine facts. */
-  probes?: {
-    baseContainerApiPresent?: boolean
-    baseContainerSupportsDenyPaths?: boolean
+  probes: {
+    baseContainerSupportsDenyPaths: boolean
+    baseContainerSupportsIngressHostLoopbackAllow: boolean
+    baseContainerSupportsIdentitylessLoopbackProxy: boolean
+    uiCapabilities: MxcUiCapabilities
   }
 }
 
-/**
- * Run `wxc-exec --probe [--config-base64 <b64>]` and parse its JSON.
- * Read-only and side-effect-free by MXC's contract (probe.rs: "does
- * not write logs, modify the filesystem, or spawn child processes").
- * Passing the session's real config makes the tier answer account for
- * denies + the deny-capability bit. Returns undefined on any spawn or
- * parse failure — the caller treats that as "not base-container".
- */
-export function probeMxc(
-  spawn: MxcSpawn,
-  configBase64?: string,
-): MxcProbeResult | undefined {
-  const args = ['--probe']
-  if (configBase64 !== undefined) args.push('--config-base64', configBase64)
-  const r = spawnSync(spawn.exe, args, { encoding: 'utf8', timeout: 15_000 })
-  if (r.error || r.status !== 0 || !r.stdout) return undefined
+/** Mirrors the SDK's `MxcProcess` members srt uses. */
+export interface MxcProcessHandle {
+  readonly id: number
+  readonly standardInput: Writable | null
+  readonly standardOutput: Readable | null
+  readonly standardError: Readable | null
+  wait(): Promise<{ exitCode: number; timedOut: boolean }>
+  kill(): void
+  dispose(): void
+}
+
+/** The two SDK entry points srt calls. */
+export interface MxcSdk {
+  probe(request: MxcRequest): MxcProbeOutput
+  spawn(request: MxcRequest): Promise<MxcProcessHandle>
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Loading the SDK
+// ────────────────────────────────────────────────────────────────────────
+
+/** Whether `@microsoft/mxc-sdk` resolves from here, without loading it. */
+export function isMxcSdkInstalled(): boolean {
   try {
-    return JSON.parse(r.stdout) as MxcProbeResult
+    createRequire(import.meta.url).resolve(`${MXC_PKG}/package.json`)
+    return true
   } catch {
-    return undefined
+    return false
   }
 }
+
+/** Why `windows.backend: 'mxc'` cannot load the SDK. */
+export const MXC_SDK_MISSING = `${MXC_PKG} is not installed (it needs Node 24 or later)`
+
+/**
+ * Load `@microsoft/mxc-sdk/v1`.
+ *
+ * @throws {WindowsSandboxError} `backend_unsupported` when the package
+ * is missing or does not export `probe` and `spawn`.
+ */
+export async function loadMxcSdk(): Promise<MxcSdk> {
+  let mod: unknown
+  try {
+    // A variable specifier keeps bundlers and tsc from resolving an
+    // optional dependency that is usually absent.
+    const specifier: string = MXC_V1
+    mod = await import(specifier)
+  } catch (e) {
+    throw new WindowsSandboxError(
+      'backend_unsupported',
+      `windows.backend is 'mxc' but ${MXC_SDK_MISSING}: ${(e as Error).message}`,
+    )
+  }
+  const sdk = mod as Partial<MxcSdk> | null
+  if (typeof sdk?.probe !== 'function' || typeof sdk.spawn !== 'function') {
+    throw new WindowsSandboxError(
+      'backend_unsupported',
+      `windows.backend is 'mxc' but ${MXC_V1} does not export probe() and spawn()`,
+    )
+  }
+  return { probe: sdk.probe, spawn: sdk.spawn }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Probe & spawn
+// ────────────────────────────────────────────────────────────────────────
 
 export type WindowsBackendSelection =
   | Readonly<{ backend: 'srt-win' }>
   | Readonly<{
       backend: 'mxc'
-      mxc: MxcSpawn
-      /** `SANDBOX_CAP_FS_DENY` bit at selection — gates per-exec denies. */
+      /** Whether the host can enforce per-command denied paths. */
       denyPathsSupported: boolean
     }>
 
-/** Why `windows.backend: 'mxc'` has no runner to use. */
-export function mxcUnavailableReason(cfg: MxcConfig | undefined): string {
-  return cfg?.path
-    ? `windows.mxc.path does not exist: ${cfg.path}`
-    : `${MXC_PKG} not installed (wxc-exec.exe not found)`
+/**
+ * Every reason the probe's answer cannot enforce `request` exactly.
+ * Empty means the request is safe to spawn.
+ */
+export function mxcProbeRefusals(
+  request: MxcRequest,
+  probe: MxcProbeOutput,
+): string[] {
+  if (probe.error !== undefined) return [`the probe failed: ${probe.error}`]
+  const reasons: string[] = []
+  if (probe.tier !== 'base-container') {
+    reasons.push(
+      `this host offers MXC tier '${probe.tier ?? 'none'}'; BaseContainer is required`,
+    )
+  }
+  if (probe.needsDaclAugmentation === true) {
+    reasons.push('the tier needs host ACL changes (DACL augmentation)')
+  }
+  const facts = probe.probes
+  if (
+    request.filesystem.deniedPaths.length > 0 &&
+    !facts.baseContainerSupportsDenyPaths
+  ) {
+    reasons.push('BaseContainer cannot enforce denied paths on this host')
+  }
+  if (request.network.runtimeConfig !== undefined) {
+    if (!facts.baseContainerSupportsIdentitylessLoopbackProxy) {
+      reasons.push('BaseContainer cannot confine egress to the host proxy')
+    }
+    if (!facts.baseContainerSupportsIngressHostLoopbackAllow) {
+      reasons.push('BaseContainer cannot allow host loopback for the proxy')
+    }
+  }
+  const ui = facts.uiCapabilities
+  if (!ui.canBlockClipboardRead || !ui.canBlockClipboardWrite) {
+    reasons.push('this host cannot block clipboard access')
+  }
+  if (!ui.canBlockInputInjection) {
+    reasons.push('this host cannot block input injection')
+  }
+  return reasons
 }
 
 /**
- * Check that the host can run this session on MXC BaseContainer, given
- * the resolved runner and the session policy compiled to a Container
- * config (see {@link buildMxcContainerConfig} + {@link encodeMxcConfig}).
- * Called once from `SandboxManager.initialize()`; the answer is held
- * for the session.
+ * Probe `request`, refusing anything {@link mxcProbeRefusals} reports.
  *
- * @throws {WindowsSandboxError} `backend_unsupported` on every failure
- * or ambiguity.
+ * @throws {WindowsSandboxError} `backend_unsupported`.
+ */
+export function assertMxcCanEnforce(
+  sdk: MxcSdk,
+  request: MxcRequest,
+): MxcProbeOutput {
+  let probe: MxcProbeOutput
+  try {
+    probe = sdk.probe(request)
+  } catch (e) {
+    throw new WindowsSandboxError(
+      'backend_unsupported',
+      `windows.backend is 'mxc' but the probe failed: ${(e as Error).message}`,
+    )
+  }
+  const reasons = mxcProbeRefusals(request, probe)
+  if (reasons.length > 0) {
+    throw new WindowsSandboxError(
+      'backend_unsupported',
+      `windows.backend is 'mxc' but ${reasons.join('; ')}`,
+    )
+  }
+  for (const warning of probe.warnings) {
+    logForDebugging(`[Sandbox Windows] mxc probe: ${warning}`)
+  }
+  return probe
+}
+
+/**
+ * Check, once at `initialize()`, that this host can run the session's
+ * policy on BaseContainer. `request` is the session policy compiled by
+ * {@link buildMxcRequest}.
+ *
+ * @throws {WindowsSandboxError} `backend_unsupported`.
  */
 export function verifyMxcBackend(
-  spawn: MxcSpawn,
-  probeConfigBase64: string,
+  sdk: MxcSdk,
+  request: MxcRequest,
 ): Extract<WindowsBackendSelection, { backend: 'mxc' }> {
-  const unsupported = (reason: string): WindowsSandboxError =>
-    new WindowsSandboxError(
-      'backend_unsupported',
-      `windows.backend is 'mxc' but ${reason}`,
-    )
-  const probe = probeMxc(spawn, probeConfigBase64)
-  if (!probe) throw unsupported('wxc-exec --probe failed or emitted no JSON')
-  if (probe.error) throw unsupported(`the probe failed: ${probe.error}`)
-  if (probe.tier !== 'base-container') {
-    throw unsupported(
-      `this host supports mxc tier '${probe.tier}' only; BaseContainer is required`,
-    )
-  }
+  const probe = assertMxcCanEnforce(sdk, request)
   return {
     backend: 'mxc',
-    mxc: spawn,
-    denyPathsSupported: probe.probes?.baseContainerSupportsDenyPaths === true,
+    denyPathsSupported: probe.probes.baseContainerSupportsDenyPaths,
   }
+}
+
+/**
+ * Start `request` after {@link assertMxcCanEnforce} accepts it. The
+ * probe runs on every spawn, so a command whose per-command policy the
+ * host cannot enforce never starts.
+ */
+export async function spawnMxcRequest(
+  sdk: MxcSdk,
+  request: MxcRequest,
+): Promise<MxcProcessHandle> {
+  assertMxcCanEnforce(sdk, request)
+  logForDebugging(
+    `[Sandbox Windows] mxc spawn: ${request.filesystem.readwritePaths.length} write, ` +
+      `${request.filesystem.deniedPaths.length} denied paths`,
+  )
+  return sdk.spawn(request)
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -320,19 +326,14 @@ export function joinWindowsCommandLine(argv: readonly string[]): string {
 }
 
 /**
- * Build the ONE `process.commandLine` string wxc-exec hands VERBATIM
- * to the OS as `lpCommandLine` (base_container_runner.rs passes it
- * with `applicationName = NULL` — no re-parse, no re-quote). The
- * string must therefore be exactly what the CHILD parses:
+ * Build the ONE command line MXC hands verbatim to the OS as
+ * `lpCommandLine`. The string must therefore be exactly what the
+ * CHILD parses:
  *
  *   - cmd.exe does NOT use MSVCRT escaping: the payload after `/c`
  *     gets ONE outer quote pair for `/s` to strip, contents verbatim
- *     (quotes and metachars untouched — they are the user's tool
- *     inside the sandbox). This mirrors srt-win's `build_cmdline`
- *     (launch.rs), including the reverted `"` → `""` mistake noted
- *     there: MSVCRT-escaping the payload turns embedded quotes into
- *     literal backslashes under cmd's parser and inverts quote state
- *     around `&`/`|`.
+ *     (quotes and metachars untouched: they are the user's tool
+ *     inside the sandbox). This mirrors srt-win's `build_cmdline`.
  *   - pwsh/powershell/bash are CRT programs that argv-parse their
  *     command line MSVCRT-style, so the payload is a regular quoted
  *     argv element.
@@ -371,160 +372,146 @@ function quoteWindowsArg(arg: string): string {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Policy → ContainerConfig
+// Policy → request
 // ────────────────────────────────────────────────────────────────────────
 
 /**
- * Inputs to {@link wrapCommandWithSandboxMxc} — the same information
- * the srt-win wrap receives, expressed in srt's own semantics. The
- * mapping to MXC's allow-list model happens inside.
+ * Inputs to {@link buildMxcRequest}: the same information the srt-win
+ * wrap receives, in srt's own semantics. The mapping to MXC's
+ * allow-list model happens inside.
  */
 export interface MxcSandboxParams {
   command: string
-  /** Mux front-end port — the ONE loopback proxy the child may reach. */
+  /** Proxy port: the ONE loopback listener the child may reach. */
   httpProxyPort?: number
   socksProxyPort?: number
   proxyAuthToken?: string
-  /** `mode:'mask'` sentinels; the MXC child gets NO inherited env. */
+  /** `mode:'mask'` sentinels; the child inherits no other env. */
   setEnvVars?: Readonly<Record<string, string>>
   /** srt read deny-list (expanded, concrete paths). */
   denyRead?: readonly string[]
-  /** srt write deny-list (expanded) — over-denied to full deny, see header. */
+  /** srt write deny-list (expanded): over-denied to full deny. */
   denyWrite?: readonly string[]
-  /** srt read allow-list — additive on top of the system-drive grant. */
+  /** srt read allow-list, on top of the system-drive grant. */
   allowRead?: readonly string[]
   /** srt write allow-list (expanded). */
   allowWrite?: readonly string[]
   cwd?: string
   gitSafeDirectories?: readonly string[]
   binShell?: WindowsBinShell
-  /** Resolved runner from selection. */
-  mxc: MxcSpawn
   timeoutMs?: number
 }
 
-/**
- * Compile srt semantics into an MXC 1.0.0 one-shot request. Separated
- * from the wrap so `initialize()` can compile the session policy once
- * for the `--probe` selection call. `proxyEnv` lets the wrap share one
- * `generateProxyEnvVars` result between the child env and the broker
- * spawn env; omitted (probe path) it is computed here.
- */
-export function buildMxcContainerConfig(
-  p: MxcSandboxParams,
-  proxyEnv?: readonly string[],
-): MxcContainerConfig {
+/** Compile srt semantics into an SDK v1 container request. */
+export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
   const systemDrive = `${process.env.SystemDrive ?? 'C:'}\\`
   const workingDirectory = p.cwd ?? process.cwd()
-  const readonlyPaths = [systemDrive, workingDirectory, ...(p.allowRead ?? [])]
   const temp = process.env.TEMP ?? process.env.TMP
-  const readwritePaths = [
-    ...(p.allowWrite ?? []),
-    ...(temp !== undefined ? [temp] : []),
-  ]
-  const deniedPaths = [...(p.denyRead ?? []), ...(p.denyWrite ?? [])]
-
   const sh = p.binShell ?? parseWindowsBinShell(undefined)
-  const commandLine = buildShellCommandLine(sh, p.command)
   const hasProxy = p.httpProxyPort !== undefined
+  const proxyEnv = generateProxyEnvVars(
+    p.httpProxyPort,
+    p.socksProxyPort,
+    undefined,
+    p.proxyAuthToken,
+  )
 
   return {
-    version: MXC_POLICY_VERSION,
-    // What the SDK's own adapter sends: a random id the runtime names
-    // the container after, and the one-shot lifecycle.
-    containerId: randomBytes(16).toString('hex'),
-    // 'process' is the ABSTRACT intent — wxc-exec resolves it per host
-    // (BaseContainer on the hosts selection admits).
-    containment: 'process',
-    lifecycle: { destroyOnExit: true, preservePolicy: false },
-    process: {
-      commandLine,
-      cwd: workingDirectory,
-      env: buildChildEnv(
-        p,
-        proxyEnv ??
-          generateProxyEnvVars(
-            p.httpProxyPort,
-            p.socksProxyPort,
-            undefined,
-            p.proxyAuthToken,
-          ),
-      ),
-      timeout: p.timeoutMs ?? 0,
+    command: buildShellCommandLine(sh, p.command),
+    filesystem: {
+      readonlyPaths: [systemDrive, workingDirectory, ...(p.allowRead ?? [])],
+      readwritePaths: [
+        ...(p.allowWrite ?? []),
+        ...(temp !== undefined ? [temp] : []),
+      ],
+      deniedPaths: [...(p.denyRead ?? []), ...(p.denyWrite ?? [])],
     },
-    filesystem: { readonlyPaths, readwritePaths, deniedPaths },
     network: {
       egress: { default: 'deny' },
-      // MXC 1.0 resolves hostLoopback on its own (no inheritance from
-      // ingress.default), and admits a host proxy that carries no
-      // allowedProxyPeer identity only with hostLoopback 'allow' plus
-      // ingress 'allow' for a ProcessContainer. Without a proxy both
-      // axes deny — stated, not left to the omitted-means-deny rule.
-      ingress: hasProxy
-        ? { default: 'allow', hostLoopback: 'allow' }
-        : { default: 'deny', hostLoopback: 'deny' },
+      // MXC 1.0 resolves hostLoopback on its own (it does not inherit
+      // ingress.default), and admits a host proxy without a peer
+      // identity only with hostLoopback 'allow' plus ingress 'allow'.
+      // Without a proxy both are denied explicitly.
+      ...(hasProxy
+        ? {
+            ingress: { default: 'allow', hostLoopback: 'allow' },
+            runtimeConfig: {
+              networkProxy: `http://${
+                p.proxyAuthToken ? `srt:${p.proxyAuthToken}@` : ''
+              }127.0.0.1:${p.httpProxyPort}`,
+            },
+          }
+        : { ingress: { default: 'deny', hostLoopback: 'deny' } }),
     },
-    ...(hasProxy
-      ? {
-          runtimeConfig: {
-            networkProxy: `http://${
-              p.proxyAuthToken ? `srt:${p.proxyAuthToken}@` : ''
-            }127.0.0.1:${p.httpProxyPort}`,
-          },
-        }
+    // UI stays on for every command. With it off, any program that loads
+    // user32 or gdi32 (PowerShell, git, node, whoami, tasklist and most
+    // other tools) fails at startup with 0xC0000142, and children
+    // inherit the container's setting, so it can't be chosen per shell.
+    // The cost: a sandboxed program can open a window on the desktop.
+    // Clipboard and input injection stay blocked.
+    ui: { disable: false, clipboard: 'none', allowInputInjection: false },
+    ...(p.timeoutMs !== undefined && p.timeoutMs > 0
+      ? { timeoutMs: p.timeoutMs }
       : {}),
-    // Shells need UI: upstream documents that PowerShell (5.1 and 7)
-    // fails at startup with UI disabled because of win32k calls.
-    // cmd.exe is fine either way. Clipboard and input injection stay
-    // denied, as the SDK adapter defaults them.
-    ui: {
-      disable: !isPowerShell(p.binShell),
-      clipboard: 'none',
-      injection: false,
-    },
+    workingDirectory,
+    environment: buildChildEnv(p, proxyEnv),
+    inheritDefaultEnvironment: false,
   }
 }
 
 /**
- * Base OS variables copied from the broker into the sealed child env.
- * `encode_env_block(request.env)` is the child's COMPLETE environment
- * (base_container_runner.rs — the OS default block is used only when
- * env is empty), so everything a Windows process needs to merely run
- * must be enumerated. srt-win never has this problem: its child gets
- * a fresh OS logon-profile block and only an overlay rides on top.
- * TEMP/TMP are the broker's values on purpose — the same path
- * `buildMxcContainerConfig` grants readwrite, so `%TEMP%` inside the
- * child both resolves and is writable.
+ * Host variables copied into the child's environment. The child gets
+ * exactly the environment srt builds (`inheritDefaultEnvironment` is
+ * off): the user's profile environment can hold secrets, so it is
+ * never layered underneath. This is the set ordinary Windows programs
+ * expect to find; MXC refuses to start a child without LOCALAPPDATA.
  */
 const CHILD_BASE_ENV_VARS = [
-  'SystemRoot',
-  'windir',
-  'SystemDrive',
+  'ALLUSERSPROFILE',
+  'APPDATA',
+  'CommonProgramFiles',
+  'CommonProgramFiles(Arm)',
+  'CommonProgramFiles(x86)',
+  'CommonProgramW6432',
+  'COMPUTERNAME',
   'ComSpec',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'LOCALAPPDATA',
+  'NUMBER_OF_PROCESSORS',
+  'OS',
   'PATH',
   'PATHEXT',
+  'PROCESSOR_ARCHITECTURE',
+  'PROCESSOR_IDENTIFIER',
+  'PROCESSOR_LEVEL',
+  'PROCESSOR_REVISION',
+  'ProgramData',
+  'ProgramFiles',
+  'ProgramFiles(Arm)',
+  'ProgramFiles(x86)',
+  'ProgramW6432',
+  'PUBLIC',
+  'SystemDrive',
+  'SystemRoot',
   'TEMP',
   'TMP',
-  'LOCALAPPDATA',
+  'USERDOMAIN',
+  'USERNAME',
   'USERPROFILE',
-  'NUMBER_OF_PROCESSORS',
-  'PROCESSOR_ARCHITECTURE',
+  'windir',
 ] as const
 
 /**
- * The child's sealed environment as KEY=VALUE strings. Precedence
- * matches srt-win: OS base vars, then mask sentinels, then the
- * generated proxy set (so a caller masking HTTPS_PROXY cannot break
- * the sandbox's own plumbing), then GIT_CONFIG_* last so its COUNT
- * composition wins. Merged through one object so precedence is
- * decided HERE, last-wins — wxc-exec's `encode_env_block` keeps
- * duplicate keys (split+sort, no dedupe), and which duplicate a
- * child's getenv would see is not a contract to lean on.
+ * The child's environment. Precedence matches srt-win: host base vars,
+ * then mask sentinels, then the generated proxy set (so a caller
+ * masking HTTPS_PROXY cannot break the sandbox's own plumbing), then
+ * GIT_CONFIG_* last so its COUNT composition wins.
  */
 function buildChildEnv(
   p: MxcSandboxParams,
   proxyEnv: readonly string[],
-): string[] {
+): Record<string, string> {
   // Same two deletions as srt-win, same reasons: TMPDIR is POSIX-only
   // and breaks msys2 tools; NO_PROXY would send localhost DIRECT into
   // the container's egress block (only the proxy port is reachable).
@@ -558,74 +545,5 @@ function buildChildEnv(
   for (const [k, v] of Object.entries(gitCfg)) {
     merged[k] = v
   }
-  return Object.entries(merged).map(([k, v]) => `${k}=${v}`)
-}
-
-/** Serialize the one-shot request for `--config-base64`. */
-export function encodeMxcConfig(cfg: MxcContainerConfig): string {
-  return Buffer.from(JSON.stringify(cfg), 'utf-8').toString('base64')
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// Wrap
-// ────────────────────────────────────────────────────────────────────────
-
-/**
- * Produce the `{argv, env}` to spawn under MXC BaseContainer. Same
- * contract as `wrapCommandWithSandboxWindows`: caller spawns `argv`
- * with `shell:false`.
- */
-export function wrapCommandWithSandboxMxc(p: MxcSandboxParams): {
-  argv: string[]
-  env: NodeJS.ProcessEnv
-} {
-  const proxyEnv = generateProxyEnvVars(
-    p.httpProxyPort,
-    p.socksProxyPort,
-    undefined,
-    p.proxyAuthToken,
-  )
-  const cfg = buildMxcContainerConfig(p, proxyEnv)
-  const argv = [p.mxc.exe]
-  if (process.env.SRT_DEBUG) {
-    argv.push('--debug')
-  }
-  argv.push('--config-base64', encodeMxcConfig(cfg))
-
-  // Same CreateProcessW 32 767-WCHAR ceiling as srt-win — here the
-  // whole policy (every path list) is inside ONE base64 argv element,
-  // so large path lists are the pressure point, not the user command.
-  // Base64 inflates by 4/3.
-  const cmdlineEstimate = argv.reduce((n, a) => n + a.length + 3, 0)
-  if (cmdlineEstimate > 30_000) {
-    throw new Error(
-      `MXC config is ~${cmdlineEstimate} chars on argv ` +
-        `(CreateProcessW limit is 32 767). The base64 policy carries ` +
-        `every path in the filesystem lists — trim allowRead/allowWrite/` +
-        `denyRead/denyWrite.`,
-    )
-  }
-
-  // Broker (wxc-exec) spawn env: our process env + the proxy set,
-  // same as srt-win. The CHILD's env is the sealed process.env list
-  // inside the config, not this.
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    ...envListToObject(proxyEnv),
-  }
-  logForDebugging(
-    `[Sandbox Windows] mxc wrap: ${argv[0]} (config ${cmdlineEstimate} chars)`,
-  )
-  return { argv, env }
-}
-
-function isPowerShell(sh?: WindowsBinShell): boolean {
-  if (!sh) return false
-  const base = path.win32.basename(sh.exe).toLowerCase()
-  return (
-    base === 'pwsh' ||
-    base === 'pwsh.exe' ||
-    base === 'powershell' ||
-    base === 'powershell.exe'
-  )
+  return merged
 }
