@@ -216,16 +216,24 @@ function denyPathFilter(entry: PathEntry): string {
 }
 
 /**
- * A concrete path shaped like the ones `entry` matches (every glob segment
- * replaced by a literal `x`), used to test whether a deny regex covers the
- * region an allow / write root points at. An anchored glob's anchor, and a
- * literal entry's whole path, are names on disk and stay as they are.
+ * A concrete path shaped like the ones `entry` matches, substituting `*`/`**`
+ * with `starFill` and `?`/`[...]` with `charFill`. Probing both `('x', 'x')`
+ * and `('Q7_', '9')` in {@link denyGlobCovers} ensures a narrower deny glob
+ * that happens to match `'x'` (such as `/dir/x*`, `/dir/[u-z]*`, or `/dir/?`)
+ * is not mistaken for universal coverage of an allow/writeRoot region.
  */
-function entrySamplePath(entry: PathEntry): string {
+function entrySamplePath(
+  entry: PathEntry,
+  starFill = 'x',
+  charFill = 'x',
+): string {
   if (!entry.glob) return entry.path
   const anchor = entry.anchor ?? ''
   return (
-    anchor + entry.path.slice(anchor.length).replace(/\[[^\]]*\]|[*?]+/g, 'x')
+    anchor +
+    entry.path
+      .slice(anchor.length)
+      .replace(/\[[^\]]*\]|\*+|\?/g, m => (m[0] === '*' ? starFill : charFill))
   )
 }
 
@@ -333,7 +341,10 @@ function callerEntries(
 
 /** Does a subtree-extended deny glob regex cover `entry`'s region? */
 function denyGlobCovers(denyRegex: RegExp, entry: PathEntry): boolean {
-  return denyRegex.test(entrySamplePath(entry))
+  return (
+    denyRegex.test(entrySamplePath(entry, 'x', 'x')) &&
+    denyRegex.test(entrySamplePath(entry, 'Q7_', '9'))
+  )
 }
 
 /** Is `entry`'s region strictly inside the literal directory `dir`? */
@@ -997,13 +1008,18 @@ function generateWriteRules(
 
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on
   // macOS). The caller's spellings are patterns when they read as patterns;
-  // the mandatory entries carry their own literal/glob split.
+  // the mandatory entries carry their own literal/glob split. Expand every
+  // literal deny through `inBothSpellings('deny', ...)` (matching
+  // `resolveReadConfig`) so an intra-workspace symlink to a protected file or
+  // directory also denies writes to its resolved realpath target.
   const denyEntries = [
-    ...(config.denyWithinAllow || []).map(toPathEntry),
-    ...(config.literalDenyWithinAllow ?? []).map(toLiteralPathEntry),
+    ...callerEntries(
+      'deny',
+      config.denyWithinAllow,
+      config.literalDenyWithinAllow,
+    ),
     ...macGetMandatoryDenyEntries(allowGitConfig),
-  ]
-  denyEntries.push(...alsoReadAs(config.denyWithinAllow, 'deny'))
+  ].flatMap(entry => inBothSpellings('deny', entry))
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)
   const groupFilters = groups.map(literalDenyGroupFilters)

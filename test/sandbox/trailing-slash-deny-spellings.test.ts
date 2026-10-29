@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
@@ -186,5 +187,65 @@ describe.if(!isWindows)(
       })
       expect(profile).toContain('/work/priv/pub/[^/]*/$')
     })
+
+    it('expands intra-workspace symlink denyWithinAllow entries to both spellings in file-write* rules', () => {
+      const base = realpathSync(mkdtempSync(join(tmpdir(), 'srt-write-sym-')))
+      try {
+        const realDir = join(base, 'real_config')
+        mkdirSync(realDir, { recursive: true })
+        const realMcp = join(realDir, 'mcp.json')
+        writeFileSync(realMcp, '{"mcpServers":{}}\n')
+
+        const linkMcp = join(base, 'linked_mcp.json')
+        symlinkSync(realMcp, linkMcp)
+
+        const profile = wrapCommandWithSandboxMacOS({
+          command: 'true',
+          needsNetworkRestriction: false,
+          readConfig: {
+            denyOnly: [linkMcp],
+          },
+          writeConfig: {
+            allowOnly: [base],
+            denyWithinAllow: [linkMcp],
+          },
+        })
+
+        const writeSection = profile.slice(profile.indexOf('; File write'))
+        expect(writeSection).toContain(`(subpath "${linkMcp}")`)
+        expect(writeSection).toContain(`(subpath "${realMcp}")`)
+      } finally {
+        rmSync(base, { recursive: true, force: true })
+      }
+    })
+
+    it.each([
+      ['/work/pub/x*', '^/work/pub/x[^/]*(/.*)?$'],
+      ['/work/pub/[u-z]*', '^/work/pub/[u-z][^/]*(/.*)?$'],
+      ['/work/pub/?', '^/work/pub/[^/](/.*)?$'],
+    ])(
+      'does not carve out a broader allowWithinDeny glob from a narrower denyOnly glob (%s)',
+      (narrowDenyGlob, expectedRegex) => {
+        const profile = wrapCommandWithSandboxMacOS({
+          command: 'true',
+          needsNetworkRestriction: false,
+          readConfig: {
+            denyOnly: ['/work', narrowDenyGlob],
+            allowWithinDeny: ['/work/pub/*'],
+          },
+          writeConfig: undefined,
+        })
+
+        expect(profile).not.toContain(
+          `(require-all (regex "${expectedRegex}") (require-not (regex "^/work/pub/[^/]*$")))`,
+        )
+        const allowIdx = profile.indexOf(
+          `(allow file-read*\n  (regex "^/work/pub/[^/]*$")`,
+        )
+        const narrowDenyIdx = profile.lastIndexOf(`(regex "${expectedRegex}")`)
+        expect(allowIdx).toBeGreaterThanOrEqual(0)
+        expect(narrowDenyIdx).toBeGreaterThan(allowIdx)
+      },
+    )
   },
 )
