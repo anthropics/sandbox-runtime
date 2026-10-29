@@ -70,6 +70,8 @@ import {
   stripHopByHop,
 } from './parent-proxy.js'
 
+// Fixed fields only: an error's message, cause and stack can carry whatever
+// the failing call held, such as a proxy URL with credentials in it.
 function describeError(error: unknown): string {
   if (error instanceof Error) {
     const details = error as Error & {
@@ -78,24 +80,20 @@ function describeError(error: unknown): string {
       syscall?: unknown
       address?: unknown
       port?: unknown
-      cause?: unknown
     }
     return inspect(
       {
         name: details.name,
-        message: details.message,
         code: details.code,
         errno: details.errno,
         syscall: details.syscall,
         address: details.address,
         port: details.port,
-        cause: details.cause,
-        stack: details.stack,
       },
-      { depth: 4, breakLength: Infinity },
+      { depth: 0, breakLength: Infinity },
     )
   }
-  return inspect(error, { depth: 4, breakLength: Infinity })
+  return typeof error
 }
 
 export interface HttpProxyServerOptions {
