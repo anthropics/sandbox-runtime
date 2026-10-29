@@ -992,15 +992,20 @@ const { exitCode, timedOut } = await proc.wait()
 proc.dispose()
 ```
 
-`kill()` ends the command and everything it started. Each call checks its own policy with MXC's probe first and throws `backend_unsupported` if the host cannot enforce all of it; nothing falls back to a weaker policy or to srt-win.
+`spawnSandboxed()` takes the same `commandId` and `commandText` as `wrapWithSandboxArgv()`'s options, so per-command network lists and violation attribution work as on the other backends. `kill()` ends the command and everything it started. Each call checks its own policy with MXC's probe first and throws `backend_unsupported` if the host cannot enforce all of it; nothing falls back to a weaker policy or to srt-win.
 
 What works: the network fence (only the proxy is reachable), reads everywhere on the system drive except the deny-list, writes only inside `allowWrite` and `%TEMP%`, per-command `allowRead`/`allowWrite`, credential masking of environment variables, and everyday tools such as cmd, PowerShell, git, node and whoami.
 
 Known limitations:
 
-- **Git Bash does not start**: `bash.exe` crashes with `0xC0000005` inside a BaseContainer.
+- **MSYS2 programs do not start**: anything built on the MSYS2 runtime (`msys-2.0.dll`) crashes at startup with `0xC0000005` inside a BaseContainer, and Windows writes no crash record for it. That covers Git Bash (`bash.exe`, `sh.exe`), the Unix tools in Git for Windows' `usr\bin`, and git hooks or aliases that run through `sh`. Native `git.exe` works. Use cmd or PowerShell as the shell with this backend.
 - **Sandboxed programs can open windows on the desktop.** UI is on for every command, because with it off any program that loads `user32` or `gdi32` (PowerShell, git, node and most other tools) fails at startup with `0xC0000142`. Clipboard access and input injection stay blocked.
-- **No `network.tlsTerminate`**: `initialize()` refuses it, so credential masking of request headers is unavailable.
+- **Settings refused under mxc**, with `backend_unsupported`, because MXC cannot express them with the meaning they have elsewhere:
+  - `network.tlsTerminate`, so credential masking of request headers is unavailable.
+  - `filesystem.disabled` at the session level: MXC is allow-list in both directions, and the nearest request would restrict rather than lift restrictions. (Per command it keeps the session's policy, as on srt-win.)
+  - `network.allowLocalBinding: true`, at the session level or per command.
+  - An `allowRead`, `allowWrite`, the working directory or `%TEMP%` beneath a denied path: srt ranks such a grant above the deny, and MXC documents no way to do that.
+- **Loopback with a proxy is not guaranteed closed.** MXC admits a host proxy that has no app identity only with host loopback allowed, and documents that this opens host loopback in both directions without limiting it to the proxy. In CI an outbound connection to another loopback port was still blocked, but MXC does not promise it.
 - **The child's environment is sealed**: it gets a fixed set of Windows variables, the proxy settings and srt's own, never the user's profile environment.
 - **Host file I/O can stall** for several seconds while several sandboxed commands run at once.
 - **Bun** needs a build whose `fs` streams accept `windowsHandle`; Node 24 works.

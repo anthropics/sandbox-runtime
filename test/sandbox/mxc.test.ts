@@ -78,9 +78,9 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
  *     F4 PowerShell starts (UI policy)
  *   G — everyday tools start inside the sandbox
  *     G1 cmd.exe, G2 whoami, G3 git, G4 node
- *     G5 Git Bash: a KNOWN FAILURE under mxc (bash.exe crashes with
- *        0xC0000005 in a BaseContainer). Marked failing, so the row
- *        turns red the day it starts working.
+ *     G5 Git Bash: a KNOWN FAILURE under mxc. Every MSYS2 program
+ *        (msys-2.0.dll) crashes with 0xC0000005 in a BaseContainer.
+ *        Marked failing, so the row turns red the day it starts working.
  */
 
 const FIXTURE_SECRET = 'BOUNDARY-SECRET-4d1f'
@@ -726,9 +726,10 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
     60_000,
   )
 
-  // Known failure under mxc: bash.exe dies with 0xC0000005 inside a
-  // BaseContainer. `it.failing` passes while it still fails, and
-  // fails as soon as Git Bash works, so the row gets removed then.
+  // Known failure under mxc: every MSYS2 program, bash.exe included,
+  // dies with 0xC0000005 at startup inside a BaseContainer.
+  // `it.failing` passes while it still fails, and fails as soon as
+  // Git Bash works, so the row gets removed then.
   // srt-win's Git Bash coverage lives in winsrt.test.ts.
   const knownMxcFailure =
     BOUNDARY_BACKEND === 'mxc' && isWindows && existsSync(GIT_BASH)
