@@ -978,6 +978,33 @@ The cross-platform `filesystem` and `network` blocks apply as described above. W
 - `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
 - `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
 
+### MXC backend (experimental)
+
+`windows.backend: 'mxc'` runs commands in an MXC BaseContainer through the [`@microsoft/mxc-sdk`](https://www.npmjs.com/package/@microsoft/mxc-sdk) package (an optional dependency that needs Node 24 or later). The OS applies the filesystem and network policy for each command, so there is no install step, no sandbox user and no ACL changes. It needs a Windows build with the BaseContainer tier; MXC's AppContainer tiers are never used.
+
+The SDK starts the process itself, so commands start with `spawnSandboxed()` rather than `wrapWithSandboxArgv()`, which throws under this backend:
+
+```typescript
+const proc = await SandboxManager.spawnSandboxed('npm test', { cwd })
+proc.stdout?.pipe(process.stdout)
+proc.stderr?.pipe(process.stderr)
+const { exitCode, timedOut } = await proc.wait()
+proc.dispose()
+```
+
+`kill()` ends the command and everything it started. Each call checks its own policy with MXC's probe first and throws `backend_unsupported` if the host cannot enforce all of it; nothing falls back to a weaker policy or to srt-win.
+
+What works: the network fence (only the proxy is reachable), reads everywhere on the system drive except the deny-list, writes only inside `allowWrite` and `%TEMP%`, per-command `allowRead`/`allowWrite`, credential masking of environment variables, and everyday tools such as cmd, PowerShell, git, node and whoami.
+
+Known limitations:
+
+- **Git Bash does not start**: `bash.exe` crashes with `0xC0000005` inside a BaseContainer.
+- **Sandboxed programs can open windows on the desktop.** UI is on for every command, because with it off any program that loads `user32` or `gdi32` (PowerShell, git, node and most other tools) fails at startup with `0xC0000142`. Clipboard access and input injection stay blocked.
+- **No `network.tlsTerminate`**: `initialize()` refuses it, so credential masking of request headers is unavailable.
+- **The child's environment is sealed**: it gets a fixed set of Windows variables, the proxy settings and srt's own, never the user's profile environment.
+- **Host file I/O can stall** for several seconds while several sandboxed commands run at once.
+- **Bun** needs a build whose `fs` streams accept `windowsHandle`; Node 24 works.
+
 ### Local servers on Windows
 
 By default a sandboxed command cannot connect to anything on `localhost` except the sandbox's own proxies: not a development server, not a database, not a server another sandboxed command started. `network.allowLocalBinding` — the same setting that opens local ports on macOS — opens loopback on Windows. It is off by default, and it is a property of the install:
