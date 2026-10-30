@@ -512,15 +512,16 @@ While `filterRequest` is set, `TRACE` and `TRACK` requests are answered 405 befo
 
 **Unix Socket Settings** (platform-specific behavior):
 
-| Setting                        | macOS                     | Linux                                    |
-| ------------------------------ | ------------------------- | ---------------------------------------- |
-| `allowUnixSockets: string[]`   | Allowlist of socket paths | _Ignored_ (seccomp can't filter by path) |
-| `allowAllUnixSockets: boolean` | Allow all sockets         | Disable seccomp blocking                 |
+| Setting                            | macOS                     | Linux                                                  |
+| ---------------------------------- | ------------------------- | ------------------------------------------------------ |
+| `allowUnixSockets: string[]`       | Allowlist of socket paths | _Ignored_ (seccomp can't filter by path)               |
+| `allowAllUnixSockets: boolean`     | Allow all sockets         | Disable seccomp blocking                               |
+| `allowUnixSocketCreation: boolean` | _Ignored_                 | Allow all sockets, keep the rest of the seccomp helper |
 
 Unix sockets are **blocked by default** on both platforms.
 
 - **macOS**: Use `allowUnixSockets` to allow specific paths (e.g., `["/var/run/docker.sock"]`), or `allowAllUnixSockets: true` to allow all.
-- **Linux**: Blocking uses seccomp filters (x64/arm64 only). If seccomp isn't available, sockets are unrestricted and a warning is shown. Use `allowAllUnixSockets: true` to explicitly disable blocking.
+- **Linux**: Blocking uses seccomp filters (x64/arm64 only). If seccomp isn't available, sockets are unrestricted and a warning is shown. Use `allowAllUnixSockets: true` to explicitly disable blocking. That removes the seccomp helper and everything else it does: VM sockets (`AF_VSOCK`) and io_uring become usable, and the PID namespace isolation, the namespaces filter and violation monitoring are gone. To allow Unix sockets and keep all of those, use `allowUnixSocketCreation: true` instead. Either way, every socket the command can reach in the filesystem becomes usable (see [Security Limitations](#security-limitations)).
 
 #### Filesystem Configuration
 
@@ -1211,7 +1212,7 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 **PID namespace isolation**: The nested PID namespace ensures the user command cannot see or address any process that runs without the seccomp filter (bwrap's init, the shell wrapper, or the socat helpers). This keeps the seccomp boundary intact regardless of `kernel.yama.ptrace_scope`, since unfiltered helpers are not reachable via `ptrace` or `/proc/N/mem`. The inner PID 1 sets `PR_SET_DUMPABLE=0` so it is not ptraceable either. If nested namespace creation fails, apply-seccomp aborts rather than running without isolation.
 
-**Security limitations**: The filter blocks `socket(AF_UNIX, ...)` and the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls (the latter three because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rule). It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
+**Security limitations**: The filter blocks `socket(AF_UNIX, ...)` and the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls (the latter three because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rule). It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC. Under `allowUnixSocketCreation` the helper applies the same filter without the `AF_UNIX` rule.
 
 **Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
 
