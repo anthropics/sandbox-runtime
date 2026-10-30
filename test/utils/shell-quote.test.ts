@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'bun:test'
 import * as fc from 'fast-check'
 import { spawnSync } from 'node:child_process'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import * as path from 'node:path'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { quote } from '../../src/utils/shell-quote.js'
+import { quote, quoteForCmd } from '../../src/utils/shell-quote.js'
 import { whichSync } from '../../src/utils/which.js'
 
 /**
@@ -125,6 +128,109 @@ describe('quote', () => {
           }, 30_000)
         })
       }
+    },
+  )
+})
+
+/**
+ * On Windows the CLI runs its argv through `cmd.exe /d /s /c`, where POSIX
+ * single quotes are literal characters: `quote()` wrapped every absolute
+ * path in them, so `C:\x\f.js` arrived as `'C:\x\f.js'`.
+ */
+describe('quoteForCmd', () => {
+  it('wraps a program name in plain quotes for cmd', () => {
+    expect(quoteForCmd(['C:\\Program Files\\nodejs\\node.exe', 'x'])).toBe(
+      '"C:\\Program Files\\nodejs\\node.exe" x',
+    )
+  })
+
+  it('refuses a program name cmd would read past its quotes', () => {
+    for (const name of ['a"b', '%PATH%\\x.exe', 'a\nb']) {
+      expect(() => quoteForCmd([name])).toThrow('cannot pass the program name')
+    }
+  })
+
+  it('leaves a Windows path bare', () => {
+    expect(quoteForCmd(['node', 'C:\\Users\\me\\f.js'])).toBe(
+      'node C:\\Users\\me\\f.js',
+    )
+  })
+
+  it('double-quotes and caret-escapes the rest, never single-quotes', () => {
+    expect(quoteForCmd(['echo', 'a b'])).toBe('echo ^"a^ b^"')
+    expect(quoteForCmd(['echo', "don't"])).toBe(`echo ^"don't^"`)
+    expect(quoteForCmd(['echo', 'x & y'])).toBe('echo ^"x^ ^&^ y^"')
+  })
+
+  it('doubles backslashes before a quote, as the MSVCRT parser reads them', () => {
+    expect(quoteForCmd(['p', 'a\\"b'])).toBe('p ^"a\\\\\\^"b^"')
+    expect(quoteForCmd(['p', 'dir\\ x\\'])).toBe('p ^"dir\\^ x\\\\^"')
+  })
+
+  describe.skipIf(process.platform !== 'win32')(
+    'round-trips through cmd.exe /d /s /c',
+    () => {
+      const comspec = process.env.ComSpec ?? 'C:\\Windows\\System32\\cmd.exe'
+      // A script file, not `-e`: node stops reading its own options at the
+      // file name, where after `-e` it still reads an argument such as `- `.
+      // Node rather than the test runner, whose default install path has the
+      // space the program name's quoting has to carry.
+      const printArgv = path.join(
+        mkdtempSync(path.join(tmpdir(), 'quote-for-cmd-')),
+        'argv.js',
+      )
+      writeFileSync(
+        printArgv,
+        'process.stdout.write(JSON.stringify(process.argv.slice(2)))',
+      )
+      const node = whichSync('node') ?? process.execPath
+
+      /** The command line srt-win builds: post-`/c` content wrapped once. */
+      function roundTrip(args: string[]): string[] {
+        const command = quoteForCmd([node, printArgv, ...args])
+        const result = spawnSync(comspec, ['/d', '/s', '/c', `"${command}"`], {
+          encoding: 'utf8',
+          windowsVerbatimArguments: true,
+        })
+        expect(result.status).toBe(0)
+        return JSON.parse(result.stdout) as string[]
+      }
+
+      it('preserves paths, quotes and cmd metacharacters', () => {
+        const args = [
+          'C:\\Users\\me\\f.js',
+          'C:\\Program Files\\x\\',
+          'a "quoted" word',
+          'back\\"slash',
+          "don't",
+          '& | < > ^ ( ) % ! , ; =',
+          '%PATH%',
+          '',
+        ]
+        expect(roundTrip(args)).toEqual(args)
+      })
+
+      // cmd cannot carry a line break inside a command line, so the
+      // property covers printable ASCII only.
+      it('property: any printable-ASCII argv round-trips exactly', () => {
+        fc.assert(
+          fc.property(
+            fc.array(
+              fc
+                .string({ unit: 'binary-ascii' })
+                .map(s => s.replace(/[^\x20-\x7e]/g, '')),
+              {
+                minLength: 1,
+                maxLength: 6,
+              },
+            ),
+            args => {
+              expect(roundTrip(args)).toEqual(args)
+            },
+          ),
+          { numRuns: 50 },
+        )
+      }, 60_000)
     },
   )
 })
