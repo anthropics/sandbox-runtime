@@ -994,7 +994,7 @@ proc.dispose()
 
 `spawnSandboxed()` takes the same `commandId` and `commandText` as `wrapWithSandboxArgv()`'s options, so per-command network lists and violation attribution work as on the other backends. `kill()` ends the command and everything it started. Each call checks its own policy with MXC's probe first and throws `backend_unsupported` if the host cannot enforce all of it; nothing falls back to a weaker policy or to srt-win.
 
-What works: the network fence (only the proxy is reachable), reads everywhere on the system drive except the deny-list, writes only inside `allowWrite` and `%TEMP%`, per-command `allowRead`/`allowWrite`, credential masking of environment variables, and everyday tools such as cmd, PowerShell, git, node and whoami.
+What works: the network fence (only the proxy is reachable), reads everywhere on the system drive except the deny-list, writes only inside `allowWrite` and the host's temp folder (by its full path), per-command `allowRead`/`allowWrite`, credential masking of environment variables, and everyday tools such as cmd, PowerShell, git, node and whoami.
 
 Known limitations:
 
@@ -1005,6 +1005,7 @@ Known limitations:
   - `filesystem.disabled` at the session level: MXC is allow-list in both directions, and the nearest request would restrict rather than lift restrictions. (Per command it keeps the session's policy, as on srt-win.)
   - `network.allowLocalBinding: true`, at the session level or per command: nothing outside the container can connect in.
 - **Loopback with a proxy is closed by measurement, not by promise.** MXC 1.0 refuses a host proxy unless `ingress.default` is `allow`, and one without an app identity also needs host loopback allowed. On Windows 11 25H2 (build 26200.9711) that request still admitted no inbound connection, from loopback or the LAN, and blocked outbound connections to loopback ports other than the proxy's. MXC documents no guarantee of either.
+- **`%TEMP%`, `%TMP%` and `%LOCALAPPDATA%` are per-command scratch.** MXC points them at a folder of its own for each command and deletes it when the command ends, so a file written there is not seen by the next command or on the host. Caches kept under `LOCALAPPDATA` (npm, pip and similar) do not persist between commands. The host's own temp folder is still writable by its full path.
 - **The child's environment is sealed**: it gets a fixed set of Windows variables, the proxy settings and srt's own, never the user's profile environment.
 - **Host file I/O can stall** for several seconds while several sandboxed commands run at once.
 - **Bun** needs a build whose `fs` streams accept `windowsHandle`; Node 24 works.

@@ -407,6 +407,8 @@ export interface MxcSandboxParams {
 export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
   const systemDrive = `${process.env.SystemDrive ?? 'C:'}\\`
   const workingDirectory = p.cwd ?? process.cwd()
+  // The host's temp folder stays writable by its full path. It is not
+  // the child's %TEMP%: see CHILD_BASE_ENV_VARS.
   const temp = process.env.TEMP ?? process.env.TMP
   const sh = p.binShell ?? parseWindowsBinShell(undefined)
   const hasProxy = p.httpProxyPort !== undefined
@@ -498,6 +500,10 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
  * off): the user's profile environment can hold secrets, so it is
  * never layered underneath. This is the set ordinary Windows programs
  * expect to find; MXC refuses to start a child without LOCALAPPDATA.
+ *
+ * MXC replaces TEMP, TMP and LOCALAPPDATA with a per-command folder of
+ * its own (under `AppData\Local\Packages\sandbox.{GUID}\AC`), deleted
+ * when the command ends; the values sent here only have to be present.
  */
 const CHILD_BASE_ENV_VARS = [
   'ALLUSERSPROFILE',
