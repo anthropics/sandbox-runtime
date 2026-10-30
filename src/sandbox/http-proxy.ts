@@ -6,6 +6,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { connect, isIP } from 'node:net'
 import { URL } from 'node:url'
+import { inspect } from 'node:util'
 import { logForDebugging } from '../utils/debug.js'
 import { encodedCommandFromProxyUser } from './sandbox-utils.js'
 import {
@@ -68,6 +69,32 @@ import {
   stripBrackets,
   stripHopByHop,
 } from './parent-proxy.js'
+
+// Fixed fields only: an error's message, cause and stack can carry whatever
+// the failing call held, such as a proxy URL with credentials in it.
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    const details = error as Error & {
+      code?: unknown
+      errno?: unknown
+      syscall?: unknown
+      address?: unknown
+      port?: unknown
+    }
+    return inspect(
+      {
+        name: details.name,
+        code: details.code,
+        errno: details.errno,
+        syscall: details.syscall,
+        address: details.address,
+        port: details.port,
+      },
+      { depth: 0, breakLength: Infinity },
+    )
+  }
+  return typeof error
+}
 
 export interface HttpProxyServerOptions {
   /**
@@ -913,7 +940,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           upstream = await dialDirect(hostname, port, lookup)
         }
       } catch (err) {
-        logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
+        logForDebugging(`CONNECT tunnel failed: ${describeError(err)}`, {
           level: 'error',
         })
         // If we already sent 200 (mitmCA sniff path), an HTTP status line now
@@ -952,7 +979,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       socket.pipe(upstream)
 
       upstream.on('error', err => {
-        logForDebugging(`CONNECT tunnel failed: ${err.message}`, {
+        logForDebugging(`CONNECT tunnel failed: ${describeError(err)}`, {
           level: 'error',
         })
         socket.destroy()
@@ -1250,7 +1277,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
 
       const failUpstream = (err: Error) => {
-        logForDebugging(`Proxy request failed: ${err.message}`, {
+        logForDebugging(`Proxy request failed: ${describeError(err)}`, {
           level: 'error',
         })
         respondUpstreamError(res, err, options.denyHeader)
@@ -1276,9 +1303,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
             const outHeaders = stripHopByHop(proxyRes.headers)
@@ -1311,9 +1341,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
             const outHeaders = stripHopByHop(proxyRes.headers)
@@ -1356,9 +1389,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
             const outHeaders = stripHopByHop(proxyRes.headers)

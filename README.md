@@ -967,13 +967,48 @@ A kept write grant on a volume that cannot be reached — a disk that is not att
 
 Clients with their own TLS stack (msys2 `curl`, git on its OpenSSL backend, Node, Python) are covered by the env-var trust layer: the same trust bundle used on macOS/Linux is passed into the sandbox via `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, etc., and the bundle path is added to the session's `allowRead` grant so the sandbox account can open it.
 
+The MXC backend does not support `network.tlsTerminate`: `initialize()` refuses that combination.
+
 ### Windows-specific configuration
 
 The cross-platform `filesystem` and `network` blocks apply as described above. Windows-only settings live under `windows`:
 
+- `windows.backend` — `'mxc'` or `'srt-win'`. Defaults to `'srt-win'`; a future breaking release will require it. `initialize()` throws a `WindowsSandboxError` with code `backend_unsupported` when `'mxc'` cannot run the configuration on this host. Nothing falls back from one backend to the other, so the caller decides what to try next.
 - `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range.
 - `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
 - `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
+
+### MXC backend (experimental)
+
+`windows.backend: 'mxc'` runs commands in an MXC BaseContainer through the [`@microsoft/mxc-sdk`](https://www.npmjs.com/package/@microsoft/mxc-sdk) package (an optional dependency that needs Node 24 or later). The OS applies the filesystem and network policy for each command, so there is no install step, no sandbox user and no ACL changes. It needs a Windows build with the BaseContainer tier; MXC's AppContainer tiers are never used.
+
+The SDK starts the process itself, so commands start with `spawnSandboxed()` rather than `wrapWithSandboxArgv()`, which throws under this backend:
+
+```typescript
+const proc = await SandboxManager.spawnSandboxed('npm test', { cwd })
+proc.stdout?.pipe(process.stdout)
+proc.stderr?.pipe(process.stderr)
+const { exitCode, timedOut } = await proc.wait()
+proc.dispose()
+```
+
+`spawnSandboxed()` takes the same `commandId` and `commandText` as `wrapWithSandboxArgv()`'s options, so per-command network lists and violation attribution work as on the other backends. `kill()` ends the command and everything it started. Each call checks its own policy with MXC's probe first and throws `backend_unsupported` if the host cannot enforce all of it; nothing falls back to a weaker policy or to srt-win.
+
+What works: the network fence (only the proxy is reachable), reads everywhere on the system drive except the deny-list, writes only inside `allowWrite` and the host's temp folder (by its full path), per-command `allowRead`/`allowWrite`, credential masking of environment variables, and everyday tools such as cmd, PowerShell, git, node and whoami.
+
+Known limitations:
+
+- **MSYS2 programs do not start**: anything built on the MSYS2 runtime (`msys-2.0.dll`) crashes at startup with `0xC0000005` inside a BaseContainer, and Windows writes no crash record for it. That covers Git Bash (`bash.exe`, `sh.exe`), the Unix tools in Git for Windows' `usr\bin`, and git hooks or aliases that run through `sh`. Native `git.exe` works. Use cmd or PowerShell as the shell with this backend.
+- **Sandboxed programs can open windows on the desktop.** UI is on for every command, because with it off any program that loads `user32` or `gdi32` (PowerShell, git, node and most other tools) fails at startup with `0xC0000142`. Clipboard access and input injection stay blocked.
+- **Settings refused under mxc**, with `backend_unsupported`, because MXC cannot express them with the meaning they have elsewhere:
+  - `network.tlsTerminate`, so credential masking of request headers is unavailable.
+  - `filesystem.disabled` at the session level: MXC is allow-list in both directions, and the nearest request would restrict rather than lift restrictions. (Per command it keeps the session's policy, as on srt-win.)
+  - `network.allowLocalBinding: true`, at the session level or per command: nothing outside the container can connect in.
+- **Loopback with a proxy is closed by measurement, not by promise.** MXC 1.0 refuses a host proxy unless `ingress.default` is `allow`, and one without an app identity also needs host loopback allowed. On Windows 11 25H2 (build 26200.9711) that request still admitted no inbound connection, from loopback or the LAN, and blocked outbound connections to loopback ports other than the proxy's. MXC documents no guarantee of either.
+- **`%TEMP%`, `%TMP%` and `%LOCALAPPDATA%` are per-command scratch.** MXC points them at a folder of its own for each command and deletes it when the command ends, so a file written there is not seen by the next command or on the host. Caches kept under `LOCALAPPDATA` (npm, pip and similar) do not persist between commands. The host's own temp folder is still writable by its full path.
+- **The child's environment is sealed**: it gets a fixed set of Windows variables, the proxy settings and srt's own, never the user's profile environment.
+- **Host file I/O can stall** for several seconds while several sandboxed commands run at once.
+- **Bun** needs a build whose `fs` streams accept `windowsHandle`; Node 24 works.
 
 ### Local servers on Windows
 
