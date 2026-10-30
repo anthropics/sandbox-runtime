@@ -138,6 +138,27 @@ describe('Config Validation', () => {
     ).toBe(false)
   })
 
+  test('network.allowUnixSocketCreation is a boolean, and absent unless given', () => {
+    const filesystem = { denyRead: [], allowWrite: [], denyWrite: [] }
+    const network = { allowedDomains: [], deniedDomains: [] }
+    expect(
+      SandboxRuntimeConfigSchema.safeParse({ network, filesystem }).data
+        ?.network.allowUnixSocketCreation,
+    ).toBeUndefined()
+    expect(
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { ...network, allowUnixSocketCreation: true },
+        filesystem,
+      }).data?.network.allowUnixSocketCreation,
+    ).toBe(true)
+    expect(
+      SandboxRuntimeConfigSchema.safeParse({
+        network: { ...network, allowUnixSocketCreation: 'yes' },
+        filesystem,
+      }).success,
+    ).toBe(false)
+  })
+
   test('should reject missing required fields', () => {
     const config = {
       network: {

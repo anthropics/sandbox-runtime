@@ -38,6 +38,11 @@
  * filter. SRT_ALLOW_NESTED_USERNS=1, read before the command exists and
  * removed from its environment, turns both off.
  *
+ * SRT_ALLOW_UNIX_SOCKETS=1, read and removed the same way, lets the command
+ * make Unix sockets: the `vsock` filter goes in where the `unix` one would,
+ * so VM sockets and io_uring stay refused, and everything else this program
+ * does (the PID namespace, the namespaces filter, observation) is unchanged.
+ *
  * Compile: gcc -static -O2 -o apply-seccomp apply-seccomp.c
  */
 
@@ -682,15 +687,24 @@ int main(int argc, char *argv[]) {
      * removed below. */
     const char *allow_env = getenv("SRT_ALLOW_NESTED_USERNS");
     int allow_nested_userns = allow_env && strcmp(allow_env, "1") == 0;
+    const char *unix_env = getenv("SRT_ALLOW_UNIX_SOCKETS");
+    int allow_unix_sockets = unix_env && strcmp(unix_env, "1") == 0;
     /* Set when path (b) below runs, the only one the limit is written in. */
     int made_userns = 0;
 
     _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
                    "BPF filter size must be a multiple of sock_filter");
-    struct sock_fprog prog = {
-        .len = (unsigned short)(sizeof(unix_block_bpf) / sizeof(struct sock_filter)),
-        .filter = (struct sock_filter *)unix_block_bpf,
-    };
+    _Static_assert(sizeof(vsock_block_bpf) % sizeof(struct sock_filter) == 0,
+                   "BPF filter size must be a multiple of sock_filter");
+    struct sock_fprog prog = allow_unix_sockets
+        ? (struct sock_fprog){
+              .len = (unsigned short)(sizeof(vsock_block_bpf) / sizeof(struct sock_filter)),
+              .filter = (struct sock_filter *)vsock_block_bpf,
+          }
+        : (struct sock_fprog){
+              .len = (unsigned short)(sizeof(unix_block_bpf) / sizeof(struct sock_filter)),
+              .filter = (struct sock_filter *)unix_block_bpf,
+          };
     _Static_assert(sizeof(namespace_block_bpf) % sizeof(struct sock_filter) == 0,
                    "BPF filter size must be a multiple of sock_filter");
     struct sock_fprog namespace_prog = {
@@ -940,6 +954,7 @@ int main(int argc, char *argv[]) {
     unsetenv("SRT_OBSERVE_SOCK");
     unsetenv("SRT_ENCODED_CMD");
     unsetenv("SRT_ALLOW_NESTED_USERNS");
+    unsetenv("SRT_ALLOW_UNIX_SOCKETS");
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }
