@@ -270,6 +270,37 @@ describe('MXC probe gate (fail closed)', () => {
     expect(spawned).toEqual([req])
   })
 
+  it('never makes a write grant, or what is beneath it, read-only', () => {
+    const req = buildMxcRequest({
+      command: 'x',
+      cwd: 'C:\\proj\\src',
+      allowWrite: ['C:\\proj'],
+      allowRead: ['C:\\proj', 'C:\\proj\\docs', 'D:\\data'],
+    })
+    expect(req.filesystem.readwritePaths).toContain('C:\\proj')
+    expect(req.filesystem.readonlyPaths).toEqual(['C:\\', 'D:\\data'])
+  })
+
+  it('keeps a read grant beneath a deny inside a write grant', () => {
+    const req = buildMxcRequest({
+      command: 'x',
+      cwd: 'C:\\elsewhere',
+      allowWrite: ['C:\\proj'],
+      denyRead: ['C:\\proj\\secret'],
+      allowRead: ['C:\\proj\\secret\\ok'],
+    })
+    expect(req.filesystem.readonlyPaths).toContain('C:\\proj\\secret\\ok')
+  })
+
+  it('does not grant reads on a working directory beneath a deny', () => {
+    const req = buildMxcRequest({
+      command: 'x',
+      cwd: 'C:\\Users\\me\\private',
+      denyRead: ['C:\\Users\\me'],
+    })
+    expect(req.filesystem.readonlyPaths).not.toContain('C:\\Users\\me\\private')
+  })
+
   it('sends a deny beneath a grant as a denied path', () => {
     const req = buildMxcRequest({
       command: 'x',

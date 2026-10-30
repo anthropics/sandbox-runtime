@@ -2748,7 +2748,7 @@ function windowsPathKeyOf(p: string, resolved: ResolvedWindowsPath): string {
 }
 
 /** The one of `dirs` that a path is, or lies beneath. */
-function coveringWindowsPath(
+export function coveringWindowsPath(
   dirs: readonly string[],
 ): (p: string) => string | undefined {
   const keys = dirs.map(windowsPathKey)

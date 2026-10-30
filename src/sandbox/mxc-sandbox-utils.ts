@@ -74,6 +74,7 @@ import {
   proxyUsernameFor,
 } from './sandbox-utils.js'
 import {
+  coveringWindowsPath,
   envListToObject,
   parseWindowsBinShell,
   WindowsSandboxError,
@@ -424,16 +425,36 @@ export function buildMxcRequest(p: MxcSandboxParams): MxcRequest {
     encodedCommand,
   )
 
+  const readwritePaths = [
+    ...(p.allowWrite ?? []),
+    ...(temp !== undefined ? [temp] : []),
+  ]
+  const deniedPaths = [...(p.denyRead ?? []), ...(p.denyWrite ?? [])]
+  // MXC lets the most specific entry win. A read-only entry at or
+  // beneath a write grant would make that subtree read-only, so it is
+  // left out when the write grant is what governs it (no deny between
+  // the two; beneath such a deny the read grant is what re-opens reads).
+  // The working directory is added for reading only outside every deny:
+  // beneath one it would override the deny.
+  const writable = coveringWindowsPath(readwritePaths)
+  const denied = coveringWindowsPath(deniedPaths)
+  const governedByWrite = (r: string): boolean => {
+    const w = writable(r)
+    if (w === undefined) return false
+    const under = coveringWindowsPath([w])
+    return !deniedPaths.some(
+      d => coveringWindowsPath([d])(r) !== undefined && under(d) !== undefined,
+    )
+  }
+  const readonlyPaths = [
+    systemDrive,
+    ...(denied(workingDirectory) === undefined ? [workingDirectory] : []),
+    ...(p.allowRead ?? []),
+  ].filter(r => !governedByWrite(r))
+
   return {
     command: buildShellCommandLine(sh, p.command),
-    filesystem: {
-      readonlyPaths: [systemDrive, workingDirectory, ...(p.allowRead ?? [])],
-      readwritePaths: [
-        ...(p.allowWrite ?? []),
-        ...(temp !== undefined ? [temp] : []),
-      ],
-      deniedPaths: [...(p.denyRead ?? []), ...(p.denyWrite ?? [])],
-    },
+    filesystem: { readonlyPaths, readwritePaths, deniedPaths },
     network: {
       egress: { default: 'deny' },
       // MXC 1.0 refuses a host proxy unless ingress.default is 'allow',

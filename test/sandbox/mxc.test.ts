@@ -66,6 +66,8 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
  *     D5 delete of a write-denied file blocked
  *     D6 cwd is not implicitly writable
  *     D7 per-exec allowWrite (MXC-only capability; srt-win throws)
+ *     D8 (mxc) write from inside an allowWrite folder, as its working
+ *        directory, and read it back from the host
  *   E — environment & credentials
  *     E1 broker environment not inherited by the child
  *     E2 mode:'mask' env var: child sees a sentinel, not the value
@@ -600,6 +602,22 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
       ).rejects.toThrow(/allowRead\/allowWrite/)
     }
   }, 60_000)
+
+  it.skipIf(BOUNDARY_BACKEND !== 'mxc')(
+    'D8: a write from inside an allowWrite folder reaches the host',
+    async () => {
+      // Under mxc the most specific path entry wins, so a read-only
+      // entry for the working directory once made its own write grant
+      // read-only. Run from inside the grant and check on the host.
+      const target = join(allowWriteDir, 'd8.txt')
+      const r = await runSandboxed('echo d8-mark> d8.txt', {
+        cwd: allowWriteDir,
+      })
+      expectStatus('D8', r, [0])
+      expect(readFileSync(target, 'utf8')).toContain('d8-mark')
+    },
+    60_000,
+  )
 
   // ── E: environment & credentials ─────────────────────────────────
 

@@ -1940,6 +1940,65 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
   })
 
+  it('mxc: allowWrite is writable from its own folder, as spawnSandboxed sends it', async () => {
+    const spawned: MxcRequest[] = []
+    spies.push(
+      spyOn(mxcUtils, 'isMxcSdkInstalled').mockReturnValue(true),
+      spyOn(mxcUtils, 'loadMxcSdk').mockResolvedValue({
+        probe: () => ({
+          tier: 'base-container',
+          needsDaclAugmentation: false,
+          warnings: [],
+          probes: {
+            baseContainerSupportsDenyPaths: true,
+            baseContainerSupportsIngressHostLoopbackAllow: true,
+            baseContainerSupportsIdentitylessLoopbackProxy: true,
+            uiCapabilities: {
+              canBlockClipboardRead: true,
+              canBlockClipboardWrite: true,
+              canBlockInputInjection: true,
+            },
+          },
+        }),
+        spawn: request => {
+          spawned.push(request)
+          return Promise.resolve({} as MxcProcessHandle)
+        },
+      }),
+    )
+    const w = join(root, 'w')
+    mkdirSync(w)
+    const keep = join(sub, 'keep')
+    mkdirSync(keep)
+    const base = configOf({
+      denyRead: [d],
+      allowWrite: [w, sub],
+      denyWrite: [keep],
+    })
+    await SandboxManager.initialize({
+      ...base,
+      windows: { ...base.windows, backend: 'mxc' },
+    })
+    // A read-only entry for the working directory would be the most
+    // specific match for a write grant's own folder and win over it.
+    for (const cwd of [w, sub]) {
+      await SandboxManager.spawnSandboxed!('echo f> f.txt', { cwd })
+      const fsReq = spawned.at(-1)!.filesystem
+      expect(fsReq.readwritePaths).toContain(cwd)
+      expect(fsReq.readonlyPaths).not.toContain(cwd)
+      expect(fsReq.deniedPaths).not.toContain(cwd)
+    }
+    const fsReq = spawned.at(-1)!.filesystem
+    expect(fsReq.deniedPaths).toContain(d)
+    expect(fsReq.deniedPaths).toContain(keep)
+    // The child's TEMP is the folder granted for writing.
+    const env = spawned.at(-1)!.environment
+    if (process.env.TEMP !== undefined) {
+      expect(fsReq.readwritePaths).toContain(process.env.TEMP)
+      expect(env.TEMP).toBe(process.env.TEMP)
+    }
+  })
+
   it('mxc: a masked credential file is denied in the spawned request', async () => {
     const spawned: MxcRequest[] = []
     const probe = (): mxcUtils.MxcProbeOutput => ({
