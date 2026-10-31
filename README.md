@@ -493,7 +493,7 @@ These two are read at each CONNECT, so `updateConfig` changes them for the tunne
 }
 ```
 
-**Request rewriting** (with `network.filterRequest`, set by library consumers): an allow decision may also carry header edits (`removeHeaders`, `setHeaders`) and an `onResponse` observer, and a deny decision may choose its status (403 by default). These options are read when the proxy starts; `updateConfig` does not change them.
+**Request rewriting** (with `network.filterRequest`, set by library consumers): an allow decision may also carry header edits (`removeHeaders`, `setHeaders`) and `onResponse`, `onResponseChunk` and `onResponseEnd` observers, and a deny decision may choose its status (403 by default). `onResponseChunk` gets a copy of each body chunk as the upstream sent it (a compressed body stays compressed), and `onResponseEnd` is called once and says whether the whole body arrived. Neither can change or hold the response, and what a caller keeps is its own to bound. These options are read when the proxy starts; `updateConfig` does not change them.
 
 - `network.allowPlaintextHeaderSet` - Let an allow decision set headers on plain-HTTP requests. Off by default: a header set there would travel in cleartext, so while it is off an allow decision that carries `setHeaders` is refused with 403, and nothing is forwarded, for every request the proxy receives in cleartext (an absolute `https://` URI included). An allow without `setHeaders` is unaffected and removals always apply. The callback's second argument reports `scheme: 'http'` for these requests.
 - `network.stripResponseHeaders` - Response headers never passed back to the sandboxed client, matched case-insensitively with `-`, `_` and `.` folded (e.g. `["set-cookie"]`).
