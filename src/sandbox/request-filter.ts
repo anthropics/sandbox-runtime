@@ -70,6 +70,24 @@ export type RequestDecision = {
    * response is not held for it.
    */
   onResponse?: (status: number, headers: IncomingHttpHeaders) => void
+  /**
+   * Allow only: called with each chunk of the upstream response body as it
+   * is relayed, in order, with the bytes the upstream sent: a compressed
+   * body stays compressed, as the `content-encoding` given to `onResponse`
+   * says. It gets a copy, so it observes and cannot change the response. The
+   * response is not held for it, and nothing bounds what it keeps: a caller
+   * that buffers sets its own limit. A throw or a rejection is logged and
+   * ignored, and later chunks still arrive.
+   */
+  onResponseChunk?: (chunk: Buffer) => void
+  /**
+   * Allow only: called once when the upstream response is over. `complete`
+   * is true when the whole body arrived, and false when it did not: the
+   * upstream or the client went away part-way, or the proxy replaced an
+   * unrelayable response with its own 502. A throw or a rejection is logged
+   * and ignored.
+   */
+  onResponseEnd?: (complete: boolean) => void
 }
 
 /**
@@ -453,6 +471,15 @@ function malformedDecisionReason(decision: unknown): string | undefined {
   if (d.action === 'deny') return undefined
   if (d.onResponse !== undefined && typeof d.onResponse !== 'function') {
     return 'onResponse is not a function'
+  }
+  if (
+    d.onResponseChunk !== undefined &&
+    typeof d.onResponseChunk !== 'function'
+  ) {
+    return 'onResponseChunk is not a function'
+  }
+  if (d.onResponseEnd !== undefined && typeof d.onResponseEnd !== 'function') {
+    return 'onResponseEnd is not a function'
   }
   const removals = d.removeHeaders
   if (removals !== undefined) {
@@ -846,6 +873,50 @@ export function notifyResponse(
   }
 }
 
+/**
+ * Report an upstream response's body to an allow decision's observers,
+ * containing their failures. `relayed` is what relayResponseHead answered: a
+ * response it replaced has no body to report. Call it before the body is
+ * piped, and in the same tick: a data listener starts the stream flowing, and
+ * pipe() then paces both.
+ */
+export function observeResponseBody(
+  decision: RequestDecision | undefined,
+  upstream: IncomingMessage,
+  relayed: boolean,
+): void {
+  const onChunk = decision?.onResponseChunk
+  const onEnd = decision?.onResponseEnd
+  if (!onChunk && !onEnd) return
+  const contained = (call: () => unknown): void => {
+    try {
+      const returned = call()
+      if (isThenable(returned)) returned.then(undefined, logResponseFailure)
+    } catch (err) {
+      logResponseFailure(err)
+    }
+  }
+  let ended = false
+  const end = (complete: boolean): void => {
+    if (ended) return
+    ended = true
+    if (onEnd) contained(() => onEnd(complete))
+  }
+  if (!relayed) return end(false)
+  if (onChunk) {
+    upstream.on('data', (chunk: Buffer) => {
+      if (ended) return
+      const copy = Buffer.from(chunk)
+      contained(() => onChunk(copy))
+    })
+  }
+  // 'end' alone does not say the body was whole, and a cut body does not reach
+  // 'close' on every runtime.
+  upstream.once('end', () => end(upstream.complete))
+  upstream.once('error', () => end(false))
+  upstream.once('close', () => end(false))
+}
+
 function isThenable(value: unknown): value is PromiseLike<unknown> {
   return (
     typeof value === 'object' &&
@@ -856,7 +927,7 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 
 function logResponseFailure(err: unknown): void {
   logForDebugging(
-    `[request-filter] onResponse failed: ${(err as Error)?.message ?? String(err)}`,
+    `[request-filter] response observer failed: ${(err as Error)?.message ?? String(err)}`,
     { level: 'error' },
   )
 }

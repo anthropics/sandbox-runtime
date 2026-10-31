@@ -951,6 +951,187 @@ describe('an allow decision can observe the upstream response', () => {
     )
   }, 15_000)
 
+  test('the body observers see every byte and the end, on both paths', async () => {
+    const chunks: Buffer[] = []
+    const ends: boolean[] = []
+    await withProxy(
+      async () => ({
+        action: 'allow',
+        onResponseChunk: chunk => {
+          chunks.push(chunk)
+        },
+        onResponseEnd: complete => {
+          ends.push(complete)
+        },
+      }),
+      {},
+      async port => {
+        expect((await viaTls(port, '/observed')).body).toBe('upstream ok')
+        expect((await viaPlain(port, '/observed')).body).toBe('upstream ok')
+      },
+    )
+    expect(Buffer.concat(chunks).toString()).toBe('upstream okupstream ok')
+    expect(ends).toEqual([true, true])
+  }, 15_000)
+
+  test('onResponseEnd alone does not take the body from the client', async () => {
+    const ends: boolean[] = []
+    await withProxy(
+      async () => ({
+        action: 'allow',
+        onResponseEnd: complete => {
+          ends.push(complete)
+        },
+      }),
+      {},
+      async port => {
+        expect((await viaTls(port, '/observed')).body).toBe('upstream ok')
+        expect((await viaPlain(port, '/observed')).body).toBe('upstream ok')
+      },
+    )
+    expect(ends).toEqual([true, true])
+  }, 15_000)
+
+  test('a body observer gets a copy: changing it does not change what the client receives', async () => {
+    await withProxy(
+      async () => ({
+        action: 'allow',
+        onResponseChunk: chunk => {
+          chunk.fill(0x58)
+        },
+      }),
+      {},
+      async port => {
+        expect((await viaTls(port, '/observed')).body).toBe('upstream ok')
+        expect((await viaPlain(port, '/observed')).body).toBe('upstream ok')
+      },
+    )
+  }, 15_000)
+
+  test('body observers that throw or reject do not disturb the response', async () => {
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason)
+    }
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      let calls = 0
+      await withProxy(
+        async () => ({
+          action: 'allow',
+          onResponseChunk: () => {
+            calls++
+            throw new Error('chunk observer failed')
+          },
+          onResponseEnd: async () => {
+            calls++
+            throw new Error('end observer failed')
+          },
+        }),
+        {},
+        async port => {
+          expect((await viaTls(port, '/observed')).body).toBe('upstream ok')
+          expect((await viaPlain(port, '/observed')).body).toBe('upstream ok')
+        },
+      )
+      await new Promise(r => setTimeout(r, 50))
+      expect(calls).toBeGreaterThanOrEqual(4)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  }, 15_000)
+
+  test('a body cut off part-way ends incomplete, on both paths', async () => {
+    const cut = (req: IncomingMessage, res: ServerResponse): void => {
+      req.resume()
+      res.writeHead(200, { 'content-length': '100' })
+      res.write('partial')
+      // Long enough for the head and the first bytes to reach the proxy.
+      setTimeout(() => res.destroy(), 100)
+    }
+    httpsUpstream.removeListener('request', upstreamHandler)
+    httpUpstream.removeListener('request', upstreamHandler)
+    httpsUpstream.on('request', cut)
+    httpUpstream.on('request', cut)
+    try {
+      const chunks: Buffer[] = []
+      const ends: boolean[] = []
+      await withProxy(
+        async () => ({
+          action: 'allow',
+          onResponseChunk: chunk => {
+            chunks.push(chunk)
+          },
+          onResponseEnd: complete => {
+            ends.push(complete)
+          },
+        }),
+        {},
+        async port => {
+          await viaTls(port, '/observed').catch(() => undefined)
+          await viaPlain(port, '/observed').catch(() => undefined)
+        },
+      )
+      await new Promise(r => setTimeout(r, 50))
+      expect(ends).toEqual([false, false])
+      expect(Buffer.concat(chunks).toString()).toBe('partialpartial')
+    } finally {
+      httpsUpstream.removeListener('request', cut)
+      httpUpstream.removeListener('request', cut)
+      httpsUpstream.on('request', upstreamHandler)
+      httpUpstream.on('request', upstreamHandler)
+    }
+  }, 15_000)
+
+  test('a response the proxy cannot relay ends incomplete, with no bytes', async () => {
+    const bad = (req: IncomingMessage, res: ServerResponse): void => {
+      req.resume()
+      // A status outside 100-999 cannot be written: the client gets a 502.
+      res.socket?.end('HTTP/1.1 099 x\r\nContent-Length: 5\r\n\r\nhello')
+    }
+    httpUpstream.removeListener('request', upstreamHandler)
+    httpUpstream.on('request', bad)
+    try {
+      const chunks: Buffer[] = []
+      const ends: boolean[] = []
+      await withProxy(
+        async () => ({
+          action: 'allow',
+          onResponseChunk: chunk => {
+            chunks.push(chunk)
+          },
+          onResponseEnd: complete => {
+            ends.push(complete)
+          },
+        }),
+        {},
+        async port => {
+          expect((await viaPlain(port, '/observed')).status).toBe(502)
+        },
+      )
+      await new Promise(r => setTimeout(r, 50))
+      expect(ends).toEqual([false])
+      expect(chunks).toEqual([])
+    } finally {
+      httpUpstream.removeListener('request', bad)
+      httpUpstream.on('request', upstreamHandler)
+    }
+  }, 15_000)
+
+  test('a body observer that is not a function denies', async () => {
+    for (const field of ['onResponseChunk', 'onResponseEnd']) {
+      await withProxy(
+        async () =>
+          ({ action: 'allow', [field]: 'nope' }) as unknown as RequestDecision,
+        {},
+        async port => {
+          expect((await viaPlain(port, '/observed')).status).toBe(403)
+        },
+      )
+    }
+  }, 15_000)
+
   test('an onResponse that is not a function denies', async () => {
     await withProxy(
       async () =>

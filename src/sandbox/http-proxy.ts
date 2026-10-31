@@ -24,6 +24,7 @@ import {
   type DenyMark,
   applyHeaderEdits,
   notifyResponse,
+  observeResponseBody,
   removeHeadersFolded,
   hostHeaderValues,
   hostMismatch,
@@ -1286,7 +1287,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             if (options.stripResponseHeaders) {
               removeHeadersFolded(outHeaders, options.stripResponseHeaders)
             }
-            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
+            const relayed = relayResponseHead(res, proxyRes, outHeaders)
+            observeResponseBody(decision, proxyRes, relayed)
+            if (relayed) proxyRes.pipe(res)
           },
         )
       } else if (parentUrl) {
@@ -1321,7 +1324,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             if (options.stripResponseHeaders) {
               removeHeadersFolded(outHeaders, options.stripResponseHeaders)
             }
-            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
+            const relayed = relayResponseHead(res, proxyRes, outHeaders)
+            observeResponseBody(decision, proxyRes, relayed)
+            if (relayed) proxyRes.pipe(res)
           },
         )
       } else {
@@ -1366,7 +1371,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             if (options.stripResponseHeaders) {
               removeHeadersFolded(outHeaders, options.stripResponseHeaders)
             }
-            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
+            const relayed = relayResponseHead(res, proxyRes, outHeaders)
+            observeResponseBody(decision, proxyRes, relayed)
+            if (relayed) proxyRes.pipe(res)
           },
         )
       }

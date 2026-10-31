@@ -44,6 +44,7 @@ import {
   type DenyMark,
   applyHeaderEdits,
   notifyResponse,
+  observeResponseBody,
   removeHeadersFolded,
   hostHeaderValues,
   hostMismatch,
@@ -1339,7 +1340,9 @@ async function forwardUpstream(
       if (target.stripResponseHeaders) {
         removeHeadersFolded(outHeaders, target.stripResponseHeaders)
       }
-      if (relayResponseHead(res, upRes, outHeaders)) relayResponse(upRes, res)
+      const relayed = relayResponseHead(res, upRes, outHeaders)
+      observeResponseBody(decision, upRes, relayed)
+      if (relayed) relayResponse(upRes, res)
     },
   )
 
