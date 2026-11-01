@@ -860,8 +860,8 @@ export const NetworkConfigSchema = z.object({
             'generates-if-absent a persistent CA under ' +
             '%ProgramData%\\sandbox-runtime\\ca\\ and trusts it in the ' +
             "sandbox user's Root store; on other platforms SRT generates " +
-            'an ephemeral CA into a temp directory for the lifetime of the ' +
-            'session.',
+            'an ephemeral CA in memory and writes only a public trust ' +
+            'bundle for the lifetime of the session.',
         ),
       caKeyPath: z
         .string()

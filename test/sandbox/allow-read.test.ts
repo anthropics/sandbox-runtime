@@ -828,7 +828,7 @@ describe.if(isMacOS)('macOS glob denyRead inside allowRead (deny wins)', () => {
       try {
         const readConfig: FsReadRestrictionConfig = {
           denyOnly: ['/**/*.crt'],
-          allowWithinDeny: [RAW_PROJECT, ca.certPath, ca.trustBundlePath],
+          allowWithinDeny: [RAW_PROJECT, ca.trustBundlePath],
         }
         const bundle = run(`head -c 27 ${ca.trustBundlePath}`, readConfig)
         expect(bundle.status).toBe(0)

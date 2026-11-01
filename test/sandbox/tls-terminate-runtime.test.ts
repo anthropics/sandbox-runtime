@@ -62,7 +62,7 @@ describe('a runtime that cannot terminate TLS in-process fails at start-up', () 
       SandboxManager.initialize(baseConfig({ tlsTerminate: {} })),
     ).rejects.toThrow(STARTUP_ERROR)
     expect(SandboxManager.getProxyPort()).toBeUndefined()
-    expect(SandboxManager.getMitmCA()).toBeUndefined()
+    expect(SandboxManager.getTlsTrust()).toBeUndefined()
   })
 
   test('SandboxManager.initialize without tlsTerminate is not affected', async () => {

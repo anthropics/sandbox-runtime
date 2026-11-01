@@ -113,11 +113,10 @@ describe.if(isLinux || isMacOS)('temp objects when the process ends', () => {
   ])(
     'are all gone when it exits %s',
     (_when, ending) => {
-      const { before, after } = endWith(ending)
-
-      // The second `srt-ca` holds the generated CA and its private key.
-      expect(before).toEqual([...ALWAYS, 'srt-ca'].sort())
-      expect(after).toEqual([])
+      expect(endWith(ending)).toStrictEqual({
+        before: [...ALWAYS].sort(),
+        after: [],
+      })
     },
     TIMEOUT_MS,
   )

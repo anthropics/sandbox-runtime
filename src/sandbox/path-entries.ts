@@ -402,10 +402,25 @@ export function readNamesOf(
   config: FsReadRestrictionConfig | undefined,
 ): FsReadRestrictionConfig | undefined {
   if (!config) return config
-  const { literalDenyOnly, literalAllowWithinDeny, ...rest } = config
+  const {
+    literalDenyOnly,
+    literalAllowWithinDeny,
+    literalCredentialDenyOnly,
+    ...rest
+  } = config
   return {
     ...rest,
     denyOnly: [...(config.denyOnly || []), ...(literalDenyOnly ?? [])],
+    ...(literalCredentialDenyOnly
+      ? {
+          credentialDenyOnly: [
+            ...new Set([
+              ...(config.credentialDenyOnly ?? []),
+              ...literalCredentialDenyOnly,
+            ]),
+          ],
+        }
+      : {}),
     ...(config.allowWithinDeny || literalAllowWithinDeny
       ? {
           allowWithinDeny: [

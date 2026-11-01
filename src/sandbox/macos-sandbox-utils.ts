@@ -402,7 +402,11 @@ function resolveReadConfig(
   libraryDenies: readonly PathEntry[],
 ): ResolvedReadConfig {
   const credentialDenies = [
-    ...callerEntries('deny', config.credentialDenyOnly, undefined),
+    ...callerEntries(
+      'deny',
+      config.credentialDenyOnly,
+      config.literalCredentialDenyOnly,
+    ),
     ...libraryDenies,
   ].flatMap(entry => inBothSpellings('deny', entry))
   return {
@@ -410,7 +414,9 @@ function resolveReadConfig(
       ...callerEntries(
         'deny',
         config.denyOnly.filter(p => !config.credentialDenyOnly?.includes(p)),
-        config.literalDenyOnly,
+        config.literalDenyOnly?.filter(
+          p => !config.literalCredentialDenyOnly?.includes(p),
+        ),
       ).flatMap(entry => inBothSpellings('deny', entry)),
       ...credentialDenies,
     ],

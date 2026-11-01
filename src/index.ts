@@ -4,6 +4,7 @@ export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
 export type {
   WrapWithSandboxOptions,
   SandboxInitializeOptions,
+  TlsTrustInfo,
 } from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 

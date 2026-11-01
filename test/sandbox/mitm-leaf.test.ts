@@ -162,7 +162,7 @@ describe('mitm-leaf: mintLeafCert', () => {
     expect(days).toBeLessThanOrEqual(99)
   })
 
-  test('leaf notAfter never exceeds a short-lived CA notAfter', () => {
+  test('leaf notAfter never exceeds a short-lived CA notAfter', async () => {
     // CA expires in 10 days. Leaf must clamp to the CA, not to
     // notBefore+99d (which would mint a leaf valid long after its issuer).
     const shortCA = makeShortLivedCA(10)
@@ -176,10 +176,7 @@ describe('mitm-leaf: mintLeafCert', () => {
       // rather than the 825-day cap.
       expect(caEnd - leafEnd).toBeLessThan(5_000)
     } finally {
-      rmSync(shortCA.certPath.replace(/\/[^/]+$/, ''), {
-        recursive: true,
-        force: true,
-      })
+      await disposeMitmCA(shortCA)
     }
   })
 
@@ -203,7 +200,7 @@ describe('mitm-leaf: mintLeafCert', () => {
           // and rejects leaves missing AKI/SKI.
           const out = execFileSync(
             'openssl',
-            ['verify', '-x509_strict', '-CAfile', c.certPath, leafPath],
+            ['verify', '-x509_strict', '-CAfile', c.trustBundlePath, leafPath],
             { encoding: 'utf8' },
           )
           expect(out.trim()).toMatch(/: OK$/)
@@ -217,8 +214,7 @@ describe('mitm-leaf: mintLeafCert', () => {
 })
 
 /**
- * Build an on-disk RSA CA whose notAfter is `days` from now, then load it via
- * createMitmCA. Used to exercise the CA-end branch of clampValidity.
+ * Build an RSA CA whose notAfter is `days` from now for clampValidity tests.
  */
 function makeShortLivedCA(days: number) {
   const { pki, md } = forge
@@ -245,12 +241,10 @@ function makeShortLivedCA(days: number) {
   ])
   cert.sign(keys.privateKey, md.sha256.create())
 
-  const dir = mkdtempSync(join(tmpdir(), 'srt-short-ca-'))
-  const certPath = join(dir, 'ca.crt')
-  const keyPath = join(dir, 'ca.key')
-  writeFileSync(certPath, pki.certificateToPem(cert))
-  writeFileSync(keyPath, pki.privateKeyToPem(keys.privateKey))
-  return createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
+  return createMitmCA({
+    caCertPem: pki.certificateToPem(cert),
+    caKeyPem: pki.privateKeyToPem(keys.privateKey),
+  })
 }
 
 function firstPemBlock(pem: string): string {

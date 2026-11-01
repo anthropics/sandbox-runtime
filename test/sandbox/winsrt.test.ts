@@ -1883,11 +1883,60 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
           tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
         },
       })
-      expect(SandboxManager.getMitmCA()).toBeDefined()
+      expect(SandboxManager.getTlsTrust()).toBeDefined()
     } finally {
       overrideEmittedConnectionProbe(undefined)
     }
   })
+
+  it.each([false, true])(
+    'CA source files rank above exact grants, filesystem.disabled=%p',
+    async disabled => {
+      const cert = join(root, 'ca[cert].pem')
+      const key = join(root, 'ca[key].pem')
+      const extra = join(root, 'extra.pem')
+      const parent = join(root, 'parent.pem')
+      const certificate = readFileSync(CA_CERT, 'utf8')
+      const privateKey = readFileSync(CA_KEY, 'utf8')
+      for (const file of [cert, extra, parent])
+        writeFileSync(file, certificate + privateKey)
+      writeFileSync(key, privateKey)
+      const sources = [cert, key, parent, extra]
+      const base = configOf({
+        disabled,
+        allowRead: sources.map(path => ({ path, literal: true })),
+        allowWrite: sources.map(path => ({ path, literal: true })),
+      })
+      const previous = process.env.NODE_EXTRA_CA_CERTS
+      process.env.NODE_EXTRA_CA_CERTS = parent
+      overrideEmittedConnectionProbe(() => true)
+      try {
+        await SandboxManager.initialize({
+          ...base,
+          network: {
+            ...base.network,
+            tlsTerminate: {
+              caCertPath: cert,
+              caKeyPath: key,
+              extraCaCertPaths: [extra],
+            },
+          },
+        })
+        const trust = SandboxManager.getTlsTrust()!
+        expect({ granted, stamped }).toStrictEqual({
+          granted: { read: [dirname(trust.trustBundlePath)], write: [] },
+          stamped: disabled ? undefined : { denyRead: sources, denyWrite: [] },
+        })
+        expect(readFileSync(trust.trustBundlePath, 'utf8')).not.toContain(
+          'PRIVATE KEY',
+        )
+      } finally {
+        overrideEmittedConnectionProbe(undefined)
+        if (previous === undefined) delete process.env.NODE_EXTRA_CA_CERTS
+        else process.env.NODE_EXTRA_CA_CERTS = previous
+      }
+    },
+  )
 
   it("the library's trust bundle is granted beneath a credential deny", async () => {
     const above = { path: tmpdir(), mode: 'deny' as const }
@@ -1899,7 +1948,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
       },
     })
-    const own = dirname(SandboxManager.getMitmCA()!.trustBundlePath)
+    const own = dirname(SandboxManager.getTlsTrust()!.trustBundlePath)
     expect(granted).toMatchObject({ read: [own], write: [] })
     expect(
       await flagged('--deny-read', {
@@ -6110,7 +6159,7 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     windowsTrustCa(CA_CERT, { srtWin: TEST_SRT_WIN })
     await SandboxManager.initialize(createTlsTestConfig(TLS_ALLOWED))
     // Sanity: tlsTerminate config produced a CA + trust bundle.
-    const ca = SandboxManager.getMitmCA()
+    const ca = SandboxManager.getTlsTrust()
     expect(ca?.trustBundlePath).toBeTruthy()
     console.error('[winsrt G beforeAll] done')
     // 120s: install re-provisions the sandbox user (H-rows'
@@ -6144,7 +6193,7 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
       `echo %SSL_CERT_FILE% && type "%SSL_CERT_FILE:/=\\%"`,
     )
     expectStatus('G2', r, [0])
-    const bundle = SandboxManager.getMitmCA()!.trustBundlePath.replace(
+    const bundle = SandboxManager.getTlsTrust()!.trustBundlePath.replace(
       /\\/g,
       '/',
     )
@@ -6153,6 +6202,40 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     expect(firstLine).toBe(bundle)
     expect(out).toContain('-----BEGIN CERTIFICATE-----')
   })
+
+  it('G2b: exact file grants cannot expose the CA certificate or key sources', async () => {
+    await SandboxManager.reset()
+    const cfg = createTlsTestConfig(TLS_ALLOWED)
+    try {
+      await SandboxManager.initialize({
+        ...cfg,
+        filesystem: {
+          ...cfg.filesystem,
+          allowRead: [CA_CERT, CA_KEY],
+          allowWrite: [CA_CERT, CA_KEY],
+        },
+      })
+      for (const source of [CA_CERT, CA_KEY]) {
+        const result = await runSandboxed(`type "${source}"`)
+        expect({ status: result.status, stdout: result.stdout }).toStrictEqual({
+          status: 1,
+          stdout: '',
+        })
+      }
+      const bundle = SandboxManager.getTlsTrust()!.trustBundlePath
+      const result = await runSandboxed(`type "${bundle}"`)
+      expect({
+        status: result.status,
+        stdout: result.stdout.replace(/\r/g, ''),
+      }).toStrictEqual({
+        status: 0,
+        stdout: readFileSync(bundle, 'utf8').replace(/\r/g, ''),
+      })
+    } finally {
+      await SandboxManager.reset()
+      await SandboxManager.initialize(cfg)
+    }
+  }, 60_000)
 
   it.skipIf(OPENSSL_CURL === undefined)(
     'G3: OpenSSL curl trusts the MITM CA via CURL_CA_BUNDLE',
@@ -6208,7 +6291,7 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
       // NODE_EXTRA_CA_CERTS failures are a one-time startup
       // warning, NOT a hard error — assert the MITM'd request
       // returns 200, not just that node ran.
-      const bundle = SandboxManager.getMitmCA()!.trustBundlePath
+      const bundle = SandboxManager.getTlsTrust()!.trustBundlePath
       const script = nodeGetThroughProxy('example.com')
       const r = await runSandboxedUntil(
         `"${NODE}" -e "${script}"`,
@@ -6266,7 +6349,7 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
         ...createTlsTestConfig(['example.com']),
         credentials: { files: [{ path: scratch, mode: 'deny' }] },
       })
-      const bundle = SandboxManager.getMitmCA()!.trustBundlePath
+      const bundle = SandboxManager.getTlsTrust()!.trustBundlePath
       expect(dirname(dirname(bundle))).toBe(scratch)
       const r = await runSandboxed(
         `echo RAN & type "%SSL_CERT_FILE:/=\\%" & type "${beside}"`,
@@ -6384,28 +6467,20 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
   }, 120_000)
 
   it('P2: initialize() with tlsTerminate:{} auto-loads the persistent CA', async () => {
-    // No caCertPath/caKeyPath → the Windows branch of initialize()
-    // calls ensurePersistentWindowsCa(), then createMitmCA on its
-    // paths. First run generates; the returned MitmCA's certPath
-    // must be under the state-dir `ca/` (not a mkdtemp `srt-ca-`).
     const cfg = createTestConfig(['example.com'])
     await SandboxManager.initialize({
       ...cfg,
       network: { ...cfg.network, tlsTerminate: {} },
     })
-    const ca = SandboxManager.getMitmCA()
-    expect(ca).toBeTruthy()
-    expect(ca!.ephemeral).toBe(false)
-    // Case-insensitive prefix match — Windows path casing varies.
-    expect(ca!.certPath.toLowerCase()).toBe(
-      join(caDir, 'cert.pem').toLowerCase(),
-    )
-    // `srt-win user status` now reports the same thumb the session
-    // CA carries — proves ensurePersistentWindowsCa's trust step
-    // landed and the initialize() gate would have passed the
-    // explicit-path check too.
+    const ca = SandboxManager.getTlsTrust()
     const u = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
-    expect(u.caCertThumb).toBeTruthy()
+    expect({
+      certificate: ca?.caCertPem,
+      thumbprint: u.caCertThumb,
+    }).toStrictEqual({
+      certificate: readFileSync(join(caDir, 'cert.pem'), 'utf8'),
+      thumbprint: certThumbprint(ca!.caCertPem),
+    })
   }, 60_000)
 
   it.skipIf(!HAS_OWN_TLS_CLIENT)(
