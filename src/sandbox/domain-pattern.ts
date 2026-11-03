@@ -8,8 +8,9 @@
  * apply it to lists registered at run time without loading the schema module.
  */
 
-import { isIP } from 'node:net'
+import { BlockList, isIP } from 'node:net'
 import { canonicalizeHost, stripBrackets } from './parent-proxy.js'
+import { addRange, addressInSet, parseAddressRange } from './address.js'
 
 /** Drop an IPv6 zone id from an IP-literal entry; matching ignores zones. */
 function dropZone(host: string): string {
@@ -77,6 +78,21 @@ function parsePortSuffix(suffix: string): number | undefined {
 }
 
 /**
+ * CIDR entries of an allow/deny list, memoized as a `net.BlockList` so
+ * repeated matches don't re-parse. A cached `null` marks an entry that
+ * contains `/` but is not a parsable IP/CIDR range.
+ */
+const cidrBlockLists = new Map<string, BlockList | null>()
+function cidrBlockList(pattern: string): BlockList | null {
+  const cached = cidrBlockLists.get(pattern)
+  if (cached !== undefined) return cached
+  const list = new BlockList()
+  const result = addRange(list, pattern) ? list : null
+  cidrBlockLists.set(pattern, result)
+  return result
+}
+
+/**
  * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
  * protocols, paths, ports, and overly broad wildcards.
  */
@@ -139,31 +155,51 @@ export function hasValidIpv6Bracketing(val: string): boolean {
 
 /**
  * The check an allow-list entry gets: a domain pattern with an optional
- * `:port` suffix. Shared by the `network.allowedDomains` schema and the lists
- * registered at run time, so neither accepts what the other refuses.
+ * `:port` suffix, or an IP literal / CIDR range. Shared by the
+ * `network.allowedDomains` schema and the lists registered at run time, so
+ * neither accepts what the other refuses.
  */
 export function isValidAllowedDomainEntry(val: string): boolean {
   return (
-    hasValidIpv6Bracketing(val) &&
-    isValidDomainPattern(splitDomainPatternPort(val).hostPattern)
+    isAddressRangeEntry(val) ||
+    (hasValidIpv6Bracketing(val) &&
+      isValidDomainPattern(splitDomainPatternPort(val).hostPattern))
   )
 }
 
 export const ALLOWED_DOMAIN_ENTRY_MESSAGE =
   DOMAIN_PATTERN_MESSAGE +
-  ' An optional ":port" suffix (1-65535) restricts the entry to that port.'
+  ' An IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "192.168.1.10", "2001:db8::/32") is also accepted. ' +
+  'An optional ":port" suffix (1-65535) restricts the entry to that port.'
 
 /**
- * The IP-literal entries of an allow/deny list as `{ range, port? }` rules
- * for the resolved-address check: an address the list names explicitly is
- * judged the same way when a hostname resolves to it.
+ * An entry that is an IP literal or CIDR range (`10.0.0.0/8`,
+ * `192.168.1.10`, `2001:db8::/32` — IPv6 unbracketed, the same syntax as
+ * `deniedResolvedAddresses`) is judged as an address rule rather than a
+ * domain pattern. The `:port` suffix is split off first, so
+ * `10.0.0.0/8:8080` validates like any other `host:port` entry.
+ */
+export function isAddressRangeEntry(val: string): boolean {
+  return (
+    parseAddressRange(splitDomainPatternPort(val).hostPattern) !== undefined
+  )
+}
+
+/**
+ * The IP-literal and CIDR entries of an allow/deny list as `{ range, port? }`
+ * rules for the resolved-address check: an address the list names explicitly
+ * is judged the same way when a hostname resolves to it.
  */
 export function ipLiteralRules(
   entries: readonly string[],
 ): Array<{ range: string; port?: number }> {
   return entries.flatMap(entry => {
     const { hostPattern, port } = splitDomainPatternPort(entry)
-    return isIP(hostPattern) ? [{ range: hostPattern, port }] : []
+    // IP literals and CIDR ranges both feed the resolved-address guard; its
+    // rule set already consumes CIDR via net.BlockList (addRange).
+    return parseAddressRange(hostPattern) !== undefined
+      ? [{ range: hostPattern, port }]
+      : []
   })
 }
 
@@ -179,6 +215,8 @@ export function stripDomainPatternPort(pattern: string): string {
  *   - `*` matches everything (deny-all; the schema only accepts this in
  *     deniedDomains).
  *   - `*.example.com` matches any strict subdomain of example.com.
+ *   - an IP literal or CIDR range (`10.0.0.0/8`, `2001:db8::/32`) matches
+ *     IP-literal destinations only, by range membership — never names.
  *   - anything else matches exactly (case-insensitive).
  *
  * Wildcard suffix matching is refused for IP literals so an IPv6 zone-ID
@@ -192,6 +230,13 @@ export function matchesDomainPattern(
 ): boolean {
   const h = hostname.toLowerCase()
   if (pattern === '*') return true
+  if (pattern.includes('/')) {
+    const list = cidrBlockList(pattern)
+    if (!list) return false
+    const bare = stripBrackets(h)
+    const addr = isIP(bare) ? bare : (canonicalizeHost(bare) ?? bare)
+    return isIP(addr) !== 0 && addressInSet(list, addr)
+  }
   if (pattern.startsWith('*.')) {
     if (isIP(stripBrackets(h))) return false
     const baseDomain = pattern.substring(2).toLowerCase()
