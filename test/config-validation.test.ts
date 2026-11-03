@@ -238,6 +238,7 @@ describe('Config Validation', () => {
       '10.22.86.0/24',
       '10.0.0.0/8',
       '10.22.86.0/24:8080', // port-scoped CIDR
+      '[2001:db8::/32]:8080', // port-scoped IPv6 CIDR, bracketed
       '2001:db8::/32', // IPv6 CIDR, unbracketed (deniedResolvedAddresses syntax)
       '2001:db8::1', // bare unbracketed IPv6 literal, same syntax
       '[2001:db8::1]', // bracketed IPv6 literal (already accepted)
@@ -262,6 +263,7 @@ describe('Config Validation', () => {
       '10.0.0.0/33', // prefix beyond the family width
       '2001:db8::/129',
       '[2001:db8::]/32', // bracketed CIDR is unrepresentable; unbracketed is the spelling
+      '2001:db8::/32:8080', // unbracketed port-scoped IPv6 CIDR is an address ambiguity; use "[2001:db8::/32]:8080"
       '10.22.86.0/24junk',
       '10.22.86.0/24:0', // bad port
       '10.22.86.0/24:65536',

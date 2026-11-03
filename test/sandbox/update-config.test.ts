@@ -917,6 +917,8 @@ describe('per-command network allow lists', () => {
     ['127.0.0.1:3000', true],
     ['[::1]', true],
     ['[2001:db8::1]:443', true],
+    ['[2001:db8::/32]:8080', true],
+    ['2001:db8::/32:8080', false],
     ['*', false],
     ['*:443', false],
     ['*.com', false],

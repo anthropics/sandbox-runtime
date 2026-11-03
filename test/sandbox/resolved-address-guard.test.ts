@@ -579,6 +579,21 @@ describe('resolved-address-guard: config schema', () => {
     expect(g.permits('intranet.example.com', '2001:db8:2::42', 443)).toBe(true)
   })
 
+  it('a name that spells an allowed range is judged by where it resolves', () => {
+    // "169236173" is the decimal spelling of 10.22.86.205, inside the
+    // allowed 10.22.86.0/24 — but it is a name, and its spelling earns
+    // no carve-out from the built-in denials for an address it resolves
+    // to outside the range. It is judged by the resolved address, like
+    // any other name.
+    const g = createResolvedAddressGuard({
+      localAddresses,
+      allowedDomains: ['myapp.test', '10.22.86.0/24'],
+      deniedDomains: [],
+    })
+    expect(g.permits('169236173', '127.0.0.2', 443)).toBe(false)
+    expect(g.permits('169236173', '10.22.86.205', 443)).toBe(true)
+  })
+
   it('an allowed CIDR carves a name out of a built-in denial, like an IP literal does', () => {
     // Without an allow entry, a name resolving to loopback is denied.
     const g = createResolvedAddressGuard({

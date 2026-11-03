@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import {
   ipLiteralRules,
+  isAddressRangeEntry,
   isInjectHostCoveredByAllowedDomains,
   matchesDomainPattern,
   matchesDomainPatternWithPort,
@@ -253,9 +254,23 @@ describe('IP literal and CIDR entries', () => {
     expect(matchesDomainPattern('fc00::1', 'fc00::/7')).toBe(true)
   })
 
-  test('inet_aton spellings canonicalize into the range', () => {
-    // 169236173 == 10.22.86.5 (10*2^24 + 22*2^16 + 86*2^8 + 5)
+  test('numeric IP spellings canonicalize into the range', () => {
+    // 169236173 == 10.22.86.205 (10*2^24 + 22*2^16 + 86*2^8 + 205). A
+    // pure decimal / dotted-integer destination is an IP spelling, not a
+    // name — it is judged by the address it spells.
     expect(matchesDomainPattern('169236173', '10.22.86.0/24')).toBe(true)
+    expect(matchesDomainPattern('127.1', '127.0.0.0/8')).toBe(true)
+  })
+
+  test('names never match range entries, even with an address inside them', () => {
+    // Anything that is not an IP spelling (strict or pure numeric) is a
+    // name: it never matches a range, and is judged by where it
+    // resolves, via the resolved-address check.
+    expect(matchesDomainPattern('169236173x', '10.22.86.0/24')).toBe(false)
+    expect(matchesDomainPattern('x169236173', '10.22.86.0/24')).toBe(false)
+    expect(
+      matchesDomainPattern('10.22.86.5.example.com', '10.22.86.0/24'),
+    ).toBe(false)
   })
 
   test('CIDR entries never match names, and names never match CIDRs', () => {
@@ -279,6 +294,34 @@ describe('IP literal and CIDR entries', () => {
     ).toBe(true)
   })
 
+  test('port-scoped IPv6 ranges are written bracketed', () => {
+    // Like a bracketed IPv6 literal ([2001:db8::1]:443), an IPv6 range
+    // takes its port suffix bracketed: unbracketed, "2001:db8::/32:8080"
+    // is indistinguishable from an address spelling and is refused.
+    expect(splitDomainPatternPort('[2001:db8::/32]:8080')).toEqual({
+      hostPattern: '2001:db8::/32',
+      port: 8080,
+    })
+    expect(isAddressRangeEntry('[2001:db8::/32]:8080')).toBe(true)
+    expect(isAddressRangeEntry('2001:db8::/32:8080')).toBe(false)
+    expect(
+      matchesDomainPatternWithPort('2001:db8::5', 8080, '[2001:db8::/32]:8080'),
+    ).toBe(true)
+    expect(
+      matchesDomainPatternWithPort('2001:db8::5', 443, '[2001:db8::/32]:8080'),
+    ).toBe(false)
+    expect(
+      matchesDomainPatternWithPort(
+        '[2001:db8::5]',
+        8080,
+        '[2001:db8::/32]:8080',
+      ),
+    ).toBe(true)
+    expect(
+      matchesDomainPatternWithPort('2001:db9::5', 8080, '[2001:db8::/32]:8080'),
+    ).toBe(false)
+  })
+
   test('unparsable "/ entries" match nothing', () => {
     expect(matchesDomainPattern('10.0.0.1', '10.0.0.0/33')).toBe(false)
     expect(matchesDomainPattern('evil.com', 'evil.com/24')).toBe(false)
@@ -294,6 +337,7 @@ describe('IP literal and CIDR entries', () => {
       '[2001:db8::1]',
       'localhost',
       '10.22.86.0/24:8080',
+      '[2001:db8::/32]:8080',
     ])
     expect(rules).toEqual([
       { range: '10.22.86.0/24', port: undefined },
@@ -301,6 +345,7 @@ describe('IP literal and CIDR entries', () => {
       { range: '2001:db8::/32', port: undefined },
       { range: '2001:db8::1', port: undefined },
       { range: '10.22.86.0/24', port: 8080 },
+      { range: '2001:db8::/32', port: 8080 },
     ])
   })
 })

@@ -170,14 +170,17 @@ export function isValidAllowedDomainEntry(val: string): boolean {
 export const ALLOWED_DOMAIN_ENTRY_MESSAGE =
   DOMAIN_PATTERN_MESSAGE +
   ' An IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "192.168.1.10", "2001:db8::/32") is also accepted. ' +
-  'An optional ":port" suffix (1-65535) restricts the entry to that port.'
+  'An optional ":port" suffix (1-65535) restricts the entry to that port; an IPv6 range takes it bracketed ("[2001:db8::/32]:8080").'
 
 /**
  * An entry that is an IP literal or CIDR range (`10.0.0.0/8`,
  * `192.168.1.10`, `2001:db8::/32` — IPv6 unbracketed, the same syntax as
  * `deniedResolvedAddresses`) is judged as an address rule rather than a
  * domain pattern. The `:port` suffix is split off first, so
- * `10.0.0.0/8:8080` validates like any other `host:port` entry.
+ * `10.0.0.0/8:8080` validates like any other `host:port` entry; an IPv6
+ * range takes the port bracketed, `[2001:db8::/32]:8080`, because
+ * unbracketed `2001:db8::/32:8080` is indistinguishable from an address
+ * (the same reason a port-scoped `2001:db8::1:443` is unrepresentable).
  */
 export function isAddressRangeEntry(val: string): boolean {
   return (
@@ -217,6 +220,8 @@ export function stripDomainPatternPort(pattern: string): string {
  *   - `*.example.com` matches any strict subdomain of example.com.
  *   - an IP literal or CIDR range (`10.0.0.0/8`, `2001:db8::/32`) matches
  *     IP-literal destinations only, by range membership — never names.
+ *     Callers that judge IP spellings (filterNetworkRequest canonicalizes
+ *     the destination first) get the same treatment as for exact literals.
  *   - anything else matches exactly (case-insensitive).
  *
  * Wildcard suffix matching is refused for IP literals so an IPv6 zone-ID
@@ -234,7 +239,15 @@ export function matchesDomainPattern(
     const list = cidrBlockList(pattern)
     if (!list) return false
     const bare = stripBrackets(h)
-    const addr = isIP(bare) ? bare : (canonicalizeHost(bare) ?? bare)
+    // A range entry matches IP-literal destinations only, never names.
+    // Only IP spellings are canonicalized and range-checked: a strict IP
+    // (isIP), or a pure numeric IPv4 form (decimal "169236173" or dotted
+    // "127.1") that canonicalizeHost resolves to an IP. A name — which
+    // carries an alphabetic label — is refused here rather than
+    // canonicalized into a range; it is judged by where it actually
+    // resolves, via the resolved-address check.
+    if (isIP(bare) === 0 && !/^\d+(\.\d+)*$/.test(bare)) return false
+    const addr = canonicalizeHost(bare) ?? bare
     return isIP(addr) !== 0 && addressInSet(list, addr)
   }
   if (pattern.startsWith('*.')) {

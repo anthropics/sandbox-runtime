@@ -59,7 +59,7 @@ const deniedDomainPatternSchema = z.string().refine(
     message:
       DOMAIN_PATTERN_MESSAGE +
       ' In deniedDomains a bare "*" (deny-all) is also accepted, as is an IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "2001:db8::/32"). ' +
-      'An optional ":port" suffix (1-65535) restricts the entry to that port.',
+      'An optional ":port" suffix (1-65535) restricts the entry to that port; an IPv6 range takes it bracketed ("[2001:db8::/32]:8080").',
   },
 )
 
@@ -683,8 +683,8 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'List of allowed domains (e.g., ["github.com", "*.npmjs.org", "api.example.com:443"]). ' +
         'An IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "2001:db8::/32") is also accepted and ' +
-        'matches IP-literal destinations by range. ' +
-        'An optional ":port" suffix restricts the entry to that destination port.',
+        'matches IP-literal destinations by range, never names. ' +
+        'An optional ":port" suffix restricts the entry to that destination port; an IPv6 range takes it bracketed ("[2001:db8::/32]:8080").',
     ),
   deniedDomains: z
     .array(deniedDomainPatternSchema)
@@ -692,7 +692,7 @@ export const NetworkConfigSchema = z.object({
       'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all). ' +
         'An IP literal or CIDR range (IPv4 or IPv6, unbracketed; e.g., "10.0.0.0/8", "2001:db8::/32") is also accepted ' +
         'and denies IP-literal destinations by range, as well as any hostname resolving into it. ' +
-        'An optional ":port" suffix (e.g., "*:22") restricts the entry to that destination port.',
+        'An optional ":port" suffix (e.g., "*:22") restricts the entry to that destination port; an IPv6 range takes it bracketed ("[2001:db8::/32]:8080").',
     ),
   deniedDomainReasons: z
     .record(z.string(), z.string().min(1))
