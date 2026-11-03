@@ -531,7 +531,11 @@ export const CredentialSourceConfigSchema = z
         'Budget for the command, default 10000. The child is SIGKILLed ' +
           'at the deadline, but a grandchild holding its stdout can still ' +
           'delay the wrap past it, so a source command should not fork ' +
-          'anything that outlives it.',
+          'anything that outlives it. A prompt shown by another process ' +
+          '(the macOS keychain dialog) stays open after the deadline, and ' +
+          'a late answer has no effect: the timeout is cached for the ' +
+          'session (reset() clears it). Give sources that wait on a person ' +
+          'a longer budget.',
       ),
   })
   .strict()
