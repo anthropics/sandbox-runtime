@@ -2680,6 +2680,10 @@ async function wrapWithSandboxOnce(
   const allowNestedUserNamespaces =
     customConfig?.allowNestedUserNamespaces ?? config?.allowNestedUserNamespaces
 
+  // Check custom config to allow .git/config access
+  const allowGitConfig =
+    customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig()
+
   const gitSafeDirectories = getGitSafeDirectories(customConfig)
 
   switch (platform) {
@@ -2701,16 +2705,21 @@ async function wrapWithSandboxOnce(
         setEnvVars: credentialRestrictions.setEnvVars,
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
         degradeToDenyPaths: credentialRestrictions.degradeToDenyPaths,
-        allowUnixSockets: getAllowUnixSockets(),
+        allowUnixSockets:
+          customConfig?.network?.allowUnixSockets ?? getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
+        allowLocalBinding:
+          customConfig?.network?.allowLocalBinding ?? getAllowLocalBinding(),
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
         gitSafeDirectories,
-        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
-        allowAppleEvents: getAllowAppleEvents(),
+        enableWeakerNetworkIsolation:
+          customConfig?.enableWeakerNetworkIsolation ??
+          getEnableWeakerNetworkIsolation(),
+        allowAppleEvents:
+          customConfig?.allowAppleEvents ?? getAllowAppleEvents(),
         binShell,
       })
 
@@ -2747,7 +2756,7 @@ async function wrapWithSandboxOnce(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
         gitSafeDirectories,
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
