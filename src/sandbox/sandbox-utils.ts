@@ -937,10 +937,13 @@ export function generateProxyEnvVars(
     envVars.push(`FTP_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
     envVars.push(`ftp_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
 
-    // rsync proxy support — RSYNC_PROXY is host:port only, no userinfo. With
-    // proxy auth on, rsync via this var fails at the CONNECT (407); use SSH
-    // transport or wrap with proxychains instead.
-    envVars.push(`RSYNC_PROXY=localhost:${socksProxyPort}`)
+    // rsync proxy support. rsync reads RSYNC_PROXY as [USER:PASS@]HOST:PORT
+    // and sends the userinfo as Proxy-Authorization: Basic on its CONNECT.
+    // It splits at the last `@` and the first `:` and decodes nothing, so the
+    // username goes in raw: neither it (`srt.<base64>`) nor the hex token
+    // holds an `@` or a `:`.
+    const rsyncAuth = proxyAuthToken ? `${userRaw}:${proxyAuthToken}@` : ''
+    envVars.push(`RSYNC_PROXY=${rsyncAuth}localhost:${socksProxyPort}`)
 
     // Database tools NOTE: Most database clients don't have built-in proxy support
     // You typically need to use SSH tunneling or a SOCKS wrapper like tsocks/proxychains
