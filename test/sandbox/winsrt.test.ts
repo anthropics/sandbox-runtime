@@ -31,8 +31,14 @@ import { isMacOS, isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import {
   SandboxManager,
+  resolveCommandText,
   windowsProfileReadWarningsOf,
 } from '../../src/sandbox/sandbox-manager.js'
+import {
+  attributionKeyFor,
+  decodeSandboxedCommand,
+  encodeSandboxedCommand,
+} from '../../src/sandbox/sandbox-utils.js'
 import type {
   CredentialFileConfig,
   SandboxRuntimeConfig,
@@ -47,6 +53,11 @@ import { certThumbprint } from '../../src/sandbox/mitm-ca.js'
 import * as platform from '../../src/utils/platform.js'
 import { overrideEmittedConnectionProbe } from '../../src/sandbox/emitted-connection.js'
 import * as winUtils from '../../src/sandbox/windows-sandbox-utils.js'
+import * as mxcUtils from '../../src/sandbox/mxc-sandbox-utils.js'
+import type {
+  MxcProcessHandle,
+  MxcRequest,
+} from '../../src/sandbox/mxc-sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
@@ -942,12 +953,16 @@ describe('WindowsSandboxError (pure, all platforms)', () => {
 describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
   it('accepts a valid name and rejects empty / >20 chars', () => {
     expect(
-      WindowsConfigSchema.safeParse({ sandboxUser: 'srt-sb-custom' }).success,
+      WindowsConfigSchema.safeParse({
+        sandboxUser: 'srt-sb-custom',
+      }).success,
     ).toBe(true)
     expect(WindowsConfigSchema.safeParse({}).success).toBe(true)
     // Windows local usernames are capped at 20 (LM20_UNLEN).
     expect(
-      WindowsConfigSchema.safeParse({ sandboxUser: 'a'.repeat(21) }).success,
+      WindowsConfigSchema.safeParse({
+        sandboxUser: 'a'.repeat(21),
+      }).success,
     ).toBe(false)
     expect(WindowsConfigSchema.safeParse({ sandboxUser: '' }).success).toBe(
       false,
@@ -997,7 +1012,9 @@ describe('network.allowLocalBinding on Windows (pure, all platforms)', () => {
       expect(r.data.network.allowLocalBinding).toBeUndefined()
     }
     expect(
-      WindowsConfigSchema.safeParse({ loopbackPortRange: 'x' }).success,
+      WindowsConfigSchema.safeParse({
+        loopbackPortRange: 'x',
+      }).success,
     ).toBe(true)
   })
 })
@@ -1006,7 +1023,9 @@ describe('WindowsConfigSchema (pure, all platforms)', () => {
   it('has no writeRestrictedToken option: a config that still sets it parses without it', () => {
     expect('writeRestrictedToken' in WindowsConfigSchema.shape).toBe(false)
     expect(
-      WindowsConfigSchema.parse({ writeRestrictedToken: false }),
+      WindowsConfigSchema.parse({
+        writeRestrictedToken: false,
+      }),
     ).not.toHaveProperty('writeRestrictedToken')
   })
 })
@@ -1906,6 +1925,241 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         credentials: { files: [{ path: dirname(own), mode: 'deny' }] },
       }),
     ).not.toContain(own)
+  })
+
+  it('defaults to srt-win when no backend is named', async () => {
+    await SandboxManager.initialize(configOf({}))
+    expect(SandboxManager.getWindowsBackend?.()).toEqual({ backend: 'srt-win' })
+  })
+
+  it('refuses tlsTerminate on the mxc backend', async () => {
+    const base = configOf({})
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.initialize({
+        ...base,
+        network: {
+          ...base.network,
+          tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
+        },
+        windows: { ...base.windows, backend: 'mxc' },
+      }),
+    ).rejects.toMatchObject({
+      code: 'backend_unsupported',
+      message: expect.stringContaining('network.tlsTerminate is not supported'),
+    })
+  })
+
+  it('refuses the mxc backend off a BaseContainer host, with no fallback', async () => {
+    // Here the SDK is either not installed (it needs Node 24) or its
+    // probe refuses a non-Windows host: both must refuse, not fall
+    // back to srt-win.
+    const base = configOf({})
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.initialize({
+        ...base,
+        windows: { ...base.windows, backend: 'mxc' },
+      }),
+    ).rejects.toMatchObject({
+      code: 'backend_unsupported',
+      message: expect.stringContaining("windows.backend is 'mxc'"),
+    })
+    expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
+  })
+
+  it('mxc: allowWrite is writable from its own folder, as spawnSandboxed sends it', async () => {
+    const spawned: MxcRequest[] = []
+    spies.push(
+      spyOn(mxcUtils, 'isMxcSdkInstalled').mockReturnValue(true),
+      spyOn(mxcUtils, 'loadMxcSdk').mockResolvedValue({
+        probe: () => ({
+          tier: 'base-container',
+          needsDaclAugmentation: false,
+          warnings: [],
+          probes: {
+            baseContainerSupportsDenyPaths: true,
+            baseContainerSupportsIngressHostLoopbackAllow: true,
+            baseContainerSupportsIdentitylessLoopbackProxy: true,
+            uiCapabilities: {
+              canBlockClipboardRead: true,
+              canBlockClipboardWrite: true,
+              canBlockInputInjection: true,
+            },
+          },
+        }),
+        spawn: request => {
+          spawned.push(request)
+          return Promise.resolve({} as MxcProcessHandle)
+        },
+      }),
+    )
+    const w = join(root, 'w')
+    mkdirSync(w)
+    const keep = join(sub, 'keep')
+    mkdirSync(keep)
+    const base = configOf({
+      denyRead: [d],
+      allowWrite: [w, sub],
+      denyWrite: [keep],
+    })
+    await SandboxManager.initialize({
+      ...base,
+      windows: { ...base.windows, backend: 'mxc' },
+    })
+    // A read-only entry for the working directory would be the most
+    // specific match for a write grant's own folder and win over it.
+    for (const cwd of [w, sub]) {
+      await SandboxManager.spawnSandboxed!('echo f> f.txt', { cwd })
+      const fsReq = spawned.at(-1)!.filesystem
+      expect(fsReq.readwritePaths).toContain(cwd)
+      expect(fsReq.readonlyPaths).not.toContain(cwd)
+      expect(fsReq.deniedPaths).not.toContain(cwd)
+    }
+    const fsReq = spawned.at(-1)!.filesystem
+    expect(fsReq.deniedPaths).toContain(d)
+    expect(fsReq.deniedPaths).toContain(keep)
+    // The child's TEMP is the folder granted for writing.
+    const env = spawned.at(-1)!.environment
+    if (process.env.TEMP !== undefined) {
+      expect(fsReq.readwritePaths).toContain(process.env.TEMP)
+      expect(env.TEMP).toBe(process.env.TEMP)
+    }
+  })
+
+  it('mxc: a masked credential file is denied in the spawned request', async () => {
+    const spawned: MxcRequest[] = []
+    const probe = (): mxcUtils.MxcProbeOutput => ({
+      tier: 'base-container',
+      needsDaclAugmentation: false,
+      warnings: [],
+      probes: {
+        baseContainerSupportsDenyPaths: true,
+        baseContainerSupportsIngressHostLoopbackAllow: true,
+        baseContainerSupportsIdentitylessLoopbackProxy: true,
+        uiCapabilities: {
+          canBlockClipboardRead: true,
+          canBlockClipboardWrite: true,
+          canBlockInputInjection: true,
+        },
+      },
+    })
+    spies.push(
+      spyOn(mxcUtils, 'isMxcSdkInstalled').mockReturnValue(true),
+      spyOn(mxcUtils, 'loadMxcSdk').mockResolvedValue({
+        probe,
+        spawn: request => {
+          spawned.push(request)
+          return Promise.resolve({} as MxcProcessHandle)
+        },
+      }),
+    )
+    const base = configOf({ allowWrite: [root] })
+    await SandboxManager.initialize({
+      ...base,
+      windows: { ...base.windows, backend: 'mxc' },
+    })
+    expect(SandboxManager.getWindowsBackend?.()?.backend).toBe('mxc')
+    const credentials = { files: [{ path: token, mode: 'mask' as const }] }
+    const missing = join(d, 'not-yet-created')
+    await SandboxManager.spawnSandboxed!('rem', {
+      customConfig: {
+        credentials,
+        filesystem: { denyRead: [missing], allowWrite: [], denyWrite: [] },
+      },
+    })
+    // filesystem.disabled leaves the mask in force, as under srt-win.
+    await SandboxManager.spawnSandboxed!('rem', {
+      customConfig: {
+        credentials,
+        filesystem: {
+          disabled: true,
+          denyRead: [],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      },
+    })
+    expect(spawned).toHaveLength(2)
+    expect(spawned[0].filesystem.deniedPaths).toContain(token)
+    // A missing literal deny is kept, not dropped.
+    expect(spawned[0].filesystem.deniedPaths).toContain(missing)
+    expect(spawned[1].filesystem.deniedPaths).toContain(token)
+    // The command text is registered under the command id's key, as
+    // on srt-win (the proxy username carries the same key; see
+    // mxc-config.test.ts).
+    await SandboxManager.spawnSandboxed!('curl x', {
+      commandId: 'tool-7',
+      commandText: 'curl shown',
+    })
+    expect(
+      resolveCommandText(
+        decodeSandboxedCommand(
+          encodeSandboxedCommand(attributionKeyFor('curl x', 'tool-7')),
+        ),
+      ),
+    ).toBe('curl shown')
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.spawnSandboxed!('rem', {
+        customConfig: {
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+            allowLocalBinding: true,
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'backend_unsupported' })
+    expect(spawned).toHaveLength(3)
+  })
+
+  it('mxc: refuses settings it cannot honour, before loading the SDK', async () => {
+    const load = spyOn(mxcUtils, 'loadMxcSdk')
+    spies.push(load)
+    const base = configOf({ allowWrite: [root] })
+    const mxc = { ...base.windows, backend: 'mxc' as const }
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.initialize({
+        ...base,
+        filesystem: { ...base.filesystem, disabled: true },
+        windows: mxc,
+      }),
+    ).rejects.toMatchObject({
+      code: 'backend_unsupported',
+      message: expect.stringContaining('filesystem.disabled'),
+    })
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.initialize({
+        ...base,
+        network: { ...base.network, allowLocalBinding: true },
+        windows: mxc,
+      }),
+    ).rejects.toMatchObject({
+      code: 'backend_unsupported',
+      message: expect.stringContaining('network.allowLocalBinding'),
+    })
+    expect(load).not.toHaveBeenCalled()
+  })
+
+  it('checkDependencies checks the backend it is told, before initialize()', () => {
+    spies.push(spyOn(mxcUtils, 'isMxcSdkInstalled').mockReturnValue(false))
+    expect(
+      SandboxManager.checkDependencies(undefined, { windowsBackend: 'mxc' }),
+    ).toEqual({
+      errors: [mxcUtils.MXC_SDK_MISSING],
+      warnings: [],
+    })
+  })
+
+  it('wrapWithSandboxArgv and spawnSandboxed name the other entry point', async () => {
+    await SandboxManager.initialize(configOf({}))
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(SandboxManager.spawnSandboxed?.('echo x')).rejects.toThrow(
+      /wrapWithSandboxArgv/,
+    )
   })
 })
 
@@ -4626,6 +4880,9 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
     await SandboxManager.initialize(createTestConfig())
+    // This suite asserts srt-win-shaped behavior (argv, WFP, ACLs).
+    // mxc coverage lives in test/sandbox/mxc.test.ts.
+    expect(SandboxManager.getWindowsBackend?.()?.backend).toBe('srt-win')
     console.error('[winsrt beforeAll] done')
     // Install and uninstall each run an elevated srt-win that can outlast
     // bun's 5s default hook timeout; a hook that times out is killed
@@ -4634,10 +4891,17 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
   afterAll(async () => {
     await SandboxManager.reset()
+    // 55s spawn inside the 60s hook (like the H-rows teardown): the
+    // default internal timeout (120s) exceeds the hook budget, so a
+    // slow uninstall would be hook-killed into an opaque
+    // `uninstall failed (exit null)` instead of the legible
+    // srt_win_timeout. Uninstall removes the sandbox user + profile
+    // and routinely exceeds bun's 5s default hook timeout.
     uninstallWindowsSandbox({
       ...SUITE_INSTALL,
       sublayerGuid: TEST_SUBLAYER,
       srtWin: TEST_SRT_WIN,
+      timeoutMs: 55_000,
     })
   }, 60_000)
 
@@ -6783,7 +7047,11 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       denyWrite: [],
       ...filesystem,
     },
-    windows: { srtWin: { path: process.execPath }, ...windows },
+    windows: {
+      backend: 'srt-win',
+      srtWin: { path: process.execPath },
+      ...windows,
+    },
   })
   const pathsOf = (cfg: SandboxRuntimeConfig): string[] =>
     [
@@ -7802,7 +8070,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         const via = (path?: string) =>
           SandboxManager.wrapWithSandboxArgv('echo x', undefined, {
             ...config({}, { denyRead: [join(home, '.cargo')], allowWrite: [] }),
-            ...(path && { windows: { srtWin: { path } } }),
+            ...(path && {
+              windows: { srtWin: { path } },
+            }),
           })
         const refusedBy = async (path?: string) => {
           try {
@@ -7859,7 +8129,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
         writeFileSync(other, 'x')
         const cfg = (path?: string) => ({
           ...config({}, { denyRead: [join(home, '.cargo')], allowWrite: [] }),
-          ...(path && { windows: { srtWin: { path } } }),
+          ...(path && {
+            windows: { srtWin: { path } },
+          }),
         })
         calls = []
         await SandboxManager.wrapWithSandboxArgv('echo x', undefined, cfg())
