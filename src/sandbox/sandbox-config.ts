@@ -149,6 +149,37 @@ const ParentProxyConfigSchema = z.object({
 })
 
 /**
+ * Where in a forwarded request a masked credential's sentinel may be
+ * substituted. An HTTP header name is an RFC 9110 token.
+ */
+const injectTargetSchema = z.union([
+  z.literal('headers'),
+  z.literal('body'),
+  z
+    .string()
+    .regex(
+      /^header:[!#$%&'*+.^_`|~0-9A-Za-z-]+$/,
+      'Expected "headers", "body", or "header:<name>" (e.g. ' +
+        '"header:authorization")',
+    )
+    .transform(s => s as `header:${string}`),
+])
+
+const injectIntoSchema = z
+  .array(injectTargetSchema)
+  .optional()
+  .describe(
+    'Optional narrowing of where in a request the proxy substitutes this ' +
+      'credential: "headers" (any header), "header:<name>" (that header ' +
+      'only, case-insensitive), "body". If unset, every header and the ' +
+      'body. A sentinel anywhere else reaches the upstream as the fake. ' +
+      'Narrow to the header the API authenticates with when an injectHost ' +
+      'stores what it is sent (issues, gists, notes): substituted in a ' +
+      'body, the real value is stored there and can be read back. Only ' +
+      'meaningful when mode is "mask"; accepted but ignored for "deny".',
+  )
+
+/**
  * Schema for the access mode of a declared credential source.
  *
  * - `deny` — the sandboxed process cannot read the file / does not see the
@@ -388,6 +419,7 @@ export const CredentialFileConfigSchema = z.object({
         'injected at every reachable host. Only meaningful when mode is ' +
         '"mask"; accepted but ignored for "deny".',
     ),
+  injectInto: injectIntoSchema,
 })
 
 /**
@@ -530,6 +562,7 @@ export const CredentialEnvVarConfigSchema = z.object({
         'injected at every reachable host. Only meaningful when mode is ' +
         '"mask"; accepted but ignored for "deny".',
     ),
+  injectInto: injectIntoSchema,
 })
 
 /**
@@ -1323,7 +1356,7 @@ export const SandboxRuntimeConfigSchema = z
     // certainly a config mistake. Applies to both env vars and files.
     let hasMasked = false
     const checkMaskedEntry = (
-      entry: { mode: string; injectHosts?: string[] },
+      entry: { mode: string; injectHosts?: string[]; injectInto?: string[] },
       path: (string | number)[],
     ) => {
       if (entry.injectHosts) {
@@ -1377,6 +1410,17 @@ export const SandboxRuntimeConfigSchema = z
               `injection only runs on TLS-terminated connections.`,
           })
         }
+      }
+      if (entry.injectInto !== undefined && entry.injectInto.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [...path, 'injectInto'],
+          message:
+            `injectInto is explicitly empty — the credential would be ` +
+            `masked but never injected. Omit injectInto to substitute in ` +
+            `every header and the body, or list where it belongs (e.g. ` +
+            `["header:authorization"]).`,
+        })
       }
       if (entry.injectHosts !== undefined && entry.injectHosts.length === 0) {
         ctx.addIssue({
