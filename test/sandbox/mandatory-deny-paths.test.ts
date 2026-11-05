@@ -38,7 +38,12 @@ import {
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from '../../src/sandbox/sandbox-utils.js'
-import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
+import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
+import {
+  createLinkedWorktreeFixture,
+  createMainWorktreeFixture,
+  withWorktreeFixture,
+} from '../helpers/git-fixtures.js'
 
 /**
  * Integration tests for mandatory deny paths.
@@ -126,23 +131,32 @@ describe.if(isSupportedPlatform)(
       cleanupBwrapMountPoints({ force: true })
     })
 
+    type WriteOptions = {
+      allowGitConfig?: boolean
+      allowGitCommonDir?: boolean
+      allowOnly?: string[]
+      denyWithinAllow?: string[]
+    }
+
     function runSandboxedWrite(
       filePath: string,
       content: string,
+      options: WriteOptions = {},
     ): Promise<{ success: boolean; stderr: string }> {
-      return runSandboxed(`echo '${content}' > '${filePath}'`)
+      return runSandboxed(`echo '${content}' > '${filePath}'`, [], options)
     }
 
     async function runSandboxed(
       command: string,
       ripgrepArgs: string[] = [],
+      options: WriteOptions = {},
     ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
 
       // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
-        allowOnly: ['.'],
-        denyWithinAllow: [], // Empty - relying on mandatory denies
+        allowOnly: options.allowOnly ?? ['.'],
+        denyWithinAllow: options.denyWithinAllow ?? [],
       }
 
       let wrappedCommand: string
@@ -152,6 +166,8 @@ describe.if(isSupportedPlatform)(
           needsNetworkRestriction: false,
           readConfig: undefined,
           writeConfig,
+          allowGitConfig: options.allowGitConfig,
+          allowGitCommonDir: options.allowGitCommonDir,
         })
       } else {
         wrappedCommand = await wrapCommandWithSandboxLinux({
@@ -159,6 +175,8 @@ describe.if(isSupportedPlatform)(
           needsNetworkRestriction: false,
           readConfig: undefined,
           writeConfig,
+          allowGitConfig: options.allowGitConfig,
+          allowGitCommonDir: options.allowGitCommonDir,
           ripgrepConfig: { command: 'rg', args: ripgrepArgs },
         })
       }
@@ -174,6 +192,128 @@ describe.if(isSupportedPlatform)(
         stderr: result.stderr || '',
       }
     }
+
+    describe.if(isLinux || isMacOS)('allowGitCommonDir', () => {
+      for (const enabled of [false, true]) {
+        it(`common refs are writable only when enabled: ${enabled}`, async () => {
+          await withWorktreeFixture(
+            createLinkedWorktreeFixture(
+              TEST_DIR,
+              'linked-refs',
+              ORIGINAL_CONTENT,
+            ),
+            async ({ commonDir }) => {
+              const target = join(commonDir, 'refs', 'heads', 'main')
+              const result = await runSandboxedWrite(target, MODIFIED_CONTENT, {
+                allowGitCommonDir: enabled,
+              })
+              expect(result.success).toBe(enabled)
+              expect(readFileSync(target, 'utf8')).toBe(
+                enabled ? `${MODIFIED_CONTENT}\n` : ORIGINAL_CONTENT,
+              )
+            },
+          )
+        })
+      }
+
+      for (const [relativeTarget, initiallyExists] of [
+        ['config', true],
+        ['config.worktree', true],
+        ['config.worktree', false],
+        ['worktrees/feature/config.worktree', true],
+        ['worktrees/sibling/config.worktree', true],
+        ['hooks/pre-commit', true],
+      ] as const) {
+        it(`protects ${relativeTarget}${initiallyExists ? '' : ' (absent)'} with common-dir access and broader user allows`, async () => {
+          await withWorktreeFixture(
+            createLinkedWorktreeFixture(
+              TEST_DIR,
+              'linked-protected',
+              ORIGINAL_CONTENT,
+            ),
+            async ({ commonDir, worktreeGitDir }) => {
+              mkdirSync(join(commonDir, 'worktrees', 'sibling'), {
+                recursive: true,
+              })
+              const target = join(commonDir, relativeTarget)
+              if (initiallyExists) writeFileSync(target, ORIGINAL_CONTENT)
+              else rmSync(target)
+              for (const options of [
+                { allowOnly: ['..'] },
+                { allowOnly: ['..'], malformedHead: true },
+                { allowGitCommonDir: true },
+                { allowGitCommonDir: true, allowGitConfig: true },
+              ]) {
+                const head = join(worktreeGitDir, 'HEAD')
+                let command = `echo '${MODIFIED_CONTENT}' > '${target}'`
+                if (options.malformedHead) {
+                  writeFileSync(head, 'not a Git HEAD\n')
+                  command = `printf 'ref: refs/heads/feature\\n' > '${head}' && ${command}`
+                }
+                const result = await runSandboxed(command, [], options)
+                if (options.malformedHead) {
+                  expect(readFileSync(head, 'utf8')).toBe(
+                    'ref: refs/heads/feature\n',
+                  )
+                }
+                const allowed =
+                  options.allowGitConfig === true &&
+                  relativeTarget !== 'hooks/pre-commit'
+                expect(result.success).toBe(allowed)
+                // Linux's temporary deny mount point is not a created config.
+                if (!initiallyExists) cleanupBwrapMountPoints()
+                if (!initiallyExists && !allowed) {
+                  expect(existsSync(target)).toBe(false)
+                } else {
+                  expect(readFileSync(target, 'utf8')).toBe(
+                    allowed ? `${MODIFIED_CONTENT}\n` : ORIGINAL_CONTENT,
+                  )
+                }
+              }
+            },
+          )
+        })
+      }
+
+      it('explicit denies beat the common-dir grant', async () => {
+        await withWorktreeFixture(
+          createLinkedWorktreeFixture(
+            TEST_DIR,
+            'linked-deny',
+            ORIGINAL_CONTENT,
+          ),
+          async ({ commonDir }) => {
+            const target = join(commonDir, 'refs', 'heads', 'main')
+            const result = await runSandboxedWrite(target, MODIFIED_CONTENT, {
+              allowGitCommonDir: true,
+              denyWithinAllow: [target],
+            })
+            expect(result.success).toBe(false)
+            expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
+          },
+        )
+      })
+
+      it('does not expand the main worktree using commondir', async () => {
+        await withWorktreeFixture(
+          createMainWorktreeFixture(
+            TEST_DIR,
+            'main-commondir',
+            ORIGINAL_CONTENT,
+          ),
+          async ({ rootDir, commonDir }) => {
+            const target = join(rootDir, 'outside')
+            writeFileSync(target, ORIGINAL_CONTENT)
+            writeFileSync(join(commonDir, 'commondir'), rootDir)
+            const result = await runSandboxedWrite(target, MODIFIED_CONTENT, {
+              allowGitCommonDir: true,
+            })
+            expect(result.success).toBe(false)
+            expect(readFileSync(target, 'utf8')).toBe(ORIGINAL_CONTENT)
+          },
+        )
+      })
+    })
 
     describe('Dangerous files should be blocked', () => {
       for (const name of DANGEROUS_FILES) {
