@@ -823,6 +823,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               port,
               upstreamCA: options.tlsTerminateUpstreamCA,
               lookup,
+              parentProxy: options.parentProxy,
               stripResponseHeaders: options.stripResponseHeaders,
               requireHostMatch: options.requireHostMatch,
               maxHeaderSize: options.maxHeaderSize,
