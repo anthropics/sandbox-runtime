@@ -944,6 +944,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // http-server sockets to allowHalfOpen=false auto-close the client
       // side on FIN and the reply is lost.
       socket.allowHalfOpen = true
+      if ('setNoDelay' in socket && typeof socket.setNoDelay === 'function') {
+        socket.setNoDelay(true)
+      }
+      upstream.setNoDelay(true)
       // Forward any bytes the client sent in the same packet as the CONNECT
       // (Node delivers these as the `head` buffer, not via the socket stream),
       // plus anything the ClientHello sniff consumed when mitmCA is on.
@@ -958,7 +962,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         socket.destroy()
       })
       socket.on('close', () => upstream.destroy())
-      upstream.on('close', () => socket.destroy())
+      upstream.on('close', hadError => {
+        if (hadError) socket.destroy()
+      })
     } catch (err) {
       logForDebugging(`Error handling CONNECT: ${err}`, { level: 'error' })
       // Same rule as the 502 path: once the MITM sniff's 200 is out, a
