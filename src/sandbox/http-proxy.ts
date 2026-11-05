@@ -30,6 +30,7 @@ import {
   type RequestDecision,
   rawDenied,
   respondDenied,
+  endDeniedRequest,
   respondUpstreamError,
   type FilterRequestCallback,
   type MutateForwardedHeaders,
@@ -45,6 +46,9 @@ import {
   type TunnelTimeouts,
 } from './tls-terminate-proxy.js'
 import {
+  BodySubstitutionTooLargeError,
+  MAX_BODY_SUBSTITUTION_BUFFER_BYTES,
+  collectSubstitutedBody,
   prepareBodySubstitution,
   type GetBodySubstitutions,
 } from './body-substitution.js'
@@ -1224,13 +1228,41 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // on the TLS-terminated path, so a set value can carry a sentinel.
       options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
       // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
-      // the same config gate). May delete content-length from fwdHeaders.
-      const bodyTransform = prepareBodySubstitution(
+      // the same config gate). Length-changing pairs are buffered so
+      // Content-Length stays exact.
+      const bodyPlan = prepareBodySubstitution(
         options.getBodySubstitutionsPlaintext,
         req,
         fwdHeaders,
         hostname,
       )
+      let bodyTransform = bodyPlan?.transform
+      let substitutedBody: Buffer | undefined
+
+      if (bodyPlan?.mayChangeLength) {
+        try {
+          substitutedBody = await collectSubstitutedBody(
+            body,
+            bodyPlan.transform,
+            MAX_BODY_SUBSTITUTION_BUFFER_BYTES,
+          )
+          fwdHeaders['content-length'] = String(substitutedBody.length)
+          bodyTransform = undefined
+        } catch (err) {
+          if (err instanceof BodySubstitutionTooLargeError) {
+            respondDenied(
+              res,
+              `Masked-credential body substitution may change Content-Length, ` +
+                `so the proxy must buffer the body, but it exceeds the ` +
+                `${MAX_BODY_SUBSTITUTION_BUFFER_BYTES}-byte buffering limit; denied.`,
+            )
+            endDeniedRequest(req, res, body)
+            return
+          }
+          endDeniedRequest(req, res, body)
+          throw err
+        }
+      }
 
       // When the client declared a body but the forwarded headers carry no
       // framing (chunked TE stripped as hop-by-hop, or a body transform
@@ -1376,7 +1408,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())
 
-      if (bodyTransform) {
+      if (substitutedBody !== undefined) {
+        proxyReq.end(substitutedBody)
+      } else if (bodyTransform) {
         // Errors on either side of the extra pipe stage tear the chain
         // down — a stalled half-open upstream would otherwise wait for the
         // client.

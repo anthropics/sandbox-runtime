@@ -192,6 +192,20 @@ function destroyAfterResponse(req: IncomingMessage, res: ServerResponse): void {
   })
 }
 
+/** Stop a forwarded body after a denial without losing the response. */
+export function endDeniedRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  body: Readable,
+): void {
+  // A filtered body may be a web-tee branch. Stop feeding its shim before
+  // cancelling it, or late upload bytes can hit an already closed stream.
+  req.unpipe()
+  req.pause()
+  if (body !== req) body.destroy()
+  destroyAfterResponse(req, res)
+}
+
 /**
  * Build a `Request`, run the callback, and if denied write the 403 response
  * and return `null`. On allow, returns the body stream the caller must pipe

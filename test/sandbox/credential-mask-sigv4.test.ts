@@ -887,6 +887,69 @@ describe('body substitution composes with SigV4 re-signing', () => {
     verifyUpstreamSignature(captured)
   }, 20000)
 
+  test('UNSIGNED-PAYLOAD: signed Content-Length covers the substituted short-secret body', async () => {
+    const real = 'short-unsigned-token'
+    const fake = state.sentinels.register('API_TOKEN_UNSIGNED_SHORT', real, [
+      DEST,
+    ])
+    expect(fake.length).toBeGreaterThan(real.length)
+    const body = JSON.stringify({ token: fake })
+    const expectedBody = JSON.stringify({ token: real })
+    const amzDate = '20260715T000000Z'
+    const headers: IncomingHttpHeaders = {
+      'content-length': String(Buffer.byteLength(body)),
+      'x-amz-date': amzDate,
+      'x-amz-content-sha256': UNSIGNED_PAYLOAD,
+    }
+    const { authorization } = signSigv4({
+      method: 'PUT',
+      requestTarget: '/compose/unsigned-short',
+      headers,
+      hostHeader: `${DEST}:${state.upstreamPort}`,
+      signedHeaders: [
+        'content-length',
+        'host',
+        'x-amz-date',
+        'x-amz-content-sha256',
+      ],
+      payloadHash: UNSIGNED_PAYLOAD,
+      amzDate,
+      scope: { date: '20260715', region: REGION, service: SERVICE },
+      accessKeyId: state.fakeAkid,
+      secretAccessKey: state.fakeSecret,
+    })
+    state.captured = undefined
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/compose/unsigned-short`,
+      {
+        method: 'PUT',
+        data: body,
+        headers: [
+          `Authorization: ${authorization}`,
+          `Content-Length: ${Buffer.byteLength(body)}`,
+          `X-Amz-Date: ${amzDate}`,
+          `X-Amz-Content-Sha256: ${UNSIGNED_PAYLOAD}`,
+        ],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(captured.body.toString()).toBe(expectedBody)
+    expect(singleHeader(captured.headers['content-length'])).toBe(
+      String(Buffer.byteLength(expectedBody)),
+    )
+    expect(singleHeader(captured.headers['x-amz-content-sha256'])).toBe(
+      UNSIGNED_PAYLOAD,
+    )
+    const auth = parseSigv4Authorization(
+      singleHeader(captured.headers.authorization)!,
+    )!
+    expect(auth.signedHeaders).toContain('content-length')
+    verifyUpstreamSignature(captured)
+  }, 20000)
+
   test('literal-hash POST: short secret re-frames; signature and Content-Length track the substituted body', async () => {
     // Real value < 47 bytes → the sentinel is longer than the real value,
     // substitution shrinks the body, and the buffered length becomes the
