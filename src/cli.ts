@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import pkg from '../package.json' with { type: 'json' }
-import { quote } from './utils/shell-quote.js'
+import { quote, quoteForCmd } from './utils/shell-quote.js'
 import { Command, InvalidArgumentError } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
@@ -558,8 +558,12 @@ async function main(): Promise<void> {
             // Default mode: argv-style invocation. The result is later
             // executed via `bash -c <command>`, so each arg must be
             // shell-quoted to survive that re-parse — a plain join(' ')
-            // splits arguments containing whitespace (#157).
-            command = quote(commandArgs)
+            // splits arguments containing whitespace (#157). On Windows it
+            // runs via `cmd.exe /d /s /c` instead, which needs its own quoting.
+            command =
+              process.platform === 'win32'
+                ? quoteForCmd(commandArgs)
+                : quote(commandArgs)
             logForDebugging(`Original command: ${command}`)
           } else {
             console.error(
