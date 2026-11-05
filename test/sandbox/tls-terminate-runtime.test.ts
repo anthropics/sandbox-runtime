@@ -43,6 +43,24 @@ const baseConfig = (
 })
 
 describe('a runtime that cannot terminate TLS in-process fails at start-up', () => {
+  test('incompatible TLS modes leave the previous config unchanged', async () => {
+    const previousConfig = SandboxManager.getConfig()
+    const previouslyEnabled = SandboxManager.isSandboxingEnabled()
+    cleanup.push(() => SandboxManager.reset())
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      SandboxManager.initialize(
+        baseConfig({
+          tlsTerminate: {},
+          mitmProxy: { socketPath: 'unused', domains: ['a.test'] },
+        }),
+      ),
+    ).rejects.toThrow('mutually exclusive')
+    expect(SandboxManager.isSandboxingEnabled()).toBe(previouslyEnabled)
+    expect(SandboxManager.getConfig()).toEqual(previousConfig)
+    expect(SandboxManager.getProxyPort()).toBeUndefined()
+  })
+
   test('createHttpProxyServer with a CA throws naming the requirement and the runtime; without one it starts', () => {
     pretendRuntimeServes(false)
     expect(() =>
@@ -53,6 +71,8 @@ describe('a runtime that cannot terminate TLS in-process fails at start-up', () 
   })
 
   test('SandboxManager.initialize with tlsTerminate rejects with that error before starting anything', async () => {
+    const previousConfig = SandboxManager.getConfig()
+    const previouslyEnabled = SandboxManager.isSandboxingEnabled()
     pretendRuntimeServes(false)
     cleanup.push(() => SandboxManager.reset())
     // bun-types declares .rejects matchers as returning void, but bun returns
@@ -63,6 +83,8 @@ describe('a runtime that cannot terminate TLS in-process fails at start-up', () 
     ).rejects.toThrow(STARTUP_ERROR)
     expect(SandboxManager.getProxyPort()).toBeUndefined()
     expect(SandboxManager.getMitmCA()).toBeUndefined()
+    expect(SandboxManager.isSandboxingEnabled()).toBe(previouslyEnabled)
+    expect(SandboxManager.getConfig()).toEqual(previousConfig)
   })
 
   test('SandboxManager.initialize without tlsTerminate is not affected', async () => {

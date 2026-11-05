@@ -175,6 +175,9 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+// Covers dependency checks and provisioning as well as network startup.
+let initializationAttempt: Promise<void> | undefined
+let resetAttempt: Promise<void> | undefined
 let cleanupRegistered = false
 let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
@@ -1126,56 +1129,48 @@ async function initializeSteps(
   enableLogMonitor: boolean,
   options: SandboxInitializeOptions | undefined,
 ): Promise<void> {
+  if (resetAttempt) await resetAttempt
+  if (initializationAttempt) {
+    await initializationAttempt
+    return
+  }
+  const attempt = initializeOnce(
+    runtimeConfig,
+    sandboxAskCallback,
+    enableLogMonitor,
+    options,
+  )
+  initializationAttempt = attempt
+  try {
+    await attempt
+  } finally {
+    if (initializationAttempt === attempt) initializationAttempt = undefined
+  }
+}
+
+async function initializeOnce(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback?: SandboxAskCallback,
+  enableLogMonitor = false,
+  options?: SandboxInitializeOptions,
+): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
     await initializationPromise
     return
   }
 
-  // Store config for use by other functions
-  config = runtimeConfig
-  configInstalls++
-
-  // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
-  // start our own listeners (which will later shadow those vars in the child).
-  parentProxy = resolveParentProxy(runtimeConfig.network.parentProxy)
-  if (parentProxy) {
-    logForDebugging(
-      `Parent proxy configured: http=${redactUrl(parentProxy.httpUrl)} ` +
-        `https=${redactUrl(parentProxy.httpsUrl)}`,
-    )
-  }
-  resolvedAddressGuard = createResolvedAddressGuard(runtimeConfig.network)
-
-  // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
-  // tlsTerminate is explicit opt-in, so a bad config is a hard error.
+  // Reject incompatible TLS modes and unsupported runtimes before publishing
+  // the config: a rejected initialization must not enable sandboxing.
   if (runtimeConfig.network.tlsTerminate && runtimeConfig.network.mitmProxy) {
     throw new Error(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
-  // Before any CA, proxy or sandbox is set up: a runtime that cannot
-  // terminate TLS in-process fails here, not on each tunnel.
   if (runtimeConfig.network.tlsTerminate) assertTlsTerminationSupported()
-  // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
-  // defer CA creation until the Windows block below has resolved
-  // srt-win and fetched user status — the persistent CA is
-  // generated-if-absent under windowsStateDir()/ca and
-  // trusted in the sandbox user's Root store, then loaded here.
-  // Explicit paths (or non-Windows) go straight to createMitmCA.
-  const tlsTerminate = runtimeConfig.network.tlsTerminate
-  const useWindowsPersistentCa =
-    getPlatform() === 'windows' &&
-    tlsTerminate !== undefined &&
-    !tlsTerminate.caCertPath &&
-    !tlsTerminate.caKeyPath
-  mitmCA =
-    tlsTerminate && !useWindowsPersistentCa
-      ? createMitmCA(tlsTerminate)
-      : undefined
-
-  // Check dependencies
-  const deps = await checkDependenciesAsync()
+  const nextGuard = createResolvedAddressGuard(runtimeConfig.network)
+  // Probe the candidate config without publishing it or creating a CA.
+  const deps = await checkDependenciesForConfig(runtimeConfig)
   if (deps.errors.length > 0) {
     if (deps.reinstallRequired) {
       throw new WindowsSandboxError(
@@ -1195,6 +1190,42 @@ async function initializeSteps(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
     )
   }
+
+  // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
+  // start our own listeners (which will later shadow those vars in the child).
+  const nextParentProxy = resolveParentProxy(runtimeConfig.network.parentProxy)
+  if (nextParentProxy) {
+    logForDebugging(
+      `Parent proxy configured: http=${redactUrl(nextParentProxy.httpUrl)} ` +
+        `https=${redactUrl(nextParentProxy.httpsUrl)}`,
+    )
+  }
+
+  // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
+  // tlsTerminate is explicit opt-in, so a bad config is a hard error.
+  // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
+  // defer CA creation until the Windows block below has resolved
+  // srt-win and fetched user status — the persistent CA is
+  // generated-if-absent under windowsStateDir()/ca and
+  // trusted in the sandbox user's Root store, then loaded here.
+  // Explicit paths (or non-Windows) go straight to createMitmCA.
+  const tlsTerminate = runtimeConfig.network.tlsTerminate
+  const useWindowsPersistentCa =
+    getPlatform() === 'windows' &&
+    tlsTerminate !== undefined &&
+    !tlsTerminate.caCertPath &&
+    !tlsTerminate.caKeyPath
+  const nextMitmCA =
+    tlsTerminate && !useWindowsPersistentCa
+      ? createMitmCA(tlsTerminate)
+      : undefined
+
+  // Publish only after synchronous configuration validation succeeds.
+  config = runtimeConfig
+  configInstalls++
+  parentProxy = nextParentProxy
+  resolvedAddressGuard = nextGuard
+  mitmCA = nextMitmCA
 
   // Start log monitor for macOS if enabled
   if (enableLogMonitor && getPlatform() === 'macos') {
@@ -1590,7 +1621,7 @@ async function initializeSteps(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
-      reset().catch(e => {
+      await resetResources().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
         })
@@ -1622,7 +1653,10 @@ function isSandboxingEnabled(): boolean {
  * srt-win resolution failure) or the inputs for the Windows probe —
  * the only platform where the sync and async variants differ.
  */
-function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
+function checkDependenciesCommon(
+  ripgrepConfig?: RipgrepConfig,
+  candidateConfig = config,
+):
   | { done: SandboxDependencyCheck }
   | {
       windows: {
@@ -1645,22 +1679,23 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
     // ripgrep is Linux-only: it's used by linuxGetMandatoryDenyPaths() to
     // expand glob deny-patterns to concrete paths for bwrap. macOS seatbelt
     // profiles take regex patterns directly, so rg is never invoked there.
-    const rgToCheck = ripgrepConfig ?? config?.ripgrep ?? { command: 'rg' }
+    const rgToCheck = ripgrepConfig ??
+      candidateConfig?.ripgrep ?? { command: 'rg' }
     if (whichSync(rgToCheck.command) === null) {
       errors.push(`ripgrep (${rgToCheck.command}) not found`)
     }
 
     const linuxDeps = checkLinuxDependencies({
-      seccompConfig: config?.seccomp,
-      bwrapPath: config?.bwrapPath,
-      socatPath: config?.socatPath,
+      seccompConfig: candidateConfig?.seccomp,
+      bwrapPath: candidateConfig?.bwrapPath,
+      socatPath: candidateConfig?.socatPath,
     })
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   } else if (platform === 'windows') {
     let srtWin: SrtWinSpawn
     try {
-      srtWin = resolveSrtWin(config?.windows?.srtWin)
+      srtWin = resolveSrtWin(candidateConfig?.windows?.srtWin)
     } catch (e) {
       errors.push((e as Error).message)
       return { done: { errors, warnings } }
@@ -1668,14 +1703,15 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
     return {
       windows: {
         sublayerGuid:
-          config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
-        proxyPortRange: config?.windows?.proxyPortRange,
-        sandboxUser: config?.windows?.sandboxUser,
+          candidateConfig?.windows?.sublayerGuid ??
+          candidateConfig?.windows?.wfpSublayerGuid,
+        proxyPortRange: candidateConfig?.windows?.proxyPortRange,
+        sandboxUser: candidateConfig?.windows?.sandboxUser,
         srtWin,
         // With a config to go by, an install whose loopback mode is
         // not the configured one is an error.
-        ...(config && {
-          allowLoopback: config.network?.allowLocalBinding === true,
+        ...(candidateConfig && {
+          allowLoopback: candidateConfig.network?.allowLocalBinding === true,
         }),
       },
     }
@@ -1717,13 +1753,20 @@ function checkDependencies(
 async function checkDependenciesAsync(
   ripgrepConfig?: RipgrepConfig,
 ): Promise<SandboxDependencyCheck> {
+  return checkDependenciesForConfig(config, ripgrepConfig)
+}
+
+async function checkDependenciesForConfig(
+  candidateConfig: SandboxRuntimeConfig | undefined,
+  ripgrepConfig?: RipgrepConfig,
+): Promise<SandboxDependencyCheck> {
   // Linux: resolve apply-seccomp first so its global-npm fallback
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
-  if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+  if (getPlatform() === 'linux' && !candidateConfig?.seccomp?.argv0) {
+    await getApplySeccompBinaryPathAsync(candidateConfig?.seccomp?.applyPath)
   }
-  const common = checkDependenciesCommon(ripgrepConfig)
+  const common = checkDependenciesCommon(ripgrepConfig, candidateConfig)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
 }
@@ -3188,6 +3231,27 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  if (resetAttempt) {
+    await resetAttempt
+    return
+  }
+  // Let startup finish (including its own failure cleanup) before teardown,
+  // so a pending continuation cannot restore context after reset returns.
+  // With no startup in flight, teardown starts synchronously: the 'exit'
+  // handler relies on reset() running up to its first await.
+  const pending = initializationAttempt
+  const attempt = pending
+    ? pending.catch(() => {}).then(() => resetResources())
+    : resetResources()
+  resetAttempt = attempt
+  try {
+    await attempt
+  } finally {
+    if (resetAttempt === attempt) resetAttempt = undefined
+  }
+}
+
+async function resetResources(): Promise<void> {
   // Windows: release this session's sandbox-user ACEs. Best-effort:
   // log anomalies rather than throw, so teardown always completes.
   // Persistent write roots and the denies under them are not released.
