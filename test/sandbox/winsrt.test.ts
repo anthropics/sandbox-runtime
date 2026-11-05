@@ -2490,6 +2490,273 @@ describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
     expect(asynFail).toEqual(syncFail)
   })
 
+  it('checkWindowsDependencies{,Async}: a partial WFP set is an install error', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const partial = JSON.stringify({
+      ...JSON.parse(RAW_WFP),
+      state: 'partial',
+      filters: 3,
+    })
+    stubSpawn(argv => ({
+      status: 0,
+      stdout: argv.includes('user') ? RAW_USER : partial,
+    }))
+    const sync = checkWindowsDependencies({ srtWin })
+    const asyn = await checkWindowsDependenciesAsync({ srtWin })
+    expect(sync.errors).toHaveLength(1)
+    expect(sync.errors[0]).toMatch(
+      /WFP filter set incomplete \(3 srt-win filters found\)/,
+    )
+    expect(sync.errors[0]).not.toMatch(/--force/)
+    expect(asyn).toEqual(sync)
+  })
+
+  it('checkWindowsDependencies{,Async}: a partial WFP set of the other loopback mode names the install with --force, in either direction', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    for (const recorded of [true, false]) {
+      const partial = JSON.stringify({
+        ...JSON.parse(RAW_WFP),
+        state: 'partial',
+        filters: 5,
+        allow_loopback: recorded,
+      })
+      for (const configured of [recorded, !recorded]) {
+        stubSpawn(argv => ({
+          status: 0,
+          stdout: argv.includes('user') ? RAW_USER : partial,
+        }))
+        const opts = { srtWin, allowLoopback: configured }
+        const sync = checkWindowsDependencies(opts)
+        expect(await checkWindowsDependenciesAsync(opts)).toEqual(sync)
+        spawnSpy.mockRestore()
+        spawnSyncSpy.mockRestore()
+        expect(sync.errors).toHaveLength(1)
+        const msg = sync.errors[0]
+        expect(msg).toMatch(/WFP filter set incomplete/)
+        const flag = configured ? ' --allow-loopback' : ''
+        if (configured === recorded) {
+          expect(msg).toContain(`windows-install${flag}\n`)
+          expect(msg).not.toMatch(/--force|differs from the install below/)
+        } else {
+          expect(msg).toContain(`windows-install${flag} --force`)
+          expect(msg).toContain(
+            `differs from the install below, which replaces it: loopback ` +
+              `${recorded ? 'open' : 'closed'} ` +
+              `(requested: ${configured ? 'open' : 'closed'}).`,
+          )
+        }
+      }
+    }
+  })
+
+  it('checkWindowsDependencies{,Async}: with allowLoopback omitted, the suggested install requests loopback closed and says so', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const partial = JSON.stringify({
+      ...JSON.parse(RAW_WFP),
+      state: 'partial',
+      filters: 5,
+      allow_loopback: true,
+    })
+    stubSpawn(argv => ({
+      status: 0,
+      stdout: argv.includes('user') ? RAW_USER : partial,
+    }))
+    const sync = checkWindowsDependencies({ srtWin })
+    expect(await checkWindowsDependenciesAsync({ srtWin })).toEqual(sync)
+    expect(sync.errors).toHaveLength(1)
+    const msg = sync.errors[0]!
+    expect(msg).toContain('loopback open (requested: closed)')
+    expect(msg).not.toMatch(/configured/)
+    expect(msg).toContain('windows-install --force\n')
+  })
+
+  it('checkWindowsDependencies{,Async}: with the sandbox user not provisioned, the suggested install carries --force when the set in place differs, as srt-win refuses it otherwise', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const run = async (
+      wfp: Record<string, unknown>,
+      user: Record<string, unknown>,
+      opts: {
+        proxyPortRange?: [number, number]
+        sandboxUser?: string
+        allowLoopback?: boolean
+      },
+    ): Promise<string[]> => {
+      const raw = JSON.parse(RAW_USER)
+      const userOut = JSON.stringify({
+        ...raw,
+        ...user,
+        user: { ...raw.user, name: 'srt-sandbox', ...(user.user as object) },
+      })
+      const wfpOut = JSON.stringify({ ...JSON.parse(RAW_WFP), ...wfp })
+      stubSpawn(argv => ({
+        status: 0,
+        stdout: argv.includes('user') ? userOut : wfpOut,
+      }))
+      const sync = checkWindowsDependencies({ srtWin, ...opts })
+      expect(await checkWindowsDependenciesAsync({ srtWin, ...opts })).toEqual(
+        sync,
+      )
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+      return sync.errors
+    }
+    const replaces = /differs from the install below/
+    const states: Array<Record<string, unknown>> = [
+      { user: { exists: false } },
+      { cred_present: false },
+    ]
+    for (const user of states) {
+      // `loopback-mismatch` is an installed set to srt-win's pre-check;
+      // its own error (with --force) follows the user's.
+      for (const state of ['partial', 'installed', 'loopback-mismatch']) {
+        // Same configuration: a plain install.
+        let errors = await run({ state }, user, {})
+        expect(errors).toHaveLength(state === 'loopback-mismatch' ? 2 : 1)
+        expect(errors[0]).toMatch(/Sandbox user is not provisioned/)
+        expect(errors[0]).not.toMatch(/--force/)
+        expect(errors[0]).not.toMatch(replaces)
+        // Range, loopback mode, user: each makes it a --force install.
+        errors = await run({ state }, user, { proxyPortRange: [61000, 61009] })
+        expect(errors[0]).toContain(
+          'port range 60080-60089 (requested: 61000-61009)',
+        )
+        expect(errors[0]).toContain(
+          'windows-install --proxy-port-range 61000-61009 --force\n',
+        )
+        errors = await run({ state, allow_loopback: true }, user, {
+          allowLoopback: false,
+        })
+        expect(errors[0]).toContain('loopback open (requested: closed)')
+        expect(errors[0]).toContain('windows-install --force\n')
+        errors = await run({ state }, user, { sandboxUser: 'new-sandbox' })
+        expect(errors[0]).toContain(
+          "sandbox user 'srt-sandbox' (requested: 'new-sandbox')",
+        )
+        expect(errors[0]).toContain(
+          'windows-install --sandbox-user new-sandbox --force\n',
+        )
+      }
+      // A complete set without a range is a legacy one: it differs.
+      for (const state of ['installed', 'loopback-mismatch']) {
+        const errors = await run({ state, port_range: undefined }, user, {})
+        expect(errors[0]).toContain(
+          'port range unknown (requested: 60080-60089)',
+        )
+        expect(errors[0]).toContain('windows-install --force\n')
+      }
+    }
+    // No install recorded (no setup marker): srt-win has no name to
+    // compare, so neither does the suggestion.
+    const errors = await run(
+      { state: 'partial' },
+      { user: { exists: false }, cred_present: false, marker_version: null },
+      { sandboxUser: 'new-sandbox' },
+    )
+    expect(errors[0]).not.toMatch(replaces)
+    expect(errors[0]).toContain('windows-install --sandbox-user new-sandbox\n')
+    // Nothing in place to replace: a plain install.
+    for (const state of ['absent', 'cannot-read']) {
+      const errors = await run(
+        { state, allow_loopback: true },
+        { user: { exists: false } },
+        { proxyPortRange: [61000, 61009], sandboxUser: 'new-sandbox' },
+      )
+      expect(errors[0]).not.toMatch(/--force/)
+    }
+  })
+
+  it('checkWindowsDependencies{,Async}: a partial WFP set of another port range or sandbox user names the install with --force, as srt-win refuses it otherwise', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const run = async (
+      wfp: Record<string, unknown>,
+      userName: string | undefined,
+      opts: {
+        proxyPortRange?: [number, number]
+        sandboxUser?: string
+        allowLoopback?: boolean
+      },
+    ): Promise<string> => {
+      const raw = JSON.parse(RAW_USER)
+      const user = JSON.stringify({
+        ...raw,
+        user: { ...raw.user, ...(userName && { name: userName }) },
+      })
+      const partial = JSON.stringify({
+        ...JSON.parse(RAW_WFP),
+        state: 'partial',
+        filters: 3,
+        ...wfp,
+      })
+      stubSpawn(argv => ({
+        status: 0,
+        stdout: argv.includes('user') ? user : partial,
+      }))
+      const sync = checkWindowsDependencies({ srtWin, ...opts })
+      expect(await checkWindowsDependenciesAsync({ srtWin, ...opts })).toEqual(
+        sync,
+      )
+      spawnSpy.mockRestore()
+      spawnSyncSpy.mockRestore()
+      expect(sync.errors).toHaveLength(1)
+      return sync.errors[0]!
+    }
+    const replaces = /differs from the install below/
+
+    // Range, both directions: the set's range against the configured one.
+    let msg = await run({ port_range: [1024, 65535] }, 'srt-sandbox', {})
+    expect(msg).toContain(
+      'which replaces it: port range 1024-65535 ' + '(requested: 60080-60089).',
+    )
+    expect(msg).toContain('windows-install --force\n')
+    msg = await run({ port_range: [60080, 60089] }, 'srt-sandbox', {
+      proxyPortRange: [61000, 61009],
+    })
+    expect(msg).toContain('port range 60080-60089 (requested: 61000-61009)')
+    expect(msg).toContain(
+      'windows-install --proxy-port-range 61000-61009 --force\n',
+    )
+    // No proxy PERMIT range left: nothing to compare, a plain install.
+    msg = await run({ port_range: undefined }, 'srt-sandbox', {
+      proxyPortRange: [61000, 61009],
+    })
+    expect(msg).not.toMatch(replaces)
+    expect(msg).toContain('windows-install --proxy-port-range 61000-61009\n')
+
+    // Sandbox user, both directions.
+    msg = await run({}, 'old-sandbox', {})
+    expect(msg).toContain(
+      "sandbox user 'old-sandbox' (requested: 'srt-sandbox')",
+    )
+    expect(msg).toContain('windows-install --force\n')
+    msg = await run({}, 'srt-sandbox', { sandboxUser: 'new-sandbox' })
+    expect(msg).toContain(
+      "sandbox user 'srt-sandbox' (requested: 'new-sandbox')",
+    )
+    expect(msg).toContain(
+      'windows-install --sandbox-user new-sandbox --force\n',
+    )
+    // An srt-win that does not report the name: nothing to compare.
+    msg = await run({}, undefined, { sandboxUser: 'new-sandbox' })
+    expect(msg).not.toMatch(replaces)
+
+    // Everything the same: a plain install, no --force.
+    msg = await run({}, 'srt-sandbox', {})
+    expect(msg).not.toMatch(/--force/)
+    expect(msg).not.toMatch(replaces)
+    // Several at once: each is named.
+    msg = await run(
+      { port_range: [1024, 65535], allow_loopback: true },
+      'old-sandbox',
+      { allowLoopback: false },
+    )
+    expect(msg).toContain(
+      'loopback open (requested: closed); port range 1024-65535 ' +
+        "(requested: 60080-60089); sandbox user 'old-sandbox' " +
+        "(requested: 'srt-sandbox').",
+    )
+    expect(msg).toContain('windows-install --force\n')
+  })
+
   it('checkWindowsDependencies{,Async}: seclogon state → error / silent', async () => {
     const srtWin = resolveSrtWin({ path: process.execPath })
     const withSeclogon = (seclogon: string | undefined) =>

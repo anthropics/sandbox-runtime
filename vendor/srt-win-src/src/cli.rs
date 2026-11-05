@@ -127,9 +127,9 @@ enum Cmd {
     ///        port-range; no changes)
     ///   10 — UAC prompt cancelled by the user
     ///   12 — WFP filter install failed
-    ///   13 — already installed under this sublayer with a
-    ///        DIFFERENT port-range, loopback mode or
-    ///        sandbox-user name; pass `--force` to replace
+    ///   13 — a filter set (complete or partial) exists under
+    ///        this sublayer with a DIFFERENT port-range, loopback
+    ///        mode or sandbox-user name; pass `--force` to replace
     ///   14 — sandbox user provisioning failed
     ///   1  — other error (parse, elevation check, etc.)
     Install {
@@ -1149,16 +1149,24 @@ enum WfpCmd {
     /// port_range?, allow_loopback, loopback_notice?, user_sid?,
     /// hint?}`. `allow_loopback` is whether the installed set opens
     /// loopback (read off the filters when elevated, off the install
-    /// record otherwise); when it does, `loopback_notice` says in
-    /// plain words what that exposes.
+    /// record otherwise, and off the record for a `partial` set when
+    /// there is one); when it does, `loopback_notice` says in plain
+    /// words what that exposes.
     /// BFE's
     /// `FwpmFilterCreateEnumHandle0` is admin-gated, so a
     /// non-elevated caller gets `{state:"cannot-read", hint:…}`
     /// (exit 0). The non-elevated readiness check is `wfp verify`.
     ///
+    /// `state:"partial"`: some but not all of the filters the install
+    /// adds for its loopback mode are present, or the proxy PERMITs
+    /// carry different port ranges, or the filters are keyed to
+    /// different user SIDs; a plain `install` of the recorded
+    /// mode re-adds the set. With a `hint` when the filters show
+    /// loopback closed but the install record says open.
+    ///
     /// `state:"loopback-mismatch"` (with a `hint`): the loopback mode
     /// of the filters is not the one the install recorded. Only an
-    /// elevated caller can see it.
+    /// elevated caller can see either.
     Status {
         #[arg(long)]
         sublayer_guid: Option<String>,
@@ -1349,13 +1357,17 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // port-range, loopback mode or sandbox-user name
             // and no --force, refuse
             // (exit 13) so an unintended config drift surfaces
-            // instead of silently overwriting. With the SAME config,
-            // only return early when the install is COMPLETE — i.e.
-            // the sandbox user is provisioned and the marker is
-            // current. A partial install falls through and the
-            // (idempotent) steps below complete it. A pre-existing
-            // install whose tags lack a port_range (legacy) is
-            // treated as "different" and requires --force.
+            // instead of silently overwriting; this holds for a
+            // complete and for a partial filter set. With the SAME
+            // config, only return early when the install is
+            // COMPLETE — i.e. the filter set is whole, the sandbox
+            // user is provisioned and the marker is current. A
+            // partial install falls through and the (idempotent)
+            // steps below complete it. A complete set whose tags
+            // lack a port_range (legacy) is treated as "different"
+            // and requires --force; a partial set without one (no
+            // proxy PERMIT left, or a legacy tag) has no range to
+            // compare and is re-added.
             let existing = install::read_setup().ok().flatten();
             // Shared by the early-out completeness check and the
             // stamping step below (env reads + a stat per entry).
@@ -1369,15 +1381,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!("srt-win: {why}");
                 std::process::exit(13);
             }
+            // A partial set's loopback mode is the recorded one
+            // (`apply_recorded_parts`). An unreadable record is
+            // treated as none here: the filters' own verdict stands,
+            // and the main path below marks the mode as changing
+            // before replacing them.
+            let recorded = install::read_loopback_mode(&sl).ok().flatten();
             if !force
-                && let Ok(st) = wfp::filter_status(&sl)
-                && st.state == "installed"
+                && let Ok(st) =
+                    wfp::filter_status(&sl).map(|st| wfp::apply_recorded_parts(st, recorded))
+                && (st.state == "installed" || st.state == "partial")
             {
-                let want = [range.0, range.1];
-                if st.port_range != Some(want)
-                    || st.allow_loopback != allow_loopback
-                    || name_changed
-                {
+                if wfp::differs_from_request(&st, range, allow_loopback) || name_changed {
                     let have_range = st
                         .port_range
                         .map(|[l, h]| format!("{l}-{h}"))
@@ -1387,7 +1402,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         .map(|s| s.sandbox_user.as_str())
                         .unwrap_or("<none>");
                     eprintln!(
-                        "srt-win: error: already installed under \
+                        "srt-win: error: existing filter set is {} under \
                          sublayer {sl:?} with port_range={have_range}, \
                          loopback={}, \
                          sandbox_user='{have_name}'; requested \
@@ -1395,6 +1410,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                          sandbox_user='{name}'. \
                          Pass --force to replace, or run `srt-win \
                          uninstall` first.",
+                        st.state,
                         wfp::fmt_loopback(st.allow_loopback),
                         range.0,
                         range.1,
@@ -1467,9 +1483,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     ),
                     _ => eprintln!(
                         "srt-win: partial install detected \
-                         (user_provisioned={}, marker_version={:?}) — \
-                         completing",
-                        us.exists, mv,
+                         (wfp={}, user_provisioned={}, \
+                         marker_version={:?}) — completing",
+                        st.state, us.exists, mv,
                     ),
                 }
                 // Fall through; the steps are idempotent.
