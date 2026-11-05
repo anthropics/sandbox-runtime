@@ -1,5 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
+import { StringDecoder } from 'node:string_decoder'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -1649,17 +1650,10 @@ export function startMacOSSandboxLogMonitor(
     'compact',
   ])
 
-  logProcess.stdout?.on('data', (data: Buffer) => {
-    const lines = data.toString().split('\n')
-
-    // Get violation and command lines
-    const violationLine = lines.find(
-      line => line.includes('Sandbox:') && line.includes('deny'),
-    )
-    const commandLine = lines.find(line => line.startsWith('CMD64_'))
-
-    if (!violationLine) return
-
+  const handleViolation = (
+    violationLine: string,
+    commandLine?: string,
+  ): void => {
     // Extract violation details
     const sandboxMatch = violationLine.match(sandboxExtractRegex)
     if (!sandboxMatch?.[1]) return
@@ -1702,6 +1696,57 @@ export function startMacOSSandboxLogMonitor(
       encodedCommand,
       timestamp: new Date(), // We could parse the timestamp from the log but this feels more reliable
     })
+  }
+
+  let incompleteLine = ''
+  let pendingViolation: string | undefined
+  const decoder = new StringDecoder('utf8')
+  const logEntryStartRegex = /^\d{4}-\d{2}-\d{2}\s/
+  const handleLine = (line: string): void => {
+    if (line.includes('Sandbox:') && line.includes('deny')) {
+      // A new denial closes an earlier entry that had no attribution line.
+      // Do not let a later command tag get attached to the wrong violation.
+      if (pendingViolation !== undefined) {
+        handleViolation(pendingViolation)
+      }
+      pendingViolation = line
+      return
+    }
+
+    if (line.startsWith('CMD64_') && pendingViolation !== undefined) {
+      handleViolation(pendingViolation, line)
+      pendingViolation = undefined
+      return
+    }
+
+    if (logEntryStartRegex.test(line) && pendingViolation !== undefined) {
+      handleViolation(pendingViolation)
+      pendingViolation = undefined
+    }
+  }
+
+  const processOutput = (text: string): void => {
+    const lines = (incompleteLine + text).split('\n')
+    incompleteLine = lines.pop() ?? ''
+    for (const line of lines) {
+      handleLine(line)
+    }
+  }
+
+  logProcess.stdout?.on('data', (data: Buffer) => {
+    processOutput(decoder.write(data))
+  })
+
+  logProcess.stdout?.on('end', () => {
+    processOutput(decoder.end())
+    if (incompleteLine) {
+      handleLine(incompleteLine)
+      incompleteLine = ''
+    }
+    if (pendingViolation !== undefined) {
+      handleViolation(pendingViolation)
+      pendingViolation = undefined
+    }
   })
 
   logProcess.stderr?.on('data', (data: Buffer) => {
