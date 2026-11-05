@@ -26,6 +26,8 @@ param(
   [string]$AmbientSublayer = '9e4b2d7a-6c05-4f18-8a3d-2b9e7c1f5a0d',
   # Must match smoke-machine-store.ps1.
   [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93',
+  # Must match smoke-env-stdin.ps1.
+  [string]$EnvStdinSublayer = 'a7f3c9d1-5e28-4b06-8f4a-9c1d2e6b0a35',
   # Must match smoke-write-restricted.ps1.
   [string]$WriteRestrictedSublayer = 'c8f3a1d5-2e6b-4a97-b0c4-5d1e7f9a3b62',
   # Must match smoke-profile-read.ps1.
@@ -46,6 +48,7 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $TsSublayer
 & $Exe wfp uninstall --sublayer-guid $AmbientSublayer
 & $Exe wfp uninstall --sublayer-guid $MachineStoreSublayer
+& $Exe wfp uninstall --sublayer-guid $EnvStdinSublayer
 & $Exe wfp uninstall --sublayer-guid $WriteRestrictedSublayer
 & $Exe wfp uninstall --sublayer-guid $ProfileReadSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
