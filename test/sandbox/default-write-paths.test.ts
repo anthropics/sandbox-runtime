@@ -123,7 +123,10 @@ describe.if(!isWindows)('getDefaultWritePaths', () => {
         runtime,
         [
           '-e',
-          `import('./dist/index.js').then(async ({ SandboxManager }) => {
+          `import('./dist/sandbox/bwrap-mount-manifests.js').then(async places => {
+             // As test/helpers/isolated does, for the built library.
+             places.setMountPointManifestPlacesForTesting('/nonexistent')
+             const { SandboxManager } = await import('./dist/index.js')
              await SandboxManager.initialize({
                network: { allowedDomains: [], deniedDomains: [] },
                filesystem: {
@@ -231,7 +234,7 @@ describe.if(isLinux || isMacOS)(
       mkdirSync(join(fakeHome, NPM_LOGS), { recursive: true })
       const { allowOnly, wrapped, reopened } = runWithHome(
         fakeHome,
-        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+        `const { SandboxManager } = await import('./test/helpers/isolated/manager.ts')
        const filesystem = { denyRead: ['~/.npm'], allowWrite: [], denyWrite: [] }
        await SandboxManager.initialize({
          network: { allowedDomains: [], deniedDomains: [] },
@@ -261,7 +264,7 @@ describe.if(isLinux || isMacOS)(
       mkdirSync(join(fakeHome, NPM_LOGS), { recursive: true })
       const wrapped = runWithHome(
         fakeHome,
-        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+        `const { SandboxManager } = await import('./test/helpers/isolated/manager.ts')
        console.log(JSON.stringify(await SandboxManager.wrapWithSandbox('true', undefined, {
          filesystem: { denyRead: [], allowWrite: [], denyWrite: ['~/.npm'] },
        })))`,
@@ -360,7 +363,7 @@ describe.if(isLinux || isMacOS)(
       mkdirSync(join(home, NPM_LOGS), { recursive: true })
       return runWithHome(
         home,
-        `const { SandboxManager } = await import('./src/sandbox/sandbox-manager.ts')
+        `const { SandboxManager } = await import('./test/helpers/isolated/manager.ts')
        const fs = await import('node:fs')
        const home = process.env.HOME
        const logs = home + '/${NPM_LOGS}'
