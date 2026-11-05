@@ -795,9 +795,13 @@ async function filterNetworkRequest(
   // Coming after both configured lists, it lifts the default deny for that
   // one command and never a configured deniedDomains entry. The username is
   // presented by the sandboxed client: see registerCommandNetworkLists.
-  const perCommand = encodedCommand
-    ? commandNetworkListsByKey.get(decodeSandboxedCommand(encodedCommand))
+  const attributionKey = encodedCommand
+    ? decodeSandboxedCommand(encodedCommand)
     : undefined
+  const perCommand =
+    attributionKey !== undefined
+      ? commandNetworkListsByKey.get(attributionKey)
+      : undefined
   for (const allowedDomain of perCommand?.allowedDomains ?? []) {
     if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {
       logForDebugging(`Allowed by per-command rule: ${host}:${port}`)
@@ -813,7 +817,12 @@ async function filterNetworkRequest(
   logForDebugging(`No matching rule, asking user: ${host}:${port}`)
   try {
     // Held as unknown: a JavaScript caller is not bound by the declared type.
-    const answer: unknown = await sandboxAskCallback({ host, port })
+    // The key the per-command lists and the violation store use, so the
+    // callback can tell which invocation opened the connection.
+    const answer: unknown = await sandboxAskCallback(
+      { host, port },
+      { attributionKey },
+    )
     // Only `true` allows: an object is how a callback denies with a reason,
     // and a truthiness test here would read every such denial as an allow.
     if (answer === true) {
