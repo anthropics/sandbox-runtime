@@ -115,6 +115,65 @@ describe('generateProxyEnvVars', () => {
       }
     })
 
+    it('names loopback only, so private and link-local addresses reach the proxy', () => {
+      // The child cannot dial a private or link-local address directly, so a
+      // NO_PROXY match there only turns an allow-listed IP literal
+      // (`192.168.1.10:8080`) into a connect error the proxy never sees.
+      const env = generateProxyEnvVars(3128, 1080)
+      for (const name of ['NO_PROXY', 'no_proxy']) {
+        expect(env).toContain(`${name}=localhost,127.0.0.1,::1`)
+        expect(env.filter(v => v.startsWith(`${name}=`))).toHaveLength(1)
+      }
+    })
+
+    it.if(!isWindows)(
+      'sandboxed curl to an allow-listed private IP literal reaches the proxy',
+      async () => {
+        let proxy: Server | undefined
+        const received: string[] = []
+        try {
+          proxy = createServer((req, res) => {
+            received.push(req.url ?? '')
+            res.writeHead(200)
+            res.end('ok')
+          })
+          const proxyPort = await new Promise<number>((resolve, reject) => {
+            proxy!.on('error', reject)
+            proxy!.listen(0, '127.0.0.1', () =>
+              resolve((proxy!.address() as AddressInfo).port),
+            )
+          })
+
+          const config: SandboxRuntimeConfig = {
+            network: {
+              allowedDomains: ['10.255.255.1:8080'],
+              deniedDomains: [],
+              httpProxyPort: proxyPort,
+            },
+            filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+          }
+          await SandboxManager.initialize(config)
+
+          const wrapped = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 5 http://10.255.255.1:8080/',
+          )
+          const result = await spawnAsync(wrapped, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+
+          expect(result.status).toBe(0)
+          expect(received).toContain('http://10.255.255.1:8080/')
+        } finally {
+          await SandboxManager.reset()
+          if (proxy) {
+            await new Promise<void>(r => proxy!.close(() => r()))
+          }
+        }
+      },
+    )
+
     it.if(isLinux)(
       'sandboxed curl to a .local hostname reaches the parent proxy',
       async () => {
