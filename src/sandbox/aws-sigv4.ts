@@ -36,7 +36,10 @@ export const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD'
  *   `X-Amz-Signature`) — re-signing would rewrite the URL itself. Applies
  *   whenever the Authorization header does not itself classify: a non-AWS
  *   Authorization value (e.g. `Basic ...`) must not exempt the query, or
- *   adding a junk header would bypass the presigned policy.
+ *   adding a junk header would bypass the presigned policy. The shape, not
+ *   the algorithm, decides: a presigned URL may be signed with either
+ *   `AWS4-HMAC-SHA256` or `AWS4-ECDSA-P256-SHA256`, and neither can be
+ *   re-signed without rewriting the URL.
  * - `sigv4a`: Authorization is `AWS4-ECDSA-P256-SHA256 ...` — asymmetric
  *   signing keyed off the secret via ECDSA; there is no shared-key HMAC to
  *   recompute without the client's derived private key.
@@ -84,11 +87,19 @@ export function detectSigv4(
   // Presigned URL: the signature is in the query string. Checked whenever
   // the Authorization header did not classify above — an unrecognized or
   // malformed Authorization value alongside presigned sentinel params must
-  // not turn the request invisible to the presigned policy.
+  // not turn the request invisible to the presigned policy. Both signing
+  // algorithms count: a presigned SigV4A URL (X-Amz-Algorithm
+  // AWS4-ECDSA-P256-SHA256, plus X-Amz-Region-Set) carries its signature in
+  // the URL exactly like a presigned SigV4 one, and accepting only the
+  // HMAC spelling would let it past both this policy and the header-only
+  // sigv4a one.
   const q = requestTarget.indexOf('?')
   if (q === -1) return null
   const params = new URLSearchParams(requestTarget.slice(q + 1))
-  if (params.get('X-Amz-Algorithm') !== SIGV4_ALGORITHM) return null
+  const algorithm = params.get('X-Amz-Algorithm')
+  if (algorithm !== SIGV4_ALGORITHM && algorithm !== SIGV4A_ALGORITHM) {
+    return null
+  }
   if (!params.has('X-Amz-Signature')) return null
   const credential = params.get('X-Amz-Credential')
   if (!credential) return null
