@@ -16,6 +16,7 @@ export type {
   CredentialsConfig,
   CredentialFileConfig,
   CredentialEnvVarConfig,
+  CredentialSourceConfig,
   CredentialMode,
   IgnoreViolationsConfig,
 } from './sandbox/sandbox-config.js'
