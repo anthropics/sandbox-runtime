@@ -243,7 +243,7 @@ describe('tls-terminate-proxy: end-to-end with ephemeral CA', () => {
       const r = await curlViaProxy(
         proxyPort,
         `https://127.0.0.1:${upstreamPort}/hello?a=1`,
-        { method: 'POST', body: 'from-ephemeral', cacert: ca.certPath },
+        { method: 'POST', body: 'from-ephemeral', cacert: ca.trustBundlePath },
       )
       expect(r.exit).toBe(0)
       expect(r.status).toBe(200)
@@ -344,7 +344,7 @@ describe('tls-terminate-proxy: per-host termination opt-out (mTLS upstream)', ()
       // the proxy's listener (which never asks for it), not to the
       // upstream, and the proxy's own outbound leg has no client cert.
       const r = await curlViaProxy(port, url(), {
-        cacert: proxyCA.certPath,
+        cacert: proxyCA.trustBundlePath,
         clientCertPath,
         clientKeyPath,
       })
@@ -451,7 +451,7 @@ describe('tls-terminate-proxy: per-host termination opt-out (mTLS upstream)', ()
     const port = (proxy.address() as AddressInfo).port
     try {
       const r = await curlViaProxy(port, url(), {
-        cacert: proxyCA.certPath,
+        cacert: proxyCA.trustBundlePath,
         clientCertPath,
         clientKeyPath,
       })

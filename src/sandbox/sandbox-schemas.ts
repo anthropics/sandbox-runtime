@@ -28,10 +28,15 @@ export interface FsReadRestrictionConfig {
   literalDenyOnly?: string[]
   literalAllowWithinDeny?: string[]
   /**
-   * The `denyOnly` entries that come from `credentials.files`. Their only
-   * exceptions are the `ownAllowWithinDeny` paths. Absent when there are none.
+   * Entries from `denyOnly` that protect credential files. Their only
+   * exceptions are `ownAllowWithinDeny` paths.
    */
   credentialDenyOnly?: string[]
+  /**
+   * Entries from `literalDenyOnly` that protect credential or CA source
+   * files. Their only exceptions are `ownAllowWithinDeny` paths.
+   */
+  literalCredentialDenyOnly?: string[]
   /**
    * The `allowWithinDeny` entries the library adds for files of its own that
    * a command is pointed at. Absent when there are none.

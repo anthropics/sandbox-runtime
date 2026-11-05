@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -40,8 +41,6 @@ describe('mitm-ca: createMitmCA', () => {
 
   test('returns parsed cert+key from a real CA', () => {
     const ca = createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
-    expect(ca.certPath).toBe(certPath)
-    expect(ca.keyPath).toBe(keyPath)
     expect(ca.certPem).toBe(certPem)
     expect(ca.keyPem).toBe(keyPem)
     expect(ca.certPem).toContain('-----BEGIN CERTIFICATE-----')
@@ -93,13 +92,32 @@ describe('mitm-ca: createMitmCA', () => {
 })
 
 describe('mitm-ca: ephemeral generation', () => {
-  test('createMitmCA({}) generates a CA, writes PEMs to a temp dir', async () => {
+  test('writes only the public trust bundle', async () => {
+    const scratch = mkdtempSync(join(tmpdir(), 'srt-ca-output-'))
+    const variable = process.platform === 'win32' ? 'TEMP' : 'TMPDIR'
+    const previous = process.env[variable]
+    process.env[variable] = scratch
+    let ca: ReturnType<typeof createMitmCA> | undefined
+    try {
+      ca = createMitmCA({})
+      const files = readdirSync(scratch).flatMap(dir =>
+        readdirSync(join(scratch, dir)),
+      )
+      expect(files).toStrictEqual(['trust-bundle.crt'])
+      expect(readFileSync(ca.trustBundlePath, 'utf8')).not.toContain(
+        'PRIVATE KEY',
+      )
+    } finally {
+      if (previous === undefined) delete process.env[variable]
+      else process.env[variable] = previous
+      if (ca) await disposeMitmCA(ca)
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  })
+
+  test('createMitmCA({}) generates a CA that can sign certificates', async () => {
     const ca = createMitmCA({})
     try {
-      expect(ca.ephemeral).toBe(true)
-      expect(ca.certPath).toContain('srt-ca-')
-      expect(readFileSync(ca.certPath, 'utf8')).toBe(ca.certPem)
-      expect(readFileSync(ca.keyPath, 'utf8')).toBe(ca.keyPem)
       expect(ca.certPem).toContain('-----BEGIN CERTIFICATE-----')
       expect(ca.cert.subject.getField('CN').value).toBe(
         'sandbox-runtime ephemeral CA',
@@ -115,16 +133,48 @@ describe('mitm-ca: ephemeral generation', () => {
 
   test('disposeMitmCA removes the temp dir for ephemeral, no-ops for user CA', async () => {
     const eph = createMitmCA({})
-    const dir = dirname(eph.certPath)
+    const dir = dirname(eph.trustBundlePath)
     expect(existsSync(dir)).toBe(true)
     await disposeMitmCA(eph)
     expect(existsSync(dir)).toBe(false)
 
     const user = createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
-    expect(user.ephemeral).toBe(false)
     await disposeMitmCA(user) // must not delete the fixture
     expect(existsSync(certPath)).toBe(true)
   })
+
+  test.each(['sync', 'async'] as const)(
+    '%s cleanup preserves the working directory and supplied files',
+    async mode => {
+      const scratch = mkdtempSync(join(tmpdir(), 'srt-ca-cleanup-'))
+      const previousCwd = process.cwd()
+      const ca = createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
+      const sentinel = join(scratch, 'sentinel')
+      writeFileSync(sentinel, 'keep')
+      process.chdir(scratch)
+      try {
+        if (mode === 'sync') disposeMitmCASync(ca)
+        if (mode === 'async') await disposeMitmCA(ca)
+        disposeMitmCASync(ca)
+        await disposeMitmCA(ca)
+        expect({
+          bundleExists: existsSync(ca.trustBundlePath),
+          sentinel: readFileSync(sentinel, 'utf8'),
+          certificate: readFileSync(certPath, 'utf8'),
+          key: readFileSync(keyPath, 'utf8'),
+        }).toStrictEqual({
+          bundleExists: false,
+          sentinel: 'keep',
+          certificate: certPem,
+          key: keyPem,
+        })
+      } finally {
+        process.chdir(previousCwd)
+        await disposeMitmCA(ca)
+        rmSync(scratch, { recursive: true, force: true })
+      }
+    },
+  )
 
   test('writes a trust bundle: MITM CA first, then the host root store', async () => {
     // The child's trust env vars (SSL_CERT_FILE etc.) REPLACE the tool's
@@ -155,7 +205,6 @@ describe('mitm-ca: ephemeral generation', () => {
   test('disposeMitmCASync removes what disposeMitmCA does, before or after it', async () => {
     const eph = createMitmCA({})
     disposeMitmCASync(eph)
-    expect(existsSync(dirname(eph.keyPath))).toBe(false)
     expect(existsSync(dirname(eph.trustBundlePath))).toBe(false)
     await disposeMitmCA(eph)
     disposeMitmCASync(eph)
@@ -210,6 +259,50 @@ describe('mitm-ca: ephemeral generation', () => {
     expect(() => createMitmCA({ caKeyPath: keyPath })).toThrow(
       /must be provided together/,
     )
+  })
+})
+
+describe('mitm-ca: certificate-only inputs', () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'srt-ca-inputs-'))
+  const combined = join(scratch, 'combined.pem')
+  const chain = certPem.trim() + '\n' + certPem.trim() + '\n'
+  writeFileSync(combined, chain + keyPem)
+
+  afterAll(() => rmSync(scratch, { recursive: true, force: true }))
+
+  test.each(['paths', 'PEMs'] as const)(
+    'keeps the certificate chain without the key from %s',
+    async source => {
+      const ca = createMitmCA(
+        source === 'paths'
+          ? { caCertPath: combined, caKeyPath: keyPath }
+          : { caCertPem: chain + keyPem, caKeyPem: keyPem },
+      )
+      try {
+        expect(ca.certPem.trim()).toBe(chain.trim())
+        expect(readFileSync(ca.trustBundlePath, 'utf8')).not.toContain(
+          'PRIVATE KEY',
+        )
+      } finally {
+        await disposeMitmCA(ca)
+      }
+    },
+  )
+
+  test('copies only certificates from the parent extra-CA file', async () => {
+    const previous = process.env.NODE_EXTRA_CA_CERTS
+    process.env.NODE_EXTRA_CA_CERTS = combined
+    let ca: ReturnType<typeof createMitmCA> | undefined
+    try {
+      ca = createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      expect(bundle.endsWith(chain)).toBe(true)
+      expect(bundle).not.toContain('PRIVATE KEY')
+    } finally {
+      if (previous === undefined) delete process.env.NODE_EXTRA_CA_CERTS
+      else process.env.NODE_EXTRA_CA_CERTS = previous
+      if (ca) await disposeMitmCA(ca)
+    }
   })
 })
 
@@ -352,7 +445,7 @@ describe('mitm-ca: generateEmptyCrl', () => {
       // "verify OK" goes to stderr; a bad signature exits non-zero.
       const verify = spawnSync(
         'openssl',
-        ['crl', '-inform', 'DER', '-noout', '-CAfile', ca.certPath],
+        ['crl', '-inform', 'DER', '-noout', '-CAfile', ca.trustBundlePath],
         { input: ca.crlDer, encoding: 'utf8' },
       )
       expect(verify.status).toBe(0)

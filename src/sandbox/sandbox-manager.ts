@@ -1883,6 +1883,23 @@ function* resolveReadDenies(
   }
 }
 
+function withCaSourceDenies(
+  readConfig: FsReadRestrictionConfig,
+): FsReadRestrictionConfig {
+  const sources = mitmCA?.sourcePaths ?? []
+  if (sources.length === 0) return readConfig
+
+  return {
+    ...readConfig,
+    literalCredentialDenyOnly: [
+      ...new Set([...(readConfig.literalCredentialDenyOnly ?? []), ...sources]),
+    ],
+    literalDenyOnly: [
+      ...new Set([...(readConfig.literalDenyOnly ?? []), ...sources]),
+    ],
+  }
+}
+
 /**
  * Strip a trailing `/**` from each read-path entry and, on Linux, replace
  * any remaining glob with what `expandGlob` returns for it (bubblewrap takes
@@ -2016,7 +2033,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     ),
   )
 
-  return {
+  return withCaSourceDenies({
     ...denyPaths,
     allowWithinDeny: allowPaths,
     unlistableDenyDirs: [...unlistableDenyDirs],
@@ -2024,7 +2041,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
       config.filesystem.denyRead,
       config.filesystem.allowRead,
     ),
-  }
+  })
 }
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
@@ -2108,6 +2125,10 @@ function computeWindowsFsAccessSet(
     credentialDeny: [
       ...expand(getCredentialDenyReadPaths(c.credentials), { mode: 'deny' }),
       ...maskedFiles,
+      ...expand(
+        (mitmCA?.sourcePaths ?? []).map(path => ({ path, literal: true })),
+        { mode: 'deny' },
+      ),
     ],
   })
 }
@@ -2575,12 +2596,10 @@ async function wrapWithSandboxOnce(
       ),
     )
     if (expandedAllowRead === REPLACED) return startOver()
-    // The TLS-termination CA cert and the trust bundle the env vars point at
-    // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
-    // paths fall under a user-configured denyRead or credential entry.
+    // The child's trust bundle remains readable beneath caller read denies.
     const ownAllowWithinDeny: string[] = []
     if (mitmCA) {
-      ownAllowWithinDeny.push(mitmCA.certPath, mitmCA.trustBundlePath)
+      ownAllowWithinDeny.push(mitmCA.trustBundlePath)
     }
     // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
     if (javaAgentJarPath) {
@@ -2611,7 +2630,7 @@ async function wrapWithSandboxOnce(
     // long as it is suspended, which is until the scan below has ended.
     listings.clear()
     if (expandedDenyRead === REPLACED) return startOver()
-    readConfig = {
+    readConfig = withCaSourceDenies({
       ...expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
       ...(ownAllowWithinDeny.length > 0 && { ownAllowWithinDeny }),
@@ -2620,7 +2639,7 @@ async function wrapWithSandboxOnce(
         customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead,
         customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead,
       ),
-    }
+    })
   }
   // Nothing below walks, and what it waits for is not this thread.
   walkEnded()
@@ -3405,6 +3424,12 @@ function getLinuxGlobPatternWarnings(): string[] {
 // Public API Interface
 // ============================================================================
 
+/** Public trust settings for clients using the active TLS proxy. */
+export type TlsTrustInfo = Readonly<{
+  caCertPem: string
+  trustBundlePath: string
+}>
+
 /**
  * Interface for the sandbox manager API
  */
@@ -3512,7 +3537,11 @@ export interface ISandboxManager {
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
-  getMitmCA(): MitmCA | undefined
+  /**
+   * Public certificate and bundle path for the active session. The path is
+   * valid until reset; each call returns an immutable snapshot.
+   */
+  getTlsTrust(): TlsTrustInfo | undefined
   /**
    * Windows: whether the commands of the current session read the
    * user's profile through the profile read grant.
@@ -3567,7 +3596,13 @@ export const SandboxManager: ISandboxManager = {
   askCallbackDenyReason: true,
   cleanupAfterCommand,
   reset,
-  getMitmCA: () => mitmCA,
+  getTlsTrust: () =>
+    mitmCA
+      ? Object.freeze({
+          caCertPem: mitmCA.certPem,
+          trustBundlePath: mitmCA.trustBundlePath,
+        })
+      : undefined,
   getWindowsProfileRead: () => windowsProfileRead,
   getWindowsProfileReadWarnings: () => [...windowsProfileReadWarnings],
   getSentinelRegistry: () => sentinelRegistry,

@@ -344,21 +344,25 @@ describe.if(!isWindows)('precedence between the read lists', () => {
 
     for (const kind of ['denyRead', 'credential deny'] as const) {
       it(`${kind} on their folders: they are readable, what lies beside them is not`, async () => {
-        const { trustBundlePath, certPath, keyPath } =
-          SandboxManager.getMitmCA()!
-        for (const own of [trustBundlePath, certPath, JAR]) {
+        const { trustBundlePath } = SandboxManager.getTlsTrust()!
+        for (const own of [trustBundlePath, JAR]) {
           expect(await reading(`head -c 10 '${own}'`, kind, dirname(own))).toBe(
             readFileSync(own, 'utf8').slice(0, 10),
           )
         }
-        expect(dirname(keyPath)).toBe(dirname(certPath))
+        const sibling = join(dirname(trustBundlePath), 'sibling')
+        writeFileSync(sibling, CONTENT)
         expect(
-          await reading(`echo ran; cat '${keyPath}'`, kind, dirname(certPath)),
+          await reading(
+            `echo ran; cat '${sibling}'`,
+            kind,
+            dirname(trustBundlePath),
+          ),
         ).toBe('ran\n')
       })
 
       it(`${kind} on a pattern that matches it: the trust bundle is readable`, async () => {
-        const { trustBundlePath } = SandboxManager.getMitmCA()!
+        const { trustBundlePath } = SandboxManager.getTlsTrust()!
         expect(
           await reading(
             'head -c 10 "$SSL_CERT_FILE"',
@@ -370,7 +374,7 @@ describe.if(!isWindows)('precedence between the read lists', () => {
     }
 
     it.if(isLinux)('the debug log names none of them', async () => {
-      const { trustBundlePath } = SandboxManager.getMitmCA()!
+      const { trustBundlePath } = SandboxManager.getTlsTrust()!
       const { warnings } = await withCapturedWarnings(() =>
         reading('true', 'credential deny', dirname(trustBundlePath)),
       )

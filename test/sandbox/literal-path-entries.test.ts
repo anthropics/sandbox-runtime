@@ -628,10 +628,13 @@ describe('path entries as configured', () => {
         allowWithinDeny: ['/d/a'],
         unlistableDenyDirs: ['/u'],
         literalDenyOnly: ['/l*'],
+        credentialDenyOnly: ['/d'],
+        literalCredentialDenyOnly: ['/l*'],
         literalAllowWithinDeny: ['/d/l*'],
       }),
     ).toEqual({
       denyOnly: ['/d', '/l*'],
+      credentialDenyOnly: ['/d', '/l*'],
       allowWithinDeny: ['/d/a', '/d/l*'],
       unlistableDenyDirs: ['/u'],
     })
