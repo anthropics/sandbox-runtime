@@ -140,6 +140,7 @@ pub fn run() -> Result<u32> {
             )
         }
         RunnerCmd::InstallCa { der } => {
+            crate::self_protect::protect_runner()?;
             let thumb = crate::cert_store::install_root_ca(&der)?;
             eprintln!(
                 "srt-win: runner: CA installed into sandbox-user \
@@ -152,13 +153,16 @@ pub fn run() -> Result<u32> {
             anonymous_target,
             anonymous_egress,
             allow_loopback,
-        } => Ok(crate::probe::run(
-            &target,
-            anonymous_target.as_deref(),
-            anonymous_egress,
-            allow_loopback,
-        )?
-        .encode()),
+        } => {
+            crate::self_protect::protect_runner()?;
+            Ok(crate::probe::run(
+                &target,
+                anonymous_target.as_deref(),
+                anonymous_egress,
+                allow_loopback,
+            )?
+            .encode())
+        }
     }
 }
 
