@@ -695,6 +695,16 @@ export const NetworkConfigSchema = z.object({
         'Reported in the <sandbox_violations> line when that entry denies a connection, and to the sandboxed client as the status phrase of the 403 that answers its CONNECT; entries without one use a generic reason. ' +
         'Keys are matched by exact entry string, so a key with no matching deniedDomains entry never fires.',
     ),
+  allowlistDenyReason: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Optional reason for the denial of a destination that is on no list at all (e.g. "blocked by sandbox policy; ask the user to add the host to allowedDomains rather than working around the proxy"). ' +
+        'deniedDomainReasons cannot cover this case, since there is no deniedDomains entry to key it on. ' +
+        'Reported in the <sandbox_violations> line, as the status phrase of the 403 that answers a CONNECT, and as the body of the 403 that answers a plain-HTTP request. ' +
+        'Unset, such a denial reads "host is not on the allow list".',
+    ),
   strictAllowlist: z
     .boolean()
     .optional()
