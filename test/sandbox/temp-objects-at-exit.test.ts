@@ -97,13 +97,12 @@ describe.if(isLinux || isMacOS)('temp objects when the process ends', () => {
     }
   }
 
-  // The bridge's socket, the trust bundle, the masked credential file, the
-  // proxy's socket.
+  // Objects with filesystem entries; the Linux mux backend is abstract.
   const ALWAYS = [
     ...(isLinux ? ['claude-http'] : []),
     'srt-ca',
     'srt-credmask',
-    'srt-mux',
+    ...(isMacOS ? ['srt-mux'] : []),
   ]
 
   it.each([

@@ -2,8 +2,12 @@
  * apply-seccomp.c - Apply seccomp BPF filter in an isolated PID namespace
  *
  * Usage: apply-seccomp <command> [args...]
+ *        apply-seccomp --bridge-launcher <parent-pid> [<socket-path> <command> [args...]]
  *
- * This program applies a baked-in seccomp BPF filter, isolates the
+ * The bridge-launcher mode is a host-side lifecycle supervisor. It applies
+ * no sandbox and owns cleanup of the managed Unix socket after its child exits.
+ *
+ * The default mode applies a baked-in seccomp BPF filter, isolates the
  * target command in a nested user+PID+mount namespace so it cannot see or
  * ptrace any process that lacks the filter, applies the filter with
  * prctl(PR_SET_SECCOMP), and execs the command.
@@ -56,6 +60,7 @@
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -670,7 +675,111 @@ static int reap_until(pid_t main_child) {
     }
 }
 
+/* The host bridge owns its socket even when socat exits without unlinking
+ * it. Keep the child unreaped until signalling is resolved so a recycled PID
+ * can never receive a forwarded signal. This mode applies no sandbox. */
+static int run_bridge(int argc, char *argv[]) {
+    char *end = NULL;
+    errno = 0;
+    long parent = argc >= 3 ? strtol(argv[2], &end, 10) : 0;
+    if (argc < 3 || errno || !end || *end || parent <= 0 || parent > INT_MAX ||
+        (argc != 3 && argc < 5)) {
+        fprintf(stderr, "apply-seccomp: expected --bridge-launcher <parent-pid> [<socket-path> <command> [args...]]\n");
+        return 1;
+    }
+    if (getppid() != (pid_t)parent) return 1;
+
+    sigset_t watched, previous;
+    sigemptyset(&watched);
+    sigaddset(&watched, SIGTERM);
+    sigaddset(&watched, SIGINT);
+    sigaddset(&watched, SIGHUP);
+    sigaddset(&watched, SIGQUIT);
+    sigaddset(&watched, SIGCHLD);
+    sigaddset(&watched, SIGALRM);
+    if (sigprocmask(SIG_BLOCK, &watched, &previous) < 0) {
+        die("apply-seccomp: bridge sigprocmask");
+    }
+    struct sigaction default_action = { .sa_handler = SIG_DFL };
+    sigemptyset(&default_action.sa_mask);
+    for (int sig = 1; sig < NSIG; sig++) {
+        if (sigismember(&watched, sig) == 1 &&
+            sigaction(sig, &default_action, NULL) < 0) {
+            die("apply-seccomp: bridge sigaction");
+        }
+    }
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) < 0) {
+        die("apply-seccomp: bridge prctl(PR_SET_PDEATHSIG)");
+    }
+    if (getppid() != (pid_t)parent) return 1;
+    if (argc == 3) return 0;
+
+    pid_t launcher = getpid();
+    pid_t child = fork();
+    if (child < 0) die("apply-seccomp: fork bridge");
+    if (child == 0) {
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) < 0) {
+            die("apply-seccomp: bridge child prctl(PR_SET_PDEATHSIG)");
+        }
+        if (getppid() != launcher) _exit(1);
+        for (int sig = 1; sig < NSIG; sig++) {
+            if (sigismember(&watched, sig) == 1) {
+                sigdelset(&previous, sig);
+            }
+        }
+        if (sigprocmask(SIG_SETMASK, &previous, NULL) < 0) {
+            die("apply-seccomp: bridge child sigprocmask");
+        }
+        execvp(argv[4], &argv[4]);
+        die("apply-seccomp: execvp bridge");
+    }
+
+    int status;
+    int stopping = 0;
+    for (;;) {
+        pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) break;
+        if (result < 0) {
+            if (errno == EINTR) continue;
+            die("apply-seccomp: waitpid bridge");
+        }
+        int sig = sigwaitinfo(&watched, NULL);
+        if (sig < 0) {
+            if (errno == EINTR) continue;
+            die("apply-seccomp: sigwaitinfo bridge");
+        }
+        if (sig == SIGALRM) {
+            if (stopping) kill(child, SIGKILL);
+        } else if (sig != SIGCHLD && !stopping) {
+            stopping = 1;
+            kill(child, SIGTERM);
+            alarm(1);
+        }
+    }
+    alarm(0);
+
+    struct stat socket_stat;
+    if (lstat(argv[3], &socket_stat) == 0) {
+        if (!S_ISSOCK(socket_stat.st_mode) || socket_stat.st_uid != getuid()) {
+            fprintf(stderr, "apply-seccomp: bridge cleanup path is not an owned socket\n");
+            return 1;
+        }
+        if (unlink(argv[3]) < 0 && errno != ENOENT) {
+            die("apply-seccomp: unlink bridge socket");
+        }
+    } else if (errno != ENOENT) {
+        die("apply-seccomp: lstat bridge socket");
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 1;
+}
+
 int main(int argc, char *argv[]) {
+    if (argc >= 2 && strcmp(argv[1], "--bridge-launcher") == 0) {
+        return run_bridge(argc, argv);
+    }
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <command> [args...]\n", argv[0]);
         return 1;
