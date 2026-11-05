@@ -1,0 +1,4 @@
+[test]
+# Gives the run directories of its own for the mount point manifests, before any
+# test file is loaded: see test/preload.ts.
+preload = ["./test/preload.ts"]
