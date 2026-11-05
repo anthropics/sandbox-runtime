@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test'
+import { describe, test, expect, spyOn } from 'bun:test'
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -105,6 +105,34 @@ describe('mitm-leaf: mintLeafCert', () => {
       createSecureContext({ cert: leaf.certPem, key: leaf.keyPem }),
     ).not.toThrow()
   })
+
+  // Whatever the random source gives. All zeros is the far end of a serial
+  // that begins with zero bytes, about one in 65,000.
+  for (const [what, byte] of [
+    ['zeros', '\x00'],
+    ['ones', '\xff'],
+  ] as const) {
+    test(`a serial drawn as all ${what} gives a certificate that parses`, () => {
+      // The leaves' key pair is made first, from the real source.
+      mintLeafCert(ca, 'first.serial.example.com')
+      const drawn = spyOn(forge.random, 'getBytesSync').mockImplementation(n =>
+        byte.repeat(n),
+      )
+      let leaf
+      try {
+        leaf = mintLeafCert(ca, `${what}.serial.example.com`)
+        expect(drawn).toHaveBeenCalled()
+      } finally {
+        drawn.mockRestore()
+      }
+      expect(() =>
+        createSecureContext({ cert: leaf.certPem, key: leaf.keyPem }),
+      ).not.toThrow()
+      const serial = new X509Certificate(leaf.certPem).serialNumber
+      expect(serial).toHaveLength(32)
+      expect(serial).toMatch(/^[4-7]/)
+    })
+  }
 
   test('caches per (CA instance, hostname)', () => {
     const a = secureContextFor(ca, 'cached.example')

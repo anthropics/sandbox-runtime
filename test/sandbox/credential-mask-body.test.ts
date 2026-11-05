@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { testWithTls } from '../helpers/emitted-connections.js'
 import { createServer as createHttpsServer } from 'node:https'
 import {
   createServer as createHttpServer,
@@ -45,24 +46,17 @@ type SeenRequest = {
   body: Buffer
 }
 
-/**
- * On the chunked-fallback path the proxy deletes the client's (now stale)
- * Content-Length and lets the runtime re-frame the upstream leg. Node
- * streams it chunked; Bun sometimes buffers a small body and sends a fresh
- * correct Content-Length instead. Both are valid framing — what must never
- * appear is the stale length, `clientSentLength`.
- */
+/** Length-changing substitution is buffered and forwarded with an exact length. */
 function expectReframed(got: SeenRequest, clientSentLength: number): void {
   const cl = got.headers['content-length']
-  if (got.headers['transfer-encoding'] === 'chunked') {
-    expect(cl).toBeUndefined()
-  } else {
-    expect(cl).toBe(String(got.body.length))
-  }
+  expect(got.headers['transfer-encoding']).toBeUndefined()
+  expect(cl).toBe(String(got.body.length))
   expect(cl).not.toBe(String(clientSentLength))
 }
 
 describe('credential-mask-body: end-to-end through the TLS-terminating proxy', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
 
   let upstream: Server
@@ -144,14 +138,37 @@ describe('credential-mask-body: end-to-end through the TLS-terminating proxy', (
     }
   })
 
-  test('JSON body, non-length-matched sentinel: chunked fallback, real secret arrives', async () => {
+  test('a short registered credential does not change sentinel-free upload framing', async () => {
+    const reg = new SentinelRegistry()
+    reg.register('GH_TOKEN', REAL_SHORT, ['127.0.0.1'])
+    const { server, port } = await startProxy(reg)
+    try {
+      const payload = 'release asset without a credential'
+      const result = await curlViaProxy(port, url('/sentinel-free'), {
+        method: 'POST',
+        body: payload,
+      })
+      expect(result.exit).toBe(0)
+      expect(result.status).toBe(200)
+      const got = lastSeen()
+      expect(got.body.toString()).toBe(payload)
+      expect(got.headers['content-length']).toBe(
+        String(Buffer.byteLength(payload)),
+      )
+      expect(got.headers['transfer-encoding']).toBeUndefined()
+    } finally {
+      await stop(server)
+    }
+  })
+
+  test('JSON body, non-length-matched sentinel: exact Content-Length, real secret arrives', async () => {
     const reg = new SentinelRegistry()
     const sentinel = reg.register('GH_TOKEN', REAL_SHORT, ['127.0.0.1'])
     expect(sentinel.length).not.toBe(REAL_SHORT.length)
     const { server, port } = await startProxy(reg)
     try {
       const payload = `{"token":"${sentinel}"}`
-      const r = await curlViaProxy(port, url('/json-chunked'), {
+      const r = await curlViaProxy(port, url('/json-buffered'), {
         method: 'POST',
         body: payload,
         headers: ['Content-Type: application/json'],
@@ -161,14 +178,14 @@ describe('credential-mask-body: end-to-end through the TLS-terminating proxy', (
       const got = lastSeen()
       expect(got.body.toString()).toBe(`{"token":"${REAL_SHORT}"}`)
       // Substitution changed the body length: the client's Content-Length
-      // was dropped and the upstream leg re-framed.
+      // was replaced with the exact substituted byte length.
       expectReframed(got, payload.length)
     } finally {
       await stop(server)
     }
   })
 
-  test('caller-minted sentinel (registerWithSentinel) also takes the chunked fallback', async () => {
+  test('caller-minted sentinel (registerWithSentinel) also gets an exact length', async () => {
     const reg = new SentinelRegistry()
     // Shaped fake, e.g. a JWT-form sentinel — never padded by the registry.
     const fake = 'eyJhbGciOiJub25lIn0.fake-a1b2c3d4-5678-4abc-8def-000011112222'
@@ -332,7 +349,7 @@ describe('credential-mask-body: end-to-end through the TLS-terminating proxy', (
 })
 
 describe('credential-mask-body: plaintext proxy path (opt-in)', () => {
-  test('getBodySubstitutionsPlaintext substitutes in a plain-HTTP POST body', async () => {
+  async function checkPlaintextBody(real: string): Promise<void> {
     const seen: SeenRequest[] = []
     const upstream = createHttpServer((req, res) => {
       const chunks: Buffer[] = []
@@ -352,7 +369,7 @@ describe('credential-mask-body: plaintext proxy path (opt-in)', () => {
     const upstreamPort = (upstream.address() as AddressInfo).port
 
     const reg = new SentinelRegistry()
-    const sentinel = reg.register('GH_TOKEN', REAL_LONG, ['127.0.0.1'])
+    const sentinel = reg.register('GH_TOKEN', real, ['127.0.0.1'])
     const proxy = createHttpProxyServer({
       filter: () => true,
       mutateHeadersPlaintext: (h, d) => reg.substituteInHeaders(h, d, eq),
@@ -387,13 +404,19 @@ describe('credential-mask-body: plaintext proxy path (opt-in)', () => {
       })
       expect(status).toBe(200)
       const got = seen[seen.length - 1]!
-      expect(got.body.toString()).toBe(`{"token":"${REAL_LONG}"}`)
-      expect(got.headers['content-length']).toBe(String(payload.length))
+      expect(got.body.toString()).toBe(`{"token":"${real}"}`)
+      expect(got.headers['content-length']).toBe(String(got.body.length))
+      expect(got.headers['transfer-encoding']).toBeUndefined()
     } finally {
       await new Promise<void>(r => proxy.close(() => r()))
       await new Promise<void>(r => upstream.close(() => r()))
     }
-  })
+  }
+
+  test('length-matched plaintext POST preserves exact framing', () =>
+    checkPlaintextBody(REAL_LONG))
+  test('length-changing plaintext POST preserves exact framing', () =>
+    checkPlaintextBody(REAL_SHORT))
 })
 
 type CurlResult = {
@@ -423,6 +446,10 @@ async function curlViaProxy(
     '-v',
     '--proxy',
     `http://127.0.0.1:${proxyPort}`,
+    // An empty list overrides NO_PROXY, which would send curl around
+    // the proxy under test for 127.0.0.1.
+    '--noproxy',
+    '',
     '--cacert',
     CA_CERT,
     '--max-time',

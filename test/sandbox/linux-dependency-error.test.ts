@@ -30,6 +30,14 @@ let spawnSyncSpy: ReturnType<typeof spyOn>
 const bwrapExiting = (status: number, stderr = '') =>
   ({ status, signal: null, pid: 1, output: [], stdout: '', stderr }) as never
 
+// The spawns that are not the `bwrap --version` probe every caller runs:
+// the ones that ask about capabilities.
+const capabilityProbes = (): unknown[] =>
+  spawnSyncSpy.mock.calls.filter(
+    (call: unknown[]) =>
+      !(Array.isArray(call[1]) && call[1].includes('--version')),
+  )
+
 beforeEach(() => {
   whichSpy = spyOn(which, 'whichSync').mockImplementation(
     (bin: string) => `/usr/bin/${bin}`,
@@ -61,7 +69,7 @@ describe('checkLinuxDependencies', () => {
     expect(result.errors).toEqual([])
     expect(result.warnings).toEqual([])
     // A non-root caller is never asked about capabilities.
-    expect(spawnSyncSpy).not.toHaveBeenCalled()
+    expect(capabilityProbes()).toEqual([])
   })
 
   test('returns error when bwrap missing', () => {
@@ -118,7 +126,7 @@ describe('checkLinuxDependencies', () => {
 
       const result = checkLinuxDependencies()
 
-      expect(spawnSyncSpy.mock.calls.length > 0).toBe(lacksSetfcap)
+      expect(capabilityProbes().length > 0).toBe(lacksSetfcap)
       expect(result.errors).toEqual([])
       expect(result.warnings).toEqual([])
     },

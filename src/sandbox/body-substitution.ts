@@ -6,9 +6,10 @@
  * request body (JSON payload, form post) would otherwise reach the API as
  * the useless fake. Sentinels are exact-match strings over `[a-z0-9_-]`, so
  * they survive JSON, form-urlencoded, multipart, and XML verbatim — a raw
- * byte scan needs no format parsing. Bodies are never buffered whole:
- * memory is bounded by one chunk plus a hold-back of `maxSentinelLength - 1`
- * bytes carried across chunk boundaries.
+ * byte scan needs no format parsing. The transform retains one chunk plus
+ * a hold-back of `maxSentinelLength - 1` bytes across chunk boundaries.
+ * Callers buffer length-changing substitutions up to a fixed cap to send
+ * an exact Content-Length; length-matched substitutions keep streaming.
  *
  * Fail-safe direction: substitution is fake→real, so a missed sentinel
  * (compressed body, base64-wrapped, split by an encoder) means the FAKE
@@ -64,7 +65,7 @@ export type BodySubstitutionPlan = {
 export function prepareBodySubstitution(
   getBodySubstitutions: GetBodySubstitutions | undefined,
   req: IncomingMessage,
-  fwdHeaders: IncomingHttpHeaders,
+  _fwdHeaders: IncomingHttpHeaders,
   destHost: string,
 ): BodySubstitutionPlan | undefined {
   if (getBodySubstitutions === undefined) return undefined
@@ -174,6 +175,7 @@ export const MAX_BODY_SUBSTITUTION_BUFFER_BYTES = 64 * 1024 * 1024
 
 export class BodySubstitutionTooLargeError extends Error {}
 
+/** Stop reading at the cap; the caller owns response-safe source teardown. */
 export function collectLimitedBody(
   body: Readable,
   maxBytes: number,
@@ -181,12 +183,27 @@ export function collectLimitedBody(
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let total = 0
+    const cleanup = () => {
+      body.removeListener('data', onData)
+      body.removeListener('end', onEnd)
+      body.removeListener('error', onError)
+      body.removeListener('close', onClose)
+    }
+    const onError = (err: Error) => {
+      body.pause()
+      chunks.length = 0
+      cleanup()
+      reject(err)
+    }
+    const onClose = () => onError(new Error('request body closed before end'))
+    const onEnd = () => {
+      cleanup()
+      resolve(Buffer.concat(chunks, total))
+    }
     const onData = (c: Buffer) => {
       total += c.length
       if (total > maxBytes) {
-        chunks.length = 0
-        body.removeListener('data', onData)
-        reject(
+        onError(
           new BodySubstitutionTooLargeError(
             `request body exceeds ${maxBytes} bytes`,
           ),
@@ -195,8 +212,50 @@ export function collectLimitedBody(
       }
       chunks.push(c)
     }
+    if (body.readableEnded) {
+      resolve(Buffer.alloc(0))
+      return
+    }
+    if (body.destroyed) {
+      reject(new Error('request body closed before end'))
+      return
+    }
     body.on('data', onData)
-    body.once('end', () => resolve(Buffer.concat(chunks)))
-    body.once('error', reject)
+    body.once('end', onEnd)
+    body.once('error', onError)
+    body.once('close', onClose)
   })
+}
+
+/** Buffer substitution without destroying the client's socket before a denial. */
+export async function collectSubstitutedBody(
+  body: Readable,
+  transform: Transform,
+  maxBytes: number,
+): Promise<Buffer> {
+  // Overflow can settle the collector before a queued source error arrives.
+  // Keep an error listener until the transform closes, including that gap.
+  const swallowError = () => {}
+  transform.on('error', swallowError)
+  transform.once('close', () => transform.removeListener('error', swallowError))
+  const onError = (err: Error) => transform.destroy(err)
+  const onClose = () => {
+    if (!body.readableEnded) {
+      transform.destroy(new Error('request body closed before end'))
+    }
+  }
+  body.on('error', onError)
+  body.once('close', onClose)
+  try {
+    const collected = collectLimitedBody(transform, maxBytes)
+    if (body.destroyed && !body.readableEnded) onClose()
+    else body.pipe(transform)
+    return await collected
+  } finally {
+    body.unpipe(transform)
+    body.pause()
+    body.removeListener('error', onError)
+    body.removeListener('close', onClose)
+    transform.destroy()
+  }
 }

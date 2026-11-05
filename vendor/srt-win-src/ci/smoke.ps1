@@ -90,7 +90,9 @@ if (-not $us.user.in_sandbox_group)  { throw "install: sandbox user not in sandb
 if (-not $us.user.hidden_from_logon) { throw "install: sandbox user not hidden from Winlogon" }
 if (-not $us.cred_present)           { throw "install: credential not present (HKLM Cred\Blob)" }
 # Keep in sync with SETUP_VERSION (vendor/srt-win-src/src/install.rs).
-if ($us.marker_version -ne 2)        { throw "install: setup marker version expected 2, got $($us.marker_version)" }
+$SetupVersion = 3
+if ($us.marker_version -ne $SetupVersion) { throw "install: setup marker version expected $SetupVersion, got $($us.marker_version)" }
+if ($us.setup_version -ne $SetupVersion)  { throw "install: user status setup_version expected $SetupVersion, got $($us.setup_version)" }
 if ($us.marker_user_sid -ne $us.user.sid) {
   throw "install: marker SID '$($us.marker_user_sid)' != live SID '$($us.user.sid)'"
 }
@@ -168,28 +170,48 @@ if (-not ($caAcl.Access | Where-Object { $_.AccessControlType -eq 'Allow' -and $
   throw "install: Ca key lacks BUILTIN\Users SetValue (unelevated trust-ca broken):`n$($caAcl.Access | Out-String)"
 }
 
-# ── M1: stale/foreign marker → plain install completes ────────────
-# An admin (or an older build) leaves MarkerVersion at a value the
-# broker doesn't expect: read_cred refuses with "re-run install",
-# status still exits 0, and a plain (no --force) install falls
-# through the early-out and heals the marker.
-Set-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -Name MarkerVersion -Value 99
-$m1b = & $Exe user read-cred 2>&1 | Out-String
-if ($LASTEXITCODE -eq 0) { throw "M1b: read-cred succeeded on marker v99. out: $m1b" }
-if ($m1b -notmatch '(?i)marker version mismatch.*re-run') {
-  throw "M1b: expected marker-mismatch refusal. out: $m1b"
+# ── M1: a marker of another setup version → plain install upgrades ─
+foreach ($stale in @(($SetupVersion - 1), 99)) {
+  Set-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime' -Name MarkerVersion -Value $stale
+  $m1b = & $Exe user read-cred 2>&1 | Out-String
+  if ($LASTEXITCODE -eq 0) { throw "M1b: read-cred succeeded on marker v$stale. out: $m1b" }
+  if ($m1b -notmatch '(?i)marker version mismatch.*re-run') {
+    throw "M1b: expected marker-mismatch refusal on v$stale. out: $m1b"
+  }
+  $m1c = & $Exe user status 2>$null | Out-String
+  if ($LASTEXITCODE -ne 0) { throw "M1c: user status on marker v$stale expected exit 0; got $LASTEXITCODE" }
+  $m1s = $m1c | ConvertFrom-Json
+  if ($m1s.marker_version -ne $stale -or $m1s.setup_version -ne $SetupVersion) {
+    throw "M1c: user status on marker v$stale reports marker_version=$($m1s.marker_version) setup_version=$($m1s.setup_version)"
+  }
+  Write-Host "M1b ok: read-cred refuses + status survives a v$stale marker"
+  if ($stale -gt $SetupVersion) {
+    # A newer install is not replaced without --force.
+    $m1n = & $Exe @(@('install') + $isl + $pr) 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0 -or $m1n -notmatch "newer than this build's") {
+      throw "M1n: plain install on a newer marker v${stale}: exit=$LASTEXITCODE out: $m1n"
+    }
+    $mvn = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime').MarkerVersion
+    if ($mvn -ne $stale) { throw "M1n: refused install changed the marker (v$stale -> v$mvn)" }
+    Write-Host "M1n ok: plain install refuses a newer marker v$stale"
+    $m1out = & $Exe @(@('install', '--force') + $isl + $pr) 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "M1: install --force exited $LASTEXITCODE on marker v$stale. out: $m1out" }
+  } else {
+    $m1out = & $Exe @(@('install') + $isl + $pr) 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "M1: install exited $LASTEXITCODE on marker v$stale. out: $m1out" }
+    if ($m1out -match '(?i)already installed.*no changes') {
+      throw "M1: install short-circuited on a v$stale marker. out: $m1out"
+    }
+    if ($m1out -notmatch "setup version $stale; upgrading it to $SetupVersion") {
+      throw "M1: install did not report the upgrade from v$stale. out: $m1out"
+    }
+  }
+  $mv = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime').MarkerVersion
+  if ($mv -ne $SetupVersion) { throw "M1: marker not rewritten (v$stale -> v$mv, expected v$SetupVersion)" }
+  & $Exe user read-cred 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "M1: read-cred fails after the upgrade from v$stale" }
+  Write-Host "M1 ok: v$stale marker brought to this build's (now v$mv)"
 }
-$m1c = & $Exe user status 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) { throw "M1c: user status on stale marker expected exit 0; got $LASTEXITCODE" }
-Write-Host "M1b ok: read-cred refuses + status survives a stale marker"
-$m1out = & $Exe @(@('install') + $isl + $pr) 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) { throw "M1: install exited $LASTEXITCODE. out: $m1out" }
-if ($m1out -match '(?i)already installed.*no changes') {
-  throw "M1: install short-circuited on a stale marker. out: $m1out"
-}
-$mv = (Get-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime').MarkerVersion
-if ($mv -eq 99) { throw "M1: marker not healed (still 99)" }
-Write-Host "M1 ok: stale marker healed by plain install (now v$mv)"
 # Re-install above re-wrote the cred; downstream rows (read-cred
 # etc.) already ran and don't depend on it.
 
@@ -272,12 +294,15 @@ function WfpVerify([string]$tgt) {
   $out = & $Exe wfp verify --target $tgt
   $ec = $LASTEXITCODE
   Write-Host "wfp verify --target ${tgt}: exit=$ec stdout='$out'"
+  # The exit code first: only 0, 2 and 3 come with a probe report to parse.
+  if ($ec -notin 0, 2, 3) { throw "wfp verify --target ${tgt} exited $ec without a probe report. stdout: $out" }
   return [pscustomobject]@{ exit = $ec; json = $out | ConvertFrom-Json }
 }
 $v = WfpVerify $probeTgt
 if ($v.exit -ne 0 -or $v.json.egress_probe -ne 'blocked') {
   throw ("wfp verify (fence-active): expected exit 0 + blocked, " +
-         "got exit=$($v.exit) probe='$($v.json.egress_probe)'")
+         "got exit=$($v.exit) probe='$($v.json.egress_probe)'. " +
+         "Every attempt: $($v.json | ConvertTo-Json -Compress)")
 }
 if ($v.json.target -ne $probeTgt) {
   throw "wfp verify: --target not honoured; got '$($v.json.target)'"
@@ -376,6 +401,10 @@ if ($v.exit -ne 3 -or $v.json.egress_probe -ne 'connected') {
          "fence-active from fence-missing")
 }
 Write-Host 'wfp verify ok: fence-inactive → exit 3 + connected'
+# The plain connect settles it: nothing else is attempted.
+if ($v.json.low_integrity_loopback_probe -ne 'skipped' -or $v.json.anonymous_loopback_probe -ne 'skipped') {
+  throw "wfp verify (fence-inactive): expected the remaining attempts skipped: $($v.json | ConvertTo-Json -Compress)"
+}
 $probeLsn.Stop()
 
 # Re-install to set up for the full uninstall below.

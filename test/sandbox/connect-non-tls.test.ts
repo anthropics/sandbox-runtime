@@ -1,6 +1,7 @@
 import { connect, createServer, type Server, type Socket } from 'node:net'
 import { once } from 'node:events'
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { SERVES_EMITTED_CONNECTIONS } from '../helpers/emitted-connections.js'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { looksLikeClientHello } from '../../src/sandbox/tls-terminate-proxy.js'
@@ -118,47 +119,53 @@ describe('CONNECT carrying non-TLS bytes with mitmCA configured', () => {
     expect(r.upstreamSaw).toContain('SSH-2.0-OpenSSH')
   })
 
-  it('with mitmCA: non-TLS bytes are sniffed and opaque-tunnelled', async () => {
-    const ca = createMitmCA({})
-    try {
-      const r = await tunnel(ca)
-      // Before the fix: buf was "200...\r\n\r\n\x15\x03\x01\x00\x02\x02\x46"
-      // (TLS protocol_version alert) and upstreamSaw was "".
-      expect(r.buf).toContain('SSH-2.0-FakeUpstream')
-      expect(r.upstreamSaw).toContain('SSH-2.0-OpenSSH')
-    } finally {
-      await disposeMitmCA(ca)
-    }
-  })
+  it.skipIf(!SERVES_EMITTED_CONNECTIONS)(
+    'with mitmCA: non-TLS bytes are sniffed and opaque-tunnelled',
+    async () => {
+      const ca = createMitmCA({})
+      try {
+        const r = await tunnel(ca)
+        // Before the fix: buf was "200...\r\n\r\n\x15\x03\x01\x00\x02\x02\x46"
+        // (TLS protocol_version alert) and upstreamSaw was "".
+        expect(r.buf).toContain('SSH-2.0-FakeUpstream')
+        expect(r.upstreamSaw).toContain('SSH-2.0-OpenSSH')
+      } finally {
+        await disposeMitmCA(ca)
+      }
+    },
+  )
 
-  it('with mitmCA: hostname filter still runs before the sniff', async () => {
-    let filterCalled = false
-    const ca = createMitmCA({})
-    try {
-      const proxy = createHttpProxyServer({
-        filter: (_port, host) => {
-          filterCalled = host === 'localhost'
-          return false
-        },
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        mitmCA: ca as any,
-      })
-      proxy.listen(0, '127.0.0.1')
-      await once(proxy, 'listening')
-      const proxyPort = (proxy.address() as { port: number }).port
-      const sock = connect({ host: '127.0.0.1', port: proxyPort })
-      await once(sock, 'connect')
-      sock.write(
-        `CONNECT localhost:${upstreamPort} HTTP/1.1\r\nHost: localhost:${upstreamPort}\r\n\r\n`,
-      )
-      let buf = ''
-      sock.on('data', d => (buf += d.toString()))
-      await once(sock, 'close')
-      proxy.close()
-      expect(filterCalled).toBe(true)
-      expect(buf).toContain('403 Forbidden')
-    } finally {
-      await disposeMitmCA(ca)
-    }
-  })
+  it.skipIf(!SERVES_EMITTED_CONNECTIONS)(
+    'with mitmCA: hostname filter still runs before the sniff',
+    async () => {
+      let filterCalled = false
+      const ca = createMitmCA({})
+      try {
+        const proxy = createHttpProxyServer({
+          filter: (_port, host) => {
+            filterCalled = host === 'localhost'
+            return false
+          },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          mitmCA: ca as any,
+        })
+        proxy.listen(0, '127.0.0.1')
+        await once(proxy, 'listening')
+        const proxyPort = (proxy.address() as { port: number }).port
+        const sock = connect({ host: '127.0.0.1', port: proxyPort })
+        await once(sock, 'connect')
+        sock.write(
+          `CONNECT localhost:${upstreamPort} HTTP/1.1\r\nHost: localhost:${upstreamPort}\r\n\r\n`,
+        )
+        let buf = ''
+        sock.on('data', d => (buf += d.toString()))
+        await once(sock, 'close')
+        proxy.close()
+        expect(filterCalled).toBe(true)
+        expect(buf).toContain('403 Forbidden')
+      } finally {
+        await disposeMitmCA(ca)
+      }
+    },
+  )
 })

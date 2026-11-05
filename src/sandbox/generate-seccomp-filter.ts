@@ -131,30 +131,17 @@ function buildGlobalNpmPaths(npmRootOutput: string | undefined): string[] {
  * Returns null for unsupported architectures
  */
 function getVendorArchitecture(): string | null {
-  const arch = process.arch as string
+  const arch = process.arch
   switch (arch) {
     case 'x64':
-    case 'x86_64':
       return 'x64'
     case 'arm64':
-    case 'aarch64':
       return 'arm64'
     case 'ia32':
-    case 'x86':
-      // TODO: Add support for 32-bit x86 (ia32)
-      // Currently blocked because the seccomp filter does not block the socketcall() syscall,
-      // which is used on 32-bit x86 for all socket operations (socket, socketpair, bind, connect, etc.).
-      // On 32-bit x86, the direct socket() syscall doesn't exist - instead, all socket operations
-      // are multiplexed through socketcall(SYS_SOCKET, ...), socketcall(SYS_SOCKETPAIR, ...), etc.
-      //
-      // To properly support 32-bit x86, we need to:
-      // 1. Build a separate i386 BPF filter (BPF bytecode is architecture-specific)
-      // 2. Modify vendor/seccomp-src/seccomp-unix-block.c to conditionally add rules that block:
-      //    - socketcall(SYS_SOCKET, [AF_UNIX, ...])
-      //    - socketcall(SYS_SOCKETPAIR, [AF_UNIX, ...])
-      // 3. This requires complex BPF logic to inspect socketcall's sub-function argument
-      //
-      // Until then, 32-bit x86 is not supported to avoid a security bypass.
+      // ia32 multiplexes every socket operation through socketcall(), whose
+      // sub-function argument the filter cannot inspect, so AF_UNIX is not
+      // blockable there. vendor/seccomp-src/seccomp-unix-block.c carries what
+      // supporting it would take.
       logForDebugging(
         `[SeccompFilter] 32-bit x86 (ia32) is not currently supported due to missing socketcall() syscall blocking. ` +
           `The current seccomp filter only blocks socket(AF_UNIX, ...), but on 32-bit x86, socketcall() can be used to bypass this.`,

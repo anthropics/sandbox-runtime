@@ -346,7 +346,7 @@ describe('restriction pattern semantics', () => {
         })
 
         expect(result).toContain('/opt/sc/socat')
-        expect(result).toContain('TCP-LISTEN:3128')
+        expect(result).toContain('TCP6-LISTEN:3128')
       } finally {
         rmSync(httpSock, { force: true })
         rmSync(socksSock, { force: true })
@@ -746,8 +746,8 @@ describe('allowWrite glob suffix handling', () => {
 
         const result = await SandboxManager.wrapWithSandbox(command)
 
-        // One --ro-bind <path> <path> contains the path twice (src + dest).
-        // Without dedup this was 4 occurrences (two binds).
+        // One --ro-bind <path> <path> contains the path twice (src + dest);
+        // the two spellings of the same file must not each emit a bind.
         const occurrences = result.split(childFile).length - 1
         expect(occurrences).toBe(2)
       } finally {
@@ -757,10 +757,9 @@ describe('allowWrite glob suffix handling', () => {
     },
   )
 
-  // Regression: #190 reordered denyWrite after denyRead so .git/hooks ro-binds
-  // survive a tmpfs over an ancestor. But denyWrite's --ro-bind <host> <host>
-  // now lands after denyRead's --ro-bind /dev/null <host>, undoing the mask
-  // when the same file is in both lists.
+  // A path in both denyRead and denyWrite: the /dev/null read mask must win.
+  // denyWrite's --ro-bind is emitted after the denyRead masks, so a host-file
+  // bind at the same destination would re-expose the contents.
   it.if(isLinux)(
     'does not let denyWrite unmask a denyRead /dev/null bind (Linux)',
     async () => {
@@ -792,9 +791,8 @@ describe('allowWrite glob suffix handling', () => {
     },
   )
 
-  // A file listed in denyRead should stay denied even if allowRead covers its
-  // parent directory. Before this change, startsWith(allowPath + '/') matched
-  // and the file-deny was silently skipped.
+  // A file listed in denyRead stays denied even when allowRead covers its
+  // parent directory: a containing allow does not absorb a file-level deny.
   it.if(isLinux)(
     'file-level denyRead survives a parent-directory allowRead (Linux)',
     async () => {

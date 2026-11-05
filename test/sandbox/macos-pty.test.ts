@@ -25,6 +25,7 @@ describe.if(isMacOS)('macOS Seatbelt PTY Support', () => {
 
     const writeConfig: FsWriteRestrictionConfig = {
       allowOnly: [TEST_BASE_DIR],
+      denyWithinAllow: [],
     }
 
     // Use 'script' command which requires PTY allocation
@@ -53,6 +54,7 @@ describe.if(isMacOS)('macOS Seatbelt PTY Support', () => {
 
     const writeConfig: FsWriteRestrictionConfig = {
       allowOnly: [TEST_BASE_DIR],
+      denyWithinAllow: [],
     }
 
     const wrappedCommand = wrapCommandWithSandboxMacOS({

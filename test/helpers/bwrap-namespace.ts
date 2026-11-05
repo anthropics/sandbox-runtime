@@ -1,6 +1,29 @@
 import { spawnSync } from 'node:child_process'
 
+function probe(extraArgs: string[]): boolean {
+  return (
+    spawnSync(
+      'bwrap',
+      [
+        '--unshare-pid',
+        '--unshare-user',
+        ...extraArgs,
+        '--cap-drop',
+        'ALL',
+        '--ro-bind',
+        '/',
+        '/',
+        '--proc',
+        '/proc',
+        'true',
+      ],
+      { timeout: 5000 },
+    ).status === 0
+  )
+}
+
 let probed: boolean | undefined
+let probedWithNetwork: boolean | undefined
 
 /**
  * Whether bwrap here can run the same namespace/proc surface the wrapped
@@ -15,21 +38,16 @@ let probed: boolean | undefined
  * a test helper should pay for.
  */
 export function bwrapCanNamespace(): boolean {
-  return (probed ??=
-    spawnSync(
-      'bwrap',
-      [
-        '--unshare-pid',
-        '--unshare-user',
-        '--cap-drop',
-        'ALL',
-        '--ro-bind',
-        '/',
-        '/',
-        '--proc',
-        '/proc',
-        'true',
-      ],
-      { timeout: 5000 },
-    ).status === 0)
+  return (probed ??= probe([]))
+}
+
+/**
+ * The same probe with --unshare-net added, for the suites whose wrap does
+ * restrict the network: that wrap creates a network namespace, which a host
+ * can refuse while still granting the PID and user namespaces above. Kept
+ * apart from {@link bwrapCanNamespace} so the suites that never create one
+ * are not skipped along with these.
+ */
+export function bwrapCanNamespaceNetwork(): boolean {
+  return (probedWithNetwork ??= probe(['--unshare-net']))
 }

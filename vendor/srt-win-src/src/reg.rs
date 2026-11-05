@@ -41,9 +41,9 @@ use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE, REG_BINARY, REG_DWORD,
-    REG_MULTI_SZ, REG_OPENED_EXISTING_KEY, REG_OPTION_NON_VOLATILE, REG_QWORD, REG_SZ, RegCloseKey,
-    RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, KEY_WRITE, REG_BINARY,
+    REG_DWORD, REG_MULTI_SZ, REG_OPENED_EXISTING_KEY, REG_OPTION_NON_VOLATILE, REG_QWORD, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 
 use crate::util::{OwnedSd, pcwstr, wstr};
@@ -65,16 +65,26 @@ impl Drop for Key {
 impl Key {
     /// Open an existing key. `Ok(None)` when absent.
     pub fn open(path: &str, write: bool) -> Result<Option<Key>> {
+        Self::open_in(HKEY_LOCAL_MACHINE, "HKLM", path, write)
+    }
+
+    /// [`Key::open`] under `HKEY_CURRENT_USER` — per-user state the
+    /// unelevated broker writes itself (see [`crate::persist`]).
+    pub fn open_hkcu(path: &str, write: bool) -> Result<Option<Key>> {
+        Self::open_in(HKEY_CURRENT_USER, "HKCU", path, write)
+    }
+
+    fn open_in(hive: HKEY, label: &str, path: &str, write: bool) -> Result<Option<Key>> {
         let mut h = HKEY::default();
         let w = wstr(path);
         let access =
             KEY_READ | KEY_WOW64_64KEY | if write { KEY_WRITE } else { Default::default() };
-        let r = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, pcwstr(&w), None, access, &mut h) };
+        let r = unsafe { RegOpenKeyExW(hive, pcwstr(&w), None, access, &mut h) };
         if r == ERROR_FILE_NOT_FOUND {
             return Ok(None);
         }
         if r.is_err() {
-            return Err(anyhow!("RegOpenKeyExW(HKLM\\{path}): {r:?}"));
+            return Err(anyhow!("RegOpenKeyExW({label}\\{path}): {r:?}"));
         }
         Ok(Some(Key(h)))
     }
@@ -108,13 +118,24 @@ impl Key {
     /// [`set_key_dacl_from_sddl`] (only admins can have created it,
     /// so this is drift-healing, not squat defense).
     pub fn create(path: &str, sddl: Option<&str>) -> Result<(Key, bool)> {
+        Self::create_in(HKEY_LOCAL_MACHINE, "HKLM", path, sddl)
+    }
+
+    /// Create (or open) a key under `HKEY_CURRENT_USER` with the
+    /// hive's inherited security (the owning user, SYSTEM and
+    /// Administrators; no other account, so not the sandbox one).
+    pub fn create_hkcu(path: &str) -> Result<Key> {
+        Ok(Self::create_in(HKEY_CURRENT_USER, "HKCU", path, None)?.0)
+    }
+
+    fn create_in(hive: HKEY, label: &str, path: &str, sddl: Option<&str>) -> Result<(Key, bool)> {
         let mut h = HKEY::default();
         let mut disp = Default::default();
         let w = wstr(path);
         let sd;
         let mut sa = None;
         if let Some(sddl) = sddl {
-            sd = OwnedSd::from_sddl(sddl).with_context(|| format!("SD for HKLM\\{path}"))?;
+            sd = OwnedSd::from_sddl(sddl).with_context(|| format!("SD for {label}\\{path}"))?;
             sa = Some(windows::Win32::Security::SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>()
                     as u32,
@@ -124,7 +145,7 @@ impl Key {
         }
         let r = unsafe {
             RegCreateKeyExW(
-                HKEY_LOCAL_MACHINE,
+                hive,
                 pcwstr(&w),
                 None,
                 None,
@@ -136,7 +157,7 @@ impl Key {
             )
         };
         if r.is_err() {
-            return Err(anyhow!("RegCreateKeyExW(HKLM\\{path}): {r:?}"));
+            return Err(anyhow!("RegCreateKeyExW({label}\\{path}): {r:?}"));
         }
         Ok((Key(h), disp != REG_OPENED_EXISTING_KEY))
     }

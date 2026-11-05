@@ -686,6 +686,25 @@ describe.if(isMacOS)('macOS glob denyRead inside allowRead (deny wins)', () => {
   const SECRET = 'GLOB_DENY_SECRET_' + Date.now()
   const PLAIN = 'PLAIN_CONTENT_OK'
 
+  /**
+   * Whether the volume holding the tree folds case in file names. Decided
+   * while the block is collected, so the `.ENV` spelling below is skipped
+   * where it cannot resolve rather than passing for the wrong reason.
+   */
+  const volumeFoldsCase = ((): boolean => {
+    const probeDir = join(tmpdir(), 'case-fold-probe-' + Date.now())
+    try {
+      mkdirSync(probeDir, { recursive: true })
+      writeFileSync(join(probeDir, 'probe'), 'x')
+      return existsSync(join(probeDir, 'PROBE'))
+    } finally {
+      rmSync(probeDir, { recursive: true, force: true })
+    }
+  })()
+
+  /** Second spelling of the data volume; absent before macOS 10.15. */
+  const DATA_FIRMLINK = '/System/Volumes/Data'
+
   type Tree = Record<string, string>
   const TREE: Tree = {
     '.env': SECRET,
@@ -979,18 +998,12 @@ describe.if(isMacOS)('macOS glob denyRead inside allowRead (deny wins)', () => {
   })
 
   /**
-   * Behaviors this change does not claim to fix. Each test records what the
-   * current build does (look for `[record]` lines in the test output) so the
-   * PR description can state it; none of them asserts a direction. All of
-   * these were equally (un)covered before this change, for literal denies
-   * too.
+   * Spellings that reach a denied file by another name. The deny is written
+   * against one path; each case pins whether the alias gets past it, so a
+   * build that starts leaking through one of them fails here.
    */
-  describe('recorded (not asserted): adjacent aliasing behaviors', () => {
+  describe('adjacent aliasing behaviors', () => {
     beforeAll(resetTree)
-
-    function record(label: string, detail: string): void {
-      console.log(`[record] ${label}: ${detail}`)
-    }
 
     it('hard link to a denied file (ln .env x; cat x)', () => {
       const link = join(PROJECT, 'hardlink.txt')
@@ -999,18 +1012,15 @@ describe.if(isMacOS)('macOS glob denyRead inside allowRead (deny wins)', () => {
         PROJECT_READ(),
         PROJECT_WRITE(),
       )
-      record(
-        'hardlink',
-        `ln ${r.stdout.includes('LN_OK') ? 'succeeded' : 'failed'}; ` +
-          `link ${existsSync(link) ? 'exists' : 'absent'}; ` +
-          `secret ${r.stdout.includes(SECRET) ? 'READABLE via link' : 'not readable via link'}`,
-      )
+      expect(r.stdout).not.toContain('LN_OK')
+      expect(existsSync(link)).toBe(false)
+      expect(r.stdout).not.toContain(SECRET)
     })
 
-    it('(deny file-link …) — does the operation compile, and does it block ln?', () => {
-      // Informs the follow-up for the hard-link case above: if Seatbelt on
-      // this OS accepts file-link and it fires on the source path, a
-      // deny-only rule can close it the same way unlink is closed here.
+    it('(deny file-link …) compiles and blocks ln', () => {
+      // The hard link above is closed by the read deny on the source. This
+      // pins that Seatbelt here also takes file-link, so a deny-only rule
+      // could close it at the link itself the way unlink is closed.
       const link = join(PROJECT, 'hardlink2.txt')
       const profile =
         '(version 1) (allow default) ' +
@@ -1026,11 +1036,13 @@ describe.if(isMacOS)('macOS glob denyRead inside allowRead (deny wins)', () => {
         ],
         { encoding: 'utf8', timeout: 10000 },
       )
-      record(
-        'deny file-link',
-        `sandbox-exec status=${r.status}; link ${existsSync(link) ? 'CREATED (not blocked)' : 'not created'}; ` +
-          `stderr=${JSON.stringify(r.stderr.trim().split('\n')[0] ?? '')}`,
-      )
+      expect(r.status).not.toBe(0)
+      // `ln` names itself in the denial. A profile Seatbelt refused to
+      // parse or apply fails the same command without ever reaching it,
+      // and says so under its own name instead.
+      expect(r.stderr).toContain('ln:')
+      expect(r.stderr).toContain('Operation not permitted')
+      expect(existsSync(link)).toBe(false)
     })
 
     it('clonefile of a denied file (cp -c .env x; cat x)', () => {
@@ -1040,43 +1052,35 @@ describe.if(isMacOS)('macOS glob denyRead inside allowRead (deny wins)', () => {
         PROJECT_READ(),
         PROJECT_WRITE(),
       )
-      record(
-        'cp -c',
-        `cp ${r.stdout.includes('CP_OK') ? 'succeeded' : 'failed'}; ` +
-          `secret ${r.stdout.includes(SECRET) ? 'READABLE via clone' : 'not readable via clone'}`,
-      )
+      expect(r.stdout).not.toContain('CP_OK')
+      expect(existsSync(clone)).toBe(false)
+      expect(r.stdout).not.toContain(SECRET)
     })
 
-    it('case-folded spelling on a case-insensitive volume (cat .ENV)', () => {
-      const r = run(`cat ${join(PROJECT, '.ENV')} 2>&1; true`, PROJECT_READ())
-      const probe = spawnSync(
-        '/bin/sh',
-        ['-c', `cat ${join(PROJECT, '.ENV')}`],
-        {
+    it.if(volumeFoldsCase)(
+      'case-folded spelling on a case-insensitive volume (cat .ENV)',
+      () => {
+        const spelling = join(PROJECT, '.ENV')
+        const probe = spawnSync('/bin/sh', ['-c', `cat ${spelling}`], {
           encoding: 'utf8',
-        },
-      )
-      const volumeFolds = probe.stdout.includes(SECRET)
-      record(
-        'cat .ENV',
-        volumeFolds
-          ? `volume is case-insensitive; secret ${r.stdout.includes(SECRET) ? 'READABLE via .ENV' : 'not readable via .ENV'}`
-          : 'volume is case-sensitive here; spelling not exercisable',
-      )
-    })
+        })
+        // Unsandboxed, the spelling reaches the file: the deny is what
+        // stops the sandboxed read below, not a missing path.
+        expect(probe.stdout).toContain(SECRET)
+        const r = run(`cat ${spelling} 2>&1; true`, PROJECT_READ())
+        expect(r.stdout).not.toContain(SECRET)
+      },
+    )
 
-    it('firmlink spelling (/System/Volumes/Data<path>)', () => {
-      const alias = join('/System/Volumes/Data', join(PROJECT, '.env'))
-      if (!existsSync(alias)) {
-        record('firmlink', `${alias} does not exist here; not exercisable`)
-        return
-      }
-      const r = run(`cat ${alias} 2>&1; true`, PROJECT_READ())
-      record(
-        'firmlink',
-        `secret ${r.stdout.includes(SECRET) ? 'READABLE via firmlink spelling' : 'not readable via firmlink spelling'}`,
-      )
-    })
+    it.if(existsSync(DATA_FIRMLINK))(
+      'firmlink spelling (/System/Volumes/Data<path>)',
+      () => {
+        const alias = join(DATA_FIRMLINK, join(PROJECT, '.env'))
+        expect(existsSync(alias)).toBe(true)
+        const r = run(`cat ${alias} 2>&1; true`, PROJECT_READ())
+        expect(r.stdout).not.toContain(SECRET)
+      },
+    )
   })
 })
 

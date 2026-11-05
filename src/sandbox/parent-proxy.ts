@@ -16,7 +16,12 @@
  */
 
 import type { LookupFunction, Socket } from 'node:net'
-import type { IncomingHttpHeaders } from 'node:http'
+import type {
+  ClientRequest,
+  IncomingHttpHeaders,
+  IncomingMessage,
+  ServerResponse,
+} from 'node:http'
 import { BlockList, connect as netConnect, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import { URL } from 'node:url'
@@ -364,22 +369,104 @@ export function proxyAuthHeader(proxyUrl: URL): string | undefined {
 }
 
 /**
+ * Write an upstream response's status line and headers to the client.
+ *
+ * An upstream can answer with a head that `writeHead` refuses to send: a
+ * status code outside 100-999 (`HTTP/1.1 099 x`), or a header name or value
+ * with characters that are not allowed on the wire. `writeHead` throws
+ * synchronously, and from inside a response callback that exception would be
+ * uncaught and end the proxy process. Such a response is answered with
+ * `502 Bad Gateway` instead: nothing from the upstream head or body is
+ * relayed, and the upstream connection is closed.
+ *
+ * `headers` is what to send in place of the upstream's own headers with the
+ * hop-by-hop ones removed, for a caller that has filtered them further.
+ *
+ * Returns true when the head was written and the body should be piped,
+ * false when the response was replaced by the 502.
+ */
+export function relayResponseHead(
+  res: ServerResponse,
+  upstreamRes: IncomingMessage,
+  headers: IncomingHttpHeaders = stripHopByHop(upstreamRes.headers),
+): boolean {
+  try {
+    res.writeHead(upstreamRes.statusCode ?? 502, headers)
+    return true
+  } catch (err) {
+    logForDebugging(
+      `Invalid upstream response head (status ${upstreamRes.statusCode}): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+      { level: 'error' },
+    )
+    upstreamRes.destroy()
+    if (res.headersSent) {
+      res.destroy()
+      return false
+    }
+    // A header rejected part-way can leave earlier upstream headers set.
+    for (const name of res.getHeaderNames()) res.removeHeader(name)
+    res.writeHead(502, { 'Content-Type': 'text/plain' })
+    res.end('Bad Gateway')
+    return false
+  }
+}
+
+/**
+ * Calls `fail` for an error of a forwarded request, unless its answer has
+ * arrived whole by then. An upstream that sends more than the Content-Length
+ * it declared (one that counts characters for bytes) has those bytes taken for
+ * the start of a next answer, which is an error of the request: it comes after
+ * the answer is complete and before that has been read. The answer is good,
+ * and a client that asks the upstream itself takes it. The runtime has closed
+ * the connection, so nothing that follows on it is read.
+ */
+export function onUpstreamError(
+  upstream: ClientRequest,
+  fail: (err: Error) => void,
+): void {
+  let answer: IncomingMessage | undefined
+  upstream.once('response', res => {
+    answer = res
+  })
+  upstream.on('error', err => {
+    if (answer?.complete) {
+      logForDebugging(
+        `Upstream connection failed after a whole answer: ${err.message}`,
+      )
+      return
+    }
+    fail(err)
+  })
+}
+
+/**
  * Strip hop-by-hop and proxy-specific headers before forwarding upstream.
  * Also strips any headers named in the incoming `Connection` header, per
- * RFC 7230 §6.1.
+ * RFC 9110 §7.6.1. With `folded`, a name also matches in any spelling of
+ * `-`, `_` and `.` (`Proxy_Authorization`, `keep.alive`), for upstreams
+ * that read those separators as one.
  */
-export function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders {
+export function stripHopByHop(
+  h: IncomingHttpHeaders,
+  { folded = false }: { folded?: boolean } = {},
+): IncomingHttpHeaders {
+  const norm = (name: string): string => {
+    const lower = name.trim().toLowerCase()
+    return folded ? lower.replace(/[_.]/g, '-') : lower
+  }
   const extra = new Set<string>()
   const connHeader = h.connection
   if (connHeader) {
     for (const tok of String(connHeader).split(',')) {
-      extra.add(tok.trim().toLowerCase())
+      extra.add(norm(tok))
     }
   }
   const out: IncomingHttpHeaders = {}
   for (const [k, v] of Object.entries(h)) {
-    const lk = k.toLowerCase()
-    if (!HOP_BY_HOP.has(lk) && !extra.has(lk)) out[k] = v
+    const nk = norm(k)
+    if (!HOP_BY_HOP.has(nk) && !extra.has(nk)) out[k] = v
   }
   return out
 }

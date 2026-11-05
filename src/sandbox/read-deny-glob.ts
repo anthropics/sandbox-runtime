@@ -1,10 +1,13 @@
 import { logForDebugging } from '../utils/debug.js'
 import {
+  type GlobWalkListings,
   isAtOrUnder,
   normalizePathForSandbox,
   pathSpellings,
   properAncestors,
-  walkGlobPattern,
+  type Steps,
+  finish,
+  walkGlobPatternSteps,
 } from './sandbox-utils.js'
 
 /**
@@ -70,15 +73,37 @@ function collapseReadDenyLocations({
  * covering it. The Linux wrapper binds nothing back beneath one: what the
  * pattern matches under an allowed path in there was never found, and would
  * come back unmasked.
+ * @param opts.anchor - as in `ExpandGlobOptions.anchor`.
+ * @param opts.listings - one map for all the patterns of a configuration.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
   reExposedPaths: readonly string[],
   unlistableDirs?: Set<string>,
+  opts: { anchor?: string; listings?: GlobWalkListings } = {},
 ): string[] {
-  const walk = walkGlobPattern(globPattern, {
+  return finish(
+    expandReadDenyGlobLinuxSteps(
+      globPattern,
+      reExposedPaths,
+      unlistableDirs,
+      opts,
+    ),
+  )
+}
+
+/** {@link expandReadDenyGlobLinux}, in the walk's steps. */
+export function* expandReadDenyGlobLinuxSteps(
+  globPattern: string,
+  reExposedPaths: readonly string[],
+  unlistableDirs?: Set<string>,
+  opts: { anchor?: string; listings?: GlobWalkListings } = {},
+): Steps<string[]> {
+  const walk = yield* walkGlobPatternSteps(globPattern, {
     withDirectoryForm: true,
     followSymlinkedDirectories: true,
+    anchor: opts.anchor,
+    listings: opts.listings,
   })
   // Where a path the walk reported really lives: the denyRead loop mounts an
   // entry there, whatever spelling named it.
@@ -95,9 +120,9 @@ export function expandReadDenyGlobLinux(
     const holdMatches = new Set(walk.matches.map(m => parentOf(locationOf(m))))
     for (const dir of walk.directoryMatches) {
       // A directory-form match that is a symlink counts in its own right:
-      // one the walk did not list through (a link back into its own
-      // ancestry, or a second name for a directory already walked) has no
-      // match beneath it, yet denies everything it reaches.
+      // one the walk did not list through (a link back up the tree, or a
+      // further name for a directory already listed) has no match beneath
+      // it, yet denies everything it reaches.
       if (holdMatches.has(locationOf(dir)) || walk.symlinks.has(dir)) {
         candidates.add(dir)
       }
@@ -105,6 +130,10 @@ export function expandReadDenyGlobLinux(
   }
 
   const locations = new Set<string>()
+  /** Links kept under their own spelling, which is not where they lead: a
+   *  directory denied above one hides the link and not that place, so they
+   *  take no part in the collapse. */
+  const spelledLinks: string[] = []
   /** Which spelling first put a location in the list, for the warning below. */
   const namedBy = new Map<string, string>()
   const addLocation = (location: string, candidate: string): void => {
@@ -128,7 +157,7 @@ export function expandReadDenyGlobLinux(
         `[Sandbox Linux] denyRead glob "${globPattern}": ${candidate} leads somewhere that cannot be inspected; denying what holds it`,
         { level: 'warn' },
       )
-      addLocation(candidate, candidate)
+      spelledLinks.push(candidate)
       continue
     }
     const location = locationOf(candidate)
@@ -156,8 +185,11 @@ export function expandReadDenyGlobLinux(
     addLocation(standIn, candidate)
   }
 
+  // Allow paths, which reach this backend as names whatever they hold.
   const reExposed = new Set(
-    reExposedPaths.flatMap(p => pathSpellings(normalizePathForSandbox(p))),
+    reExposedPaths.flatMap(p =>
+      pathSpellings(normalizePathForSandbox(p, { literal: true })),
+    ),
   )
   const mounts = collapseReadDenyLocations({
     locations,
@@ -190,7 +222,7 @@ export function expandReadDenyGlobLinux(
     // that directory, not over anything the pattern names.
     if (walk.baseLocation !== '' && !isAtOrUnder(mount, walk.baseLocation)) {
       logForDebugging(
-        `[Sandbox Linux] denyRead glob "${globPattern}" hides ${mount}, outside ${walk.baseLocation}: reached through ${namedBy.get(mount)}`,
+        `[Sandbox Linux] denyRead glob "${globPattern}" hides ${mount}, outside ${walk.baseLocation}: reached through ${namedBy.get(mount) === mount ? 'a symlinked directory' : namedBy.get(mount)}`,
         { level: 'warn' },
       )
     }
@@ -203,5 +235,5 @@ export function expandReadDenyGlobLinux(
       { level: 'warn' },
     )
   }
-  return [...mounts].sort()
+  return [...mounts, ...spelledLinks].sort()
 }

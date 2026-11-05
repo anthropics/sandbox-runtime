@@ -105,9 +105,12 @@ describe('SigV4 signer against the official aws-sig-v4-test-suite', () => {
   const vectors = loadVectors(SUITE_DIR)
   // The fixture set covers GET with query params, path normalization,
   // UTF-8/unreserved encoding, header trimming/duplicates, POST with a
-  // literal body hash, and session tokens. Guard against a silently
-  // missing fixture directory.
-  expect(vectors.length).toBeGreaterThanOrEqual(20)
+  // literal body hash, and session tokens. Pinned to the exact count so a
+  // fixture that stops loading reds the suite. The upstream vectors that
+  // vary header order and key case (get-header-value-order,
+  // post-header-key-sort, post-header-key-case) are not vendored; the
+  // second signing pass in each test below covers what they exercise.
+  expect(vectors.length).toBe(22)
 
   for (const v of vectors) {
     test(v.name, () => {
@@ -139,6 +142,20 @@ describe('SigV4 signer against the official aws-sig-v4-test-suite', () => {
       expect(result.canonicalRequest).toBe(v.creq)
       expect(result.stringToSign).toBe(v.sts)
       expect(result.authorization).toBe(v.authz)
+
+      // Every .req lists its headers lowercase and already sorted, so the
+      // pass above never leaves the order and case the signer normalizes
+      // to. Signing the same request with the set reversed and upper-cased
+      // must produce the same three strings.
+      const renamed = signSigv4({
+        ...input,
+        signedHeaders: signedHeaders.map(h => h.toUpperCase()).reverse(),
+        accessKeyId: SUITE_AKID,
+        secretAccessKey: SUITE_SECRET,
+      })
+      expect(renamed.canonicalRequest).toBe(v.creq)
+      expect(renamed.stringToSign).toBe(v.sts)
+      expect(renamed.authorization).toBe(v.authz)
     })
   }
 })

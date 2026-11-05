@@ -6,7 +6,6 @@ import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import {
   buildJavaToolOptions,
-  getJavaProxyAgentJarPath,
   getJavaProxyAgentJarPathAsync,
   JAVA_PROXY_AGENT_JAR_NAME,
 } from '../../src/sandbox/java-proxy-agent.js'
@@ -69,27 +68,10 @@ describe('buildJavaToolOptions', () => {
 // The jar is a build artifact (vendor/java-proxy-agent/srt-proxy-agent.jar,
 // `npm run build:java-agent`, needs a JDK) and is not in git; CI builds it
 // before `bun test`. Suites that need it on disk self-skip otherwise.
-const jarPath = getJavaProxyAgentJarPath()
+const jarPath = await getJavaProxyAgentJarPathAsync()
 
-describe('getJavaProxyAgentJarPath', () => {
-  it('prefers an existing explicit path', () => {
-    const explicit = join(
-      import.meta.dir,
-      '..',
-      'fixtures',
-      'java-proxy-agent',
-      'ProxyProbe.java',
-    )
-    expect(getJavaProxyAgentJarPath(explicit)).toBe(explicit)
-  })
-
-  it('falls back past a missing explicit path', () => {
-    // Either the vendor jar (when built) or null — never the bogus path.
-    const r = getJavaProxyAgentJarPath('/nonexistent/srt-proxy-agent.jar')
-    expect(r).toBe(jarPath)
-  })
-
-  it('async variant resolves the same paths as the sync one', async () => {
+describe('getJavaProxyAgentJarPathAsync', () => {
+  it('prefers an existing explicit path, and falls back past a missing one', async () => {
     const explicit = join(
       import.meta.dir,
       '..',
@@ -100,6 +82,7 @@ describe('getJavaProxyAgentJarPath', () => {
     expect(await getJavaProxyAgentJarPathAsync(explicit)).toBe(explicit)
     // A distinct missing path is its own cache key, so this runs the full
     // lookup (including the async global-npm fallback) rather than a hit.
+    // Either the vendor jar (when built) or null — never the bogus path.
     expect(
       await getJavaProxyAgentJarPathAsync('/nonexistent/async-agent.jar'),
     ).toBe(jarPath)

@@ -31,7 +31,7 @@ export type RunResult = {
  */
 export async function spawnAsync(
   cmd: string,
-  argsOrOpts?: readonly string[] | RunOpts,
+  argsOrOpts?: string[] | RunOpts,
   maybeOpts?: RunOpts,
 ): Promise<RunResult> {
   const args = Array.isArray(argsOrOpts) ? argsOrOpts : undefined

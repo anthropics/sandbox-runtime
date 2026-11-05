@@ -12,7 +12,7 @@
  *
  *   bwrap init (PID 1)          <- outer PID ns, no seccomp
  *   \_ bash / socat ...         <- outer PID ns, no seccomp
- *      \_ apply-seccomp [outer] <- outer PID ns, waits for inner init
+ *      \_ apply-seccomp [outer] <- outer PID ns, PR_SET_DUMPABLE=0, waits
  *         ================================================= PID ns boundary
  *         \_ apply-seccomp [inner init] <- inner PID 1, PR_SET_DUMPABLE=0
  *            \_ user command            <- inner PID 2, seccomp applied
@@ -20,11 +20,23 @@
  * From the user command's point of view /proc contains only its own process
  * tree. The bwrap init, bash wrapper, and socat helpers are not addressable,
  * so they cannot be ptraced or patched via /proc/N/mem even on systems with
- * kernel.yama.ptrace_scope=0. The inner init (PID 1) sets PR_SET_DUMPABLE=0
- * so it cannot be ptraced either.
+ * kernel.yama.ptrace_scope=0. Both halves of this program are non-dumpable
+ * from before the first fork, and the outer half takes the namespaces filter
+ * too (not with SRT_ALLOW_NESTED_USERNS=1): where the fresh /proc below cannot
+ * be mounted (enableWeakerNestedSandbox) the command still sees the outer
+ * half, and one started by uid 0 holds capabilities in its user namespace.
  *
  * Any failure to set up the nested namespaces aborts with a non-zero exit
  * status; we never fall back to running the command without isolation.
+ *
+ * The command may not make namespaces of its own: one that can create a user
+ * namespace can undo the sandbox's write denies (NESTED_USERNS_ENV in
+ * src/sandbox/linux-sandbox-utils.ts says how). Two independent means: the
+ * `namespaces` seccomp filter (seccomp-unix-block.c), which is what holds a
+ * command started by uid 0, and user.max_user_namespaces=0 in the user
+ * namespace this helper made, which holds if a call is missing from the
+ * filter. SRT_ALLOW_NESTED_USERNS=1, read before the command exists and
+ * removed from its environment, turns both off.
  *
  * Compile: gcc -static -O2 -o apply-seccomp apply-seccomp.c
  */
@@ -94,7 +106,7 @@
  * When SRT_OBSERVE_SOCK is set the worker installs a second seccomp filter
  * that traps write-intent filesystem syscalls to
  * SECCOMP_RET_USER_NOTIF, then ships the listener fd to the OUTER STUB over
- * a pre-fork socketpair. The outer stub is never under either filter, so it
+ * a pre-fork socketpair. The outer stub is under neither of the two, so it
  * services every notification with SECCOMP_USER_NOTIF_FLAG_CONTINUE — the
  * workload's behaviour is unchanged — and writes one JSON line per
  * observed call to the SRT_OBSERVE_SOCK unix socket (a Node net.Server).
@@ -314,11 +326,12 @@ static int recv_fd(int sock) {
  * filter with no listener, which makes matched syscalls fail ENOSYS).
  *
  * Audited syscalls between the seccomp() return and execve():
- *   sendmsg, close, close, prctl(PR_SET_SECCOMP), execve
- * None are in the observe match set (write-intent fs) and none are
+ *   sendmsg, close, close, prctl(PR_SET_SECCOMP) once per filter, execve
+ * None are in the observe match set (write-intent fs), none are in the
+ * namespaces set (user-namespace creation, setns, mount calls) and none are
  * in the unix-block set (socket(AF_UNIX)/io_uring), so the worker cannot
- * trap on itself before exec. perror()/snprintf() are deliberately avoided
- * post-filter to keep this set closed. */
+ * trap on itself, or be refused, before exec. perror()/snprintf() are
+ * deliberately avoided post-filter to keep this set closed. */
 static void install_observe_filter(int sp_fd) {
     if (sp_fd < 0) return;
 
@@ -483,7 +496,7 @@ static int connect_observe_sock(const char *path) {
 }
 
 /* Service the notify fd until the inner-init child exits. Runs in the OUTER
- * STUB, which never installed either seccomp filter. Always replies CONTINUE,
+ * STUB, which has only the namespaces filter. Always replies CONTINUE,
  * even when out_sock < 0, so a missing listener never wedges the workload. */
 static void supervise(pid_t child, int notify_fd, int out_sock,
                       const char *enc, int host_proc_fd) {
@@ -665,11 +678,24 @@ int main(int argc, char *argv[]) {
 
     char **command_argv = &argv[1];
 
+    /* Read once, from the environment the caller built; the worker's copy is
+     * removed below. */
+    const char *allow_env = getenv("SRT_ALLOW_NESTED_USERNS");
+    int allow_nested_userns = allow_env && strcmp(allow_env, "1") == 0;
+    /* Set when path (b) below runs, the only one the limit is written in. */
+    int made_userns = 0;
+
     _Static_assert(sizeof(unix_block_bpf) % sizeof(struct sock_filter) == 0,
                    "BPF filter size must be a multiple of sock_filter");
     struct sock_fprog prog = {
         .len = (unsigned short)(sizeof(unix_block_bpf) / sizeof(struct sock_filter)),
         .filter = (struct sock_filter *)unix_block_bpf,
+    };
+    _Static_assert(sizeof(namespace_block_bpf) % sizeof(struct sock_filter) == 0,
+                   "BPF filter size must be a multiple of sock_filter");
+    struct sock_fprog namespace_prog = {
+        .len = (unsigned short)(sizeof(namespace_block_bpf) / sizeof(struct sock_filter)),
+        .filter = (struct sock_filter *)namespace_block_bpf,
     };
 
     /* ---- Optional observation: pre-fork setup --------------------------- */
@@ -720,22 +746,22 @@ int main(int argc, char *argv[]) {
          * mode 0111), the kernel marked the process non-dumpable, which
          * makes /proc/self/{setgroups,uid_map,gid_map} root-owned, so the
          * writes below would fail with EACCES. Temporarily flip dumpable
-         * on for the uid/gid mapping and restore it right after. While
+         * on for the uid/gid mapping; it is cleared before the fork. While
          * dumpable is 1, a same-uid process can ptrace us (under yama
          * ptrace_scope=0) and dump the mapped pages that mode 0111 is
-         * meant to hide; the save/restore keeps that exposure to a
+         * meant to hide; that exposure is kept to a
          * few-syscall race window — the same unavoidable window runc and
          * systemd accept for this pattern.
          *
-         * prctl failures here are ignored: they are next to impossible for
-         * these calls, and if raising dumpable did fail the map writes
+         * A prctl failure here is ignored: it is next to impossible for
+         * this call, and if raising dumpable did fail the map writes
          * below fail with their own clearer errors. */
-        int dumpable = prctl(PR_GET_DUMPABLE);
         (void)prctl(PR_SET_DUMPABLE, 1);
 
         if (unshare(CLONE_NEWUSER) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWUSER)");
         }
+        made_userns = 1;
         if (write_file("/proc/self/setgroups", "deny") < 0) {
             die("apply-seccomp: write /proc/self/setgroups "
                 "(nested userns is capability-restricted; "
@@ -747,13 +773,19 @@ int main(int argc, char *argv[]) {
         if (write_file("/proc/self/gid_map", "%u %u 1\n", gid, gid) < 0) {
             die("apply-seccomp: write /proc/self/gid_map");
         }
-        /* PR_SET_DUMPABLE only accepts 0 or 1; if the saved value was
-         * SUID_DUMP_ROOT (2) — or the read above failed — restore the more
-         * restrictive 0. */
-        (void)prctl(PR_SET_DUMPABLE, dumpable == 1 ? 1 : 0);
         if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS) after userns");
         }
+    }
+
+    /* Non-dumpable from here on, in both halves: fork copies it, and nothing
+     * below execs until the worker does. It refuses ptrace and every
+     * /proc/<pid> file that asks the same question (mem, environ, fd) to
+     * anything without CAP_SYS_PTRACE over the user namespace this process
+     * was exec'd in, which is bubblewrap's, where the command holds nothing.
+     * Zero whatever the flag was on entry: this only ever tightens. */
+    if (prctl(PR_SET_DUMPABLE, 0) < 0) {
+        die("apply-seccomp: prctl(PR_SET_DUMPABLE)");
     }
 
     pid_t child = fork();
@@ -764,8 +796,19 @@ int main(int argc, char *argv[]) {
     if (child > 0) {
         /* Outer stub: still in bwrap's PID namespace. Forward signals,
          * optionally service the USER_NOTIF observation fd, then relay the
-         * child's exit status. Never under either seccomp filter. */
+         * child's exit status. It never runs the command, but takes the
+         * namespaces filter (not the Unix-socket one: it has to connect to
+         * SRT_OBSERVE_SOCK) so that code it was made to run is no better
+         * placed than the command. Nothing here calls what it refuses. */
         if (sp[1] >= 0) close(sp[1]);
+        if (!allow_nested_userns) {
+            if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+                die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS, stub)");
+            }
+            if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &namespace_prog) < 0) {
+                die("apply-seccomp: prctl(PR_SET_SECCOMP, stub)");
+            }
+        }
         install_forwarders(child);
 
         if (sp[0] >= 0) {
@@ -824,13 +867,32 @@ int main(int argc, char *argv[]) {
         die("apply-seccomp: mount(MS_PRIVATE)");
     }
     /* EPERM here means a masked /proc is underneath (unprivileged Docker)
-     * and the kernel domination check refused the overmount. The nested
-     * userns above is the isolation boundary; this remount only hides
-     * outer PIDs from `ls /proc`. enableWeakerNestedSandbox targets
+     * and the kernel domination check refused the overmount. The command
+     * then still sees this program's outer half, in the same user namespace
+     * and non-dumpable (above). enableWeakerNestedSandbox targets
      * exactly this environment. */
     if (mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0
         && errno != EPERM) {
         die("apply-seccomp: mount(/proc)");
+    }
+
+    /* No further user namespaces below this one. The sysctl is per user
+     * namespace and the path resolves to the opener's, so it is written only
+     * in path (b): in path (a) it would be the caller's, on a bare host the
+     * machine's. Zero: the limit counts namespaces created beneath this one.
+     * Raising it takes CAP_SYS_RESOURCE here, which a command not started by
+     * uid 0 loses at exec. Not fatal: where /proc could not be mounted above,
+     * /proc/sys is commonly read-only, and the filter below refuses the same
+     * calls. */
+    if (!allow_nested_userns && made_userns
+        && write_file("/proc/sys/user/max_user_namespaces", "0") < 0) {
+        const char *debug = getenv("SRT_DEBUG");
+        if (debug && *debug) {
+            fprintf(stderr,
+                    "apply-seccomp: could not set user.max_user_namespaces (%s); "
+                    "the seccomp filter alone keeps the command from making namespaces\n",
+                    strerror(errno));
+        }
     }
 
     /* Drop whatever bwrap's --cap-add left in the ambient set (today at most
@@ -850,9 +912,11 @@ int main(int argc, char *argv[]) {
      * rule's recompute into a gain and NO_NEW_PRIVS clamps a gain back to
      * what was held; dropping the bounding set has the same effect. Neither
      * is done here. What keeps the deny mounts in place for that worker is
-     * not its capabilities but that the nested mount namespace's copies of
-     * them are locked, having been created across a user-namespace
-     * boundary. */
+     * not its capabilities, nor by itself that the nested mount namespace's
+     * copies of them are locked: a lock refuses the unmount of one of them,
+     * but the whole tree can be moved aside with pivot_root and dropped with
+     * a lazy unmount. It is the namespaces filter, which refuses those
+     * calls. With SRT_ALLOW_NESTED_USERNS=1 nothing does. */
     if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_CAP_AMBIENT_CLEAR_ALL)");
     }
@@ -875,6 +939,7 @@ int main(int argc, char *argv[]) {
     /* ---- Worker (inner PID 2): apply seccomp and exec. ---- */
     unsetenv("SRT_OBSERVE_SOCK");
     unsetenv("SRT_ENCODED_CMD");
+    unsetenv("SRT_ALLOW_NESTED_USERNS");
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }
@@ -883,6 +948,13 @@ int main(int argc, char *argv[]) {
      * NO_NEW_PRIVS (required) and before the unix-block filter / exec so only
      * the workload is observed. */
     install_observe_filter(sp[1]);
+    /* Two filters, stacked: the kernel runs every installed filter and takes
+     * the most restrictive answer, so their order does not matter. Installing
+     * a filter is not among the calls this one refuses. */
+    if (!allow_nested_userns
+        && prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &namespace_prog) < 0) {
+        die("apply-seccomp: prctl(PR_SET_SECCOMP, namespaces)");
+    }
     if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0) {
         die("apply-seccomp: prctl(PR_SET_SECCOMP)");
     }

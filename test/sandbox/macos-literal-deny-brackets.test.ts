@@ -9,10 +9,8 @@ import {
   buildMaskedFileBinds,
 } from '../../src/sandbox/credential-mask-files.js'
 import { SentinelRegistry } from '../../src/sandbox/credential-sentinel.js'
-import {
-  denyGlobRegex,
-  normalizePathForSandbox,
-} from '../../src/sandbox/sandbox-utils.js'
+import { denyGlobRegex } from '../../src/sandbox/glob-pattern.js'
+import { normalizePathForSandbox } from '../../src/sandbox/sandbox-utils.js'
 import { isMacOS, isWindows } from '../helpers/platform.js'
 
 /**

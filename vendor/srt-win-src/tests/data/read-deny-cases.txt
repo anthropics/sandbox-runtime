@@ -1,0 +1,105 @@
+# Which recorded paths of the profile read grant end up carrying a
+# session's read deny. Read by the library's tests and by srt-win's:
+# the library ranks a session's lists and hands srt-win the result
+# (`handed-*`); srt-win writes each handed deny on itself and on the
+# recorded paths beneath it, except those the handed grants allow more
+# specifically. `expect` is the outcome both must agree on.
+#
+# One case per block. `recorded` is `kind path`; lists are separated
+# by ` | `; a path is given beneath `P`, the profile directory, which
+# stands for `C:\Users\me` (`P` alone is the profile itself).
+
+recorded: container P | granted P\Documents | granted P\proj | file P\.npmrc | container P\.cargo | file P\.cargo\config.toml | denied P\.ssh | container P\AppData | container P\AppData\Local | granted P\AppData\Local\Programs | ungranted P\AppData\Local\Temp | skipped P\link
+
+case: a deny on the profile reaches every recorded allow
+deny: P
+handed-deny: P
+expect: P | P\Documents | P\proj | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData | P\AppData\Local | P\AppData\Local\Programs
+
+case: a recorded directory the session allows for reading keeps its allow
+read: P\proj
+deny: P
+handed-read: P\proj
+handed-deny: P
+expect: P | P\Documents | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData | P\AppData\Local | P\AppData\Local\Programs
+
+case: a recorded directory that is the session's write root keeps its allow
+write: P\proj
+deny: P
+handed-write: P\proj
+handed-deny: P
+expect: P | P\Documents | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData | P\AppData\Local | P\AppData\Local\Programs
+
+case: an allow beneath a recorded directory does not spare the directory
+read: P\Documents\work
+deny: P
+handed-read: P\Documents\work
+handed-deny: P
+expect: P | P\Documents | P\proj | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData | P\AppData\Local | P\AppData\Local\Programs
+
+case: an allow on a container spares what is recorded beneath it
+read: P\AppData
+deny: P
+handed-read: P\AppData
+handed-deny: P
+expect: P | P\Documents | P\proj | P\.npmrc | P\.cargo | P\.cargo\config.toml
+
+case: a deny beneath an allow beneath a deny
+read: P\AppData
+deny: P | P\AppData\Local
+handed-read: P\AppData
+handed-deny: P | P\AppData\Local
+expect: P | P\Documents | P\proj | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData\Local | P\AppData\Local\Programs
+
+case: a grant beneath a second, deeper deny that an upper grant lies above
+read: P\AppData | P\AppData\Local\Programs
+deny: P | P\AppData\Local
+handed-read: P\AppData | P\AppData\Local\Programs
+handed-deny: P | P\AppData\Local
+except: P\AppData | P\AppData\Local\Programs
+expect: P | P\Documents | P\proj | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData\Local
+
+case: an allow on the denied path itself does not win
+read: P\Documents
+deny: P\Documents
+handed-read: P\Documents
+handed-deny: P\Documents
+expect: P\Documents
+
+case: an allow above the deny changes nothing beneath it
+read: P\AppData
+deny: P\.cargo
+handed-read: P\AppData
+handed-deny: P\.cargo
+expect: P\.cargo | P\.cargo\config.toml
+
+case: a credential file outranks the allow on it
+read: P\.npmrc | P\proj
+credential: P\.npmrc
+handed-read: P\proj
+handed-deny: P\.npmrc
+expect: P\.npmrc
+
+case: an allow at or beneath a credential entry is not handed over at all
+write: P\proj
+deny: P
+credential: P\proj
+handed-deny: P | P\proj
+expect: P | P\Documents | P\proj | P\.npmrc | P\.cargo | P\.cargo\config.toml | P\AppData | P\AppData\Local | P\AppData\Local\Programs
+
+case: paths are compared as objects, not as spelled
+read: P\APPDATA\local\programs
+deny: P\appdata\
+handed-read: P\APPDATA\local\programs
+handed-deny: P\appdata\
+expect: P\AppData | P\AppData\Local
+
+case: a deny beneath a granted directory needs nothing more
+deny: P\Documents\secret
+handed-deny: P\Documents\secret
+expect:
+
+case: no deny
+read: P\proj
+handed-read: P\proj
+expect:
