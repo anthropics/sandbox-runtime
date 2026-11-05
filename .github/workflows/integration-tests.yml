@@ -27,7 +27,7 @@ jobs:
             runner: macos-15-large
             os: macos
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
             os: macos
           # Windows legs build srt-win, run the Rust smoke scripts,
           # then the TS integration suite (test/sandbox/winsrt.test.ts).
