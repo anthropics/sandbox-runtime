@@ -18,20 +18,20 @@ npm install -g @anthropic-ai/sandbox-runtime
 
 ```bash
 # Network restrictions
-$ srt "curl anthropic.com"
+$ srt curl anthropic.com
 Running: curl anthropic.com
 <html>...</html>  # Request succeeds
 
-$ srt "curl example.com"
+$ srt curl example.com
 Running: curl example.com
 Connection blocked by network allowlist  # Request blocked
 
 # Filesystem restrictions
-$ srt "cat README.md"
+$ srt cat README.md
 Running: cat README.md
 # Anthropic Sandb...  # Current directory access allowed
 
-$ srt "cat ~/.ssh/id_rsa"
+$ srt cat ~/.ssh/id_rsa
 Running: cat ~/.ssh/id_rsa
 cat: /Users/ollie/.ssh/id_rsa: Operation not permitted  # Specific file blocked
 ```
@@ -172,6 +172,13 @@ srt --debug curl https://example.com
 
 # Specify custom settings file
 srt --settings /path/to/srt-settings.json npm install
+```
+
+Positional arguments use argv-style invocation. Pass the executable and its arguments as separate shell arguments. For commands that require shell syntax such as pipes, redirections, `&&`, or variable expansion, use `-c`:
+
+```bash
+srt -c 'cat README.md | grep sandbox'
+srt -c 'npm install && npm test'
 ```
 
 The settings file is optional — with no file at `~/.srt-settings.json`, `srt`
@@ -664,7 +671,7 @@ This denies reading anything under `/Users` (or `/home` on Linux), then re-allow
 **Running Jest:** Use `--no-watchman` flag to avoid sandbox violations:
 
 ```bash
-srt "jest --no-watchman"
+srt jest --no-watchman
 ```
 
 Watchman accesses files outside the sandbox boundaries, which will trigger permission errors. Disabling it allows Jest to run with the built-in file watcher instead.
