@@ -219,6 +219,13 @@ async function main(): Promise<void> {
       [] as string[],
     )
     .option(
+      '--profile-include <path>',
+      'a directory inside your profile to make readable in addition to ' +
+        'the built-in list of per-user tool directories (repeatable)',
+      (v: string, acc: string[]) => [...acc, v],
+      [] as string[],
+    )
+    .option(
       '--skip-profile-grant',
       'install the account and the filters only; sandboxed commands ' +
         'then read nothing in your profile (use this on a computer other ' +
@@ -245,6 +252,7 @@ async function main(): Promise<void> {
             force: Boolean(o.force),
             skipProfileGrant: Boolean(o.skipProfileGrant),
             profileExclude: o.profileExclude as string[],
+            profileInclude: o.profileInclude as string[],
             // One line on what is about to become readable, and how to
             // skip or undo it, before the grant is applied.
             onProfileGrantStart: notice => console.error(notice),
@@ -502,7 +510,14 @@ async function main(): Promise<void> {
 
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
+          try {
+            await SandboxManager.initialize(runtimeConfig)
+          } catch (err) {
+            // The library's own handler resets on the same signal, which
+            // cancels initialize(): the interrupt is the reason to report.
+            interrupted.signal.throwIfAborted()
+            throw err
+          }
 
           // Read config updates only now. The stream has been waiting
           // unread, so nothing the caller wrote meanwhile is lost, and an
