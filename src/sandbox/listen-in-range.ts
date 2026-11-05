@@ -1,5 +1,6 @@
 /**
- * Bind `server` to the first free port in `range`, retrying on EADDRINUSE.
+ * Bind `server` to the first free port in `range`, retrying on EADDRINUSE or
+ * EACCES (Windows can report an occupied port as permission denied).
  * With `range` undefined, binds to ephemeral port 0 once. The Windows WFP
  * loopback permit is installed by range, so proxy listeners on Windows must
  * land inside it; other platforms bake the actual ephemeral port into the
@@ -35,9 +36,10 @@ export function listenInRange(
         // The paired 'listening' once-listener never fired; drop it
         // so retries don't accumulate stale listeners.
         server.removeListener('listening', onListening)
+        const code = (err as NodeJS.ErrnoException)?.code
         if (
           range &&
-          (err as NodeJS.ErrnoException)?.code === 'EADDRINUSE' &&
+          (code === 'EADDRINUSE' || code === 'EACCES') &&
           port < hi
         ) {
           port++
