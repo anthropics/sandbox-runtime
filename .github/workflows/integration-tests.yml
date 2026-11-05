@@ -437,7 +437,11 @@ jobs:
             test/sandbox/path-canonicalization.test.ts \
             test/sandbox/credential-deny.test.ts \
             test/sandbox/symlink-boundary.test.ts \
-            test/sandbox/stale-mount-point.test.ts
+            test/sandbox/mount-point-manifests.test.ts \
+            test/sandbox/mount-point-liveness.test.ts \
+            test/sandbox/mount-point-passes.test.ts \
+            test/sandbox/stale-mount-point.test.ts \
+            test/sandbox/linux-bwrap-args-file.test.ts
 
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'

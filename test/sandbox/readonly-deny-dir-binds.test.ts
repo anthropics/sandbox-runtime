@@ -1481,7 +1481,10 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
       ]
 
       it('puts every one of them back after the bind, the masks last', async () => {
-        const mounts = mountsOf(await wrapAll([PROJ]))
+        // But for the manifest directories, which every wrap binds.
+        const mounts = mountsOf(await wrapAll([PROJ])).filter(
+          mount => !mount.startsWith('--ro-bind-try '),
+        )
 
         expect(
           mounts.slice(mounts.indexOf(`--ro-bind ${PROJ} ${PROJ}`)),
