@@ -18,6 +18,7 @@ import {
   pathSpellings,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  getRipgrepConfigFile,
 } from './sandbox-utils.js'
 import {
   denyGlobRegex,
@@ -99,6 +100,10 @@ export interface MacOSSandboxParams {
  * carries the cwd as its anchor — only the `**\/<name>` tail is pattern.
  * Compiled as one glob, a cwd like `a[b/c]d` would turn into a character
  * class and every one of these denies would match nothing.
+ *
+ * ripgrep's configuration file ({@link getRipgrepConfigFile}) can lie
+ * anywhere, so it is a literal entry, under each spelling it has outside
+ * /dev.
  */
 export function macGetMandatoryDenyEntries(
   allowGitConfig = false,
@@ -114,6 +119,19 @@ export function macGetMandatoryDenyEntries(
   for (const fileName of DANGEROUS_FILES) {
     entries.push(literal(fileName))
     entries.push(beneathCwd(`**/${fileName}`))
+  }
+  const ripgrepConfigFile = getRipgrepConfigFile()
+  if (ripgrepConfigFile !== undefined) {
+    // A link to elsewhere (a dotfiles checkout) keeps its own spelling in a
+    // literal entry, and Seatbelt matches the path a write resolves to: the
+    // file is denied under both. Except in /dev: `/dev/null` turns the
+    // configuration off, and a deny there would be one on /dev/null for
+    // every command.
+    for (const spelling of pathSpellings(
+      path.resolve(cwd, ripgrepConfigFile),
+    )) {
+      if (!isAtOrUnder(spelling, '/dev')) entries.push(literal(spelling))
+    }
   }
 
   // Dangerous directories

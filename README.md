@@ -1148,6 +1148,7 @@ Certain sensitive files and directories are **always blocked from writes**, even
 - Shell config files: `.bashrc`, `.bash_profile`, `.zshrc`, `.zprofile`, `.profile`
 - Git config files: `.gitconfig`, `.gitmodules`
 - Other sensitive files: `.ripgreprc`, `.mcp.json`
+- ripgrep's configuration file: the one `RIPGREP_CONFIG_PATH` names in the environment of the process that wraps the command, wherever it is (ripgrep reads no other); a relative name is denied in the working directory only
 
 **Always-blocked directories:**
 
