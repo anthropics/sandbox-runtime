@@ -917,6 +917,8 @@ describe('per-command network allow lists', () => {
     ['127.0.0.1:3000', true],
     ['[::1]', true],
     ['[2001:db8::1]:443', true],
+    ['[2001:db8::/32]:8080', true],
+    ['2001:db8::/32:8080', false],
     ['*', false],
     ['*:443', false],
     ['*.com', false],
@@ -924,7 +926,9 @@ describe('per-command network allow lists', () => {
     ['example.com/path', false],
     ['example.com:0', false],
     ['example.com:443.evil.test', false],
-    ['2001:db8::1', false],
+    // Unbracketed IPv6 literals are address entries (deniedResolvedAddresses
+    // syntax), so both the schema and run-time registration accept them.
+    ['2001:db8::1', true],
     ['nodots', false],
     ['', false],
   ])(

@@ -190,6 +190,11 @@ describe('Config Validation', () => {
       'localhost:3000',
       'example.com:65535',
       'example.com:1',
+      // Unbracketed IPv6 is accepted as an address entry (same syntax as
+      // deniedResolvedAddresses). With >=2 colons and no brackets it is
+      // never split into host:port — this is the full address 2001:db8::1:443.
+      '::1',
+      '2001:db8::1:443',
     ]
     for (const domain of valid) {
       const result = SandboxRuntimeConfigSchema.safeParse({
@@ -214,9 +219,6 @@ describe('Config Validation', () => {
       'example.com:80:443',
       'example.com:', // empty suffix
       '*:22', // "*" is deny-only, still rejected in allowedDomains
-      '::1', // IPv6 literals must be bracketed
-      'fd00:ec2::254',
-      '2001:db8::1:443', // ambiguous — is 443 a port or the last hextet?
       '[::1', // unterminated bracket
       '[::1]:0',
       '[not-an-ip]',
@@ -224,6 +226,52 @@ describe('Config Validation', () => {
     for (const domain of invalid) {
       const result = SandboxRuntimeConfigSchema.safeParse({
         network: { allowedDomains: [domain], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      expect(result.success).toBe(false)
+    }
+  })
+
+  test('should accept IP literals and CIDR ranges in allowed/denied domains', () => {
+    const valid = [
+      '10.22.86.5', // bare IP literal (already accepted)
+      '10.22.86.0/24',
+      '10.0.0.0/8',
+      '10.22.86.0/24:8080', // port-scoped CIDR
+      '[2001:db8::/32]:8080', // port-scoped IPv6 CIDR, bracketed
+      '2001:db8::/32', // IPv6 CIDR, unbracketed (deniedResolvedAddresses syntax)
+      '2001:db8::1', // bare unbracketed IPv6 literal, same syntax
+      '[2001:db8::1]', // bracketed IPv6 literal (already accepted)
+      '[2001:db8::1]:443',
+      'fc00::/7',
+    ]
+    for (const entry of valid) {
+      const allow = SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [entry], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      expect(allow.success).toBe(true)
+      const deny = SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [], deniedDomains: [entry] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
+      expect(deny.success).toBe(true)
+    }
+
+    const invalid = [
+      'evil.com/24', // not an IP before the slash
+      '10.0.0.0/33', // prefix beyond the family width
+      '2001:db8::/129',
+      '[2001:db8::]/32', // bracketed CIDR is unrepresentable; unbracketed is the spelling
+      '2001:db8::/32:8080', // unbracketed port-scoped IPv6 CIDR is an address ambiguity; use "[2001:db8::/32]:8080"
+      '10.22.86.0/24junk',
+      '10.22.86.0/24:0', // bad port
+      '10.22.86.0/24:65536',
+      '*.10.0.0.0/8', // wildcard + CIDR mix
+    ]
+    for (const entry of invalid) {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        network: { allowedDomains: [entry], deniedDomains: [] },
         filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
       })
       expect(result.success).toBe(false)

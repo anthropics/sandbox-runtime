@@ -560,6 +560,56 @@ describe('resolved-address-guard: config schema', () => {
     expect(g.permits('intranet.example.com', 'fd00::7', 443)).toBe(true)
   })
 
+  it('reads the CIDR ranges of the allow/deny lists with the same precedence as for names', () => {
+    // A name may reach exactly what an allow-listed range already permits,
+    // nothing wider; a deny-listed range is refused by name too.
+    const g = createResolvedAddressGuard({
+      localAddresses,
+      allowedDomains: ['*.example.com', 'myapp.test', '127.0.0.0/8:3000'],
+      deniedDomains: ['198.51.100.0/24', '2001:db8:1::/64', '*:25'],
+    })
+    expect(g.permits('myapp.test', '127.0.0.1', 3000)).toBe(true)
+    expect(g.permits('myapp.test', '127.0.0.1', 5432)).toBe(false)
+    // The carve-out covers the whole range, not just one literal in it.
+    expect(g.permits('evil.example.com', '127.0.0.10', 3000)).toBe(true)
+    // ...but nothing wider: IPv6 loopback is still denied on that port.
+    expect(g.permits('evil.example.com', '::1', 3000)).toBe(false)
+    expect(g.permits('intranet.example.com', '198.51.100.7', 443)).toBe(false)
+    expect(g.permits('intranet.example.com', '2001:db8:1::42', 443)).toBe(false)
+    expect(g.permits('intranet.example.com', '2001:db8:2::42', 443)).toBe(true)
+  })
+
+  it('a name that spells an allowed range is judged by where it resolves', () => {
+    // "169236173" is the decimal spelling of 10.22.86.205, inside the
+    // allowed 10.22.86.0/24 — but it is a name, and its spelling earns
+    // no carve-out from the built-in denials for an address it resolves
+    // to outside the range. It is judged by the resolved address, like
+    // any other name.
+    const g = createResolvedAddressGuard({
+      localAddresses,
+      allowedDomains: ['myapp.test', '10.22.86.0/24'],
+      deniedDomains: [],
+    })
+    expect(g.permits('169236173', '127.0.0.2', 443)).toBe(false)
+    expect(g.permits('169236173', '10.22.86.205', 443)).toBe(true)
+  })
+
+  it('an allowed CIDR carves a name out of a built-in denial, like an IP literal does', () => {
+    // Without an allow entry, a name resolving to loopback is denied.
+    const g = createResolvedAddressGuard({
+      localAddresses,
+      allowedDomains: ['myapp.test'],
+    })
+    expect(g.permits('myapp.test', '127.0.0.1', 3000)).toBe(false)
+    // ...an explicit 127.0.0.0/8 allow entry lifts it, matching the
+    // long-standing semantics for exact IP literals.
+    const carved = createResolvedAddressGuard({
+      localAddresses,
+      allowedDomains: ['myapp.test', '127.0.0.0/8'],
+    })
+    expect(carved.permits('myapp.test', '127.0.0.1', 3000)).toBe(true)
+  })
+
   it('a deny-listed literal wins over an allow-listed one and over the localhost rule', () => {
     const g = createResolvedAddressGuard({
       localAddresses,
