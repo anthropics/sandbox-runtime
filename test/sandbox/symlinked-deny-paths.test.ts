@@ -5,9 +5,11 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -17,7 +19,11 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
-import { countMounts } from '../helpers/bwrap-argv.js'
+import {
+  countMounts,
+  indexOfMount,
+  lastIndexOfMount,
+} from '../helpers/bwrap-argv.js'
 import { withCapturedWarnings } from '../helpers/captured-warnings.js'
 
 /**
@@ -236,7 +242,6 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       'x/../name',
       'too many names',
     ],
-    ['leads through a name that is no text', Buffer.of(0x6e, 0xff), 'EILSEQ'],
   ])('masks the link and says why where the way %s', async (_, target, why) => {
     symlinkSync(target, join(PROJ, 'name'))
 
@@ -250,6 +255,80 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     expect(warnings.filter(said => said.includes('cannot be settled'))).toEqual(
       [expect.stringMatching(new RegExp(`${join(PROJ, 'name')} .*${why}`))],
     )
+  })
+
+  /** `before`, a byte that is no text, `after`. */
+  const noText = (before: string, after = ''): Buffer =>
+    Buffer.concat([Buffer.from(before), Buffer.of(0xff), Buffer.from(after)])
+
+  /** Bound read-only above the write root's own bind, and not as a pin. */
+  const isDeniedWhole = (result: string, dir: string): boolean =>
+    lastIndexOfMount(result, '--ro-bind', dir, dir) >
+    indexOfMount(result, '--bind', AREA, AREA)
+
+  it.each([
+    ['that is not there', noText('gone'), () => {}],
+    [
+      'of a file',
+      noText('n'),
+      () => writeFileSync(noText(`${PROJ}/n`), 'kept'),
+    ],
+    [
+      'of a directory, and on into it',
+      noText('n', '/in/x'),
+      () => mkdirSync(noText(`${PROJ}/n`, '/in'), { recursive: true }),
+    ],
+    ['that is not there, and up from it', noText('gone', '/../made'), () => {}],
+  ])(
+    'denies the directory whole where the way comes to a name that is no text, %s',
+    async (_, target, make) => {
+      make()
+      symlinkSync(target, join(PROJ, 'name'))
+
+      const { result, warnings } = await withCapturedWarnings(() =>
+        wrap([join(PROJ, 'name')]),
+      )
+
+      expect(isDeniedWhole(result, PROJ)).toBe(true)
+      expect(placeholders(result)).toEqual({})
+      expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
+      expect(warnings.filter(said => said.includes('no text'))).toEqual([
+        expect.stringMatching(new RegExp(`${join(PROJ, 'name')} .* ${PROJ},`)),
+      ])
+    },
+  )
+
+  it('follows a link whose name is no text to where it leads', async () => {
+    symlinkSync('../dotfiles', noText(`${PROJ}/hop`))
+    symlinkSync(noText('hop', '/made'), join(PROJ, 'name'))
+
+    const result = await wrap([join(PROJ, 'name')])
+
+    expect(
+      countMounts(result, '--ro-bind', '/dev/null', join(DOTFILES, 'made')),
+    ).toBe(1)
+    expect(isDeniedWhole(result, PROJ)).toBe(false)
+    expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
+  })
+
+  it('puts a placeholder on a missing name that a name that is no text follows', async () => {
+    symlinkSync(noText('lacking/in'), join(PROJ, 'name'))
+
+    const result = await wrap([join(PROJ, 'name')])
+
+    expect(placeholders(result)).toEqual({ lacking: 'file' })
+    expect(isDeniedWhole(result, PROJ)).toBe(false)
+  })
+
+  it('mounts nothing for a name that is no text where the command cannot write', async () => {
+    symlinkSync(noText(`${BASE}/gone`), join(PROJ, 'name'))
+
+    const result = await wrap([join(PROJ, 'name')])
+
+    // BASE holds the write root, which stays writable.
+    expect(countMounts(result, '--ro-bind', BASE, BASE)).toBe(0)
+    expect(isDeniedWhole(result, PROJ)).toBe(false)
+    expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
   })
 
   // root searches a directory of any mode.
@@ -480,6 +559,70 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
       expect(existsSync(join(PROJ, '.claude', 'commands', 'planted.md'))).toBe(
         false,
       )
+    },
+  )
+
+  describe.if(hasBwrap)(
+    'e2e: a built-in deny on a link to a name that is no text',
+    () => {
+      /** What `command` prints, run in PROJ with AREA to write to. */
+      const printedBy = async (command: string): Promise<string> => {
+        const originalCwd = process.cwd()
+        process.chdir(PROJ)
+        try {
+          const wrapped = await wrapCommandWithSandboxLinux({
+            command,
+            needsNetworkRestriction: false,
+            readConfig: { denyOnly: [] },
+            writeConfig: { allowOnly: [AREA], denyWithinAllow: [] },
+          })
+          const { stdout } = spawnSync(wrapped, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+          cleanupBwrapMountPoints()
+          return stdout
+        } finally {
+          process.chdir(originalCwd)
+        }
+      }
+
+      it('starts, and lets nothing be made where the link leads', async () => {
+        symlinkSync(noText('gone'), join(PROJ, '.mcp.json'))
+
+        expect(
+          await printedBy(
+            'echo STARTED; echo planted > .mcp.json || echo REFUSED; echo ok > ../ok',
+          ),
+        ).toBe('STARTED\nREFUSED\n')
+        expect(readdirSync(PROJ)).toEqual(['.mcp.json'])
+        expect(existsSync(join(AREA, 'ok'))).toBe(true)
+      })
+
+      it('starts, and keeps the file the link leads to', async () => {
+        writeFileSync(noText(`${PROJ}/n`), 'kept')
+        symlinkSync(noText('n'), join(PROJ, '.bashrc'))
+
+        expect(
+          await printedBy(
+            'echo STARTED; echo planted > .bashrc || echo REFUSED',
+          ),
+        ).toBe('STARTED\nREFUSED\n')
+        expect(readFileSync(noText(`${PROJ}/n`), 'utf8')).toBe('kept')
+      })
+
+      it('starts, with the working directory to write to, where the link leads out of the write paths', async () => {
+        symlinkSync(noText(`${BASE}/gone`), join(PROJ, '.mcp.json'))
+
+        expect(
+          await printedBy(
+            'echo STARTED; echo planted > .mcp.json || echo REFUSED; echo ok > ok',
+          ),
+        ).toBe('STARTED\nREFUSED\n')
+        expect(readdirSync(BASE)).toEqual(['area'])
+        expect(existsSync(join(PROJ, 'ok'))).toBe(true)
+      })
     },
   )
 })
