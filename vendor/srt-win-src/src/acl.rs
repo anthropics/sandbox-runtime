@@ -9,7 +9,7 @@
 //!   sandbox user (which has no inherent rights on real-user-owned
 //!   files) can reach the working tree;
 //! - `stamp` ⇒ `(D;OICI;mask;;;<sb-SID>)` on the target plus
-//!   `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent;
+//!   `(D;;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent;
 //! - install-time ambient write-denies (`ambient.rs`) reuse the
 //!   `stamp` deny shape, recorded in `ambient_denies` with no holder
 //!   so they persist across sessions until `uninstall`.
@@ -20,6 +20,8 @@
 //! path keeps its severed inheritance). The single chokepoint is
 //! [`apply_sandbox_aces`] ([`SbAceSet`]): converge the path to
 //! exactly the wanted ALLOW + DENY for `<sb-SID>`, idempotently.
+//! Session parent guards use the object-only writer in [`commit_dacl`];
+//! changing or removing legacy inheritable guards still walks descendants.
 //!
 //! The PROTECTED allow-lists in [`set_path_dacl_from_sddl`]'s
 //! callers are the ONE remaining `PROTECTED` consumer — they
@@ -935,8 +937,8 @@ pub fn set_handle_dacl_from_sddl(
 // rights on real-user-owned files. `acl grant` adds an inheritable
 // ALLOW ACE for the sandbox user's SID on a path (typically the
 // working-tree root) so the child can read/write there; `acl stamp
-// --sandbox-user-sid` adds an explicit DENY ACE on a path (and a
-// `(OI)(CI)` `FILE_DELETE_CHILD` DENY on its parent) so the child
+// --sandbox-user-sid` adds an explicit DENY ACE on a path (and
+// an object-only `FILE_DELETE_CHILD` DENY on its parent) so the child
 // can NOT read/write/delete it even when an inherited
 // `BUILTIN\Users` ACE would otherwise allow. Both are ADDITIVE
 // (the path keeps its own explicit ACEs and inheritance);
@@ -966,18 +968,19 @@ pub enum DenyMask {
 /// One explicit ACE the sandbox user holds on a path. The
 /// separate-user FS model is entirely additive: `acl grant` adds
 /// ALLOW ACEs, `acl stamp --sandbox-user-sid` adds DENY ACEs (plus
-/// a `(OI)(CI)` `FILE_DELETE_CHILD` DENY on the parent). Restore
+/// an object-only `FILE_DELETE_CHILD` DENY on the parent). Restore
 /// drops the SID's ACEs via walk-and-filter — no PROTECTED rewrite,
 /// no SD snapshot, no calibration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SbAce {
     Grant(GrantMask),
     Deny(DenyMask),
-    /// `(D;OICI;FILE_DELETE_CHILD;;;<sb>)` — applied to the parent
+    /// `(D;;FILE_DELETE_CHILD;;;<sb>)` — applied to the parent
     /// of every denied target so the sandbox user cannot `del`/`ren`
     /// it via parent-FDC even when the parent carries an inherited
     /// `BUILTIN\Users:(F)` (which the sandbox user, a Users member,
-    /// would otherwise pick up).
+    /// would otherwise pick up). It must not inherit into unrelated
+    /// siblings; denied trees carry their own inheritable FDC deny.
     DenyFdc,
     /// `(D;;DELETE;;;<sb>)` — object-only (`NO_INHERIT`) DELETE deny
     /// on a placeholder INTERMEDIATE directory. Blocks the sandbox
@@ -1083,17 +1086,29 @@ pub struct SbAceSet {
 
 impl SbAceSet {
     /// The set's DENY entries as [`NewAce`]s for `sid`, deny →
-    /// deny-delete → deny-fdc, and its ALLOW entry.
+    /// deny-delete → deny-fdc, and its ALLOW entry. `DenyFdc` and
+    /// `DenyDelete` are object-only; `Deny` and `Grant` inherit.
     fn aces(&self, sid: PSID) -> (Vec<NewAce>, Vec<NewAce>) {
         let mut v = Vec::with_capacity(3);
         if let Some(m) = self.deny {
-            v.push(NewAce::Deny(sid, m.bits(), OICI));
+            // With the parent-FDC deny now object-only, a denied
+            // directory must itself deny FDC throughout its subtree:
+            // DELETE on a child alone does not block parent-FDC.
+            v.push(NewAce::Deny(
+                sid,
+                m.bits() | Mask::FILE_DELETE_CHILD.bits(),
+                OICI,
+            ));
         }
         if self.deny_delete {
             v.push(NewAce::Deny(sid, Mask::DELETE.bits(), NO_INHERIT));
         }
         if self.deny_fdc {
-            v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));
+            v.push(NewAce::Deny(
+                sid,
+                Mask::FILE_DELETE_CHILD.bits(),
+                NO_INHERIT,
+            ));
         }
         let allow = self
             .grant
