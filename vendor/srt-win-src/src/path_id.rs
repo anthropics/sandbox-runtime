@@ -451,6 +451,16 @@ pub fn canonical_parent_of(canonical_path: &str) -> Option<String> {
         .map(|p| p.display().to_string())
 }
 
+/// The directories strictly between `root` and `canonical_path`, which
+/// lies beneath it, the nearest to the path first.
+pub fn dirs_between(root: &str, canonical_path: &str) -> Vec<String> {
+    std::iter::successors(canonical_parent_of(canonical_path), |p| {
+        canonical_parent_of(p)
+    })
+    .take_while(|p| p.len() > root.len())
+    .collect()
+}
+
 // ─── File identity (FILE_ID_INFO) ───────────────────────────────────
 
 /// A file's stable identity on a volume — the
@@ -924,6 +934,18 @@ mod tests {
             canonical_parent_of(r"\\?\C:\a\b").as_deref(),
             Some(r"\\?\C:\a"),
         );
+    }
+
+    #[test]
+    fn dirs_between_a_root_and_a_path_beneath_it() {
+        assert_eq!(
+            dirs_between(r"\\?\C:\r", r"\\?\C:\r\a\.git\hooks"),
+            [r"\\?\C:\r\a\.git", r"\\?\C:\r\a"],
+        );
+        assert!(dirs_between(r"\\?\C:\r", r"\\?\C:\r\.bashrc").is_empty());
+        assert!(dirs_between(r"\\?\C:\r", r"\\?\C:\r").is_empty());
+        // A drive for a root, which is written with its separator.
+        assert_eq!(dirs_between(r"\\?\D:\", r"\\?\D:\a\f"), [r"\\?\D:\a"]);
     }
 
     #[test]

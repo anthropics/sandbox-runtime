@@ -1081,6 +1081,7 @@ export const WindowsConfigSchema = z.object({
         'refuses a configuration the named backend cannot enforce; there ' +
         'is no fallback between backends. Under mxc, commands start with ' +
         'SandboxManager.spawnSandboxed() rather than wrapWithSandboxArgv(), ' +
+        'the mandatory deny paths are not blocked, ' +
         'and sandboxed programs can open windows on the desktop (UI is on ' +
         'so that ordinary tools start; clipboard and input injection stay ' +
         'blocked).',
@@ -1242,8 +1243,8 @@ export const SandboxRuntimeConfigSchema = z
       .max(10)
       .optional()
       .describe(
-        'How deep below the working directory dangerous names are looked for on Linux (default: 3): ' +
-          'a dangerous file down to this depth, and a dangerous directory, or the hooks and ' +
+        'How deep below the working directory dangerous names are looked for on Linux and Windows (default: 3): ' +
+          'a dangerous file down to this depth, and on Linux a dangerous directory, or the hooks and ' +
           'config of a repository, one level higher up. ' +
           'Higher values provide more protection but slower performance.',
       ),
