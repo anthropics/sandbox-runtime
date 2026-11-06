@@ -545,7 +545,10 @@ Paths support git-style glob patterns on macOS, similar to `.gitignore` syntax:
 - `*` - Matches any characters except `/` (e.g., `*.ts` matches `foo.ts` but not `foo/bar.ts`)
 - `**` - Matches any characters including `/` (e.g., `src/**/*.ts` matches all `.ts` files in `src/`)
 - `?` - Matches any single character except `/` (e.g., `file?.txt` matches `file1.txt`)
-- `[abc]` - Matches any character in the set (e.g., `file[0-9].txt` matches `file3.txt`). Whatever stands between the brackets is a member, a `*` or a `?` too (`[*]` matches a `*` in a name). Brackets that spell no set, because a range in them runs backwards (`[user-id]`, `backup[2024-01-15]`) or there is nothing in them (`list[].ts`), are the text they are, on every platform; the rest of the entry is still a pattern (`app/**/[user-id]/*.env`)
+- `[abc]` - Matches any character in the set (e.g., `file[0-9].txt` matches `file3.txt`). Whatever stands between the brackets is a member, a `*` or a `?` too (`[*]` matches a `*` in a name), but for a `!` or `^` that negates (next entry). Brackets that spell no set, because a range in them runs backwards (`[user-id]`, `backup[2024-01-15]`) or there is nothing in them (`list[].ts`), are the text they are, on every platform; the rest of the entry is still a pattern (`app/**/[user-id]/*.env`)
+- `[!abc]` and `[^abc]` - Matches any character outside the set, and never `/` (e.g., `file[!a-c].txt` matches `filed.txt` but not `fileb.txt`). Only a `!` or `^` straight after the `[` negates, and it is no member itself. With nothing after it (`[!]`, `[^]`) the brackets spell no set
+
+Two things a macOS sandbox profile's own regex engine does with these. It matches bytes, so `?` and a set, negated or not, match no character outside ASCII. And in a deny rule it reads a negated set that lists a `-` and one of `,` and `.`, not both (`[!-.]`, `[!+--]`), as any character but `/`, so that deny covers the characters it lists as well: wider than written, never narrower.
 
 Examples:
 
