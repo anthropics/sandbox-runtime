@@ -11,6 +11,7 @@ import * as readline from 'readline'
 import * as fs from 'fs'
 import * as net from 'net'
 import * as path from 'path'
+import { finished } from 'stream/promises'
 import * as os from 'os'
 
 /**
@@ -424,7 +425,7 @@ async function main(): Promise<void> {
 
           // The wrapped command, once it exists: a control channel that
           // dies before it delivers anything takes it down with it.
-          let child: ChildProcess | undefined
+          let child: Pick<ChildProcess, 'kill'> | undefined
           let controlChannelFailed = false
           let receivedAnyLine = false
           let controlErrorReported = false
@@ -576,42 +577,10 @@ async function main(): Promise<void> {
             ),
           )
 
-          // Wrap the command with sandbox restrictions. On Windows
-          // the wrapper returns an argv array that MUST be spawned
-          // with {shell:false} — that's the boundary keeping the
-          // command bytes off the host shell. On other platforms
-          // we keep the existing shell-string path.
-          if (process.platform === 'win32') {
-            // env carries the proxy vars the sandboxed child must inherit.
-            const { argv, env } =
-              await SandboxManager.wrapWithSandboxArgv(command)
-            // No slot to displace: libuv passes only the stdio array's
-            // entries to the child as CRT descriptors, so the control fd
-            // is not among them (an inheritable HANDLE still reaches the
-            // child, but unnamed — nothing there can find it).
-            aboutToSpawn()
-            child = spawn(argv[0], argv.slice(1), {
-              shell: false,
-              stdio: 'inherit',
-              env,
-            })
-          } else {
-            // The wrap can take seconds over a large tree.
-            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
-              command,
-              undefined,
-              undefined,
-              interrupted.signal,
-            )
-            aboutToSpawn()
-            child = spawn(sandboxedCommand, {
-              shell: true,
-              stdio: sandboxedStdio(controlFd),
-            })
-          }
-
-          // Handle process exit
-          child.on('exit', (code, signal) => {
+          function onCommandExit(
+            code: number | null,
+            signal: NodeJS.Signals | null,
+          ): void {
             // Clean up bwrap mount point artifacts before exiting.
             // On Linux, bwrap creates empty files on the host when protecting
             // non-existent deny paths. This removes them.
@@ -632,12 +601,108 @@ async function main(): Promise<void> {
               }
             }
             process.exit(code ?? 0)
-          })
+          }
 
-          child.on('error', error => {
-            console.error(`Failed to execute command: ${error.message}`)
-            process.exit(1)
-          })
+          // Wrap the command with sandbox restrictions. On Windows
+          // the wrapper returns an argv array that MUST be spawned
+          // with {shell:false} — that's the boundary keeping the
+          // command bytes off the host shell. On other platforms
+          // we keep the existing shell-string path.
+          if (
+            process.platform === 'win32' &&
+            SandboxManager.getWindowsBackend?.()?.backend === 'mxc'
+          ) {
+            // The MXC SDK starts the command itself; there is no argv.
+            const spawnSandboxed = SandboxManager.spawnSandboxed
+            if (spawnSandboxed === undefined) {
+              throw new Error('spawnSandboxed() is not available')
+            }
+            aboutToSpawn()
+            const proc = await spawnSandboxed(command)
+            // MXC has no signals: any kill ends the whole tree. Remember
+            // which signal asked, so the exit reads as it does elsewhere.
+            let killedBy: NodeJS.Signals | null = null
+            child = {
+              kill: (signal?: NodeJS.Signals | number) => {
+                killedBy = typeof signal === 'string' ? signal : 'SIGTERM'
+                proc.kill()
+                return true
+              },
+            }
+            proc.stdout?.pipe(process.stdout, { end: false })
+            proc.stderr?.pipe(process.stderr, { end: false })
+            const stdin = proc.stdin
+            if (stdin) {
+              // The command may exit without reading its input.
+              stdin.on('error', () => {})
+              process.stdin.pipe(stdin)
+            }
+            // Exit only once the command's output has been read to the
+            // end and written out: a pipe on Windows is asynchronous,
+            // and process.exit() would drop what is still queued.
+            const drained = Promise.all(
+              [proc.stdout, proc.stderr].map(s =>
+                s ? finished(s).catch(() => {}) : Promise.resolve(),
+              ),
+            )
+            const flushed = (out: NodeJS.WriteStream): Promise<void> =>
+              new Promise(resolve => out.write('', () => resolve()))
+            proc
+              .wait()
+              .then(async ({ exitCode }) => {
+                await drained
+                await Promise.all([
+                  flushed(process.stdout),
+                  flushed(process.stderr),
+                ])
+                onCommandExit(exitCode, killedBy)
+              })
+              .catch((error: unknown) => {
+                console.error(
+                  `Failed to execute command: ${error instanceof Error ? error.message : String(error)}`,
+                )
+                process.exit(1)
+              })
+          } else if (process.platform === 'win32') {
+            // env carries the proxy vars the sandboxed child must inherit.
+            const { argv, env } =
+              await SandboxManager.wrapWithSandboxArgv(command)
+            // No slot to displace: libuv passes only the stdio array's
+            // entries to the child as CRT descriptors, so the control fd
+            // is not among them (an inheritable HANDLE still reaches the
+            // child, but unnamed — nothing there can find it).
+            aboutToSpawn()
+            const spawned = spawn(argv[0], argv.slice(1), {
+              shell: false,
+              stdio: 'inherit',
+              env,
+            })
+            child = spawned
+            spawned.on('exit', onCommandExit)
+            spawned.on('error', error => {
+              console.error(`Failed to execute command: ${error.message}`)
+              process.exit(1)
+            })
+          } else {
+            // The wrap can take seconds over a large tree.
+            const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+              command,
+              undefined,
+              undefined,
+              interrupted.signal,
+            )
+            aboutToSpawn()
+            const spawned = spawn(sandboxedCommand, {
+              shell: true,
+              stdio: sandboxedStdio(controlFd),
+            })
+            child = spawned
+            spawned.on('exit', onCommandExit)
+            spawned.on('error', error => {
+              console.error(`Failed to execute command: ${error.message}`)
+              process.exit(1)
+            })
+          }
 
           // Handle cleanup on interrupt
           process.on('SIGINT', () => {
