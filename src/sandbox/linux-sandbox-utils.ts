@@ -1,7 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf, wayTo } from '../utils/real-path.js'
-import { whichSync } from '../utils/which.js'
+import { realPathOf, wayPastMissingNames } from '../utils/real-path.js'
 import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
@@ -10,7 +9,14 @@ import { endianness, tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep, RipgrepError, type RipgrepConfig } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
-import { readNamesOf, writeNamesOf } from './path-entries.js'
+import { readNamesOf, writeNamesOf, writeRootsOf } from './path-entries.js'
+import {
+  describeUnavailableHostHelper,
+  findHostHelper,
+  writableNamedHelperWarning,
+  writablePlaces,
+  type WritablePlaces,
+} from './host-helpers.js'
 import {
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
@@ -20,6 +26,7 @@ import {
   encodeSandboxedCommand,
   attributionKeyFor,
   DANGEROUS_FILES,
+  followLinks,
   isAbsenceErrno,
   isAtOrUnder,
   isStrictlyUnder,
@@ -95,10 +102,16 @@ export interface LinuxSandboxParams {
   gitSafeDirectories?: readonly string[]
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
-  /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
+  /** Absolute path to bwrap (default: "bwrap" as `findHostHelper` finds it) */
   bwrapPath?: string
-  /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
+  /** Absolute path to the socat binary (default: "socat", found likewise) */
   socatPath?: string
+  /**
+   * Where commands wrapped before this one could write, beyond `writeConfig`:
+   * the session's places, when `writeConfig` is one call's own. No host helper
+   * is taken from there either.
+   */
+  alsoWritable?: WritablePlaces
   /** Filesystem unix socket bound by the Linux violation monitor. When set,
    *  the socket is bind-mounted into the sandbox and apply-seccomp is told
    *  (via SRT_OBSERVE_SOCK) to install a USER_NOTIF observation filter and
@@ -149,9 +162,6 @@ function findSymlinkInPath(
 
   return null
 }
-
-/** As many missing names as one way is followed up from again. */
-const MAX_MISSING_NAMES_PASSED = 40
 
 /**
  * Canonicalize a deny path through symlinks before any mask or bind is
@@ -225,21 +235,11 @@ function resolveSymlinkedDenyPath(
   } catch {
     return rejoined // Not a symlink — nothing left to resolve.
   }
-  let why: unknown = 'it goes up from too many names that are not there'
+  let why: unknown
   try {
-    let onward = rejoined
-    for (let i = 0; i < MAX_MISSING_NAMES_PASSED; i++) {
-      const { real, rest, notThere } = wayTo(onward)
-      if ((notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES') {
-        return real || '/'
-      }
-      const names = rest.filter(name => name !== '' && name !== '.')
-      if (names[1] !== '..') {
-        return [real, ...names.slice(0, 2)].join('/') || '/'
-      }
-      alsoDenied?.push(`${real}/${names[0]}`)
-      onward = [real, ...names.slice(2)].join('/')
-    }
+    const { real, rest, shut, passed } = wayPastMissingNames(rejoined)
+    alsoDenied?.push(...passed)
+    return [real, ...(shut ? [] : rest.slice(0, 2))].join('/') || '/'
   } catch (err) {
     why = err
   }
@@ -543,7 +543,8 @@ async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: RipgrepConfig = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
-  abortSignal?: AbortSignal,
+  abortSignal: AbortSignal | undefined,
+  writable: WritablePlaces,
 ): Promise<string[]> {
   const cwd = process.cwd()
   // Use provided signal or create a fallback controller
@@ -599,7 +600,15 @@ async function linuxGetMandatoryDenyPaths(
       ],
       cwd,
       signal,
-      ripgrepConfig,
+      // The scan runs on the host. With no copy to be had it has failed.
+      {
+        ...ripgrepConfig,
+        command: requireHostHelper(
+          ripgrepConfig.command,
+          'ripgrep.command',
+          writable,
+        ),
+      },
     )
   } catch (error) {
     // Stopped, it found nothing: the caller must not be handed a command
@@ -959,6 +968,13 @@ function errorText(error: unknown): string {
 
 /** Why a bubblewrap profile could not be run. */
 export type LinuxSandboxProfileErrorCode =
+  /**
+   * bubblewrap, socat or the shell has no copy on PATH outside the paths the
+   * command may write. The message names each copy passed over and why, and
+   * `.cause` holds the same: `{ helper, skipped: SkippedHostHelper[] }`.
+   * Lifted by such a copy on PATH, or by naming the program by its path.
+   */
+  | 'host_helper_unavailable'
   /** More arguments than bubblewrap parses, on the line or through a file. */
   | 'too_many_arguments'
   /** A mount path holds a NUL byte, which no carrier of arguments can hold. */
@@ -972,6 +988,12 @@ export type LinuxSandboxProfileErrorCode =
   | 'args_file_unavailable'
   /** The line does not fit one shell argument even with the mounts in a file. */
   | 'command_too_long'
+  /**
+   * The read patterns could not be expanded within their budget, so which
+   * paths to hide is not known. The `GlobWalkBudgetError` on `.cause` names
+   * the pattern, the directory being listed and what had been spent.
+   */
+  | 'deny_glob_too_large'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
@@ -982,8 +1004,9 @@ export type LinuxSandboxProfileErrorCode =
  * (`cleanupAfterCommand()`, `cleanupBwrapMountPoints()`) for a wrap that
  * threw: it would release a second time, and a sandbox still running would
  * lose its mount points. Branch on `.code`, never on `.message`, which
- * carries the sizes of the moment. Other wrap-time failures (a shell that is
- * not on PATH, a bridge socket that is gone) are plain Errors.
+ * carries the sizes of the moment. Other wrap-time failures (a bridge socket
+ * that is gone) are plain Errors. One code says nothing of the profile: with
+ * `host_helper_unavailable` a program the wrap runs is not to be had.
  */
 export class LinuxSandboxProfileError extends Error {
   readonly code: LinuxSandboxProfileErrorCode
@@ -1007,6 +1030,27 @@ export class LinuxSandboxProfileError extends Error {
       })
     }
   }
+}
+
+/**
+ * The path `findHostHelper` gives for `helper`, which `option` could name.
+ * Throws the typed refusal when there is none, never going on under the bare
+ * name.
+ */
+function requireHostHelper(
+  helper: string,
+  option: string,
+  writable: WritablePlaces,
+): string {
+  const search = findHostHelper(helper, writable)
+  if (search.path === null) {
+    throw new LinuxSandboxProfileError(
+      'host_helper_unavailable',
+      describeUnavailableHostHelper(helper, option, search),
+      { helper, skipped: search.skipped },
+    )
+  }
+  return search.path
 }
 
 /**
@@ -1035,7 +1079,13 @@ export class WorkingDirectoryChanged extends Error {
 function renderBwrapInvocation(
   bwrapBinary: string,
   bwrapArgs: string[],
-  mounts: { start: number; end: number; mandatoryDenyArgs: number },
+  mounts: {
+    start: number
+    end: number
+    mandatoryDenyArgs: number
+    /** How much of the command word is the seccomp helper's `--hold-link`s. */
+    holdWordsBytes: number
+  },
 ): string {
   // Whose the arguments are and what lowers each share: the mandatory denies
   // follow from what the working directory holds, not from the configuration.
@@ -1100,7 +1150,11 @@ function renderBwrapInvocation(
     closeBwrapArgsProfile(argsFd)
     throw new LinuxSandboxProfileError(
       'command_too_long',
-      `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})`,
+      `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})${
+        mounts.holdWordsBytes > 0
+          ? `. At least ${mounts.holdWordsBytes} of them are not the caller's: they name the symbolic links on the way to denied paths, for the seccomp helper to hold, and stay on the line (seccomp.holdsLinks: false leaves them unheld)`
+          : ''
+      }`,
     )
   }
   logForDebugging(
@@ -1269,6 +1323,12 @@ export type LinuxDependencyOptions = {
   seccompConfig?: SeccompConfig
   bwrapPath?: string
   socatPath?: string
+  /**
+   * Where the sandboxed command may write: bwrap and socat are looked for on
+   * PATH outside it, as the wrap does, and an explicit path inside it is
+   * warned about. Omitted: as for a policy that is not known yet.
+   */
+  writable?: WritablePlaces
 }
 
 function isExecutable(p: string): boolean {
@@ -1287,14 +1347,17 @@ export function getLinuxDependencyStatus(
   opts?: LinuxDependencyOptions,
 ): LinuxDependencyStatus {
   const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
+  const writable = opts?.writable ?? writablePlaces(undefined)
+  const onPath = (helper: string): boolean =>
+    findHostHelper(helper, writable).path !== null
   // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
   // the on-disk lookup and trust that applyPath resolves inside bwrap.
   return {
-    hasBwrap: bwrapPath ? isExecutable(bwrapPath) : whichSync('bwrap') !== null,
-    hasSocat: socatPath ? isExecutable(socatPath) : whichSync('socat') !== null,
+    hasBwrap: bwrapPath ? isExecutable(bwrapPath) : onPath('bwrap'),
+    hasSocat: socatPath ? isExecutable(socatPath) : onPath('socat'),
     hasSeccompApply: seccompConfig?.argv0
       ? true
-      : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
+      : getApplySeccompBinaryPath(seccompConfig?.applyPath, writable) !== null,
   }
 }
 
@@ -1305,8 +1368,25 @@ export function checkLinuxDependencies(
   opts?: LinuxDependencyOptions,
 ): SandboxDependencyCheck {
   const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
+  const writable = opts?.writable ?? writablePlaces(undefined)
   const errors: string[] = []
   const warnings: string[] = []
+
+  // Found as the wrap will find it (see `findHostHelper`). A copy passed over
+  // is named, so the caller learns at start-up that it will not be run.
+  const onPath = (
+    helper: string,
+    option: string,
+    notInstalled: string,
+  ): string | null => {
+    const search = findHostHelper(helper, writable)
+    if (search.path === null) {
+      errors.push(
+        describeUnavailableHostHelper(helper, option, search, notInstalled),
+      )
+    }
+    return search.path
+  }
 
   // An explicit override is a directive, not a hint — if it doesn't exist,
   // surface that rather than silently falling back to PATH.
@@ -1315,22 +1395,35 @@ export function checkLinuxDependencies(
     if (isExecutable(bwrapPath)) usableBwrap = bwrapPath
     else errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
   } else {
-    usableBwrap = whichSync('bwrap')
-    if (usableBwrap === null) errors.push('bubblewrap (bwrap) not installed')
+    usableBwrap = onPath(
+      'bwrap',
+      'bwrapPath',
+      'bubblewrap (bwrap) not installed',
+    )
   }
 
   if (socatPath) {
     if (!isExecutable(socatPath))
       errors.push(`socat not executable at ${socatPath}`)
-  } else if (whichSync('socat') === null) {
-    errors.push('socat not installed')
+  } else {
+    onPath('socat', 'socatPath', 'socat not installed')
   }
 
   if (
     !seccompConfig?.argv0 &&
-    getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
+    getApplySeccompBinaryPath(seccompConfig?.applyPath, writable) === null
   ) {
     warnings.push('seccomp not available - unix socket access not restricted')
+  }
+
+  // A directive is followed wherever it points; a writable one is reported.
+  for (const [option, file] of [
+    ['bwrapPath', bwrapPath],
+    ['socatPath', socatPath],
+    ['seccomp.applyPath', seccompConfig?.applyPath],
+  ] as const) {
+    const warning = writableNamedHelperWarning(option, file, writable)
+    if (warning !== undefined) warnings.push(warning)
   }
 
   const uid0Error = uid0SandboxError({
@@ -1453,11 +1546,14 @@ export function uid0SandboxError({
 const uid0UserNamespaceProbes = new Map<string, string | null>()
 
 /**
- * Run `bwrap --unshare-user --dev-bind / / true` once and report whether this
+ * Run bwrap under `--unshare-user --dev-bind / /` once and report whether this
  * kernel actually refuses to map uid 0. `null` means it does not, so there is
  * nothing to report; otherwise bubblewrap's own first stderr line, or the
  * empty string when the probe could not be run at all and the prediction
  * stands unaided.
+ *
+ * The command run inside is bubblewrap's own `--version`, by its path: a bare
+ * name is looked up on PATH, and this runs as uid 0 with everything writable.
  */
 function probeUid0UserNamespace(bwrap: string): string | null {
   const cached = uid0UserNamespaceProbes.get(bwrap)
@@ -1465,7 +1561,7 @@ function probeUid0UserNamespace(bwrap: string): string | null {
 
   const probe = spawnSync(
     bwrap,
-    ['--unshare-user', '--dev-bind', '/', '/', 'true'],
+    ['--unshare-user', '--dev-bind', '/', '/', bwrap, '--version'],
     {
       timeout: 5000,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -1514,8 +1610,10 @@ export async function initializeLinuxNetworkBridge(
   httpProxyPort: number,
   socksProxyPort: number,
   socatPath?: string,
+  writable: WritablePlaces = writablePlaces(undefined),
 ): Promise<LinuxNetworkBridgeContext> {
-  const socat = socatPath ?? 'socat'
+  // The bridges run on the host for as long as the sandbox is up.
+  const socat = socatPath ?? requireHostHelper('socat', 'socatPath', writable)
   const socketId = randomBytes(8).toString('hex')
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
   // Only allocated when ports differ; in the mux case the SOCKS side
@@ -1663,6 +1761,61 @@ export async function initializeLinuxNetworkBridge(
   }
 }
 
+/** Why a symbolic link that should be held in place is not; see README.md. */
+export type LinuxUnheldLinkReason =
+  | 'no_helper'
+  | 'told_no'
+  | 'not_told'
+  | 'older_helper'
+  | 'no_answer'
+
+/**
+ * Why the seccomp helper is not handed the links to hold, or undefined where
+ * it is. One built from older sources takes `--hold-link` for the command to
+ * run, so the words go to no helper that is not known to take them.
+ */
+function whyLinksAreNotHeld(
+  helperInUse: boolean,
+  config: SeccompConfig | undefined,
+  writable: WritablePlaces,
+): LinuxUnheldLinkReason | undefined {
+  if (!helperInUse) return 'no_helper'
+  if (config?.holdsLinks !== undefined) {
+    return config.holdsLinks ? undefined : 'told_no'
+  }
+  // A path the caller gave need name the helper only inside the sandbox.
+  const helper = config?.argv0
+    ? null
+    : getApplySeccompBinaryPath(config?.applyPath, writable)
+  if (helper === null || helper === config?.applyPath) return 'not_told'
+  // THREAT: read, never run. This is outside any sandbox, and where the
+  // library lies in a path the command may write (a checkout, a project's own
+  // node_modules) the file is whatever an earlier command left there.
+  try {
+    return fs.readFileSync(helper).includes('--holds-links')
+      ? undefined
+      : 'older_helper'
+  } catch {
+    return 'no_answer'
+  }
+}
+
+/** A symbolic link where it lies, and why nothing holds it there. */
+export type LinuxUnheldLink = { path: string; reason: LinuxUnheldLinkReason }
+
+// By link: what the latest wrap that met it came to.
+const unheldLinks = new Map<string, LinuxUnheldLinkReason>()
+
+/** `SandboxManager.getLinuxUnheldLinks()`. */
+export function getLinuxUnheldLinks(): LinuxUnheldLink[] {
+  return [...unheldLinks].map(([path, reason]) => ({ path, reason }))
+}
+
+/** For `reset()` and `updateConfig()`: the list is of one configuration. */
+export function forgetLinuxUnheldLinks(): void {
+  unheldLinks.clear()
+}
+
 /**
  * Read by the seccomp helper, never by this process. The write denies are
  * read-only binds, and a bind protects a path only in the mount namespace it
@@ -1731,6 +1884,7 @@ let noUsernsLimitLogged = false
 function resolveApplySeccompPrefix(
   applyPath: string | undefined,
   argv0: string | undefined,
+  writable: WritablePlaces,
 ): string | undefined {
   if (argv0) {
     if (!applyPath) {
@@ -1738,7 +1892,7 @@ function resolveApplySeccompPrefix(
     }
     return `ARGV0=${quote([argv0])} ${quote([applyPath])} `
   }
-  const binary = getApplySeccompBinaryPath(applyPath)
+  const binary = getApplySeccompBinaryPath(applyPath, writable)
   return binary ? `${quote([binary])} ` : undefined
 }
 
@@ -1795,14 +1949,13 @@ function buildSandboxCommand(
   socksSocketPath: string,
   userCommand: string,
   applySeccompPrefix: string | undefined,
-  shell?: string,
-  socatPath?: string,
+  shellPath: string,
+  socatPath: string,
 ): string {
-  // Default to bash for backward compatibility
-  const shellPath = shell || 'bash'
-  // Host filesystem is bind-mounted into the sandbox, so an explicit
-  // socatPath resolves to the same binary inside bwrap.
-  const socat = quote([socatPath ?? 'socat'])
+  // Host filesystem is bind-mounted into the sandbox, so socat's host path
+  // names the same binary inside bwrap. Never the bare name: these listeners
+  // start before the seccomp filter is applied.
+  const socat = quote([socatPath])
   // socat's own backlog is 5. A connection that finds the queue full is
   // dropped, and tried again after 1 s, then 2 s, 4 s and so on: of a package
   // installer's burst, some wait for a minute. The kernel caps the number.
@@ -2100,8 +2253,16 @@ async function generateFilesystemArgs(
   ripgrepConfig: RipgrepConfig = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
-  abortSignal?: AbortSignal,
-): Promise<{ args: string[]; mandatoryDenyArgs: number }> {
+  abortSignal: AbortSignal | undefined,
+  writable: WritablePlaces,
+  /** Whether the caller has `linksToHold` held. */
+  linksAreHeld: boolean,
+): Promise<{
+  args: string[]
+  mandatoryDenyArgs: number
+  /** The links the command could replace, each with what it said. */
+  linksToHold: Array<[link: string, target: string]>
+}> {
   const args: string[] = []
   const startedIn = workingDirectory()
   // fs already imported
@@ -2114,6 +2275,19 @@ async function generateFilesystemArgs(
   const denyWriteArgs: string[] = []
   // Where the mandatory denies' binds begin in it: after the configuration's.
   let mandatoryDenyArgsStart = Infinity
+  // What the ways to the denied paths depend on; see followLinks.
+  const linksToDenies = new Map<string, string>()
+  const leftOnTheWay = new Set<string>()
+  /**
+   * Returns what stands in for `name` where the walk to it could not look in
+   * a directory: that directory, and the missing names it went up from before.
+   */
+  const noteLinksTo = (name: string): string[] | undefined => {
+    const { links, left, passed, unsearched } = followLinks(name)
+    for (const [link, target] of links) linksToDenies.set(link, target)
+    for (const dir of left) leftOnTheWay.add(dir)
+    return unsearched === undefined ? undefined : [unsearched, ...passed]
+  }
   // Directories that a deny entry re-binds read-only inside the sandbox
   // (--ro-bind <dir> <dir>), keyed by resolved dest, with every raw
   // (pre-resolution) spelling each was reached through. A non-existent deny
@@ -2613,11 +2787,27 @@ async function generateFilesystemArgs(
         mandatoryDenySearchDepth,
         allowGitConfig,
         abortSignal,
+        writable,
       )),
     ]
     // INVARIANT: one plan, one working directory. A relative entry is resolved
     // against it on both sides of the await above, the only one here.
     if (workingDirectory() !== startedIn) throw new WorkingDirectoryChanged()
+
+    // Each deny path as both loops below take it. A directory the walk could
+    // not look in stands in for the path: bound read-only, it keeps its mode.
+    const rawDenyPaths = denyPaths.flatMap(pathPattern => {
+      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
+      // Both loops skip it.
+      if (rawPath.startsWith('/dev/')) return rawPath
+      const instead = noteLinksTo(rawPath)
+      if (instead === undefined) return rawPath
+      logForDebugging(
+        `[Sandbox Linux] Write deny path ${rawPath} cannot be looked at; denying ${instead[0]} whole instead`,
+        { level: 'warn' },
+      )
+      return instead
+    })
 
     // Duplicate deny entries must be collapsed: a duplicate
     // --ro-bind /dev/null <dest> hits a char device on the second pass and
@@ -2643,12 +2833,11 @@ async function generateFilesystemArgs(
     // where the loop masks that component and emits no bind for the
     // directory (the re-check below); an emitted one missing from the record
     // only costs a spurious abort.
-    for (const pathPattern of denyPaths) {
-      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
+    for (const rawPath of rawDenyPaths) {
       if (rawPath.startsWith('/dev/')) {
         continue
       }
-      const resolvedPath = resolveSymlinkedDenyPath(rawPath, denyPaths)
+      const resolvedPath = resolveSymlinkedDenyPath(rawPath, rawDenyPaths)
       if (resolvedPath === null || resolvedPath.startsWith('/dev/')) {
         continue
       }
@@ -2921,11 +3110,10 @@ async function generateFilesystemArgs(
           return '/dev/null'
       }
     }
-    for (const [index, pathPattern] of denyPaths.entries()) {
+    for (const [index, rawPath] of rawDenyPaths.entries()) {
       if (index === configuredDenyPaths.length) {
         mandatoryDenyArgsStart = denyWriteArgs.length
       }
-      const rawPath = normalizePathForSandbox(pathPattern, { literal: true })
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (rawPath.startsWith('/dev/')) {
@@ -3299,9 +3487,39 @@ async function generateFilesystemArgs(
   // each: a symlink spelling would pin the chain of the link, not of where
   // the mount sits. Deny binds, tmpfs units and masks are emitted later and
   // land on top of both pins and covers.
+  //
+  // The read side's names count like the write denies': the next wrap finds
+  // what to hide by the name again. A path that cannot be looked at has its
+  // stand-in already (readDenyTargetOf), and one that is where it resolves to
+  // has no link on the way.
+  for (const name of [
+    ...readDenyPlan().map(entry => entry.normalizedPath),
+    ...(maskedFileBinds ?? []).map(bind => bind.realPath),
+  ]) {
+    const { canonical, resolved } = canonicalLocationOf(name)
+    if (!resolved || canonical !== name) noteLinksTo(name)
+  }
+  readConfig?.matchedLinks?.forEach(noteLinksTo)
+  // A link is held where the command could replace it: in a directory it can
+  // write to, and sees as it is on the host.
+  const linksToHold = [...linksToDenies].filter(
+    ([link]) =>
+      isWithinAnyAllowedWritePath(path.dirname(link)) &&
+      !KERNEL_TOP_LEVEL_DIRS.some(dir => isAtOrUnder(link, dir)) &&
+      !isHiddenByTmpfs(path.dirname(link), 'writes and reads'),
+  )
   const pinArgs = ancestorPinArgs(
     [
       ...denyWriteRawDests.keys(),
+      // The directories above a held link are pinned like those above a
+      // mount, and so is each the way goes up from, itself included. Where
+      // nothing holds the links, pins would keep nothing from being led away.
+      ...(linksAreHeld || linksToHold.length === 0
+        ? [
+            ...linksToHold.map(([link]) => link),
+            ...[...leftOnTheWay].map(dir => `${dir}/.`),
+          ]
+        : []),
       ...fileMasks.map(mask => mask.landing),
       ...readDenyTmpfsUnits.map(unit => unit.landing),
     ],
@@ -3480,7 +3698,7 @@ async function generateFilesystemArgs(
     args.push('--ro-bind', emptySource, emptySource)
   }
 
-  return { args, mandatoryDenyArgs }
+  return { args, mandatoryDenyArgs, linksToHold }
 }
 
 /**
@@ -3558,6 +3776,7 @@ export async function wrapCommandWithSandboxLinux(
     seccompConfig,
     bwrapPath,
     socatPath,
+    alsoWritable = [],
     observeSocketPath,
     abortSignal,
   } = params
@@ -3612,6 +3831,13 @@ export async function wrapCommandWithSandboxLinux(
   let applySeccompPrefix: string | undefined
 
   try {
+    const writable = [
+      ...writablePlaces(writeConfig ? writeRootsOf(writeConfig) : 'anywhere'),
+      ...alsoWritable,
+    ]
+    const bwrapBinary =
+      bwrapPath ?? requireHostHelper('bwrap', 'bwrapPath', writable)
+
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
@@ -3619,6 +3845,7 @@ export async function wrapCommandWithSandboxLinux(
       applySeccompPrefix = resolveApplySeccompPrefix(
         seccompConfig?.applyPath,
         seccompConfig?.argv0,
+        writable,
       )
 
       if (!applySeccompPrefix) {
@@ -3779,7 +4006,16 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
-    const { args: fsArgs, mandatoryDenyArgs } = await generateFilesystemArgs(
+    const whyNotHeld = whyLinksAreNotHeld(
+      applySeccompPrefix !== undefined,
+      seccompConfig,
+      writable,
+    )
+    const {
+      args: fsArgs,
+      mandatoryDenyArgs,
+      linksToHold,
+    } = await generateFilesystemArgs(
       readConfig,
       writeConfig,
       maskedFileBinds,
@@ -3788,13 +4024,21 @@ export async function wrapCommandWithSandboxLinux(
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      writable,
+      whyNotHeld === undefined,
     )
+    const holdWords =
+      whyNotHeld === undefined
+        ? quote(linksToHold.flatMap(pair => ['--hold-link', ...pair]))
+        : ''
+    if (holdWords !== '') applySeccompPrefix += `${holdWords} `
     const mountsStart = bwrapArgs.length
     bwrapArgs.push(...fsArgs)
     const mounts = {
       start: mountsStart,
       end: bwrapArgs.length,
       mandatoryDenyArgs,
+      holdWordsBytes: Buffer.byteLength(holdWords, 'utf8'),
     }
 
     // Always bind /dev
@@ -3852,10 +4096,9 @@ export async function wrapCommandWithSandboxLinux(
       applySeccompPrefix === undefined &&
       allowNestedUserNamespaces !== true
     ) {
-      const bwrap = enableWeakerNestedSandbox
-        ? null
-        : (bwrapPath ?? whichSync('bwrap'))
-      if (bwrap !== null && bwrapCanDisableUserns(bwrap)) {
+      // Asked of the copy this wrap runs, never of PATH's: the probe runs it
+      // on the host.
+      if (!enableWeakerNestedSandbox && bwrapCanDisableUserns(bwrapBinary)) {
         bwrapArgs.push('--disable-userns')
       } else if (!noUsernsLimitLogged) {
         noUsernsLimitLogged = true
@@ -3877,11 +4120,9 @@ export async function wrapCommandWithSandboxLinux(
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
     // Resolve the full path to the shell binary since bwrap doesn't use $PATH
-    const shellName = binShell || 'bash'
-    const shell = whichSync(shellName)
-    if (!shell) {
-      throw new Error(`Shell '${shellName}' not found in PATH`)
-    }
+    // THREAT: the shell starts the relays and the seccomp helper, so one the
+    // command could write would decide whether the filter is ever applied.
+    const shell = requireHostHelper(binShell || 'bash', 'binShell', writable)
     bwrapArgs.push('--', shell, '-c')
 
     // With network restrictions, route the command through buildSandboxCommand
@@ -3894,7 +4135,7 @@ export async function wrapCommandWithSandboxLinux(
         command,
         applySeccompPrefix,
         shell,
-        socatPath,
+        socatPath ?? requireHostHelper('socat', 'socatPath', writable),
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
@@ -3904,11 +4145,7 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = renderBwrapInvocation(
-      bwrapPath ?? 'bwrap',
-      bwrapArgs,
-      mounts,
-    )
+    const wrappedCommand = renderBwrapInvocation(bwrapBinary, bwrapArgs, mounts)
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
@@ -3920,6 +4157,18 @@ export async function wrapCommandWithSandboxLinux(
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
     )
+
+    for (const [link] of linksToHold) {
+      if (whyNotHeld === undefined) {
+        unheldLinks.delete(link)
+        continue
+      }
+      unheldLinks.set(link, whyNotHeld)
+      logForDebugging(
+        `[Sandbox Linux] A denied path leads through the symbolic link ${link}, which the command can replace: nothing holds it (${whyNotHeld})`,
+        { level: 'warn' },
+      )
+    }
 
     // INVARIANT: a wrap that hands out a command is in the count when it does,
     // whatever a forced cleanup did meanwhile: its caller gives one back.

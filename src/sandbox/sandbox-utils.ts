@@ -3,7 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf } from '../utils/real-path.js'
+import { realPathOf, wayPastMissingNames } from '../utils/real-path.js'
 import {
   denyGlobRegex,
   globToRegex,
@@ -114,6 +114,63 @@ export function nameLocation(
   if (p === '/') return p
   const parent = canonicalOf(path.dirname(p))
   return `${parent === '/' ? '' : parent}/${path.basename(p)}`
+}
+
+/**
+ * What has to stay as it is for `p`, a denied name, to go on leading where it
+ * leads, and where that is. `p` is folded in text first, as by `realPathOf`.
+ *
+ * INVARIANT: "could not look" is never "no link". A walk that stops for any
+ * reason but a name that is not there, or that nothing can be at, has no end,
+ * and `unsearched` is the directory it could not look in: a same-uid command
+ * can take a directory's search bit away and give it back from inside the next
+ * sandbox. Never the root, which stands in for nothing.
+ */
+export function followLinks(p: string): {
+  /** The symbolic links on the way: where each lies, and what it says, ''
+   *  where that is no text. */
+  links: Map<string, string>
+  /** The directories a link's target goes into and, by `..`, out of again. */
+  left: Set<string>
+  /** The names that are not there which one goes up from in the same way. */
+  passed: string[]
+  /** Where the way ends, what is not there taken as written: the path a write
+   *  through a dangling link would create. A way that goes up again further on
+   *  among such names ends at the first. None where the walk stopped. */
+  end?: string
+  unsearched?: string
+} {
+  const links = new Map<string, string>()
+  const left = new Set<string>()
+  const walk = (): ReturnType<typeof followLinks> => {
+    const { real, rest, shut, passed } = wayPastMissingNames(path.resolve(p), {
+      link: (at, target) => links.set(at, target),
+      left: dir => left.add(dir),
+    })
+    if (shut) return { links, left, passed, unsearched: real || undefined }
+    const names = rest.includes('..') ? rest.slice(0, 1) : rest
+    return { links, left, passed, end: [real, ...names].join('/') || '/' }
+  }
+  try {
+    return walk()
+  } catch {
+    // Once more: a look can fail in passing (EIO, ESTALE), and what would
+    // follow from that is a directory denied whole.
+  }
+  try {
+    return walk()
+  } catch (err) {
+    const { code, path: at } = err as NodeJS.ErrnoException
+    // A link all the same, which says what no string spells.
+    if (code === 'EILSEQ' && at) links.set(at, '')
+    const nothingCanBeThere =
+      isAbsenceErrno(err) ||
+      code === 'EILSEQ' ||
+      code === 'ERR_INVALID_ARG_VALUE'
+    const dir = path.dirname(at ?? path.resolve(p))
+    const unsearched = nothingCanBeThere || dir === '/' ? undefined : dir
+    return { links, left, passed: [], unsearched }
+  }
 }
 
 /** `process.cwd()`, or undefined where that throws: it has been removed. */
@@ -1252,6 +1309,67 @@ export interface ExpandGlobOptions {
   anchor?: string
 }
 
+/**
+ * What the walks handed it may spend between them: one count and one clock,
+ * so the patterns of one configuration cannot each spend a full one.
+ */
+export interface GlobWalkBudget {
+  /** The directory entries the walks may read, together. */
+  readonly maxEntries: number
+  /** How long they may take, together, in milliseconds. */
+  readonly timeoutMs: number
+  /** When the budget was made, as a `performance.now()` reading. */
+  readonly startedAt: number
+  /** The directory entries read so far. */
+  entries: number
+}
+
+/** A budget nothing has been spent from, its clock starting now. */
+export function newGlobWalkBudget(
+  limits: { maxEntries?: number; timeoutMs?: number } = {},
+): GlobWalkBudget {
+  return {
+    maxEntries: limits.maxEntries ?? 20_000_000,
+    timeoutMs: limits.timeoutMs ?? 60_000,
+    startedAt: performance.now(),
+    entries: 0,
+  }
+}
+
+/**
+ * Thrown by {@link walkGlobPattern} when its budget runs out. What it had
+ * found is not handed back: a deny list cut short is a path left readable.
+ */
+export class GlobWalkBudgetError extends Error {
+  /** Which limit was reached. */
+  readonly exhausted: 'entries' | 'time'
+  /** The entries read under the budget, by this walk and those before. */
+  readonly entries: number
+  /** Milliseconds since the budget was made. */
+  readonly elapsedMs: number
+  readonly maxEntries: number
+  readonly timeoutMs: number
+  constructor(
+    /** The pattern being walked, as the caller wrote it. */
+    readonly pattern: string,
+    /** The directory the walk was listing. */
+    readonly directory: string,
+    budget: GlobWalkBudget,
+  ) {
+    const exhausted = budget.entries > budget.maxEntries ? 'entries' : 'time'
+    const elapsedMs = Math.round(performance.now() - budget.startedAt)
+    super(
+      `Pattern "${pattern}" could not be expanded: the ${exhausted} ran out with ${budget.entries} of ${budget.maxEntries} directory entries read after ${elapsedMs} of ${budget.timeoutMs} ms, while listing ${directory}`,
+    )
+    this.name = 'GlobWalkBudgetError'
+    this.exhausted = exhausted
+    this.entries = budget.entries
+    this.elapsedMs = elapsedMs
+    this.maxEntries = budget.maxEntries
+    this.timeoutMs = budget.timeoutMs
+  }
+}
+
 /** What the walk reads of a listed entry. */
 type GlobWalkEntry = Pick<fs.Dirent, 'name' | 'isDirectory' | 'isSymbolicLink'>
 
@@ -1263,6 +1381,7 @@ export type GlobWalkListings = Map<string, GlobWalkEntry[] | Error>
 export type GlobWalkOptions = ExpandGlobOptions & {
   withDirectoryForm?: boolean
   followSymlinkedDirectories?: boolean
+  budget?: GlobWalkBudget
   /** Handed to every walk of one configuration, so that patterns with a
    *  base in common list each directory once between them. */
   listings?: GlobWalkListings
@@ -1610,6 +1729,9 @@ export function toForwardSlashes(s: string): string {
  * `globPath` without its trailing `/**`, with the symlinks seen recorded.
  * With `followSymlinkedDirectories` it also lists through a symlinked
  * directory and reports every match where it really lives.
+ *
+ * With a `budget` it throws {@link GlobWalkBudgetError} once that is spent.
+ * One step is not cut short: a filesystem call that blocks, or a slow match.
  */
 export function walkGlobPattern(
   globPath: string,
@@ -1719,6 +1841,22 @@ export function* walkGlobPatternSteps(
   const records = new Map<string, DirectoryRecord>()
   const listings: GlobWalkListings = opts.listings ?? new Map()
   const pending: Frame[] = []
+  /** Counts `read` more entries of `dir` read from disk, and throws once the
+   *  budget is spent. An entry another pattern has read already costs time
+   *  alone, so the tree that fits does not shrink with every pattern written
+   *  over it. The clock is read every time: what one entry costs is not
+   *  bounded, so a stride would not bound the time. */
+  const spend = (dir: string, read: 0 | 1): void => {
+    const budget = opts.budget
+    if (budget === undefined) return
+    budget.entries += read
+    if (
+      budget.entries > budget.maxEntries ||
+      performance.now() - budget.startedAt >= budget.timeoutMs
+    ) {
+      throw new GlobWalkBudgetError(globPath, dir, budget)
+    }
+  }
   const codeOf = (err: unknown): string | undefined =>
     (err as NodeJS.ErrnoException | undefined)?.code
   /**
@@ -1746,7 +1884,7 @@ export function* walkGlobPatternSteps(
     try {
       return call(real)
     } catch (first) {
-      if (short === real) throw first
+      if (short === real || first instanceof GlobWalkBudgetError) throw first
       let answer: T
       try {
         answer = call(short)
@@ -1819,6 +1957,7 @@ export function* walkGlobPatternSteps(
     ) {
       return entry
     }
+    spend(real, 0)
     const { name } = entry
     const spelled = path.join(listedAs, name)
     let type: 'directory' | 'link' | 'other' = 'other'
@@ -1886,6 +2025,8 @@ export function* walkGlobPatternSteps(
     const fresh = frame.positions.filter(p => !record.listedFor.has(p))
     if (fresh.length === 0) continue
     yield
+    // After the step, in which time can have passed, and before the listing.
+    spend(dir, 0)
     // Once. What one pattern denies is denied for the whole configuration, so
     // what the short name listed is kept for the next pattern like any other.
     const denyWhole = (): void => {
@@ -1895,8 +2036,8 @@ export function* walkGlobPatternSteps(
       if (real !== dir) walk.realOf.set(dir, real)
     }
     let entries: GlobWalkEntry[]
+    const known = listings.get(real)
     try {
-      const known = listings.get(real)
       if (known instanceof Error) throw known
       entries =
         known ??
@@ -1912,6 +2053,8 @@ export function* walkGlobPatternSteps(
         )
       listings.set(real, entries)
     } catch (err) {
+      // Not a directory that could not be listed.
+      if (err instanceof GlobWalkBudgetError) throw err
       const errorCode = codeOf(err)
       logForDebugging(
         `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
@@ -1935,6 +2078,7 @@ export function* walkGlobPatternSteps(
     }
     for (const p of fresh) record.listedFor.add(p)
     for (const entry of entries) {
+      spend(dir, known === undefined ? 1 : 0)
       // Nearly every entry of a large tree: a plain file the pattern does not
       // match, which nothing below records. A pattern that splits is matched
       // by name, so no path need be spelled to find that out.

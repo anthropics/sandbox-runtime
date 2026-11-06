@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stands in for cl.exe and lib.exe in a cross-target `cargo check`: makes the
+# files it is asked for, empty.
+for a in "$@"; do
+  case "$a" in
+    -out:*|/out:*|/OUT:*|-OUT:*) : > "${a#*:}" ;;
+    -Fo*|/Fo*) : > "${a#???}" ;;
+  esac
+done
+exit 0

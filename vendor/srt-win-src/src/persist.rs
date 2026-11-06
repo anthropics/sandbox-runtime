@@ -479,17 +479,36 @@ fn root_row(conn: &Connection, canon: &str) -> Result<Option<(FileId, String)>> 
         .transpose()
 }
 
+/// Those of `roots` that are `canon` or a directory above it.
+fn covering_roots<'a>(roots: &'a [String], canon: &str) -> impl Iterator<Item = &'a str> {
+    roots.iter().map(String::as_str).filter(move |r| {
+        canon == *r
+            || (canon.starts_with(r)
+                && (r.ends_with('\\') || canon.as_bytes().get(r.len()) == Some(&b'\\')))
+    })
+}
+
 /// The longest of `roots` that is `canon` or a directory above it.
 pub fn covering_root<'a>(roots: &'a [String], canon: &str) -> Option<&'a str> {
-    roots
+    covering_roots(roots, canon).max_by_key(|r| r.len())
+}
+
+/// What keeps the NAME of each of `denies` denied. A deny is on the object,
+/// so a directory above it that is renamed aside takes it along and leaves
+/// the name free to be made anew. Each one is kept where it is, up to the
+/// outermost of `roots`: a session that holds that one could move a root
+/// nested in it.
+fn pins(roots: &[String], denies: &[(String, SbAce)]) -> Vec<(String, SbAce)> {
+    denies
         .iter()
-        .map(String::as_str)
-        .filter(|r| {
-            canon == *r
-                || (canon.starts_with(r)
-                    && (r.ends_with('\\') || canon.as_bytes().get(r.len()) == Some(&b'\\')))
+        .filter(|(_, ace)| matches!(ace, SbAce::Deny(_)))
+        .filter_map(|(canon, _)| {
+            let outermost = covering_roots(roots, canon).min_by_key(|r| r.len())?;
+            Some(path_id::dirs_between(outermost, canon))
         })
-        .max_by_key(|r| r.len())
+        .flatten()
+        .map(|dir| (dir, SbAce::DenyDelete))
+        .collect()
 }
 
 /// The ACEs `canon` (now the object `cur`) is to carry, from the
@@ -949,7 +968,7 @@ pub fn apply(
     }
     let all_roots = all_root_paths(conn)?;
     let mut per_session = Vec::new();
-    for (canon, ace) in denies {
+    for (canon, ace) in denies.iter().chain(&pins(&all_roots, denies)) {
         let Some(root) = covering_root(&all_roots, canon) else {
             per_session.push((canon.clone(), *ace));
             continue;
@@ -1932,6 +1951,24 @@ mod tests {
         // A sibling whose name merely starts with a root's name.
         assert_eq!(c(r"\\?\C:\ab"), None);
         assert_eq!(c(r"\\?\C:\"), None);
+    }
+
+    #[test]
+    fn pins_reach_the_outermost_root() {
+        let roots = vec![r"\\?\C:\a".to_owned(), r"\\?\C:\a\b\c".to_owned()];
+        let deny = |p: &str| (p.to_owned(), SbAce::Deny(acl::DenyMask::WriteDeny));
+        assert_eq!(
+            pins(&roots, &[deny(r"\\?\C:\a\b\c\.git\hooks")]),
+            [r"\\?\C:\a\b\c\.git", r"\\?\C:\a\b\c", r"\\?\C:\a\b"]
+                .map(|dir| (dir.to_owned(), SbAce::DenyDelete)),
+        );
+        // Right under a root, under none, and what is no deny of an object.
+        let none = [
+            deny(r"\\?\C:\a\f"),
+            deny(r"\\?\C:\x\y\f"),
+            (r"\\?\C:\a\b\f".to_owned(), SbAce::DenyFdc),
+        ];
+        assert!(pins(&roots, &none).is_empty());
     }
 
     fn marker_with(ever_enabled: bool, roots: &[&str]) -> Marker {

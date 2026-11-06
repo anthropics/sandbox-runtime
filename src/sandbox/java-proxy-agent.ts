@@ -24,6 +24,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import { getGlobalNpmPathsAsync } from './generate-seccomp-filter.js'
+import { writablePlaces, type WritablePlaces } from './host-helpers.js'
 
 export const JAVA_PROXY_AGENT_JAR_NAME = 'srt-proxy-agent.jar'
 
@@ -44,12 +45,14 @@ const jarPathCache = new Map<string, string | null>()
  */
 export async function getJavaProxyAgentJarPathAsync(
   explicitPath?: string,
+  writable: WritablePlaces = writablePlaces(undefined),
 ): Promise<string | null> {
   const key = explicitPath ?? ''
   const cached = jarPathCache.get(key)
   if (cached !== undefined) return cached
   const found =
-    findLocalJar(explicitPath) ?? findGlobalJar(await getGlobalNpmPathsAsync())
+    findLocalJar(explicitPath) ??
+    findGlobalJar(await getGlobalNpmPathsAsync(writable))
   jarPathCache.set(key, found)
   return found
 }
