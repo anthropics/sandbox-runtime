@@ -49,6 +49,7 @@ export type {
 
 // Platform-specific utilities
 export type { SandboxViolationEvent } from './sandbox/macos-sandbox-utils.js'
+export type { SkippedHostHelper } from './sandbox/host-helpers.js'
 export {
   type SandboxDependencyCheck,
   LinuxSandboxProfileError,
@@ -57,7 +58,6 @@ export {
   type LinuxUnheldLinkReason,
 } from './sandbox/linux-sandbox-utils.js'
 export type { GlobWalkBudgetError } from './sandbox/sandbox-utils.js'
-export type { SkippedHostHelper } from './sandbox/host-helpers.js'
 
 // Windows install/status API
 export {
