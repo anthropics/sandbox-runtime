@@ -14,6 +14,7 @@ export interface RipgrepConfig {
  * @param target Target directory or file to search
  * @param abortSignal AbortSignal to cancel the operation
  * @param config Ripgrep configuration (command and optional args)
+ *   The command is spawned as given: a bare name is searched on the whole PATH.
  * @returns Array of matching lines (one per line of output)
  * @throws RipgrepError if ripgrep exits with non-zero status (except exit code 1 which means no matches)
  */
