@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: ['**']
 
+permissions:
+  contents: read
+
+# LISTED, in the steps that take it: on each line, the SHA-256 of a
+# certificate and of its public key.
 jobs:
   integration-tests:
     name: Tests (${{ matrix.os }} / ${{ matrix.label || matrix.arch }})
@@ -25,7 +30,7 @@ jobs:
             runner: macos-15-large
             os: macos
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
             os: macos
           # The newest macOS as well: the sandbox profile's own regex engine
           # and what Seatbelt refuses have both moved between releases, and
@@ -44,6 +49,153 @@ jobs:
             os: windows
 
     steps:
+      - name: Drop the listed CA certificates from the trust store
+        if: matrix.os == 'linux'
+        timeout-minutes: 5
+        env:
+          LISTED: |
+            86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b 8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782
+            bc4d809b15189d78db3e1d8cf4f9726a795da1643ca5f1358e1ddb0edc0d7eb3 eabc185c4e82d942b1a5978ba3c0181487d6b3b9974e5c49f72f6d0bd9637150
+            40f6af0346a99aa1cd1d555a4e9cce62c7f9634603ee406615833dc8c8d00367 376a1a7082a593dccc20d561d119e9ab8d30f11cc321d0a37fa41f0df284e01c
+            125609aa301da0a249b97a8239cb6a34216f44dcac9f3954b14292f2e8c8608f b7408b4d2be0238ba37004dd34e276c6019bd2f24c9db7d4980f5f6c359a4bcc
+            d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
+        run: |
+          set -euo pipefail
+          shopt -s nullglob dotglob
+          stop() { echo "::error::$1"; exit 1; }
+          conf=/etc/ca-certificates.conf
+          shipped=/usr/share/ca-certificates
+          added=/usr/local/share/ca-certificates
+          store=/etc/ssl/certs
+          bundle=$store/ca-certificates.crt
+
+          declare -A listed=() cert_of=() key_of=() gone=()
+          for hash in $LISTED; do
+            [[ $hash =~ ^[0-9a-f]{64}$ ]] || stop 'The list holds an entry that is not a SHA-256 hash.'
+            listed[$hash]=1
+          done
+          [ ${#listed[@]} -eq 10 ] || stop "The list holds ${#listed[@]} hashes, not 10."
+
+          # Reads the PEM file $1. Sets count to the number of its certificates, hits
+          # to how many of them are listed, and kept to the hashes of the others.
+          read_file() {
+            local line block='' cert key
+            count=0 hits=0 kept=()
+            while IFS= read -r line || [ -n "$line" ]; do
+              line=${line%$'\r'}
+              case "$line" in
+                '-----BEGIN CERTIFICATE-----')
+                  [ -z "$block" ] || return 1
+                  block=$line$'\n'
+                  ;;
+                '-----END CERTIFICATE-----')
+                  [ -n "$block" ] || return 1
+                  block+=$line
+                  if [ -z "${cert_of[$block]:-}" ]; then
+                    cert=$(openssl x509 -outform DER <<< "$block" 2> /dev/null | sha256sum) || return 1
+                    key=$(openssl x509 -noout -pubkey <<< "$block" 2> /dev/null | openssl pkey -pubin -outform DER 2> /dev/null | sha256sum) || return 1
+                    cert_of[$block]=${cert%% *}
+                    key_of[$block]=${key%% *}
+                  fi
+                  cert=${cert_of[$block]}
+                  key=${key_of[$block]}
+                  count=$((count + 1))
+                  if [ -n "${listed[$cert]:-}" ] || [ -n "${listed[$key]:-}" ]; then
+                    hits=$((hits + 1))
+                  else
+                    kept+=("$cert")
+                  fi
+                  block=''
+                  ;;
+                *-----BEGIN* | *-----END*)
+                  return 1
+                  ;;
+                *)
+                  [ -z "$block" ] || block+=$line$'\n'
+                  ;;
+              esac
+            done < "$1" || return 1
+            [ -z "$block" ]
+          }
+
+          [ -d "$shipped" ] && [ -f "$conf" ] || stop 'The store is not laid out as expected.'
+          read_file "$bundle" || stop 'The bundle could not be read.'
+          before=$count
+          expected=$((count - hits))
+          [ "$expected" -gt 0 ] || stop "Nothing would be left of the $before certificates in the bundle."
+          want=$(printf '%s\n' "${kept[@]}" | sort)
+
+          # Keystores in other formats, and the hooks that would write them again.
+          sudo find "$store" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+          sudo rm -rf /etc/ca-certificates/update.d
+
+          sources=("$shipped")
+          [ ! -d "$added" ] || sources+=("$added")
+          while IFS= read -r -d '' file; do
+            read_file "$file" || stop 'A certificate file could not be read.'
+            [ "$hits" -gt 0 ] || continue
+            [ "$hits" -eq "$count" ] || stop "A file holds $count certificates, of which only $hits are listed."
+            sudo rm -f -- "$file" < /dev/null
+            gone[$file]=1
+          done < <(find -L "${sources[@]}" -type f -print0)
+
+          new=$(mktemp)
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              '' | '#'* | '!'*) ;;
+              *) [ -z "${gone[$shipped/$line]:-}" ] || line="!$line" ;;
+            esac
+            printf '%s\n' "$line"
+          done < "$conf" > "$new" || stop 'The selection of certificates could not be read.'
+          sudo tee "$conf" < "$new" > /dev/null
+          rm -f "$new"
+
+          sudo update-ca-certificates --fresh > /dev/null 2>&1 < /dev/null || stop 'The store could not be rebuilt.'
+
+          after='' got=''
+          for entry in "$store"/*; do
+            [ -f "$entry" ] || stop 'An entry of the store is not a file, so it was not checked.'
+            read_file "$entry" || stop 'An entry of the store could not be read.'
+            [ "$count" -gt 0 ] || stop 'An entry of the store holds no certificate.'
+            [ "$hits" -eq 0 ] || stop 'A listed certificate or key is still in the store.'
+            [ "$entry" != "$bundle" ] || { after=$count; got=$(printf '%s\n' "${kept[@]}" | sort); }
+          done
+          [ -n "$after" ] && [ "$got" = "$want" ] \
+            || stop "The bundle went from $before certificates to ${after:-none}, expected $expected."
+          echo "Dropped ${#gone[@]} files and $((before - expected)) of $before certificates; $expected remain."
+      - name: Drop the listed CA certificates from the Windows stores
+        if: matrix.os == 'windows'
+        timeout-minutes: 5
+        shell: pwsh
+        env:
+          LISTED: |
+            86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b 8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782
+            bc4d809b15189d78db3e1d8cf4f9726a795da1643ca5f1358e1ddb0edc0d7eb3 eabc185c4e82d942b1a5978ba3c0181487d6b3b9974e5c49f72f6d0bd9637150
+            40f6af0346a99aa1cd1d555a4e9cce62c7f9634603ee406615833dc8c8d00367 376a1a7082a593dccc20d561d119e9ab8d30f11cc321d0a37fa41f0df284e01c
+            125609aa301da0a249b97a8239cb6a34216f44dcac9f3954b14292f2e8c8608f b7408b4d2be0238ba37004dd34e276c6019bd2f24c9db7d4980f5f6c359a4bcc
+            d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
+        run: |
+          $ErrorActionPreference = 'Stop'
+          trap { "::error::The stores were not cleaned ($($_.Exception.GetType().Name), line $($_.InvocationInfo.ScriptLineNumber))."; exit 1 }
+          function Stop-Step($message) { "::error::$message"; exit 1 }
+          $listed = @(-split $env:LISTED)
+          if ($listed.Count -ne 10 -or @($listed -notmatch '^[0-9a-f]{64}$').Count -ne 0) { Stop-Step 'The list does not hold 10 SHA-256 hashes.' }
+          function Get-Hash($bytes) { (Get-FileHash -Algorithm SHA256 -InputStream ([IO.MemoryStream]::new([byte[]]$bytes))).Hash.ToLower() }
+          function Find-Listed($store) {
+            Get-ChildItem "Cert:\$store" | Where-Object {
+              $listed -contains (Get-Hash $_.RawData) -or $listed -contains (Get-Hash $_.PublicKey.ExportSubjectPublicKeyInfo())
+            }
+          }
+          foreach ($store in 'LocalMachine\Root', 'LocalMachine\AuthRoot', 'LocalMachine\CA') {
+            $found = @(Find-Listed $store)
+            $found | Remove-Item
+            "Dropped $($found.Count) certificates from $store."
+          }
+          $left = @('LocalMachine', 'CurrentUser' | ForEach-Object { Find-Listed "$_\Root"; Find-Listed "$_\AuthRoot"; Find-Listed "$_\CA" })
+          if ($left.Count -gt 0) { Stop-Step "$($left.Count) listed certificates are still in the stores." }
+          if (@(Get-ChildItem Cert:\LocalMachine\Root).Count -eq 0) { Stop-Step 'The store reads as empty, so it was not checked.' }
+          $policy = Get-ItemProperty HKLM:\SOFTWARE\Policies\Microsoft\SystemCertificates\AuthRoot
+          if ($policy.DisableRootAutoUpdate -ne 1) { Stop-Step 'DisableRootAutoUpdate is not 1.' }
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -55,7 +207,11 @@ jobs:
           # and on Windows that release tries only `::1` for `localhost`,
           # where the proxy listens on 127.0.0.1. The floor itself is run by
           # the package check in release.yml.
-          node-version: '22'
+          #
+          # Windows runs 24: @microsoft/mxc-sdk declares Node >=24, and
+          # npm leaves an optional dependency out when its engines do not
+          # match, so on 22 the MXC SDK is never installed.
+          node-version: ${{ matrix.os == 'windows' && '24' || '22' }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -168,12 +324,49 @@ jobs:
           $env:SRT_WIN_TEST_HOOKS_EXE = (Resolve-Path 'vendor\srt-win-src\target\test-hooks\release\srt-win.exe').Path
           npm ci
           npm run build
+          # mxc.test.ts (the backend-agnostic boundary suite) runs in
+          # its OWN bun process, before the srt-win suites: it
+          # self-provisions srt-win and uninstalls what it installed,
+          # and the separate process keeps sandbox-manager's
+          # process-lifetime state (e.g. the once-per-process WFP
+          # verification) from leaking into winsrt's fail-closed
+          # guards. It runs on srt-win for now: the mxc backend needs
+          # fs streams that accept `windowsHandle`, which no Bun
+          # release has yet. Set SRT_BOUNDARY_BACKEND to 'mxc' on the
+          # arm64 leg (the only BaseContainer-capable image) once the
+          # pinned Bun has it.
+          $env:SRT_BOUNDARY_BACKEND = 'srt-win'
+          bun test test/sandbox/mxc.test.ts
           # These are listed explicitly because the non-Windows legs run the
           # whole tree: winsrt-paths.property is the only property suite over
           # the Windows path pipeline, glob-expand holds the UNC pass-raw
           # block that runs on no other leg, and config-validation covers the
           # schema on a real Windows host rather than under a platform spy.
           bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
+
+      # Diagnostic only: why the MXC BaseContainer tier is or isn't available
+      # on this runner. Never fails the job.
+      - name: MXC host diagnostics (Windows)
+        if: ${{ !cancelled() && matrix.os == 'windows' }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          HUSKY: '0'
+        run: |
+          $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+          "OS: $($cv.ProductName) $($cv.EditionID) $($cv.InstallationType) $($cv.DisplayVersion) build $($cv.CurrentBuild).$($cv.UBR)"
+          $dll = Get-Item "$env:SystemRoot\System32\processmodel.dll" -ErrorAction SilentlyContinue
+          "processmodel.dll: $(if ($dll) { $dll.VersionInfo.FileVersion } else { 'absent' })"
+          foreach ($id in 61389575, 61155944) {
+            foreach ($priority in 4, 8) {
+              $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FeatureManagement\Overrides\$priority\$id"
+              $state = (Get-ItemProperty $key -ErrorAction SilentlyContinue).EnabledState
+              "feature $id override $priority EnabledState: $(if ($null -eq $state) { 'unset' } else { $state })"
+            }
+          }
+          if (-not (Test-Path node_modules)) { npm ci }
+          "MXC SDK probe:"
+          node -e "import('@microsoft/mxc-sdk/v1').then(s => console.log(JSON.stringify(s.probe(), null, 1)), e => console.log('not available: ' + e.message))"
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
@@ -367,7 +560,124 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
 
+    env:
+      # Node on the host reads the trust store of the system. The container
+      # below has a store of its own, and its Node its own list.
+      NODE_OPTIONS: --use-openssl-ca
     steps:
+      - name: Drop the listed CA certificates from the trust store
+        timeout-minutes: 5
+        env:
+          LISTED: |
+            86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b 8d417db2dd8bf5e3084d1e3f196d583849d81bdd4c00c70b9d39369e96b8c782
+            bc4d809b15189d78db3e1d8cf4f9726a795da1643ca5f1358e1ddb0edc0d7eb3 eabc185c4e82d942b1a5978ba3c0181487d6b3b9974e5c49f72f6d0bd9637150
+            40f6af0346a99aa1cd1d555a4e9cce62c7f9634603ee406615833dc8c8d00367 376a1a7082a593dccc20d561d119e9ab8d30f11cc321d0a37fa41f0df284e01c
+            125609aa301da0a249b97a8239cb6a34216f44dcac9f3954b14292f2e8c8608f b7408b4d2be0238ba37004dd34e276c6019bd2f24c9db7d4980f5f6c359a4bcc
+            d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4 bd153ed7b0434f6886b17bce8bbe84ed340c7132d702a8f4fa318f756ecbd6f3
+        run: |
+          set -euo pipefail
+          shopt -s nullglob dotglob
+          stop() { echo "::error::$1"; exit 1; }
+          conf=/etc/ca-certificates.conf
+          shipped=/usr/share/ca-certificates
+          added=/usr/local/share/ca-certificates
+          store=/etc/ssl/certs
+          bundle=$store/ca-certificates.crt
+
+          declare -A listed=() cert_of=() key_of=() gone=()
+          for hash in $LISTED; do
+            [[ $hash =~ ^[0-9a-f]{64}$ ]] || stop 'The list holds an entry that is not a SHA-256 hash.'
+            listed[$hash]=1
+          done
+          [ ${#listed[@]} -eq 10 ] || stop "The list holds ${#listed[@]} hashes, not 10."
+
+          # Reads the PEM file $1. Sets count to the number of its certificates, hits
+          # to how many of them are listed, and kept to the hashes of the others.
+          read_file() {
+            local line block='' cert key
+            count=0 hits=0 kept=()
+            while IFS= read -r line || [ -n "$line" ]; do
+              line=${line%$'\r'}
+              case "$line" in
+                '-----BEGIN CERTIFICATE-----')
+                  [ -z "$block" ] || return 1
+                  block=$line$'\n'
+                  ;;
+                '-----END CERTIFICATE-----')
+                  [ -n "$block" ] || return 1
+                  block+=$line
+                  if [ -z "${cert_of[$block]:-}" ]; then
+                    cert=$(openssl x509 -outform DER <<< "$block" 2> /dev/null | sha256sum) || return 1
+                    key=$(openssl x509 -noout -pubkey <<< "$block" 2> /dev/null | openssl pkey -pubin -outform DER 2> /dev/null | sha256sum) || return 1
+                    cert_of[$block]=${cert%% *}
+                    key_of[$block]=${key%% *}
+                  fi
+                  cert=${cert_of[$block]}
+                  key=${key_of[$block]}
+                  count=$((count + 1))
+                  if [ -n "${listed[$cert]:-}" ] || [ -n "${listed[$key]:-}" ]; then
+                    hits=$((hits + 1))
+                  else
+                    kept+=("$cert")
+                  fi
+                  block=''
+                  ;;
+                *-----BEGIN* | *-----END*)
+                  return 1
+                  ;;
+                *)
+                  [ -z "$block" ] || block+=$line$'\n'
+                  ;;
+              esac
+            done < "$1" || return 1
+            [ -z "$block" ]
+          }
+
+          [ -d "$shipped" ] && [ -f "$conf" ] || stop 'The store is not laid out as expected.'
+          read_file "$bundle" || stop 'The bundle could not be read.'
+          before=$count
+          expected=$((count - hits))
+          [ "$expected" -gt 0 ] || stop "Nothing would be left of the $before certificates in the bundle."
+          want=$(printf '%s\n' "${kept[@]}" | sort)
+
+          # Keystores in other formats, and the hooks that would write them again.
+          sudo find "$store" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+          sudo rm -rf /etc/ca-certificates/update.d
+
+          sources=("$shipped")
+          [ ! -d "$added" ] || sources+=("$added")
+          while IFS= read -r -d '' file; do
+            read_file "$file" || stop 'A certificate file could not be read.'
+            [ "$hits" -gt 0 ] || continue
+            [ "$hits" -eq "$count" ] || stop "A file holds $count certificates, of which only $hits are listed."
+            sudo rm -f -- "$file" < /dev/null
+            gone[$file]=1
+          done < <(find -L "${sources[@]}" -type f -print0)
+
+          new=$(mktemp)
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              '' | '#'* | '!'*) ;;
+              *) [ -z "${gone[$shipped/$line]:-}" ] || line="!$line" ;;
+            esac
+            printf '%s\n' "$line"
+          done < "$conf" > "$new" || stop 'The selection of certificates could not be read.'
+          sudo tee "$conf" < "$new" > /dev/null
+          rm -f "$new"
+
+          sudo update-ca-certificates --fresh > /dev/null 2>&1 < /dev/null || stop 'The store could not be rebuilt.'
+
+          after='' got=''
+          for entry in "$store"/*; do
+            [ -f "$entry" ] || stop 'An entry of the store is not a file, so it was not checked.'
+            read_file "$entry" || stop 'An entry of the store could not be read.'
+            [ "$count" -gt 0 ] || stop 'An entry of the store holds no certificate.'
+            [ "$hits" -eq 0 ] || stop 'A listed certificate or key is still in the store.'
+            [ "$entry" != "$bundle" ] || { after=$count; got=$(printf '%s\n' "${kept[@]}" | sort); }
+          done
+          [ -n "$after" ] && [ "$got" = "$want" ] \
+            || stop "The bundle went from $before certificates to ${after:-none}, expected $expected."
+          echo "Dropped ${#gone[@]} files and $((before - expected)) of $before certificates; $expected remain."
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

@@ -169,6 +169,11 @@ export type WindowsSandboxErrorCode =
    * launch subcommands exit **18** ({@link SeclogonDisabledError}).
    */
   | 'seclogon_disabled'
+  /**
+   * The named `windows.backend` cannot run this configuration on this
+   * host. Nothing falls back; the caller decides what to try next.
+   */
+  | 'backend_unsupported'
 
 /**
  * Error thrown by the Windows sandbox backend. Carries a stable
@@ -1428,11 +1433,15 @@ function windowsInstallFlags(
   )
 }
 
+/** The install command, as error messages print it. */
+export const WINDOWS_INSTALL_COMMAND =
+  'npx @anthropic-ai/sandbox-runtime windows-install'
+
 function windowsInstallCommand(
   ctx: WindowsInstallContext,
   force: boolean,
 ): string {
-  return `npx sandbox-runtime windows-install` + windowsInstallFlags(ctx, force)
+  return WINDOWS_INSTALL_COMMAND + windowsInstallFlags(ctx, force)
 }
 
 /**
@@ -1971,14 +1980,14 @@ export async function ensurePersistentWindowsCa(
     throw new Error(
       `ensurePersistentWindowsCa: sandbox user is not provisioned ` +
         `(user=${status.provisioned}, cred=${status.credPresent}). ` +
-        `Run \`npx sandbox-runtime windows-install\` first.`,
+        `Run \`${WINDOWS_INSTALL_COMMAND}\` first.`,
     )
   }
   const stateDir = opts.dir ? undefined : windowsStateDir()
   if (stateDir && !fs.existsSync(stateDir)) {
     throw new Error(
       `ensurePersistentWindowsCa: state directory ${stateDir} does not ` +
-        `exist. Run \`npx sandbox-runtime windows-install\` first.`,
+        `exist. Run \`${WINDOWS_INSTALL_COMMAND}\` first.`,
     )
   }
   const dir = opts.dir ?? path.win32.join(stateDir!, 'ca')
@@ -2743,7 +2752,7 @@ function windowsPathKeyOf(p: string, resolved: ResolvedWindowsPath): string {
 }
 
 /** The one of `dirs` that a path is, or lies beneath. */
-function coveringWindowsPath(
+export function coveringWindowsPath(
   dirs: readonly string[],
 ): (p: string) => string | undefined {
   const keys = dirs.map(windowsPathKey)
@@ -4337,9 +4346,10 @@ export function mergeWindowsEnv(
 /**
  * Parse a list of `KEY=VALUE` strings (as produced by
  * {@link generateProxyEnvVars}) into an object. Splits on the FIRST
- * `=` only, so values containing `=` survive intact.
+ * `=` only, so values containing `=` survive intact. Shared with the
+ * MXC backend's child-environment assembly.
  */
-function envListToObject(list: string[]): NodeJS.ProcessEnv {
+export function envListToObject(list: readonly string[]): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}
   for (const entry of list) {
     const eq = entry.indexOf('=')
@@ -4388,7 +4398,7 @@ export function windowsSetupVersionMismatch(
 /** The two ways to run the install, with `flags` (see `windowsInstallFlags`). */
 function windowsInstallCommandLines(flags: string): string {
   return (
-    `  npx sandbox-runtime windows-install${flags}\n` +
+    `  ${WINDOWS_INSTALL_COMMAND}${flags}\n` +
     `  — or call installWindowsSandbox(), or run ` +
     `\`srt-win.exe install${flags}\` directly.\n`
   )
