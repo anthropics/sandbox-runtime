@@ -1876,6 +1876,22 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       await SandboxManager.initialize({ ...session, ...disabled })
       expect(await stampedFor()).toEqual([])
     })
+
+    it('the mxc backend, whose only deny takes reads away too, is handed none', async () => {
+      process.chdir(root)
+      const verify = spyOn(mxcUtils, 'verifyMxcBackend').mockReturnValue()
+      spies.push(
+        verify,
+        spyOn(mxcUtils, 'isMxcSdkInstalled').mockReturnValue(true),
+        spyOn(mxcUtils, 'loadMxcSdk').mockResolvedValue({} as mxcUtils.MxcSdk),
+      )
+      const base = configOf({ allowWrite: [root], denyWrite: [d] })
+      await SandboxManager.initialize({
+        ...base,
+        windows: { ...base.windows, backend: 'mxc' },
+      })
+      expect(verify.mock.calls[0][1].filesystem.deniedPaths).toEqual([d])
+    })
   })
 
   it('allowLocalBinding: the session mode reaches the fence probe and every exec', async () => {

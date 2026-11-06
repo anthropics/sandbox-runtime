@@ -1004,6 +1004,7 @@ Known limitations:
   - `network.tlsTerminate`, so credential masking of request headers is unavailable.
   - `filesystem.disabled` at the session level: MXC is allow-list in both directions, and the nearest request would restrict rather than lift restrictions. (Per command it keeps the session's policy, as on srt-win.)
   - `network.allowLocalBinding: true`, at the session level or per command: nothing outside the container can connect in.
+- **The [mandatory deny paths](#mandatory-deny-paths-auto-protected-files) are not blocked.** MXC has one kind of deny, which takes reads away as well (a path in `denyWrite` cannot be read either), and git does not run without reading `.git\config`. List in `denyWrite` the ones a command need not read.
 - **Loopback with a proxy is closed by measurement, not by promise.** MXC 1.0 refuses a host proxy unless `ingress.default` is `allow`, and one without an app identity also needs host loopback allowed. On Windows 11 25H2 (build 26200.9711) that request still admitted no inbound connection, from loopback or the LAN, and blocked outbound connections to loopback ports other than the proxy's. MXC documents no guarantee of either.
 - **`%TEMP%`, `%TMP%` and `%LOCALAPPDATA%` are per-command scratch.** MXC points them at a folder of its own for each command and deletes it when the command ends, so a file written there is not seen by the next command or on the host. Caches kept under `LOCALAPPDATA` (npm, pip and similar) do not persist between commands. The host's own temp folder is still writable by its full path.
 - **The child's environment is sealed**: it gets a fixed set of Windows variables, the proxy settings and srt's own, never the user's profile environment.
@@ -1190,7 +1191,7 @@ Certain sensitive files and directories are **always blocked from writes**, even
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
 - Git hooks and config: `.git/hooks/`, `.git/config`. Where the working directory is a worktree or a submodule, its `.git` is a file: on Linux and Windows that file is blocked, so it can be read but not changed, moved or removed.
 
-These paths are blocked automatically, on every platform - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
+These paths are blocked automatically, on every platform (on Windows by the srt-win backend only) - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 
 ```bash
 $ srt 'echo "malicious" >> .bashrc'
