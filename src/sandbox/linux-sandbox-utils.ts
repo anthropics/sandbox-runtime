@@ -972,6 +972,12 @@ export type LinuxSandboxProfileErrorCode =
   | 'args_file_unavailable'
   /** The line does not fit one shell argument even with the mounts in a file. */
   | 'command_too_long'
+  /**
+   * The read patterns could not be expanded within their budget, so which
+   * paths to hide is not known. The `GlobWalkBudgetError` on `.cause` names
+   * the pattern, the directory being listed and what had been spent.
+   */
+  | 'deny_glob_too_large'
 
 /**
  * Thrown when a Linux bubblewrap profile cannot be run on this host: what the

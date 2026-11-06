@@ -48,6 +48,7 @@ import type {
   SandboxRuntimeConfig,
   SeccompConfig,
 } from './sandbox-config.js'
+import { FilesystemConfigSchema } from './sandbox-config.js'
 import type {
   SandboxAskCallback,
   CredentialRestrictionConfig,
@@ -64,6 +65,7 @@ import {
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
   linuxGetCwdMandatoryDenyPaths,
+  LinuxSandboxProfileError,
 } from './linux-sandbox-utils.js'
 import { expandReadDenyGlobLinuxSteps } from './read-deny-glob.js'
 import {
@@ -123,9 +125,12 @@ import {
   globPatternBaseDir,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
+  GlobWalkBudgetError,
   walkGlobPatternSteps,
   workingDirectory,
+  type GlobWalkBudget,
   type GlobWalkListings,
+  newGlobWalkBudget,
   type Steps,
   finish,
   finishInTurns,
@@ -2037,11 +2042,8 @@ function* resolveReadPathEntries(
       !literal.has(p) &&
       containsGlobChars(stripped)
     ) {
-      for (const found of yield* withOtherReadings(
-        p,
-        stripped,
-        kind,
-        expandGlob,
+      for (const found of yield* withinBudget(
+        withOtherReadings(p, stripped, kind, expandGlob),
       )) {
         resolved.add(found)
       }
@@ -2078,11 +2080,49 @@ function stripWriteGlobs(
     })
 }
 
+/**
+ * What the glob walks of one read configuration may spend between them, on
+ * Linux, its clock starting now: `filesystem.denyReadGlobBudget`, a wrap's own
+ * limits over the session's one by one. Checked here, because only the CLI
+ * runs the schema and a limit that is no number would never be reached.
+ */
+function readGlobBudget(
+  ...limits: Array<SandboxRuntimeConfig['filesystem']['denyReadGlobBudget']>
+): GlobWalkBudget {
+  const [session, own] = limits.map(given =>
+    FilesystemConfigSchema.shape.denyReadGlobBudget.parse(given, {
+      path: ['filesystem', 'denyReadGlobBudget'],
+    }),
+  )
+  return newGlobWalkBudget({
+    maxEntries: own?.maxEntries ?? session?.maxEntries,
+    timeoutMs: own?.timeoutMs ?? session?.timeoutMs,
+  })
+}
+
+/** `walk`, with a budget that runs out in it told as
+ *  {@link LinuxSandboxProfileError} `deny_glob_too_large`. */
+function* withinBudget<T>(walk: Steps<T>): Steps<T> {
+  try {
+    return yield* walk
+  } catch (error) {
+    if (!(error instanceof GlobWalkBudgetError)) throw error
+    throw new LinuxSandboxProfileError(
+      'deny_glob_too_large',
+      `${error.message}; the allowRead, denyRead and credentials.files patterns of one configuration share the budget: ` +
+        `narrow the pattern, remove or move what it walks into, or raise filesystem.denyReadGlobBudget`,
+      error,
+    )
+  }
+}
+
 function* expandAllowReadGlob(
+  budget: GlobWalkBudget,
   pattern: string,
   anchor?: string,
 ): Steps<string[]> {
-  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor })).matches
+  const expanded = (yield* walkGlobPatternSteps(pattern, { anchor, budget }))
+    .matches
   logForDebugging(
     `[Sandbox] Expanded allowRead glob pattern "${pattern}" to ${expanded.length} paths on Linux`,
   )
@@ -2110,11 +2150,12 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   )
   // allowRead (re-allow within denied regions) is resolved first: the
   // denyRead glob expansion collapses against it.
+  const budget = readGlobBudget(config.filesystem.denyReadGlobBudget)
   const allowPaths = finish(
     resolveReadPathEntries(
       'allow',
       config.filesystem.allowRead ?? [],
-      expandAllowReadGlob,
+      (pattern, anchor) => expandAllowReadGlob(budget, pattern, anchor),
     ),
   )
   const reExposedPaths = reExposedBy(
@@ -2133,7 +2174,7 @@ function getFsReadConfig(): FsReadRestrictionConfig {
           pattern,
           reExposedPaths,
           unlistableDenyDirs,
-          { anchor, listings },
+          { anchor, budget, listings },
         ),
     ),
   )
@@ -2687,13 +2728,17 @@ async function wrapWithSandboxOnce(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
+    const budget = readGlobBudget(
+      config?.filesystem.denyReadGlobBudget,
+      customConfig?.filesystem?.denyReadGlobBudget,
+    )
     const expandedAllowRead = await walked(
       resolveReadPathEntries(
         'allow',
         customConfig?.filesystem?.allowRead ??
           config?.filesystem.allowRead ??
           [],
-        expandAllowReadGlob,
+        (pattern, anchor) => expandAllowReadGlob(budget, pattern, anchor),
       ),
     )
     if (expandedAllowRead === REPLACED) return startOver()
@@ -2725,7 +2770,7 @@ async function wrapWithSandboxOnce(
             pattern,
             reExposedPaths,
             unlistableDenyDirs,
-            { anchor, listings },
+            { anchor, budget, listings },
           ),
       ),
     )
@@ -3753,6 +3798,8 @@ export interface ISandboxManager {
     },
     options?: CheckDependenciesOptions,
   ): Promise<SandboxDependencyCheck>
+  /** On Linux it expands the `denyRead` globs, and throws
+   *  {@link LinuxSandboxProfileError} `deny_glob_too_large` as the wrap does. */
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
