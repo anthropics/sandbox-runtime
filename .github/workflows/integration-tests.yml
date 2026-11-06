@@ -436,7 +436,7 @@ jobs:
 
       # Builds dist/ as `npm run build` does, which compiles src only. This is
       # the one step that checks the types of test/, which bun strips at runtime.
-      - name: Typecheck
+      - name: Build and typecheck
         if: matrix.os != 'windows'
         run: npm run typecheck
 

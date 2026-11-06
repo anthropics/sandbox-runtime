@@ -116,7 +116,9 @@ async function main(): Promise<void> {
     )
     check(
       'the seccomp helper it was told of is the one the command starts',
-      process.platform !== 'linux' || multicall || wrapped.includes(applyPath!),
+      process.platform !== 'linux' ||
+        multicall ||
+        (applyPath !== undefined && wrapped.includes(applyPath)),
       wrapped,
     )
     const result = spawnSync(wrapped, {
