@@ -1089,6 +1089,20 @@ export const SrtWinConfigSchema = z.object({
  * `.extend()`/`.shape` it.
  */
 export const WindowsConfigSchema = z.object({
+  // Optional, not `.default()`: a default would make the inferred type
+  // required, which would break existing callers.
+  backend: z
+    .enum(['mxc', 'srt-win'])
+    .optional()
+    .describe(
+      'The Windows enforcement backend. Defaults to srt-win. initialize() ' +
+        'refuses a configuration the named backend cannot enforce; there ' +
+        'is no fallback between backends. Under mxc, commands start with ' +
+        'SandboxManager.spawnSandboxed() rather than wrapWithSandboxArgv(), ' +
+        'and sandboxed programs can open windows on the desktop (UI is on ' +
+        'so that ordinary tools start; clipboard and input injection stay ' +
+        'blocked).',
+    ),
   sandboxUser: z
     .string()
     .min(1)
