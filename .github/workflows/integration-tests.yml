@@ -434,8 +434,8 @@ jobs:
         if: matrix.os != 'windows'
         run: npm ci
 
-      # `npm run build` compiles src only. This is the one step that checks
-      # the types of test/, which bun strips at runtime.
+      # Builds dist/ as `npm run build` does, which compiles src only. This is
+      # the one step that checks the types of test/, which bun strips at runtime.
       - name: Typecheck
         if: matrix.os != 'windows'
         run: npm run typecheck
@@ -453,10 +453,6 @@ jobs:
       - name: Build JVM proxy agent (macOS/Linux)
         if: matrix.os != 'windows'
         run: npm run build:java-agent
-
-      - name: Build project
-        if: matrix.os != 'windows'
-        run: npm run build
 
       - name: Run tests
         if: matrix.os != 'windows'

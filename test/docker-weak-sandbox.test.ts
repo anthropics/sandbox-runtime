@@ -5,7 +5,7 @@
  * Gated on SRT_E2E_DOCKER so `npm test` on the host jobs skips it. CI runs it
  * twice in one container — once holding CAP_SYS_ADMIN, once under
  * `capsh --drop=cap_sys_admin` — because a uid-0 caller is what the
- * capability drop exists for.
+ * capability drop exists for. Then the same in alpine:3.22, for musl.
  *
  * Invoked by CI via:
  *   docker run --rm \

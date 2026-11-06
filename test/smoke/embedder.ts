@@ -114,6 +114,11 @@ async function main(): Promise<void> {
         'exit 7',
       ].join('; '),
     )
+    check(
+      'the seccomp helper it was told of is the one the command starts',
+      process.platform !== 'linux' || multicall || wrapped.includes(applyPath!),
+      wrapped,
+    )
     const result = spawnSync(wrapped, {
       shell: true,
       encoding: 'utf8',
