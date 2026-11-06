@@ -1877,11 +1877,13 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       expect(await stampedFor()).toEqual([])
     })
 
-    it('the mxc backend, whose only deny takes reads away too, is handed none', async () => {
+    it('the mxc backend, where a write deny takes reads away too, is handed none', async () => {
       process.chdir(root)
       const verify = spyOn(mxcUtils, 'verifyMxcBackend').mockReturnValue()
+      const spawn = spyOn(mxcUtils, 'spawnMxcRequest')
       spies.push(
         verify,
+        spawn.mockResolvedValue({} as MxcProcessHandle),
         spyOn(mxcUtils, 'isMxcSdkInstalled').mockReturnValue(true),
         spyOn(mxcUtils, 'loadMxcSdk').mockResolvedValue({} as mxcUtils.MxcSdk),
       )
@@ -1890,7 +1892,10 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         ...base,
         windows: { ...base.windows, backend: 'mxc' },
       })
-      expect(verify.mock.calls[0][1].filesystem.deniedPaths).toEqual([d])
+      await SandboxManager.spawnSandboxed!('rem', { cwd: root })
+      for (const [[, request]] of [verify.mock.calls, spawn.mock.calls]) {
+        expect(request.filesystem.deniedPaths).toEqual([d])
+      }
     })
   })
 
