@@ -2331,10 +2331,13 @@ function computeWindowsFsAccessSet(
     denyRead: expand(fs?.denyRead ?? [], { mode: 'deny' }),
     denyWrite: [
       ...expand(fs?.denyWrite ?? [], { mode: 'deny' }),
-      ...windowsMandatoryDenyPaths(process.cwd(), allowWrite, {
-        maxDepth: c.mandatoryDenySearchDepth ?? 3,
-        allowGitConfig: fs?.allowGitConfig ?? false,
-      }),
+      // Not for mxc: its only deny takes reads away too, `.git\config`'s with them.
+      ...(c.windows?.backend === 'mxc'
+        ? []
+        : windowsMandatoryDenyPaths(process.cwd(), allowWrite, {
+            maxDepth: c.mandatoryDenySearchDepth ?? 3,
+            allowGitConfig: fs?.allowGitConfig ?? false,
+          })),
     ],
     credentialDeny: [
       ...expand(getCredentialDenyReadPaths(c.credentials), { mode: 'deny' }),
