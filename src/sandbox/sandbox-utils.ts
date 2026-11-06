@@ -3,7 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf } from '../utils/real-path.js'
+import { realPathOf, wayPastMissingNames } from '../utils/real-path.js'
 import {
   denyGlobRegex,
   globToRegex,
@@ -114,6 +114,63 @@ export function nameLocation(
   if (p === '/') return p
   const parent = canonicalOf(path.dirname(p))
   return `${parent === '/' ? '' : parent}/${path.basename(p)}`
+}
+
+/**
+ * What has to stay as it is for `p`, a denied name, to go on leading where it
+ * leads, and where that is. `p` is folded in text first, as by `realPathOf`.
+ *
+ * INVARIANT: "could not look" is never "no link". A walk that stops for any
+ * reason but a name that is not there, or that nothing can be at, has no end,
+ * and `unsearched` is the directory it could not look in: a same-uid command
+ * can take a directory's search bit away and give it back from inside the next
+ * sandbox. Never the root, which stands in for nothing.
+ */
+export function followLinks(p: string): {
+  /** The symbolic links on the way: where each lies, and what it says, ''
+   *  where that is no text. */
+  links: Map<string, string>
+  /** The directories a link's target goes into and, by `..`, out of again. */
+  left: Set<string>
+  /** The names that are not there which one goes up from in the same way. */
+  passed: string[]
+  /** Where the way ends, what is not there taken as written: the path a write
+   *  through a dangling link would create. A way that goes up again further on
+   *  among such names ends at the first. None where the walk stopped. */
+  end?: string
+  unsearched?: string
+} {
+  const links = new Map<string, string>()
+  const left = new Set<string>()
+  const walk = (): ReturnType<typeof followLinks> => {
+    const { real, rest, shut, passed } = wayPastMissingNames(path.resolve(p), {
+      link: (at, target) => links.set(at, target),
+      left: dir => left.add(dir),
+    })
+    if (shut) return { links, left, passed, unsearched: real || undefined }
+    const names = rest.includes('..') ? rest.slice(0, 1) : rest
+    return { links, left, passed, end: [real, ...names].join('/') || '/' }
+  }
+  try {
+    return walk()
+  } catch {
+    // Once more: a look can fail in passing (EIO, ESTALE), and what would
+    // follow from that is a directory denied whole.
+  }
+  try {
+    return walk()
+  } catch (err) {
+    const { code, path: at } = err as NodeJS.ErrnoException
+    // A link all the same, which says what no string spells.
+    if (code === 'EILSEQ' && at) links.set(at, '')
+    const nothingCanBeThere =
+      isAbsenceErrno(err) ||
+      code === 'EILSEQ' ||
+      code === 'ERR_INVALID_ARG_VALUE'
+    const dir = path.dirname(at ?? path.resolve(p))
+    const unsearched = nothingCanBeThere || dir === '/' ? undefined : dir
+    return { links, left, passed: [], unsearched }
+  }
 }
 
 /** `process.cwd()`, or undefined where that throws: it has been removed. */

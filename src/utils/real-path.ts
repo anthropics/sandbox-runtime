@@ -14,6 +14,7 @@ function textOf(ask: typeof fs.readlinkSync, at: string): string {
   if (text.includes('\uFFFD') && !ask(at, 'buffer').equals(Buffer.from(text))) {
     throw Object.assign(new Error(`EILSEQ: illegal byte sequence, '${at}'`), {
       code: 'EILSEQ',
+      path: at,
     })
   }
   return text
@@ -50,6 +51,15 @@ export function realPathOf(p: string): string {
   return real || '/'
 }
 
+/** What {@link wayTo} passes that decides where it leads: whoever can put
+ *  something else at one of these can lead it elsewhere. */
+export type WayWatcher = {
+  /** A link it follows: where the link lies, and what it says. */
+  link?: (at: string, target: string) => void
+  /** A directory it goes up from again, by a `..` in a link's target. */
+  left?: (dir: string) => void
+}
+
 /**
  * The kernel's way to `folded`, an absolute path with no `.`, `..` or `//` of
  * its own: name by name, split at `/` alone, every link followed. `real` is
@@ -58,7 +68,10 @@ export function realPathOf(p: string): string {
  * look for (EACCES), with what the kernel said of it. Whatever else stops the
  * way is thrown. POSIX only.
  */
-export function wayTo(folded: string): {
+export function wayTo(
+  folded: string,
+  watcher: WayWatcher = {},
+): {
   real: string
   rest: string[]
   notThere?: unknown
@@ -77,7 +90,10 @@ export function wayTo(folded: string): {
         }
         return { real, rest: [name, ...rest], notThere }
       }
-      if (name === '..') real = real.slice(0, real.lastIndexOf('/'))
+      if (name === '..' && real !== '') {
+        watcher.left?.(real)
+        real = real.slice(0, real.lastIndexOf('/'))
+      }
       continue
     }
     const next = `${real}/${name}`
@@ -104,8 +120,39 @@ export function wayTo(folded: string): {
       )
     }
     const target = textOf(fs.readlinkSync, next)
+    watcher.link?.(next, target)
     if (target.startsWith('/')) real = ''
     rest.unshift(...target.split('/'))
   }
   return { real, rest }
+}
+
+/**
+ * {@link wayTo}, followed on where it goes up again at once from a name that
+ * is not there (`missing/../x`): a directory made at that name lets the way
+ * pass, and a link made there leads it elsewhere. `passed` holds each such
+ * name, `rest` no `.` or empty name, and `shut` whether `real` lets nobody
+ * look (EACCES). ELOOP past as many of them as links.
+ */
+export function wayPastMissingNames(
+  folded: string,
+  watcher?: WayWatcher,
+): { real: string; rest: string[]; shut: boolean; passed: string[] } {
+  const passed: string[] = []
+  let onward = folded
+  while (passed.length <= MAX_LINKS) {
+    const { real, rest, notThere } = wayTo(onward, watcher)
+    const names = rest.filter(name => name !== '' && name !== '.')
+    const shut =
+      (notThere as NodeJS.ErrnoException | undefined)?.code === 'EACCES'
+    if (shut || names[1] !== '..') return { real, rest: names, shut, passed }
+    passed.push(`${real}/${names[0]}`)
+    onward = [real, ...names.slice(2)].join('/')
+  }
+  throw Object.assign(
+    new Error(
+      `ELOOP: '${folded}' goes up from too many names that are not there`,
+    ),
+    { code: 'ELOOP', path: folded },
+  )
 }

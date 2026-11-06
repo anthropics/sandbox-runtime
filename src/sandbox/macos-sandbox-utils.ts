@@ -12,6 +12,7 @@ import {
   encodeSandboxedCommand,
   decodeSandboxedCommand,
   containsGlobChars,
+  followLinks,
   isAtOrUnder,
   isStrictlyUnder as isPathStrictlyUnder,
   nameLocation,
@@ -362,14 +363,20 @@ interface ResolvedReadConfig {
  * links on the way resolved. A deny is resolved to its end. An allow is a
  * name, so its last component stays as written. Of a pattern, the directory
  * it starts from is what is resolved. The root is never a second spelling.
+ * `end` is the second spelling where the caller has walked there itself.
  */
-function inBothSpellings(kind: PathListKind, entry: PathEntry): PathEntry[] {
+function inBothSpellings(
+  kind: PathListKind,
+  entry: PathEntry,
+  end?: string,
+): PathEntry[] {
   const resolved = (p: string): string => pathSpellings(p)[1] ?? p
   const base = entryBaseDir(entry)
   const canonical =
-    kind === 'deny' || entry.glob
+    end ??
+    (kind === 'deny' || entry.glob
       ? resolved(base)
-      : nameLocation(base, resolved)
+      : nameLocation(base, resolved))
   // Nor among the devices: a rule on a name blanked with a link to /dev/null
   // would be one on /dev/null for every command.
   if (
@@ -998,12 +1005,20 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on
   // macOS). The caller's spellings are patterns when they read as patterns;
   // the mandatory entries carry their own literal/glob split.
-  const denyEntries = [
+  const walked = [
     ...(config.denyWithinAllow || []).map(toPathEntry),
     ...(config.literalDenyWithinAllow ?? []).map(toLiteralPathEntry),
     ...macGetMandatoryDenyEntries(allowGitConfig),
-  ]
-  denyEntries.push(...alsoReadAs(config.denyWithinAllow, 'deny'))
+    ...alsoReadAs(config.denyWithinAllow, 'deny'),
+  ].map(entry => ({ entry, ...followLinks(entryBaseDir(entry)) }))
+  // As written, and where the links on the way lead, there or not: that is the
+  // path Seatbelt compares a write through them with. Denied whole: a directory
+  // the walk could not look in, and a missing name the way goes up from.
+  const denyEntries = walked.flatMap(({ entry, end, unsearched, passed }) => [
+    ...inBothSpellings('deny', entry, end),
+    ...(unsearched === undefined ? [] : [unsearched]).map(toLiteralPathEntry),
+    ...passed.map(toLiteralPathEntry),
+  ])
 
   const { groups, rest: ungrouped } = groupLiteralDenyPaths(denyEntries)
   const groupFilters = groups.map(literalDenyGroupFilters)
@@ -1027,6 +1042,14 @@ function generateWriteRules(
     const { dir } = groups[index]
     for (const ancestorDir of [dir, ...getAncestorDirectories(dir)]) {
       moveFilters.add(`(literal ${escapePath(ancestorDir)})`)
+    }
+  }
+  // Each of those links stays where it lies, and each directory the way goes
+  // up from: whoever replaces one decides what the denied name leads to.
+  for (const stays of walked.flatMap(w => [...w.links.keys(), ...w.left])) {
+    if (isAtOrUnder(stays, '/dev')) continue
+    for (const kept of [stays, ...getAncestorDirectories(stays)]) {
+      moveFilters.add(`(literal ${escapePath(kept)})`)
     }
   }
   rules.push(
