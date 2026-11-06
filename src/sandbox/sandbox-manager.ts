@@ -2241,7 +2241,8 @@ function computeWindowsFsAccessSet(
     denyRead: expand(fs?.denyRead ?? [], { mode: 'deny' }),
     denyWrite: [
       ...expand(fs?.denyWrite ?? [], { mode: 'deny' }),
-      // Not for mxc: its only deny takes reads away too, `.git\config`'s with them.
+      // Not for mxc, which is handed a write deny as a full one: git could
+      // not read `.git\config`.
       ...(c.windows?.backend === 'mxc'
         ? []
         : windowsMandatoryDenyPaths(process.cwd(), allowWrite, {
@@ -2316,7 +2317,8 @@ function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
   // Keyed exactly on what {@link computeWindowsFsAccessSet} reads of
   // the config. The masked files are not session-wide: each wrap
   // denies the ones the session has not stamped. So with the mandatory
-  // denies, whose two settings each wrap reads anew.
+  // denies, whose two settings each wrap reads anew. `windows.backend` is
+  // the session's from initialize() on.
   // `network.allowedDomains` does NOT feed file-deny (only mask
   // injectHosts), so a network-only updateConfig hits the cache.
   return {

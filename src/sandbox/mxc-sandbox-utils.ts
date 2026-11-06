@@ -52,7 +52,8 @@
  *     grant beneath a deny outranks it). So the lists go as they are.
  *   - denyWrite: mapped into `deniedPaths` too, which over-denies
  *     (BaseContainer has no write-only deny, so reads on those paths
- *     are lost as well).
+ *     are lost as well). So the mandatory write denies are not sent:
+ *     git does not run without reading `.git\config`.
  *   - network: `egress.default: 'deny'`; with a proxy configured,
  *     `ingress.default: 'allow'` + `ingress.hostLoopback: 'allow'` and
  *     `runtimeConfig.networkProxy` naming the proxy port as the only

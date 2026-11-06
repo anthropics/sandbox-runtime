@@ -1081,6 +1081,7 @@ export const WindowsConfigSchema = z.object({
         'refuses a configuration the named backend cannot enforce; there ' +
         'is no fallback between backends. Under mxc, commands start with ' +
         'SandboxManager.spawnSandboxed() rather than wrapWithSandboxArgv(), ' +
+        'the mandatory deny paths are not blocked, ' +
         'and sandboxed programs can open windows on the desktop (UI is on ' +
         'so that ordinary tools start; clipboard and input injection stay ' +
         'blocked).',
