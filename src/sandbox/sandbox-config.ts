@@ -757,6 +757,32 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'macOS only: Additional XPC/Mach service names to allow looking up. Supports trailing-wildcard prefix matching (e.g., "2BUA8C4S2C.com.1password.*"). Needed for tools like 1Password CLI, Playwright, or the iOS Simulator that communicate via XPC.',
     ),
+  reachHostPorts: z
+    .array(
+      z
+        .number()
+        .int()
+        .min(1)
+        .max(65535)
+        .refine(port => port !== 3128 && port !== 1080, {
+          message:
+            'ports 3128 and 1080 are taken inside the sandbox by the proxy relays',
+        }),
+    )
+    .optional()
+    .describe(
+      'Linux only: TCP ports of services on the host loopback that ' +
+        'sandboxed commands may connect to directly. For each port, the ' +
+        'sandbox listens on 127.0.0.1:<port> and ::1:<port> inside its ' +
+        'network namespace and relays each connection to 127.0.0.1:<port> ' +
+        'on the host, so clients that ignore HTTP_PROXY/ALL_PROXY (database ' +
+        'clients, plain TCP) reach that one service and no other loopback ' +
+        'port. The connection does not go through the proxy, so ' +
+        'allowedDomains does not apply to it. A sandboxed process cannot ' +
+        'bind a listed port itself. Only takes effect when network ' +
+        'restrictions are on (allowedDomains is set). Ignored on macOS ' +
+        'and Windows.',
+    ),
   httpProxyPort: z
     .number()
     .int()
