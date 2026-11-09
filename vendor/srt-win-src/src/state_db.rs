@@ -166,6 +166,20 @@ CREATE TABLE IF NOT EXISTS profile_paths (
   kind           TEXT NOT NULL,
   created        INTEGER NOT NULL
 );
+-- Entries of the profile read grant being taken back: one row from
+-- before the first walk or change of kind until the whole tree has been
+-- checked. `kind` is what the path carried, `wanted` what it is to carry
+-- (NULL: nothing), and `class`/`reason` the last failure. Added without a
+-- schema version change, as above.
+CREATE TABLE IF NOT EXISTS profile_revokes (
+  canonical_path TEXT PRIMARY KEY,
+  file_id        BLOB NOT NULL,
+  kind           TEXT NOT NULL,
+  created        INTEGER NOT NULL,
+  wanted         TEXT,
+  class          TEXT NOT NULL,
+  reason         TEXT NOT NULL
+);
 "#;
 
 /// Outcome of a crash-recovery pass.
