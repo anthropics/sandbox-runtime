@@ -101,9 +101,13 @@ import {
   windowsGrantsBeneathDenies,
   windowsMandatoryDenyPaths,
   type WindowsProfileGrantItem,
+  type WindowsProfileGrantResult,
   type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
   getWindowsProfileReadStatusAsync,
+  grantWindowsProfileRead,
+  retryWindowsProfileStale,
+  windowsProfileGrantRefreshable,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
   type WindowsAclRevokeResult,
@@ -180,6 +184,7 @@ import {
 } from './resolved-address-guard.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { getJavaProxyAgentJarPathAsync } from './java-proxy-agent.js'
 import { getApplySeccompBinaryPathAsync } from './generate-seccomp-filter.js'
 
@@ -203,6 +208,15 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+// The initialize() in flight, from its first step: a profile grant refresh
+// can hold it for minutes before initializationPromise exists. reset()
+// moves the generation on, which cancels it.
+let pendingInitialize:
+  | { promise: Promise<void>; generation: number; args: unknown[] }
+  | undefined
+let initializeGeneration = 0
+// Kills the profile grant a refresh is running, at reset().
+let windowsProfileGrantAbort: AbortController | undefined
 let cleanupRegistered = false
 let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
@@ -295,6 +309,8 @@ let windowsProfileRead: 'granted' | 'absent' | undefined
 // Windows: what the session has to tell its user about the profile
 // read grant it runs on (getWindowsProfileReadWarnings).
 let windowsProfileReadWarnings: WindowsProfileReadWarning[] = []
+// Windows: what this initialize() found when it refreshed the grant.
+let windowsProfileReadRefresh: WindowsProfileGrantResult | undefined
 
 /** Something about the profile read grant that the user should be shown. */
 export interface WindowsProfileReadWarning {
@@ -400,10 +416,12 @@ export function windowsProfileReadWarningsOf(
       code: 'profile_stale_allow',
       message:
         `${grant.staleAllow.length} path(s) that have left the profile ` +
-        `read grant still carry an entry of it that could not be removed, ` +
-        `and are readable to sandboxed commands through it: ` +
+        `read grant may still carry an entry of it that could not be ` +
+        `removed, and stay readable to sandboxed commands until it is: ` +
         `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
-        `path's reason gives the icacls command that removes the entry.`,
+        `path's reason says what stopped it. A session start tries local ` +
+        `paths again, at most every six hours; with every sandbox session ` +
+        `closed, \`srt-win profile retry-stale\` tries them all now.`,
       paths: grant.staleAllow,
     })
   }
@@ -1130,6 +1148,21 @@ async function startMuxProxyServer(
 // ============================================================================
 
 /**
+ * A second {@link initialize} while one is in flight asked for something
+ * else: its configuration or callbacks would not have been applied.
+ */
+export class SandboxInitializeConflictError extends Error {
+  readonly code = 'initialize_conflict'
+  constructor() {
+    super(
+      'initialize() is already running with a different configuration or ' +
+        'different callbacks: wait for it, or reset() first',
+    )
+    this.name = 'SandboxInitializeConflictError'
+  }
+}
+
+/**
  * Options of {@link initialize} that are the embedding program's to
  * set, not part of the configuration a user writes.
  */
@@ -1139,6 +1172,12 @@ export interface SandboxInitializeOptions {
    * Never applies to a write root or to a path above an exclusion.
    */
   dangerouslyAllowReadOfProfileExclusions?: readonly string[]
+  /**
+   * Windows: called with each progress line while initialize() narrows
+   * an older profile read grant, which can take minutes. Show the user
+   * why the session has not started yet.
+   */
+  onWindowsProfileGrantProgress?: (line: string) => void
 }
 
 async function initialize(
@@ -1146,6 +1185,49 @@ async function initialize(
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
   options?: SandboxInitializeOptions,
+): Promise<void> {
+  const args = [runtimeConfig, sandboxAskCallback, enableLogMonitor, options]
+  if (pendingInitialize) {
+    const { promise, generation, args: running } = pendingInitialize
+    if (generation === initializeGeneration) {
+      // Functions compare by identity, the rest by value.
+      if (!isDeepStrictEqual(args, running)) {
+        throw new SandboxInitializeConflictError()
+      }
+      return promise
+    }
+    // A reset() cancelled that run: this one starts once it has stopped.
+    await promise.catch(() => {})
+    return initialize(
+      runtimeConfig,
+      sandboxAskCallback,
+      enableLogMonitor,
+      options,
+    )
+  }
+  const entry = {
+    promise: initializeOnce(
+      runtimeConfig,
+      sandboxAskCallback,
+      enableLogMonitor,
+      options,
+    ),
+    generation: initializeGeneration,
+    args,
+  }
+  pendingInitialize = entry
+  try {
+    await entry.promise
+  } finally {
+    if (pendingInitialize === entry) pendingInitialize = undefined
+  }
+}
+
+async function initializeOnce(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  enableLogMonitor: boolean,
+  options: SandboxInitializeOptions | undefined,
 ): Promise<void> {
   try {
     await initializeSteps(
@@ -1173,6 +1255,14 @@ async function initializeSteps(
   if (initializationPromise) {
     await initializationPromise
     return
+  }
+  const generation = initializeGeneration
+  // After every await below: a reset() meanwhile means no session starts.
+  const stopIfReset = (): void => {
+    if (generation !== initializeGeneration) {
+      config = undefined
+      throw new Error('initialize() was cancelled by reset()')
+    }
   }
 
   // Store config for use by other functions
@@ -1232,6 +1322,7 @@ async function initializeSteps(
 
   // Check dependencies
   const deps = await checkDependenciesAsync()
+  stopIfReset()
   if (deps.errors.length > 0) {
     if (deps.reinstallRequired) {
       throw new WindowsSandboxError(
@@ -1378,6 +1469,7 @@ async function initializeSteps(
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
     const u = await getWindowsSandboxUserStatusAsync({ srtWin })
+    stopIfReset()
     if (!u.provisioned || !u.credPresent) {
       config = undefined
       throw new WindowsSandboxError(
@@ -1399,8 +1491,10 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
-    // initialize() never writes or refreshes the profile read grant.
+    // initialize() writes the profile read grant only to narrow one
+    // already there (windowsProfileGrantRefreshable).
     windowsProfileReadWarnings = []
+    windowsProfileReadRefresh = undefined
     let profileRead: 'granted' | 'absent' = 'absent'
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
@@ -1413,7 +1507,65 @@ async function initializeSteps(
       }
       windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
       if (u.profileGrant) {
-        const grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        let grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        stopIfReset()
+        let refreshed: WindowsProfileGrantResult | undefined
+        // Before this session is a holder of anything: the grant is
+        // written only while no session or command holds it. A run that
+        // does not finish throws; one that finishes with paths it could
+        // not revoke starts the session, and they are warned about.
+        if (windowsProfileGrantRefreshable(grant)) {
+          logForDebugging(
+            `[Sandbox Windows] refreshing the profile read grant ` +
+              `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''})`,
+          )
+          windowsProfileGrantAbort = new AbortController()
+          try {
+            refreshed = await grantWindowsProfileRead({
+              srtWin,
+              signal: windowsProfileGrantAbort.signal,
+              onProgress: line => {
+                logForDebugging(`[Sandbox Windows] ${line}`)
+                // The host's code, called from a stream handler.
+                try {
+                  options?.onWindowsProfileGrantProgress?.(line)
+                } catch (e) {
+                  logForDebugging(
+                    `[Sandbox Windows] progress callback threw: ${e}`,
+                    { level: 'warn' },
+                  )
+                }
+              },
+            })
+          } catch (e) {
+            stopIfReset()
+            throw e
+          } finally {
+            windowsProfileGrantAbort = undefined
+          }
+          stopIfReset()
+          grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        } else if (
+          grant.state === 'current' &&
+          (grant.staleAllow.length > 0 ||
+            grant.unprotected.some(u => u.entry !== undefined))
+        ) {
+          // Bounded, on the noted paths alone, and never a reason not to
+          // start.
+          try {
+            const { cleared } = await retryWindowsProfileStale({ srtWin })
+            if (cleared > 0) {
+              grant = await getWindowsProfileReadStatusAsync({ srtWin })
+            }
+          } catch (e) {
+            logForDebugging(
+              `[Sandbox Windows] retrying stale profile entries: ${e}`,
+              { level: 'warn' },
+            )
+          }
+        }
+        stopIfReset()
+        windowsProfileReadRefresh = refreshed
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
             'profile_grant_outdated',
@@ -1424,7 +1576,7 @@ async function initializeSteps(
               `user who starts sessions to bring it up to date, or ` +
               `forgetWindowsProfileRead() (\`srt-win profile forget\`) to ` +
               `run without reading the profile. initialize() does neither ` +
-              `itself.`,
+              `itself for a grant in this state.`,
           )
         }
         if (grant.state === 'current') {
@@ -1467,6 +1619,7 @@ async function initializeSteps(
     if (useWindowsPersistentCa && tlsTerminate) {
       try {
         const p = await ensurePersistentWindowsCa({ status: u, srtWin })
+        stopIfReset()
         mitmCA = createMitmCA({
           caCertPem: p.certPem,
           caKeyPem: p.keyPem,
@@ -1577,6 +1730,7 @@ async function initializeSteps(
         allowProfileExclusions: override,
         srtWin,
       })
+      stopIfReset()
       // Gates running revoke/restore at reset(): every session is
       // recorded with srt-win, whatever it was given. Set before the
       // probe, so that a reset() during it releases what was granted.
@@ -1608,6 +1762,7 @@ async function initializeSteps(
           sandboxUser: runtimeConfig.windows?.sandboxUser,
           srtWin,
         })
+        stopIfReset()
         windowsWfpVerifiedFor = sb
         windowsWfpVerifiedLoopback = allowLoopback
       }
@@ -1657,6 +1812,7 @@ async function initializeSteps(
       const muxPort = needLocalProxy
         ? await startMuxProxyServer(sandboxAskCallback, portRange)
         : undefined
+      stopIfReset()
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
       // JVMs read neither HTTPS_PROXY nor its credential; the agent bridges
@@ -1667,6 +1823,7 @@ async function initializeSteps(
           config.javaAgentJarPath,
           hostWritablePlaces(),
         )) ?? undefined
+      stopIfReset()
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1695,6 +1852,7 @@ async function initializeSteps(
           config.socatPath,
           hostWritablePlaces(),
         )
+        stopIfReset()
       }
 
       const context: HostNetworkManagerContext = {
@@ -1709,7 +1867,9 @@ async function initializeSteps(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
-      reset().catch(e => {
+      // Awaited: an initialize() queued behind this one must not start
+      // until this clean-up has finished clearing what it shares.
+      await reset().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
         })
@@ -3675,6 +3835,8 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  initializeGeneration++
+  windowsProfileGrantAbort?.abort()
   // Windows: release this session's sandbox-user ACEs. Best-effort:
   // log anomalies rather than throw, so teardown always completes.
   // Persistent write roots and the denies under them are not released.
@@ -3693,6 +3855,7 @@ async function reset(): Promise<void> {
   srtWinSpawn = undefined
   windowsProfileRead = undefined
   windowsProfileReadWarnings = []
+  windowsProfileReadRefresh = undefined
   windowsCapableSrtWin.clear()
   // MXC applies policy per spawn and leaves no host state behind, so
   // there is no ACL/user state to unwind: only the loaded SDK and the
@@ -4053,6 +4216,8 @@ export interface ISandboxManager {
    * entries that could not be removed. None of them is a rejection.
    */
   getWindowsProfileReadWarnings(): WindowsProfileReadWarning[]
+  /** What this `initialize()` found if it refreshed the profile read grant. */
+  getWindowsProfileReadRefresh(): WindowsProfileGrantResult | undefined
   getSentinelRegistry(): SentinelRegistry
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
@@ -4101,6 +4266,7 @@ export const SandboxManager: ISandboxManager = {
   getMitmCA: () => mitmCA,
   getWindowsProfileRead: () => windowsProfileRead,
   getWindowsProfileReadWarnings: () => [...windowsProfileReadWarnings],
+  getWindowsProfileReadRefresh: () => windowsProfileReadRefresh,
   getSentinelRegistry: () => sentinelRegistry,
   getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,
