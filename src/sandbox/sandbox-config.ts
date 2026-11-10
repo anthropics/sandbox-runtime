@@ -4,7 +4,6 @@
  */
 
 import type { FilterRequestCallback } from './request-filter.js'
-import type { MxcSdk } from './mxc-sandbox-utils.js'
 
 import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
 // The 'zod/v3' subpath, not bare 'zod': it exists from zod 3.25 on and is the
@@ -1085,24 +1084,6 @@ export const WindowsConfigSchema = z.object({
         'and sandboxed programs can open windows on the desktop (UI is on ' +
         'so that ordinary tools start; clipboard and input injection stay ' +
         'blocked).',
-    ),
-  sdk: z
-    .custom<MxcSdk>(
-      v => {
-        const sdk = v as Partial<MxcSdk> | undefined
-        return (
-          typeof sdk?.probe === 'function' && typeof sdk.spawn === 'function'
-        )
-      },
-      { message: 'windows.sdk must have probe() and spawn() functions' },
-    )
-    .optional()
-    .describe(
-      'For embedders that bundle the MXC SDK: an object with its probe() ' +
-        'and spawn(). When set, the windows.backend mxc path uses it and ' +
-        'does not resolve @microsoft/mxc-sdk. Read by initialize(); ' +
-        'updateConfig() does not change the SDK of a running session. Holds ' +
-        'functions, so a configuration file cannot carry it.',
     ),
   sandboxUser: z
     .string()

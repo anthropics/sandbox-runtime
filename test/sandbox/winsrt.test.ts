@@ -2213,18 +2213,19 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       spies.push(load, installed)
       return { load, installed }
     }
-    const withSdk = (sdk: ReturnType<typeof injected>) => {
+    const mxcConfig = () => {
       const base = configOf({})
-      return {
-        ...base,
-        windows: { ...base.windows, backend: 'mxc' as const, sdk },
-      }
+      return { ...base, windows: { ...base.windows, backend: 'mxc' as const } }
     }
+    const start = (sdk: MxcSdk, config = mxcConfig()) =>
+      SandboxManager.initialize(config, undefined, false, {
+        windowsMxcSdk: sdk,
+      })
 
     it('is probed and spawned through, and the package is never loaded', async () => {
       const { load, installed } = packageSpies()
       const sdk = injected()
-      await SandboxManager.initialize(withSdk(sdk))
+      await start(sdk)
       expect(SandboxManager.getWindowsBackend?.()).toEqual({ backend: 'mxc' })
       expect(sdk.probe).toHaveBeenCalled()
       await SandboxManager.spawnSandboxed!('exit 0')
@@ -2237,23 +2238,16 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       const sdk = injected()
       sdk.probe.mockReturnValue({ ...fullProbe(), tier: 'app-container' })
       // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(
-        SandboxManager.initialize(withSdk(sdk)),
-      ).rejects.toMatchObject({ code: 'backend_unsupported' })
+      await expect(start(sdk)).rejects.toMatchObject({
+        code: 'backend_unsupported',
+      })
       expect(sdk.spawn).not.toHaveBeenCalled()
     })
 
     it('two concurrent initialize() calls with the same SDK share one run', async () => {
       const sdk = injected()
-      const config = withSdk(sdk)
-      const again = {
-        ...config,
-        windows: { ...config.windows, sdk: { ...sdk } },
-      }
-      await Promise.all([
-        SandboxManager.initialize(config),
-        SandboxManager.initialize(again),
-      ])
+      const config = mxcConfig()
+      await Promise.all([start(sdk, config), start({ ...sdk }, config)])
       expect(SandboxManager.getWindowsBackend?.()).toEqual({ backend: 'mxc' })
       expect(sdk.probe).toHaveBeenCalledTimes(1)
     })
@@ -2261,20 +2255,12 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     it('keeps working after updateConfig, and meets the dependency check', async () => {
       const { installed } = packageSpies()
       installed.mockReturnValue(false)
-      const sdk = injected()
-      const config = withSdk(sdk)
-      await SandboxManager.initialize(config)
+      const config = mxcConfig()
+      await start(injected(), config)
       SandboxManager.updateConfig(config)
-      expect(SandboxManager.getConfig()?.windows?.sdk).toBe(sdk)
       const none = { errors: [], warnings: [] }
       expect(SandboxManager.checkDependencies()).toEqual(none)
       expect(await SandboxManager.checkDependenciesAsync!()).toEqual(none)
-      // An update that leaves the SDK out does not unmake the session's.
-      SandboxManager.updateConfig({
-        ...config,
-        windows: { backend: 'mxc' },
-      })
-      expect(SandboxManager.checkDependencies()).toEqual(none)
     })
 
     it('meets the dependency check before initialize(), when named', async () => {
@@ -2294,20 +2280,12 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
 
     it('is refused when it lacks probe() or spawn(), with no fallback', async () => {
       const { load } = packageSpies()
-      const base = configOf({})
       // eslint-disable-next-line @typescript-eslint/await-thenable
       await expect(
-        SandboxManager.initialize({
-          ...base,
-          windows: {
-            ...base.windows,
-            backend: 'mxc',
-            sdk: { probe: fullProbe } as unknown as MxcSdk,
-          },
-        }),
+        start({ probe: fullProbe } as unknown as MxcSdk),
       ).rejects.toMatchObject({
         code: 'backend_unsupported',
-        message: expect.stringContaining('windows.sdk'),
+        message: expect.stringContaining('windowsMxcSdk'),
       })
       expect(load).not.toHaveBeenCalled()
     })

@@ -220,7 +220,7 @@ export async function resolveMxcSdk(
   if (typeof probe !== 'function' || typeof spawn !== 'function') {
     throw new WindowsSandboxError(
       'backend_unsupported',
-      `windows.backend is 'mxc' but windows.sdk does not have probe() and spawn()`,
+      `windows.backend is 'mxc' but windowsMxcSdk does not have probe() and spawn()`,
     )
   }
   // The two functions, bound, so a later change to the caller's object

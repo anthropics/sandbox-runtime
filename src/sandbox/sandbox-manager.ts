@@ -1159,6 +1159,12 @@ export interface SandboxInitializeOptions {
    * why the session has not started yet.
    */
   onWindowsProfileGrantProgress?: (line: string) => void
+  /**
+   * Windows, `windows.backend: 'mxc'`: for embedders that bundle the MXC
+   * SDK, an object with its `probe()` and `spawn()`. The session uses it,
+   * and `@microsoft/mxc-sdk` is not resolved.
+   */
+  windowsMxcSdk?: MxcSdk
 }
 
 async function initialize(
@@ -1279,7 +1285,7 @@ async function initializeSteps(
       )
     }
     assertMxcSessionConfig(runtimeConfig)
-    mxcSdk = await resolveMxcSdk(runtimeConfig.windows?.sdk)
+    mxcSdk = await resolveMxcSdk(options?.windowsMxcSdk)
   }
   // Before any CA, proxy or sandbox is set up: a runtime that cannot
   // terminate TLS in-process fails here, not on each tunnel.
@@ -1955,9 +1961,9 @@ export interface CheckDependenciesOptions {
    */
   windowsBackend?: 'mxc' | 'srt-win'
   /**
-   * The SDK that will be passed as `windows.sdk`, when checking before
-   * initialize() with `windowsBackend: 'mxc'`. With one, the mxc check
-   * does not look for the package.
+   * The SDK that will be passed to initialize() as `windowsMxcSdk`, when
+   * checking before initialize() with `windowsBackend: 'mxc'`. With one,
+   * the mxc check does not look for the package.
    */
   windowsMxcSdk?: MxcSdk
 }
@@ -3524,19 +3530,11 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   // previous config fully in effect.
   const nextGuard = createResolvedAddressGuard(newConfig.network)
   // Deep clone the config to avoid mutations. structuredClone cannot clone
-  // functions, so pull filterRequest and windows.sdk out, clone the rest,
-  // and put them back as given.
+  // functions, so pull filterRequest out, clone the rest, and put it back —
+  // a function reference is immutable in the sense that matters here.
   const { filterRequest, ...rest } = newConfig.network
-  const windowsSdk = newConfig.windows?.sdk
-  const windowsRest = newConfig.windows && { ...newConfig.windows }
-  if (windowsRest) delete windowsRest.sdk
-  config = structuredClone({
-    ...newConfig,
-    network: rest,
-    ...(windowsRest && { windows: windowsRest }),
-  })
+  config = structuredClone({ ...newConfig, network: rest })
   config.network.filterRequest = filterRequest
-  if (config.windows && windowsSdk) config.windows.sdk = windowsSdk
   configInstalls++
   resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
