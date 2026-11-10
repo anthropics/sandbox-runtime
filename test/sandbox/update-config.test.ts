@@ -1445,6 +1445,24 @@ describe('SandboxManager.updateConfig', () => {
       filterRequest,
     )
   })
+
+  it('preserves windows.sdk across updateConfig, and leaves the object given as it was', () => {
+    const sdk = {
+      probe: () => {
+        throw new Error('not called')
+      },
+      spawn: () => Promise.reject(new Error('not called')),
+    }
+    const windows = { backend: 'mxc' as const, sdk }
+    SandboxManager.updateConfig({
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      windows,
+    })
+    expect(SandboxManager.getConfig()?.windows).toEqual(windows)
+    expect(SandboxManager.getConfig()?.windows?.sdk).toBe(sdk)
+    expect(windows.sdk).toBe(sdk)
+  })
 })
 
 describe('SandboxManager.updateConfig proxy filtering', () => {

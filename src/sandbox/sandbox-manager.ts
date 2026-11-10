@@ -111,7 +111,7 @@ import {
 } from './windows-sandbox-utils.js'
 import {
   isMxcSdkInstalled,
-  loadMxcSdk,
+  resolveMxcSdk,
   verifyMxcBackend,
   buildMxcRequest,
   spawnMxcRequest,
@@ -1279,7 +1279,7 @@ async function initializeSteps(
       )
     }
     assertMxcSessionConfig(runtimeConfig)
-    mxcSdk = await loadMxcSdk()
+    mxcSdk = await resolveMxcSdk(runtimeConfig.windows?.sdk)
   }
   // Before any CA, proxy or sandbox is set up: a runtime that cannot
   // terminate TLS in-process fails here, not on each tunnel.
@@ -1302,7 +1302,9 @@ async function initializeSteps(
       : undefined
 
   // Check dependencies
-  const deps = await checkDependenciesAsync()
+  const deps = await checkDependenciesAsync(undefined, {
+    windowsMxcSdk: mxcSdk,
+  })
   stopIfReset()
   if (deps.errors.length > 0) {
     if (deps.reinstallRequired) {
@@ -1952,12 +1954,19 @@ export interface CheckDependenciesOptions {
    * before initialize().
    */
   windowsBackend?: 'mxc' | 'srt-win'
+  /**
+   * The SDK that will be passed as `windows.sdk`, when checking before
+   * initialize() with `windowsBackend: 'mxc'`. With one, the mxc check
+   * does not look for the package.
+   */
+  windowsMxcSdk?: MxcSdk
 }
 
 /**
  * The mxc backend needs neither srt-win.exe nor the WFP/user install,
- * only the SDK package. Whether the host can run it is settled by
- * initialize()'s probe. undefined when the srt-win check applies.
+ * only the SDK, injected or as the package. Whether the host can run
+ * it is settled by initialize()'s probe. undefined when the srt-win
+ * check applies.
  */
 function mxcDependencies(
   options: CheckDependenciesOptions | undefined,
@@ -1965,7 +1974,10 @@ function mxcDependencies(
   const backend = options?.windowsBackend ?? config?.windows?.backend
   if (backend !== 'mxc' || getPlatform() !== 'windows') return undefined
   return {
-    errors: isMxcSdkInstalled() ? [] : [MXC_SDK_MISSING],
+    errors:
+      options?.windowsMxcSdk || windowsMxcState || isMxcSdkInstalled()
+        ? []
+        : [MXC_SDK_MISSING],
     warnings: [],
   }
 }
@@ -3512,11 +3524,19 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   // previous config fully in effect.
   const nextGuard = createResolvedAddressGuard(newConfig.network)
   // Deep clone the config to avoid mutations. structuredClone cannot clone
-  // functions, so pull filterRequest out, clone the rest, and put it back —
-  // a function reference is immutable in the sense that matters here.
+  // functions, so pull filterRequest and windows.sdk out, clone the rest,
+  // and put them back as given.
   const { filterRequest, ...rest } = newConfig.network
-  config = structuredClone({ ...newConfig, network: rest })
+  const windowsSdk = newConfig.windows?.sdk
+  const windowsRest = newConfig.windows && { ...newConfig.windows }
+  if (windowsRest) delete windowsRest.sdk
+  config = structuredClone({
+    ...newConfig,
+    network: rest,
+    ...(windowsRest && { windows: windowsRest }),
+  })
   config.network.filterRequest = filterRequest
+  if (config.windows && windowsSdk) config.windows.sdk = windowsSdk
   configInstalls++
   resolvedAddressGuard = nextGuard
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
