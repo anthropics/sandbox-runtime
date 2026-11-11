@@ -229,9 +229,8 @@ jobs:
           # where the proxy listens on 127.0.0.1. The floor itself is run by
           # the package check in release.yml.
           #
-          # Windows runs 24: @microsoft/mxc-sdk declares Node >=24, and
-          # npm leaves an optional dependency out when its engines do not
-          # match, so on 22 the MXC SDK is never installed.
+          # Windows runs 24: @microsoft/mxc-sdk, which the MXC host
+          # diagnostics step installs, declares Node >=24.
           node-version: ${{ matrix.os == 'windows' && '24' || '22' }}
 
       - name: Setup Bun
@@ -386,6 +385,7 @@ jobs:
             }
           }
           if (-not (Test-Path node_modules)) { npm ci }
+          npm install --no-save @microsoft/mxc-sdk@^1.0.1
           "MXC SDK probe:"
           node -e "import('@microsoft/mxc-sdk/v1').then(s => console.log(JSON.stringify(s.probe(), null, 1)), e => console.log('not available: ' + e.message))"
 

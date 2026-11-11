@@ -76,6 +76,7 @@ import {
 import {
   coveringWindowsPath,
   envListToObject,
+  mergeWindowsEnv,
   parseWindowsBinShell,
   WindowsSandboxError,
 } from './windows-sandbox-utils.js'
@@ -85,7 +86,7 @@ const MXC_PKG = '@microsoft/mxc-sdk'
 const MXC_V1 = `${MXC_PKG}/v1`
 
 // ────────────────────────────────────────────────────────────────────────
-// The SDK surface srt uses. `@microsoft/mxc-sdk` is an optional
+// The SDK surface srt uses. `@microsoft/mxc-sdk` is an optional peer
 // dependency that only installs on Node 24+, so srt cannot compile
 // against its types; these mirror the subset of `@microsoft/mxc-sdk/v1`
 // (`ContainerRequest`, `ProbeOutput`, `MxcProcess`) srt reads and
@@ -172,7 +173,7 @@ export function isMxcSdkInstalled(): boolean {
 }
 
 /** Why `windows.backend: 'mxc'` cannot load the SDK. */
-export const MXC_SDK_MISSING = `${MXC_PKG} is not installed (it needs Node 24 or later)`
+export const MXC_SDK_MISSING = `${MXC_PKG} is not installed (install it on Node 24 or later, or pass windowsMxcSdk to initialize())`
 
 /**
  * Load `@microsoft/mxc-sdk/v1`.
@@ -426,6 +427,8 @@ export interface MxcSandboxParams {
   gitSafeDirectories?: readonly string[]
   binShell?: WindowsBinShell
   timeoutMs?: number
+  /** The caller's variables for the child, laid over every other layer. */
+  env?: Readonly<Record<string, string>>
 }
 
 /** Compile srt semantics into an SDK v1 container request. */
@@ -570,7 +573,10 @@ const CHILD_BASE_ENV_VARS = [
  * The child's environment. Precedence matches srt-win: host base vars,
  * then mask sentinels, then the generated proxy set (so a caller
  * masking HTTPS_PROXY cannot break the sandbox's own plumbing), then
- * GIT_CONFIG_* last so its COUNT composition wins.
+ * GIT_CONFIG_* last so its COUNT composition wins, then the caller's
+ * `env` over all of it, as the `--env` pairs a caller adds after
+ * srt-win's own are. The caller keeps sandbox-runtime's names (PATH,
+ * the proxy variables, GIT_CONFIG_*) and masked names off it.
  */
 function buildChildEnv(
   p: MxcSandboxParams,
@@ -594,16 +600,20 @@ function buildChildEnv(
     schannelCa: false,
     baseEnv: p.setEnvVars,
   })
-  const merged: Record<string, string> = {}
+  const base: Record<string, string> = {}
   for (const k of CHILD_BASE_ENV_VARS) {
     const v = process.env[k]
-    if (v !== undefined) merged[k] = v
+    if (v !== undefined) base[k] = v
   }
-  const layers = [p.setEnvVars ?? {}, envListToObject(envList), gitCfg]
-  for (const layer of layers) {
-    for (const [k, v] of Object.entries(layer)) {
-      if (v !== undefined) merged[k] = v
-    }
-  }
-  return merged
+  // Node's built-in clients read the proxy variables only with
+  // NODE_USE_ENV_PROXY set, as srt-win sets it; first, so a caller's
+  // value wins.
+  return mergeWindowsEnv(
+    base,
+    p.httpProxyPort ? { NODE_USE_ENV_PROXY: '1' } : {},
+    p.setEnvVars ?? {},
+    envListToObject(envList),
+    gitCfg,
+    p.env ?? {},
+  ) as Record<string, string>
 }

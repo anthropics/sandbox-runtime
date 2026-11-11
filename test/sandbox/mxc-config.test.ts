@@ -161,7 +161,7 @@ describe('MXC SDK request', () => {
         networkProxy: `http://${user}:tok@127.0.0.1:48123`,
       },
     })
-    expect(req.environment.HTTPS_PROXY).toBe(
+    expect(req.environment.https_proxy).toBe(
       `http://${user}:tok@localhost:48123`,
     )
     expect(req.environment).not.toHaveProperty('NO_PROXY')
@@ -216,6 +216,40 @@ describe('MXC SDK request', () => {
       'C:\\work\\out\\keep',
     ])
     expect(req.timeoutMs).toBe(5000)
+  })
+
+  it("lays the caller's env over every other layer", () => {
+    const req = buildMxcRequest({
+      command: 'exit 0',
+      httpProxyPort: 48123,
+      setEnvVars: { MASKED: 'sentinel' },
+      env: { MASKED: 'caller', CALLER_ONLY: '1', NODE_USE_ENV_PROXY: '0' },
+    })
+    expect(req.environment.MASKED).toBe('caller')
+    expect(req.environment.CALLER_ONLY).toBe('1')
+    expect(req.environment.NODE_USE_ENV_PROXY).toBe('0')
+  })
+
+  it('gives each name one spelling, as Windows reads names', () => {
+    const req = buildMxcRequest({
+      command: 'exit 0',
+      setEnvVars: { Masked: 'sentinel' },
+      env: { MASKED: 'caller' },
+    })
+    expect(
+      Object.keys(req.environment).filter(k => k.toUpperCase() === 'MASKED'),
+    ).toEqual(['MASKED'])
+    expect(req.environment.MASKED).toBe('caller')
+  })
+
+  it('sets NODE_USE_ENV_PROXY only when there is a proxy', () => {
+    expect(
+      buildMxcRequest({ command: 'exit 0', httpProxyPort: 48123 }).environment
+        .NODE_USE_ENV_PROXY,
+    ).toBe('1')
+    expect(
+      buildMxcRequest({ command: 'exit 0' }).environment,
+    ).not.toHaveProperty('NODE_USE_ENV_PROXY')
   })
 
   it('does not pass the host environment through', () => {
