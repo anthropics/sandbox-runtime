@@ -3333,6 +3333,13 @@ export interface SpawnSandboxedOptions {
   commandId?: string
   /** As for `wrapWithSandboxArgv`: see {@link WrapWithSandboxOptions}. */
   commandText?: string
+  /**
+   * Variables for the command, laid over the environment the backend
+   * builds for it (the host's base variables, the proxy settings, git's
+   * config), as the `--env` pairs a caller adds to an srt-win argv are.
+   * The command inherits nothing else of this process's environment.
+   */
+  env?: Readonly<Record<string, string>>
 }
 
 /**
@@ -3465,6 +3472,7 @@ async function spawnSandboxed(
     gitSafeDirectories: getGitSafeDirectories(customConfig),
     binShell: parseWindowsBinShell(options.binShell),
     timeoutMs: options.timeoutMs,
+    env: options.env,
   })
   return sandboxedProcessOf(await spawnMxcRequest(st.sdk, request))
 }

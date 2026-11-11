@@ -2101,6 +2101,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
     const credentials = { files: [{ path: token, mode: 'mask' as const }] }
     const missing = join(d, 'not-yet-created')
     await SandboxManager.spawnSandboxed!('rem', {
+      env: { SRT_CALLER_VAR: '1' },
       customConfig: {
         credentials,
         filesystem: { denyRead: [missing], allowWrite: [], denyWrite: [] },
@@ -2119,6 +2120,8 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       },
     })
     expect(spawned).toHaveLength(2)
+    expect(spawned[0].environment.SRT_CALLER_VAR).toBe('1')
+    expect(spawned[1].environment).not.toHaveProperty('SRT_CALLER_VAR')
     expect(spawned[0].filesystem.deniedPaths).toContain(token)
     // A missing literal deny is kept, not dropped.
     expect(spawned[0].filesystem.deniedPaths).toContain(missing)
