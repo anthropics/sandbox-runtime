@@ -136,7 +136,7 @@ describe.if(isSupportedPlatform)(
     async function runSandboxed(
       command: string,
       ripgrepArgs: string[] = [],
-    ): Promise<{ success: boolean; stderr: string }> {
+    ): Promise<{ success: boolean; stdout: string; stderr: string }> {
       const platform = getPlatform()
 
       // Allow writes to current directory, but mandatory denies should still block dangerous files
@@ -171,6 +171,7 @@ describe.if(isSupportedPlatform)(
 
       return {
         success: result.status === 0,
+        stdout: result.stdout || '',
         stderr: result.stderr || '',
       }
     }
@@ -178,8 +179,11 @@ describe.if(isSupportedPlatform)(
     describe('Dangerous files should be blocked', () => {
       for (const name of DANGEROUS_FILES) {
         it(`blocks writes to ${name}`, async () => {
-          const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
+          const result = await runSandboxed(
+            `echo ran; echo '${MODIFIED_CONTENT}' > '${name}'`,
+          )
 
+          expect(result.stdout).toBe('ran\n')
           expect(result.success).toBe(false)
           expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
         })

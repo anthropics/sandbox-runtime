@@ -700,7 +700,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         )
 
         const startTime = Date.now()
-        await spawnAsync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -708,21 +708,17 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         })
         const endTime = Date.now()
 
+        // A sandbox that never started cannot demonstrate child cleanup.
+        expect(result.status).toBe(0)
+        expect(existsSync(markerFile)).toBe(true)
+        const content = readFileSync(markerFile, 'utf8')
+        expect(content).toContain('alive')
+
         // Wait a bit to ensure background process would continue if not killed
         await new Promise(resolve => setTimeout(resolve, 2000))
 
-        if (existsSync(markerFile)) {
-          const content = readFileSync(markerFile, 'utf8')
-          const lines = content.trim().split('\n').length
-
-          // Should have ~4 lines (2 seconds / 0.5s each), not 10+ (if process continued for 5s)
-          expect(lines).toBeLessThan(10)
-
-          unlinkSync(markerFile)
-        } else {
-          // If file doesn't exist, that's also fine - process was killed
-          expect(true).toBe(true)
-        }
+        expect(readFileSync(markerFile, 'utf8')).toBe(content)
+        unlinkSync(markerFile)
 
         // Verify total execution was ~2 seconds, not hanging
         expect(endTime - startTime).toBeLessThan(4000)
@@ -759,21 +755,15 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         // timeout returns 124 when it kills the process
         expect(result.status).toBe(124)
 
+        expect(existsSync(markerFile)).toBe(true)
+        const content = readFileSync(markerFile, 'utf8')
+        expect(content).toContain('tick ')
+
         // Wait a bit to let any orphaned processes continue (if they weren't killed)
         await new Promise(resolve => setTimeout(resolve, 1500))
 
-        // Check how many ticks were written
-        if (existsSync(markerFile)) {
-          const content = readFileSync(markerFile, 'utf8')
-          const lines = content.trim().split('\n').length
-
-          // With 1 second timeout and 0.2s per tick, we expect ~5 ticks
-          // If child survived, we'd see 5 + 7 (1.5s more) = 12+ ticks
-          // Allow some margin for timing variance
-          expect(lines).toBeLessThan(10)
-
-          unlinkSync(markerFile)
-        }
+        expect(readFileSync(markerFile, 'utf8')).toBe(content)
+        unlinkSync(markerFile)
       })
 
       it('should not leave orphan processes after timeout kills sandbox', async () => {
@@ -792,14 +782,25 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         )
 
         // Kill after 0.5 seconds
-        await spawnAsync('timeout', ['0.5', 'bash', '-c', command], {
-          encoding: 'utf8',
-          cwd: TEST_DIR,
-          timeout: 3000,
-        })
+        const result = await spawnAsync(
+          'timeout',
+          ['0.5', 'bash', '-c', command],
+          {
+            encoding: 'utf8',
+            cwd: TEST_DIR,
+            timeout: 3000,
+          },
+        )
+
+        expect(result.status).toBe(124)
+        expect(existsSync(markerFile)).toBe(true)
+        const content = readFileSync(markerFile, 'utf8')
+        expect(content).toContain(uniqueMarker)
 
         // Wait to see if any orphan continues
         await new Promise(resolve => setTimeout(resolve, 1500))
+
+        expect(readFileSync(markerFile, 'utf8')).toBe(content)
 
         // Check for orphan processes with our marker
         const psResult = await spawnAsync(
