@@ -140,7 +140,14 @@ export type {
 
 // Windows MXC BaseContainer backend, named by `windows.backend`:
 // commands start through SandboxManager.spawnSandboxed().
-export type { WindowsBackendSelection } from './sandbox/mxc-sandbox-utils.js'
+export type {
+  MxcProbeOutput,
+  MxcProcessHandle,
+  MxcRequest,
+  MxcSdk,
+  MxcUiCapabilities,
+  WindowsBackendSelection,
+} from './sandbox/mxc-sandbox-utils.js'
 export type {
   CheckDependenciesOptions,
   SandboxedProcess,

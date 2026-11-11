@@ -999,7 +999,7 @@ The cross-platform `filesystem` and `network` blocks apply as described above. W
 
 ### MXC backend (experimental)
 
-`windows.backend: 'mxc'` runs commands in an MXC BaseContainer through the [`@microsoft/mxc-sdk`](https://www.npmjs.com/package/@microsoft/mxc-sdk) package (an optional dependency that needs Node 24 or later). The OS applies the filesystem and network policy for each command, so there is no install step, no sandbox user and no ACL changes. It needs a Windows build with the BaseContainer tier; MXC's AppContainer tiers are never used.
+`windows.backend: 'mxc'` runs commands in an MXC BaseContainer through the [`@microsoft/mxc-sdk`](https://www.npmjs.com/package/@microsoft/mxc-sdk) package (an optional dependency that needs Node 24 or later). The OS applies the filesystem and network policy for each command, so there is no install step, no sandbox user and no ACL changes. It needs a Windows build with the BaseContainer tier; MXC's AppContainer tiers are never used. An embedder that bundles the SDK passes it to `initialize()` as the `windowsMxcSdk` option, an object with its `probe()` and `spawn()`; the package is then not resolved.
 
 The SDK starts the process itself, so commands start with `spawnSandboxed()` rather than `wrapWithSandboxArgv()`, which throws under this backend:
 

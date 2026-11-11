@@ -203,6 +203,31 @@ export async function loadMxcSdk(): Promise<MxcSdk> {
   return { probe: sdk.probe, spawn: sdk.spawn }
 }
 
+/**
+ * The SDK a session uses: the embedder's when it passed one, otherwise
+ * the installed package. An injected SDK is used as given, and the
+ * package is not resolved.
+ *
+ * @throws {WindowsSandboxError} `backend_unsupported` when the injected
+ * object lacks `probe` or `spawn`, or from {@link loadMxcSdk}.
+ */
+export async function resolveMxcSdk(
+  injected: MxcSdk | undefined,
+): Promise<MxcSdk> {
+  if (injected === undefined) return loadMxcSdk()
+  const probe = injected?.probe
+  const spawn = injected?.spawn
+  if (typeof probe !== 'function' || typeof spawn !== 'function') {
+    throw new WindowsSandboxError(
+      'backend_unsupported',
+      `windows.backend is 'mxc' but windowsMxcSdk does not have probe() and spawn()`,
+    )
+  }
+  // The two functions, bound, so a later change to the caller's object
+  // changes nothing here and methods keep their receiver.
+  return { probe: probe.bind(injected), spawn: spawn.bind(injected) }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Probe & spawn
 // ────────────────────────────────────────────────────────────────────────

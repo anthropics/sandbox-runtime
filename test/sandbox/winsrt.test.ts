@@ -6,6 +6,7 @@ import {
   describe,
   expect,
   it,
+  mock,
   spyOn,
 } from 'bun:test'
 import * as child_process from 'node:child_process'
@@ -58,6 +59,7 @@ import * as mxcUtils from '../../src/sandbox/mxc-sandbox-utils.js'
 import type {
   MxcProcessHandle,
   MxcRequest,
+  MxcSdk,
 } from '../../src/sandbox/mxc-sandbox-utils.js'
 import {
   getSrtWinPath,
@@ -2178,6 +2180,115 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       message: expect.stringContaining('network.allowLocalBinding'),
     })
     expect(load).not.toHaveBeenCalled()
+  })
+
+  describe('mxc: an injected SDK', () => {
+    afterEach(() => SandboxManager.reset())
+
+    const fullProbe = () => ({
+      tier: 'base-container',
+      needsDaclAugmentation: false,
+      warnings: [],
+      probes: {
+        baseContainerSupportsDenyPaths: true,
+        baseContainerSupportsIngressHostLoopbackAllow: true,
+        baseContainerSupportsIdentitylessLoopbackProxy: true,
+        uiCapabilities: {
+          canBlockClipboardRead: true,
+          canBlockClipboardWrite: true,
+          canBlockInputInjection: true,
+        },
+      },
+    })
+    const injected = () => {
+      const probe = mock(fullProbe)
+      const spawn = mock((_request: MxcRequest) =>
+        Promise.resolve({} as MxcProcessHandle),
+      )
+      return { probe, spawn }
+    }
+    const packageSpies = () => {
+      const load = spyOn(mxcUtils, 'loadMxcSdk')
+      const installed = spyOn(mxcUtils, 'isMxcSdkInstalled')
+      spies.push(load, installed)
+      return { load, installed }
+    }
+    const mxcConfig = () => {
+      const base = configOf({})
+      return { ...base, windows: { ...base.windows, backend: 'mxc' as const } }
+    }
+    const start = (sdk: MxcSdk, config = mxcConfig()) =>
+      SandboxManager.initialize(config, undefined, false, {
+        windowsMxcSdk: sdk,
+      })
+
+    it('is probed and spawned through, and the package is never loaded', async () => {
+      const { load, installed } = packageSpies()
+      const sdk = injected()
+      await start(sdk)
+      expect(SandboxManager.getWindowsBackend?.()).toEqual({ backend: 'mxc' })
+      expect(sdk.probe).toHaveBeenCalled()
+      await SandboxManager.spawnSandboxed!('exit 0')
+      expect(sdk.spawn).toHaveBeenCalledTimes(1)
+      expect(load).not.toHaveBeenCalled()
+      expect(installed).not.toHaveBeenCalled()
+    })
+
+    it('still goes through the probe gate', async () => {
+      const sdk = injected()
+      sdk.probe.mockReturnValue({ ...fullProbe(), tier: 'app-container' })
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(start(sdk)).rejects.toMatchObject({
+        code: 'backend_unsupported',
+      })
+      expect(sdk.spawn).not.toHaveBeenCalled()
+    })
+
+    it('two concurrent initialize() calls with the same SDK share one run', async () => {
+      const sdk = injected()
+      const config = mxcConfig()
+      await Promise.all([start(sdk, config), start({ ...sdk }, config)])
+      expect(SandboxManager.getWindowsBackend?.()).toEqual({ backend: 'mxc' })
+      expect(sdk.probe).toHaveBeenCalledTimes(1)
+    })
+
+    it('keeps working after updateConfig, and meets the dependency check', async () => {
+      const { installed } = packageSpies()
+      installed.mockReturnValue(false)
+      const config = mxcConfig()
+      await start(injected(), config)
+      SandboxManager.updateConfig(config)
+      const none = { errors: [], warnings: [] }
+      expect(SandboxManager.checkDependencies()).toEqual(none)
+      expect(await SandboxManager.checkDependenciesAsync!()).toEqual(none)
+    })
+
+    it('meets the dependency check before initialize(), when named', async () => {
+      const { installed } = packageSpies()
+      installed.mockReturnValue(false)
+      const options = {
+        windowsBackend: 'mxc' as const,
+        windowsMxcSdk: injected(),
+      }
+      const none = { errors: [], warnings: [] }
+      expect(SandboxManager.checkDependencies(undefined, options)).toEqual(none)
+      expect(
+        await SandboxManager.checkDependenciesAsync!(undefined, options),
+      ).toEqual(none)
+      expect(installed).not.toHaveBeenCalled()
+    })
+
+    it('is refused when it lacks probe() or spawn(), with no fallback', async () => {
+      const { load } = packageSpies()
+      // eslint-disable-next-line @typescript-eslint/await-thenable
+      await expect(
+        start({ probe: fullProbe } as unknown as MxcSdk),
+      ).rejects.toMatchObject({
+        code: 'backend_unsupported',
+        message: expect.stringContaining('windowsMxcSdk'),
+      })
+      expect(load).not.toHaveBeenCalled()
+    })
   })
 
   it('checkDependencies checks the backend it is told, before initialize()', () => {

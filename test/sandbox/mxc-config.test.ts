@@ -1,7 +1,9 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, spyOn } from 'bun:test'
+import * as mxcUtils from '../../src/sandbox/mxc-sandbox-utils.js'
 import {
   buildMxcRequest,
   mxcProbeRefusals,
+  resolveMxcSdk,
   spawnMxcRequest,
   verifyMxcBackend,
   type MxcProbeOutput,
@@ -65,6 +67,62 @@ function fakeSdk(probe: () => MxcProbeOutput): {
   }
   return { sdk, spawned }
 }
+
+describe('resolveMxcSdk', () => {
+  it('returns the injected functions and does not load the package', async () => {
+    const load = spyOn(mxcUtils, 'loadMxcSdk')
+    try {
+      const { sdk, spawned } = fakeSdk(fullSupport)
+      const resolved = await resolveMxcSdk(sdk)
+      expect(resolved.probe(strictRequest())).toEqual(fullSupport())
+      await resolved.spawn(strictRequest())
+      expect(spawned).toHaveLength(1)
+      expect(load).not.toHaveBeenCalled()
+    } finally {
+      load.mockRestore()
+    }
+  })
+
+  it('is not changed by a later change to the object it was given', async () => {
+    const { sdk } = fakeSdk(fullSupport)
+    const resolved = await resolveMxcSdk(sdk)
+    sdk.probe = () => ({ ...fullSupport(), tier: 'other' })
+    expect(resolved.probe(strictRequest()).tier).toBe('base-container')
+  })
+
+  it('keeps the receiver of an SDK whose methods use this', async () => {
+    class Sdk implements MxcSdk {
+      #answer = fullSupport()
+      probe(): MxcProbeOutput {
+        return this.#answer
+      }
+      spawn(): Promise<MxcProcessHandle> {
+        return Promise.resolve({ id: this.#answer.warnings.length } as never)
+      }
+    }
+    const resolved = await resolveMxcSdk(new Sdk())
+    expect(resolved.probe(strictRequest()).tier).toBe('base-container')
+    expect((await resolved.spawn(strictRequest())).id).toBe(0)
+  })
+
+  it('refuses null rather than throwing a TypeError', async () => {
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(
+      resolveMxcSdk(null as unknown as MxcSdk),
+    ).rejects.toMatchObject({ code: 'backend_unsupported' })
+  })
+
+  it('falls back to the package when none is injected', async () => {
+    const package_ = fakeSdk(fullSupport).sdk
+    const load = spyOn(mxcUtils, 'loadMxcSdk').mockResolvedValue(package_)
+    try {
+      expect(await resolveMxcSdk(undefined)).toBe(package_)
+      expect(load).toHaveBeenCalledTimes(1)
+    } finally {
+      load.mockRestore()
+    }
+  })
+})
 
 describe('MXC SDK request', () => {
   it('seals the environment and sets no backend containment', () => {

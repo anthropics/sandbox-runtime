@@ -111,7 +111,7 @@ import {
 } from './windows-sandbox-utils.js'
 import {
   isMxcSdkInstalled,
-  loadMxcSdk,
+  resolveMxcSdk,
   verifyMxcBackend,
   buildMxcRequest,
   spawnMxcRequest,
@@ -1159,6 +1159,12 @@ export interface SandboxInitializeOptions {
    * why the session has not started yet.
    */
   onWindowsProfileGrantProgress?: (line: string) => void
+  /**
+   * Windows, `windows.backend: 'mxc'`: for embedders that bundle the MXC
+   * SDK, an object with its `probe()` and `spawn()`. The session uses it,
+   * and `@microsoft/mxc-sdk` is not resolved.
+   */
+  windowsMxcSdk?: MxcSdk
 }
 
 async function initialize(
@@ -1279,7 +1285,7 @@ async function initializeSteps(
       )
     }
     assertMxcSessionConfig(runtimeConfig)
-    mxcSdk = await loadMxcSdk()
+    mxcSdk = await resolveMxcSdk(options?.windowsMxcSdk)
   }
   // Before any CA, proxy or sandbox is set up: a runtime that cannot
   // terminate TLS in-process fails here, not on each tunnel.
@@ -1302,7 +1308,9 @@ async function initializeSteps(
       : undefined
 
   // Check dependencies
-  const deps = await checkDependenciesAsync()
+  const deps = await checkDependenciesAsync(undefined, {
+    windowsMxcSdk: mxcSdk,
+  })
   stopIfReset()
   if (deps.errors.length > 0) {
     if (deps.reinstallRequired) {
@@ -1952,12 +1960,19 @@ export interface CheckDependenciesOptions {
    * before initialize().
    */
   windowsBackend?: 'mxc' | 'srt-win'
+  /**
+   * The SDK that will be passed to initialize() as `windowsMxcSdk`, when
+   * checking before initialize() with `windowsBackend: 'mxc'`. With one,
+   * the mxc check does not look for the package.
+   */
+  windowsMxcSdk?: MxcSdk
 }
 
 /**
  * The mxc backend needs neither srt-win.exe nor the WFP/user install,
- * only the SDK package. Whether the host can run it is settled by
- * initialize()'s probe. undefined when the srt-win check applies.
+ * only the SDK, injected or as the package. Whether the host can run
+ * it is settled by initialize()'s probe. undefined when the srt-win
+ * check applies.
  */
 function mxcDependencies(
   options: CheckDependenciesOptions | undefined,
@@ -1965,7 +1980,10 @@ function mxcDependencies(
   const backend = options?.windowsBackend ?? config?.windows?.backend
   if (backend !== 'mxc' || getPlatform() !== 'windows') return undefined
   return {
-    errors: isMxcSdkInstalled() ? [] : [MXC_SDK_MISSING],
+    errors:
+      options?.windowsMxcSdk || windowsMxcState || isMxcSdkInstalled()
+        ? []
+        : [MXC_SDK_MISSING],
     warnings: [],
   }
 }
