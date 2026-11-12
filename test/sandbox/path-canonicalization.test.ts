@@ -47,10 +47,8 @@ function normalizeWithHome(
 ): { homedir: string; results: string[]; tildeBindsRoot: boolean } {
   const module = new URL('../../src/sandbox/sandbox-utils.ts', import.meta.url)
     .href
-  const linuxModule = new URL(
-    '../../src/sandbox/linux-sandbox-utils.ts',
-    import.meta.url,
-  ).href
+  const linuxModule = new URL('../helpers/isolated/library.ts', import.meta.url)
+    .href
   const child = spawnSync(
     process.execPath,
     [
@@ -69,7 +67,8 @@ function normalizeWithHome(
     {
       encoding: 'utf8',
       timeout: 20000,
-      env: { PATH: process.env.PATH ?? '', HOME: home },
+      // The temp dir is where the wrap keeps its mount point manifests.
+      env: { PATH: process.env.PATH ?? '', HOME: home, TMPDIR: tmpdir() },
       // Its own directory: the Linux wrap scans the working directory and may
       // leave mount-point stubs there, which this process would not clean up.
       cwd: scratch,

@@ -2354,7 +2354,7 @@ describe.if(!isWindows)(
       join(import.meta.dir, '../../src/sandbox/sandbox-utils.ts'),
     )})
     const { SandboxManager } = await import(${JSON.stringify(
-      join(import.meta.dir, '../../src/sandbox/sandbox-manager.ts'),
+      join(import.meta.dir, '../helpers/isolated/manager.ts'),
     )})
     const kept = paths => paths.filter(p => p.endsWith('/debug') || p.endsWith('/_logs')).map(p => p.split('/').slice(-2).join('/'))
     ${body}`
