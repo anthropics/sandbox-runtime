@@ -35,6 +35,7 @@ export {
 // Schema types and utilities
 export type {
   SandboxAskCallback,
+  SandboxAskContext,
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   CredentialRestrictionConfig,
