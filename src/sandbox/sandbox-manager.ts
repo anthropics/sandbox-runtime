@@ -2520,6 +2520,10 @@ function getAllowAllUnixSockets(): boolean | undefined {
   return config?.network?.allowAllUnixSockets
 }
 
+function getAllowUnixSocketCreation(): boolean | undefined {
+  return config?.network?.allowUnixSocketCreation
+}
+
 function getAllowLocalBinding(): boolean | undefined {
   return config?.network?.allowLocalBinding
 }
@@ -3044,6 +3048,7 @@ async function wrapWithSandboxOnce(
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
         allowNestedUserNamespaces,
         allowAllUnixSockets: getAllowAllUnixSockets(),
+        allowUnixSocketCreation: getAllowUnixSocketCreation(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),

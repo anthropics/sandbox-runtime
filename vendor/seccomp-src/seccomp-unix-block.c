@@ -27,7 +27,7 @@
  *   gcc -o seccomp-unix-block seccomp-unix-block.c -lseccomp
  *
  * Usage:
- *   ./seccomp-unix-block <output-file> [arch] [unix|namespaces]
+ *   ./seccomp-unix-block <output-file> [arch] [unix|vsock|namespaces]
  *
  * If arch is given (x86_64 or aarch64), the filter is generated for that
  * architecture instead of the native one. Lets a single-arch builder emit
@@ -38,7 +38,9 @@
  * above; `namespaces` is a second one, which apply-seccomp stacks on it to
  * keep the command in the namespaces the sandbox made for it (apply-seccomp.c
  * says why). Two filters, so that a command opted out of the second keeps the
- * first.
+ * first. `vsock` is `unix` without the AF_UNIX rule, which apply-seccomp
+ * takes in its place for a command allowed to make Unix sockets: VM sockets
+ * and io_uring stay refused.
  *
  * Dependencies:
  *   - libseccomp (libseccomp-dev package on Debian/Ubuntu)
@@ -149,7 +151,7 @@ int main(int argc, char *argv[]) {
 
     if (argc < 2 || argc > 4) {
         fprintf(stderr,
-                "Usage: %s <output-file> [x86_64|aarch64] [unix|namespaces]\n",
+                "Usage: %s <output-file> [x86_64|aarch64] [unix|vsock|namespaces]\n",
                 argv[0]);
         return 1;
     }
@@ -157,7 +159,8 @@ int main(int argc, char *argv[]) {
     const char *output_file = argv[1];
     const char *arch_name = (argc >= 3) ? argv[2] : NULL;
     const char *rule_set = (argc == 4) ? argv[3] : "unix";
-    if (strcmp(rule_set, "unix") != 0 && strcmp(rule_set, "namespaces") != 0) {
+    if (strcmp(rule_set, "unix") != 0 && strcmp(rule_set, "vsock") != 0
+        && strcmp(rule_set, "namespaces") != 0) {
         fprintf(stderr, "Error: Unknown rule set '%s'\n", rule_set);
         return 1;
     }
@@ -202,19 +205,21 @@ int main(int argc, char *argv[]) {
         return export_filter(ctx, output_file);
     }
 
-    /* Add rule to block socket(AF_UNIX, ...) */
+    /* Add rule to block socket(AF_UNIX, ...), in `unix` only. */
     /* socket() syscall signature: int socket(int domain, int type, int protocol) */
     /* arg0 = domain (AF_UNIX = 1) */
     /* Use SCMP_CMP_MASKED_EQ with a 32-bit mask: the domain argument is a 32-bit
      * int, so the kernel ignores the upper 32 bits of the register. A plain
      * SCMP_CMP_EQ would compare all 64 bits and miss calls where the upper bits
      * are set. */
-    rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
-                          SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
-    if (rc < 0) {
-        fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
-        seccomp_release(ctx);
-        return 1;
+    if (strcmp(rule_set, "unix") == 0) {
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
+                              SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
+            seccomp_release(ctx);
+            return 1;
+        }
     }
 
     /* Add rule to block socket(AF_VSOCK, ...) */

@@ -723,6 +723,17 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK).',
     ),
+  allowUnixSocketCreation: z
+    .boolean()
+    .optional()
+    .describe(
+      'Linux only: let the sandboxed command create Unix sockets while the seccomp helper stays in ' +
+        'place, so that VM sockets (AF_VSOCK) and io_uring stay blocked and the PID namespace, the ' +
+        'namespaces filter and violation monitoring are kept. allowAllUnixSockets removes the helper ' +
+        'and all of these with it. As with allowAllUnixSockets, every Unix socket the command can ' +
+        'reach in the filesystem (Docker, the D-Bus session bus, ssh-agent) becomes usable. ' +
+        'Ignored when allowAllUnixSockets is true. Default: false.',
+    ),
   allowLocalBinding: z
     .boolean()
     .optional()
