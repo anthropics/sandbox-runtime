@@ -18,7 +18,7 @@ export enum GlobTokenKind {
   Globstar = 'globstar',
   /** `**` with the `/` after it: any number of directories. */
   GlobstarSlash = 'globstarSlash',
-  /** `[abc]`, `[a-z]`: one character of a set. */
+  /** `[abc]`, `[a-z]`: one character of a set. `[!abc]`: one outside it. */
   Set = 'set',
 }
 
@@ -26,9 +26,11 @@ export type GlobToken =
   | { kind: GlobTokenKind.Text; text: string }
   | {
       kind: GlobTokenKind.Set
-      /** What is written between the brackets. */
+      /** What is written between the brackets, after a `!` or `^` that negates. */
       members: string
-      /** `[+-9]` does: a `/` lies between the two. */
+      /** `[!abc]`, `[^abc]`: a character that is no member, and no `/`. */
+      negated: boolean
+      /** `[+-9]` does: a `/` lies between the two. A negated set never does. */
       matchesSeparator: boolean
     }
   | { kind: GlobTokenKind.Separator | GlobTokenKind.AnyChar | WildcardKind }
@@ -66,11 +68,12 @@ const SEPARATOR = '/'.charCodeAt(0)
  * is a pattern, and no character escapes another:
  *
  * - A set runs from a `[` to the first `]` after it, be that the next
- *   character. All between the two are members, a `*`, a `?`, a `/` or another
- *   `[` too, and `^` and `!` do not negate.
+ *   character. A `!` or a `^` straight after the `[` negates it. All else
+ *   between the two are members, a `*`, a `?`, a `/` or another `[` too.
  * - Brackets that spell no set (see {@link setRanges}) are text, as POSIX
- *   reads a `[` that opens none, and what is between them keeps its meaning.
- *   So are a `[` that nothing closes and a `]` that nothing opens.
+ *   reads a `[` that opens none, and what is between them keeps its meaning:
+ *   `[!]` and `[^]` have no members. So are a `[` that nothing closes and a
+ *   `]` that nothing opens.
  * - Of a run of `*`, the last two go with a `/` that follows. Two or more of
  *   the rest are a `**`.
  */
@@ -151,10 +154,11 @@ export function parseGlob(pattern: string): GlobToken[] {
           i++
           break
         }
-        const members = pattern.slice(i + 1, close)
+        const negated = pattern[i + 1] === '!' || pattern[i + 1] === '^'
+        const members = pattern.slice(i + (negated ? 2 : 1), close)
         const ranges = setRanges(members)
         if (ranges === undefined) {
-          noSets.push(`[${members}]`)
+          noSets.push(pattern.slice(i, close + 1))
           bracketsAreTextUntil = close + 1
           i++
           break
@@ -163,9 +167,10 @@ export function parseGlob(pattern: string): GlobToken[] {
         tokens.push({
           kind: GlobTokenKind.Set,
           members,
-          matchesSeparator: ranges.some(
-            ([from, to]) => from <= SEPARATOR && SEPARATOR <= to,
-          ),
+          negated,
+          matchesSeparator:
+            !negated &&
+            ranges.some(([from, to]) => from <= SEPARATOR && SEPARATOR <= to),
         })
         textStart = i = close + 1
         break
@@ -189,6 +194,69 @@ export function escapeRegexLiteral(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+const DASH = '-'.charCodeAt(0)
+const CARET = '^'.charCodeAt(0)
+
+/**
+ * The regular expression for a set, written the way JavaScript and the regex
+ * engine of a macOS sandbox profile read alike. What that engine does with a
+ * set, as measured on macOS 14, 15 and 26, and what is done about it:
+ *
+ * - A backslash is a member (`[^/\$]` leaves out `\` as well as `$`). So a
+ *   member is written as it is, and a backslash doubled: one `\` to both.
+ * - `[.`, `[:` and `[=` open a POSIX element, and the whole profile is refused
+ *   where nothing closes it (`[[.]`). So the members go in ascending order,
+ *   in which none of the three follows a `[`.
+ * - A `-` is a member only where it is the first: a set that ends in one
+ *   (`[a-]`) and a range that starts at one (`[--9]`) are refused. So one
+ *   that stands for itself, or at either end of a range, goes first, and such
+ *   a range is the `-` and the rest of it, from `.` or up to `,`.
+ * - In a rule with the tail of {@link denyGlobRegex}, a negated set in which
+ *   two neighbours are written apart (`[^/0-9]`, `[^/abc]`) is read as `[^/]`.
+ *   So there they are written as one range (`[^/-9]`, `[^/a-c]`). That leaves
+ *   a `-` beside a `,` or a `.`, which the line above keeps apart.
+ *
+ * In a set that is not negated a `^` goes last, where neither takes it to
+ * negate. Beyond ASCII nothing is moved: sorted by code unit, the halves of
+ * two characters outside the basic plane would part.
+ */
+function setToRegex(members: string, negated: boolean): string {
+  const ranges = setRanges(members) ?? []
+  if (negated) ranges.push([SEPARATOR, SEPARATOR])
+  const isAscii = ([, to]: (typeof ranges)[number]): boolean => to < 0x80
+  const merged: typeof ranges = []
+  for (const [from, to] of ranges.filter(isAscii).sort(([a], [b]) => a - b)) {
+    const last = merged[merged.length - 1]
+    if (last !== undefined && from <= last[1] + (negated ? 1 : 0)) {
+      last[1] = Math.max(last[1], to)
+    } else {
+      merged.push([from, to])
+    }
+  }
+  const member = (code: number): string =>
+    String.fromCharCode(code).replace('\\', '\\\\')
+  let dash = ''
+  let caret = ''
+  let rest = ''
+  for (let [from, to] of [...merged, ...ranges.filter(r => !isAscii(r))]) {
+    if (from === DASH || to === DASH) {
+      dash = '-'
+      if (from === to) continue
+      if (from === DASH) from++
+      else to--
+    }
+    if (from === CARET && !negated) {
+      caret = '^'
+      if (from === to) continue
+      from++
+    }
+    rest += from === to ? member(from) : `${member(from)}-${member(to)}`
+  }
+  const body = dash + rest + caret
+  // Alone in its set, the `-` is as well written without one.
+  return body === '-' ? body : `[${negated ? '^' : ''}${body}]`
+}
+
 /** The regular expression for what `token` matches. */
 export function globTokenToRegex(token: GlobToken): string {
   switch (token.kind) {
@@ -205,8 +273,7 @@ export function globTokenToRegex(token: GlobToken): string {
     case GlobTokenKind.GlobstarSlash:
       return '(.*/)?'
     case GlobTokenKind.Set:
-      // A `-` stays what it is to the set, and the rest are its members.
-      return `[${token.members.replace(/[.^$+{}()|\\]/g, '\\$&')}]`
+      return setToRegex(token.members, token.negated)
   }
 }
 
@@ -221,6 +288,7 @@ export function globTokenToRegex(token: GlobToken): string {
  * - ** matches any characters including / (e.g., src/**\/*.ts matches all .ts files in src/)
  * - ? matches any single character except / (e.g., file?.txt matches file1.txt)
  * - [abc] matches any character in the set (e.g., file[0-9].txt matches file3.txt)
+ * - [!abc] and [^abc] match any character outside the set, never a `/`
  *
  * Whatever a pattern spells, what is returned compiles, so that no entry keeps
  * a sandbox from starting (see {@link parseGlob}). Only its size can be more

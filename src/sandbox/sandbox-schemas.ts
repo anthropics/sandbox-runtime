@@ -45,6 +45,11 @@ export interface FsReadRestrictionConfig {
    * unmasked. Linux only: the other backends match globs natively.
    */
   unlistableDenyDirs?: string[]
+  /**
+   * The names a glob expansion matched that are symbolic links: `denyOnly`
+   * holds what each leads to. Linux only, likewise.
+   */
+  matchedLinks?: string[]
 }
 
 /**

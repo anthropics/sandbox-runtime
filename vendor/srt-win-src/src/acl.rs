@@ -980,7 +980,8 @@ pub enum SbAce {
     /// would otherwise pick up).
     DenyFdc,
     /// `(D;;DELETE;;;<sb>)` — object-only (`NO_INHERIT`) DELETE deny
-    /// on a placeholder INTERMEDIATE directory. Blocks the sandbox
+    /// on an INTERMEDIATE directory: of a placeholder chain, or between
+    /// a kept deny and the root above it. Blocks the sandbox
     /// from renaming/rmdir'ing the intermediate (which would bypass
     /// the leaf's stamp) without leaking any semantics onto children:
     /// a full-mask `(OI)(CI)` deny here would deny reads over the

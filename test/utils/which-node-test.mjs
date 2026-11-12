@@ -1,10 +1,13 @@
 /**
  * Test whichSync behavior in Node.js environment
- * Run with: node --experimental-vm-modules test/utils/which-node.test.mjs
+ * Run with: node test/utils/which-node-test.mjs
  */
 
 import assert from 'node:assert'
 import { spawnSync } from 'node:child_process'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 // Verify we're running in Node.js, not Bun
 assert.strictEqual(
@@ -13,7 +16,7 @@ assert.strictEqual(
   'This test must run in Node.js, not Bun',
 )
 
-console.log('Running whichSync Node.js fallback tests...')
+console.log('Running whichSync Node.js tests...')
 
 // Build the project first to get the JS output
 const buildResult = spawnSync('npm', ['run', 'build'], {
@@ -52,7 +55,7 @@ const bashPath = whichSync('bash')
 assert.ok(bashPath !== null, 'whichSync should find bash')
 console.log('✓ Found bash at:', bashPath)
 
-// Test 4: Verify spawnSync is being used (by checking behavior matches which command)
+// Test 4: The search in this process finds what the which command finds
 const whichResult = spawnSync('which', ['ls'], { encoding: 'utf8' })
 const expectedPath = whichResult.stdout.trim()
 assert.strictEqual(
@@ -62,4 +65,21 @@ assert.strictEqual(
 )
 console.log('✓ Output matches which command')
 
-console.log('\n✅ All Node.js fallback tests passed!')
+// Test 5: No which command is run: one first on PATH, where a sandboxed
+// command may have left it, would run on the host
+const planted = mkdtempSync(join(tmpdir(), 'which-node-test-'))
+const savedPath = process.env.PATH
+try {
+  writeFileSync(join(planted, 'which'), `#!/bin/sh\ntouch '${planted}/ran'\n`, {
+    mode: 0o755,
+  })
+  process.env.PATH = `${planted}:${savedPath}`
+  assert.strictEqual(whichSync('ls'), lsPath)
+  assert.ok(!existsSync(join(planted, 'ran')), 'the planted which was run')
+} finally {
+  process.env.PATH = savedPath
+  rmSync(planted, { recursive: true, force: true })
+}
+console.log('✓ Runs no which command')
+
+console.log('\n✅ All Node.js tests passed!')
