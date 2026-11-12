@@ -49,12 +49,16 @@ import {
   hostMismatch,
   type RequestDecision,
   respondDenied,
+  endDeniedRequest,
   respondUpstreamError,
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
 import {
   prepareBodySubstitution,
+  collectSubstitutedBody,
+  collectLimitedBody,
+  BodySubstitutionTooLargeError,
   type GetBodySubstitutions,
 } from './body-substitution.js'
 import { secureContextFor } from './mitm-leaf.js'
@@ -79,9 +83,6 @@ import type { PlanSigv4 } from './credential-aws-pairs.js'
  * with larger payloads should sign UNSIGNED-PAYLOAD, which streams.
  */
 export const MAX_SIGV4_RESIGN_BODY_BYTES = 64 * 1024 * 1024
-
-/** Rejection cause when a body exceeds {@link MAX_SIGV4_RESIGN_BODY_BYTES}. */
-class BodyTooLargeError extends Error {}
 
 /**
  * True if `buf` starts with a TLS Handshake record header.
@@ -967,21 +968,6 @@ function destroyAfterDenial(req: IncomingMessage, res: ServerResponse): void {
   })
 }
 
-/**
- * After a deny: stop a forwarded body that is not the request itself (a
- * tee branch, a transform) at once, and the request once the answer is
- * out. A request without a body is its own body, and destroying it before
- * the answer is out would drop the answer.
- */
-function endDeniedRequest(
-  req: IncomingMessage,
-  res: ServerResponse,
-  body: Readable,
-): void {
-  if (body !== req) body.destroy()
-  destroyAfterDenial(req, res)
-}
-
 function forwardUpstreamGuarded(
   ...args: Parameters<typeof forwardUpstream>
 ): void {
@@ -1185,13 +1171,14 @@ async function forwardUpstream(
   mutateHeaders?.(fwdHeaders, target.hostname)
   // Masked-credential substitution in the request body, mirroring the
   // header substitution above. undefined → the bare pipe below, exactly as
-  // before. May delete content-length from fwdHeaders (chunked fallback).
-  const bodyTransform = prepareBodySubstitution(
+  // before. Length-changing pairs are buffered so Content-Length stays exact.
+  const bodyPlan = prepareBodySubstitution(
     getBodySubstitutions,
     req,
     fwdHeaders,
     target.hostname,
   )
+  let bodyTransform = bodyPlan?.transform
 
   // SigV4 re-signing runs after substitution so the new signature covers
   // the headers as they actually go upstream (real access key id, real
@@ -1202,22 +1189,21 @@ async function forwardUpstream(
     endDeniedRequest(req, res, body)
     return
   }
+  let payloadHash =
+    sigv4Plan?.action === 'resign' ? sigv4Plan.payloadHash : undefined
   if (sigv4Plan?.action === 'resign') {
-    let payloadHash = sigv4Plan.payloadHash
     if (payloadHash === undefined) {
       // The client signed a literal body hash: buffer the body and
       // recompute so the signature covers the bytes actually sent. Body
       // substitution runs FIRST — the buffered bytes (and therefore the
       // hash and signature) must be the substituted body, not the
       // sentinel-bearing one the client wrote.
-      const bodySource = bodyTransform ? body.pipe(bodyTransform) : body
-      if (bodyTransform) {
-        body.on('error', err => bodyTransform.destroy(err))
-      }
       try {
-        bufferedBody = await collectBody(bodySource, maxSigv4BodyBytes)
+        bufferedBody = bodyTransform
+          ? await collectSubstitutedBody(body, bodyTransform, maxSigv4BodyBytes)
+          : await collectLimitedBody(body, maxSigv4BodyBytes)
       } catch (err) {
-        if (err instanceof BodyTooLargeError) {
+        if (err instanceof BodySubstitutionTooLargeError) {
           respondDenied(
             res,
             `AWS SigV4 request uses a masked credential and signs a ` +
@@ -1228,9 +1214,7 @@ async function forwardUpstream(
               `buffering, or use an unmasked credential to have the ` +
               `request forwarded untouched.`,
           )
-          // Drain (discarding) whatever the client is still sending so it
-          // can read the 403 instead of seeing a reset mid-upload.
-          bodySource.resume()
+          endDeniedRequest(req, res, body)
           return
         }
         logForDebugging(
@@ -1238,6 +1222,7 @@ async function forwardUpstream(
           { level: 'error' },
         )
         res.destroy()
+        endDeniedRequest(req, res, body)
         return
       }
       payloadHash = sha256Hex(bufferedBody)
@@ -1247,7 +1232,43 @@ async function forwardUpstream(
       // bodyless-default methods it would raw-append the buffer unframed.
       fwdHeaders['content-length'] = String(bufferedBody.length)
     }
+  }
+
+  if (bodyPlan?.mayChangeLength && bufferedBody === undefined) {
     try {
+      bufferedBody = await collectSubstitutedBody(
+        body,
+        bodyPlan.transform,
+        maxSigv4BodyBytes,
+      )
+      fwdHeaders['content-length'] = String(bufferedBody.length)
+      bodyTransform = undefined
+    } catch (err) {
+      if (err instanceof BodySubstitutionTooLargeError) {
+        respondDenied(
+          res,
+          `Masked-credential body substitution may change Content-Length, ` +
+            `so the proxy must buffer the body, but it exceeds the ` +
+            `${maxSigv4BodyBytes}-byte buffering limit; denied.`,
+        )
+        endDeniedRequest(req, res, body)
+        return
+      }
+      logForDebugging(
+        `[tls-terminate] failed to buffer body for substitution: ${(err as Error).message}`,
+        { level: 'error' },
+      )
+      res.destroy()
+      endDeniedRequest(req, res, body)
+      return
+    }
+  }
+
+  // The final length must be set before signing even for UNSIGNED-PAYLOAD:
+  // content-length may itself be one of the signed headers.
+  if (sigv4Plan?.action === 'resign') {
+    try {
+      if (payloadHash === undefined) throw new Error('missing payload hash')
       sigv4Plan.apply(fwdHeaders, authority, payloadHash)
     } catch (err) {
       // Fail closed on any signer error — a request the proxy claimed to
@@ -1365,32 +1386,6 @@ async function forwardUpstream(
     body.on('error', err => upstream.destroy(err))
     body.pipe(upstream)
   }
-}
-
-/**
- * Read a request body fully into memory (for SigV4 body-hash re-signing).
- * Rejects with {@link BodyTooLargeError} once more than `maxBytes` have
- * arrived, discarding everything buffered so far — the caller denies the
- * request, so holding the partial body would defeat the cap.
- */
-function collectBody(body: Readable, maxBytes: number): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = []
-    let total = 0
-    const onData = (c: Buffer) => {
-      total += c.length
-      if (total > maxBytes) {
-        chunks.length = 0
-        body.removeListener('data', onData)
-        reject(new BodyTooLargeError(`request body exceeds ${maxBytes} bytes`))
-        return
-      }
-      chunks.push(c)
-    }
-    body.on('data', onData)
-    body.once('end', () => resolve(Buffer.concat(chunks)))
-    body.once('error', reject)
-  })
 }
 
 /** The authority of an absolute-form request-target, as spelled; undefined for origin form. */
