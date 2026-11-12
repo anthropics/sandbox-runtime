@@ -1023,3 +1023,36 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     expect(result.status).toBe(0)
   })
 })
+
+describe.if(isMacOS)('macOS Seatbelt Hardware Features', () => {
+  it('should emit sysctl-name-prefix rule for hw.optional.neon', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain('(sysctl-name-prefix "hw.optional.neon")')
+  })
+
+  it('should allow reading hw.optional.neon on arm64 Apple Silicon', () => {
+    if (process.arch !== 'arm64') return
+
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'sysctl -n hw.optional.neon',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: [] },
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(result.status).toBe(0)
+    expect(result.stdout.trim()).toBe('1')
+  })
+})
