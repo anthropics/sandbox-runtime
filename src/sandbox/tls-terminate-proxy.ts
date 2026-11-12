@@ -18,7 +18,7 @@ import type {
   ServerResponse,
 } from 'node:http'
 import type { LookupFunction, Socket } from 'node:net'
-import { checkServerIdentity, TLSSocket } from 'node:tls'
+import { checkServerIdentity, connect as tlsConnect, TLSSocket } from 'node:tls'
 import type { TLSSocketOptions } from 'node:tls'
 import { Duplex } from 'node:stream'
 import type { Readable, Writable } from 'node:stream'
@@ -59,11 +59,15 @@ import {
 } from './body-substitution.js'
 import { secureContextFor } from './mitm-leaf.js'
 import {
+  connectViaParentProxy,
   directRequestOptions,
   type DirectRequestOptions,
   formatAuthority,
   onUpstreamError,
   relayResponseHead,
+  type ResolvedParentProxy,
+  selectParentProxyUrl,
+  shouldBypassParentProxy,
   stripHopByHop,
 } from './parent-proxy.js'
 import { sha256Hex } from './aws-sigv4.js'
@@ -318,6 +322,8 @@ export type TerminateTarget = {
   upstreamCA?: string | Buffer | Array<string | Buffer>
   /** Upstream-leg name resolution, already bound for this target (see HttpProxyServerOptions.lookupFor). */
   lookup?: LookupFunction
+  /** Parent proxy through which to route the outbound upstream leg, when set. */
+  parentProxy?: ResolvedParentProxy
   /**
    * Called when filterRequest denies a parsed request, with the verified
    * method/URL and the decision reason. Carried on the target so the
@@ -902,6 +908,12 @@ type UpstreamLeg = {
 }
 
 function createUpstreamLeg(target: TerminateTarget): UpstreamLeg {
+  const parentUrl =
+    target.parentProxy &&
+    !shouldBypassParentProxy(target.parentProxy, target.hostname)
+      ? selectParentProxyUrl(target.parentProxy, { isHttps: true })
+      : undefined
+
   const agent = new HttpsAgent({
     keepAlive: true,
     maxSockets: 1,
@@ -915,21 +927,50 @@ function createUpstreamLeg(target: TerminateTarget): UpstreamLeg {
       checkServerIdentity(target.hostname, cert),
     ...(target.upstreamCA ? { ca: target.upstreamCA } : {}),
   })
+
+  if (parentUrl) {
+    agent.createConnection = (_opts, cb): Duplex | undefined => {
+      connectViaParentProxy(parentUrl, target.hostname, target.port)
+        .then(rawSocket => {
+          const tlsSocket = tlsConnect({
+            socket: rawSocket,
+            servername: target.hostname,
+            checkServerIdentity: (_host, cert) =>
+              checkServerIdentity(target.hostname, cert),
+            ...(target.upstreamCA ? { ca: target.upstreamCA } : {}),
+          })
+          if (cb) cb(null, tlsSocket)
+        })
+        .catch(err => {
+          if (cb) cb(err, undefined as unknown as Duplex)
+        })
+      return undefined
+    }
+  }
   let vetted: Promise<DirectRequestOptions> | undefined
   return {
     agent,
     address() {
       if (!vetted) {
-        const probe = directRequestOptions(
-          target.hostname,
-          target.port,
-          target.lookup,
-          true,
-        )
-        vetted = probe
-        probe.catch(() => {
-          if (vetted === probe) vetted = undefined
-        })
+        if (parentUrl) {
+          vetted = Promise.resolve({
+            host: target.hostname,
+            port: target.port,
+            servername: target.hostname,
+            agent: false,
+          })
+        } else {
+          const probe = directRequestOptions(
+            target.hostname,
+            target.port,
+            target.lookup,
+            true,
+          )
+          vetted = probe
+          probe.catch(() => {
+            if (vetted === probe) vetted = undefined
+          })
+        }
       }
       return vetted
     },
@@ -1315,7 +1356,6 @@ async function forwardUpstream(
     return
   }
 
-  // TODO(terminating-tls): honour parentProxy for the upstream leg.
   const upstream = httpsRequest(
     {
       ...direct,
