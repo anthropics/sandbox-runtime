@@ -60,6 +60,9 @@ import {
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
+  startHostPortBridge,
+  type HostPortBridge,
+  type HostPortSocket,
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
@@ -205,6 +208,10 @@ let cleanupRegistered = false
 let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
+// Linux: one host bridge per `network.reachHostPorts` port, started by the
+// first wrap that asks for it and shared by every later one, like the proxy
+// bridges. A promise, so two wraps asking at once start one bridge.
+const hostPortBridges = new Map<number, Promise<HostPortBridge>>()
 let parentProxy: ResolvedParentProxy | undefined
 /** Read live through {@link directLookup}, so a config update applies to the next dial. */
 let resolvedAddressGuard: ResolvedAddressGuard = createResolvedAddressGuard()
@@ -2524,6 +2531,71 @@ function getAllowLocalBinding(): boolean | undefined {
   return config?.network?.allowLocalBinding
 }
 
+/** `network.reachHostPorts` for one wrap, without repeats. */
+function getReachHostPorts(
+  customConfig: Partial<SandboxRuntimeConfig> | undefined,
+): number[] {
+  const ports =
+    customConfig?.network?.reachHostPorts ?? config?.network?.reachHostPorts
+  return [...new Set(ports ?? [])]
+}
+
+/** A bridge that has not exited. */
+function isLive(bridge: HostPortBridge): boolean {
+  return bridge.process.exitCode === null && bridge.process.signalCode === null
+}
+
+/** Start, or reuse, the host bridge of each port, and return their sockets. */
+async function ensureHostPortBridges(
+  ports: number[],
+): Promise<HostPortSocket[]> {
+  return Promise.all(
+    ports.map(async (port): Promise<HostPortSocket> => {
+      for (;;) {
+        const pending = hostPortBridges.get(port)
+        if (!pending) break
+        const bridge = await pending.catch(() => undefined)
+        if (bridge && isLive(bridge)) {
+          return { port, socketPath: bridge.socketPath }
+        }
+        // Dead or failed: start a new one, unless another wrap already has.
+        if (hostPortBridges.get(port) === pending) {
+          hostPortBridges.delete(port)
+          if (bridge) fs.rmSync(bridge.socketPath, { force: true })
+          break
+        }
+      }
+      const started = startHostPortBridge(port, config?.socatPath)
+      hostPortBridges.set(port, started)
+      started.catch(() => {
+        if (hostPortBridges.get(port) === started) hostPortBridges.delete(port)
+      })
+      const bridge = await started
+      return { port, socketPath: bridge.socketPath }
+    }),
+  )
+}
+
+/** Stop every host port bridge and remove its socket. */
+async function stopHostPortBridges(): Promise<void> {
+  const pending = [...hostPortBridges.values()]
+  hostPortBridges.clear()
+  await Promise.all(
+    pending.map(async started => {
+      const bridge = await started.catch(() => undefined)
+      if (!bridge) return
+      await killBridgeProcess(bridge.process, `host port ${bridge.port}`)
+      try {
+        fs.rmSync(bridge.socketPath, { force: true })
+      } catch (err) {
+        logForDebugging(`Host port socket cleanup error: ${err}`, {
+          level: 'error',
+        })
+      }
+    }),
+  )
+}
+
 function getAllowMachLookup(): string[] | undefined {
   return config?.network?.allowMachLookup
 }
@@ -2949,6 +3021,16 @@ async function wrapWithSandboxOnce(
     await waitForNetworkInitialization()
   }
 
+  // Linux: the host bridges for network.reachHostPorts. Started here, before
+  // the check below, since nothing after it awaits; a configuration replaced
+  // meanwhile makes the wrap start over and ask again.
+  const reachHostPorts =
+    platform === 'linux' && needsNetworkProxy
+      ? getReachHostPorts(customConfig)
+      : []
+  const hostPortSockets =
+    reachHostPorts.length > 0 ? await ensureHostPortBridges(reachHostPorts) : []
+
   // INVARIANT: one wrap, one configuration. updateConfig() can run in any of
   // the turns above, and what was read before it must not be put together
   // with what is read after it: the write list of one configuration with the
@@ -3052,6 +3134,7 @@ async function wrapWithSandboxOnce(
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        hostPortSockets,
         observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
       }).catch((err: unknown) => {
@@ -3721,6 +3804,8 @@ async function reset(): Promise<void> {
     linuxMonitor.stop()
     linuxMonitor = undefined
   }
+
+  await stopHostPortBridges()
 
   if (managerContext?.linuxBridge) {
     const {

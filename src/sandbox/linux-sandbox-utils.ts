@@ -99,6 +99,10 @@ export interface LinuxSandboxParams {
   bwrapPath?: string
   /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
   socatPath?: string
+  /** Host loopback ports the command may reach (`network.reachHostPorts`),
+   *  each with the Unix socket of its host bridge (startHostPortBridge).
+   *  Used only with network restriction and the proxy sockets. */
+  hostPortSockets?: HostPortSocket[]
   /** Filesystem unix socket bound by the Linux violation monitor. When set,
    *  the socket is bind-mounted into the sandbox and apply-seccomp is told
    *  (via SRT_OBSERVE_SOCK) to install a USER_NOTIF observation filter and
@@ -1663,6 +1667,87 @@ export async function initializeLinuxNetworkBridge(
   }
 }
 
+/** A host loopback port and the Unix socket that reaches it. */
+export interface HostPortSocket {
+  port: number
+  socketPath: string
+}
+
+/** A running host bridge for one `network.reachHostPorts` entry. */
+export interface HostPortBridge extends HostPortSocket {
+  process: ChildProcess
+}
+
+/**
+ * Start the host side of one `network.reachHostPorts` entry: socat listens
+ * on a Unix socket and connects each client to 127.0.0.1:<port> on the host.
+ * The socket is bound into the sandbox, where buildSandboxCommand relays
+ * TCP <port> to it, the same pattern as the proxy bridges, in the other
+ * direction: the far end is a service on the host, not the proxy.
+ *
+ * Resolves once the socket exists. Rejects, with the process stopped, when
+ * socat cannot be started or does not create the socket.
+ */
+export async function startHostPortBridge(
+  port: number,
+  socatPath?: string,
+): Promise<HostPortBridge> {
+  const socat = socatPath ?? 'socat'
+  const socketPath = join(
+    tmpdir(),
+    `claude-host-${port}-${randomBytes(8).toString('hex')}.sock`,
+  )
+  const args = [
+    `UNIX-LISTEN:${socketPath},fork,reuseaddr`,
+    `TCP:127.0.0.1:${port}`,
+  ]
+  logForDebugging(`Starting host port bridge: ${socat} ${args.join(' ')}`)
+  const proc = spawn(socat, args, { stdio: 'ignore' })
+  // Registered before the pid check, as for the proxy bridges: a failed
+  // spawn emits 'error' asynchronously.
+  let failed: Error | undefined
+  proc.on('error', err => {
+    failed = err
+    logForDebugging(`Host port bridge ${port} error: ${err}`, {
+      level: 'error',
+    })
+  })
+  let exited = false
+  proc.on('exit', (code, signal) => {
+    exited = true
+    logForDebugging(
+      `Host port bridge ${port} exited with code ${code}, signal ${signal}`,
+      { level: code === 0 ? 'info' : 'error' },
+    )
+  })
+  const stop = (): void => {
+    if (proc.pid && !exited) {
+      try {
+        process.kill(proc.pid, 'SIGTERM')
+      } catch {
+        // Ignore errors
+      }
+    }
+    fs.rmSync(socketPath, { force: true })
+  }
+  if (!proc.pid) {
+    stop()
+    throw new Error(`Failed to start the host bridge for port ${port}`)
+  }
+  for (let i = 0; i < 10; i++) {
+    if (failed || exited) break
+    if (fs.existsSync(socketPath)) {
+      return { port, socketPath, process: proc }
+    }
+    await new Promise(resolve => setTimeout(resolve, 20 * (i + 1)))
+  }
+  stop()
+  throw new Error(
+    `The host bridge for port ${port} did not start` +
+      (failed ? `: ${failed.message}` : ''),
+  )
+}
+
 /**
  * Read by the seccomp helper, never by this process. The write denies are
  * read-only binds, and a bind protects a path only in the mount namespace it
@@ -1743,16 +1828,17 @@ function resolveApplySeccompPrefix(
 }
 
 /**
- * Shell lines that return once both relays listen, given their process ids in
- * `$_srt_http` and `$_srt_socks`. The relays are started in the background,
- * and a command that connects at once got there first: its first connection
- * was refused.
+ * Shell lines that return once every relay listens, given their process ids
+ * in `$_srt_http`, `$_srt_socks` and the list `$_srt_hosts` (one per
+ * `network.reachHostPorts` entry). The relays are started in the
+ * background, and a command that connects at once got there first: its
+ * first connection was refused.
  *
  * The network namespace counts its TCP sockets in use, and a listening one
- * counts from the moment it listens. The namespace is new and only the two
- * relays make a socket in it before the command runs, one each, so two in
- * use are the two relays listening. Not `/proc/net/tcp`, which names the
- * ports: one read of it walks the host's whole connection table (5 ms on a
+ * counts from the moment it listens. The namespace is new and only the
+ * relays make a socket in it before the command runs, one each, so
+ * `relays` in use are the relays listening. Not `/proc/net/tcp`, which
+ * names the ports: one read of it walks the host's whole connection table (5 ms on a
  * machine with 256 GB).
  *
  * It gives up, and the command starts as it did before, when a relay has
@@ -1768,9 +1854,9 @@ function resolveApplySeccompPrefix(
  * No `!`: shell-quote would put a backslash before it that the shell keeps.
  * No `%1`: dash resolves no job outside an interactive shell.
  */
-const RELAYS_LISTEN = [
+const relaysListen = (relays: number): string[] => [
   '_srt_since=',
-  'while [ -r /proc/net/sockstat ] && kill -0 "$_srt_http" "$_srt_socks" 2>/dev/null; do',
+  'while [ -r /proc/net/sockstat ] && kill -0 "$_srt_http" "$_srt_socks" $_srt_hosts 2>/dev/null; do',
   '  _srt_up=0',
   '  for _srt_counts in /proc/net/sockstat /proc/net/sockstat6; do',
   '    [ -r "$_srt_counts" ] || continue',
@@ -1778,17 +1864,18 @@ const RELAYS_LISTEN = [
   '      case "$_srt_kind" in TCP: | TCP6:) _srt_up=$((_srt_up + _srt_inuse)); break ;; esac',
   '    done < "$_srt_counts"',
   '  done',
-  '  [ "$_srt_up" -lt 2 ] || break',
+  `  [ "$_srt_up" -lt ${relays} ] || break`,
   '  read -r _srt_now _srt_skip 2>/dev/null < /proc/uptime || break',
   '  _srt_now=1${_srt_now%.*}${_srt_now#*.}',
   '  [ "$((_srt_now - ${_srt_since:=$_srt_now}))" -lt 30 ] || break',
   'done',
-  'unset _srt_since _srt_now _srt_up _srt_counts _srt_kind _srt_skip _srt_inuse _srt_http _srt_socks',
+  'unset _srt_since _srt_now _srt_up _srt_counts _srt_kind _srt_skip _srt_inuse _srt_http _srt_socks _srt_hosts',
 ]
 
 /**
  * Build the command that runs inside the sandbox.
- * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
+ * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080, and one
+ * relay per `network.reachHostPorts` entry to its host bridge.
  */
 function buildSandboxCommand(
   httpSocketPath: string,
@@ -1797,6 +1884,7 @@ function buildSandboxCommand(
   applySeccompPrefix: string | undefined,
   shell?: string,
   socatPath?: string,
+  hostPortSockets: HostPortSocket[] = [],
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
@@ -1820,13 +1908,21 @@ function buildSandboxCommand(
     '_srt_http=$!',
     relay(1080, socksSocketPath),
     '_srt_socks=$!',
+    '_srt_hosts=',
+    ...hostPortSockets.flatMap(({ port, socketPath }) => [
+      relay(port, socketPath),
+      '_srt_hosts="$_srt_hosts $!"',
+    ]),
     // The trap saves the status the script is exiting with and exits with
     // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
     // keep the script's status, zsh takes the status of the trap's own last
     // command (the kill), so under zsh a failing command reported 0. Single
     // quotes, so $? and $rc are read when the trap runs, not when it is set.
-    "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
-    ...RELAYS_LISTEN,
+    `trap 'rc=$?; kill ${Array.from(
+      { length: 2 + hostPortSockets.length },
+      (_, i) => `%${i + 1}`,
+    ).join(' ')} 2>/dev/null; exit $rc' EXIT`,
+    ...relaysListen(2 + hostPortSockets.length),
   ]
 
   // apply-seccomp runs after socat so socat can still create Unix sockets.
@@ -3558,6 +3654,7 @@ export async function wrapCommandWithSandboxLinux(
     seccompConfig,
     bwrapPath,
     socatPath,
+    hostPortSockets = [],
     observeSocketPath,
     abortSignal,
   } = params
@@ -3723,6 +3820,16 @@ export async function wrapCommandWithSandboxLinux(
         // same source→target.
         if (socksSocketPath !== httpSocketPath) {
           bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        }
+        for (const { port, socketPath } of hostPortSockets) {
+          if (!fs.existsSync(socketPath)) {
+            throw new Error(
+              `Linux host bridge socket for port ${port} does not exist: ` +
+                `${socketPath}. The bridge process may have died. Try ` +
+                'reinitializing the sandbox.',
+            )
+          }
+          bwrapArgs.push('--bind', socketPath, socketPath)
         }
 
         // Add proxy environment variables
@@ -3895,6 +4002,7 @@ export async function wrapCommandWithSandboxLinux(
         applySeccompPrefix,
         shell,
         socatPath,
+        hostPortSockets,
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {

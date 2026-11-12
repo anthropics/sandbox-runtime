@@ -33,7 +33,7 @@ describe.if(isLinux && bwrapCanNamespaceNetwork() && has('socat'))(
 
     beforeAll(() => {
       dir = realpathSync(mkdtempSync(join(tmpdir(), 'relays-listen-')))
-      for (const socket of ['http.sock', 'socks.sock']) {
+      for (const socket of ['http.sock', 'socks.sock', 'host.sock']) {
         writeFileSync(join(dir, socket), '')
       }
       connectFirst = join(dir, 'connect-first.sh')
@@ -64,6 +64,7 @@ describe.if(isLinux && bwrapCanNamespaceNetwork() && has('socat'))(
         /** A directory put first on the PATH the sandbox starts with. */
         firstOnPath?: string
         allowAllUnixSockets?: boolean
+        hostPortSockets?: { port: number; socketPath: string }[]
       } = {},
     ): Promise<{ lines: string[]; ms: number }> {
       const socatPath = join(dir, 'socat-stand-in')
@@ -114,6 +115,16 @@ describe.if(isLinux && bwrapCanNamespaceNetwork() && has('socat'))(
         expect((await run(later)).lines).toEqual(['3128 up', '1080 up'])
       })
     }
+
+    it('waits for the relay of a network.reachHostPorts port too', async () => {
+      const later = `case "$1" in *:25432,*) sleep 0.15 ;; esac\nexec socat "$@"`
+      const { lines } = await run(later, {
+        command:
+          '(exec 3<>/dev/tcp/127.0.0.1/25432) 2>/dev/null && echo "25432 up" || echo "25432 refused"',
+        hostPortSockets: [{ port: 25432, socketPath: join(dir, 'host.sock') }],
+      })
+      expect(lines).toEqual(['25432 up'])
+    })
 
     // Which family a plain TCP-LISTEN takes is socat's choice, and differs by
     // version. These two stand-ins make it, so that the socat here does not.
