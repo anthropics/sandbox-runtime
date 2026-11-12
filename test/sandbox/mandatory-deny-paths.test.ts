@@ -12,7 +12,9 @@ import { spawn, spawnSync } from 'node:child_process'
 import {
   chmodSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
+  realpathSync,
   rmdirSync,
   rmSync,
   writeFileSync,
@@ -22,7 +24,7 @@ import {
   statSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import {
   wrapCommandWithSandboxMacOS,
@@ -31,14 +33,16 @@ import {
 import {
   wrapCommandWithSandboxLinux,
   cleanupBwrapMountPoints,
+  linuxGetCwdMandatoryDenyPaths,
   unreadableDirectories,
   type LinuxSandboxParams,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   DANGEROUS_FILES,
   getDangerousDirectories,
+  normalizePathForSandbox,
 } from '../../src/sandbox/sandbox-utils.js'
-import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
+import { isLinux, isSupportedPlatform, isWindows } from '../helpers/platform.js'
 
 /**
  * Integration tests for mandatory deny paths.
@@ -184,6 +188,28 @@ describe.if(isSupportedPlatform)(
           expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
         })
       }
+
+      it('blocks writes to the file RIPGREP_CONFIG_PATH names', async () => {
+        // A name that is not dangerous by itself: only the variable makes it
+        // ripgrep's configuration file.
+        const configuration = join(TEST_DIR, 'rg-config')
+        const saved = process.env.RIPGREP_CONFIG_PATH
+        writeFileSync(configuration, ORIGINAL_CONTENT)
+        process.env.RIPGREP_CONFIG_PATH = configuration
+        try {
+          const result = await runSandboxedWrite(
+            configuration,
+            MODIFIED_CONTENT,
+          )
+
+          expect(result.success).toBe(false)
+          expect(readFileSync(configuration, 'utf8')).toBe(ORIGINAL_CONTENT)
+        } finally {
+          if (saved === undefined) delete process.env.RIPGREP_CONFIG_PATH
+          else process.env.RIPGREP_CONFIG_PATH = saved
+          rmSync(configuration)
+        }
+      })
     })
 
     describe('Git hooks and config should be blocked', () => {
@@ -1627,5 +1653,109 @@ describe('macGetMandatoryDenyEntries - Unit Tests', () => {
       p => p.includes('.git/config') || p.endsWith('.git/config'),
     )
     expect(hasGitConfigPattern).toBe(true)
+  })
+})
+
+describe('RIPGREP_CONFIG_PATH - Unit Tests', () => {
+  const configuration = join(tmpdir(), 'rg-config')
+  let saved: string | undefined
+
+  beforeEach(() => {
+    saved = process.env.RIPGREP_CONFIG_PATH
+    delete process.env.RIPGREP_CONFIG_PATH
+  })
+
+  afterEach(() => {
+    if (saved === undefined) delete process.env.RIPGREP_CONFIG_PATH
+    else process.env.RIPGREP_CONFIG_PATH = saved
+  })
+
+  it('denies the file it names on macOS, and nothing else', () => {
+    const without = macGetMandatoryDenyEntries()
+    process.env.RIPGREP_CONFIG_PATH = configuration
+    const entries = macGetMandatoryDenyEntries()
+
+    expect(entries).toHaveLength(without.length + 1)
+    expect(entries).toContainEqual({
+      glob: false,
+      path: normalizePathForSandbox(configuration, { literal: true }),
+    })
+  })
+
+  it('denies the file it names on Linux, and nothing else', () => {
+    const without = linuxGetCwdMandatoryDenyPaths()
+    process.env.RIPGREP_CONFIG_PATH = configuration
+    const paths = linuxGetCwdMandatoryDenyPaths()
+
+    expect(paths).toHaveLength(without.length + 1)
+    expect(paths).toContain(configuration)
+  })
+
+  it('resolves a relative name against the cwd', () => {
+    process.env.RIPGREP_CONFIG_PATH = 'rg-config'
+
+    expect(linuxGetCwdMandatoryDenyPaths()).toContain(resolve('rg-config'))
+    expect(macGetMandatoryDenyEntries()).toContainEqual({
+      glob: false,
+      path: normalizePathForSandbox(resolve('rg-config'), { literal: true }),
+    })
+  })
+
+  it.if(!isWindows)(
+    'denies a linked file on macOS under the path it resolves to as well',
+    () => {
+      const dir = mkdtempSync(join(tmpdir(), 'rg-config-link-'))
+      try {
+        const target = join(dir, 'dotfiles', 'ripgreprc')
+        const link = join(dir, 'home', '.ripgreprc')
+        mkdirSync(join(dir, 'dotfiles'))
+        mkdirSync(join(dir, 'home'))
+        writeFileSync(target, '')
+        symlinkSync(target, link)
+        process.env.RIPGREP_CONFIG_PATH = link
+
+        const paths = macGetMandatoryDenyEntries().map(e => e.path)
+
+        expect(paths).toContain(
+          normalizePathForSandbox(link, { literal: true }),
+        )
+        expect(paths).toContain(realpathSync.native(target))
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  it('adds nothing when it is empty', () => {
+    const linux = linuxGetCwdMandatoryDenyPaths()
+    const mac = macGetMandatoryDenyEntries()
+    process.env.RIPGREP_CONFIG_PATH = ''
+
+    expect(linuxGetCwdMandatoryDenyPaths()).toEqual(linux)
+    expect(macGetMandatoryDenyEntries()).toEqual(mac)
+  })
+
+  it.if(!isWindows)('denies nothing in /dev, such as /dev/null', () => {
+    const linux = linuxGetCwdMandatoryDenyPaths()
+    const mac = macGetMandatoryDenyEntries()
+    process.env.RIPGREP_CONFIG_PATH = '/dev/null'
+
+    expect(linuxGetCwdMandatoryDenyPaths()).toEqual(linux)
+    expect(macGetMandatoryDenyEntries()).toEqual(mac)
+
+    // A link that blanks the file: on macOS only the link itself is denied.
+    const dir = mkdtempSync(join(tmpdir(), 'rg-config-null-'))
+    try {
+      const link = join(dir, '.ripgreprc')
+      symlinkSync('/dev/null', link)
+      process.env.RIPGREP_CONFIG_PATH = link
+
+      const paths = macGetMandatoryDenyEntries().map(e => e.path)
+
+      expect(paths).toContain(normalizePathForSandbox(link, { literal: true }))
+      expect(paths).not.toContain('/dev/null')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
