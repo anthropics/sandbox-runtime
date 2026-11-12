@@ -89,8 +89,18 @@ export function samePathEntries(
   const key = (entry: FilesystemPathEntry): string =>
     typeof entry === 'string' ? `s:${entry}` : `l:${markedLiteralPath(entry)}`
   if (a.length !== b.length) return false
-  const keys = new Set(a.map(key))
-  return b.every(entry => keys.has(key(entry)))
+  const counts = new Map<string, number>()
+  for (const entry of a) {
+    const k = key(entry)
+    counts.set(k, (counts.get(k) ?? 0) + 1)
+  }
+  for (const entry of b) {
+    const k = key(entry)
+    const count = counts.get(k) ?? 0
+    if (count === 0) return false
+    counts.set(k, count - 1)
+  }
+  return true
 }
 
 /**
