@@ -129,6 +129,7 @@ import {
   removeTrailingGlobSuffix,
   walkGlobPatternSteps,
   workingDirectory,
+  resolveGitCommonDirWriteAccess,
   type GlobWalkListings,
   type Steps,
   finish,
@@ -2348,14 +2349,18 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     ...allowPaths,
   ]
 
-  return {
-    allowOnly,
-    denyWithinAllow: denyPaths,
-    ...literalWriteLists(
-      config.filesystem.allowWrite,
-      config.filesystem.denyWrite,
-    ),
-  }
+  return resolveGitCommonDirWriteAccess(
+    {
+      allowOnly,
+      denyWithinAllow: denyPaths,
+      ...literalWriteLists(
+        config.filesystem.allowWrite,
+        config.filesystem.denyWrite,
+      ),
+    },
+    config.filesystem.allowGitCommonDir ?? false,
+    config.filesystem.allowGitConfig ?? false,
+  )
 }
 
 /**
@@ -2814,6 +2819,14 @@ async function wrapWithSandboxOnce(
   // Get configs - use custom if provided, otherwise fall back to main config
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
+  const allowGitConfig =
+    customConfig?.filesystem?.allowGitConfig ??
+    config?.filesystem.allowGitConfig ??
+    false
+  const allowGitCommonDir =
+    customConfig?.filesystem?.allowGitCommonDir ??
+    config?.filesystem.allowGitCommonDir ??
+    false
   let writeConfig: FsWriteRestrictionConfig | undefined
   let readConfig: FsReadRestrictionConfig | undefined
   if (!fsDisabled) {
@@ -2847,6 +2860,14 @@ async function wrapWithSandboxOnce(
         customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite,
       ),
     }
+    // Resolve the extra root before read-deny collapse, keeping its mandatory
+    // denies with it. Do not pass allowGitCommonDir to the backends: another
+    // grant discovered after the walk would not be covered by its read masks.
+    writeConfig = resolveGitCommonDirWriteAccess(
+      writeConfig,
+      allowGitCommonDir,
+      allowGitConfig,
+    )
     // For a caller that never reads checkDependencies(), the CLI among them.
     if (!ownInstallLogged) {
       ownInstallLogged = true
@@ -3007,7 +3028,7 @@ async function wrapWithSandboxOnce(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
         gitSafeDirectories,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         allowAppleEvents: getAllowAppleEvents(),
@@ -3047,7 +3068,7 @@ async function wrapWithSandboxOnce(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
         gitSafeDirectories,
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
