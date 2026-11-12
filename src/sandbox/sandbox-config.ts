@@ -787,7 +787,8 @@ export const NetworkConfigSchema = z.object({
       'Per-request filter callback. Receives the parsed HTTP request ' +
         '(web-standard Request) and request details, and returns {action, ' +
         'reason?, status?} or, for an allow, header edits (removeHeaders, ' +
-        'setHeaders) and an onResponse observer. Denied requests get the ' +
+        'setHeaders) and onResponse, onResponseChunk and onResponseEnd ' +
+        'observers. Denied requests get the ' +
         'status (403 by default) with the reason. If the callback throws, the ' +
         'request is denied. Applies to plain HTTP through the proxy and, ' +
         'when tlsTerminate is configured, to terminated HTTPS. SRT does not ' +
