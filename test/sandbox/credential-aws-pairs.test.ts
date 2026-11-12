@@ -505,6 +505,33 @@ describe('createSigv4Planner', () => {
       }
     })
 
+    test('a presigned SigV4A URL is governed by the presigned policy', () => {
+      const { pairs, fakeAkid } = plannerFixture()
+      const target =
+        '/key?X-Amz-Algorithm=AWS4-ECDSA-P256-SHA256' +
+        `&X-Amz-Credential=${encodeURIComponent(`${fakeAkid}/20150830/s3/aws4_request`)}` +
+        '&X-Amz-Date=20150830T123600Z&X-Amz-Region-Set=%2A' +
+        '&X-Amz-SignedHeaders=host&X-Amz-Signature=ff00'
+      const denied = createSigv4Planner(pairs, undefined, eq)(
+        'GET',
+        target,
+        {},
+        's3.amazonaws.com',
+      )
+      expect(denied?.action).toBe('deny')
+      if (denied?.action === 'deny') {
+        expect(denied.reason).toContain('credentials.sigv4.presigned')
+      }
+      expect(
+        createSigv4Planner(pairs, { presigned: 'passthrough' }, eq)(
+          'GET',
+          target,
+          {},
+          's3.amazonaws.com',
+        ),
+      ).toBeUndefined()
+    })
+
     test('policies are independent per shape', () => {
       const { pairs, fakeAkid } = plannerFixture()
       const plan = createSigv4Planner(pairs, { streaming: 'passthrough' }, eq)
