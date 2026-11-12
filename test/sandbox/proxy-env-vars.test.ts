@@ -1,7 +1,8 @@
 import { describe, it, expect, spyOn } from 'bun:test'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { createServer as createTcpServer } from 'node:net'
+import type { AddressInfo, Server as TcpServer } from 'node:net'
 import {
   generateProxyEnvVars,
   CA_TRUST_VARS,
@@ -9,6 +10,7 @@ import {
 import * as platform from '../../src/utils/platform.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import { whichSync } from '../../src/utils/which.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 
@@ -164,6 +166,82 @@ describe('generateProxyEnvVars', () => {
           await SandboxManager.reset()
           if (proxy) {
             await new Promise<void>(r => proxy!.close(() => r()))
+          }
+        }
+      },
+    )
+  })
+
+  describe('RSYNC_PROXY', () => {
+    it('carries the proxy credentials as rsync reads them', () => {
+      // rsync takes USER:PASS@HOST:PORT and decodes nothing, so the username
+      // is the raw one, not the percent-encoded form the URLs carry.
+      const env = generateProxyEnvVars(
+        3128,
+        1080,
+        undefined,
+        'tok',
+        undefined,
+        'YWJj+x==',
+      )
+      expect(env).toContain('RSYNC_PROXY=srt.YWJj+x==:tok@localhost:1080')
+      expect(env.filter(v => v.startsWith('RSYNC_PROXY='))).toHaveLength(1)
+    })
+
+    it('is host:port alone when the proxy wants no token', () => {
+      const env = generateProxyEnvVars(3128, 1080)
+      expect(env).toContain('RSYNC_PROXY=localhost:1080')
+    })
+
+    const rsync = isLinux ? whichSync('rsync') : null
+
+    it.if(rsync !== null)(
+      'sandboxed rsync reaches an allow-listed daemon through the proxy',
+      async () => {
+        let daemon: TcpServer | undefined
+        const received: string[] = []
+        try {
+          // Enough of an rsync daemon to see the client's greeting arrive.
+          daemon = createTcpServer(sock => {
+            sock.on('error', () => {})
+            sock.once('data', d => {
+              received.push(d.toString())
+              sock.end('@RSYNCD: 31.0\n@ERROR: test daemon\n')
+            })
+          })
+          const port = await new Promise<number>((resolve, reject) => {
+            daemon!.on('error', reject)
+            daemon!.listen(0, '127.0.0.1', () =>
+              resolve((daemon!.address() as AddressInfo).port),
+            )
+          })
+
+          const config: SandboxRuntimeConfig = {
+            network: {
+              allowedDomains: [`127.0.0.1:${port}`],
+              deniedDomains: [],
+            },
+            filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+          }
+          await SandboxManager.initialize(config)
+
+          const wrapped = await SandboxManager.wrapWithSandbox(
+            `${rsync} --list-only --timeout=5 rsync://127.0.0.1:${port}/`,
+          )
+          const result = await spawnAsync(wrapped, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 15000,
+          })
+
+          // Without the credential the proxy answers the CONNECT with 407
+          // and the daemon hears nothing.
+          expect(result.stderr).not.toContain('407')
+          expect(received.join('')).toContain('@RSYNCD:')
+        } finally {
+          await SandboxManager.reset()
+          if (daemon) {
+            await new Promise<void>(r => daemon!.close(() => r()))
           }
         }
       },
