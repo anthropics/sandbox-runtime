@@ -41,11 +41,54 @@ function mintSentinel(realValue: string): string {
 /** Predicate matching a destination host against one injectHosts pattern. */
 export type HostMatcher = (host: string, pattern: string) => boolean
 
+/**
+ * One place in a forwarded request where a credential's sentinel may be
+ * substituted: `"headers"` (any header), `"header:<name>"` (that header
+ * only, case-insensitive), or `"body"`.
+ */
+export type InjectTarget = 'headers' | 'body' | `header:${string}`
+
+/**
+ * Where in a request a credential's sentinel is substituted, resolved from
+ * its `injectInto` list. `undefined` (no list) is every header and the body.
+ */
+interface InjectScope {
+  readonly anyHeader: boolean
+  readonly headers: ReadonlySet<string>
+  readonly body: boolean
+}
+
+const EVERYWHERE: InjectScope = {
+  anyHeader: true,
+  headers: new Set(),
+  body: true,
+}
+
+function toInjectScope(
+  injectInto: readonly InjectTarget[] | undefined,
+): InjectScope {
+  if (injectInto === undefined) return EVERYWHERE
+  const headers = new Set<string>()
+  let anyHeader = false
+  let body = false
+  for (const t of injectInto) {
+    if (t === 'headers') anyHeader = true
+    else if (t === 'body') body = true
+    else headers.add(t.slice('header:'.length).toLowerCase())
+  }
+  return { anyHeader, headers, body }
+}
+
+function injectsInHeader(scope: InjectScope, name: string): boolean {
+  return scope.anyHeader || scope.headers.has(name.toLowerCase())
+}
+
 interface SentinelEntry {
   readonly name: string
   readonly sentinel: string
   realValue: string
   injectHosts: readonly string[]
+  injectScope: InjectScope
 }
 
 /**
@@ -59,6 +102,13 @@ interface SentinelEntry {
  *
  * Keying on name (not value) means two env vars holding the same secret get
  * distinct sentinels, so each can have an independent host list.
+ *
+ * Each credential also carries where in a request it is substituted
+ * (`injectInto`): any header, named headers, the body. A sentinel outside
+ * those places reaches the upstream as the fake. Narrowing to the header an
+ * API authenticates with keeps a sandboxed process from having the real
+ * value written into a request body, where an injectHost that stores what
+ * it is sent (an issue, a gist, a note) would keep it and could return it.
  */
 export class SentinelRegistry {
   private readonly byName = new Map<string, SentinelEntry>()
@@ -76,7 +126,7 @@ export class SentinelRegistry {
    * `env NAME=value` unquoted.
    *
    * Idempotent on `name`: a repeat call returns the same sentinel and updates
-   * `realValue`/`injectHosts` in place so `updateConfig()` can change either
+   * `realValue`/`injectHosts`/`injectInto` in place so `updateConfig()` can change either
    * without invalidating sentinels the sandboxed process has already read.
    * (A re-register whose new value has a different byte length leaves the
    * sentinel un-length-matched; body substitution then re-frames as chunked
@@ -86,12 +136,14 @@ export class SentinelRegistry {
     name: string,
     realValue: string,
     injectHosts: readonly string[],
+    injectInto?: readonly InjectTarget[],
   ): string {
     return this.registerWithSentinel(
       name,
       mintSentinel(realValue),
       realValue,
       injectHosts,
+      injectInto,
     )
   }
 
@@ -122,17 +174,26 @@ export class SentinelRegistry {
     sentinel: string,
     realValue: string,
     injectHosts: readonly string[],
+    injectInto?: readonly InjectTarget[],
   ): string {
+    const injectScope = toInjectScope(injectInto)
     const existing = this.byName.get(name)
     if (existing !== undefined) {
       existing.realValue = realValue
       existing.injectHosts = injectHosts
+      existing.injectScope = injectScope
       return existing.sentinel
     }
     if (!sentinel.startsWith(SENTINEL_PREFIX)) {
       this.allSentinelsPrefixed = false
     }
-    const entry: SentinelEntry = { name, sentinel, realValue, injectHosts }
+    const entry: SentinelEntry = {
+      name,
+      sentinel,
+      realValue,
+      injectHosts,
+      injectScope,
+    }
     this.byName.set(name, entry)
     this.bySentinel.set(sentinel, entry)
     return sentinel
@@ -159,8 +220,9 @@ export class SentinelRegistry {
 
   /**
    * Sentinel→real byte pairs for every credential whose `injectHosts`
-   * cover `destHost` — the substitution set the body transform scans for.
-   * Same per-credential gating as {@link substituteInHeaders}. Buffers are
+   * cover `destHost` and whose `injectInto` includes the body — the
+   * substitution set the body transform scans for. Same per-credential host
+   * gating as {@link substituteInHeaders}. Buffers are
    * built per call so a re-registered credential's updated real value is
    * always current.
    */
@@ -170,6 +232,7 @@ export class SentinelRegistry {
   ): SentinelBufferPair[] {
     const pairs: SentinelBufferPair[] = []
     for (const e of this.bySentinel.values()) {
+      if (!e.injectScope.body) continue
       if (!e.injectHosts.some(p => matches(destHost, p))) continue
       pairs.push({
         sentinel: Buffer.from(e.sentinel),
@@ -204,7 +267,8 @@ export class SentinelRegistry {
    *
    * Scans all header values rather than a fixed set — a sentinel showing up
    * anywhere is the substitution trigger, regardless of header name
-   * (Authorization, X-Api-Key, Private-Token, ...).
+   * (Authorization, X-Api-Key, Private-Token, ...) — unless the credential's
+   * `injectInto` names the headers it may be substituted in.
    *
    * The caller remains responsible for transport gating (TLS-terminated path
    * unless `allowPlaintextInject`).
@@ -219,16 +283,17 @@ export class SentinelRegistry {
       if (value === undefined) continue
       if (Array.isArray(value)) {
         for (let i = 0; i < value.length; i++) {
-          value[i] = this.substituteInString(value[i]!, destHost, matches)
+          value[i] = this.substituteInString(value[i]!, name, destHost, matches)
         }
       } else {
-        headers[name] = this.substituteInString(value, destHost, matches)
+        headers[name] = this.substituteInString(value, name, destHost, matches)
       }
     }
   }
 
   private substituteInString(
     s: string,
+    headerName: string,
     destHost: string,
     matches: HostMatcher,
   ): string {
@@ -239,6 +304,7 @@ export class SentinelRegistry {
     let out = s
     for (const e of this.bySentinel.values()) {
       if (!out.includes(e.sentinel)) continue
+      if (!injectsInHeader(e.injectScope, headerName)) continue
       if (!e.injectHosts.some(p => matches(destHost, p))) continue
       out = out.split(e.sentinel).join(e.realValue)
     }

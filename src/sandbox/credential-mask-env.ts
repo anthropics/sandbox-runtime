@@ -101,6 +101,7 @@ export function buildMaskedEnvVars(
     // the sandbox can reach — narrow it explicitly when the credential
     // should only go to a subset.
     const injectHosts = v.injectHosts ?? allowedDomains
+    const injectInto = v.injectInto
 
     if (v.decode === 'jwt') {
       if (!verifyJwt(real)) {
@@ -127,6 +128,7 @@ export function buildMaskedEnvVars(
             `${ENV_EXTRACT_KEY_PREFIX}${v.name}#${claim}`,
             value,
             injectHosts,
+            injectInto,
           ),
         )
         if (masked === null) {
@@ -157,6 +159,7 @@ export function buildMaskedEnvVars(
           masked.fakeToken,
           real,
           injectHosts,
+          injectInto,
         )
         continue
       }
@@ -169,13 +172,19 @@ export function buildMaskedEnvVars(
         mintFakeJwt(randomUUID()),
         real,
         injectHosts,
+        injectInto,
       )
       continue
     }
 
     if (v.extract === undefined) {
       // Whole-value: one sentinel for the entire value.
-      setEnvVars[v.name] = registry.register(v.name, real, injectHosts)
+      setEnvVars[v.name] = registry.register(
+        v.name,
+        real,
+        injectHosts,
+        injectInto,
+      )
       continue
     }
 
@@ -184,6 +193,7 @@ export function buildMaskedEnvVars(
         `${ENV_EXTRACT_KEY_PREFIX}${v.name}#${i}`,
         cap,
         injectHosts,
+        injectInto,
       ),
     )
     if (extracted === null) {
