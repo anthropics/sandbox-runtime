@@ -2528,6 +2528,14 @@ function getAllowMachLookup(): string[] | undefined {
   return config?.network?.allowMachLookup
 }
 
+function getAllowIokitRegistryEntryClass(): string[] | undefined {
+  return config?.network?.allowIokitRegistryEntryClass
+}
+
+function getAllowIokitUserClientClass(): string[] | undefined {
+  return config?.network?.allowIokitUserClientClass
+}
+
 function getIgnoreViolations(): Record<string, string[]> | undefined {
   return config?.ignoreViolations
 }
@@ -3005,6 +3013,8 @@ async function wrapWithSandboxOnce(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         allowMachLookup: getAllowMachLookup(),
+        allowIokitRegistryEntryClass: getAllowIokitRegistryEntryClass(),
+        allowIokitUserClientClass: getAllowIokitUserClientClass(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
