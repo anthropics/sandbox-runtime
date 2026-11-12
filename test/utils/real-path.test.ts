@@ -12,7 +12,12 @@ import { spawnSync } from 'node:child_process'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
-import { realPathOf, wayTo } from '../../src/utils/real-path.js'
+import {
+  bytesOf,
+  realPathOf,
+  spelledBy,
+  wayTo,
+} from '../../src/utils/real-path.js'
 import { isLinux, isMacOS, isWindows } from '../helpers/platform.js'
 
 /** What a call gives: its value, or the code of what it throws. */
@@ -254,7 +259,44 @@ describe.if(!isWindows)('realPathOf', () => {
     ['a\\b/nowhere/in', 'a\\b', ['not-there', 'in']],
     ['plain/out/not-there/../x', 'a/b', ['not-there', '..', 'x']],
   ])('the way to %s leads as far as %s and leaves %j', (to, real, rest) => {
-    expect(wayTo(at(to))).toMatchObject({ real: at(real), rest })
+    expect(wayTo(bytesOf(at(to)))).toMatchObject({
+      real: bytesOf(at(real)),
+      rest,
+    })
+  })
+
+  // macOS lets no such name be made.
+  it.if(isLinux)(
+    'follows a way through names that are no text, in Node too',
+    () => {
+      const named = (bytes: string): Buffer => Buffer.from(bytes, 'latin1')
+      fs.mkdirSync(named(`${bytesOf(at('plain'))}/held-\xfe`))
+      fs.symlinkSync('../plain', named(`${bytesOf(at('a\\b'))}/hop-\xfe`))
+      fs.symlinkSync(named('hop-\xfe/file'), at('a\\b/through'))
+      fs.symlinkSync(
+        named('hop-\xfe/held-\xfe/lacking-\xfe/x'),
+        at('a\\b/into'),
+      )
+
+      // The real path holds no such name, so it can be told.
+      expect(realPathOf(at('a\\b/through'))).toBe(at('plain/file'))
+      expect(inNode([at('a\\b/through')])[0]![0]).toBe(at('plain/file'))
+      expect(wayTo(bytesOf(at('a\\b/into')))).toMatchObject({
+        real: `${bytesOf(at('plain'))}/held-\xfe`,
+        rest: ['lacking-\xfe', 'x'],
+        notThere: { code: 'ENOENT' },
+      })
+    },
+    30_000,
+  )
+
+  it('spells the bytes of text, and of nothing else', () => {
+    for (const text of ['', '/plain/a\\b', '/é/\uFFFD/💾']) {
+      expect(spelledBy(bytesOf(text))).toBe(text)
+    }
+    for (const bytes of ['\xff', '/n\xff/x', '\xc3', '\xed\xa0\x80']) {
+      expect(spelledBy(bytes)).toBeUndefined()
+    }
   })
 
   // root searches a directory of any mode.
@@ -264,8 +306,8 @@ describe.if(!isWindows)('realPathOf', () => {
   ])(
     'the way to %s stops at the directory that is shut and leaves %j',
     (to, rest) => {
-      expect(wayTo(at(to))).toMatchObject({
-        real: at('shut\\'),
+      expect(wayTo(bytesOf(at(to)))).toMatchObject({
+        real: bytesOf(at('shut\\')),
         rest,
         notThere: { code: 'EACCES' },
       })
@@ -276,7 +318,7 @@ describe.if(!isWindows)('realPathOf', () => {
     ['a\\b/round', 'ELOOP'],
     ['a\\b/up-from-a-file', 'ENOTDIR'],
   ])('the way to %s fails with %s', (to, code) => {
-    expect(answer(() => wayTo(at(to)).real)).toBe(code)
+    expect(answer(() => wayTo(bytesOf(at(to))).real)).toBe(code)
   })
 
   it('is the root for the root', () => {
