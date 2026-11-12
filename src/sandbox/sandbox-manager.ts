@@ -2528,6 +2528,10 @@ function getAllowMachLookup(): string[] | undefined {
   return config?.network?.allowMachLookup
 }
 
+function getAllowMachRegister(): string[] | undefined {
+  return config?.network?.allowMachRegister
+}
+
 function getIgnoreViolations(): Record<string, string[]> | undefined {
   return config?.ignoreViolations
 }
@@ -3005,6 +3009,7 @@ async function wrapWithSandboxOnce(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         allowMachLookup: getAllowMachLookup(),
+        allowMachRegister: getAllowMachRegister(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
