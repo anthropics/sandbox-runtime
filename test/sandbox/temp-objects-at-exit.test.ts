@@ -43,9 +43,16 @@ describe.if(isLinux || isMacOS)('temp objects when the process ends', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  /** The library's objects among `names`, by kind: `srt-ca-Ab12Cd` is an `srt-ca`. */
+  /**
+   * The library's objects among `names`, by kind: `srt-ca-Ab12Cd` is an
+   * `srt-ca`. Not the directory of the mount-point manifests: it is the
+   * user's, shared with other processes, and there to outlive this one.
+   */
   const kinds = (names: string[]): string[] =>
-    names.flatMap(name => /^(srt|claude)-[a-z]+/.exec(name)?.[0] ?? []).sort()
+    names
+      .filter(name => !name.startsWith('srt-mount-points'))
+      .flatMap(name => /^(srt|claude)-[a-z]+/.exec(name)?.[0] ?? [])
+      .sort()
 
   const START = `await SandboxManager.initialize(config)
       await SandboxManager.wrapWithSandbox('true')`
@@ -64,7 +71,7 @@ describe.if(isLinux || isMacOS)('temp objects when the process ends', () => {
     const script = `
       const { readdirSync } = await import('node:fs')
       const { SandboxManager } = await import(${JSON.stringify(
-        join(import.meta.dir, '../../src/sandbox/sandbox-manager.ts'),
+        join(import.meta.dir, '../helpers/isolated/manager.ts'),
       )})
       const config = {
         network: {

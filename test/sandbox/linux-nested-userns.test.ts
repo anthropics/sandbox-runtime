@@ -323,7 +323,7 @@ describe.if(isLinux)(
     it('says once per process that nothing limits namespaces, and only where that is so', () => {
       // A process of its own: the warning is given once in each.
       const script = `
-        import { wrapCommandWithSandboxLinux } from ${JSON.stringify(join(import.meta.dir, '../../src/sandbox/linux-sandbox-utils.ts'))}
+        import { wrapCommandWithSandboxLinux } from ${JSON.stringify(join(import.meta.dir, '../helpers/isolated/library.ts'))}
         const wrap = bwrapPath => wrapCommandWithSandboxLinux({
           command: 'true',
           needsNetworkRestriction: false,
