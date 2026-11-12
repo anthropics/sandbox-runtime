@@ -203,7 +203,7 @@ let initializeGeneration = 0
 let windowsProfileGrantAbort: AbortController | undefined
 let cleanupRegistered = false
 let ownInstallLogged = false
-let logMonitorShutdown: (() => void) | undefined
+let logMonitorShutdown: (() => Promise<void>) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
 /** Read live through {@link directLookup}, so a config update applies to the next dial. */
@@ -3713,10 +3713,8 @@ async function reset(): Promise<void> {
   cleanupBwrapMountPoints({ force: true })
 
   // Stop log monitor
-  if (logMonitorShutdown) {
-    logMonitorShutdown()
-    logMonitorShutdown = undefined
-  }
+  const stopLogMonitor = logMonitorShutdown
+  const monitorClosed = stopLogMonitor?.()
   if (linuxMonitor) {
     linuxMonitor.stop()
     linuxMonitor = undefined
@@ -3763,6 +3761,10 @@ async function reset(): Promise<void> {
   // Close servers in parallel (only if they exist, i.e., were started by us)
   const closePromises: Promise<void>[] = []
 
+  if (monitorClosed) {
+    closePromises.push(monitorClosed)
+  }
+
   if (mitmCA) {
     closePromises.push(disposeMitmCA(mitmCA))
   }
@@ -3794,6 +3796,9 @@ async function reset(): Promise<void> {
   await Promise.all(closePromises)
 
   // Clear references
+  if (logMonitorShutdown === stopLogMonitor) {
+    logMonitorShutdown = undefined
+  }
   muxProxyServer = undefined
   httpProxyServer = undefined
   proxyAuthToken = undefined

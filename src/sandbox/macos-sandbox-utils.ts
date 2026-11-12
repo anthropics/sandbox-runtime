@@ -1634,7 +1634,7 @@ export function startMacOSSandboxLogMonitor(
    *  `sanitizeUnregisteredCommandKey`, which treats the key as the untrusted
    *  bytes it arrived as. */
   resolveCommandText: (decodedKey: string) => string,
-): () => void {
+): () => Promise<void> {
   // Pre-compile regex patterns for better performance
   const cmdExtractRegex = /CMD64_(.+?)_END/
   const sandboxExtractRegex = /Sandbox:\s+(.+)$/
@@ -1718,8 +1718,35 @@ export function startMacOSSandboxLogMonitor(
     logForDebugging(`[Sandbox Monitor] Log stream exited with code: ${code}`)
   })
 
+  let closed = false
+  let stopping = false
+  let stopTimeout: ReturnType<typeof setTimeout> | undefined
+  const close = new Promise<void>(resolve => {
+    logProcess.once('close', () => {
+      closed = true
+      clearTimeout(stopTimeout)
+      resolve()
+    })
+  })
+
   return () => {
-    logForDebugging('[Sandbox Monitor] Stopping log monitor')
-    logProcess.kill('SIGTERM')
+    if (!closed && !stopping) {
+      stopping = true
+      if (
+        logProcess.pid &&
+        logProcess.exitCode === null &&
+        logProcess.signalCode === null
+      ) {
+        logForDebugging('[Sandbox Monitor] Stopping log monitor')
+        logProcess.kill('SIGTERM')
+        stopTimeout = setTimeout(() => {
+          if (logProcess.exitCode === null && logProcess.signalCode === null) {
+            logProcess.kill('SIGKILL')
+          }
+        }, 1000)
+        stopTimeout.unref()
+      }
+    }
+    return close
   }
 }

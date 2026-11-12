@@ -219,7 +219,7 @@ describe('violation monitors resolve through the manager registry', () => {
       'startMacOSSandboxLogMonitor',
     ).mockImplementation((_callback, _ignoreViolations, resolve) => {
       resolver = resolve
-      return () => {}
+      return () => Promise.resolve()
     })
     try {
       await initWithLogMonitor()
