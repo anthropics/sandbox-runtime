@@ -46,7 +46,11 @@
 //! disabled logon SID. Unlike `WinSta0`, the BNO is an ordinary
 //! object-manager directory whose access check honours user-SID ACEs;
 //! and the broker's user SID has full control on it (verified by
-//! probe), so the broker can write the DACL non-elevated.
+//! probe), so the broker can write the DACL non-elevated. Session 0
+//! has no session folder: its named objects live in the global
+//! `\BaseNamedObjects`, which is shared by every service and whose
+//! DACL already lets Everyone create subdirectories, so the grant
+//! does nothing there.
 //!
 //! **Both grants persist for the session — no revoke-on-drop.**
 //! Concurrent brokers (parallel `srt-win exec`, the normal case for a
@@ -276,9 +280,14 @@ pub fn grant_sandbox_on_winsta(sb_sid: &str) -> Result<()> {
 /// BaseNamedObjects`. Idempotent. Persists for the broker's logon
 /// session — see module doc for why there is no revoke. The broker's
 /// **user** SID has full control on the session BNO (verified by
-/// probe), so this works non-elevated.
+/// probe), so this works non-elevated. A no-op from session 0, which
+/// has no such folder.
 pub fn grant_sandbox_on_session_bno(sb_sid: &str) -> Result<()> {
-    let bno = open_session_bno()?;
+    let ts = broker_session()?;
+    let Some(path) = session_bno_path(ts) else {
+        return Ok(());
+    };
+    let bno = open_session_bno(&path)?;
     let si = DACL_SECURITY_INFORMATION.0;
     recompose_dacl(
         "session BNO",
@@ -317,19 +326,30 @@ pub fn grant_sandbox_on_session_bno(sb_sid: &str) -> Result<()> {
     .context("grant srt-sandbox on session BaseNamedObjects")
 }
 
-/// `NtOpenDirectoryObject(\Sessions\<broker-TS>\BaseNamedObjects,
-/// READ_CONTROL | WRITE_DAC)`. The direct path (not via the
-/// `\Sessions\BNOLINKS\<TS>` symlink) so the open targets the
-/// directory object itself.
-fn open_session_bno() -> Result<OwnedHandle> {
-    const READ_CONTROL: u32 = 0x0002_0000;
-    const WRITE_DAC: u32 = 0x0004_0000;
-
+/// The session the broker runs in.
+fn broker_session() -> Result<u32> {
     let mut ts = 0u32;
     unsafe { ProcessIdToSessionId(std::process::id(), &mut ts) }
         .context("ProcessIdToSessionId(broker)")?;
-    let path = format!("\\Sessions\\{ts}\\BaseNamedObjects");
-    let (mut path_w, bytes) = crate::util::counted_utf16(&path);
+    Ok(ts)
+}
+
+/// `\Sessions\<ts>\BaseNamedObjects`, or `None` for session 0, whose
+/// named objects live in the global `\BaseNamedObjects` and have no
+/// session folder.
+fn session_bno_path(ts: u32) -> Option<String> {
+    (ts != 0).then(|| format!("\\Sessions\\{ts}\\BaseNamedObjects"))
+}
+
+/// `NtOpenDirectoryObject(path, READ_CONTROL | WRITE_DAC)`, where `path`
+/// is [`session_bno_path`]. The direct path (not via the
+/// `\Sessions\BNOLINKS\<TS>` symlink) so the open targets the
+/// directory object itself.
+fn open_session_bno(path: &str) -> Result<OwnedHandle> {
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+
+    let (mut path_w, bytes) = crate::util::counted_utf16(path);
     let name = UNICODE_STRING {
         Length: bytes,
         MaximumLength: bytes,
@@ -495,4 +515,22 @@ fn object_name(h: HANDLE) -> Result<String> {
         unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u16, (needed as usize) / 2) };
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     Ok(String::from_utf16_lossy(&wide[..end]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_zero_has_no_session_folder_to_grant() {
+        assert_eq!(session_bno_path(0), None);
+    }
+
+    #[test]
+    fn a_desktop_session_grants_its_own_folder() {
+        assert_eq!(
+            session_bno_path(2).as_deref(),
+            Some(r"\Sessions\2\BaseNamedObjects")
+        );
+    }
 }
