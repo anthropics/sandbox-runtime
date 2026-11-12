@@ -362,7 +362,7 @@ jobs:
           # the Windows path pipeline, glob-expand holds the UNC pass-raw
           # block that runs on no other leg, and config-validation covers the
           # schema on a real Windows host rather than under a platform spy.
-          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
+          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/listen-in-range.test.ts test/sandbox/winsrt-paths.property.test.ts test/sandbox/glob-expand.test.ts test/config-validation.test.ts
 
       # Diagnostic only: why the MXC BaseContainer tier is or isn't available
       # on this runner. Never fails the job.
