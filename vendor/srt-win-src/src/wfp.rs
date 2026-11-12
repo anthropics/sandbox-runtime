@@ -761,12 +761,20 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
     })
 }
 
-/// Status of the WFP fence under `sublayer`. `installed` iff at
-/// least one `block-user` srt-win filter exists. (We don't insist
-/// on the exact count so enterprise tooling that adds extras under
-/// the same sublayer doesn't break detection.) `port_range` is read
-/// from the first `permit-loopback-user` tag. `loopback-mismatch`: the
-/// filters' loopback mode is not the install record's ([`apply_recorded_loopback`]).
+/// Status of the WFP fence under `sublayer`. `installed` iff every
+/// filter [`install_filters`] adds is present at BOTH connect layers
+/// ([`tags_fence_state`]): the proxy PERMIT and the `block-user`, and
+/// the open-loopback PERMIT when the set shows one on any layer or
+/// the install record says loopback is open
+/// ([`apply_recorded_loopback`]). `partial` when some but not all of
+/// those are present (e.g. one address family's block was deleted:
+/// that family is open while a block on the other still exists), so
+/// `install`'s early-out falls through and re-adds the set. (We still
+/// don't insist on the exact count so enterprise tooling that adds
+/// extras under the same sublayer doesn't break detection.)
+/// `port_range` is read from the first `permit-loopback-user` tag.
+/// `loopback-mismatch`: the filters' loopback mode is not the install
+/// record's ([`apply_recorded_loopback`]).
 ///
 /// `cannot-read` is the graceful-degrade state when BFE
 /// enumeration is admin-gated ([`WfpAccessDenied`]). The
@@ -780,7 +788,10 @@ pub struct WfpStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port_range: Option<[u16; 2]>,
     /// Whether the set opens loopback: read from the filters when
-    /// elevated, else from the install record.
+    /// elevated, else from the install record. For a `partial` set,
+    /// the record's mode when there is one (the mode a plain install
+    /// restores; the filters left may not show it), else whether any
+    /// open-loopback PERMIT is left.
     pub allow_loopback: bool,
     /// [`open_loopback_notice`], present exactly when `allow_loopback`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -788,7 +799,9 @@ pub struct WfpStatus {
     /// Sandbox-user SID read from the first user-keyed tag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_sid: Option<String>,
-    /// Populated on `cannot-read` and on `loopback-mismatch`.
+    /// Populated on `cannot-read`, on `loopback-mismatch`, and on a
+    /// `partial` set whose filters show loopback closed while the
+    /// install record says open ([`apply_recorded_parts`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
@@ -844,8 +857,10 @@ pub(crate) fn tags_open_loopback(tags: &[(&str, FilterTag)]) -> bool {
 
 /// Fold the sublayer's recorded loopback mode (`None`: no record, as for
 /// a closed set from an earlier build) into an enumerated status: `cannot-read`
-/// reports it; an `installed` set of the other mode becomes `loopback-mismatch`.
-pub fn apply_recorded_loopback(mut st: WfpStatus, recorded: Option<bool>) -> WfpStatus {
+/// reports it; an `installed` set of the other mode becomes `partial`
+/// ([`apply_recorded_parts`]) or `loopback-mismatch`.
+pub fn apply_recorded_loopback(st: WfpStatus, recorded: Option<bool>) -> WfpStatus {
+    let mut st = apply_recorded_parts(st, recorded);
     let recorded = recorded.unwrap_or(false);
     match st.state {
         "cannot-read" => st.allow_loopback = recorded,
@@ -865,6 +880,45 @@ pub fn apply_recorded_loopback(mut st: WfpStatus, recorded: Option<bool>) -> Wfp
     st
 }
 
+/// An `installed` set without the open-loopback PERMITs becomes `partial`
+/// when the install record says loopback is open: the filters cannot
+/// show that mode once those PERMITs are gone from every layer. A
+/// `partial` set takes the recorded mode. Only ever lowers the state;
+/// no record, or an unreadable one, leaves the filters' own verdict
+/// ([`status_from_tags`]).
+pub fn apply_recorded_parts(mut st: WfpStatus, recorded: Option<bool>) -> WfpStatus {
+    if st.state == "installed" && !st.allow_loopback && recorded == Some(true) {
+        st.state = "partial";
+        st.hint = Some(
+            "the filters have loopback closed but the install record says \
+             open — re-run `srt-win install --allow-loopback` to restore \
+             the recorded set, or `srt-win install --force` to keep \
+             loopback closed (one UAC prompt)"
+                .to_string(),
+        );
+    }
+    if st.state == "partial"
+        && let Some(open) = recorded
+    {
+        st.allow_loopback = open;
+    }
+    st
+}
+
+/// Whether `install` without `--force` refuses (exit 13) to replace `st`
+/// (`installed` or `partial`, after [`apply_recorded_parts`]) with a set
+/// of `range` and `allow_loopback`. A set whose `port_range` is unknown
+/// (no proxy PERMIT left, or a legacy tag without a range) has no range
+/// to compare: a partial one is re-added with the requested range, a
+/// complete one is legacy and counts as different.
+pub fn differs_from_request(st: &WfpStatus, range: (u16, u16), allow_loopback: bool) -> bool {
+    let range_differs = match st.port_range {
+        Some(have) => have != [range.0, range.1],
+        None => st.state == "installed",
+    };
+    range_differs || st.allow_loopback != allow_loopback
+}
+
 /// Live BFE enumeration. Admin-gated — a non-elevated caller gets
 /// `state:"cannot-read"` (not an error) so `wfp status` exits 0
 /// with a hint pointing at `wfp verify`. Elevated callers
@@ -879,15 +933,7 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         Err(e) => return Err(e),
     };
     let mut tags: Vec<(&'static str, FilterTag)> = Vec::new();
-    let mut port_range: Option<[u16; 2]> = None;
-    let mut user_sid: Option<String> = None;
     let enum_result = for_each_tagged_filter(&engine, sublayer, |layer, _, tag| {
-        if user_sid.is_none() {
-            user_sid.clone_from(&tag.user_sid);
-        }
-        if tag.kind == KIND_PERMIT_PROXY {
-            port_range = tag.port_range;
-        }
         tags.push((layer, tag.clone()));
     });
     if let Err(e) = enum_result {
@@ -896,16 +942,76 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         }
         return Err(e);
     }
-    let have_block = tags.iter().any(|(_, t)| t.kind == KIND_BLOCK_USER);
-    Ok(WfpStatus {
-        state: if have_block { "installed" } else { "absent" },
+    Ok(status_from_tags(&tags))
+}
+
+/// [`filter_status`] of an enumerated set, before the install record is
+/// folded in. `port_range` is read from the first proxy PERMIT, so only
+/// while one is left; `user_sid` from the first user-keyed tag.
+pub(crate) fn status_from_tags(tags: &[(&str, FilterTag)]) -> WfpStatus {
+    let state = tags_fence_state(tags);
+    let allow_loopback = match state {
+        "partial" => tags.iter().any(|(_, t)| t.kind == KIND_PERMIT_OPEN),
+        _ => tags_open_loopback(tags),
+    };
+    WfpStatus {
+        state,
         filters: tags.len(),
-        port_range,
-        allow_loopback: tags_open_loopback(&tags),
+        port_range: tags
+            .iter()
+            .find(|(_, t)| t.kind == KIND_PERMIT_PROXY)
+            .and_then(|(_, t)| t.port_range),
+        allow_loopback,
         loopback_notice: None,
-        user_sid,
+        user_sid: tags.iter().find_map(|(_, t)| t.user_sid.clone()),
         hint: None,
-    })
+    }
+}
+
+/// [`filter_status`]'s state from the enumerated tags, against the set
+/// [`install_filters`] adds at each layer in the mode the tags show: an
+/// open-loopback PERMIT on ANY layer means the open set, so one left on
+/// a single layer reads `partial`, not a complete closed set. A set
+/// whose open-loopback PERMITs are gone from every layer reads as the
+/// closed set here; [`apply_recorded_loopback`] makes it `partial` when
+/// the install record says open. Every proxy PERMIT must also carry the
+/// same range, as one install writes them: one that opens other ports
+/// than the rest makes the set `partial`. So does a filter of the set
+/// whose user SID tag differs from the others': a block keyed to another
+/// account fences that account only. (The tags are compared with each
+/// other, not with the provisioned sandbox account.) Other kinds are
+/// ignored.
+pub(crate) fn tags_fence_state(tags: &[(&str, FilterTag)]) -> &'static str {
+    let open = tags.iter().any(|(_, t)| t.kind == KIND_PERMIT_OPEN);
+    let specs = filter_specs(DEFAULT_PROXY_PORT_RANGE, open);
+    let present = ALE_LAYERS
+        .iter()
+        .flat_map(|(_, layer)| specs.iter().map(move |s| (*layer, s.kind)))
+        .map(|(layer, kind)| tags.iter().any(|(l, t)| *l == layer && t.kind == kind));
+    let (mut all, mut any) = (true, false);
+    for p in present {
+        all &= p;
+        any |= p;
+    }
+    let mut ranges = tags
+        .iter()
+        .filter(|(_, t)| t.kind == KIND_PERMIT_PROXY)
+        .map(|(_, t)| t.port_range);
+    let first = ranges.next();
+    let one_range = ranges.all(|r| Some(r) == first);
+    let mut sids = tags
+        .iter()
+        .filter(|(_, t)| specs.iter().any(|s| s.kind == t.kind))
+        .map(|(_, t)| &t.user_sid);
+    let first_sid = sids.next();
+    let one_sid = sids.all(|s| Some(s) == first_sid);
+    if all && one_range && one_sid {
+        "installed"
+    } else if any {
+        "partial"
+    } else {
+        "absent"
+    }
 }
 
 fn cannot_read(e: anyhow::Error) -> WfpStatus {
@@ -1101,9 +1207,16 @@ mod tests {
             assert_eq!((st.state, st.allow_loopback), ("installed", open));
             assert_eq!(st.loopback_notice.is_some(), open);
             // They differ: the filters' mode is reported, and the state says so.
+            // A closed set recorded open lacks filters the install adds: `partial`,
+            // with the recorded mode, the one a plain install restores.
             let st = apply_recorded_loopback(with("installed", open), Some(!open));
-            assert_eq!(st.state, "loopback-mismatch", "filters {open}");
-            assert_eq!(st.allow_loopback, open);
+            if open {
+                assert_eq!((st.state, st.allow_loopback), ("loopback-mismatch", open));
+            } else {
+                assert_eq!((st.state, st.allow_loopback), ("partial", true));
+                let hint = st.hint.as_deref().unwrap();
+                assert!(hint.contains("srt-win install --allow-loopback`"));
+            }
             assert!(st.hint.unwrap().contains("srt-win install --force"));
         }
         // No record is how a closed set from an earlier build reads.
@@ -1215,6 +1328,278 @@ mod tests {
         let g2 = parse_guid("{2c5d0ad6-5f3b-4d4e-9b8f-1a3e7c9d0b21}").unwrap();
         assert_eq!(g1, g2);
         assert_eq!(g1, DEFAULT_SUBLAYER_GUID);
+    }
+
+    #[test]
+    fn fence_parts_state() {
+        let (v4, v6) = (ALE_LAYERS[0].1, ALE_LAYERS[1].1);
+        assert_eq!(tags_fence_state(&[]), "absent");
+        // Each mode's whole set, then that set less any one filter.
+        for open_layers in [&[][..], &[v4, v6][..]] {
+            let set = enumerated(open_layers);
+            assert_eq!(set.len(), filter_count(!open_layers.is_empty()));
+            assert_eq!(tags_fence_state(&set), "installed");
+            for i in 0..set.len() {
+                let mut less = set.clone();
+                let (layer, gone) = less.remove(i);
+                assert_eq!(tags_fence_state(&less), "partial", "{layer} {}", gone.kind);
+            }
+        }
+        // The open PERMIT on one layer is the open set less the other's.
+        assert_eq!(tags_fence_state(&enumerated(&[v4])), "partial");
+        assert_eq!(tags_fence_state(&enumerated(&[v6])), "partial");
+        assert_eq!(tags_fence_state(&[(v4, tag(KIND_PERMIT_OPEN))]), "partial");
+        // Unknown kinds/layers neither complete nor start a set.
+        assert_eq!(
+            tags_fence_state(&[(v4, tag("legacy-group")), ("other", tag(KIND_BLOCK_USER))]),
+            "absent"
+        );
+        // Every open PERMIT gone reads as the closed set until the record
+        // says open; the record only ever lowers the state.
+        let closed = |state| WfpStatus {
+            filters: filter_count(false),
+            ..status(state)
+        };
+        for (recorded, want) in [
+            (None, "installed"),
+            (Some(false), "installed"),
+            (Some(true), "partial"),
+        ] {
+            assert_eq!(
+                apply_recorded_parts(closed("installed"), recorded).state,
+                want
+            );
+            assert_eq!(
+                apply_recorded_loopback(closed("installed"), recorded).state,
+                want
+            );
+            assert_eq!(
+                apply_recorded_parts(closed("partial"), recorded).state,
+                "partial"
+            );
+            assert_eq!(
+                apply_recorded_parts(closed("absent"), recorded).state,
+                "absent"
+            );
+        }
+        let open = WfpStatus {
+            allow_loopback: true,
+            ..status("installed")
+        };
+        assert_eq!(apply_recorded_parts(open, Some(false)).state, "installed");
+    }
+
+    #[test]
+    fn proxy_permits_of_different_ranges_are_not_a_complete_set() {
+        let (v4, v6) = (ALE_LAYERS[0].1, ALE_LAYERS[1].1);
+        for open in [false, true] {
+            for wide in [v4, v6] {
+                let set: Vec<_> = installed_set(open)
+                    .into_iter()
+                    .map(|(l, mut t)| {
+                        if l == wide && t.kind == KIND_PERMIT_PROXY {
+                            t.port_range = Some([1024, 65535]);
+                        }
+                        (l, t)
+                    })
+                    .collect();
+                let st = apply_recorded_loopback(status_from_tags(&set), Some(open));
+                assert_eq!(st.state, "partial", "{} {wide}", fmt_loopback(open));
+                // The first PERMIT's range is reported; a plain install of
+                // that range re-adds the set, another range needs --force.
+                let have = st.port_range.unwrap();
+                assert!(!differs_from_request(&st, (have[0], have[1]), open));
+                let other = if have == [1024, 65535] {
+                    DEFAULT_PROXY_PORT_RANGE
+                } else {
+                    (1024, 65535)
+                };
+                assert!(differs_from_request(&st, other, open));
+            }
+        }
+        // Legacy tags (no range on any) still agree.
+        let legacy: Vec<_> = installed_set(false)
+            .into_iter()
+            .map(|(l, mut t)| {
+                t.port_range = None;
+                (l, t)
+            })
+            .collect();
+        assert_eq!(tags_fence_state(&legacy), "installed");
+    }
+
+    #[test]
+    fn filters_keyed_to_different_users_are_not_a_complete_set() {
+        let (v4, v6) = (ALE_LAYERS[0].1, ALE_LAYERS[1].1);
+        let range = DEFAULT_PROXY_PORT_RANGE;
+        let rekey = |set: Vec<(&'static str, FilterTag)>, layer: &str, kind: &str| {
+            set.into_iter()
+                .map(|(l, mut t)| {
+                    if l == layer && t.kind == kind {
+                        t.user_sid = Some("S-1-5-21-9-9-9-1001".into());
+                    }
+                    (l, t)
+                })
+                .collect::<Vec<_>>()
+        };
+        for open in [false, true] {
+            assert_eq!(tags_fence_state(&installed_set(open)), "installed");
+            for layer in [v4, v6] {
+                for kind in [KIND_BLOCK_USER, KIND_PERMIT_PROXY] {
+                    let ctx = format!("{} {layer} {kind}", fmt_loopback(open));
+                    let set = rekey(installed_set(open), layer, kind);
+                    let st = apply_recorded_loopback(status_from_tags(&set), Some(open));
+                    assert_eq!(st.state, "partial", "{ctx}");
+                    // A plain install of the recorded mode re-adds the set.
+                    let st = apply_recorded_parts(status_from_tags(&set), Some(open));
+                    assert!(!differs_from_request(&st, range, open), "{ctx}");
+                }
+            }
+        }
+        let set = rekey(installed_set(true), v6, KIND_PERMIT_OPEN);
+        assert_eq!(tags_fence_state(&set), "partial");
+        // A tag of another kind is not part of the set.
+        let mut set = installed_set(false);
+        set.push((
+            v4,
+            FilterTag::user("legacy-group", "S-1-5-21-9-9-9-1001", None),
+        ));
+        assert_eq!(tags_fence_state(&set), "installed");
+    }
+
+    /// The set [`install_filters`] adds, tagged as it tags them.
+    fn installed_set(open: bool) -> Vec<(&'static str, FilterTag)> {
+        ALE_LAYERS
+            .iter()
+            .flat_map(|(_, layer)| {
+                filter_specs(DEFAULT_PROXY_PORT_RANGE, open)
+                    .into_iter()
+                    .map(move |s| {
+                        let t = FilterTag::user(s.kind, "S-1-5-21-1-2-3-1005", s.port_range());
+                        (*layer, t)
+                    })
+            })
+            .collect()
+    }
+
+    /// `set` less every filter of a `kind` on a layer in `gone`.
+    fn less(
+        set: &[(&'static str, FilterTag)],
+        gone: &[(&str, &str)],
+    ) -> Vec<(&'static str, FilterTag)> {
+        set.iter()
+            .filter(|(l, t)| !gone.contains(&(*l, t.kind.as_str())))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn with_a_readable_record_a_plain_install_repairs_every_partial_set() {
+        let (v4, v6) = (ALE_LAYERS[0].1, ALE_LAYERS[1].1);
+        let range = DEFAULT_PROXY_PORT_RANGE;
+        let holes: &[(&str, &[(&str, &str)])] = &[
+            ("H4", &[(v4, KIND_BLOCK_USER)]),
+            ("H6", &[(v6, KIND_BLOCK_USER)]),
+            ("HP4", &[(v4, KIND_PERMIT_PROXY)]),
+            ("HP", &[(v4, KIND_PERMIT_PROXY), (v6, KIND_PERMIT_PROXY)]),
+            ("HO4", &[(v4, KIND_PERMIT_OPEN)]),
+            ("HO6", &[(v6, KIND_PERMIT_OPEN)]),
+            ("HO", &[(v4, KIND_PERMIT_OPEN), (v6, KIND_PERMIT_OPEN)]),
+        ];
+        for open in [false, true] {
+            let full = installed_set(open);
+            // `wfp status` and `install`'s pre-check, the record agreeing.
+            let st = apply_recorded_loopback(status_from_tags(&full), Some(open));
+            assert_eq!((st.state, st.allow_loopback), ("installed", open));
+            let st = apply_recorded_parts(status_from_tags(&full), Some(open));
+            assert!(!differs_from_request(&st, range, open));
+            for (name, gone) in holes {
+                if !open && name.starts_with("HO") {
+                    continue; // A closed set has no open PERMIT to lose.
+                }
+                let set = less(&full, gone);
+                let ctx = format!("{} {name}", fmt_loopback(open));
+                assert_eq!(set.len(), full.len() - gone.len(), "{ctx}");
+                let st = apply_recorded_loopback(status_from_tags(&set), Some(open));
+                assert_eq!(st.state, "partial", "{ctx}");
+                assert_eq!(st.allow_loopback, open, "{ctx}");
+                assert_eq!(st.loopback_notice.is_some(), open, "{ctx}");
+                // Only a set that cannot show its mode names the repair.
+                assert_eq!(st.hint.is_some(), *name == "HO", "{ctx}");
+                assert_eq!(st.filters, set.len(), "{ctx}");
+                let kept_range = *name != "HP";
+                let want_range = kept_range.then_some([range.0, range.1]);
+                assert_eq!(st.port_range, want_range, "{ctx}");
+                // Not the early-out (`installed` only); no exit 13 for the
+                // same mode, exit 13 without --force for another mode or,
+                // while a proxy PERMIT is left to say so, another range.
+                let st = apply_recorded_parts(status_from_tags(&set), Some(open));
+                assert_eq!(st.state, "partial", "{ctx}");
+                assert!(!differs_from_request(&st, range, open), "{ctx}");
+                assert!(differs_from_request(&st, range, !open), "{ctx}");
+                let other = differs_from_request(&st, (60090, 60099), open);
+                assert_eq!(other, kept_range, "{ctx}");
+            }
+        }
+        // A legacy complete set (no range on its tag) still needs --force.
+        let legacy: Vec<_> = installed_set(false)
+            .into_iter()
+            .map(|(l, mut t)| {
+                t.port_range = None;
+                (l, t)
+            })
+            .collect();
+        assert!(differs_from_request(
+            &status_from_tags(&legacy),
+            range,
+            false
+        ));
+    }
+
+    /// No record, or an unreadable one (`install` and `wfp status` read it
+    /// with `.ok().flatten()`): the filters alone give the mode. While an
+    /// open-loopback PERMIT is left the set is the open one; with none left
+    /// it cannot be told from the closed set, so `install --allow-loopback`
+    /// over it exits 13 and needs --force. Every block it has is still in
+    /// place either way.
+    #[test]
+    fn without_a_record_the_filters_alone_give_the_mode() {
+        let (v4, v6) = (ALE_LAYERS[0].1, ALE_LAYERS[1].1);
+        let range = DEFAULT_PROXY_PORT_RANGE;
+        let at = |set: &[(&'static str, FilterTag)]| {
+            let shown = apply_recorded_loopback(status_from_tags(set), None);
+            let pre = apply_recorded_parts(status_from_tags(set), None);
+            assert_eq!(
+                (shown.state, shown.allow_loopback),
+                (pre.state, pre.allow_loopback)
+            );
+            pre
+        };
+        // A closed set: every hole is repaired by a plain install.
+        let closed = installed_set(false);
+        for gone in [(v4, KIND_BLOCK_USER), (v6, KIND_PERMIT_PROXY)] {
+            let st = at(&less(&closed, &[gone]));
+            assert_eq!((st.state, st.allow_loopback), ("partial", false));
+            assert!(!differs_from_request(&st, range, false));
+            assert!(differs_from_request(&st, range, true));
+        }
+        // An open set with an open PERMIT left: still the open set.
+        let open = installed_set(true);
+        for gone in [&[(v4, KIND_PERMIT_OPEN)][..], &[(v6, KIND_BLOCK_USER)][..]] {
+            let st = at(&less(&open, gone));
+            assert_eq!((st.state, st.allow_loopback), ("partial", true));
+            assert!(!differs_from_request(&st, range, true));
+        }
+        // None left: read as the closed set, complete or not.
+        let ho = [(v4, KIND_PERMIT_OPEN), (v6, KIND_PERMIT_OPEN)];
+        let st = at(&less(&open, &ho));
+        assert_eq!((st.state, st.allow_loopback), ("installed", false));
+        assert!(differs_from_request(&st, range, true));
+        let ho_h4 = [ho[0], ho[1], (v4, KIND_BLOCK_USER)];
+        let st = at(&less(&open, &ho_h4));
+        assert_eq!((st.state, st.allow_loopback), ("partial", false));
+        assert!(differs_from_request(&st, range, true));
+        assert!(!differs_from_request(&st, range, false));
     }
 
     #[test]
