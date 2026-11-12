@@ -46,6 +46,7 @@ function runCli(
     stdout: result.stdout,
     stderr: result.stderr,
     status: result.status,
+    signal: result.signal,
   }
 }
 
@@ -144,6 +145,38 @@ describe('CLI', () => {
       const result = runCli(['printf', '%s', '$HOME;|&'])
       expect(result.stdout).toBe('$HOME;|&')
       expect(result.status).toBe(0)
+    })
+  })
+
+  describe('signal termination propagation', () => {
+    test('propagates SIGTERM termination status', () => {
+      const result = runCli([
+        'node',
+        '-e',
+        'process.kill(process.pid, "SIGTERM")',
+      ])
+      if (process.platform === 'win32') {
+        expect(result.status).toBe(128 + 15)
+      } else {
+        expect(result.signal === 'SIGTERM' || result.status === 128 + 15).toBe(
+          true,
+        )
+      }
+    })
+
+    test('propagates SIGINT termination status', () => {
+      const result = runCli([
+        'node',
+        '-e',
+        'process.kill(process.pid, "SIGINT")',
+      ])
+      if (process.platform === 'win32') {
+        expect(result.status).toBe(128 + 2)
+      } else {
+        expect(result.signal === 'SIGINT' || result.status === 128 + 2).toBe(
+          true,
+        )
+      }
     })
   })
 
