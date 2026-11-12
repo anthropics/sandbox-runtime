@@ -1812,9 +1812,20 @@ function buildSandboxCommand(
   // nothing listens; one that takes IPv4 refuses a client to which `localhost`
   // is ::1 and that tries no second address. So the family is named: IPv6 with
   // IPv4 mapped in, which serves both, and IPv4 alone where that fails.
-  const relay = (port: number, socketPath: string): string =>
-    `{ ${socat} TCP6-LISTEN:${port},ipv6only=0,${listen} UNIX-CONNECT:${socketPath} || ` +
-    `exec ${socat} TCP4-LISTEN:${port},${listen} UNIX-CONNECT:${socketPath}; } >/dev/null 2>&1 &`
+  //
+  // The address is quoted for the same reason the binary is: this string is
+  // shell source that the inner `<shell> -c` re-parses, and the socket paths sit
+  // under tmpdir(), which is whatever TMPDIR says. A space there splits the
+  // address into two words, socat is handed a third address and exits, and
+  // `>/dev/null 2>&1` swallows the message, so the command runs on with a relay
+  // that never bound.
+  const relay = (port: number, socketPath: string): string => {
+    const address = quote([`UNIX-CONNECT:${socketPath}`])
+    return (
+      `{ ${socat} TCP6-LISTEN:${port},ipv6only=0,${listen} ${address} || ` +
+      `exec ${socat} TCP4-LISTEN:${port},${listen} ${address}; } >/dev/null 2>&1 &`
+    )
+  }
   const socatCommands = [
     relay(3128, httpSocketPath),
     '_srt_http=$!',
