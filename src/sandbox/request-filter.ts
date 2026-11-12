@@ -8,7 +8,6 @@
  * enforces the decision; the library does not bless any matching DSL.
  */
 
-import { endRequestAfterResponse } from './emitted-connection.js'
 import {
   METHODS,
   type IncomingHttpHeaders,
@@ -18,6 +17,7 @@ import {
 import { isIP } from 'node:net'
 import { type Duplex, PassThrough, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
+import { drainThenDestroy } from './drain-then-destroy.js'
 import { isResolvedAddressDenied } from './resolved-address-guard.js'
 import { sanitizeDenialReason } from './sandbox-violation-store.js'
 
@@ -171,26 +171,6 @@ const ECHO_METHODS = new Set(['TRACE', 'TRACK'])
  * (<sandbox_violations>), so it names the policy, not the internal hook.
  */
 export const DEFAULT_DENY_REASON = 'denied by sandbox policy'
-
-/**
- * Destroy a denied client's request only after the 403 has flushed —
- * destroying the shared socket in the same tick can RST the response
- * away (observed on Node; the unread request body makes close send RST).
- */
-function destroyAfterResponse(req: IncomingMessage, res: ServerResponse): void {
-  if (res.destroyed) {
-    req.destroy()
-    return
-  }
-  if (res.writableFinished) {
-    endRequestAfterResponse(req)
-    return
-  }
-  res.once('finish', () => endRequestAfterResponse(req))
-  res.once('close', () => {
-    if (!res.writableFinished) req.destroy()
-  })
-}
 
 /**
  * Build a `Request`, run the callback, and if denied write the 403 response
@@ -387,7 +367,7 @@ function endDeniedBody(
     req.resume()
   }
   if (forUpstream !== req) forUpstream.destroy()
-  destroyAfterResponse(req, res)
+  drainThenDestroy(req, res)
 }
 
 /**
