@@ -57,6 +57,7 @@ export interface MacOSSandboxParams {
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  denyMachLookup?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   /** Environment variable names to unset for the sandboxed child (env -u) */
@@ -1055,6 +1056,7 @@ function generateSandboxProfile({
   allowAllUnixSockets,
   allowLocalBinding,
   allowMachLookup,
+  denyMachLookup,
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
@@ -1072,6 +1074,7 @@ function generateSandboxProfile({
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  denyMachLookup?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
@@ -1135,10 +1138,8 @@ function generateSandboxProfile({
     ...(allowMachLookup && allowMachLookup.length > 0
       ? [
           '; User-specified XPC/Mach services',
-          ...allowMachLookup.map(name =>
-            name.endsWith('*')
-              ? `(allow mach-lookup (global-name-prefix ${escapePath(name.slice(0, -1))}))`
-              : `(allow mach-lookup (global-name ${escapePath(name)}))`,
+          ...allowMachLookup.map(
+            name => `(allow mach-lookup ${machServiceFilter(name)})`,
           ),
         ]
       : []),
@@ -1396,6 +1397,18 @@ function generateSandboxProfile({
     profile.push(')')
   }
 
+  // Last, so no allow above (the essential services included) re-opens
+  // them: Seatbelt applies the last rule that matches.
+  if (denyMachLookup && denyMachLookup.length > 0) {
+    profile.push('')
+    profile.push('; User-specified XPC/Mach services to deny')
+    profile.push(
+      ...denyMachLookup.map(
+        name => `(deny mach-lookup ${machServiceFilter(name)})`,
+      ),
+    )
+  }
+
   return profile.join('\n')
 }
 
@@ -1404,6 +1417,16 @@ function generateSandboxProfile({
  */
 function escapePath(pathStr: string): string {
   return JSON.stringify(pathStr)
+}
+
+/**
+ * The Seatbelt filter for an XPC/Mach service name, or for every name that
+ * starts with a prefix ending in "*".
+ */
+function machServiceFilter(name: string): string {
+  return name.endsWith('*')
+    ? `(global-name-prefix ${escapePath(name.slice(0, -1))})`
+    : `(global-name ${escapePath(name)})`
 }
 
 /**
@@ -1425,6 +1448,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    denyMachLookup,
     readConfig,
     writeConfig,
     unsetEnvVars,
@@ -1501,6 +1525,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    denyMachLookup,
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,
