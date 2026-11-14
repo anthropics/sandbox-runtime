@@ -1,5 +1,8 @@
 // Library exports
-export { SandboxManager } from './sandbox/sandbox-manager.js'
+export {
+  SandboxManager,
+  SandboxInitializeConflictError,
+} from './sandbox/sandbox-manager.js'
 export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
 export type {
   WrapWithSandboxOptions,
@@ -123,6 +126,7 @@ export type {
   WindowsProfileGrantStatus,
   WindowsProfileGrantPath,
   WindowsProfileGrantOptions,
+  WindowsProfileForgetResult,
   WindowsProfileGrantResult,
   WindowsProfileGrantItem,
   WindowsInstallProfileGrant,
@@ -133,6 +137,22 @@ export type {
   WindowsPersistentCa,
   SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
+
+// Windows MXC BaseContainer backend, named by `windows.backend`:
+// commands start through SandboxManager.spawnSandboxed().
+export type {
+  MxcProbeOutput,
+  MxcProcessHandle,
+  MxcRequest,
+  MxcSdk,
+  MxcUiCapabilities,
+  WindowsBackendSelection,
+} from './sandbox/mxc-sandbox-utils.js'
+export type {
+  CheckDependenciesOptions,
+  SandboxedProcess,
+  SpawnSandboxedOptions,
+} from './sandbox/sandbox-manager.js'
 
 // TLS-termination CA generation/validation (mitm-ca.ts). Embedders that
 // manage CA persistence themselves (rather than relying on the Windows

@@ -110,14 +110,14 @@ describe('SandboxManager.checkDependencies with seccompConfig', () => {
 
   test('honours explicit seccompConfig.applyPath before initialize()', () => {
     const result = SandboxManager.checkDependencies(undefined, {
-      applyPath: customApply,
+      seccompConfig: { applyPath: customApply },
     })
     expect(result.warnings).not.toContain(warning)
   })
 
   test('async: honours explicit seccompConfig.applyPath', async () => {
     const result = await SandboxManager.checkDependenciesAsync(undefined, {
-      applyPath: customApply,
+      seccompConfig: { applyPath: customApply },
     })
     expect(result.warnings).not.toContain(warning)
     expect(seccompAsyncSpy).toHaveBeenCalledWith(customApply)

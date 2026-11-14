@@ -10,6 +10,7 @@ import {
   writeRootsOf,
   type PathListKind,
 } from './path-entries.js'
+import type { Readable, Writable } from 'node:stream'
 import { createHttpProxyServer } from './http-proxy.js'
 import { assertTlsTerminationSupported } from './emitted-connection.js'
 import { createSocksProxyServer } from './socks-proxy.js'
@@ -82,14 +83,19 @@ import {
   rankWindowsFsAccess,
   restoreWindowsAcl,
   grantWindowsAclPersistent,
+  WINDOWS_INSTALL_COMMAND,
   windowsSetupVersionMismatch,
   windowsSrtWinOutdatedError,
   missingWindowsSrtWinCapability,
   windowsGrantsBeneathDenies,
   type WindowsProfileGrantItem,
+  type WindowsProfileGrantResult,
   type WindowsProfileGrantStatus,
   getWindowsProfileReadStatus,
   getWindowsProfileReadStatusAsync,
+  grantWindowsProfileRead,
+  retryWindowsProfileStale,
+  windowsProfileGrantRefreshable,
   windowsProfileExclusionConflicts,
   revokeWindowsAclChecked,
   type WindowsAclRevokeResult,
@@ -103,6 +109,17 @@ import {
   type WindowsFsAccessSet,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './windows-sandbox-utils.js'
+import {
+  isMxcSdkInstalled,
+  resolveMxcSdk,
+  verifyMxcBackend,
+  buildMxcRequest,
+  spawnMxcRequest,
+  MXC_SDK_MISSING,
+  type WindowsBackendSelection,
+  type MxcSdk,
+  type MxcProcessHandle,
+} from './mxc-sandbox-utils.js'
 import {
   getDefaultWritePaths,
   containsGlobChars,
@@ -151,6 +168,7 @@ import {
 } from './resolved-address-guard.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { getJavaProxyAgentJarPathAsync } from './java-proxy-agent.js'
 import { getApplySeccompBinaryPathAsync } from './generate-seccomp-filter.js'
 
@@ -174,6 +192,15 @@ let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+// The initialize() in flight, from its first step: a profile grant refresh
+// can hold it for minutes before initializationPromise exists. reset()
+// moves the generation on, which cancels it.
+let pendingInitialize:
+  | { promise: Promise<void>; generation: number; args: unknown[] }
+  | undefined
+let initializeGeneration = 0
+// Kills the profile grant a refresh is running, at reset().
+let windowsProfileGrantAbort: AbortController | undefined
 let cleanupRegistered = false
 let ownInstallLogged = false
 let logMonitorShutdown: (() => void) | undefined
@@ -263,6 +290,8 @@ let windowsProfileRead: 'granted' | 'absent' | undefined
 // Windows: what the session has to tell its user about the profile
 // read grant it runs on (getWindowsProfileReadWarnings).
 let windowsProfileReadWarnings: WindowsProfileReadWarning[] = []
+// Windows: what this initialize() found when it refreshed the grant.
+let windowsProfileReadRefresh: WindowsProfileGrantResult | undefined
 
 /** Something about the profile read grant that the user should be shown. */
 export interface WindowsProfileReadWarning {
@@ -368,10 +397,12 @@ export function windowsProfileReadWarningsOf(
       code: 'profile_stale_allow',
       message:
         `${grant.staleAllow.length} path(s) that have left the profile ` +
-        `read grant still carry an entry of it that could not be removed, ` +
-        `and are readable to sandboxed commands through it: ` +
+        `read grant may still carry an entry of it that could not be ` +
+        `removed, and stay readable to sandboxed commands until it is: ` +
         `${list(grant.staleAllow)}. None is on the exclusion list. Each ` +
-        `path's reason gives the icacls command that removes the entry.`,
+        `path's reason says what stopped it. A session start tries local ` +
+        `paths again, at most every six hours; with every sandbox session ` +
+        `closed, \`srt-win profile retry-stale\` tries them all now.`,
       paths: grant.staleAllow,
     })
   }
@@ -398,6 +429,18 @@ export function windowsProfileReadWarningsOf(
 // and so reset()'s revoke/restore addresses the SAME binary the
 // grants/stamps were applied with even if `config` mutated between.
 let srtWinSpawn: SrtWinSpawn | undefined
+// Set iff initialize() selected mxc: the loaded SDK and the session
+// fs sets — the SAME expansion (`computeWindowsFsAccessSet`) the probe
+// validated, applied per spawn inside the MXC request instead of via
+// session ACLs. Its presence IS the "mxc selected" signal
+// spawnSandboxed, wrap and getWindowsBackend dispatch on; srt-win's is
+// `srtWinSpawn`.
+let windowsMxcState:
+  | Readonly<{
+      sdk: MxcSdk
+      fsSet: ReturnType<typeof computeWindowsFsAccessSet>
+    }>
+  | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
@@ -1025,6 +1068,7 @@ async function startMuxProxyServer(
   socksProxyServer = createSocksProxyServer({
     filter: (port, host, encodedCommand) =>
       filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
+    getMitmSocketPath,
     parentProxy,
     lookupFor: directLookup,
     proxyAuthToken,
@@ -1085,6 +1129,21 @@ async function startMuxProxyServer(
 // ============================================================================
 
 /**
+ * A second {@link initialize} while one is in flight asked for something
+ * else: its configuration or callbacks would not have been applied.
+ */
+export class SandboxInitializeConflictError extends Error {
+  readonly code = 'initialize_conflict'
+  constructor() {
+    super(
+      'initialize() is already running with a different configuration or ' +
+        'different callbacks: wait for it, or reset() first',
+    )
+    this.name = 'SandboxInitializeConflictError'
+  }
+}
+
+/**
  * Options of {@link initialize} that are the embedding program's to
  * set, not part of the configuration a user writes.
  */
@@ -1094,6 +1153,18 @@ export interface SandboxInitializeOptions {
    * Never applies to a write root or to a path above an exclusion.
    */
   dangerouslyAllowReadOfProfileExclusions?: readonly string[]
+  /**
+   * Windows: called with each progress line while initialize() narrows
+   * an older profile read grant, which can take minutes. Show the user
+   * why the session has not started yet.
+   */
+  onWindowsProfileGrantProgress?: (line: string) => void
+  /**
+   * Windows, `windows.backend: 'mxc'`: for embedders that bundle the MXC
+   * SDK, an object with its `probe()` and `spawn()`. The session uses it,
+   * and `@microsoft/mxc-sdk` is not resolved.
+   */
+  windowsMxcSdk?: MxcSdk
 }
 
 async function initialize(
@@ -1101,6 +1172,49 @@ async function initialize(
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
   options?: SandboxInitializeOptions,
+): Promise<void> {
+  const args = [runtimeConfig, sandboxAskCallback, enableLogMonitor, options]
+  if (pendingInitialize) {
+    const { promise, generation, args: running } = pendingInitialize
+    if (generation === initializeGeneration) {
+      // Functions compare by identity, the rest by value.
+      if (!isDeepStrictEqual(args, running)) {
+        throw new SandboxInitializeConflictError()
+      }
+      return promise
+    }
+    // A reset() cancelled that run: this one starts once it has stopped.
+    await promise.catch(() => {})
+    return initialize(
+      runtimeConfig,
+      sandboxAskCallback,
+      enableLogMonitor,
+      options,
+    )
+  }
+  const entry = {
+    promise: initializeOnce(
+      runtimeConfig,
+      sandboxAskCallback,
+      enableLogMonitor,
+      options,
+    ),
+    generation: initializeGeneration,
+    args,
+  }
+  pendingInitialize = entry
+  try {
+    await entry.promise
+  } finally {
+    if (pendingInitialize === entry) pendingInitialize = undefined
+  }
+}
+
+async function initializeOnce(
+  runtimeConfig: SandboxRuntimeConfig,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  enableLogMonitor: boolean,
+  options: SandboxInitializeOptions | undefined,
 ): Promise<void> {
   try {
     await initializeSteps(
@@ -1129,6 +1243,14 @@ async function initializeSteps(
     await initializationPromise
     return
   }
+  const generation = initializeGeneration
+  // After every await below: a reset() meanwhile means no session starts.
+  const stopIfReset = (): void => {
+    if (generation !== initializeGeneration) {
+      config = undefined
+      throw new Error('initialize() was cancelled by reset()')
+    }
+  }
 
   // Store config for use by other functions
   config = runtimeConfig
@@ -1152,6 +1274,19 @@ async function initializeSteps(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
+  // An mxc session it cannot run is refused before any CA, proxy or
+  // sandbox is set up; what to try next is the caller's decision.
+  let mxcSdk: MxcSdk | undefined
+  if (getPlatform() === 'windows' && runtimeConfig.windows?.backend === 'mxc') {
+    if (runtimeConfig.network.tlsTerminate) {
+      throw new WindowsSandboxError(
+        'backend_unsupported',
+        'network.tlsTerminate is not supported on the mxc backend',
+      )
+    }
+    assertMxcSessionConfig(runtimeConfig)
+    mxcSdk = await resolveMxcSdk(options?.windowsMxcSdk)
+  }
   // Before any CA, proxy or sandbox is set up: a runtime that cannot
   // terminate TLS in-process fails here, not on each tunnel.
   if (runtimeConfig.network.tlsTerminate) assertTlsTerminationSupported()
@@ -1173,7 +1308,10 @@ async function initializeSteps(
       : undefined
 
   // Check dependencies
-  const deps = await checkDependenciesAsync()
+  const deps = await checkDependenciesAsync(undefined, {
+    windowsMxcSdk: mxcSdk,
+  })
+  stopIfReset()
   if (deps.errors.length > 0) {
     if (deps.reinstallRequired) {
       throw new WindowsSandboxError(
@@ -1263,17 +1401,71 @@ async function initializeSteps(
   // wrap-time) means the host gets a single actionable error before
   // any per-exec work happens, instead of exit-15 on every command.
   if (getPlatform() === 'windows') {
+    if (mxcSdk) {
+      // Compile the session policy ONCE: the probe checks the same
+      // expanded fs sets and the same policy SHAPE (including the
+      // proxy stanza) that every spawn's request will carry, and
+      // spawnSandboxed reuses the expansion. Each spawn probes its own
+      // request again before it starts.
+      //
+      // Masked credential files are denied here as on the srt-win
+      // path below: there is no masked copy to show the child instead.
+      let maskedFiles: string[] = []
+      try {
+        maskedFiles = windowsMaskedFileDenies(
+          getCredentialRestrictions(
+            runtimeConfig.credentials,
+            runtimeConfig.network.allowedDomains,
+          ),
+        )
+      } catch {
+        // onExtractNoMatch: "error" is thrown by every wrap, so nothing runs.
+      }
+      const acc = computeWindowsFsAccessSet(runtimeConfig, maskedFiles)
+      let probeRequest: ReturnType<typeof buildMxcRequest>
+      try {
+        probeRequest = buildMxcRequest({
+          command: 'exit 0',
+          // Representative proxy port: the real mux port is bound
+          // later in initialize (inside this same range on Windows),
+          // and the probe only needs the policy shape, not a live
+          // listener.
+          httpProxyPort:
+            runtimeConfig.network.allowedDomains !== undefined
+              ? DEFAULT_WINDOWS_PROXY_PORT_RANGE[0]
+              : undefined,
+          denyRead: acc.denyRead,
+          denyWrite: acc.denyWrite,
+          allowRead: acc.grantRead,
+          allowWrite: acc.grantWrite,
+        })
+      } catch (e) {
+        throw new WindowsSandboxError(
+          'backend_unsupported',
+          `windows.backend is 'mxc' but the policy did not compile: ${(e as Error).message}`,
+        )
+      }
+      verifyMxcBackend(mxcSdk, probeRequest)
+      // MXC BaseContainer: the OS applies filesystem + network policy
+      // per spawn, in its own elevated context — no sandbox user, no
+      // WFP install, no session ACL stamping, nothing to restore.
+      windowsMxcState = { sdk: mxcSdk, fsSet: acc }
+    }
+    logForDebugging(`[Sandbox Windows] using ${mxcSdk ? 'mxc' : 'srt-win'}`)
+  }
+  if (getPlatform() === 'windows' && !windowsMxcState) {
     // Resolve once (stats disk); captured module-level for wrap/reset.
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
     const u = await getWindowsSandboxUserStatusAsync({ srtWin })
+    stopIfReset()
     if (!u.provisioned || !u.credPresent) {
       config = undefined
       throw new WindowsSandboxError(
         'not_provisioned',
         `Windows sandbox user is not provisioned (user=` +
-          `${u.provisioned}, cred=${u.credPresent}). Run \`npx ` +
-          `sandbox-runtime windows-install\` (one UAC prompt) to ` +
+          `${u.provisioned}, cred=${u.credPresent}). Run ` +
+          `\`${WINDOWS_INSTALL_COMMAND}\` (one UAC prompt) to ` +
           `provision it.`,
       )
     }
@@ -1288,8 +1480,10 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
-    // initialize() never writes or refreshes the profile read grant.
+    // initialize() writes the profile read grant only to narrow one
+    // already there (windowsProfileGrantRefreshable).
     windowsProfileReadWarnings = []
+    windowsProfileReadRefresh = undefined
     let profileRead: 'granted' | 'absent' = 'absent'
     let profileExclusions: Parameters<
       typeof windowsProfileExclusionConflicts
@@ -1302,18 +1496,76 @@ async function initializeSteps(
       }
       windowsCapableSrtWin.add(windowsSrtWinIdentity(srtWin))
       if (u.profileGrant) {
-        const grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        let grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        stopIfReset()
+        let refreshed: WindowsProfileGrantResult | undefined
+        // Before this session is a holder of anything: the grant is
+        // written only while no session or command holds it. A run that
+        // does not finish throws; one that finishes with paths it could
+        // not revoke starts the session, and they are warned about.
+        if (windowsProfileGrantRefreshable(grant)) {
+          logForDebugging(
+            `[Sandbox Windows] refreshing the profile read grant ` +
+              `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''})`,
+          )
+          windowsProfileGrantAbort = new AbortController()
+          try {
+            refreshed = await grantWindowsProfileRead({
+              srtWin,
+              signal: windowsProfileGrantAbort.signal,
+              onProgress: line => {
+                logForDebugging(`[Sandbox Windows] ${line}`)
+                // The host's code, called from a stream handler.
+                try {
+                  options?.onWindowsProfileGrantProgress?.(line)
+                } catch (e) {
+                  logForDebugging(
+                    `[Sandbox Windows] progress callback threw: ${e}`,
+                    { level: 'warn' },
+                  )
+                }
+              },
+            })
+          } catch (e) {
+            stopIfReset()
+            throw e
+          } finally {
+            windowsProfileGrantAbort = undefined
+          }
+          stopIfReset()
+          grant = await getWindowsProfileReadStatusAsync({ srtWin })
+        } else if (
+          grant.state === 'current' &&
+          (grant.staleAllow.length > 0 ||
+            grant.unprotected.some(u => u.entry !== undefined))
+        ) {
+          // Bounded, on the noted paths alone, and never a reason not to
+          // start.
+          try {
+            const { cleared } = await retryWindowsProfileStale({ srtWin })
+            if (cleared > 0) {
+              grant = await getWindowsProfileReadStatusAsync({ srtWin })
+            }
+          } catch (e) {
+            logForDebugging(
+              `[Sandbox Windows] retrying stale profile entries: ${e}`,
+              { level: 'warn' },
+            )
+          }
+        }
+        stopIfReset()
+        windowsProfileReadRefresh = refreshed
         if (grant.state !== 'none' && grant.state !== 'current') {
           throw new WindowsSandboxError(
             'profile_grant_outdated',
             `The recorded read grant on your user profile cannot be used ` +
               `(${grant.state}${grant.reason ? `: ${grant.reason}` : ''}). ` +
               `Call grantWindowsProfileRead() (\`srt-win profile grant\`, ` +
-              `or \`npx sandbox-runtime windows-install\` again) as the ` +
+              `or \`${WINDOWS_INSTALL_COMMAND}\` again) as the ` +
               `user who starts sessions to bring it up to date, or ` +
               `forgetWindowsProfileRead() (\`srt-win profile forget\`) to ` +
               `run without reading the profile. initialize() does neither ` +
-              `itself.`,
+              `itself for a grant in this state.`,
           )
         }
         if (grant.state === 'current') {
@@ -1356,6 +1608,7 @@ async function initializeSteps(
     if (useWindowsPersistentCa && tlsTerminate) {
       try {
         const p = await ensurePersistentWindowsCa({ status: u, srtWin })
+        stopIfReset()
         mitmCA = createMitmCA({
           caCertPem: p.certPem,
           caKeyPem: p.keyPem,
@@ -1460,6 +1713,7 @@ async function initializeSteps(
         allowProfileExclusions: override,
         srtWin,
       })
+      stopIfReset()
       // Gates running revoke/restore at reset(): every session is
       // recorded with srt-win, whatever it was given. Set before the
       // probe, so that a reset() during it releases what was granted.
@@ -1490,6 +1744,7 @@ async function initializeSteps(
           sandboxUser: runtimeConfig.windows?.sandboxUser,
           srtWin,
         })
+        stopIfReset()
         windowsWfpVerifiedFor = sb
         windowsWfpVerifiedLoopback = allowLoopback
       }
@@ -1539,6 +1794,7 @@ async function initializeSteps(
       const muxPort = needLocalProxy
         ? await startMuxProxyServer(sandboxAskCallback, portRange)
         : undefined
+      stopIfReset()
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
       // JVMs read neither HTTPS_PROXY nor its credential; the agent bridges
@@ -1547,6 +1803,7 @@ async function initializeSteps(
       javaAgentJarPath =
         (await getJavaProxyAgentJarPathAsync(config.javaAgentJarPath)) ??
         undefined
+      stopIfReset()
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1574,6 +1831,7 @@ async function initializeSteps(
           socksProxyPort,
           config.socatPath,
         )
+        stopIfReset()
       }
 
       const context: HostNetworkManagerContext = {
@@ -1588,7 +1846,9 @@ async function initializeSteps(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
-      reset().catch(e => {
+      // Awaited: an initialize() queued behind this one must not start
+      // until this clean-up has finished clearing what it shares.
+      await reset().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
         })
@@ -1695,17 +1955,60 @@ function checkDependenciesCommon(
   return { done: { errors, warnings } }
 }
 
+/** Options for {@link checkDependencies}. */
+export interface CheckDependenciesOptions {
+  /**
+   * The Windows backend to check for. Defaults to the initialized
+   * config's `windows.backend`, else srt-win; pass it when checking
+   * before initialize().
+   */
+  windowsBackend?: 'mxc' | 'srt-win'
+  /**
+   * The SDK that will be passed to initialize() as `windowsMxcSdk`, when
+   * checking before initialize() with `windowsBackend: 'mxc'`. With one,
+   * the mxc check does not look for the package.
+   */
+  windowsMxcSdk?: MxcSdk
+  /**
+   * Linux apply-seccomp location to check. Defaults to the initialized
+   * config's `seccomp`, else the bundled/global lookup; pass it when
+   * checking before initialize().
+   */
+  seccompConfig?: SeccompConfig
+}
+
+/**
+ * The mxc backend needs neither srt-win.exe nor the WFP/user install,
+ * only the SDK, injected or as the package. Whether the host can run
+ * it is settled by initialize()'s probe. undefined when the srt-win
+ * check applies.
+ */
+function mxcDependencies(
+  options: CheckDependenciesOptions | undefined,
+): SandboxDependencyCheck | undefined {
+  const backend = options?.windowsBackend ?? config?.windows?.backend
+  if (backend !== 'mxc' || getPlatform() !== 'windows') return undefined
+  return {
+    errors:
+      options?.windowsMxcSdk || windowsMxcState || isMxcSdkInstalled()
+        ? []
+        : [MXC_SDK_MISSING],
+    warnings: [],
+  }
+}
+
 /**
  * Check sandbox dependencies for the current platform
  * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
- * @param seccompConfig - Linux apply-seccomp location to check. If not provided, uses config from initialization or the bundled/global lookup
  * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
  */
 function checkDependencies(
   ripgrepConfig?: RipgrepConfig,
-  seccompConfig?: SeccompConfig,
+  options?: CheckDependenciesOptions,
 ): SandboxDependencyCheck {
-  const common = checkDependenciesCommon(ripgrepConfig, seccompConfig)
+  const mxc = mxcDependencies(options)
+  if (mxc) return mxc
+  const common = checkDependenciesCommon(ripgrepConfig, options?.seccompConfig)
   if ('done' in common) return common.done
   return checkWindowsDependencies(common.windows)
 }
@@ -1719,16 +2022,18 @@ function checkDependencies(
  */
 async function checkDependenciesAsync(
   ripgrepConfig?: RipgrepConfig,
-  seccompConfig?: SeccompConfig,
+  options?: CheckDependenciesOptions,
 ): Promise<SandboxDependencyCheck> {
+  const mxc = mxcDependencies(options)
+  if (mxc) return mxc
   // Linux: resolve apply-seccomp first so its global-npm fallback
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
-  const seccomp = seccompConfig ?? config?.seccomp
+  const seccomp = options?.seccompConfig ?? config?.seccomp
   if (getPlatform() === 'linux' && !seccomp?.argv0) {
     await getApplySeccompBinaryPathAsync(seccomp?.applyPath)
   }
-  const common = checkDependenciesCommon(ripgrepConfig, seccompConfig)
+  const common = checkDependenciesCommon(ripgrepConfig, options?.seccompConfig)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
 }
@@ -2816,6 +3121,14 @@ async function wrapWithSandboxArgv(
   const platform = getPlatform()
 
   if (platform === 'windows') {
+    // The MXC SDK starts the process itself, so there is no argv for
+    // the caller to spawn.
+    if (windowsMxcState) {
+      throw new Error(
+        "windows.backend 'mxc' starts commands itself: use " +
+          'SandboxManager.spawnSandboxed() instead of wrapWithSandboxArgv().',
+      )
+    }
     const hasNetworkConfig =
       customConfig?.network?.allowedDomains !== undefined ||
       config?.network?.allowedDomains !== undefined
@@ -2993,6 +3306,188 @@ async function wrapWithSandboxArgv(
 }
 
 /**
+ * Settings the mxc backend cannot honour, refused rather than run with
+ * a different meaning than on the other backends.
+ *
+ * @throws {WindowsSandboxError} `backend_unsupported`.
+ */
+function assertMxcSessionConfig(c: Partial<SandboxRuntimeConfig>): void {
+  const refuse = (what: string): never => {
+    throw new WindowsSandboxError(
+      'backend_unsupported',
+      `${what} is not supported on the mxc backend`,
+    )
+  }
+  // MXC is allow-list in both directions: "no filesystem restrictions"
+  // has no faithful mapping, and the nearest request would restrict.
+  if (c.filesystem?.disabled) refuse('filesystem.disabled')
+  // A host proxy without a peer identity needs host loopback open, and
+  // MXC promises nothing about other loopback ports either way, so
+  // opening loopback on request is not something srt can guarantee.
+  if (c.network?.allowLocalBinding === true) {
+    refuse('network.allowLocalBinding')
+  }
+}
+
+/** Options for {@link spawnSandboxed}. */
+export interface SpawnSandboxedOptions {
+  /** Inner shell, as for `wrapWithSandboxArgv`. Defaults to cmd.exe. */
+  binShell?: string | WindowsBinShell
+  /** Per-command overrides, as for `wrapWithSandboxArgv`. */
+  customConfig?: Partial<SandboxRuntimeConfig>
+  /** The command's working directory. Defaults to `process.cwd()`. */
+  cwd?: string
+  /** Kill the command after this many milliseconds. */
+  timeoutMs?: number
+  /** As for `wrapWithSandboxArgv`: see {@link WrapWithSandboxOptions}. */
+  commandId?: string
+  /** As for `wrapWithSandboxArgv`: see {@link WrapWithSandboxOptions}. */
+  commandText?: string
+  /**
+   * Variables for the command, laid over the environment the backend
+   * builds for it (the host's base variables, the proxy settings, git's
+   * config), as the `--env` pairs a caller adds to an srt-win argv are.
+   * The command inherits nothing else of this process's environment.
+   */
+  env?: Readonly<Record<string, string>>
+}
+
+/**
+ * A sandboxed command started by {@link spawnSandboxed}. Read each
+ * output stream you want before calling `wait()`: waiting drains any
+ * stream not yet read.
+ */
+export interface SandboxedProcess {
+  /** OS process id of the command. */
+  readonly pid: number
+  readonly stdin: Writable | null
+  readonly stdout: Readable | null
+  readonly stderr: Readable | null
+  /** Resolves once the command and everything it started have exited. */
+  wait(): Promise<{ exitCode: number; timedOut: boolean }>
+  /** Kill the command and everything it started. */
+  kill(): void
+  /** Release native resources once the process is no longer needed. */
+  dispose(): void
+}
+
+function sandboxedProcessOf(p: MxcProcessHandle): SandboxedProcess {
+  return {
+    pid: p.id,
+    get stdin() {
+      return p.standardInput
+    },
+    get stdout() {
+      return p.standardOutput
+    },
+    get stderr() {
+      return p.standardError
+    },
+    wait: () => p.wait(),
+    kill: () => p.kill(),
+    dispose: () => p.dispose(),
+  }
+}
+
+/**
+ * Start `command` in the sandbox and return the running process.
+ *
+ * Only for `windows.backend: 'mxc'`, where the MXC SDK starts the
+ * process itself (other backends use `wrapWithSandboxArgv`). Each call
+ * probes its own policy first and refuses to start a command the host
+ * cannot confine exactly.
+ *
+ * @throws {WindowsSandboxError} `backend_unsupported` when the probe
+ * refuses the request.
+ */
+async function spawnSandboxed(
+  command: string,
+  options: SpawnSandboxedOptions = {},
+): Promise<SandboxedProcess> {
+  const st = windowsMxcState
+  if (getPlatform() !== 'windows' || !st) {
+    throw new Error(
+      "spawnSandboxed() needs an initialized windows.backend 'mxc' " +
+        'session; other backends use wrapWithSandboxArgv().',
+    )
+  }
+  const { customConfig, cwd } = options
+  if (customConfig?.network?.allowLocalBinding === true) {
+    assertMxcSessionConfig({ network: customConfig.network })
+  }
+  const hasNetworkConfig =
+    customConfig?.network?.allowedDomains !== undefined ||
+    config?.network?.allowedDomains !== undefined
+  if (hasNetworkConfig) {
+    await waitForNetworkInitialization()
+  }
+  const credentialRestrictions = getCredentialRestrictions(
+    customConfig?.credentials ?? config?.credentials,
+    customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
+  )
+  // Every spawn carries the FULL policy, so per-command allowRead and
+  // allowWrite are expressible here (srt-win's grants are session ACL
+  // state and refuse them). Per-command paths go through the same
+  // `expandWindowsFsPaths` as the session's.
+  // `mode: 'mask'` files are denied, as on the srt-win path: nothing
+  // can show the child a masked copy. Like there, they stay in force
+  // under `filesystem.disabled`.
+  const fsCfg = customConfig?.filesystem
+  const maskedFiles = windowsMaskedFileDenies(credentialRestrictions)
+  let perExecDenyRead: string[] = []
+  let perExecDenyWrite: string[] = []
+  let perExecAllowRead: string[] = []
+  let perExecAllowWrite: string[] = []
+  if (!fsCfg?.disabled) {
+    perExecAllowRead = expandWindowsFsPaths(fsCfg?.allowRead ?? [], {
+      mode: 'grant',
+    })
+    perExecAllowWrite = expandWindowsFsPaths(fsCfg?.allowWrite ?? [], {
+      mode: 'grant',
+    })
+    // Deny mode keeps a missing literal path, so a file created after
+    // this point is still denied.
+    perExecDenyRead = expandWindowsFsPaths(
+      [
+        ...(fsCfg?.denyRead ?? []),
+        ...getCredentialDenyReadPaths(customConfig?.credentials),
+      ],
+      { mode: 'deny' },
+    )
+    perExecDenyWrite = expandWindowsFsPaths(fsCfg?.denyWrite ?? [], {
+      mode: 'deny',
+    })
+  }
+  const unique = (paths: string[]): string[] => [...new Set(paths)]
+  registerCommandText(command, {
+    commandId: options.commandId,
+    commandText: options.commandText,
+  })
+  const request = buildMxcRequest({
+    command,
+    commandId: options.commandId,
+    httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
+    socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
+    proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
+    setEnvVars: credentialRestrictions.setEnvVars,
+    denyRead: unique([
+      ...st.fsSet.denyRead,
+      ...perExecDenyRead,
+      ...maskedFiles,
+    ]),
+    denyWrite: unique([...st.fsSet.denyWrite, ...perExecDenyWrite]),
+    allowRead: unique([...st.fsSet.grantRead, ...perExecAllowRead]),
+    allowWrite: unique([...st.fsSet.grantWrite, ...perExecAllowWrite]),
+    cwd,
+    gitSafeDirectories: getGitSafeDirectories(customConfig),
+    binShell: parseWindowsBinShell(options.binShell),
+    timeoutMs: options.timeoutMs,
+    env: options.env,
+  })
+  return sandboxedProcessOf(await spawnMxcRequest(st.sdk, request))
+}
+
+/**
  * Get the current sandbox configuration
  * @returns The current configuration, or undefined if not initialized
  */
@@ -3027,9 +3522,11 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   ) {
     logForDebugging(
       `[Sandbox Windows] updateConfig: the resolved file-access set ` +
-        `(filesystem.* ∪ credentials.files) changed but the ACL ` +
-        `stamp/grant is session-wide — call reset() then initialize() ` +
-        `to apply. The previously-applied set stays in effect.`,
+        `(filesystem.* ∪ credentials.files) changed but the session ` +
+        `state is fixed at initialize() — srt-win's ACL stamp/grant ` +
+        `is session-wide, and the mxc backend's probed selection + ` +
+        `fs sets are cached — call reset() then initialize() to ` +
+        `apply. The previously-applied set stays in effect.`,
       { level: 'warn' },
     )
   }
@@ -3193,6 +3690,8 @@ function forceCloseHttpServer(
 }
 
 async function reset(): Promise<void> {
+  initializeGeneration++
+  windowsProfileGrantAbort?.abort()
   // Windows: release this session's sandbox-user ACEs. Best-effort:
   // log anomalies rather than throw, so teardown always completes.
   // Persistent write roots and the denies under them are not released.
@@ -3211,7 +3710,12 @@ async function reset(): Promise<void> {
   srtWinSpawn = undefined
   windowsProfileRead = undefined
   windowsProfileReadWarnings = []
+  windowsProfileReadRefresh = undefined
   windowsCapableSrtWin.clear()
+  // MXC applies policy per spawn and leaves no host state behind, so
+  // there is no ACL/user state to unwind: only the loaded SDK and the
+  // cached fs sets. Processes a caller started stay theirs to dispose.
+  windowsMxcState = undefined
   // windowsWfpVerifiedFor is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
@@ -3315,6 +3819,18 @@ async function reset(): Promise<void> {
   commandTextsByKey.clear()
   commandNetworkListsByKey.clear()
   maskedFileStore.dispose()
+}
+
+/**
+ * Which Windows enforcement backend initialize() selected (and why).
+ * undefined before initialize() or on non-Windows platforms. Hosts
+ * and the Windows test suite log this so a run's enforcement path is
+ * visible at a glance.
+ */
+function getWindowsBackend(): WindowsBackendSelection | undefined {
+  if (windowsMxcState) return { backend: 'mxc' }
+  if (srtWinSpawn) return { backend: 'srt-win' }
+  return undefined
 }
 
 function getSandboxViolationStore() {
@@ -3423,12 +3939,18 @@ export interface ISandboxManager {
   isSupportedPlatform(): boolean
   isSandboxingEnabled(): boolean
   checkDependencies(
-    ripgrepConfig?: { command: string; args?: string[] },
-    seccompConfig?: SeccompConfig,
+    ripgrepConfig?: {
+      command: string
+      args?: string[]
+    },
+    options?: CheckDependenciesOptions,
   ): SandboxDependencyCheck
   checkDependenciesAsync(
-    ripgrepConfig?: { command: string; args?: string[] },
-    seccompConfig?: SeccompConfig,
+    ripgrepConfig?: {
+      command: string
+      args?: string[]
+    },
+    options?: CheckDependenciesOptions,
   ): Promise<SandboxDependencyCheck>
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
@@ -3513,6 +4035,17 @@ export interface ISandboxManager {
    * is absent, deny with a plain `false`.
    */
   readonly askCallbackDenyReason: true
+  // Optional so downstream ISandboxManager implementers/mocks written
+  // against older versions keep typechecking.
+  getWindowsBackend?(): WindowsBackendSelection | undefined
+  /**
+   * Start a command in the sandbox; `windows.backend: 'mxc'` only.
+   * Optional for the same reason as getWindowsBackend.
+   */
+  spawnSandboxed?(
+    command: string,
+    options?: SpawnSandboxedOptions,
+  ): Promise<SandboxedProcess>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
@@ -3529,6 +4062,8 @@ export interface ISandboxManager {
    * entries that could not be removed. None of them is a rejection.
    */
   getWindowsProfileReadWarnings(): WindowsProfileReadWarning[]
+  /** What this `initialize()` found if it refreshed the profile read grant. */
+  getWindowsProfileReadRefresh(): WindowsProfileGrantResult | undefined
   getSentinelRegistry(): SentinelRegistry
   getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
@@ -3570,11 +4105,14 @@ export const SandboxManager: ISandboxManager = {
   registerCommandNetworkLists,
   unregisterCommandNetworkLists,
   askCallbackDenyReason: true,
+  getWindowsBackend,
+  spawnSandboxed,
   cleanupAfterCommand,
   reset,
   getMitmCA: () => mitmCA,
   getWindowsProfileRead: () => windowsProfileRead,
   getWindowsProfileReadWarnings: () => [...windowsProfileReadWarnings],
+  getWindowsProfileReadRefresh: () => windowsProfileReadRefresh,
   getSentinelRegistry: () => sentinelRegistry,
   getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,

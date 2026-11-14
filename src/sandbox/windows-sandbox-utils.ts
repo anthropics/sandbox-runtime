@@ -77,6 +77,8 @@ export type WindowsSandboxErrorCode =
   | 'spawn_failed'
   /** `srt-win` was killed by the spawn timeout (generic; see `install_timeout`). */
   | 'srt_win_timeout'
+  /** The caller aborted a run of `srt-win` (see `signal`). */
+  | 'srt_win_cancelled'
   /** A JSON-emitting `srt-win` subcommand exited non-zero. */
   | 'srt_win_nonzero'
   /** `srt-win` stdout was not valid JSON. */
@@ -169,6 +171,11 @@ export type WindowsSandboxErrorCode =
    * launch subcommands exit **18** ({@link SeclogonDisabledError}).
    */
   | 'seclogon_disabled'
+  /**
+   * The named `windows.backend` cannot run this configuration on this
+   * host. Nothing falls back; the caller decides what to try next.
+   */
+  | 'backend_unsupported'
 
 /**
  * Error thrown by the Windows sandbox backend. Carries a stable
@@ -1178,6 +1185,12 @@ export const WINDOWS_SRT_WIN_CAPABILITIES = {
    * told which session holds for it (`--held-by`) or holds for itself.
    */
   execHolder: 'exec-holder',
+  /**
+   * `profile retry-stale` tries again to revoke what the last run could
+   * not, and `profile status` says which operation wrote the record and
+   * whether it is this profile's.
+   */
+  profileRetryStale: 'profile-retry-stale',
 } as const
 
 /**
@@ -1428,11 +1441,15 @@ function windowsInstallFlags(
   )
 }
 
+/** The install command, as error messages print it. */
+export const WINDOWS_INSTALL_COMMAND =
+  'npx @anthropic-ai/sandbox-runtime windows-install'
+
 function windowsInstallCommand(
   ctx: WindowsInstallContext,
   force: boolean,
 ): string {
-  return `npx sandbox-runtime windows-install` + windowsInstallFlags(ctx, force)
+  return WINDOWS_INSTALL_COMMAND + windowsInstallFlags(ctx, force)
 }
 
 /**
@@ -1971,14 +1988,14 @@ export async function ensurePersistentWindowsCa(
     throw new Error(
       `ensurePersistentWindowsCa: sandbox user is not provisioned ` +
         `(user=${status.provisioned}, cred=${status.credPresent}). ` +
-        `Run \`npx sandbox-runtime windows-install\` first.`,
+        `Run \`${WINDOWS_INSTALL_COMMAND}\` first.`,
     )
   }
   const stateDir = opts.dir ? undefined : windowsStateDir()
   if (stateDir && !fs.existsSync(stateDir)) {
     throw new Error(
       `ensurePersistentWindowsCa: state directory ${stateDir} does not ` +
-        `exist. Run \`npx sandbox-runtime windows-install\` first.`,
+        `exist. Run \`${WINDOWS_INSTALL_COMMAND}\` first.`,
     )
   }
   const dir = opts.dir ?? path.win32.join(stateDir!, 'ca')
@@ -2169,6 +2186,11 @@ export interface WindowsInstallOptions {
    * built-in exclusions — {@link WindowsProfileGrantOptions.exclude}.
    */
   profileExclude?: readonly string[]
+  /**
+   * Directories (or files) inside the profile to make readable in
+   * addition to the built-in list — {@link WindowsProfileGrantOptions.include}.
+   */
+  profileInclude?: readonly string[]
   /**
    * How long the profile read grant may take. Default 30 minutes; the
    * first grant touches every file under the granted directories.
@@ -2476,12 +2498,16 @@ function installProfileGrantSkip(
  */
 export function windowsProfileGrantNotice(profileDir: string): string {
   return (
-    `Making ${profileDir} readable to sandboxed commands on this machine, ` +
-    `except the excluded credential stores (SSH and GPG keys, cloud and ` +
-    `browser sign-ins, password managers, registry hives). Readable ` +
-    `files include package-manager configuration that can hold feed ` +
-    `tokens: .npmrc, pip.ini, NuGet.Config, Maven settings.xml, ` +
-    `gradle.properties, .gitconfig. Skip with --skip-profile-grant ` +
+    `Making the tool directories of ${profileDir} readable to sandboxed ` +
+    `commands on this machine: where per-user tools install themselves ` +
+    `(AppData\\Local\\Programs, AppData\\Roaming\\npm, go, .nuget, ` +
+    `.cargo and the like) and package-manager configuration that can ` +
+    `hold feed tokens (.npmrc, pip.ini, NuGet.Config, Maven settings.xml, ` +
+    `gradle.properties, .gitconfig). Documents, Desktop, Downloads and ` +
+    `the rest of the profile are not readable unless added (the names ` +
+    `inside some AppData folders can be listed); credential ` +
+    `stores (SSH and GPG keys, cloud and browser sign-ins, password ` +
+    `managers, registry hives) are denied. Skip with --skip-profile-grant ` +
     `(skipProfileGrant); undo with \`srt-win profile forget\` ` +
     `(forgetWindowsProfileRead()).`
   )
@@ -2493,6 +2519,7 @@ function installProfileGrantOptions(
 ): WindowsProfileGrantOptions {
   return {
     exclude: opts.profileExclude,
+    include: opts.profileInclude,
     timeoutMs: opts.profileGrantTimeoutMs,
     onProgress: opts.onProfileGrantProgress,
     srtWin,
@@ -2743,7 +2770,7 @@ function windowsPathKeyOf(p: string, resolved: ResolvedWindowsPath): string {
 }
 
 /** The one of `dirs` that a path is, or lies beneath. */
-function coveringWindowsPath(
+export function coveringWindowsPath(
   dirs: readonly string[],
 ): (p: string) => string | undefined {
   const keys = dirs.map(windowsPathKey)
@@ -3369,6 +3396,13 @@ export interface WindowsProfileGrantStatus {
   reason?: string
   /** The profile directory the grant was made for. */
   profile?: string
+  /** The list version of this `srt-win`, and the one the grant was made with. */
+  listVersion?: number
+  recordedListVersion?: number
+  /** Which operation last wrote the record, when `srt-win` says. */
+  lastOperation?: 'grant' | 'forget'
+  /** The record was made for the profile directory that is there now. */
+  sameProfile: boolean
   /**
    * What `srt-win` says it does, by name (see
    * {@link WINDOWS_SRT_WIN_CAPABILITIES}); empty from one that does
@@ -3394,6 +3428,12 @@ export interface WindowsProfileGrantStatus {
   /** Exclusions added to the built-in list when the grant was made, relative to the profile. */
   extraExclusions: string[]
   /**
+   * Inclusions added to the built-in list when the grant was made,
+   * relative to the profile: directories (or files) readable besides
+   * the per-user tool directories the library lists.
+   */
+  extraInclusions: string[]
+  /**
    * Every PROTECTED path the grant keeps unreadable, absolute, existing or
    * not; `*` stands for one name, a trailing `*` for a prefix. A session may
    * not grant a path that is one, lies inside one, or lies above one.
@@ -3405,6 +3445,13 @@ export interface WindowsProfileGrantStatus {
    * denied.
    */
   ungrantedOnly: string[]
+  /**
+   * Every inclusion the grant was made with, absolute: the built-in
+   * list of per-user tool directories and what was added, each readable
+   * but for the exclusions inside it. Empty from an srt-win that does
+   * not report them.
+   */
+  inclusions: string[]
   counts: { containers: number; granted: number; files: number; denied: number }
   /**
    * Configuration-file variables for a sandboxed command — see
@@ -3417,6 +3464,10 @@ export interface WindowsProfileGrantStatus {
 
 type RawProfileStatus = {
   record_version?: unknown
+  list_version?: unknown
+  recorded_list_version?: unknown
+  last_operation?: unknown
+  same_profile?: unknown
   capabilities?: unknown
   not_granted?: unknown
   self_closed?: unknown
@@ -3428,8 +3479,10 @@ type RawProfileStatus = {
   reason?: string
   profile?: string | null
   extra_exclusions?: string[]
+  extra_inclusions?: unknown
   exclusions?: unknown
   ungranted_only?: unknown
+  inclusions?: unknown
   containers?: number
   granted?: number
   files?: number
@@ -3471,6 +3524,34 @@ export const WINDOWS_PROFILE_READ_ENV_VARS: readonly string[] = [
  * reads. Any other version is not read: its lists decide what may be granted.
  */
 const WINDOWS_PROFILE_RECORD_VERSION = 1
+
+/**
+ * The list versions between which every change only narrows the grant:
+ * the only ones `initialize()` moves a grant across by itself. A new list
+ * version that only narrows raises `to`; one that widens anything raises
+ * `from` to it as well, so that widening is applied only by a run the user
+ * asked for.
+ */
+export const WINDOWS_PROFILE_NARROWING_LIST_VERSIONS = { from: 3, to: 4 }
+
+/**
+ * Whether `initialize()` brings this grant up to date by itself: an
+ * older list on the same profile, or a grant that was cut short, which
+ * finishes what its caller started. Not a forget that was cut short,
+ * another profile, or a record newer than this `srt-win`.
+ */
+export function windowsProfileGrantRefreshable(
+  status: WindowsProfileGrantStatus,
+): boolean {
+  const { listVersion: list, recordedListVersion: recorded } = status
+  const { from, to } = WINDOWS_PROFILE_NARROWING_LIST_VERSIONS
+  if (list === undefined || recorded === undefined || !status.sameProfile) {
+    return false
+  }
+  if (recorded < from || recorded > list || list > to) return false
+  if (status.state === 'outdated') return recorded < list
+  return status.state === 'incomplete' && status.lastOperation === 'grant'
+}
 
 function stringList(v: unknown): string[] | undefined {
   return Array.isArray(v) && v.every(x => typeof x === 'string' && x !== '')
@@ -3520,6 +3601,16 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     state,
     ...(reason && { reason }),
     ...(raw.profile && { profile: raw.profile }),
+    ...(typeof raw.list_version === 'number' && {
+      listVersion: raw.list_version,
+    }),
+    ...(typeof raw.recorded_list_version === 'number' && {
+      recordedListVersion: raw.recorded_list_version,
+    }),
+    ...((raw.last_operation === 'grant' || raw.last_operation === 'forget') && {
+      lastOperation: raw.last_operation,
+    }),
+    sameProfile: raw.same_profile === true,
     capabilities: capabilityList(raw.capabilities),
     notGranted: grantItems(raw.not_granted),
     selfClosed: grantItems(raw.self_closed),
@@ -3528,8 +3619,12 @@ function mapProfileStatus(raw: RawProfileStatus): WindowsProfileGrantStatus {
     staleAllow: grantItems(raw.stale_allow),
     replacedFiles: stringList(raw.replaced_files) ?? [],
     extraExclusions: raw.extra_exclusions ?? [],
+    // Absent from what an srt-win without `--include` reports: read
+    // as none added. Nothing a session checks depends on it.
+    extraInclusions: stringList(raw.extra_inclusions) ?? [],
     exclusions: stringList(raw.exclusions) ?? [],
     ungrantedOnly: stringList(raw.ungranted_only) ?? [],
+    inclusions: stringList(raw.inclusions) ?? [],
     counts: {
       containers: raw.containers ?? 0,
       granted: raw.granted ?? 0,
@@ -3589,6 +3684,11 @@ export async function getWindowsProfileReadStatusAsync(
 
 export interface WindowsProfileGrantOptions {
   /**
+   * Abort the run: the child is killed and the promise rejects with
+   * `srt_win_cancelled`. The grant stays recorded as incomplete.
+   */
+  signal?: AbortSignal
+  /**
    * Paths inside the profile to keep unreadable in addition to the
    * built-in list (absolute, or relative to the profile): for example
    * the embedding program's own configuration directory.
@@ -3599,6 +3699,24 @@ export interface WindowsProfileGrantOptions {
    * runs recorded. Without it a run only ever adds.
    */
   replaceExclusions?: boolean
+  /**
+   * Directories (or files) inside the profile to make readable in
+   * addition to the built-in list of per-user tool directories
+   * (absolute, or relative to the profile): a toolchain kept somewhere
+   * the list does not name, say. A protected path, anything inside
+   * one, and the temporary directory or anything in it are refused
+   * (`profile_grant_failed`); a directory above a protected path is
+   * granted child by child. An inclusion recorded by an earlier run is
+   * checked again on every run, since the built-in exclusions may have
+   * grown: one that conflicts fails the run the same way until a run
+   * with `replaceInclusions: true` drops it.
+   */
+  include?: readonly string[]
+  /**
+   * Make `include` the whole added list, dropping the entries earlier
+   * runs recorded. Without it a run only ever adds.
+   */
+  replaceInclusions?: boolean
   /**
    * Kill `srt-win` after this long. Default 30 minutes: the first run
    * touches every file under the granted directories.
@@ -3648,6 +3766,8 @@ export interface WindowsProfileGrantResult {
   denied: number
   /** Excluded directories that did not exist and were created empty. */
   placeholders: number
+  /** Empty directories an earlier run created that left the grant, removed. */
+  placeholdersRemoved: number
   /** DACLs written by this run; 0 on a refresh that found nothing new. */
   writes: number
   unchanged: number
@@ -3677,9 +3797,10 @@ export interface WindowsProfileGrantResult {
    */
   unprotected: WindowsProfileGrantItem[]
   /**
-   * Paths that have left the grant and still carry the allow of an
+   * Paths that have left the grant and may still carry the allow of an
    * earlier run, which could not be removed: readable through the
-   * grant's own entry.
+   * grant's own entry until it is. Includes those on a volume that
+   * cannot be reached now. They stay recorded and are retried.
    */
   staleAllow: WindowsProfileGrantItem[]
   /**
@@ -3692,6 +3813,10 @@ export interface WindowsProfileGrantResult {
 }
 
 const PROFILE_GRANT_TIMEOUT_MS = 30 * 60_000
+/** How long a retry of stale entries may start new work during a start. */
+const PROFILE_STALE_RETRY_BUDGET_MS = 3_000
+/** And when it is killed, in case a single tree walk outruns the budget. */
+const PROFILE_STALE_RETRY_TIMEOUT_MS = 10_000
 
 /** A `[{path, reason}]` list as `srt-win` reports it; anything else is none. */
 function grantItems(v: unknown): WindowsProfileGrantItem[] {
@@ -3752,6 +3877,11 @@ export async function grantWindowsProfileRead(
             child.kill()
           }, timeoutMs)
         : undefined
+    const abort = (): void => {
+      child.kill()
+    }
+    if (opts.signal?.aborted) abort()
+    opts.signal?.addEventListener('abort', abort, { once: true })
     let stdout = ''
     let stderr = ''
     let pending = ''
@@ -3768,6 +3898,7 @@ export async function grantWindowsProfileRead(
     child.stdin?.on('error', () => {}).end()
     child.once('error', e => {
       clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', abort)
       reject(
         new WindowsSandboxError(
           'spawn_failed',
@@ -3778,7 +3909,20 @@ export async function grantWindowsProfileRead(
     })
     child.once('close', (status, signal) => {
       clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', abort)
       if (pending.trim() !== '') opts.onProgress?.(pending)
+      if (opts.signal?.aborted) {
+        reject(
+          new WindowsSandboxError(
+            'srt_win_cancelled',
+            `srt-win profile grant was cancelled; the grant is recorded ` +
+              `as incomplete — run it again, or remove it with ` +
+              `forgetWindowsProfileRead()`,
+            'profile',
+          ),
+        )
+        return
+      }
       if (timedOut) {
         reject(
           new WindowsSandboxError(
@@ -3807,6 +3951,8 @@ function profileGrantArgs(opts: WindowsProfileGrantOptions): string[] {
   const args = ['profile', 'grant', '--json']
   for (const e of opts.exclude ?? []) args.push('--exclude', e)
   if (opts.replaceExclusions) args.push('--replace-excludes')
+  for (const i of opts.include ?? []) args.push('--include', i)
+  if (opts.replaceInclusions) args.push('--replace-includes')
   return args
 }
 
@@ -3833,6 +3979,7 @@ function profileGrantResult(
     files: number
     denied: number
     placeholders: number
+    placeholders_removed?: number
     writes: number
     unchanged: number
     removed: number
@@ -3853,6 +4000,7 @@ function profileGrantResult(
     files: raw.files,
     denied: raw.denied,
     placeholders: raw.placeholders,
+    placeholdersRemoved: raw.placeholders_removed ?? 0,
     writes: raw.writes,
     unchanged: raw.unchanged,
     removed: raw.removed,
@@ -3865,6 +4013,39 @@ function profileGrantResult(
     forgottenRoots: grantItems(raw.forgotten_roots),
     elapsedMs: raw.elapsed_ms,
   }
+}
+
+/**
+ * Try again to revoke what the last run of the grant could not, on the
+ * paths it noted alone (`srt-win profile retry-stale`). Bounded, as a
+ * session is starting: only if a retry is due, on local paths, and
+ * keeping no starting session out. Returns how many cleared; what is
+ * left stays recorded and reported by the status.
+ */
+export async function retryWindowsProfileStale(opts: {
+  srtWin: SrtWinSpawn
+}): Promise<{ cleared: number }> {
+  const args = [
+    'profile',
+    'retry-stale',
+    '--json',
+    '--budget-ms',
+    String(PROFILE_STALE_RETRY_BUDGET_MS),
+  ]
+  const r = await runSrtWinAsync(args, {
+    timeoutMs: PROFILE_STALE_RETRY_TIMEOUT_MS,
+    srtWin: opts.srtWin,
+  })
+  throwIfRefusedBesideOthers(args, r.status, r.stdout)
+  if (r.status !== 0) {
+    throw new WindowsSandboxError(
+      'profile_grant_failed',
+      `srt-win profile retry-stale exited ${r.status}: ${r.stderr.slice(-2000)}`,
+      'profile',
+    )
+  }
+  const { cleared } = parseSrtWinJson<{ cleared?: number }>(args, r)
+  return { cleared: cleared ?? 0 }
 }
 
 /**
@@ -3892,12 +4073,12 @@ function grantWindowsProfileReadSync(
  */
 export function forgetWindowsProfileRead(
   opts: { timeoutMs?: number; srtWin?: SrtWinSpawn } = {},
-): void {
+): WindowsProfileForgetResult {
   const r = runSrtWin(['profile', 'forget', '--json'], {
     timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
     srtWin: opts.srtWin,
   })
-  profileForgetResult(r)
+  return profileForgetResult(r)
 }
 
 /** {@link forgetWindowsProfileRead} without blocking the event loop. */
@@ -3906,15 +4087,25 @@ export async function forgetWindowsProfileReadAsync(
     timeoutMs?: number
     srtWin?: SrtWinSpawn
   } = {},
-): Promise<void> {
+): Promise<WindowsProfileForgetResult> {
   const r = await runSrtWinAsync(['profile', 'forget', '--json'], {
     timeoutMs: opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS,
     srtWin: opts.srtWin,
   })
-  profileForgetResult(r)
+  return profileForgetResult(r)
 }
 
-function profileForgetResult(r: RunResult): void {
+/** What `srt-win profile forget` could not establish. */
+export interface WindowsProfileForgetResult {
+  /**
+   * Paths on a volume that cannot be reached, with nothing recorded that
+   * could find them when it returns. No longer recorded, and NOT known
+   * to be clear: if the volume comes back they may still hold the entry.
+   */
+  deferred: WindowsProfileGrantItem[]
+}
+
+function profileForgetResult(r: RunResult): WindowsProfileForgetResult {
   logForDebugging(
     `[Sandbox Windows] profile forget exit=${r.status}: ` +
       `${r.stderr || r.stdout}`,
@@ -3927,6 +4118,21 @@ function profileForgetResult(r: RunResult): void {
       'profile',
     )
   }
+  let raw: { deferred?: unknown } = {}
+  try {
+    raw = JSON.parse(r.stdout) as typeof raw
+  } catch {
+    // No report on stdout: nothing was deferred that can be named.
+  }
+  const deferred = grantItems(raw.deferred)
+  for (const d of deferred) {
+    logForDebugging(
+      `[Sandbox Windows] profile forget could not reach ${d.path}: ` +
+        `it may still carry the entry if its volume returns`,
+      { level: 'warn' },
+    )
+  }
+  return { deferred }
 }
 
 /** `p` for a comparison of profile paths: no `\\?\` prefix, `/`, lower case, no separator at the end. */
@@ -3965,6 +4171,7 @@ export interface WindowsProfileExclusionConflict {
 function exclusionComponentMatches(pattern: string, name: string): boolean {
   if (pattern === '*') return true
   if (pattern.endsWith('*')) return name.startsWith(pattern.slice(0, -1))
+  if (pattern.startsWith('*')) return name.endsWith(pattern.slice(1))
   return pattern === name
 }
 
@@ -4337,9 +4544,10 @@ export function mergeWindowsEnv(
 /**
  * Parse a list of `KEY=VALUE` strings (as produced by
  * {@link generateProxyEnvVars}) into an object. Splits on the FIRST
- * `=` only, so values containing `=` survive intact.
+ * `=` only, so values containing `=` survive intact. Shared with the
+ * MXC backend's child-environment assembly.
  */
-function envListToObject(list: string[]): NodeJS.ProcessEnv {
+export function envListToObject(list: readonly string[]): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {}
   for (const entry of list) {
     const eq = entry.indexOf('=')
@@ -4388,7 +4596,7 @@ export function windowsSetupVersionMismatch(
 /** The two ways to run the install, with `flags` (see `windowsInstallFlags`). */
 function windowsInstallCommandLines(flags: string): string {
   return (
-    `  npx sandbox-runtime windows-install${flags}\n` +
+    `  ${WINDOWS_INSTALL_COMMAND}${flags}\n` +
     `  — or call installWindowsSandbox(), or run ` +
     `\`srt-win.exe install${flags}\` directly.\n`
   )
