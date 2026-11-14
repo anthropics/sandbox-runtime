@@ -1979,11 +1979,20 @@ function mxcDependencies(
 ): SandboxDependencyCheck | undefined {
   const backend = options?.windowsBackend ?? config?.windows?.backend
   if (backend !== 'mxc' || getPlatform() !== 'windows') return undefined
-  return {
-    errors:
-      options?.windowsMxcSdk || windowsMxcState || isMxcSdkInstalled()
+  const injected = options?.windowsMxcSdk
+  if (injected !== undefined) {
+    const valid =
+      typeof injected?.probe === 'function' &&
+      typeof injected?.spawn === 'function'
+    return {
+      errors: valid
         ? []
-        : [MXC_SDK_MISSING],
+        : ['windowsMxcSdk must provide probe() and spawn() functions'],
+      warnings: [],
+    }
+  }
+  return {
+    errors: windowsMxcState || isMxcSdkInstalled() ? [] : [MXC_SDK_MISSING],
     warnings: [],
   }
 }

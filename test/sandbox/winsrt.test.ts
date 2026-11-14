@@ -2281,6 +2281,33 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       expect(installed).not.toHaveBeenCalled()
     })
 
+    it('rejects malformed injected SDKs in both preflight checks without falling back', async () => {
+      const { installed } = packageSpies()
+      installed.mockReturnValue(true)
+      for (const sdk of [
+        null,
+        {},
+        { probe: fullProbe },
+        { probe: fullProbe, spawn: true },
+      ]) {
+        const options = {
+          windowsBackend: 'mxc' as const,
+          windowsMxcSdk: sdk as unknown as MxcSdk,
+        }
+        const expected = {
+          errors: ['windowsMxcSdk must provide probe() and spawn() functions'],
+          warnings: [],
+        }
+        expect(SandboxManager.checkDependencies(undefined, options)).toEqual(
+          expected,
+        )
+        expect(
+          await SandboxManager.checkDependenciesAsync!(undefined, options),
+        ).toEqual(expected)
+      }
+      expect(installed).not.toHaveBeenCalled()
+    })
+
     it('is refused when it lacks probe() or spawn(), with no fallback', async () => {
       const { load } = packageSpies()
       // eslint-disable-next-line @typescript-eslint/await-thenable
