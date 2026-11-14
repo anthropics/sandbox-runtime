@@ -1055,26 +1055,35 @@ impl Locked {
         Ok(())
     }
 
-    /// Record a read deny of the holder that the object's own access
-    /// list stands in for ([`KIND_DENY_SATISFIED`]).
-    fn note_satisfied_deny(&self, canon: &str) -> Result<()> {
-        delete_holder(&self.conn, Some(self.holder_pid.0 as i64), canon, "deny")?;
+    /// Remove this holder's unwritten hold and prune `working_aces` when no
+    /// other holder keeps the entry.
+    fn drop_unwritten_ace(&self, canon: &str, kind: &str) -> Result<()> {
+        delete_holder(&self.conn, Some(self.holder_pid.0 as i64), canon, kind)?;
         self.conn
             .execute(
                 "DELETE FROM working_aces WHERE canonical_path = ?1 AND kind = ?2 \
                  AND NOT EXISTS (SELECT 1 FROM ace_holders \
                                  WHERE canonical_path = ?1 AND kind = ?2)",
-                params![canon, "deny"],
+                params![canon, kind],
             )
-            .context("DELETE unwritten deny")?;
-        self.conn
+            .with_context(|| format!("DELETE unwritten {kind}"))?;
+        Ok(())
+    }
+
+    /// Record a read deny of the holder that the object's own access
+    /// list stands in for ([`KIND_DENY_SATISFIED`]). Returns whether a
+    /// new row was inserted for this holder.
+    fn note_satisfied_deny(&self, canon: &str) -> Result<bool> {
+        self.drop_unwritten_ace(canon, "deny")?;
+        let inserted = self
+            .conn
             .execute(
                 "INSERT OR IGNORE INTO ace_holders (canonical_path, kind, pid, want_mask) \
                  VALUES (?1, ?2, ?3, 'denyRead')",
                 params![canon, KIND_DENY_SATISFIED, self.holder_pid.0 as i64],
             )
             .context("INSERT satisfied deny")?;
-        Ok(())
+        Ok(inserted > 0)
     }
 
     /// Drop the holder's kept-grant holds (its session, or its one
@@ -1124,12 +1133,29 @@ impl Locked {
         sandbox_sid: &str,
         f: impl FnOnce(&Self) -> Result<(Vec<AceWitness>, usize)>,
     ) -> Result<(Vec<AceWitness>, usize)> {
+        self.with_broker_registration_with(sandbox_sid, &DISK, f)
+    }
+
+    fn with_broker_registration_with(
+        &self,
+        sandbox_sid: &str,
+        disk: &Disk,
+        f: impl FnOnce(&Self) -> Result<(Vec<AceWitness>, usize)>,
+    ) -> Result<(Vec<AceWitness>, usize)> {
         self.register_broker()?;
         let (witnesses, failed) = f(self)?;
         if failed > 0 {
             let mut left = Vec::new();
             for w in witnesses.iter().filter(|w| w.holder_added) {
-                let why = match self.release_one_ace(&w.canon, w.ace.kind(), sandbox_sid) {
+                let why = match release_hold(
+                    &self.conn,
+                    Some(self.holder_pid.0 as i64),
+                    &w.canon,
+                    w.ace.kind(),
+                    sandbox_sid,
+                    disk,
+                    false,
+                ) {
                     Ok(r) if r.is_pending() => r.as_str().to_string(),
                     Ok(_) => continue,
                     Err(e) => format!("{e:#}"),
@@ -1170,9 +1196,10 @@ impl Locked {
     /// `Deny` targets implicitly add a `(parent, DenyFdc)` entry so
     /// the sandbox user cannot `del`/`ren` the file via parent-FDC
     /// even when the parent carries an inherited
-    /// `BUILTIN\Users:(F)`. Multiple denied siblings under one
-    /// parent share the parent's `deny_fdc` row (PK
-    /// `(path, kind, pid)` dedupes within one holder; refcount
+    /// `BUILTIN\Users:(F)`. Satisfied `ReadDeny` targets also add
+    /// `(parent, DenyFdc)` when the parent DACL is writable. Multiple
+    /// denied siblings under one parent share the parent's `deny_fdc`
+    /// row (PK `(path, kind, pid)` dedupes within one holder; refcount
     /// handles cross-holder).
     ///
     /// All-or-nothing per batch (via [`Self::with_broker_registration`]).
@@ -1194,73 +1221,156 @@ impl Locked {
         also: &[String],
     ) -> Result<(Vec<AceWitness>, usize)> {
         self.with_broker_registration(sandbox_sid, |db| {
-            let mut witnesses = Vec::with_capacity(targets.len());
-            let mut failed = 0usize;
-            let mut one = |canon: &str, ace: SbAce| -> bool {
-                match db.ensure_ace(canon, ace, sandbox_sid) {
-                    Ok(w) => {
-                        witnesses.push(w);
-                        true
-                    }
-                    // Access denied on an object whose own access list already gives
-                    // the sandbox account no read: the deny is satisfied, not failed.
-                    Err(e)
-                        if ace == SbAce::Deny(crate::acl::DenyMask::ReadDeny)
-                            && is_access_denied(&e)
-                            && crate::profile::closed_to_sandbox(canon) =>
-                    {
+            db.apply_targets_with(
+                targets,
+                also,
+                |d, canon, ace| d.ensure_ace(canon, ace, sandbox_sid),
+                crate::profile::closed_to_sandbox,
+            )
+        })
+    }
+
+    fn apply_targets_with(
+        &self,
+        targets: &[(String, SbAce)],
+        also: &[String],
+        mut ensure: impl FnMut(&Self, &str, SbAce) -> Result<AceWitness>,
+        mut is_closed: impl FnMut(&str) -> bool,
+    ) -> Result<(Vec<AceWitness>, usize)> {
+        enum DeniedPolicy {
+            Fail,
+            CheckSatisfied { log: bool },
+            DropAndSkip,
+        }
+        enum Outcome {
+            Applied,
+            Satisfied,
+            Failed,
+        }
+
+        let mut witnesses = Vec::with_capacity(targets.len());
+        let mut satisfied_added: Vec<String> = Vec::new();
+        let mut failed = 0usize;
+
+        let mut apply_one = |canon: &str, ace: SbAce, policy: DeniedPolicy| -> Outcome {
+            match ensure(self, canon, ace) {
+                Ok(w) => {
+                    witnesses.push(w);
+                    Outcome::Applied
+                }
+                // Access denied on an object whose own access list already gives
+                // the sandbox account no read: the deny is satisfied, not failed.
+                Err(e)
+                    if matches!(policy, DeniedPolicy::CheckSatisfied { .. })
+                        && ace == SbAce::Deny(crate::acl::DenyMask::ReadDeny)
+                        && is_access_denied(&e)
+                        && is_closed(canon) =>
+                {
+                    if matches!(policy, DeniedPolicy::CheckSatisfied { log: true }) {
                         eprintln!(
                             "srt-win: '{canon}' cannot be given a read deny and is closed to \
                              the sandbox account by its own access list"
                         );
-                        if let Err(e) = db.note_satisfied_deny(canon) {
+                    }
+                    match self.note_satisfied_deny(canon) {
+                        Ok(added) => {
+                            if added {
+                                satisfied_added.push(canon.to_owned());
+                            }
+                            Outcome::Satisfied
+                        }
+                        Err(e) => {
                             eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
                             failed += 1;
+                            Outcome::Failed
                         }
-                        false
-                    }
-                    Err(e) => {
-                        eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
-                        failed += 1;
-                        false
                     }
                 }
-            };
-            for (canon, ace) in targets {
-                // Skip the parent-FDC ACE when the file's own
-                // Deny failed (e.g. hardlink refuse) — the batch
-                // is going to roll back anyway (`failed > 0`),
-                // and stamping the parent first just to release
-                // it in the same pass wastes a SetSecurityInfo
-                // round-trip and clutters the failure output.
-                if one(canon, *ace)
-                    && matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete)
-                    && let Some(p) = path_id::canonical_parent_of(canon)
-                {
-                    one(&p, SbAce::DenyFdc);
+                Err(e) if matches!(policy, DeniedPolicy::DropAndSkip) && is_access_denied(&e) => {
+                    eprintln!(
+                        "srt-win: {} '{canon}': {e:#} (parent of satisfied deny; skipping)",
+                        ace.kind()
+                    );
+                    if let Err(ce) = self.drop_unwritten_ace(canon, ace.kind()) {
+                        eprintln!("srt-win: {} '{canon}': {ce:#}", ace.kind());
+                        failed += 1;
+                        return Outcome::Failed;
+                    }
+                    Outcome::Satisfied
+                }
+                Err(e) => {
+                    eprintln!("srt-win: {} '{canon}': {e:#}", ace.kind());
+                    failed += 1;
+                    Outcome::Failed
                 }
             }
-            let read_deny = SbAce::Deny(crate::acl::DenyMask::ReadDeny);
-            for canon in also {
-                match db.ensure_ace(canon, read_deny, sandbox_sid) {
-                    Ok(w) => witnesses.push(w),
-                    Err(e) if path_id::is_not_found(&e) => {}
-                    // Access denied, and the object's own access list already gives
-                    // the sandbox account no read: satisfied, not failed.
-                    Err(e) if is_access_denied(&e) && crate::profile::closed_to_sandbox(canon) => {
-                        if let Err(e) = db.note_satisfied_deny(canon) {
+        };
+
+        for (canon, ace) in targets {
+            let outcome = apply_one(canon, *ace, DeniedPolicy::CheckSatisfied { log: true });
+            if !matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete) {
+                continue;
+            }
+            let Some(p) = path_id::canonical_parent_of(canon) else {
+                continue;
+            };
+            match outcome {
+                Outcome::Applied => {
+                    let _ = apply_one(&p, SbAce::DenyFdc, DeniedPolicy::Fail);
+                }
+                // A satisfied ReadDeny may sit in a user-writable parent carrying
+                // inherited delete-child; stamp parent DenyFdc when permitted,
+                // without failing the batch if the parent refuses writes.
+                Outcome::Satisfied => {
+                    let _ = apply_one(&p, SbAce::DenyFdc, DeniedPolicy::DropAndSkip);
+                }
+                // Skip the parent-FDC ACE when the file's own Deny failed
+                // (e.g. hardlink refuse) — the batch will roll back anyway.
+                Outcome::Failed => {}
+            }
+        }
+
+        let read_deny = SbAce::Deny(crate::acl::DenyMask::ReadDeny);
+        for canon in also {
+            match ensure(self, canon, read_deny) {
+                Ok(w) => witnesses.push(w),
+                Err(e) if path_id::is_not_found(&e) => {}
+                // Access denied, and the object's own access list already gives
+                // the sandbox account no read: satisfied, not failed.
+                Err(e) if is_access_denied(&e) && is_closed(canon) => {
+                    match self.note_satisfied_deny(canon) {
+                        Ok(added) => {
+                            if added {
+                                satisfied_added.push(canon.to_owned());
+                            }
+                        }
+                        Err(e) => {
                             eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
                             failed += 1;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
-                        failed += 1;
-                    }
+                }
+                Err(e) => {
+                    eprintln!("srt-win: {} '{canon}': {e:#}", read_deny.kind());
+                    failed += 1;
                 }
             }
-            Ok((witnesses, failed))
-        })
+        }
+
+        if failed > 0 {
+            for canon in &satisfied_added {
+                if let Err(e) = delete_holder(
+                    &self.conn,
+                    Some(self.holder_pid.0 as i64),
+                    canon,
+                    KIND_DENY_SATISFIED,
+                ) {
+                    eprintln!("srt-win: WARNING: rollback {KIND_DENY_SATISFIED} '{canon}': {e:#}");
+                }
+            }
+        }
+
+        Ok((witnesses, failed))
     }
 
     /// Disk-first single-ACE converge. Record-first upsert (holder
@@ -1367,20 +1477,6 @@ impl Locked {
         })
     }
 
-    /// Release this holder's `(canon, kind)` hold — see
-    /// [`release_hold`].
-    fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
-        release_hold(
-            &self.conn,
-            Some(self.holder_pid.0 as i64),
-            canon,
-            kind,
-            sandbox_sid,
-            &DISK,
-            false,
-        )
-    }
-
     /// `(canon, kind)` rows held by this holder, optionally filtered
     /// to one set of kinds.
     fn my_ace_holds(&self, kinds: Option<&[&str]>) -> Result<Vec<(String, String)>> {
@@ -1405,6 +1501,15 @@ impl Locked {
         sandbox_sid: &str,
         kinds: &[&str],
     ) -> Result<(Vec<(String, AceRelease)>, usize)> {
+        self.release_aces_with(sandbox_sid, kinds, &DISK)
+    }
+
+    fn release_aces_with(
+        &self,
+        sandbox_sid: &str,
+        kinds: &[&str],
+        disk: &Disk,
+    ) -> Result<(Vec<(String, AceRelease)>, usize)> {
         let holds = self.my_ace_holds(Some(kinds))?;
         // A deny outlives every grant it was stamped under.
         if !kinds.contains(&"grant") && !holds.is_empty() {
@@ -1427,7 +1532,15 @@ impl Locked {
         let mut out = Vec::with_capacity(holds.len());
         let mut failed = 0usize;
         for (canon, kind) in &holds {
-            match self.release_one_ace(canon, kind, sandbox_sid) {
+            match release_hold(
+                &self.conn,
+                Some(self.holder_pid.0 as i64),
+                canon,
+                kind,
+                sandbox_sid,
+                disk,
+                false,
+            ) {
                 Ok(r) => out.push((canon.clone(), r)),
                 Err(e) => {
                     eprintln!(
@@ -2792,6 +2905,168 @@ mod tests {
             // Only the hold-less dead broker is pruned.
             assert_eq!(rep.dead_brokers, 1);
             assert_eq!(counts(c), (1, 1, 1));
+        });
+    }
+
+    fn access_denied_err() -> anyhow::Error {
+        anyhow::Error::new(windows::core::Error::from(
+            windows::Win32::Foundation::ERROR_ACCESS_DENIED,
+        ))
+    }
+
+    /// Simulate `ensure_ace`'s DB-first upserts followed by `recompose_at`
+    /// returning `err` when `Some`.
+    fn mock_ensure(
+        db: &Locked,
+        canon: &str,
+        ace: SbAce,
+        err: Option<anyhow::Error>,
+    ) -> Result<AceWitness> {
+        let already_held: bool = db
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ace_holders \
+                 WHERE canonical_path = ?1 AND kind = ?2 AND pid = ?3)",
+                params![canon, ace.kind(), db.holder_pid.0 as i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ace_holders (canonical_path, kind, pid, want_mask) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(canonical_path, kind, pid) \
+                 DO UPDATE SET want_mask = excluded.want_mask",
+                params![canon, ace.kind(), db.holder_pid.0 as i64, ace.as_str()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO working_aces (canonical_path, kind, file_id, mask) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(canonical_path, kind) DO UPDATE SET \
+                   file_id = excluded.file_id, mask = excluded.mask",
+                params![canon, ace.kind(), [0u8; 24].as_slice(), ace.as_str()],
+            )
+            .unwrap();
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(AceWitness {
+            canon: canon.to_owned(),
+            ace,
+            already: false,
+            holder_added: !already_held,
+            _sealed: (),
+        })
+    }
+
+    #[test]
+    fn satisfied_read_deny_stamps_parent_deny_fdc_and_releases_both() {
+        with_mem_db(|db| {
+            let (witnesses, failed) = db
+                .with_broker_registration_with(SID, &OK_DISK, |d| {
+                    d.apply_targets_with(
+                        &[(
+                            SECRET.to_owned(),
+                            SbAce::Deny(crate::acl::DenyMask::ReadDeny),
+                        )],
+                        &[],
+                        |d, canon, ace| {
+                            mock_ensure(d, canon, ace, (canon == SECRET).then(access_denied_err))
+                        },
+                        |canon| canon == SECRET,
+                    )
+                })
+                .unwrap();
+
+            assert_eq!(failed, 0);
+            assert_eq!(witnesses.len(), 1);
+            assert_eq!(witnesses[0].canon, TREE);
+            assert_eq!(witnesses[0].ace, SbAce::DenyFdc);
+
+            let mut holds = db.my_ace_holds(None).unwrap();
+            holds.sort();
+            assert_eq!(
+                holds,
+                vec![
+                    (TREE.to_owned(), "deny_fdc".to_owned()),
+                    (SECRET.to_owned(), KIND_DENY_SATISFIED.to_owned()),
+                ]
+            );
+            assert_eq!(counts(&db.conn), (1, 2, 1));
+
+            let (rels, rel_failed) = db.release_aces_with(SID, KIND_DENY, &OK_DISK).unwrap();
+            assert_eq!(rel_failed, 0);
+            assert_eq!(rels.len(), 2);
+            assert_eq!(counts(&db.conn), (0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn satisfied_read_deny_under_unwritable_parent_drops_unwritten_fdc_without_failing() {
+        with_mem_db(|db| {
+            let (witnesses, failed) = db
+                .with_broker_registration_with(SID, &OK_DISK, |d| {
+                    d.apply_targets_with(
+                        &[(
+                            SECRET.to_owned(),
+                            SbAce::Deny(crate::acl::DenyMask::ReadDeny),
+                        )],
+                        &[],
+                        |d, canon, ace| mock_ensure(d, canon, ace, Some(access_denied_err())),
+                        |canon| canon == SECRET,
+                    )
+                })
+                .unwrap();
+
+            assert_eq!(failed, 0);
+            assert!(witnesses.is_empty());
+            assert_eq!(
+                db.my_ace_holds(None).unwrap(),
+                vec![(SECRET.to_owned(), KIND_DENY_SATISFIED.to_owned())]
+            );
+            assert_eq!(counts(&db.conn), (1, 1, 0));
+        });
+    }
+
+    #[test]
+    fn failed_batch_rolls_back_satisfied_deny_and_its_parent_fdc() {
+        let fail_path = r"\\?\C:\tree\other";
+        let also_secret = r"\\?\C:\tree\also_secret";
+        with_mem_db(|db| {
+            let (witnesses, failed) = db
+                .with_broker_registration_with(SID, &OK_DISK, |d| {
+                    d.apply_targets_with(
+                        &[
+                            (
+                                SECRET.to_owned(),
+                                SbAce::Deny(crate::acl::DenyMask::ReadDeny),
+                            ),
+                            (
+                                fail_path.to_owned(),
+                                SbAce::Deny(crate::acl::DenyMask::ReadDeny),
+                            ),
+                        ],
+                        &[also_secret.to_owned()],
+                        |d, canon, ace| {
+                            if canon == fail_path {
+                                anyhow::bail!("hardlink refused");
+                            }
+                            let err =
+                                (canon == SECRET || canon == also_secret).then(access_denied_err);
+                            mock_ensure(d, canon, ace, err)
+                        },
+                        |canon| canon == SECRET || canon == also_secret,
+                    )
+                })
+                .unwrap();
+
+            assert_eq!(failed, 1);
+            assert_eq!(witnesses.len(), 1);
+            assert_eq!(witnesses[0].canon, TREE);
+            assert_eq!(witnesses[0].ace, SbAce::DenyFdc);
+            assert_eq!(counts(&db.conn), (0, 0, 0));
         });
     }
 }
