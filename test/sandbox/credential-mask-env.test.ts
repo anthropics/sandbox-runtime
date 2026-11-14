@@ -29,6 +29,35 @@ const DB_EXTRACT = '://[^:]+:([^@]+)@'
 const eq = (h: string, p: string) => h === p
 
 describe('buildMaskedEnvVars', () => {
+  test('propagates header-only scope for whole-value and extracted env credentials', () => {
+    for (const extract of [undefined, '^(.+)$']) {
+      const reg = new SentinelRegistry()
+      const real = 'gho_' + 'x'.repeat(36)
+      const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
+        [
+          {
+            name: 'GH_TOKEN',
+            mode: 'mask',
+            extract,
+            injectHosts: ['api.github.com'],
+            injectInto: ['header:authorization'],
+          },
+        ],
+        ['api.github.com'],
+        reg,
+        { GH_TOKEN: real },
+      )
+      expect(degradeToUnsetNames).toHaveLength(0)
+      const fake = setEnvVars['GH_TOKEN']!
+      expect(fake).not.toContain(real)
+      const headers = { authorization: `Bearer ${fake}`, 'x-token': fake }
+      reg.substituteInHeaders(headers, 'api.github.com', eq)
+      expect(headers.authorization).toBe(`Bearer ${real}`)
+      expect(headers['x-token']).toBe(fake)
+      expect(reg.sentinelsForHost('api.github.com', eq)).toEqual([])
+    }
+  })
+
   test('whole-value (no extract): fake value is exactly one sentinel', () => {
     const reg = new SentinelRegistry()
     const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
