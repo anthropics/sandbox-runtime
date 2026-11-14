@@ -1880,7 +1880,10 @@ function isSandboxingEnabled(): boolean {
  * srt-win resolution failure) or the inputs for the Windows probe —
  * the only platform where the sync and async variants differ.
  */
-function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
+function checkDependenciesCommon(
+  ripgrepConfig?: RipgrepConfig,
+  seccompConfig?: SeccompConfig,
+):
   | { done: SandboxDependencyCheck }
   | {
       windows: {
@@ -1909,7 +1912,7 @@ function checkDependenciesCommon(ripgrepConfig?: RipgrepConfig):
     }
 
     const linuxDeps = checkLinuxDependencies({
-      seccompConfig: config?.seccomp,
+      seccompConfig: seccompConfig ?? config?.seccomp,
       bwrapPath: config?.bwrapPath,
       socatPath: config?.socatPath,
     })
@@ -1966,6 +1969,12 @@ export interface CheckDependenciesOptions {
    * the mxc check does not look for the package.
    */
   windowsMxcSdk?: MxcSdk
+  /**
+   * Linux apply-seccomp location to check. Defaults to the initialized
+   * config's `seccomp`, else the bundled/global lookup; pass it when
+   * checking before initialize().
+   */
+  seccompConfig?: SeccompConfig
 }
 
 /**
@@ -1999,7 +2008,7 @@ function checkDependencies(
 ): SandboxDependencyCheck {
   const mxc = mxcDependencies(options)
   if (mxc) return mxc
-  const common = checkDependenciesCommon(ripgrepConfig)
+  const common = checkDependenciesCommon(ripgrepConfig, options?.seccompConfig)
   if ('done' in common) return common.done
   return checkWindowsDependencies(common.windows)
 }
@@ -2020,10 +2029,11 @@ async function checkDependenciesAsync(
   // Linux: resolve apply-seccomp first so its global-npm fallback
   // (`npm root -g`) runs off the event loop; the sync check below then
   // hits the shared path cache.
-  if (getPlatform() === 'linux' && !config?.seccomp?.argv0) {
-    await getApplySeccompBinaryPathAsync(config?.seccomp?.applyPath)
+  const seccomp = options?.seccompConfig ?? config?.seccomp
+  if (getPlatform() === 'linux' && !seccomp?.argv0) {
+    await getApplySeccompBinaryPathAsync(seccomp?.applyPath)
   }
-  const common = checkDependenciesCommon(ripgrepConfig)
+  const common = checkDependenciesCommon(ripgrepConfig, options?.seccompConfig)
   if ('done' in common) return common.done
   return checkWindowsDependenciesAsync(common.windows)
 }
