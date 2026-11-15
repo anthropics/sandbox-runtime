@@ -1816,6 +1816,7 @@ function buildSandboxCommand(
     `{ ${socat} TCP6-LISTEN:${port},ipv6only=0,${listen} UNIX-CONNECT:${socketPath} || ` +
     `exec ${socat} TCP4-LISTEN:${port},${listen} UNIX-CONNECT:${socketPath}; } >/dev/null 2>&1 &`
   const socatCommands = [
+    'set -m 2>/dev/null || true',
     relay(3128, httpSocketPath),
     '_srt_http=$!',
     relay(1080, socksSocketPath),
@@ -1823,9 +1824,13 @@ function buildSandboxCommand(
     // The trap saves the status the script is exiting with and exits with
     // it. A bare `exit` inside an EXIT trap is not portable: bash and dash
     // keep the script's status, zsh takes the status of the trap's own last
-    // command (the kill), so under zsh a failing command reported 0. Single
-    // quotes, so $? and $rc are read when the trap runs, not when it is set.
-    "trap 'rc=$?; kill %1 %2 2>/dev/null; exit $rc' EXIT",
+    // command (the kill), so under zsh a failing command reported 0.
+    // Expand the relay PIDs into the trap string when setting it, so the trap
+    // retains the explicit PIDs/PGIDs even after RELAYS_LISTEN unsets them,
+    // and kill both the process groups (-pid) and processes (pid) directly
+    // rather than job specifiers (%1, %2) that fail in non-interactive dash/bash.
+    'trap "rc=\\$?; kill -TERM -$_srt_http -$_srt_socks $_srt_http $_srt_socks 2>/dev/null; exit \\$rc" EXIT',
+    'set +m 2>/dev/null || true',
     ...RELAYS_LISTEN,
   ]
 
