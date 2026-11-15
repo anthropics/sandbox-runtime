@@ -21,6 +21,7 @@
     "clean": "rm -rf dist",
     "test": "bun test",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "typecheck:consumer": "npm run build && tsc --noEmit --strict --skipLibCheck false --target ES2022 --module NodeNext --moduleResolution NodeNext --types node type-tests/public-api.ts",
     "lint": "eslint 'src/**/*.ts' --fix --cache --cache-location=node_modules/.cache/.eslintcache",
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",
     "format": "prettier --write 'src/**/*.ts' --cache --log-level warn",
@@ -31,7 +32,7 @@
     "@pondwader/socks5-server": "^1.0.10",
     "commander": "^12.1.0",
     "node-forge": "^1.4.0",
-    "zod": "^3.25.0"
+    "zod": "^4.6.7"
   },
   "peerDependencies": {
     "@microsoft/mxc-sdk": "^1.0.1"

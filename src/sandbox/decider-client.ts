@@ -50,7 +50,7 @@
 
 import { isIP } from 'node:net'
 import type { Readable, Writable } from 'node:stream'
-import { z } from 'zod/v3'
+import { z } from 'zod'
 import {
   foldHeaderName,
   type FilterRequestCallback,
