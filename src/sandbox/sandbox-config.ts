@@ -6,11 +6,7 @@
 import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute, posix as posixPath, win32 as win32Path } from 'node:path'
-// The 'zod/v3' subpath, not bare 'zod': it exists from zod 3.25 on and is the
-// v3 API under both zod 3.25+ and zod 4. Where a consumer's dependency tree
-// resolves this package's zod to version 4, the bare import would hand these
-// schemas the v4 API they are not written against.
-import { z } from 'zod/v3'
+import { z } from 'zod'
 import {
   ALLOWED_DOMAIN_ENTRY_MESSAGE,
   DOMAIN_PATTERN_MESSAGE,
@@ -85,13 +81,13 @@ const filesystemPathEntrySchema = z.union(
     z.object({ path: filesystemPathSchema, literal: z.literal(true) }).strict(),
   ],
   {
-    errorMap: (issue, ctx) =>
+    error: issue =>
       issue.code === z.ZodIssueCode.invalid_union
         ? {
             message:
               'Expected a path, or { "path": "<path>", "literal": true }',
           }
-        : { message: ctx.defaultError },
+        : undefined,
   },
 )
 

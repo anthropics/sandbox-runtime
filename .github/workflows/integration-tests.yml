@@ -444,9 +444,9 @@ jobs:
         if: matrix.os != 'windows'
         run: npm run build:java-agent
 
-      - name: Build project
+      - name: Build project and check consumer declarations
         if: matrix.os != 'windows'
-        run: npm run build
+        run: npm run typecheck:consumer
 
       - name: Run tests
         if: matrix.os != 'windows'
