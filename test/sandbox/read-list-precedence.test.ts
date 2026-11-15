@@ -563,7 +563,7 @@ describe.if(!isWindows)('precedence between the read lists', () => {
 
     /** The file-read* denies that come after the allowRead rule. */
     const lateDenies = (profile: string): string => {
-      const allowAt = profile.indexOf('(allow file-read*\n')
+      const allowAt = profile.indexOf('(allow file-read* network-outbound\n')
       expect(allowAt).toBeGreaterThan(-1)
       return profile.slice(
         allowAt,
@@ -575,7 +575,7 @@ describe.if(!isWindows)('precedence between the read lists', () => {
     const firstRule =
       (action: 'allow' | 'deny') =>
       (profile: string, file: string): boolean => {
-        const at = profile.indexOf(`(${action} file-read*\n`)
+        const at = profile.indexOf(`(${action} file-read* network-outbound\n`)
         return profile
           .slice(at, profile.indexOf('(with message', at))
           .split('\n')
@@ -617,7 +617,8 @@ describe.if(!isWindows)('precedence between the read lists', () => {
           denyOnly: ['/vault/v1/token'],
           allowWithinDeny: [allow],
         }
-        const filter = '(deny file-read*\n  (subpath "/vault/v1/token")\n'
+        const filter =
+          '(deny file-read* network-outbound\n  (subpath "/vault/v1/token")\n'
         expect(lateDenies(profileOf(config))).not.toContain(filter)
         expect(lateDenies(profileOf(asCredential(config)))).toContain(filter)
       },
@@ -656,7 +657,9 @@ describe.if(!isWindows)('precedence between the read lists', () => {
             { masked: '/vault/v1/token' },
           ),
         ),
-      ).toContain('(deny file-read*\n  (subpath "/vault/v1/token")\n')
+      ).toContain(
+        '(deny file-read* network-outbound\n  (subpath "/vault/v1/token")\n',
+      )
     })
 
     it("the library's own files are subtracted from a credential deny", () => {

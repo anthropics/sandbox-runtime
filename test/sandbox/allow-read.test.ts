@@ -478,7 +478,9 @@ describe.if(isMacOS)('macOS denyRead nested under allowRead', () => {
     })
     // The profile is embedded in a shell command, so quotes are escaped —
     // match on the unquoted skeleton.
-    const allowAt = result.indexOf('(allow file-read*\n  (subpath')
+    const allowAt = result.indexOf(
+      '(allow file-read* network-outbound\n  (subpath',
+    )
     const lastDenySecrets = result.lastIndexOf('/work/secrets')
     const firstDenySecrets = result.indexOf('/work/secrets')
     expect(allowAt).toBeGreaterThan(-1)

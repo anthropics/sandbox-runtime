@@ -721,7 +721,8 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      'If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK).',
+      'If true, allow all Unix sockets (disables blocking on both platforms). On Linux this also unblocks VM sockets (AF_VSOCK). ' +
+        'On macOS a socket under a filesystem.denyRead path stays refused unless filesystem.allowRead re-opens it, as on Linux, where a read-denied directory is empty.',
     ),
   allowLocalBinding: z
     .boolean()
