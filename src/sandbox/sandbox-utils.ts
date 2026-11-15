@@ -23,6 +23,8 @@ export const DANGEROUS_FILES = [
   '.gitmodules',
   '.bashrc',
   '.bash_profile',
+  '.bash_login',
+  '.bash_logout',
   '.zshrc',
   '.zprofile',
   '.profile',

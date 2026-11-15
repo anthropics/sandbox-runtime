@@ -1195,11 +1195,14 @@ Filesystem restrictions are enforced at the OS level:
 
 ### Mandatory Deny Paths (Auto-Protected Files)
 
-Certain sensitive files and directories are **always blocked from writes**, even if they fall within an allowed write path. This provides defense-in-depth against sandbox escapes and configuration tampering.
+Certain sensitive files and directories in the working directory and its covered subdirectories are **always blocked from writes**, even if they fall within an allowed write path. This provides defense-in-depth against sandbox escapes and configuration tampering.
+
+These mandatory denies are anchored to the working directory, not automatically to your home directory or other allowed write roots. When allowing writes outside that tree, use explicit `denyWrite` entries for sensitive files there. For example, allowing writes to your home directory while running from a project directory requires explicit denies for the home directory's shell startup files.
 
 **Always-blocked files:**
 
-- Shell config files: `.bashrc`, `.bash_profile`, `.zshrc`, `.zprofile`, `.profile`
+- Shell config files: `.bashrc`, `.bash_profile`, `.bash_login`, `.bash_logout`,
+  `.zshrc`, `.zprofile`, `.profile`
 - Git config files: `.gitconfig`, `.gitmodules`
 - Other sensitive files: `.ripgreprc`, `.mcp.json`
 

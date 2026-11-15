@@ -184,6 +184,23 @@ describe.if(isSupportedPlatform)(
           expect(readFileSync(name, 'utf8')).toBe(ORIGINAL_CONTENT)
         })
       }
+
+      for (const name of ['.bash_login', '.bash_logout']) {
+        it(`blocks creating ${name} when it does not exist`, async () => {
+          rmSync(name, { force: true })
+          try {
+            const result = await runSandboxedWrite(name, MODIFIED_CONTENT)
+            // Linux may create an empty host-side mount point for the deny.
+            cleanupBwrapMountPoints({ force: true })
+
+            expect(result.success).toBe(false)
+            expect(existsSync(name)).toBe(false)
+          } finally {
+            cleanupBwrapMountPoints({ force: true })
+            writeFileSync(name, ORIGINAL_CONTENT)
+          }
+        })
+      }
     })
 
     describe('Git hooks and config should be blocked', () => {
