@@ -8,7 +8,7 @@ test('configuration schemas use Zod 4 and retain path-entry diagnostics', () => 
     network: { allowedDomains: [], deniedDomains: [] },
     filesystem: {
       denyRead: [],
-      allowWrite: [{ path: '/tmp/output', literal: true }],
+      allowWrite: [{ path: '/tmp/output', literal: true as const }],
       denyWrite: [],
     },
   }
