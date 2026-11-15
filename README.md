@@ -522,6 +522,12 @@ Unix sockets are **blocked by default** on both platforms.
 - **macOS**: Use `allowUnixSockets` to allow specific paths (e.g., `["/var/run/docker.sock"]`), or `allowAllUnixSockets: true` to allow all.
 - **Linux**: Blocking uses seccomp filters (x64/arm64 only). If seccomp isn't available, sockets are unrestricted and a warning is shown. Use `allowAllUnixSockets: true` to explicitly disable blocking.
 
+**Sockets in read-denied paths.** Where a command may connect to any Unix socket (`allowAllUnixSockets`, or a wrap with no network restriction), it still cannot connect to one it may not read:
+
+- **macOS**: Seatbelt does not check read access on `connect()`, so the `denyRead` / `allowRead` rules are applied to connecting as well: a socket under a `denyRead` path is refused (`EPERM`) unless an `allowRead` entry re-opens it, matched on the socket's real path as reads are. The system resolver's socket (`/private/var/run/mDNSResponder`) stays reachable so name lookups keep working. An `allowUnixSockets` list is not changed by this: the sockets it names stay reachable.
+- **Linux**: unchanged. A read-denied directory is an empty tmpfs inside the sandbox, so a socket in it is not there to connect to. seccomp cannot see a socket's path, so there is no rule by path: what decides is only whether the socket is visible in the sandbox's filesystem.
+- **Windows**: unchanged.
+
 #### Filesystem Configuration
 
 Uses two different patterns:

@@ -875,6 +875,11 @@ function moveBlockingFilters(entries: readonly PathEntry[]): Set<string> {
  *                               (see lateReadDenyFilters)
  *   (allow file-read* (literal "/"))  ← only if a deny covers "/" itself
  *
+ * With `coverUnixSocketConnect`, the deny, re-allow and re-emitted deny
+ * layers also carry `network-outbound`: a path filter on that operation
+ * matches connect() to a Unix socket at that path and nothing else, so a
+ * socket the command may not read is one it may not connect to.
+ *
  * REVIEW INVARIANT: after the allowWithinDeny block, this function only
  * ever adds denies (or narrows one with require-not). The one exception is
  * the pre-existing literal-"/" re-allow, which matches exactly one vnode.
@@ -884,12 +889,16 @@ function moveBlockingFilters(entries: readonly PathEntry[]): Set<string> {
 function generateReadRules(
   resolved: ResolvedReadConfig | undefined,
   logTag: string,
+  coverUnixSocketConnect = false,
 ): string[] {
   if (!resolved) {
     return [`(allow file-read*)`]
   }
 
   const rules: string[] = []
+  const readOps = coverUnixSocketConnect
+    ? ['file-read*', 'network-outbound']
+    : ['file-read*']
 
   // Start by allowing everything
   rules.push(`(allow file-read*)`)
@@ -897,18 +906,16 @@ function generateReadRules(
   // Then deny specific paths
   const deniesRoot = resolved.denies.some(d => d.path === '/')
   const denyFilters = new Set(resolved.denies.map(denyPathFilter))
-  rules.push(...renderRule('deny', ['file-read*'], denyFilters, logTag))
+  rules.push(...renderRule('deny', readOps, denyFilters, logTag))
 
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
   const allowFilters = new Set(resolved.allows.map(a => pathFilter(a)))
-  rules.push(...renderRule('allow', ['file-read*'], allowFilters, logTag))
+  rules.push(...renderRule('allow', readOps, allowFilters, logTag))
 
   // Denies the allow block would otherwise win over (last-match-wins) land
   // here, after it. Must stay ahead of the file-read-metadata allow below.
   const late = lateReadDenyFilters(resolved)
-  rules.push(
-    ...renderRule('deny', ['file-read*'], new Set(late.filters), logTag),
-  )
+  rules.push(...renderRule('deny', readOps, new Set(late.filters), logTag))
 
   // (subpath "/") — or a re-emitted `/*`-shaped glob — denies the root inode
   // itself; no allowWithinDeny entry covers "/", so dyld aborts before exec
@@ -1040,6 +1047,9 @@ function generateWriteRules(
 
   return rules
 }
+
+/** The socket every name lookup through the system resolver connects to. */
+const MACOS_RESOLVER_SOCKET = '/private/var/run/mDNSResponder'
 
 /**
  * Generate complete sandbox profile
@@ -1356,8 +1366,26 @@ function generateSandboxProfile({
           libraryDenyEntries,
         )
       : undefined
+  // Where a command may connect to any Unix socket (an unrestricted
+  // network, or allowAllUnixSockets), the read rules decide which: Seatbelt
+  // does not check file-read* on connect(), so a socket inside a read-denied
+  // directory would otherwise stay reachable. On Linux that directory is not
+  // there to connect into. An allowUnixSockets list is left as it is: it
+  // already names each socket the command may reach.
+  const readRulesCoverUnixSockets =
+    resolvedRead !== undefined &&
+    (!needsNetworkRestriction || allowAllUnixSockets === true)
   profile.push('; File read')
-  profile.push(...generateReadRules(resolvedRead, logTag))
+  profile.push(
+    ...generateReadRules(resolvedRead, logTag, readRulesCoverUnixSockets),
+  )
+  if (readRulesCoverUnixSockets) {
+    // Name lookups go through the resolver's socket: a read deny over / or
+    // /private is not meant to take name resolution away.
+    profile.push(
+      `(allow network-outbound (literal ${escapePath(MACOS_RESOLVER_SOCKET)}))`,
+    )
+  }
   profile.push('')
 
   // Write rules

@@ -36,8 +36,8 @@ import { isMacOS, isWindows } from '../helpers/platform.js'
  */
 
 const HEADERS = {
-  allowRead: '(allow file-read*\n',
-  denyRead: '(deny file-read*\n',
+  allowRead: '(allow file-read* network-outbound\n',
+  denyRead: '(deny file-read* network-outbound\n',
   denyUnlink: '(deny file-write-unlink\n',
   metadata: '(allow file-read-metadata',
   rootReallow: '(allow file-read* (literal "/"))',

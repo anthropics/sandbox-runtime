@@ -1471,10 +1471,12 @@ describe.if(!isWindows)(
         { denyOnly: [dir], allowWithinDeny: [open] },
         undefined,
       )
-      expect(ruleOf(profile, '(allow file-read*\n')).toContain(subpath(open))
+      expect(ruleOf(profile, '(allow file-read* network-outbound\n')).toContain(
+        subpath(open),
+      )
       // A deny nested in an allow lands again after it; here the allow is the
       // nested one, so the deny is not repeated by name.
-      const denies = profile.split('(deny file-read*\n')
+      const denies = profile.split('(deny file-read* network-outbound\n')
       expect(denies[1]).toContain(subpath(dir))
     })
 
@@ -1749,7 +1751,7 @@ function fileRulesOf(wrapped: string): string {
 
 const EXPECTED_MACOS_FILE_RULES = String.raw`; File read
 (allow file-read*)
-(deny file-read*
+(deny file-read* network-outbound
   (subpath "/srt-literal-path-entries/secrets")
   (regex "^/srt-literal-path-entries/home/\\.ssh/.*(/.*)?$")
   (regex "^/srt-literal-path-entries/proj/(.*/)?\\.env(/.*)?$")
@@ -1758,12 +1760,12 @@ const EXPECTED_MACOS_FILE_RULES = String.raw`; File read
   (regex "^/srt-literal-path-entries/proj/file[^/]\\.txt(/.*)?$")
   (regex "^/srt-literal-path-entries/proj/(.*/)?build/.*(/.*)?$")
   (with message "<tag>"))
-(allow file-read*
+(allow file-read* network-outbound
   (subpath "/srt-literal-path-entries/secrets/public")
   (regex "^/srt-literal-path-entries/proj/(.*/)?public$")
   (subpath "/srt-literal-path-entries/home/.ssh/known_hosts")
   (with message "<tag>"))
-(deny file-read*
+(deny file-read* network-outbound
   (require-all (regex "^/srt-literal-path-entries/home/\\.ssh/.*(/.*)?$") (require-not (subpath "/srt-literal-path-entries/home/.ssh/known_hosts")))
   (regex "^/srt-literal-path-entries/proj/(.*/)?\\.env(/.*)?$")
   (regex "^/srt-literal-path-entries/proj/[^/]*\\.pem(/.*)?$")
@@ -1792,6 +1794,7 @@ const EXPECTED_MACOS_FILE_RULES = String.raw`; File read
   (regex "^/srt-literal-path-entries/build/[^/]*$")
   (regex "^/srt-literal-path-entries/cache/[0-9]$")
   (with message "<tag>"))
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
 
 ; File write
 (allow file-write*
@@ -1977,7 +1980,7 @@ describe.if(!isWindows)('an entry marked literal', () => {
       },
     })
     expect(ruleOf(profile, '(deny file-read*')).toContain(subpath(starred))
-    expect(ruleOf(profile, '(allow file-read*\n')).toContain(
+    expect(ruleOf(profile, '(allow file-read* network-outbound\n')).toContain(
       subpath(join(dir, 'a?')),
     )
     expect(ruleOf(profile, '(allow file-write*')).toContain(
