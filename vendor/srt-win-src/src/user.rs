@@ -506,20 +506,9 @@ fn is_logon_ui_hidden(user: &str) -> bool {
 /// `LOGON_WITH_PROFILE` logon performs and the sandbox launch
 /// depends on (the account holds it via `BUILTIN\Users`).
 ///
-/// - `SeDenyNetworkLogonRight`: the SMB redirector dials as SYSTEM
-///   from kernel mode, so the SID-keyed WFP fence never classifies
-///   its connects — red-teaming confirmed `net use \\127.0.0.1\IPC$`
-///   succeeded from inside the sandbox, and the same mechanism
-///   reaches remote shares (an exfil channel) and SMB-hosted RPC
-///   pipes. SMB *authenticates* as the sandbox account though, so
-///   denying it the network-logon right refuses the session at the
-///   server regardless of which process carried the bytes.
-///   CAVEAT (verified): LOOPBACK SMB stays reachable — NTLM
-///   loopback auth reuses the client's existing logon session, so
-///   no new network logon happens and the deny right never fires;
-///   `LogonUser(NETWORK)` (what any REMOTE server's LSA runs)
-///   returns 1385. Content behind loopback shares is still governed
-///   by the same NTFS ACLs the sandbox is stamped with.
+/// - `SeDenyNetworkLogonRight`: THIS machine refuses a new network logon as
+///   the account. It governs logons to this machine only and is no limit on
+///   outbound SMB: a share on this machine's own server stays reachable.
 /// - `SeDenyBatchLogonRight`: a sandboxed child can REGISTER a
 ///   scheduled task (the service's DACL allows it); the task then
 ///   needs a batch logon to RUN. Denying it turns registration into

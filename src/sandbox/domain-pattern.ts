@@ -3,10 +3,19 @@
  * (sandbox-manager) and config-time validation (sandbox-config).
  * Lives in its own module so the schema can import it without pulling
  * in sandbox-manager (which imports the schema — circular).
+ *
+ * The validity check for a list entry lives here too, so the manager can
+ * apply it to lists registered at run time without loading the schema module.
  */
 
 import { isIP } from 'node:net'
 import { canonicalizeHost, stripBrackets } from './parent-proxy.js'
+
+/** Drop an IPv6 zone id from an IP-literal entry; matching ignores zones. */
+function dropZone(host: string): string {
+  const pct = host.indexOf('%')
+  return pct === -1 ? host : host.slice(0, pct)
+}
 
 /**
  * Split an optional `:port` suffix off a domain pattern.
@@ -36,7 +45,7 @@ export function splitDomainPatternPort(pattern: string): {
   if (pattern.startsWith('[')) {
     const close = pattern.indexOf(']')
     if (close === -1) return { hostPattern: pattern, port: undefined }
-    const inner = pattern.slice(1, close)
+    const inner = dropZone(pattern.slice(1, close))
     const host = canonicalizeHost(inner) ?? inner
     const rest = pattern.slice(close + 1)
     if (rest === '') return { hostPattern: host, port: undefined }
@@ -50,8 +59,9 @@ export function splitDomainPatternPort(pattern: string): {
   if (idx === -1) return { hostPattern: pattern, port: undefined }
   if (pattern.indexOf(':') !== idx) {
     // ≥2 colons, no brackets: an IPv6 literal (or garbage). Never split.
+    const host = dropZone(pattern)
     return {
-      hostPattern: canonicalizeHost(pattern) ?? pattern,
+      hostPattern: canonicalizeHost(host) ?? host,
       port: undefined,
     }
   }
@@ -64,6 +74,97 @@ function parsePortSuffix(suffix: string): number | undefined {
   if (!/^[1-9][0-9]{0,4}$/.test(suffix)) return undefined
   const port = Number(suffix)
   return port > 65535 ? undefined : port
+}
+
+/**
+ * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
+ * protocols, paths, ports, and overly broad wildcards.
+ */
+export function isValidDomainPattern(val: string): boolean {
+  // A bare IPv6 literal as produced by splitDomainPatternPort for a
+  // bracketed entry (`[::1]`, `[2001:db8::1]:443` -> `::1`, `2001:db8::1`).
+  // Whether the *raw* entry was bracketed is enforced separately
+  // (hasValidIpv6Bracketing) before the split.
+  if (isIP(val) === 6) return true
+
+  // Reject protocols, paths, ports, etc.
+  if (val.includes('://') || val.includes('/') || val.includes(':')) {
+    return false
+  }
+
+  // Allow localhost
+  if (val === 'localhost') return true
+
+  // Allow wildcard domains like *.example.com
+  if (val.startsWith('*.')) {
+    const domain = val.slice(2)
+    // After the *. there must be a valid domain with at least one more dot
+    // e.g., *.example.com is valid, *.com is not (too broad)
+    if (
+      !domain.includes('.') ||
+      domain.startsWith('.') ||
+      domain.endsWith('.')
+    ) {
+      return false
+    }
+    // Count dots - must have at least 2 parts after the wildcard (e.g., example.com)
+    const parts = domain.split('.')
+    return parts.length >= 2 && parts.every(p => p.length > 0)
+  }
+
+  // Reject any other use of wildcards (e.g., *, *., etc.)
+  if (val.includes('*')) {
+    return false
+  }
+
+  // Regular domains must have at least one dot and only valid characters
+  return val.includes('.') && !val.startsWith('.') && !val.endsWith('.')
+}
+
+export const DOMAIN_PATTERN_MESSAGE =
+  'Invalid domain pattern. Must be a valid domain (e.g., "example.com"), a wildcard (e.g., "*.example.com"), or a bracketed IPv6 literal (e.g., "[::1]", "[2001:db8::1]:443"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
+
+/**
+ * Raw-entry rule applied before the port split: an entry with two or more
+ * colons is an IPv6 literal and must use RFC 3986 brackets (`[::1]`,
+ * `[::1]:443`). Unbracketed it is ambiguous (`2001:db8::1:443` is itself a
+ * valid 8-hextet address), so reject it and make the user say which they
+ * mean, rather than accept an entry that can silently match the wrong thing.
+ */
+export function hasValidIpv6Bracketing(val: string): boolean {
+  const first = val.indexOf(':')
+  const multiColon = first !== -1 && val.indexOf(':', first + 1) !== -1
+  return !multiColon || val.startsWith('[')
+}
+
+/**
+ * The check an allow-list entry gets: a domain pattern with an optional
+ * `:port` suffix. Shared by the `network.allowedDomains` schema and the lists
+ * registered at run time, so neither accepts what the other refuses.
+ */
+export function isValidAllowedDomainEntry(val: string): boolean {
+  return (
+    hasValidIpv6Bracketing(val) &&
+    isValidDomainPattern(splitDomainPatternPort(val).hostPattern)
+  )
+}
+
+export const ALLOWED_DOMAIN_ENTRY_MESSAGE =
+  DOMAIN_PATTERN_MESSAGE +
+  ' An optional ":port" suffix (1-65535) restricts the entry to that port.'
+
+/**
+ * The IP-literal entries of an allow/deny list as `{ range, port? }` rules
+ * for the resolved-address check: an address the list names explicitly is
+ * judged the same way when a hostname resolves to it.
+ */
+export function ipLiteralRules(
+  entries: readonly string[],
+): Array<{ range: string; port?: number }> {
+  return entries.flatMap(entry => {
+    const { hostPattern, port } = splitDomainPatternPort(entry)
+    return isIP(hostPattern) ? [{ range: hostPattern, port }] : []
+  })
 }
 
 /** Drop a `:port` suffix, if any (see {@link splitDomainPatternPort}). */

@@ -2,10 +2,12 @@ import { createServer, connect, type Server, type Socket } from 'node:net'
 import type { Server as HttpServer } from 'node:http'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { rmSync } from 'node:fs'
 import { unlink } from 'node:fs/promises'
 import { logForDebugging } from '../utils/debug.js'
 import { getPlatform } from '../utils/platform.js'
 import { listenInRange } from './listen-in-range.js'
+import { closeAfterFlush } from './tls-terminate-proxy.js'
 
 /**
  * First-byte values that select the SOCKS handler. SOCKS5's greeting is
@@ -60,6 +62,11 @@ export interface MuxProxyServer {
   listenHttpBackend(): Promise<number | undefined>
   /** Tear down front-end, backend, and all open client sockets. */
   close(): Promise<void>
+  /**
+   * The part of close() left to a process 'exit' handler, where nothing
+   * awaited runs: remove the backend's unix socket file (Windows has none).
+   */
+  removeBackendSocketSync(): void
   /** unref() both listeners so they don't keep the event loop alive. */
   unref(): void
 }
@@ -113,7 +120,18 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     const upstream = backendSocketPath
       ? connect(backendSocketPath)
       : connect(backendTcpPort!, '127.0.0.1')
+    let answered = false
+    upstream.once('data', () => {
+      answered = true
+    })
     upstream.on('error', err => {
+      // The 502 is an answer, for a client that has had none. One that has
+      // may be in the middle of anything, a TLS tunnel included, where clear
+      // text is noise. The 'close' that follows ends it.
+      if (answered) {
+        logForDebugging(`mux: HTTP backend error: ${(err as Error).message}`)
+        return
+      }
       // Surface a 502 with the errno code so callers (and CI logs) can tell
       // *why* the backend was unreachable instead of an opaque empty-reply.
       // Full error (including path) goes to debug logging only — the client
@@ -132,7 +150,8 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
     })
     client.on('error', () => upstream.destroy())
     client.once('close', () => upstream.destroy())
-    upstream.once('close', () => client.destroy())
+    // What is still queued for the client then is the end of an answer.
+    upstream.once('close', () => closeAfterFlush(client, () => {}))
     client.pipe(upstream)
     upstream.pipe(client)
   }
@@ -222,6 +241,13 @@ export function createMuxProxyServer(opts: MuxProxyOptions): MuxProxyServer {
         backendSocketPath = undefined
       }
       backendTcpPort = undefined
+    },
+    removeBackendSocketSync(): void {
+      try {
+        if (backendSocketPath) rmSync(backendSocketPath, { force: true })
+      } catch {
+        // Best effort, as in close().
+      }
     },
     unref(): void {
       server.unref()

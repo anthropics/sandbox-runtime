@@ -160,6 +160,22 @@ describe('parent-proxy: NO_PROXY matching', () => {
     expect(shouldBypassParentProxy(r, 'fe80::1')).toBe(true)
   })
 
+  test('a zoned IPv6 entry is its unzoned range and never throws', () => {
+    const r = mk('fe80::1%eth0,fe80::%eth1/10,10.0.0.0/8')
+    expect(shouldBypassParentProxy(r, 'fe80::1')).toBe(true)
+    expect(shouldBypassParentProxy(r, 'fe80::2')).toBe(true)
+    expect(shouldBypassParentProxy(r, '10.1.1.1')).toBe(true)
+    expect(shouldBypassParentProxy(r, '8.8.8.8')).toBe(false)
+  })
+
+  test('an IPv4-mapped entry matches exactly its IPv4 address, not every IPv4 host', () => {
+    const r = mk('::ffff:10.0.0.1,::ffff:192.168.0.0/112')
+    expect(shouldBypassParentProxy(r, '10.0.0.1')).toBe(true)
+    expect(shouldBypassParentProxy(r, '192.168.4.4')).toBe(true)
+    expect(shouldBypassParentProxy(r, '10.0.0.2')).toBe(false)
+    expect(shouldBypassParentProxy(r, '8.8.8.8')).toBe(false)
+  })
+
   test('empty CIDR suffix does not become match-all', () => {
     const r = mk('10.0.0.0/')
     // Malformed — should be ignored, not treated as /0
@@ -384,6 +400,15 @@ describe('parent-proxy: canonicalizeHost', () => {
   test('normalizes IPv6 forms', () => {
     expect(canonicalizeHost('0:0:0:0:0:0:0:1')).toBe('::1')
     expect(canonicalizeHost('[::1]')).toBe('::1')
+  })
+
+  test('spells an IPv4-mapped IPv6 literal as the IPv4 address it connects to', () => {
+    expect(canonicalizeHost('::ffff:127.0.0.1')).toBe('127.0.0.1')
+    expect(canonicalizeHost('[::FFFF:A9FE:A9FE]')).toBe('169.254.169.254')
+    expect(canonicalizeHost('0:0:0:0:0:ffff:7f00:1')).toBe('127.0.0.1')
+    // Other IPv4-embedding forms are different destinations; left as IPv6.
+    expect(canonicalizeHost('::ffff:0:7f00:1')).toBe('::ffff:0:7f00:1')
+    expect(canonicalizeHost('64:ff9b::7f00:1')).toBe('64:ff9b::7f00:1')
   })
 
   test('strips trailing dot and lowercases', () => {

@@ -1,6 +1,13 @@
 // Library exports
-export { SandboxManager } from './sandbox/sandbox-manager.js'
-export type { WrapWithSandboxOptions } from './sandbox/sandbox-manager.js'
+export {
+  SandboxManager,
+  SandboxInitializeConflictError,
+} from './sandbox/sandbox-manager.js'
+export type { WindowsProfileReadWarning } from './sandbox/sandbox-manager.js'
+export type {
+  WrapWithSandboxOptions,
+  SandboxInitializeOptions,
+} from './sandbox/sandbox-manager.js'
 export { SandboxViolationStore } from './sandbox/sandbox-violation-store.js'
 
 // Configuration types and schemas
@@ -8,6 +15,7 @@ export type {
   SandboxRuntimeConfig,
   NetworkConfig,
   FilesystemConfig,
+  FilesystemPathEntry,
   CredentialsConfig,
   CredentialFileConfig,
   CredentialEnvVarConfig,
@@ -38,12 +46,17 @@ export type {
 export type {
   FilterRequestCallback,
   RequestDecision,
+  RequestInfo,
   MutateForwardedHeaders,
 } from './sandbox/request-filter.js'
 
 // Platform-specific utilities
 export type { SandboxViolationEvent } from './sandbox/macos-sandbox-utils.js'
-export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
+export {
+  type SandboxDependencyCheck,
+  LinuxSandboxProfileError,
+  type LinuxSandboxProfileErrorCode,
+} from './sandbox/linux-sandbox-utils.js'
 
 // Windows install/status API
 export {
@@ -72,12 +85,25 @@ export {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
+  revokeWindowsAclChecked,
+  grantWindowsProfileRead,
+  forgetWindowsProfileRead,
+  forgetWindowsProfileReadAsync,
+  getWindowsProfileReadStatus,
+  getWindowsProfileReadStatusAsync,
+  windowsProfileReadEnv,
+  windowsProfileExclusionConflicts,
+  windowsProfileGrantSkipReason,
+  windowsProfileGrantNotice,
+  WINDOWS_PROFILE_READ_ENV_VARS,
   expandWindowsFsPaths,
   buildGitConfigEnv,
   parseWindowsBinShell,
   parseWindowsSandboxError,
   isUncPath,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  WINDOWS_ALLOW_LOOPBACK_EFFECT,
+  WINDOWS_LOOPBACK_PROBE_PORT,
   SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
@@ -85,18 +111,48 @@ export type {
   WindowsSandboxStatus,
   WindowsBinShell,
   MappedDriveCwdError,
+  SeclogonDisabledError,
+  WindowsSeclogonState,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,
   WindowsAclStampOptions,
   WindowsAclGrantOptions,
   WindowsAclAceOutcome,
+  WindowsWfpProbeOutcome,
+  WindowsWfpResidual,
+  WindowsAclRevokeResult,
+  WindowsProfileGrantState,
+  WindowsProfileGrantStatus,
+  WindowsProfileGrantPath,
+  WindowsProfileGrantOptions,
+  WindowsProfileForgetResult,
+  WindowsProfileGrantResult,
+  WindowsProfileGrantItem,
+  WindowsInstallProfileGrant,
+  WindowsProfileExclusionConflict,
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
   WindowsPersistentCa,
   SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
+
+// Windows MXC BaseContainer backend, named by `windows.backend`:
+// commands start through SandboxManager.spawnSandboxed().
+export type {
+  MxcProbeOutput,
+  MxcProcessHandle,
+  MxcRequest,
+  MxcSdk,
+  MxcUiCapabilities,
+  WindowsBackendSelection,
+} from './sandbox/mxc-sandbox-utils.js'
+export type {
+  CheckDependenciesOptions,
+  SandboxedProcess,
+  SpawnSandboxedOptions,
+} from './sandbox/sandbox-manager.js'
 
 // TLS-termination CA generation/validation (mitm-ca.ts). Embedders that
 // manage CA persistence themselves (rather than relying on the Windows
@@ -120,6 +176,9 @@ export {
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'
+export { writeRootsOf } from './sandbox/path-entries.js'
+// Where the library takes a path to be: for a caller that judges paths itself.
+export { realPathOf } from './utils/real-path.js'
 
 // Platform utilities
 export { getWslVersion } from './utils/platform.js'

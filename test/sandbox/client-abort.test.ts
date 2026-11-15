@@ -1,4 +1,8 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import {
+  SERVES_EMITTED_CONNECTIONS,
+  testWithTls,
+} from '../helpers/emitted-connections.js'
 import { createServer, type Server } from 'node:http'
 import { connect } from 'node:net'
 import type { AddressInfo } from 'node:net'
@@ -705,6 +709,8 @@ describe('client-abort delivery semantics', () => {
 // HTTPS server (the request handler listeners, inner clientError, and the
 // teed-body wiring are otherwise unreachable by the plain-HTTP tests).
 describe('client aborts through the TLS-terminating path', () => {
+  // Every case runs a TLS-terminating proxy: skipped where none can run.
+  const test = testWithTls
   const FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
   const CA_PEM = readFileSync(join(FIXTURE_DIR, 'ca.crt'), 'utf8')
   const ca = createMitmCA({
@@ -724,7 +730,7 @@ describe('client aborts through the TLS-terminating path', () => {
     process.on('uncaughtException', onUncaught)
     proxy = createHttpProxyServer({
       filter: () => true,
-      mitmCA: ca,
+      mitmCA: SERVES_EMITTED_CONNECTIONS ? ca : undefined,
       filterRequest: async () => ({ action: 'allow' }),
     })
     await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))

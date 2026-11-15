@@ -14,6 +14,7 @@ import {
   certThumbprint,
   createMitmCA,
   disposeMitmCA,
+  disposeMitmCASync,
   generateCa,
   signCertificateNative,
   validateCaPair,
@@ -149,6 +150,20 @@ describe('mitm-ca: ephemeral generation', () => {
     await disposeMitmCA(user)
     expect(existsSync(bundleDir)).toBe(false)
     expect(existsSync(certPath)).toBe(true) // fixture untouched
+  })
+
+  test('disposeMitmCASync removes what disposeMitmCA does, before or after it', async () => {
+    const eph = createMitmCA({})
+    disposeMitmCASync(eph)
+    expect(existsSync(dirname(eph.keyPath))).toBe(false)
+    expect(existsSync(dirname(eph.trustBundlePath))).toBe(false)
+    await disposeMitmCA(eph)
+    disposeMitmCASync(eph)
+
+    const user = createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
+    disposeMitmCASync(user)
+    expect(existsSync(dirname(user.trustBundlePath))).toBe(false)
+    expect(existsSync(keyPath)).toBe(true) // fixture untouched
   })
 
   test('signCertificateNative is byte-identical to node-forge cert.sign()', async () => {

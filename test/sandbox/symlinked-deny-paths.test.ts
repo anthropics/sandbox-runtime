@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -15,6 +16,27 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
+import { bwrapCanNamespace } from '../helpers/bwrap-namespace.js'
+import { countMounts } from '../helpers/bwrap-argv.js'
+import { withCapturedWarnings } from '../helpers/captured-warnings.js'
+
+/**
+ * The root's symlinks into /usr (/bin, /lib, /sbin on a usr-merged system),
+ * listed here rather than inside a test: a `describe.if` body runs on every
+ * platform, and a root symlink may dangle (macOS runners have one). An empty
+ * list means the host is not usr-merged, and the case below has nothing to
+ * tell apart.
+ */
+const USR_MERGED_ROOT_LINKS = readdirSync('/', { withFileTypes: true })
+  .filter(entry => entry.isSymbolicLink())
+  .flatMap(entry => {
+    try {
+      return [realpathSync('/' + entry.name)]
+    } catch {
+      return []
+    }
+  })
+  .filter(target => target.startsWith('/usr/'))
 
 /**
  * Regression tests for symlinked deny paths (resolve-before-mask).
@@ -35,7 +57,7 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
   let PROJ: string // project dir containing the symlinks
   let DOTFILES: string // real directory the symlinks point into
 
-  const hasBwrap = spawnSync('bwrap', ['--version']).status === 0
+  const hasBwrap = bwrapCanNamespace()
 
   beforeEach(() => {
     BASE = realpathSync(mkdtempSync(join(tmpdir(), 'symlinked-deny-')))
@@ -121,6 +143,149 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
     expect(result).toContain(`--ro-bind /dev/null ${linkTarget}`)
   })
 
+  it('lands beneath where a dangling symlink leads for a path beneath the link', async () => {
+    const danglingLink = join(PROJ, 'settings')
+    const linkTarget = join(AREA, 'nowhere')
+    symlinkSync(linkTarget, danglingLink)
+
+    const result = await wrap([join(danglingLink, '.mcp.json')])
+
+    // A directory is what stands in for the first missing component.
+    expect(countMounts(result, '--ro-bind', '/dev/null', linkTarget)).toBe(0)
+    expect(result).toMatch(new RegExp(`--ro-bind \\S+ ${linkTarget} `))
+  })
+
+  /** The placeholders beneath PROJ: what stands in, by where. */
+  const placeholders = (result: string): Record<string, string> =>
+    Object.fromEntries(
+      [...result.matchAll(/--ro-bind (\S+) (\S+)/g)]
+        .filter(([, from, at]) => from !== at && at!.startsWith(`${PROJ}/`))
+        .map(([, from, at]) => [
+          at!.slice(PROJ.length + 1),
+          from === '/dev/null' ? 'file' : 'directory',
+        ]),
+    )
+
+  it.each([
+    [
+      'a directory a dangling hop lacks',
+      { hop: 'lacking/in', name: 'hop/../made' },
+      { lacking: 'directory' },
+    ],
+    [
+      'what the last of three dangling hops lacks',
+      { hop: 'two/x', two: 'three/y', three: 'lacking/z', name: 'hop/made' },
+      { lacking: 'directory' },
+    ],
+    [
+      'the names that only lead down from it',
+      { name: 'lacking/./in//deep/../../made' },
+      { lacking: 'directory' },
+    ],
+    [
+      'a hop that is not there, and where the way leads if that is a directory',
+      { name: 'hop/../made' },
+      { hop: 'file', made: 'file' },
+    ],
+    [
+      'each name the way goes up from at once',
+      { name: 'one/../two/./../three/in' },
+      { one: 'file', two: 'file', three: 'directory' },
+    ],
+  ])('puts a placeholder on %s', async (_, links, expected) => {
+    for (const [link, target] of Object.entries(links)) {
+      symlinkSync(target, join(PROJ, link))
+    }
+
+    expect(placeholders(await wrap([join(PROJ, 'name')]))).toEqual(expected)
+  })
+
+  it('denies what is there where the way leads past a name that is not', async () => {
+    mkdirSync(join(PROJ, 'kept'))
+    symlinkSync('hop/../kept', join(PROJ, 'name'))
+
+    const result = await wrap([join(PROJ, 'name')])
+
+    expect(placeholders(result)).toEqual({ hop: 'file' })
+    expect(
+      countMounts(result, '--ro-bind', join(PROJ, 'kept'), join(PROJ, 'kept')),
+    ).toBe(1)
+  })
+
+  it('denies the root where the way leads there past a name that is not', async () => {
+    symlinkSync(
+      `hop/..${'/..'.repeat(PROJ.split('/').length)}`,
+      join(PROJ, 'name'),
+    )
+
+    const result = await wrapCommandWithSandboxLinux({
+      command: 'true',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: { allowOnly: ['/'], denyWithinAllow: [join(PROJ, 'name')] },
+    })
+
+    // Beside the one that every plan starts with.
+    expect(countMounts(result, '--ro-bind', '/', '/')).toBe(2)
+  })
+
+  it.each([
+    ['comes round to itself', 'name', 'ELOOP'],
+    [
+      'goes up from one missing name after another, without end',
+      'x/../name',
+      'too many names',
+    ],
+    ['leads through a name that is no text', Buffer.of(0x6e, 0xff), 'EILSEQ'],
+  ])('masks the link and says why where the way %s', async (_, target, why) => {
+    symlinkSync(target, join(PROJ, 'name'))
+
+    const { result, warnings } = await withCapturedWarnings(() =>
+      wrap([join(PROJ, 'name')]),
+    )
+
+    expect(
+      countMounts(result, '--ro-bind', '/dev/null', join(PROJ, 'name')),
+    ).toBe(1)
+    expect(warnings.filter(said => said.includes('cannot be settled'))).toEqual(
+      [expect.stringMatching(new RegExp(`${join(PROJ, 'name')} .*${why}`))],
+    )
+  })
+
+  // root searches a directory of any mode.
+  it.if(process.getuid?.() !== 0).each([
+    ['into', 'shut/x'],
+    ['deep into', 'shut/in/deep/x'],
+    ['up from', 'shut/../made'],
+    ['through a missing name and into', 'gone/../shut/x'],
+  ])(
+    'denies a directory that cannot be searched whole where the way leads %s it',
+    async (_, target) => {
+      symlinkSync(target, join(PROJ, 'name'))
+      mkdirSync(join(PROJ, 'shut'), { mode: 0o600 })
+
+      const result = await wrap([join(PROJ, 'name')])
+
+      const shut = join(PROJ, 'shut')
+      expect(countMounts(result, '--ro-bind', shut, shut)).toBe(1)
+      expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
+    },
+  )
+
+  it.if(process.getuid?.() !== 0)(
+    'mounts nothing for a directory that cannot be searched where the command cannot write',
+    async () => {
+      const shut = join(BASE, 'shut')
+      symlinkSync(join(shut, 'x'), join(PROJ, 'name'))
+      mkdirSync(shut, { mode: 0o600 })
+
+      const result = await wrap([join(PROJ, 'name')])
+
+      expect(result).not.toContain(shut)
+      expect(result).not.toContain(`/dev/null ${join(PROJ, 'name')}`)
+    },
+  )
+
   it('fails closed on a symlink cycle rather than dropping the deny', async () => {
     // An unresolvable deny path must not silently disappear: masking the
     // symlink makes bwrap refuse to start, rather than sandboxing the
@@ -153,19 +318,64 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
   })
 
   it('does not re-expose a read-denied directory reached through a symlink', async () => {
-    // denyRead mounts a tmpfs on the raw (symlinked) dir, while the denyWrite
-    // dest is canonicalized. If the two are compared by raw string the
-    // denyWrite --ro-bind lands on top of the tmpfs and re-exposes the real,
-    // read-denied contents.
+    // denyRead names the symlinked dir; its tmpfs lands on the link's
+    // target (bwrap refuses a symlink as a mount destination), while the
+    // denyWrite dest is canonicalized. If the two were compared by the raw
+    // spelling the denyWrite --ro-bind would land on top of the tmpfs and
+    // re-expose the real, read-denied contents.
     const claudeLink = join(PROJ, '.claude')
     symlinkSync(join('..', 'dotfiles', 'claude'), claudeLink)
 
     const result = await wrap([join(claudeLink, 'commands')], [claudeLink])
     const resolved = join(DOTFILES, 'claude', 'commands')
 
-    expect(result).toContain(`--tmpfs ${claudeLink}`)
+    expect(
+      countMounts(result, '--tmpfs', join(DOTFILES, 'claude')),
+    ).toBeGreaterThan(0)
+    expect(countMounts(result, '--tmpfs', claudeLink)).toBe(0)
     expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
   })
+
+  it.skipIf(USR_MERGED_ROOT_LINKS.length === 0)(
+    "does not deny the root's symlinks in their own right under a denyRead of /",
+    async () => {
+      // A '/' deny stands for the root's children, minus the ones an allowRead
+      // entry covers: /usr and /etc are named, and /bin, /lib and /sbin are
+      // links into /usr, so all five are skipped. Denied as entries of their
+      // own the links would be mounted where they lead and empty the very
+      // directories that allowRead names.
+      // allowAllUnixSockets keeps the apply-seccomp helper out of the command:
+      // where it has been built it lives in the checkout, which the '/' deny
+      // hides, and the shell would fail to exec it (allow-read.test.ts does the
+      // same for its '/' denies).
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: 'echo STARTED',
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: ['/'], allowWithinDeny: ['/usr', '/etc'] },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+        allowAllUnixSockets: true,
+      })
+
+      expect(countMounts(wrapped, '--tmpfs', '/usr')).toBe(0)
+      expect(countMounts(wrapped, '--tmpfs', '/etc')).toBe(0)
+      for (const target of USR_MERGED_ROOT_LINKS) {
+        expect(countMounts(wrapped, '--tmpfs', target)).toBe(0)
+      }
+      if (hasBwrap) {
+        const run = spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 10000,
+        })
+        // The whole outcome, so a failure says why the sandbox did not start.
+        expect({
+          status: run.status,
+          stdout: run.stdout,
+          stderr: run.stderr,
+        }).toEqual({ status: 0, stdout: 'STARTED\n', stderr: '' })
+      }
+    },
+  )
 
   it('resolves the mandatory .claude deny paths when cwd/.claude is a symlink', async () => {
     const claudeLink = join(PROJ, '.claude')

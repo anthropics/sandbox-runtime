@@ -69,6 +69,9 @@ describe('property: expandWindowsFsPaths', () => {
       writeFileSync(f, String(i))
       files.push(f)
     }
+    // Patterns belong in the swept corpus: without one, every sample takes
+    // the literal branch and the glob branch is never reached.
+    files.push(join(scratch, 'f*.txt'), join(scratch, 'f?.txt'))
   })
 
   afterAll(() => {

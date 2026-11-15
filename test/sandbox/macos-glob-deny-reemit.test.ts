@@ -189,6 +189,19 @@ describe.if(!isWindows)('macOS read profile: glob denies vs allowRead', () => {
     expect(lateBlock(read)).toContain(filter)
   })
 
+  it('still re-emits a literal deny nested under a literal allow of "/"', () => {
+    // '/' is a legal allowWithinDeny entry and re-opens every denied path,
+    // so the nested deny only survives if it lands after the allow block.
+    // Containment against it has to be root-aware: a `dir + '/'` prefix
+    // spells '//' and matches nothing.
+    const read = readSection(
+      wrap({ denyOnly: ['/work/proj/secrets'], allowWithinDeny: ['/'] }),
+    )
+    const filter = '(subpath "/work/proj/secrets")'
+    expect(read.indexOf(filter)).toBeLessThan(allowBlockIndex(read))
+    expect(lateBlock(read)).toContain(filter)
+  })
+
   it('does not re-emit a literal deny that no allow is nested in', () => {
     const read = readSection(
       wrap({

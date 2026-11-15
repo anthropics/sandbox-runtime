@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "srt-win"
 path = "src/main.rs"
 
+[features]
+# Test-only CI smoke hooks (`srt-win probe token` / `probe parent-access`); OFF by default, never enabled for a shipped binary.
+test-hooks = []
+
 [target.'cfg(windows)'.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -26,10 +30,13 @@ windows = { version = "0.62.2", features = [
   "Win32_System_Threading",
   "Win32_System_Memory",
   "Win32_System_Rpc",
+  "Win32_System_Services",
   "Win32_System_SystemServices",
   "Win32_System_JobObjects",
   "Win32_System_StationsAndDesktops",
+  "Win32_System_Com",
   "Win32_System_Console",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_IO",
   "Win32_System_Pipes",
   "Win32_Graphics_Gdi",
@@ -40,6 +47,7 @@ windows = { version = "0.62.2", features = [
   "Win32_Storage_FileSystem",
   "Win32_NetworkManagement_WindowsFilteringPlatform",
   "Win32_NetworkManagement_NetManagement",
+  "Win32_Networking_WinSock",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Registry",

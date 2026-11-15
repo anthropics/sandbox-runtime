@@ -18,7 +18,8 @@
  * {@link extractAndSubstitute} and {@link CredentialFileConfigSchema}.
  *
  * On macOS, SBPL cannot redirect reads, so masked files degrade to
- * `mode: "deny"` (see macos-sandbox-utils.ts).
+ * `mode: "deny"` (see macos-sandbox-utils.ts). On Windows an ACL cannot
+ * either (see `windowsMaskedFileDenies` in sandbox-manager.ts).
  */
 
 import { randomUUID } from 'node:crypto'
@@ -185,7 +186,10 @@ export function buildMaskedFileBinds(
   const degradeToDenyPaths: string[] = []
   for (const f of files) {
     if (f.mode !== 'mask') continue
-    const realPath = normalizePathForSandbox(f.path)
+    // Literal: this path is stat'd, read and (on Linux) bound over, so it
+    // is the name of one file however it is spelled — a `[` in it is part
+    // of that name, not a character class.
+    const realPath = normalizePathForSandbox(f.path, { literal: true })
 
     let content: string
     try {

@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'bun:test'
 import { writeFileSync, mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
-import { ripGrep } from '../../src/utils/ripgrep.js'
+import { basename, join } from 'path'
+import { ripGrep, RipgrepError } from '../../src/utils/ripgrep.js'
 
 describe('ripGrep', () => {
   it('finds matches with default config', async () => {
@@ -68,7 +68,31 @@ describe('ripGrep', () => {
       })
       // Without argv0 override, process.argv0 defaults to the executable path
       expect(results[0]).not.toBe('rg')
-      expect(results[0]).toContain(process.execPath.split('/').pop())
+      expect(results[0]).toContain(basename(process.execPath))
+    } finally {
+      rmSync(dir, { recursive: true })
+    }
+  })
+
+  it('says what had been listed when it rejects', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rg-listed-'))
+    try {
+      const script = join(dir, 'lists-then-fails.cjs')
+      writeFileSync(
+        script,
+        "process.stdout.write('one\\ntwo\\nhalf a li'); process.stderr.write('went wrong'); process.exitCode = 2",
+      )
+
+      const error: unknown = await ripGrep(
+        [],
+        dir,
+        new AbortController().signal,
+        { command: process.execPath, args: [script] },
+      ).catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(RipgrepError)
+      expect((error as RipgrepError).listed).toEqual(['one', 'two'])
+      expect((error as RipgrepError).stderr).toBe('went wrong')
     } finally {
       rmSync(dir, { recursive: true })
     }

@@ -6,17 +6,44 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { connect, isIP } from 'node:net'
 import { URL } from 'node:url'
+import { inspect } from 'node:util'
 import { logForDebugging } from '../utils/debug.js'
 import { encodedCommandFromProxyUser } from './sandbox-utils.js'
+import {
+  assertTlsTerminationSupported,
+  type ByteBudget,
+  createByteBudget,
+  gateSocketOnBufferedBody,
+} from './emitted-connection.js'
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
+  readRequestTarget,
+  requestTargetAsSpelled,
+  respondRefusedTarget,
+  type AmbiguousRequestTarget,
+  type DenyMark,
+  applyHeaderEdits,
+  notifyResponse,
+  removeHeadersFolded,
+  hostHeaderValues,
+  hostMismatch,
+  type RequestDecision,
+  rawDenied,
+  respondDenied,
+  respondUpstreamError,
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
+
+const ALLOWLIST_DENY = [
+  'Connection blocked by network allowlist',
+  'blocked-by-allowlist',
+] as const
 import {
   peekForClientHello,
   terminateAndForward,
+  type TunnelTimeouts,
 } from './tls-terminate-proxy.js'
 import {
   prepareBodySubstitution,
@@ -24,17 +51,50 @@ import {
 } from './body-substitution.js'
 import type { PlanSigv4 } from './credential-aws-pairs.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
+import { isResolvedAddressDenied } from './resolved-address-guard.js'
 import {
   canonicalizeHost,
   connectViaParentProxy,
+  directRequestOptions,
+  type DirectRequestOptions,
   dialDirect,
+  formatAuthority,
+  type DirectLookup,
   openConnectTunnel,
   proxyAuthHeader,
+  onUpstreamError,
+  relayResponseHead,
   selectParentProxyUrl,
   shouldBypassParentProxy,
   stripBrackets,
   stripHopByHop,
 } from './parent-proxy.js'
+
+// Fixed fields only: an error's message, cause and stack can carry whatever
+// the failing call held, such as a proxy URL with credentials in it.
+function describeError(error: unknown): string {
+  if (error instanceof Error) {
+    const details = error as Error & {
+      code?: unknown
+      errno?: unknown
+      syscall?: unknown
+      address?: unknown
+      port?: unknown
+    }
+    return inspect(
+      {
+        name: details.name,
+        code: details.code,
+        errno: details.errno,
+        syscall: details.syscall,
+        address: details.address,
+        port: details.port,
+      },
+      { depth: 0, breakLength: Infinity },
+    )
+  }
+  return typeof error
+}
 
 export interface HttpProxyServerOptions {
   /**
@@ -47,12 +107,16 @@ export interface HttpProxyServerOptions {
    * filter canonicalizes internally. Every other hook below, and the
    * upstream leg itself, get the {@link canonicalizeHost} spelling of an
    * allowed host — see the note at the CONNECT handler's routing step.
+   *
+   * `explain`, called before a refusal, gives the reason: the status phrase
+   * a refused CONNECT is answered with.
    */
   filter(
     port: number,
     host: string,
     socket: Socket | Duplex,
     encodedCommand?: string,
+    explain?: (reason: string) => void,
   ): Promise<boolean> | boolean
 
   /**
@@ -70,7 +134,9 @@ export interface HttpProxyServerOptions {
    * If present, CONNECT requests are TLS-terminated in-process and the
    * decrypted HTTP forwarded upstream over real TLS, instead of opening an
    * opaque byte tunnel. Mutually exclusive with getMitmSocketPath at the
-   * config layer (sandbox-manager rejects both being set).
+   * config layer (sandbox-manager rejects both being set). Needs Node, or
+   * Bun 1.4 or later: on an older runtime createHttpProxyServer throws
+   * (see assertTlsTerminationSupported).
    */
   mitmCA?: MitmCA
 
@@ -95,6 +161,13 @@ export interface HttpProxyServerOptions {
   /**
    * Per-request filter; runs on plain-HTTP proxy requests and on terminated
    * HTTPS requests. See request-filter.ts.
+   *
+   * With `filterRequest`, the request target is normalised before the hook
+   * sees it and that normalised target is what is forwarded. Without it,
+   * the target is forwarded as it was before the hook existed: on plain
+   * HTTP that is the URL-parsed path and query (so `/a/../b` still goes
+   * out as `/b`), and on the TLS-terminated path it is the client's bytes
+   * unchanged.
    */
   filterRequest?: FilterRequestCallback
 
@@ -174,6 +247,17 @@ export interface HttpProxyServerOptions {
   parentProxy?: ResolvedParentProxy
 
   /**
+   * Name resolution for DIRECT dials (opaque CONNECT tunnel, plain-HTTP
+   * forward, TLS-terminated upstream leg), bound per destination port and
+   * requesting command. The manager returns the resolved-address guard's
+   * lookup, which refuses (and records) an allow-listed hostname that
+   * resolves into denied address space; the proxy answers that with a 403.
+   * Not consulted for the mitmProxy or parentProxy routes — that hop
+   * resolves the name.
+   */
+  lookupFor?: DirectLookup
+
+  /**
    * Per-session bearer token. When set, every CONNECT and absolute-URI
    * request must carry `Proxy-Authorization: Basic
    * base64("srt[.<encodedCommand>]:<token>")` or it gets a 407. Without
@@ -183,10 +267,204 @@ export interface HttpProxyServerOptions {
    * specific command.
    */
   proxyAuthToken?: string
+
+  /**
+   * Whether a filterRequest allow may SET headers on a plain-HTTP request.
+   * Off by default: a header set there (a credential, say) would travel in
+   * cleartext. While off, an allow that carries `setHeaders` is refused with
+   * 403 and nothing is forwarded; an allow without sets is unaffected, and
+   * removals always apply.
+   */
+  plaintextHeaderSet?: boolean
+
+  /**
+   * Response headers removed before a response is written to the client,
+   * on both paths, matched as removeHeaders matches (case and `-` `_` `.`
+   * folded). E.g. ['set-cookie', 'set-cookie2'] keeps upstream cookies
+   * from the client.
+   */
+  stripResponseHeaders?: string[]
+
+  /**
+   * When true, a CONNECT is served only by in-process TLS termination: a
+   * CONNECT whose first bytes are not a TLS ClientHello is closed, and one
+   * that would not be terminated at all (no mitmCA, or shouldTerminateTLS
+   * says no) is refused with 403, instead of either being tunnelled
+   * opaquely past filterRequest. Each refusal is reported through
+   * onFilterRequestDenied with method CONNECT. Use it when every request
+   * must be seen by filterRequest; the SOCKS side of the same port needs
+   * SocksProxyServerOptions.refuseOpaqueTunnels too. CONNECT-carried SSH
+   * (e.g. a GIT_SSH_COMMAND through this proxy) stops working.
+   */
+  refuseOpaqueTunnels?: boolean
+
+  /**
+   * When true, a request whose Host header (or, on the TLS-terminated path,
+   * whose TLS server name or absolute-form authority) does not name the
+   * host and port it is being sent to is answered 421 Misdirected Request
+   * before filterRequest is asked, and reported through
+   * onFilterRequestDenied. See hostMismatch for the accepted shapes.
+   */
+  requireHostMatch?: boolean
+
+  /**
+   * The largest request head (request line and headers) the proxy parses,
+   * on the plain path and inside a TLS-terminated tunnel, in place of the
+   * runtime's default (16 KiB in Node). A head past it is answered 400.
+   * Set it above any limit filterRequest enforces, so that limit is the
+   * one that answers.
+   */
+  maxHeaderSize?: number
+
+  /**
+   * When set, every refusal the proxy answers itself is marked
+   * `<denyHeader>: <code>` in place of `X-Proxy-Error: <tag>`. The codes:
+   * `host_not_allowed` (the host allowlist), `misdirected` (a 421 from
+   * requireHostMatch), `bad_request` (a request-target or request the
+   * proxy cannot forward), `opaque_tunnel` (refuseOpaqueTunnels),
+   * `address_not_allowed` (a resolved-address refusal), and, for a
+   * filterRequest deny, the decision's `mark` (`denied` when it has none).
+   */
+  denyHeader?: string
+
+  /**
+   * Forward the request-target exactly as the client spelled it and show
+   * filterRequest that same spelling (see requestTargetAsSpelled), instead
+   * of normalizing it; a target in any other shape is answered 400, as is
+   * absolute form inside a TLS-terminated tunnel.
+   */
+  requestTargetAsSpelled?: boolean
+
+  /**
+   * What becomes of a request filterRequest would judge whose target is
+   * ambiguous (see readRequestTarget), on both paths. `'refuse'`, the
+   * default: 400 before filterRequest is asked, reported through
+   * onFilterRequestDenied. `'asSpelled'`: forwarded as the client spelled
+   * it; filterRequest has to hold for every reading. `'normalize'`: forwarded
+   * normalized, which breaks a signature over the path and names another
+   * resource to an upstream that takes the path literally.
+   */
+  ambiguousRequestTarget?: AmbiguousRequestTarget
+
+  /**
+   * Refuse, with 400 and before the allowlist is consulted, a request
+   * whose destination host is not spelled in plain ASCII: letters, digits,
+   * `-` and `.` in non-empty labels (one trailing dot allowed), or an IP
+   * literal (IPv6 in brackets). The URL parser would otherwise map
+   * fullwidth, percent-encoded and other Unicode spellings onto an ASCII
+   * name. Case and a single trailing dot are still canonicalized.
+   */
+  requireAsciiHost?: boolean
+
+  /**
+   * Drop the client's hop-by-hop headers (and those its Connection header
+   * names) in any spelling of `-`, `_` and `.` too, not only in the exact
+   * spelling, before forwarding, on both paths.
+   */
+  foldHopByHop?: boolean
+
+  /**
+   * On the plain path, for a connection handed to the server with
+   * emit('connection') and marked with markHandedInConnection, pause the
+   * client's socket whenever more than this many bytes of its request body
+   * are buffered in the proxy, until the body's reader pulls again.
+   * Bun's HTTP server keeps reading such a connection while its request is
+   * paused, and would otherwise take a large upload into memory while the
+   * upstream reads slowly. Connections the server accepted itself are left
+   * alone.
+   */
+  maxBufferedRequestBody?: number
+
+  /**
+   * At most this many CONNECT tunnels are TLS-terminated at once (default
+   * 256); a CONNECT past it is answered 503 with `X-Proxy-Error:
+   * too-many-tunnels`. Each holds a TLS session and an HTTP parser in this
+   * process. A slot is taken when a CONNECT to a host that would be
+   * terminated is accepted, before its first bytes are seen, and held until
+   * the tunnel closes (an idle keep-alive tunnel holds one too), or until
+   * the tunnel turns out not to carry TLS. So at the cap, a CONNECT that
+   * would have been tunnelled opaquely as non-TLS is refused too. The
+   * refusal is logged and passed to onFilterRequestDenied with method CONNECT,
+   * once per command until half the slots are free again.
+   * SandboxManager sets it from network.tlsTerminate.maxTunnels.
+   */
+  maxTerminatedTunnels?: number
+
+  /**
+   * A tunnel to be TLS-terminated must finish its TLS handshake this long
+   * after its CONNECT (default 10 s), or it is closed and its slot freed.
+   * Past its handshake, tunnelTimeouts apply.
+   * SandboxManager sets it from network.tlsTerminate.handshakeTimeoutMs.
+   */
+  tlsHandshakeTimeoutMs?: number
+
+  /**
+   * When a TLS-terminated tunnel is closed, and its slot freed, past its
+   * handshake. Idle, with nothing queued for its client: with no whole
+   * request head yet (default 10 s), or none since its last response (6 s:
+   * the 5 s that `Keep-Alive: timeout` tells the client, and a margin of
+   * 1 s). Under way, with a request that is not all in or is held back for
+   * its upstream, or bytes queued for its client: once nothing has moved for
+   * 300 s. A whole request that waits for its response is not timed out.
+   * Primarily a test seam.
+   */
+  tunnelTimeouts?: Partial<TunnelTimeouts>
+
+  /**
+   * Bytes all of this proxy's connections together may hold for slow
+   * parties: request bodies waiting for an upstream, and responses waiting
+   * for a client. Past it, each holds no more than it must (default
+   * 256 MiB).
+   *
+   * Where it applies to request bodies: inside TLS-terminated tunnels under
+   * Bun, on connections the proxy is handed with emit('connection'); and on
+   * the plain path, for such a connection, when maxBufferedRequestBody is
+   * set. Under Node the runtime's own server applies backpressure to an upload,
+   * so nothing needs counting. A tunnel on a connection Bun's own listener
+   * accepted (the proxy's listen(), which is how SandboxManager runs it) is
+   * read on by the runtime while paused, so an upload to a stalled upstream
+   * is buffered without bound there whatever this says; that is a
+   * limitation of the runtime.
+   */
+  maxBufferedBytes?: number
+  /** @internal A budget to use in place of a new one, so a test can read its counter. */
+  byteBudget?: ByteBudget
+}
+
+const handedIn = new WeakSet<object>()
+
+/**
+ * Mark a socket about to be handed to a proxy server with
+ * emit('connection'), so maxBufferedRequestBody applies to it.
+ */
+export function markHandedInConnection(socket: object): void {
+  handedIn.add(socket)
 }
 
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
-  const server = createServer()
+  // Before anything is set up: a runtime that cannot terminate TLS
+  // in-process fails here, not on each tunnel.
+  if (options.mitmCA) assertTlsTerminationSupported()
+  const server = createServer(
+    options.maxHeaderSize !== undefined
+      ? { maxHeaderSize: options.maxHeaderSize }
+      : {},
+  )
+  let terminatedTunnels = 0
+  /** The commands told of the tunnel cap in this burst of refusals. */
+  const toldOfCap = new Set<string | undefined>()
+  const byteBudget =
+    options.byteBudget ??
+    createByteBudget(options.maxBufferedBytes ?? 256 << 20)
+  /** The mark for a refusal: the deny header's code, or the legacy tag. */
+  const markFor = (code: string, tag?: string): DenyMark | undefined =>
+    options.denyHeader !== undefined
+      ? { name: options.denyHeader, value: code }
+      : tag
+  const allowlistDeny = [
+    ALLOWLIST_DENY[0],
+    markFor('host_not_allowed', ALLOWLIST_DENY[1]),
+  ] as const
 
   // A client that is killed mid-exchange (sandboxed process tree teardown)
   // resets its connection; without a listener that surfaces as an
@@ -211,11 +489,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // may never fire on a parse-errored socket (the 400 is dropped;
       // verified empirically), so back-stop with a timer or the socket
       // leaks.
+      // A head past a caller's own maxHeaderSize is a request past its
+      // limits: 400, as any other request past them.
       const status =
-        (err as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW'
+        (err as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW' &&
+        options.maxHeaderSize === undefined
           ? '431 Request Header Fields Too Large'
           : '400 Bad Request'
-      socket.end(`HTTP/1.1 ${status}\r\n\r\n`, () => socket.destroy())
+      // In a proxy that marks its refusals, this one says it came from the
+      // proxy too.
+      const mark =
+        options.denyHeader !== undefined
+          ? `${options.denyHeader}: bad_request\r\n`
+          : ''
+      socket.end(`HTTP/1.1 ${status}\r\n${mark}\r\n`, () => socket.destroy())
       const backstop = setTimeout(() => socket.destroy(), 1000)
       backstop.unref?.()
       return
@@ -408,32 +695,37 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
       const target = parseConnectTarget(req.url!)
-      if (!target) {
+      if (
+        !target ||
+        (options.requireAsciiHost && !isAsciiAuthority(req.url!, false))
+      ) {
         logForDebugging(`Invalid CONNECT request: ${req.url}`, {
           level: 'error',
         })
-        endWithStatus('HTTP/1.1 400 Bad Request\r\n\r\n')
+        const mark =
+          options.denyHeader !== undefined
+            ? `${options.denyHeader}: bad_request\r\n`
+            : ''
+        endWithStatus(`HTTP/1.1 400 Bad Request\r\n${mark}\r\n`)
         return
       }
       const { hostname: requestedHost, port } = target
 
+      let reason: string | undefined
       const allowed = await options.filter(
         port,
         requestedHost,
         socket,
         auth.encodedCommand,
+        given => {
+          reason = given
+        },
       )
       if (!allowed) {
         logForDebugging(`Connection blocked to ${requestedHost}:${port}`, {
           level: 'error',
         })
-        endWithStatus(
-          'HTTP/1.1 403 Forbidden\r\n' +
-            'Content-Type: text/plain\r\n' +
-            'X-Proxy-Error: blocked-by-allowlist\r\n' +
-            '\r\n' +
-            'Connection blocked by network allowlist',
-        )
+        endWithStatus(rawDenied(...allowlistDeny, reason))
         return
       }
       // The client may have died during the filter await (EOF destroy
@@ -455,6 +747,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // the (already-validated, so practically unreachable) case where
       // canonicalization fails, so the two layers can never disagree.
       const hostname = canonicalizeHost(requestedHost) ?? requestedHost
+      const lookup = options.lookupFor?.(port, auth.encodedCommand)
 
       // Decide upstream route:
       //   in-process TLS termination
@@ -474,9 +767,71 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // only terminate if it is one. Non-TLS falls through to the opaque
         // tunnel below — i.e. base-sandbox behaviour, hostname-allowlisted
         // but not content-inspected (same as the SOCKS path).
+        const maxTunnels = options.maxTerminatedTunnels ?? 256
+        if (terminatedTunnels >= maxTunnels) {
+          // Of a refused CONNECT clients show the status at most, so that
+          // the limit is the sandbox's own is said where refusals are.
+          if (!toldOfCap.has(auth.encodedCommand)) {
+            // The client picks the name, so the names kept are bounded.
+            if (toldOfCap.size >= 100) toldOfCap.clear()
+            toldOfCap.add(auth.encodedCommand)
+            const reason =
+              `the sandbox's limit of ${maxTunnels} TLS-terminated tunnels at ` +
+              `once is reached; the limit is network.tlsTerminate.maxTunnels ` +
+              `in the sandbox's configuration`
+            logForDebugging(
+              `[proxy] CONNECT ${hostname}:${port} refused: ${reason}`,
+              { level: 'warn' },
+            )
+            options.onFilterRequestDenied?.({
+              method: 'CONNECT',
+              url: formatAuthority(hostname, port, 0),
+              reason,
+              encodedCommand: auth.encodedCommand,
+            })
+          }
+          const mark = markFor('too_many_tunnels', 'too-many-tunnels')!
+          const [name, value] =
+            typeof mark === 'string'
+              ? ['X-Proxy-Error', mark]
+              : [mark.name, mark.value]
+          socket.end(
+            `HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n${name}: ${value}\r\nConnection: close\r\n\r\ntoo many TLS-terminated tunnels at once`,
+          )
+          return
+        }
+        // A slot is held from here to the tunnel's close, or until it turns
+        // out not to be TLS; its handshake must be done by the deadline.
+        terminatedTunnels++
+        let slotHeld = true
+        const freeSlot = (): void => {
+          if (!slotHeld) return
+          slotHeld = false
+          terminatedTunnels--
+          if (terminatedTunnels * 2 <= maxTunnels) toldOfCap.clear()
+        }
+        let handshakeDone = (): boolean => false
+        const deadline = setTimeout(() => {
+          // The deadline is for the handshake only: a client that finished
+          // it and has sent nothing since keeps its tunnel.
+          if (handshakeDone()) return
+          logForDebugging(
+            `[proxy] TLS handshake not done in time for ${hostname}:${port}; tunnel closed`,
+          )
+          socket.destroy()
+        }, options.tlsHandshakeTimeoutMs ?? 10_000)
+        deadline.unref?.()
+        socket.once('close', () => {
+          clearTimeout(deadline)
+          freeSlot()
+        })
         socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         wrote200 = true
         const peeked = await peekForClientHello(socket, head)
+        if (!peeked.isTLS) {
+          clearTimeout(deadline)
+          freeSlot()
+        }
         if (clientGone || socket.destroyed) {
           socket.destroy()
           return
@@ -494,6 +849,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               hostname,
               port,
               upstreamCA: options.tlsTerminateUpstreamCA,
+              lookup,
+              stripResponseHeaders: options.stripResponseHeaders,
+              requireHostMatch: options.requireHostMatch,
+              maxHeaderSize: options.maxHeaderSize,
+              foldHopByHop: options.foldHopByHop,
+              denyHeader: options.denyHeader,
+              requestTargetAsSpelled: options.requestTargetAsSpelled,
+              ambiguousRequestTarget: options.ambiguousRequestTarget,
+              byteBudget,
+              timeouts: options.tunnelTimeouts,
+              onEstablished: () => clearTimeout(deadline),
+              onHandshakeProbe: isDone => {
+                handshakeDone = isDone
+              },
               onFilterRequestDeny: options.onFilterRequestDenied
                 ? (method, url, reason) =>
                     options.onFilterRequestDenied!({
@@ -509,10 +878,33 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           )
           return
         }
+        if (options.refuseOpaqueTunnels) {
+          logForDebugging(
+            `[tls-terminate] non-TLS bytes on CONNECT ${hostname}:${port}; refused (refuseOpaqueTunnels)`,
+          )
+          options.onFilterRequestDenied?.({
+            method: 'CONNECT',
+            url: formatAuthority(hostname, port, 0),
+            reason: 'tunnel carries no TLS and cannot be inspected',
+            encodedCommand: auth.encodedCommand,
+          })
+          socket.destroy()
+          return
+        }
         logForDebugging(
           `[tls-terminate] non-TLS bytes on CONNECT ${hostname}:${port}; opaque-tunnelling`,
         )
         head = peeked.head
+      } else if (options.refuseOpaqueTunnels) {
+        const reason = 'this proxy does not tunnel CONNECTs it cannot inspect'
+        options.onFilterRequestDenied?.({
+          method: 'CONNECT',
+          url: formatAuthority(hostname, port, 0),
+          reason,
+          encodedCommand: auth.encodedCommand,
+        })
+        endWithStatus(rawDenied(reason, markFor('opaque_tunnel')))
+        return
       } else if (options.mitmCA) {
         // Per-host termination opt-out: the policy exempts this host (mTLS
         // upstream, cert-pinning client), so skip the MITM entirely and
@@ -545,16 +937,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         } else if (parentUrl) {
           upstream = await connectViaParentProxy(parentUrl, hostname, port)
         } else {
-          upstream = await dialDirect(hostname, port)
+          upstream = await dialDirect(hostname, port, lookup)
         }
       } catch (err) {
-        logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
+        logForDebugging(`CONNECT tunnel failed: ${describeError(err)}`, {
           level: 'error',
         })
         // If we already sent 200 (mitmCA sniff path), an HTTP status line now
         // would land inside the tunnel as payload. Just close.
         if (wrote200) socket.destroy()
-        else endWithStatus('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+        else if (isResolvedAddressDenied(err)) {
+          endWithStatus(
+            rawDenied(err.message, markFor('address_not_allowed'), err.reason),
+          )
+        } else endWithStatus('HTTP/1.1 502 Bad Gateway\r\n\r\n')
         return
       }
 
@@ -583,7 +979,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       socket.pipe(upstream)
 
       upstream.on('error', err => {
-        logForDebugging(`CONNECT tunnel failed: ${err.message}`, {
+        logForDebugging(`CONNECT tunnel failed: ${describeError(err)}`, {
           level: 'error',
         })
         socket.destroy()
@@ -648,13 +1044,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         res.end()
         return
       }
+      if (options.requireAsciiHost && !isAsciiAuthority(req.url!, true)) {
+        respondDenied(
+          res,
+          'destination host is not plain ASCII',
+          markFor('bad_request'),
+          400,
+        )
+        return
+      }
       const url = new URL(req.url!)
+      const isHttps = url.protocol === 'https:'
+      const defaultPort = isHttps ? 443 : 80
       const requestedHost = stripBrackets(url.hostname)
-      const port = url.port
-        ? parseInt(url.port, 10)
-        : url.protocol === 'https:'
-          ? 443
-          : 80
+      const port = url.port ? parseInt(url.port, 10) : defaultPort
 
       const allowed = await options.filter(
         port,
@@ -675,11 +1078,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           res.destroy()
           return
         }
-        res.writeHead(403, {
-          'Content-Type': 'text/plain',
-          'X-Proxy-Error': 'blocked-by-allowlist',
-        })
-        res.end('Connection blocked by network allowlist')
+        respondDenied(res, ...allowlistDeny)
         return
       }
 
@@ -693,25 +1092,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // leaves behind is the trailing dot, which is exactly the spelling
       // that used to reach getMitmSocketPath / the upstream unchanged.
       const hostname = canonicalizeHost(requestedHost) ?? requestedHost
-      // The authority we forward (request-target and Host header) is
-      // rebuilt from the canonical host so the MITM / parent proxy sees the
-      // host we allowlist-checked, not the client's spelling of it. `url.port`
-      // is '' when the scheme default was given or implied, matching the
-      // `url.host` form this replaces.
-      const authority =
-        (isIP(hostname) === 6 ? `[${hostname}]` : hostname) +
-        (url.port ? `:${url.port}` : '')
+      // The authority we forward (request-target and Host header) is rebuilt
+      // from the canonical host so the MITM / parent proxy sees the host we
+      // allowlist-checked, not the client's spelling of it.
+      const authority = formatAuthority(hostname, port, defaultPort)
 
-      const fwdHeaders = { ...stripHopByHop(req.headers), host: authority }
-      options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
-      // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
-      // the same config gate). May delete content-length from fwdHeaders.
-      const bodyTransform = prepareBodySubstitution(
-        options.getBodySubstitutionsPlaintext,
-        req,
-        fwdHeaders,
-        hostname,
-      )
+      const fwdHeaders = {
+        ...stripHopByHop(req.headers, { folded: options.foldHopByHop }),
+        host: authority,
+      }
 
       // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
       const mitmSocketPath = options.getMitmSocketPath?.(hostname)
@@ -720,7 +1109,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         options.parentProxy &&
         !shouldBypassParentProxy(options.parentProxy, hostname)
           ? selectParentProxyUrl(options.parentProxy, {
-              isHttps: url.protocol === 'https:',
+              isHttps,
             })
           : undefined
 
@@ -728,11 +1117,86 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // forwarding the client's raw req.url. This ensures the upstream proxy
       // sees exactly the host we allowlist-checked, closing URL-parser
       // differential bypasses.
-      const absUrl = `${url.protocol}//${authority}${url.pathname}${url.search}`
+      // With filterRequest, the hook gets the target as spelled and
+      // normalized, the spelling is what is forwarded, and a target whose
+      // two forms can name different resources is refused unless
+      // ambiguousRequestTarget says which to send (see forwardUpstream in
+      // tls-terminate-proxy.ts); without it, the parsed path and query are
+      // forwarded unchanged. requestTargetAsSpelled comes first: it forwards
+      // the target as the client spelled it, hook or no hook.
+      const read =
+        options.filterRequest && !options.requestTargetAsSpelled
+          ? readRequestTarget(
+              req.url!,
+              req.method,
+              options.ambiguousRequestTarget,
+            )
+          : undefined
+      const requestTarget = options.requestTargetAsSpelled
+        ? requestTargetAsSpelled(req.url!, { absolute: true })
+        : read
+          ? read.forwarded
+          : `${url.pathname}${url.search}`
+      if (requestTarget === undefined) {
+        const reason = respondRefusedTarget(
+          res,
+          read?.refusal,
+          markFor('bad_request'),
+        )
+        options.onFilterRequestDenied?.({
+          method: req.method ?? 'GET',
+          url: `${url.protocol}//${authority}${read?.spelled ?? ''}`,
+          reason,
+          encodedCommand: auth.encodedCommand,
+        })
+        return
+      }
+      const absUrl = `${url.protocol}//${authority}${requestTarget}`
 
       // Per-request filter applies to plain HTTP too — otherwise a sandboxed
       // client could bypass it by using http:// where the upstream serves it.
+      if (
+        options.maxBufferedRequestBody !== undefined &&
+        handedIn.has(req.socket)
+      ) {
+        gateSocketOnBufferedBody(
+          req,
+          options.maxBufferedRequestBody,
+          byteBudget,
+        )
+      }
       let body: Readable = req
+      let decision: RequestDecision | undefined
+      if (options.requireHostMatch) {
+        const hostHeaders = hostHeaderValues(req.rawHeaders)
+        // RFC 9112 3.2: an HTTP/1.1 request without Host is answered 400.
+        // Not every runtime's parser does it (Bun's for an emitted
+        // connection passes it on).
+        if (hostHeaders.length === 0 && req.httpVersion === '1.1') {
+          respondDenied(
+            res,
+            'HTTP/1.1 request without a Host header',
+            markFor('bad_request'),
+            400,
+          )
+          return
+        }
+        const why = hostMismatch(hostHeaders, undefined, {
+          hostname,
+          port,
+          defaultPort,
+        })
+        if (why !== undefined) {
+          options.onFilterRequestDenied?.({
+            method: req.method ?? 'GET',
+            url: absUrl,
+            reason: why,
+            encodedCommand: auth.encodedCommand,
+          })
+          respondDenied(res, why, markFor('misdirected'), 421)
+          return
+        }
+      }
       if (options.filterRequest) {
         const ac = new AbortController()
         res.once('close', () => ac.abort())
@@ -751,9 +1215,21 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
                   encodedCommand: auth.encodedCommand,
                 })
             : undefined,
+          {
+            target: { host: hostname, port },
+            requestTarget: read?.spelled ?? requestTarget,
+            normalizedRequestTarget: read?.normalized,
+            requestTargetIsAmbiguous: read?.ambiguous,
+            rawHeaders: [...req.rawHeaders],
+            scheme: 'http',
+          },
+          options.denyHeader,
+          options.plaintextHeaderSet === true,
         )
         if (out === null) return
-        body = out
+        body = out.body
+        decision = out.decision
+        applyHeaderEdits(fwdHeaders, out.decision)
         // The client may have aborted during the filterRequest await —
         // the tee branch is already destroyed and res 'close' has already
         // fired, so the teardown listeners attached below would never
@@ -770,6 +1246,18 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           return
         }
       }
+
+      // Credential substitution runs after the decision's header edits, as
+      // on the TLS-terminated path, so a set value can carry a sentinel.
+      options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
+      // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
+      // the same config gate). May delete content-length from fwdHeaders.
+      const bodyTransform = prepareBodySubstitution(
+        options.getBodySubstitutionsPlaintext,
+        req,
+        fwdHeaders,
+        hostname,
+      )
 
       // When the client declared a body but the forwarded headers carry no
       // framing (chunked TE stripped as hop-by-hop, or a body transform
@@ -788,6 +1276,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         fwdHeaders['transfer-encoding'] = 'chunked'
       }
 
+      const failUpstream = (err: Error) => {
+        logForDebugging(`Proxy request failed: ${describeError(err)}`, {
+          level: 'error',
+        })
+        respondUpstreamError(res, err, options.denyHeader)
+      }
       let proxyReq
       if (mitmSocketPath) {
         logForDebugging(
@@ -809,13 +1303,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
-            proxyRes.pipe(res)
+            const outHeaders = stripHopByHop(proxyRes.headers)
+            notifyResponse(decision, proxyRes.statusCode!, outHeaders)
+            if (options.stripResponseHeaders) {
+              removeHeadersFolded(outHeaders, options.stripResponseHeaders)
+            }
+            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
           },
         )
       } else if (parentUrl) {
@@ -840,22 +1341,46 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
-            proxyRes.pipe(res)
+            const outHeaders = stripHopByHop(proxyRes.headers)
+            notifyResponse(decision, proxyRes.statusCode!, outHeaders)
+            if (options.stripResponseHeaders) {
+              removeHeadersFolded(outHeaders, options.stripResponseHeaders)
+            }
+            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
           },
         )
       } else {
-        const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest
-        proxyReq = requestFn(
-          {
+        // Vet and pick the upstream address before any request object exists
+        // (see directRequestOptions); the name stays in Host and, for TLS, SNI.
+        let direct: DirectRequestOptions
+        try {
+          direct = await directRequestOptions(
             hostname,
             port,
-            path: url.pathname + url.search,
+            options.lookupFor?.(port, auth.encodedCommand),
+            isHttps,
+          )
+        } catch (err) {
+          failUpstream(err as Error)
+          return
+        }
+        if (res.destroyed || req.socket.destroyed) {
+          // Client went away during the dial.
+          body.destroy()
+          return
+        }
+        proxyReq = (isHttps ? httpsRequest : httpRequest)(
+          {
+            ...direct,
+            path: requestTarget,
             method: req.method,
             headers: fwdHeaders,
           },
@@ -864,28 +1389,25 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             // upstream reset mid-body after headers); pipe() does not
             // handle source errors.
             proxyRes.on('error', err => {
-              logForDebugging(`Upstream response error: ${err.message}`, {
-                level: 'error',
-              })
+              logForDebugging(
+                `Upstream response error: ${describeError(err)}`,
+                {
+                  level: 'error',
+                },
+              )
               res.destroy()
             })
-            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
-            proxyRes.pipe(res)
+            const outHeaders = stripHopByHop(proxyRes.headers)
+            notifyResponse(decision, proxyRes.statusCode!, outHeaders)
+            if (options.stripResponseHeaders) {
+              removeHeadersFolded(outHeaders, options.stripResponseHeaders)
+            }
+            if (relayResponseHead(res, proxyRes, outHeaders)) proxyRes.pipe(res)
           },
         )
       }
 
-      proxyReq.on('error', err => {
-        logForDebugging(`Proxy request failed: ${err.message}`, {
-          level: 'error',
-        })
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'text/plain' })
-          res.end('Bad Gateway')
-        } else {
-          res.destroy()
-        }
-      })
+      onUpstreamError(proxyReq, failUpstream)
 
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())
@@ -933,4 +1455,21 @@ function parseConnectTarget(
   const port = Number(m[2])
   if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined
   return { hostname: m[1]!, port }
+}
+
+/**
+ * Whether the destination host of a CONNECT authority (`host:port`) or of
+ * an absolute http(s) URI (`absolute`) is spelled in plain ASCII: an IP
+ * literal (IPv6 in brackets), or letters, digits and `-` in non-empty
+ * dot-separated labels, with one trailing dot at most.
+ */
+function isAsciiAuthority(raw: string, absolute: boolean): boolean {
+  const m = absolute
+    ? /^https?:\/\/(\[[^\]]*\]|[^/?#:@[\]]*)(?::\d+)?(?:[/?]|$)/i.exec(raw)
+    : /^(\[[^\]]*\]|[^:[\]]*):\d+$/.exec(raw)
+  if (!m) return false
+  const host = m[1]!
+  if (host.startsWith('[')) return isIP(host.slice(1, -1)) === 6
+  if (isIP(host) === 4) return true
+  return /^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.?$/.test(host)
 }
