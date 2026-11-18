@@ -439,6 +439,7 @@ let windowsMxcState:
   | Readonly<{
       sdk: MxcSdk
       fsSet: ReturnType<typeof computeWindowsFsAccessSet>
+      maskedFiles: readonly string[]
     }>
   | undefined
 const sandboxViolationStore = new SandboxViolationStore()
@@ -1449,7 +1450,7 @@ async function initializeSteps(
       // MXC BaseContainer: the OS applies filesystem + network policy
       // per spawn, in its own elevated context — no sandbox user, no
       // WFP install, no session ACL stamping, nothing to restore.
-      windowsMxcState = { sdk: mxcSdk, fsSet: acc }
+      windowsMxcState = { sdk: mxcSdk, fsSet: acc, maskedFiles }
     }
     logForDebugging(`[Sandbox Windows] using ${mxcSdk ? 'mxc' : 'srt-win'}`)
   }
@@ -3428,6 +3429,7 @@ async function spawnSandboxed(
   let perExecDenyWrite: string[] = []
   let perExecAllowRead: string[] = []
   let perExecAllowWrite: string[] = []
+  let perExecCredDeny: string[] = []
   if (!fsCfg?.disabled) {
     perExecAllowRead = expandWindowsFsPaths(fsCfg?.allowRead ?? [], {
       mode: 'grant',
@@ -3437,18 +3439,29 @@ async function spawnSandboxed(
     })
     // Deny mode keeps a missing literal path, so a file created after
     // this point is still denied.
-    perExecDenyRead = expandWindowsFsPaths(
+    perExecDenyRead = expandWindowsFsPaths(fsCfg?.denyRead ?? [], {
+      mode: 'deny',
+    })
+    perExecDenyWrite = expandWindowsFsPaths(fsCfg?.denyWrite ?? [], {
+      mode: 'deny',
+    })
+    perExecCredDeny = expandWindowsFsPaths(
       [
-        ...(fsCfg?.denyRead ?? []),
+        ...(config?.filesystem?.disabled
+          ? []
+          : getCredentialDenyReadPaths(config?.credentials)),
         ...getCredentialDenyReadPaths(customConfig?.credentials),
       ],
       { mode: 'deny' },
     )
-    perExecDenyWrite = expandWindowsFsPaths(fsCfg?.denyWrite ?? [], {
-      mode: 'deny',
-    })
   }
-  const unique = (paths: string[]): string[] => [...new Set(paths)]
+  const ranked = rankWindowsFsAccess({
+    allowRead: [...st.fsSet.grantRead, ...perExecAllowRead],
+    allowWrite: [...st.fsSet.grantWrite, ...perExecAllowWrite],
+    denyRead: [...st.fsSet.denyRead, ...perExecDenyRead],
+    denyWrite: [...st.fsSet.denyWrite, ...perExecDenyWrite],
+    credentialDeny: [...st.maskedFiles, ...maskedFiles, ...perExecCredDeny],
+  })
   registerCommandText(command, {
     commandId: options.commandId,
     commandText: options.commandText,
@@ -3460,14 +3473,10 @@ async function spawnSandboxed(
     socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
     proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
     setEnvVars: credentialRestrictions.setEnvVars,
-    denyRead: unique([
-      ...st.fsSet.denyRead,
-      ...perExecDenyRead,
-      ...maskedFiles,
-    ]),
-    denyWrite: unique([...st.fsSet.denyWrite, ...perExecDenyWrite]),
-    allowRead: unique([...st.fsSet.grantRead, ...perExecAllowRead]),
-    allowWrite: unique([...st.fsSet.grantWrite, ...perExecAllowWrite]),
+    denyRead: ranked.denyRead,
+    denyWrite: ranked.denyWrite,
+    allowRead: ranked.grantRead,
+    allowWrite: ranked.grantWrite,
     cwd,
     gitSafeDirectories: getGitSafeDirectories(customConfig),
     binShell: parseWindowsBinShell(options.binShell),
