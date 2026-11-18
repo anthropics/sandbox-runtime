@@ -1332,6 +1332,36 @@ describe('rankWindowsFsAccess (pure, all platforms)', () => {
       { denyRead: [D] },
     ],
     [
+      'allowWrite with ADS suffix on a denyWrite: read',
+      { allowWrite: [W, `${D}:stream`, `${D}::$DATA`], denyWrite: [D] },
+      {
+        grantRead: [`${D}:stream`, `${D}::$DATA`],
+        grantWrite: [W],
+        denyWrite: [D],
+      },
+    ],
+    [
+      'allowRead/allowWrite with ADS suffix on a credentialDeny: omitted',
+      {
+        allowRead: [`${D}:stream`],
+        allowWrite: [W, `${D}::$DATA`],
+        credentialDeny: [D],
+      },
+      { grantWrite: [W], denyRead: [D] },
+    ],
+    [
+      'NT/device drive prefix preserves its drive colon and strips ADS',
+      {
+        allowWrite: [`\\??\\${BESIDE}`, `//?/${D.replace(/\\/g, '/')}:ads`],
+        denyWrite: [`\\??\\${D}`, `//?/${D.replace(/\\/g, '/')}`],
+      },
+      {
+        grantRead: [`//?/${D.replace(/\\/g, '/')}:ads`],
+        grantWrite: [`\\??\\${BESIDE}`],
+        denyWrite: [`\\??\\${D}`, `//?/${D.replace(/\\/g, '/')}`],
+      },
+    ],
+    [
       'a held write grant beneath a denyWrite: write-denied at its own path',
       {
         denyWrite: [D],
@@ -8282,6 +8312,11 @@ describe('Windows profile read grant (pure, all platforms)', () => {
             '//server/share/x',
             '\\\\?\\GLOBALROOT\\Device\\Mup\\server\\share',
             '\\\\.\\pipe\\x',
+            '\\??\\C:\\Windows\\win.ini',
+            '/??/C:/Windows/win.ini',
+            '\\Device\\HarddiskVolume1\\Windows',
+            '/device/namedpipe/x',
+            '\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}\\x',
           ]) {
             for (const write of [false, true]) {
               expect(

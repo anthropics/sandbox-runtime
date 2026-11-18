@@ -2703,12 +2703,29 @@ export function expandWindowsFsPaths(
 }
 
 /**
- * A path that names a network share (`\\\\server\\share\\…`, `\\\\?\\UNC\\…`)
- * or anything in the device namespace other than a drive (`\\\\.\\pipe\\…`,
- * `\\\\?\\GLOBALROOT\\…`).
+ * Strip any NTFS Alternate Data Stream (`:stream` / `::$DATA`) suffix
+ * beyond a leading `X:` drive prefix (including `\\?\X:`, `\\.\X:`,
+ * `//?/X:`, or `\??\X:`) so ADS spellings rank under the host path.
+ */
+function stripNtfsAdsSuffix(p: string): string {
+  const m = /^(?:[\\/]{2}[?.][\\/]|[\\/]\?\?[\\/])?[a-z]:/i.exec(p)
+  const idx = p.indexOf(':', m ? m[0].length : 0)
+  return idx < 0 ? p : p.slice(0, idx)
+}
+
+/**
+ * A path that names a network share (`\\\\server\\share\\…`,
+ * `\\\\?\\UNC\\…`) or anything in a device/object-manager namespace
+ * other than a drive (`\\\\.\\pipe\\…`, `\\??\\…`, `\\Device\\…`,
+ * `\\\\?\\GLOBALROOT\\…`, `\\\\?\\Volume{…}\\…`).
  */
 function isUnprobedWindowsPath(p: string): boolean {
-  return isUncPath(p) || /^[\\/]{2}[?.][\\/](?![a-z]:)/i.test(p)
+  return (
+    isUncPath(p) ||
+    /^[\\/]{2}[?.][\\/](?![a-z]:)/i.test(p) ||
+    /^[\\/]\?\?(?:[\\/]|$)/i.test(p) ||
+    /^[\\/]device(?:[\\/]|$)/i.test(p)
+  )
 }
 
 /** What the one look at a path on disk found. */
@@ -2760,8 +2777,10 @@ function windowsPathKeyOf(p: string, resolved: ResolvedWindowsPath): string {
   return normalizeCaseForComparison(
     path.win32
       .normalize(
-        stripExtendedPathPrefix(
-          resolved.state === 'resolved' ? resolved.path : p,
+        stripNtfsAdsSuffix(
+          stripExtendedPathPrefix(
+            resolved.state === 'resolved' ? resolved.path : p,
+          ),
         ),
       )
       .replace(/\\/g, '/')
