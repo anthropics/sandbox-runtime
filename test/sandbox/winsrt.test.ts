@@ -2292,6 +2292,72 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
       })
       expect(load).not.toHaveBeenCalled()
     })
+
+    it('ranks per-exec grants below session and cred denies', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'srt-mxc-rank-'))
+      try {
+        const root = realpathSync.native(dir)
+        const denySub = join(root, 'locked-write')
+        const denyReadDir = join(root, 'secret-dir')
+        const allowedSub = join(denyReadDir, 'ok')
+        const sessCred = join(root, 'sess.key')
+        const sessMask = join(root, 'sess-mask.key')
+        const customCred = join(root, 'cmd.key')
+        const maskCred = join(root, 'mask.key')
+        for (const d of [denySub, denyReadDir, allowedSub]) {
+          mkdirSync(d, { recursive: true })
+        }
+        for (const f of [sessCred, sessMask, customCred, maskCred]) {
+          writeFileSync(f, 'secret')
+        }
+        const sdk = injected()
+        const cfg = mxcConfig()
+        cfg.filesystem = {
+          ...cfg.filesystem,
+          allowWrite: [root],
+          denyWrite: [denySub],
+          denyRead: [denyReadDir],
+        }
+        cfg.credentials = {
+          files: [
+            { path: sessCred, mode: 'deny' },
+            { path: sessMask, mode: 'mask' },
+          ],
+        }
+        await start(sdk, cfg)
+        await SandboxManager.spawnSandboxed!('rem', {
+          customConfig: {
+            credentials: {
+              files: [
+                { path: customCred, mode: 'deny' },
+                { path: maskCred, mode: 'mask' },
+              ],
+            },
+            filesystem: {
+              allowRead: [sessCred, sessMask, customCred, maskCred, allowedSub],
+              allowWrite: [denySub, sessCred, sessMask],
+              denyRead: [],
+              denyWrite: [],
+            },
+          },
+        })
+        expect(sdk.spawn).toHaveBeenCalledTimes(1)
+        const req = sdk.spawn.mock.calls[0]![0]
+        const creds = [sessCred, sessMask, customCred, maskCred]
+        expect(req.filesystem.deniedPaths).toEqual(
+          expect.arrayContaining(creds),
+        )
+        expect(req.filesystem.readonlyPaths).toContain(allowedSub)
+        expect(req.filesystem.readonlyPaths).toContain(denySub)
+        for (const c of creds) {
+          expect(req.filesystem.readonlyPaths).not.toContain(c)
+          expect(req.filesystem.readwritePaths).not.toContain(c)
+        }
+        expect(req.filesystem.readwritePaths).not.toContain(denySub)
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    })
   })
 
   it('checkDependencies checks the backend it is told, before initialize()', () => {
