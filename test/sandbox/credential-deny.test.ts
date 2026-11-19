@@ -197,7 +197,7 @@ describe.if(isSupportedPlatform)(
     // written (never backslash-escaped).
     const denyReadRule = (p: string) =>
       new RegExp(
-        String.raw`\(deny file-read\*(\n  \([^\n]*\))*\n  \(subpath "` +
+        String.raw`\(deny file-read\* process-exec\* file-map-executable(\n  \([^\n]*\))*\n  \(subpath "` +
           escapeRegExp(p) +
           '"',
       )
