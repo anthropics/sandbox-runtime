@@ -858,6 +858,29 @@ function moveBlockingFilters(entries: readonly PathEntry[]): Set<string> {
 }
 
 /**
+ * What a read deny takes away, and what a re-allow inside it gives back.
+ * Seatbelt checks the running of a file separately from the reading of it:
+ * under a profile that denies only `file-read*`, a denied binary still runs
+ * when named by its path (`/usr/bin/curl`, `env curl`), because the profile
+ * allows `process-exec` everywhere. On Linux a denied file is not there to
+ * run, so the two platforms disagreed about what `denyRead` on a program
+ * means. `process-exec*` covers the exec itself and a script's interpreter
+ * line; `file-map-executable` covers loading a denied library into a
+ * process that is already running.
+ *
+ * The three rules that layer the read deny list (deny, re-allow, late
+ * re-deny) all carry these, so a re-allowed region inside a broad deny
+ * keeps running its programs. They ride on the read rules rather than on
+ * rules of their own because each filter is spelled once per rule and the
+ * profile has to fit in argv (see macos-profile-size.test.ts).
+ */
+const READ_DENY_OPERATIONS = [
+  'file-read*',
+  'process-exec*',
+  'file-map-executable',
+] as const
+
+/**
  * Generate filesystem read rules for sandbox profile
  *
  * Supports two layers:
@@ -897,17 +920,17 @@ function generateReadRules(
   // Then deny specific paths
   const deniesRoot = resolved.denies.some(d => d.path === '/')
   const denyFilters = new Set(resolved.denies.map(denyPathFilter))
-  rules.push(...renderRule('deny', ['file-read*'], denyFilters, logTag))
+  rules.push(...renderRule('deny', READ_DENY_OPERATIONS, denyFilters, logTag))
 
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
   const allowFilters = new Set(resolved.allows.map(a => pathFilter(a)))
-  rules.push(...renderRule('allow', ['file-read*'], allowFilters, logTag))
+  rules.push(...renderRule('allow', READ_DENY_OPERATIONS, allowFilters, logTag))
 
   // Denies the allow block would otherwise win over (last-match-wins) land
   // here, after it. Must stay ahead of the file-read-metadata allow below.
   const late = lateReadDenyFilters(resolved)
   rules.push(
-    ...renderRule('deny', ['file-read*'], new Set(late.filters), logTag),
+    ...renderRule('deny', READ_DENY_OPERATIONS, new Set(late.filters), logTag),
   )
 
   // (subpath "/") — or a re-emitted `/*`-shaped glob — denies the root inode

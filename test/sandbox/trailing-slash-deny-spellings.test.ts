@@ -160,13 +160,13 @@ describe.if(!isWindows)(
         })
 
         // The carve-out allow rule uses the slash-free subpath spelling.
-        const allowRule = `(allow file-read*\n  (subpath "/work/priv/pub")`
+        const allowRule = `(allow file-read* process-exec* file-map-executable\n  (subpath "/work/priv/pub")`
         const allowIdx = profile.indexOf(allowRule)
         expect(allowIdx).toBeGreaterThanOrEqual(0)
         // Last-match-wins: the more-specific nested deny must land AFTER the
         // allow rule, or the carve-out silently re-allows it.
         const lastDenyIdx = profile.lastIndexOf(
-          `(deny file-read*\n  (subpath "/work/priv/pub/secret")`,
+          `(deny file-read* process-exec* file-map-executable\n  (subpath "/work/priv/pub/secret")`,
         )
         expect(lastDenyIdx).toBeGreaterThan(allowIdx)
       },
