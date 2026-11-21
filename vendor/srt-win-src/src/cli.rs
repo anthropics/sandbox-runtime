@@ -151,6 +151,15 @@ enum Cmd {
         /// with the other mode than the installed one is refused.
         #[arg(long)]
         allow_loopback: bool,
+        /// Opt-in machine-wide WSL2 / Hyper-V NAT egress guard: install
+        /// persistent `FWPM_LAYER_IPFORWARD_V4` and `_V6` BLOCK filters
+        /// under this sublayer so packets forwarded from WSL2 / Hyper-V
+        /// NAT guests cannot leave the host outside the `srt-sandbox`
+        /// ALE connect fence. Intended for dedicated single-purpose
+        /// sandbox hosts; host-originated connections stay unaffected.
+        /// Default: off. Changing this option requires `--force`.
+        #[arg(long)]
+        block_wsl_nat: bool,
         /// Name for the sandbox user account. Default:
         /// `srt-sandbox`. srt-win only manages an account it
         /// created — a name that already resolves to a principal
@@ -1352,6 +1361,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sublayer_guid,
             proxy_port_range,
             allow_loopback,
+            block_wsl_nat,
             sandbox_user,
             force,
         } => {
@@ -1409,6 +1419,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 let want = [range.0, range.1];
                 if st.port_range != Some(want)
                     || st.allow_loopback != allow_loopback
+                    || st.block_wsl_nat != block_wsl_nat
                     || name_changed
                 {
                     let have_range = st
@@ -1422,13 +1433,14 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     eprintln!(
                         "srt-win: error: already installed under \
                          sublayer {sl:?} with port_range={have_range}, \
-                         loopback={}, \
+                         loopback={}, block_wsl_nat={}, \
                          sandbox_user='{have_name}'; requested \
-                         port_range={}-{}, loopback={}, \
+                         port_range={}-{}, loopback={}, block_wsl_nat={block_wsl_nat}, \
                          sandbox_user='{name}'. \
                          Pass --force to replace, or run `srt-win \
                          uninstall` first.",
                         wfp::fmt_loopback(st.allow_loopback),
+                        st.block_wsl_nat,
                         range.0,
                         range.1,
                         wfp::fmt_loopback(allow_loopback),
@@ -1459,6 +1471,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     && mv == Some(install::SETUP_VERSION)
                     && st.state == "installed"
                     && st.allow_loopback == allow_loopback
+                    && st.block_wsl_nat == block_wsl_nat
                     && install::read_loopback_mode(&sl)
                         .ok()
                         .flatten()
@@ -1595,7 +1608,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 eprintln!("srt-win: error: mark the loopback mode as changing: {e:#}");
                 std::process::exit(12);
             }
-            if let Err(e) = wfp::install_filters(&sl, &pu.sid, range, allow_loopback) {
+            if let Err(e) = wfp::install_filters(&sl, &pu.sid, range, allow_loopback, block_wsl_nat)
+            {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
             }
@@ -1615,14 +1629,17 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             eprintln!(
                 "srt-win: installed (sublayer={sl:?}, \
                  proxy_port_range={}-{}, loopback={}, \
-                 filters={})",
+                 block_wsl_nat={block_wsl_nat}, filters={})",
                 range.0,
                 range.1,
                 wfp::fmt_loopback(allow_loopback),
-                wfp::filter_count(allow_loopback),
+                wfp::filter_count(allow_loopback, block_wsl_nat),
             );
             if allow_loopback {
                 eprintln!("srt-win: warning: {}", wfp::open_loopback_notice());
+            }
+            if block_wsl_nat {
+                eprintln!("srt-win: warning: {}", wfp::wsl_nat_block_notice());
             }
             eprintln!(
                 "srt-win: sandbox user '{}' provisioned (sid={}, \
@@ -1932,6 +1949,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                         "untrusted_integrity_probe": "error",
                         "untrusted_integrity_loopback_probe": "error",
                         "open_loopback_probe": "error",
+                        "wsl_probe": "error",
                         "target": target,
                         "egress_target": egress_target,
                         "anonymous_target": anonymous_target,
@@ -1960,6 +1978,13 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                             "a lowered-integrity copy of the sandbox token \
                              could not be set up, so no connect under it was \
                              observed (see the per-ordering lines above)",
+                        probe::RESIDUAL_WSL_REACHABLE =>
+                            "wsl.exe --status answered under the sandbox \
+                             account: traffic from a WSL distribution does \
+                             not leave under the sandbox user SID and is not \
+                             matched by the ALE connect filters (dedicated \
+                             sandbox hosts can pass `srt-win install \
+                             --block-wsl-nat` to block WSL2 NAT forwarding)",
                         _ =>
                             "a connect made under a copy of the sandbox token \
                              whose user SID is deny-only is not blocked \
@@ -1978,6 +2003,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 "untrusted_integrity_loopback_probe":
                     report.untrusted_integrity_loopback.label(),
                 "open_loopback_probe": report.open_loopback.label(),
+                "wsl_probe": report.wsl_reachable.label(),
                 "target": target,
                 "egress_target": egress_target,
                 "anonymous_target": anonymous_target,
@@ -3624,6 +3650,26 @@ mod tests {
             Cli::try_parse_from(["srt-win", "install", "--loopback-port-range", "3000-3099"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn block_wsl_nat_flag_parses() {
+        let on = Cli::try_parse_from(["srt-win", "install", "--block-wsl-nat"]).expect("parse");
+        assert!(matches!(
+            on.cmd,
+            Cmd::Install {
+                block_wsl_nat: true,
+                ..
+            }
+        ));
+        let off = Cli::try_parse_from(["srt-win", "install"]).expect("parse");
+        assert!(matches!(
+            off.cmd,
+            Cmd::Install {
+                block_wsl_nat: false,
+                ..
+            }
+        ));
     }
 
     /// The flag is off unless given, and the hidden `probe` subcommands parse.
