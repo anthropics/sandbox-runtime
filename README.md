@@ -254,6 +254,50 @@ How srt reads the channel, and what it refuses:
   command is spawned with the three standard streams alone, so the control
   descriptor is not among the descriptors it is handed.
 
+#### External request decider on `srt`: `--decider-fd` / `--decider-in` / `--decider-out`
+
+`srt` can also attach an out-of-process v1 request decider (the same
+length-prefixed JSON protocol documented in
+[docs/srt-proxy.md](docs/srt-proxy.md)) directly to its built-in HTTP proxy
+while running a sandboxed command on macOS and Linux:
+
+```bash
+# fd 5 is a bidirectional socket to the external decider process
+srt --decider-fd 5 -- curl https://api.example.com
+
+# or a pair of inherited descriptors (decider -> srt, srt -> decider)
+srt --decider-in 5 --decider-out 6 --decider-timeout-ms 3000 -- npm test
+```
+
+How the decider interacts with `srt`:
+
+- **Descriptor isolation**: every `--decider-*` descriptor (along with
+  `--control-fd` when both are used) is displaced with `/dev/null` in the
+  sandboxed child's stdio table on POSIX so the sandboxed command can never
+  read requests or spoof verdicts. All inherited descriptors must be integers
+  `>= 3`, `--decider-fd` cannot be combined with `--decider-in`/`--decider-out`,
+  and decider descriptors cannot collide with `--control-fd`. Under Node, use a
+  socket pair for `--decider-fd` or `--decider-in`/`--decider-out`; Bun accepts
+  pipes in either form (see [docs/srt-proxy.md](docs/srt-proxy.md)).
+- **Fail-closed startup and runtime**: `srt` completes the decider's v1 `hello`
+  handshake before `SandboxManager.initialize()` or spawning the wrapped
+  command. If the descriptor is unusable, the handshake fails, or the decider
+  disconnects or violates the protocol while the command is running, `srt`
+  refuses pending/future requests and terminates the command with exit code 1.
+- **Policy merging**: `network.allowedDomains` in `--settings` must be empty
+  when an external decider is attached (the decider's `hello.allowedDomains`
+  is the single allowlist source), and `network.httpProxyPort` is refused so
+  the decider is never bypassed. `network.deniedDomains` from `--settings` and
+  `hello.deniedDomains` are unioned.
+- **HTTPS inspection**: `network.tlsTerminate` remains opt-in via `--settings`
+  (pair with `network.refuseOpaqueTunnels: true` and
+  `network.requireHostMatch: true` to guarantee every HTTPS request is
+  inspected by the decider). Without `network.tlsTerminate`, plain HTTP
+  requests are filtered by the decider while HTTPS CONNECT tunnels remain
+  filtered only by `hello.allowedDomains` / `deniedDomains`.
+- **Platform support**: `--decider-fd` / `--decider-in` / `--decider-out` use
+  inherited POSIX descriptors and are refused on Windows.
+
 ### As a standalone proxy with an external decider: `srt proxy`
 
 `srt proxy` (or the single-file `srt-proxy` executable built by `bun run build:srt-proxy`) runs only SRT's HTTP proxy, with no sandboxed child, for a host that runs the workload elsewhere. It accepts on a listening socket the host hands in, terminates every CONNECT in-process, and forwards a request only when a separate decider process, reached over another inherited descriptor, allows it. See [docs/srt-proxy.md](docs/srt-proxy.md) for the command line, the decider protocol and the security model.
