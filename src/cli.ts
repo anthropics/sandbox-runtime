@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 import pkg from '../package.json' with { type: 'json' }
 import { quote } from './utils/shell-quote.js'
-import { Command, InvalidArgumentError } from 'commander'
+import { Command } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
 import { spawn, type ChildProcess } from 'child_process'
 import { logForDebugging } from './utils/debug.js'
-import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
-import * as readline from 'readline'
+import { loadConfig } from './utils/config-loader.js'
+import {
+  createControlChannel,
+  openControlFd,
+  openControlPipe,
+  parseControlFd,
+  parseControlPipe,
+  type ControlChannelController,
+} from './utils/control-channel.js'
 import * as fs from 'fs'
-import * as net from 'net'
 import * as path from 'path'
 import { finished } from 'stream/promises'
 import * as os from 'os'
@@ -74,68 +80,6 @@ function getDefaultConfig(): SandboxRuntimeConfig {
       denyWrite: [],
     },
   }
-}
-
-/**
- * A readable stream over the control fd. A pipe or socket is read through a
- * libuv stream handle, driven by the event loop: fs.createReadStream would
- * park a threadpool thread in a blocking read(2) that process.exit() then
- * waits for, so srt would outlive the wrapped command until the parent
- * closed the fd. Anything else keeps the fs stream, which is right for a
- * regular file (its reads never block) and leaves a tty with the old wait.
- * Under Bun, net.Socket({ fd }) reads nothing, and Bun's fs stream does not
- * hold exit, so the fs stream serves every fd kind there.
- *
- * A libuv handle switches the fd's open file description to non-blocking
- * mode, from the moment srt opens it and for good (Node restores only fds
- * 0-2 at exit). A parent that shares that description (a shell
- * `exec 3<fifo`, a Python pass_fds of an fd it keeps using) then sees
- * EAGAIN on its own blocking reads, so hand srt a dedicated pipe end.
- */
-function openControlFd(fd: number): NodeJS.ReadableStream {
-  // fstat succeeds on descriptors srt can never read a byte from — one
-  // opened write-only, the write end of a pipe — and a reader over those
-  // fails only once the command is already running. A zero-length readv(2)
-  // asks the kernel whether a read is permitted at all without performing
-  // one: EBADF for those, 0 for every readable kind, on both node and bun,
-  // without blocking on an empty pipe or consuming a byte of a full one.
-  fs.readvSync(fd, [Buffer.alloc(0)])
-  const stat = fs.fstatSync(fd)
-  if (!process.versions.bun && (stat.isFIFO() || stat.isSocket())) {
-    try {
-      return new net.Socket({ fd, readable: true, writable: false }).unref()
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code
-      if (code !== 'ERR_INVALID_FD_TYPE') {
-        // ERR_INVALID_FD_TYPE is the only refusal that leaves the fd
-        // untouched (a datagram or seqpacket socket, which the fs stream
-        // still reads, one read(2) per datagram). Every other failure comes
-        // out of uv_pipe_open, which has already switched the fd to
-        // non-blocking mode: an fs stream over it would read EAGAIN
-        // forever, so no fallback is left to take.
-        throw new Error(
-          `could not be adopted as a stream (${code ?? String(err)})`,
-        )
-      }
-      logForDebugging(
-        `Control fd ${fd} is not a stream socket (${err instanceof Error ? err.message : String(err)}); reading it through fs`,
-      )
-    }
-  }
-  return fs.createReadStream('', { fd })
-}
-
-/**
- * Parse --control-fd: an integer descriptor number >= 3.
- */
-function parseControlFd(value: string): number {
-  // Number() alone would also take '0x10', '3e0' and ' 5 '.
-  if (!/^\d+$/.test(value) || Number(value) < 3) {
-    throw new InvalidArgumentError(
-      'must be an integer file descriptor >= 3 (0-2 are stdin, stdout and stderr).',
-    )
-  }
-  return Number(value)
 }
 
 /**
@@ -355,6 +299,12 @@ async function main(): Promise<void> {
         'protocol; give srt a dedicated read-only end — see the README)',
       parseControlFd,
     )
+    .option(
+      '--control-pipe <path>',
+      'Windows: read config updates from a local named pipe (\\\\.\\pipe\\<name>, ' +
+        'JSON lines protocol; restrict the pipe DACL to your user SID — see the README)',
+      parseControlPipe,
+    )
     .allowUnknownOption()
     .action(
       async (
@@ -364,6 +314,7 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          controlPipe?: string
         },
       ) => {
         try {
@@ -434,66 +385,112 @@ async function main(): Promise<void> {
           // The wrapped command, once it exists: a control channel that
           // dies before it delivers anything takes it down with it.
           let child: Pick<ChildProcess, 'kill'> | undefined
-          let controlChannelFailed = false
-          let receivedAnyLine = false
-          let controlErrorReported = false
           const controlFd = options.controlFd
+          const controlPipe = options.controlPipe
 
-          function onControlError(err: Error): void {
-            // Attached both to the stream and to the reader: the stream is
-            // live from the moment the fd is opened, which is before the
-            // reader exists, and readline re-emits an input error on the
-            // reader as well. The channel is gone after the first error
-            // either way, so it is reported once.
-            if (controlErrorReported) {
-              return
-            }
-            controlErrorReported = true
-            if (receivedAnyLine) {
-              // The channel did deliver. The config last applied stays in
-              // force, so the command keeps running under it.
-              console.error(
-                `Error reading control fd ${controlFd}: ${err.message}. The control channel is closed; no further updates will be applied.`,
-              )
-              return
-            }
-            // Nothing ever came through: this is the descriptor that would
-            // not open, found one step later. The caller is sending updates
-            // into a channel srt cannot read.
+          if (controlFd !== undefined && controlPipe !== undefined) {
             console.error(
-              `Error: control fd ${controlFd} failed before delivering an update: ${err.message}. Refusing to run the command without the control channel it asks for.`,
+              'Error: --control-fd and --control-pipe cannot be used together.',
             )
-            controlChannelFailed = true
-            if (child === undefined) {
-              process.exit(1)
-            }
-            child.kill('SIGTERM')
-            // The child's own exit is what exits srt; this covers a command
-            // that ignores SIGTERM.
-            setTimeout(() => child?.kill('SIGKILL'), KILL_GRACE_MS).unref()
+            process.exit(1)
           }
 
-          // Open and check the control fd before anything is built: a
+          const controlKind =
+            controlFd !== undefined ? 'control fd' : 'control pipe'
+          const controlTarget =
+            controlFd !== undefined
+              ? `control fd ${controlFd}`
+              : `control pipe ${controlPipe}`
+          const listeningTarget =
+            controlFd !== undefined ? `fd ${controlFd}` : `pipe ${controlPipe}`
+
+          // Open and check the control channel before anything is built: a
           // refusal here has no proxy or Linux bridge to unwind, and
           // process.exit() cannot wait for the async reset() that would.
-          let controlStream: NodeJS.ReadableStream | undefined
-          if (controlFd !== undefined) {
-            try {
-              controlStream = openControlFd(controlFd)
-            } catch (err) {
-              // Same rule as an explicit --settings that will not load: a
-              // caller that asked for a control channel gets an error, not
-              // a run whose updates — including the ones that tighten the
-              // sandbox — quietly go nowhere.
-              console.error(
-                `Error: --control-fd ${controlFd} is not usable: ` +
-                  `${err instanceof Error ? err.message : String(err)}. ` +
-                  'Refusing to run the command without the control channel it asks for.',
-              )
-              process.exit(1)
+          let controlChannel: ControlChannelController | null = null
+          if (controlFd !== undefined || controlPipe !== undefined) {
+            let controlStream: NodeJS.ReadableStream
+            if (controlFd !== undefined) {
+              try {
+                controlStream = openControlFd(controlFd)
+              } catch (err) {
+                // Same rule as an explicit --settings that will not load: a
+                // caller that asked for a control channel gets an error, not
+                // a run whose updates — including the ones that tighten the
+                // sandbox — quietly go nowhere.
+                console.error(
+                  `Error: --control-fd ${controlFd} is not usable: ` +
+                    `${err instanceof Error ? err.message : String(err)}. ` +
+                    'Refusing to run the command without the control channel it asks for.',
+                )
+                process.exit(1)
+              }
+            } else {
+              try {
+                controlStream = await openControlPipe(controlPipe!)
+              } catch (err) {
+                console.error(
+                  `Error: --control-pipe ${controlPipe} is not usable: ` +
+                    `${err instanceof Error ? err.message : String(err)}. ` +
+                    'Refusing to run the command without the control channel it asks for.',
+                )
+                process.exit(1)
+              }
             }
-            controlStream.on('error', onControlError)
+
+            controlChannel = createControlChannel(controlStream, {
+              onConfig: newConfig => {
+                logForDebugging(
+                  `Config updated from ${controlKind}: ${JSON.stringify(newConfig)}`,
+                )
+                SandboxManager.updateConfig(newConfig)
+              },
+              onInvalidLine: line => {
+                // The caller has to learn its update was dropped whether
+                // or not it runs srt with --debug; the line itself stays
+                // in the debug log rather than on the terminal.
+                console.error(
+                  `Invalid config on ${controlTarget}: ignored, previous config still in force`,
+                )
+                logForDebugging(
+                  `Invalid config on ${controlKind} (ignored): ${line}`,
+                )
+              },
+              onPostUpdateError: err => {
+                console.error(
+                  `Error reading ${controlTarget}: ${err.message}. The control channel is closed; no further updates will be applied.`,
+                )
+              },
+              onFatalError: err => {
+                console.error(
+                  `Error: ${controlTarget} failed before delivering an update: ${err.message}. Refusing to run the command without the control channel it asks for.`,
+                )
+                if (child === undefined) {
+                  process.exit(1)
+                }
+                if (process.platform === 'win32') {
+                  // Terminating srt-win.exe closes its Job Object handle
+                  // (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE), tearing down the
+                  // entire sandboxed process tree; MXC's proc.kill() ends
+                  // its tree directly as well.
+                  child.kill()
+                } else {
+                  child.kill('SIGTERM')
+                  // The child's own exit is what exits srt; this covers a
+                  // command that ignores SIGTERM.
+                  setTimeout(
+                    () => child?.kill('SIGKILL'),
+                    KILL_GRACE_MS,
+                  ).unref()
+                }
+              },
+            })
           }
+
+          // Cleanup control channel on exit
+          process.on('exit', () => {
+            controlChannel?.close()
+          })
 
           // Until there is a child to pass an interrupt on to, it stops the
           // run. The library's own handlers, which initialize() installs, only
@@ -524,45 +521,14 @@ async function main(): Promise<void> {
           // unread, so nothing the caller wrote meanwhile is lost, and an
           // update applied before initialize() would have been overwritten
           // by it.
-          let controlReader: readline.Interface | null = null
-          if (controlStream !== undefined) {
-            controlReader = readline.createInterface({
-              input: controlStream,
-              crlfDelay: Infinity,
-            })
-
-            controlReader.on('line', line => {
-              receivedAnyLine = true
-              const newConfig = loadConfigFromString(line)
-              if (newConfig) {
-                logForDebugging(
-                  `Config updated from control fd: ${JSON.stringify(newConfig)}`,
-                )
-                SandboxManager.updateConfig(newConfig)
-              } else if (line.trim()) {
-                // The caller has to learn its update was dropped whether
-                // or not it runs srt with --debug; the line itself stays
-                // in the debug log rather than on the terminal.
-                console.error(
-                  `Invalid config on control fd ${controlFd}: ignored, previous config still in force`,
-                )
-                logForDebugging(
-                  `Invalid config on control fd (ignored): ${line}`,
-                )
-              }
-            })
-
-            controlReader.on('error', onControlError)
-
+          if (controlChannel !== null) {
+            controlChannel.startReading()
             // End of input just means the writer closed its end. The
             // command keeps running under the config last applied.
-            logForDebugging(`Listening for config updates on fd ${controlFd}`)
+            logForDebugging(
+              `Listening for config updates on ${listeningTarget}`,
+            )
           }
-
-          // Cleanup control reader on exit
-          process.on('exit', () => {
-            controlReader?.close()
-          })
 
           // Determine command string based on mode
           let command: string
@@ -601,7 +567,7 @@ async function main(): Promise<void> {
             // non-existent deny paths. This removes them.
             SandboxManager.cleanupAfterCommand()
 
-            if (controlChannelFailed) {
+            if (controlChannel?.failed) {
               // srt killed the command over a dead control channel, so the
               // status it died with is not the run's result.
               process.exit(1)

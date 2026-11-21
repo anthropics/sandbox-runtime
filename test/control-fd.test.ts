@@ -5,10 +5,20 @@ import {
   execFileSync,
   type ChildProcess,
 } from 'child_process'
+import * as crypto from 'crypto'
 import * as fs from 'fs'
+import * as net from 'net'
 import * as os from 'os'
 import * as path from 'path'
-import { type Writable } from 'stream'
+import { PassThrough, type Writable } from 'stream'
+import type { SandboxRuntimeConfig } from '../src/sandbox/sandbox-config.js'
+import {
+  createControlChannel,
+  openControlFd,
+  openControlPipe,
+  parseControlFd,
+  parseControlPipe,
+} from '../src/utils/control-channel.js'
 import { isLinux, isWindows } from './helpers/platform.js'
 
 // Get the path to the built CLI
@@ -568,4 +578,334 @@ describe.skipIf(isWindows)('--control-fd', () => {
       expect(stderr).toContain('updated-domain.com')
     },
   )
+})
+
+const LOCKDOWN_UPDATE = JSON.stringify({
+  network: { allowedDomains: [], deniedDomains: ['*'] },
+  filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+})
+
+function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs = 2000,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs
+    const tick = (): void => {
+      if (predicate()) {
+        resolve()
+        return
+      }
+      if (Date.now() >= deadline) {
+        reject(new Error(`Condition not met within ${timeoutMs}ms`))
+        return
+      }
+      setTimeout(tick, 10)
+    }
+    tick()
+  })
+}
+
+describe('control-channel parsing and state machine', () => {
+  it('validates --control-fd values', () => {
+    expect(parseControlFd('3')).toBe(3)
+    expect(parseControlFd('20')).toBe(20)
+    for (const bad of ['0', '1', '2', '-1', 'abc', '0x10', '3e0', ' 5 ']) {
+      expect(() => parseControlFd(bad)).toThrow(
+        'must be an integer file descriptor >= 3',
+      )
+    }
+  })
+
+  it('validates and canonicalizes --control-pipe local named pipe paths', () => {
+    expect(parseControlPipe('\\\\.\\pipe\\srt-control-1')).toBe(
+      '\\\\.\\pipe\\srt-control-1',
+    )
+    expect(parseControlPipe('\\\\.\\PIPE\\nested\\srt-control')).toBe(
+      '\\\\.\\pipe\\nested\\srt-control',
+    )
+
+    for (const bad of [
+      '',
+      'srt-control',
+      '/tmp/srt-control',
+      '\\\\.\\pipe\\',
+      '\\\\.\\pipe\\trailing\\',
+      '\\\\.\\pipe\\double\\\\seg',
+      '\\\\.\\pipe\\..\\escape',
+      '\\\\.\\pipe\\a\\.\\b',
+      '\\\\.\\pipe\\forward/slash',
+      '\\\\.\\pipe\\ctrl\nchar',
+      '\\\\remote-host\\pipe\\srt-control',
+      '\\\\127.0.0.1\\pipe\\srt-control',
+      '\\\\?\\pipe\\srt-control',
+    ]) {
+      expect(() => parseControlPipe(bad)).toThrow(
+        'must be a local Windows named pipe path',
+      )
+    }
+  })
+
+  it('enforces platform guards for --control-fd and --control-pipe', async () => {
+    expect(() => openControlFd(3, { platform: 'win32' })).toThrow(
+      '--control-fd is not supported on Windows',
+    )
+    const linuxErr = await openControlPipe('\\\\.\\pipe\\srt-test', {
+      platform: 'linux',
+    }).then(
+      () => null,
+      (err: Error) => err,
+    )
+    expect(linuxErr?.message).toContain(
+      '--control-pipe is only supported on Windows',
+    )
+    const darwinErr = await openControlPipe('\\\\.\\pipe\\srt-test', {
+      platform: 'darwin',
+    }).then(
+      () => null,
+      (err: Error) => err,
+    )
+    expect(darwinErr?.message).toContain(
+      '--control-pipe is only supported on Windows',
+    )
+  })
+
+  it('buffers pre-attach updates, applies live updates, ignores blanks, and reports invalid lines', async () => {
+    const stream = new PassThrough()
+    const applied: SandboxRuntimeConfig[] = []
+    const invalid: string[] = []
+    const fatal: Error[] = []
+    const postErr: Error[] = []
+
+    const channel = createControlChannel(stream, {
+      onConfig: cfg => applied.push(cfg),
+      onInvalidLine: line => invalid.push(line),
+      onFatalError: err => fatal.push(err),
+      onPostUpdateError: err => postErr.push(err),
+    })
+
+    // Write before startReading(): must wait rather than being dropped.
+    stream.pause()
+    stream.write(CONFIG_UPDATE + '\n')
+    await new Promise(r => setTimeout(r, 20))
+    expect(applied).toHaveLength(0)
+
+    channel.startReading()
+    await waitForCondition(() => applied.length === 1)
+    expect(applied[0].network.allowedDomains).toEqual(['updated-domain.com'])
+
+    // Blank lines ignored, invalid JSON reported, live lockdown applied.
+    stream.write('\n   \n{ "network": "bad" }\n')
+    stream.write(LOCKDOWN_UPDATE + '\n')
+    await waitForCondition(() => applied.length === 2 && invalid.length === 1)
+
+    expect(applied[1].network.allowedDomains).toEqual([])
+    expect(applied[1].network.deniedDomains).toEqual(['*'])
+    expect(invalid).toEqual(['{ "network": "bad" }'])
+    expect(fatal).toHaveLength(0)
+    expect(postErr).toHaveLength(0)
+    expect(channel.failed).toBe(false)
+
+    channel.close()
+  })
+
+  it('fails closed on error before any update and degrades gracefully after an update', async () => {
+    const preStream = new PassThrough()
+    const fatal: Error[] = []
+    const preChannel = createControlChannel(preStream, {
+      onConfig: () => {},
+      onFatalError: err => fatal.push(err),
+    })
+    preStream.emit('error', new Error('broken before update'))
+    preStream.emit('error', new Error('second error should be ignored'))
+    expect(preChannel.failed).toBe(true)
+    expect(fatal).toHaveLength(1)
+    expect(fatal[0].message).toBe('broken before update')
+    preChannel.close()
+
+    const postStream = new PassThrough()
+    const applied: SandboxRuntimeConfig[] = []
+    const postFatal: Error[] = []
+    const postErrors: Error[] = []
+    const postChannel = createControlChannel(postStream, {
+      onConfig: cfg => applied.push(cfg),
+      onFatalError: err => postFatal.push(err),
+      onPostUpdateError: err => postErrors.push(err),
+    })
+    postChannel.startReading()
+    postStream.write(CONFIG_UPDATE + '\n')
+    await waitForCondition(() => applied.length === 1)
+
+    postStream.emit('error', new Error('broken after update'))
+    expect(postChannel.failed).toBe(false)
+    expect(postFatal).toHaveLength(0)
+    expect(postErrors).toHaveLength(1)
+    expect(postErrors[0].message).toBe('broken after update')
+    postChannel.close()
+  })
+})
+
+describe.skipIf(!isWindows)('--control-pipe (Windows)', () => {
+  let activeServers: net.Server[] = []
+  let activeSockets: net.Socket[] = []
+
+  function uniquePipePath(tag: string): string {
+    return `\\\\.\\pipe\\srt-control-test-${tag}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
+  }
+
+  function startPipeServer(
+    pipePath: string,
+    onConnection: (conn: net.Socket) => void,
+  ): Promise<net.Server> {
+    return new Promise((resolve, reject) => {
+      const server = net.createServer(conn => {
+        activeSockets.push(conn)
+        onConnection(conn)
+      })
+      activeServers.push(server)
+      server.once('error', reject)
+      server.listen(pipePath, () => {
+        server.removeListener('error', reject)
+        resolve(server)
+      })
+    })
+  }
+
+  afterEach(async () => {
+    for (const sock of activeSockets) {
+      sock.destroy()
+    }
+    activeSockets = []
+    await Promise.all(
+      activeServers.map(
+        s =>
+          new Promise<void>(resolve => {
+            s.close(() => resolve())
+          }),
+      ),
+    )
+    activeServers = []
+  })
+
+  it('streams buffered and live policy updates over a real Windows named pipe', async () => {
+    const pipePath = uniquePipePath('live')
+    let serverConn: net.Socket | undefined
+
+    await startPipeServer(pipePath, conn => {
+      serverConn = conn
+      // Write immediately upon connect (before srt attaches readline) to prove
+      // the paused socket buffers pre-initialize updates without loss.
+      conn.write(CONFIG_UPDATE + '\n')
+    })
+
+    const socket = await openControlPipe(pipePath)
+    activeSockets.push(socket)
+    await waitForCondition(() => serverConn !== undefined)
+    // Allow the initial write to arrive while the client socket is still paused.
+    await new Promise(r => setTimeout(r, 40))
+
+    const applied: SandboxRuntimeConfig[] = []
+    const invalid: string[] = []
+    const fatal: Error[] = []
+
+    const channel = createControlChannel(socket, {
+      onConfig: cfg => applied.push(cfg),
+      onInvalidLine: line => invalid.push(line),
+      onFatalError: err => fatal.push(err),
+    })
+
+    expect(applied).toHaveLength(0)
+
+    channel.startReading()
+    await waitForCondition(() => applied.length === 1)
+    expect(applied[0].network.allowedDomains).toEqual(['updated-domain.com'])
+
+    // Live updates after reader attach: blank line, invalid line, then lockdown.
+    serverConn!.write('\n{ invalid }\n' + LOCKDOWN_UPDATE + '\n')
+    await waitForCondition(() => applied.length === 2 && invalid.length === 1)
+
+    expect(applied[1].network.allowedDomains).toEqual([])
+    expect(applied[1].network.deniedDomains).toEqual(['*'])
+    expect(invalid).toEqual(['{ invalid }'])
+    expect(fatal).toHaveLength(0)
+    expect(channel.failed).toBe(false)
+
+    // Clean writer EOF must not trigger an error.
+    serverConn!.end()
+    await new Promise(r => setTimeout(r, 40))
+    expect(fatal).toHaveLength(0)
+    expect(channel.failed).toBe(false)
+
+    channel.close()
+  })
+
+  it('fails closed when connecting to a nonexistent named pipe', async () => {
+    const missing = uniquePipePath('missing')
+    const err = await openControlPipe(missing, { timeoutMs: 1000 }).then(
+      () => null,
+      (e: Error) => e,
+    )
+    expect(err).toBeInstanceOf(Error)
+  })
+
+  for (const runtime of RUNTIMES) {
+    it(`CLI refuses --control-fd, conflicting flags, remote pipes, and missing pipes on Windows (${runtime.name})`, () => {
+      const run = (args: string[]) =>
+        spawnSync(runtime.bin, [CLI_PATH, ...args], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          encoding: 'utf8',
+          timeout: EXIT_TIMEOUT_MS,
+        })
+
+      // 1. --control-fd refused cleanly on Windows with pointer to --control-pipe
+      const fdRes = run(['--control-fd', '3', '--', 'echo', 'SHOULD_NOT_RUN'])
+      expect(fdRes.status).toBe(1)
+      expect(fdRes.stdout).not.toContain('SHOULD_NOT_RUN')
+      expect(fdRes.stderr).toContain('--control-fd 3 is not usable')
+      expect(fdRes.stderr).toContain('--control-pipe')
+
+      // 2. Mutual exclusion of --control-fd and --control-pipe
+      const bothRes = run([
+        '--control-fd',
+        '3',
+        '--control-pipe',
+        uniquePipePath('both'),
+        '--',
+        'echo',
+        'SHOULD_NOT_RUN',
+      ])
+      expect(bothRes.status).toBe(1)
+      expect(bothRes.stdout).not.toContain('SHOULD_NOT_RUN')
+      expect(bothRes.stderr).toContain(
+        '--control-fd and --control-pipe cannot be used together',
+      )
+
+      // 3. Remote UNC named pipe rejected at parse time
+      const uncRes = run([
+        '--control-pipe',
+        '\\\\remote-server\\pipe\\srt-control',
+        '--',
+        'echo',
+        'SHOULD_NOT_RUN',
+      ])
+      expect(uncRes.status).toBe(1)
+      expect(uncRes.stdout).not.toContain('SHOULD_NOT_RUN')
+      expect(uncRes.stderr).toContain('must be a local Windows named pipe path')
+
+      // 4. Nonexistent local named pipe refused before sandbox init / spawn
+      const missingPipe = uniquePipePath('cli-missing')
+      const missingRes = run([
+        '--control-pipe',
+        missingPipe,
+        '--',
+        'echo',
+        'SHOULD_NOT_RUN',
+      ])
+      expect(missingRes.status).toBe(1)
+      expect(missingRes.stdout).not.toContain('SHOULD_NOT_RUN')
+      expect(missingRes.stderr).toContain(
+        `--control-pipe ${missingPipe} is not usable`,
+      )
+    })
+  }
 })

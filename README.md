@@ -184,18 +184,23 @@ config rather than a weaker one — falling back would drop the file's
 said. The same goes for a file named with `--settings`, which must also
 exist.
 
-#### Updating the config while the command runs: `--control-fd`
+#### Updating the config while the command runs: `--control-fd` and `--control-pipe`
 
-`--control-fd <fd>` reads config updates from a descriptor the caller has
-already opened, one JSON object per line in the same shape as the settings
-file. Each line replaces the whole config and is validated against the same
-schema, so a line is a complete config rather than a patch: `network` and
-`filesystem` are required, and a key the line leaves out goes back to its
-default.
+`--control-fd <fd>` (macOS and Linux) and `--control-pipe <path>` (Windows)
+read config updates from a channel the caller has already opened, one JSON
+object per line in the same shape as the settings file. Each line replaces
+the whole config and is validated against the same schema, so a line is a
+complete config rather than a patch: `network` and `filesystem` are
+required, and a key the line leaves out goes back to its default.
 
 ```bash
-# fd 3 is the read end of a pipe the caller writes lines to
+# macOS / Linux: fd 3 is the read end of a pipe the caller writes lines to
 srt --control-fd 3 -- npm test
+```
+
+```powershell
+# Windows: connect to a local named pipe created by the supervisor
+srt --control-pipe \\.\pipe\srt-control-1234 -- npm test
 ```
 
 What an accepted line changes once the command is running:
@@ -222,13 +227,21 @@ What an accepted line changes once the command is running:
 
 How srt reads the channel, and what it refuses:
 
-- The descriptor must be an integer **3 or above** and readable — `0`-`2`
-  are the standard streams. srt exits with an error instead of running the
-  command when it cannot read the descriptor it was given, so a dead
-  channel never passes for a live one. A channel that dies before it has
-  delivered a single update takes the command down with it; one that dies
-  after says so and leaves the command running under the config last
-  applied.
+- On macOS and Linux, `--control-fd <fd>` requires an integer descriptor
+  **3 or above** that is readable — `0`-`2` are the standard streams. On
+  Windows, `--control-fd` is refused with an error pointing to
+  `--control-pipe`, and `--control-pipe <path>` requires a local Windows
+  named pipe path (`\\.\pipe\<name>`): remote UNC pipes (`\\server\pipe\...`),
+  relative paths, and path traversal segments are rejected, and
+  `--control-fd` and `--control-pipe` cannot be passed together.
+- srt exits with an error instead of running the command when it cannot
+  open or connect to the channel it was given, so a dead channel never
+  passes for a live one. A channel that dies before it has delivered a
+  single update takes the command down with it — on Windows, terminating
+  the `srt-win.exe` broker closes its `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+  Job Object and tears down the entire sandboxed process tree. A channel
+  that dies after delivering an update reports the error and leaves the
+  command running under the config last applied.
 - A line that is not a valid config is reported on stderr and dropped; the
   previous config stays in force. The line itself goes to the debug log
   rather than to the terminal, and a blank line is ignored silently.
@@ -241,18 +254,19 @@ How srt reads the channel, and what it refuses:
   tree is long enough), so a rule the command must start under belongs in
   the settings file.
 - srt **exits with the wrapped command** and does not wait for the writer
-  to close the descriptor. End of input is not an error either: the
-  command keeps running under the config last applied.
-- Give srt a **dedicated, read-only end**. srt puts a pipe or socket into
-  non-blocking mode, and that flag lives on the open file description, so
-  anything else holding the same description — a shell's `exec 3<fifo`, a
-  `pass_fds` of a descriptor the parent goes on using — gets `EAGAIN` from
-  its own blocking reads from then on.
+  to close the descriptor or named pipe. End of input is not an error
+  either: the command keeps running under the config last applied.
+- On macOS and Linux, give srt a **dedicated, read-only end**. srt puts a
+  pipe or socket into non-blocking mode, and that flag lives on the open
+  file description, so anything else holding the same description — a
+  shell's `exec 3<fifo`, a `pass_fds` of a descriptor the parent goes on
+  using — gets `EAGAIN` from its own blocking reads from then on.
 - On macOS and Linux the sandboxed command does not get the descriptor: srt
   points that slot at `/dev/null` for the command, so nothing inside the
-  sandbox can read the updates or write a config of its own. On Windows the
-  command is spawned with the three standard streams alone, so the control
-  descriptor is not among the descriptors it is handed.
+  sandbox can read the updates or write a config of its own. On Windows,
+  create the named pipe with a DACL granting access **only to the host user
+  SID** (never `srt-sandbox` or `Everyone`) so the sandboxed process cannot
+  connect to the control pipe to drain or spoof updates.
 
 ### As a standalone proxy with an external decider: `srt proxy`
 
