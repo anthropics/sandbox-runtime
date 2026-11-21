@@ -55,6 +55,13 @@ pub const RESIDUAL_DENY_ONLY: &str = "deny-only-user-sid";
 /// under that shape was observed.
 pub const RESIDUAL_LOWERED_INTEGRITY_UNPROBED: &str = "lowered-integrity-unprobed";
 
+/// Residual: `wsl.exe --status` succeeded under the sandbox account,
+/// meaning the WSL service answers the sandboxed process. Traffic from
+/// a WSL distribution leaves outside the `srt-sandbox` SID and is not
+/// matched by the ALE connect filters unless WSL2 NAT forwarding is
+/// separately blocked (`srt-win install --block-wsl-nat`).
+pub const RESIDUAL_WSL_REACHABLE: &str = "wsl-reachable";
+
 const ANONYMOUS_SID: &str = "S-1-5-7";
 
 const IL_LOW: u32 = 0x1000;
@@ -152,14 +159,20 @@ pub struct Report {
     /// Own token, to the loopback target. Attempted exactly when
     /// loopback is open, where it must connect; else `Skipped`.
     pub open_loopback: Outcome,
+    /// Non-destructive `wsl.exe --status` probe under the sandbox token.
+    /// `Connected` means the WSL service answered (reported as the
+    /// [`RESIDUAL_WSL_REACHABLE`] residual); `Blocked` means access was
+    /// denied; `Skipped` means `wsl.exe` is absent on this host.
+    pub wsl_reachable: Outcome,
 }
 
 const BITS: u32 = 3;
 const MASK: u32 = (1 << BITS) - 1;
-const FIELDS: u32 = 9;
+const FIELDS: u32 = 10;
 /// Marks a runner exit code as an encoded [`Report`]: the bit just
-/// above the fields, so the runner's other exits (0, and 1 for its own
-/// error path) never decode.
+/// above the fields (bit 30 = `0x4000_0000`, keeping all encoded reports
+/// strictly positive in `i32` and disjoint from NTSTATUS codes), so the
+/// runner's other exits (0, and 1 for its own error path) never decode.
 const REPORT_BASE: u32 = 1 << (FIELDS * BITS);
 
 impl Report {
@@ -174,6 +187,7 @@ impl Report {
             self.untrusted_integrity,
             self.untrusted_integrity_loopback,
             self.open_loopback,
+            self.wsl_reachable,
         ]
     }
 
@@ -201,6 +215,7 @@ impl Report {
             untrusted_integrity: field(6)?,
             untrusted_integrity_loopback: field(7)?,
             open_loopback: field(8)?,
+            wsl_reachable: field(9)?,
         })
     }
 
@@ -217,6 +232,7 @@ impl Report {
             untrusted_integrity: Outcome::Skipped,
             untrusted_integrity_loopback: Outcome::Skipped,
             open_loopback: Outcome::Skipped,
+            wsl_reachable: Outcome::Skipped,
         }
     }
 
@@ -287,6 +303,9 @@ pub fn verdict(r: &Report, allow_loopback: bool) -> Verdict {
         }
         if lowered.iter().any(|(o, _)| *o == Outcome::Error) {
             residuals.push(RESIDUAL_LOWERED_INTEGRITY_UNPROBED);
+        }
+        if r.wsl_reachable.passed_fence() {
+            residuals.push(RESIDUAL_WSL_REACHABLE);
         }
     }
     Verdict { exit, residuals }
@@ -779,6 +798,106 @@ fn attempt(name: &str, id: Identity, target: &SocketAddr) -> Result<Outcome> {
     Ok(worst)
 }
 
+const WSL_PROBE_TIMEOUT_MS: u64 = 2000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const ERROR_ACCESS_DENIED_CODE: u32 = 5;
+const E_ACCESSDENIED_CODE: u32 = 0x8007_0005;
+
+fn classify_wsl_io_err(kind: std::io::ErrorKind) -> Outcome {
+    match kind {
+        std::io::ErrorKind::NotFound => Outcome::Skipped,
+        std::io::ErrorKind::PermissionDenied => Outcome::Blocked,
+        _ => Outcome::Error,
+    }
+}
+
+fn classify_wsl_exit(code: Option<i32>) -> Outcome {
+    match code {
+        Some(0) => Outcome::Connected,
+        Some(c) if c as u32 == ERROR_ACCESS_DENIED_CODE || c as u32 == E_ACCESSDENIED_CODE => {
+            Outcome::Blocked
+        }
+        _ => Outcome::Unreachable,
+    }
+}
+
+/// Non-destructive check of whether the sandboxed token can invoke
+/// `%SystemRoot%\System32\wsl.exe --status` and receive an answer from
+/// the WSL service without launching any distribution.
+fn probe_wsl_reachable() -> Outcome {
+    use std::os::windows::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let wsl_exe = root.join("System32").join("wsl.exe");
+
+    if let Err(e) = std::fs::metadata(&wsl_exe) {
+        let o = classify_wsl_io_err(e.kind());
+        eprintln!(
+            "srt-win: runner: egress probe [wsl]: {} (metadata {}: {e})",
+            o.label().to_uppercase(),
+            wsl_exe.display(),
+        );
+        return o;
+    }
+
+    let mut child = match Command::new(&wsl_exe)
+        .arg("--status")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let o = classify_wsl_io_err(e.kind());
+            eprintln!(
+                "srt-win: runner: egress probe [wsl]: {} (spawn {}: {e})",
+                o.label().to_uppercase(),
+                wsl_exe.display(),
+            );
+            return o;
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(WSL_PROBE_TIMEOUT_MS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let o = classify_wsl_exit(status.code());
+                eprintln!(
+                    "srt-win: runner: egress probe [wsl]: {} (wsl.exe --status exit {:?})",
+                    o.label().to_uppercase(),
+                    status.code(),
+                );
+                return o;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!(
+                        "srt-win: runner: egress probe [wsl]: UNREACHABLE (timed out after {WSL_PROBE_TIMEOUT_MS}ms)"
+                    );
+                    return Outcome::Unreachable;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("srt-win: runner: egress probe [wsl]: ERROR (wait: {e})");
+                return Outcome::Error;
+            }
+        }
+    }
+}
+
 /// Run the attempts; with no `anonymous_target` the off-loopback ones
 /// skip. The anonymous off-loopback one, which no filter refuses and
 /// which can wait on its destination, runs only with `anonymous_egress`.
@@ -850,6 +969,7 @@ pub fn run(
         } else {
             Outcome::Skipped
         },
+        wsl_reachable: probe_wsl_reachable(),
     })
 }
 
@@ -987,7 +1107,7 @@ pub fn parent_access() -> Result<ParentAccess> {
 mod tests {
     use super::*;
 
-    /// The four lowered-integrity attempts blocked, the rest as given.
+    /// The four lowered-integrity attempts blocked, WSL skipped, the rest as given.
     fn report(p: Outcome, a: Outcome, al: Outcome, d: Outcome) -> Report {
         Report {
             plain: p,
@@ -999,6 +1119,7 @@ mod tests {
             untrusted_integrity: Outcome::Blocked,
             untrusted_integrity_loopback: Outcome::Blocked,
             open_loopback: Outcome::Skipped,
+            wsl_reachable: Outcome::Skipped,
         }
     }
 
@@ -1086,8 +1207,10 @@ mod tests {
                 for al in Outcome::ALL {
                     for d in Outcome::ALL {
                         // Reordered, so every field sees every outcome
-                        // beside differing neighbours.
-                        let r = lowered(report(p, a, al, d), [d, al, a, p]);
+                        // beside differing neighbours, including wsl_reachable.
+                        let mut r = lowered(report(p, a, al, d), [d, al, a, p]);
+                        r.open_loopback = a;
+                        r.wsl_reachable = p;
                         assert_eq!(Report::decode(r.encode()), Some(r));
                     }
                 }
@@ -1331,5 +1454,50 @@ mod tests {
                 EXIT_INCONCLUSIVE
             );
         }
+    }
+
+    #[test]
+    fn verdict_wsl_reachable_is_a_residual_never_a_failure() {
+        for through in [Connected, Refused] {
+            let mut r = report(Blocked, Blocked, Blocked, Blocked);
+            r.wsl_reachable = through;
+            let v = closed(&r);
+            assert_eq!(v.exit, EXIT_FENCED);
+            assert_eq!(v.residuals, [RESIDUAL_WSL_REACHABLE]);
+        }
+        for other in [Blocked, Unreachable, Error, Skipped] {
+            let mut r = report(Blocked, Blocked, Blocked, Blocked);
+            r.wsl_reachable = other;
+            let v = closed(&r);
+            assert_eq!(v.exit, EXIT_FENCED, "{other:?}");
+            assert!(v.residuals.is_empty(), "{other:?}");
+        }
+        // When plain already failed, residuals stay empty.
+        let mut unfenced = report(Connected, Blocked, Blocked, Blocked);
+        unfenced.wsl_reachable = Connected;
+        let v = closed(&unfenced);
+        assert_eq!(v.exit, EXIT_NOT_FENCED);
+        assert!(v.residuals.is_empty());
+    }
+
+    #[test]
+    fn classify_wsl_outcomes() {
+        use std::io::ErrorKind;
+        assert_eq!(classify_wsl_io_err(ErrorKind::NotFound), Outcome::Skipped);
+        assert_eq!(
+            classify_wsl_io_err(ErrorKind::PermissionDenied),
+            Outcome::Blocked
+        );
+        assert_eq!(classify_wsl_io_err(ErrorKind::Other), Outcome::Error);
+
+        assert_eq!(classify_wsl_exit(Some(0)), Outcome::Connected);
+        assert_eq!(classify_wsl_exit(Some(5)), Outcome::Blocked);
+        assert_eq!(
+            classify_wsl_exit(Some(0x8007_0005_u32 as i32)),
+            Outcome::Blocked
+        );
+        assert_eq!(classify_wsl_exit(Some(1)), Outcome::Unreachable);
+        assert_eq!(classify_wsl_exit(Some(50)), Outcome::Unreachable);
+        assert_eq!(classify_wsl_exit(None), Outcome::Unreachable);
     }
 }

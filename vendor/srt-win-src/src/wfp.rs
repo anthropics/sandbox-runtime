@@ -71,11 +71,11 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_ACTION0, FWPM_ACTION0_0, FWPM_CONDITION_ALE_USER_ID, FWPM_CONDITION_IP_REMOTE_ADDRESS,
     FWPM_CONDITION_IP_REMOTE_PORT, FWPM_DISPLAY_DATA0, FWPM_FILTER_CONDITION0,
     FWPM_FILTER_ENUM_TEMPLATE0, FWPM_FILTER_FLAG_PERSISTENT, FWPM_FILTER0,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SUBLAYER_FLAG_PERSISTENT,
-    FWPM_SUBLAYER0, FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0,
-    FwpmFilterDeleteByKey0, FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0,
-    FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0,
-    FwpmTransactionCommit0,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_LAYER_IPFORWARD_V4,
+    FWPM_LAYER_IPFORWARD_V6, FWPM_SUBLAYER_FLAG_PERSISTENT, FWPM_SUBLAYER0, FwpmEngineClose0,
+    FwpmEngineOpen0, FwpmFilterAdd0, FwpmFilterCreateEnumHandle0, FwpmFilterDeleteByKey0,
+    FwpmFilterDestroyEnumHandle0, FwpmFilterEnum0, FwpmFreeMemory0, FwpmSubLayerAdd0,
+    FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0, FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -359,6 +359,10 @@ impl FilterTag {
 pub(crate) const KIND_PERMIT_PROXY: &str = "permit-loopback-user";
 pub(crate) const KIND_PERMIT_OPEN: &str = "permit-loopback-open";
 pub(crate) const KIND_BLOCK_USER: &str = "block-user";
+/// Opt-in `FWPM_LAYER_IPFORWARD_V4`/`_V6` BLOCK filter (`install --block-wsl-nat`)
+/// dropping forwarded packets (such as WSL2 / Hyper-V NAT guest egress)
+/// machine-wide.
+pub(crate) const KIND_BLOCK_WSL_NAT: &str = "block-wsl-nat";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilterShape {
@@ -407,9 +411,16 @@ pub(crate) fn filter_specs(proxy_range: (u16, u16), allow_loopback: bool) -> Vec
     specs
 }
 
-/// Number of filters in the set (one more per layer with loopback open).
-pub fn filter_count(allow_loopback: bool) -> usize {
+/// Number of filters in the set (one more per ALE connect layer with
+/// loopback open; two more at the IP forwarding layers when
+/// `block_wsl_nat` is enabled).
+pub fn filter_count(allow_loopback: bool, block_wsl_nat: bool) -> usize {
     ALE_LAYERS.len() * filter_specs(DEFAULT_PROXY_PORT_RANGE, allow_loopback).len()
+        + if block_wsl_nat {
+            FORWARD_LAYERS.len()
+        } else {
+            0
+        }
 }
 
 // Filter weights — kept below 2^60 so they stay in WFP's
@@ -428,7 +439,12 @@ const ALE_LAYERS: [(GUID, &str); 2] = [
     (FWPM_LAYER_ALE_AUTH_CONNECT_V6, "ale_auth_connect_v6"),
 ];
 
-/// Walk every filter at the two ALE connect layers under
+const FORWARD_LAYERS: [(GUID, &str); 2] = [
+    (FWPM_LAYER_IPFORWARD_V4, "ipforward_v4"),
+    (FWPM_LAYER_IPFORWARD_V6, "ipforward_v6"),
+];
+
+/// Walk every filter at the ALE connect and IP forwarding layers under
 /// `sublayer` that carries a parseable `srt-win` providerData tag,
 /// invoking `f(layer_name, filterKey, &tag)` for each. Owns the
 /// enum-handle and per-batch `FwpmFreeMemory0` lifecycle so callers
@@ -443,7 +459,7 @@ fn for_each_tagged_filter(
     sublayer: &GUID,
     mut f: impl FnMut(&'static str, GUID, &FilterTag),
 ) -> Result<()> {
-    for (layer, layer_name) in ALE_LAYERS {
+    for (layer, layer_name) in ALE_LAYERS.into_iter().chain(FORWARD_LAYERS) {
         let mut tmpl = FWPM_FILTER_ENUM_TEMPLATE0::default();
         tmpl.layerKey = layer;
         tmpl.enumType = FWP_FILTER_ENUM_OVERLAPPING;
@@ -627,6 +643,7 @@ pub fn install_filters(
     sandbox_user_sid: &str,
     port_range: (u16, u16),
     allow_loopback: bool,
+    block_wsl_nat: bool,
 ) -> Result<()> {
     debug_assert!(port_range.0 <= port_range.1);
     let specs = filter_specs(port_range, allow_loopback);
@@ -739,6 +756,29 @@ pub fn install_filters(
                 }
             }
         }
+        if block_wsl_nat {
+            // Opt-in machine-wide IP forwarding block (WSL2 / Hyper-V NAT
+            // guest egress). Host-originated connections are not routed
+            // through IPFORWARD and stay unaffected.
+            for (layer, label) in [
+                (FWPM_LAYER_IPFORWARD_V4, "v4"),
+                (FWPM_LAYER_IPFORWARD_V6, "v6"),
+            ] {
+                let name = format!("srt-win-{label}-{KIND_BLOCK_WSL_NAT}");
+                let mut tag =
+                    FilterTag::user(KIND_BLOCK_WSL_NAT, sandbox_user_sid, None).to_blob_bytes();
+                add_filter(
+                    engine.h(),
+                    sublayer,
+                    layer,
+                    &name,
+                    W_BLOCK,
+                    FWP_ACTION_BLOCK,
+                    &mut [],
+                    &mut tag,
+                )?;
+            }
+        }
         Ok(())
     })
 }
@@ -782,6 +822,11 @@ pub struct WfpStatus {
     /// Whether the set opens loopback: read from the filters when
     /// elevated, else from the install record.
     pub allow_loopback: bool,
+    /// Whether the opt-in `FWPM_LAYER_IPFORWARD_V4`/`_V6` filters
+    /// blocking WSL2 / Hyper-V NAT forwarding are installed under this
+    /// sublayer (read from the filters when elevated; `false` on
+    /// `cannot-read`).
+    pub block_wsl_nat: bool,
     /// [`open_loopback_notice`], present exactly when `allow_loopback`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loopback_notice: Option<String>,
@@ -833,12 +878,32 @@ pub fn loopback_closed_hint() -> String {
         .to_string()
 }
 
+/// What to say when `--block-wsl-nat` is installed, so operators know
+/// its machine-wide scope.
+pub fn wsl_nat_block_notice() -> String {
+    "WSL2 NAT egress guard is active: WFP IPFORWARD filters block IPv4 \
+     and IPv6 packet forwarding machine-wide (WSL2, Hyper-V, and Docker \
+     NAT guests cannot reach the network while installed; host-originated \
+     traffic is unaffected). Re-run `srt-win install --force` without \
+     `--block-wsl-nat` to remove those filters."
+        .to_string()
+}
+
 /// Whether the enumerated set opens loopback: the open-loopback PERMIT
 /// on EVERY connect layer. One layer alone reads as closed.
 pub(crate) fn tags_open_loopback(tags: &[(&str, FilterTag)]) -> bool {
     ALE_LAYERS.iter().all(|(_, layer)| {
         tags.iter()
             .any(|(l, t)| l == layer && t.kind == KIND_PERMIT_OPEN)
+    })
+}
+
+/// Whether the enumerated set carries the WSL2 NAT forwarding BLOCK
+/// on EVERY IP forwarding layer (both v4 and v6).
+pub(crate) fn tags_block_wsl_nat(tags: &[(&str, FilterTag)]) -> bool {
+    FORWARD_LAYERS.iter().all(|(_, layer)| {
+        tags.iter()
+            .any(|(l, t)| l == layer && t.kind == KIND_BLOCK_WSL_NAT)
     })
 }
 
@@ -902,6 +967,7 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
         filters: tags.len(),
         port_range,
         allow_loopback: tags_open_loopback(&tags),
+        block_wsl_nat: tags_block_wsl_nat(&tags),
         loopback_notice: None,
         user_sid,
         hint: None,
@@ -914,6 +980,7 @@ fn cannot_read(e: anyhow::Error) -> WfpStatus {
         filters: 0,
         port_range: None,
         allow_loopback: false,
+        block_wsl_nat: false,
         loopback_notice: None,
         user_sid: None,
         hint: Some(format!(
@@ -1028,7 +1095,8 @@ mod tests {
         assert_eq!(specs[0].port_range(), Some((60080, 60089)));
         assert_eq!(specs[1].shape, FilterShape::BlockUser);
         assert_eq!(specs[1].port_range(), None);
-        assert_eq!(filter_count(false), 4);
+        assert_eq!(filter_count(false, false), 4);
+        assert_eq!(filter_count(false, true), 6);
     }
 
     #[test]
@@ -1039,7 +1107,8 @@ mod tests {
             open.iter().map(|s| s.kind).collect::<Vec<_>>(),
             ["permit-loopback-user", "permit-loopback-open", "block-user"]
         );
-        assert_eq!(filter_count(true), 6);
+        assert_eq!(filter_count(true, false), 6);
+        assert_eq!(filter_count(true, true), 8);
         let added = open[1];
         assert_eq!(added.shape, FilterShape::PermitLoopbackOpen);
         assert_eq!(added.weight, W_LOOPBACK);
@@ -1146,10 +1215,27 @@ mod tests {
             filters: 0,
             port_range: None,
             allow_loopback: false,
+            block_wsl_nat: false,
             loopback_notice: None,
             user_sid: None,
             hint: None,
         }
+    }
+
+    #[test]
+    fn wsl_nat_block_requires_both_forward_layers() {
+        let (v4, v6) = (FORWARD_LAYERS[0].1, FORWARD_LAYERS[1].1);
+        let mut set = enumerated(&[]);
+        assert!(!tags_block_wsl_nat(&set));
+        set.push((v4, tag(KIND_BLOCK_WSL_NAT)));
+        assert!(!tags_block_wsl_nat(&set));
+        set.push((v6, tag(KIND_BLOCK_WSL_NAT)));
+        assert!(tags_block_wsl_nat(&set));
+        // Round-trips the block-wsl-nat FilterTag JSON cleanly.
+        let t = tag(KIND_BLOCK_WSL_NAT);
+        let back: FilterTag = serde_json::from_slice(&t.to_blob_bytes()).unwrap();
+        assert_eq!(back, t);
+        assert!(wsl_nat_block_notice().contains("IPFORWARD"));
     }
 
     #[test]
