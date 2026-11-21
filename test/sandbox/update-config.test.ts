@@ -120,6 +120,66 @@ describe('proxy auth + network deny semantics', () => {
     )
   })
 
+  it('preserves and reloads deniedResolvedAddressReasons across updateConfig()', async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: [],
+        deniedResolvedAddresses: ['10.0.0.0/8'],
+        deniedResolvedAddressReasons: {
+          '10.0.0.0/8': 'Initial private-network reason.',
+        },
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    expect(
+      SandboxManager.getConfig()?.network.deniedResolvedAddressReasons,
+    ).toEqual({
+      '10.0.0.0/8': 'Initial private-network reason.',
+    })
+
+    SandboxManager.updateConfig({
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: [],
+        deniedResolvedAddresses: ['10.0.0.0/8', 'fc00::/7'],
+        deniedResolvedAddressReasons: {
+          '10.0.0.0/8': 'Updated IPv4 private reason.',
+          'fc00::/7': 'Updated IPv6 ULA reason.',
+        },
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    expect(
+      SandboxManager.getConfig()?.network.deniedResolvedAddressReasons,
+    ).toEqual({
+      '10.0.0.0/8': 'Updated IPv4 private reason.',
+      'fc00::/7': 'Updated IPv6 ULA reason.',
+    })
+
+    // A malformed range throws before swapping config, leaving the previous
+    // deniedResolvedAddressReasons intact.
+    expect(() =>
+      SandboxManager.updateConfig({
+        network: {
+          allowedDomains: ['example.com'],
+          deniedDomains: [],
+          deniedResolvedAddresses: ['not-a-cidr/99'],
+          deniedResolvedAddressReasons: {
+            'not-a-cidr/99': 'should not take effect',
+          },
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      }),
+    ).toThrow(/Invalid IP address or CIDR range/)
+    expect(
+      SandboxManager.getConfig()?.network.deniedResolvedAddressReasons,
+    ).toEqual({
+      '10.0.0.0/8': 'Updated IPv4 private reason.',
+      'fc00::/7': 'Updated IPv6 ULA reason.',
+    })
+  })
+
   it('a deniedDomains entry spelled like a member of Object.prototype has the reason written for it, or the generic one', async () => {
     const names = ['constructor', 'valueOf', '__proto__', 'hasOwnProperty']
     await SandboxManager.initialize({

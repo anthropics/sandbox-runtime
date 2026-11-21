@@ -85,6 +85,7 @@ export type ProxyOnlyOptions = {
   lifeline?: Readable
   stripResponseHeaders?: string[]
   deniedResolvedAddresses?: string[]
+  deniedResolvedAddressReasons?: Readonly<Record<string, string>>
   /** Let allow verdicts set headers on plain-HTTP requests (cleartext). Default off. */
   plaintextHeaderSet?: boolean
   /** Where credential classes' values go (first match wins; default Bearer). */
@@ -116,6 +117,7 @@ export function startProxyOnly(opts: ProxyOnlyOptions): ProxyOnly {
   let guard = createResolvedAddressGuard({
     deniedResolvedAddresses:
       opts.deniedResolvedAddresses ?? DEFAULT_DENIED_RESOLVED_ADDRESSES,
+    deniedResolvedAddressReasons: opts.deniedResolvedAddressReasons,
   })
 
   let closing: Promise<void> | undefined
@@ -229,6 +231,7 @@ export function startProxyOnly(opts: ProxyOnlyOptions): ProxyOnly {
       deniedDomains: denied,
       deniedResolvedAddresses:
         opts.deniedResolvedAddresses ?? DEFAULT_DENIED_RESOLVED_ADDRESSES,
+      deniedResolvedAddressReasons: opts.deniedResolvedAddressReasons,
     })
     await new Promise<void>((resolve, reject) => {
       listener.once('error', reject)

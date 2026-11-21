@@ -1,5 +1,6 @@
 import { connect, createServer as createTcpServer } from 'node:net'
 import type { AddressInfo, Server as TcpServer, Socket } from 'node:net'
+import { connect as tlsConnect } from 'node:tls'
 import { createServer as createHttpServer } from 'node:http'
 import type { Server as HttpServer } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
@@ -23,6 +24,11 @@ import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { type DirectLookup } from '../../src/sandbox/parent-proxy.js'
 import { createSocksProxyServer } from '../../src/sandbox/socks-proxy.js'
 import { SandboxRuntimeConfigSchema } from '../../src/sandbox/sandbox-config.js'
+import {
+  SandboxViolationStore,
+  shouldIgnoreViolation,
+} from '../../src/sandbox/sandbox-violation-store.js'
+import { loadConfigFromString } from '../../src/utils/config-loader.js'
 import { createMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 
@@ -465,6 +471,235 @@ describe('resolved-address-guard: lookup', () => {
     )
   })
 
+  it('uses deniedResolvedAddressReasons for matching entries without leaking the resolved IP', async () => {
+    const privateReason =
+      'Private network addresses are blocked. Ask your administrator to open the address.'
+    const resolve = fakeResolver({
+      'intranet.example.com': ['10.20.30.40'],
+      'ula.example.com': ['fd12:3456::1'],
+      'mapped.example.com': ['::ffff:10.20.30.40'],
+      'nat64.example.com': ['64:ff9b::a14:1e28'],
+      'unmapped.example.com': ['172.16.5.4'],
+    })
+    const guard = createResolvedAddressGuard({
+      resolve,
+      localAddresses,
+      deniedResolvedAddresses: ['10.0.0.0/8', 'fc00::/7', '172.16.0.0/12'],
+      deniedResolvedAddressReasons: {
+        '10.0.0.0/8': privateReason,
+        'fc00::/7': privateReason,
+        // Key with no matching deniedResolvedAddresses entry never fires.
+        '192.168.0.0/16': 'unused reason',
+      },
+    })
+
+    for (const [host, expectedAddr] of [
+      ['intranet.example.com', '10.20.30.40'],
+      ['ula.example.com', 'fd12:3456::1'],
+      ['mapped.example.com', '::ffff:10.20.30.40'],
+      ['nat64.example.com', '64:ff9b::a14:1e28'],
+    ] as const) {
+      const err = (await lookupAll(guard, host).catch(
+        e => e,
+      )) as ResolvedAddressDeniedError
+      expect(err).toBeInstanceOf(ResolvedAddressDeniedError)
+      expect(err.reason).toBe(privateReason)
+      expect(err.message).toBe(
+        `Connection to ${host} blocked: ${privateReason}`,
+      )
+      expect(err.message).not.toContain(expectedAddr)
+      expect(err.addresses).toEqual([expectedAddr])
+    }
+
+    const unmapped = (await lookupAll(guard, 'unmapped.example.com').catch(
+      e => e,
+    )) as ResolvedAddressDeniedError
+    expect(unmapped.reason).toBe('resolved to a listed address')
+  })
+
+  it('first-match-wins in deniedResolvedAddresses list order for overlapping ranges', async () => {
+    const resolve = fakeResolver({
+      'sub.example.com': ['10.20.1.5'],
+      'other.example.com': ['10.99.1.5'],
+    })
+    // Specific range first: gets its own reason; broader range handles the rest.
+    const specificFirst = createResolvedAddressGuard({
+      resolve,
+      localAddresses,
+      deniedResolvedAddresses: ['10.20.0.0/16', '10.0.0.0/8'],
+      deniedResolvedAddressReasons: {
+        '10.20.0.0/16': 'Database subnet is blocked.',
+        '10.0.0.0/8': 'Private 10/8 network is blocked.',
+      },
+    })
+    const subErr = (await lookupAll(specificFirst, 'sub.example.com').catch(
+      e => e,
+    )) as ResolvedAddressDeniedError
+    const otherErr = (await lookupAll(specificFirst, 'other.example.com').catch(
+      e => e,
+    )) as ResolvedAddressDeniedError
+    expect(subErr.reason).toBe('Database subnet is blocked.')
+    expect(otherErr.reason).toBe('Private 10/8 network is blocked.')
+
+    // First matching entry with no reason wins and uses the generic fallback
+    // rather than falling through to a later overlapping entry's reason.
+    const unmappedFirst = createResolvedAddressGuard({
+      resolve,
+      localAddresses,
+      deniedResolvedAddresses: ['10.20.0.0/16', '10.0.0.0/8'],
+      deniedResolvedAddressReasons: {
+        '10.0.0.0/8': 'Private 10/8 network is blocked.',
+      },
+    })
+    const fallbackErr = (await lookupAll(
+      unmappedFirst,
+      'sub.example.com',
+    ).catch(e => e)) as ResolvedAddressDeniedError
+    expect(fallbackErr.reason).toBe('resolved to a listed address')
+  })
+
+  it('keeps built-in class priority ahead of deniedResolvedAddressReasons', async () => {
+    const resolve = fakeResolver({
+      'loop.example.com': ['127.0.0.1'],
+      'meta.example.com': ['169.254.169.254'],
+      'denylit.example.com': ['10.0.0.5'],
+    })
+    const guard = createResolvedAddressGuard({
+      resolve,
+      localAddresses,
+      deniedDomains: ['10.0.0.5'],
+      deniedResolvedAddresses: ['127.0.0.0/8', '169.254.0.0/16', '10.0.0.0/8'],
+      deniedResolvedAddressReasons: {
+        '127.0.0.0/8': 'custom loopback',
+        '169.254.0.0/16': 'custom link-local',
+        '10.0.0.0/8': 'custom private',
+      },
+    })
+    const reasonFor = (host: string) =>
+      lookupAll(guard, host).then(
+        () => 'permitted',
+        e => (e as ResolvedAddressDeniedError).reason,
+      )
+    expect(await reasonFor('loop.example.com')).toBe(
+      'resolved to a loopback address',
+    )
+    expect(await reasonFor('meta.example.com')).toBe(
+      'resolved to a link-local address',
+    )
+    expect(await reasonFor('denylit.example.com')).toBe(
+      'resolved to a deny-listed address',
+    )
+  })
+
+  it('orders and deduplicates multi-address reasons by config order, not resolver order', async () => {
+    const shared = 'Private network addresses are blocked.'
+    const makeGuard = (
+      addrs: string[],
+      reasons: Record<string, string>,
+      deniedResolvedAddresses = ['10.0.0.0/8', 'fc00::/7', '172.16.0.0/12'],
+    ) =>
+      createResolvedAddressGuard({
+        resolve: fakeResolver({ 'multi.example.com': addrs }),
+        localAddresses,
+        deniedResolvedAddresses,
+        deniedResolvedAddressReasons: reasons,
+      })
+
+    const reasonOf = (g: ResolvedAddressGuard) =>
+      lookupAll(g, 'multi.example.com').then(
+        () => 'permitted',
+        e => (e as ResolvedAddressDeniedError).reason,
+      )
+
+    // Same reason on both matched entries -> emitted once regardless of DNS order.
+    const sameReasons = { '10.0.0.0/8': shared, 'fc00::/7': shared }
+    expect(
+      await reasonOf(makeGuard(['10.1.2.3', 'fd00::1'], sameReasons)),
+    ).toBe(shared)
+    expect(
+      await reasonOf(makeGuard(['fd00::1', '10.1.2.3'], sameReasons)),
+    ).toBe(shared)
+
+    // Distinct reasons -> joined in configured deniedResolvedAddresses order.
+    const distinctReasons = {
+      '10.0.0.0/8': 'IPv4 private blocked.',
+      'fc00::/7': 'IPv6 ULA blocked.',
+    }
+    expect(
+      await reasonOf(makeGuard(['10.1.2.3', 'fd00::1'], distinctReasons)),
+    ).toBe('IPv4 private blocked. / IPv6 ULA blocked.')
+    expect(
+      await reasonOf(makeGuard(['fd00::1', '10.1.2.3'], distinctReasons)),
+    ).toBe('IPv4 private blocked. / IPv6 ULA blocked.')
+
+    // Mixed built-in before listed, listed (custom + unmapped), and built-in after listed.
+    const partialReasons = { '10.0.0.0/8': 'IPv4 private blocked.' }
+    expect(
+      await reasonOf(makeGuard(['10.1.2.3', '127.0.0.1'], partialReasons)),
+    ).toBe('resolved to a loopback address / IPv4 private blocked.')
+    expect(
+      await reasonOf(makeGuard(['192.168.7.23', '10.1.2.3'], partialReasons)),
+    ).toBe("IPv4 private blocked. / resolved to one of this host's addresses")
+    expect(
+      await reasonOf(makeGuard(['172.16.0.1', '10.1.2.3'], partialReasons)),
+    ).toBe('IPv4 private blocked. / resolved to a listed address')
+  })
+
+  it('reads deniedResolvedAddressReasons own keys only and falls back on empty or non-string values', async () => {
+    const resolve = fakeResolver({ 'intranet.example.com': ['10.1.2.3'] })
+
+    // Inherited prototype property must not be read.
+    const inherited = Object.create({
+      '10.0.0.0/8': 'inherited from prototype',
+    }) as Record<string, string>
+    const gInherited = createResolvedAddressGuard({
+      resolve,
+      localAddresses,
+      deniedResolvedAddresses: ['10.0.0.0/8'],
+      deniedResolvedAddressReasons: inherited,
+    })
+    const errInherited = (await lookupAll(
+      gInherited,
+      'intranet.example.com',
+    ).catch(e => e)) as ResolvedAddressDeniedError
+    expect(errInherited.reason).toBe('resolved to a listed address')
+
+    // Null-prototype object with own key works.
+    const nullProto = Object.assign(
+      Object.create(null) as Record<string, string>,
+      {
+        '10.0.0.0/8': 'null-proto own reason',
+      },
+    )
+    const gNullProto = createResolvedAddressGuard({
+      resolve,
+      localAddresses,
+      deniedResolvedAddresses: ['10.0.0.0/8'],
+      deniedResolvedAddressReasons: nullProto,
+    })
+    const errNullProto = (await lookupAll(
+      gNullProto,
+      'intranet.example.com',
+    ).catch(e => e)) as ResolvedAddressDeniedError
+    expect(errNullProto.reason).toBe('null-proto own reason')
+
+    // Empty, whitespace-only, or undefined/null values from untyped JS callers fall back.
+    for (const bad of ['', '   ', undefined, null]) {
+      const gBad = createResolvedAddressGuard({
+        resolve,
+        localAddresses,
+        deniedResolvedAddresses: ['10.0.0.0/8'],
+        deniedResolvedAddressReasons: {
+          '10.0.0.0/8': bad as unknown as string,
+        },
+      })
+      const errBad = (await lookupAll(gBad, 'intranet.example.com').catch(
+        e => e,
+      )) as ResolvedAddressDeniedError
+      expect(errBad.reason).toBe('resolved to a listed address')
+    }
+  })
+
   it('returns only the surviving addresses, in resolver order', async () => {
     const resolve = fakeResolver({
       'mixed.example.com': ['169.254.169.254', '2001:db8::5', '192.0.2.10'],
@@ -528,6 +763,40 @@ describe('resolved-address-guard: config schema', () => {
       },
     })
     expect(r.success).toBe(true)
+  })
+
+  it('accepts deniedResolvedAddressReasons and parses them via loadConfigFromString', () => {
+    const cfg = {
+      ...base,
+      network: {
+        ...base.network,
+        deniedResolvedAddresses: ['10.0.0.0/8', 'fc00::/7'],
+        deniedResolvedAddressReasons: {
+          '10.0.0.0/8':
+            'Private network addresses are blocked. Ask your administrator to open the address.',
+          'fc00::/7':
+            'Private network addresses are blocked. Ask your administrator to open the address.',
+        },
+      },
+    }
+    const r = SandboxRuntimeConfigSchema.safeParse(cfg)
+    expect(r.success).toBe(true)
+    const fromControlFd = loadConfigFromString(JSON.stringify(cfg))
+    expect(fromControlFd?.network.deniedResolvedAddressReasons).toEqual(
+      cfg.network.deniedResolvedAddressReasons,
+    )
+  })
+
+  it('rejects empty string values in deniedResolvedAddressReasons', () => {
+    const r = SandboxRuntimeConfigSchema.safeParse({
+      ...base,
+      network: {
+        ...base.network,
+        deniedResolvedAddresses: ['10.0.0.0/8'],
+        deniedResolvedAddressReasons: { '10.0.0.0/8': '' },
+      },
+    })
+    expect(r.success).toBe(false)
   })
 
   it('rejects a malformed range with a pointed message', () => {
@@ -782,6 +1051,72 @@ describe('resolved-address-guard: through the proxy servers', () => {
     expect(denials[0]?.reason).toBe('resolved to a listed address')
   })
 
+  it('plain HTTP and violation store: deniedResolvedAddressReasons reaches the 403 body and violation line without the IP', async () => {
+    const reason =
+      'Private network addresses are blocked. Ask your administrator to open the address.'
+    const store = new SandboxViolationStore()
+    const guard = createResolvedAddressGuard({
+      resolve: fakeResolver({ 'intranet.example.com': ['10.20.30.40'] }),
+      deniedResolvedAddresses: ['10.0.0.0/8'],
+      deniedResolvedAddressReasons: { '10.0.0.0/8': reason },
+    })
+    const proxyPort = await startHttpProxy(guard)
+    const resp = await rawExchange(
+      proxyPort,
+      `GET http://intranet.example.com/ HTTP/1.1\r\nHost: intranet.example.com\r\nConnection: close\r\n\r\n`,
+    )
+    expect(resp.startsWith('HTTP/1.1 403')).toBe(true)
+    expect(resp).toContain('X-Proxy-Error: blocked-by-sandbox-runtime')
+    expect(resp).toContain(
+      `Connection to intranet.example.com blocked: ${reason}`,
+    )
+    expect(resp).not.toContain('10.20.30.40')
+    expect(denials[0]?.reason).toBe(reason)
+
+    const line = `deny network-outbound intranet.example.com:80 (${denials[0]!.reason})`
+    store.addViolation({ line, timestamp: new Date() })
+    expect(store.getViolations()[0]?.line).toBe(line)
+    // Custom reason stops matching generic "resolved to a listed address" but still matches host/prefix/custom text.
+    expect(
+      shouldIgnoreViolation(line, 'curl', {
+        '*': ['resolved to a listed address'],
+      }),
+    ).toBe(false)
+    expect(
+      shouldIgnoreViolation(line, 'curl', {
+        '*': ['deny network-outbound intranet.example.com:80 ('],
+      }),
+    ).toBe(true)
+    expect(
+      shouldIgnoreViolation(line, 'curl', {
+        '*': ['Private network addresses are blocked'],
+      }),
+    ).toBe(true)
+  })
+
+  it('CONNECT: surfaces deniedResolvedAddressReasons as the 403 status phrase (sanitized ASCII) and body', async () => {
+    const reason = 'Private LAN — ask admin'
+    const proxyPort = await startHttpProxy(
+      createResolvedAddressGuard({
+        resolve: fakeResolver({ 'intranet.example.com': ['10.20.30.40'] }),
+        deniedResolvedAddresses: ['10.0.0.0/8'],
+        deniedResolvedAddressReasons: { '10.0.0.0/8': reason },
+      }),
+    )
+    const resp = await rawExchange(
+      proxyPort,
+      `CONNECT intranet.example.com:443 HTTP/1.1\r\nHost: intranet.example.com:443\r\n\r\n`,
+    )
+    const utf8 = Buffer.from(resp, 'latin1').toString('utf8')
+    expect(utf8).toStartWith('HTTP/1.1 403 Private LAN ? ask admin\r\n')
+    expect(utf8).toContain('X-Proxy-Error: blocked-by-sandbox-runtime')
+    expect(utf8).toEndWith(
+      `\r\n\r\nConnection to intranet.example.com blocked: ${reason}`,
+    )
+    expect(utf8).not.toContain('10.20.30.40')
+    expect(denials[0]?.reason).toBe(reason)
+  })
+
   it('CONNECT: allow-listed name resolving to loopback gets 403 instead of a tunnel', async () => {
     const proxyPort = await startHttpProxy()
     const resp = await rawExchange(
@@ -891,6 +1226,31 @@ describe('resolved-address-guard: through the proxy servers', () => {
         host: 'rebind.example.com',
         port: upstreamPort,
         reason: 'resolved to a loopback address',
+      },
+    ])
+  })
+
+  it('SOCKS: records deniedResolvedAddressReasons when a listed range blocks the dial', async () => {
+    const reason = 'Private network addresses are blocked.'
+    const socksPort = await startSocks(
+      createResolvedAddressGuard({
+        resolve: fakeResolver({ 'intranet.example.com': ['10.20.30.40'] }),
+        deniedResolvedAddresses: ['10.0.0.0/8'],
+        deniedResolvedAddressReasons: { '10.0.0.0/8': reason },
+      }),
+    )
+    const { rep, sock } = await socksConnect(socksPort, {
+      type: 'domain',
+      host: 'intranet.example.com',
+      port: upstreamPort,
+    })
+    sock.destroy()
+    expect(rep).toBe(0x02)
+    expect(denials).toEqual([
+      {
+        host: 'intranet.example.com',
+        port: upstreamPort,
+        reason,
       },
     ])
   })
@@ -1057,6 +1417,49 @@ describe('resolved-address-guard: TLS-terminated upstream leg', () => {
         host: UP_HOST,
         port: upstreamPort,
         reason: 'resolved to a loopback address',
+      },
+    ])
+  })
+
+  it('hostname resolving to a listed range surfaces deniedResolvedAddressReasons in the terminated 403', async () => {
+    const reason = 'Private network addresses are blocked.'
+    const proxyPort = await startTerminatingProxy(
+      createResolvedAddressGuard({
+        resolve: fakeResolver({ [UP_HOST]: ['10.20.30.40'] }),
+        deniedResolvedAddresses: ['10.0.0.0/8'],
+        deniedResolvedAddressReasons: { '10.0.0.0/8': reason },
+      }),
+    )
+    const sock = connect({ host: '127.0.0.1', port: proxyPort })
+    await once(sock, 'connect')
+    sock.write(
+      `CONNECT ${UP_HOST}:${upstreamPort} HTTP/1.1\r\nHost: ${UP_HOST}:${upstreamPort}\r\n\r\n`,
+    )
+    const [established] = (await once(sock, 'data')) as [Buffer]
+    expect(established.toString('latin1')).toContain(
+      '200 Connection Established',
+    )
+    const tlsSock = tlsConnect({
+      socket: sock,
+      servername: UP_HOST,
+      ca: CA_PEM,
+    })
+    await once(tlsSock, 'secureConnect')
+    tlsSock.write(
+      `GET /secret HTTP/1.1\r\nHost: ${UP_HOST}:${upstreamPort}\r\nConnection: close\r\n\r\n`,
+    )
+    let out = ''
+    tlsSock.setEncoding('utf8').on('data', c => (out += c))
+    await once(tlsSock, 'close')
+    expect(out).toContain('HTTP/1.1 403')
+    expect(out).toContain(`Connection to ${UP_HOST} blocked: ${reason}`)
+    expect(out).not.toContain('10.20.30.40')
+    expect(out).not.toContain('tls-upstream-ok')
+    expect(denials).toEqual([
+      {
+        host: UP_HOST,
+        port: upstreamPort,
+        reason,
       },
     ])
   })
