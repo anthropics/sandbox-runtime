@@ -75,15 +75,21 @@ const DENIED_CLASSES: ReadonlyArray<readonly [string, readonly string[]]> = [
   ['a cloud metadata address', CLOUD_METADATA_ADDRESSES],
 ]
 
-/** Refusal classes in priority order, so a multi-address reason reads the same however the resolver ordered its answer. */
-const REASON_ORDER: readonly string[] = [
+/** Built-in refusal classes ahead of embedder-configured `deniedResolvedAddresses`. */
+const BUILTIN_REASONS_BEFORE_LISTED: readonly string[] = [
   'a deny-listed address',
   ...DENIED_CLASSES.map(([why]) => why),
-  'a listed address',
+]
+
+/** Built-in refusal classes after embedder-configured `deniedResolvedAddresses`. */
+const BUILTIN_REASONS_AFTER_LISTED: readonly string[] = [
   "one of this host's addresses",
   'a non-loopback address',
   'an unparsable address',
 ]
+
+/** Default class for a `deniedResolvedAddresses` entry with no custom reason. */
+const LISTED_ADDRESS_CLASS = 'a listed address'
 
 /** Unicast addresses currently assigned to this host's network interfaces. */
 export function localInterfaceAddresses(): string[] {
@@ -149,6 +155,12 @@ export interface ResolvedAddressGuardOptions {
   deniedDomains?: readonly string[]
   /** IPs / CIDRs denied in addition to the built-in {@link DENIED_CLASSES} and this host's own addresses. */
   deniedResolvedAddresses?: readonly string[]
+  /**
+   * Optional refusal reason keyed by the exact `deniedResolvedAddresses` entry
+   * string (own keys only). Entries without a non-empty reason fall back to
+   * the generic `"resolved to a listed address"` class.
+   */
+  deniedResolvedAddressReasons?: Readonly<Record<string, string>>
   /** Name resolver; defaults to `dns.lookup`. Test seam. */
   resolve?: Resolver
   /** This host's interface addresses; defaults to {@link localInterfaceAddresses}, read per lookup. Test seam. */
@@ -196,17 +208,73 @@ function inRuleSet(set: RuleSet, address: string, port: number): boolean {
   )
 }
 
+type DenialMatch =
+  | { kind: 'builtin'; text: string }
+  | { kind: 'listed'; index: number; custom?: string }
+
+type ReasonItem = { isCustom: boolean; text: string }
+
+/**
+ * Own keys only, mirroring `deniedDomainReasons`: inherited prototype
+ * properties and empty/blank or non-string values fall back to the generic
+ * class.
+ */
+function listedAddressReason(
+  reasons: Readonly<Record<string, string>> | undefined,
+  entry: string,
+): string | undefined {
+  if (!reasons || !Object.prototype.hasOwnProperty.call(reasons, entry)) {
+    return undefined
+  }
+  const value: unknown = reasons[entry]
+  return typeof value === 'string' && value.trim().length > 0
+    ? value
+    : undefined
+}
+
+/**
+ * Format an ordered, deduplicated list of denial reasons. Contiguous runs of
+ * built-in classes share one `resolved to ` prefix (preserving built-in
+ * refusal wording); embedder-authored reasons stand as written.
+ */
+function formatDenialReasons(items: readonly ReasonItem[]): string {
+  const parts: string[] = []
+  let builtinRun: string[] = []
+  const flushBuiltins = (): void => {
+    if (builtinRun.length > 0) {
+      parts.push(`resolved to ${builtinRun.join(' / ')}`)
+      builtinRun = []
+    }
+  }
+  for (const item of items) {
+    if (item.isCustom) {
+      flushBuiltins()
+      parts.push(item.text)
+    } else {
+      builtinRun.push(item.text)
+    }
+  }
+  flushBuiltins()
+  return parts.join(' / ')
+}
+
 export function createResolvedAddressGuard(
   opts: ResolvedAddressGuardOptions = {},
 ): ResolvedAddressGuard {
   const refused = buildRuleSet(ipLiteralRules(opts.deniedDomains ?? []))
   const allowed = buildRuleSet(ipLiteralRules(opts.allowedDomains ?? []))
-  const denied: Array<readonly [string, RuleSet]> = [
-    ...DENIED_CLASSES.map(
-      ([why, ranges]) => [why, buildRuleSet(ranges)] as const,
-    ),
-    ['a listed address', buildRuleSet(opts.deniedResolvedAddresses ?? [])],
-  ]
+  const builtinDenied: Array<readonly [string, RuleSet]> = DENIED_CLASSES.map(
+    ([why, ranges]) => [why, buildRuleSet(ranges)] as const,
+  )
+  // One RuleSet per configured entry, checked in config order (first match
+  // wins for overlapping ranges), so each entry carries its optional reason.
+  const listedDenied = (opts.deniedResolvedAddresses ?? []).map(
+    (entry, index) => ({
+      index,
+      set: buildRuleSet([entry]),
+      custom: listedAddressReason(opts.deniedResolvedAddressReasons, entry),
+    }),
+  )
   const resolve: Resolver = opts.resolve ?? dnsLookup
   /** This host's addresses right now; a malformed entry from the seam is skipped. */
   const localSet = (): BlockList => {
@@ -223,9 +291,11 @@ export function createResolvedAddressGuard(
     address: string,
     port: number,
     local: BlockList,
-  ): string | undefined => {
+  ): DenialMatch | undefined => {
     if (isIP(hostname)) return undefined
-    if (!isIP(address)) return 'an unparsable address'
+    if (!isIP(address)) {
+      return { kind: 'builtin', text: 'an unparsable address' }
+    }
     // A NAT64 / 6to4 / IPv4-compatible answer is delivered to the IPv4
     // address it carries, so every deny is applied to that address too. The
     // carried form only ADDS denials: it never earns an allow-list carve-out
@@ -237,18 +307,27 @@ export function createResolvedAddressGuard(
     const denies = (set: RuleSet) =>
       inRuleSet(set, address, port) ||
       (v4 !== undefined && inRuleSet(set, v4, port))
-    if (denies(refused)) return 'a deny-listed address'
+    if (denies(refused)) {
+      return { kind: 'builtin', text: 'a deny-listed address' }
+    }
     if (inRuleSet(allowed, address, port)) return undefined
     if (isLoopbackName(hostname)) {
-      return isLoopbackAddress(address) ? undefined : 'a non-loopback address'
+      return isLoopbackAddress(address)
+        ? undefined
+        : { kind: 'builtin', text: 'a non-loopback address' }
     }
-    const why = denied.find(([, set]) => denies(set))?.[0]
-    if (why) return why
+    const builtin = builtinDenied.find(([, set]) => denies(set))?.[0]
+    if (builtin) return { kind: 'builtin', text: builtin }
+    const listed = listedDenied.find(({ set }) => denies(set))
+    if (listed) {
+      return { kind: 'listed', index: listed.index, custom: listed.custom }
+    }
     if (
       addressInSet(local, address) ||
       (v4 !== undefined && addressInSet(local, v4))
-    )
-      return "one of this host's addresses"
+    ) {
+      return { kind: 'builtin', text: "one of this host's addresses" }
+    }
     return undefined
   }
 
@@ -263,22 +342,45 @@ export function createResolvedAddressGuard(
         const local = localSet()
         const kept: LookupAddress[] = []
         const dropped: string[] = []
-        const whys = new Set<string>()
+        const builtinWhys = new Set<string>()
+        const listedMatches = new Map<number, string | undefined>()
         for (const a of addresses) {
-          const why = denial(hostname, a.address, port, local)
-          if (why === undefined) kept.push(a)
+          const match = denial(hostname, a.address, port, local)
+          if (match === undefined) kept.push(a)
           else {
             dropped.push(a.address)
-            whys.add(why)
+            if (match.kind === 'builtin') {
+              builtinWhys.add(match.text)
+            } else {
+              listedMatches.set(match.index, match.custom)
+            }
           }
         }
-        // Order the classes by the built-in priority, not by the order the
-        // resolver happened to return the addresses, so the reason (which
+        // Order built-in classes by fixed priority and embedder-listed matches
+        // by config order (not resolver order), so the reason (which
         // `ignoreViolations` matches by substring) is stable.
-        const classes = REASON_ORDER.filter(w => whys.has(w))
+        const ordered: ReasonItem[] = []
+        for (const why of BUILTIN_REASONS_BEFORE_LISTED) {
+          if (builtinWhys.has(why)) ordered.push({ isCustom: false, text: why })
+        }
+        const seenListed = new Set<string>()
+        for (const [, custom] of [...listedMatches.entries()].sort(
+          ([a], [b]) => a - b,
+        )) {
+          const isCustom = custom !== undefined
+          const text = isCustom ? custom : LISTED_ADDRESS_CLASS
+          const dedupKey = `${isCustom ? 'c' : 'b'}:${text}`
+          if (!seenListed.has(dedupKey)) {
+            seenListed.add(dedupKey)
+            ordered.push({ isCustom, text })
+          }
+        }
+        for (const why of BUILTIN_REASONS_AFTER_LISTED) {
+          if (builtinWhys.has(why)) ordered.push({ isCustom: false, text: why })
+        }
         if (dropped.length) {
           logForDebugging(
-            `Denied address(es) for ${hostname}:${port}: ${dropped.join(', ')} (${classes.join('; ')})`,
+            `Denied address(es) for ${hostname}:${port}: ${dropped.join(', ')} (${ordered.map(o => o.text).join('; ')})`,
           )
         }
         const first = kept[0]
@@ -287,7 +389,7 @@ export function createResolvedAddressGuard(
           const none: NodeJS.ErrnoException = dropped.length
             ? new ResolvedAddressDeniedError(
                 hostname,
-                `resolved to ${classes.join(' / ')}`,
+                formatDenialReasons(ordered),
                 dropped,
               )
             : Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), {

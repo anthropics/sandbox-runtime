@@ -711,6 +711,15 @@ export const NetworkConfigSchema = z.object({
         'resolve to a denied address only if that IP literal (and port) is itself in allowedDomains. Not evaluated ' +
         'for connections routed through parentProxy (including one taken from HTTP_PROXY/HTTPS_PROXY) or mitmProxy (that hop resolves the name).',
     ),
+  deniedResolvedAddressReasons: z
+    .record(z.string(), z.string().min(1))
+    .optional()
+    .describe(
+      'Optional model-facing reason keyed by the exact deniedResolvedAddresses entry it explains ' +
+        '(e.g., {"10.0.0.0/8": "Private network addresses are blocked. Ask your administrator to open the address."}). ' +
+        'Reported in the <sandbox_violations> line and 403 refusal (body and CONNECT status phrase) when a hostname resolves only to denied addresses matching that entry; entries without one use the generic reason ("resolved to a listed address"). ' +
+        'Keys are matched by exact entry string (own keys only), so a key with no matching deniedResolvedAddresses entry never fires.',
+    ),
   allowUnixSockets: z
     .array(z.string())
     .optional()
