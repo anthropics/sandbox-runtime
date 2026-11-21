@@ -1,12 +1,24 @@
 #!/usr/bin/env node
 import pkg from '../package.json' with { type: 'json' }
 import { quote } from './utils/shell-quote.js'
-import { Command, InvalidArgumentError } from 'commander'
+import { Command } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
+import type { Decider, DeciderHello } from './sandbox/decider-client.js'
 import { spawn, type ChildProcess } from 'child_process'
 import { logForDebugging } from './utils/debug.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
+import {
+  applyDeciderHelloToConfig,
+  assertDeciderCompatibleConfig,
+  buildSandboxedStdio,
+  connectCliDecider,
+  openDeciderFdStreams,
+  parseDeciderTimeoutMs,
+  parseInheritedFd,
+  resolveCliDeciderSpec,
+  type ResolvedCliDeciderSpec,
+} from './utils/cli-decider.js'
 import * as readline from 'readline'
 import * as fs from 'fs'
 import * as net from 'net'
@@ -123,54 +135,6 @@ function openControlFd(fd: number): NodeJS.ReadableStream {
     }
   }
   return fs.createReadStream('', { fd })
-}
-
-/**
- * Parse --control-fd: an integer descriptor number >= 3.
- */
-function parseControlFd(value: string): number {
-  // Number() alone would also take '0x10', '3e0' and ' 5 '.
-  if (!/^\d+$/.test(value) || Number(value) < 3) {
-    throw new InvalidArgumentError(
-      'must be an integer file descriptor >= 3 (0-2 are stdin, stdout and stderr).',
-    )
-  }
-  return Number(value)
-}
-
-/**
- * stdio for the sandboxed command: the three standard streams, plus
- * /dev/null over the control fd's slot, so nothing inside the sandbox can
- * read the channel that carries the policy confining it.
- *
- * The displacement is what matters on Linux. On macOS libuv spawns through
- * posix_spawn with POSIX_SPAWN_CLOEXEC_DEFAULT, which already keeps every
- * descriptor the caller did not list out of the child.
- */
-function sandboxedStdio(
-  controlFd: number | undefined,
-): Array<'inherit' | 'ignore' | number> {
-  const stdio: Array<'inherit' | 'ignore' | number> = [
-    'inherit',
-    'inherit',
-    'inherit',
-  ]
-  if (controlFd === undefined) {
-    return stdio
-  }
-  // 'ignore' past fd 2 leaves a slot as it is rather than closing it, so the
-  // control fd's slot needs a descriptor of its own to displace it with.
-  while (stdio.length < controlFd) {
-    stdio.push('ignore')
-  }
-  // Only close-on-exec keeps an inherited descriptor out of an exec'd
-  // command, and uv_disable_stdio_inheritance() stops at the first closed
-  // number above 15, so `--control-fd 20` with 16-19 closed leaves the
-  // channel live in the sandbox. Displacing the slot covers every kind of
-  // descriptor, which re-opening the fd privately does not: a unix socket
-  // cannot be re-opened through /proc/self/fd at all (ENXIO).
-  stdio.push(fs.openSync('/dev/null', 'r'))
-  return stdio
 }
 
 async function main(): Promise<void> {
@@ -353,7 +317,28 @@ async function main(): Promise<void> {
       '--control-fd <fd>',
       'read config updates from an inherited file descriptor >= 3 (JSON lines ' +
         'protocol; give srt a dedicated read-only end — see the README)',
-      parseControlFd,
+      parseInheritedFd,
+    )
+    .option(
+      '--decider-fd <fd>',
+      'bidirectional inherited socket (>= 3) to an external v1 request decider ' +
+        '(same protocol as srt-proxy — see docs/srt-proxy.md)',
+      parseInheritedFd,
+    )
+    .option(
+      '--decider-in <fd>',
+      'inherited descriptor (>= 3) for decider -> srt frames (use with --decider-out)',
+      parseInheritedFd,
+    )
+    .option(
+      '--decider-out <fd>',
+      'inherited descriptor (>= 3) for srt -> decider frames (use with --decider-in)',
+      parseInheritedFd,
+    )
+    .option(
+      '--decider-timeout-ms <ms>',
+      'per-verdict timeout in milliseconds for the external decider (default: 5000)',
+      parseDeciderTimeoutMs,
     )
     .allowUnknownOption()
     .action(
@@ -364,6 +349,10 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          deciderFd?: number
+          deciderIn?: number
+          deciderOut?: number
+          deciderTimeoutMs?: number
         },
       ) => {
         try {
@@ -432,12 +421,33 @@ async function main(): Promise<void> {
           }
 
           // The wrapped command, once it exists: a control channel that
-          // dies before it delivers anything takes it down with it.
+          // dies before it delivers anything, or an external decider that
+          // disconnects or violates the protocol, takes it down with it.
           let child: Pick<ChildProcess, 'kill'> | undefined
           let controlChannelFailed = false
+          let deciderFailed = false
           let receivedAnyLine = false
           let controlErrorReported = false
           const controlFd = options.controlFd
+
+          let deciderSpec: ResolvedCliDeciderSpec | undefined
+          try {
+            deciderSpec = resolveCliDeciderSpec({
+              deciderFd: options.deciderFd,
+              deciderIn: options.deciderIn,
+              deciderOut: options.deciderOut,
+              deciderTimeoutMs: options.deciderTimeoutMs,
+              controlFd,
+            })
+            if (deciderSpec !== undefined) {
+              assertDeciderCompatibleConfig(runtimeConfig)
+            }
+          } catch (err) {
+            console.error(
+              `Error: ${err instanceof Error ? err.message : String(err)}`,
+            )
+            process.exit(1)
+          }
 
           function onControlError(err: Error): void {
             // Attached both to the stream and to the reader: the stream is
@@ -495,6 +505,69 @@ async function main(): Promise<void> {
             controlStream.on('error', onControlError)
           }
 
+          // Connect to the external decider and complete its v1 hello
+          // handshake before initialize() starts the proxy or builds any OS
+          // sandbox state, failing closed if the decider cannot be reached.
+          let activeDecider:
+            | { decider: Decider; hello: DeciderHello }
+            | undefined
+          if (deciderSpec !== undefined) {
+            let deciderStreams: ReturnType<typeof openDeciderFdStreams>
+            try {
+              deciderStreams = openDeciderFdStreams(deciderSpec)
+            } catch (err) {
+              console.error(
+                `Error: external decider descriptor is not usable: ` +
+                  `${err instanceof Error ? err.message : String(err)}. ` +
+                  'Refusing to run the command without the external decider it asks for.',
+              )
+              process.exit(1)
+            }
+            try {
+              activeDecider = await connectCliDecider({
+                streams: deciderStreams,
+                timeoutMs: deciderSpec.timeoutMs,
+                onDead: why => {
+                  if (deciderFailed) {
+                    return
+                  }
+                  deciderFailed = true
+                  console.error(
+                    `Error: external decider disconnected (${why}). Terminating sandboxed command.`,
+                  )
+                  if (child === undefined) {
+                    process.exit(1)
+                  }
+                  child.kill('SIGTERM')
+                  setTimeout(
+                    () => child?.kill('SIGKILL'),
+                    KILL_GRACE_MS,
+                  ).unref()
+                },
+              })
+            } catch (err) {
+              console.error(
+                `Error: external decider failed during startup: ` +
+                  `${err instanceof Error ? err.message : String(err)}. ` +
+                  'Refusing to run the command without the external decider it asks for.',
+              )
+              process.exit(1)
+            }
+            runtimeConfig = applyDeciderHelloToConfig(
+              runtimeConfig,
+              activeDecider.hello,
+              activeDecider.decider.filterRequest,
+            )
+            logForDebugging(
+              `Connected external decider (allowedDomains=${activeDecider.hello.allowedDomains.length}, deniedDomains=${activeDecider.hello.deniedDomains.length})`,
+            )
+            if (runtimeConfig.network.tlsTerminate === undefined) {
+              logForDebugging(
+                'External decider connected without network.tlsTerminate: plain HTTP requests will be filtered, while HTTPS CONNECT tunnels remain opaque unless network.tlsTerminate is configured in settings.',
+              )
+            }
+          }
+
           // Until there is a child to pass an interrupt on to, it stops the
           // run. The library's own handlers, which initialize() installs, only
           // clean up: left to them the command would be run all the same.
@@ -538,7 +611,22 @@ async function main(): Promise<void> {
                 logForDebugging(
                   `Config updated from control fd: ${JSON.stringify(newConfig)}`,
                 )
-                SandboxManager.updateConfig(newConfig)
+                const effectiveConfig = activeDecider
+                  ? {
+                      ...newConfig,
+                      network: {
+                        ...newConfig.network,
+                        deniedDomains: Array.from(
+                          new Set([
+                            ...newConfig.network.deniedDomains,
+                            ...activeDecider.hello.deniedDomains,
+                          ]),
+                        ),
+                        filterRequest: activeDecider.decider.filterRequest,
+                      },
+                    }
+                  : newConfig
+                SandboxManager.updateConfig(effectiveConfig)
               } else if (line.trim()) {
                 // The caller has to learn its update was dropped whether
                 // or not it runs srt with --debug; the line itself stays
@@ -559,9 +647,10 @@ async function main(): Promise<void> {
             logForDebugging(`Listening for config updates on fd ${controlFd}`)
           }
 
-          // Cleanup control reader on exit
+          // Cleanup control reader and external decider on exit
           process.on('exit', () => {
             controlReader?.close()
+            activeDecider?.decider.close()
           })
 
           // Determine command string based on mode
@@ -600,10 +689,12 @@ async function main(): Promise<void> {
             // On Linux, bwrap creates empty files on the host when protecting
             // non-existent deny paths. This removes them.
             SandboxManager.cleanupAfterCommand()
+            activeDecider?.decider.close()
 
-            if (controlChannelFailed) {
-              // srt killed the command over a dead control channel, so the
-              // status it died with is not the run's result.
+            if (controlChannelFailed || deciderFailed) {
+              // srt killed the command over a dead control channel or
+              // external decider, so the status it died with is not the run's
+              // result.
               process.exit(1)
             }
 
@@ -707,9 +798,13 @@ async function main(): Promise<void> {
               interrupted.signal,
             )
             aboutToSpawn()
+            const displacedFds = [
+              ...(controlFd !== undefined ? [controlFd] : []),
+              ...(deciderSpec?.fds ?? []),
+            ]
             const spawned = spawn(sandboxedCommand, {
               shell: true,
-              stdio: sandboxedStdio(controlFd),
+              stdio: buildSandboxedStdio(displacedFds),
             })
             child = spawned
             spawned.on('exit', onCommandExit)
