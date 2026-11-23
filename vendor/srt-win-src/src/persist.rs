@@ -479,17 +479,104 @@ fn root_row(conn: &Connection, canon: &str) -> Result<Option<(FileId, String)>> 
         .transpose()
 }
 
-/// The longest of `roots` that is `canon` or a directory above it.
-pub fn covering_root<'a>(roots: &'a [String], canon: &str) -> Option<&'a str> {
+fn is_at_or_under(root: &str, canon: &str) -> bool {
+    canon == root
+        || (canon.starts_with(root)
+            && (root.ends_with('\\') || canon.as_bytes().get(root.len()) == Some(&b'\\')))
+}
+
+/// Those of `roots` that are `canon` or a directory above it.
+fn covering_roots<'a>(roots: &'a [String], canon: &str) -> impl Iterator<Item = &'a str> {
     roots
         .iter()
         .map(String::as_str)
-        .filter(|r| {
-            canon == *r
-                || (canon.starts_with(r)
-                    && (r.ends_with('\\') || canon.as_bytes().get(r.len()) == Some(&b'\\')))
-        })
+        .filter(move |r| is_at_or_under(r, canon))
+}
+
+/// The longest of `roots` that is `canon` or a directory above it.
+pub fn covering_root<'a>(roots: &'a [String], canon: &str) -> Option<&'a str> {
+    covering_roots(roots, canon).max_by_key(|r| r.len())
+}
+
+/// The longest of `roots` strictly above `canon` (never `canon` itself).
+/// Used to attribute intermediate `DenyDelete` pins to the root whose
+/// inherited write grant would otherwise permit renaming `canon`.
+fn strict_covering_root<'a>(roots: &'a [String], canon: &str) -> Option<&'a str> {
+    covering_roots(roots, canon)
+        .filter(|r| r.len() < canon.len())
         .max_by_key(|r| r.len())
+}
+
+/// What keeps the NAME of each of `denies` denied. A deny is on the object,
+/// so a directory above it that is renamed aside takes it along and leaves
+/// the name free to be made anew. Each intermediate directory is kept in
+/// place up to the outermost covering root in `roots`: a session that holds
+/// an outer root could otherwise move an inner root (and any kept denies
+/// beneath it) aside.
+fn pins(roots: &[String], denies: &[(String, SbAce)]) -> Vec<(String, SbAce)> {
+    let mut out: Vec<(String, SbAce)> = Vec::new();
+    for (canon, ace) in denies {
+        if !matches!(ace, SbAce::Deny(_)) {
+            continue;
+        }
+        let Some(outermost) = covering_roots(roots, canon).min_by_key(|r| r.len()) else {
+            continue;
+        };
+        for dir in path_id::dirs_between(outermost, canon) {
+            if !out.iter().any(|(d, _)| d.as_str() == dir.as_str()) {
+                out.push((dir, SbAce::DenyDelete));
+            }
+        }
+    }
+    out
+}
+
+/// Already-kept `kind = 'deny'` targets strictly under any root in `roots`
+/// whose on-disk object still matches its recorded file id. Re-pinning them
+/// when a wider enclosing root is added in a later session ensures that
+/// sessions holding the outer root cannot rename an inner root or
+/// intermediate directory aside to bypass an earlier kept deny.
+fn existing_denies_under(
+    conn: &Connection,
+    roots: &[String],
+    current: &[(String, SbAce)],
+) -> Result<Vec<(String, SbAce)>> {
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut s = conn.prepare(
+        "SELECT canonical_path, mask, file_id FROM persistent_denies WHERE kind = 'deny'",
+    )?;
+    let rows = s.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (canon, mask, id_bytes) = row?;
+        if !roots
+            .iter()
+            .any(|r| canon.len() > r.len() && is_at_or_under(r, &canon))
+        {
+            continue;
+        }
+        if current
+            .iter()
+            .any(|(d, a)| d.as_str() == canon.as_str() && matches!(a, SbAce::Deny(_)))
+        {
+            continue;
+        }
+        if let Ok(id) = FileId::from_bytes(&id_bytes)
+            && at_path(&canon, &id).ok() == Some(AtPath::Recorded)
+            && let Ok(ace) = SbAce::parse("deny", &mask)
+        {
+            out.push((canon, ace));
+        }
+    }
+    Ok(out)
 }
 
 /// The ACEs `canon` (now the object `cur`) is to carry, from the
@@ -726,16 +813,76 @@ fn is_settled(
     }
 }
 
+struct ReparentDeny {
+    path: String,
+    kind: String,
+    new_root: String,
+}
+
+struct DropDeny {
+    path: String,
+    kind: String,
+    file_id: Vec<u8>,
+}
+
+/// Partition `persistent_denies` rows currently attributed to `canon` into
+/// those still covered by another kept root (re-parented to that root so
+/// forgetting an inner root never un-denies targets under an enclosing
+/// root) and those no remaining root covers (deleted and stripped).
+fn partition_denies_for_forget(
+    conn: &Connection,
+    canon: &str,
+) -> Result<(Vec<ReparentDeny>, Vec<DropDeny>)> {
+    let remaining_roots: Vec<String> = all_root_paths(conn)?
+        .into_iter()
+        .filter(|r| r != canon)
+        .collect();
+    let rows: Vec<(String, String, Vec<u8>)> = {
+        let mut s = conn.prepare(
+            "SELECT canonical_path, kind, file_id FROM persistent_denies WHERE root = ?1",
+        )?;
+        let mapped = s.query_map(params![canon], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        mapped.collect::<rusqlite::Result<_>>()?
+    };
+    let mut reparent = Vec::new();
+    let mut drop_denies = Vec::new();
+    for (path, kind, file_id) in rows {
+        let next_root = match kind.as_str() {
+            // An intermediate DenyDelete pin is only needed while a
+            // remaining root strictly encloses `path`.
+            "deny_delete" => strict_covering_root(&remaining_roots, &path),
+            _ => covering_root(&remaining_roots, &path),
+        };
+        if let Some(outer) = next_root {
+            reparent.push(ReparentDeny {
+                path,
+                kind,
+                new_root: outer.to_owned(),
+            });
+        } else {
+            drop_denies.push(DropDeny {
+                path,
+                kind,
+                file_id,
+            });
+        }
+    }
+    Ok((reparent, drop_denies))
+}
+
 /// Put on record, outside any transaction, that the strip of `root` and
-/// of the deny targets kept with it has begun. A strip that is killed
-/// mid-walk then reads as unfinished and is walked again.
+/// of the deny targets that will be removed with it has begun. A strip
+/// that is killed mid-walk then reads as unfinished and is walked again.
 fn mark_strip_begun(conn: &Connection, root: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE persistent_writes SET done = 0 WHERE canonical_path = ?1 \
-         OR canonical_path IN (SELECT canonical_path FROM persistent_denies WHERE root = ?1)",
-        params![root],
-    )
-    .context("record the strip as begun")?;
+    let (_, drop_denies) = partition_denies_for_forget(conn, root)?;
+    let mut s =
+        conn.prepare_cached("UPDATE persistent_writes SET done = 0 WHERE canonical_path = ?1")?;
+    s.execute(params![root])
+        .context("record the strip as begun")?;
+    for d in &drop_denies {
+        s.execute(params![d.path])
+            .context("record the strip as begun")?;
+    }
     Ok(())
 }
 
@@ -975,6 +1122,13 @@ pub fn apply(
         touch(root);
     }
     let all_roots = all_root_paths(conn)?;
+    let existing_denies = existing_denies_under(conn, roots, denies)?;
+    let mut pin_targets = pins(&all_roots, denies);
+    for (dir, ace) in pins(&all_roots, &existing_denies) {
+        if !pin_targets.iter().any(|(d, _)| d.as_str() == dir.as_str()) {
+            pin_targets.push((dir, ace));
+        }
+    }
     let mut per_session = Vec::new();
     for (canon, ace) in denies {
         let Some(root) = covering_root(&all_roots, canon) else {
@@ -986,6 +1140,17 @@ pub fn apply(
         if matches!(ace, SbAce::Deny(_) | SbAce::DenyDelete)
             && let Some(parent) = path_id::canonical_parent_of(canon)
         {
+            record_deny(conn, &parent, SbAce::DenyFdc, root)?;
+            touch(&parent);
+        }
+    }
+    for (canon, ace) in &pin_targets {
+        let Some(root) = strict_covering_root(&all_roots, canon) else {
+            continue;
+        };
+        record_deny(conn, canon, *ace, root)?;
+        touch(canon);
+        if let Some(parent) = path_id::canonical_parent_of(canon) {
             record_deny(conn, &parent, SbAce::DenyFdc, root)?;
             touch(&parent);
         }
@@ -1180,17 +1345,19 @@ fn forget_one_with(
     // writes back if the process is killed, the object's DACL stays.
     mark_strip_begun(conn, canon)?;
     let tx = conn.unchecked_transaction().context("begin forget tx")?;
-    let denies: Vec<(String, Vec<u8>)> = {
-        let mut s = tx.prepare(
-            "SELECT DISTINCT canonical_path, file_id FROM persistent_denies WHERE root = ?1",
+    let (reparent, drop_denies) = partition_denies_for_forget(&tx, canon)?;
+    for r in &reparent {
+        tx.execute(
+            "UPDATE persistent_denies SET root = ?1 WHERE canonical_path = ?2 AND kind = ?3",
+            params![r.new_root, r.path, r.kind],
         )?;
-        let rows = s.query_map(params![canon], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    tx.execute(
-        "DELETE FROM persistent_denies WHERE root = ?1",
-        params![canon],
-    )?;
+    }
+    for d in &drop_denies {
+        tx.execute(
+            "DELETE FROM persistent_denies WHERE canonical_path = ?1 AND kind = ?2",
+            params![d.path, d.kind],
+        )?;
+    }
     tx.execute(
         "DELETE FROM persistent_roots WHERE canonical_path = ?1",
         params![canon],
@@ -1202,11 +1369,13 @@ fn forget_one_with(
     let mut pending: Vec<PendingStrip> = Vec::new();
     let mut recorded: Vec<(String, FileId)> =
         granted.iter().map(|id| (canon.to_owned(), *id)).collect();
-    recorded.extend(
-        denies
-            .iter()
-            .filter_map(|(d, id)| Some((d.clone(), FileId::from_bytes(id).ok()?))),
-    );
+    for d in &drop_denies {
+        if let Ok(fid) = FileId::from_bytes(&d.file_id)
+            && !recorded.iter().any(|(p, i)| p == &d.path && *i == fid)
+        {
+            recorded.push((d.path.clone(), fid));
+        }
+    }
     // Whatever is at a recorded path now carries nothing of ours any
     // more, whichever object it is.
     let mut stripped_here: Vec<&str> = Vec::new();
@@ -1959,6 +2128,153 @@ mod tests {
         // A sibling whose name merely starts with a root's name.
         assert_eq!(c(r"\\?\C:\ab"), None);
         assert_eq!(c(r"\\?\C:\"), None);
+    }
+
+    #[test]
+    fn strict_covering_root_excludes_the_path_itself() {
+        let roots = vec![r"\\?\C:\a".to_owned(), r"\\?\C:\a\b".to_owned()];
+        let s = |p: &str| strict_covering_root(&roots, p);
+        assert_eq!(s(r"\\?\C:\a"), None);
+        assert_eq!(s(r"\\?\C:\a\b"), Some(r"\\?\C:\a"));
+        assert_eq!(s(r"\\?\C:\a\b\.git"), Some(r"\\?\C:\a\b"));
+        assert_eq!(s(r"\\?\C:\ab"), None);
+    }
+
+    #[test]
+    fn pins_reach_the_outermost_root() {
+        let roots = vec![r"\\?\C:\a".to_owned(), r"\\?\C:\a\b\c".to_owned()];
+        let deny = |p: &str| (p.to_owned(), SbAce::Deny(acl::DenyMask::WriteDeny));
+        assert_eq!(
+            pins(
+                &roots,
+                &[
+                    deny(r"\\?\C:\a\b\c\.git\hooks"),
+                    deny(r"\\?\C:\a\b\c\.git\config"),
+                ]
+            ),
+            [r"\\?\C:\a\b\c\.git", r"\\?\C:\a\b\c", r"\\?\C:\a\b"]
+                .map(|dir| (dir.to_owned(), SbAce::DenyDelete)),
+        );
+        // Right under a root, under none, and what is no deny of an object.
+        let none = [
+            deny(r"\\?\C:\a\f"),
+            deny(r"\\?\C:\x\y\f"),
+            (r"\\?\C:\a\b\f".to_owned(), SbAce::DenyFdc),
+        ];
+        assert!(pins(&roots, &none).is_empty());
+    }
+
+    #[test]
+    fn forget_partitions_nested_root_denies_in_either_order() {
+        let seed = || {
+            let conn = crate::state_db::open_memory_db_for_tests();
+            let id = [9u8; 24];
+            let r1 = r"\\?\C:\a";
+            let r2 = r"\\?\C:\a\b\c";
+            let mid = r"\\?\C:\a\b";
+            let git = r"\\?\C:\a\b\c\.git";
+            let hooks = r"\\?\C:\a\b\c\.git\hooks";
+            for (r, cap) in [
+                (r1, "S-1-0-1936880739-1-1-1-1"),
+                (r2, "S-1-0-1936880739-2-2-2-2"),
+            ] {
+                conn.execute(
+                    "INSERT INTO persistent_roots (canonical_path, file_id, capability_sid) \
+                     VALUES (?1, ?2, ?3)",
+                    params![r, id.as_slice(), cap],
+                )
+                .unwrap();
+            }
+            for p in [r1, mid, r2, git, hooks] {
+                conn.execute(
+                    "INSERT INTO persistent_writes (canonical_path, file_id, spec, done) \
+                     VALUES (?1, ?2, 'spec', 1)",
+                    params![p, id.as_slice()],
+                )
+                .unwrap();
+            }
+            for (p, kind, mask, root) in [
+                (hooks, "deny", "denyWrite", r2),
+                (git, "deny_fdc", "fdc", r2),
+                (git, "deny_delete", "delete", r2),
+                (r2, "deny_fdc", "fdc", r2),
+                (r2, "deny_delete", "delete", r1),
+                (mid, "deny_fdc", "fdc", r1),
+                (mid, "deny_delete", "delete", r1),
+                (r1, "deny_fdc", "fdc", r1),
+            ] {
+                conn.execute(
+                    "INSERT INTO persistent_denies (canonical_path, kind, file_id, mask, root) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![p, kind, id.as_slice(), mask, root],
+                )
+                .unwrap();
+            }
+            (conn, r1, mid, r2, git, hooks)
+        };
+
+        // Order 1: forgetting inner root `r2` while `r1` stays re-parents all of
+        // `r2`'s denies/pins to `r1` and marks only `r2` unfinished.
+        {
+            let (conn, r1, mid, r2, git, hooks) = seed();
+            let (reparent, drop) = partition_denies_for_forget(&conn, r2).unwrap();
+            assert!(drop.is_empty());
+            let reparent_keys: Vec<(&str, &str, &str)> = reparent
+                .iter()
+                .map(|r| (r.path.as_str(), r.kind.as_str(), r.new_root.as_str()))
+                .collect();
+            assert_eq!(reparent_keys.len(), 4);
+            assert!(reparent_keys.contains(&(hooks, "deny", r1)));
+            assert!(reparent_keys.contains(&(git, "deny_fdc", r1)));
+            assert!(reparent_keys.contains(&(git, "deny_delete", r1)));
+            assert!(reparent_keys.contains(&(r2, "deny_fdc", r1)));
+
+            mark_strip_begun(&conn, r2).unwrap();
+            let done = |p: &str| -> i64 {
+                conn.query_row(
+                    "SELECT done FROM persistent_writes WHERE canonical_path = ?1",
+                    params![p],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                (done(r1), done(mid), done(r2), done(git), done(hooks)),
+                (1, 1, 0, 1, 1)
+            );
+        }
+
+        // Order 2: forgetting outer root `r1` while `r2` stays drops `r1`'s pins
+        // (including `r2`'s `deny_delete`, which no longer has an enclosing root)
+        // while leaving `r2`'s own denies/pins untouched.
+        {
+            let (conn, r1, mid, r2, git, hooks) = seed();
+            let (reparent, drop) = partition_denies_for_forget(&conn, r1).unwrap();
+            assert!(reparent.is_empty());
+            let drop_keys: Vec<(&str, &str)> = drop
+                .iter()
+                .map(|d| (d.path.as_str(), d.kind.as_str()))
+                .collect();
+            assert_eq!(drop_keys.len(), 4);
+            assert!(drop_keys.contains(&(r2, "deny_delete")));
+            assert!(drop_keys.contains(&(mid, "deny_fdc")));
+            assert!(drop_keys.contains(&(mid, "deny_delete")));
+            assert!(drop_keys.contains(&(r1, "deny_fdc")));
+
+            mark_strip_begun(&conn, r1).unwrap();
+            let done = |p: &str| -> i64 {
+                conn.query_row(
+                    "SELECT done FROM persistent_writes WHERE canonical_path = ?1",
+                    params![p],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                (done(r1), done(mid), done(r2), done(git), done(hooks)),
+                (0, 0, 0, 1, 1)
+            );
+        }
     }
 
     fn marker_with(ever_enabled: bool, roots: &[&str]) -> Marker {

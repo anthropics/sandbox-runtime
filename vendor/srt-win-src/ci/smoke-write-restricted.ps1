@@ -1,4 +1,4 @@
-<#
+﻿<#
   Smoke test for the write-restricted child token (`srt-win exec
   --write-restricted-token`). Rows (option ON unless noted):
     A  group-held write access is denied (allowed with the option off)
@@ -739,6 +739,92 @@ const n=require('net');const p=String.raw`\\.\pipe\NAME`;let t=0;(function go(){
   $t = Try-Denied 'P4-AFTER'
   if ($t.bad.Count -eq 0) { Ok 'P4: the deny targets still hold in the next session, with zero DACL writes at its start' }
   else { Fail "P4: in the next session: $($t.bad -join '; '). raw: $($t.raw)" }
+
+  # ── P4b: intermediate directories above a kept deny are pinned ───
+  # Regression for #840: renaming `.git` (or an inner kept root) aside
+  # would otherwise bypass a kept deny beneath it.
+  End-Session
+  $pp = New-AclDir 'pp' @('(A;;0x1200a9;;;BU)')
+  $ppBase = Dacl $pp
+  $ppSub = Join-Path $pp 'sub'
+  $ppGit = Join-Path $ppSub '.git'
+  $ppHooks = Join-Path $ppGit 'hooks'
+  $ppHook = Join-Path $ppHooks 'pre-commit'
+  New-Item -ItemType Directory -Path $ppHooks -Force | Out-Null
+  'HOOK' | Set-Content -Encoding ASCII $ppHook
+  $g = Grant-P @($ppSub) @($ppHooks)
+  if ($g.exit -ne 0) { Fail "P4b: inner-root grant failed (exit=$($g.exit))" }
+  else {
+    $line = "ren `"$ppGit`" .git.bak & rmdir /s /q `"$ppGit`" & echo P4B-HIT>> `"$ppHook`" & echo P4B-WORK> `"$ppSub\work.txt`" & echo P4B-NOTE> `"$ppGit\note.txt`""
+    $r = SbRoots @($ppSub) @($cmd, '/d', '/s', '/c', $line)
+    $bad = @()
+    if (-not (Test-Path -LiteralPath $ppGit)) { $bad += '.git was moved or deleted' }
+    if (Test-Path -LiteralPath (Join-Path $ppSub '.git.bak')) { $bad += '.git renamed to .git.bak' }
+    if (-not (Test-Path -LiteralPath $ppHook) -or (Get-Content -Raw $ppHook) -match 'P4B-HIT') { $bad += 'hook was modified or deleted' }
+    if (-not (Test-Path -LiteralPath "$ppSub\work.txt")) { $bad += 'sibling in inner root not writable' }
+    if (-not (Test-Path -LiteralPath "$ppGit\note.txt")) { $bad += 'non-denied file inside pinned .git not writable' }
+    if ($bad.Count -eq 0) { Ok 'P4b: .git above a kept deny cannot be renamed or removed while siblings and non-denied children stay writable' }
+    else { Fail "P4b (single root): $($bad -join '; '). raw: $($r.raw)" }
+
+    # Grant enclosing outer root later with NO denies passed: existing kept
+    # denies beneath it must re-pin the inner root up to the outer root.
+    End-Session
+    $gOuter = Grant-P @($pp)
+    if ($gOuter.exit -ne 0) { Fail "P4b: outer-root grant failed (exit=$($gOuter.exit))" }
+    else {
+      $line2 = "ren `"$ppSub`" sub.bak & ren `"$ppGit`" .git.bak & echo P4B-OUTER>> `"$ppHook`""
+      $r2 = SbRoots @($pp) @($cmd, '/d', '/s', '/c', $line2)
+      $bad2 = @()
+      if (-not (Test-Path -LiteralPath $ppSub) -or (Test-Path -LiteralPath (Join-Path $pp 'sub.bak'))) { $bad2 += 'inner root was renamed aside from outer root' }
+      if (-not (Test-Path -LiteralPath $ppGit) -or (Test-Path -LiteralPath (Join-Path $ppSub '.git.bak'))) { $bad2 += '.git was renamed aside from outer root' }
+      if (-not (Test-Path -LiteralPath $ppHook) -or (Get-Content -Raw $ppHook) -match 'P4B-OUTER') { $bad2 += 'hook was modified from outer root' }
+      if ($bad2.Count -eq 0) { Ok 'P4b: granting an enclosing outer root re-pins the inner root and intermediates up to the outer root' }
+      else { Fail "P4b (outer root): $($bad2 -join '; '). raw: $($r2.raw)" }
+
+      End-Session
+      $gRepeat = Grant-P @($pp)
+      if ($gRepeat.exit -eq 0 -and $gRepeat.writes -eq 0) { Ok 'P4b: repeat session start on enclosing root performs zero DACL writes' }
+      else { Fail "P4b: repeat outer-root grant: exit=$($gRepeat.exit), writes=$($gRepeat.writes) (want 0)" }
+
+      # Forget order 1: forget inner root first; outer root keeps the deny and pins.
+      End-Session
+      Run @('acl', 'forget', $ppSub)
+      $r3 = SbRoots @($pp) @($cmd, '/d', '/s', '/c', "ren `"$ppSub`" sub.bak & ren `"$ppGit`" .git.bak & echo P4B-AFTER-INNER>> `"$ppHook`"")
+      $bad3 = @()
+      if (-not (Test-Path -LiteralPath $ppSub) -or (Test-Path -LiteralPath (Join-Path $pp 'sub.bak'))) { $bad3 += 'inner dir renamed after inner forget' }
+      if (-not (Test-Path -LiteralPath $ppGit) -or (Test-Path -LiteralPath (Join-Path $ppSub '.git.bak'))) { $bad3 += '.git renamed after inner forget' }
+      if (-not (Test-Path -LiteralPath $ppHook) -or (Get-Content -Raw $ppHook) -match 'P4B-AFTER-INNER') { $bad3 += 'hook modified after inner forget' }
+      if ($bad3.Count -eq 0) { Ok 'P4b: forgetting inner root keeps the deny and pins active under the enclosing outer root' }
+      else { Fail "P4b (forget inner first): $($bad3 -join '; '). raw: $($r3.raw)" }
+
+      End-Session
+      Run @('acl', 'forget', $pp)
+      $stillPp = @($pp, $ppSub, $ppGit, $ppHooks) | Where-Object { Has-Persistent $_ }
+      if (-not $stillPp -and (Dacl $pp) -eq $ppBase) { Ok 'P4b: forgetting the outer root strips all grants, denies, and intermediate pins cleanly' }
+      else { Fail "P4b: leftovers after outer forget: paths=$($stillPp -join ', ') base=$ppBase now=$(Dacl $pp)" }
+
+      # Forget order 2: both roots granted, forget outer root first; outer is
+      # clean while inner still holds its deny and .git pin.
+      $gBoth = Grant-P @($pp, $ppSub) @($ppHooks)
+      if ($gBoth.exit -ne 0) { Fail "P4b (order 2): dual-root grant failed (exit=$($gBoth.exit))" }
+      else {
+        End-Session
+        Run @('acl', 'forget', $pp)
+        $r4 = SbRoots @($ppSub) @($cmd, '/d', '/s', '/c', "ren `"$ppGit`" .git.bak & echo P4B-AFTER-OUTER>> `"$ppHook`"")
+        $bad4 = @()
+        if ((Has-Persistent $pp) -or (Dacl $pp) -ne $ppBase) { $bad4 += "outer root still carries persistent ACEs: $(Sddl $pp)" }
+        if (-not (Test-Path -LiteralPath $ppGit) -or (Test-Path -LiteralPath (Join-Path $ppSub '.git.bak'))) { $bad4 += '.git renamed after outer forget' }
+        if (-not (Test-Path -LiteralPath $ppHook) -or (Get-Content -Raw $ppHook) -match 'P4B-AFTER-OUTER') { $bad4 += 'hook modified after outer forget' }
+        if ($bad4.Count -eq 0) { Ok 'P4b: forgetting outer root first leaves outer clean while keeping inner deny and .git pin intact' }
+        else { Fail "P4b (forget outer first): $($bad4 -join '; '). raw: $($r4.raw)" }
+        End-Session
+        Run @('acl', 'forget', $ppSub)
+        $stillPp2 = @($pp, $ppSub, $ppGit, $ppHooks) | Where-Object { Has-Persistent $_ }
+        if (-not $stillPp2 -and (Dacl $pp) -eq $ppBase) { Ok 'P4b: forgetting remaining inner root strips all remaining ACEs cleanly' }
+        else { Fail "P4b (order 2 cleanup): paths=$($stillPp2 -join ', ') base=$ppBase now=$(Dacl $pp)" }
+      }
+    }
+  }
 
   # ── P5: the real user and their own file ─────────────────────────
   $pc = Join-Path $root 'pc'

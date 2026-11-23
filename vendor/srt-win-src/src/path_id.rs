@@ -451,6 +451,25 @@ pub fn canonical_parent_of(canonical_path: &str) -> Option<String> {
         .map(|p| p.display().to_string())
 }
 
+/// The directories strictly between `root` and `canonical_path`, nearest
+/// to `canonical_path` first. Returns an empty `Vec` if `canonical_path`
+/// does not lie strictly beneath `root`.
+pub fn dirs_between(root: &str, canonical_path: &str) -> Vec<String> {
+    let strictly_under = |p: &str| {
+        p.len() > root.len()
+            && p.starts_with(root)
+            && (root.ends_with('\\') || p.as_bytes().get(root.len()) == Some(&b'\\'))
+    };
+    if !strictly_under(canonical_path) {
+        return Vec::new();
+    }
+    std::iter::successors(canonical_parent_of(canonical_path), |p| {
+        canonical_parent_of(p)
+    })
+    .take_while(|p| strictly_under(p))
+    .collect()
+}
+
 // ─── File identity (FILE_ID_INFO) ───────────────────────────────────
 
 /// A file's stable identity on a volume — the
@@ -923,6 +942,25 @@ mod tests {
         assert_eq!(
             canonical_parent_of(r"\\?\C:\a\b").as_deref(),
             Some(r"\\?\C:\a"),
+        );
+    }
+
+    #[test]
+    fn dirs_between_a_root_and_a_path_beneath_it() {
+        assert_eq!(
+            dirs_between(r"\\?\C:\r", r"\\?\C:\r\a\.git\hooks"),
+            [r"\\?\C:\r\a\.git", r"\\?\C:\r\a"],
+        );
+        assert!(dirs_between(r"\\?\C:\r", r"\\?\C:\r\.bashrc").is_empty());
+        assert!(dirs_between(r"\\?\C:\r", r"\\?\C:\r").is_empty());
+        // Sibling prefix or unrelated subtree must not walk past `root`.
+        assert!(dirs_between(r"\\?\C:\r", r"\\?\C:\r2\a\f").is_empty());
+        assert!(dirs_between(r"\\?\C:\r", r"\\?\C:\other\a\f").is_empty());
+        // A drive root carries a trailing separator.
+        assert_eq!(dirs_between(r"\\?\D:\", r"\\?\D:\a\f"), [r"\\?\D:\a"]);
+        assert_eq!(
+            dirs_between(r"\\?\UNC\srv\share\r", r"\\?\UNC\srv\share\r\.git\hooks"),
+            [r"\\?\UNC\srv\share\r\.git"],
         );
     }
 
