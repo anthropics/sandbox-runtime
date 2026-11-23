@@ -208,6 +208,12 @@ async function main(): Promise<void> {
         'off); must match network.allowLocalBinding',
     )
     .option(
+      '--block-wsl-nat',
+      'block IPv4/IPv6 packet forwarding (WSL2 / Hyper-V NAT guest egress) ' +
+        'machine-wide via WFP IPFORWARD filters (default: off; for dedicated ' +
+        'sandbox hosts)',
+    )
+    .option(
       '--sandbox-user <name>',
       'name for the sandbox user account (default: srt-sandbox)',
     )
@@ -239,6 +245,7 @@ async function main(): Promise<void> {
           resolveSrtWin,
           VENDORED_SRT_WIN_EXE,
           WINDOWS_ALLOW_LOOPBACK_EFFECT,
+          WINDOWS_BLOCK_WSL_NAT_EFFECT,
         } = await import('./sandbox/windows-sandbox-utils.js')
         const range =
           typeof o.proxyPortRange === 'string'
@@ -249,6 +256,7 @@ async function main(): Promise<void> {
             sublayerGuid: o.sublayerGuid as string | undefined,
             proxyPortRange: range,
             allowLoopback: Boolean(o.allowLoopback),
+            blockWslNat: Boolean(o.blockWslNat),
             sandboxUser: o.sandboxUser as string | undefined,
             force: Boolean(o.force),
             skipProfileGrant: Boolean(o.skipProfileGrant),
@@ -290,7 +298,8 @@ async function main(): Promise<void> {
               `\`srt-sandbox\` user's SID, so your network is unaffected.` +
               (r.wfp.allowLoopback
                 ? `\n\n${WINDOWS_ALLOW_LOOPBACK_EFFECT}`
-                : ''),
+                : '') +
+              (r.wfp.blockWslNat ? `\n\n${WINDOWS_BLOCK_WSL_NAT_EFFECT}` : ''),
           )
         } catch (e) {
           console.error(`Error: ${(e as Error).message}`)

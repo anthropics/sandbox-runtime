@@ -230,6 +230,14 @@ export const WINDOWS_ALLOW_LOOPBACK_EFFECT =
   `reachable there gives them a way off the machine that the network ` +
   `restrictions do not cover.`
 
+/** What `windows-install --block-wsl-nat` enforces on Windows, in plain words. */
+export const WINDOWS_BLOCK_WSL_NAT_EFFECT =
+  `WSL2 NAT egress guard is active: persistent WFP IPFORWARD filters block ` +
+  `IPv4 and IPv6 packet forwarding machine-wide (WSL2, Hyper-V, and Docker ` +
+  `NAT guests cannot reach the network while installed; host-originated ` +
+  `connections stay unaffected). Re-run windows-install --force without ` +
+  `--block-wsl-nat to remove those filters.`
+
 /**
  * `cannot-read` is the graceful-degrade state when BFE enumeration
  * is access-denied (it is admin-gated). The non-elevated readiness
@@ -255,6 +263,11 @@ export interface WindowsWfpStatusResult {
    * {@link WINDOWS_ALLOW_LOOPBACK_EFFECT}.
    */
   allowLoopback: boolean
+  /**
+   * Whether the opt-in WFP IPFORWARD filters blocking WSL2 / Hyper-V NAT
+   * forwarding are installed — see {@link WINDOWS_BLOCK_WSL_NAT_EFFECT}.
+   */
+  blockWslNat?: boolean
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
   /**
@@ -288,6 +301,7 @@ export type WindowsWfpResidual =
   | 'anonymous-loopback'
   | 'deny-only-user-sid'
   | 'lowered-integrity-unprobed'
+  | 'wsl-reachable'
 
 /**
  * Result of `srt-win wfp verify` on success (exit 0); anything else
@@ -314,6 +328,8 @@ export interface WindowsWfpVerifyResult {
     untrustedIntegrityLoopback: WindowsWfpProbeOutcome
     /** With loopback open: own token, to the loopback listener. */
     openLoopback?: WindowsWfpProbeOutcome
+    /** Non-destructive `wsl.exe --status` probe under the sandbox token. */
+    wsl?: WindowsWfpProbeOutcome
   }
   /** Gaps the probe found open: NOT a clean pass when non-empty. */
   residuals: WindowsWfpResidual[]
@@ -1097,6 +1113,7 @@ type RawWfpStatus = {
   filters: number
   port_range?: [number, number]
   allow_loopback?: boolean
+  block_wsl_nat?: boolean
   user_sid?: string
   hint?: string
 }
@@ -1113,6 +1130,9 @@ function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
     filters: raw.filters,
     ...(raw.port_range && { portRange: raw.port_range }),
     allowLoopback: raw.allow_loopback === true,
+    ...(typeof raw.block_wsl_nat === 'boolean' && {
+      blockWslNat: raw.block_wsl_nat,
+    }),
     ...(raw.user_sid && { userSid: raw.user_sid }),
     ...(raw.hint && { hint: raw.hint }),
   }
@@ -1403,6 +1423,7 @@ type RawWfpVerify = {
   egress_target?: string
   allow_loopback?: boolean
   open_loopback_probe?: string
+  wsl_probe?: string
   residuals?: string[]
   allow_loopback_mismatch?: boolean
   hint?: string
@@ -1417,6 +1438,7 @@ export interface WindowsInstallContext {
   proxyPortRange?: readonly [number, number]
   sandboxUser?: string
   allowLoopback?: boolean
+  blockWslNat?: boolean
 }
 
 /**
@@ -1437,6 +1459,7 @@ function windowsInstallFlags(
       ? ` --sandbox-user ${ctx.sandboxUser}`
       : '') +
     (ctx.allowLoopback ? ` --allow-loopback` : '') +
+    (ctx.blockWslNat ? ` --block-wsl-nat` : '') +
     (force ? ` --force` : '')
   )
 }
@@ -1485,6 +1508,12 @@ const WFP_RESIDUAL_TEXT: Record<WindowsWfpResidual, string> = {
   'lowered-integrity-unprobed':
     'a lowered-integrity copy of the sandbox token could not be set up on ' +
     'this machine, so no connect under it was observed',
+  'wsl-reachable':
+    'wsl.exe and the WSL service answered under the sandbox account; ' +
+    'traffic from a WSL distribution does not leave under the sandbox user ' +
+    'SID and is not matched by the ALE connect filters (dedicated sandbox ' +
+    'hosts can pass `windows-install --block-wsl-nat` to block WSL2 NAT ' +
+    'forwarding machine-wide)',
 }
 
 function isWfpResidual(s: string): s is WindowsWfpResidual {
@@ -1535,6 +1564,9 @@ export function interpretWindowsWfpVerify(
     ...(raw.allow_loopback && {
       openLoopback: outcome(raw.open_loopback_probe),
     }),
+    ...(raw.wsl_probe !== undefined && {
+      wsl: outcome(raw.wsl_probe),
+    }),
   }
   const offLoopback = raw.anonymous_target ?? 'no target'
   // Where the attempts the fence must refuse on loopback went: the
@@ -1551,7 +1583,8 @@ export function interpretWindowsWfpVerify(
     `untrusted-integrity-loopback=${probes.untrustedIntegrityLoopback}` +
     (raw.allow_loopback
       ? `, open-loopback=${probes.openLoopback} (${raw.target})`
-      : '')
+      : '') +
+    (probes.wsl !== undefined ? `, wsl=${probes.wsl}` : '')
   // The reinstall that suits THIS session: its loopback mode, and the
   // install options it was configured with.
   const session: WindowsInstallContext = {
@@ -2160,6 +2193,13 @@ export interface WindowsInstallOptions {
    */
   allowLoopback?: boolean
   /**
+   * Opt-in machine-wide WSL2 / Hyper-V NAT egress guard
+   * ({@link WINDOWS_BLOCK_WSL_NAT_EFFECT}): installs persistent WFP
+   * `FWPM_LAYER_IPFORWARD_V4` / `_V6` BLOCK filters under the sublayer.
+   * Intended for dedicated single-purpose sandbox hosts; default off.
+   */
+  blockWslNat?: boolean
+  /**
    * Name for the sandbox user account (created if absent, adopted
    * if it already exists as a local user). Default `srt-sandbox`.
    */
@@ -2270,6 +2310,7 @@ function installArgs(opts: WindowsInstallOptions): string[] {
     )
   }
   if (opts.allowLoopback) args.push('--allow-loopback')
+  if (opts.blockWslNat) args.push('--block-wsl-nat')
   if (opts.sandboxUser) args.push('--sandbox-user', opts.sandboxUser)
   if (opts.force) args.push('--force')
   return args
