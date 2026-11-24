@@ -33,8 +33,20 @@ function fileAt(p: string): string {
 }
 
 /**
+ * The absolute path `p` as realPathOf reads it: as the kernel does where the
+ * kernel has an answer for all of it, and folded in text where it has none.
+ */
+function asRead(p: string): string {
+  const whole = `/${p
+    .split('/')
+    .filter(name => name !== '' && name !== '.')
+    .join('/')}`
+  return fileAt(whole).includes(':') ? whole : resolve(p)
+}
+
+/**
  * For each of `paths`, in Node: what realPathOf gives, what the C library
- * gives for the name folded in text and, if asked for, Node's own answer. The
+ * gives for the name as it is read and, if asked for, Node's own answer. The
  * child is ended hard: a call that does not return hears no signal.
  */
 function inNode(paths: string[], askNode = false): string[][] {
@@ -48,18 +60,17 @@ function inNode(paths: string[], askNode = false): string[][] {
       '-e',
       `
     import fs from 'node:fs'
-    import path from 'node:path'
     const { realPathOf } = await import(process.argv[1])
     const answer = call => { try { return call() } catch (error) { return error.code } }
-    const { paths, askNode } = JSON.parse(fs.readFileSync(0, 'utf8'))
-    console.log(JSON.stringify(paths.map(p => [
+    const { paths, read, askNode } = JSON.parse(fs.readFileSync(0, 'utf8'))
+    console.log(JSON.stringify(paths.map((p, i) => [
       answer(() => realPathOf(p)),
-      answer(() => fs.realpathSync.native(path.resolve(p))),
+      answer(() => fs.realpathSync.native(read[i])),
       askNode && answer(() => fs.realpathSync(p))])))`,
       resolve(import.meta.dirname, '../../src/utils/real-path.ts'),
     ],
     {
-      input: JSON.stringify({ paths, askNode }),
+      input: JSON.stringify({ paths, read: paths.map(asRead), askNode }),
       encoding: 'utf8',
       timeout: 20_000,
       killSignal: 'SIGKILL',
@@ -143,14 +154,26 @@ describe.if(!isWindows)('realPathOf', () => {
     ['a\\b/slashes', 'a\\b/in'],
     ['plain/up-behind-a-link', 'a/file'],
     ['plain/up-and-in', 'a/up-and-in/in'],
-    // In the name given they are folded in text.
-    ['a\\b/out/../file', 'a\\b/file'],
+    // In the name given it is that too, where the kernel has an answer for
+    // the name: behind a link, the parent of where the link leads.
+    ['a\\b/out/../file', 'file'],
+    ['a\\b/out/../a\\b/out/..', ''],
+    ['to-it/../plain/out/../..', ''],
+    ['a\\b/in/../file', 'a\\b/file'],
+    ['plain/out/../file', 'a/file'],
+    ['plain/out/../../plain/out/..', 'a'],
+    ['plain/in/../file', 'plain/file'],
+    // Where it has none, they are folded in text.
+    ['a\\b/out/../not-there/..', 'a\\b'],
+    ['a\\b/nowhere/..', 'a\\b'],
+    ['a\\b/round/..', 'a\\b'],
+    ['a\\b/1/..', 'a\\b'],
     ['a\\b/file/../in', 'a\\b/in'],
     ['a\\b/not-there/..', 'a\\b'],
     ['a\\b/./in//', 'a\\b/in'],
     ['a\\b/..', ''],
     ['a\\b/file/', 'a\\b/file'],
-    ['plain/out/../file', 'plain/file'],
+    ['plain/out/../not-there/../file', 'plain/file'],
     ['plain/file/../in', 'plain/in'],
     ['plain/not-there/..', 'plain'],
     ['plain/./in//', 'plain/in'],
@@ -283,8 +306,8 @@ describe.if(!isWindows)('realPathOf', () => {
     fs.symlinkSync('/', at('a\\b/root'))
 
     expect(realPathOf(at('a\\b/root'))).toBe('/')
-    expect(realPathOf(at('a\\b/root/..'))).toBe(at('a\\b'))
-    expect(realPathOf(at('a\\b/root/../..'))).toBe(root)
+    expect(realPathOf(at('a\\b/root/..'))).toBe('/')
+    expect(realPathOf(at('a\\b/root/../..'))).toBe('/')
   })
 
   describe('what it asks', () => {
@@ -313,21 +336,45 @@ describe.if(!isWindows)('realPathOf', () => {
       return calls
     }
 
-    it.each(['plain/file', 'to-it/file', 'plain/../plain//in/'])(
-      'asks once about %s, which holds no backslash, folded in text',
+    it.each(['plain/file', 'to-it/file', 'plain/.//in/'])(
+      'asks once about %s, which holds no backslash and no .., folded in text',
       given => {
         expect(asked(at(given))).toEqual([`native ${resolve(at(given))}`])
       },
     )
 
-    it('asks about each component once where the name holds one', () => {
-      const above = [...root.matchAll(/(?<=.)\/|$/g)].map(
+    /** One question about the root, and one about each name on the way to
+     *  the tree. */
+    const above = (): string[] => [
+      'lstatSync /.',
+      ...[...root.matchAll(/(?<=.)\/|$/g)].map(
         cut => `lstatSync ${root.slice(0, cut.index)}`,
-      )
+      ),
+    ]
 
+    it('asks about each component where the name holds a .., which not every runtime leaves to the kernel', () => {
+      expect(asked(at('to-it/../plain'))).toEqual([
+        ...above(),
+        `lstatSync ${at('to-it')}`,
+        `readlinkSync ${at('to-it')}`,
+        `lstatSync ${at('a\\b')}`,
+        `lstatSync ${at('a\\b')}/.`,
+        `lstatSync ${at('plain')}`,
+      ])
+    })
+
+    it('asks once more, about the name folded in text, where the kernel has no answer for it', () => {
+      expect(asked(at('plain/not-there/../file'))).toEqual([
+        ...above(),
+        `lstatSync ${at('plain')}`,
+        `lstatSync ${at('plain/not-there')}`,
+        `native ${at('plain/file')}`,
+      ])
+    })
+
+    it('asks about each component once where the name holds a backslash', () => {
       expect(asked(at('a\\b/out/file'))).toEqual([
-        'lstatSync /.',
-        ...above,
+        ...above(),
         `lstatSync ${at('a\\b')}`,
         `lstatSync ${at('a\\b/out')}`,
         `readlinkSync ${at('a\\b/out')}`,
@@ -459,11 +506,13 @@ describe.if(!isWindows)('property: realPathOf', () => {
             // behind a name its own answer can differ, or never come.
             const askNode = !upBehindAName
             const answers = inNode(paths, askNode)
+            // Node folds a `..` behind a link in text as well.
+            const goesUp = paths.map(p => asRead(p) !== resolve(p))
             paths.forEach((p, i) => {
               const real = answer(() => realPathOf(p))
               expect([p, real.startsWith('/') ? fileAt(real) : real]).toEqual([
                 p,
-                fileAt(resolve(p)),
+                fileAt(asRead(p)),
               ])
               if (real.startsWith('/')) {
                 expect([p, resolve(real), linksOnTheWayTo(real)]).toEqual([
@@ -480,7 +529,7 @@ describe.if(!isWindows)('property: realPathOf', () => {
                 return
               }
               expect([p, there, library]).toEqual([p, real, real])
-              if (askNode) expect([p, own]).toEqual([p, real])
+              if (askNode && !goesUp[i]) expect([p, own]).toEqual([p, real])
             })
           } finally {
             fs.rmSync(root, { recursive: true, force: true })

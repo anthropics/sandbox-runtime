@@ -3,7 +3,7 @@ import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
-import { realPathOf } from '../utils/real-path.js'
+import { realPathOf, wholeWayOf } from '../utils/real-path.js'
 import {
   denyGlobRegex,
   globToRegex,
@@ -405,6 +405,41 @@ export function collapseInteriorSpellings(pathPattern: string): string {
 }
 
 /**
+ * What the absolute `spelling` names where the kernel reads a `..` in it
+ * otherwise than the text does: behind a link, where the kernel's `..` is
+ * the parent of where the link leads. That is what a caller who checks the
+ * entry with realpath(3) is told, so it is the entry, wherever it lies: no
+ * boundary holds it, there being no spelling without the `..` to keep in its
+ * place. Of a pattern, the directory it starts from is what is read.
+ *
+ * Undefined where the two readings agree, and where the kernel has no answer
+ * for the spelling (a name in it is not there, a link leads nowhere or round
+ * in a circle): the text is then read as it always was. POSIX only.
+ */
+function whereReadingsPart(
+  spelling: string,
+  isGlob: boolean,
+): string | undefined {
+  let dir = spelling
+  if (isGlob) {
+    const staticPrefix = spelling.split(/[*?[\]]/)[0]!
+    dir = staticPrefix.endsWith('/')
+      ? staticPrefix.slice(0, -1)
+      : path.dirname(staticPrefix)
+  }
+  const led = wholeWayOf(dir)
+  if (led === undefined) return undefined
+  let folded: string | undefined
+  try {
+    folded = realPathOf(path.resolve(dir))
+  } catch {
+    // The text names nothing that is there.
+  }
+  if (led === folded) return undefined
+  return isGlob ? (led === '/' ? '' : led) + spelling.slice(dir.length) : led
+}
+
+/**
  * Says so when a `..` reaches a backend unfolded — realpath could not resolve
  * the path (absent, or unreadable), and folding `..` lexically here could aim
  * the rule past a symlink at a file the kernel would never reach. Debug-only
@@ -493,12 +528,22 @@ export function normalizePathForSandbox(
     pathPattern = pathPattern.replace(/\/+$/, '') || '/'
   }
   let normalizedPath = expandTilde(pathPattern)
+  // The spelling made absolute and nothing more, for the kernel to read.
+  let asWritten = normalizedPath
 
   // A pattern with no tilde to expand and no root is resolved against the
   // working directory; path.resolve covers './', '../', '.' and a bare
   // relative name alike.
   if (normalizedPath === pathPattern && !path.isAbsolute(pathPattern)) {
+    asWritten = `${process.cwd()}/${pathPattern}`
     normalizedPath = path.resolve(process.cwd(), pathPattern)
+  }
+
+  // POSIX: a '..' behind a link is the parent of where the link leads, as the
+  // kernel and realpath(3) have it, and not what the text below makes of it.
+  if (getPlatform() !== 'windows') {
+    const led = whereReadingsPart(asWritten, isGlobSpelling(asWritten))
+    if (led !== undefined) return led
   }
 
   // POSIX: collapse the interior spellings realpath would have removed, on the
