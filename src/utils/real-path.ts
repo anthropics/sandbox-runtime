@@ -30,10 +30,12 @@ function textOf(ask: typeof fs.readlinkSync, at: string): string {
  * `realpathSync.native`, since runtimes differ in how they read a link's
  * target too. On Windows `realpathSync` is asked, of `p` as it is.
  *
- * A `.`, `..` or `//` in `p` itself, and a `/` at its end, is folded in text
- * before anything is looked at: `link/..` is the directory that holds the
- * link. In a link's target they are read as the kernel reads them, `..` being
- * the parent of the real directory reached.
+ * A `..` in `p` itself is read as the kernel reads it, where the kernel has
+ * an answer for `p`: `link/..` is the parent of where the link leads. Where
+ * it has none (`absent/..`, `file/..`), `.`, `..` and `//` in `p`, and a `/`
+ * at its end, are folded in text before anything is looked at. In a link's
+ * target they are always read as the kernel reads them, `..` being the
+ * parent of the real directory reached.
  *
  * An error carries the `code` the kernel gave the call that failed, ELOOP
  * past the number of links the kernel follows, and EILSEQ where the way leads
@@ -43,6 +45,8 @@ export function realPathOf(p: string): string {
   if (process.platform === 'win32') return fs.realpathSync(p)
   // What a relative `p` is resolved against is part of the name.
   const from = path.isAbsolute(p) ? '' : process.cwd()
+  const whole = wholeWayOf(`${from}/${p}`)
+  if (whole !== undefined) return whole
   const folded = path.resolve(from, p)
   if (!(from + p).includes('\\')) return textOf(fs.realpathSync.native, folded)
   const { real, notThere } = wayTo(folded)
@@ -51,8 +55,27 @@ export function realPathOf(p: string): string {
 }
 
 /**
- * The kernel's way to `folded`, an absolute path with no `.`, `..` or `//` of
- * its own: name by name, split at `/` alone, every link followed. `real` is
+ * The real path of the absolute path `p` as the kernel reads all of it, each
+ * `..` being the parent of the real directory reached. Undefined where `p`
+ * holds no `..`, since the text says the same then, and where the kernel has
+ * no answer for it. Not every runtime's `realpathSync.native` leaves a `..`
+ * to the kernel, so the way is followed name by name. POSIX only.
+ */
+export function wholeWayOf(p: string): string | undefined {
+  const names = p.split('/').filter(name => name !== '' && name !== '.')
+  if (!names.includes('..')) return undefined
+  try {
+    const { real, notThere } = wayTo(`/${names.join('/')}`)
+    return notThere === undefined ? real || '/' : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The kernel's way to `folded`, an absolute path with no `.` or `//` of its
+ * own: name by name, split at `/` alone, every link followed, a `..` going up
+ * from where the way has led. `real` is
  * as far as it leads, '' being the root. `rest` is what it has not come to:
  * nothing, or first the name that is not there, or that `real` lets nobody
  * look for (EACCES), with what the kernel said of it. Whatever else stops the
