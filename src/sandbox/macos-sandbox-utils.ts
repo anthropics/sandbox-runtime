@@ -1621,6 +1621,13 @@ export function wrapCommandWithSandboxMacOS(
 }
 
 /**
+ * The stop function of a running log monitor. `ready` settles once
+ * `log stream` is reading: it resolves on the first data the process writes
+ * to stdout and rejects if the process cannot start or exits before that.
+ */
+export type MacOSLogMonitor = (() => void) & { ready: Promise<void> }
+
+/**
  * Start monitoring macOS system logs for sandbox violations
  * Look for sandbox-related kernel deny events ending in {logTag}
  */
@@ -1634,7 +1641,7 @@ export function startMacOSSandboxLogMonitor(
    *  `sanitizeUnregisteredCommandKey`, which treats the key as the untrusted
    *  bytes it arrived as. */
   resolveCommandText: (decodedKey: string) => string,
-): () => void {
+): MacOSLogMonitor {
   // Pre-compile regex patterns for better performance
   const cmdExtractRegex = /CMD64_(.+?)_END/
   const sandboxExtractRegex = /Sandbox:\s+(.+)$/
@@ -1649,7 +1656,19 @@ export function startMacOSSandboxLogMonitor(
     'compact',
   ])
 
+  // `log stream` prints "Filtering the log data using ..." once it is
+  // reading, so the first stdout data means a violation from here on is seen.
+  let markReady!: () => void
+  let markFailed!: (error: Error) => void
+  const ready = new Promise<void>((resolve, reject) => {
+    markReady = resolve
+    markFailed = reject
+  })
+  // A caller that does not wait for `ready` must not get an unhandled rejection.
+  ready.catch(() => {})
+
   logProcess.stdout?.on('data', (data: Buffer) => {
+    markReady()
     const lines = data.toString().split('\n')
 
     // Get violation and command lines
@@ -1712,14 +1731,19 @@ export function startMacOSSandboxLogMonitor(
     logForDebugging(
       `[Sandbox Monitor] Failed to start log stream: ${error.message}`,
     )
+    markFailed(error)
   })
 
   logProcess.on('exit', (code: number | null) => {
     logForDebugging(`[Sandbox Monitor] Log stream exited with code: ${code}`)
+    markFailed(
+      new Error(`log stream exited with code ${code} before it was reading`),
+    )
   })
 
-  return () => {
+  const stop = (): void => {
     logForDebugging('[Sandbox Monitor] Stopping log monitor')
     logProcess.kill('SIGTERM')
   }
+  return Object.assign(stop, { ready })
 }
