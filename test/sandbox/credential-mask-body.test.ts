@@ -107,8 +107,10 @@ describe('credential-mask-body: end-to-end through the TLS-terminating proxy', (
             headers: req.headers,
             body: Buffer.concat(chunks),
           })
+          // /echo stands for an injectHost that stores what it is sent
+          // (an issue, a gist) and returns it on a later read.
           res.writeHead(200, { 'x-upstream': 'ok' })
-          res.end('ok')
+          res.end(req.url === '/echo' ? Buffer.concat(chunks) : 'ok')
         })
       },
     )
@@ -314,6 +316,95 @@ describe('credential-mask-body: end-to-end through the TLS-terminating proxy', (
       expect(got.body.toString()).toBe(`{"token":"${REAL_LONG}"}`)
     } finally {
       await stop(server)
+    }
+  })
+
+  test('an upstream that returns what it stored hands the real value back (default injectInto)', async () => {
+    const reg = new SentinelRegistry()
+    const sentinel = reg.register('GH_TOKEN', REAL_LONG, ['127.0.0.1'])
+    const { server, port } = await startProxy(reg)
+    try {
+      const r = await curlViaProxy(port, url('/echo'), {
+        method: 'POST',
+        body: `{"note":"${sentinel}"}`,
+        headers: ['Content-Type: application/json'],
+      })
+      expect(r.exit).toBe(0)
+      expect(r.body).toBe(`{"note":"${REAL_LONG}"}`)
+    } finally {
+      await stop(server)
+    }
+  })
+
+  test('injectInto ["header:authorization"]: the header gets the real value, the body keeps the fake', async () => {
+    const reg = new SentinelRegistry()
+    const sentinel = reg.register(
+      'GH_TOKEN',
+      REAL_LONG,
+      ['127.0.0.1'],
+      ['header:authorization'],
+    )
+    const { server, port } = await startProxy(reg)
+    try {
+      const payload = `{"note":"${sentinel}"}`
+      const r = await curlViaProxy(port, url('/echo'), {
+        method: 'POST',
+        body: payload,
+        headers: [
+          'Content-Type: application/json',
+          `Authorization: Bearer ${sentinel}`,
+          `X-Note: ${sentinel}`,
+        ],
+      })
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      const got = lastSeen()
+      expect(got.headers.authorization).toBe(`Bearer ${REAL_LONG}`)
+      expect(got.headers['x-note']).toBe(sentinel)
+      expect(got.body.toString()).toBe(payload)
+      // Nothing was substituted in the body, so its length is the client's.
+      expect(got.headers['content-length']).toBe(String(payload.length))
+      expect(r.body).toBe(payload)
+      expect(r.body).not.toContain(REAL_LONG)
+    } finally {
+      await stop(server)
+    }
+  })
+
+  test('short header-only token preserves binary upload bytes and Content-Length', async () => {
+    const reg = new SentinelRegistry()
+    const real = 'gho_' + 'x'.repeat(36)
+    const sentinel = reg.register(
+      'GH_TOKEN',
+      real,
+      ['127.0.0.1'],
+      ['header:authorization'],
+    )
+    expect(sentinel.length).not.toBe(real.length)
+    const directory = mkdtempSync(join(tmpdir(), 'srt-header-upload-'))
+    const file = join(directory, 'upload.bin')
+    const payload = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0xff, 0x0d, 0x0a])
+    writeFileSync(file, payload)
+    const { server, port } = await startProxy(reg)
+    try {
+      const r = await curlViaProxy(port, url('/upload'), {
+        method: 'POST',
+        dataFile: file,
+        headers: [
+          'Content-Type: application/octet-stream',
+          `Authorization: Bearer ${sentinel}`,
+        ],
+      })
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      const got = lastSeen()
+      expect(got.headers.authorization).toBe(`Bearer ${real}`)
+      expect(got.headers['content-length']).toBe(String(payload.length))
+      expect(got.headers['transfer-encoding']).toBeUndefined()
+      expect(got.body).toEqual(payload)
+    } finally {
+      await stop(server)
+      rmSync(directory, { recursive: true, force: true })
     }
   })
 
