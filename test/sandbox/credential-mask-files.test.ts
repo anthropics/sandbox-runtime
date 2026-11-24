@@ -316,6 +316,41 @@ describe('extractAndSubstitute', () => {
 })
 
 describe('buildMaskedFileBinds', () => {
+  test('propagates header-only scope for whole-file and extracted file credentials', () => {
+    for (const extract of [undefined, '^(.+)$']) {
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      try {
+        const { binds } = buildMaskedFileBinds(
+          [
+            {
+              path: TOKEN_FILE,
+              mode: 'mask',
+              extract,
+              injectHosts: ['api.github.com'],
+              injectInto: ['header:authorization'],
+            },
+          ],
+          ['api.github.com'],
+          reg,
+          store,
+        )
+        expect(binds).toHaveLength(1)
+        const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+        expect(fake).not.toContain(TOKEN_CONTENT)
+        const headers = { authorization: `Bearer ${fake}`, 'x-token': fake }
+        reg.substituteInHeaders(headers, 'api.github.com', (h, p) => h === p)
+        expect(headers.authorization).toBe(`Bearer ${TOKEN_CONTENT}`)
+        expect(headers['x-token']).toBe(fake)
+        expect(
+          reg.sentinelsForHost('api.github.com', (h, p) => h === p),
+        ).toEqual([])
+      } finally {
+        store.dispose()
+      }
+    }
+  })
+
   test('registers a sentinel keyed on file path and writes it to a fake', () => {
     const reg = new SentinelRegistry()
     const store = new MaskedFileStore()

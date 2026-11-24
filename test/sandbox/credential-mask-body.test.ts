@@ -371,6 +371,43 @@ describe('credential-mask-body: end-to-end through the TLS-terminating proxy', (
     }
   })
 
+  test('short header-only token preserves binary upload bytes and Content-Length', async () => {
+    const reg = new SentinelRegistry()
+    const real = 'gho_' + 'x'.repeat(36)
+    const sentinel = reg.register(
+      'GH_TOKEN',
+      real,
+      ['127.0.0.1'],
+      ['header:authorization'],
+    )
+    expect(sentinel.length).not.toBe(real.length)
+    const directory = mkdtempSync(join(tmpdir(), 'srt-header-upload-'))
+    const file = join(directory, 'upload.bin')
+    const payload = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0xff, 0x0d, 0x0a])
+    writeFileSync(file, payload)
+    const { server, port } = await startProxy(reg)
+    try {
+      const r = await curlViaProxy(port, url('/upload'), {
+        method: 'POST',
+        dataFile: file,
+        headers: [
+          'Content-Type: application/octet-stream',
+          `Authorization: Bearer ${sentinel}`,
+        ],
+      })
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      const got = lastSeen()
+      expect(got.headers.authorization).toBe(`Bearer ${real}`)
+      expect(got.headers['content-length']).toBe(String(payload.length))
+      expect(got.headers['transfer-encoding']).toBeUndefined()
+      expect(got.body).toEqual(payload)
+    } finally {
+      await stop(server)
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   test('regression: bodyless GET is unaffected', async () => {
     const reg = new SentinelRegistry()
     reg.register('GH_TOKEN', REAL_LONG, ['127.0.0.1'])
