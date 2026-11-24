@@ -984,6 +984,22 @@ describe.if(isMacOS)('macOS Seatbelt Process Enumeration', () => {
   })
 })
 
+describe.if(isMacOS)('macOS Seatbelt kern.hv_vmm_present', () => {
+  it('should list kern.hv_vmm_present in the sysctl-read allowlist', () => {
+    // Chromium reads this key in base::mac::IsVirtualMachine() and aborts
+    // with a PCHECK if the read fails, so headless Chromium run under the
+    // sandbox needs it.
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain('(sysctl-name "kern.hv_vmm_present")')
+  })
+})
+
 describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
   it('should emit global-name and global-name-prefix rules for configured services', () => {
     const wrappedCommand = wrapCommandWithSandboxMacOS({
