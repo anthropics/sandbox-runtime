@@ -203,6 +203,9 @@ let initializeGeneration = 0
 let windowsProfileGrantAbort: AbortController | undefined
 let cleanupRegistered = false
 let ownInstallLogged = false
+// How long initialize() waits for `log stream` to start reading (about 10 ms
+// when measured on an idle machine).
+const LOG_MONITOR_READY_TIMEOUT_MS = 2000
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
@@ -1334,11 +1337,41 @@ async function initializeSteps(
 
   // Start log monitor for macOS if enabled
   if (enableLogMonitor && getPlatform() === 'macos') {
-    logMonitorShutdown = startMacOSSandboxLogMonitor(
+    const monitor = startMacOSSandboxLogMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       config.ignoreViolations,
       resolveCommandText,
     )
+    logMonitorShutdown = monitor
+    // A command started before `log stream` is reading can be denied without
+    // the denial ever being reported, so initialize() waits for it.
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        monitor.ready,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `log stream did not start reading within ${LOG_MONITOR_READY_TIMEOUT_MS} ms`,
+                ),
+              ),
+            LOG_MONITOR_READY_TIMEOUT_MS,
+          )
+        }),
+      ])
+    } catch (error) {
+      monitor()
+      if (logMonitorShutdown === monitor) logMonitorShutdown = undefined
+      stopIfReset()
+      throw new Error(
+        `macOS sandbox log monitor did not start: ${(error as Error).message}`,
+      )
+    } finally {
+      clearTimeout(timer)
+    }
+    stopIfReset()
     logForDebugging('Started macOS sandbox log monitor')
   }
   if (enableLogMonitor && getPlatform() === 'linux') {
