@@ -123,6 +123,7 @@ export type {
   WindowsWfpProbeOutcome,
   WindowsWfpResidual,
   WindowsAclRevokeResult,
+  WindowsAclRecoveryReport,
   WindowsProfileGrantState,
   WindowsProfileGrantStatus,
   WindowsProfileGrantPath,

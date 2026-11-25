@@ -124,6 +124,8 @@ export type WindowsSandboxErrorCode =
   | 'acl_stamp_failed'
   /** `srt-win acl grant` exited non-zero. */
   | 'acl_grant_failed'
+  /** `srt-win acl recover --json` printed no report. */
+  | 'acl_recover_failed'
   /**
    * A profile read grant is recorded and cannot be relied on (unfinished,
    * older exclusion list, another profile, unreadable record). An ABSENT
@@ -3275,6 +3277,66 @@ export async function grantWindowsAclPersistent(
         `: ${r.stderr || r.stdout}`,
     )
   }
+}
+
+/** What `srt-win acl recover --json` reports. */
+export interface WindowsAclRecoveryReport {
+  /** Holders found dead and pruned. */
+  deadBrokers: number
+  /** Their ACEs removed. */
+  acesRevoked: number
+  /** Grants of dead holders that could not be released; may be on disk. */
+  grantsPending: string[]
+  /** Records dropped for grants that can no longer be located. */
+  grantsDropped: string[]
+}
+
+/**
+ * Run srt-win's crash recovery (dead holders' ACEs) and return its
+ * counts. srt-win exits non-zero when a grant is still pending; the
+ * report is returned all the same. Throws only when there is no report.
+ */
+export async function recoverWindowsAclAsync(opts: {
+  srtWin?: SrtWinSpawn
+}): Promise<WindowsAclRecoveryReport> {
+  const args = ['acl', 'recover', '--json']
+  // Recovery may walk the trees a dead holder was granted.
+  const r = await runSrtWinAsync(args, {
+    timeoutMs: 600_000,
+    srtWin: opts.srtWin,
+  })
+  logForDebugging(
+    `[Sandbox Windows] acl recover exit=${r.status}: ${r.stderr || r.stdout}`,
+  )
+  let raw: Partial<Record<keyof WindowsAclRecoveryReport, unknown>> | undefined
+  try {
+    raw = JSON.parse(r.stdout)
+  } catch {
+    raw = undefined
+  }
+  const count = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : undefined
+  const list = (v: unknown): string[] | undefined =>
+    Array.isArray(v) && v.every(p => typeof p === 'string') ? v : undefined
+  const report = raw && {
+    deadBrokers: count(raw.deadBrokers),
+    acesRevoked: count(raw.acesRevoked),
+    grantsPending: list(raw.grantsPending ?? []),
+    grantsDropped: list(raw.grantsDropped ?? []),
+  }
+  if (
+    report?.deadBrokers === undefined ||
+    report.acesRevoked === undefined ||
+    report.grantsPending === undefined ||
+    report.grantsDropped === undefined
+  ) {
+    throw new WindowsSandboxError(
+      'acl_recover_failed',
+      `srt-win acl recover exited ${r.status} without a report: ` +
+        `${r.stderr || r.stdout}`,
+    )
+  }
+  return report as WindowsAclRecoveryReport
 }
 
 export interface WindowsAclRevokeResult {

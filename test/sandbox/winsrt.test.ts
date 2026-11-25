@@ -508,6 +508,7 @@ function madeWithoutBlocking(argv: readonly string[]): boolean {
   return (
     (own[0] === 'acl' &&
       (own[1] === 'forget' ||
+        own[1] === 'recover' ||
         (own[1] === 'grant' && own.includes('--persistent')))) ||
     (own[0] === 'profile' &&
       (own[1] === 'forget' || own[1] === 'status' || own[1] === 'retry-stale'))
@@ -4663,6 +4664,57 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     )
     await SandboxManager.reset()
     expect(aclCalls).toEqual(WITH_RESTORE)
+  })
+
+  describe('onWindowsAclRecovery', () => {
+    const REPORT = {
+      deadBrokers: 2,
+      acesRevoked: 5,
+      grantsPending: [],
+      grantsDropped: ['C:\\gone'],
+    }
+
+    it('not set: no separate recovery is run', async () => {
+      await SandboxManager.initialize(config())
+      expect(aclCalls).toEqual(START)
+    })
+
+    it('set: recovery runs before the grant and its report is passed on', async () => {
+      aclResult.recover = exit(0, JSON.stringify(REPORT))
+      const seen: unknown[] = []
+      await SandboxManager.initialize(config(), undefined, false, {
+        onWindowsAclRecovery: r => seen.push(r),
+      })
+      expect(aclCalls).toEqual(['recover', ...START])
+      expect(seen).toEqual([REPORT])
+    })
+
+    it('a pending grant: srt-win exits non-zero, the report is still passed on', async () => {
+      const pending = { ...REPORT, grantsPending: ['C:\\tree'] }
+      aclResult.recover = exit(1, JSON.stringify(pending))
+      const seen: unknown[] = []
+      await SandboxManager.initialize(config(), undefined, false, {
+        onWindowsAclRecovery: r => seen.push(r),
+      })
+      expect(seen).toEqual([pending])
+      expect(aclCalls).toEqual(['recover', ...START])
+    })
+
+    for (const [how, result] of [
+      ['an srt-win without the flag', () => exit(2, '')],
+      ['a report with a missing count', () => exit(0, '{"deadBrokers":1}')],
+      ['unparseable output', () => exit(0, 'not json')],
+    ] as Revoke[]) {
+      it(`${how}: no report, the session still starts`, async () => {
+        aclResult.recover = result()
+        const seen: unknown[] = []
+        await SandboxManager.initialize(config(), undefined, false, {
+          onWindowsAclRecovery: r => seen.push(r),
+        })
+        expect(seen).toEqual([])
+        expect(aclCalls).toEqual(['recover', ...START])
+      })
+    }
   })
 
   it('initialize() failure cleanup: an incomplete release is retried by reset()', async () => {

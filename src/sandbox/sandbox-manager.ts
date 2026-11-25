@@ -83,6 +83,8 @@ import {
   rankWindowsFsAccess,
   restoreWindowsAcl,
   grantWindowsAclPersistent,
+  recoverWindowsAclAsync,
+  type WindowsAclRecoveryReport,
   WINDOWS_INSTALL_COMMAND,
   windowsSetupVersionMismatch,
   windowsSrtWinOutdatedError,
@@ -558,8 +560,8 @@ const WINDOWS_ACL_RESTORE_DONE = new Set([
 
 /**
  * {@link reset} could not release this process's Windows ACL session:
- * a grant or deny ACE may still be on disk. The session is kept, so the
- * next reset() runs the release again.
+ * a grant or deny ACE may still be on disk. The release stays pending:
+ * the next reset() runs it again.
  */
 export class WindowsAclReleaseError extends Error {
   readonly code = 'acl_release_failed'
@@ -1223,6 +1225,14 @@ export interface SandboxInitializeOptions {
    */
   onWindowsProfileGrantProgress?: (line: string) => void
   /**
+   * Windows, srt-win backend: when set, initialize() first runs srt-win's
+   * crash recovery on its own and calls this with what it found: holders
+   * that died without releasing their ACEs, the ACEs removed, and grants
+   * that could not be released (`grantsPending`, possibly still on disk).
+   * Not called when the recovery printed no report.
+   */
+  onWindowsAclRecovery?: (report: WindowsAclRecoveryReport) => void
+  /**
    * Windows, `windows.backend: 'mxc'`: for embedders that bundle the MXC
    * SDK, an object with its `probe()` and `spawn()`. The session uses it,
    * and `@microsoft/mxc-sdk` is not resolved.
@@ -1761,6 +1771,22 @@ async function initializeSteps(
         )
       }
       const sb = u.sid
+      // Asked for: run crash recovery on its own first, so its counts
+      // reach the embedder. Best-effort: the grant below recovers too.
+      const onRecovery = options?.onWindowsAclRecovery
+      if (onRecovery) {
+        let report: WindowsAclRecoveryReport | undefined
+        try {
+          report = await recoverWindowsAclAsync({ srtWin })
+        } catch (e) {
+          logForDebugging(
+            `[Sandbox Windows] acl recover: ${(e as Error).message}`,
+            { level: 'warn' },
+          )
+        }
+        stopIfReset()
+        if (report) onRecovery(report)
+      }
       // Record module-level state BEFORE the first acl call so the
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
