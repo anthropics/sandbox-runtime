@@ -532,10 +532,10 @@ export const CredentialSourceConfigSchema = z
           'at the deadline, but a grandchild holding its stdout can still ' +
           'delay the wrap past it, so a source command should not fork ' +
           'anything that outlives it. A prompt shown by another process ' +
-          '(the macOS keychain dialog) stays open after the deadline, and ' +
-          'a late answer has no effect: the timeout is cached for the ' +
-          'session (reset() clears it). Give sources that wait on a person ' +
-          'a longer budget.',
+          '(the macOS keychain dialog, the 1Password app) stays open after ' +
+          'the deadline, and a late answer has no effect: the timeout is ' +
+          'cached for the session (reset() clears it). Give sources that ' +
+          'wait on a person a longer budget.',
       ),
   })
   .strict()
