@@ -1981,7 +1981,14 @@ async function initializeSteps(
             (before.dir === 'absent' ||
               windowsPlainDirectory(windowsAclStateDir(srtWin)!) === before.dir)
           : checkedStateDir !== undefined && before?.dir === checkedStateDir
-      if (!sameStateDir) drainWindowsAclReleasesSharingLedger(sb, srtWin)
+      if (!sameStateDir) {
+        try {
+          drainWindowsAclReleasesSharingLedger(sb, srtWin)
+        } catch (e) {
+          if (generation === initializeGeneration) srtWinSpawn = undefined
+          throw e
+        }
+      }
       const context: WindowsAclContext = { sandboxUserSid: sb, srtWin }
       grantContext = context
       // Reset can take ownership while this helper still has work to do.

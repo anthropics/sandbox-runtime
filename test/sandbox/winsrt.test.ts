@@ -5360,6 +5360,8 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
           if (earlierStillFails) {
             expect(started).toBeInstanceOf(m.WindowsAclReleaseError)
             expect(aclCalls).toEqual(['recover', 'revoke', 'restore'])
+            expect(m.SandboxManager.getWindowsBackend?.()).toBeUndefined()
+            expect(m.SandboxManager.getConfig()).toBeUndefined()
           } else {
             expect(started).toBeUndefined()
             expect(aclCalls).toEqual(['recover', 'revoke', 'restore', 'grant'])
