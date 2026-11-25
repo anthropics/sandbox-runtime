@@ -4019,6 +4019,7 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
   let verifyResult: () => Promise<unknown>
   let spies: { mockRestore(): void }[]
   let dir: string
+  let ledger: { restore(): void }
 
   const subs = () => acl.map(c => c.sub)
 
@@ -4031,6 +4032,7 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
     aclResult = {}
     verifyCalls = []
     verifyResult = () => Promise.resolve({ outcome: 'blocked' })
+    ledger = stubWindowsAclLedger()
     dir = mkdtempSync(join(tmpdir(), 'srt-persist-'))
     mkdirSync(join(dir, 'secret'))
     spies = [
@@ -4091,9 +4093,13 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
 
   afterEach(async () => {
     aclResult = {}
-    await SandboxManager.reset()
-    for (const s of spies) s.mockRestore()
-    rmSync(dir, { recursive: true, force: true })
+    try {
+      await SandboxManager.reset()
+    } finally {
+      for (const s of spies) s.mockRestore()
+      rmSync(dir, { recursive: true, force: true })
+      ledger.restore()
+    }
   })
 
   const config = (): SandboxRuntimeConfig => ({
@@ -4536,10 +4542,13 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     aclResult = {}
     failedRestoreExe = undefined
     afterRevoke = undefined
-    await SandboxManager.reset()
-    for (const s of spies) s.mockRestore()
-    rmSync(dir, { recursive: true, force: true })
-    ledger.restore()
+    try {
+      await SandboxManager.reset()
+    } finally {
+      for (const s of spies) s.mockRestore()
+      rmSync(dir, { recursive: true, force: true })
+      ledger.restore()
+    }
   })
 
   const config = (): SandboxRuntimeConfig => ({
@@ -8285,11 +8294,14 @@ describe('Windows profile read grant (pure, all platforms)', () => {
 
   afterEach(async () => {
     syncResult = {}
-    await SandboxManager.reset()
-    for (const s of spies) s.mockRestore()
-    rmSync(home, { recursive: true, force: true })
-    rmSync(work, { recursive: true, force: true })
-    ledger.restore()
+    try {
+      await SandboxManager.reset()
+    } finally {
+      for (const s of spies) s.mockRestore()
+      rmSync(home, { recursive: true, force: true })
+      rmSync(work, { recursive: true, force: true })
+      ledger.restore()
+    }
   })
 
   const config = (
