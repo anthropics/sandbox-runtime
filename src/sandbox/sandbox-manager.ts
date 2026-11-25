@@ -541,14 +541,77 @@ function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   return false
 }
 
+// `acl restore` statuses that leave no deny ACE of this holder behind
+// (srt-win's `AceRelease::is_pending` is false for them). Any other
+// status, including one this code does not know, keeps the release
+// pending.
+const WINDOWS_ACL_RESTORE_DONE = new Set([
+  ...WINDOWS_ACL_RELEASE_OK,
+  'downgraded',
+  'relocated',
+  'mismatch',
+  'gone',
+  'noRow',
+  'dropped',
+  'missing',
+])
+
+/**
+ * {@link reset} could not release this process's Windows ACL session:
+ * a grant or deny ACE may still be on disk. The session is kept, so the
+ * next reset() runs the release again.
+ */
+export class WindowsAclReleaseError extends Error {
+  readonly code = 'acl_release_failed'
+  constructor(
+    /** The `srt-win acl` step that did not complete. */
+    readonly step: 'revoke' | 'restore',
+    /** Paths reported as not released; empty when srt-win reported none. */
+    readonly paths: readonly string[],
+  ) {
+    super(
+      `Windows ACL ${step} did not complete; ACEs may be left in place` +
+        (paths.length > 0 ? ` at ${paths.map(p => `'${p}'`).join(', ')}` : '') +
+        '. Call reset() again to retry.',
+    )
+    this.name = 'WindowsAclReleaseError'
+  }
+}
+
+// A session whose release failed: what the next reset() releases with.
+// Cleared once a release of this holder completes.
+let windowsAclReleasePending:
+  | { sandboxUserSid: string; srtWin: SrtWinSpawn | undefined }
+  | undefined
+
+/**
+ * Revoke, then (only after a completed revoke) restore this holder's
+ * ACEs. Returns the failure, if any, and records it for the next reset().
+ */
 function releaseWindowsSessionAcls(
   sandboxUserSid: string,
   srtWin: SrtWinSpawn | undefined,
-): void {
+): WindowsAclReleaseError | undefined {
   const o = { sandboxUserSid, srtWin }
-  if (windowsAclRestoreAllowed(revokeWindowsAclChecked(o))) {
-    logWindowsAclOutcomes('deny restore', restoreWindowsAcl(o))
+  let failure: WindowsAclReleaseError | undefined
+  const revoke = revokeWindowsAclChecked(o)
+  if (!windowsAclRestoreAllowed(revoke)) {
+    failure = new WindowsAclReleaseError('revoke', revoke.pending)
+  } else {
+    const restore = restoreWindowsAcl(o)
+    logWindowsAclOutcomes('deny restore', restore)
+    const left = (restore ?? []).filter(
+      e => !WINDOWS_ACL_RESTORE_DONE.has(e.status),
+    )
+    if (restore === undefined || left.length > 0) {
+      failure = new WindowsAclReleaseError(
+        'restore',
+        left.map(e => e.path),
+      )
+    }
   }
+  windowsAclReleasePending = failure ? o : undefined
+  return failure
 }
 
 /**
@@ -3682,9 +3745,11 @@ function forceCloseHttpServer(
 async function reset(): Promise<void> {
   initializeGeneration++
   windowsProfileGrantAbort?.abort()
-  // Windows: release this session's sandbox-user ACEs. Best-effort:
-  // log anomalies rather than throw, so teardown always completes.
+  // Windows: release this session's sandbox-user ACEs, or retry the
+  // release an earlier reset() could not finish. The rest of the
+  // teardown always runs; a failed release rejects at the end.
   // Persistent write roots and the denies under them are not released.
+  let windowsAclReleaseFailure: WindowsAclReleaseError | undefined
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
@@ -3692,7 +3757,10 @@ async function reset(): Promise<void> {
     const srtWin = srtWinSpawn
     // The 'exit'/signal handler lands here too: this part of
     // reset() runs synchronously.
-    releaseWindowsSessionAcls(sb, srtWin)
+    windowsAclReleaseFailure = releaseWindowsSessionAcls(sb, srtWin)
+  } else if (windowsAclReleasePending) {
+    const { sandboxUserSid, srtWin } = windowsAclReleasePending
+    windowsAclReleaseFailure = releaseWindowsSessionAcls(sandboxUserSid, srtWin)
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
@@ -3809,6 +3877,7 @@ async function reset(): Promise<void> {
   commandTextsByKey.clear()
   commandNetworkListsByKey.clear()
   maskedFileStore.dispose()
+  if (windowsAclReleaseFailure) throw windowsAclReleaseFailure
 }
 
 /**

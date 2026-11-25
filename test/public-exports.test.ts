@@ -33,6 +33,7 @@ const PUBLIC_VALUE_EXPORTS = [
   'WINDOWS_ALLOW_LOOPBACK_EFFECT',
   'WINDOWS_LOOPBACK_PROBE_PORT',
   'WINDOWS_PROFILE_READ_ENV_VARS',
+  'WindowsAclReleaseError',
   'WindowsConfigSchema',
   'WindowsSandboxError',
   'buildGitConfigEnv',

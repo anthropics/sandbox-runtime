@@ -33,6 +33,7 @@ import { spawnAsync } from '../helpers/spawn.js'
 import {
   SandboxInitializeConflictError,
   SandboxManager,
+  WindowsAclReleaseError,
   resolveCommandText,
   windowsProfileReadWarningsOf,
 } from '../../src/sandbox/sandbox-manager.js'
@@ -4511,10 +4512,15 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   const WITH_RESTORE = [...START, 'revoke', 'restore']
 
   for (const [how, result] of INCOMPLETE_REVOKES) {
-    it(`reset(): revoke ${how} → restore is not spawned`, async () => {
+    it(`reset(): revoke ${how} → restore is not spawned, reset() rejects`, async () => {
       await SandboxManager.initialize(config())
       aclResult.revoke = result()
-      await SandboxManager.reset()
+      const e = await SandboxManager.reset().then(
+        () => undefined,
+        (err: unknown) => err,
+      )
+      expect(e).toBeInstanceOf(WindowsAclReleaseError)
+      expect((e as WindowsAclReleaseError).step).toBe('revoke')
       expect(aclCalls).toEqual(NO_RESTORE)
     })
 
@@ -4569,13 +4575,104 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   it('reset(): a complete revoke after an incomplete one → restore runs', async () => {
     await SandboxManager.initialize(config())
     aclResult.revoke = reports('unreadable')
-    await SandboxManager.reset()
+    await expect(SandboxManager.reset()).rejects.toBeInstanceOf(
+      WindowsAclReleaseError,
+    )
     expect(aclCalls).toEqual(NO_RESTORE)
     aclCalls = []
     aclResult = {}
     await SandboxManager.initialize(config())
     await SandboxManager.reset()
     expect(aclCalls).toEqual(WITH_RESTORE)
+  })
+
+  it('reset(): an incomplete revoke is retried by the next reset()', async () => {
+    await SandboxManager.initialize(config())
+    aclResult.revoke = reports('unreadable', 'C:\\tree')
+    const e = await SandboxManager.reset().then(
+      () => undefined,
+      (err: unknown) => err as WindowsAclReleaseError,
+    )
+    expect(e?.code).toBe('acl_release_failed')
+    expect(e?.paths).toEqual(['C:\\tree'])
+    // The rest of the teardown ran.
+    expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
+    // Still failing: rejects again, still no restore.
+    await expect(SandboxManager.reset()).rejects.toBeInstanceOf(
+      WindowsAclReleaseError,
+    )
+    expect(aclCalls).toEqual([...START, 'revoke', 'revoke'])
+    aclResult = {}
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual([
+      ...START,
+      'revoke',
+      'revoke',
+      'revoke',
+      'restore',
+    ])
+    // Released: nothing is left to retry.
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual([
+      ...START,
+      'revoke',
+      'revoke',
+      'revoke',
+      'restore',
+    ])
+  })
+
+  for (const [how, result] of [
+    ['exits non-zero', () => exit(1, '[{"path":"p","status":"failed"}]')],
+    [
+      'reports "unreadable"',
+      () => exit(1, '[{"path":"p","status":"unreadable"}]'),
+    ],
+    [
+      'reports a status this code does not know',
+      () => exit(0, '[{"path":"p","status":"someLaterStatus"}]'),
+    ],
+    ['prints unparseable output', () => exit(0, 'not json')],
+  ] as Revoke[]) {
+    it(`reset(): restore ${how} → reset() rejects, the next reset() retries`, async () => {
+      await SandboxManager.initialize(config())
+      aclResult.restore = result()
+      const e = await SandboxManager.reset().then(
+        () => undefined,
+        (err: unknown) => err as WindowsAclReleaseError,
+      )
+      expect(e).toBeInstanceOf(WindowsAclReleaseError)
+      expect(e?.step).toBe('restore')
+      expect(aclCalls).toEqual(WITH_RESTORE)
+      aclResult = {}
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual([...WITH_RESTORE, 'revoke', 'restore'])
+    })
+  }
+
+  it('reset(): a restore that reports every path released resolves', async () => {
+    await SandboxManager.initialize(config())
+    aclResult.restore = exit(
+      0,
+      JSON.stringify(
+        ['revoked', 'stillHeld', 'gone', 'noRow', 'mismatch'].map(status => ({
+          path: 'p',
+          status,
+        })),
+      ),
+    )
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual(WITH_RESTORE)
+  })
+
+  it('initialize() failure cleanup: an incomplete release is retried by reset()', async () => {
+    aclResult.revoke = reports('unreadable')
+    const e = await failingInitialize()
+    expect(e.code).toBe(START_FAILED)
+    expect(aclCalls).toEqual(NO_RESTORE)
+    aclResult = {}
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual([...NO_RESTORE, 'revoke', 'restore'])
   })
 
   it('restoreWindowsAcl surfaces a refusal by srt-win', () => {
@@ -4596,11 +4693,14 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     expect(r.pending).toEqual(['C:\\tree'])
   })
 
-  it('reset(): a restore that fails after a completed revoke stays best-effort', async () => {
+  it('reset(): a restore that fails after a completed revoke rejects once teardown is done', async () => {
     await SandboxManager.initialize(config())
     aclResult.restore = exit(1, 'boom')
-    await SandboxManager.reset()
+    await expect(SandboxManager.reset()).rejects.toBeInstanceOf(
+      WindowsAclReleaseError,
+    )
     expect(aclCalls).toEqual(WITH_RESTORE)
+    expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
   })
 })
 
