@@ -5449,6 +5449,27 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         expect(aclCalls).toEqual(['grant'])
       })
     })
+
+    it('round 8: a dangling junction at grant start is not an absent state directory', async () => {
+      await withFreshManager(async m => {
+        rmSync(stateDir(), { recursive: true, force: true })
+        aclResult.recover = exit(0, JSON.stringify(RECOVERY))
+        await initializeAround(
+          m,
+          () => {
+            fs.rmdirSync(stateDir())
+            mkdirSync(stateDir())
+            writeFileSync(ledgerFile(), '')
+          },
+          {
+            onWindowsAclRecovery: () =>
+              symlinkSync(join(dir, 'gone'), stateDir(), 'junction'),
+          },
+        )
+        await unestablished(m)
+        expect(aclCalls).toEqual(['recover', 'grant'])
+      })
+    })
   })
 
   for (const [how, status, body, paths] of [

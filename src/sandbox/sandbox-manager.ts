@@ -602,13 +602,20 @@ function windowsAclReleaseKey({
 }
 
 /**
- * Identity of the object at `p`, links followed; `'absent'` only when it
- * does not exist, and unset when it could not be read.
+ * Identity of the object at `p`, links followed; `'absent'` only when no
+ * entry exists there (a dangling link is not absent), and unset when it
+ * could not be read.
  */
 function observeWindowsFile(p: string): string | 'absent' | undefined {
   try {
     const { dev, ino } = fs.statSync(p, { bigint: true })
     return ino === 0n ? undefined : `${dev}:${ino}`
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') return undefined
+  }
+  try {
+    fs.lstatSync(p)
+    return undefined
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : undefined
   }
