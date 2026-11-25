@@ -577,52 +577,79 @@ export class WindowsAclReleaseError extends Error {
 type WindowsAclContext = {
   sandboxUserSid: string
   srtWin: SrtWinSpawn
-  ledger?: { path: string; dev: bigint; ino: bigint }
+  // The ledger the grant recorded into. Unset when it could not be
+  // established, which leaves every release of the context incomplete.
+  ledger?: WindowsAclLedger
 }
+
+/** Identities (`dev:ino`) of the helper's state directory and database. */
+type WindowsAclLedger = { dir: string; db: string }
 
 const windowsAclReleasePending = new Map<string, WindowsAclContext>()
 
 function windowsAclReleaseKey({
   sandboxUserSid,
   srtWin,
+  ledger,
 }: WindowsAclContext): string {
   return JSON.stringify([
     sandboxUserSid,
     srtWin.exe,
     srtWin.prependArgs,
     srtWin.stateEnv,
+    ledger?.db ?? null,
   ])
 }
 
-function readWindowsAclLedger(path: string): WindowsAclContext['ledger'] {
+/** Identity of the object at `p`, links followed; unset if unavailable. */
+function windowsFileIdentity(p: string): string | undefined {
   try {
-    const { dev, ino } = fs.statSync(path, { bigint: true })
-    return { path, dev, ino }
+    const { dev, ino } = fs.statSync(p, { bigint: true })
+    return ino === 0n ? undefined : `${dev}:${ino}`
   } catch {
     return undefined
   }
 }
 
-function windowsAclLedgerBase({
-  srtWin,
-}: WindowsAclContext): string | undefined {
-  return srtWin.stateEnv?.LOCALAPPDATA?.toLowerCase()
+function windowsAclStateDir(srtWin: SrtWinSpawn): string | undefined {
+  const base = srtWin.stateEnv?.LOCALAPPDATA
+  return base ? join(base, 'sandbox-runtime') : undefined
+}
+
+function readWindowsAclLedger(
+  srtWin: SrtWinSpawn,
+): WindowsAclLedger | undefined {
+  const dir = windowsAclStateDir(srtWin)
+  if (!dir) return undefined
+  const dirId = windowsFileIdentity(dir)
+  const dbId = windowsFileIdentity(join(dir, 'state.db'))
+  return dirId && dbId ? { dir: dirId, db: dbId } : undefined
+}
+
+/** The context's recorded ledger is still the one its helper opens. */
+function windowsAclLedgerConfirmed(o: WindowsAclContext): boolean {
+  return (
+    o.ledger !== undefined &&
+    isDeepStrictEqual(readWindowsAclLedger(o.srtWin), o.ledger)
+  )
 }
 
 /**
- * The helper keeps one ledger per state base and selects a holder's rows
- * by PID, so a release for another SID would consume a pending release's
- * rows and leave its ACEs. Retry those releases first; an incomplete one
- * blocks the new session.
+ * The helper keeps one ledger per state directory and selects a holder's
+ * rows by PID, so a release for another SID would consume a pending
+ * release's rows and leave its ACEs. Retry every other-SID release whose
+ * state directory is the same object, or cannot be told apart, first; an
+ * incomplete one blocks the new session.
  */
 function drainWindowsAclReleasesSharingLedger(
   sandboxUserSid: string,
   srtWin: SrtWinSpawn,
 ): void {
-  const base = windowsAclLedgerBase({ sandboxUserSid, srtWin })
+  const stateDir = windowsAclStateDir(srtWin)
+  const dir = stateDir && windowsFileIdentity(stateDir)
   for (const pending of [...windowsAclReleasePending.values()]) {
     if (pending.sandboxUserSid === sandboxUserSid) continue
-    if (windowsAclLedgerBase(pending) !== base) continue
+    if (dir && pending.ledger && pending.ledger.dir !== dir) continue
     const failure = releaseWindowsSessionAcls(pending)
     if (failure) throw failure
   }
@@ -630,35 +657,39 @@ function drainWindowsAclReleasesSharingLedger(
 
 /**
  * Revoke, then (only after a completed revoke) restore this holder's
- * ACEs. Returns the failure, if any, and records it for the next reset().
+ * ACEs. Each call counts only if the recorded ledger is confirmed before
+ * and after it. Returns the failure, if any, and records it for the next
+ * reset().
  */
 function releaseWindowsSessionAcls(
   o: WindowsAclContext,
 ): WindowsAclReleaseError | undefined {
   const key = windowsAclReleaseKey(o)
-  if (
-    o.ledger &&
-    !isDeepStrictEqual(readWindowsAclLedger(o.ledger.path), o.ledger)
-  ) {
-    const failure = new WindowsAclReleaseError('revoke', [])
+  const unconfirmed = (): boolean => {
+    if (windowsAclLedgerConfirmed(o)) return false
     logForDebugging(
       '[Sandbox Windows] the original ACL ledger is unavailable',
       {
         level: 'error',
       },
     )
-    windowsAclReleasePending.set(key, o)
-    return failure
+    return true
   }
   let failure: WindowsAclReleaseError | undefined
-  const revoke = revokeWindowsAclChecked(o)
-  if (!windowsAclRestoreAllowed(revoke)) {
-    failure = new WindowsAclReleaseError('revoke', revoke.pending)
+  if (unconfirmed()) {
+    failure = new WindowsAclReleaseError('revoke', [])
   } else {
-    const restore = restoreWindowsAclChecked(o)
-    logWindowsAclOutcomes('deny restore', restore.outcomes)
-    if (!restore.complete) {
-      failure = new WindowsAclReleaseError('restore', restore.pending)
+    const revoke = revokeWindowsAclChecked(o)
+    if (!windowsAclRestoreAllowed(revoke)) {
+      failure = new WindowsAclReleaseError('revoke', revoke.pending)
+    } else if (unconfirmed()) {
+      failure = new WindowsAclReleaseError('revoke', [])
+    } else {
+      const restore = restoreWindowsAclChecked(o)
+      logWindowsAclOutcomes('deny restore', restore.outcomes)
+      if (!restore.complete || unconfirmed()) {
+        failure = new WindowsAclReleaseError('restore', restore.pending)
+      }
     }
   }
   if (failure) windowsAclReleasePending.set(key, o)
@@ -1866,6 +1897,9 @@ async function initializeSteps(
       const sb = u.sid
       const context: WindowsAclContext = { sandboxUserSid: sb, srtWin }
       grantContext = context
+      // The grant records into the ledger that exists when it starts, or
+      // the one it creates. A release must find that same ledger.
+      context.ledger = readWindowsAclLedger(srtWin)
       // Reset can take ownership while this helper still has work to do.
       const promise = grantWindowsAclPersistent({
         ...context,
@@ -1875,11 +1909,7 @@ async function initializeSteps(
         denyWrite: acc.denyWrite,
         allowProfileExclusions: override,
       }).finally(() => {
-        const base = srtWin.stateEnv?.LOCALAPPDATA
-        const ledger =
-          base &&
-          readWindowsAclLedger(join(base, 'sandbox-runtime', 'state.db'))
-        if (ledger) context.ledger = ledger
+        context.ledger ??= readWindowsAclLedger(srtWin)
       })
       windowsAclGrantInFlight = { context, promise }
       await promise

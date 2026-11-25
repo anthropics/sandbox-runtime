@@ -4296,6 +4296,25 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
   })
 })
 
+/**
+ * Gives stubbed sessions a helper ledger to bind to: a fresh
+ * `LOCALAPPDATA` with `sandbox-runtime/state.db`, as srt-win creates.
+ */
+function stubWindowsAclLedger(): { restore(): void } {
+  const saved = process.env.LOCALAPPDATA
+  const root = mkdtempSync(join(tmpdir(), 'srt-ledger-'))
+  mkdirSync(join(root, 'sandbox-runtime'))
+  writeFileSync(join(root, 'sandbox-runtime', 'state.db'), '')
+  process.env.LOCALAPPDATA = root
+  return {
+    restore() {
+      if (saved === undefined) delete process.env.LOCALAPPDATA
+      else process.env.LOCALAPPDATA = saved
+      rmSync(root, { recursive: true, force: true })
+    },
+  }
+}
+
 describe('Windows session ACLs: restore gated on a completed revoke (pure, all platforms)', () => {
   /** The `acl` call a session start makes. */
   const START = ['grant']
@@ -4411,10 +4430,13 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   let releaseContexts: { exe: string; localAppData?: string }[]
   let sandboxSid: string
   let failedRestoreExe: string | undefined
+  /** Runs inside the stubbed `acl revoke`, before it answers. */
+  let afterRevoke: (() => void) | undefined
   /** spawnSync result per `acl` subcommand; default exit 0, `[]`. */
   let aclResult: Record<string, SyncResult>
   let spies: { mockRestore(): void }[]
   let dir: string
+  let ledger: { restore(): void }
 
   beforeEach(() => {
     aclCalls = []
@@ -4424,7 +4446,9 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     grantGate = undefined
     sandboxSid = SID
     failedRestoreExe = undefined
+    afterRevoke = undefined
     aclResult = {}
+    ledger = stubWindowsAclLedger()
     dir = mkdtempSync(join(tmpdir(), 'srt-acl-gate-'))
     mkdirSync(join(dir, 'secret'))
     spies = [
@@ -4494,6 +4518,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
             sub,
           })
         }
+        if (sub === 'revoke') afterRevoke?.()
         if (sub === 'restore' && _exe === failedRestoreExe) {
           return reports('failed', 'first-path')
         }
@@ -4506,9 +4531,11 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   afterEach(async () => {
     aclResult = {}
     failedRestoreExe = undefined
+    afterRevoke = undefined
     await SandboxManager.reset()
     for (const s of spies) s.mockRestore()
     rmSync(dir, { recursive: true, force: true })
+    ledger.restore()
   })
 
   const config = (): SandboxRuntimeConfig => ({
@@ -4692,6 +4719,8 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     sandboxSid = secondSid
     const next = { ...config(), windows: { srtWin: { path: secondPath } } }
     const oldLocalAppData = process.env.LOCALAPPDATA
+    mkdirSync(join(dir, 'sandbox-runtime'))
+    writeFileSync(join(dir, 'sandbox-runtime', 'state.db'), '')
     process.env.LOCALAPPDATA = dir
     try {
       await SandboxManager.initialize(next)
@@ -4774,6 +4803,8 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     for (const base of [first, second]) {
       mkdirSync(base)
       writeFileSync(join(base, 'srt.exe'), '')
+      mkdirSync(join(base, 'sandbox-runtime'))
+      writeFileSync(join(base, 'sandbox-runtime', 'state.db'), '')
     }
     const firstExe = join(first, 'srt.exe')
     const configuredPath = relative(first, firstExe)
@@ -4884,6 +4915,146 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       expect(aclCalls).toEqual(['grant', 'revoke', 'revoke', 'restore'])
     })
   }
+
+  describe('round 4: releases bound to the grant ledger', () => {
+    const stateDir = () => join(process.env.LOCALAPPDATA!, 'sandbox-runtime')
+    const ledgerFile = () => join(stateDir(), 'state.db')
+    /** Moves the ledger aside and leaves a new, empty one in its place. */
+    const replaceLedger = () => {
+      const aside = ledgerFile() + '.aside'
+      fs.renameSync(ledgerFile(), aside)
+      writeFileSync(ledgerFile(), '')
+      return () => {
+        rmSync(ledgerFile(), { force: true })
+        fs.renameSync(aside, ledgerFile())
+      }
+    }
+
+    it('round 4: another SID whose state directory aliases the pending ledger waits', async () => {
+      await SandboxManager.initialize(config())
+      failedRestoreExe = STUB_SRT_WIN.exe
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      const original = process.env.LOCALAPPDATA!
+      const alias = join(dir, 'alias-root')
+      mkdirSync(alias)
+      symlinkSync(stateDir(), join(alias, 'sandbox-runtime'), 'junction')
+      const next = join(dir, 'other-srt.exe')
+      writeFileSync(next, '')
+      sandboxSid = 'S-1-5-21-4'
+      process.env.LOCALAPPDATA = alias
+      try {
+        await expect(
+          SandboxManager.initialize({
+            ...config(),
+            windows: { srtWin: { path: next } },
+          }),
+        ).rejects.toBeInstanceOf(WindowsAclReleaseError)
+      } finally {
+        process.env.LOCALAPPDATA = original
+        failedRestoreExe = undefined
+      }
+      expect(aclCalls).toEqual([
+        ...START,
+        'revoke',
+        'restore',
+        'revoke',
+        'restore',
+      ])
+      expect(new Set(releaseCalls.map(c => c.sid))).toEqual(new Set([SID]))
+    })
+
+    it('round 4: another SID whose state directory cannot be identified waits', async () => {
+      await SandboxManager.initialize(config())
+      failedRestoreExe = STUB_SRT_WIN.exe
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      const original = process.env.LOCALAPPDATA!
+      const fresh = join(dir, 'fresh-root')
+      mkdirSync(fresh)
+      sandboxSid = 'S-1-5-21-4'
+      process.env.LOCALAPPDATA = fresh
+      try {
+        await expect(
+          SandboxManager.initialize(config()),
+        ).rejects.toBeInstanceOf(WindowsAclReleaseError)
+      } finally {
+        process.env.LOCALAPPDATA = original
+        failedRestoreExe = undefined
+      }
+      expect(aclCalls).toEqual([
+        ...START,
+        'revoke',
+        'restore',
+        'revoke',
+        'restore',
+      ])
+    })
+
+    it('round 4: a release on a replacement ledger keeps the original pending', async () => {
+      await SandboxManager.initialize(config())
+      aclResult.revoke = reports('unreadable')
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      aclResult = {}
+      const putBack = replaceLedger()
+      try {
+        await SandboxManager.initialize(config())
+        expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+        // The new session's own release ran; the original one did not.
+        expect(aclCalls).toEqual([...NO_RESTORE, 'grant', 'revoke', 'restore'])
+      } finally {
+        putBack()
+      }
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual([
+        ...NO_RESTORE,
+        'grant',
+        'revoke',
+        'restore',
+        'revoke',
+        'restore',
+      ])
+    })
+
+    it('round 4: a ledger that disappears during the grant keeps the release incomplete', async () => {
+      const started = new Promise<void>(resolve => {
+        grantStarted = resolve
+      })
+      let finishGrant!: () => void
+      grantGate = new Promise<void>(resolve => {
+        finishGrant = resolve
+      })
+      const initializing = SandboxManager.initialize(config())
+      await started
+      const aside = ledgerFile() + '.aside'
+      fs.renameSync(ledgerFile(), aside)
+      try {
+        finishGrant()
+        await initializing
+        expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+        expect(aclCalls).toEqual(['grant'])
+      } finally {
+        fs.renameSync(aside, ledgerFile())
+      }
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual(['grant', 'revoke', 'restore'])
+    })
+
+    it('round 4: a ledger replaced between revoke and restore keeps the release incomplete', async () => {
+      await SandboxManager.initialize(config())
+      let putBack: (() => void) | undefined
+      afterRevoke = () => {
+        afterRevoke = undefined
+        putBack = replaceLedger()
+      }
+      try {
+        expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+        expect(aclCalls).toEqual(NO_RESTORE)
+      } finally {
+        putBack?.()
+      }
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual([...NO_RESTORE, 'revoke', 'restore'])
+    })
+  })
 
   for (const [how, status, body, paths] of [
     ['unrecognized object', 0, {}, []],
@@ -7581,7 +7752,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       elapsed_ms: 1234,
     })
 
+  let ledger: { restore(): void }
   beforeEach(() => {
+    ledger = stubWindowsAclLedger()
     briefGrant = { state: 'present' }
     realUserSid = REAL_USER
     sessionUserSid = REAL_USER
@@ -7736,6 +7909,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     for (const s of spies) s.mockRestore()
     rmSync(home, { recursive: true, force: true })
     rmSync(work, { recursive: true, force: true })
+    ledger.restore()
   })
 
   const config = (
