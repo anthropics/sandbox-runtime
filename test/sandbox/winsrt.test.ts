@@ -1467,6 +1467,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
   let sub: string
   let sub2: string
   let token: string
+  let ledger: { restore(): void }
 
   const configOf = (
     filesystem: Partial<SandboxRuntimeConfig['filesystem']>,
@@ -1499,6 +1500,7 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
 
   beforeEach(() => {
     granted = stamped = undefined
+    ledger = stubWindowsAclLedger()
     root = realpathSync.native(mkdtempSync(join(tmpdir(), 'srt-handed-')))
     d = join(root, 'd')
     sub = join(d, 'sub')
@@ -1605,9 +1607,13 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
   })
 
   afterEach(async () => {
-    await SandboxManager.reset()
-    for (const spy of spies.splice(0)) spy.mockRestore()
-    rmSync(root, { recursive: true, force: true })
+    try {
+      await SandboxManager.reset()
+    } finally {
+      for (const spy of spies.splice(0)) spy.mockRestore()
+      rmSync(root, { recursive: true, force: true })
+      ledger.restore()
+    }
   })
 
   const VERIFY_OK: WindowsWfpVerifyResult = {
