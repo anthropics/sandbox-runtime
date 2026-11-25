@@ -24,7 +24,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, relative } from 'node:path'
 import * as net from 'node:net'
 import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
@@ -519,7 +519,11 @@ function madeWithoutBlocking(argv: readonly string[]): boolean {
  * A fake child for an asynchronous `srt-win` call, answered by the test's
  * `spawnSync` mock once its stdin has been written.
  */
-function asyncChildAnsweredBySync(exe: string, argv: readonly string[]) {
+function asyncChildAnsweredBySync(
+  exe: string,
+  argv: readonly string[],
+  env?: NodeJS.ProcessEnv,
+) {
   const mkStream = () => {
     const s = new EventEmitter() as EventEmitter & {
       setEncoding(e: string): typeof s
@@ -539,6 +543,7 @@ function asyncChildAnsweredBySync(exe: string, argv: readonly string[]) {
     setImmediate(() => {
       const r = child_process.spawnSync(exe, [...argv], {
         input,
+        env,
       }) as unknown as {
         status: number | null
         stdout?: string
@@ -4400,6 +4405,10 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   /** `acl` subcommands spawned, in order. */
   let aclCalls: string[]
   let releaseCalls: { exe: string; sid: string; sub: string }[]
+  let grantStarted: (() => void) | undefined
+  let grantGate: Promise<void> | undefined
+  let grantContext: { exe: string; localAppData?: string }
+  let releaseContexts: { exe: string; localAppData?: string }[]
   let sandboxSid: string
   let failedRestoreExe: string | undefined
   /** spawnSync result per `acl` subcommand; default exit 0, `[]`. */
@@ -4410,6 +4419,9 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   beforeEach(() => {
     aclCalls = []
     releaseCalls = []
+    releaseContexts = []
+    grantStarted = undefined
+    grantGate = undefined
     sandboxSid = SID
     failedRestoreExe = undefined
     aclResult = {}
@@ -4425,9 +4437,20 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       spyOn(child_process, 'spawn').mockImplementation(((
         _exe: string,
         argv: readonly string[],
+        opts?: { env?: NodeJS.ProcessEnv },
       ) => {
-        if (madeWithoutBlocking(argv))
-          return asyncChildAnsweredBySync(_exe, argv)
+        if (madeWithoutBlocking(argv)) {
+          const child = asyncChildAnsweredBySync(_exe, argv, opts?.env)
+          if (grantGate && argv.includes('grant')) {
+            const stdinEnd = child.stdin.end
+            const gate = grantGate
+            child.stdin.end = input => {
+              grantStarted?.()
+              void gate.then(() => stdinEnd(input))
+            }
+          }
+          return child
+        }
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -4453,10 +4476,17 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       spyOn(child_process, 'spawnSync').mockImplementation(((
         _exe: string,
         argv: readonly string[],
+        opts?: { env?: NodeJS.ProcessEnv },
       ) => {
+        const context = {
+          exe: _exe,
+          localAppData: (opts?.env ?? process.env).LOCALAPPDATA,
+        }
         if (!argv.includes('acl')) return exit(0, stdoutFor(argv))
         const sub = argv[argv.indexOf('acl') + 1]
         aclCalls.push(sub)
+        if (sub === 'grant') grantContext = context
+        if (sub === 'revoke' || sub === 'restore') releaseContexts.push(context)
         if (sub === 'revoke' || sub === 'restore') {
           releaseCalls.push({
             exe: _exe,
@@ -4661,7 +4691,14 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
     sandboxSid = secondSid
     const next = { ...config(), windows: { srtWin: { path: secondPath } } }
-    await SandboxManager.initialize(next)
+    const oldLocalAppData = process.env.LOCALAPPDATA
+    process.env.LOCALAPPDATA = dir
+    try {
+      await SandboxManager.initialize(next)
+    } finally {
+      if (oldLocalAppData === undefined) delete process.env.LOCALAPPDATA
+      else process.env.LOCALAPPDATA = oldLocalAppData
+    }
     expect(await resetError()).toMatchObject({
       step: 'restore',
       paths: ['first-path'],
@@ -4679,6 +4716,174 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     await SandboxManager.reset()
     expect(releaseCalls).toEqual(callsFor(firstExe, SID))
   })
+
+  it('round 3: a different SID cannot initialize over a pending shared ledger', async () => {
+    await SandboxManager.initialize(config())
+    failedRestoreExe = STUB_SRT_WIN.exe
+    expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+    const next = join(dir, 'other-srt.exe')
+    writeFileSync(next, '')
+    try {
+      sandboxSid = 'S-1-5-21-4'
+      await expect(
+        SandboxManager.initialize({
+          ...config(),
+          windows: { srtWin: { path: next } },
+        }),
+      ).rejects.toBeInstanceOf(WindowsAclReleaseError)
+      // The earlier release is retried first and still fails: no grant.
+      expect(aclCalls).toEqual([
+        ...START,
+        'revoke',
+        'restore',
+        'revoke',
+        'restore',
+      ])
+      expect(new Set(releaseCalls.map(c => c.sid))).toEqual(new Set([SID]))
+    } finally {
+      failedRestoreExe = undefined
+    }
+    // Once that release completes, the other SID can start a session.
+    await SandboxManager.initialize({
+      ...config(),
+      windows: { srtWin: { path: next } },
+    })
+    expect(aclCalls).toEqual([
+      ...START,
+      'revoke',
+      'restore',
+      'revoke',
+      'restore',
+      'revoke',
+      'restore',
+      'grant',
+    ])
+    expect(new Set(releaseCalls.map(c => c.sid))).toEqual(new Set([SID]))
+    await SandboxManager.reset()
+    expect(releaseCalls.slice(-2).map(c => c.sid)).toEqual([
+      'S-1-5-21-4',
+      'S-1-5-21-4',
+    ])
+  })
+
+  it('round 3: retry addresses the original executable and state base', async () => {
+    const oldCwd = process.cwd()
+    const oldLocalAppData = process.env.LOCALAPPDATA
+    const first = join(dir, 'first')
+    const second = join(dir, 'second')
+    for (const base of [first, second]) {
+      mkdirSync(base)
+      writeFileSync(join(base, 'srt.exe'), '')
+    }
+    const firstExe = join(first, 'srt.exe')
+    const configuredPath = relative(first, firstExe)
+    try {
+      process.chdir(first)
+      process.env.LOCALAPPDATA = first
+      await SandboxManager.initialize({
+        ...config(),
+        windows: { srtWin: { path: configuredPath } },
+      })
+      aclResult.revoke = reports('unreadable')
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      aclResult = {}
+      process.chdir(second)
+      process.env.LOCALAPPDATA = second
+      await SandboxManager.reset()
+      expect(grantContext).toEqual({ exe: firstExe, localAppData: first })
+      expect(releaseContexts).toEqual([
+        grantContext,
+        grantContext,
+        grantContext,
+      ])
+    } finally {
+      process.chdir(oldCwd)
+      if (oldLocalAppData === undefined) delete process.env.LOCALAPPDATA
+      else process.env.LOCALAPPDATA = oldLocalAppData
+    }
+  })
+
+  it('round 3: a missing original ledger keeps the release pending', async () => {
+    const oldLocalAppData = process.env.LOCALAPPDATA
+    const stateDir = join(dir, 'sandbox-runtime')
+    mkdirSync(stateDir)
+    const ledger = join(stateDir, 'state.db')
+    const moved = join(stateDir, 'moved.db')
+    writeFileSync(ledger, '')
+    try {
+      process.env.LOCALAPPDATA = dir
+      await SandboxManager.initialize(config())
+      aclResult.revoke = reports('unreadable')
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      aclResult = {}
+      fs.renameSync(ledger, moved)
+      try {
+        expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+        expect(aclCalls).toEqual(NO_RESTORE)
+      } finally {
+        fs.renameSync(moved, ledger)
+      }
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual([...NO_RESTORE, 'revoke', 'restore'])
+    } finally {
+      if (oldLocalAppData === undefined) delete process.env.LOCALAPPDATA
+      else process.env.LOCALAPPDATA = oldLocalAppData
+    }
+  })
+
+  it('round 3: malformed revoke keeps pending paths and finishes teardown', async () => {
+    await SandboxManager.initialize(config())
+    aclResult.revoke = exit(
+      0,
+      JSON.stringify([null, { path: 'pending', status: 'unreadable' }]),
+    )
+    expect(await resetError()).toMatchObject({
+      code: 'acl_release_failed',
+      step: 'revoke',
+      paths: ['pending'],
+    })
+    expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
+    expect(aclCalls).toEqual(NO_RESTORE)
+    aclResult = {}
+    await SandboxManager.reset()
+    expect(aclCalls).toEqual([...NO_RESTORE, 'revoke', 'restore'])
+  })
+
+  for (const grantExitCode of [0, 2]) {
+    it(`round 3: reset waits for and releases a delayed grant (exit ${grantExitCode})`, async () => {
+      const started = new Promise<void>(resolve => {
+        grantStarted = resolve
+      })
+      let finishGrant!: () => void
+      grantGate = new Promise<void>(resolve => {
+        finishGrant = resolve
+      })
+      aclResult.grant = exit(grantExitCode, '')
+      aclResult.revoke = reports('unreadable', 'pending')
+      const initializing = SandboxManager.initialize(config()).catch(
+        (e: unknown) => e,
+      )
+      await started
+      const resetting = resetError()
+      try {
+        expect(aclCalls).toEqual([])
+      } finally {
+        finishGrant()
+      }
+      const resetFailure = await resetting
+      expect(await initializing).toBeInstanceOf(Error)
+      expect(resetFailure).toMatchObject({
+        code: 'acl_release_failed',
+        step: 'revoke',
+        paths: ['pending'],
+      })
+      expect(aclCalls).toEqual(['grant', 'revoke'])
+      expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
+      aclResult = {}
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual(['grant', 'revoke', 'revoke', 'restore'])
+    })
+  }
 
   for (const [how, status, body, paths] of [
     ['unrecognized object', 0, {}, []],
@@ -4809,6 +5014,25 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       expect(seen).toEqual([REPORT])
       expect(aclCalls).toEqual(['recover', ...START])
     })
+
+    for (const thrown of [
+      Symbol('callback'),
+      {
+        toString() {
+          throw new Error('conversion')
+        },
+      },
+    ]) {
+      it('round 3: recovery callback may throw an arbitrary value', async () => {
+        aclResult.recover = exit(0, JSON.stringify(REPORT))
+        await SandboxManager.initialize(config(), undefined, false, {
+          onWindowsAclRecovery: () => {
+            throw thrown
+          },
+        })
+        expect(aclCalls).toEqual(['recover', ...START])
+      })
+    }
 
     for (const [how, result] of [
       ['an srt-win without the flag', () => exit(2, '')],

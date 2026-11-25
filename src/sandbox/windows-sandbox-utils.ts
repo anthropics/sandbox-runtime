@@ -6,6 +6,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
+import { realPathOf } from '../utils/real-path.js'
 import {
   generateProxyEnvVars,
   encodeSandboxedCommand,
@@ -771,11 +772,11 @@ export const SRT_WIN_DISPATCH_ARG1 = '--srt-win'
 export type SrtWinSpawn = Readonly<{
   exe: string
   prependArgs: readonly string[]
+  stateEnv?: Readonly<{ LOCALAPPDATA?: string; ProgramData?: string }>
 }>
 
 /**
- * Resolve the `srt-win` spawn target from config. `cfg.path` is
- * required and used verbatim; {@link SRT_WIN_DISPATCH_ARG1} is
+ * Resolve the `srt-win` spawn target from an explicit config path; {@link SRT_WIN_DISPATCH_ARG1} is
  * prepended so a multicall dispatcher routes on `argv[1]` (the
  * standalone binary strips it harmlessly).
  *
@@ -787,7 +788,10 @@ export type SrtWinSpawn = Readonly<{
  *
  * @throws if `cfg.path` is unset or names a missing file.
  */
-export function resolveSrtWin(cfg?: SrtWinConfig): SrtWinSpawn {
+export function resolveSrtWin(
+  cfg?: SrtWinConfig,
+  pinState = false,
+): SrtWinSpawn {
   if (cfg?.path === undefined) {
     throw new WindowsSandboxError(
       'srt_win_not_found',
@@ -795,14 +799,49 @@ export function resolveSrtWin(cfg?: SrtWinConfig): SrtWinSpawn {
         `exported VENDORED_SRT_WIN_EXE constant for the packaged binary)`,
     )
   }
-  if (!fs.existsSync(cfg.path)) {
+  const exe = path.resolve(cfg.path)
+  if (!fs.existsSync(exe)) {
     throw new WindowsSandboxError(
       'srt_win_not_found',
       `windows.srtWin.path is set to '${cfg.path}' but the file does ` +
         `not exist`,
     )
   }
-  return { exe: cfg.path, prependArgs: [SRT_WIN_DISPATCH_ARG1] }
+  return {
+    exe,
+    prependArgs: [SRT_WIN_DISPATCH_ARG1],
+    ...(pinState && {
+      stateEnv: {
+        LOCALAPPDATA: resolveSrtWinStateBase(process.env.LOCALAPPDATA),
+        ProgramData: resolveSrtWinStateBase(process.env.ProgramData),
+      },
+    }),
+  }
+}
+
+function resolveSrtWinStateBase(base: string | undefined): string | undefined {
+  if (!base || !path.isAbsolute(base)) return undefined
+  try {
+    return realPathOf(base)
+  } catch {
+    // The helper may need to create this location on its first call.
+    return path.resolve(base)
+  }
+}
+
+function srtWinEnvironment(
+  srtWin: SrtWinSpawn | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  if (!srtWin?.stateEnv) return env
+  // Clear every spelling of a pinned variable, including when it was unset.
+  const others = Object.fromEntries(
+    Object.entries(env).filter(([key]) => {
+      const name = key.toUpperCase()
+      return name !== 'LOCALAPPDATA' && name !== 'PROGRAMDATA'
+    }),
+  )
+  return { ...others, ...srtWin.stateEnv }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -826,10 +865,12 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
   // Callers must thread `srtWin` (SandboxManager resolves once at
   // `initialize()`); the argless `resolveSrtWin()` throws, telling a
   // direct helper caller to pass an explicit path.
-  const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
+  const srtWin = opts.srtWin ?? resolveSrtWin()
+  const { exe, prependArgs } = srtWin
   const r = spawnSync(exe, [...prependArgs, ...args], {
     encoding: 'utf8',
     windowsHide: true,
+    env: srtWinEnvironment(srtWin),
     timeout: opts.timeoutMs ?? 15_000,
     ...(opts.stdin !== undefined ? { input: opts.stdin } : {}),
   })
@@ -976,11 +1017,13 @@ function runSrtWinAsync(
   args: string[],
   opts: RunOpts = {},
 ): Promise<RunResult> {
-  const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
+  const srtWin = opts.srtWin ?? resolveSrtWin()
+  const { exe, prependArgs } = srtWin
   const timeoutMs = opts.timeoutMs ?? 15_000
   return new Promise((resolve, reject) => {
     const child = spawn(exe, [...prependArgs, ...args], {
       windowsHide: true,
+      env: srtWinEnvironment(srtWin),
     })
     // Manual timer instead of spawn's `timeout` option so a timeout
     // is distinguishable from an external kill — parity with the
@@ -3104,10 +3147,10 @@ const WINDOWS_ACL_GRANT_RELEASED_STATUSES: ReadonlySet<string> = new Set([
  * comes only from an older srt-win, which also says it of a path it
  * could not open, so it counts only if the path is really gone.
  */
-function windowsAclGrantReleased(o: unknown): boolean {
-  if (typeof o !== 'object' || o === null) return false
-  const { path: p, status } = o as Partial<WindowsAclAceOutcome>
-  if (typeof p !== 'string' || typeof status !== 'string') return false
+function windowsAclGrantReleased({
+  path: p,
+  status,
+}: WindowsAclAceOutcome): boolean {
   if (!WINDOWS_ACL_GRANT_RELEASED_STATUSES.has(status)) return false
   if (status !== 'missing') return true
   try {
@@ -3179,33 +3222,13 @@ export function restoreWindowsAclChecked(opts: {
       lists.push(...reported.filter(Array.isArray))
     }
 
-    const outcomes: WindowsAclAceOutcome[] = []
-    const pending: string[] = []
-    for (const list of lists) {
-      for (const entry of list) {
-        const { path, status } =
-          entry !== null && typeof entry === 'object'
-            ? (entry as Partial<Record<keyof WindowsAclAceOutcome, unknown>>)
-            : {}
-        if (typeof path !== 'string' || typeof status !== 'string') {
-          valid = false
-          if (typeof path === 'string') pending.push(path)
-          continue
-        }
-        outcomes.push({ path, status })
-        if (!WINDOWS_ACL_RESTORE_DONE.has(status)) pending.push(path)
-      }
-    }
-    if (!valid) {
-      logForDebugging('[Sandbox Windows] acl restore: malformed report', {
-        level: 'error',
-      })
-    }
-    return {
-      complete: r.ok && valid && pending.length === 0,
-      outcomes: valid || outcomes.length > 0 ? outcomes : undefined,
-      pending,
-    }
+    return checkedWindowsAclOutcomes(
+      'restore',
+      r.ok,
+      valid,
+      lists.flat(),
+      ({ status }) => WINDOWS_ACL_RESTORE_DONE.has(status),
+    )
   } catch (e) {
     logForDebugging(`[Sandbox Windows] acl restore: ${(e as Error).message}`, {
       level: 'error',
@@ -3421,7 +3444,7 @@ export function revokeWindowsAclChecked(opts: {
   const holder = opts.holderPid ?? process.pid
   let result: WindowsAclRevokeResult
   try {
-    const r = runSrtWinJsonAllowFail<WindowsAclAceOutcome[]>(
+    const r = runSrtWinJsonAllowFail<unknown>(
       [
         'acl',
         'revoke',
@@ -3456,15 +3479,50 @@ function windowsAclRevokeResult(
   json: unknown,
   stderr: string,
 ): WindowsAclRevokeResult {
-  const outcomes = Array.isArray(json)
-    ? (json as WindowsAclAceOutcome[])
-    : undefined
-  const unreleased = (outcomes ?? []).filter(o => !windowsAclGrantReleased(o))
   return {
-    complete: exitedZero && outcomes !== undefined && unreleased.length === 0,
-    outcomes,
-    pending: unreleased.map(o => String(o?.path)),
+    ...checkedWindowsAclOutcomes(
+      'revoke',
+      exitedZero,
+      Array.isArray(json),
+      Array.isArray(json) ? json : [],
+      windowsAclGrantReleased,
+    ),
     detail: stderr.trim() || undefined,
+  }
+}
+
+function checkedWindowsAclOutcomes(
+  command: 'revoke' | 'restore',
+  exitedZero: boolean,
+  valid: boolean,
+  entries: unknown[],
+  released: (outcome: WindowsAclAceOutcome) => boolean,
+): Omit<WindowsAclRevokeResult, 'detail'> {
+  const outcomes: WindowsAclAceOutcome[] = []
+  const pending: string[] = []
+  for (const entry of entries) {
+    const { path, status } =
+      entry !== null && typeof entry === 'object'
+        ? (entry as Partial<Record<keyof WindowsAclAceOutcome, unknown>>)
+        : {}
+    if (typeof path !== 'string' || typeof status !== 'string') {
+      valid = false
+      if (typeof path === 'string') pending.push(path)
+      continue
+    }
+    const outcome = { path, status }
+    outcomes.push(outcome)
+    if (!released(outcome)) pending.push(path)
+  }
+  if (!valid) {
+    logForDebugging(`[Sandbox Windows] acl ${command}: malformed report`, {
+      level: 'error',
+    })
+  }
+  return {
+    complete: exitedZero && valid && pending.length === 0,
+    outcomes: valid || outcomes.length > 0 ? outcomes : undefined,
+    pending,
   }
 }
 
@@ -3979,11 +4037,15 @@ function grantItems(v: unknown): WindowsProfileGrantItem[] {
 export async function grantWindowsProfileRead(
   opts: WindowsProfileGrantOptions = {},
 ): Promise<WindowsProfileGrantResult> {
-  const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
+  const srtWin = opts.srtWin ?? resolveSrtWin()
+  const { exe, prependArgs } = srtWin
   const args = profileGrantArgs(opts)
   const timeoutMs = opts.timeoutMs ?? PROFILE_GRANT_TIMEOUT_MS
   const r = await new Promise<RunResult>((resolve, reject) => {
-    const child = spawn(exe, [...prependArgs, ...args], { windowsHide: true })
+    const child = spawn(exe, [...prependArgs, ...args], {
+      windowsHide: true,
+      env: srtWinEnvironment(srtWin),
+    })
     let timedOut = false
     const timer =
       timeoutMs > 0
@@ -4615,7 +4677,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // returned `env` is the spawn env for the broker (srt-win)
   // process only; the child sees the `--env` overlay built into
   // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy).
-  const env: NodeJS.ProcessEnv = { ...process.env, ...generated }
+  const env = srtWinEnvironment(p.srtWin, { ...process.env, ...generated })
   return { argv, env }
 }
 
