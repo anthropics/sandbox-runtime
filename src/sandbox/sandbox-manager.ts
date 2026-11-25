@@ -614,6 +614,22 @@ function observeWindowsFile(p: string): string | 'absent' | undefined {
   }
 }
 
+/**
+ * Identity of the directory at `p` when it is not itself a link
+ * (symbolic link, junction or mount point); unset otherwise.
+ */
+function windowsPlainDirectory(p: string): string | undefined {
+  try {
+    const st = fs.lstatSync(p, { bigint: true })
+    if (!st.isDirectory() || st.isSymbolicLink() || st.ino === 0n) {
+      return undefined
+    }
+    return `${st.dev}:${st.ino}`
+  } catch {
+    return undefined
+  }
+}
+
 /** Identity of the object at `p`, links followed; unset if unavailable. */
 function windowsFileIdentity(p: string): string | undefined {
   const id = observeWindowsFile(p)
@@ -669,7 +685,12 @@ function windowsAclLedgerAfterGrant(
 ): WindowsAclLedger | undefined {
   const after = readWindowsAclLedger(srtWin)
   if (!before || !after) return undefined
-  if (before.dir !== 'absent' && before.dir !== after.dir) return undefined
+  if (before.dir === 'absent') {
+    // A first use counts only if the grant created a plain directory.
+    if (windowsPlainDirectory(windowsAclStateDir(srtWin)!) !== after.dir) {
+      return undefined
+    }
+  } else if (before.dir !== after.dir) return undefined
   if (before.db !== 'absent' && before.db !== after.db) return undefined
   return after
 }
@@ -1950,12 +1971,16 @@ async function initializeSteps(
       // Observed before the grant and again when it settles; a release
       // must find that same ledger. Other SIDs' pending releases were
       // checked against the state directory seen earlier. If an existing
-      // one is no longer that directory, or either could not be read,
-      // check again here and leave this session's ledger unestablished.
+      // one is no longer that directory, one absent then is now anything
+      // but a plain directory, or either could not be read, check again
+      // here and leave this session's ledger unestablished.
       const before = observeWindowsAclLedger(srtWin)
       const sameStateDir =
-        checkedStateDir === 'absent' ||
-        (checkedStateDir !== undefined && before?.dir === checkedStateDir)
+        checkedStateDir === 'absent'
+          ? before !== undefined &&
+            (before.dir === 'absent' ||
+              windowsPlainDirectory(windowsAclStateDir(srtWin)!) === before.dir)
+          : checkedStateDir !== undefined && before?.dir === checkedStateDir
       if (!sameStateDir) drainWindowsAclReleasesSharingLedger(sb, srtWin)
       const context: WindowsAclContext = { sandboxUserSid: sb, srtWin }
       grantContext = context

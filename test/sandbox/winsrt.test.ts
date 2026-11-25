@@ -5370,6 +5370,68 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         })
       })
     }
+
+    // The junction's target stands for a state directory whose ledger
+    // holds another SID's pending rows.
+    for (const [how, earlierDrained] of [
+      ['nothing pending in this process', false],
+      ['an earlier release drained at the first check', true],
+    ] as const) {
+      it(`round 7: a state directory absent when first checked and a junction at grant start is unestablished: ${how}`, async () => {
+        await withFreshManager(async m => {
+          if (earlierDrained) {
+            await m.SandboxManager.initialize(config())
+            failedRestoreExe = STUB_SRT_WIN.exe
+            expect(await m.SandboxManager.reset().catch(e => e)).toBeInstanceOf(
+              m.WindowsAclReleaseError,
+            )
+            failedRestoreExe = undefined
+          }
+          const original = base()
+          const pendingDir = stateDir()
+          const other = join(dir, 'other-root')
+          mkdirSync(other)
+          sandboxSid = OTHER_SID
+          aclResult.recover = exit(0, JSON.stringify(RECOVERY))
+          aclCalls = []
+          releaseCalls = []
+          process.env.LOCALAPPDATA = other
+          try {
+            await m.SandboxManager.initialize(config(), undefined, false, {
+              onWindowsAclRecovery: () =>
+                symlinkSync(
+                  pendingDir,
+                  join(other, 'sandbox-runtime'),
+                  'junction',
+                ),
+            })
+          } finally {
+            process.env.LOCALAPPDATA = original
+          }
+          await unestablished(m)
+          expect(aclCalls).toEqual([
+            ...(earlierDrained ? ['revoke', 'restore'] : []),
+            'recover',
+            'grant',
+          ])
+          expect(releaseCalls.every(c => c.sid === SID)).toBe(true)
+        })
+      })
+    }
+
+    it('round 7: a junction where the grant was to create the state directory is unestablished', async () => {
+      await withFreshManager(async m => {
+        const target = join(dir, 'pending-root', 'sandbox-runtime')
+        mkdirSync(target, { recursive: true })
+        writeFileSync(join(target, 'state.db'), '')
+        rmSync(stateDir(), { recursive: true, force: true })
+        await initializeAround(m, () =>
+          symlinkSync(target, stateDir(), 'junction'),
+        )
+        await unestablished(m)
+        expect(aclCalls).toEqual(['grant'])
+      })
+    })
   })
 
   for (const [how, status, body, paths] of [
