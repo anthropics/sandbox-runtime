@@ -81,7 +81,7 @@ import {
   parseWindowsBinShell,
   expandWindowsFsPaths,
   rankWindowsFsAccess,
-  restoreWindowsAcl,
+  restoreWindowsAclChecked,
   grantWindowsAclPersistent,
   recoverWindowsAclAsync,
   type WindowsAclRecoveryReport,
@@ -543,21 +543,6 @@ function windowsAclRestoreAllowed(revoke: WindowsAclRevokeResult): boolean {
   return false
 }
 
-// `acl restore` statuses that leave no deny ACE of this holder behind
-// (srt-win's `AceRelease::is_pending` is false for them). Any other
-// status, including one this code does not know, keeps the release
-// pending.
-const WINDOWS_ACL_RESTORE_DONE = new Set([
-  ...WINDOWS_ACL_RELEASE_OK,
-  'downgraded',
-  'relocated',
-  'mismatch',
-  'gone',
-  'noRow',
-  'dropped',
-  'missing',
-])
-
 /**
  * {@link reset} could not release this process's Windows ACL session:
  * a grant or deny ACE may still be on disk. The release stays pending:
@@ -580,11 +565,19 @@ export class WindowsAclReleaseError extends Error {
   }
 }
 
-// A session whose release failed: what the next reset() releases with.
-// Cleared once a release of this holder completes.
-let windowsAclReleasePending:
-  | { sandboxUserSid: string; srtWin: SrtWinSpawn | undefined }
-  | undefined
+// A later session may use a different helper or sandbox user. Keep each
+// failed release until that context's own revoke and restore complete.
+const windowsAclReleasePending = new Map<
+  string,
+  { sandboxUserSid: string; srtWin: SrtWinSpawn | undefined }
+>()
+
+function windowsAclReleaseKey(
+  sandboxUserSid: string,
+  srtWin: SrtWinSpawn | undefined,
+): string {
+  return JSON.stringify([sandboxUserSid, srtWin?.exe, srtWin?.prependArgs])
+}
 
 /**
  * Revoke, then (only after a completed revoke) restore this holder's
@@ -600,19 +593,15 @@ function releaseWindowsSessionAcls(
   if (!windowsAclRestoreAllowed(revoke)) {
     failure = new WindowsAclReleaseError('revoke', revoke.pending)
   } else {
-    const restore = restoreWindowsAcl(o)
-    logWindowsAclOutcomes('deny restore', restore)
-    const left = (restore ?? []).filter(
-      e => !WINDOWS_ACL_RESTORE_DONE.has(e.status),
-    )
-    if (restore === undefined || left.length > 0) {
-      failure = new WindowsAclReleaseError(
-        'restore',
-        left.map(e => e.path),
-      )
+    const restore = restoreWindowsAclChecked(o)
+    logWindowsAclOutcomes('deny restore', restore.outcomes)
+    if (!restore.complete) {
+      failure = new WindowsAclReleaseError('restore', restore.pending)
     }
   }
-  windowsAclReleasePending = failure ? o : undefined
+  const key = windowsAclReleaseKey(sandboxUserSid, srtWin)
+  if (failure) windowsAclReleasePending.set(key, o)
+  else windowsAclReleasePending.delete(key)
   return failure
 }
 
@@ -1229,7 +1218,8 @@ export interface SandboxInitializeOptions {
    * crash recovery on its own and calls this with what it found: holders
    * that died without releasing their ACEs, the ACEs removed, and grants
    * that could not be released (`grantsPending`, possibly still on disk).
-   * Not called when the recovery printed no report.
+   * Called only for a valid report. A callback exception is logged and
+   * initialization continues.
    */
   onWindowsAclRecovery?: (report: WindowsAclRecoveryReport) => void
   /**
@@ -1569,7 +1559,16 @@ async function initializeSteps(
         )
       }
       stopIfReset()
-      if (report) onRecovery(report)
+      if (report) {
+        try {
+          onRecovery(report)
+        } catch (e) {
+          logForDebugging(`[Sandbox Windows] recovery callback threw: ${e}`, {
+            level: 'warn',
+          })
+        }
+        stopIfReset()
+      }
     }
     // initialize() writes the profile read grant only to narrow one
     // already there (windowsProfileGrantRefreshable).
@@ -3773,11 +3772,11 @@ function forceCloseHttpServer(
 async function reset(): Promise<void> {
   initializeGeneration++
   windowsProfileGrantAbort?.abort()
-  // Windows: release this session's sandbox-user ACEs, or retry the
-  // release an earlier reset() could not finish. The rest of the
-  // teardown always runs; a failed release rejects at the end.
+  // Windows: release this session's sandbox-user ACEs and retry any
+  // unfinished releases. A failed release rejects after teardown.
   // Persistent write roots and the denies under them are not released.
   let windowsAclReleaseFailure: WindowsAclReleaseError | undefined
+  let currentReleaseKey: string | undefined
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
     // Captured at initialize() — the SAME binary the grants/stamps
@@ -3785,10 +3784,13 @@ async function reset(): Promise<void> {
     const srtWin = srtWinSpawn
     // The 'exit'/signal handler lands here too: this part of
     // reset() runs synchronously.
+    currentReleaseKey = windowsAclReleaseKey(sb, srtWin)
     windowsAclReleaseFailure = releaseWindowsSessionAcls(sb, srtWin)
-  } else if (windowsAclReleasePending) {
-    const { sandboxUserSid, srtWin } = windowsAclReleasePending
-    windowsAclReleaseFailure = releaseWindowsSessionAcls(sandboxUserSid, srtWin)
+  }
+  for (const [key, { sandboxUserSid, srtWin }] of windowsAclReleasePending) {
+    if (key === currentReleaseKey) continue
+    const failure = releaseWindowsSessionAcls(sandboxUserSid, srtWin)
+    windowsAclReleaseFailure ??= failure
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined

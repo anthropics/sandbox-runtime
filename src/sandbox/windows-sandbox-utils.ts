@@ -3118,27 +3118,35 @@ function windowsAclGrantReleased(o: unknown): boolean {
   }
 }
 
-/**
- * Release this holder's deny ACEs. Best-effort; `undefined` when
- * `srt-win` failed. srt-win refuses (status `grantPending`) while the
- * holder still has a grant recorded: revoke first.
- */
-export function restoreWindowsAcl(opts: {
+// Older helpers report 'restored'/'alreadyOriginal' where current ones
+// report 'revoked'/'stillHeld'. Unknown statuses keep the release pending.
+const WINDOWS_ACL_RESTORE_DONE = new Set([
+  'revoked',
+  'stillHeld',
+  'restored',
+  'alreadyOriginal',
+  'downgraded',
+  'relocated',
+  'mismatch',
+  'gone',
+  'noRow',
+  'dropped',
+  'missing',
+])
+
+/** Release this holder's deny ACEs and verify that the restore completed. */
+export function restoreWindowsAclChecked(opts: {
   sandboxUserSid: string
   holderPid?: number
   srtWin?: SrtWinSpawn
-}): WindowsAclAceOutcome[] | undefined {
+}): {
+  complete: boolean
+  outcomes: WindowsAclAceOutcome[] | undefined
+  pending: string[]
+} {
   const holder = opts.holderPid ?? process.pid
-  // Don't let a teardown helper throw — the caller's reset() must
-  // complete. runSrtWinJsonAllowFail parses stdout before checking
-  // the exit code, so a non-zero exit with the per-path JSON intact
-  // still surfaces every entry to reset()'s loop. Only spawn-fail
-  // / unparseable output throws → log and return undefined.
   try {
-    const r = runSrtWinJsonAllowFail<
-      | WindowsAclAceOutcome[]
-      | { paths?: WindowsAclAceOutcome[]; parents?: WindowsAclAceOutcome[] }
-    >(
+    const r = runSrtWinJsonAllowFail<unknown>(
       [
         'acl',
         'restore',
@@ -3157,18 +3165,63 @@ export function restoreWindowsAcl(opts: {
         { level: 'error' },
       )
     }
-    // Pre- same-user-removal builds emit `{paths, parents}`; post-
-    // emit a flat array. Flatten either so reset()'s logging loop
-    // is shape-agnostic across the transition.
-    return Array.isArray(r.json)
-      ? r.json
-      : [...(r.json.paths ?? []), ...(r.json.parents ?? [])]
+    const lists: unknown[][] = Array.isArray(r.json) ? [r.json] : []
+    let valid = lists.length > 0
+    // Older builds emit {paths, parents}. Accept a single reported list
+    // in that envelope and validate every list the helper included.
+    if (!valid && r.json !== null && typeof r.json === 'object') {
+      const { paths, parents } = r.json as {
+        paths?: unknown
+        parents?: unknown
+      }
+      const reported = [paths, parents].filter(list => list !== undefined)
+      valid = reported.length > 0 && reported.every(Array.isArray)
+      lists.push(...reported.filter(Array.isArray))
+    }
+
+    const outcomes: WindowsAclAceOutcome[] = []
+    const pending: string[] = []
+    for (const list of lists) {
+      for (const entry of list) {
+        const { path, status } =
+          entry !== null && typeof entry === 'object'
+            ? (entry as Partial<Record<keyof WindowsAclAceOutcome, unknown>>)
+            : {}
+        if (typeof path !== 'string' || typeof status !== 'string') {
+          valid = false
+          if (typeof path === 'string') pending.push(path)
+          continue
+        }
+        outcomes.push({ path, status })
+        if (!WINDOWS_ACL_RESTORE_DONE.has(status)) pending.push(path)
+      }
+    }
+    if (!valid) {
+      logForDebugging('[Sandbox Windows] acl restore: malformed report', {
+        level: 'error',
+      })
+    }
+    return {
+      complete: r.ok && valid && pending.length === 0,
+      outcomes: valid || outcomes.length > 0 ? outcomes : undefined,
+      pending,
+    }
   } catch (e) {
     logForDebugging(`[Sandbox Windows] acl restore: ${(e as Error).message}`, {
       level: 'error',
     })
-    return undefined
+    return { complete: false, outcomes: undefined, pending: [] }
   }
+}
+
+/**
+ * Release this holder's deny ACEs. Returns any usable per-path outcomes
+ * from srt-win, including when it refuses to restore until revoke completes.
+ */
+export function restoreWindowsAcl(
+  opts: Parameters<typeof restoreWindowsAclChecked>[0],
+): WindowsAclAceOutcome[] | undefined {
+  return restoreWindowsAclChecked(opts).outcomes
 }
 
 export interface WindowsAclGrantOptions {
@@ -3321,8 +3374,8 @@ export async function recoverWindowsAclAsync(opts: {
   const report = raw && {
     deadBrokers: count(raw.deadBrokers),
     acesRevoked: count(raw.acesRevoked),
-    grantsPending: list(raw.grantsPending ?? []),
-    grantsDropped: list(raw.grantsDropped ?? []),
+    grantsPending: list(raw.grantsPending),
+    grantsDropped: list(raw.grantsDropped),
   }
   if (
     report?.deadBrokers === undefined ||

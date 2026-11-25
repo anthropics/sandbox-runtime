@@ -1589,7 +1589,11 @@ describe.if(!isWindows)('what srt-win is handed (platform spy)', () => {
         outcomes: [],
         pending: [],
       }),
-      spyOn(winUtils, 'restoreWindowsAcl').mockReturnValue([]),
+      spyOn(winUtils, 'restoreWindowsAclChecked').mockReturnValue({
+        complete: true,
+        outcomes: [],
+        pending: [],
+      }),
     )
   })
 
@@ -4318,16 +4322,19 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     port_range: [60080, 60089],
     user_sid: SID,
   }
-  const stdoutFor = (argv: readonly string[]): string =>
-    argv.includes('profile')
+  const stdoutFor = (argv: readonly string[]): string => {
+    const user = { ...RAW_USER, user: { ...RAW_USER.user, sid: sandboxSid } }
+    const wfp = { ...RAW_WFP, user_sid: sandboxSid }
+    return argv.includes('profile')
       ? CURRENT_PROFILE_GRANT
       : argv.includes('user')
-        ? JSON.stringify(RAW_USER)
+        ? JSON.stringify(user)
         : argv.includes('wfp')
-          ? JSON.stringify(RAW_WFP)
+          ? JSON.stringify(wfp)
           : argv.includes('status')
-            ? JSON.stringify({ user: RAW_USER, wfp: RAW_WFP })
+            ? JSON.stringify({ user, wfp })
             : ''
+  }
 
   type SyncResult = {
     status: number | null
@@ -4392,6 +4399,9 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
 
   /** `acl` subcommands spawned, in order. */
   let aclCalls: string[]
+  let releaseCalls: { exe: string; sid: string; sub: string }[]
+  let sandboxSid: string
+  let failedRestoreExe: string | undefined
   /** spawnSync result per `acl` subcommand; default exit 0, `[]`. */
   let aclResult: Record<string, SyncResult>
   let spies: { mockRestore(): void }[]
@@ -4399,6 +4409,9 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
 
   beforeEach(() => {
     aclCalls = []
+    releaseCalls = []
+    sandboxSid = SID
+    failedRestoreExe = undefined
     aclResult = {}
     dir = mkdtempSync(join(tmpdir(), 'srt-acl-gate-'))
     mkdirSync(join(dir, 'secret'))
@@ -4444,6 +4457,16 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
         if (!argv.includes('acl')) return exit(0, stdoutFor(argv))
         const sub = argv[argv.indexOf('acl') + 1]
         aclCalls.push(sub)
+        if (sub === 'revoke' || sub === 'restore') {
+          releaseCalls.push({
+            exe: _exe,
+            sid: argv[argv.indexOf('--sandbox-user-sid') + 1],
+            sub,
+          })
+        }
+        if (sub === 'restore' && _exe === failedRestoreExe) {
+          return reports('failed', 'first-path')
+        }
         return aclResult[sub] ?? exit(0, '[]')
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       }) as any),
@@ -4452,6 +4475,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
 
   afterEach(async () => {
     aclResult = {}
+    failedRestoreExe = undefined
     await SandboxManager.reset()
     for (const s of spies) s.mockRestore()
     rmSync(dir, { recursive: true, force: true })
@@ -4511,6 +4535,8 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
 
   const NO_RESTORE = [...START, 'revoke']
   const WITH_RESTORE = [...START, 'revoke', 'restore']
+  const resetError = () =>
+    SandboxManager.reset().catch((error: unknown) => error)
 
   for (const [how, result] of INCOMPLETE_REVOKES) {
     it(`reset(): revoke ${how} → restore is not spawned, reset() rejects`, async () => {
@@ -4576,9 +4602,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   it('reset(): a complete revoke after an incomplete one → restore runs', async () => {
     await SandboxManager.initialize(config())
     aclResult.revoke = reports('unreadable')
-    await expect(SandboxManager.reset()).rejects.toBeInstanceOf(
-      WindowsAclReleaseError,
-    )
+    expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
     expect(aclCalls).toEqual(NO_RESTORE)
     aclCalls = []
     aclResult = {}
@@ -4599,9 +4623,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     // The rest of the teardown ran.
     expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
     // Still failing: rejects again, still no restore.
-    await expect(SandboxManager.reset()).rejects.toBeInstanceOf(
-      WindowsAclReleaseError,
-    )
+    expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
     expect(aclCalls).toEqual([...START, 'revoke', 'revoke'])
     aclResult = {}
     await SandboxManager.reset()
@@ -4622,6 +4644,81 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       'restore',
     ])
   })
+
+  it('round 2: a newer helper and SID cannot clear a failed older release', async () => {
+    const firstExe = STUB_SRT_WIN.exe
+    const secondPath = join(dir, 'second-srt.exe')
+    writeFileSync(secondPath, '')
+    const secondExe = resolveSrtWin({ path: secondPath }).exe
+    const secondSid = 'S-1-5-21-4'
+    const callsFor = (exe: string, sid: string) => [
+      { exe, sid, sub: 'revoke' },
+      { exe, sid, sub: 'restore' },
+    ]
+
+    await SandboxManager.initialize(config())
+    failedRestoreExe = firstExe
+    expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+    sandboxSid = secondSid
+    const next = { ...config(), windows: { srtWin: { path: secondPath } } }
+    await SandboxManager.initialize(next)
+    expect(await resetError()).toMatchObject({
+      step: 'restore',
+      paths: ['first-path'],
+    })
+    expect(releaseCalls).toEqual([
+      ...callsFor(firstExe, SID),
+      ...callsFor(secondExe, secondSid),
+      ...callsFor(firstExe, SID),
+    ])
+    expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
+
+    failedRestoreExe = undefined
+    releaseCalls = []
+    await SandboxManager.reset()
+    await SandboxManager.reset()
+    expect(releaseCalls).toEqual(callsFor(firstExe, SID))
+  })
+
+  for (const [how, status, body, paths] of [
+    ['unrecognized object', 0, {}, []],
+    ['legacy envelope with malformed list', 0, { paths: [], parents: '' }, []],
+    ['legacy envelope with null list', 0, { paths: [], parents: null }, []],
+    [
+      'null entry next to a pending path',
+      0,
+      [null, { path: 'pending-path', status: 'failed' }],
+      ['pending-path'],
+    ],
+    [
+      'released entry with a non-string path',
+      0,
+      [{ path: 7, status: 'revoked' }],
+      [],
+    ],
+    ['nonzero exit with empty flat output', 1, [], []],
+    [
+      'nonzero exit with empty legacy output',
+      1,
+      { paths: [], parents: [] },
+      [],
+    ],
+  ] as const) {
+    it('round 2: reset retries restore after ' + how, async () => {
+      await SandboxManager.initialize(config())
+      aclResult.restore = exit(status, JSON.stringify(body))
+      const error = await resetError()
+      expect(error).toBeInstanceOf(WindowsAclReleaseError)
+      expect(error).toMatchObject({ step: 'restore', paths })
+      expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
+      expect(aclCalls).toEqual(WITH_RESTORE)
+
+      aclResult.restore = exit(0, '{"paths":[],"parents":[]}')
+      await SandboxManager.reset()
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual([...WITH_RESTORE, 'revoke', 'restore'])
+    })
+  }
 
   for (const [how, result] of [
     ['exits non-zero', () => exit(1, '[{"path":"p","status":"failed"}]')],
@@ -4700,10 +4797,31 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       expect(aclCalls).toEqual(['recover', ...START])
     })
 
+    it('round 2: a throwing recovery callback leaves initialization running', async () => {
+      aclResult.recover = exit(0, JSON.stringify(REPORT))
+      const seen: unknown[] = []
+      await SandboxManager.initialize(config(), undefined, false, {
+        onWindowsAclRecovery: r => {
+          seen.push(r)
+          throw new Error('callback failed')
+        },
+      })
+      expect(seen).toEqual([REPORT])
+      expect(aclCalls).toEqual(['recover', ...START])
+    })
+
     for (const [how, result] of [
       ['an srt-win without the flag', () => exit(2, '')],
       ['a report with a missing count', () => exit(0, '{"deadBrokers":1}')],
       ['unparseable output', () => exit(0, 'not json')],
+      [
+        'round 2: a report with a missing path list',
+        () => exit(0, JSON.stringify({ ...REPORT, grantsPending: undefined })),
+      ],
+      [
+        'round 2: a report with a null path list',
+        () => exit(0, JSON.stringify({ ...REPORT, grantsDropped: null })),
+      ],
     ] as Revoke[]) {
       it(`${how}: no report, the session still starts`, async () => {
         aclResult.recover = result()
@@ -4748,9 +4866,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   it('reset(): a restore that fails after a completed revoke rejects once teardown is done', async () => {
     await SandboxManager.initialize(config())
     aclResult.restore = exit(1, 'boom')
-    await expect(SandboxManager.reset()).rejects.toBeInstanceOf(
-      WindowsAclReleaseError,
-    )
+    expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
     expect(aclCalls).toEqual(WITH_RESTORE)
     expect(SandboxManager.getWindowsBackend?.()).toBeUndefined()
   })
@@ -7082,6 +7198,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
   let syncResult: Record<string, SyncResult>
   /** Every async spawn's argv (after the dispatch sentinel). */
   let asyncCalls: string[][]
+  let recoveryOrder: string[]
   /** What an async `profile grant` does; `code: null` never exits. */
   let grantRun: { stderr: string[]; stdout: string; code: number | null }
   /** Exit code of `install`, sync and async. */
@@ -7247,6 +7364,7 @@ describe('Windows profile read grant (pure, all platforms)', () => {
     calls = []
     syncResult = {}
     asyncCalls = []
+    recoveryOrder = []
     installCode = 0
     homeAsSpelled = mkdtempSync(join(tmpdir(), 'srt-profile-'))
     home = canonical(homeAsSpelled)
@@ -7316,6 +7434,9 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           return asyncChildAnsweredBySync(_exe, argv)
         const own = argv.filter(a => a !== SRT_WIN_DISPATCH_ARG1)
         asyncCalls.push([...own])
+        if (own[0] === 'profile' && own[1] === 'grant') {
+          recoveryOrder.push('profile grant')
+        }
         const mkStream = () => {
           const s = new EventEmitter() as EventEmitter & {
             setEncoding(e: string): typeof s
@@ -7373,6 +7494,8 @@ describe('Windows profile read grant (pure, all platforms)', () => {
           stdin: opts.input === undefined ? undefined : JSON.parse(opts.input),
         })
         const key = `${cmd} ${sub}`
+        if (key === 'acl recover') recoveryOrder.push(own.join(' '))
+        if (key === 'acl grant') recoveryOrder.push(key)
         if (syncResult[key]) return syncResult[key]
         if (key === 'profile status') {
           return exit(0, JSON.stringify(profileStatus))
@@ -7544,6 +7667,29 @@ describe('Windows profile read grant (pure, all platforms)', () => {
       const report = (patch: Record<string, unknown>) =>
         JSON.stringify({ ...JSON.parse(grantJson()), ...patch })
       const staleItem = { path: 'C:\\p\\Documents', reason: 'copies beneath' }
+
+      it('round 2: recovery and callback precede the profile and session grants', async () => {
+        const result = {
+          deadBrokers: 1,
+          acesRevoked: 2,
+          grantsPending: [],
+          grantsDropped: [],
+        }
+        profileStatus = until(refreshable())
+        syncResult['acl recover'] = exit(0, JSON.stringify(result))
+        await SandboxManager.initialize(config(), undefined, false, {
+          onWindowsAclRecovery: report => {
+            expect(report).toEqual(result)
+            recoveryOrder.push('callback')
+          },
+        })
+        expect(recoveryOrder).toEqual([
+          'acl recover --json',
+          'callback',
+          'profile grant',
+          'acl grant',
+        ])
+      })
 
       for (const [what, patch] of [
         ['an older list on the same profile', {}],
