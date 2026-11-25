@@ -34,10 +34,11 @@ import {
   SandboxInitializeConflictError,
   SandboxManager,
   WindowsAclReleaseError,
-  clearWindowsAclReleasesForTesting,
   resolveCommandText,
   windowsProfileReadWarningsOf,
 } from '../../src/sandbox/sandbox-manager.js'
+import type { SandboxInitializeOptions } from '../../src/sandbox/sandbox-manager.js'
+import * as managerModule from '../../src/sandbox/sandbox-manager.js'
 import {
   attributionKeyFor,
   decodeSandboxedCommand,
@@ -4297,6 +4298,8 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
   })
 })
 
+type Manager = typeof managerModule
+
 /**
  * Gives stubbed sessions a helper ledger to check against: a fresh
  * `LOCALAPPDATA` with `sandbox-runtime/state.db`, as srt-win creates.
@@ -4595,6 +4598,63 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
   const WITH_RESTORE = [...START, 'revoke', 'restore']
   const resetError = () =>
     SandboxManager.reset().catch((error: unknown) => error)
+
+  let freshManagers = 0
+  /**
+   * Runs `body` on its own instance of the manager module, for a test that
+   * leaves a release pending for good: the entry stays with that instance.
+   * The process listeners its initialize() adds are taken off afterwards.
+   */
+  const withFreshManager = async (
+    body: (m: Manager) => Promise<void>,
+  ): Promise<void> => {
+    const events = ['exit', 'SIGINT', 'SIGTERM']
+    const emitter = process as unknown as EventEmitter
+    const had = new Map(events.map(e => [e, new Set(emitter.listeners(e))]))
+    const spec = `../../src/sandbox/sandbox-manager.js?fresh=${++freshManagers}`
+    const m = (await import(spec)) as Manager
+    try {
+      await body(m)
+    } finally {
+      await m.SandboxManager.reset().catch(() => {})
+      for (const e of events) {
+        for (const l of emitter.listeners(e)) {
+          if (!had.get(e)!.has(l)) {
+            emitter.removeListener(e, l as (...args: unknown[]) => void)
+          }
+        }
+      }
+    }
+  }
+
+  /** Initializes `m` and runs `during` while the stubbed grant is in flight. */
+  const initializeAround = async (
+    m: Manager,
+    during: () => void,
+    options?: SandboxInitializeOptions,
+  ) => {
+    const started = new Promise<void>(resolve => {
+      grantStarted = resolve
+    })
+    let finishGrant!: () => void
+    grantGate = new Promise<void>(resolve => {
+      finishGrant = resolve
+    })
+    const initializing = m.SandboxManager.initialize(
+      config(),
+      undefined,
+      false,
+      options,
+    )
+    try {
+      await started
+      during()
+    } finally {
+      finishGrant()
+      await initializing
+      grantGate = undefined
+    }
+  }
 
   for (const [how, result] of INCOMPLETE_REVOKES) {
     it(`reset(): revoke ${how} → restore is not spawned, reset() rejects`, async () => {
@@ -5016,29 +5076,23 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     })
 
     it('round 4: a ledger that disappears during the grant keeps the release incomplete', async () => {
-      const started = new Promise<void>(resolve => {
-        grantStarted = resolve
-      })
-      let finishGrant!: () => void
-      grantGate = new Promise<void>(resolve => {
-        finishGrant = resolve
-      })
-      const initializing = SandboxManager.initialize(config())
-      await started
-      const aside = ledgerFile() + '.aside'
-      fs.renameSync(ledgerFile(), aside)
-      try {
-        finishGrant()
-        await initializing
-        expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      await withFreshManager(async m => {
+        const aside = ledgerFile() + '.aside'
+        try {
+          await initializeAround(m, () => fs.renameSync(ledgerFile(), aside))
+          expect(await m.SandboxManager.reset().catch(e => e)).toBeInstanceOf(
+            m.WindowsAclReleaseError,
+          )
+          expect(aclCalls).toEqual(['grant'])
+        } finally {
+          fs.renameSync(aside, ledgerFile())
+        }
+        // Not seen when the grant settled: putting it back does not help.
+        expect(await m.SandboxManager.reset().catch(e => e)).toBeInstanceOf(
+          m.WindowsAclReleaseError,
+        )
         expect(aclCalls).toEqual(['grant'])
-      } finally {
-        fs.renameSync(aside, ledgerFile())
-      }
-      // Not seen when the grant settled: putting it back does not help.
-      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
-      expect(aclCalls).toEqual(['grant'])
-      clearWindowsAclReleasesForTesting()
+      })
     })
 
     it('round 4: a ledger replaced between revoke and restore keeps the release incomplete', async () => {
@@ -5073,23 +5127,6 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       mkdirSync(stateDir())
       fs.linkSync(join(base(), aside, 'state.db'), ledgerFile())
     }
-    /** Runs `during` while the stubbed grant is in flight. */
-    const initializeAround = async (during: () => void) => {
-      const started = new Promise<void>(resolve => {
-        grantStarted = resolve
-      })
-      let finishGrant!: () => void
-      grantGate = new Promise<void>(resolve => {
-        finishGrant = resolve
-      })
-      const initializing = SandboxManager.initialize(config())
-      await started
-      during()
-      finishGrant()
-      await initializing
-      grantGate = undefined
-    }
-
     it('round 5: a success on a recreated directory with a linked database keeps the original pending', async () => {
       await SandboxManager.initialize(config())
       aclResult.revoke = reports('unreadable')
@@ -5150,29 +5187,189 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     })
 
     it('round 5: a preexisting ledger replaced while the grant runs leaves the release unestablished', async () => {
-      const aside = ledgerFile() + '.aside'
-      await initializeAround(() => {
-        fs.renameSync(ledgerFile(), aside)
-        writeFileSync(ledgerFile(), '')
+      await withFreshManager(async m => {
+        const aside = ledgerFile() + '.aside'
+        await initializeAround(m, () => {
+          fs.renameSync(ledgerFile(), aside)
+          writeFileSync(ledgerFile(), '')
+        })
+        // The original is back before reset(): it still does not count.
+        rmSync(ledgerFile(), { force: true })
+        fs.renameSync(aside, ledgerFile())
+        const error = await m.SandboxManager.reset().catch(e => e)
+        expect(error).toBeInstanceOf(m.WindowsAclReleaseError)
+        expect(error).toMatchObject({ step: 'revoke', paths: [] })
+        expect(aclCalls).toEqual(['grant'])
       })
-      // The original is back before reset(): it still does not count.
-      rmSync(ledgerFile(), { force: true })
-      fs.renameSync(aside, ledgerFile())
-      const error = await resetError()
-      expect(error).toBeInstanceOf(WindowsAclReleaseError)
+    })
+  })
+
+  describe('round 6: the ledger observed before and around the grant', () => {
+    const base = () => process.env.LOCALAPPDATA!
+    const stateDir = () => join(base(), 'sandbox-runtime')
+    const ledgerFile = () => join(stateDir(), 'state.db')
+    const OTHER_SID = 'S-1-5-21-4'
+    const RECOVERY = {
+      deadBrokers: 0,
+      acesRevoked: 0,
+      grantsPending: [],
+      grantsDropped: [],
+    }
+    const unestablished = async (m: Manager) => {
+      const error = await m.SandboxManager.reset().catch(e => e)
+      expect(error).toBeInstanceOf(m.WindowsAclReleaseError)
       expect(error).toMatchObject({ step: 'revoke', paths: [] })
-      expect(aclCalls).toEqual(['grant'])
-      clearWindowsAclReleasesForTesting()
+    }
+
+    it('round 6: the manager module exports no way to drop pending releases', () => {
+      expect(
+        Object.keys(managerModule).filter(n =>
+          /release|pending|testing|fortest/i.test(n),
+        ),
+      ).toEqual(['WindowsAclReleaseError'])
     })
 
-    it("round 5: the helper's schema migration during the grant is followed", async () => {
-      await initializeAround(() => {
-        fs.renameSync(ledgerFile(), ledgerFile() + '.v7.1700000000.bak')
-        writeFileSync(ledgerFile(), '')
+    it('round 6: a ledger the helper rotates during the grant reports incomplete, not success', async () => {
+      await withFreshManager(async m => {
+        await initializeAround(m, () => {
+          fs.renameSync(ledgerFile(), ledgerFile() + '.v7.1700000000.bak')
+          writeFileSync(ledgerFile(), '')
+        })
+        await unestablished(m)
+        expect(aclCalls).toEqual(['grant'])
       })
-      await SandboxManager.reset()
-      expect(aclCalls).toEqual(['grant', 'revoke', 'restore'])
     })
+
+    for (const [how, failedStat] of [
+      [
+        'an error other than not-found',
+        () => {
+          throw Object.assign(new Error('EACCES: permission denied'), {
+            code: 'EACCES',
+          })
+        },
+      ],
+      [
+        'a zero file index',
+        (real: typeof fs.statSync, p: fs.PathLike) => ({
+          ...real(p, { bigint: true }),
+          ino: 0n,
+        }),
+      ],
+    ] as const) {
+      it(`round 6: a failed pre-grant read of an existing ledger (${how}) leaves the release unestablished`, async () => {
+        await withFreshManager(async m => {
+          const db = ledgerFile()
+          const real = fs.statSync
+          let failing = true
+          const stat = spyOn(fs, 'statSync').mockImplementation(((
+            p: fs.PathLike,
+            o?: fs.StatSyncOptions,
+          ) =>
+            failing && String(p) === db
+              ? failedStat(real, p)
+              : real(p, o)) as typeof fs.statSync)
+          try {
+            await initializeAround(m, () => {
+              failing = false
+              // A different database is the one seen when the grant settles.
+              fs.renameSync(db, db + '.aside')
+              writeFileSync(db, '')
+            })
+          } finally {
+            stat.mockRestore()
+          }
+          await unestablished(m)
+          expect(aclCalls).toEqual(['grant'])
+        })
+      })
+    }
+
+    for (const [how, during, beforeGrant] of [
+      ['created by the grant', true, false],
+      ['created before the grant', false, true],
+    ] as const) {
+      it(`round 6: a first use whose ledger is ${how} still releases`, async () => {
+        rmSync(stateDir(), { recursive: true, force: true })
+        const create = () => {
+          mkdirSync(stateDir())
+          writeFileSync(ledgerFile(), '')
+        }
+        aclResult.recover = exit(0, JSON.stringify(RECOVERY))
+        await initializeAround(
+          managerModule,
+          () => {
+            if (during) create()
+          },
+          { onWindowsAclRecovery: () => beforeGrant && create() },
+        )
+        await SandboxManager.reset()
+        expect(aclCalls).toEqual(['recover', 'grant', 'revoke', 'restore'])
+      })
+    }
+
+    for (const [how, earlierStillFails] of [
+      ['an earlier release still pending there blocks the grant', true],
+      ['the new session cannot release', false],
+    ] as const) {
+      it(`round 6: a state directory retargeted onto another SID's pending ledger before the grant: ${how}`, async () => {
+        await withFreshManager(async m => {
+          await m.SandboxManager.initialize(config())
+          failedRestoreExe = STUB_SRT_WIN.exe
+          expect(await m.SandboxManager.reset().catch(e => e)).toBeInstanceOf(
+            m.WindowsAclReleaseError,
+          )
+          if (!earlierStillFails) failedRestoreExe = undefined
+          const original = base()
+          const pendingDir = stateDir()
+          const other = join(dir, 'other-root')
+          mkdirSync(join(other, 'sandbox-runtime'), { recursive: true })
+          writeFileSync(join(other, 'sandbox-runtime', 'state.db'), '')
+          const next = join(dir, 'other-srt.exe')
+          writeFileSync(next, '')
+          sandboxSid = OTHER_SID
+          aclResult.recover = exit(0, JSON.stringify(RECOVERY))
+          aclCalls = []
+          releaseCalls = []
+          process.env.LOCALAPPDATA = other
+          let started: unknown
+          try {
+            started = await m.SandboxManager.initialize(
+              { ...config(), windows: { srtWin: { path: next } } },
+              undefined,
+              false,
+              {
+                // Separate when first checked, the original from here on.
+                onWindowsAclRecovery: () => {
+                  rmSync(join(other, 'sandbox-runtime'), {
+                    recursive: true,
+                    force: true,
+                  })
+                  symlinkSync(
+                    pendingDir,
+                    join(other, 'sandbox-runtime'),
+                    'junction',
+                  )
+                },
+              },
+            ).catch(e => e)
+          } finally {
+            process.env.LOCALAPPDATA = original
+            failedRestoreExe = undefined
+          }
+          if (earlierStillFails) {
+            expect(started).toBeInstanceOf(m.WindowsAclReleaseError)
+            expect(aclCalls).toEqual(['recover', 'revoke', 'restore'])
+          } else {
+            expect(started).toBeUndefined()
+            expect(aclCalls).toEqual(['recover', 'revoke', 'restore', 'grant'])
+            await unestablished(m)
+            expect(aclCalls).toEqual(['recover', 'revoke', 'restore', 'grant'])
+          }
+          expect(new Set(releaseCalls.map(c => c.sid))).toEqual(new Set([SID]))
+        })
+      })
+    }
   })
 
   for (const [how, status, body, paths] of [

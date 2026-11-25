@@ -601,19 +601,23 @@ function windowsAclReleaseKey({
   ])
 }
 
-/** Exported for testing: a context whose ledger is lost stays pending. */
-export function clearWindowsAclReleasesForTesting(): void {
-  windowsAclReleasePending.clear()
+/**
+ * Identity of the object at `p`, links followed; `'absent'` only when it
+ * does not exist, and unset when it could not be read.
+ */
+function observeWindowsFile(p: string): string | 'absent' | undefined {
+  try {
+    const { dev, ino } = fs.statSync(p, { bigint: true })
+    return ino === 0n ? undefined : `${dev}:${ino}`
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : undefined
+  }
 }
 
 /** Identity of the object at `p`, links followed; unset if unavailable. */
 function windowsFileIdentity(p: string): string | undefined {
-  try {
-    const { dev, ino } = fs.statSync(p, { bigint: true })
-    return ino === 0n ? undefined : `${dev}:${ino}`
-  } catch {
-    return undefined
-  }
+  const id = observeWindowsFile(p)
+  return id === 'absent' ? undefined : id
 }
 
 function windowsAclStateDir(srtWin: SrtWinSpawn): string | undefined {
@@ -632,31 +636,42 @@ function readWindowsAclLedger(
 }
 
 /**
- * The ledger a grant leaves behind, given the one observed before it.
- * A different one is accepted only as the helper's schema migration,
- * which renames the old database to `state.db.v<N>.<ts>.bak` in the same
- * directory; anything else leaves the ledger unestablished.
+ * The state directory and database as seen before a grant. `'absent'`
+ * marks one confirmed not to exist yet; unset when either could not be
+ * read.
+ */
+type WindowsAclLedgerObservation = {
+  dir: string | 'absent'
+  db: string | 'absent'
+}
+
+function observeWindowsAclLedger(
+  srtWin: SrtWinSpawn,
+): WindowsAclLedgerObservation | undefined {
+  const dir = windowsAclStateDir(srtWin)
+  if (!dir) return undefined
+  const dirId = observeWindowsFile(dir)
+  if (dirId === undefined) return undefined
+  if (dirId === 'absent') return { dir: dirId, db: 'absent' }
+  const dbId = observeWindowsFile(join(dir, 'state.db'))
+  return dbId === undefined ? undefined : { dir: dirId, db: dbId }
+}
+
+/**
+ * The ledger a grant leaves behind, given what was observed before it.
+ * One that existed must still be the same directory and database; only
+ * one confirmed absent may be created. Anything else, a rotated or
+ * replaced database included, leaves the ledger unestablished.
  */
 function windowsAclLedgerAfterGrant(
   srtWin: SrtWinSpawn,
-  before: WindowsAclLedger | undefined,
+  before: WindowsAclLedgerObservation | undefined,
 ): WindowsAclLedger | undefined {
   const after = readWindowsAclLedger(srtWin)
-  if (!before || isDeepStrictEqual(before, after)) return after
-  const dir = windowsAclStateDir(srtWin)
-  if (!dir || !after || after.dir !== before.dir) return undefined
-  let names: string[]
-  try {
-    names = fs.readdirSync(dir)
-  } catch {
-    return undefined
-  }
-  const migrated = names.some(
-    n =>
-      /^state\.db\.v-?\d+\.\d+\.bak$/.test(n) &&
-      windowsFileIdentity(join(dir, n)) === before.db,
-  )
-  return migrated ? after : undefined
+  if (!before || !after) return undefined
+  if (before.dir !== 'absent' && before.dir !== after.dir) return undefined
+  if (before.db !== 'absent' && before.db !== after.db) return undefined
+  return after
 }
 
 /** A stat still shows the ledger observed around the grant. */
@@ -672,20 +687,23 @@ function windowsAclLedgerConfirmed(o: WindowsAclContext): boolean {
  * rows by PID, so a release for another SID would consume a pending
  * release's rows and leave its ACEs. Retry every other-SID release whose
  * state directory is the same object, or cannot be told apart, first; an
- * incomplete one blocks the new session.
+ * incomplete one blocks the new session. Returns the state directory as
+ * observed for that check.
  */
 function drainWindowsAclReleasesSharingLedger(
   sandboxUserSid: string,
   srtWin: SrtWinSpawn,
-): void {
+): string | 'absent' | undefined {
   const stateDir = windowsAclStateDir(srtWin)
-  const dir = stateDir && windowsFileIdentity(stateDir)
+  const observed = stateDir ? observeWindowsFile(stateDir) : undefined
+  const dir = observed === 'absent' ? undefined : observed
   for (const pending of [...windowsAclReleasePending.values()]) {
     if (pending.sandboxUserSid === sandboxUserSid) continue
     if (dir && pending.ledger && pending.ledger.dir !== dir) continue
     const failure = releaseWindowsSessionAcls(pending)
     if (failure) throw failure
   }
+  return observed
 }
 
 /**
@@ -1669,9 +1687,10 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
+    let checkedStateDir: string | 'absent' | undefined
     if (u.sid) {
       try {
-        drainWindowsAclReleasesSharingLedger(u.sid, srtWin)
+        checkedStateDir = drainWindowsAclReleasesSharingLedger(u.sid, srtWin)
       } catch (e) {
         srtWinSpawn = undefined
         config = undefined
@@ -1928,12 +1947,18 @@ async function initializeSteps(
         )
       }
       const sb = u.sid
+      // Observed before the grant and again when it settles; a release
+      // must find that same ledger. Other SIDs' pending releases were
+      // checked against the state directory seen earlier. If an existing
+      // one is no longer that directory, or either could not be read,
+      // check again here and leave this session's ledger unestablished.
+      const before = observeWindowsAclLedger(srtWin)
+      const sameStateDir =
+        checkedStateDir === 'absent' ||
+        (checkedStateDir !== undefined && before?.dir === checkedStateDir)
+      if (!sameStateDir) drainWindowsAclReleasesSharingLedger(sb, srtWin)
       const context: WindowsAclContext = { sandboxUserSid: sb, srtWin }
       grantContext = context
-      // Observed before the grant and again when it settles; a release
-      // must find that same ledger.
-      const before = readWindowsAclLedger(srtWin)
-      context.ledger = before
       // Reset can take ownership while this helper still has work to do.
       const promise = grantWindowsAclPersistent({
         ...context,
@@ -1943,7 +1968,9 @@ async function initializeSteps(
         denyWrite: acc.denyWrite,
         allowProfileExclusions: override,
       }).finally(() => {
-        context.ledger = windowsAclLedgerAfterGrant(srtWin, before)
+        context.ledger = sameStateDir
+          ? windowsAclLedgerAfterGrant(srtWin, before)
+          : undefined
       })
       windowsAclGrantInFlight = { context, promise }
       await promise
