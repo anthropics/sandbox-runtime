@@ -1553,6 +1553,24 @@ async function initializeSteps(
       config = undefined
       throw new WindowsSandboxError('reinstall_required', staleSetup)
     }
+    // Asked for: run crash recovery on its own before any srt-win call
+    // that takes the init lock (a profile grant refresh and the session
+    // grant both recover too), so its counts reach the embedder.
+    // Best-effort.
+    const onRecovery = options?.onWindowsAclRecovery
+    if (onRecovery) {
+      let report: WindowsAclRecoveryReport | undefined
+      try {
+        report = await recoverWindowsAclAsync({ srtWin })
+      } catch (e) {
+        logForDebugging(
+          `[Sandbox Windows] acl recover: ${(e as Error).message}`,
+          { level: 'warn' },
+        )
+      }
+      stopIfReset()
+      if (report) onRecovery(report)
+    }
     // initialize() writes the profile read grant only to narrow one
     // already there (windowsProfileGrantRefreshable).
     windowsProfileReadWarnings = []
@@ -1771,22 +1789,6 @@ async function initializeSteps(
         )
       }
       const sb = u.sid
-      // Asked for: run crash recovery on its own first, so its counts
-      // reach the embedder. Best-effort: the grant below recovers too.
-      const onRecovery = options?.onWindowsAclRecovery
-      if (onRecovery) {
-        let report: WindowsAclRecoveryReport | undefined
-        try {
-          report = await recoverWindowsAclAsync({ srtWin })
-        } catch (e) {
-          logForDebugging(
-            `[Sandbox Windows] acl recover: ${(e as Error).message}`,
-            { level: 'warn' },
-          )
-        }
-        stopIfReset()
-        if (report) onRecovery(report)
-      }
       // Record module-level state BEFORE the first acl call so the
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
