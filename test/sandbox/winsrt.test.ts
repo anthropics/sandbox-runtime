@@ -34,6 +34,7 @@ import {
   SandboxInitializeConflictError,
   SandboxManager,
   WindowsAclReleaseError,
+  clearWindowsAclReleasesForTesting,
   resolveCommandText,
   windowsProfileReadWarningsOf,
 } from '../../src/sandbox/sandbox-manager.js'
@@ -4297,7 +4298,7 @@ describe('Windows write roots are granted once and kept (pure, all platforms)', 
 })
 
 /**
- * Gives stubbed sessions a helper ledger to bind to: a fresh
+ * Gives stubbed sessions a helper ledger to check against: a fresh
  * `LOCALAPPDATA` with `sandbox-runtime/state.db`, as srt-win creates.
  */
 function stubWindowsAclLedger(): { restore(): void } {
@@ -4916,7 +4917,7 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
     })
   }
 
-  describe('round 4: releases bound to the grant ledger', () => {
+  describe('round 4: releases checked against the grant ledger', () => {
     const stateDir = () => join(process.env.LOCALAPPDATA!, 'sandbox-runtime')
     const ledgerFile = () => join(stateDir(), 'state.db')
     /** Moves the ledger aside and leaves a new, empty one in its place. */
@@ -5034,8 +5035,10 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       } finally {
         fs.renameSync(aside, ledgerFile())
       }
-      await SandboxManager.reset()
-      expect(aclCalls).toEqual(['grant', 'revoke', 'restore'])
+      // Not seen when the grant settled: putting it back does not help.
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      expect(aclCalls).toEqual(['grant'])
+      clearWindowsAclReleasesForTesting()
     })
 
     it('round 4: a ledger replaced between revoke and restore keeps the release incomplete', async () => {
@@ -5053,6 +5056,122 @@ describe('Windows session ACLs: restore gated on a completed revoke (pure, all p
       }
       await SandboxManager.reset()
       expect(aclCalls).toEqual([...NO_RESTORE, 'revoke', 'restore'])
+    })
+  })
+
+  describe('round 5: ledger consistency checks', () => {
+    const base = () => process.env.LOCALAPPDATA!
+    const stateDir = () => join(base(), 'sandbox-runtime')
+    const ledgerFile = () => join(stateDir(), 'state.db')
+    /** Moves the state directory to `name` and returns a putBack. */
+    const moveStateDir = (name: string) => {
+      fs.renameSync(stateDir(), join(base(), name))
+      return () => fs.renameSync(join(base(), name), stateDir())
+    }
+    /** A new state directory whose `state.db` links the original's. */
+    const recreateLinked = (aside: string) => {
+      mkdirSync(stateDir())
+      fs.linkSync(join(base(), aside, 'state.db'), ledgerFile())
+    }
+    /** Runs `during` while the stubbed grant is in flight. */
+    const initializeAround = async (during: () => void) => {
+      const started = new Promise<void>(resolve => {
+        grantStarted = resolve
+      })
+      let finishGrant!: () => void
+      grantGate = new Promise<void>(resolve => {
+        finishGrant = resolve
+      })
+      const initializing = SandboxManager.initialize(config())
+      await started
+      during()
+      finishGrant()
+      await initializing
+      grantGate = undefined
+    }
+
+    it('round 5: a success on a recreated directory with a linked database keeps the original pending', async () => {
+      await SandboxManager.initialize(config())
+      aclResult.revoke = reports('unreadable')
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      aclResult = {}
+      const putBack = moveStateDir('original')
+      recreateLinked('original')
+      await SandboxManager.initialize(config())
+      // The new session releases; the original cannot be confirmed.
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      expect(aclCalls).toEqual([...NO_RESTORE, 'grant', 'revoke', 'restore'])
+      rmSync(stateDir(), { recursive: true, force: true })
+      putBack()
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual([
+        ...NO_RESTORE,
+        'grant',
+        'revoke',
+        'restore',
+        'revoke',
+        'restore',
+      ])
+    })
+
+    it('round 5: a failure on a recreated directory does not overwrite the original entry', async () => {
+      await SandboxManager.initialize(config())
+      aclResult.revoke = reports('unreadable')
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      const putBackOriginal = moveStateDir('original')
+      recreateLinked('original')
+      await SandboxManager.initialize(config())
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      expect(aclCalls).toEqual([...NO_RESTORE, 'grant', 'revoke'])
+      aclResult = {}
+      // Each directory in place in turn: each entry retries on its own.
+      const putBackRecreated = moveStateDir('recreated')
+      putBackOriginal()
+      expect(await resetError()).toBeInstanceOf(WindowsAclReleaseError)
+      expect(aclCalls).toEqual([
+        ...NO_RESTORE,
+        'grant',
+        'revoke',
+        'revoke',
+        'restore',
+      ])
+      moveStateDir('original')
+      putBackRecreated()
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual([
+        ...NO_RESTORE,
+        'grant',
+        'revoke',
+        'revoke',
+        'restore',
+        'revoke',
+        'restore',
+      ])
+    })
+
+    it('round 5: a preexisting ledger replaced while the grant runs leaves the release unestablished', async () => {
+      const aside = ledgerFile() + '.aside'
+      await initializeAround(() => {
+        fs.renameSync(ledgerFile(), aside)
+        writeFileSync(ledgerFile(), '')
+      })
+      // The original is back before reset(): it still does not count.
+      rmSync(ledgerFile(), { force: true })
+      fs.renameSync(aside, ledgerFile())
+      const error = await resetError()
+      expect(error).toBeInstanceOf(WindowsAclReleaseError)
+      expect(error).toMatchObject({ step: 'revoke', paths: [] })
+      expect(aclCalls).toEqual(['grant'])
+      clearWindowsAclReleasesForTesting()
+    })
+
+    it("round 5: the helper's schema migration during the grant is followed", async () => {
+      await initializeAround(() => {
+        fs.renameSync(ledgerFile(), ledgerFile() + '.v7.1700000000.bak')
+        writeFileSync(ledgerFile(), '')
+      })
+      await SandboxManager.reset()
+      expect(aclCalls).toEqual(['grant', 'revoke', 'restore'])
     })
   })
 
