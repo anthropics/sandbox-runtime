@@ -366,4 +366,126 @@ describe('CLI', () => {
       }, 60_000)
     }
   })
+
+  describe.if(process.platform !== 'win32')(
+    'piped stdout/stderr stay blocking across proxy requests (#861)',
+    () => {
+      for (const runtime of [
+        {
+          name: 'node',
+          bin: 'node',
+          entry: join(process.cwd(), 'dist', 'cli.js'),
+        },
+        { name: 'bun', bin: process.execPath, entry: getCliPath() },
+      ]) {
+        test(`child stdout/stderr stay blocking and large writes succeed (${runtime.name})`, async () => {
+          const dir = mkdtempSync(join(tmpdir(), 'srt-pipe-nonblock-'))
+          try {
+            const settingsPath = join(dir, 'settings.json')
+            writeFileSync(
+              settingsPath,
+              JSON.stringify({
+                network: { allowedDomains: [], deniedDomains: [] },
+                filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+              }),
+            )
+            const childScript = join(dir, 'child.js')
+            // Connect through HTTP_PROXY (offline-safe: proxy responds 403 via
+            // mux-proxy pipe(), which previously triggered lazy process.stdout
+            // initialization and flipped shared fd 1/2 to O_NONBLOCK). Then
+            // verify child writes > pipe buffer succeed with blocking stdout.
+            writeFileSync(
+              childScript,
+              `const fs = require('node:fs');
+const http = require('node:http');
+const proxyUrl = new URL(process.env.HTTP_PROXY);
+http.get({ host: proxyUrl.hostname, port: proxyUrl.port, path: 'http://blocked.invalid/' }, res => {
+  res.resume();
+  res.on('end', () => {
+    const chunk = Buffer.alloc(512 * 1024, 'x');
+    let offset = 0;
+    while (offset < chunk.length) {
+      offset += fs.writeSync(1, chunk, offset, chunk.length - offset);
+    }
+    fs.writeSync(2, 'STDERR_OK:' + offset);
+  });
+}).on('error', err => {
+  console.error(err);
+  process.exit(2);
+});
+`,
+            )
+
+            const child = spawn(
+              runtime.bin,
+              [runtime.entry, '--settings', settingsPath, 'node', childScript],
+              { stdio: ['inherit', 'pipe', 'pipe'] },
+            )
+            // Delay reading stdout so the kernel pipe fills before draining.
+            child.stdout.pause()
+            const stdoutChunks: Buffer[] = []
+            const stderrChunks: Buffer[] = []
+            child.stdout.on('data', (d: Buffer) => stdoutChunks.push(d))
+            child.stderr.on('data', (d: Buffer) => stderrChunks.push(d))
+            setTimeout(() => child.stdout.resume(), 150)
+
+            const status = await new Promise<number | null>(resolve =>
+              child.on('close', resolve),
+            )
+            const totalBytes = Buffer.concat(stdoutChunks).length
+            expect(Buffer.concat(stderrChunks).toString()).toContain(
+              'STDERR_OK:524288',
+            )
+            expect(totalBytes).toBe(512 * 1024)
+            expect(status).toBe(0)
+          } finally {
+            rmSync(dir, { recursive: true, force: true })
+          }
+        }, 15_000)
+
+        test(`exits without EPIPE crash when downstream stdout pipe closes early (${runtime.name})`, async () => {
+          const dir = mkdtempSync(join(tmpdir(), 'srt-pipe-epipe-'))
+          try {
+            const settingsPath = join(dir, 'settings.json')
+            writeFileSync(
+              settingsPath,
+              JSON.stringify({
+                network: { allowedDomains: [], deniedDomains: [] },
+                filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+              }),
+            )
+            const child = spawn(
+              runtime.bin,
+              [
+                runtime.entry,
+                '--settings',
+                settingsPath,
+                '--',
+                'node',
+                '-e',
+                "process.stdout.on('error', () => process.exit(0)); setInterval(() => process.stdout.write('line\\n'), 5);",
+              ],
+              { stdio: ['inherit', 'pipe', 'pipe'] },
+            )
+            let stderr = ''
+            child.stderr.on('data', (d: Buffer) => (stderr += d.toString()))
+            await new Promise<void>(resolve => {
+              child.stdout.once('data', () => {
+                child.stdout.destroy()
+                resolve()
+              })
+            })
+            const status = await new Promise<number | null>(resolve =>
+              child.on('close', resolve),
+            )
+            expect(stderr).not.toContain('Unhandled')
+            expect(stderr).not.toContain('Error: write EPIPE')
+            expect(status).toBe(0)
+          } finally {
+            rmSync(dir, { recursive: true, force: true })
+          }
+        }, 15_000)
+      }
+    },
+  )
 })
